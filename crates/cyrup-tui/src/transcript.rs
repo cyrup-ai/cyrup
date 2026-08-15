@@ -3446,6 +3446,72 @@ mod output_pad_tests {
             assert!(rows[1].spans.iter().any(|s| s.style.fg.is_some()), "colour lost: {rows:?}");
         }
     }
+
+    /// **CFG-051** — the migrated-credential notice must RENDER, verbatim, and BEFORE the
+    /// model-fallback warning.
+    ///
+    /// pi shows the line inside the running UI — `if (migratedProviders && migratedProviders.length
+    /// > 0) { this.showWarning(\`Migrated credentials to auth.json: ${migratedProviders.join(", ")}\`); }`
+    /// (`interactive-mode.ts:874-876` @v0.83.0) — ahead of the `modelFallbackMessage` warning
+    /// (`:883-885`). cyrup pushes both from `run_interactive` in that order
+    /// (`crates/cyrup/src/main.rs:1940` then `:1946`), and the STRING is pinned on that side by
+    /// `the_migrated_credential_notice_is_pis_line_and_is_absent_when_nothing_moved`.
+    ///
+    /// What no test pinned — the residual REPRO-LOG carried for this row — is the RENDER: a string
+    /// pushed into `pending` is only a notice if `entry_lines` (the production path, `app.rs:1851`)
+    /// actually emits it. `Entry::Warning` renders its text VERBATIM, which is why `Warning: ` is a
+    /// per-caller obligation here (TUI-062) — so a renderer that re-prefixed, truncated or dropped
+    /// the line would leave the string test green and the user with nothing on screen.
+    #[test]
+    fn the_migrated_credential_notice_renders_first_and_verbatim_in_the_transcript() {
+        // The two production lines, in `run_interactive` order. Deliberately DISTINCT values (two
+        // providers, a comma join) so a renderer that emitted the wrong entry cannot pass.
+        const MIGRATED: &str = "Warning: Migrated credentials to auth.json: anthropic, openai";
+        const FALLBACK: &str = "Warning: No models available.";
+        let theme = UiTheme::dark();
+        let mut view = TranscriptView::new();
+        view.push_warning(MIGRATED);
+        view.push_warning(FALLBACK);
+        // PRESENCE before absence: an empty queue would make every row assertion below vacuous.
+        assert_eq!(view.pending().len(), 2, "both warnings queued: {:?}", view.pending());
+
+        // The production render path: `app.rs:1851` maps every entry through `entry_lines` at the
+        // transcript's own `output_pad`. Width 100 is wider than either line, so a row that does
+        // not match exactly is a render defect, not a wrap.
+        let rows: Vec<Line<'static>> = view
+            .pending()
+            .iter()
+            .flat_map(|e| entry_lines(e, &theme, 100, view.output_pad(), ImageOpts::default()))
+            .collect();
+        let text: Vec<String> = rows.iter().map(line_text).collect();
+
+        let migrated_at = text
+            .iter()
+            .position(|r| r.trim() == MIGRATED)
+            .unwrap_or_else(|| panic!("the migrated-credential notice never rendered: {text:?}"));
+        let fallback_at = text
+            .iter()
+            .position(|r| r.trim() == FALLBACK)
+            .unwrap_or_else(|| panic!("the model-fallback warning never rendered: {text:?}"));
+        assert!(
+            migrated_at < fallback_at,
+            "pi renders the migrated-credential notice (`:874-876`) BEFORE the modelFallbackMessage \
+             warning (`:883-885`); got {text:?}"
+        );
+        // Verbatim: exactly one `Warning: `, no second prefix from the renderer.
+        assert_eq!(
+            text[migrated_at].matches("Warning: ").count(),
+            1,
+            "the renderer must not re-prefix a verbatim `Entry::Warning`: {:?}",
+            text[migrated_at]
+        );
+        // …and in the warning colour, not the default foreground.
+        assert_eq!(
+            rows[migrated_at].spans.iter().find_map(|s| s.style.fg),
+            theme.warning_style().fg,
+            "the notice must render in the warning colour (`theme.fg(\"warning\", …)`)"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -832,6 +832,7 @@ fn runner_config(
     step: SingleStepSpec,
 ) -> RunnerConfig {
     RunnerConfig {
+        turn_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
         share: None,

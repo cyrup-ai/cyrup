@@ -5,6 +5,281 @@ next work item**.
 
 ---
 
+# RECONCILED 2026-08-14 (third edition) — EIGHT sweeps applied, every count re-derived from the twelve area tables
+
+> **cyrup HEAD `e5c6933`** (docs HEAD `0097149`), branch `david/cyrup`. **Both gates green:**
+> `cargo nextest run --workspace` = **6740 tests, 6740 passed, 17.9 s**;
+> `cargo nextest run -p cyrup-it --features it` = **473 tests, 473 passed, 92 s**.
+>
+> **Everything below this block is the previous edition and is superseded on every number.** It is
+> retained because its *reasoning* — the two-failure-modes-of-"refuted" analysis, the orchestration
+> finding, the JS→Rust register — is still the argument this file rests on.
+
+## The open set — re-derived row by row from the twelve `## Open items` tables, nothing carried forward
+
+| | critical | high | medium | low | **counted open** |
+|---|---:|---:|---:|---:|---:|
+| first edition (after sweeps 1-2) | 0 | 3 | 75 | 95 | **173** |
+| second edition (after sweeps 3-6) | 0 | 2 | 63 | 88 | **153** |
+| **this edition (after sweeps 7-8)** | **0** | **2** | **61** | **82** | **145** |
+
+**503 rows across the twelve tables. 349 carry a full closure marker and 35 more a partial one — 384
+of 503 (76%).** *(Method, stated so it is reproducible and so the drift from the second edition's
+"338 of 500" is visible rather than mysterious: a row counts as fully closed if its ID is struck
+through **or** its severity cell says `CLOSED`/`FIXED` without `PARTIALLY`; a `PARTIALLY CLOSED` /
+`REOPENED` row is still counted **open** and carries its severity into the arithmetic above. Ten
+`tracker` rows are excluded from every figure — eight in the area tables plus `SEAM-058` and
+`SUBA-005` in their areas' separate `## Trackers` tables. One row, `AGENT-S04`, carries
+`*(partially-closed)*` in place of a severity and is in neither total; that has been true for three
+editions and is left alone rather than silently rated.)*
+
+**THREE rows are new since the second edition, and all three are closed** — `PROV-M01` (area 01) and
+`TOOL-M01` (area 04), both filed and closed in the same pass; and `EXT-M03` (area 06), **filed
+retroactively by this reconciliation because the ID was cited FIVE times in
+`crates/cyrup-ext/src/host/live.rs` and had no row in any area file.** The work landed in sweep 6;
+the bookkeeping never did. An ID citable from source but absent from the backlog is the orphan
+condition `README.md` blind spot 4 names as *more dangerous than no entry at all* — and it is a
+reason to grep the SOURCE for `AREA-NNN` citations at every reconciliation, not just the docs. Both came out of one assigned audit rather than from
+the backlog, which is the point: see "The dropped-delegation class" below. **One row was REOPENED:
+`TOOL-042`, by measurement.** **No ID was renumbered, merged or deleted.**
+
+### By area
+
+| file | crit | high | medium | low | **open** | Δ vs second edition |
+|---|---:|---:|---:|---:|---:|---|
+| `01-cyrup-core-and-provider.md` | 0 | 1 | 4 | 6 | **11** | — (`PROV-M01` filed+closed) |
+| `02-cyrup-agent.md` | 0 | 0 | 0 | 2 | **2** | — |
+| `03-cyrup-session.md` | 0 | 1 | 1 | 6 | **8** | — |
+| `04-cyrup-tools.md` | 0 | 0 | 2 | 3 | **5** | — net (`TOOL-024` closed, `TOOL-042` **reopened**, `TOOL-M01` filed+closed) |
+| `05-cyrup-config-and-resources.md` | 0 | 0 | 4 | 5 | **9** | **−3** (`CFG-045`, `CFG-051`, `CFG-052`) |
+| `06-cyrup-ext.md` | 0 | 0 | 11 | 12 | **23** | **−1** (`EXT-060`; `EXT-M03` row filed retroactively, closed) |
+| `07-cyrup-tui.md` | 0 | 0 | 14 | 21 | **35** | — |
+| `08-cyrup-session-svc-and-modes.md` | 0 | 0 | 3 | 3 | **6** | **−1** (`SEAM-017`) |
+| `09-cyrup-ext-subagents.md` | 0 | 0 | 8 | 9 | **17** | **−3** (`SUBA-008`, `SUBA-030`, `SUBA-035`) |
+| `10-cyrup-permission-system.md` | 0 | 0 | 2 | 2 | **4** | — |
+| `11-cyrup-intercom.md` | 0 | 0 | 5 | 4 | **9** | — |
+| `12-upstream-drift-pi-core.md` | 0 | 0 | 7 | 9 | **16** | — (no sweep since 3 has owned it) |
+| | **0** | **2** | **61** | **82** | **145** | **−8** |
+
+**The two highs are unchanged — `SESS-040` and `PROV-047`.** Areas 08, 09 and 10 still have zero open
+criticals and zero open highs between them, which is why sweep 8's tail-a agent correctly reported
+that its *entire* remaining set was medium/low and then landed the top-ranked medium end to end.
+
+## What eight sweeps produced, honestly
+
+| outcome | count | what it means |
+|---|---:|---|
+| **closed** | ~424 of 448 originally-worked rows, +8 this edition | the fix landed and was verified at HEAD |
+| **refuted-not-fixed** | **≈56 across all eight sweeps** | the row was wrong about the code or about upstream, **or** the fix had landed and no writer had reconciled it |
+| **already-done** | 6 this edition alone | verified in place; a first-class outcome, not a shortfall |
+| **reopened** | **1** (`TOOL-042`) | a closure was refuted by *measurement* |
+| **blocked / not-taken** | 13 this edition | needs an owner decision, a cross-crate seam, or a live provider call |
+
+**The measured error rate is unchanged at ≈12%** (≈56 refutations against ~465 rows worked across
+eight sweeps). **It has not improved in six editions, and the honest reading is that this is the
+method's floor, not a defect to be driven out** — refuting is how a static analysis corrects itself.
+What *did* change is which failure the word "refuted" names, and the second edition's split still
+holds: the majority is **doc staleness** (the fix landed; nobody reconciled), the minority is
+**genuine analysis error**. Sweep 8 produced clean instances of each. Doc staleness: `SEAM-017` read
+*"sweep 2 — not started"* while `crates/cyrup-modes/src/rpc_client.rs` was **1262 lines** at HEAD;
+`CFG-045` read *"sweeps 2 and 6 — unchanged at HEAD"* while both branches it called missing were in
+`app.rs:2263-2290`. Genuine analysis error: **`CFG-052`'s entire premise about upstream is false** —
+pi's `parseGitUrl` returns `null` before reaching `hostedGitInfo.fromUrl` unless there is a `git:`
+prefix or an explicit `://`, and its own doc comment says so (`utils/git.ts:165-179` @v0.83.0), so
+the "internally inconsistent state" the row filed is **upstream's, faithfully ported**.
+
+**And this edition adds a third failure mode, which is the sharpest thing in it: a closure validated
+against the wrong signal.** `TOOL-042` was closed on a static fd-inheritance argument plus two pins.
+The argument was correct and the pins closed a real class — the LEAK rate fell from ~12% to ~1.0%.
+**But the failure did not stop**, and the one occurrence that was instrumented cannot be explained by
+inherited handles at all: it names a test driving an **in-memory** `RecordingProc` whose only possible
+child names all three stdio handles and is reaped. **A tripwire's RED was read as naming its own
+cause.** Sweep 6's own caveat set the falsification condition — *"If a LEAK still appears the
+fd-inheritance theory is wrong"* — and sweep 8 ran the 286 runs and met it. **That caveat is why this
+row could be reopened at all. Write the falsification condition into every closure that rests on an
+argument rather than an observation.**
+
+## The dropped-delegation class — now three instances, and the invariant is wider than anyone wrote
+
+**This is the highest-value finding of sweep 8 and it produced a live behaviour defect.** pi composes
+by **object spread** — `return { ...provider, getModels, refreshModels }`
+(`core/remote-catalog-provider.ts:52-54` @v0.83.0) — so every member of the interface survives **by
+construction**. Rust has no spread, so a hand-written delegating impl silently drops any method it
+forgets, **and the drop is invisible precisely because the trait default is a plausible answer**:
+`name`→id, `base_url`/`headers`→`None`, `filter_models`→identity, `render_kind`→`Default`,
+`constrained_sampling`→`None`, `read_stream`→a `Cursor` over the whole file,
+`detect_image_mime`→extension-based.
+
+| # | site | trait | found by | consequence |
+|---|---|---|---|---|
+| 1 | `RegisteredTool` (`cyrup-ext/src/wrapper.rs`) | `Tool` | `TOOL-024` | 9 of 11 assertions vacuous |
+| 2 | `WasmTool` (`cyrup-ext/src/host/live.rs`) | `Tool` | `EXT-M03` *(row filed retroactively this edition — it was cited in source and existed nowhere in the backlog)* | a guest's declared `label` crossed the whole ABI **write-only**; a native tool could express one, a WASM guest could not |
+| 3 | **`RemoteCatalogProvider` + `ConfigProvider`** (`cyrup-provider`) | **`Provider`** — the first NON-`Tool` trait | **`PROV-M01`, sweep 8** | **LIVE:** `github-copilot` is the one built-in installing a `filter_models`, and `all_providers_with_overlay` maps every built-in through `CatalogOverlay::apply` — so `Models::get_available` got the identity default and **offered all 29 Copilot models regardless of what the OAuth credential entitled.** Proven by running the new test against the pre-fix code: 29 ids, not 1. |
+
+**The invariant is not "audit `Tool` impls".** It is: **every hand-written same-trait decorator, every
+defaulted method, and a fixture value that CONTRADICTS the default — ideally in both directions.**
+`TOOL-M01` is that rule applied: both `FsOps` decorators forwarded `detect_image_mime` correctly, but
+nothing could see it, so the probe now reports `Some(Png)` for a `.txt` path *and* `None` for a
+`.png` path.
+
+**Sweep 8 also published the complete enumeration of same-trait decorators in areas 01-07 and 11-12,
+so the next sweep does not re-derive it:** `RegisteredTool`/`Tool` (13/13, pinned);
+`WasmTool`/`Tool` (complete, source-level-pinned at `host/live.rs:2323`); `ProtectedFs`/`FsOps` and
+`TraversalFs`/`FsOps` (8/8, both defaults now pinned); `OverlayEnvContext`/`AuthContext` (the trait
+has 2 methods and **no defaults**, so it is structurally immune); `RemoteCatalogProvider` and
+`ConfigProvider`/`Provider` (fixed this pass). **Checked and dismissed as not decorators despite
+matching the `impl Trait for Wrapper` grep:** `RecordingServices`/`HostServices` (records into its own
+state, no inner), `DeferredSandbox`/`OsSandbox` (no inner), `NativeHandle`/`Extension` (adapts a
+*different* trait, so the compiler catches omissions).
+
+## JS→Rust mechanism gaps found in sweeps 7-8 — nine more, and one of them was in a BRIEF
+
+These are appended to the register further down this file, which now stands at its original entries
+plus these.
+
+1. **A budget the child is told about and nobody enforces.** `SUBA-008`'s own `Fix` line instructed
+   *"port as `exec/turn_budget.rs` mirroring `exec/tool_budget.rs`'s env-handoff shape"*. The tool
+   budget is env-var + **child-side refusal** (`PI_SUBAGENT_TOOL_BUDGET`). **The turn budget is the
+   opposite shape** — `git grep -n TURN_BUDGET v0.43.0 -- src/` matches only `turn-budget.ts` itself;
+   there is no env var and no child-side enforcement. The child is only **told**, via a system-prompt
+   block; the **supervisor** enforces by counting assistant `message_end` events off the child's
+   NDJSON stdout (`foreground/execution.ts:910-924`). **A faithful-looking env-shaped port would have
+   advertised a budget nothing enforced.**
+2. **`setTimeout` + keep reading vs. a `terminate` that CONSUMES the child.** pi arms two timers
+   inside `requestTurnBudgetAbort` and keeps reading stdout during the window, so a child that wraps
+   up inside it still delivers output. cyrup's `SpawnedChild::terminate` takes the child; there is no
+   signal-without-taking seam. Recorded as an explicit `[CYRUP-DELTA]` at the call site rather than
+   silently matching the observable outcome, **because a late final message is dropped here where
+   upstream would have read it**. The graces reproduce upstream's **absolute instants** — SIGINT,
+   SIGTERM at +1 s, SIGKILL at +4 s — since pi arms both timers from the same moment: **the real
+   SIGTERM→SIGKILL gap is 3 s, not 4 s, and reading `execution.ts:752` alone gives the wrong number.**
+3. **A JS DEFAULTED parameter fed its own previous value.** `terminationDeferredAtTurn = turnCount`
+   (`execution.ts:773-777`). A naive Rust port taking `u64` renumbers the deferral point on every
+   later deferral; the port takes `Option<u64>` + `unwrap_or(turn_count)`, and a test pins that a
+   second deferral still names the FIRST turn.
+4. **Two fields that look like synonyms and differ exactly when the feature matters.**
+   `wrapUpRequestedAtTurn` is upstream's literal `budget.maxTurns` (the THRESHOLD); `exceededAtTurn`
+   is the OBSERVED `turnCount`. Equal in the common case, different whenever a grace turn is
+   configured — **precisely the case the feature exists for.** Both tests assert they differ (2 vs 3).
+5. **A stale reassurance in a comment is a defect the moment the thing it reassures about changes.**
+   `tui/intercom.rs:348-352` justified a hard-coded `false` with two claims, and the turn-budget
+   landing falsified **both**: "a turn-budget stop is not signal-killed in this port" (it is now) and
+   "`false` can only WIDEN `isUnexplainedProcessSignal`, never narrow it" (**widening is the bug** — a
+   deliberate budget kill has `process_signal: Some` and a non-zero exit, so `false` routed it down
+   the unexplained-signal branch and reported `stopped` rather than a budget abort).
+6. **A correct consumer starved of a value is a different and quieter failure than a consumer reading
+   a constant.** `is_retryable_subagent_startup_failure` was **already** reading
+   `evidence.turn_budget_exceeded` correctly (`exec/fallback.rs:915`); it just had no producer — so
+   the ladder would have **relaunched the very model that blew its turn budget.** The item counted it
+   as one of three consumers "reading a hard-coded `false`". It was not.
+7. **`Entry::Warning` renders verbatim, so `Warning: ` is a per-caller obligation** (`TUI-062`).
+   Demonstrated concretely this pass: an injected double prefix left the **producer's** own unit test
+   green and **only the rendered assertion caught it.** A string-level test on the producer side
+   cannot see a renderer that re-prefixes, truncates or drops the line.
+8. **Assert presence before absence — twice, and both would have been vacuous tests.** (a) The first
+   draft of the turn-budget system-prompt test asserted on the **argv**; `SUBA-030` had moved the
+   persona off the command line into a spilled `0600` file, so it would have passed whatever the file
+   contained. (b) The existing `message_end_line` fixture helper sets `stopReason: "stop"`, which
+   makes every turn a **terminal** assistant stop — and `turnBudgetDecision` returns `continue` for a
+   terminal stop **however far past the hard limit** (`turn-budget.ts:94`). **An enforcement test
+   built on that helper can never abort.** A separate `working_message_end_line` with
+   `stopReason: "toolUse"` was added, and its doc comment says why.
+9. **A live-fixture null run reads as a product bug.** Planting `hooks/` at `$HOME/.cyrup/hooks`
+   collects zero warnings because the agent dir is `$HOME/.cyrup/agent`
+   (`cyrup-config/src/env.rs:178`). The `CFG-049` agent's first run **looked exactly like "the
+   keypress gate was dropped"**. **Any live row whose fixture plants files under a resolved directory
+   must assert PRESENCE — that the effect fires — before it is allowed to report ABSENCE.**
+
+## ORCHESTRATION — what sweeps 7-8 confirmed, and the one new rule
+
+**The second edition's finding held and should be treated as settled: per-crate partitioning stalled
+at sweep 4 (15 items); repartitioning by FEATURE unblocked it (sweep 5 landed 5 of 5, sweep 6 ~15).**
+Sweep 8 kept the feature shape and it worked again — its tail-a agent held five crates and landed
+`SUBA-008` end to end including two `cyrup-it` tests, which no per-crate agent could have done
+because the change touches `cyrup-ext-subagents` *and* 15 `cyrup-it` fixture files.
+
+**THE NEW RULE, and it cost this edition a correction of its own: TREAT THE BRIEF AS A LEAD.** Two of
+sweep 8's three agents found a load-bearing error **in their own assignment text**, not in the code:
+
+- `SUBA-008`'s `Fix` line prescribed the wrong mechanism (register entry 1 above). An agent following
+  it faithfully ships a non-functioning feature and reports success.
+- **A pi citation in the orchestrator's own brief was FABRICATED**, and an agent caught it by opening
+  the file. That is the same class as the three fabricated citations the second edition recorded
+  inside items — **it is not confined to the area files.**
+- Sweep 6 had already refuted `PROV-030` rather than rewriting it, on the ground that the area file
+  said it was done and the code agreed.
+
+**So: no brief, no item and no ledger line — including this one — is evidence until the file is
+open.** `already-done` is a first-class outcome and must be reported with the evidence that closed it.
+
+**Three fix sites in the area files are recorded WRONG in the same way, and each would have produced
+a no-op or a half-landed fix.** All three name `crates/cyrup-tui` (± `cyrup-core`) and all three need
+a **producer in `crates/cyrup-session-svc`** that does not exist:
+
+| row | what the TUI cannot reach | what must be added first |
+|---|---|---|
+| `EXT-013` (*"NOW A ONE-LINER"*) | `has_arg_completion` at `cyrup-tui/src/commands.rs:358` | `AgentSession::slash_command_catalog()` emits only name/description/source/sourceInfo (`session.rs:2504-2514`) — **no arg-completion signal arrives** |
+| `TOOL-022` / `TOOL-015` / `EXT-024` | any branch on `render_kind` | **there is no tool-metadata channel at all** — `ToolRun` (`transcript.rs:701-720`) holds only `name: String`; no `tool_info`/`tool_catalog`/`set_tools` accessor exists on `App` |
+| `PROV-036` | the per-model cost breakdown | the consumer is `SessionStats::from_entries` in `cyrup-session-svc/src/state.rs`, rendered at `app.rs:4778-4804` |
+
+**`SEAM-020` is a fourth of the same shape but fails differently: its recorded residual — "one line at
+`main.rs:215`" — is a TYPE ERROR.** `render_help` takes cyrup's *parsed argv* `ExtensionFlag`; pi's
+`printHelp` takes flag **declarations** carrying `type`/`description`/`extensionPath`
+(`cli/args.ts:212-222` @v0.83.0). And the renderer is already lossy: `cli.rs:900-910` drops the whole
+description column that upstream emits via `.padEnd(30)`. **Three parts, two crates, and a live
+terminal.**
+
+**Route sweep 9 by FIX SITE, and the specific pairings that must go to one agent:**
+`SEAM-015` **+** `DRIFT-004` (both need the same `BashOperations` trait in `crates/cyrup-tools`);
+`SEAM-S03` (the `cyrup-tools` half only); `EXT-013` **+** `TOOL-022`/`TOOL-015`/`EXT-024` **+**
+`PROV-036` (all three need `cyrup-session-svc` + `cyrup-tui`, so one owner closes five rows);
+`SEAM-048` → `cyrup-ext/src/facade.rs`; `SEAM-073` half (a) → `cyrup-config/src/lock.rs`, half (b)
+**must be re-scoped away from `cyrup-session-svc` before anyone hunts there.**
+
+**Six rows are NOT agent work and must stop being scheduled as such.** `SEAM-057` (declined by three
+sweeps — deleting `--json`/`--rpc`/`--output-format` breaks `cyrup-it`'s `--rpc` fixture);
+`SUBA-025` (declined by two — requires **authoring model-facing text**, because upstream's
+FULL/COMPACT/SAFETY constants are written around `workflowScript`, which cyrup deliberately does not
+implement); `SUBA-055`'s guide action (same hazard — requires authoring a `resources/docs/` set; and
+**`SUBA-066` is its last mile, not an independent item**); `SUBA-054`'s async half (needs a decision
+on which cwd an async single step's read instruction resolves against, or it double-emits);
+`PERM-032` (needs a live provider call this environment cannot safely make —
+`TOGETHER_API_KEY`/`TOGETHER_AI_API_KEY` are exported here — **and its request-body diff must be
+re-baselined against the current block shape, since `HookOutcome::Block` gained a `terminate` field
+via `EXT-049` after it was filed**); and `CFG-049`'s `MIGRATION_GUIDE_URL`/`EXTENSIONS_DOC_URL`
+rebrand, which still points cyrup users at `github.com/earendil-works/pi-mono` and is **visible
+verbatim in a live transcript**.
+
+**Two operational hazards recorded because they will recur.** (a) **Ambient credentials must be
+scrubbed when spawning the binary.** `TOGETHER_API_KEY`, `TOGETHER_AI_API_KEY`, `CYRUP_INTERCOM`,
+`CYRUP_SUBAGENTS`, `CYRUP_PERMISSION_SYSTEM` and `GITHUB_TOKEN` are exported on this machine; the
+integration suite has **guard tests that FAIL when they leak in**, and seven "failures" in one run
+were those guards doing their job. (b) **A concurrent agent's red crate blocks `cargo clippy` for
+everyone downstream.** Sweep 8's tail-a agent could not lint its own crate because
+`crates/cyrup-provider` was mid-edit and clippy-RED, which aborts the dependency graph before
+`cyrup-ext-subagents` is linted — `--keep-going` does not get past it. `cargo check --all-targets`
+was clean and both nextest gates green, but **the clippy gate on that change is UNVERIFIED and should
+be re-run centrally.**
+
+## Test architecture and the gates — current numbers
+
+- **310 integration binaries → 6 + 8 gated**, behind the `cyrup-it` harness crate (`63d729a` /
+  `c3982b5` / `d973906`). **Every `crates/<crate>/tests/<x>.rs` citation in this directory is stale
+  unless it names `cyrup-it`.**
+- **Unit gate: `cargo nextest run --workspace` = 6740 tests in 17.9 s** (was 6699 in 16.3 s at the
+  second edition; 6440, 6387 and 3932 are older still).
+- **Integration gate: `cargo nextest run -p cyrup-it --features it` = 473 tests in 92 s.** This is
+  new information for `ICOM-053`: the harness **does** run, as a second gate. What `ICOM-053` still
+  names is that the 17.9 s merge gate does not invoke it, so a breakage inside `cyrup-it` lands
+  silently — which is why `EXT-025` still cannot be closed by deleting its dead methods without one
+  agent owning `cyrup-ext` + `cyrup-session-svc` + `cyrup-it` in a single commit.
+- **The integration suite carries guard tests that FAIL when ambient credentials leak in.** Scrub the
+  environment before running it; the suite is 473/473 once scrubbed.
+- **`.config/nextest.toml`'s 500 ms `leak-timeout` was deliberately NOT raised** while investigating
+  `TOOL-042`. Raising it would hide the signal and is the user's call.
+
+---
+
 # RECONCILED 2026-08-14 (second edition) — six sweeps applied, every count re-derived from the twelve area tables
 
 > **cyrup HEAD `bdcb0d0`** (was `380c713` when the first edition below was written), branch
@@ -47,7 +322,7 @@ separate `## Trackers` tables.
 
 **Eight rows are new since the first edition, and FOUR of them were filed AND closed in the same
 pass** — which is what a *hunting* sweep produces when it finds a defect the backlog never named:
-`TOOL-042` (the nextest `LEAK`, root-caused, area 04), `EXT-M01` and `EXT-M02` (two JS→Rust mechanism
+~~`TOOL-042` (the nextest `LEAK`, root-caused, area 04)~~ — **CORRECTED (third edition): `TOOL-042` was filed, LARGELY fixed, and its residual REOPENED by measurement in sweep 8. It is not one of the four same-pass wins; three of the four are.** — `EXT-M01` and `EXT-M02` (two JS→Rust mechanism
 gaps, area 06) and `PERM-033` (16 unported forwarding audit sites, area 10). One more was filed and
 **partially** closed: `TUI-062` (area 07, still counted open). Three were filed open: `CFG-052`
 (`github:` shorthand), `CFG-053` (test debt re-filed out of `CFG-006`) and `ICOM-053` (re-filed out
@@ -513,12 +788,34 @@ a spawn for what it SETS can never catch this; only a rule about what it must no
 `.output()` is safe (it overrides all three); **`.status()` is NOT** — any future lint that exempts
 "terminal builder methods" as a class re-opens the leak through `.status()`.
 
+> **AMENDED, third edition — this entry is CORRECT and INSUFFICIENT, and the distinction is the
+> lesson.** The rule it states closed a real class: 286 measured runs put the LEAK rate at ~1.0%,
+> down from ~4 in 33 (~12%). **But the failure still fires**, and the one occurrence that was
+> instrumented cannot be an inherited handle: it names a test driving an in-memory `RecordingProc`
+> whose only possible child (`which bash`) names all three handles and is reaped, and over 80
+> sampled runs **no orphan was ever seen holding a harness pipe** (69 orphan pipe addresses vs 244
+> harness pipe addresses, zero intersection). **The generalisable form: a LEAK-FAIL is not proof of
+> an inherited handle. A tripwire's RED does not name its own cause, and a fix validated against the
+> wrong signal looks exactly like a fix.** See `TOOL-042` in `04-cyrup-tools.md`.
+
 **T. Two functions ported from two different upstream files can leave a value classified by neither.**
 
 `is_local_path` (from `paths.ts:41-55`) treats `github:user/repo` as **non-local**, while
 `parse_git_url` (from `git.ts`) rejects it because the prefix is not `git:` and the scheme is not
 https/http/ssh/git — so the source is simultaneously "not a local path" and stored as one.
-Upstream's `parseGitUrl` reaches `hostedGitInfo.fromUrl`, which resolves the shorthands. (`CFG-052`.)
+~~Upstream's `parseGitUrl` reaches `hostedGitInfo.fromUrl`, which resolves the shorthands.~~ (`CFG-052`.)
+
+> **STRUCK, third edition — this entry's premise about upstream is FALSE and the entry is withdrawn
+> as a mechanism gap.** `parseGitUrl` opens with
+> `if (!hasGitPrefix && !/^(https?|ssh|git):\/\//i.test(url)) return null;` (`utils/git.ts:172-179`
+> @v0.83.0) and its own doc comment says verbatim *"Without git: prefix, only accept explicit
+> protocol URLs"* (`:165-171`), so **upstream returns null before ever reaching `fromUrl`** and its
+> `parseSource` stores the shorthand through the final local arm (`package-manager.ts:1459`).
+> **The "two files whose domains no longer meet" condition is UPSTREAM's, and cyrup ports it
+> faithfully.** The *shape* of the observation — two functions ported from two different upstream
+> files can leave a value classified by neither — remains a real hazard worth watching for; it just
+> has no instance here. `CFG-052` is closed as REFUTED. **This is the third edition's clearest
+> reminder that a citation is only as good as the frame you opened.**
 
 ## Structural defect J — the merge gate does not cover the `cyrup-it` harness
 

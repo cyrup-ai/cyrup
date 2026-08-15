@@ -2400,6 +2400,9 @@ mod tests {
         }
         fn child(exit_code: i32, stopped: bool) -> crate::exec::SingleResult {
             crate::exec::SingleResult {
+                turn_budget: None,
+                turn_budget_exceeded: false,
+                wrap_up_requested: false,
                 agent: "worker".to_string(),
                 task: String::new(),
                 exit_code,
@@ -3152,6 +3155,9 @@ mod tests {
 
     fn imported_child(agent: &str, output: Option<&str>, exit_code: i32, error: Option<&str>) -> SingleResult {
         SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: agent.to_string(),
             task: String::new(),
             exit_code,

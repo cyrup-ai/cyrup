@@ -124,6 +124,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        turn_budget: None,
+        enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,

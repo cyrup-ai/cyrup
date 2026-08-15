@@ -153,6 +153,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        turn_budget: None,
+        enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,
@@ -617,6 +619,7 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run dir");
 
     let config = RunnerConfig {
+        turn_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
         share: None,

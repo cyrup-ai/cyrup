@@ -2193,6 +2193,7 @@ mod tests {
 
     fn capability_agent(tools: Option<Vec<crate::discovery::types::ToolRef>>) -> AgentDefinition {
         AgentDefinition {
+            default_turn_budget: None,
             name: "cap".to_string(),
             local_name: "cap".to_string(),
             package_name: None,

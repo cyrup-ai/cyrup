@@ -147,28 +147,33 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 
 > **RECOUNTED 2026-08-14 (sweeps 3-6 reconciliation) — counted set: 0 critical, 0 high, 1 medium, 4 low = 5.** 25 rows are now marked CLOSED (`TOOL-016` closed by sweep 6 under `PROV-011`; `TOOL-042` filed and closed in sweep 6). The `-S` table below remains fully closed. *(Previous edition: 0 / 0 / 1 / 5 = 6, 23 closed.)*
 
+> **RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set: 0 critical, 0 high, 2 medium, 3 low = 5, unchanged in total but NOT in composition.** The table now carries **31 rows: 26 fully closed, 5 open (2 of them partially closed, including the reopened `TOOL-042`)**. Sweep 8: **`TOOL-024` closes as already-done** (all 13 `Tool` methods delegated at HEAD; its stated evidence was itself wrong — see the row); **`TOOL-042` is REOPENED as PARTIALLY CLOSED (medium)** after 286 measured runs refuted the mechanism its closure rested on; and **`TOOL-M01` is filed and closed in the same pass** (the `FsOps` decorator audit's one real residual). `TOOL-022`/`TOOL-015`'s fix site is corrected below — it was incomplete in a way that would have produced a no-op fix. *(Previous edition: 0 / 0 / 1 / 4 = 5, 26 closed.)*
+
 > **⚠ PARTITIONING NOTE — 2026-08-14 (sweep 6). AREA 04 IS FINISHED AS A CRATE: after sweep 6 re-verified every remaining row at HEAD, NOT ONE open row has a fix site inside `crates/cyrup-tools/**`.** `TOOL-015` and `TOOL-022` need a **consumer** in `crates/cyrup-tui` (plus `cyrup-core`); `TOOL-017` needs `crates/cyrup-tui` **and a product decision** (cyrup has no decided shipped-docs root for `getPiDocsClassification` to resolve against — the blocker is recorded in-source at `cyrup-tui/src/transcript.rs:2305`); `TOOL-024`'s two fix sites are both `crates/cyrup-ext/src/wrapper.rs`; `TOOL-031`'s residual is `crates/cyrup-ext-subagents/**`. Every row below now names its fix site. **Do not schedule a "finish area 04" assignment against `crates/cyrup-tools`** — sweep 6 was the second sweep to be routed at a `cyrup-ext` defect from this table, and it produced an agent with no reachable work in its own crate. Route these rows by FIX SITE, not by area number.
+
+> **AMENDED 2026-08-14 (sweep 8): the "not one open row has a fix site inside `crates/cyrup-tools/**`" claim now has exactly one exception — `TOOL-042`, reopened.** Its residual is a harness-level question about `cargo nextest`'s 500 ms leak tripwire and, secondarily, `crates/cyrup-tools`' own `exec`/`exec_argv` fixtures (`ops/local.rs:1135`, `:1568`, `:1812`). Everything else in the partitioning note stands.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
+| ~~TOOL-M01~~ | ~~low~~ **FILED AND CLOSED 2026-08-14** | test-defect | S | Both `FsOps` decorators forwarded `detect_image_mime` but no test could see it — deleting either forward was silent — **FILED AND CLOSED 2026-08-14**: sweep 8, the one real residual of the assigned `FsOps` decorator audit. See the body below. |
 | ~~TOOL-039~~ | ~~**high**~~ **CLOSED 2026-08-14** | cyrup-original | S | `CYRUP_SHELL` silently redirects every `bash` call to an arbitrary interpreter; pi has no shell env var *(ships with TOOL-007)* — **CLOSED 2026-08-14**: sweep 1 — the area's only `high` was stale. The ADR-0003 bash-surface landing deleted the `CYRUP_SHELL` arm entirely (option (i), the item's own default recommendation); `grep -rn CYRUP_SHELL crates/` now returns only the regression test `crates/cyrup-tools/tests/shell_interpreter.rs`. This also invalidates handoff (g) — TOOL-007/-038/-039 were one shell-surface decision and it has been taken. |
 | ~~TOOL-006~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `write`/`edit` declare `Sequential`, serializing the whole batch — **CLOSED 2026-08-14**: sweep 1 — both `execution_mode` overrides deleted; pinned by `mutators_do_not_declare_sequential_execution` in the new `src/tests/pi_tool_semantics.rs`. The item's second Verify limb (an agent-level test that one edit + two reads yields `sequential == false`) is NOT done and belongs to whoever owns crates/cyrup-agent. |
 | ~~TOOL-007~~ | ~~medium~~ **CLOSED 2026-08-14** | cyrup-original | M | Protected-path write block is on by default, has no pi analog, and `bash` bypasses it *(ships with TOOL-039)* — **CLOSED 2026-08-14**: sweep 1 — `builder.rs:239` now sets `protect_paths: false` (the item cites `:208` = true) and `isolation/mod.rs:11-17` is rewritten to match the wiring. All three cited facts were stale. |
 | ~~TOOL-019~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | File-mutation-lock key is computed by a blocking canonicalize inside `guard()` (residual only) — **CLOSED 2026-08-14**: sweep 1 — closed together (one fix, as both items state). `key` is async over `tokio::fs::canonicalize` with pi's narrow ENOENT/ENOTDIR catch; the ENOTDIR half required a raw-errno match (`libc::ENOTDIR`) because stable Rust exposes no `ErrorKind` for it. Handoff (d) discharged. |
 | ~~TOOL-020~~ | ~~medium~~ **CLOSED 2026-08-14** | test-defect | M | Forced-SIGKILL drain test asserts scheduling and shell-buffering outcomes — **CLOSED 2026-08-14**: sweep 1 — both defective assertions are gone: the run window is 250 ms decoupled from the 15 ms kill grace, and the shell-flush claim is REFUTED in-source and independently re-verified (`exec_argv` runs the argv it is handed, so `ShellConfig::detect()` is not consulted on this path at all). |
 | ~~TOOL-021~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `Tool::prompt_guidelines` returns `&[&str]`, so guest tools lose their guidelines — **CLOSED 2026-08-14**: sweep 2 (area 06, via the EXT-007 refutation) — the blocker is gone: `Tool::prompt_guidelines` returns `Vec<&str>` (`crates/cyrup-core/src/tool.rs:130`), `ToolDescriptor.prompt_guidelines: Vec<String>` exists (`cyrup-ext/src/registry.rs:27`), and `impl Tool for WasmTool` overrides it (`cyrup-ext/src/host/live.rs:1690`) with an in-source note recording that TOOL-021/EXT-007 unblocked it. Consumed by EXT-038's `promptGuidelines` half. The one remaining producer gap is EXT-007's, not this item's. |
-| TOOL-022 | medium | not-ported | L | `renderShell`, `prepareArguments` and `label` never reach a guest tool's behavior — **FIX SITE: `crates/cyrup-tui/**` + `crates/cyrup-core`, NOT `crates/cyrup-tools`.** **2026-08-14, sweep 6 — re-verified: the PRODUCER half is done** (`WasmTool` overrides `render_kind`/`prompt_guidelines`/`prepare_arguments` at `cyrup-ext/src/host/live.rs:1774-1808`, and `cyrup-ext/src/wrapper.rs:110` delegates `render_kind`). What is missing is a CONSUMER: `grep -rn 'render_kind' crates` shows **zero** sites in `cyrup-tui` that branch on the value. Needs one agent owning cyrup-tui + cyrup-core to wire the transcript's per-tool render dispatch to `Tool::render_kind()` so `SelfRendered` suppresses the generic frame. |
+| TOOL-022 | medium | not-ported | L | `renderShell`, `prepareArguments` and `label` never reach a guest tool's behavior — **FIX SITE: `crates/cyrup-tui/**` + `crates/cyrup-core`, NOT `crates/cyrup-tools`.** **2026-08-14, sweep 6 — re-verified: the PRODUCER half is done** (`WasmTool` overrides `render_kind`/`prompt_guidelines`/`prepare_arguments` at `cyrup-ext/src/host/live.rs:1774-1808`, and `cyrup-ext/src/wrapper.rs:110` delegates `render_kind`). What is missing is a CONSUMER: `grep -rn 'render_kind' crates` shows **zero** sites in `cyrup-tui` that branch on the value. ~~Needs one agent owning cyrup-tui + cyrup-core~~ **CORRECTED 2026-08-14 (sweep 8): needs `cyrup-session-svc` TOO — `ToolRun` carries only `name: String` and no `tool_info`/`tool_catalog`/`set_tools` accessor exists on `App`, so there is nothing for a TUI branch to read.** See the correction block under the body. |
 | ~~TOOL-023~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `find` walks the whole tree then sorts and truncates; pi passes `--max-results` — **CLOSED 2026-08-14**: sweep 1 — option (i) chosen (bounded walk, sort DELETED), landed with TOOL-033, discharging handoff (e). Citations corrected: the empty-result check is find.ts:311 (not :172/:297) and `--max-results` is :252. |
 | ~~TOOL-033~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `grep` walks the whole tree before searching; `limit` bounds neither cost nor selection — **CLOSED 2026-08-14**: sweep 1 — walk and search fused; sort deleted. Citations corrected to the re-derived v0.84.1 offsets: the early-return guard is grep.ts:278 (the item implies :288) and the limit block is :292-295 (the item says :288-295). |
 | ~~TOOL-034~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | M | `grep` materializes every candidate file in memory, twice on the context path — **CLOSED 2026-08-14**: sweep 1 — the seam gained `FsOps::read_stream` with a whole-read default (decorators untouched) and a real-`File` override on `LocalFs`; grep drives `search_reader` from `spawn_blocking`. The item's premise that the FsOps seam "offers no alternative" is now false. The context-path re-read was NOT changed and needed no change. |
 | ~~TOOL-038~~ | ~~medium~~ **CLOSED 2026-08-14** | cyrup-original | S | On Windows with no bash, `bash` silently falls back to `cmd.exe /C`; pi refuses to run — **CLOSED 2026-08-14**: sweep 1 — `ops/shell.rs` `try_detect()`'s Windows arm is pi's verbatim `No bash shell found.` throw with the searched-paths list; no `cmd.exe` arm exists. `detect()` survives only as the infallible `Default` path, degrading to `bash -c` with a `[CYRUP-DELTA]`. |
 | ~~TOOL-011~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `find` path-globs match the relative path; pi/fd match the absolute path — **CLOSED 2026-08-14**: sweep 1 — and FIX THE ITEM'S VERIFY rather than copying it forward: "assert `/src/**/*.ts` returns the same set as `src/**/*.ts`" is wrong about fd, which compares the ABSOLUTE candidate path, so a leading-slash pattern anchors at the filesystem root and matches nothing under a tmp repo. The genuine divergence is case (a) — a pattern naming an ancestor above the search root — and that is what the landed test pins. The confidence-medium caveat (fd not vendored) still applies. |
 | ~~TOOL-014~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `edit`'s access-failure body diverges from pi's `Error code: <ERRNO>` — **CLOSED 2026-08-14**: sweep 1 — the errno mapping exists in `error.rs` (`errno_name`/`io_errno`/`errno_code_of`) and is consumed by `ops/local.rs`'s `access` AND `read_dir`, so TOOL-029 reuses it as the item anticipated. The factually-wrong comment at `edit.rs` is deleted. |
-| TOOL-015 | low | not-ported | M | `edit` does not declare `renderShell: "self"`; nothing reads `render_kind` (residual only) — **FIX SITE: `crates/cyrup-tui/**` + `crates/cyrup-core`, NOT `crates/cyrup-tools`.** **2026-08-14, still open**: sweep 1 — kept open as a pure TOOL-022 residual; the built-in half is done (`EditTool::render_kind()` returns `SelfRendered` at `cyrup-tools/src/tools/edit.rs:131-132`, pinned at `src/tests/pi_tool_semantics.rs:66-78`). Sweep 6 re-verified: what remains is only "give the value a consumer" (cluster C5), and `grep -rn 'render_kind' crates` still shows zero branching sites in cyrup-tui. |
+| TOOL-015 | low | not-ported | M | `edit` does not declare `renderShell: "self"`; nothing reads `render_kind` (residual only) — **FIX SITE: `crates/cyrup-tui/**` + `crates/cyrup-core`, NOT `crates/cyrup-tools`.** **2026-08-14, still open**: sweep 1 — kept open as a pure TOOL-022 residual; the built-in half is done (`EditTool::render_kind()` returns `SelfRendered` at `cyrup-tools/src/tools/edit.rs:131-132`, pinned at `src/tests/pi_tool_semantics.rs:66-78`). Sweep 6 re-verified: what remains is only "give the value a consumer" (cluster C5), and `grep -rn 'render_kind' crates` still shows zero branching sites in cyrup-tui. **FIX SITE CORRECTED 2026-08-14 (sweep 8): `cyrup-tui` + `cyrup-core` is NOT sufficient — `cyrup-tui` has no tool-metadata channel at all, so a producer must be added in `crates/cyrup-session-svc` in the same commit. See the correction block under TOOL-022.** |
 | ~~TOOL-016~~ | ~~low~~ **CLOSED 2026-08-14** | upstream-drift | M | `constrainedSampling` has no representation in cyrup's tool model — **CLOSED 2026-08-14**: sweep 6 — **closed under `PROV-011`, not under this row, which is why no tools pass noticed.** `cyrup_core::Tool::constrained_sampling()` is on the vtable (`cyrup-core/src/tool.rs:156`, type in `cyrup-core/src/constrained_sampling.rs`), the WIT `tool-descriptor` carries `constrained-sampling`, and `cyrup-agent/src/agent.rs:829` copies it onto the runtime tool; pinned end-to-end by `cyrup-agent/src/tests/agent_loop.rs::prov011_a_tools_constrained_sampling_declaration_reaches_the_provider`. **Do not add opt-ins to cyrup-tools' built-ins**: no pi built-in declares `constrainedSampling` (three grep hits at v0.83.0, all in `extensions/types.ts:463` and `tool-definition-wrapper.ts:14`/`:42`), so that would be a divergence *from* pi. |
 | TOOL-017 | low | not-ported | M | `read`'s compact `docs` classification arm is unported (residual only) — **FIX SITE: `crates/cyrup-tui/**`, and it needs a PRODUCT DECISION first.** **2026-08-14, sweep 6 — re-verified still open**: `cyrup-tui/src/transcript.rs:2305` documents the missing arm in-source and names the blocker precisely — cyrup has no decided shipped-docs root for `getPiDocsClassification` to resolve against. Once that root is decided the arm is mechanical. |
 | ~~TOOL-018~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `edit` fuzzy matcher returns not-found where pi returns duplicate-occurrences — **CLOSED 2026-08-14**: sweep 1 — the CODE option was taken, not the documentation option: the divergence was not forced (Rust `str::find("")` is `Some(0)`, identical to JS), so a `[CYRUP-DELTA]` would have been an accepted-divergence in disguise. The one genuinely unobservable difference (empty content + empty needle: pi -1 vs cyrup 0) is documented in-source. |
-| TOOL-024 | low | test-defect | S | `every_surface_method_delegates` proves nothing for 9 of its 11 assertions — **FIX SITE: `crates/cyrup-ext/src/wrapper.rs`. RE-HOMED TO AREA 06 for routing (the ID stays here so it is neither renumbered nor double-counted; `06-cyrup-ext.md` carries a pointer row note).** **2026-08-14, still open**: sweep 2 re-routed it and sweep 6 re-verified at HEAD — both fix sites are `crates/cyrup-ext/src/wrapper.rs` (the `Fixed` double at `:229-230`, returning the same `SelfRendered` the real default returns, and `every_surface_method_delegates` at `:379-380`). It is not actionable from `crates/cyrup-tools/**` at all. **Sweep 6 also showed the item is not a one-off:** `constrained_sampling` was added to `cyrup_core::Tool` *after* TOOL-024's original nine were fixed and immediately reintroduced a tenth vacuous assertion (fixed under `PROV-011`). Fixing the fixture once does not immunise it — the "every fixture value is DISTINCT and non-default" invariant has to be re-established in the same commit as every new trait method. |
+| ~~TOOL-024~~ | ~~low~~ **CLOSED 2026-08-14 — already-done, and its own evidence was wrong** | test-defect | S | `every_surface_method_delegates` proves nothing for 9 of its 11 assertions — **CLOSED 2026-08-14**: sweep 8 re-read `crates/cyrup-ext/src/wrapper.rs` at HEAD rather than the row. All **13** `Tool` methods are delegated (`:88-158`: name, parameters, execution_mode, description, label, prompt_snippet, prompt_guidelines, render_kind, constrained_sampling, prepare_arguments, render_call, render_result, execute); the `Fixed` fixture (`:202-272`) carries a **distinct non-default for every one**, including a *mutating* `prepare_arguments` (an identity default would be indistinguishable from a dropped delegation); and `every_surface_method_delegates` (`:362`) asserts each against **both** the inner and a literal, with presence-before-absence on `constrained_sampling` (`assert!(inner.constrained_sampling().is_some(), "fixture must declare it")`). **CORRECTION TO THIS ROW, recorded because it is the kind of claim a later reader would trust:** the text below asserts the `Fixed` double at `:229-230` "returns the same `SelfRendered` the real default returns". **That is false** — `Tool::render_kind`'s trait default is `ToolRenderKind::Default` (`cyrup-core/src/tool.rs:137-139`), so the fixture's `SelfRendered` **is** distinct. The row's standing lesson survives its closure and is promoted to `PROV-M01`'s body: fixing the fixture once does not immunise it. **Superseded fix-site text follows.** — **FIX SITE: `crates/cyrup-ext/src/wrapper.rs`. RE-HOMED TO AREA 06 for routing (the ID stays here so it is neither renumbered nor double-counted; `06-cyrup-ext.md` carries a pointer row note).** **2026-08-14, still open**: sweep 2 re-routed it and sweep 6 re-verified at HEAD — both fix sites are `crates/cyrup-ext/src/wrapper.rs` (the `Fixed` double at `:229-230`, returning the same `SelfRendered` the real default returns, and `every_surface_method_delegates` at `:379-380`). It is not actionable from `crates/cyrup-tools/**` at all. **Sweep 6 also showed the item is not a one-off:** `constrained_sampling` was added to `cyrup_core::Tool` *after* TOOL-024's original nine were fixed and immediately reintroduced a tenth vacuous assertion (fixed under `PROV-011`). Fixing the fixture once does not immunise it — the "every fixture value is DISTINCT and non-default" invariant has to be re-established in the same commit as every new trait method. |
 | ~~TOOL-025~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | The mutation-lock concurrency test is probabilistic and misnamed (residual only) — **CLOSED 2026-08-14**: sweep 1 — renamed to `write_creates_dirs_and_holds_one_mutator_per_path` and made structural via a `MutexProbeFs` asserting max-concurrency 1 inside the guarded region — the exact "shared counter" fix the item specifies. |
 | ~~TOOL-026~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | `bash_timeout_fractional_seconds` asserts a wall-clock upper bound — **CLOSED 2026-08-14**: sweep 1 — the ceiling is `< 15s`, not the cited 4000 ms; the `>= 2300ms` lower bound and the message assertion are retained. |
 | ~~TOOL-029~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `ls` swallows pi's `Cannot read directory: <message>` — **CLOSED 2026-08-14**: sweep 1 — upstream citation corrected to ls.ts:147-152 (the item says :145/:150). |
@@ -180,7 +185,7 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 | ~~TOOL-037~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `output-guard`'s protocol-writer half (retry, serialized tail, flush) is unported — **CLOSED 2026-08-14**: sweep 1 — location corrected: the retrying writer is `crates/cyrup-modes/src/raw_stdout.rs`, not `crates/cyrup/src/output_guard.rs` (the consumers are the protocol writers and `cyrup` depends on `cyrup-modes`, not the reverse); `output_guard.rs` re-exports it. |
 | ~~TOOL-040~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `find_bash_on_path` runs `which bash` with no timeout; pi bounds it at 5s — **CLOSED 2026-08-14**: sweep 1 — `BASH_PROBE_TIMEOUT = 5s` (citing shell.ts:47) with a deadline-polled `try_wait()` loop that kills, reaps and returns `None` on expiry — pi's `sh -c` fall-through. |
 | ~~TOOL-041~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `write`/`edit` never re-check cancellation after the write lands — **CLOSED 2026-08-14**: sweep 1. |
-| ~~TOOL-042~~ | ~~medium~~ **FILED AND CLOSED 2026-08-14** | test-defect | S | The crate's own test fixture leaked a live child holding nextest's stderr pipe, so an unrelated test in the same crate was named `LEAK` at random (~4 runs in 33) — **FILED AND CLOSED 2026-08-14**: sweep 6 — root-caused, verified already repaired at HEAD by sweep 5 (`bdcb0d0`), and pinned so it cannot return. See the body below. |
+| TOOL-042 | medium — **REOPENED 2026-08-14; PARTIALLY CLOSED** | test-defect | M | An intermittent `LEAK` fails the `cyrup-tools` suite; the source-scan pin closed one real class but **not** the failure — **REOPENED 2026-08-14 (sweep 8), superseding sweep 6's "filed and closed … pinned so it cannot return".** Refuted by measurement, not by reading: **3 LEAK-FAILs in 286 scrubbed runs (~1.0%, down from the historical ~4 in 33 ≈ 12%), on three DIFFERENT tests**, one of them on an idle box. `fail-fast` CANCELS the run (`243 tests run: 242 passed, 1 failed`), so it is a hard gate red. **The stated mechanism is refuted for the instrumented occurrence**: it named `ops::bash_operations_tests::local_bash_operations_forwards_command_cwd_and_env_onto_the_proc_seam`, which drives `RecordingProc` — an in-memory double (`ops/mod.rs:605`) — and whose only possible child (`which bash`, `ops/shell.rs:78-84`) names all three stdio handles and is reaped in-loop, so **no candidate holder of that test process's fd 1/2 exists in its subtree**, and the wait ran the full 500 ms. Corroborating: 69 distinct orphan pipe addresses vs 244 sampled `cargo-nextest` pipe addresses — **zero intersection**. **KEEP the source-scan pin: it closed a real class.** RESIDUAL: a harness-level question. See the body. |
 
 ## TOOL-039 — `CYRUP_SHELL` silently redirects every `bash` tool call to an arbitrary interpreter; pi has no shell env var
 
@@ -355,6 +360,27 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 **Fix** — Add `render-shell: option<render-shell>` and `prepare-arguments: bool` to the WIT `tool-descriptor` record in BOTH copies (`f777e44` established that both must move together and that this breaks the guest ABI), mirror them onto `crates/cyrup-ext/src/registry.rs`, map them in `register_tool` (`live.rs:71-86`), then implement `render_kind` and `prepare_arguments` on `WasmTool` — the latter via a guest-side `prepare-arguments` export the host calls only when the flag is set. Add `fn label` and `fn prompt_guidelines` (TOOL-021) at the same time; these are one WIT bump, cluster **C5** in the residual ledger.
 
 **Verify** — A fixture guest tool whose `prepare_arguments` renames a key: assert the renamed key reaches `execute` and passes schema validation. A second declaring `renderShell: "self"`: assert no outer frame in the TUI. Note the ABI break — any component built against the old world must be rebuilt.
+
+> **FIX SITE CORRECTED 2026-08-14 (sweep 8) — applies to this row, to `TOOL-015`, and to `EXT-024`
+> in `06-cyrup-ext.md`. The recorded site "`crates/cyrup-tui/**` + `crates/cyrup-core`" is
+> INCOMPLETE, and landing only that half is a no-op.** Re-verified at HEAD:
+> `grep -rn 'render_kind|ToolRenderKind|SelfRendered' crates/cyrup-tui/src/` returns **zero**, exactly
+> as the rows say — but the reason is deeper than "nobody wrote the branch". **`cyrup-tui` has no
+> tool-metadata channel at all:** `ToolRun` (`cyrup-tui/src/transcript.rs:701-720`) holds only
+> `name: String`; there is no `tool_info` / `tool_catalog` / `set_tools` accessor anywhere on `App`;
+> and the extension-renderer siblings `rendered_call` / `rendered_result` are supplied **per call by
+> the caller**, not looked up. **A producer must publish a `name → ToolRenderKind` map from
+> `cyrup-session-svc` first.** A TUI-side branch with nothing to read would be the "declared surface
+> with no consumer" failure this directory repeatedly names. **Route to one agent owning
+> `cyrup-session-svc` + `cyrup-tui` + `cyrup-core`.**
+>
+> **And record pi's actual mechanism, which none of the three rows states:** `renderShell: "self"`
+> does not mean "the tool draws itself" in the abstract — `ToolExecutionComponent` resolves
+> `getRenderShell()` **at construction** and adds a bare `selfRenderContainer` instead of the framed
+> `contentBox` (`modes/interactive/components/tool-execution.ts:65-76` @v0.83.0), with three-way
+> precedence `toolDefinition.renderShell ?? builtInToolDefinition.renderShell ?? "default"` at
+> `:105-113`. The field is `core/extensions/types.ts:465`; the one built-in that declares it is
+> `core/tools/edit.ts:306`.
 
 ## TOOL-023 — `find` walks the whole tree then sorts and truncates; pi passes `--max-results` to fd
 
@@ -694,9 +720,86 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 
 **Verify** — Fire a `write` whose backing `FsOps` blocks inside `write_in_place` until the test cancels, then completes. Assert the tool returns the aborted error rather than a success, and assert the file on disk still contains the payload (pi's semantics: the write is not undone, only the result is reported as aborted).
 
-## TOOL-042 — A test fixture's unnamed stdio handles leaked nextest's pipe, producing an intermittent `LEAK` on an unrelated test — **FILED AND CLOSED 2026-08-14**
+## TOOL-M01 — Both `FsOps` decorators forwarded `detect_image_mime` but nothing could see it — **FILED AND CLOSED 2026-08-14**
 
-**Kind** test-defect · **Severity** medium · **Effort** S · **Confidence** confirmed (static; see the caveat) · **Filed and closed** 2026-08-14 (sweep 6)
+**Kind** test-defect · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed and closed** 2026-08-14 (sweep 8)
+
+**Provenance** — the one real residual of the `FsOps` half of sweep 8's assigned audit of hand-written
+delegating trait impls (the audit that produced `PROV-M01`). **Both decorators were already complete
+(8/8 methods) and well-documented**, and `read_stream` — the more dangerous of the trait's two
+defaulted methods — was already pinned by a distinct-value probe. This row is the other one.
+
+**cyrup** — `detect_image_mime` was forwarded by both decorators (`isolation/protected.rs:145-147`,
+`isolation/traversal.rs:123-125`) but had **no test**, so deleting either forward would have been
+silent. The trait default is extension-based (`cyrup-tools/src/ops/mod.rs:363-365`), which is a
+*plausible* answer for every fixture whose inner leaves it alone — the `PROV-M01` hazard exactly.
+
+**upstream** — pi's operation decorators are object literals (`{ ...ops, writeFile }`,
+`core/tools/write.ts:32-35` / `edit.ts:83-87` @v0.83.0), so the member survives by construction and
+upstream has no equivalent exposure. The existing `read_stream` test's doc block already cites this
+correctly.
+
+**Fix — LANDED.** Extended the existing `DistinctStreamFs` probe in
+`crates/cyrup-tools/src/tests/isolation.rs` with a `detect_image_mime` override that **contradicts the
+default in BOTH directions**: a `.txt` path (default `None`) reports `Some(Png)`, and a `.png` path
+(default `Some(Png)`) reports `None`.
+
+**Verify — DONE.**
+`fs_decorators_forward_detect_image_mime_instead_of_inheriting_the_extension_default` — presence
+before absence on the probe itself (it must disagree with the default in both directions before any
+decorator is asserted), then all three decorator configurations: `TraversalFs`, `ProtectedFs`, and the
+stacked composition.
+
+## TOOL-042 — An intermittent nextest `LEAK` fails the `cyrup-tools` suite — **REOPENED 2026-08-14 (sweep 8); PARTIALLY CLOSED**
+
+**Kind** test-defect · **Severity** medium · **Effort** M · **Confidence** confirmed by measurement · **Filed** 2026-08-14 (sweep 6, as closed) · **REOPENED** 2026-08-14 (sweep 8)
+
+> **READ THIS FIRST. Sweep 6's caveat below set its own falsification condition — "Confirming it
+> needs ~35 runs … If a LEAK still appears the fd-inheritance theory is wrong" — and sweep 8 ran the
+> experiment. The LEAK still appears.** 286 runs of `cargo nextest run -p cyrup-tools` with the
+> ambient env scrubbed, in five blocks:
+>
+> | block | shape | runs | LEAKs | named test |
+> |---|---|---:|---:|---|
+> | A | idle box, first after build | 1 | **1** | `tests::tools::bash_timeout_at_maximum_is_valid` |
+> | B | sequential, idle (the row's own ask) | 35 | 0 | — |
+> | C | 25 concurrent pairs | 50 | **1** | `ops::local::tests::terminate_pid_reports_true_and_the_real_process_dies` |
+> | D | + a 100 ms orphan/`lsof` sampler | 80 | 0 | — |
+> | E | + a snapshot fired reactively on the LEAK line | 120 | **1** | `ops::bash_operations_tests::local_bash_operations_forwards_command_cwd_and_env_onto_the_proc_seam` |
+> | | | **286** | **3 (~1.0%)** | **three DIFFERENT tests** |
+>
+> **The rate fell (from ~4 in 33 ≈ 12%), so the source-scan pin closed a real class — keep it. The
+> failure did not go away, so the row does not close.** `fail-fast` CANCELS the run on a LEAK
+> (block A: `243 tests run: 242 passed, 1 failed`), so this is a hard gate red, not a warning.
+>
+> **The mechanism is refuted for the one occurrence that was instrumented.** Block E's LEAK names
+> `local_bash_operations_forwards_command_cwd_and_env_onto_the_proc_seam`, which drives
+> `RecordingProc`, an **in-memory double** (`ops/mod.rs:605`). Its only possible child is
+> `find_bash_on_path`'s `which bash` (`ops/shell.rs:78-84`), which names all three stdio handles and
+> is reaped in-loop. **There is no candidate holder of that test process's fd 1/2 anywhere in its
+> subtree**, and the wait ran the full 500 ms (`LEAK-FAIL [0.513s]`). Corroborating over block D: **69
+> distinct orphan pipe addresses vs 244 sampled `cargo-nextest` pipe addresses — zero intersection.
+> No orphan was ever seen holding a harness pipe.**
+>
+> **Stray children DO exist, and they are a separate finding.** Under two concurrent suites the box
+> carries orphaned `sleep 30`s (ppid 1, fd0 `/dev/null`, fd1+fd2 PIPE), one alive for its full 00:30
+> — the `exec`/`exec_argv` fixtures' backgrounded descendants (`ops/local.rs:1135`, `:1568`, `:1812`)
+> holding **the tool's** pipes, not the harness's. After a single idle run there are **zero** orphan
+> sleeps at t+1 s … t+32 s. Hygiene lead, not the leak.
+>
+> **RESIDUAL — a harness-level question, and the next instrument is named so nobody re-derives it.**
+> Does `cargo nextest`'s leak detector time out under saturation? `.config/nextest.toml`'s 500 ms
+> tripwire was **deliberately not touched** — raising it would hide the signal and is the user's call.
+> **Any future closure of this row has to name a holder or name the harness.** Nothing was weakened to
+> reach green: leak-timeout untouched, no `#[ignore]`, no retries.
+>
+> **MEASUREMENT HYGIENE, disclosed rather than smoothed:** the runs straddled other agents' in-flight
+> edits — `crates/cyrup-tools/src/tests/isolation.rs` gained a test mid-measurement (243 → 244 tests
+> between blocks C and D) and the binary was built from a working tree carrying 34 modified files,
+> though the two files the live rows measure were unmodified vs HEAD.
+>
+> **Everything below is sweep 6's closure argument, retained unedited.** Its fd algebra and its two
+> pins are still correct and still load-bearing; only its *sufficiency* is refuted.
 
 **Mechanism — fd algebra, not a bad assertion.** nextest hands each test process a pipe for fd 1/2 and waits `leak-timeout` (500 ms, `.config/nextest.toml:42`) for EOF *after the process exits*; EOF requires every copy of the WRITE end to be closed. `std::process::Command` defaults every **unnamed** handle to `Stdio::inherit()`, and naming a handle `dup2`s over the harness's copy — so **only a spawn that omits a handle can hold the harness pipe open**. `git show c8c86bc:crates/cyrup-tools/src/ops/shell.rs` shows exactly one such site in the whole crate: `path_probe_is_bounded` spawned `sleep 30` naming only `.stdout(piped())`, handing the child the harness's **stdin and stderr**, and its `Err(_) => break` arm left that child alive, unkilled and unreaped for 30 s. Sweep 5 (`bdcb0d0`) fixed both halves at `ops/shell.rs:339-378`.
 

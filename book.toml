@@ -1,0 +1,26 @@
+[book]
+title = "cyrup"
+description = "User guide for cyrup — a coding agent in Rust with WebAssembly extensions."
+authors = ["cyrup contributors"]
+language = "en"
+src = "docs/guide"
+
+[build]
+build-dir = "target/guide"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+preferred-dark-theme = "navy"
+git-repository-url = "https://github.com/cyrup-ai/cyrup"
+edit-url-template = "https://github.com/cyrup-ai/cyrup/edit/main/{path}"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true
+limit-results = 20
+use-boolean-and = true

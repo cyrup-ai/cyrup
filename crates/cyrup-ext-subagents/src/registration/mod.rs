@@ -247,6 +247,18 @@ pub struct SubagentExtensionConfig {
     /// see [`Self::validate_authority_policy`], which is upstream's own `throw`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub authority_policy: Option<authority::AuthorityPolicyConfig>,
+    /// SUBA-008 — pi `ExtensionConfig.turnBudget?: TurnBudgetConfig` (`shared/types.ts:1766`
+    /// @v0.43.0), the LAST rung of the assistant-turn-budget chain
+    /// (`effectiveParams.turnBudget ?? deps.config.turnBudget`,
+    /// `runs/foreground/subagent-executor.ts:4928`), where `effectiveParams.turnBudget` has already
+    /// absorbed the agent's own `turnBudget:` frontmatter.
+    ///
+    /// Carried RAW rather than pre-resolved because upstream validates it at USE time, through the
+    /// same `resolveTurnBudgetConfig` call that validates the tool param — so a malformed
+    /// `subagents.turnBudget` produces the tool call's own error text with upstream's label, and
+    /// does not take the whole extension down at load. `None` (the key omitted) is unbudgeted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_budget: Option<serde_json::Value>,
 }
 
 /// SUBA-059 — pi's `Pick<ArtifactConfig, "cleanupDays">` (`shared/types.ts:1859` @v0.47.1): the
@@ -296,6 +308,7 @@ impl Default for SubagentExtensionConfig {
             artifact_config: None,
             artifact_dir: None,
             authority_policy: None,
+            turn_budget: None,
         }
     }
 }

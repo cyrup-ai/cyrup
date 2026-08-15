@@ -201,6 +201,7 @@ async fn build_run(dir: &Path, temp_root: &Path, run_token: &str, child_id: &str
     tokio::fs::create_dir_all(&run_paths.run_dir).await.unwrap();
 
     let config = RunnerConfig {
+        turn_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
         share: None,

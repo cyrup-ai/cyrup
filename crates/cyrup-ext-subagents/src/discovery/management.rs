@@ -509,6 +509,9 @@ fn build_definition(
         default_timeout_ms: None,
         memory: None,
         tool_budget: None,
+        // SUBA-008: same rule as `toolBudget` — no management field exists for it, so a CREATED
+        // agent declares none.
+        default_turn_budget: None,
         disabled: fields.disabled.unwrap_or(None),
         system_prompt_body: fields.system_prompt_body.clone().unwrap_or_default(),
         source,
@@ -576,6 +579,8 @@ fn merge_fields(
         default_timeout_ms: existing.default_timeout_ms,
         memory: existing.memory.clone(),
         tool_budget: existing.tool_budget.clone(),
+        // SUBA-008: an UPDATE never edits it but must not DROP it either — see the note above.
+        default_turn_budget: existing.default_turn_budget,
         disabled: fields.disabled.unwrap_or(existing.disabled),
         system_prompt_body: fields
             .system_prompt_body
@@ -835,6 +840,23 @@ fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&HashSet<Strin
             .and_then(|b| serde_json::to_string(b).ok())
             .unwrap_or_default();
         lines.push(format!("toolBudget: {value}"));
+    }
+
+    // SUBA-008 turnBudget (`agent-serializer.ts:91` @v0.43.0): emitted as compact JSON when set,
+    // or as an empty value under preserve — the same shape as `toolBudget` above, and landed with
+    // it for the same reason: `turnBudget` is now in `KNOWN_FIELDS`, so a known-but-unemitted key
+    // would be SILENTLY DELETED from an author's agent file on the first management rewrite.
+    //
+    // Upstream's guard is `config.defaultTurnBudget || preserve(...)` — TRUTHY, not
+    // `!== undefined` like the two lines above it — which for an always-populated object type is
+    // the same test `is_some()` performs here.
+    if def.default_turn_budget.is_some() || preserve(&["turnBudget"]) {
+        let value = def
+            .default_turn_budget
+            .as_ref()
+            .and_then(|b| serde_json::to_string(b).ok())
+            .unwrap_or_default();
+        lines.push(format!("turnBudget: {value}"));
     }
 
     // memory (`agent-serializer.ts:95-99` @ v0.34.0): a two-line nested block, emitted ONLY when
@@ -3687,6 +3709,7 @@ mod tests {
 
     fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefinition {
         AgentDefinition {
+            default_turn_budget: None,
             name: "reviewer".to_string(),
             local_name: "reviewer".to_string(),
             package_name: None,
@@ -4256,6 +4279,72 @@ mod tests {
         );
         assert!(!reparsed.extra_fields.contains_key("memory"));
         assert!(!reparsed.extra_fields.contains_key("toolBudget"));
+    }
+
+    /// SUBA-008 — the same silent-deletion trap for `turnBudget`, and the parse half with it.
+    ///
+    /// The trap is specific and worth naming: adding a key to `KNOWN_FIELDS` without a matching
+    /// `serialize_agent` arm makes the extra-fields round-trip loop skip it, so the FIRST
+    /// management rewrite of an author's agent file silently deletes their budget. Adding the key
+    /// and the arm in one change is why both halves are asserted here.
+    #[test]
+    fn serialize_agent_round_trips_the_turn_budget_launch_default() {
+        use crate::discovery::frontmatter::parse_agent_file;
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "pacer".to_string();
+        def.name = "pacer".to_string();
+        def.description = "Paces itself".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.default_turn_budget = Some(crate::exec::turn_budget::ResolvedTurnBudget {
+            max_turns: 6,
+            grace_turns: 0,
+        });
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains(r#"turnBudget: {"maxTurns":6,"graceTurns":0}"#),
+            "turnBudget must be emitted as compact JSON under pi's own key names:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(
+            reparsed.default_turn_budget, def.default_turn_budget,
+            "turnBudget lost on round trip — the silent-deletion trap"
+        );
+        assert!(
+            !reparsed.extra_fields.contains_key("turnBudget"),
+            "a KNOWN_FIELDS key must never be demoted to extra_fields"
+        );
+
+        // The parser applies upstream's `graceTurns` DEFAULT, so an author who writes only
+        // `maxTurns` gets grace 1 — not grace 0, which is a materially different policy.
+        let with_default = parse_agent_file(
+            "---\nname: pacer\ndescription: d\nturnBudget: {\"maxTurns\": 3}\n---\nbody",
+            AgentSource::Project,
+            Path::new("/w.md"),
+        )
+        .expect("parses");
+        assert_eq!(
+            with_default.default_turn_budget,
+            Some(crate::exec::turn_budget::ResolvedTurnBudget {
+                max_turns: 3,
+                grace_turns: 1,
+            })
+        );
+
+        // A malformed budget skips the FILE (this crate's per-file `[CYRUP-DELTA]`), it does not
+        // silently disarm the budget and load the agent anyway.
+        assert!(
+            parse_agent_file(
+                "---\nname: pacer\ndescription: d\nturnBudget: {\"maxTurns\": 0}\n---\nbody",
+                AgentSource::Project,
+                Path::new("/w.md"),
+            )
+            .is_none(),
+            "an invalid turnBudget must skip the agent file, never load it unbudgeted"
+        );
     }
 
     /// The same silent-deletion trap for the two launch defaults (G98).

@@ -237,6 +237,19 @@ pub struct RunnerConfig {
     /// (the pre-inheritance behavior).
     #[serde(default)]
     pub inherited_session_model: Option<cyrup_core::ModelId>,
+    /// SUBA-008 — the run-level assistant-TURN budget (pi `params.turnBudget`,
+    /// `runs/background/async-execution.ts:165`/`:214`, threaded to the runner as `ctx.turnBudget`,
+    /// `subagent-runner.ts:1091`, and from there onto every step's `runSubagentProcess` call at
+    /// `:1409`).
+    ///
+    /// Run-level, NOT per-step, because that is upstream's shape: `AsyncExecutionParams.turnBudget`
+    /// is resolved once by the orchestrator and applies to the whole async run — a chain's steps
+    /// share one budget rather than each getting a fresh one.
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize, and `None` is
+    /// "unbudgeted", which is every run that does not ask for a budget.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
     /// The effective `subagents.modelScope` policy in force for this run (SUBA-003), resolved ONCE
     /// by the orchestrator from its own discovery pass
     /// ([`crate::discovery::AgentDiscoveryResult::model_scope`]) and carried verbatim into the
@@ -1260,6 +1273,8 @@ async fn run_inner(
         // one-shot config so an async run honours `share`/`artifacts` and leaves the same artifact
         // quadruple a foreground run does (pi `subagent-runner.ts:879-890,1117-1125` @v0.34.0).
         share: config.share,
+        // SUBA-008 — the run-level turn budget reaches every step from the one-shot config.
+        turn_budget: config.turn_budget,
         artifacts_dir: config.artifacts_dir.clone(),
         artifact_config: config.artifact_config,
         // G90 (pi `subagent-runner.ts:2313,2600,2797` @v0.34.0): the async run dir every
@@ -1978,6 +1993,9 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_) => String::new(),
     };
     SingleResult {
+        turn_budget: None,
+        turn_budget_exceeded: false,
+        wrap_up_requested: false,
         agent,
         task,
         // The child's real code when the executor ran one; the success/failure mapping only as the
@@ -2029,6 +2047,9 @@ fn imported_root_to_single_result(
     imported: &control::ImportedAsyncRootResult,
 ) -> SingleResult {
     SingleResult {
+        turn_budget: None,
+        turn_budget_exceeded: false,
+        wrap_up_requested: false,
         agent: imported.agent.clone(),
         task: format!("Attach async root {}", spec.run_id),
         exit_code: imported.exit_code,
@@ -2150,6 +2171,12 @@ pub(crate) struct ExecSingleStepExecutor {
     /// (`runs/foreground/execution.ts:1027,1039` @v0.34.0): `Some(true)` keeps a child's session store on
     /// where it would otherwise be spawned `--no-session`. `None`/`Some(false)` is not enabling.
     pub(crate) share: Option<bool>,
+    /// SUBA-008 — the run-level assistant-TURN budget, carried from
+    /// [`RunnerConfig::turn_budget`] and threaded onto every dispatched step's
+    /// [`crate::exec::RunOptions::turn_budget`] (pi `ctx.turnBudget` →
+    /// `runSubagentProcess({ … turnBudget: ctx.turnBudget })`, `subagent-runner.ts:1091`/`:1409`).
+    /// `None` is unbudgeted.
+    pub(crate) turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
     /// SUBA-N03 — where this run's per-step artifact quadruple is written (pi `ctx.artifactsDir`,
     /// `runs/background/subagent-runner.ts:879-890,1117-1125` @v0.34.0 @v0.34.0), paired with
     /// [`Self::artifact_config`]. `None` disables artifact writing outright, which is exactly pi's
@@ -2243,6 +2270,12 @@ impl ExecSingleStepExecutor {
             // `with_*` builder: an unused one would be dead code, and the background runner sets
             // these three directly in its own `ExecSingleStepExecutor` literal from `RunnerConfig`.
             share: None,
+            // SUBA-008: the foreground chain/parallel slash surfaces advertise no `turnBudget`
+            // param — upstream's is on the `subagent` TOOL's schema (`extension/schemas.ts:328`),
+            // not on `/chain`//`/parallel`//`/run-chain` — so a foreground walk is unbudgeted, as
+            // it is upstream. The SINGLE-mode tool path does not build this executor; it passes
+            // its own `RunOptions::turn_budget` directly.
+            turn_budget: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
             // G90: a foreground walk has no async run directory, hence no steer inbox — the same
@@ -2459,6 +2492,15 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             }
         });
         let opts = RunOptions {
+            // SUBA-008 — pi `turnBudget: ctx.turnBudget` on every step's `runSubagentProcess`
+            // call (`subagent-runner.ts:1409`): the RUN-level budget, applied per step, exactly
+            // as upstream applies one `AsyncExecutionParams.turnBudget` to every step of an async
+            // chain rather than giving each step a fresh one.
+            turn_budget: self.turn_budget,
+            // pi's `enforceHardTurnLimit` reaches `runSubagentProcess` only from the slash
+            // delegation adapter (`slash/delegation-adapters.ts:298`); the async runner never sets
+            // it, so the mid-tool-work deferral stays armed here as upstream leaves it.
+            enforce_hard_turn_limit: false,
             cwd: effective_cwd,
             deadline_at: ctx.deadline_at,
             // pi `chain-execution.ts:335-336,741-742,1197-1198` @v0.34.0: every step's `runSync` call carries BOTH
@@ -3119,6 +3161,9 @@ async fn finish_run(
 
     if !error.is_empty() && results.is_empty() {
         results.push(SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: status
                 .steps
                 .first()
@@ -3299,6 +3344,7 @@ mod tests {
 
         // The executor built for THIS run, exactly as `run` builds it.
         let executor = ExecSingleStepExecutor {
+            turn_budget: None,
             depth: DepthEnvelope {
                 current_depth: 0,
                 max_depth: 5,
@@ -3553,6 +3599,7 @@ mod tests {
         // The executor carries an EMPTY persona map — exactly the state that must NOT dispatch a
         // placeholder.
         let executor = ExecSingleStepExecutor {
+            turn_budget: None,
             depth: DepthEnvelope {
                 current_depth: 0,
                 max_depth: 5,
@@ -3617,6 +3664,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
@@ -3669,6 +3717,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
@@ -3793,6 +3842,7 @@ mod tests {
             .expect("pre-create a blocking file where the control dir needs to go");
 
         let config = RunnerConfig {
+            turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
@@ -3876,6 +3926,9 @@ mod tests {
             status.clone(),
             RunState::Complete,
             vec![SingleResult {
+                turn_budget: None,
+                turn_budget_exceeded: false,
+                wrap_up_requested: false,
                 agent: "researcher".to_string(),
                 task: "do the thing".to_string(),
                 exit_code: 0,
@@ -4258,6 +4311,9 @@ mod tests {
     #[test]
     fn promoting_stopped_children_leaves_already_settled_ones_alone() {
         let settled = |agent: &str, interrupted: bool, output: Option<&str>| SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: agent.to_string(),
             task: String::new(),
             exit_code: 0,
@@ -4355,6 +4411,9 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             session_file: None,
             results: vec![SingleResult {
+                turn_budget: None,
+                turn_budget_exceeded: false,
+                wrap_up_requested: false,
                 agent: "researcher".to_string(),
                 task: "research the topic".to_string(),
                 exit_code: 0,
@@ -4391,6 +4450,7 @@ mod tests {
             .expect("mkdir results_dir");
 
         let config = RunnerConfig {
+            turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,

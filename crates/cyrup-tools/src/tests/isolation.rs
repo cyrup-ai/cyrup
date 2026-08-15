@@ -331,6 +331,19 @@ impl FsOps for DistinctStreamFs {
     async fn read_dir(&self, _path: &Path) -> Result<Vec<DirEntry>, ToolError> {
         Ok(Vec::new())
     }
+    /// The SECOND defaulted method on `FsOps`, and the one this probe previously left unpinned.
+    ///
+    /// The trait default classifies by file EXTENSION
+    /// (`path.extension() → ImageMime::from_extension`, `ops/mod.rs:363-365`). This override
+    /// deliberately contradicts it in both directions, so neither answer can be produced by the
+    /// default: a `.txt` path (default `None`) reports `Png`, and a `.png` path (default
+    /// `Some(Png)`) reports `None`.
+    fn detect_image_mime(&self, path: &Path) -> Option<ImageMime> {
+        match path.extension().and_then(|e| e.to_str()) {
+            Some("png") => None,
+            _ => Some(ImageMime::Png),
+        }
+    }
     fn walk(&self, _root: &Path, _opts: WalkOpts) -> EventStream<Result<WalkItem, ToolError>> {
         Box::pin(tokio_stream::empty())
     }
@@ -393,4 +406,49 @@ async fn fs_decorators_forward_read_stream_instead_of_inheriting_the_whole_file_
         confined.read_stream(Path::new("/etc/passwd")).await.is_err(),
         "read_stream must apply the traversal guard, not just delegate"
     );
+}
+
+/// The companion to the test above for `FsOps`' OTHER defaulted method.
+///
+/// `detect_image_mime` is the second place a decorator can silently substitute the trait default
+/// (`ops/mod.rs:363-365`, extension-based classification). Both decorators DO forward it
+/// (`protected.rs:145-147`, `traversal.rs:123-125`) — this test is what keeps that true, and it is
+/// written so a deleted forward FAILS rather than agreeing with the default: the probe answers
+/// `Some(Png)` where the default answers `None`, and `None` where the default answers `Some(Png)`.
+#[test]
+fn fs_decorators_forward_detect_image_mime_instead_of_inheriting_the_extension_default() {
+    let base: Arc<dyn FsOps> = Arc::new(DistinctStreamFs);
+    let root = std::env::temp_dir();
+    let text = root.join("probe.txt");
+    let png = root.join("probe.png");
+
+    // Presence before absence: the probe must disagree with the default in BOTH directions, or the
+    // assertions below can be satisfied by a decorator that forwards nothing.
+    assert_eq!(base.detect_image_mime(&text), Some(ImageMime::Png));
+    assert_eq!(base.detect_image_mime(&png), None);
+
+    let traversal: Arc<dyn FsOps> = Arc::new(TraversalFs::new(base.clone(), root.clone()));
+    let protected: Arc<dyn FsOps> =
+        Arc::new(ProtectedFs::new(base.clone(), ProtectedPaths::defaults()));
+    let stacked: Arc<dyn FsOps> = Arc::new(ProtectedFs::new(
+        Arc::new(TraversalFs::new(base, root.clone())),
+        ProtectedPaths::defaults(),
+    ));
+
+    for (label, fs) in [
+        ("TraversalFs", &traversal),
+        ("ProtectedFs", &protected),
+        ("ProtectedFs∘TraversalFs", &stacked),
+    ] {
+        assert_eq!(
+            fs.detect_image_mime(&text),
+            Some(ImageMime::Png),
+            "{label} must forward detect_image_mime; the extension default would answer None"
+        );
+        assert_eq!(
+            fs.detect_image_mime(&png),
+            None,
+            "{label} must forward detect_image_mime; the extension default would answer Some(Png)"
+        );
+    }
 }

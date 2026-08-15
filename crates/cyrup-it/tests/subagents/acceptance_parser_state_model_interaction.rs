@@ -101,6 +101,8 @@ fn agent_config(name: &str) -> AgentConfig {
 /// artifact the AUTHORITATIVE report source (`execution.ts:1680-1701`).
 fn run_options(cwd: &Path, output_path: &Path) -> RunOptions {
     RunOptions {
+        turn_budget: None,
+        enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,

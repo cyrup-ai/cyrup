@@ -129,6 +129,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        turn_budget: None,
+        enforce_hard_turn_limit: false,
         // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.
         model_scope: None,
         // Added with G90's steer inbox. `None` is upstream's foreground shape — only a background

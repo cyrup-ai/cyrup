@@ -177,6 +177,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        turn_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
@@ -352,6 +353,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
     tokio::fs::create_dir_all(&run_paths.run_dir).await.expect("mkdir run_dir");
 
     let config = RunnerConfig {
+        turn_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
@@ -417,6 +419,8 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
+        turn_budget: None,
+        enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,
@@ -633,6 +637,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // already blocked — the same terminal state a genuinely deep chain reaches once the T0.3
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
+        turn_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
@@ -1013,6 +1018,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
         .spawn_background_steps(
             dir.path(),
             BackgroundStepsSpec {
+                turn_budget: None,
                 // SUBA-N03: this fixture drives the generic step-graph entry point, which
                 // carries none of the SINGLE-mode overrides.
                 run_id: cyrup_ext_subagents::background::RunId::new(),

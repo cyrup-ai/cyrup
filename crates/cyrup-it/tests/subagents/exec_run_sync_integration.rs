@@ -96,6 +96,8 @@ fn base_agent_config(model: &str) -> AgentConfig {
 
 fn base_run_options(cwd: &std::path::Path, model: &str) -> RunOptions {
     RunOptions {
+        turn_budget: None,
+        enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
         timeout_ms: None,
@@ -1458,4 +1460,197 @@ async fn include_progress_on_an_interrupt_paused_run_keeps_pis_uncompacted_runni
         "the child's own extracted text must be what survived: {:?}",
         progress.recent_output
     );
+}
+
+// -------------------------------------------------------------------------------------------
+// SUBA-008: the turn budget, end to end against a real child process.
+//
+// This is the item's own Verify recipe, corrected on one point: the item writes
+// `turnBudget:{hard:2}`, which is the TOOL budget's key shape. Upstream's turn budget takes
+// `{maxTurns, graceTurns}` (`extension/schemas.ts:104-107` @v0.43.0) and has no `hard`.
+// -------------------------------------------------------------------------------------------
+
+/// One NON-terminal assistant `message_end` — `stopReason` is `toolUse`, so pi's
+/// `terminalAssistantStop` (`execution.ts:921`) is FALSE and the budget's first decision arm does
+/// not short-circuit. A child that stops cleanly is never aborted however far over budget it is,
+/// which is exactly why the enforcement test must not use [`message_end_line`].
+fn working_message_end_line(text: &str) -> String {
+    serde_json::json!({
+        "type": "message_end",
+        "message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": text}],
+            "usage": {
+                "input": 1, "output": 1, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 2,
+                "cost": {"input": 0.0, "output": 0.0, "cacheRead": 0.0, "cacheWrite": 0.0, "total": 0.0}
+            },
+            "stopReason": "toolUse"
+        }
+    })
+    .to_string()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_turn_budget_wraps_up_at_max_turns_and_aborts_the_child_after_the_grace_turn() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // Four working turns are scripted, then a long sleep. With maxTurns 2 / graceTurns 1 the
+    // supervisor must request wrap-up on turn 2 and ABORT on turn 3 — so the fourth turn and the
+    // sleep must never be observed, which is what makes this a test of enforcement rather than of
+    // bookkeeping.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_start"}"#.to_string())},
+            {"kind": "emit", "line": working_message_end_line("still thinking 1")},
+            {"kind": "emit", "line": working_message_end_line("still thinking 2")},
+            {"kind": "emit", "line": working_message_end_line("still thinking 3")},
+            {"kind": "sleep_ms", "ms": 30000},
+            {"kind": "emit", "line": working_message_end_line("never reached")}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "turn-budget.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.turn_budget = Some(cyrup_ext_subagents::exec::turn_budget::ResolvedTurnBudget {
+        max_turns: 2,
+        grace_turns: 1,
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Work on this forever", &opts),
+    )
+    .await
+    .expect("the turn-budget abort must end the run well inside the child's 30s sleep");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    // pi `result.turnBudgetExceeded = true` + `turnBudgetState(budget, turnCount, true)`
+    // (`execution.ts:737-739`).
+    assert!(
+        result.turn_budget_exceeded,
+        "the third assistant turn crosses maxTurns(2)+graceTurns(1) and must abort: {result:?}"
+    );
+    assert!(result.wrap_up_requested, "the soft limit was reached, so wrap-up was requested");
+    let state = result.turn_budget.expect("an aborted run must publish its budget state");
+    assert_eq!(
+        state.outcome,
+        cyrup_ext_subagents::exec::turn_budget::TurnBudgetOutcome::Exceeded
+    );
+    assert_eq!(state.turn_count, 3, "the abort fires ON the third assistant turn");
+    assert_eq!(state.max_turns, 2);
+    assert_eq!(state.grace_turns, 1);
+    // `wrapUpRequestedAtTurn` is the THRESHOLD (pi's literal `budget.maxTurns`), while
+    // `exceededAtTurn` is the OBSERVED turn — the two differ here, which is the point.
+    assert_eq!(state.wrap_up_requested_at_turn, Some(2));
+    assert_eq!(state.exceeded_at_turn, Some(3));
+    assert_eq!(state.termination_deferred_at_turn, None);
+
+    // pi `result.error = turnBudgetExceededMessage(...)` (`execution.ts:740`), verbatim.
+    assert_eq!(
+        result.error.as_deref(),
+        Some("Subagent exceeded turn budget after 3 assistant turns (soft limit 2 + grace 1)."),
+        "the abort message must be upstream's, and must outrank every other diagnosis: {result:?}"
+    );
+    assert_ne!(result.exit_code, 0, "a budget abort is a failure, not a clean exit");
+    assert!(!result.timed_out, "this is a budget abort, not the orchestrator's deadline");
+    assert!(!result.interrupted);
+
+    // pi `formatTurnBudgetOutput(message, fullOutput)` (`execution.ts:1252`): the message leads,
+    // and whatever the child DID produce follows under upstream's own heading.
+    let output = result.final_output.expect("an aborted run still delivers its partial output");
+    assert!(
+        output.starts_with("Subagent exceeded turn budget after 3 assistant turns"),
+        "the abort message must lead the delivered output: {output}"
+    );
+    assert!(
+        output.contains("Partial output before turn-budget abort:"),
+        "upstream's partial-output heading must be present: {output}"
+    );
+    assert!(
+        output.contains("still thinking 3"),
+        "the child's real partial output must survive the abort: {output}"
+    );
+    assert!(
+        !output.contains("never reached"),
+        "the child must have been killed before its post-sleep turn: {output}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_child_that_finishes_inside_its_turn_budget_is_untouched() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // ADVERSARIAL, and the reason this test exists next to the one above: the SAME budget must be
+    // completely inert for a child that stops on its own. Without this, an enforcement bug that
+    // aborted every budgeted run would still pass the abort test.
+    let script = serde_json::json!({
+        "steps": [
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_start"}"#.to_string())},
+            {"kind": "emit", "line": message_end_line("All done.", 5, 3)},
+            {"kind": "emit", "line": serde_json::Value::String(r#"{"type":"agent_end"}"#.to_string())}
+        ],
+        "exit_code": 0
+    });
+    let script_path = write_script(dir.path(), "within-budget.json", &script);
+
+    let fixture = fixture_binary_path();
+    // SAFETY: scoped, mutex-serialized env mutation — see this file's module doc.
+    unsafe {
+        std::env::set_var(FIXTURE_BINARY_ENV_VAR, &fixture);
+        std::env::set_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT", &script_path);
+    }
+
+    let agent = base_agent_config("fixture-model");
+    let mut opts = base_run_options(dir.path(), "fixture-model");
+    opts.turn_budget = Some(cyrup_ext_subagents::exec::turn_budget::ResolvedTurnBudget {
+        max_turns: 2,
+        grace_turns: 1,
+    });
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        cyrup_ext_subagents::exec::run_sync(&agent, "Answer briefly", &opts),
+    )
+    .await
+    .expect("run_sync must not hang");
+
+    // SAFETY: scoped cleanup under the same mutex-held critical section.
+    unsafe {
+        std::env::remove_var(FIXTURE_BINARY_ENV_VAR);
+        std::env::remove_var("CYRUP_SUBAGENT_FIXTURE_SCRIPT");
+    }
+
+    assert_eq!(result.exit_code, 0, "an in-budget run is untouched: {result:?}");
+    assert!(!result.turn_budget_exceeded);
+    assert!(!result.wrap_up_requested);
+    assert_eq!(result.error, None);
+    assert_eq!(
+        result.final_output.as_deref(),
+        Some("All done."),
+        "no turn-budget note may be folded onto an in-budget run's output"
+    );
+    let state = result
+        .turn_budget
+        .expect("pi stamps `initialTurnBudgetState` on any budgeted run (execution.ts:399)");
+    assert_eq!(
+        state.outcome,
+        cyrup_ext_subagents::exec::turn_budget::TurnBudgetOutcome::WithinBudget
+    );
+    assert_eq!(state.turn_count, 1);
 }

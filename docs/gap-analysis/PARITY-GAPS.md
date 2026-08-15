@@ -37,7 +37,7 @@ difference costs behaviour, the entry says so and stays on the list as work.**
 
 | | |
 |---|---|
-| cyrup HEAD | **`04c1ba2`** — last code commit (docs HEAD `a9000b1`, branch `david/cyrup`, tree clean) |
+| cyrup HEAD | **`e5c6933`** — last code commit as of the third edition, 2026-08-14 (docs HEAD `0097149`, branch `david/cyrup`). *Superseded: `04c1ba2` (docs `a9000b1`) when this file was regenerated; `bdcb0d0` at the second edition.* |
 | `pi` | ported baseline **v0.83.0** → latest **v0.84.1** · delta 627 files, +52 291 / −17 556 |
 | `pi-subagents` | ported baseline **≈v0.43.0** (inferred — the crate records no version string) → latest **v0.47.1** · delta 151 files, +10 254 / −1 333 |
 | `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** · delta 28 files, +4 023 / −1 851 |
@@ -49,6 +49,42 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 ---
 
 ## 0. Census — every open item in the twelve area files, by class
+
+> **SUPERSEDED — THIRD EDITION 2026-08-14 (after sweeps 7-8). The census below enumerates a set that
+> no longer exists, and so does the second-edition block beneath it.** **Eight** whole-backlog sweeps
+> have landed. The current set, re-derived row by row from the twelve `## Open items` tables, is
+> **145 open work items — 0 critical, 2 high, 61 medium, 82 low**, plus the same **10 `tracker`
+> rows**. **503 rows across the twelve tables: 349 carry a full closure marker and 35 more a partial
+> one — 384 of 503 (76%).** *(The second edition's "338 of 500" and its 63/88 medium/low split were
+> derived by a different method; this edition states its counting rule in `00-residual-ledger.md` so
+> the two can be compared.)*
+>
+> **THREE rows are new since the second edition and all three are closed: `PROV-M01` (area 01) and
+> `TOOL-M01` (area 04), filed and closed in the same pass, plus `EXT-M03` (area 06), filed
+> RETROACTIVELY because the ID was cited five times in `crates/cyrup-ext/src/host/live.rs` and had no
+> row anywhere** — both produced by one assigned audit of
+> hand-written delegating trait impls rather than by the backlog. **One row was REOPENED by
+> measurement: `TOOL-042`** (area 04), whose closure rested on an argument that a 286-run experiment
+> refuted for the one occurrence it instrumented. **The two highs are unchanged: `SESS-040` and
+> `PROV-047`.** **No ID was renumbered, merged or deleted.**
+>
+> **THREE ENTRIES IN THIS FILE ARE NOW WRONG AND ARE CORRECTED HERE, because a work-facing document
+> that mis-sizes an item costs a whole agent-pass:**
+>
+> - **`PB-10` (`turnBudget` = `SUBA-008`) IS CLOSED (sweep 8), and the second-edition note calling it
+>   "the cheapest remaining medium … wiring plus a schema key, not a port" was measurably wrong.**
+>   cyrup's `Usage` carried **no `turns` counter at all**, so there was no turn count to wire; the
+>   port is ~888 lines of new module plus a drive-loop arm, a signal ladder, three new `SingleResult`
+>   fields, a frontmatter field, a serializer arm and a config key. **And the mechanism it prescribed
+>   was inverted** — the turn budget has no env handoff and no child-side enforcement, unlike the tool
+>   budget it was told to mirror. See the ledger's mechanism register, entry 1.
+> - **The `CFG-052` entry's premise about upstream is FALSE and the row is closed as REFUTED.** pi's
+>   `parseGitUrl` returns `null` before reaching `hostedGitInfo.fromUrl` unless there is a `git:`
+>   prefix or an explicit `://` (`utils/git.ts:172-179` @v0.83.0, and its own doc comment says so).
+>   Upstream stores the shorthand as a local path exactly as cyrup does.
+> - **`TOOL-042` is not a same-pass win.** It was filed, largely fixed, and reopened.
+>
+> *Second-edition block, retained for provenance:*
 
 > **SUPERSEDED — SECOND EDITION 2026-08-14 (after sweeps 3-6). The census below enumerates a set that
 > no longer exists.** **Six** whole-backlog sweeps have landed. The current set, re-derived from the
@@ -76,9 +112,10 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 > landed: the immediate-bash half in `cyrup-session-svc/src/bash.rs:107-109` **and the bash-TOOL half
 > in `cyrup-tools/src/tools/bash.rs:154-165`**, pinned by `cyrup-tools/src/tests/bash_session_env.rs:200-221`.
 > **`PB-5`'s remaining fix site is `crates/cyrup-ext-subagents/**` — route it there, not to area 04.**
-> **`PB-10`** (`turnBudget`) is `SUBA-008`, re-verified open at HEAD and rated the cheapest remaining
+> ~~**`PB-10`** (`turnBudget`) is `SUBA-008`, re-verified open at HEAD and rated the cheapest remaining
 > medium in area 09: the three consumers already exist and read a hard-coded `false`, so it is wiring
-> plus a schema key, not a port.
+> plus a schema key, not a port.~~ **CLOSED 2026-08-14 (sweep 8) with `SUBA-008`; the sizing and the
+> mechanism in this sentence were both wrong — see the third-edition block above.**
 > **`VL-P22`** is half-addressed: `DiskStore::rewrite`'s temp-sibling-and-rename now carries a
 > `[CYRUP-DELTA]` naming pi's `_rewriteFile` (session-manager.ts:979-988) and the reason; the
 > torn-tail half is untouched.

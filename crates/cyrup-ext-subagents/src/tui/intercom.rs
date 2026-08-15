@@ -345,11 +345,14 @@ pub fn resolve_single_result_status(child: &crate::exec::SingleResult) -> Subage
         process_signal: child.process_signal.as_deref(),
         timed_out: child.timed_out,
         stopped: child.stopped,
-        // cyrup's `SingleResult` carries no `turnBudgetExceeded` (the turn-budget subsystem stops a
-        // child via its own tool-budget path and does not stamp a terminal flag); `false` here can
-        // only WIDEN `isUnexplainedProcessSignal`, never narrow it, and a turn-budget stop is not
-        // signal-killed in this port, so no real case is misclassified.
-        turn_budget_exceeded: false,
+        // SUBA-008 — pi `turnBudgetExceeded: result.turnBudgetExceeded` (`result-intercom.ts:39`).
+        // The note that stood here — "cyrup's `SingleResult` carries no `turnBudgetExceeded` … a
+        // turn-budget stop is not signal-killed in this port" — described the gap, and BOTH of its
+        // reassurances were wrong once the subsystem landed: a turn-budget abort now really does
+        // signal the child down (SIGINT→SIGTERM→SIGKILL), so `process_signal` is `Some` with
+        // `exit_code != 0`, and a hard-coded `false` would have sent exactly that case down
+        // `isUnexplainedProcessSignal`'s branch and reported a deliberate budget kill as `stopped`.
+        turn_budget_exceeded: child.turn_budget_exceeded,
     })
 }
 
@@ -441,7 +444,8 @@ impl IntercomPayload {
                     process_signal: r.process_signal.as_deref(),
                     timed_out: r.timed_out,
                     stopped: r.stopped,
-                    turn_budget_exceeded: false,
+                    // SUBA-008 — same field, same reason, on the run-level fold.
+                    turn_budget_exceeded: r.turn_budget_exceeded,
                 };
                 if r.acceptance
                     .as_ref()
@@ -1048,6 +1052,9 @@ mod tests {
 
     fn sample_single_result(agent: &str, output: &str) -> crate::exec::SingleResult {
         crate::exec::SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: agent.to_string(),
             task: "task".to_string(),
             exit_code: 0,

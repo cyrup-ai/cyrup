@@ -535,6 +535,7 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // fragile against this type's own serde shape) — one SingleStep, matching
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
+        turn_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
@@ -747,6 +748,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // has real remaining work to cut short (R-SA-084 marks the NOT-yet-dispatched step(s) Paused
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
+        turn_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,

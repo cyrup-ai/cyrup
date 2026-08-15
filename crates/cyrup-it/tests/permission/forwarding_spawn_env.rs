@@ -160,6 +160,8 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
         tool_budget: None,
     };
     let opts = RunOptions {
+        turn_budget: None,
+        enforce_hard_turn_limit: false,
         // G90's steer inbox: `None` is the foreground shape.
         steer_inbox_dir: None,
         // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.

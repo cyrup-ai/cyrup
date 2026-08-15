@@ -1521,6 +1521,9 @@ mod tests {
     #[test]
     fn the_writers_own_output_renders_as_conversation_and_tool_rows() {
         let result = crate::exec::SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: "reviewer".to_string(),
             task: "task".to_string(),
             exit_code: 0,

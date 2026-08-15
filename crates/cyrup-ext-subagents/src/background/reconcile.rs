@@ -491,6 +491,9 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
         .steps
         .iter()
         .map(|step| crate::exec::SingleResult {
+            turn_budget: None,
+            turn_budget_exceeded: false,
+            wrap_up_requested: false,
             agent: step.agent.clone(),
             task: String::new(),
             exit_code: -1,
@@ -523,6 +526,9 @@ fn placeholder_result(
 ) -> crate::exec::SingleResult {
     let _ = mode;
     crate::exec::SingleResult {
+        turn_budget: None,
+        turn_budget_exceeded: false,
+        wrap_up_requested: false,
         agent: agent.to_string(),
         task: String::new(),
         exit_code: -1,

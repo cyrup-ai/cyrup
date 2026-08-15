@@ -251,7 +251,34 @@ impl CatalogOverlay {
 }
 
 /// A [`Provider`] decorator whose catalog is `inner`'s with a remote overlay merged in. Every other
-/// behavior — id, auth, streaming, dynamic refresh — delegates untouched.
+/// behavior — id, display name, base URL, headers, credential filter, auth, streaming, dynamic
+/// refresh — delegates untouched.
+///
+/// # PROV-M01 — why every surface method is named here, including the ones with trait defaults
+///
+/// Upstream `withRemoteCatalog` is an OBJECT SPREAD:
+/// `return { ...provider, getModels: …, refreshModels: … }`
+/// (`packages/coding-agent/src/core/remote-catalog-provider.ts:52-54` @v0.83.0). Every other member
+/// of `Provider` — `name`, `baseUrl?`, `headers?`, `filterModels?`, `auth`, `stream`, `streamSimple`
+/// (`packages/ai/src/models.ts:76-119` @v0.83.0) — survives BY CONSTRUCTION. Rust has no spread, so
+/// a hand-written delegating impl forwards exactly the methods it names, and the four members whose
+/// cyrup counterparts carry a TRAIT DEFAULT fail silently when omitted: the decorator inherits the
+/// default and returns a plausible answer rather than the inner's.
+///
+/// That was not hypothetical here. Before this delegation was written out, `filter_models` was
+/// dropped — and `github-copilot` is the one built-in that installs one
+/// ([`crate::providers::github_copilot::filter_github_copilot_models`], via
+/// `WireProvider::with_filter_models`, `providers/github_copilot.rs:178`). `all_providers_with_overlay`
+/// maps EVERY built-in through [`CatalogOverlay::apply`] (`providers/all.rs:148-157`), so in the
+/// overlay configuration `Models::get_available` (`collection.rs:419`) called `filter_models` on the
+/// decorator, got the identity default back, and offered the user every Copilot model regardless of
+/// what the OAuth credential's `availableModelIds` actually entitled. `name`/`base_url`/`headers`
+/// were dropped the same way: a wrapped `WireProvider` overrides all three (`wire.rs:113-123`), and
+/// the decorator reported the id as the display name and `None` for both provider-level defaults.
+///
+/// `get_model` is deliberately NOT delegated: its default derives from `models()`, which this type
+/// overrides, so the default resolves against the MERGED catalog — which is what upstream's
+/// `Models` does against the spread's `getModels`. Delegating it to `inner` would be the bug.
 pub struct RemoteCatalogProvider {
     inner: Arc<dyn Provider>,
     models: Vec<Model>,
@@ -275,8 +302,40 @@ impl Provider for RemoteCatalogProvider {
         self.inner.id()
     }
 
+    /// PROV-M01 — carried by `...provider`. The trait default is `self.id().as_str()`, so omitting
+    /// this silently renamed every overlaid provider to its machine id.
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    /// PROV-M01 — carried by `...provider`. The trait default is `None`.
+    fn base_url(&self) -> Option<&str> {
+        self.inner.base_url()
+    }
+
+    /// PROV-M01 — carried by `...provider`. The trait default is `None`.
+    fn headers(&self) -> Option<&crate::HeaderMap> {
+        self.inner.headers()
+    }
+
     fn models(&self) -> &[Model] {
         &self.models
+    }
+
+    /// PROV-M01 — carried by `...provider`. The trait default returns the catalog UNCHANGED, which
+    /// is indistinguishable from a working filter for every provider that installs none — so the
+    /// one provider that does install one (`github-copilot`) lost its credential-scoped narrowing
+    /// with no test able to see it.
+    ///
+    /// The models handed on are the caller's slice, not `self.models`: `Models::get_available`
+    /// passes the catalog it already resolved (`collection.rs:419`), exactly as pi passes
+    /// `getModels()`' result to `filterModels` at `models.ts:407`.
+    fn filter_models(
+        &self,
+        models: &[Model],
+        credential: Option<&crate::auth::Credential>,
+    ) -> Vec<Model> {
+        self.inner.filter_models(models, credential)
     }
 
     fn provider_auth(&self) -> Option<&ProviderAuth> {
@@ -672,6 +731,142 @@ mod tests {
             compat: None,
             headers: None,
         }
+    }
+
+    /// PROV-M01 fixture — every method the decorator must forward carries a **distinct
+    /// non-default** value, so a deleted delegation cannot pass by agreeing with the trait default.
+    ///
+    /// The trait defaults this deliberately contradicts (`provider.rs:23-51`): `name` → the id,
+    /// `base_url` → `None`, `headers` → `None`, `filter_models` → the catalog unchanged.
+    struct Decorated {
+        id: ProviderId,
+        models: Vec<Model>,
+        headers: crate::HeaderMap,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Decorated {
+        fn id(&self) -> &ProviderId {
+            &self.id
+        }
+        fn name(&self) -> &str {
+            "Decorated Display Name"
+        }
+        fn base_url(&self) -> Option<&str> {
+            Some("https://inner.invalid/v1")
+        }
+        fn headers(&self) -> Option<&crate::HeaderMap> {
+            Some(&self.headers)
+        }
+        fn models(&self) -> &[Model] {
+            &self.models
+        }
+        /// A REAL narrowing, not the identity default: it keeps only ids starting with `keep`.
+        fn filter_models(
+            &self,
+            models: &[Model],
+            _credential: Option<&crate::auth::Credential>,
+        ) -> Vec<Model> {
+            models.iter().filter(|m| m.id.as_str().starts_with("keep")).cloned().collect()
+        }
+        fn stream(
+            &self,
+            _model: &Model,
+            _context: &Context,
+            _options: &StreamOptions,
+        ) -> EventStream<StreamEvent> {
+            Box::pin(tokio_stream::empty())
+        }
+    }
+
+    /// PROV-M01 — upstream `withRemoteCatalog` SPREADS the provider
+    /// (`remote-catalog-provider.ts:52` @v0.83.0), so `name`/`baseUrl`/`headers`/`filterModels`
+    /// survive by construction. In Rust they survive only because the delegation is written out,
+    /// and the failure of forgetting is SILENT — the trait default answers instead.
+    #[test]
+    fn the_decorator_forwards_every_surface_method_the_spread_carries() {
+        let mut headers = crate::HeaderMap::new();
+        headers.insert("x-inner".to_string(), Some("inner-value".to_string()));
+        let inner: Arc<dyn Provider> = Arc::new(Decorated {
+            id: "decorated".into(),
+            models: vec![model("decorated", "keep-a", 1), model("decorated", "drop-b", 2)],
+            headers,
+        });
+        // Assert PRESENCE on the inner first: a fixture that ever loses a declaration must fail
+        // loudly rather than make the comparisons below vacuous.
+        assert_ne!(inner.name(), inner.id().as_str(), "fixture must not agree with the default");
+        assert!(inner.base_url().is_some(), "fixture must declare a base_url");
+        assert!(inner.headers().is_some(), "fixture must declare headers");
+
+        let overlay = vec![model("decorated", "keep-c", 3)];
+        let w = RemoteCatalogProvider::new(inner.clone(), &overlay);
+
+        assert_eq!(w.id(), inner.id());
+        assert_eq!(w.name(), "Decorated Display Name");
+        assert_eq!(w.base_url(), Some("https://inner.invalid/v1"));
+        assert_eq!(w.headers().and_then(|h| h.get("x-inner")), Some(&Some("inner-value".to_string())));
+
+        // The overlay half still works: the merged catalog is the floor plus the overlay.
+        let ids: Vec<&str> = w.models().iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["keep-a", "drop-b", "keep-c"]);
+        // `get_model` resolves against the MERGED catalog (it must NOT be delegated to the inner).
+        assert!(w.get_model("keep-c").is_some(), "get_model must see the overlay");
+
+        // The credential filter is the one whose loss was a live defect: the identity default would
+        // return all three.
+        let filtered: Vec<String> =
+            w.filter_models(w.models(), None).into_iter().map(|m| m.id.to_string()).collect();
+        assert_eq!(filtered, ["keep-a", "keep-c"]);
+    }
+
+    /// PROV-M01, the production path: `all_providers_with_overlay` maps EVERY built-in through
+    /// [`CatalogOverlay::apply`] (`providers/all.rs:148-157`), and `github-copilot` is the one
+    /// built-in that installs a `filter_models` (`providers/github_copilot.rs:178`). Before the
+    /// delegation landed, wrapping it discarded the credential-scoped narrowing entirely.
+    #[test]
+    fn overlaying_github_copilot_keeps_its_credential_filter() {
+        use crate::auth::Credential;
+        let providers = crate::all_providers();
+        let copilot = providers
+            .iter()
+            .find(|p| p.id().as_str() == "github-copilot")
+            .expect("github-copilot is a built-in")
+            .clone();
+        let catalog = copilot.models().to_vec();
+        assert!(catalog.len() > 2, "the embedded copilot catalog must be non-trivial");
+
+        // An OAuth credential entitled to exactly one of the catalog's ids.
+        let entitled = catalog[0].id.to_string();
+        let cred = Credential::Oauth {
+            access: "a".into(),
+            refresh: "r".into(),
+            expires: i64::MAX,
+            ext: [(
+                "availableModelIds".to_string(),
+                serde_json::json!([entitled.clone()]),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        // Presence first: the UNWRAPPED provider narrows.
+        let bare = copilot.filter_models(&catalog, Some(&cred));
+        assert_eq!(bare.len(), 1, "the bare provider must narrow to the entitled id");
+
+        let overlay = CatalogOverlay::from_entries(vec![(
+            "github-copilot".to_string(),
+            vec![model("github-copilot", "overlay-only", 7)],
+        )]);
+        let wrapped = overlay.apply(copilot);
+        assert!(
+            wrapped.get_model("overlay-only").is_some(),
+            "the overlay must actually have wrapped the provider"
+        );
+        let narrowed = wrapped.filter_models(wrapped.models(), Some(&cred));
+        assert_eq!(
+            narrowed.iter().map(|m| m.id.to_string()).collect::<Vec<_>>(),
+            vec![entitled],
+            "the decorator must forward filter_models, not answer with the identity default"
+        );
     }
 
     #[test]
