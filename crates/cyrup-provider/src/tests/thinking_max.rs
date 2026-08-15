@@ -86,7 +86,7 @@ fn model_thinking_level_max_lowers_to_the_on_level_max() {
 
 // ------------------------------------------------------- supported-levels + clamp, per upstream --
 
-/// Pi models.ts:670 — `if (level === "xhigh" || level === "max") return mapped !== undefined`.
+/// Pi `models.ts:669` @v0.83.0 — `if (level === "xhigh" || level === "max") return mapped !== undefined;`.
 /// `max` is opt-in per model exactly like `xhigh`, so a model with no map advertises neither.
 #[test]
 fn max_requires_an_explicit_map_entry_like_xhigh() {

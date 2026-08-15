@@ -44,6 +44,92 @@ pub struct CreateModelsOptions {
     pub catalog_overlay: Option<Arc<crate::remote_catalog::CatalogOverlay>>,
 }
 
+/// Options for [`Models::refresh_with`] — pi `ModelsRefreshOptions` (`models.ts:46-51` @v0.83.0).
+/// PROV-S05.
+///
+/// [`Default`] reproduces pi's defaults for a bare `refresh()`: `allowNetwork = options.allowNetwork
+/// ?? true` (`:277`), `force` undefined ⇒ falsy, and a fresh, never-cancelled token standing in for
+/// an absent `signal`.
+#[derive(Clone, Debug)]
+pub struct ModelsRefreshOptions {
+    /// pi `allowNetwork?: boolean` (`:47`). `false` is the cache-only restore.
+    pub allow_network: bool,
+    /// pi `force?: boolean` (`:49`) — "bypass provider freshness checks and fetch immediately when
+    /// network access is allowed". Forwarded to every provider; NOT forwarded to the post-failure
+    /// cache restore, which pi builds without it (`:314-319`).
+    pub force: bool,
+    /// pi `signal?: AbortSignal` (`:50`).
+    pub cancel: cyrup_core::CancelToken,
+}
+
+impl Default for ModelsRefreshOptions {
+    fn default() -> Self {
+        Self {
+            allow_network: true,
+            force: false,
+            cancel: cyrup_core::CancelToken::new(),
+        }
+    }
+}
+
+impl ModelsRefreshOptions {
+    /// Network allowed, freshness window respected — the background posture.
+    pub fn network() -> Self {
+        Self::default()
+    }
+
+    /// The offline restore (pi `refresh({ allowNetwork: false })`,
+    /// `agent-session-services.ts:180`).
+    pub fn cache_only() -> Self {
+        Self {
+            allow_network: false,
+            ..Self::default()
+        }
+    }
+
+    /// Bypass the freshness window (pi `force: true`, `package-manager-cli.ts:409`).
+    pub fn forced() -> Self {
+        Self {
+            force: true,
+            ..Self::default()
+        }
+    }
+
+    /// Attach the caller's abort token (pi's `signal`).
+    pub fn with_cancel(mut self, cancel: cyrup_core::CancelToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+}
+
+/// The outcome of [`Models::refresh_with`] — pi `ModelsRefreshResult` (`models.ts:53-56` @v0.83.0),
+/// returned rather than thrown so a per-provider failure never rejects the whole refresh
+/// (`:304-312`). PROV-S05.
+#[derive(Debug, Default)]
+pub struct ModelsRefreshResult {
+    /// pi `aborted: boolean` (`:54`) — `options.signal?.aborted ?? false`, read AFTER every
+    /// provider has settled (`:327`), so it reports whether the caller cancelled at any point, not
+    /// whether cancellation was observed by a particular provider.
+    pub aborted: bool,
+    /// pi `errors: ReadonlyMap<string, Error>` (`:55`) — one entry per provider whose refresh threw,
+    /// keyed by provider id, exactly as upstream keys it (`errors.set(provider.id, …)`, `:306`). A
+    /// provider aborted by `cancel` contributes NO entry, because pi guards the `errors.set` with
+    /// `if (!options.signal?.aborted)` (`:305`).
+    pub errors: BTreeMap<String, ProviderError>,
+}
+
+impl ModelsRefreshResult {
+    /// No provider failed and nobody cancelled.
+    pub fn is_clean(&self) -> bool {
+        !self.aborted && self.errors.is_empty()
+    }
+
+    /// The error recorded for one provider, if any.
+    pub fn error_for(&self, provider: &str) -> Option<&ProviderError> {
+        self.errors.get(provider)
+    }
+}
+
 /// Runtime collection of providers plus auth application + stream convenience (Pi `MutableModels`).
 /// Providers are held by id (ids are unique; `set_provider` upserts).
 pub struct Models {
@@ -66,7 +152,7 @@ pub fn create_models(options: CreateModelsOptions) -> Models {
 }
 
 impl Models {
-    // ---- MutableModels (Pi models.ts:130) ----
+    // ---- MutableModels (Pi `models.ts:189-194` @v0.83.0; PROV-041 corrected `:130`, blank) ----
 
     /// Upsert/replace by `provider.id` (Pi `setProvider`). Ids are unique.
     pub fn set_provider(&mut self, provider: Arc<dyn Provider>) {
@@ -84,7 +170,8 @@ impl Models {
         self.providers.clear();
     }
 
-    // ---- reads (Pi models.ts:164) ----
+    // ---- reads (Pi `getModels` `models.ts:135` / `getModel` `:141` @v0.83.0; PROV-041 corrected
+    // `:164`, which is `getAuth`) ----
 
     /// All registered providers (Pi `getProviders`).
     pub fn get_providers(&self) -> Vec<Arc<dyn Provider>> {
@@ -120,7 +207,8 @@ impl Models {
             .find(|m| m.id.as_str() == id)
     }
 
-    // ---- auth (Pi models.ts:216) ----
+    // ---- auth (Pi `getAuth` declared `models.ts:164-165`, implemented `:411-429` @v0.83.0;
+    // PROV-041 corrected `:216`, the closing brace of `mergeHeaders`) ----
 
     /// Resolve request auth for a model (Pi `getAuth(model)` with no overrides). `Ok(None)` when the
     /// provider is unknown or unconfigured; `Err` carries the R-01-017 taxonomy (e.g. `oauth` on a
@@ -129,7 +217,8 @@ impl Models {
         self.get_auth_with(model, AuthOverrides::default()).await
     }
 
-    /// [`Self::get_auth`] with per-request overrides (Pi `getAuth(model, overrides)`, models.ts:216
+    /// [`Self::get_auth`] with per-request overrides (Pi `getAuth(model, overrides)`, `models.ts:165`
+    /// declared / `:413-429` implemented @v0.83.0
     /// / `ModelRuntimeAuthOverrides`, model-runtime.ts:72-77). `min_oauth_validity_ms` is how a
     /// caller that needs a token to survive past the request — Pi's bearer-token export,
     /// credential-print.ts:122-125 — widens the OAuth refresh window and gets the post-refresh
@@ -156,8 +245,10 @@ impl Models {
         .await?)
     }
 
-    // ---- stream / complete (Pi models.ts:258). applyAuth lives on [`AuthHelper`] so the spawned
-    // stream task can own its inputs (Pi `applyAuth`, models.ts:230). ----
+    // ---- stream / complete (Pi `stream` declared `models.ts:173-177` / implemented `:489-502`,
+    // `complete` `:179-183` / `:504-510` @v0.83.0; PROV-041 corrected `:258`, which is inside
+    // `getModels`). applyAuth lives on [`AuthHelper`] so the spawned stream task can own its
+    // inputs (Pi `applyAuth`, `models.ts:463-487`; PROV-041 corrected `:230`, `setProvider`). ----
 
     /// Stream a model through the owning provider, applying auth first (Pi `stream`). Returns
     /// immediately; auth application happens behind the stream and any failure arrives as a terminal
@@ -228,7 +319,8 @@ impl Models {
     }
 
     /// Stream a model through the owning provider with the unified "simple" option surface,
-    /// applying auth first (Pi `streamSimple`, models.ts:278). Like [`Models::stream`], returns
+    /// applying auth first (Pi `streamSimple`, `models.ts:185` declared / `:512-518`
+    /// implemented @v0.83.0; PROV-041 corrected `:278`). Like [`Models::stream`], returns
     /// immediately and surfaces every failure (unknown provider, auth) as a terminal
     /// [`StreamEvent::Error`]. Auth is applied to the wrapped [`StreamOptions`] (`base`) exactly as
     /// for `stream`; the unified `reasoning`/`thinking_budgets` ride through untouched to the
@@ -292,7 +384,8 @@ impl Models {
         Box::pin(ReceiverStream::new(rx))
     }
 
-    /// Stream to completion with the unified "simple" options (Pi `completeSimple`, models.ts:286):
+    /// Stream to completion with the unified "simple" options (Pi `completeSimple`, `models.ts:186` declared /
+    /// `:520-526` implemented @v0.83.0; PROV-041 corrected `:286`):
     /// drive [`Models::stream_simple`] and fold into the terminal message.
     pub async fn complete_simple(
         &self,
@@ -303,17 +396,102 @@ impl Models {
         collect_message(self.stream_simple(model, context, options)).await
     }
 
-    /// Ask dynamic providers to re-fetch their model lists (Pi `Models.refresh`, declared
-    /// `models.ts:147` and implemented `:276-328` @v0.83.0).
+    /// Ask dynamic providers to re-fetch their model lists — **the full port** of Pi
+    /// `Models.refresh` (declared `models.ts:147`, implemented `:276-328` @v0.83.0). PROV-S05.
     ///
-    /// **This is NOT a 1:1 port**, and the previous claim that it was — together with a citation to
-    /// `models.ts:198-214`, which is `CreateModelsOptions` + `mergeHeaders`, not `refresh` — is
-    /// PROV-041. Four upstream features are missing and are tracked as PROV-S05: the
-    /// `ModelsRefreshOptions { allowNetwork, force, signal }` argument (`:46-51`), the
-    /// `ModelsRefreshResult { aborted, errors }` return (`:52-56`), the abort signal, and the
-    /// re-invocation with `allowNetwork: false` that restores the persisted catalog after any
-    /// failure. The allow-network split, the mode gate and the configured-provider restriction ARE
-    /// reproduced, by a different mechanism, in `crates/cyrup/src/provider.rs:71-130`.
+    /// Every clause of upstream's body is reproduced here, in upstream's order:
+    ///
+    /// | pi | here |
+    /// |---|---|
+    /// | `allowNetwork = options.allowNetwork ?? true` (`:277`) | [`ModelsRefreshOptions::default`] |
+    /// | `refreshable = providers.filter(p => p.refreshModels !== undefined)` (`:279-282`) | a provider whose [`Provider::refresh_models`] answers `None` |
+    /// | `if (options.signal?.aborted) return;` (`:286`) | the per-provider pre-check below |
+    /// | `provider.refreshModels({…, allowNetwork, force, signal})` (`:297-303`) | [`RefreshModelsContext`] |
+    /// | `if (!signal?.aborted) errors.set(id, error)` (`:305-311`) | an abort records NO error |
+    /// | the `allowNetwork:false` re-invocation, its own failure swallowed (`:313-322`) | the restore arm |
+    /// | `return { aborted: signal?.aborted ?? false, errors }` (`:327`) | [`ModelsRefreshResult`] |
+    ///
+    /// Two deliberate deltas, both narrower than upstream rather than wider:
+    ///
+    /// * **`provider: Option<&str>` has no upstream counterpart.** pi's `refresh` always fans out;
+    ///   the single-provider form exists here because [`Models::refresh`] has always had it and
+    ///   `crates/cyrup/src/provider.rs` restricts the fetch set by id. `Some(id)` refreshes exactly
+    ///   that provider and is a clean no-op for an unknown id (pi's
+    ///   `if (!entry?.refreshModels) return`).
+    /// * **No `credential` / `store` are threaded.** See [`RefreshModelsContext`]'s `[CYRUP-DELTA]`:
+    ///   the persisting fetcher owns both, so pi's `resolveRefreshCredential` bail (`:296`) is
+    ///   reproduced at the trigger site rather than here.
+    ///
+    /// **The abort is real, not advisory.** A provider that has not started when `cancel` fires is
+    /// never called; a provider that is mid-flight is cut off only if it honours the token it was
+    /// handed, which is why [`RefreshModelsContext::cancel`] documents that as a requirement rather
+    /// than a courtesy. Like pi, this waits for every started provider to settle before returning —
+    /// it does not drop in-flight futures at this layer.
+    pub async fn refresh_with(
+        &self,
+        provider: Option<&str>,
+        options: ModelsRefreshOptions,
+    ) -> ModelsRefreshResult {
+        // `refreshable` (`:279-282`) — pi filters on the optional member being present; here a
+        // static provider is the one that answers `None`, which it can only do by being called, so
+        // the filter is expressed inside the per-provider body instead.
+        let targets: Vec<&Arc<dyn Provider>> = match provider {
+            Some(id) => self.providers.get(id).into_iter().collect(),
+            None => self.providers.values().collect(),
+        };
+
+        let ctx = crate::provider::RefreshModelsContext {
+            allow_network: options.allow_network,
+            force: options.force,
+            cancel: options.cancel.clone(),
+        };
+
+        let refreshes = targets.into_iter().map(|entry| {
+            let ctx = &ctx;
+            async move {
+                // `if (options.signal?.aborted) return;` (`:286`). Checked per provider, INSIDE the
+                // concurrent body, so a cancellation that lands while an earlier provider is in
+                // flight still stops the ones that have not begun.
+                if ctx.is_aborted() {
+                    return None;
+                }
+                let failure = match entry.refresh_models(ctx).await {
+                    // Static provider (`refreshModels === undefined`) or a clean refresh.
+                    None | Some(Ok(())) => return None,
+                    Some(Err(e)) => e,
+                };
+
+                // `catch (error) { if (!options.signal?.aborted) errors.set(…) }` (`:304-312`) — an
+                // abort is a cancellation, not a provider failure, so it records nothing.
+                let recorded =
+                    (!ctx.is_aborted()).then(|| (entry.id().as_str().to_string(), failure));
+
+                // `try { await provider.refreshModels({credential: stored, store, allowNetwork:
+                // false, signal}) } catch { /* best-effort */ }` (`:313-322`) — restore the
+                // persisted catalog after ANY failure. Note upstream does NOT carry `force` onto
+                // this call, and its own failure is deliberately swallowed so the original
+                // auth/network error is what the caller sees.
+                let restore = crate::provider::RefreshModelsContext {
+                    allow_network: false,
+                    force: false,
+                    cancel: ctx.cancel.clone(),
+                };
+                let _ = entry.refresh_models(&restore).await;
+                recorded
+            }
+        });
+
+        let collected = futures::future::join_all(refreshes).await;
+        ModelsRefreshResult {
+            // `aborted: options.signal?.aborted ?? false` (`:327`) — read after the join, exactly
+            // as upstream reads it after `Promise.all`.
+            aborted: options.cancel.is_cancelled(),
+            errors: collected.into_iter().flatten().collect(),
+        }
+    }
+
+    /// [`Models::refresh_with`] with pi's default options, keeping the pre-PROV-S05 return shape for
+    /// existing callers.
     ///
     /// With a provider id: a static provider (no [`Provider::refresh_models`] source → `None`) is a
     /// no-op (`Ok(())`); a dynamic provider's fetch failure is surfaced as a `model_source`
@@ -322,27 +500,25 @@ impl Models {
     /// `if (error instanceof ModelsError) throw error`).
     ///
     /// Without a provider id: every provider is refreshed concurrently, best-effort — failures are
-    /// swallowed (Pi `Promise.allSettled`). Static providers are no-ops.
+    /// swallowed (Pi `Promise.all` + the collected error map, which this form discards). **A caller
+    /// that needs to know WHICH provider failed, to cancel, or to force past the freshness window
+    /// must use [`Models::refresh_with`]** — `refresh(None)` reporting `Ok(())` for a wholly failed
+    /// refresh is the exact hole PROV-S05 was filed for, and it survives here only as the
+    /// compatibility shape.
     pub async fn refresh(&self, provider: Option<&str>) -> Result<(), ProviderError> {
-        if let Some(id) = provider {
-            let Some(entry) = self.providers.get(id) else {
-                // Unknown provider: no refresh source → no-op (Pi `if (!entry?.refreshModels) return`).
-                return Ok(());
-            };
-            return match entry.refresh_models().await {
-                None => Ok(()),
-                Some(Ok(())) => Ok(()),
-                Some(Err(e @ ProviderError::ModelSource(_))) => Err(e),
-                Some(Err(e)) => Err(ProviderError::ModelSource(
-                    format!("Model refresh failed for {id}: {e}").into(),
-                )),
-            };
+        let result = self
+            .refresh_with(provider, ModelsRefreshOptions::default())
+            .await;
+        let Some(id) = provider else {
+            return Ok(());
+        };
+        match result.errors.into_iter().next() {
+            None => Ok(()),
+            Some((_, e @ ProviderError::ModelSource(_))) => Err(e),
+            Some((_, e)) => Err(ProviderError::ModelSource(
+                format!("Model refresh failed for {id}: {e}").into(),
+            )),
         }
-
-        // Best-effort: refresh every provider concurrently, ignoring failures (Pi `allSettled`).
-        let refreshes = self.providers.values().map(|p| p.refresh_models());
-        futures::future::join_all(refreshes).await;
-        Ok(())
     }
 
     // ---- auth status / availability (Pi models.ts:150-153, :364-409 @v0.83.0) ----
@@ -585,7 +761,9 @@ fn merge_headers(
     Some(merged)
 }
 
-// ---- model capability helpers (Pi models.ts:397) ----
+// ---- model capability helpers (Pi `hasApi` `models.ts:635-637`, `getSupportedThinkingLevels`
+// `:663-672`, `clampThinkingLevel` `:674-693`, `calculateCost` `:639-659` @v0.83.0; PROV-041
+// corrected `:397`, a line inside `getAvailable`) ----
 
 /// The full ordered extended-thinking ladder (Pi `EXTENDED_THINKING_LEVELS`).
 pub const EXTENDED_THINKING_LEVELS: [ModelThinkingLevel; 7] = [
@@ -604,7 +782,8 @@ fn level_key(level: ModelThinkingLevel) -> &'static str {
 
 /// The thinking levels a model supports (Pi `getSupportedThinkingLevels`). A non-reasoning model
 /// supports only `off`. A `thinkingLevelMap` value of `null` marks a level unsupported; `xhigh` and
-/// `max` additionally require an explicit (non-`undefined`) map entry (Pi models.ts:670).
+/// `max` additionally require an explicit (non-`undefined`) map entry (Pi `models.ts:669`
+/// @v0.83.0; PROV-041 corrected `:670`, the `return true` fall-through beneath it).
 pub fn get_supported_thinking_levels(model: &Model) -> Vec<ModelThinkingLevel> {
     if !model.reasoning {
         return vec![ModelThinkingLevel::Off];
@@ -801,7 +980,8 @@ mod tests {
         assert_eq!(auth.source.as_deref(), Some("stored"));
     }
 
-    /// `get_auth_with` really forwards its overrides (Pi `getAuth(model, overrides)`, models.ts:216)
+    /// `get_auth_with` really forwards its overrides (Pi `getAuth(model, overrides)`,
+    /// `models.ts:165`/`:413-429` @v0.83.0)
     /// — `get_auth` used to hard-code `AuthOverrides::default()`, so the whole override tier,
     /// `min_oauth_validity_ms` included, was unreachable through this seam.
     #[tokio::test]
@@ -949,7 +1129,8 @@ mod tests {
         );
 
         // Reasoning, no map → off,minimal,low,medium,high (xhigh AND max each require an explicit
-        // entry — Pi models.ts:670 `if (level === "xhigh" || level === "max")`).
+        // entry — Pi `models.ts:669` @v0.83.0 `if (level === "xhigh" || level === "max") return
+        // mapped !== undefined;`).
         let r = model("p", "b", true, None);
         assert_eq!(
             get_supported_thinking_levels(&r),
@@ -994,7 +1175,7 @@ mod tests {
             ModelThinkingLevel::Xhigh
         );
         // `max` is above every supported rung → the upward walk finds nothing and the downward
-        // walk lands on xhigh (Pi models.ts:688-691).
+        // walk lands on xhigh (Pi `models.ts:688-691` @v0.83.0).
         assert_eq!(
             clamp_thinking_level(&m, ModelThinkingLevel::Max),
             ModelThinkingLevel::Xhigh
@@ -1031,7 +1212,9 @@ mod tests {
         assert!(!has_api(&a, "anthropic-messages"));
     }
 
-    // ---- dynamic-refresh dispatch (Pi `Models.refresh`, models.ts:198-214) ----
+    // ---- dynamic-refresh dispatch (Pi `Models.refresh`, declared `models.ts:147`, implemented
+    // `:276-328` @v0.83.0; PROV-041 corrected `:198-214`, which is `CreateModelsOptions` +
+    // `mergeHeaders`) ----
 
     use crate::utils::refresh::RefreshDedup;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1042,7 +1225,11 @@ mod tests {
         id: cyrup_core::ProviderId,
         models: Vec<Model>,
         fetches: Arc<AtomicUsize>,
+        /// Calls that arrived with `allow_network: false` — pi's cache restore (`models.ts:314-319`).
+        restores: Arc<AtomicUsize>,
         fail: bool,
+        /// When set, the fetch parks on this until notified or aborted (PROV-S05's abort test).
+        hold: Option<Arc<tokio::sync::Notify>>,
         dedup: RefreshDedup,
     }
 
@@ -1073,13 +1260,38 @@ mod tests {
             });
             Box::pin(ReceiverStream::new(rx))
         }
-        async fn refresh_models(&self) -> Option<Result<(), ProviderError>> {
+        /// PROV-S05: shaped like pi's `createProvider` `refreshModels` (`models.ts:566-616`
+        /// @v0.83.0) — it honours `allowNetwork` by returning without fetching, which is what makes
+        /// the post-failure cache restore (`:313-322`) a restore rather than a second attempt, and
+        /// it honours the abort token so a cancel actually cuts the fetch off.
+        async fn refresh_models(
+            &self,
+            ctx: &crate::provider::RefreshModelsContext,
+        ) -> Option<Result<(), ProviderError>> {
+            // `if (!allowNetwork) { restore from store; return; }` — no fetch, no error.
+            if !ctx.allow_network {
+                self.restores.fetch_add(1, Ordering::SeqCst);
+                return Some(Ok(()));
+            }
             let fetches = self.fetches.clone();
             let fail = self.fail;
+            let hold = self.hold.clone();
+            let cancel = ctx.cancel.clone();
             Some(
                 self.dedup
                     .run(move || async move {
                         fetches.fetch_add(1, Ordering::SeqCst);
+                        if let Some(hold) = hold {
+                            // Block until either the caller aborts or the test releases us. `biased`
+                            // so the abort arm is deterministic when both are ready.
+                            tokio::select! {
+                                biased;
+                                () = cancel.cancelled() => {
+                                    return Err(ProviderError::Transport("aborted".into()));
+                                }
+                                _ = hold.notified() => {}
+                            }
+                        }
                         if fail {
                             Err(ProviderError::Transport("network down".into()))
                         } else {
@@ -1092,15 +1304,28 @@ mod tests {
     }
 
     fn dyn_provider(id: &str, fail: bool) -> (Arc<DynProvider>, Arc<AtomicUsize>) {
+        let (p, fetches, _) = dyn_provider_full(id, fail, None);
+        (p, fetches)
+    }
+
+    /// [`dyn_provider`] plus the restore counter and an optional park handle (PROV-S05).
+    fn dyn_provider_full(
+        id: &str,
+        fail: bool,
+        hold: Option<Arc<tokio::sync::Notify>>,
+    ) -> (Arc<DynProvider>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let fetches = Arc::new(AtomicUsize::new(0));
+        let restores = Arc::new(AtomicUsize::new(0));
         let p = Arc::new(DynProvider {
             id: cyrup_core::ProviderId::from(id),
             models: vec![model(id, "m1", false, None)],
             fetches: fetches.clone(),
+            restores: restores.clone(),
             fail,
+            hold,
             dedup: RefreshDedup::new(),
         });
-        (p, fetches)
+        (p, fetches, restores)
     }
 
     #[tokio::test]
@@ -1166,6 +1391,225 @@ mod tests {
             1,
             "healthy source fetched"
         );
+    }
+
+    // ---- PROV-S05: `Models::refresh` options, result and abort (Pi `models.ts:276-328` @v0.83.0) ----
+
+    /// PROV-S05 (a) — `refresh_with(None, …)` names the provider that failed.
+    ///
+    /// **Red before the fix:** `refresh` returned `Result<(), ProviderError>` and the all-provider
+    /// path was `join_all(refreshes).await; Ok(())` with EVERY result discarded, so a wholly failed
+    /// refresh was indistinguishable from a clean one and there was no `errors` map to assert on —
+    /// this test did not compile, and its `refresh(None)` predecessor asserted `Ok(())` for exactly
+    /// the state this asserts an error for.
+    #[tokio::test]
+    async fn prov_s05_refresh_all_returns_a_per_provider_error_map() {
+        let mut models = create_models(CreateModelsOptions::default());
+        models.set_provider(Arc::new(fleet::GROQ.provider())); // static: contributes nothing
+        let (bad, bad_fetches, bad_restores) = dyn_provider_full("dyn-bad", true, None);
+        let (ok, ok_fetches, ok_restores) = dyn_provider_full("dyn-ok", false, None);
+        models.set_provider(bad);
+        models.set_provider(ok);
+
+        let result = models
+            .refresh_with(None, ModelsRefreshOptions::default())
+            .await;
+
+        assert!(!result.aborted, "nobody cancelled");
+        assert_eq!(
+            result.errors.keys().collect::<Vec<_>>(),
+            vec!["dyn-bad"],
+            "exactly the failing provider is named, and the static one is absent"
+        );
+        // pi stores the ORIGINAL error (`errors.set(provider.id, error)`, models.ts:306), not a
+        // re-wrapped one — `error instanceof Error ? error : …` always takes the first arm here.
+        //
+        // That claim is about the error's IDENTITY, so it is asserted on the variant: a re-wrap
+        // would arrive as `ProviderError::ModelSource` (which is what the legacy `refresh(Some(id))`
+        // shape below deliberately produces). Asserting the rendered string instead would have been
+        // asserting `ProviderError::Transport`'s own `Display` prefix, which is not what upstream
+        // is saying anything about.
+        let recorded = result.error_for("dyn-bad").expect("the failing provider is named");
+        assert!(
+            matches!(recorded, ProviderError::Transport(_)),
+            "the provider's own error variant must survive the fan-out unwrapped, got {recorded:?}"
+        );
+        assert_eq!(
+            recorded.to_string(),
+            "transport error: network down",
+            "and it must still carry the provider's message verbatim"
+        );
+        assert!(result.error_for("dyn-ok").is_none());
+        assert!(!result.is_clean());
+
+        // The healthy provider's catalog is still updated — one failure does not abandon the fan-out.
+        assert_eq!(ok_fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(bad_fetches.load(Ordering::SeqCst), 1);
+
+        // pi `:313-322`: after ANY failure, re-invoke with `allowNetwork: false` so the persisted
+        // catalog is restored. Only the failing provider gets it.
+        assert_eq!(
+            bad_restores.load(Ordering::SeqCst),
+            1,
+            "the failed provider must get the allowNetwork:false cache restore"
+        );
+        assert_eq!(
+            ok_restores.load(Ordering::SeqCst),
+            0,
+            "a clean refresh must NOT be followed by a restore"
+        );
+    }
+
+    /// PROV-S05 (b) — `force` and `allow_network` actually reach the provider.
+    ///
+    /// **Red before the fix:** `Provider::refresh_models` took no argument at all, so neither flag
+    /// had anywhere to arrive; this test could not be written.
+    #[tokio::test]
+    async fn prov_s05_force_and_allow_network_reach_the_provider() {
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            seen: Mutex<Vec<(bool, bool)>>,
+        }
+        struct RecordingProvider {
+            id: cyrup_core::ProviderId,
+            models: Vec<Model>,
+            rec: Arc<Recorder>,
+        }
+        #[async_trait::async_trait]
+        impl Provider for RecordingProvider {
+            fn id(&self) -> &cyrup_core::ProviderId {
+                &self.id
+            }
+            fn models(&self) -> &[Model] {
+                &self.models
+            }
+            fn stream(
+                &self,
+                _model: &Model,
+                _context: &Context,
+                _options: &StreamOptions,
+            ) -> EventStream<StreamEvent> {
+                let (_tx, rx) = tokio::sync::mpsc::channel(1);
+                Box::pin(ReceiverStream::new(rx))
+            }
+            async fn refresh_models(
+                &self,
+                ctx: &crate::provider::RefreshModelsContext,
+            ) -> Option<Result<(), ProviderError>> {
+                if let Ok(mut seen) = self.rec.seen.lock() {
+                    seen.push((ctx.allow_network, ctx.force));
+                }
+                Some(Ok(()))
+            }
+        }
+
+        let rec = Arc::new(Recorder::default());
+        let mut models = create_models(CreateModelsOptions::default());
+        models.set_provider(Arc::new(RecordingProvider {
+            id: cyrup_core::ProviderId::from("rec"),
+            models: vec![model("rec", "m1", false, None)],
+            rec: rec.clone(),
+        }));
+
+        models
+            .refresh_with(None, ModelsRefreshOptions::forced())
+            .await;
+        models
+            .refresh_with(None, ModelsRefreshOptions::cache_only())
+            .await;
+        models
+            .refresh_with(None, ModelsRefreshOptions::default())
+            .await;
+
+        let seen = rec.seen.lock().expect("not poisoned").clone();
+        assert_eq!(
+            seen,
+            vec![(true, true), (false, false), (true, false)],
+            "forced ⇒ (network, force); cache_only ⇒ (offline, no force); default ⇒ pi's \
+             `allowNetwork ?? true` with force falsy (models.ts:277)"
+        );
+    }
+
+    /// PROV-S05 (c) — **the abort actually aborts.** This is the guarantee the item was filed on:
+    /// a signal that is accepted and then ignored is worse than none.
+    ///
+    /// Two distinct properties, because only the pair makes the signal real:
+    ///
+    /// 1. a provider parked in its fetch is CUT OFF when the token fires (it returns because it
+    ///    selected on `ctx.cancel`, which is only possible because the token reaches it); and
+    /// 2. a provider whose turn had not started is never called at all — pi's
+    ///    `if (options.signal?.aborted) return;` (`models.ts:286`).
+    ///
+    /// Also pins pi's `:305` guard: an aborted provider records NO error, even though its fetch
+    /// returned `Err`. Cancellation is not a provider failure.
+    ///
+    /// **Red before the fix:** there was no token to pass, no `aborted` to read, and no `errors` to
+    /// find empty — `refresh(None)` would have parked forever on the held provider with no way for
+    /// any caller to interrupt it.
+    #[tokio::test]
+    async fn prov_s05_cancel_actually_aborts_an_in_flight_refresh() {
+        let hold = Arc::new(tokio::sync::Notify::new());
+        let (held, held_fetches, _) = dyn_provider_full("dyn-held", false, Some(hold.clone()));
+
+        let mut models = create_models(CreateModelsOptions::default());
+        models.set_provider(held);
+
+        let cancel = cyrup_core::CancelToken::new();
+        let options = ModelsRefreshOptions::default().with_cancel(cancel.clone());
+
+        // Nothing ever notifies `hold`, so the ONLY way this resolves is the abort arm.
+        let refresh = models.refresh_with(None, options);
+        tokio::pin!(refresh);
+
+        // Let the fetch reach its park before cancelling, so this is a genuine mid-flight abort
+        // rather than the pre-check.
+        tokio::select! {
+            biased;
+            _ = &mut refresh => panic!("refresh settled before the fetch was even entered"),
+            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+        }
+        assert_eq!(
+            held_fetches.load(Ordering::SeqCst),
+            1,
+            "the fetch must be in flight for this to test a mid-flight abort"
+        );
+
+        cancel.cancel();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), refresh)
+            .await
+            .expect("cancel must cut the in-flight refresh off, not merely be recorded");
+
+        assert!(result.aborted, "models.ts:327 — `aborted: signal?.aborted ?? false`");
+        assert!(
+            result.errors.is_empty(),
+            "models.ts:305 — an aborted provider records no error, even though its fetch returned Err"
+        );
+    }
+
+    /// PROV-S05 (c2) — the pre-check half of the abort: a provider whose turn has not begun when
+    /// the token is already cancelled is never called (pi `models.ts:286`).
+    #[tokio::test]
+    async fn prov_s05_a_pre_cancelled_refresh_calls_no_provider() {
+        let mut models = create_models(CreateModelsOptions::default());
+        let (p, fetches, restores) = dyn_provider_full("dyn-ok", false, None);
+        models.set_provider(p);
+
+        let cancel = cyrup_core::CancelToken::new();
+        cancel.cancel();
+        let result = models
+            .refresh_with(None, ModelsRefreshOptions::default().with_cancel(cancel))
+            .await;
+
+        assert!(result.aborted);
+        assert!(result.errors.is_empty());
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            0,
+            "models.ts:286 — an already-aborted refresh must not start any provider"
+        );
+        assert_eq!(restores.load(Ordering::SeqCst), 0);
     }
 
     /// PROV-042. `transformHeaders` runs after auth + request headers are merged (Pi

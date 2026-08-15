@@ -100,6 +100,19 @@ pub mod tool_budget;
 /// [`drive_attempt`] enforces it parent-side off the child's own assistant `message_end` events.
 pub mod turn_budget;
 
+/// SUBA-021 (first half) — the subagent CAPABILITY CEILING: the monotonically-tightening
+/// `allowedTools`/`allowedAgents`/`denyExtensions` upper bound a parent imposes on its subtree, its
+/// per-session registry, and the [`capability_ceiling::CAPABILITY_CEILING_ENV`] hand-off that keeps
+/// it applying across this crate's re-exec boundary. A port of pi-subagents'
+/// `runs/shared/capability-ceiling.ts`.
+pub mod capability_ceiling;
+
+/// SUBA-021 (second half) — per-run USAGE budgets (`tokens` / `costUsd`, each with an advisory
+/// `soft` and a terminal `hard` limit): a port of pi-subagents' `runs/shared/usage-budget.ts`.
+/// Distinct from [`turn_budget`] and [`tool_budget`], which bound how MANY turns/tool calls a child
+/// takes rather than what they cost.
+pub mod usage_budget;
+
 /// SUBA-046 — the per-session subagent SPAWN budget, its snapshot, and the explicit grant path
 /// behind an exhausted cap: a port of pi-subagents' `runs/shared/spawn-budget.ts`. Consumed by
 /// `extension.rs`'s `reserve_subagent_spawns` and by the `grant-spawn-budget` dispatch arm.
@@ -659,6 +672,31 @@ pub struct RunOptions {
     /// `None` on the foreground path (no async run directory exists), matching upstream's own
     /// `if (input.steerInboxDir)` guard.
     pub steer_inbox_dir: Option<PathBuf>,
+    /// SUBA-049 — this child's OWN steer-acknowledgment directory
+    /// (`<run_dir>/control/steer-acks/<flatIndex>/`), handed over as
+    /// [`crate::prompt_runtime::STEER_ACK_DIR_ENV`].
+    ///
+    /// pi `steerAckDir` (`runs/shared/pi-args.ts:766-768` @v0.43.0, `if (input.steerAckDir)
+    /// env[SUBAGENT_STEER_ACK_DIR_ENV] = input.steerAckDir`), read child-side at
+    /// `subagent-prompt-runtime.ts:335`.
+    ///
+    /// This is the RETURN path, and without it the whole steer channel is one-way: the parent could
+    /// write a request and could not learn whether it was taken, queued behind a full follow-up
+    /// queue, or refused outright by a child whose host cannot inject messages at all. All three
+    /// looked like success.
+    pub steer_ack_dir: Option<PathBuf>,
+    /// SUBA-049 — where this child publishes its steering capability
+    /// (`<run_dir>/control/steer-capabilities/<flatIndex>.json`), handed over as
+    /// [`crate::prompt_runtime::STEER_CAPABILITY_ENV`].
+    ///
+    /// pi `steerCapabilityPath` (`runs/shared/pi-args.ts:764-765` @v0.43.0), read child-side at
+    /// `subagent-prompt-runtime.ts:334` and written from its `publishCapability` closure (`:360-362`).
+    ///
+    /// Separate from the ack directory because it answers a different question at a different time:
+    /// the ack says what happened to ONE request, the capability says — before any request exists —
+    /// whether this child can be steered at all and under which pid. A parent that sees
+    /// `supported: false` knows not to wait out the acknowledgment timeout.
+    pub steer_capability_path: Option<PathBuf>,
     /// pi `options.controlConfig` (`execution.ts:245`, threaded from `runSinglePath`'s
     /// `resolveControlConfig(deps.config.control, effectiveParams.control)`, `subagent-executor.ts:3385`
     /// @v0.34.0; the detached async runner reads the same value back out of its one-shot config,
@@ -699,6 +737,14 @@ pub struct RunOptions {
     /// `false` for every tool-driven run, matching upstream's optional field being absent; pi's only
     /// caller that sets it is the slash-command delegation adapter (`slash/delegation-adapters.ts:298`).
     pub enforce_hard_turn_limit: bool,
+    /// SUBA-021 — pi `params.usageBudget` (`extension/schemas.ts:330`, threaded to the runner at
+    /// `subagent-runner.ts:172`): the reported-consumption budget this run enforces.
+    ///
+    /// Already validated by [`crate::exec::usage_budget::validate_usage_budget_config`], so an
+    /// invalid budget never reaches here — it is refused at the tool boundary with upstream's own
+    /// text. `None` means unbudgeted, which is every run that does not ask for one: upstream has no
+    /// default usage budget any more than it has a default turn budget.
+    pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
 }
 
 /// A live per-line sink installed via [`RunOptions::live_events`]: [`run_sync`]'s per-attempt driver
@@ -871,6 +917,18 @@ pub struct SingleResult {
     /// (`subagent-runner.ts:924`).
     #[serde(default, skip_serializing_if = "crate::exec::is_false")]
     pub wrap_up_requested: bool,
+    /// SUBA-021 — pi `statusPayload.usageBudget` (`subagent-runner.ts:4411`, published onto the
+    /// result at `:4471` and onto `status.json` via `async-status.ts:336`): the reported-consumption
+    /// budget this run ran under and where it ended up.
+    ///
+    /// `None` for every run that declared no budget, and omitted from the wire when `None`, so a
+    /// result file written before this field existed still round-trips. When
+    /// [`crate::exec::usage_budget::UsageBudgetState::exhausted`] is set, [`Self::error`] carries
+    /// [`crate::exec::usage_budget::usage_budget_exceeded_message`] — that pairing is upstream's
+    /// own at `:4403-4404`, and it is what makes an exhausted budget a TERMINAL outcome rather than
+    /// a note on a successful run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetState>,
     pub error: Option<String>,
     /// pi `result.savedOutputPath` (`shared/types.ts:492`, assigned at
     /// `runs/foreground/execution.ts:963` from `resolveSingleOutput(...).savedPath`): the concrete
@@ -1511,6 +1569,26 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     // an explicit `tools:` list that omits it.
     require_read_tool: bool,
 ) -> Result<AttemptSpawnPlan, SubagentError> {
+    // SUBA-021 — the CAPABILITY CEILING preflight (pi `resolveCurrentSubagentCapabilityCeiling` +
+    // `assertAgentAllowedByCapabilityCeiling`, `runs/shared/capability-ceiling.ts:168`/`:183`).
+    //
+    // Resolved FIRST, before any argv or env is built, because a ceiling is an upper bound on what
+    // this subtree may do and the only useful place to enforce it is before a child exists. The
+    // resolution intersects the INHERITED ceiling (this process's own
+    // `CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`, which a parent wrote when it spawned us) with every
+    // ceiling registered for this session, so it can only ever tighten as the tree deepens.
+    //
+    // Both arms are fail-CLOSED: a malformed inherited ceiling is an error, not "unbounded".
+    let capability_ceiling = crate::exec::capability_ceiling::resolve_current_capability_ceiling(
+        opts.parent_session_id.as_deref(),
+    )
+    .map_err(SubagentError::CapabilityCeilingViolation)?;
+    crate::exec::capability_ceiling::assert_agent_allowed(
+        agent.name.as_str(),
+        capability_ceiling.as_ref(),
+    )
+    .map_err(SubagentError::CapabilityCeilingViolation)?;
+
     let command = crate::spawn::resolve_spawn_command();
 
     // T4 (pi `applyThinkingSuffix`): the per-attempt model id, suffixed with the agent's frontmatter
@@ -2060,6 +2138,25 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         );
     }
 
+    // SUBA-021 — the capability ceiling resolved at the top of this function crosses the process
+    // boundary here (pi `encodeSubagentCapabilityCeiling` into `SUBAGENT_CAPABILITY_CEILING_ENV`,
+    // `capability-ceiling.ts:192-195`, read back by the child's own
+    // `resolveCurrentSubagentCapabilityCeiling` at `:168`).
+    //
+    // This is what makes the bound MONOTONIC across the re-exec that is this crate's whole
+    // mechanism: the child intersects what it inherits here with anything registered in its own
+    // process, so a grandchild can be narrower than its parent and never wider. Absent ceiling =>
+    // no var, so an unbounded run does not inherit a stale bound from the parent's environment (the
+    // overlay only ever adds).
+    if let Some(encoded) =
+        crate::exec::capability_ceiling::encode_capability_ceiling(capability_ceiling.as_ref())
+    {
+        env_overlay.insert(
+            crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV.to_string(),
+            encoded,
+        );
+    }
+
     // SUBA-045 (pi `pi-args.ts:610-621`): the diagnostic path and the resolved direct-MCP names go
     // out BESIDE the required-tools list and under upstream's own gate — `if
     // (toolPlan.requiredChildTools.length > 0)`. An agent with no explicit `tools:` requires
@@ -2116,6 +2213,32 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         env_overlay.insert(
             crate::prompt_runtime::STEER_INBOX_ENV.to_string(),
             inbox.display().to_string(),
+        );
+    }
+
+    // SUBA-049 (pi `runs/shared/pi-args.ts:764-768` @v0.43.0: `if (input.steerCapabilityPath)
+    // env[SUBAGENT_STEER_CAPABILITY_ENV] = …; if (input.steerAckDir) env[SUBAGENT_STEER_ACK_DIR_ENV]
+    // = …`): the RETURN half of the same channel. Both are written under the same `if (…)` shape
+    // upstream uses, so a foreground child — which has no run directory and therefore neither path —
+    // is byte-identical to before.
+    if let Some(path) = opts
+        .steer_capability_path
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        env_overlay.insert(
+            crate::prompt_runtime::STEER_CAPABILITY_ENV.to_string(),
+            path.display().to_string(),
+        );
+    }
+    if let Some(dir) = opts
+        .steer_ack_dir
+        .as_deref()
+        .filter(|p| !p.as_os_str().is_empty())
+    {
+        env_overlay.insert(
+            crate::prompt_runtime::STEER_ACK_DIR_ENV.to_string(),
+            dir.display().to_string(),
         );
     }
 
@@ -3536,6 +3659,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             max: agent.depth.max_depth,
         };
         return SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
@@ -3567,6 +3692,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     if let Some(err) = validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
     {
         return SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
@@ -3612,6 +3739,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
 
     if candidates.is_empty() {
         return SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
@@ -3677,6 +3806,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
             .any(|m| m == crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL);
         if orchestration_requested && orchestration_missing {
             return SingleResult {
+                // SUBA-021: no usage budget on this path (see the field doc).
+                usage_budget: None,
                 turn_budget: None,
                 turn_budget_exceeded: false,
                 wrap_up_requested: false,
@@ -3719,6 +3850,8 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     let scratch_dir = opts.cwd.join(".cyrup-subagent-scratch");
     if let Err(err) = std::fs::create_dir_all(&scratch_dir) {
         return SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
@@ -3755,6 +3888,18 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
     // run must not fail to start because a control subdirectory could not be made.
     if let Some(inbox) = opts.steer_inbox_dir.as_deref() {
         let _ = std::fs::create_dir_all(inbox);
+    }
+
+    // SUBA-049: same reasoning for the ack directory, one hop earlier. The child creates it itself
+    // before its first write, but the PARENT polls it while waiting for the acknowledgment — and
+    // `consume_steer_acks` treats an unreadable directory as "no acks yet", which is
+    // indistinguishable from "the child has not answered". Creating it here makes the empty-and-
+    // waiting state a real, observable empty directory from the moment the child is spawned.
+    if let Some(acks) = opts.steer_ack_dir.as_deref() {
+        let _ = std::fs::create_dir_all(acks);
+    }
+    if let Some(parent) = opts.steer_capability_path.as_deref().and_then(std::path::Path::parent) {
+        let _ = std::fs::create_dir_all(parent);
     }
 
     // SUBA-S01 (pi `chain-execution.ts:301` / `async-execution.ts:498`): when the step declares an
@@ -4252,7 +4397,31 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         guard.disarm();
     }
 
+    // SUBA-021 — the USAGE budget's terminal check (pi `subagent-runner.ts:4403-4411`):
+    //
+    //     setOptionalProperty(statusPayload, "usageBudget", usageBudgetState(config.usageBudget, currentUsageTotals()));
+    //     if (usageBudgetExceeded && statusPayload.usageBudget && !statusPayload.error)
+    //         statusPayload.error = usageBudgetExceededMessage(statusPayload.usageBudget);
+    //
+    // Computed from the run's AGGREGATE usage (every attempt of the fallback ladder, not just the
+    // winning one) because that is what the run actually spent. `!statusPayload.error` is
+    // load-bearing: a run that already failed keeps its own diagnosis — the budget did not cause
+    // that failure and overwriting it would hide the real cause behind a bookkeeping note.
+    let usage_budget = crate::exec::usage_budget::usage_budget_state(
+        opts.usage_budget,
+        Some(crate::exec::usage_budget::UsageTotals::from(
+            &outcome.aggregate_usage,
+        )),
+    );
+    let error = match (&error, usage_budget.as_ref()) {
+        (None, Some(state)) if state.exhausted => Some(
+            crate::exec::usage_budget::usage_budget_exceeded_message(state),
+        ),
+        _ => error,
+    };
+
     SingleResult {
+        usage_budget,
         // SUBA-008 — pi `result.turnBudget` / `result.turnBudgetExceeded` / `result.wrapUpRequested`
         // (`execution.ts:1087`), published from the WINNING attempt's own latch. `None`/`false` for
         // every run that declared no budget.
@@ -4477,6 +4646,8 @@ mod tests {
 
     fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions {
         RunOptions {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             enforce_hard_turn_limit: false,
             model_scope: None,
@@ -4486,6 +4657,8 @@ mod tests {
             output_path: None,
             output_mode: OutputMode::Inline,
             reads: None,
+            steer_ack_dir: None,
+            steer_capability_path: None,
             structured_output_schema: None,
             model_override: ModelOverride::Inherit,
             preferred_provider: None,
@@ -4511,6 +4684,86 @@ mod tests {
             on_control_event: None,
             artifacts_dir: None,
         }
+    }
+
+    /// SUBA-021 — the CAPABILITY CEILING is consulted by `build_attempt_spawn_plan`, on both of its
+    /// halves: the agent gate REFUSES a delegation outside the ceiling before any child is planned,
+    /// and the resolved ceiling is handed to the child in
+    /// [`crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV`] so the bound survives the re-exec.
+    ///
+    /// Pre-fix BOTH observations were the opposite: `rg 'capability_ceiling' crates/…/src` was 0, so
+    /// there was no ceiling concept at all — every agent was allowed and no env var was ever
+    /// written, meaning a child could be granted a capability set wider than its parent's.
+    ///
+    /// The registration handle is scoped to this test and disposes on `Drop`, so it cannot leak into
+    /// another test's session.
+    #[test]
+    fn the_capability_ceiling_refuses_an_out_of_ceiling_agent_and_reaches_the_child_env() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-ceiling-session";
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+
+        let plan = |agent: &AgentConfig, opts: &RunOptions| {
+            build_attempt_spawn_plan(
+                agent,
+                &ModelId::from("m1"),
+                "task",
+                opts,
+                DepthEnvelope { current_depth: 0, max_depth: 5 },
+                dir.path(),
+                None,
+            )
+        };
+
+        // No ceiling registered: the plan builds and writes no ceiling var (the overlay only adds,
+        // so an unbounded run cannot inherit a stale bound).
+        let unbounded = plan(&agent, &opts).expect("no ceiling, no refusal");
+        assert!(!unbounded
+            .spec
+            .env_overlay
+            .contains_key(cc::CAPABILITY_CEILING_ENV));
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "allowedAgents": ["reviewer"] }),
+        )
+        .expect("registers");
+
+        // `worker` is outside the ceiling: refused BEFORE any argv/env is built, with pi's text.
+        let Err(err) = plan(&agent, &opts) else {
+            panic!("a plan outside the ceiling must be refused");
+        };
+        assert!(
+            matches!(err, SubagentError::CapabilityCeilingViolation(_)),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Capability ceiling from org-policy does not allow agent 'worker'. Allowed agents: \
+             reviewer."
+        );
+
+        // An allowed agent plans normally AND carries the ceiling down to the child.
+        let mut allowed = sample_agent_config("m1", &[]);
+        allowed.name = "reviewer".to_string();
+        let Ok(planned) = plan(&allowed, &opts) else {
+            panic!("an agent inside the ceiling plans normally");
+        };
+        let encoded = planned
+            .spec
+            .env_overlay
+            .get(cc::CAPABILITY_CEILING_ENV)
+            .expect("the ceiling crosses the process boundary");
+        let decoded = cc::decode_capability_ceiling(Some(encoded))
+            .expect("decodes")
+            .expect("present");
+        assert_eq!(decoded.allowed_agents, Some(vec!["reviewer".to_string()]));
+        assert_eq!(decoded.sources, vec!["org-policy".to_string()]);
     }
 
     // ---- AgentProgress: R-SA-027/028 folding ----

@@ -88,8 +88,10 @@ mod tests {
     #[test]
     fn catalog_parses_with_expected_count_and_tags() {
         let models = azure_openai_responses_models();
-        // pi `azure-openai-responses.models.ts` @91585d9a (45 — GPT-5.6 trio, `7df2a94e`).
-        assert_eq!(models.len(), 45);
+        // pi `azure-openai-responses.models.ts` @`b0c2a90e` (46). The 46th is the derived clone
+        // of `openai`'s `gpt-realtime-2.1` row, absent from cyrup's `91585d9a` snapshot
+        // (PROV-057/PROV-060).
+        assert_eq!(models.len(), 46);
         assert!(
             models
                 .iter()
@@ -174,7 +176,7 @@ mod tests {
         let p = azure_openai_responses_provider();
         assert_eq!(p.id(), &ProviderId::from("azure-openai-responses"));
         assert_eq!(p.name(), "Azure OpenAI");
-        assert_eq!(p.models().len(), 45);
+        assert_eq!(p.models().len(), 46);
     }
 
     #[tokio::test]

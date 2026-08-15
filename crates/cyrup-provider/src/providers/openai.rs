@@ -87,9 +87,11 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = openai_models();
-        // Every entry in Pi's `openai.models.ts` @91585d9a (45 models — the GPT-5.6 trio landed in
-        // `7df2a94e`).
-        assert_eq!(models.len(), 45);
+        // Every entry in pi's `openai.models.ts` @`b0c2a90e` (46 models). The 46th is
+        // `gpt-realtime-2.1`, which cyrup was missing until the catalogs were regenerated from a
+        // single revision (PROV-057/PROV-060) — the snapshot had been taken at `91585d9a`, a week
+        // earlier, where the catalog holds 45.
+        assert_eq!(models.len(), 46);
         assert!(models.iter().all(|m| m.api.as_str() == OPENAI_RESPONSES));
         assert!(models.iter().all(|m| m.provider.as_str() == "openai"));
         assert!(models.iter().all(|m| m.base_url == OPENAI_BASE_URL));

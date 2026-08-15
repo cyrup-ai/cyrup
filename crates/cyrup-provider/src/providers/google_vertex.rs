@@ -21,10 +21,12 @@
 //! "feat(ai): separate generated model data") the data moved to
 //! `packages/ai/src/providers/data/google-vertex.json`, which `.gitignore:11` excludes — so at the
 //! ported tag `v0.83.0` the catalog is not obtainable from the repository at all, and `b0c2a90e` is
-//! the closest knowable snapshot to it. This is the same revision
-//! `providers/catalog/github-copilot.json` was extracted from; see that module's note for why a
-//! revision newer than `providers/catalog_manifest.json`'s `91585d9a` cannot violate the manifest's
-//! staleness *floor* invariant (`providers/all.rs:76-83`).
+//! the closest knowable snapshot to it. **Since 2026-08-15 that is true of EVERY embedded catalog,
+//! not just this one:** all 35 are generated from `b0c2a90e` by
+//! `cargo run -p xtask -- gen-catalogs` (PROV-018/PROV-060), so the "four newer files among 31
+//! older ones" split this note used to describe is gone, and `catalog_manifest.json` records one
+//! revision with a per-provider source map. Do not hand-edit this file — `gen-catalogs --check`
+//! fails if you do.
 //!
 //! # Where the rest of Vertex lives
 //!

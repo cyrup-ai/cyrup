@@ -1052,6 +1052,8 @@ mod tests {
 
     fn sample_single_result(agent: &str, output: &str) -> crate::exec::SingleResult {
         crate::exec::SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,

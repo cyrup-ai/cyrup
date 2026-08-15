@@ -100,6 +100,168 @@ pub struct VercelGatewayRouting {
     pub order: Option<Vec<String>>,
 }
 
+/// A price that may be written as a number or as a string (Pi `number | string`,
+/// `types.ts:691-699` @v0.83.0). Passed through verbatim in whichever form the user wrote.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum OpenRouterPrice {
+    Number(f64),
+    Text(String),
+}
+
+/// Per-percentile cutoffs for `preferred_min_throughput` / `preferred_max_latency`
+/// (Pi `types.ts:704-713` / `:717-726` @v0.83.0).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRouterPercentiles {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub p50: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub p75: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub p90: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub p99: Option<f64>,
+}
+
+/// `number | { p50?, p75?, p90?, p99? }` — "can be a number (applies to p50) or an object with
+/// percentile-specific cutoffs" (Pi `types.ts:702-713` @v0.83.0).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum OpenRouterPercentileCutoff {
+    /// The bare number form, which OpenRouter applies to p50.
+    P50(f64),
+    ByPercentile(OpenRouterPercentiles),
+}
+
+/// The object form of `sort` (Pi `types.ts:682-687` @v0.83.0).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRouterSortSpec {
+    /// The sorting metric: `"price"`, `"throughput"`, `"latency"` (Pi `:684`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub by: Option<String>,
+    /// Partitioning strategy: `"model"` (default) or `"none"` (Pi `partition?: string | null`,
+    /// `types.ts:686` @v0.83.0).
+    ///
+    /// The double `Option` and its custom deserializer are load-bearing, because upstream's type is
+    /// a THREE-state one: absent, an explicit `null`, or a string. With a plain `Option<String>`
+    /// serde maps a JSON `null` to `None`, which `skip_serializing_if` then DELETES from the
+    /// outgoing request — so a user's explicit `"partition": null` would silently become "key
+    /// absent", a different instruction to OpenRouter. `de_present_partition` runs only for a
+    /// PRESENT key, so absent stays `None` while `null` becomes `Some(None)` and serializes back
+    /// out as `null`.
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        default,
+        deserialize_with = "de_present_partition"
+    )]
+    pub partition: Option<Option<String>>,
+}
+
+/// See [`OpenRouterSortSpec::partition`]. Serde calls this only for a PRESENT key, so every value
+/// it sees — `null` included — is a value the user actually wrote.
+fn de_present_partition<'de, D>(de: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize as _;
+    Option::<String>::deserialize(de).map(Some)
+}
+
+/// `sort?: string | { by?, partition? }` (Pi `types.ts:680-687` @v0.83.0).
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(untagged)]
+pub enum OpenRouterSort {
+    Named(String),
+    Spec(OpenRouterSortSpec),
+}
+
+/// Maximum price per million tokens, USD (Pi `types.ts:689-700` @v0.83.0).
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRouterMaxPrice {
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub prompt: Option<OpenRouterPrice>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub completion: Option<OpenRouterPrice>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub image: Option<OpenRouterPrice>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub audio: Option<OpenRouterPrice>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub request: Option<OpenRouterPrice>,
+}
+
+/// OpenRouter provider-routing preferences — a 1:1 port of Pi `OpenRouterRouting`
+/// (`packages/ai/src/types.ts:660-727` @v0.83.0), sent verbatim as the `provider` field of the
+/// OpenRouter request body. PROV-066.
+///
+/// **Why this is a struct and not a `serde_json::Value`.** The value is wire-identical either way —
+/// both sides forward it untouched — so what a typed shape buys is the one thing the `Value` form
+/// could not do: **reject a misspelled key**. `deny_unknown_fields` here and on every nested object
+/// turns `"allow_fallback"` (singular) from a preference OpenRouter silently ignores, presenting to
+/// the user as "my `order` never takes effect" with nothing anywhere saying why, into a config
+/// error at load. pi gets the same protection from its TypeScript declaration.
+///
+/// **Field names are the wire names verbatim** — snake_case, NOT the enclosing [`ModelCompat`]'s
+/// `rename_all = "camelCase"`, because OpenRouter's API spells them this way and pi's interface
+/// declares them this way. That is why this type is declared outside `ModelCompat`'s rename scope
+/// and carries no `rename_all` of its own.
+///
+/// **Key ORDER note.** cyrup's `serde_json` has no `preserve_order` feature, so the previous
+/// `Value` representation emitted these keys alphabetically, while pi emits them in the order the
+/// user's config file wrote them (JS objects preserve insertion order). This struct emits them in
+/// pi's DECLARATION order, which matches neither exactly — but JSON object key order carries no
+/// meaning to the OpenRouter API, and no shipped catalog sets `openRouterRouting` at all
+/// (`grep openRouterRouting crates/**/catalog/*.json` is empty), so the only producer is a user's
+/// `models.json`.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpenRouterRouting {
+    /// Whether to allow backup providers to serve requests. Default: true (Pi `:662`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub allow_fallbacks: Option<bool>,
+    /// Filter providers to only those that support all parameters in the request (Pi `:664`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub require_parameters: Option<bool>,
+    /// `"allow"` (default) or `"deny"` (Pi `:666`). Typed as a string rather than a two-variant
+    /// enum because pi types it `"deny" | "allow"` and an unknown value must reach OpenRouter for
+    /// OpenRouter to reject, exactly as it does upstream.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub data_collection: Option<String>,
+    /// Restrict routing to Zero-Data-Retention endpoints only (Pi `:668`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub zdr: Option<bool>,
+    /// Restrict routing to models that allow text distillation (Pi `:670`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub enforce_distillable_text: Option<bool>,
+    /// Ordered list of provider names/slugs to try in sequence (Pi `:672`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub order: Option<Vec<String>>,
+    /// Providers to exclusively allow for this request (Pi `:674`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub only: Option<Vec<String>>,
+    /// Providers to skip for this request (Pi `:676`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub ignore: Option<Vec<String>>,
+    /// Quantization levels to filter providers by (Pi `:678`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub quantizations: Option<Vec<String>>,
+    /// Sorting strategy (Pi `:680-687`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sort: Option<OpenRouterSort>,
+    /// Maximum price per million tokens, USD (Pi `:689-700`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_price: Option<OpenRouterMaxPrice>,
+    /// Preferred minimum throughput, tokens/second (Pi `:702-713`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub preferred_min_throughput: Option<OpenRouterPercentileCutoff>,
+    /// Preferred maximum latency, seconds (Pi `:715-726`).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub preferred_max_latency: Option<OpenRouterPercentileCutoff>,
+}
+
 /// Per-model compatibility overrides — cyrup's **flat union** of every per-API compat shape.
 ///
 /// Pi types `Model<API>["compat"]` per wire API via the `Model<API>` generic, so the single `compat`
@@ -126,6 +288,20 @@ pub struct ModelCompat {
     /// Pi `supportsFinishReason` (v0.84.1 `ai/src/types.ts:547-548`, default `true`): whether
     /// streamed responses include `finish_reason`. When `false`, pi INFERS `stop` vs `toolUse` at
     /// end of stream instead of treating the missing reason as a truncated turn.
+    ///
+    /// `[CYRUP-DELTA]` **Forward-port from v0.84.1; no v0.83.0 warrant** (PROV-063). The ported
+    /// baseline is v0.83.0 and `git grep supportsFinishReason v0.83.0 -- packages/ai` is EMPTY —
+    /// the flag first exists at v0.84.1 (`ai/src/types.ts:548`, read at
+    /// `ai/src/api/openai-completions.ts:578`, `:584`, detected `:1499`, resolved `:1551`). It is
+    /// the only member of [`ModelCompat`] without a baseline counterpart, kept rather than deleted
+    /// because it is real upstream behaviour that the v0.84.1 rebase will need.
+    ///
+    /// **Inert in every shipped configuration**, and that inertness is pinned rather than assumed:
+    /// [`detect_compat`] hard-codes `true` for every provider, no embedded catalog sets the key,
+    /// and the sole consumer (`api/openai_completions.rs`'s stop-reason inference) is therefore
+    /// unreachable — so behaviour is byte-identical to v0.83.0. See
+    /// `supports_finish_reason_is_a_v0841_forward_port_that_stays_inert` and
+    /// `crate::tests::catalog_data`'s roster guard.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub supports_finish_reason: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -143,8 +319,11 @@ pub struct ModelCompat {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub chat_template_kwargs: Option<Map<String, Value>>,
     /// OpenRouter routing, passed through verbatim as the `provider` request field.
+    ///
+    /// PROV-066: typed as [`OpenRouterRouting`] rather than a bare `serde_json::Value`, so a
+    /// misspelled routing key is a config error instead of a preference OpenRouter silently drops.
     #[serde(skip_serializing_if = "Option::is_none", default)]
-    pub open_router_routing: Option<Value>,
+    pub open_router_routing: Option<OpenRouterRouting>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub vercel_gateway_routing: Option<VercelGatewayRouting>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -713,6 +892,190 @@ mod tests {
             mapped_effort_or(Some(&map), ModelThinkingLevel::Medium, "fb"),
             "fb"
         );
+    }
+
+    /// PROV-063 — pins the INERTNESS of the one `ModelCompat` member with no v0.83.0 warrant.
+    ///
+    /// `supports_finish_reason` is a knowing forward-port from v0.84.1 (`ai/src/types.ts:548`;
+    /// `git grep supportsFinishReason v0.83.0 -- packages/ai` is empty). Its `[CYRUP-DELTA]` tag
+    /// says behaviour is byte-identical to the baseline; that claim rests on two facts, and this
+    /// test makes both of them properties rather than observations:
+    ///
+    /// 1. `detect_compat` answers `true` for EVERY provider, so the flag is on unless a catalog
+    ///    turns it off; and
+    /// 2. no embedded catalog turns it off — so `get_compat` can never yield `false` and the sole
+    ///    consumer (`openai_completions.rs`'s stop-reason inference) is unreachable.
+    ///
+    /// **This test does not go red before any change in this pass** — PROV-063 proposed no code
+    /// change and the fix is the `[CYRUP-DELTA]` tag. It goes red the moment somebody makes the
+    /// delta live: shipping a catalog row with `"supportsFinishReason": false`, or flipping the
+    /// detection default, without carrying the item forward.
+    #[test]
+    fn supports_finish_reason_is_a_v0841_forward_port_that_stays_inert() {
+        // (1) Detection is unconditionally `true`, across every shape `detect_compat` branches on.
+        for (provider, base_url, id) in [
+            ("openai", "https://api.openai.com/v1", "gpt-5"),
+            ("together", "https://api.together.ai/v1", "x/y"),
+            ("zai", "https://api.z.ai/api/paas/v4", "glm-4.6"),
+            ("deepseek", "https://api.deepseek.com", "deepseek-chat"),
+            ("openrouter", "https://openrouter.ai/api/v1", "a/b"),
+            ("moonshotai", "https://api.moonshot.ai/v1", "kimi-k2"),
+            ("nvidia", "https://integrate.api.nvidia.com/v1", "n/m"),
+            ("ant-ling", "https://api.ling.ai/v1", "ling-1"),
+            ("custom", "https://example.invalid/v1", "whatever"),
+        ] {
+            assert!(
+                detect_compat(&base_model(provider, base_url, id)).supports_finish_reason,
+                "{provider} must detect supports_finish_reason = true (v0.83.0 has no flag at all)"
+            );
+        }
+
+        // (2) No embedded catalog row sets the key, so the resolver can never see `Some(false)`.
+        for model in crate::catalog::builtin_catalog() {
+            assert_eq!(
+                model
+                    .compat
+                    .as_ref()
+                    .and_then(|c| c.supports_finish_reason),
+                None,
+                "{}/{} sets supportsFinishReason — a v0.84.1-only flag with no v0.83.0 warrant \
+                 (PROV-063). Carry the item forward before shipping it.",
+                model.provider.as_str(),
+                model.id.as_str()
+            );
+            assert!(
+                get_compat(model).supports_finish_reason,
+                "{}/{} resolves supports_finish_reason = false, so the v0.84.1 inference branch \
+                 is LIVE and cyrup no longer matches v0.83.0 (PROV-063)",
+                model.provider.as_str(),
+                model.id.as_str()
+            );
+        }
+    }
+
+    /// PROV-066 (a) — a fully populated routing object round-trips through the typed shape with
+    /// zero semantic change, so nothing on the wire moved.
+    ///
+    /// **Red before the fix:** `open_router_routing` was `Option<serde_json::Value>`; every field
+    /// access below (`routing.sort`, `routing.max_price.prompt`, …) is a compile error against that
+    /// type, so this test could not exist. The `Value` form accepted this JSON and any other.
+    #[test]
+    fn prov066_open_router_routing_round_trips_every_upstream_field() {
+        // Every member of pi `OpenRouterRouting` (`types.ts:660-727` @v0.83.0), including all four
+        // union arms: `sort` as an object, `max_price` mixing number and string, and both
+        // percentile cutoffs in their two forms.
+        let json = serde_json::json!({
+            "allow_fallbacks": false,
+            "require_parameters": true,
+            "data_collection": "deny",
+            "zdr": true,
+            "enforce_distillable_text": false,
+            "order": ["alpha", "beta"],
+            "only": ["alpha"],
+            "ignore": ["gamma"],
+            "quantizations": ["fp16", "bf16"],
+            "sort": { "by": "throughput", "partition": "model" },
+            "max_price": { "prompt": 1.5, "completion": "2.0", "image": 0.1, "audio": 0.2, "request": 0.01 },
+            "preferred_min_throughput": 42.0,
+            "preferred_max_latency": { "p50": 1.0, "p99": 9.0 },
+        });
+
+        let routing: OpenRouterRouting =
+            serde_json::from_value(json.clone()).expect("every upstream field must parse");
+
+        assert_eq!(routing.allow_fallbacks, Some(false));
+        assert_eq!(routing.require_parameters, Some(true));
+        assert_eq!(routing.data_collection.as_deref(), Some("deny"));
+        assert_eq!(routing.zdr, Some(true));
+        assert_eq!(routing.enforce_distillable_text, Some(false));
+        assert_eq!(routing.order.as_deref().map(<[String]>::len), Some(2));
+        assert!(matches!(
+            routing.sort,
+            Some(OpenRouterSort::Spec(OpenRouterSortSpec {
+                by: Some(ref by),
+                partition: Some(Some(ref p)),
+            })) if by == "throughput" && p == "model"
+        ));
+        assert!(matches!(
+            routing.max_price.as_ref().and_then(|m| m.prompt.clone()),
+            Some(OpenRouterPrice::Number(n)) if (n - 1.5).abs() < f64::EPSILON
+        ));
+        assert!(matches!(
+            routing.max_price.as_ref().and_then(|m| m.completion.clone()),
+            Some(OpenRouterPrice::Text(ref s)) if s == "2.0"
+        ));
+        assert!(matches!(
+            routing.preferred_min_throughput,
+            Some(OpenRouterPercentileCutoff::P50(_))
+        ));
+        assert!(matches!(
+            routing.preferred_max_latency,
+            Some(OpenRouterPercentileCutoff::ByPercentile(_))
+        ));
+
+        // The wire payload is unchanged: re-serializing yields the same object, key for key and
+        // value for value. (Key ORDER differs from the old `Value` path — see the type's doc — so
+        // this compares parsed values, which is what the OpenRouter API actually consumes.)
+        let back = serde_json::to_value(&routing).expect("serializes");
+        assert_eq!(back, json, "the typed shape must be wire-identical to the JSON it came from");
+    }
+
+    /// PROV-066 (b) — the whole point: a misspelled key is a config error, not a silent
+    /// pass-through.
+    ///
+    /// **Red before the fix:** with `Option<serde_json::Value>` this JSON deserialized cleanly and
+    /// was forwarded verbatim; OpenRouter ignores unknown members, so the user's `order` preference
+    /// vanished with nothing anywhere saying why. `assert!(… .is_err())` failed.
+    #[test]
+    fn prov066_a_misspelled_routing_key_is_rejected() {
+        // `allow_fallback` — singular; the real key is `allow_fallbacks`.
+        let typo = serde_json::json!({ "order": ["alpha"], "allow_fallback": false });
+        let err = serde_json::from_value::<OpenRouterRouting>(typo)
+            .expect_err("a misspelled routing key must not pass silently");
+        assert!(
+            err.to_string().contains("allow_fallback"),
+            "the error must name the offending key so the user can fix it: {err}"
+        );
+
+        // Nested objects are guarded too — the same failure mode one level down.
+        let nested_typo = serde_json::json!({ "max_price": { "prmopt": 1.0 } });
+        assert!(
+            serde_json::from_value::<OpenRouterRouting>(nested_typo).is_err(),
+            "deny_unknown_fields must reach the nested max_price object"
+        );
+        let sort_typo = serde_json::json!({ "sort": { "bye": "price" } });
+        assert!(
+            serde_json::from_value::<OpenRouterRouting>(sort_typo).is_err(),
+            "deny_unknown_fields must reach the nested sort object"
+        );
+
+        // And the valid spellings still parse, so the guard is not simply rejecting everything.
+        assert!(
+            serde_json::from_value::<OpenRouterRouting>(
+                serde_json::json!({ "order": ["alpha"], "allow_fallbacks": false })
+            )
+            .is_ok()
+        );
+    }
+
+    /// PROV-066 (c) — `sort.partition: null` is preserved rather than dropped. pi types it
+    /// `string | null` (`types.ts:686`), so an explicit null is a value, and collapsing it into
+    /// `Option::None` would silently remove the key from the request.
+    #[test]
+    fn prov066_an_explicit_null_partition_survives_the_round_trip() {
+        let json = serde_json::json!({ "sort": { "by": "price", "partition": null } });
+        let routing: OpenRouterRouting = serde_json::from_value(json.clone()).expect("parses");
+        assert!(
+            matches!(
+                routing.sort,
+                Some(OpenRouterSort::Spec(OpenRouterSortSpec {
+                    partition: Some(None),
+                    ..
+                }))
+            ),
+            "an explicit null must survive as Some(None), not collapse to None"
+        );
+        assert_eq!(serde_json::to_value(&routing).expect("serializes"), json);
     }
 
     #[test]

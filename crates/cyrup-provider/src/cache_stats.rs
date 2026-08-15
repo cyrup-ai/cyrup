@@ -99,6 +99,15 @@ impl ModelPriceSource for [Model] {
     }
 }
 
+/// The same, for an owned catalog. `[Model]` is unsized, so it can satisfy the trait but can never
+/// be coerced to `&dyn ModelPriceSource`; a caller holding a `Vec<Model>` (every real one — the
+/// session's model registry is built, not borrowed) needs this impl to pass it in at all.
+impl ModelPriceSource for Vec<Model> {
+    fn cache_read_rate(&self, provider: &str, model_id: &str) -> Option<f64> {
+        self.as_slice().cache_read_rate(provider, model_id)
+    }
+}
+
 /// A price source that knows nothing — pi's `models.getModel(...) ?? undefined` path, where the
 /// cache-read rate falls back to `0`.
 pub struct NoPrices;

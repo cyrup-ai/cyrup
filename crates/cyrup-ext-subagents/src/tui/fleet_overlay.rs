@@ -219,16 +219,15 @@ async fn run_fleet_action(
 ) -> FleetActionResult {
     match action {
         FleetPendingAction::Steer { target, message, mode } => {
-            // \[CYRUP-DELTA] `mode` is `fleet.rs` delta 1: the `Tab` cycle is ported and shown in
-            // the prompt, but `control_steer` takes no delivery-mode argument yet, so all three
-            // currently deliver identically. Recorded rather than dropped silently, so the
-            // divergence is observable in a trace instead of only in a doc comment — and so the
-            // wiring point is one argument away the day the control channel grows the field.
+            // SUBA-049: `fleet.rs` delta 1 is CLOSED. The `Tab` cycle's mode used to be logged and
+            // then dropped — `control_steer` had no delivery-mode argument, so all three settings
+            // delivered identically and the prompt lied about what it was about to do. It is now
+            // carried through to the `SteerRequest` and honoured by the child's inbox.
             tracing::debug!(
                 target: "cyrup_ext_subagents::fleet",
                 run_id = %target.run_id,
                 mode = mode.as_str(),
-                "fleet steer dispatched (delivery mode not yet carried by control_steer)"
+                "fleet steer dispatched"
             );
             let fallback = format!("Failed to steer async run {}.", target.run_id);
             let dir = target.async_dir.to_str();
@@ -241,6 +240,7 @@ async fn run_fleet_action(
                         Some(message.as_str()),
                         None,
                         target.index,
+                        Some(mode.as_str()),
                     )
                     .await,
                 &fallback,

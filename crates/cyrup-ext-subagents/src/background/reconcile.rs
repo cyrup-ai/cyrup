@@ -165,6 +165,23 @@ pub enum ReconcileAction {
     /// A dead-or-long-stale `Running` pid was detected and a synthesized failure was written to
     /// both `status.json` and a new [`ResultFile`] (R-SA-092, algorithm step 4).
     SynthesizedFailure,
+    /// SUBA-057 — the run carries a [`RunStatus::display_dismissed_at`] marker and no [`ResultFile`]
+    /// repaired it away, so reconciliation declines to report it at all: pi's
+    /// `if (effectiveStatus.displayDismissedAt !== undefined) return { status: null, repaired:
+    /// false, resultPath }` (`stale-run-reconciler.ts:359-361` @v0.47.1).
+    ///
+    /// **[CYRUP-DELTA] on the carrier, not the meaning.** Upstream signals this by returning a
+    /// `null` status; [`ReconcileOutcome::status`] is not an `Option` (every one of its ~20 call
+    /// sites treats it as "current truth", and widening it would push an `unwrap`-shaped decision
+    /// into all of them), so the *action* carries the signal and the status field still carries the
+    /// dismissed record for the one reader that wants it — the single-run status view, which needs
+    /// `run_id` and `display_dismissed_at` to render pi's `State: display-dismissed` report
+    /// (`run-status.ts:332-345`). Callers that upstream would hand a `null` MUST test the action:
+    /// [`crate::background::run_status::list_active_runs`] does, and drops the run.
+    ///
+    /// No write is performed on this path — dismissal is display-only and reconciliation must not
+    /// advance a dismissed run's state.
+    DisplayDismissed,
 }
 
 // =================================================================================================
@@ -227,6 +244,16 @@ pub async fn reconcile(
         // status", never an I/O-not-found error for a legitimately-in-flight run.
         return Ok(reconcile_missing_status(paths, spawn_confirmed_at, now, grace));
     };
+
+    // SUBA-057 — pi `if (effectiveStatus.displayDismissedAt !== undefined) return { status: null,
+    // repaired: false, resultPath }` (`stale-run-reconciler.ts:359-361` @v0.47.1). Sequenced here,
+    // in pi's own position: AFTER the result-file branch (a real result outranks the marker and
+    // erases it, `:169`) and BEFORE the liveness probe (a dismissed run is deliberately never
+    // probed, never repaired and never advanced — dismissal is display-only and terminates
+    // nothing).
+    if status.display_dismissed_at.is_some() {
+        return Ok(ReconcileOutcome { status, action: ReconcileAction::DisplayDismissed });
+    }
 
     // Step 3: status.json exists but isn't claiming Running with a numeric pid — nothing to
     // reconcile (Queued/Paused/terminal all pass through unmodified).
@@ -307,7 +334,18 @@ async fn repair_from_result(
     if !needs_repair {
         // Safe: `needs_repair` is false only in the `Some(status)` arm above.
         if let Some(status) = existing {
-            return Ok(ReconcileOutcome { status, action: ReconcileAction::NoneNeeded });
+            // SUBA-057 — pi `if (effectiveStatus.displayDismissedAt === undefined) return { status:
+            // effectiveStatus, repaired: false, resultPath }` (`stale-run-reconciler.ts:357`): with a
+            // result file present but the status ALREADY terminal, upstream returns early only for a
+            // NON-dismissed run; a dismissed one falls through to its own `status: null` return at
+            // `:359-361`. The marker therefore still hides an already-terminal dismissed run, and only
+            // an actual repair (below) erases it.
+            let action = if status.display_dismissed_at.is_some() {
+                ReconcileAction::DisplayDismissed
+            } else {
+                ReconcileAction::NoneNeeded
+            };
+            return Ok(ReconcileOutcome { status, action });
         }
     }
 
@@ -338,6 +376,12 @@ async fn repair_from_result(
     // otherwise reject the jump (e.g. a corrupted `status.json` stuck in `Queued` while the result
     // file says `Complete`).
     repaired.state = result.state;
+    // SUBA-057 — pi `delete terminalStatus.displayDismissedAt` (`stale-run-reconciler.ts:169`,
+    // inside `terminalStatusFromResult`). A display-dismissal hides a run the operator judged
+    // orphaned; the arrival of a real `ResultFile` proves it was not, so the marker is erased and
+    // the run reappears with its genuine terminal outcome. Without this line a dismissed run whose
+    // result landed a moment later would stay invisible forever.
+    repaired.display_dismissed_at = None;
     repaired.ended_at = repaired.ended_at.or_else(|| Some(epoch_millis(SystemTime::now())));
     repaired.last_update = epoch_millis(SystemTime::now());
 
@@ -491,6 +535,8 @@ fn synthesize_step_results(status: &RunStatus, diagnostic: &str) -> Vec<crate::e
         .steps
         .iter()
         .map(|step| crate::exec::SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
@@ -526,6 +572,8 @@ fn placeholder_result(
 ) -> crate::exec::SingleResult {
     let _ = mode;
     crate::exec::SingleResult {
+        // SUBA-021: no usage budget on this path (see the field doc).
+        usage_budget: None,
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,

@@ -21,21 +21,21 @@
 //! ported tag `v0.83.0` the catalog is not obtainable from the repository at all, and `b0c2a90e` is
 //! the closest knowable snapshot to it.
 //!
-//! `providers/catalog_manifest.json` names `91585d9a` (2026-07-10) as the extraction revision for
-//! the sibling catalogs. This one is deliberately NEWER, because `91585d9a` is demonstrably stale
-//! against the ported tag on points that change behavior, not just pricing:
+//! **This note used to argue why THIS catalog was deliberately newer than its siblings' `91585d9a`.
+//! That argument is settled and the exception is gone: since 2026-08-15 every embedded catalog is
+//! generated from `b0c2a90e` by `cargo run -p xtask -- gen-catalogs` (PROV-018/PROV-060).** The
+//! evidence it rested on is why: `91585d9a` was demonstrably stale against the ported tag on points
+//! that change behaviour, not just pricing —
 //!
-//! - `mai-code-1-flash-picker` moved from `openai-completions` to `openai-responses` in Pi
+//! - `mai-code-1-flash-picker` moved from `openai-completions` to `openai-responses` in pi
 //!   `f7b78e2a` (2026-07-13, "route GitHub Copilot MAI-Code models through /responses endpoint").
-//!   Shipping the `91585d9a` row would POST chat-completions bodies to a `/responses` model.
+//!   Shipping the `91585d9a` row would POST chat-completions bodies to a `/responses` model — the
+//!   same defect PROV-054 later found on `xai/grok-4.5`, which nobody had made this argument for.
 //! - `gemini-3-flash-preview`'s context window went 200k → 1M in `9eedaf8c`.
 //! - The `gpt-5.6-{luna,sol,terra}` trio landed for Copilot after `91585d9a`.
 //!
-//! The sibling catalogs are already not uniformly at `91585d9a` either — `catalog/openai.json`
-//! carries the same GPT-5.6 trio, added upstream in `7df2a94e` (2026-07-09). Using the newer
-//! revision here cannot violate the manifest's *floor* invariant (`providers/all.rs:76-83`): a lower
-//! `generatedAt` only makes the pi.dev overlay MORE likely to be accepted, and the overlay can never
-//! remove an embedded model.
+//! Generalising this one file's reasoning to all 35 is exactly what the regeneration did. Do not
+//! hand-edit this file — `gen-catalogs --check` fails if you do.
 //!
 //! # Where the login lives
 //!

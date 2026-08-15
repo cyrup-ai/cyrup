@@ -85,6 +85,21 @@ pub enum SubagentError {
     #[error("{0}")]
     ModelOutOfScope(String),
 
+    /// SUBA-021 — the run named an agent outside the effective CAPABILITY CEILING (pi
+    /// `assertAgentAllowedByCapabilityCeiling`, `runs/shared/capability-ceiling.ts:183-186`), or the
+    /// inherited ceiling itself was malformed, so the run was REFUSED before any child process was
+    /// spawned.
+    ///
+    /// Carries pi's verbatim text (`Capability ceiling from <sources> does not allow agent '<name>'.
+    /// Allowed agents: <list>.`, `capability-ceiling.ts:180`) as the whole message, so the operator
+    /// sees WHICH policy blocked the delegation and what it does allow.
+    ///
+    /// Fail-CLOSED for the same reason [`Self::ModelOutOfScope`] is: a ceiling is an upper bound on
+    /// what a subtree may do, so an unreadable one must refuse rather than degrade to "unbounded" —
+    /// degrading would invert the guarantee exactly when it matters.
+    #[error("{0}")]
+    CapabilityCeilingViolation(String),
+
     /// The per-SESSION subagent spawn budget (`subagents.maxSubagentSpawnsPerSession`) would be
     /// exceeded by this dispatch, so the WHOLE call was refused before any child was planned
     /// (SUBA-002; pi `reserveSubagentSpawns`, `runs/foreground/subagent-executor.ts:266-282`).

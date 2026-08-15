@@ -123,8 +123,11 @@ impl Provider for ConfigProvider {
 
     /// PROV-M01 — trait default is `None` ("static provider"). Delegated so the answer tracks the
     /// inner rather than this wrapper's knowledge of what the inner currently implements.
-    async fn refresh_models(&self) -> Option<Result<(), crate::error::ProviderError>> {
-        self.inner.refresh_models().await
+    async fn refresh_models(
+        &self,
+        ctx: &crate::provider::RefreshModelsContext,
+    ) -> Option<Result<(), crate::error::ProviderError>> {
+        self.inner.refresh_models(ctx).await
     }
 
     fn stream(

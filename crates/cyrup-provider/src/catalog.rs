@@ -19,13 +19,14 @@ pub fn load_catalog(json: &str) -> Result<Vec<Model>, serde_json::Error> {
 }
 
 /// Every model the implemented built-in providers ship — the real, whole model registry catalog
-/// (Pi `Models.getModels()` over `builtinModels()`, `models.ts:130` / `all.ts:111-117`).
+/// (Pi `Models.getModels()` over `builtinModels()`, `models.ts:135` @v0.83.0 / `all.ts:111-117`).
 ///
 /// This is the credential-BLIND read: it is the complete synchronous catalog, exactly as Pi
 /// documents `getModels()` ("`getModels()` remains the complete synchronous catalog", `models.ts:108`),
 /// and it is what an embedder that only needs provider/model METADATA (cost, reasoning,
 /// `context_window`, `max_tokens`) should consult. Pi's credential-FILTERED
-/// `Models.getAvailable()` (`models.ts:394-408`, provider auth checked per provider) has no port in
+/// `Models.getAvailable()` (`models.ts:394-409` @v0.83.0, provider auth checked per provider) is now
+/// ported (PROV-031); a caller that wants availability must still layer its own auth check on top of
 /// this crate yet; a caller that wants availability must layer its own auth check on top.
 ///
 /// Composition matches [`crate::providers::all::default_models`] with default options: every
@@ -34,7 +35,8 @@ pub fn load_catalog(json: &str) -> Result<Vec<Model>, serde_json::Error> {
 /// catalogs are compile-time constants, so nothing here can change between calls.
 ///
 /// Never panics: a provider whose catalog fails to parse simply contributes no models (Pi's
-/// catch-and-skip contract, `models.ts:99-101`).
+/// catch-and-skip contract, `models.ts:254-258` and `:263-267` @v0.83.0; PROV-041 corrected
+/// `:99-101`, the `refreshModels?` docblock).
 pub fn builtin_catalog() -> &'static [Model] {
     static CATALOG: std::sync::OnceLock<Vec<Model>> = std::sync::OnceLock::new();
     CATALOG.get_or_init(|| {

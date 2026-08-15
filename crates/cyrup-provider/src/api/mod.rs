@@ -3,6 +3,33 @@
 //! One `ApiImpl` per wire protocol. Multiple providers share one impl (R-01-007); a provider maps
 //! `model.api → ApiImpl` per request (mixed-API, R-01-008). The registry constructs impls lazily on
 //! first use of their api id (R-01-010/066).
+//!
+//! ## `[CYRUP-DELTA, mechanism]` — a fn-pointer factory table where pi uses dynamic `import()`
+//!
+//! PROV-067. **The id set is identical and nothing observable differs; the deferral MECHANISM is
+//! substituted, and this note is the sign-off the port-mechanism-fidelity rule requires.**
+//!
+//! pi declares its wire apis as `KnownApi` (`packages/ai/src/types.ts:16-26` @v0.83.0, 10 ids) plus
+//! `KnownImagesApi` (`:30`, `openrouter-images`), and makes each one lazy with a per-module
+//! `api/<id>.lazy.ts` wrapper: `export const anthropicMessagesApi = (): ProviderStreams =>
+//! lazyApi(() => import("./anthropic-messages.ts"))`. `lazyApi` (`api/lazy.ts:66-75` @v0.83.0)
+//! returns a `ProviderStreams` **immediately** and defers the `import()` — the actual module load —
+//! to the first `stream`/`streamSimple` call on it, relying on the JS host's import cache to
+//! deduplicate. cyrup registers the same 10 ids ([`crate::known_api`], registered in
+//! [`register_builtins`]) plus `openrouter-images` in [`crate::images`], and defers with
+//! [`ApiFactory`] + [`ApiRegistry::get`]'s get-or-init.
+//!
+//! **Why the substitution.** Rust has no dynamic `import()`: a wire impl is a statically linked
+//! type, so there is no module-load event to defer and no import cache to share. The only thing
+//! left to defer is *construction of the impl value*, which is what the factory table does. The
+//! deferral POINT is the same in observable terms — pi builds nothing of an api until a request
+//! streams over it; cyrup constructs nothing of an api until a request resolves it out of the
+//! registry — and both are once-per-process. Nothing in either codebase depends on module-load
+//! timing (`lazy.ts` carries no top-level side effect beyond the import itself), which is what
+//! makes the two equivalent rather than merely similar.
+//!
+//! Pinned by [`tests::prov067_registry_constructs_nothing_until_the_first_get`], so "same
+//! observable laziness" stays a property rather than a claim in a comment.
 
 use crate::auth::AuthResult;
 use crate::context::Context;
@@ -217,6 +244,57 @@ mod tests {
         let _ = reg.get(&ApiId::from("lazy")).unwrap();
         let _ = reg.get(&ApiId::from("lazy")).unwrap();
         assert_eq!(FACTORY_CALLS.load(Ordering::SeqCst), 1); // get-or-init: built once
+    }
+
+    /// PROV-067 — pins the `[CYRUP-DELTA, mechanism]` note in this module's header.
+    ///
+    /// The substituted mechanism (fn-pointer factory table vs pi's per-module dynamic `import()`
+    /// in `api/*.lazy.ts` @v0.83.0) is only defensible while two things hold: the id set is
+    /// identical, and construction really is deferred. `lazy_factory_runs_once` above proves the
+    /// second for a hand-built registry; this proves BOTH for the registry that actually ships.
+    ///
+    /// **This test does not go red before any change in this pass** — PROV-067 proposed no code
+    /// change and the fix is the header note. It goes red if a factory is replaced by an eager
+    /// `register_impl` (construction at registry-build time, which pi's `lazyApi` never does) or if
+    /// the registered id set drifts from pi's `KnownApi`.
+    #[test]
+    fn prov067_registry_constructs_nothing_until_the_first_get() {
+        let reg = builtin_registry();
+
+        // pi `KnownApi` (`packages/ai/src/types.ts:16-26` @v0.83.0) — all ten, no more, no fewer.
+        // `openrouter-images` is `KnownImagesApi` (`:30`) and lives in `crate::images`, not here.
+        let mut registered: Vec<String> = reg.factories.keys().map(|a| a.to_string()).collect();
+        registered.sort();
+        let mut expected = vec![
+            crate::known_api::ANTHROPIC_MESSAGES,
+            crate::known_api::AZURE_OPENAI_RESPONSES,
+            crate::known_api::BEDROCK_CONVERSE_STREAM,
+            crate::known_api::GOOGLE_GENERATIVE_AI,
+            crate::known_api::GOOGLE_VERTEX,
+            crate::known_api::MISTRAL_CONVERSATIONS,
+            crate::known_api::OPENAI_CODEX_RESPONSES,
+            crate::known_api::OPENAI_COMPLETIONS,
+            crate::known_api::OPENAI_RESPONSES,
+            crate::known_api::PI_MESSAGES,
+        ];
+        expected.sort_unstable();
+        assert_eq!(registered, expected, "registered wire-api ids drifted from pi's KnownApi");
+
+        // Nothing is constructed by building the registry — pi's `lazyApi` likewise runs no
+        // `import()` until a stream call.
+        assert_eq!(reg.live.len(), 0, "builtin_registry() constructed an impl eagerly");
+
+        // `contains` answers from the factory table, so a capability probe stays free.
+        for id in &expected {
+            assert!(reg.contains(&ApiId::from(*id)), "{id} not registered");
+        }
+        assert_eq!(reg.live.len(), 0, "contains() constructed an impl");
+
+        // The first `get` constructs exactly one impl, and only the one asked for.
+        let anthropic = ApiId::from(crate::known_api::ANTHROPIC_MESSAGES);
+        let imp = reg.get(&anthropic).expect("anthropic-messages registered");
+        assert_eq!(imp.api(), &anthropic);
+        assert_eq!(reg.live.len(), 1, "a single get constructed more than its own impl");
     }
 
     #[test]

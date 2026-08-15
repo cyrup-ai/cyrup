@@ -342,8 +342,14 @@ impl Provider for RemoteCatalogProvider {
         self.inner.provider_auth()
     }
 
-    async fn refresh_models(&self) -> Option<Result<(), ProviderError>> {
-        self.inner.refresh_models().await
+    /// PROV-S05 — the context is forwarded UNCHANGED. pi's spread carries `refreshModels` through
+    /// with its argument intact (`remote-catalog-provider.ts:54` @v0.83.0); dropping `allow_network`,
+    /// `force` or the abort token here would make an overlaid provider silently un-cancellable.
+    async fn refresh_models(
+        &self,
+        ctx: &crate::provider::RefreshModelsContext,
+    ) -> Option<Result<(), ProviderError>> {
+        self.inner.refresh_models(ctx).await
     }
 
     fn stream(

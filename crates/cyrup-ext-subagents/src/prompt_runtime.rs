@@ -132,6 +132,20 @@ pub const STRUCTURED_OUTPUT_TOOL_NAME: &str = "structured_output";
 /// existed at all, so nothing in the crate ever read them in production.
 pub const STEER_INBOX_ENV: &str = "CYRUP_SUBAGENT_STEER_INBOX";
 
+/// SUBA-049 — where this child publishes its steering capability once, at start. pi
+/// `SUBAGENT_STEER_CAPABILITY_ENV` (`runs/shared/pi-args.ts:101`, value
+/// `PI_SUBAGENT_STEER_CAPABILITY`), read at `subagent-prompt-runtime.ts:334`.
+pub const STEER_CAPABILITY_ENV: &str = "CYRUP_SUBAGENT_STEER_CAPABILITY";
+
+/// SUBA-049 — where this child writes one [`crate::background::control::SteerAck`] per consumed or
+/// refused request. pi `SUBAGENT_STEER_ACK_DIR_ENV` (`runs/shared/pi-args.ts:102`, value
+/// `PI_SUBAGENT_STEER_ACK_DIR`), read at `subagent-prompt-runtime.ts:335`.
+///
+/// Declared here, on the reader, for the same reason [`STEER_INBOX_ENV`] is — and with the same
+/// history behind the convention: the request half of this channel spent an entire release as a
+/// write-only file drop because the writer and the reader never shared a constant.
+pub const STEER_ACK_DIR_ENV: &str = "CYRUP_SUBAGENT_STEER_ACK_DIR";
+
 /// How often the child re-checks its inbox. pi `setInterval(flush, 250)`
 /// (`subagent-prompt-runtime.ts:432`).
 ///
@@ -188,11 +202,59 @@ pub fn format_steer_message(request: &crate::background::control::SteerRequest) 
 pub struct SteeringInbox {
     /// `<run_dir>/control/steer-targets/<flatIndex>/` for THIS child.
     dir: PathBuf,
+    /// SUBA-049 — `<run_dir>/control/steer-acks/<flatIndex>/` for THIS child, from
+    /// [`STEER_ACK_DIR_ENV`]. `None` reproduces upstream's own `if (!ackDir … ) return;`
+    /// (`subagent-prompt-runtime.ts:349`): the child still delivers, it just does not report.
+    ack_dir: Option<PathBuf>,
+    /// SUBA-049 — `<run_dir>/control/steer-capabilities/<flatIndex>.json`, from
+    /// [`STEER_CAPABILITY_ENV`]. `None` degrades the same way.
+    capability_path: Option<PathBuf>,
+    /// SUBA-049 — this child's flat index, which every ack and the capability record carry so the
+    /// parent can tell WHICH child of a fan-out answered. pi reads it from
+    /// `SUBAGENT_CHILD_INDEX_ENV` (`subagent-prompt-runtime.ts:337`).
+    child_index: usize,
     /// The late-bound capability backend (`NativeExtension::set_host_services`). `None` until the
     /// host binds it, and on a headless/default host it is bound to a backend whose
     /// `inject_message` denies — both of which degrade to "no steering", never to a panic.
     services: std::sync::Mutex<Option<Arc<dyn cyrup_ext::host::HostServices>>>,
     state: std::sync::Mutex<SteeringInboxState>,
+}
+
+/// SUBA-049 — one follow-up request parked until a turn boundary (pi's `queued` array entry,
+/// `subagent-prompt-runtime.ts:339`).
+#[derive(Clone, Debug)]
+struct QueuedFollowUp {
+    request: crate::background::control::SteerRequest,
+    /// pi `ready` (`:339`): a follow-up queued DURING a turn is not eligible at that same turn's
+    /// start — it becomes ready at the turn's END. Without this flag a mid-turn `follow_up` would
+    /// be delivered by the very turn it was meant to follow.
+    ready: bool,
+}
+
+/// Clears [`SteeringInboxState::flushing`] on every exit from [`SteeringInbox::flush`], including a
+/// future-drop.
+///
+/// Upstream's `flush` is a SYNCHRONOUS `(): void` whose whole body sits in
+/// `try { … } finally { flushing = false; }` (`subagent-prompt-runtime.ts:381-413`), so the latch
+/// cannot outlive the call. cyrup's port is `async` and awaits at every `acknowledge`, at
+/// `consume_steer_requests_from_dir` and at the write-back — and a Rust future can be dropped at any
+/// one of them (the caller is an event handler; the runtime also drives `flush` from the poll task).
+/// A plain fall-through assignment therefore reproduces the `try` and NOT the `finally`: one dropped
+/// flush would latch `flushing = true` forever, every later flush would take the `:534` early
+/// return, and the inbox would go permanently deaf — silently, since the requests keep being
+/// consumed off disk but never acknowledged, so the parent's `await_steer_ack` only ever times out
+/// to `pending`. This guard is that `finally`.
+struct FlushGuard<'a> {
+    state: &'a std::sync::Mutex<SteeringInboxState>,
+}
+
+impl Drop for FlushGuard<'_> {
+    fn drop(&mut self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .flushing = false;
+    }
 }
 
 #[derive(Default)]
@@ -209,16 +271,88 @@ struct SteeringInboxState {
     /// could interleave two orderings of one queue, and ordering is the one property the
     /// `(ts, id)` sort exists to guarantee.
     flushing: bool,
+    /// SUBA-049 / pi `inTurn` (`:343`): whether an assistant turn is currently in flight. This is
+    /// the whole of what `mode: "auto"` branches on.
+    in_turn: bool,
+    /// SUBA-049 / pi `queued` (`:339`): follow-ups parked for a turn boundary, capped at
+    /// [`crate::background::control::MAX_STEER_QUEUE_SIZE`].
+    queued: Vec<QueuedFollowUp>,
 }
 
 impl SteeringInbox {
     #[must_use]
-    fn new(dir: PathBuf) -> Self {
+    fn new(
+        dir: PathBuf,
+        ack_dir: Option<PathBuf>,
+        capability_path: Option<PathBuf>,
+        child_index: usize,
+    ) -> Self {
         Self {
             dir,
+            ack_dir,
+            capability_path,
+            child_index,
             services: std::sync::Mutex::new(None),
             state: std::sync::Mutex::new(SteeringInboxState::default()),
         }
+    }
+
+    /// SUBA-049 / pi's `acknowledge` closure (`subagent-prompt-runtime.ts:348-358`).
+    ///
+    /// A write failure is swallowed exactly as upstream's is: the acknowledgment is a diagnostic
+    /// channel, and a child that cannot report must still deliver. Its absence is what the parent's
+    /// acknowledgment timeout already covers.
+    async fn acknowledge(
+        &self,
+        request: &crate::background::control::SteerRequest,
+        state: crate::background::control::SteerAckState,
+        message: &str,
+        delivery_status: Option<crate::background::control::SteerDeliveryStatus>,
+    ) {
+        let Some(dir) = self.ack_dir.as_deref() else {
+            return;
+        };
+        let ack = crate::background::control::SteerAck {
+            kind: "steer-ack".to_string(),
+            protocol_version: 1,
+            request_id: request.id.clone(),
+            index: self.child_index,
+            state,
+            message: message.to_string(),
+            ts: crate::background::control::now_epoch_millis(),
+            delivery_status,
+        };
+        let _ = crate::background::control::write_steer_ack_at(dir, &ack).await;
+    }
+
+    /// SUBA-049 / pi's `publishCapability` closure (`subagent-prompt-runtime.ts:360-363`).
+    ///
+    /// Republished on every `activate`, not only at `start`, and the reason is a Rust-side ordering
+    /// fact rather than a preference: `NativeExtension::set_host_services` is LATE-BOUND, so at
+    /// `session_start` this child genuinely does not yet know whether it can be steered. Upstream's
+    /// `canSteer` is decidable at registration because `pi.sendUserMessage` either exists or does
+    /// not. Publishing once here would therefore pin `supported: false` on every child that can in
+    /// fact be steered — the exact inversion of what the record is for.
+    ///
+    /// [CYRUP-DELTA: republish cadence only. The record shape, the path and the semantics are pi's.]
+    async fn publish_capability(&self) {
+        let Some(path) = self.capability_path.as_deref() else {
+            return;
+        };
+        let supported = self
+            .services
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some();
+        let capability = crate::background::control::SteerCapability {
+            kind: "steer-capability".to_string(),
+            protocol_version: 1,
+            index: self.child_index,
+            pid: std::process::id(),
+            ready_at: crate::background::control::now_epoch_millis(),
+            supported,
+        };
+        let _ = crate::background::control::write_steer_capability_at(path, &capability).await;
     }
 
     /// The inbox this child watches — exposed for tests and diagnostics.
@@ -256,6 +390,12 @@ impl SteeringInbox {
         }
         let inbox = Arc::clone(self);
         tokio::spawn(async move {
+            // SUBA-049 / pi `start`'s `publishCapability()` (`subagent-prompt-runtime.ts:227`):
+            // announce this child BEFORE the first poll, so a parent that steers immediately finds
+            // a capability record rather than an empty directory it cannot interpret. Done on the
+            // poller task because `start` is sync (it is called from a sync `session_start` arm)
+            // and the write is async.
+            inbox.publish_capability().await;
             loop {
                 tokio::time::sleep(STEER_POLL_INTERVAL).await;
                 if inbox
@@ -286,27 +426,131 @@ impl SteeringInbox {
             }
             state.can_steer = true;
         }
+        self.publish_capability().await;
         self.flush().await;
     }
 
-    /// pi `dispose` (`:252-258`).
-    fn dispose(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.disposed = true;
-        state.can_steer = false;
+    /// SUBA-049 / pi's `turn_start` handler (`subagent-prompt-runtime.ts:449-457`): a turn is now in
+    /// flight, and exactly ONE ready follow-up is released into it.
+    ///
+    /// One, not all: upstream splices a single entry (`queued.splice(next, 1)`), so a burst of
+    /// queued follow-ups is spread across turn boundaries rather than dumped into one turn. That is
+    /// the difference between "follow-up" and "steer" surviving the queue.
+    pub async fn on_turn_start(self: &Arc<Self>) {
+        let released = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.disposed {
+                return;
+            }
+            state.in_turn = true;
+            state
+                .queued
+                .iter()
+                .position(|entry| entry.ready)
+                .map(|at| state.queued.remove(at))
+        };
+        if let Some(entry) = released {
+            let delivered = self
+                .services
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()
+                .is_some_and(|services| {
+                    services
+                        .inject_message(&format_steer_message(&entry.request), None, true, false)
+                        .is_ok()
+                });
+            if delivered {
+                self.acknowledge(
+                    &entry.request,
+                    crate::background::control::SteerAckState::Delivered,
+                    "Cyrup delivered the queued follow-up at a turn boundary.",
+                    Some(crate::background::control::SteerDeliveryStatus::Delivered),
+                )
+                .await;
+            } else {
+                // Not upstream's branch, because upstream cannot reach it: `sendUserMessage` is
+                // resolved once at registration and cannot start failing later. cyrup's host CAN
+                // (the session may be tearing down), and a follow-up that was acknowledged `queued`
+                // and then silently evaporated is precisely the fire-and-forget failure this item
+                // exists to remove — so the terminal outcome is reported.
+                self.acknowledge(
+                    &entry.request,
+                    crate::background::control::SteerAckState::Failed,
+                    "Run ended before queued follow-up delivery.",
+                    Some(crate::background::control::SteerDeliveryStatus::Queued),
+                )
+                .await;
+            }
+        }
+        self.activate().await;
+    }
+
+    /// SUBA-049 / pi's `turn_end` handler (`subagent-prompt-runtime.ts:458-462`): the turn is over,
+    /// so every parked follow-up becomes eligible for the NEXT one.
+    pub async fn on_turn_end(self: &Arc<Self>) {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if state.disposed {
+                return;
+            }
+            state.in_turn = false;
+            for entry in &mut state.queued {
+                entry.ready = true;
+            }
+        }
+        self.activate().await;
+    }
+
+    /// pi `dispose` (`:252-258`) plus SUBA-049's `session_shutdown` acknowledgment sweep
+    /// (`subagent-prompt-runtime.ts:465-469`): every follow-up still parked when the run ends is
+    /// reported `failed`, because it was never delivered.
+    ///
+    /// This is the acknowledgment that makes the whole channel honest. Without it a `follow_up`
+    /// steer against a child that finished before its next turn boundary would have been
+    /// acknowledged `queued` and then silently vanished — a fire-and-forget outcome wearing a
+    /// receipt.
+    pub async fn dispose(&self) {
+        let queued = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.disposed = true;
+            state.can_steer = false;
+            state.in_turn = false;
+            std::mem::take(&mut state.queued)
+        };
+        for entry in queued {
+            self.acknowledge(
+                &entry.request,
+                crate::background::control::SteerAckState::Failed,
+                "Run ended before queued follow-up delivery.",
+                Some(crate::background::control::SteerDeliveryStatus::Queued),
+            )
+            .await;
+        }
     }
 
     /// pi `flush` (`:205-222`): drain the inbox in `(ts, id)` order and inject each request into
     /// the live session.
     ///
-    /// On an injection failure, the requests NOT yet delivered — including the one that failed —
-    /// are written back to the inbox and the drain stops (pi `:214-217`). This is what makes the
-    /// hand-off lossless across a transient host error: `consume_steer_requests_from_dir` removes
-    /// each file as it reads it, so without the write-back a single failed inject would silently
-    /// discard the rest of the queue.
+    /// On an injection failure the failed request is acknowledged `failed` and the requests AFTER
+    /// it are written back to the inbox, then the drain stops (pi `:389-392`, whose write-back loop
+    /// is over `requests.slice(index + 1)`). This is what makes the hand-off lossless across a
+    /// transient host error:
+    /// `consume_steer_requests_from_dir` removes each file as it reads it, so without the write-back
+    /// a single failed inject would silently discard the rest of the queue.
+    ///
+    /// SUBA-049: every path out of this loop now writes exactly one
+    /// [`crate::background::control::SteerAck`]. That is the invariant — a request that was
+    /// consumed and not acknowledged is the fire-and-forget bug this item was filed for.
     async fn flush(&self) {
         {
             let mut state = self
@@ -318,6 +562,10 @@ impl SteeringInbox {
             }
             state.flushing = true;
         }
+        // pi's `finally { flushing = false; }` (`:411-413`). Armed the instant the latch is set and
+        // BEFORE the first `.await`, so no drop point between here and the end of the body can
+        // strand it. See [`FlushGuard`].
+        let _flush_guard = FlushGuard { state: &self.state };
 
         let services = self
             .services
@@ -325,21 +573,124 @@ impl SteeringInbox {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
 
-        if let Some(services) = services {
-            let requests =
-                crate::background::control::consume_steer_requests_from_dir(&self.dir).await;
-            for (index, request) in requests.iter().enumerate() {
-                // `custom_type: None` is the load-bearing argument: it routes to
-                // `AgentSession::send_user_message`, i.e. a real USER message the model must
-                // answer, which is what `deliverAs: "steer"` means. A `Some(kind)` would make it a
-                // custom (non-LLM) message the model never sees. `display: true` so the operator
-                // watching the child's transcript sees the guidance arrive; `trigger_turn: true`
-                // so an IDLE child (between turns) actually acts on it instead of parking it.
-                if services
-                    .inject_message(&format_steer_message(request), None, true, true)
-                    .is_err()
-                {
-                    for pending in requests.get(index..).unwrap_or_default() {
+        let requests =
+            crate::background::control::consume_steer_requests_from_dir(&self.dir).await;
+        for (index, request) in requests.iter().enumerate() {
+            // SUBA-049 / pi `:370-372`. The `canSteer` half of upstream's guard is cyrup's
+            // "`set_host_services` never bound a backend": both mean the child has no way to reach
+            // its own session. Before this the request was simply dropped on the floor and the tool
+            // still answered success.
+            //
+            // [CYRUP-DELTA: "Pi" -> "Cyrup" in the sentence, matching this crate's standing rebrand
+            // of upstream's product noun in user-facing text — the same substitution
+            // `STEER_FOREGROUND_RUN_REFUSAL` already carries.]
+            let Some(services) = services.clone() else {
+                self.acknowledge(
+                    request,
+                    crate::background::control::SteerAckState::Failed,
+                    "Child Cyrup session does not support sendUserMessage steering.",
+                    None,
+                )
+                .await;
+                continue;
+            };
+
+            // pi `:374-375`: `follow_up` always parks; `auto` parks only when a turn is already in
+            // flight; `steer` (and an absent mode) always interrupts.
+            let requested_mode = request
+                .mode
+                .unwrap_or(crate::background::control::SteerDeliveryMode::Steer);
+            let in_turn = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .in_turn;
+            let park = matches!(
+                requested_mode,
+                crate::background::control::SteerDeliveryMode::FollowUp
+            ) || (matches!(
+                requested_mode,
+                crate::background::control::SteerDeliveryMode::Auto
+            ) && in_turn);
+
+            if park {
+                // pi `:376-380`: the cap is enforced BEFORE the message is accepted, and a request
+                // over it is acknowledged `failed` with this exact sentence rather than silently
+                // discarded. This is the item's own Verify.
+                let accepted = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if state.queued.len() >= crate::background::control::MAX_STEER_QUEUE_SIZE {
+                        false
+                    } else {
+                        // Queued DURING a turn -> not eligible until that turn ends.
+                        let ready = !state.in_turn;
+                        state.queued.push(QueuedFollowUp { request: request.clone(), ready });
+                        true
+                    }
+                };
+                if accepted {
+                    self.acknowledge(
+                        request,
+                        crate::background::control::SteerAckState::Queued,
+                        "Cyrup queued the correlated follow-up input.",
+                        Some(crate::background::control::SteerDeliveryStatus::Queued),
+                    )
+                    .await;
+                } else {
+                    self.acknowledge(
+                        request,
+                        crate::background::control::SteerAckState::Failed,
+                        &format!(
+                            "Follow-up queue is full ({} messages).",
+                            crate::background::control::MAX_STEER_QUEUE_SIZE
+                        ),
+                        None,
+                    )
+                    .await;
+                }
+                continue;
+            }
+
+            // `custom_type: None` is the load-bearing argument: it routes to
+            // `AgentSession::send_user_message`, i.e. a real USER message the model must
+            // answer, which is what `deliverAs: "steer"` means. A `Some(kind)` would make it a
+            // custom (non-LLM) message the model never sees. `display: true` so the operator
+            // watching the child's transcript sees the guidance arrive; `trigger_turn: true`
+            // so an IDLE child (between turns) actually acts on it instead of parking it.
+            match services.inject_message(&format_steer_message(request), None, true, true) {
+                Ok(()) => {
+                    // SUBA-049 / pi `:413`. Upstream can only report this once its own `input`
+                    // event correlates the injected text back to the request; cyrup's
+                    // `inject_message` reports acceptance synchronously at the call, so the
+                    // acknowledgment is written here.
+                    //
+                    // [CYRUP-DELTA: no `input`-event round trip. Upstream needs the correlation
+                    // because `pi.sendUserMessage` returns before the host has accepted; the
+                    // `HostServices` seam does not, so the two-phase `pending` map has no work to
+                    // do and would only introduce a window in which an accepted steer is
+                    // unacknowledged.]
+                    self.acknowledge(
+                        request,
+                        crate::background::control::SteerAckState::Delivered,
+                        "Cyrup accepted the correlated steering input.",
+                        Some(crate::background::control::SteerDeliveryStatus::Delivered),
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    // pi `:389-392`: report the failure with the host's own message, put the
+                    // UNDELIVERED remainder back (including this one), and stop the drain.
+                    self.acknowledge(
+                        request,
+                        crate::background::control::SteerAckState::Failed,
+                        &error.to_string(),
+                        None,
+                    )
+                    .await;
+                    for pending in requests.get(index + 1..).unwrap_or_default() {
                         let _ = crate::background::control::write_steer_request_to_dir(
                             &self.dir, pending,
                         )
@@ -350,10 +701,8 @@ impl SteeringInbox {
             }
         }
 
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .flushing = false;
+        // `flushing` is cleared by `_flush_guard`'s `Drop`, which also covers the drop paths a
+        // trailing assignment here would miss.
     }
 }
 
@@ -1215,9 +1564,30 @@ impl SubagentPromptRuntime {
     /// Attach the child-side steering inbox (pi `registerSteeringInbox`,
     /// `subagent-prompt-runtime.ts:328-585`). `None` leaves the child with no live steering channel,
     /// which is every foreground child.
+    ///
+    /// The request-only form. SUBA-049's return path (capability + acknowledgments) is opt-in
+    /// through [`Self::with_steering_channel`], because upstream itself treats
+    /// `SUBAGENT_STEER_ACK_DIR_ENV` / `SUBAGENT_STEER_CAPABILITY_ENV` as independently optional
+    /// (`subagent-prompt-runtime.ts:334-335`, each guarded on its own): a child handed only an
+    /// inbox still delivers, it just does not report.
     #[must_use]
-    pub fn with_steering_inbox(mut self, dir: Option<PathBuf>) -> Self {
-        self.steering = dir.map(|dir| Arc::new(SteeringInbox::new(dir)));
+    pub fn with_steering_inbox(self, dir: Option<PathBuf>) -> Self {
+        self.with_steering_channel(dir, None, None, 0)
+    }
+
+    /// SUBA-049 — the full child-side steering channel: the request inbox, the acknowledgment
+    /// directory, the capability file, and this child's flat index (which every record carries so a
+    /// fan-out's parent can tell which child answered).
+    #[must_use]
+    pub fn with_steering_channel(
+        mut self,
+        dir: Option<PathBuf>,
+        ack_dir: Option<PathBuf>,
+        capability_path: Option<PathBuf>,
+        child_index: usize,
+    ) -> Self {
+        self.steering = dir
+            .map(|dir| Arc::new(SteeringInbox::new(dir, ack_dir, capability_path, child_index)));
         self
     }
 
@@ -1474,6 +1844,10 @@ impl NativeExtension for SubagentPromptRuntime {
             kinds.extend_from_slice(&[
                 EventKind::SessionStart,
                 EventKind::SessionShutdown,
+                // SUBA-049: `turn_start` joins the set, and it is not decoration — it is the only
+                // event at which a parked `follow_up` can be released, so without it a
+                // `mode:"follow_up"` steer would be acknowledged `queued` and never delivered.
+                EventKind::TurnStart,
                 EventKind::MessageStart,
                 EventKind::MessageUpdate,
                 EventKind::MessageEnd,
@@ -1530,13 +1904,19 @@ impl NativeExtension for SubagentPromptRuntime {
         if let Some(steering) = &self.steering {
             match ev {
                 HostEvent::SessionStart { .. } => steering.start(),
-                HostEvent::SessionShutdown { .. } => steering.dispose(),
+                HostEvent::SessionShutdown { .. } => steering.dispose().await,
+                // SUBA-049: `turn_start` and `turn_end` are no longer plain `activate` triggers —
+                // they are the follow-up queue's clock (pi `:449-462`). `turn_start` releases ONE
+                // ready follow-up into the turn that is beginning; `turn_end` makes the rest
+                // eligible for the next one. Both still `activate` afterwards, exactly as upstream's
+                // handlers `return activate()`.
+                HostEvent::TurnStart { .. } => steering.on_turn_start().await,
+                HostEvent::TurnEnd { .. } => steering.on_turn_end().await,
                 HostEvent::MessageStart { .. }
                 | HostEvent::MessageUpdate { .. }
                 | HostEvent::MessageEnd { .. }
                 | HostEvent::ToolExecStart { .. }
-                | HostEvent::ToolExecEnd { .. }
-                | HostEvent::TurnEnd { .. } => steering.activate().await,
+                | HostEvent::ToolExecEnd { .. } => steering.activate().await,
                 _ => {}
             }
         }
@@ -1798,6 +2178,18 @@ pub fn prompt_runtime_from_env(
     // and a poller would drain unrelated files from it.
     let steer_inbox = non_empty(STEER_INBOX_ENV).map(PathBuf::from);
 
+    // SUBA-049 / pi `:334-337`: the return path, read with the same trim-and-treat-blank-as-unset
+    // rule as the inbox, and each independently optional exactly as upstream's two `?.trim()`
+    // reads are. `childIndex` defaults to 0 rather than being rejected: upstream guards every write
+    // with `Number.isInteger(childIndex) && childIndex >= 0` and silently skips otherwise, and a
+    // single top-level run's only child IS index 0 — so a missing var means "the one child",
+    // not "no acknowledgment".
+    let steer_ack_dir = non_empty(STEER_ACK_DIR_ENV).map(PathBuf::from);
+    let steer_capability_path = non_empty(STEER_CAPABILITY_ENV).map(PathBuf::from);
+    let steer_child_index = non_empty(crate::spawn::nested_events::CHILD_INDEX_ENV)
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(0);
+
     // pi `registerChildWatchdog(pi)` (`subagent-prompt-runtime.ts:477`), which reads
     // `process.env[CHILD_WATCHDOG_CONFIG_ENV]` itself. `None` for every child the orchestrator did
     // not arm, which is the default.
@@ -1840,7 +2232,12 @@ pub fn prompt_runtime_from_env(
         .with_supervisor_tool(supervisor_tool)
         .with_intercom_fallback(intercom_fallback)
         .with_tool_budget(tool_budget)
-        .with_steering_inbox(steer_inbox)
+        .with_steering_channel(
+            steer_inbox,
+            steer_ack_dir,
+            steer_capability_path,
+            steer_child_index,
+        )
         .with_permission_gate(
             permission_policy.as_deref(),
             raw_watchdog_config,
@@ -2206,6 +2603,82 @@ mod tests {
 
     fn tool(schema: serde_json::Value, path: PathBuf) -> StructuredOutputTool {
         StructuredOutputTool::new(schema, path)
+    }
+
+    /// SUBA-049 (review) — a DROPPED `flush` future must not latch the re-entrancy guard.
+    ///
+    /// Upstream cannot have this bug: its `flush` is a synchronous `(): void` whose body is wrapped
+    /// in `try { … } finally { flushing = false; }` (`subagent-prompt-runtime.ts:381-413`). cyrup's
+    /// port is `async` and awaits at `consume_steer_requests_from_dir`, at every `acknowledge` and
+    /// at the write-back, and it is driven both from the poll task and from the turn-lifecycle event
+    /// handlers — so the future genuinely can be dropped mid-body.
+    ///
+    /// **Red before the fix:** `flush` set `state.flushing = true` before its first `.await` and
+    /// cleared it only with a trailing assignment on the fall-through path, reproducing upstream's
+    /// `try` but NOT its `finally`. This test polls `flush` once (which reaches the first await and
+    /// returns `Pending`) and drops it; pre-fix `flushing` is still `true` afterwards, the first
+    /// assertion fails, and — the consequence that matters — the second flush takes the
+    /// `disposed || flushing` early return, so the queued request is never consumed and
+    /// `remaining_after` stays 1 forever. Post-fix `FlushGuard::drop` clears the latch and the
+    /// second flush drains the inbox.
+    #[tokio::test]
+    async fn a_dropped_flush_future_does_not_wedge_the_steering_inbox() {
+        use std::task::{Context, Poll, Waker};
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("steer-inbox");
+        std::fs::create_dir_all(&dir).expect("create inbox");
+
+        let request = crate::background::control::SteerRequest {
+            kind: "steer".to_string(),
+            id: "req-1".to_string(),
+            ts: 1,
+            message: "look at the retry path".to_string(),
+            mode: None,
+            target_index: None,
+            source: None,
+        };
+        crate::background::control::write_steer_request_to_dir(&dir, &request)
+            .await
+            .expect("write request");
+
+        let inbox = Arc::new(SteeringInbox::new(dir.clone(), None, None, 0));
+        // `can_steer` is what the turn-lifecycle events set; without it `flush` returns before the
+        // latch is even reached and this test would prove nothing.
+        inbox.state.lock().expect("not poisoned").can_steer = true;
+
+        {
+            let fut = inbox.flush();
+            let mut fut = std::pin::pin!(fut);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(
+                matches!(fut.as_mut().poll(&mut cx), Poll::Pending),
+                "the first poll must reach an await for this to exercise a mid-body drop"
+            );
+            assert!(
+                inbox.state.lock().expect("not poisoned").flushing,
+                "the latch must be held at the drop point, or the test is not testing anything"
+            );
+        } // `fut` dropped here, mid-body.
+
+        assert!(
+            !inbox.state.lock().expect("not poisoned").flushing,
+            "a dropped flush must release the re-entrancy latch (pi's `finally`)"
+        );
+
+        // The consequence: a later flush still drains the inbox. No services are bound, so each
+        // request is acknowledged `failed` and consumed rather than injected — either way it must
+        // LEAVE the directory, which a wedged latch would prevent.
+        inbox.flush().await;
+        let remaining_after = std::fs::read_dir(&dir)
+            .expect("read inbox")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+            .count();
+        assert_eq!(
+            remaining_after, 0,
+            "the request must be consumed by the flush that follows a dropped one"
+        );
     }
 
     /// SUBA-045 — a [`cyrup_ext::host::HostServices`] double that answers only `all_tool_names`,

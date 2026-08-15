@@ -2503,6 +2503,52 @@ mod tests {
         assert!(beta.contains(INTERLEAVED_THINKING_BETA));
     }
 
+    /// PROV-056 — the wire half. The catalog now carries `forceAdaptiveThinking: true` on every
+    /// `kimi-coding` row (pi `ai/scripts/generate-models.ts:1861-1864` @v0.83.0), and this asserts
+    /// what that flag actually changes on the request, driven by the SHIPPED catalog rather than a
+    /// synthetic model — because the defect was never in this file's logic, which was already a
+    /// faithful port, but in the data that reaches it.
+    ///
+    /// Two divergences per request, on all three models, which is every model the provider has:
+    /// cyrup sent a budget-based `thinking` block where pi sends `{type: "adaptive"}`
+    /// (pi `anthropic-messages.ts:1033`), and it sent the `interleaved-thinking-2025-05-14` beta
+    /// that pi suppresses for adaptive models (`:858`,
+    /// `needsInterleavedBeta = interleavedThinking && model.compat?.forceAdaptiveThinking !== true`).
+    /// Pre-fix both assertions are RED for all three rows.
+    #[test]
+    fn kimi_coding_catalog_rows_send_adaptive_thinking_and_no_interleaved_beta() {
+        let auth = auth_with(Some("sk-ant-api03-xxx"));
+        let opts = StreamOptions {
+            reasoning: ModelThinkingLevel::High,
+            ..Default::default()
+        };
+        let models = crate::providers::anthropic::anthropic_fleet_spec("kimi-coding")
+            .expect("kimi-coding fleet spec")
+            .models();
+        assert_eq!(models.len(), 5, "every kimi-coding row must be covered");
+
+        for m in &models {
+            let body = build_body(m, &user_ctx("think"), &opts);
+            assert_eq!(
+                body["thinking"]["type"], "adaptive",
+                "kimi-coding/{} sends a non-adaptive thinking block to an upstream pi flags as \
+                 requiring the adaptive format",
+                m.id.as_str()
+            );
+
+            let beta = build_headers(m, &Context::default(), &auth, &opts, false)
+                .get("anthropic-beta")
+                .and_then(|v| v.clone())
+                .unwrap_or_default();
+            assert!(
+                !beta.contains(INTERLEAVED_THINKING_BETA),
+                "kimi-coding/{} sent the interleaved-thinking beta pi suppresses for adaptive \
+                 models; beta header was {beta:?}",
+                m.id.as_str()
+            );
+        }
+    }
+
     #[test]
     fn interleaved_thinking_per_api_option_suppresses_beta() {
         // Pi `options?.interleavedThinking ?? true` (anthropic-messages.ts:520): an explicit

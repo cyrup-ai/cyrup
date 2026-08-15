@@ -8,19 +8,58 @@
 		"headers": {
 			"User-Agent": "KimiCLI/1.5"
 		},
+		"compat": {
+			"forceAdaptiveThinking": true
+		},
 		"reasoning": true,
 		"input": [
 			"text",
 			"image"
 		],
 		"cost": {
-			"input": 0,
-			"output": 0,
-			"cacheRead": 0,
+			"input": 0.95,
+			"output": 4,
+			"cacheRead": 0.19,
 			"cacheWrite": 0
 		},
 		"contextWindow": 262144,
 		"maxTokens": 32768
+	},
+	{
+		"id": "k3",
+		"name": "Kimi K3",
+		"api": "anthropic-messages",
+		"provider": "kimi-coding",
+		"baseUrl": "https://api.kimi.com/coding",
+		"headers": {
+			"User-Agent": "KimiCLI/1.5"
+		},
+		"compat": {
+			"allowEmptySignature": true,
+			"forceAdaptiveThinking": true
+		},
+		"reasoning": true,
+		"thinkingLevelMap": {
+			"off": null,
+			"minimal": null,
+			"low": null,
+			"medium": null,
+			"high": null,
+			"xhigh": null,
+			"max": "max"
+		},
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 3,
+			"output": 15,
+			"cacheRead": 0.3,
+			"cacheWrite": 0
+		},
+		"contextWindow": 1048576,
+		"maxTokens": 131072
 	},
 	{
 		"id": "kimi-for-coding",
@@ -31,15 +70,45 @@
 		"headers": {
 			"User-Agent": "KimiCLI/1.5"
 		},
+		"compat": {
+			"allowEmptySignature": true,
+			"forceAdaptiveThinking": true
+		},
 		"reasoning": true,
 		"input": [
 			"text",
 			"image"
 		],
 		"cost": {
-			"input": 0,
-			"output": 0,
-			"cacheRead": 0,
+			"input": 0.95,
+			"output": 4,
+			"cacheRead": 0.19,
+			"cacheWrite": 0
+		},
+		"contextWindow": 262144,
+		"maxTokens": 32768
+	},
+	{
+		"id": "kimi-for-coding-highspeed",
+		"name": "Kimi For Coding HighSpeed",
+		"api": "anthropic-messages",
+		"provider": "kimi-coding",
+		"baseUrl": "https://api.kimi.com/coding",
+		"headers": {
+			"User-Agent": "KimiCLI/1.5"
+		},
+		"compat": {
+			"forceAdaptiveThinking": true
+		},
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 1.9,
+			"output": 8,
+			"cacheRead": 0.38,
 			"cacheWrite": 0
 		},
 		"contextWindow": 262144,
@@ -54,14 +123,17 @@
 		"headers": {
 			"User-Agent": "KimiCLI/1.5"
 		},
+		"compat": {
+			"forceAdaptiveThinking": true
+		},
 		"reasoning": true,
 		"input": [
 			"text"
 		],
 		"cost": {
-			"input": 0,
-			"output": 0,
-			"cacheRead": 0,
+			"input": 0.6,
+			"output": 2.5,
+			"cacheRead": 0.15,
 			"cacheWrite": 0
 		},
 		"contextWindow": 262144,

@@ -7,7 +7,72 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::{StreamEvent, StreamOptions};
 use crate::utils::simple_options::{SimpleStreamOptions, build_base_options};
-use cyrup_core::{EventStream, ProviderId};
+use cyrup_core::{CancelToken, EventStream, ProviderId};
+
+/// The per-refresh context a dynamic provider's [`Provider::refresh_models`] receives — pi
+/// `RefreshModelsContext` (`packages/ai/src/models.ts:34-44` @v0.83.0), threaded from
+/// [`crate::collection::Models::refresh_with`] exactly as pi threads it from `Models.refresh`
+/// (`models.ts:297-303`). PROV-S05.
+///
+/// `[CYRUP-DELTA]` **two of pi's five members are absent, and both by construction.** pi carries
+/// `credential` (`:36`) and `store` (`:38`) because `Models.refresh` resolves the effective
+/// credential (`resolveRefreshCredential`, `models.ts:330-354`) and builds a provider-scoped
+/// `ProviderModelsStore` (`:287-291`) before calling in. In cyrup the persisting fetcher is
+/// [`crate::remote_catalog::RemoteCatalog`], which owns its own [`crate::models_store::ModelsStore`]
+/// and its own auth context, and the configured-provider restriction lives at the trigger site
+/// (`crates/cyrup/src/provider.rs`) — so neither value has anywhere useful to arrive here. The three
+/// that DO change a provider's behaviour per call are all present.
+#[derive(Clone, Debug)]
+pub struct RefreshModelsContext {
+    /// `false` during offline / cache-only initialization (pi `:40`). A provider MUST restore its
+    /// persisted catalog and perform no network I/O.
+    pub allow_network: bool,
+    /// Bypass provider freshness checks and fetch immediately when network access is allowed
+    /// (pi `:42`).
+    pub force: bool,
+    /// pi's `signal?: AbortSignal` (`:43`). **This is not advisory** — an implementation that can
+    /// block MUST select on [`RefreshModelsContext::cancelled`] or check
+    /// [`RefreshModelsContext::is_aborted`], because that is the only thing that makes
+    /// [`crate::collection::ModelsRefreshResult::aborted`] mean anything. `Models::refresh_with`
+    /// additionally skips any provider whose turn has not started when the token fires (pi's
+    /// `if (options.signal?.aborted) return;`, `models.ts:286`).
+    pub cancel: CancelToken,
+}
+
+impl Default for RefreshModelsContext {
+    /// pi's defaults for a bare `refresh()`: `allowNetwork = options.allowNetwork ?? true`
+    /// (`models.ts:277`), `force` undefined ⇒ falsy, no signal.
+    fn default() -> Self {
+        Self {
+            allow_network: true,
+            force: false,
+            cancel: CancelToken::new(),
+        }
+    }
+}
+
+impl RefreshModelsContext {
+    /// The offline posture: restore the persisted catalog, touch no network. This is both pi's
+    /// startup call (`agent-session-services.ts:180`, `refresh({ allowNetwork: false })`) and the
+    /// shape of its post-failure cache restore (`models.ts:314-319`).
+    pub fn cache_only() -> Self {
+        Self {
+            allow_network: false,
+            ..Self::default()
+        }
+    }
+
+    /// Whether the caller has already aborted (pi `options.signal?.aborted`).
+    pub fn is_aborted(&self) -> bool {
+        self.cancel.is_cancelled()
+    }
+
+    /// Resolves when the caller aborts. Implementations that block on I/O should race this —
+    /// `tokio::select! { biased; () = ctx.cancelled() => …, r = fetch => … }`.
+    pub async fn cancelled(&self) {
+        self.cancel.cancelled().await;
+    }
+}
 
 /// A runtime unit owning a model catalog, auth, and stream behavior (func-01 §6).
 ///
@@ -24,13 +89,13 @@ pub trait Provider: Send + Sync {
         self.id().as_str()
     }
 
-    /// Provider-level default base URL (Pi `Provider.baseUrl?`, `models.ts:78` @v0.83.0).
+    /// Provider-level default base URL (Pi `Provider.baseUrl?`, `models.ts:79` @v0.83.0).
     /// `None` = the provider has none and every model carries its own (PROV-017).
     fn base_url(&self) -> Option<&str> {
         None
     }
 
-    /// Provider-level default headers (Pi `Provider.headers?: ProviderHeaders`, `models.ts:79`
+    /// Provider-level default headers (Pi `Provider.headers?: ProviderHeaders`, `models.ts:80`
     /// @v0.83.0), merged beneath the per-model and per-request overlays (PROV-017).
     fn headers(&self) -> Option<&crate::HeaderMap> {
         None
@@ -63,7 +128,8 @@ pub trait Provider: Send + Sync {
     }
 
     /// Dynamic providers only: re-fetch and update the model list (Pi `Provider.refreshModels?`,
-    /// models.ts:63). Side-effect-free discovery (no loading/downloading). Returns:
+    /// `models.ts:104` @v0.83.0, documented at `:99-103`; PROV-041 corrected `:63`, which is
+    /// `ModelsApiStreamOptions`). Side-effect-free discovery (no loading/downloading). Returns:
     ///
     /// - `None` for a static provider (no dynamic model source) — `Models::refresh` treats this as a
     ///   no-op, exactly as Pi's optional `refreshModels?` being `undefined`.
@@ -73,7 +139,12 @@ pub trait Provider: Send + Sync {
     ///
     /// Concurrent calls MUST share one in-flight fetch — an override builds that with
     /// [`crate::utils::refresh::RefreshDedup`]. The default is `None` (static provider). Additive.
-    async fn refresh_models(&self) -> Option<Result<(), ProviderError>> {
+    ///
+    /// PROV-S05: `ctx` is pi's `RefreshModelsContext` argument (`models.ts:104`, constructed at
+    /// `:297-303`). Before this the method took nothing, so `allowNetwork`, `force` and the abort
+    /// signal could not reach an implementation at all. An implementation that performs network I/O
+    /// **must** honour all three; see [`RefreshModelsContext`].
+    async fn refresh_models(&self, _ctx: &RefreshModelsContext) -> Option<Result<(), ProviderError>> {
         None
     }
 
@@ -87,7 +158,8 @@ pub trait Provider: Send + Sync {
         options: &StreamOptions,
     ) -> EventStream<StreamEvent>;
 
-    /// Stream with the unified "simple" option surface (Pi `Provider.streamSimple`, models.ts:71).
+    /// Stream with the unified "simple" option surface (Pi `Provider.streamSimple`,
+    /// `models.ts:119` @v0.83.0; PROV-041 corrected `:71`, a prose line in the `Provider` docblock).
     ///
     /// Lowers a [`SimpleStreamOptions`] to a concrete [`StreamOptions`] and delegates to
     /// [`Provider::stream`]. The default mirrors Pi's per-API `streamSimple` for the

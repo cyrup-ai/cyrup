@@ -392,10 +392,10 @@ mod tests {
     #[test]
     fn anthropic_fleet_catalogs_parse_with_expected_counts() {
         let expected = [
-            ("kimi-coding", 3usize),
+            ("kimi-coding", 5usize),
             ("minimax", 3),
             ("minimax-cn", 3),
-            ("vercel-ai-gateway", 192),
+            ("vercel-ai-gateway", 190),
         ];
         for (id, count) in expected {
             let spec = anthropic_fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));

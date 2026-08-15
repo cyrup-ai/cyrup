@@ -564,26 +564,6 @@
 		"maxTokens": 4096
 	},
 	{
-		"id": "anthropic/claude-3.5-haiku",
-		"name": "Claude 3.5 Haiku",
-		"api": "anthropic-messages",
-		"provider": "vercel-ai-gateway",
-		"baseUrl": "https://ai-gateway.vercel.sh",
-		"reasoning": false,
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 0.8,
-			"output": 4,
-			"cacheRead": 0.08,
-			"cacheWrite": 1
-		},
-		"contextWindow": 200000,
-		"maxTokens": 8192
-	},
-	{
 		"id": "anthropic/claude-fable-5",
 		"name": "Claude Fable 5",
 		"api": "anthropic-messages",
@@ -649,7 +629,7 @@
 			"cacheWrite": 18.75
 		},
 		"contextWindow": 200000,
-		"maxTokens": 32000
+		"maxTokens": 8192
 	},
 	{
 		"id": "anthropic/claude-opus-4.1",
@@ -746,6 +726,34 @@
 		"maxTokens": 128000
 	},
 	{
+		"id": "anthropic/claude-opus-4.7-fast",
+		"name": "Claude Opus 4.7 (Fast)",
+		"api": "anthropic-messages",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh",
+		"compat": {
+			"forceAdaptiveThinking": true,
+			"supportsTemperature": false
+		},
+		"reasoning": true,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 30,
+			"output": 150,
+			"cacheRead": 3,
+			"cacheWrite": 37.5
+		},
+		"contextWindow": 1000000,
+		"maxTokens": 128000
+	},
+	{
 		"id": "anthropic/claude-opus-4.8",
 		"name": "Claude Opus 4.8",
 		"api": "anthropic-messages",
@@ -774,6 +782,34 @@
 		"maxTokens": 128000
 	},
 	{
+		"id": "anthropic/claude-opus-4.8-fast",
+		"name": "Claude Opus 4.8 (Fast)",
+		"api": "anthropic-messages",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh",
+		"compat": {
+			"forceAdaptiveThinking": true,
+			"supportsTemperature": false
+		},
+		"reasoning": true,
+		"thinkingLevelMap": {
+			"xhigh": "xhigh",
+			"max": "max"
+		},
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 10,
+			"output": 50,
+			"cacheRead": 1,
+			"cacheWrite": 12.5
+		},
+		"contextWindow": 1000000,
+		"maxTokens": 128000
+	},
+	{
 		"id": "anthropic/claude-sonnet-4",
 		"name": "Claude Sonnet 4",
 		"api": "anthropic-messages",
@@ -791,7 +827,7 @@
 			"cacheWrite": 3.75
 		},
 		"contextWindow": 1000000,
-		"maxTokens": 64000
+		"maxTokens": 8192
 	},
 	{
 		"id": "anthropic/claude-sonnet-4.5",
@@ -865,25 +901,6 @@
 		},
 		"contextWindow": 1000000,
 		"maxTokens": 128000
-	},
-	{
-		"id": "arcee-ai/trinity-large-preview",
-		"name": "Trinity Large Preview",
-		"api": "anthropic-messages",
-		"provider": "vercel-ai-gateway",
-		"baseUrl": "https://ai-gateway.vercel.sh",
-		"reasoning": false,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 0.25,
-			"output": 1,
-			"cacheRead": 0,
-			"cacheWrite": 0
-		},
-		"contextWindow": 131000,
-		"maxTokens": 131000
 	},
 	{
 		"id": "arcee-ai/trinity-large-thinking",
@@ -1031,12 +1048,12 @@
 			"text"
 		],
 		"cost": {
-			"input": 0.6,
-			"output": 1.7,
-			"cacheRead": 0,
+			"input": 0.25,
+			"output": 0.95,
+			"cacheRead": 0.13,
 			"cacheWrite": 0
 		},
-		"contextWindow": 128000,
+		"contextWindow": 163840,
 		"maxTokens": 128000
 	},
 	{
@@ -1413,6 +1430,25 @@
 		"maxTokens": 32000
 	},
 	{
+		"id": "kwaipilot/kat-coder-air-v2.5",
+		"name": "Kat Coder Air V2.5",
+		"api": "anthropic-messages",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh",
+		"reasoning": true,
+		"input": [
+			"text"
+		],
+		"cost": {
+			"input": 0.15,
+			"output": 0.6,
+			"cacheRead": 0.03,
+			"cacheWrite": 0
+		},
+		"contextWindow": 256000,
+		"maxTokens": 80000
+	},
+	{
 		"id": "kwaipilot/kat-coder-pro-v1",
 		"name": "KAT-Coder-Pro V1",
 		"api": "anthropic-messages",
@@ -1451,27 +1487,8 @@
 		"maxTokens": 256000
 	},
 	{
-		"id": "meituan/longcat-flash-chat",
-		"name": "LongCat Flash Chat",
-		"api": "anthropic-messages",
-		"provider": "vercel-ai-gateway",
-		"baseUrl": "https://ai-gateway.vercel.sh",
-		"reasoning": false,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 0,
-			"output": 0,
-			"cacheRead": 0,
-			"cacheWrite": 0
-		},
-		"contextWindow": 128000,
-		"maxTokens": 100000
-	},
-	{
-		"id": "meituan/longcat-flash-thinking-2601",
-		"name": "LongCat Flash Thinking 2601",
+		"id": "kwaipilot/kat-coder-pro-v2.5",
+		"name": "Kat Coder Pro V2.5",
 		"api": "anthropic-messages",
 		"provider": "vercel-ai-gateway",
 		"baseUrl": "https://ai-gateway.vercel.sh",
@@ -1480,13 +1497,13 @@
 			"text"
 		],
 		"cost": {
-			"input": 0,
-			"output": 0,
-			"cacheRead": 0,
+			"input": 0.74,
+			"output": 2.96,
+			"cacheRead": 0.15,
 			"cacheWrite": 0
 		},
-		"contextWindow": 32768,
-		"maxTokens": 32768
+		"contextWindow": 256000,
+		"maxTokens": 80000
 	},
 	{
 		"id": "meta/llama-3.1-70b",
@@ -1837,25 +1854,6 @@
 		"maxTokens": 256000
 	},
 	{
-		"id": "mistral/devstral-small",
-		"name": "Devstral Small 1.1",
-		"api": "anthropic-messages",
-		"provider": "vercel-ai-gateway",
-		"baseUrl": "https://ai-gateway.vercel.sh",
-		"reasoning": false,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 0.1,
-			"output": 0.3,
-			"cacheRead": 0,
-			"cacheWrite": 0
-		},
-		"contextWindow": 128000,
-		"maxTokens": 64000
-	},
-	{
 		"id": "mistral/devstral-small-2",
 		"name": "Devstral Small 2",
 		"api": "anthropic-messages",
@@ -2093,26 +2091,6 @@
 		"maxTokens": 4000
 	},
 	{
-		"id": "mistral/pixtral-large",
-		"name": "Pixtral Large",
-		"api": "anthropic-messages",
-		"provider": "vercel-ai-gateway",
-		"baseUrl": "https://ai-gateway.vercel.sh",
-		"reasoning": false,
-		"input": [
-			"text",
-			"image"
-		],
-		"cost": {
-			"input": 2,
-			"output": 6,
-			"cacheRead": 0,
-			"cacheWrite": 0
-		},
-		"contextWindow": 128000,
-		"maxTokens": 4000
-	},
-	{
 		"id": "moonshotai/kimi-k2",
 		"name": "Kimi K2 Instruct",
 		"api": "anthropic-messages",
@@ -2229,6 +2207,26 @@
 		},
 		"contextWindow": 262144,
 		"maxTokens": 32768
+	},
+	{
+		"id": "moonshotai/kimi-k3",
+		"name": "Kimi K3",
+		"api": "anthropic-messages",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 3,
+			"output": 15,
+			"cacheRead": 0.3,
+			"cacheWrite": 0
+		},
+		"contextWindow": 1000000,
+		"maxTokens": 131072
 	},
 	{
 		"id": "nvidia/nemotron-3-nano-30b-a3b",
@@ -3269,6 +3267,26 @@
 		"maxTokens": 256000
 	},
 	{
+		"id": "thinkingmachines/inkling",
+		"name": "Inkling",
+		"api": "anthropic-messages",
+		"provider": "vercel-ai-gateway",
+		"baseUrl": "https://ai-gateway.vercel.sh",
+		"reasoning": true,
+		"input": [
+			"text",
+			"image"
+		],
+		"cost": {
+			"input": 1,
+			"output": 4.05,
+			"cacheRead": 0.17,
+			"cacheWrite": 0
+		},
+		"contextWindow": 256000,
+		"maxTokens": 256000
+	},
+	{
 		"id": "xai/grok-4.1-fast-non-reasoning",
 		"name": "Grok 4.1 Fast Non-Reasoning",
 		"api": "anthropic-messages",
@@ -3487,44 +3505,6 @@
 		},
 		"contextWindow": 256000,
 		"maxTokens": 256000
-	},
-	{
-		"id": "xiaomi/mimo-v2-flash",
-		"name": "MiMo V2 Flash",
-		"api": "anthropic-messages",
-		"provider": "vercel-ai-gateway",
-		"baseUrl": "https://ai-gateway.vercel.sh",
-		"reasoning": true,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 0.1,
-			"output": 0.3,
-			"cacheRead": 0.01,
-			"cacheWrite": 0
-		},
-		"contextWindow": 262144,
-		"maxTokens": 32000
-	},
-	{
-		"id": "xiaomi/mimo-v2-pro",
-		"name": "MiMo V2 Pro",
-		"api": "anthropic-messages",
-		"provider": "vercel-ai-gateway",
-		"baseUrl": "https://ai-gateway.vercel.sh",
-		"reasoning": true,
-		"input": [
-			"text"
-		],
-		"cost": {
-			"input": 1,
-			"output": 3,
-			"cacheRead": 0.2,
-			"cacheWrite": 0
-		},
-		"contextWindow": 1000000,
-		"maxTokens": 128000
 	},
 	{
 		"id": "xiaomi/mimo-v2.5",
@@ -3826,9 +3806,9 @@
 			"text"
 		],
 		"cost": {
-			"input": 3,
-			"output": 10.25,
-			"cacheRead": 0.5,
+			"input": 2.1,
+			"output": 6.6,
+			"cacheRead": 0.21,
 			"cacheWrite": 0
 		},
 		"contextWindow": 1000000,
