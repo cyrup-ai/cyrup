@@ -97,8 +97,11 @@ None of that lessens the debt. Design is the expensive part, and it was already 
 differs, it is usually because Rust forced the issue; where it agrees — which is nearly everywhere —
 it is because these projects had already worked out the right answer.
 
-If you are choosing between cyrup and the projects above, use the projects above. They are mature,
-maintained, and the reference implementations of their own behaviour.
+Each remains the reference implementation of its own behaviour, and cyrup treats that as binding:
+where the two disagree, the upstream is right by definition and cyrup is what changes. That rule is
+what makes the citations above auditable rather than decorative — a divergence cannot be quietly
+preferred, it has to be recorded as a `CYRUP-DELTA` naming the upstream symbol and the reason it was
+forced.
 
 Thank you to Mario Zechner, Nico Bailon and MasuRii.
 
