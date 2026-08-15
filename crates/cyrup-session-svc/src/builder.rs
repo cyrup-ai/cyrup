@@ -927,6 +927,12 @@ impl SessionBuilder {
         // own `execute` is observed by the wrapper's "after" snapshot. It reads `None` until
         // `attach_dynamic_tools` runs further down, which is correct: nothing executes before then.
         host.set_active_tool_source(host_services.clone());
+        // PERM-011 half B: hand the backend the host's ONE `SharedBus`, so a NATIVE extension's
+        // `HostServices::emit_event` lands in the same queue a WASM guest's `bus.emit` does and is
+        // fanned out by the same drain. Done here because the ordering is forced — the host takes
+        // this backend as an argument, so the bus cannot exist at `LiveHostServices::new` — and
+        // BEFORE the native load loop below, so no extension can emit into an unattached bus.
+        host_services.attach_event_bus(Arc::clone(host.bus()));
         // P-1 (reconciliation §2 item 1): late-bind the session's OWN `host_services` into every
         // native built-in — the SAME `LiveHostServices` the WASM path gets via `discover_and_load`
         // below — so a native extension can reach the live session id/file, dialogs, and

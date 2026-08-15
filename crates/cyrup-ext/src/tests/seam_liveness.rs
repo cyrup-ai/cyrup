@@ -332,6 +332,7 @@ struct LiveState;
 impl HostCtxSource for LiveState {
     fn rich(&self) -> HostCtxRich {
         HostCtxRich {
+            system_prompt_options: None,
             model: Some("live-model".into()),
             is_idle: true,
             is_project_trusted: true,

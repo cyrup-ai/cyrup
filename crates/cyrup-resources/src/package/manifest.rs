@@ -19,6 +19,25 @@ pub struct PackageMeta {
 }
 
 /// Declared resource paths (relative to the package root).
+///
+/// EXT-070 — THIS is pi's `interface PiManifest`, ported: `{extensions?, themes?, skills?,
+/// prompts?}`, declared at `pi/packages/coding-agent/src/core/extensions/loader.ts:561-566`
+/// @v0.83.0 and read off the `pi` key of `package.json` at `:572-573`. It is a DIFFERENT surface
+/// from `crates/cyrup-ext/src/manifest.rs`'s `extension.json`, which shares zero keys with it
+/// (`{id, version, world, entry, capabilities}` — identity, WIT world version and sandbox grant,
+/// all cyrup-original because pi has no per-extension manifest and no capability model). The two
+/// files now point at each other: a reader who finds only one of them otherwise concludes the other
+/// half of the extension-manifest surface is unported, which is exactly what the enumeration that
+/// filed EXT-070 concluded until this crate turned up.
+///
+/// [CYRUP-DELTA] EXT-063 — two cyrup-originals are bolted onto pi's four keys, disclosed here
+/// rather than left to be inferred from the code:
+///   1. `agents` is a FIFTH key with no upstream counterpart (arch-SA §4.1 / R-SA-020); pi has no
+///      subagent resource kind at any version.
+///   2. [`PiPackageJson`] accepts a `cyrup` key alongside pi's `pi` key. `pi` WINS on collision —
+///      `parsed.pi.or(parsed.cyrup)` — and that ordering is an INVARIANT, not an artefact: a
+///      package authored for pi must resolve identically under cyrup, so the cross-harness key is
+///      the fallback and never the override. Do not reorder the `.or()`.
 #[derive(Debug, Clone, Default, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManifestResources {
@@ -31,6 +50,7 @@ pub struct ManifestResources {
     #[serde(default)]
     pub themes: Vec<PathBuf>,
     /// Subagent persona/chain definitions declared by this package (arch-SA §4.1/R-SA-020).
+    /// cyrup-original — see the `[CYRUP-DELTA]` on the struct (EXT-063).
     #[serde(default)]
     pub agents: Vec<PathBuf>,
 }
@@ -660,5 +680,50 @@ fn walk_tree(root: &Path, dir: &Path, matcher: &globset::GlobMatcher, out: &mut 
         if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
             walk_tree(root, &path, matcher, out);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+mod ext063_tests {
+    use super::*;
+
+    /// EXT-063, the invariant half. The `cyrup` key beside pi's `pi` key is a cyrup-original, and
+    /// `parsed.pi.or(parsed.cyrup)` is what makes `pi` win when a package declares both — so a
+    /// package authored for pi resolves identically under cyrup. That ordering was, until this
+    /// test, an unstated property of one `.or()` call: swapping the two operands compiles, passes
+    /// every other test, and silently makes the cross-harness key an OVERRIDE.
+    ///
+    /// COVERAGE, NOT A REGRESSION PROOF: EXT-063 is a disclosure item and the behaviour was already
+    /// correct at HEAD, so this test is green before and after. It is written to go red on the
+    /// FUTURE edit (the `.or()` reorder), which is the failure the item is actually about.
+    #[test]
+    fn the_pi_key_wins_over_the_cyrup_key_when_a_package_declares_both() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"pi": {"skills": ["from-pi"]}, "cyrup": {"skills": ["from-cyrup"]}}"#,
+        )
+        .expect("write package.json");
+
+        let resolved = resolve_manifest(dir.path()).expect("resolve");
+        assert_eq!(resolved.kind, ManifestKind::PackageJson);
+        assert_eq!(
+            resolved.skills,
+            vec![dir.path().join("from-pi")],
+            "`pi` must win on collision — a package authored for pi has to resolve the same under \
+             cyrup (EXT-063)"
+        );
+    }
+
+    /// The fallback direction of the same delta: with no `pi` key, the cyrup-original one is read.
+    #[test]
+    fn the_cyrup_key_is_read_when_no_pi_key_is_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("package.json"), r#"{"cyrup": {"agents": ["a/b.md"]}}"#)
+            .expect("write package.json");
+
+        let resolved = resolve_manifest(dir.path()).expect("resolve");
+        assert_eq!(resolved.agents, vec![dir.path().join("a/b.md")]);
     }
 }

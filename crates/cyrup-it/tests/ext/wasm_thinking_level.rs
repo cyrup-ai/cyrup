@@ -6,7 +6,7 @@
 //!   * event tier  (`agent_start` hook)  — Pi allows it from any handler, so cyrup QUEUES it,
 //!   * command tier (`/thinkdemo` command) — always allowed.
 //!
-//! Pi allows `setThinkingLevel` from any handler (`loader.ts:352-354` / `runner.ts:330`, no tier
+//! Pi allows `setThinkingLevel` from any handler (`loader.ts:369-372` / `runner.ts:336`, no tier
 //! gate) and it takes effect. cyrup now matches: from EITHER tier the call is QUEUED as a
 //! `SetThinkingLevel` control op (a synchronous mpsc push that touches no wasm store) and the guest
 //! observes `Ok(())`. The op is later applied at the store-free turn-boundary drain

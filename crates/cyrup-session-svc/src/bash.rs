@@ -34,7 +34,13 @@ pub struct BashResult {
     #[serde(default)]
     pub output: String,
     /// Process exit code (`None` when killed/signaled without a code).
-    #[serde(default)]
+    ///
+    /// SEAM-083 — `skip_serializing_if` is the WIRE half and is not cosmetic. Upstream declares
+    /// `exitCode: number | undefined` (`core/bash-executor.ts:33` @v0.83.0): a required key whose
+    /// `undefined` value `JSON.stringify` **drops**, so a killed or signalled command produces a
+    /// `bash` response with no `exitCode` key at all. The RPC handler arm is a bare
+    /// `serde_json::to_value(result)` (`cyrup-modes/src/rpc.rs`), so this attribute IS the contract.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
     /// Whether the command was cancelled via [`crate::AgentSession::abort_bash`].
     #[serde(default)]
@@ -48,7 +54,15 @@ pub struct BashResult {
     /// opened by `ensureTempFile`, bash-executor.ts:64-74). `#[serde(default)]` on read: Pi's own
     /// `UserBashEventResult.result` type marks this field optional (`fullOutputPath?: string`,
     /// `extensions/types.ts:1044-1048`), so an extension-supplied override may omit it.
-    #[serde(default)]
+    ///
+    /// SEAM-083 — and `skip_serializing_if` on WRITE, for the same reason it is optional on read.
+    /// pi's `fullOutputPath?: string` (`core/bash-executor.ts:39` @v0.83.0) is present ONLY when the
+    /// output spilled: `docs/rpc.md:473-479` @v0.83.0 shows the normal `bash` response with no such
+    /// key, and `:482-495` shows it appearing only in the truncated case. Without this, every
+    /// response carried `"fullOutputPath":null`, and a client using the documented
+    /// `"fullOutputPath" in data` / `!== undefined` test to detect truncation took the truncated
+    /// branch on EVERY bash response and went looking for a temp file that does not exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub full_output_path: Option<String>,
 }
 
@@ -226,17 +240,30 @@ pub(crate) async fn run_bash(
     }
 }
 
-/// Build the `bashExecution` custom-message payload Pi records (agent-session.ts:2628-2640).
+/// Build the `bashExecution` custom-message payload Pi records (`recordBashResult`,
+/// agent-session.ts:2803-2814 @v0.83.0).
+///
+/// SEAM-083 — the two optional fields are OMITTED when absent, not emitted as `null`. Upstream builds
+/// this object with `exitCode: result.exitCode` and `fullOutputPath: result.fullOutputPath`
+/// (`:2808`/`:2811`), both `undefined` when the command was killed or the output did not spill, and
+/// the message is persisted and re-emitted through `JSON.stringify`, which drops an `undefined`
+/// value. This payload rides the same stdout stream as the `bash` response (it becomes a custom
+/// message inside `message_update`), so a `null` here is the same client-visible divergence the
+/// response's own keys had.
 pub(crate) fn bash_message_payload(command: &str, result: &BashResult, exclude_from_context: bool) -> serde_json::Value {
-    serde_json::json!({
-        "command": command,
-        "output": result.output,
-        "exitCode": result.exit_code,
-        "cancelled": result.cancelled,
-        "truncated": result.truncated,
-        "fullOutputPath": result.full_output_path,
-        "excludeFromContext": exclude_from_context,
-    })
+    let mut payload = serde_json::Map::new();
+    payload.insert("command".into(), serde_json::Value::from(command));
+    payload.insert("output".into(), serde_json::Value::from(result.output.clone()));
+    if let Some(code) = result.exit_code {
+        payload.insert("exitCode".into(), serde_json::Value::from(code));
+    }
+    payload.insert("cancelled".into(), serde_json::Value::from(result.cancelled));
+    payload.insert("truncated".into(), serde_json::Value::from(result.truncated));
+    if let Some(path) = &result.full_output_path {
+        payload.insert("fullOutputPath".into(), serde_json::Value::from(path.clone()));
+    }
+    payload.insert("excludeFromContext".into(), serde_json::Value::from(exclude_from_context));
+    serde_json::Value::Object(payload)
 }
 
 /// Streaming sanitize + rolling-buffer + tempfile-spill for immediate-bash output — a direct port of
@@ -680,5 +707,108 @@ mod sanitize_tests {
             let _ = sanitize_binary_output(&stripped);
             let _ = sanitize_chunk(&s);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod wire_shape_tests {
+    use super::{bash_message_payload, BashResult};
+
+    /// SEAM-083 — RED before this pass on the FIRST assertion of each half.
+    ///
+    /// The RPC `bash` handler arm is a bare `serde_json::to_value(result)`
+    /// (`cyrup-modes/src/rpc.rs`), so `BashResult`'s serde attributes ARE the wire contract. Both
+    /// optionals carried `#[serde(default)]` (a READ-side allowance for an extension-supplied
+    /// `user_bash` override) but no `skip_serializing_if`, so every response shipped
+    /// `"fullOutputPath":null`, and a killed command shipped `"exitCode":null`.
+    ///
+    /// Upstream: `exitCode: number | undefined` (`core/bash-executor.ts:33` @v0.83.0 — a required key
+    /// whose `undefined` value `JSON.stringify` drops) and `fullOutputPath?: string` (`:39`).
+    /// `docs/rpc.md:473-479` @v0.83.0 shows the normal response with NO `fullOutputPath` key and
+    /// `:482-495` shows it appearing only when truncated — which is why the documented client test
+    /// for truncation is `"fullOutputPath" in data`, a test that was true on every cyrup response.
+    #[test]
+    fn bash_response_omits_absent_optionals_rather_than_sending_null() {
+        let normal = BashResult {
+            output: "total 48\n".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: false,
+            full_output_path: None,
+        };
+        let v = serde_json::to_value(&normal).expect("BashResult serializes");
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("fullOutputPath"),
+            "a non-truncated bash response must omit the key entirely; got {v}"
+        );
+        // Presence before absence: the keys that ARE present upstream must stay present.
+        assert_eq!(obj.get("exitCode"), Some(&serde_json::json!(0)));
+        assert_eq!(obj.get("cancelled"), Some(&serde_json::json!(false)));
+        assert_eq!(obj.get("truncated"), Some(&serde_json::json!(false)));
+        assert_eq!(obj.get("output"), Some(&serde_json::json!("total 48\n")));
+
+        let killed = BashResult {
+            output: String::new(),
+            exit_code: None,
+            cancelled: true,
+            truncated: false,
+            full_output_path: None,
+        };
+        let v = serde_json::to_value(&killed).expect("BashResult serializes");
+        let obj = v.as_object().expect("object");
+        assert!(
+            !obj.contains_key("exitCode"),
+            "a killed/signalled command must omit exitCode, not send null; got {v}"
+        );
+
+        let spilled = BashResult {
+            output: "truncated output...".into(),
+            exit_code: Some(0),
+            cancelled: false,
+            truncated: true,
+            full_output_path: Some("/tmp/cyrup-bash-abc123.log".into()),
+        };
+        let v = serde_json::to_value(&spilled).expect("BashResult serializes");
+        assert_eq!(
+            v.get("fullOutputPath"),
+            Some(&serde_json::json!("/tmp/cyrup-bash-abc123.log")),
+            "the truncated branch DOES carry the key — the fix must not delete it"
+        );
+    }
+
+    /// SEAM-083's other half: the persisted/`message_update`-borne `bashExecution` payload, built by
+    /// hand rather than through serde, had the same two `null`s. Upstream's object literal
+    /// (`recordBashResult`, `agent-session.ts:2803-2814` @v0.83.0) assigns `result.exitCode` and
+    /// `result.fullOutputPath` straight through, both `undefined` on these paths.
+    #[test]
+    fn bash_execution_message_omits_absent_optionals_too() {
+        let killed = BashResult {
+            output: "partial".into(),
+            exit_code: None,
+            cancelled: true,
+            truncated: false,
+            full_output_path: None,
+        };
+        let payload = bash_message_payload("sleep 100", &killed, false);
+        let obj = payload.as_object().expect("object");
+        assert!(!obj.contains_key("exitCode"), "got {payload}");
+        assert!(!obj.contains_key("fullOutputPath"), "got {payload}");
+        assert_eq!(obj.get("command"), Some(&serde_json::json!("sleep 100")));
+        assert_eq!(obj.get("cancelled"), Some(&serde_json::json!(true)));
+        assert_eq!(obj.get("excludeFromContext"), Some(&serde_json::json!(false)));
+
+        let ok = BashResult {
+            output: "hi".into(),
+            exit_code: Some(3),
+            cancelled: false,
+            truncated: true,
+            full_output_path: Some("/tmp/x.log".into()),
+        };
+        let payload = bash_message_payload("echo hi", &ok, true);
+        assert_eq!(payload.get("exitCode"), Some(&serde_json::json!(3)));
+        assert_eq!(payload.get("fullOutputPath"), Some(&serde_json::json!("/tmp/x.log")));
+        assert_eq!(payload.get("excludeFromContext"), Some(&serde_json::json!(true)));
     }
 }

@@ -1,5 +1,8 @@
 //! The handler context wrappers (arch-08 §2.2/§6.3; Pi `ExtensionContext`/`ExtensionUIContext`/
-//! `ExtensionCommandContext`, types.ts:124-390). Every event/tool handler receives a [`Ctx`], the
+//! `ExtensionCommandContext`, types.ts:131-404 @v0.83.0 — `ExtensionUIContext` `:131-282`,
+//! `ExtensionContext` `:307-347`, `ExtensionCommandContext` `:353-387`, `ReplacedSessionContext`
+//! `:394-404`; EXT-072: the `:124-390` this cited opens on `AutocompleteProviderFactory`). Every
+//! event/tool handler receives a [`Ctx`], the
 //! safe-Rust front for the `ui`/`session`/`models`/`exec`/`bus` capability imports. Command handlers
 //! receive a [`CommandCtx`] which additionally exposes the COMMAND-only `control` ops — the
 //! type-level half of the deadlock rule (the host check is authoritative, R-08-008).
@@ -62,7 +65,11 @@ impl Ctx {
     pub fn session(&self) -> Session {
         Session
     }
-    /// Model registry view (read; `set_model` is command-only).
+    /// Model registry view. EXT-074: `set_model`/`set_thinking_level` are NOT command-only — this
+    /// line said they were, and the host dropped that gate at GAP-11 (`cyrup-ext/src/host/live.rs`
+    /// takes the ungated `guest_of` for both). pi binds both with only `assertActive`
+    /// (`core/extensions/loader.ts:359-362` and `:369-372` @v0.83.0), so the ungated host is the
+    /// parity-correct one and the comment was the stale half.
     pub fn models(&self) -> Models {
         Models
     }
@@ -111,7 +118,8 @@ impl Ctx {
         let _ = tool;
     }
 
-    // --- base-context state + lifecycle (Pi `ExtensionContext`, types.ts:305-347). Pi puts ALL of
+    // --- base-context state + lifecycle (pi `ExtensionContext`, types.ts:307-347 @v0.83.0;
+    // EXT-072: `:305` is `ExtensionMode`). Pi puts ALL of
     // these on the base context — "Available in all contexts" — so they live on `Ctx`, not on
     // `CommandCtx`, and the host does not tier-gate them (EXT-005). ---
 
@@ -145,7 +153,8 @@ impl Ctx {
         true
     }
 
-    /// Whether no agent run is in flight (Pi `ctx.isIdle()`, types.ts:333).
+    /// Whether no agent run is in flight (pi `ctx.isIdle()`, types.ts:330 @v0.83.0; EXT-072: `:333`
+    /// is `signal`'s doc line).
     pub fn is_idle(&self) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
@@ -156,7 +165,7 @@ impl Ctx {
     }
 
     /// Whether user messages are queued for the next turn (Pi `ctx.hasPendingMessages()`,
-    /// types.ts:341).
+    /// types.ts:338 @v0.83.0; EXT-072: `:341` is `getContextUsage`'s doc line).
     pub fn has_pending_messages(&self) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
@@ -166,7 +175,8 @@ impl Ctx {
         false
     }
 
-    /// Whether the project is trusted (Pi `ctx.isProjectTrusted()`, types.ts:335).
+    /// Whether the project is trusted (pi `ctx.isProjectTrusted()`, types.ts:332 @v0.83.0;
+    /// EXT-072: `:335` is `abort`'s doc line).
     pub fn is_project_trusted(&self) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
@@ -1261,8 +1271,8 @@ impl Models {
     /// Set the thinking level (Pi `setThinkingLevel(level)`, `types.ts:1342` @v0.83.0; EXT-036
     /// corrected `:1288`; sdk gap #25 / GAP-11).
     ///
-    /// Pi allows `setThinkingLevel` from ANY handler (factory-tier `pi.*`, `loader.ts:352-354` /
-    /// `runner.ts:330`, no tier gate) and it takes effect. cyrup now matches this: the call is QUEUED
+    /// Pi allows `setThinkingLevel` from ANY handler (factory-tier `pi.*`, `loader.ts:369-372` /
+    /// `runner.ts:336`, no tier gate) and it takes effect. cyrup now matches this: the call is QUEUED
     /// as a control op and applied at the store-free turn-boundary drain
     /// (`AgentSession::apply_pending_control`), so its `thinking_level_select` re-emit
     /// (`agent-session.ts:1560-1567`) runs as a fresh top-level guest call after the event hook's wasm
@@ -1283,7 +1293,8 @@ impl Models {
     }
 }
 
-/// The command-tier context (Pi `ExtensionCommandContext`, types.ts:339-373). Adds the COMMAND-only
+/// The command-tier context (pi `ExtensionCommandContext`, types.ts:353-387 @v0.83.0; EXT-072: the
+/// `:339-373` this cited starts on `shutdown`'s doc line). Adds the COMMAND-only
 /// `control` ops to [`Ctx`]; the host rejects any control op from an event handler (R-08-008).
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CommandCtx {
@@ -1305,6 +1316,30 @@ impl CommandCtx {
     }
     pub fn models(&self) -> Models {
         self.base.models()
+    }
+
+    /// The base system-prompt construction options — pi `ctx.getSystemPromptOptions()`
+    /// (`extensions/types.ts:355` @v0.83.0, documented at `:354` "Get the current base
+    /// system-prompt construction options"), the BAG behind the string [`Ctx::system_prompt`]
+    /// returns (EXT-061).
+    ///
+    /// COMMAND-tier, and deliberately NOT on [`Ctx`]: upstream puts `getSystemPrompt()` on the base
+    /// `ExtensionContext` and this on `ExtensionCommandContext` (`:353-387`), so an event handler
+    /// has the string and not the bag. Calling it from an event tier is refused host-side with the
+    /// same deadlock-guard error every `control.*` op gives.
+    ///
+    /// The bag is `core/system-prompt.ts:8-25` @v0.83.0 — `{customPrompt?, selectedTools?,
+    /// toolSnippets?, promptGuidelines?, appendSystemPrompt?, cwd, contextFiles?, skills?}` — and
+    /// with no session backend the host answers pi's own default, `{cwd}` alone
+    /// (`core/extensions/runner.ts:287`), rather than an error: a one-key bag is a valid answer.
+    pub fn system_prompt_options(&self) -> Result<serde_json::Value, String> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let raw = crate::guest::bindings::cyrup::ext::ctx_state::get_system_prompt_options()?;
+            return serde_json::from_str(&raw).map_err(|e| format!("system prompt options: {e}"));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        Ok(serde_json::Value::Null)
     }
 
     pub fn new_session(&self) -> Result<(), String> {
@@ -1336,10 +1371,12 @@ impl CommandCtx {
         control(Control::Fork(entry_id, &opts))
     }
 
-    // --- withSession re-binding callbacks (Pi ReplacedSessionContext, types.ts:346-390; sdk gap #3) ---
+    // --- withSession re-binding callbacks (pi `ReplacedSessionContext`, types.ts:394-404 @v0.83.0;
+    // EXT-072 corrected `:346-390`; sdk gap #3) ---
 
     /// Start a new session, then run `with_session` against the re-bound session (Pi
-    /// `newSession({withSession})`, types.ts:346). The closure is stored guest-side and invoked by the
+    /// `newSession({withSession})`, types.ts:361-365 @v0.83.0; EXT-072 corrected `:346`). The closure
+    /// is stored guest-side and invoked by the
     /// host's `with-session` export after the replacement completes and the command body returns —
     /// move post-replacement work here (Pi: a captured `ctx` is stale after `newSession`, runner.ts:511).
     pub fn new_session_with_callback(
@@ -1352,7 +1389,9 @@ impl CommandCtx {
     }
 
     /// Fork, then run `with_session` against the re-bound session (Pi `fork(entryId, {withSession})`,
-    /// types.ts:355).
+    /// types.ts:368-371 @v0.83.0). EXT-072: the `:355` this cited is `getSystemPromptOptions`, the
+    /// one command-context member cyrup does not port (EXT-061) — a mis-citation that made the gap
+    /// look covered.
     pub fn fork_with_callback(
         &self,
         entry_id: &str,
@@ -1364,7 +1403,7 @@ impl CommandCtx {
     }
 
     /// Switch sessions, then run `with_session` against the re-bound session (Pi
-    /// `switchSession({withSession})`, types.ts:368).
+    /// `switchSession({withSession})`, types.ts:380-383 @v0.83.0; EXT-072: `:368` is `fork(`).
     pub fn switch_session_with_callback(
         &self,
         session_id: &str,
@@ -1462,7 +1501,8 @@ fn control(op: Control<'_>) -> Result<(), String> {
     }
 }
 
-// --- withSession re-binding (Pi ReplacedSessionContext, types.ts:374-390; sdk gap #3) ---
+// --- withSession re-binding (pi `ReplacedSessionContext`, types.ts:394-404 @v0.83.0;
+// EXT-072 corrected `:374-390`; sdk gap #3) ---
 
 /// A guest `withSession(ctx)` re-binding closure (Pi types.ts:382).
 pub type WithSessionFn = Box<dyn Fn(&ReplacedSessionContext) -> Result<(), String> + 'static>;
@@ -1509,7 +1549,8 @@ fn opts_with_callback(opts: impl Serialize, with_session: WithSessionFn) -> Stri
 }
 
 /// A fresh command-capable context bound to the replacement session after `newSession`/`fork`/
-/// `switchSession` (Pi `ReplacedSessionContext extends ExtensionCommandContext`, types.ts:374-390;
+/// `switchSession` (pi `ReplacedSessionContext extends ExtensionCommandContext`, types.ts:394-404
+/// @v0.83.0;
 /// sdk gap #3). Passed to the `withSession` closure. Derefs to [`CommandCtx`], so every command-tier
 /// op (incl. `send_message`/`send_user_message`) is available on the re-bound session.
 #[derive(Clone, Copy, Debug, Default)]

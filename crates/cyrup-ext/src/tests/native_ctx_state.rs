@@ -135,3 +135,50 @@ async fn a_native_handler_without_a_backend_keeps_the_defaults() {
     let seen = prober.seen();
     assert_eq!(seen[0], "event:idle=false trusted=false prompt=None model=None usage=false");
 }
+
+// ---------------------------------------------------------------------------
+// EXT-061 — `ctx.getSystemPromptOptions()`, the native half.
+// ---------------------------------------------------------------------------
+
+/// COVERAGE, NOT A REGRESSION PROOF (this pass's rule 8): `HostCtx::system_prompt_options` is a NEW
+/// accessor, so no version of this test can go red against the previous HEAD — it did not exist to
+/// call. It is written to pin the three behaviours the item's Verify line asks for, each of which a
+/// later edit could silently take away.
+///
+/// (1) The COMMAND tier reads the attached bag. pi declares `getSystemPromptOptions()` on
+/// `ExtensionCommandContext` (`extensions/types.ts:355` @v0.83.0), one tier up from
+/// `getSystemPrompt()` on the base context (`:346`).
+#[tokio::test]
+async fn a_native_command_handler_reads_the_attached_system_prompt_options_bag() {
+    let bag = serde_json::json!({"cwd": "/live", "selectedTools": ["read", "bash"]});
+    let svc = Arc::new(RecordingServices::new(CannedResponses {
+        system_prompt_options: Some(bag.clone()),
+        ..Default::default()
+    }));
+    let ctx = crate::HostCtx::command(crate::ExtMode::Tui, true, std::path::PathBuf::from("/fallback"))
+        .with_rich(crate::native::rich_from_services(svc.as_ref()));
+
+    assert_eq!(ctx.system_prompt_options().expect("command tier"), bag);
+}
+
+/// (2) With no bag attached the answer is pi's OWN no-backend default — `() => ({ cwd: this.cwd })`
+/// (`core/extensions/runner.ts:287`, re-bound at `:350` @v0.83.0) — not `{}` and not an error. This
+/// is the assertion that keeps the capability from being the shape EXT-066 found: declared in the
+/// world, dead at the backend.
+#[tokio::test]
+async fn a_native_command_handler_with_no_bag_reads_pis_cwd_only_default() {
+    let ctx = crate::HostCtx::command(crate::ExtMode::Tui, true, std::path::PathBuf::from("/proj"));
+    assert_eq!(ctx.system_prompt_options().expect("command tier"), serde_json::json!({"cwd": "/proj"}));
+}
+
+/// (3) An EVENT-tier read is refused with the observable deadlock-guard error, never a silent empty
+/// bag — the tier gate is upstream's own placement, not a cyrup restriction.
+#[tokio::test]
+async fn an_event_tier_native_handler_is_refused_the_options_bag() {
+    let ctx = crate::HostCtx::event(crate::ExtMode::Tui, true, std::path::PathBuf::from("/proj"));
+    assert!(
+        matches!(ctx.system_prompt_options(), Err(ExtError::Deadlock)),
+        "pi puts getSystemPromptOptions on ExtensionCommandContext (types.ts:355), so an event \
+         handler must be refused rather than handed a bag"
+    );
+}

@@ -13,10 +13,17 @@
 //! - [`session_list::SessionListOverlay::render`] + [`compose::compose_send`] are driven by the
 //!   `/intercom` slash command ([`crate::extension::IntercomExtension::execute_command`]).
 //!
-//! **What DEGRADES (the port doc §4.3, precise later-phase TODO):** cyrup's native `InitApi` has no
-//! `register_message_renderer`, so the live *message* renderer for the injected
-//! `intercom_message` custom message is still unreachable — and blocked outside this crate besides,
-//! since `HostServices::inject_message` carries no `details` for one to read (ICOM-029/ICOM-024).
+//! **What DEGRADES (the port doc §4.3, precise later-phase TODO):** the live *message* renderer for
+//! the injected `intercom_message` custom message is still unreachable, blocked outside this crate
+//! on TWO counts (ICOM-024/ICOM-029). `InitApi::register_message_renderer` DOES exist
+//! (`cyrup-ext/src/native.rs:270`) — that half of this note was stale, corrected 2026-08-15 — but
+//! (1) `HostServices::inject_message` carries no `details` for a renderer to read, and the live
+//! `AgentMessage::Custom` the TUI hands renderers has no field to carry them either, and
+//! (2) `NativeExtension::render_call` receives no `options`/`theme` and returns a `String`, where
+//! pi's `(message, options, theme) => Component` is re-invoked per frame — so even with `details`
+//! the seam cannot draw the live-width, expandable, themed card this would exist for. Until both
+//! clear, a registered message renderer would return exactly the fixed-width string
+//! `IntercomExtension`'s `render_entry` (ICOM-028) already returns.
 //! The *interactive* overlay-host surface — the `alt+m` shortcut opening a live
 //! [`compose::ComposeOverlay`]/[`session_list::SessionListOverlay`] with live keystroke handling —
 //! is likewise not reachable yet. The overlays' interactive `handle_input` state machines are ported faithfully and

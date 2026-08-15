@@ -24,6 +24,28 @@
 //! (that list is for the package/config subcommands, a distinct concern), and dispatched from
 //! `main()` **before** any user-facing arg leniency/clap parsing runs, exactly mirroring the
 //! existing package/config subcommand pre-dispatch's own placement rationale (Pi `main.ts:486`).
+//!
+//! # [CYRUP-DELTA] (SEAM-109) — an argv verb has no upstream counterpart at all
+//!
+//! **pi has NO argv verbs.** `git -C pi grep -nE 'argv\[2\]|process\.argv' v0.83.0` finds none, and
+//! `packages/coding-agent/src/rpc-entry.ts` / `bun/cli.ts` are separate binary ENTRY POINTS rather
+//! than verbs (the first prepends `--mode rpc`, the second sets `process.title` and re-imports
+//! `../cli.ts`); neither contributes a flag or a subcommand.
+//!
+//! **The mechanism this replaces** is `pi-subagents`' out-of-process runner launch —
+//! `src/runs/background/async-execution.ts:492` (`const runner = path.join(…, "subagent-runner.ts")`)
+//! and `:516` (`spawn(nodeCommand, [jitiCliPath, runner, cfgPath], { detached: true, … })`), read at
+//! `pi-subagents` HEAD `30c6080`. Upstream hands a SEPARATE TypeScript file to `node` + `jiti`, so the
+//! child needs no verb on the agent binary: the script path IS the selector. cyrup ships one compiled
+//! binary with no interpreter to hand a script to (arch-SA §6.5), so the same "detached second OS
+//! process running the runner" is expressed as a re-exec of `current_exe()` under a reserved argv
+//! token. The user-visible mechanism — a genuinely detached process, its own process group, stdio to
+//! files, config handed over by path — is ported literally; only the SELECTOR differs.
+//!
+//! **Deliberately undocumented, and that is the delta's point.** The token is `__`-prefixed, absent
+//! from `--help` and from [`crate::subcommands::SUBCOMMANDS`], and matched only as an exact `argv[1]`
+//! ([`is_selected`]), so it is undiscoverable rather than absent — a user-reachable command surface
+//! that upstream does not have. Recorded here so it is KNOWN rather than mistaken for parity.
 
 use std::path::{Path, PathBuf};
 

@@ -48,6 +48,14 @@ pub enum BrokerListener {
         /// The idle instance currently waiting for a client.
         pending: tokio::net::windows::named_pipe::NamedPipeServer,
     },
+    /// A bound loopback-TCP endpoint (`listen({ host, port })`, `broker.ts:149-151`), the opt-in
+    /// Windows transport (`PI_INTERCOM_TRANSPORT=tcp` / `PI_INTERCOM_TCP=1`, `paths.ts:44-59`).
+    ///
+    /// Compiled on EVERY platform, exactly as upstream's branch is: `getBrokerListenTarget` only
+    /// selects it on Windows, but the arm is neither `#[cfg]`-gated nor unreachable — a unix host
+    /// binds and accepts it identically, which is what makes it testable here at all (the crate
+    /// `#![forbid(unsafe_code)]`s, so no test can flip `process.platform`).
+    Tcp(tokio::net::TcpListener),
 }
 
 impl BrokerListener {
@@ -55,30 +63,38 @@ impl BrokerListener {
     ///
     /// # Errors
     /// Propagates the bind/create failure. The Unix arm's message names the path AND its byte
-    /// length (see the CYRUP-DELTA at the call site in [`crate::broker::run`]); the opt-in
-    /// loopback-TCP listen target is rejected here, see [`Self::bind`]'s `Tcp` arm.
+    /// length (see the CYRUP-DELTA at the call site in [`crate::broker::run`]); the loopback-TCP arm
+    /// binds port `0` and the CHOSEN port is read back with [`Self::local_addr`].
     pub async fn bind(target: &BrokerConnectTarget) -> std::io::Result<Self> {
         match target {
             BrokerConnectTarget::Socket(path) => Self::bind_socket(path),
-            // `getBrokerListenTarget` only ever returns the TCP arm on Windows with
-            // `CYRUP_INTERCOM_TRANSPORT=tcp` / `CYRUP_INTERCOM_TCP=1` explicitly set
-            // (`paths.ts:107-116` via `shouldUseWindowsTcpTransport`, `:44-59`). The BROKER half of
-            // that opt-in — `BROKER_STATE_ID`, the `broker.port.json` endpoint file
-            // (`broker.ts:134-141`) and the `requiresEndpointAuth` credential gate on
-            // `health`/`register` (`broker.ts:284-305`) — is the one piece of pi-intercom this port
-            // has never carried; it is recorded as deferred in this crate's module docs
-            // (`broker/mod.rs`, `paths.rs`) and in the port doc §10-Q2.
-            //
-            // It is refused LOUDLY rather than silently downgraded to the pipe: falling back would
-            // bind an endpoint no client is looking for (`broker_connect_target` reads
-            // `broker.port.json` under the same env), so every session would spawn a fresh broker
-            // and time out, which reads as an intercom outage rather than an unimplemented opt-in.
-            BrokerConnectTarget::Tcp(_) => Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                "the opt-in loopback-TCP intercom transport (CYRUP_INTERCOM_TRANSPORT=tcp / \
-                 CYRUP_INTERCOM_TCP=1) is not implemented by this broker; unset it to use the \
-                 default named-pipe transport",
-            )),
+            // `this.server.listen({ host: LISTEN_TARGET.host, port: LISTEN_TARGET.port })`
+            // (`broker.ts:150-151`). The listen target's port is `0` (`paths.ts:112`), i.e.
+            // bind-any: the kernel picks, and the CHOSEN port is what `broker.port.json` publishes
+            // — read back with [`Self::local_addr`] at the call site (`broker.ts:131-141`), never
+            // from this target.
+            BrokerConnectTarget::Tcp(endpoint) => {
+                tokio::net::TcpListener::bind((endpoint.host.as_str(), endpoint.port))
+                    .await
+                    .map(Self::Tcp)
+            }
+        }
+    }
+
+    /// The endpoint actually bound, for the TCP arm only (`this.server.address()`,
+    /// `broker.ts:132`). `None` on the socket/pipe arms, which have no address —
+    /// upstream's `if (typeof LISTEN_TARGET === "string")` split at `:128`.
+    ///
+    /// # Errors
+    /// Propagates the `getsockname` failure, which is upstream's
+    /// `throw new Error("Intercom TCP broker started without a TCP address")` (`:134`).
+    pub fn local_addr(&self) -> std::io::Result<Option<std::net::SocketAddr>> {
+        match self {
+            #[cfg(unix)]
+            Self::Unix(_) => Ok(None),
+            #[cfg(windows)]
+            Self::Pipe { .. } => Ok(None),
+            Self::Tcp(listener) => listener.local_addr().map(Some),
         }
     }
 
@@ -129,6 +145,15 @@ impl BrokerListener {
                 let connected = std::mem::replace(pending, next);
                 Ok(BrokerStream::new(connected))
             }
+            Self::Tcp(listener) => {
+                let (stream, _addr) = listener.accept().await?;
+                // The client side sets `noDelay` for the same reason
+                // (`transport::stream::BrokerStream::connect`): Node has had it on by default since
+                // v18, and the intercom wire is small request/response frames where Nagle would add
+                // up to 40 ms to every ack.
+                let _ = stream.set_nodelay(true);
+                Ok(BrokerStream::new(stream))
+            }
         }
     }
 
@@ -143,9 +168,19 @@ impl BrokerListener {
             Self::Unix(_) => true,
             #[cfg(windows)]
             Self::Pipe { .. } => false,
+            Self::Tcp(_) => false,
         }
     }
 
+    /// `const requiresEndpointAuth = typeof LISTEN_TARGET !== "string"` (`broker.ts:284`): only the
+    /// TCP endpoint demands the per-run `stateId` credential on `health`/`register`. A socket or
+    /// pipe is reachable only by a peer that can already open the filesystem/namespace entry, which
+    /// is the credential; a loopback port is reachable by every process on the machine, which is
+    /// why the file the port is published in is `0600` and its `stateId` is the actual gate.
+    #[must_use]
+    pub const fn requires_endpoint_auth(&self) -> bool {
+        matches!(self, Self::Tcp(_))
+    }
 }
 
 /// Remove a stale endpoint left by a crashed broker
@@ -229,20 +264,76 @@ mod tests {
         drop(dir);
     }
 
-    /// The opt-in loopback-TCP listen target is refused with a message that names the env vars, on
-    /// EVERY platform — never silently downgraded to the socket/pipe endpoint, which would bind an
-    /// endpoint no client under that env is looking for.
+    /// ICOM-015 — the opt-in loopback-TCP listen target BINDS, accepts a real client, and publishes
+    /// a `broker.port.json` body that this crate's own client-side validation ladder accepts.
+    ///
+    /// Pre-fix `bind` returned `ErrorKind::Unsupported` for this arm and the test asserted that
+    /// refusal, so this fails on the first line. The end-to-end shape is what matters: upstream's
+    /// listen target carries port `0` (`paths.ts:112`) and the endpoint file publishes the port the
+    /// KERNEL chose (`broker.ts:132-140`), so a port read back from the listen target rather than
+    /// from `local_addr()` would publish `0` and every client would fail the `port <= 0` rung.
     #[tokio::test]
-    async fn the_opt_in_tcp_listen_target_is_refused_rather_than_silently_downgraded() {
-        let err = BrokerListener::bind(&BrokerConnectTarget::Tcp(BrokerTcpEndpoint {
+    async fn the_tcp_listen_target_binds_accepts_and_publishes_a_readable_endpoint() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut listener = BrokerListener::bind(&BrokerConnectTarget::Tcp(BrokerTcpEndpoint {
             host: INTERCOM_TCP_HOST.to_string(),
+            // `{ transport: "tcp", host: INTERCOM_TCP_HOST, port: 0 }` — bind-any (`paths.ts:112`).
             port: 0,
             state_id: None,
         }))
         .await
-        .expect_err("the TCP broker half is not implemented");
-        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
-        assert!(err.to_string().contains("CYRUP_INTERCOM_TRANSPORT=tcp"), "{err}");
+        .expect("the loopback TCP endpoint binds");
+
+        let addr = listener.local_addr().expect("local_addr").expect("the TCP arm has an address");
+        assert_ne!(addr.port(), 0, "the published port is the one the kernel chose, never the 0 bound");
+
+        // A TCP peer carries no uid, so it is never `trustedLocal` (`broker.ts:365`), and it is the
+        // one endpoint that demands the `stateId` credential (`:284`).
+        assert!(!listener.is_trusted_local());
+        assert!(listener.requires_endpoint_auth());
+
+        // The exact file body `run` writes, back through the client-side ladder that reads it.
+        let published = BrokerTcpEndpoint {
+            host: INTERCOM_TCP_HOST.to_string(),
+            port: addr.port(),
+            state_id: Some("run-state-id".to_string()),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let intercom_dir = dir.path();
+        std::fs::write(
+            crate::transport::target::broker_port_file_path(intercom_dir),
+            published.to_port_file_body(),
+        )
+        .unwrap();
+        // `broker_connect_target_in`, not `_from`: the `_from` form derives `<agentDir>/intercom/`
+        // (`paths.ts:79`), and this fixture's temp dir IS the intercom dir. `Platform::Windows` +
+        // the transport env is the only combination under which `shouldUseWindowsTcpTransport`
+        // selects the TCP arm at all (`paths.ts:44-59`), and the crate `#![forbid(unsafe_code)]`s,
+        // so the platform and the env both have to be injected rather than set.
+        let parsed = crate::transport::target::broker_connect_target_in(
+            crate::transport::target::Platform::Windows,
+            |k| (k == crate::transport::target::ENV_INTERCOM_TRANSPORT).then(|| "tcp".to_string()),
+            intercom_dir,
+            intercom_dir,
+        )
+        .expect("the published endpoint file passes the client validation ladder");
+        assert_eq!(parsed, BrokerConnectTarget::Tcp(published));
+
+        // And the bound listener really serves that endpoint.
+        let client = tokio::spawn(async move {
+            let mut stream = BrokerStream::connect(&parsed).await.expect("connects");
+            stream.write_all(b"ping").await.expect("write");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).await.expect("read");
+            buf
+        });
+        let mut accepted = listener.accept().await.expect("accepts");
+        let mut buf = [0u8; 4];
+        accepted.read_exact(&mut buf).await.expect("server read");
+        assert_eq!(&buf, b"ping");
+        accepted.write_all(b"pong").await.expect("server write");
+        assert_eq!(&client.await.unwrap(), b"pong");
     }
 
     /// `unlinkSync(LISTEN_TARGET)` is guarded by `platform !== "win32"` at BOTH upstream sites

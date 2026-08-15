@@ -77,10 +77,26 @@ impl AskChannel for CountingOnceChannel {
 /// `set_var`/`getenv` pair is undefined behaviour, not merely flaky ordering.
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Take [`ENV_LOCK`] for the whole test body, recovering from poisoning so one failing test does
-/// not cascade into spurious failures in its siblings.
-fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+/// Drive `body` to completion with [`ENV_LOCK`] held for the whole test, recovering from poisoning
+/// so one failing test does not cascade into spurious failures in its siblings.
+///
+/// The lock is taken in this SYNCHRONOUS frame, around `block_on`, rather than at the top of an
+/// `async` test body. The span covered is identical — every `.await` in the body runs with the lock
+/// held, which it must, because the gate calls `getenv` on the decision path. What changes is where
+/// the `MutexGuard` lives. Inside an `async fn` it is captured in the generated future's state
+/// (`clippy::await_holding_lock`): the guard then makes the future `!Send`, it is owned by whichever
+/// thread last resumed the future rather than by one identifiable thread, and it is released only
+/// when the runtime drops the future — including down cancellation paths no test here wrote. A
+/// `std::sync::Mutex` is not reentrant and has no deadlock detection, so a guard whose release is
+/// contingent on runtime bookkeeping is the shape that hangs a whole test binary instead of failing
+/// it. On a stack frame the guard's lifetime is the frame's, and unwinding releases it.
+///
+/// `block_on` on a CURRENT-THREAD runtime is also what `#[tokio::test]` builds by default, so the
+/// scheduling the bodies see (including `tokio::spawn` + `yield_now` in the PERM-014 test) is
+/// unchanged.
+fn with_env_lock<F: std::future::Future>(body: F) -> F::Output {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body)
 }
 
 /// `prompt_decision`'s fail-fast pre-check (pi `canRequestPermissionConfirmation`,
@@ -89,7 +105,7 @@ fn env_guard() -> std::sync::MutexGuard<'static, ()> {
 /// routes the prompt to [`CountingOnceChannel`] instead of a live `LocalAskChannel`. Set ONCE and
 /// never unset: both tests in this binary need it and may run concurrently.
 ///
-/// PERM-020: the caller MUST already hold [`env_guard`]. The `Once` alone does not help — it makes
+/// PERM-020: the caller MUST already be inside [`with_env_lock`]. The `Once` alone does not help — it makes
 /// the write happen once, but says nothing about whether another test is reading the environment
 /// while it happens.
 fn ensure_subagent_child() {
@@ -154,13 +170,37 @@ fn read_call(call_id: &str, path: &str) -> HostEvent {
     }
 }
 
+/// RED BEFORE THE FIX — and red at COMPILE time, which is the strongest form available here.
+///
+/// `std::sync::MutexGuard` is `!Send`. While each test took `env_guard()` at the top of its `async`
+/// body, the guard was captured in that body's future and every one of these futures was `!Send`,
+/// so this assertion did not compile ("`MutexGuard<'_, ()>` cannot be sent between threads safely
+/// ... required because it appears within the type of the future"). It compiles now precisely
+/// because the guard lives on [`with_env_lock`]'s stack frame instead of inside the futures — which
+/// is the whole content of the fix, not a proxy for it.
+///
+/// Constructing an `async fn`'s future runs none of its body, so this test opens no tempdir, writes
+/// no policy file and touches no environment variable; it needs no lock of its own.
+#[test]
+fn env_locked_bodies_do_not_carry_the_guard_across_their_awaits() {
+    fn assert_send<F: Send>(_: F) {}
+    assert_send(reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_body());
+    assert_send(
+        reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt_body(),
+    );
+    assert_send(two_concurrent_identical_asks_collapse_to_one_prompt_body());
+}
+
 // ================================================================================================
 // (1) SKILL-READ ask surface (pi `index.ts:2282-2292`, `source: "skill_read"`).
 // ================================================================================================
 
-#[tokio::test]
-async fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt() {
-    let _env = env_guard();
+#[test]
+fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt() {
+    with_env_lock(reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_body());
+}
+
+async fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_body() {
     ensure_subagent_child();
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
@@ -220,9 +260,14 @@ async fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt()
 // (2) EXTERNAL-DIRECTORY ask surface (pi `index.ts:2369-2378`, `source: "tool_call"`).
 // ================================================================================================
 
-#[tokio::test]
-async fn reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt() {
-    let _env = env_guard();
+#[test]
+fn reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt() {
+    with_env_lock(
+        reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt_body(),
+    );
+}
+
+async fn reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt_body() {
     ensure_subagent_child();
     let cwd_dir = tempfile::tempdir().unwrap();
     let outside_dir = tempfile::tempdir().unwrap();
@@ -326,9 +371,15 @@ async fn settle() {
 /// prompts, exactly as pi does. That is a second ask surface, not a dedup failure, and it has no
 /// place in a test whose readout is a prompt COUNT. Keeping the read in-workdir isolates the single
 /// surface under test (`read: ask` → the main check).
-#[tokio::test(flavor = "current_thread")]
-async fn two_concurrent_identical_asks_collapse_to_one_prompt() {
-    let _env = env_guard();
+/// The runtime is CURRENT-THREAD, as it was under `#[tokio::test(flavor = "current_thread")]`:
+/// [`settle`]'s determinism depends on there being exactly one worker, so a `spawn`ed task can only
+/// run while this body is parked in `yield_now`. [`with_env_lock`] builds precisely that runtime.
+#[test]
+fn two_concurrent_identical_asks_collapse_to_one_prompt() {
+    with_env_lock(two_concurrent_identical_asks_collapse_to_one_prompt_body());
+}
+
+async fn two_concurrent_identical_asks_collapse_to_one_prompt_body() {
     ensure_subagent_child();
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();

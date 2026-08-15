@@ -931,8 +931,12 @@ where
                     // load-bearing: `agent_end` fires again after an auto-retry or a post-run
                     // compaction, so exiting there would cut a run that is still going.
                     let settled = matches!(ev, AgentSessionEvent::AgentSettled);
-                    // The internal `SessionReplaced` terminal is a rebind signal, not a Pi event.
-                    if !matches!(ev, AgentSessionEvent::SessionReplaced { .. }) {
+                    // Only members of pi's own `AgentSessionEvent` union reach stdout. The internal
+                    // `SessionReplaced` terminal is a rebind signal, not a pi event; `model_changed`
+                    // (SEAM-080) and `session_start`/`session_shutdown` (SEAM-081) are cyrup
+                    // super-set members that pi's `session.subscribe` can never deliver. See
+                    // [`crate::is_upstream_wire_event`].
+                    if crate::is_upstream_wire_event(&ev) {
                         let _ = out.send(RpcOut::Event(Box::new(ev)));
                     }
                     if settled {
@@ -955,7 +959,8 @@ where
             // Flush any events already buffered on the channel + any extension_error queued during
             // shutdown, then shut down cleanly.
             while let Some(Some(ev)) = events.next().now_or_never() {
-                if !matches!(ev, AgentSessionEvent::SessionReplaced { .. }) {
+                // Same rule as the live arm above (SEAM-080/SEAM-081).
+                if crate::is_upstream_wire_event(&ev) {
                     let _ = out.send(RpcOut::Event(Box::new(ev)));
                 }
             }

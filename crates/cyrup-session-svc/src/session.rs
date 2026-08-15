@@ -2561,19 +2561,60 @@ impl AgentSession {
         // names something; an empty path collapses every extension command into one bucket for a
         // client grouping or filtering by source. `ResolvedCommand` carries the owner, which is why
         // the two fixes are one change.
+        //
+        // SEAM-084 — the remaining three fields of that `sourceInfo`, which SEAM-055 did not reach.
+        // pi derives the whole object ONCE per extension in `createExtension`
+        // (`core/extensions/loader.ts:433-444` @v0.83.0) and `registerCommand` copies it onto every
+        // `RegisteredCommand`; `rpc-mode.ts:681-686` then passes `command.sourceInfo` straight
+        // through. cyrup hard-coded a literal instead, so:
+        //
+        // * `source` was `"extension"` — a value that exists NOWHERE upstream. pi emits `"local"` for
+        //   a filesystem-loaded extension and the `<prefix:…>` segment for a synthetic one, so a
+        //   client grouping by `sourceInfo.source` could not tell the two apart. (The sibling
+        //   TOP-LEVEL `"source": "extension"` below IS correct — that is `SlashCommandSource`,
+        //   `core/slash-commands.ts:4`, a different field, and `rpc-mode.ts:684` really does emit it.)
+        // * `baseDir` was absent entirely, so a client resolving a command's assets relative to its
+        //   extension directory had nothing to resolve against.
+        //
+        // Both now come from the provenance the loader recorded ([`cyrup_ext::ExtensionProvenance`]).
+        // `scope`/`origin` stay `"temporary"`/`"top-level"`: those are `createSyntheticSourceInfo`'s
+        // defaults (`core/source-info.ts:36-37`), which `createExtension` never overrides.
         if let Ok(cmds) = self.services.ext_host.registry().resolved_commands() {
             for cmd in cmds {
-                out.push(serde_json::json!({
-                    "name": cmd.invocation_name,
-                    "description": cmd.descriptor.description,
-                    "source": "extension",
-                    "sourceInfo": {
-                        "path": cmd.owner.as_str(),
-                        "source": "extension",
-                        "scope": "temporary",
-                        "origin": "top-level",
-                    },
-                }));
+                let prov = self
+                    .services
+                    .ext_host
+                    .registry()
+                    .extension_provenance(&cmd.owner)
+                    .ok()
+                    .flatten()
+                    // No loader recorded one: the extension came in through neither the discovery
+                    // nor the native path (a test harness registering straight into the registry is
+                    // the only in-tree case). "Loaded by the host with no path" is upstream's
+                    // `<inline>` case, so answer as that rather than inventing a fourth value.
+                    .unwrap_or_else(cyrup_ext::ExtensionProvenance::inline);
+                let mut source_info = serde_json::Map::new();
+                source_info.insert("path".into(), serde_json::Value::from(cmd.owner.as_str()));
+                source_info.insert("source".into(), serde_json::Value::from(prov.source));
+                source_info.insert("scope".into(), serde_json::Value::from("temporary"));
+                source_info.insert("origin".into(), serde_json::Value::from("top-level"));
+                // `baseDir?: string` (`core/source-info.ts:11`) — the key is ABSENT for a synthetic
+                // extension, exactly as `JSON.stringify` drops `baseDir: undefined`.
+                if let Some(dir) = prov.base_dir {
+                    source_info.insert("baseDir".into(), serde_json::Value::from(dir));
+                }
+                let mut entry = serde_json::Map::new();
+                entry.insert("name".into(), serde_json::Value::from(cmd.invocation_name));
+                // `RegisteredCommand.description?: string` (`core/extensions/types.ts:1163-1168`) —
+                // an undescribed command OMITS the key rather than sending `""`. cyrup's
+                // `CommandDescriptor.description` is a non-optional `String` whose empty value is
+                // this port's representation of that absent field, so empty is omitted here.
+                if !cmd.descriptor.description.is_empty() {
+                    entry.insert("description".into(), serde_json::Value::from(cmd.descriptor.description));
+                }
+                entry.insert("source".into(), serde_json::Value::from("extension"));
+                entry.insert("sourceInfo".into(), serde_json::Value::Object(source_info));
+                out.push(serde_json::Value::Object(entry));
             }
         }
         // Prompt templates.

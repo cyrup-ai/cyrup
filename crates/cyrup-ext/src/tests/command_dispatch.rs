@@ -213,3 +213,32 @@ async fn an_unregistered_command_name_routes_nowhere() {
         .expect("routing succeeds")
         .is_none());
 }
+
+/// SEAM-048's LAST reader — RED before this pass.
+///
+/// The two dispatch sites route through `command_route` → `resolved_commands()` (proved by the tests
+/// above), but `ExtensionHost::native_command_names` — the diagnostics/completion enumerator — still
+/// walked `ExtensionRegistry::command_names`, the LAST-WINS `HashMap`. With the same two colliding
+/// natives loaded, it returned the single bare name `["deploy"]`: the first registrant's command was
+/// invisible, and the one entry that survived named a command that `execute_native_command` REFUSES
+/// (a collided bare name is not a command upstream either — see the test below). So `deploy:2` was
+/// executable and unlistable, and `deploy` was listable and unexecutable.
+///
+/// Upstream offers completion the resolved `invocationName` — `name: cmd.invocationName` over
+/// `getRegisteredCommands()` (`modes/interactive/interactive-mode.ts:605` @v0.83.0) — which is
+/// load-ordered and keeps BOTH duplicates.
+#[tokio::test]
+async fn native_command_names_lists_both_colliding_commands_at_their_suffixes() {
+    let (host, _first, _second) = two_colliding_deploys().await;
+
+    let names = host.native_command_names();
+    assert_eq!(
+        names,
+        vec!["deploy:1".to_string(), "deploy:2".to_string()],
+        "both registrants must be listed, in load order, at the names that actually execute"
+    );
+    assert!(
+        !names.contains(&"deploy".to_string()),
+        "the bare name of a collided command is not a command upstream, so it must not be offered"
+    );
+}

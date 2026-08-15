@@ -138,7 +138,7 @@ pub fn build() -> ExtensionApi {
     api.on_agent_start(|ctx| {
         ctx.ui().notify("demo extension active");
         // GAP-11: set_thinking_level from an EVENT handler. Pi allows this from any handler
-        // (loader.ts:352-354 / runner.ts:330, no tier gate) and it TAKES EFFECT. cyrup now QUEUES the
+        // (loader.ts:369-372 / runner.ts:336, no tier gate) and it TAKES EFFECT. cyrup now QUEUES the
         // op and applies it at the store-free turn-boundary drain (never rejects it), so the guest
         // observes `Ok(())` and the level changes on the subsequent turn — matching Pi.
         match ctx.models().set_thinking_level("minimal") {

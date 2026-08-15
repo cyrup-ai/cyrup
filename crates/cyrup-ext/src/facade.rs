@@ -261,7 +261,7 @@ impl ExtensionHost {
     }
 
     /// Attach the live `getActiveTools` source (Pi binds `runtime.getActiveTools` from the session's
-    /// actions, runner.ts:330). Every tool [`Self::active_tools`] returns from then on is wrapped
+    /// actions, runner.ts:329 — `:330` is `getAllTools`). Every tool [`Self::active_tools`] returns from then on is wrapped
     /// for `addedToolNames` derivation (Pi `wrapRegisteredTool`, extensions/wrapper.ts:17-36).
     /// Idempotent; the last source wins.
     pub fn set_active_tool_source(&self, source: Arc<dyn crate::wrapper::ActiveToolNames>) {
@@ -388,6 +388,13 @@ impl ExtensionHost {
         for tool in tools {
             self.registry.register_tool(id.clone(), tool)?;
         }
+        // SEAM-084 — a compiled-in native has no path and no directory, which is exactly upstream's
+        // `loadExtensionFromFactory` case: its default `extensionPath` is the literal `"<inline>"`
+        // (`core/extensions/loader.ts:490` @v0.83.0), so `createExtension`'s `<…>` split yields
+        // `source: "inline"` and `baseDir: undefined`. Recorded alongside the commands it describes,
+        // and after `init` has succeeded, so a native whose `init` failed leaves no orphan row.
+        self.registry
+            .record_extension_provenance(id.clone(), crate::ExtensionProvenance::inline())?;
         for (name, desc) in commands {
             self.registry.register_command(id.clone(), name, desc)?;
         }
@@ -1691,6 +1698,16 @@ impl ExtensionHost {
         // with no manifest parameter — so `disc.manifest.capabilities` was parsed and dropped, and a
         // guest declaring `{"fs": [], "exec": false, "net": false, "ui": false}` received the full
         // host surface (reproduced live: `REPRO-LOG.md`, "EXT-054 — CONFIRMED").
+        // SEAM-084 — record the extension's provenance BEFORE its factory runs, because the guest's
+        // `register-command` imports fire inside `load_wasm_with_caps` and `get_commands` reads the
+        // two back together. This is pi's `createExtension` deriving `{source, baseDir}` from the
+        // extension path up front (`core/extensions/loader.ts:433-444` @v0.83.0) — a discovered
+        // extension is upstream's `else "local"` branch and `disc.dir` is its `path.dirname(
+        // resolvedPath)`, since cyrup discovers a DIRECTORY and resolves the component inside it.
+        self.registry.record_extension_provenance(
+            id.clone(),
+            crate::ExtensionProvenance::local(disc.dir.to_string_lossy().into_owned()),
+        )?;
         self.load_wasm_with_caps(id.clone(), &bytes, services, &disc.manifest.capabilities).await?;
         Ok(id)
     }
@@ -1993,24 +2010,29 @@ impl ExtensionHost {
     #[cfg(feature = "wasm-host")]
     const WASM_EPOCH_BUDGET_TICKS: u64 = 1000;
 
-    /// Names of every registered native command (diagnostics / completion). A subset of
-    /// [`ExtensionRegistry::command_names`] limited to native-owned commands.
+    /// INVOCATION names of every registered native command (diagnostics / completion), in load
+    /// order. A subset of [`ExtensionRegistry::resolved_commands`] limited to native-owned commands.
+    ///
+    /// SEAM-048's last reader. This walked [`ExtensionRegistry::command_names`] — the LAST-WINS
+    /// `HashMap` — and resolved each through `command_owner`, so when two natives registered the same
+    /// name the first one's command was invisible here and the surviving entry was attributed to
+    /// whichever extension registered last. Upstream offers completion the resolved `invocationName`
+    /// (`modes/interactive/interactive-mode.ts:605` @v0.83.0, `name: cmd.invocationName`, over
+    /// `getRegisteredCommands()` → `resolveRegisteredCommands()`), which is load-ordered and keeps
+    /// BOTH duplicates as `name:1` / `name:2`. The two dispatch sites already route through
+    /// [`Self::command_route`]; this was the one enumerator left on the old map, so a `deploy:2` was
+    /// executable but unlistable.
     pub fn native_command_names(&self) -> Vec<String> {
         let native = match self.native.read() {
             Ok(g) => g,
             Err(_) => return Vec::new(),
         };
         self.registry
-            .command_names()
+            .resolved_commands()
             .unwrap_or_default()
             .into_iter()
-            .filter(|n| {
-                self.registry
-                    .command_owner(n)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|o| native.contains_key(&o))
-            })
+            .filter(|c| native.contains_key(&c.owner))
+            .map(|c| c.invocation_name)
             .collect()
     }
 

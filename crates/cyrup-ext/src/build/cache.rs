@@ -80,6 +80,30 @@ impl ArtifactCache {
     }
 
     /// The default cache location (`$XDG_CACHE_HOME` or `~/.cache`).
+    ///
+    /// **[CYRUP-DELTA — cyrup-original read of a name pi also reads, for something else]**
+    /// (CFG-071). `XDG_CACHE_HOME` is a **false name-match** across the two code bases, and the
+    /// match runs in BOTH directions at once:
+    ///
+    /// * **cyrup reads it here** to site the Tier-1 WASM component build cache. pi has no WASM
+    ///   component ABI and no artifact cache, so there is no upstream counterpart for this read —
+    ///   it is a cyrup-original, forced by the extension mechanism (arch-08 §6.4).
+    /// * **pi reads it somewhere cyrup does not** —
+    ///   `packages/coding-agent/src/extensions/llama/huggingface.ts:53` (`findHuggingFaceToken`,
+    ///   declared at `:46`; identical at v0.83.0 and v0.84.1), where it locates
+    ///   `$XDG_CACHE_HOME/huggingface/token` as the third of four token-file candidates after
+    ///   `HF_TOKEN` and `HF_TOKEN_PATH`/`HF_HOME`. That read belongs to the bundled llama.cpp
+    ///   router extension cyrup has not ported: `EXT-027` (`docs/gap-analysis/06-cyrup-ext.md`)
+    ///   owns it, with `DRIFT-032` (`docs/gap-analysis/12-upstream-drift-pi-core.md`) as tracker.
+    ///
+    /// Recorded because a NAME-level parity diff scores the variable as present on both sides and
+    /// therefore as parity, while cyrup simultaneously has an unexplained extra read *and* a
+    /// missing one. **Neither direction closes the other**: this doc closes the cyrup-original half
+    /// only, and CFG-071 stays open until `EXT-027` lands pi's half.
+    ///
+    /// Adjacent grep trap, from `DRIFT-032`: `HF_TOKEN` *does* appear as a literal in cyrup, but
+    /// only as a provider-catalog entry registered through the fleet macro — never as a token-file
+    /// search path. Finding it does not mean `findHuggingFaceToken` is ported.
     pub fn default_location() -> Self {
         let base = std::env::var_os("XDG_CACHE_HOME")
             .map(PathBuf::from)

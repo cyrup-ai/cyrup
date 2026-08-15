@@ -9,7 +9,9 @@
 // catalog one-for-one (`extensions/types.ts:1190-1231` @v0.83.0 — 33 `on(event: "…")` overloads,
 // hand re-derived; the range `:1198-1239` this header used to cite corresponds to NO upstream
 // version and was fabricated, EXT-036). `before_provider_headers` (EXT-009, upstream `:1212`) and
-// `session_info_changed` (EXT-011, upstream `:1203`) closed the last two gaps. The 34th,
+// `session_info_changed` (EXT-011, upstream `:1193`) closed the last two gaps — EXT-073: the
+// `:1203` this line and the event's own comment carried is `session_compact`'s overload, not this
+// event's, and is one of the fabricated-band citations that item cleared. The 34th,
 // `on-terminal-input`, is NOT an `on(event: …)` overload: it is the guest-side half of
 // `ExtensionUIContext.onTerminalInput(handler)` (`extensions/types.ts:145` @v0.83.0), which
 // upstream registers as a closure rather than a named event — a closure cannot cross a component
@@ -40,8 +42,24 @@
 // `event-json` because the payload is pi's four-field LEAF TRANSITION, not a tree dump (EXT-068).
 // IMPORTS: `add-autocomplete-provider` MOVED from `interface registration` to `interface ui`, which
 // is what puts it behind the manifest's `capabilities.ui` grant (EXT-065), and `ui.theme-get-json`
-// was ADDED so a guest can read the colours of the theme that is actually active (EXT-066). Each of
-// the four forces the bump on its own.
+// was ADDED so a guest can read the colours of the theme that is actually active (EXT-066).
+// THREE of those four force the bump on its own; `theme-get-json` does NOT, and this line used to
+// say all four did. A purely ADDITIVE import cannot break an already-built guest — the host simply
+// offers an import nothing calls — which is why `manifest.rs`'s history entry for this same batch
+// records it as "would not have required a bump on its own". The two statements contradicted each
+// other; `manifest.rs` is the correct one (EXT-061 re-derived it against `check_world`).
+//
+// ADDED WITHOUT A BUMP, same batch, same rule: `ctx-state.get-system-prompt-options` (EXT-061), the
+// last unaccounted-for member of pi's extension API surface. Recorded here because "additive import,
+// no bump" is the ONE case where the world file changes and the version does not, so a reader
+// diffing the two will otherwise read it as the `f777e44` mistake.
+//
+// AND THE LIMIT OF THE GATE, which nothing else in the tree states: `check_world` accepts a guest
+// whose minor is >= the host's (`manifest.rs`), so it defends exactly one direction — an OLD guest
+// against a NEW host. A guest built against a NEWER world than the host it runs on is ACCEPTED and
+// then dies in wasmtime on the missing import, and NO version bump can change that, because the
+// bump moves the host's floor rather than its ceiling. Bumping for an additive import therefore buys
+// nothing and costs every already-built guest at the old minor.
 package cyrup:ext@0.8.0;
 
 // ---------------------------------------------------------------------------
@@ -173,7 +191,9 @@ interface types {
 interface events {
   use types.{hook-outcome, tool-output, terminal-input-result};
 
-  // --- provider OAuth + custom streaming (Pi ProviderConfig.oauth/streamSimple, types.ts:1373-1392) ---
+  // --- provider OAuth + custom streaming (pi `ProviderConfig`, `extensions/types.ts:1427-1464`
+  // @v0.83.0; `streamSimple` `:1437`, `oauth` `:1450-1463`) ---
+  // EXT-072: the `:1373-1392` this used to cite is inside `registerProvider`'s `@example` JSDoc.
   // The host invokes these on a guest that registered a provider carrying OAuth/`streamSimple`
   // callbacks. Credentials/models/model/context/options cross as serde_json strings (open-shaped,
   // arch-08 §4.1). `provider-login` runs the guest's `login(callbacks)` flow — during it the guest
@@ -186,14 +206,16 @@ interface events {
   provider-modify-models: func(id: string, models-json: string, credentials-json: string) -> result<string, string>;
   provider-stream-simple: func(id: string, stream-id: string, model-json: string, context-json: string, options-json: string) -> result<_, string>;
 
-  // --- global autocomplete provider stacking (Pi addAutocompleteProvider, types.ts:218) ---
+  // --- global autocomplete provider stacking (pi `addAutocompleteProvider`,
+  // `extensions/types.ts:225` @v0.83.0; EXT-072: `:218` is `getEditorText`'s doc line) ---
   // The host folds the guest's stacked `AutocompleteProviderFactory` chain over its own built-in
   // suggestions: `base-json` is the built-in `autocomplete-suggestions` (the wrapped "current"),
   // `query-json` carries `{lines, cursorLine, cursorCol, force}`. The guest returns the final
   // suggestions after applying every stacked provider in registration order.
   autocomplete-suggest:   func(base-json: string, query-json: string) -> string;
 
-  // --- withSession re-binding callback (Pi ReplacedSessionContext, types.ts:346-390) ---
+  // --- withSession re-binding callback (pi `ReplacedSessionContext`, `extensions/types.ts:394-404`
+  // @v0.83.0; EXT-072: the `:346-390` this cited starts on `getSystemPrompt`) ---
   // After a command-tier `control.new-session`/`switch`/`fork` carrying a `withSessionCallbackId`,
   // the host re-binds the replacement session then invokes THIS export with that id — a fresh
   // top-level call, because wasm single-instance reentrancy forbids calling it synchronously inside
@@ -219,13 +241,17 @@ interface events {
 
   // --- guest slash-command execution (R-08-016) ---
   // The host invokes a guest-registered command at COMMAND tier (session ops legal). `args` is the
-  // raw argument string (Pi RegisteredCommand.handler(args, ctx), types.ts:1109); the optional text
+  // raw argument string (pi `RegisteredCommand.handler(args, ctx)`, `extensions/types.ts:1167`
+  // @v0.83.0; EXT-072: `:1109` is `skipConversationRestore`); the optional text
   // result is surfaced to the user. `get-argument-completions` is Pi's dynamic getArgumentCompletions
-  // (types.ts:1108): given a prefix, the guest returns the completion items (replacing static lists).
+  // (`extensions/types.ts:1166` @v0.83.0; EXT-072: `:1108` is `cancel?: boolean`): given a prefix,
+  // the guest returns the completion items (replacing static lists).
   execute-command:          func(name: string, args: string) -> result<option<string>, string>;
   get-argument-completions: func(name: string, prefix: string) -> list<string>;
 
-  // --- guest keyboard-shortcut execution (R-08-017; Pi registerShortcut handler, types.ts:1199-1205) ---
+  // --- guest keyboard-shortcut execution (R-08-017; pi `registerShortcut` handler,
+  // `extensions/types.ts:1250-1256` @v0.83.0; EXT-072: the `:1199-1205` this cited is inside the
+  // `on(event: …)` overload block) ---
   // The host invokes the guest's stored shortcut handler (`options.handler(ctx)`) when the registered
   // `KeyId` fires. Runs at COMMAND tier (Pi hands the shortcut handler the full `ExtensionContext`).
   execute-shortcut:         func(key: string) -> result<_, string>;
@@ -293,27 +319,31 @@ interface events {
   on-terminal-input: func(data: string) -> option<terminal-input-result>;
 
   // --- 5.4 tools — the mutating seams ---
-  // tool_call [block/mutate] (types.ts:1145), tool_result [mutate] (types.ts:1146).
-  // tool_result carries the FULL Pi `ToolResultEventBase` shape (types.ts:883-929): the executed
+  // tool_call [block/mutate] (subscribed at types.ts:1228 @v0.83.0), tool_result [mutate] (:1229).
+  // EXT-073: the `:1145`/`:1146` these carried lie outside the overload block at every version.
+  // tool_result carries the FULL pi `ToolResultEventBase` shape (types.ts:914-922 @v0.83.0; EXT-072:
+  // `:883-929` spans the whole per-tool result-event family): the executed
   // tool `input` (the arguments), the per-tool `details` blob (`BashToolDetails | …`) AND the
-  // optional `usage` the tool execution itself reported (types.ts:919-921, upstream `2fd38684`) —
+  // optional `usage` the tool execution itself reported (types.ts:920-921 @v0.83.0, upstream
+  // `2fd38684`; EXT-072: `:919` is the sibling `isError`) —
   // not just content+isError. A `tool_result` handler inspects and patches all of them; the patch
   // direction rides the `hook-outcome` mutate JSON, whose `usage` key is read back host-side.
   on-tool-call:    func(call-id: string, name: string, input-json: string) -> hook-outcome;
   on-tool-result:  func(call-id: string, name: string, input-json: string, content-json: string, is-error: bool, details-json: option<string>, usage-json: option<string>) -> hook-outcome;
 
   // --- 5.3 agent & turn ---
-  // context [mutate] (types.ts:1144), message_end [mutate] (types.ts:1143),
-  // before_agent_start [mutate] (types.ts:1135).
+  // context [mutate] (subscribed at types.ts:1207 @v0.83.0), message_end [mutate] (:1222),
+  // before_agent_start [mutate] (:1214). EXT-073: `:1143`/`:1144`/`:1135` were the fabricated band.
   on-context:            func(messages-json: string) -> hook-outcome;
   on-message-end:        func(message-json: string) -> hook-outcome;
   on-before-agent-start: func(prompt: string, images-json: string, system-prompt: string, options-json: string) -> hook-outcome;
 
-  // input [block/mutate/handled] (types.ts:1158), user_bash [block/mutate/handled] (types.ts:1159).
-  // `input` carries the full Pi `InputEvent` (types.ts:800-810): the submission `text`, the attached
+  // input [block/mutate/handled] (subscribed at types.ts:1231 @v0.83.0), user_bash
+  // [block/mutate/handled] (:1230). EXT-073: `:1158`/`:1159` land on the Command Registration banner.
+  // `input` carries the full pi `InputEvent` (types.ts:831-841 @v0.83.0): the submission `text`, the attached
   // `images`, the `source` ("interactive"|"rpc"|"extension"), and the in-flight `streaming-behavior`
   // ("steer"|"followUp"; none when the agent is idle).
-  // `user_bash` carries the Pi `UserBashEvent` (types.ts:782-790): the `command`, the
+  // `user_bash` carries the pi `UserBashEvent` (types.ts:813-821 @v0.83.0): the `command`, the
   // `exclude-from-context` flag (true for the `!!` prefix), and the `cwd`. The `operations`/`result`
   // override is returned via the `handled` outcome (Pi `UserBashEventResult`, `extensions/types.ts:1078-1083` @v0.83.0; EXT-036 corrected `:1043-1048`),
   // NOT passed in.
@@ -321,7 +351,8 @@ interface events {
   on-user-bash:    func(command: string, exclude-from-context: bool, cwd: string) -> hook-outcome;
 
   // --- 5.6 provider ---
-  // before_provider_request [mutate] (types.ts:1160), after_provider_response [notify] (types.ts:1161).
+  // before_provider_request [mutate] (subscribed at types.ts:1209 @v0.83.0),
+  // after_provider_response [notify] (:1213). EXT-073: `:1160`/`:1161` were the fabricated band.
   on-before-provider-request: func(payload-json: string) -> hook-outcome;
   // before_provider_headers [mutate] (pi `BeforeProviderHeadersEvent`, extensions/types.ts:686-689
   // @v0.83.0, subscribed at :1212, reduced by `emitBeforeProviderHeaders` at runner.ts:1045).
@@ -344,7 +375,9 @@ interface events {
   // --- notify-only (return ignored); high-frequency ones are subscription-gated ---
   on-agent-start:           func();
   on-agent-end:             func(messages-json: string);
-  // agent_settled (Pi AgentSettledEvent, extensions/types.ts:721-725, subscribed at types.ts:1225):
+  // agent_settled (pi `AgentSettledEvent`, extensions/types.ts:721-725 @v0.83.0, subscribed at
+  // `:1217`; EXT-073: the `:1225` this carried is `tool_execution_end`'s overload — the same
+  // wrong-surface value EXT-036 fixed in `host/services.rs` and left standing here):
   // the run has FULLY settled — no automatic retry, post-run compaction or queued continuation will
   // follow. Distinct from on-agent-end, which fires once per agent.prompt/agent.continue: a run that
   // auto-retries delivers TWO on-agent-end calls and exactly ONE on-agent-settled. Pi emits it from
@@ -352,13 +385,13 @@ interface events {
   // the session subscribers second.
   on-agent-settled:         func();
   on-turn-start:            func(turn-index: u32, timestamp: u64);
-  // turn_end (Pi TurnEndEvent, types.ts:703-709): the turn index, the finalized assistant `message`,
+  // turn_end (pi `TurnEndEvent`, types.ts:735-740 @v0.83.0): the turn index, the finalized assistant `message`,
   // AND the `tool-results` produced this turn (`ToolResultMessage[]`).
   on-turn-end:              func(turn-index: u32, message-json: string, tool-results-json: string);
-  // message_start (Pi MessageStartEvent, types.ts:711-715): the full `message` (user|assistant|
+  // message_start (pi `MessageStartEvent`, types.ts:743-746 @v0.83.0): the full `message` (user|assistant|
   // toolResult), not just its role.
   on-message-start:         func(message-json: string);
-  // message_update (Pi MessageUpdateEvent, types.ts:717-722): the full in-flight `message` AND the
+  // message_update (pi `MessageUpdateEvent`, types.ts:749-753 @v0.83.0): the full in-flight `message` AND the
   // `assistant-message-event` delta (carried here as `delta-json`). HIGH-FREQ, gated.
   on-message-update:        func(message-json: string, delta-json: string);   // HIGH-FREQ, gated
   // EXT-069: these three used to be spelled `on-tool-exec-{start,update,end}` — the ONLY three
@@ -387,7 +420,8 @@ interface events {
   // replacement" (EXT-015).
   on-session-shutdown:      func(reason: string, target-session-file: option<string>);
   // session_info_changed (pi `SessionInfoChangedEvent`, extensions/types.ts:571-575 @v0.83.0,
-  // subscribed at :1203): "Current normalized session name. Undefined when the name is cleared" —
+  // subscribed at `:1193`; EXT-073: `:1203` is `session_compact`): "Current normalized session
+  // name. Undefined when the name is cleared" —
   // hence `option<string>`, where `none` is upstream's `undefined` (EXT-011).
   on-session-info-changed:  func(name: option<string>);
   // resources_discover (pi `ResourcesDiscoverEvent`, extensions/types.ts:544-548 @v0.83.0):
@@ -409,8 +443,11 @@ interface events {
   // `entryId` AND `position: "before" | "at"` — a fork BEFORE an entry and a fork AT it are
   // different operations (EXT-015).
   on-session-before-fork:    func(entry-id: string, position: string) -> hook-outcome;
-  // session_before_compact (Pi SessionBeforeCompactEvent, types.ts:577-587): the computed
-  // `preparation` (CompactionPreparation, compaction.ts:634) + the `branch-entries` in scope + optional
+  // session_before_compact (pi `SessionBeforeCompactEvent`, extensions/types.ts:592-602 @v0.83.0 —
+  // the value the CYRUP-DELTA below already cites; EXT-072: `:577-587` is `SessionBeforeSwitchEvent`):
+  // the computed
+  // `preparation` (`CompactionPreparation`, `core/compaction/compaction.ts:692` @v0.83.0; EXT-072:
+  // `:634` was both the wrong line and an unqualified path) + the `branch-entries` in scope + optional
   // `custom-instructions` + the trigger `reason` ("manual"|"threshold"|"overflow") + `will-retry`. A
   // handler may VETO via `block` or return a compaction override via `mutate` (Pi
   // SessionBeforeCompactResult.compaction = a CompactionResult) — the override's summary/details land
@@ -424,12 +461,16 @@ interface events {
   // `on-session-before-tree`'s enumerate the OTHER payload fields exhaustively, which made the
   // absence read as an oversight rather than the decision it is.
   on-session-before-compact: func(preparation-json: string, branch-entries-json: string, custom-instructions: option<string>, reason: string, will-retry: bool) -> hook-outcome;
-  // session_compact (Pi SessionCompactEvent, types.ts:589-598): the produced `compaction-entry` (its
+  // session_compact (pi `SessionCompactEvent`, extensions/types.ts:605-613 @v0.83.0): the produced
+  // `compaction-entry` (its
   // `summary` field carries the summary text), whether an extension drove it (`from-extension`), the
   // trigger `reason`, and `will-retry`.
   on-session-compact:        func(compaction-entry-json: string, from-extension: bool, reason: string, will-retry: bool);
-  // session_before_tree (Pi SessionBeforeTreeEvent, types.ts:623-628): the computed `preparation`
-  // (TreePreparation, compaction.ts) — targetId/oldLeafId/commonAncestorId/entriesToSummarize/
+  // session_before_tree (pi `SessionBeforeTreeEvent`, extensions/types.ts:639-643 @v0.83.0 — the
+  // value the CYRUP-DELTA below already cites; EXT-072: `:623-628` lands on `TreePreparation`, a
+  // different type): the computed `preparation`
+  // (`TreePreparation`, `extensions/types.ts:624-636` @v0.83.0 — NOT `compaction.ts`, which is
+  // where its compaction-side sibling lives) — targetId/oldLeafId/commonAncestorId/entriesToSummarize/
   // userWantsSummary/customInstructions?/label?. A handler may VETO via `block` or return a
   // summary/customInstructions/label override via `mutate` (Pi SessionBeforeTreeResult).
   //
@@ -563,7 +604,9 @@ interface ui {
   // `{signal, timeout}` — `timeout?: number`, "Timeout in milliseconds. Dialog auto-dismisses with
   // live countdown display" (:100), and/or a programmatic-dismiss signal id (none = `{}`).
   // EXT-048: the citation this comment used to carry (`types.ts:89`, key `timeoutMs`) was wrong on
-  // both counts — `:89` is a blank line before the UI Context banner at v0.83.0 and upstream has no
+  // both counts — `:89` is the `AppKeybinding`/`KeybindingsManager` re-export at v0.83.0 (EXT-072
+  // corrected this note's own claim that it was "a blank line before the UI Context banner"; the
+  // blank is `:90` and the banner `:91-93`) and upstream has no
   // `timeoutMs` anywhere. `timeout` is now the CANONICAL key; `timeoutMs` is still accepted as a
   // serde alias for back-compat with bags cyrup's own SDK already wrote.
   // EXT-036, SECOND CLUSTER: the three `rpc-types.ts` citations below were stale by a uniform +8 —
@@ -695,8 +738,9 @@ interface ui {
   set-hidden-thinking-label: func(label: option<string>);
   // CYRUP-DELTA: `working-start`/`working-stop` are cyrup-ORIGINAL. Upstream has no `startWorking`
   // or `stopWorking` at v0.83.0 (`git grep -n 'startWorking\|stopWorking' v0.83.0` is empty) and
-  // the `types.ts:265-275` this pair used to cite is `getAllThemes`/`getTheme`/`setTheme`/
-  // `getToolsExpanded` — a fabricated citation (EXT-021/EXT-036). They are kept because guests and
+  // the `types.ts:265-275` this pair used to cite is the theme block — `theme`/`getAllThemes`/
+  // `getTheme`/`setTheme` (EXT-072 corrected this note too: `getToolsExpanded` is `:278`, OUTSIDE
+  // the range it named) — a fabricated citation (EXT-021/EXT-036). They are kept because guests and
   // the bundled example already call them; they are now defined in terms of the pi imports above:
   // `working-start(label)` == `set-working-message(some(label))` + `set-working-visible(true)`,
   // `working-stop()` == `set-working-visible(false)`.
@@ -731,12 +775,24 @@ interface models {
   // `/scoped-models` command shows. Empty when no scoping is configured." json array (EXT-045).
   scoped-models:      func() -> string;
   current:            func() -> option<string>;
-  set-model:          func(model-json: string);  // COMMAND-only at the host
+  // Callable from ANY tier, matching pi: `setModel` is bound with only `assertActive`
+  // (`core/extensions/loader.ts:359-362` @v0.83.0) and takes effect
+  // (`core/agent-session.ts:1476-1490`). EXT-074: this line read "COMMAND-only at the host" and its
+  // sibling below said an event-tier call is "REJECTED" — both were STALE. GAP-11 dropped the tier
+  // gate in `host/live.rs` (`set_model` `:561-562`, `set_thinking_level` `:580-581` both take the
+  // ungated `guest_of`) and neither comment moved, so the WIT advertised a restriction the host does
+  // not enforce — the mirror image of EXT-066's capability-with-a-dead-backend, and just as
+  // misleading to a guest author, who is reading the only contract they have.
+  set-model:          func(model-json: string);
   context-usage:      func() -> string;
   thinking-level:     func() -> option<string>;
-  // COMMAND-only at the host (deadlock rule): Pi allows setThinkingLevel from any handler
-  // (runner.ts:330), but cyrup routes it through the command-tier `control` path, so an event-tier
-  // call is REJECTED with an observable error (like every `control.*` op) — never a silent no-op.
+  // Callable from ANY tier too (EXT-074, see `set-model` above): pi binds `setThinkingLevel` with
+  // only `assertActive` (`core/extensions/loader.ts:369-372` @v0.83.0, wired at
+  // `core/extensions/runner.ts:336`; EXT-072: `:330` is the `getAllTools` wiring). cyrup QUEUES the
+  // op through the `control` mpsc — a synchronous push touching no wasm store — and applies it at
+  // the store-free turn-boundary drain, which is what dissolves the R-08-008 deadlock the old
+  // command-tier gate existed to prevent. The `result` stays: it carries a real backend failure
+  // (no session attached), not a tier refusal.
   set-thinking-level: func(level: string) -> result<_, string>;
 }
 
@@ -874,7 +930,9 @@ interface oauth {
   on-select:      func(message: string, options-json: string) -> option<string>;
 }
 
-// streamSimple output (Pi `createAssistantMessageEventStream`, types.ts:1373): the guest's custom
+// streamSimple output (pi `createAssistantMessageEventStream`,
+// `packages/ai/src/utils/event-stream.ts:86` @v0.83.0 — EXT-072: the `types.ts:1373` this cited is a
+// JSDoc line and the symbol is in a different package): the guest's custom
 // stream pushes assistant-message stream events keyed by `stream-id`; the host forwards them to the
 // provider pipeline (the streaming analog of `host-tool.emit-update`).
 interface provider-stream {
@@ -916,10 +974,14 @@ interface ext-tools {
   get-commands:     func() -> string;   // json array of SlashCommandInfo {name, description?, source, sourceInfo}
 }
 
-// Read-only ctx state (Pi `ExtensionContext`, extensions/types.ts:305-347). Pi puts `mode`, `hasUI`,
+// Read-only ctx state (pi `ExtensionContext`, extensions/types.ts:307-347 @v0.83.0 — EXT-072:
+// `:305` is `ExtensionMode`). Pi puts `mode`, `hasUI`,
 // `isIdle`, `hasPendingMessages`, `isProjectTrusted` and `getSystemPrompt` on the BASE context —
 // available to EVERY handler, not just command handlers — so these are deliberately NOT tier-gated.
 // The native built-in path reads the same six values off `HostCtx` / `HostCtx::rich()`.
+//
+// `get-system-prompt-options` (EXT-061) is the ONE exception and it is upstream's, not cyrup's: it
+// is the only member here pi declares on `ExtensionCommandContext` instead. See its comment.
 interface ctx-state {
   use types.{ext-mode};
 
@@ -929,14 +991,35 @@ interface ctx-state {
   // Pi `ctx.hasUI` (types.ts:313): "Whether dialog-capable UI is available (true in TUI and RPC
   // modes)" — the guard a guest checks before `ui.confirm`/`input`/`select`.
   has-ui:               func() -> bool;
-  // Pi `ctx.isIdle()` (types.ts:333): false while an agent run is in flight.
+  // pi `ctx.isIdle()` (types.ts:330 @v0.83.0; EXT-072: `:333` is `signal`'s doc line): false while
+  // an agent run is in flight.
   is-idle:              func() -> bool;
-  // Pi `ctx.hasPendingMessages()` (types.ts:341): queued user messages awaiting the next turn.
+  // pi `ctx.hasPendingMessages()` (types.ts:338 @v0.83.0; EXT-072: `:341` is `getContextUsage`'s
+  // doc line): queued user messages awaiting the next turn.
   has-pending-messages: func() -> bool;
-  // Pi `ctx.isProjectTrusted()` (types.ts:335).
+  // pi `ctx.isProjectTrusted()` (types.ts:332 @v0.83.0; EXT-072: `:335` is `abort`'s doc line).
   is-project-trusted:   func() -> bool;
   // Pi `ctx.getSystemPrompt()` (types.ts:346); empty string when no session backend is attached.
   get-system-prompt:    func() -> string;
+  // pi `ctx.getSystemPromptOptions()` (`extensions/types.ts:355` @v0.83.0, documented at `:354`
+  // "Get the current base system-prompt construction options") — the serialized
+  // `BuildSystemPromptOptions` BAG that produced the string `get-system-prompt` returns, so a
+  // command can rebuild the prompt with ONE option changed instead of reconstructing the bag by
+  // guesswork from the resolved text (EXT-061). The bag is `core/system-prompt.ts:8-25` @v0.83.0:
+  // `{customPrompt?, selectedTools?, toolSnippets?, promptGuidelines?, appendSystemPrompt?, cwd,
+  // contextFiles?, skills?}`; upstream fills it once per build as `_baseSystemPromptOptions`
+  // (`core/agent-session.ts:1044-1053`) and hands it back verbatim at `:2436`.
+  //
+  // THE ONE TIER-GATED MEMBER OF THIS INTERFACE, and the exception is upstream's own: pi declares
+  // `getSystemPrompt()` on the BASE `ExtensionContext` (`:346`) but `getSystemPromptOptions()` on
+  // `ExtensionCommandContext` (`:353-387`), so an event-tier call is REJECTED here with the same
+  // observable error every `control.*` op gives — never a silent empty bag. That is also why this
+  // returns a `result` where its six siblings return plain values.
+  //
+  // With no session backend the host answers pi's OWN no-backend default rather than an error or an
+  // empty object: `() => ({ cwd: this.cwd })` (`core/extensions/runner.ts:287`, re-bound at `:350`
+  // @v0.83.0). A bag carrying only `cwd` is therefore a valid answer, not a broken one.
+  get-system-prompt-options: func() -> result<string, string>;
   // pi `ctx.cwd: string` (extensions/types.ts:315 @v0.83.0) — on the BASE `ExtensionContext`, in
   // the same block as `mode` (:311) and `hasUI` (:313), so it is available to every handler and
   // every tool `execute`, not just command handlers. Without it a guest can resolve no relative
@@ -958,11 +1041,15 @@ interface ctx-state {
 
 // COMMAND-ONLY (arch-08 §6.3, deadlock rule): session/runtime mutation. Calling any of
 // these from an event handler returns a host-side deadlock error (surfaced, never a hang).
-// EXCEPT `abort`/`shutdown` — see their comments: Pi puts both on the BASE `ExtensionContext`
-// (types.ts:339-340,344), callable from any handler, so cyrup does NOT tier-gate them.
+// EXCEPT `abort`/`shutdown` — see their comments: pi puts both on the BASE `ExtensionContext`
+// (`abort` `:336`, `shutdown` `:340`, alongside `compact` `:344`, @v0.83.0; EXT-072: the
+// `:339-340,344` this cited put `abort` on `shutdown`'s doc line), callable from any handler, so
+// cyrup does NOT tier-gate them.
 interface control {
   // opts-json carries the typed Pi option bags (newSession{parentSession,withSession},
-  // fork{position,withSession}, switchSession{withSession}, navigateTree{summarize,…}, types.ts:346-368).
+  // fork{position,withSession}, switchSession{withSession}, navigateTree{summarize,…},
+  // `extensions/types.ts:361-383` @v0.83.0 — EXT-072: `:346-368` starts on `getSystemPrompt` and
+  // ends on `fork(`).
   new-session:   func(opts-json: string) -> result<_, string>;
   switch:        func(session-id: string, opts-json: string) -> result<_, string>;
   fork:          func(entry-id: string, opts-json: string) -> result<_, string>;
@@ -974,7 +1061,8 @@ interface control {
   // `session_compact` event (Pi's own `SessionCompactEvent` carries the produced entry).
   compact:       func(opts-json: string) -> result<_, string>;
   wait-idle:     func() -> result<_, string>;
-  // send-message (types.ts:1223): opts-json carries {triggerTurn, deliverAs}.
+  // send-message (pi `sendMessage`, `extensions/types.ts:1286` @v0.83.0; EXT-072: `:1223` is the
+  // `tool_execution_start` overload): opts-json carries {triggerTurn, deliverAs}.
   send-message:      func(message-json: string, opts-json: string) -> result<_, string>;
   send-user-message: func(content: string, opts-json: string) -> result<_, string>;
 

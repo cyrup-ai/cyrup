@@ -109,7 +109,7 @@ fn the_header_version_marker_matches_the_package_line_in_both_copies() {
             .lines()
             .next()
             .and_then(|l| l.trim().strip_prefix("//"))
-            .map(|rest| rest.trim().split_whitespace().next().unwrap_or("").to_string())
+            .map(|rest| rest.split_whitespace().next().unwrap_or("").to_string())
             .unwrap_or_else(|| panic!("no leading `// cyrup:ext@…` marker in {}", path.display()));
         assert_eq!(
             marker,
@@ -197,4 +197,207 @@ fn the_cache_key_tracks_the_wit_and_sdk_sources_outside_the_extension_crate() {
     let id = crate::build::world_abi_id();
     assert!(id.starts_with(crate::HOST_WORLD), "the world identity leads with HOST_WORLD: {id}");
     assert!(id.ends_with(&recomputed), "the world identity carries the ABI fingerprint: {id}");
+}
+
+// ---------------------------------------------------------------------------
+// EXT-072 / EXT-073 — the citation lint.
+//
+// Under this project's rules an in-tree `pi` citation IS the evidence that a port matches upstream,
+// so a citation that resolves to an unrelated line is worth less than none — and worse than none
+// when it resolves to a PLAUSIBLE line, which every one of EXT-072's neighbour-doc offsets did.
+// EXT-036 asked for this guard, EXT-072 asked again, and both times the citations were rewritten by
+// hand with nothing left behind to keep them rewritten: `:1257-1266` was named by name in EXT-036's
+// write-up, fixed in the `.rs` sites, and left standing in the WIT for two more sweeps.
+//
+// These two tests are the durable half, and they are deliberately OFFLINE — a test that needs a pi
+// checkout skips in CI, and a skipped guard is not a guard.
+// ---------------------------------------------------------------------------
+
+/// Every ABI-adjacent file that carries pi citations. `world.wit` is checked in BOTH copies because
+/// they are byte-identical by test and a fix applied to one only would pass every other pin here.
+fn cited_files() -> Vec<PathBuf> {
+    let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    vec![
+        crate_dir.join("wit/world.wit"),
+        crate_dir.join("../cyrup-ext-sdk/wit/world.wit"),
+        crate_dir.join("../cyrup-ext-sdk/src/ctx.rs"),
+        crate_dir.join("../cyrup-ext-sdk/src/api.rs"),
+        crate_dir.join("src/host/services.rs"),
+        crate_dir.join("src/host/live.rs"),
+        crate_dir.join("src/event.rs"),
+        crate_dir.join("src/native.rs"),
+        crate_dir.join("src/registry.rs"),
+    ]
+}
+
+/// A gap-analysis id on the SAME line marks a deliberate quotation of a struck value — the
+/// "do-not-restore" note. Anything else carrying one of these numbers is a live citation.
+const CORRECTIVE_MARKERS: &[&str] =
+    &["EXT-036", "EXT-048", "EXT-060", "EXT-072", "EXT-073", "EXT-074"];
+
+/// Values re-derived against `v0.83.0` this pass and found to resolve to an unrelated symbol. Each
+/// entry is `(the citation text, what that line actually is upstream)`; the second half is not
+/// asserted on, it is the reason, kept here so a reader who hits this test learns why rather than
+/// deleting the entry.
+const STRUCK_CITATIONS: &[(&str, &str)] = &[
+    ("types.ts:1145", "blank line (tool_call subscribes at :1228)"),
+    ("types.ts:1146", "`MessageRenderer` (tool_result subscribes at :1229)"),
+    ("types.ts:1144", "a closing brace (context subscribes at :1207)"),
+    ("types.ts:1143", "`expanded: boolean` (message_end subscribes at :1222)"),
+    ("types.ts:1135", "blank line (before_agent_start subscribes at :1214)"),
+    ("types.ts:1158", "the Command Registration banner (input subscribes at :1231)"),
+    ("types.ts:1159", "the Command Registration banner (user_bash subscribes at :1230)"),
+    ("types.ts:1160", "a banner rule (before_provider_request subscribes at :1209)"),
+    ("types.ts:1161", "blank line (after_provider_response subscribes at :1213)"),
+    ("types.ts:1108", "`cancel?: boolean` (getArgumentCompletions is :1166)"),
+    ("types.ts:1109", "`skipConversationRestore` (RegisteredCommand.handler is :1167)"),
+    ("types.ts:1105", "a closing brace (registerCommand is :1247)"),
+    ("types.ts:218", "`getEditorText`'s doc line (addAutocompleteProvider is :225)"),
+    ("types.ts:1373", "an `@example` JSDoc line inside `registerProvider`"),
+    ("types.ts:1257", "wrong surface; getActiveTools/getAllTools/setActiveTools/getCommands are :1320-:1329"),
+    ("types.ts:117", "a `WorkingIndicatorOptions` doc line (AutocompleteProviderFactory is :124)"),
+    ("types.ts:1337", "blank line (registerProvider(name, config) is :1401)"),
+    // EXT-074's own citations, struck by the verification pass that closed it. `:342-345` and
+    // `:352-354` correspond to NO tag: at v0.83.0 they are the `getAllTools` and `getCommands`
+    // bindings, at v0.82.1 `setModel`/`setThinkingLevel` are :359/:369 and at v0.84.x they are
+    // :383/:393. The claim they support (pi gates neither) is correct; only the lines were wrong.
+    ("loader.ts:342-345", "the `getAllTools` binding (`setModel` is :359-362 @v0.83.0)"),
+    ("loader.ts:352-354", "the `getCommands` binding (`setThinkingLevel` is :369-372 @v0.83.0)"),
+];
+
+/// EXT-072/EXT-073: a struck citation may appear ONLY on a line that also names the item that
+/// struck it — i.e. as a do-not-restore note, never as a live citation.
+///
+/// Pre-fix this is RED at nine sites in each `world.wit` copy alone: `world.wit:296` read
+/// "`tool_call [block/mutate] (types.ts:1145), tool_result [mutate] (types.ts:1146)`" with no
+/// marker on the line, and `:1145` is a blank line at `v0.83.0` — the fabricated `:1135-1161` band
+/// EXT-073 filed, which lies entirely outside pi's `on(event: …)` overload block.
+#[test]
+fn no_struck_pi_citation_is_restored_as_a_live_citation() {
+    let mut live: Vec<String> = Vec::new();
+    for path in cited_files() {
+        for (n, line) in read(&path).lines().enumerate() {
+            for (cite, actual) in STRUCK_CITATIONS {
+                if line.contains(cite) && !CORRECTIVE_MARKERS.iter().any(|m| line.contains(m)) {
+                    live.push(format!(
+                        "{}:{} cites `{cite}`, which at v0.83.0 is {actual}\n    {}",
+                        path.display(),
+                        n + 1,
+                        line.trim(),
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        live.is_empty(),
+        "{} struck pi citation(s) are live again — re-derive against the tag before citing it, and \
+         if you are quoting a struck value on purpose, name the item that struck it on the same \
+         line (EXT-072/EXT-073):\n{}",
+        live.len(),
+        live.join("\n"),
+    );
+}
+
+/// EXT-073, the class rather than the instances. pi's `on(event: "…")` overload block occupies
+/// `extensions/types.ts:1190-1231` @v0.83.0 — 33 overloads, the count the header test pins — and
+/// every "subscribed at" citation in the tree names one of them. So the citation is checkable
+/// WITHOUT a pi checkout: the line number determines which event upstream subscribes there, and that
+/// event must be the one the comment is about.
+///
+/// The map below was re-derived line by line at `v0.83.0` this pass (EXT-073 records the same
+/// derivation). It is the whole reason a fabricated subscription line is a different defect from a
+/// stale one: staleness moves every citation by one offset, so the map still resolves in order,
+/// while `agent_settled … subscribed at :1225` resolves to `tool_execution_end` — a real overload,
+/// eight events away, which is why it read as plausible through nine sweeps.
+///
+/// Pre-fix this is RED at eight sites (measured), all of them INSIDE the band and therefore
+/// invisible to a plain range check: `agent_settled … :1225` — upstream `tool_execution_end` — in
+/// both `world.wit` copies, `api.rs:51` and `event.rs:50`; and `session_info_changed … :1203` —
+/// upstream `session_compact` — in both copies, `api.rs:58` and `event.rs:61`.
+const PI_EVENT_SUBSCRIPTION_LINES: &[(&str, u32)] = &[
+    ("project_trust", 1190),
+    ("resources_discover", 1191),
+    ("session_start", 1192),
+    ("session_info_changed", 1193),
+    ("session_before_switch", 1195),
+    ("session_before_fork", 1198),
+    ("session_before_compact", 1200),
+    ("session_compact", 1203),
+    ("session_shutdown", 1204),
+    ("session_before_tree", 1205),
+    ("session_tree", 1206),
+    ("context", 1207),
+    ("before_provider_request", 1209),
+    ("before_provider_headers", 1212),
+    ("after_provider_response", 1213),
+    ("before_agent_start", 1214),
+    ("agent_start", 1215),
+    ("agent_end", 1216),
+    ("agent_settled", 1217),
+    ("turn_start", 1218),
+    ("turn_end", 1219),
+    ("message_start", 1220),
+    ("message_update", 1221),
+    ("message_end", 1222),
+    ("tool_execution_start", 1223),
+    ("tool_execution_update", 1224),
+    ("tool_execution_end", 1225),
+    ("model_select", 1226),
+    ("thinking_level_select", 1227),
+    ("tool_call", 1228),
+    ("tool_result", 1229),
+    ("user_bash", 1230),
+    ("input", 1231),
+];
+
+#[test]
+fn every_subscribed_at_citation_names_the_event_pi_subscribes_on_that_line() {
+    let mut wrong: Vec<String> = Vec::new();
+    for path in cited_files() {
+        let src = read(&path);
+        let lines: Vec<&str> = src.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            let Some(rest) = line.split("subscribed at").nth(1) else { continue };
+            let next = lines.get(i + 1).copied().unwrap_or_default();
+            // A wrapped citation puts the number on the continuation line.
+            let joined =
+                if rest.trim().is_empty() || !rest.contains(':') { format!("{rest} {next}") } else { rest.to_string() };
+            let Some(num) = joined
+                .split(':')
+                .nth(1)
+                .map(|t| t.chars().take_while(char::is_ascii_digit).collect::<String>())
+                .and_then(|d| d.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            // The comment the citation belongs to: the line itself plus one either side, which is as
+            // far as any of these wrap.
+            let window = format!("{} {line} {next}", lines.get(i.saturating_sub(1)).copied().unwrap_or_default());
+            match PI_EVENT_SUBSCRIPTION_LINES.iter().find(|(_, l)| *l == num) {
+                Some((event, _)) if window.contains(event) => {}
+                Some((event, _)) => wrong.push(format!(
+                    "{}:{} cites `:{num}`, where pi subscribes `{event}` — which this comment is not about\n    {}",
+                    path.display(),
+                    i + 1,
+                    line.trim(),
+                )),
+                None => wrong.push(format!(
+                    "{}:{} cites `:{num}`, which is not one of pi's 33 `on(event: …)` overload lines \
+                     (extensions/types.ts:1190-1231 @v0.83.0)\n    {}",
+                    path.display(),
+                    i + 1,
+                    line.trim(),
+                )),
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} `subscribed at` citation(s) name the wrong pi overload. Re-derive against the tag — a \
+         subscription line that resolves to a DIFFERENT event is the fabrication class EXT-073 \
+         filed, not a stale offset:\n{}",
+        wrong.len(),
+        wrong.join("\n"),
+    );
 }

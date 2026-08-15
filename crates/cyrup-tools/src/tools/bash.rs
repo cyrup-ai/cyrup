@@ -192,8 +192,17 @@ impl Tool for BashTool {
         // `exposeSessionEnvironment` and covers only the five session keys (bash.ts:171-181); these
         // two come from `process.env` unconditionally and are never scrubbed.
         env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));
-        // [CYRUP-DELTA, value only] `AI_AGENT` names WHICH agent is running (`"pi"` upstream), so
-        // cyrup names itself. The key and its semantics are pi's verbatim.
+        // [CYRUP-DELTA — KEY *and* value; the key is a FORWARD-PORT from `cli.ts:14` @v0.84.1, which
+        // is AHEAD of the ported tag] `AI_AGENT` does not exist anywhere in pi @v0.83.0
+        // (`git -C pi grep -n AI_AGENT v0.83.0 -- packages/` → 0 hits; `cli.ts:13` @v0.83.0 sets
+        // only `PI_CODING_AGENT`), so cyrup writes a variable into every bash child that the ported
+        // baseline never wrote. The value additionally names WHICH agent is running (`"pi"`
+        // upstream), so cyrup names itself; the key and its semantics are pi's verbatim.
+        // Deliberate and kept: the marker is how a hook or a script tells an agent shell from a
+        // human one, and dropping it would leave the v0.84.1 uplift with a hole. Stated on the
+        // delta line itself rather than only in the prose above (CFG-069) so a later v0.84.1 uplift
+        // reads this as ALREADY-PORTED-EARLY and not as already-done-at-tag. Same class as the
+        // `working-start`/`working-stop` precedent.
         env.push(("AI_AGENT".to_string(), "cyrup".to_string()));
         let env_remove = crate::config::session_env_scrub_keys();
         if self.opts.expose_session_environment

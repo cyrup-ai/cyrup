@@ -28,6 +28,11 @@ cyrup-ext = { workspace = true }
 # Only for the two seam traits (`ClarifyChannel`/`DeliveryChannel`) + `IntercomPayload`/`RunId`
 # (`tui::intercom`). One-directional (no cycle): subagents never depends on intercom.
 cyrup-ext-subagents = { workspace = true }
+# ICOM-004 — the bundled `skills/pi-intercom/SKILL.md` is discovered through the SAME
+# `cyrup_resources::resolve_manifest` auto-discovery `cyrup-ext-subagents` uses for its own bundled
+# skill/prompts/agents (`registration/resources.rs`), rather than a second, private walk. Nothing in
+# `cyrup-resources` depends on this crate, so there is no cycle.
+cyrup-resources = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "macros", "rt-multi-thread", "signal", "process"] }
 bytes = { workspace = true }
 serde = { workspace = true }

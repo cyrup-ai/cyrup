@@ -793,7 +793,10 @@ fn format_session_list_row(
     )
 }
 
-fn parameters_schema() -> serde_json::Value {
+/// `pub(crate)` so the bundled-skill check (`crate::resources`, ICOM-004) can assert that every
+/// action the shipped `SKILL.md` tells the model to call is actually advertised here — a skill that
+/// documents an unadvertised action instructs the model into a preflight rejection.
+pub(crate) fn parameters_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "object",
         "properties": {

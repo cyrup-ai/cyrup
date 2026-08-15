@@ -140,10 +140,95 @@ async fn bind_and_subscribe(
 /// projection (never the raw event) is what goes on the wire; see [`crate::to_json_event`] for what
 /// it drops and why.
 async fn write_event<W: Write>(out: &mut W, ev: &AgentSessionEvent) -> Result<(), ModesError> {
+    // SEAM-080 / SEAM-081. pi's json mode is `session.subscribe(event => writeRawStdout(...))`
+    // (`print-mode.ts:74` @v0.83.0), so its line set is exactly the `AgentSessionEvent` union.
+    // cyrup's enum is a super-set, and the four cyrup-only members (`session_replaced`,
+    // `model_changed`, `session_start`, `session_shutdown`) must not reach the stream. The rpc host
+    // filtered `session_replaced` at both of its write sites; this mode had NO guard at all, so all
+    // four went out. See [`crate::is_upstream_wire_event`].
+    if !crate::is_upstream_wire_event(ev) {
+        return Ok(());
+    }
     let line = serde_json::to_string(&crate::to_json_event(ev))?;
     // TOOL-037 — pi's `writeRawStdout` (`core/output-guard.ts:85` → `writeRawStdoutChunk`,
     // `:20-43`), retry loop included. See `crate::raw_stdout`.
     crate::raw_stdout::write_raw_stdout(out, &format!("{line}\n")).await?;
     crate::raw_stdout::flush_raw_stdout(out).await?;
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+mod tests {
+    use super::write_event;
+    use cyrup_session_svc::AgentSessionEvent;
+
+    /// Drive [`write_event`] directly — it is the single serializer both the per-run drain and the
+    /// trailing non-blocking drain go through — and collect the produced bytes.
+    fn wire(ev: &AgentSessionEvent) -> String {
+        let mut buf: Vec<u8> = Vec::new();
+        // `write_event` awaits only `write_raw_stdout`/`flush_raw_stdout`, which never yield for a
+        // `Vec<u8>` sink, so the future is ready on the first poll and a current-thread runtime is
+        // the lightest correct driver.
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("current-thread runtime")
+            .block_on(async { write_event(&mut buf, ev).await })
+            .expect("writing to a Vec cannot fail");
+        String::from_utf8(buf).expect("json is utf-8")
+    }
+
+    /// SEAM-080 + SEAM-081 — RED before this pass.
+    ///
+    /// pi's json mode is `session.subscribe(event => writeRawStdout(JSON.stringify(...)))`
+    /// (`modes/print-mode.ts:74` @v0.83.0) and its listener type is `AgentSessionEventListener`, so
+    /// the stdout line set is EXACTLY pi's `AgentSessionEvent` union (`core/agent-session.ts:139-181`
+    /// @v0.83.0). cyrup's enum is a super-set with four extra members and `write_event` had NO guard
+    /// whatsoever, so before this pass every one of these four produced a full JSON line:
+    /// `{"type":"model_changed",…}`, `{"type":"session_start",…}`, `{"type":"session_shutdown",…}`
+    /// and `{"type":"session_replaced",…}`. Each assertion below fails on the pre-fix code.
+    #[test]
+    fn cyrup_only_events_never_reach_the_json_stdout_stream() {
+        let invented = [
+            AgentSessionEvent::ModelChanged {
+                provider: "anthropic".into(),
+                model: "claude".into(),
+            },
+            AgentSessionEvent::SessionStart {
+                reason: "startup".into(),
+                previous_session_file: None,
+            },
+            AgentSessionEvent::SessionShutdown { reason: "quit".into() },
+            AgentSessionEvent::SessionReplaced { generation: 2 },
+        ];
+        for ev in &invented {
+            assert_eq!(
+                wire(ev),
+                "",
+                "`{}` is not a member of pi's AgentSessionEvent union and must not reach stdout",
+                ev.kind()
+            );
+        }
+    }
+
+    /// Presence before absence: the filter must not have taken a genuine upstream event with it.
+    /// `thinking_level_changed` and `session_info_changed` are the two members that sit right beside
+    /// the removed ones in cyrup's enum and ARE in pi's union (`agent-session.ts:153-154`).
+    #[test]
+    fn genuine_upstream_events_still_reach_the_json_stdout_stream() {
+        let kept = [
+            AgentSessionEvent::ThinkingLevelChanged { level: "high".into() },
+            AgentSessionEvent::SessionInfoChanged { name: Some("work".into()) },
+            AgentSessionEvent::AgentSettled,
+        ];
+        for ev in &kept {
+            let line = wire(ev);
+            assert!(
+                line.contains(&format!("\"type\":\"{}\"", ev.kind())),
+                "`{}` is in pi's union and must still be written; got {line:?}",
+                ev.kind()
+            );
+            assert!(line.ends_with('\n'), "every protocol line is LF-terminated");
+        }
+    }
 }

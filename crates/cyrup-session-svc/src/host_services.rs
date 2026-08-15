@@ -610,6 +610,14 @@ pub struct LiveHostServices {
     /// [`Self::attach_editor_mirror`]. `None` outside the interactive TUI, where
     /// [`HostServices::editor_text`] keeps pi's headless `""`. See [`EditorTextMirror`].
     editor_mirror: Mutex<Option<EditorTextMirror>>,
+    /// The host-owned inter-extension event bus (Pi's single `createEventBus()`, threaded onto
+    /// every `ExtensionAPI` at `extensions/loader.ts:389` @v0.83.0), attached post-build via
+    /// [`Self::attach_event_bus`] — the `ExtensionHost` that owns it is built AFTER this backend,
+    /// because the host is handed this backend. It is the SAME `SharedBus` every loaded WASM guest
+    /// emits into, so a native's [`HostServices::emit_event`] and a guest's `bus.emit` land in one
+    /// queue and are fanned out by the one drain. `None` on the default/by-value backend, where an
+    /// emit is dropped (PERM-011 half B).
+    event_bus: Mutex<Option<Arc<cyrup_ext::host::SharedBus>>>,
 }
 
 impl LiveHostServices {
@@ -641,7 +649,18 @@ impl LiveHostServices {
             catalog: Mutex::new(None),
             theme_access: Mutex::new(None),
             editor_mirror: Mutex::new(None),
+            event_bus: Mutex::new(None),
         }
+    }
+
+    /// Attach the host-owned inter-extension event bus (PERM-011 half B), so a NATIVE extension's
+    /// [`HostServices::emit_event`] reaches the same queue a WASM guest's `bus.emit` does.
+    ///
+    /// Called by the builder immediately after the `ExtensionHost` is constructed — the ordering is
+    /// forced, since the host takes this backend as an argument. Every native is loaded after that
+    /// point, so no emit can be issued before the bus is in place.
+    pub fn attach_event_bus(&self, bus: Arc<cyrup_ext::host::SharedBus>) {
+        *Self::lock(&self.event_bus) = Some(bus);
     }
 
     /// Build with a caller-supplied fallback exec timeout (tests only; production always gets the
@@ -1224,6 +1243,17 @@ impl HostServices for LiveHostServices {
         Some(Arc::clone(&self.human_interaction))
     }
 
+    /// PERM-011 half B — a native extension's `pi.events.emit`. Enqueues on the SHARED bus, so the
+    /// host's next fan-out delivers it to every subscriber (guest or native) exactly as an emit
+    /// from a guest's `bus.emit` import is delivered. Dropped when no bus is attached (a by-value
+    /// session), which is the same tier of "no backend, no effect" as the ui-effect sink.
+    fn emit_event(&self, topic: &str, payload: &Value) {
+        let bus = Self::lock(&self.event_bus).clone();
+        if let Some(bus) = bus {
+            bus.emit(topic.to_string(), payload.clone());
+        }
+    }
+
     fn session_file(&self) -> Option<PathBuf> {
         // The LIVE persisted file (deferred until the first assistant message; changes on fork), read
         // from the attached tree manager. `Ok(_)` — attached and read (the value may itself be `None`
@@ -1671,6 +1701,22 @@ impl HostServices for LiveHostServices {
         });
     }
 
+    fn system_prompt_options(&self) -> Option<Value> {
+        // EXT-061. pi keeps the bag and the string in lockstep: `_rebuildSystemPrompt` assigns
+        // `this._baseSystemPromptOptions` on the way to producing the prompt
+        // (`core/agent-session.ts:1044-1053` @v0.83.0) and `getSystemPromptOptions` returns that
+        // field verbatim (`:2436`). cyrup's analog is the SAME structure the next rebuild would
+        // consume — `PromptRebuilder::base` plus the live active set — so the bag a command handler
+        // reads cannot drift from the prompt `system_prompt()` returns.
+        //
+        // `None` until the shared dynamic-tool view is attached (default host, no live agent): the
+        // WIT import then answers pi's own no-backend default `{cwd}`
+        // (`core/extensions/runner.ts:287` @v0.83.0) rather than an error — see
+        // `cyrup-ext/src/host/live.rs::get_system_prompt_options`.
+        let dt = Self::lock(&self.dynamic_tools).clone()?;
+        Some(Self::lock(&dt).base_prompt_options())
+    }
+
     fn active_tools(&self) -> Option<Vec<String>> {
         // The live session's REAL active tool set (Pi `getActiveTools` = `getActiveToolNames`,
         // agent-session.ts:2281,813). `None` until the shared view is attached (default host).
@@ -1771,7 +1817,7 @@ impl HostServices for LiveHostServices {
 }
 
 /// The `getActiveTools` source the registered-tool wrapper diffs around every `execute` (Pi binds
-/// `runtime.getActiveTools` from the session's own actions, extensions/runner.ts:330, and
+/// `runtime.getActiveTools` from the session's own actions, extensions/runner.ts:329 — EXT-072 class: `:330` is the `getAllTools` wiring, and
 /// `wrapRegisteredTool` calls it either side of the tool, extensions/wrapper.ts:23-25).
 ///
 /// Deliberately the SAME read `HostServices::active_tools` performs — the authoritative
@@ -2445,6 +2491,47 @@ mod tests {
             contributions,
         );
         Arc::new(Mutex::new(DynamicToolState::new(tools.clone(), tools, rebuilder)))
+    }
+
+    /// EXT-061 — `system_prompt_options()` is the BAG behind `system_prompt()`, in pi's
+    /// `BuildSystemPromptOptions` shape (`core/system-prompt.ts:8-25` @v0.83.0), sourced from the
+    /// SAME `PromptRebuilder` the next prompt rebuild consumes (pi's `_baseSystemPromptOptions`,
+    /// `core/agent-session.ts:1044-1053`, handed back at `:2436`).
+    ///
+    /// COVERAGE, NOT A REGRESSION PROOF (rule 8): the trait method is new this pass, so no form of
+    /// this test could have failed against the previous HEAD. What it pins is the two properties a
+    /// later edit can quietly break — that the unattached backend answers `None` (which is what
+    /// routes the WIT import to pi's `{cwd}` default instead of a fabricated bag), and that the
+    /// attached one reports the LIVE active set rather than the cleared `selected_tools` the
+    /// rebuild base carries.
+    #[test]
+    fn system_prompt_options_reports_the_live_bag_behind_the_system_prompt() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+
+        // Unattached ⇒ `None`. The import layer, not this backend, supplies pi's `{cwd}` default.
+        assert!(svc.system_prompt_options().is_none(), "no dynamic-tool view attached ⇒ no live bag");
+
+        let read: Arc<dyn Tool> = Arc::new(CatalogTool::new("read", vec!["read: prefer read"]));
+        let bash: Arc<dyn Tool> = Arc::new(CatalogTool::new("bash", vec![]));
+        svc.attach_dynamic_tools(dynamic_tools_with(vec![read, bash]));
+
+        let bag = svc.system_prompt_options().expect("a live dynamic-tool view answers");
+        assert_eq!(
+            bag["selectedTools"],
+            json!(["read", "bash"]),
+            "pi's bag carries `selectedTools: validToolNames` — the ACTIVE set, not the rebuild \
+             base's cleared field: {bag}"
+        );
+        assert!(bag.get("cwd").is_some(), "`cwd` is the one REQUIRED key of pi's bag: {bag}");
+        assert_eq!(
+            bag["promptGuidelines"],
+            json!(["read: prefer read"]),
+            "each active tool's guidelines, in active order (agent-session.ts:1031-1034): {bag}"
+        );
+        // pi omits `customPrompt`/`appendSystemPrompt` when unset rather than emitting null.
+        assert!(bag.get("customPrompt").is_none(), "an unset optional is OMITTED, not null: {bag}");
+        assert!(bag.get("appendSystemPrompt").is_none(), "an unset optional is OMITTED, not null: {bag}");
     }
 
     /// EXT-038 — `all_tools()` must report the WHOLE merged registry (built-ins included) in pi's

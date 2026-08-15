@@ -416,7 +416,13 @@ pub(crate) fn build_params(
             json!(max.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)),
         );
     }
-    if let Some(temp) = opts.temperature {
+    // PERM-012. Same guard as the sibling `openai-responses` builder — this api is the second
+    // member of upstream's `OPENAI_RESPONSES_APIS` (`model-option-compatibility.ts:16-19`
+    // @v0.8.0), so a `codex`-token id or a reasoning model omits `temperature` here too.
+    if let Some(temp) = opts
+        .temperature
+        .filter(|_| crate::api::compat::temperature_is_supported(model))
+    {
         obj.insert("temperature".to_string(), json!(temp));
     }
 
@@ -664,6 +670,43 @@ mod tests {
         assert_eq!(
             body.get("max_output_tokens").and_then(Value::as_u64),
             Some(128)
+        );
+    }
+
+    /// PERM-012 — `azure-openai-responses` is the second member of upstream's
+    /// `OPENAI_RESPONSES_APIS` (`pi-permission-system/src/model-option-compatibility.ts:16-19`
+    /// @v0.8.0), so the reasoning-model rule at `:78-80` applies here too. Red at HEAD~: the
+    /// body carried `"temperature": 0.7`.
+    #[test]
+    fn a_reasoning_model_never_carries_temperature() {
+        let m = azure_model("o5", true);
+        let opts = StreamOptions {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = build_params(&m, &Context::default(), &opts, "o5").unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "a reasoning model accepts only the provider default temperature: {body}"
+        );
+    }
+
+    /// The control: same api, same request, `reasoning: false` — the key must still be written, or
+    /// the assertion above proves nothing.
+    #[test]
+    fn a_non_reasoning_model_still_carries_temperature() {
+        let m = azure_model("gpt-4", false);
+        let opts = StreamOptions {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = build_params(&m, &Context::default(), &opts, "dep").unwrap();
+        // `StreamOptions::temperature` is `Option<f32>` (`stream.rs:165`); the serialized number is
+        // that f32 widened, `0.699999988079071`. Compare against the same widening — the f64
+        // literal `0.7` is a different number and this assertion failed on it.
+        assert_eq!(
+            body.get("temperature").and_then(Value::as_f64),
+            Some(f64::from(0.7_f32))
         );
     }
 

@@ -462,8 +462,22 @@ impl RpcClient {
     // -----------------------------------------------------------------------------------------
 
     /// Attach to an already-open RPC transport: `reader` is the host's `RpcOut` stream, `writer` its
-    /// command sink. This is pi's `attachJsonlLineReader(childProcess.stdout, …)` + `stdin.write`
-    /// pair (`rpc-client.ts:127-129`, `:580`) with the process half factored out.
+    /// command sink.
+    ///
+    /// **[CYRUP-DELTA] (SEAM-082) — this constructor has NO upstream counterpart.** pi's `RpcClient`
+    /// exposes exactly one way to come into existence, `start()`
+    /// (`packages/coding-agent/src/modes/rpc/rpc-client.ts:73-139` @v0.83.0), and it always spawns
+    /// `node <cliPath> --mode rpc`; there is no `attach`, and no route by which a caller supplies its
+    /// own transport. cyrup adds one so an in-process `tokio::io::duplex` pair can drive the protocol
+    /// without a child process. What it decomposes out of `start()` is pi's
+    /// `attachJsonlLineReader(childProcess.stdout, …)` + `stdin.write` pair (`:127-129`, `:580`);
+    /// [`RpcClient::spawn`] below is the faithful `start()` port and keeps the process half.
+    ///
+    /// The delta adds **no wire surface** — the 33 protocol verbs, the three helpers, the four
+    /// lifecycle methods, the `req_${n}` id format and every timeout constant are pi's — so a client
+    /// built through `attach` speaks exactly the protocol a client built through `spawn` speaks. It is
+    /// recorded here rather than left implicit so an auditor comparing the two method surfaces finds
+    /// the one difference already accounted for.
     ///
     /// Framing is pi's strict LF-only JSONL (`jsonl.ts:7-8`, `:26`): records split on `\n` only, a
     /// trailing `\r` is stripped, and a final unterminated line is delivered at EOF —

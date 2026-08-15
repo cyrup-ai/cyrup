@@ -18,6 +18,35 @@ use std::process::Command;
 
 /// BLAKE3 of every ABI source file, computed by `build.rs` at HOST compile time (EXT-028).
 /// `unknown` only if the build script could not resolve the workspace `crates/` directory.
+///
+/// # Where the value comes from, and why a missing one is a *compile* error (CFG-075)
+///
+/// **`env!`, not [`std::env::var`].** This is the only BUILD-time environment dependency on
+/// cyrup's whole env-var surface — every other name in the port is read at runtime and falls back.
+/// Here the value is substituted by `rustc` at compile time, so if nothing supplies
+/// `CYRUP_EXT_ABI_FINGERPRINT` the crate **fails to compile**; there is no runtime branch to reach
+/// and nothing to fall back to. That is the intended posture (a host with no ABI identity must not
+/// build), but it is worth knowing before anyone reorganizes the build scripts, and it is why
+/// CFG-075 is recorded separately from the runtime `CYRUP_*` inventions of CFG-074.
+///
+/// **The supplier is this package's own `build.rs`**, which emits
+/// `cargo:rustc-env=CYRUP_EXT_ABI_FINGERPRINT=<hash>` (`crates/cyrup-ext/build.rs:37`) — or the
+/// literal `unknown` sentinel at `:24` when `CARGO_MANIFEST_DIR` does not resolve, deliberately
+/// chosen over failing the build. It `include!`s `src/build/abi.rs` so the hash the script computes
+/// and the one [`abi`] recomputes at test time are the same code, and it re-runs on every file in
+/// `abi::ABI_SOURCE_ROOTS`. Three consequences, all load-bearing:
+///
+/// * **No upstream counterpart is possible.** pi has no WASM component ABI to fingerprint, so this
+///   is a cyrup-original with no `pi` symbol to cite — not an unported one.
+/// * **Deleting or relocating `build.rs` breaks the crate**, not a feature of it. Neither cargo
+///   feature arm helps: `build/` is compiled unconditionally (`lib.rs`'s bare `pub mod build;`),
+///   so the dependency exists in the `--no-default-features` build too, not only under
+///   `wasm-host`.
+/// * **A vendored/patched build that drops build scripts** gets a compile error here rather than a
+///   silently stale artifact cache — which is the trade EXT-028 chose.
+///
+/// `crates/cyrup-it/tests/ext/abi_fingerprint_invalidation.rs` pins the end of that chain: an edit
+/// to either `world.wit` copy must move this value, and a moved value must miss the cache.
 pub const ABI_FINGERPRINT: &str = env!("CYRUP_EXT_ABI_FINGERPRINT");
 
 /// The full world identity folded into every Tier-1 cache key: the declared [`HOST_WORLD`] PLUS

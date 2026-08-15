@@ -97,6 +97,51 @@ pub struct CommandDescriptor {
     pub completions: Vec<String>,
 }
 
+/// Where a loaded extension came from — the two `SourceInfo` fields upstream derives once, in
+/// `createExtension` (`core/extensions/loader.ts:433-444` @v0.83.0), and then copies onto every
+/// `RegisteredCommand.sourceInfo` it mints:
+///
+/// ```ts
+/// const source =
+///     extensionPath.startsWith("<") && extensionPath.endsWith(">")
+///         ? extensionPath.slice(1, -1).split(":")[0] || "temporary"
+///         : "local";
+/// const baseDir = extensionPath.startsWith("<") ? undefined : path.dirname(resolvedPath);
+/// ```
+///
+/// So a FILESYSTEM extension is `{source: "local", baseDir: <its directory>}` and a SYNTHETIC one
+/// (`<inline>`, `<builtin:foo>`) is `{source: <the prefix>, baseDir: undefined}`. SEAM-084: cyrup
+/// had neither — the whole `sourceInfo` on the `get_commands` extension branch was a literal, with a
+/// `source` of `"extension"` that exists nowhere upstream and no `baseDir` at all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtensionProvenance {
+    /// pi's `SourceInfo.source`. `"local"` for a filesystem-loaded extension; the `<prefix:…>`
+    /// segment for a synthetic one.
+    pub source: String,
+    /// pi's `SourceInfo.baseDir` — `path.dirname(resolvedPath)` for a filesystem extension, absent
+    /// for a synthetic one. A client resolves a command's assets against this.
+    pub base_dir: Option<String>,
+}
+
+impl ExtensionProvenance {
+    /// A filesystem-loaded extension: upstream's `else "local"` branch, with the extension's own
+    /// directory as `baseDir`.
+    #[must_use]
+    pub fn local(base_dir: impl Into<String>) -> Self {
+        Self { source: "local".to_string(), base_dir: Some(base_dir.into()) }
+    }
+
+    /// A synthetic extension registered from an in-process factory rather than a path — upstream's
+    /// `loadExtensionFromFactory`, whose default `extensionPath` is the literal `"<inline>"`
+    /// (`core/extensions/loader.ts:490` @v0.83.0). The `<…>` split therefore yields `source:
+    /// "inline"` and `baseDir: undefined`, which is exactly what cyrup's compiled-in native built-ins
+    /// are: no path, no directory, loaded by the host itself.
+    #[must_use]
+    pub fn inline() -> Self {
+        Self { source: "inline".to_string(), base_dir: None }
+    }
+}
+
 /// A command after invocation-name disambiguation (Pi `ResolvedCommand`, runner.ts:556-595). When two
 /// extensions register the same `name`, Pi assigns `name:1`/`name:2` suffixes in LOAD ORDER (the
 /// `invocation_name`) while keeping the original `name`; a unique name keeps its bare `name`.
@@ -179,7 +224,8 @@ struct RegistryInner {
     /// `GuestState`). Registry-backed so a NATIVE can reach it too (EXT-035).
     command_autocomplete: Vec<(ExtensionId, String)>,
     /// Count of stacked GLOBAL autocomplete providers (pi `addAutocompleteProvider`,
-    /// `extensions/types.ts:218`) contributed by natives (EXT-035).
+    /// `extensions/types.ts:225` @v0.83.0 — EXT-072: `:218` is `getEditorText`'s doc line) contributed
+    /// by natives (EXT-035).
     autocomplete_providers: Vec<ExtensionId>,
     /// Warnings produced by the last [`ExtensionRegistry::resolve_shortcuts`] call (pi
     /// `getShortcutDiagnostics()`, `extensions/runner.ts:538-540` @v0.83.0), which upstream folds
@@ -242,6 +288,13 @@ struct RegistryInner {
     /// for exactly that reason; re-registration by the same owner is idempotent rather than a
     /// second fold step, because upstream's field ASSIGNMENT replaces rather than appends.
     markdown_transformers: Vec<ExtensionId>,
+    /// Per-extension `{source, baseDir}` provenance (SEAM-084). pi derives this ONCE per extension
+    /// in `createExtension` (`core/extensions/loader.ts:433-444` @v0.83.0) and stores it on the
+    /// `Extension` object, from which `registerCommand` copies it onto every `RegisteredCommand`;
+    /// cyrup's registry is flat, so the map is keyed by owner and read back at emit time. An
+    /// extension that never recorded one is absent — see
+    /// [`ExtensionRegistry::extension_provenance`] for what that means at the emit site.
+    extension_provenance: HashMap<ExtensionId, ExtensionProvenance>,
     /// Extensions subscribed to raw terminal input, in LOAD order (EXT-021; pi
     /// `ExtensionUIContext.onTerminalInput`, `extensions/types.ts:145` @v0.83.0).
     ///
@@ -701,6 +754,38 @@ impl ExtensionRegistry {
         Ok(out)
     }
 
+    /// Record where `owner` was loaded from (SEAM-084). Called once per extension, by the loader
+    /// that knows the answer: the WASM tier passes [`ExtensionProvenance::local`] with the
+    /// discovered directory, the native tier passes [`ExtensionProvenance::inline`]. Re-recording
+    /// replaces, matching pi's per-extension field assignment.
+    ///
+    /// # Errors
+    /// A poisoned lock degrades to [`ExtError`], never a panic (R-00-009).
+    pub fn record_extension_provenance(
+        &self,
+        owner: ExtensionId,
+        prov: ExtensionProvenance,
+    ) -> Result<(), ExtError> {
+        self.lock_write()?.extension_provenance.insert(owner, prov);
+        Ok(())
+    }
+
+    /// The `{source, baseDir}` recorded for `owner`, if any (SEAM-084).
+    ///
+    /// `None` means no loader recorded one. Callers must NOT invent a value in that case: upstream
+    /// has no such state — every `Extension` goes through `createExtension`, so every command's
+    /// `sourceInfo` carries a real `source` — and the closest honest analog of "loaded by the host
+    /// with no path" is [`ExtensionProvenance::inline`], which is what the native tier records.
+    ///
+    /// # Errors
+    /// A poisoned lock degrades to [`ExtError`], never a panic (R-00-009).
+    pub fn extension_provenance(
+        &self,
+        owner: &ExtensionId,
+    ) -> Result<Option<ExtensionProvenance>, ExtError> {
+        Ok(self.lock_read()?.extension_provenance.get(owner).cloned())
+    }
+
     /// Route an invocation name (bare `name` OR a disambiguated `name:N`) back to its owning
     /// extension, exactly as far as pi routes one.
     ///
@@ -930,7 +1015,7 @@ impl ExtensionRegistry {
     }
 
     /// Stack one global autocomplete provider (EXT-035; pi `addAutocompleteProvider`,
-    /// `extensions/types.ts:218`).
+    /// `extensions/types.ts:225` @v0.83.0; EXT-072 corrected `:218`).
     pub fn add_autocomplete_provider(&self, owner: ExtensionId) -> Result<(), ExtError> {
         self.lock_write()?.autocomplete_providers.push(owner);
         Ok(())

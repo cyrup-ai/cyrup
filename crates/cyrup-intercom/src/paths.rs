@@ -10,8 +10,9 @@
 //! [`crate::transport::target`], which both the client
 //! ([`broker_connect_target`](crate::transport::target::broker_connect_target)) and the broker
 //! ([`broker_listen_target`](crate::transport::target::broker_listen_target)) resolve through.
-//! Of those three transports only the opt-in TCP one is still unported on the
-//! BROKER side; see [`crate::broker::listener::BrokerListener::bind`] and the port doc §10-Q2.
+//! All three are bound on the BROKER side as of ICOM-015; the TCP one additionally publishes
+//! `<intercomDir>/broker.port.json` (`broker.ts:131-141`), whose path is
+//! [`crate::transport::target::broker_port_file_path`].
 
 use std::path::{Path, PathBuf};
 

@@ -211,6 +211,35 @@ pub struct StreamOptions {
     pub timeout_ms: Option<u64>,
     /// WebSocket connect (handshake) timeout in milliseconds for WebSocket transports (Pi
     /// `StreamOptions.websocketConnectTimeoutMs`, types.ts:159).
+    ///
+    /// # `None` must stay `None` here — the 15 s default belongs at the connect site (CFG-058)
+    ///
+    /// pi keeps this `undefined` all the way down and defaults it **at the socket**: the getter
+    /// returns `number | undefined` when the key is unset (`settings-manager.ts:842-844`
+    /// @v0.83.0), `sdk.ts:309-315` threads that `undefined` through verbatim
+    /// (`options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs()`),
+    /// and only `connectWebSocket` supplies the number, as a *parameter default* —
+    /// `const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;`
+    /// (`packages/ai/src/api/openai-codex-responses.ts:64` @v0.83.0) applied at `:1039`, with
+    /// `if (connectTimeoutMs > 0)` at `:1102` making an explicit `0` mean *disabled* rather than
+    /// *immediate*. Documented as the user-visible default at
+    /// `packages/coding-agent/docs/settings.md:172`.
+    ///
+    /// So **defaulting this field to `Some(15_000)` — in `Default`, in `build_base_options`, or in
+    /// the settings thread at `cyrup-session-svc/src/builder.rs` — would be the divergence, not the
+    /// fix.** It would erase the distinction between "unset" and "explicitly 15 000" that pi's
+    /// `??` chain relies on, and it would apply a WebSocket handshake bound to a code path that
+    /// never opens one.
+    ///
+    /// **Why there is no connect site to default it at:** cyrup's `openai-codex-responses` port has
+    /// no WebSocket client at all — see that module's "Mechanism deltas" header — so every
+    /// transport resolves to SSE, which is pi's own documented behaviour in a runtime that exposes
+    /// no WebSocket constructor (`connectWebSocket` throws at `:1043-1045`, `stream` records the
+    /// failure and breaks to the SSE path at `:358-377`). The field is therefore carried faithfully
+    /// (settings → [`crate::utils::simple_options::build_base_options`] → here) and consumed by
+    /// nothing, which is correct: **the constant lands WITH the WebSocket transport, in the same
+    /// change, or it lands nowhere.** CFG-058 stands refuted as filed — an unset key cannot produce
+    /// an unbounded handshake in a port that performs no handshake.
     pub websocket_connect_timeout_ms: Option<u64>,
     /// Maximum retry attempts for providers/SDKs that support client-side retries (Pi
     /// `StreamOptions.maxRetries`, types.ts:164).

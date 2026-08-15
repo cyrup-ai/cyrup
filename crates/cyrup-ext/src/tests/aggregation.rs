@@ -305,6 +305,7 @@ async fn host_run_shortcut_reports_unregistered_key() {
 fn host_ctx_rich_fields() {
     let ctx = HostCtx::command(ExtMode::Tui, true, std::path::PathBuf::from(".")).with_rich(
         HostCtxRich {
+            system_prompt_options: None,
             model: Some("claude-x".into()),
             is_idle: true,
             is_project_trusted: true,

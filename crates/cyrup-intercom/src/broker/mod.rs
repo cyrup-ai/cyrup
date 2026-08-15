@@ -10,12 +10,15 @@
 //! presence, answers the health probe byte-identically, and auto-shuts-down 5 s after its last
 //! client leaves (`broker.ts:286-296`).
 //!
-//! Transports: the Unix domain socket (POSIX) and the Windows named pipe are both bound through
-//! [`listener::BrokerListener`], which is this port's stand-in for upstream's single polymorphic
-//! `net.createServer().listen(LISTEN_TARGET)` (`broker.ts:123,149-152`). The **opt-in** loopback-TCP
-//! transport (`CYRUP_INTERCOM_TRANSPORT=tcp`; `broker.ts:134-141,284-305`, `stateId` auth) is the
-//! one piece still unported — see the port doc §10-Q2 and [`listener::BrokerListener::bind`], which
-//! refuses that listen target loudly rather than downgrading to another endpoint.
+//! Transports: all three — the Unix domain socket (POSIX), the Windows named pipe, and the
+//! **opt-in** loopback-TCP endpoint (`CYRUP_INTERCOM_TRANSPORT=tcp` / `CYRUP_INTERCOM_TCP=1`) — are
+//! bound through [`listener::BrokerListener`], this port's stand-in for upstream's single
+//! polymorphic `net.createServer().listen(LISTEN_TARGET)` (`broker.ts:123,149-152`). ICOM-015
+//! landed the TCP arm's broker half: [`run`] publishes the kernel-chosen port plus this run's
+//! `BROKER_STATE_ID` into `broker.port.json` (`broker.ts:131-141`) and unlinks it at shutdown
+//! (`:1423-1427`), [`BrokerState::handle_frame`] enforces the `requiresEndpointAuth` credential on
+//! `health`/`register` (`:284-305`), and `trustedLocal` now follows the bound endpoint rather than
+//! the platform (`:365`).
 
 pub mod listener;
 pub mod ratelimit;
@@ -270,6 +273,21 @@ struct BrokerState {
     shutdown_task: Option<tokio::task::JoinHandle<()>>,
     /// Global shutdown signal awaited by [`run`].
     shutdown: Arc<Notify>,
+    /// `trustedLocal = typeof LISTEN_TARGET === "string" && process.platform !== "win32"`
+    /// (`broker.ts:365`), stamped onto every registered [`SessionInfo`] (`:374`).
+    ///
+    /// ICOM-015 — a PROPERTY OF THE BOUND ENDPOINT, not of the platform: this was `cfg!(unix)`,
+    /// which is upstream's answer for a unix socket but the wrong one for the loopback-TCP endpoint,
+    /// where pi's `typeof LISTEN_TARGET === "string"` is false on every platform. A TCP peer carries
+    /// no uid the broker can read, so claiming `trustedLocal` for it would let a remote-shaped
+    /// connection inherit a local peer's trust. Supplied by
+    /// [`listener::BrokerListener::is_trusted_local`].
+    trusted_local: bool,
+    /// `BROKER_STATE_ID` (`broker.ts:29`, `randomUUID()` once per broker process) when — and only
+    /// when — the bound endpoint demands it: `requiresEndpointAuth = typeof LISTEN_TARGET !==
+    /// "string"` (`:284`). `None` collapses upstream's two constants into "no gate", which is
+    /// exactly what a socket/pipe endpoint gets.
+    endpoint_state_id: Option<String>,
 }
 
 /// What the reader task should do after one frame.
@@ -334,7 +352,23 @@ impl BrokerState {
             shutdown_scheduled: false,
             shutdown_task: None,
             shutdown,
+            // The socket/pipe answer, which is what every caller but [`run`] binds.
+            trusted_local: cfg!(unix),
+            endpoint_state_id: None,
         }
+    }
+
+    /// Adopt the properties of the endpoint actually bound (ICOM-015): whether a peer on it is
+    /// `trustedLocal` (`broker.ts:365`) and, for the TCP endpoint only, the per-run credential
+    /// clients must echo (`BROKER_STATE_ID`, `:29`/`:284-305`).
+    ///
+    /// Separate from [`Self::new`] rather than folded into it because upstream's two facts come
+    /// from the LISTEN TARGET, which only the real [`run`] has; every unit test drives a state whose
+    /// endpoint is the default socket, and pi's own default is that same string arm.
+    fn with_listen_endpoint(mut self, trusted_local: bool, endpoint_state_id: Option<String>) -> Self {
+        self.trusted_local = trusted_local;
+        self.endpoint_state_id = endpoint_state_id;
+        self
     }
 
     /// Register a fresh connection and evict the oldest unregistered ones past the cap
@@ -687,12 +721,34 @@ impl BrokerState {
             return FrameResult::protocol_error();
         };
 
+        // `const requiresEndpointAuth = typeof LISTEN_TARGET !== "string";`
+        // `const hasEndpointAuth = clientMessage.stateId === BROKER_STATE_ID;` (`broker.ts:284-285`).
+        //
+        // ICOM-015 — computed for EVERY frame, ahead of the health branch, exactly where upstream
+        // computes it. `endpoint_state_id` is `Some` only on the TCP endpoint, so on a socket/pipe
+        // both halves collapse to "no gate" and a client's `stateId` is ignored rather than
+        // rejected — pi's `requiresEndpointAuth &&` short-circuit, which is what lets the SAME
+        // client code send `stateId` on TCP and omit it on a socket.
+        let has_endpoint_auth = self.endpoint_state_id.as_deref().is_some_and(|id| {
+            value.get("stateId").and_then(|v| v.as_str()) == Some(id)
+        });
+        let requires_endpoint_auth = self.endpoint_state_id.is_some();
+
         // health — legal before register, no TCP endpoint auth on a Unix socket (broker.ts:312-326).
         // HealthOk is not part of the BrokerMessage union, so it is encoded directly (framing only).
         if ty == "health" {
             let Some(rid) = value.get("requestId").and_then(|v| v.as_str()) else {
                 return FrameResult::protocol_error();
             };
+            // `if (requiresEndpointAuth && !hasEndpointAuth) throw new Error("Invalid intercom TCP
+            // endpoint credentials")` (`broker.ts:290-292`) — AFTER the requestId shape check, so a
+            // malformed health frame is malformed on every transport, and BEFORE the reply, so an
+            // uncredentialled prober learns nothing about the broker (not even that it speaks the
+            // protocol). A `throw` here is `socket.destroy(error)` (`:204-206`), i.e. cyrup's
+            // `ProtocolError`.
+            if requires_endpoint_auth && !has_endpoint_auth {
+                return FrameResult::protocol_error();
+            }
             if let Ok(frame) = encode_json(&HealthMessage::HealthOk {
                 request_id: rid.to_string(),
                 protocol: PROTOCOL_NAME.to_string(),
@@ -701,6 +757,15 @@ impl BrokerState {
                 let _ = self_tx.send(frame);
             }
             return FrameResult::cont();
+        }
+
+        // `if (requiresEndpointAuth && clientMessage.type === "register" && !hasEndpointAuth) throw`
+        // (`broker.ts:303-305`) — register is gated on the credential BEFORE the
+        // before-register ordering check below, and only register: every other frame type is
+        // already unreachable pre-registration, and post-registration the connection itself is the
+        // credential (a client that registered proved the state id once).
+        if requires_endpoint_auth && ty == "register" && !has_endpoint_auth {
+            return FrameResult::protocol_error();
         }
 
         // Only health/register are legal before registration (broker.ts:332-334).
@@ -1075,8 +1140,10 @@ impl BrokerState {
             last_activity: registration.last_activity,
             status: registration.status,
             peer_uid: None,
-            // trustedLocal = unix && !win — broker-owned, never from the payload (broker.ts:374).
-            trusted_local: Some(cfg!(unix)),
+            // `trustedLocal` — broker-owned, never from the payload (`broker.ts:374`), and a
+            // property of the BOUND ENDPOINT rather than of the platform (ICOM-015): false for the
+            // loopback-TCP endpoint even on unix, because a TCP peer carries no uid.
+            trusted_local: Some(self.trusted_local),
             context_pct: None,
             context_tokens: None,
             context_window: None,
@@ -1821,6 +1888,7 @@ fn shutdown_broker(
     state: &Arc<Mutex<BrokerState>>,
     listen_target: &crate::transport::target::BrokerConnectTarget,
     pid_path: &std::path::Path,
+    port_path: &std::path::Path,
 ) {
     {
         let mut g = lock(state);
@@ -1843,6 +1911,12 @@ fn shutdown_broker(
     // `typeof LISTEN_TARGET === "string" && process.platform !== "win32"`
     // (`v0.10.1 broker/broker.ts:1416-1418`) — a named pipe has no filesystem entry to remove.
     listener::unlink_stale_endpoint(listen_target);
+    // `try { unlinkSync(PORT_PATH) } catch {}` (`v0.10.1 broker/broker.ts:1423-1427`, comment
+    // verbatim: "The TCP endpoint file only exists when opt-in TCP transport is active") — done
+    // unconditionally and ignoring the error, so a socket-transport shutdown that has no endpoint
+    // file is silent, and a stale one left by a crashed TCP broker cannot outlive this process and
+    // point the next client at a dead port under a credential nobody holds.
+    let _ = std::fs::remove_file(port_path);
     let _ = std::fs::remove_file(pid_path);
 }
 
@@ -1872,6 +1946,9 @@ pub async fn run() -> std::io::Result<()> {
     // `paths::broker_socket_path(...)` read, which hard-coded the POSIX arm.
     let listen_target = crate::transport::target::broker_listen_target(&agent_dir);
     let pid_path = paths::broker_pid_path(&intercom_dir);
+    // `PORT_PATH` (`broker.ts:27` via `getBrokerPortFilePath`): written only on the TCP arm, but
+    // resolved unconditionally because `shutdown` unlinks it unconditionally (`:1423-1427`).
+    let port_path = crate::transport::target::broker_port_file_path(&intercom_dir);
 
     // Claim the runtime BEFORE touching anything in it (`assertNoLiveBroker(PID_PATH)`,
     // `v0.9.2 broker/broker.ts:231`, sitting between `ensureIntercomRuntimeDir` at `:230` and the
@@ -1901,17 +1978,54 @@ pub async fn run() -> std::io::Result<()> {
             format!("failed to bind the intercom broker endpoint at {endpoint} ({} bytes): {e}", endpoint.len()),
         )
     })?;
-    if let crate::transport::target::BrokerConnectTarget::Socket(path) = &listen_target {
-        // `restrictIntercomRuntimeFile(LISTEN_TARGET)` for the string arm (`broker.ts:128-130`);
-        // itself a no-op off POSIX (`paths.ts:128-135`).
-        let _ = paths::restrict_intercom_runtime_file(path);
-    }
+    // `onListening` (`broker.ts:127-146`): the string arm restricts the socket; the TCP arm
+    // publishes the endpoint the kernel actually gave it, credentialled with this run's
+    // `BROKER_STATE_ID`, into `broker.port.json` — the file `broker_connect_target` validates
+    // (`transport/target.rs`'s ladder) and every client reads its `stateId` from.
+    let endpoint_state_id = match &listen_target {
+        crate::transport::target::BrokerConnectTarget::Socket(path) => {
+            // `restrictIntercomRuntimeFile(LISTEN_TARGET)` for the string arm (`broker.ts:128-130`);
+            // itself a no-op off POSIX (`paths.ts:128-135`).
+            let _ = paths::restrict_intercom_runtime_file(path);
+            None
+        }
+        crate::transport::target::BrokerConnectTarget::Tcp(target) => {
+            // `const address = this.server.address(); if (!address || typeof address === "string")
+            // throw new Error("Intercom TCP broker started without a TCP address")`
+            // (`broker.ts:132-135`).
+            let Some(addr) = listener.local_addr()? else {
+                return Err(std::io::Error::other(
+                    "Intercom TCP broker started without a TCP address",
+                ));
+            };
+            // `const BROKER_STATE_ID = randomUUID()` (`broker.ts:29`) — one credential per broker
+            // PROCESS, generated here (rather than at module load) so it cannot outlive, or be
+            // reused across, the endpoint file that publishes it.
+            let state_id = uuid::Uuid::new_v4().to_string();
+            let endpoint = crate::transport::target::BrokerTcpEndpoint {
+                host: target.host.clone(),
+                port: addr.port(),
+                state_id: Some(state_id.clone()),
+            };
+            // `writeFileSync(PORT_PATH, `${JSON.stringify(endpoint)}\n`, { mode:
+            // INTERCOM_RUNTIME_FILE_MODE }); restrictIntercomRuntimeFile(PORT_PATH)`
+            // (`broker.ts:140-141`). The 0600 mode is the real gate on the credential: a loopback
+            // port is reachable by every process on the machine, so the file's permissions are what
+            // keep `stateId` to this user.
+            std::fs::write(&port_path, endpoint.to_port_file_body())?;
+            let _ = paths::restrict_intercom_runtime_file(&port_path);
+            Some(state_id)
+        }
+    };
     std::fs::write(&pid_path, std::process::id().to_string())?;
     let _ = paths::restrict_intercom_runtime_file(&pid_path);
     tracing::info!(pid = std::process::id(), endpoint = %endpoint, "intercom broker started");
 
     let shutdown = Arc::new(Notify::new());
-    let state = Arc::new(Mutex::new(BrokerState::new(ask_timeout, shutdown.clone())));
+    let state = Arc::new(Mutex::new(
+        BrokerState::new(ask_timeout, shutdown.clone())
+            .with_listen_endpoint(listener.is_trusted_local(), endpoint_state_id),
+    ));
     let mut next_conn_id: u64 = 0;
 
     // `process.on("SIGTERM"|"SIGINT", () => this.shutdown())` (`broker.ts:181-182`).
@@ -1947,7 +2061,7 @@ pub async fn run() -> std::io::Result<()> {
     }
 
     tracing::info!("intercom broker shutting down");
-    shutdown_broker(&state, &listen_target, &pid_path);
+    shutdown_broker(&state, &listen_target, &pid_path, &port_path);
     Ok(())
 }
 
@@ -2015,6 +2129,98 @@ mod tests {
 
     fn make_state() -> BrokerState {
         BrokerState::new(30_000, Arc::new(Notify::new()))
+    }
+
+    /// ICOM-015 — the `requiresEndpointAuth` gate on the loopback-TCP endpoint
+    /// (`v0.10.1 broker/broker.ts:284-305`). Pre-fix the broker had no `endpoint_state_id` at all
+    /// and answered `health` and `register` from ANY connection on ANY endpoint, so every TCP
+    /// assertion below failed: an uncredentialled prober got a `health_ok` and could register.
+    ///
+    /// All three groups matter, because the gate is asymmetric by design: it must reject on TCP
+    /// without a credential, admit on TCP with the right one, and stay entirely out of the way on
+    /// the socket endpoint — where pi's `requiresEndpointAuth &&` short-circuits and a client's
+    /// `stateId` is simply not read. That last case is what lets ONE client implementation send
+    /// `stateId` on TCP and omit it on a socket (`broker/client.ts:287`).
+    #[test]
+    fn the_tcp_endpoint_credential_gates_health_and_register_and_the_socket_endpoint_does_not() {
+        fn drive(state_id: Option<&str>, frame: serde_json::Value) -> FrameOutcome {
+            let mut state = BrokerState::new(30_000, Arc::new(Notify::new()))
+                .with_listen_endpoint(state_id.is_none(), state_id.map(str::to_string));
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut sid = None;
+            state.handle_frame(1, &tx, &frame, &mut sid, 1_000).outcome
+        }
+        let with_cred = |mut f: serde_json::Value, cred: Option<&str>| {
+            if let (Some(o), Some(c)) = (f.as_object_mut(), cred) {
+                o.insert("stateId".to_string(), json!(c));
+            }
+            f
+        };
+        let health = |cred: Option<&str>| with_cred(json!({ "type": "health", "requestId": "r1" }), cred);
+        let register = |cred: Option<&str>| {
+            with_cred(
+                json!({
+                    "type": "register", "sessionId": "s1",
+                    "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+                }),
+                cred,
+            )
+        };
+
+        // TCP endpoint (`endpoint_state_id = Some`), no/wrong credential => `throw` => destroy.
+        for frame in [health(None), health(Some("wrong")), register(None), register(Some("wrong"))] {
+            assert!(
+                matches!(drive(Some("run-state-id"), frame.clone()), FrameOutcome::ProtocolError),
+                "an uncredentialled {} on the TCP endpoint must destroy the connection",
+                frame["type"]
+            );
+        }
+        // TCP endpoint, matching credential => served.
+        for frame in [health(Some("run-state-id")), register(Some("run-state-id"))] {
+            assert!(
+                matches!(drive(Some("run-state-id"), frame.clone()), FrameOutcome::Continue),
+                "the credentialled {} must be served",
+                frame["type"]
+            );
+        }
+        // Socket endpoint: the gate does not exist, with or without a `stateId`.
+        for frame in [health(None), health(Some("anything")), register(None), register(Some("x"))] {
+            assert!(
+                matches!(drive(None, frame.clone()), FrameOutcome::Continue),
+                "the socket endpoint must not gate {}",
+                frame["type"]
+            );
+        }
+    }
+
+    /// ICOM-015 — `trustedLocal = typeof LISTEN_TARGET === "string" && platform !== "win32"`
+    /// (`v0.10.1 broker/broker.ts:365`), stamped at register (`:374`). Pre-fix this was the
+    /// compile-time `cfg!(unix)`, so a broker bound to the loopback-TCP endpoint on a unix host
+    /// stamped `trustedLocal: true` on every session — the inverse of upstream, and the one field a
+    /// peer reads to decide whether a connection came from a process that could open the socket.
+    #[test]
+    fn trusted_local_follows_the_bound_endpoint_not_the_platform() {
+        for (trusted, label) in [(true, "socket"), (false, "tcp")] {
+            let mut state = BrokerState::new(30_000, Arc::new(Notify::new()))
+                .with_listen_endpoint(trusted, None);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut sid = None;
+            state.handle_frame(
+                1,
+                &tx,
+                &json!({
+                    "type": "register", "sessionId": "s1",
+                    "session": { "cwd": "/w", "model": "m", "pid": 1, "startedAt": 0, "lastActivity": 0 },
+                }),
+                &mut sid,
+                1_000,
+            );
+            assert_eq!(
+                state.sessions.get("s1").and_then(|s| s.info.trusted_local),
+                Some(trusted),
+                "the {label} endpoint's registration must carry trustedLocal = {trusted}"
+            );
+        }
     }
 
     /// `String(msg.namespace || "")`, the coercion pi applies to the raw `namespace` before it has

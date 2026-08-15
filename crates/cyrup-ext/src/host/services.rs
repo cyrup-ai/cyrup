@@ -77,7 +77,9 @@ pub struct ExecOutput {
     pub killed: bool,
 }
 
-/// UI dialog options bag (Pi `ExtensionUIDialogOptions`, types.ts:89): a live-countdown `timeout_ms`
+/// UI dialog options bag (pi `ExtensionUIDialogOptions`, types.ts:95-101 @v0.83.0; EXT-072: `:89`
+/// is the `AppKeybinding` re-export — the same wrong value EXT-048 already struck from the WIT):
+/// a live-countdown `timeout_ms`
 /// and/or a programmatic-dismiss `signal_id` for `confirm`/`input`/`select` (host gap-08-sdk #4).
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -394,6 +396,24 @@ pub trait HostServices: Send + Sync {
         None
     }
 
+    /// Emit an event on the host-owned inter-extension bus (Pi `pi.events.emit(channel, data)`,
+    /// `core/event-bus.ts:12-32` @v0.83.0, threaded onto every `ExtensionAPI` at
+    /// `extensions/loader.ts:389`).
+    ///
+    /// **Why this is on `HostServices` and not only on `GuestState`.** A WASM guest reaches the bus
+    /// through its `bus.emit` import ([`GuestState::bus_emit`]); a compiled-in NATIVE extension has
+    /// no import table and holds only this backend, so before this method existed the natives —
+    /// the three extensions cyrup actually ships — could SUBSCRIBE to nothing and EMIT nothing.
+    /// That is the seam PERM-011 half B was missing: `cyrup-permission-system` publishes its
+    /// permission-request events here, and pi's own `pi.events` is a single object shared by every
+    /// extension kind, so restricting it to one tier would be the divergence.
+    ///
+    /// Fire-and-forget and infallible, matching `emit`'s `void` return: a host with no bus attached
+    /// (the default backend, a by-value session) drops the event, exactly as pi's `noOpUIContext`
+    /// tier drops ui effects. Delivery is DEFERRED even when a bus is attached — see
+    /// [`crate::bus::SharedBus::emit`] for why cyrup queues instead of fanning out inline.
+    fn emit_event(&self, _topic: &str, _payload: &Value) {}
+
     /// The live session's persisted file path (Pi `sessionManager.sessionFilePath`). `None` when
     /// unattached, headless, or the session is not persisted (an ephemeral/in-memory session). This is
     /// the REAL orchestrator session file that cyrup-ext-subagents fork-context branches from, instead
@@ -522,23 +542,27 @@ pub trait HostServices: Send + Sync {
         Err("control capability not available".into())
     }
 
-    // --- base-context state accessors (Pi `ExtensionContext`, extensions/types.ts:329-346). Pi puts
+    // --- base-context state accessors (pi `ExtensionContext`, extensions/types.ts:330-346
+    // @v0.83.0). Pi puts
     // these on the BASE context so EVERY handler can read them, not just command handlers; they back
     // both the WIT `ctx-state` imports and the native path's `HostCtx::rich()` (EXT-005). Each
     // defaults to the "no live session attached" answer rather than a confident wrong one. ---
 
-    /// Pi `ctx.isIdle()` (types.ts:333): whether no agent run is in flight. The default host has no
+    /// pi `ctx.isIdle()` (types.ts:330 @v0.83.0; EXT-072: `:333` is `signal`'s doc line): whether no
+    /// agent run is in flight. The default host has no
     /// agent, so nothing is running — `true`.
     fn is_idle(&self) -> bool {
         true
     }
 
-    /// Pi `ctx.hasPendingMessages()` (types.ts:341): user messages queued for the next turn.
+    /// pi `ctx.hasPendingMessages()` (types.ts:338 @v0.83.0; EXT-072: `:341` is
+    /// `getContextUsage`'s doc line): user messages queued for the next turn.
     fn has_pending_messages(&self) -> bool {
         false
     }
 
-    /// Pi `ctx.isProjectTrusted()` (types.ts:335). The default host grants no trust.
+    /// pi `ctx.isProjectTrusted()` (types.ts:332 @v0.83.0; EXT-072: `:335` is `abort`'s doc line).
+    /// The default host grants no trust.
     fn is_project_trusted(&self) -> bool {
         false
     }
@@ -547,6 +571,21 @@ pub trait HostServices: Send + Sync {
     /// WIT binding lowers that to the empty string, and the native `HostCtx::rich()` keeps it `None`
     /// so a built-in can tell "unavailable" from "empty prompt".
     fn system_prompt(&self) -> Option<String> {
+        None
+    }
+
+    /// The BAG that built the string [`Self::system_prompt`] returns — pi
+    /// `ctx.getSystemPromptOptions(): BuildSystemPromptOptions` (`extensions/types.ts:355`
+    /// @v0.83.0), whose shape is `core/system-prompt.ts:8-25`: `{customPrompt?, selectedTools?,
+    /// toolSnippets?, promptGuidelines?, appendSystemPrompt?, cwd, contextFiles?, skills?}`.
+    /// Upstream fills it once per build as `_baseSystemPromptOptions`
+    /// (`core/agent-session.ts:1044-1053`) and hands it back verbatim at `:2436` (EXT-061).
+    ///
+    /// `None` = no session backend attached. The CALLER supplies pi's own no-backend answer in that
+    /// case — `() => ({ cwd: this.cwd })` (`core/extensions/runner.ts:287`, re-bound at `:350`) —
+    /// which is why this is `Option<Value>` and not a bag defaulted here: only the caller knows the
+    /// cwd, and a bag defaulted to `{}` would be upstream's value for nothing at all.
+    fn system_prompt_options(&self) -> Option<Value> {
         None
     }
 
@@ -724,14 +763,17 @@ pub struct CannedResponses {
     pub oauth_prompt: Option<String>,
     /// Id returned from a guest `login` flow's `onSelect`.
     pub oauth_select: Option<String>,
-    /// Canned `ctx.isIdle()` (Pi types.ts:333).
+    /// Canned `ctx.isIdle()` (pi types.ts:330 @v0.83.0).
     pub is_idle: bool,
-    /// Canned `ctx.hasPendingMessages()` (Pi types.ts:341).
+    /// Canned `ctx.hasPendingMessages()` (pi types.ts:338 @v0.83.0).
     pub has_pending_messages: bool,
-    /// Canned `ctx.isProjectTrusted()` (Pi types.ts:335).
+    /// Canned `ctx.isProjectTrusted()` (pi types.ts:332 @v0.83.0).
     pub is_project_trusted: bool,
     /// Canned `ctx.getSystemPrompt()` (Pi types.ts:346).
     pub system_prompt: Option<String>,
+    /// Canned `ctx.getSystemPromptOptions()` (pi `extensions/types.ts:355` @v0.83.0; EXT-061).
+    /// `None` = no bag attached, which is what makes the caller fall back to pi's `{cwd}` default.
+    pub system_prompt_options: Option<Value>,
 }
 
 impl Default for CannedResponses {
@@ -761,6 +803,7 @@ impl Default for CannedResponses {
             has_pending_messages: false,
             is_project_trusted: false,
             system_prompt: None,
+            system_prompt_options: None,
         }
     }
 }
@@ -1083,6 +1126,9 @@ impl HostServices for RecordingServices {
     }
     fn system_prompt(&self) -> Option<String> {
         self.responses.system_prompt.clone()
+    }
+    fn system_prompt_options(&self) -> Option<Value> {
+        self.responses.system_prompt_options.clone()
     }
     fn append_entry(&self, custom_type: &str, data: &Value) -> Result<String, String> {
         let mut g = self.state.lock().map_err(|_| "recording lock poisoned".to_string())?;
