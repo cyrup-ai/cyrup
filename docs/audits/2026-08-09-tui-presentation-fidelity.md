@@ -1,4 +1,16 @@
-# TUI Presentation-Fidelity Backlog — `cyrup-tui` vs pi v0.84.1
+# TUI Presentation-Fidelity Audit (executed) — `cyrup-tui` vs pi v0.84.1
+
+> **Status: EXECUTED AND CLOSED — non-normative. Evidence only.**
+> All ten batches of §7 were applied (`0aaca00` … `922d90c`). A 46-of-117 sample re-read at cyrup
+> `72cd292` against pi `v0.84.1` found 46 of 46 rows landed and 0 open (ADR-0009).
+> **The "cyrup" column of every table below describes a tree that no longer exists.** No work may
+> be scheduled from this file and no commit may cite it as authority for a change. It is retained
+> as the two-sided evidence record for the changes already in `crates/cyrup-tui/`, which cite it by
+> section in 15 places, and for §8's killed claims.
+>
+> Archived from the repository root by [ADR-0009](../adr/ADR-0009-tui-fidelity-doc.md).
+> Section numbers (`§2`, `§3C`, `§3D`, `§5`, `§8`) are stable — in-source citations name sections,
+> not paths, so they still resolve.
 
 Read-only audit. Every row below was verified on both sides against `git -C pi show v0.84.1:<path>` and the live `crates/cyrup-tui/` tree. `F<n>` tags are the audit finding IDs — keep them in commit messages so nothing gets re-filed.
 

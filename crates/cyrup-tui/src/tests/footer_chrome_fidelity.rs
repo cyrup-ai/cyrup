@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 //! Presentation-fidelity guards for the always-on chrome — footer, status band, loaders, hints.
-//! C1–C15 of `TUI-FIDELITY.md` §3C, each anchored to a line of pi **v0.84.1** that was read.
+//! C1–C15 of `docs/audits/2026-08-09-tui-presentation-fidelity.md` §3C, each anchored to a line of pi **v0.84.1** that was read.
 //!
 //! Upstream paths, all under `pi/packages/`:
 //!   - `coding-agent/src/modes/interactive/components/footer.ts` — the three footer lines.

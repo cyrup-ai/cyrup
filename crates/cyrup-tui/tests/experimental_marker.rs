@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
-//! C15 of `TUI-FIDELITY.md` §3C — the footer's `• xp` experimental marker.
+//! C15 of `docs/audits/2026-08-09-tui-presentation-fidelity.md` §3C — the footer's `• xp` experimental marker.
 //!
 //! ```ts
 //! // pi v0.84.1 coding-agent/src/modes/interactive/components/footer.ts:162-164

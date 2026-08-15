@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
-//! Presentation-fidelity guards for `cyrup-tui`'s style construction, T1–T9 of `TUI-FIDELITY.md` §2.
+//! Presentation-fidelity guards for `cyrup-tui`'s style construction, T1–T9 of `docs/audits/2026-08-09-tui-presentation-fidelity.md` §2.
 //!
 //! Every assertion here is anchored to a line of pi **v0.84.1** that was read, not inferred. The
 //! shared theme file is where a single wrong accessor reaches dozens of render sites, so these pin
