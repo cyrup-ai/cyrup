@@ -110,6 +110,19 @@ impl Tool for RegisteredTool {
     fn render_kind(&self) -> ToolRenderKind {
         self.inner.render_kind()
     }
+    /// PROV-011 — upstream `wrapRegisteredTool` is a SPREAD of the already-wrapped tool
+    /// (`return { ...tool, execute }`, `core/extensions/wrapper.ts:21-22` @v0.83.0), so every field
+    /// `wrapToolDefinition` copied — `constrainedSampling` among them
+    /// (`core/tools/tool-definition-wrapper.ts:14`) — survives this wrapper by construction.
+    /// Rust has no spread: each surface method must be delegated by hand, and this one was the
+    /// method the hand-written list missed. Extension-registered and WASM-guest tools are the ONLY
+    /// tools that can declare `constrainedSampling` (no pi built-in does), and every one of them
+    /// reaches the loop through this wrapper — so without this override the whole opt-in path was
+    /// dead on arrival: `WasmTool::constrained_sampling` read the guest's declaration off the
+    /// descriptor and this wrapper dropped it one frame later, silently.
+    fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
+        self.inner.constrained_sampling()
+    }
     async fn prepare_arguments(&self, args: Value) -> Value {
         self.inner.prepare_arguments(args).await
     }
@@ -190,6 +203,7 @@ mod tests {
         params: Value,
         result: Result<Vec<String>, ()>,
         guidelines: Vec<String>,
+        constrained: cyrup_core::ConstrainedSampling,
     }
 
     #[async_trait::async_trait]
@@ -214,6 +228,13 @@ mod tests {
         }
         fn render_kind(&self) -> ToolRenderKind {
             ToolRenderKind::SelfRendered
+        }
+        /// PROV-011 — a DISTINCT non-default declaration, for the reason this fixture exists: the
+        /// trait default is `None`, so a fixture that left it defaulted would let
+        /// `every_surface_method_delegates` compare `None` against `None` and stay green with the
+        /// wrapper's delegation deleted.
+        fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
+            Some(&self.constrained)
         }
         fn execution_mode(&self) -> ExecMode {
             ExecMode::Sequential
@@ -255,6 +276,11 @@ mod tests {
             params: serde_json::json!({}),
             result: Ok(added.into_iter().map(str::to_string).collect()),
             guidelines: vec!["use fixed sparingly".to_string(), "fixed is not read".to_string()],
+            constrained: cyrup_core::ConstrainedSampling::Config(
+                cyrup_core::ConstrainedSamplingConfig::JsonSchema {
+                    strict: cyrup_core::StrictSampling::Require,
+                },
+            ),
         })
     }
 
@@ -316,6 +342,9 @@ mod tests {
                 params: serde_json::json!({}),
                 result: Err(()),
                 guidelines: Vec::new(),
+                // pi's explicit opt-OUT literal (`constrainedSampling: false`,
+                // `packages/ai/README.md:483` @v0.83.0) — behaves as omitted.
+                constrained: cyrup_core::ConstrainedSampling::Disabled(false),
             });
         let w = wrap_registered_tool(inner, active);
         assert!(run(&w).await.is_err());
@@ -349,6 +378,18 @@ mod tests {
         assert_eq!(w.prompt_guidelines(), vec!["use fixed sparingly", "fixed is not read"]);
         assert_eq!(w.render_kind(), inner.render_kind());
         assert_eq!(w.render_kind(), ToolRenderKind::SelfRendered);
+        // PROV-011 — upstream this survives because `wrapRegisteredTool` SPREADS the wrapped tool
+        // (`core/extensions/wrapper.ts:21-22` @v0.83.0); in Rust it survives only because the
+        // delegation is written out. Assert PRESENCE on the inner tool first, so a fixture that
+        // ever loses its declaration fails loudly rather than passing this vacuously.
+        assert!(inner.constrained_sampling().is_some(), "fixture must declare it");
+        assert_eq!(w.constrained_sampling(), inner.constrained_sampling());
+        assert!(matches!(
+            w.constrained_sampling().and_then(cyrup_core::ConstrainedSampling::config),
+            Some(cyrup_core::ConstrainedSamplingConfig::JsonSchema {
+                strict: cyrup_core::StrictSampling::Require
+            })
+        ));
         assert_eq!(w.execution_mode(), inner.execution_mode());
         assert_eq!(w.execution_mode(), ExecMode::Sequential);
         assert_eq!(w.parameters(), inner.parameters());

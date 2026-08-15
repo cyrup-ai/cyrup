@@ -2214,6 +2214,68 @@ fn package_source_parse_routes_git_local_and_npm() {
     assert!(matches!(parsed.into_source(), PackageSource::Git { .. }));
 }
 
+/// **CFG-052, REFUTED — this pins pi's ACTUAL behaviour, which cyrup already matches.**
+///
+/// CFG-052 asserts that "upstream's `parseGitUrl` reaches `hostedGitInfo.fromUrl`, which resolves
+/// the `github:`/`gitlab:`/`bitbucket:` shorthands", and calls the resulting `PackageSource::Path`
+/// an internal inconsistency created by porting two functions from two upstream files. Opening pi
+/// at the ported tag refutes both halves:
+///
+/// - `parseGitUrl` (`utils/git.ts:172-179` @v0.83.0) opens with
+///   `const hasGitPrefix = trimmed.startsWith("git:");` and
+///   `if (!hasGitPrefix && !/^(https?|ssh|git):\/\//i.test(url)) { return null; }`. `github:u/r` has
+///   no `git:` prefix, and the regex requires a literal `://`, so upstream **returns null before
+///   `hostedGitInfo.fromUrl` is ever called** — the shorthand-resolution path CFG-052 relies on is
+///   unreachable for this input. `crates/cyrup-resources/src/package/git_url.rs:278-287` is the same
+///   two statements.
+/// - The "inconsistency" is upstream's own and is deliberate: `parseSource`
+///   (`core/package-manager.ts:1435-1459`) routes an `isLocalPath`-false string to `parseGitUrl` and
+///   then falls through to the SAME `return { type: "local", path: source }` at `:1459` that
+///   `isLocalPath`-true strings take at `:1450`. `isLocalPath` classifying `github:` as non-local
+///   (`utils/paths.ts:41-55`) changes only which of the two identical returns is reached.
+///
+/// So a `github:` shorthand is a local path in pi and must stay a local path in cyrup. Encoding it
+/// here — rather than leaving the case untested, as CFG-026 did — is what stops a future pass
+/// "fixing" it into a divergence.
+#[test]
+fn cfg052_a_github_shorthand_is_a_local_path_exactly_as_upstream_leaves_it() {
+    // Presence before absence: the same function DOES resolve the `git:`-prefixed shorthand, so a
+    // `None` below is a statement about the missing `git:` prefix and not about a dead parser.
+    let with_prefix = parse_git_url("git:owner/repo")
+        .expect("`git:owner/repo` must still resolve through the hosted-git-info table");
+    assert_eq!(with_prefix.host, "github.com");
+    assert_eq!(with_prefix.path, "owner/repo");
+
+    for shorthand in ["github:owner/repo", "gitlab:group/proj", "bitbucket:owner/repo"] {
+        assert!(
+            parse_git_url(shorthand).is_none(),
+            "{shorthand}: pi's `parseGitUrl` returns null at git.ts:177-179 before reaching \
+             hostedGitInfo, so cyrup's must too"
+        );
+        match PackageSource::parse(shorthand).unwrap() {
+            PackageSource::Path { path } => assert_eq!(
+                path,
+                std::path::PathBuf::from(shorthand),
+                "pi stores the source string VERBATIM on the local arm (package-manager.ts:1459)"
+            ),
+            other => panic!("{shorthand}: expected the local arm pi takes, got {other:?}"),
+        }
+    }
+
+    // The identity keyer takes pi's same final `local:` arm, for the same reason.
+    let base = std::path::Path::new("/base");
+    assert_eq!(
+        crate::package::package_identity("github:owner/repo", base),
+        "local:/base/github:owner/repo"
+    );
+    // …while a form `parseGitUrl` CAN read keys on `git:<host>/<path>`, proving the `local:` arm
+    // above is reached by the git parser declining, not by the identity keyer being inert.
+    assert_eq!(
+        crate::package::package_identity("git:owner/repo", base),
+        "git:github.com/owner/repo"
+    );
+}
+
 // ===========================================================================
 // G3 — manifest override patterns filter at resolved-file granularity (plain dirs)
 // ===========================================================================
@@ -3460,50 +3522,67 @@ async fn cfg010_project_autoload_false_entry_is_a_delta_over_the_global_entry() 
 
 /// CFG-010 (dedupe half) — the project delta RESOLVES against the entry it deltas over.
 ///
-/// Pi's `findAutoloadDeltaBase` (package-manager.ts:1285-1299) swaps in the user entry's source and
-/// scope (`resolvedSource`/`resolvedScope`, :1232-1234) before parsing, so the pair lands on ONE
-/// working tree. Without it the same relative source string resolves against `<cwd>/.cyrup` for the
-/// project entry and the agent dir for the global one — two different (usually non-existent)
-/// directories, and the delta would silently apply to nothing.
+/// Pi's `findAutoloadDeltaBase` (package-manager.ts:1301-1313 @v0.83.0) swaps in the user entry's
+/// source and scope (`resolvedSource`/`resolvedScope`, :1246-1247) before parsing, so the pair lands
+/// on ONE working tree even though the INSTALL PATH is scope-dependent
+/// (`getGitInstallPath(parsed, resolvedScope)`, :1289; `getNpmInstallPath(…, resolvedScope)`,
+/// :1276). Without the swap the project half looks under `<project>/.cyrup/packages/<id>`, which no
+/// install ever wrote, and the delta applies to nothing.
+///
+/// The pair is a GIT source on purpose. `findAutoloadDeltaBase` matches by `getPackageIdentity`,
+/// and that identity is scope-independent ONLY for the npm and git arms
+/// (`npm:<name>` / `git:<host>/<path>`, package-manager.ts:1678-1684); the local arm resolves the
+/// path against `getBaseDirForScope(scope)` (`:1685-1688`), so one RELATIVE local string is two
+/// different packages across scopes and pi finds no delta base at all — the CFG-026 rule that
+/// [`crate::package::package_identity`]'s own unit tests pin. A relative local source therefore
+/// cannot express this case; it would only assert a pairing pi does not make.
 #[tokio::test]
 async fn cfg010_project_delta_resolves_against_the_global_entrys_install_location() {
     let tmp = tempfile::tempdir().unwrap();
     let cwd = tmp.path().join("project");
     fs::create_dir_all(&cwd).unwrap();
     let global = tmp.path().join("agent");
-    // The package lives ONLY under the global base dir — the project base dir has no such tree.
-    let pkg = global.join("shared-pack");
+
+    let source_str = "https://github.com/acme/shared-pack.git";
+    let source = PackageSource::parse(source_str).unwrap();
+    let id = source.package_id();
+    // Installed under the GLOBAL package store ONLY — `<project>/.cyrup/packages/<id>` does not
+    // exist, so any resolution that keeps the project scope lands on nothing.
+    let store = PackageStore::new(global.join("packages"), Some(cwd.clone()));
+    let pkg = store.package_dir(InstallScope::Global, &id).unwrap();
     make_package_tree(&pkg, true, false);
     write(
         &pkg.join("skills/beta/SKILL.md"),
         &skill_md("beta", "beta skill"),
     );
 
-    let mut cfg = DiscoveryConfig::new(cwd, global);
+    let delta = crate::ConfiguredPackage {
+        source: source_str.into(),
+        scope: InstallScope::Project,
+        filter: crate::PackageFilter {
+            autoload: Some(false),
+            skills: Some(vec!["-skills/alpha".to_string()]),
+            ..Default::default()
+        },
+    };
+    let base = crate::ConfiguredPackage {
+        source: source_str.into(),
+        scope: InstallScope::Global,
+        filter: crate::PackageFilter::default(),
+    };
+
+    let mut cfg = DiscoveryConfig::new(&cwd, &global);
+    cfg.project_root = Some(cwd.clone());
     cfg.trusted_project = true;
-    cfg.configured_packages = vec![
-        crate::ConfiguredPackage {
-            source: "shared-pack".into(),
-            scope: InstallScope::Project,
-            filter: crate::PackageFilter {
-                autoload: Some(false),
-                skills: Some(vec!["-skills/alpha".to_string()]),
-                ..Default::default()
-            },
-        },
-        crate::ConfiguredPackage {
-            source: "shared-pack".into(),
-            scope: InstallScope::Global,
-            filter: crate::PackageFilter::default(),
-        },
-    ];
+    cfg.configured_packages = vec![delta.clone(), base];
     let report = discover(&cfg, CancelToken::new()).await.unwrap();
     assert!(
         report
             .diagnostics
             .iter()
             .all(|d| !d.message.contains("shared-pack")),
-        "the delta must resolve to the global entry's tree, not to a missing project path: {:?}",
+        "the delta must resolve to the global entry's install location, not to a missing project \
+         path: {:?}",
         report.diagnostics
     );
     assert!(
@@ -3513,6 +3592,96 @@ async fn cfg010_project_delta_resolves_against_the_global_entrys_install_locatio
     assert!(
         !report.registry.skills.contains("alpha"),
         "the delta's `-` pattern reached the same tree and kept `alpha` off"
+    );
+
+    // NON-VACUITY CONTROL. Drop the global entry and the same delta has nothing to resolve against,
+    // so it stays at project scope and hits the empty project store — i.e. the pass above is the
+    // swap doing work, not the project scope happening to point at the same tree.
+    let mut alone = cfg.clone();
+    alone.configured_packages = vec![delta];
+    let report = discover(&alone, CancelToken::new()).await.unwrap();
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("shared-pack")),
+        "an unpaired project delta resolves against the PROJECT store, which is empty: {:?}",
+        report.diagnostics
+    );
+    assert!(!report.registry.skills.contains("beta"));
+}
+
+/// CFG-010 (pairing key) — the delta pair is matched by IDENTITY, not by source string.
+///
+/// `dedupePackages` keys on `getPackageIdentity(source, entry.scope)`
+/// (package-manager.ts:1703 @v0.83.0), and the git arm of that identity is `git:<host>/<path>`
+/// (`:1682-1684`) — deliberately spelling-independent, "to normalize SSH and HTTPS" per its own doc
+/// comment (`:1669-1674`). So a project delta written `ssh://git@github.com/acme/p.git` pairs with a
+/// global entry written `https://github.com/acme/p.git`. (The scp-like `git@github.com:acme/p.git`
+/// would NOT: `isLocalPath` lists only `npm:`/`git:`/`github:`/`http:`/`https:`/`ssh:` as non-local
+/// (paths.ts:41-55 @v0.83.0), so upstream reads that spelling as a local path, and so does cyrup.)
+///
+/// A source-STRING key does not pair them, and the failure is not merely a missed subtraction: the
+/// two spellings still resolve onto one tree (`findAutoloadDeltaBase` matches by identity), so an
+/// unpaired global half is a repeat visit to an already-seen tree and is skipped outright — every
+/// resource it autoloads disappears.
+#[tokio::test]
+async fn cfg010_delta_pairs_across_ssh_and_https_spellings_of_one_repo() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+
+    let https = "https://github.com/acme/shared-pack.git";
+    let ssh = "ssh://git@github.com/acme/shared-pack.git";
+    let id = PackageSource::parse(https).unwrap().package_id();
+    assert_eq!(
+        id,
+        PackageSource::parse(ssh).unwrap().package_id(),
+        "precondition: the two spellings are one package"
+    );
+    let store = PackageStore::new(global.join("packages"), Some(cwd.clone()));
+    let pkg = store.package_dir(InstallScope::Global, &id).unwrap();
+    make_package_tree(&pkg, true, false);
+    write(
+        &pkg.join("skills/beta/SKILL.md"),
+        &skill_md("beta", "beta skill"),
+    );
+
+    let mut cfg = DiscoveryConfig::new(&cwd, &global);
+    cfg.project_root = Some(cwd.clone());
+    cfg.trusted_project = true;
+    cfg.configured_packages = vec![
+        crate::ConfiguredPackage {
+            source: ssh.into(),
+            scope: InstallScope::Project,
+            filter: crate::PackageFilter {
+                autoload: Some(false),
+                skills: Some(vec!["-skills/alpha".to_string()]),
+                ..Default::default()
+            },
+        },
+        crate::ConfiguredPackage {
+            source: https.into(),
+            scope: InstallScope::Global,
+            filter: crate::PackageFilter::default(),
+        },
+    ];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    // The global half must still be walked: `beta` and the package's prompt are what it autoloads,
+    // and neither is anything the delta could have contributed (its only pattern is a `-`).
+    assert!(
+        report.registry.skills.contains("beta"),
+        "the global half of the pair must not be skipped as a duplicate tree: {:?}",
+        report.diagnostics
+    );
+    assert!(
+        report.registry.prompts.contains("greet"),
+        "…including resource types the delta says nothing about"
+    );
+    assert!(
+        !report.registry.skills.contains("alpha"),
+        "and the delta the other spelling declared still subtracts `alpha`"
     );
 }
 

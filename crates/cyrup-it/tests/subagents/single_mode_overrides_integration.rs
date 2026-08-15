@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId};
+use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
@@ -152,10 +153,19 @@ async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_re
     let text = tool_result_text(&result);
 
     // (1) The file was actually written. `output: "report.md"` is relative, so pi resolves it
-    // against the run's own scoped output base dir (`<artifactsDir>/outputs/<runId>`,
-    // `subagent-executor.ts:2838-2842`) — under the isolated CYRUP_HOME, never the user's cwd.
+    // against the run's own scoped output base dir, `path.join(artifactsDir, "outputs", runId)`
+    // (`runs/foreground/subagent-executor.ts:2838-2842` @v0.43.0).
+    //
+    // `artifactsDir` is the PROJECT dir by default — pi's `DEFAULT_ARTIFACT_CONFIG.dir = "project"`
+    // (`src/shared/types.ts:1796-1798`) — so the base dir is
+    // `<cwd>/.cyrup-subagents/artifacts/outputs/<runId>`, NOT anything under `CYRUP_HOME`. This
+    // test walked `home_dir` and asserted the file was NOT under `work_dir`, both of which encode
+    // the pre-SUBA-048 temp default; after that default moved onto pi's, the walk searched a tree
+    // the run never writes to. The real invariant is not "outside the cwd" — pi's own default is
+    // inside it — but "inside the run's scoped output base dir", never loose in the cwd root.
+    let outputs_base = project_artifacts_dir(work_dir.path()).join("outputs");
     let mut files = Vec::new();
-    walk(home_dir.path(), &mut files);
+    walk(work_dir.path(), &mut files);
     let report = files
         .iter()
         .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("report.md"))
@@ -166,9 +176,15 @@ async fn single_mode_output_and_output_mode_write_a_file_and_return_a_concise_re
         "the child's output must be persisted to the file, got: {written:?}"
     );
     assert!(
-        !report.starts_with(work_dir.path()),
-        "a relative `output` must NOT land in the run cwd (pi resolves it against the scoped \
-         output base dir): {report:?}"
+        report.starts_with(&outputs_base),
+        "a relative `output` resolves against `<artifactsDir>/outputs/<runId>` ({}), not the cwd \
+         root: {report:?}",
+        outputs_base.display()
+    );
+    assert_ne!(
+        report.parent(),
+        Some(work_dir.path()),
+        "the file must never be written loose in the run cwd: {report:?}"
     );
 
     // (2) `outputMode: "file-only"` returns ONLY the concise reference inline — pi's
@@ -261,8 +277,12 @@ async fn single_mode_output_without_file_only_still_inlines_the_full_output() {
         "inline mode appends the saved-output reference, got: {text:?}"
     );
 
+    // Walk the CWD, not `CYRUP_HOME`: the scoped output base dir is
+    // `<artifactsDir>/outputs/<runId>` and `artifactsDir` defaults to the PROJECT dir (pi
+    // `DEFAULT_ARTIFACT_CONFIG.dir = "project"`, `src/shared/types.ts:1796-1798` @v0.43.0). See the
+    // longer note in `single_mode_output_and_output_mode_...` above — same pre-SUBA-048 staleness.
     let mut files = Vec::new();
-    walk(home_dir.path(), &mut files);
+    walk(work_dir.path(), &mut files);
     assert!(
         files
             .iter()
@@ -270,7 +290,9 @@ async fn single_mode_output_without_file_only_still_inlines_the_full_output() {
         "the output file must still be written in inline mode; found: {files:?}"
     );
     // `artifacts: false` (pi `subagent-executor.ts:3387-3390`) suppresses the T6 quadruple, so no
-    // `*_input.md`/`*_output.md`/`*_meta.json` companion is written for this run.
+    // `*_input.md`/`*_output.md`/`*_meta.json` companion is written for this run. This absence is
+    // only meaningful because the walk above now covers the tree the quadruple WOULD land in —
+    // against `home_dir` it was true no matter what the run did.
     assert!(
         !files
             .iter()

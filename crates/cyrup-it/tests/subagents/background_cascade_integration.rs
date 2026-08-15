@@ -211,6 +211,7 @@ async fn build_run(dir: &Path, temp_root: &Path, run_token: &str, child_id: &str
         steps: vec![RunnerStep::SingleStep(single_step("worker", "do the thing"))],
         cwd: dir.to_path_buf(),
         session_file: None,
+        session_id: None,
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,

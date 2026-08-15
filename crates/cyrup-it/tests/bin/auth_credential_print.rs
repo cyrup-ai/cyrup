@@ -121,32 +121,51 @@ fn print_api_key_infers_the_provider_from_stored_credentials() {
     assert_eq!(r.code, 0, "stderr was: {}", r.stderr);
 }
 
-/// An unknown `auth` verb is upstream's `CredentialPrintError`, not a prompt: exit 1, the message on
-/// stderr, and stdout left completely empty for the caller's `$( … )` capture.
+/// An unknown `auth` verb is upstream's error, not a prompt: exit 1, the message on stderr, and
+/// stdout left completely empty for the caller's `$( … )` capture.
+///
+/// THE THIRD VERB. This asserted the v0.83.0 two-verb sentence
+/// (`credential-print.ts:39`); `auth check` arrived at pi v0.84.1 and cyrup ported it (SEAM-050),
+/// so the live sentence is `auth-command.ts:60-62` @v0.84.1's three-verb form. The test was never
+/// re-run after that port — `cyrup-it` is `required-features = ["it"]` and the merge gate does not
+/// arm it — so it sat red-in-waiting.
 #[test]
 fn an_unknown_auth_command_errors_instead_of_prompting() {
     let tmp = fixture();
     let r = run(&tmp, &["auth", "login"]);
     assert_eq!(
         r.stderr.trim_end(),
-        "Error: Unknown auth command \"login\". Use \"cyrup auth print-api-key\" or \"cyrup auth \
-         print-bearer-token\"."
+        "Error: Unknown auth command \"login\". Use \"cyrup auth print-api-key\", \"cyrup auth \
+         print-bearer-token\", or \"cyrup auth check\"."
     );
     assert_eq!(r.code, 1);
     assert_eq!(r.stdout, "", "stdout must stay clean on failure");
 }
 
-/// A bare `cyrup auth` prints the usage block and exits 0 (Pi `isCredentialPrintHelp` +
-/// `printCredentialPrintHelp`).
+/// A bare `cyrup auth` prints the usage block and exits 0 (Pi `isAuthCommandHelp` +
+/// `printAuthCommandHelp`, `cli/auth-command.ts:31-45` @v0.84.1).
+///
+/// Same staleness as the test above: the old assertion demanded `--model <model>` as a REQUIRED
+/// argument in the two print lines, which is the v0.83.0 `printCredentialPrintHelp` text
+/// (`credential-print.ts:24-30`). v0.84.1 made both `[--provider <provider>] [--model <model>]`
+/// optional-bracketed and added the `check` line, because auth commands now require provider OR
+/// model rather than model alone.
 #[test]
 fn bare_auth_prints_the_usage_block() {
     let tmp = fixture();
     let r = run(&tmp, &["auth"]);
     assert_eq!(r.code, 0, "stderr was: {}", r.stderr);
+    assert!(r.stdout.starts_with("Usage:"), "stdout was: {}", r.stdout);
+    for line in [
+        "cyrup auth print-api-key [--provider <provider>] [--model <model>]",
+        "cyrup auth print-bearer-token [--provider <provider>] [--model <model>] [--min-expiry <duration>]",
+        "cyrup auth check [--provider <provider>] [--model <model>] [--json] [--credentials] [--no-refresh]",
+    ] {
+        assert!(r.stdout.contains(line), "usage block is missing `{line}`; stdout was: {}", r.stdout);
+    }
+    // pi `:44` — the sentence that states the provider-OR-model rule the v0.84.1 surface turns on.
     assert!(
-        r.stdout.starts_with("Usage:")
-            && r.stdout.contains("cyrup auth print-api-key --model <model>")
-            && r.stdout.contains("cyrup auth print-bearer-token --model <model>"),
+        r.stdout.contains("Auth commands require at least one of --provider or --model."),
         "stdout was: {}",
         r.stdout
     );
@@ -169,25 +188,25 @@ fn print_bearer_token_rejects_an_api_key_provider() {
     assert_eq!(r.stdout, "");
 }
 
-/// The `validateCredentialPrintArgs` triad, each reached through the real binary.
+/// The `validateAuthCommandArgs` surface (`cli/auth-command.ts:96-116` @v0.84.1), each reached
+/// through the real binary.
+///
+/// The v0.83.0 `validateCredentialPrintArgs` had three separate messages and required `--model`;
+/// v0.84.1 folded `--api-key`/positionals into ONE sentence (`:103-105`) and made the requirement
+/// provider-OR-model (`:113-115`). Production followed (SEAM-050); this test did not.
 #[test]
 fn credential_printing_validates_its_argument_surface() {
     let tmp = fixture();
 
-    let r = run(&tmp, &["auth", "print-api-key", "--provider", "acme"]);
-    assert_eq!(
-        r.stderr.trim_end(),
-        "Error: Credential printing requires --model <model>"
-    );
-    assert_eq!(r.code, 1);
-
+    // pi `:103-105` — `apiKey !== undefined || messages.length > 0 || fileArgs.length > 0` is a
+    // SINGLE message, not one per cause.
     let r = run(
         &tmp,
         &["auth", "print-api-key", "--model", "acme-1", "--api-key", "sk-injected"],
     );
     assert_eq!(
         r.stderr.trim_end(),
-        "Error: Credential printing reads configured credentials; --api-key is not supported"
+        "Error: Auth commands only accept --provider and --model"
     );
     assert_eq!(r.code, 1);
     assert_eq!(r.stdout, "", "an injected key must never be echoed back");
@@ -195,7 +214,23 @@ fn credential_printing_validates_its_argument_surface() {
     let r = run(&tmp, &["auth", "print-api-key", "--model", "acme-1", "extra"]);
     assert_eq!(
         r.stderr.trim_end(),
-        "Error: Credential printing only accepts --provider and --model"
+        "Error: Auth commands only accept --provider and --model"
+    );
+    assert_eq!(r.code, 1);
+
+    // pi `:113-115` — neither provider nor model.
+    let r = run(&tmp, &["auth", "print-api-key"]);
+    assert_eq!(
+        r.stderr.trim_end(),
+        "Error: Credential printing requires --provider <provider> or --model <model>"
+    );
+    assert_eq!(r.code, 1);
+
+    // pi `:99-102` — an unmatched flag names the command it was given to.
+    let r = run(&tmp, &["auth", "print-api-key", "--model", "acme-1", "--nope"]);
+    assert_eq!(
+        r.stderr.trim_end(),
+        "Error: Unknown option --nope for \"auth print-api-key\"."
     );
     assert_eq!(r.code, 1);
 
@@ -208,6 +243,48 @@ fn credential_printing_validates_its_argument_surface() {
         "Error: --min-expiry must use a duration such as 30m or 1h"
     );
     assert_eq!(r.code, 1);
+}
+
+/// `--provider` ALONE prints the credential — no `--model` required.
+///
+/// pi `resolveCredentialForPrint` (`cli/credential-print.ts:29-40` @v0.84.1) branches on `cliModel`:
+/// with a model it resolves one; WITHOUT one it pushes `{ id: provider.id }` and fetches the
+/// credential with `getAuth(provider.id, …)` (`:66`). SEAM-050 relaxed the VALIDATOR to pi's
+/// provider-OR-model rule but never gave the RESOLVER that second branch, so cyrup passed the
+/// absent model into `resolve_cli_model` and turned its empty result into
+/// `Unable to resolve the requested provider/model` — the rejection moved one layer down and the
+/// port read as finished. This is the assertion that distinguishes the two.
+#[test]
+fn print_api_key_accepts_a_provider_with_no_model() {
+    let tmp = fixture();
+    let r = run(&tmp, &["auth", "print-api-key", "--provider", "acme"]);
+    assert_eq!(
+        r.stdout, "sk-acme-stored\n",
+        "a bare --provider must print the credential; stderr was: {}",
+        r.stderr
+    );
+    assert_eq!(r.code, 0, "stderr was: {}", r.stderr);
+    assert_eq!(r.stderr, "", "the success path is silent on stderr");
+}
+
+/// The companion bound: an UNKNOWN `--provider` is pi's own named error, not the generic resolver
+/// message.
+///
+/// pi `credential-print.ts:30-32` @v0.84.1 checks `modelRuntime.getProvider(cliProvider)` FIRST and
+/// throws `Unknown provider "…". Use --list-models to see available providers.`. cyrup had no such
+/// check at all — an unknown provider fell through `resolve_cli_model` and surfaced as
+/// `Unable to resolve the requested provider/model`, which never mentions `--list-models`. Without
+/// this test the fix above could have been "accept every provider", which is not the port.
+#[test]
+fn an_unknown_provider_is_named_and_points_at_list_models() {
+    let tmp = fixture();
+    let r = run(&tmp, &["auth", "print-api-key", "--provider", "nosuchprovider"]);
+    assert_eq!(
+        r.stderr.trim_end(),
+        "Error: Unknown provider \"nosuchprovider\". Use --list-models to see available providers."
+    );
+    assert_eq!(r.code, 1);
+    assert_eq!(r.stdout, "", "stdout must stay clean on failure");
 }
 
 /// `--help` advertises the command exactly as upstream's `cli/args.ts` does.

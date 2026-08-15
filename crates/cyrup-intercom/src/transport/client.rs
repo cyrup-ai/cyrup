@@ -27,8 +27,8 @@ use tokio::task::AbortHandle;
 use crate::error::{IntercomError, Result};
 use crate::transport::framing::{FrameReader, encode_json};
 use crate::transport::protocol::{
-    Attachment, BrokerMessage, ClientMessage, Message, MessageContent, SessionInfo,
-    SessionRegistration, now_ms,
+    Attachment, BrokerMessage, ClientMessage, Message, MessageContent, MessageControl,
+    MessageReceipt, SessionInfo, SessionRegistration, now_ms,
 };
 use crate::transport::stream::{BrokerReadHalf, BrokerStream, BrokerWriteHalf};
 use crate::transport::target::BrokerConnectTarget;
@@ -37,6 +37,11 @@ use crate::transport::target::BrokerConnectTarget;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const SEND_TIMEOUT: Duration = Duration::from_secs(10);
 const LIST_TIMEOUT: Duration = Duration::from_secs(5);
+/// `cancelMessage`'s own correlation deadline (`v0.10.1 broker/client.ts:684-690`). It is NOT
+/// [`SEND_TIMEOUT`] even though both correlate through `pendingSends`: upstream writes `10000`
+/// inline in each, and the failure text differs (`Cancel timeout` vs `Send timeout`), so a shared
+/// constant would be a merge cyrup invented.
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
 /// The `disconnect()` forced-destroy watchdog (`client.ts:452-454`).
 const DISCONNECT_TIMEOUT: Duration = Duration::from_millis(2000);
 const READ_BUF: usize = 16 * 1024;
@@ -54,6 +59,14 @@ pub struct SendOptions {
     pub expects_reply: Option<bool>,
     /// A caller-supplied message id (the ask `questionId`); a fresh UUID is minted when absent.
     pub message_id: Option<String>,
+    /// `supersedes` (`v0.10.1 broker/client.ts:12`) — the previous message this one replaces. The
+    /// broker validates it against `messageReceiptRoutes` and refuses the send when it does not
+    /// name a message this sender delivered to this same receiver
+    /// (`v0.10.1 broker/broker.ts:525-534`).
+    pub supersedes: Option<String>,
+    /// `retryOf` (`v0.10.1 broker/client.ts:13`) — the previous message this one retries. Carried on
+    /// the envelope only; the broker does not validate it.
+    pub retry_of: Option<String>,
 }
 
 /// The result of a [`IntercomClient::send`] (`SendResult`, `client.ts:16-20`).
@@ -87,6 +100,22 @@ pub enum InboundEvent {
     SessionLeft(String),
     /// A presence change (`client.ts:400-406`).
     PresenceUpdate(SessionInfo),
+    /// A receipt the broker forwarded from a message this session SENT
+    /// (`v0.10.1 broker/client.ts:402-409` → `this.emit("message_receipt", from, receipt)`).
+    MessageReceipt {
+        /// The receiving session that emitted the receipt.
+        from: SessionInfo,
+        /// What happened to the message.
+        receipt: MessageReceipt,
+    },
+    /// A control frame about a message this session RECEIVED — the sender withdrew or replaced it
+    /// (`v0.10.1 broker/client.ts:411-418` → `this.emit("message_control", from, control)`).
+    MessageControl {
+        /// The sending session that issued the control.
+        from: SessionInfo,
+        /// The control itself.
+        control: MessageControl,
+    },
     /// A broker-level error for this connection (`client.ts:409-418`).
     Error(String),
     /// The connection closed (`client.ts:227-229`).
@@ -461,6 +490,8 @@ impl IntercomClient {
             timestamp: now_ms().into(),
             reply_to: options.reply_to,
             expects_reply: options.expects_reply,
+            supersedes: options.supersedes,
+            retry_of: options.retry_of,
             content: MessageContent { text: options.text, attachments: options.attachments, ..Default::default() },
             ..Default::default()
         };
@@ -500,6 +531,63 @@ impl IntercomClient {
     /// As [`Self::list_sessions`].
     pub async fn list_sessions_with_timeout(&self, timeout: Duration) -> Result<Vec<SessionInfo>> {
         list_sessions_inner(&self.inner, timeout).await
+    }
+
+    /// Withdraw a message this session already sent (`cancelMessage`,
+    /// `v0.10.1 broker/client.ts:666-699`), awaiting the broker's `delivered`/`delivery_failed` ack.
+    ///
+    /// Correlated through the SAME `pending_sends` table as [`Self::send`] — upstream reuses
+    /// `this.pendingSends` keyed by the *cancelled* message's id (`:689`), because the broker
+    /// answers a `cancel_message` with a `delivered { messageId }` naming that same id
+    /// (`v0.10.1 broker/broker.ts:719,744`). A separate table would never be resolved.
+    ///
+    /// # Errors
+    /// [`IntercomError::Client`] on a cancel timeout (pi's `Cancel timeout`, `:688`) or if the
+    /// client is not connected / disconnected mid-cancel (pi's `requireActiveSocket()` throw,
+    /// `:668-671`, which rejects the promise rather than returning a result).
+    pub async fn cancel_message(&self, message_id: &str) -> Result<SendResult> {
+        if !self.is_connected() {
+            return Err(IntercomError::Client("not connected".to_string()));
+        }
+        let message_id = message_id.to_string();
+        let (tx, rx) = oneshot::channel();
+        guard(&self.inner.pending_sends).insert(message_id.clone(), tx);
+        let frame = encode_json(&ClientMessage::CancelMessage { message_id: message_id.clone() })?;
+        if !self.inner.send_frame(frame) {
+            guard(&self.inner.pending_sends).remove(&message_id);
+            return Err(IntercomError::Client("client disconnected".to_string()));
+        }
+        match tokio::time::timeout(CANCEL_TIMEOUT, rx).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(_)) => {
+                guard(&self.inner.pending_sends).remove(&message_id);
+                Err(IntercomError::Client("client disconnected".to_string()))
+            }
+            Err(_) => {
+                guard(&self.inner.pending_sends).remove(&message_id);
+                Err(IntercomError::Client("Cancel timeout".to_string()))
+            }
+        }
+    }
+
+    /// Report what happened to a message this session RECEIVED (`sendMessageReceipt`,
+    /// `v0.10.1 broker/client.ts:701-712`).
+    ///
+    /// Fire-and-forget and unacknowledged, with the same `disconnecting`/registered/socket-liveness
+    /// guards as [`Self::cancel_ask`] (`:702-709`) — a receipt is a diagnostic, and upstream's own
+    /// caller swallows every throw (`emitMessageReceipt`'s bare `catch {}`,
+    /// `v0.10.1 index.ts:550-559`), so this returns `()` rather than a `Result` nobody could act on.
+    pub fn send_message_receipt(&self, receipt: MessageReceipt) {
+        if self.inner.disconnecting.load(Ordering::SeqCst) || !self.is_connected() {
+            return;
+        }
+        // `!this._sessionId` (`:707`) — a receipt before `registered` is dropped, not queued.
+        if self.session_id().is_none() {
+            return;
+        }
+        if let Ok(frame) = encode_json(&ClientMessage::MessageReceipt { receipt }) {
+            let _ = self.inner.send_frame(frame);
+        }
     }
 
     /// Best-effort cancel of an outstanding ask edge this session owns (`cancelAsk`,
@@ -793,23 +881,23 @@ async fn read_task(
                 BrokerMessage::PresenceUpdate { session } => {
                     let _ = inner.events.send(InboundEvent::PresenceUpdate(session));
                 }
-                // v0.9.x frames this client decodes but does not yet act on. Decoding them is what
-                // keeps the connection ALIVE: before these variants existed, a `message_receipt`
-                // — which pi's broker forwards to the original sender the moment a route exists
-                // (`v0.9.2 broker/broker.ts:812-818`) — was an `unknown variant` serde error, i.e.
-                // `close_reason` + `break 'outer`, so the first message a cyrup client successfully
-                // sent to a pi peer killed its own connection.
+                // ICOM-017: re-emitted, not dropped. pi's client turns both into `EventEmitter`
+                // events (`v0.10.1 broker/client.ts:402-419`) and the extension subscribes to both
+                // (`index.ts:1018-1026`): a `message_receipt` updates `latestOutboundReceipts` (the
+                // delivery state an ask timeout reports), and a `message_control` runs
+                // `handleMessageControl`, which is what makes a peer's `cancel`/`supersede`
+                // actually retract the pending ask on THIS side. Dropping them left the whole
+                // diagnostic half of the protocol write-only.
                 //
-                // Reacting to them is deliberately NOT done here: pi's client re-emits them as
-                // `message_receipt`/`message_control` events (`v0.9.2 broker/client.ts:475-491`)
-                // and the session-side handling of those is a separate, larger port. Dropping them
-                // is a strict improvement over disconnecting and loses nothing that was previously
-                // delivered.
-                BrokerMessage::MessageReceipt { .. } | BrokerMessage::MessageControl { .. } => {
-                    tracing::debug!(
-                        kind,
-                        "intercom client: v0.9.x frame decoded but not yet surfaced"
-                    );
+                // Decoding them was already load-bearing for connection survival — a
+                // `message_receipt` is forwarded by pi's broker the moment a route exists
+                // (`v0.10.1 broker/broker.ts:688-696`), and before these variants existed it was an
+                // `unknown variant` serde error, i.e. `close_reason` + `break 'outer`.
+                BrokerMessage::MessageReceipt { from, receipt } => {
+                    let _ = inner.events.send(InboundEvent::MessageReceipt { from, receipt });
+                }
+                BrokerMessage::MessageControl { from, control } => {
+                    let _ = inner.events.send(InboundEvent::MessageControl { from, control });
                 }
                 // Extension-bus frames (`v0.9.2 types.ts:115-136`). Unreachable in practice: pi's
                 // broker only routes these to a session that advertised `extensions` in its
@@ -1355,6 +1443,14 @@ mod tests {
     // `unknown variant` error, which this reader turns into `close_reason` + `break 'outer` — so
     // the FIRST message a cyrup client successfully sent to a pi peer killed its own connection.
     // Against that pre-fix behavior the `Message` assertion below never fires: the reader is gone.
+    //
+    // Surviving is only half of it, so the ORDERED sequence is pinned: pi's client does not swallow
+    // these two, it re-emits both (`this.emit("message_receipt", from, receipt)` /
+    // `this.emit("message_control", from, control)`, `v0.9.2 broker/client.ts:475-491`), which is
+    // what lets a subscriber act on them (`v0.9.2 index.ts:1018-1026`). `extension_owner` is the
+    // control: it is emitted upstream (`:538-551`) but cyrup has no extension bus to route it to
+    // (`read_task`'s extension-bus arm), so it contributes NO event — which is exactly why an
+    // "expect the next event to be the Message" assertion cannot express any of this.
     #[tokio::test]
     async fn read_task_survives_v0_9_x_receipt_and_control_frames() {
         let (mut b, mut events, _keepalive) = registered_read_task().await;
@@ -1392,11 +1488,38 @@ mod tests {
         .expect("encodes");
         b.write_all(&follow_up).await.expect("write");
 
-        let evt = tokio::time::timeout(Duration::from_secs(2), events.recv())
-            .await
-            .expect("the connection must still be reading after the v0.9.x frames")
-            .expect("channel open");
-        match evt {
+        let mut next = async || {
+            tokio::time::timeout(Duration::from_secs(2), events.recv())
+                .await
+                .expect("the connection must still be reading after the v0.9.x frames")
+                .expect("channel open")
+        };
+
+        match next().await {
+            InboundEvent::MessageReceipt { from, receipt } => {
+                assert_eq!(from.id, "peer");
+                assert_eq!(receipt.message_id, "m1");
+                assert_eq!(
+                    receipt.status,
+                    crate::transport::protocol::MessageReceiptStatus::ReceiverReceived
+                );
+            }
+            other => panic!("pi re-emits the receipt (`client.ts:475-481`), got {other:?}"),
+        }
+        match next().await {
+            InboundEvent::MessageControl { from, control } => {
+                assert_eq!(from.id, "peer");
+                assert_eq!(control.message_id, "m1");
+                assert_eq!(
+                    control.action,
+                    crate::transport::protocol::MessageControlAction::Cancel
+                );
+            }
+            other => panic!("pi re-emits the control (`client.ts:483-490`), got {other:?}"),
+        }
+        // The `extension_owner` written between the control and the follow-up produces no event of
+        // its own, so the very next event is the message — that ordering is the assertion.
+        match next().await {
             InboundEvent::Message { message, .. } => assert_eq!(message.content.text, "still alive"),
             other => panic!("expected the follow-up message, got {other:?}"),
         }

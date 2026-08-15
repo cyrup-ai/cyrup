@@ -82,6 +82,24 @@ impl FsOps for TraversalFs {
         self.inner.read(&p).await
     }
 
+    /// Forwarded EXPLICITLY — and here the omission was worse than a lost optimization.
+    ///
+    /// `FsOps::read_stream`'s default is `Cursor::new(self.read(path).await?)`
+    /// (`ops/mod.rs:329-334`). Routing through `self.read` does re-apply [`Self::confine`], so the
+    /// containment was never bypassed; what was lost is `LocalFs`'s real-`File` override, so
+    /// `confineToCwd` silently reverted grep to the whole-file materialization TOOL-034 removed —
+    /// undetectable by any test, because the default returns exactly the bytes a real stream would.
+    ///
+    /// The confinement is applied here and NOT delegated to `read`, so the guarded path is what the
+    /// inner seam opens, exactly as in every other method on this decorator.
+    async fn read_stream(
+        &self,
+        path: &Path,
+    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+        let p = self.confine(path)?;
+        self.inner.read_stream(&p).await
+    }
+
     async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         let p = self.confine(path)?;
         self.inner.write_in_place(&p, bytes).await

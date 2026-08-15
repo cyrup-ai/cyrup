@@ -1195,6 +1195,37 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
 // LiveExtension: a loaded `.wasm` component as a unified Extension.
 // ---------------------------------------------------------------------------
 
+/// Clears [`GuestState`]'s bound tool `CancelToken` when the executing tool call ends — **including
+/// when the `execute_tool` future is DROPPED mid-await**, which is the case a JS port cannot think
+/// of and a Rust one must.
+///
+/// Upstream, `signal` is a parameter of `ToolDefinition.execute` (`extensions/types.ts:483`
+/// @v0.83.0): it is scoped to the call by the language, and an `async function` that has begun
+/// ALWAYS settles, so there is no state to unwind. cyrup cannot pass the token through the
+/// Component Model — a `CancelToken` is not a WIT value — so it binds it on
+/// [`GuestState::set_tool_cancel`] for the duration of the call and the guest polls it through the
+/// `host-tool.is-cancelled` import.
+///
+/// That turns a call-scoped parameter into instance-scoped mutable state, and instance-scoped state
+/// must be torn down on EVERY exit path. Clearing it on both arms of the `tokio::select!` covers
+/// completion and token-cancellation but NOT the third exit a Rust future has: the whole
+/// `execute_tool` future being dropped at its await point by a racing caller (an outer `select!`, a
+/// `tokio::time::timeout`, an aborted `JoinHandle`). On that path the old code left the token bound
+/// forever, and `host-tool.is-cancelled` is NOT gated to tool calls — a guest may poll it from any
+/// handler — so every later poll, from any entry point, read the abandoned call's token and
+/// answered `true` until the next `execute_tool` happened to rebind it. A guest that checks
+/// `is-cancelled` to decide whether to keep working would quietly stop working.
+///
+/// Declared AFTER the `inner` mutex guard in `execute_tool` so it drops BEFORE it: the token is
+/// cleared while the instance lock is still held, so no other call can observe the gap.
+pub(crate) struct ToolCancelBinding<'a>(pub(crate) &'a Arc<GuestState>);
+
+impl Drop for ToolCancelBinding<'_> {
+    fn drop(&mut self) {
+        self.0.set_tool_cancel(None);
+    }
+}
+
 /// A live loaded WASM extension (arch-08b). Holds the instantiated component + its `Store` behind an
 /// async `Mutex` (single-thread-per-Store, R-ARCH-EXT-013) and the `GuestState` that backs its
 /// imports. Implements [`Extension`]; the dispatcher treats it identically to a native built-in.
@@ -1315,19 +1346,19 @@ impl LiveExtension {
         self.guest.set_tier(CtxTier::Event);
         // Bind this call's CancelToken so the guest's `signal` poll (`host-tool.is-cancelled`) reads
         // the live cancellation state during a long `execute` (Pi `signal` param, sdk gap #1).
+        // Unbound by [`ToolCancelBinding`]'s `Drop`, NOT by hand: this future can be dropped at the
+        // `select!` below, and a hand-written clear on each arm does not run on that path. See the
+        // guard's own doc for what the leaked token then does to `is-cancelled`.
         self.guest.set_tool_cancel(Some(cancel.clone()));
+        let _tool_cancel = ToolCancelBinding(&self.guest);
         let params_s = params.to_string();
         let api = inner.instance.cyrup_ext_events();
         let call = api.call_execute_tool(&mut inner.store, name, call_id.as_str(), &params_s);
         let res = tokio::select! {
             biased;
-            _ = cancel.cancelled() => {
-                self.guest.set_tool_cancel(None);
-                return Err(ToolError::new("tool execution cancelled"));
-            }
+            _ = cancel.cancelled() => return Err(ToolError::new("tool execution cancelled")),
             r = call => r,
         };
-        self.guest.set_tool_cancel(None);
         // Replay streamed updates (Pi onUpdate) into the runtime sink.
         for (_cid, chunk) in self.guest.take_tool_updates() {
             let content = chunk
@@ -1339,7 +1370,10 @@ impl LiveExtension {
                 content,
                 details: chunk.get("details").cloned(),
                 // Pi's `partialResult` is an `AgentToolResult`, which may carry `terminate`
-                // (types.ts:359); thread it through from the guest's update chunk.
+                // (`packages/agent/src/types.ts:368` @v0.83.0 — EXT-036 corrected
+                // `extensions/types.ts:359`, which is `ExtensionContext.compact`'s neighbourhood in
+                // the wrong package; `:359` in the RIGHT package is `details: T`); thread it through
+                // from the guest's update chunk.
                 terminate: chunk.get("terminate").and_then(Value::as_bool),
             });
         }
@@ -1479,7 +1513,7 @@ impl LiveExtension {
         }
     }
 
-    /// Render a tool call via a guest-registered message renderer (Pi `renderCall`, types.ts:472).
+    /// Render a tool call via a guest-registered message renderer (Pi `renderCall`, types.ts:489).
     /// Returns the serialized widget tree, or `None` to fall back to the default renderer.
     pub async fn render_call(
         &self,
@@ -1489,7 +1523,7 @@ impl LiveExtension {
         self.render(custom_type, call, true).await
     }
 
-    /// Render a tool result via a guest-registered renderer (Pi `renderResult`, types.ts:481).
+    /// Render a tool result via a guest-registered renderer (Pi `renderResult`, types.ts:492).
     pub async fn render_result(
         &self,
         custom_type: &str,
@@ -1736,6 +1770,15 @@ impl WasmTool {
     }
 }
 
+/// The `Tool::label` view of a guest descriptor (EXT-M03). Split out of the trait method purely so
+/// it is reachable from a unit test: constructing a `WasmTool` needs an `Arc<LiveExtension>`, i.e. a
+/// compiled component and the `wasm32-wasip2` toolchain, which is exactly why the missing
+/// delegation went unnoticed for as long as it did.
+fn descriptor_label(descriptor: &ToolDescriptor) -> Option<&str> {
+    let label = descriptor.label.as_str();
+    (!label.is_empty()).then_some(label)
+}
+
 #[async_trait::async_trait]
 impl Tool for WasmTool {
     fn name(&self) -> &str {
@@ -1753,15 +1796,43 @@ impl Tool for WasmTool {
     fn description(&self) -> &str {
         &self.descriptor.description
     }
+    /// The guest's declared `label` (pi `ToolDefinition.label: string`, "Human-readable label for
+    /// UI", `extensions/types.ts:452-453` @v0.83.0 — a REQUIRED field upstream, which is why the
+    /// WIT `tool-descriptor.label` is a bare `string` and not an `option<string>`).
+    ///
+    /// EXT-M03, the delegation-omission class sweep 6 generalised from `wrapRegisteredTool`: this
+    /// override did not exist, so `<WasmTool as Tool>::label` fell through to the trait DEFAULT
+    /// (`None`, `cyrup-core/src/tool.rs`). The field crossed the entire ABI with no reader — the SDK
+    /// builder sets it (`cyrup-ext-sdk/src/descriptor.rs:132`, defaulted to the name at `:113`, and
+    /// set explicitly by all three `tool_factory` presets), `lower_tool_descriptor` lowers it
+    /// (`cyrup-ext-sdk/src/guest.rs:58`), the WIT declares it, and `register_tool` lifts it into
+    /// `ToolDescriptor.label` at `:113` above — where it then stopped, write-only. Exactly the
+    /// EXT-007 `prompt_guidelines` shape and exactly the hazard that hides from tests: a dropped
+    /// delegation returns the same `None` a fixture that never sets a label would.
+    ///
+    /// The asymmetry this closes is the real defect: a NATIVE tool can express a label (it writes
+    /// its own `impl Tool`), a WASM guest could not, no matter what it declared.
+    ///
+    /// An EMPTY label maps to `None` rather than `Some("")` — the trait documents `None` as "fall
+    /// back to the tool name", which is what upstream's always-populated `label` degenerates to,
+    /// and a non-SDK guest sending `""` must not blank the UI row.
+    fn label(&self) -> Option<&str> {
+        descriptor_label(&self.descriptor)
+    }
     /// The guest's declared `promptSnippet` (Pi `ToolDefinition.promptSnippet`,
-    /// extensions/types.ts:442-443). `None` when the descriptor omits it, which keeps the tool out
+    /// `extensions/types.ts:456-457` @v0.83.0; the `:442-443` this line used to cite is
+    /// `isError: boolean` on `ToolRenderContext`, a different interface — re-derived this pass
+    /// while adding `label` below). `None` when the descriptor omits it, which keeps the tool out
     /// of the system prompt's "Available tools" section exactly as Pi's
     /// `tools.filter(name => !!toolSnippets?.[name])` does (system-prompt.ts:79-80).
     fn prompt_snippet(&self) -> Option<&str> {
         self.descriptor.prompt_snippet.as_deref()
     }
     /// The guest's declared `promptGuidelines` (pi `ToolDefinition.promptGuidelines`,
-    /// `extensions/types.ts:444-446` @v0.83.0) — the bullets that reach the system prompt's
+    /// `extensions/types.ts:458-459` @v0.83.0; `:444-446` was stale by the same -14 as the
+    /// `promptSnippet` cite above, while the `:463`/`:465`/`:468` cites its neighbours carry are
+    /// EXACT — the tell that the rot is confined to this pair's original import) — the bullets that
+    /// reach the system prompt's
     /// "Guidelines" section.
     ///
     /// TOOL-021 / EXT-007: this override could not be written until `Tool::prompt_guidelines`
@@ -2182,6 +2253,112 @@ mod tests {
         let guest =
             GuestState::with_services(ExtensionId::from("test"), Arc::new(ExtensionRegistry::new()), services);
         HostState::with_guest(StoreLimits::default(), Arc::new(guest))
+    }
+
+    /// EXT-M03 — a guest tool's declared `label` (pi `ToolDefinition.label: string`, "Human-readable
+    /// label for UI", `extensions/types.ts:452-453` @v0.83.0) reaches `Tool::label`.
+    ///
+    /// The defect was a MISSING delegation, not a wrong one: `impl Tool for WasmTool` overrode
+    /// every other descriptor-backed accessor (`description`, `prompt_snippet`,
+    /// `prompt_guidelines`, `render_kind`, `constrained_sampling`, `prepare_arguments`) and simply
+    /// omitted `label`, so it fell through to `Tool::label`'s default `None`. The field crossed the
+    /// whole ABI — SDK builder, `lower_tool_descriptor`, WIT record, `register_tool`'s lift into
+    /// `ToolDescriptor.label` — and had no reader on the far side.
+    ///
+    /// This is the vacuous-pass shape the sweep briefs warn about, which is why the assertions
+    /// below use DISTINCT non-default values: a label that differs from the name (so a test that
+    /// accidentally read `name` would fail), and the empty case asserted separately (so
+    /// `Some("") != None` cannot be confused with the fallback).
+    #[test]
+    fn a_guest_tools_declared_label_reaches_the_tool_surface() {
+        let described = ToolDescriptor {
+            name: "run_migrations".into(),
+            // Deliberately NOT the name, and not the description either.
+            label: "Run Migrations".into(),
+            description: "applies pending migrations".into(),
+            parameters: serde_json::json!({ "type": "object", "properties": {} }),
+            execution_mode: None,
+            prompt_snippet: None,
+            prompt_guidelines: Vec::new(),
+            has_renderer: false,
+            prepare_arguments: false,
+            render_shell: None,
+            constrained_sampling: None,
+        };
+        assert_eq!(
+            descriptor_label(&described),
+            Some("Run Migrations"),
+            "the guest's declared label must survive to `Tool::label`, not fall back to the name"
+        );
+        assert_ne!(
+            descriptor_label(&described),
+            Some(described.name.as_str()),
+            "and it must be the LABEL, not the name — the pre-fix behaviour was `None`, which the \
+             runtime renders as the name"
+        );
+
+        // The SDK defaults `label` to the name (`cyrup-ext-sdk/src/descriptor.rs:113`), so an EMPTY
+        // label only reaches the host from a guest that sent one deliberately. `Tool::label`
+        // documents `None` as "fall back to the tool name"; `Some("")` would blank the UI row.
+        let blank = ToolDescriptor { label: String::new(), ..described };
+        assert_eq!(descriptor_label(&blank), None, "an empty label is the name fallback, not an empty row");
+    }
+
+    /// EXT-M03, the half the mapping test above CANNOT cover — and the half that was actually
+    /// broken.
+    ///
+    /// `descriptor_label` is a free function, so a test of it passes whether or not
+    /// `impl Tool for WasmTool` calls it: deleting the `fn label` override again would leave the
+    /// test above green while `Tool::label` silently returned the trait default. Constructing a
+    /// `WasmTool` to check the real vtable needs an `Arc<LiveExtension>` — a compiled component and
+    /// the `wasm32-wasip2` toolchain — which is precisely why the omission survived. So the
+    /// delegation is pinned at the source level instead, the same way `tests/wit_world_sync.rs`
+    /// pins the two `world.wit` copies.
+    ///
+    /// Generalised deliberately: every accessor listed here is descriptor-backed, and each one that
+    /// goes missing degrades to a trait default that a fixture leaving the field unset cannot tell
+    /// apart from a correct answer. `render_call`/`render_result` are NOT listed — a guest renderer
+    /// is routed by `has_renderer` through the registry's tool-renderer table, not off this impl.
+    #[test]
+    fn the_wasm_tool_impl_delegates_every_descriptor_backed_accessor() {
+        let src = include_str!("live.rs");
+        let block = src
+            .split_once("impl Tool for WasmTool {")
+            .map(|(_, rest)| rest.split("\n}\n").next().unwrap_or(rest))
+            .expect("`impl Tool for WasmTool` block present");
+
+        // Non-vacuity: prove the slice really is just that impl body. If the `\n}\n` split ever
+        // over-reads, the block would swallow the rest of the file and every assertion below would
+        // pass for the wrong reason. `impl Extension for LiveExtension` is the next item in the
+        // file, and `fn label(` genuinely does not appear in it.
+        assert!(
+            !block.contains("impl Extension for LiveExtension"),
+            "the extracted block over-ran the `impl Tool for WasmTool` body, so the assertions \
+             below would be vacuous"
+        );
+
+        for method in [
+            "fn name(",
+            "fn parameters(",
+            "fn execution_mode(",
+            "fn description(",
+            "fn label(",
+            "fn prompt_snippet(",
+            "fn prompt_guidelines(",
+            "fn render_kind(",
+            "fn constrained_sampling(",
+            "fn prepare_arguments(",
+            "fn execute(",
+        ] {
+            assert!(
+                block.contains(method),
+                "`impl Tool for WasmTool` no longer overrides `{method})` — a dropped delegation \
+                 falls through to the `Tool` trait default, which is indistinguishable from a \
+                 descriptor that left the field unset (EXT-M03; `label` was missing exactly this \
+                 way). Delete a line here only together with the reason it is no longer \
+                 descriptor-backed."
+            );
+        }
     }
 
     /// Closes the SDK gap this fix addresses: `ExecOptions::signal_id` (`cyrup-ext-sdk::descriptor`)

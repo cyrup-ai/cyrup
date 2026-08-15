@@ -238,7 +238,23 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 > 11 — which is how `SEAM-S01` escaped a full audit pass on 2026-08-07. One table now; `-S` ids keep
 > their suffix to mark provenance.
 
-> **RECOUNTED 2026-08-14 — counted set: 0 critical, 0 high, 14 medium, 20 low = 34.** 29 rows are now marked CLOSED. This area had no sweep-2 pass; see the reconciliation block above for the residuals other areas filed here.
+> **RECOUNTED 2026-08-14 (sweeps 3-6 reconciliation) — counted set: 0 critical, 0 high, 14 medium, 21 low = 35.** 36 rows are now marked CLOSED. `TUI-062` is new (filed by sweep 6 from another partition, partially closed). This area had no sweep-2 pass; see the reconciliation block above for the residuals other areas filed here.
+
+
+> **⚠ ROUTING — 2026-08-14 (sweeps 3-6 reconciliation). ELEVEN OPEN ROWS FILED IN OTHER AREA FILES HAVE THEIR FIX SITE IN `crates/cyrup-tui`.** Their ids stay in their own files (ids are never renumbered or moved) and they are **not counted here**, but a cyrup-tui assignment that ignores them will keep leaving the cheapest work in the backlog undone. Ranked by sweep 6's own assessment:
+>
+> | id (home file) | what is left, in cyrup-tui |
+> |---|---|
+> | **`CFG-038`** (05) | *Sweep 6 calls this the single highest-value unlanded item in area 05.* All four `merge_json` bodies in `src/keymap.rs` (`:597-604`, `:684-691`, `:787-794` and siblings) propagate `parse_key_values(&value)?` from **inside** the entry loop, so one typo'd key spec aborts the load AFTER earlier entries were applied — and `crates/cyrup/src/main.rs:1624-1629` then prints "ignoring {path}", which is false. ~30 lines + one test: skip-and-continue per entry with a collected failure list, returned from `App::load_keybindings_json`, named by `main.rs`. The whole-document error must survive ONLY for `keybindings_object`. |
+> | **`EXT-013`** (06) | One line: `src/commands.rs:348` hard-codes `has_arg_completion: false`. The cyrup-ext side (`facade.rs::command_completions`, `host/live.rs::argument_completions`) already exists and works. |
+> | **`TOOL-015` / `TOOL-022`** (04) | The producer half is done in cyrup-tools and cyrup-ext; **nothing in cyrup-tui branches on `Tool::render_kind()`** (`grep -rn render_kind crates` → zero consuming sites). Wire the transcript's per-tool render dispatch so `SelfRendered` suppresses the generic frame. Needs cyrup-tui + cyrup-core. |
+> | **`CFG-045`** (05) | The `Action::Interrupt` arm in `src/app.rs` plus a `last_escape_time` field (pi `interactive-mode.ts:2570-2596`). |
+> | **`CFG-051`** (05) | The residual is a rendered-transcript assertion in `crates/cyrup-tui/tests/` plus a live-terminal confirmation; the push and the string are landed and unit-tested. |
+> | **`CFG-014` / `CFG-015`** (05) | The consumer halves of `show_cache_miss_notices`, `code_block_indent`, `last_changelog_version`, `collapse_changelog`, `npm_command`. The accessors exist; **landing accessors alone is the "a /settings row is not a consumer" failure.** |
+> | **`TOOL-017`** (04) | The `docs` classification arm — but a **product decision comes first**: cyrup has no decided shipped-docs root for `getPiDocsClassification`. Blocker recorded in-source at `src/transcript.rs:2305`. |
+> | **`EXT-041` / `EXT-053`** (06) | Replay/draw path; autocomplete shadowing diagnostic. |
+> | **`TUI-062`** (this file) | The wrong `showWarning` cite at `src/transcript.rs:2965-2971` and the prefix-location design question. |
+
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
@@ -312,6 +328,7 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-S10 | low | not-ported | S | Shift+Ctrl+D global debug chord absent — `/debug` reachable only by typing into the editor |
 | TUI-056 | low | parity-bug | S | The context-usage meter resets to `0.0%` after an aborted turn while the conversation is still in the transcript — **new, observed 2026-08-13** |
 | TUI-057 | low | port-divergence | M | Slash-command palette submission is inconsistent — sometimes one Enter, sometimes two, sometimes a trailing space suppresses it — **new, observed 2026-08-13, low confidence** |
+| TUI-062 | low — **PARTIALLY CLOSED 2026-08-14** | parity-bug | S | `showWarning`'s `Warning: ` prefix lives INSIDE pi's function but OUTSIDE cyrup's renderer, making it a per-caller obligation that one of three callers had dropped — **FILED AND PARTIALLY CLOSED 2026-08-14 (sweep 6, found while fixing `CFG-051`; the work was done from another partition and the design half belongs to whoever owns cyrup-tui).** pi's `showWarning` builds `Warning: ${warningMessage}` inside the function (`interactive-mode.ts:3885-3889` @v0.83.0), while cyrup's `Entry::Warning` renders its text **verbatim**, so every cyrup caller must supply the prefix. Two of three did (`app.rs:3626`, `:7821`); `main.rs`'s `modelFallbackMessage` push did not, so **a credential-less first run rendered a bare "No models available…" where pi renders "Warning: No models available…"**. That call site is fixed. **RESIDUAL, two halves, both cyrup-tui's:** (a) the in-tree citation at `crates/cyrup-tui/src/transcript.rs:2965-2971` cites `interactive-mode.ts:3956-3960` for `showWarning`; at v0.83.0 it is `:3885-3889` — a wrong cite of the version-lag kind, uncorrected; (b) the DESIGN question — prefix in the renderer (pi's shape, one place) vs. at each caller (cyrup's current shape, N places, already broken once). **This is the general class "a mechanism ported one level up or down, so the invariant quietly becomes optional"** — see the JS→Rust register in `00-residual-ledger.md`. |
 
 ## TUI-042 — The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message
 

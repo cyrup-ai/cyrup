@@ -4,7 +4,8 @@
 //! `fd`/`rg` binaries from `tools/` to `bin/`, rename legacy keybinding ids in
 //! `<agent_dir>/keybindings.json`, migrate a `commands/` resource dir to `prompts/`, and
 //! collect deprecation warnings for legacy `hooks/`/`tools/` dirs (surfaced in interactive mode by
-//! [`format_deprecation_warnings`], Pi `showDeprecationWarnings`, migrations.ts:265-289).
+//! [`show_deprecation_warnings`], Pi `showDeprecationWarnings`, migrations.ts:277-298 @v0.83.0 —
+//! which BLOCKS startup on a keypress, so the notice cannot be painted over by the first TUI frame).
 //!
 //! Each step is best-effort and never fatal — a malformed/locked file is skipped exactly as Pi's
 //! `try { … } catch {}` arms do. The keybindings step is Pi's `migrateKeybindingsConfigFile()`
@@ -32,7 +33,9 @@ pub struct MigrationResult {
 pub fn run_migrations(dirs: &ConfigDirs) -> MigrationResult {
     let migrated_auth_providers = migrate_auth_to_auth_json(&dirs.agent_dir);
     migrate_sessions_from_agent_root(&dirs.agent_dir);
-    migrate_tools_to_bin(&dirs.agent_dir, &dirs.bin_dir());
+    // Pi discards the return too (`migrateToolsToBin();`, migrations.ts:311) — the notice is the
+    // whole observable effect, and it is emitted inside the callee.
+    let _moved_binaries = migrate_tools_to_bin(&dirs.agent_dir, &dirs.bin_dir());
     // migrations.ts:312 — between `migrateToolsToBin()` (`:311`) and `migrateExtensionSystem()`
     // (`:313`). Every failure mode is swallowed inside the callee, as Pi's `try { … } catch {}` does.
     cyrup_config::migrate_keybindings_config_file(&dirs.agent_dir);
@@ -173,12 +176,20 @@ fn migrate_sessions_from_agent_root(agent_dir: &Path) {
 }
 
 /// Move managed `fd`/`rg` binaries from `tools/` to `bin/` (Pi `migrateToolsToBin`,
-/// migrations.ts:175-220).
-fn migrate_tools_to_bin(agent_dir: &Path, bin_dir: &Path) {
+/// migrations.ts:177-216 @v0.83.0).
+///
+/// Returns Pi's `movedAny` (`:185`, set at `:198`) so the caller — and a test — can see whether the
+/// filesystem changed. On `true` the notice at `:213-215` is emitted, routed through the stdout
+/// guard exactly like the sibling `commands/ → prompts/` line: `console.log` under Pi's
+/// `takeOverStdout` reaches stderr during a PRINT/JSON/RPC run, so it cannot corrupt the
+/// machine-readable stream. **A "target already exists" delete is NOT a move** (`:203-208` sets the
+/// flag only on `renameSync`), so a second run after a successful migration says nothing (CFG-050).
+fn migrate_tools_to_bin(agent_dir: &Path, bin_dir: &Path) -> bool {
     let tools_dir = agent_dir.join("tools");
     if !tools_dir.exists() {
-        return;
+        return false;
     }
+    let mut moved_any = false;
     for bin in ["fd", "rg", "fd.exe", "rg.exe"] {
         let old_path = tools_dir.join(bin);
         let new_path = bin_dir.join(bin);
@@ -188,11 +199,15 @@ fn migrate_tools_to_bin(agent_dir: &Path, bin_dir: &Path) {
             }
             if new_path.exists() {
                 let _ = std::fs::remove_file(&old_path);
-            } else {
-                let _ = std::fs::rename(&old_path, &new_path);
+            } else if std::fs::rename(&old_path, &new_path).is_ok() {
+                moved_any = true;
             }
         }
     }
+    if moved_any {
+        crate::output_guard::emit_stray_line("Migrated managed binaries tools/ → bin/");
+    }
+    moved_any
 }
 
 /// Migrate a `commands/` resource dir to `prompts/` for global + project bases, then collect
@@ -257,9 +272,72 @@ fn check_deprecated_extension_dirs(base_dir: &Path, label: &str) -> Vec<String> 
     warnings
 }
 
+/// Pi `showDeprecationWarnings(warnings)` (migrations.ts:277-298 @v0.83.0) in full: print the
+/// warning block, print `Press any key to continue...`, then **block startup** until a key arrives,
+/// and finish with a blank line (`console.log()`, `:297`).
+///
+/// The gate is the point of the function. These warnings are the only signal that a legacy `hooks/`
+/// or custom `tools/` directory has stopped being loaded — i.e. that every extension in it is now
+/// silently doing nothing — and pi deliberately refuses to proceed until the user has seen them
+/// (awaited from `main.ts:838-840`, BEFORE the interactive UI takes the terminal). cyrup printed the
+/// same text microseconds before the first TUI frame painted over it (CFG-049).
+///
+/// Returns immediately when there is nothing to show, exactly like Pi's `if (warnings.length === 0)
+/// return;` (`:278`) — so the common startup pays nothing.
+///
+/// **[CYRUP-DELTA]** on EOF: `process.stdin.once("data")` never fires when stdin is already closed,
+/// so upstream hangs forever on a piped/closed stdin. A zero-length read returns here instead. The
+/// same input reaches this function only in interactive mode, where a closed stdin means there is no
+/// one to press a key.
+pub fn show_deprecation_warnings(warnings: &[String]) {
+    let text = deprecation_gate_block(warnings);
+    if text.is_empty() {
+        return;
+    }
+    // cyrup writes the block to stderr rather than Pi's `console.log`, which is the pre-existing
+    // choice at this call site and the safe one: stdout may be a protocol stream.
+    eprint!("{text}");
+    wait_for_any_key();
+    // `console.log()` (`:297`) — one blank line once the key has been pressed.
+    eprintln!();
+}
+
+/// Everything [`show_deprecation_warnings`] writes BEFORE it blocks: the warning block
+/// (migrations.ts:280-285) plus the prompt line (`:286`). Split out so a test can pin the strings —
+/// the block itself cannot be asserted through the wait, and a test must never drive
+/// [`wait_for_any_key`], which would hang the suite on a terminal stdin.
+fn deprecation_gate_block(warnings: &[String]) -> String {
+    let text = format_deprecation_warnings(warnings);
+    if text.is_empty() {
+        return text;
+    }
+    // `console.log(chalk.dim("\nPress any key to continue..."))` (`:286`) — a leading blank line,
+    // then the prompt, then `console.log`'s own newline.
+    format!("{text}\nPress any key to continue...\n")
+}
+
+/// Pi's `await new Promise(resolve => { process.stdin.setRawMode?.(true); process.stdin.resume();
+/// process.stdin.once("data", () => { process.stdin.setRawMode?.(false); process.stdin.pause();
+/// resolve(); }); })` (migrations.ts:288-296 @v0.83.0).
+///
+/// Raw mode is what makes it "any key" rather than "Enter"; `setRawMode?.` is an OPTIONAL call
+/// upstream — undefined on a non-TTY — so a failure to enter raw mode is ignored here too, and the
+/// read simply becomes line-buffered on that stdin. Raw mode is always restored, including on a read
+/// error, because leaving it on would hand the user a terminal that echoes nothing.
+fn wait_for_any_key() {
+    use std::io::Read as _;
+    let raw = cyrup_tui::crossterm::terminal::enable_raw_mode().is_ok();
+    let mut byte = [0u8; 1];
+    let _ = std::io::stdin().read(&mut byte);
+    if raw {
+        let _ = cyrup_tui::crossterm::terminal::disable_raw_mode();
+    }
+}
+
 /// Format the deprecation warnings for interactive display (Pi `showDeprecationWarnings`,
-/// migrations.ts:265-289) — minus the keypress wait (handled by the interactive front-end). Returns
-/// an empty string when there are no warnings.
+/// migrations.ts:277-286 @v0.83.0) — the TEXT half only; [`show_deprecation_warnings`] is the whole
+/// function, including the keypress gate at `:286-297`. Returns an empty string when there are no
+/// warnings.
 pub fn format_deprecation_warnings(warnings: &[String]) -> String {
     if warnings.is_empty() {
         return String::new();
@@ -437,6 +515,74 @@ mod tests {
         let formatted = format_deprecation_warnings(&result.deprecation_warnings);
         assert!(formatted.contains("Warning:"));
         assert!(formatted.contains("extensions/ directory"));
+    }
+
+    /// CFG-049 — Pi's `showDeprecationWarnings` does not just print: it prints `Press any key to
+    /// continue...` (migrations.ts:286) and then blocks startup until a key arrives (`:288-296`),
+    /// awaited from `main.ts:838-840` BEFORE the interactive UI takes the terminal.
+    ///
+    /// RED before this pass: `grep -rn 'Press any key' crates` returned ZERO hits workspace-wide —
+    /// cyrup's `main.rs` printed the warning text and fell straight into TUI init, so the first
+    /// frame painted over the only notice that a legacy `hooks/` dir has stopped loading.
+    ///
+    /// This pins the text and the early return. The BLOCK itself is deliberately not driven from a
+    /// test: `wait_for_any_key` reads stdin, and a test harness whose stdin is a terminal would hang
+    /// the suite. It needs the live-terminal run the item's Verify calls for.
+    #[test]
+    fn the_deprecation_gate_prints_pis_prompt_and_is_free_when_there_is_nothing_to_show() {
+        assert_eq!(
+            deprecation_gate_block(&[]),
+            "",
+            "no warnings must not reach the keypress gate (Pi `:278`)"
+        );
+        // The early return is what makes `show_deprecation_warnings` safe to call unconditionally.
+        show_deprecation_warnings(&[]);
+
+        let block = deprecation_gate_block(&["Global hooks/ directory found.".to_string()]);
+        assert!(block.contains("Warning: Global hooks/ directory found."));
+        assert!(block.contains("Move your extensions to the extensions/ directory."));
+        assert!(
+            block.ends_with("\nPress any key to continue...\n"),
+            "the prompt is the LAST thing written before the block, got {block:?}"
+        );
+    }
+
+    /// CFG-050 — Pi's `migrateToolsToBin` tracks `movedAny` (migrations.ts:185, set at `:198`) and
+    /// announces the move at `:213-215`. cyrup moved the binaries silently, so a user pointing a
+    /// script or a `PATH` entry at `~/.cyrup/agent/tools/rg` found it gone with nothing said.
+    ///
+    /// RED before this pass: `migrate_tools_to_bin` returned `()` and emitted nothing at all.
+    /// The three assertions are Pi's three states: a real move (notice), a re-run with nothing left
+    /// to move (silence), and a collision-only pass — `rmSync` on the stale source, which Pi does
+    /// NOT count as a move (`:203-208`), so it must stay silent too.
+    #[test]
+    fn announces_a_managed_binary_move_exactly_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        let tools = d.agent_dir.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::fs::write(tools.join("rg"), b"#!/bin/sh\n").unwrap();
+
+        assert!(
+            migrate_tools_to_bin(&d.agent_dir, &d.bin_dir()),
+            "a successful rename is Pi's `movedAny = true`"
+        );
+        assert!(d.bin_dir().join("rg").exists());
+        assert!(!tools.join("rg").exists());
+
+        assert!(
+            !migrate_tools_to_bin(&d.agent_dir, &d.bin_dir()),
+            "nothing left in tools/ — Pi says nothing on the second run"
+        );
+
+        // Both copies present: Pi deletes the stale source WITHOUT setting `movedAny`.
+        std::fs::write(tools.join("rg"), b"#!/bin/sh\n").unwrap();
+        assert!(
+            !migrate_tools_to_bin(&d.agent_dir, &d.bin_dir()),
+            "a collision delete is not a move"
+        );
+        assert!(!tools.join("rg").exists(), "the stale source is still removed");
+        assert!(d.bin_dir().join("rg").exists());
     }
 
     /// CFG-048 — Pi's FIFTH `runMigrations` call (`migrations.ts:312`, between `migrateToolsToBin()`

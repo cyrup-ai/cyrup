@@ -291,6 +291,25 @@ async fn absent_optional_fields_are_served_and_relayed_verbatim() {
     plain.assert_alive("a `message_receipt` with `detail` absent").await;
 
     // The relay half: every optional field set to a well-typed value, plus an unmodelled key.
+    //
+    // `supersedes` cannot be filled in with an arbitrary id. The broker enforces pi's supersede
+    // legality rule — the superseded id must name a message THIS sender previously had delivered to
+    // THIS receiver, else `delivery_failed "Supersede target does not match a previous message from
+    // this sender to this receiver"` (`v0.10.1 broker/broker.ts:524-534`, ported at
+    // `broker/mod.rs:1248-1266`). This test predates that port and set `"supersedes": "m0"` with no
+    // `m0` ever sent, so once the rule landed the envelope below was refused and the `delivered`
+    // frame never came. Send a real `m0` first: that records the receipt route and makes the
+    // supersede legal, which is what "every optional field set to a WELL-TYPED value" has to mean
+    // for a field whose validity depends on prior traffic.
+    let earlier = serde_json::json!({
+        "id": "m0",
+        "timestamp": 1_699_999_999_000_u64,
+        "content": { "text": "first" },
+    });
+    alpha.send(&serde_json::json!({ "type": "send", "to": "beta-session", "message": earlier })).await;
+    assert_eq!(alpha.expect_frame("delivered").await["messageId"], "m0");
+    assert_eq!(beta.expect_frame("message").await["message"]["id"], "m0");
+
     let sent = serde_json::json!({
         "id": "m-good",
         "timestamp": 1_700_000_000_000_u64,
@@ -540,3 +559,4 @@ async fn the_client_survives_absent_optional_fields() {
         );
     }
 }
+

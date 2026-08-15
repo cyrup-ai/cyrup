@@ -226,13 +226,23 @@ async fn a_serviced_request_leaves_the_auto_approved_and_approved_entries() {
 /// `permission_forwarding.warning` (pi `logPermissionForwardingWarning`, v0.8.0 `index.ts:1149-1151`)
 /// and then deleted.
 ///
-/// The malformed sibling is asserted here too, and it asserts the OPPOSITE: an unparseable request
-/// is deleted with NO entry at all. That is upstream's actual shape — `if (!request) {
-/// safeDeleteFile(...); continue; }` at `index.ts:1144-1147` has no `logPermissionForwardingWarning`
-/// above it, unlike every branch below it. Pinning the silence stops a future pass from "improving"
-/// the trail into a divergence.
+/// The malformed sibling is asserted here too, and **this assertion was inverted until 2026-08-14**.
+///
+/// The previous version of this test pinned SILENCE for an unparseable request, reasoning that
+/// `if (!request) { safeDeleteFile(...); continue; }` (v0.8.0 `index.ts:1144-1147`) carries no
+/// `logPermissionForwardingWarning` above it, unlike every branch below it. That reading of the
+/// CALLER is correct and the conclusion drawn from it is not: upstream raises the entry one frame
+/// down, inside `readForwardedPermissionRequest` itself — `Failed to read forwarded permission
+/// request '${filePath}'` in its `catch` (`:942`) and `Ignoring invalid forwarded permission
+/// request format in '${filePath}'` when the field ladder rejects well-formed JSON (`:928`). A
+/// non-JSON request file therefore DOES warn upstream, and cyrup's silence was the divergence the
+/// old assertion had frozen in place.
+///
+/// It is left as a two-request test precisely because the ORDER matters: cyrup reads and services
+/// each request in one sorted pass, so `broken.json` produces its reader warning before
+/// `elsewhere.json` produces its off-session warning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_off_session_request_warns_while_a_malformed_one_is_deleted_silently() {
+async fn an_off_session_request_and_a_malformed_one_each_warn() {
     let agent_dir = tempfile::tempdir().expect("tempdir");
     let logs_dir = agent_dir.path().join("logs");
     let audit = AuditTrail::detached(logs_dir.clone());
@@ -275,18 +285,240 @@ async fn an_off_session_request_warns_while_a_malformed_one_is_deleted_silently(
     let names = events(&logs_dir);
     assert_eq!(
         names,
-        vec!["permission_forwarding.warning".to_string()],
-        "exactly ONE entry: the off-session warning. The malformed request is upstream-silent."
+        vec![
+            "permission_forwarding.warning".to_string(),
+            "permission_forwarding.warning".to_string()
+        ],
+        "TWO warnings: the reader's for `broken.json`, then the loop's for `elsewhere.json`"
     );
     let all = entries(&logs_dir);
-    let warning = record(&all, "permission_forwarding.warning");
+    let messages: Vec<&str> = all
+        .iter()
+        .filter(|(_, event, _)| event == "permission_forwarding.warning")
+        .filter_map(|(_, _, value)| value["message"].as_str())
+        .collect();
+
+    // The reader's entry, upstream `index.ts:942`. Non-JSON bytes land in pi's `catch`, so this is
+    // the "Failed to read" wording and it carries the parse error as its cause — NOT the
+    // "Ignoring invalid … format" wording, which is reserved for well-formed JSON of the wrong
+    // shape (`:928`, exercised by `a_structurally_invalid_request_warns_about_its_format`).
     assert!(
-        warning["message"].as_str().is_some_and(|m| m.contains("req-elsewhere")
-            && m.contains("some-other-parent")),
-        "the warning must name the request and the session it was addressed to: {warning}"
+        messages[0].starts_with("Failed to read forwarded permission request '")
+            && messages[0].contains("broken.json"),
+        "the malformed request must be reported by the reader: {:?}",
+        messages[0]
+    );
+    let broken_entry = &all[0].2;
+    assert!(
+        broken_entry["error"].as_str().is_some_and(|e| !e.is_empty()),
+        "pi passes the caught error to this call site, so the entry carries a cause: {broken_entry}"
+    );
+
+    // The loop's entry, upstream `index.ts:1149-1151`.
+    assert!(
+        messages[1].contains("req-elsewhere") && messages[1].contains("some-other-parent"),
+        "the off-session warning must name the request and the session it was addressed to: {:?}",
+        messages[1]
+    );
+    assert!(
+        all[1].2.get("error").is_none(),
+        "pi passes NO error to the off-session call site, so the key is ABSENT: {}",
+        all[1].2
     );
 
     // Both files are consumed either way — a request that cannot be serviced never lingers.
     assert!(!broken.exists(), "a malformed request is deleted");
     assert!(!elsewhere.exists(), "an off-session request is deleted");
+}
+
+/// The reader's OTHER entry: well-formed JSON whose fields fail the shape ladder is reported as
+/// `Ignoring invalid forwarded permission request format in '<path>'` (v0.8.0 `index.ts:928`) —
+/// a DIFFERENT message from the unparseable case above, and one upstream raises with **no** cause
+/// attached, because at that point it is holding a parsed object and not an error.
+///
+/// The two are kept in separate tests because collapsing them is exactly the mistake a Rust port
+/// invites: `serde_json::from_str::<T>` fails identically for "not JSON" and "JSON of the wrong
+/// shape", so a single `.ok()?` would have produced one message for both and matched neither
+/// upstream site faithfully.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_structurally_invalid_request_warns_about_its_format() {
+    let agent_dir = tempfile::tempdir().expect("tempdir");
+    let logs_dir = agent_dir.path().join("logs");
+    let audit = AuditTrail::detached(logs_dir.clone());
+    let session_id = "parent-session-shape";
+    let location = forwarding_location(agent_dir.path(), session_id).expect("derives a location");
+    for dir in [&location.session_root, &location.requests_dir, &location.responses_dir] {
+        std::fs::create_dir_all(dir).expect("creates the spool dirs");
+    }
+    // Valid JSON, valid object, every field the right TYPE — and `message` simply absent. This is
+    // upstream's `typeof parsed.message !== "string"` leg and nothing else.
+    let shaped = location.requests_dir.join("shaped.json");
+    std::fs::write(
+        &shaped,
+        serde_json::json!({
+            "id": "req-shape",
+            "responseNonce": "nonce-3",
+            "createdAt": 1_i64,
+            "requesterSessionId": "child-session",
+            "targetSessionId": session_id,
+            "requesterAgentName": "coder"
+        })
+        .to_string(),
+    )
+    .expect("writes");
+
+    let services: Arc<dyn HostServices> = Arc::new(SessionOnlyServices(session_id.to_string()));
+    process_forwarded_requests(
+        agent_dir.path(),
+        session_id,
+        &services,
+        &ExtensionConfig::default(),
+        ProcessForwardedOptions::preserve_location(),
+        &audit,
+        true,
+    )
+    .await;
+
+    let all = entries(&logs_dir);
+    assert_eq!(
+        events(&logs_dir),
+        vec!["permission_forwarding.warning".to_string()],
+        "exactly one entry, from the reader"
+    );
+    let warning = &all[0].2;
+    let message = warning["message"].as_str().unwrap_or_default();
+    assert!(
+        message.starts_with("Ignoring invalid forwarded permission request format in '")
+            && message.contains("shaped.json"),
+        "a shape failure must use upstream's FORMAT wording, not the read wording: {message:?}"
+    );
+    assert!(
+        warning.get("error").is_none(),
+        "upstream passes no cause at `:928`, so the key is ABSENT: {warning}"
+    );
+    assert!(!shaped.exists(), "an unusable request is still consumed");
+}
+
+/// The two response-binding rejections, upstream `isForwardedPermissionResponseBoundToRequest`
+/// (v0.8.0 `index.ts:890` and `:894`). cyrup dropped BOTH: a forged or misaddressed response was
+/// discarded in silence, leaving only the `response_received` review entry with every field null —
+/// enough for an operator to notice that something arrived, not enough to say what was wrong with
+/// it, which is the whole point of a security trail.
+///
+/// Driven end to end rather than against the private predicate: the request id and nonce are read
+/// back out of the spool the waiter actually wrote, so the forged responses differ from a genuine
+/// one in exactly one field each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_and_a_misaddressed_response_are_each_named_in_the_trail() {
+    let agent_dir = tempfile::tempdir().expect("tempdir");
+    let logs_dir = agent_dir.path().join("logs");
+    let audit = Arc::new(AuditTrail::detached(logs_dir.clone()));
+    let target = "parent-session-binding";
+    let location = forwarding_location(agent_dir.path(), target).expect("derives a location");
+
+    let waiter = {
+        let root = agent_dir.path().to_path_buf();
+        let audit = Arc::clone(&audit);
+        tokio::spawn(async move {
+            wait_for_forwarded_approval(
+                &root,
+                "parent-session-binding",
+                "child-session",
+                "coder",
+                "run bash?",
+                // Generous, because the test never relies on it expiring — the final GOOD response
+                // is what ends the wait. It exists only so a broken build fails instead of hanging.
+                Duration::from_secs(20),
+                &audit,
+            )
+            .await
+        })
+    };
+
+    // The waiter names its own request; read it back rather than guessing the uuid.
+    let request = loop {
+        if let Ok(read_dir) = std::fs::read_dir(&location.requests_dir)
+            && let Some(path) = read_dir
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .find(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+            && let Some(request) = cyrup_permission_system_request(&path)
+        {
+            break request;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let request_id = request.0;
+    let nonce = request.1;
+    let response_path = location.responses_dir.join(format!("{request_id}.json"));
+
+    let respond = |nonce: &str, responder: &str, approved: bool| {
+        std::fs::write(
+            &response_path,
+            serde_json::json!({
+                "requestId": request_id.clone(),
+                "responseNonce": nonce,
+                "approved": approved,
+                "state": "approved",
+                "responderSessionId": responder,
+                "respondedAt": 1_i64,
+            })
+            .to_string(),
+        )
+        .expect("writes a response");
+    };
+    // The waiter CONSUMES each response file it reads (pi `:1066`), so the file vanishing is the
+    // handshake that says "this one has been judged" — no sleeps, no margins.
+    async fn until_consumed(path: &Path) {
+        while path.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    // 1. Right request id, WRONG nonce → "is not bound to request".
+    respond("forged-nonce", target, true);
+    until_consumed(&response_path).await;
+    // 2. Right nonce, WRONG responder session → "does not match target session".
+    respond(&nonce, "some-other-session", true);
+    until_consumed(&response_path).await;
+    // 3. Genuine, which ends the wait.
+    respond(&nonce, target, true);
+
+    let decision = waiter.await.expect("the waiter task completes");
+    assert!(decision.approved, "the third, genuine response must be honoured");
+
+    let all = entries(&logs_dir);
+    let warnings: Vec<&str> = all
+        .iter()
+        .filter(|(_, event, _)| event == "permission_forwarding.warning")
+        .filter_map(|(_, _, value)| value["message"].as_str())
+        .collect();
+    assert_eq!(warnings.len(), 2, "exactly one warning per rejected response: {warnings:?}");
+    assert!(
+        warnings[0].contains("is not bound to request")
+            && warnings[0].contains(&request_id)
+            && warnings[0].contains("Ignoring forwarded permission response '"),
+        "the nonce mismatch must be reported as an unbound response: {:?}",
+        warnings[0]
+    );
+    assert!(
+        warnings[1].contains("does not match target session")
+            && warnings[1].contains("some-other-session")
+            && warnings[1].contains(target),
+        "the responder mismatch must name BOTH sessions: {:?}",
+        warnings[1]
+    );
+    // Presence-before-absence: the review entry for every observed response is still written, so
+    // the two warnings are an ADDITION to the trail, not a replacement for it.
+    assert_eq!(
+        all.iter().filter(|(_, e, _)| e == "forwarded_permission.response_received").count(),
+        3,
+        "all three response files are still recorded as received"
+    );
+}
+
+/// `(id, responseNonce)` of a request file, or `None` while it is still being written.
+fn cyrup_permission_system_request(path: &Path) -> Option<(String, String)> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    Some((value["id"].as_str()?.to_string(), value["responseNonce"].as_str()?.to_string()))
 }

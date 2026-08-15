@@ -407,25 +407,76 @@ pub async fn resolve_credential_for_print(
         cyrup_config::provider_is_configured(&auth, &models_json, &m.provider, None)
     };
 
-    // Pi's two branches: an explicit `--provider` resolves exactly one model (an error is fatal);
-    // otherwise every provider that HAS a stored credential is tried and ambiguity is reported.
+    // Pi's `--provider` value is the TRIMMED one `validateAuthCommandArgs` returns
+    // (`auth-command.ts:97-98` @v0.84.1: `args.provider?.trim() || undefined`), and
+    // `resolveCredentialForPrint` destructures exactly that (`credential-print.ts:24`) — so a
+    // `--provider " acme "` must resolve, not miss.
+    let explicit_provider = cli
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty());
+
+    // Pi's two branches: an explicit `--provider` names ONE provider; otherwise every provider that
+    // HAS a stored credential is tried and ambiguity is reported.
     let mut models: Vec<Model> = Vec::new();
-    if let Some(provider) = cli.provider.as_deref() {
-        let resolved = cyrup_config::resolve_cli_model(
-            Some(provider),
-            cli.model.as_deref(),
-            None,
-            &all,
-            &has_configured_auth,
-        );
-        match (resolved.error, resolved.model) {
-            (Some(error), _) => return Err(CredentialPrintError::msg(error)),
-            (None, None) => {
-                return Err(CredentialPrintError::msg(
-                    "Unable to resolve the requested provider/model",
-                ));
+    if let Some(provider) = explicit_provider {
+        // Pi `credential-print.ts:29-32` @v0.84.1 — the provider must EXIST first, and its absence
+        // is its own message. cyrup had no such check: an unknown `--provider` fell into
+        // `resolve_cli_model` and came back as the generic "Unable to resolve the requested
+        // provider/model", so `--list-models` was never suggested.
+        if !registry
+            .get_providers()
+            .iter()
+            .any(|p| p.id().as_str() == provider)
+        {
+            return Err(CredentialPrintError::msg(format!(
+                "Unknown provider \"{provider}\". Use --list-models to see available providers."
+            )));
+        }
+        match cli.model.as_deref().map(str::trim).filter(|m| !m.is_empty()) {
+            // Pi `:33-38` — a `--model` alongside `--provider` must resolve, and a failure is fatal.
+            Some(model_pattern) => {
+                let resolved = cyrup_config::resolve_cli_model(
+                    Some(provider),
+                    Some(model_pattern),
+                    None,
+                    &all,
+                    &has_configured_auth,
+                );
+                match (resolved.error, resolved.model) {
+                    (Some(error), _) => return Err(CredentialPrintError::msg(error)),
+                    (None, None) => {
+                        return Err(CredentialPrintError::msg(
+                            "Unable to resolve the requested provider/model",
+                        ));
+                    }
+                    (None, Some(model)) => models.push(model),
+                }
             }
-            (None, Some(model)) => models.push(model),
+            // Pi `:39-40` — `providers.push({ id: provider.id })`: the provider is exported with NO
+            // model, and the credential is fetched with `getAuth(provider.id, …)` (`:66`).
+            //
+            // THIS BRANCH DID NOT EXIST. cyrup passed `cli.model` (here `None`) straight into
+            // `resolve_cli_model` and turned its empty result into a hard "Unable to resolve the
+            // requested provider/model" — so `cyrup auth print-api-key --provider acme` errored
+            // where pi prints the credential. SEAM-050 had already relaxed
+            // `validate_credential_print_args` to pi's provider-OR-model rule (see its doc comment,
+            // which names this exact invocation), but the RESOLVER was never given the matching
+            // branch, so the rejection simply moved from the validator to here and the fix read as
+            // complete. Found by running `cyrup-it`'s `bin` target, which is `required-features =
+            // ["it"]` and therefore never runs in the merge gate.
+            //
+            // cyrup resolves auth through a `&Model`, so a provider with no model needs a
+            // representative one — the same stand-in `run_auth_check` already uses for pi's
+            // `getAuth(provider)` (see its tiers 6-7). A provider with an empty catalog leaves
+            // `models` empty and falls through to the no-usable-credential branch below, which
+            // still names the provider via `explicit_provider`.
+            None => {
+                if let Some(model) = all.iter().find(|m| m.provider.as_str() == provider) {
+                    models.push(model.clone());
+                }
+            }
         }
     } else {
         for provider in registry.get_providers() {
@@ -516,11 +567,18 @@ pub async fn resolve_credential_for_print(
         return Ok(value.clone());
     }
     if credentials.is_empty() {
-        let provider_id = models.first().map(|m| m.provider.as_str().to_string());
+        // Pi `providers[0]?.id` (`credential-print.ts:73`). In the model-less `--provider` branch
+        // pi's `providers[0]` is `{ id: provider.id }`, so the id is present even with no model —
+        // `explicit_provider` is what keeps the two typed messages below reachable when the named
+        // provider has an empty catalog and `models` is therefore empty.
+        let provider_id = models
+            .first()
+            .map(|m| m.provider.as_str().to_string())
+            .or_else(|| explicit_provider.map(str::to_string));
         let stored = provider_id
             .as_deref()
             .and_then(|p| credential_types.get(p).copied());
-        if let Some(provider_id) = provider_id.filter(|_| cli.provider.is_some()) {
+        if let Some(provider_id) = provider_id.filter(|_| explicit_provider.is_some()) {
             if kind == CredentialPrintKind::ApiKey && stored == Some(CredentialType::Oauth) {
                 return Err(CredentialPrintError::msg(format!(
                     "Provider \"{provider_id}\" is configured with OAuth, not an API key"

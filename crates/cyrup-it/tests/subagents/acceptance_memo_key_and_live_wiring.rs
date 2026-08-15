@@ -44,7 +44,7 @@ use std::path::{Path, PathBuf};
 use tokio::sync::Mutex;
 
 use cyrup_core::{CancelToken, Content, ModelId, Tool, ToolCallId};
-use cyrup_ext_subagents::artifacts::temp_artifacts_dir;
+use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::background::atomic::write_atomic_json;
 use cyrup_ext_subagents::background::runner_main::{RunnerConfig, run};
 use cyrup_ext_subagents::background::{RunId, RunMode, RunPaths};
@@ -624,7 +624,14 @@ async fn the_subagent_tools_single_run_memoizes_its_verify_commands_under_the_ru
         std::env::set_var("CYRUP_HOME", home_dir.path());
     }
 
-    let art_dir = temp_artifacts_dir(work_dir.path());
+    // `project_artifacts_dir`, NOT `temp_artifacts_dir`: `ArtifactDirPreference::default()` is
+    // `Project` — pi's `DEFAULT_ARTIFACT_CONFIG.dir = "project"` (`src/shared/types.ts:1796-1798`
+    // @v0.43.0) — so a subagent-tool run with the default config writes
+    // `<cwd>/.cyrup-subagents/artifacts`. SUBA-048 moved that default onto pi's and these two
+    // sites were never updated: the presence assertion below went red, and the sibling
+    // `artifacts_false_...` ABSENCE assertion went vacuous — it was looking in a directory the
+    // run would not have written to even with artifacts enabled.
+    let art_dir = project_artifacts_dir(work_dir.path());
     let extension = SubagentsExtension::with_config_and_cwd(
         SubagentExtensionConfig::default(),
         work_dir.path().to_path_buf(),
@@ -724,7 +731,14 @@ async fn artifacts_false_disarms_verify_memoization_along_with_the_quadruple() {
         std::env::set_var("CYRUP_HOME", home_dir.path());
     }
 
-    let art_dir = temp_artifacts_dir(work_dir.path());
+    // `project_artifacts_dir`, NOT `temp_artifacts_dir`: `ArtifactDirPreference::default()` is
+    // `Project` — pi's `DEFAULT_ARTIFACT_CONFIG.dir = "project"` (`src/shared/types.ts:1796-1798`
+    // @v0.43.0) — so a subagent-tool run with the default config writes
+    // `<cwd>/.cyrup-subagents/artifacts`. SUBA-048 moved that default onto pi's and these two
+    // sites were never updated: the presence assertion below went red, and the sibling
+    // `artifacts_false_...` ABSENCE assertion went vacuous — it was looking in a directory the
+    // run would not have written to even with artifacts enabled.
+    let art_dir = project_artifacts_dir(work_dir.path());
     let extension = SubagentsExtension::with_config_and_cwd(
         SubagentExtensionConfig::default(),
         work_dir.path().to_path_buf(),
@@ -828,6 +842,7 @@ fn runner_config(
         steps: vec![RunnerStep::SingleStep(step)],
         cwd: dir.to_path_buf(),
         session_file: None,
+        session_id: None,
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,

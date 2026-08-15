@@ -22,7 +22,7 @@ use crate::config::InboundTrigger;
 use crate::reply_tracker::IntercomContext;
 use crate::session_state::SharedIntercomState;
 use crate::transport::client::{InboundEvent, IntercomClient, SendOptions};
-use crate::transport::protocol::{Attachment, Message, SessionInfo, now_ms};
+use crate::transport::protocol::{Attachment, Message, MessageReceiptStatus, SessionInfo, now_ms};
 use crate::ui::{InlineMessage, PlainTheme};
 
 /// The width the degraded inline card is pre-rendered at for the `append_entry` payload (cyrup has no
@@ -223,6 +223,10 @@ pub fn send_incoming_message_at(
         return false;
     };
     let message = &stamp_injected_at(message);
+    // `emitMessageReceipt(injectedMessage.id, "injected")` (`v0.10.1 index.ts:881`) — emitted from
+    // the INJECTION site, after the liveness guard and before the content is built, so a delivery
+    // that the guard above dropped emits nothing.
+    state.emit_message_receipt(&message.id, MessageReceiptStatus::Injected, None);
     state.tracker.lock().unwrap_or_else(|e| e.into_inner()).queue_turn_context(IntercomContext {
         from: from.clone(),
         message: message.clone(),
@@ -257,6 +261,10 @@ pub fn trigger_turn_over_inbound(
         return false;
     };
     let message = &stamp_injected_at(message);
+    // `emitMessageReceipt(injectedMessage.id, "injected")` (`v0.10.1 index.ts:881`) — emitted from
+    // the INJECTION site, after the liveness guard and before the content is built, so a delivery
+    // that the guard above dropped emits nothing.
+    state.emit_message_receipt(&message.id, MessageReceiptStatus::Injected, None);
     state.tracker.lock().unwrap_or_else(|e| e.into_inner()).queue_turn_context(IntercomContext {
         from: from.clone(),
         message: message.clone(),
@@ -319,6 +327,8 @@ pub async fn auto_reply_non_interactive_at(
             reply_to: Some(message.id.clone()),
             expects_reply: Some(false),
             message_id: None,
+            supersedes: None,
+            retry_of: None,
         })
         .await;
     match send {
@@ -369,18 +379,53 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     if !crate::connect::is_live_at(&state, message_generation) {
                         continue;
                     }
+                    // (0b) ICOM-017 — `const receiverReceivedAt = Date.now();` then
+                    //     `if (hasSeenInboundMessage(...)) { emitMessageReceipt(id, "acknowledged",
+                    //     "duplicate message id suppressed"); return; }` (`v0.10.1 index.ts:908-912`).
+                    //     ONE timestamp is taken and reused as the dedupe clock AND the stamp, so a
+                    //     second `now_ms()` below would be a divergence, not a tidy-up.
+                    let receiver_received_at = now_ms();
+                    if state.has_seen_inbound_message(&from.id, &message.id, receiver_received_at) {
+                        state.emit_message_receipt(
+                            &message.id,
+                            MessageReceiptStatus::Acknowledged,
+                            Some("duplicate message id suppressed"),
+                        );
+                        continue;
+                    }
+                    // `const receivedMessage = { ...message, receiverReceivedAt };` (`:913`) — every
+                    // use below is of the STAMPED copy, which is what puts `receiver received …`
+                    // into the delivery-metadata line (`v0.10.1 index.ts:480-481`).
+                    let mut message = message;
+                    message.receiver_received_at = Some(receiver_received_at.into());
+                    let message = message;
+                    state.emit_message_receipt(
+                        &message.id,
+                        MessageReceiptStatus::ReceiverReceived,
+                        None,
+                    );
                     // (1) Resolve an outstanding OUTBOUND ask first (index.ts:715-724). When matched,
                     //     the message is the reply to our own ask — do NOT also surface it.
                     if state.waiter.try_deliver(&from, &message) {
+                        state.emit_message_receipt(
+                            &message.id,
+                            MessageReceiptStatus::Acknowledged,
+                            Some("matched reply waiter"),
+                        );
                         continue;
                     }
                     // (2) Record the inbound ask (for a future `intercom{reply}` / the ClarifyChannel
                     //     correlation) and (3) surface it to the human.
-                    state
-                        .tracker
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .record_incoming_message(from.clone(), message.clone(), now_ms());
+                    state.tracker.lock().unwrap_or_else(|e| e.into_inner()).record_incoming_message(
+                        from.clone(),
+                        message.clone(),
+                        receiver_received_at,
+                    );
+                    state.emit_message_receipt(
+                        &message.id,
+                        MessageReceiptStatus::Acknowledged,
+                        Some("accepted by receiver"),
+                    );
                     surface_incoming_message(&state, &from, &message);
                     // (4) Dispatch the inbound delivery policy (pi `handleIncomingMessage`,
                     //     `index.ts:745-765`), computed AFTER the durable surface from whether a run
@@ -445,6 +490,17 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                     // rest of the process — ONE drop disabled intercom permanently.
                     crate::connect::handle_disconnect(&state, &client, &reason);
                     break;
+                }
+                // ICOM-017 — `case "message_receipt"` (`v0.10.1 index.ts:1018-1024`): a receipt
+                // about a message THIS session sent. Recorded, never surfaced: its only reader is
+                // `latestDeliveryState`, which the ask timeout quotes.
+                Ok(InboundEvent::MessageReceipt { receipt, .. }) => {
+                    state.record_outbound_receipt(&receipt);
+                }
+                // ICOM-017 — `case "message_control"` (`:1025-1027`): the sender withdrew or
+                // replaced a message it sent US. `handleMessageControl` retracts the pending ask.
+                Ok(InboundEvent::MessageControl { control, .. }) => {
+                    state.handle_message_control(&control);
                 }
                 Ok(_) => {} // joined/left/presence/error — presence UI is a later phase.
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

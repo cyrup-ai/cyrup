@@ -1348,9 +1348,9 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// nothing at all when it pinned none (pi's `explicitToolAllowlist` gate, `runs/shared/pi-args.ts:389-393,549-555`); the agent's
 /// extension threading (`--no-extensions` + `--extension <path>` allowlist when `agent.extensions`
 /// is `Some`, else `--extension <path>` for tool-extension/child-only paths with discovery left
-/// on); `--no-skills` when the agent does not inherit skills; `--system-prompt=<persona body>` /
-/// `--append-system-prompt=<persona body>` per `agent.system_prompt_mode` when the body is
-/// non-empty (ONE argv element, `=`-joined — see below); pi's full session branch
+/// on); `--no-skills` when the agent does not inherit skills; `--system-prompt <path>` /
+/// `--append-system-prompt <path>` per `agent.system_prompt_mode` when the body is
+/// non-empty (TWO argv elements naming a `0600` spill file — SUBA-030, see below); pi's full session branch
 /// (`runs/shared/pi-args.ts:100-112`) — either `--session <path>` when `opts.fork_context` resolved a session
 /// file path, or else `--no-session` unless [`RunOptions::session_dir`]/[`RunOptions::share`]
 /// enable sessions plus `--session-dir <dir>` for an explicit directory; then the task prompt last
@@ -1363,7 +1363,8 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// ([`MCP_DIRECT_TOOLS_ENV`], or the `__none__` sentinel).
 ///
 /// The agent's own persona prose (`agent.system_prompt_body`) is delivered here as
-/// `--system-prompt=<body>` (`SystemPromptMode::Replace`) or `--append-system-prompt=<body>`
+/// `--system-prompt <spill path>` (`SystemPromptMode::Replace`) or
+/// `--append-system-prompt <spill path>`
 /// (`SystemPromptMode::Append`) — pi `runs/shared/pi-args.ts:159-165` (v0.34.0), where the mode picks the flag
 /// and the body always ships. Nothing child-side re-resolves the persona from
 /// [`AGENT_NAME_ENV_VAR`] (that var is read only by the permission companion), so this argv pair is
@@ -1386,22 +1387,33 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// presence of an output PATH alone, never on [`RunOptions::output_mode`], and both are
 /// capability-aware.
 ///
-/// **[CYRUP-DELTA]** pi writes the composed prompt to a `0600` temp file and passes the PATH,
-/// because pi's `resolvePromptInput` (`resource-loader.ts:53-68`) reads `--system-prompt`'s value
-/// from disk when it names an existing file. `cyrup`'s own `--system-prompt`/`--append-system-prompt`
-/// take LITERAL text (`cyrup/src/cli.rs:125-129` → `SessionConfig::system_prompt`, no path
-/// resolution anywhere), so the body is passed inline; handing over a path here would deliver the
-/// path string itself as the child's system prompt. Inline means the `=`-joined single-argv form is
-/// mandatory, not stylistic — clap refuses a detached value beginning with `-`, and markdown
-/// personas routinely open on a `- bullet` or a `---` rule. A body that is still empty AFTER the
-/// memory block, the refinement overlay and the output-path override have been composed onto it
-/// emits NO flag at all (pi
-/// emits unconditionally, `runs/shared/pi-args.ts:570-585`'s `!== undefined && !== null`, so an empty string
-/// still writes a `0600` prompt file and still passes `--system-prompt <path>`; emitting
-/// `--system-prompt=` here would blank the child's assembled prompt instead of leaving it alone).
-/// That delta now covers only the genuinely-empty case: an agent with an output path configured
-/// composes a non-empty override and therefore DOES ship the flag, which is upstream's own
-/// rationale for why its value "is never meaningfully empty".
+/// SUBA-030 — the composed prompt is written to a `0600` file in `temp_dir` and the flag carries
+/// its PATH as two argv elements, which is pi's literal mechanism at
+/// `runs/shared/pi-args.ts:570-585` @v0.43.0 (unconditional `mkdtemp` + `writeFileSync(promptPath,
+/// …, { mode: 0o600 })` + `args.push(flag, promptPath)`), read back child-side by
+/// `resolvePromptInput` (`resource-loader.ts:53-68`). **The earlier `[CYRUP-DELTA]` here asserted
+/// that `cyrup`'s own flags "take LITERAL text … no path resolution anywhere" and passed the body
+/// inline on that basis; that is false at HEAD** — `crates/cyrup/src/cli.rs:511` runs
+/// `--system-prompt` through `resolve_prompt_input` (`:680-704`, an existing path is read from
+/// disk) and `:423-439` does the same for every `--append-system-prompt` entry, both pinned by
+/// `system_prompt_reads_the_file_when_the_token_is_an_existing_path`. The `=`-joined single-argv
+/// form went with the inline delivery, and so did its reason: clap refuses a DETACHED value
+/// beginning with `-`, and an absolute temp path cannot begin with one.
+///
+/// **[CYRUP-DELTA]** the one surviving difference is the empty case. A body that is still empty
+/// AFTER the memory block, the refinement overlay and the output-path override have been composed
+/// onto it emits NO flag at all, where pi's guard is `!== undefined && !== null` (`:570`) and an
+/// empty string still writes a prompt file and still passes the path. Emitting the flag over an
+/// empty file here would blank the child's assembled prompt instead of leaving it alone. An agent
+/// with an output path configured composes a non-empty override and therefore DOES ship the flag,
+/// which is upstream's own rationale for why its value "is never meaningfully empty".
+///
+/// **[CYRUP-DELTA]** pi prefixes the file with `<active_agent name="…"/>` (`:576-578`) so its
+/// in-process `@gotgenes/pi-permission-system` can resolve per-agent policy from the prompt text.
+/// cyrup's permission companion resolves the same name from `CYRUP_SUBAGENT_AGENT_NAME` instead
+/// (`cyrup-permission-system/src/extension.rs:2249-2263`, `resolve_agent_name_from_env`), because
+/// cyrup's subagent is a separate PROCESS that IS its persona for its whole lifetime, so the tag
+/// would be a second, weaker channel for a fact the env already carries.
 ///
 /// # Errors
 ///
@@ -1705,18 +1717,35 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         Some(&output_capabilities),
     );
     let persona_body: &str = &persona_owned;
+    let mut persona_temp_file: Option<std::path::PathBuf> = None;
     if !persona_body.is_empty() {
         let flag = match agent.system_prompt_mode {
             SystemPromptMode::Replace => SYSTEM_PROMPT_FLAG,
             SystemPromptMode::Append => APPEND_SYSTEM_PROMPT_FLAG,
         };
-        // `--flag=<body>` (ONE argv element), never `--flag <body>` (two): the child's clap parser
-        // refuses a separate value that starts with `-`, and a markdown persona body very commonly
-        // opens on a `- bullet` or a `---` rule. Verified against the real binary: `--system-prompt
-        // "- be terse"` dies with `error: unexpected argument '- ' found`, while
-        // `--system-prompt=- be terse` parses. The `=` split is on the FIRST `=` only, so a body
-        // containing `=` round-trips intact.
-        args.push(format!("{flag}={persona_body}"));
+        // SUBA-030 / pi `runs/shared/pi-args.ts:570-585` @v0.43.0: the composed prompt is written to
+        // a `0600` file in the run's scratch directory and the flag carries the PATH, as TWO argv
+        // elements (`args.push(flag, promptPath)`, `:580-585`). Upstream applies no size threshold
+        // here — unlike the task spill at `:588` it spills every time — so this is the literal
+        // mechanism, not a large-persona fallback.
+        //
+        // Two defects close with it. The persona no longer appears in `/proc/<pid>/cmdline`, where
+        // any local user could read a body that routinely carries project context; and a persona
+        // above Linux's `MAX_ARG_STRLEN` (131072) can no longer make `execve` fail with `E2BIG` and
+        // kill the spawn with an opaque OS error.
+        //
+        // The `=`-joined single-argv form the inline delivery required is gone with it, and so is
+        // its reason: a detached value beginning with `-` is what clap refuses, and an ABSOLUTE
+        // temp path can never begin with one.
+        let stem = if agent.name.trim().is_empty() {
+            "prompt"
+        } else {
+            agent.name.as_str()
+        };
+        let prompt_path = ChildSpawnSpec::resolve_system_prompt_arg(persona_body, stem, temp_dir)?;
+        args.push(flag.to_string());
+        args.push(prompt_path.display().to_string());
+        persona_temp_file = Some(prompt_path);
     }
 
     // Session threading (pi `buildPiArgs`, `runs/shared/pi-args.ts:517-528`) — the FULL branch, both halves:
@@ -2045,7 +2074,11 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
             task_arg,
             env_overlay,
             cwd,
-            temp_files: temp_file.into_iter().collect(),
+            // SUBA-030: BOTH spills are registered, so `cleanup_temp_files` removes the persona
+            // file on every exit path exactly as it already removed the over-threshold task file.
+            // A leaked `0600` prompt file would still be unreadable by other users, but it would
+            // outlive the run, which pi's `mkdtemp`-per-spawn scratch directory never does.
+            temp_files: temp_file.into_iter().chain(persona_temp_file).collect(),
         },
         tool_diagnostic_path,
     })
@@ -4684,16 +4717,136 @@ mod tests {
 
     // ---- SUBA-001: persona system-prompt delivery (pi `runs/shared/pi-args.ts:159-165` @ v0.34.0) ----
 
+    /// The delivered persona: locate the `--system-prompt`/`--append-system-prompt` FLAG element,
+    /// take the element after it as the spill path, and return the file's contents (SUBA-030 — pi
+    /// `runs/shared/pi-args.ts:580-585` pushes flag and path as two argv elements).
+    ///
+    /// Deliberately asserts the two-element shape on the way through: a regression back to the old
+    /// `--flag=<body>` single-element form makes `starts_with("--system-prompt")` still match while
+    /// the path lookup fails, so it fails loudly rather than reading as "no persona".
+    fn delivered_system_prompt(argv: &[String]) -> Option<String> {
+        let idx = argv
+            .iter()
+            .position(|a| a == "--system-prompt" || a == "--append-system-prompt")?;
+        assert!(
+            !argv.iter().any(|a| a.starts_with("--system-prompt=")
+                || a.starts_with("--append-system-prompt=")),
+            "SUBA-030: the persona must NEVER ride on argv as `--flag=<body>`; argv was {argv:?}"
+        );
+        let path = argv
+            .get(idx + 1)
+            .unwrap_or_else(|| panic!("the flag must be followed by a spill path; argv {argv:?}"));
+        Some(std::fs::read_to_string(path).unwrap_or_else(|e| {
+            panic!("the spill file named on argv must be readable ({path}): {e}")
+        }))
+    }
+
+    /// SUBA-030 — the persona spill exists on disk, carries the composed body, and is mode `0600`;
+    /// the body appears NOWHERE in argv. This is the item's own Verify recipe, minus the live
+    /// `/proc/<pid>/cmdline` half, which needs a real spawn.
+    #[test]
+    fn the_persona_ships_as_a_0600_spill_file_and_never_on_argv() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.name = "code reviewer/v2".to_string();
+        agent.system_prompt_mode = SystemPromptMode::Replace;
+        // A body far over Linux's MAX_ARG_STRLEN (131072): inline delivery would have made
+        // `execve` fail with E2BIG.
+        let body = format!("- You are the REVIEWER persona.\n{}", "x".repeat(200_000));
+        agent.system_prompt_body = body.clone();
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope {
+            current_depth: 0,
+            max_depth: 5,
+        };
+
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "do the thing",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+
+        let idx = argv
+            .iter()
+            .position(|a| a == "--system-prompt")
+            .expect("replace mode ships the persona on --system-prompt");
+        let path = std::path::PathBuf::from(&argv[idx + 1]);
+        assert!(path.is_absolute(), "the spill path must be absolute: {path:?}");
+        assert_eq!(
+            path.parent(),
+            Some(dir.path()),
+            "the spill must land in the run's scratch directory, not the OS temp root"
+        );
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("code_reviewer_v2.md"),
+            "pi `promptFileStem` sanitization: `[^\\w.-]` -> `_`, extension `.md`"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("spill readable"),
+            body,
+            "the spill must carry the composed persona verbatim"
+        );
+
+        // The whole point: nothing on argv contains the body.
+        assert!(
+            !argv.iter().any(|a| a.contains("You are the REVIEWER persona.")),
+            "SUBA-030: the persona must not be readable from the child's cmdline; argv was {argv:?}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("spill metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600, "pi writes the prompt file with {{ mode: 0o600 }}");
+        }
+
+        // Cleanup contract: the spill is registered, so `cleanup_temp_files` removes it on every
+        // exit path exactly as it already removed the over-threshold task spill.
+        assert!(
+            plan.spec.temp_files.contains(&path),
+            "the persona spill must be registered for cleanup: {:?}",
+            plan.spec.temp_files
+        );
+        crate::spawn::cleanup_temp_files(&plan.spec.temp_files);
+        assert!(!path.exists(), "cleanup must remove the persona spill");
+    }
+
+    /// pi `(input.promptFileStem ?? "prompt").replace(/[^\w.-]/g, "_")`
+    /// (`runs/shared/pi-args.ts:572` @v0.43.0).
+    #[test]
+    fn prompt_file_stem_sanitization_matches_pis_character_class() {
+        use crate::spawn::sanitize_prompt_file_stem as s;
+        assert_eq!(s("reviewer"), "reviewer");
+        assert_eq!(s("my.agent-2_x"), "my.agent-2_x", "`.`, `-` and `_` are kept");
+        assert_eq!(s("a/b c:d"), "a_b_c_d", "separators and spaces become `_`");
+        // JS `\w` is ASCII-only; `char::is_alphanumeric` would wrongly keep these.
+        assert_eq!(s("résumé"), "r_sum_");
+        assert_eq!(s(""), "prompt", "pi's `?? \"prompt\"` default");
+        assert_eq!(s("   "), "prompt");
+    }
+
     #[test]
     fn build_attempt_spawn_plan_delivers_the_persona_body_as_system_prompt_in_replace_mode() {
         // The critical path: 7 of the 8 bundled personas (and every user-authored agent, per
         // `default_system_prompt_mode`) declare `systemPromptMode: replace`. The child MUST be
-        // spawned with `--system-prompt=<persona body>` — pi `runs/shared/pi-args.ts:164-165` picks
+        // spawned with `--system-prompt <spill path>` — pi `runs/shared/pi-args.ts:164-165` picks
         // `--system-prompt` for `replace` — or the subagent runs as a generic coding agent that
         // received nothing but the task text.
         //
-        // The body deliberately opens on a markdown bullet: the `=` encoding is not cosmetic, the
-        // child's clap parser rejects `--system-prompt` followed by a separate `- …` value.
+        // The body deliberately opens on a markdown bullet — the case that made the old inline
+        // `--flag=<body>` encoding mandatory. SUBA-030 replaced it with pi's own spill-file form,
+        // where a leading `-` in the BODY can no longer reach the child's clap parser at all.
         let dir = tempfile::tempdir().expect("tempdir");
         let mut agent = sample_agent_config("m1", &[]);
         agent.system_prompt_mode = SystemPromptMode::Replace;
@@ -4709,13 +4862,10 @@ mod tests {
                 .expect("plan builds");
         let argv = plan.spec.build_argv();
 
-        let delivered = argv
-            .iter()
-            .find(|a| a.starts_with("--system-prompt"))
-            .cloned()
-            .unwrap_or_default();
+        let delivered = delivered_system_prompt(&argv)
+            .unwrap_or_else(|| panic!("replace mode must emit --system-prompt; argv was {argv:?}"));
         assert_eq!(
-            delivered, "--system-prompt=- You are the REVIEWER persona.\n- Only review.",
+            delivered, "- You are the REVIEWER persona.\n- Only review.",
             "replace mode must ship the persona body on --system-prompt; argv was {argv:?}"
         );
         // `replace` must never also append — the two flags are mutually exclusive per mode.
@@ -4780,10 +4930,9 @@ mod tests {
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let delivered = argv
-            .iter()
-            .find_map(|a| a.strip_prefix("--system-prompt="))
+        let delivered = delivered_system_prompt(&argv)
             .expect("replace mode ships the persona on --system-prompt");
+        let delivered = delivered.as_str();
 
         let persona_at = delivered
             .find("You are the WORKER persona.")
@@ -4825,10 +4974,9 @@ mod tests {
         )
         .expect("plan builds");
         let without = plan.spec.build_argv();
-        let without = without
-            .iter()
-            .find_map(|a| a.strip_prefix("--system-prompt="))
+        let without = delivered_system_prompt(&without)
             .expect("replace mode ships the persona on --system-prompt");
+        let without = without.as_str();
         assert!(
             !without.contains("pi-subagents-refinement"),
             "no overlay file means no overlay block: {without}"
@@ -5250,11 +5398,7 @@ mod tests {
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        let delivered = argv
-            .iter()
-            .find(|a| a.starts_with("--system-prompt"))
-            .cloned()
-            .unwrap_or_default();
+        let delivered = delivered_system_prompt(&argv).unwrap_or_default();
         assert!(
             delivered.contains("- You are the REVIEWER persona."),
             "the persona body must survive; argv was {argv:?}"
@@ -5292,7 +5436,11 @@ mod tests {
         )
         .expect("plan builds");
         let argv = plan.spec.build_argv();
-        assert!(argv.contains(&"--system-prompt=- persona".to_string()), "{argv:?}");
+        assert_eq!(
+            delivered_system_prompt(&argv).as_deref(),
+            Some("- persona"),
+            "{argv:?}"
+        );
         assert!(!argv.iter().any(|a| a.contains("Persistent agent memory")));
     }
 
@@ -5499,11 +5647,7 @@ mod tests {
         .expect("plan builds");
 
         let argv = plan.spec.build_argv();
-        let delivered = argv
-            .iter()
-            .find(|a| a.starts_with("--system-prompt"))
-            .cloned()
-            .unwrap_or_default();
+        let delivered = delivered_system_prompt(&argv).unwrap_or_default();
         assert!(
             delivered.contains("the detached runner must see this too."),
             "G95: a background/chain/parallel child must receive the SAME persistent-memory block \
@@ -5672,13 +5816,9 @@ mod tests {
                 .expect("plan builds");
         let argv = plan.spec.build_argv();
 
-        let delivered = argv
-            .iter()
-            .find(|a| a.starts_with("--append-system-prompt"))
-            .cloned()
-            .unwrap_or_default();
+        let delivered = delivered_system_prompt(&argv).unwrap_or_default();
         assert_eq!(
-            delivered, "--append-system-prompt=You are a delegate persona.",
+            delivered, "You are a delegate persona.",
             "append mode must ship the persona body on --append-system-prompt; argv was {argv:?}"
         );
         assert!(!argv.iter().any(|a| a.starts_with("--system-prompt")));
@@ -5712,17 +5852,6 @@ mod tests {
 
     // ---- G82 / R-SA-024: the SYSTEM-PROMPT half of the output-path override
     //      (pi `injectOutputPathSystemPrompt`, `execution.ts:1443`) ----
-
-    /// Extract the single `--system-prompt=`/`--append-system-prompt=` argv element's VALUE, or
-    /// `None` when neither flag was emitted. Used by the output-path-override tests below, which
-    /// all care about the flag's payload rather than which of the two flags carried it.
-    fn delivered_system_prompt(argv: &[String]) -> Option<String> {
-        argv.iter().find_map(|a| {
-            a.strip_prefix("--append-system-prompt=")
-                .or_else(|| a.strip_prefix("--system-prompt="))
-                .map(str::to_string)
-        })
-    }
 
     /// Upstream composes the override onto the SAME `systemPrompt` string the persona and the
     /// memory block already occupy, as the statement directly after the memory fold

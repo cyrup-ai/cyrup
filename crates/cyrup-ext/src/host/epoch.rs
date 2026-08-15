@@ -25,7 +25,15 @@ impl EpochDriver {
             let mut iv = tokio::time::interval(tick);
             iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                // `biased;` so cancellation always wins a tie. A freshly built `tokio::interval`
+                // fires its FIRST tick immediately, so on the very first iteration both arms are
+                // ready whenever the token was already cancelled at spawn — and an unbiased
+                // `select!` picks at RANDOM, unlike a JS race, which cannot have two things ready at
+                // once. The driver would then increment the epoch of an engine that is shutting
+                // down and loop, exiting only on a later coin flip. Ordered, the shutdown is
+                // deterministic: cancelled means stop, on the first poll, every time.
                 tokio::select! {
+                    biased;
                     _ = token.cancelled() => break,
                     _ = iv.tick() => engine.increment_epoch(),
                 }

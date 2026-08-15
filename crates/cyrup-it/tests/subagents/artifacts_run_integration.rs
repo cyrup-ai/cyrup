@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use tokio::sync::Mutex;
 
-use cyrup_ext_subagents::artifacts::temp_artifacts_dir;
+use cyrup_ext_subagents::artifacts::project_artifacts_dir;
 use cyrup_ext_subagents::extension::SubagentsExtension;
 use cyrup_ext_subagents::registration::SubagentExtensionConfig;
 
@@ -107,9 +107,17 @@ async fn a_real_foreground_run_writes_the_four_artifact_files() {
         std::env::set_var("CYRUP_HOME", home_dir.path());
     }
 
-    // Resolve the exact artifacts directory this run will write into (same env → same derivation as
-    // `run_foreground`'s own `temp_artifacts_dir(cwd)` call).
-    let art_dir = temp_artifacts_dir(work_dir.path());
+    // Resolve the exact artifacts directory this run will write into.
+    //
+    // `project_artifacts_dir`, NOT `temp_artifacts_dir`. `ArtifactDirPreference::default()` is
+    // `Project` — pi's own `DEFAULT_ARTIFACT_CONFIG.dir = "project"`
+    // (`src/shared/types.ts:1796-1798` @v0.43.0) — so an unconfigured run writes
+    // `<cwd>/.cyrup-subagents/artifacts`, not the scoped temp root. This test predates SUBA-048,
+    // which moved the default onto pi's, and kept looking in the temp location; it found an empty
+    // directory and blamed the run for writing nothing. `CYRUP_HOME` is still pointed at a tempdir
+    // above because the background/results roots derive from it, but it no longer decides where
+    // THESE files land — `work_dir` does.
+    let art_dir = project_artifacts_dir(work_dir.path());
 
     let extension = SubagentsExtension::with_config_and_cwd(
         SubagentExtensionConfig::default(),

@@ -195,13 +195,41 @@ impl ConfigDirs {
             .or_else(|| env.package_dir.clone())
             .unwrap_or_else(|| agent_dir.join("packages"));
 
+        // SESS-036's residual: this used to end in `std::fs::canonicalize(&cwd).unwrap_or(cwd)`,
+        // justified as "R-07-013 keys are canonical". That justification does not hold and the call
+        // was a divergence:
+        //
+        // 1. pi never realpaths the runtime cwd. `main.ts:534` @v0.83.0 is `const cwd =
+        //    process.cwd();`, used VERBATIM, and every downstream consumer that wants an absolute
+        //    form applies `resolvePath` — node's LEXICAL `path.resolve` (`utils/paths.ts:81-85`) —
+        //    never `canonicalizePath` (`paths.ts:26-32`, `realpathSync`), which pi reserves for the
+        //    two places that genuinely compare realpaths: `trust-manager.ts:39-40` `normalizeCwd`
+        //    and `resource-loader.ts:102-113` `findShadowedContextFile`.
+        // 2. R-07-013 is satisfied WITHOUT this call, exactly as it is upstream: `TrustStore::nearest`
+        //    canonicalizes the cwd it is handed itself (`trust.rs:147`), mirroring pi's
+        //    `normalizeCwd` inside `trust-manager.ts`. Nothing else in the tree needs a realpath here.
+        // 3. On unix the call was a no-op that hid a real defect: `std::env::current_dir()` is
+        //    `getcwd(3)`, which already returns the PHYSICAL path — the same string node's
+        //    `process.cwd()` returns — so canonicalizing it changed nothing and the divergence was
+        //    invisible on every developer machine. **On Windows it is not a no-op:**
+        //    `std::fs::canonicalize` converts to extended-length (`\\?\`-verbatim) syntax, while
+        //    node's `path.resolve` never does. That prefix would have flowed into `encode_cwd`'s
+        //    session-directory name, the `"cwd"` field written into every session header, the
+        //    `<project_instructions path="…">` attribute shown to the model, and the
+        //    `sessionCwdMatches` comparison against headers written by any other tool — a
+        //    JS→Rust mechanism gap with no JS counterpart, since JS has no verbatim-path concept.
         let cwd = match cli.cwd.clone() {
-            Some(p) => p,
+            // pi has no `--cwd` flag, so there is no upstream line for this slot; its nearest
+            // analogue is the caller-supplied cwd `SessionManager` accepts, normalized with
+            // `this.cwd = resolvePath(cwd)` (session-manager.ts:876 @v0.83.0). Same rule here:
+            // lexical resolve against the process cwd, no filesystem access, no symlink resolution.
+            Some(p) => {
+                let base = std::env::current_dir().map_err(ConfigError::Io)?;
+                crate::paths::resolve_path_from_base(&p.to_string_lossy(), &base)
+            }
+            // pi `main.ts:534`: `const cwd = process.cwd();` — verbatim.
             None => std::env::current_dir().map_err(ConfigError::Io)?,
         };
-        // Canonicalize when possible; otherwise keep the literal path (R-07-013 keys are canonical
-        // but a not-yet-existing cwd must not crash startup).
-        let cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
 
         Ok(Self {
             agent_dir,

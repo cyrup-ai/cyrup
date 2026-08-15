@@ -14,7 +14,7 @@ use cyrup_core::PackageId;
 
 pub use git_url::{ParsedGitUrl, has_unsafe_git_install_part, parse_git_url};
 pub use manifest::{ManifestKind, ManifestResources, ResolvedManifest, resolve_manifest};
-pub use source::{PackageSource, PinRef};
+pub use source::{PackageSource, PinRef, package_identity};
 pub use store::PackageStore;
 
 use crate::scope::InstallScope;

@@ -145,7 +145,7 @@ impl ToolDescriptor {
     }
 
     /// Declare that this tool renders its own call/result rows (Pi `ToolDefinition.renderCall`/
-    /// `renderResult`, extensions/types.ts:472-481). The host records the OWNER of the renderer for
+    /// `renderResult`, extensions/types.ts:489-497). The host records the OWNER of the renderer for
     /// this tool NAME and routes rendering back through the guest's `render-call`/`render-result`
     /// exports (keyed by the tool name); register the matching renderer with
     /// [`crate::ExtensionApi::register_message_renderer`] under the SAME name.
@@ -401,7 +401,7 @@ pub struct ForkOptions {
     pub with_session: bool,
 }
 
-/// Options for `navigateTree` (Pi types.ts:362): summarize the skipped span, with custom/replacement
+/// Options for `navigateTree` (Pi `navigateTree(targetId, options)`, `extensions/types.ts:374-377` @v0.83.0, the options bag at `:376`; EXT-036 corrected `:362`): summarize the skipped span, with custom/replacement
 /// instructions and an optional label.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

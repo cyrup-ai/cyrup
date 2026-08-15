@@ -148,6 +148,7 @@ async fn replying_mid_run_dismisses_the_pending_ask_and_never_redelivers() {
             reply_to: None,
             expects_reply: Some(true),
             message_id: None,
+            ..Default::default()
         })
         .await
         .expect("peer's ask is accepted by the broker");

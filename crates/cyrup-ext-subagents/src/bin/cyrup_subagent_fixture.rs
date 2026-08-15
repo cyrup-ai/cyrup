@@ -210,9 +210,35 @@ fn default_script_from_env_fallback() -> FixtureScript {
 /// binary's own `arg[0]`), matching `spawn/mod.rs`'s own existing `sh`-based argv-echo test
 /// convention so later phases' tests can assert on the identical event shape without depending on
 /// `sh` being present on the test host at all.
+/// SUBA-030 — the composed persona/system prompt is no longer an argv element. It is spilled to a
+/// `0600` file and passed as `--system-prompt`/`--append-system-prompt <path>` (pi
+/// `runs/shared/pi-args.ts:570-585` @v0.43.0), precisely so the persona never appears in the
+/// child's `/proc/<pid>/cmdline`. A REAL child reads that file; so does this fixture, emitting one
+/// `{"type":"unknown","promptFile":"<path>","contents":"<body>"}` line for it.
+///
+/// Without this, an argv echo can no longer distinguish the real persona from an
+/// empty-system-prompt placeholder — both produce the identical two argv elements — and any test
+/// asserting on the prompt BODY has nowhere left to look. The parent deletes the file when the run
+/// ends (`spawn::cleanup_temp_files`), so reading it after the fact is not an option either; the
+/// child's own read is the only moment it exists.
 fn emit_argv_echo(out: &mut impl Write) {
-    for arg in std::env::args().skip(1) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    for arg in &args {
         let line = serde_json::json!({"type": "unknown", "arg": arg}).to_string();
+        let _ = writeln!(out, "{line}");
+    }
+    for pair in args.windows(2) {
+        let (flag, path) = (&pair[0], &pair[1]);
+        if flag != "--system-prompt" && flag != "--append-system-prompt" {
+            continue;
+        }
+        // A missing/unreadable file is echoed as an explicit empty body rather than skipped, so a
+        // test can tell "the flag arrived pointing at nothing" from "the flag never arrived".
+        let contents = std::fs::read_to_string(path).unwrap_or_default();
+        let line = serde_json::json!({
+            "type": "unknown", "promptFile": path, "contents": contents
+        })
+        .to_string();
         let _ = writeln!(out, "{line}");
     }
     let _ = out.flush();

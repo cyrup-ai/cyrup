@@ -13,3 +13,4 @@
 
 mod payload_fidelity;
 mod dialog_options_timeout;
+mod world_import_coverage;

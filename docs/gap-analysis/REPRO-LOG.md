@@ -12,7 +12,9 @@ without anyone ever watching them happen.
 
 ---
 
-## 0. AMENDMENT 2026-08-14 — what two parity sweeps did to these seventeen rows
+## 0a. AMENDMENT 2026-08-14 — what two parity sweeps did to these seventeen rows
+
+> **Superseded in part by §0b below, which covers sweeps 3-6. Read §0b first.**
 
 > **This log remains a measurement and nothing below has been re-measured.** What follows records
 > which of its seventeen rows have had the *code under them changed* since 2026-08-13, so nobody
@@ -56,8 +58,9 @@ this log specifically:**
 | `SESS-040` | CONFIRMED, mechanism half REFUTED | **STILL OPEN, and it is now the cheapest of the three remaining highs.** Both siblings closed: `SESS-041` (auto-compaction token — refuted at HEAD, `abort_compaction` cancels both tokens) and `SESS-042` (the `aborted: true` payload — present at both `compaction_end` failure sites). **040, 041 and 042 now differ only in wiring: the moment 040 lands a dispatch site the abort takes effect.** `TUI-055` is fixed, so the band renders — **but nobody has watched it, and this row's mechanism correction (no indicator rendered at all) was measured against a build where it could not**. Re-run before trusting either half. |
 | `TUI-045` | CONFIRMED | **FIXED** by `c8c86bc`, with the same stale-record caveat as `TUI-016`. |
 
-**Fifteen of the seventeen are now fixed; two — `SEAM-061` and `SESS-040` — are open and are two of
-the three remaining highs in the entire backlog.** Both are blocked on coordination across crates
+~~**Fifteen of the seventeen are now fixed; two — `SEAM-061` and `SESS-040` — are open and are two of
+the three remaining highs in the entire backlog.**~~ **CORRECTED by §0b: sixteen are fixed and one —
+`SESS-040` — is open. `SEAM-061` was already fixed when this sentence was written.** Both are blocked on coordination across crates
 rather than on analysis, which is the same thing this log's §5 concluded about the method.
 
 ### What §5's argument looks like a year later, in one paragraph
@@ -69,6 +72,66 @@ resting on a premise that was false at the tag. **The two numbers are measuring 
 opposite ends: a written status in this directory is evidence, not fact.** The difference is that
 running the binary corrected *severities*, while re-reading at HEAD corrected *existence*. Neither
 substitutes for the other, and the sweeps did the cheaper one — nothing in either sweep was executed.
+
+---
+
+## 0b. AMENDMENT 2026-08-14 (second) — what sweeps 3-6 did to these seventeen rows
+
+> **Still a measurement, still not re-measured.** cyrup HEAD is now **`bdcb0d0`** (this log ran at
+> `0c76986`; amendment 0a was written at `380c713`). Sweeps 3, 4, 5 and 6 landed in between and
+> **none of them executed anything either** — sweep 6 was explicitly forbidden `cargo nextest`.
+> Every status below is again fixed **by reading, not by re-running**.
+
+**The suite numbers moved again: the gate is now `cargo nextest run --workspace` = 6699 tests, 6699
+passed, 7 skipped, in 16.3 s** (was 6440 / 8 skipped / 16.4 s in amendment 0a; 6387 in §1; the
+inherited 3932 is two corrections old). The structural facts in 0a are unchanged: 310 integration
+binaries → **6 + 8 gated** behind the `cyrup-it` harness crate, and **`cyrup-it` is
+`required-features = ["it"]`, so the gate still buys zero coverage of the broker-socket seam tests.**
+
+**One correction to 0a, and it matters because it was this log's evidence:** 0a cites "four `cyrup-it`
+assertions currently contradicting production" as proof that the un-built crate is not a theoretical
+problem. **Sweep 6 re-read all four at HEAD and they now match production** — `tool_actions.rs:319`,
+`:372`, `:502` and `intercom_command_transcript.rs:144` carry no trailing period, exactly as
+`tools/intercom.rs` emits (`ICOM-026`, closed as REFUTED). **The structural defect is unchanged and is
+now filed in its own right as `ICOM-053`**; it just no longer has that particular demonstration.
+
+### Row changes since amendment 0a
+
+| row | status at `380c713` (0a) | status at `bdcb0d0` |
+|---|---|---|
+| `SEAM-061` | "STILL OPEN, and now the top of the whole backlog" | **FIXED — and it was already fixed when 0a said otherwise.** Sweep 6 found both halves live at HEAD: `cyrup-tui/src/session_selector.rs:154`, `:276`, `:313`, `:1918`, `:1985` (including upstream's un-wired `onToggleScope` semantics, where Tab is *swallowed* rather than ignored) and `crates/cyrup/src/main.rs:1354` taking pi's **two** loaders, handed to the picker at `startup_ui.rs:191-201` (`cli/session-picker.ts:15-19` @v0.83.0). **The §3 transcript for this row is NO LONGER current behaviour.** |
+| `SESS-040` | "STILL OPEN, the cheapest of the three remaining highs" | **STILL OPEN — and now one of only TWO highs in the entire backlog** (with `PROV-047`). Unchanged: the indicator advertises "(esc to cancel)" and nothing dispatches. Its §3 transcript IS still current behaviour. |
+
+**Sixteen of the seventeen are now fixed; one — `SESS-040` — is open.**
+
+### A new measurement risk this log should own
+
+Sweep 6 root-caused the intermittent `cyrup-tools` nextest **`LEAK`** (filed as `TOOL-042`) to fd
+inheritance: `std::process::Command` defaults every **unnamed** stdio handle to `Stdio::inherit()`, so
+a test fixture that named only `.stdout(piped())` handed its child the harness's stdin and stderr and
+held nextest's pipe open past exit. **That closure is a static argument plus two regression pins, not
+an observation** — no one has re-run it. **Confirming it needs ~35 runs of `cargo nextest run -p
+cyrup-tools` with the LEAK count reported**, which is exactly the kind of work this log exists to do
+and which no sweep is permitted to perform. If a LEAK still appears, the next instrument is
+`lsof -p <pid>` on any surviving `sleep`/`bash` — **not `pgrep -f <pattern>`, which matches its own
+pattern in other shells' command lines and already produced a fabricated "22 orphaned brokers"
+measurement in this very log.**
+
+### Two live-behaviour claims filed by sweep 6 that this log has NOT measured
+
+Recorded here rather than in an area file, because they are precisely the class this log exists for:
+
+1. **`CFG-049`'s startup keypress gate.** `show_deprecation_warnings` now prints pi's block, prints
+   `Press any key to continue...`, enters raw mode, reads one byte and restores — blocking startup
+   before TUI init. **The block itself is exercised by no test** (a harness whose stdin is a terminal
+   would hang the suite), so only the strings and the empty early return are pinned. **Needs a live
+   run with `~/.cyrup/hooks/` present: the session must WAIT.** It also carries a deliberate
+   `[CYRUP-DELTA]` — pi's `once("data")` never fires on an already-closed stdin, so *upstream hangs
+   there* and cyrup returns on a zero-length read.
+2. **`CFG-051`'s migrated-credential notice.** The line moved off the pre-TUI stderr path into the
+   transcript, ahead of `modelFallbackMessage`. Verified **structurally**, not visually: nothing
+   asserts a RENDERED transcript line. Needs a rendered-transcript assertion in
+   `crates/cyrup-tui/tests/` plus a live confirmation.
 
 ---
 

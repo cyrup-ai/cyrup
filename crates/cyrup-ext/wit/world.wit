@@ -117,7 +117,15 @@ interface types {
     killed: bool,
   }
 
-  // Result of executing a guest-registered tool (R-08-015, Pi types.ts:1043 AgentToolResult).
+  // Result of executing a guest-registered tool (R-08-015, Pi `AgentToolResult`,
+  // `packages/agent/src/types.ts:355-369` @v0.83.0 — a DIFFERENT package from
+  // `coding-agent/.../extensions/types.ts`, which only RE-EXPORTS the type at `:87`).
+  //
+  // EXT-036: this cited `extensions/types.ts:1043`, which is `| AgentStartEvent`, a member of the
+  // `ExtensionEvent` union. Three unrelated types in this tree were all cited to that one line
+  // (`AgentToolResult`, `UserBashEventResult`, `ToolResultEventResult`) — a catch-all, which is a
+  // fabrication tell distinct from the uniform-offset one: staleness moves every citation by the
+  // same delta, invention converges them on one plausible-looking number.
   // `content-json` is a serde_json array of (text|image) content blocks; `terminate` ends the
   // agent loop after this result.
   record tool-output {
@@ -187,7 +195,7 @@ interface events {
 
   // --- guest tool execution (R-08-015) ---
   // The host invokes a guest-registered tool. Mirrors Pi's ToolDefinition.execute
-  // (types.ts:464): `call-id` = toolCallId, `params-json` = arguments; cancellation (signal)
+  // (types.ts:480): `call-id` = toolCallId, `params-json` = arguments; cancellation (signal)
   // is delivered by the host epoch/cancel; streaming updates go back via host-tool.emit-update;
   // `ctx` is reconstructed guest-side from the capability imports.
   execute-tool: func(name: string, call-id: string, params-json: string) -> result<tool-output, string>;
@@ -213,7 +221,7 @@ interface events {
   // `KeyId` fires. Runs at COMMAND tier (Pi hands the shortcut handler the full `ExtensionContext`).
   execute-shortcut:         func(key: string) -> result<_, string>;
 
-  // --- message renderer dispatch (R-08-020; Pi renderCall/renderResult, types.ts:472-481) ---
+  // --- message renderer dispatch (R-08-020; Pi renderCall/renderResult, types.ts:489-497) ---
   // A guest that registered a renderer for `custom-type` renders a tool call / result into a
   // serialized widget tree (none = fall back to the runtime's default renderer).
   //
@@ -298,7 +306,7 @@ interface events {
   // ("steer"|"followUp"; none when the agent is idle).
   // `user_bash` carries the Pi `UserBashEvent` (types.ts:782-790): the `command`, the
   // `exclude-from-context` flag (true for the `!!` prefix), and the `cwd`. The `operations`/`result`
-  // override is returned via the `handled` outcome (Pi `UserBashEventResult`, types.ts:1043-1048),
+  // override is returned via the `handled` outcome (Pi `UserBashEventResult`, `extensions/types.ts:1078-1083` @v0.83.0; EXT-036 corrected `:1043-1048`),
   // NOT passed in.
   on-input:        func(text: string, images-json: string, source: string, streaming-behavior: option<string>) -> hook-outcome;
   on-user-bash:    func(command: string, exclude-from-context: bool, cwd: string) -> hook-outcome;
@@ -430,9 +438,18 @@ interface registration {
   // one. Upstream stores it as `extension.markdownTransformer = transformer`, i.e. AT MOST ONE per
   // extension with the last registration winning; the host models that the same way (EXT-019).
   register-markdown-transformer: func();
-  // Pi registerEntryRenderer(customType, renderer), types.ts:1295 / loader.ts:314-318 — the
+  // Pi `registerEntryRenderer(customType, renderer)` (`extensions/types.ts:1279` @v0.83.0, the
+  // ported baseline — `:1295` @v0.84.1 / `loader.ts:314-318`) — the
   // custom-ENTRY surface, a SEPARATE table from register-message-renderer above (upstream keeps
-  // `messageRenderers` and `entryRenderers` as disjoint maps, types.ts:1703-1704). An entry is
+  // `messageRenderers` and `entryRenderers` as disjoint maps, `types.ts:1677-1678` @v0.83.0 /
+  // `:1702` and `:1704` @v0.84.1).
+  //
+  // EXT-036, VERSION-LAG class: this comment carried the v0.84.1 numbers (`:1295`, `:1703-1704`)
+  // with NO version tag, in a file whose stated baseline is v0.83.0. At v0.83.0 `:1295` is
+  // `sendUserMessage` and `:1703` does not exist (the file is 1701 lines); at v0.84.1 `:1703` is
+  // `markdownTransformer`, i.e. neither of the two maps the sentence is about. An unversioned
+  // citation that resolves to a different symbol at the ported tag reads as a fabrication to the
+  // next auditor and cost this pass a round-trip to disprove — cite the tag you opened. An entry is
   // TUI-only durable state appended by `append-entry`; a message participates in LLM context. They
   // differ in what a FAULTING renderer draws: a message falls through to the default box
   // (custom-message.ts:82-84), an entry draws `[type] renderer failed: …` (custom-entry.ts:47-52).
@@ -465,13 +482,28 @@ interface registration {
 //     it (ADR-0002).
 // ---------------------------------------------------------------------------
 interface ui {
-  // notification severity (Pi notify `type`: "info" | "warning" | "error", types.ts:135); info is the default.
+  // EXT-036 (the import-surface re-run, completed here): every `types.ts` citation in this
+  // interface was re-derived line by line against `v0.83.0`. A cluster of them was stale by a
+  // uniform ~7 lines — the same offset, and therefore the same cause, as the cluster the register
+  // in `cyrup-ext-sdk/src/ctx.rs` fixed on the SDK side: taken against a pi revision this region is
+  // seven lines shorter in, not invented. Corrected below, with the old value named so nobody
+  // "restores" it: notify `:135`->`:142`, set-status `:141`->`:148`, the dialog-options
+  // `AbortSignal` `:89-94`->`:95-101`, editor `:216`->`:222`, the chrome trio
+  // `:130-150`->`:183`/`:190`/`:193`. Two MORE were found here that the SDK-side register did not
+  // list, of the same class: `custom` `:175`->`:196` (`:175` is the closing paren of the
+  // `setWidget` component-factory overload), and the editor-buffer trio's `:200-230` range, which
+  // named a function pi does not have — see that comment.
+  //
+  // notification severity (Pi `notify(message, type?: "info" | "warning" | "error")`,
+  // `types.ts:142` @v0.83.0); info is Pi's default when the argument is omitted.
   enum notify-kind { info, warning, error }
   notify:     func(message: string, kind: notify-kind);
-  // Pi setStatus(key, text?: string), types.ts:141: a keyed status segment; a none `text` clears that key.
+  // Pi `setStatus(key, text: string | undefined)` (`types.ts:148` @v0.83.0) — "Set status text in
+  // the footer/status bar. Pass undefined to clear." A none `text` clears that key.
   set-status: func(key: string, text: option<string>);
   // programmatically dismiss any dialog bound to `signal-id` (Pi `ExtensionUIDialogOptions.signal`
-  // AbortSignal, types.ts:89-94): a dialog subsequently opened carrying that signal id returns
+  // AbortSignal, `types.ts:95-101` @v0.83.0 — the whole `{signal?, timeout?}` block; `signal?` is
+  // `:98`): a dialog subsequently opened carrying that signal id returns
   // cancelled (`confirm` -> false, `input`/`select` -> none).
   abort-signal: func(signal-id: string);
   // Pi `onTerminalInput(handler: TerminalInputHandler): () => void` (`extensions/types.ts:145`
@@ -486,24 +518,34 @@ interface ui {
   // because an export addition forces a HOST_WORLD bump"). That bump is 0.6 -> 0.7.
   subscribe-terminal-input:   func();
   unsubscribe-terminal-input: func();
-  // `opts-json` is pi's `ExtensionUIDialogOptions` bag (`extensions/types.ts:95-100` @v0.83.0):
+  // `opts-json` is pi's `ExtensionUIDialogOptions` bag (`extensions/types.ts:95-101` @v0.83.0):
   // `{signal, timeout}` — `timeout?: number`, "Timeout in milliseconds. Dialog auto-dismisses with
   // live countdown display" (:100), and/or a programmatic-dismiss signal id (none = `{}`).
   // EXT-048: the citation this comment used to carry (`types.ts:89`, key `timeoutMs`) was wrong on
   // both counts — `:89` is a blank line before the UI Context banner at v0.83.0 and upstream has no
   // `timeoutMs` anywhere. `timeout` is now the CANONICAL key; `timeoutMs` is still accepted as a
   // serde alias for back-compat with bags cyrup's own SDK already wrote.
-  // Pi `confirm(title, message, opts)` (rpc-types.ts:232): `prompt` is the short `title`, `message`
-  // is the (often large, formatted) body — both genuinely used, e.g. pi-mcp-adapter's sampling
-  // handler passes a label as `title` and the full prompt/conversation text as `message`.
+  // EXT-036, SECOND CLUSTER: the three `rpc-types.ts` citations below were stale by a uniform +8 —
+  // the same failure mode as the `types.ts` cluster above, in a file the SDK-side register never
+  // opened. The file is `packages/coding-agent/src/modes/rpc/rpc-types.ts` @v0.83.0, and the wire
+  // shapes live in the `RpcExtensionUIRequest` union at `:238-248`. `:232` (the old confirm cite)
+  // is a BLANK line and `:233-240` (the old input cite) starts on a banner comment.
+  //
+  // Pi `confirm(title, message, opts)` (`rpc-types.ts:240`): `prompt` is the short `title`,
+  // `message` is the (often large, formatted) body — both genuinely used, e.g. pi-mcp-adapter's
+  // sampling handler passes a label as `title` and the full prompt/conversation text as `message`.
   confirm:    func(prompt: string, message: string, opts-json: string) -> bool;
-  // Pi `input(title, placeholder, opts)` (rpc-types.ts:233-240): `placeholder` is optional
+  // Pi `input(title, placeholder, opts)` (`rpc-types.ts:241-248`): `placeholder` is optional
   // (`none` = Pi omits the wire field entirely) and forwarded live to the renderer.
   input:      func(prompt: string, placeholder: option<string>, opts-json: string) -> option<string>;
   // single-choice select over a json array of options; returns the chosen string (none = cancel).
+  // Pi `select(title, options, opts?): Promise<string | undefined>` (`extensions/types.ts:133`
+  // @v0.83.0; wire shape `rpc-types.ts:239`). EXT-036: the SDK-side register recorded `:127` as the
+  // stale value for this one; the WIT carried no citation at all, which is how it survived.
   select:     func(prompt: string, options-json: string, opts-json: string) -> option<string>;
-  // multiline editor seeded with `initial`, labeled `title` (Pi `editor(title, prefill)`,
-  // types.ts:216); returns the edited text (none = cancelled).
+  // multiline editor seeded with `initial`, labeled `title` (Pi
+  // `editor(title, prefill?): Promise<string | undefined>`, `types.ts:222` @v0.83.0 — `:216` is
+  // `setEditorText`, EXT-036); returns the edited text (none = cancelled).
   editor:     func(title: string, initial: string) -> option<string>;
   // Pi `setWidget(key, content: string[] | undefined, options?: ExtensionWidgetOptions)`
   // (`extensions/types.ts:170-175` @v0.83.0, plus a component-factory overload at `:171-175`), with
@@ -521,13 +563,25 @@ interface ui {
   // `opts-json` is the `ExtensionWidgetOptions` bag; `{}` = pi's default `"aboveEditor"`.
   set-widget: func(key: string, content-json: option<string>, opts-json: string);
 
-  // --- chrome (Pi setHeader/setFooter/setTitle, types.ts:130-150) ---
+  // --- chrome (Pi `setHeader` `types.ts:190`, `setFooter` `:183`, `setTitle` `:193` @v0.83.0;
+  //     EXT-036: the range `:130-150` this line used to cite is the dialog/notify block above) ---
   set-header: func(content: string);
   set-footer: func(content: string);
   set-title:  func(title: string);
-  // custom overlay component; returns an optional serialized result (Pi custom(), types.ts:175).
+  // custom overlay component; returns an optional serialized result (Pi
+  // `custom<T>(factory, ...)`, `types.ts:196` @v0.83.0 — "Show a custom component with keyboard
+  // focus". EXT-036: `:175` is the closing paren of the `setWidget` component-factory overload).
   custom:     func(spec-json: string) -> option<string>;
-  // --- editor buffer access (Pi getEditorText/setEditorText/pasteEditorText, types.ts:200-230) ---
+  // --- editor buffer access (Pi `pasteToEditor` `types.ts:213`, `setEditorText` `:216`,
+  //     `getEditorText` `:219` @v0.83.0).
+  //
+  //     EXT-036, NAME correction: this line used to read "getEditorText/setEditorText/
+  //     pasteEditorText, types.ts:200-230". There is no `pasteEditorText` upstream — the pi name is
+  //     `pasteToEditor` — so the citation named a function that does not exist, which is exactly
+  //     the fabrication class EXT-036 was filed for, and the `:200-230` range was wide enough to
+  //     hide it. The WIT import stays spelled `paste-editor-text`: renaming it would RE-SIGN an
+  //     import and force a HOST_WORLD bump for a comment fix. That spelling is therefore a
+  //     [CYRUP-DELTA] against `types.ts:213` — cyrup's import name, pi's semantics. ---
   get-editor-text:   func() -> string;
   set-editor-text:   func(text: string);
   paste-editor-text: func(text: string);
@@ -721,10 +775,10 @@ interface bus {
   unsubscribe: func(topic: string);
 }
 
-// streaming tool output: the `onUpdate` callback of Pi's ToolDefinition.execute (types.ts:467).
+// streaming tool output: the `onUpdate` callback of Pi's ToolDefinition.execute (types.ts:484).
 interface host-tool {
   emit-update: func(call-id: string, chunk-json: string);
-  // the tool's AbortSignal (Pi `ToolDefinition.execute` `signal` param, types.ts:466): the guest
+  // the tool's AbortSignal (Pi `ToolDefinition.execute` `signal` param, types.ts:483): the guest
   // polls this during a long `execute` to cooperatively stop. True once the host cancels the call
   // (epoch/`CancelToken`) or a named signal for this `call-id` was aborted (`ui.abort-signal`).
   is-cancelled: func(call-id: string) -> bool;

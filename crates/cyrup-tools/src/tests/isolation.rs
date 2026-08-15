@@ -295,3 +295,102 @@ async fn backend_swap_retargets_tools_without_contract_change() {
     // The write actually landed on the host workspace (R-12-014 write-through analog).
     assert_eq!(std::fs::read_to_string(cwd.join("out.txt")).unwrap(), "routed");
 }
+
+// -------------------------------------------------------- decorator delegation completeness
+
+/// An `FsOps` whose `read_stream` returns something a whole-file `read` CANNOT produce.
+///
+/// The distinct value is the whole design of this probe. `FsOps::read_stream`'s default body is
+/// `Cursor::new(self.read(path).await?)` (`ops/mod.rs:329-334`), so a decorator that forgets to
+/// forward `read_stream` still yields byte-for-byte the same content as one that forwards it — a
+/// dropped delegation and the trait default are observationally identical on content alone, which
+/// is exactly why this omission survived TOOL-034's landing and both later sweeps. Making the two
+/// paths return DIFFERENT bytes is what turns the assertion from vacuous into a real one.
+struct DistinctStreamFs;
+
+#[async_trait::async_trait]
+impl FsOps for DistinctStreamFs {
+    async fn read(&self, _path: &Path) -> Result<Vec<u8>, ToolError> {
+        Ok(b"WHOLE-READ".to_vec())
+    }
+    async fn read_stream(
+        &self,
+        _path: &Path,
+    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+        Ok(Box::new(std::io::Cursor::new(b"REAL-STREAM".to_vec())))
+    }
+    async fn write_in_place(&self, _path: &Path, _bytes: &[u8]) -> Result<(), ToolError> {
+        Ok(())
+    }
+    async fn access(&self, _path: &Path, _mode: Access) -> Result<(), ToolError> {
+        Ok(())
+    }
+    async fn metadata(&self, _path: &Path) -> Result<Meta, ToolError> {
+        Err(ToolError::new("metadata unused by this probe"))
+    }
+    async fn read_dir(&self, _path: &Path) -> Result<Vec<DirEntry>, ToolError> {
+        Ok(Vec::new())
+    }
+    fn walk(&self, _root: &Path, _opts: WalkOpts) -> EventStream<Result<WalkItem, ToolError>> {
+        Box::pin(tokio_stream::empty())
+    }
+}
+
+async fn stream_text(fs: &dyn FsOps, path: &Path) -> String {
+    use std::io::Read as _;
+    let mut reader = fs.read_stream(path).await.expect("read_stream succeeds");
+    let mut out = String::new();
+    reader.read_to_string(&mut out).expect("probe stream is utf-8");
+    out
+}
+
+/// Every `FsOps` decorator must forward `read_stream` to its inner seam rather than inherit the
+/// trait's whole-file default.
+///
+/// The defect this pins is the Rust half of a JS/Rust asymmetry: pi's operation decorators are
+/// object literals (`{ ...ops, writeFile }`, e.g. `write.ts:32-35` / `edit.ts:83-87` style), so a
+/// method added to the seam later is carried through BY CONSTRUCTION. A Rust decorator has to name
+/// every method, and omitting one silently substitutes the trait default. Here that default is
+/// `Cursor::new(self.read(..))`, so `confineToCwd` or `protectPaths` quietly reverted `grep` to the
+/// whole-file materialization TOOL-034 removed — correct output, wrong memory profile, no failing
+/// test anywhere.
+#[tokio::test]
+async fn fs_decorators_forward_read_stream_instead_of_inheriting_the_whole_file_default() {
+    let base: Arc<dyn FsOps> = Arc::new(DistinctStreamFs);
+    let root = std::env::temp_dir();
+    let probe = root.join("decorator-delegation-probe.txt");
+
+    // Presence before absence: the probe itself must distinguish the two paths, or every assertion
+    // below is vacuous.
+    assert_eq!(stream_text(&*base, &probe).await, "REAL-STREAM");
+    assert_eq!(base.read(&probe).await.unwrap(), b"WHOLE-READ".to_vec());
+
+    let traversal: Arc<dyn FsOps> = Arc::new(TraversalFs::new(base.clone(), root.clone()));
+    assert_eq!(
+        stream_text(&*traversal, &probe).await,
+        "REAL-STREAM",
+        "TraversalFs must forward read_stream; inheriting the default silently drops LocalFs's \
+         real-File streaming and re-opens TOOL-034 whenever confineToCwd is on"
+    );
+
+    let protected: Arc<dyn FsOps> = Arc::new(ProtectedFs::new(base.clone(), ProtectedPaths::defaults()));
+    assert_eq!(
+        stream_text(&*protected, &probe).await,
+        "REAL-STREAM",
+        "ProtectedFs must forward read_stream for the same reason"
+    );
+
+    // Stacked exactly as `cyrup-session-svc/src/builder.rs:753-758` stacks them when both settings
+    // are on — the configuration where the loss actually shipped.
+    let stacked: Arc<dyn FsOps> =
+        Arc::new(ProtectedFs::new(Arc::new(TraversalFs::new(base, root.clone())), ProtectedPaths::defaults()));
+    assert_eq!(stream_text(&*stacked, &probe).await, "REAL-STREAM");
+
+    // TraversalFs must still CONFINE on this method, not merely pass it through: a path outside the
+    // root is rejected before the inner seam is opened.
+    let confined = TraversalFs::new(Arc::new(DistinctStreamFs), root.join("cyrup-decorator-root"));
+    assert!(
+        confined.read_stream(Path::new("/etc/passwd")).await.is_err(),
+        "read_stream must apply the traversal guard, not just delegate"
+    );
+}

@@ -812,10 +812,21 @@ impl RunCtx {
                 description: t.description().to_string(),
                 parameters: t.parameters().clone(),
                 // PROV-011: pi's `constrainedSampling` is a per-tool OPT-IN declared on the tool
-                // definition (`types.ts:484` @v0.83.0); `undefined` and `false` behave identically.
-                // `cyrup_core::Tool` exposes no such accessor, so an agent-loop tool never opts in
-                // — the field is absent, exactly as it is for a pi tool that does not declare it.
-                constrained_sampling: None,
+                // definition (`extensions/types.ts:463` @v0.83.0); `undefined` and `false` behave
+                // identically (`packages/ai/README.md:483`).
+                //
+                // Upstream the declaration is COPIED off the `ToolDefinition` onto the runtime
+                // `AgentTool` by `wrapToolDefinition`
+                // (`packages/coding-agent/src/core/tools/tool-definition-wrapper.ts:14` @v0.83.0),
+                // and the loop then hands those same `AgentTool`s to the stream verbatim —
+                // `tools: context.tools` (`packages/agent/src/agent-loop.ts:301` @v0.83.0) — so
+                // whatever the tool declared is what `convertTools` sees. This `.map` IS that
+                // hand-off, so it must read the declaration rather than erase it: hardcoding `None`
+                // here made `cyrup_provider::utils::constrained_sampling` unreachable from the
+                // agent loop, so no tool — extension-registered or WASM guest — could ever opt in,
+                // and a `strict: "require"` declaration that upstream FAILS the request silently
+                // degraded to an ordinary unconstrained tool call.
+                constrained_sampling: t.constrained_sampling().cloned(),
             })
             .collect();
 

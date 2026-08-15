@@ -627,6 +627,7 @@ async fn a_stop_landing_with_a_timeout_ends_the_run_stopped_not_failed() {
         steps: vec![RunnerStep::SingleStep(single_step("only", "sleep a long time"))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
+        session_id: None,
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 2,

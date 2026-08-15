@@ -306,7 +306,7 @@ impl InitApi {
     }
 
     /// Declare that this extension renders the TOOL named `tool_name` (Pi's per-tool
-    /// `ToolDefinition.renderCall`/`renderResult`, extensions/types.ts:472-481, resolved by
+    /// `ToolDefinition.renderCall`/`renderResult`, extensions/types.ts:489-497, resolved by
     /// `modes/interactive/components/tool-execution.ts:81-112`). The guest path declares the same
     /// thing through `ToolDescriptor.has_renderer`; a native tool is an already-executable
     /// `Arc<dyn Tool>` and has no descriptor, so it declares it here.
@@ -572,7 +572,7 @@ pub trait NativeExtension: Send + Sync {
     }
 
     /// Render a tool CALL / custom MESSAGE this extension declared a renderer for (Pi
-    /// `renderCall`, extensions/types.ts:472-473). `key` is the TOOL NAME for a tool renderer
+    /// `renderCall`, extensions/types.ts:489). `key` is the TOOL NAME for a tool renderer
     /// declared via [`InitApi::register_tool_renderer`], or the CUSTOM TYPE for a message renderer
     /// declared via [`InitApi::register_message_renderer`]. `None` (the default) falls the host back
     /// to its own framing — the same degradation a faulting guest renderer gets.
@@ -584,7 +584,7 @@ pub trait NativeExtension: Send + Sync {
     }
 
     /// The result-side companion of [`Self::render_call`] (Pi `renderResult`,
-    /// extensions/types.ts:475-481).
+    /// extensions/types.ts:492-497).
     fn render_result(&self, _key: &str, _result: &serde_json::Value) -> Option<serde_json::Value> {
         None
     }

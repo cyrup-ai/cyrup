@@ -118,7 +118,11 @@ async fn session_start_registers_under_the_live_session_id() {
     // MIRROR (green before AND after the fix): the presence alias was always derived from the same
     // `HostServices::session_id()`.
     let expected_alias = presence_name(None, LIVE_SESSION_ID);
-    assert_eq!(expected_alias, "subagent-chat-9f8e7d6c");
+    // 18 id characters, not 8. pi-intercom v0.10.0 (`126875e`) widened the unnamed-session fallback
+    // alias precisely so two UUIDv7 sessions minted in the same millisecond stay distinguishable —
+    // `slice(0, 8)` stops inside the shared 48-bit timestamp. `identity.rs:262` takes 18 and
+    // `identity.rs:521` pins the reason. This mirror assertion still spelled the pre-widening form.
+    assert_eq!(expected_alias, "subagent-chat-9f8e7d6c5b4a3210");
 
     // And the broker's OWN view agrees — the id is addressable by a peer through `list`.
     let sessions = client.list_sessions().await.expect("list sessions");

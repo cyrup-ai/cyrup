@@ -1088,7 +1088,8 @@ pub fn build_output_path_system_prompt_instruction(
 /// # Where it is wired
 ///
 /// `exec/mod.rs::build_attempt_spawn_plan` calls this on the persona body it is about to ship as
-/// the child's `--system-prompt=<body>` / `--append-system-prompt=<body>`, immediately after
+/// the child's `--system-prompt <spill path>` / `--append-system-prompt <spill path>` (SUBA-030),
+/// immediately after
 /// folding in `build_agent_memory_injection`'s block — which is exactly upstream's own composition
 /// order, where `injectOutputPathSystemPrompt` is the statement following the memory fold
 /// (`execution.ts:1433-1443`). Upstream's other call site, `api/preflight.ts:313`, applies the same

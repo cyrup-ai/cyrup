@@ -82,8 +82,18 @@ async fn cross_extension_bus_emit_reaches_a_subscribed_handler() {
 }
 
 /// (A, production path) `run_command`'s tail drain delivers automatically — the assembled product
-/// needs no manual `deliver_bus_events` call. `/buspub` routes to its (last-registered) owner, emits,
-/// and the drain fans it out to every subscriber (both guests) before `run_command` returns.
+/// needs no manual `deliver_bus_events` call. `/buspub` routes to its owner, emits, and the drain
+/// fans it out to every subscriber (both guests) before `run_command` returns.
+///
+/// INVOCATION NAME, not the registered name. Both loaded guests are the same component, so BOTH
+/// register a command named `buspub`; pi's `resolveRegisteredCommands` therefore emits `buspub:1`
+/// and `buspub:2` in load order and NOTHING named `buspub`, and `getCommand(name)` matches
+/// `command.invocationName` alone —
+/// `packages/coding-agent/src/core/extensions/runner.ts:596-628` and `:647-649` @v0.83.0, ported at
+/// `cyrup-ext/src/registry.rs:644` / `facade.rs:1642`. This test predates that port (SEAM-048 /
+/// EXT-017) and still asked for the bare `buspub`, which upstream resolves to `undefined`; because
+/// the `it` suite is feature-gated off by default, nothing re-ran it after the port landed and it
+/// has been red-in-waiting ever since. Asking for `buspub:1` is what a pi user's `/buspub:1` does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn run_command_auto_delivers_bus_events() {
     let bytes = std::fs::read(fixture_component()).expect("read fixture component bytes");
@@ -95,8 +105,18 @@ async fn run_command_auto_delivers_bus_events() {
     let ext_b =
         host.load_wasm("sub".into(), &bytes, Arc::new(DenyServices)).await.expect("load guest B");
 
+    // Pin the disambiguation itself before using it, so a regression that reinstates the old
+    // last-registration-wins raw-name fallback fails HERE rather than silently making the drain
+    // assertion below pass through the wrong door. Under a collision pi leaves no bare name.
+    let bare = host.run_command("buspub", "ping", &cancel).await;
+    assert!(
+        matches!(&bare, Err(e) if e.to_string().contains("no such command: buspub")),
+        "with two extensions registering `buspub`, pi resolves only `buspub:1`/`buspub:2` and \
+         `getCommand(\"buspub\")` is undefined (runner.ts:596-628,647-649 @v0.83.0); got {bare:?}"
+    );
+
     // Production slash-command path: no explicit drain call.
-    let out = host.run_command("buspub", "ping", &cancel).await.expect("run_command buspub");
+    let out = host.run_command("buspub:1", "ping", &cancel).await.expect("run_command buspub:1");
     assert_eq!(out.as_deref(), Some("emitted demo:bus: ping"));
 
     // BOTH guests (all subscribers, Pi delivers to every listener incl. the emitter) received it.
