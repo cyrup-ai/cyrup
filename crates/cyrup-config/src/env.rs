@@ -78,7 +78,23 @@ impl EnvVars {
         // (config.ts:498-500). CFG-036.
         let path = |keys: &[&str]| first(keys).map(|raw| crate::paths::normalize_path_buf(&raw));
         Self {
-            agent_dir: path(&["CYRUP_AGENT_DIR", "PI_CODING_AGENT_DIR"]),
+            // CFG-076 — upstream has exactly ONE agent-dir env name, `PI_CODING_AGENT_DIR`, and
+            // pi core, `pi-intercom` (`broker/paths.ts:27-38`, asserted at `broker/paths.test.ts:25`)
+            // and `pi-subagents` (`src/shared/utils.ts:96`, `src/agents/agents.ts:1886`) all read
+            // that same name — so upstream, one variable moves every tree at once. cyrup's rename
+            // split it in two: core took the SHORT `CYRUP_AGENT_DIR` (which is what `--help`
+            // advertises, `cli.rs:895`) while the two sibling ports took the mechanical long form
+            // `CYRUP_CODING_AGENT_DIR` (`cyrup-intercom/src/paths.rs:18`,
+            // `cyrup-ext-subagents/src/native_supervisor.rs:1772`). Reading BOTH here restores
+            // upstream's one-name-one-tree property from the operator's side: whichever spelling is
+            // set, core lands on the same directory the siblings do. The short name stays FIRST so
+            // the documented spelling wins when both are set. `PI_CODING_AGENT_DIR` remains last as
+            // the migration fallback (R-07-028).
+            agent_dir: path(&[
+                "CYRUP_AGENT_DIR",
+                "CYRUP_CODING_AGENT_DIR",
+                "PI_CODING_AGENT_DIR",
+            ]),
             session_dir: path(&["CYRUP_SESSION_DIR", "PI_CODING_AGENT_SESSION_DIR"]),
             package_dir: path(&["CYRUP_PACKAGE_DIR", "PI_PACKAGE_DIR"]),
             offline: first(&["CYRUP_OFFLINE", "PI_OFFLINE"])
@@ -348,6 +364,41 @@ mod tests {
         assert_eq!(dirs.agent_dir, dirs.home.join(".cyrup").join("agent"));
         assert_ne!(dirs.home, dirs.agent_dir);
         assert!(dirs.agent_dir.starts_with(&dirs.home));
+    }
+
+    /// CFG-076 — upstream's ONE agent-dir env name is read by pi core AND both sibling repos
+    /// (`pi-intercom/broker/paths.test.ts:25` asserts `getAgentDirPath` honors
+    /// `PI_CODING_AGENT_DIR`; `pi-subagents/src/shared/utils.ts:96` reads the same name), so
+    /// setting it moves every tree at once. cyrup's rename split that name across crates —
+    /// `CYRUP_AGENT_DIR` in core, `CYRUP_CODING_AGENT_DIR` in `cyrup-intercom` /
+    /// `cyrup-ext-subagents` — so core now reads BOTH and an operator gets one tree either way.
+    #[test]
+    fn both_spellings_of_the_agent_dir_env_reach_the_core_resolver() {
+        let long = EnvVars::from_lookup(|k| {
+            (k == "CYRUP_CODING_AGENT_DIR").then(|| "/opt/long".to_string())
+        });
+        assert_eq!(long.agent_dir, Some(PathBuf::from("/opt/long")));
+
+        let short =
+            EnvVars::from_lookup(|k| (k == "CYRUP_AGENT_DIR").then(|| "/opt/short".to_string()));
+        assert_eq!(short.agent_dir, Some(PathBuf::from("/opt/short")));
+
+        // The documented spelling wins when both are set, and the `PI_` migration fallback stays
+        // last.
+        let both = EnvVars::from_lookup(|k| match k {
+            "CYRUP_AGENT_DIR" => Some("/opt/short".to_string()),
+            "CYRUP_CODING_AGENT_DIR" => Some("/opt/long".to_string()),
+            "PI_CODING_AGENT_DIR" => Some("/opt/legacy".to_string()),
+            _ => None,
+        });
+        assert_eq!(both.agent_dir, Some(PathBuf::from("/opt/short")));
+
+        let legacy = EnvVars::from_lookup(|k| match k {
+            "CYRUP_CODING_AGENT_DIR" => Some("/opt/long".to_string()),
+            "PI_CODING_AGENT_DIR" => Some("/opt/legacy".to_string()),
+            _ => None,
+        });
+        assert_eq!(legacy.agent_dir, Some(PathBuf::from("/opt/long")));
     }
 
     /// CFG-036: Pi normalizes EVERY directory tier, not only the settings one — the CLI flag at

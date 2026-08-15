@@ -267,6 +267,14 @@ pub fn parse_package_command(argv: &[String]) -> Option<ParsedCommand> {
             }
             update_target = Some(UpdateTargetSel::Extensions(Some(ext_source)));
         } else if let Some(src) = source.clone() {
+            // CYRUP-DELTA (SEAM-110) — upstream is `source === "self" || source === "pi"`
+            // (pi v0.83.0 `packages/coding-agent/src/package-manager-cli.ts:348`): exactly TWO self
+            // aliases. cyrup accepts a third, its own name, because that is the spelling a user of a
+            // binary called `cyrup` would actually guess; `self` and `pi` stay accepted as the legacy
+            // spellings so an upstream muscle-memory invocation keeps working. The superset is
+            // harmless — what was NOT harmless is that the help advertised only the `pi` alias and
+            // never the `cyrup` one, so the guessable spelling was the undocumented one. The short
+            // forms in [`render_command_help`] now name `cyrup` and record the other two.
             let source_is_self = src == "self" || src == "pi" || src == "cyrup";
             if source_is_self {
                 update_target = Some(if extensions_flag {
@@ -362,8 +370,14 @@ pub fn render_command_help(command: PackageCommand) -> String {
         // a source install. `--models` IS implemented (pi `refreshModelCatalogs`,
         // package-manager-cli.ts:397-423) and is described exactly as upstream describes it (`:159`,
         // `:169`).
+        //
+        // SEAM-110 — the last short form used to read `cyrup update pi   … (self works as alias to
+        // pi)`, a straight rebrand of pi's `:170`. It advertised the one self alias a cyrup user is
+        // least likely to type and never mentioned `cyrup`, the one they would guess. It now names
+        // `cyrup` and records `self`/`pi` as the other accepted spellings; the accepting code and its
+        // CYRUP-DELTA are at the `source_is_self` binding in [`parse_package_command`].
         PackageCommand::Update => format!(
-            "Usage:\n  {}\n\nUpdate installed packages or model catalogs. Self-update is unavailable in this build.\n\nOptions:\n  --self                  Update {APP} only (UNAVAILABLE — see below; default when no target is given)\n  --extensions            Update installed packages only\n  --models                Refresh model catalogs only\n  --all                   Update {APP} (UNAVAILABLE) and installed packages\n  --extension <source>    Update one package only\n  -a, --approve           Trust project-local files for this command\n  -na, --no-approve       Ignore project-local files for this command\n  --force                 Reinstall {APP} even if the current version is latest (UNAVAILABLE)\n\nShort forms:\n  {APP} update                Update {APP} only (UNAVAILABLE)\n  {APP} update --all          Update {APP} (UNAVAILABLE) and all extensions\n  {APP} update --extensions   Update all installed packages\n  {APP} update --models       Refresh model catalogs only\n  {APP} update <source>       Update one package\n  {APP} update pi             Update {APP} only (self works as alias to pi, UNAVAILABLE)\n\nSelf-update: this build cannot replace its own binary. Update it with:\n  cargo install --git {REPO} {APP}\n",
+            "Usage:\n  {}\n\nUpdate installed packages or model catalogs. Self-update is unavailable in this build.\n\nOptions:\n  --self                  Update {APP} only (UNAVAILABLE — see below; default when no target is given)\n  --extensions            Update installed packages only\n  --models                Refresh model catalogs only\n  --all                   Update {APP} (UNAVAILABLE) and installed packages\n  --extension <source>    Update one package only\n  -a, --approve           Trust project-local files for this command\n  -na, --no-approve       Ignore project-local files for this command\n  --force                 Reinstall {APP} even if the current version is latest (UNAVAILABLE)\n\nShort forms:\n  {APP} update                Update {APP} only (UNAVAILABLE)\n  {APP} update --all          Update {APP} (UNAVAILABLE) and all extensions\n  {APP} update --extensions   Update all installed packages\n  {APP} update --models       Refresh model catalogs only\n  {APP} update <source>       Update one package\n  {APP} update {APP}          Update {APP} only (self and pi also work as aliases, UNAVAILABLE)\n\nSelf-update: this build cannot replace its own binary. Update it with:\n  cargo install --git {REPO} {APP}\n",
             usage(command)
         ),
         PackageCommand::List => format!(
@@ -443,7 +457,9 @@ pub async fn dispatch(
         // `if (rest.includes("-h") || rest.includes("--help")) { printConfigCommandHelp(); return
         // true; }` (package-manager-cli.ts:612-615) — FIRST, before any flag scan, so `config
         // --help` never reaches the picker (SEAM-079).
-        let rest = &argv[1..];
+        // `.get(1..)` rather than `&argv[1..]`: the slice is provably in bounds (the `first()` test
+        // above just matched an element) but the workspace denies `clippy::indexing_slicing`.
+        let rest = argv.get(1..).unwrap_or_default();
         if rest.iter().any(|a| a == "-h" || a == "--help") {
             print!("{}", render_config_help());
             return Ok(Some(0));
@@ -791,7 +807,7 @@ async fn run_update(
 /// needs the installed-package → live-session wiring (`DiscoveryConfig.installed`, gap-07 §1) and
 /// `PackageManager::set_enabled`, both in `cyrup-resources`/`cyrup-session-svc`.
 async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32> {
-    let settings = SettingsManager::load(crate::file_settings_store(dirs), Settings::new(), trusted);
+    let settings = SettingsManager::load(crate::file_settings_store(dirs), trusted);
     let rows = resolve_config_rows(dirs, &settings, trusted).await?;
 
     if rows.is_empty() {
@@ -814,7 +830,7 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
     // two resolves are the same object upstream (`:661-663`).
     let inherited_keys: Vec<String> = if trusted {
         let global_settings =
-            SettingsManager::load(crate::file_settings_store(dirs), Settings::new(), false);
+            SettingsManager::load(crate::file_settings_store(dirs), false);
         resolve_config_rows(dirs, &global_settings, false)
             .await?
             .iter()
@@ -1166,6 +1182,46 @@ mod tests {
                 .unwrap()
                 .command,
             PackageCommand::Remove
+        );
+    }
+
+    /// SEAM-110 — all three self aliases resolve, and the help names the one a cyrup user would
+    /// actually guess.
+    ///
+    /// Upstream accepts exactly two (`source === "self" || source === "pi"`, pi v0.83.0
+    /// `package-manager-cli.ts:348`); cyrup's third is a deliberate CYRUP-DELTA recorded at the
+    /// `source_is_self` binding. What was a defect is that the short-forms block advertised `pi` and
+    /// never `cyrup`, so the accepted spelling closest to hand was the undocumented one.
+    #[test]
+    fn update_accepts_all_three_self_aliases_and_advertises_the_cyrup_one() {
+        for alias in ["self", "pi", "cyrup"] {
+            assert_eq!(
+                parse_package_command(&v(&["update", alias]))
+                    .unwrap()
+                    .update_target,
+                Some(UpdateTargetSel::SelfUpdate),
+                "`cyrup update {alias}` must behave as --self"
+            );
+        }
+        let help = render_command_help(PackageCommand::Update);
+        assert!(
+            help.contains("cyrup update cyrup"),
+            "the guessable alias must be the advertised one: {help}"
+        );
+        assert!(
+            !help.contains("self works as alias to pi"),
+            "the old line named only the alias a cyrup user is least likely to type: {help}"
+        );
+        // Presence before absence: the other two spellings are still recorded as accepted.
+        assert!(help.contains("self and pi also work as aliases"), "{help}");
+        // A non-alias positional is still a package source, not a self-update.
+        assert_eq!(
+            parse_package_command(&v(&["update", "git:github.com/u/r"]))
+                .unwrap()
+                .update_target,
+            Some(UpdateTargetSel::Extensions(Some(
+                "git:github.com/u/r".to_string()
+            )))
         );
     }
 

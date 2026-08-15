@@ -38,7 +38,7 @@ use cyrup::startup::{
     should_run_first_time_setup, should_run_first_time_setup_with,
 };
 use cyrup::{Cli, resolve_app_mode};
-use cyrup_config::{ConfigDirs, Settings, SettingsManager};
+use cyrup_config::{ConfigDirs, SettingsManager};
 use cyrup_session_svc::AppMode;
 use cyrup_tui::TerminalTheme;
 
@@ -369,7 +369,7 @@ fn dirs_under(root: &Path) -> ConfigDirs {
 }
 
 fn manager_for(dirs: &ConfigDirs) -> SettingsManager {
-    SettingsManager::load(cyrup::startup::file_settings_store(dirs), Settings::new(), false)
+    SettingsManager::load(cyrup::startup::file_settings_store(dirs), false)
 }
 
 fn read_settings(dirs: &ConfigDirs) -> serde_json::Value {

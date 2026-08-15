@@ -308,14 +308,14 @@ macro_rules! export_extension {
                 ) {
                     $crate::guest::notify(12, &[&message_json, &delta_json]);
                 }
-                fn on_tool_exec_start(
+                fn on_tool_execution_start(
                     call_id: ::std::string::String,
                     name: ::std::string::String,
                     args_json: ::std::string::String,
                 ) {
                     $crate::guest::notify(13, &[&call_id, &name, &args_json]);
                 }
-                fn on_tool_exec_update(
+                fn on_tool_execution_update(
                     call_id: ::std::string::String,
                     name: ::std::string::String,
                     args_json: ::std::string::String,
@@ -323,7 +323,7 @@ macro_rules! export_extension {
                 ) {
                     $crate::guest::notify(14, &[&call_id, &name, &args_json, &chunk_json]);
                 }
-                fn on_tool_exec_end(
+                fn on_tool_execution_end(
                     call_id: ::std::string::String,
                     name: ::std::string::String,
                     result_json: ::std::string::String,

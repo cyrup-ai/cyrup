@@ -1,19 +1,29 @@
 //! Slash-command registry, parse & dispatch (spec/tui/04 §2; gaps 2/19/20).
 //!
-//! A 1:1 port of Pi's builtin command surface (`core/slash-commands.ts:18-41`
-//! `BUILTIN_SLASH_COMMANDS`) plus the submit-handler dispatch chain
-//! (`interactive-mode.ts:2549-2734` `setupEditorSubmitHandler`). The registry is **display order**
+//! A 1:1 port of Pi's builtin command surface (`packages/coding-agent/src/core/slash-commands.ts:19-42`
+//! `BUILTIN_SLASH_COMMANDS` @v0.83.0) plus the submit-handler dispatch chain
+//! (`interactive-mode.ts:2660-2846` `setupEditorSubmitHandler` @v0.83.0). The registry is **display order**
 //! (NOT alphabetical) and feeds both autocomplete (`autocomplete.rs`) and dispatch.
 //!
 //! Dispatch is intentionally **neutral**: [`CommandRegistry::dispatch`] classifies a submitted line
 //! into a [`Dispatch`] (a builtin command + argument, a bash invocation, or an agent prompt) without
 //! performing any side effect — the app shell runs the resulting action (opening an overlay, calling
 //! the runtime, etc.). This mirrors Pi, where completion never executes and dispatch is a pure
-//! `trim()`-then-if-chain on the exact text (`interactive-mode.ts:2554`).
+//! `trim()`-then-if-chain on the exact text (`interactive-mode.ts:2662` @v0.83.0).
 use std::borrow::Cow;
 
-/// Where a command came from (`slash-commands.ts`; `interactive-mode.ts:443-467`). Only [`Builtin`]
-/// commands ship in this crate; the dynamic sources are merged by the app from session resources.
+/// Where a command came from. Only [`Builtin`] commands ship in this crate; the dynamic sources are
+/// merged by the app from session resources (`interactive-mode.ts:592-621` @v0.83.0 builds pi's
+/// three dynamic blocks — templates, extension commands, skills).
+///
+/// TUI-086, and the reason this enum is NOT the port of pi's `SlashCommandSource`: upstream's union
+/// is exactly `"extension" | "prompt" | "skill"` (`core/slash-commands.ts:4` @v0.83.0), and
+/// `BuiltinSlashCommand` (`:13-17`) has **no `source` field at all** — builtins are a different
+/// TYPE upstream. cyrup unified the two into one struct, which forces this fourth variant.
+/// [`Builtin`] is therefore cyrup-only and **must never be serialized as a `SlashCommandSource`**:
+/// anything crossing the RPC or WIT boundary with it emits a value pi has no word for. TUI-087: the
+/// `interactive-mode.ts:443-467` this used to cite is a getter and the constructor's opening at the
+/// ported tag — it has nothing to do with command provenance.
 ///
 /// [`Builtin`]: CommandSource::Builtin
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,15 +50,22 @@ pub struct SlashCommand {
     pub argument_hint: Option<Cow<'static, str>>,
     /// Provenance.
     pub source: CommandSource,
-    /// Whether the command provides argument completion (only `/model` in Pi, `:498-528`).
+    /// Whether the command provides argument completion.
+    ///
+    /// TUI-087: this said "only `/model` in Pi, `:498-528`" and was wrong on both halves. pi assigns
+    /// `getArgumentCompletions` to **two** builtins at v0.83.0 — `/model`
+    /// (`interactive-mode.ts:555`) and `/login` (`:582`) — which is what the `arg_cmd("login", …)`
+    /// row six lines below already reflects; and `:498-528` is `getAutocompleteSourceTag` /
+    /// `prefixAutocompleteDescription`, neither of which is a completer.
     pub has_arg_completion: bool,
 }
 
-/// The 22 builtin slash commands in Pi display/autocomplete order (`slash-commands.ts:18-41`).
+/// The 22 builtin slash commands in Pi display/autocomplete order
+/// (`core/slash-commands.ts:19-42` @v0.83.0).
 /// NOT alphabetical — order is user-visible and preserved exactly.
 pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     cmd("settings", "Open settings menu", None),
-    // TUI-025 — pi's hint is `"<provider/model>"` (`slash-commands.ts:21` @v0.84.1); `"<model>"`
+    // TUI-025 — pi's hint is `"<provider/model>"` (`slash-commands.ts:21` @v0.83.0); `"<model>"`
     // understated the required form and left the user guessing at the `provider/` half.
     arg_cmd("model", "Select model (opens selector UI)", "<provider/model>"),
     cmd("scoped-models", "Enable/disable models for Ctrl+P cycling", None),
@@ -64,14 +81,14 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     cmd("clone", "Duplicate the current session at the current position", None),
     cmd("tree", "Navigate session tree (switch branches)", None),
     cmd("trust", "Save project trust decision for future sessions", None),
-    // TUI-025 — pi carries `argumentHint: "<provider>"` here (`slash-commands.ts:35`); cyrup had no
+    // TUI-025 — pi carries `argumentHint: "<provider>"` here (`slash-commands.ts:35` @v0.83.0); cyrup had no
     // hint at all, which is also what left `has_arg_completion` false for `/login`.
     arg_cmd("login", "Configure provider authentication", "<provider>"),
     cmd("logout", "Remove provider authentication", None),
     cmd("new", "Start a new session", None),
     cmd("compact", "Manually compact the session context", None),
     cmd("resume", "Resume a different session", None),
-    // TUI-025 — `slash-commands.ts:40`: `"Reload keybindings, extensions, skills, prompts, themes,
+    // TUI-025 — `slash-commands.ts:40` @v0.83.0: `"Reload keybindings, extensions, skills, prompts, themes,
     // and context files"`. `/reload` does reload context files, so the shorter sentence was wrong,
     // not merely shorter.
     cmd(
@@ -79,11 +96,18 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
         "Reload keybindings, extensions, skills, prompts, themes, and context files",
         None,
     ),
+    // TUI-083 — upstream this description is not a literal: `slash-commands.ts:41` @v0.83.0 reads
+    // `` `Quit ${APP_NAME}` `` where `APP_NAME = piConfigName || "pi"` (`config.ts:489`), so a user
+    // running under a renamed config sees their own app name. cyrup has no config-name override to
+    // template against, so the literal is a DECISION, recorded here rather than left as an accident:
+    // the moment such an override is added, this line is the one that has to change.
     cmd("quit", "Quit cyrup", None),
 ];
 
 /// Hidden / undocumented commands dispatched but kept out of autocomplete
-/// (`interactive-mode.ts:2657-2671`): `/debug` + the two easter eggs.
+/// (`interactive-mode.ts:2769-2783` @v0.83.0 — `/debug` `:2769`, `/arminsayshi` `:2774`,
+/// `/dementedelves` `:2779`): `/debug` + the two easter eggs. TUI-087: the `:2657-2671` this cited
+/// is a v0.84.1-era offset; at the ported tag it lands inside `setupEditorSubmitHandler`'s opening.
 pub const HIDDEN_COMMANDS: &[&str] = &["debug", "arminsayshi", "dementedelves"];
 
 /// TUI-074 — the **only** dispatch names that accept an argument
@@ -190,14 +214,32 @@ impl CommandRegistry {
     pub fn with_dynamic(dynamic: impl IntoIterator<Item = SlashCommand>) -> Self {
         let mut registry = Self::new();
         // Builtins win a name collision: pi resolves duplicate registrations by suffixing the
-        // LATER one (`runner.ts:556-595` `invocation_name`), never by shadowing an existing name.
+        // LATER one (`runner.ts:598-641` `invocationName`), never by shadowing an existing name.
         let existing: std::collections::HashSet<String> =
             registry.commands.iter().map(|c| c.name.to_string()).collect();
-        for cmd in dynamic {
-            if !existing.contains(cmd.name.as_ref()) {
-                registry.commands.push(cmd);
-            }
-        }
+        let mut merged: Vec<SlashCommand> =
+            dynamic.into_iter().filter(|c| !existing.contains(c.name.as_ref())).collect();
+        // TUI-075 — pi's display order is builtins → PROMPT TEMPLATES → extension commands → skills
+        // (`interactive-mode.ts:625` @v0.83.0, `[...slashCommands, ...templateCommands,
+        // ...extensionCommands, ...skillCommandList]`). The catalog this list comes from emits
+        // extensions FIRST (`cyrup-session-svc/src/session.rs:2503` extensions, `:2517` prompts,
+        // `:2526` skills) because it is also the RPC `get_commands` payload, whose order is pi's RPC
+        // order and must not be changed to fix an interactive display. So the reorder happens here,
+        // at the one consumer that shows the list. Order is user-visible: an empty `/` query returns
+        // the items unfiltered on both sides (pi `fuzzy.ts:100-102`, cyrup `fuzzy.rs::filter`), so a
+        // user with several extensions had to scroll past them to reach their own prompt templates.
+        //
+        // A STABLE sort, so within a source the catalog's own order (extension LOAD order, and the
+        // resource loaders' winner order) survives — that ordering is load-bearing upstream too.
+        merged.sort_by_key(|c| match c.source {
+            CommandSource::Prompt => 0u8,
+            CommandSource::Extension => 1,
+            CommandSource::Skill => 2,
+            // Unreachable through `dynamic_commands_from_catalog_gated`, which never emits a builtin
+            // row; ordered first so a hand-built one cannot land after the dynamic blocks.
+            CommandSource::Builtin => 0,
+        });
+        registry.commands.extend(merged);
         registry
     }
 
@@ -214,7 +256,7 @@ impl CommandRegistry {
 
     /// Classify a submitted line (spec/tui/04 §2.3). Pure: no side effects, no I/O.
     ///
-    /// Order (load-bearing, matching `interactive-mode.ts:2554-2734`):
+    /// Order (load-bearing, matching `interactive-mode.ts:2660-2846` @v0.83.0):
     /// 1. `trim()`; empty → [`Dispatch::Empty`].
     /// 2. A slash command via **exact** match, plus the `"name "`-prefix form for the six names in
     ///    [`ARGUMENT_DISPATCH_NAMES`] (so `/modelX` is NOT `/model`, and `/quit now` is NOT
@@ -259,7 +301,7 @@ impl CommandRegistry {
             }
             if !ARGUMENT_DISPATCH_NAMES.contains(&name) {
                 // Strict equality upstream, so `/quit now`, `/copy that`, `/new session` and
-                // `/trust me` are prompts, not commands (`interactive-mode.ts:2666-2793`).
+                // `/trust me` are prompts, not commands (`interactive-mode.ts:2666-2793` @v0.83.0).
                 continue;
             }
             // `"name "`-prefixed: an argument follows. `strip_prefix(name)` then a leading space.
@@ -273,33 +315,81 @@ impl CommandRegistry {
     }
 }
 
-/// pi `getAutocompleteSourceTag` (`interactive-mode.ts:536-559`): the short provenance tag shown
-/// before a non-builtin command's description.
+/// pi `getAutocompleteSourceTag(sourceInfo?)` (`interactive-mode.ts:497-520` @v0.83.0): the short
+/// provenance tag shown before a non-builtin command's description.
 ///
-/// `scope` picks the prefix (`user`→`u`, `project`→`p`, anything else→`t`), and the `source` only
-/// widens it for package origins: `npm:…` and git URLs get appended, while `auto`/`local`/`cli`
-/// — and every unrecognized source, via pi's final `return scopePrefix` — stay bare.
+/// `None` when the row carries NO `sourceInfo` — pi's `if (!sourceInfo) return undefined` (`:498-500`).
+/// TUI-085: this used to take a bare `scope` defaulted to `"temporary"` by the caller and always
+/// return a tag, so a `sourceInfo`-less row rendered `[t] desc` — a provenance claim ("came from a
+/// temporary scope") that upstream does not make and that may be false. A wrong tag is worse than
+/// none. Unreachable through cyrup's own catalog, which always emits `sourceInfo`; kept honest
+/// because the option-ness is the contract, not the current callers.
+///
+/// Otherwise `scope` picks the prefix (`user`→`u`, `project`→`p`, anything else→`t`), and `source`
+/// only widens it for package origins: `npm:…` and git URLs get appended, while `auto`/`local`/`cli`
+/// — and every unrecognized source, via pi's final `return scopePrefix` (`:519`) — stay bare.
+///
+/// TUI-086: `pub(crate)`, not `pub`. Upstream's is a PRIVATE method on `InteractiveMode`
+/// (`interactive-mode.ts:497`), and there is no cross-crate caller at HEAD; a wider surface than
+/// pi's invites callers upstream has no counterpart for.
 #[must_use]
-pub fn autocomplete_source_tag(scope: &str, source: &str) -> String {
-    let scope_prefix = match scope {
-        "user" => "u",
-        "project" => "p",
+pub(crate) fn autocomplete_source_tag(source_info: Option<&serde_json::Value>) -> Option<String> {
+    let info = source_info?;
+    let scope_prefix = match info.get("scope").and_then(serde_json::Value::as_str) {
+        Some("user") => "u",
+        Some("project") => "p",
         _ => "t",
     };
-    let source = source.trim();
+    let source = info.get("source").and_then(serde_json::Value::as_str).unwrap_or("").trim();
     if source.starts_with("npm:") {
-        return format!("{scope_prefix}:{source}");
+        return Some(format!("{scope_prefix}:{source}"));
     }
-    // pi also special-cases a parseable git URL (`:552-556`). cyrup's catalog synthesizes
+    // pi also special-cases a parseable git URL (`:513-518`). cyrup's catalog synthesizes
     // `source: "extension"|"prompt"|"skill"` for every row it emits, so no row reaches that arm
     // today; it falls through to pi's own `return scopePrefix` default either way.
-    scope_prefix.to_string()
+    Some(scope_prefix.to_string())
 }
 
-/// pi `prefixAutocompleteDescription` (`interactive-mode.ts:561-567`): `[tag] description`, or a
-/// bare `[tag]` when the command carries no description.
+/// pi `getPathCommandArgument` (`interactive-mode.ts:5450-5477` @v0.83.0), called at `:5435`
+/// (`/export`) and `:5480` (`/import`) — ONE quote-aware token, not the whole remainder (TUI-079).
+///
+/// `arg` is what [`CommandRegistry::dispatch`] already produced: the text after `"/export "` /
+/// `"/import "`, trimmed. Upstream takes the raw line and does the slicing itself; the outcome is
+/// identical, because its `argsString` is `trimStart()`ed and any trailing whitespace is cut by the
+/// same `search(/\s/)` that cuts a second token.
+///
+/// The three rules, in pi's order:
+/// * a leading `"` or `'` runs to its MATCHING close, and the quotes are stripped (`:5464-5470`);
+/// * an UNTERMINATED quote is `undefined` — a refusal, not a best-effort path (`:5467-5469`);
+/// * otherwise the token ends at the first whitespace (`:5472-5476`).
+///
+/// Deliberately NOT a general dispatch rule: `/name`, `/compact`, `/model` and `/login` take their
+/// remainder whole upstream, so this is applied at the `/export` and `/import` arms only.
 #[must_use]
-fn prefix_autocomplete_description(description: &str, tag: &str) -> String {
+pub(crate) fn path_command_argument(arg: &str) -> Option<String> {
+    let args = arg.trim_start();
+    if args.is_empty() {
+        return None;
+    }
+    let first = args.chars().next()?;
+    if first == '"' || first == '\'' {
+        let rest = &args[first.len_utf8()..];
+        // `indexOf(firstChar, 1)`: the matching close. `< 0` (none) is upstream's `undefined`.
+        let close = rest.find(first)?;
+        return Some(rest[..close].to_string());
+    }
+    match args.find(char::is_whitespace) {
+        Some(ws) => Some(args[..ws].to_string()),
+        None => Some(args.to_string()),
+    }
+}
+
+/// pi `prefixAutocompleteDescription` (`interactive-mode.ts:522-528` @v0.83.0): `[tag] description`,
+/// or a bare `[tag]` when the command carries no description — and the description UNPREFIXED when
+/// there is no tag at all (`if (!sourceTag) return description`, `:524-526`; TUI-085).
+#[must_use]
+fn prefix_autocomplete_description(description: &str, tag: Option<&str>) -> String {
+    let Some(tag) = tag else { return description.to_string() };
     if description.is_empty() {
         format!("[{tag}]")
     } else {
@@ -325,16 +415,22 @@ pub fn dynamic_commands_from_catalog(catalog: &[serde_json::Value]) -> Vec<Slash
 /// [`dynamic_commands_from_catalog`], with the `enableSkillCommands` setting applied.
 ///
 /// Pi builds the interactive autocomplete list in `createBaseAutocompleteProvider`
-/// (`interactive-mode.ts:610-622`) and wraps the `skill:<name>` half in
+/// (`interactive-mode.ts:609-621` @v0.83.0) and wraps the `skill:<name>` half in
 /// `if (this.settingsManager.getEnableSkillCommands())` — so a `false` setting removes every skill
 /// from the `/` menu while leaving extension commands and prompt templates alone. The gate is
-/// **interactive-only**: Pi's `get_commands` RPC (`rpc-mode.ts:676-690`) emits skills
+/// **interactive-only**: Pi's `get_commands` RPC (`modes/rpc/rpc-mode.ts:677-707` @v0.83.0) emits skills
 /// unconditionally, which is why `AgentSession::slash_command_catalog()` — the port of that RPC
 /// handler — stays ungated and the filtering happens here, at the one consumer Pi gates.
 ///
+/// TUI-087: this paragraph used to name `AgentSession::expand_slash_command`, a function that has
+/// never existed in this workspace — a fabricated symbol inside an otherwise-correct behavioural
+/// claim, which is the worst kind: it reads as verified and cannot be checked.
+///
 /// Note the gate is autocomplete visibility only, in cyrup as in Pi: dynamic commands are never
 /// added to `dispatch_names`, and `/skill:<name>` expansion happens server-side in
-/// `AgentSession::expand_slash_command`, so a hidden skill typed out in full still runs — exactly
+/// `AgentSession::expand_input_text` / `expand_skill_command`
+/// (`cyrup-session-svc/src/session.rs:1208`, `:1216`), so a hidden skill typed out in full still
+/// runs — exactly
 /// as Pi's `skillCommands` map (populated at `:616`, read nowhere) leaves it.
 #[must_use]
 pub fn dynamic_commands_from_catalog_gated(
@@ -360,21 +456,25 @@ pub fn dynamic_commands_from_catalog_gated(
                 .get("description")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("");
-            let info = row.get("sourceInfo");
-            let scope = info
-                .and_then(|i| i.get("scope"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("temporary");
-            let info_source = info
-                .and_then(|i| i.get("source"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or(source);
-            let tag = autocomplete_source_tag(scope, info_source);
+            // TUI-085: pass the whole `sourceInfo` (absent = `None`), the way pi passes
+            // `cmd.sourceInfo` straight into `prefixAutocompleteDescription` (`:595`, `:606`,
+            // `:619`). The old code defaulted a missing scope to `"temporary"`, which INVENTED a
+            // `[t]` provenance for a row that declared none.
+            let tag = autocomplete_source_tag(row.get("sourceInfo"));
             Some(SlashCommand {
                 name: Cow::Owned(name.to_string()),
-                description: Cow::Owned(prefix_autocomplete_description(description, &tag)),
+                description: Cow::Owned(prefix_autocomplete_description(
+                    description,
+                    tag.as_deref(),
+                )),
                 argument_hint: None,
                 source: kind,
+                // EXT-013 / TUI-012: still hardcoded, and it CANNOT be resolved in this crate —
+                // `slash_command_catalog()` (`cyrup-session-svc/src/session.rs:2503-2532`) emits no
+                // key saying whether a registered command declared `getArgumentCompletions`
+                // (pi carries the callback itself onto the autocomplete row, `:607`). The producer
+                // side exists (`cyrup-ext` `registry::command_autocomplete()`, fed by
+                // `live.rs::add_autocomplete`); what is missing is one key on the catalog row.
                 has_arg_completion: false,
             })
         })

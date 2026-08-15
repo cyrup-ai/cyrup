@@ -163,9 +163,12 @@ fn push_registrations(api: &ExtensionApi) {
     for command in &api.autocomplete {
         registration::add_autocomplete(command);
     }
-    // One `add-autocomplete-provider` per stacked global provider (Pi addAutocompleteProvider).
+    // One `add-autocomplete-provider` per stacked global provider (Pi `addAutocompleteProvider`,
+    // `extensions/types.ts:225` @v0.83.0). EXT-065: this import moved from `registration` to `ui`,
+    // where the manifest's `capabilities.ui` grant gates it — a guest with no `ui` grant now gets
+    // its providers refused host-side instead of silently stacked onto the core input editor.
     for _ in 0..api.autocomplete_provider_count() {
-        registration::add_autocomplete_provider();
+        ui::add_autocomplete_provider();
     }
     // Declare each inter-extension bus topic this guest listens on (Pi `pi.events.on`,
     // event-bus.ts:18) so the host fans a matching `bus.emit` out to our `bus-deliver` export.

@@ -680,14 +680,29 @@ impl ExtensionApi {
         });
     }
 
-    /// Add an autocomplete provider for a command (R-08-021).
+    /// Declare that `command` supplies argument completions — the host then calls this guest's
+    /// `argument-completions` export for it.
+    ///
+    /// [CYRUP-DELTA] EXT-062: upstream this is not a call but a FIELD on the options bag passed to
+    /// `registerCommand` — `getArgumentCompletions?: (argumentPrefix: string) => AutocompleteItem[]
+    /// | null | Promise<…>` (`extensions/types.ts:1166` @v0.83.0). A closure cannot cross the
+    /// component boundary, so the declaration and the callback separate: this flag, and the export.
+    /// Same inversion as `prepare_arguments` / `has_renderer` on a tool descriptor. `R-08-021` is a
+    /// cyrup requirement id, not a pi citation.
     pub fn add_autocomplete(&mut self, command: impl Into<String>) {
         self.autocomplete.push(command.into());
     }
 
     /// Stack a global autocomplete provider on top of the current one (Pi `addAutocompleteProvider`,
-    /// types.ts:218; sdk gap #2). Providers are folded in registration order: each sees the wrapped
-    /// ("current") provider's suggestions and may augment or replace them.
+    /// `extensions/types.ts:225` @v0.83.0 — the `:218` this used to cite is `getEditorText`'s doc
+    /// line, the declaration being `:219`).
+    /// Providers are folded in registration order: each sees the wrapped ("current") provider's
+    /// suggestions and may augment or replace them.
+    ///
+    /// EXT-065: the declaring import is `ui.add-autocomplete-provider`, not
+    /// `registration.add-autocomplete-provider` — upstream declares this inside `ExtensionUIContext`,
+    /// and on cyrup that placement is what puts it behind the manifest's `capabilities.ui` grant. A
+    /// guest without that grant has its providers refused host-side.
     pub fn add_autocomplete_provider(&mut self, provider: impl AutocompleteProvider) {
         self.autocomplete_providers.push(Box::new(provider));
     }

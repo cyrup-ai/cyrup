@@ -321,6 +321,11 @@ pub enum AppCommand {
     Copy,
     /// `/name <name>` — set the session display name (`handleNameCommand`).
     SetName(String),
+    /// `/name` with NO argument — the GETTER half of `handleNameCommand`
+    /// (`interactive-mode.ts:5632-5644` @v0.83.0): with a name set it reports it, and only with no
+    /// name set does it warn about usage (TUI-080). Needs the run loop because the stored name lives
+    /// on the session, which `run_command` cannot reach.
+    ShowName,
     /// `/session` — show session info + stats (`handleSessionCommand`).
     SessionInfo,
     /// `/resume` in-list delete of a persisted session file (session-selector.ts:540 →
@@ -2118,16 +2123,25 @@ impl<B: Backend> App<B> {
             "compact" => cmd(C::Compact(arg)),
             "clone" => cmd(C::Clone),
             "reload" => cmd(C::Reload),
-            "export" => cmd(C::Export(arg)),
-            "import" => cmd(C::Import(arg)),
+            // TUI-079 — `/export` and `/import` take ONE quote-aware token, not the whole
+            // remainder: pi runs both through `getPathCommandArgument`
+            // (`interactive-mode.ts:5435`, `:5480` @v0.83.0). Without it
+            // `/export "my session.html"` wrote a file whose name contained the quote characters,
+            // `/export a.html junk` wrote to the path `a.html junk`, and an unterminated quote —
+            // which upstream REFUSES — was accepted as a path. A refusal arrives here as `None`,
+            // which is already each arm's no-argument branch: usage for `/import`, and the
+            // session-directory default for `/export`, exactly as upstream's `undefined` does.
+            "export" => cmd(C::Export(arg.as_deref().and_then(crate::commands::path_command_argument))),
+            "import" => cmd(C::Import(arg.as_deref().and_then(crate::commands::path_command_argument))),
             "share" => cmd(C::Share),
             "copy" => cmd(C::Copy),
+            // TUI-080 — `/name` with no argument is a GETTER upstream, not a usage error. This arm
+            // used to print `usage: /name <session name>` unconditionally, so a user who typed
+            // `/name` to CHECK the session's name was told they had used the command wrong, and the
+            // only way to read the name was `/session`.
             "name" => match arg {
                 Some(n) => cmd(C::SetName(n)),
-                None => {
-                    self.state.transcript.push_status("usage: /name <session name>");
-                    AppAction::Redraw
-                }
+                None => cmd(C::ShowName),
             },
             "session" => cmd(C::SessionInfo),
             // --- in-crate info blocks ---
@@ -4882,8 +4896,14 @@ impl<B: Backend> App<B> {
                     let path = arg.as_deref().map(std::path::Path::new);
                     match session.export_to_jsonl(path).await {
                         Ok(_) => {
+                            // TUI-082 — one status string for BOTH branches, pi's:
+                            // `Session exported to: ${filePath}` (`interactive-mode.ts:5440`
+                            // jsonl / `:5443` html @v0.83.0). The two branches used to disagree
+                            // with each other as well as with upstream.
                             let label = arg.unwrap_or_default();
-                            self.state.transcript.push_status(format!("exported session → {label}"));
+                            self.state
+                                .transcript
+                                .push_status(format!("Session exported to: {label}"));
                         }
                         Err(e) => self.state.transcript.push_status(format!("export error: {e}")),
                     }
@@ -4892,18 +4912,48 @@ impl<B: Backend> App<B> {
                     match session.export_to_jsonl(None).await {
                         Ok(Some(jsonl)) => {
                             let html = crate::export::session_jsonl_to_html(&jsonl);
-                            match &arg {
-                                Some(path) => match std::fs::write(path, &html) {
-                                    Ok(()) => self
-                                        .state
-                                        .transcript
-                                        .push_status(format!("exported session → {path}")),
+                            // TUI-082 — bare `/export` WRITES A FILE. It used to `push_block` the
+                            // raw HTML into the transcript, so the single most likely invocation
+                            // produced no artifact and flooded scrollback with markup the user
+                            // could not do anything with. There is no upstream branch that
+                            // corresponds to it: pi always writes and always reports a path
+                            // (`handleExportCommand`, `interactive-mode.ts:5434-5447` @v0.83.0).
+                            //
+                            // The default name is pi's LITERAL mechanism, and it is NOT what
+                            // `agent-session.ts:3213`'s doc comment says ("defaults to session
+                            // directory") — the code is `exportSessionToHtml`
+                            // (`core/export-html/index.ts:274-278` @v0.83.0):
+                            //   `outputPath = `${APP_NAME}-session-${basename(sessionFile,".jsonl")}.html``
+                            // i.e. a RELATIVE name resolved against the process cwd, not a path
+                            // under the session directory. Ported as written, with `cyrup` for
+                            // `APP_NAME` (TUI-083 — cyrup has no config-name override).
+                            let target = match &arg {
+                                Some(path) => Some(std::path::PathBuf::from(path)),
+                                None => session.session_file().await.map(|f| {
+                                    let stem = f
+                                        .file_stem()
+                                        .map(|s| s.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| "session".into());
+                                    std::path::PathBuf::from(format!("cyrup-session-{stem}.html"))
+                                }),
+                            };
+                            match target {
+                                Some(path) => match std::fs::write(&path, &html) {
+                                    Ok(()) => self.state.transcript.push_status(format!(
+                                        "Session exported to: {}",
+                                        path.display()
+                                    )),
                                     Err(e) => self
                                         .state
                                         .transcript
                                         .push_status(format!("export error: {e}")),
                                 },
-                                None => self.state.transcript.push_block("Session (HTML)", html),
+                                // pi throws "Cannot export in-memory session to HTML"
+                                // (`export-html/index.ts:243-245`) when there is no session file;
+                                // an unpersisted session has no basename to build the name from.
+                                None => self.state.transcript.push_status(
+                                    "export error: cannot export an in-memory session to HTML",
+                                ),
                             }
                         }
                         Ok(None) => self.state.transcript.push_status("exported session"),
@@ -4911,9 +4961,38 @@ impl<B: Backend> App<B> {
                     }
                 }
             }
+            // `handleNameCommand`'s SETTER half (`interactive-mode.ts:5645-5653` @v0.83.0).
+            // TUI-080: the echo is the STORED name, re-read after the write, not the input — the
+            // store normalizes, and echoing the input told the user a name was set that `/resume`
+            // would not show. When the two differ upstream warns first (`:5648-5650`), verbatim
+            // including the JSON quoting of both values.
             C::SetName(name) => match session.set_session_name(&name).await {
-                Ok(()) => self.state.transcript.push_status(format!("session name → {name}")),
+                Ok(()) => {
+                    let stored = session.session_name().await;
+                    if stored.as_deref() != Some(name.as_str()) {
+                        self.state.transcript.push_warning(format!(
+                            "Session name was normalized from {} to {}",
+                            serde_json::to_string(&name).unwrap_or_else(|_| format!("{name:?}")),
+                            match &stored {
+                                Some(s) => serde_json::to_string(s)
+                                    .unwrap_or_else(|_| format!("{s:?}")),
+                                None => "null".to_string(),
+                            },
+                        ));
+                    }
+                    let shown = stored.unwrap_or(name);
+                    self.state.transcript.push_status(format!("Session name set: {shown}"));
+                }
                 Err(e) => self.state.transcript.push_status(format!("name error: {e}")),
+            },
+            // TUI-080 / TUI-084 — the getter, and pi's severity CHANNEL for the usage line: a
+            // `showWarning` (`interactive-mode.ts:5638`), not a neutral status, and pi's exact
+            // string `Usage: /name <name>` rather than cyrup's `usage: /name <session name>`.
+            C::ShowName => match session.session_name().await {
+                Some(name) => {
+                    self.state.transcript.push_status(format!("Session name: {name}"))
+                }
+                None => self.state.transcript.push_warning("Usage: /name <name>"),
             },
             C::Copy => match session.last_assistant_text().await {
                 Some(text) => {
@@ -5021,7 +5100,13 @@ impl<B: Backend> App<B> {
                     }
                     Err(e) => self.state.transcript.push_status(format!("import error: {e}")),
                 },
-                (Some(_), None) => self.state.transcript.push_status("usage: /import <path>"),
+                // TUI-084 — pi's string and pi's CHANNEL: `Usage: /import <path.jsonl>` through
+                // `showError` (`interactive-mode.ts:5482` @v0.83.0). cyrup dropped the `.jsonl`
+                // constraint, lowercased the word, and routed a real error to the neutral status
+                // line, where it is neither coloured nor prefixed as a problem.
+                (Some(_), None) => {
+                    self.state.transcript.push_error("Usage: /import <path.jsonl>")
+                }
                 (None, p) => self
                     .state
                     .transcript

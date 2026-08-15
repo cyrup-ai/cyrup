@@ -25,8 +25,8 @@ use cyrup::{
     should_take_over_stdout, spawn_abort_on_signal, subcommands, timings,
 };
 use cyrup_config::{
-    AuthStore, CliConfigOverrides, ConfigDirs, DefaultProjectTrust, EnvVars, Settings,
-    SettingsManager, SettingsScope,
+    AuthStore, CliConfigOverrides, ConfigDirs, DefaultProjectTrust, EnvVars, SettingsManager,
+    SettingsScope,
 };
 use cyrup_resources::theme::ThemeWatcher;
 use cyrup_sdk::core::CancelToken;
@@ -140,6 +140,45 @@ async fn run() -> anyhow::Result<i32> {
         return Ok(cyrup::intercom_broker_cmd::dispatch().await);
     }
 
+    // PROV-047 — the BOOTSTRAP `httpProxy` install, Pi main.ts:536-538 @v0.83.0:
+    //
+    // ```ts
+    // const bootstrapSettingsManager = SettingsManager.create(cwd, agentDir, { projectTrusted: false });
+    // applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy);
+    // configureHttpDispatcher();
+    // ```
+    //
+    // It sits HERE — above the package/config subcommand pre-dispatch (pi `handlePackageCommand`,
+    // main.ts:541), above the credential-print pre-dispatch (`runCredentialPrintCommand`, :557) and
+    // above `parseArgs` (:562) — because every one of those can egress before a session exists:
+    // `cyrup auth check` / `print-bearer-token` REFRESHES an expired OAuth credential by default
+    // (`credential_print.rs`), and `restore_model_catalog` / the catalog revalidation and update
+    // check all run upstream of `SessionBuilder::build`. Until this call landed, the only
+    // `configure_http_proxy` in the process was the one in `cyrup-session-svc/src/builder.rs:1462`
+    // (pi's SECOND call, main.ts:801), so a user whose network requires `httpProxy` got a working
+    // chat and a silently-direct login — the exact split PROV-047 names.
+    //
+    // `projectTrusted: false` is pi's, verbatim, and is why the store is loaded untrusted here; the
+    // key is `GLOBAL_ONLY` besides (CFG-057). `EnvVars::default()` is passed to the accessor rather
+    // than the real environment so the SETTING alone is installed: pi's `??=` gives an ambient
+    // `HTTP_PROXY`/`HTTPS_PROXY` precedence, and that precedence lives in the resolver
+    // (`node_http_proxy::get_proxy_env`, which consults `configured_http_proxy` only after all four
+    // ambient lookups miss). Passing the real env here would invert it (CFG-060).
+    //
+    // pi's paired `configureHttpDispatcher()` with no argument installs `DEFAULT_HTTP_IDLE_TIMEOUT_MS`
+    // — which is already the initial value of cyrup's process-global
+    // (`cyrup_provider::stream::sse::HTTP_IDLE_TIMEOUT_MS`), so there is no second call to make: the
+    // settings-driven `configure_http_idle_timeout` at builder.rs:1475 is pi's `:802`.
+    {
+        let env = EnvVars::from_process();
+        if let Ok(dirs) = ConfigDirs::resolve(&CliConfigOverrides::default(), &env) {
+            let bootstrap = SettingsManager::load(file_settings_store(&dirs), false);
+            cyrup_provider::configure_http_proxy(
+                bootstrap.effective().http_proxy(&EnvVars::default()),
+            );
+        }
+    }
+
     // Package/config subcommand pre-dispatch (Pi main.ts:486, before arg parsing). Resolve dirs with
     // no CLI overrides for the subcommand's package/project roots.
     if subcommands::first_subcommand(&argv).is_some() {
@@ -178,6 +217,10 @@ async fn run() -> anyhow::Result<i32> {
     // `value_delimiter = ','` splits but never trims, so `--tools "read, grep"` would otherwise keep
     // `" grep"` and silently drop the tool. Run before any consumer reads these Vecs.
     cli.normalize_list_flags();
+    // SEAM-107: put back the literal spelling of a `-p ---…` escape-hatch message (pi
+    // args.ts:140-146). Must run before anything reads `positionals` — `--export`'s output path and
+    // `split_file_args` both do, immediately below.
+    cli.restore_escaped_positionals();
     init_tracing(cli.verbose);
     timings::time("parseArgs", timings::TimingLabel::Main);
 
@@ -196,6 +239,26 @@ async fn run() -> anyhow::Result<i32> {
     if cli.version {
         println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
+    }
+
+    // `--export <session> [out]` (Pi main.ts:578-590) — a standalone action that runs and exits.
+    //
+    // SEAM-106: this used to sit ~130 lines further down, DOWNSTREAM of four guards pi runs it
+    // upstream of — `validateForkFlags`/`validateSessionIdFlags` (pi `:603-604`), the RPC `@file`
+    // guard (`:598-601`) and the `--api-key requires a model` bail (`:757-761`) — so
+    // `cyrup --export s.jsonl --api-key K` and `cyrup --export s.jsonl --fork X --continue` errored
+    // where pi exports and exits 0. Export is what a user reaches for when the session is ALREADY in
+    // a bad state, so the guards fired on exactly the invocations that need it most. Upstream's only
+    // predecessors are `parseArgs` + the diagnostics gate (`:562-570`) and the `--version` exit
+    // (`:573-576`), which are the two blocks directly above.
+    //
+    // The optional output path is pi's `parsed.messages.length > 0 ? parsed.messages[0] : undefined`
+    // (`:580`) — the MESSAGE list, from which `@file` tokens have already been partitioned away
+    // (args.ts:186-187). cyrup read `cli.positionals.first()`, which still holds them, so
+    // `cyrup --export s.jsonl @notes.md` wrote its HTML to a file literally named `@notes.md`.
+    if let Some(export) = &cli.export {
+        let messages = cyrup::split_positionals(&cli.positionals).1;
+        return export_session_html(export, messages.first().map(String::as_str)).await;
     }
 
     // `--tui-mode fullscreen` parses (pi args.ts:180-192 @v0.84.1) and is then declined HERE, at
@@ -278,7 +341,7 @@ async fn run() -> anyhow::Result<i32> {
     // project's `.cyrup/settings.json` cannot relocate the session dir under cyrup; the global
     // `<agent_dir>/settings.json` tier — the documented one — behaves exactly as upstream.
     let mut startup_settings =
-        SettingsManager::load(file_settings_store(&dirs), Settings::new(), false);
+        SettingsManager::load(file_settings_store(&dirs), false);
     report_diagnostics(&collect_settings_diagnostics(
         &mut startup_settings,
         "startup session lookup",
@@ -346,10 +409,8 @@ async fn run() -> anyhow::Result<i32> {
         );
     }
 
-    // Standalone actions that run and exit (Pi `--export`/`--list-models`, main.ts:520,470).
-    if let Some(export) = &cli.export {
-        return export_session_html(export, cli.positionals.first().map(String::as_str)).await;
-    }
+    // (`--export` is the other standalone run-and-exit action; it dispatches far above, at pi's own
+    // position immediately after the `--version` exit — SEAM-106.)
 
     // `<agent_dir>/models.json` — the user's custom-provider / custom-model file (CFG-002). Pi loads
     // it ONCE per runtime (`ModelConfig.load(join(getAgentDir(),"models.json"))`,
@@ -480,7 +541,7 @@ async fn run() -> anyhow::Result<i32> {
     // spawn, so this outer guard is an optimization (it skips the settings/auth reads) rather than
     // the gate itself.
     if cyrup::provider::mode_refreshes_catalogs(mode) {
-        let startup_settings = SettingsManager::load(settings_store.clone(), Settings::new(), false);
+        let startup_settings = SettingsManager::load(settings_store.clone(), false);
         let policy = cyrup_config::policy::NetworkPolicy::resolve(
             startup_settings.effective(),
             &env,
@@ -530,7 +591,7 @@ async fn run() -> anyhow::Result<i32> {
             cyrup_config::provider_is_configured(&auth, &auth_models_json, &m.provider, None)
         };
         // Saved settings default `(provider, model)` (Pi step 3), read from the same file store.
-        let settings = SettingsManager::load(settings_store.clone(), Settings::new(), false);
+        let settings = SettingsManager::load(settings_store.clone(), false);
         let eff = settings.effective();
         let default_provider = eff.default_provider();
         let default_model = eff.default_model();
@@ -1425,7 +1486,7 @@ fn trust_store_for(dirs: &ConfigDirs) -> Arc<cyrup_config::trust::TrustStore> {
 /// want it verbatim.
 #[allow(dead_code)]
 fn default_project_trust(dirs: &ConfigDirs) -> DefaultProjectTrust {
-    let mgr = SettingsManager::load(file_settings_store(dirs), Settings::new(), false);
+    let mgr = SettingsManager::load(file_settings_store(dirs), false);
     mgr.effective().default_project_trust()
 }
 

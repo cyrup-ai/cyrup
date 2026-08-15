@@ -728,3 +728,40 @@ async fn immediate_bash_carries_the_agent_identity_markers() {
         result.output
     );
 }
+
+/// CFG-069 — `AI_AGENT` is a FORWARD-PORT: the key does not exist at the ported tag at all
+/// (`git -C pi grep -n AI_AGENT v0.83.0 -- packages/` → 0; `cli.ts:13` @v0.83.0 sets only
+/// `PI_CODING_AGENT`), it arrives at `cli.ts:14` @v0.84.1. The delta annotation therefore has to
+/// name the KEY and the TAG, not only the value — otherwise a later v0.84.1 uplift reads the site
+/// as already-done-at-tag and never records that cyrup ran ahead of the baseline.
+///
+/// Presence before absence: `PI_CODING_AGENT`, which IS at the ported tag, must still be pushed
+/// beside it — this test must not be satisfiable by deleting the forward-ported marker.
+#[test]
+fn the_forward_ported_ai_agent_marker_names_its_key_and_its_tag() {
+    let src = include_str!("../bash.rs");
+
+    assert!(
+        src.contains(r#"env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));"#),
+        "the at-tag marker `PI_CODING_AGENT` (cli.ts:13 @v0.83.0) must still be pushed"
+    );
+
+    let push = r#"env.push(("AI_AGENT".to_string(), "cyrup".to_string()));"#;
+    let at = src.find(push).expect("`AI_AGENT` is pushed into the immediate-bash child env");
+    // The annotation is the comment block immediately above the push.
+    let annotation = &src[..at];
+    let annotation = &annotation[annotation.rfind("[CYRUP-DELTA").expect("a delta annotation")..];
+
+    assert!(
+        annotation.contains("@v0.84.1"),
+        "the delta line must state the TAG the key comes from; got: {annotation}"
+    );
+    assert!(
+        annotation.contains("AI_AGENT"),
+        "the delta line must name the KEY, not only its value; got: {annotation}"
+    );
+    assert!(
+        annotation.contains("v0.83.0"),
+        "the delta line must state that the key is ABSENT at the ported tag; got: {annotation}"
+    );
+}

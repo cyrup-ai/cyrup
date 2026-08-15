@@ -21,7 +21,7 @@ use std::time::SystemTime;
 use cyrup_config::trust::{
     TrustInputs, TrustOption, TrustOutcome, TrustStore, decide_trust, has_trust_requiring_resources,
 };
-use cyrup_config::{ConfigDirs, Settings, SettingsManager};
+use cyrup_config::{ConfigDirs, SettingsManager};
 use cyrup_session_svc::{AppMode, DefaultProjectTrust, SessionInfo, TrustDecision, TrustEntry};
 use cyrup_tui::{
     ListSelector, SelectKeymap, SelectorOutcome, SessionKeymap, SessionRow, SessionSelector,
@@ -44,11 +44,7 @@ use cyrup_tui::{
 /// (`applyDetectedStartupTheme`, `startup-ui.ts:92-100`) belongs to whichever selector owns the
 /// terminal, and `ThemeController::boot_from_env` already folds in `COLORFGBG`.
 pub fn startup_theme(dirs: &ConfigDirs) -> UiTheme {
-    let mgr = SettingsManager::load(
-        crate::startup::file_settings_store(dirs),
-        Settings::new(),
-        false,
-    );
+    let mgr = SettingsManager::load(crate::startup::file_settings_store(dirs), false);
     let setting = mgr.effective().theme_setting();
     ThemeController::boot_from_env(setting.as_deref()).theme()
 }

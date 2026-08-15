@@ -222,13 +222,14 @@ impl bindings::cyrup::ext::registration::Host for HostState {
 
     async fn add_autocomplete(&mut self, command: String) {
         let Ok(guest) = guest_of(self) else { return };
+        // Record it in the SHARED registry as well as in `GuestState`, for the reason spelled out on
+        // `register_message_renderer` above: the per-guest bookkeeping is host-side diagnostics and
+        // no consumer can reach it. The NATIVE tier already lands in the registry
+        // (`facade.rs::load_native_body` -> `add_command_autocomplete`); without this line the WASM
+        // tier declared the flag into a counter nothing reads, so the two tiers disagreed about
+        // whether a guest had argument completions at all.
+        let _ = guest.registry.add_command_autocomplete(guest.owner.clone(), command.clone());
         guest.add_autocomplete(command);
-    }
-
-    async fn add_autocomplete_provider(&mut self) {
-        if let Ok(guest) = guest_of(self) {
-            guest.add_autocomplete_provider();
-        }
     }
 
     async fn subscribe(&mut self, event_kinds: Vec<u8>) {
@@ -435,8 +436,35 @@ impl bindings::cyrup::ext::ui::Host for HostState {
             guest.editor_write(text, true);
         }
     }
+    /// Pi `addAutocompleteProvider(factory)` (`extensions/types.ts:225` @v0.83.0).
+    ///
+    /// EXT-065: this impl used to sit in `registration::Host` above and call the UNGATED
+    /// [`guest_of`], so an extension whose manifest granted no `ui` could still stack a provider
+    /// onto the core input editor. It is a `ui.*` import now, and goes through [`ui_guest_of`] like
+    /// every other one — the grant is the whole point of the move, so do not relax it back to
+    /// `guest_of`.
+    async fn add_autocomplete_provider(&mut self) {
+        if let Ok(guest) = ui_guest_of(self) {
+            // Same shared-registry rule as `add_autocomplete`: the native tier lands in the registry
+            // (`facade.rs::load_native_body`), so the WASM tier must too, or a stacked provider is a
+            // number in `GuestState` that no consumer can reach. (The consumer itself — the
+            // interactive editor consulting these providers — is TUI-029 and still open; this is the
+            // producer half it will read.)
+            let _ = guest.registry.add_autocomplete_provider(guest.owner.clone());
+            guest.add_autocomplete_provider();
+        }
+    }
     async fn theme_get(&mut self) -> Option<String> {
         ui_guest_of(self).ok().and_then(|g| g.services.theme())
+    }
+    /// Pi's `readonly theme: Theme` (`extensions/types.ts:266` @v0.83.0) — the ACTIVE theme's
+    /// colours, not just its name (EXT-066). Composed from the backend's own two accessors rather
+    /// than a third trait method, so every `HostServices` impl that can already answer
+    /// `theme()` + `theme_by_name()` answers this too, with no chance of the three disagreeing.
+    async fn theme_get_json(&mut self) -> Option<String> {
+        let guest = ui_guest_of(self).ok()?;
+        let name = guest.services.theme()?;
+        guest.services.theme_by_name(&name).map(|t| t.to_string())
     }
     async fn theme_list(&mut self) -> String {
         ui_guest_of(self).map(|g| g.services.theme_list().to_string()).unwrap_or_else(|_| "[]".into())
@@ -2096,11 +2124,11 @@ async fn invoke(
             .await
             .and_then(|()| noop()),
         HostEvent::ToolExecStart { call_id, name, args } => api
-            .call_on_tool_exec_start(store, call_id.as_str(), name, &args.to_string())
+            .call_on_tool_execution_start(store, call_id.as_str(), name, &args.to_string())
             .await
             .and_then(|()| noop()),
         HostEvent::ToolExecUpdate { call_id, name, args, chunk } => api
-            .call_on_tool_exec_update(
+            .call_on_tool_execution_update(
                 store,
                 call_id.as_str(),
                 name,
@@ -2110,7 +2138,7 @@ async fn invoke(
             .await
             .and_then(|()| noop()),
         HostEvent::ToolExecEnd { call_id, name, result, is_error } => api
-            .call_on_tool_exec_end(store, call_id.as_str(), name, &result.to_string(), *is_error)
+            .call_on_tool_execution_end(store, call_id.as_str(), name, &result.to_string(), *is_error)
             .await
             .and_then(|()| noop()),
         HostEvent::SessionStart { reason, previous_session_file } => api

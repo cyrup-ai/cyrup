@@ -68,14 +68,11 @@ const KNOWN_SHORT_FLAGS: [&str; 9] = ["-p", "-c", "-r", "-a", "-n", "-t", "-e", 
 /// passed through verbatim, never inspected as a flag). Kept in lockstep with [`crate::cli::Cli`];
 /// `--mode`/`--thinking` are handled specially (their value IS inspected for leniency) and so are
 /// excluded here.
-const VALUE_LONG_FLAGS: [&str; 17] = [
+const VALUE_LONG_FLAGS: [&str; 14] = [
     "--provider",
     "--api-key",
-    "--models",
     "--system-prompt",
     "--append-system-prompt",
-    "--tools",
-    "--exclude-tools",
     "--extension",
     "--skill",
     "--prompt-template",
@@ -92,12 +89,40 @@ const VALUE_LONG_FLAGS: [&str; 17] = [
 /// it is the most common; it is handled with the same verbatim pass-through.
 const MODEL_FLAG: &str = "--model";
 
+/// The three value-taking flags pi **ASSIGNS** rather than accumulates — `result.models = …`
+/// (args.ts:114), `result.tools = …` (`:121-124`) and `result.excludeTools = …` (`:125-129`) — with
+/// every spelling cyrup accepts for each. SEAM-105.
+///
+/// clap declares all three as `Vec<String>` with `value_delimiter = ','` (cli.rs), so a REPEATED
+/// flag appends: `--tools read --tools bash` resolved to `{read,bash}` where pi resolves `{bash}`.
+/// Only the repeated form ever diverged — the comma form (`--tools read,bash`) is identical under
+/// both — which is why every existing test passed. [`apply_arg_leniency`] therefore drops every
+/// occurrence but the LAST before clap sees the argv; the surviving occurrence still comma-splits
+/// exactly as it does today.
+///
+/// `-xt` never reaches here (`normalize_short_aliases` rewrites it to `--exclude-tools`); `-t` does,
+/// and pi's arm is `(arg === "--tools" || arg === "-t")`, so it belongs to the same family and takes
+/// its value the same way.
+const ASSIGNING_FLAGS: [&[&str]; 3] = [&["--models"], &["--tools", "-t"], &["--exclude-tools"]];
+
+/// The [`ASSIGNING_FLAGS`] family `arg` belongs to, if any. The `--tools=read` form is matched on the
+/// name part: pi has no `=` form at all (it would land in `unknownFlags`, args.ts:190-192), but cyrup
+/// accepts one through `KNOWN_LONG_FLAGS` (cli.rs), so last-occurrence-wins has to cover it too or
+/// `--tools read --tools=bash` would keep both.
+fn assigning_family(arg: &str) -> Option<usize> {
+    let name = arg.split('=').next().unwrap_or(arg);
+    ASSIGNING_FLAGS.iter().position(|names| names.contains(&name))
+}
+
 /// Apply Pi's lenient arg handling over `argv` (program name already stripped, short-aliases already
 /// normalized), returning the cleaned argv clap should parse plus the collected diagnostics
 /// (args.ts:80-82,131-139,202-203).
 pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
     let mut clean: Vec<String> = Vec::new();
     let mut diagnostics: Vec<Diagnostic> = Vec::new();
+    // SEAM-105: the `[start, end)` slice of `clean` each occurrence of an [`ASSIGNING_FLAGS`] family
+    // wrote. Everything but the last entry per family is deleted once the walk finishes.
+    let mut assign_spans: [Vec<(usize, usize)>; 3] = [Vec::new(), Vec::new(), Vec::new()];
     let mut i = 0usize;
     while let Some(arg) = argv.get(i) {
         // `--mode <value>` (space form): keep when valid, silently drop both when invalid.
@@ -175,6 +200,70 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
             i += 1;
             continue;
         }
+        // `--models` / `--tools` / `-t` / `--exclude-tools` — pi ASSIGNS these (args.ts:114,121-129),
+        // so a repeated flag REPLACES the earlier value. Record the span this occurrence occupies in
+        // `clean`; the post-pass below keeps only the last one per family. The value token is passed
+        // through verbatim, exactly as the generic value-flag arm below does. SEAM-105.
+        if let Some(family) = assigning_family(arg) {
+            let start = clean.len();
+            clean.push(arg.clone());
+            if !arg.contains('=')
+                && let Some(value) = argv.get(i + 1)
+            {
+                clean.push(value.clone());
+                i += 1;
+            }
+            // Indexing is bounded by `assigning_family`, which only ever answers `0..3`.
+            if let Some(spans) = assign_spans.get_mut(family) {
+                spans.push((start, clean.len()));
+            }
+            i += 1;
+            continue;
+        }
+        // `--list-models [pattern]` — pi args.ts:171-177, both halves of its guard:
+        //   `if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@"))`
+        // The `@` half is the one cyrup lacked: clap's `num_args = 0..=1` consumes ANY following
+        // non-flag token, so `cyrup --list-models @notes.md` searched for the pattern `@notes.md`
+        // (printing `No models matching "@notes.md"`) and lost the file attachment, where pi lists
+        // the whole configured catalog and routes `@notes.md` to `fileArgs`. Emitting the `=` form
+        // binds the empty value explicitly, so clap cannot reach past the flag for one. SEAM-103.
+        if arg == "--list-models" {
+            match argv.get(i + 1) {
+                Some(next) if !next.starts_with('-') && !next.starts_with('@') => {
+                    clean.push(arg.clone());
+                    clean.push(next.clone());
+                    i += 2;
+                }
+                _ => {
+                    clean.push("--list-models=".to_string());
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // `--print` / `-p` followed by a `---`-prefixed token — pi args.ts:140-146:
+        //   `if (next !== undefined && !next.startsWith("@") && (!next.startsWith("-") ||
+        //    next.startsWith("---"))) { result.messages.push(next); i++; }`
+        // Every other shape of that condition already matches: a bare word after `-p` is a clap
+        // positional, and an `@file` or a `-`/`--` flag is left alone. Only `next.startsWith("---")`
+        // — the escape hatch that lets a prompt legitimately begin with dashes — was unported, so
+        // `cyrup -p ---weird` captured an extension flag named `-weird` (which then died on
+        // `Unknown option: ---weird`) instead of sending `---weird` as the prompt. SEAM-107.
+        //
+        // The token is emitted with a leading NUL, which `Cli::restore_escaped_positionals` strips
+        // after the parse. That keeps the message at its exact argv POSITION among the positionals —
+        // a trailing `--` escape would move it to the end of `messages` — and the marker cannot
+        // collide with a real argument: process arguments arrive as NUL-terminated C strings, so no
+        // argv token can contain a NUL byte.
+        if (arg == "--print" || arg == "-p")
+            && let Some(next) = argv.get(i + 1)
+            && next.starts_with("---")
+        {
+            clean.push(arg.clone());
+            clean.push(format!("{ESCAPED_MESSAGE_PREFIX}{next}"));
+            i += 2;
+            continue;
+        }
         // A known value-taking long flag (space form): pass the flag AND its next token through
         // verbatim, so a value that looks like a flag (`--model -5`) is not re-interpreted (Pi
         // consumes `args[++i]` unconditionally).
@@ -209,8 +298,31 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
         clean.push(arg.clone());
         i += 1;
     }
+    // SEAM-105: pi assigns, so the LAST occurrence of each family stands alone. Drop every earlier
+    // span; the surviving one still comma-splits under clap exactly as it does today.
+    let dropped: Vec<(usize, usize)> = assign_spans
+        .iter()
+        .flat_map(|spans| spans.iter().rev().skip(1).copied())
+        .collect();
+    if !dropped.is_empty() {
+        clean = clean
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, _)| !dropped.iter().any(|(start, end)| idx >= start && idx < end))
+            .map(|(_, token)| token)
+            .collect();
+    }
     (clean, diagnostics)
 }
+
+/// The marker [`apply_arg_leniency`] puts in front of a `-p ---…` escape-hatch message so clap
+/// accepts it as a positional rather than reading it as a long flag (SEAM-107).
+///
+/// A NUL is used because it is the one byte that CANNOT appear in a process argument: `execve`
+/// takes NUL-terminated C strings, so the kernel truncates at the first NUL and `std::env::args()`
+/// can never yield a token containing one. The marker therefore cannot collide with anything a user
+/// types, and no escaping-the-escape rule is needed.
+pub const ESCAPED_MESSAGE_PREFIX: char = '\0';
 
 /// Provider login guidance (Pi `getProviderLoginHelp`, auth-guidance.ts:6-11). The doc paths are
 /// shown relative to the package docs dir (the absolute prefix is environment-cosmetic).
@@ -309,6 +421,104 @@ mod tests {
         let (clean, diags) = apply_arg_leniency(&v(&["--"]));
         assert_eq!(clean, v(&["--"]));
         assert!(diags.is_empty(), "{diags:?}");
+    }
+
+    /// SEAM-103 — RED before the fix. pi's guard is TWO-part (args.ts:171-177):
+    /// `!args[i + 1].startsWith("-") && !args[i + 1].startsWith("@")`. clap's `num_args = 0..=1`
+    /// only ever knew the `-` half, so an `@file` token following `--list-models` was eaten as the
+    /// search pattern — `cyrup --list-models @notes.md` printed `No models matching "@notes.md"` and
+    /// dropped the attachment, where pi lists the configured catalog and routes `@notes.md` to
+    /// `fileArgs`.
+    #[test]
+    fn list_models_does_not_swallow_a_following_file_arg() {
+        // Presence before absence: a real search pattern is still taken as the value.
+        let (clean, diags) = apply_arg_leniency(&v(&["--list-models", "gpt"]));
+        assert_eq!(clean, v(&["--list-models", "gpt"]));
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // …and an `@file` is NOT. The `=` form binds the empty value so clap cannot reach past the
+        // flag for one; `@foo` survives to the positionals, where `split_positionals` makes it a
+        // file arg.
+        let (clean, diags) = apply_arg_leniency(&v(&["--list-models", "@foo"]));
+        assert_eq!(clean, v(&["--list-models=", "@foo"]));
+        assert!(diags.is_empty(), "{diags:?}");
+
+        // The `-` half of pi's guard, and the end-of-argv case, keep working.
+        let (clean, _) = apply_arg_leniency(&v(&["--list-models", "--verbose"]));
+        assert_eq!(clean, v(&["--list-models=", "--verbose"]));
+        let (clean, _) = apply_arg_leniency(&v(&["--list-models"]));
+        assert_eq!(clean, v(&["--list-models="]));
+    }
+
+    /// SEAM-105 — RED before the fix. pi ASSIGNS all three (args.ts:114, :121-124, :125-129), so the
+    /// last occurrence replaces the earlier one; clap's `Vec<String>` appended across repeats.
+    #[test]
+    fn repeated_assigning_flags_keep_only_the_last_occurrence() {
+        // Presence before absence: the comma form — identical under both, and the reason every
+        // existing test passed — is untouched, and so is a single occurrence.
+        let (clean, _) = apply_arg_leniency(&v(&["--tools", "read,bash"]));
+        assert_eq!(clean, v(&["--tools", "read,bash"]));
+        let (clean, _) = apply_arg_leniency(&v(&["--models", "a"]));
+        assert_eq!(clean, v(&["--models", "a"]));
+
+        // …and the repeated form now resolves to the LAST occurrence alone.
+        let (clean, _) = apply_arg_leniency(&v(&["--tools", "read", "--tools", "bash"]));
+        assert_eq!(clean, v(&["--tools", "bash"]));
+        let (clean, _) = apply_arg_leniency(&v(&["--models", "a", "--models", "b"]));
+        assert_eq!(clean, v(&["--models", "b"]));
+        let (clean, _) =
+            apply_arg_leniency(&v(&["--exclude-tools", "x", "--exclude-tools", "y"]));
+        assert_eq!(clean, v(&["--exclude-tools", "y"]));
+
+        // `-t` is pi's own alias for `--tools` in the SAME arm (`arg === "--tools" || arg === "-t"`),
+        // so it belongs to the same family — including when the spellings are mixed. `-xt` never
+        // reaches here (`normalize_short_aliases` rewrote it), and the `=` form cyrup additionally
+        // accepts counts as an occurrence too.
+        let (clean, _) = apply_arg_leniency(&v(&["-t", "read", "-t", "bash"]));
+        assert_eq!(clean, v(&["-t", "bash"]));
+        let (clean, _) = apply_arg_leniency(&v(&["--tools", "read", "-t", "bash"]));
+        assert_eq!(clean, v(&["-t", "bash"]));
+        let (clean, _) = apply_arg_leniency(&v(&["--tools", "read", "--tools=bash"]));
+        assert_eq!(clean, v(&["--tools=bash"]));
+
+        // Three families are independent, and the surrounding argv is preserved in order.
+        let (clean, _) = apply_arg_leniency(&v(&[
+            "--tools", "read", "--models", "a", "hello", "--tools", "bash", "--models", "b",
+            "--verbose",
+        ]));
+        assert_eq!(
+            clean,
+            v(&["hello", "--tools", "bash", "--models", "b", "--verbose"])
+        );
+    }
+
+    /// SEAM-107 — RED before the fix. pi's `-p` arm consumes the next token as a MESSAGE when
+    /// `next !== undefined && !next.startsWith("@") && (!next.startsWith("-") ||
+    /// next.startsWith("---"))` (args.ts:140-146). The `---` clause is the escape hatch that lets a
+    /// prompt begin with dashes; unported, `cyrup -p ---weird` captured an extension flag named
+    /// `-weird` and died on `Unknown option: ---weird` instead of sending the prompt.
+    #[test]
+    fn print_consumes_a_triple_dash_token_as_the_message() {
+        for flag in ["-p", "--print"] {
+            let (clean, diags) = apply_arg_leniency(&v(&[flag, "---weird"]));
+            assert_eq!(
+                clean,
+                vec![flag.to_string(), format!("{ESCAPED_MESSAGE_PREFIX}---weird")],
+                "the `---` token must be marked as a positional, not left to the flag capture"
+            );
+            assert!(diags.is_empty(), "{diags:?}");
+        }
+        // Presence before absence: every OTHER shape of pi's condition is unchanged — a bare word is
+        // already a clap positional, an `@file` is left for `fileArgs`, and a one- or two-dash flag
+        // stays a flag.
+        let (clean, _) = apply_arg_leniency(&v(&["-p", "hello"]));
+        assert_eq!(clean, v(&["-p", "hello"]));
+        let (clean, _) = apply_arg_leniency(&v(&["-p", "@notes.md"]));
+        assert_eq!(clean, v(&["-p", "@notes.md"]));
+        let (clean, _) = apply_arg_leniency(&v(&["-p", "--verbose"]));
+        assert_eq!(clean, v(&["-p", "--verbose"]));
+        let (clean, _) = apply_arg_leniency(&v(&["-p"]));
+        assert_eq!(clean, v(&["-p"]));
     }
 
     #[test]

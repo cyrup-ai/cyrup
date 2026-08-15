@@ -183,3 +183,50 @@ fn armin_easter_egg_pushes_a_half_block_art_block() {
         "art uses half-block glyphs: {block:?}"
     );
 }
+
+/// TUI-079 — `/export` and `/import` route ONE quote-aware token, not the whole remainder
+/// (`getPathCommandArgument`, `interactive-mode.ts:5435`/`:5480` @v0.83.0).
+///
+/// The routing half is asserted here; the helper's own four cases live in `tests::commands`.
+#[test]
+fn export_and_import_route_one_quote_aware_path_token() {
+    let mut app = new_app();
+    assert_eq!(
+        submit(&mut app, "/export \"my session.html\""),
+        AppAction::Command(AppCommand::Export(Some("my session.html".to_string()))),
+        "the quotes are stripped and the inner space survives"
+    );
+    assert_eq!(
+        submit(&mut app, "/export a.html junk"),
+        AppAction::Command(AppCommand::Export(Some("a.html".to_string()))),
+        "a second word is not part of the path"
+    );
+    assert_eq!(
+        submit(&mut app, "/export \"a b"),
+        AppAction::Command(AppCommand::Export(None)),
+        "an unterminated quote is upstream's `undefined`, i.e. the no-path branch"
+    );
+    assert_eq!(
+        submit(&mut app, "/import 'sess ion.jsonl'"),
+        AppAction::Command(AppCommand::Import(Some("sess ion.jsonl".to_string())))
+    );
+    // Unchanged for the plain case — this is a parse, not a new restriction.
+    assert_eq!(
+        submit(&mut app, "/export out.jsonl"),
+        AppAction::Command(AppCommand::Export(Some("out.jsonl".to_string())))
+    );
+}
+
+/// TUI-080 — argument-less `/name` is the GETTER, so it must reach the run loop rather than being
+/// answered in-crate with a usage line (`handleNameCommand`, `interactive-mode.ts:5632-5644`
+/// @v0.83.0: it prints `Session name: …` when a name is set, and only warns when none is).
+#[test]
+fn a_bare_name_command_routes_to_the_getter() {
+    let mut app = new_app();
+    assert_eq!(submit(&mut app, "/name"), AppAction::Command(AppCommand::ShowName));
+    // The setter half is untouched.
+    assert_eq!(
+        submit(&mut app, "/name my session"),
+        AppAction::Command(AppCommand::SetName("my session".to_string()))
+    );
+}
