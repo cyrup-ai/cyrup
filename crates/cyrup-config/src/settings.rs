@@ -778,14 +778,29 @@ impl EffectiveSettings {
         }
     }
 
-    /// `httpProxy` setting (Pi reads the setting in addition to env; settings-manager.ts:121,
-    /// http-dispatcher.ts:42-46). The actual `HTTP_PROXY`/`HTTPS_PROXY` apply is a bin concern.
-    pub fn http_proxy(&self, env: &crate::env::EnvVars) -> Option<String> {
+    /// `httpProxy` — the SETTING alone, never the ambient environment (CFG-060).
+    ///
+    /// Pi's only read of this key is `applyHttpProxySettings(bootstrapSettingsManager
+    /// .getGlobalSettings().httpProxy)` (`main.ts:537`, again at `:801` @v0.83.0), and
+    /// `applyHttpProxySettings` is `const proxy = httpProxy?.trim(); if (!proxy) return;
+    /// process.env.HTTP_PROXY ??= proxy; process.env.HTTPS_PROXY ??= proxy`
+    /// (`core/http-dispatcher.ts:43-48` @v0.83.0) — hence the trim and the empty filter here. The
+    /// key is declared at `settings-manager.ts:126` and is GLOBAL-only (CFG-057), which is why the
+    /// merged view is the right document to read it from.
+    ///
+    /// **The setting-vs-ambient precedence deliberately does NOT live here.** `??=` lets an ambient
+    /// `HTTP_PROXY` win, and cyrup expresses that in the resolver instead — `get_proxy_env`
+    /// (`cyrup-provider/src/utils/node_http_proxy.rs`) consults `configured_http_proxy()` only
+    /// after all four ambient lookups miss. An earlier version of this accessor took an `EnvVars`
+    /// and fell back to `env.http_proxy`, which was dead (both callers passed
+    /// `EnvVars::default()`) and wrong the moment it was not: pi writes the SETTING into
+    /// `HTTPS_PROXY` even when `HTTP_PROXY` is ambient, so returning the ambient value here would
+    /// have installed it as the configured proxy and lost the setting for https targets entirely.
+    pub fn http_proxy(&self) -> Option<String> {
         self.merged
             .get_str("httpProxy")
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
-            .or_else(|| env.http_proxy.clone())
     }
 
     /// `shellPath`, tilde-expanded (Pi `getShellPath` → `normalizePath`, settings-manager.ts:883-886).
@@ -1036,13 +1051,23 @@ impl EffectiveSettings {
             .unwrap_or_default()
     }
 
-    /// `getPackages` — configured npm/git package sources (empty default; Pi
-    /// settings-manager.ts:953-955).
+    /// `getPackages` — configured npm/git package sources (empty default; Pi `getPackages`,
+    /// settings-manager.ts:969-971 @v0.83.0, which is `[...(this.settings.packages ?? [])]`).
+    ///
+    /// CFG-061: upstream copies the array verbatim and never parses it, so a malformed entry is
+    /// carried forward and rejected INDIVIDUALLY downstream. This delegates to
+    /// [`Settings::packages_with_errors`], which is the per-entry port; the blanket
+    /// `from_value::<Vec<_>>().ok().unwrap_or_default()` that used to sit here turned one typo in a
+    /// ten-entry array into "no packages configured" for all ten.
     pub fn packages(&self) -> Vec<PackageSource> {
-        self.merged
-            .get("packages")
-            .and_then(|v| serde_json::from_value::<Vec<PackageSource>>(v.clone()).ok())
-            .unwrap_or_default()
+        self.merged.packages()
+    }
+
+    /// [`Self::packages`] with the per-entry diagnostics upstream's downstream rejection produces
+    /// (CFG-061). The live discovery path composes the per-LAYER twin
+    /// (`Settings::packages_with_errors`); this is the merged-view equivalent.
+    pub fn packages_with_errors(&self) -> (Vec<PackageSource>, Vec<String>) {
+        self.merged.packages_with_errors()
     }
 
     /// `getExtensionPaths` — local extension file/dir paths (empty default; Pi
@@ -1465,7 +1490,20 @@ impl SettingsManager {
                     return None;
                 }
             };
-            doc.obj.insert(key_owned.clone(), json.clone());
+            // CFG-062 — "clear" means the key is GONE, not present-and-null. Pi's clearing setters
+            // assign `undefined` (`setShellPath` settings-manager.ts:883-887, `setShellCommandPrefix`
+            // :914-918, `setNpmCommand` :924-928 @v0.83.0) and `persistScopedSettings` serializes
+            // through `JSON.stringify(mergedSettings, null, 2)` (:605), which OMITS
+            // undefined-valued properties. `serde_json` has no `undefined`, so `None::<String>`
+            // arrives here as `Value::Null` and used to persist as `"shellPath": null` — a value
+            // upstream cannot write, and one that a lower layer's `deep_merge` treats as a real
+            // override (both sides let a project `null` blank a global value, so the divergence is
+            // the WRITE, not the merge).
+            if json.is_null() {
+                doc.obj.remove(&key_owned);
+            } else {
+                doc.obj.insert(key_owned.clone(), json.clone());
+            }
             Some(doc.to_pretty())
         })?;
         if let Some(message) = corrupt {
@@ -1676,7 +1714,15 @@ fn set_value_at_path(map: &mut Map<String, Value>, path: &[String], value: Value
         return;
     };
     if rest.is_empty() {
-        map.insert(first.clone(), value);
+        // CFG-062, nested leg. `persistScopedSettings` writes the nested object through the same
+        // `JSON.stringify(mergedSettings, null, 2)` (settings-manager.ts:605 @v0.83.0), so an
+        // undefined nested field is omitted at depth exactly as a top-level one is. A `Null` leaf
+        // therefore CLEARS the key rather than persisting `"terminal": { "showImages": null }`.
+        if value.is_null() {
+            map.remove(first);
+        } else {
+            map.insert(first.clone(), value);
+        }
         return;
     }
     let entry = map
@@ -1889,7 +1935,7 @@ mod tests {
         assert_eq!(mgr.effective().default_model(), Some("o".to_string()));
         // ABSENCE: the two global-only keys did not.
         assert_eq!(
-            mgr.effective().http_proxy(&crate::env::EnvVars::default()),
+            mgr.effective().http_proxy(),
             Some("http://global:8080".to_string())
         );
         assert_eq!(
@@ -1988,7 +2034,7 @@ mod tests {
         );
         let mgr = SettingsManager::load(store, true);
         assert_eq!(
-            mgr.effective().http_proxy(&crate::env::EnvVars::default()),
+            mgr.effective().http_proxy(),
             Some("http://global:8080".to_string())
         );
 
@@ -1999,9 +2045,178 @@ mod tests {
             r#"{ "httpProxy": "http://project:9090" }"#,
         );
         let mgr = SettingsManager::load(store, true);
+        assert_eq!(mgr.effective().http_proxy(), None);
+    }
+
+    /// CFG-060 — **COVERAGE, not a red-before proof, and the distinction is the point.** The fix is
+    /// the REMOVAL of the accessor's `&EnvVars` parameter, so this test cannot be written against
+    /// the pre-fix API at all: it would not compile. What the pre-fix code did, stated so the
+    /// change is auditable — `http_proxy(&EnvVars { http_proxy: Some("http://ambient:3128"), .. })`
+    /// with NO `httpProxy` key in either document returned `Some("http://ambient:3128")`, because
+    /// the body ended in `.or_else(|| env.http_proxy.clone())`.
+    ///
+    /// Why that was wrong rather than merely redundant. pi calls
+    /// `applyHttpProxySettings(getGlobalSettings().httpProxy)` (`main.ts:537`, `:801` @v0.83.0),
+    /// which is `process.env.HTTP_PROXY ??= proxy; process.env.HTTPS_PROXY ??= proxy`
+    /// (`http-dispatcher.ts:43-48`) — the two names are filled INDEPENDENTLY. With an ambient
+    /// `HTTP_PROXY=http://ambient:3128` and `"httpProxy": "http://setting:8080"`, upstream leaves
+    /// `HTTP_PROXY` ambient and sets `HTTPS_PROXY` to the SETTING, so an https target proxies
+    /// through `http://setting:8080`. Feeding the ambient value back through this accessor into
+    /// `configure_http_proxy` would have made `http://ambient:3128` the configured proxy for both
+    /// names and lost the setting for https targets entirely. The ambient-wins half of `??=` is
+    /// already ported, once, in `node_http_proxy::get_proxy_env`.
+    #[test]
+    fn http_proxy_is_the_setting_alone_and_takes_no_environment() {
+        // Unset on both layers: the accessor has nothing to fall back TO any more.
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Global, r#"{ "defaultModel": "m" }"#);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(
-            mgr.effective().http_proxy(&crate::env::EnvVars::default()),
-            None
+            mgr.effective().http_proxy(),
+            None,
+            "no httpProxy key means no configured proxy, whatever the ambient environment holds"
+        );
+
+        // Set: trimmed, and an all-whitespace value is `!proxy` upstream (http-dispatcher.ts:44-45).
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Global,
+            r#"{ "httpProxy": "  http://setting:8080  " }"#,
+        );
+        let mgr = SettingsManager::load(store, true);
+        assert_eq!(
+            mgr.effective().http_proxy(),
+            Some("http://setting:8080".to_string())
+        );
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Global, r#"{ "httpProxy": "   " }"#);
+        let mgr = SettingsManager::load(store, true);
+        assert_eq!(mgr.effective().http_proxy(), None);
+    }
+
+    /// CFG-061 — **RED before the fix**: `EffectiveSettings::packages()` was
+    /// `from_value::<Vec<PackageSource>>(v.clone()).ok().unwrap_or_default()`, so the `Err` from
+    /// entry 4 collapsed the whole array and this asserted 9 against 0. pi's `getPackages`
+    /// (`settings-manager.ts:969-971` @v0.83.0) is `[...(this.settings.packages ?? [])]` — a
+    /// verbatim copy with no parsing at all, so a malformed entry travels downstream and is
+    /// rejected on its own.
+    #[test]
+    fn one_malformed_package_entry_does_not_discard_the_other_nine() {
+        let s = EffectiveSettings::from_settings(
+            Settings::parse(
+                r#"{"packages": [
+                     "a", "b", "c",
+                     42,
+                     "e", "f", "g", "h", "i", "j"
+                   ]}"#,
+            )
+            .unwrap(),
+        );
+        let (pkgs, errors) = s.packages_with_errors();
+        assert_eq!(
+            pkgs.len(),
+            9,
+            "nine well-formed entries survive the tenth being a number"
+        );
+        assert_eq!(s.packages().len(), 9, "the error-free accessor agrees");
+        assert_eq!(errors.len(), 1, "and the bad entry is reported, not silent");
+        assert!(
+            errors
+                .first()
+                .is_some_and(|e| e.starts_with("settings `packages[3]`")),
+            "the diagnostic names the index: {errors:?}"
+        );
+        assert_eq!(
+            pkgs.first(),
+            Some(&PackageSource::Name("a".to_string())),
+            "and the entries before the bad one are kept, not just the ones after"
+        );
+    }
+
+    /// CFG-062 — **RED before the fix** on both halves: the written document contained
+    /// `"shellPath": null` / `"terminal": {"showImages": null}` and both `contains` assertions
+    /// failed. pi's clearing setters assign `undefined` (`setShellPath`
+    /// settings-manager.ts:883-887, `setShellCommandPrefix` `:914-918`, `setNpmCommand`
+    /// `:924-928` @v0.83.0) and `persistScopedSettings` writes through
+    /// `JSON.stringify(mergedSettings, null, 2)` (`:605`), which omits undefined-valued properties
+    /// at every depth — so upstream cannot produce a `null` in a settings document at all.
+    #[test]
+    fn clearing_a_key_removes_it_rather_than_writing_json_null() {
+        let store = Arc::new(InMemorySettingsStore::new());
+        let mut mgr = SettingsManager::load(store.clone(), true);
+
+        mgr.set(SettingsScope::Global, "shellPath", Some("~/bin/bash"))
+            .unwrap();
+        mgr.set_nested(
+            SettingsScope::Global,
+            &["terminal", "showImages"],
+            Value::Bool(true),
+        )
+        .unwrap();
+        let written = store.read(SettingsScope::Global).unwrap().unwrap();
+        assert!(written.contains("shellPath"), "precondition: {written}");
+        assert!(written.contains("showImages"), "precondition: {written}");
+
+        // Clear both. `None::<&str>` serializes to `Value::Null`, which is the only way a Rust
+        // caller can express pi's `undefined`.
+        mgr.set(SettingsScope::Global, "shellPath", None::<&str>)
+            .unwrap();
+        mgr.set_nested(
+            SettingsScope::Global,
+            &["terminal", "showImages"],
+            Value::Null,
+        )
+        .unwrap();
+
+        let written = store.read(SettingsScope::Global).unwrap().unwrap();
+        assert!(
+            !written.contains("shellPath"),
+            "the key must be GONE, not present-and-null: {written}"
+        );
+        assert!(
+            !written.contains("showImages"),
+            "nested leaves clear the same way: {written}"
+        );
+        assert!(
+            !written.contains("null"),
+            "no null survives anywhere in the document: {written}"
+        );
+        assert!(
+            written.contains("terminal"),
+            "clearing a leaf must not delete its parent object: {written}"
+        );
+        assert_eq!(mgr.effective().shell_path(), None);
+    }
+
+    /// CFG-062, the merge half — **recorded as a REFUTATION, and it is not a bug.** The item's
+    /// Impact claims cyrup's `deep_merge` lacks pi's undefined-skip and that "a project
+    /// `npmCommand: null` blanks the global value where pi has no way to express that state at
+    /// all". Both clauses are false. `serde_json` has no `undefined`, so a key absent from the
+    /// project map is structurally skipped — the skip pi spells at `settings-manager.ts:139-141`
+    /// @v0.83.0 (and at `:149-152` of the v0.84.1 `deepMergeObjects`) is unrepresentable here. And
+    /// a hand-written `"npmCommand": null` in a project file IS expressible upstream: JSON.parse
+    /// yields `null`, `overrideValue === undefined` is false, so pi's merge takes the null too and
+    /// `getNpmCommand`'s `this.settings.npmCommand ? … : undefined` then reads it as unset —
+    /// exactly what cyrup does. The write path was the only divergence.
+    #[test]
+    fn a_project_null_blanks_a_global_value_on_both_sides() {
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Global,
+            r#"{ "npmCommand": ["pnpm"], "defaultModel": "m" }"#,
+        );
+        store.seed(SettingsScope::Project, r#"{ "npmCommand": null }"#);
+        let mgr = SettingsManager::load(store, true);
+        assert_eq!(
+            mgr.effective().npm_command(),
+            None,
+            "pi's deepMergeSettings skips undefined, not null — the null wins there too"
+        );
+        assert_eq!(
+            mgr.effective().default_model(),
+            Some("m".to_string()),
+            "and it is scoped to the one key, not the document"
         );
     }
 

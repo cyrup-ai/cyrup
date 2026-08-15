@@ -72,6 +72,12 @@ impl Tool for FindTool {
     fn name(&self) -> &str {
         "find"
     }
+    /// TOOL-045 — pi declares `label` explicitly beside `name` on every built-in
+    /// `ToolDefinition` and the two are equal for all seven (`find.ts:115-116` @v0.83.0). See
+    /// [`super::ReadTool::label`] for why the trait default was not left to stand in.
+    fn label(&self) -> Option<&str> {
+        Some("find")
+    }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
     }

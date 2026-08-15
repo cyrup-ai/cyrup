@@ -38,11 +38,16 @@
 //!   contract is identical: the prompt message is the header, the option **labels** are the rows,
 //!   confirming answers with the option **id**, and cancelling rejects the login with
 //!   `"Login cancelled"` (`:5314-5319`).
-//! * **No OSC-8 hyperlink wrapping and no browser launch.** pi wraps the auth URL in OSC-8 and calls
-//!   `openBrowser(url)` (`login-dialog.ts:98-110`). cyrup renders the bare URL: the crate already
-//!   drops OSC-8 wrapping elsewhere for the same reason (`image.rs:351`), and
-//!   `utils/open-browser.ts` has no cyrup counterpart anywhere in the workspace. The URL is shown in
-//!   full so the login is completable by copy/paste.
+//! * **No OSC-8 hyperlink wrapping** (the browser launch is now ported — DRIFT-042). pi wraps both
+//!   the auth URL and the click hint in `\x1b]8;;<url>\x07…\x1b]8;;\x07`
+//!   (`login-dialog.ts:98-104` @v0.84.2) so the hint itself is the clickable target; cyrup renders
+//!   the bare URL, because the crate drops OSC-8 wrapping everywhere for one reason
+//!   (`image.rs:351`) and the escape must be emitted at paint time rather than stored in the line
+//!   text (`markdown.rs:136`). That is `TUI-020`'s work, not this module's. The URL is shown in
+//!   full so the login stays completable by copy/paste.
+//!   [`LoginDialog::show_auth`] **does** now call pi's `openBrowser(url)` (`:111`) through
+//!   [`crate::open_browser`]; [`LoginDialog::show_device_code`] deliberately does not, matching
+//!   `:118-131`.
 //! * **Secrets are not masked**, matching upstream — pi's dialog uses a plain `Input` for every
 //!   prompt kind including `secret` (`login-dialog.ts:54`, `:154-172`).
 
@@ -136,6 +141,11 @@ pub struct LoginDialog {
     cancel_hint: String,
     /// The live `tui.select.confirm` label (`login-dialog.ts:164`).
     confirm_hint: String,
+    /// The browser launcher [`show_auth`](LoginDialog::show_auth) calls — pi's
+    /// `openBrowser(url)` (`login-dialog.ts:111`). A field rather than a direct call so the
+    /// invocation is observable in a unit test without a live desktop session; the default is the
+    /// real [`crate::open_browser::open_browser`] and nothing but a test replaces it (DRIFT-042).
+    launch_browser: std::sync::Arc<dyn Fn(&str) + Send + Sync>,
 }
 
 impl LoginDialog {
@@ -160,7 +170,15 @@ impl LoginDialog {
             confirm_hint: keymap
                 .keys_label(SelectAction::Confirm)
                 .unwrap_or_else(|| "enter".to_string()),
+            launch_browser: std::sync::Arc::new(crate::open_browser::open_browser),
         }
+    }
+
+    /// Replace the browser launcher (test seam for DRIFT-042). Production never calls this.
+    #[cfg(test)]
+    fn with_browser_launcher(mut self, f: std::sync::Arc<dyn Fn(&str) + Send + Sync>) -> Self {
+        self.launch_browser = f;
+        self
     }
 
     /// The dialog's title (`` `Login to ${providerName}` ``, `login-dialog.ts:41`).
@@ -208,8 +226,15 @@ impl LoginDialog {
         self.lines.push((LoginLineKind::Spacer, String::new()));
     }
 
-    /// `showAuth(url, instructions)` (`login-dialog.ts:96-113`): clear, then the URL, the click
-    /// hint, and any instructions. pi additionally calls `openBrowser(url)` — see the module note.
+    /// `showAuth(url, instructions)` (`login-dialog.ts:96-113` @v0.84.2): clear, then the URL, the
+    /// click hint, any instructions — **and `openBrowser(url)`** (`:111`), which is the last thing
+    /// the method does before requesting a render.
+    ///
+    /// DRIFT-042: the launch was disclosed-but-absent here for the whole port. The OSC-8 wrapping
+    /// of the URL and of the click hint (`login-dialog.ts:98-104`) is the *other* half and is NOT
+    /// closed by this method — it is an instance of `TUI-020` (the crate detects and tests
+    /// hyperlink support but emits no OSC-8), and the escape has to be written at paint time
+    /// rather than stored in the line text (`markdown.rs:136`).
     pub fn show_auth(&mut self, url: &str, instructions: Option<&str>) {
         self.lines.clear();
         self.spacer();
@@ -219,10 +244,18 @@ impl LoginDialog {
             self.spacer();
             self.push(LoginLineKind::Warning, instructions);
         }
+        // `openBrowser(url)` (`login-dialog.ts:111`) — after the lines are staged, so the URL is on
+        // screen even if the launcher wins the race. Best-effort: see `open_browser`.
+        (self.launch_browser)(url);
     }
 
     /// `showDeviceCode(info)` (`login-dialog.ts:118-131`): clear, then the verification URI, the
     /// click hint, a spacer, and `` `Enter code: ${info.userCode}` ``.
+    ///
+    /// Deliberately does **not** open a browser: pi's `showDeviceCode` applies the same OSC-8
+    /// wrapping as `showAuth` but has no `openBrowser` call (`login-dialog.ts:118-131` @v0.84.2).
+    /// A device-code flow expects the user to move to another device, so launching here would be a
+    /// divergence, not an improvement.
     pub fn show_device_code(&mut self, user_code: &str, verification_uri: &str) {
         self.lines.clear();
         self.spacer();
@@ -758,8 +791,50 @@ mod tests {
         }
     }
 
+    /// Every dialog built by a test gets an INERT launcher. Without this, `show_auth` would open a
+    /// real browser tab on the developer's desktop on every `cargo test` run (DRIFT-042).
     fn dialog() -> LoginDialog {
-        LoginDialog::new("Login to Anthropic", &SelectKeymap::default())
+        recording_dialog().0
+    }
+
+    /// A dialog plus the list of URLs its launcher was handed, in call order.
+    fn recording_dialog() -> (LoginDialog, std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let calls: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let sink = std::sync::Arc::clone(&calls);
+        let d = LoginDialog::new("Login to Anthropic", &SelectKeymap::default())
+            .with_browser_launcher(std::sync::Arc::new(move |url: &str| {
+                if let Ok(mut v) = sink.lock() {
+                    v.push(url.to_string());
+                }
+            }));
+        (d, calls)
+    }
+
+    /// **DRIFT-042.** `showAuth` opens the browser; `showDeviceCode` deliberately does not.
+    ///
+    /// **Red before the fix:** `LoginDialog` had no launcher at all — `login_dialog.rs:212`
+    /// carried a comment saying "pi additionally calls `openBrowser(url)`" and nothing called it,
+    /// and `grep -rnE 'xdg-open|rundll32|open_browser|FileProtocolHandler' crates --include='*.rs'`
+    /// returned 0 across the workspace. `with_browser_launcher` did not exist, so this test did not
+    /// compile; once it did, the `show_auth` assertion failed on an empty call list.
+    #[test]
+    fn show_auth_launches_the_browser_once_and_device_code_never_does() {
+        let (mut d, calls) = recording_dialog();
+        d.show_auth("https://example.test/auth", None);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            ["https://example.test/auth".to_string()],
+            "`openBrowser(url)` (login-dialog.ts:111 @v0.84.2) runs exactly once, with the auth URL"
+        );
+
+        // `showDeviceCode` (`login-dialog.ts:118-131`) wraps the URI in OSC-8 but has NO
+        // `openBrowser` call: the user is expected to move to another device.
+        let (mut d, calls) = recording_dialog();
+        d.show_device_code("WXYZ-1234", "https://example.test/device");
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "showDeviceCode must not launch a browser"
+        );
     }
 
     #[test]

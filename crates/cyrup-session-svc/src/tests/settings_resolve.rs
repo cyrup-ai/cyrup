@@ -99,9 +99,17 @@ impl Fx {
     }
 
     async fn session(&self) -> crate::AgentSession {
+        self.session_with(|_| {}).await
+    }
+
+    /// [`Self::session`] with the [`SessionConfig`] adjusted first — used by the CFG-003 install
+    /// gate, which is a config field rather than a settings key (it is pi's `PI_OFFLINE`, not a
+    /// `settings.json` entry).
+    async fn session_with(&self, tweak: impl FnOnce(&mut SessionConfig)) -> crate::AgentSession {
         let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
         let mut cfg = SessionConfig::new(self.cwd.clone(), self.agent_dir.clone());
         cfg.trust_override = Some(true);
+        tweak(&mut cfg);
         SessionBuilder::new(faux, cfg)
             .settings_store(self.store())
             .build()
@@ -344,8 +352,15 @@ async fn malformed_models_json_is_reported_not_fatal() {
 /// Constraint 6 (loud + safe), packages half: a package DECLARED in settings that cyrup would have
 /// to INSTALL to resolve must produce a startup diagnostic — never a silent drop and never a failed
 /// build. Pi installs it on demand (`resolvePackageSources` git arm, package-manager.ts:1287-1291 →
-/// `installMissing` `:1260-1271` @v0.83.0); cyrup does no network install during session assembly
-/// ([CYRUP-DELTA]) and says so instead.
+/// `installMissing` `:1260-1271` @v0.83.0).
+///
+/// **Updated by CFG-003:** cyrup now installs on that arm too. This build leaves
+/// `SessionConfig::install_missing_packages` at its `false` default — pi's
+/// `resolve(async () => "skip")` caller (cli/startup-ui.ts:73 @v0.83.0) — so the assertion below is
+/// the DECLINED arm, where pi `continue`s silently (`:1290`) and cyrup's `[CYRUP-DELTA]` says so
+/// loudly. The open arm is `cfg003_the_install_gate_reaches_discovery_in_both_directions`, and it
+/// is why this fixture must NOT be flipped to the open gate: `github.com/org/nope-not-here` would
+/// become a real network fetch from the test suite.
 ///
 /// The entry must be a protocol-qualified GIT url, because that is the only arm Pi installs. A
 /// missing LOCAL path is silent in Pi — `resolveLocalExtensionSource` opens with
@@ -369,6 +384,68 @@ async fn missing_settings_declared_package_is_reported_not_fatal() {
         diags.iter().any(|d| d.message.contains("nope-not-here")),
         "a missing settings-declared package must be reported: {:?}",
         diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+    );
+}
+
+/// CFG-003: `SessionConfig::install_missing_packages` must actually reach discovery's install gate.
+///
+/// pi's session path calls `packageManager.resolve()` with no `onMissing`
+/// (resource-loader.ts:403,549 @v0.83.0), so a declared git package with no working tree is cloned
+/// unless `isOfflineModeEnabled()` (package-manager.ts:1260-1271). cyrup carries that decision on
+/// the config because `cyrup-resources` reads no environment; the bin sets it from
+/// `--offline`/`CYRUP_OFFLINE`/`PI_OFFLINE`.
+///
+/// The two directions are asserted TOGETHER, and that is the point: a threading line that was
+/// dropped, or a field that was landed and never read, produces the SAME message in both runs.
+/// `git:localhost/acme/pack` parses to `https://localhost/acme/pack`, so the open-gate run attempts
+/// a loopback clone that nobody is serving and reports the failure; the closed-gate run attempts
+/// nothing and keeps the "run `cyrup install`" text. Neither run touches a network beyond loopback.
+///
+/// **COVERAGE, NOT PROOF-BY-RED:** `install_missing_packages` is new, so this test could not have
+/// failed before the field existed — it is mutation-verifiable (delete
+/// `disc.install_missing_packages = cfg.install_missing_packages` in `builder.rs` and the open-gate
+/// assertion fails), not red-before. The red-before assertion for the mechanism itself is
+/// `cfg003_an_open_gate_attempts_the_install_and_reports_its_failure` in `cyrup-resources`.
+#[tokio::test]
+async fn cfg003_the_install_gate_reaches_discovery_in_both_directions() {
+    let messages = |session: &crate::AgentSession| -> Vec<String> {
+        session
+            .services()
+            .startup_diagnostics
+            .resources
+            .iter()
+            .map(|d| d.message.clone())
+            .collect()
+    };
+
+    let closed = fixture();
+    write(
+        &closed.agent_dir.join("settings.json"),
+        "{\"packages\": [\"git:localhost/acme/pack\"]}",
+    );
+    let closed_msgs = messages(&closed.session_with(|c| c.install_missing_packages = false).await);
+    // The remedy text names the source — "run `cyrup install <source>`" — so the match must not
+    // expect a closing backtick straight after `install`.
+    assert!(
+        closed_msgs
+            .iter()
+            .any(|m| m.contains("acme/pack")
+                && m.contains("run `cyrup install ")
+                && !m.contains("could not be installed")),
+        "a closed gate installs nothing and says so: {closed_msgs:?}"
+    );
+
+    let open = fixture();
+    write(
+        &open.agent_dir.join("settings.json"),
+        "{\"packages\": [\"git:localhost/acme/pack\"]}",
+    );
+    let open_msgs = messages(&open.session_with(|c| c.install_missing_packages = true).await);
+    assert!(
+        open_msgs
+            .iter()
+            .any(|m| m.contains("acme/pack") && m.contains("could not be installed")),
+        "an open gate attempts the install and reports the failure: {open_msgs:?}"
     );
 }
 

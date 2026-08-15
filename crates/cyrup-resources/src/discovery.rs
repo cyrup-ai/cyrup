@@ -173,6 +173,24 @@ pub struct DiscoveryConfig {
     pub enable_themes: bool,
     pub cli: CliResourcePaths,
     pub installed: InstalledPackages,
+    /// Whether a settings-declared GIT package whose working tree is not materialized may be cloned
+    /// during this discovery pass (CFG-003).
+    ///
+    /// This one flag carries BOTH halves of upstream's gate, because upstream has exactly two
+    /// callers and they sit at the two ends of it. `resolvePackageSources`' `installMissing`
+    /// (package-manager.ts:1260-1271 @v0.83.0) installs UNCONDITIONALLY unless
+    /// `isOfflineModeEnabled()` (`:42-46`, `PI_OFFLINE`) or an optional `onMissing(source)` answers
+    /// `"skip"`/`"error"`. The session path — `ResourceLoader.reload()` and
+    /// `loadCurrentExtensionSet()` — calls `packageManager.resolve()` with **no** `onMissing`
+    /// (resource-loader.ts:403, :549 @v0.83.0), i.e. install; the startup-theme pass calls
+    /// `packageManager.resolve(async () => "skip")` (cli/startup-ui.ts:73 @v0.83.0), i.e. do not.
+    ///
+    /// So `true` is pi's resource-loader behaviour and `false` is pi's startup-ui behaviour, and
+    /// `false` is the default: a caller that has not thought about the network gets the pass that
+    /// touches no network, and the bin turns it on for the session build unless
+    /// `--offline`/`CYRUP_OFFLINE`/`PI_OFFLINE` is set (`SessionConfig::install_missing_packages`).
+    /// npm and OCI sources are unaffected — they never reach this arm (R-09-021, CFG-009).
+    pub install_missing_packages: bool,
     /// Packages DECLARED in `settings.json` (`packages: [...]`), per settings layer. Pi's ONLY
     /// package channel — `PackageManager.resolve()` re-reads
     /// `projectSettings.packages`/`globalSettings.packages` on every call and resolves each entry to
@@ -214,6 +232,9 @@ impl DiscoveryConfig {
             enable_themes: true,
             cli: CliResourcePaths::default(),
             installed: InstalledPackages::default(),
+            // Pi's `resolve(async () => "skip")` caller, not its `resolve()` one — see the field
+            // docs. The bin flips it for the session build.
+            install_missing_packages: false,
             configured_packages: Vec::new(),
             extra: DiscoveredPaths::default(),
             disabled: DisabledSet::default(),
@@ -345,12 +366,25 @@ enum ConfiguredPackageResolution {
 
 /// Resolve a settings-declared package entry to its on-disk working tree.
 ///
-/// Pi's `resolvePackageSources` (package-manager.ts:1224-1283) resolves a `local` source against the
-/// scope base dir (`getBaseDirForScope`, 2055-2064: `<cwd>/.cyrup` for project, the agent dir for
-/// user) and *installs* an npm/git source that is missing. **[CYRUP-DELTA]**: cyrup performs no
-/// network install during session assembly — a non-local source resolves only through the existing
-/// install registry paths, and anything unresolvable becomes a loud [`ResourceDiagnostic`] instead of
-/// a silent drop or a failed session (constraint: malformed/missing declarations fail loudly + safely).
+/// Pi's `resolvePackageSources` (package-manager.ts:1240-1298 @v0.83.0) resolves a `local` source
+/// against the scope base dir (`getBaseDirForScope`, `:2071-2088`: `<cwd>/.cyrup` for project, the
+/// agent dir for user) and *installs* an npm/git source that is missing.
+///
+/// **CFG-003 — the git install arm is now ported.** When the working tree is absent, the git arm
+/// (`:1287-1292`) calls `installMissing` (`:1260-1271`), which installs unless
+/// `isOfflineModeEnabled()` (`:42-46`) or an `onMissing` callback declines; that reaches
+/// `installParsedSource` (`:1347-1356`) → `installGit` (`:1820-1852`), whose fresh-clone path is
+/// `ensureGitIgnore(gitRoot)` (`:1831-1834`, ported as [`crate::package::install::ensure_git_ignore`])
+/// followed by the clone (`:1837`, ported as [`crate::package::install::git_clone`]). Whether this
+/// pass may install at all is [`DiscoveryConfig::install_missing_packages`], which carries pi's
+/// offline gate and its `onMissing` "skip" answer in one flag — see that field.
+///
+/// **[CYRUP-DELTA]**, on the two arms that remain: (a) when the install is not permitted pi simply
+/// `continue`s (`:1290`, silent) and cyrup emits a loud [`ResourceDiagnostic`] naming the package,
+/// and (b) when the install FAILS pi throws out of `resolve()` and takes the session build down
+/// (`installGit`'s `throw error`, `:1849`) while cyrup reports the error as a diagnostic and carries
+/// on with the rest of the resource set (constraint: malformed/missing declarations fail loudly +
+/// safely). npm and OCI sources never reach the install arm at all (R-09-021, CFG-009).
 ///
 /// `all` is the full declared set, needed for Pi's `findAutoloadDeltaBase`
 /// (package-manager.ts:1285-1299): a project-scope `autoload: false` entry RESOLVES against the
@@ -368,10 +402,50 @@ pub fn scope_base_dir(cwd: &Path, global_dir: &Path, scope: InstallScope) -> Pat
     }
 }
 
+/// Materialize a settings-declared git package that has no working tree yet — Pi `installGit`'s
+/// fresh-clone path (package-manager.ts:1831-1837 @v0.83.0), reached from the git arm of
+/// `resolvePackageSources` (`:1287-1291`) through `installMissing` (`:1260-1271`) and
+/// `installParsedSource` (`:1347-1356`).
+///
+/// The install ROOT is prepared before the clone, exactly as upstream orders it: `getGitInstallRoot`
+/// then `ensureGitIgnore` (`:1831-1834`) — at project scope that root is inside the user's own
+/// repository, so without it the clone shows up in `git status` (CFG-037). [`git_clone`] then
+/// stages and renames, so a failure leaves nothing behind at `dir`.
+///
+/// **No registry row is written.** pi has no install registry: a settings-declared package IS the
+/// declaration, re-read from `settings.json` on every `resolve()` (package-manager.ts:891-901), and
+/// its tree is found by deriving the path from the source (`getGitInstallPath`, `:2031-2040`).
+/// cyrup's `packages.json` records what `cyrup install` did, on purpose — writing a row here would
+/// invent a package the user never installed and make `cyrup remove` fight the settings file.
+/// Discovery resolves this tree by the same path derivation ([`installed_dir`]), so the row is not
+/// needed to load it.
+pub(crate) fn install_declared_git_package(
+    source: &crate::package::PackageSource,
+    scope: InstallScope,
+    dir: &Path,
+    cfg: &DiscoveryConfig,
+) -> Result<(), ResourceError> {
+    let crate::package::PackageSource::Git { url, reff } = source else {
+        // npm is rejected by `PackageSource::parse` before reaching here (CFG-009) and OCI has no
+        // fetcher (R-09-021); neither is a `git clone`.
+        return Err(ResourceError::UnsupportedOci);
+    };
+    let store = crate::package::PackageStore::new(
+        cfg.package_global_dir.clone(),
+        cfg.project_root.clone(),
+    );
+    if let Some(root) = store.packages_root(scope) {
+        crate::package::install::ensure_git_ignore(&root)?;
+    }
+    crate::package::install::git_clone(url, dir, reff.ref_name().map(str::to_string))?;
+    Ok(())
+}
+
 fn resolve_configured_package(
     declared: &ConfiguredPackage,
     all: &[ConfiguredPackage],
     cfg: &DiscoveryConfig,
+    cancel: &CancelToken,
 ) -> Result<ConfiguredPackageResolution, Box<ResourceDiagnostic>> {
     let tier = declared.scope.package_resource_scope();
     // Pi `findAutoloadDeltaBase` (package-manager.ts:1301-1313 @v0.83.0) pairs the two entries by
@@ -444,7 +518,9 @@ fn resolve_configured_package(
             }
             resolved
         }
-        // git/oci: use the tree a previous `cyrup install` materialized, if any.
+        // git/oci: the derived working-tree path — Pi `getGitInstallPath` (package-manager.ts:
+        // 2031-2040 @v0.83.0). It is where a previous `cyrup install` materialized the tree, and
+        // where the CFG-003 auto-install below puts one when it is absent.
         _ => installed_dir(
             &source,
             resolve_scope,
@@ -466,16 +542,39 @@ fn resolve_configured_package(
     };
     // Only reachable for a git/oci source now: the local arm above has already returned for every
     // non-directory outcome, Pi-silently.
+    //
+    // CFG-003 — pi's `if (!existsSync(installedPath)) { const installed = await installMissing();
+    // if (!installed) continue; }` (package-manager.ts:1287-1291 @v0.83.0). The clone runs on this
+    // thread: `discover_blocking` is already inside `spawn_blocking` and [`git_clone`] is
+    // synchronous, so there is no future to drop mid-install and no `.await` between the clone and
+    // the tree being read. Cancellation is checked BEFORE starting one — an aborted session build
+    // must not begin a fetch, and a token that fires mid-clone cannot abort the blocking task, so
+    // the check has to sit ahead of the work rather than behind it.
     if !dir.is_dir() {
-        return Err(Box::new(ResourceDiagnostic::error(
-            ResourceKind::Package,
-            &dir,
-            format!(
-                "package {:?} is declared in settings but is not installed at this path — run \
-                 `cyrup install {}`",
-                declared.source, declared.source
-            ),
-        )));
+        if !cfg.install_missing_packages {
+            return Err(Box::new(ResourceDiagnostic::error(
+                ResourceKind::Package,
+                &dir,
+                format!(
+                    "package {:?} is declared in settings but is not installed at this path — run \
+                     `cyrup install {}`",
+                    declared.source, declared.source
+                ),
+            )));
+        }
+        if cancel.is_cancelled() {
+            return Ok(ConfiguredPackageResolution::Skip);
+        }
+        if let Err(e) = install_declared_git_package(&source, resolve_scope, &dir, cfg) {
+            return Err(Box::new(ResourceDiagnostic::error(
+                ResourceKind::Package,
+                &dir,
+                format!(
+                    "package {:?} is declared in settings and could not be installed: {e}",
+                    declared.source
+                ),
+            )));
+        }
     }
     Ok(ConfiguredPackageResolution::Tree(Box::new(PackageTree {
         dir,
@@ -693,7 +792,11 @@ pub async fn discover(
         return Err(ResourceError::Cancelled);
     }
     let cfg = cfg.clone();
-    let join = tokio::task::spawn_blocking(move || discover_blocking(&cfg));
+    // CFG-003: the blocking pass can now clone a declared git package, so it needs the token
+    // itself. `run_until_cancelled` below only stops WAITING — a `spawn_blocking` task is never
+    // aborted — so without this a cancelled build would keep fetching every remaining package.
+    let inner_cancel = cancel.clone();
+    let join = tokio::task::spawn_blocking(move || discover_blocking(&cfg, &inner_cancel));
     match cancel.run_until_cancelled(join).await {
         Some(joined) => joined.map_err(|e| {
             ResourceError::Core(cyrup_core::CoreError::Io(std::io::Error::other(
@@ -704,7 +807,10 @@ pub async fn discover(
     }
 }
 
-fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceError> {
+fn discover_blocking(
+    cfg: &DiscoveryConfig,
+    cancel: &CancelToken,
+) -> Result<DiscoveryReport, ResourceError> {
     let mut skills: Vec<Skill> = Vec::new();
     let mut prompts: Vec<PromptTemplate> = Vec::new();
     let mut themes: Vec<Theme> = Vec::new();
@@ -837,7 +943,7 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
         if declared.scope == InstallScope::Project && !cfg.trusted_project {
             continue; // fail-closed trust gate (Pi `assertProjectTrustedForScope`, 2055-2058)
         }
-        match resolve_configured_package(declared, &cfg.configured_packages, cfg) {
+        match resolve_configured_package(declared, &cfg.configured_packages, cfg, cancel) {
             Ok(ConfiguredPackageResolution::Tree(tree)) => {
                 let mut tree = *tree;
                 match declared.scope {

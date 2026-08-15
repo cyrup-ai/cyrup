@@ -17,6 +17,111 @@ use cyrup_tools::{PermissionPolicy, PolicyDecision};
 /// The placeholder text Pi substitutes for a blocked image (sdk.ts:270).
 const BLOCKED_IMAGE_TEXT: &str = "Image reading is disabled.";
 
+/// SESS-043 — cyrup's `convertToLlm` (`coding-agent/src/core/messages.ts:148-195` @v0.83.0), the
+/// function pi hands the Agent as `convertToLlm` (`coding-agent/src/core/sdk.ts:256-301`).
+///
+/// pi has TWO of these: the base `defaultConvertToLlm` in the agent package, which keeps only
+/// `user`/`assistant`/`toolResult`, and this one in the coding agent, which additionally renders the
+/// four declaration-merged roles. cyrup only had the base one
+/// ([`cyrup_agent::default_convert_to_llm`]), which is why the coding-agent roles could not live in
+/// the transcript at all: anything that entered would silently vanish from the request.
+///
+/// The three [`AgentMessage::App`] roles are rendered by handing the stored pi wire object back to
+/// `cyrup-session`, whose `push_llm` IS this crate's other copy of the same upstream switch — so the
+/// transcript-seeded path and the `build_context()` path cannot drift. `custom` is rendered by
+/// [`cyrup_session::agent_message::custom_to_message`], pi's `case "custom"` (`:162-168`): before
+/// this, a `custom` message was dropped here while the SAME message rendered into the request after
+/// a compaction re-seed, because `build_context()` had already flattened it to a `user` turn.
+pub(crate) fn coding_agent_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message> {
+    use cyrup_session::agent_message::AgentMessage as Raw;
+
+    let mut out = Vec::with_capacity(msgs.len());
+    for m in msgs {
+        match m {
+            AgentMessage::User { content, timestamp } => {
+                out.push(Message::User { content: content.clone(), timestamp: timestamp.unwrap_or(0) });
+            }
+            AgentMessage::Assistant(a) => out.push(Message::Assistant(a.clone())),
+            AgentMessage::ToolResult(t) => out.push(Message::ToolResult {
+                tool_call_id: t.tool_call_id.clone(),
+                tool_name: t.tool_name.clone(),
+                content: t.content.clone(),
+                is_error: t.is_error,
+                details: t.details.clone(),
+                // Both must cross the agent→LLM boundary — see `cyrup_agent::default_convert_to_llm`.
+                usage: t.usage.clone(),
+                added_tool_names: t.added_tool_names.clone(),
+                timestamp: t.timestamp,
+            }),
+            // `kind` is OVERLOADED on this arm and both meanings have to be honoured here.
+            //
+            // For an extension message it is pi's `customType` and `payload` is pi's `content`, so
+            // `case "custom"` (`messages.ts:162-168` @v0.83.0) applies. But `record_bash_result`
+            // (`session.rs`) also appends a LIVE `!` execution as `Custom { kind: "bashExecution",
+            // payload: <the whole BashExecutionMessage object> }` — pi has a first-class
+            // `bashExecution` ROLE there, and the session file already treats that `customType` as
+            // the role (`append_custom_message("bashExecution", …)` reloads as
+            // `Raw::BashExecution`). Rendering such a message through `custom_to_message` would hit
+            // its stringify catch-all and inject the raw JSON object as a user turn — and, worse,
+            // would ignore `excludeFromContext`, so a `!!` command's output would reach the model
+            // on the live turn. pi's `case "bashExecution"` returns `undefined` for exactly that
+            // message (`:152-156`).
+            //
+            // So a `kind` naming one of pi's declaration-merged roles is reconstituted into its pi
+            // wire object and rendered by the SAME `push_llm` the `App` arm below uses — the two
+            // paths cannot disagree, which they did until this was added: after a compaction
+            // re-seed the same execution arrives as `App { role: "bashExecution" }` and IS dropped.
+            AgentMessage::Custom { kind, payload, timestamp } => {
+                match app_role_payload(kind, payload, *timestamp)
+                    .and_then(|v| serde_json::from_value::<Raw>(v).ok())
+                {
+                    Some(raw) => raw.push_llm(&mut out),
+                    None => out.push(cyrup_session::agent_message::custom_to_message(
+                        payload,
+                        timestamp.unwrap_or(0),
+                    )),
+                }
+            }
+            // A payload this crate wrote and cannot read back would be a bug, not user data, so
+            // the `Err` arm skips exactly this message — pi's `default:` case
+            // (`messages.ts:187-190`), which likewise returns `undefined` and is filtered out.
+            AgentMessage::App { payload, .. } => {
+                if let Ok(raw) =
+                    serde_json::from_value::<Raw>(serde_json::Value::Object(payload.clone()))
+                {
+                    raw.push_llm(&mut out);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Rebuild the pi wire object for an [`AgentMessage::Custom`] whose `kind` is in fact one of pi's
+/// declaration-merged ROLES rather than a `customType` — see the `Custom` arm above.
+///
+/// Returns `None` for a genuine `custom` message, which is every `kind` outside
+/// [`cyrup_agent::APP_MESSAGE_ROLES`]. The `role` key is injected because cyrup's producer stores
+/// only the body, and `timestamp` is filled from the transcript entry when the body has none (all
+/// three target structs carry `#[serde(default)] timestamp`).
+fn app_role_payload(
+    kind: &str,
+    payload: &serde_json::Value,
+    timestamp: Option<i64>,
+) -> Option<serde_json::Value> {
+    if !cyrup_agent::APP_MESSAGE_ROLES.contains(&kind) {
+        return None;
+    }
+    let serde_json::Value::Object(mut obj) = payload.clone() else {
+        return None;
+    };
+    obj.insert("role".to_string(), serde_json::Value::String(kind.to_string()));
+    if let (None, Some(ts)) = (obj.get("timestamp"), timestamp) {
+        obj.insert("timestamp".to_string(), serde_json::Value::from(ts));
+    }
+    Some(serde_json::Value::Object(obj))
+}
+
 /// The composed hooks handed to the agent (permission gate → extension hooks).
 pub(crate) struct PolicyHooks {
     policy: PermissionPolicy,
@@ -72,7 +177,14 @@ fn filter_images(content: &[cyrup_core::Content]) -> Vec<cyrup_core::Content> {
 #[async_trait::async_trait]
 impl Hooks for PolicyHooks {
     async fn convert_to_llm(&self, msgs: &[AgentMessage]) -> Result<Vec<Message>, HookError> {
-        let converted = self.inner.convert_to_llm(msgs).await?;
+        // SESS-043 — pi's `convertToLlmWithBlockImages` is `blockImages(convertToLlm(messages))`
+        // (`coding-agent/src/core/sdk.ts:256-289` @v0.83.0) over the CODING-AGENT `convertToLlm`,
+        // not the agent package's base one. This previously delegated to `inner` (the extension
+        // seam), which does not override `convert_to_llm` and so resolved to
+        // `cyrup_agent::default_convert_to_llm` — pi's BASE function. Upstream has no extension
+        // seam on `convertToLlm` at all (extensions hook `transformContext`, which still runs
+        // ahead of this), so the delegation was inventing a seam AND losing the merged roles.
+        let converted = coding_agent_convert_to_llm(msgs);
         if !self.block_images {
             return Ok(converted);
         }

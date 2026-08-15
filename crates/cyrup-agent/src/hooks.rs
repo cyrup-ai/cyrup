@@ -197,6 +197,11 @@ pub fn default_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message> {
                 timestamp: t.timestamp,
             }),
             AgentMessage::Custom { .. } => None,
+            // SESS-043 — a declaration-merged coding-agent role. pi's BASE `defaultConvertToLlm`
+            // (`packages/agent/src/harness/messages.ts:120` @v0.83.0) likewise keeps only the three
+            // LLM roles; the app supplies its own `convertToLlm` to render the merged ones, which
+            // for cyrup is `PolicyHooks::convert_to_llm` (`cyrup-session-svc/src/hooks.rs`).
+            AgentMessage::App { .. } => None,
         })
         .collect()
 }

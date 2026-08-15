@@ -44,15 +44,36 @@ pub enum TruncatedBy {
 ///   is always present — an explicit `null` is not the same record as an absent key to any reader
 ///   that distinguishes them. The skip is gone; `None` now serializes as `null`.
 /// * `maxLines` — see [`TruncOpts::bytes_only`].
-/// * **RESIDUAL:** pi's `TruncationResult` also carries `content` (`truncate.ts:17`), the entire
-///   truncated output text a SECOND time inside `details`. cyrup keeps the text only on
-///   [`Truncated::content`] and never serializes it. Left open deliberately rather than ported
-///   blind, because it doubles the session-file cost of every truncated tool result and
-///   `git grep -n 'truncation\.content' v0.83.0 -- packages/` shows every hit is a LOCAL variable
-///   inside an `execute()` body — no pi consumer reads `details.truncation.content`.
+/// * `content` — **PORTED 2026-08-15, closing TOOL-044's residual.** pi's `TruncationResult`
+///   declares `content` FIRST (`truncate.ts:17`), and every one of pi's five call sites puts the
+///   object into `details.truncation` **whole**, so the text is in the record twice: `read.ts:294`
+///   / `:305`, `grep.ts:348`, `find.ts:199` / `:336`, `ls.ts:193`, and for `bash` both the
+///   streaming `details` (`bash.ts:356`) and the final one (`:409`), whose `snapshot.truncation`
+///   is `{...tailTruncation, …}` (`output-accumulator.ts:100-107`) — the spread is what carries
+///   `content` in. Re-derived at v0.83.0 this pass.
+///
+///   The prior pass left this unported on a cost argument (it duplicates up to `max_bytes` of text
+///   per truncated result in the session file, and `git grep -n 'truncation\.content' v0.83.0 --
+///   packages/` shows every hit is a LOCAL variable inside an `execute()` body, so no pi consumer
+///   reads it). **That decision is reversed and the reasoning is recorded so it is not re-litigated
+///   a third time:** the cost is exactly the cost pi pays for the identical record, so it is not a
+///   divergence cyrup is *forced* into — and an unforced divergence is precisely what the port rule
+///   does not permit. `details` is session-record interop, and interop that differs "only where
+///   nobody currently looks" is a difference a future reader of BOTH implementations' records hits
+///   first.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Truncation {
+    /// The truncated content (pi `TruncationResult.content`, `truncate.ts:17` @v0.83.0) — the same
+    /// text as [`Truncated::content`], carried into the serialized record because pi's object is
+    /// one struct and cyrup's is two.
+    ///
+    /// `#[serde(default)]` on the READ side only: cyrup session files written before this field
+    /// existed have no `content` key, and a hard failure to load an old session is a worse
+    /// outcome than an empty string in a field nothing reads. The WRITE side is unconditional, so
+    /// every record cyrup emits from here on carries pi's shape.
+    #[serde(default)]
+    pub content: String,
     pub truncated: bool,
     pub truncated_by: Option<TruncatedBy>,
     pub total_lines: usize,
@@ -130,6 +151,7 @@ pub fn truncate_head(content: &str, opts: TruncOpts) -> Truncated {
         return Truncated {
             content: content.to_string(),
             info: Truncation {
+                content: content.to_string(),
                 truncated: false,
                 truncated_by: None,
                 total_lines,
@@ -150,6 +172,7 @@ pub fn truncate_head(content: &str, opts: TruncOpts) -> Truncated {
         return Truncated {
             content: String::new(),
             info: Truncation {
+                content: String::new(),
                 truncated: true,
                 truncated_by: Some(TruncatedBy::Bytes),
                 total_lines,
@@ -190,8 +213,9 @@ pub fn truncate_head(content: &str, opts: TruncOpts) -> Truncated {
     let out = out_lines.join("\n");
     let output_bytes = out.len();
     Truncated {
-        content: out,
+        content: out.clone(),
         info: Truncation {
+            content: out,
             truncated: true,
             truncated_by: Some(truncated_by),
             total_lines,
@@ -233,6 +257,7 @@ pub fn truncate_tail(content: &str, opts: TruncOpts) -> Truncated {
         return Truncated {
             content: content.to_string(),
             info: Truncation {
+                content: content.to_string(),
                 truncated: false,
                 truncated_by: None,
                 total_lines,
@@ -284,8 +309,9 @@ pub fn truncate_tail(content: &str, opts: TruncOpts) -> Truncated {
     let out = selected.join("\n");
     let output_bytes = out.len();
     Truncated {
-        content: out,
+        content: out.clone(),
         info: Truncation {
+            content: out,
             truncated: true,
             truncated_by: Some(truncated_by),
             total_lines,

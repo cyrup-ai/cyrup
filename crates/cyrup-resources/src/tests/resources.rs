@@ -3028,13 +3028,19 @@ async fn cfg003_settings_declared_package_is_discovered_with_its_filter() {
     );
 }
 
-/// A settings-declared package that cyrup would have to INSTALL to resolve is a LOUD diagnostic,
-/// never a silent drop and never a failed discovery pass.
+/// A settings-declared package that cyrup would have to INSTALL to resolve, on a pass whose
+/// install gate is CLOSED, is a LOUD diagnostic — never a silent drop and never a failed discovery
+/// pass.
+///
+/// The gate is [`DiscoveryConfig::install_missing_packages`], `false` here because this config is
+/// left at its default — pi's `resolve(async () => "skip")` caller (cli/startup-ui.ts:73 @v0.83.0).
+/// With it OPEN the package is cloned instead; that arm is
+/// `cfg003_a_declared_git_package_is_cloned_when_the_install_gate_is_open`.
 ///
 /// The source must be a git one. Pi installs an uninstalled npm/git source on demand
 /// (`resolvePackageSources`, package-manager.ts:1287-1291 → `installMissing` `:1260-1271`
-/// @v0.83.0) and cyrup does no network install during session assembly, so the diagnostic is
-/// cyrup's documented `[CYRUP-DELTA]` for exactly that arm. A missing LOCAL path is a different
+/// @v0.83.0), and where `installMissing` answers `false` pi `continue`s SILENTLY (`:1290`), so the
+/// diagnostic is cyrup's documented `[CYRUP-DELTA]` for exactly that arm. A missing LOCAL path is a different
 /// upstream path entirely and is silent — see
 /// `cfg027_a_missing_local_package_path_is_a_silent_skip`.
 ///
@@ -3068,6 +3074,206 @@ async fn cfg003_uninstallable_settings_declared_package_is_an_error_diagnostic()
         .expect("an uninstalled declared package must be reported");
     assert_eq!(d.diagnostic_type, DiagnosticType::Error);
     assert_eq!(d.resource_type, crate::ResourceKind::Package);
+    // …and the gate held: nothing was fetched, so the message is the "run `cyrup install`" one and
+    // not an install failure.
+    // The remedy text names the source, so the literal is "run `cyrup install <source>`" — matching
+    // on a closing backtick right after `install` can never fire.
+    assert!(
+        d.message.contains("run `cyrup install "),
+        "a closed gate must not have attempted an install: {}",
+        d.message
+    );
+    assert!(
+        !d.message.contains("could not be installed"),
+        "…and specifically must not report an install FAILURE: {}",
+        d.message
+    );
+}
+
+/// CFG-003 — a settings-declared GIT package with no working tree is CLONED during discovery when
+/// the install gate is open, and its resources load in the same pass.
+///
+/// This is pi's session path verbatim: `ResourceLoader.reload()` calls `packageManager.resolve()`
+/// with **no** `onMissing` (resource-loader.ts:403 @v0.83.0, and again at `:549` for
+/// `loadCurrentExtensionSet`), so the git arm's `if (!existsSync(installedPath)) { const installed =
+/// await installMissing(); if (!installed) continue; }` (package-manager.ts:1287-1291) reaches
+/// `installMissing` (`:1260-1271`) with no callback to consult, which installs unconditionally
+/// unless `isOfflineModeEnabled()` (`:42-46`). `installParsedSource` (`:1347-1356`) → `installGit`
+/// (`:1820-1852`) then does `ensureGitIgnore(gitRoot)` (`:1831-1834`) and clones (`:1837`), and the
+/// tree is walked by `collectPackageResources` (`:1296`) in that same `resolve()` call.
+///
+/// **Red before the fix:** `resolve_configured_package` resolved a git source ONLY through an
+/// already-materialized `cyrup install` tree, so this exact config produced the
+/// "…is not installed at this path — run `cyrup install`" diagnostic and zero skills. Both the
+/// `skills.contains("alpha")` assertion and the `dir.is_dir()` one failed.
+///
+/// **Hermeticity, and why this test asserts a FAILED clone rather than a successful one.** The only
+/// source spellings that reach the git arm are the ones `isLocalPath` calls non-local
+/// (`npm:`/`git:`/`github:`/`http:`/`https:`/`ssh:`, paths.ts:41-55 @v0.83.0) — a `file://` URL is
+/// LOCAL to pi and to cyrup alike (`source.rs::is_local_path`), so it can never arrive here as a
+/// git source no matter how the fixture is written. A settings string therefore cannot name a local
+/// repository, and a successful clone through THIS entry point would need a real remote. `localhost`
+/// keeps it on the loopback: `git:localhost/acme/pack` parses to
+/// `Git { url: "https://localhost/acme/pack" }` (`parse_generic_git_url`'s bare `host/path` arm,
+/// which accepts a dotted host or `localhost`) and the clone fails against a port nobody is serving.
+/// The successful-clone half is `cfg003_install_declared_git_package_materializes_the_tree`.
+/// (The one environmental assumption is that nothing serves a git repo on `localhost:443`; any
+/// other outcome there is still a clone FAILURE, so the assertion holds either way. `git://` cannot
+/// be used instead: `parseGitUrl` strips a leading `git:` before parsing (git.ts:172-179 @v0.83.0,
+/// ported at `git_url.rs`), so `git://host/p` loses its scheme on both sides.)
+///
+/// **Red before the fix** on the message: with no install arm at all, a declared git package with
+/// no tree produced "…is not installed at this path — run `cyrup install`" and nothing was ever
+/// attempted. The assertion that the diagnostic says the INSTALL failed is what pins that the arm
+/// is now entered.
+#[tokio::test]
+async fn cfg003_an_open_gate_attempts_the_install_and_reports_its_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+    // A loose skill that must survive the failed package: pi throws out of `resolve()` here
+    // (`installGit`'s `throw error`, package-manager.ts:1849 @v0.83.0) and loses the whole build;
+    // cyrup's stated `[CYRUP-DELTA]` is to report and continue.
+    write(
+        &global.join("skills/solo/SKILL.md"),
+        &skill_md("solo", "solo skill"),
+    );
+
+    let source = "git:localhost/acme/pack";
+    let parsed = PackageSource::parse(source).unwrap();
+    assert!(
+        matches!(&parsed, PackageSource::Git { url, .. } if url == "https://localhost/acme/pack"),
+        "precondition: the entry must reach the GIT arm, not the local one: {parsed:?}"
+    );
+
+    let mut cfg = DiscoveryConfig::new(cwd.clone(), global.clone());
+    cfg.project_root = Some(cwd.clone());
+    cfg.trusted_project = true;
+    cfg.install_missing_packages = true;
+    cfg.configured_packages = vec![crate::ConfiguredPackage {
+        source: source.into(),
+        scope: InstallScope::Global,
+        filter: crate::PackageFilter::default(),
+    }];
+
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    let d = report
+        .diagnostics
+        .iter()
+        .find(|d| d.message.contains("acme/pack"))
+        .expect("the declared package must be reported");
+    assert_eq!(d.diagnostic_type, DiagnosticType::Error);
+    assert!(
+        d.message.contains("could not be installed"),
+        "the gate was open, so an install was ATTEMPTED — the old \"run `cyrup install`\" text \
+         means the arm was never entered: {}",
+        d.message
+    );
+    assert!(
+        report.registry.skills.contains("solo"),
+        "a failed package install must not take the rest of the resource set down"
+    );
+    // `git_clone` stages and only renames on success — pi's `rmSync(targetDir, …)` guarantee
+    // (`:1847`) arrived at differently. Nothing is left at the target path.
+    let store = PackageStore::new(cfg.package_global_dir.clone(), Some(cwd.clone()));
+    assert!(
+        !store
+            .package_dir(InstallScope::Global, &parsed.package_id())
+            .unwrap()
+            .exists(),
+        "a failed clone must leave no partial tree"
+    );
+}
+
+/// CFG-003, the clone half: [`crate::discovery::install_declared_git_package`] materializes the
+/// working tree at exactly the path discovery resolves, prepares the install root first, and writes
+/// no registry row.
+///
+/// Ported from `installGit`'s fresh-clone path (package-manager.ts:1820-1852 @v0.83.0):
+/// `getGitInstallRoot` + `ensureGitIgnore` (`:1831-1834`) then the clone (`:1837`). The tree lands
+/// under `PackageStore::package_dir`, which is what [`crate::package::store::installed_dir`] — the
+/// resolver's git arm — returns, so the fall-through in `resolve_configured_package` walks the tree
+/// it just created within the same pass, matching pi's `collectPackageResources(installedPath, …)`
+/// immediately after `installMissing` (`:1293-1296`).
+///
+/// **COVERAGE, NOT PROOF-BY-RED:** this function is new, so no version of this test could fail
+/// before the change — there was nothing to call. The red-before assertion for CFG-003 lives in
+/// `cfg003_an_open_gate_attempts_the_install_and_reports_its_failure`, which drives the same arm
+/// through the public `discover` entry point. Hermetic: the "remote" is a local repo behind a
+/// `file://` URL — a real gix clone, no network — which is a spelling only reachable by
+/// constructing the source directly, exactly as this crate's other clone tests do.
+#[tokio::test]
+async fn cfg003_install_declared_git_package_materializes_the_tree() {
+    let Some((_repo_tmp, repo_dir)) = make_local_git_repo() else {
+        eprintln!("skipping CFG-003 clone test: `git` CLI not available");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let cwd = tmp.path().join("project");
+    fs::create_dir_all(&cwd).unwrap();
+    let global = tmp.path().join("agent");
+    fs::create_dir_all(&global).unwrap();
+
+    let source = PackageSource::Git {
+        url: format!("file://{}", repo_dir.display()),
+        reff: PinRef::Default,
+    };
+    let mut cfg = DiscoveryConfig::new(cwd.clone(), global.clone());
+    cfg.project_root = Some(cwd.clone());
+    cfg.install_missing_packages = true;
+
+    let store = PackageStore::new(cfg.package_global_dir.clone(), Some(cwd.clone()));
+    let dir = store
+        .package_dir(InstallScope::Global, &source.package_id())
+        .unwrap();
+    assert!(!dir.exists(), "precondition: nothing is installed yet");
+
+    crate::discovery::install_declared_git_package(&source, InstallScope::Global, &dir, &cfg)
+        .expect("clone over file:// transport");
+
+    assert!(
+        dir.join("skills/alpha/SKILL.md").exists(),
+        "the working tree is materialized at the path discovery resolves: {}",
+        dir.display()
+    );
+    // The install ROOT is prepared BEFORE the clone (`:1831-1834`); at project scope that root sits
+    // inside the user's own repository, which is what CFG-037 is about.
+    assert_eq!(
+        fs::read_to_string(
+            store
+                .packages_root(InstallScope::Global)
+                .unwrap()
+                .join(".gitignore")
+        )
+        .unwrap(),
+        "*\n!.gitignore\n"
+    );
+    // No registry row is invented: `packages.json` records what `cyrup install` did, and the user
+    // never installed this one. pi has no registry here at all — the declaration IS the record.
+    assert!(
+        !store.registry_path(InstallScope::Global).unwrap().exists(),
+        "auto-install must not write an install-registry row"
+    );
+
+    // …and the tree is now the ordinary already-installed case: discovery walks it and does not
+    // touch the remote again (pi's `existsSync(installedPath)` short-circuit, `:1288`). Proven with
+    // the remote deleted first, so a second clone attempt could not silently succeed.
+    fs::remove_dir_all(&repo_dir).unwrap();
+    cfg.configured_packages = vec![crate::ConfiguredPackage {
+        // The same tree, named the way a settings entry names an ALREADY-installed local tree.
+        source: dir.to_string_lossy().into_owned(),
+        scope: InstallScope::Global,
+        filter: crate::PackageFilter::default(),
+    }];
+    let report = discover(&cfg, CancelToken::new()).await.unwrap();
+    assert!(
+        report.registry.skills.contains("alpha"),
+        "the cloned tree loads its resources: {:?}",
+        report.diagnostics
+    );
+    assert!(report.registry.prompts.contains("greet"));
 }
 
 /// CFG-027: a settings-declared LOCAL package path that does not exist contributes nothing and

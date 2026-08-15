@@ -1316,20 +1316,42 @@ impl<B: Backend> App<B> {
         self.state.editor.insert_str(&path.to_string_lossy());
     }
 
-    /// Read a system-clipboard image, materialize it to a `cyrup-clipboard-<uuid>.png` temp file, and
-    /// insert its PATH as text at the editor cursor (Pi `handleClipboardImagePaste`,
-    /// interactive-mode.ts:2537-2557). Returns `true` when an image was found and its path pasted;
-    /// `false` when the clipboard holds no image (Pi `clipboard.hasImage()` gate) or on any
-    /// clipboard/encode/IO error — so the caller lets Ctrl+V fall through to the editor, preserving
-    /// normal text-paste behavior.
-    fn try_paste_clipboard_image_path(&mut self) -> bool {
-        match read_clipboard_image_to_temp() {
-            Some(path) => {
-                self.insert_clipboard_image_path(&path);
-                true
-            }
-            None => false,
+    /// Pi `handleClipboardPaste` (`interactive-mode.ts:2870-2892` @v0.84.2): read an **image**
+    /// first and, only when there is none, read **text** — both inserted at the editor cursor with
+    /// `insertTextAtCursor`. Returns whether anything was pasted.
+    ///
+    /// The two clipboard reads are passed as closures rather than performed here so the ORDER is a
+    /// unit-testable fact without a live system clipboard: pi's text read is lazy — it never runs
+    /// when an image was found (`:2882` returns before `:2884`) — and a version that read both up
+    /// front would pass an equality assertion while diverging on a clipboard holding both.
+    fn paste_from_clipboard(
+        &mut self,
+        image: impl FnOnce() -> Option<std::path::PathBuf>,
+        text: impl FnOnce() -> Option<String>,
+    ) -> bool {
+        // `const image = await readClipboardImage(); if (image) { … return; }` (`:2872-2882`).
+        if let Some(path) = image() {
+            self.insert_clipboard_image_path(&path);
+            return true;
         }
+        // `const text = await readClipboardText(); if (text) { this.editor.insertTextAtCursor(text) }`
+        // (`:2884-2888`). DRIFT-045: this branch did not exist, so a Ctrl+V over a clipboard
+        // holding text inserted nothing at all — against a help table that advertises
+        // "Paste image or text from clipboard" (`:2101`).
+        if let Some(text) = text().filter(|t| !t.is_empty()) {
+            self.state.editor.insert_str(&text);
+            return true;
+        }
+        false
+    }
+
+    /// Read a system-clipboard image, materialize it to a `cyrup-clipboard-<uuid>.png` temp file, and
+    /// insert its PATH as text at the editor cursor; failing that, insert the clipboard's TEXT
+    /// (Pi `handleClipboardPaste`, interactive-mode.ts:2870-2892). Returns `true` when something
+    /// was pasted; `false` when the clipboard holds neither an image nor text, or on any
+    /// clipboard/encode/IO error — so the caller still lets Ctrl+V fall through to the editor.
+    fn try_paste_clipboard_image_path(&mut self) -> bool {
+        self.paste_from_clipboard(read_clipboard_image_to_temp, crate::clipboard::read_clipboard_text)
     }
 
     /// Clear all attached images (after the prompt is sent, or on `Esc`).
@@ -2021,17 +2043,18 @@ impl<B: Backend> App<B> {
                 //   • Ctrl+D on a non-empty buffer is forward-delete; it only exits on empty
                 //     (spec/tui/03 §6, spec/tui/07 §3.3).
                 if let Some(action) = self.state.keymap.action_for(key) {
-                    // `app.clipboard.pasteImage` (Ctrl+V): read a system-clipboard image and insert its
-                    // temp-file PATH as text at the editor cursor (Pi `handleClipboardImagePaste` →
-                    // `insertTextAtCursor(filePath)`, interactive-mode.ts:2537-2557). Gated on an image
-                    // actually being present (Pi `clipboard.hasImage()`): when the clipboard holds no
-                    // image the key is NOT swallowed — it falls through to the editor below so normal
-                    // Ctrl+V behavior is preserved (do not break text paste).
+                    // `app.clipboard.pasteImage` (Ctrl+V): pi `handleClipboardPaste`
+                    // (`interactive-mode.ts:2870-2892` @v0.84.2) reads an IMAGE first — inserting
+                    // its temp-file PATH as text at the editor cursor — and, when there is none,
+                    // reads TEXT and inserts that (DRIFT-045; the text half used to be missing, so
+                    // Ctrl+V over a text clipboard did nothing). When the clipboard holds neither,
+                    // the key is NOT swallowed: it falls through to the editor below, so a terminal
+                    // that maps Ctrl+V to a bracketed paste still works.
                     if action == Action::ClipboardPasteImage {
                         if self.try_paste_clipboard_image_path() {
                             return AppAction::Redraw;
                         }
-                        // No image on the clipboard: fall through to the editor (text) handling below.
+                        // Nothing on the clipboard: fall through to the editor handling below.
                     } else {
                         let defer_to_editor = match action {
                             Action::Interrupt => self.state.editor.autocomplete_open(),
@@ -9085,6 +9108,56 @@ mod clipboard_paste_tests {
             outgoing.images.is_empty(),
             "outgoing user message must carry no image content block"
         );
+    }
+
+    /// **DRIFT-045.** Pi `handleClipboardPaste` (`interactive-mode.ts:2870-2892` @v0.84.2) is
+    /// image-first, text-second, and the text read is LAZY — `:2882` returns before the
+    /// `readClipboardText()` at `:2884` can run.
+    ///
+    /// **Red before the fix:** `paste_from_clipboard` did not exist and
+    /// `try_paste_clipboard_image_path` consulted the image clipboard only, so the
+    /// `image absent + text present` case inserted nothing and returned `false` — the whole defect.
+    /// (`grep -rnE 'read_clipboard_text|wl-paste' crates --include='*.rs'` returned 0.)
+    #[test]
+    fn clipboard_paste_is_image_first_text_second_and_the_text_read_is_lazy() {
+        let path = std::env::temp_dir().join("cyrup-clipboard-0198f001-test.png");
+        let path_str = path.to_string_lossy().to_string();
+
+        // (a) An image on the clipboard wins, and the TEXT read never happens (`:2882` returns).
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        let text_read = std::cell::Cell::new(false);
+        let pasted = app.paste_from_clipboard(
+            || Some(path.clone()),
+            || {
+                text_read.set(true);
+                Some("clipboard text".to_string())
+            },
+        );
+        assert!(pasted);
+        assert_eq!(app.state().editor.text(), path_str);
+        assert!(
+            !text_read.get(),
+            "pi returns at `:2882`; reading the text clipboard anyway is a second system call \
+             upstream never makes and would clobber the path on a clipboard holding both"
+        );
+
+        // (b) No image, text present → the text is inserted (`:2884-2888`). This is the case that
+        // used to insert nothing at all.
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        assert!(app.paste_from_clipboard(|| None, || Some("hello from the clipboard".to_string())));
+        assert_eq!(app.state().editor.text(), "hello from the clipboard");
+
+        // (c) Neither → nothing inserted and `false`, so the caller lets Ctrl+V fall through to the
+        // editor (a terminal that maps Ctrl+V to a bracketed paste still works).
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        assert!(!app.paste_from_clipboard(|| None, || None));
+        assert_eq!(app.state().editor.text(), "");
+
+        // (d) `text || null` (`clipboard.ts:66`): an EMPTY string is falsy upstream, so it must not
+        // count as a paste — otherwise Ctrl+V over an empty clipboard would swallow the key.
+        let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
+        assert!(!app.paste_from_clipboard(|| None, || Some(String::new())));
+        assert_eq!(app.state().editor.text(), "");
     }
 }
 

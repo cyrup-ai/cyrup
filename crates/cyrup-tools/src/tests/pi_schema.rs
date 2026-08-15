@@ -151,6 +151,15 @@ fn assert_meta(
     guidelines: &[&str],
 ) {
     assert_eq!(tool.name(), name, "tool name");
+    // TOOL-045 — pi sets `label` EXPLICITLY on every built-in `ToolDefinition`, immediately after
+    // `name`, and for all seven the two strings are equal: `read.ts:210-211` @v0.83.0,
+    // `bash.ts:325-326`, `edit.ts:293-294`, `write.ts:187-188`, `grep.ts:129-130`,
+    // `find.ts:115-116`, `ls.ts:101-102`. Asserted as `Some(name)`, NOT as "`None` is fine because
+    // the runtime falls back to the name": the fallback and an explicit declaration are only
+    // indistinguishable while every label happens to equal its name, and this assertion is what
+    // makes the seven declarations data. RED for all seven before the fix (`label()` was the
+    // trait default `None`, `cyrup-core/src/tool.rs:102-104`).
+    assert_eq!(tool.label(), Some(name), "{name} label() diverges from Pi's ToolDefinition.label");
     assert_eq!(tool.description(), description, "{name} description() diverges from Pi");
     assert_eq!(
         tool.prompt_snippet(),

@@ -54,6 +54,20 @@ impl Tool for ReadTool {
     fn name(&self) -> &str {
         "read"
     }
+    /// TOOL-045. Pi's built-in `ToolDefinition`s all declare `label` EXPLICITLY next to `name`, and
+    /// for all seven the two strings are equal — `read.ts:210-211` @v0.83.0, and the same adjacent
+    /// pair at `bash.ts:325-326`, `edit.ts:293-294`, `write.ts:187-188`, `grep.ts:129-130`,
+    /// `find.ts:115-116`, `ls.ts:101-102`.
+    ///
+    /// Leaving these to `Tool::label`'s `None` default was behaviourally equivalent *today* (the
+    /// fallback yields the name), but it meant the field was declared on the trait and set by NO
+    /// built-in, so the fallback had never been exercised against a label that differs from the
+    /// name and nothing downstream was proven to read the declared value. Declaring it makes the
+    /// seven a byte-diffable port of pi's literal definitions rather than an inference from a
+    /// default.
+    fn label(&self) -> Option<&str> {
+        Some("read")
+    }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
     }

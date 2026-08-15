@@ -81,6 +81,10 @@ fn role(m: &AgentMessage) -> &'static str {
         AgentMessage::Assistant(_) => "assistant",
         AgentMessage::ToolResult(_) => "tool",
         AgentMessage::Custom { .. } => "custom",
+        // SESS-043 — a declaration-merged coding-agent role never produced by the agent loop
+        // itself; it only enters through `set_messages` when `cyrup-session-svc` seeds the raw
+        // context projection, so no event in this file can carry one.
+        AgentMessage::App { .. } => "app",
     }
 }
 

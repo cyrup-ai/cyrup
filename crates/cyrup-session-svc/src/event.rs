@@ -392,6 +392,72 @@ pub(crate) fn agent_message_to_core(m: &AgentMessage) -> Option<cyrup_core::Mess
             timestamp: t.timestamp,
         }),
         AgentMessage::Custom { .. } => None,
+        // SESS-043 — an `App` message is a *projection* of an entry that is already on disk (the
+        // raw context seeding at `set_messages`), never something the agent loop produced, so it
+        // is never on the persist path. Dropping it here is the same reason `Custom` is dropped:
+        // it is not an LLM message.
+        AgentMessage::App { .. } => None,
+    }
+}
+
+/// SESS-043 — project one **raw** context message (`cyrup_session`'s full pi `AgentMessage` union)
+/// into the agent transcript, roles intact.
+///
+/// pi assigns `this.agent.state.messages = sessionContext.messages` at all three re-seed sites
+/// (`agent-session.ts:1874-1875`, `:2155-2156`, `:3067-3068` @v0.83.0), where `buildSessionContext`
+/// (`session-manager.ts:460-468`) is `buildContextEntries(...).flatMap(sessionEntryToContextMessages)`
+/// — the projection BEFORE `convertToLlm`. cyrup previously folded the flattened
+/// `build_context().messages` through [`core_message_to_agent`], which cannot represent a
+/// `bashExecution` / `branchSummary` / `compactionSummary` at all and so produced a transcript of a
+/// different LENGTH and different roles from pi's.
+///
+/// The `custom` role keeps the typed [`AgentMessage::Custom`] arm every other cyrup producer uses
+/// (`kind` is pi's `customType`, `payload` is pi's `content`); the other three ride through
+/// [`AgentMessage::App`] as their pi wire object and are rendered back at the LLM boundary by
+/// [`crate::hooks::coding_agent_convert_to_llm`].
+pub(crate) fn raw_message_to_agent(m: &cyrup_session::agent_message::AgentMessage) -> AgentMessage {
+    use cyrup_session::agent_message::AgentMessage as Raw;
+    match m {
+        Raw::Core(core) => core_message_to_agent(core),
+        Raw::Custom(c) => AgentMessage::Custom {
+            kind: c.custom_type.clone(),
+            payload: c.content.clone(),
+            timestamp: Some(c.timestamp),
+        },
+        // `serde_json::to_value` on the raw union emits pi's exact wire object with `role` first
+        // (`cyrup-session/src/agent_message.rs`'s manual `Serialize`), which is precisely what
+        // `AgentMessage::App` stores. A non-object is unrepresentable for these three arms.
+        other => match serde_json::to_value(other) {
+            Ok(serde_json::Value::Object(payload)) => AgentMessage::App {
+                role: raw_role_tag(other).to_string(),
+                payload,
+            },
+            // Unreachable: the three arms are structs whose serializer is a map. Degrade to the
+            // pre-SESS-043 behaviour (the flattened rendering) rather than lose the turn.
+            _ => {
+                let mut rendered = Vec::new();
+                other.push_llm(&mut rendered);
+                match rendered.first() {
+                    Some(first) => core_message_to_agent(first),
+                    None => AgentMessage::User { content: Vec::new(), timestamp: None },
+                }
+            }
+        },
+    }
+}
+
+/// The pi wire `role` tag of a raw context message (`coding-agent/src/core/messages.ts:30,47,56,63`
+/// @v0.83.0).
+fn raw_role_tag(m: &cyrup_session::agent_message::AgentMessage) -> &'static str {
+    use cyrup_session::agent_message::MessageRole;
+    match m.role() {
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::ToolResult => "toolResult",
+        MessageRole::BashExecution => "bashExecution",
+        MessageRole::Custom => "custom",
+        MessageRole::BranchSummary => "branchSummary",
+        MessageRole::CompactionSummary => "compactionSummary",
     }
 }
 
