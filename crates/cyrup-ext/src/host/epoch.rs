@@ -1,8 +1,14 @@
 //! The epoch driver (arch-08 §5.3, R-ARCH-EXT-012). One background task increments the engine epoch
-//! every TICK; each armed instance has a deadline = ticks_until(timeout). On `RunCancel.cancel()`
-//! the bridge calls `engine.increment_epoch()` immediately to preempt any running guest. A guest
-//! exceeding its deadline traps with `Trap::Interrupt`, caught and surfaced as `EpochTimeout` — the
-//! host never crashes.
+//! every TICK; each armed instance has a deadline = ticks_until(timeout). A guest exceeding its
+//! deadline traps with `Trap::Interrupt`, caught and surfaced as `EpochTimeout` — the host never
+//! crashes.
+//!
+//! The cancel-and-preempt bridge this doc used to describe as fact — "On `RunCancel.cancel()` the
+//! bridge calls `engine.increment_epoch()` immediately to preempt any running guest" — is
+//! [`crate::WasmRuntime::preempt_all`], which **has no caller** (EXT-M09). What actually reaches a
+//! running guest on cancellation is the `cancel.cancelled()` arm of
+//! [`crate::host::LiveExtension`]'s `tokio::select!`s, which drops the in-flight call future. The
+//! ticker below is unaffected either way: it is the thing that makes a deadline expire at all.
 
 use cyrup_core::RunCancel;
 use std::time::Duration;

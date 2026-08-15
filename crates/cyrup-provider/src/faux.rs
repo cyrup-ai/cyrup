@@ -114,6 +114,7 @@ impl FauxModelDefinition {
             cost: self.cost,
             context_window: self.context_window,
             max_tokens: self.max_tokens,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

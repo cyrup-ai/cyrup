@@ -1286,6 +1286,10 @@ pub struct GuestState {
     bus: Arc<SharedBus>,
     /// `host-tool.emit-update` chunks emitted during a guest tool's `execute` (call_id, chunk).
     /// Drained to the runtime `ToolUpdateSink` after the execute call settles (Pi `onUpdate`).
+    /// Drain BY `call-id` ([`GuestState::take_tool_updates_for`]) and clear on every non-replaying
+    /// exit ([`GuestState::clear_tool_updates`]) — this queue is instance-scoped while upstream's
+    /// `onUpdate` is call-scoped by the language, so an undrained chunk is a cross-call leak
+    /// (EXT-M06).
     tool_updates: Mutex<Vec<(String, Value)>>,
     /// Count of stacked global autocomplete providers (Pi addAutocompleteProvider, host gap #3).
     autocomplete_providers: Mutex<u32>,
@@ -1934,9 +1938,56 @@ impl GuestState {
         }
     }
 
-    /// Drain the streamed updates for a settled tool execution.
-    pub fn take_tool_updates(&self) -> Vec<(String, Value)> {
-        self.tool_updates.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
+    /// Drain the streamed updates belonging to ONE settled tool execution, keyed by its `call-id`.
+    ///
+    /// EXT-M06 — pi's `onUpdate` is a CLOSURE passed as a field of `ToolDefinition.execute`'s second
+    /// argument (`packages/coding-agent/src/core/extensions/types.ts:484` @v0.83.0), so a chunk
+    /// physically cannot reach another call's sink: the callback IS the call. cyrup cannot send a
+    /// closure through the Component Model, so `host-tool.emit-update(call-id, chunk)` writes into
+    /// this INSTANCE-scoped queue and [`crate::host::LiveExtension::execute_tool`] replays it after
+    /// the call settles — which re-introduces exactly the cross-call channel the language ruled out
+    /// upstream. Draining unconditionally (the old `take_tool_updates`) handed every queued chunk to
+    /// whichever call happened to drain next.
+    ///
+    /// Chunks carrying any OTHER `call-id` are dropped here rather than left queued: only one tool
+    /// call can be in flight per instance (`execute_tool` holds the `LiveInner` mutex for its whole
+    /// duration, and a guest can only reach `emit-update` while it holds the store), so a foreign id
+    /// is an abandoned call's residue or an `emit-update` from a handler that is not a tool call at
+    /// all. Leaving them queued would grow the buffer for the life of the instance.
+    pub fn take_tool_updates_for(&self, call_id: &str) -> Vec<Value> {
+        let Ok(mut g) = self.tool_updates.lock() else {
+            return Vec::new();
+        };
+        let mut mine = Vec::new();
+        let mut foreign = 0usize;
+        for (cid, chunk) in std::mem::take(&mut *g) {
+            if cid == call_id {
+                mine.push(chunk);
+            } else {
+                foreign += 1;
+            }
+        }
+        drop(g);
+        if foreign > 0 {
+            tracing::warn!(
+                extension = %self.owner, call_id, foreign,
+                "discarded queued `host-tool.emit-update` chunk(s) addressed to another call-id"
+            );
+        }
+        mine
+    }
+
+    /// Discard every queued `emit-update` chunk. The teardown half of [`Self::take_tool_updates_for`]
+    /// (EXT-M06), run by `execute_tool`'s drop guard on the exit paths that never reach a replay —
+    /// a cancelled call and, the one a JS port cannot think of, the `execute_tool` future being
+    /// DROPPED at its await point. Returns how many were discarded (diagnostics/tests).
+    pub fn clear_tool_updates(&self) -> usize {
+        self.tool_updates.lock().map(|mut g| std::mem::take(&mut *g).len()).unwrap_or(0)
+    }
+
+    /// How many `emit-update` chunks are queued (tests/diagnostics; never consumed by the host).
+    pub fn queued_tool_update_count(&self) -> usize {
+        self.tool_updates.lock().map(|g| g.len()).unwrap_or(0)
     }
 
     // --- global autocomplete provider stacking (Pi addAutocompleteProvider, host gap #3) ---

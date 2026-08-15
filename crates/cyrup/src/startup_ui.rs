@@ -70,13 +70,31 @@ pub fn startup_keymaps(dirs: &ConfigDirs) -> (SelectKeymap, SessionKeymap) {
     let Ok(text) = std::fs::read_to_string(&path) else {
         return (select, session);
     };
-    if let Err(e) = select.merge_json(&text) {
-        tracing::warn!(path = %path.display(), error = %e, "ignoring malformed keybindings.json");
-        return (SelectKeymap::default(), session);
+    // CFG-038 — a rejected ENTRY is warned about by id and skipped; only an unparseable or
+    // non-object DOCUMENT drops the whole file, which is Pi's `loadRawConfig` returning `undefined`
+    // (`core/keybindings.ts:328-336`). Both maps read the same document, so the document-level
+    // error is decided by the first call and the second cannot disagree.
+    let mut issues = match select.merge_json(&text) {
+        Ok(issues) => issues,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "ignoring malformed keybindings.json");
+            return (SelectKeymap::default(), SessionKeymap::default());
+        }
+    };
+    match session.merge_json(&text) {
+        Ok(more) => issues.extend(more),
+        Err(e) => {
+            tracing::warn!(path = %path.display(), error = %e, "ignoring malformed keybindings.json");
+            return (SelectKeymap::default(), SessionKeymap::default());
+        }
     }
-    if let Err(e) = session.merge_json(&text) {
-        tracing::warn!(path = %path.display(), error = %e, "ignoring malformed keybindings.json");
-        return (select, SessionKeymap::default());
+    for issue in issues {
+        tracing::warn!(
+            path = %path.display(),
+            id = %issue.id,
+            reason = %issue.reason,
+            "ignoring keybindings.json entry"
+        );
     }
     (select, session)
 }

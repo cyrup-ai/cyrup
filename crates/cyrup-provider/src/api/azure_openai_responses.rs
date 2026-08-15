@@ -449,6 +449,11 @@ pub(crate) fn build_params(
         }
     }
 
+    // Last so custom keys override the named request fields (Pi's own comment,
+    // `azure-openai-responses.ts:324-327` @v0.84.1). AGENT-026 — the merge with
+    // `Model.sampling_params` happened in `build_base_options` (`simple-options.ts:27-33`).
+    crate::api::openai_completions::apply_sampling_params(&mut obj, opts);
+
     Ok(Value::Object(obj))
 }
 
@@ -497,6 +502,7 @@ mod tests {
             cost: ModelCost::default(),
             context_window: 1000,
             max_tokens: 1000,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

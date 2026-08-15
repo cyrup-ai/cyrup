@@ -102,12 +102,101 @@ fn malformed_keybindings_json_errors_cleanly() {
     let mut km = Keymap::default();
     assert!(km.merge_json("not json").is_err(), "garbage json should error");
     assert!(km.merge_json("[1,2,3]").is_err(), "a non-object document should error");
-    assert!(
-        km.merge_json(r#"{ "app.exit": "ctrl+nope+bad+" }"#).is_err(),
-        "an invalid key spec should error"
+    // CFG-038 — an invalid key SPEC is no longer a document-level error. Pi cannot fail one here at
+    // all: a `KeyId` is a plain string, so `"ctrl+nope+bad+"` survives into `keysById` and simply
+    // never matches (`packages/tui/src/keybindings.ts:198-204` @v0.83.0). The action ends up
+    // unbound, and the entry is REPORTED rather than thrown.
+    let issues = km.merge_json(r#"{ "app.exit": "ctrl+nope+bad+" }"#).unwrap();
+    assert_eq!(issues.len(), 1, "the bad spec is reported, not thrown: {issues:?}");
+    assert_eq!(issues[0].id, "app.exit");
+    // Unknown ids are silently ignored (forward-compat), not an error and not an issue.
+    assert_eq!(km.merge_json(r#"{ "some.future.binding": "ctrl+a" }"#).unwrap(), Vec::new());
+}
+
+/// CFG-038 — one unusable entry must not discard the rest of the document, and must not be
+/// half-applied either.
+///
+/// **This is a JS→Rust mechanism gap, and the failure was invisible in exactly the way that class
+/// of gap always is.** Pi has no all-or-nothing path through `keybindings.json`:
+/// `toKeybindingsConfig` (`core/keybindings.ts:275-287` @v0.83.0) drops an off-shape value with a
+/// bare `continue` and keeps going, and `rebuild` (`packages/tui/src/keybindings.ts:172-191`)
+/// never parses a key at all. cyrup's `merge_json` did `set_action(action, parse_key_values(&value)?)`
+/// INSIDE the entry loop, so `?` aborted the merge with the entries ahead of it in
+/// `serde_json::Map` iteration order — which is *sorted*, not file order — already applied. The
+/// binary then printed `warning: ignoring <path>`, a claim the code had already falsified.
+///
+/// The two rejected shapes have different outcomes, and both are Pi's:
+///   * a value that is not a string / array-of-strings is dropped from the config, so the action
+///     keeps its DEFAULT (`toKeybindingsConfig` never assigns it);
+///   * a well-shaped but unparseable spec is kept upstream as a never-matching `KeyId`, so the
+///     action is UNBOUND — which is what dropping the key and calling `set_action(a, vec![])` does.
+#[test]
+fn one_bad_entry_does_not_discard_or_half_apply_the_document() {
+    let mut km = Keymap::default();
+    // `app.exit` sorts BEFORE `app.interrupt`, and `app.suspend` after both, so under the old
+    // first-error abort the outcome depended on which of the three was malformed. Make the middle
+    // one bad and assert the two on either side of it both landed.
+    let issues = km
+        .merge_json(
+            r#"{
+                "app.exit": "ctrl+x",
+                "app.interrupt": "ctrl+nope+bad+",
+                "app.suspend": "ctrl+w",
+                "app.clear": 17
+            }"#,
+        )
+        .unwrap();
+
+    // The entry BEFORE the bad one, in sorted order, applied.
+    assert_eq!(km.action_for(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)), Some(Action::Quit));
+    // ...and so did the one AFTER it — the half-application this item names.
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('w'), KeyModifiers::CONTROL)),
+        Some(Action::Suspend)
     );
-    // Unknown ids are silently ignored (forward-compat), not an error.
-    assert!(km.merge_json(r#"{ "some.future.binding": "ctrl+a" }"#).is_ok());
+
+    // The unparseable spec leaves `app.interrupt` unbound (Pi: bound to a `KeyId` nothing matches),
+    // NOT sitting on its `esc` default.
+    assert_eq!(
+        km.action_for(&key(KeyCode::Esc, KeyModifiers::NONE)),
+        None,
+        "an unparseable spec still replaces the default, exactly as a never-matching KeyId does"
+    );
+    // The off-shape value is dropped from the config entirely, so `app.clear` keeps its Ctrl+C
+    // default — `toKeybindingsConfig`'s missing `else`.
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        Some(Action::Clear),
+        "a non-string value is skipped, so the action keeps its default"
+    );
+
+    // Both rejects are reported, by id, so the binary can name them.
+    let mut ids: Vec<&str> = issues.iter().map(|i| i.id.as_str()).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec!["app.clear", "app.interrupt"], "{issues:?}");
+}
+
+/// CFG-038, the array leg: `["ctrl+x", 7]` is not an array of strings, so Pi's
+/// `binding.every((entry) => typeof entry === "string")` is false and the WHOLE entry is dropped —
+/// `ctrl+x` must not be applied on its own.
+#[test]
+fn an_array_with_a_non_string_element_drops_the_whole_entry() {
+    let mut km = Keymap::default();
+    let issues = km.merge_json(r#"{ "app.exit": ["ctrl+x", 7] }"#).unwrap();
+    assert_eq!(issues.len(), 1);
+    assert_eq!(issues[0].id, "app.exit");
+    // Ctrl+X is `app.message.copy` by default, so the proof that the rejected array's first element
+    // did not take effect is that Ctrl+X still resolves to THAT action rather than to `Quit`.
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+        Some(Action::MessageCopy),
+        "no element of a rejected array may take effect"
+    );
+    assert_eq!(
+        km.action_for(&key(KeyCode::Char('d'), KeyModifiers::CONTROL)),
+        Some(Action::Quit),
+        "the action keeps its default"
+    );
 }
 
 // ---- TUI-028 / TUI-035: the id namespace -----------------------------------------------------

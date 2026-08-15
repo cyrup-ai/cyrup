@@ -4979,9 +4979,13 @@ impl AgentSession {
             });
         }));
         let chunk_pump = self.spawn_event_pump(chunk_rx);
+        // Pi `options?.operations ?? createLocalBashOperations({ shellPath })`
+        // (agent-session.ts:2782): a caller-supplied backend replaces the local one for THIS call
+        // only. `run_bash` takes the `??` whole — `None` is the local branch it always took.
         let outcome = run_bash(
             &self.proc,
             &shell,
+            options.operations.as_deref(),
             cwd,
             resolved_command,
             Some(bin_dir.as_path()),
@@ -5014,10 +5018,18 @@ impl AgentSession {
     /// "fix: rpc bash no longer bypass user_bash", #7214, so an extension observing user bash no
     /// longer misses RPC-issued commands). Both cyrup front-ends therefore share this one wrapper.
     ///
-    /// (Pi's `operations` remote-exec override — the other half of `UserBashEventResult` — is NOT
-    /// honored here: cyrup has no per-call bash-backend override seam, `self.proc` is the fixed
-    /// backend. Only the `result` short-circuit is ported. This carve-out predates DRIFT-004 and is
-    /// unchanged by it.)
+    /// Pi's sibling `operations` remote-exec override — the other half of `UserBashEventResult` —
+    /// is threaded through [`BashOptions::operations`] and honored by [`Self::execute_bash`]
+    /// (`options?.operations ?? createLocalBashOperations({ shellPath })`,
+    /// `agent-session.ts:2782`). **What this wrapper still cannot do is FILL it from the event
+    /// result, and that is DRIFT-004 / SEAM-015's last remaining half.** Upstream's
+    /// `rpc-mode.ts:576` can write `operations: eventResult?.operations` because a JS handler
+    /// returns a live object; cyrup's extension I/O is serde values (ADR-0002), so the payload
+    /// [`Self::emit_user_bash_event`] receives can carry the `operations` KEY but never a callable
+    /// behind it. Closing it needs the `register-bash-operations` import + keyed
+    /// `bash-operations-exec` export round-trip designed in full in `crates/cyrup-ext/src/lib.rs`'s
+    /// CYRUP-DELTA register — a `crates/cyrup-ext` + `crates/cyrup-ext-sdk` change with a
+    /// `HOST_WORLD` minor bump, not a change here. Once it exists this wrapper sets one field.
     pub async fn execute_bash_with_user_event(
         &self,
         command: &str,

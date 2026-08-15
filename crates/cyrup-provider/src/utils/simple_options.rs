@@ -54,6 +54,29 @@ pub fn clamp_max_tokens_to_context(model: &Model, context: &Context, max_tokens:
     (max_tokens as i64).min(available.max(MIN_MAX_TOKENS)) as u64
 }
 
+/// Merge the model's default sampling parameters with the per-request ones, per key (Pi
+/// `{ ...model.samplingParams, ...options?.samplingParams }`, simple-options.ts:27-33 @v0.84.1).
+///
+/// Returns `None` when both sides are absent — pi's ternary yields `undefined` there, and the three
+/// OpenAI-compatible adapters gate on `if (options?.samplingParams)`, so an empty map is NOT the
+/// same thing as no map. A present-but-empty map on either side is kept (JS spreads it and produces
+/// a truthy `{}`), so that distinction is upstream's, not ours to smooth over.
+fn merge_sampling_params(
+    model: Option<&serde_json::Map<String, serde_json::Value>>,
+    request: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if model.is_none() && request.is_none() {
+        return None;
+    }
+    let mut merged = model.cloned().unwrap_or_default();
+    if let Some(request) = request {
+        for (k, v) in request {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    Some(merged)
+}
+
 /// Lower a [`SimpleStreamOptions`] to a concrete [`StreamOptions`] (Pi `buildBaseOptions`,
 /// simple-options.ts:21-45): clamps `max_tokens` (defaulting to the model cap) and threads through
 /// every transport-level field. `api_key` (when non-empty) wins over `options.base.api_key`,
@@ -71,6 +94,16 @@ pub fn build_base_options(
     };
     StreamOptions {
         temperature: options.base.temperature,
+        // AGENT-026 — `samplingParams` is the ONE field `buildBaseOptions` computes rather than
+        // copies (`simple-options.ts:27-33` @v0.84.1): the model's defaults are spread first and the
+        // per-request map second, so per-request keys win PER KEY, and the result is `undefined`
+        // (not an empty map) when neither side has any. `None` is preserved exactly, because an
+        // empty-but-present map would make the adapters take their `if (options?.samplingParams)`
+        // branch where pi does not.
+        sampling_params: merge_sampling_params(
+            model.sampling_params.as_ref(),
+            options.base.sampling_params.as_ref(),
+        ),
         max_tokens: Some(clamp_max_tokens_to_context(model, context, requested)),
         cancel: options.base.cancel.clone(),
         api_key,
@@ -179,6 +212,7 @@ mod tests {
             cost: ModelCost::default(),
             context_window,
             max_tokens,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

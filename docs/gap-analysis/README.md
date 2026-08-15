@@ -340,6 +340,115 @@ converted a real finding into a non-finding across every pass, which is the only
 project has for finding anything. The out-of-scope package list remains contested — see blind
 spot 6.
 
+### Killed claims — disproved hypotheses about `crates/cyrup-tui`, do not re-file
+
+Rescued 2026-08-14 from §8 of `docs/audits/2026-08-09-tui-presentation-fidelity.md`, which
+**ADR-0009 stamped non-normative** — a non-normative document cannot discharge the one job these
+rows exist for, which is to stop the next pass re-filing a hypothesis that has already been
+refuted with evidence. Each row is a claim that was *investigated and killed*; the evidence is the
+part that matters, so it is carried across verbatim in substance. Re-file any of these only by
+first refuting the evidence quoted here.
+
+**The one that cost behaviour, twice over:**
+
+- **S24 — "pi never draws `⊟` in the tree connector." WRONG, and acting on it deleted a working
+  feature.** The row read the guard at `tree-selector.ts:734` backwards.
+  `foldMarker = isFolded && !showsFoldInConnector ? theme.fg("accent","⊞ ") : ""` does **not** mean
+  "pi only ever shows a folded marker". `showsFoldInConnector` is
+  `flatNode.showConnector && !flatNode.isVirtualRootChild`, so `!showsFoldInConnector` reads *"the
+  connector did NOT already show the fold state"*: `:734` is the FALLBACK for a node with no
+  connector to put the cell in (depth 0 / virtual-root children). The general case is `:722`, inside
+  the connector — `prefixChars.push(isFolded ? "⊞" : foldable ? "⊟" : "─")`. pi draws `⊟` on every
+  foldable, expanded node that has a connector. A batch acting on the wrong row deleted `⊟` from
+  cyrup **and inverted two tests into asserting its absence**; both are restored.
+  **The general rule: when a marker is gated on a `!shows…InX` predicate, find X and read what X
+  emits before concluding the marker's site is the only site.** An inverted guard plus an inverted
+  test is invisible to the gate — the suite is green in exactly the state where the feature is gone.
+
+**Unreachable code mistaken for a rendered defect** (the trap: quoting a literal proves the literal,
+not that anything reaches it):
+
+- **F22 — hex fallback defaults in `role_style(key, default_hex)` not matching `dark.json`.** The
+  hexes are correctly quoted on both sides, but the code is **unreachable**. `role_style`/
+  `role_color` fall back only when `self.roles` lacks the key; the synthetic-empty-roles constructor
+  is called only from `UiTheme::dark()`/`light()` with names `builtin_themes()` always resolves; and
+  a custom theme omitting a token is blocked by `cyrup-resources/src/theme.rs:109-121`, which
+  hard-errors on any missing `REQUIRED_COLOR_TOKEN`. **No real session renders `#666666` fence
+  borders because of this.** The residual — a syntactically valid string that is neither a hex nor a
+  defined var, dropped by `from_theme_data`'s `filter_map` — is a real but far narrower bug.
+- **F21 / F142's hex-fallback clause.** Dead for exactly the same reason as F22. The live half of
+  those rows is the `Modifier::DIM` alone.
+- **F90 — the data-selector empty-state string.** The literals are as quoted, but
+  `SelectList::with_no_match` only renders when `items.is_empty()`, and every production
+  `open_data_selector` call site guards emptiness first (Logout, UserMessage, Login);
+  BranchSummary uses `ListSelector::prompt` with three hardcoded rows. **No user ever sees the
+  string.**
+
+**Claims about cyrup's colour handling that are simply false:**
+
+- **"cyrup ships one palette that assumes dark."** False. `cyrup-resources/src/theme.rs` matches
+  `dark.json` *and* `light.json` token-for-token across all 50 shared tokens, `vars` and `export`
+  blocks included, and `ThemeController` ports `resolveThemeSetting` / `parseAutoThemeSetting` /
+  terminal-background detection. The light-theme damage was entirely downstream of SYS-1.
+- **"cyrup hardcodes colours where pi uses tokens."** Essentially false. `grep "Color::"` over
+  `crates/cyrup-tui/src/*.rs` yields two files: `image.rs` (two `Color::Reset` *equality tests*) and
+  `theme.rs` (`unwrap_or(...)` fallbacks + hex-parse plumbing). **There is no `Color::Rgb` literal in
+  any renderer.** All colour drift is accessor-level or call-site-level, never a magic number.
+
+**Rows whose scope, severity or direction was wrong as first written** — re-file only the corrected
+half:
+
+- **F134's scope ("the single most common shape, nearly every turn").** Wrong. With a blank line
+  before a list (the normal case) marked's `space` token pushes `""` (`markdown.ts:619-622`), so pi
+  and cyrup both produce exactly one blank row. The divergence occurs **only** for a list that
+  interrupts a paragraph with *no* blank line in the source.
+- **F40's effect direction — inverted.** `chars().count()` **under**-counts wide glyphs, so
+  `width - len` is too **large**: the line is **over**-padded and spills past the frame into a
+  spurious extra tinted row. (It was filed as under-padding.) Corrected as L6.
+- **F31 / F88 / F124's "2 columns off" clause.** Fires only when the clamp binds
+  (`primary_min`/`primary_max`); when `primary_min <= widest` and `widest + GAP <= primary_max` both
+  sides land the description at `2 + widest + 2` and agree exactly. **The scroll-window jitter is the
+  always-on half** — that is the part worth fixing.
+- **F19's `scrollbarThumb` sub-claim ("cannot even be expressed").** Overstated — pi itself defaults
+  it (`theme.ts:164`, `withThemeColorFallbacks` at `:330`), so a palette omitting the key is harmless
+  upstream. The real defect is only that no cyrup renderer reads it.
+- **F39's severity.** Lowered: pi gates the scrollbar on `getFullscreenScrollbar()`
+  (`interactive-mode.ts:873`), an alt-screen-only feature, and cyrup runs an inline viewport by
+  design.
+- **S3 / S28 are NOT properties of the shared `SelectList`.** Neither the hint row nor the
+  one-column inset is generic; both are built per-component upstream. A cyrup "fix" putting either on
+  `ListSelector` unconditionally reaches ~10 dialogs where pi draws them on 4 (hints) and 6 (inset).
+  Both are opt-in via `SelectorKind::draws_hint_row()` / `insets_rows()`, whose doc comments carry
+  the per-component evidence. **Generalising a per-caller behaviour onto a shared widget is a
+  divergence, not a port.**
+
+**Verified-matching pairs — do not re-derive:**
+
+- **"`config_selector.rs:372`'s group line is accent+BOLD vs pi's plain accent."** Wrong:
+  `config-selector.ts:418-419` is `theme.fg(inherited ? "dim" : "accent", theme.bold(label))` —
+  accent **and** bold, exactly what cyrup does. The config-selector defects are S17-S19.
+- **"`selectedBg` is used in exactly one place upstream."** Wrong — `session-selector.ts:507` uses it
+  too. See SYS-4.
+- **"`overlay.rs` has no pi counterpart, so there is nothing to audit."** Wrong —
+  `interactive-mode.ts:6090-6204 handleHotkeysCommand` is the counterpart, rendering the same content
+  as a transcript markdown block. It was filed as S36.
+- **`h-stack` / `v-stack` / `stack` gap handling.** Not a finding: `git grep "gap:"` at v0.84.1 over
+  `packages/coding-agent/src packages/tui/src` returns only the declarations and CSS. No caller ever
+  passes a non-zero gap, so `this.gap` is always 0 — matching ratatui's gapless layout.
+- **Spinner frames and interval.** Byte- and millisecond-identical (`loader.ts:11-12` ↔
+  `status_indicator.rs:28-30`).
+- **`markdown.rs`'s code-block indent, HR glyph, H1 underline, `### ` prefix rule, blockquote prefix
+  and `trim_partial_closing_fence`; and `ansi.rs` entire.** All verified matching.
+- **`session_search.rs` ↔ `session-selector-search.ts`.** A pure query DSL with no render surface on
+  either side. pi does no match-highlighting anywhere in these components (`fuzzyFilter` returns
+  items, not spans), so the absence of highlight styling in cyrup is **correct**, not a gap.
+
+Two §8 entries were deliberately **not** rescued as traps, because they are live coverage rather than
+killed claims, and ADR-0009 item 5 routes them to area 07's `## Coverage` instead:
+`startup.rs`/`startup_selector.rs` vs `interactive-mode.ts:1480-1690 showLoadedResources`, and
+`login_dialog.rs` ↔ `login-dialog.ts` — both **unaudited, not clean**. "Nobody has looked" is a
+coverage statement, not a trap and not an item.
+
 ## Structural blind spots, all found the hard way
 
 Each was found because something the analysis had looked straight at and blessed turned out to be

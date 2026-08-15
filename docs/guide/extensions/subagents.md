@@ -60,7 +60,7 @@ evidence. You do not guess; you verify from the code, tests, docs, or requiremen
 ```
 
 `name` and `description` are required. **A file missing either is skipped silently** — no warning,
-no diagnostic, the agent simply never appears. If an agent you wrote is not listed by
+no diagnostic, the agent never appears at all. If an agent you wrote is not listed by
 `/subagents-doctor`, check those two keys first.
 
 The frontmatter parser is a YAML subset: line-oriented, with one level of block nesting. It does not

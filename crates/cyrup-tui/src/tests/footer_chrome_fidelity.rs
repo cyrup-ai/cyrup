@@ -943,9 +943,14 @@ fn c13_mirror_onboarding_copy_follows_a_rebind() {
 /// FAILS before the fix: `3 queued` appeared between the cost and the model.
 #[test]
 fn c14_footer_has_no_queued_segment() {
-    let mut status = StatusLine::new("anthropic/claude-opus-4-8");
-    status.set_queued(3);
-    assert_eq!(status.queued, 3, "the depth is still TRACKED — only the footer segment is gone");
+    // The depth is no longer TRACKED HERE AT ALL — `StatusLine` has no `queued` field and no
+    // `set_queued`. C14's deletion was right about the footer and silent about the replacement, and
+    // the counter it left behind was dead state that read like rendered state (ADR-0009 item 3).
+    // The queue's real surface is `crate::pending_messages`; the paired PRESENCE assertion is
+    // `tests::render::ingest_events_drive_status_and_transcript`, which asserts the `Steering: …` /
+    // `Follow-up: …` rows and the dequeue hint are on screen — so this absence assertion cannot
+    // quietly come to mean "nowhere", which is exactly what it meant for one release.
+    let status = StatusLine::new("anthropic/claude-opus-4-8");
     assert!(
         !status.usage_cluster().contains("queued"),
         "left cluster: [{}]",

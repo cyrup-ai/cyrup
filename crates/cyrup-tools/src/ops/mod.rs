@@ -452,6 +452,12 @@ pub struct BashExecOptions<'a> {
 /// `crates/cyrup-ext/src/lib.rs` (DRIFT-004 / SEAM-015). This trait is the host-side half and is
 /// complete: any in-host caller — the isolation decorators (arch-12), a future keyed guest proxy —
 /// can already supply one.
+///
+/// The CONSUMER side is built as well: `cyrup_session_svc::BashOptions::operations` carries an
+/// `Arc<dyn BashOperations>` through `execute_bash_with_user_event` into `execute_bash`, which
+/// resolves pi's `options?.operations ?? createLocalBashOperations({ shellPath })`
+/// (`agent-session.ts:2782`) and routes the whole sanitize/buffer/spill pipeline over whichever
+/// backend won. The one remaining half of DRIFT-004 / SEAM-015 is the guest round-trip above.
 #[async_trait::async_trait]
 pub trait BashOperations: Send + Sync {
     /// Execute `command` in `cwd`, streaming combined stdout+stderr to `opts.on_data`.

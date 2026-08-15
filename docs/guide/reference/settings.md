@@ -51,7 +51,7 @@ authentication configured. See [Models and thinking](../guides/models.md).
 |---|---|---|---|
 | `theme` | string | *unset* | Theme name, or an auto pair. See below. |
 | `hideThinkingBlock` | bool | `false` | Hide thinking blocks in responses. |
-| `showCacheMissNotices` | bool | `false` | Per-message cache-miss notices; no consumer reads this yet. |
+| `showCacheMissNotices` | bool | `false` | Per-message cache-miss notices; nothing in the interface reads this setting. |
 | `showHardwareCursor` | bool | `false` | Show the terminal's hardware cursor. |
 | `editorPaddingX` | integer | `0` | Input-editor horizontal padding; the settings editor clamps this to 0–3. |
 | `outputPad` | `0`\|`1` | `1` | Chat-output horizontal padding; only an explicit `0` removes it. |
@@ -206,7 +206,7 @@ Both accept a number or a numeric string. `httpIdleTimeoutMs` additionally accep
 { "httpIdleTimeoutMs": "disabled" }
 ```
 
-**A present-but-invalid value is an error, not a fallback.** `"httpIdleTimeoutMs": "5 minutes"`
+A present-but-invalid value is an error, not a fallback. `"httpIdleTimeoutMs": "5 minutes"`
 fails at startup rather than quietly reverting to the default. Remove the key entirely if you want
 the default.
 

@@ -109,7 +109,7 @@ To skip the question everywhere, set `defaultProjectTrust` in your global settin
 default), `always`, or `never`. It is a global-only key: cyrup strips it from project settings, so a
 repository cannot vote itself trusted.
 
-**In non-interactive modes an undecided project is untrusted.** `-p`, `--mode json` and `--mode rpc`
+In non-interactive modes an undecided project is untrusted. `-p`, `--mode json` and `--mode rpc`
 have nobody to ask, so a folder with no saved decision and no `--approve` gets the safe answer. This
 is the usual reason a CI run silently ignores a repository's `.cyrup/` directory — see
 [Scripting and automation](scripting.md).

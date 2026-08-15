@@ -494,6 +494,11 @@ pub(crate) fn try_build_params(
         }
     }
 
+    // Last so custom keys override the named request fields (Pi's own comment,
+    // `openai-responses.ts:330-333` @v0.84.1). AGENT-026 — the merge with `Model.sampling_params`
+    // happened in `build_base_options` (`simple-options.ts:27-33`); this is the assign.
+    crate::api::openai_completions::apply_sampling_params(&mut obj, opts);
+
     Ok(Value::Object(obj))
 }
 
@@ -1755,6 +1760,7 @@ mod tests {
             },
             context_window: 400_000,
             max_tokens: 128_000,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

@@ -86,6 +86,7 @@ impl ImagesModel {
             cost: self.cost.clone(),
             context_window: 0,
             max_tokens: 0,
+            sampling_params: None,
             thinking_level_map: self.thinking_level_map.clone(),
             compat: None,
             headers: self.headers.clone(),

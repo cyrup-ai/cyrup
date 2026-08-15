@@ -27,17 +27,28 @@
 //! in either mode. A child that went idle or blocked on a decision would otherwise stall the loop
 //! until the timeout, and the caller is exactly who has to act on it.
 //!
-//! # Wake mechanism, and the deliberate delta from pi
+//! # Wake mechanism (SUBA-034)
 //!
-//! pi additionally subscribes to its in-process event bus so a completion wakes `wait` instantly,
-//! with the poll as a reconciliation fallback — and pi is explicit that the poll, not the event, is
-//! the source of truth for what changed ("With no bus, `wait` degrades to pure polling"). cyrup
-//! runs the pure-polling shape: the crate's completion signal is a real file
-//! ([`super::ResultFile`], authoritative per R-SA-077) written by a separate OS process, which the
-//! poll reads through the same R-SA-079 reconciliation gate every other control action uses
-//! ([`super::run_status::list_active_runs`]). There is no in-process bus a detached hop-2 runner
-//! could publish to, so the fallback IS the mechanism. The cost is bounded by
-//! [`DEFAULT_POLL_INTERVAL_MS`] (1s, pi's own value).
+//! pi subscribes to its in-process event bus so a completion wakes `wait` at once, with the poll as
+//! a reconciliation fallback — and pi is explicit that the poll, not the event, is the source of
+//! truth for what changed ("With no bus, `wait` degrades to pure polling"). cyrup now runs that
+//! same two-part shape: [`WaitDeps::completion_bus`] carries the orchestrator's
+//! [`super::watch::CompletionBus`], the loop `select!`s the subscription against the sleep, and
+//! every wake — from either arm — re-reads authoritative state from disk through the same R-SA-079
+//! reconciliation gate every other control action uses ([`super::run_status::list_active_runs`]).
+//! The event is never itself the answer.
+//!
+//! **The delta that survives, and it is a latency floor rather than a mechanism difference.** pi's
+//! publisher is the run itself (in-process), so upstream's wake is immediate. cyrup's runs are
+//! detached OS processes whose only completion signal is the terminal [`super::ResultFile`]
+//! (R-SA-077), and the in-process thing that first learns of it is
+//! [`super::watch::ResultsWatcher`] — so a wake here is bounded below by that watcher's own
+//! 500 ms [`super::watch::RESULTS_DIR_POLL_INTERVAL`]. What the bus removes is the SECOND,
+//! independent [`DEFAULT_POLL_INTERVAL_MS`] (1 s, pi's own value) stacked on top of it. See
+//! [`super::watch::CompletionBus`] for the `[CYRUP-DELTA]` and for why closing the remaining
+//! 500 ms is a separate R-SA-098 decision.
+//!
+//! `completion_bus: None` is upstream's own no-bus degradation — pure polling, exactly as before.
 //!
 //! # Scoping (SUBA-031)
 //!
@@ -181,6 +192,11 @@ pub struct WaitDeps {
     /// SUBA-031 — the live orchestrator session (pi `deps.state.currentSessionId`), narrowing every
     /// listing this wait performs. `None` applies no filter; see the module docs.
     pub session_id: Option<String>,
+    /// SUBA-034 — the in-process completion bus this wait wakes on (pi's event-bus subscription,
+    /// `runs/background/wait.ts`'s `onAsyncComplete` listener). `None` is upstream's own documented
+    /// no-bus degradation to pure polling, and is what every construction that has no live watcher
+    /// (tests, headless embedders) supplies.
+    pub completion_bus: Option<crate::background::watch::CompletionBus>,
 }
 
 impl WaitDeps {
@@ -196,7 +212,23 @@ impl WaitDeps {
             poll_interval: Duration::from_millis(DEFAULT_POLL_INTERVAL_MS),
             enabled,
             session_id,
+            completion_bus: None,
         }
+    }
+
+    /// SUBA-034 — attach the orchestrator's live completion bus, so this wait wakes on the
+    /// observation of a terminal result instead of re-deriving it one poll interval later.
+    ///
+    /// Separate from [`Self::for_cwd`] because the bus is owned by the extension (it is the same
+    /// handle [`crate::background::watch::install_completion_watcher_with_observer`] publishes
+    /// into), while `for_cwd` is reachable from contexts that have no watcher at all.
+    #[must_use]
+    pub fn with_completion_bus(
+        mut self,
+        bus: Option<crate::background::watch::CompletionBus>,
+    ) -> Self {
+        self.completion_bus = bus;
+        self
     }
 }
 
@@ -357,6 +389,14 @@ pub async fn wait_for_subagents(
     // A single named run always means "wait until that one is done", regardless of `all`.
     let wait_for_all = params.id.is_some() || params.all == Some(true);
 
+    // SUBA-034: subscribe BEFORE the first listing, never after. A completion observed between the
+    // snapshot below and a later subscription would be missed by BOTH — the snapshot still shows
+    // the run active and the subscription starts after the edge — and the wait would then pay the
+    // full poll interval anyway, which is exactly the latency this closes. `broadcast::Receiver`
+    // only delivers values sent after `subscribe()`, so this ordering is the whole correctness
+    // argument for the wake.
+    let mut wake = deps.completion_bus.as_ref().map(super::watch::CompletionBus::subscribe);
+
     let mut active = active_runs(params.id.as_deref(), deps).await?;
 
     if active.is_empty() {
@@ -429,10 +469,58 @@ pub async fn wait_for_subagents(
 
         // Escape hatch #1 + #2, in one place: never sleep past the deadline, and wake instantly on
         // cancellation instead of after the remaining poll interval.
+        //
+        // SUBA-034 adds the third arm: a completion observed by this process's own
+        // [`super::watch::ResultsWatcher`] ends the sleep immediately, with the poll kept underneath
+        // as reconciliation — pi's own arrangement, and pi is explicit that the poll, not the
+        // event, is the source of truth for what changed. The loop re-reads the run tree from disk
+        // on every iteration regardless of WHICH arm woke it, so a spurious or unrelated event
+        // costs one extra listing and can never resolve a wait that has not actually finished.
+        //
+        // `biased;` is load-bearing: with a cancelled token AND a ready wake, an unbiased
+        // `select!` picks at random, so an aborted turn could take the wake arm, do one more
+        // listing, and only notice the cancellation on the next iteration. Upstream cannot express
+        // that race at all (JS awaits settle in order), so the bias is what preserves its
+        // behaviour — cancellation first, then the event, then the timer.
         let slice = poll_interval.min(timeout - elapsed);
-        tokio::select! {
-            () = cancel.cancelled() => {}
-            () = tokio::time::sleep(slice) => {}
+        let mut wake_closed = false;
+        match wake.as_mut() {
+            Some(receiver) => {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {}
+                    // A `Lagged` receiver is a wake-up, not an error: it means MORE completions
+                    // landed than the bus buffered, which is the strongest possible signal that
+                    // something changed. `Closed` — the watcher was torn down mid-wait — is the one
+                    // outcome that must not be treated as an edge: `recv` would then return
+                    // instantly forever and spin this loop at 100% CPU, so it retires the
+                    // subscription instead and the remainder of the wait polls.
+                    outcome = receiver.recv() => {
+                        wake_closed = matches!(
+                            outcome,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed)
+                        );
+                    }
+                    () = tokio::time::sleep(slice) => {}
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    () = cancel.cancelled() => {}
+                    () = tokio::time::sleep(slice) => {}
+                }
+            }
+        }
+        if wake_closed {
+            wake = None;
+            // Pay the interval this iteration would otherwise have skipped, so retiring the
+            // subscription costs the same cadence a wait that never had a bus pays.
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => {}
+                () = tokio::time::sleep(slice) => {}
+            }
         }
 
         active = active_runs(effective_id.as_deref(), deps).await?;
@@ -550,6 +638,10 @@ mod tests {
                 poll_interval: Duration::from_millis(MIN_POLL_INTERVAL_MS),
                 enabled,
                 session_id: None,
+                // SUBA-034: the no-bus shape is upstream's own documented degradation, and it is
+                // what every pre-existing test in this module exercises — so the polling path stays
+                // covered exactly as before and only the two new tests opt into a bus.
+                completion_bus: None,
             }
         }
 
@@ -1027,6 +1119,156 @@ mod tests {
         assert_eq!(format_duration(59_999), "60.0s");
         assert_eq!(format_duration(65_000), "1m5s");
         assert_eq!(format_duration(DEFAULT_TIMEOUT_MS), "30m0s");
+    }
+
+    // =============================================================================================
+    // SUBA-034 — the event wake
+    // =============================================================================================
+
+    /// The item's own Verify, expressed against the mechanism rather than against wall-clock luck:
+    /// a wait whose poll interval is FIVE SECONDS must still return promptly once the completion
+    /// is observed and published, because the bus arm — not the timer — is what releases it.
+    ///
+    /// Deliberately not asserting "~50 ms": cyrup's publisher is the orchestrator's result-file
+    /// watcher rather than the run itself, so the production floor is that watcher's own 500 ms
+    /// cadence (see the module docs' `[CYRUP-DELTA]`). What IS asserted is the property the port
+    /// adds — that the second, independent 1 s wait cadence no longer applies — and the 5 s /
+    /// 2 s gap makes a regression to pure polling fail this test rather than merely slow it.
+    #[tokio::test]
+    async fn a_published_completion_releases_a_wait_long_before_its_poll_interval() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-bus-wake");
+        fx.write_status(&run, RunState::Running, false);
+
+        let bus = crate::background::watch::CompletionBus::new();
+        let deps = WaitDeps {
+            poll_interval: Duration::from_secs(5),
+            completion_bus: Some(bus.clone()),
+            ..fx.deps(true)
+        };
+
+        let async_root = fx.async_root.clone();
+        let results_dir = fx.results_dir.clone();
+        let settle_run = run.clone();
+        let settler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // The completion is the FILE — published second, exactly as the watcher does it, so a
+            // waiter that woke on the event and re-read the tree finds terminal state waiting.
+            Fixture::settle(&async_root, &results_dir, &settle_run);
+            bus.publish(crate::background::watch::CompletionEvent {
+                run_id: settle_run,
+                outcome: crate::background::watch::ClassifiedOutcome::Completed,
+            });
+        });
+
+        let started = Instant::now();
+        let text = wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps)
+            .await
+            .expect("wait resolves on the published completion");
+        let elapsed = started.elapsed();
+        settler.await.expect("settler task");
+
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the bus arm must release the wait; a pure-poll regression would take ~5s, took {elapsed:?}"
+        );
+        assert!(
+            text.contains("1 of 1 run(s) finished"),
+            "the wake must still resolve through the on-disk reconciliation, not from the event: {text}"
+        );
+    }
+
+    /// The event is a WAKE-UP, never the answer. A publish for a run that has NOT settled must
+    /// leave the wait blocked — the poll under it stays the source of truth, which is upstream's
+    /// own stated contract for the same subscription.
+    ///
+    /// Asserts presence before absence: the wait is first shown to be genuinely resolvable (it
+    /// completes once the run really settles), so the "still blocked" half cannot pass because the
+    /// wait was broken outright.
+    #[tokio::test]
+    async fn a_spurious_wake_does_not_resolve_a_wait_whose_run_is_still_active() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-bus-spurious");
+        fx.write_status(&run, RunState::Running, false);
+
+        let bus = crate::background::watch::CompletionBus::new();
+        let deps = WaitDeps {
+            poll_interval: Duration::from_secs(5),
+            completion_bus: Some(bus.clone()),
+            ..fx.deps(true)
+        };
+
+        let cancel = CancelToken::new();
+        let params = WaitParams::default();
+        let mut waiting = Box::pin(wait_for_subagents(&params, &cancel, &deps));
+
+        // Three wakes with nothing settled: each one costs the loop a listing and must put it
+        // straight back to sleep.
+        for _ in 0..3 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            bus.publish(crate::background::watch::CompletionEvent {
+                run_id: RunId::from_token("run-bus-spurious"),
+                outcome: crate::background::watch::ClassifiedOutcome::Completed,
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(60), &mut waiting).await.is_err(),
+                "a wake for a still-running run must not resolve the wait"
+            );
+        }
+
+        // …and the wait really was resolvable all along.
+        Fixture::settle(&fx.async_root, &fx.results_dir, &run);
+        bus.publish(crate::background::watch::CompletionEvent {
+            run_id: run,
+            outcome: crate::background::watch::ClassifiedOutcome::Completed,
+        });
+        let text = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("the wait resolves once the run genuinely settles")
+            .expect("wait ok");
+        assert!(text.contains("1 of 1 run(s) finished"), "{text}");
+    }
+
+    /// A torn-down watcher (`SessionStart` replacing the session's watch, or the extension
+    /// dropping it) closes every outstanding receiver. That must retire the subscription and leave
+    /// the wait polling — NOT spin the loop, which is what an un-retired `Closed` receiver does
+    /// (`recv` returns instantly, forever).
+    #[tokio::test]
+    async fn a_closed_bus_degrades_to_polling_instead_of_spinning() {
+        let fx = Fixture::new();
+        let run = RunId::from_token("run-bus-closed");
+        fx.write_status(&run, RunState::Running, false);
+
+        let bus = crate::background::watch::CompletionBus::new();
+        let deps = WaitDeps {
+            poll_interval: Duration::from_millis(MIN_POLL_INTERVAL_MS),
+            completion_bus: Some(bus.clone()),
+            ..fx.deps(true)
+        };
+        // Every sender gone ⇒ the receiver this wait takes will report `Closed` on its first recv.
+        drop(bus);
+
+        // The run is still active when the wait starts, so the wait genuinely enters the loop with
+        // a dead subscription — the condition this test exists for — and only the POLL can release
+        // it.
+        let async_root = fx.async_root.clone();
+        let results_dir = fx.results_dir.clone();
+        let settle_run = run.clone();
+        let settler = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            Fixture::settle(&async_root, &results_dir, &settle_run);
+        });
+
+        let started = Instant::now();
+        let text = wait_for_subagents(&WaitParams::default(), &CancelToken::new(), &deps)
+            .await
+            .expect("wait still resolves with a dead bus");
+        settler.await.expect("settler task");
+        assert!(text.contains("1 of 1 run(s) finished"), "{text}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a closed bus must degrade to the poll, not wedge the wait"
+        );
     }
 
     #[test]

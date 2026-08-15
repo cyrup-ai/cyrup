@@ -110,10 +110,14 @@
 //!   `tests::payload_and_seam_parity::user_bash_reduction_carries_the_operations_half_not_only_the_result_half`.
 //!   The host-side seam an override would be expressed AS also exists now:
 //!   [`cyrup_tools::ops::BashOperations`] with [`cyrup_tools::ops::LocalBashOperations`], the port
-//!   of `createLocalBashOperations`. What is open is (a) the WIT round-trip above and (b) the
-//!   consumption in `cyrup-session-svc` — `emit_user_bash_event` reads only the `"result"` key and
-//!   `BashOptions` has no `operations` field. **Owning item: DRIFT-004 / SEAM-015,
-//!   `docs/gap-analysis/06-cyrup-ext.md`.**
+//!   of `createLocalBashOperations`. **The consumption half is now built too**: `BashOptions` has an
+//!   `operations` field, `AgentSession::execute_bash_with_user_event` forwards it and
+//!   `execute_bash` resolves pi's `options?.operations ?? createLocalBashOperations({ shellPath })`
+//!   (`agent-session.ts:2782`), pinned by the three `..._operations_override_...` tests in
+//!   `cyrup-session-svc/src/tests/round9_l5res.rs`. **What is open is (a) the WIT round-trip above
+//!   ALONE** — `emit_user_bash_event` can read the `"operations"` key out of the reduction payload
+//!   but there is nothing callable behind it until a guest can register one. **Owning item:
+//!   DRIFT-004 / SEAM-015, `docs/gap-analysis/06-cyrup-ext.md`.**
 //!
 //! No-panic policy (arch-00 §8) is enforced crate-wide via `[workspace.lints]`; tests may
 //! `#[allow(...)]` where unwrap/expect is acceptable.
@@ -193,9 +197,9 @@ pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
     DENIED_EXEC, DENIED_NET, DENIED_UI,
     GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
-    HumanInteractionLock, InstancePool, InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent,
+    HumanInteractionLock, InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent,
     OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan,
-    ProcSpawnSpec, RecordingServices, StoreLimits, UiChrome, WasmExtension, WasmTool,
+    ProcSpawnSpec, RecordingServices, StoreLimits, UiChrome, WasmTool,
 };
 #[cfg(feature = "wasm-host")]
 pub use host_runtime::WasmRuntime;

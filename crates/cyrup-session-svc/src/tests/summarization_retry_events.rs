@@ -626,7 +626,7 @@ async fn execute_bash_emits_bash_execution_update_even_with_no_chunk_sink() {
     let result = session
         .execute_bash(
             "printf 'alpha\\n'",
-            BashOptions { exclude_from_context: false, id: Some("rpc-7".to_string()) },
+            BashOptions { exclude_from_context: false, id: Some("rpc-7".to_string()), operations: None },
             // No sink — exactly what `rpc.rs`'s `SessionCommand::Bash` arm passes.
             None,
         )
@@ -668,7 +668,7 @@ async fn bash_execution_update_omits_id_when_the_caller_supplied_none() {
     session
         .execute_bash(
             "printf 'beta\\n'",
-            BashOptions { exclude_from_context: false, id: None },
+            BashOptions { exclude_from_context: false, id: None, operations: None },
             None,
         )
         .await
@@ -715,7 +715,7 @@ async fn immediate_bash_carries_the_agent_identity_markers() {
     let result = session
         .execute_bash(
             r#"printf '[%s][%s]\n' "${PI_CODING_AGENT-}" "${AI_AGENT-}""#,
-            BashOptions { exclude_from_context: false, id: None },
+            BashOptions { exclude_from_context: false, id: None, operations: None },
             None,
         )
         .await

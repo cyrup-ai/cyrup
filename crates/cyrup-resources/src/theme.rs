@@ -761,6 +761,15 @@ impl ThemeWatcher {
         let task = tokio::spawn(async move {
             loop {
                 tokio::select! {
+                    // `biased;` — the poll watcher fires every 50 ms, so at teardown the
+                    // cancellation and a pending file event are routinely BOTH ready, and an
+                    // unbiased `select!` picks between two ready arms at RANDOM. That let a
+                    // cancelled watcher run one more `reload` and publish a theme onto `tx` after
+                    // dispose — nondeterministically, which is why it never showed up as a failing
+                    // test. There is no JS counterpart to the race: upstream's watcher callback is
+                    // a plain listener removed by `close()`, and a listener cannot be invoked
+                    // "concurrently with" its own removal on one event loop.
+                    biased;
                     _ = cancel.cancelled() => break,
                     msg = evt_rx.recv() => {
                         if msg.is_none() { break; }

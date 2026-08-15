@@ -700,7 +700,18 @@ fn collect_headers(headers: &reqwest::header::HeaderMap) -> Vec<(String, String)
 /// REAL wire headers (matching Pi's real `fetch()`, which preserves `Content-Encoding`/
 /// `Content-Length` even while transparently decompressing — see [`HttpCaps::new`]'s doc comment).
 fn client_builder() -> reqwest::ClientBuilder {
-    reqwest::Client::builder().no_gzip().no_brotli().no_deflate().no_zstd()
+    // PROV-047 — `.no_proxy()` retires reqwest's OWN environment-proxy detection, leaving the
+    // ported resolver ([`HttpCaps::client_for`] → `resolveHttpProxyUrlForTarget`,
+    // node-http-proxy.ts:92-112) as the single authority for extension HTTP, exactly as
+    // `build_client_with_proxy`'s negative arm already does for provider traffic
+    // (`cyrup-provider/src/stream/sse.rs`). Without it, a target the ported resolver declined to
+    // proxy could still be proxied by reqwest's separate `no_proxy`/`all_proxy` matching — two
+    // implementations disagreeing inside one process, which is the asymmetry PROV-047 names.
+    //
+    // It does NOT disable the proxy [`HttpCaps::client_through`] installs: `no_proxy()` clears the
+    // proxies added BEFORE it and turns off auto system-proxy detection, and that builder adds its
+    // `.proxy(..)` after this call.
+    reqwest::Client::builder().no_gzip().no_brotli().no_deflate().no_zstd().no_proxy()
 }
 
 /// The response's `Content-Encoding` value, verbatim (original casing preserved — this is also the

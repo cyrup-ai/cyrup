@@ -156,9 +156,9 @@ submitting.
 
 ## Undo or the char-jump keys do nothing
 
-Your terminal does not implement the kitty keyboard protocol, so `Ctrl+-`, `Ctrl+]` and `Ctrl+\`
-never reach cyrup. Those terminals decode the same actions from `Ctrl+7` (undo), `Ctrl+5` (jump
-forward) and `Ctrl+4`.
+Your terminal does not implement the kitty keyboard protocol, so `Ctrl+-` and `Ctrl+]` never reach
+cyrup. Press `Ctrl+7` for undo and `Ctrl+5` to jump forward — cyrup decodes them to the same
+actions. `Ctrl+4` arrives as `Ctrl+\`, which has no default binding of its own.
 
 ## `xhigh` or `max` thinking has no effect
 
@@ -172,9 +172,9 @@ Providers that take a token budget rather than an effort string collapse `xhigh`
 
 ## The first build takes forever
 
-`cargo install --git ...` compiles a large dependency graph, including the WebAssembly host. A
-cold build of ten to twenty minutes is normal on a laptop. It is not hung; watch the cargo output
-if you want reassurance.
+`cargo install --git ...` compiles a large dependency graph, including the WebAssembly host. A cold
+build takes many minutes on a laptop and produces long stretches with no output. It is not hung —
+run cargo with `-v` if you want to watch it move.
 
 ## A "not valid subagents config JSON" warning
 

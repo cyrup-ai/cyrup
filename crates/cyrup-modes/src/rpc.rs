@@ -1317,18 +1317,27 @@ async fn handle(
             // `rpc-mode.ts:577` still holds `eventResult` and can pass `operations` down; cyrup emits
             // inside the shared `execute_bash_with_user_event` wrapper (so the interactive `!`/`!!`
             // front-end and this one cannot drift on WHETHER they emit), and the event result never
-            // surfaces here. The override therefore has to be honored inside that wrapper, and the
-            // two open halves both live outside this file: the WIT round-trip that would let a WASM
-            // guest supply a backend at all (the CYRUP-DELTA register in `crates/cyrup-ext/src/lib.rs`)
-            // and the consumption in `cyrup-session-svc` (`emit_user_bash_event` reads only the
-            // `"result"` key; `BashOptions` has no `operations` field to put one in). The host-side
-            // seam an override is expressed as now exists: `cyrup_tools::ops::BashOperations` /
-            // `LocalBashOperations`, the port of pi's `createLocalBashOperations` (`tools/bash.ts:82`).
+            // surfaces here. The override therefore has to be honored inside that wrapper.
+            //
+            // The CONSUMPTION half is now built and this `operations: None` is upstream's absent
+            // `operations`, not a dropped one: `BashOptions::operations` exists,
+            // `execute_bash_with_user_event` forwards it and `execute_bash` resolves pi's
+            // `options?.operations ?? createLocalBashOperations({ shellPath })`
+            // (`agent-session.ts:2782`), pinned by
+            // `cyrup-session-svc/src/tests/round9_l5res.rs`'s three
+            // `..._operations_override_...` tests. **ONE half is left, and it is not in this file
+            // either:** cyrup's extension I/O is serde values (ADR-0002), so a WASM guest cannot
+            // RETURN a backend — `emit_user_bash_event`'s reduction payload can carry the
+            // `operations` KEY but never a callable behind it. Closing it is the
+            // `register-bash-operations` import + keyed `bash-operations-exec` export round-trip
+            // designed in full in the CYRUP-DELTA register in `crates/cyrup-ext/src/lib.rs`, plus
+            // its guest half in `crates/cyrup-ext-sdk` and a `HOST_WORLD` minor bump. When that
+            // lands, the wrapper sets one field and this arm is unchanged.
             // DRIFT-004 / SEAM-015.
             match session
                 .execute_bash_with_user_event(
                     &command,
-                    BashOptions { exclude_from_context, id: bash_id },
+                    BashOptions { exclude_from_context, id: bash_id, operations: None },
                     None,
                 )
                 .await

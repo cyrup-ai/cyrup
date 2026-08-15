@@ -121,6 +121,15 @@ pub struct SubagentExecutor {
     /// and retained here so the watch stays live for the session's lifetime (dropping it stops the
     /// watch). Re-installing replaces (and thereby tears down) any prior handle.
     completion_watcher: AsyncMutex<Option<crate::background::watch::CompletionWatcherHandle>>,
+    /// SUBA-034 — the in-process completion bus (pi's `SUBAGENT_ASYNC_COMPLETE_EVENT`). Published
+    /// into by the watcher installed above (as one member of its observer fan-out) and subscribed
+    /// to by the `wait` tool, so a wait wakes on the observation of a terminal result instead of
+    /// re-discovering it on its own 1 s cadence.
+    ///
+    /// Owned here rather than created per-install because it must outlive any single watcher: the
+    /// session's watcher is REPLACED on every `SessionStart`, and a bus recreated with it would
+    /// hand every already-subscribed waiter a `Closed` receiver.
+    completion_bus: crate::background::watch::CompletionBus,
     /// The late-bound live capability backend (P-1, reconciliation §2 item 1). Captured by
     /// [`SubagentsExtension::set_host_services`] (which the builder calls via
     /// `load_native_with_services` BEFORE `init`), so a background task / the `SessionStart` handler
@@ -689,6 +698,7 @@ impl SubagentExecutor {
             tracker: Arc::new(JobTracker::new()),
             completion_sink_override: None,
             completion_watcher: AsyncMutex::new(None),
+            completion_bus: crate::background::watch::CompletionBus::new(),
             host_services: Arc::new(OnceLock::new()),
             root_parent_session: Arc::new(std::sync::Mutex::new(None)),
             root_parent_session_name: Arc::new(std::sync::Mutex::new(None)),
@@ -726,6 +736,17 @@ impl SubagentExecutor {
     #[must_use]
     pub fn host_services(&self) -> Option<Arc<dyn cyrup_ext::host::HostServices>> {
         self.host_services.get().cloned()
+    }
+
+    /// SUBA-034 — a handle on this orchestrator's completion bus (pi's
+    /// `SUBAGENT_ASYNC_COMPLETE_EVENT`), for a caller that needs to WAKE on completions rather than
+    /// consume them: the `wait` tool subscribes through this.
+    ///
+    /// Cloning shares the one underlying channel, so a subscriber taken before a `SessionStart`
+    /// re-installs the watcher keeps receiving from the new one.
+    #[must_use]
+    pub fn completion_bus(&self) -> crate::background::watch::CompletionBus {
+        self.completion_bus.clone()
     }
 
     /// Thread the intercom companion's real broker-backed delivery + clarify + steer channels into
@@ -1382,14 +1403,22 @@ impl SubagentExecutor {
         match crate::background::watch::install_completion_watcher_with_observer(
             results_dir,
             self.effective_completion_sink(),
-            // pi `asyncCompleteHandler`'s third subscriber (`extension/index.ts:655`):
-            // `syncMissionFromAsyncCompletion(payload)`. A background run that carries a
-            // `mission.json` binding gets its mission reconciled the moment its result file is
-            // observed — including in a LATER process than the one that launched it, which is the
-            // whole reason the binding file exists.
-            Some(Arc::new(MissionSyncCompletionObserver {
-                async_root: default_async_root(cwd),
-            })),
+            // SUBA-034: pi's async-complete EVENT has several independent listeners
+            // (`extension/index.ts:648-659` @v0.43.0 registers three; `wait-subscriptions.ts` adds
+            // the wait wake-up). cyrup's one-observer seam could only model the mission sync, so
+            // both now hang off a `CompositeCompletionObserver` in the same registration order.
+            Some(Arc::new(crate::background::watch::CompositeCompletionObserver::new(vec![
+                // pi `asyncCompleteHandler`'s third subscriber (`extension/index.ts:655`):
+                // `syncMissionFromAsyncCompletion(payload)`. A background run that carries a
+                // `mission.json` binding gets its mission reconciled the moment its result file is
+                // observed — including in a LATER process than the one that launched it, which is
+                // the whole reason the binding file exists.
+                Arc::new(MissionSyncCompletionObserver {
+                    async_root: default_async_root(cwd),
+                }),
+                // SUBA-034: the wake-up every in-flight `wait` is selecting on.
+                Arc::new(self.completion_bus.clone()),
+            ]))),
         ) {
             Ok(handle) => {
                 *self.completion_watcher.lock().await = Some(handle);
@@ -7432,7 +7461,11 @@ impl Tool for WaitTool {
             &self.cwd,
             enabled,
             self.executor.current_session_id(),
-        );
+        )
+        // SUBA-034: subscribe this wait to the orchestrator's completion bus, so a result observed
+        // by THIS process's watcher releases the wait immediately rather than one poll interval
+        // later. The poll under it is unchanged and remains the source of truth.
+        .with_completion_bus(Some(self.executor.completion_bus()));
         match crate::background::wait::wait_for_subagents(&parsed, &cancel, &deps).await {
             Ok(text) => Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(text)],
@@ -12207,10 +12240,21 @@ struct AvailableModelEntry {
 /// registered provider ships.
 ///
 /// [CYRUP-DELTA] pi's `getAvailable()` additionally filters to providers whose auth is configured
-/// (`ai/src/models.ts:522-542` @pi v0.84.1); `cyrup-provider` has no `checkAuth`/`getAvailable` port yet
-/// (PROV-003 — cyrup ships no login flow at all), so this is the credential-BLIND registry:
-/// `getModels()`, pi's "complete synchronous catalog" (`ai/src/models.ts:131,164` @pi v0.84.1). That is a strictly wider
-/// list than pi's, never a narrower one, so no model pi would offer is hidden here.
+/// (`ai/src/models.ts:522-542` @pi v0.84.1), so this is the credential-BLIND registry:
+/// `getModels()`, pi's "complete synchronous catalog" (`ai/src/models.ts:131,164` @pi v0.84.1). That
+/// is a strictly wider list than pi's, never a narrower one, so no model pi would offer is hidden
+/// here.
+///
+/// **The reason recorded here was stale and is corrected (PROV-041).** It previously read
+/// "`cyrup-provider` has no `checkAuth`/`getAvailable` port yet (PROV-003 — cyrup ships no login
+/// flow at all)". Both halves are false at HEAD: `Models::check_auth`
+/// (`cyrup-provider/src/collection.rs:367`), `Models::get_available` (`:408`), `Models::login`
+/// (`:426`) and `Models::logout` (`:474`) all exist (PROV-003, PROV-031 and PROV-032 are closed).
+/// What remains is a WIRING gap, not a missing port: this accessor is a free function over the
+/// static [`cyrup_provider::catalog::builtin_catalog`] and holds no `Models` instance — hence no
+/// credential store to filter against. Reaching pi's `getAvailable()` here means giving this call
+/// site the session's `Models`, which is a change to this crate's model-registry seam, not another
+/// port of cyrup-provider.
 fn registry_models() -> &'static [cyrup_provider::Model] {
     cyrup_provider::catalog::builtin_catalog()
 }
@@ -20810,6 +20854,10 @@ mod tests {
             },
             context_window,
             max_tokens,
+            // AGENT-026 added `Model.sampling_params` after this fixture was written. This crate
+            // never reads it (the model report and the scope checks are cost/context-window
+            // driven), so the fixture states the unset form rather than inventing a value.
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,
