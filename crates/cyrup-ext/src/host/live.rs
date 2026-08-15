@@ -1195,9 +1195,10 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
 // LiveExtension: a loaded `.wasm` component as a unified Extension.
 // ---------------------------------------------------------------------------
 
-/// Clears [`GuestState`]'s bound tool `CancelToken` when the executing tool call ends — **including
-/// when the `execute_tool` future is DROPPED mid-await**, which is the case a JS port cannot think
-/// of and a Rust one must.
+/// Unwinds the two pieces of INSTANCE-scoped state `execute_tool` binds for the duration of ONE
+/// call — the bound tool `CancelToken` and the queued `host-tool.emit-update` chunks — when the call
+/// ends, **including when the `execute_tool` future is DROPPED mid-await**, which is the case a JS
+/// port cannot think of and a Rust one must.
 ///
 /// Upstream, `signal` is a parameter of `ToolDefinition.execute` (`extensions/types.ts:483`
 /// @v0.83.0): it is scoped to the call by the language, and an `async function` that has begun
@@ -1216,13 +1217,31 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
 /// answered `true` until the next `execute_tool` happened to rebind it. A guest that checks
 /// `is-cancelled` to decide whether to keep working would quietly stop working.
 ///
-/// Declared AFTER the `inner` mutex guard in `execute_tool` so it drops BEFORE it: the token is
-/// cleared while the instance lock is still held, so no other call can observe the gap.
-pub(crate) struct ToolCancelBinding<'a>(pub(crate) &'a Arc<GuestState>);
+/// EXT-M06 — the `onUpdate` half is the same shape and the same third exit. Upstream `onUpdate` is
+/// a CLOSURE field of the very same second argument (`extensions/types.ts:484`), so a chunk is
+/// delivered to that call's sink and to nothing else, by construction. cyrup routes
+/// `host-tool.emit-update(call-id, chunk)` into an instance-scoped queue on [`GuestState`] that
+/// `execute_tool` replays AFTER the call settles, so a call that never reaches its replay — the
+/// cancelled arm, or the dropped future — used to leave its chunks queued for whichever tool call
+/// drained next, which then emitted another call's partial output into its own `ToolUpdateSink`.
+/// Clearing the queue here makes that impossible on every exit path; the replay itself additionally
+/// filters by `call-id` (see [`GuestState::take_tool_updates_for`]).
+///
+/// Declared AFTER the `inner` mutex guard in `execute_tool` so it drops BEFORE it: both are unwound
+/// while the instance lock is still held, so no other call can observe the gap.
+pub(crate) struct ToolCallBinding<'a>(pub(crate) &'a Arc<GuestState>);
 
-impl Drop for ToolCancelBinding<'_> {
+impl Drop for ToolCallBinding<'_> {
     fn drop(&mut self) {
         self.0.set_tool_cancel(None);
+        let dropped = self.0.clear_tool_updates();
+        if dropped > 0 {
+            tracing::debug!(
+                chunks = dropped,
+                "tool call ended without replaying its streamed updates (cancelled or abandoned); \
+                 discarded so they cannot surface in the next call"
+            );
+        }
     }
 }
 
@@ -1346,21 +1365,29 @@ impl LiveExtension {
         self.guest.set_tier(CtxTier::Event);
         // Bind this call's CancelToken so the guest's `signal` poll (`host-tool.is-cancelled`) reads
         // the live cancellation state during a long `execute` (Pi `signal` param, sdk gap #1).
-        // Unbound by [`ToolCancelBinding`]'s `Drop`, NOT by hand: this future can be dropped at the
+        // Unbound by [`ToolCallBinding`]'s `Drop`, NOT by hand: this future can be dropped at the
         // `select!` below, and a hand-written clear on each arm does not run on that path. See the
-        // guard's own doc for what the leaked token then does to `is-cancelled`.
+        // guard's own doc for what the leaked token then does to `is-cancelled`, and what the
+        // leaked `emit-update` chunks then do to the NEXT tool call (EXT-M06).
         self.guest.set_tool_cancel(Some(cancel.clone()));
-        let _tool_cancel = ToolCancelBinding(&self.guest);
+        let _tool_call = ToolCallBinding(&self.guest);
         let params_s = params.to_string();
         let api = inner.instance.cyrup_ext_events();
         let call = api.call_execute_tool(&mut inner.store, name, call_id.as_str(), &params_s);
+        // EXT-M06: the cancelled arm falls THROUGH to the replay instead of returning from inside
+        // the `select!`. Upstream `onUpdate` fires synchronously as the tool runs, so an abort never
+        // retracts the partial output already delivered (`extensions/types.ts:484` @v0.83.0); cyrup
+        // batches the same chunks and must therefore still hand over what the guest emitted before
+        // the cancellation, rather than discarding a tool's whole partial output because it was
+        // interrupted.
         let res = tokio::select! {
             biased;
-            _ = cancel.cancelled() => return Err(ToolError::new("tool execution cancelled")),
-            r = call => r,
+            _ = cancel.cancelled() => None,
+            r = call => Some(r),
         };
-        // Replay streamed updates (Pi onUpdate) into the runtime sink.
-        for (_cid, chunk) in self.guest.take_tool_updates() {
+        // Replay this call's streamed updates (Pi onUpdate) into the runtime sink. Filtered by
+        // `call-id`: the queue is instance-scoped, upstream's callback is call-scoped (EXT-M06).
+        for chunk in self.guest.take_tool_updates_for(call_id.as_str()) {
             let content = chunk
                 .get("content")
                 .cloned()
@@ -1377,6 +1404,9 @@ impl LiveExtension {
                 terminate: chunk.get("terminate").and_then(Value::as_bool),
             });
         }
+        let Some(res) = res else {
+            return Err(ToolError::new("tool execution cancelled"));
+        };
         match res {
             Ok(Ok(out)) => {
                 let content = serde_json::from_str::<Vec<Content>>(&out.content_json)

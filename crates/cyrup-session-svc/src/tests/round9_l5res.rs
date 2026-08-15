@@ -425,7 +425,7 @@ async fn execute_bash_with_user_event_emits_user_bash_with_live_values() {
     let _ = session
         .execute_bash_with_user_event(
             "echo hello",
-            BashOptions { exclude_from_context: true, id: None },
+            BashOptions { exclude_from_context: true, id: None, operations: None },
             None,
         )
         .await;
@@ -460,7 +460,7 @@ async fn bare_execute_bash_executor_emits_no_user_bash() {
         .expect("build");
 
     let _ = session
-        .execute_bash("echo hello", BashOptions { exclude_from_context: true, id: None }, None)
+        .execute_bash("echo hello", BashOptions { exclude_from_context: true, id: None, operations: None }, None)
         .await;
 
     let seen = probe.lock().unwrap().clone();
@@ -560,4 +560,181 @@ async fn compaction_before_compact_override_lands_in_entry() {
     let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
     assert!(jsonl.contains("ext-summary[manual"), "the override summary is persisted: {jsonl}");
     assert!(jsonl.contains("\"type\":\"compaction\""), "a compaction entry was appended");
+}
+
+// ===========================================================================================
+// DRIFT-004 / SEAM-015 — `options.operations`, the per-call bash-backend override
+// ===========================================================================================
+
+/// A [`cyrup_tools::ops::BashOperations`] that records what it was handed and answers with a
+/// sentinel the local shell could not produce, so "the override ran" and "the local shell did not"
+/// are two independent observations rather than one.
+///
+/// The sentinel carries an ANSI escape on purpose: pi builds its `onChunk` wrapper ONCE and hands it
+/// to `executeBashWithOperations` whichever backend the `??` resolved (`agent-session.ts:2779-2789`),
+/// so an overriding backend's bytes must go through the SAME sanitize → rolling-buffer → temp-spill
+/// pipeline. A port that wired the override straight to the result would return the escape verbatim.
+struct RecordingBashOps {
+    seen: Mutex<Vec<(String, PathBuf, Vec<(String, String)>)>>,
+}
+
+#[async_trait::async_trait]
+impl cyrup_tools::ops::BashOperations for RecordingBashOps {
+    async fn exec(
+        &self,
+        command: &str,
+        cwd: &std::path::Path,
+        opts: cyrup_tools::ops::BashExecOptions<'_>,
+    ) -> Result<cyrup_tools::ExitStatus, ToolError> {
+        self.seen.lock().unwrap().push((
+            command.to_string(),
+            cwd.to_path_buf(),
+            opts.env.clone(),
+        ));
+        (opts.on_data)(b"REMOTE-SENTINEL\x1b[0m\n");
+        Ok(cyrup_tools::ExitStatus::Exited(7))
+    }
+}
+
+/// DRIFT-004 / SEAM-015: `BashOptions::operations` is pi's `options.operations`
+/// (`agent-session.ts:2768`), consumed as `options?.operations ?? createLocalBashOperations({
+/// shellPath })` (`:2782`). When it is `Some`, THAT backend executes the command and the local
+/// process backend is never reached.
+///
+/// **Presence before absence.** The absence half — "no local shell ran" — is asserted against a
+/// sentinel, and a sentinel assertion is vacuous unless the same command demonstrably DOES reach the
+/// local shell without the override. The sibling test below is that control: it runs the identical
+/// command with `operations: None` and asserts the local shell's own output comes back. Neither test
+/// means anything alone.
+#[tokio::test]
+async fn execute_bash_routes_through_an_operations_override_instead_of_the_local_shell() {
+    let fx = fixture();
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
+
+    let ops = Arc::new(RecordingBashOps { seen: Mutex::new(Vec::new()) });
+    let streamed: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink_out = streamed.clone();
+
+    let result = session
+        .execute_bash(
+            "echo LOCAL_SHELL_RAN",
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: Some(ops.clone() as Arc<dyn cyrup_tools::ops::BashOperations>),
+            },
+            Some(Box::new(move |delta: &str| {
+                sink_out.lock().unwrap().push(delta.to_string());
+            })),
+        )
+        .await
+        .expect("the override backend succeeds");
+
+    // PRESENCE — the override actually executed and its result is what came back.
+    let seen = ops.seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1, "exactly one exec reached the override backend");
+    assert_eq!(
+        seen[0].0, "echo LOCAL_SHELL_RAN",
+        "pi hands `executeBashWithOperations` the RESOLVED command verbatim (bash-executor.ts)"
+    );
+    assert_eq!(seen[0].1, fx.cwd, "and the session cwd (`this.sessionManager.getCwd()`, :2781)");
+    assert_eq!(result.exit_code, Some(7), "the override's exit code is the reported one");
+
+    // The shared pipeline still ran: the ANSI escape the backend emitted is stripped, exactly as it
+    // is on the local branch, because pi's `onChunk` wrapper is built once for both.
+    assert!(result.output.contains("REMOTE-SENTINEL"), "got: {:?}", result.output);
+    assert!(
+        !result.output.contains('\x1b'),
+        "an overriding backend's bytes go through the SAME sanitizer as the local branch — pi \
+         builds the onChunk wrapper once and passes it to whichever backend the `??` chose \
+         (agent-session.ts:2779-2789); got: {:?}",
+        result.output
+    );
+    // …and the caller's streaming sink saw it, so the override is not a buffered special case.
+    let deltas = streamed.lock().unwrap().concat();
+    assert!(deltas.contains("REMOTE-SENTINEL"), "the on_chunk sink streams the override's output: {deltas:?}");
+
+    // The env vector this seam builds is handed to the override too — `getShellEnv()` is inside
+    // `createLocalBashOperations`' options upstream, but cyrup's per-child agent-identity stamping
+    // (TOOL-031) lives on this path and an override that never saw it would run user commands in a
+    // measurably different environment from the local branch.
+    let env_keys: Vec<&str> = seen[0].2.iter().map(|(k, _)| k.as_str()).collect();
+    assert!(env_keys.contains(&"PI_CODING_AGENT"), "got: {env_keys:?}");
+    assert!(env_keys.contains(&"AI_AGENT"), "got: {env_keys:?}");
+
+    // ABSENCE — the local shell never ran this command.
+    assert!(
+        !result.output.contains("LOCAL_SHELL_RAN"),
+        "the local process backend must never have been reached; got: {:?}",
+        result.output
+    );
+}
+
+/// The control that makes the test above non-vacuous, and the regression pin on the `??`'s
+/// right-hand branch: with `operations: None` — upstream's absent `operations` — the identical
+/// command reaches the local shell and returns ITS output, byte-for-byte the path this seam took
+/// before the field existed.
+#[tokio::test]
+async fn execute_bash_without_an_operations_override_still_runs_on_the_local_shell() {
+    let fx = fixture();
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
+
+    let result = session
+        .execute_bash(
+            "echo LOCAL_SHELL_RAN",
+            BashOptions { exclude_from_context: false, id: None, operations: None },
+            None,
+        )
+        .await
+        .expect("the local backend succeeds");
+
+    assert!(
+        result.output.contains("LOCAL_SHELL_RAN"),
+        "without an override the local shell runs the command — this is what makes the sibling \
+         test's absence assertion mean something; got: {:?}",
+        result.output
+    );
+    assert_eq!(result.exit_code, Some(0));
+}
+
+/// DRIFT-004 / SEAM-015, the wrapper half: `execute_bash_with_user_event` FORWARDS a caller-supplied
+/// `operations` down to the executor. Pi's RPC front-end writes the field
+/// (`operations: eventResult?.operations`, `rpc-mode.ts:576`) and `executeBash` consumes it one
+/// frame lower, so the value has to survive the wrapper.
+///
+/// What this test deliberately does NOT assert is that the wrapper FILLS the field from the
+/// `user_bash` event result — it cannot, and that is the row's last open half: cyrup's extension I/O
+/// is serde values (ADR-0002), so the reduction payload can carry the `operations` key but never a
+/// callable behind it. See `crates/cyrup-ext/src/lib.rs`'s CYRUP-DELTA register.
+#[tokio::test]
+async fn execute_bash_with_user_event_forwards_the_operations_override_to_the_executor() {
+    let fx = fixture();
+    let session = SessionBuilder::new(faux_ok() as Arc<dyn Provider>, base_config(&fx))
+        .build()
+        .await
+        .expect("build");
+
+    let ops = Arc::new(RecordingBashOps { seen: Mutex::new(Vec::new()) });
+    let result = session
+        .execute_bash_with_user_event(
+            "echo LOCAL_SHELL_RAN",
+            BashOptions {
+                exclude_from_context: false,
+                id: None,
+                operations: Some(ops.clone() as Arc<dyn cyrup_tools::ops::BashOperations>),
+            },
+            None,
+        )
+        .await
+        .expect("the override backend succeeds");
+
+    assert_eq!(ops.seen.lock().unwrap().len(), 1, "the wrapper forwarded the override");
+    assert!(result.output.contains("REMOTE-SENTINEL"), "got: {:?}", result.output);
+    assert!(!result.output.contains("LOCAL_SHELL_RAN"), "got: {:?}", result.output);
 }

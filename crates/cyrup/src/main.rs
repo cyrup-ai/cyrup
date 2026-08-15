@@ -1872,10 +1872,26 @@ async fn run_interactive(
     // load the user's `~/.cyrup/keybindings.json` and merge it into every live keymap (global/editor/
     // selector/tree). Absent file ⇒ defaults; a malformed file logs to stderr and keeps the defaults.
     let keybindings_path = session.services().agent_dir.join("keybindings.json");
-    if let Ok(json) = std::fs::read_to_string(&keybindings_path)
-        && let Err(e) = app.load_keybindings_json(&json)
-    {
-        eprintln!("warning: ignoring {}: {e}", keybindings_path.display());
+    if let Ok(json) = std::fs::read_to_string(&keybindings_path) {
+        // CFG-038 — `load_keybindings_json` no longer aborts on the first bad entry, so the two
+        // outcomes are now genuinely different and are reported differently. `Err` really does mean
+        // the whole document was ignored (unparseable JSON or a non-object top level, Pi's
+        // `loadRawConfig` → `undefined`, `core/keybindings.ts:328-336` @v0.83.0). `Ok(issues)` means
+        // everything else applied and these specific ids did not — the old code printed
+        // "ignoring <path>" for that case too, which was false: the file had already been
+        // half-applied in an iteration order the user cannot see.
+        match app.load_keybindings_json(&json) {
+            Err(e) => eprintln!("warning: ignoring {}: {e}", keybindings_path.display()),
+            Ok(issues) => {
+                for issue in issues {
+                    eprintln!(
+                        "warning: {}: ignoring {}",
+                        keybindings_path.display(),
+                        issue
+                    );
+                }
+            }
+        }
     }
 
     // Autocomplete dropdown height (feature #6; Pi `autocompleteMaxVisible`, default 5, clamped 3–20).

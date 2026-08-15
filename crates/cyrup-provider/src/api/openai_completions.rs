@@ -454,7 +454,28 @@ pub(crate) fn build_body_with_env(
         }
     }
 
+    // Last so custom keys override the named request fields (Pi's own comment,
+    // `openai-completions.ts:884-887` @v0.84.1: `if (options?.samplingParams)
+    // Object.assign(params, options.samplingParams)`). AGENT-026. The merge with
+    // `Model.sampling_params` already happened in `build_base_options`
+    // (`simple-options.ts:27-33`), so what arrives here is the resolved map — and being LAST is the
+    // whole point: an operator's `top_p` must beat the named `temperature`/`max_tokens` block above.
+    apply_sampling_params(&mut obj, opts);
+
     Ok(Value::Object(obj))
+}
+
+/// `Object.assign(params, options.samplingParams)` — the identical three-line tail of all three
+/// OpenAI-compatible `buildParams` (`openai-completions.ts:884-887`, `openai-responses.ts:330-333`,
+/// `azure-openai-responses.ts:324-327` @v0.84.1). Shared here rather than triplicated so the three
+/// cannot drift apart; the absent-map case is a no-op exactly as pi's `if` guard is. AGENT-026.
+pub(crate) fn apply_sampling_params(obj: &mut Map<String, Value>, opts: &StreamOptions) {
+    let Some(params) = &opts.sampling_params else {
+        return;
+    };
+    for (k, v) in params {
+        obj.insert(k.clone(), v.clone());
+    }
 }
 
 /// Apply the per-provider reasoning encoding (Pi `buildParams` reasoning chain, L594-668). Each
@@ -2202,6 +2223,7 @@ mod tests {
             },
             context_window: 131072,
             max_tokens: 131072,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

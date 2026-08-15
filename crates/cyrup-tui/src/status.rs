@@ -73,12 +73,13 @@ pub struct StatusLine {
     /// existed; pi's `statsParts` (`footer.ts:129-164`) has no such segment, and the slot it stood in
     /// for — the context segment — is now unconditional, so the fallback could never fire again.
     pub tokens: u64,
-    /// Number of queued (steering + follow-up) messages.
-    ///
-    /// **Not rendered.** `footer.ts:129-164` builds exactly `↑ ↓ R W CH% $cost`, the context segment
-    /// and `xp` — there is no queue segment upstream under any name, and the extra segment pushed the
-    /// right-aligned model name over (or off) the line. Pi surfaces queued messages in the transcript.
-    pub queued: usize,
+    // NOTE — there is deliberately no `queued` field here. `footer.ts:129-165` builds exactly
+    // `↑ ↓ R W CH% $cost`, the context segment and `xp`; upstream has no queue segment under any
+    // name. cyrup once carried a dead `queued: usize` + `set_queued` pair with no render site, and a
+    // reader who found it could reasonably mistake dead state for rendered state — which is how
+    // TUI-016 stayed invisible. The queue's real surface is `crate::pending_messages`, Pi's
+    // `updatePendingMessagesDisplay` (`interactive-mode.ts:3974-3991` @v0.83.0), drawn ABOVE the
+    // editor, never in the footer (ADR-0009 decision item 3).
     /// Cumulative token + cost usage across the session (`footer.ts:86-107`). Accumulated via
     /// [`add_usage`](Self::add_usage), one call per finalized assistant turn.
     pub usage: Usage,
@@ -145,9 +146,6 @@ impl StatusLine {
     }
     pub fn set_tokens(&mut self, tokens: u64) {
         self.tokens = tokens;
-    }
-    pub fn set_queued(&mut self, queued: usize) {
-        self.queued = queued;
     }
     /// Accumulate one finalized turn's `Usage` into the cumulative session totals and record that
     /// turn's cache-hit rate (`footer.ts:86-107`). Token sums saturate (never panic / wrap).

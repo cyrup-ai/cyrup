@@ -144,9 +144,9 @@ pub use keyboard_protocol::{
     KITTY_FLAGS_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT,
 };
 pub use keymap::{
-    Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key, Keymap,
-    ModelsAction, ModelsKeymap, SelectAction, SelectKeymap, SessionAction, SessionKeymap,
-    TreeAction, TreeKeymap,
+    Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key,
+    KeybindingIssue, Keymap, ModelsAction, ModelsKeymap, SelectAction, SelectKeymap, SessionAction,
+    SessionKeymap, TreeAction, TreeKeymap,
 };
 pub use login_dialog::{
     notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginLineKind, LoginUiMsg,

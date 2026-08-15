@@ -55,10 +55,20 @@ async fn a_session_swap_clears_extension_owned_surfaces() {
 async fn a_session_swap_still_resets_the_session_owned_surfaces() {
     let mut app = app();
     app.state_mut().status.set_streaming(true);
-    app.state_mut().status.set_queued(3);
+    // The RENDERED queue, not the dead counter this used to poke: a `queue_update` from the
+    // outgoing session fills `pending_messages`, which draws `Steering: …` above the editor.
+    app.ingest_event(&cyrup_session_svc::AgentSessionEvent::QueueUpdate {
+        steering: vec!["from the old session".to_string()],
+        follow_up: vec!["and this".to_string()],
+    });
+    assert_eq!(app.state().pending_messages.len(), 2, "fixture: the region is populated");
 
     app.rebind_session();
 
     assert!(!app.state().status.streaming, "streaming flag cleared");
-    assert_eq!(app.state().status.queued, 0, "queue depth cleared");
+    assert!(
+        app.state().pending_messages.is_empty(),
+        "the outgoing session's queued messages must not keep rendering above the new session's \
+         editor"
+    );
 }

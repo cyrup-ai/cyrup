@@ -49,6 +49,11 @@ struct Seen {
     /// The map `apply_reasoning` (`api/openai_completions.rs:402`) consults per request to pick the
     /// wire `reasoning_effort` for the requested thinking level.
     thinking_level_map: Option<cyrup_provider::model::ThinkingLevelMap>,
+    /// CFG-039 — the model-level `samplingParams` the OpenAI-compatible adapters spread into the
+    /// request body (`simple-options.ts:27-33` @v0.84.1). Recorded here so the models.json legs are
+    /// pinned at the WIRE, not at the composed struct: a field that stops one layer short is the
+    /// exact defect this item was held back to avoid.
+    sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A scripted `openai-completions` impl: records the request inputs, then emits one text turn.
@@ -80,6 +85,7 @@ impl ApiImpl for RecordingApi {
                 context_window: model.context_window,
                 compat: model.compat.clone(),
                 thinking_level_map: model.thinking_level_map.clone(),
+                sampling_params: model.sampling_params.clone(),
             });
         }
         let message = AssistantMessage {
@@ -555,5 +561,119 @@ async fn a_partial_thinking_level_map_override_patches_rather_than_wipes_the_map
         map.get("off"),
         Some(&None),
         "a `null` entry (level unsupported) must survive too: {map:?}"
+    );
+}
+
+/// CFG-039 — `samplingParams` on a `models[]` definition and on a `modelOverrides` entry
+/// (`model-config.ts:167` / `:188` @v0.84.1) must reach the composed model, and the override leg
+/// must MERGE per key rather than replace.
+///
+/// This was silently dropped end to end: `ModelDefinition`/`ModelOverride` had no field, so serde
+/// discarded the key with no diagnostic, and a user who wrote `"samplingParams": {"top_p": 0.95}`
+/// got a request that never mentioned `top_p`. The item was deliberately held until
+/// `cyrup_provider::Model::sampling_params` existed, because landing a config-only field recreates
+/// AGENT-021's defect — a field a later layer drops.
+///
+/// The two legs have DIFFERENT rules and both are asserted, because getting the second one wrong is
+/// invisible unless the override names a strict subset of the definition's keys:
+///   * definition: `samplingParams: definition.samplingParams` — copied verbatim
+///     (`provider-composer.ts:158`);
+///   * override: `override.samplingParams ? { ...model.samplingParams, ...override.samplingParams }
+///     : model.samplingParams` (`:123-125`) — per-key merge, so `min_p` survives a `top_p`-only
+///     patch.
+#[tokio::test]
+async fn models_json_sampling_params_reach_the_model_and_the_override_merges_per_key() {
+    let file = model_file(
+        r#"{"providers":{"mycorp":{
+             "baseUrl":"https://gateway.mycorp.example/v1","api":"openai-completions",
+             "apiKey":"sk-static",
+             "models":[{"id":"mycorp-large",
+                        "samplingParams":{"top_p":0.95,"min_p":0.05,"repetition_penalty":1.1}}],
+             "modelOverrides":{"mycorp-large":{"samplingParams":{"top_p":0.5,"top_k":40}}}
+           }}}"#,
+    );
+    let (models, seen, errors) = composed(
+        &file,
+        BTreeMap::new(),
+        Arc::new(InMemoryCredentialStore::new()) as Arc<dyn CredentialStore>,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+    let model = models.get_model("mycorp", "mycorp-large").unwrap();
+    let message = models
+        .complete(&model, &Context::default(), &StreamOptions::default())
+        .await;
+    assert_eq!(message.stop_reason, StopReason::Stop);
+    let params = seen
+        .lock()
+        .unwrap()
+        .clone()
+        .unwrap()
+        .sampling_params
+        .expect("the wire impl must be handed the model's samplingParams");
+
+    assert_eq!(
+        params.get("top_p"),
+        Some(&serde_json::json!(0.5)),
+        "the overridden key wins: {params:?}"
+    );
+    assert_eq!(
+        params.get("top_k"),
+        Some(&serde_json::json!(40)),
+        "a key only the override names is added: {params:?}"
+    );
+    assert_eq!(
+        params.get("min_p"),
+        Some(&serde_json::json!(0.05)),
+        "an unmentioned definition key must survive the patch — this is the leg that a wholesale \
+         replace would break: {params:?}"
+    );
+    assert_eq!(
+        params.get("repetition_penalty"),
+        Some(&serde_json::json!(1.1)),
+        "{params:?}"
+    );
+}
+
+/// CFG-039, the definition-only leg: with no `modelOverrides` entry the declared params reach the
+/// model untouched, and pi's deliberate NON-inheritance holds — `ProviderConfigSchema` has no
+/// `samplingParams` key, so a provider-level one is not a thing and nothing is inherited from a
+/// same-id built-in either (`modelFromJson` assigns `definition.samplingParams` with no `??` chain,
+/// unlike `api`/`baseUrl` two lines above it).
+#[tokio::test]
+async fn a_definitions_sampling_params_are_copied_verbatim_with_no_inheritance() {
+    let file = model_file(
+        r#"{"providers":{"mycorp":{
+             "baseUrl":"https://gateway.mycorp.example/v1","api":"openai-completions",
+             "apiKey":"sk-static",
+             "models":[{"id":"with-params","samplingParams":{"top_k":0}},
+                       {"id":"without-params"}]
+           }}}"#,
+    );
+    let (models, seen, errors) = composed(
+        &file,
+        BTreeMap::new(),
+        Arc::new(InMemoryCredentialStore::new()) as Arc<dyn CredentialStore>,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
+
+    let model = models.get_model("mycorp", "with-params").unwrap();
+    models
+        .complete(&model, &Context::default(), &StreamOptions::default())
+        .await;
+    let params = seen.lock().unwrap().clone().unwrap().sampling_params;
+    assert_eq!(
+        params.as_ref().and_then(|p| p.get("top_k")),
+        Some(&serde_json::json!(0)),
+        "a falsy-but-present value must survive: {params:?}"
+    );
+
+    let bare = models.get_model("mycorp", "without-params").unwrap();
+    models
+        .complete(&bare, &Context::default(), &StreamOptions::default())
+        .await;
+    assert_eq!(
+        seen.lock().unwrap().clone().unwrap().sampling_params,
+        None,
+        "a model that declares none must get none — there is no provider-level tier to inherit"
     );
 }

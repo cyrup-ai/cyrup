@@ -1695,6 +1695,14 @@ pub struct ModelDefinition {
     pub context_window: Option<i64>,
     #[serde(default)]
     pub max_tokens: Option<i64>,
+    /// `Type.Optional(Type.Record(Type.String(), Type.Unknown()))` (model-config.ts:167 @v0.84.1) —
+    /// arbitrary OpenAI-compatible sampling keys (`top_p`, `top_k`, `min_p`,
+    /// `repetition_penalty`, …) that become the composed model's defaults. `modelFromJson` copies
+    /// it straight across (`provider-composer.ts:158`); it is NOT inherited from the provider block
+    /// or from the same-id built-in, because pi's `ModelDefinitionSchema` has no provider-level
+    /// twin. CFG-039.
+    #[serde(default)]
+    pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -1721,6 +1729,12 @@ pub struct ModelOverride {
     pub context_window: Option<i64>,
     #[serde(default)]
     pub max_tokens: Option<i64>,
+    /// `Type.Optional(Type.Record(Type.String(), Type.Unknown()))` (model-config.ts:188 @v0.84.1).
+    /// Unlike every other override field this one MERGES per key rather than replacing:
+    /// `override.samplingParams ? { ...model.samplingParams, ...override.samplingParams } :
+    /// model.samplingParams` (`provider-composer.ts:123-125`). CFG-039.
+    #[serde(default)]
+    pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     #[serde(default)]
     pub headers: Option<std::collections::BTreeMap<String, String>>,
     #[serde(default)]
@@ -2452,6 +2466,11 @@ fn model_from_json(
         // Both are guaranteed `> 0` by the checks above, so the cast is total.
         context_window: definition.context_window.map_or(128_000, |v| v as u64),
         max_tokens: definition.max_tokens.map_or(16_384, |v| v as u64),
+        // `samplingParams: definition.samplingParams` (provider-composer.ts:158 @v0.84.1) — copied
+        // verbatim, with NO fallback to `providerConfig` or `defaults`: the provider block has no
+        // `samplingParams` key in `ProviderConfigSchema`, and a same-id built-in's defaults are
+        // deliberately not inherited here. CFG-039.
+        sampling_params: definition.sampling_params.clone(),
         thinking_level_map: definition.thinking_level_map.clone(),
         // Pi sets `headers: undefined` on the composed model — `models.json` headers are REQUEST
         // config resolved separately through `resolveConfiguredModelHeaders` (:156, :501-511), so
@@ -2499,6 +2518,17 @@ fn apply_model_override(model: &mut Model, ov: &ModelOverride) {
     }
     if let Some(mt) = ov.max_tokens {
         model.max_tokens = mt.max(0) as u64;
+    }
+    // Pi `:123-125` @v0.84.1: `override.samplingParams ? { ...model.samplingParams,
+    // ...override.samplingParams } : model.samplingParams`. This is a per-key MERGE, not a
+    // replacement — the same shape as `thinkingLevelMap` above and unlike every other field here —
+    // so an override naming only `top_p` must leave a model-level `top_k` in place. CFG-039.
+    if let Some(params) = &ov.sampling_params {
+        let mut merged = model.sampling_params.clone().unwrap_or_default();
+        for (key, value) in params {
+            merged.insert(key.clone(), value.clone());
+        }
+        model.sampling_params = Some(merged);
     }
     if let Some(cost) = &ov.cost {
         if let Some(v) = cost.input {
@@ -2608,6 +2638,7 @@ mod tests {
             cost: ModelCost::default(),
             context_window: 200_000,
             max_tokens: 8192,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,
@@ -3235,6 +3266,7 @@ mod tests {
             cost: ModelCost::default(),
             context_window: 128_000,
             max_tokens: 16_384,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

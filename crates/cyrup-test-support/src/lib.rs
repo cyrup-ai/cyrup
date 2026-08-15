@@ -577,6 +577,7 @@ mod smoke {
             cost: ModelCost::default(),
             context_window: 4_096,
             max_tokens: 1_024,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

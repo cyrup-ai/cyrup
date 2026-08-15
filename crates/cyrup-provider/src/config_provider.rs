@@ -170,6 +170,7 @@ mod tests {
             cost: ModelCost::default(),
             context_window: 128_000,
             max_tokens: 16_384,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

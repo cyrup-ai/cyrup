@@ -127,6 +127,8 @@ fn spawn_proxy_server(frames: Vec<String>) -> String {
 
 #[tokio::test]
 async fn proxy_stream_fn_streams_a_live_agent_turn() {
+    // Requires NO process-global `httpProxy` — see PROV-047's `PROXY_SETTING_GUARD` below.
+    let _serial = PROXY_SETTING_GUARD.lock().await;
     let usage = r#"{"input":5,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}}"#;
     let frames = vec![
         r#"{"type":"start"}"#.to_string(),
@@ -214,6 +216,9 @@ async fn agent035_aborted_proxy_stream_reports_pis_request_aborted_by_user() {
     use cyrup_provider::stream::ErrorReason;
     use futures::StreamExt;
 
+    // Requires NO process-global `httpProxy` — see PROV-047's `PROXY_SETTING_GUARD` below.
+    let _serial = PROXY_SETTING_GUARD.lock().await;
+
     let frames = vec![
         r#"{"type":"start"}"#.to_string(),
         r#"{"type":"text_start","contentIndex":0}"#.to_string(),
@@ -272,5 +277,129 @@ async fn agent035_aborted_proxy_stream_reports_pis_request_aborted_by_user() {
         error.error_message.as_deref(),
         Some("Request aborted by user"),
         "pi puts its own literal into partial.errorMessage (proxy.ts:189/:210 → :215-218)"
+    );
+}
+
+// ----------------------------------------------------------------------------------------------
+// 4. PROV-047 — the proxy transport honours the `httpProxy` setting.
+//
+// pi's `applyHttpProxySettings` writes `process.env.HTTP_PROXY ??= proxy` (http-dispatcher.ts:43-48
+// @v0.83.0) and `configureHttpDispatcher` installs an `EnvHttpProxyAgent` as the GLOBAL undici
+// dispatcher that `globalThis.fetch` then runs on (`:79-93`, `:103`), so the bare `fetch` in
+// `proxy.ts:165` is proxied like every other request in the process. cyrup built this transport's
+// client with the proxy-BLIND `build_client()`, so an operator whose only egress is an HTTPS proxy
+// got working model streaming and a hard connect failure here, with nothing in the error naming the
+// proxy that was configured and ignored.
+// ----------------------------------------------------------------------------------------------
+
+/// `configure_http_proxy` is PROCESS-global, so the test that installs one must not overlap the two
+/// above that require none — they would be routed into the recording proxy and fail. This
+/// serializes those three tests; it weakens no assertion in any of them.
+static PROXY_SETTING_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Clears the process-global `httpProxy` on the way out — in `Drop`, not on the success path, so a
+/// panicking assertion (or a future `?`/cancellation at any `.await` in the test) cannot leak the
+/// setting into whichever test takes [`PROXY_SETTING_GUARD`] next.
+struct ClearHttpProxyOnDrop;
+
+impl Drop for ClearHttpProxyOnDrop {
+    fn drop(&mut self) {
+        cyrup_provider::configure_http_proxy(None);
+    }
+}
+
+/// A loopback HTTP proxy: records the request line it is handed, then answers it itself with Pi's
+/// proxy SSE frames. For a plain-`http` target, reqwest sends the ABSOLUTE-form request line
+/// (`POST http://host:port/api/stream HTTP/1.1`) to the proxy, which is what makes the recorded line
+/// proof that the request was proxied rather than sent direct.
+fn spawn_recording_http_proxy(
+    frames: Vec<String>,
+) -> (String, std::sync::mpsc::Receiver<String>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("addr");
+    let url = format!("http://{addr}");
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 4096];
+            let mut acc: Vec<u8> = Vec::new();
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        acc.extend_from_slice(&buf[..n]);
+                        if acc.windows(4).any(|w| w == b"\r\n\r\n") {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            let head = String::from_utf8_lossy(&acc);
+            let _ = tx.send(head.lines().next().unwrap_or_default().to_string());
+            let mut body = String::from(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
+            );
+            for f in &frames {
+                body.push_str("data: ");
+                body.push_str(f);
+                body.push_str("\n\n");
+            }
+            let _ = stream.write_all(body.as_bytes());
+            let _ = stream.flush();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+    });
+    (url, rx)
+}
+
+#[tokio::test]
+async fn prov047_the_proxy_transport_routes_through_the_configured_http_proxy() {
+    let _serial = PROXY_SETTING_GUARD.lock().await;
+
+    let usage = r#"{"input":5,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0.0,"output":0.0,"cacheRead":0.0,"cacheWrite":0.0,"total":0.0}}"#;
+    let frames = vec![
+        r#"{"type":"start"}"#.to_string(),
+        r#"{"type":"text_start","contentIndex":0}"#.to_string(),
+        r#"{"type":"text_delta","contentIndex":0,"delta":"streamed via the proxy"}"#.to_string(),
+        r#"{"type":"text_end","contentIndex":0}"#.to_string(),
+        format!(r#"{{"type":"done","reason":"stop","usage":{usage}}}"#),
+    ];
+    let (proxy_url, seen) = spawn_recording_http_proxy(frames);
+
+    // The proxy TARGET is a port nothing listens on: bound only long enough for the OS to name a
+    // free one, then released. A transport that ignores the setting connects here, fails, and both
+    // assertions below go red — so the test cannot pass by accident.
+    let target = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        let port = l.local_addr().expect("addr").port();
+        drop(l);
+        format!("http://127.0.0.1:{port}")
+    };
+
+    let _restore = ClearHttpProxyOnDrop;
+    cyrup_provider::configure_http_proxy(Some(proxy_url));
+
+    let sf: Arc<dyn StreamFn> = Arc::new(ProxyStreamFn::new(target.clone(), "test-token"));
+    let agent = Agent::builder(model_ref(), sf).build();
+    let handle = agent.prompt("ping through the proxy").await.unwrap();
+    let new = handle.finished().await;
+    agent.wait_for_idle().await;
+
+    // Presence first: the proxy saw the request, and saw it addressed to the target in absolute
+    // form — i.e. it was proxied, not merely connected to.
+    let request_line = seen
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the configured httpProxy must receive the proxy-transport request");
+    assert!(
+        request_line.contains(&format!("{target}/api/stream")),
+        "the proxy must be handed the absolute-form target URI, got {request_line:?}"
+    );
+    // And the turn completed THROUGH it, rather than dying on a connect error to the dead target.
+    assert_eq!(new.len(), 2, "user + assistant");
+    assert_eq!(
+        assistant_text(&new[1]),
+        "streamed via the proxy",
+        "the proxied turn must stream end to end"
     );
 }

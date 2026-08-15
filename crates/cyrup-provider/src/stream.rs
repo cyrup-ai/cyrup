@@ -163,6 +163,19 @@ pub struct StreamOptions {
     /// `None`, which resolves to `Short` unless the env promotes it to `Long`).
     pub cache_retention: Option<CacheRetention>,
     pub temperature: Option<f32>,
+    /// Arbitrary sampling parameters merged into the request body **as-is, after the named request
+    /// fields, so keys here override them** (Pi `StreamOptions.samplingParams`, types.ts:183-189
+    /// @v0.84.1, introduced by `25a2c8dcf`; declared between `temperature` and `maxTokens`, which is
+    /// why it sits here). Lets custom OpenAI-compatible servers (llama.cpp, vLLM, SGLang, …) receive
+    /// parameters cyrup does not model — `top_p`, `top_k`, `min_p`, `repetition_penalty`.
+    ///
+    /// Merged over [`crate::Model::sampling_params`] per key by
+    /// [`crate::utils::simple_options::build_base_options`] (`simple-options.ts:27-33`). **Only
+    /// applied by the OpenAI-compatible adapters** — completions, responses, Azure responses
+    /// (`openai-completions.ts:885-887`, `openai-responses.ts:331-333`,
+    /// `azure-openai-responses.ts:325-327` @v0.84.1) — every other api ignores it, including
+    /// `openai-codex-responses`, which upstream does NOT apply it in. AGENT-026.
+    pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     pub max_tokens: Option<u64>,
     /// Unified reasoning level (func-01 R-01-040). Additive, backward-compatible (defaulted to
     /// `Off`); a non-reasoning model silently ignores it (R-01-041).

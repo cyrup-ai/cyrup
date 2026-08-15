@@ -56,7 +56,7 @@ pub struct BashResult {
 pub type BashChunkSink = Option<Box<dyn FnMut(&str) + Send>>;
 
 /// Options for [`crate::AgentSession::execute_bash`] (Pi `executeBash` options, agent-session.ts:2588).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct BashOptions {
     /// `!!` prefix: keep the output out of the LLM context (still recorded for history).
     pub exclude_from_context: bool,
@@ -64,6 +64,39 @@ pub struct BashOptions {
     /// agent-session.ts:2769/2786), so a front-end driving several concurrent `executeBash` calls
     /// can route the deltas. Absent from the emitted JSON when `None`, matching Pi's `id?: string`.
     pub id: Option<String>,
+    /// Per-call command-execution backend override — Pi's `options.operations?: BashOperations`
+    /// (`agent-session.ts:2768` @v0.83.0), consumed one line later as
+    /// `options?.operations ?? createLocalBashOperations({ shellPath })` (`:2782`). This is the
+    /// remote-exec seam an `ssh` / sandbox / VM extension redirects a single user command through
+    /// without re-implementing the bash pipeline: sanitization, rolling buffer, temp-file spill and
+    /// history recording all stay here and only the *execution* is delegated.
+    ///
+    /// `None` is upstream's absent `operations` and takes the local-shell branch of that `??`,
+    /// byte-for-byte the path this seam took before the field existed.
+    ///
+    /// **The one producer pi has is not yet reachable here, and that is DRIFT-004 / SEAM-015's
+    /// remaining half, now the ONLY one.** Upstream fills this from the `user_bash` event result
+    /// (`UserBashEventResult.operations`, `core/extensions/types.ts:1078-1080`; threaded at
+    /// `modes/rpc/rpc-mode.ts:576`, `operations: eventResult?.operations`). cyrup's extension I/O is
+    /// serde values, not references (ADR-0002), so a WASM guest cannot *return* an implementation of
+    /// this trait until the `register-bash-operations` import + keyed `bash-operations-exec` export
+    /// round-trip is built — the design is written out in full in `crates/cyrup-ext/src/lib.rs`'s
+    /// CYRUP-DELTA register. Any in-host caller can supply one today.
+    pub operations: Option<Arc<dyn cyrup_tools::ops::BashOperations>>,
+}
+
+/// Hand-written because `Arc<dyn BashOperations>` is not [`Debug`] — the trait is a behavioural seam
+/// with one method and giving it a `Debug` supertrait would tax every implementor for a derive that
+/// only this line needs. Reports *whether* an override is installed, which is the only thing a debug
+/// dump of the options bag can honestly say about a backend.
+impl std::fmt::Debug for BashOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BashOptions")
+            .field("exclude_from_context", &self.exclude_from_context)
+            .field("id", &self.id)
+            .field("operations", &if self.operations.is_some() { "Some(<override>)" } else { "None" })
+            .finish()
+    }
 }
 
 /// Run `command` against `proc` in `cwd`, streaming combined output to `on_chunk`, honoring `cancel`
@@ -80,9 +113,18 @@ pub struct BashOptions {
 /// abort case in its `catch` block (`bash-executor.ts:130-155`); every other error hits `throw err`
 /// (line 154), discarding whatever partial output had been captured. Mirror that exactly: the
 /// caller must NOT record a history entry for a call that never really completed.
+///
+/// `operations` is Pi's `options?.operations ?? createLocalBashOperations({ shellPath })`
+/// (`agent-session.ts:2782`): when `Some`, the command is handed to that backend instead of the
+/// session's local process backend, and EVERYTHING else on this path — the env vector built below,
+/// the sanitize/rolling-buffer/temp-spill pipeline, the [`ExitStatus`] → [`BashResult`] mapping —
+/// is unchanged, because upstream delegates only the `exec` call itself
+/// (`executeBashWithOperations(command, cwd, operations, {onChunk, signal})`, `bash-executor.ts`).
+/// `None` takes the `??`'s right-hand branch, which is `proc`/`shell` exactly as before.
 pub(crate) async fn run_bash(
     proc: &Arc<dyn ProcOps>,
     shell: &ShellConfig,
+    operations: Option<&dyn cyrup_tools::ops::BashOperations>,
     cwd: PathBuf,
     command: String,
     bin_dir: Option<&std::path::Path>,
@@ -107,22 +149,52 @@ pub(crate) async fn run_bash(
     env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));
     // [CYRUP-DELTA, value only] `AI_AGENT` names WHICH agent is running (`"pi"` upstream).
     env.push(("AI_AGENT".to_string(), "cyrup".to_string()));
-    let spec = ExecSpec {
-        command,
-        cwd,
-        env,
-        env_remove: Vec::new(),
-        shell: shell.clone(),
-    };
     let mut buffer = BashOutputBuffer::new();
-    let status = proc
-        .exec(spec, cancel, None, &mut |data: &[u8]| {
-            let sanitized = buffer.push_raw(data);
-            if let Some(cb) = on_chunk.as_mut() {
-                cb(&sanitized);
-            }
-        })
-        .await;
+    // ONE sink, shared by both branches: pi's `onChunk` wrapper is built once and handed to
+    // `executeBashWithOperations` whichever backend it resolved (`agent-session.ts:2779-2789`), so
+    // an overriding backend gets the identical sanitize→buffer→spill treatment. Hoisted out of the
+    // call so the two arms below cannot drift on it.
+    let mut sink = |data: &[u8]| {
+        let sanitized = buffer.push_raw(data);
+        if let Some(cb) = on_chunk.as_mut() {
+            cb(&sanitized);
+        }
+    };
+    let status = match operations {
+        // Pi's `options?.operations` branch. `timeout: None` mirrors this seam's call, which passes
+        // no `timeout` (only the agent-loop `bash` TOOL has one); `env_remove` is empty for the same
+        // reason the `ExecSpec` below leaves it empty — `executeBashWithOperations` never resolves a
+        // spawn context and so never deletes session keys (`bash-executor.ts`; the deletions are
+        // `resolveSpawnContext`'s, `bash.ts:158-184`, and belong to the tool).
+        Some(ops) => {
+            ops.exec(
+                &command,
+                &cwd,
+                cyrup_tools::ops::BashExecOptions {
+                    on_data: &mut sink,
+                    cancel,
+                    timeout: None,
+                    env,
+                    env_remove: Vec::new(),
+                },
+            )
+            .await
+        }
+        // The `?? createLocalBashOperations({ shellPath })` branch. `shell` was already resolved by
+        // the caller from the live `shellPath` setting, which is where the per-call resolution pi
+        // does inside `createLocalBashOperations`' closure (`bash.ts:89`) happens here.
+        None => {
+            let spec = ExecSpec {
+                command,
+                cwd,
+                env,
+                env_remove: Vec::new(),
+                shell: shell.clone(),
+            };
+            proc.exec(spec, cancel, None, &mut sink).await
+        }
+    };
+    drop(sink);
     let (output, truncated, full_output_path) = buffer.finish();
 
     match status {

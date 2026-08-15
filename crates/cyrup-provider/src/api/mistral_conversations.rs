@@ -1377,6 +1377,7 @@ mod tests {
             },
             context_window: 256_000,
             max_tokens: 4096,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

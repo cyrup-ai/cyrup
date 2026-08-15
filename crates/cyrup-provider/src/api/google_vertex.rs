@@ -471,6 +471,7 @@ mod tests {
             },
             context_window: 1_048_576,
             max_tokens: 65_536,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

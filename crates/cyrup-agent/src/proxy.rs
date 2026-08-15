@@ -19,7 +19,7 @@ use cyrup_core::{
 };
 use cyrup_provider::stream::{DoneReason, ErrorReason};
 use cyrup_provider::{
-    build_client, open_sse, parse_streaming_json_object, CacheRetention, Context, HeaderMap,
+    open_sse, parse_streaming_json_object, CacheRetention, Context, HeaderMap,
     ProviderError, SseRequest, StreamEvent, StreamOptions, ThinkingBudgets, Transport,
 };
 use cyrup_core::{ModelThinkingLevel, SessionId, ThinkingLevel};
@@ -462,10 +462,19 @@ async fn run_proxy(
         "options": build_proxy_request_options(&options),
     });
     let url = format!("{}/api/stream", options.proxy_url);
-    let req = SseRequest::post_json(url, body)
+    let req = SseRequest::post_json(url.clone(), body)
         .header("Authorization", format!("Bearer {}", options.auth_token));
 
-    let client = match build_client() {
+    // PROV-047 — proxy-aware, per target. Pi's `applyHttpProxySettings` writes the `httpProxy`
+    // setting into `process.env` (http-dispatcher.ts:43-48 @v0.83.0) and installs an
+    // `EnvHttpProxyAgent` as the GLOBAL undici dispatcher (`:79-93`), which `globalThis.fetch` then
+    // runs on (`:103`) — so the bare `fetch` in `proxy.ts:165` is proxied like every other request
+    // in the process. `build_client()` consulted neither the ported resolver nor
+    // `configure_http_proxy` and did not call `.no_proxy()`, so this transport both ignored the
+    // `httpProxy` setting entirely and let reqwest's own competing env detection decide for the
+    // env-var case. `build_client_for` runs `resolveHttpProxyUrlForTarget` (node-http-proxy.ts:92-112)
+    // against the proxy-stream URL, so the same authority decides here as for provider streams.
+    let client = match cyrup_provider::build_client_for(&url).await {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(error_terminal(&builder, &cancel, e.to_string())).await;
@@ -476,7 +485,7 @@ async fn run_proxy(
     // `open_sse` maps a non-2xx response / transport failure / connect-time cancel to a typed error
     // (Pi throws on `!response.ok`, proxy.ts:166-177). No request-level retry: Pi's `proxy.ts` calls
     // `fetch` directly, outside `retryProviderRequest`, and relies on the global dispatcher's idle
-    // timeout — which `build_client` above carries — to bound a stalled proxy.
+    // timeout — which the client above carries — to bound a stalled proxy.
     let mut frames = match open_sse(
         &client,
         req,
@@ -708,12 +717,12 @@ impl ProxyStreamFn {
     fn options_from(&self, opts: &StreamOptions) -> ProxyStreamOptions {
         ProxyStreamOptions {
             temperature: opts.temperature,
-            // AGENT-026 — `cyrup_provider::StreamOptions` has no `sampling_params` field yet (area
-            // 01 owns adding it, beside `metadata` at `stream.rs:188`, plus the merge over
-            // `Model.sampling_params` in the OpenAI-compatible adapters). Until it lands there is
-            // nothing to copy here; a caller that builds `ProxyStreamOptions` directly — the shape
-            // pi's own `streamProxy` example uses — can set it and it reaches the wire body.
-            sampling_params: None,
+            // AGENT-026 — carried straight through, pi's `{...options}` spread (proxy.ts:93-97)
+            // feeding the `ProxySerializableStreamOptions` Pick (`:59-71` @v0.84.1). What arrives
+            // here is already `Model.samplingParams` merged under the per-request map
+            // (`simple-options.ts:27-33`), so the proxy server receives the resolved set and its own
+            // OpenAI-compatible adapter applies it.
+            sampling_params: opts.sampling_params.clone(),
             max_tokens: opts.max_tokens,
             reasoning: model_thinking_to_unified(opts.reasoning),
             cache_retention: opts.cache_retention,
@@ -1045,6 +1054,44 @@ mod tests {
         ))
         .unwrap();
         assert!(none_body.get("thinkingBudgets").is_none());
+    }
+
+    /// AGENT-026 — the same spread must carry `samplingParams`, the entire v0.83.0→v0.84.1 diff of
+    /// `proxy.ts` (`ProxySerializableStreamOptions` Pick at `:59-71`, `buildProxyRequestOptions` at
+    /// `:102-114`).
+    ///
+    /// This closes the OTHER half of the frame: `ProxyStreamOptions` and the wire struct already
+    /// carried the field, but `options_from` hardcoded `None`, so nothing upstream of the proxy
+    /// could populate it and the field was reachable only by hand-constructing
+    /// `ProxyStreamOptions`. The provider half (`StreamOptions.sampling_params` and the merge over
+    /// `Model.sampling_params`) is pinned separately in
+    /// `cyrup-provider/src/tests/sampling_params.rs`.
+    #[test]
+    fn agent026_proxy_stream_fn_threads_sampling_params_into_wire_body() {
+        let mut params = Map::new();
+        params.insert("top_p".to_string(), Value::from(0.9));
+        params.insert("repetition_penalty".to_string(), Value::from(1.05));
+        let stream_opts =
+            StreamOptions { sampling_params: Some(params.clone()), ..StreamOptions::default() };
+
+        let proxy_fn = ProxyStreamFn::new("https://proxy.example", "secret");
+        let proxy_opts = proxy_fn.options_from(&stream_opts);
+        assert_eq!(
+            proxy_opts.sampling_params.as_ref(),
+            Some(&params),
+            "options_from must thread StreamOptions.sampling_params through, not drop it"
+        );
+
+        let body = serde_json::to_value(build_proxy_request_options(&proxy_opts)).unwrap();
+        assert_eq!(body["samplingParams"]["top_p"], serde_json::json!(0.9));
+        assert_eq!(body["samplingParams"]["repetition_penalty"], serde_json::json!(1.05));
+
+        // Unset stays absent on the wire (Pi's `JSON.stringify` drops undefined).
+        let none_body = serde_json::to_value(build_proxy_request_options(
+            &proxy_fn.options_from(&StreamOptions::default()),
+        ))
+        .unwrap();
+        assert!(none_body.get("samplingParams").is_none());
     }
 
     // --- transport (Pi streamProxy, proxy.ts:116-233) -------------------------

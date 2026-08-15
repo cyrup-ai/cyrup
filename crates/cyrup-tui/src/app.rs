@@ -59,8 +59,8 @@ use crate::error::TuiError;
 use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
 use crate::keymap::{
-    Action, EditorAction, Key, Keymap, ModelsKeymap, SelectAction, SelectKeymap, SessionKeymap,
-    TreeKeymap,
+    Action, EditorAction, Key, KeybindingIssue, Keymap, ModelsKeymap, SelectAction, SelectKeymap,
+    SessionKeymap, TreeKeymap,
 };
 use crate::login_dialog::{
     notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginUiMsg,
@@ -1127,21 +1127,29 @@ impl<B: Backend> App<B> {
     /// `KeybindingsManager.create`, keybindings.ts:348-352). Each map's `merge_json` applies only the
     /// ids in its own namespace (`app.*` / `editor.*` / `tui.select.*` / `app.tree.*`) and ignores the
     /// rest, so one document configures the global, editor, selector and tree maps in a single pass.
-    /// A malformed document or key spec is surfaced as a typed error (the binary logs + continues with
-    /// the defaults) — never a panic.
-    pub fn load_keybindings_json(&mut self, json: &str) -> Result<(), TuiError> {
-        self.state.keymap.merge_json(json)?;
+    /// A malformed DOCUMENT (unparseable JSON, or a non-object top level) is surfaced as a typed
+    /// error and nothing is applied — Pi's `loadRawConfig` returning `undefined`
+    /// (`core/keybindings.ts:328-336` @v0.83.0). An individual bad ENTRY is not an error: it comes
+    /// back in the returned [`KeybindingIssue`] list and every other entry still applies, so the
+    /// binary can name the offending ids instead of claiming it ignored a file it half-applied
+    /// (CFG-038). Never a panic.
+    ///
+    /// The issue lists of all six maps are concatenated rather than short-circuited, for the same
+    /// reason: `?` between the maps used to leave the global keymap applied and the editor keymap
+    /// untouched whenever a later map rejected something.
+    pub fn load_keybindings_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        let mut issues = self.state.keymap.merge_json(json)?;
         // X9 — every `… to expand` hint resolves its key label through the LIVE keymap upstream
         // (`keyText("app.tools.expand")`, `keybinding-hints.ts:34-36`). The transcript holds no
         // keymap, so the resolved label is pushed to it whenever bindings change.
         let expand = self.state.keymap.keys_label(Action::ToolsExpand);
         self.state.transcript.set_expand_hint(expand);
-        self.state.select_keymap.merge_json(json)?;
-        self.state.tree_keymap.merge_json(json)?;
-        self.state.session_keymap.merge_json(json)?;
-        self.state.models_keymap.merge_json(json)?;
-        self.state.editor.merge_keybindings_json(json)?;
-        Ok(())
+        issues.extend(self.state.select_keymap.merge_json(json)?);
+        issues.extend(self.state.tree_keymap.merge_json(json)?);
+        issues.extend(self.state.session_keymap.merge_json(json)?);
+        issues.extend(self.state.models_keymap.merge_json(json)?);
+        issues.extend(self.state.editor.merge_keybindings_json(json)?);
+        Ok(issues)
     }
 
     /// TUI-051 — re-read `<agent_dir>/keybindings.json` and re-apply it to every live map.
@@ -1159,7 +1167,13 @@ impl<B: Backend> App<B> {
     /// **Reset-then-merge, not merge**: `rebuild()` REPLACES (`keybindings.ts:187-191`), so an entry
     /// the user deleted must go back to its default. A missing file is not an error — it means "no
     /// user bindings", i.e. every default (Pi's `loadFromFile` returns `{}` for one).
-    pub fn reload_keybindings_from(&mut self, agent_dir: &std::path::Path) -> Result<(), TuiError> {
+    ///
+    /// Returns the entries the reloaded document could not use (CFG-038), so `/reload` can name
+    /// them the same way startup does.
+    pub fn reload_keybindings_from(
+        &mut self,
+        agent_dir: &std::path::Path,
+    ) -> Result<Vec<KeybindingIssue>, TuiError> {
         let path = agent_dir.join("keybindings.json");
         let json = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -1455,7 +1469,15 @@ impl<B: Backend> App<B> {
         self.state.selector = None;
         self.state.overlays.clear();
         self.state.status.set_streaming(false);
-        self.state.status.set_queued(0);
+        // The queue belongs to the OUTGOING session: its steering/follow-up lists were emitted by a
+        // `queue_update` from a session that is gone, and its compaction queue would be delivered
+        // into the new one. Clearing them clears the rendered region, which is the whole point —
+        // this used to be `status.set_queued(0)`, which zeroed a counter with no render site and
+        // left `pending_messages` drawing the previous session's `Steering: …` rows above the
+        // editor for the rest of the process (TUI-016 / ADR-0009 item 3).
+        self.state.session_queue = (Vec::new(), Vec::new());
+        self.state.compaction_queue.clear();
+        self.rebuild_pending_messages();
         self.state.indicator.idle();
         // The new session starts idle, so drop the prior turn's grow-only height floor; the next
         // `draw` collapses the viewport to the compact idle region (void-fix).
@@ -2158,7 +2180,6 @@ impl<B: Backend> App<B> {
                 .map(|m| m.text.clone()),
         );
         self.state.pending_messages.set(steering, follow_up);
-        self.state.status.set_queued(self.state.pending_messages.len());
     }
 
     /// Pi's `queueCompactionMessage(text, mode)` (`interactive-mode.ts:4014-4020` @v0.83.0): push
@@ -2389,6 +2410,68 @@ impl<B: Backend> App<B> {
                 self.try_paste_clipboard_image_path();
                 AppAction::Redraw
             }
+            // TUI-008 — the seven ids `interactive-mode.ts:2608-2618` wires. Every destination
+            // already existed and had no key routed to it; the ids were simply unrecognized, so a
+            // `keybindings.json` naming them did nothing and the documented default chords were
+            // dead keys.
+            //
+            // `app.model.select` (Ctrl+L): `showModelSelector()` (`:2608`) is the UNFILTERED picker
+            // — the same thing a bare `/model` opens, which is `ModelCommand(None)`
+            // (`handleModelCommand(undefined)`, `:4175`).
+            Action::ModelSelect => AppAction::Command(AppCommand::ModelCommand(None)),
+            // `app.thinking.toggle` (Ctrl+T): `toggleThinkingBlockVisibility` (`:3834-3850`) flips
+            // `hideThinkingBlock`, PERSISTS it via `settingsManager.setHideThinkingBlock` (`:3836`)
+            // and ends in `showStatus(\`Thinking blocks: ${… ? "hidden" : "visible"}\`)` (`:3849`).
+            // The persist is what makes this different from a view-only flag, so it rides
+            // `ApplySetting` — the same command the `/settings` row uses, whose handler also applies
+            // the flip live to the transcript (one write path, not two).
+            //
+            // **[CYRUP-DELTA]** — pi additionally rebuilds the whole chat container from the session
+            // messages (`:3838-3840`), so ALREADY-SHOWN assistant messages change form. cyrup's
+            // committed rows have left the render tree for the terminal's native scrollback
+            // (`flush_committed` → `insert_before`, ADR-0001), so they keep the form they committed
+            // with; only the in-flight block and everything after the flip change. That residual is
+            // `TUI-N06`, which owns it — it is not introduced here.
+            Action::ThinkingToggle => {
+                let hidden = !self.state.transcript.hide_thinking_block();
+                // Pi flips its own field FIRST (`:3835`) and only then persists (`:3836`), so the
+                // rebuild two lines later already sees the new value. Applying it here rather than
+                // relying solely on the `ApplySetting` round-trip is not belt-and-braces: the
+                // command is resolved by the run loop against the live session, so a press while
+                // the settings write is unavailable (or simply before the loop turns) would
+                // otherwise leave the view unchanged AND compute the same `hidden` again on the
+                // next press — a key that toggles nothing, twice.
+                self.state.transcript.set_hide_thinking_block(hidden);
+                self.state
+                    .transcript
+                    .push_status(if hidden {
+                        "Thinking blocks: hidden"
+                    } else {
+                        "Thinking blocks: visible"
+                    });
+                AppAction::Command(AppCommand::ApplySetting {
+                    id: "hideThinkingBlock".to_string(),
+                    value: hidden.to_string(),
+                })
+            }
+            // `app.message.copy` (Ctrl+X): `void this.handleCopyCommand()` (`:2612`) — the identical
+            // handler `/copy` runs, so it is the identical command.
+            Action::MessageCopy => AppAction::Command(AppCommand::Copy),
+            // `app.session.new/tree/fork/resume` (`:2615-2618`) → `handleClearCommand`,
+            // `showTreeSelector`, `showUserMessageSelector`, `showSessionSelector` — i.e. exactly
+            // what `/new`, `/tree`, `/fork` and `/resume` dispatch to in `run_command`. All four
+            // ship with `defaultKeys: []` (`core/keybindings.ts:115-118`): reachable only from a
+            // user's `keybindings.json`, which is precisely the case that used to be silent.
+            Action::SessionNew => AppAction::Command(AppCommand::NewSession),
+            Action::SessionTree => {
+                AppAction::Command(AppCommand::OpenSelector(SelectorKind::Tree))
+            }
+            Action::SessionFork => {
+                AppAction::Command(AppCommand::OpenSelector(SelectorKind::UserMessage))
+            }
+            Action::SessionResume => {
+                AppAction::Command(AppCommand::OpenSelector(SelectorKind::Session))
+            }
         }
     }
 
@@ -2419,11 +2502,12 @@ impl<B: Backend> App<B> {
     /// part title-cased — not just the first key, so a rebind that binds two keys shows both. Unbound
     /// ids render as the empty string exactly as upstream's `keys.length === 0 → ""` does (:30).
     ///
-    /// `[CYRUP-DELTA]` — three of upstream's `**Other**` rows are omitted because the binding itself is
-    /// unported, not merely unbound: `app.model.select` ("Open model selector"), `app.thinking.toggle`
-    /// ("Toggle thinking block visibility") and `app.message.copy` ("Copy last assistant message") have
-    /// no [`Action`] variant (`core/keybindings.ts:21,23,26` vs `keymap.rs`'s enum). Printing them with
-    /// an empty key cell would advertise a shortcut no key reaches.
+    /// The `**Other**` table is upstream's in full. It used to omit three rows behind a
+    /// `[CYRUP-DELTA]` — `app.model.select`, `app.thinking.toggle`, `app.message.copy` — on the
+    /// grounds that printing them with an empty key cell would advertise a shortcut no key reaches.
+    /// That was legitimate only while the bindings were unported; **TUI-008 ported them**, so the
+    /// rows are back at upstream's positions (`:5834`, `:5836`, `:5838`) and the delta is deleted
+    /// rather than left to make `/hotkeys` permanently three rows short with nothing tracking it.
     ///
     /// The trailing **Extensions** table (`:6186-6197`) IS built. It is gated on
     /// `if (shortcuts.size > 0)` (`:6189`) — no registered shortcut, no section, never an empty
@@ -2487,8 +2571,11 @@ impl<B: Backend> App<B> {
              | `{suspend}` | Suspend to background |\n\
              | `{thinking_cycle}` | Cycle thinking level |\n\
              | `{model_fwd}` / `{model_back}` | Cycle models |\n\
+             | `{select_model}` | Open model selector |\n\
              | `{expand_tools}` | Toggle tool output expansion |\n\
+             | `{toggle_thinking}` | Toggle thinking block visibility |\n\
              | `{external_editor}` | Edit message in external editor |\n\
+             | `{copy_message}` | Copy last assistant message |\n\
              | `{follow_up}` | Queue follow-up message |\n\
              | `{dequeue}` | Restore queued messages |\n\
              | `{paste_image}` | Paste image or text from clipboard |\n\
@@ -2526,8 +2613,11 @@ impl<B: Backend> App<B> {
             thinking_cycle = g(Action::ThinkingCycle),
             model_fwd = g(Action::ModelCycleForward),
             model_back = g(Action::ModelCycleBackward),
+            select_model = g(Action::ModelSelect),
             expand_tools = g(Action::ToolsExpand),
+            toggle_thinking = g(Action::ThinkingToggle),
             external_editor = g(Action::ExternalEditor),
+            copy_message = g(Action::MessageCopy),
             follow_up = g(Action::FollowUp),
             dequeue = g(Action::Dequeue),
             paste_image = g(Action::ClipboardPasteImage),
@@ -4836,10 +4926,21 @@ impl<B: Backend> App<B> {
                         // document must not wipe the live keymap silently, so the error is
                         // surfaced; the maps have already been reset to defaults by then, which is
                         // also what pi's replace-semantics `rebuild()` leaves behind.
-                        if let Err(e) = self.reload_keybindings_from(&agent_dir) {
-                            self.state
+                        // CFG-038 — a rejected ENTRY is now reported by id and the rest of the
+                        // document still applies; only an unusable DOCUMENT keeps the old
+                        // whole-file wording.
+                        match self.reload_keybindings_from(&agent_dir) {
+                            Err(e) => self
+                                .state
                                 .transcript
-                                .push_status(format!("keybindings error: {e}"));
+                                .push_status(format!("keybindings error: {e}")),
+                            Ok(issues) => {
+                                for issue in issues {
+                                    self.state
+                                        .transcript
+                                        .push_status(format!("keybindings: ignoring {issue}"));
+                                }
+                            }
                         }
                         self.state.pending_swap_status = Some(
                             "Reloaded keybindings, extensions, skills, prompts, themes, and \
@@ -8062,7 +8163,11 @@ fn spawn_session_bash(
             let _ = chunk_tx.send(BashMsg::Chunk(delta.to_string()));
         }));
         let options =
-            cyrup_session_svc::BashOptions { exclude_from_context: excluded, id: None };
+            cyrup_session_svc::BashOptions {
+            exclude_from_context: excluded,
+            id: None,
+            operations: None,
+        };
         let done = match session.execute_bash_with_user_event(&command, options, sink).await {
             Ok(result) => BashMsg::Done {
                 exit_code: result.exit_code,

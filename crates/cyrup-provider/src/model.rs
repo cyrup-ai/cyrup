@@ -63,6 +63,14 @@ pub struct Model {
     pub cost: ModelCost,
     pub context_window: u64,
     pub max_tokens: u64,
+    /// Default sampling parameters for this model (Pi `Model.samplingParams`, types.ts:801-802
+    /// @v0.84.1, introduced by `25a2c8dcf`), declared in pi immediately after `maxTokens` — which is
+    /// why it sits here. Per-request [`crate::StreamOptions::sampling_params`] keys override these,
+    /// merged per key by [`crate::utils::simple_options::build_base_options`]
+    /// (`simple-options.ts:27-33`). Only the OpenAI-compatible adapters apply the result; every
+    /// other api ignores it. Additive, defaulted to `None`. AGENT-026.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub sampling_params: Option<serde_json::Map<String, serde_json::Value>>,
     /// Per-level reasoning value overrides (Pi `Model.thinkingLevelMap`). Additive, defaulted.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub thinking_level_map: Option<ThinkingLevelMap>,

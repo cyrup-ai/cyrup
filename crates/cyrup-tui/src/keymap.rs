@@ -49,23 +49,103 @@ fn normalize_legacy_control_byte(ev: &KeyEvent) -> Option<KeyEvent> {
     Some(KeyEvent::new(KeyCode::Char(decoded), ev.modifiers))
 }
 
-/// Parse one binding-id JSON value (a key-spec string or an array of them) into [`Key`]s
-/// (spec/tui/07 §3.9). `"ctrl+c"` and `["esc", "ctrl+["]` are both accepted.
-fn parse_key_values(value: &serde_json::Value) -> Result<Vec<Key>, TuiError> {
-    match value {
-        serde_json::Value::String(s) => Ok(vec![Key::parse(s)?]),
-        serde_json::Value::Array(items) => {
-            let mut keys = Vec::with_capacity(items.len());
-            for item in items {
-                let s = item
-                    .as_str()
-                    .ok_or_else(|| TuiError::Keybindings(format!("expected key string, got {item}")))?;
-                keys.push(Key::parse(s)?);
-            }
-            Ok(keys)
-        }
-        other => Err(TuiError::Keybindings(format!("expected string or array, got {other}"))),
+/// One `keybindings.json` entry the merge could not use, named so the caller can report it.
+///
+/// CFG-038. `id` is the (post-migration) binding id; `reason` is why that entry — or one key spec
+/// inside it — was rejected. A document can produce several of these and still apply everything
+/// else, which is the whole point: upstream has no all-or-nothing failure mode here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeybindingIssue {
+    /// The binding id the rejected value was written against.
+    pub id: String,
+    /// Human-readable reason, suitable for a `warning:` line.
+    pub reason: String,
+}
+
+impl std::fmt::Display for KeybindingIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}", self.id, self.reason)
     }
+}
+
+/// Coerce one binding-id JSON value to its key-spec strings, or `None` when the value is neither a
+/// string nor an array whose every element is a string.
+///
+/// This is Pi's `toKeybindingsConfig` (`core/keybindings.ts:275-287` @v0.83.0) exactly:
+///
+/// ```ts
+/// if (typeof binding === "string") { config[key] = binding; continue; }
+/// if (Array.isArray(binding) && binding.every((entry) => typeof entry === "string")) {
+///     config[key] = binding;
+/// }
+/// ```
+///
+/// Note the missing `else`: a value of any other shape is **dropped from the config**, and the
+/// action then falls back to its default (`packages/tui/src/keybindings.ts:187-191` —
+/// `userKeys === undefined ? normalizeKeys(definition.defaultKeys) : …`). One malformed entry never
+/// touches any other entry.
+fn key_specs(value: &serde_json::Value) -> Option<Vec<&str>> {
+    match value {
+        serde_json::Value::String(s) => Some(vec![s.as_str()]),
+        serde_json::Value::Array(items) => items.iter().map(serde_json::Value::as_str).collect(),
+        _ => None,
+    }
+}
+
+/// Walk a keybindings document once, applying every entry this map recognizes and **collecting**
+/// the rejects instead of aborting on the first one — CFG-038.
+///
+/// **Mechanism note (JS → Rust).** Pi cannot fail an individual entry: `toKeybindingsConfig` drops
+/// an off-shape value silently (see [`key_specs`]) and a `KeyId` is just a string, so an
+/// unparseable spell like `"ctrl+nope+bad+"` survives into `keysById` and simply never matches
+/// anything in `matchesKey` (`packages/tui/src/keybindings.ts:198-204` @v0.83.0) — the action ends
+/// up **unbound**, not defaulted, and nothing else in the document is affected. cyrup's `Key` is a
+/// parsed type, so the two shapes have to be reproduced explicitly:
+///
+/// * value not a string / not an array-of-strings ⇒ **skip the entry**, action keeps its default;
+/// * a spec string that does not parse ⇒ **drop that key** from the entry's list and apply the
+///   rest. A dropped key is behaviourally identical to Pi's never-matching `KeyId`; when it was the
+///   only key, `set_action(action, vec![])` leaves the action unbound, which is Pi's outcome too.
+///
+/// Before this, every `merge_json` did `set_action(action, parse_key_values(&value)?)` **inside**
+/// the loop, so one bad spec aborted the merge — after the entries ahead of it in iteration order
+/// had already been applied — and the binary then printed `warning: ignoring <path>`, which was
+/// false: the file had been half-applied, in an order the user cannot see.
+///
+/// The whole-document error survives for `keybindings_object` only, which is Pi's `loadRawConfig`
+/// returning `undefined` for unparseable JSON or a non-object top level
+/// (`core/keybindings.ts:328-336`).
+fn merge_entries<A>(
+    json: &str,
+    from_id: impl Fn(&str) -> Option<A>,
+    mut apply: impl FnMut(A, Vec<Key>),
+) -> Result<Vec<KeybindingIssue>, TuiError> {
+    let mut issues = Vec::new();
+    for (id, value) in keybindings_object(json)? {
+        // Pi `rebuild()`: `if (!(keybinding in this.definitions)) continue;`
+        // (`packages/tui/src/keybindings.ts:172-179`). An id this map does not own is not an error
+        // — it belongs to one of the other maps, or to a future release.
+        let Some(action) = from_id(&id) else { continue };
+        let Some(specs) = key_specs(&value) else {
+            issues.push(KeybindingIssue {
+                id,
+                reason: format!("expected a key string or an array of key strings, got {value}"),
+            });
+            continue;
+        };
+        let mut keys = Vec::with_capacity(specs.len());
+        for spec in specs {
+            match Key::parse(spec) {
+                Ok(k) => keys.push(k),
+                Err(e) => issues.push(KeybindingIssue {
+                    id: id.clone(),
+                    reason: e.to_string(),
+                }),
+            }
+        }
+        apply(action, keys);
+    }
+    Ok(issues)
 }
 
 /// Parse a keybindings document into the `(id, value)` entries of its top-level JSON object
@@ -146,6 +226,36 @@ pub enum Action {
     /// an image actually being present (Pi `clipboard.hasImage()`); a bare Ctrl+V with no clipboard
     /// image falls through to the editor so normal text behavior is preserved.
     ClipboardPasteImage,
+    /// Open the model selector (Ctrl+L) — `app.model.select`
+    /// (`onAction("app.model.select", () => this.showModelSelector())`,
+    /// interactive-mode.ts:2608; `core/keybindings.ts:85`, default `ctrl+l`). The unfiltered picker,
+    /// i.e. exactly what a bare `/model` opens.
+    ModelSelect,
+    /// Toggle whether reasoning blocks are shown (Ctrl+T) — `app.thinking.toggle`
+    /// (`toggleThinkingBlockVisibility`, interactive-mode.ts:2610 → `:3834-3850`;
+    /// `core/keybindings.ts:87-90`, default `ctrl+t`). Flips `hideThinkingBlock`, PERSISTS it
+    /// (`settingsManager.setHideThinkingBlock`, `:3836`) and shows
+    /// `Thinking blocks: hidden|visible` (`:3849`). Distinct from
+    /// [`ThinkingCycle`](Self::ThinkingCycle), which changes the reasoning *level* on the model.
+    ThinkingToggle,
+    /// Copy the last assistant message to the clipboard (Ctrl+X) — `app.message.copy`
+    /// (`onAction("app.message.copy", () => void this.handleCopyCommand())`,
+    /// interactive-mode.ts:2612; `core/keybindings.ts:99-102`, default `ctrl+x`). The same handler
+    /// `/copy` runs.
+    MessageCopy,
+    /// Start a fresh session — `app.session.new` (`handleClearCommand`,
+    /// interactive-mode.ts:2615; `core/keybindings.ts:115`). **`defaultKeys: []`** upstream: the id
+    /// exists so a `keybindings.json` can bind it, and nothing is bound out of the box.
+    SessionNew,
+    /// Open the session tree — `app.session.tree` (`showTreeSelector`,
+    /// interactive-mode.ts:2616; `core/keybindings.ts:116`, `defaultKeys: []`).
+    SessionTree,
+    /// Fork from an earlier user message — `app.session.fork` (`showUserMessageSelector`,
+    /// interactive-mode.ts:2617; `core/keybindings.ts:117`, `defaultKeys: []`).
+    SessionFork,
+    /// Resume a persisted session — `app.session.resume` (`showSessionSelector`,
+    /// interactive-mode.ts:2618; `core/keybindings.ts:118`, `defaultKeys: []`).
+    SessionResume,
 }
 
 impl Action {
@@ -167,6 +277,15 @@ impl Action {
             "app.message.followUp" => Some(Action::FollowUp),
             "app.message.dequeue" => Some(Action::Dequeue),
             "app.clipboard.pasteImage" => Some(Action::ClipboardPasteImage),
+            // TUI-008 — the seven ids `interactive-mode.ts:2608-2618` wires that cyrup accepted
+            // nowhere, so a `keybindings.json` naming any of them silently did nothing.
+            "app.model.select" => Some(Action::ModelSelect),
+            "app.thinking.toggle" => Some(Action::ThinkingToggle),
+            "app.message.copy" => Some(Action::MessageCopy),
+            "app.session.new" => Some(Action::SessionNew),
+            "app.session.tree" => Some(Action::SessionTree),
+            "app.session.fork" => Some(Action::SessionFork),
+            "app.session.resume" => Some(Action::SessionResume),
             _ => None,
         }
     }
@@ -401,6 +520,25 @@ impl Key {
                 // `label()` emits the lowercased `pageup`/`pagedown`, so both round-trip.
                 "pageup" | "pgup" => code = Some(KeyCode::PageUp),
                 "pagedown" | "pgdn" => code = Some(KeyCode::PageDown),
+                // `insert` and `f1`…`f12` are `SpecialKey`s upstream (`tui/src/keys.ts:118`,
+                // `:128-139` @v0.83.0), with real sequence tables (`:380`, `:456-476`) and real
+                // `matchesKey` arms (`:1128-1139`). cyrup had neither, so the multi-character token
+                // fell through to the `_ => Err` arm below and the WHOLE entry was rejected — which
+                // meant `{"app.model.select": "f5"}` silently bound nothing. Found by TUI-008's own
+                // round-trip test, which used `f9` as an arbitrary second key.
+                //
+                // `clear` (`keys.ts:119`) is deliberately absent: crossterm's `KeyCode` has no
+                // counterpart, so there is nothing to map it to.
+                "insert" | "ins" => code = Some(KeyCode::Insert),
+                other if other.len() >= 2
+                    && other.starts_with('f')
+                    && other[1..].bytes().all(|b| b.is_ascii_digit()) =>
+                {
+                    match other[1..].parse::<u8>() {
+                        Ok(n @ 1..=12) => code = Some(KeyCode::F(n)),
+                        _ => return Err(TuiError::KeySpec(s.to_string())),
+                    }
+                }
                 other => {
                     let mut chars = other.chars();
                     match (chars.next(), chars.next()) {
@@ -476,6 +614,11 @@ impl Key {
             KeyCode::Delete => "delete".to_string(),
             KeyCode::PageUp => "pageup".to_string(),
             KeyCode::PageDown => "pagedown".to_string(),
+            KeyCode::Insert => "insert".to_string(),
+            // Without this arm the `Debug` fallback below renders `KeyCode::F(9)` as `f(9)`, which
+            // `Key::parse` cannot read back — a label that does not round-trip is a label that
+            // lies in `/hotkeys` and in every `keyHint`.
+            KeyCode::F(n) => format!("f{n}"),
             other => format!("{other:?}").to_lowercase(),
         };
         s.push_str(&base);
@@ -526,6 +669,16 @@ impl Default for Keymap {
                 // editor as before).
                 (Key::ctrl('v'), Action::ClipboardPasteImage),
                 (Key { code: KeyCode::Char('v'), mods: KeyModifiers::ALT }, Action::ClipboardPasteImage),
+                // TUI-008. `app.model.select` `ctrl+l` (`core/keybindings.ts:85`),
+                // `app.thinking.toggle` `ctrl+t` (`:87-90`), `app.message.copy` `ctrl+x`
+                // (`:99-102`).
+                (Key::ctrl('l'), Action::ModelSelect),
+                (Key::ctrl('t'), Action::ThinkingToggle),
+                (Key::ctrl('x'), Action::MessageCopy),
+                // `app.session.new` / `.tree` / `.fork` / `.resume` are declared with
+                // `defaultKeys: []` (`core/keybindings.ts:115-118`) — bindable, deliberately
+                // unbound. They are NOT listed here on purpose: inventing a default cyrup would be
+                // a divergence, and `keys_label` returning `None` is upstream's `keys.length === 0`.
             ],
         }
     }
@@ -593,14 +746,11 @@ impl Keymap {
 
     /// Merge a JSON keybindings document (spec/tui/07 §3.9; `core/keybindings.ts:14-262`): each
     /// recognized `app.*` id **replaces** that action's key set with the listed key spec(s). Ids for
-    /// the editor/select maps (and unknown ids) are ignored here. Malformed JSON or key specs error.
-    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
-        for (id, value) in keybindings_object(json)? {
-            if let Some(action) = Action::from_id(&id) {
-                self.set_action(action, parse_key_values(&value)?);
-            }
-        }
-        Ok(())
+    /// the editor/select maps (and unknown ids) are ignored here. Only an unparseable or non-object
+    /// DOCUMENT is an error; a rejected entry or key spec comes back as a [`KeybindingIssue`] and
+    /// every other entry still applies (CFG-038 — see [`merge_entries`]).
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, Action::from_id, |action, keys| self.set_action(action, keys))
     }
 }
 
@@ -681,13 +831,8 @@ impl SelectKeymap {
     }
 
     /// Merge a JSON keybindings document, applying only the `tui.select.*` ids (spec/tui/05 §10).
-    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
-        for (id, value) in keybindings_object(json)? {
-            if let Some(action) = SelectAction::from_id(&id) {
-                self.set_action(action, parse_key_values(&value)?);
-            }
-        }
-        Ok(())
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, SelectAction::from_id, |action, keys| self.set_action(action, keys))
     }
 }
 
@@ -784,13 +929,8 @@ impl AutocompleteKeymap {
     }
 
     /// Merge a JSON keybindings document, applying only the `tui.autocomplete.*` ids (item #6).
-    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
-        for (id, value) in keybindings_object(json)? {
-            if let Some(action) = AutocompleteAction::from_id(&id) {
-                self.set_action(action, parse_key_values(&value)?);
-            }
-        }
-        Ok(())
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, AutocompleteAction::from_id, |action, keys| self.set_action(action, keys))
     }
 }
 
@@ -884,13 +1024,8 @@ impl ModelsKeymap {
     }
 
     /// Merge a JSON keybindings document, applying only the `app.models.*` ids.
-    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
-        for (id, value) in keybindings_object(json)? {
-            if let Some(action) = ModelsAction::from_id(&id) {
-                self.set_action(action, parse_key_values(&value)?);
-            }
-        }
-        Ok(())
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, ModelsAction::from_id, |action, keys| self.set_action(action, keys))
     }
 }
 
@@ -979,13 +1114,8 @@ impl SessionKeymap {
     }
 
     /// Merge a JSON keybindings document, applying only the `app.session.*` ids.
-    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
-        for (id, value) in keybindings_object(json)? {
-            if let Some(action) = SessionAction::from_id(&id) {
-                self.set_action(action, parse_key_values(&value)?);
-            }
-        }
-        Ok(())
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, SessionAction::from_id, |action, keys| self.set_action(action, keys))
     }
 }
 
@@ -1127,13 +1257,8 @@ impl TreeKeymap {
     }
 
     /// Merge a JSON keybindings document, applying only the `app.tree.*` ids.
-    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
-        for (id, value) in keybindings_object(json)? {
-            if let Some(action) = TreeAction::from_id(&id) {
-                self.set_action(action, parse_key_values(&value)?);
-            }
-        }
-        Ok(())
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, TreeAction::from_id, |action, keys| self.set_action(action, keys))
     }
 }
 
@@ -1283,12 +1408,7 @@ impl EditorKeymap {
     }
 
     /// Merge a JSON keybindings document, applying only the `editor.*` ids (spec/tui/03 §6.1).
-    pub fn merge_json(&mut self, json: &str) -> Result<(), TuiError> {
-        for (id, value) in keybindings_object(json)? {
-            if let Some(action) = EditorAction::from_id(&id) {
-                self.set_action(action, parse_key_values(&value)?);
-            }
-        }
-        Ok(())
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, EditorAction::from_id, |action, keys| self.set_action(action, keys))
     }
 }

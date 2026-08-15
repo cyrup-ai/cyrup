@@ -85,6 +85,7 @@ fn model(
         cost,
         context_window,
         max_tokens,
+        sampling_params: None,
         thinking_level_map,
         compat: Some(compat),
         headers: None,

@@ -202,6 +202,7 @@ mod tests {
             cost: crate::model::ModelCost::default(),
             context_window: 0,
             max_tokens: 0,
+            sampling_params: None,
             thinking_level_map: None,
             compat: None,
             headers: None,

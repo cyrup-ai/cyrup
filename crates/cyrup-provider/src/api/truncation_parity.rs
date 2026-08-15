@@ -50,6 +50,7 @@ fn model_for(api: &str, provider: &str) -> Model {
         },
         context_window: 128_000,
         max_tokens: 4_096,
+        sampling_params: None,
         thinking_level_map: None,
         compat: None,
         headers: None,

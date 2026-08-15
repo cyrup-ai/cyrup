@@ -145,7 +145,7 @@ impl AgentSession {
                     &command,
                     // No request id on the in-process command seam (Pi's `options.id` is the
                     // JSON-RPC request id, supplied only by `rpc-mode.ts:574`).
-                    crate::BashOptions { exclude_from_context, id: None },
+                    crate::BashOptions { exclude_from_context, id: None, operations: None },
                     None,
                 )
                 .await?,

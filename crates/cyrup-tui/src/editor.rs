@@ -335,9 +335,15 @@ impl InputEditor {
     /// Merge a JSON keybindings document into the editor keymap **and** the autocomplete-popup keymap
     /// (R-10-018; the `editor.*` + `tui.autocomplete.*` ids). Called by the binary at boot with the
     /// user's `keybindings.json` so custom editor + popup bindings take effect (item #6).
-    pub fn merge_keybindings_json(&mut self, json: &str) -> Result<(), crate::TuiError> {
-        self.keymap.merge_json(json)?;
-        self.autocomplete_keymap.merge_json(json)
+    /// CFG-038 — the two maps' rejected entries are CONCATENATED rather than short-circuited: the
+    /// editor map returning an issue must not stop the autocomplete map from being applied.
+    pub fn merge_keybindings_json(
+        &mut self,
+        json: &str,
+    ) -> Result<Vec<crate::KeybindingIssue>, crate::TuiError> {
+        let mut issues = self.keymap.merge_json(json)?;
+        issues.extend(self.autocomplete_keymap.merge_json(json)?);
+        Ok(issues)
     }
 
     /// Restore both editor-side binding tables to their defaults — TUI-051.

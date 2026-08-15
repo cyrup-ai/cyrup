@@ -243,11 +243,12 @@ fn ingest_events_drive_status_and_transcript() {
 
     let text = buf_text(&app);
     assert!(text.contains("openai/gpt"), "model not reflected:\n{text}");
-    // The queue depth is TRACKED but must NOT reach the footer: `statsParts` (v0.84.1
-    // `footer.ts:129-164`) is exactly `↑ ↓ R W CH% $cost`, the context segment and `xp` — there is no
-    // queue segment upstream under any name. The extra segment pushed the right-aligned model name
-    // over at narrow widths. pi surfaces queued messages in the transcript instead.
-    assert_eq!(app.state().status.queued, 3, "queue depth not tracked");
+    // The queue depth is tracked by the thing that RENDERS it. It must not reach the footer:
+    // `statsParts` (v0.84.1 `footer.ts:129-164`) is exactly `↑ ↓ R W CH% $cost`, the context segment
+    // and `xp` — there is no queue segment upstream under any name, and the extra segment pushed the
+    // right-aligned model name over at narrow widths. This used to read `status.queued`, a counter
+    // with no render site at all (ADR-0009 item 3); that field is gone.
+    assert_eq!(app.state().pending_messages.len(), 3, "queue depth not tracked");
     // Assert the FOOTER, not the whole screen. The old form was `!text.contains("queued")` over the
     // entire buffer, which was only ever a proxy for "no footer segment" — and it also asserted, in
     // its comment, that "pi surfaces queued messages in the transcript instead". That second claim is

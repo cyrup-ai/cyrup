@@ -3,8 +3,28 @@
 //! parses it, resolves the API key (literal / `$ENV`/`${ENV}` interpolation / leading `!command`,
 //! Pi's resolution rules), and routes it to the [`ModelRegistrySink`] the session injects. Until the
 //! sink is bound, registrations QUEUE; [`ProviderHub::bind`] flushes the pending set (Pi's
-//! defer→`bindCore` lifecycle, A-08-7). OAuth + `streamSimple` cross as opaque blocks (executing
-//! those guest callbacks needs guest exports — see gap-08 #5: a documented partial).
+//! defer→`bindCore` lifecycle, A-08-7).
+//!
+//! # EXT-M07 — the dynamic half of a guest provider is declared everywhere and invoked nowhere
+//!
+//! OAuth + `streamSimple` cross this seam as opaque blocks because they are guest CLOSURES; the
+//! guest exports that execute them do exist and are implemented end to end —
+//! [`crate::host::LiveExtension::provider_login`], `provider_refresh_token`,
+//! `provider_get_api_key`, `provider_modify_models`, `provider_stream_simple`, each backed by a WIT
+//! export and a `cyrup-ext-sdk` wrapper. **None of the five has a production caller** (workspace
+//! grep at HEAD: only `crates/cyrup-it/tests/ext/{wasm_provider,ergonomic}.rs`). The one consumer
+//! of a registration is `cyrup_session_svc::GuestProviderRegistry::upsert_provider`, which calls
+//! [`ProviderRegistration::build_provider`] and gets a `ConfigProvider` over `baseUrl` with the
+//! api-key string resolved ONCE at registration time.
+//!
+//! So a guest-registered provider is selectable and streamable, but statically: its login flow
+//! never runs, an expired token is never refreshed, `getApiKey` never resolves a per-request key,
+//! `modifyModels` never reshapes the catalog, and a custom `streamSimple` transport is replaced by
+//! the built-in HTTP one. Upstream all five are plain fields of the object pi's `ModelRegistry`
+//! holds and calls (`extensions/types.ts:1363-1475`, `model-registry.ts:828-960` @v0.84.1), so
+//! there is nothing to wire there and everything to wire here. **The fix site is
+//! `crates/cyrup-session-svc/src/guest_providers.rs` (plus whatever credential store the refresh
+//! writes back to) — not this crate**, which already exposes every call it needs.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,8 +60,17 @@ pub struct ProviderConfig {
     /// on this side.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<Value>,
-    /// Whether the guest supplied a custom `streamSimple` handler (drives the host to invoke the
-    /// `provider-stream-simple` export rather than a built-in API stream).
+    /// Whether the guest supplied a custom `streamSimple` handler (pi `ProviderConfig.streamSimple`,
+    /// `extensions/types.ts:1452-1457` @v0.84.1).
+    ///
+    /// **EXT-M07 — nothing reads this in production.** It is parsed here and exposed by
+    /// [`Self::has_stream_simple`]/[`ProviderRegistration::has_stream_simple`], but a workspace-wide
+    /// grep at HEAD finds the only readers are `crates/cyrup-it/tests/ext/`. The realized provider
+    /// comes from [`ProviderRegistration::build_provider`], which unconditionally builds a
+    /// `ConfigProvider` streaming over `baseUrl` — so a guest that registered a provider precisely
+    /// to own the transport gets the built-in HTTP one instead, silently, and its
+    /// `provider-stream-simple` export is never invoked. The same holds for the four OAuth
+    /// callbacks; see this module's doc.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_stream_simple: bool,
 }
@@ -278,6 +307,13 @@ impl ProviderRegistration {
                 },
                 context_window: m.context_window.unwrap_or(128_000),
                 max_tokens: m.max_tokens.unwrap_or(16_384),
+                // AGENT-026 — `Model.samplingParams` has NO counterpart in pi's config/extension
+                // model schema: at v0.84.1 `samplingParams` appears only in `packages/ai/src`
+                // (types + the three OpenAI-compatible adapters + `simple-options.ts`) and
+                // `packages/agent/src/proxy.ts`, never in `packages/coding-agent`'s config
+                // plumbing. An extension-declared model therefore carries no defaults upstream
+                // either, so `None` is the port, not a stub.
+                sampling_params: None,
                 thinking_level_map,
                 compat,
                 headers,

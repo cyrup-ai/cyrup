@@ -11,6 +11,7 @@
 //! environment with `std::env::set_var`, which this crate's `#![forbid(unsafe_code)]` rules out
 //! in `src/` — and whose soundness argument depends on being a one-test binary).
 
+mod app_global_actions;
 mod assembled_render;
 mod auth_selector;
 mod autocomplete;
