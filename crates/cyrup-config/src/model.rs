@@ -1429,7 +1429,11 @@ pub fn find_initial_model(
     available: &[Model],
     has_configured_auth: &dyn Fn(&Model) -> bool,
 ) -> InitialModelResult {
-    let default_level = ModelThinkingLevel::default();
+    // Pi `model-resolver.ts:594` @v0.83.0 — `let thinkingLevel: ThinkingLevel =
+    // DEFAULT_THINKING_LEVEL;`, re-named at every one of this function's return arms (`:608`,
+    // `:616`, `:642`, `:647`, `:651`). CFG-056: this was `ModelThinkingLevel::default()` (= `Off`),
+    // which is the type's zero, not upstream's unset-fallback (`medium`).
+    let default_level = crate::DEFAULT_THINKING_LEVEL;
 
     // 1. CLI args take priority.
     if let (Some(_), Some(_)) = (cli_provider, cli_model) {

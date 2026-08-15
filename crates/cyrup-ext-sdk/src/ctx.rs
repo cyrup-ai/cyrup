@@ -222,7 +222,9 @@ impl Ctx {
         String::new()
     }
 
-    /// Abort the in-flight agent run (Pi `ctx.abort()`, types.ts:339 — available in all contexts).
+    /// Abort the in-flight agent run (Pi `ctx.abort()`, types.ts:336 @v0.83.0, doc "Abort the
+    /// current agent operation" at `:335`; legal from every tier). EXT-073: the `:339 — available in
+    /// all contexts` this line used to carry belongs to `shutdown`, not `abort`.
     pub fn abort(&self) -> Result<(), String> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -232,8 +234,9 @@ impl Ctx {
         Ok(())
     }
 
-    /// Request a graceful host shutdown (Pi `ctx.shutdown()`, types.ts:344 — available in all
-    /// contexts). The host exits at its next settle point.
+    /// Request a graceful host shutdown (Pi `ctx.shutdown()`, types.ts:340 @v0.83.0, doc
+    /// "Gracefully shutdown pi and exit. Available in all contexts." at `:339`). The host exits at
+    /// its next settle point. EXT-073: `:344` is `compact`.
     pub fn shutdown(&self) -> Result<(), String> {
         #[cfg(target_arch = "wasm32")]
         {

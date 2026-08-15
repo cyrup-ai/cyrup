@@ -1035,6 +1035,7 @@ Examples:
   {APP} --export session.jsonl output.html
 
 Environment Variables:
+  ANTHROPIC_AUTH_TOKEN             - Anthropic bearer auth token
   ANTHROPIC_API_KEY                - Anthropic Claude API key
   ANTHROPIC_OAUTH_TOKEN            - Anthropic OAuth token (alternative to API key)
   ANT_LING_API_KEY                 - Ant Ling API key
@@ -1064,6 +1065,12 @@ Environment Variables:
   CLOUDFLARE_API_KEY               - Cloudflare API token (Workers AI and AI Gateway)
   CLOUDFLARE_ACCOUNT_ID            - Cloudflare account id (required for both)
   CLOUDFLARE_GATEWAY_ID            - Cloudflare AI Gateway slug (required for AI Gateway)
+  QWEN_TOKEN_PLAN_API_KEY          - Qwen Token Plan API key (international region)
+  QWEN_TOKEN_PLAN_CN_API_KEY       - Qwen Token Plan API key (China region)
+  XIAOMI_API_KEY                   - Xiaomi MiMo API key (api.xiaomimimo.com billing)
+  XIAOMI_TOKEN_PLAN_CN_API_KEY     - Xiaomi MiMo Token Plan API key (China region)
+  XIAOMI_TOKEN_PLAN_AMS_API_KEY    - Xiaomi MiMo Token Plan API key (Amsterdam region)
+  XIAOMI_TOKEN_PLAN_SGP_API_KEY    - Xiaomi MiMo Token Plan API key (Singapore region)
   AWS_PROFILE                      - AWS profile for Amazon Bedrock
   AWS_ACCESS_KEY_ID                - AWS access key for Amazon Bedrock
   AWS_SECRET_ACCESS_KEY            - AWS secret key for Amazon Bedrock
@@ -1074,7 +1081,7 @@ Environment Variables:
   CYRUP_PACKAGE_DIR                - Override package directory (for Nix/Guix store paths)
   CYRUP_OFFLINE                    - Disable startup network operations when set to 1/true/yes
   CYRUP_TELEMETRY                  - Override install telemetry when set to 1/true/yes or 0/false/no
-  CYRUP_SHARE_VIEWER_URL           - Base URL for /share command
+  CYRUP_SHARE_VIEWER_URL           - Base URL for /share command (default: https://pi.dev/session/)
 
 Built-in Tool Names:
   read   - Read file contents
@@ -1504,6 +1511,50 @@ mod tests {
         }]);
         assert!(with_ext.contains("Extension CLI Flags:"));
         assert!(with_ext.contains("--plan"));
+    }
+
+    /// The env block and the read set must be the SAME set, in both directions (SEAM-102 /
+    /// TUI-063 — one invariant, two failure modes).
+    ///
+    /// Direction 1 (SEAM-102, seven rows): a credential cyrup genuinely reads was missing from the
+    /// block, so `--help` told a user with a working `ANTHROPIC_AUTH_TOKEN` / Qwen / Xiaomi key that
+    /// cyrup does not read it. Each name is asserted against
+    /// [`cyrup_provider::env_api_keys::api_key_env_vars`], the table the resolver itself consults,
+    /// so the row cannot be right in the help and wrong in the product.
+    ///
+    /// Direction 2 (TUI-063): `CYRUP_SHARE_VIEWER_URL` was advertised and read by nothing. It has a
+    /// consumer now (`cyrup-tui`'s `/share`, `share_viewer_url`), and pi's row carries the default
+    /// (`args.ts:389` @v0.83.0) — which the cyrup row had dropped, leaving the help unable to say
+    /// what happens when the variable is unset.
+    #[test]
+    fn the_env_help_block_and_the_read_set_are_the_same_set() {
+        let help = render_help(&[]);
+        for (provider, name) in [
+            ("anthropic", "ANTHROPIC_AUTH_TOKEN"),
+            ("qwen-token-plan", "QWEN_TOKEN_PLAN_API_KEY"),
+            ("qwen-token-plan-cn", "QWEN_TOKEN_PLAN_CN_API_KEY"),
+            ("xiaomi", "XIAOMI_API_KEY"),
+            ("xiaomi-token-plan-cn", "XIAOMI_TOKEN_PLAN_CN_API_KEY"),
+            ("xiaomi-token-plan-ams", "XIAOMI_TOKEN_PLAN_AMS_API_KEY"),
+            ("xiaomi-token-plan-sgp", "XIAOMI_TOKEN_PLAN_SGP_API_KEY"),
+        ] {
+            assert!(
+                cyrup_provider::env_api_keys::api_key_env_vars(provider)
+                    .is_some_and(|keys| keys.contains(&name)),
+                "{name} must really be read for {provider}, or the help row would be the lie in the \
+                 other direction"
+            );
+            assert!(
+                help.contains(name),
+                "{name} is read but absent from the --help environment block"
+            );
+        }
+        assert!(
+            help.contains(
+                "CYRUP_SHARE_VIEWER_URL           - Base URL for /share command (default: https://pi.dev/session/)"
+            ),
+            "pi's row carries the default (args.ts:389): {help}"
+        );
     }
 
     #[test]

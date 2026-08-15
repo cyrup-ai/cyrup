@@ -19,6 +19,9 @@ pub const GREP_MAX_MATCHES: usize = 100;
 pub const FIND_MAX_RESULTS: usize = 1000;
 /// Entry cap for `ls`.
 pub const LS_MAX_ENTRIES: usize = 500;
+/// JavaScript's `Number.MAX_SAFE_INTEGER` (2^53 − 1), the "no line cap" sentinel pi's byte-only
+/// truncation callers pass verbatim. See [`TruncOpts::bytes_only`] (TOOL-044).
+pub const MAX_SAFE_INTEGER: usize = 9_007_199_254_740_991;
 
 /// Which limit triggered truncation.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -29,11 +32,28 @@ pub enum TruncatedBy {
 }
 
 /// Truncation report (arch-03 §3.2) — serialized into a tool's `details`.
+///
+/// Pi `core/tools/truncate.ts:15-38` `TruncationResult` @v0.83.0. `details` is persisted on
+/// `ToolResultMessage` (pi `packages/ai/src/types.ts:415-420`), so every field here reaches the
+/// session file and is interop surface, not an internal.
+///
+/// **TOOL-044 (2026-08-14, sweep 9).** Two of the three divergences the mechanical diff of this
+/// struct found are closed here; the third is the item's stated residual.
+/// * `truncatedBy` was `skip_serializing_if = "Option::is_none"`, so the key VANISHED on an
+///   untruncated result. pi's type is `"lines" | "bytes" | null` (`truncate.ts:21`) and the field
+///   is always present — an explicit `null` is not the same record as an absent key to any reader
+///   that distinguishes them. The skip is gone; `None` now serializes as `null`.
+/// * `maxLines` — see [`TruncOpts::bytes_only`].
+/// * **RESIDUAL:** pi's `TruncationResult` also carries `content` (`truncate.ts:17`), the entire
+///   truncated output text a SECOND time inside `details`. cyrup keeps the text only on
+///   [`Truncated::content`] and never serializes it. Left open deliberately rather than ported
+///   blind, because it doubles the session-file cost of every truncated tool result and
+///   `git grep -n 'truncation\.content' v0.83.0 -- packages/` shows every hit is a LOCAL variable
+///   inside an `execute()` body — no pi consumer reads `details.truncation.content`.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Truncation {
     pub truncated: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated_by: Option<TruncatedBy>,
     pub total_lines: usize,
     pub total_bytes: usize,
@@ -57,8 +77,17 @@ impl TruncOpts {
         Self { max_lines, max_bytes }
     }
     /// Byte-cap only: row count already bounded by the caller (grep/find/ls).
+    ///
+    /// The sentinel is pi's `Number.MAX_SAFE_INTEGER`, not `usize::MAX` (TOOL-044). All four of
+    /// pi's byte-only call sites pass `{ maxLines: Number.MAX_SAFE_INTEGER }` literally —
+    /// `grep.ts:335`, `find.ts:189`, `find.ts:324`, `ls.ts:182` @v0.83.0 — and the value is copied
+    /// verbatim into the serialized report's `maxLines`, so `usize::MAX` wrote
+    /// `18446744073709551615` into every `details.truncation` where pi writes
+    /// `9007199254740991`. Both are "effectively unbounded" to the truncation arithmetic and
+    /// neither is reachable as a real line count; the difference is only ever visible in the
+    /// session record, which is exactly where interop is read.
     pub fn bytes_only(max_bytes: usize) -> Self {
-        Self { max_lines: usize::MAX, max_bytes }
+        Self { max_lines: MAX_SAFE_INTEGER, max_bytes }
     }
 }
 

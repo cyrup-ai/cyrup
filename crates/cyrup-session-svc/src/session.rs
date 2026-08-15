@@ -1519,7 +1519,10 @@ impl AgentSession {
         // aborted turn was still writing tool results raced the transcript it is about to compact.
         self.abort_and_settle().await;
         let cancel = self.session_cancel.child_token();
-        *Self::lock(&self.compaction_cancel) = Some(cancel.clone());
+        // The slot is installed BY the guard so the two can never be written apart — see
+        // [`CompactionCancelGuard`] for why a hand-written clear at each `return` is not enough in
+        // Rust, and why the ordered `clear()` calls below still stand.
+        let mut cancel_slot = CompactionCancelGuard::install(&self.compaction_cancel, cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
         // Pi's very first statement inside `compact()`'s `try` is the model check —
@@ -1532,7 +1535,7 @@ impl AgentSession {
         let model = match current_model {
             Some(m) => m,
             None => {
-                *Self::lock(&self.compaction_cancel) = None;
+                cancel_slot.clear();
                 let err = SessionServiceError::NoModelSelected;
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
@@ -1579,7 +1582,7 @@ impl AgentSession {
                         ))
                     );
                     drop(guard);
-                    *Self::lock(&self.compaction_cancel) = None;
+                    cancel_slot.clear();
                     let err = if already {
                         SessionServiceError::AlreadyCompacted
                     } else {
@@ -1614,7 +1617,7 @@ impl AgentSession {
             .await
         {
             BeforeCompactOutcome::Cancel => {
-                *Self::lock(&self.compaction_cancel) = None;
+                cancel_slot.clear();
                 // Pi throws "Compaction cancelled" (agent-session.ts:1824); its catch classifies that
                 // exact message as an ABORT, so `compaction_end` carries `aborted:true` and NO
                 // errorMessage (agent-session.ts:1909-1916).
@@ -1692,7 +1695,7 @@ impl AgentSession {
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
         drop(compactor);
         let _ = retry_pump.await;
-        *Self::lock(&self.compaction_cancel) = None;
+        cancel_slot.clear();
 
         match result {
             Ok(Some(entry)) => {
@@ -4663,7 +4666,11 @@ impl AgentSession {
             return Ok(false);
         };
         let cancel = self.session_cancel.child_token();
-        *Self::lock(&self.auto_compaction_cancel) = Some(cancel.clone());
+        // Same guard as the manual path — an auto compaction runs on the spawned `drive_run` task,
+        // but `check_compaction` is also awaited from `prepare` on the CALLER's future
+        // (`:1199`), which a racing caller can drop.
+        let mut cancel_slot =
+            CompactionCancelGuard::install(&self.auto_compaction_cancel, cancel.clone());
         self.fanout_emit(AgentSessionEvent::CompactionStart { reason }).await;
 
         // Pi: `this._summarizationRetryCallbacks({ source: "compaction", reason })` — the LIVE
@@ -4688,7 +4695,7 @@ impl AgentSession {
                 Some(x) => x,
                 None => {
                     drop(guard);
-                    *Self::lock(&self.auto_compaction_cancel) = None;
+                    cancel_slot.clear();
                     self.fanout_emit(AgentSessionEvent::CompactionEnd {
                         reason,
                         result: None,
@@ -4709,7 +4716,7 @@ impl AgentSession {
             .await
         {
             BeforeCompactOutcome::Cancel => {
-                *Self::lock(&self.auto_compaction_cancel) = None;
+                cancel_slot.clear();
                 // Pi agent-session.ts:1984-1990: a cancelling handler emits aborted:true, willRetry:false.
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
@@ -4789,7 +4796,7 @@ impl AgentSession {
         let _ = retry_pump.await;
         match result {
             Ok(Some(entry)) => {
-                *Self::lock(&self.auto_compaction_cancel) = None;
+                cancel_slot.clear();
                 let cr = crate::state::CompactionResult {
                     summary: entry.summary.clone(),
                     first_kept_entry_id: entry.first_kept_entry_id.to_string(),
@@ -4827,7 +4834,7 @@ impl AgentSession {
                 Ok(true)
             }
             Ok(None) => {
-                *Self::lock(&self.auto_compaction_cancel) = None;
+                cancel_slot.clear();
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,
                     result: None,
@@ -4839,7 +4846,7 @@ impl AgentSession {
                 Ok(false)
             }
             Err(e) => {
-                *Self::lock(&self.auto_compaction_cancel) = None;
+                cancel_slot.clear();
                 let aborted = matches!(e, cyrup_session::compaction::CompactionError::Aborted);
                 // Pi agent-session.ts:2083-2097: on a non-abort failure, emit the reason-tagged
                 // recovery/auto-compaction error message; an abort emits no errorMessage.
@@ -4874,6 +4881,58 @@ impl AgentSession {
             reserve_tokens: self.compaction_settings.reserve_tokens,
             keep_recent_tokens: self.compaction_settings.keep_recent_tokens,
         }
+    }
+}
+
+/// Clears the compaction cancel-token slot it installed into, whatever happens to the future that
+/// installed it — the same role [`BashCancelGuard`] plays for `_bashAbortControllers`, and for the
+/// same reason.
+///
+/// pi's `compact` / `_runAutoCompaction` clear `this._compactionAbortController` /
+/// `this._autoCompactionAbortController` on every settling path, and a JS `async fn` ALWAYS settles.
+/// A Rust future does not: `AgentSession::compact` is a public API whose body is one 10-20 s
+/// provider call surrounded by `.await`s, and any caller that races it — `tokio::time::timeout`
+/// around the `cyrup-sdk` handle (`cyrup-sdk/src/handle.rs:285`), or `run_rpc`'s `select!` dropping
+/// the driver when the write pump reports a broken pipe (`cyrup-modes/src/rpc.rs:668-676`) — drops
+/// it mid-flight. The hand-written clears at each `return` cannot run then, so the slot keeps a
+/// token nobody is awaiting and **`is_compacting()` answers true forever**. That is not a leaked
+/// allocation: the TUI's Submit arm consults `session.is_compacting()` before anything else
+/// (`cyrup-tui/src/app.rs`, the `AppAction::Submit if session.is_compacting()` arm), so every
+/// subsequent prompt the user types is diverted into the compaction queue and drained by a
+/// `compaction_end` that can never arrive — the session accepts input and silently sends none of
+/// it, with no way out short of a restart.
+///
+/// [`Self::clear`] is what the settling paths call, so the slot is still emptied at pi's exact
+/// point in the sequence — **before** `compaction_end` is fanned out, which is load-bearing: the
+/// TUI drains its compaction queue in response to that event and would re-queue the whole batch if
+/// `is_compacting()` were still true when it did. Clearing only in `Drop` would move the clear
+/// after the emit and reintroduce that race, so this guard is a backstop for the dropped-future
+/// path, not a replacement for the ordered clear. Once cleared it disarms, so it can never wipe a
+/// token a later compaction installed.
+struct CompactionCancelGuard<'a> {
+    slot: &'a Mutex<Option<CancelToken>>,
+    armed: bool,
+}
+
+impl<'a> CompactionCancelGuard<'a> {
+    /// Install `cancel` into `slot` and arm the guard.
+    fn install(slot: &'a Mutex<Option<CancelToken>>, cancel: CancelToken) -> Self {
+        *AgentSession::lock(slot) = Some(cancel);
+        Self { slot, armed: true }
+    }
+
+    /// Clear the slot now (pi's ordered clear), and disarm.
+    fn clear(&mut self) {
+        if self.armed {
+            *AgentSession::lock(self.slot) = None;
+            self.armed = false;
+        }
+    }
+}
+
+impl Drop for CompactionCancelGuard<'_> {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 

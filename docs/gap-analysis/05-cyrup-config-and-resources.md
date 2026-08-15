@@ -184,6 +184,61 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 > **RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set: 0 critical, 0 high, 4 medium, 5 low = 9.** The table carries **40 rows: 31 fully closed, 9 open (1 partially)**. Sweep 8 closed three: **`CFG-051`** on both halves (live-observed in a running UI *and* pinned by a rendered-transcript assertion), **`CFG-045`** as already-done (landed under `TUI-009`; the row's "unchanged at HEAD" was stale for two sweeps), and **`CFG-052`** as **REFUTED** — its premise about upstream is false and the refutation is the durable finding, not the closure. **`CFG-049` stays closed but its stated COVERAGE GAP is now closed by live observation too**, with two residuals restated rather than dropped. *(Previous edition: 0 / 0 / 5 / 7 = 12, 30 closed.)*
 >
 > **The routing note below is now stale on three of its eight entries** (`CFG-045`, `CFG-051`'s residual and `CFG-052` are closed); the remaining five stand.
+>
+> **AMENDED 2026-08-14 (documentation audit) — counted set: 0 critical, 0 high, 5 medium, 6 low = 11.** Two rows filed from a user-documentation audit that read the CLI surface against the code: `CFG-054` (doubled `packages/packages/` path) and `CFG-055` (`cyrup remove` id round trip). Both are `cyrup-original`; neither has an upstream leg established. The registry-path half of `CFG-054` was verified by running the binary, which is rare for this directory — see `REPRO-LOG.md` for the standard that sets.
+
+> ### AMENDED 2026-08-14 (mechanical surface enumeration — settings.json + environment variables)
+>
+> **Counted set: 0 critical, 0 high, 10 medium, 20 low = 30.** Twenty-one rows added, `CFG-056` …
+> `CFG-076`; **two of them (`CFG-056`, `CFG-057`) were FIXED in the same pass and are already closed**,
+> so 19 of the 21 are open. No id was renumbered, merged or deleted.
+>
+> These did **not** come from re-reading the backlog. Two upstream surfaces were enumerated
+> MECHANICALLY and diffed in both directions — every `settings.json` key/type/default/precedence
+> (66 upstream vs 67 cyrup), and every environment variable read or written (130 upstream vs 233
+> cyrup) — and the findings were filed regardless of whether an item already pointed at them. That
+> is why the largest single class here is **`cyrup-original`** (11 of the 21): surfaces cyrup has and
+> pi does not are the class this directory has had no habit of tracking, and an invented surface is
+> how divergence enters while everyone is looking at parity.
+>
+> **The area's new `high` was found and closed in the same pass.** `CFG-056` — `defaultThinkingLevel`
+> fell back to `off` where pi falls back to `medium`, so every user who had never written the key
+> started every session with reasoning DISABLED. It was invisible to a backlog re-read because
+> nothing was missing: the getter existed, the key was honoured, the `/settings` row agreed with the
+> getter, and the wrong constant was `ModelThinkingLevel::default()` — a correct value for the type's
+> zero, in the one place it is not the right fallback.
+>
+> **THE ENVIRONMENT-VARIABLE ENUMERATION IS INCOMPLETE, and these rows must not be read as coverage
+> of it.** Three gaps are named by the enumeration itself:
+> 1. **`pi-mcp-adapter`'s env surface was extracted but NOT diffed** — `BROWSER`, `GLIMPSE_BINARY`,
+>    `MCP_DIRECT_TOOLS`, `MCP_HASH_{CWD,ENV,HEADER,TOKEN,URL}`, `MCP_OAUTH_CALLBACK_PORT`,
+>    `MCP_OAUTH_DIR`, `MCP_UI_DEBUG`, `MCP_UI_VIEWER`, `NPM_CONFIG_CACHE`, the five
+>    `PI_MCP_ADAPTER_*` test/keyring vars, `PI_PACKAGE_DIR`, `SSH_CONNECTION`, `SSH_TTY`, `HOME`.
+>    Spot-checked: `MCP_UI_DEBUG`, `MCP_UI_VIEWER`, `MCP_OAUTH_DIR`, `MCP_OAUTH_CALLBACK_PORT`,
+>    `GLIMPSE_BINARY` and all five `MCP_HASH_*` return zero hits in `crates/`. **That area is owned by
+>    `MCP-PORT-METHODOLOGY.md` / `13-cyrup-mcp.md` and is deliberately untouched here** — somebody
+>    with that ownership should run the same `PI_`→`CYRUP_` diff against it.
+> 2. **The cyrup→`pi-subagents` direction is only partly walked.** `pi-subagents`' 48 literal env
+>    names were diffed against cyrup (that produced `CFG-067`), but the ~110 `CYRUP_SUBAGENT_*` /
+>    `CYRUP_INTERCOM_*` names were **not** all walked back the other way. `CFG-074` names the seven
+>    confirmed cyrup-originals in that family; **there may be more.**
+> 3. **~110 of cyrup's 233 names come from the three sibling ports** (`pi-subagents`,
+>    `pi-intercom`, `pi-permission-system`). Diffing only `pi/packages` would mislabel every one of
+>    them as a cyrup-original; the rows below were assigned against the sibling repos, not against
+>    `pi/packages`. Anyone re-deriving this must do the same or the `cyrup-original` count is fiction.
+>
+> **Findings from the same sweep that got no new id, and why** — recorded so nobody re-derives them:
+> `markdown.mermaid` → `CFG-040`; the deep-merge recursion depth → `CFG-012` (**superseded**; upstream
+> moved TO cyrup's behaviour — do not "fix" it); `PI_TUI_WRITE_LOG` → `TUI-040`;
+> `PI_SHARE_VIEWER_URL` → `TUI-063`; `SystemRoot` / `WINDIR` → `12-upstream-drift-pi-core.md:1075`
+> (the `ensureTool` N/A); `LLAMA_BASE_URL` / `HF_HOME` / `HF_TOKEN_PATH` → `EXT-027`;
+> `PI_CONFIG_DIR` / `PI_SERVER_DIR` / `PI_RADIUS_URL` / `PI_RADIUS_SERVER_URL` →
+> `12-upstream-drift-pi-core.md:1073` (`packages/server` is outside the dependency closure);
+> `PNPM_HOME` → `SEAM-078`; the process-global `PI_CODING_AGENT` set → `TOOL-031` / `PARITY-GAPS`
+> PB-5; the `HTTP_PROXY` mechanism difference → `PROV-047`; the `NO_PROXY` case-folding "gap" →
+> **not a defect**, retired in `CFG-060`'s body; `CYRUP_SHELL` → **not a cyrup-original**, it is the
+> sentinel of a NEGATIVE test under `TOOL-039` and is the one case where a grep hit means the
+> opposite of what it looks like.
 
 > **ROUTING — of the eleven rows still open, EIGHT have their fix site outside `cyrup-config`/`cyrup-resources`:** `CFG-038`, `CFG-045`, `CFG-021`, `CFG-051`'s residual, `CFG-014` and `CFG-015` are **cyrup-tui**; `CFG-042`'s residual and `CFG-039` are **cyrup-provider**. Only `CFG-052` is in-area; `CFG-003` and `CFG-020` are three-crate restructurings. **Six of the thirteen rows sweep 6 opened were already closed at HEAD or had stale headline evidence** — re-verify before scheduling.
 
@@ -229,6 +284,29 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 | CFG-053 | low | test-defect | S | `max_retry_delay_ms` is verified structurally only — nothing proves it reaches the retry loop (blind spot 6) — **FILED 2026-08-14 (sweep 6), open.** Re-filed from `CFG-006`'s Verify note when that row closed, rather than being closed with it: the `retry.provider.*` assignment at `crates/cyrup-session-svc/src/builder.rs` is asserted at the assignment site, and no test drives a retrying provider and observes the delay ceiling actually taking effect. Sibling of the `websocketConnectTimeoutMs` half, which IS pinned end to end (`round8_postrun.rs:341`). |
 | ~~CFG-052~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED, and its premise is struck** | parity-bug | S | `parse_git_url` rejects the `github:user/repo` shorthand that `is_local_path` has already classified as NON-local — **CLOSED AS REFUTED 2026-08-14 (sweep 8), which is a correction to the ANALYSIS and must survive: this is not a defect, it is a faithful port of upstream's own inconsistency.** The row asserts "Upstream's `parseGitUrl` reaches `hostedGitInfo.fromUrl`, which resolves the `github:`/`gitlab:`/`bitbucket:` shorthands". **False at v0.83.0.** `parseGitUrl` opens with `if (!hasGitPrefix && !/^(https?\|ssh\|git):\/\//i.test(url)) return null;` (`packages/coding-agent/src/utils/git.ts:172-179`) and its **own doc comment** says verbatim: *"Without git: prefix, only accept explicit protocol URLs."* (`:165-171`). `github:owner/repo` has no `git:` prefix and no `://`, so **upstream returns null BEFORE reaching `fromUrl`**. pi's `parseSource` then takes `isLocalPath` → false (`utils/paths.ts:36-55` lists `github:`) → `parseGitUrl` → null → `return { type: "local", path: source }` (`core/package-manager.ts:1435-1459`). **So upstream ALSO classifies it non-local and then stores it as a local path.** cyrup's `git_url.rs:285-287` + `has_protocol_prefix` at `:367-373` and `source.rs:59-67` are verbatim ports. The "internally inconsistent state" the row describes is **upstream's**, and it was ALREADY pinned before this sweep by `cfg052_a_github_shorthand_is_a_local_path_exactly_as_upstream_leaves_it` (`crates/cyrup-resources/src/tests/resources.rs:2241`), which does presence-before-absence — `git:owner/repo` MUST still resolve through the hosted-git-info table, so the `None` below it is about the missing prefix and not a dead parser — covers all three shorthands, and cites `git.ts:177-179` and `package-manager.ts:1459`. **Superseded original text follows.** — ~~**FILED 2026-08-14 (sweep 6), open.**~~ `crates/cyrup-resources/src/package/git_url.rs::parse_git_url` returns `None` for `github:user/repo`: `has_git_prefix` is false (the prefix is `github:`, not `git:`) and `has_protocol_prefix` accepts only https/http/ssh/git schemes — so the source falls through to `PackageSource::Path` and to `package_identity`'s **local** arm. Upstream's `parseGitUrl` reaches `hostedGitInfo.fromUrl`, which resolves the `github:`/`gitlab:`/`bitbucket:` shorthands. `is_local_path` already treats `github:` as non-local (`paths.ts:41-55`), so cyrup is in an internally inconsistent state: not a local path, and stored as one. **Two functions ported from two different upstream files whose domains no longer meet.** Found while closing CFG-026 and deliberately filed rather than fixed (out of that item's scope); CFG-026's tests were kept off the shorthand rather than encode the current behaviour. |
 | CFG-021 | low | upstream-drift | L | `tuiMode` / `fullscreenScrollbar` not modelled — **2026-08-14, still open**: sweeps 2 and 6 — unchanged; waits on the alt-screen renderer (ADR-0005 / area 07). `grep -rni 'tuiMode\|fullscreenScrollbar' crates` is still zero. The settings half alone would be another inert key — the exact failure this area's Coverage section records. *(Its restatement of the "three keys with zero occurrences" claim is stale for `showCacheMissNotices` — see CFG-014.)* |
+| CFG-054 | low | cyrup-original | S | Installed package working tree lands under a doubled `packages/packages/` segment — **filed 2026-08-14** by a documentation audit; the registry path was verified empirically, the working-tree path read from `store.rs:26-40`. |
+| CFG-055 | medium | cyrup-original | S | `cyrup remove` may not match the `PackageId` that `cyrup install` stored — **filed 2026-08-14**; cyrup side only, the upstream leg is not established. |
+| ~~CFG-056~~ | ~~high~~ **CLOSED 2026-08-14 — FIXED THIS PASS** | parity-bug | S | `defaultThinkingLevel`'s unset-fallback was `off`; pi's is `medium`, so every default session started with reasoning disabled — **FIXED 2026-08-14** (surface-enumeration sweep, settings.json surface). `crates/cyrup-config/src/defaults.rs` is new and ports pi's one-export `core/defaults.ts`; `EffectiveSettings::default_thinking_level()` now returns `Option<ModelThinkingLevel>` as pi's getter returns `ThinkingLevel \| undefined`, and the three `builder.rs` sites plus `model.rs`'s `default_level` name the fallback explicitly. |
+| ~~CFG-057~~ | ~~medium~~ **CLOSED 2026-08-14 — FIXED THIS PASS** | parity-bug | S | `httpProxy` was read from the MERGED view, so a project `.cyrup/settings.json` could rewrite the session's egress; pi reads it off the global document only — **FIXED 2026-08-14**: one entry in `GLOBAL_ONLY_KEYS` plus a red-before test. |
+| CFG-058 | medium | not-ported | S | `websocketConnectTimeoutMs` has no 15 000 ms default at the connect site, so an unset key means an unbounded WebSocket handshake — **filed 2026-08-14** (settings.json surface). **FIX SITE: `crates/cyrup-provider` — NOT cyrup-config.** `CFG-006` closed the THREADING half and did not verify the default. |
+| CFG-059 | medium | cyrup-original | M | A third, persistent `cli` settings layer sits above project in the precedence chain; pi has no CLI settings tier at all — **filed 2026-08-14** (settings.json surface). Inert today (no binary call site), but it is a divergence in the precedence MODEL. |
+| CFG-060 | low | cyrup-original | S | `EffectiveSettings::http_proxy`'s env fallback inverts pi's `??=` precedence — the setting wins over an ambient `HTTP_PROXY` where upstream lets the ambient value win — **filed 2026-08-14** (env-var surface). Distinct axis from `PROV-047`. Also retires the `NO_PROXY` case-folding false positive. |
+| CFG-061 | low | cyrup-original | S | `EffectiveSettings::packages()` discards the whole array on one malformed entry, reporting "no packages configured" — **filed 2026-08-14** (settings.json surface). Dead but wrong-shaped; the live path (`packages_with_errors`) is correct. |
+| CFG-062 | low | parity-bug | S | Clearing a string/array settings key writes JSON `null`; pi's `JSON.stringify` drops the key, and the two merge differently — **filed 2026-08-14** (settings.json surface). LATENT: no production caller passes `None` to `set` today. |
+| CFG-063 | low | not-ported | S | `PI_TUI_DEBUG` and `PI_DEBUG_REDRAW` — the two upstream render-debug env vars — have no counterpart, so the cursor/viewport bug class has no instrument — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** Sibling of `TUI-040`. |
+| CFG-064 | low | not-ported | S | `isWindowsTerminalSession()` is unported — `SSH_CLIENT` / `SSH_CONNECTION` / `SSH_TTY` are read nowhere — so Ctrl+Backspace degrades to Backspace on Windows Terminal, and the bug direction flips over SSH — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** |
+| CFG-065 | low | not-ported | S | `isWslEnvironment()` (`WSL_DISTRO_NAME` / `WSL_INTEROP`) and its git-HEAD polling fallback are unported, so the footer branch indicator goes stale on `/mnt/<drive>` repos where inotify never fires — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** |
+| CFG-066 | low | not-ported | S | The clipboard backend's two load gates — `TERMUX_VERSION` and `hasDisplay` (`DISPLAY` / `WAYLAND_DISPLAY`) — are unported, so the backend is attempted unconditionally on headless Linux and under Termux — **filed 2026-08-14** (env-var surface). Distinct from the known clipboard-TEXT gap at `12-upstream-drift-pi-core.md:820-828`. |
+| CFG-067 | medium | not-ported | M | Twelve `pi-subagents` env vars have no `CYRUP_` counterpart — three of them are budget/ceiling caps and one is a security kill switch — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-ext-subagents` (area 09); this row exists so the enumeration is not lost while area 09 has no item for any of them.** |
+| CFG-068 | medium | cyrup-original | S | `CYRUP_HOME` is invented, live in shipped builds, and takes precedence over `$HOME` at four sites at once — undocumented in `--help` and described in-source as a test knob — **filed 2026-08-14** (env-var surface). Needs an owner decision: promote it or confine it to test builds. |
+| CFG-069 | low | cyrup-original | S | `AI_AGENT` is written into every bash and subagent child; the KEY does not exist at the ported tag (it is a v0.84.1 addition) and the `[CYRUP-DELTA]` lines flag only its VALUE — **filed 2026-08-14** (env-var surface). Same class as the `working-start`/`working-stop` precedent: a real citation attached to a tag the port is not at. |
+| CFG-070 | low | cyrup-original | S | `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` and `APPDATA` are read by cyrup's hand-rolled credential resolvers and appear nowhere in pi's source, which inherits them from `@aws-sdk` / `google-auth-library` — **filed 2026-08-14** (env-var surface). **Correct as written — do NOT "fix" it by removing the reads.** Recorded so a later fidelity pass does not read them as unexplained branches. |
+| CFG-071 | low | cyrup-original | S | `XDG_CACHE_HOME` is a false name-match: cyrup reads it to site the WASM build cache, pi reads it to find the HuggingFace token file — so the same name is simultaneously a cyrup-original and a missing-upstream read — **filed 2026-08-14** (env-var surface). pi's use belongs to `EXT-027`. |
+| CFG-072 | low | cyrup-original | S | `HOMEDRIVE` / `HOMEPATH` widen home resolution past pi, which reads neither — cyrup resolves a home on Windows configurations where pi resolves none — **filed 2026-08-14** (env-var surface). |
+| CFG-073 | low | cyrup-original | S | `NO_COLOR` and `CI` are read where pi reads neither — behaviour that changes under CI and not locally is the divergence class that hides — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-ext-subagents` (area 09).** |
+| CFG-074 | medium | cyrup-original | M | Nine invented env vars across the three sibling ports — `CYRUP_PERMISSION_SYSTEM` (an opt-in over a SECURITY gate), two permission-forwarding knobs upstream keeps as compile-time constants, three `CYRUP_INTERCOM_*` transport/broker vars, `CYRUP_SUBAGENT_AGENT_NAME`, `CYRUP_HOOK_WARMUP` and `CYRUP_SUBAGENTS_TEMP_ROOT` — **filed 2026-08-14** (env-var surface). Each is defensible; none is currently KNOWN, and each wants a `[CYRUP-DELTA]` naming the upstream file:line it replaces. |
+| CFG-075 | low | cyrup-original | S | `CYRUP_EXT_ABI_FINGERPRINT` is the surface's only BUILD-time env dependency (`env!`, not `env::var`), so a missing value is a compile error rather than a runtime fallback — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-ext` (area 06);** no work implied beyond knowing it before the build scripts are reorganized. |
+| CFG-076 | low | cyrup-original | S | Three `PI_`→`CYRUP_` rename exceptions, one of which is a live inconsistency INSIDE cyrup: `CYRUP_AGENT_DIR` (short) in `cyrup-config` vs `CYRUP_CODING_AGENT_DIR` (long) in `cyrup-ext-subagents` — **filed 2026-08-14** (env-var surface). The other two are deliberate and are recorded so the mechanical diff stops scoring them as missing vars. |
 
 ## CFG-035 — `.cyrup/SYSTEM.md` and `APPEND_SYSTEM.md` are never discovered — the trust-gated project system-prompt override is inert
 
@@ -796,6 +874,357 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 **Fix** — land with the fullscreen viewport work: add both accessors and setters in `settings.rs` and the `/settings` rows, then consume them in the alt-screen renderer.
 
 **Verify** — settings round-trip test once the mode exists, plus a `/settings` row assertion.
+
+## CFG-054 — installed package working tree lands under a doubled `packages/packages/` segment
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-resources/src/package/store.rs:26-40` — `PackageStore` is constructed with `global_dir = package_dir`, which already defaults to `<agent_dir>/packages` (`crates/cyrup-config/src/env.rs:191-196`). `packages_root(Global)` then returns `global_dir.join("packages")` and `package_dir(scope, id)` appends the sanitized id, so a cloned package's working tree is `<agent_dir>/packages/packages/<id>`. `registry_path(Global)` does **not** double — it is `global_dir.join("packages.json")` = `<agent_dir>/packages/packages.json`, **verified empirically** by installing a local package under an isolated `CYRUP_AGENT_DIR`. Project scope does not double either (`<cwd>/.cyrup/packages/<id>`), so the two scopes disagree in shape.
+
+**upstream** — no upstream basis; pi has no equivalent two-level join. Filed `cyrup-original`.
+
+**Impact** — the path a user must open to inspect, patch or delete an installed package is not one any document would naturally state, and differs in shape between global and project scope. Cosmetic, but it is the path documentation has to name.
+
+**Fix** — either drop the `.join("packages")` in `packages_root(Global)` or construct `PackageStore` from `agent_dir` rather than `package_dir`. `CYRUP_PACKAGE_DIR` / `PI_PACKAGE_DIR` override `package_dir` directly, so whichever is chosen must keep that override meaningful; either change is a migration for existing installs.
+
+**Verify** — `CYRUP_AGENT_DIR=$(mktemp -d) cyrup install git:github.com/<u>/<r>`, then assert the clone directory and `packages.json` sit at the same level.
+
+## CFG-055 — `cyrup remove` may not match the `PackageId` that `cyrup install` stored
+
+**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** confirmed on the cyrup side; upstream leg not established
+
+**cyrup** — `crates/cyrup/src/subcommands.rs:445-447` builds `PackageId::from(source_str)` from the raw argument, while the install path records the normalized form produced by `PackageSource::parse` → `PackageId` (`crates/cyrup-resources/src/package/source.rs:100-111`, `:180-190`) — `git:<host>/<user>/<repo>` or `path:<canonical-abs-path>`, with every non-`[A-Za-z0-9._-]` character replaced by `-`. `CFG-026` ported `getPackageIdentity` and wired pi's two call sites (`dedupePackages`, `findAutoloadDeltaBase`); the `remove` round trip is not among them, and no test covers it.
+
+**upstream** — pi's remove path @v0.83.0 was **not re-read this pass**. Establish it before writing a fix.
+
+**Impact** — `cyrup remove <source>` can report success, or "not installed", while leaving the registry row in place — for any spelling that normalizes: an `https://` URL, a relative path, a `@ref` suffix, an scp-style `git@host:u/r`. The user's remedy is undiscoverable because `cyrup list` prints the source display, not the id.
+
+**Fix** — route `remove` through the same `PackageSource::parse` → `PackageId` pipeline `install` uses and match on the normalized id, keeping an exact-string fallback for legacy rows.
+
+**Verify** — install by each accepted source spelling, then remove by the same string and by a differing-but-equivalent one; assert the row is gone in the first case and a diagnostic names the mismatch in the second.
+
+## CFG-056 — `defaultThinkingLevel`'s unset-fallback was `off` where pi's is `medium` — **CLOSED 2026-08-14 (FIXED THIS PASS)**
+
+**Kind** parity-bug · **Severity** high · **Effort** S · **Confidence** confirmed
+
+**upstream** — `packages/coding-agent/src/core/defaults.ts:3` @v0.83.0 — `export const DEFAULT_THINKING_LEVEL: ThinkingLevel = "medium";`. It is the ONLY export of defaults.ts. Applied at `core/sdk.ts:230` and `:235` (`settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL`), `core/agent-session.ts:1738` (same expression), and `core/model-resolver.ts:594` (`let thinkingLevel: ThinkingLevel = DEFAULT_THINKING_LEVEL`), `:608`, `:616`, `:642`, `:647`, `:651`. The getter itself, `settings-manager.ts:740-742`, deliberately returns `ThinkingLevel | undefined` so each site names this fallback.
+
+**cyrup (as filed)** — `EffectiveSettings::default_thinking_level()` ended `.unwrap_or_default()` on `ModelThinkingLevel`, whose `#[default]` is `Off` (`crates/cyrup-core/src/message.rs:44-48`). The same wrong constant appeared a second time as `let default_level = ModelThinkingLevel::default();` in `find_initial_model` (`crates/cyrup-config/src/model.rs`), the terminal fallback in all five arms — pi's `DEFAULT_THINKING_LEVEL` at `model-resolver.ts:594/608/616/642/647/651`. Consumed at `crates/cyrup-session-svc/src/builder.rs` (pi's `sdk.ts:223-236` rung, arm for arm), after which `clamp_thinking_level(model, Off)` is still `Off`.
+
+**Impact** — every user who had never written `defaultThinkingLevel` into `settings.json` started every session with reasoning DISABLED where pi starts at `medium`. Silent (no warning; the `/settings` row reports what the getter says), survives session restore, and on reasoning models it changes output quality and cost on the very first turn.
+
+**Fix — LANDED 2026-08-14.** (a) New `crates/cyrup-config/src/defaults.rs`, a one-constant module mirroring pi's one-export `defaults.ts`, exporting `DEFAULT_THINKING_LEVEL = ModelThinkingLevel::Medium` and stating in its doc why `ModelThinkingLevel::default()` is *not* it. (b) `EffectiveSettings::default_thinking_level()` now returns `Option<ModelThinkingLevel>`, matching pi's `ThinkingLevel | undefined` — this closes the `differingShape` half of the same finding, and it is the mechanism that keeps the value correct: the fallback is now spelled in the source at each site instead of hiding inside a `Default` impl. (c) `model.rs`'s `default_level` is `crate::DEFAULT_THINKING_LEVEL`. (d) `builder.rs`'s three sites go through one `settings_default` closure that is literally `…default_thinking_level().unwrap_or(cyrup_config::DEFAULT_THINKING_LEVEL)`. **`ModelThinkingLevel::default()` was deliberately NOT changed** — `Off` is correct as the type's zero and `builder.rs` relies on it for the modelless branch (pi `sdk.ts:238-240`).
+
+**Verify** — `unset_default_thinking_level_is_none_and_falls_back_to_medium` in `crates/cyrup-config/src/settings.rs` asserts the getter returns `None` for `{}`, that the named fallback is `Medium`, and that `DEFAULT_THINKING_LEVEL != ModelThinkingLevel::default()` — all three RED before the change. The two pre-existing `default_thinking_level_*` tests were re-expressed against the `Option`. `cargo check -p cyrup-config -p cyrup-session-svc -p cyrup --all-targets` clean.
+
+## CFG-057 — `httpProxy` was read from the merged view; pi reads it from the GLOBAL layer only — **CLOSED 2026-08-14 (FIXED THIS PASS)**
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**upstream** — `packages/coding-agent/src/main.ts:537` (`applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy)`) and `:801` (`applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy)`) @v0.83.0 — both go through `getGlobalSettings()` (`settings-manager.ts:442-444`), which returns the raw GLOBAL document, NOT `this.settings` (the merged view every other getter reads). Confirmed as intentional by `packages/coding-agent/docs/settings.md:87` — "| `httpProxy` | string | - | HTTP proxy URL applied as `HTTP_PROXY` and `HTTPS_PROXY`. **Global setting only.** |". `git grep -nE 'get(Global|Project)Settings\(\)\s*[.\[]' v0.83.0` returns exactly two production keys read this way: `httpProxy` and `npmCommand` (`package-manager-cli.ts:754`, the self-update path only).
+
+**cyrup (as filed)** — `GLOBAL_ONLY_KEYS` was `&["defaultProjectTrust"]`; `EffectiveSettings::http_proxy` reads `self.merged`, and its one production consumer (`crates/cyrup-session-svc/src/builder.rs`) passes the merged `eff`.
+
+**Impact** — a project `.cyrup/settings.json` containing `{"httpProxy": "http://attacker:8080"}` routed that session's provider traffic through the named proxy, where pi ignores the key entirely. The trust gate limits this to an approved project, but approving a project is not approving an egress rewrite. Note the neighbouring `httpIdleTimeoutMs` IS merged upstream, so this is a per-key upstream decision cyrup had flattened, not a category.
+
+**Fix — LANDED 2026-08-14.** `httpProxy` added to `GLOBAL_ONLY_KEYS` in `crates/cyrup-config/src/settings.rs`, with the two upstream call sites and the docs line quoted in the constant's doc comment so the *reason* survives. `strip_global_only` already ran over both the project and the CLI layer, so no other change was needed.
+
+**Verify** — `http_proxy_is_global_only` in `crates/cyrup-config/src/settings.rs`: a global `http://global:8080` beats a project `http://project:9090` even with `project_trusted = true`, and a project-only value yields `None`. RED before the change (it returned the project value). **`PROV-047` is independent and is NOT closed by this** — it is about which egress PATHS see the proxy, not which SCOPE supplies it.
+
+## CFG-058 — `websocketConnectTimeoutMs` has no 15 s default at the connect site
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**upstream** — `packages/ai/src/api/openai-codex-responses.ts:64` @v0.83.0 — `const DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS = 15_000;`, applied at `:1039` as the parameter default `connectTimeoutMs = DEFAULT_WEBSOCKET_CONNECT_TIMEOUT_MS`. The settings getter returns `undefined` when unset (`settings-manager.ts:842-844`) and `sdk.ts:309-315` threads that `undefined` straight through, so the default lives at the connect site. Documented as the user-visible default in `packages/coding-agent/docs/settings.md:172` — `| websocketConnectTimeoutMs | number | 15000 | ... Set to 0 to disable. |`.
+
+**cyrup** — the settings half is faithful: `EffectiveSettings::websocket_connect_timeout_ms` (`crates/cyrup-config/src/settings.rs`) returns `Ok(None)` when unset and `crates/cyrup-session-svc/src/builder.rs:1510-1512` threads `Some(ms)` onto the builder. The 15 000 ms floor at the other end is absent: `grep -rn --include='*.rs' '15_000' crates/cyrup-provider/` returns nothing, and `StreamOptions.websocket_connect_timeout_ms` (`crates/cyrup-provider/src/stream.rs:214`) is an `Option<u64>` that no connect path defaults.
+
+**Impact** — a user who has not set the key gets an unbounded WebSocket handshake where pi gives up after 15 s and falls back to SSE. **PARTIALLY KNOWN:** `CFG-006` covered this key and closed once `builder.rs:1510` landed; that closure verified the THREADING, not the DEFAULT, so this residual is new — the same "closed one half, named the other" pattern the ledger records.
+
+**Fix** — **FIX SITE: `crates/cyrup-provider`, NOT cyrup-config.** Port the constant next to the WebSocket connect path and apply it where the `Option` is consumed, preserving `0` as "disabled" per the docs line.
+
+**Verify** — a test that constructs `StreamOptions` with `websocket_connect_timeout_ms: None` and asserts the connect deadline is 15 s, plus one asserting `Some(0)` disables it rather than meaning "immediately".
+
+## CFG-059 — A third, persistent `cli` settings layer that pi does not have
+
+**Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-config/src/settings.rs` carries a `cli: Settings` field on `SettingsManager`, taken by `SettingsManager::load(store, cli, project_trusted)`, and `recompute` merges `global ◁ project ◁ cli`, applying `strip_global_only` to BOTH project and cli. Seams at `crates/cyrup-session-svc/src/builder.rs:369/435/538/593` and `crates/cyrup-session-svc/src/factory.rs:30/49/95/154/185`.
+
+**upstream** — pi v0.83.0 has NO CLI settings tier. `git -C pi grep -n 'applyOverrides' v0.83.0 -- 'packages/**/*.ts'` returns exactly two hits: the method definition (`settings-manager.ts:508-510`) and one SDK example (`examples/sdk/10-settings.ts:17`) — zero production callers.
+
+**Impact** — cyrup carries BOTH a faithful `apply_overrides` (correctly documented as transient) AND this persistent third merge layer. It is currently inert — `grep -rn 'cli_settings(' crates/` finds only the builder/factory setters and their own chaining, never a binary call site — so nothing is mis-merged today. But it diverges in the precedence MODEL, not just in an unused setter: it is stripped by `strip_global_only`, it participates in every `recompute()` including after `reload()` / `set_project_trusted()`, and it outranks project settings — three properties pi's transient `applyOverrides` does not have.
+
+**Fix** — either delete it in favour of `apply_overrides`, or keep it and write a `[CYRUP-DELTA]` on the field naming `settings-manager.ts:508-510` as what it replaces and stating the three property differences. Deleting is the smaller change today and the larger one after a binary starts calling it.
+
+**Verify** — if kept: a test pinning that a `cli` value outranks a project value and survives `reload()`. If deleted: assert `SettingsManager::load` no longer takes the layer and that `apply_overrides` is the only override path.
+
+## CFG-060 — `EffectiveSettings::http_proxy`'s env fallback inverts pi's `??=` precedence
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-config/src/settings.rs` — `http_proxy` reads the setting first (`get_str("httpProxy")`) and falls back to `env.http_proxy` second.
+
+**upstream** — pi has no `getHttpProxy()` at all; the interaction between the setting and the ambient env happens in `applyHttpProxySettings` (`core/http-dispatcher.ts:43-46` @v0.83.0), which is `process.env.HTTP_PROXY ??= proxy; process.env.HTTPS_PROXY ??= proxy` — the `??=` means an ambient `HTTP_PROXY` WINS and the setting only fills a gap.
+
+**Impact** — inert today: the only production caller passes an empty `EnvVars::default()` (`crates/cyrup-session-svc/src/builder.rs:1462`), which is why the in-source comment says it "mirrors Pi reading the setting value" — true of that call, not of the accessor. The moment any caller passes real `EnvVars` the precedence flips against upstream. Different axis from `PROV-047`'s recorded `??=`/empty-string corner in `node_http_proxy::get_proxy_env`; that one is in the provider resolver, this one is in the settings accessor.
+
+**Fix** — either invert the `or_else` so env wins, or delete the env leg and let the caller compose — and say which in a `[CYRUP-DELTA]` citing `http-dispatcher.ts:43-46`.
+
+**Verify** — a test passing a non-empty `EnvVars` alongside a set `httpProxy` and asserting the ambient value wins.
+
+**Note — a retired false positive, recorded so nobody re-derives it.** `NO_PROXY`, `HTTP_PROXY`, `FTP_PROXY` etc. never appear as string literals on EITHER side: pi's `getProxyEnv(key)` lowercases and uppercases the key at runtime (`packages/ai/src/utils/node-http-proxy.ts:13-23`, consumed at `:38` and `:103-106`) and cyrup does the same (`crates/cyrup-provider/src/utils/node_http_proxy.rs:50-56`). A literal-grep diff reports `NO_PROXY` as missing in cyrup; it is fully handled. The same trap will fire for any future case-folded lookup.
+
+## CFG-061 — `EffectiveSettings::packages()` discards the whole array on one malformed entry
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-config/src/settings.rs` — `serde_json::from_value::<Vec<PackageSource>>(v.clone()).ok().unwrap_or_default()`.
+
+**upstream** — pi's `getPackages` (`settings-manager.ts:969-971` @v0.83.0) is `[...(this.settings.packages ?? [])]` — a verbatim copy with no parsing, so a malformed entry is carried forward and rejected individually downstream.
+
+**Impact** — cyrup's per-layer `Settings::packages_with_errors` reproduces upstream correctly and is what production actually calls; this `EffectiveSettings` twin has no production caller (`grep -rn '\.packages()' crates/` finds only three assertions inside `settings.rs`'s own tests) and silently returns an EMPTY list — "no packages configured" — when one of ten entries has a typo. Dead but wrong-shaped, which is exactly how a future caller inherits a defect.
+
+**Fix** — delete it, or route it through `packages_with_errors` and surface the errors.
+
+**Verify** — a ten-entry array with one malformed row must yield nine packages and one diagnostic, not zero and silence.
+
+## CFG-062 — Clearing a string/array settings key writes JSON `null`; pi drops the key
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `packages/coding-agent/src/core/settings-manager.ts:883-887` (`setShellPath(path: string | undefined)`), `:914-918` (`setShellCommandPrefix`), `:924-928` (`setNpmCommand`) @v0.83.0 — each assigns `undefined`, and `JSON.stringify` at `:605` OMITS undefined-valued properties, so "clear" means the key is gone from the file.
+
+**cyrup** — the generic `SettingsManager::set` (`crates/cyrup-config/src/settings.rs`) does `serde_json::to_value(value)` then `doc.obj.insert(key, json)`, so `None::<String>` persists as `"shellPath": null`.
+
+**Impact** — reads coincide (`get_str` on null yields `None`), but the merge does not: a `null` in the GLOBAL file is a present value that cyrup's `deep_merge` lets a project layer override, and in the other direction pi's `deepMergeSettings` skips `undefined` overrides at `:139-141` while cyrup has no such skip — so a project `"npmCommand": null` blanks the global value where pi has no way to express that state at all. **LATENT, not live:** no production caller passes `None` to `set` for any of the three keys.
+
+**Fix** — when the serialized value is `Value::Null`, remove the key instead of inserting it. Do this before any clear-path is added, not after.
+
+**Verify** — set then clear `shellPath`; assert the key is ABSENT from the written document, and that a project `null` does not blank a global value.
+
+## CFG-063 — `PI_TUI_DEBUG` and `PI_DEBUG_REDRAW` have no counterpart, so the cursor/viewport bug class has no instrument
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi/packages/tui/src/tui.ts:1577` — `if (process.env.PI_TUI_DEBUG === "1")` dumps firstChanged/viewportTop/cursorRow/height/lineDiff/hardwareCursorRow/renderEnd/finalCursorRow/cursorPos to `/tmp/tui/render-<ts>-<rand>.log` at the end of every synchronized-output frame. `pi/packages/tui/src/tui.ts:1331` — `const debugRedraw = process.env.PI_DEBUG_REDRAW === "1"`; `logRedraw(reason)` appends `fullRender: <reason> (prev=…, new=…, height=…)` to `<logDirectory>/pi-debug.log`.
+
+**cyrup** — neither exists: `grep -rl 'DEBUG_REDRAW\|debug_redraw' crates --include='*.rs'` → 0.
+
+**Impact** — `PI_TUI_DEBUG` records the per-frame decision state and `PI_DEBUG_REDRAW` records WHY a full redraw fired. Together they are the instrument for the cursor/viewport class of TUI bugs — the class the project's own live-render note says `TestBackend` unit tests cannot see. `TUI-040` already files the byte-stream sibling (`PI_TUI_WRITE_LOG`); filing these together is what makes any of the three useful, because a byte stream without the decision state that produced it is not diagnosable.
+
+**Fix** — **FIX SITE: `crates/cyrup-tui` (area 07), alongside `TUI-040`.** Port both under `CYRUP_`-prefixed names, matching the `== "1"` gate and the two output paths.
+
+**Verify** — set each var, drive one frame and one forced full redraw, assert the log files exist and carry the named fields.
+
+## CFG-064 — `isWindowsTerminalSession()` is unported, so Ctrl+Backspace degrades on Windows Terminal — and flips over SSH
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi/packages/tui/src/keys.ts:715-718` — `isWindowsTerminalSession()` = `Boolean(process.env.WT_SESSION) && !process.env.SSH_CONNECTION && !process.env.SSH_CLIENT && !process.env.SSH_TTY` (`SSH_CONNECTION` and `SSH_TTY` both at `:717`).
+
+**cyrup** — `grep -rn 'SSH_TTY\|SSH_CLIENT\|SSH_CONNECTION' crates --include='*.rs'` → 0. cyrup reads `WT_SESSION` for terminal capabilities (`crates/cyrup-tui/src/image.rs:640`) but never for this predicate.
+
+**Impact** — the predicate gates two decisions upstream: raw `0x08` → `ctrl+backspace` vs `backspace` (`keys.ts:1287`) and the modifier expected by `matchesRawBackspace` (`keys.ts:733`). Without it Ctrl+Backspace degrades to plain Backspace on Windows Terminal — and because the predicate is a NEGATION of the three SSH vars, the bug direction flips when you ssh INTO or OUT OF a WT session, which is why all three names are filed rather than one representative.
+
+**Fix** — **FIX SITE: `crates/cyrup-tui` (area 07).** Port the predicate verbatim, including all three SSH negations, and route both `keys.ts` decisions through it.
+
+**Verify** — a key-decode test parameterized over `WT_SESSION` set/unset × each SSH var set/unset, asserting the `0x08` mapping flips exactly where upstream's predicate does.
+
+## CFG-065 — `isWslEnvironment()` and its git-HEAD polling fallback are unported
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi/packages/coding-agent/src/core/footer-data-provider.ts:84` — `isWslEnvironment()` = `process.platform === "linux" && !!(process.env.WSL_DISTRO_NAME || process.env.WSL_INTEROP)`, consumed by `shouldPollGitHead()` at `:91` together with `isWindowsMountedRepoPath` (`/^\/mnt\/[a-z](?:\/|$)/i`).
+
+**cyrup** — no `isWslEnvironment` and no `WSL_*` read anywhere.
+
+**Impact** — pi POLLS git HEAD instead of relying on filesystem watch events specifically when a repo sits on a 9p `/mnt/<drive>` mount under WSL, because inotify does not fire there. Without it the footer's branch indicator goes stale after a checkout for exactly the users the fallback was added for. `WSL_INTEROP` is filed alongside `WSL_DISTRO_NAME` because WSL2 sets it even when `WSL_DISTRO_NAME` is scrubbed. `12-upstream-drift-pi-core.md:1061` records `footer-data-provider.ts` as read first-hand — this predicate was not carried across.
+
+**Fix** — **FIX SITE: `crates/cyrup-tui` (area 07), in the footer data provider.** Port both halves — the env predicate and the `/mnt/<drive>` path test — and switch the branch source to polling when both hold.
+
+**Verify** — with `WSL_DISTRO_NAME` set and a cwd under `/mnt/c`, assert the footer picks the polling path; assert it does not on a native Linux path.
+
+## CFG-066 — The clipboard backend's two load gates (`TERMUX_VERSION`, `DISPLAY`/`WAYLAND_DISPLAY`) are unported
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi/packages/coding-agent/src/utils/clipboard-native.ts:31` — `const clipboard = !process.env.TERMUX_VERSION && hasDisplay ? loadClipboardNative() : null;` and `:16` — `const hasDisplay = process.platform !== "linux" || Boolean(process.env.DISPLAY || process.env.WAYLAND_DISPLAY);`.
+
+**cyrup** — no `TERMUX_*` read anywhere; `grep -rn '"DISPLAY"' crates --include='*.rs'` → 0.
+
+**Impact** — upstream refuses to even LOAD the native clipboard module under Termux (where the prebuilt `.node` cannot load and the require throws at import time) or on headless Linux (CI, ssh without X forwarding, a container). cyrup attempts the backend unconditionally. **Adjacent to but distinct from** the known clipboard-text gap at `12-upstream-drift-pi-core.md:820-828`, which is about READING text; this is about whether the backend is loaded at all. Note `12-upstream-drift-pi-core.md:822` already cites `WAYLAND_DISPLAY` for the v0.84.1 `wl-paste` TEXT-read branch (`clipboard.ts:54`) — a different call site at a different tag; the v0.83.0 `hasDisplay` gate is unfiled.
+
+**Fix** — gate the clipboard backend's construction on the same two predicates before any platform call is attempted.
+
+**Verify** — with `TERMUX_VERSION` set, or on Linux with neither `DISPLAY` nor `WAYLAND_DISPLAY`, assert no clipboard backend is constructed and the caller degrades rather than erroring.
+
+## CFG-067 — Twelve `pi-subagents` env vars have no `CYRUP_` counterpart
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**upstream** (`pi-subagents` v0.10.1 checkout at `/Users/davidmaple/cyrup.ai/pi-subagents`) — each name with the file:line it is declared at:
+
+| var | pi citation | what is lost |
+|---|---|---|
+| `PI_SUBAGENT_TOOL_TIMEOUT_MS` | `src/runs/shared/tool-timeout.ts:1` | per-tool timeout override for children; cyrup ports `CYRUP_SUBAGENT_TOOL_BUDGET` but not the time dimension (`grep -rn 'TOOL_TIMEOUT_MS' crates --include='*.rs'` → 0) |
+| `PI_SUBAGENT_TASK_DELIVERY` | `src/runs/shared/pi-args.ts:76` | selects how the task body reaches the child (argv vs stdin vs file); the delivery mechanism is fixed and unswitchable in cyrup |
+| `PI_SUBAGENT_STEER_CAPABILITY` | `src/runs/shared/pi-args.ts:129` | the capability token authorizing a child to be steered; cyrup has `CYRUP_SUBAGENT_STEER_INBOX` and `..._PARENT_CAPABILITY_TOKEN` but not this |
+| `PI_SUBAGENT_STEER_ACK_DIR` | `src/runs/shared/pi-args.ts:130` | steer acknowledgement directory; without it a steer is fire-and-forget |
+| `PI_SUBAGENT_CAPABILITY_CEILING_V1` | `src/runs/shared/capability-ceiling.ts:5` | versioned ceiling capping what a nested child may inherit |
+| `PI_SUBAGENT_RUN_FANOUT_BUDGET` | `src/runs/shared/run-fanout-budget.ts:12` | per-run fanout budget; cyrup has the `CYRUP_SUBAGENT_FANOUT_CHILD` marker but no cap |
+| `PI_SUBAGENT_MAX_SPAWNS_PER_RUN` | `src/shared/types.ts:2184`, `src/extension/doctor.ts:192` (`normalizeMaxSubagentSpawnsPerRun(process.env.PI_SUBAGENT_MAX_SPAWNS_PER_RUN)`) | cyrup ports only the PER_SESSION sibling; the per-RUN cap is the tighter one and the one `doctor` reports on |
+| `PI_SUBAGENT_TOOL_BUDGET_ZERO_AUTH` | `src/runs/shared/tool-budget.ts:5` | the escape hatch authorizing a zero tool budget; the `budget == 0` case has no gate |
+| `PI_SUBAGENT_ASYNC_EVENTS_MAX_BYTES` | `src/runs/background/subagent-runner.ts:281` | cap on the async event stream → no backpressure limit on the NDJSON sink |
+| `PI_SUBAGENT_RUNTIME_ACKNOWLEDGED_EXTENSIONS` | `src/runs/shared/runtime-acknowledged-extensions.ts:6` | the acknowledged-extension list passed down at spawn |
+| `PI_SUBAGENTS_LLM_INTENT_ARBITER` | `src/runs/shared/llm-intent-arbiter.ts:229` — `if (process.env.PI_SUBAGENTS_LLM_INTENT_ARBITER === "0") return undefined;` (doc at `:20`: "Enabled by default; set …=0 to disable") | the operator kill switch for the LLM intent arbiter |
+| `PI_SUBAGENTS_PI_CODING_AGENT_PACKAGE_ROOT` | `src/shared/utils.ts:19` | package-root override used to locate the agent package from a child |
+
+**Impact** — four of the twelve are ceilings or budgets (`CAPABILITY_CEILING_V1`, `RUN_FANOUT_BUDGET`, `MAX_SPAWNS_PER_RUN`, `TOOL_BUDGET_ZERO_AUTH`), so their absence is a missing bound rather than a missing convenience, and one is a security-adjacent off switch. Per the port-mechanism-fidelity rule these are knobs to port literally, not to choose. `09-cyrup-ext-subagents.md` mentions `ASYNC_EVENTS_MAX_BYTES` and the acknowledged-extensions concept in prose, but **no item owns any of the twelve env vars**.
+
+**Fix** — **FIX SITE: `crates/cyrup-ext-subagents` (area 09).** This row exists so the enumeration survives until area 09 files per-var items; close it by reference when it does, do not delete it.
+
+**Verify** — per var: set it, assert the ported behaviour changes, and assert `doctor` reports the two that upstream's doctor reports.
+
+## CFG-068 — `CYRUP_HOME` is invented, live in shipped builds, and outranks `$HOME` at four sites
+
+**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-ext-subagents/src/extension.rs:5168` (`dirs_home`), `native_supervisor.rs:1784` (`agent_dir_from`), `background/mod.rs:1408` (`temp_root_dir_from`) and `:2580`.
+
+**upstream** — there is no `PI_HOME` or equivalent anywhere in pi @v0.83.0 or in the three sibling repos (`git -C pi grep -n 'PI_HOME' v0.83.0 -- packages/` → 0).
+
+**Impact** — it takes PRECEDENCE over `$HOME` at all four sites, so setting it relocates the agent dir, the tilde expansion used by `expand_tilde`, and the subagent temp root simultaneously. Its comments describe it as a test sandbox knob, but **none of the four sites is behind `#[cfg(test)]`** — it is live in shipped builds and absent from `cyrup --help`, i.e. supported by accident. Two concrete risks: an operator who sets it for one purpose silently moves three unrelated trees, and its precedence against `CYRUP_AGENT_DIR` is undefined anywhere.
+
+**Fix** — an owner decision, taken deliberately either way: **promote it** (document it, define its precedence against `CYRUP_AGENT_DIR`, list it in `--help`) or **confine it** (`#[cfg(test)]` / a test-only lookup seam).
+
+**Verify** — whichever is chosen, a test asserting the precedence against both `$HOME` and `CYRUP_AGENT_DIR`, plus a `--help` assertion if promoted.
+
+## CFG-069 — `AI_AGENT` is written into every bash and subagent child, and the KEY is a v0.84.1 forward-port
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tools/src/tools/bash.rs:167` (`env.push(("AI_AGENT".to_string(), "cyrup".to_string()))`), `crates/cyrup-session-svc/src/bash.rs:151`, `crates/cyrup-ext-subagents/src/exec/mod.rs:1885`.
+
+**upstream** — `git -C pi grep -n 'AI_AGENT' v0.83.0 -- packages/` returns NOTHING. The var does not exist at the ported tag; `cli.ts:13` @v0.83.0 is a one-line statement setting only `PI_CODING_AGENT`. The three cyrup sites cite `cli.ts:14 @v0.84.1`, which is honest — and which means cyrup writes an env var into every bash and subagent child that the ported baseline never wrote.
+
+**Impact** — the `[CYRUP-DELTA]` annotations at those sites cover the VALUE (`"cyrup"` vs `"pi"`); they do not flag that the KEY itself is a forward-port. This is the same class as the `working-start`/`working-stop` precedent — a real upstream citation attached to a tag the port is not at — and it is exactly how a v0.84.1 uplift later reads as already-done.
+
+**Fix** — either pin it to a v0.84.1 uplift item, or record it as a deliberate forward-port with the TAG stated in the delta line itself rather than only in surrounding prose. Do not remove it silently.
+
+**Verify** — assert the delta line at each of the three sites names `@v0.84.1` and the key, not only the value.
+
+## CFG-070 — Three credential-resolver env names cyrup must read because it does not inherit an SDK
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-provider/src/api/bedrock_converse_stream.rs:1006` (`AWS_CONFIG_FILE`, with the doc line at `:996-997`: "Honors AWS_SHARED_CREDENTIALS_FILE and AWS_CONFIG_FILE, exactly as the SDK does"), `:1002` (`AWS_SHARED_CREDENTIALS_FILE`), and `crates/cyrup-provider/src/auth/google_adc.rs:223` (`APPDATA`, the Windows ADC well-known path branch in `resolve_source`).
+
+**upstream** — all three are absent from pi's source by NAME. pi delegates Bedrock profile resolution to `@aws-sdk`'s `fromNodeProviderChain`, which reads the AWS pair itself, and `env-api-keys.ts:61` hardcodes only the POSIX ADC well-known path (`_homedir()/.config/gcloud/application_default_credentials.json`), letting `google-auth-library` handle Windows.
+
+**Impact** — **not a divergence in observable behaviour, and the reads are correct as written.** The `APPDATA` branch makes cyrup MORE correct on Windows than the literal pi source. Filed because a name-level parity diff flags all three, and because a later fidelity pass comparing `resolve_source` against `env-api-keys.ts:54-63` will otherwise read the `%APPDATA%\gcloud\…` branch as an unexplained extra. **Do NOT "fix" this by removing the reads.**
+
+**Fix** — none. If anything, extend the existing in-file boundary comment (which already states that role assumption / SSO / IMDS are deliberately not ported) to say that the SDK-inherited env names are reimplemented on purpose.
+
+**Verify** — n/a; this row is a record, not work.
+
+## CFG-071 — `XDG_CACHE_HOME` is a false name-match: both directions, one name
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-ext/src/build/cache.rs:84` reads it to site the WASM extension build cache.
+
+**upstream** — `pi/packages/coding-agent/src/extensions/llama/huggingface.ts:53` reads it to locate `$XDG_CACHE_HOME/huggingface/token`.
+
+**Impact** — the NAME exists on both sides for unrelated purposes, so a name-only diff scores it as parity while cyrup simultaneously (a) has a cyrup-original use of it and (b) is missing pi's use of it. pi's use belongs to the llama.cpp gap already owned by `EXT-027` (`06-cyrup-ext.md:601`) with `DRIFT-032` (`12-upstream-drift-pi-core.md:712`) as tracker; the cyrup-original use is filed here.
+
+**Fix** — none required for the cyrup side; record the double meaning so neither direction is closed by the other. Note the adjacent grep trap `DRIFT-032` already warns about at `12-…:725`: `HF_TOKEN` appears as a literal in cyrup, but only as a provider-catalog name, never as a token-file search path.
+
+**Verify** — n/a; this row is a record. It closes only when `EXT-027` closes AND the build-cache read is documented as unrelated.
+
+## CFG-072 — `HOMEDRIVE` / `HOMEPATH` widen home resolution past upstream
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tools/src/path.rs:105` reads both as a further fallback.
+
+**upstream** — neither appears anywhere in pi @v0.83.0 (`git -C pi grep -c HOMEDRIVE v0.83.0 -- packages/` → 0). pi uses `process.env.HOME || homedir()` and, on the footer path, `USERPROFILE`.
+
+**Impact** — harmless widening, but it means cyrup resolves a home on Windows configurations where pi resolves none — a behavioural difference in the direction nobody looks, and the kind that makes a "same input, different output" report unreproducible upstream.
+
+**Fix** — keep it and add a `[CYRUP-DELTA]` naming pi's `HOME || homedir()` as what it extends, or drop the pair for strict parity. Keeping it is the better call; stating it is the point.
+
+**Verify** — a path-resolution test with `HOME`/`USERPROFILE` unset and `HOMEDRIVE`+`HOMEPATH` set, asserting the documented outcome.
+
+## CFG-073 — `NO_COLOR` and `CI` are read where pi reads neither
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-ext-subagents/src/watchdog/lsp_diagnostics.rs:903` (`NO_COLOR`, honoured when spawning LSP diagnostics) and `crates/cyrup-ext-subagents/src/exec/acceptance.rs:2702` (`CI`).
+
+**upstream** — neither is read in pi @v0.83.0 product code; pi's only CI-ish read is `GITHUB_ACTIONS` in `packages/agent/vitest.config.ts`, a build config that does not ship.
+
+**Impact** — both are defensible conventions, and `NO_COLOR` especially so. `CI` is the one worth naming: behaviour that changes under CI and not locally is precisely the divergence class that hides, because the environment where it differs is the environment nobody attaches a debugger to.
+
+**Fix** — **FIX SITE: `crates/cyrup-ext-subagents` (area 09).** Add a `[CYRUP-DELTA]` at each site stating that upstream reads neither and what the read changes.
+
+**Verify** — assert the acceptance path's behaviour under `CI=1` is stated in the delta line and covered by one test.
+
+## CFG-074 — Nine invented env vars across the three sibling ports
+
+**Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup**, each with the upstream fact that makes it an invention:
+
+| var | cyrup citation | upstream |
+|---|---|---|
+| `CYRUP_PERMISSION_SYSTEM` | `crates/cyrup-permission-system/src/extension.rs:183` — `pub const INSTALL_ENV_VAR` ("the explicit opt-in flag (DI-5)") | `pi-permission-system` reads exactly two env vars — `PI_PERMISSION_SYSTEM_CONFIG_PATH` (`src/permission-manager.ts`) and `PI_PERMISSION_SYSTEM_LOGS_DIR`. There is no install/opt-in flag; the extension installs on the presence of a policy file. |
+| `CYRUP_PERMISSION_SYSTEM_FORWARDING_AGENT_DIR` | `crates/cyrup-permission-system/src/forwarding.rs:89` | `pi-permission-system/src/permission-forwarding.ts:6-8` declares only numeric constants (`POLL_INTERVAL_MS`, `WATCH_DEBOUNCE_MS`, `TIMEOUT_MS`) — all compile-time, none env-overridable. |
+| `CYRUP_PERMISSION_FORWARDING_TIMEOUT_MS` | `crates/cyrup-permission-system/src/forwarding.rs:63` — `CHILD_WAIT_TIMEOUT_ENV` | upstream's `PERMISSION_FORWARDING_TIMEOUT_MS = 10 * 60 * 1000` (`src/permission-forwarding.ts:8`) is a fixed constant. |
+| `CYRUP_INTERCOM_TRANSPORT` | `crates/cyrup-intercom/src/transport/target.rs:36` | `pi-intercom` has no transport-selection var; its full set is `PI_BIN`, `PI_INTERCOM_PI_BIN`, `PI_INTERCOM_ASK_TIMEOUT_MS`, `PI_INTERCOM_LIVENESS_INTERVAL_MS`, `PI_INTERCOM_LIVENESS_TIMEOUT_MS`, `PI_INTERCOM_NAME_POLL_MS`, `PI_INTERCOM_SESSION_ID`, `PI_INTERCOM_STABLE_ID`, plus the `PI_SUBAGENT_*` it reads and `HERDR_BIN`. |
+| `CYRUP_INTERCOM_TCP` | `crates/cyrup-intercom/src/transport/target.rs:39` | same — the TCP variant selector has no counterpart. |
+| `CYRUP_INTERCOM_BROKER_BINARY` | `crates/cyrup-intercom/src/transport/spawn.rs:42`, overriding the `current_exe()` re-exec at `:140` | the closest analogue is `PI_INTERCOM_PI_BIN` / `PI_BIN` (`pi-intercom/project-agent.ts:245`), but those name the PI binary to launch in a Herdr pane, not the broker to spawn — a different object. |
+| `CYRUP_SUBAGENT_AGENT_NAME` | `crates/cyrup-ext-subagents/src/exec/mod.rs:1319` — `AGENT_NAME_ENV_VAR`, set by the spawn overlay in `build_attempt_spawn_plan` | no `PI_SUBAGENT_AGENT_NAME` in `pi-subagents` (checked against the 48-name literal set extracted from `pi-subagents/src`). |
+| `CYRUP_HOOK_WARMUP` | `crates/cyrup-ext-subagents/src/spawn/worktree.rs:1312` — `HOOK_WARMUP_ENV` | no counterpart in `pi-subagents`' `worktree.ts`. |
+| `CYRUP_SUBAGENTS_TEMP_ROOT` | `crates/cyrup-ext-subagents/src/background/mod.rs`, alongside `temp_root_dir_from` at `:1408` | no `PI_SUBAGENTS_TEMP_ROOT` upstream. Pairs with the documented `[CYRUP-DELTA]` at `background/mod.rs:1418-1423`, where cyrup interposes a cwd key that pi's flat `ASYNC_DIR`/`RESULTS_DIR` do not have — so the root that key hangs off is itself an invention, and the delta comment covers the layout but not the var. |
+
+**Impact** — each is individually defensible; several follow structurally from the port mechanism (a re-exec'd Rust broker instead of a Node module has to be able to name the broker). The problem is that none of them is KNOWN: an extension, hook or operator written against pi's contract sees names in the child environment that upstream children never carry, and `CYRUP_PERMISSION_SYSTEM` in particular is an invented control over whether a SECURITY gate is installed — the one category worth naming explicitly. **Note for the record:** `PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR`, which cyrup carries as a legacy alias, is NOT fabricated — it is real at `pi-permission-system/src/permission-manager.ts:29` (bracket-form access, which a `process.env.X` dot-grep misses).
+
+**Fix** — one `[CYRUP-DELTA]` per var naming the upstream file:line it replaces or the mechanism that forced it, and a decision on `CYRUP_PERMISSION_SYSTEM` specifically: does presence of a policy file install the gate (upstream's rule), with the flag as an override, or is the flag load-bearing? **FIX SITES: areas 09, 10 and 11.**
+
+**Verify** — a test per crate asserting the documented install/transport precedence, and a doc assertion that each const carries a delta line.
+
+## CFG-075 — `CYRUP_EXT_ABI_FINGERPRINT` is the surface's only build-time env dependency
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-ext/src/build/mod.rs:21` — `pub const ABI_FINGERPRINT: &str = env!("CYRUP_EXT_ABI_FINGERPRINT");`.
+
+**upstream** — none possible: pi has no WASM component ABI to fingerprint.
+
+**Impact** — it is a compile-time `env!`, not a runtime `env::var`, so a missing value is a **compile error**, not a runtime fallback. That is worth knowing before anyone reorganizes the build scripts, and it is why this one is filed separately from `CFG-074` rather than folded into it.
+
+**Fix** — **FIX SITE: `crates/cyrup-ext` (area 06).** No behavioural work implied; ensure the build script that supplies it is documented next to the `env!` so the dependency is discoverable from the consumer.
+
+**Verify** — n/a beyond a build-script comment; the compiler already enforces it.
+
+## CFG-076 — Three `PI_`→`CYRUP_` rename exceptions, one of them a live inconsistency inside cyrup
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi-subagents/src/runs/shared/pi-spawn.ts:6` — `export const PI_SUBAGENT_PI_BINARY_ENV = "PI_SUBAGENT_PI_BINARY"`; and `pi/packages/coding-agent/src/config.ts:515-521` (`getAgentDir()`) with `main.ts:625-628` (the session-dir env tier).
+
+**cyrup** — three departures from the mechanical `PI_` → `CYRUP_` substitution that the whole env diff relies on:
+
+1. **`PI_SUBAGENT_PI_BINARY` → `CYRUP_SUBAGENT_BINARY`.** The upstream name carries TWO `PI` tokens (the prefix and the `PI_BINARY` noun) and cyrup collapses them, giving `CYRUP_SUBAGENT_BINARY` rather than `CYRUP_SUBAGENT_CYRUP_BINARY`. Sensible; recorded because the mechanical diff scores it as a MISSING upstream var and anyone re-running the enumeration hits the same false positive. Sites: `crates/cyrup-ext-subagents/src/registration/doctor.rs:311`, `:338`, `background/runner_main.rs:3793`.
+2. **`PI_CODING_AGENT_DIR` / `PI_CODING_AGENT_SESSION_DIR` → `CYRUP_AGENT_DIR` / `CYRUP_SESSION_DIR`.** cyrup shortens the noun as well as swapping the prefix. Both original spellings are retained as lower-precedence fallbacks (`crates/cyrup-config/src/env.rs:81-82`, `first(&["CYRUP_AGENT_DIR", "PI_CODING_AGENT_DIR"])`), so nothing breaks for a migrating user. Worth stating because the surrounding twelve aliases in that file DO preserve the noun exactly (`CYRUP_CACHE_RETENTION` ← `PI_CACHE_RETENTION`, `CYRUP_CLEAR_ON_SHRINK` ← `PI_CLEAR_ON_SHRINK`, …), making these two the odd pair.
+3. **The real defect: `CYRUP_CODING_AGENT_DIR` also exists**, at `crates/cyrup-ext-subagents/src/native_supervisor.rs:1772`. The long form is live in one crate and the short form in another, so the same concept has two `CYRUP_` names — an inconsistency internal to cyrup, independent of pi.
+
+**Impact** — items 1 and 2 cost nothing but re-derivation; item 3 means an operator who sets `CYRUP_AGENT_DIR` does not necessarily move the subagent supervisor's notion of the agent dir, and neither name is documented in `--help`.
+
+**Fix** — route `native_supervisor.rs:1772` through the same `first(&[…])` alias list `cyrup-config` uses, so one name wins everywhere and the `PI_` fallbacks stay honoured. Leave items 1 and 2 alone; this row is their record.
+
+**Verify** — a test asserting `CYRUP_AGENT_DIR` is honoured by the subagent supervisor, and that the `PI_CODING_AGENT_DIR` fallback still resolves when the short form is unset.
 
 ## Coverage
 

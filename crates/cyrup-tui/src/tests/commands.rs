@@ -82,6 +82,39 @@ fn theme_think_show_images_route_to_the_agent_like_pi() {
 }
 
 #[test]
+fn only_pis_six_argument_commands_accept_trailing_text() {
+    // TUI-074. `setupEditorSubmitHandler` guards exactly six names with
+    // `text === "/x" || text.startsWith("/x ")` — model (`:2676`), export (`:2682`), import
+    // (`:2687`), name (`:2702`), login (`:2742`), compact (`:2758`) @v0.83.0. The other nineteen
+    // are strict equality, so trailing text makes the line a PROMPT upstream. cyrup's matcher was
+    // uniform, so `/quit now` quit, `/copy that` copied and `/new session` started a new session.
+    let reg = CommandRegistry::new();
+    for line in ["/quit now", "/copy that", "/new session", "/trust me", "/tree left", "/debug on"] {
+        assert_eq!(
+            reg.dispatch(line),
+            Dispatch::Prompt(line.to_string()),
+            "{line} must reach the agent verbatim, as it does upstream"
+        );
+    }
+    // The six that DO take an argument are unchanged, bare and with one.
+    for (line, name, arg) in [
+        ("/model claude-opus", "model", Some("claude-opus")),
+        ("/export out.html", "export", Some("out.html")),
+        ("/import s.jsonl", "import", Some("s.jsonl")),
+        ("/name my session", "name", Some("my session")),
+        ("/login anthropic", "login", Some("anthropic")),
+        ("/compact keep the diff", "compact", Some("keep the diff")),
+        ("/compact", "compact", None),
+    ] {
+        assert_eq!(
+            reg.dispatch(line),
+            Dispatch::Command { name: name.to_string(), arg: arg.map(str::to_string) },
+            "{line}"
+        );
+    }
+}
+
+#[test]
 fn hidden_commands_dispatch_but_are_not_in_autocomplete() {
     let reg = CommandRegistry::new();
     assert_eq!(

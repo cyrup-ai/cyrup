@@ -149,6 +149,16 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 
 > **RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set: 0 critical, 0 high, 2 medium, 3 low = 5, unchanged in total but NOT in composition.** The table now carries **31 rows: 26 fully closed, 5 open (2 of them partially closed, including the reopened `TOOL-042`)**. Sweep 8: **`TOOL-024` closes as already-done** (all 13 `Tool` methods delegated at HEAD; its stated evidence was itself wrong — see the row); **`TOOL-042` is REOPENED as PARTIALLY CLOSED (medium)** after 286 measured runs refuted the mechanism its closure rested on; and **`TOOL-M01` is filed and closed in the same pass** (the `FsOps` decorator audit's one real residual). `TOOL-022`/`TOOL-015`'s fix site is corrected below — it was incomplete in a way that would have produced a no-op fix. *(Previous edition: 0 / 0 / 1 / 4 = 5, 26 closed.)*
 
+> **RECOUNTED 2026-08-14 (sweep 9, fourth edition) — counted set: 0 critical, 0 high, 2 medium, 6 low = 8.** The table now carries **34 rows: 26 fully closed, 8 open (3 of them partially closed)**. *(Previous edition: 0 / 0 / 2 / 3 = 5, 26 closed, 31 rows.)* Three ids filed — **`TOOL-043`, `TOOL-044`, `TOOL-045`** — from a mechanical enumeration of the built-in tool surface (names, parameter schemas, result shapes) on both sides.
+>
+> **The result on this surface is mostly a clean bill, and that is worth recording as strongly as the three findings.** 7/7 tools walked in both directions with nothing sampled: **zero** `missingInCyrup` findings, names and order identical, all 7 descriptions / `promptSnippet`s / schemas byte-matching, all 6 `details` structs matching field-for-field, result envelopes matching. Details are in the section preamble under `## Findings filed 2026-08-14`.
+>
+> **A fourth finding from the same sweep was fixed inline and committed before this filing and is deliberately NOT re-filed here** — `additionalProperties: false` on `edit`'s parameter schema, which no pi built-in emits at all. It matters as precedent rather than as a bug: the in-source comment asserted `edit` "is the ONLY tool whose source passes `{ additionalProperties: false }`" and the test file's own `PI_EDIT` constant was documented as "the EXACT output ... ground truth, not a paraphrase" — **both false, so the test suite was certifying the divergence.** A ground-truth constant that was never mechanically re-derived is indistinguishable from an assertion of the current behaviour.
+>
+> **`TOOL-044`'s residual needs a DECISION, not an agent.** Two of its three limbs landed; the third (pi duplicates the whole truncated output into `details.truncation.content`) is a size-vs-literal-fidelity tradeoff with no reachable consumer on either side. Route it to whoever can say "port it" or "tag it `[CYRUP-DELTA]`" — scheduling it as work will produce another pass that re-derives the same tradeoff.
+>
+> **The partitioning note above needs one amendment.** All three new rows have fix sites INSIDE `crates/cyrup-tools/**` (`tools/bash.rs`, `truncate.rs`, all seven `tools/*.rs`), so "area 04 is finished as a crate" is no longer true. It was true of the rows that existed when it was written; it was never a property of the crate.
+
 > **⚠ PARTITIONING NOTE — 2026-08-14 (sweep 6). AREA 04 IS FINISHED AS A CRATE: after sweep 6 re-verified every remaining row at HEAD, NOT ONE open row has a fix site inside `crates/cyrup-tools/**`.** `TOOL-015` and `TOOL-022` need a **consumer** in `crates/cyrup-tui` (plus `cyrup-core`); `TOOL-017` needs `crates/cyrup-tui` **and a product decision** (cyrup has no decided shipped-docs root for `getPiDocsClassification` to resolve against — the blocker is recorded in-source at `cyrup-tui/src/transcript.rs:2305`); `TOOL-024`'s two fix sites are both `crates/cyrup-ext/src/wrapper.rs`; `TOOL-031`'s residual is `crates/cyrup-ext-subagents/**`. Every row below now names its fix site. **Do not schedule a "finish area 04" assignment against `crates/cyrup-tools`** — sweep 6 was the second sweep to be routed at a `cyrup-ext` defect from this table, and it produced an agent with no reachable work in its own crate. Route these rows by FIX SITE, not by area number.
 
 > **AMENDED 2026-08-14 (sweep 8): the "not one open row has a fix site inside `crates/cyrup-tools/**`" claim now has exactly one exception — `TOOL-042`, reopened.** Its residual is a harness-level question about `cargo nextest`'s 500 ms leak tripwire and, secondarily, `crates/cyrup-tools`' own `exec`/`exec_argv` fixtures (`ops/local.rs:1135`, `:1568`, `:1812`). Everything else in the partitioning note stands.
@@ -186,6 +196,9 @@ Fourteen items closed, four partially closed, nothing overturned, no previously-
 | ~~TOOL-040~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `find_bash_on_path` runs `which bash` with no timeout; pi bounds it at 5s — **CLOSED 2026-08-14**: sweep 1 — `BASH_PROBE_TIMEOUT = 5s` (citing shell.ts:47) with a deadline-polled `try_wait()` loop that kills, reaps and returns `None` on expiry — pi's `sh -c` fall-through. |
 | ~~TOOL-041~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `write`/`edit` never re-check cancellation after the write lands — **CLOSED 2026-08-14**: sweep 1. |
 | TOOL-042 | medium — **REOPENED 2026-08-14; PARTIALLY CLOSED** | test-defect | M | An intermittent `LEAK` fails the `cyrup-tools` suite; the source-scan pin closed one real class but **not** the failure — **REOPENED 2026-08-14 (sweep 8), superseding sweep 6's "filed and closed … pinned so it cannot return".** Refuted by measurement, not by reading: **3 LEAK-FAILs in 286 scrubbed runs (~1.0%, down from the historical ~4 in 33 ≈ 12%), on three DIFFERENT tests**, one of them on an idle box. `fail-fast` CANCELS the run (`243 tests run: 242 passed, 1 failed`), so it is a hard gate red. **The stated mechanism is refuted for the instrumented occurrence**: it named `ops::bash_operations_tests::local_bash_operations_forwards_command_cwd_and_env_onto_the_proc_seam`, which drives `RecordingProc` — an in-memory double (`ops/mod.rs:605`) — and whose only possible child (`which bash`, `ops/shell.rs:78-84`) names all three stdio handles and is reaped in-loop, so **no candidate holder of that test process's fd 1/2 exists in its subtree**, and the wait ran the full 500 ms. Corroborating: 69 distinct orphan pipe addresses vs 244 sampled `cargo-nextest` pipe addresses — **zero intersection**. **KEEP the source-scan pin: it closed a real class.** RESIDUAL: a harness-level question. See the body. |
+| TOOL-043 | low | cyrup-original | S | `bash`'s `promptGuidelines` string diverges from the ported tag TWICE — a v0.84.0 rewording cyrup is ahead of, and a deliberate `PI_*` → `CYRUP_*` rename — and neither carries a `[CYRUP-DELTA]` tag. Model-facing: this lands in the system prompt's Guidelines section. **FILED 2026-08-14** (sweep 9, mechanical built-in-tool surface enumeration) |
+| TOOL-044 | low — **PARTIALLY CLOSED 2026-08-14** | parity-bug | S | The serialized `details.truncation` payload diverges from pi's `TruncationResult` on three fields — **FILED AND PARTIALLY CLOSED 2026-08-14** (sweep 9): `truncatedBy` now serializes as an explicit `null` instead of vanishing, and the byte-only `maxLines` sentinel is pi's `Number.MAX_SAFE_INTEGER` instead of `usize::MAX`. **RESIDUAL: pi's `content` field**, deliberately not ported — see the body. |
+| TOOL-045 | low | not-ported | S | No built-in overrides `Tool::label`, so all seven return the trait default `None` where pi sets an explicit `label` on every built-in `ToolDefinition`. Behaviourally equivalent today ONLY because pi's seven values are identical to the names. **FILED 2026-08-14** (sweep 9) |
 
 ## TOOL-039 — `CYRUP_SHELL` silently redirects every `bash` tool call to an arbitrary interpreter; pi has no shell env var
 
@@ -810,6 +823,98 @@ stacked composition.
 **REFUTED sub-claim** — the original report's premise that "the named victim is ARBITRARY and changes every run" is false as stated: nextest runs each test in its own process, so a leaked child holds the pipe of the test that spawned it and the victim can only be that test. The intermittency is explained by `path_probe_is_bounded`'s `Err(_)` arm firing only sometimes (the normal path kills and reaps inside 200 ms), or by the observation having been taken from a `--workspace` run where a different crate leaked.
 
 **CAVEAT — this closure is a static argument plus two pins, NOT an observation.** Sweep 6 was forbidden `cargo nextest`, so the `LEAK` was never re-run. Confirming it needs ~35 runs of `cargo nextest run -p cyrup-tools` with the LEAK count reported. If a LEAK still appears the fd-inheritance theory is wrong and the next instrument is `lsof -p <pid>` on any surviving `sleep`/`bash` — **not** `pgrep -f <pattern>`, which matches its own pattern in other shells' command lines and already fabricated a "22 orphaned brokers" measurement once (`REPRO-LOG.md`, the orphaned-broker entry).
+
+
+## Findings filed 2026-08-14 (sweep 9 — the mechanical built-in-tool surface enumeration)
+
+Filed by the surface sweep that enumerated **built-in tool names, parameter JSON schemas and result
+shapes** on both sides by command rather than by eye — pi `packages/coding-agent/src/core/tools/*.ts`
+@`v0.83.0` vs `crates/cyrup-tools/src/tools/`.
+
+> **This surface came back 7/7 CLEAN on almost everything, and that is the useful headline.** Names
+> identical and in identical order on both sides (`read`, `bash`, `edit`, `write`, `grep`, `find`,
+> `ls`; pi `index.ts:156-166` vs cyrup `registry.rs:20,62-78`, with `createCodingTools` /
+> `createReadOnlyTools` reproducing by filtering that order). **Zero** `missingInCyrup` findings. All
+> 7 descriptions, all 7 `promptSnippet`s and all 3 non-empty `promptGuidelines` sets byte-match
+> except `bash`'s guideline (`TOOL-043`). All 7 schemas byte-match the evaluated TypeBox output.
+> Every Rust input struct's field types match its advertised schema type (all numerics are `f64`
+> against TypeBox `Type.Number`, so `limit: -1` / `offset: 10.0` deserialize as pi accepts them).
+> Result envelopes match (`ToolResult` == `AgentToolResult`: content, details, usage,
+> addedToolNames, terminate). All 6 `details` structs match pi's interfaces field-for-field in name
+> and optionality; `write` correctly has none. Result-content strings match verbatim, including the
+> edit-diff error family (pi `edit-diff.ts:260,264,271,275,281,283,351` vs cyrup
+> `edit_diff.rs:462,464,470,472,478,480,546`). **`ToolName` is closed at the same seven on both
+> sides** (pi `index.ts:79`), so the ten `impl Tool for` sites outside `cyrup-tools` are a different
+> surface with a different ported tag (`pi-subagents`, `pi-intercom`) and are not gaps here.
+>
+> **One finding from this sweep is already fixed and committed and is deliberately NOT re-filed** —
+> `additionalProperties: false` on `edit`'s schema, which pi does not emit, and which the test
+> suite's own `PI_EDIT` "ground truth" constant carried too, so the suite was certifying the
+> divergence. It was closed inline at all four sites plus the two stale comments that repeated the
+> claim.
+
+## TOOL-043 — `bash`'s `promptGuidelines` diverges from the ported tag twice, and neither delta carries a `[CYRUP-DELTA]` tag
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — `packages/coding-agent/src/core/tools/bash.ts:328-331` @`v0.83.0` (snippet `:328`, guideline `:330`). The guideline is the bare imperative `"Inspect PI_* environment variables for current model and session details."`
+
+**cyrup** — `crates/cyrup-tools/src/tools/bash.rs:120-122` emits `"You can inspect CYRUP_* environment variables for current model and session details."`
+
+**Impact** — **Two independent deltas in one string, and the string is model-facing** — it lands in the system prompt's Guidelines section, so it is part of the prompt every bash-capable session ships.
+
+* **(a) `"You can "` is a v0.84.0 upstream rewording** — cyrup is *ahead* of the ported tag here, not behind. It is documented as such at `bash.rs:104-110`, and the reasoning is sound (v0.84.0 softened an instruction into a statement of availability and hoisted the pair into an exported const; only the wording is model-facing).
+* **(b) `PI_*` → `CYRUP_*` is a deliberate rename**, justified in-tree at `bash.rs:117-126`: cyrup's `resolveSpawnContext` port injects `CYRUP_SESSION_ID` / `CYRUP_SESSION_FILE` / `CYRUP_PROVIDER` / `CYRUP_MODEL` / `CYRUP_REASONING_LEVEL` and `config::session_env_scrub_keys` unconditionally deletes the five `PI_*` names from the child, so naming `PI_*` would point the model at variables cyrup guarantees are absent. That reasoning is correct and the rename should stand.
+
+**This item is not asking for either to be reverted.** It exists because **the sweep rules admit no accepted-divergence category**: the rationale is present and cites pi's file:line, but neither delta carries a `[CYRUP-DELTA]` tag, which is the mechanism the project uses to *find* accepted divergences. A future parity sweep diffing prompt strings will re-derive this analysis from scratch, exactly as this one did. The gating (`exposeSessionEnvironment`, default true) and the `promptSnippet` are byte-identical, so nothing else on this tool is in question.
+
+**Fix** — Add two `[CYRUP-DELTA]` tags at `bash.rs:104-126`: one marked *version-lag, ahead* naming v0.84.0 for the wording, one marked *deliberate, value only* naming the `PI_*`→`CYRUP_*` rename and the scrub list that forces it. This is the same treatment `TOOL-038` gave `ShellConfig::detect()`'s degradation and `TOOL-031` gave `AI_AGENT`'s value.
+
+**Verify** — `grep -rn '\[CYRUP-DELTA' crates/cyrup-tools/src/tools/bash.rs` finds both; and a test pinning the exact guideline string, so the next edit to it is a deliberate one. (A string-equality test here is not busywork: this string is prompt content, and prompt content that drifts silently is the failure `pi_schema.rs` exists to prevent for schemas.)
+
+## TOOL-044 — The serialized `details.truncation` payload diverges from pi's `TruncationResult` on three fields — **FILED AND PARTIALLY CLOSED 2026-08-14**
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed and partially closed** 2026-08-14 (sweep 9)
+
+**upstream** — `packages/coding-agent/src/core/tools/truncate.ts:15-38` @`v0.83.0` — `TruncationResult` carries eleven fields (incl. `content` `:17` and `truncatedBy` `:21`) and is placed into `details.truncation` **whole**. Byte-only call sites: `grep.ts:335`, `find.ts:189`, `find.ts:324`, `ls.ts:182`, each passing `{ maxLines: Number.MAX_SAFE_INTEGER }`.
+
+**cyrup** — `crates/cyrup-tools/src/truncate.rs:34-46` `Truncation`. Three divergences, on `read` / `bash` / `grep` / `find` / `ls`:
+
+1. **`truncatedBy` was omitted when null.** `skip_serializing_if = "Option::is_none"` (`truncate.rs:36`) made the key VANISH on an untruncated result, where pi always emits `truncatedBy: null`.
+2. **`maxLines` differed numerically for the three byte-only callers.** `TruncOpts::bytes_only` (`truncate.rs:61`) passed `usize::MAX`, so the record read `maxLines: 18446744073709551615` where pi's reads `9007199254740991`.
+3. **`content` is ABSENT in cyrup.** pi's object carries the entire truncated output text a second time inside `details`.
+
+**Impact** — `details` is persisted on `ToolResultMessage` (pi `packages/ai/src/types.ts:415-420`), so **all three reach the session file** — this is session-record interop, not a model-facing difference. Impact is genuinely bounded and the bound was measured, not assumed: `git grep -n 'truncation\.content' v0.83.0 -- packages/` shows every hit is a LOCAL variable inside an `execute()` body — **no pi consumer reads `details.truncation.content`** — and the renderers read only `truncated` / `truncatedBy` / `outputLines` / `totalLines` / `maxBytes`. What survives that bound is a reader of a cyrup session file who distinguishes an absent key from an explicit null (1), and any consumer that compares the two implementations' records byte-for-byte (1, 2, 3).
+
+**Fix — LANDED for limbs 1 and 2.**
+* `skip_serializing_if` removed from `truncated_by`; `None` now serializes as `null`.
+* A `MAX_SAFE_INTEGER` constant (2⁵³ − 1) added beside the other truncation caps, and `TruncOpts::bytes_only` uses it. It is "effectively unbounded" to the truncation arithmetic exactly as `usize::MAX` was, so no behaviour outside the serialized record changes.
+* Both are documented at their sites with pi's file:line and with the reasoning, so the values read as ported rather than arbitrary.
+
+**RESIDUAL — limb 3, `content`, deliberately not ported, and this is the part that needs a decision rather than a patch.** Porting it duplicates the entire truncated output text into `details` on every truncated `read`/`bash`/`grep`/`find`/`ls` result, roughly doubling the session-file cost of the largest tool results cyrup writes — and no pi consumer reads it. Porting it blind would honour the letter of the port-the-literal-mechanism rule at a real cost with no reachable benefit; NOT porting it is an accepted divergence and needs to be recorded as one. The reasoning is written into `Truncation`'s doc comment so the next reader inherits the analysis instead of re-deriving it. **Take the decision explicitly**: either port `content` and accept the size, or tag it `[CYRUP-DELTA]` and close this row.
+
+**Verify — DONE for limbs 1 and 2.** `crates/cyrup-tools/src/tests/pi_tool_semantics.rs` →
+`truncation_details_serialize_in_pis_shape`. RED before on both: the untruncated case had no
+`truncatedBy` member at all, and `maxLines` serialized as `18446744073709551615`. The test asserts
+over the SERIALIZED value (`serde_json::to_value`), not the struct, because the serialized form is
+what reaches the session file; and it re-asserts the truncated case still reports `"lines"`, so limb
+1 cannot be satisfied by blanket-nulling the field. `cargo check -p cyrup-tools --all-targets` green.
+
+## TOOL-045 — No built-in overrides `Tool::label`; all seven inherit the trait default `None`
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — pi sets an explicit `label` on every built-in `ToolDefinition`, always equal to `name`: `read.ts:210-211` @`v0.83.0`, and the parallel `name`/`label` pair at `bash.ts:325-326`, `edit.ts:293-294`, `write.ts:187-188`, `grep.ts:129-130`, `find.ts:115-116`, `ls.ts:101-102`.
+
+**cyrup** — no `cyrup-tools` built-in overrides `Tool::label()`, so all seven return the trait default `None` (`crates/cyrup-core/src/tool.rs:102-104`), documented as "the runtime falls back to the tool name".
+
+**Impact** — **Behaviourally equivalent for these seven**, because pi's seven values are identical to the names and cyrup's fallback produces the name. Filed for completeness and for one specific hazard: the field is **declared on the trait and left unimplemented across the entire built-in set**, so the fallback has never been exercised against a value that differs from the name. A future built-in — or a ported subagent/intercom tool — whose label legitimately differs from its name inherits the wrong fallback **silently**, and there is no test anywhere that would notice. That is the `TOOL-024` / `PROV-M01` dropped-delegation shape one step earlier: not a delegation that drops a value, but a value nothing ever sets, so nothing downstream is proven to read it.
+
+**Relationship to `TOOL-022`/`TOOL-015`** — those are about `label` (with `renderShell` and `prepareArguments`) never reaching a **guest** tool's behaviour, i.e. a missing CONSUMER. This is the built-in PRODUCER half, and it is independent: closing this one does not close those, and closing those does not close this.
+
+**Fix** — Override `label()` on all seven built-ins returning the tool name, matching pi's literal `ToolDefinition`. Trivial, and its value is that it makes the seven declarations *data* rather than an inference from a default.
+
+**Verify** — Extend `crates/cyrup-tools/src/tests/pi_tool_semantics.rs`: assert `label() == Some(name())` for all seven (RED today — all seven are `None`). Separately, and more valuable, assert in `cyrup-ext`'s wrapper tests that a tool whose `label` differs from its `name` has that label survive to the consumer — the `Fixed` fixture's "every value DISTINCT and non-default" invariant `TOOL-024` established.
 
 
 ## Coverage

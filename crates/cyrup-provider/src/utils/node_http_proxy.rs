@@ -336,9 +336,16 @@ mod tests {
     /// `sse::configure_http_proxy`, consulted at the same layer.
     ///
     /// These four assertions run as one test on purpose: the setting is process-global, so two
-    /// `#[test]`s writing it would race inside the shared test binary.
+    /// `#[test]`s writing it would race inside the shared test binary. The same reason is why the
+    /// test takes [`crate::tests::proxy_setting::guard`] — other modules write the setting too
+    /// (`tests/oauth_http_proxy.rs`) — and why the clear happens in
+    /// [`crate::tests::proxy_setting::ClearOnDrop`] rather than only on the success path below: a
+    /// panicking assertion here previously left `configure_http_proxy` set for the remainder of the
+    /// test binary, silently rerouting every later loopback test in this crate.
     #[tokio::test]
     async fn the_http_proxy_setting_reaches_the_resolver_and_yields_to_everything_above_it() {
+        let _serial = crate::tests::proxy_setting::guard().await;
+        let _restore = crate::tests::proxy_setting::ClearOnDrop;
         let none = ctx([]);
 
         // (1) Unset ⇒ unchanged behaviour: no setting, no ambient var, no proxy.

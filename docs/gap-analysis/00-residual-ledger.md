@@ -5,6 +5,269 @@ next work item**.
 
 ---
 
+# RECONCILED 2026-08-14 (fourth edition) — the ninth pass was an ENUMERATION, not a sweep: nine finite pi surfaces walked end to end, 191 findings, 93 ids filed
+
+> **This block changes how the rest of this file should be read, and that matters more than the
+> numbers in it.** Everything below it is the third edition and is superseded on every count.
+>
+> **cyrup last commit `5990e86`** (`fix(tools): edit/read schemas emit no additionalProperties, matching pi`),
+> branch `david/cyrup`. **The area files are ahead of that commit — every figure here is derived from
+> the WORKING TREE**, because the four surface writers' filings are not committed yet. The third
+> edition's `e5c6933` figures are still reproducible from git and are used as this edition's baseline.
+>
+> **SCOPE EXCLUSION, stated so the numbers stay interpretable: `13-cyrup-mcp.md`, `13a`–`13i` and
+> `MCP-PORT-METHODOLOGY.md` are owned by another team and are excluded from every count in this
+> file.** They always have been — "the twelve `## Open items` tables" has meant areas 01–12 since the
+> first edition — but it was never written down, and a reader who counts the directory gets a
+> different answer. No figure in this edition, and no figure in `PARITY-GAPS.md` or `README.md`,
+> includes an MCP row.
+
+## The open set — re-derived row by row from the twelve `## Open items` tables (areas 01–12), nothing carried forward
+
+| | critical | high | medium | low | **counted open** |
+|---|---:|---:|---:|---:|---:|
+| first edition (after sweeps 1-2) | 0 | 3 | 75 | 95 | **173** |
+| second edition (after sweeps 3-6) | 0 | 2 | 63 | 88 | **153** |
+| third edition (after sweeps 7-8) | 0 | 2 | 61 | 82 | **145** |
+| **this edition (after the surface enumeration)** | **0** | **5** | **88** | **144** | **237** |
+
+**606 rows across the twelve tables. 360 carry a full closure marker and 36 more a partial one — 396
+of 606 (65%).** The closure *rate* fell from 76% to 65% while eleven more rows closed: the
+denominator grew by 103 rows in one pass. That is what an enumeration does to a backlog, and it is
+not a regression.
+
+**The counting rule is unchanged from the third edition and was validated rather than assumed.** Run
+against the twelve area files *as they stand at commit `e5c6933`*, the script that produced the table
+above reproduces the third edition exactly — **503 rows, 349 full closures, 35 partial, 8 in-table
+`tracker` rows, 145 open = 0/2/61/82.** Every number in this edition therefore differs from the
+third's because the *files* changed, not because the method did. *(Rule, restated: a row counts fully
+closed if its ID is struck through **or** its severity cell says `CLOSED`/`FIXED` without
+`PARTIALLY`; `PARTIALLY CLOSED`/`REOPENED` rows count **open** at their current severity — and where
+a severity cell reads `~~medium~~ low`, the surviving severity is the one counted. `tracker` rows are
+excluded: 8 in the area tables plus `SEAM-058` and `SUBA-005` in their areas' separate `## Trackers`
+tables = 10, unchanged. `AGENT-S04` still carries `*(partially-closed)*` in place of a severity and is
+in neither total — four editions now, and still left alone rather than silently rated.)*
+
+### By area
+
+| file | crit | high | medium | low | **open** | Δ vs third edition | rows |
+|---|---:|---:|---:|---:|---:|---|---|
+| `01-cyrup-core-and-provider.md` | 0 | **4** | 8 | 11 | **23** | **+12** (`PROV-054`…`PROV-067`; `PROV-061`/`PROV-062` filed+closed) | 43 → 57 |
+| `02-cyrup-agent.md` | 0 | 0 | 0 | 2 | **2** | — | 31 |
+| `03-cyrup-session.md` | 0 | 1 | 1 | 6 | **8** | — | 34 |
+| `04-cyrup-tools.md` | 0 | 0 | 2 | 6 | **8** | **+3** (`TOOL-043`…`TOOL-045`) | 31 → 34 |
+| `05-cyrup-config-and-resources.md` | 0 | 0 | 10 | 20 | **30** | **+21** (`CFG-054`…`CFG-076`; `CFG-056`/`CFG-057` filed+closed) | 40 → 63 |
+| `06-cyrup-ext.md` | 0 | 0 | 18 | 17 | **35** | **+12** (`EXT-061`…`EXT-073`; `EXT-071` filed+closed) | 57 → 70 |
+| `07-cyrup-tui.md` | 0 | 0 | 17 | 40 | **57** | **+22** (`TUI-063`…`TUI-087`; `TUI-069`/`070`/`074` filed+closed) | 71 → 96 |
+| `08-cyrup-session-svc-and-modes.md` | 0 | 0 | 9 | 17 | **26** | **+20** (`SEAM-076`…`079`, `080`…`086`, `100`…`111`; three filed+closed) | 45 → 68 |
+| `09-cyrup-ext-subagents.md` | 0 | 0 | 9 | 10 | **19** | **+2** (`SUBA-070`/`SUBA-071` — a documentation audit, **not** this enumeration) | 48 → 50 |
+| `10-cyrup-permission-system.md` | 0 | 0 | 2 | 2 | **4** | — | 23 |
+| `11-cyrup-intercom.md` | 0 | 0 | 5 | 4 | **9** | — | 46 |
+| `12-upstream-drift-pi-core.md` | 0 | 0 | 7 | 9 | **16** | — (no sweep since 3 has owned it) | 34 |
+| | **0** | **5** | **88** | **144** | **237** | **+92** | **503 → 606** |
+
+**Where the +92 came from, so none of it is unattributed.** **93 ids were filed by the four surface
+writers; 11 of them closed on arrival** (`CFG-056`, `CFG-057`, `SEAM-104`, `TUI-069`, `TUI-070`,
+`TUI-074`, `EXT-071`, `SEAM-085`, `SEAM-086`, `PROV-061`, `PROV-062`), leaving **82 open — 3 high,
+24 medium, 55 low**. **Eight more rows were already in the working tree, unreconciled, before this
+pass started** — `CFG-054`, `CFG-055`, `TUI-063`, `TUI-064`, `SEAM-076`…`SEAM-079` — all eight open;
+the surface writers cite several of them as pre-existing ids, which is how they were caught. **Two
+more, `SUBA-070` and `SUBA-071`, came from a documentation audit of area 09 and are not part of this
+enumeration at all.** 82 + 8 + 2 = 92. **No ID was renumbered, merged or deleted; `SEAM-087`…`SEAM-099`
+are deliberately unallocated** — two writers were minting SEAM ids concurrently and the second block
+moved to `SEAM-100` rather than risk a collision. **Do not "recover" that range.**
+
+**The above-medium set is no longer two rows. It is FIVE**, and three are new: `PROV-054` (xai
+`grok-4.5` routed over the wrong wire API — and it is the xai *default* model), `PROV-055` (opencode's
+`openai-nosession` affinity format missing on all 16 `openai-responses` rows, so cyrup leaks a
+`session_id` header pi suppresses) and `PROV-056` (kimi-coding's `forceAdaptiveThinking` ×3 and
+`allowEmptySignature` ×1 — two wire divergences per request on every model of the provider), joining
+the unchanged `PROV-047` and `SESS-040`. **All three new highs are catalog DATA and share one fix
+site**: they close through `PROV-018`/`PROV-060`'s bulk regeneration, in the commit that rewrites
+`catalog_manifest.json`. Scheduling them as three items produces three agents hand-patching one row
+each and each invalidating the manifest.
+
+## What this pass actually was, and the lesson — which is NOT that the analysis was blind
+
+**Nine whole-backlog sweeps read the BACKLOG against the code and closed 384+ of ~503 rows.** This
+pass did something different: it enumerated **nine finite pi surfaces mechanically and diffed both
+directions**, and produced **191 findings — 67 missing in cyrup, 66 cyrup-original, 58 differing in
+shape.** For scale, a late-stage sweep produces 10–25 items.
+
+**pi's source was fully available the entire time** — the whole tree is checked out at
+`/Users/davidmaple/cyrup.ai/pi` and every sweep could read it. Nothing was hidden. **The limit is
+structural: an item-driven pass can only close what someone already wrote down.** Under that method
+*"we have stopped finding things"* and *"there is nothing left"* produce identical evidence, and
+nine sweeps' worth of falling yield was read as the second when it was the first.
+
+**Enumeration removes the ambiguity.** When all 39 CLI flags are walked, all 73 keybinding ids, all
+25 slash commands, all 7 built-in tools — **the diff IS the answer**, and the residual is stated as a
+named gap rather than inferred from a quiet result. The two specimens worth remembering:
+
+- **`cyrup update --models` does not exist** (`SEAM-100`) — verified by running the shipped binary,
+  which prints `Unknown option --models for "update".` There is no CLI route to refresh model
+  catalogs. **And the backlog already assumed it shipped**: `05-cyrup-config-and-resources.md:779`
+  reasons about lock contention "against any concurrent `cyrup update --models`". *A gap that other
+  analysis has already built on top of cannot be revealed by closing the items above it.*
+- **The `edit` tool emitted `"additionalProperties": false` where pi emits none — and the test
+  suite's own `PI_EDIT` "ground truth" constant carried the same keyword**, so the suite was
+  certifying the divergence. Fixed and committed inline (`5990e86`) before the filing, and recorded
+  in area 04 as precedent rather than backlog. **A ground-truth constant that was never mechanically
+  re-derived is indistinguishable from an assertion of the current behaviour.**
+
+**The catalog refutation belongs in the same list and is routed, not just filed.** `PROV-004` and
+`PARITY-GAPS.md` §6 q5 both recorded as SETTLED that catalog accuracy is "not statically auditable".
+**That premise is false.** pi's `*.models.ts` files are two-line re-exports only from `a9f6a3159`
+onward; at its direct parent `b0c2a90e` — the revision cyrup's own manifest names as its provenance
+floor — they are full data literals. `git log --oneline b0c2a90e..a9f6a3159` returns exactly one
+commit. The whole catalog is checkable with `git show b0c2a90e:…` plus a ~12-line script, and that is
+what made `PROV-054`…`PROV-059` measurable. Filed as `PROV-060`; the `PARITY-GAPS.md` entry is
+corrected by this reconciliation.
+
+## The re-run recipe — enumeration must be a RE-RUN, not a re-derivation
+
+**This matters more here than anywhere else in the record, because this analysis's own measured error
+rate is ≈12% and has not moved in six editions.** A finding that can only be reproduced by a human
+walking a file again inherits that rate every time. A finding whose extraction is a command does not.
+The commands below are recorded verbatim from
+`scratchpad/surfaces.json`; upstream is always read out of the tag, never from a working tree.
+
+| surface | extraction, as run |
+|---|---|
+| CLI flags | `git -C pi show v0.83.0:packages/coding-agent/src/cli/args.ts` (parseArgs + printHelp) · `git -C pi grep -n 'registerFlag' v0.83.0 -- packages/coding-agent/src/extensions/` (returns **zero** — pi's shipped default flag surface has no extension entries) · `git -C pi grep -nE 'argv\[2\]\|process\.argv' v0.83.0` |
+| settings keys | `git -C pi grep -nE 'get(Global\|Project)Settings\(\)\s*[.\[]' v0.83.0` · `git -C pi grep -n 'applyOverrides' v0.83.0 -- 'packages/**/*.ts'` · `git -C pi grep -n mermaid v0.83.0 -- packages/coding-agent/src/core/settings-manager.ts` · cyrup side `grep -rn 'cli_settings(' crates/`, `grep -rn '\.packages()' crates/` |
+| env vars | `git -C pi show v0.83.0:packages/coding-agent/src/cli/args.ts \| sed -n '342,390p' \| grep -oE '^  [A-Za-z_{][A-Za-z0-9_{}:<]*'` (the help block) · `git -C pi grep -n '<NAME>' v0.83.0 -- packages/` per name · cyrup side `grep -rn '"<NAME>"' crates --include='*.rs'` |
+| keybinding ids | `git -C pi show v0.83.0:packages/tui/src/keybindings.ts` + `…coding-agent/src/core/keybindings.ts` · **independent check that settles the count:** ``git -C pi show v0.83.0:packages/coding-agent/docs/keybindings.md \| grep -c '^\| ` ' `` ⇒ **73** (the grep pattern is a pipe, a space, then a backtick — the table-row prefix of pi's shipped keybinding doc) |
+| slash commands | `git -C pi show v0.83.0:packages/coding-agent/src/core/slash-commands.ts` + `modes/interactive/interactive-mode.ts` · cyrup side `grep -rn 'has_arg_completion' crates/ --include='*.rs'`, `grep -rn 'expand_slash_command' crates/ --include='*.rs'` |
+| extension API | `grep -c '^\ton('` over `types.ts` @v0.83.0 ⇒ **33** overloads · `git -C pi grep -n 'startWorking\|stopWorking' v0.83.0` (⇒ empty; this is what exposed the fabricated `working-start`/`working-stop` citation) · every `types.ts:N` citation in both `world.wit` copies (109) and `ctx.rs` (57) resolved against the tag |
+| built-in tools | `git -C pi grep -n additionalProperties v0.83.0 -- packages/coding-agent/src/core/tools/ packages/agent/src/harness/tools/` · `git -C pi grep -n 'truncation\.content' v0.83.0 -- packages/` · cyrup side `grep -rn 'impl Tool for'` |
+| RPC protocol | `git -C pi grep -cn 'model_changed\|modelChanged' v0.83.0 -- packages/` (⇒ zero — the line is cyrup-invented) · `git -C pi grep -n toJsonEvent v0.83.0 -- packages/` (⇒ absent at v0.83.0, present at v0.84.1: this is how four citations were caught presenting v0.84.1 lines against v0.83.0 paths) |
+| providers/catalogs | `git -C pi show b0c2a90e:packages/ai/src/providers/<name>.models.ts` for all 35, parsed and field-diffed against `crates/cyrup-provider/src/providers/catalog/*.json` · `git -C pi grep supportsFinishReason v0.83.0 -- packages/ai` · registration list read at v0.83.0 **and** at `91585d9a` side by side |
+
+**One honest gap in the artifact itself: `surfaces.json` records no `extractionCommands` field.** Its
+own prose refers to "the extractionCommands above", and surface 8's narrative describes a ~12-line
+node script that parsed all 35 catalogs — **that script is not in the artifact, and the `surface`
+strings are truncated at ~200 characters.** The table above is what could be recovered verbatim from
+the finding bodies. **The catalog parser and the env-var cross-product recipe must be rewritten by
+whoever re-runs those two surfaces.** Recording this is the point: the pass that argues enumeration
+should be re-runnable did not fully make its own re-runnable, and the next one should emit the
+commands as a first-class field.
+
+## Which surfaces are COMPLETE, and exactly what the four incomplete ones could not reach
+
+**Five of nine were enumerated completely on both sides.** For these, the diff is the answer and a
+future pass re-runs rather than re-walks:
+
+| surface | upstream | cyrup | findings |
+|---|---:|---:|---:|
+| CLI flags, subcommands, value enums, help text | 79 | 86 | 21 |
+| settings.json keys — key, type, default, precedence | 66 | 67 | 10 |
+| keybinding ids + default chords (**73**, not the ~40 the brief assumed) | 73 | 71 | 14 |
+| slash commands + argument parsing + completion | 25 | 25 | 25 |
+| built-in tool names, parameter schemas, result shapes | 7 | 7 | 4 |
+
+**Four are INCOMPLETE and say so. Do not read coverage into them:**
+
+1. **Environment variables (130 upstream / 233 cyrup — 62 findings).** Three named gaps. (a)
+   **pi-mcp-adapter's env surface was extracted but NOT diffed** — `BROWSER`, `GLIMPSE_BINARY`,
+   `MCP_DIRECT_TOOLS`, the five `MCP_HASH_*`, `MCP_OAUTH_DIR`, `MCP_OAUTH_CALLBACK_PORT`,
+   `MCP_UI_DEBUG`, `MCP_UI_VIEWER`, `NPM_CONFIG_CACHE`, the five `PI_MCP_ADAPTER_*`,
+   `PI_PACKAGE_DIR`; spot-checks show ten of those return zero hits in `crates/`. **Routed, not
+   filed — that surface belongs to the MCP team's files, which this reconciliation may not touch.**
+   (b) The **cyrup→pi-subagents direction is only partly walked**: ~110 `CYRUP_SUBAGENT_*` /
+   `CYRUP_INTERCOM_*` names were not all walked back, so `CFG-074`'s nine confirmed cyrup-originals
+   in that family **may not be all of them**. (c) ~110 of cyrup's 233 names come from the three
+   sibling ports, so `cyrup-original` there was assigned against pi-subagents / pi-intercom /
+   pi-permission-system, **not** against `pi/packages` — **anyone re-deriving must do the same or the
+   cyrup-original count is fiction.**
+2. **Extension API (134 / 182 — 28 findings).** Complete for pi's 33 `on(event:)` overloads (1:1,
+   zero gaps both directions), all 28 `ExtensionUIContext` members, all 18 `ExtensionContext`, all 24
+   non-`on` `ExtensionAPI` members, all 13 `ToolDefinition` fields, all 157 WIT functions, and every
+   `types.ts:N` citation in both `world.wit` copies. **Not reached: the non-`types.ts` citations** —
+   `agent-session.ts`, `tui.ts`, `event-bus.ts`, `exec.ts`, `agent/types.ts`, `project-trust.ts`,
+   `tool-definition-wrapper.ts`, `agent-session-runtime.ts` were spot-checked, not exhaustively
+   resolved, and `tui.ts:773-788` / `:784-786` remain **"plausible" — nobody has resolved them.**
+   `EXT-072`'s ~40-site citation rewrite is filed, not landed.
+3. **RPC protocol (68 / 72 — 9 findings).** Commands 32 v 32 (`diff` of the extracted lists is
+   empty), event types 23 v 27, `extension_ui_request` methods 9 v 9, `RpcSessionState` 12 v 12,
+   `RpcClient` surface complete with constants matching. **Not reached: the response DATA shapes
+   behind each command** were verified only where a finding was already suspected —
+   `bash`'s envelope and `get_commands`' entries are filed (`SEAM-083`, `SEAM-084`); the rest of the
+   32 payloads were not walked field-by-field.
+4. **Providers / wire APIs / compat flags (88 / 86 — 18 findings).** The compat-interface, wire-api-id
+   and registration halves were read at v0.83.0 and carry no caveat. **The catalog half carries a
+   provenance caveat that must travel with every claim derived from it:** pi gitignores
+   `packages/ai/src/providers/data/`, so the 35 catalogs were read at **`b0c2a90e`, 13 days EARLIER
+   than v0.83.0.** Every catalog claim in `PROV-054`…`PROV-061` is measured against `b0c2a90e`, **not**
+   the ported baseline, and a clean refresh to `b0c2a90e` still leaves an unmeasurable 13-day
+   residue. **Any future claim of "catalog parity at v0.83.0" is a claim about `b0c2a90e` plus an
+   unbounded delta.** Also not reached: request-body fields beyond the compat matrix.
+
+## `cyrup-original` — promoted to a first-class class, with its own count
+
+**66 of the 191 findings are surfaces cyrup HAS and pi does NOT.** This project has tracked parity
+gaps for four editions and has never tracked this class systematically — and it is the class through
+which divergence enters *while everyone is looking at parity*. It gets its own count here rather than
+being folded into the medium/low totals unexamined.
+
+| | rows | open | medium | low |
+|---|---:|---:|---:|---:|
+| at the third edition (commit `e5c6933`) | 28 | **7** | — | — |
+| **this edition** | **68** | **46** | **13** | **33** |
+
+**31 of the 46 open rows were filed by this pass** (32 filed, `PROV-061` closed on arrival), and 8
+more are the pre-existing working-tree rows. By area: 05 → 14, 08 → 11, 06 → 8, 01 → 5, 07 → 5,
+04 → 1, 09 → 1, 11 → 1.
+
+**These are not automatically defects. Every one must become KNOWN.** Rate them by **reachability**:
+an advertised-but-dead surface outranks an internal helper, and a mechanism port forced by the
+language is not divergence at all. The precedents that define the class:
+
+- **`TUI-063` — `CYRUP_SHARE_VIEWER_URL` is advertised in `--help` and read by nothing.** The failure
+  mode with a name: the binary documents a control that does not exist.
+- **`EXT-021` — `working-start` / `working-stop` were documented in the WIT against a FABRICATED pi
+  citation.** `git -C pi grep -n 'startWorking|stopWorking' v0.83.0` is empty. This pass found the
+  same class twice more: a spliced `ctx.abort()` doc quote (fixed, `EXT-073`) and nine citations
+  naming a line band that exists in **no** version (open). **Three fabrications in one area file is a
+  test-infrastructure gap, not three mistakes** — both `EXT-072` and `EXT-073` specify the same
+  guard (resolve every `types.ts:N` citation against the checked-out tag); **land the guard, not just
+  the rewrite.**
+- **`EXT-071` — `get-all-tools`' shape comment advertised a `source` field on `ToolInfo` that
+  `EXT-060` had already REMOVED from the emitted object.** An advertised surface nothing produces, in
+  the guest's only contract. Fixed this pass.
+- **`SEAM-080` — `model_changed` is a cyrup-invented line on the RPC stdout stream, and two backlog
+  items already reason about it as upstream.** Same shape as `SEAM-100`: invented surface that other
+  analysis has already built on.
+- **`CFG-068` — `CYRUP_HOME` is invented, live in shipped builds, and outranks `$HOME` at four sites
+  at once.**
+
+**Two scheduling hazards inside this class, recorded because they outlive the pass.** (1)
+**`SEAM-047`'s Verify line would pin a cyrup-invented wire line (`session_shutdown` on stdout) as
+required behaviour** — flagged LOAD-BEARING in `SEAM-081`'s body, but nothing forces someone to read
+it before landing `SEAM-047`. (2) A catalog regeneration from `b0c2a90e` will **re-introduce** groq
+`qwen/qwen3-32b`'s `thinkingLevelMap` and turn `PROV-064`'s guard test red; the generator needs a
+named exception list or that deliberate delta is silently reverted.
+
+**And one anti-pattern the writers got right, worth copying:** several `cyrup-original` findings were
+examined and given **no id on purpose**, with the reasoning recorded — the 16 closure-to-export
+inversions and the 22 authority imports are *forced* by the Component Model (a WASM guest cannot hand
+back a function), `NO_PROXY`'s absence is a false positive of a literal grep because both sides
+case-fold the key at runtime, and `supportsStrictMode`'s three different upstream defaults were
+checked individually and are all correct in cyrup. **Verified non-divergence is a result. Write it
+down or the next pass re-derives it.**
+
+## What this edition does NOT change
+
+The third edition's reasoning is intact and is still what this file rests on: the two-failure-modes
+analysis of "refuted", the **dropped-delegation class** (three instances, the third a live behaviour
+defect), the JS→Rust mechanism register, the orchestration rules, and the ≈12% measured error rate.
+**Nothing in this pass was executed** — the standing test rules permit only
+`cargo check -p <crate> --all-targets`, so all eleven fixes are type-checked arguments, not
+observations, and the three TUI fixes additionally want a live terminal run per this workspace's
+standing rule. Read those sections below as current; read only the *counts* below as superseded.
+
+---
+
 # RECONCILED 2026-08-14 (third edition) — EIGHT sweeps applied, every count re-derived from the twelve area tables
 
 > **cyrup HEAD `e5c6933`** (docs HEAD `0097149`), branch `david/cyrup`. **Both gates green:**

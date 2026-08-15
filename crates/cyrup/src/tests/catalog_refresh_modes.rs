@@ -202,6 +202,63 @@ async fn offline_still_suppresses_the_refreshing_modes() {
     }
 }
 
+// ------------------------------------------------------------------- `cyrup update --models` --
+
+/// The THIRD trigger — the only foreground one, and the only one a user asks for by name.
+///
+/// `cyrup update --models` did not exist at all before this pass (the binary answered `Unknown
+/// option --models for "update"`), so there was no CLI route to refresh the model catalogs; pi has
+/// had `refreshModelCatalogs` since `package-manager-cli.ts:397-423` @v0.83.0.
+///
+/// Three properties, all against the loopback origin:
+///
+/// - it FETCHES for each configured provider (`force: true`, `:409`) — no mode gate, no freshness
+///   window, unlike both background triggers;
+/// - a second call fetches AGAIN, which is what `force` means: the 4h window
+///   (`REMOTE_CATALOG_REFRESH_INTERVAL_MS`) would otherwise make this a no-op;
+/// - a provider with no credential is never in the set the caller passes, so an empty set issues
+///   ZERO requests and still succeeds — pi's per-provider `if (!credential) return;`
+///   (`packages/ai/src/models.ts:296`) reaching the same end state.
+#[tokio::test]
+async fn update_models_forces_a_fetch_for_every_configured_provider() {
+    let origin = MockOrigin::spawn().await;
+    let catalog = catalog(&origin.base_url);
+
+    crate::provider::refresh_model_catalogs_with(
+        catalog.clone(),
+        vec!["groq".to_string(), "openai".to_string()],
+    )
+    .await
+    .expect("a 404 from the origin is pi's `no remote catalog` branch, not an error");
+    assert_eq!(
+        origin.accept_count(),
+        2,
+        "one request per configured provider"
+    );
+
+    // `force: true` bypasses the freshness window, so the SAME call fetches again immediately.
+    crate::provider::refresh_model_catalogs_with(catalog, vec!["groq".to_string()])
+        .await
+        .expect("forced refresh");
+    assert_eq!(
+        origin.accept_count(),
+        3,
+        "`cyrup update --models` must bypass the 4h window (RefreshOptions::forced)"
+    );
+}
+
+/// No credential anywhere ⇒ no request, and still a success: a fresh install can run
+/// `cyrup update --models` without an `auth.json` and gets `Model catalogs refreshed`, exactly as
+/// upstream does.
+#[tokio::test]
+async fn update_models_with_no_configured_provider_issues_no_request() {
+    let origin = MockOrigin::spawn().await;
+    crate::provider::refresh_model_catalogs_with(catalog(&origin.base_url), Vec::new())
+        .await
+        .expect("an empty provider set is a successful no-op");
+    assert_eq!(origin.accept_count(), 0);
+}
+
 /// The predicate itself, stated once against Pi's two sites so the intent is greppable.
 #[test]
 fn only_rpc_and_interactive_refresh_catalogs() {

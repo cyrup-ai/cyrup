@@ -1539,6 +1539,48 @@ impl<B: Backend> App<B> {
         self.replay_session_rendered(messages, &std::collections::HashMap::new());
     }
 
+    /// TUI-N04 — the second statement of Pi's `renderInitialMessages()`, immediately after the
+    /// replay (`interactive-mode.ts:3485`), body at `:3496-3514` @v0.83.0:
+    ///
+    /// ```ts
+    /// private renderProjectTrustWarningIfNeeded(): void {
+    ///     if (this.settingsManager.isProjectTrusted() || !hasTrustRequiringProjectResources(this.sessionManager.getCwd())) {
+    ///         return;
+    ///     }
+    ///     if (this.chatContainer.children.length > 0) this.chatContainer.addChild(new Spacer(1));
+    ///     this.chatContainer.addChild(new Text(theme.fg("warning",
+    ///         `This project is not trusted. Project ${CONFIG_DIR_NAME} resources and packages are ignored. Use /trust to save a trust decision, then restart pi.`), 1, 0));
+    /// }
+    /// ```
+    ///
+    /// Both halves of the predicate already existed in cyrup and neither had a reader on this path:
+    /// `AgentSessionServices::project_trusted` (`services.rs:104`, the same field the `/trust`
+    /// dialog reads at [`Self::open_selector`]) and
+    /// [`cyrup_config::trust::has_trust_requiring_resources`] (`trust.rs:201`, the same scan
+    /// `AgentSessionBuilder` runs at `builder.rs:597` to decide whether trust is even in question).
+    ///
+    /// **The string is rebranded, not reworded**: `.cyrup` for pi's `CONFIG_DIR_NAME` (the directory
+    /// `has_trust_requiring_resources` actually probes, `trust.rs:211`) and `cyrup` for `pi`.
+    ///
+    /// **[CYRUP-DELTA]** — pi gates its leading `Spacer(1)` on `chatContainer.children.length > 0`
+    /// (`:3502`), so on a *completely* empty transcript the warning is the first row with no blank
+    /// above it. `Entry::Warning` emits its leading blank unconditionally
+    /// (`transcript.rs`'s `Entry::Warning` arm, matching `showWarning`), so cyrup shows one extra
+    /// blank line in that one case. Reproducing the gate would mean a second warning entry kind
+    /// whose only difference is a blank line; recorded rather than taken.
+    pub fn render_project_trust_warning_if_needed(&mut self, session: &Arc<AgentSession>) {
+        let services = session.services();
+        if services.project_trusted
+            || !cyrup_config::trust::has_trust_requiring_resources(&services.cwd, &services.home)
+        {
+            return;
+        }
+        // No `Warning: ` prefix: pi's trust banner is a RAW `Text` in the warning colour (`:3505`),
+        // not a `showWarning` call, so — unlike `interactive-mode.ts:3884-3888`'s
+        // `Warning: ${warningMessage}` — there is no prefix to carry (TUI-062).
+        self.state.transcript.push_warning(PROJECT_UNTRUSTED_WARNING);
+    }
+
     /// [`Self::replay_session`], first resolving each displayed `custom` message's registered
     /// extension renderer (EXT-006; Pi `getMessageRenderer(message.customType)`,
     /// `interactive-mode.ts:3471`).
@@ -2855,10 +2897,26 @@ impl<B: Backend> App<B> {
             Ok(result) => {
                 self.state.transcript.push_compaction_summary(result.tokens_before, result.summary);
             }
-            // A refusal (nothing to compact / already compacted / an extension veto) carries Pi's
-            // reason string, so the status line names WHY instead of the old undifferentiated
-            // "nothing to compact".
-            Err(e) => self.state.transcript.push_status(format!("compact error: {e}")),
+            // SESS-040 — the failure half of the MANUAL compaction surface, which this path owns
+            // in full (see the `[CYRUP-DELTA]` on the `CompactionEnd` arm: the event renders the
+            // automatic reasons only, because upstream's `/compact` handler renders nothing at all
+            // and cyrup's returns an outcome here instead).
+            //
+            // Pi's manual `compaction_end` branches are BOTH `showError`
+            // (`interactive-mode.ts:3099-3100` aborted, `:3116-3117` `errorMessage`), never the dim
+            // `showStatus` (`:3200-3213`); and pi classifies the abort by comparing the thrown
+            // message to the bare `"Compaction cancelled"` (`agent-session.ts:1911`) — the same
+            // test on the same string, because `SessionServiceError::CompactionCancelled`'s
+            // `Display` is that message verbatim (`cyrup-session-svc/src/error.rs:92`).
+            //
+            // Before this: pressing the Escape the band advertises produced the dim status line
+            // `compact error: Compaction cancelled` — a cyrup-invented prefix that reports the
+            // user's own deliberate cancel as an error, in the wrong channel. A genuine failure
+            // took the same dim line, where pi shows `Compaction failed: …` in error styling (the
+            // wrapper its catch applies at `agent-session.ts:1908-1917`, which cyrup already emits
+            // verbatim on the `compaction_end` event — this path was the one that disagreed).
+            Err(e) if e == "Compaction cancelled" => self.state.transcript.push_error(e),
+            Err(e) => self.state.transcript.push_error(format!("Compaction failed: {e}")),
         }
     }
 
@@ -5018,11 +5076,37 @@ impl<B: Backend> App<B> {
         let _ = std::fs::remove_file(&tmp);
         match result {
             Ok(out) if out.status.success() => {
-                let url = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if url.is_empty() {
-                    self.state.transcript.push_status("gist created (no URL returned by gh)");
+                // TUI-063 — pi does NOT surface the raw gist URL on its own. It peels the gist ID
+                // off the URL `gh` printed and renders the VIEWER link built from it:
+                //
+                // ```ts
+                // const gistUrl = result.stdout?.trim();
+                // const gistId = gistUrl?.split("/").pop();                 // :5599
+                // if (!gistId) { this.showError("Failed to parse gist ID from gh output"); return; }
+                // const previewUrl = getShareViewerUrl(gistId);             // :5606
+                // this.showStatus(`Share URL: ${previewUrl}\nGist: ${gistUrl}`);
+                // ```
+                //
+                // (`interactive-mode.ts:5597-5608` @v0.83.0.) cyrup printed only the gist URL, so
+                // [`share_viewer_url`] — and therefore `CYRUP_SHARE_VIEWER_URL`, which
+                // `cyrup --help` advertises as "Base URL for /share command" — had no consumer at
+                // all: setting it changed nothing and said nothing.
+                let gist_url = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let gist_id = gist_id_from_url(&gist_url);
+                if gist_id.is_empty() {
+                    // pi `showError` (`:5601`) — cyrup's `"gist created (no URL returned by gh)"`
+                    // covered only the empty-stdout half of the same failure. `showError` builds
+                    // `Error: ${errorMessage}` INSIDE itself (`interactive-mode.ts:3878-3882`)
+                    // while cyrup's `Entry::Error` renders verbatim, so the prefix is the caller's
+                    // to supply here (TUI-062's shape, same as `Warning: `).
+                    self.state
+                        .transcript
+                        .push_error("Error: Failed to parse gist ID from gh output");
                 } else {
-                    self.state.transcript.push_block("Shared session", url);
+                    let preview = share_viewer_url(gist_id);
+                    self.state
+                        .transcript
+                        .push_status(format!("Share URL: {preview}\nGist: {gist_url}"));
                 }
             }
             Ok(out) => {
@@ -5425,8 +5509,9 @@ impl<B: Backend> App<B> {
                 // that [`App::apply_compact_outcome`] renders on the command path — the seam that
                 // moved the compaction off the run loop. Both would fire for a manual compaction,
                 // so this arm renders the automatic reasons only and leaves `Manual` to the command
-                // path. Residual: a manual abort reads `compact error: …` here where pi reads
-                // `Compaction cancelled`.
+                // path — which now renders pi's two manual branches verbatim and through
+                // `showError`, so the residual this comment used to record (a manual abort reading
+                // `compact error: …` where pi reads `Compaction cancelled`) is closed.
                 if !matches!(reason, CompactionReason::Manual) {
                     if *aborted {
                         self.state.transcript.push_status("Auto-compaction cancelled");
@@ -6673,6 +6758,65 @@ fn system_time_nanos(t: std::time::SystemTime) -> u128 {
     t.duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
 
+/// Pi's project-trust banner, rebranded (`interactive-mode.ts:3506-3509` @v0.83.0). `${CONFIG_DIR_NAME}`
+/// is `.cyrup` here — the directory [`cyrup_config::trust::has_trust_requiring_resources`] probes
+/// (`trust.rs:211`) — and the closing `pi` is `cyrup`. TUI-N04.
+pub(crate) const PROJECT_UNTRUSTED_WARNING: &str = "This project is not trusted. Project .cyrup resources and packages are ignored. Use /trust to save a trust decision, then restart cyrup.";
+
+/// The environment override for the `/share` viewer base URL — cyrup's rebranding of pi's
+/// `PI_SHARE_VIEWER_URL` (`config.ts:506` @v0.83.0), and the name `cyrup --help` already advertises
+/// at `crates/cyrup/src/cli.rs:1077` ("Base URL for /share command").
+const ENV_SHARE_VIEWER_URL: &str = "CYRUP_SHARE_VIEWER_URL";
+
+/// pi's `DEFAULT_SHARE_VIEWER_URL` (`config.ts:502` @v0.83.0), kept verbatim.
+///
+/// **Not a rebranding oversight.** The viewer is a pi-operated service that renders any GitHub gist
+/// by id, so it works for a cyrup-produced gist unchanged, and this repo already points at that host
+/// wherever the service is pi's — `cyrup-provider/src/remote_catalog.rs:68`
+/// `DEFAULT_CATALOG_BASE_URL = "https://pi.dev"` and the referer headers at
+/// `cyrup-session-svc/src/attribution.rs:82`. Substituting a cyrup host cyrup does not operate would
+/// print a dead link on every `/share`.
+const DEFAULT_SHARE_VIEWER_URL: &str = "https://pi.dev/session/";
+
+/// pi's `const gistId = gistUrl?.split("/").pop();` (`interactive-mode.ts:5599` @v0.83.0) over the
+/// URL `gh gist create` printed (`https://gist.github.com/<user>/<id>`).
+///
+/// JS `"abc".split("/")` is `["abc"]` and `pop()` returns `"abc"`, so a `gh` that printed a bare id
+/// still resolves; only an empty tail (empty stdout, or a trailing `/`) is the failure pi's
+/// `if (!gistId)` reports. `rsplit(..).next()` has exactly that shape — `"".rsplit('/').next()` is
+/// `Some("")`, not `None`.
+pub fn gist_id_from_url(gist_url: &str) -> &str {
+    gist_url.rsplit('/').next().unwrap_or_default()
+}
+
+/// Port of pi's `getShareViewerUrl(gistId)` (`packages/coding-agent/src/config.ts:504-508`
+/// @v0.83.0):
+///
+/// ```ts
+/// export function getShareViewerUrl(gistId: string): string {
+///     const baseUrl = process.env.PI_SHARE_VIEWER_URL || DEFAULT_SHARE_VIEWER_URL;
+///     return `${baseUrl}#${gistId}`;
+/// }
+/// ```
+///
+/// JS `||` treats the empty string as unset, so an exported-but-empty variable falls back to the
+/// default rather than producing a bare `#{id}` — hence the `filter(|v| !v.is_empty())`.
+///
+/// TUI-063: this is the ONLY consumer of [`ENV_SHARE_VIEWER_URL`]. Before it existed, `/share`
+/// printed the raw gist URL and the advertised variable was inert.
+pub fn share_viewer_url(gist_id: &str) -> String {
+    share_viewer_url_from(std::env::var(ENV_SHARE_VIEWER_URL).ok().as_deref(), gist_id)
+}
+
+/// [`share_viewer_url`] with the environment already read — the same split
+/// [`crate::status::experimental_features_enabled_from`] uses, so the `||` semantics are unit-testable
+/// without `std::env::set_var` (`unsafe` in edition 2024, and this crate is `#![forbid(unsafe_code)]`).
+#[must_use]
+pub fn share_viewer_url_from(env_base: Option<&str>, gist_id: &str) -> String {
+    let base = env_base.filter(|v| !v.is_empty()).unwrap_or(DEFAULT_SHARE_VIEWER_URL);
+    format!("{base}#{gist_id}")
+}
+
 /// Render the `/arminsayshi` XBM bitmap as half-block art (`armin.ts`: 31×36, LSB-first, `1` =
 /// background, `0` = foreground; two vertical pixels packed per cell into `█`/`▀`/`▄`/space). A pure,
 /// deterministic transcript block (the animation effects are omitted as non-testable chrome).
@@ -7454,6 +7598,14 @@ impl App<CrosstermBackend<Stdout>> {
         // `getContextUsage()` per frame (`footer.ts:108`), so a `/resume`d session shows its
         // occupancy on the very first frame rather than only after the next assistant message.
         self.refresh_context_usage(&session).await;
+        // TUI-N04 — Pi's `renderInitialMessages()` runs `renderProjectTrustWarningIfNeeded()`
+        // straight after the replay (`interactive-mode.ts:3479-3485`). cyrup's replay is the
+        // caller's (`crates/cyrup/src/main.rs` for a `--resume`/`--continue` boot, the
+        // `session_swapped` arm below for a `/resume`/`/fork`/`/import`), so the check lands HERE
+        // rather than inside `replay_session_*`: pi's call is UNconditional, while cyrup's replay is
+        // skipped entirely when `raw_context_messages()` is empty — and a fresh session in an
+        // untrusted project is precisely the case that most needs the banner.
+        self.render_project_trust_warning_if_needed(&session);
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
         // indicator is active, so the Braille frame advances without a timer thread and an idle
@@ -8086,6 +8238,11 @@ impl App<CrosstermBackend<Stdout>> {
                             let ext_host = session.services().ext_host.clone();
                             self.replay_session_with_extensions(&restored, &ext_host).await;
                         }
+                        // TUI-N04 — the same statement `renderInitialMessages()` runs after its
+                        // replay (`interactive-mode.ts:3485`), and it must run here too: a
+                        // `/resume` of a session recorded in a DIFFERENT project swaps the cwd and
+                        // the trust decision with it, so the banner's answer changes on the swap.
+                        self.render_project_trust_warning_if_needed(&session);
                         // The swapped-in session owns a fresh extension host; re-source its
                         // registered shortcuts (R-08-017) so a post-swap press still routes.
                         // EXT-040: `shortcut_specs()` carries the description `/hotkeys` renders;
@@ -8891,5 +9048,56 @@ mod x13_live_bash_tests {
         let path = payload["fullOutputPath"].as_str().expect("the spool path persisted");
         assert!(path.contains("cyrup-bash-"));
         let _ = std::fs::remove_file(path);
+    }
+}
+
+/// TUI-063 — `/share`'s viewer link, the only consumer of the `CYRUP_SHARE_VIEWER_URL` that
+/// `cyrup --help` advertises at `crates/cyrup/src/cli.rs:1077`.
+///
+/// The env-var half lives in `tests/share_viewer_url.rs` (its own binary): `std::env::set_var` is
+/// `unsafe` in edition 2024 and this crate is `#![forbid(unsafe_code)]`, the same split
+/// `experimental_features_enabled_from` + `tests/experimental_marker.rs` already uses.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod share_viewer_url_tests {
+    use super::*;
+
+    /// `gistUrl?.split("/").pop()` (`interactive-mode.ts:5599` @v0.83.0) over what `gh gist create`
+    /// actually prints, plus the two shapes pi's `if (!gistId)` guard is testing for.
+    #[test]
+    fn the_gist_id_is_the_last_path_segment_of_gh_s_output() {
+        assert_eq!(gist_id_from_url("https://gist.github.com/octocat/abc123def456"), "abc123def456");
+        // JS `"abc".split("/")` is `["abc"]`, so `pop()` yields the whole string.
+        assert_eq!(gist_id_from_url("abc123def456"), "abc123def456");
+        // The two failures `if (!gistId)` catches: nothing on stdout, and a trailing separator.
+        assert_eq!(gist_id_from_url(""), "");
+        assert_eq!(gist_id_from_url("https://gist.github.com/octocat/"), "");
+    }
+
+    /// `${baseUrl}#${gistId}` with `baseUrl = process.env.PI_SHARE_VIEWER_URL || DEFAULT`
+    /// (`config.ts:504-508` @v0.83.0). The default is pi's verbatim — see [`DEFAULT_SHARE_VIEWER_URL`].
+    #[test]
+    fn an_unset_or_empty_override_falls_back_to_pi_s_default_base() {
+        assert_eq!(
+            share_viewer_url_from(None, "abc123"),
+            "https://pi.dev/session/#abc123",
+            "`DEFAULT_SHARE_VIEWER_URL` is `https://pi.dev/session/` (`config.ts:502`)"
+        );
+        assert_eq!(
+            share_viewer_url_from(Some(""), "abc123"),
+            "https://pi.dev/session/#abc123",
+            "JS `||` treats the empty string as unset — an exported-but-empty variable must not \
+             produce a bare `#abc123`"
+        );
+    }
+
+    /// The point of the item: a set variable REACHES the rendered link. Before this landed, `/share`
+    /// printed the gist URL alone and the variable had no reader anywhere in `crates/`.
+    #[test]
+    fn a_set_override_becomes_the_base_of_the_share_url() {
+        assert_eq!(
+            share_viewer_url_from(Some("https://viewer.example/s/"), "abc123"),
+            "https://viewer.example/s/#abc123"
+        );
     }
 }

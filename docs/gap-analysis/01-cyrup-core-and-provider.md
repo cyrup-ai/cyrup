@@ -194,6 +194,18 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 
 > **RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set UNCHANGED at 0 critical, 1 high, 4 medium, 6 low = 11**, plus the one `tracker` (`PROV-004`). The table now carries **43 rows: 31 fully closed, 11 open (4 of them partially), 1 `tracker`**. Sweep 8 **filed and closed `PROV-M01` in the same pass** — a real live behaviour defect on `github-copilot`, found by the assigned audit of hand-written delegating trait impls, and the **third instance of the dropped-delegation class** after `TOOL-024` (`RegisteredTool`) and `EXT-M03` (`WasmTool`), and the **first on a non-`Tool` trait**. `PROV-036` and `PROV-037` stay open but their fix sites were corrected — **both land in `crates/cyrup-session-svc`, outside this area's crates**; scheduling either against a provider-only agent will produce a blocked pass, which is exactly the failure the ledger's orchestration section names.
 
+> **RECOUNTED 2026-08-14 (sweep 9, fourth edition) — counted set: 0 critical, 4 high, 8 medium, 11 low = 23**, plus the one `tracker` (`PROV-004`). The table now carries **57 rows: 33 fully closed, 23 open (4 of them partially), 1 `tracker`**. *(Previous edition: 0 / 1 / 4 / 6 = 11, 31 closed, 43 rows.)*
+>
+> **This is the largest single filing this area has taken, and its provenance is different from every pass before it.** Sweeps 1-8 read the BACKLOG against the code. Sweep 9 enumerated a finite SURFACE — providers, wire-api ids, and the four compat interfaces — mechanically on both sides and diffed in both directions, so it could see the things nobody had written an item for. Fourteen ids: **`PROV-054` … `PROV-067`**, three of them **high**, two **filed and closed in the same pass** (`PROV-061`, `PROV-062`).
+>
+> **The three highs are all one class and it is the class this project has already shipped four of.** `PROV-023`/`024`/`033`/`034` were each a compat flag defaulting the wrong way; `PROV-054` (grok-4.5 on the wrong WIRE API, on the xai DEFAULT model), `PROV-055` (16 opencode rows leaking a `session_id` header pi suppresses) and `PROV-056` (kimi-coding sending a non-adaptive thinking block plus a beta header pi suppresses, on every model the provider has) are the same shape at data level rather than code level. **A compat flag defaulting the wrong way is a wire difference nobody sees**, and cyrup's resolvers invent a default wherever the catalog is silent — so a stale catalog does not degrade to "missing", it degrades to "confidently wrong".
+>
+> **`PROV-060` is the one to read first if you only read one.** It refutes the premise `PROV-004` and `PARITY-GAPS.md:931` (`OQ-5`) both rest on — that catalog accuracy is "not statically auditable" — by showing the `*.models.ts` files are full data literals at `b0c2a90e`, the very revision cyrup's manifest names as its provenance floor. That refutation is what makes `PROV-054` … `PROV-059` measurable at all, and it hands `PROV-018` its drift check. Nine sweeps inherited the "unverifiable" verdict; the data was one `git show` away.
+>
+> **Six of the fourteen are `cyrup-original`** (`PROV-058`, `PROV-061`, `PROV-063`, `PROV-064`, `PROV-065`, `PROV-067`) — surfaces cyrup has that pi does not. Not all are defects, and two are deliberate, but every one is now KNOWN, which is the point: an invented surface is how divergence enters while everyone is looking at parity.
+>
+> **Routing note.** `PROV-054` … `PROV-059` all have the same fix site and it is **not a hand edit**: they close together through `PROV-018` / `PROV-060`'s regeneration. Scheduling them individually will produce six agents each hand-patching one catalog row and each invalidating `catalog_manifest.json`. Schedule `PROV-060` + `PROV-018` as one piece of work and close the six as its verification.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | ~~PROV-M01~~ | ~~medium~~ **FILED AND CLOSED 2026-08-14** | parity-bug | S | Two hand-written `impl Provider` decorators dropped the trait-defaulted half of the surface pi's object spread carries — `github-copilot`'s credential filter was discarded in the overlay configuration — **FILED AND CLOSED 2026-08-14**: sweep 8. See the body below. |
@@ -239,6 +251,20 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 | ~~PROV-S04~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `estimateContextTokens`' message-anchored added-tool accounting unported — **CLOSED 2026-08-14**: sweep 1 — CLASSIFICATION CORRECTED: the item said the added-tool block was post-baseline (3d8f7435) and cyrup was "a faithful stale port". `git show v0.83.0:packages/ai/src/utils/estimate.ts` has it at :118-133, byte-identical to v0.84.1. It was a port omission. Citation-sweep miss of the same class as the nine already recorded. |
 | PROV-S05 | low | not-ported | M | `Models::refresh` has no `force`, no abort signal, no per-provider error map |
 | PROV-053 | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | **FILED AND CLOSED IN THE SAME PASS (sweep 2).** `EnvAuthContext` diverged from pi's `defaultProviderAuthContext()` (ai/src/auth/context.ts:22-40 @v0.83.0) in two ways: `file_exists` did not expand a leading `~` (pi does, at :29-33), and `env` returned `Some("")` for a blank variable where pi returns undefined unless `value.trim().length > 0` (:24-25). The first made the Vertex ADC arm unreachable **on every machine** — `ctx.fileExists(VERTEX_ADC_PATH)` was always false — and was PROV-030's real hidden blocker. The second is the more general hazard: every precedence chain ported from a JS `??` or truthiness test reads `Some("")` as CONFIGURED, which INVERTS the upstream semantics; the concrete instance is `GOOGLE_CLOUD_API_KEY=""` winning the coalesce at providers/google_vertex.rs:301-304 and suppressing the ADC fallback. Both fixed in `auth/types.rs` with the pi citations inline and pinned by two tests. **Worth a sweep: any other `ctx.env(...)`-fed `??` chain in this crate may have been written around the old `Some("")` behaviour.** |
+| PROV-054 | **high** | stale-port | S | `xai/grok-4.5` is routed over the WRONG WIRE API — cyrup's catalog says `openai-completions`, pi says `openai-responses` — and it is the xai DEFAULT model — **FILED 2026-08-14** (sweep 9, mechanical provider/compat surface enumeration) |
+| PROV-055 | **high** | stale-port | S | `opencode`: `sessionAffinityFormat: "openai-nosession"` absent on all 16 `openai-responses` rows, so cyrup emits a `session_id` header pi deliberately suppresses — **FILED 2026-08-14** (sweep 9) |
+| PROV-056 | **high** | stale-port | S | `kimi-coding`: `forceAdaptiveThinking` (×3) and `allowEmptySignature` (×1) absent — non-adaptive thinking block + an interleaved-thinking beta pi suppresses, on every request — **FILED 2026-08-14** (sweep 9) |
+| PROV-057 | medium | stale-port | M | 25 catalog models present upstream are absent from cyrup across 9 catalogs — each is a model id that resolves in pi and errors here — **FILED 2026-08-14** (sweep 9) |
+| PROV-058 | medium | cyrup-original | M | 16 catalog models cyrup ships that upstream retired before the ported tag — offered, autocompleted, streamed, and billed — **FILED 2026-08-14** (sweep 9) |
+| PROV-059 | medium | stale-port | M | 119 non-compat catalog field differences on models present in both sides — `cost` 55, `maxTokens` 36, `contextWindow` 25, `thinkingLevelMap` 2, `api` 1 — includes zero-priced `kimi-coding` and a 100k `contextWindow` understatement on three `openai-codex` rows — **FILED 2026-08-14** (sweep 9) |
+| PROV-060 | medium | tooling | M | Catalog provenance is split across two pi revisions and both predate the ported tag — **and `PROV-004`'s "no longer statically auditable" premise is REFUTED**: `git show b0c2a90e:` restores the full data literals — **FILED 2026-08-14** (sweep 9); this is what unblocks `PROV-018` |
+| ~~PROV-061~~ | ~~medium~~ **FILED AND CLOSED 2026-08-14** | cyrup-original | S | `fireworks` `glm-5p2` / `glm-5p2-fast` carried two INVENTED compat flags present at neither provenance revision — `sendSessionAffinityHeaders: true` made cyrup emit three affinity headers pi never sends — **FILED AND CLOSED 2026-08-14** (sweep 9). See the body below. |
+| ~~PROV-062~~ | ~~low~~ **FILED AND CLOSED 2026-08-14** | stale-port | S | `providers/all.rs`'s port-status table omits `all.ts:115-117` and its summary asserts the opposite of `PROV-014`; every line number in it is a `91585d9a` offset under a declared `v0.83.0` baseline — **FILED AND CLOSED 2026-08-14** (sweep 9). See the body below. |
+| PROV-063 | low | cyrup-original | S | `ModelCompat::supports_finish_reason` is a v0.84.1 flag with no v0.83.0 warrant — correctly labelled in-tree and unreachable in every shipped configuration, but it is the only field in `ModelCompat` without a baseline counterpart — **FILED 2026-08-14** (sweep 9) |
+| PROV-064 | low | cyrup-original | S | `groq` `qwen/qwen3-32b` has its `thinkingLevelMap` deliberately REMOVED relative to the ported tag (a documented, tested v0.84.1 forward-port) but carries no `[CYRUP-DELTA]` tag — **FILED 2026-08-14** (sweep 9) |
+| PROV-065 | low | cyrup-original | S | `openrouter-images.json` is a catalog file pi has no `*.models.ts` counterpart for (content verified exact against `image-models.generated.ts`) — noted so 35-vs-35 is not read as a one-to-one mapping — **FILED 2026-08-14** (sweep 9) |
+| PROV-066 | low | not-ported | S | `open_router_routing` is typed `serde_json::Value` where pi declares a structured 11-field `OpenRouterRouting` — wire-identical, but cyrup validates nothing a user writes — **FILED 2026-08-14** (sweep 9) |
+| PROV-067 | low | cyrup-original | S | The wire-api registry is an eager fn-pointer factory table where pi's laziness is per-module dynamic `import()` (`api/*.lazy.ts`) — same observable behaviour, substituted mechanism, no sign-off recorded — **FILED 2026-08-14** (sweep 9) |
 
 ## PROV-003 — `ApiKeyAuth` has no `login`; `Models` has no `login`/`logout` (OAuth flow half closed)
 
@@ -427,6 +453,22 @@ This area covers `cyrup/crates/cyrup-core` (message/type model, JSONL serializat
 **Fix** — This is PROV-018's `xtask gen-catalogs` and nothing else: once the generator exists, the diff is a command rather than an audit. Until then, do not re-derive by hand — record the constraint and move on.
 
 **Verify** — `cargo xtask gen-catalogs` against the pi revision each provider module names reproduces all 35 files byte-for-byte.
+
+> **⚠ CORRECTION 2026-08-14 (sweep 9) — this item's central premise is REFUTED, and the row is left
+> in place unchanged otherwise.** The **upstream** paragraph above ("Not obtainable … it cannot be
+> reproduced today at any tag") and `PARITY-GAPS.md:931` (`OQ-5`) both rest on the observation that
+> every `*.models.ts` is a two-line re-export. **That is true only from `a9f6a3159` onward.** At its
+> DIRECT PARENT `b0c2a90e` — the very revision `catalog_manifest.json` names as cyrup's provenance
+> floor — the files are still full data literals, because `a9f6a3159` (`feat(ai): separate generated
+> model data (#6765)`) is the commit that both added `.gitignore:11` and converted them.
+> `git log --oneline b0c2a90e..a9f6a3159` returns exactly one commit. The whole catalog is therefore
+> checkable with `git show b0c2a90e:packages/ai/src/providers/<p>.models.ts` plus a ~12-line node
+> script — **no generator run, no `npm install`, no network.** Sweep 9 did it: 35/35 catalogs parsed,
+> 1072 upstream models vs 1078 in cyrup, 1027 compared field-by-field. The results are filed as
+> `PROV-054` … `PROV-059`, and the provenance mechanism as `PROV-060`. Nine sweeps inherited the
+> "unverifiable" verdict from this paragraph; the data was one `git show` away the whole time.
+> **This does not close `PROV-004`** — the ledgered coverage hole and its `PROV-018` owner both
+> stand, and `PROV-018`'s drift check should be exactly the recipe in `PROV-060`.
 
 ## PROV-015 — `ApiStreamOptions` has no `openai-completions` variant
 
@@ -1307,6 +1349,268 @@ http 401: {"type":"error","error":{"type":"authentication_error","message":"inva
 * **`crates/cyrup-provider/tests/faux_not_in_normal_build.rs`** (new) — the invariant is a **Cargo feature-graph** property, which no `#[cfg]`-based Rust test can express (the resolver decides `feature = "faux"` before any Rust is parsed, and the resolver is what regressed), so the guard runs `cargo tree -p cyrup -e features --edges normal` and fails on any `feature "faux"` line, with the offending lines and the fix in the assertion message. **Demonstrated RED-then-GREEN mechanically on this pass**: re-adding `features = ["faux"]` to `crates/cyrup/Cargo.toml`'s `[dependencies]` produced `test result: FAILED. 1 passed; 1 failed`, printing `├── cyrup-provider feature "faux"`; reverting produced `test result: ok. 2 passed; 0 failed`. Its companion asserts the feature is **still** reachable on a dev edge, so the guard cannot be satisfied by deleting the double and stranding nine crates' offline oracle.
 * **`crates/cyrup-provider/src/unconfigured.rs`** — three new tests: the catalog is empty; the message is byte-identical to `formatNoModelsAvailableMessage()`; the (session-unreachable) direct `stream()` yields an actionable `error` terminal rather than a scripted answer.
 * Stale `faux` prose corrected in the same pass at `crates/cyrup/src/{provider.rs,main.rs,lib.rs}` — including `provider.rs`'s "a non-provider prefix maps to faux (ledgered) — no warn", which this item's Fix text specifically called out.
+
+
+## Findings filed 2026-08-14 (sweep 9 — the mechanical provider / wire-api / compat-flag surface enumeration)
+
+Filed by the surface sweep that enumerated **providers, wire APIs and per-provider compat flags** on
+both sides by command rather than by eye — pi `packages/ai/src/providers/all.ts` (registration list),
+`packages/ai/src/types.ts` (the four compat interfaces), `packages/ai/src/api/*` (wire-api ids) and
+all 35 `*.models.ts` catalogs, against `crates/cyrup-provider/src/{providers,api}`. **88 upstream
+entries vs 86 in cyrup; 1027 models compared field-by-field.**
+
+> **⚠ PROVENANCE OF THIS SECTION — state it before acting on any row below.** The catalog half of
+> this enumeration is **INCOMPLETE by construction, and the incompleteness has a specific shape.**
+> pi gitignores `packages/ai/src/providers/data/` (`.gitignore:11`) at the ported tag `v0.83.0`, so
+> **the catalogs below were read at `b0c2a90e`, a revision 13 days EARLIER than `v0.83.0`** — the
+> last revision at which the `*.models.ts` files are still full data literals rather than two-line
+> re-exports. Every catalog claim in `PROV-054` … `PROV-061` is therefore measured against
+> `b0c2a90e`, **not** against the ported baseline, and a clean refresh to `b0c2a90e` still leaves an
+> unmeasured 13-day residue. The compat-interface, wire-api-id and registration halves of the sweep
+> were read at `v0.83.0` directly and carry no such caveat. See `PROV-060`.
+
+> **Nothing in this section was closed by hand-patching catalog data, with one deliberate exception.**
+> `PROV-061` is invention — wrong at *both* provenance revisions — so removing it moves the data
+> TOWARD every upstream revision at once and cannot be undone by a future regeneration. Everything
+> else in `PROV-054` … `PROV-059` is provenance lag, and hand-patching those would fix a handful of
+> rows while destroying the one property the catalogs still have: a single stated provenance
+> revision. Those close correctly only through `PROV-018`'s bulk regeneration, in the commit that
+> rewrites `catalog_manifest.json`.
+
+## PROV-054 — `xai/grok-4.5` is routed over the WRONG WIRE API (`openai-completions` where pi uses `openai-responses`), and it is the xai default model
+
+**Kind** stale-port · **Severity** **high** · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — pi `packages/ai/src/providers/xai.models.ts:25-42` @`b0c2a90e` — `"grok-4.5": { api: "openai-responses", compat: {"supportsLongCacheRetention":false}, thinkingLevelMap: {"off":null,"minimal":null} }`. Contrast `:10` and `:47` where `grok-4.3` and `grok-build-0.1` are `api: "openai-completions"`. At `91585d9a` grok-4.5 WAS `openai-completions` with compat `{supportsStore/supportsDeveloperRole/supportsReasoningEffort:false}` — **pi moved it to the Responses API before the ported tag.**
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog/xai.json` still carries the pre-move row verbatim: `"api": "openai-completions"`, the three old compat flags, no `thinkingLevelMap`, and no `supportsLongCacheRetention: false`.
+
+**Impact** — The highest-severity item on this surface, and **not a flag — the protocol.** cyrup builds a Chat-Completions body and POSTs it to the Completions path for xAI's flagship model, where pi builds a Responses body (`input[]` not `messages[]`, a `reasoning` object, a different SSE event grammar). Every `grok-4.5` request diverges wholesale. Compounding: `thinkingLevelMap {off:null, minimal:null}` is absent so `off`/`minimal` are not suppressed, and `supportsLongCacheRetention:false` is absent so the resolver defaults it **true** (`detect_compat` gives `true` for xai) and will offer long cache retention xAI rejects. **This is on the default path** — `CFG-045` (`05-cyrup-config-and-resources.md:423`) makes `grok-4.5` the xai default model. No existing id covers it: `grep -rn 'grok-4.5' docs/gap-analysis/` hits only the model-resolver item, never the api mismatch.
+
+**Fix** — Regenerate `xai.json` from `b0c2a90e` (`PROV-018` / `PROV-060`); do NOT hand-patch the single row, because the same file also carries five retired models (`PROV-058`) and two field diffs (`PROV-059`) and a one-row patch leaves the manifest lying about all three. If `PROV-018` is not imminent, the **whole `xai.json` file** may be replaced in one commit with the `b0c2a90e` extraction and `catalog_manifest.json` amended in the same commit to record xai's revision explicitly.
+
+**Verify** — `pick(&selection(), "xai", "grok-4.5").api == "openai-responses"`; its `thinking_level_map` maps `off` and `minimal` to `None`; `get_responses_compat` resolves `supports_long_cache_retention == false`; and a wire test asserting the request body for `xai/grok-4.5` is a Responses envelope (`input`) rather than a Completions one (`messages`). All four are RED today.
+
+## PROV-055 — `opencode`: `sessionAffinityFormat: "openai-nosession"` missing on all 16 `openai-responses` rows, so cyrup leaks a `session_id` header pi suppresses
+
+**Kind** stale-port · **Severity** **high** · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — pi `packages/ai/src/providers/opencode.models.ts` @`b0c2a90e` sets `compat {"sessionAffinityFormat":"openai-nosession"}` on `gpt-5`, `gpt-5-codex`, `gpt-5-nano`, `gpt-5.1`, `gpt-5.1-codex`, `gpt-5.1-codex-max`, `gpt-5.1-codex-mini`, `gpt-5.2`, `gpt-5.2-codex`, `gpt-5.3-codex`, `gpt-5.4`, `gpt-5.4-mini`, `gpt-5.4-nano`, `gpt-5.4-pro`, `gpt-5.5`, `gpt-5.5-pro` (all `api: openai-responses`). Consumed at `packages/ai/src/api/openai-responses.ts:232-241`.
+
+**cyrup** — all 16 rows in `crates/cyrup-provider/src/providers/catalog/opencode.json` carry `"compat": null`.
+
+**Impact** — **Exactly the `PROV-023`/`024`/`033`/`034` shape, and unconditionally live.** The `openai-responses` header gate is `if (sessionId)` with **no** `sendSessionAffinityHeaders` guard (`openai-responses.ts:232`), so the *format alone* decides the headers. With the flag omitted, `get_responses_compat` (`api/compat.rs:267-286`) falls back to `detect_session_affinity_format` (`compat.rs:84-92`), which returns `Openai` for provider `opencode` — and cyrup then emits a `session_id` header (`api/openai_responses.rs:553-555`) that pi deliberately suppresses, on all 16 models, on every request that carries a session id. A silent wire difference that leaks a session identifier to OpenCode Zen. This is the fourth instance of the class the ledger already tracks four of; the class is not "occasionally wrong", it is "wrong by default whenever the catalog is silent".
+
+**Fix** — `PROV-018` / `PROV-060` regeneration of `opencode.json`. **A stopgap worth considering separately, because it removes the whole class:** `detect_session_affinity_format` invents a default for a field pi resolves purely from data. Auditing it against the providers that actually declare the flag upstream — and preferring `NoSession` where pi's catalogs say so — would be a code fix in this crate rather than a data fix, but it must not be done by guessing; derive it from the `b0c2a90e` catalogs.
+
+**Verify** — For each of the 16 ids, `get_responses_compat(model).session_affinity_format == SessionAffinityFormat::OpenaiNoSession`, and `build_headers` with a session id present emits **no** `session_id` header. RED today on all 16.
+
+## PROV-056 — `kimi-coding`: `forceAdaptiveThinking` (×3) and `allowEmptySignature` (×1) missing — two wire divergences per request on every model of the provider
+
+**Kind** stale-port · **Severity** **high** · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — pi `packages/ai/src/providers/kimi-coding.models.ts` @`b0c2a90e` — `k2p7` compat `{"forceAdaptiveThinking":true}`; `kimi-k2-thinking` compat `{"forceAdaptiveThinking":true}`; `kimi-for-coding` compat `{"allowEmptySignature":true,"forceAdaptiveThinking":true}`. All three carry `{}` at `91585d9a`, so this is the same one-week provenance gap.
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog/kimi-coding.json`: all three rows have `"compat": null`.
+
+**Impact** — `forceAdaptiveThinking` is read **raw off `model.compat`**, not through a resolver, at three sites in pi's `anthropic-messages` route (`api/anthropic-messages.ts:815`, `:858`, `:1033`): it forces `thinking.type: "adaptive"` plus `output_config.effort`, and at `:858` it **suppresses** the interleaved-thinking beta header (`needsInterleavedBeta = interleavedThinking && model.compat?.forceAdaptiveThinking !== true`). cyrup therefore sends the non-adaptive thinking block **and** the `interleaved-thinking-2025-05-14` beta to an upstream pi has flagged as requiring the adaptive format — two divergences per request, on all three models, which is every model this provider has. `allowEmptySignature:true` missing on `kimi-for-coding` additionally makes cyrup convert empty-signature thinking blocks to text instead of replaying `signature:""` (`anthropic-messages.ts:967`), corrupting thinking replay. Note the interaction with `PROV-059`: the same three rows are also priced at zero.
+
+**Fix** — `PROV-018` / `PROV-060` regeneration of `kimi-coding.json`.
+
+**Verify** — `get_anthropic_compat` is not the right probe (pi excludes `forceAdaptiveThinking` from its resolver and cyrup correctly matches that) — assert on the raw model: `pick(&selection(),"kimi-coding","k2p7").compat.unwrap().force_adaptive_thinking == Some(true)` for all three, `allow_empty_signature == Some(true)` for `kimi-for-coding`, plus a `build_params` test asserting `thinking.type == "adaptive"` and the ABSENCE of the interleaved beta header. RED today.
+
+## PROV-057 — 25 catalog models present upstream are absent from cyrup, across 9 catalogs
+
+**Kind** stale-port · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — pi `packages/ai/src/providers/{azure-openai-responses,cloudflare-ai-gateway,kimi-coding,moonshotai,moonshotai-cn,openai,opencode,opencode-go,openrouter,vercel-ai-gateway}.models.ts` @`b0c2a90e`.
+
+**cyrup** — enumerated exhaustively, by catalog:
+
+| catalog | absent model ids |
+|---|---|
+| `azure-openai-responses` | `gpt-realtime-2.1` |
+| `cloudflare-ai-gateway` | `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `workers-ai/@cf/zai-org/glm-5.2` |
+| `kimi-coding` | `k3`, `kimi-for-coding-highspeed` |
+| `moonshotai` | `kimi-k3` |
+| `moonshotai-cn` | `kimi-k3` |
+| `openai` | `gpt-realtime-2.1` |
+| `opencode` | `gpt-5.6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra` |
+| `opencode-go` | `grok-4.5`, `kimi-k3` |
+| `openrouter` | `kwaipilot/kat-coder-air-v2.5`, `kwaipilot/kat-coder-pro-v2.5`, `meta/muse-spark-1.1`, `moonshotai/kimi-k3` |
+| `vercel-ai-gateway` | `anthropic/claude-opus-4.7-fast`, `anthropic/claude-opus-4.8-fast`, `kwaipilot/kat-coder-air-v2.5`, `kwaipilot/kat-coder-pro-v2.5`, `moonshotai/kimi-k3`, `thinkingmachines/inkling` |
+
+**Impact** — Each is a model id that resolves in pi and errors here. The root cause is **one provenance decision, not nine bugs**: 31 of 35 catalogs were extracted at `91585d9a` (2026-07-10) though `b0c2a90e` (2026-07-17, the last in-git revision) was available, and 12 of those 31 changed in the intervening week and were never refreshed. `catalog_manifest.json` documents the split. See `PROV-060`.
+
+**Fix** — `PROV-018` / `PROV-060`. Do not add rows by hand.
+
+**Verify** — After regeneration, `models.get_model(provider, id).is_some()` for all 25.
+
+## PROV-058 — 16 catalog models exist in cyrup that upstream retired before the ported tag
+
+**Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog/{xai,vercel-ai-gateway,openrouter}.json`. Exhaustive list: **xai** `grok-3`, `grok-3-fast`, `grok-4.20-0309-non-reasoning`, `grok-4.20-0309-reasoning`, `grok-code-fast-1` (cyrup ships 8 xai models, pi ships 3); **vercel-ai-gateway** `anthropic/claude-3.5-haiku`, `arcee-ai/trinity-large-preview`, `meituan/longcat-flash-chat`, `meituan/longcat-flash-thinking-2601`, `mistral/devstral-small`, `mistral/pixtral-large`, `xiaomi/mimo-v2-flash`, `xiaomi/mimo-v2-pro`; **openrouter** `arcee-ai/trinity-mini`, `liquid/lfm-2.5-1.2b-thinking:free`, `openai/gpt-oss-120b:free`.
+
+**upstream** — all 16 were removed between `91585d9a` and `b0c2a90e`, i.e. **before** the ported tag `v0.83.0`.
+
+**Impact** — This is the reverse face of `PROV-057`'s single provenance gap rather than free invention, but it is a real divergence and it is the class this project has no habit of tracking: cyrup **offers, autocompletes and will attempt to stream** 16 model ids pi retired, and their pricing rows keep accruing in usage totals. An id that is gone upstream is usually gone at the vendor too, so the reachable outcome is a model that appears in `/model`, is selectable, and then fails at the API.
+
+**Fix** — `PROV-018` / `PROV-060` regeneration, which deletes them as a side effect of replacing the file. Do not delete by hand for the reason in the section preamble.
+
+**Verify** — After regeneration, `models.get_model(provider, id).is_none()` for all 16, and `xai`'s catalog has exactly 3 rows.
+
+## PROV-059 — 119 non-compat catalog field differences on models present in both sides
+
+**Kind** stale-port · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — pi `packages/ai/src/providers/*.models.ts` @`b0c2a90e` vs `crates/cyrup-provider/src/providers/catalog/*.json` — **1027 shared models compared field-by-field.**
+
+**cyrup** — breakdown by field: `cost` 55, `maxTokens` 36, `contextWindow` 25, `thinkingLevelMap` 2, `api` 1. By provider: `openrouter` 97, `openai-codex` 5, `vercel-ai-gateway` 5, `kimi-coding` 3, `azure-openai-responses` 2, `openai` 2, `xai` 2, `cerebras` 1, `groq` 1, `opencode` 1. (The single `api` difference is `PROV-054`; one of the two `thinkingLevelMap` differences is `PROV-064`, which is deliberate.)
+
+**Impact** — **These are behavioural, not cosmetic.** Concrete worst cases:
+* **(a)** `kimi-coding` `k2p7` / `kimi-for-coding` / `kimi-k2-thinking` all have `cost {input:0, output:0, cacheRead:0, cacheWrite:0}` in cyrup against real prices upstream (0.95/4/0.19 and 0.6/2.5/0.15) — **every kimi-coding session reports zero spend.**
+* **(b)** `cerebras` `zai-glm-4.7` has `cacheRead: 0` in cyrup vs `2.25` upstream (`cerebras.models.ts:55`) — cached reads billed at zero.
+* **(c)** `openai` / `openai-codex` / `azure` `gpt-5.6-luna` and `gpt-5.6-terra` carry roughly 5× understated cost tiers (luna `input` 0.2 vs 1; terra `input` 2 vs 2.5 with every tier scaled down).
+* **(d)** `openai-codex` `gpt-5.6-luna`/`sol`/`terra` have `contextWindow: 272000` in cyrup vs `372000` upstream — **cyrup compacts 100k tokens early on all three.**
+
+`maxTokens` and `contextWindow` feed overflow estimation and compaction triggers; `cost` feeds `/session` and every usage total.
+
+**Fix** — `PROV-018` / `PROV-060`. **`PROV-004` is the nearest existing tracker and it explicitly classifies this as unverifiable** ("no longer checkable from this workspace"); that premise is refuted — see the correction block under `PROV-004` and see `PROV-060`. These are demonstrated wrong values now, not audit debt.
+
+**Verify** — The regeneration recipe in `PROV-060` re-run against `b0c2a90e` yields zero field differences on the 1027 shared models, and that recipe becomes `PROV-018`'s drift check.
+
+## PROV-060 — Catalog provenance is split across two pi revisions, both predate the ported tag — and the "not statically auditable" premise is REFUTED
+
+**Kind** tooling · **Severity** medium · **Effort** M · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — pi `.gitignore:11` gitignores `packages/ai/src/providers/data/` at `v0.83.0`; `a9f6a3159` (`feat(ai): separate generated model data (#6765)`) is the commit that added that line, and **`b0c2a90e` is its direct parent** — `git log --oneline b0c2a90e..a9f6a3159` returns exactly one commit.
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog_manifest.json` records `generatedAt` `2026-07-17T09:00:03Z` / `source` `pi@b0c2a90e`, but **its own note concedes only 4 catalogs** (`amazon-bedrock`, `github-copilot`, `google-vertex`, `openai-codex`) came from `b0c2a90e` while the other **31 came from `91585d9a`** (2026-07-10). Twelve of those 31 changed in the intervening week — `azure-openai-responses`, `cerebras`, `cloudflare-ai-gateway`, `kimi-coding`, `moonshotai`, `moonshotai-cn`, `openai`, `opencode`, `opencode-go`, `openrouter`, `vercel-ai-gateway`, `xai`.
+
+**Impact** — Two distinct things, and the second is the important one.
+
+1. **That single unrefreshed week is the root cause of `PROV-054` … `PROV-059`** — 25 missing models, 16 retired-but-shipped models, 27 of the 28 compat differences and most of the 119 field differences. The manifest's *value* is right (`PROV-039` correctly demanded the LATEST revision, and it was set) but it **describes a floor the catalogs do not actually sit on**, which is a worse failure than the one `PROV-039` closed: the drift guard now reports a provenance the data does not have.
+2. **`PROV-004`'s and `PARITY-GAPS.md:931` (`OQ-5`)'s "not statically auditable" verdict is FALSE.** Both record, as settled, that "every `*.models.ts` at v0.84.1 is a two-line re-export, so no pricing, context-window, maxTokens or compat-flag claim about the 35 embedded catalogs can be checked by reading this workspace", and `PROV-004` is downgraded to "a verification task, not a fix task" on that basis. The re-export form begins at `a9f6a3159`; at its parent `b0c2a90e` — **precisely the revision cyrup's own manifest names as its provenance floor** — the files are full data literals. The entire catalog is checkable with `git show b0c2a90e:packages/ai/src/providers/<p>.models.ts` plus a ~12-line node script: no generator run, no `npm install`, no network. Nine sweeps read the backlog and inherited the "unverifiable" verdict; the data was one `git show` away.
+
+**Residue that a clean refresh does NOT remove, stated so nobody claims parity from it:** both revisions predate `v0.83.0` (2026-07-30) by 13–20 days. Even a perfect refresh to `b0c2a90e` leaves an **unmeasurable** 13-day window, because from `a9f6a3159` onward the data is genuinely not in git. Any future claim of catalog parity at `v0.83.0` is therefore a claim about `b0c2a90e` plus an unbounded delta, and should say so.
+
+**Fix** — (1) Make `PROV-018`'s `xtask gen-catalogs` extract from `b0c2a90e` via `git show`, rewrite all 35 files **and** `catalog_manifest.json` in one commit, and make the manifest **per-provider** (`{provider: {generatedAt, source}}`) so a split can never again be described by a single value — `remote_catalog.rs`'s floor comparison then becomes per provider, which is what `PROV-039`'s Fix already proposed. (2) Ship the same extraction as `PROV-018`'s **drift check**: it is a diff, so it can run in CI against a pinned pi worktree. (3) Record the irreducible 13-day residue in the manifest note itself, not only here.
+
+**Verify** — `cargo xtask gen-catalogs` reproduces all 35 files byte-for-byte from `b0c2a90e`; the manifest names a revision per provider; the drift check fails when a catalog is hand-edited (this is the guard `PROV-061` had to be closed without).
+
+## PROV-061 — `fireworks` `glm-5p2` / `glm-5p2-fast` carried two INVENTED compat flags — **FILED AND CLOSED 2026-08-14**
+
+**Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** confirmed · **Filed and closed** 2026-08-14 (sweep 9)
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog/fireworks.json`, rows `accounts/fireworks/models/glm-5p2` and `accounts/fireworks/routers/glm-5p2-fast`, compat `{supportsStore:false, supportsDeveloperRole:false, sendSessionAffinityHeaders:true, supportsLongCacheRetention:false}`.
+
+**upstream** — pi has compat `{"supportsStore":false,"supportsDeveloperRole":false}` for both rows at **BOTH** provenance revisions (`91585d9a` and `b0c2a90e`, `fireworks.models.ts:61-68` and `:224-231`). The two extra flags exist in neither, so this is **invention, not staleness** — which is why it was closable here while `PROV-054` … `PROV-059` are not: removing it moves the data toward every upstream revision at once.
+
+**Impact** — A genuine cyrup-original with a live wire effect, and the mechanism is visible in the file: these two are the **only** `openai-completions` rows in `fireworks.json`; the other 14 are `anthropic-messages` and legitimately carry `{sendSessionAffinityHeaders:true, supportsEagerToolInputStreaming:false, supportsCacheControlOnTools:false, supportsLongCacheRetention:false}`. The flag block was **pattern-matched across the whole provider instead of copied per row** — plausibly encouraged by pi's own doc comment at `types.ts:604-611`, which names Fireworks as the motivating case for `sendSessionAffinityHeaders`. Effect: on the `openai-completions` route the emission gate is `if (sessionId && compat.sendSessionAffinityHeaders)` (`openai-completions.ts:647`), and `detect_compat` gives `false` for fireworks (`api/compat.rs:491`), so the catalog value alone decided it — cyrup emitted `session_id`, `x-client-request-id` and `x-session-affinity` on these two models where pi emits none. `supportsLongCacheRetention:false` is inert here (`cacheControlFormat` is not `"anthropic"` for fireworks, so `getCompatCacheControl` short-circuits at `openai-completions.ts:883`) but is still an unfounded value. **This is the `CYRUP_SHARE_VIEWER_URL` shape**: a flag that reads as deliberate and has no upstream warrant.
+
+**Fix — LANDED.** Both invented keys deleted from both rows; `supportsStore`/`supportsDeveloperRole` kept exactly as upstream has them. No other row in the file was touched — the fourteen `anthropic-messages` rows keep `sendSessionAffinityHeaders: true` because that **is** upstream's value for them.
+
+**Verify — DONE.** `crates/cyrup-provider/src/tests/catalog_data.rs` →
+`fireworks_openai_completions_rows_carry_no_invented_affinity_or_cache_flags`. RED before on both
+rows. The assertion is scoped to **every** `openai-completions` row of the provider rather than the
+two ids, so re-introducing the pattern-match on a future row fails too; it also asserts the two
+legitimate flags are still present, so the test cannot be satisfied by deleting the compat block, and
+it pins the row count at 2 with a message telling the next reader to re-derive the scope if that
+changes. `cargo check -p cyrup-provider --all-targets` green.
+
+## PROV-062 — `providers/all.rs`'s port-status table omits `all.ts:115-117` and its guard asserted the opposite of `PROV-014` — **FILED AND CLOSED 2026-08-14**
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed and closed** 2026-08-14 (sweep 9)
+
+**upstream** — pi `packages/ai/src/providers/all.ts:115-117` @`v0.83.0` — `qwenTokenPlanProvider()`, `qwenTokenPlanCnProvider()`, `radiusProvider()`.
+
+**cyrup** — an in-tree documentation defect, in the file `PROV-014` is about. `crates/cyrup-provider/src/providers/all.rs`'s header tabulated pi's `builtinProviders()` line by line and **had no row for `all.ts:115`, `:116` or `:117`** — the mapping silently ended at 33 of 36 entries. The prose immediately below then asserted "Every provider pi's `builtinProviders()` constructs is registered below", which is false. The guard test went further: where the not-yet-ported assertion used to be, it recorded "Every built-in provider pi ships is now ported, so there is no not-yet list left to assert against" — **so the file that documents the gap denied it, in the same header that scolds an earlier sweep for exactly this failure mode.**
+
+**Root cause, found while fixing and worth more than the fix** — every line number in that table was a **`91585d9a` offset carried under a declared `v0.83.0` baseline**. At `91585d9a`, `amazonBedrockProvider()` really is `all.ts:72` as the table said; at `v0.83.0` it is `:89`. And `git show 91585d9a:packages/ai/src/providers/all.ts | grep -n 'qwenTokenPlan\|radiusProvider'` returns **nothing** — the three providers did not exist at the revision the table was transcribed from. The omission was not carelessness; it was a faithful transcription of the wrong revision, which is the same defect class as the nine wrong-at-the-tag citations the 2026-08-12 repair pass corrected (`PROV-041`), and it is why the omission survived every subsequent read of the file.
+
+**Fix — LANDED.** (1) The whole table re-derived at `v0.83.0` (offsets `:89`–`:126`) with three new rows for `qwen-token-plan`, `qwen-token-plan-cn` and `radius` marked **`✗ NOT REGISTERED — PROV-014`**. (2) The false summary replaced with "33 of pi's 36 built-in providers are registered below", scoped so the surviving true half (every registered provider's api ids have impls) is still stated and still names the test that enforces it. (3) The deleted not-yet-ported assertion **restored** with the three ids, with a message telling a future porter to remove the id from the array and the NOT-REGISTERED row from the table in the same commit. (4) A note in the header recording what the table used to say, so a reader who remembers the old text can see it was wrong rather than assume the file regressed.
+
+**Verify — DONE.** `crates/cyrup-provider/src/providers/all.rs` →
+`registry_contains_implemented_provider_ids` now asserts `qwen-token-plan`, `qwen-token-plan-cn` and
+`radius` are **absent** from `default_models(...)`'s provider ids. It is green today and goes red the
+moment one is registered without a working stream path — the "absent until real" invariant the array
+was created for and was deleted with. `cargo check -p cyrup-provider --all-targets` green. **This does
+not close `PROV-014`**, which is the actual port work.
+
+## PROV-063 — `ModelCompat::supports_finish_reason` is a v0.84.1 flag with no v0.83.0 warrant
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**cyrup** — `crates/cyrup-provider/src/api/compat.rs:126-131` (`ModelCompat`), `:302-303` (`ResolvedCompat`), detected `true` at `:469`, resolved at `:519-521`; sole consumer `api/openai_completions.rs:1709`.
+
+**upstream** — `git grep supportsFinishReason v0.83.0 -- packages/ai` is **empty**. The flag first appears at v0.84.1 (`types.ts:548`, `openai-completions.ts:578`, `:584`, `:1499`, `:1551`).
+
+**Assessment — a knowing forward-port, correctly labelled, and inert.** cyrup's doc comment cites the v0.84.1 lines explicitly rather than claiming a v0.83.0 warrant. It is the **only** field in cyrup's `ModelCompat` with no v0.83.0 counterpart — all 38 pi flags across the four compat interfaces are present and no other extras exist. No embedded catalog sets it (`grep` over `providers/catalog/*.json` is empty) and `detect_compat` pins it `true`, so the only branch that reads it (`openai_completions.rs:1709`) is unreachable in every shipped configuration and behaviour is byte-identical to v0.83.0.
+
+**Impact** — None today. Filed because an inventoried cyrup-original is the point: this is the one place a reader auditing "does cyrup's compat model match pi's" will find a field that is not in the baseline, and without a row they will either re-derive the analysis or, worse, treat its presence as licence for the next one.
+
+**Fix** — No code change proposed. Either keep it with a `[CYRUP-DELTA]` tag naming v0.84.1 as its warrant (the cheap option, and consistent with how the project marks forward-ports elsewhere), or fold it into whatever item lands the v0.84.1 rebase. **Do not silently delete it** — it is real upstream behaviour, just not at this tag.
+
+**Verify** — A test asserting `detect_compat(..).supports_finish_reason == true` for every provider, so the flag's inertness is a pinned property rather than an observation that decays.
+
+## PROV-064 — `groq` `qwen/qwen3-32b` has its `thinkingLevelMap` deliberately removed relative to the ported tag, with no `[CYRUP-DELTA]` tag
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog/groq.json` has no `thinkingLevelMap` on `qwen/qwen3-32b`, with the rationale and a guard test at `providers/fleet.rs:257-278`.
+
+**upstream** — pi at `b0c2a90e` gives the row `thinkingLevelMap {minimal:null, low:null, medium:null, high:"default"}`. `fleet.rs:257-262` explains that upstream retargeted the sole generator override from `qwen/qwen3-32b` (v0.83.0 `generate-models.ts:837`) to `qwen/qwen3.6-27b` (v0.84.1 `:870`), and the test at `:264` asserts the absence.
+
+**Impact** — A deliberate, documented and tested v0.84.1 forward-port — **but it IS a divergence from v0.83.0** and it should carry a `[CYRUP-DELTA]` tag rather than only a prose note, because the tag is what makes it findable by the mechanism the project uses to find accepted divergences. Effect at the ported tag: pi maps `high` to the literal `"default"` and pins `low`/`medium` to `null` for this model; cyrup passes the raw effort through. It is one of only **two** `thinkingLevelMap` differences in the entire 1027-model comparison — the other is `PROV-054`, which is not deliberate.
+
+**Fix** — Add the `[CYRUP-DELTA]` tag at `providers/fleet.rs:257-262` naming the v0.83.0 value it diverges from and the v0.84.1 commit that justifies it. Note the interaction with `PROV-060`: a regeneration from `b0c2a90e` will **re-introduce** the map and turn the guard test red, so the regeneration must carry this exception explicitly or it will be silently reverted.
+
+**Verify** — The `[CYRUP-DELTA]` grep finds it; `PROV-018`'s generator has a named exception list containing this row, and its drift check reports the row as an accepted difference rather than as noise.
+
+## PROV-065 — `openrouter-images.json` is a catalog file pi has no `*.models.ts` counterpart for
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**cyrup** — `crates/cyrup-provider/src/providers/catalog/openrouter-images.json`, 35 rows.
+
+**upstream** — pi keeps image models in `packages/ai/src/image-models.generated.ts` (`IMAGE_MODELS.openrouter`) rather than in `providers/*.models.ts`, so the file has **no upstream counterpart by name**. Content verified **exact**: the 35 ids match `image-models.generated.ts` @`b0c2a90e` with zero differences in either direction.
+
+**Impact** — A benign structural original. Filed for one reason only: so the **35-vs-35 catalog count is not mistaken for a clean one-to-one mapping.** The true mapping is 34 shared names, plus `together` (inline Rust in cyrup, `together.models.ts` in pi, 20/20 exact), plus `openrouter-images`, against pi's 37 `*.models.ts` files. A future sweep that compares directory counts and stops will conclude the catalog set is complete; it is not (`PROV-014` names three providers with no catalog at all).
+
+**Fix** — No code change. `PROV-018`'s generator must source this file from `image-models.generated.ts`, not from `providers/*.models.ts`, and `catalog_manifest.json`'s per-provider note (`PROV-060`) should record that different source path.
+
+**Verify** — The generator reproduces `openrouter-images.json` from `image-models.generated.ts`; a comment in the file names its upstream source so the next reader does not go looking for `openrouter-images.models.ts`.
+
+## PROV-066 — `open_router_routing` is typed `serde_json::Value` where pi declares a structured `OpenRouterRouting`
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**cyrup** — `crates/cyrup-provider/src/api/compat.rs:147` types `open_router_routing` as `serde_json::Value`.
+
+**upstream** — pi `packages/ai/src/types.ts:664-707` declares `OpenRouterRouting` with 11 fields, including the `sort` string-or-object union and the five-key `max_price` object.
+
+**Impact** — Wire-identical: the value is passed through verbatim as the `provider` request field on both sides. What is lost is **validation** — cyrup accepts any JSON a user writes into `openRouterRouting` and forwards it, where pi rejects a misspelled key at the type level. The failure mode is a silently ignored routing preference (OpenRouter ignores unknown members), which presents as "my `order` never takes effect" with nothing anywhere saying why.
+
+**Verified clean while here, recorded so it is not re-derived** — the headline shape difference this finding started from is a **non-issue**: `ResolvedCompat` (`compat.rs:297-326`) has no counterpart for `openRouterRouting` or `vercelGatewayRouting`, and neither does it need one. pi never reads the resolved copies — both emission sites read the RAW `model.compat` (`openai-completions.ts:823` `if (model.compat?.openRouterRouting)` and `:828` `if (model.compat?.vercelGatewayRouting)`) — so pi's two resolved fields are dead. cyrup does the same at `openai_completions.rs:436-454`, and the vercel gateway shape matches exactly (only/order gate, `providerOptions.gateway` envelope). Documented at `compat.rs:294-296`.
+
+**Fix** — Give `open_router_routing` a typed struct mirroring `types.ts:664-707`, with `deny_unknown_fields` and an untagged enum for `sort`. Serialization must stay byte-identical (skip-if-none on every optional).
+
+**Verify** — A round-trip test over a fully populated routing object producing byte-identical JSON to today's `Value` path, plus a test that a misspelled key is a config error rather than a silent pass-through.
+
+## PROV-067 — The wire-api registry is an eager fn-pointer factory table where pi's laziness is per-module dynamic `import()`
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed · **Filed** 2026-08-14 (sweep 9)
+
+**upstream** — pi `packages/ai/src/types.ts:16-26` `KnownApi` (10 ids) and `:30` `KnownImagesApi` (`openrouter-images`); the `api/*.lazy.ts` modules perform dynamic `import()`.
+
+**cyrup** — **zero diff on the id sets.** `lib.rs:187-201` declares exactly the same 10 (`anthropic-messages`, `openai-completions`, `openai-responses`, `azure-openai-responses`, `google-generative-ai`, `google-vertex`, `mistral-conversations`, `bedrock-converse-stream`, `pi-messages`, `openai-codex-responses`), `api/mod.rs:129-171` registers all 10, and `images/openrouter.rs` covers `openrouter-images`. What differs is the **mechanism**: pi's laziness is per-module dynamic `import()` (`api/*.lazy.ts`); cyrup's is a fn-pointer factory table with get-or-init (`api/mod.rs:80-119`).
+
+**Impact** — None observable: same laziness, same ids, same construction points. Filed under the standing **port-mechanism fidelity** rule, which says port the literal mechanism and do not substitute an idiomatic-Rust design without explicit sign-off. Rust has no dynamic `import()`, so a factory table is very likely the right answer — but that is a *decision*, and right now it exists nowhere except in the shape of the code, so a future reader auditing this file cannot distinguish "considered and chosen" from "nobody noticed".
+
+**Fix** — No code change proposed. Record the substitution in `api/mod.rs`'s header as a `[CYRUP-DELTA, mechanism]` naming `api/*.lazy.ts` and stating why the factory table is equivalent (nothing observable depends on module-load timing; construction is still deferred to first `get`).
+
+**Verify** — The `[CYRUP-DELTA]` grep finds it; a test asserting `ApiRegistry` constructs nothing until the first `get`, so the "same observable laziness" claim is pinned rather than asserted.
 
 
 ## Coverage

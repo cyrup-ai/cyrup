@@ -5,48 +5,63 @@
 //! `Models` collection ([`all.ts:111-117`]); the model pattern then resolves to the owning provider.
 //! This module mirrors that for the providers actually implemented in this crate today.
 //!
-//! ## Pi `all.ts` `builtinProviders()` listing (line numbers from `all.ts:71-107`):
+//! ## Pi `all.ts` `builtinProviders()` listing (line numbers from `all.ts:89-126` **@ `v0.83.0`**):
 //!
 //! | Pi line | provider id              | here                                   |
 //! |---------|--------------------------|----------------------------------------|
-//! | 72      | `amazon-bedrock`         | ✓                                      |
-//! | 73      | `ant-ling`               | ✓ fleet                                |
-//! | 74      | `anthropic`              | ✓                                      |
-//! | 75      | `azure-openai-responses` | ✓                                      |
-//! | 76      | `cerebras`               | ✓ fleet                                |
-//! | 77      | `cloudflare-ai-gateway`  | ✓                                      |
-//! | 78      | `cloudflare-workers-ai`  | ✓                                      |
-//! | 79      | `deepseek`               | ✓ fleet                                |
-//! | 80      | `fireworks`              | ✓                                      |
-//! | 81      | `github-copilot`         | ✓                                      |
-//! | 82      | `google`                 | ✓                                      |
-//! | 83      | `google-vertex`          | ✓                                      |
-//! | 84      | `groq`                   | ✓ fleet                                |
-//! | 85      | `huggingface`            | ✓ fleet                                |
-//! | 86      | `kimi-coding`            | ✓ anthropic-compat fleet               |
-//! | 87      | `minimax`                | ✓ anthropic-compat fleet               |
-//! | 88      | `minimax-cn`             | ✓ anthropic-compat fleet               |
-//! | 89      | `mistral`                | ✓                                      |
-//! | 90      | `moonshotai`             | ✓ fleet                                |
-//! | 91      | `moonshotai-cn`          | ✓ fleet                                |
-//! | 92      | `nvidia`                 | ✓ fleet                                |
-//! | 93      | `openai`                 | ✓                                      |
-//! | 94      | `openai-codex`           | ✓                                      |
-//! | 95      | `opencode`               | ✓                                      |
-//! | 96      | `opencode-go`            | ✓                                      |
-//! | 97      | `openrouter`             | ✓ fleet                                |
-//! | 98      | `together`               | ✓                                      |
-//! | 99      | `vercel-ai-gateway`      | ✓ anthropic-compat fleet               |
-//! | 100     | `xai`                    | ✓ fleet                                |
-//! | 101     | `xiaomi`                 | ✓ fleet                                |
-//! | 102-104 | `xiaomi-token-plan-*`    | ✓ fleet                                |
-//! | 105     | `zai`                    | ✓ fleet                                |
-//! | 106     | `zai-coding-cn`          | ✓ fleet                                |
+//! | 89      | `amazon-bedrock`         | ✓                                      |
+//! | 90      | `ant-ling`               | ✓ fleet                                |
+//! | 91      | `anthropic`              | ✓                                      |
+//! | 92      | `azure-openai-responses` | ✓                                      |
+//! | 93      | `cerebras`               | ✓ fleet                                |
+//! | 94      | `cloudflare-ai-gateway`  | ✓                                      |
+//! | 95      | `cloudflare-workers-ai`  | ✓                                      |
+//! | 96      | `deepseek`               | ✓ fleet                                |
+//! | 97      | `fireworks`              | ✓                                      |
+//! | 98      | `github-copilot`         | ✓                                      |
+//! | 99      | `google`                 | ✓                                      |
+//! | 100     | `google-vertex`          | ✓                                      |
+//! | 101     | `groq`                   | ✓ fleet                                |
+//! | 102     | `huggingface`            | ✓ fleet                                |
+//! | 103     | `kimi-coding`            | ✓ anthropic-compat fleet               |
+//! | 104     | `minimax`                | ✓ anthropic-compat fleet               |
+//! | 105     | `minimax-cn`             | ✓ anthropic-compat fleet               |
+//! | 106     | `mistral`                | ✓                                      |
+//! | 107     | `moonshotai`             | ✓ fleet                                |
+//! | 108     | `moonshotai-cn`          | ✓ fleet                                |
+//! | 109     | `nvidia`                 | ✓ fleet                                |
+//! | 110     | `openai`                 | ✓                                      |
+//! | 111     | `openai-codex`           | ✓                                      |
+//! | 112     | `opencode`               | ✓                                      |
+//! | 113     | `opencode-go`            | ✓                                      |
+//! | 114     | `openrouter`             | ✓ fleet                                |
+//! | **115** | **`qwen-token-plan`**    | **✗ NOT REGISTERED — `PROV-014`**      |
+//! | **116** | **`qwen-token-plan-cn`** | **✗ NOT REGISTERED — `PROV-014`**      |
+//! | **117** | **`radius`**             | **✗ NOT REGISTERED — `PROV-014`**      |
+//! | 118     | `together`               | ✓                                      |
+//! | 119     | `vercel-ai-gateway`      | ✓ anthropic-compat fleet               |
+//! | 120     | `xai`                    | ✓ fleet                                |
+//! | 121     | `xiaomi`                 | ✓ fleet                                |
+//! | 122-124 | `xiaomi-token-plan-*`    | ✓ fleet                                |
+//! | 125     | `zai`                    | ✓ fleet                                |
+//! | 126     | `zai-coding-cn`          | ✓ fleet                                |
 //!
-//! Every provider pi's `builtinProviders()` constructs is registered below, and every api id those
-//! providers' catalogs name has a registered impl — the invariant is not left to this comment:
+//! **33 of pi's 36 built-in providers are registered below.** Every api id the registered providers'
+//! catalogs name has a registered impl — that half is not left to this comment:
 //! `src/tests/catalog_data.rs`'s `every_catalog_api_has_a_registered_impl` walks all 35 catalogs and
 //! asserts `builtin_registry().contains(&row.api)` for every row.
+//!
+//! **PROV-062, 2026-08-14 (sweep 9) — what this table used to say, and why it was worse than no
+//! table.** It ended at `zai-coding-cn` with **no row for `all.ts:115`, `:116` or `:117`**, and then
+//! asserted in prose that "Every provider pi's `builtinProviders()` constructs is registered below";
+//! the guard test below went further and recorded that "Every built-in provider pi ships is now
+//! ported, so there is no not-yet list left to assert against". Both were false, and `PROV-014` had
+//! been open against exactly those three the whole time — so the file that documents the gap denied
+//! it, in the same header that scolds an earlier sweep for this failure mode. Separately, **every
+//! line number in the old table was a `91585d9a` offset carried under a declared `v0.83.0`
+//! baseline**: at `91585d9a` `amazonBedrockProvider()` really is `all.ts:72`, but the three
+//! providers above did not exist yet at that revision, which is precisely how their absence went
+//! unnoticed when the table was transcribed. The offsets above are re-derived at `v0.83.0`.
 //!
 //! The table above was stale for four rows (`amazon-bedrock`, `github-copilot`, `google-vertex`,
 //! `openai-codex` were marked *pending (NOT registered)* by the very sweep that registered them,
@@ -351,8 +366,22 @@ mod tests {
         // ports everything, and an id leaves this array by being implemented. It exists so a
         // half-finished provider cannot be registered and silently answer requests it cannot serve
         // — the assertion is "absent until real", never "must stay absent".
-        // Every built-in provider pi ships is now ported, so there is no not-yet list left to
-        // assert against. If a future upstream version adds one, reinstate the assertion here.
+        //
+        // PROV-062: this list was DELETED, with a comment claiming "every built-in provider pi ships
+        // is now ported, so there is no not-yet list left to assert against". That was false at the
+        // time it was written — PROV-014 has been open against these three since before it — so the
+        // guard was removed in the same edit that made the claim it was guarding untrue. Restored,
+        // and it is the one place a future porter learns the set is incomplete without reading a
+        // backlog file. Each id leaves this array by being implemented (PROV-014), not by being
+        // reclassified.
+        for not_yet in ["qwen-token-plan", "qwen-token-plan-cn", "radius"] {
+            assert!(
+                !ids.iter().any(|id| id == not_yet),
+                "'{not_yet}' is registered but has no working stream path (PROV-014, pi \
+                 all.ts:115-117 @v0.83.0). If it was genuinely ported, delete it from this array \
+                 and from the NOT REGISTERED rows in this module's header table in the same commit."
+            );
+        }
 
         // The count matches what `all_providers()` returns and has no duplicate ids.
         assert_eq!(ids.len(), all_providers().len());

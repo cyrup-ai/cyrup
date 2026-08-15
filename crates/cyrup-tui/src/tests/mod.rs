@@ -59,6 +59,7 @@ mod model_selector_assembled;
 mod native_shift_enter;
 mod package_update_notice;
 mod pending_messages;
+mod project_trust_banner;
 mod render;
 mod rich_messages;
 mod runtime_swap;

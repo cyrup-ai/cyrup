@@ -820,14 +820,23 @@ interface provider-stream {
   on-response: func(stream-id: string, status: u16, headers-json: string);
 }
 
-// Active-tool / command introspection (Pi getActiveTools/getAllTools/setActiveTools/getCommands,
-// types.ts:1257-1266): the plan-mode active-tool restriction surface. `set-active-tools` is the only
-// mutating one; the host enforces the merge (arch-08 §3.5).
+// Active-tool / command introspection (Pi getActiveTools `types.ts:1320`, getAllTools `:1323`,
+// setActiveTools `:1326`, getCommands `:1329`, all @v0.83.0): the plan-mode active-tool restriction
+// surface. `set-active-tools` is the only mutating one; the host enforces the merge (arch-08 §3.5).
+// EXT-073: the range `:1257-1266` these four used to cite is the one EXT-036 already named as
+// wrong-surface and fixed in `host/services.rs`; it survived here. Do not restore it.
 interface ext-tools {
   get-active-tools: func() -> string;   // json array of active tool names
-  get-all-tools:    func() -> string;   // json array of ToolInfo {name, source, parameters, …}
+  // EXT-071: `ToolInfo` is pi's FIVE keys — `{name, description, parameters, promptGuidelines,
+  // sourceInfo}` (`types.ts:1552-1554` @v0.83.0). This comment used to advertise a `source` key;
+  // that was cyrup-invented and EXT-060 REMOVED it from the emitted object (`registry.rs`, pinned by
+  // `tests/aggregation.rs`). Do not restore it.
+  get-all-tools:    func() -> string;   // json array of ToolInfo {name, description, parameters, promptGuidelines, sourceInfo}
   set-active-tools: func(names-json: string);
-  get-commands:     func() -> string;   // json array of SlashCommandInfo {name, description}
+  // EXT-071: `SlashCommandInfo` is `{name, description?, source, sourceInfo}`
+  // (`core/slash-commands.ts:6-11` @v0.83.0) and EXT-037's implementation emits all four; this
+  // comment under-documented it as two keys.
+  get-commands:     func() -> string;   // json array of SlashCommandInfo {name, description?, source, sourceInfo}
 }
 
 // Read-only ctx state (Pi `ExtensionContext`, extensions/types.ts:305-347). Pi puts `mode`, `hasUI`,
@@ -892,13 +901,18 @@ interface control {
   send-message:      func(message-json: string, opts-json: string) -> result<_, string>;
   send-user-message: func(content: string, opts-json: string) -> result<_, string>;
 
-  // Pi `ctx.abort()` (extensions/types.ts:339, "Abort the current agent run. Available in all
-  // contexts."): cancels the in-flight run. NOT tier-gated — an event handler (e.g. a
+  // Pi `ctx.abort()` (extensions/types.ts:336 @v0.83.0, doc "Abort the current agent operation"
+  // at `:335`): cancels the in-flight run. NOT tier-gated — an event handler (e.g. a
   // `tool_call` gate that decides the whole run must stop) is exactly Pi's use case, and abort
   // cannot deadlock the way a session REPLACEMENT op can.
   abort:    func() -> result<_, string>;
-  // Pi `ctx.shutdown()` (extensions/types.ts:344, "Gracefully shutdown pi and exit. Available in
-  // all contexts."). Sets the host's shutdown-requested flag; the host acts on it at the next
+  // EXT-073: this comment used to read `types.ts:339, "Abort the current agent run. Available in
+  // all contexts."` — a FABRICATED quote, spliced from two different members. `:339` is
+  // `shutdown`'s doc line, "Available in all contexts." is `shutdown`'s sentence, and upstream
+  // never writes "agent run" here. Do not restore it.
+  //
+  // Pi `ctx.shutdown()` (extensions/types.ts:340 @v0.83.0, doc "Gracefully shutdown pi and exit.
+  // Available in all contexts." at `:339`). Sets the host's shutdown-requested flag; the host acts at the next
   // settle point (Pi rpc-mode.ts:355-358). Also NOT tier-gated.
   shutdown: func() -> result<_, string>;
 }

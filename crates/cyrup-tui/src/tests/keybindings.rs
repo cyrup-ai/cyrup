@@ -98,6 +98,37 @@ fn key_label_round_trips_through_parse() {
 }
 
 #[test]
+fn hotkey_cells_match_pis_key_text_for_shift_tab_and_the_page_keys() {
+    // TUI-069 / TUI-070. `/hotkeys` renders `formatKeyText(keys_label(action))`
+    // (`app.rs`'s `g`/`e` closures), pi renders `formatKeys(getKeys(id))` =
+    // `keys.join("/")` (`keybinding-hints.ts:29-40`).
+    //
+    // `app.thinking.cycle` declares ONE key upstream, `"shift+tab"`
+    // (`coding-agent/src/core/keybindings.ts:73-76` @v0.83.0), so pi's cell is `Shift+Tab`.
+    // cyrup binds the chord three ways because a terminal reports it three ways; before this
+    // fix the cell read `Shift+Tab/Shift+Shift+Tab/Shift+Tab`, whose middle entry is not a
+    // chord any terminal sends and which `Key::parse` reads back as plain `Tab`+SHIFT.
+    let km = Keymap::default();
+    assert_eq!(km.keys_label(Action::ThinkingCycle).as_deref(), Some("shift+tab"));
+    assert_eq!(
+        crate::chrome::format_key_text(&km.keys_label(Action::ThinkingCycle).unwrap(), true),
+        "Shift+Tab"
+    );
+    assert_eq!(Key { code: KeyCode::BackTab, mods: KeyModifiers::SHIFT }.label(), "shift+tab");
+
+    // `tui.editor.pageUp` / `pageDown` are camelCase `KeyId`s upstream
+    // (`tui/src/keybindings.ts:89-90` @v0.83.0) and `formatKeyPart` upper-cases only the first
+    // character (`keybinding-hints.ts:12-15`), so pi prints `PageUp` where the lowercased label
+    // printed `Pageup`. The camelCase label must still round-trip through `Key::parse`.
+    assert_eq!(Key::plain(KeyCode::PageUp).label(), "pageUp");
+    assert_eq!(Key::plain(KeyCode::PageDown).label(), "pageDown");
+    assert_eq!(Key::parse("pageUp").unwrap(), Key::plain(KeyCode::PageUp));
+    assert_eq!(Key::parse(&Key::plain(KeyCode::PageDown).label()).unwrap().code, KeyCode::PageDown);
+    assert_eq!(crate::chrome::format_key_text("pageUp", true), "PageUp");
+    assert_eq!(km.keys_label(Action::PageUp).as_deref(), Some("pageUp"));
+}
+
+#[test]
 fn malformed_keybindings_json_errors_cleanly() {
     let mut km = Keymap::default();
     assert!(km.merge_json("not json").is_err(), "garbage json should error");

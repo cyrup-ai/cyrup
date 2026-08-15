@@ -101,14 +101,35 @@ mod tests {
         let gc = glm.compat.as_ref().expect("compat");
         assert_eq!(gc.supports_store, Some(false));
         assert_eq!(gc.supports_developer_role, Some(false));
-        // VERSION LAG (v0.83.0 → v0.84.1): the glm-5p2 rows moved from an inline
-        // `candidate.compat = { supportsStore: false, supportsDeveloperRole: false }` patch
-        // (v0.83.0 `ai/scripts/generate-models.ts:2151-2155`) to the shared `openAICompat`
-        // constant, which also sets these two (v0.84.1 `…:1217-1222`, applied at `…:1253-1259`).
-        // Fireworks caches by session affinity and does not honour long retention, so a missing
-        // `sendSessionAffinityHeaders` silently loses every prompt-cache hit on GLM 5.2.
-        assert_eq!(gc.send_session_affinity_headers, Some(true));
-        assert_eq!(gc.supports_long_cache_retention, Some(false));
+        // The glm-5p2 patch at pi v0.83.0 `ai/scripts/generate-models.ts:2151-2155` **assigns**
+        // (it does not spread) `candidate.compat = { supportsStore: false,
+        // supportsDeveloperRole: false }`, DISCARDING all four keys the models.dev fireworks
+        // ingest had just set at `…:1560-1565` (`sendSessionAffinityHeaders: true`,
+        // `supportsEagerToolInputStreaming`/`supportsCacheControlOnTools`/
+        // `supportsLongCacheRetention: false`). So at the frozen v0.83.0 target these two are
+        // ABSENT on the glm rows — exactly two keys survive. (v0.84.1 reinstates them via the
+        // shared `openAICompat` const, `…:1216-1221` applied at `…:1253-1259`; that is upstream
+        // drift past the pin, and encoding it here would be the "v0.84.1 offset asserted as
+        // v0.83.0" error PARITY-PLAN.md:1647 already caught once.)
+        assert_eq!(gc.send_session_affinity_headers, None);
+        assert_eq!(gc.supports_long_cache_retention, None);
+        // Absence is NOT inert, and the two keys do NOT behave alike on the wire — assert the
+        // RESOLVED values rather than only the missing fields (a bare `None` check would also
+        // pass against a catalog that never carried compat at all).
+        //   * `sendSessionAffinityHeaders` detects to `false` (`openai-completions.ts:1471`
+        //     @v0.83.0), so absent and `Some(false)` are indistinguishable: no `x-session-affinity`
+        //     header either way (`…:647`).
+        //   * `supportsLongCacheRetention` detects to `!(isTogether || isCloudflareWorkersAI ||
+        //     isCloudflareAiGateway || isNvidia || isAntLing)` (`…:1474-1480`) — all false for
+        //     fireworks, so absent resolves to **true** where `Some(false)` would resolve to
+        //     false. pi v0.83.0 therefore DOES request long cache retention on GLM 5.2; carrying
+        //     `Some(false)` here would be a silent wire divergence of the PROV-023/024/033/034
+        //     shape.
+        let gr = crate::api::compat::get_compat(glm);
+        assert!(!gr.send_session_affinity_headers);
+        assert!(gr.supports_long_cache_retention);
+        assert!(!gr.supports_store);
+        assert!(!gr.supports_developer_role);
         // pi fireworks.models.ts @91585d9a maps the top rung as `"max":"max"` (never `xhigh`).
         let gm = glm.thinking_level_map.as_ref().expect("glm map");
         assert_eq!(gm.get("max"), Some(&Some("max".to_string())));
@@ -124,13 +145,20 @@ mod tests {
         assert_eq!(dc.supports_cache_control_on_tools, Some(false));
         assert_eq!(dc.supports_long_cache_retention, Some(false));
 
-        // MIRROR: the router twin takes the same `openAICompat` (the branch keys off
-        // `modelId.includes("glm-5p2")`, v0.84.1 `…:1253`), and NO other row gains the openai keys.
+        // MIRROR: the `routers/` twin takes the SAME two-key overwrite — the v0.83.0 branch keys
+        // off `candidate.id.includes("glm-5p2")` (`generate-models.ts:2151`), which matches the
+        // router id too — and NO other row gains the openai keys.
         let fast = find("accounts/fireworks/routers/glm-5p2-fast");
+        assert_eq!(fast.api.as_str(), OPENAI_COMPLETIONS);
+        assert_eq!(fast.base_url, "https://api.fireworks.ai/inference/v1");
         let fc = fast.compat.as_ref().expect("compat");
-        assert_eq!(fc.send_session_affinity_headers, Some(true));
-        assert_eq!(fc.supports_long_cache_retention, Some(false));
         assert_eq!(fc.supports_store, Some(false));
+        assert_eq!(fc.supports_developer_role, Some(false));
+        assert_eq!(fc.send_session_affinity_headers, None);
+        assert_eq!(fc.supports_long_cache_retention, None);
+        let fr = crate::api::compat::get_compat(fast);
+        assert!(!fr.send_session_affinity_headers);
+        assert!(fr.supports_long_cache_retention);
         for m in &models {
             if !m.id.as_str().contains("glm-5p2") {
                 let c = m.compat.as_ref().expect("compat");

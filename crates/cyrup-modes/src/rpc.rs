@@ -302,7 +302,10 @@ impl RpcResponse {
 /// dispatches on `type`. The event is boxed (it is the larger variant).
 ///
 /// [`RpcOut::Event`] serializes through [`crate::to_json_event`], NOT through
-/// [`AgentSessionEvent`]'s own `Serialize` — Pi's `output(toJsonEvent(event))` (rpc-mode.ts:356).
+/// [`AgentSessionEvent`]'s own `Serialize` — Pi's `output(toJsonEvent(event))`
+/// (`rpc-mode.ts:356` **@v0.84.1**; at the ported v0.83.0 baseline that line is
+/// `if (event.type === "agent_settled")` and `:355` is a bare `output(event)` — `toJsonEvent` does
+/// not exist at the tag. See [`crate::json_event`] for the version-lag rationale, SEAM-085).
 /// The `Serialize` impl is hand-written for exactly that reason (see below); the variant keeps its
 /// `Box<AgentSessionEvent>` payload so the projection stays a wire concern and no public signature
 /// changes.
@@ -326,7 +329,7 @@ pub enum RpcOut {
 /// Untagged serialization — each variant serializes as its inner value and nothing else, exactly as
 /// `#[serde(untagged)]` did — with ONE difference: [`RpcOut::Event`] routes through
 /// [`crate::to_json_event`], so the rpc stdout stream carries the delta-only `message_update` Pi
-/// emits (rpc-mode.ts:356) rather than the cumulative snapshots.
+/// emits (`rpc-mode.ts:356` **@v0.84.1** — see above) rather than the cumulative snapshots.
 ///
 /// Hand-written rather than derived because the projection has to happen at the point of writing:
 /// `RpcOut::Event` is constructed from an [`AgentSessionEvent`] the driver has in hand (`:807`,
@@ -794,9 +797,13 @@ where
                     Some(line) => {
                         // Intercept an `extension_ui_response` BEFORE command dispatch (Pi
                         // `handleInputLine`, rpc-mode.ts:739-753): look up the pending dialog by `id`,
-                        // resolve its one-shot, and never route it to the command switch.
+                        // resolve its one-shot, and never route it to the command switch. The
+                        // intercept is decided by the `type` tag ALONE and always `continue`s
+                        // (SEAM-086) — an envelope with a missing/non-string `id`, or one whose id
+                        // matches no pending dialog, is swallowed with no output line, exactly as
+                        // pi's unconditional `return` does (rpc-mode.ts:763-777 @v0.83.0).
                         if let Some(id) = extension_ui_response_id(&line) {
-                            if let Some(p) = pending.remove(&id) {
+                            if let Some(p) = id.and_then(|id| pending.remove(&id)) {
                                 let body: Value = serde_json::from_str(&line).unwrap_or(Value::Null);
                                 let reply = map_ui_response(&p, &body);
                                 let _ = p.reply.send(reply);
@@ -1499,15 +1506,24 @@ fn new_request_id() -> String {
     format!("ext-ui-{}", COUNTER.fetch_add(1, Ordering::Relaxed))
 }
 
-/// If `line` is an `extension_ui_response` envelope, return its correlation `id` (Pi intercepts these
-/// before command dispatch, rpc-mode.ts:739-753). Returns `None` for any other line so it falls
-/// through to the normal command path.
-fn extension_ui_response_id(line: &str) -> Option<String> {
+/// If `line` is an `extension_ui_response` envelope, return `Some(id)` — where the inner `Option`
+/// is the correlation `id`, `None` when the envelope carries no *string* `id`. Returns the outer
+/// `None` for any other line, so only non-`extension_ui_response` lines fall through to the normal
+/// command path.
+///
+/// SEAM-086 — the `type` discriminant alone decides the intercept, exactly as pi's does. pi's
+/// `handleInputLine` (`packages/coding-agent/src/modes/rpc/rpc-mode.ts:763-777` @v0.83.0) tests
+/// `parsed.type === "extension_ui_response"`, looks the id up in `pendingExtensionRequests`, and
+/// `return`s **unconditionally** — a malformed or unmatched envelope produces no output line at all.
+/// Deciding the intercept on the id instead let a malformed one fall into `dispatch`, which answered
+/// it with `{"type":"response","command":"extension_ui_response","success":false,"error":"Unknown
+/// command: extension_ui_response"}` — an extra stdout line pi never writes.
+fn extension_ui_response_id(line: &str) -> Option<Option<String>> {
     let value: Value = serde_json::from_str(line).ok()?;
     if value.get("type").and_then(Value::as_str) != Some("extension_ui_response") {
         return None;
     }
-    value.get("id").and_then(Value::as_str).map(str::to_owned)
+    Some(value.get("id").and_then(Value::as_str).map(str::to_owned))
 }
 
 /// Build an RPC-sourced [`UserInput`] from text + optional image content blocks.

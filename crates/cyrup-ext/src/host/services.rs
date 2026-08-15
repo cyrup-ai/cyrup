@@ -116,11 +116,13 @@ pub enum ControlOp {
     SendUserMessage { content: String, opts: Value },
     SetModel(Value),
     SetThinkingLevel(String),
-    /// Abort the in-flight agent run (Pi `ctx.abort()`, extensions/types.ts:339 — "Available in all
-    /// contexts"). Legal from EVERY tier, unlike the session-replacement ops above.
+    /// Abort the in-flight agent run (Pi `ctx.abort()`, extensions/types.ts:336 @v0.83.0, doc
+    /// "Abort the current agent operation" at `:335`). Legal from EVERY tier, unlike the
+    /// session-replacement ops above. EXT-073: `:339`/"Available in all contexts" is `shutdown`'s.
     Abort,
-    /// Request a graceful host shutdown (Pi `ctx.shutdown()`, extensions/types.ts:344 — "Available
-    /// in all contexts"; the runner entry point is runner.ts:656-662). Legal from every tier. The
+    /// Request a graceful host shutdown (Pi `ctx.shutdown()`, extensions/types.ts:340 @v0.83.0,
+    /// doc "Gracefully shutdown pi and exit. Available in all contexts." at `:339`; the runner entry
+    /// point is runner.ts:656-662). Legal from every tier. EXT-073: `:344` is `compact`. The
     /// host acts on it at its next settle point (Pi rpc-mode.ts:355-358).
     Shutdown,
 }
