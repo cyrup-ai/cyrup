@@ -157,7 +157,18 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
         .expect("the append channel delivered the surfaced entry");
     assert_eq!(custom_type, "intercom_message", "surfaced as the intercom_message custom entry");
     let content = data["content"].as_str().unwrap_or_default();
-    assert!(content.contains("📨 From"), "surfaced content is pi's inbound-message body: {content:?}");
+    // `**From <sender>** (<cwd>)`, with NO `📨`. pi dropped the emoji in v0.10.0 (the "deslop"
+    // pass) and cyrup ported that removal — `inbound.rs:1140-1144` pins it against
+    // `v0.10.1 index.ts:891-893`. This assertion still demanded the pre-v0.10.0 header, so it was
+    // asserting the very glyph upstream deleted.
+    assert!(
+        content.starts_with("**From "),
+        "surfaced content is pi's inbound-message body: {content:?}"
+    );
+    assert!(
+        !content.contains('📨'),
+        "the v0.10.0 deslop removed the envelope glyph from the header: {content:?}"
+    );
     assert!(content.contains("Which database should I use?"), "content carries the child's ask: {content:?}");
     // The pre-rendered card (the §4.3 degrade of the inline renderer) is present too.
     assert!(data["card"].as_array().map(|a| !a.is_empty()).unwrap_or(false), "the rendered card is embedded");

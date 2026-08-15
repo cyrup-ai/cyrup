@@ -126,6 +126,59 @@ impl ProviderStream {
         #[cfg(not(target_arch = "wasm32"))]
         let _ = event_json;
     }
+
+    /// **Call this BEFORE sending the provider request**, with the request payload, and send the
+    /// REPLACEMENT this returns (`None` = unchanged).
+    ///
+    /// Half of pi's must-invoke `streamSimple` contract, quoted verbatim from
+    /// `ProviderConfig.streamSimple` (`extensions/types.ts:1452-1457` @v0.84.1): "Implementations
+    /// must invoke `options.onPayload` before sending the provider request and use any returned
+    /// replacement payload. They must invoke `options.onResponse` after receiving the response and
+    /// before consuming its body, matching built-in providers."
+    ///
+    /// EXT-M05 — EXT-052 landed this contract on the HOST side only: `provider-stream.on-payload`
+    /// is declared in `world.wit` and implemented in `cyrup-ext/src/host/live.rs`, but no SDK
+    /// surface existed, so a guest provider written with this crate could not invoke it no matter
+    /// how carefully its author read the world. `ProviderStream::emit` was the type's only method.
+    /// The failure is exactly the one the world comment names: every request an extension-supplied
+    /// provider issues stays invisible to `before_provider_request`, so a redaction or audit
+    /// extension silently stops working the moment the user switches to a guest provider.
+    ///
+    /// (Upstream these are fields of the `options` bag rather than of the stream. They hang off
+    /// `ProviderStream` here because the world keys BOTH on the same `stream-id` this type already
+    /// owns — a [CYRUP-DELTA] of shape, not of semantics, against `types.ts:1452-1457`.)
+    pub fn on_payload(&self, payload: impl Serialize) -> Option<Value> {
+        let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "null".into());
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::provider_stream::on_payload(
+                &self.stream_id,
+                &payload_json,
+            )
+            .and_then(|s| serde_json::from_str(&s).ok());
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = payload_json;
+            None
+        }
+    }
+
+    /// **Call this AFTER receiving the provider response and BEFORE consuming its body** — the
+    /// notify-only half of the same must-invoke contract (EXT-M05; see [`Self::on_payload`]). This
+    /// is how `after_provider_response` (`extensions/types.ts:692-696`) reaches a guest provider's
+    /// responses; `headers` is serialized as the response header map.
+    pub fn on_response(&self, status: u16, headers: impl Serialize) {
+        let headers_json = serde_json::to_string(&headers).unwrap_or_else(|_| "{}".into());
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::provider_stream::on_response(
+            &self.stream_id,
+            status,
+            &headers_json,
+        );
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = (status, headers_json);
+    }
 }
 
 /// The guest's dynamic OAuth provider (Pi `ProviderConfig.oauth`, types.ts:1380-1392). `login`

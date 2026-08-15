@@ -43,7 +43,7 @@ pub use cyrup_core::PackageId;
 pub use discovery::{
     CliResourcePaths, DiscoveredPaths, DiscoveryConfig, DiscoveryReport, Named, ResourceOverrides,
     ResourceRegistry, ResourceSet, discover, discover_append_system_prompt_file,
-    discover_system_prompt_file,
+    discover_system_prompt_file, scope_base_dir,
 };
 pub use error::{
     Collision, DiagnosticType, ResourceDiagnostic, ResourceError, ResourceKind, ResourceWarning,
@@ -54,8 +54,8 @@ pub use package::source::{PackageSource, PinRef};
 pub use package::{
     ConfiguredPackage, DisabledSet, InstalledPackage, InstalledPackages, ManifestResources,
     PackageFilter, PackageStore, ParsedGitUrl, ResolvedManifest, ResourceSelector, SECURITY_CAVEAT,
-    SecurityNotice, UpdateReport, UpdateTarget, has_unsafe_git_install_part, parse_git_url,
-    resolve_manifest,
+    SecurityNotice, UpdateReport, UpdateTarget, has_unsafe_git_install_part, package_identity,
+    parse_git_url, resolve_manifest,
 };
 pub use prompt::{PromptTemplate, expand_prompt_template, parse_command_args, substitute_args};
 pub use scope::{InstallScope, ResourceOrigin, ResourceScope};

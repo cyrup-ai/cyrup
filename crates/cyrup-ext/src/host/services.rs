@@ -185,12 +185,14 @@ pub struct HumanInteractionGuard {
 /// guest is suspended across the call by Wasmtime's async support).
 pub trait HostServices: Send + Sync {
     // --- ui (R-08-022) ---
-    /// `message` is Pi's `confirm(title, message, opts)` body (rpc-types.ts:232) — distinct from
+    /// `message` is Pi's `confirm(title, message, opts)` body (`rpc-types.ts:240` @v0.83.0;
+    /// EXT-036 corrected `:232`, a blank line) — distinct from
     /// `prompt` (the title); denied by default (empty confirm surfaces as `false`, same as before).
     fn confirm(&self, _prompt: &str, _message: &str, _opts: &DialogOptions) -> bool {
         false
     }
-    /// `placeholder` is Pi's `input(title, placeholder, opts)` optional field (rpc-types.ts:233-240).
+    /// `placeholder` is Pi's `input(title, placeholder, opts)` optional field
+    /// (`rpc-types.ts:241-248` @v0.83.0; EXT-036 corrected `:233-240`).
     fn input(&self, _prompt: &str, _placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
         None
     }
@@ -264,21 +266,30 @@ pub trait HostServices: Send + Sync {
     fn set_theme(&self, _name: &str) -> Result<(), String> {
         Err("theme capability not granted".into())
     }
-    /// Whether tool rows are expanded (Pi `getToolsExpanded`).
+    /// Whether tool rows are expanded (Pi `getToolsExpanded()`, `types.ts:278` @v0.83.0).
     fn tools_expanded(&self) -> bool {
         false
     }
 
-    // --- fire-and-forget ui effects (Pi `ExtensionUIContext` mutators, types.ts:130-275) ---
+    // --- fire-and-forget ui effects (Pi `ExtensionUIContext` mutators, types.ts:131-281) ---
     // Unlike confirm/input/select/editor above, the guest does NOT block on a reply for any of
-    // these — Pi's own signatures return `void` (types.ts:136,142,164,177,184,187,210,275) and its
-    // RPC-mode wire handlers explicitly say "Fire and forget - no response needed"
-    // (`rpc-mode.ts:149,163,196`). No-op by default (no ambient delivery authority); the session
-    // service routes these to the active mode's live renderer.
-    /// A notification toast (Pi `notify(message, type)`, types.ts:136).
+    // these — Pi's own signatures return `void` (`types.ts:142,148,164,170,183,190,193,216,281`
+    // @v0.83.0) and its RPC-mode wire handlers explicitly say "Fire and forget - no response
+    // needed" (`modes/rpc/rpc-mode.ts:152,168` @v0.83.0; the sibling "Fire and forget - host can
+    // implement …" at `:218` and `:238` cover the title and editor verbs). No-op by default (no
+    // ambient delivery authority); the session service routes these to the active mode's live
+    // renderer.
+    //
+    // EXT-036: every citation in this block used to sit ~6 lines low
+    // (`types.ts:136,142,164,177,184,187,210,275`, `rpc-mode.ts:149,163,196`) — the SAME uniform
+    // offset as the `interface ui` cluster in `world.wit` and the `Ui` cluster in
+    // `cyrup-ext-sdk/src/ctx.rs`. Note the tell: the citations ADDED by the EXT-021/EXT-047 pass
+    // just above (`:151`, `:154`, `:164`, `:167`, `:170-175`) are all EXACT, so the rot is
+    // confined to the original import of this block and is not a systematic misreading.
+    /// A notification toast (Pi `notify(message, type?)`, `types.ts:142` @v0.83.0).
     fn notify(&self, _message: &str, _kind: NotifyKind) {}
-    /// A keyed status-bar segment (Pi `setStatus(key, text?)`, types.ts:141-142); `None` clears the
-    /// key.
+    /// A keyed status-bar segment (Pi `setStatus(key, text?)`, `types.ts:148` @v0.83.0); `None`
+    /// clears the key.
     fn set_status(&self, _key: &str, _text: Option<&str>) {}
     /// One keyed extension widget (Pi `setWidget(key, content, options?)`,
     /// `extensions/types.ts:170-175` @v0.83.0).
@@ -316,16 +327,22 @@ pub trait HostServices: Send + Sync {
     /// The label shown for hidden thinking blocks (Pi `setHiddenThinkingLabel(label?)`,
     /// `extensions/types.ts:167` @v0.83.0). `None` restores the default.
     fn set_hidden_thinking_label(&self, _label: Option<&str>) {}
-    /// Custom header content (Pi `setHeader`, types.ts:184).
+    /// Custom header content (Pi `setHeader(factory)`, `types.ts:190` @v0.83.0).
     fn set_header(&self, _content: &str) {}
-    /// Custom footer content (Pi `setFooter`, types.ts:174-177).
+    /// Custom footer content (Pi `setFooter(factory)`, `types.ts:183-187` @v0.83.0).
     fn set_footer(&self, _content: &str) {}
-    /// The terminal/window title (Pi `setTitle`, types.ts:187).
+    /// The terminal/window title (Pi `setTitle(title)`, `types.ts:193` @v0.83.0).
     fn set_title(&self, _title: &str) {}
-    /// Replace (`is_paste=false`, Pi `setEditorText`, types.ts:210) or paste-insert
-    /// (`is_paste=true`, Pi `pasteEditorText`, types.ts:230) into the editor buffer.
+    /// Replace (`is_paste=false`, Pi `setEditorText`, `types.ts:216` @v0.83.0) or paste-insert
+    /// (`is_paste=true`, Pi `pasteToEditor`, `:213`) into the editor buffer.
+    ///
+    /// EXT-036, NAME correction: this doc cited "Pi `pasteEditorText`, types.ts:230". Upstream has
+    /// no `pasteEditorText` at any version — the function is `pasteToEditor` — so the citation
+    /// named a nonexistent symbol at a line that is `getEditorComponent`'s doc comment. The WIT
+    /// import keeps cyrup's `paste-editor-text` spelling ([CYRUP-DELTA] vs `types.ts:213`) because
+    /// renaming it would re-sign an import and force a `HOST_WORLD` bump for a comment fix.
     fn set_editor_text(&self, _text: &str, _is_paste: bool) {}
-    /// Expand/collapse tool rows (Pi `setToolsExpanded`, types.ts:275).
+    /// Expand/collapse tool rows (Pi `setToolsExpanded(expanded)`, `types.ts:281` @v0.83.0).
     fn set_tools_expanded(&self, _expanded: bool) {}
 
     // --- session read-only view (R-08-027) ---
@@ -636,7 +653,7 @@ pub trait HostServices: Send + Sync {
     }
 }
 
-/// Recorded extended-UI chrome effects (Pi `ExtensionUIContext` mutators, types.ts:124-275). These
+/// Recorded extended-UI chrome effects (Pi `ExtensionUIContext` mutators, `extensions/types.ts:131-282` @v0.83.0; EXT-036 corrected `:124-275`). These
 /// are observable host-side (tests/diagnostics) and would drive the TUI widget protocol (arch-11).
 #[derive(Clone, Debug, Default)]
 pub struct UiChrome {
@@ -1248,9 +1265,9 @@ pub struct GuestState {
     /// Message renderers registered via `register-message-renderer` (custom types).
     renderers: Mutex<Vec<String>>,
     /// `ui.notify` log — observable host effect (used by tests + diagnostics). Each entry carries
-    /// the Pi `type` severity (`info`|`warning`|`error`, types.ts:135).
+    /// the Pi `type` severity (`info`|`warning`|`error`, types.ts:142 @v0.83.0).
     notifications: Mutex<Vec<(String, NotifyKind)>>,
-    /// `ui.set-status` log: keyed status segments (Pi `setStatus(key, text?)`, types.ts:141). A
+    /// `ui.set-status` log: keyed status segments (Pi `setStatus(key, text?)`, types.ts:148 @v0.83.0). A
     /// `None` text clears that key (Pi `setStatus(key, undefined)`).
     statuses: Mutex<Vec<(String, Option<String>)>>,
     /// `ui.set-widget` calls in pi's `(key, content, placement)` shape (EXT-047).
@@ -1333,7 +1350,7 @@ pub struct GuestState {
     last_wait_touch: Mutex<Option<std::time::Instant>>,
 }
 
-/// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:135).
+/// Notification severity (Pi `notify` `type`: `"info" | "warning" | "error"`, types.ts:142 @v0.83.0).
 /// `info` is Pi's default when the guest omits the argument.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NotifyKind {
@@ -1817,12 +1834,12 @@ impl GuestState {
             .unwrap_or_default()
     }
 
-    /// Recorded notifications with their Pi `type` severity (types.ts:135).
+    /// Recorded notifications with their Pi `type` severity (types.ts:142 @v0.83.0).
     pub fn notifications_with_kind(&self) -> Vec<(String, NotifyKind)> {
         self.notifications.lock().map(|g| g.clone()).unwrap_or_default()
     }
 
-    /// Record a keyed status update (Pi `setStatus(key, text?)`, types.ts:141). A `None` `text`
+    /// Record a keyed status update (Pi `setStatus(key, text?)`, types.ts:148 @v0.83.0). A `None` `text`
     /// clears that key.
     pub fn set_status(&self, key: String, text: Option<String>) {
         if let Ok(mut g) = self.statuses.lock() {
@@ -2162,7 +2179,7 @@ mod tests {
 
         // Message-text view is back-compat (severity-agnostic).
         assert_eq!(s.notifications(), vec!["plain", "careful", "boom"]);
-        // Severity is preserved 1:1 with Pi's notify `type` (types.ts:135).
+        // Severity is preserved 1:1 with Pi's notify `type` (types.ts:142 @v0.83.0).
         assert_eq!(
             s.notifications_with_kind(),
             vec![
@@ -2176,7 +2193,7 @@ mod tests {
     #[test]
     fn set_status_addresses_and_clears_keyed_segments() {
         let s = state();
-        // Two independent keyed segments (Pi `setStatus(key, text)`, types.ts:141).
+        // Two independent keyed segments (Pi `setStatus(key, text)`, types.ts:148 @v0.83.0).
         s.set_status("lint".into(), Some("12 warnings".into()));
         s.set_status("build".into(), Some("compiling".into()));
         // Update one key, then clear it (Pi `setStatus(key, undefined)`).

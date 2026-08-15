@@ -358,24 +358,43 @@ enum ConfiguredPackageResolution {
 /// on one working tree even where the two scopes resolve the same source string differently — a
 /// relative local path, or an npm install root. Its `tier` still comes from its own scope, exactly
 /// like Pi's `metadata` (`{ source: sourceStr, scope, … }`, :1235).
+/// Pi `getBaseDirForScope` (package-manager.ts:2071-2080 @v0.83.0): `join(cwd, CONFIG_DIR_NAME)` for
+/// a project entry (`.pi` upstream, `.cyrup` here), the agent dir for a user entry. The base a
+/// settings-declared LOCAL source resolves against, both for its working tree and for its identity.
+pub fn scope_base_dir(cwd: &Path, global_dir: &Path, scope: InstallScope) -> PathBuf {
+    match scope {
+        InstallScope::Project => cwd.join(".cyrup"),
+        InstallScope::Global => global_dir.to_path_buf(),
+    }
+}
+
 fn resolve_configured_package(
     declared: &ConfiguredPackage,
     all: &[ConfiguredPackage],
     cfg: &DiscoveryConfig,
 ) -> Result<ConfiguredPackageResolution, Box<ResourceDiagnostic>> {
     let tier = declared.scope.package_resource_scope();
+    // Pi `findAutoloadDeltaBase` (package-manager.ts:1301-1313 @v0.83.0) pairs the two entries by
+    // `getPackageIdentity`, and computes each side against ITS OWN scope base (`…, scope)` at :1307
+    // vs `…, "user")` at :1311). A raw source-string comparison paired `"./pack"` in both scopes,
+    // which pi does NOT: the project one is `local:<cwd>/.cyrup/pack`, the global one is
+    // `local:<agent_dir>/pack` — two different trees, so there is no delta base (CFG-026).
     let delta_base = if declared.scope == InstallScope::Project && declared.filter.is_delta() {
-        all.iter()
-            .find(|e| e.scope == InstallScope::Global && e.source.trim() == declared.source.trim())
+        let identity = crate::package::package_identity(
+            &declared.source,
+            &scope_base_dir(&cfg.cwd, &cfg.global_dir, InstallScope::Project),
+        );
+        let global_base = scope_base_dir(&cfg.cwd, &cfg.global_dir, InstallScope::Global);
+        all.iter().find(|e| {
+            e.scope == InstallScope::Global
+                && crate::package::package_identity(&e.source, &global_base) == identity
+        })
     } else {
         None
     };
     let resolve_scope = delta_base.map_or(declared.scope, |e| e.scope);
     let resolve_source = delta_base.map_or(declared.source.as_str(), |e| e.source.as_str());
-    let base = match resolve_scope {
-        InstallScope::Project => cfg.cwd.join(".cyrup"),
-        InstallScope::Global => cfg.global_dir.clone(),
-    };
+    let base = scope_base_dir(&cfg.cwd, &cfg.global_dir, resolve_scope);
     let source = crate::package::PackageSource::parse(resolve_source.trim()).map_err(|e| {
         Box::new(ResourceDiagnostic::error(
             ResourceKind::Package,
@@ -800,6 +819,19 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
     // keeps both halves of the pair, package-manager.ts:1691-1696). Recorded from the admitted
     // trees, not from the raw settings, so an untrusted or unresolvable project entry cannot reach
     // in and suppress resources from the global package it names.
+    //
+    // Keyed by `getPackageIdentity` computed against EACH side's own scope base — the exact key
+    // `dedupePackages` pairs on (`getPackageIdentity(source, entry.scope)`,
+    // package-manager.ts:1703 @v0.83.0), and the same key `findAutoloadDeltaBase` used above to
+    // decide the pair exists at all (`:1307` vs `:1311`). A raw source-string key disagreed with
+    // that lookup in both directions: `git@github.com:acme/p.git` at project scope and
+    // `https://github.com/acme/p.git` at global scope are ONE identity (`git:<host>/<path>`,
+    // `:1682-1684`), so the delta base resolved them onto one tree while the string compare found
+    // no pair — leaving the global half with no `delta_shadow`, hence skipped by the `seen_trees`
+    // guard below, silently dropping every resource it autoloads. Conversely one RELATIVE local
+    // string is two identities across scopes (`:1685-1688`), where pi makes no pair at all.
+    let project_delta_base = scope_base_dir(&cfg.cwd, &cfg.global_dir, InstallScope::Project);
+    let global_delta_base = scope_base_dir(&cfg.cwd, &cfg.global_dir, InstallScope::Global);
     let mut project_deltas: Vec<(String, PackageFilter)> = Vec::new();
     for declared in ordered_cfg {
         if declared.scope == InstallScope::Project && !cfg.trusted_project {
@@ -809,12 +841,18 @@ fn discover_blocking(cfg: &DiscoveryConfig) -> Result<DiscoveryReport, ResourceE
             Ok(ConfiguredPackageResolution::Tree(tree)) => {
                 let mut tree = *tree;
                 match declared.scope {
-                    InstallScope::Project if declared.filter.is_delta() => project_deltas
-                        .push((declared.source.trim().to_string(), declared.filter.clone())),
+                    InstallScope::Project if declared.filter.is_delta() => project_deltas.push((
+                        crate::package::package_identity(&declared.source, &project_delta_base),
+                        declared.filter.clone(),
+                    )),
                     InstallScope::Global => {
+                        let identity = crate::package::package_identity(
+                            &declared.source,
+                            &global_delta_base,
+                        );
                         tree.delta_shadow = project_deltas
                             .iter()
-                            .find(|(source, _)| source == declared.source.trim())
+                            .find(|(candidate, _)| *candidate == identity)
                             .map(|(_, filter)| filter.clone());
                     }
                     InstallScope::Project => {}

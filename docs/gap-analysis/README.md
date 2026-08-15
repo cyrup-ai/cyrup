@@ -16,7 +16,51 @@ the evidence.
 > actually does. Closed items keep their IDs in each area file's status table so a closure can be
 > re-audited later.
 >
-> **RECONCILED 2026-08-14 against cyrup HEAD `380c713`.** Two whole-backlog parity sweeps have
+> **RECONCILED 2026-08-14 (second edition) against cyrup HEAD `bdcb0d0`.** **Six** whole-backlog
+> sweeps have now landed. The first edition of this block reconciled sweeps 1-2; **sweeps 3, 4, 5 and
+> 6 ran before any doc writer did**, and this edition reconciles them. Every count below is
+> re-derived from the twelve `## Open items` tables, nothing carried forward.
+>
+> **Open set: 153 work items — 0 critical, 2 high, 63 medium, 88 low** (was 173 = 0/3/75/95), plus
+> **10 `tracker` rows** excluded from the count as always (`PERM-017` was re-classified this
+> edition). **338 of 500 rows now carry a closure marker.** Eight rows are new since the first
+> edition and **four were filed AND closed in the same pass** — `TOOL-042`, `EXT-M01`, `EXT-M02`,
+> `PERM-033` — which is what a *hunting* sweep produces. `TUI-062` was filed and partially closed;
+> `CFG-052`, `CFG-053` and `ICOM-053` were filed open. **No ID was renumbered, merged or deleted.**
+>
+> **The two remaining highs are `SESS-040` and `PROV-047`.** `SEAM-061`, ranked #1 for two editions,
+> **is closed as REFUTED — it was already landed at HEAD in both crates.** Areas 08, 09 and 10 now
+> have zero open criticals and zero open highs between them.
+>
+> **The measured error rate is unchanged at ≈12% (≈53 refutations across ~430 items worked), but the
+> failure mode has shifted, and this is the finding to act on.** Sweep 6 recorded ~39
+> `refuted-not-fixed` outcomes; **roughly 32 of them were DOC STALENESS, not analysis error** — the
+> fix had landed in a sweep between 3 and 5 and no writer had reconciled it. In `06-cyrup-ext.md`,
+> eighteen rows read "still open" in one table while the *same file's* `## Open items` table had
+> already marked them CLOSED. **Reconcile documentation every sweep, not every four.** The remaining
+> ~7 are genuine analysis errors, including three fabricated citations and one refutation that was
+> itself wrong (`PERM-008`).
+>
+> **ORCHESTRATION, recorded for whoever runs sweep 7:** per-crate partitioning **stalled at sweep 4,
+> which landed 15 items**, because an agent owning the crate where a defect is *observed* rarely owns
+> the crate where the fix *lands*. **Sweep 5 repartitioned by FEATURE — each agent owning every crate
+> its feature needs — and landed all five assigned items**; sweep 6 kept that shape and landed ~15,
+> including `PROV-011`, which five consecutive provider-side re-verifications had called "clean"
+> because both of its remaining defects were plumbing frames in the middle. **Route sweep 7 by FIX
+> SITE, not by area number**: not one open row in `04-cyrup-tools.md` has a fix site inside
+> `crates/cyrup-tools/**` any more, and `07-cyrup-tui.md` now carries a routing table of eleven
+> foreign-filed rows that land in it.
+>
+> **The test architecture changed**: 310 integration binaries → **6 + 8 gated** behind the
+> `cyrup-it` harness crate, gate now at **6699 tests, 7 skipped, in 16.3 s** (was 6440 in 16.4 s).
+> Every `crates/<crate>/tests/<x>.rs` citation in this directory is stale unless it names `cyrup-it`
+> — **and `cyrup-it` is `required-features = ["it"]`, so the gate does not build or run it**
+> (structural defect J, now filed in its own right as `ICOM-053`; it also blocks `EXT-025` and hides
+> an un-instantiated 0.7 `HOST_WORLD` guest fixture).
+>
+> *Superseded first-edition figures, retained for provenance:*
+
+> **RECONCILED 2026-08-14 (first edition) against cyrup HEAD `380c713`.** Two whole-backlog parity sweeps have
 > landed — **sweep 1, 232 items across 11 crates, plus sweep 2** — and every count in this file has
 > been re-derived from the twelve `## Open items` tables. **Open set: 173 work items — 0 critical,
 > 3 high, 75 medium, 95 low**, plus **9 `tracker` rows** excluded from the count as always. **290 rows
@@ -25,8 +69,8 @@ the evidence.
 > refuted item keeps its ID with the refutation recorded in its row. Start at
 > [`00-residual-ledger.md`](00-residual-ledger.md), whose top section is the reconciliation.
 >
-> **The three remaining highs are `SEAM-061`, `SESS-040` and `PROV-047`**, and all three are blocked
-> on coordination across two or more crates rather than on analysis.
+> ~~**The three remaining highs are `SEAM-061`, `SESS-040` and `PROV-047`**, and all three are blocked
+> on coordination across two or more crates rather than on analysis.~~ **Superseded: two highs, see above.**
 >
 > **The analysis's own error rate is now measured: ≈12%.** Sweep 1 refuted 31 of ~290 items it
 > worked; sweep 2 recorded 16 further `refuted-not-fixed` outcomes plus about a dozen in-body factual
@@ -34,7 +78,7 @@ the evidence.
 > evidence, not fact, until it has been re-read at HEAD. See the ledger's error-rate section.
 >
 > **The test architecture changed**: 310 integration binaries → **6 + 8 gated** behind a new
-> `cyrup-it` harness crate, gate at **6440 tests in 16.4 s**. Every `crates/<crate>/tests/<x>.rs`
+> `cyrup-it` harness crate, gate at ~~**6440 tests in 16.4 s**~~ **6699 tests in 16.3 s (2026-08-14)**. Every `crates/<crate>/tests/<x>.rs`
 > citation in this directory is stale unless it names `cyrup-it` — **and `cyrup-it` is
 > `required-features = ["it"]`, so the gate does not build or run it** (structural defect J).
 >
@@ -76,25 +120,33 @@ the evidence.
 | [`PARITY-GAPS.md`](PARITY-GAPS.md) | **the same items grouped by gap class — read first.** Its §0 census and §0a above-medium table are **superseded 2026-08-14** (they enumerate the 448-item set); the class taxonomy, the per-entry fix sketches and §7 Method are current | — | — | — |
 | [`REPRO-LOG.md`](REPRO-LOG.md) | **the first execution of this binary — 17 items driven through a real pty or headless, 16 confirmed / 1 refuted / 0 blocked, plus the real suite numbers (6387, not the inherited 3932) and 9 new items filed from what the binary was seen doing.** Every row carries a transcript. **Read this before trusting a severity: only 3 of 17 items survived a live run unchanged.** | — | — | — |
 | [`00-residual-ledger.md`](00-residual-ledger.md) | ranked cross-cutting view | — | — | — |
-| [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | **12** | 0 | 1 |
+| [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | **11** | 0 | 1 |
 | [`02-cyrup-agent.md`](02-cyrup-agent.md) | the turn loop, tool dispatch, hooks, abort | **2** | 0 | 0 |
 | [`03-cyrup-session.md`](03-cyrup-session.md) | JSONL session tree, compaction, system prompt | **8** | 0 | 1 |
-| [`04-cyrup-tools.md`](04-cyrup-tools.md) | the built-in tool set | **6** | 0 | 0 |
-| [`05-cyrup-config-and-resources.md`](05-cyrup-config-and-resources.md) | settings, model resolution, trust, skills, packages | **18** | 0 | 0 |
+| [`04-cyrup-tools.md`](04-cyrup-tools.md) | the built-in tool set | **5** | 0 | 0 |
+| [`05-cyrup-config-and-resources.md`](05-cyrup-config-and-resources.md) | settings, model resolution, trust, skills, packages | **12** | 0 | 0 |
 | [`06-cyrup-ext.md`](06-cyrup-ext.md) | extension host, WIT world, event catalog | **24** | 0 | 0 |
-| [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | **34** | 0 | 0 |
-| [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | **8** | 0 | 1 |
-| [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation | **26** | 0 | 0 |
-| [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | **5** | 0 | 0 |
-| [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker | **14** | 0 | 0 |
+| [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | **35** | 0 | 0 |
+| [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | **7** | 0 | 0 |
+| [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation | **20** | 0 | 0 |
+| [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | **4** | 0 | 0 |
+| [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker | **9** | 0 | 0 |
 | [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline | **16** | 0 | 0 |
-| | **total** | **173** | **0** | **3** |
+| | **total** | **153** | **0** | **2** |
 
-Counts are the `## Open items` table of each file. **Every file now carries exactly one such table**
-— area 03's second table was the last one and was folded in during the repair pass — so a single
-enumeration is complete. Nine `tracker` rows sit in those tables (or, in areas 08 and 09, in a
-separate `## Trackers` table) and are deliberately outside the arithmetic: one each in areas 01, 02,
-03, 08 and 09, and four in area 12.
+Counts are the `## Open items` table of each file, re-derived 2026-08-14 (second edition, after
+sweeps 3-6). **Every file now carries exactly one such table** — area 03's second table was the last
+one and was folded in during the repair pass — so a single enumeration is complete. **Ten** `tracker`
+rows sit in those tables (or, in areas 08 and 09, in a separate `## Trackers` table) and are
+deliberately outside the arithmetic: one each in areas 01, 02, 03, 08, 09 and **10** (`PERM-017`,
+re-classified 2026-08-14), and four in area 12.
+
+**A count in this table is a floor for a second reason as of this edition: eighteen rows in
+`06-cyrup-ext.md`, six in `09-cyrup-ext-subagents.md` and five in `11-cyrup-intercom.md` were found by
+sweep 6 to be CLOSED at HEAD while a *second* table in the same file still called them open.** Where a
+file carries both a `## Status of every item from prior analyses` table and an `## Open items` table,
+**only the latter is counted, and only the latter was kept current between reconciliations.** Read
+both before quoting either.
 
 **Every one of these is a floor, not a total** — see blind spot 1. It is also not a clean total in
 the other direction: area 12 marks **16 of its 30** rows `duplicate-of` an item another area owns

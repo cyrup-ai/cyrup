@@ -219,28 +219,71 @@ pub fn forwarding_location(
 
 // ---------------------------------------------------------------------------- filesystem helpers
 
+/// pi `setRestrictiveFileSystemMode` (v0.8.0 `index.ts:746-752`): chmod, and on failure raise
+/// `Failed to restrict {description} permissions for '{path}'` on the forwarding WARNING stream.
+///
+/// `audit` is `Option` only because pi's logger is module-scope and cyrup's is an owned
+/// [`AuditTrail`] handle: the crate's own unit tests call these helpers with no trail in scope, and
+/// upstream's shape has no way to express that. Every PRODUCTION path passes `Some`.
 #[cfg(unix)]
-fn set_restrictive_mode(path: &Path, mode: u32) {
+fn set_restrictive_mode(path: &Path, mode: u32, description: &str, audit: Option<&AuditTrail>) {
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    if let Err(err) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+        && let Some(audit) = audit
+    {
+        audit.forwarding_warning(
+            &format!("Failed to restrict {description} permissions for '{}'", path.display()),
+            Some(&err.to_string()),
+        );
+    }
 }
 
 #[cfg(not(unix))]
-fn set_restrictive_mode(_path: &Path, _mode: u32) {}
+fn set_restrictive_mode(
+    _path: &Path,
+    _mode: u32,
+    _description: &str,
+    _audit: Option<&AuditTrail>,
+) {
+}
 
-/// pi `ensureDirectoryExists` (`index.ts:1030-1039`): mkdir recursive + chmod `0o700`. Returns `true`
-/// only if all three dirs are ready.
+/// pi `ensureDirectoryExists` (v0.8.0 `index.ts:754-763`): mkdir recursive + chmod `0o700`, with
+/// `Failed to create {description} directory '{path}'` on the forwarding ERROR stream when the
+/// mkdir fails. pi logs the mkdir failure at `error` and the chmod failure at `warning`; both are
+/// reproduced.
+fn ensure_directory_exists(path: &Path, description: &str, audit: Option<&AuditTrail>) -> bool {
+    if let Err(err) = std::fs::create_dir_all(path) {
+        if let Some(audit) = audit {
+            audit.forwarding_error(
+                &format!("Failed to create {description} directory '{}'", path.display()),
+                Some(&err.to_string()),
+            );
+        }
+        return false;
+    }
+    set_restrictive_mode(path, 0o700, description, audit);
+    true
+}
+
+/// pi `ensurePermissionForwardingLocation` (v0.8.0 `index.ts:793-809`): the three
+/// [`ensure_directory_exists`] calls, in upstream's order, with upstream's three literal
+/// descriptions. Returns `true` only if all three dirs are ready.
+///
+/// **Upstream evaluates all three even when an earlier one failed** (`:803-805` are three
+/// unconditional `const` bindings ANDed at `:808`), so a run with a broken spool reports all three
+/// causes rather than only the first. `Iterator::all` short-circuits, which would have logged one —
+/// hence the fold.
 #[must_use]
-pub fn ensure_location(location: &ForwardingLocation) -> bool {
-    [&location.session_root, &location.requests_dir, &location.responses_dir]
-        .into_iter()
-        .all(|dir| {
-            if std::fs::create_dir_all(dir).is_err() {
-                return false;
-            }
-            set_restrictive_mode(dir, 0o700);
-            true
-        })
+pub fn ensure_location(location: &ForwardingLocation, audit: Option<&AuditTrail>) -> bool {
+    [
+        (&location.session_root, "permission forwarding session root"),
+        (&location.requests_dir, "permission forwarding requests"),
+        (&location.responses_dir, "permission forwarding responses"),
+    ]
+    .into_iter()
+    .fold(true, |ready, (dir, description)| {
+        ensure_directory_exists(dir, description, audit) && ready
+    })
 }
 
 /// pi `createPermissionForwardingNonce` (`index.ts:1135-1137`): 32 CSPRNG bytes, base64url (no pad),
@@ -289,6 +332,47 @@ pub fn response_is_bound(
         && response.responder_session_id == target_session_id
 }
 
+/// [`response_is_bound`] with pi's TWO rejection warnings
+/// (`isForwardedPermissionResponseBoundToRequest`, v0.8.0 `index.ts:879-898`), which name the two
+/// failures separately because they mean different things: the first is a stale or forged response,
+/// the second is a response written by the wrong session. cyrup dropped both, so a forged response
+/// was discarded in silence and the operator saw only the `response_received` review entry with
+/// every field null — enough to notice something, not enough to say what.
+#[must_use]
+fn response_is_bound_logged(
+    response: &ForwardedPermissionResponse,
+    request: &ForwardedPermissionRequest,
+    target_session_id: &str,
+    response_path: &Path,
+    audit: &AuditTrail,
+) -> bool {
+    if response.request_id != request.id
+        || !safe_equal_string(&response.response_nonce, &request.response_nonce)
+    {
+        audit.forwarding_warning(
+            &format!(
+                "Ignoring forwarded permission response '{}' because it is not bound to request '{}'",
+                response_path.display(),
+                request.id
+            ),
+            None,
+        );
+        return false;
+    }
+    if response.responder_session_id != target_session_id {
+        audit.forwarding_warning(
+            &format!(
+                "Ignoring forwarded permission response '{}' because responder session '{}' does not match target session '{target_session_id}'",
+                response_path.display(),
+                response.responder_session_id
+            ),
+            None,
+        );
+        return false;
+    }
+    true
+}
+
 /// pi `writeJsonFileAtomic` (`index.ts:1166-1178`): write a unique `<path>.<pid>.<uuid>.tmp` with
 /// `O_EXCL` (`wx`, no-clobber) + `0o600`, chmod, then `rename` into place, then chmod again. On any
 /// failure the temp is removed. The no-clobber flag on the (unique) temp is load-bearing for
@@ -296,7 +380,11 @@ pub fn response_is_bound(
 ///
 /// # Errors
 /// Returns [`PermissionError::Io`] if serialization, the exclusive create/write, or the rename fails.
-pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), PermissionError> {
+pub fn write_json_atomic<T: Serialize>(
+    path: &Path,
+    value: &T,
+    audit: Option<&AuditTrail>,
+) -> Result<(), PermissionError> {
     let body = serde_json::to_string(value).map_err(|e| PermissionError::Io(e.to_string()))?;
     let pid = std::process::id();
     let uid = uuid::Uuid::new_v4();
@@ -320,32 +408,112 @@ pub fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> Result<(), Per
         file.write_all(body.as_bytes())?;
         let _ = file.sync_all();
         drop(file);
-        set_restrictive_mode(&temp, 0o600);
+        // pi's two chmod descriptions, `index.ts:983` and `:985`.
+        set_restrictive_mode(&temp, 0o600, "temporary permission-forwarding file", audit);
         std::fs::rename(&temp, path)?;
-        set_restrictive_mode(path, 0o600);
+        set_restrictive_mode(path, 0o600, "permission-forwarding file", audit);
         Ok(())
     })();
 
     if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&temp);
+        // pi `safeDeleteFile(tempPath, "temporary permission-forwarding")` (`index.ts:987`) — note
+        // upstream's description here omits the trailing `file`, which `safeDeleteFile` appends.
+        safe_delete_file(&temp, "temporary permission-forwarding", audit);
         return Err(PermissionError::Io(e.to_string()));
     }
     Ok(())
 }
 
-/// pi `readForwardedPermissionRequest` (`index.ts:1180-1211`): parse + strict-schema-validate; any
-/// malformed/missing field → `None` (serde enforces the required fields).
-#[must_use]
-pub fn read_request(path: &Path) -> Option<ForwardedPermissionRequest> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+/// The read-then-validate ladder shared by [`read_request`] and [`read_response`], reproducing the
+/// TWO DISTINCT diagnostics upstream raises for what Rust would otherwise collapse into one
+/// `serde_json::from_str` failure:
+///
+/// * an unreadable file or non-JSON bytes land in pi's `catch` and log
+///   `Failed to read forwarded permission {kind} '{path}'` **with the cause**
+///   (v0.8.0 `index.ts:942` / `:973`);
+/// * well-formed JSON that fails the field-shape check logs
+///   `Ignoring invalid forwarded permission {kind} format in '{path}'` **with no cause**
+///   (`:928` / `:959`), because upstream has no error object at that point.
+///
+/// Deserializing to [`serde_json::Value`] first is what keeps the two apart: it is exactly pi's
+/// `JSON.parse` boundary, and only the typed step after it is pi's field ladder.
+fn read_forwarded_json<T: serde::de::DeserializeOwned>(
+    path: &Path,
+    kind: &str,
+    audit: Option<&AuditTrail>,
+) -> Option<T> {
+    let parsed = std::fs::read_to_string(path)
+        .map_err(|e| e.to_string())
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
+        });
+    let value = match parsed {
+        Ok(value) => value,
+        Err(err) => {
+            if let Some(audit) = audit {
+                audit.forwarding_warning(
+                    &format!(
+                        "Failed to read forwarded permission {kind} '{}'",
+                        path.display()
+                    ),
+                    Some(&err),
+                );
+            }
+            return None;
+        }
+    };
+    match serde_json::from_value::<T>(value) {
+        Ok(typed) => Some(typed),
+        Err(_) => {
+            if let Some(audit) = audit {
+                // pi passes NO error to this call (`index.ts:928`, `:959`) — the field ladder is a
+                // boolean check upstream, so the entry carries `{message}` alone. Attaching serde's
+                // message here would emit a shape pi's readers do not produce.
+                audit.forwarding_warning(
+                    &format!(
+                        "Ignoring invalid forwarded permission {kind} format in '{}'",
+                        path.display()
+                    ),
+                    None,
+                );
+            }
+            None
+        }
+    }
 }
 
-/// pi `readForwardedPermissionResponse` (`index.ts:1213-1242`).
+/// pi `readForwardedPermissionRequest` (v0.8.0 `index.ts:906-948`) WITHOUT the audit trail — the
+/// shape the crate's own tests and out-of-crate probes use. Production reads go through
+/// [`read_request_with_audit`].
+#[must_use]
+pub fn read_request(path: &Path) -> Option<ForwardedPermissionRequest> {
+    read_forwarded_json(path, "request", None)
+}
+
+/// pi `readForwardedPermissionRequest` (v0.8.0 `index.ts:906-948`), including both of its warning
+/// entries.
+#[must_use]
+pub fn read_request_with_audit(
+    path: &Path,
+    audit: &AuditTrail,
+) -> Option<ForwardedPermissionRequest> {
+    read_forwarded_json(path, "request", Some(audit))
+}
+
+/// pi `readForwardedPermissionResponse` (v0.8.0 `index.ts:950-977`) without the audit trail.
 #[must_use]
 pub fn read_response(path: &Path) -> Option<ForwardedPermissionResponse> {
-    let text = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&text).ok()
+    read_forwarded_json(path, "response", None)
+}
+
+/// pi `readForwardedPermissionResponse` (v0.8.0 `index.ts:950-977`), including both of its warning
+/// entries.
+#[must_use]
+pub fn read_response_with_audit(
+    path: &Path,
+    audit: &AuditTrail,
+) -> Option<ForwardedPermissionResponse> {
+    read_forwarded_json(path, "response", Some(audit))
 }
 
 fn now_millis() -> i64 {
@@ -355,14 +523,79 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
-/// pi `tryRemoveDirectoryIfEmpty` × 3 (`cleanupPermissionForwardingLocationIfEmpty`,
-/// `index.ts:1089-1121`): best-effort removal of now-empty spool dirs (leaf → root).
-fn cleanup_location_if_empty(location: &ForwardingLocation) {
-    for dir in [&location.requests_dir, &location.responses_dir, &location.session_root] {
-        let is_empty = std::fs::read_dir(dir).map(|mut it| it.next().is_none()).unwrap_or(false);
-        if is_empty {
-            let _ = std::fs::remove_dir(dir);
+/// pi `tryRemoveDirectoryIfEmpty` (v0.8.0 `index.ts:823-849`): an absent dir is silent; a dir that
+/// cannot be listed warns `Failed to inspect …`; a non-empty dir returns; a removal that fails with
+/// anything other than `ENOENT`/`ENOTEMPTY` warns `Failed to remove empty …`.
+///
+/// The two ignored codes are load-bearing and are why `remove_dir`'s error is inspected rather than
+/// discarded: both mean another process won the race, which is normal for a shared spool.
+fn try_remove_directory_if_empty(path: &Path, description: &str, audit: Option<&AuditTrail>) {
+    if !path.exists() {
+        return;
+    }
+    let is_empty = match std::fs::read_dir(path) {
+        Ok(mut entries) => entries.next().is_none(),
+        Err(err) => {
+            if let Some(audit) = audit {
+                audit.forwarding_warning(
+                    &format!("Failed to inspect {description} directory '{}'", path.display()),
+                    Some(&err.to_string()),
+                );
+            }
+            return;
         }
+    };
+    if !is_empty {
+        return;
+    }
+    if let Err(err) = std::fs::remove_dir(path) {
+        let ignorable = matches!(
+            err.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+        );
+        if !ignorable && let Some(audit) = audit {
+            audit.forwarding_warning(
+                &format!("Failed to remove empty {description} directory '{}'", path.display()),
+                Some(&err.to_string()),
+            );
+        }
+    }
+}
+
+/// pi `cleanupPermissionForwardingLocationIfEmpty` (v0.8.0 `index.ts:851-855`): best-effort removal
+/// of now-empty spool dirs (leaf → root), with upstream's `${location.label} …` descriptions. The
+/// label is the literal `"primary"` for every location this crate builds
+/// (`permission-forwarding.ts:120`), which is why it is inlined rather than carried on
+/// [`ForwardingLocation`] — the same choice the crate's existing `"Failed to read primary permission
+/// forwarding requests from …"` message already made.
+fn cleanup_location_if_empty(location: &ForwardingLocation, audit: Option<&AuditTrail>) {
+    try_remove_directory_if_empty(
+        &location.requests_dir,
+        "primary permission forwarding requests",
+        audit,
+    );
+    try_remove_directory_if_empty(
+        &location.responses_dir,
+        "primary permission forwarding responses",
+        audit,
+    );
+    try_remove_directory_if_empty(
+        &location.session_root,
+        "primary permission forwarding session root",
+        audit,
+    );
+}
+
+/// pi `safeDeleteFile` (v0.8.0 `index.ts:857-867`): unlink, silent on `ENOENT`, warning otherwise.
+fn safe_delete_file(path: &Path, description: &str, audit: Option<&AuditTrail>) {
+    if let Err(err) = std::fs::remove_file(path)
+        && err.kind() != std::io::ErrorKind::NotFound
+        && let Some(audit) = audit
+    {
+        audit.forwarding_warning(
+            &format!("Failed to delete {description} file '{}'", path.display()),
+            Some(&err.to_string()),
+        );
     }
 }
 
@@ -443,7 +676,7 @@ pub async fn wait_for_forwarded_approval(
             return denied();
         }
     };
-    if !ensure_location(&location) {
+    if !ensure_location(&location, Some(audit)) {
         // pi unavailable-dirs deny + error entry (v0.8.0 `index.ts:1007-1013`).
         audit.forwarding_error(
             &format!("Permission forwarding is unavailable because session-scoped directories could not be prepared for '{target}'"),
@@ -480,7 +713,7 @@ pub async fn wait_for_forwarded_approval(
         }),
     );
 
-    if let Err(err) = write_json_atomic(&request_path, &request) {
+    if let Err(err) = write_json_atomic(&request_path, &request, Some(audit)) {
         // pi request-write failure deny + error entry (v0.8.0 `index.ts:1039-1044`).
         audit.forwarding_error(
             &format!("Failed to write forwarded permission request '{}'", request_path.display()),
@@ -517,8 +750,9 @@ pub async fn wait_for_forwarded_approval(
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if response_path.exists() {
-            let bound = read_response(&response_path)
-                .filter(|resp| response_is_bound(resp, &request, &target));
+            let bound = read_response_with_audit(&response_path, audit).filter(|resp| {
+                response_is_bound_logged(resp, &request, &target, &response_path, audit)
+            });
             // pi `writeReviewEntry("forwarded_permission.response_received", …)`
             // (v0.8.0 `index.ts:1056-1064`) — written for EVERY response file observed, bound or
             // not, with every field `null` when the binding check rejected it. That is the whole
@@ -540,7 +774,7 @@ pub async fn wait_for_forwarded_approval(
             let _ = std::fs::remove_file(&response_path); // consume-on-read (pi `:1066`).
             if let Some(resp) = bound {
                 let _ = std::fs::remove_file(&request_path);
-                cleanup_location_if_empty(&location);
+                cleanup_location_if_empty(&location, Some(audit));
                 return PermissionPromptDecision {
                     approved: resp.approved,
                     state: resp.state,
@@ -586,7 +820,7 @@ pub async fn wait_for_forwarded_approval(
         }),
     );
     let _ = std::fs::remove_file(&request_path);
-    cleanup_location_if_empty(&location);
+    cleanup_location_if_empty(&location, Some(audit));
     denied()
 }
 
@@ -694,10 +928,17 @@ pub async fn process_forwarded_requests(
     request_files.sort(); // pi `.sort()` (`index.ts:1375`) — deterministic order.
 
     for request_path in request_files {
-        let request = match read_request(&request_path) {
+        let request = match read_request_with_audit(&request_path, audit) {
             Some(r) => r,
             None => {
-                let _ = std::fs::remove_file(&request_path); // invalid → delete (pi `:1143-1146`).
+                // pi `safeDeleteFile(requestPath, "${location.label} forwarded permission request")`
+                // (v0.8.0 `index.ts:1147`). The READER has already said WHY it was unusable; this
+                // call only reports a delete that itself failed.
+                safe_delete_file(
+                    &request_path,
+                    "primary forwarded permission request",
+                    Some(audit),
+                );
                 continue;
             }
         };
@@ -813,7 +1054,7 @@ pub async fn process_forwarded_requests(
             responder_session_id: current.clone(),
             responded_at: now_millis(),
         };
-        if let Err(err) = write_json_atomic(&response_path, &response) {
+        if let Err(err) = write_json_atomic(&response_path, &response, Some(audit)) {
             // pi response-write failure: report it and leave the request for a retry
             // (v0.8.0 `index.ts:1240-1243`).
             audit.forwarding_error(
@@ -831,7 +1072,7 @@ pub async fn process_forwarded_requests(
     // pi `if (!options.preserveLocation) { cleanupPermissionForwardingLocationIfEmpty(location); }`
     // (`index.ts:1501-1503`).
     if !options.preserve_location {
-        cleanup_location_if_empty(&location);
+        cleanup_location_if_empty(&location, Some(audit));
     }
 }
 
@@ -1040,7 +1281,7 @@ pub fn spawn_forwarding_watcher(
         };
 
         // Create the inbox so the watch target exists for the run's lifetime (pi ensures on demand).
-        let _ = ensure_location(&location);
+        let _ = ensure_location(&location, Some(&*audit));
 
         // Mandatory startup re-scan (a request may have landed before the watcher attached).
         // `preserve_location` — pi `index.ts:1935`'s `{ preserveLocation: true }`: this watcher owns
@@ -1168,7 +1409,7 @@ mod tests {
             requester_agent_name: "worker".into(),
             message: "run bash?".into(),
         };
-        write_json_atomic(&path, &req).unwrap();
+        write_json_atomic(&path, &req, None).unwrap();
         let back = read_request(&path).unwrap();
         assert_eq!(back.id, "id1");
         assert_eq!(back.target_session_id, "parent");
@@ -1263,7 +1504,7 @@ mod tests {
     /// Drop a well-formed forwarded request into `parent`'s inbox and return its id.
     fn seed_request(agent_dir: &Path, parent: &str) -> String {
         let loc = forwarding_location(agent_dir, parent).unwrap();
-        assert!(ensure_location(&loc), "the spool dirs must be creatable");
+        assert!(ensure_location(&loc, None), "the spool dirs must be creatable");
         let req = ForwardedPermissionRequest {
             id: "req-perm005".to_string(),
             response_nonce: create_nonce(),
@@ -1273,7 +1514,7 @@ mod tests {
             requester_agent_name: "worker".to_string(),
             message: "run `bash rm -rf /`?".to_string(),
         };
-        write_json_atomic(&loc.requests_dir.join("req-perm005.json"), &req).unwrap();
+        write_json_atomic(&loc.requests_dir.join("req-perm005.json"), &req, None).unwrap();
         req.id
     }
 

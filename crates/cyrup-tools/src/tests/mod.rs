@@ -7,6 +7,7 @@ mod cross_registry_mutation_lock;
 mod edit_preview_diff;
 mod grep_context_zero_line_text;
 mod isolation;
+mod no_inherited_harness_stdio;
 mod pi_schema;
 mod pi_tool_semantics;
 mod read_access_errno;

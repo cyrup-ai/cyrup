@@ -5,6 +5,196 @@ next work item**.
 
 ---
 
+# RECONCILED 2026-08-14 (second edition) — six sweeps applied, every count re-derived from the twelve area tables
+
+> **cyrup HEAD `bdcb0d0`** (was `380c713` when the first edition below was written), branch
+> `david/cyrup`, tree clean. Gate: **`cargo nextest run --workspace` = 6699 tests, 6699 passed,
+> 7 skipped, 16.3 s**; `cargo check --workspace --all-targets` clean.
+>
+> **Everything below this block — including the `RECONCILED 2026-08-14 — two parity sweeps applied`
+> header that follows it — is the previous edition and is superseded on every number.** It is
+> retained unedited because its *reasoning* is still the argument this file rests on. Only the
+> arithmetic is dead. Where a sentence in it is wrong about the CODE or about UPSTREAM (not merely
+> out of date), it has been struck in place; those strikes are listed under
+> "Corrections to the previous edition" below.
+
+## What happened: sweeps 3, 4, 5 and 6
+
+The first edition reconciled sweeps 1-2. **Four more sweeps ran before any doc writer did**, and that
+delay is itself the largest finding of this edition — see "Why sweep 6 'refuted' 39 rows" below.
+
+| sweep | shape | landed | note |
+|---|---|---|---|
+| 1 | per-crate, 11 agents | 232 items | 184 `docUpdatesNeeded`; reconciled in the first edition |
+| 2 | per-crate | (see first edition) | reconciled in the first edition |
+| 3 | per-crate | — | **never reconciled into these files** |
+| 4 | per-crate | **15 items only** | the stall; see the orchestration finding |
+| 5 | **by FEATURE** | **5 of 5 assigned, incl. `SUBA-S01`** | the unblock |
+| 6 | **by FEATURE**, 5 agents | **~15 landed, ~39 rows refuted** | reconciled here |
+
+## The open set — derived from the twelve `## Open items` tables, nothing carried forward
+
+| | critical | high | medium | low | **counted open** |
+|---|---:|---:|---:|---:|---:|
+| first edition (after sweeps 1-2) | 0 | 3 | 75 | 95 | **173** |
+| **this edition (after sweeps 3-6)** | **0** | **2** | **63** | **88** | **153** |
+
+**338 of 500 rows across the twelve tables now carry a closure marker** (was 311 of 492). **Ten
+`tracker` rows are excluded from every figure**, as always — eight in the area tables (`PERM-017`
+was re-classified this edition; its own body says "No action while the middle levels remain
+meaningless", which is the Trackers contract) plus `SEAM-058` and `SUBA-005` in their areas'
+separate `## Trackers` tables.
+
+**Eight rows are new since the first edition, and FOUR of them were filed AND closed in the same
+pass** — which is what a *hunting* sweep produces when it finds a defect the backlog never named:
+`TOOL-042` (the nextest `LEAK`, root-caused, area 04), `EXT-M01` and `EXT-M02` (two JS→Rust mechanism
+gaps, area 06) and `PERM-033` (16 unported forwarding audit sites, area 10). One more was filed and
+**partially** closed: `TUI-062` (area 07, still counted open). Three were filed open: `CFG-052`
+(`github:` shorthand), `CFG-053` (test debt re-filed out of `CFG-006`) and `ICOM-053` (re-filed out
+of `ICOM-026`'s structural half).
+
+### By area
+
+| file | crit | high | medium | low | **open** | Δ vs first edition |
+|---|---:|---:|---:|---:|---:|---|
+| `01-cyrup-core-and-provider.md` | 0 | 1 | 4 | 6 | **11** | −1 (`PROV-011`) |
+| `02-cyrup-agent.md` | 0 | 0 | 0 | 2 | **2** | — |
+| `03-cyrup-session.md` | 0 | 1 | 1 | 6 | **8** | — |
+| `04-cyrup-tools.md` | 0 | 0 | 1 | 4 | **5** | −1 (`TOOL-016`; `TOOL-042` filed+closed) |
+| `05-cyrup-config-and-resources.md` | 0 | 0 | 5 | 7 | **12** | −6 (8 closed, 2 filed) |
+| `06-cyrup-ext.md` | 0 | 0 | 11 | 13 | **24** | — (`EXT-M01`/`EXT-M02` filed+closed) |
+| `07-cyrup-tui.md` | 0 | 0 | 14 | 21 | **35** | +1 (`TUI-062` filed) |
+| `08-cyrup-session-svc-and-modes.md` | 0 | 0 | 3 | 4 | **7** | −1 (`SEAM-061`) |
+| `09-cyrup-ext-subagents.md` | 0 | 0 | 10 | 10 | **20** | −6 |
+| `10-cyrup-permission-system.md` | 0 | 0 | 2 | 2 | **4** | −1 (`PERM-017` → tracker; `PERM-033` filed+closed) |
+| `11-cyrup-intercom.md` | 0 | 0 | 5 | 4 | **9** | −5 |
+| `12-upstream-drift-pi-core.md` | 0 | 0 | 7 | 9 | **16** | — (no sweep-6 agent owned it) |
+| | **0** | **2** | **63** | **88** | **153** | **−20** |
+
+**The two remaining highs — the whole actionable high set:**
+
+| # | ID | area | why it is still the top of the backlog |
+|---|---|---|---|
+| 1 | **`SESS-040`** | 03 + 07 + 08 | A shipped control that bills tokens and rewrites the session file still has no dispatch site, and the UI advertises it. Its two siblings (`SESS-041`, `SESS-042`) are closed, so **the moment `SESS-040` lands a caller the abort actually takes effect.** |
+| 2 | **`PROV-047`** | 01 + 02 + 06 + 08 | `httpProxy` reaches OAuth and the ADC minting path, but **the fix stays inert in production until one line lands**: `configure_http_proxy(...)` beside the existing `configure_http_idle_timeout(timeout_ms)` in `cyrup-session-svc/src/builder.rs`. Two further one-liners (`cyrup-agent/src/proxy.rs:468`, `cyrup-ext/src/caps/http.rs:599`) complete it. |
+
+`SEAM-061` — ranked #1 in the first edition — **is closed as REFUTED**: sweep 6 found it already
+landed at HEAD in *both* crates (`cyrup-tui/src/session_selector.rs:154`/`:276`/`:313`/`:1918`/`:1985`
+and `crates/cyrup/src/main.rs:1354` + `startup_ui.rs:191-201`). **Areas 08, 09 and 10 now have zero
+open criticals and zero open highs between them.**
+
+## Why sweep 6 "refuted" 39 rows — two different failures wearing one word
+
+**This is the correction a reader most needs, and it cuts the other way from the first edition's
+headline.** Sweep 6 recorded ~39 `refuted-not-fixed` outcomes across five agents. They are **not** 39
+analysis errors. Separate them:
+
+- **(b) DOC STALENESS — roughly 32 of the 39.** The analysis was right, a sweep between 3 and 5
+  landed the fix, and **no writer ever reconciled it**, so the row still said "still open". Area 06
+  alone accounts for eighteen: every one of `EXT-007`, `-009`, `-011`, `-016`, `-018`, `-023`, `-030`,
+  `-032`, `-033`, `-034`, `-036`, `-044`, `-045`, `-046`, `-049`, `-052`, `-056`, `-057` still read
+  "still open" in `## Status of every item from prior analyses` **while that file's own
+  `## Open items` table had already marked them CLOSED.** Two tables in one file disagreed for four
+  sweeps. Areas 09 and 11 each contributed six more of the same kind.
+- **(a) GENUINE ANALYSIS ERROR — roughly 7.** Fabricated or wrong citations (`PROV-011`'s claim that
+  pi's built-in Edit/Write/Read/Bash declare `constrainedSampling` — **no pi built-in does, three
+  grep hits total at v0.83.0**; three fabrications and four wrong-offset clusters in `EXT-036`),
+  a wrong premise (`LEAK-FAIL`'s "the victim is arbitrary" — nextest runs each test in its own
+  process, so the victim can only be the test that spawned the leak), a misclassification
+  (`PERM-017` is a tracker, not work), stale headline evidence (`CFG-014`'s "grep returns ZERO",
+  `CFG-048`'s "~30-name rename table" — it is **59**, diffed pair-for-pair), and **one refutation
+  that was itself wrong** (`PERM-008-R2`, below).
+
+**Combined across all six sweeps: ≈53 recorded refutations against ~430 items worked ≈ 12%** — the
+same rate the first edition measured, and it did not improve. **But the failure mode has shifted:**
+sweeps 1-2's refutations were mostly type (a); sweep 6's are mostly type (b). **Type (b) is cheaper
+per instance and far more expensive in aggregate, because it costs a whole agent-pass to rediscover
+and it is entirely preventable by reconciling documentation every sweep instead of every four.**
+
+**One refutation was itself wrong, and this is the sharpest lesson in the file.** Sweep 2 refuted a
+third of `PERM-008`'s Verify recipe on the ground that pi emits no warning for a malformed forwarded
+request: `if (!request) { safeDeleteFile(...); continue; }` at `index.ts:1144-1147` has no log call
+above it. **The reading of the CALLER is correct; the conclusion is not** — upstream logs one frame
+down, inside `readForwardedPermissionRequest` (`:942` catch, `:928` field-ladder). The test that
+resulted **pinned cyrup-invented silence as if it were parity**, and sweep 6 had to un-pin it.
+**A test that pins ABSENCE is only as good as the frame depth of the citation behind it. Absence
+claims require the callee to be opened too.**
+
+## ORCHESTRATION — per-crate partitioning stalled at sweep 4; partitioning by FEATURE unblocked it
+
+**Record this for whoever runs sweep 7; it is the highest-leverage finding of this edition and it is
+about the process, not the code.**
+
+- **Sweep 4, partitioned per-crate, landed 15 items.** Per-crate ownership strands everything
+  cross-cutting: an agent that owns the crate where the defect is *observed* usually does not own the
+  crate where the fix *lands*, so the honest outcome is "blocked", every pass, forever.
+- **Sweep 5 repartitioned by FEATURE — each agent owning every crate its feature needs — and landed
+  all five assigned items, including `SUBA-S01`,** which three per-crate passes had left blocked.
+- **Sweep 6 kept the feature partition and landed ~15**, including `PROV-011`, which had been
+  reported "clean" by five consecutive provider-side re-verifications **because both of its two
+  remaining defects were plumbing frames in the middle** (`cyrup-agent/src/agent.rs:818` and
+  `cyrup-ext/src/wrapper.rs`) — sites no per-crate provider agent would ever have opened.
+
+**Three limits of the feature partition, all observed in sweep 6, all worth designing around:**
+
+1. **Ownership partitions the WRITE set; it says nothing about the BUILD set,** which is the
+   dependency closure. `crates/cyrup-intercom` cannot type-check while `crates/cyrup-ext` is
+   mid-edit, and cyrup-ext's WIT was being changed by a concurrent agent for ~20 minutes of the pass.
+2. **Exclusive crate ownership was violated twice, both times for good reason.** The provider agent
+   edited `crates/cyrup-ext/src/wrapper.rs` (one delegating override) because landing only its own
+   half would have shipped a feature no tool could use — the deferral pattern the standing rules
+   forbid. `crates/cyrup/src/main.rs` was edited by two agents in the same window, one of them via
+   **whole-file scripted rewrites** — a clobbering risk that agent itself flagged and said it would
+   not repeat. **A shared bin like `crates/cyrup/src/main.rs` should be assigned to exactly one agent
+   per sweep, or edited only through anchored patches.**
+3. **A "feature" must actually be one.** Area 04's tail was paired with area 11's, and they have
+   nothing in common: **not one open row in `04-cyrup-tools.md` has a fix site inside
+   `crates/cyrup-tools/**` any more** (`TOOL-015`/`-022` → cyrup-tui + cyrup-core, `TOOL-017` →
+   cyrup-tui + a product decision, `TOOL-024` → cyrup-ext, `TOOL-031`'s residual →
+   cyrup-ext-subagents). **Area 04 is finished as a crate; what remains is five rows filed under the
+   wrong area.** Every affected row now names its FIX SITE, and `07-cyrup-tui.md` carries a routing
+   table of the eleven foreign-filed rows that land in it. **Route sweep 7 by fix site, not by area
+   number** — or it will again spawn an agent with no reachable work.
+
+## Test architecture and the gate — updated numbers
+
+- The integration tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` /
+  `d973906`): **310 integration binaries → 6 + 8 gated**, behind the `cyrup-it` harness crate.
+- **The gate is now 6699 tests in 16.3 s** (was 6440 in 16.4 s at the first edition; 3932 and 6387
+  are older still). **Every `crates/<crate>/tests/<x>.rs` citation in this directory is stale unless
+  it names `cyrup-it`.**
+- **Structural defect J is unchanged and now has a second and third instance.** `crates/cyrup-it` is
+  `required-features = ["it"]`, so the 16-second gate builds and runs **none** of it. Consequences
+  now on the record: (i) `EXT-025` cannot be closed by deleting its dead methods, because the
+  breakage would land silently in the un-built crate — it needs **one** agent owning cyrup-ext +
+  cyrup-session-svc + cyrup-it in a single commit; (ii) the 0.6 and 0.7 `HOST_WORLD` bumps have
+  **never been instantiated against a real guest**, because that fixture lives there too, and the
+  failure mode is an opaque wasmtime LINK error; (iii) the four `cyrup-it` assertions the first
+  edition cited as contradicting production **no longer do** — sweep 6 re-read them and they match
+  (`ICOM-026`, closed as refuted). The gap is now filed as **`ICOM-053`** so it is tracked as a
+  statement about the GATE rather than hidden inside a closed test-defect row.
+
+## Corrections to the previous edition — wrong about the CODE or about UPSTREAM, not merely stale
+
+1. **`CFG-042`/`CFG-048`'s "needs `indexmap` in the workspace dependency table" is VOID.** The
+   insertion-ordered map landed in sweep 6 as a ~60-line local `OrderedObject` in
+   `crates/cyrup-config/src/models_store.rs` with **no new dependency**. The mechanism claim in
+   register entry **D** is right; its prescription was wrong.
+2. **`PERM-008`'s "REFUTED ONE THIRD OF THE RECIPE" is struck** — see above. The observation about the
+   caller stands; the conclusion and the test it produced were wrong.
+3. **`SEAM-061`'s ranking note ("two sweeps have split this across areas 07 and 08 and neither took
+   it") is struck** — it was already closed at HEAD in both crates.
+4. **The claim that pi's built-in tools declare `constrainedSampling` is struck.** Three grep hits
+   exist at v0.83.0, all of them the `ToolDefinition` field (`extensions/types.ts:463`) and the two
+   `tool-definition-wrapper.ts` copies (`:14`, `:42`). **Adding opt-ins to cyrup-tools' built-ins
+   would be a divergence FROM pi.**
+5. **`SUBA-N03`'s closure is wider than recorded**: it covers **eleven** `async:true` single-mode
+   parameters, not eight, and the load-bearing half — that the parameters reach the **detached hop-2
+   runner** at the `runner-config.json` boundary, not merely past the router — is separately pinned.
+
+
+---
+
 # RECONCILED 2026-08-14 — two parity sweeps applied, every count re-derived
 
 > **cyrup HEAD `380c713`** (was `04c1ba2` when the edition below was written), branch `david/cyrup`,
@@ -68,7 +258,7 @@ figure in this section was produced by parsing them, and the parse is reproducib
 
 | # | ID | area | why it is still the top of the backlog |
 |---|---|---|---|
-| 1 | **`SEAM-061`** | 08 + **07** | The `--resume` picker lists every project's sessions under a header that says "Current Folder", with a `tab scope` hint bound to nothing. The blocking evidence has NARROWED to one crate: `SessionScope`, `SessionSelector::set_scope` and `scope()` all exist (`session_selector.rs:54`, `:250`, `:255`); what is missing is `SessionAction::ToggleScope` in `keymap.rs:888-909`, its `handle` arm, and making `show_path` follow the scope. **Two sweeps have split this across areas 07 and 08 and neither took it. It must go to one agent holding both crates.** |
+| ~~1~~ | ~~**`SEAM-061`**~~ **CLOSED 2026-08-14 — REFUTED (sweep 6): already landed at HEAD in BOTH crates — `cyrup-tui/src/session_selector.rs:154`/`:276`/`:313`/`:1918`/`:1985` and `crates/cyrup/src/main.rs:1354` + `startup_ui.rs:191-201`. The "blocking evidence" below, and the "two sweeps split this and neither took it" note, are both wrong at HEAD.** | ~~08 + 07~~ | The `--resume` picker lists every project's sessions under a header that says "Current Folder", with a `tab scope` hint bound to nothing. The blocking evidence has NARROWED to one crate: `SessionScope`, `SessionSelector::set_scope` and `scope()` all exist (`session_selector.rs:54`, `:250`, `:255`); what is missing is `SessionAction::ToggleScope` in `keymap.rs:888-909`, its `handle` arm, and making `show_path` follow the scope. **Two sweeps have split this across areas 07 and 08 and neither took it. It must go to one agent holding both crates.** |
 | 2 | **`SESS-040`** | 03 + 07 + 08 | A shipped control that bills tokens and rewrites the session file still has no dispatch site. Its two siblings are now closed — `SESS-041` (auto-compaction token) and `SESS-042` (the `aborted: true` payload) — so **040, 041 and 042 now differ only in wiring: the moment 040 lands a caller the abort actually takes effect.** Blocked on `TUI-055`'s consequence, not on `TUI-055`: the band renders now, but nobody has watched it. |
 | 3 | **`PROV-047`** | 01 + 02 + 06 + 08 | `httpProxy` now reaches OAuth and the ADC minting path, but **the fix is inert in production until one line lands**: `configure_http_proxy(...)` beside the existing `configure_http_idle_timeout(timeout_ms)` in `cyrup-session-svc/src/builder.rs`. Two further one-liners (`cyrup-agent/src/proxy.rs:468`, `cyrup-ext/src/caps/http.rs:599`) complete it. |
 
@@ -209,33 +399,161 @@ not have — **the WASM-vs-native tier leaking into a guest-facing introspection
 pi's one-extension-kind model has no word for. **Re-run the `EXT-036` sweep over the import surfaces,
 not only the event catalog.**
 
+
+**I. Instance-scoped host state substituted for a call-scoped pi parameter must be torn down in `Drop`. (`EXT-M01` — the sixth real bug from this class.)**
+
+`LiveExtension::execute_tool` binds the tool's `CancelToken` on `GuestState` before awaiting the guest
+call and cleared it on both arms of a `tokio::select!`. Upstream's `signal` is a **parameter** of
+`ToolDefinition.execute` (`extensions/types.ts:483` @v0.83.0), so it is call-scoped by the language and
+a started `async` function always settles. A Rust future has a **third** exit neither `select!` arm
+covers — being dropped at the await by an outer `select!`, a `timeout`, or an aborted `JoinHandle` —
+and on that path the cancelled token stayed bound forever. `host-tool.is-cancelled` is **not gated to
+tool calls** (`world.wit:773`), so every later poll from every guest handler answered `true`: a guest
+that checks it to decide whether to keep working silently stopped working. Fixed with an RAII
+`ToolCancelBinding` declared *after* the instance mutex guard, so it drops *before* it and no other
+call can observe the gap. **This generalises to the whole WIT seam:** every pi surface where a
+parameter cannot cross the Component Model boundary is re-expressed as host-side instance state plus a
+guest poll import (`signal` → `is-cancelled`, `AbortSignal` → `is-run-cancelled`, the `onUpdate`
+callback → `emit-update` + `take_tool_updates`). **It is a bug generator, not a one-off.**
+
+**J. An unbiased `tokio::select!` picks at RANDOM; a JS race cannot. (`EXT-M02`.)**
+
+`EpochDriver::spawn` raced `token.cancelled()` against `iv.tick()` with no `biased;`, and a freshly
+built `tokio::interval` fires its **first tick immediately** — so whenever the token was already
+cancelled at spawn, both arms were ready on the very first iteration and shutdown depended on a coin
+flip (expected ~2 iterations: a flake, not a hang). **Audit result, recorded so it is not redone:**
+this was the only unbiased `select!` in cyrup-ext / cyrup-ext-sdk / cyrup-sdk; the other eleven carry
+`biased;`, and **`caps/proc.rs:297`'s unbiased one is CORRECT** — its loop re-evaluates the
+authoritative condition at the top of every iteration and both arms are no-ops. **Do not "fix" it.**
+
+**K. Rust has no object spread, so every wrapper is a hand-written list that silently rots — and the rot is INVISIBLE to the obvious test.**
+
+pi's `wrapRegisteredTool` is `return { ...tool, execute }` (`core/extensions/wrapper.ts:21-22`): every
+field survives **by construction**, including fields added years later. `impl Tool for RegisteredTool`
+must name each method, and its list of eleven omitted `constrained_sampling` — so a WASM guest's
+declaration was read off the descriptor and discarded one frame later (`PROV-011`). **Because a
+dropped delegation returns exactly the trait default, `assert_eq!(w.x(), inner.x())` compares the
+default against the default and passes with the delegation deleted.** `TOOL-024` fixed nine instances
+of that vacuity; `constrained_sampling` was added to the trait afterwards and made a tenth. **Fixing
+the fixture once does not immunise it — the "every fixture value is DISTINCT and non-default"
+invariant must be re-established in the same commit as every new trait method.**
+
+**L. A JS `Map` is TWO data structures, and this port keeps translating it as one.**
+
+`seenInboundMessages` (`ICOM-017`) uses `has(key)` (hash) **and** `keys().next().value` (insertion
+order) inside the same sixteen-line function: the cap eviction is "forget the OLDEST", and a bare
+`HashMap` silently makes it "forget one at random". The file had already recorded this trap for
+`activeTools` (`v0.10.1 index.ts:677` reading `activeTools.values().next().value`) and it was hit
+again. **Standing rule: any pi `Map` whose code touches `.keys()`, `.values()` or `.entries()` needs
+an explicit order carrier in Rust.** Register entry **D**'s `serde_json::Map` case is the same
+mechanism at the serialization layer — and worth a dedicated sweep rather than one item at a time,
+since every user-authored JSON file this port round-trips through `serde_json::Map` gets its key order
+rewritten (`models-store.json` was `CFG-042`; `keybindings.json` already carries a bespoke ordered
+type).
+
+**M. `Iterator::all` short-circuits; three effectful calls ANDed together do not.**
+
+pi's `ensurePermissionForwardingLocation` evaluates three `ensureDirectoryExists` calls as
+unconditional bindings and ANDs the results at the end (`:803-805` → `:808`), so a spool with three
+broken directories reports **three** causes. The natural Rust transcription
+(`[..].into_iter().all(..)`) reports one and stops. **The RETURN VALUE is identical, which is exactly
+why this survives review — only the side effects differ.** Any port of a JS expression that ANDs
+several effectful calls needs a fold. (`PERM-033`.)
+
+**N. A boolean predicate has nowhere to put a diagnostic; the JS guard function it replaced logged before returning `false`.**
+
+`forwarding::response_is_bound` had a real caller and correct constant-time semantics — but the caller
+was `Option::filter`, which **discards the reason**. Upstream cannot lose it, because the same check is
+a function that logs first. **Any Rust `bool` predicate standing in for a JS guard that also logged is
+a place to look for dropped diagnostics**, and the security-relevant instance is exactly this one: a
+forged or misaddressed forwarded response was discarded leaving only an all-null `response_received`
+entry. (`PERM-033`.)
+
+**O. `serde_json::from_str::<T>` collapses two upstream error classes into one.**
+
+pi separates `JSON.parse` failure (catch → `Failed to read …`, **with** the cause) from a field-shape
+rejection (→ `Ignoring invalid … format in …`, **without** a cause, because it holds a parsed object
+and not an error). A single typed deserialize cannot tell them apart, so a faithful port must go
+through `serde_json::Value` first. **Every ported `readX()` that has both a catch and a validation
+ladder has this trap, and it is silent:** one plausible message where upstream emits two distinct ones,
+with the `error` key wrongly present or wrongly absent. (`PERM-033`.)
+
+**P. A correlation table keyed by id is deliberately REUSED across operations upstream; "tidying" it into two tables type-checks and then hangs.**
+
+pi's `cancelMessage` resolves through the **same** `pendingSends` map as `send`, keyed by the
+**cancelled** message's id, because the broker answers a cancel with `delivered { messageId }` naming
+that id. A Rust port that introduces a separate `pending_cancels` table compiles and then waits
+forever on every cancel — the ack arrives and matches nothing. (`ICOM-017`.)
+
+**Q. A mechanism ported one level up or down turns an invariant into an obligation.**
+
+pi's `showWarning` builds `Warning: ${message}` **inside** the function
+(`interactive-mode.ts:3885-3889`); cyrup's `Entry::Warning` renders verbatim, so the prefix became a
+**per-caller** duty. Two of three callers complied; `main.rs`'s `modelFallbackMessage` push did not, so
+a credential-less first run rendered a bare sentence where pi renders a labelled warning. (`TUI-062`.)
+The same shape appears in `findAutoloadDeltaBase` (`CFG-026`): pi computes each scope's identity
+against **its own** base (`package-manager.ts:1307` vs `:1311`), so a relative local path never pairs —
+cyrup's raw-string comparison paired them, i.e. **cyrup was more permissive than pi**, and the in-code
+doc comment asserted the opposite of upstream's behaviour.
+
+**R. `??` and `||` differ on the empty string, and pi uses both within sixty lines.**
+
+`result.reason ?? "Message may not exist..."` (`v0.10.1 index.ts:1955`) **keeps** an empty-string
+reason, where the `||` fallbacks nearby replace it. `unwrap_or_else` on `Option` is `??`; reproducing
+`||` needs an extra `.filter(|s| !s.is_empty())`. (`ICOM-017`.)
+
+**S. `std::process::Command` inherits every UNNAMED stdio handle, so a test fixture can hold the harness's pipe open.**
+
+nextest waits `leak-timeout` for EOF on fds 1/2 after a test process exits, and EOF needs every copy of
+the write end closed. Naming a handle `dup2`s over the harness's copy — **only an omitted handle can
+leak**. One test (`path_probe_is_bounded`) named `.stdout(piped())` only, handed its child the
+harness's stdin and stderr, and left it alive for 30 s on an error arm — producing an intermittent
+`LEAK` on the very test whose purpose was proving the production probe reaps (`TOOL-042`). **Reviewing
+a spawn for what it SETS can never catch this; only a rule about what it must not leave UNSET does.**
+`.output()` is safe (it overrides all three); **`.status()` is NOT** — any future lint that exempts
+"terminal builder methods" as a class re-opens the leak through `.status()`.
+
+**T. Two functions ported from two different upstream files can leave a value classified by neither.**
+
+`is_local_path` (from `paths.ts:41-55`) treats `github:user/repo` as **non-local**, while
+`parse_git_url` (from `git.ts`) rejects it because the prefix is not `git:` and the scheme is not
+https/http/ssh/git — so the source is simultaneously "not a local path" and stored as one.
+Upstream's `parseGitUrl` reaches `hostedGitInfo.fromUrl`, which resolves the shorthands. (`CFG-052`.)
+
 ## Structural defect J — the merge gate does not cover the `cyrup-it` harness
 
 New this pass, and it is a property of the gate rather than of any item.
 
 `crates/cyrup-it` is `required-features = ["it"]` (its own `Cargo.toml:26-34` says so), so
 `cargo test --workspace` / `cargo nextest run --workspace` **does not build or run it**. The 6440-test
-figure therefore gives **zero coverage of the broker-socket seam tests**. The evidence that this is
-not theoretical: four `cyrup-it` assertions (`tests/intercom/tool_actions.rs:319`, `:372`, `:502`,
-`tests/intercom/intercom_command_transcript.rs:142`) currently **contradict production** — they pin a
-trailing period `tools/intercom.rs` stopped emitting when `ICOM-013`'s closed half landed — and they
-are green only because nothing runs them. `PERM-022` moved into the same crate and inherits the
-problem. **Either the gate gains a second invocation with `--features it`, or every assertion in that
-crate should be treated as unverified.**
+figure therefore gives **zero coverage of the broker-socket seam tests**. **UPDATED 2026-08-14 (sweep 6).** The four `cyrup-it` assertions this section cited as contradicting
+production (`tests/intercom/tool_actions.rs:319`, `:372`, `:502`,
+`tests/intercom/intercom_command_transcript.rs:144`) **no longer do** — they were re-read at HEAD and
+match production with no trailing period (`ICOM-026`, closed as REFUTED). **The structural defect is
+unchanged and is now filed in its own right as `ICOM-053`**, because it is a statement about the GATE
+rather than about those tests, and burying it inside a closed test-defect row is how it would be lost.
+Two further consequences are now on the record: **`EXT-025` cannot be closed by deleting its dead
+methods** — the only callers are tests in this un-built crate, so the breakage would land silently, and
+it needs ONE agent owning cyrup-ext + cyrup-session-svc + cyrup-it in a single commit; and **the 0.6
+and 0.7 `HOST_WORLD` bumps have never been instantiated against a real guest**, because the Tier-1
+fixture component lives here too, with an opaque wasmtime LINK error as the failure mode. `PERM-022`
+moved into the same crate and inherits the problem. **Either the gate gains a second invocation with
+`--features it`, or every assertion in that crate should be treated as unverified.**
 
 ## Test architecture — recorded because it invalidates path citations everywhere
 
 The integration tests were relocated into their crates as unit tests (`63d729a` / `c3982b5` /
 `d973906`): **310 integration binaries → 6 + 8 gated**, behind the new `cyrup-it` harness crate, with
-the gate at **6440 tests in 16.4 s** (the previously-inherited figure of 3932, and the 6387 the repro
-pass measured, are both superseded). **Every `crates/<crate>/tests/<x>.rs` citation in this directory
+the gate now at **6699 tests, 6699 passed, 7 skipped, in 16.3 s at HEAD `bdcb0d0`** (**6440 in 16.4 s**
+was this section's own previous figure; the inherited 3932 and the repro pass's 6387 are older still —
+all three are superseded). **Every `crates/<crate>/tests/<x>.rs` citation in this directory
 is stale unless it names `cyrup-it`** — the affected items are enumerated in each area file's
 reconciliation block. Areas 02, 03 and 04 additionally have no out-of-crate `tests/` directory at all.
 
 ## What a planner should do next, in order
 
-1. **`SEAM-061`** — one agent, both crates (07 + 08). It is the only high whose fix is fully
-   understood and fully blocked on coordination.
+1. ~~**`SEAM-061`** — one agent, both crates (07 + 08). It is the only high whose fix is fully~~
+   ~~understood and fully blocked on coordination.~~ **STRUCK 2026-08-14 (sweep 6): closed as REFUTED — it was already landed at HEAD in both crates. The ranked actionable set is now `SESS-040` and `PROV-047`.**
 2. **The one-line residuals**, which are cheap and are what makes three landed features actually
    reachable by a user: `PROV-047`'s `configure_http_proxy` call in the session-svc builder;
    `EXT-037`/`EXT-038`'s two `LiveHostServices` impls (`commands()` off
@@ -381,7 +699,7 @@ schedule without opening the area file. Every row names the file and the fix.
 | 11 | **SEAM-064** | 08 | high · S | **A user cannot answer a security prompt without recording a permanent verdict.** `main.rs:1155` passes `trust_options(&dirs.cwd, false)`; the flag gates both "(this session only)" rows (`trust.rs:356-363`, `:370-377`), so the startup prompt renders three options, every one with a non-empty `updates`, and `run_trust_prompt` persists them unconditionally (`startup_ui.rs:266-268`) — including a permanent lockout. pi's **pre-launch** path passes `includeSessionOnly: true` (`project-trust.ts:32`) while its in-app selector does not, so cyrup's other call site (`session.rs:3255`) is correct and must be left alone. **Fix:** one production character — `true`. Update `startup_ui.rs:504-537` to assert the five-option order and that a session-only index yields empty `updates`. |
 | 12 | **SEAM-062** | 08 | high · S | **The pre-launch `--resume` picker invites a rename, accepts it, repaints the row with the typed name, and drops it.** `run_resume_picker`'s `on_apply` (`startup_ui.rs:129-138`) matches only `Delete`; the rename payload falls through. pi disables rename entirely on this surface (`session-picker.ts:48` passes `showRenameHint:false` and no `renameSession` callback, so `canRename` is false and the handler bails). **Minimum fix:** `set_show_rename_hint(false)` plus a new `SessionSelector::set_rename_enabled(bool)` gating `SessionAction::Rename`. **Preferred:** handle the outcome by opening the target and appending `session_info`, reusing `session.rs:3355-3365`. Same class as #5 — typed text accepted, echoed, discarded. Verify by relaunching after a rename **in a real terminal**. |
 | 13 | **SEAM-063** | 08 | high · M | **Session delete permanently unlinks where pi routes through `trash`, and the failure is swallowed.** `rg -ni trash crates/` returns zero; both `startup_ui.rs:133-137` and `cyrup-session-svc/src/session.rs:3343-3347` bare-unlink, and the startup site discards the `io::Result` so a failed delete still reports success. **Fix:** one `delete_session_file(path) -> Result<DeleteMethod, String>` helper — spawn `trash` first with pi's `["--", path]` guard, success on exit-0 **or** the file having vanished, else `std::fs::remove_file` — called from both sites, propagating the method so `app.rs:4025` can say "moved to trash" vs "deleted". Verify with a stub `trash` on PATH for all three arms, then a live run. |
-| 14 | **SEAM-061** | 08 | high · M | **The `--resume` picker lists every project's sessions under a header that says "Current Folder", with a `tab scope` hint that does nothing.** `gather_session_infos` (`main.rs:1259-1268`) concatenates the cwd listing and the cross-project listing into one vector; `run_resume_picker` hands it to a `SessionSelector` defaulting to `scope=Current`, so the cwd column is off and the advertised toggle is inert — no `SessionAction::ToggleScope` exists. **Fix:** take pi's two loaders separately, add `ToggleScope` bound to Tab, flip `show_path` with the scope (pi's `showCwd`), make the hint conditional, thread `SessionListProgress`. Both halves must land together or the screen keeps lying. Verify with two project dirs **in a real terminal**. |
+| ~~14~~ | ~~**SEAM-061**~~ **CLOSED 2026-08-14 — REFUTED (sweep 6)** | 08 | ~~high · M~~ | **The `--resume` picker lists every project's sessions under a header that says "Current Folder", with a `tab scope` hint that does nothing.** `gather_session_infos` (`main.rs:1259-1268`) concatenates the cwd listing and the cross-project listing into one vector; `run_resume_picker` hands it to a `SessionSelector` defaulting to `scope=Current`, so the cwd column is off and the advertised toggle is inert — no `SessionAction::ToggleScope` exists. **Fix:** take pi's two loaders separately, add `ToggleScope` bound to Tab, flip `show_path` with the scope (pi's `showCwd`), make the hint conditional, thread `SessionListProgress`. Both halves must land together or the screen keeps lying. Verify with two project dirs **in a real terminal**. |
 | 15 | **SESS-040** | 03 | high · M | **A shipped control that bills tokens and rewrites the session file does nothing, and the UI advertises it.** The indicator band renders "(esc to cancel)" at `app.rs:6044`, but `app.rs:4615-4639` handles `CompactionStart` by setting `IndicatorKind::Compaction` and nothing else — no `defaultEditor.onEscape` equivalent is installed; `rg AbortCompaction crates/` returns only the enum variant (`command.rs:32`) and its handler (`:116-118`), **no caller**, and `AgentSession::abort_compaction` (`session.rs:1677-1681`) has no production caller either. pi rebinds Escape on every `compaction_start` (`interactive-mode.ts:3074-3085` @v0.83.0) and restores it at `:3088-3095`. **Fix:** save and replace the default-editor Escape handler on `CompactionStart`, restore in the `CompactionEnd` arm, route through `command.rs:116-118`. `SESS-041` (auto-compaction still uncancellable) and `SESS-042` (a cancelled compaction is still written) are latent **only** because this has no caller — all three ship together. Verification must include a live terminal run. |
 | 16 | **TUI-031** | 07 | high · M | **A turn is assembled from a context that is being rewritten under it.** A prompt typed during compaction dispatches immediately: the `AppAction::Submit` arm (`app.rs:6606-6626`) branches on `is_streaming()` only and never consults `is_compacting()`, and `AgentSession::prepare` (`session.rs:849-900`) has no compaction guard either. pi checks compaction **first** (`interactive-mode.ts:3023-3033`). **Fix:** check `session.is_compacting()` before `is_streaming()`, push onto a new `AppState::compaction_queue`, clear the editor, push pi's `Queued message for after compaction` status, suppress the optimistic echo `dispatch_submission` does at `:1750`, drain on `CompactionComplete` (`:4650-4654`). The session-layer serialization is area 03's to own; note `TUI-016` means there is currently no surface that would show a queued message. |
 | 17 | **SEAM-051** | 08 | high · S | **The DEFAULT value of a v0.84.1 flag makes the binary refuse to start.** `rg tui_mode crates/*.rs` returns nothing; `--tui-mode` is absent from `KNOWN_LONG_FLAGS` (`cli.rs:757-799`), so `partition_extension_flags` (`:701-753`) captures `--tui-mode regular` as an extension flag (the value does not start with `-`/`@`), `report_runtime_diagnostics` returns fatal, and all three modes return `Ok(1)` (`main.rs:514-517`, `:662-666`, `:770-774`). No pi command line or wrapper script can launch cyrup. **Fix:** add the flag to `KNOWN_LONG_FLAGS` + `KNOWN_VALUE_LONG_FLAGS`, add a `TuiMode {Regular, Fullscreen}` value-enum to `Cli`, add pi's two error diagnostics to `apply_arg_leniency` (`diagnostics.rs:90-152`), add the help line. Accepting `regular` as a no-op and rejecting `fullscreen` with an explicit not-supported message is a legitimate interim; the rendering half is `TUI-019`/`OQ-07-1` and **must not block this**. |
@@ -549,7 +867,7 @@ closed. Do not re-schedule either.
 
 ---
 
-## Trackers — 9 ids that propose no work, excluded from every count
+## Trackers — 10 ids that propose no work, excluded from every count
 
 These keep their IDs, their rows and their full bodies, per the stable-id rule. **A planner should
 not pick one up.** They are here so the backlog stops mixing work with bookkeeping — and so that
@@ -565,6 +883,7 @@ each one's escalation condition is written down instead of implied.
 | `DRIFT-022` | 12 | TUI mode / alternate screen. Fix: "Do **not** implement yet"; Verify: "n/a while tracking". `duplicate-of: SEAM-051`. | `OQ-07-1` being answered. The behavioural cost is already carried as work by `SEAM-051`, `CFG-021` and `TUI-019`. |
 | `DRIFT-023` | 12 | `ModelRegistry` → `ModelRuntime`. **Also a LEAD — neither side was re-read, in this pass or the repair pass.** `duplicate-of: CFG-020`. | Someone spending the two-sided read. The area file records the exact commands. |
 | `DRIFT-032` | 12 | llama.cpp router / HF model search. Fix: "Defer until DRIFT-019 and DRIFT-009 are settled". Kind corrected `upstream-drift` → `not-ported` this pass (all files exist at **v0.83.0**), confidence medium → high. `duplicate-of: EXT-027`. | `EXT-027` being scoped — upstream ships it as a bundled **extension**, which is why area 06 owns it. |
+| `PERM-017` | 10 | **Re-classified 2026-08-14 (sweep 6)** — forwarding-root agent-dir env overrides. Its own Fix is "No action while the middle levels remain meaningless" and its Verify is "n/a until triggered", which is the Trackers contract; it was counted as open work and overstated area 10's remaining set by 20%. Re-derived at the tag: `permission-forwarding.ts:62-92` @v0.8.0 resolves five levels, the three middle ones all guarded by `options.isSubagent`, and the v0.7.1→v0.8.0 diff of that file is a pure `normalizeAgentName` extraction — no level added or removed. | cyrup grows a delegated or multi-auth runtime dir, i.e. the middle levels acquire a meaning. |
 | `DRIFT-040` | 12 | pi's agent-harness v2 rearchitecture. Fix: "Do **not** port now". **Also a LEAD** — its three load-bearing claims (the `agent-harness.ts` rewrite, `docs/harness-v2.md`, the sqlite-node rebuild) are still carried forward unverified. `duplicate-of: PARITY-GAPS VL-P22`. | The same harness decision as `AGENT-028`. |
 
 ---
@@ -1011,7 +1330,7 @@ clean.
 | ID | area | state *(as of 2026-08-11)* | why it mattered |
 |---|---|---|---|
 | **SUBA-S01** | 09 | OPEN — **now CLOSED** | A declared `outputSchema` never reached the child in any form. *(Its residual is `SUBA-043`, still high.)* |
-| **SUBA-N03** | 09 | OPEN — **now CLOSED** | Overrides refused on the async/background branch. **EIGHT params, not seven.** |
+| **SUBA-N03** | 09 | **CLOSED** | Overrides refused on the async/background branch. ~~**EIGHT params, not seven.**~~ **CORRECTED 2026-08-14 (sweep 6): the closure covers ELEVEN params** — output, outputMode, skill, share, sessionDir, artifacts, acceptance, control, includeProgress, timeoutMs, maxRuntimeMs — each asserted (a) not to hit the refusal, (b) to reach agent resolution, (c) to be an advertised property; **and the load-bearing half is separately pinned: two companion tests assert the params reach the DETACHED hop-2 runner at the `runner-config.json` boundary, not merely past the router.** Do not re-open it with the eight-param framing. |
 | **EXT-S02** | 06 | OPEN — **now CLOSED** | Extension slash commands never reached the TUI `/` autocomplete. `SlashCommand::name` is `Cow<'static, str>` at `commands.rs:36`. |
 | **TUI-S01** | 07 | PARTIAL — **now CLOSED as framed** | 6 of 9 `UiEffect` mutators wired. Residue is `TUI-014` + `TUI-033`. |
 | **PROV-027 / 028 / 029** | 01 | OPEN (2026-08-11) — **still open** | See the Copilot update above. All three remain in the current actionable table. |

@@ -99,6 +99,29 @@ impl FsOps for ProtectedFs {
         self.inner.read(path).await
     }
 
+    /// Forwarded EXPLICITLY, not left to the trait default.
+    ///
+    /// `FsOps::read_stream`'s default is `Cursor::new(self.read(path).await?)` (`ops/mod.rs:329-334`)
+    /// — a whole-file materialization. That default is *semantically* indistinguishable from a real
+    /// stream, so a decorator that omits this method still returns the right bytes and no test can
+    /// see the difference; what it silently discards is `LocalFs`'s real-`File` override, i.e. the
+    /// entire point of TOOL-034 (grep must not hold every candidate file in memory). Enabling
+    /// `protectPaths` would then have re-opened the exact defect TOOL-034 closed, invisibly.
+    ///
+    /// This is the JS-object-spread-vs-Rust-trait-delegation hazard: pi's decorators are
+    /// `{ ...ops, writeFile }` object literals, so a method added to the seam later is forwarded BY
+    /// CONSTRUCTION; a Rust decorator must name every one, and the failure mode of forgetting is
+    /// silent because the trait default and a dropped delegation return the same thing.
+    ///
+    /// No guard is applied, matching [`Self::read`]: `ProtectedFs` restricts MUTATION only
+    /// (`write_in_place`, and `access` under `ReadWrite`).
+    async fn read_stream(
+        &self,
+        path: &Path,
+    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+        self.inner.read_stream(path).await
+    }
+
     async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
         self.deny_if_protected(path)?;
         self.inner.write_in_place(path, bytes).await

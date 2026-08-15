@@ -115,6 +115,69 @@ pub fn normalize_path_buf(input: &str) -> PathBuf {
     PathBuf::from(normalize_path(input))
 }
 
+/// Pi `resolvePath(input, baseDir, { homeDir, trim: true })` (`paths.ts:81-85` @v0.83.0), reached
+/// through `PackageManager.resolvePathFromBase` (`package-manager.ts:2086-2088`).
+///
+/// [`normalize_path`] is the FIRST half only — it expands `~` and `file://` and stops. This is the
+/// second half: normalize the input (with `trim: true`, which every package-manager call site
+/// passes) and the base (with pi's DEFAULT options, i.e. no trim, `paths.ts:83`), join when the
+/// input is relative, and finish with node's `path.resolve` — which normalizes `.` / `..`
+/// LEXICALLY, never touching the filesystem and never following a symlink.
+pub fn resolve_path_from_base(input: &str, base_dir: &std::path::Path) -> PathBuf {
+    resolve_path_from_base_with_home(input, base_dir, ambient_home().as_deref())
+}
+
+/// [`resolve_path_from_base`] with an explicit home directory (pi's `options.homeDir`), so a test
+/// can pin `~` expansion without depending on the process environment.
+pub fn resolve_path_from_base_with_home(
+    input: &str,
+    base_dir: &std::path::Path,
+    home: Option<&std::path::Path>,
+) -> PathBuf {
+    let normalized = normalize_path_with_home(input.trim(), home);
+    let normalized = std::path::Path::new(&normalized);
+    let normalized_base = normalize_path_with_home(&base_dir.to_string_lossy(), home);
+    let joined = if normalized.is_absolute() {
+        normalized.to_path_buf()
+    } else {
+        std::path::Path::new(&normalized_base).join(normalized)
+    };
+    // `nodeResolvePath` prepends `process.cwd()` when the accumulated path is still relative
+    // (node `path.resolve` contract); every in-tree base dir is absolute, so this is the guard for a
+    // caller that hands over a relative one rather than a path anyone takes.
+    let joined = if joined.is_absolute() {
+        joined
+    } else {
+        std::env::current_dir().unwrap_or_default().join(joined)
+    };
+    lexically_normalize(&joined)
+}
+
+/// The `.` / `..` collapse node's `path.resolve` performs after joining — purely lexical.
+///
+/// `..` at the root is dropped rather than escaping it (`path.resolve("/a/../..") === "/"`); on a
+/// relative remainder it is kept, because there is nothing to cancel it against.
+fn lexically_normalize(path: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => out.push(component.as_os_str()),
+            // `Components` already elides `.` and repeated separators, so this arm is defensive.
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            Component::Normal(part) => out.push(part),
+        }
+    }
+    out
+}
+
 /// Node's `fileURLToPath` restricted to what `normalizePath` can hand it — a string matching
 /// `/^file:\/\//` (`paths.ts:73`). Returns `None` when `input` is not a `file://` URL.
 ///
@@ -245,6 +308,59 @@ mod tests {
         // is not a whole segment, and a `mnt`/`cygdrive` prefix not followed by a drive letter.
         for path in ["/mnt", "/mnt/", "/mnt/2", "/mnt/mnt/e", "/", "/1/x"] {
             assert_eq!(normalize_windows_shell_path(path), path, "{path}");
+        }
+    }
+
+    /// `resolvePath` (paths.ts:81-85) is `normalizePath` PLUS the base-relative join, which is what
+    /// `getPackageIdentity`'s `local:` arm depends on (package-manager.ts:1686-1687).
+    #[test]
+    fn resolves_a_relative_source_against_the_scope_base() {
+        let home = Path::new("/tmp/home-fixture");
+        assert_eq!(
+            resolve_path_from_base_with_home("./pack", Path::new("/proj/.cyrup"), Some(home)),
+            PathBuf::from("/proj/.cyrup/pack")
+        );
+        assert_eq!(
+            resolve_path_from_base_with_home("pack", Path::new("/home/u/.cyrup/agent"), Some(home)),
+            PathBuf::from("/home/u/.cyrup/agent/pack")
+        );
+    }
+
+    #[test]
+    fn an_absolute_tilde_or_file_url_source_ignores_the_base() {
+        let home = Path::new("/tmp/home-fixture");
+        let base = Path::new("/proj/.cyrup");
+        assert_eq!(
+            resolve_path_from_base_with_home("/abs/pack", base, Some(home)),
+            PathBuf::from("/abs/pack")
+        );
+        assert_eq!(
+            resolve_path_from_base_with_home("~/pack", base, Some(home)),
+            PathBuf::from("/tmp/home-fixture/pack")
+        );
+        assert_eq!(
+            resolve_path_from_base_with_home("file:///abs/pack", base, Some(home)),
+            PathBuf::from("/abs/pack")
+        );
+    }
+
+    /// node's `path.resolve` collapses `.`/`..` lexically and clamps at the root; it never stats the
+    /// filesystem, so a component that does not exist resolves exactly like one that does.
+    #[test]
+    fn collapses_dot_and_dotdot_lexically_and_clamps_at_the_root() {
+        let base = Path::new("/proj/.cyrup");
+        for (input, expected) in [
+            ("../pack", "/proj/pack"),
+            ("./a/./b/../c", "/proj/.cyrup/a/c"),
+            ("../../../../pack", "/pack"),
+            ("/a/../..", "/"),
+            ("  ./spaced  ", "/proj/.cyrup/spaced"),
+        ] {
+            assert_eq!(
+                resolve_path_from_base_with_home(input, base, None),
+                PathBuf::from(expected),
+                "{input}"
+            );
         }
     }
 

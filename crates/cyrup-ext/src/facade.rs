@@ -51,7 +51,7 @@ pub enum InputReduction {
     Blocked { reason: Option<String>, by: ExtensionId },
 }
 
-/// The reduced result of [`ExtensionHost::emit_user_bash`] (Pi `UserBashEventResult`, types.ts:1043):
+/// The reduced result of [`ExtensionHost::emit_user_bash`] (Pi `UserBashEventResult`, `extensions/types.ts:1078-1083` @v0.83.0; EXT-036 corrected `:1043`, a member of the `ExtensionEvent` union):
 /// proceed, the extension fully serviced it (`operations`/`result`), or a block.
 #[derive(Clone, Debug)]
 pub enum UserBashReduction {
@@ -832,7 +832,7 @@ impl ExtensionHost {
     }
 
     /// Render a TOOL CALL through the extension that registered a renderer for that tool (Pi's
-    /// per-tool `ToolDefinition.renderCall`, extensions/types.ts:472-473, resolved by
+    /// per-tool `ToolDefinition.renderCall`, extensions/types.ts:489, resolved by
     /// `modes/interactive/components/tool-execution.ts:81-112` — the extension's definition is
     /// preferred over the built-in). `None` = no extension renders this tool (draw the standard
     /// shell), which is also what a faulting renderer degrades to.
@@ -854,7 +854,7 @@ impl ExtensionHost {
     }
 
     /// Render a TOOL RESULT through the tool's registered renderer (Pi `renderResult`,
-    /// extensions/types.ts:475-481). See [`Self::render_tool_call`].
+    /// extensions/types.ts:492-497). See [`Self::render_tool_call`].
     pub async fn render_tool_result(&self, tool_name: &str, result: &Value) -> Option<Value> {
         self.render_tool_result_outcome(tool_name, result).await.into_option()
     }

@@ -50,12 +50,17 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 
 ## 0. Census — every open item in the twelve area files, by class
 
-> **SUPERSEDED 2026-08-14 — the census below enumerates a set that no longer exists.** Two
-> whole-backlog parity sweeps (sweep 1: 232 items across 11 crates; sweep 2) closed **290 rows**. The
-> current set, re-derived from the twelve `## Open items` tables, is **173 open work items — 0
-> critical, 3 high, 75 medium, 95 low**, plus the same **9 `tracker` rows**. Eight rows are new:
-> `PROV-053`, `AGENT-034`, `AGENT-035`, `SESS-045`…`SESS-048` (filed and closed on arrival) and
-> `EXT-060` (filed open). **The three remaining highs are `SEAM-061`, `SESS-040` and `PROV-047`.**
+> **SUPERSEDED — SECOND EDITION 2026-08-14 (after sweeps 3-6). The census below enumerates a set that
+> no longer exists.** **Six** whole-backlog sweeps have landed. The current set, re-derived from the
+> twelve `## Open items` tables, is **153 open work items — 0 critical, 2 high, 63 medium, 88 low**,
+> plus **10 `tracker` rows** (`PERM-017` re-classified 2026-08-14). **338 of 500 rows carry a closure
+> marker.** Eight rows are new since the first edition, four of them filed AND closed in the same
+> pass — `TOOL-042`, `EXT-M01`, `EXT-M02`, `PERM-033`; `TUI-062` was filed and partially closed, and
+> `CFG-052`, `CFG-053` and `ICOM-053` were filed open. **The two remaining highs are `SESS-040` and `PROV-047`;
+> `SEAM-061` closed as REFUTED (already landed at HEAD in both crates).**
+>
+> *First-edition figures, superseded: 173 open = 0 / 3 / 75 / 95 after sweeps 1-2, which closed 290
+> rows; eight rows new (`PROV-053`, `AGENT-034`, `AGENT-035`, `SESS-045`…`SESS-048`, `EXT-060`).*
 > The class *taxonomy* below is unchanged and still the right way to read the backlog; only the
 > per-class counts are dead, and they have not been re-derived because the disposition is recorded
 > per row in the area files rather than per class. See `00-residual-ledger.md`, top section.
@@ -67,7 +72,13 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 > **Re-derive every remaining §3 entry at `v0.83.0` before scheduling it.**
 >
 > **`PB-13` is closed** with `SUBA-048`, as its own text instructed. **`PB-5`** is down to the
-> subagent re-exec half only — `TOOL-031`'s immediate-bash half landed in `cyrup-session-svc/src/bash.rs`.
+> subagent re-exec half only — and as of 2026-08-14 (sweep 6) **both** of its non-subagent halves are
+> landed: the immediate-bash half in `cyrup-session-svc/src/bash.rs:107-109` **and the bash-TOOL half
+> in `cyrup-tools/src/tools/bash.rs:154-165`**, pinned by `cyrup-tools/src/tests/bash_session_env.rs:200-221`.
+> **`PB-5`'s remaining fix site is `crates/cyrup-ext-subagents/**` — route it there, not to area 04.**
+> **`PB-10`** (`turnBudget`) is `SUBA-008`, re-verified open at HEAD and rated the cheapest remaining
+> medium in area 09: the three consumers already exist and read a hard-coded `false`, so it is wiring
+> plus a schema key, not a port.
 > **`VL-P22`** is half-addressed: `DiskStore::rewrite`'s temp-sibling-and-rename now carries a
 > `[CYRUP-DELTA]` naming pi's `_rewriteFile` (session-manager.ts:979-988) and the reason; the
 > torn-tail half is untouched.
@@ -146,7 +157,15 @@ Where the re-audit moved an item to a different class, the id moves section and 
 
 ## 0a. Everything above medium, in one table
 
-> **SUPERSEDED 2026-08-14 — every row in this table is dispositioned.** All six criticals and 31 of
+> **SUPERSEDED — SECOND EDITION 2026-08-14 (after sweeps 3-6). The current above-medium set is TWO
+> rows — `SESS-040` and `PROV-047` — tabled at the top of `00-residual-ledger.md`.** `SEAM-061`
+> closed as REFUTED: sweep 6 found it already landed at HEAD in **both** crates
+> (`cyrup-tui/src/session_selector.rs:154`/`:276`/`:313`/`:1918`/`:1985`; `crates/cyrup/src/main.rs:1354`
+> + `startup_ui.rs:191-201`), which also retires the "one agent, both crates" coordination note that
+> ranked it #1 for two editions. `PROV-030` (row 7 below) is likewise closed and was re-verified at
+> HEAD by sweep 6 — `api/google_vertex.rs` is 717 lines with a real `ApiImpl::run`.
+>
+> *First edition, retained:* **SUPERSEDED 2026-08-14 — every row in this table is dispositioned.** All six criticals and 31 of
 > the 34 highs are closed. Three of the highs (`PROV-027`, `PROV-028`, `PROV-029`) turned out to have
 > been fixed before either sweep and were closed by **refutation**; four more (`SEAM-047`, `SEAM-051`,
 > `SEAM-064`, `SEAM-072`) plus `DRIFT-049` had been marked fixed in their *kind* cell while their
@@ -447,7 +466,7 @@ the behaviour was available to be ported and was not.
 - cyrup: `grep -rn "events.emit|emit_event|permission-request" crates/cyrup-permission-system/src` = 0. **The bus itself exists** — `SharedBus` at `cyrup-ext/src/host/services.rs:988` (`subscribe` `:1002`, `emit` `:1010`, `take_pending` `:1018`), fanned out by `cyrup-ext/src/facade.rs:1003-1026` — but it is wired to WASM guests only (`host/live.rs:642`, `:650`) and `cyrup-ext/src/native.rs` contains **zero** `bus` references
 - observable: in pi any extension can subscribe and observe every waiting/approved/denied transition with its requestId, tool, command, target and agent; in cyrup no such stream exists. The work is a native-extension bus accessor (area 06 owns the seam) plus three emit sites at `extension.rs:1384-1469` — **not** a new subsystem.
 
-**PB-17 · The forwarding half of the security-review audit trail is unwritten** — *medium* · = area 10 `PERM-008`, which sharpened the count to **8 review + 3 debug sites**
+**PB-17 · The forwarding half of the security-review audit trail is unwritten** — *medium* · = area 10 `PERM-008`, which sharpened the count to **8 review + 3 debug sites** — **CLOSED; and the census was still short.** `PERM-008` landed the mechanism and **eleven** call sites; upstream has **~28**, and the sixteen missing ones (the fs helpers, both reader diagnostics, and **both response-binding rejections**) were ported by sweep 6 as **`PERM-033`** — filed and closed 2026-08-14. The security-relevant one: a forged or misaddressed forwarded response was discarded leaving only an all-null `response_received` entry, so nothing named it.
 - upstream: `src/index.ts` @v0.8.0 has the `writeReviewEntry` definition at `:200` plus 17 call sites; the forwarding path is `:735`, `:1032`, `:1058`, `:1080`, `:1173`, `:1184`, `:1187`, `:1228`. All eight exist at v0.7.1 (`:1011`, `:1019`, `:1298`, `:1324`, `:1346`, `:1417`, `:1428`, `:1473`)
 - cyrup: `crates/cyrup-permission-system/src/forwarding.rs` is 1125 lines and `grep -n "logger|review|tracing"` returns **zero**; both entry points (`wait_for_forwarded_approval` `:398`, `process_forwarded_requests` `:528`) log nothing. `write_review_entry` is at `extension.rs:930` with 6 calls
 - observable: a forwarded child ask that times out, expires, is auto-approved or is denied leaves no audit record, and every forwarding I/O failure is silent where pi writes `permission_forwarding.error`.

@@ -18,11 +18,96 @@
 //! which degrades cleanly to the compiled-in catalogs. The cache is an accelerator; it is never
 //! allowed to be the reason a user sees fewer models or a failed start.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use cyrup_provider::error::ProviderError;
 use cyrup_provider::models_store::{ModelsStore, ModelsStoreEntry};
+
+/// A JSON object in **file order** — Pi's `StoredModels` is a plain JS object, and both
+/// `JSON.parse` and `JSON.stringify` preserve its insertion order (models-store.ts:120-145
+/// @v0.84.1), so a rewrite leaves every untouched provider exactly where it was.
+///
+/// `serde_json::Map` cannot stand in: it is a `BTreeMap` in this workspace (the `preserve_order`
+/// feature is off), so `write_all` re-sorted every provider id alphabetically on every write —
+/// CFG-042's residual. Rather than take an `indexmap` dependency on the shared workspace manifest
+/// mid-sweep, the ordering is carried here, where the only operations needed are the four JS ones:
+/// `current[id]`, `current[id] = v`, `delete current[id]`, and the two serde ends.
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+struct OrderedObject(Vec<(String, serde_json::Value)>);
+
+impl OrderedObject {
+    fn get(&self, key: &str) -> Option<&serde_json::Value> {
+        self.0.iter().find(|(k, _)| k == key).map(|(_, v)| v)
+    }
+
+    /// `current[providerId] = entry` — JS assignment REPLACES in place and keeps the key's original
+    /// position; only a genuinely new key is appended.
+    fn insert(&mut self, key: String, value: serde_json::Value) {
+        match self.0.iter_mut().find(|(k, _)| *k == key) {
+            Some(slot) => slot.1 = value,
+            None => self.0.push((key, value)),
+        }
+    }
+
+    /// `delete current[providerId]`; `true` when something was there, mirroring
+    /// `BTreeMap::remove(..).is_some()`.
+    fn remove(&mut self, key: &str) -> bool {
+        let before = self.0.len();
+        self.0.retain(|(k, _)| k != key);
+        before != self.0.len()
+    }
+
+    /// `JSON.stringify(current, null, 2)` over the ordered pairs (models-store.ts:130, `:141`).
+    fn stringify(&self) -> String {
+        if self.0.is_empty() {
+            // `JSON.stringify({}, null, 2) === "{}"`.
+            return "{}".to_string();
+        }
+        let mut out = String::from("{\n");
+        for (index, (key, value)) in self.0.iter().enumerate() {
+            out.push_str("  ");
+            out.push_str(&serde_json::Value::String(key.clone()).to_string());
+            out.push_str(": ");
+            // `serde_json`'s pretty printer already indents by two, so a nested value only needs its
+            // continuation lines shifted one level.
+            let rendered = serde_json::to_string_pretty(value)
+                .unwrap_or_else(|_| serde_json::Value::Null.to_string())
+                .replace('\n', "\n  ");
+            out.push_str(&rendered);
+            if index + 1 < self.0.len() {
+                out.push(',');
+            }
+            out.push('\n');
+        }
+        out.push('}');
+        out
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for OrderedObject {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> serde::de::Visitor<'de> for V {
+            type Value = OrderedObject;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<M: serde::de::MapAccess<'de>>(
+                self,
+                mut map: M,
+            ) -> Result<OrderedObject, M::Error> {
+                let mut out = OrderedObject::default();
+                while let Some((k, v)) = map.next_entry::<String, serde_json::Value>()? {
+                    // A duplicate key in the source text takes the LAST value at the FIRST
+                    // position, which is what `JSON.parse` does.
+                    out.insert(k, v);
+                }
+                Ok(out)
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
 
 /// The file name Pi uses, resolved beside `models.json` (`model-runtime.ts:141-144`,
 /// `join(dirname(modelsPath), "models-store.json")`).
@@ -55,7 +140,7 @@ pub struct FileModelsStore {
 /// cyrup's reader is synchronous file I/O under a `FileLock`, so there is no promise to share.
 #[derive(Default)]
 struct ModelsFileReadState {
-    data: BTreeMap<String, serde_json::Value>,
+    data: OrderedObject,
     revision: Option<String>,
 }
 
@@ -119,16 +204,16 @@ impl FileModelsStore {
     /// Entries are kept as `serde_json::Value` rather than typed up front so ONE malformed provider
     /// entry cannot take the rest of the cache down with it — the typed conversion happens per
     /// provider in [`FileModelsStore::read`], where a failure is simply "no overlay for that one".
-    fn read_all(&self) -> BTreeMap<String, serde_json::Value> {
+    fn read_all(&self) -> OrderedObject {
         let Ok(text) = std::fs::read_to_string(&self.path) else {
-            return BTreeMap::new();
+            return OrderedObject::default();
         };
         serde_json::from_str(&text).unwrap_or_default()
     }
 
     /// `readLatest` (models-store.ts:81-108 @v0.84.1): answer from the snapshot when the file's
     /// revision is unchanged, otherwise reload under the cross-process lock and re-stamp it.
-    fn read_latest(&self) -> BTreeMap<String, serde_json::Value> {
+    fn read_latest(&self) -> OrderedObject {
         let revision = file_revision(&self.path);
         if revision.is_some()
             && let Ok(state) = self.read_state.read()
@@ -147,27 +232,21 @@ impl FileModelsStore {
     /// `updateReadState` (models-store.ts:65-68 @v0.84.1). A `write`/`delete` passes `None` for the
     /// revision, exactly as upstream's two-argument call does (`:134`, `:145`), so the next read
     /// re-stats rather than trusting a revision captured before the rename.
-    fn update_read_state(
-        &self,
-        data: &BTreeMap<String, serde_json::Value>,
-        revision: Option<String>,
-    ) {
+    fn update_read_state(&self, data: &OrderedObject, revision: Option<String>) {
         if let Ok(mut state) = self.read_state.write() {
             state.data.clone_from(data);
             state.revision = revision;
         }
     }
 
-    fn write_all(&self, entries: &BTreeMap<String, serde_json::Value>) {
-        // `JSON.stringify(current, null, 2)` + the trailing newline every other cyrup config file
-        // gets. A serialization failure here is unreachable (the map came from `Value`s), and is
-        // swallowed rather than propagated for the same reason the rest of this file is infallible.
-        if let Ok(mut text) = serde_json::to_string_pretty(entries) {
-            text.push('\n');
-            // 0600 + 0700 parent, matching Pi's `FileAuthStorageBackend`. The catalog itself is not
-            // secret, but the file lives in the agent dir beside credentials and inherits its posture.
-            let _ = crate::lock::write_atomic(&self.path, text.as_bytes(), true);
-        }
+    fn write_all(&self, entries: &OrderedObject) {
+        // `JSON.stringify(current, null, 2)` (models-store.ts:130, `:141`) in FILE order — CFG-042 —
+        // plus the trailing newline every other cyrup config file gets (upstream writes none).
+        let mut text = entries.stringify();
+        text.push('\n');
+        // 0600 + 0700 parent, matching Pi's `FileAuthStorageBackend`. The catalog itself is not
+        // secret, but the file lives in the agent dir beside credentials and inherits its posture.
+        let _ = crate::lock::write_atomic(&self.path, text.as_bytes(), true);
     }
 }
 
@@ -195,7 +274,7 @@ impl ModelsStore for FileModelsStore {
     async fn delete(&self, provider_id: &str) -> Result<(), ProviderError> {
         let _guard = crate::lock::FileLock::acquire(&self.path).ok();
         let mut all = self.read_all();
-        if all.remove(provider_id).is_some() {
+        if all.remove(provider_id) {
             self.write_all(&all);
             self.update_read_state(&all, None);
         }
@@ -310,11 +389,7 @@ mod tests {
         // planted snapshot.
         std::fs::write(
             &path,
-            serde_json::to_string(&BTreeMap::from([(
-                "groq".to_string(),
-                serde_json::to_value(entry("\"v2\"")).unwrap(),
-            )]))
-            .unwrap(),
+            serde_json::json!({ "groq": entry("\"v2\"") }).to_string(),
         )
         .unwrap();
         assert_ne!(file_revision(&path), stamped);
@@ -346,6 +421,94 @@ mod tests {
             store.read("groq").await.unwrap().is_none(),
             "no revision means no short-circuit: pi reloads and finds nothing"
         );
+    }
+
+    /// CFG-042's second residual: Pi's `StoredModels` is a plain JS object, so `JSON.parse` +
+    /// `JSON.stringify(current, null, 2)` (models-store.ts:126-134 @v0.84.1) round-trip a rewrite
+    /// with every untouched provider still in its original file position, and a NEW provider
+    /// appended.
+    ///
+    /// RED before this pass: `read_all`/`write_all` went through `BTreeMap`, so `write` re-sorted
+    /// every provider id alphabetically — `zai` ahead of `anthropic` became `anthropic` ahead of
+    /// `zai`, rewriting lines the user never touched and losing pi's byte-for-byte interop.
+    #[tokio::test]
+    async fn a_write_preserves_the_files_provider_order_and_appends_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(MODELS_STORE_FILE_NAME);
+        // Deliberately NOT alphabetical, and not the order a `BTreeMap` would produce. Written as
+        // raw text on purpose: `serde_json::json!` builds a `Map`, which would alphabetize the two
+        // keys before they ever reached the file and make this test vacuous.
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"zai\":{},\"anthropic\":{}}}",
+                serde_json::to_string(&entry("\"z\"")).unwrap(),
+                serde_json::to_string(&entry("\"a\"")).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let store = FileModelsStore::new(&path);
+        store.write("groq", entry("\"g\"")).await.unwrap();
+
+        let keys = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter_map(|l| l.strip_prefix("  \""))
+                .filter_map(|l| l.split('"').next())
+                .map(str::to_string)
+                .collect()
+        };
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            keys(&text),
+            vec!["zai", "anthropic", "groq"],
+            "file order is kept and the new provider is appended, not sorted in — got:\n{text}"
+        );
+
+        // Presence before absence: the values really did survive the reorder-free rewrite.
+        assert_eq!(
+            store.read("zai").await.unwrap().unwrap().etag.as_deref(),
+            Some("\"z\"")
+        );
+        assert_eq!(
+            store.read("groq").await.unwrap().unwrap().etag.as_deref(),
+            Some("\"g\"")
+        );
+
+        // An overwrite of an existing provider replaces IN PLACE (`current[id] = entry`), and a
+        // delete removes only its own line.
+        store.write("zai", entry("\"z2\"")).await.unwrap();
+        assert_eq!(
+            keys(&std::fs::read_to_string(&path).unwrap()),
+            vec!["zai", "anthropic", "groq"]
+        );
+        store.delete("anthropic").await.unwrap();
+        assert_eq!(
+            keys(&std::fs::read_to_string(&path).unwrap()),
+            vec!["zai", "groq"]
+        );
+    }
+
+    /// The bytes themselves: `JSON.stringify(x, null, 2)` — two-space indent, `": "` after each
+    /// key, no trailing comma, and `{}` for an empty object.
+    #[test]
+    fn stringify_matches_json_stringify_with_two_space_indent() {
+        assert_eq!(OrderedObject::default().stringify(), "{}");
+        let mut obj = OrderedObject::default();
+        obj.insert("b".to_string(), serde_json::json!({ "models": [] }));
+        obj.insert("a".to_string(), serde_json::Value::from(1));
+        assert_eq!(
+            obj.stringify(),
+            "{\n  \"b\": {\n    \"models\": []\n  },\n  \"a\": 1\n}"
+        );
+    }
+
+    /// `JSON.parse` keeps a duplicate key's FIRST position with its LAST value.
+    #[test]
+    fn a_duplicate_key_takes_the_last_value_at_the_first_position() {
+        let parsed: OrderedObject =
+            serde_json::from_str(r#"{"a":1,"b":2,"a":3}"#).expect("valid json");
+        assert_eq!(parsed.stringify(), "{\n  \"a\": 3,\n  \"b\": 2\n}");
     }
 
     /// CFG-042: `this.path = normalizePath(path)` (models-store.ts:53 @v0.84.1). Red at HEAD — the

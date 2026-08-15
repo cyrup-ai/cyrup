@@ -340,7 +340,7 @@ pub struct SessionTreeEvent {
 
 // --- Per-event multi-field result shapes ---
 
-/// `tool_result` patch (Pi `ToolResultEventResult`, types.ts:1043): replace-not-merge result fields.
+/// `tool_result` patch (Pi `ToolResultEventResult`, `extensions/types.ts:1085-1090` @v0.83.0; EXT-036 corrected `:1043`): replace-not-merge result fields.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultPatch {

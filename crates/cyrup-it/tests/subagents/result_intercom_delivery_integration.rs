@@ -291,9 +291,18 @@ async fn parallel_mode_receipt_cites_the_same_run_id_the_chain_dir_was_created_u
     // Independent cross-check: this run's `{chain_dir}` scratch directory (created BEFORE the
     // out-of-band payload is built, under the SAME id per `run_or_background_graph`) must exist
     // under exactly the payload's own run id — proving that id is the run's real, genuine one.
-    // Computed BEFORE `CYRUP_HOME` is cleared below (`chain_runs_dir` itself reads that env var).
-    let chain_dir = cyrup_ext_subagents::artifacts::chain_runs_dir(work_dir.path())
-        .join(payload.run_id.as_str());
+    // Computed BEFORE `CYRUP_HOME` is cleared below (the temp branch reads that env var).
+    //
+    // Through `resolve_chain_runs_dir`, which is the derivation the RUN itself uses
+    // (`extension.rs:6994`, pi `getChainRunsDir(effectiveCwd, preference)`), not the bare
+    // `chain_runs_dir` temp-root helper this test used to call. Under the default
+    // `ArtifactDirPreference::Project` the two are different directories, so the old call looked in
+    // the temp root, found nothing, and reported the run id as disconnected when it was correct.
+    let chain_dir = cyrup_ext_subagents::artifacts::resolve_chain_runs_dir(
+        work_dir.path(),
+        cyrup_ext_subagents::artifacts::ArtifactDirPreference::default(),
+    )
+    .join(payload.run_id.as_str());
     let chain_dir_exists = chain_dir.is_dir();
 
     unsafe {

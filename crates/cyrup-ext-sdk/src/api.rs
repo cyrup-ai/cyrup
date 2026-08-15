@@ -159,7 +159,7 @@ pub enum RawOutcome {
     Handled(String),
 }
 
-// --- tool execution (Pi `ToolDefinition.execute`, types.ts:464; R-08-015) ---
+// --- tool execution (Pi `ToolDefinition.execute`, types.ts:480; R-08-015) ---
 
 /// A (text|image) content block in a tool result. Serializes 1:1 with `cyrup_core::Content`.
 #[derive(Clone, Debug, Serialize)]
@@ -175,7 +175,7 @@ impl ContentBlock {
     }
 }
 
-/// The result of executing a guest-registered tool (Pi `AgentToolResult`, types.ts:1043).
+/// The result of executing a guest-registered tool (Pi `AgentToolResult`, `packages/agent/src/types.ts:355-369` @v0.83.0 — a DIFFERENT package; EXT-036 corrected `extensions/types.ts:1043`, which is a member of the `ExtensionEvent` union).
 #[derive(Clone, Debug, Default)]
 pub struct ToolOutput {
     pub content: Vec<ContentBlock>,
@@ -295,7 +295,7 @@ pub struct RegisteredShortcut {
     pub handler: Box<dyn ShortcutExec>,
 }
 
-// --- message renderers (Pi `renderCall`/`renderResult`, types.ts:472-481; R-08-020) ---
+// --- message renderers (Pi `renderCall`/`renderResult`, types.ts:489-497; R-08-020) ---
 
 /// A custom message renderer the guest registers for a `custom_type`. Each method returns a
 /// serialized widget tree (`Value`), or `None` to fall back to the runtime's default renderer.
@@ -605,7 +605,7 @@ impl ExtensionApi {
     }
 
     /// Register a custom message renderer (R-08-020). The renderer's `render_call`/`render_result`
-    /// are invoked across the boundary when a tool of `custom_type` is displayed (Pi types.ts:472).
+    /// are invoked across the boundary when a tool of `custom_type` is displayed (Pi types.ts:489).
     pub fn register_message_renderer(
         &mut self,
         custom_type: impl Into<String>,

@@ -189,6 +189,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         steps: vec![RunnerStep::SingleStep(single_step("reviewer", "Review the diff"))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
+        session_id: None,
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 5,
@@ -236,10 +237,37 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
          placeholder carried no tools. tee:\n{tee}"
     );
 
-    // (2) The persona's SYSTEM PROMPT (Append mode) was composed into the task text the child
-    // received — the placeholder carried an empty system prompt.
+    // (2) The persona's SYSTEM PROMPT (Append mode) reached the child — the placeholder carried an
+    // empty system prompt.
+    //
+    // NOT in argv. SUBA-030 spills the composed prompt to a `0600` file and passes
+    // `--append-system-prompt <path>` (pi `runs/shared/pi-args.ts:570-585` @v0.43.0) so the persona
+    // never lands in the child's `/proc/<pid>/cmdline`. This assertion used to grep the argv echo
+    // for the body; after that port the body is legitimately absent from argv, and the test went
+    // red asserting the very disclosure SUBA-030 removed. The child READS the file, so that is
+    // where the body is now observed — the fixture echoes the contents it read.
     assert!(
-        tee.contains("You are the REVIEWER persona"),
+        tee.lines().any(|l| l.contains("\"arg\":\"--append-system-prompt\"")),
+        "the composed prompt must be passed by FILE, not inline (SUBA-030). tee:\n{tee}"
+    );
+    let prompt_line = tee
+        .lines()
+        .find(|l| l.contains("\"promptFile\""))
+        .unwrap_or_else(|| panic!("the child must have read its prompt file. tee:\n{tee}"));
+    let prompt: serde_json::Value =
+        serde_json::from_str(prompt_line).expect("the prompt-file echo is one JSON object");
+    let prompt_path = prompt["promptFile"].as_str().unwrap_or_default();
+    assert!(
+        std::path::Path::new(prompt_path)
+            .file_name()
+            .is_some_and(|n| n == "reviewer.md"),
+        "the prompt file is named for the resolved agent (pi's `promptFileStem`); got {prompt_path}"
+    );
+    assert!(
+        prompt["contents"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("You are the REVIEWER persona"),
         "the reviewer persona's system-prompt body must reach the child, proving `## reviewer` ran \
          the real reviewer, not an empty-system-prompt placeholder. tee:\n{tee}"
     );
@@ -337,6 +365,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         steps: vec![RunnerStep::SingleStep(single_step("worker", "Handle {task} now"))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
+        session_id: None,
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 5,
@@ -616,6 +645,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
         steps: vec![RunnerStep::SingleStep(single_step("reviewer", "review at the ceiling"))],
         cwd: dir.path().to_path_buf(),
         session_file: None,
+        session_id: None,
         global_concurrency_limit: 20,
         worktree_base_dir: None,
         max_subagent_depth: 0,

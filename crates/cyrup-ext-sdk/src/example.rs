@@ -31,7 +31,7 @@ impl MessageRenderer for DemoRenderer {
 }
 
 /// The per-TOOL renderer for `demo_echo` (Pi `ToolDefinition.renderCall`/`renderResult`,
-/// extensions/types.ts:472-481). Registered under the TOOL NAME, which is the key the host routes
+/// extensions/types.ts:489-497). Registered under the TOOL NAME, which is the key the host routes
 /// a tool row by (EXT-006).
 ///
 /// The call side returns a MULTI-NODE tree (Pi renderers routinely return a `Container` of a header
@@ -50,7 +50,7 @@ impl MessageRenderer for DemoToolRenderer {
     }
 }
 
-/// A custom-ENTRY renderer (Pi `registerEntryRenderer`, extensions/types.ts:1295). Entries are
+/// A custom-ENTRY renderer (Pi `registerEntryRenderer`, `extensions/types.ts:1279` @v0.83.0; EXT-036 corrected `:1295`, which is `sendUserMessage` at that tag — `:1295` is this symbol at v0.84.1, so the old cite was version lag, not fabrication). Entries are
 /// TUI-only durable state appended with `append_entry`; they never enter LLM context. An entry
 /// crosses the boundary on `render-call`, so the renderer only implements that half.
 struct DemoEntryRenderer;
@@ -99,7 +99,7 @@ pub fn build() -> ExtensionApi {
             return Outcome::block("shutting down");
         }
         if ev.name == "bash" {
-            // An `error`-severity notification (Pi `notify(msg, "error")`, types.ts:135).
+            // An `error`-severity notification (Pi `notify(msg, "error")`, types.ts:142 @v0.83.0).
             ctx.ui().notify_with("permission-gate: blocked a bash call", NotifyKind::Error);
             Outcome::block("bash is disabled by the demo extension")
         } else {
@@ -147,7 +147,7 @@ pub fn build() -> ExtensionApi {
         }
     });
 
-    // SEAM-005: `agent_settled` (Pi `on("agent_settled", …)`, extensions/types.ts:1225). Fires ONCE
+    // SEAM-005: `agent_settled` (Pi `on("agent_settled", …)`, `extensions/types.ts:1217` @v0.83.0; EXT-036 corrected `:1225`, which is `tool_execution_end`). Fires ONCE
     // per run, after every automatic retry / post-run compaction / queued continuation — unlike
     // `agent_start`/`agent_end` above, which fire once per agent loop. The distinct notification
     // text is what lets a host test prove the GUEST's handler ran across the WIT boundary.
@@ -340,7 +340,7 @@ pub fn build() -> ExtensionApi {
         )
         .description("Echo the input text back (demo tool).")
         // EXT-006: this tool draws its OWN call/result rows (Pi `renderCall`/`renderResult`,
-        // types.ts:472-481). The matching renderer is registered under the tool NAME below.
+        // types.ts:489-497). The matching renderer is registered under the tool NAME below.
         .has_renderer(true),
         |call: ToolCall| {
             let text =
@@ -357,7 +357,7 @@ pub fn build() -> ExtensionApi {
         CommandDescriptor::new("Greet someone by name (demo command)."),
         |args: &str, ctx: &crate::CommandCtx| {
             ctx.ui().notify("greet command ran");
-            // Address a keyed status segment (Pi `setStatus(key, text)`, types.ts:141), then clear
+            // Address a keyed status segment (Pi `setStatus(key, text)`, types.ts:148 @v0.83.0), then clear
             // it (Pi `setStatus(key, undefined)`) — proves keyed set + clear over the boundary.
             ctx.ui().set_status("greet", Some("greeting…"));
             ctx.ui().clear_status("greet");
@@ -748,14 +748,14 @@ pub fn build() -> ExtensionApi {
     );
 
     // A custom-MESSAGE renderer (Pi `registerMessageRenderer(customType, renderer)`,
-    // types.ts:1284) keyed by a custom message type.
+    // `types.ts:1276` @v0.83.0; EXT-036 corrected `:1284`) keyed by a custom message type.
     api.register_message_renderer("demo", DemoRenderer);
     // EXT-006: the per-TOOL renderer for `demo_echo` (whose descriptor declares `has_renderer`).
     // Keyed by the TOOL NAME — that is how the host routes a tool row back to the guest that draws
     // it (Pi `getCallRenderer`/`getResultRenderer`, tool-execution.ts:81-112).
     api.register_message_renderer("demo_echo", DemoToolRenderer);
     // X15 — the custom-ENTRY surface (Pi `registerEntryRenderer(customType, renderer)`,
-    // types.ts:1295). `demo_card` draws; `demo_boom` deliberately FAULTS, which is the only way to
+    // `types.ts:1279` @v0.83.0; EXT-036 corrected `:1295`, the v0.84.1 line for the same symbol — version lag, not fabrication). `demo_card` draws; `demo_boom` deliberately FAULTS, which is the only way to
     // exercise the guest half of the failure box (`custom-entry.ts:47-52`) end to end. A guest
     // panic is a wasm trap, which the host reports as `RenderOutcome::Failed`.
     api.register_entry_renderer("demo_card", DemoEntryRenderer);
@@ -867,7 +867,7 @@ pub fn build() -> ExtensionApi {
     );
 
     // A command exercising `confirm`'s `message` body (Pi `confirm(title, message, opts)`,
-    // rpc-types.ts:232; L4 review §2.6): threads live through `ctx.rs` -> WIT `confirm` -> the host
+    // rpc-types.ts:240 @v0.83.0; L4 review §2.6): threads live through `ctx.rs` -> WIT `confirm` -> the host
     // backend, distinct from the prompt/title (not dismissed, so the backend actually sees it).
     api.register_command(
         "confirmdemo",
@@ -889,7 +889,7 @@ pub fn build() -> ExtensionApi {
     );
 
     // A command exercising `input`'s `placeholder` (Pi `input(title, placeholder, opts)`,
-    // rpc-types.ts:233-240; L4 review §2.7): threads live through `ctx.rs` -> WIT `input` -> the host
+    // rpc-types.ts:241-248 @v0.83.0; L4 review §2.7): threads live through `ctx.rs` -> WIT `input` -> the host
     // backend, distinct from the prompt/title.
     api.register_command(
         "inputdemo",
@@ -906,7 +906,7 @@ pub fn build() -> ExtensionApi {
     );
 
     // A command exercising `select` (Pi `select(title, options, opts): Promise<string|undefined>`,
-    // types.ts:127; L4 review §2.1 interactive-TUI wiring): offers three options and surfaces the
+    // types.ts:133 @v0.83.0; L4 review §2.1 interactive-TUI wiring): offers three options and surfaces the
     // chosen STRING (or "none" if dismissed).
     api.register_command(
         "selectdemo",

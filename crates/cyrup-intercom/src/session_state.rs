@@ -5,6 +5,7 @@
 //! The [`IntercomClient`] is created on `SessionStart` (after the broker is health-connectable) and
 //! stashed here; tools/seams clone the `Arc` out under a short lock (never held across `.await`).
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -15,6 +16,69 @@ use crate::config::IntercomConfig;
 use crate::error::{IntercomError, Result};
 use crate::reply_tracker::{OutboundReplyWaiter, ReplyTracker};
 use crate::transport::client::{IntercomClient, SendOptions};
+use crate::transport::protocol::{
+    MessageControl, MessageControlAction, MessageReceipt, MessageReceiptStatus, now_ms,
+};
+
+/// `INBOUND_MESSAGE_DEDUPE_MAX` (`v0.10.1 index.ts:32`).
+const INBOUND_MESSAGE_DEDUPE_MAX: usize = 1000;
+/// `INBOUND_MESSAGE_DEDUPE_RETENTION_MS` (`v0.10.1 index.ts:33`) — one hour.
+const INBOUND_MESSAGE_DEDUPE_RETENTION_MS: u64 = 60 * 60 * 1000;
+
+/// `seenInboundMessages: Map<string, number>` (`v0.10.1 index.ts:527`) — the `(from.id, message.id)`
+/// pairs this session has already accepted, with the epoch-ms it first saw each.
+///
+/// A JS `Map` is BOTH a hash lookup and an insertion-ordered list, and `hasSeenInboundMessage` uses
+/// both halves: `has(key)` is the dedupe test, and `keys().next().value` is the OLDEST key, which is
+/// what the size cap evicts (`:543-547`). A bare `HashMap` would evict an arbitrary entry, which
+/// turns the cap from "forget the oldest" into "forget one at random" — so the insertion order is
+/// carried explicitly in `order`.
+#[derive(Debug, Default)]
+struct SeenInboundMessages {
+    /// Insertion order, oldest first (`seenInboundMessages.keys()`).
+    order: VecDeque<String>,
+    /// key → first-seen epoch-ms.
+    seen: HashMap<String, u64>,
+}
+
+impl SeenInboundMessages {
+    /// `hasSeenInboundMessage(from, message, now)` (`v0.10.1 index.ts:532-548`): sweep expired
+    /// entries, then test-and-insert, then evict down to the cap. Returns whether this pair had
+    /// already been accepted.
+    fn test_and_insert(&mut self, key: String, now: u64) -> bool {
+        // The retention sweep runs over EVERY entry on every call, before the lookup (`:533-537`).
+        // `now - seenAt` is a JS number subtraction that can go negative on a clock step; the
+        // comparison is then false, so `saturating_sub` reproduces it exactly (0 is never `>`
+        // the retention).
+        self.seen.retain(|_, seen_at| now.saturating_sub(*seen_at) <= INBOUND_MESSAGE_DEDUPE_RETENTION_MS);
+        if self.order.len() != self.seen.len() {
+            self.order.retain(|k| self.seen.contains_key(k));
+        }
+        if self.seen.contains_key(&key) {
+            return true;
+        }
+        self.seen.insert(key.clone(), now);
+        self.order.push_back(key);
+        while self.seen.len() > INBOUND_MESSAGE_DEDUPE_MAX {
+            let Some(oldest) = self.order.pop_front() else { break };
+            self.seen.remove(&oldest);
+        }
+        false
+    }
+}
+
+/// The three fields `latestOutboundReceipts` keeps per message (`v0.10.1 index.ts:528`,
+/// written at `:1019-1023`) — deliberately NOT the whole [`MessageReceipt`], because upstream
+/// drops `messageId` (it is the map key) and spreads `detail` in only when truthy.
+#[derive(Clone, Debug)]
+pub struct OutboundReceipt {
+    /// The latest status reported for the message.
+    pub status: MessageReceiptStatus,
+    /// Its epoch-ms — `[JS-NUMBER]`.
+    pub timestamp: serde_json::Number,
+    /// The receipt's free-form detail, when it carried a non-empty one.
+    pub detail: Option<String>,
+}
 
 /// The three context-usage fields of a `presence` frame, in the tri-state the wire has
 /// (`v0.9.2 types.ts:86`): `None` omits the key, `Some(None)` sends an explicit `null` (the broker
@@ -77,6 +141,14 @@ pub struct SharedIntercomState {
     /// `ensure_connected`/`schedule_reconnect` recover the broker connection after a drop instead of
     /// leaving [`Self::client`] empty for the rest of the session.
     pub connect: crate::connect::ConnectSupervisor,
+    /// `seenInboundMessages` (`v0.10.1 index.ts:527`) — the inbound `(from.id, message.id)` dedupe
+    /// set. Reachable in practice, not theoretically: the reconnect ladder re-registers the same
+    /// session id, and ICOM-010's broker mailbox redelivers on that re-register, so a message
+    /// acknowledged just before a drop can arrive a second time. Without this, it is injected twice.
+    seen_inbound_messages: Mutex<SeenInboundMessages>,
+    /// `latestOutboundReceipts` (`v0.10.1 index.ts:528`) — the newest receipt seen for each message
+    /// THIS session sent, read back by [`Self::latest_delivery_state`].
+    latest_outbound_receipts: Mutex<HashMap<String, OutboundReceipt>>,
     /// Inbound ask tracking (`ReplyTracker`).
     pub tracker: Mutex<ReplyTracker>,
     /// The outbound single-slot reply waiter (`replyWaiter`).
@@ -104,11 +176,112 @@ impl SharedIntercomState {
             last_presence_identity: Mutex::new(None),
             name_poll_task: Mutex::new(None),
             connect: crate::connect::ConnectSupervisor::default(),
+            seen_inbound_messages: Mutex::new(SeenInboundMessages::default()),
+            latest_outbound_receipts: Mutex::new(HashMap::new()),
             tracker: Mutex::new(ReplyTracker::new(ask_timeout_ms)),
             waiter: OutboundReplyWaiter::new(),
             config,
             ask_timeout_ms,
             cwd,
+        }
+    }
+
+    /// `hasSeenInboundMessage(from, message, now)` (`v0.10.1 index.ts:532-548`) — has this session
+    /// already accepted this `(from.id, message.id)` pair? Test-and-insert: a `false` answer also
+    /// RECORDS the pair, so the second delivery of the same message answers `true`.
+    ///
+    /// The key is upstream's `` `${from.id}\0${message.id}` `` (`:538`) verbatim, NUL separator
+    /// included — a separator that cannot occur in either id is what stops `("a\0b", "c")` and
+    /// `("a", "b\0c")` colliding.
+    #[must_use]
+    pub fn has_seen_inbound_message(&self, from_id: &str, message_id: &str, now: u64) -> bool {
+        let key = format!("{from_id}\0{message_id}");
+        self.seen_inbound_messages
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .test_and_insert(key, now)
+    }
+
+    /// `emitMessageReceipt(messageId, status, detail?)` (`v0.10.1 index.ts:550-559`).
+    ///
+    /// Best-effort and silent on failure — upstream's body is wrapped in a bare `try {} catch {}`
+    /// whose own comment is "Receipts are diagnostics; message handling should not fail when the
+    /// sender disconnects" — so a disconnected client, an unbound client, or a write error must all
+    /// be no-ops rather than propagate into the inbound path that called this.
+    ///
+    /// `...(detail ? { detail } : {})` (`:556`) is a JS TRUTHINESS test, so an EMPTY detail string
+    /// omits the key rather than sending `""`. `Option::filter` reproduces that; a bare `Some("")`
+    /// would put a key on the wire pi never puts there.
+    pub fn emit_message_receipt(
+        &self,
+        message_id: &str,
+        status: MessageReceiptStatus,
+        detail: Option<&str>,
+    ) {
+        let Some(client) = self.client() else { return };
+        client.send_message_receipt(MessageReceipt {
+            message_id: message_id.to_string(),
+            status,
+            timestamp: now_ms().into(),
+            detail: detail.filter(|d| !d.is_empty()).map(str::to_string),
+            extra: Default::default(),
+        });
+    }
+
+    /// `case "message_receipt"` (`v0.10.1 index.ts:1018-1024`) — remember the newest receipt for a
+    /// message THIS session sent. Last writer wins; upstream `Map.set`s unconditionally.
+    pub fn record_outbound_receipt(&self, receipt: &MessageReceipt) {
+        self.latest_outbound_receipts.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            receipt.message_id.clone(),
+            OutboundReceipt {
+                status: receipt.status,
+                timestamp: receipt.timestamp.clone(),
+                detail: receipt.detail.clone().filter(|d| !d.is_empty()),
+            },
+        );
+    }
+
+    /// `latestDeliveryState(messageId, fallback)` (`v0.10.1 index.ts:570-576`) — the newest receipt
+    /// status for `message_id`, or `fallback` when there is no message id or no receipt yet.
+    #[must_use]
+    pub fn latest_delivery_state(&self, message_id: Option<&str>, fallback: &str) -> String {
+        let Some(message_id) = message_id else {
+            return fallback.to_string();
+        };
+        self.latest_outbound_receipts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(message_id)
+            .map_or_else(|| fallback.to_string(), |r| r.status.wire_name().to_string())
+    }
+
+    /// `handleMessageControl(control)` (`v0.10.1 index.ts:562-569`) — a peer withdrew or replaced a
+    /// message it had sent US.
+    ///
+    /// The `dismissPendingAsk` comes FIRST and is unconditional (`:563`), ahead of the branch: both
+    /// actions retract the pending ask, and only the receipt they emit differs. Getting that order
+    /// wrong would leave a superseded ask in the peer's `pending` list forever, which is the exact
+    /// symptom ICOM-017 records.
+    pub fn handle_message_control(&self, control: &MessageControl) {
+        self.tracker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .dismiss_pending_ask(&control.message_id);
+        match control.action {
+            MessageControlAction::Cancel => self.emit_message_receipt(
+                &control.message_id,
+                MessageReceiptStatus::CancellationRequested,
+                Some("message may already be injected or processed"),
+            ),
+            MessageControlAction::Supersede => {
+                // `control.supersededBy ? \`superseded by ${…}\` : undefined` (`:568`).
+                let detail = control.superseded_by.as_deref().map(|by| format!("superseded by {by}"));
+                self.emit_message_receipt(
+                    &control.message_id,
+                    MessageReceiptStatus::Superseded,
+                    detail.as_deref(),
+                );
+            }
         }
     }
 
@@ -519,7 +692,17 @@ impl SharedIntercomState {
         cancel: &cyrup_core::CancelToken,
     ) -> Result<String> {
         let message = self
-            .ask_and_wait_with_reply_to(client, target, question_id, text, attachments, None, cancel)
+            .ask_and_wait_with_reply_to(
+                client,
+                target,
+                question_id,
+                text,
+                attachments,
+                None,
+                None,
+                None,
+                cancel,
+            )
             .await?;
         // Inline the reply's attachments into the visible body, exactly as pi does
         // (`replyText + formatAttachments(replyMessage.content.attachments)`,
@@ -554,6 +737,8 @@ impl SharedIntercomState {
         text: String,
         attachments: Option<Vec<crate::transport::protocol::Attachment>>,
         reply_to: Option<String>,
+        supersedes: Option<String>,
+        retry_of: Option<String>,
         cancel: &cyrup_core::CancelToken,
     ) -> Result<crate::transport::protocol::Message> {
         // Single-slot guard (`if replyWaiter → "Already waiting for a reply"`).
@@ -569,6 +754,8 @@ impl SharedIntercomState {
                 reply_to,
                 expects_reply: Some(true),
                 message_id: Some(question_id.clone()),
+                supersedes,
+                retry_of,
             })
             .await;
 
@@ -609,8 +796,23 @@ impl SharedIntercomState {
             () = tokio::time::sleep(timeout) => {
                 self.waiter.clear_matching(&question_id);
                 client.cancel_ask(&question_id);
+                // `v0.10.1 index.ts:594` verbatim. Three facts cyrup's short form dropped, and each
+                // changes what the model does next: WHICH message went unanswered (the id it would
+                // `cancel` or `supersede`), the LAST KNOWN DELIVERY STATE (ICOM-017's receipt map is
+                // read here and nowhere else — `receiver_received` vs `injected` vs nothing at all
+                // is the difference between "the peer is thinking" and "the peer never saw it"), and
+                // that the timeout is NOT a cancellation, so the peer may still act on it. Without
+                // the last sentence a supervisor re-sends work a peer is already doing.
+                //
+                // `deliveryState`'s fallback here is `socket_delivered` rather than upstream's
+                // initial `"created"` (`:2092`) because this branch is only reachable AFTER the
+                // `result.delivered` arm above — which is exactly where `:2148` assigns it.
+                let delivery_state =
+                    self.latest_delivery_state(Some(&question_id), "socket_delivered");
                 Err(IntercomError::Client(format!(
-                    "No reply from \"{target}\" within {}",
+                    "No reply from \"{target}\" for message {question_id} within {}. Last known \
+                     delivery state: {delivery_state}. This waiter timeout is not cancellation; the \
+                     delivered message may still be queued or actionable in the recipient session.",
                     describe_timeout(self.ask_timeout_ms)
                 )))
             }
@@ -647,6 +849,148 @@ fn describe_timeout(ask_timeout_ms: u64) -> String {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// ICOM-017 — `hasSeenInboundMessage` (`v0.10.1 index.ts:532-548`).
+    ///
+    /// Three independent properties, each of which was absent (there was no dedupe at all):
+    /// the second delivery of the same `(from, id)` pair is suppressed, a DIFFERENT sender with the
+    /// same message id is NOT, and an entry older than the retention window is forgotten so the
+    /// same pair is accepted again.
+    #[test]
+    fn inbound_dedupe_suppresses_a_redelivery_and_keys_on_the_sender_too() {
+        let mut seen = SeenInboundMessages::default();
+        // Presence before absence: the FIRST sighting must be reported as new, or every
+        // "suppressed" assertion below would hold against a function that always returns `true`.
+        assert!(!seen.test_and_insert("peer-a\0m1".to_string(), 1_000));
+        assert!(seen.test_and_insert("peer-a\0m1".to_string(), 1_001));
+        // The NUL-separated key is `${from.id}\0${message.id}` (`:538`): the same message id from a
+        // different peer is a different message.
+        assert!(!seen.test_and_insert("peer-b\0m1".to_string(), 1_002));
+
+        // `now - seenAt > INBOUND_MESSAGE_DEDUPE_RETENTION_MS` sweeps the entry (`:533-537`), so the
+        // pair is accepted again rather than suppressed forever.
+        let later = 1_000 + INBOUND_MESSAGE_DEDUPE_RETENTION_MS + 1;
+        assert!(!seen.test_and_insert("peer-a\0m1".to_string(), later));
+    }
+
+    /// ICOM-017 — the size cap evicts the OLDEST key (`keys().next().value`, `:544-546`), which is
+    /// the half a bare `HashMap` cannot express.
+    ///
+    /// RED if `order` is dropped and eviction picks an arbitrary entry: this asserts the specific
+    /// pair that must have survived, not merely that the map shrank.
+    #[test]
+    fn inbound_dedupe_cap_evicts_the_oldest_insertion_not_an_arbitrary_one() {
+        let mut seen = SeenInboundMessages::default();
+        for i in 0..INBOUND_MESSAGE_DEDUPE_MAX {
+            assert!(!seen.test_and_insert(format!("p\0m{i}"), 10_000));
+        }
+        assert_eq!(seen.seen.len(), INBOUND_MESSAGE_DEDUPE_MAX);
+        // One past the cap: `m0` (the oldest) is evicted; the newest and the second-oldest stay.
+        assert!(!seen.test_and_insert("p\0overflow".to_string(), 10_001));
+        assert_eq!(seen.seen.len(), INBOUND_MESSAGE_DEDUPE_MAX);
+        assert!(
+            !seen.seen.contains_key("p\0m0"),
+            "the oldest key must be the one evicted at the cap"
+        );
+        assert!(seen.seen.contains_key("p\0m1"), "the second-oldest must survive one eviction");
+        assert!(seen.seen.contains_key("p\0overflow"), "the newly inserted key must survive");
+    }
+
+    /// ICOM-017 — `latestDeliveryState(messageId, fallback)` (`v0.10.1 index.ts:570-576`), the ONLY
+    /// reader of `latestOutboundReceipts` and therefore the thing that makes recording receipts
+    /// observable. It is what the ask timeout quotes.
+    #[test]
+    fn latest_delivery_state_falls_back_then_reports_the_recorded_status() {
+        let s = SharedIntercomState::new(
+            IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        );
+        assert_eq!(s.latest_delivery_state(None, "created"), "created");
+        assert_eq!(s.latest_delivery_state(Some("q1"), "socket_delivered"), "socket_delivered");
+
+        s.record_outbound_receipt(&MessageReceipt {
+            message_id: "q1".to_string(),
+            status: MessageReceiptStatus::ReceiverReceived,
+            timestamp: 1u64.into(),
+            detail: None,
+            extra: Default::default(),
+        });
+        assert_eq!(s.latest_delivery_state(Some("q1"), "socket_delivered"), "receiver_received");
+        // `Map.set` is unconditional — the newest receipt wins.
+        s.record_outbound_receipt(&MessageReceipt {
+            message_id: "q1".to_string(),
+            status: MessageReceiptStatus::Injected,
+            timestamp: 2u64.into(),
+            detail: None,
+            extra: Default::default(),
+        });
+        assert_eq!(s.latest_delivery_state(Some("q1"), "socket_delivered"), "injected");
+        // A different message is untouched by either write.
+        assert_eq!(s.latest_delivery_state(Some("q2"), "created"), "created");
+    }
+
+    /// ICOM-017 — `handleMessageControl` (`v0.10.1 index.ts:562-569`): a peer's `cancel` must
+    /// retract the ask from THIS session's pending list.
+    ///
+    /// Before this, `message_control` was decoded and dropped (`transport/client.rs`), so a
+    /// cancelled ask sat in `pending` until the ask timeout — the exact symptom ICOM-017 records.
+    /// The `dismissPendingAsk` is upstream's FIRST statement and is unconditional, so the same
+    /// assertion must hold for `supersede`; both are checked, because a port that put the dismissal
+    /// inside the `cancel` branch would pass a cancel-only test.
+    #[test]
+    fn a_peer_control_frame_retracts_the_pending_ask_for_both_actions() {
+        for action in [MessageControlAction::Cancel, MessageControlAction::Supersede] {
+            let s = SharedIntercomState::new(
+                IntercomConfig::default(),
+                600_000,
+                std::path::PathBuf::from("/w"),
+            );
+            let from = crate::transport::protocol::SessionInfo {
+                id: "peer".to_string(),
+                name: None,
+                runtime_fallback_alias: None,
+                cwd: "/w".to_string(),
+                model: "m".to_string(),
+                pid: 1u32.into(),
+                started_at: 0u64.into(),
+                last_activity: 0u64.into(),
+                status: None,
+                peer_uid: None,
+                trusted_local: None,
+                context_pct: None,
+                context_tokens: None,
+                context_window: None,
+                extra: Default::default(),
+            };
+            let message = crate::transport::protocol::Message {
+                id: "m-ask".to_string(),
+                timestamp: 0u64.into(),
+                expects_reply: Some(true),
+                ..Default::default()
+            };
+            s.tracker.lock().unwrap().record_incoming_message(from, message, 0);
+            assert_eq!(
+                s.tracker.lock().unwrap().list_pending(0).len(),
+                1,
+                "fixture: the ask must be pending BEFORE the control frame, or its absence \
+                 afterwards proves nothing"
+            );
+
+            s.handle_message_control(&MessageControl {
+                message_id: "m-ask".to_string(),
+                action,
+                timestamp: 1u64.into(),
+                superseded_by: None,
+                detail: None,
+                extra: Default::default(),
+            });
+            assert!(
+                s.tracker.lock().unwrap().list_pending(0).is_empty(),
+                "a {action:?} control frame must retract the pending ask"
+            );
+        }
+    }
 
     #[test]
     fn describe_timeout_formats_minutes_and_ms() {

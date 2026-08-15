@@ -66,6 +66,27 @@ fn project_with_caps(name: &str, caps_json: &str) -> PathBuf {
     cwd
 }
 
+/// The same layout with **no `capabilities` key at all** — the shape [`project_with_caps`] cannot
+/// produce, because it always interpolates the key. `ExtensionManifest::capabilities` is
+/// `#[serde(default)]` over a `Capabilities` whose every field is `#[serde(default)]`
+/// (`cyrup-ext/src/manifest.rs:23-24,43-50`), so this must deserialize to `Capabilities::none()`.
+fn project_without_caps_key(name: &str) -> PathBuf {
+    let bytes = std::fs::read(fixture_component()).expect("read fixture component");
+    let cwd = temp_project(name);
+    let ext_dir = cwd.join(".cyrup").join("extensions").join("demo");
+    std::fs::create_dir_all(&ext_dir).unwrap();
+    std::fs::write(
+        ext_dir.join("extension.json"),
+        format!(
+            r#"{{ "id": "demo", "version": "1.0.0", "world": "{}" }}"#,
+            cyrup_ext::HOST_WORLD
+        ),
+    )
+    .unwrap();
+    std::fs::write(ext_dir.join("demo.wasm"), &bytes).unwrap();
+    cwd
+}
+
 /// Load the fixture from `cwd` through the production discovery path, as a TRUSTED project.
 async fn load(cwd: &Path) -> (ExtensionHost, Arc<RecordingServices>) {
     let roots = DiscoveryRoots {
@@ -177,6 +198,111 @@ async fn net_runs_when_the_manifest_grants_it() {
     let out = out.unwrap_or_default();
     assert!(!out.contains("denied"), "granted net is not denied, got: {out}");
     assert_eq!(rec.http_requests().len(), 1, "the request reached the backend");
+
+    let _ = std::fs::remove_dir_all(&cwd);
+}
+
+// ---------------------------------------------------------------------------------------------
+// zero declarations — the DEFAULT, which is the shape a real authoring mistake produces
+// ---------------------------------------------------------------------------------------------
+
+/// A guest declaring **zero** capabilities is refused exec AND net.
+///
+/// Every `*_is_refused_when_the_manifest_denies_it` test above writes the bits out EXPLICITLY
+/// (`"exec": false, "net": false`). That pins the explicit-deny path and leaves the default path —
+/// an author who simply omits the key, which is what a hand-written `extension.json` actually looks
+/// like — resting on `#[serde(default)]` and on the module doc's claim at
+/// `cyrup-ext/src/manifest.rs:31-33` that "a manifest with no `capabilities` block … grant[s]
+/// nothing at all". Only `fs` had that claim observed
+/// ([`fs_is_refused_when_no_grant_is_declared`]); for `exec` and `net` it was read, never run. A
+/// `#[serde(default)]` that someone later replaces with a custom `Deserialize`, or a field that
+/// gains a non-`false` default, fails HERE and nowhere else.
+///
+/// Both zero shapes are covered: an empty `capabilities: {}` object and no `capabilities` key at
+/// all. They reach the same `Capabilities::none()` by different serde routes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_guest_declaring_zero_capabilities_is_refused_exec_and_net() {
+    for (label, cwd) in [
+        ("empty capabilities object", project_with_caps("caps-empty", "{}")),
+        ("no capabilities key", project_without_caps_key("caps-absent")),
+    ] {
+        let (host, rec) = load(&cwd).await;
+
+        // ---- exec ----
+        let out = host
+            .run_command("execdemo", "", &CancelToken::new())
+            .await
+            .expect("command runs")
+            .unwrap_or_default();
+        assert!(out.contains("exec denied"), "{label}: guest saw an exec denial, got: {out}");
+        assert!(out.contains(DENIED_EXEC), "{label}: denial names the manifest key, got: {out}");
+        assert!(
+            rec.exec_calls().is_empty(),
+            "{label}: the host refused BEFORE the exec backend: {:?}",
+            rec.exec_calls()
+        );
+
+        // ---- net, both doors (`request` and `request-stream`) ----
+        let out = host
+            .run_command("httpdemo", "https://example.invalid/", &CancelToken::new())
+            .await
+            .expect("command runs")
+            .unwrap_or_default();
+        assert!(out.contains("http denied"), "{label}: guest saw a net denial, got: {out}");
+        assert!(out.contains(DENIED_NET), "{label}: denial names the manifest key, got: {out}");
+        assert!(
+            rec.http_requests().is_empty(),
+            "{label}: the host refused BEFORE the http backend: {:?}",
+            rec.http_requests()
+        );
+
+        let out = host
+            .run_command("httpstreamdemo", "https://example.invalid/", &CancelToken::new())
+            .await
+            .expect("command runs");
+        assert!(
+            rec.http_requests().is_empty(),
+            "{label}: request-stream refused too: {:?} (guest said: {out:?})",
+            rec.http_requests()
+        );
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+}
+
+/// The companion that keeps the test above from being vacuous. `load()` installs a FULLY CAPABLE
+/// `RecordingServices`, so "zero exec calls" would also be the reading if the demo commands were
+/// misnamed, the guest never instantiated, or the backend were a deny-stub. Granting the very same
+/// bits on the very same fixture must produce a NON-empty backend record — which is what makes the
+/// emptiness above an enforced refusal rather than an absence of activity.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_zero_capability_refusal_is_a_refusal_and_not_an_absence_of_activity() {
+    let cwd = project_with_caps("caps-empty-control", r#"{ "exec": true, "net": true }"#);
+    let (host, rec) = load(&cwd).await;
+
+    let out = host
+        .run_command("execdemo", "", &CancelToken::new())
+        .await
+        .expect("command runs")
+        .unwrap_or_default();
+    assert!(!out.contains("denied"), "control: granted exec is not denied, got: {out}");
+    assert_eq!(
+        rec.exec_calls(),
+        vec![("echo".to_string(), vec!["hi".to_string()])],
+        "control: the SAME `execdemo` command reaches the backend once granted"
+    );
+
+    let out = host
+        .run_command("httpdemo", "https://example.invalid/", &CancelToken::new())
+        .await
+        .expect("command runs")
+        .unwrap_or_default();
+    assert!(!out.contains("denied"), "control: granted net is not denied, got: {out}");
+    assert_eq!(
+        rec.http_requests().len(),
+        1,
+        "control: the SAME `httpdemo` command reaches the backend once granted"
+    );
 
     let _ = std::fs::remove_dir_all(&cwd);
 }

@@ -690,22 +690,23 @@ async fn run() -> anyhow::Result<i32> {
         // does it (its own `bindExtensions` inside `InteractiveMode`, the sibling of
         // print-mode.ts:73 / rpc-mode.ts:319). Idempotent per session.
         session.bind_extensions().await;
-        // Migrated-credential notice (Pi `InteractiveMode` startup warning, interactive-mode.ts:797):
-        // when `runMigrations` moved any provider credential into `auth.json`, name them.
-        if !migration.migrated_auth_providers.is_empty() {
-            eprintln!(
-                "Warning: Migrated credentials to auth.json: {}",
-                migration.migrated_auth_providers.join(", ")
-            );
-        }
+        // (The migrated-credential notice is NOT printed here either — pi renders it INSIDE the
+        // running UI, `if (migratedProviders && migratedProviders.length > 0) { this.showWarning(
+        // `Migrated credentials to auth.json: ${migratedProviders.join(", ")}`); }`,
+        // interactive-mode.ts:874-876 @v0.83.0, threaded in as `options.migratedProviders` from
+        // `main.ts:607`. A pre-TUI `eprintln!` put the one notice saying a user's OAuth tokens and
+        // API keys moved out of `oauth.json`/`settings.json` exactly where the first frame paints
+        // over it. See `run_interactive`. CFG-051.)
         // (The `modelFallbackMessage` warning is NOT printed here — pi shows it INSIDE the TUI via
         // `this.showWarning(modelFallbackMessage)` (interactive-mode.ts:883-884), so it lands in the
         // transcript rather than scrolling off behind the alternate screen. See `run_interactive`.)
-        // Show extension-system deprecation warnings in interactive mode (Pi main.ts:781).
-        let warnings = migrations::format_deprecation_warnings(&deprecation_warnings);
-        if !warnings.is_empty() {
-            eprint!("{warnings}");
-        }
+        // Show extension-system deprecation warnings in interactive mode and BLOCK on a keypress
+        // before the TUI takes the terminal — Pi `if (appMode === "interactive" &&
+        // deprecationWarnings.length > 0) await showDeprecationWarnings(deprecationWarnings);`
+        // (main.ts:838-840 @v0.83.0). This arm is already the interactive one, so the mode guard is
+        // structural. Printing without the gate (CFG-049) put the only notice that a legacy `hooks/`
+        // directory has stopped loading one frame ahead of the paint that erases it.
+        migrations::show_deprecation_warnings(&deprecation_warnings);
         let _signals =
             spawn_abort_on_signal(runtime.clone(), cancel.clone(), AppMode::Interactive);
         // `PI_STARTUP_BENCHMARK` interactive run path (Pi main.ts:819-835): init the TUI, let stdin
@@ -757,6 +758,7 @@ async fn run() -> anyhow::Result<i32> {
             cli.verbose,
             cancel,
             package_updates,
+            migration.migrated_auth_providers.clone(),
         )
         .await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path
@@ -1059,7 +1061,7 @@ async fn run() -> anyhow::Result<i32> {
 /// The scope patterns follow Pi's precedence `parsed.models ?? settingsManager.getEnabledModels()`
 /// (main.ts:685): an explicit `--models` wins, otherwise the persisted `enabledModels` setting is the
 /// fallback scope source. Matching itself is delegated to `cyrup-config`'s `minimatch`-faithful
-/// resolver (see [`resolve_scoped_models`]), not a bespoke matcher.
+/// resolver (see [`resolve_scoped_models_reporting`]), not a bespoke matcher.
 ///
 /// `fresh` is whether this is a brand-new session (Pi `!hasExistingSession`, main.ts:394): a resumed
 /// session keeps its own restored model, so the saved-default-in-scope active-model pick only fires
@@ -1082,8 +1084,8 @@ async fn apply_post_build(session: &AgentSession, name: Option<&str>, cli: &Cli,
         // before returning the (possibly empty) scope, and does so on the live path at main.ts:741-743
         // for both `--models` and the `enabledModels` fallback. Without this a typo'd
         // `--models "anthropc/*"` scoped nothing with no output at all.
-        report_diagnostics(&scope_diagnostics(&catalog, &patterns));
-        let scoped = resolve_scoped_models(&catalog, &patterns);
+        let (scoped, diagnostics) = resolve_scoped_models_reporting(&catalog, &patterns);
+        report_diagnostics(&diagnostics);
         if !scoped.is_empty() {
             // The saved-default-in-scope active-model pick (Pi `buildSessionOptions`, main.ts:394-414):
             // when `--models` scopes the set and `--model` is omitted, the active model is the saved
@@ -1140,111 +1142,69 @@ fn pick_scoped_active_model<'a>(
     saved.or_else(|| scoped.first())
 }
 
-/// Resolve the `--models`/`enabledModels` patterns to a [`ScopedModel`] set against the live catalog
-/// (Pi `resolveModelScope`, model-resolver.ts:269-339): each pattern (optionally `:level`-suffixed)
-/// selects the catalog models whose `provider/id` (or bare `id`) matches it; duplicates are
-/// de-duplicated in first-seen order.
+/// The startup migrated-credential warning line, or `None` when nothing was migrated — Pi
+/// `if (migratedProviders && migratedProviders.length > 0) { this.showWarning(`Migrated credentials
+/// to auth.json: ${migratedProviders.join(", ")}`); }` (interactive-mode.ts:874-876 @v0.83.0), with
+/// `showWarning`'s own `Warning: ` prefix (`:3885-3889`) folded in, because cyrup's `Entry::Warning`
+/// renders its text verbatim. Split out from the call site so the string is pinnable (CFG-051).
+fn migrated_credentials_warning(providers: &[String]) -> Option<String> {
+    if providers.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Warning: Migrated credentials to auth.json: {}",
+        providers.join(", ")
+    ))
+}
+
+/// Pi `resolveModelScope(available, patterns)` in ONE call — both halves of its
+/// `{ scopedModels, diagnostics }` return (model-resolver.ts:269-350 @v0.83.0).
 ///
-/// The matching is delegated to `cyrup-config`'s `ModelResolver::resolve_scope`, a byte-for-byte
-/// `minimatch({ nocase: true })` port (13,877-case verified): a pattern containing `*`/`?`/`[` is
+/// CFG-008's residual. The diagnostics used to be REPLAYED in this binary: a per-pattern loop that
+/// re-ran `resolve_scope` on a one-element slice to test emptiness, plus a hand-rolled recursion
+/// that re-derived `parseModelPattern`'s colon-stripping to recover pi's `Invalid thinking level
+/// "X" in pattern "Y". Using default instead.` sentence. Both of those now come from the resolver
+/// that already computes them (`ModelScopeDiagnostic`, model.rs), so the glob/non-glob split, the
+/// `:level` stripping and the exact-reference short-circuit exist in exactly one place.
+///
+/// Two notes the deleted replay carried, now settled rather than dropped:
+///
+/// * its `[CYRUP-DELTA]` about the missing `findExactModelReferenceMatch` short-circuit (:297-303)
+///   was STALE — CFG-018 put the short-circuit into `resolve_scope_reporting`'s glob arm, so a
+///   literal id containing `[` or `?` resolves instead of warning;
+/// * its claim that `cyrup-config` "abbreviates the text to `invalid thinking level '<suffix>'`"
+///   was also stale — `parse_pattern` mints pi's full sentence (model.rs, Pi `:243`).
+///
+/// The matching itself stays where it was: `cyrup-config`'s byte-for-byte
+/// `minimatch({ nocase: true })` port (13,877-case verified) — a pattern containing `*`/`?`/`[` is
 /// matched with real path-segment-aware globbing (`*` never crosses `/`, full `?`/`[...]`/`{a,b}`/
 /// extglob support), and a non-glob pattern resolves to Pi's single best (alias-preferred,
-/// `localeCompare`-tie-broken) model — exactly as `resolveModelScopeWithDiagnostics` does. This
-/// replaces the prior bespoke `*`-only, non-path-segment-aware substring matcher in `cli.rs`, which
-/// diverged from Pi (e.g. `anthropic*` wrongly matched every anthropic model; `[...]` classes were
-/// unsupported). The resolver's `ScopedModel` is mapped onto the session-svc `ScopedModel` here.
-fn resolve_scoped_models(
+/// `localeCompare`-tie-broken) model. This replaced the bespoke `*`-only, non-path-segment-aware
+/// substring matcher that once lived in `cli.rs` (e.g. `anthropic*` wrongly matched every anthropic
+/// model; `[...]` classes were unsupported). The resolver's `ScopedModel` is mapped onto the
+/// session-svc `ScopedModel` here.
+fn resolve_scoped_models_reporting(
     catalog: &[cyrup_provider::Model],
     patterns: &[String],
-) -> Vec<ScopedModel> {
-    cyrup_config::ModelResolver::new(catalog)
-        .resolve_scope(patterns)
+) -> (Vec<ScopedModel>, Vec<Diagnostic>) {
+    let result = cyrup_config::ModelResolver::new(catalog).resolve_scope_reporting(patterns);
+    let scoped = result
+        .models
         .into_iter()
         .map(|sm| ScopedModel {
             model: sm.model,
             thinking_level: sm.thinking_level,
         })
-        .collect()
-}
-
-/// The scope diagnostics Pi emits alongside the resolved scope (Pi `ModelScopeDiagnostic` /
-/// `resolveModelScopeWithDiagnostics`, model-resolver.ts:259-350), in Pi's order: for each pattern,
-/// the `invalid-thinking-level` warning first (:330-332), then the `no-match` warning when the
-/// pattern selected nothing (:311-318 for the glob arm, :334-341 for the non-glob arm).
-///
-/// `resolve_scope` returns only the matched set, so emptiness *per pattern* is the no-match test —
-/// hence the one-element slice per iteration rather than a bulk call. That keeps the glob/non-glob
-/// split, the `:level` suffix stripping and the `minimatch` semantics in the single ported
-/// implementation instead of duplicating them here; the only cost is that the de-duplication Pi does
-/// across patterns is irrelevant to emptiness anyway (a pattern whose every match was already seen
-/// still matched, and still resolves non-empty on its own).
-///
-/// [CYRUP-DELTA] Pi's glob arm short-circuits on `findExactModelReferenceMatch(globPattern)` before
-/// running `minimatch` (:308-314), so a literal model id that happens to contain `[` or `?` never
-/// reaches the no-match branch. `resolve_scope` has no such short-circuit, so such an id would warn
-/// here where Pi stays silent — no shipped catalog id contains a glob metacharacter, and closing it
-/// belongs in `cyrup-config`'s resolver, not in the bin.
-fn scope_diagnostics(catalog: &[cyrup_provider::Model], patterns: &[String]) -> Vec<Diagnostic> {
-    let resolver = cyrup_config::ModelResolver::new(catalog);
-    let mut diagnostics: Vec<Diagnostic> = Vec::new();
-    for pattern in patterns {
-        // Pi pushes the `invalid-thinking-level` warning BEFORE the no-match check, and only for the
-        // non-glob arm — the glob arm silently ignores an unrecognised `:suffix` and globs the whole
-        // pattern (model-resolver.ts:288-297).
-        if !is_glob_pattern(pattern)
-            && let Some(message) = invalid_thinking_level_message(&resolver, pattern)
-        {
-            diagnostics.push(Diagnostic::warning(message));
-        }
-        if resolver.resolve_scope(std::slice::from_ref(pattern)).is_empty() {
-            diagnostics.push(Diagnostic::warning(format!(
-                "No models match pattern \"{pattern}\""
-            )));
-        }
-    }
-    diagnostics
-}
-
-/// Pi's glob test — a pattern is a glob iff it contains `*`, `?` or `[` (model-resolver.ts:286,
-/// mirrored at `cyrup-config` model.rs:257).
-fn is_glob_pattern(pattern: &str) -> bool {
-    pattern.contains('*') || pattern.contains('?') || pattern.contains('[')
-}
-
-/// Pi's `invalid-thinking-level` message at Pi's exact wording — `Invalid thinking level "X" in
-/// pattern "Y". Using default instead.` (`parseModelPattern`, model-resolver.ts:243).
-///
-/// `cyrup-config`'s [`cyrup_config::ModelResolver::parse_pattern`] detects the identical condition
-/// but abbreviates the text to `invalid thinking level '<suffix>'` and drops the pattern (model.rs:
-/// 205-212), because on the `--model` path that string is only ever appended to a caller-composed
-/// sentence. So this replays `parseModelPattern`'s colon-stripping recursion (model-resolver.ts:
-/// 196-246) to recover WHICH recursion level produced it, and formats Pi's sentence there:
-///
-/// * a valid `:level` suffix recurses on the prefix and *propagates* the inner warning (:218-226);
-/// * an invalid suffix warns at THIS level and *overwrites* any inner warning, but only when the
-///   prefix itself resolves to a model (:237-245) — otherwise the inner (model-less, warning-less)
-///   result is returned verbatim.
-///
-/// Gated on the resolver reporting a warning at all, so a pattern that simply does not match
-/// produces nothing here and falls through to the `no-match` diagnostic.
-fn invalid_thinking_level_message(
-    resolver: &cyrup_config::ModelResolver<'_>,
-    pattern: &str,
-) -> Option<String> {
-    resolver.parse_pattern(pattern, false).warning?;
-    // A warning implies the pattern did NOT match outright (an exact/partial hit returns early with
-    // `warning: None`, model-resolver.ts:200-204), so a colon split did happen.
-    let idx = pattern.rfind(':')?;
-    let (prefix, rest) = pattern.split_at(idx);
-    let suffix = rest.get(1..).unwrap_or("");
-    if cyrup_config::parse_thinking_level(suffix).is_some() {
-        // Valid level — the warning came from deeper in the recursion (:218-226).
-        return invalid_thinking_level_message(resolver, prefix);
-    }
-    // Invalid suffix — Pi warns HERE iff the prefix resolves (:237-245).
-    resolver.parse_pattern(prefix, false).model.map(|_| {
-        format!("Invalid thinking level \"{suffix}\" in pattern \"{pattern}\". Using default instead.")
-    })
+        .collect();
+    // Pi's rendering loop: `for (const diagnostic of diagnostics) console.warn(chalk.yellow(
+    // `Warning: ${diagnostic.message}`))` (model-resolver.ts:355-361), reached on the live path at
+    // main.ts:741-743 for both `--models` and the `enabledModels` fallback.
+    let diagnostics = result
+        .diagnostics
+        .into_iter()
+        .map(|d| Diagnostic::warning(d.message))
+        .collect();
+    (scoped, diagnostics)
 }
 
 /// Resolve the session target with Pi's full non-interactive depth (Pi `createSessionManager`,
@@ -1868,6 +1828,9 @@ async fn run_interactive(
     // The detached startup package-update check's answer channel (Pi `interactive-mode.ts:850-856`);
     // `None` when the network policy declined. Handed straight to the run loop.
     package_updates: Option<tokio::sync::mpsc::UnboundedReceiver<Vec<String>>>,
+    // Pi `InteractiveModeOptions.migratedProviders` (interactive-mode.ts:308), threaded from
+    // `runMigrations` through `main.ts:607`. CFG-051.
+    migrated_providers: Vec<String>,
 ) -> anyhow::Result<()> {
     // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
     // the `ThemeController`), instead of the hardwired dark boot the audit flagged (theme.rs #4). An
@@ -1961,16 +1924,28 @@ async fn run_interactive(
     // reader thread starts. `quietStartup` hides the inventory; it never hides a load failure.
     app.push_loaded_resources(&build_startup_report(&session, verbose));
 
-    // The startup `modelFallbackMessage` warning (Pi `if (modelFallbackMessage) {
-    // this.showWarning(modelFallbackMessage); }`, interactive-mode.ts:883-884). It goes in the
-    // TRANSCRIPT, not on stderr, because that is the only place a first-run user will still see it
-    // once the alternate screen is up — and reading it is the whole point: on a credential-less
-    // start it is `formatNoModelsAvailableMessage()`, i.e. "No models available. Use /login …"
-    // (auth-guidance.ts:14-16), the instruction that turns a modelless launch (SEAM-075) into a
-    // working session. Pushed after `showLoadedResources` (which pi runs from `init()`, ahead of
-    // `run()`'s startup-warning block) and before the replay, matching pi's order.
+    // Pi's startup-warning block (interactive-mode.ts:871-885 @v0.83.0), in pi's order. Both lines
+    // go in the TRANSCRIPT, not on stderr, because that is the only place a first-run user will
+    // still see them once the alternate screen is up. Pushed after `showLoadedResources` (which pi
+    // runs from `init()`, ahead of `run()`'s startup-warning block) and before the replay.
+    //
+    // The `Warning: ` prefix belongs to pi's `showWarning` itself — `new Text(theme.fg("warning",
+    // `Warning: ${warningMessage}`), 1, 0)`, interactive-mode.ts:3885-3889 @v0.83.0 — and cyrup
+    // renders `Entry::Warning` verbatim, so every caller supplies it (app.rs:3626, :7821).
+
+    // FIRST: the migrated-credential notice (`:874-876`). It tells the user their OAuth tokens and
+    // API keys were relocated out of `oauth.json`/`settings.json` into `auth.json` — a change that
+    // silently invalidates any backup or tooling pointing at the old files — and on stderr it lived
+    // exactly one frame before the paint that erased it. CFG-051.
+    if let Some(line) = migrated_credentials_warning(&migrated_providers) {
+        app.state_mut().transcript.push_warning(line);
+    }
+    // THEN the `modelFallbackMessage` warning (`:883-885`). Reading it is the whole point: on a
+    // credential-less start it is `formatNoModelsAvailableMessage()`, i.e. "No models available.
+    // Use /login …" (auth-guidance.ts:14-16), the instruction that turns a modelless launch
+    // (SEAM-075) into a working session. The `Warning: ` prefix was missing at this call site.
     if let Some(msg) = runtime.model_fallback_message().await {
-        app.state_mut().transcript.push_warning(msg);
+        app.state_mut().transcript.push_warning(format!("Warning: {msg}"));
     }
 
     let input_stream = crossterm_input_stream(cancel.clone());
@@ -2228,8 +2203,47 @@ fn init_tracing(verbose: bool) {
 mod tests {
     use super::{
         DiagnosticLevel, ScopedModel, SessionTarget, format_token_count, is_fresh_target,
-        pick_scoped_active_model, resolve_scoped_models, scope_diagnostics,
+        migrated_credentials_warning, pick_scoped_active_model, resolve_scoped_models_reporting,
     };
+
+    /// CFG-051 — the notice that a user's OAuth tokens and API keys were relocated out of
+    /// `oauth.json`/`settings.json` into `auth.json`. pi renders it INSIDE the running UI
+    /// (`this.showWarning(...)`, interactive-mode.ts:874-876 @v0.83.0, whose copy carries the
+    /// `Warning: ` prefix at `:3885-3889`); cyrup wrote it to stderr on the pre-TUI path, one frame
+    /// ahead of the paint that erased it. It is now a transcript entry beside the
+    /// `modelFallbackMessage` warning, in pi's order (`:874` before `:884`).
+    ///
+    /// RED before this pass: there was no function — the text was an `eprintln!` in `main`.
+    #[test]
+    fn the_migrated_credential_notice_is_pis_line_and_is_absent_when_nothing_moved() {
+        assert_eq!(migrated_credentials_warning(&[]), None);
+        assert_eq!(
+            migrated_credentials_warning(&["anthropic".to_string()]).as_deref(),
+            Some("Warning: Migrated credentials to auth.json: anthropic")
+        );
+        // `migratedProviders.join(", ")` — comma-space, and every provider named.
+        assert_eq!(
+            migrated_credentials_warning(&["anthropic".to_string(), "openai".to_string()])
+                .as_deref(),
+            Some("Warning: Migrated credentials to auth.json: anthropic, openai")
+        );
+    }
+
+    /// The models half of the one scope pass, for the tests that only assert matching.
+    fn resolve_scoped_models_reporting_models(
+        catalog: &[cyrup_provider::Model],
+        patterns: &[String],
+    ) -> Vec<ScopedModel> {
+        resolve_scoped_models_reporting(catalog, patterns).0
+    }
+
+    /// The diagnostics half of the one scope pass.
+    fn resolve_scoped_models_reporting_diagnostics(
+        catalog: &[cyrup_provider::Model],
+        patterns: &[String],
+    ) -> Vec<super::Diagnostic> {
+        resolve_scoped_models_reporting(catalog, patterns).1
+    }
 
     /// The `--models`/`enabledModels` scope must report Pi's diagnostics, not resolve in silence
     /// (Pi `resolveModelScopeWithDiagnostics` → `resolveModelScope`, model-resolver.ts:270-361;
@@ -2243,7 +2257,7 @@ mod tests {
         // A pattern that matches nothing warns, in BOTH arms — the glob arm
         // (model-resolver.ts:311-318) and the non-glob arm (:334-341).
         for pattern in ["anthropc/*", "no-such-model-anywhere"] {
-            let diags = scope_diagnostics(&catalog, &[pattern.to_string()]);
+            let diags = resolve_scoped_models_reporting_diagnostics(&catalog, &[pattern.to_string()]);
             assert_eq!(diags.len(), 1, "{pattern}: {diags:?}");
             let only = diags.first().expect("one diagnostic");
             assert_eq!(only.level, DiagnosticLevel::Warning);
@@ -2252,14 +2266,14 @@ mod tests {
 
         // A pattern that DOES match is silent.
         assert!(
-            scope_diagnostics(&catalog, &["anthropic/*".to_string()]).is_empty(),
+            resolve_scoped_models_reporting_diagnostics(&catalog, &["anthropic/*".to_string()]).is_empty(),
             "a matching pattern emits no diagnostic"
         );
 
         // An invalid `:level` suffix on a resolving pattern warns with Pi's exact sentence
         // (`parseModelPattern`, model-resolver.ts:243) and does NOT also warn no-match — the model
         // still resolves, at the default thinking level.
-        let diags = scope_diagnostics(&catalog, &["claude-opus-4-8:hihg".to_string()]);
+        let diags = resolve_scoped_models_reporting_diagnostics(&catalog, &["claude-opus-4-8:hihg".to_string()]);
         assert_eq!(diags.len(), 1, "{diags:?}");
         assert_eq!(
             diags.first().expect("one diagnostic").message,
@@ -2268,12 +2282,12 @@ mod tests {
 
         // A VALID `:level` is not a diagnostic at all.
         assert!(
-            scope_diagnostics(&catalog, &["claude-opus-4-8:high".to_string()]).is_empty(),
+            resolve_scoped_models_reporting_diagnostics(&catalog, &["claude-opus-4-8:high".to_string()]).is_empty(),
             "a valid thinking level is silent"
         );
 
         // Both warnings can ride on one pattern list, in pattern order.
-        let diags = scope_diagnostics(
+        let diags = resolve_scoped_models_reporting_diagnostics(
             &catalog,
             &["claude-opus-4-8:hihg".to_string(), "anthropc/*".to_string()],
         );
@@ -2281,6 +2295,58 @@ mod tests {
         let messages: Vec<&str> = diags.iter().map(|d| d.message.as_str()).collect();
         assert!(messages.first().is_some_and(|m| m.starts_with("Invalid thinking level")));
         assert!(messages.get(1).is_some_and(|m| m.starts_with("No models match pattern")));
+    }
+
+    /// CFG-008's residual. Pi's `resolveModelScope` returns `{ scopedModels, diagnostics }` from ONE
+    /// pass (model-resolver.ts:269-350 @v0.83.0) and the live call site consumes both
+    /// (main.ts:741-743). cyrup resolved twice — once for the models, once more per pattern to
+    /// re-derive the warnings — so the diagnostic TYPE lived in this binary as a replay.
+    ///
+    /// This pins the pairing: for a list mixing a hit, a miss and a bad thinking level, ONE call
+    /// yields the scoped set AND both warnings, in pattern order, and the two legacy entry points
+    /// are the two halves of exactly that result.
+    #[test]
+    fn one_scope_pass_returns_pis_models_and_diagnostics_together() {
+        let catalog = cyrup::provider::all_available_models(&cyrup_config::ModelFile::default());
+        let patterns = vec![
+            "anthropic/*".to_string(),
+            "anthropc/*".to_string(),
+            "claude-opus-4-8:hihg".to_string(),
+        ];
+
+        let (scoped, diagnostics) = resolve_scoped_models_reporting(&catalog, &patterns);
+
+        // Presence before absence: the good pattern really did scope something.
+        assert!(!scoped.is_empty(), "`anthropic/*` scopes a non-empty set");
+        assert!(
+            scoped.iter().any(|s| s.model.id.as_str() == "claude-opus-4-8"),
+            "the `:hihg` pattern still resolves its prefix — Pi keeps the model and drops the level"
+        );
+        assert!(
+            scoped
+                .iter()
+                .filter(|s| s.model.id.as_str() == "claude-opus-4-8")
+                .all(|s| s.thinking_level.is_none()),
+            "an invalid level yields `thinkingLevel: undefined` (model-resolver.ts:237-245)"
+        );
+
+        let messages: Vec<&str> = diagnostics.iter().map(|d| d.message.as_str()).collect();
+        assert_eq!(
+            messages,
+            vec![
+                "No models match pattern \"anthropc/*\"",
+                "Invalid thinking level \"hihg\" in pattern \"claude-opus-4-8:hihg\". Using default \
+                 instead.",
+            ],
+            "diagnostics come back in pattern order, from the resolver"
+        );
+        assert!(
+            diagnostics
+                .iter()
+                .all(|d| matches!(d.level, DiagnosticLevel::Warning)),
+            "Pi renders every scope diagnostic through `console.warn` (model-resolver.ts:355-361)"
+        );
+
     }
 
     /// The live `--models`/`enabledModels` scope resolution must go through `cyrup-config`'s
@@ -2300,7 +2366,7 @@ mod tests {
         // `anthropic.claude-opus-4-7`. So the assertion is no longer "zero matches" — it is that
         // every match is a BARE dotted id and none is the provider-qualified `anthropic/…` form.
         // Asserting emptiness here would have quietly re-encoded "amazon-bedrock is not ported".
-        let scoped = resolve_scoped_models(&catalog, &["anthropic*".to_string()]);
+        let scoped = resolve_scoped_models_reporting_models(&catalog, &["anthropic*".to_string()]);
         assert!(
             scoped.iter().all(|m| !m.model.id.as_str().contains('/')),
             "`anthropic*` is one segment, so it must never match the 2-segment `anthropic/<id>` \
@@ -2317,7 +2383,7 @@ mod tests {
         // (it fell through to a literal-substring miss). Pi matches exactly the -6 and -8 opus ids.
         // (This used to read `[08]`; `claude-opus-4-0` was retired upstream in pi `cc2db980` — see
         // cyrup-provider `tests/catalog_data.rs`, PROV-004.)
-        let scoped = resolve_scoped_models(&catalog, &["anthropic/claude-opus-4-[68]".to_string()]);
+        let scoped = resolve_scoped_models_reporting_models(&catalog, &["anthropic/claude-opus-4-[68]".to_string()]);
         let ids: Vec<&str> = scoped.iter().map(|s| s.model.id.as_str()).collect();
         assert!(
             ids.contains(&"claude-opus-4-6") && ids.contains(&"claude-opus-4-8"),
@@ -2333,7 +2399,7 @@ mod tests {
         // is either an anthropic-provider model (fullId `anthropic/<id>`) or a model whose bare id
         // itself begins `anthropic/` (e.g. openrouter's `anthropic/claude-…`) — never an unrelated
         // provider like `anthropicX/…` (segment boundary, not a substring).
-        let scoped = resolve_scoped_models(&catalog, &["anthropic/*".to_string()]);
+        let scoped = resolve_scoped_models_reporting_models(&catalog, &["anthropic/*".to_string()]);
         assert!(!scoped.is_empty(), "`anthropic/*` scopes a non-empty set");
         assert!(
             scoped.iter().any(|s| s.model.provider.as_str() == "anthropic"),

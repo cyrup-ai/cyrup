@@ -33,6 +33,19 @@ struct IntercomParams {
     attachments: Option<Vec<Attachment>>,
     #[serde(default)]
     reply_to: Option<String>,
+    /// `messageId` (`v0.10.1 index.ts:1822-1824`) — the message the `cancel` action withdraws.
+    #[serde(default)]
+    message_id: Option<String>,
+    /// `supersedes` (`v0.10.1 index.ts:1825-1827`) — a previous message id this `send`/`ask`
+    /// explicitly replaces. The broker refuses one that does not name a message this sender already
+    /// delivered to this same receiver (`v0.10.1 broker/broker.ts:525-534`).
+    #[serde(default)]
+    supersedes: Option<String>,
+    /// `retryOf` (`v0.10.1 index.ts:1828-1830`) — a previous message id this `send`/`ask` retries.
+    /// Carried on the envelope for the receiver's delivery-metadata line only; the broker does not
+    /// validate it.
+    #[serde(default)]
+    retry_of: Option<String>,
     /// `cwd` (`v0.10.1 index.ts:1831-1833`) — the working directory to filter `list-cwd` by, and
     /// for `send`/`ask` the directory the target lookup is scoped to (omit `to` to address the sole
     /// live peer there).
@@ -248,6 +261,47 @@ impl IntercomTool {
                 };
                 Ok(text_result(format!("{current_section}\n\n{other_section}")))
             }
+            // ICOM-017 — `case "cancel"` (`v0.10.1 index.ts:1943-1969`). Placed here, between
+            // `list-cwd` and `send`, in upstream's own order.
+            //
+            // This is the action that makes the whole receipt/control half reachable from the model:
+            // without it a stale ask sits in the peer's `pending` list until the ask timeout, and
+            // the broker's `handle_cancel_message` (ported with ICOM-010) had no caller at all.
+            "cancel" => {
+                let Some(message_id) = params.message_id.clone().filter(|v| !v.trim().is_empty())
+                else {
+                    // Upstream answers `{ text: "Missing 'messageId' parameter", details: { error:
+                    // true } }` — a non-error RESULT. cyrup renders every such arm as a `ToolError`
+                    // (see the identical `Missing 'to' or 'cwd', or missing 'message' parameter`
+                    // guard in `send` below); the text is upstream's, byte for byte.
+                    return Err(ToolError::new("Missing 'messageId' parameter"));
+                };
+                let result = client.cancel_message(&message_id).await.map_err(|e| {
+                    // `catch (error) { … \`Failed to cancel message: ${getErrorMessage(error)}\` }`
+                    // (`:1964-1968`).
+                    ToolError::new(format!("Failed to cancel message: {e}"))
+                })?;
+                if !result.delivered {
+                    // `result.reason ?? "Message may not exist or may belong to another sender."`
+                    // (`:1955`) — `??`, so an empty-string reason is KEPT, unlike the `||` fallbacks
+                    // elsewhere in this file.
+                    let error_text = result.reason.clone().unwrap_or_else(|| {
+                        "Message may not exist or may belong to another sender.".to_string()
+                    });
+                    return Ok(detailed_result(
+                        format!("Cancellation for {message_id} was not delivered: {error_text}"),
+                        serde_json::json!({
+                            "messageId": message_id,
+                            "delivered": false,
+                            "reason": result.reason,
+                        }),
+                    ));
+                }
+                Ok(detailed_result(
+                    format!("Cancellation requested for {message_id}"),
+                    serde_json::json!({ "messageId": message_id, "delivered": true }),
+                ))
+            }
             "send" => {
                 // `v0.10.1 index.ts:1973-1978`: `if ((!to && !cwd) || !message)` — ONE guard and one
                 // message covering all three params, because `cwd` is an alternative addressing mode
@@ -350,6 +404,11 @@ impl IntercomTool {
                         reply_to: effective_reply_to.clone(),
                         expects_reply: None,
                         message_id: None,
+                        // `supersedes` / `retryOf` are threaded through `send` and `ask` only
+                        // (`v0.10.1 index.ts:2029-2030`, `:2144-2145`); the `reply` arm below
+                        // deliberately does NOT carry them (`:2217-2221`).
+                        supersedes: params.supersedes.clone(),
+                        retry_of: params.retry_of.clone(),
                     })
                     .await
                     .map_err(to_tool_err)?;
@@ -469,6 +528,8 @@ impl IntercomTool {
                         message.clone(),
                         params.attachments.clone(),
                         params.reply_to.clone(),
+                        params.supersedes.clone(),
+                        params.retry_of.clone(),
                         cancel,
                     )
                     .await
@@ -547,6 +608,8 @@ impl IntercomTool {
                         reply_to: Some(target.message.id.clone()),
                         expects_reply: None,
                         message_id: None,
+                        supersedes: None,
+                        retry_of: None,
                     })
                     .await
                     .map_err(to_tool_err)?;
@@ -736,7 +799,7 @@ fn parameters_schema() -> serde_json::Value {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["list", "list-cwd", "send", "ask", "reply", "pending", "status"],
+                "enum": ["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"],
                 "description": "The intercom action to perform."
             },
             // `v0.10.1 index.ts:1831-1833`, minus the sentence about `openProjectPaneIfMissing`
@@ -760,7 +823,11 @@ fn parameters_schema() -> serde_json::Value {
                     "required": ["type", "name", "content"]
                 }
             },
-            "replyTo": { "type": "string", "description": "The ask message id this replies to (reply)." }
+            "replyTo": { "type": "string", "description": "The ask message id this replies to (reply)." },
+            // `v0.10.1 index.ts:1822-1830`, descriptions verbatim.
+            "messageId": { "type": "string", "description": "Message ID for actions that operate on an existing message, such as 'cancel'." },
+            "supersedes": { "type": "string", "description": "Previous message ID this send/ask explicitly supersedes. Only works for the same sender and receiver." },
+            "retryOf": { "type": "string", "description": "Previous message ID this send/ask is a user-authored retry of. Retries always send a new message ID." }
         },
         "required": ["action"]
     })
@@ -777,7 +844,7 @@ impl Tool for IntercomTool {
     }
 
     fn description(&self) -> &str {
-        "Coordinate with other local agent sessions over the intercom broker: list/list-cwd/send/ask/reply/pending/status."
+        "Coordinate with other local agent sessions over the intercom broker: list/list-cwd/send/ask/reply/pending/status/cancel."
     }
 
     async fn execute(
@@ -805,6 +872,45 @@ mod tests {
     use crate::transport::protocol::{Message, MessageContent};
 
     use super::*;
+
+    /// ICOM-017 — the tool's SCHEMA is what decides whether the model can reach the cancel path at
+    /// all, and it is the half that stayed unported after the broker's `handle_cancel_message`
+    /// landed: `cancel_message` had no caller, so the broker code was dead.
+    ///
+    /// Pinned against `v0.10.1 index.ts:1810-1830`: the action enum ends with `"cancel"` in pi's own
+    /// order, and the three message-id parameters exist with pi's descriptions. A `cancel` arm
+    /// without the enum entry is unreachable (the agent preflight validates the call against this
+    /// schema before `execute` runs), and `messageId` without the enum entry is decoration.
+    #[test]
+    fn the_schema_advertises_cancel_and_the_three_message_id_parameters() {
+        let schema = parameters_schema();
+        let actions: Vec<&str> = schema["properties"]["action"]["enum"]
+            .as_array()
+            .expect("the action property must carry an enum")
+            .iter()
+            .map(|v| v.as_str().expect("every action must be a string"))
+            .collect();
+        // Presence before absence: assert the WHOLE list, in pi's order, so a rewrite that drops an
+        // existing action to add `cancel` is red too.
+        assert_eq!(
+            actions,
+            vec!["list", "list-cwd", "send", "ask", "reply", "pending", "status", "cancel"],
+            "`v0.10.1 index.ts:1810-1812` — pi's enum, in pi's order, with `cancel` last"
+        );
+        for (key, needle) in [
+            ("messageId", "such as 'cancel'"),
+            ("supersedes", "explicitly supersedes"),
+            ("retryOf", "user-authored retry"),
+        ] {
+            let description = schema["properties"][key]["description"]
+                .as_str()
+                .unwrap_or_else(|| panic!("`{key}` must be declared with a description"));
+            assert!(
+                description.contains(needle),
+                "`{key}`'s description must be pi's ({needle:?}); got {description:?}"
+            );
+        }
+    }
 
     /// pi `index.ts:1747-1751`. The MESSAGE ID is the load-bearing column, not decoration:
     /// `reply_tracker.rs:126` refuses a sender-targeted reply with upstream's own wording

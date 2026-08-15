@@ -208,7 +208,7 @@ struct RegistryInner {
     guest_tool_order: Vec<String>,
     guest_tools: HashMap<String, (ExtensionId, ToolDescriptor)>,
     /// Which extension owns the RENDERER for a tool name (`ToolDescriptor.has_renderer` =>
-    /// Pi's per-tool `renderCall`/`renderResult`, extensions/types.ts:472-481, resolved by
+    /// Pi's per-tool `renderCall`/`renderResult`, extensions/types.ts:489-497, resolved by
     /// `modes/interactive/components/tool-execution.ts:81-112`). Populated by
     /// [`ExtensionRegistry::register_guest_tool`]; read by
     /// [`crate::ExtensionHost::render_tool_call`]/[`crate::ExtensionHost::render_tool_result`] to
@@ -388,7 +388,7 @@ impl ExtensionRegistry {
             g.guest_tool_order.push(name.clone());
         }
         // A descriptor that declares `has_renderer` makes its owner the renderer for that TOOL name
-        // (Pi's per-tool `renderCall`/`renderResult`, types.ts:472-481) — EXT-006.
+        // (Pi's per-tool `renderCall`/`renderResult`, types.ts:489-497) — EXT-006.
         if desc.has_renderer {
             g.tool_renderer_owner.insert(name.clone(), owner.clone());
         } else {
@@ -404,7 +404,7 @@ impl ExtensionRegistry {
     /// [`ToolDescriptor`] — i.e. a NATIVE extension's tool, which arrives as an already-executable
     /// `Arc<dyn Tool>` and therefore carries no `has_renderer` flag (Pi does not distinguish:
     /// `ToolDefinition.renderCall` is declared the same way whichever runtime supplies the tool,
-    /// extensions/types.ts:472-481).
+    /// extensions/types.ts:489-497).
     ///
     /// **FIRST registration wins** (EXT-056), like every sibling table. Upstream has no separate
     /// tool-renderer table at all: `renderCall`/`renderResult` ride on the tool's own
@@ -572,7 +572,10 @@ impl ExtensionRegistry {
                     "parameters": t.parameters(),
                     // EXT-038: pi's `ToolInfo` is
                     // `Pick<ToolDefinition, "name"|"description"|"parameters"|"promptGuidelines"> &
-                    // {sourceInfo}` (`extensions/types.ts:1551-1553` @v0.83.0), produced by
+                    // {sourceInfo}` (`extensions/types.ts:1552-1554` @v0.83.0 — re-verified this
+                    // pass; `:1551` is the doc comment and the type body runs `:1552-1554`, so the
+                    // `:1551-1553` this line carried disagreed with the EXT-060 doc directly above
+                    // it on the same type), produced by
                     // `getAllTools()` at `core/agent-session.ts:906-914`. Both trailing fields were
                     // simply absent, so an extension reading this API could not see the guidelines
                     // a tool contributes to the system prompt, nor where a tool came from.

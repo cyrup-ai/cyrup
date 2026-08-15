@@ -452,6 +452,26 @@ pub enum MessageReceiptStatus {
     CancellationRequested,
 }
 
+impl MessageReceiptStatus {
+    /// The wire spelling — the same string `#[serde(rename_all = "snake_case")]` emits, and the same
+    /// value pi's `latestDeliveryState` hands back to the model (`v0.10.1 index.ts:570-576`, where
+    /// the status IS the JS string literal). Spelled out rather than derived through
+    /// `serde_json::to_string` so the user-visible text cannot change with a serde attribute.
+    #[must_use]
+    pub const fn wire_name(self) -> &'static str {
+        match self {
+            Self::ReceiverReceived => "receiver_received",
+            Self::Queued => "queued",
+            Self::Injected => "injected",
+            Self::Acknowledged => "acknowledged",
+            Self::Expired => "expired",
+            Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
+            Self::CancellationRequested => "cancellation_requested",
+        }
+    }
+}
+
 /// `MessageReceipt` (`v0.9.2 types.ts:51-56`), guarded by `isMessageReceipt`
 /// (`v0.9.2 broker/client.ts:56-65`, mirrored at `v0.9.2 broker/broker.ts:107-116`).
 ///

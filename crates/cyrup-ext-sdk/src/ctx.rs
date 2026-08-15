@@ -243,7 +243,7 @@ impl Ctx {
         Ok(())
     }
 
-    // --- active-tool / command introspection (Pi getActiveTools/…/getCommands, types.ts:1257-1266) ---
+    // --- active-tool / command introspection (Pi getActiveTools/…/getCommands, `types.ts:1320`/`:1329` @v0.83.0; EXT-036 corrected `:1257-1266`) ---
 
     /// The names of the currently-active tools (Pi `getActiveTools`).
     pub fn get_active_tools(&self) -> Vec<String> {
@@ -284,7 +284,7 @@ impl Ctx {
         Value::Array(vec![])
     }
 
-    /// Read a registered flag's resolved VALUE (Pi `getFlag(name)`, types.ts:1218; sdk gap #23). The
+    /// Read a registered flag's resolved VALUE (Pi `getFlag(name)`, `types.ts:1269` @v0.83.0 (EXT-036 corrected `:1218`); sdk gap #23). The
     /// WIT `registration.get-flag` import returns the value (its default / CLI override) as JSON; this
     /// wraps it. `None` when the flag is unregistered or has no value (Pi `undefined`).
     pub fn get_flag(&self, name: &str) -> Option<Value> {
@@ -301,7 +301,7 @@ impl Ctx {
     }
 
     /// Unregister a custom provider previously registered by this extension (Pi `unregisterProvider`,
-    /// types.ts:1361; sdk gap #24). Wraps the existing WIT `registration.unregister-provider` import.
+    /// `types.ts:1416` @v0.83.0 (EXT-036 corrected `:1361`); sdk gap #24). Wraps the existing WIT `registration.unregister-provider` import.
     pub fn unregister_provider(&self, id: &str) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::registration::unregister_provider(id);
@@ -683,19 +683,55 @@ impl NotifyKind {
     }
 }
 
-/// The UI capability surface (Pi `ExtensionUIContext`, `extensions/types.ts:131-290` @v0.83.0).
+/// The UI capability surface (Pi `ExtensionUIContext`, `extensions/types.ts:131-282` @v0.83.0 —
+/// the interface's closing brace is `:282`; the `:290` this line used to carry is inside
+/// `ContextUsage`, two interfaces later).
 ///
-/// EXT-036 (the import-surface re-run): the `types.ts` line citations on this type's methods were
-/// re-derived one by one against `v0.83.0` and a cluster of them was stale by a consistent ~7 lines
-/// — `notify` was cited `:135` (that line is `confirm`'s doc comment; `notify` is `:142`),
-/// `setStatus` `:141` (it is `:148`), `select` `:127` (`:133`), `editor` `:216` (that is
-/// `setEditorText`; `editor` is `:222`), the dialog-options `AbortSignal` `:89-94` (`:95-101`, and
-/// the sibling comment four lines below it already said `:95-100` — the file contradicted itself,
-/// which is EXT-036's signature), and the chrome trio `:130-150` (they are `:183`/`:190`/`:193`).
-/// The uniform offset says these were taken against a pi version this region is 7 lines shorter in,
-/// not invented. **The same stale citations are still in both `world.wit` copies** (`:420`, `:423`,
-/// `:426`, `:446`, `:470`) and were left there deliberately: the world is frozen for the 0.6 bump
-/// this pass. Fix them there in the next pass that opens it.
+/// # EXT-036 — the citation re-run, now COMPLETE
+///
+/// The first pass re-derived the `types.ts` citations on this type's methods one by one against
+/// `v0.83.0` and found a cluster stale by a consistent ~7 lines: `notify` cited `:135` (that line
+/// is `confirm`'s doc comment; `notify` is `:142`), `setStatus` `:141` (it is `:148`), `select`
+/// `:127` (`:133`), `editor` `:216` (that is `setEditorText`; `editor` is `:222`), the
+/// dialog-options `AbortSignal` `:89-94` (`:95-101`, while the sibling comment four lines below it
+/// already said `:95-100` — the file contradicted itself, which is EXT-036's signature), and the
+/// chrome trio `:130-150` (they are `:183`/`:190`/`:193`). The uniform offset says these were taken
+/// against a pi revision this region is ~7 lines shorter in, not invented.
+///
+/// That pass could not touch the two `world.wit` copies — the world was frozen for the 0.6 bump —
+/// and left a register naming the exact lines to fix. **Those are now fixed**, in both copies and
+/// in the host, and re-running the sweep across the whole import surface rather than just this type
+/// turned up **three more clusters the register did not know about**:
+///
+/// 1. **`modes/rpc/rpc-types.ts`, uniform +8.** `confirm` cited `:232` (a BLANK line; it is `:240`)
+///    and `input` cited `:233-240` (a banner comment; it is `:241-248`). Five sites: both
+///    `world.wit` copies, `cyrup-ext/src/host/services.rs`, this file, and `example.rs`.
+/// 2. **`cyrup-ext/src/host/services.rs`'s fire-and-forget block, uniform ~+6.** `notify` `:136`,
+///    `setStatus` `:141-142`, `setHeader` `:184`, `setFooter` `:174-177`, `setTitle` `:187`,
+///    `setEditorText` `:210`, `setToolsExpanded` `:275`, and the `rpc-mode.ts:149,163,196`
+///    fire-and-forget cite (it is `:152`/`:168`, with `:218`/`:238` for the title and editor
+///    verbs). The tell that this is import rot and not systematic misreading: every citation ADDED
+///    to that same block by the EXT-021/EXT-047 pass (`:151`, `:154`, `:164`, `:167`, `:170-175`)
+///    is exact.
+/// 3. **`types.ts`'s `pi.*` region — NOT an off-by-N, wrong surface entirely.** `getFlag` cited
+///    `:1218` (that is `on("turn_start")`; it is `:1269`), `unregisterProvider` `:1361` (an
+///    `@example` line; `:1416`), `getActiveTools`/`getCommands` `:1257-1266` (`:1320`/`:1329`),
+///    `setThinkingLevel` `:1288` (`:1342`), the `Models` view `:1273-1279` (that is
+///    `registerMessageRenderer`/`registerEntryRenderer`; the surface is `:319`/`:326`/`:341`/
+///    `:1336`/`:1342`), `registerEntryRenderer` `:1295` (`sendUserMessage`; it is `:1279`),
+///    `registerMessageRenderer` `:1284` (a blank line; `:1276`), and `agent_settled` `:1225`
+///    (`tool_execution_end`; it is `:1217`).
+///
+/// **Two FABRICATIONS, not staleness, were also found** and are recorded where they live rather
+/// than here: `pasteEditorText` (`world.wit`'s editor-buffer comment and
+/// `services.rs::set_editor_text`) names a function pi has at no version — the upstream name is
+/// `pasteToEditor`, `types.ts:213` — and `ui.custom` cited `types.ts:175`, the closing paren of the
+/// `setWidget` component-factory overload, where `custom` is `:196`. Both are the same class as the
+/// `working-start`/`working-stop` fabrication EXT-021 caught, and both were hidden by a citation
+/// wide enough to look plausible (`:200-230`).
+///
+/// Method for the next auditor: a citation is only checkable if it names ONE line or a range whose
+/// endpoints are both meaningful. Every fabrication found in this area so far hid inside a range.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Ui;
 
@@ -733,13 +769,50 @@ impl Ui {
         #[cfg(not(target_arch = "wasm32"))]
         let _ = signal_id;
     }
+
+    /// Stop receiving raw terminal input — the unsubscribe closure pi's
+    /// `onTerminalInput(handler): () => void` returns (`extensions/types.ts:145` @v0.83.0,
+    /// "Listen to raw terminal input (interactive mode only). Returns an unsubscribe function").
+    /// Idempotent, like upstream's `Set.delete`.
+    ///
+    /// EXT-M04, the same defect EXT-050 closed for the event bus, left open on this pair by the
+    /// same pass. The host half has existed since the 0.6 -> 0.7 bump —
+    /// `ui.unsubscribe-terminal-input` is declared in `world.wit`, implemented at
+    /// `cyrup-ext/src/host/live.rs` and backed by `ExtensionRegistry::unsubscribe_terminal_input`
+    /// — but NOTHING in this SDK ever called it: `guest::init` calls
+    /// `ui::subscribe_terminal_input()` when the api declares a handler and there was no way back.
+    /// A declared import with no caller on the guest side is the mirror image of the EXT-023 class
+    /// (a declared field with no reader on the host side), and it made pi's return value —
+    /// the entire point of `onTerminalInput` for an extension that listens only while an overlay
+    /// or mode is up — unreachable.
+    ///
+    /// The handler itself stays registered ([`crate::api::ExtensionApi::on_terminal_input`] is an
+    /// init-time factory call, since a closure cannot cross the component boundary); this takes
+    /// down the HOST-side subscription, which is what stops the `on-terminal-input` export from
+    /// being invoked. Pair with [`Self::subscribe_terminal_input`] to resume.
+    pub fn unsubscribe_terminal_input(&self) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::unsubscribe_terminal_input();
+    }
+
+    /// Resume receiving raw terminal input after [`Self::unsubscribe_terminal_input`] (EXT-M04).
+    ///
+    /// `guest::init` already calls this once for an extension whose factory registered a handler,
+    /// so a guest that never unsubscribes never needs it. Calling it without a registered handler
+    /// subscribes to input that this guest's `on-terminal-input` export will answer with pi's
+    /// `undefined` (no-op) — harmless, and the same thing upstream's `onTerminalInput(() => {})`
+    /// does.
+    pub fn subscribe_terminal_input(&self) {
+        #[cfg(target_arch = "wasm32")]
+        crate::guest::bindings::cyrup::ext::ui::subscribe_terminal_input();
+    }
     /// Confirmation dialog (Pi `confirm`). Indefinite, no message body; use [`Self::confirm_with`]
     /// for a message/timeout/signal.
     pub fn confirm(&self, prompt: &str) -> bool {
         self.confirm_with(prompt, "", &DialogOptions::default())
     }
     /// Confirmation dialog with a message body and a [`DialogOptions`] bag (Pi
-    /// `confirm(title, message, {timeout, signal})`, rpc-types.ts:232): `prompt` is the short title,
+    /// `confirm(title, message, {timeout, signal})`, rpc-types.ts:240 @v0.83.0): `prompt` is the short title,
     /// `message` the (often large, formatted) body — e.g. pi-mcp-adapter's sampling handler passes a
     /// label as `title` and the full prompt/conversation text as `message`.
     pub fn confirm_with(&self, prompt: &str, message: &str, opts: &DialogOptions) -> bool {
@@ -759,7 +832,7 @@ impl Ui {
         self.input_with(prompt, None, &DialogOptions::default())
     }
     /// Text input dialog with a placeholder and a [`DialogOptions`] bag (Pi
-    /// `input(title, placeholder, {timeout, signal})`, rpc-types.ts:233-240); forwarded live to the
+    /// `input(title, placeholder, {timeout, signal})`, rpc-types.ts:241-248 @v0.83.0); forwarded live to the
     /// renderer. `placeholder = None` omits the wire field entirely, matching Pi's optional field.
     pub fn input_with(&self, prompt: &str, placeholder: Option<&str>, opts: &DialogOptions) -> Option<String> {
         let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
@@ -1108,7 +1181,12 @@ fn parse_json(s: String) -> Value {
     serde_json::from_str(&s).unwrap_or(Value::Null)
 }
 
-/// The model registry view (Pi types.ts:1273-1279).
+/// The model registry view (Pi `ctx.modelRegistry: ModelRegistry`, `extensions/types.ts:319`
+/// @v0.83.0, plus `ctx.scopedModels` `:326`, `getContextUsage()` `:341`, `pi.setModel(model)`
+/// `:1336` and `pi.setThinkingLevel(level)` `:1342`).
+///
+/// EXT-036: this cited `types.ts:1273-1279`, which is `registerMessageRenderer`/
+/// `registerEntryRenderer` — a different surface entirely, not an off-by-N.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Models;
 
@@ -1161,7 +1239,8 @@ impl Models {
         None
     }
 
-    /// Set the thinking level (Pi `setThinkingLevel(level)`, types.ts:1288; sdk gap #25 / GAP-11).
+    /// Set the thinking level (Pi `setThinkingLevel(level)`, `types.ts:1342` @v0.83.0; EXT-036
+    /// corrected `:1288`; sdk gap #25 / GAP-11).
     ///
     /// Pi allows `setThinkingLevel` from ANY handler (factory-tier `pi.*`, `loader.ts:352-354` /
     /// `runner.ts:330`, no tier gate) and it takes effect. cyrup now matches this: the call is QUEUED
@@ -1437,7 +1516,7 @@ impl core::ops::Deref for ReplacedSessionContext {
 }
 
 /// The tool `execute` cancellation signal (Pi `ToolDefinition.execute` `signal: AbortSignal`,
-/// types.ts:466; sdk gap #1). A long-running tool polls [`Self::is_aborted`] to cooperatively stop;
+/// types.ts:483; sdk gap #1). A long-running tool polls [`Self::is_aborted`] to cooperatively stop;
 /// it reads the host's live cancellation state for this `call_id` (the run `CancelToken`, the epoch
 /// deadline, or a named `ui.abort-signal` matching the call id). The host epoch is the hard backstop.
 #[derive(Clone, Debug, Default)]
@@ -1462,7 +1541,7 @@ impl Signal {
     }
 }
 
-/// The call passed to a guest tool's `execute` (Pi `ToolDefinition.execute` args, types.ts:464).
+/// The call passed to a guest tool's `execute` (Pi `ToolDefinition.execute` args, types.ts:480).
 /// Carries the `toolCallId`, parsed `params`, the cancellation [`Signal`], and a [`Ctx`];
 /// `emit_update` streams partial output back to the runtime (Pi `onUpdate`).
 #[derive(Clone, Debug)]

@@ -259,6 +259,34 @@ impl ChildSpawnSpec {
         Ok((arg, Some(path)))
     }
 
+    /// SUBA-030 — spill the composed persona/system prompt to a `0600` file in `temp_dir` and
+    /// return its path, a 1:1 port of pi `buildPiArgs`' prompt-file block
+    /// (`runs/shared/pi-args.ts:570-585` @v0.43.0).
+    ///
+    /// Upstream writes the prompt UNCONDITIONALLY — there is no size threshold, unlike the task
+    /// spill at `:588` — into the same `mkdtemp` scratch directory, then pushes
+    /// `--system-prompt`/`--append-system-prompt` and the PATH as two separate argv elements. The
+    /// file name is `<stem>.md` where `stem` is `promptFileStem ?? "prompt"` with every character
+    /// outside JS's `[\w.-]` replaced by `_` (`:572`); upstream's only two callers pass the agent
+    /// name (`foreground/execution.ts:329`, `background/subagent-runner.ts:1337`).
+    ///
+    /// The persona therefore never appears in the child's `/proc/<pid>/cmdline`, which is the
+    /// disclosure half of SUBA-030, and can never hit `MAX_ARG_STRLEN`/`E2BIG`, which is its
+    /// availability half.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SubagentError::Spawn`] if the prompt file cannot be created or written.
+    pub fn resolve_system_prompt_arg(
+        prompt: &str,
+        stem: &str,
+        temp_dir: &Path,
+    ) -> Result<PathBuf, SubagentError> {
+        let path = temp_dir.join(format!("{}.md", sanitize_prompt_file_stem(stem)));
+        write_private(&path, prompt)?;
+        Ok(path)
+    }
+
     /// Full argv for `tokio::process::Command::args`, in the mandated order: `command.base_args`,
     /// then `args`, then the task prompt argument last.
     #[must_use]
@@ -269,6 +297,30 @@ impl ChildSpawnSpec {
         argv.push(self.task_arg.clone());
         argv
     }
+}
+
+/// pi `(input.promptFileStem ?? "prompt").replace(/[^\w.-]/g, "_")` (`runs/shared/pi-args.ts:572`
+/// @v0.43.0). JS `\w` is exactly `[A-Za-z0-9_]`, so the retained set is ASCII alphanumerics plus
+/// `_`, `.` and `-`; EVERY other character — including non-ASCII letters, which
+/// `char::is_alphanumeric` would wrongly keep — becomes `_`.
+///
+/// An empty or all-blank stem degrades to pi's own `"prompt"` default rather than producing a
+/// hidden `.md` file: upstream reaches the default through `?? "prompt"` on an absent field, and a
+/// caller that passes an unnamed agent is expressing the same "no stem" condition.
+#[must_use]
+pub fn sanitize_prompt_file_stem(stem: &str) -> String {
+    if stem.trim().is_empty() {
+        return "prompt".to_string();
+    }
+    stem.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// SUBA-030 — write `contents` to `path` with mode `0600`, matching pi's
@@ -1012,7 +1064,7 @@ fn drain_stderr_lines(lines: &mut BoundedLineReader) {
 /// says nothing about failing the whole run over a temp-file removal that didn't take, so a
 /// leftover-but-harmless temp file is preferred over surfacing a spurious error from what is
 /// otherwise a successful (or already-failed, and about to report that failure) run.
-fn cleanup_temp_files(paths: &[PathBuf]) {
+pub(crate) fn cleanup_temp_files(paths: &[PathBuf]) {
     for path in paths {
         if let Err(err) = std::fs::remove_file(path)
             && err.kind() != std::io::ErrorKind::NotFound

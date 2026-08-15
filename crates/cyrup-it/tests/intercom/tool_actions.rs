@@ -223,10 +223,20 @@ async fn list_splits_current_and_other_sessions_with_headed_sections() {
     let other_section = &text[other_idx..];
     let self_short_id = short_session_id("me-session");
     let other_short_id = short_session_id("other-session");
-    assert!(current_section.contains("[self]"), "self row missing [self] tag: {text}");
+    // `[self, idle]`, not a bare `[self]`. `format_session_list_row` pushes `self` FIRST and then
+    // appends the session's status; the CURRENT session's status comes from `current_status()`
+    // (pi `v0.10.1 index.ts:676-680`), which is never empty — it floors at `idle` when no tool is
+    // active and the agent is not running, which is exactly this fixture's state. A bare `[self]`
+    // was only ever reachable before that status reached the row, so this assertion could not pass
+    // against current behaviour. (The OTHER row still shows a bare `[same cwd]`: its status comes
+    // from its own registration, which `common::registration` leaves `None`.)
+    assert!(
+        current_section.contains("[self, idle]"),
+        "self row must be tagged `self` first and carry its lifecycle status: {text}"
+    );
     assert!(current_section.contains(&self_short_id), "self row missing own id: {text}");
     assert!(
-        !other_section.contains(&self_short_id) && !other_section.contains("[self]"),
+        !other_section.contains(&self_short_id) && !other_section.contains("[self"),
         "self leaked into other sessions: {text}"
     );
     assert!(other_section.contains(&other_short_id), "the other session must be listed: {text}");
@@ -277,9 +287,36 @@ async fn send_honors_a_declined_confirm_send_prompt() {
     assert_eq!(result_text(&result), "Message cancelled by user");
     assert!(services.entries_persisted().is_empty(), "a cancelled send must not append an audit entry");
 
-    // The target never actually received anything.
-    let never_delivered = tokio::time::timeout(Duration::from_millis(300), target_events.recv()).await;
-    assert!(never_delivered.is_err(), "the declined send must never reach the broker/target");
+    // The target never actually received the MESSAGE.
+    //
+    // Not "received nothing": the broker broadcasts a `PresenceUpdate` to every peer when a session
+    // joins the roster, and `me` connects after `target` subscribes, so one reliably lands inside
+    // any wait window here. This assertion used to be `recv()` timing out, which conflated that
+    // routine presence traffic with delivery and went red the moment presence arrived promptly
+    // enough. Drain the window and assert on the event KIND — a declined confirm must produce no
+    // `MessageReceived`, while presence is expected and says nothing about delivery.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(300);
+    let mut delivered: Vec<InboundEvent> = Vec::new();
+    let mut saw_presence = false;
+    while let Ok(Ok(event)) =
+        tokio::time::timeout_at(deadline, target_events.recv()).await
+    {
+        match event {
+            InboundEvent::PresenceUpdate(_) => saw_presence = true,
+            other => delivered.push(other),
+        }
+    }
+    assert!(
+        delivered.is_empty(),
+        "the declined send must never reach the broker/target; got: {delivered:?}"
+    );
+    // Presence-before-absence: if NOTHING at all arrived, the drain above proves nothing about
+    // delivery — the channel could simply be dead. The presence broadcast is the liveness witness.
+    assert!(
+        saw_presence,
+        "the target's event channel must be live (a peer joining broadcasts presence), otherwise \
+         the empty-delivery assertion above is vacuous"
+    );
 
     me.disconnect();
     target.disconnect();
@@ -414,6 +451,7 @@ async fn ask_prefixes_the_reply_with_the_reply_from_header() {
                         reply_to: Some(message.id.clone()),
                         expects_reply: None,
                         message_id: None,
+                        ..Default::default()
                     })
                     .await;
                 return;
@@ -471,6 +509,7 @@ async fn reply_reports_the_sender_name_rather_than_the_raw_session_id() {
         reply_to: None,
         expects_reply: Some(true),
         message_id: Some("q1".to_string()),
+        ..Default::default()
     })
     .await
     .expect("the ask is delivered");
@@ -537,3 +576,4 @@ async fn status_renders_pi_four_line_intercom_status_block() {
     me.disconnect();
     peer.disconnect();
 }
+

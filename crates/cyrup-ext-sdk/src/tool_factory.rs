@@ -1,6 +1,6 @@
 //! Author-facing tool factories (Pi `defineTool` + the re-exported `createBashTool`/`createReadTool`/…
 //! tool factories, sdk.ts:111-123; sdk gap #6). [`define_tool`] bundles a [`ToolDescriptor`] with its
-//! executor into a [`RegisteredTool`] (the analog of Pi's identity `defineTool`, types.ts:493), and
+//! executor into a [`RegisteredTool`] (the analog of Pi's identity `defineTool`, types.ts:509), and
 //! the [`crate::tool_factory`] descriptor builders reproduce the shapes of Pi's built-in tools so an
 //! author can compose / override them with a custom `cwd` or guidelines.
 
@@ -8,7 +8,7 @@ use crate::api::{RegisteredTool, ToolExec};
 use crate::descriptor::{ExecMode, ToolDescriptor};
 use serde_json::json;
 
-/// Bundle a descriptor + executor into a [`RegisteredTool`] (Pi `defineTool`, types.ts:493). Pass
+/// Bundle a descriptor + executor into a [`RegisteredTool`] (Pi `defineTool`, types.ts:509). Pass
 /// the result to [`crate::ExtensionApi::register_tool_def`].
 pub fn define_tool(descriptor: ToolDescriptor, exec: impl ToolExec) -> RegisteredTool {
     RegisteredTool { descriptor, exec: Box::new(exec) }

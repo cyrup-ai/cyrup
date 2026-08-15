@@ -978,7 +978,7 @@ impl SessionBuilder {
         // resolves each entry to a working tree (package-manager.ts:891-901). cyrup read only its own
         // `packages.json` install registry, so a package DECLARED in settings contributed nothing.
         // Project entries are pushed first so they win the shared package precedence rank (:887-893).
-        let (configured_packages, package_errors) = configured_packages_from_settings(&settings);
+        let (configured_packages, package_errors) = configured_packages_from_settings(&settings, &cwd, &cfg.agent_dir);
         disc.configured_packages = configured_packages;
         let report = discover(&disc, cancel.token()).await?;
         // TUI-006: the discovery pass's structured diagnostics (shadowed same-name skills, a
@@ -2096,13 +2096,18 @@ fn load_installed_packages(package_dir: &Path, cwd: &Path) -> InstalledPackages 
 /// document) — the returned `Vec<String>` becomes startup diagnostics.
 fn configured_packages_from_settings(
     settings: &SettingsManager,
+    cwd: &Path,
+    agent_dir: &Path,
 ) -> (Vec<ConfiguredPackage>, Vec<String>) {
-    let mut out: Vec<ConfiguredPackage> = Vec::new();
+    let mut out: Vec<(String, ConfiguredPackage)> = Vec::new();
     let mut errors: Vec<String> = Vec::new();
     for (layer, scope) in [
         (settings.project(), InstallScope::Project),
         (settings.global(), InstallScope::Global),
     ] {
+        // Pi `getBaseDirForScope(entry.scope)` (package-manager.ts:2071-2080), the base the scope's
+        // LOCAL sources resolve against before they can be compared.
+        let base = cyrup_resources::scope_base_dir(cwd, agent_dir, scope);
         let (declared, layer_errors) = layer.packages_with_errors();
         errors.extend(layer_errors);
         for entry in declared {
@@ -2136,27 +2141,30 @@ fn configured_packages_from_settings(
             // - otherwise, a PROJECT entry replaces whatever is in the slot (`result[index] =
             //   entry`, :1698) — project wins, later project entry wins an intra-scope repeat.
             //
-            // [CYRUP-DELTA] the identity is the trimmed source STRING, where Pi normalizes through
-            // `getPackageIdentity` (:1660-1674) so `npm:x@1` and `npm:x@2`, or an SSH and an HTTPS
-            // URL for one repo, collide. Tracked separately as CFG-026.
-            match out.iter().position(|p| p.source == built.source) {
-                None => out.push(built),
+            // The key is Pi's `getPackageIdentity(source, entry.scope)` (:1676-1690), NOT the raw
+            // source string (CFG-026): `npm:x@1`/`npm:x@2` and an SSH/HTTPS pair for one repo
+            // collide, while `"./pack"` declared in BOTH scopes does not — it names
+            // `<cwd>/.cyrup/pack` in project scope and `<agent_dir>/pack` in global scope, two
+            // different trees, so pi keeps both and cyrup used to drop the global one.
+            let identity = cyrup_resources::package_identity(&built.source, &base);
+            match out.iter().position(|(id, _)| *id == identity) {
+                None => out.push((identity, built)),
                 Some(index) => {
-                    let existing_is_project_delta = out
-                        .get(index)
-                        .is_some_and(|p| p.scope == InstallScope::Project && p.filter.is_delta());
+                    let existing_is_project_delta = out.get(index).is_some_and(|(_, p)| {
+                        p.scope == InstallScope::Project && p.filter.is_delta()
+                    });
                     if existing_is_project_delta && built.scope == InstallScope::Global {
-                        out.push(built);
+                        out.push((identity, built));
                     } else if built.scope == InstallScope::Project
                         && let Some(slot) = out.get_mut(index)
                     {
-                        *slot = built;
+                        *slot = (identity, built);
                     }
                 }
             }
         }
     }
-    (out, errors)
+    (out.into_iter().map(|(_, p)| p).collect(), errors)
 }
 
 /// Map the runtime mode to the extension `(ExtMode, has_ui)` (R-11-002).
@@ -2213,6 +2221,7 @@ fn today() -> time::Date {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::http_proxy_overlay;
+    use std::path::Path;
 
     // ---- SEAM-071: `--no-extensions` gates the native built-ins ----------------------------
     //
@@ -2400,7 +2409,7 @@ mod tests {
         store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
         let mgr = SettingsManager::load(store, Settings::new(), true);
 
-        let (pkgs, errors) = super::configured_packages_from_settings(&mgr);
+        let (pkgs, errors) = super::configured_packages_from_settings(&mgr, Path::new("/proj"), Path::new("/home/u/.cyrup/agent"));
         assert!(errors.is_empty(), "{errors:?}");
         assert_eq!(
             pkgs.len(),
@@ -2431,9 +2440,92 @@ mod tests {
         store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
         let mgr = SettingsManager::load(store, Settings::new(), true);
 
-        let (pkgs, _) = super::configured_packages_from_settings(&mgr);
+        let (pkgs, _) = super::configured_packages_from_settings(&mgr, Path::new("/proj"), Path::new("/home/u/.cyrup/agent"));
         assert_eq!(pkgs.len(), 1, "{pkgs:?}");
         assert_eq!(pkgs[0].scope, InstallScope::Project);
+    }
+
+    /// CFG-026. The dedupe key is Pi `getPackageIdentity(source, entry.scope)`
+    /// (package-manager.ts:1676-1690 @v0.83.0), which resolves a LOCAL source against that scope's
+    /// base dir (`getBaseDirForScope`, :2071-2080). `"./pack"` in both scopes therefore names two
+    /// different trees — `<cwd>/.cyrup/pack` and `<agent_dir>/pack` — and pi keeps BOTH.
+    ///
+    /// RED before the fix: the key was the trimmed source string, the two entries collided, and the
+    /// project one replaced the global one, so `<agent_dir>/pack`'s skills/prompts/themes vanished.
+    #[test]
+    fn the_same_relative_local_source_in_both_scopes_is_two_packages() {
+        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_resources::InstallScope;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Project, r#"{"packages":["./pack"]}"#);
+        store.seed(SettingsScope::Global, r#"{"packages":["./pack"]}"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+
+        let (pkgs, errors) = super::configured_packages_from_settings(
+            &mgr,
+            Path::new("/proj"),
+            Path::new("/home/u/.cyrup/agent"),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            pkgs.len(),
+            2,
+            "`./pack` means /proj/.cyrup/pack in project scope and /home/u/.cyrup/agent/pack in \
+             global scope — two packages, not one; got {pkgs:?}"
+        );
+        assert_eq!(pkgs[0].scope, InstallScope::Project);
+        assert_eq!(pkgs[1].scope, InstallScope::Global);
+    }
+
+    /// The other direction of the same key change: an ABSOLUTE local source is scope-independent,
+    /// so the two scopes still collide and the project entry wins — the behaviour a raw
+    /// source-string key got right and must not lose.
+    #[test]
+    fn the_same_absolute_local_source_in_both_scopes_is_still_one_package() {
+        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_resources::InstallScope;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Project, r#"{"packages":["/shared/pack"]}"#);
+        // A different SPELLING of the same absolute path: `resolvePath` normalizes `.`/`..` before
+        // the comparison, which a string key cannot do.
+        store.seed(SettingsScope::Global, r#"{"packages":["/shared/sub/../pack"]}"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+
+        let (pkgs, _) = super::configured_packages_from_settings(
+            &mgr,
+            Path::new("/proj"),
+            Path::new("/home/u/.cyrup/agent"),
+        );
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].scope, InstallScope::Project);
+    }
+
+    /// And the version-ignoring half of `getPackageIdentity` (`npm:${parsed.name}`, :1678-1680):
+    /// two entries pinning different versions of one npm package are ONE package, where a raw
+    /// source-string key loaded both.
+    #[test]
+    fn two_npm_versions_of_one_package_dedupe_to_the_project_entry() {
+        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_resources::InstallScope;
+        use std::sync::Arc;
+
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(SettingsScope::Project, r#"{"packages":["npm:pi-tools@2"]}"#);
+        store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools@1"]}"#);
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+
+        let (pkgs, _) = super::configured_packages_from_settings(
+            &mgr,
+            Path::new("/proj"),
+            Path::new("/home/u/.cyrup/agent"),
+        );
+        assert_eq!(pkgs.len(), 1, "{pkgs:?}");
+        assert_eq!(pkgs[0].scope, InstallScope::Project);
+        assert_eq!(pkgs[0].source, "npm:pi-tools@2");
     }
 
     /// PROV-002: the persisted session key for the `max` rung. Both directions go through serde,

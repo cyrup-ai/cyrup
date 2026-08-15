@@ -1543,3 +1543,108 @@ async fn agent016_panicking_tool_keeps_its_slot_in_a_parallel_batch() {
 async fn agent016_panicking_tool_keeps_its_slot_in_a_sequential_batch() {
     agent016_batch(ToolExecution::Sequential).await;
 }
+
+// ----------------------------------------------------------------------------
+// PROV-011 — a tool's `constrainedSampling` declaration reaches `Context.tools`.
+// ----------------------------------------------------------------------------
+
+/// A tool that OPTS IN, plus one that stays silent, so the assertion below can tell "forwarded"
+/// from "stamped onto everything".
+struct DeclaringTool {
+    name: String,
+    params: Value,
+    declared: Option<cyrup_core::ConstrainedSampling>,
+}
+
+impl DeclaringTool {
+    fn new(name: &str, declared: Option<cyrup_core::ConstrainedSampling>) -> Arc<Self> {
+        Arc::new(Self { name: name.into(), params: obj_schema(), declared })
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for DeclaringTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
+        self.declared.as_ref()
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        Ok(ToolResult::default())
+    }
+}
+
+/// PROV-011 — pi copies `constrainedSampling` off the `ToolDefinition` onto the runtime `AgentTool`
+/// (`packages/coding-agent/src/core/tools/tool-definition-wrapper.ts:14` @v0.83.0) and the loop
+/// hands those same tools to the stream verbatim (`tools: context.tools`,
+/// `packages/agent/src/agent-loop.ts:301` @v0.83.0). So a declaration made on the tool MUST be
+/// visible on the `Context.tools` entry the provider receives.
+///
+/// The loop used to hardcode `constrained_sampling: None` here, which made the entire opt-in path
+/// unreachable: `cyrup_provider::utils::constrained_sampling` could never see a config, and a
+/// `strict: "require"` declaration — which upstream FAILS the request when the model cannot honor
+/// it — silently degraded to an ordinary unconstrained tool call.
+#[tokio::test]
+async fn prov011_a_tools_constrained_sampling_declaration_reaches_the_provider() {
+    use cyrup_core::{ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants};
+
+    let declared = ConstrainedSampling::Config(ConstrainedSamplingConfig::Grammar {
+        variants: GrammarVariants {
+            openai_lark: Some("start: /[a-z]+/".into()),
+            openai_regex: None,
+        },
+    });
+    let opting = DeclaringTool::new("opting", Some(declared.clone()));
+    // pi's explicit opt-OUT literal, which must survive as `false` rather than collapse to absent —
+    // `constrainedSampling: false` round-trips through `wrapToolDefinition` unchanged.
+    let opting_out = DeclaringTool::new("opting_out", Some(ConstrainedSampling::Disabled(false)));
+    // A tool that declares nothing: its entry must stay absent, or "forwarding" would be
+    // indistinguishable from stamping a constant onto every tool.
+    let silent = DeclaringTool::new("silent", None);
+
+    let (_faux, inner) =
+        faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sf: Arc<dyn StreamFn> = Arc::new(RecordingStreamFn { inner, captured: captured.clone() });
+    let agent = Agent::builder(model_ref(), sf)
+        .tools(vec![opting, opting_out, silent])
+        .build();
+
+    agent.prompt("go").await.unwrap();
+    agent.wait_for_idle().await;
+
+    let reqs = captured.lock().unwrap();
+    assert_eq!(reqs.len(), 1);
+    let tools = &reqs[0].tools;
+    // Presence before absence: if the tool set never made it into the request at all, the
+    // `is_none()` assertion below would pass vacuously.
+    assert_eq!(tools.len(), 3, "all three tools reached the request");
+    let find = |n: &str| {
+        tools.iter().find(|t| t.name == n).unwrap_or_else(|| panic!("tool {n} in Context.tools"))
+    };
+
+    assert_eq!(
+        find("opting").constrained_sampling.as_ref(),
+        Some(&declared),
+        "the grammar declaration reached Context.tools verbatim"
+    );
+    assert_eq!(
+        find("opting_out").constrained_sampling.as_ref(),
+        Some(&ConstrainedSampling::Disabled(false)),
+        "pi's `false` literal survives as `false`, not as absent"
+    );
+    assert!(
+        find("silent").constrained_sampling.is_none(),
+        "a tool that declares nothing keeps the field absent"
+    );
+}
