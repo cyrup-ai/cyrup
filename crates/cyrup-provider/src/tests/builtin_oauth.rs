@@ -120,6 +120,42 @@ fn wiring_oauth_keeps_the_api_key_strategy() {
     }
 }
 
+/// The runtime halves must not drift from the strategies that are actually wired.
+///
+/// `GitHubCopilotOAuth` and `OpenAiCodexOAuth` are no longer what [`crate::all_providers`] carries
+/// — `GitHubCopilotLogin` / `OpenAiCodexOAuthFlow` are, and they only *delegate* `refresh`/
+/// `to_auth` to the runtime halves. Two `is_subscription` bodies now stand for one upstream
+/// `isSubscription: true`, so this pins that they answer alike: editing the runtime half alone (the
+/// mistake the old "this impl is the one the provider's `ProviderAuth` actually carries" doc
+/// invited) changes nothing `/login` observes, and this test says so out loud.
+#[test]
+fn runtime_oauth_halves_agree_with_the_wired_strategies() {
+    for (id, runtime) in [
+        (
+            "github-copilot",
+            Arc::new(crate::providers::github_copilot::GitHubCopilotOAuth::new())
+                as Arc<dyn crate::auth::OAuthAuth>,
+        ),
+        (
+            "openai-codex",
+            Arc::new(crate::providers::openai_codex::OpenAiCodexOAuth::new())
+                as Arc<dyn crate::auth::OAuthAuth>,
+        ),
+    ] {
+        let wired = oauth_by_id(id).unwrap_or_else(|| panic!("{id} oauth"));
+        assert_eq!(
+            wired.is_subscription(),
+            runtime.is_subscription(),
+            "{id}: the wired strategy and the delegated runtime half disagree on isSubscription"
+        );
+        assert_eq!(
+            wired.name(),
+            runtime.name(),
+            "{id}: the wired strategy and the delegated runtime half disagree on name"
+        );
+    }
+}
+
 /// PROV-029 — `/login` must REACH the ported flows.
 ///
 /// `github-copilot` and `openai-codex` wired the *runtime half* of their upstream OAuth object

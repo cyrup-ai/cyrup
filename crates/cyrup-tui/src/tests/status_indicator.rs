@@ -308,3 +308,98 @@ fn summarization_retry_writes_the_error_but_not_the_countdown() {
     assert!(!sb.contains("Retrying"), "countdown leaked to scrollback:\n{sb}");
     assert!(buf_text(&app).contains("Retrying (2/3)"), "retry band missing");
 }
+
+// ============================================ TUI-030 — WorkingIndicatorOptions resolution ====
+//
+// Coverage for the `setWorkingIndicator` options bag, NOT the seam proof: `WorkingIndicator` did
+// not exist before the fix, so these cannot go red against the unfixed tree. The tests that
+// genuinely fail without it live in `crate::tests::extension_working_indicator`, which drives the
+// real `LiveHostServices` → effect-sink → `App::apply_ui_effect` path.
+
+/// `pi/packages/tui/src/components/loader.ts:64-69` @v0.84.2 resolution, field by field. Every pi
+/// line in this section and the next is that tag, NOT this file's older @v0.83.0 cites.
+#[test]
+fn working_indicator_options_resolve_exactly_as_pis_loader_does() {
+    use crate::{WorkingIndicator, SPINNER_INTERVAL};
+    use serde_json::json;
+
+    let theme = UiTheme::dark();
+    let text = |ind: &StatusIndicator, ms: u64| -> String {
+        line_text(&ind.lines_at(Duration::from_millis(ms), &theme, None)[1])
+    };
+
+    // `frames` absent ⇒ DEFAULT_FRAMES, but `intervalMs` still honoured (`:66-67`).
+    let mut ind = StatusIndicator::new();
+    ind.working();
+    ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"intervalMs": 200}))));
+    assert!(text(&ind, 0).contains(SPINNER_FRAMES[0]), "absent `frames` keeps the Braille set");
+    assert!(text(&ind, 199).contains(SPINNER_FRAMES[0]), "…advancing on the extension's clock");
+    assert!(text(&ind, 200).contains(SPINNER_FRAMES[1]), "…not the built-in 80 ms");
+    assert_eq!(ind.spinner_period(), Duration::from_millis(200), "the run-loop tick follows too");
+
+    // `intervalMs: 0` is falsy upstream (`indicator?.intervalMs && > 0`, `:67`) ⇒ the 80 ms default.
+    let mut ind = StatusIndicator::new();
+    ind.working();
+    ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"intervalMs": 0}))));
+    assert_eq!(ind.spinner_period(), SPINNER_INTERVAL, "`0` means unset, not instant");
+
+    // A two-frame list cycles; a one-frame list never animates (`:74-76`).
+    let mut ind = StatusIndicator::new();
+    ind.working();
+    ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": ["A", "B"]}))));
+    assert!(text(&ind, 0).contains(" A "), "frame 0");
+    assert!(text(&ind, 80).contains(" B "), "frame 1 at the default interval");
+    ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": ["S"]}))));
+    assert!(text(&ind, 0).contains(" S ") && text(&ind, 4_000).contains(" S "), "static frame");
+
+    // `frames: []` ⇒ no glyph AND no glyph-trailing space; the message keeps the paddingX inset.
+    let mut ind = StatusIndicator::new();
+    ind.working();
+    ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": []}))));
+    assert_eq!(text(&ind, 0), " Working... ", "`frames: []` hides the indicator entirely");
+
+    // A custom indicator applies to the WORKING band only (`interactive-mode.ts:2112`, `:3116-3120`).
+    let mut ind = StatusIndicator::new();
+    ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": ["A"]}))));
+    ind.set(IndicatorKind::Compaction, None);
+    assert!(
+        !text(&ind, 0).contains(" A "),
+        "compaction keeps the built-in spinner: [{}]",
+        text(&ind, 0)
+    );
+    assert!(text(&ind, 0).contains(SPINNER_FRAMES[0]));
+}
+
+/// `resetExtensionUI`'s working block (`interactive-mode.ts:2210-2218`), including the one place
+/// upstream ever suffixes a working message — and it says "to interrupt", not "to cancel".
+#[test]
+fn reset_extension_working_state_restores_the_defaults_and_pis_interrupt_suffix() {
+    use crate::WorkingIndicator;
+    use serde_json::json;
+
+    let theme = UiTheme::dark();
+    let mut ind = StatusIndicator::new();
+    ind.set_working_message(Some("mine".to_string()));
+    ind.set_working_indicator(Some(WorkingIndicator::from_json(&json!({"frames": ["A"]}))));
+    ind.set_working_visible(false, true);
+    ind.working();
+    assert_eq!(ind.kind(), IndicatorKind::Idle, "fixture: hidden while an extension owns it");
+
+    // Reset with the band DOWN: defaults come back and the next turn mounts a plain band.
+    ind.reset_extension_working_state(Some("escape"));
+    ind.working();
+    let msg = line_text(&ind.lines_at(Duration::ZERO, &theme, None)[1]);
+    assert!(msg.contains("Working..."), "visibility + message restored: [{msg}]");
+    assert!(!msg.contains(" A "), "the custom frame is gone: [{msg}]");
+    assert!(msg.contains(SPINNER_FRAMES[0]), "the built-in spinner is back: [{msg}]");
+
+    // Reset with the band UP: upstream re-messages the LIVE loader with the interrupt suffix.
+    let mut live = StatusIndicator::new();
+    live.working();
+    live.reset_extension_working_state(Some("escape"));
+    let msg = line_text(&live.lines_at(Duration::ZERO, &theme, None)[1]);
+    assert!(
+        msg.contains("Working... (escape to interrupt)"),
+        "pi's `:2213-2217` copy, and it is `to interrupt`, not `to cancel`: [{msg}]"
+    );
+}

@@ -34,10 +34,17 @@
 //!
 //! On non-Unix targets there is no direct `SIGINT`/`SIGTERM` process-group equivalent; per
 //! R-SA-059's own fallback clause and the workspace convention already established by
-//! `cyrup_tools::ops::local::terminate_pid`/`send_sigterm_tree`, the "graceful" stages become
-//! best-effort no-ops that report `false` (nothing was actually sent) so callers can skip the
-//! pointless grace wait, and the final stage falls back to `tokio::process::Child::start_kill`
-//! (the platform's closest force-terminate primitive) with the same overall timing shape.
+//! `cyrup_tools::ops::local::terminate_pid`, the "graceful" stages become best-effort no-ops that
+//! report `false` (nothing was actually sent) so [`terminate`] skips the pointless grace wait —
+//! sitting out a stage's full grace period waiting for a reaction to a signal that was never sent
+//! is pure latency with a zero chance of paying off. The final stage is NOT allowed the same
+//! excuse: it is the rung the whole ladder exists to guarantee, so non-Unix runs upstream's own
+//! win32 tree kill — `taskkill /F /T /PID <pid>`, the `/T` being the flag that reaches descendants
+//! (pi `killProcessTree`, `packages/coding-agent/src/utils/shell.ts:200-212` @v0.83.0) — before
+//! falling back to `tokio::process::Child::start_kill`. `start_kill` ALONE would be a silent
+//! divergence, not a graceful degradation: it is `TerminateProcess` against the direct pid only,
+//! where the Unix arm deliberately goes through [`send_signal`] → `kill(-pgid, SIGKILL)` against
+//! the whole process group precisely so the child's descendants die with it.
 //!
 //! This module is defined directly against `tokio::process::Child` and takes no dependency on
 //! `crate::spawn::mod`'s not-yet-implemented `SpawnedChild`/`ChildSpawnSpec` types — `spawn/mod.rs`
@@ -209,9 +216,12 @@ pub async fn terminate_with_graces(
     cancel: &CancelToken,
     graces: EscalationGraces,
 ) -> std::io::Result<TerminationOutcome> {
-    // Stage 1: SIGINT, raced against the SIGINT grace and `cancel`.
-    send_sigint(&child);
-    if let Some(status) = race_wait(&mut child, graces.sigint, cancel).await? {
+    // Stage 1: SIGINT, raced against the SIGINT grace and `cancel`. The grace is skipped outright
+    // when nothing was actually sent (non-Unix, or the child was already reaped out-of-band so it
+    // has no pid left to signal) — see [`send_sigint`]: waiting out a grace period for a reaction
+    // to a signal that was never delivered cannot succeed, it only delays the rung that can.
+    let sigint_grace = grace_if_sent(send_sigint(&child), graces.sigint);
+    if let Some(status) = race_wait(&mut child, sigint_grace, cancel).await? {
         return Ok(TerminationOutcome {
             signal_name: signal_name_of(&status),
             status,
@@ -219,9 +229,10 @@ pub async fn terminate_with_graces(
         });
     }
 
-    // Stage 2: SIGTERM, raced against the SIGTERM grace and `cancel`.
-    send_sigterm(&child);
-    if let Some(status) = race_wait(&mut child, graces.sigterm, cancel).await? {
+    // Stage 2: SIGTERM, raced against the SIGTERM grace and `cancel` — same skip-if-nothing-was-sent
+    // rule as stage 1.
+    let sigterm_grace = grace_if_sent(send_sigterm(&child), graces.sigterm);
+    if let Some(status) = race_wait(&mut child, sigterm_grace, cancel).await? {
         return Ok(TerminationOutcome {
             signal_name: signal_name_of(&status),
             status,
@@ -292,8 +303,9 @@ pub async fn terminate_on_timeout_with_grace(
     grace: Duration,
 ) -> std::io::Result<std::process::ExitStatus> {
     // Rung 1: SIGTERM, raced against the hard-kill timer only — a timeout path has no grace period
-    // left to honor beyond the one upstream itself arms.
-    send_sigterm(child);
+    // left to honor beyond the one upstream itself arms, and none at all when the SIGTERM was never
+    // actually sent (non-Unix; see [`send_sigterm`]).
+    let grace = grace_if_sent(send_sigterm(child), grace);
     tokio::select! {
         biased;
         result = child.wait() => return result,
@@ -324,41 +336,87 @@ async fn race_wait(
     }
 }
 
+/// The grace period a stage should actually wait, given whether that stage's signal was really
+/// sent: the stage's own grace when it was, and [`Duration::ZERO`] when it was not.
+///
+/// A stage that sent nothing has nothing to wait for — no signal was delivered, so no reaction can
+/// arrive, and the wait is pure latency in front of the rung that CAN end the child. This is the
+/// same rule (and the same `Ok(false)` "nothing was sent" convention it keys off) that
+/// `cyrup_tools::ops::local::terminate_pid` states for its own callers, which gate their grace wait
+/// on the returned bool exactly this way (`ops/local.rs:898,904`).
+///
+/// The `wait()` itself is still raced even against a ZERO grace rather than skipped outright: a
+/// child that has ALREADY exited must be reported at the rung it actually died on, and `race_wait`
+/// is `biased` with `child.wait()` first, so a ready exit status wins over a zero-length timer.
+const fn grace_if_sent(sent: bool, grace: Duration) -> Duration {
+    if sent { grace } else { Duration::ZERO }
+}
+
 /// Send `SIGINT` to the child — and to its process group when it leads one, see [`send_signal`]
-/// — (R-SA-059 stage 1). Best-effort on non-Unix: there is no portable
-/// `SIGINT`-equivalent primitive for an arbitrary child process there, so this is a no-op and the
-/// escalation proceeds straight to the (also best-effort) `SIGTERM` stage after paying out its
-/// own grace period — a slightly longer overall wait than the Unix path, but never a skipped
-/// stage, since [`terminate`]'s caller-facing contract (stage timing) is a floor, not a ceiling.
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn send_sigint(child: &Child) {
+/// — (R-SA-059 stage 1). Returns whether a REAL signal was actually sent.
+///
+/// `false` means nothing was delivered at all: either this is a non-Unix target (there is no
+/// portable `SIGINT`-equivalent primitive for an arbitrary child process there — Windows'
+/// `GenerateConsoleCtrlEvent` reaches only console groups this detached child is not in), or the
+/// child had already been reaped out-of-band and has no pid left to signal. [`terminate`] gates
+/// this stage's grace period on that bool ([`grace_if_sent`]): paying out a full ~1000ms waiting
+/// for a reaction to a signal nobody sent is latency with a zero chance of paying off, which on
+/// Windows previously cost two of the ladder's three rungs in pure delay.
+fn send_sigint(child: &Child) -> bool {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
             send_signal(pid, nix::sys::signal::Signal::SIGINT);
+            return true;
         }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        false
     }
 }
 
 /// Send `SIGTERM` to the child — and to its process group when it leads one, see [`send_signal`]
-/// — (R-SA-059 stage 2). Best-effort on non-Unix, matching [`send_sigint`]'s rationale.
-#[cfg_attr(not(unix), allow(unused_variables))]
-fn send_sigterm(child: &Child) {
+/// — (R-SA-059 stage 2). Returns whether a REAL signal was actually sent, with exactly
+/// [`send_sigint`]'s meaning and exactly its grace-skipping consequence.
+fn send_sigterm(child: &Child) -> bool {
     #[cfg(unix)]
     {
         if let Some(pid) = child.id() {
             send_signal(pid, nix::sys::signal::Signal::SIGTERM);
+            return true;
         }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child;
+        false
     }
 }
 
-/// Force-terminate the child (R-SA-059 stage 3: `SIGKILL` on Unix, `tokio::process::Child::
-/// start_kill`'s platform primitive — `TerminateProcess` — on non-Unix). Unlike the two graceful
-/// stages above, this one is NOT allowed to be a true no-op on any platform: it is the one
-/// escalation rung the whole ladder exists to guarantee eventually fires, so non-Unix falls back
-/// to tokio's own portable `start_kill` rather than another best-effort signal send. On Unix this
-/// too targets the process group when the child leads one ([`send_signal`]) — a pid-only `SIGKILL`
-/// here is what would otherwise leak the child's entire descendant subtree.
+/// Force-terminate the child and, with it, its whole descendant subtree (R-SA-059 stage 3:
+/// `SIGKILL` to the process group on Unix, `taskkill /F /T /PID` on non-Unix). Unlike the two
+/// graceful stages above, this one is NOT allowed to be a no-op — or a narrower kill — on any
+/// platform: it is the one escalation rung the whole ladder exists to guarantee eventually fires,
+/// and the SUBTREE is the thing it must reach.
+///
+/// On Unix that means [`send_signal`]'s `kill(-pgid, SIGKILL)` whenever the child leads its own
+/// group, which a [`crate::spawn::SpawnedChild`] always does. On non-Unix it means upstream's own
+/// win32 tree kill — pi `killProcessTree` runs
+/// `spawn("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore", detached: true,
+/// windowsHide: true })` (`packages/coding-agent/src/utils/shell.ts:200-212` @v0.83.0), the `/T`
+/// being precisely the tree flag — fire-and-forget, exactly as upstream leaves it, since the
+/// `child.wait()` in [`terminate_with_graces`] is what actually confirms the death.
+///
+/// `tokio::process::Child::start_kill` still runs afterward as the backstop, but it is NOT the
+/// tree kill and must never be mistaken for one: it is `TerminateProcess` against the DIRECT pid
+/// only, so on its own it reaps the re-exec'd `cyrup` child and orphans everything that child
+/// spawned (the bash-tool command, `cargo`/`npm`/`git`, any nested subagent) into processes
+/// nothing holds a handle to — inside a worktree the caller is about to treat as safe to clean up.
+/// It is also the whole story on the Unix path when the pid is already gone.
 pub(crate) fn send_sigkill(child: &mut Child) {
     #[cfg(unix)]
     {
@@ -367,11 +425,42 @@ pub(crate) fn send_sigkill(child: &mut Child) {
             return;
         }
     }
-    // Either non-Unix, or the pid was already unavailable (child already reaped out-of-band) —
-    // fall back to tokio's own portable kill primitive. `start_kill` is idempotent against an
-    // already-exited child (returns `Ok(())` or a benign `InvalidInput`, per tokio's own docs),
-    // so ignoring its result here is deliberate, not a swallowed real failure.
+    #[cfg(not(unix))]
+    {
+        if let Some(pid) = child.id() {
+            // Fire-and-forget, mirroring upstream's `spawn(...)` (never a blocking `output()`):
+            // the confirmation of death is the caller's own `child.wait()`, not this command's
+            // exit code, and `taskkill` failing (the tree already gone) is the benign, expected
+            // race — the same one the Unix arm swallows as `ESRCH`.
+            let _ = std::process::Command::new("taskkill")
+                .args(win32_tree_kill_argv(pid))
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn();
+        }
+    }
+    // Either non-Unix (where the tree kill above has already gone out and this is the direct-pid
+    // backstop), or the pid was already unavailable (child already reaped out-of-band) — fall back
+    // to tokio's own portable kill primitive. `start_kill` is idempotent against an already-exited
+    // child (returns `Ok(())` or a benign `InvalidInput`, per tokio's own docs), so ignoring its
+    // result here is deliberate, not a swallowed real failure.
     let _ = child.start_kill();
+}
+
+/// The exact argv pi's `killProcessTree` passes to `taskkill` on win32
+/// (`packages/coding-agent/src/utils/shell.ts:204` @v0.83.0:
+/// `["/F", "/T", "/PID", String(pid)]`), and the in-workspace twin of
+/// `cyrup_tools::ops::local::kill_process_tree`'s `not(unix)` arm (`ops/local.rs:458-459`).
+///
+/// `/T` is the load-bearing flag and the reason this is a named function rather than an inline
+/// array: it is what makes the kill reach the child's DESCENDANTS, which is the entire behavioural
+/// difference between stage 3 and a bare `TerminateProcess`. Compiled on Unix too — but only under
+/// `cfg(test)` — so the ported literal is pinned by a test on every platform, not just the one
+/// platform that runs it.
+#[cfg(any(not(unix), test))]
+fn win32_tree_kill_argv(pid: u32) -> [String; 4] {
+    ["/F".to_string(), "/T".to_string(), "/PID".to_string(), pid.to_string()]
 }
 
 /// Send `signal` to the child via `nix::sys::signal::kill`, swallowing the result.
@@ -492,8 +581,105 @@ mod tests {
 
     /// A generous stage-1 grace for the tests whose claim is "this child dies at rung 1", so the
     /// claim is not silently also a bet that the OS reaps it inside the production 1000ms.
-    #[cfg(unix)]
     const GENEROUS: Duration = Duration::from_secs(30);
+
+    /// The two graceful rungs must REPORT whether they actually sent anything, and the ladder must
+    /// gate that rung's grace period on the answer.
+    ///
+    /// Before the fix `send_sigint`/`send_sigterm` had a `#[cfg(unix)]` body and NO `not(unix)`
+    /// counterpart at all, so on Windows they compiled to empty functions that returned `()` —
+    /// indistinguishable, at the call site, from a signal that really went out. `terminate` then
+    /// paid out the full 1000ms and 3500ms grace periods waiting for a reaction to two signals that
+    /// were never sent: 4.5s of pure latency in front of the only rung that can end the child
+    /// there. The bool is what makes "nothing was sent" observable, and [`grace_if_sent`] is what
+    /// acts on it.
+    ///
+    /// Both arms are asserted: on Unix a live child really is signalled (`true`); on non-Unix
+    /// nothing is sent (`false`). The already-reaped case is the one that is `false` on EVERY
+    /// platform — no pid, nothing to signal — so it exercises the skip wiring on this host too.
+    #[tokio::test]
+    async fn graceful_rungs_report_whether_a_signal_was_really_sent_and_gate_their_grace_on_it() {
+        // A genuinely long-lived child on either platform. `timeout.exe` is deliberately NOT used
+        // for the non-Unix leg: it refuses to run at all with stdin redirected, which would make
+        // the "live child" half of this test silently assert against an already-exited process.
+        let mut cmd = if cfg!(unix) {
+            let mut cmd = tokio::process::Command::new("sleep");
+            cmd.arg("30");
+            cmd
+        } else {
+            let mut cmd = tokio::process::Command::new("ping");
+            cmd.args(["-n", "31", "127.0.0.1"]);
+            cmd
+        };
+        cmd.stdin(std::process::Stdio::null());
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+        let mut child = cmd.spawn().expect("the sleeper spawns");
+
+        // A LIVE child: Unix delivers a real signal, non-Unix has no equivalent to deliver.
+        assert_eq!(
+            send_sigint(&child),
+            cfg!(unix),
+            "a live child is really signalled on Unix and really is not on non-Unix — and the \
+             ladder must be told which"
+        );
+        assert_eq!(send_sigterm(&child), cfg!(unix));
+
+        // ...and the grace period follows the report, on whichever platform this runs.
+        assert_eq!(
+            grace_if_sent(send_sigint(&child), GENEROUS),
+            if cfg!(unix) { GENEROUS } else { Duration::ZERO },
+            "a rung that sent nothing must not wait for a reaction to it"
+        );
+
+        // An already-reaped child has no pid to signal on ANY platform: nothing is sent, so no
+        // grace may be paid out. This half of the assertion runs everywhere.
+        send_sigkill(&mut child);
+        let _ = child.wait().await.expect("the sleeper is reaped");
+        assert!(child.id().is_none(), "a reaped child has no pid left to signal");
+        assert!(!send_sigint(&child), "nothing can be sent to a reaped child");
+        assert!(!send_sigterm(&child), "nothing can be sent to a reaped child");
+        assert_eq!(grace_if_sent(send_sigint(&child), GENEROUS), Duration::ZERO);
+        assert_eq!(grace_if_sent(send_sigterm(&child), GENEROUS), Duration::ZERO);
+    }
+
+    /// Stage 3 must kill the SUBTREE on every platform, not just on Unix.
+    ///
+    /// The Unix arm goes through [`send_signal`] → `kill(-pgid, SIGKILL)` specifically so the
+    /// child's descendants die with it. Before the fix the non-Unix arm was `child.start_kill()`
+    /// alone — `TerminateProcess` against the direct pid — which reaps the re-exec'd `cyrup` child
+    /// and ORPHANS everything it spawned into the worktree the caller is about to clean up. This
+    /// pins the ported upstream remedy: pi `killProcessTree` runs `taskkill /F /T /PID <pid>`
+    /// (`shell.ts:200-212` @v0.83.0), and `/T` — the flag whose absence IS the bug — is the whole
+    /// point of the argv.
+    ///
+    /// The argv is compiled (and therefore pinned) on Unix as well as non-Unix, so this assertion
+    /// is not silently skipped on the platform where the suite actually runs.
+    #[test]
+    fn stage_three_targets_the_whole_tree_on_non_unix_via_pis_own_taskkill_argv() {
+        let argv = win32_tree_kill_argv(4242);
+        assert_eq!(
+            argv,
+            ["/F".to_string(), "/T".to_string(), "/PID".to_string(), "4242".to_string()],
+            "stage 3's non-Unix argv is pi `killProcessTree`'s literal, `/T` (tree) included"
+        );
+        assert!(
+            argv.contains(&"/T".to_string()),
+            "dropping /T turns stage 3 back into a direct-pid kill that orphans the subtree"
+        );
+    }
+
+    /// [`grace_if_sent`]'s own contract, in isolation: a sent signal keeps its full grace, an
+    /// unsent one gets none. Mirrors `cyrup_tools::ops::local::terminate_pid`'s `Ok(false)`
+    /// convention and its callers' `if sent { grace } else { Duration::ZERO }` gate.
+    #[test]
+    fn an_unsent_signal_earns_no_grace_period() {
+        assert_eq!(grace_if_sent(true, SIGINT_GRACE), SIGINT_GRACE);
+        assert_eq!(grace_if_sent(true, SIGTERM_GRACE), SIGTERM_GRACE);
+        assert_eq!(grace_if_sent(false, SIGINT_GRACE), Duration::ZERO);
+        assert_eq!(grace_if_sent(false, SIGTERM_GRACE), Duration::ZERO);
+        assert_eq!(grace_if_sent(false, TIMEOUT_SIGTERM_GRACE), Duration::ZERO);
+    }
 
     /// A normal child that traps NOTHING dies to plain `SIGINT` almost immediately — the
     /// escalation must not walk any further than stage 1 in that case, and the OS process must

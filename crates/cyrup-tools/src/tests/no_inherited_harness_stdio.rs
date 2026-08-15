@@ -35,6 +35,11 @@
 //! all three by itself (stdin null, stdout and stderr piped), so it is safe by construction;
 //! `.status()` is deliberately NOT exempt, because it INHERITS stdout and stderr.
 
+// Same allow-set the crate's other test modules carry. Without it `cargo clippy -p cyrup-tools
+// --all-targets` is RED here (the workspace `deny`s `expect`/raw slicing), which a check-only gate
+// never sees because clippy lints do not fire under `cargo check`.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
 use std::path::{Path, PathBuf};
 
 /// The window, in lines, in which a spawn's stdio must be pinned. Generous on purpose: cyrup's

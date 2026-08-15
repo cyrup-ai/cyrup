@@ -4,7 +4,7 @@
 //! PREEMPTED and SURFACED, never crashing the host, WITHOUT needing the `wasm32-wasip2` guest
 //! toolchain. The full component E2E (loading a `cyrup-ext-sdk` guest) is tooling-gated.
 #![cfg(feature = "wasm-host")]
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 use crate::host::testkit;
 use crate::ExtError;

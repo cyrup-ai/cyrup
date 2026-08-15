@@ -129,7 +129,7 @@ impl Tool for RegisteredTool {
     fn render_call(&self, args: &Value) -> Option<String> {
         self.inner.render_call(args)
     }
-    fn render_result(&self, result: &ToolResult) -> Option<String> {
+    fn render_result(&self, result: &Value) -> Option<String> {
         self.inner.render_result(result)
     }
 
@@ -242,8 +242,11 @@ mod tests {
         fn render_call(&self, args: &Value) -> Option<String> {
             Some(format!("call:{args}"))
         }
-        fn render_result(&self, result: &ToolResult) -> Option<String> {
-            Some(format!("result:{}", result.content.len()))
+        fn render_result(&self, result: &Value) -> Option<String> {
+            Some(format!(
+                "result:{}",
+                result.get("content").and_then(|c| c.as_array()).map_or(0, Vec::len)
+            ))
         }
         /// A MUTATING shim: an identity default would be indistinguishable from a dropped
         /// delegation (which is exactly how EXT-023 stayed invisible on the guest side).
@@ -395,7 +398,12 @@ mod tests {
         assert_eq!(w.parameters(), inner.parameters());
         assert_eq!(w.render_call(&serde_json::json!({})), inner.render_call(&serde_json::json!({})));
         assert_eq!(w.render_call(&serde_json::json!({})), Some("call:{}".to_string()));
-        assert_eq!(w.render_result(&ToolResult::default()), Some("result:0".to_string()));
+        assert_eq!(w.render_result(&serde_json::json!({"content": []})), Some("result:0".to_string()));
+        assert_eq!(
+            w.render_result(&serde_json::json!({"content": [{"type": "text"}]})),
+            Some("result:1".to_string()),
+            "the wrapper delegates the payload through unchanged, not a default"
+        );
 
         // A MUTATING `prepare_arguments`: the identity default cannot satisfy this.
         let args = serde_json::json!({"z": 1});

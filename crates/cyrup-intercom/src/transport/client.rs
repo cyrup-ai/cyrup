@@ -946,6 +946,9 @@ mod tests {
     use super::*;
     use crate::transport::protocol::now_ms;
     use crate::transport::target::{BrokerTcpEndpoint, INTERCOM_TCP_HOST};
+    // Only the `#[cfg(unix)]`-gated socket tests below use it; ungated, this one import kept the
+    // whole test target from compiling for Windows.
+    #[cfg(unix)]
     use tokio::net::UnixStream;
 
     /// A bare `ClientInner` with a throwaway writer channel — enough to exercise
@@ -1036,6 +1039,9 @@ mod tests {
         assert_eq!(frame["stateId"], "state-1", "client.ts:284 spreads the TCP endpoint stateId");
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     /// MIRROR (stays green): over a socket target pi spreads `{}` (`client.ts:284`), so `stateId`
     /// must be **absent** from the register frame — not present-and-null, which the broker's
     /// `clientMessage.stateId === BROKER_STATE_ID` comparison would treat identically but which
@@ -1060,6 +1066,9 @@ mod tests {
         assert!(frame.get("stateId").is_none(), "socket registers carry no credential: {frame}");
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     /// ICOM-038 / `v0.10.1 broker/client.ts:39-45,106-141`. A broker that registers and then goes
     /// deaf — it keeps reading, so every write still succeeds and the OS never delivers a close —
     /// is exactly the half-open shape upstream's doc comment names ("stays 'writable' indefinitely,
@@ -1210,6 +1219,9 @@ mod tests {
         assert!(wrx.try_recv().is_err(), "cancel_ask/update_presence must not queue any frame");
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     // dossier item 4 (client.ts:302-304): any message other than `registered`/`error` arriving
     // before the session is registered is a fatal, connection-ending protocol violation.
     // Regression proof: pre-fix, `read_task` processed every message type unconditionally
@@ -1237,6 +1249,9 @@ mod tests {
         assert!(err.contains("before registered"), "error text: {err}");
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     // dossier item 4 (client.ts:312-314): a second `registered` frame after the session is already
     // registered is fatal. Regression proof: pre-fix, the second `Registered` arm just overwrote
     // `session_id` again silently (reg_tx was already consumed) with no error surfaced at all.
@@ -1276,6 +1291,9 @@ mod tests {
         assert!(matches!(disc_evt, InboundEvent::Disconnected(_)));
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     // dossier item 5 (client.ts:242-251): a post-registration reader/protocol error emits a
     // distinct `InboundEvent::Error` BEFORE the eventual `InboundEvent::Disconnected`. Regression
     // proof: pre-fix, `read_task` only ever set a local `close_reason` and broke, so a caller
@@ -1313,6 +1331,9 @@ mod tests {
         assert!(matches!(second_evt, InboundEvent::Disconnected(_)), "{second_evt:?}");
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     // framing.rs dossier item ("frames already reassembled before an oversize frame in the same
     // push() call are discarded"): pi's reader delivers every complete frame found earlier in the
     // same `data` chunk to `onMessage` synchronously, in order, BEFORE it discovers a later oversize
@@ -1390,6 +1411,8 @@ mod tests {
         assert!(matches!(third_evt, InboundEvent::Disconnected(_)), "{third_evt:?}");
     }
 
+    // Only the `#[cfg(unix)]` socket tests below build the fixture sessions it makes.
+    #[cfg(unix)]
     fn test_session_info(id: &str) -> SessionInfo {
         SessionInfo {
             id: id.to_string(),
@@ -1410,6 +1433,9 @@ mod tests {
         }
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     /// Drive `read_task` to a registered state over a socketpair; returns the peer end, an event
     /// receiver, and the two handles the caller must keep alive for the socket to stay open.
     #[allow(clippy::type_complexity)]
@@ -1436,6 +1462,9 @@ mod tests {
         (b, events, (write_half, wrx))
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     // G136(a), client side. pi >= 0.9.0 brokers forward a `message_receipt` to the ORIGINAL SENDER
     // as soon as a route exists (`v0.9.2 broker/broker.ts:812-818`) and send a `message_control` to
     // the RECEIVER on any peer cancel (`:852-860`) or supersede (`:684-688`). Regression proof:
@@ -1525,6 +1554,9 @@ mod tests {
         }
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     // MIRROR for the test above. Modelling the v0.9.2 tag set must not make the reader credulous:
     // a tag from some *later* protocol version is still fatal, exactly as it is upstream
     // (`default: throw new Error(\`Unknown broker message type\`)`, `v0.9.2 broker/client.ts:599-600`,
@@ -1567,6 +1599,9 @@ mod tests {
         }
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     // dossier item 6 (client.ts:235-240): a write-path failure must propagate the real error and
     // tear the connection down, not silently discard it. Regression proof: pre-fix, `writer_task`
     // only ever did `if write_half.write_all(...).is_err() { break; }` with no event emitted and no
@@ -1621,6 +1656,9 @@ mod tests {
         assert!(inner.teardown_started.load(Ordering::SeqCst));
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     // dossier item 3 (client.ts:184-191): a registration timeout must destroy the socket + its
     // background tasks, not leave them running. Regression proof: pre-fix, `connect()` just
     // returned `Err` on timeout without aborting `read_task` or closing the writer, so the broker's

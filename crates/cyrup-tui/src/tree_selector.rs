@@ -577,7 +577,11 @@ impl TreeSelector {
         ];
         let cur = MODES.iter().position(|m| *m == self.filter).unwrap_or(0);
         let next = if forward { (cur + 1) % MODES.len() } else { (cur + MODES.len() - 1) % MODES.len() };
-        self.apply_filter_mode(MODES[next]);
+        // `.get()` rather than `MODES[next]`: the index is already in range by construction (`% len`),
+        // but the workspace denies `clippy::indexing_slicing` and this line was tripping it.
+        if let Some(mode) = MODES.get(next) {
+            self.apply_filter_mode(*mode);
+        }
     }
 
     /// Begin inline label editing on the highlighted entry (`app.tree.editLabel` → `onLabelEdit` →

@@ -189,6 +189,9 @@ mod tests {
         assert_eq!(server.await.unwrap(), INTERCOM_TCP_HOST, "loopback only");
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     /// MIRROR (stays green): the `Socket` arm still opens a Unix domain socket, unchanged.
     #[tokio::test]
     async fn connect_opens_a_unix_socket_for_the_socket_target() {
@@ -240,6 +243,9 @@ mod tests {
         panic!("a just-released ephemeral port was re-bound on all 16 attempts: {:?}", last.map(|r| r.is_ok()));
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     /// The split halves are usable concurrently: a read pending on one half must not block a write
     /// on the other (the property Node's single duplex `net.Socket` gives pi for free).
     #[tokio::test]

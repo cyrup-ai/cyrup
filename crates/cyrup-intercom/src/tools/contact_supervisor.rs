@@ -562,6 +562,37 @@ impl Tool for ContactSupervisorTool {
         "Contact your supervising orchestrator over the intercom: need_decision (blocks for an answer), progress_update (fire-and-forget), or interview_request (blocks for structured answers)."
     }
 
+    /// `label: "Contact Supervisor"` (`v0.10.1 index.ts:1510`). Matches the sibling
+    /// `NativeContactSupervisorTool` (`cyrup-ext-subagents/src/native_supervisor.rs`), which
+    /// registers under the SAME tool name on the native-channel path — the two must not render
+    /// differently depending on which transport delivered the run.
+    fn label(&self) -> Option<&str> {
+        Some("Contact Supervisor")
+    }
+
+    /// `promptSnippet` (`v0.10.1 index.ts:1512`), verbatim. Without it the tool is filtered out of
+    /// the default system prompt's "Available tools" section entirely
+    /// (`tools.filter(name => !!toolSnippets?.[name])`).
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some(
+            "Subagent-only: contact the supervisor for decisions, structured interviews, or \
+             meaningful plan-changing updates. Do not use for routine completion handoffs.",
+        )
+    }
+
+    /// `promptGuidelines` (`v0.10.1 index.ts:1513-1518`), all four bullets verbatim and in
+    /// upstream's order. These are the only place a subagent is told WHICH `reason` to pick, and in
+    /// particular that `need_decision`/`interview_request` block while `progress_update` does not —
+    /// the description alone states the mechanics, not the policy.
+    fn prompt_guidelines(&self) -> Vec<&str> {
+        vec![
+            "Use contact_supervisor with reason='need_decision' when a subagent is blocked, uncertain, needs approval, or faces a product/API/scope decision before continuing.",
+            "Use contact_supervisor with reason='interview_request' when the child needs multiple structured answers from the supervisor in one blocking exchange.",
+            "Use contact_supervisor with reason='progress_update' only for meaningful progress or unexpected discoveries that change the plan.",
+            "Do not use contact_supervisor for routine completion handoffs; return the final subagent result normally.",
+        ]
+    }
+
     async fn execute(
         &self,
         _call_id: ToolCallId,
@@ -579,6 +610,63 @@ impl Tool for ContactSupervisorTool {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+
+    /// The `contact_supervisor` tool's PROMPT SURFACE. `Tool::label`/`prompt_snippet`/
+    /// `prompt_guidelines` all have defaults (`None`/`None`/`Vec::new()`,
+    /// `cyrup-core/src/tool.rs`), so an impl that omits them compiles and reads as complete while
+    /// dropping the tool out of the system prompt entirely.
+    ///
+    /// The four guideline bullets are the ONLY place a subagent is told which `reason` to pick —
+    /// specifically that `need_decision`/`interview_request` BLOCK for an answer while
+    /// `progress_update` does not, and that completion handoffs are not a use for this tool.
+    /// Pinned verbatim against `v0.10.1 index.ts:1509-1519`.
+    #[test]
+    fn the_contact_supervisor_tool_declares_pis_label_snippet_and_four_guidelines() {
+        let tool = ContactSupervisorTool::new(
+            Arc::new(SharedIntercomState::new(
+                crate::config::IntercomConfig::default(),
+                600_000,
+                std::path::PathBuf::from("/w"),
+            )),
+            ChildOrchestratorMetadata {
+                orchestrator_target: "sup".to_string(),
+                orchestrator_session_id: None,
+                run_id: "run-1".to_string(),
+                agent: "worker".to_string(),
+                index: "0".to_string(),
+                session_name: None,
+            },
+        );
+
+        assert_eq!(
+            tool.label(),
+            Some("Contact Supervisor"),
+            "`v0.10.1 index.ts:1510` — and the same label the sibling native-channel tool renders"
+        );
+        assert_eq!(
+            tool.prompt_snippet(),
+            Some(
+                "Subagent-only: contact the supervisor for decisions, structured interviews, or \
+                 meaningful plan-changing updates. Do not use for routine completion handoffs."
+            ),
+            "`v0.10.1 index.ts:1512` verbatim"
+        );
+        assert_eq!(
+            tool.prompt_guidelines(),
+            vec![
+                "Use contact_supervisor with reason='need_decision' when a subagent is blocked, uncertain, needs approval, or faces a product/API/scope decision before continuing.",
+                "Use contact_supervisor with reason='interview_request' when the child needs multiple structured answers from the supervisor in one blocking exchange.",
+                "Use contact_supervisor with reason='progress_update' only for meaningful progress or unexpected discoveries that change the plan.",
+                "Do not use contact_supervisor for routine completion handoffs; return the final subagent result normally.",
+            ],
+            "`v0.10.1 index.ts:1513-1518`, all four bullets in upstream's order"
+        );
+        // func-03 R-03-039: every guideline must name its own tool, so it stays meaningful once the
+        // tool is disabled and the bullet is dropped from the prompt.
+        for bullet in tool.prompt_guidelines() {
+            assert!(bullet.contains("contact_supervisor"), "R-03-039: {bullet}");
+        }
+    }
 
     fn sample_interview(extra_question: Option<serde_json::Value>) -> serde_json::Value {
         let mut questions = vec![serde_json::json!({

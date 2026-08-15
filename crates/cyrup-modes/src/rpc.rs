@@ -433,8 +433,9 @@ fn notify_kind_str(kind: NotifyKind) -> &'static str {
 /// `pendingExtensionRequests`, since no response is ever awaited (Pi's own comment: "Fire and forget -
 /// no response needed"). Returns `None` for `SetHeader`/`SetFooter`/`SetToolsExpanded` — Pi's real RPC
 /// mode never forwards THOSE three over the wire either ("not supported in RPC mode - requires TUI
-/// access" / "no TUI", rpc-mode.ts:209-215,296-298); [`run_rpc`]'s effect-drain arm below only writes
-/// out when this returns `Some`.
+/// access" / "no TUI", rpc-mode.ts:209-215,296-298) — and, for the identical upstream reason, for the
+/// four working-indicator effects (`rpc-mode.ts:179-193` @v0.84.2); see their arm below. [`run_rpc`]'s
+/// effect-drain arm below only writes out when this returns `Some`.
 pub(crate) fn extension_ui_effect_json(effect: &UiEffect) -> Option<Value> {
     Some(match effect {
         // Pi `notify(message, type)` → `{method:"notify", message, notifyType}` (rpc-mode.ts:149-157).
@@ -513,6 +514,25 @@ pub(crate) fn extension_ui_effect_json(effect: &UiEffect) -> Option<Value> {
         }),
         // Intentionally no wire shape — see this function's doc.
         UiEffect::SetHeader { .. } | UiEffect::SetFooter { .. } | UiEffect::SetToolsExpanded { .. } => {
+            return None;
+        }
+        // TUI-030, the working-indicator family — NOT forwarded, and that is upstream's own
+        // decision, not an omission. Pi's RPC `createExtensionUIContext` gives all four EMPTY
+        // bodies (`modes/rpc/rpc-mode.ts:179-193` @v0.84.2 — every line in this arm is that tag,
+        // NOT the @v0.83.0 the rest of this function cites; the block moved by one line between
+        // them): "Working message not supported in RPC
+        // mode - requires TUI loader access" (`:180`), the same for visibility (`:184`) and the
+        // indicator (`:188`), and "Hidden thinking label not supported in RPC mode - requires TUI
+        // message rendering access" (`:192`). There is no `RpcExtensionUIRequest` method for any of
+        // them to ride, and inventing one would put a cyrup-only verb on a wire pi's clients parse.
+        //
+        // This is a deliberate `None`, spelled out because a silent omission HERE would be the same
+        // defect this fix closes one layer out: the four now reach the interactive TUI, and an RPC
+        // client that saw nothing would have no way to tell "dropped by design" from "never wired".
+        UiEffect::SetWorkingMessage { .. }
+        | UiEffect::SetWorkingVisible { .. }
+        | UiEffect::SetWorkingIndicator { .. }
+        | UiEffect::SetHiddenThinkingLabel { .. } => {
             return None;
         }
     })

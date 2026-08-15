@@ -13,11 +13,6 @@ use std::sync::Arc;
 /// The notify-only subscriber handed to the agent (arch-08 §3.1).
 pub struct ExtSubscriber {
     dispatcher: Arc<Dispatcher>,
-    /// The subscriber-lifetime token. Superseded per-event by the `cancel` argument pi passes to
-    /// every listener (`agent.ts:574` @v0.83.0); kept because [`ExtSubscriber::new`] is public API
-    /// and callers construct with it.
-    #[allow(dead_code)]
-    cancel: CancelToken,
     /// Turn counter mirroring Pi's `AgentSession._turnIndex` (agent-session.ts:302/616/635). The
     /// upstream `AgentEvent::{TurnStart, TurnEnd}` are payload-less, so — exactly like Pi's
     /// `_emitExtensionEvent` — the turn index a `turn_start`/`turn_end` carries is DERIVED in this
@@ -28,8 +23,16 @@ pub struct ExtSubscriber {
 }
 
 impl ExtSubscriber {
-    pub fn new(dispatcher: Arc<Dispatcher>, cancel: CancelToken) -> Self {
-        Self { dispatcher, cancel, turn_index: AtomicU32::new(0) }
+    /// EXT-061: no subscriber-lifetime token. It used to take one, store it behind
+    /// `#[allow(dead_code)]` — the compiler stating the field is never read — under a doc that
+    /// asserted it "stays as the fallback for a caller that hands us a token detached from any
+    /// run". No such fallback existed: [`Self::on_event`] uses only the per-event `cancel`
+    /// argument, and the `allow` is what suppressed the warning that would have shown it. pi has
+    /// no subscriber-lifetime signal either — it passes the run's signal per listener (`await
+    /// listener(event, signal)`, `packages/agent/src/agent.ts:574` @v0.83.0) — so the code matched
+    /// upstream and the doc did not. Removed rather than implemented, which is the port.
+    pub fn new(dispatcher: Arc<Dispatcher>) -> Self {
+        Self { dispatcher, turn_index: AtomicU32::new(0) }
     }
 }
 
@@ -38,9 +41,7 @@ impl EventSubscriber for ExtSubscriber {
     /// `cancel` is the run's abort signal, the second argument pi passes to every listener
     /// (`await listener(event, signal)`, `packages/agent/src/agent.ts:574` @v0.83.0) — a FRESH
     /// child of the run token, so it is what a dispatched handler should race against rather than
-    /// the subscriber-lifetime token captured at construction. The captured
-    /// [`ExtSubscriber::cancel`] stays as the fallback for a caller that hands us a token detached
-    /// from any run.
+    /// a token captured at construction — which is why this type keeps none (EXT-061).
     async fn on_event(&self, event: &AgentEvent, cancel: CancelToken) {
         // Maintain the Pi turn counter BEFORE the subscription gate so the index stays correct even
         // when the intervening events have no subscribers (Pi agent-session.ts:615-635). `agent_start`

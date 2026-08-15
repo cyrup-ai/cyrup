@@ -2,8 +2,14 @@
 //!
 //! **Mechanism divergence.** pi calls `crypto.subtle.digest("SHA-256", data)`
 //! (`ai/src/auth/oauth/pkce.ts:29`) — an ambient Web Crypto API that exists in Node and the
-//! browser alike. Rust has no ambient crypto, and `cyrup-provider`'s manifest carries no hashing
-//! dependency, so the digest is implemented here from FIPS 180-4. The output is byte-identical:
+//! browser alike. Rust has no ambient crypto, so the digest is implemented here from FIPS 180-4.
+//!
+//! (This module predates the `ring` entry in `Cargo.toml`, so the old claim here that the manifest
+//! "carries no hashing dependency" is no longer true — `ring::digest::SHA256` is reachable. The
+//! hand-rolled implementation is kept because it is pinned against five published vectors below
+//! and swapping it is a mechanism change nobody asked for; the note is corrected so a maintainer
+//! is not told a dependency is missing when it is not. Contrast `random.rs`, which DID have to
+//! move to `ring` because its second arm was functionally broken.) The output is byte-identical:
 //! the tests pin the two FIPS 180-4 example vectors plus the RFC 7636 PKCE vector, so a
 //! divergence from `crypto.subtle` cannot pass.
 

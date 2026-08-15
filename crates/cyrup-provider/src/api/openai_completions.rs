@@ -290,6 +290,8 @@ fn reasoning_effort(level: ModelThinkingLevel) -> Option<&'static str> {
 /// Test-only convenience wrapper for [`build_body_with_env`] with no env overlay (the request path
 /// uses [`build_body_with_env`] directly so it can forward the provider-scoped env).
 #[cfg(test)]
+// Test-only fixture wrapper: the deny-list allowance the crate's `mod tests` blocks carry.
+#[allow(clippy::expect_used)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
     build_body_with_env(model, ctx, opts, None)
         .expect("fixture declares no unsatisfiable constrained sampling")

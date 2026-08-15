@@ -1,7 +1,8 @@
 //! The dispatch engine (arch-08 §6.1): subscription-gated, deterministic load-order, block/mutate
-//! chaining. Holds extensions in load order plus an aggregate subscription bitset so an event with
-//! zero subscribers returns in a single branch — no serialization, no boundary crossing
-//! (R-08-034 / R-ARCH-EXT-014). Every guest call is fault-contained (R-08-036): a trap, OOM, epoch
+//! chaining. Holds extensions in load order and ORs their current subscription bitsets on demand so
+//! an event with zero subscribers returns after a handful of `u64` tests — no serialization, no
+//! boundary crossing (R-08-034 / R-ARCH-EXT-014; the aggregate is recomputed rather than frozen at
+//! load so a late `subscribe` is honoured — EXT-058). Every guest call is fault-contained (R-08-036): a trap, OOM, epoch
 //! timeout, or panic is logged and never crashes the host. On most kinds the handler is then
 //! SKIPPED and the chain continues (fail OPEN); on the fail-CLOSED kinds
 //! ([`EventKind::fails_closed`] — `tool_call`, the permission seam) the fault BLOCKS the action
@@ -45,14 +46,15 @@ pub struct Dispatcher {
     /// `None` on a bare dispatcher built outside an `ExtensionHost` (tests), in which case every
     /// drain is a no-op and nothing can be queued anyway.
     bus_drain: RwLock<Option<std::sync::Weak<dyn crate::bus::BusDrain>>>,
+    /// Latch so the "lock poisoned" diagnostic is emitted ONCE rather than on every dispatch
+    /// (poisoning is permanent for the lock's lifetime). See [`Self::note_poisoned`].
+    poison_reported: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Default)]
 struct DispatchInner {
     /// Extensions in deterministic LOAD ORDER (R-08-004).
     exts: Vec<Arc<dyn Extension>>,
-    /// Union of every extension's subscription bitset — the cheap zero-subscriber gate.
-    aggregate: Subscriptions,
 }
 
 impl Default for Dispatcher {
@@ -63,12 +65,7 @@ impl Default for Dispatcher {
 
 impl Dispatcher {
     pub fn new() -> Self {
-        Self {
-            inner: RwLock::new(DispatchInner::default()),
-            budget: DEFAULT_INVOKE_BUDGET,
-            error_listeners: RwLock::new(Vec::new()),
-            bus_drain: RwLock::new(None),
-        }
+        Self::with_budget(DEFAULT_INVOKE_BUDGET)
     }
 
     pub fn with_budget(budget: Duration) -> Self {
@@ -77,6 +74,7 @@ impl Dispatcher {
             budget,
             error_listeners: RwLock::new(Vec::new()),
             bus_drain: RwLock::new(None),
+            poison_reported: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -187,34 +185,83 @@ impl Dispatcher {
         }
     }
 
-    /// Add an extension at the end of the load order and fold its subscriptions into the aggregate.
+    /// Add an extension at the end of the load order.
     pub fn add(&self, ext: Arc<dyn Extension>) -> Result<(), ExtError> {
         let mut g = self.lock_write()?;
-        g.aggregate = g.aggregate.union(*ext.subscriptions());
         g.exts.push(ext);
         Ok(())
     }
 
-    /// Drop every loaded extension and reset the aggregate gate (hot-reload, R-08-005). After this
-    /// the dispatcher has no subscribers; the loader re-adds the freshly-discovered set.
+    /// Drop every loaded extension (hot-reload, R-08-005). After this the dispatcher has no
+    /// subscribers; the loader re-adds the freshly-discovered set.
     pub fn clear(&self) -> Result<(), ExtError> {
         let mut g = self.lock_write()?;
         *g = DispatchInner::default();
         Ok(())
     }
 
-    /// The cheap gate (R-08-034): true iff NO loaded extension subscribes to `kind`. A single
-    /// `bitset & kind` test; callers skip all serialization when this is true.
-    pub fn no_subscribers(&self, kind: EventKind) -> bool {
+    /// The union of every loaded extension's CURRENT subscription bitset (EXT-058).
+    ///
+    /// Computed on demand rather than folded once at [`Self::add`]. The load-time aggregate was a
+    /// process-wide snapshot, so a guest that called the `subscribe` import from a live handler
+    /// (which pi's `api.on` permits — `extensions/loader.ts:252-258` @v0.83.0, re-read at every
+    /// emit) was gated out by [`Self::no_subscribers`] before its own
+    /// [`Extension::subscriptions`] was ever consulted, with no log and no error. The cost is one
+    /// `u64` OR per loaded extension — still O(extensions) with no serialization and no boundary
+    /// crossing, which is what R-08-034 / R-ARCH-EXT-014 actually require.
+    fn aggregate(&self) -> Subscriptions {
         match self.lock_read() {
-            Ok(g) => !g.aggregate.contains(kind),
-            Err(_) => true, // poisoned => behave as if nothing subscribed (never crash)
+            Ok(g) => g
+                .exts
+                .iter()
+                .fold(Subscriptions::empty(), |acc, e| acc.union(e.subscriptions())),
+            Err(_) => {
+                self.note_poisoned();
+                // poisoned => behave as if nothing subscribed (never crash)
+                Subscriptions::empty()
+            }
         }
+    }
+
+    /// Report — ONCE — that the dispatcher's lock is poisoned and every extension event is
+    /// therefore being dropped.
+    ///
+    /// CYRUP-DELTA: pi has no counterpart; JS has no lock poisoning and `runner.ts:806`'s handler
+    /// lookup cannot fail. The fail-soft fallback itself is a legitimate cyrup-original mechanism
+    /// (`bus.rs`/`facade.rs` degrade the same way), but poisoning is PERMANENT for the lock's
+    /// lifetime, so a single panic taken under the write guard turns the whole extension event
+    /// system into a silent, total no-op — indistinguishable from "nobody subscribed". The latch
+    /// keeps the diagnostic off the per-dispatch hot path while making the state observable.
+    fn note_poisoned(&self) {
+        if !self.poison_reported.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            tracing::error!(
+                "extension dispatcher lock poisoned; no extension events will be delivered for \
+                 the rest of this process"
+            );
+        }
+    }
+
+    /// Whether the poisoned-lock diagnostic has already been latched (tests).
+    #[cfg(test)]
+    pub(crate) fn poison_reported(&self) -> bool {
+        self.poison_reported.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The cheap gate (R-08-034): true iff NO loaded extension subscribes to `kind`. Callers skip
+    /// all serialization when this is true.
+    pub fn no_subscribers(&self, kind: EventKind) -> bool {
+        !self.aggregate().contains(kind)
     }
 
     /// Number of loaded extensions (diagnostics/tests).
     pub fn len(&self) -> usize {
-        self.lock_read().map(|g| g.exts.len()).unwrap_or(0)
+        match self.lock_read() {
+            Ok(g) => g.exts.len(),
+            Err(_) => {
+                self.note_poisoned();
+                0
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -224,7 +271,10 @@ impl Dispatcher {
     fn subscribers_for(&self, kind: EventKind) -> Vec<Arc<dyn Extension>> {
         match self.lock_read() {
             Ok(g) => g.exts.iter().filter(|e| e.subscriptions().contains(kind)).cloned().collect(),
-            Err(_) => Vec::new(),
+            Err(_) => {
+                self.note_poisoned();
+                Vec::new()
+            }
         }
     }
 
@@ -486,6 +536,17 @@ impl Dispatcher {
                 }
             }
         }
+    }
+
+    /// Poison the inner lock the only way a lock can be poisoned — a panic taken while the write
+    /// guard is held — so the fail-soft degradation and its latched diagnostic are testable.
+    #[cfg(test)]
+    #[allow(clippy::panic, reason = "a panic under the write guard is the only way to poison it")]
+    pub(crate) fn poison_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _g = self.inner.write();
+            panic!("poisoning the dispatcher lock");
+        }));
     }
 
     fn lock_read(&self) -> Result<std::sync::RwLockReadGuard<'_, DispatchInner>, ExtError> {

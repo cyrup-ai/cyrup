@@ -2940,7 +2940,11 @@ fn message_end_has_tool_call(event: &SubagentEvent) -> bool {
 fn is_sole_structured_output_tool_call(event: &SubagentEvent) -> bool {
     let calls = message_end_tool_calls(event);
     calls.len() == 1
-        && calls[0].get("name").and_then(serde_json::Value::as_str) == Some("structured_output")
+        && calls
+            .first()
+            .and_then(|call| call.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("structured_output")
 }
 
 /// Drive one spawned child to completion, folding every NDJSON line into `progress` (R-SA-027/028)
@@ -4393,7 +4397,15 @@ pub async fn plan_batch(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    // `clippy::panic` joins the three that were already here: a test's `panic!` (and the
+    // `unwrap_or_else(|| panic!(…))` this module uses to report WHICH argv it saw) is its failure
+    // mechanism, not production code. Without it `cargo clippy --all-targets` fails on this module.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
 
     use super::*;
     use crate::exec::acceptance::AcceptanceStatus;

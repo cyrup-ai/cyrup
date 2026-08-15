@@ -94,6 +94,17 @@ impl Tool for FindTool {
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
+        // Pi's FIRST statement inside the executor, before `resolveToCwd`, before `ops.exists`,
+        // before anything: `if (signal?.aborted) { reject(new Error("Operation aborted")); return; }`
+        // (find.ts:142-145). cyrup observed the token for the first time only at the walk loop's
+        // `select!`, so an already-cancelled `find` still paid `fs.metadata(search_root)` AND the
+        // whole `inside_git_repo` ancestor walk — one `metadata` per parent up to the filesystem
+        // root — before it could report the abort. (find.ts has no parameter validation at all, so
+        // "abort first, parse second" is also pi's order.)
+        if cancel.is_cancelled() {
+            return Err(error::aborted());
+        }
+
         let input: FindInput =
             serde_json::from_value(params).map_err(|e| error::invalid(format!("find: {e}")))?;
 
@@ -137,7 +148,22 @@ impl Tool for FindTool {
             if results.len() >= limit {
                 break;
             }
+            // Pi re-tests `signal?.aborted` FIRST on every data path (find.ts:174, :182, :226,
+            // :299, :355), so data can never win a race against an already-fired abort. The
+            // `select!` below only observes a cancel while it is parked on `walk.next()`; one that
+            // lands while the previous entry was being matched is observed here, on the next turn.
+            // The sibling `grep.rs` already carries this guard.
+            if cancel.is_cancelled() {
+                return Err(error::aborted());
+            }
             tokio::select! {
+                // `biased;` — without it `select!` polls in RANDOM order, so with the token
+                // already cancelled AND an entry already buffered the walk arm won half the time
+                // and the tool kept consuming directory entries after Esc: bounded in expectation,
+                // unbounded in the worst case. Pi's abort is deterministic on both edges (the
+                // `{once:true}` listener at find.ts:158-160 rejects the instant the signal fires),
+                // so the cancel arm must be polled first here.
+                biased;
                 _ = cancel.cancelled() => return Err(error::aborted()),
                 item = walk.next() => {
                     match item {

@@ -775,6 +775,24 @@ impl SharedIntercomState {
 
         let timeout = Duration::from_millis(self.ask_timeout_ms);
         tokio::select! {
+            // `biased;` is REQUIRED, not a micro-optimisation. Upstream's waiter is not a race
+            // between three peers: the reply path calls `replyWaiter.resolve(receivedMessage)`
+            // (`v0.10.1 index.ts:922`) which runs `cleanup()` (`:611`) → `clearTimeout(timeout)`
+            // (`:596`) and `removeEventListener("abort", onAbort)` (`:597`) BEFORE resolving. So a
+            // reply that has landed permanently disarms both the deadline and the abort — the
+            // timeout can never fire afterwards, at any load.
+            //
+            // An unbiased `tokio::select!` polls ready arms in RANDOM order, so once the one-shot
+            // already holds the answer AND the deadline has also elapsed (routine on a loaded
+            // runtime: the reply landing does not preempt this task), it picks the timeout arm ~50%
+            // of the time — clearing the waiter, `cancel_ask`ing the edge broker-side, discarding a
+            // delivered answer, and telling the model the peer never replied. Biased polling with
+            // the reply arm first is the only ordering that expresses upstream's disarm.
+            //
+            // Same shape, same fix as the sibling reply-vs-countdown race in
+            // `cyrup-session-svc/src/host_services.rs` (`LiveHostServices::ui_roundtrip`), which
+            // already carries `biased;` with its reply arm first.
+            biased;
             reply = rx => {
                 match reply {
                     Ok(Ok(message)) => Ok(message),
@@ -792,6 +810,18 @@ impl SharedIntercomState {
                         Err(IntercomError::Client("reply waiter cancelled".to_string()))
                     }
                 }
+            }
+            // Second under `biased;`, ahead of the deadline: upstream's `onAbort` runs
+            // SYNCHRONOUSLY inside `abort()` (DOM event dispatch), while the deadline is a macrotask
+            // that can only run at the next timer phase — so an abort raised while the timer is
+            // already due still wins there, and `cleanup()` (`:596`) disarms the timer behind it.
+            // It also keeps the two arms' messages honest: the timeout text asserts "this waiter
+            // timeout is not cancellation", which is a lie to the model on a call that WAS
+            // cancelled.
+            () = cancel.cancelled() => {
+                self.waiter.clear_matching(&question_id);
+                client.cancel_ask(&question_id);
+                Err(IntercomError::Client("Cancelled".to_string()))
             }
             () = tokio::time::sleep(timeout) => {
                 self.waiter.clear_matching(&question_id);
@@ -815,11 +845,6 @@ impl SharedIntercomState {
                      delivered message may still be queued or actionable in the recipient session.",
                     describe_timeout(self.ask_timeout_ms)
                 )))
-            }
-            () = cancel.cancelled() => {
-                self.waiter.clear_matching(&question_id);
-                client.cancel_ask(&question_id);
-                Err(IntercomError::Client("Cancelled".to_string()))
             }
         }
     }
@@ -847,7 +872,7 @@ fn describe_timeout(ask_timeout_ms: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
 
     /// ICOM-017 — `hasSeenInboundMessage` (`v0.10.1 index.ts:532-548`).
@@ -1095,5 +1120,180 @@ mod tests {
     fn inline_reply_attachments_passes_through_when_none() {
         assert_eq!(inline_reply_attachments("no attachments here".to_string(), None), "no attachments here");
         assert_eq!(inline_reply_attachments("empty vec".to_string(), Some(&[])), "empty vec");
+    }
+
+    /// The ask/reply race in [`SharedIntercomState::ask_and_wait_with_reply_to`], driven into the
+    /// exact state the unbiased `select!` decided by coin flip: the reply is ALREADY sitting in the
+    /// one-shot **and** the deadline has ALREADY elapsed when the future is first polled.
+    ///
+    /// Upstream cannot reach this state at all — `replyWaiter.resolve` (`v0.10.1 index.ts:922`)
+    /// runs `cleanup()` → `clearTimeout` (`:596`) before it resolves, so a landed reply permanently
+    /// disarms the deadline. `tokio::select!` without `biased;` polls ready arms in RANDOM order,
+    /// so the timeout arm won ~50% of the time — clearing the waiter, cancelling the ask edge
+    /// broker-side, discarding the peer's delivered answer, and reporting "No reply" to the model.
+    ///
+    /// Determinism, not luck: a gated fake broker holds the `send` ack until the test has put the
+    /// reply in the slot, and `ask_timeout_ms = 0` makes `sleep(0)` ready on the first poll. So
+    /// EVERY iteration reaches the `select!` with both arms already ready.
+    ///
+    /// Pre-fix arithmetic: `select!` picks a uniform start index over its three branches and takes
+    /// the first READY one in that rotation. With the old order `(reply, timeout, cancel)` and only
+    /// `reply`/`timeout` ready, start 0 → reply, start 1 → timeout, start 2 → reply, i.e. the answer
+    /// is dropped 1 time in 3. Over 40 iterations the old code survives with probability
+    /// `(2/3)^40 ≈ 9·10⁻⁸`. After the fix `biased;` makes the reply arm unconditional, so all 40
+    /// must return the peer's message.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_already_delivered_reply_beats_an_already_elapsed_ask_deadline() {
+        use crate::transport::framing::{FrameReader, encode_json};
+        use crate::transport::protocol::{
+            BrokerMessage, MessageContent, SessionInfo, SessionRegistration,
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for attempt in 0..40 {
+            let _dir = tempfile::tempdir().unwrap();
+            // Bound through the broker's own listen abstraction so this proof runs on the
+            // named-pipe arm too, rather than pinning the race to POSIX.
+            #[cfg(unix)]
+            let target = crate::transport::target::BrokerConnectTarget::Socket(
+                _dir.path().join("broker.sock"),
+            );
+            #[cfg(windows)]
+            let target = crate::transport::target::BrokerConnectTarget::Socket(
+                std::path::PathBuf::from(format!(
+                    r"\\.\pipe\cyrup-intercom-askrace-{}-{attempt}",
+                    std::process::id()
+                )),
+            );
+            let mut listener =
+                crate::broker::listener::BrokerListener::bind(&target).await.unwrap();
+
+            // The broker saw the `send` frame; the test may now fill the reply slot.
+            let send_seen = Arc::new(tokio::sync::Notify::new());
+            // The test filled the slot; the broker may now release the `delivered` ack.
+            let ack_gate = Arc::new(tokio::sync::Notify::new());
+            let (broker_send_seen, broker_ack_gate) = (send_seen.clone(), ack_gate.clone());
+
+            let broker = tokio::spawn(async move {
+                let mut stream = listener.accept().await.unwrap();
+                let mut reader = FrameReader::new();
+                let mut buf = vec![0u8; 4096];
+                let mut registered = false;
+                loop {
+                    let n = match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
+                    };
+                    for payload in reader.push(&buf[..n]).unwrap() {
+                        let frame: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        match frame["type"].as_str() {
+                            Some("register") if !registered => {
+                                registered = true;
+                                let out = encode_json(&BrokerMessage::Registered {
+                                    session_id: "self".to_string(),
+                                    features: None,
+                                })
+                                .unwrap();
+                                stream.write_all(&out).await.unwrap();
+                            }
+                            Some("send") => {
+                                let id = frame["message"]["id"].as_str().unwrap().to_string();
+                                // Hand control to the test so the reply lands in the one-shot
+                                // BEFORE `client.send()` resolves — i.e. before the `select!` is
+                                // ever polled.
+                                broker_send_seen.notify_one();
+                                broker_ack_gate.notified().await;
+                                let out = encode_json(&BrokerMessage::Delivered { message_id: id })
+                                    .unwrap();
+                                stream.write_all(&out).await.unwrap();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            });
+
+            let registration = SessionRegistration {
+                runtime_fallback_alias: None,
+                name: None,
+                cwd: "/w".to_string(),
+                model: "m".to_string(),
+                pid: 1u32.into(),
+                started_at: now_ms().into(),
+                last_activity: now_ms().into(),
+                status: None,
+                extra: Default::default(),
+            };
+            let client = Arc::new(
+                IntercomClient::connect_target(&target, registration, Some("self".into()))
+                    .await
+                    .unwrap(),
+            );
+
+            // `ask_timeout_ms = 0` ⇒ `tokio::time::sleep(Duration::ZERO)` is ready on the very
+            // first poll, exactly like a deadline that elapsed while the task was descheduled.
+            let state =
+                Arc::new(SharedIntercomState::new(IntercomConfig::default(), 0, "/w".into()));
+
+            let ask = tokio::spawn({
+                let (state, client) = (state.clone(), client.clone());
+                async move {
+                    state
+                        .ask_and_wait_with_reply_to(
+                            &client,
+                            "peer",
+                            "q1".to_string(),
+                            "are you there?".to_string(),
+                            None,
+                            None,
+                            None,
+                            None,
+                            &cyrup_core::CancelToken::new(),
+                        )
+                        .await
+                }
+            });
+
+            send_seen.notified().await;
+            let reply = crate::transport::protocol::Message {
+                id: "r1".to_string(),
+                timestamp: now_ms().into(),
+                reply_to: Some("q1".to_string()),
+                content: MessageContent { text: "yes".to_string(), ..Default::default() },
+                ..Default::default()
+            };
+            let peer = SessionInfo {
+                id: "peer".to_string(),
+                name: Some("peer".to_string()),
+                runtime_fallback_alias: None,
+                cwd: "/w".to_string(),
+                model: "m".to_string(),
+                pid: 2u32.into(),
+                started_at: 0u64.into(),
+                last_activity: 0u64.into(),
+                status: None,
+                peer_uid: None,
+                trusted_local: None,
+                context_pct: None,
+                context_tokens: None,
+                context_window: None,
+                extra: Default::default(),
+            };
+            assert!(state.waiter.try_deliver(&peer, &reply), "the waiter slot must be armed");
+            ack_gate.notify_one();
+
+            let outcome = ask.await.unwrap();
+            let message = outcome.unwrap_or_else(|e| {
+                panic!(
+                    "attempt {attempt}: a reply already in the slot lost to an already-elapsed \
+                     deadline — the answer was dropped and the ask edge cancelled: {e}"
+                )
+            });
+            assert_eq!(message.id, "r1");
+            assert_eq!(message.content.text, "yes");
+
+            drop(client);
+            broker.abort();
+        }
     }
 }

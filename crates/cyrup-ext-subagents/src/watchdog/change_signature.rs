@@ -184,10 +184,32 @@ fn permission_bits(metadata: &std::fs::Metadata) -> u32 {
     metadata.permissions().mode() & 0o777
 }
 
-/// Non-unix has no mode bits to mask; upstream's `stat.mode` is likewise synthetic there.
+/// Non-unix has no real mode bits to mask; upstream's `stat.mode` is likewise synthetic there, so
+/// the port reproduces the synthesis rather than deriving one of its own — see
+/// [`synthetic_win32_mode`].
 #[cfg(not(unix))]
 fn permission_bits(metadata: &std::fs::Metadata) -> u32 {
-    u32::from(!metadata.permissions().readonly()) * 0o666
+    synthetic_win32_mode(metadata.permissions().readonly())
+}
+
+/// The `stat.mode & 0o777` a Node `fs.Stats` yields on win32, reproduced exactly.
+///
+/// libuv synthesizes `st_mode` on Windows from the read-only attribute alone: `0o100666` for a
+/// writable file and `0o100444` for a read-only one, which masked to `0o777` the way
+/// `hashFileEntry` masks it (`change-signature.ts:77-96`, reading `stat.mode`) gives `0o666` /
+/// `0o444`.
+///
+/// The previous arithmetic form, `u32::from(!readonly) * 0o666`, agreed with that by construction
+/// for the writable case and disagreed for the read-only one — it reported `0`, i.e. a file with NO
+/// permission bits at all, where upstream reports `0o444`. Two literals rather than a bool-to-int
+/// multiplication is the point: the mapping is a pair of ported constants, not a formula, and
+/// nothing about "read-only" arithmetically implies "unreadable".
+///
+/// Compiled on Unix as well as non-Unix, but only under `cfg(test)`, so the ported pair is pinned
+/// by a test on every platform rather than only on the one that runs it.
+#[cfg(any(not(unix), test))]
+const fn synthetic_win32_mode(readonly: bool) -> u32 {
+    if readonly { 0o444 } else { 0o666 }
 }
 
 /// `hashFileEntry` (`change-signature.ts:77-96`).
@@ -583,6 +605,30 @@ mod tests {
         run(&["config", "user.email", "t@example.com"])?;
         run(&["config", "user.name", "t"])?;
         Some(tmp)
+    }
+
+    /// The non-Unix `mode` a file entry contributes to the signature must be the mode Node's
+    /// `fs.Stats` reports on win32, masked the way `hashFileEntry` masks it — `0o666` writable,
+    /// `0o444` read-only.
+    ///
+    /// The read-only half is the one that was wrong: the previous
+    /// `u32::from(!readonly) * 0o666` reported `0`, a mode with no permission bits at all, so a
+    /// read-only file's contribution to the change signature differed from upstream's for the same
+    /// file. It stayed invisible because a signature is only ever compared against another
+    /// signature from the same build — it shows up the moment one crosses builds or platforms, or
+    /// is diffed against pi's for parity verification.
+    ///
+    /// Asserted on every platform (the synthesis is compiled under `cfg(test)` on Unix too), since
+    /// the arm that uses it in production is the one this suite does not run.
+    #[test]
+    fn the_non_unix_mode_is_nodes_own_win32_synthesis() {
+        assert_eq!(synthetic_win32_mode(false), 0o666, "writable: Node reports 0o100666");
+        assert_eq!(synthetic_win32_mode(true), 0o444, "read-only: Node reports 0o100444, not 0");
+        // Both are real permission bits; neither is the empty mode the arithmetic form produced.
+        assert_ne!(synthetic_win32_mode(true), 0);
+        // And both survive `hashFileEntry`'s own `& 0o777` mask unchanged.
+        assert_eq!(synthetic_win32_mode(true) & 0o777, synthetic_win32_mode(true));
+        assert_eq!(synthetic_win32_mode(false) & 0o777, synthetic_win32_mode(false));
     }
 
     #[test]

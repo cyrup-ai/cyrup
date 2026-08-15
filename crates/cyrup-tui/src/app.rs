@@ -74,7 +74,7 @@ use crate::selector::{
 use crate::session_selector::{SessionRow, SessionSelector, SessionSelectorOutcome};
 use crate::settings_selector::{SettingRow, SettingsSelector, TrustSelector};
 use crate::status::StatusLine;
-use crate::status_indicator::{IndicatorKind, StatusIndicator, SPINNER_INTERVAL};
+use crate::status_indicator::{IndicatorKind, StatusIndicator, WorkingIndicator, SPINNER_INTERVAL};
 use crate::escape_reassembly::EscapeReassembler;
 use crate::stray_reply::StrayReplyFilter;
 use crate::terminal_title::session_terminal_title;
@@ -483,6 +483,21 @@ pub struct AppState {
     /// [`App::handle_selector_key`]'s `Cancel` arm take + resolve it. `None` whenever no extension
     /// dialog is open (including every ordinary first-party selector).
     pending_ui_reply: Option<PendingUiReply>,
+    /// The extension-visible mirror of the editor buffer (SEAM-T02) — the cell backing
+    /// `HostServices::editor_text`, i.e. pi's `getEditorText: () =>
+    /// this.editor.getExpandedText?.() ?? this.editor.getText()` (`interactive-mode.ts:2393`
+    /// @v0.84.2). Republished by [`App::publish_extension_readbacks`] on every frame; handed to the
+    /// session's `LiveHostServices` by [`App::install_extension_readbacks`], without which
+    /// `editor_text` keeps the trait default `""` — the shape the read half shipped in, while its
+    /// WRITE half (`set_editor_text`) worked, so a guest's read-modify-write silently discarded its
+    /// own edit. Always present here (an unattached mirror is simply never read).
+    editor_mirror: cyrup_session_svc::EditorTextMirror,
+    /// The live theme seam handed to the session's `LiveHostServices` (SEAM-T01) — pi's four
+    /// `createExtensionUIContext` theme bindings (`interactive-mode.ts:2401-2417` @v0.84.2). `None`
+    /// until a session binds ([`App::install_extension_readbacks`]), and rebuilt on every session
+    /// swap because it holds that session's resource snapshot. Kept here so
+    /// [`App::publish_extension_readbacks`] can republish the active theme name each frame.
+    theme_access: Option<Arc<crate::theme_access::TuiThemeAccess>>,
     /// The `/tree` target the user confirmed, held while the "Summarize branch?" prompt (and, on its
     /// third option, the custom-instructions editor) is open — Pi keeps the same values in the
     /// `entryId` / `wantsSummary` / `customInstructions` locals of its `while (true)` prompt loop
@@ -660,6 +675,8 @@ impl AppState {
                 hyperlinks: false,
             },
             pending_ui_reply: None,
+            editor_mirror: cyrup_session_svc::EditorTextMirror::new(),
+            theme_access: None,
             pending_tree_nav: None,
             terminal_title: None,
             // Off until a session binds and `terminal.showTerminalProgress` is read ([`App::run`]).
@@ -1456,6 +1473,20 @@ impl<B: Backend> App<B> {
         // present a prompt whose reply channel is about to be dropped.
         self.state.overlays.clear();
         self.state.selector = None;
+        // TUI-030 — the working-indicator family, which upstream resets in the SAME function:
+        // `this.workingMessage = undefined; this.workingVisible = true; this.setWorkingIndicator();`
+        // then `this.setHiddenThinkingLabel()` (`interactive-mode.ts:2210-2218` @v0.84.2). Without
+        // this, an extension that hid the working band — or renamed it — would leave the NEXT
+        // session with a band owned by a host that no longer exists: the same class of leak the
+        // header/footer/widget clears above fix.
+        //
+        // Upstream's one extra step is the live band's copy: when the band is currently the working
+        // one it is re-messaged to `"${defaultWorkingMessage} (${keyText("app.interrupt")} to
+        // interrupt)"` (`:2213-2217`) — the ONLY place upstream ever suffixes a working message, and
+        // it says "to interrupt", not the "to cancel" the other three kinds bake in.
+        let interrupt = self.state.keymap.keys_label(Action::Interrupt);
+        self.state.indicator.reset_extension_working_state(interrupt.as_deref());
+        self.state.transcript.set_hidden_thinking_label(None);
     }
 
     pub fn rebind_session(&mut self) {
@@ -1791,6 +1822,11 @@ impl<B: Backend> App<B> {
     where
         B: RebuildBackend,
     {
+        // SEAM-T01/T02 — republish the extension-visible editor buffer and active theme name before
+        // anything is painted, so a guest reading either sees the state this frame is about to
+        // show. One call site because `draw` is the one every run-loop arm that can have changed
+        // them passes through (see [`Self::publish_extension_readbacks`]).
+        self.publish_extension_readbacks();
         // Content-size the inline viewport to the live region (active turn + band + slot + footer),
         // recomputed every frame as content grows/shrinks (ADR-0001 #1, audit #1). The viewport is
         // rebuilt only when its height actually changes so steady-state frames keep their cell-diff.
@@ -1914,6 +1950,10 @@ impl<B: Backend> App<B> {
             // expandable child (`interactive-mode.ts:4032-4046`), so a branch/compaction summary
             // pushed while collapsed still opens when `Ctrl+O` is pressed before it paints.
             tools_expanded: self.state.transcript.tool_expanded(),
+            // TUI-030 — the LIVE `setHiddenThinkingLabel` override, for the same reason
+            // `tools_expanded` is read live here: a reasoning block flushed to scrollback must not
+            // disagree with the one still on screen it was scrolled up from.
+            hidden_thinking_label: Some(self.state.transcript.hidden_thinking_label()),
         };
         let lines: Vec<Line<'static>> = committed
             .iter()
@@ -3682,6 +3722,64 @@ impl<B: Backend> App<B> {
         services.set_ui_effect_sink(effects);
     }
 
+    /// Bind the two INTERACTIVE READ-BACK seams an extension asks the host for — the editor buffer
+    /// (SEAM-T02) and the theme family (SEAM-T01).
+    ///
+    /// Separate from [`Self::install_ui_sinks`] for the reason [`Self::install_overlay_sink`] is:
+    /// these are interactive-only in pi. `getEditorText` and all four theme members are bound only
+    /// inside `createExtensionUIContext` (`interactive-mode.ts:2393`, `:2401-2417` @v0.84.2); every
+    /// other mode gets `noOpUIContext`'s `""` / `[]` / `undefined` /
+    /// `{success: false, error: "UI not available"}` (`core/extensions/runner.ts:253`, `:261-263`)
+    /// or, for RPC, the same answers hard-coded (`modes/rpc/rpc-mode.ts:248-252`, `:290-300`).
+    /// Leaving them unattached elsewhere is what reproduces that, which is why the theme switch
+    /// does NOT ride the `UiEffect` sink RPC also drains.
+    ///
+    /// Both were dead before this call existed: `LiveHostServices` overrode neither `editor_text`
+    /// nor any of `theme`/`theme_list`/`theme_by_name`/`set_theme`, so they took the trait defaults
+    /// in EVERY mode — including this one, and including for WASM guests, since
+    /// `cyrup-ext/src/host/live.rs` forwards `get-editor-text`, `theme-get`, `theme-get-json`,
+    /// `theme-list`, `theme-get-by-name` and `theme-set` to exactly these trait methods.
+    ///
+    /// Must be re-run against every swapped-in session, for the reason [`Self::install_ui_sinks`]
+    /// must — and additionally because [`crate::theme_access::TuiThemeAccess`] holds THAT session's
+    /// resource snapshot, so a `/reload` that discovers a new theme has to rebuild it.
+    pub fn install_extension_readbacks(
+        &mut self,
+        services: &cyrup_session_svc::LiveHostServices,
+        resources: Arc<cyrup_resources::ResourceRegistry>,
+        switch: crate::theme_access::ThemeSwitchSink,
+    ) {
+        services.attach_editor_mirror(self.state.editor_mirror.clone());
+        let access = Arc::new(crate::theme_access::TuiThemeAccess::new(
+            resources,
+            &self.state.theme.name,
+            switch,
+        ));
+        services.attach_theme_access(Arc::clone(&access) as Arc<dyn cyrup_session_svc::ThemeAccess>);
+        self.state.theme_access = Some(access);
+        // Seed both cells before the first extension can ask, rather than waiting for the first
+        // frame: a boot-time `onSessionStart` handler runs before any draw.
+        self.publish_extension_readbacks();
+    }
+
+    /// Republish the state behind the interactive read-back seams (SEAM-T01/T02).
+    ///
+    /// Called from [`Self::draw`], which is the one choke point every run-loop arm that can have
+    /// changed the editor or the theme passes through — the same reasoning that puts
+    /// `flush_terminal_progress` on the frame path. An extension therefore reads the buffer and the
+    /// theme AS DRAWN, which is upstream's guarantee too: pi's getters read the live component the
+    /// same render tree drew.
+    ///
+    /// The editor value is [`crate::InputEditor::expanded_text`], not `text()` — pi hands the
+    /// extension `getExpandedText?.() ?? getText()` (`interactive-mode.ts:2393` @v0.84.2), i.e. with
+    /// `[paste #N …]` markers substituted back to their full content.
+    pub fn publish_extension_readbacks(&mut self) {
+        self.state.editor_mirror.publish(self.state.editor.expanded_text());
+        if let Some(access) = self.state.theme_access.as_ref() {
+            access.publish_active(&self.state.theme.name);
+        }
+    }
+
     /// Bind the INTERACTIVE-OVERLAY seam — Pi's `ctx.ui.custom(factory, { overlay: true, … })`
     /// (`interactive-mode.ts:2719`, the only `showOverlay` consumer upstream has).
     ///
@@ -3824,6 +3922,31 @@ impl<B: Backend> App<B> {
                 if !parsed.lines.is_empty() {
                     self.state.extension_widgets.push(parsed);
                 }
+            }
+            // TUI-030 — the working-indicator family. All four used to be unreachable: the
+            // `HostServices` methods had no `UiEffect` to push, so `LiveHostServices` kept the
+            // trait's empty defaults and an extension calling any of them changed nothing, in
+            // silence. Pi binds every one to real interactive state (`createExtensionUIContext`,
+            // `interactive-mode.ts:2377-2385` @v0.84.2 — every pi line in this arm and in
+            // `reset_extension_ui` is that tag, not this file's older @v0.83.0 cites). The state
+            // itself lives on [`crate::status_indicator::StatusIndicator`] and [`TranscriptView`],
+            // whose setters carry the per-verb citations and the branch logic.
+            UiEffect::SetWorkingMessage { message } => {
+                self.state.indicator.set_working_message(message)
+            }
+            UiEffect::SetWorkingVisible { visible } => {
+                // `this.session.isStreaming` (`interactive-mode.ts:2098`) — cyrup mirrors it on the
+                // status line, set by the `AgentStart`/`AgentEnd` arms.
+                let streaming = self.state.status.streaming;
+                self.state.indicator.set_working_visible(visible, streaming);
+            }
+            UiEffect::SetWorkingIndicator { options } => {
+                self.state
+                    .indicator
+                    .set_working_indicator(options.as_ref().map(WorkingIndicator::from_json));
+            }
+            UiEffect::SetHiddenThinkingLabel { label } => {
+                self.state.transcript.set_hidden_thinking_label(label)
             }
         }
     }
@@ -4997,8 +5120,19 @@ impl<B: Backend> App<B> {
             C::Copy => match session.last_assistant_text().await {
                 Some(text) => {
                     let n = text.chars().count();
-                    copy_to_clipboard(&text);
-                    self.state.transcript.push_status(format!("copied last message ({n} chars)"));
+                    // Pi's `handleCopyCommand` (interactive-mode.ts:6002-6019) wraps the write in a
+                    // `try`: success shows a status, a THROW shows `showError(...)`. Reporting
+                    // "copied" unconditionally is what let the old `#[cfg(not(unix))]` no-op tell a
+                    // Windows user their message was on the clipboard when nothing had been written.
+                    if crate::clipboard::copy_to_clipboard(&text).await {
+                        self.state
+                            .transcript
+                            .push_status(format!("copied last message ({n} chars)"));
+                    } else {
+                        // The message Pi throws when every branch failed (`clipboard.ts:171-173`),
+                        // surfaced through the same error channel as its `showError`.
+                        self.state.transcript.push_error("Failed to copy to clipboard");
+                    }
                 }
                 None => self.state.transcript.push_status("no assistant message to copy"),
             },
@@ -5954,34 +6088,9 @@ fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-/// Copy `text` to the system clipboard best-effort via the platform CLI (`pbcopy` on macOS, `xclip`/
-/// `wl-copy` on Linux). No new dependency and no unsafe — a missing tool is silently ignored
-/// (`handleCopyCommand` clipboard write, interactive-mode.ts:5285). Unix-only.
-#[cfg(unix)]
-fn copy_to_clipboard(text: &str) {
-    use std::io::Write;
-    let candidates: &[(&str, &[&str])] =
-        &[("pbcopy", &[]), ("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
-    for (bin, args) in candidates {
-        let child = std::process::Command::new(bin)
-            .args(*args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if let Ok(mut child) = child {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-            return;
-        }
-    }
-}
-
-/// No-op clipboard write on non-unix targets (the platform CLI tools are unix-only here).
-#[cfg(not(unix))]
-fn copy_to_clipboard(_text: &str) {}
+// The clipboard WRITE lives in [`crate::clipboard`] — Pi's `utils/clipboard.ts` is likewise its own
+// module, and the target-gated pair that used to sit here (a `#[cfg(unix)]` CLI probe beside a
+// `#[cfg(not(unix))]` no-op) is documented there as what it replaced.
 
 /// Read a system-clipboard image and materialize it as a PNG temp file, returning its path (Pi
 /// `readClipboardImage` + the temp-file write of `handleClipboardImagePaste`,
@@ -7229,8 +7338,32 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         let cancel = state.keymap.keys_label(Action::Interrupt);
         state.indicator.render(frame, band_area, &state.theme, cancel.as_deref());
     }
+    // Pi gates the hardware cursor globally — `showHardwareCursor` (`tui.ts:344,389-397`), fed from
+    // the setting at `interactive-mode.ts:1721-1732` — and cyrup parks that flag on the editor
+    // (`editor.rs:277`, "the ONLY component that asks for a cursor position is this editor"), which
+    // was true only because the selector half had never been wired. Read before the borrow below.
+    // …and only while the slot actually holds focus: a floating overlay draws OVER the live region
+    // and captures input, so parking the cursor on a caret the user cannot type into would point at
+    // the wrong thing. Pi ties the same decision to its own z-stack (`if (this.overlayStack.length
+    // === 0) this.terminal.hideCursor()`, `tui.ts:656`).
+    let show_hardware_cursor = state.editor.show_hardware_cursor() && state.overlays.is_empty();
     if let Some(active) = state.selector.as_mut() {
         active.inner.render(frame, slot_area, &state.theme);
+        // The selector half of the hardware cursor. While a selector owns the input slot — an
+        // extension `ui.input` dialog, `/model`, `/resume`'s search — Pi still positions the real
+        // cursor at the typed character, because the focused `Input` inside the dialog emits
+        // `CURSOR_MARKER` and `TUI.extractCursorPosition` finds it in the rendered output
+        // (`tui.ts:1189-1207`, `input.ts:434`). Cyrup drew the reverse-video caret but left the
+        // terminal cursor wherever the previous frame put it, which is what an IME composes
+        // against and what a screen reader follows. [`crate::selector::caret_cell`] is the same
+        // scan over the rendered CELLS; see its doc for why the reversed caret is the marker.
+        if show_hardware_cursor {
+            // Bound the buffer borrow to this statement so `set_cursor_position` can take `frame`.
+            let caret = crate::selector::caret_cell(frame.buffer_mut(), slot_area);
+            if let Some(pos) = caret {
+                frame.set_cursor_position(pos);
+            }
+        }
     } else if let Some(loader) = state.loader.as_ref() {
         // A long inline op (e.g. `/share`'s gist creation) owns the slot with a `BorderedLoader`.
         loader.render(frame, slot_area, &state.theme, state.loader_tick);
@@ -7580,12 +7713,26 @@ impl App<CrosstermBackend<Stdout>> {
         // Re-installed on session swap below, for the same reason `ui_tx` is.
         let (overlay_tx, mut overlay_rx) =
             tokio::sync::mpsc::unbounded_channel::<cyrup_session_svc::OverlayRequest>();
+        // The FIFTH extension seam (SEAM-T01): a guest's `setTheme`. Unlike its `set_*` siblings it
+        // does NOT ride `ui_effect_tx` — RPC mode installs that sink, and pi's RPC `setTheme` is a
+        // hard-coded failure (`modes/rpc/rpc-mode.ts:298-300`), so routing it there would make the
+        // switch succeed in a mode upstream refuses it in. `TuiThemeAccess::set` validates the name
+        // against the session's discovered themes first (pi's `loadTheme` throw,
+        // `theme/theme.ts:622`) and only a RESOLVED theme reaches this channel. Re-installed on
+        // session swap below, for the same reason `ui_tx` is.
+        let (theme_switch_tx, mut theme_switch_rx) =
+            tokio::sync::mpsc::unbounded_channel::<cyrup_resources::Theme>();
         Self::install_ui_sinks(
             &session.services().host_services,
             ui_tx.clone(),
             ui_effect_tx.clone(),
         );
         Self::install_overlay_sink(&session.services().host_services, overlay_tx.clone());
+        self.install_extension_readbacks(
+            &session.services().host_services,
+            Arc::clone(&session.services().resources),
+            theme_switch_tx.clone(),
+        );
         // The open overlay's self-refresh timer, armed from its own `refresh_ms` when it arrives and
         // dropped when the stack empties. `None` means "no ticking overlay is open", which the
         // `select!` arm below expresses as a `pending()` future rather than a spinning interval.
@@ -7808,6 +7955,21 @@ impl App<CrosstermBackend<Stdout>> {
                 }
             };
             tokio::select! {
+                // REQUIRED, not a micro-optimisation — the same statement `cyrup-tools/src/lock.rs:
+                // 178` makes for its own cancel race, and the shape every `select!` in
+                // `cyrup-ext/src/host/live.rs` already uses. Without it tokio picks a READY arm at
+                // random, so a loop iteration in which teardown was requested AND a keystroke,
+                // agent event or ticker is simultaneously ready could service the work arm instead:
+                // one more consumed key, one more drawn frame, one more applied event after the
+                // token fired. It terminates quickly in expectation, but nothing in the code bounds
+                // how much runs after cancellation — and shutdown ordering is exactly what the
+                // token is for. `biased;` makes the cancel arm win every such tie, deterministically.
+                //
+                // Nothing below depends on being polled ahead of the cancel arm: the five ticker
+                // arms are all `if`-guarded and idempotent (a skipped tick is re-armed by
+                // `MissedTickBehavior::Skip`), and every channel arm keeps its message queued for
+                // the next poll. `src/tests/run_loop_cancel_bias.rs` pins this.
+                biased;
                 _ = cancel.cancelled() => break,
                 // The live `!`/`!!` block owns a `Loader` of its own (`bash-execution.ts:55-61`)
                 // with its own `setInterval` (`loader.ts:77-80`), so its spinner animates whether or
@@ -8119,7 +8281,20 @@ impl App<CrosstermBackend<Stdout>> {
                         // `apply_ui_effect`.
                         write_terminal_title(title);
                     }
+                    let reframe = matches!(effect, UiEffect::SetWorkingIndicator { .. });
                     self.apply_ui_effect(effect);
+                    if reframe {
+                        // TUI-030 — pi's `Loader.setIndicator` re-arms its `setInterval` with the
+                        // extension's `intervalMs` (`loader.ts:69` → `:77-80` @v0.84.2). cyrup has
+                        // no timer per indicator: the run loop's single tick IS the animation
+                        // clock, so the
+                        // new period has to replace it here, next to the `SetTitle` write above and
+                        // for the same reason — it is run-loop state `apply_ui_effect` cannot reach.
+                        // Without this a `frames`-heavy indicator with a 40 ms `intervalMs` would
+                        // still only be sampled every 80 ms.
+                        spinner = tokio::time::interval(self.state.indicator.spinner_period());
+                        spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
                     self.draw_synchronized()?;
                 }
                 Some(err) = ext_error_rx.recv() => {
@@ -8157,6 +8332,39 @@ impl App<CrosstermBackend<Stdout>> {
                     // (`interactive-mode.ts:3885-3889`), the same framing the extension `notify`
                     // path uses in `apply_ui_effect`.
                     self.state.transcript.push_warning(format!("Warning: {warning}"));
+                    self.draw_synchronized()?;
+                }
+                Some(theme) = theme_switch_rx.recv() => {
+                    // SEAM-T01 — a guest called `ctx.ui().set_theme(name)` and the name RESOLVED
+                    // (`TuiThemeAccess::set` rejected it otherwise, which is where pi's
+                    // `{success: false, error}` comes from). Pi's handler does two things
+                    // (`interactive-mode.ts:2406-2417` @v0.84.2): `themeController.setThemeName`,
+                    // which repaints, and — guarded on the value actually differing —
+                    // `settingsManager.setTheme(name)`, which persists. Both are done here, and both
+                    // are the SAME pair the `/settings → theme` confirm arm runs
+                    // (`SelectorKind::Theme` in `apply_selection`), so an extension switch and a
+                    // human switch cannot drift apart.
+                    let name = theme.key.as_str().to_string();
+                    // `from_theme_data`, not `UiTheme::builtin`: the listing this name came from is
+                    // the session's whole discovered set, so a file-backed custom theme is
+                    // switchable exactly as upstream's is, and would otherwise silently render as
+                    // `dark` (`UiTheme::builtin`'s unknown-name fallback).
+                    let projected = UiTheme::from_theme_data(&theme.data, 0);
+                    self.set_theme(projected);
+                    // [CYRUP-DELTA] vs `interactive-mode.ts:2412`: upstream guards the persist with
+                    // `if (this.settingsManager.getTheme() !== themeOrName)`. That guard is a pure
+                    // write-avoidance — writing the same value yields the same file — and cyrup
+                    // cannot evaluate it correctly here: the session's `SettingsManager` is a boot
+                    // snapshot that `ApplySetting` does not refresh (its own arm says the effective
+                    // view is re-read on `/reload`), so a stale read would SKIP a write that is
+                    // genuinely needed after an earlier switch. Persisting unconditionally is what
+                    // the human `/settings → theme` confirm arm already does, for the same reason.
+                    self.execute_command(
+                        AppCommand::ApplySetting { id: "theme".to_string(), value: name },
+                        &session,
+                        runtime.as_ref(),
+                    )
+                    .await;
                     self.draw_synchronized()?;
                 }
                 Some(msg) = login_rx.recv() => {
@@ -8221,6 +8429,18 @@ impl App<CrosstermBackend<Stdout>> {
                         events = new_session.subscribe();
                         session = new_session;
                         self.rebind_session();
+                        // TUI-030 — `rebind_session` ran `reset_extension_ui`, whose
+                        // `reset_extension_working_state` drops the outgoing extension's
+                        // `setWorkingIndicator` options (pi's `this.setWorkingIndicator()` with no
+                        // argument, `interactive-mode.ts:2212` @v0.84.2). Upstream that call
+                        // re-arms `Loader`'s own `setInterval` back to `DEFAULT_INTERVAL_MS`
+                        // (`loader.ts:67-69` → `:77-80`); cyrup has no per-indicator timer — the run
+                        // loop's single tick IS the animation clock — so the period has to be
+                        // re-read here, exactly as the `SetWorkingIndicator` effect arm above
+                        // re-reads it. Without this a guest that asked for `intervalMs: 1000` would
+                        // leave the NEXT session's built-in Braille spinner sampled once a second.
+                        spinner = tokio::time::interval(self.state.indicator.spinner_period());
+                        spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                         // Pi re-titles the window from the newly bound session (`bindSession` →
                         // `updateTerminalTitle`, interactive-mode.ts:1761): a `/new`, `/resume` or
                         // `/fork` almost always changes the name, and a swap must never leave the
@@ -8250,6 +8470,17 @@ impl App<CrosstermBackend<Stdout>> {
                         Self::install_overlay_sink(
                             &session.services().host_services,
                             overlay_tx.clone(),
+                        );
+                        // ...and the two read-back seams (SEAM-T01/T02). The theme half additionally
+                        // has to be REBUILT rather than merely re-attached: it answers
+                        // `getAllThemes`/`getTheme` out of the session's resource snapshot, and a
+                        // swap (`/reload` above all) is exactly when a newly discovered theme
+                        // appears — pi re-runs `setRegisteredThemes(resourceLoader.getThemes())` on
+                        // the same events (`interactive-mode.ts:1910`, `:5787`).
+                        self.install_extension_readbacks(
+                            &session.services().host_services,
+                            Arc::clone(&session.services().resources),
+                            theme_switch_tx.clone(),
                         );
                         // ...and the fault listener, whose `ExtensionHost` is likewise brand new on
                         // the swapped-in session (Pi re-binds `onError` from `rebindSession`, and

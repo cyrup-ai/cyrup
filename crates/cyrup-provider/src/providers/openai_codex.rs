@@ -273,8 +273,19 @@ pub fn openai_codex_account_id(access_token: &str) -> Option<String> {
 // The OAuth strategy (pi `auth/oauth/openai-codex.ts:392-460`, minus `login`)
 // ---------------------------------------------------------------------------------------------
 
-/// OpenAI Codex's OAuth strategy: exchange the stored refresh token for a fresh ChatGPT JWT and use
-/// that JWT as the bearer (pi `openaiCodexOAuth`, `auth/oauth/openai-codex.ts:392-460`).
+/// The **runtime half** of OpenAI Codex's OAuth strategy: exchange the stored refresh token for a
+/// fresh ChatGPT JWT and use that JWT as the bearer (pi `openaiCodexOAuth`,
+/// `auth/oauth/openai-codex.ts:392-460`).
+///
+/// **Not the wired strategy.** [`openai_codex_auth`] carries
+/// [`crate::auth::oauth::openai_codex::OpenAiCodexOAuthFlow`], which owns the full upstream object
+/// — the login-method picker, the PKCE browser flow and the device-code alternative, plus
+/// `refresh`/`to_auth`. This type is retained because `OpenAiCodexOAuthFlow` **delegates**
+/// `refresh` and `to_auth` to it (it holds one as its `runtime` field,
+/// `auth/oauth/openai_codex.rs:524`), so those two methods have exactly one implementation.
+/// Nothing reaches this type's own [`OAuthAuth`] impl from `/login`; before PROV-029 this WAS the
+/// wired strategy, and because it leaves `login` on the trait default, `/login openai-codex`
+/// reported `LoginUnsupported` against a fully ported flow.
 ///
 /// `[CYRUP-DELTA]` pi wraps this in `lazyOAuth` (`auth/helpers.ts:38-56`) so the Node-only login
 /// code (`node:http` callback server, `node:crypto` state) stays out of browser bundles. Rust links
@@ -454,8 +465,13 @@ impl OAuthAuth for OpenAiCodexOAuth {
 
     /// `isSubscription: true` — set on both the flow (pi v0.84.1
     /// `auth/oauth/openai-codex.ts:517`) and the provider's `lazyOAuth` wrapper
-    /// (`providers/openai-codex.ts:15`). This impl is the one the provider's [`ProviderAuth`]
-    /// actually carries, so it must answer the same.
+    /// (`providers/openai-codex.ts:15`).
+    ///
+    /// The strategy [`openai_codex_auth`] actually carries is
+    /// [`crate::auth::oauth::openai_codex::OpenAiCodexOAuthFlow`], whose own `is_subscription`
+    /// (`auth/oauth/openai_codex.rs:1040`) is the answer `/login` observes; this one must agree
+    /// with it because both stand for the same upstream object. Changing one without the other is
+    /// the bug this doc used to invite by claiming *this* impl was the wired one.
     fn is_subscription(&self) -> bool {
         true
     }

@@ -101,7 +101,10 @@ fn install_ui_sinks_delivers_all_eight_fire_and_forget_capabilities() {
             UiEffect::SetEditorText { text: "typed".into(), is_paste: false },
             UiEffect::SetToolsExpanded { expanded: true },
         ],
-        "all eight ui.* mutators must reach the interactive run loop"
+        "these eight ui.* mutators must reach the interactive run loop, in call order. TUI-030 \
+         added four more (`setWorkingMessage`/`setWorkingVisible`/`setWorkingIndicator`/\
+         `setHiddenThinkingLabel`); they are covered by `crate::tests::extension_working_indicator`, \
+         which drives them through this same sink to a painted band"
     );
 }
 

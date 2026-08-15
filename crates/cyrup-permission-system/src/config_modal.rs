@@ -346,7 +346,13 @@ impl PermissionSystemSettingsOverlay {
             return OverlayOutcome::Ignored;
         };
         let ring_index = ON_OFF.iter().position(|v| *v == item.current_value).unwrap_or(0);
-        let next_value = ON_OFF[(ring_index + 1) % ON_OFF.len()];
+        // `.get()` rather than `ON_OFF[..]`: the `% len` already makes the index infallible, but
+        // the crate denies `clippy::indexing_slicing` (lib.rs:69) and this line was tripping it.
+        // `ON_OFF` is a non-empty const array, so the fallback is unreachable; it stays on the
+        // item's CURRENT value, which is the inert, non-destructive answer if it ever were not.
+        let Some(&next_value) = ON_OFF.get((ring_index + 1) % ON_OFF.len()) else {
+            return OverlayOutcome::Ignored;
+        };
         let id = item.id;
 
         let next = apply_setting(&self.current, id, next_value);

@@ -35,7 +35,7 @@ pub use hook::{
     apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
 };
 pub use overrides::ResolvedOverride;
-pub use tool_prompts::{PromptContributor, ToolPromptContribution};
+pub use tool_prompts::ToolPromptContribution;
 
 // Re-export the prompt-facing skill pointer projection (defined in cyrup-resources).
 pub use cyrup_resources::SkillPointer;

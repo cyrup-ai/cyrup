@@ -40,6 +40,7 @@ mod auth_select;
 mod autocomplete;
 mod bash;
 mod chrome;
+mod clipboard;
 mod commands;
 mod component;
 mod config_selector;
@@ -79,6 +80,7 @@ mod terminal_query;
 mod terminal_title;
 mod text_input;
 mod theme;
+mod theme_access;
 mod tmux;
 mod transcript;
 mod tree_selector;
@@ -187,7 +189,9 @@ pub use status::{
 };
 pub use text_input::TextInputSelector;
 pub use tree_selector::{FilterMode, TreeEntryRole, TreeKind, TreeNode, TreeSelector};
-pub use status_indicator::{IndicatorKind, StatusIndicator, SPINNER_FRAMES, SPINNER_INTERVAL};
+pub use status_indicator::{
+    IndicatorKind, StatusIndicator, WorkingIndicator, SPINNER_FRAMES, SPINNER_INTERVAL,
+};
 pub use startup::{
     build_startup_lines, display_path, extension_diagnostics, resource_diagnostics,
     DiagnosticCollision, DiagnosticSeverity, StartupDiagnostic, StartupLine, StartupReport,

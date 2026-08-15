@@ -5,6 +5,7 @@ mod bash_session_env;
 mod builtin_tool_order;
 mod cross_registry_mutation_lock;
 mod edit_preview_diff;
+mod find_abort;
 mod grep_context_zero_line_text;
 mod isolation;
 mod no_inherited_harness_stdio;

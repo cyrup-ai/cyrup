@@ -112,20 +112,15 @@ fn run_capture(program: &str, args: &[&str]) -> Option<String> {
     }
 }
 
-/// Guard used by the Tier-1 loader: returns the actionable error if the toolchain is not ready
-/// (R-ARCH-EXT-015) so the live build path is gated cleanly.
-pub fn require_ready(tc: &Toolchain) -> Result<(), ExtError> {
-    if tc.status.is_ready() {
-        Ok(())
-    } else {
-        Err(ExtError::Toolchain(
-            tc.status.actionable().unwrap_or_else(|| "toolchain not ready".into()),
-        ))
-    }
-}
-
-/// Guard used by [`crate::build::build_component`]: a build only needs `cargo` + the `wasm32-wasip2`
-/// target (the linker componentizes directly). Missing optional component tooling does NOT gate.
+/// Guard used by [`crate::build::build_component`] (`build/mod.rs:72`) — the ONLY toolchain guard
+/// on the Tier-1 build path: a build needs `cargo` + the `wasm32-wasip2` target (the linker
+/// componentizes directly). Missing optional component tooling (`wasm-tools`/`cargo-component`,
+/// used for validation/inspection) does NOT gate.
+///
+/// A stricter `require_ready` sibling used to sit here, documented as "the guard used by the Tier-1
+/// loader" — a caller that does not exist: the loader uses this laxer guard, so `require_ready` was
+/// superseded dead code whose doc claimed a reach it did not have. Deleted rather than left for a
+/// reader to trust.
 pub fn require_buildable(tc: &Toolchain) -> Result<(), ExtError> {
     if tc.status.can_build() {
         Ok(())

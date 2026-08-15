@@ -146,11 +146,13 @@ pub struct ExtensionHost {
     /// Upstream hangs `events` on the ONE base `ExtensionAPI` every extension receives; which tier
     /// an extension runs in is not something the coordination channel is allowed to know.
     bus: Arc<crate::bus::SharedBus>,
-    /// The live capability backend the session injected (via [`Self::load_native_with_services`]).
-    /// Threaded into every native dispatch/command ctx so a built-in's `ctx.rich()` reports the
-    /// LIVE idle/trust/usage/model/system-prompt instead of `HostCtxRich::default()` (EXT-005).
-    #[cfg(feature = "wasm-host")]
-    services: RwLock<Option<Arc<dyn crate::host::HostServices>>>,
+    /// The live rich-ctx source every native dispatch/command/shortcut ctx is enriched from
+    /// (EXT-060). Feature-INDEPENDENT, unlike [`Self::services`]: `HostCtxSource` is the read-only
+    /// five-getter slice of the capability backend, so a `--no-default-features` host can attach
+    /// one and its native built-ins read the same live `is_idle`/`is_project_trusted` the shipped
+    /// arm does. Set by [`Self::set_ctx_source`], which
+    /// [`Self::load_native_with_services`] calls for the `wasm-host` path.
+    ctx_source: RwLock<Option<Arc<dyn crate::native::HostCtxSource>>>,
     /// The live `getActiveTools` source the registered-tool wrapper diffs against (Pi
     /// `ExtensionRunner.getActiveTools`, runner.ts:664-667). `None` until a session attaches one
     /// via [`Self::set_active_tool_source`], in which case [`Self::active_tools`] hands tools back
@@ -160,6 +162,25 @@ pub struct ExtensionHost {
     /// every dispatch entry point drains after its subscriber loop — not just the two command-tier
     /// call sites that used to be the only drain.
     fanout: Arc<BusFanout>,
+    /// Tools that carry their OWN `render_call`/`render_result`, keyed by tool name — the SDK half
+    /// of upstream's one renderer map, consulted by [`Self::render_tool_call_outcome`].
+    ///
+    /// Upstream keeps a SINGLE map: `_toolDefinitions` is the built-in table overlaid by a loop
+    /// over `allCustomTools` = `extensionRunner.getAllRegisteredTools()` **followed by** the SDK
+    /// `_customTools` (`core/agent-session.ts:2471-2495` @v0.84.2), and the resolver reads
+    /// `session.getToolDefinition(name)?.renderCall` out of it
+    /// (`modes/interactive/components/tool-execution.ts:84-91`, via `interactive-mode.ts:1996`).
+    /// cyrup's extension tier is keyed in [`ExtensionRegistry`] by the OWNING extension, which a
+    /// plain `Arc<dyn Tool>` has none of, so the two halves cannot share one table here.
+    ///
+    /// **Precedence follows upstream's write order, not the table split.** `_customTools` is spread
+    /// LAST into `allCustomTools` and the loop is a plain `definitionRegistry.set(name, …)`, so on
+    /// a name collision the SDK tool overwrites the extension-registered one — which is why
+    /// [`Self::render_tool_call_outcome`] consults THIS table first and the extension registry
+    /// second.
+    native_tool_renderers: RwLock<std::collections::HashMap<String, Arc<dyn Tool>>>,
+    /// Counts [`Self::invalidate_live`] calls — see [`Self::live_invalidations`].
+    live_invalidations: std::sync::atomic::AtomicU64,
 }
 
 /// The native routing table, shared between the facade and the bus fan-out.
@@ -230,9 +251,10 @@ impl ExtensionHost {
             wasm: None,
             #[cfg(feature = "wasm-host")]
             live,
+            native_tool_renderers: RwLock::new(std::collections::HashMap::new()),
+            live_invalidations: std::sync::atomic::AtomicU64::new(0),
             bus,
-            #[cfg(feature = "wasm-host")]
-            services: RwLock::new(None),
+            ctx_source: RwLock::new(None),
             active_tool_source: RwLock::new(None),
             fanout,
         }
@@ -281,17 +303,26 @@ impl ExtensionHost {
     ) -> Result<(), ExtError> {
         ext.set_host_services(services.clone());
         // Keep the backend so EVERY native dispatch/command ctx can carry live rich fields
-        // (EXT-005), not just the built-ins that stash the Arc themselves.
-        if let Ok(mut g) = self.services.write() {
-            *g = Some(services);
-        }
+        // (EXT-005), not just the built-ins that stash the Arc themselves. It is held as the
+        // feature-independent [`crate::native::HostCtxSource`] slice (EXT-060) — the ONLY thing the
+        // facade ever read the backend for — so the enrichment exists on both arms of `wasm-host`.
+        self.set_ctx_source(Arc::new(crate::native::ServicesCtxSource(services)));
         self.load_native_inner(ext).await
     }
 
-    /// The injected capability backend, if one was supplied (EXT-005).
-    #[cfg(feature = "wasm-host")]
-    fn host_services(&self) -> Option<Arc<dyn crate::host::HostServices>> {
-        self.services.read().ok().and_then(|g| g.clone())
+    /// Attach the live source of the rich `HostCtx` fields (EXT-005/EXT-060). Idempotent; the last
+    /// source wins. [`Self::load_native_with_services`] calls this with the injected
+    /// `HostServices`; a host built WITHOUT `wasm-host` calls it directly, which is the whole point
+    /// of the seam being feature-independent — see [`crate::native::HostCtxSource`].
+    pub fn set_ctx_source(&self, source: Arc<dyn crate::native::HostCtxSource>) {
+        if let Ok(mut g) = self.ctx_source.write() {
+            *g = Some(source);
+        }
+    }
+
+    /// The attached rich-ctx source, if any (EXT-060).
+    fn ctx_source(&self) -> Option<Arc<dyn crate::native::HostCtxSource>> {
+        self.ctx_source.read().ok().and_then(|g| g.clone())
     }
 
     /// The shared native-load body (register tools/commands, build subscriptions, wire into the
@@ -418,9 +449,7 @@ impl ExtensionHost {
             g.insert(id.clone(), ext.clone());
         }
         let ctx = HostCtx::event(self.config.mode, self.config.has_ui, self.config.cwd.clone());
-        let handle = NativeHandle::new(ext, subs, ctx);
-        #[cfg(feature = "wasm-host")]
-        let handle = handle.with_services(self.host_services());
+        let handle = NativeHandle::new(ext, subs, ctx).with_ctx_source(self.ctx_source());
         self.dispatcher.add(Arc::new(handle))?;
         Ok(())
     }
@@ -459,9 +488,8 @@ impl ExtensionHost {
         let ctx = HostCtx::command(self.config.mode, self.config.has_ui, self.config.cwd.clone());
         // Live rich fields for the command ctx too (EXT-005) — a command handler reading
         // `ctx.is_idle()`/`ctx.is_project_trusted()` used to get `HostCtxRich::default()`.
-        #[cfg(feature = "wasm-host")]
-        let ctx = match self.host_services() {
-            Some(svc) => ctx.with_rich(crate::native::rich_from_services(svc.as_ref())),
+        let ctx = match self.ctx_source() {
+            Some(src) => ctx.with_rich(src.rich()),
             None => ctx,
         };
         let fut = std::panic::AssertUnwindSafe(ext.execute_command(&registered, args, &ctx));
@@ -478,8 +506,16 @@ impl ExtensionHost {
     }
 
     /// The ordered-awaited, notify-only subscriber handed to the agent (R-02-012/048).
-    pub fn subscriber(&self, cancel: CancelToken) -> Arc<dyn EventSubscriber> {
-        Arc::new(ExtSubscriber::new(self.dispatcher.clone(), cancel))
+    ///
+    /// EXT-061: `_cancel` is IGNORED, and named so. pi passes the run's signal to each listener at
+    /// the emit (`await listener(event, signal)`, `packages/agent/src/agent.ts:574` @v0.83.0) and
+    /// keeps no subscriber-lifetime token; `ExtSubscriber` correspondingly holds none, and the
+    /// per-event token `EventSubscriber::on_event` receives is what every dispatched handler races
+    /// against. The parameter survives only because the sole caller lives in another crate
+    /// (`cyrup-session-svc/src/builder.rs:1373`); it can be dropped in the same change that
+    /// updates that line.
+    pub fn subscriber(&self, _cancel: CancelToken) -> Arc<dyn EventSubscriber> {
+        Arc::new(ExtSubscriber::new(self.dispatcher.clone()))
     }
 
     /// The mutating hooks adapter handed to the agent (arch-02 §3.3).
@@ -516,8 +552,9 @@ impl ExtensionHost {
 
     /// Re-materialize guest tool descriptors registered after their extension's `init` into
     /// executable `Arc<dyn Tool>` handles (Pi `refreshTools` → `_refreshToolRegistry`,
-    /// agent-session.ts:2452-2546; EXT-004). Returns whether the executable tool set changed, so a
-    /// caller can skip an expensive downstream rebuild (system prompt / active-set push).
+    /// agent-session.ts:2452-2546; EXT-004). Returns whether any tool registration has landed since
+    /// the last call, so a caller can skip an expensive downstream rebuild (system prompt /
+    /// active-set push) when nothing has.
     ///
     /// Cheap when nothing changed: a relaxed atomic load, no lock. Sync on purpose — wrapping a
     /// descriptor is pure bookkeeping, so this is callable from `active_tools` and from a
@@ -526,18 +563,43 @@ impl ExtensionHost {
         if !self.registry.take_tools_dirty() {
             return Ok(false);
         }
-        self.materialize_guest_tools()
+        self.materialize_guest_tools()?;
+        // The FLAG is the answer, not the materializer's own bookkeeping. It is raised by exactly
+        // one thing — a tool registration landing in the registry — and this call has just
+        // consumed it, so the tool set demonstrably changed. Reporting the materializer's
+        // `changed` instead made every registration the materializer does not itself re-wrap read
+        // as "nothing happened": a NATIVE late registration (`register_late_tool` ->
+        // `register_tool`, which lands in the executable `tools` map, not `guest_tools`) always
+        // came back `Ok(false)`, and so did a guest descriptor whose owner was not yet live —
+        // while `take_tools_dirty` is a `swap(false)`, so the signal was consumed and destroyed
+        // with nothing to re-read on a later turn. `AgentSession::refresh_extension_tools`
+        // hard-gates on this bool with no diagnostic (MCP-037a). Upstream cannot express the bug:
+        // `registerTool` ends with an unconditional `runtime.refreshTools()`
+        // (`extensions/loader.ts:245-252` @v0.83.0) and `_refreshToolRegistry` rebuilds the whole
+        // registry every time (`core/agent-session.ts:2452-2546`).
+        Ok(true)
     }
 
-    /// The `wasm-host` half of [`Self::refresh_tools`]: wrap every guest descriptor that has no
-    /// executable counterpart yet into a [`crate::host::WasmTool`] bound to its OWNING live instance.
+    /// The `wasm-host` half of [`Self::refresh_tools`]: wrap every guest descriptor whose owner is
+    /// live into a [`crate::host::WasmTool`] bound to that instance.
+    ///
+    /// EXT-059: every descriptor is re-wrapped, not just the ones with no executable counterpart
+    /// yet. [`crate::ExtensionRegistry::register_guest_tool`] REPLACES the descriptor when its own
+    /// owner re-registers the same name (the documented `dynamic-tools.ts` pattern: same tool,
+    /// changed schema / description / guidelines / `prepare_arguments` / `render_shell` /
+    /// `constrained_sampling`), but [`crate::host::WasmTool`] captured the descriptor BY VALUE at
+    /// first materialization. Skipping on `registry.tool(&name).is_some()` therefore answered
+    /// "already materialized" from a subset of the question — a tool of that name exists — and
+    /// left the model looking at the ORIGINAL parameters for the rest of the session, while
+    /// `registry.tool_info()` (which reads `guest_tools` directly) showed the guest the NEW ones.
+    /// pi holds no such handle: `_refreshToolRegistry` rebuilds `_toolDefinitions`,
+    /// `_toolPromptSnippets`, `_toolPromptGuidelines` and `_toolRegistry` from scratch out of
+    /// `getAllRegisteredTools()` on every refresh, so a stale definition is not representable.
+    /// This is that full rebuild, scoped to the guest half (native tools are already executable
+    /// `Arc<dyn Tool>`s and are never re-derived from a descriptor).
     #[cfg(feature = "wasm-host")]
-    fn materialize_guest_tools(&self) -> Result<bool, ExtError> {
-        let mut changed = false;
+    fn materialize_guest_tools(&self) -> Result<(), ExtError> {
         for (owner, desc) in self.registry.guest_tool_entries()? {
-            if self.registry.tool(&desc.name)?.is_some() {
-                continue;
-            }
             let Some(ext) = self.live.read().ok().and_then(|g| g.get(&owner).cloned()) else {
                 // A descriptor whose owner is not (yet) live: skip it rather than fabricating a
                 // tool that cannot execute. Re-arm so the next refresh retries once it is live.
@@ -552,17 +614,20 @@ impl ExtensionHost {
             // re-arm three lines above — a descriptor whose owner was not yet live was dropped
             // for the rest of the session — plus any mark another extension raised concurrently.
             self.registry.register_materialized_tool(owner, tool)?;
-            changed = true;
         }
-        Ok(changed)
+        Ok(())
     }
 
     /// Native-only build: a native extension's tools are already executable `Arc<dyn Tool>`s
-    /// registered directly into the registry, so "re-materialize" is a no-op — but the dirty flag
-    /// still reports that the set CHANGED, which is what the caller acts on.
+    /// registered directly into the registry, so "re-materialize" is genuinely a no-op. Both arms
+    /// return the SAME thing now (nothing): the two used to disagree about the caller-visible
+    /// `bool` — `Ok(true)` here, `Ok(false)` from the `wasm-host` arm for anything it did not
+    /// itself re-wrap — which is how MCP-037a stayed invisible on the shipped arm (`default =
+    /// ["wasm-host"]`) while the other arm looked correct. The refresh answer now comes from the
+    /// dirty flag in [`Self::refresh_tools`], which is tier-independent.
     #[cfg(not(feature = "wasm-host"))]
-    fn materialize_guest_tools(&self) -> Result<bool, ExtError> {
-        Ok(true)
+    fn materialize_guest_tools(&self) -> Result<(), ExtError> {
+        Ok(())
     }
 
     /// Register a tool AFTER its extension's `init` (Pi `api.registerTool()` called from a live
@@ -844,9 +909,38 @@ impl ExtensionHost {
         self.render_tool_call_outcome(tool_name, call).await.into_option()
     }
 
+    /// Register a tool that supplies its own `render_call`/`render_result` — the SDK half of
+    /// upstream's renderer map. See [`Self::native_tool_renderers`].
+    ///
+    /// Called by `SessionBuilder` for every configured custom tool, mirroring upstream spreading
+    /// `this._customTools` into `allCustomTools` (`core/agent-session.ts:2474-2477` @v0.84.2).
+    /// Registering is unconditional and cheap: `Tool::render_call`/`render_result` default to
+    /// `None`, and a tool that takes both defaults resolves to [`RenderOutcome::None`], i.e. the
+    /// built-in shell — exactly as a definition without a `renderCall` does upstream.
+    pub fn register_native_tool_renderer(&self, tool: Arc<dyn Tool>) {
+        if let Ok(mut g) = self.native_tool_renderers.write() {
+            g.insert(tool.name().to_string(), tool);
+        }
+    }
+
+    /// The registered native tool for `tool_name`, if any.
+    fn native_tool_renderer(&self, tool_name: &str) -> Option<Arc<dyn Tool>> {
+        self.native_tool_renderers.read().ok().and_then(|g| g.get(tool_name).cloned())
+    }
+
     /// [`Self::render_tool_call`] keeping the FAULT distinct from "no renderer" — see
     /// [`RenderOutcome`].
+    ///
+    /// Tiers, in upstream's order (`tool-execution.ts:84-91`; see
+    /// [`Self::native_tool_renderers`] for why the SDK tier is consulted FIRST): the tool's own
+    /// `render_call`, then the extension that registered a renderer for this name. `None` from
+    /// both leaves the caller to draw the built-in shell.
     pub async fn render_tool_call_outcome(&self, tool_name: &str, call: &Value) -> RenderOutcome {
+        if let Some(tool) = self.native_tool_renderer(tool_name)
+            && let Some(text) = tool.render_call(call)
+        {
+            return RenderOutcome::Rendered(Value::String(text));
+        }
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
@@ -866,6 +960,11 @@ impl ExtensionHost {
         tool_name: &str,
         result: &Value,
     ) -> RenderOutcome {
+        if let Some(tool) = self.native_tool_renderer(tool_name)
+            && let Some(text) = tool.render_result(result)
+        {
+            return RenderOutcome::Rendered(Value::String(text));
+        }
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
@@ -1199,10 +1298,27 @@ impl ExtensionHost {
         RenderOutcome::None
     }
 
-    /// Whether ANY extension registered a renderer for this tool name (Pi
-    /// `hasRendererDefinition`, tool-execution.ts:81-112) — the cheap check a UI makes before
+    /// Whether anything outside the built-in table can render this tool name (Pi
+    /// `hasRendererDefinition`, tool-execution.ts:104-106) — the cheap check a UI makes before
     /// paying for a guest round trip.
+    ///
+    /// Covers BOTH non-built-in tiers, because upstream's single `getToolDefinition(name)` lookup
+    /// does: an extension-registered renderer, or a tool that carries its own
+    /// (see [`Self::native_tool_renderers`]). Answering only for the extension tier is what kept
+    /// `Tool::render_call` unreachable — `cyrup_tui::app::extension_render` early-returns on a
+    /// `false` here, so a custom tool's renderer was never invoked even after the resolver knew
+    /// how to call it.
+    ///
+    /// COARSE on the native tier, and deliberately: whether `Tool::render_call` will return
+    /// `Some` cannot be known without calling it, so any registered custom tool answers `true` and
+    /// a tool that overrides neither method costs one resolution returning
+    /// [`RenderOutcome::None`]. Upstream's gate is coarser still — `hasRendererDefinition()` is
+    /// `builtInToolDefinition !== undefined || toolDefinition !== undefined`
+    /// (`tool-execution.ts:104-106`), true for every tool that has a definition at all.
     pub fn has_tool_renderer(&self, tool_name: &str) -> bool {
+        if self.native_tool_renderers.read().is_ok_and(|g| g.contains_key(tool_name)) {
+            return true;
+        }
         self.registry.tool_renderer_owner(tool_name).ok().flatten().is_some()
     }
 
@@ -1729,9 +1845,8 @@ impl ExtensionHost {
             // Live rich fields, exactly as the native COMMAND route does (EXT-005) — a shortcut
             // handler reading `ctx.is_idle()`/`ctx.is_project_trusted()` must not get
             // `HostCtxRich::default()`.
-            #[cfg(feature = "wasm-host")]
-            let ctx = match self.host_services() {
-                Some(svc) => ctx.with_rich(crate::native::rich_from_services(svc.as_ref())),
+            let ctx = match self.ctx_source() {
+                Some(src) => ctx.with_rich(src.rich()),
                 None => ctx,
             };
             ext.execute_shortcut(key, &ctx).await
@@ -1767,13 +1882,45 @@ impl ExtensionHost {
     /// (`agent-session-runtime.ts:167-177`) — and those live in `cyrup-session-svc`
     /// (`AgentSession::dispose_with`, which already documents itself as sitting at exactly pi's
     /// `invalidate` position). This is the one call that seam needs.
+    ///
+    /// Callable on BOTH arms of `wasm-host` (EXT-060): it used to exist only with the Wasmtime host
+    /// compiled in, which would have forced its cross-crate caller to carry a `#[cfg]` on a feature
+    /// of a DEPENDENCY — a seam nobody reaches for is a seam that stays uncalled. Without live
+    /// guests there is nothing to invalidate, so the native-only arm is a genuine no-op.
     #[cfg(feature = "wasm-host")]
     pub fn invalidate_live(&self, reason: Option<String>) {
+        self.live_invalidations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(g) = self.live.read() {
             for ext in g.values() {
                 ext.guest().invalidate(reason.clone());
             }
         }
+    }
+
+    /// Native-only build: no live guest instances exist, so there is nothing to mark stale. See the
+    /// `wasm-host` twin above for the contract.
+    ///
+    /// It still COUNTS — [`Self::live_invalidations`] records that the teardown contract was
+    /// honoured, which is a property of the caller, not of whether a guest happened to be loaded.
+    /// Counting on one arm only would make the seam's own test pass or fail on a feature flag.
+    #[cfg(not(feature = "wasm-host"))]
+    pub fn invalidate_live(&self, _reason: Option<String>) {
+        self.live_invalidations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many times [`Self::invalidate_live`] has run on this host.
+    ///
+    /// The observable for the invalidation seam. Marking a guest stale is otherwise only visible
+    /// THROUGH a live guest (`GuestState::stale_reason`), so on a host with no wasm instances —
+    /// every unit test, and the whole `--no-default-features` build — a caller that forgets to
+    /// invalidate is indistinguishable from one that does. That is exactly how
+    /// `AgentSession::dispose_with` went a long time without invalidating at all. This counts the
+    /// CALL, so the contract can be asserted without standing up a guest.
+    ///
+    /// Monotonic and saturating in practice (it is a `u64` bumped once per teardown); the ordering
+    /// is `Relaxed` because nothing is published through it.
+    pub fn live_invalidations(&self) -> u64 {
+        self.live_invalidations.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Hot reload (`/reload`, R-08-005): emit `session_shutdown{reload}` to the live set, cache-bust

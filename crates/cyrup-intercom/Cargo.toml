@@ -30,9 +30,6 @@ cyrup-ext = { workspace = true }
 cyrup-ext-subagents = { workspace = true }
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "macros", "rt-multi-thread", "signal", "process"] }
 bytes = { workspace = true }
-# `signal` (kill(pid,0) liveness probe) + `process` (setsid; unused today — detach uses the
-# unsafe-free `process_group(0)` mirroring cyrup-ext-subagents' spawn precedent).
-nix = { workspace = true, features = ["signal", "process"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -47,6 +44,15 @@ unicode-width = "0.2"
 # `tracing` is not (yet) a workspace-table dep; cyrup-ext-subagents pins it directly at the same
 # version — matched here rather than introducing a new workspace-wide version surface.
 tracing = "0.1.44"
+
+# `nix` is POSIX-only and will not build for `*-pc-windows-*`. Every use in this crate already sits
+# behind `#[cfg(unix)]` (`broker::runtime_claim::probe_pid`, `transport::spawn::{pid_alive,
+# broker_wait_error}`), so the DEPENDENCY has to be gated too or the crate — and with it the `cyrup`
+# binary, which takes cyrup-intercom as a non-optional dependency — cannot be produced for Windows.
+# `signal` = the kill(pid,0) liveness probe; `process` = setsid (unused today — detach uses the
+# unsafe-free `process_group(0)`, mirroring cyrup-ext-subagents' spawn precedent).
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal", "process"] }
 
 [[bin]]
 # The real-broker-participant test-double `cyrup`-child stand-in (the claim-6 production-activation

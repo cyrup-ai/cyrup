@@ -204,8 +204,8 @@ impl Extension for ErroringGate {
     fn kind(&self) -> ExtKind {
         ExtKind::Native
     }
-    fn subscriptions(&self) -> &Subscriptions {
-        &self.subs
+    fn subscriptions(&self) -> Subscriptions {
+        self.subs
     }
     async fn invoke_event(
         &self,

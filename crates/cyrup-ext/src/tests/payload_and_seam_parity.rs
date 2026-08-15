@@ -40,8 +40,8 @@ impl Extension for CancelledGate {
     fn kind(&self) -> ExtKind {
         ExtKind::Native
     }
-    fn subscriptions(&self) -> &Subscriptions {
-        &self.subs
+    fn subscriptions(&self) -> Subscriptions {
+        self.subs
     }
     async fn invoke_event(
         &self,
@@ -119,8 +119,8 @@ async fn a_real_fault_on_the_fail_closed_seam_still_reports_and_still_names_the_
         fn kind(&self) -> ExtKind {
             ExtKind::Native
         }
-        fn subscriptions(&self) -> &Subscriptions {
-            &self.1
+        fn subscriptions(&self) -> Subscriptions {
+            self.1
         }
         async fn invoke_event(
             &self,
@@ -176,8 +176,8 @@ async fn a_blocking_handler_can_hint_terminate_and_it_survives_the_reduction() {
         fn kind(&self) -> ExtKind {
             ExtKind::Native
         }
-        fn subscriptions(&self) -> &Subscriptions {
-            &self.1
+        fn subscriptions(&self) -> Subscriptions {
+            self.1
         }
         async fn invoke_event(
             &self,

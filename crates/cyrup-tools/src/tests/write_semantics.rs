@@ -19,7 +19,13 @@
 use cyrup_core::{CancelToken, Tool, ToolCallId, ToolUpdate, ToolUpdateSink};
 use crate::ops::local::LocalFs;
 use crate::ops::FsOps;
-use crate::tools::{EditTool, WriteTool};
+// `EditTool` is only reachable from the `#[cfg(unix)]` tests below — every `edit` assertion here
+// needs a unix-only primitive (mode bits, symlinks, hard links, `chmod 0444`), so these gates are
+// load-bearing rather than incidental. The two portable tests (`write_still_creates_new_files_…`,
+// `write_truncates_at_open_…`) are deliberately ungated and DO run on the Windows arm.
+#[cfg(unix)]
+use crate::tools::EditTool;
+use crate::tools::WriteTool;
 use crate::FileMutationLocks;
 use std::sync::Arc;
 

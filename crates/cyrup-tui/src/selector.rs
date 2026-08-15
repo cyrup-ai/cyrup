@@ -80,6 +80,40 @@ pub fn search_input_spans(query: &str, cursor: usize, theme: &UiTheme) -> Vec<Sp
     spans
 }
 
+/// Locate the caret inside an already-rendered selector slot: the first `REVERSED` cell in `area`,
+/// scanning **rows bottom-up** and each row left-to-right, as `(x, y)` screen coordinates.
+///
+/// This is the port of Pi `TUI.extractCursorPosition` (`packages/tui/src/tui.ts:1189-1207`), which
+/// walks the rendered lines from the last one upward looking for the `CURSOR_MARKER` that a focused
+/// `Input` emits at its caret (`components/input.ts:434`: `const marker = this.focused ?
+/// CURSOR_MARKER : ""`) and hands the position to `positionHardwareCursor`. Pi's marker is an
+/// invisible APC string inside the text; cyrup has no text stream to hide a marker in — the frame is
+/// a cell grid — so the marker is the caret CELL ITSELF, written by the single shared
+/// [`search_input_spans`] (`cursor_style = base.add_modifier(REVERSED)`), which is the one and only
+/// producer of a reversed cell inside a selector slot. **Anything new that reverses a cell inside
+/// the input slot must be reconciled with this scan**, exactly as a second `CURSOR_MARKER` emitter
+/// would have to be reconciled with Pi's.
+///
+/// Returns `None` when the slot holds a pure-list selector with no `Input` — the case Pi expresses
+/// as "no component emitted a marker", where it hides the cursor rather than moving it.
+pub(crate) fn caret_cell(buf: &ratatui::buffer::Buffer, area: Rect) -> Option<(u16, u16)> {
+    let bottom = area.y.saturating_add(area.height);
+    let right = area.x.saturating_add(area.width);
+    for y in (area.y..bottom).rev() {
+        for x in area.x..right {
+            // `Buffer::cell` is bounds-checked and returns `None` outside the buffer, so a slot
+            // partially off-screen (a terminal shrunk mid-frame) simply finds nothing.
+            if buf
+                .cell((x, y))
+                .is_some_and(|c| c.modifier.contains(ratatui::style::Modifier::REVERSED))
+            {
+                return Some((x, y));
+            }
+        }
+    }
+    None
+}
+
 /// Split a dialog title/message string on literal `\n` (Pi's `${title}\n${message}` confirm join,
 /// `interactive-mode.ts:2177`) into per-paragraph [`Line`]s, each carrying the same one-space left
 /// pad the single-line title used to (`" {title}"`). Word-wrap of any resulting long paragraph is
@@ -426,10 +460,14 @@ pub trait Selector: Send {
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme);
     /// Route one key through the [`SelectKeymap`], returning the outcome.
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome;
-    /// Cursor position for an embedded search `Input` (none for these pure-list selectors).
-    fn cursor(&self) -> Option<(u16, u16)> {
-        None
-    }
+    // NOTE: there is deliberately no `fn cursor(&self) -> Option<(u16, u16)>` here. It existed as a
+    // defaulted accessor returning `None` that all 13 implementors took and no caller ever read, so
+    // while a selector owned the input slot the terminal's hardware cursor sat wherever the last
+    // frame left it. The hardware cursor is now placed by [`caret_cell`] from the chrome, which
+    // finds the caret in the RENDERED CELLS — Pi's own mechanism (`TUI.extractCursorPosition`,
+    // `tui.ts:1189-1207`, scans the rendered lines for the marker an `Input` emits, `input.ts:434`)
+    // and the reason no per-selector accessor is needed: every selector already draws its caret
+    // through the one shared [`search_input_spans`].
     /// Overwrite the selector's rendered title, if it has one (a no-op default for the selectors
     /// that don't). Used by the extension-UI countdown (Pi's `CountdownTimer`, `countdown-timer.ts:
     /// 7-38`) to live-update an open `ui.{confirm,select,input}` dialog's title with its remaining

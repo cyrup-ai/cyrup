@@ -316,6 +316,8 @@ fn resolve_cache_retention(
 /// Test-only infallible view of [`try_build_params`]: every in-file fixture declares tools whose
 /// `constrainedSampling` is absent, so the resolver cannot fail.
 #[cfg(test)]
+// Test-only fixture wrapper: the deny-list allowance the crate's `mod tests` blocks carry.
+#[allow(clippy::expect_used)]
 pub(crate) fn build_params(
     model: &Model,
     ctx: &Context,

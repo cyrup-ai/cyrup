@@ -76,8 +76,11 @@ pub async fn write_raw_stdout<W: Write>(out: &mut W, text: &str) -> io::Result<(
         return Ok(());
     }
     let mut written = 0usize;
-    while written < bytes.len() {
-        match out.write(&bytes[written..]) {
+    // `.get(written..)` rather than `&bytes[written..]`: `written` never exceeds `bytes.len()`
+    // (it only advances by an accepted count), so the slice was already infallible — but the
+    // workspace denies `clippy::slicing`, and `None` simply ends the loop the bound already ended.
+    while let Some(rest) = bytes.get(written..).filter(|r| !r.is_empty()) {
+        match out.write(rest) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::WriteZero,
@@ -110,7 +113,9 @@ pub async fn flush_raw_stdout<W: Write>(out: &mut W) -> io::Result<()> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+// `indexing_slicing` joins the two already here: the `Flaky` double below slices by a length it
+// just computed with `min`. Without it `cargo clippy -p cyrup-modes --all-targets` is RED.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

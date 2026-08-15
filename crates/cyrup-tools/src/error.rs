@@ -82,6 +82,18 @@ pub(crate) fn io_errno(context: &str, e: &std::io::Error) -> ToolError {
     }
 }
 
+/// [`io_errno`] for a branch where the platform hands back no `io::Error` whose code we can
+/// derive — the code is supplied by the caller instead. The wire shape is IDENTICAL to
+/// [`io_errno`]'s (`CODE: context: display`), so [`errno_code_of`] recovers it the same way and
+/// `edit` still renders Pi's `Error code: ${error.code}` line (edit.ts:332-333).
+///
+/// Used by `LocalFs::access`'s `cfg(not(unix))` arm, where libuv fixes the code (`UV_EPERM`)
+/// rather than reporting an errno — see `crate::ops::local::windows_access_result`.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn io_errno_code(code: &str, context: &str, e: &std::io::Error) -> ToolError {
+    ToolError::new(format!("{code}: {context}: {e}"))
+}
+
 /// Recover the errno code from a message built by [`io_errno`] — Pi's `"code" in error` test
 /// (edit.ts:332). `None` means "this error object has no `code`", which is Pi's `String(error)`
 /// branch.

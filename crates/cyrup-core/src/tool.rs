@@ -165,16 +165,62 @@ pub trait Tool: Send + Sync {
     }
 
     /// Custom rendering of a tool *call* for the UI (Pi `ToolDefinition.renderCall`,
-    /// extensions/types.ts:472-473). The returned string is the rendered representation; `None` =
-    /// the runtime uses its standard call framing (today's behavior).
+    /// `core/extensions/types.ts:488-489` @v0.84.2). The returned string is the rendered
+    /// representation; `None` = the runtime uses its standard call framing.
+    ///
+    /// **This is a live contribution point** — see [`Tool::render_result`] for the resolution
+    /// order it participates in. It is the tier upstream reaches for a tool that is neither a
+    /// built-in nor extension-registered: pi's resolver is
+    /// `toolDefinition.renderCall ?? builtInToolDefinition.renderCall`
+    /// (`modes/interactive/components/tool-execution.ts:84-91` @v0.84.2), where `toolDefinition` is
+    /// `session.getToolDefinition(name)` (`interactive-mode.ts:1996-1998`) reading
+    /// `_toolDefinitions` — a map built from the built-in table OVERLAID with `allCustomTools`,
+    /// which is `extensionRunner.getAllRegisteredTools()` **plus `this._customTools`**, the SDK
+    /// tools handed to `createAgentSession({customTools})` (`core/agent-session.ts:2471-2495`).
+    /// So upstream a plain SDK tool object supplies its own renderer through the very same map an
+    /// extension's does, and this method is that seam in cyrup.
+    ///
+    /// Implementors do not register anything: `SessionBuilder` hands every configured custom tool
+    /// to `ExtensionHost::register_native_tool_renderer`, and the host consults it when no
+    /// extension owns a renderer for the name.
     fn render_call(&self, _args: &serde_json::Value) -> Option<String> {
         None
     }
 
     /// Custom rendering of a tool *result* for the UI (Pi `ToolDefinition.renderResult`,
-    /// extensions/types.ts:475-481). The returned string is the rendered representation; `None` =
-    /// the runtime uses its standard result framing (today's behavior).
-    fn render_result(&self, _result: &ToolResult) -> Option<String> {
+    /// `core/extensions/types.ts:491-497` @v0.84.2). The returned string is the rendered
+    /// representation; `None` = the runtime uses its standard result framing.
+    ///
+    /// # Resolution order
+    ///
+    /// Upstream is `toolDefinition.renderResult ?? builtInToolDefinition.renderResult`
+    /// (`modes/interactive/components/tool-execution.ts:94-101`), i.e. a tool's OWN renderer wins
+    /// over the built-in table keyed by name. cyrup resolves the same three tiers in the same
+    /// order, split across two crates because the built-in tier draws `ratatui` lines rather than
+    /// returning a string:
+    ///
+    /// 1. an extension that registered a renderer for this tool NAME
+    ///    (`ExtensionHost::render_tool_result_outcome` → `registry.tool_renderer_owner`);
+    /// 2. **this method**, via the host's native-tool table
+    ///    (`ExtensionHost::register_native_tool_renderer`) — tiers 1 and 2 are one map upstream
+    ///    (`allCustomTools`, `core/agent-session.ts:2472-2478`);
+    /// 3. the built-in per-name dispatch in `cyrup_tui::transcript::tool_lines`.
+    ///
+    /// # Why `&Value` and not `&ToolResult`
+    ///
+    /// CYRUP-DELTA vs the typed `AgentToolResult` upstream's `renderResult` receives. The renderer
+    /// is resolved at the point of DISPLAY, and by then the result has crossed the session-event
+    /// boundary as `AgentSessionEvent::ToolExecutionEnd { result: serde_json::Value, .. }`
+    /// (`cyrup-session-svc/src/event.rs:143-148`) — [`ToolResult`] is not `Deserialize`, so no
+    /// typed value survives to the seam. Taking the `Value` the seam actually carries is what
+    /// makes this method reachable; taking `&ToolResult` is what kept it dead.
+    ///
+    /// RESIDUAL, shared with tier 1 and NOT introduced here: upstream also passes
+    /// `ToolRenderResultOptions` (`expanded`, `isPartial`), the theme and a `ToolRenderContext`.
+    /// cyrup renders once as the event is folded into the transcript rather than at draw time, so
+    /// neither tier has an expansion state to pass; the extension tier
+    /// (`ExtensionHost::render_tool_result`) has always had the same shape.
+    fn render_result(&self, _result: &serde_json::Value) -> Option<String> {
         None
     }
 
@@ -188,7 +234,7 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -227,7 +273,7 @@ mod tests {
         assert_eq!(t.render_kind(), ToolRenderKind::Default);
         assert!(t.constrained_sampling().is_none());
         assert_eq!(t.render_call(&serde_json::json!({"a": 1})), None);
-        assert_eq!(t.render_result(&ToolResult::default()), None);
+        assert_eq!(t.render_result(&serde_json::json!({"content": []})), None);
         // prepare_arguments is an identity passthrough.
         let args = serde_json::json!({"x": [1, 2, 3]});
         assert_eq!(t.prepare_arguments(args.clone()).await, args);

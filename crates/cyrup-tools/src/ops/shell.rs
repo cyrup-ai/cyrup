@@ -150,6 +150,36 @@ impl ShellConfig {
     ///
     /// Fallible because the Windows arm ends in a throw (shell.ts:100-106) rather than a fallback
     /// (ADR-0003 D4). The unix arm cannot fail: `sh -c` is Pi's terminal fallback (shell.ts:119).
+    /// Pi's Windows no-`shellPath` branch (shell.ts:76-106) with its two `process.env` reads and
+    /// its `where bash.exe` probe hoisted into arguments, so the arm that SHIPS to Windows is
+    /// compiled and unit-tested on every host (`windows_arm_without_bash_errors_with_pis_repair_recipe`
+    /// below). It previously lived inline under `#[cfg(not(unix))]` and its only regression test
+    /// was `#[cfg(not(unix))]` too — a test that had never compiled, let alone run: it mutated
+    /// `std::env` inside an `unsafe` block, which `#![deny(unsafe_code)]` (lib.rs:16) rejects, so
+    /// `cargo check -p cyrup-tools --all-targets --target x86_64-pc-windows-gnu` failed on it.
+    #[cfg_attr(unix, allow(dead_code))]
+    fn windows_detect_from(
+        candidates: &[PathBuf],
+        find_on_path: impl FnOnce() -> Option<PathBuf>,
+    ) -> Result<Self, ToolError> {
+        for cand in candidates {
+            if cand.exists() {
+                return Ok(get_bash_shell_config(cand.clone()));
+            }
+        }
+        if let Some(found) = find_on_path() {
+            return Ok(get_bash_shell_config(found));
+        }
+        // shell.ts:100-106 verbatim, including the `  ${p}`-indented searched-path list.
+        let searched =
+            candidates.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n");
+        Err(ToolError::new(format!(
+            "No bash shell found. Options:\n  1. Install Git for Windows: \
+             https://git-scm.com/download/win\n  2. Add your bash to PATH (Cygwin, MSYS2, \
+             etc.)\n  3. Set shellPath in settings.json\n\nSearched Git Bash in:\n{searched}"
+        )))
+    }
+
     pub fn try_detect() -> Result<Self, ToolError> {
         #[cfg(unix)]
         {
@@ -180,25 +210,7 @@ impl ShellConfig {
             if let Some(pf86) = std::env::var_os("ProgramFiles(x86)") {
                 candidates.push(PathBuf::from(pf86).join("Git").join("bin").join("bash.exe"));
             }
-            for cand in &candidates {
-                if cand.exists() {
-                    return Ok(get_bash_shell_config(cand.clone()));
-                }
-            }
-            if let Some(found) = find_bash_on_path() {
-                return Ok(get_bash_shell_config(found));
-            }
-            // shell.ts:100-106 verbatim, including the `  ${p}`-indented searched-path list.
-            let searched = candidates
-                .iter()
-                .map(|p| format!("  {}", p.display()))
-                .collect::<Vec<_>>()
-                .join("\n");
-            Err(ToolError::new(format!(
-                "No bash shell found. Options:\n  1. Install Git for Windows: \
-                 https://git-scm.com/download/win\n  2. Add your bash to PATH (Cygwin, MSYS2, \
-                 etc.)\n  3. Set shellPath in settings.json\n\nSearched Git Bash in:\n{searched}"
-            )))
+            Self::windows_detect_from(&candidates, find_bash_on_path)
         }
     }
 
@@ -255,7 +267,7 @@ pub fn shell_env(bin_dir: Option<&Path>) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -291,17 +303,25 @@ mod tests {
     /// TOOL-038 / ADR-0003 D4 — on Windows with no Git Bash and no `bash.exe` on PATH, detection
     /// is Pi's hard stop (`shell.ts:100-106`), never a silent `cmd.exe /C` substitution.
     ///
-    /// RED before the fix (the arm returned `cmd.exe` and `try_detect` did not exist); GREEN after.
-    #[cfg(not(unix))]
+    /// This test used to be `#[cfg(not(unix))]` and drove the arm by mutating `std::env` inside an
+    /// `unsafe` block. Two things were wrong with that, and they compounded: it could only ever run
+    /// on a Windows host (this project has none), and it did not COMPILE for one either —
+    /// `#![deny(unsafe_code)]` (lib.rs:16) rejects the block, so
+    /// `cargo check -p cyrup-tools --all-targets --target x86_64-pc-windows-gnu` was RED on it. The
+    /// carefully written regression guard for the arm was therefore worth exactly nothing.
+    /// Driving [`ShellConfig::windows_detect_from`] directly runs the same code on every host and
+    /// drops the global-env mutation (which is UB-adjacent in a threaded test binary, hence the
+    /// `unsafe`) at the same time.
     #[test]
-    fn windows_without_bash_errors_with_pis_repair_recipe() {
-        // SAFETY: single-threaded test; the two variables are read only by `try_detect`.
-        unsafe {
-            std::env::remove_var("ProgramFiles");
-            std::env::remove_var("ProgramFiles(x86)");
-            std::env::set_var("PATH", "");
-        }
-        let err = ShellConfig::try_detect().expect_err("no bash anywhere ⇒ Pi throws");
+    fn windows_arm_without_bash_errors_with_pis_repair_recipe() {
+        // Candidates that cannot exist on any host, so the assertion is about the hard stop rather
+        // than about whether this machine happens to have Git for Windows installed.
+        let candidates = vec![
+            std::env::temp_dir().join("cyrup-no-such-programfiles/Git/bin/bash.exe"),
+            std::env::temp_dir().join("cyrup-no-such-programfiles-x86/Git/bin/bash.exe"),
+        ];
+        let err = ShellConfig::windows_detect_from(&candidates, || None)
+            .expect_err("no bash anywhere ⇒ Pi throws");
         let msg = err.to_string();
         assert!(msg.starts_with("No bash shell found. Options:"), "got: {msg}");
         assert!(msg.contains("1. Install Git for Windows: https://git-scm.com/download/win"));
@@ -309,6 +329,39 @@ mod tests {
         assert!(msg.contains("3. Set shellPath in settings.json"));
         assert!(msg.contains("Searched Git Bash in:"));
         assert!(!msg.contains("cmd.exe"), "cyrup must never name a non-bash interpreter here");
+        for cand in &candidates {
+            assert!(
+                msg.contains(&format!("  {}", cand.display())),
+                "every searched candidate is listed with pi's two-space indent (shell.ts:104), \
+                 missing {cand:?} in: {msg}"
+            );
+        }
+    }
+
+    /// The other two rows of pi's Windows order (shell.ts:76-99), also never covered: an existing
+    /// Git Bash candidate wins over the PATH probe, and the PATH probe wins over the hard stop.
+    /// Both must come back as bash with argv `-c` transport, never a different interpreter.
+    #[test]
+    fn windows_arm_prefers_git_bash_then_path_then_throws() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("bash.exe");
+        std::fs::write(&present, b"#!/bin/sh\n").unwrap();
+        let missing = dir.path().join("nope/Git/bin/bash.exe");
+
+        // Row 1: a candidate that exists short-circuits before the PATH probe ever runs.
+        let cfg = ShellConfig::windows_detect_from(&[missing.clone(), present.clone()], || {
+            panic!("the PATH probe must not run once a Git Bash candidate exists (shell.ts:87-91)")
+        })
+        .unwrap();
+        assert_eq!(cfg.program, present);
+        assert_eq!(cfg.transport, Transport::Argv);
+        assert_eq!(cfg.args, vec!["-c".to_string()]);
+
+        // Row 2: no candidate exists, so `where bash.exe` decides (shell.ts:93-98).
+        let on_path = dir.path().join("from-path-bash.exe");
+        let cfg = ShellConfig::windows_detect_from(&[missing], || Some(on_path.clone())).unwrap();
+        assert_eq!(cfg.program, on_path);
+        assert_eq!(cfg.transport, Transport::Argv);
     }
 
     /// The unix arm is unaffected by TOOL-038: `sh -c` stays Pi's terminal fallback

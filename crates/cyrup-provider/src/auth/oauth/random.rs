@@ -1,36 +1,37 @@
 //! Cryptographic randomness for login flows: PKCE verifiers, `state` nonces and the per-login
 //! callback path.
 //!
-//! **Mechanism divergence.** pi calls the ambient `crypto.getRandomValues`
+//! `[CYRUP-DELTA]` **Mechanism, not behaviour.** pi calls the ambient `crypto.getRandomValues`
 //! (`ai/src/auth/oauth/pkce.ts:24`) and `crypto.randomUUID()` (`openrouter.ts:246`). Rust has no
-//! ambient CSPRNG and `cyrup-provider`'s manifest carries no RNG dependency, so the OS source is
-//! read directly. The generated *values* have the same shape and the same entropy: 32 random
-//! bytes for a verifier, a v4 UUID for the callback path.
+//! ambient CSPRNG, so the draw goes through [`ring::rand::SystemRandom`] — already a direct
+//! dependency of this crate (see the `ring` entry in `Cargo.toml`, and its second use at
+//! `auth/google_adc.rs:383`), so this costs nothing in the dependency graph. The generated
+//! *values* have the same shape and the same entropy: 32 random bytes for a verifier, a v4 UUID
+//! for the callback path.
+//!
+//! **PROV-RANDOM.** This module used to carry a `cfg(unix)` / `cfg(not(unix))` attribute pair: the
+//! unix arm read `/dev/urandom`, and the other arm ignored its buffer and returned
+//! `Entropy("no OS random source is reachable on this platform")` for every input. That arm is
+//! genuinely compiled and shipped on Windows, so `/login` could not complete for ANY provider
+//! there — every flow dies at [`super::pkce::generate_pkce`]. pi has no platform arm at all
+//! (`pkce.ts:19`: "Uses Web Crypto API for cross-platform compatibility"), and neither does this
+//! module any more. Do not reintroduce a fallback arm: `SystemRandom` reaches the OS CSPRNG on
+//! every target this workspace builds for, so there is nothing to fall back *from*, and a login
+//! that silently draws weaker entropy is worse than one that refuses.
 
 use super::OAuthError;
+use ring::rand::SecureRandom as _;
 
-/// Fill `buf` with cryptographically secure random bytes.
+/// Fill `buf` with cryptographically secure random bytes — `crypto.getRandomValues(buf)`
+/// (`pkce.ts:24`).
 ///
-/// On unix this reads `/dev/urandom` — the same source `getrandom(2)` serves, and the source
-/// Node's `crypto.getRandomValues` ultimately draws from.
-#[cfg(unix)]
+/// One body, no platform branch. [`ring::rand::SystemRandom`] resolves to the OS CSPRNG on every
+/// supported target (`getrandom(2)`/`/dev/urandom` on unix, `BCryptGenRandom`/`RtlGenRandom` on
+/// Windows) — the same sources Node's `crypto.getRandomValues` ultimately draws from.
 pub fn fill_random(buf: &mut [u8]) -> Result<(), OAuthError> {
-    use std::io::Read;
-
-    let mut file = std::fs::File::open("/dev/urandom")
-        .map_err(|e| OAuthError::Entropy(format!("/dev/urandom: {e}")))?;
-    file.read_exact(buf)
-        .map_err(|e| OAuthError::Entropy(format!("/dev/urandom: {e}")))
-}
-
-/// Non-unix builds have no dependency-free CSPRNG reachable from this crate, so login is
-/// refused rather than served weak entropy. See this module's `not_done` note: lifting this
-/// needs an RNG entry in `cyrup-provider`'s manifest.
-#[cfg(not(unix))]
-pub fn fill_random(_buf: &mut [u8]) -> Result<(), OAuthError> {
-    Err(OAuthError::Entropy(
-        "no OS random source is reachable on this platform".to_string(),
-    ))
+    ring::rand::SystemRandom::new()
+        .fill(buf)
+        .map_err(|_| OAuthError::Entropy("OS random source unavailable".to_string()))
 }
 
 /// `n` cryptographically secure random bytes.
@@ -78,6 +79,74 @@ mod tests {
     )]
 
     use super::*;
+
+    /// PROV-RANDOM regression, and the reason it needs a *source* assertion.
+    ///
+    /// `fill_random` previously had two bodies: `#[cfg(unix)]` read `/dev/urandom` and returned
+    /// `Ok(())`, while `#[cfg(not(unix))]` ignored its buffer and returned
+    /// `Entropy("no OS random source is reachable on this platform")` for every input. That arm
+    /// is genuinely compiled on Windows, so no `/login` flow for ANY provider could produce a
+    /// PKCE verifier there. A behavioural test cannot reach it from a unix host — the failing arm
+    /// is not compiled here, so `random_bytes(32)` passes either way — which is exactly how the
+    /// defect survived. Asserting on the source covers **both** arms from **either** platform.
+    ///
+    /// If this fails you have reintroduced a platform branch. Don't: see the module note.
+    #[test]
+    fn fill_random_has_exactly_one_body_and_no_platform_arm() {
+        let src = include_str!("random.rs");
+        // Everything above the test module, with COMMENT lines stripped. The strip is
+        // load-bearing, not tidiness: the module header above describes the arm this replaced and
+        // quotes its refusal string verbatim, so scanning the raw text would match the very
+        // literal the last assertion forbids and fail against a correct file.
+        let code: String = src
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(src)
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("#[cfg("),
+            "no cfg attribute may gate this module's code — a platform arm here means some \
+             supported target ships an entropy source that differs from every other target"
+        );
+        assert_eq!(
+            code.matches("pub fn fill_random").count(),
+            1,
+            "fill_random must have exactly one definition"
+        );
+        // The literal the dead arm returned. Its absence is what makes login work on Windows.
+        assert!(
+            !code.contains("no OS random source is reachable on this platform"),
+            "the unconditional-refusal arm is back"
+        );
+    }
+
+    /// `fill_random` must actually fill — the refused arm returned without touching its buffer,
+    /// so a caller that ignored the `Result` would have base64url'd 32 zero bytes into a PKCE
+    /// verifier. Over 8192 draws every byte value appears with overwhelming probability
+    /// (a specific value missing has probability `(255/256)^8192` ≈ 1e-14).
+    #[test]
+    fn fill_random_writes_the_whole_buffer_with_spread_values() {
+        let mut buf = [0u8; 8192];
+        fill_random(&mut buf).expect("OS CSPRNG must be reachable on every supported platform");
+        let mut seen = [false; 256];
+        for byte in buf {
+            seen[byte as usize] = true;
+        }
+        assert!(
+            seen.iter().all(|s| *s),
+            "every byte value must appear across 8192 random bytes"
+        );
+    }
+
+    /// A zero-length draw is well-defined and succeeds, matching `getRandomValues(new
+    /// Uint8Array(0))`.
+    #[test]
+    fn fill_random_accepts_an_empty_buffer() {
+        assert!(fill_random(&mut []).is_ok());
+    }
 
     #[test]
     fn random_bytes_are_the_requested_length_and_not_constant() {

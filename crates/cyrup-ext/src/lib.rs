@@ -178,9 +178,13 @@ pub use loader::{
 };
 pub use manifest::{Capabilities, ExtensionManifest, FsGrant, HOST_WORLD, MANIFEST_FILE};
 pub use native::{
-    CtxTier, ExtMode, HostCtx, HostCtxRich, HumanWaitGate, HumanWaitGuard, InitApi,
+    CtxTier, ExtMode, HostCtx, HostCtxRich, HostCtxSource, HumanWaitGate, HumanWaitGuard, InitApi,
     NativeExtension, NativeHandle,
 };
+/// EXT-060: the `HostServices` -> [`native::HostCtxSource`] adapter is only meaningful when the
+/// capability backend exists, but the TRAIT it feeds is unconditional.
+#[cfg(feature = "wasm-host")]
+pub use native::ServicesCtxSource;
 pub use provider::{
     resolve_api_key, ModelCost, ModelCostTier, ModelRegistrySink, ProviderConfig, ProviderHub,
     ProviderModelConfig, ProviderRegistration,
@@ -197,6 +201,7 @@ pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
     DENIED_EXEC, DENIED_NET, DENIED_UI,
     GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
+    CustomOption, CustomSpec, SpecOverlay,
     HumanInteractionLock, InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent,
     OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan,
     ProcSpawnSpec, RecordingServices, StoreLimits, UiChrome, WasmTool,
