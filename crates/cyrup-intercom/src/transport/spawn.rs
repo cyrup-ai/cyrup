@@ -524,6 +524,9 @@ mod tests {
         assert!(probe["requestId"].is_string());
     }
 
+    // Unix-domain-socket specific (`UnixStream::pair()` / `UnixListener`): the transport-neutral
+    // behaviour it asserts is covered on Windows by the named-pipe arm of `broker::listener`.
+    #[cfg(unix)]
     /// MIRROR (stays green): over a socket target pi spreads `{}` instead
     /// (`...(expectedStateId ? { stateId } : {})`, `spawn.ts:290`) — the key must be **absent**, not
     /// null, since the broker compares `clientMessage.stateId === BROKER_STATE_ID`.

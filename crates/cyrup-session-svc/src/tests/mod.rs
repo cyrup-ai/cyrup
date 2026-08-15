@@ -17,6 +17,7 @@ mod delete_session_file_trash;
 mod fork_non_persisted;
 mod fork_parent_and_unsaved_guard;
 mod install_noop;
+mod late_seams;
 mod integration;
 mod mid_run_tool_anchoring;
 mod modelless_launch;

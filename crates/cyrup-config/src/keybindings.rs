@@ -332,6 +332,11 @@ pub fn migrate_keybindings_config_file(agent_dir: &Path) {
 }
 
 #[cfg(test)]
+// The same allow-set every other test module in this workspace carries. Without it
+// `cargo clippy -p cyrup-config --all-targets` is RED on 14 deny-level diagnostics in this file
+// alone — and because clippy lints do not fire under `cargo build`/`cargo check`, a check-only
+// gate never saw any of them.
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

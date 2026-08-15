@@ -40,6 +40,7 @@ mod auth_select;
 mod autocomplete;
 mod bash;
 mod chrome;
+mod clipboard;
 mod commands;
 mod component;
 mod config_selector;

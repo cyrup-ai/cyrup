@@ -640,6 +640,8 @@ fn map_thinking_level_to_effort(model: &Model, level: ThinkingLevel) -> String {
 
 /// Test-only convenience wrapper for [`build_params`] with no env overlay and API-key auth.
 #[cfg(test)]
+// Test-only fixture wrapper: the deny-list allowance the crate's `mod tests` blocks carry.
+#[allow(clippy::expect_used)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
     build_params(model, ctx, opts, None, false)
         .expect("fixture declares no unsatisfiable constrained sampling")
@@ -1267,19 +1269,26 @@ pub(crate) fn convert_tools(
             // accepted. Under strict sampling pi sends the WHOLE schema with that subset spread
             // over it (`:1305-1311`), so `type`/`properties`/`required` still win and any extra
             // keyword (`$defs`, `additionalProperties`, …) survives for the constrainer.
-            let legacy = json!({ "type": "object", "properties": properties, "required": required });
+            //
+            // Built as a `Map` rather than via `json!` so the strict arm can spread it without
+            // an `as_object().expect(..)` round-trip — the workspace denies `expect_used`, and
+            // an infallible construction is stronger than a justified panic either way.
+            let mut legacy = Map::new();
+            legacy.insert("type".to_string(), json!("object"));
+            legacy.insert("properties".to_string(), properties);
+            legacy.insert("required".to_string(), required);
             let input_schema = if strict == Some(true) {
                 let mut merged = tool
                     .parameters
                     .as_object()
                     .cloned()
                     .unwrap_or_else(Map::new);
-                for (k, v) in legacy.as_object().expect("legacy schema is an object") {
+                for (k, v) in &legacy {
                     merged.insert(k.clone(), v.clone());
                 }
                 Value::Object(merged)
             } else {
-                legacy
+                Value::Object(legacy)
             };
             let mut o = Map::new();
             o.insert("name".to_string(), json!(name));

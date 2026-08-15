@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use cyrup_core::ProviderId;
+use cyrup_provider::auth::oauth::{AuthInteraction, AuthPrompt, OAuthError};
 use cyrup_provider::wire::WireProvider;
 use cyrup_provider::{
     ApiKeyAuth, ApiRegistry, AuthContext, AuthError, AuthResult, CreateModelsOptions, Credential,
@@ -163,6 +164,13 @@ fn auth_err(provider: &ProviderId, message: String) -> AuthError {
 /// auth-store/env path, never acquired.
 pub struct ConfiguredApiKeyAuth {
     provider_id: String,
+    /// Pi `name: inherited?.name ?? "API key"` (provider-composer.ts:315).
+    ///
+    /// **[CYRUP-DELTA]** `composeApiKeyAuth` evaluates that coalesce once, at compose time, into a
+    /// plain string field. [`ApiKeyAuth::name`] returns `&str`, so the resolved value is stored
+    /// here rather than recomputed per call — a borrow of a `String` owned by `inherited` cannot
+    /// outlive the `&self` frame. Same observable value, same evaluation point as upstream.
+    name: String,
     api_key: Option<String>,
     headers: Option<HashMap<String, String>>,
     /// Per-model request headers, keyed by model id ([`raw_model_headers`]). Applied LAST, over the
@@ -176,8 +184,55 @@ pub struct ConfiguredApiKeyAuth {
 
 #[async_trait::async_trait]
 impl ApiKeyAuth for ConfiguredApiKeyAuth {
+    /// Pi `name: inherited?.name ?? "API key"` (provider-composer.ts:315) — resolved at compose
+    /// time into [`ConfiguredApiKeyAuth::name`]. `/login`'s provider picker labels the api-key
+    /// option with this (`login.rs`'s `login_provider_options`, `method_name:
+    /// api_key.name()`), so hardcoding `"API key"` here erased the inherited strategy's display
+    /// name — `"Gemini API key"`, `"GitHub Copilot token"`, `"Hugging Face token"` — from every
+    /// provider a `models.json` block touches.
     fn name(&self) -> &str {
-        "API key"
+        &self.name
+    }
+
+    /// Pi's `login` member is **unconditionally populated** — `inherited?.login ?? (async
+    /// (interaction) => …)` (provider-composer.ts:316-321) — so the object this composes always
+    /// satisfies `interactive-mode.ts:4942`'s `method.login !== undefined`, and
+    /// `ai/src/models.ts:433-435`'s `if (!method?.login) throw` never fires for a composed
+    /// provider.
+    ///
+    /// [`ApiKeyAuth::supports_login`] is cyrup's stand-in for that presence check
+    /// (`cyrup-provider/src/auth/mod.rs:64-78`), and its `false` default is what silently dropped
+    /// the inherited strategy's login one frame after `compose_provider_auth` captured it: every
+    /// `models.json`-declared provider answered `LoginError::Unsupported` at `login.rs`'s
+    /// `.filter(|s| s.supports_login())`.
+    fn supports_login(&self) -> bool {
+        true
+    }
+
+    /// Pi `login: inherited?.login ?? (async (interaction) => ({ type: "api_key", key: await
+    /// interaction.prompt({ type: "secret", message: "Enter API key" }) }))`
+    /// (provider-composer.ts:316-321).
+    ///
+    /// The `??` coalesce is on the *member*, not on the strategy: an `inherited` whose `login` is
+    /// absent (upstream's *"Absent = ambient-only"*, `ai/src/auth/types.ts:166`) falls through to
+    /// the generic flow exactly as an absent `inherited` does. `supports_login()` is cyrup's
+    /// spelling of `login !== undefined`, so it is the correct discriminator here.
+    ///
+    /// Delegating matters because the inherited flow is frequently multi-prompt — Cloudflare
+    /// (account id), Google Vertex (project + location), Amazon Bedrock (profile) — and the
+    /// generic one-secret flow would persist a partial credential and report success (ADR-0010
+    /// §"(3)"). Note the generic message is the literal `"Enter API key"`, NOT `env_key`'s
+    /// `format!("Enter {name}")` (`auth/helpers.ts:12`): upstream inlines the fixed string here.
+    async fn login(&self, interaction: &dyn AuthInteraction) -> Result<Credential, OAuthError> {
+        if let Some(inner) = self.inherited.as_ref()
+            && inner.supports_login()
+        {
+            return inner.login(interaction).await;
+        }
+        let key = interaction
+            .prompt(AuthPrompt::secret("Enter API key"))
+            .await?;
+        Ok(Credential::api_key(key))
     }
 
     async fn resolve(
@@ -317,6 +372,11 @@ fn compose_provider_auth(
         } else {
             Some(Arc::new(ConfiguredApiKeyAuth {
                 provider_id: provider_id.to_string(),
+                // Pi `name: inherited?.name ?? "API key"` (:315).
+                name: inherited
+                    .as_ref()
+                    .map(|i| i.name().to_string())
+                    .unwrap_or_else(|| "API key".to_string()),
                 api_key: config.api_key.clone(),
                 headers: config
                     .headers
@@ -428,4 +488,204 @@ pub fn compose_provider_registry(
     }
     let errors = file.compose_providers(&mut models, store, registry, auth_context);
     (models, errors)
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
+    use super::*;
+    use cyrup_provider::auth::oauth::{AuthPromptKind, ScriptedInteraction};
+
+    /// A stand-in for a built-in strategy with a real, MULTI-prompt `login` — the shape Cloudflare
+    /// (key + account id), Vertex (key + project + location) and Bedrock actually have. Its
+    /// credential carries an `env` overlay so a test can prove the inherited flow ran and the
+    /// generic one-secret flow did not.
+    struct MultiPromptInherited;
+
+    #[async_trait::async_trait]
+    impl ApiKeyAuth for MultiPromptInherited {
+        fn name(&self) -> &str {
+            "Cloudflare API key"
+        }
+        fn supports_login(&self) -> bool {
+            true
+        }
+        async fn login(
+            &self,
+            interaction: &dyn AuthInteraction,
+        ) -> Result<Credential, cyrup_provider::auth::oauth::OAuthError> {
+            let key = interaction
+                .prompt(AuthPrompt::secret("Enter Cloudflare API key"))
+                .await?;
+            let account = interaction
+                .prompt(AuthPrompt::text("Enter Cloudflare account ID"))
+                .await?;
+            Ok(Credential::ApiKey {
+                key: Some(key),
+                env: Some(
+                    [("CLOUDFLARE_ACCOUNT_ID".to_string(), account)]
+                        .into_iter()
+                        .collect(),
+                ),
+            })
+        }
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _ctx: &dyn AuthContext,
+            _cred: Option<&Credential>,
+        ) -> Result<Option<AuthResult>, AuthError> {
+            Ok(None)
+        }
+    }
+
+    /// Upstream's *"Absent = ambient-only"* strategy (`ai/src/auth/types.ts:166`): a `name`, a
+    /// `resolve`, and no `login` member at all.
+    struct AmbientOnlyInherited;
+
+    #[async_trait::async_trait]
+    impl ApiKeyAuth for AmbientOnlyInherited {
+        fn name(&self) -> &str {
+            "Ambient token"
+        }
+        async fn resolve(
+            &self,
+            _model: &Model,
+            _ctx: &dyn AuthContext,
+            _cred: Option<&Credential>,
+        ) -> Result<Option<AuthResult>, AuthError> {
+            Ok(None)
+        }
+    }
+
+    fn compose(base: Option<ProviderAuth>, config: ProviderConfig) -> Arc<dyn ApiKeyAuth> {
+        compose_provider_auth("acme", base.as_ref(), &config)
+            .expect("auth composes")
+            .api_key
+            .expect("composed provider has an api-key strategy")
+    }
+
+    fn key_of(cred: &Credential) -> Option<&str> {
+        match cred {
+            Credential::ApiKey { key, .. } => key.as_deref(),
+            Credential::Oauth { .. } => None,
+        }
+    }
+
+    /// Pi `name: inherited?.name ?? "API key"` (provider-composer.ts:315) — the INHERITED half.
+    /// Before the fix `name()` was the hardcoded literal, so `/login`'s picker labelled every
+    /// composed provider "API key".
+    #[test]
+    fn name_delegates_to_the_inherited_strategy() {
+        let base = ProviderAuth::with_api_key(Arc::new(MultiPromptInherited));
+        let composed = compose(Some(base), ProviderConfig::default());
+        assert_eq!(composed.name(), "Cloudflare API key");
+    }
+
+    /// The `?? "API key"` half: a base-less `models.json` provider keeps upstream's literal.
+    #[test]
+    fn name_falls_back_to_api_key_without_a_base() {
+        let config = ProviderConfig {
+            api_key: Some("sk-configured".to_string()),
+            ..Default::default()
+        };
+        let composed = compose(None, config);
+        assert_eq!(composed.name(), "API key");
+    }
+
+    /// Pi always populates `login` (:316-321), so `method.login !== undefined`
+    /// (`interactive-mode.ts:4942`) is true for EVERY composed provider — with a base, without a
+    /// base, and with an ambient-only base. Before the fix the trait default returned `false` in
+    /// all three cases and `login.rs`'s `.filter(|s| s.supports_login())` rejected the provider.
+    #[test]
+    fn supports_login_is_always_true() {
+        assert!(compose(None, ProviderConfig::default()).supports_login());
+        assert!(
+            compose(
+                Some(ProviderAuth::with_api_key(Arc::new(MultiPromptInherited))),
+                ProviderConfig::default()
+            )
+            .supports_login()
+        );
+        assert!(
+            compose(
+                Some(ProviderAuth::with_api_key(Arc::new(AmbientOnlyInherited))),
+                ProviderConfig::default()
+            )
+            .supports_login()
+        );
+    }
+
+    /// `inherited?.login ?? …` (:316-318) resolves to the INHERITED flow when it has one: both
+    /// prompts run and the multi-value credential survives whole. The generic flow would have
+    /// asked exactly one question and dropped the account id.
+    #[tokio::test]
+    async fn login_delegates_to_the_inherited_flow() {
+        let composed = compose(
+            Some(ProviderAuth::with_api_key(Arc::new(MultiPromptInherited))),
+            ProviderConfig::default(),
+        );
+        let interaction =
+            ScriptedInteraction::new(vec![Ok("cf-key".to_string()), Ok("acct-123".to_string())]);
+        let cred = composed.login(&interaction).await.expect("login succeeds");
+
+        assert_eq!(key_of(&cred), Some("cf-key"));
+        assert_eq!(
+            cred.env().and_then(|e| e.get("CLOUDFLARE_ACCOUNT_ID")),
+            Some(&"acct-123".to_string()),
+            "the inherited flow's second value must survive; the generic one-secret flow drops it"
+        );
+        let prompts = interaction.prompts();
+        assert_eq!(prompts.len(), 2, "inherited flow is multi-prompt");
+        assert_eq!(prompts[0].message, "Enter Cloudflare API key");
+        assert_eq!(prompts[1].message, "Enter Cloudflare account ID");
+    }
+
+    /// The `?? (async (interaction) => …)` half (:318-321): no base at all, so the generic
+    /// one-secret flow runs with upstream's literal `"Enter API key"` message — NOT `env_key`'s
+    /// `format!("Enter {name}")`.
+    #[tokio::test]
+    async fn login_runs_the_generic_secret_prompt_without_a_base() {
+        let composed = compose(
+            None,
+            ProviderConfig {
+                api_key: Some("sk-configured".to_string()),
+                ..Default::default()
+            },
+        );
+        let interaction = ScriptedInteraction::new(vec![Ok("sk-typed".to_string())]);
+        let cred = composed.login(&interaction).await.expect("login succeeds");
+
+        assert_eq!(key_of(&cred), Some("sk-typed"));
+        let prompts = interaction.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].kind, Some(AuthPromptKind::Secret));
+        assert_eq!(prompts[0].message, "Enter API key");
+    }
+
+    /// The coalesce is on the `login` MEMBER, not on the strategy: an inherited strategy that is
+    /// ambient-only (`login` absent) still yields the generic flow, exactly as `undefined ?? fn`
+    /// does upstream. Delegating blindly here would surface `LoginUnsupported` instead.
+    #[tokio::test]
+    async fn login_falls_back_when_the_inherited_strategy_has_no_login() {
+        let composed = compose(
+            Some(ProviderAuth::with_api_key(Arc::new(AmbientOnlyInherited))),
+            ProviderConfig::default(),
+        );
+        let interaction = ScriptedInteraction::new(vec![Ok("sk-typed".to_string())]);
+        let cred = composed.login(&interaction).await.expect("login succeeds");
+
+        assert_eq!(key_of(&cred), Some("sk-typed"));
+        let prompts = interaction.prompts();
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].message, "Enter API key");
+        // `name` still delegates even though `login` does not.
+        assert_eq!(composed.name(), "Ambient token");
+    }
 }

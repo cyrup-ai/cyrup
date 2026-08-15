@@ -1070,28 +1070,7 @@ impl AgentSession {
                 // The bind is the HANDLER's own `Result` — `execute_native_command` returns
                 // `Result<Option<Result<Option<String>, ExtError>>, _>`: outer = routing, `Option` =
                 // did a native extension own the name, inner = what the handler itself returned.
-                match &payload {
-                    Ok(Some(text)) if !text.trim().is_empty() => {
-                        cyrup_ext::HostServices::notify(
-                            &*self.services.host_services,
-                            text,
-                            cyrup_ext::NotifyKind::Info,
-                        );
-                    }
-                    // A handler that deliberately returns nothing stays silent.
-                    Ok(_) => {}
-                    // Pi surfaces a THROWN handler through `emitError` with
-                    // `extensionPath: command:<name>` (`agent-session.ts:1294-1299`) and still
-                    // reports the command handled. Same here: show it, do not fall through to
-                    // treating `/name` as a prompt.
-                    Err(e) => {
-                        cyrup_ext::HostServices::notify(
-                            &*self.services.host_services,
-                            &format!("command:{name}: {e}"),
-                            cyrup_ext::NotifyKind::Error,
-                        );
-                    }
-                }
+                self.surface_command_outcome(name, &payload);
                 // SEAM-003: drain the control ops the native handler queued. This route used to
                 // `return true` with NO drain at all, so a native built-in's `control(...)` sat in
                 // the queue until some later WASM command happened to run. Pi keeps native + wasm
@@ -1109,6 +1088,48 @@ impl AgentSession {
             Err(_) => return false,
         }
         self.try_execute_wasm_command(name, args, &cancel).await
+    }
+
+    /// Surface a slash-command handler's OWN outcome to the user — the one behaviour the native and
+    /// the wasm tier must share, factored out so they cannot drift again.
+    ///
+    /// pi keeps native and wasm commands in ONE map and runs them through a single
+    /// `_tryExecuteExtensionCommand` (`core/agent-session.ts:1277-1301` @v0.83.0), so upstream there
+    /// is exactly one behaviour and it is the SURFACING one: a thrown handler goes to
+    /// `this._extensionRunner.emitError({extensionPath: `command:${commandName}`, event: "command",
+    /// error})` (`:1294-1299`) and the command still reports handled. Routing it to `notify`
+    /// reproduces that observable behaviour over the one UI channel that is live end-to-end
+    /// (`LiveHostServices::notify` → `UiEffect::Notify` → the TUI's `show_extension_notify`, and the
+    /// RPC drain's `extension_error` line).
+    ///
+    /// `Ok(Some(text))` has no pi counterpart — pi's handler signature is `Promise<void>` and it
+    /// talks to the user through `ctx.ui.*` — but it is a real cyrup-side channel that the SDK's
+    /// `CommandExec` populates (`cyrup-ext-sdk/src/guest.rs`'s `run_command` → `api.execute_command`),
+    /// so a guest command that answers with text must speak exactly as the identical native command
+    /// already does. An empty payload stays silent.
+    pub(crate) fn surface_command_outcome(
+        &self,
+        name: &str,
+        outcome: &Result<Option<String>, cyrup_ext::ExtError>,
+    ) {
+        match outcome {
+            Ok(Some(text)) if !text.trim().is_empty() => {
+                cyrup_ext::HostServices::notify(
+                    &*self.services.host_services,
+                    text,
+                    cyrup_ext::NotifyKind::Info,
+                );
+            }
+            // A handler that deliberately returns nothing stays silent.
+            Ok(_) => {}
+            Err(e) => {
+                cyrup_ext::HostServices::notify(
+                    &*self.services.host_services,
+                    &format!("command:{name}: {e}"),
+                    cyrup_ext::NotifyKind::Error,
+                );
+            }
+        }
     }
 
     /// Execute a LIVE wasm-guest-registered slash command through the real run path (R-08-016; Pi
@@ -1133,10 +1154,17 @@ impl AgentSession {
         ) {
             return false;
         }
-        // Run the guest handler. Pi discards the handler's return value (the command manages its own
-        // LLM interaction via `pi.sendMessage`), and treats a thrown handler as still "handled"
-        // (agent-session.ts:1192-1200) — so a guest fault does not fall through to a prompt.
-        let _ = self.services.ext_host.run_command(name, args, cancel).await;
+        // Run the guest handler and SURFACE its outcome, exactly as the native arm above does —
+        // this used to be `let _ = …`, discarding both channels. pi treats a thrown handler as still
+        // "handled" (`core/agent-session.ts:1292-1300`) but emits the error first; discarding it
+        // here meant a trapping guest, an epoch-deadline interrupt, an `ExtError::Cancelled` or the
+        // guest's own `execute-command` error return produced NOTHING — no transcript line, no
+        // toast, no RPC `extension_error`, no log — while `return true` below still swallowed the
+        // input, so the user pressed Enter on `/deploy` and the UI did nothing at all. The `true`
+        // stays on every branch: a faulted command must not fall through to being treated as a
+        // prompt.
+        let outcome = self.services.ext_host.run_command(name, args, cancel).await;
+        self.surface_command_outcome(name, &outcome);
         // Apply every control op the guest queued — session-tier (compact / set-model /
         // send-message / set-thinking-level / navigate / wait-idle) AND runtime-tier (new-session /
         // switch / fork / reload), the latter through the installed [`crate::RuntimeActions`] sink
@@ -2538,7 +2566,12 @@ impl AgentSession {
         out
     }
 
-    /// The persisted entries on the current branch, serialized (Pi `get_entries`, rpc-mode.ts:609).
+    /// EVERY persisted entry except the session header, serialized (pi `get_entries`,
+    /// rpc-mode.ts:609 → `SessionManager.getEntries()`, `core/session-manager.ts:1301`: "Get all
+    /// session entries (excludes header)"). NOT the current branch — that is `getBranch()`
+    /// (`:1260`), which the extension seam exposes separately as
+    /// [`cyrup_ext::HostServices::branch`]. The body has always called `entries()`; only this line
+    /// said "on the current branch".
     pub async fn entries_json(&self) -> Vec<serde_json::Value> {
         let guard = self.manager.lock().await;
         guard
@@ -2558,29 +2591,13 @@ impl AgentSession {
     /// Without it a client cannot sort or age branch labels, cannot render "renamed 2 days ago",
     /// and cannot spot a label that predates the entries beneath it. Emitted with the same
     /// omit-when-`None` insert as `label`, so an unlabelled node still carries neither key.
+    ///
+    /// The per-node serializer is [`crate::host_services::tree_node_to_json`], shared with
+    /// [`cyrup_ext::HostServices::tree`]: both must emit pi's one `SessionTreeNode` shape, and a
+    /// second private copy here is precisely how the SEAM-060 omission survived on one side.
     pub async fn tree_json(&self) -> Vec<serde_json::Value> {
-        fn node_to_json(node: &cyrup_session::manager::TreeNode) -> serde_json::Value {
-            let mut obj = serde_json::Map::new();
-            if let Ok(entry) = serde_json::to_value(&node.entry) {
-                obj.insert("entry".to_string(), entry);
-            }
-            obj.insert(
-                "children".to_string(),
-                serde_json::Value::Array(node.children.iter().map(node_to_json).collect()),
-            );
-            if let Some(label) = &node.label {
-                obj.insert("label".to_string(), serde_json::Value::String(label.clone()));
-            }
-            if let Some(ts) = &node.label_timestamp {
-                obj.insert(
-                    "labelTimestamp".to_string(),
-                    serde_json::Value::String(ts.clone()),
-                );
-            }
-            serde_json::Value::Object(obj)
-        }
         let guard = self.manager.lock().await;
-        guard.tree().iter().map(node_to_json).collect()
+        guard.tree().iter().map(crate::host_services::tree_node_to_json).collect()
     }
 
     /// The **flattened session DAG** for the `/tree` selector (feature #2): the manager's real branch
@@ -2674,6 +2691,20 @@ impl AgentSession {
         if let Some(hook) = before_invalidate {
             hook();
         }
+        // pi `teardownCurrent` runs `this.beforeSessionInvalidate?.()` and then
+        // `this.session.dispose()` (`core/agent-session-runtime.ts:176-177` @v0.83.0), and
+        // `dispose()` ends in `this._extensionRunner.invalidate(<stale text>)`
+        // (`core/agent-session.ts:851-853`) — the latch that makes a captured extension ctx refuse
+        // to act, plus the event-bus unsubscribe sweep (`core/extensions/loader.ts:206-215`).
+        //
+        // cyrup reached exactly this position and then never invalidated: `invalidate_live` had
+        // ONE caller in the workspace, `ExtensionHost::reload`. So `/new`, `/resume`, `/fork` and
+        // `/switch` all left every live guest un-stale and still subscribed, and its handlers went
+        // on receiving events on the bus the REPLACEMENT session's set is listening on — pi's
+        // `assertActive` refusal never fired. `None` takes the ported default stale text
+        // (`GuestState::invalidate`); the call is a no-op on the `--no-default-features` arm, which
+        // is why it needs no `#[cfg]` here.
+        self.services.ext_host.invalidate_live(None);
         self.session_cancel.cancel();
     }
 
@@ -4147,7 +4178,34 @@ impl AgentSession {
     }
 
     /// Replace the scoped-model cycle set (Pi `setScopedModels`, agent-session.ts:875).
+    ///
+    /// Also re-seeds the guest-visible mirror behind `ctx.scopedModels` (EXT-045). pi exposes the
+    /// SAME field to extensions off the base context — `getScopedModels: () => this._scopedModels`
+    /// (`core/agent-session.ts:2416`), read by `get scopedModels()`
+    /// (`core/extensions/runner.ts:706-709`) — so the extension seam and the `/scoped-models`
+    /// command must never disagree. `LiveHostServices`'s read is SYNC and this set lives behind a
+    /// lock it does not own, so it is mirrored the way the system prompt already is; doing it HERE,
+    /// in the single writer, is what keeps the mirror from lagging.
     pub fn set_scoped_models(&self, models: Vec<ScopedModel>) {
+        // pi's `ScopedModel` is `{model: Model<Api>; thinkingLevel?: ThinkingLevel}`
+        // (`core/model-resolver.ts:63-67` @v0.83.0). `thinkingLevel` is OMITTED when unset, exactly
+        // as an `undefined` field is absent from upstream's object.
+        let mirrored: Vec<serde_json::Value> = models
+            .iter()
+            .map(|sm| {
+                let mut obj = serde_json::Map::new();
+                if let Ok(model) = serde_json::to_value(&sm.model) {
+                    obj.insert("model".to_string(), model);
+                }
+                if let Some(level) = sm.thinking_level
+                    && let Ok(level) = serde_json::to_value(level)
+                {
+                    obj.insert("thinkingLevel".to_string(), level);
+                }
+                serde_json::Value::Object(obj)
+            })
+            .collect();
+        self.services.host_services.update_scoped_models(mirrored);
         *Self::lock(&self.scoped_models) = models;
     }
 
@@ -4322,7 +4380,10 @@ impl AgentSession {
         &self.services.ext_host
     }
 
-    /// Whether any loaded extension handles `kind` (Pi `hasExtensionHandlers`, agent-session.ts:3135).
+    /// Whether any loaded extension handles `kind` (pi `hasExtensionHandlers(eventType: string):
+    /// boolean { return this._extensionRunner.hasHandlers(eventType); }`,
+    /// `core/agent-session.ts:3334` @v0.83.0). The `:3135` this used to cite is inside an unrelated
+    /// usage-totals accumulation loop.
     pub fn has_extension_handlers(&self, kind: cyrup_ext::EventKind) -> bool {
         !self.services.ext_host.dispatcher().no_subscribers(kind)
     }
@@ -5353,8 +5414,19 @@ impl AgentSession {
     }
 
     /// Register additional custom tools into the enable-able registry (Pi `customTools`, sdk.ts:71,384).
+    ///
+    /// Each tool goes through [`cyrup_ext::ExtensionHost::wrap_tool`] first, exactly as the
+    /// BUILD-TIME custom-tool path does (`builder.rs`'s
+    /// `registry_tools.extend(cfg.custom_tools.iter().map(|t| ext_host.wrap_tool(t.clone())))`),
+    /// which is the parity this method claims. pi wraps its SDK custom tools together with
+    /// everything else in one `wrapRegisteredTools` pass (`core/agent-session.ts:2513`, over the
+    /// `allCustomTools` list built at `:2472-2478`), so there is no upstream shape in which an
+    /// SDK-supplied tool runs unwrapped. Unwrapped, the tool executed with NO extension
+    /// `tool_call`/`tool_result` hooks around it — the permission gate and every observer extension
+    /// were blind to it — and it never derived `addedToolNames`.
     pub fn register_custom_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>) {
-        Self::lock(&self.dynamic_tools).register_custom(tools);
+        let wrapped = tools.into_iter().map(|t| self.services.ext_host.wrap_tool(t)).collect();
+        Self::lock(&self.dynamic_tools).register_custom(wrapped);
     }
 }
 

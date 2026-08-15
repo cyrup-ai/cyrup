@@ -58,6 +58,20 @@ impl Session {
     }
 
     /// The shared session `Arc` (clone-cheap; share across tasks).
+    ///
+    /// This is the *same* allocation [`Session::agent_session`] borrows and
+    /// [`Session::into_inner`] yields — the one minted by `into_shared()` in `Session::new`, which
+    /// the post-run execution driver and the extension subscriber hold weak references to. Cloning
+    /// it therefore keeps those weak refs upgradable; it does not mint a second session.
+    ///
+    /// # Examples
+    /// ```no_run
+    /// # async fn demo(session: &cyrup_sdk::Session) {
+    /// let shared = session.agent_session_arc();
+    /// // Same allocation as the borrow — not a second session.
+    /// assert!(std::ptr::eq(session.agent_session(), std::sync::Arc::as_ptr(&shared)));
+    /// # }
+    /// ```
     pub fn agent_session_arc(&self) -> Arc<AgentSession> {
         self.inner.clone()
     }

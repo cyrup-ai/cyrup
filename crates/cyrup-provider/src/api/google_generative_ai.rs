@@ -288,6 +288,8 @@ pub struct GoogleOptions {
 
 /// Test-only convenience wrapper for [`build_params`].
 #[cfg(test)]
+// Test-only fixture wrapper: the deny-list allowance the crate's `mod tests` blocks carry.
+#[allow(clippy::expect_used)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
     build_params(model, ctx, opts).expect("fixture declares no unsatisfiable constrained sampling")
 }

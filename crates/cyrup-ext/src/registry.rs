@@ -623,6 +623,19 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.guest_tools.contains_key(name))
     }
 
+    /// Register a slash command owned by an extension (R-08-016; pi `registerCommand(name,
+    /// options)`, `extensions/loader.ts:270-277` @v0.83.0).
+    ///
+    /// A re-registration by the SAME owner REPLACES in place. Upstream's store is one `Map` per
+    /// extension (`extension.commands.set(name, …)`), so the same extension registering `deploy`
+    /// twice ends with one entry, at its original insertion position. cyrup's `command_order` is a
+    /// cross-extension Vec (it carries the load order `resolveRegisteredCommands` disambiguates
+    /// by), so a blind `push` turned that single upstream entry into two rows — and two rows of
+    /// the same NAME make `resolved_commands` hand out `deploy:1`/`deploy:2` and NOTHING named
+    /// `deploy`, i.e. the extension's own re-registration would silently un-route its own bare
+    /// `/deploy`. Latent while `register-command` only ran during `init`; EXT-058 made the import
+    /// write through from live handlers, where re-registering a command (a mode toggle rewriting
+    /// its own description) is an ordinary thing to do.
     pub fn register_command(
         &self,
         owner: ExtensionId,
@@ -632,7 +645,13 @@ impl ExtensionRegistry {
         let name = name.into();
         let mut g = self.lock_write()?;
         g.commands.insert(name.clone(), (owner.clone(), desc.clone()));
-        g.command_order.push((owner, name, desc));
+        if let Some(slot) =
+            g.command_order.iter_mut().find(|(o, n, _)| *o == owner && *n == name)
+        {
+            slot.2 = desc;
+        } else {
+            g.command_order.push((owner, name, desc));
+        }
         Ok(())
     }
 
@@ -843,8 +862,9 @@ impl ExtensionRegistry {
                 None => {}
             }
             // Rule 4 — extension vs extension: warn, LAST wins (`runner.ts:530-536`).
-            if let Some(pos) = out.iter().position(|(k, _)| *k == normalized) {
-                let existing = out[pos].1.clone();
+            if let Some(pos) = out.iter().position(|(k, _)| *k == normalized)
+                && let Some(existing) = out.get(pos).map(|(_, o)| o.clone())
+            {
                 warn(
                     &mut g,
                     format!(

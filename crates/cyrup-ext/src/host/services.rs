@@ -7,7 +7,7 @@
 use crate::event::{EventKind, Subscriptions};
 use crate::manifest::Capabilities;
 use crate::native::{CtxTier, ExtMode};
-use crate::registry::{CommandDescriptor, ExtensionRegistry};
+use crate::registry::ExtensionRegistry;
 use cyrup_core::{CancelToken, ExtensionId};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
@@ -1256,10 +1256,10 @@ pub struct GuestState {
     has_ui: bool,
     /// The current dispatch tier; control ops are legal only at [`CtxTier::Command`] (R-08-008).
     tier: Mutex<CtxTier>,
-    /// Subscriptions declared via the `subscribe` import (read back after `init`).
+    /// Subscriptions declared via the `subscribe` import. Read LIVE by
+    /// `<LiveExtension as Extension>::subscriptions` on every dispatch, so a `subscribe` from a
+    /// live handler is honoured on the next event (EXT-058) — never snapshotted after `init`.
     subs: Mutex<Subscriptions>,
-    /// Commands registered via `register-command` (drained into the registry after `init`).
-    commands: Mutex<Vec<(String, CommandDescriptor)>>,
     /// Flags registered via `register-flag` (name -> spec JSON).
     flags: Mutex<HashMap<String, Value>>,
     /// Autocomplete providers added via `add-autocomplete` (command names).
@@ -1437,7 +1437,6 @@ impl GuestState {
             has_ui: true,
             tier: Mutex::new(CtxTier::Command), // init runs at command tier (load time)
             subs: Mutex::new(Subscriptions::empty()),
-            commands: Mutex::new(Vec::new()),
             flags: Mutex::new(HashMap::new()),
             autocomplete: Mutex::new(Vec::new()),
             renderers: Mutex::new(Vec::new()),
@@ -1755,17 +1754,6 @@ impl GuestState {
 
     pub fn subscriptions(&self) -> Subscriptions {
         self.subs.lock().map(|g| *g).unwrap_or_else(|_| Subscriptions::empty())
-    }
-
-    pub fn push_command(&self, name: String, desc: CommandDescriptor) {
-        if let Ok(mut g) = self.commands.lock() {
-            g.push((name, desc));
-        }
-    }
-
-    /// Drain the commands registered during `init` (the loader writes them into the registry).
-    pub fn take_commands(&self) -> Vec<(String, CommandDescriptor)> {
-        self.commands.lock().map(|mut g| std::mem::take(&mut *g)).unwrap_or_default()
     }
 
     pub fn set_flag(&self, name: String, spec: Value) {
@@ -2216,7 +2204,7 @@ impl GuestState {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::indexing_slicing)]
     use super::*;
 
     fn state() -> GuestState {

@@ -563,7 +563,12 @@ impl Default for Backend {
 
 #[cfg(test)]
 mod bash_operations_tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    // `indexing_slicing` joins the two the crate's other test modules already allow: the
+    // assertions below index a `Vec` whose length the preceding `assert_eq!` has just pinned, and
+    // a panic there IS the test failure. Without it `cargo clippy -p cyrup-tools --all-targets`
+    // is RED on this file — the crate lints are `deny`, and clippy lints do not fire under
+    // `cargo check`, so this stayed invisible to a check-only gate.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
     use std::sync::Mutex;
 

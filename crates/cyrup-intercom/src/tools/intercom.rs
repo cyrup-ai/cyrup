@@ -847,6 +847,30 @@ impl Tool for IntercomTool {
         "Coordinate with other local agent sessions over the intercom broker: list/list-cwd/send/ask/reply/pending/status/cancel."
     }
 
+    /// `label: "Intercom"` (`v0.10.1 index.ts:1781`).
+    ///
+    /// Not decoration: the tool-row UI falls back to the raw `name()` when this is `None`, so
+    /// omitting it renders `intercom` where upstream renders `Intercom`.
+    fn label(&self) -> Option<&str> {
+        Some("Intercom")
+    }
+
+    /// `promptSnippet` (`v0.10.1 index.ts:1800-1801`), verbatim except for the product name.
+    ///
+    /// This is the ONLY thing that puts a tool into the default system prompt's "Available tools"
+    /// section — upstream builds that list with `tools.filter(name => !!toolSnippets?.[name])`, so a
+    /// `None` here means the model is never told in prose that `intercom` exists.
+    ///
+    /// [CYRUP-DELTA] `v0.10.1 index.ts:1801` reads "other local pi sessions"; this is the same
+    /// product-name substitution the whole port applies (`.pi/agent` → `.cyrup`, `PI_*` →
+    /// `CYRUP_*`), and the sentence names sessions of the running agent, not of a foreign tool.
+    fn prompt_snippet(&self) -> Option<&str> {
+        Some(
+            "Use to coordinate with other local cyrup sessions: list peers, send updates, ask for \
+             help, or check intercom connectivity.",
+        )
+    }
+
     async fn execute(
         &self,
         _call_id: ToolCallId,
@@ -872,6 +896,40 @@ mod tests {
     use crate::transport::protocol::{Message, MessageContent};
 
     use super::*;
+
+    /// The `intercom` tool's PROMPT SURFACE — the three `Tool` accessors that default to
+    /// `None`/`None`/`Vec::new()` (`cyrup-core/src/tool.rs`) and therefore compile, run and look
+    /// correct while contributing nothing.
+    ///
+    /// `prompt_snippet` is the sole gate on the default system prompt's "Available tools" section
+    /// (`tools.filter(name => !!toolSnippets?.[name])`): `None` means the model is never told in
+    /// prose that this tool exists. `label` is the tool-row UI's display name; `None` falls back to
+    /// the raw `name()`. Pinned against `v0.10.1 index.ts:1780-1801` — which declares `label` and
+    /// `promptSnippet` and, deliberately, NO `promptGuidelines`.
+    #[test]
+    fn the_intercom_tool_declares_pis_label_and_prompt_snippet() {
+        let tool = IntercomTool::new(Arc::new(SharedIntercomState::new(
+            crate::config::IntercomConfig::default(),
+            600_000,
+            std::path::PathBuf::from("/w"),
+        )));
+
+        assert_eq!(tool.label(), Some("Intercom"), "`v0.10.1 index.ts:1781` `label: \"Intercom\"`");
+        assert_eq!(
+            tool.prompt_snippet(),
+            Some(
+                "Use to coordinate with other local cyrup sessions: list peers, send updates, ask \
+                 for help, or check intercom connectivity."
+            ),
+            "`v0.10.1 index.ts:1800-1801` verbatim, with the port's product-name substitution"
+        );
+        // Absence is load-bearing too: upstream gives `intercom` no `promptGuidelines`, so a future
+        // edit that invents some is a divergence, not an improvement.
+        assert!(
+            tool.prompt_guidelines().is_empty(),
+            "`v0.10.1 index.ts:1779-1802` declares no promptGuidelines for `intercom`"
+        );
+    }
 
     /// ICOM-017 — the tool's SCHEMA is what decides whether the model can reach the cancel path at
     /// all, and it is the half that stayed unported after the broker's `handle_cancel_message`

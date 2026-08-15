@@ -83,15 +83,30 @@ pub fn assert_no_live_broker(pid_path: &Path) -> std::io::Result<()> {
     };
 
     match probe_pid(pid) {
+        #[cfg(unix)]
         PidProbe::Gone => Ok(()),
         // `throw new Error(\`Refusing to replace live intercom broker process ${pid}\`)` (`:20`).
+        #[cfg(unix)]
         PidProbe::Live => Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             format!("Refusing to replace live intercom broker process {pid}"),
         )),
+        #[cfg(unix)]
         PidProbe::Undetermined(errno) => Err(std::io::Error::new(
             std::io::ErrorKind::AddrInUse,
             format!("Refusing to replace live intercom broker process {pid}: {errno}"),
+        )),
+        // Same limb as `Undetermined`: not proven absent ⇒ not reclaimable. The message names the
+        // recovery (delete the pid file) because, unlike `EPERM`, this verdict does not clear on
+        // its own.
+        #[cfg(not(unix))]
+        PidProbe::Unsupported => Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "Refusing to replace intercom broker process {pid}: process liveness cannot be \
+                 probed on this platform. If that process is gone, delete {}.",
+                pid_path.display()
+            ),
         )),
     }
 }
@@ -101,16 +116,43 @@ pub fn assert_no_live_broker(pid_path: &Path) -> std::io::Result<()> {
 /// proves *absence*, and every other errno is re-thrown rather than read as "dead".
 enum PidProbe {
     /// The signal was accepted — the process exists.
+    #[cfg(unix)]
     Live,
     /// `ESRCH`: no such process (`runtime-claim.ts:17`).
+    #[cfg(unix)]
     Gone,
     /// Any other errno — upstream re-throws (`runtime-claim.ts:18`). `EPERM` is the realistic one:
     /// the process exists, we just may not signal it.
-    #[cfg_attr(not(unix), allow(dead_code))]
+    #[cfg(unix)]
     Undetermined(nix::errno::Errno),
+    /// No liveness probe exists on this platform at all — see [`probe_pid`]'s `CYRUP-DELTA`.
+    #[cfg(not(unix))]
+    Unsupported,
 }
 
 /// `process.kill(pid, 0)` (**v0.9.2** `broker/runtime-claim.ts:15`).
+///
+/// # [CYRUP-DELTA] — the non-Unix arm cannot probe, and therefore must not answer `Gone`
+///
+/// Upstream symbol: `process.kill(pid, 0)` at **v0.9.2** `broker/runtime-claim.ts:15`. Node
+/// implements `process.kill` on Windows too (`OpenProcess`), so upstream gets a real three-way
+/// answer on every platform. Rust's std has no portable equivalent and `nix` is POSIX-only, so a
+/// faithful Windows probe would mean a new `windows-sys` dependency — a workspace-level decision
+/// this crate cannot make on its own.
+///
+/// What the arm must NOT do is guess. It previously returned [`PidProbe::Gone`] for every pid,
+/// justified by "the broker is unix-only, nothing can reach this" — a justification that expires
+/// the moment the broker listens on a Windows named pipe (see `broker::listener`), at which point
+/// every starting `cyrup` would declare a live incumbent dead, unlink its endpoint, and silently
+/// partition the session graph: exactly the split-brain this whole module exists to prevent.
+///
+/// So the non-Unix arm takes the same limb a live-but-unsignalable pid takes — upstream re-throws
+/// every outcome that is not `ESRCH` (`:18`), and "no probe exists" is certainly not `ESRCH`. This
+/// matches the sibling `check_pid_liveness` in
+/// `cyrup-ext-subagents/src/background/reconcile.rs`, which reports `Liveness::Unknown` rather than
+/// `Dead` on non-Unix for the same reason. The cost is that a pid file left by a SIGKILLed Windows
+/// broker wedges intercom until it is deleted; the error text says so. A loud, one-command wedge is
+/// the correct trade against a silent fabric split.
 fn probe_pid(pid: i32) -> PidProbe {
     #[cfg(unix)]
     {
@@ -120,13 +162,10 @@ fn probe_pid(pid: i32) -> PidProbe {
             Err(errno) => PidProbe::Undetermined(errno),
         }
     }
-    // The broker binds a `tokio::net::UnixListener`, so `broker::run` is unix-only for this
-    // milestone (the Windows named-pipe transport is deferred, `broker/mod.rs` module docs).
-    // Nothing can reach the claim on a non-unix host; yield the runtime rather than wedge it.
     #[cfg(not(unix))]
     {
         let _ = pid;
-        PidProbe::Gone
+        PidProbe::Unsupported
     }
 }
 
@@ -173,6 +212,11 @@ mod tests {
 
     /// Mirrors upstream `v0.9.2 broker/runtime-claim.test.ts:8-20` ("broker startup refuses to
     /// replace a live broker PID"): the test process's own pid is by definition live.
+    /// The exact refusal text is upstream's (`runtime-claim.ts:20`) and is asserted on the Unix arm,
+    /// where `kill(pid, 0)` returns `Ok` and the verdict is genuinely `Live`. The cross-platform
+    /// half of the claim ("a live pid is never replaced") is
+    /// `a_live_pid_is_refused_on_every_platform`.
+    #[cfg(unix)]
     #[test]
     fn a_live_pid_is_refused() {
         let dir = tempfile::tempdir().unwrap();
@@ -202,9 +246,69 @@ mod tests {
         std::fs::write(&pid_path, "invalid\n").unwrap();
         assert!(assert_no_live_broker(&pid_path).is_ok());
 
-        // Stale (`:29-30`): upstream's own choice of an unallocatable pid.
+        // Stale (`:29-30`): upstream's own choice of an unallocatable pid. Reclaim requires a probe
+        // that can PROVE absence (`ESRCH`), which only the Unix arm can do — see
+        // `probe_pid`'s CYRUP-DELTA and `a_pid_that_cannot_be_probed_is_never_reclaimed` below.
+        #[cfg(unix)]
+        {
+            std::fs::write(&pid_path, "2147483647\n").unwrap();
+            assert!(assert_no_live_broker(&pid_path).is_ok());
+        }
+    }
+
+    /// Both cfg arms of [`probe_pid`], asserted through the public entrypoint, because the two arms
+    /// answered the SAME question with OPPOSITE defaults: the Unix arm distinguishes
+    /// `Live`/`Gone`/`Undetermined`, while the non-Unix arm used to answer `Gone` for every pid —
+    /// live or not.
+    ///
+    /// That was latent only for as long as the crate refused to compile for Windows at all. With the
+    /// broker's listener now gated rather than the whole crate (`broker::listener`), a `Gone`
+    /// default would make every starting `cyrup` on Windows declare a live incumbent dead, unlink
+    /// its endpoint and split the intercom fabric — silently.
+    ///
+    /// The rule under test is upstream's, not an invention: `runtime-claim.ts:16-18` swallows only
+    /// `ESRCH` and re-throws every other outcome. "This platform has no probe" is not `ESRCH`.
+    #[test]
+    fn a_pid_that_cannot_be_probed_is_never_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("broker.pid");
+        // Upstream's own stale-pid fixture (`runtime-claim.test.ts:29`): unallocatable, so on Unix
+        // `kill(2)` answers ESRCH and this is the reclaimable case.
         std::fs::write(&pid_path, "2147483647\n").unwrap();
-        assert!(assert_no_live_broker(&pid_path).is_ok());
+
+        #[cfg(unix)]
+        {
+            // The probe can prove absence, so the runtime is yielded — pi's behaviour verbatim.
+            assert!(
+                assert_no_live_broker(&pid_path).is_ok(),
+                "ESRCH is the one outcome upstream reads as absence"
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            // No probe exists, so absence is unproven and the claim must refuse rather than guess.
+            let err = assert_no_live_broker(&pid_path)
+                .expect_err("an unprobeable pid must not be treated as dead");
+            assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+            let text = err.to_string();
+            assert!(text.contains("cannot be probed"), "{text}");
+            // The wedge has to be recoverable, so the message names the file to delete.
+            assert!(text.contains(&pid_path.display().to_string()), "{text}");
+        }
+    }
+
+    /// MIRROR (both arms): a live pid is refused on every platform. On Unix that is `kill` → `Ok`;
+    /// on non-Unix it is the unprobeable limb. Either way the incumbent is never replaced, which is
+    /// the property `assert_no_live_broker` exists for.
+    #[test]
+    fn a_live_pid_is_refused_on_every_platform() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_path = dir.path().join("broker.pid");
+        std::fs::write(&pid_path, format!("{}\n", std::process::id())).unwrap();
+
+        let err = assert_no_live_broker(&pid_path).expect_err("a live broker must not be replaced");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(err.to_string().contains(&std::process::id().to_string()), "{err}");
     }
 
     /// The other early-return arms of `runtime-claim.ts:12`, which upstream's own suite does not

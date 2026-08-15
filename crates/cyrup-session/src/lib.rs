@@ -50,10 +50,9 @@ pub use listing::{
 pub use manager::{NewSessionOpts, SessionManager, TreeNode};
 pub use prompt::{
     apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
-    ContextDiagnostic, ContextError, ContextFile, ContextFileLoader, ContextScope,
-    ContextSnapshot, ContextStore, DocsPointers, PromptContributor, PromptInputs, ResolvedOverride,
-    SkillPointer, SystemPromptBuilder, ToolPromptContribution, TrustQuery,
-    DEFAULT_SELECTED_TOOLS,
+    ContextDiagnostic, ContextError, ContextFile, ContextFileLoader, ContextScope, ContextSnapshot,
+    ContextStore, DocsPointers, PromptInputs, ResolvedOverride, SkillPointer, SystemPromptBuilder,
+    ToolPromptContribution, TrustQuery, DEFAULT_SELECTED_TOOLS,
 };
 pub use store::{DiskStore, MemStore, SessionStore};
 

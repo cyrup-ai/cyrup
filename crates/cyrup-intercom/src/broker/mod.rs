@@ -1,17 +1,23 @@
 //! The standalone broker **process** — a 1:1 port of `pi-intercom/broker/broker.ts`.
 //!
 //! Dispatched as the hidden `cyrup __intercom-broker` subcommand (re-exec of `current_exe()`,
-//! mirroring `cyrup-ext-subagents`' `__subagent-runner`). It binds a `tokio::net::UnixListener` at
-//! `<intercomDir>/broker.sock`, speaks length-prefixed JSON ([`crate::transport::framing`]), routes
+//! mirroring `cyrup-ext-subagents`' `__subagent-runner`). It binds the listen target resolved by
+//! [`crate::transport::target::broker_listen_target`] — `<intercomDir>/broker.sock` on POSIX,
+//! `\\.\pipe\cyrup-intercom-<agent dir>` on Windows — speaks length-prefixed JSON
+//! ([`crate::transport::framing`]), routes
 //! `send` frames child→broker→target by session identity, enforces the registration handshake +
 //! caps + per-connection token bucket, tracks ask edges (mutual-ask refusal + prune), coalesces
 //! presence, answers the health probe byte-identically, and auto-shuts-down 5 s after its last
 //! client leaves (`broker.ts:286-296`).
 //!
-//! First cyrup milestone: **Unix domain socket only**. The Windows named-pipe / opt-in TCP-loopback
-//! transports (`broker.ts:143-180,307-330`, TCP `stateId` auth) are deferred behind the same env
-//! gates (the port doc §10-Q2); on a Unix socket `requiresEndpointAuth` is always `false`.
+//! Transports: the Unix domain socket (POSIX) and the Windows named pipe are both bound through
+//! [`listener::BrokerListener`], which is this port's stand-in for upstream's single polymorphic
+//! `net.createServer().listen(LISTEN_TARGET)` (`broker.ts:123,149-152`). The **opt-in** loopback-TCP
+//! transport (`CYRUP_INTERCOM_TRANSPORT=tcp`; `broker.ts:134-141,284-305`, `stateId` auth) is the
+//! one piece still unported — see the port doc §10-Q2 and [`listener::BrokerListener::bind`], which
+//! refuses that listen target loudly rather than downgrading to another endpoint.
 
+pub mod listener;
 pub mod ratelimit;
 pub mod routing;
 pub mod runtime_claim;
@@ -21,8 +27,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::UnixListener;
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Notify;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
@@ -1648,7 +1652,10 @@ fn schedule_shutdown_check(state: &Arc<Mutex<BrokerState>>) {
 }
 
 /// The per-connection writer task: drain queued frames to the socket, then half-close on EOF.
-async fn writer_task(mut write_half: OwnedWriteHalf, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn writer_task(
+    mut write_half: crate::transport::stream::BrokerWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+) {
     while let Some(frame) = rx.recv().await {
         if write_half.write_all(&frame).await.is_err() {
             break;
@@ -1715,7 +1722,7 @@ fn process_frame_payload(
 /// [`BrokerState::handle_frame`], honoring the 1 s registration timeout.
 async fn reader_task(
     conn_id: u64,
-    mut read_half: OwnedReadHalf,
+    mut read_half: crate::transport::stream::BrokerReadHalf,
     self_tx: UnboundedSender<Vec<u8>>,
     close: Arc<Notify>,
     state: Arc<Mutex<BrokerState>>,
@@ -1794,7 +1801,7 @@ async fn reader_task(
 /// Wire one accepted connection: split it, spawn its writer + reader, and register it.
 fn spawn_connection(
     conn_id: u64,
-    stream: tokio::net::UnixStream,
+    stream: crate::transport::stream::BrokerStream,
     state: Arc<Mutex<BrokerState>>,
 ) {
     let (read_half, write_half) = stream.into_split();
@@ -1810,7 +1817,11 @@ fn spawn_connection(
 
 /// Tear down the whole broker on shutdown (`shutdown`, `broker.ts:606-633`): end every session,
 /// clear the maps, unlink the runtime files.
-fn shutdown_broker(state: &Arc<Mutex<BrokerState>>, socket_path: &std::path::Path, pid_path: &std::path::Path) {
+fn shutdown_broker(
+    state: &Arc<Mutex<BrokerState>>,
+    listen_target: &crate::transport::target::BrokerConnectTarget,
+    pid_path: &std::path::Path,
+) {
     {
         let mut g = lock(state);
         for (_id, h) in g.connections.drain() {
@@ -1828,16 +1839,20 @@ fn shutdown_broker(state: &Arc<Mutex<BrokerState>>, socket_path: &std::path::Pat
         g.mailbox_messages.clear();
         g.unregistered.clear();
     }
-    let _ = std::fs::remove_file(socket_path);
+    // `unlinkSync(LISTEN_TARGET)` guarded by
+    // `typeof LISTEN_TARGET === "string" && process.platform !== "win32"`
+    // (`v0.10.1 broker/broker.ts:1416-1418`) — a named pipe has no filesystem entry to remove.
+    listener::unlink_stale_endpoint(listen_target);
     let _ = std::fs::remove_file(pid_path);
 }
 
 /// The `cyrup __intercom-broker` entrypoint (`new IntercomBroker().start()`, `broker.ts:636`).
-/// Binds the Unix socket, writes the pid file, runs the accept loop, and shuts down on SIGTERM/
-/// SIGINT or the 5 s idle auto-shutdown. Returns once the socket + runtime files are cleaned up.
+/// Binds the listen target (Unix socket / Windows named pipe, [`listener::BrokerListener`]), writes
+/// the pid file, runs the accept loop, and shuts down on SIGTERM/SIGINT or the 5 s idle
+/// auto-shutdown. Returns once the endpoint + runtime files are cleaned up.
 ///
 /// # Errors
-/// Returns an I/O error if the intercom dir cannot be created or the socket cannot be bound.
+/// Returns an I/O error if the intercom dir cannot be created or the listen target cannot be bound.
 pub async fn run() -> std::io::Result<()> {
     // `ask_timeout_ms` hard-errors on an invalid env value, matching pi's uncaught throw
     // (`config.ts:14-16`) that crashes `new IntercomBroker()` — a class-field initializer that runs
@@ -1851,7 +1866,11 @@ pub async fn run() -> std::io::Result<()> {
     let agent_dir = paths::agent_dir_path();
     let intercom_dir = paths::intercom_dir_path(&agent_dir);
     paths::ensure_intercom_runtime_dir(&intercom_dir)?;
-    let socket_path = paths::broker_socket_path(&intercom_dir);
+    // `const LISTEN_TARGET = getBrokerListenTarget();` (`v0.9.2 broker/broker.ts:26`) — the socket
+    // path on POSIX, the `\\.\pipe\cyrup-intercom-<agent dir>` name on Windows, or the loopback-TCP
+    // endpoint under the Windows-only opt-in (`broker/paths.ts:107-116`). This replaces a direct
+    // `paths::broker_socket_path(...)` read, which hard-coded the POSIX arm.
+    let listen_target = crate::transport::target::broker_listen_target(&agent_dir);
     let pid_path = paths::broker_pid_path(&intercom_dir);
 
     // Claim the runtime BEFORE touching anything in it (`assertNoLiveBroker(PID_PATH)`,
@@ -1865,8 +1884,9 @@ pub async fn run() -> std::io::Result<()> {
     runtime_claim::assert_no_live_broker(&pid_path)?;
 
     // Unlink a stale socket left by a crashed broker (`v0.9.2 broker/broker.ts:233-238`;
-    // `v0.7.0 broker/broker.ts:143-148`).
-    let _ = std::fs::remove_file(&socket_path);
+    // `v0.7.0 broker/broker.ts:143-148`), under upstream's own
+    // `typeof LISTEN_TARGET === "string" && platform !== "win32"` guard (`:116`).
+    listener::unlink_stale_endpoint(&listen_target);
     // CYRUP-DELTA (`v0.9.2 broker/broker.ts:239` `net.createServer().listen(LISTEN_TARGET)`, and
     // `broker/paths.ts:65-74`, which has no length guard either): upstream loses the reason the same
     // way, so this is a shared robustness gap, not a parity divergence. What is added here is only
@@ -1874,37 +1894,48 @@ pub async fn run() -> std::io::Result<()> {
     // `HOME`/`CYRUP_AGENT_DIR` makes this bind fail with a bare "path must be shorter than SUN_LEN"
     // that names neither the limit's cause nor the path. Naming both here is what makes the parent's
     // captured-stderr message (`transport::spawn::BrokerStderrTail`) actionable.
-    let listener = UnixListener::bind(&socket_path).map_err(|e| {
+    let endpoint = describe_listen_target(&listen_target);
+    let mut listener = listener::BrokerListener::bind(&listen_target).await.map_err(|e| {
         std::io::Error::new(
             e.kind(),
-            format!(
-                "failed to bind the intercom broker socket at {} ({} bytes): {e}",
-                socket_path.display(),
-                socket_path.as_os_str().len()
-            ),
+            format!("failed to bind the intercom broker endpoint at {endpoint} ({} bytes): {e}", endpoint.len()),
         )
     })?;
-    let _ = paths::restrict_intercom_runtime_file(&socket_path);
+    if let crate::transport::target::BrokerConnectTarget::Socket(path) = &listen_target {
+        // `restrictIntercomRuntimeFile(LISTEN_TARGET)` for the string arm (`broker.ts:128-130`);
+        // itself a no-op off POSIX (`paths.ts:128-135`).
+        let _ = paths::restrict_intercom_runtime_file(path);
+    }
     std::fs::write(&pid_path, std::process::id().to_string())?;
     let _ = paths::restrict_intercom_runtime_file(&pid_path);
-    tracing::info!(pid = std::process::id(), socket = %socket_path.display(), "intercom broker started");
+    tracing::info!(pid = std::process::id(), endpoint = %endpoint, "intercom broker started");
 
     let shutdown = Arc::new(Notify::new());
     let state = Arc::new(Mutex::new(BrokerState::new(ask_timeout, shutdown.clone())));
     let mut next_conn_id: u64 = 0;
 
-    // SIGTERM/SIGINT → graceful shutdown (broker.ts:181-182). The broker is a Unix-socket process
-    // (`UnixListener` above), so this whole entrypoint is inherently unix-only for this milestone.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    // `process.on("SIGTERM"|"SIGINT", () => this.shutdown())` (`broker.ts:181-182`).
+    //
+    // # [CYRUP-DELTA] — the terminate signal is per-platform because the OS is
+    //
+    // Upstream symbol: `broker.ts:181-182`. Node synthesises a `SIGTERM`/`SIGINT` listener on every
+    // platform, but on Windows there are no POSIX signals underneath: libuv raises `SIGINT` from a
+    // console Ctrl-C and simply never raises `SIGTERM` (`taskkill` without `/F` delivers a console
+    // CTRL_CLOSE/CTRL_SHUTDOWN event instead). `tokio::signal::unix` does not exist off POSIX at
+    // all, so the same intent is expressed with the platform's own events: Ctrl-C everywhere, plus
+    // SIGTERM on POSIX and the console close/shutdown controls on Windows. The observable behaviour
+    // — a polite terminate reaches `shutdown_broker`, so the pid file and (on POSIX) the socket are
+    // removed rather than orphaned — is the same one upstream gets.
+    let mut terminate = TerminateSignal::install()?;
 
     loop {
         tokio::select! {
             () = shutdown.notified() => break,
             _ = tokio::signal::ctrl_c() => break,
-            _ = sigterm.recv() => break,
+            () = terminate.recv() => break,
             accepted = listener.accept() => {
                 match accepted {
-                    Ok((stream, _addr)) => {
+                    Ok(stream) => {
                         let conn_id = next_conn_id;
                         next_conn_id = next_conn_id.wrapping_add(1);
                         spawn_connection(conn_id, stream, state.clone());
@@ -1916,8 +1947,64 @@ pub async fn run() -> std::io::Result<()> {
     }
 
     tracing::info!("intercom broker shutting down");
-    shutdown_broker(&state, &socket_path, &pid_path);
+    shutdown_broker(&state, &listen_target, &pid_path);
     Ok(())
+}
+
+/// The listen target rendered for diagnostics — the socket path / pipe name, or `host:port`.
+fn describe_listen_target(target: &crate::transport::target::BrokerConnectTarget) -> String {
+    match target {
+        crate::transport::target::BrokerConnectTarget::Socket(path) => path.display().to_string(),
+        crate::transport::target::BrokerConnectTarget::Tcp(e) => format!("{}:{}", e.host, e.port),
+    }
+}
+
+/// The platform's "please terminate" event, standing in for upstream's `process.on("SIGTERM")`
+/// (`broker.ts:181`). See the CYRUP-DELTA at its installation site in [`run`].
+struct TerminateSignal {
+    #[cfg(unix)]
+    sigterm: tokio::signal::unix::Signal,
+    #[cfg(windows)]
+    close: tokio::signal::windows::CtrlClose,
+    #[cfg(windows)]
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+impl TerminateSignal {
+    /// Register the handler(s). Errors propagate exactly as the old bare
+    /// `tokio::signal::unix::signal(...)?` did.
+    fn install() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        {
+            Ok(Self {
+                sigterm: tokio::signal::unix::signal(
+                    tokio::signal::unix::SignalKind::terminate(),
+                )?,
+            })
+        }
+        #[cfg(windows)]
+        {
+            Ok(Self {
+                close: tokio::signal::windows::ctrl_close()?,
+                shutdown: tokio::signal::windows::ctrl_shutdown()?,
+            })
+        }
+    }
+
+    /// Resolve on the first terminate-shaped event.
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        {
+            self.sigterm.recv().await;
+        }
+        #[cfg(windows)]
+        {
+            tokio::select! {
+                _ = self.close.recv() => {}
+                _ = self.shutdown.recv() => {}
+            }
+        }
+    }
 }
 
 #[cfg(test)]

@@ -3,9 +3,15 @@
 //! `crates/cyrup-ext-subagents/src/background/mod.rs:1086-1100` resolves the same `<home>/.cyrup`
 //! root from `CYRUP_HOME`/`HOME`).
 //!
-//! First cyrup milestone: **Unix domain socket only** (macOS/Linux). The Windows named-pipe and
-//! opt-in TCP-loopback transports (`paths.ts:44-116`) are deferred behind the same env gates
-//! (`CYRUP_INTERCOM_TRANSPORT=tcp`) — see the port doc §10-Q2.
+//! This module is the POSIX arm only: [`broker_socket_path`] is `getBrokerSocketPath`'s
+//! `<intercomDir>/broker.sock` branch. The platform CHOICE — that same branch vs the Windows named
+//! pipe `\\.\pipe\cyrup-intercom-…` (`paths.ts:65-74`), and the opt-in TCP-loopback endpoint
+//! (`paths.ts:44-116`, `CYRUP_INTERCOM_TRANSPORT=tcp`) — lives in
+//! [`crate::transport::target`], which both the client
+//! ([`broker_connect_target`](crate::transport::target::broker_connect_target)) and the broker
+//! ([`broker_listen_target`](crate::transport::target::broker_listen_target)) resolve through.
+//! Of those three transports only the opt-in TCP one is still unported on the
+//! BROKER side; see [`crate::broker::listener::BrokerListener::bind`] and the port doc §10-Q2.
 
 use std::path::{Path, PathBuf};
 

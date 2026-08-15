@@ -149,10 +149,24 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         let _ = guest.registry.register_guest_tool(guest.owner.clone(), desc);
     }
 
+    /// EXT-058 — pi `registerCommand(name, options)` writes STRAIGHT into the extension's live
+    /// `commands` map (`extensions/loader.ts:270-277` @v0.83.0:
+    /// `extension.commands.set(name, {name, sourceInfo, ...options})`), and `getCommand`
+    /// re-reads that map at every dispatch (`runner.ts:647-649`), so a post-`init`
+    /// `registerCommand` takes effect on the next `/name`.
+    ///
+    /// This used to stage into a per-guest `GuestState.commands` buffer that
+    /// [`LiveExtension::load`] drained ONCE, right after `call_init` — a `std::mem::take`, so a
+    /// registration made from any LIVE handler was accepted (`Ok`, no error channel in the WIT
+    /// signature) and then invisible forever: `resolved_command_owner` returned `None`,
+    /// `AgentSession::try_execute_wasm_command` returned `false` with no log, and `/name` went to
+    /// the model as an ordinary prompt. Every sibling import in this block already writes through
+    /// to the shared registry; this one now does too, which is also what makes it legal for the
+    /// `init`-time call (`register_shortcut` proves the registry is reachable during `init`).
     async fn register_command(&mut self, name: String, desc_json: String) {
         let Ok(guest) = guest_of(self) else { return };
         let desc: CommandDescriptor = serde_json::from_str(&desc_json).unwrap_or_default();
-        guest.push_command(name, desc);
+        let _ = guest.registry.register_command(guest.owner.clone(), name, desc);
     }
 
     async fn register_shortcut(&mut self, key: String, desc: String) {
@@ -1278,7 +1292,6 @@ impl Drop for ToolCallBinding<'_> {
 /// imports. Implements [`Extension`]; the dispatcher treats it identically to a native built-in.
 pub struct LiveExtension {
     id: ExtensionId,
-    subs: Subscriptions,
     epoch_ticks: u64,
     guest: Arc<GuestState>,
     inner: tokio::sync::Mutex<LiveInner>,
@@ -1355,15 +1368,13 @@ impl LiveExtension {
             Err(e) => return Err(map_wasm_error(&e)),
         }
 
-        // Flush command registrations declared during init into the registry (R-08-016).
-        for (name, desc) in guest.take_commands() {
-            guest.registry.register_command(guest.owner.clone(), name, desc)?;
-        }
-
-        let subs = guest.subscriptions();
+        // EXT-058: command registrations declared during `init` already landed in the registry —
+        // `registration::register-command` writes through like every sibling import, so there is
+        // no post-`init` drain (and therefore no init-only window a late registration falls out
+        // of). Subscriptions are likewise read LIVE off `GuestState` by
+        // `<LiveExtension as Extension>::subscriptions`, so nothing is snapshotted here either.
         Ok(Self {
             id,
-            subs,
             epoch_ticks,
             guest,
             inner: tokio::sync::Mutex::new(LiveInner { store, instance }),
@@ -1972,8 +1983,14 @@ impl Extension for LiveExtension {
     fn kind(&self) -> ExtKind {
         ExtKind::Wasm
     }
-    fn subscriptions(&self) -> &Subscriptions {
-        &self.subs
+    /// EXT-058 — read LIVE off [`GuestState`] on every call, never snapshotted. pi's `api.on(event,
+    /// handler)` pushes into `extension.handlers` (`extensions/loader.ts:252-258` @v0.83.0) and
+    /// every emitter re-reads `ext.handlers.get(event.type)` at dispatch time (`runner.ts:571`,
+    /// `:806`, `:841`, `:883`, `:937`, `:959`, `:989`, `:1021`, …), so a `subscribe` from a live
+    /// handler takes effect on the NEXT event. Snapshotting this once after `init` made the
+    /// `subscribe` import a write with no reader.
+    fn subscriptions(&self) -> Subscriptions {
+        self.guest.subscriptions()
     }
 
     async fn invoke_event(

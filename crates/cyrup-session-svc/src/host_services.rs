@@ -222,6 +222,18 @@ struct LiveSnapshot {
     /// the resolved `SettingsManager`, so a guest asking mid-session gets the session's REAL verdict
     /// rather than the trait default's conservative `false`.
     project_trusted: bool,
+    /// The session's scoped-model set, pre-serialized in pi's `ScopedModel` shape
+    /// (`{model, thinkingLevel?}` — `core/model-resolver.ts:63-67` @v0.83.0), backing
+    /// [`HostServices::scoped_models`] (pi `ctx.scopedModels`, `core/extensions/types.ts:326`,
+    /// bound on the BASE context by `getScopedModels()`, `core/extensions/runner.ts:706-709`).
+    ///
+    /// Mirrored for the same reason [`Self::system_prompt`] is: the authority
+    /// (`AgentSession::scoped_models`, session.rs) lives behind a lock this backend does not own,
+    /// and the read is SYNC. `AgentSession::set_scoped_models` — the ONLY writer, called from
+    /// `main.rs` after `resolve_scoped_models_reporting` — re-seeds it on every change, so the
+    /// mirror can never lag. Empty until then, which is upstream's documented "Empty when no
+    /// scoping is configured".
+    scoped_models: Vec<Value>,
 }
 
 /// The live session's activity readback + interrupt, backing the `ctx-state`/`control` imports that
@@ -292,6 +304,32 @@ fn builtin_tool_source_info(name: &str) -> Value {
         "scope": "temporary",
         "origin": "top-level",
     })
+}
+
+/// One `SessionTreeNode` (pi `core/session-manager.ts:159-166`) as `{entry, children, label?,
+/// labelTimestamp?}` — the shape pi's `getTree()` hands out and the wire contract names
+/// (`modes/rpc/rpc-types.ts:202-208`).
+///
+/// Lives here rather than nested inside [`crate::AgentSession::tree_json`] because BOTH the RPC
+/// `get_tree` reply and the extension seam's [`HostServices::tree`] must emit the identical shape;
+/// two copies is exactly how SEAM-060's dropped `labelTimestamp` survived on one side after being
+/// fixed on the other.
+pub(crate) fn tree_node_to_json(node: &cyrup_session::manager::TreeNode) -> Value {
+    let mut obj = serde_json::Map::new();
+    if let Ok(entry) = serde_json::to_value(&node.entry) {
+        obj.insert("entry".to_string(), entry);
+    }
+    obj.insert(
+        "children".to_string(),
+        Value::Array(node.children.iter().map(tree_node_to_json).collect()),
+    );
+    if let Some(label) = &node.label {
+        obj.insert("label".to_string(), Value::String(label.clone()));
+    }
+    if let Some(ts) = &node.label_timestamp {
+        obj.insert("labelTimestamp".to_string(), Value::String(ts.clone()));
+    }
+    Value::Object(obj)
 }
 
 /// A host-originated message injection routed from a background task's `inject_message` to the live
@@ -494,6 +532,14 @@ impl LiveHostServices {
             g.system_prompt = system_prompt;
         }
         g.project_trusted = project_trusted;
+    }
+
+    /// Seed/refresh the mirrored scoped-model set a guest's `ctx.scopedModels` reads (EXT-045; pi
+    /// `getScopedModels()` on the base extension context, `core/extensions/runner.ts:706-709`).
+    /// Called by `AgentSession::set_scoped_models`, the one writer of the authoritative set, so the
+    /// guest-visible view moves in lockstep with the `/scoped-models` command's own.
+    pub fn update_scoped_models(&self, models: Vec<Value>) {
+        Self::lock(&self.snapshot).scoped_models = models;
     }
 
     /// Attach the live session's activity readback + interrupt (EXT-005). Installed by
@@ -1163,6 +1209,153 @@ impl HostServices for LiveHostServices {
             Self::lock(&self.pending_events)
                 .push(AgentSessionEvent::SessionInfoChanged { name: resolved });
         }
+    }
+
+    // --- session READ-only view (pi `ctx.sessionManager: ReadonlySessionManager`,
+    // `core/extensions/types.ts:317` @v0.83.0, bound on the BASE extension context by
+    // `get sessionManager() { runner.assertActive(); return runner.sessionManager }`,
+    // `core/extensions/runner.ts:694-697` — so pi answers these truthfully in EVERY mode, tui/rpc/
+    // json/print alike; there is no upstream variant that reports an empty session).
+    //
+    // The write half of this same interface (`append_entry`/`set_session_name`/`set_label`, just
+    // above) has always been overridden, which is what made the read half's silence invisible: the
+    // seam looks wired at every call site and only one direction lies. `Err` from `with_manager`
+    // (unattached, or the non-blocking `try_lock` momentarily contended by an in-progress turn)
+    // degrades to the trait default exactly as the sibling `session_file` read already does —
+    // never a block, never a panic.
+
+    fn entries(&self) -> Value {
+        // pi `SessionManager.getEntries()` (`core/session-manager.ts:1301`): every entry except the
+        // session header, in file order. Same serialization `AgentSession::entries_json` performs.
+        self.with_manager(|mgr| {
+            Ok(Value::Array(
+                mgr.entries().iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
+            ))
+        })
+        .unwrap_or_else(|_| json!([]))
+    }
+
+    fn branch(&self) -> Value {
+        // pi `SessionManager.getBranch()` (`core/session-manager.ts:1260`), the root→leaf path from
+        // the CURRENT leaf — pi's own no-argument call site shape (`core/sdk.ts:192`,
+        // `core/agent-session.ts:1802`), which is `branch_path(None)` here.
+        self.with_manager(|mgr| {
+            Ok(Value::Array(
+                mgr.branch_path(None).iter().filter_map(|e| serde_json::to_value(e).ok()).collect(),
+            ))
+        })
+        .unwrap_or_else(|_| json!([]))
+    }
+
+    fn tree(&self) -> Value {
+        // pi `SessionManager.getTree()` (`core/session-manager.ts:1306`) → `SessionTreeNode[]`.
+        // Shares [`tree_node_to_json`] with `AgentSession::tree_json`, so the `labelTimestamp`
+        // SEAM-060 restored on the RPC side cannot go missing on this one.
+        self.with_manager(|mgr| Ok(Value::Array(mgr.tree().iter().map(tree_node_to_json).collect())))
+            .unwrap_or(Value::Null)
+    }
+
+    fn scoped_models(&self) -> Value {
+        // EXT-045; pi `ctx.scopedModels` (`core/extensions/types.ts:326` @v0.83.0), bound on the
+        // base context as `getScopedModels()` (`core/extensions/runner.ts:706-709`) and backed by
+        // `getScopedModels: () => this._scopedModels` (`core/agent-session.ts:2416`). Reads the
+        // mirror `AgentSession::set_scoped_models` keeps current; `[]` until then, which is
+        // upstream's documented "Empty when no scoping is configured".
+        Value::Array(Self::lock(&self.snapshot).scoped_models.clone())
+    }
+
+    // --- provider OAuth login callbacks (pi `OAuthLoginCallbacks`; the real wiring is
+    // `onPrompt: (prompt) => callbacks.prompt({ type: "text", ...prompt })` and
+    // `onSelect: (prompt) => callbacks.prompt({ type: "select", ...prompt })`,
+    // `core/provider-composer.ts:245,248` @v0.83.0, against `AuthInteraction.prompt(prompt):
+    // Promise<string>` — "returns the entered/selected string (`select` returns the option id).
+    // Rejects on cancel/abort" — `packages/ai/src/auth/types.ts:152-161`).
+    //
+    // These are the SAME human-paced dialog shape `confirm`/`input`/`select` already ride, so they
+    // ride the SAME `ui_sink` round trip; the two bridge-site comments in `cyrup-ext`'s
+    // `host/live.rs` (`:911-914`, `:929-930`) anticipate exactly this. With NO sink attached
+    // (headless print/json) they keep the trait deny defaults WITHOUT blocking — pi's
+    // `noOpUIContext` — which is why the sink presence is probed before the round trip rather than
+    // inferred from a `None` reply (a `None` reply also means "cancelled", and cancelled is
+    // upstream's REJECT, not "no surface").
+
+    fn oauth_prompt(
+        &self,
+        message: &str,
+        placeholder: Option<&str>,
+        allow_empty: bool,
+    ) -> Result<String, String> {
+        // Bound the guard to its own statement: `ui_roundtrip` takes this SAME std `Mutex`, which is
+        // not reentrant, so the probe must never be alive across the call.
+        let attached = Self::lock(&self.ui_sink).is_some();
+        if !attached {
+            return Err("oauth prompt capability not granted".into());
+        }
+        let reply = self.ui_roundtrip(
+            UiKind::Input,
+            message,
+            Value::Null,
+            String::new(),
+            placeholder.map(str::to_string),
+            &DialogOptions::default(),
+        );
+        match reply {
+            // `allow-empty: false` is the guest declaring the value mandatory (world.wit:871), so an
+            // empty submission is not an answer — pi's own prompt components re-prompt rather than
+            // resolve. Cyrup cannot re-prompt across the suspended guest call, so it reports the
+            // step unsatisfied, which is upstream's reject-on-no-value.
+            Some(UiReply::Text(Some(text))) if allow_empty || !text.trim().is_empty() => Ok(text),
+            Some(UiReply::Text(Some(_))) => Err("oauth prompt cancelled: a value is required".into()),
+            // Esc / timeout / a dropped renderer — pi's `prompt()` REJECTS on cancel/abort.
+            _ => Err("oauth prompt cancelled".into()),
+        }
+    }
+
+    fn oauth_select(&self, message: &str, options: &Value) -> Option<String> {
+        // Same non-reentrancy note as `oauth_prompt`: the guard dies before `ui_roundtrip` re-locks.
+        let attached = Self::lock(&self.ui_sink).is_some();
+        if !attached {
+            return None;
+        }
+        // CYRUP-DELTA (`packages/ai/src/auth/types.ts:128` @v0.83.0, the `select` `AuthPrompt`
+        // variant `{id, label, description?}`): the shared [`UiRequest`] carries `options` as a flat
+        // array of option STRINGS and replies with the chosen STRING (the TUI's `UiKind::Select` arm
+        // and the RPC `method:"select"` wire both read it that way). The OAuth selector's options are
+        // `{id, label}` OBJECTS and it must return the chosen ID. Rather than widen `UiRequest` —
+        // which would break both renderers — project `label` (falling back to `id`) out for display
+        // and map the answer back to its `id` here, so the guest still receives exactly the id pi's
+        // `callbacks.prompt({type:"select"})` returns. `description` has no carrier and is dropped.
+        let rows: Vec<(String, String)> = options
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|o| {
+                        let id = o.get("id").and_then(Value::as_str)?;
+                        let label = o.get("label").and_then(Value::as_str).unwrap_or(id);
+                        Some((id.to_string(), label.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let labels = Value::Array(rows.iter().map(|(_, l)| Value::String(l.clone())).collect());
+        let picked = match self.ui_roundtrip(
+            UiKind::Select,
+            message,
+            labels,
+            String::new(),
+            None,
+            &DialogOptions::default(),
+        ) {
+            Some(UiReply::Text(Some(t))) => t,
+            // `none` = cancel (world.wit:874), which is upstream's rejected prompt.
+            _ => return None,
+        };
+        // Map the chosen LABEL back to its id; a guest that labelled two options identically gets
+        // the first, and a renderer that echoed an id straight back still resolves.
+        rows.iter()
+            .find(|(_, l)| *l == picked)
+            .or_else(|| rows.iter().find(|(id, _)| *id == picked))
+            .map(|(id, _)| id.clone())
     }
 
     fn set_label(&self, entry_id: &str, label: Option<&str>) {
@@ -2012,6 +2205,232 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["name"], json!("bash"));
         assert_eq!(rows[0]["sourceInfo"]["source"], json!("builtin"));
+    }
+
+    // ------------------------------------------------- session read-only view (ctx.sessionManager) --
+
+    /// The READ half of the `session` interface must answer from the LIVE tree.
+    ///
+    /// pi binds the real `ReadonlySessionManager` onto the BASE extension context
+    /// (`get sessionManager() { runner.assertActive(); return runner.sessionManager }`,
+    /// `core/extensions/runner.ts:694-697`, typed at `core/extensions/types.ts:317`), so
+    /// `getEntries()`/`getBranch()`/`getTree()` are truthful in every mode upstream. cyrup's ONLY
+    /// production backend overrode none of them, so every guest read `[]`/`[]`/`null` forever —
+    /// indistinguishable from a genuinely fresh session, with no error and no log line, exactly the
+    /// shape the EXT-005 ctx-state postmortem describes.
+    ///
+    /// RED before the fix on all three attached assertions (they returned the trait defaults
+    /// `json!([])`/`json!([])`/`Value::Null` regardless of the attached manager); the UNATTACHED
+    /// assertions pass either way and are here to pin that the honest default-host answer survives.
+    #[test]
+    fn session_read_view_answers_from_the_live_tree() {
+        use cyrup_session::manager::NewSessionOpts;
+
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+
+        // No manager attached (the default host / a by-value session): the trait defaults ARE the
+        // honest answer — there is no session to report on.
+        assert_eq!(svc.entries(), json!([]), "unattached ⇒ pi's empty read");
+        assert_eq!(svc.branch(), json!([]), "unattached ⇒ pi's empty read");
+        assert_eq!(svc.tree(), Value::Null, "unattached ⇒ the trait's null tree");
+
+        let mut mgr = SessionManager::in_memory(&std::env::temp_dir(), NewSessionOpts::default())
+            .expect("an in-memory session tree");
+        let root = mgr.append_custom_entry("note", Some(json!({"n": 1}))).expect("append root");
+        let leaf = mgr.append_custom_entry("note", Some(json!({"n": 2}))).expect("append leaf");
+        let label = mgr.append_label(&root, Some("checkpoint")).expect("label the root");
+        let (root, leaf, label) = (root.to_string(), leaf.to_string(), label.to_string());
+        svc.attach_session(Arc::new(AsyncMutex::new(mgr)));
+
+        // `entries` — pi `SessionManager.getEntries()`: every entry except the header. The label is
+        // itself an appended entry, so three rows, and the two notes are among them BY ID.
+        let entries = svc.entries();
+        let ids: Vec<&str> =
+            entries.as_array().expect("an array").iter().filter_map(|e| e["id"].as_str()).collect();
+        assert!(ids.contains(&root.as_str()), "the live tree's entries reached the guest: {ids:?}");
+        assert!(ids.contains(&leaf.as_str()), "the live tree's entries reached the guest: {ids:?}");
+
+        // `branch` — pi `SessionManager.getBranch()`: walk parent-ward from the CURRENT leaf, then
+        // reverse. Its doc is explicit that the walk "Includes all entry types (messages,
+        // compaction, model changes, etc.)", and `appendLabelChange` builds its `LabelEntry` with
+        // `parentId: this.leafId` and then `_appendEntry`s it — so labelling APPENDS to the path
+        // rather than annotating off it, and the label entry is the branch head here.
+        // `SessionManager::append_label` is the same mechanism (`push_entry` of a
+        // `KnownEntry::Label`), so the path is asserted exactly rather than by containment.
+        let branch = svc.branch();
+        let branch_ids: Vec<&str> =
+            branch.as_array().expect("an array").iter().filter_map(|e| e["id"].as_str()).collect();
+        assert_eq!(
+            branch_ids,
+            vec![root.as_str(), leaf.as_str(), label.as_str()],
+            "the branch is the whole root→leaf path, in order: {branch_ids:?}"
+        );
+
+        // `tree` — pi `SessionManager.getTree()` → `SessionTreeNode[]`, nested, carrying `label`
+        // AND SEAM-060's `labelTimestamp` because it shares `tree_node_to_json` with the RPC
+        // `get_tree` reply rather than re-deriving the node shape.
+        let tree = svc.tree();
+        let roots = tree.as_array().expect("an array of roots");
+        assert_eq!(roots.len(), 1, "a well-formed session has exactly one root: {tree}");
+        assert_eq!(roots[0]["entry"]["id"], json!(root));
+        assert_eq!(roots[0]["label"], json!("checkpoint"), "labels survive the serialization");
+        assert!(
+            roots[0]["labelTimestamp"].is_string(),
+            "SEAM-060's labelTimestamp must not be dropped on this side either: {tree}"
+        );
+        let kids = roots[0]["children"].as_array().expect("children");
+        assert_eq!(kids.len(), 1, "the leaf hangs off the root: {tree}");
+        assert_eq!(kids[0]["entry"]["id"], json!(leaf));
+    }
+
+    /// EXT-045 — `scoped_models` must report the session's REAL scoped set, in pi's
+    /// `ScopedModel` shape (`{model, thinkingLevel?}`, `core/model-resolver.ts:63-67`).
+    ///
+    /// pi exposes it on the base context (`getScopedModels()`, `core/extensions/runner.ts:706-709`;
+    /// `getScopedModels: () => this._scopedModels`, `core/agent-session.ts:2416`), so a guest can
+    /// tell a `--models`-scoped session from an unscoped one. Reading `[]` forever made the two
+    /// indistinguishable and every model-picking extension free to offer models the user had
+    /// deliberately excluded. RED before the fix on the seeded assertion.
+    #[test]
+    fn scoped_models_reports_the_sessions_real_scoped_set() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = svc_with(provider);
+
+        // Unscoped is upstream's documented "Empty when no scoping is configured".
+        assert_eq!(svc.scoped_models(), json!([]));
+
+        svc.update_scoped_models(vec![
+            json!({"model": {"id": "faux-1", "provider": "faux"}, "thinkingLevel": "high"}),
+            json!({"model": {"id": "faux-2", "provider": "faux"}}),
+        ]);
+        let scoped = svc.scoped_models();
+        let rows = scoped.as_array().expect("an array");
+        assert_eq!(rows.len(), 2, "the whole scoped set reaches the guest: {scoped}");
+        assert_eq!(rows[0]["model"]["id"], json!("faux-1"));
+        assert_eq!(rows[0]["thinkingLevel"], json!("high"), "pi's per-model thinking level survives");
+        assert!(
+            rows[1].get("thinkingLevel").is_none(),
+            "an unset thinkingLevel is OMITTED, matching an `undefined` field upstream: {scoped}"
+        );
+    }
+
+    // ---------------------------------------------------- provider OAuth login callbacks (pi) --
+
+    /// `oauth_prompt`/`oauth_select` must reach the live dialog renderer.
+    ///
+    /// pi wires them to the real interaction — `onPrompt: (prompt) => callbacks.prompt({type:
+    /// "text", ...prompt})` and `onSelect: (prompt) => callbacks.prompt({type: "select", ...prompt})`
+    /// (`core/provider-composer.ts:245,248`) against `AuthInteraction.prompt(): Promise<string>`,
+    /// "returns the entered/selected string (`select` returns the option id)"
+    /// (`packages/ai/src/auth/types.ts:152-161`). cyrup's production backend overrode neither, so a
+    /// guest-authored provider's interactive `login` could never obtain a value: every prompt came
+    /// back "oauth prompt capability not granted" from a capability nothing in the workspace grants,
+    /// and every select came back `None` (which a guest reads as the user cancelling).
+    ///
+    /// RED before the fix on both round-trip assertions. The headless assertions pass either way and
+    /// pin that an unattached renderer still yields pi's `noOpUIContext` denial WITHOUT blocking.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_prompt_and_select_round_trip_through_the_ui_sink() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = Arc::new(svc_with(provider));
+
+        // Headless (no renderer): the deny defaults, without blocking — pi's `noOpUIContext`.
+        assert!(svc.oauth_prompt("paste the callback url", None, false).is_err());
+        assert_eq!(svc.oauth_select("pick an account", &json!([])), None);
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
+        svc.set_ui_sink(tx);
+        // The scripted renderer answers exactly as the TUI's `UiKind::Input`/`UiKind::Select` arms
+        // do: a typed string, or the chosen option STRING out of `options`.
+        let seen: Arc<Mutex<Vec<(UiKind, String, Value)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = seen.clone();
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                seen2
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push((req.kind, req.prompt.clone(), req.options.clone()));
+                let reply = match req.kind {
+                    UiKind::Input => UiReply::Text(Some("pasted-code".to_string())),
+                    // Pick the SECOND row, so the id mapped back cannot be an accident of ordering.
+                    UiKind::Select => UiReply::Text(
+                        req.options.as_array().and_then(|a| a.get(1)).and_then(Value::as_str).map(str::to_string),
+                    ),
+                    _ => UiReply::Confirm(false),
+                };
+                let _ = req.reply.send(reply);
+            }
+        });
+
+        let s1 = svc.clone();
+        let prompted = tokio::task::spawn_blocking(move || {
+            s1.oauth_prompt("paste the callback url", Some("https://…"), false)
+        })
+        .await
+        .expect("oauth prompt task");
+        assert_eq!(
+            prompted.as_deref(),
+            Ok("pasted-code"),
+            "pi's `prompt()` resolves with the entered string, not a capability denial"
+        );
+
+        let s2 = svc.clone();
+        let picked = tokio::task::spawn_blocking(move || {
+            s2.oauth_select(
+                "pick an account",
+                &json!([
+                    {"id": "acct-1", "label": "Personal"},
+                    {"id": "acct-2", "label": "Work"},
+                ]),
+            )
+        })
+        .await
+        .expect("oauth select task");
+        assert_eq!(
+            picked.as_deref(),
+            Some("acct-2"),
+            "`select` returns the option ID (auth/types.ts:157), mapped back from the label the \
+             renderer displayed"
+        );
+
+        // The renderer saw the OAuth selector's LABELS, not raw `{id,label}` objects it cannot
+        // render (the `UiRequest.options` contract is a flat array of option strings).
+        let seen = seen.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let select = seen.iter().find(|(k, _, _)| *k == UiKind::Select).expect("a select request");
+        assert_eq!(select.2, json!(["Personal", "Work"]), "labels are what reach the renderer");
+        assert!(
+            seen.iter().any(|(k, p, _)| *k == UiKind::Input && p == "paste the callback url"),
+            "the prompt message rides the dialog title, like every other kind: {seen:?}"
+        );
+    }
+
+    /// `allow_empty: false` is the guest declaring the value mandatory (`world.wit:871`), so an
+    /// empty submission is not an answer — pi's prompt rejects rather than resolving with `""`.
+    /// With `allow_empty: true` the same submission IS the answer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn oauth_prompt_honours_allow_empty() {
+        let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+        let svc = Arc::new(svc_with(provider));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<UiRequest>();
+        svc.set_ui_sink(tx);
+        tokio::spawn(async move {
+            while let Some(req) = rx.recv().await {
+                let _ = req.reply.send(UiReply::Text(Some(String::new())));
+            }
+        });
+
+        let s1 = svc.clone();
+        let strict = tokio::task::spawn_blocking(move || s1.oauth_prompt("token?", None, false))
+            .await
+            .expect("task");
+        assert!(strict.is_err(), "a mandatory prompt does not resolve with an empty value");
+
+        let s2 = svc.clone();
+        let lenient = tokio::task::spawn_blocking(move || s2.oauth_prompt("token?", None, true))
+            .await
+            .expect("task");
+        assert_eq!(lenient.as_deref(), Ok(""), "allow-empty accepts the empty submission");
     }
 
     /// EXT-037 — the override must (a) answer `None` when no catalog is attached, so the cyrup-ext

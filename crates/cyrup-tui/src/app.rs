@@ -4997,8 +4997,19 @@ impl<B: Backend> App<B> {
             C::Copy => match session.last_assistant_text().await {
                 Some(text) => {
                     let n = text.chars().count();
-                    copy_to_clipboard(&text);
-                    self.state.transcript.push_status(format!("copied last message ({n} chars)"));
+                    // Pi's `handleCopyCommand` (interactive-mode.ts:6002-6019) wraps the write in a
+                    // `try`: success shows a status, a THROW shows `showError(...)`. Reporting
+                    // "copied" unconditionally is what let the old `#[cfg(not(unix))]` no-op tell a
+                    // Windows user their message was on the clipboard when nothing had been written.
+                    if crate::clipboard::copy_to_clipboard(&text).await {
+                        self.state
+                            .transcript
+                            .push_status(format!("copied last message ({n} chars)"));
+                    } else {
+                        // The message Pi throws when every branch failed (`clipboard.ts:171-173`),
+                        // surfaced through the same error channel as its `showError`.
+                        self.state.transcript.push_error("Failed to copy to clipboard");
+                    }
                 }
                 None => self.state.transcript.push_status("no assistant message to copy"),
             },
@@ -5954,34 +5965,9 @@ fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-/// Copy `text` to the system clipboard best-effort via the platform CLI (`pbcopy` on macOS, `xclip`/
-/// `wl-copy` on Linux). No new dependency and no unsafe — a missing tool is silently ignored
-/// (`handleCopyCommand` clipboard write, interactive-mode.ts:5285). Unix-only.
-#[cfg(unix)]
-fn copy_to_clipboard(text: &str) {
-    use std::io::Write;
-    let candidates: &[(&str, &[&str])] =
-        &[("pbcopy", &[]), ("wl-copy", &[]), ("xclip", &["-selection", "clipboard"])];
-    for (bin, args) in candidates {
-        let child = std::process::Command::new(bin)
-            .args(*args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-        if let Ok(mut child) = child {
-            if let Some(mut stdin) = child.stdin.take() {
-                let _ = stdin.write_all(text.as_bytes());
-            }
-            let _ = child.wait();
-            return;
-        }
-    }
-}
-
-/// No-op clipboard write on non-unix targets (the platform CLI tools are unix-only here).
-#[cfg(not(unix))]
-fn copy_to_clipboard(_text: &str) {}
+// The clipboard WRITE lives in [`crate::clipboard`] — Pi's `utils/clipboard.ts` is likewise its own
+// module, and the target-gated pair that used to sit here (a `#[cfg(unix)]` CLI probe beside a
+// `#[cfg(not(unix))]` no-op) is documented there as what it replaced.
 
 /// Read a system-clipboard image and materialize it as a PNG temp file, returning its path (Pi
 /// `readClipboardImage` + the temp-file write of `handleClipboardImagePaste`,
@@ -7229,8 +7215,32 @@ pub fn render(frame: &mut Frame, state: &mut AppState) {
         let cancel = state.keymap.keys_label(Action::Interrupt);
         state.indicator.render(frame, band_area, &state.theme, cancel.as_deref());
     }
+    // Pi gates the hardware cursor globally — `showHardwareCursor` (`tui.ts:344,389-397`), fed from
+    // the setting at `interactive-mode.ts:1721-1732` — and cyrup parks that flag on the editor
+    // (`editor.rs:277`, "the ONLY component that asks for a cursor position is this editor"), which
+    // was true only because the selector half had never been wired. Read before the borrow below.
+    // …and only while the slot actually holds focus: a floating overlay draws OVER the live region
+    // and captures input, so parking the cursor on a caret the user cannot type into would point at
+    // the wrong thing. Pi ties the same decision to its own z-stack (`if (this.overlayStack.length
+    // === 0) this.terminal.hideCursor()`, `tui.ts:656`).
+    let show_hardware_cursor = state.editor.show_hardware_cursor() && state.overlays.is_empty();
     if let Some(active) = state.selector.as_mut() {
         active.inner.render(frame, slot_area, &state.theme);
+        // The selector half of the hardware cursor. While a selector owns the input slot — an
+        // extension `ui.input` dialog, `/model`, `/resume`'s search — Pi still positions the real
+        // cursor at the typed character, because the focused `Input` inside the dialog emits
+        // `CURSOR_MARKER` and `TUI.extractCursorPosition` finds it in the rendered output
+        // (`tui.ts:1189-1207`, `input.ts:434`). Cyrup drew the reverse-video caret but left the
+        // terminal cursor wherever the previous frame put it, which is what an IME composes
+        // against and what a screen reader follows. [`crate::selector::caret_cell`] is the same
+        // scan over the rendered CELLS; see its doc for why the reversed caret is the marker.
+        if show_hardware_cursor {
+            // Bound the buffer borrow to this statement so `set_cursor_position` can take `frame`.
+            let caret = crate::selector::caret_cell(frame.buffer_mut(), slot_area);
+            if let Some(pos) = caret {
+                frame.set_cursor_position(pos);
+            }
+        }
     } else if let Some(loader) = state.loader.as_ref() {
         // A long inline op (e.g. `/share`'s gist creation) owns the slot with a `BorderedLoader`.
         loader.render(frame, slot_area, &state.theme, state.loader_tick);
@@ -7808,6 +7818,21 @@ impl App<CrosstermBackend<Stdout>> {
                 }
             };
             tokio::select! {
+                // REQUIRED, not a micro-optimisation — the same statement `cyrup-tools/src/lock.rs:
+                // 178` makes for its own cancel race, and the shape every `select!` in
+                // `cyrup-ext/src/host/live.rs` already uses. Without it tokio picks a READY arm at
+                // random, so a loop iteration in which teardown was requested AND a keystroke,
+                // agent event or ticker is simultaneously ready could service the work arm instead:
+                // one more consumed key, one more drawn frame, one more applied event after the
+                // token fired. It terminates quickly in expectation, but nothing in the code bounds
+                // how much runs after cancellation — and shutdown ordering is exactly what the
+                // token is for. `biased;` makes the cancel arm win every such tie, deterministically.
+                //
+                // Nothing below depends on being polled ahead of the cancel arm: the five ticker
+                // arms are all `if`-guarded and idempotent (a skipped tick is re-armed by
+                // `MissedTickBehavior::Skip`), and every channel arm keeps its message queued for
+                // the next poll. `src/tests/run_loop_cancel_bias.rs` pins this.
+                biased;
                 _ = cancel.cancelled() => break,
                 // The live `!`/`!!` block owns a `Loader` of its own (`bash-execution.ts:55-61`)
                 // with its own `setInterval` (`loader.ts:77-80`), so its spinner animates whether or

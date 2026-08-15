@@ -16,6 +16,11 @@
 //! wake — against a `HostServices` whose `select` PANICS, so a scan that reaches the dialog fails
 //! loudly rather than silently producing the denial it used to.
 
+// The allow-set every other test module in this workspace carries. The crate denies
+// `expect_used` at lib.rs:69, so without this `cargo clippy -p cyrup-permission-system
+// --all-targets` is RED on eight sites in this file alone.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
 use std::path::Path;
 use std::sync::Arc;
 

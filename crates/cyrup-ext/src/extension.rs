@@ -20,9 +20,16 @@ pub enum ExtKind {
 pub trait Extension: Send + Sync {
     fn id(&self) -> &ExtensionId;
     fn kind(&self) -> ExtKind;
-    /// Which events this extension subscribed to (built at init). Drives the subscription gate:
-    /// events with zero subscribers never serialize/cross (R-ARCH-EXT-014).
-    fn subscriptions(&self) -> &Subscriptions;
+    /// Which events this extension subscribes to RIGHT NOW. Drives the subscription gate: events
+    /// with zero subscribers never serialize/cross (R-ARCH-EXT-014).
+    ///
+    /// EXT-058: by VALUE, and re-read on every dispatch. pi keeps no snapshot — `api.on` mutates
+    /// `extension.handlers` (`extensions/loader.ts:252-258` @v0.83.0) and each emitter looks the
+    /// handler list up at dispatch (`runner.ts:806` and its twelve siblings), so an extension that
+    /// subscribes after `init` receives the next event. A `&Subscriptions` return forced every impl
+    /// to own a frozen bitset built at load time, which silently dropped exactly that case; the
+    /// bitset is `Copy` so returning it costs nothing.
+    fn subscriptions(&self) -> Subscriptions;
 
     /// Dispatch one event. Returns this extension's contribution to the block/mutate/notify
     /// reduction. `cancel` bounds the call (epoch deadline for wasm). A fault MUST surface as

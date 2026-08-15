@@ -79,6 +79,7 @@ use crate::exec::SingleResult;
 use crate::spawn::chain_graph::RunnerStep;
 
 use super::atomic::write_atomic_json;
+use super::reconcile::Liveness;
 use super::{ResultFile, RunId, RunMode, RunPaths, RunState, RunStatus, StepState};
 
 // =================================================================================================
@@ -408,13 +409,16 @@ pub async fn interrupt(
 /// subprocess(es); this signal targets the detached RUNNER process itself, to nudge it into
 /// checking its control inbox sooner than its next poll tick) to `pid`, if known.
 ///
-/// A signal-send failure that specifically indicates "no such process" (`ESRCH` on Unix) removes
-/// the just-written [`InterruptRequest`] file — the runner is already gone, so leaving the file
-/// behind would misrepresent a dead run as having a pending, eventually-actionable interrupt.
-/// Every other failure class (including "signal type unsupported" on a non-Unix target, and
-/// `EPERM`-class ambiguous failures) is swallowed: the file-inbox channel remains authoritative
-/// regardless of whether the signal itself was delivered (R-SA-081's explicit "opportunistically…
-/// best-effort").
+/// A CONFIRMED-gone addressee (`ESRCH` from the signal send on Unix; the zero-signal
+/// [`crate::background::reconcile::check_pid_liveness`] probe where there is no signal to send)
+/// removes the just-written [`InterruptRequest`] file — the runner is already gone, so leaving the
+/// file behind would misrepresent a dead run as having a pending, eventually-actionable interrupt.
+/// That cleanup is deliberately NOT conditioned on signal support: "the addressee is gone" is a
+/// question about the pid, and it is answerable on platforms where the wake-up signal itself is
+/// not. Every other outcome — an ambiguous `EPERM`-class failure, an inconclusive probe, or a
+/// platform with no notification signal at all — is swallowed: the file-inbox channel remains
+/// authoritative regardless of whether the signal itself was delivered (R-SA-081's explicit
+/// "opportunistically… best-effort"). See [`wakeup_addressee_liveness`] for the per-platform split.
 async fn deliver_wakeup_signal(paths: &RunPaths, pid: Option<u32>) -> Result<(), SubagentError> {
     deliver_wakeup_signal_to(&paths.control_inbox, pid).await;
     Ok(())
@@ -428,33 +432,71 @@ async fn deliver_wakeup_signal_to(control_inbox: &Path, pid: Option<u32>) {
         return;
     };
 
+    // Clause (b) is TWO independent obligations, and only the first of them is about signals:
+    //
+    //   1. Wake the runner, if this platform has a notification signal to wake it with.
+    //   2. Do not leave a control request addressed to a run that can never consume it.
+    //
+    // Obligation 2 is a question about the PID, not about signal support — "is this process gone"
+    // is answerable on every platform this crate builds for. Keeping the reaction in ONE shared
+    // place, fed by a per-platform liveness answer, is what stops the second obligation from being
+    // silently dropped wherever the first happens to be unsupported: previously the `not(unix)` arm
+    // returned without doing either, so on Windows a `control/interrupt.json` addressed to an
+    // already-dead run stayed on disk permanently, and every later reconciliation pass (and every
+    // operator reading the run directory) saw a pending, eventually-actionable interrupt for a run
+    // that had ended.
+    //
+    // `remove_file` racing a concurrent removal (a second interrupt call, or the runner itself
+    // finishing an in-flight consumption) is swallowed: "already gone" is a success outcome for a
+    // removal, not a failure to propagate.
+    if wakeup_addressee_liveness(pid) == Liveness::Dead {
+        let _ = tokio::fs::remove_file(control_inbox).await;
+    }
+}
+
+/// Send the best-effort wake-up signal where the platform has one, and report what the attempt
+/// learned about the addressee — the single liveness answer [`deliver_wakeup_signal_to`]'s
+/// stale-request cleanup keys off.
+///
+/// The two arms differ in HOW the answer is obtained, never in whether it is obtained:
+///
+/// * **Unix** takes it from the `SIGUSR2` send itself — one syscall that both notifies and probes,
+///   so there is no TOCTOU window between "is it alive" and "signal it". `ESRCH` is
+///   [`Liveness::Dead`]; success is [`Liveness::Alive`]; every other errno (realistically `EPERM`
+///   under sandboxing) is [`Liveness::Unknown`] and is swallowed per R-SA-081's
+///   "opportunistically… best-effort" — the file inbox stays authoritative. **`Unknown` is never
+///   collapsed into `Dead`** (R-SA-089): a request must not be deleted because a probe was merely
+///   inconclusive.
+/// * **Non-Unix** has no portable `SIGUSR2`-equivalent notification signal, so obligation 1 is
+///   genuinely unsupported there and the runner falls back to its poll-fallback watch (R-SA-082),
+///   which picks the request up within its fixed interval anyway. Obligation 2 still has to be
+///   met, so the pid is put to this crate's own zero-signal probe,
+///   [`crate::background::reconcile::check_pid_liveness`] — the same probe reconciliation uses to
+///   answer the same question about the same pids.
+///
+/// # Known gap on Windows
+///
+/// [`check_pid_liveness`]'s own `not(unix)` body currently answers [`Liveness::Unknown`] for every
+/// pid (`background/reconcile.rs:118-122`), so on Windows this reports `Unknown` and the cleanup
+/// correctly declines to fire on an inconclusive answer. That is a limitation of the PROBE, not of
+/// this seam — the moment `check_pid_liveness` can distinguish a dead pid on Windows (tracked
+/// alongside `cyrup-intercom`'s `broker::runtime_claim::probe_pid`, whose `not(unix)` arm answers
+/// the OPPOSITE default, `Gone`, and which must be reconciled with this one), this cleanup starts
+/// working there with no change here. It is deliberately NOT worked around by treating `Unknown` as
+/// dead, which would delete live runs' pending requests.
+fn wakeup_addressee_liveness(pid: u32) -> Liveness {
     #[cfg(unix)]
     {
         let nix_pid = nix::unistd::Pid::from_raw(pid as nix::libc::pid_t);
         match nix::sys::signal::kill(nix_pid, nix::sys::signal::Signal::SIGUSR2) {
-            Ok(()) => {}
-            Err(nix::errno::Errno::ESRCH) => {
-                // The tracked pid is already gone: the file-inbox request we just wrote is now
-                // stale/misleading (a dead run can never consume it) — remove it. `remove_file`
-                // itself racing a concurrent removal (e.g. a second interrupt call, or the runner
-                // itself finishing an in-flight consumption) is swallowed: "already gone" is a
-                // success outcome for a removal, not a failure to propagate.
-                let _ = tokio::fs::remove_file(control_inbox).await;
-            }
-            Err(_other) => {
-                // EPERM-class or any other ambiguous failure: swallowed per R-SA-081's
-                // "opportunistically... best-effort" — the file inbox stays authoritative.
-            }
+            Ok(()) => Liveness::Alive,
+            Err(nix::errno::Errno::ESRCH) => Liveness::Dead,
+            Err(_other) => Liveness::Unknown,
         }
     }
     #[cfg(not(unix))]
     {
-        // No portable SIGUSR2-equivalent notification signal on non-Unix targets: this is the
-        // "signal unsupported" case R-SA-081 explicitly distinguishes from "process gone" — the
-        // request file is deliberately left in place (the runner's poll-fallback watch, R-SA-082,
-        // still picks it up within its fixed interval even with no signal wake-up).
-        let _ = control_inbox;
-        let _ = pid;
+        crate::background::reconcile::check_pid_liveness(pid)
     }
 }
 
@@ -2130,6 +2172,115 @@ mod tests {
     use super::*;
     use crate::spawn::chain_graph::SingleStepSpec;
     use std::sync::Arc;
+
+    // ---- wake-up delivery / stale-request cleanup (R-SA-081 clause (b)) ----
+
+    /// A pid that is GENUINELY dead — a real OS-level fact, not a mocked one. Mirrors
+    /// `reconcile::tests::spawn_and_reap_dead_pid`, which answers the same question for the same
+    /// probe.
+    fn spawn_and_reap_dead_pid() -> u32 {
+        let mut child = std::process::Command::new(if cfg!(unix) { "true" } else { "cmd" })
+            .args(if cfg!(unix) { Vec::new() } else { vec!["/c", "exit"] })
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the immediately-exiting child spawns");
+        let pid = child.id();
+        let _ = child.wait().expect("wait reaps the child");
+        pid
+    }
+
+    /// A real, genuinely-running process that is NOT this test process. Signalling ourselves is not
+    /// an option here: `SIGUSR2`'s default disposition is *terminate*, so probing `process::id()`
+    /// through the Unix arm would kill the test runner.
+    fn spawn_long_lived() -> (std::process::Child, u32) {
+        let child = if cfg!(unix) {
+            std::process::Command::new("sleep").arg("30").spawn()
+        } else {
+            std::process::Command::new("ping").args(["-n", "31", "127.0.0.1"]).spawn()
+        }
+        .expect("the long-lived child spawns");
+        let pid = child.id();
+        (child, pid)
+    }
+
+    /// R-SA-081 clause (b), cleanup half: a wake-up addressed to an already-dead run must not leave
+    /// its control request on disk — on ANY platform.
+    ///
+    /// Before the fix the `not(unix)` arm of `deliver_wakeup_signal_to` bound both parameters to
+    /// `_` and returned, doing neither the signal nor the cleanup, on the rationale that the signal
+    /// is unsupported there. That rationale covers only half of what the function owes: "is this
+    /// pid gone" is not a signal question, and a `control/interrupt.json` addressed to a run that
+    /// ended stayed on disk permanently, since nothing else removes it — every later reconciliation
+    /// pass and every operator reading the run directory saw a pending interrupt for a dead run.
+    ///
+    /// The cleanup now lives in ONE shared code path fed by a per-platform liveness answer
+    /// ([`wakeup_addressee_liveness`]), which is what makes it structurally impossible for the
+    /// cleanup to be lost again wherever the signal happens to be unsupported.
+    #[tokio::test]
+    async fn a_wakeup_addressed_to_a_dead_run_removes_the_stale_control_request() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let inbox = dir.path().join("control").join("interrupt.json");
+        std::fs::create_dir_all(inbox.parent().expect("inbox has a parent")).expect("mkdir");
+        write_atomic_json(&inbox, &InterruptRequest::new("test", None))
+            .await
+            .expect("the request is written");
+        assert!(inbox.exists(), "precondition: the request file is on disk");
+
+        deliver_wakeup_signal_to(&inbox, Some(spawn_and_reap_dead_pid())).await;
+
+        assert!(
+            !inbox.exists(),
+            "a request addressed to a confirmed-gone pid must be removed, not left behind as a \
+             permanently-pending interrupt for a run that ended"
+        );
+    }
+
+    /// The other side of the same rule, and the reason `Unknown` must never be collapsed into
+    /// `Dead` (R-SA-089): a request addressed to a LIVE run is the normal case and must survive —
+    /// it is exactly what the runner is about to consume.
+    #[tokio::test]
+    async fn a_wakeup_addressed_to_a_live_run_leaves_its_control_request_in_place() {
+        let dir = tempfile::tempdir().expect("real tempdir");
+        let inbox = dir.path().join("control").join("interrupt.json");
+        std::fs::create_dir_all(inbox.parent().expect("inbox has a parent")).expect("mkdir");
+        write_atomic_json(&inbox, &InterruptRequest::new("test", None))
+            .await
+            .expect("the request is written");
+
+        let (mut child, pid) = spawn_long_lived();
+        deliver_wakeup_signal_to(&inbox, Some(pid)).await;
+        let _ = child.kill();
+        let _ = child.wait();
+
+        assert!(
+            inbox.exists(),
+            "a request addressed to a live run must survive — it is what the runner consumes"
+        );
+    }
+
+    /// The liveness answer itself, which is what the shared cleanup keys off. Asserted directly so
+    /// the contract is pinned independently of the file side effect.
+    ///
+    /// Note this deliberately asserts the SAME thing on every platform that
+    /// `reconcile::tests::check_pid_liveness_reports_dead_for_a_genuinely_reaped_pid` already
+    /// asserts: a reaped pid is `Dead`. Where the wake-up signal exists the answer comes from the
+    /// send's own `ESRCH`; where it does not, from the zero-signal probe.
+    #[test]
+    fn a_reaped_pid_is_reported_dead_by_the_wakeup_liveness_answer() {
+        assert_eq!(wakeup_addressee_liveness(spawn_and_reap_dead_pid()), Liveness::Dead);
+    }
+
+    /// ...and a live one is not, so the cleanup never fires against it.
+    #[test]
+    fn a_live_pid_is_not_reported_dead_by_the_wakeup_liveness_answer() {
+        let (mut child, pid) = spawn_long_lived();
+        let observed = wakeup_addressee_liveness(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_ne!(observed, Liveness::Dead);
+    }
 
     // ---- steer queue ordering ----
 

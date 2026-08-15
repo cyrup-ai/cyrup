@@ -221,8 +221,12 @@ fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
-    while i < bytes.len() {
-        if bytes[i] == b'%'
+    // `.get(i)` rather than `bytes[i]`: the loop bound already made both reads infallible, but the
+    // workspace denies `clippy::indexing_slicing`, and because cyrup-config sits at the bottom of
+    // the dependency graph those two denials aborted `cargo clippy` for EVERY crate downstream of
+    // it before their own code was ever linted. An unindexed read is the same instruction.
+    while let Some(&byte) = bytes.get(i) {
+        if byte == b'%'
             && let (Some(h), Some(l)) = (bytes.get(i + 1), bytes.get(i + 2))
             && let (Some(h), Some(l)) = ((*h as char).to_digit(16), (*l as char).to_digit(16))
         {
@@ -230,7 +234,7 @@ fn percent_decode(input: &str) -> String {
             i += 3;
             continue;
         }
-        out.push(bytes[i]);
+        out.push(byte);
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()

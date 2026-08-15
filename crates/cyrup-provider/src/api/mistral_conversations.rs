@@ -312,6 +312,8 @@ pub struct MistralOptions {
 
 /// Test-only convenience wrapper for [`build_chat_payload`].
 #[cfg(test)]
+// Test-only fixture wrapper: the deny-list allowance the crate's `mod tests` blocks carry.
+#[allow(clippy::expect_used)]
 pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> Value {
     build_chat_payload(model, ctx, opts)
         .expect("fixture declares no unsatisfiable constrained sampling")

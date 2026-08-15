@@ -519,6 +519,11 @@ mod tests {
         );
     }
 
+    /// Unix-only: `std::os::unix::fs::symlink` does not exist on other targets, and without this
+    /// gate the crate's whole `cfg(test)` build fails to compile for a non-Unix host — which is
+    /// exactly how a cfg-arm regression elsewhere in the crate would go unnoticed, since nobody can
+    /// build the tests there to find it.
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_memory_file_suppresses_the_block() {
         let tmp = tempfile::tempdir().expect("tmpdir");

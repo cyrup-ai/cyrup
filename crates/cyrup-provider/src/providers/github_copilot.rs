@@ -415,9 +415,18 @@ struct OriginOverride {
     api_origin: String,
 }
 
-/// GitHub Copilot's OAuth strategy: exchange the stored GitHub token for a short-lived Copilot
-/// token, and derive each request's endpoint from that token (Pi `githubCopilotOAuth`,
-/// `auth/oauth/github-copilot.ts:365-378`).
+/// The **runtime half** of GitHub Copilot's OAuth strategy: exchange the stored GitHub token for a
+/// short-lived Copilot token, and derive each request's endpoint from that token (Pi
+/// `githubCopilotOAuth`, `auth/oauth/github-copilot.ts:365-378`).
+///
+/// **Not the wired strategy.** [`github_copilot_auth`] carries
+/// [`crate::auth::oauth::github_copilot::GitHubCopilotLogin`], which owns the full upstream object
+/// — `login` (the RFC 8628 device grant) plus `refresh`/`to_auth`. This type is retained because
+/// `GitHubCopilotLogin` **delegates** `refresh` and `to_auth` to it (it holds one as its `runtime`
+/// field, `auth/oauth/github_copilot.rs:398`), so those two methods have exactly one
+/// implementation. Nothing reaches this type's own [`OAuthAuth`] impl from `/login`; before
+/// PROV-029 this WAS the wired strategy, and because it leaves `login` on the trait default,
+/// `/login github-copilot` reported `LoginUnsupported` against a fully ported flow.
 ///
 /// `[CYRUP-DELTA]` Pi wraps this in `lazyOAuth` (`auth/helpers.ts:38-56`) so the Node-only flow code
 /// stays out of browser bundles. Rust links statically and has no bundle to split, so the strategy
@@ -607,8 +616,13 @@ impl OAuthAuth for GitHubCopilotOAuth {
 
     /// `isSubscription: true` — set on both the flow (pi v0.84.1
     /// `auth/oauth/github-copilot.ts:402`) and the provider's `lazyOAuth` wrapper
-    /// (`providers/github-copilot.ts:16`). This impl is the one the provider's [`ProviderAuth`]
-    /// actually carries, so it must answer the same.
+    /// (`providers/github-copilot.ts:16`).
+    ///
+    /// The strategy [`github_copilot_auth`] actually carries is
+    /// [`crate::auth::oauth::github_copilot::GitHubCopilotLogin`], whose own `is_subscription`
+    /// (`auth/oauth/github_copilot.rs:813`) is the answer `/login` observes; this one must agree
+    /// with it because both stand for the same upstream object. Changing one without the other is
+    /// the bug this doc used to invite by claiming *this* impl was the wired one.
     fn is_subscription(&self) -> bool {
         true
     }

@@ -51,6 +51,49 @@ pub(crate) fn unique_suffix() -> String {
     format!("{pid:x}-{nanos:x}-{n:x}")
 }
 
+/// The win32 half of [`FsOps::access`], factored out of the `cfg(not(unix))` arm so the decision
+/// that SHIPS to Windows is compiled and unit-tested on every host — see
+/// `crates/cyrup-tools/src/tests/read_access_errno.rs`. The arm itself cannot be exercised here,
+/// but this predicate is the whole of its behaviour.
+///
+/// Pi issues ONE call on every platform (`fsAccess(path, R_OK)` at read.ts:60, `fsAccess(path,
+/// R_OK | W_OK)` at edit.ts:97), so parity for this arm is defined by libuv's `fs__access`
+/// (`uv/src/win/fs.c`), which Node's `fs.access` runs on win32:
+///
+///   * it calls `GetFileAttributesW` and fails with the *stat* error when the path is absent;
+///   * otherwise access is granted unless **W_OK was requested** AND the file carries
+///     `FILE_ATTRIBUTE_READONLY` AND it is **not a directory** (directories cannot be read-only on
+///     Windows, so libuv exempts them explicitly);
+///   * the denial is `UV_EPERM`, not `EACCES`.
+///
+/// Two consequences worth stating, because both look like bugs against the unix arm and are not.
+/// `R_OK` NEVER fails for a path that exists: libuv does not consult ACLs, which Node documents
+/// ("the `fs.access()` function … does not check the ACL and therefore may report that a path is
+/// accessible even if the ACL restricts the user"). So the coarse, stat-only shape of this arm is
+/// parity with pi, not a shortcut — an unreadable-but-present file passes upstream too. And the
+/// `Exists` mode reduces to the same stat, exactly as `F_OK` does for libuv.
+/// The denial itself is `UV_EPERM`, surfaced by Node as an error whose `.code` is `EPERM`, so it
+/// travels through [`error::io_errno_code`] — the same `CODE: context: display` shape the unix arm
+/// builds with [`error::io_errno`]. `edit.rs`'s `errno_code_of` therefore recovers a code on BOTH
+/// arms and Pi's `Error code: ${error.code}` line (edit.ts:332-333) survives on Windows. The
+/// previous `error::invalid("{path} is not writable")` carried no code token at all.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn windows_access_result(
+    path: &Path,
+    mode: Access,
+    readonly: bool,
+    is_dir: bool,
+) -> Result<(), ToolError> {
+    if mode == Access::ReadWrite && readonly && !is_dir {
+        return Err(error::io_errno_code(
+            "EPERM",
+            &error::show(path),
+            &std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        ));
+    }
+    Ok(())
+}
+
 /// Local filesystem operations.
 #[derive(Default, Clone)]
 pub struct LocalFs;
@@ -149,15 +192,15 @@ impl FsOps for LocalFs {
         }
         #[cfg(not(unix))]
         {
-            // No portable effective-access syscall here: fall back to metadata existence + the
-            // readonly bit (the pre-`access(2)` behavior).
+            // Pi's precheck is the SAME one call on every platform — `fsAccess(path, R_OK)`
+            // (read.ts:60) / `fsAccess(path, R_OK | W_OK)` (edit.ts:97) — so what this arm has to
+            // reproduce is what libuv's `fs__access` does on win32, not what `access(2)` does.
+            // See [`windows_access_result`] for the decision, its parity argument, and the tests
+            // that cover it on every host.
             let meta = tokio::fs::metadata(path)
                 .await
                 .map_err(|e| error::io_errno(&error::show(path), &e))?;
-            if mode == Access::ReadWrite && meta.permissions().readonly() {
-                return Err(error::invalid(format!("{} is not writable", error::show(path))));
-            }
-            Ok(())
+            windows_access_result(path, mode, meta.permissions().readonly(), meta.is_dir())
         }
     }
 
@@ -993,6 +1036,9 @@ mod tests {
     use super::*;
     use crate::ops::ArgvSpec;
 
+    // Every caller builds an `sh`-based spec and so lives under `#[cfg(unix)]`; the helper itself
+    // is portable. Silenced rather than gated so it stays available to any future Windows test.
+    #[cfg_attr(not(unix), allow(dead_code))]
     fn argv(program: &str, args: &[&str]) -> ArgvSpec {
         ArgvSpec {
             program: program.to_string(),

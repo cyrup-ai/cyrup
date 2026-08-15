@@ -27,6 +27,7 @@ mod native_ctx_state;
 mod payload_and_seam_parity;
 mod native_dispatch;
 mod project_trust_shortcircuit;
+mod seam_liveness;
 mod trust_gate_order;
 mod provider;
 mod wasm_host;

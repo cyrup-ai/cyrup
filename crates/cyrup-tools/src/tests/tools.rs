@@ -128,6 +128,11 @@ async fn read_missing_file_errors() {
     // errno and the resolved absolute path — see `tests/read_access_errno.rs`.
     let msg = err.to_string();
     assert!(msg.contains("nope.txt"), "got: {msg}");
+    // Asserted on the errno CODE, which `errno_name` produces on BOTH `access` arms (error.rs);
+    // the trailing `strerror` prose is unix-only and made this test un-runnable on the Windows
+    // arm the crate actually ships.
+    assert!(msg.starts_with("ENOENT: "), "got: {msg}");
+    #[cfg(unix)]
     assert!(msg.contains("No such file or directory"), "got: {msg}");
 }
 
@@ -193,6 +198,39 @@ async fn read_image_vision_attaches() {
         .await
         .unwrap();
     assert!(r.content.iter().any(|c| matches!(c, Content::Image { .. })));
+}
+
+// The `--no-default-features` arm of `ReadTool::read_image`. Pi has no build in which `read`
+// withholds the image attachment (read.ts:247-263), so this arm is a KNOWN cyrup delta, recorded
+// as such in `crates/cyrup-tools/Cargo.toml` (`default = ["inline-images"]`). What must not happen
+// is that it degrades SILENTLY: the delta is only tolerable because the tool result says so in
+// words the model can read. Until now the arm had zero tests — all three image tests here are
+// `#[cfg(feature = "inline-images")]` — so nothing held it to that, and it was never even built by
+// the gate. Run it with `cargo test -p cyrup-tools --no-default-features`.
+#[cfg(not(feature = "inline-images"))]
+#[tokio::test]
+async fn read_image_without_inline_images_announces_the_delta_instead_of_going_quiet() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    // `image` is an unconditional dev-dependency, so the fixture is a real PNG on this arm too —
+    // magic-byte detection (mime.ts) still has to classify it as an image.
+    let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+    img.save(cwd.join("p.png")).unwrap();
+    let read = ReadTool::new(fs(), cwd, ReadOpts::default());
+    let r = read
+        .execute(cid(), serde_json::json!({ "path": "p.png" }), CancelToken::new(), noop_sink())
+        .await
+        .unwrap();
+
+    // No attachment on this arm — that is the delta.
+    assert!(!r.content.iter().any(|c| matches!(c, Content::Image { .. })));
+    let text = first_text(&r);
+    // It was still recognised as an image, and the divergence is stated, not hidden.
+    assert!(text.starts_with("Read image file [image/png]"), "got: {text}");
+    assert!(
+        text.contains("[Image inlining is not enabled in this build (feature `inline-images`).]"),
+        "the arm must self-announce or the delta is silent, got: {text}"
+    );
 }
 
 // ---------------------------------------------------------------- A-03-3 edit

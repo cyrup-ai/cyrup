@@ -1245,9 +1245,12 @@ impl SessionBuilder {
         let prompt_tools: Vec<Arc<dyn cyrup_core::Tool>> = {
             let mut order: Vec<Arc<dyn cyrup_core::Tool>> = base_tools.clone();
             for t in active_tools.iter() {
-                match order.iter().position(|b| b.name() == t.name()) {
-                    Some(i) => order[i] = t.clone(),
-                    None => order.push(t.clone()),
+                // `iter_mut().find()` rather than `position()` + `order[i]`: same `set`-by-name
+                // semantics, without the raw index the workspace denies (`indexing_slicing`).
+                if let Some(slot) = order.iter_mut().find(|b| b.name() == t.name()) {
+                    *slot = t.clone();
+                } else {
+                    order.push(t.clone());
                 }
             }
             order

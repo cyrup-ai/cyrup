@@ -656,13 +656,53 @@ pub struct NativeHandle {
     subs: Subscriptions,
     ctx: HostCtx,
     inner: Arc<dyn NativeExtension>,
-    /// The live capability backend, when the host was given one ([`crate::ExtensionHost::
-    /// load_native_with_services`]). Used to refresh [`HostCtxRich`] on EVERY dispatch (EXT-005):
+    /// The live source of the rich ctx fields, when the host was given one
+    /// ([`crate::ExtensionHost::set_ctx_source`], which
+    /// [`crate::ExtensionHost::load_native_with_services`] feeds from the injected
+    /// `HostServices`). Used to refresh [`HostCtxRich`] on EVERY dispatch (EXT-005):
     /// idle/trust/usage/model/system-prompt are all live values, so a ctx built once at load time
     /// would go stale — and, before EXT-005, `HostCtxRich::default()` meant a native built-in read a
     /// confident `is_idle = false` / `is_project_trusted = false` rather than the truth.
-    #[cfg(feature = "wasm-host")]
-    services: Option<Arc<dyn crate::host::HostServices>>,
+    ///
+    /// EXT-060: NOT `wasm-host`-gated. It was, because it was typed against
+    /// [`crate::host::HostServices`], which lives behind that feature — so a
+    /// `--no-default-features` build (the manifest explicitly invites one: "the native-builtin
+    /// dispatch foundation… builds without pulling Wasmtime") kept the whole EXT-005 fix out and
+    /// silently handed every native built-in `is_idle = false` / `is_project_trusted = false`,
+    /// with no diagnostic. pi has one extension kind and one `ExtensionAPI`
+    /// (`extensions/loader.ts:274-410` @v0.83.0) whose `ExtensionContext` data fields
+    /// (`extensions/types.ts:329-346`) are populated unconditionally; which host features are
+    /// compiled in is not something a handler's `ctx.isIdle` is allowed to depend on.
+    ctx_source: Option<Arc<dyn HostCtxSource>>,
+}
+
+/// The live source of pi's `ExtensionContext` DATA fields (`extensions/types.ts:329-346`) for a
+/// native dispatch — model, idle, project-trust, context usage, system prompt.
+///
+/// CYRUP-DELTA: upstream needs no such trait; `ExtensionContext` is one object built by one loader
+/// (`extensions/loader.ts:274-410` @v0.83.0). cyrup needs a feature-independent seam because the
+/// full capability backend ([`crate::host::HostServices`]) only exists with the Wasmtime host
+/// compiled in, while native built-ins — and their `ctx.is_idle()` / `ctx.is_project_trusted()`
+/// reads — exist on both arms. This is the narrow read-only slice of that backend, so the arms can
+/// stop disagreeing: with `wasm-host` the host wires it straight off the injected `HostServices`
+/// (blanket impl below); without it, a host embedder attaches its own via
+/// [`crate::ExtensionHost::set_ctx_source`].
+pub trait HostCtxSource: Send + Sync {
+    /// Snapshot the rich fields as of RIGHT NOW (re-read per dispatch, never cached).
+    fn rich(&self) -> HostCtxRich;
+}
+
+/// Adapts the injected [`crate::host::HostServices`] backend to [`HostCtxSource`] — the live rich
+/// values are exactly the five getters EXT-005 reads. A wrapper rather than a blanket impl because
+/// `Arc<dyn HostServices>` cannot be coerced to `Arc<dyn HostCtxSource>` through one.
+#[cfg(feature = "wasm-host")]
+pub struct ServicesCtxSource(pub Arc<dyn crate::host::HostServices>);
+
+#[cfg(feature = "wasm-host")]
+impl HostCtxSource for ServicesCtxSource {
+    fn rich(&self) -> HostCtxRich {
+        rich_from_services(self.0.as_ref())
+    }
 }
 
 impl NativeHandle {
@@ -672,21 +712,13 @@ impl NativeHandle {
         ctx: HostCtx,
     ) -> Self {
         let id = inner.id();
-        Self {
-            id,
-            subs,
-            ctx,
-            inner,
-            #[cfg(feature = "wasm-host")]
-            services: None,
-        }
+        Self { id, subs, ctx, inner, ctx_source: None }
     }
 
-    /// Attach the live capability backend so each dispatch gets a FRESH [`HostCtxRich`] (EXT-005).
-    #[cfg(feature = "wasm-host")]
+    /// Attach the live rich-ctx source so each dispatch gets a FRESH [`HostCtxRich`] (EXT-005).
     #[must_use]
-    pub fn with_services(mut self, services: Option<Arc<dyn crate::host::HostServices>>) -> Self {
-        self.services = services;
+    pub fn with_ctx_source(mut self, source: Option<Arc<dyn HostCtxSource>>) -> Self {
+        self.ctx_source = source;
         self
     }
 
@@ -694,11 +726,10 @@ impl NativeHandle {
     /// the SHARED [`HumanWaitGate`] the dispatcher's budget watchdog polls) with the rich fields
     /// re-read from the live backend.
     fn dispatch_ctx(&self) -> HostCtx {
-        #[cfg(feature = "wasm-host")]
-        if let Some(svc) = &self.services {
-            return self.ctx.clone().with_rich(rich_from_services(svc.as_ref()));
+        match &self.ctx_source {
+            Some(src) => self.ctx.clone().with_rich(src.rich()),
+            None => self.ctx.clone(),
         }
-        self.ctx.clone()
     }
 }
 
@@ -724,8 +755,11 @@ impl Extension for NativeHandle {
         ExtKind::Native
     }
 
-    fn subscriptions(&self) -> &Subscriptions {
-        &self.subs
+    /// A native's subscription set is fixed by [`InitApi::subscribe`] during `init` — there is no
+    /// native equivalent of the guest's late `subscribe` import — so this is the stored bitset.
+    /// Returned by value per [`Extension::subscriptions`] (EXT-058).
+    fn subscriptions(&self) -> Subscriptions {
+        self.subs
     }
 
     /// The P-3 human-wait gate for this native handler: its ctx's shared [`HumanWaitGate`]. The

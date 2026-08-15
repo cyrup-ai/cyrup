@@ -9102,6 +9102,19 @@ impl Tool for SubagentTool {
         self.description
     }
 
+    /// pi `label: "Subagent"` (`pi-subagents/src/extension/index.ts:598`, and the identical
+    /// child-safe variant at `src/extension/fanout-child.ts:177`).
+    ///
+    /// Not optional in practice: `Tool::label`'s default is `None`
+    /// (`cyrup-core/src/tool.rs:103-106`) and the transcript's tool-row renderer falls back to
+    /// `name()` when it gets one, so omitting this made the row read `subagent` rather than
+    /// "Subagent". Every sibling tool in this crate already overrides it — [`WaitTool`],
+    /// `SubagentSupervisorTool`, `StructuredOutputTool` — which is precisely why the omission was
+    /// invisible sitting next to them.
+    fn label(&self) -> Option<&str> {
+        Some("Subagent")
+    }
+
     async fn execute(
         &self,
         _call_id: ToolCallId,
@@ -13950,6 +13963,33 @@ mod tests {
             Err(error) => error.to_string(),
         };
         assert!(!full_text.contains("child-safe subagent fanout mode"), "{full_text}");
+    }
+
+    /// Both variants of the subagent tool must carry pi's `label: "Subagent"`
+    /// (`pi-subagents/src/extension/index.ts:598`, `src/extension/fanout-child.ts:177`).
+    ///
+    /// `Tool::label`'s default is `None` (`cyrup-core/src/tool.rs:103-106`) and the transcript's
+    /// tool-row renderer falls back to `name()` on `None`, so before the fix the row read
+    /// `subagent` — the raw wire name — instead of "Subagent". The omission was invisible because
+    /// every sibling tool in this crate (`WaitTool`, `SubagentSupervisorTool`,
+    /// `StructuredOutputTool`) does override it, so the impl looked complete next to them.
+    #[test]
+    fn both_subagent_tool_variants_carry_pis_subagent_label() {
+        let executor = Arc::new(SubagentExecutor::new());
+        let full = SubagentTool::new(executor.clone(), PathBuf::from("/tmp"));
+        let child_safe = SubagentTool::new_child_safe(executor, PathBuf::from("/tmp"));
+
+        assert_eq!(
+            Tool::label(&full),
+            Some("Subagent"),
+            "a `None` label silently renders the tool row as the raw name `subagent`"
+        );
+        assert_eq!(Tool::label(&child_safe), Some("Subagent"));
+        assert_ne!(
+            Tool::label(&full).map(str::to_string),
+            Some(Tool::name(&full).to_string()),
+            "the label must be the display form, not the wire name the default falls back to"
+        );
     }
 
     #[test]

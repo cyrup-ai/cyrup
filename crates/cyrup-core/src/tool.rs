@@ -165,15 +165,33 @@ pub trait Tool: Send + Sync {
     }
 
     /// Custom rendering of a tool *call* for the UI (Pi `ToolDefinition.renderCall`,
-    /// extensions/types.ts:472-473). The returned string is the rendered representation; `None` =
-    /// the runtime uses its standard call framing (today's behavior).
+    /// extensions/types.ts:488-489 @v0.83.0). The returned string is the rendered representation;
+    /// `None` = the runtime uses its standard call framing (today's behavior).
+    ///
+    /// NOT the resolution site. cyrup ports upstream's per-tool renderer pair through the
+    /// EXTENSION tier, keyed by tool NAME, not through this trait — see
+    /// `cyrup_ext::ExtensionHost::render_tool_call` (`crates/cyrup-ext/src/facade.rs:843`, whose
+    /// own doc cites the same upstream resolver `tool-execution.ts:81-112`) and the built-in
+    /// per-name dispatch in `cyrup_tui::transcript::tool_lines`
+    /// (`crates/cyrup-tui/src/transcript.rs:1276`). This accessor currently has NO reader anywhere
+    /// in `crates/`: overriding it on a concrete tool changes nothing, which is why no built-in in
+    /// `cyrup-tools` and not even `impl Tool for WasmTool`
+    /// (`crates/cyrup-ext/src/host/live.rs:1852`) bothers. Closing the gap is a cross-crate change
+    /// — the pair is either wired into the two resolvers above or collapsed away together with the
+    /// delegations at `crates/cyrup-ext/src/wrapper.rs:129-134` — so do NOT implement it here
+    /// expecting an effect.
     fn render_call(&self, _args: &serde_json::Value) -> Option<String> {
         None
     }
 
     /// Custom rendering of a tool *result* for the UI (Pi `ToolDefinition.renderResult`,
-    /// extensions/types.ts:475-481). The returned string is the rendered representation; `None` =
-    /// the runtime uses its standard result framing (today's behavior).
+    /// extensions/types.ts:491-497 @v0.83.0). The returned string is the rendered representation;
+    /// `None` = the runtime uses its standard result framing (today's behavior).
+    ///
+    /// Same "no reader" caveat as [`Tool::render_call`] — read that doc before implementing this.
+    /// Note also that upstream's signature carries `ToolRenderResultOptions` (`expanded`,
+    /// `isPartial`) plus the theme and a `ToolRenderContext`; this Rust shape carries only the
+    /// result, so wiring it up requires widening the signature to reach parity.
     fn render_result(&self, _result: &ToolResult) -> Option<String> {
         None
     }
@@ -188,7 +206,7 @@ pub trait Tool: Send + Sync {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

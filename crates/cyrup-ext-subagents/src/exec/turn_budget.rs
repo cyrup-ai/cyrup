@@ -572,6 +572,17 @@ pub fn prepend_turn_budget_note(output: &str, note: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    // The same test-module allowance every other test module in this crate carries: the workspace
+    // denies these crate-wide (`lib.rs:20-24`) for PRODUCTION code, and a test's `panic!`/`expect`
+    // IS its failure mechanism. Without it `cargo clippy --all-targets -p cyrup-ext-subagents`
+    // fails on this module alone.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
+
     use super::*;
     use serde_json::json;
 

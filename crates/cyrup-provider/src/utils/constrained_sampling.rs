@@ -174,7 +174,11 @@ fn infer_grammar_input_property(tool: &ToolDef) -> Result<String> {
     if required.len() != 1 {
         return err("grammar constrained sampling requires exactly one required string property");
     }
-    let Some(input_property) = required[0].as_str() else {
+    // `.first()` rather than `[0]`: the `len() != 1` guard above already makes the index
+    // infallible, but the workspace denies `clippy::indexing_slicing` and an unindexed read is
+    // the same instruction. `None` folds into the same `err` the non-string case takes, which is
+    // what `schema.required[0]` being `undefined` would produce upstream.
+    let Some(input_property) = required.first().and_then(Value::as_str) else {
         return err("grammar constrained sampling requires exactly one required string property");
     };
 
@@ -287,6 +291,12 @@ pub fn create_grammar_tool_input_properties(
 
 #[cfg(test)]
 mod tests {
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing
+    )]
     use super::*;
     use crate::context::{ConstrainedSampling, GrammarVariants};
     use serde_json::json;
