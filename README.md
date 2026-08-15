@@ -216,9 +216,12 @@ than trusting this table. The window between the two columns is measured and fil
 resulting items live. The measured windows there stop at pi v0.84.1 and pi-subagents v0.47.1 — pi
 has cut one tag past that, pi-subagents two (v0.48.0, then v0.49.0).
 
-These are mature, maintained projects and the reference implementations of their own behaviour —
-if you are choosing between them and cyrup, use them. [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md)
-describes what each one contributed and why it was worth following closely.
+Each is the reference implementation of its own behaviour, and that is a working rule here rather
+than a courtesy: where cyrup and an upstream disagree, the upstream is correct by definition and
+cyrup is what changes. Every item in [`docs/gap-analysis/`](docs/gap-analysis/README.md) is
+adjudicated that way, and it is why a divergence has to be recorded as a `CYRUP-DELTA` with a reason
+instead of just being written. [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md) describes what each
+project contributed and why it was worth following this closely.
 
 ## License
 
