@@ -1,161 +1,228 @@
-# TUI-092 — The TUI degrades from smooth to a total lockup that cannot be exited
+# TUI-092 — The TUI wedges and cannot be exited: input shares fate with the work loop
 
 > **Task file for** the `TUI-092` row in [`../07-cyrup-tui.md`](../07-cyrup-tui.md) (filed 2026-08-15
-> from live use, escalated to **critical** the same day). **No code has been changed; this is a
-> triage spec, not a diagnosis.**
+> from live use, escalated to **critical** the same day).
 >
-> **Status** — **NOT diagnosed.** No reproduction, no confirmed mechanism. Everything below marked
-> *candidate* is a hypothesis with a stated test, not a finding. Do not implement from this file
-> until §3 produces a measurement.
+> **Status** — **root cause identified structurally** by reading the run loop, the input stream and
+> the signal handler at HEAD. The *structural* defect below is certain and is what this task fixes.
+> The *specific* `.await` that wedges is not yet named; §5 makes naming it a by-product of the fix
+> rather than a prerequisite, because the fix removes the class.
 >
-> **Kind** port-bug *(provisional — re-class once the mechanism is known; if it proves to be the
-> same `live_floor` residue as `TUI-090`, it is `cyrup-original` and this file folds into that one)*
-> · **Severity** **critical** · **Effort** **M** · **Confidence** **low — symptom only**
+> **Kind** `cyrup-original` — the failing mechanism (a single serialized `biased!` loop that both
+> drains input and awaits session work) has no upstream counterpart: pi's interactive mode runs on
+> Node's event loop where a stalled handler cannot make `process.stdin` stop being read.
+> · **Severity** **critical** · **Effort** **M**
 >
-> **Cross-references** — [`TUI-090`](TUI-090-post-turn-whitespace.md) (**diagnosed, confirmed**;
-> the leading candidate for *causing* this bug — see §2.1), `TUI-088` (Ctrl+C has no global
-> binding — the reason this bug has no escape hatch), `TUI-091` (reasoning never renders; already
-> believed a duplicate of `TUI-090`).
+> **Cross-references** — [`TUI-090`](TUI-090-post-turn-whitespace.md) (confirmed; supplies the
+> *slowness*, not the *wedge*), `TUI-088` (no `Ctrl+C` binding — **fixed as part of this task**, it
+> is the missing escape hatch), `TUI-091` (reasoning never renders — believed duplicate of
+> `TUI-090`).
 
 ---
 
 ## 1. Symptom
 
-Reported by the project owner from live use, in three increments:
+Owner reports, live use 2026-08-15, in three increments:
 
 1. *"the terminal is super fast and smooth but freezes up over time"*
 2. *"keystrokes become unresponsive and rendering comes to a crawl"*
-3. *"terminal gets totally locked up and can't even be killed with ctrl+d"*
-
-**The progression matters and should not be collapsed.** It is not a single stall: the session
-starts responsive and degrades monotonically with use, ending fully wedged.
-
-### 1.1 The two facts that constrain the search
-
-**(a) Keystrokes die *with* rendering, not after it.** If render cost alone were growing, input
-would still be READ and the screen would simply lag behind it. Input going unresponsive means the
-loop that reads keys is **starved**. So the target is render work executing *on the input path*, or
-a lock the input path needs being held across a growing render — **not** an expensive draw.
-
-**(b) `Ctrl+D` does not kill it either.** EOF on stdin failing to terminate the process means the
-input path is not merely slow, it is **not being serviced at all** at that point. Combined with
-`TUI-088` (no global `Ctrl+C` binding), the user has **no in-band way to exit** — the only recourse
-is killing the process from another terminal. That elevates `TUI-088` beyond its own severity: it
-is the missing escape hatch for this bug.
-
-A hang that survives both EOF and the interrupt key is a **blocked event loop or a held lock**, not
-slow drawing.
+3. *"terminal gets totally locked up and can't even be killed with ctrl+d which is currently the only
+   way to exit the terminal since ctrl+c is borked up"*
 
 ---
 
-## 2. Candidates
+## 2. Root cause
 
-Ordered by cost to test, cheapest first. **None is confirmed.**
+### 2.1 Input is captured independently but **drained only by the work loop**
 
-### 2.1 Candidate A — `TUI-090` is the cause, not a sibling *(leading)*
+[`crossterm_input_stream`](../../../crates/cyrup-tui/src/app.rs) (`app.rs:8777`) spawns a **dedicated
+OS thread** that blocks on `event::poll`/`event::read` and forwards over an **unbounded** channel:
 
-`TUI-090` is **confirmed**: `live_floor` × `Terminal::insert_before` leaves a full screen of
-whitespace after every turn, and committed content goes to native scrollback invisibly.
+```rust
+pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<InputEvent>();
+    std::thread::spawn(move || { /* blocking event::poll + read, forever */ });
+    // …
+}
+```
 
-If the inline viewport's active region grows with each turn rather than collapsing back to content
-size, then per-frame work grows **linearly with turn count** — which is exactly "fast at first,
-crawling later." Whether that also starves input depends on whether the render runs on the same
-task as the key reader; §3.2 settles that.
+**Keys are therefore never lost — only undrained.** They accumulate in the channel. The only code
+that drains that channel is arm #5 of the run loop.
 
-**This is the first thing to test, and if it holds, `TUI-092` should not be fixed independently.**
+### 2.2 The run loop is one serialized task, and every arm body awaits
 
-### 2.2 Candidate B — a per-turn leak
+`App::run` (`app.rs:8019`) is a single `tokio::select!` with **21 arms** and `biased;`. Arm order is
+`cancel` → 3 tickers → **`input.next()`** (#5) → … → `events.next()` (#19). Sixteen `.await`
+points sit inside arm bodies — `ingest_session_event`, `execute_command`, `rt.session()`, and more.
 
-A subscription, task, channel or lock guard created per turn and never released. This codebase has
-shipped that class **twice**: a `DrainLatch` that left the event bus permanently disabled after an
-abort, and a dedup owner dropped without settling (fixed by making the owner hold the sole
-`watch::Sender`).
+Because it is one task, **an arm body that blocks indefinitely blocks the loop**, and because the
+loop is the sole input drain, **it blocks input with it.** That is the entire bug:
 
-Note `active_tools.iter` runs **five times per frame** (`transcript.rs`), so a single retained entry
-costs every subsequent frame — a leak here degrades render *and* grows the window in which any lock
-around it is held.
+> Input capture is decoupled from the work loop. Input *servicing* is not.
 
-### 2.3 Candidate C — recomputation over history
+### 2.3 Why `Ctrl+D` cannot save you
 
-Markdown wrapping or image rasterisation recomputed across accumulated history rather than cached.
-`MAX_RASTER_PX` caps a single raster's size but not the number of them.
+`Ctrl+D` is not special. It arrives as an ordinary `InputEvent`, is drained by arm #5, mapped by
+`handle_input`, and only then becomes `AppAction::Quit => break`:
 
-### 2.4 Already ruled out — do not re-check
+```rust
+maybe_in = input.next() => {
+    let Some(ev) = maybe_in else { break };
+    match self.handle_input(&ev) {
+        AppAction::Quit => break,
+```
 
-- **`TranscriptView::pending`** is emptied by `drain_committed` via `std::mem::take`
-  (`transcript.rs:553-556`).
-- **`active_tools`** is drained at `transcript.rs:899` and `:935`.
+If the loop is wedged, arm #5 never runs, so the quit key is sitting in the channel unread. **The
+exit path is downstream of the thing that is broken.**
 
-Neither is an unbounded accumulator.
+### 2.4 Why `Ctrl+C` cannot save you either — and this is the sharpest finding
 
----
+A correct escalating signal handler already exists.
+[`spawn_abort_on_signal`](../../../crates/cyrup/src/signals.rs) (`signals.rs:189`) reaps detached
+children, arms a repeat watcher **before** awaiting teardown, and the second signal **hard-exits from
+its own spawned task**:
 
-## 3. Reproduction and measurement — do this before anything else
+```rust
+let repeat = tokio::spawn(async move {
+    let again = wait_for_signal().await;
+    kill_tracked_detached_children();
+    std::process::exit(again.exit_code());   // independent of the run loop
+});
+```
 
-**This bug has no reproduction yet. Producing one is the task**, and the file should be updated with
-the result before any fix is designed.
+That task is not blocked by the wedged loop and would terminate the process. **It is unreachable**
+because the TUI puts the terminal in **raw mode**, where `Ctrl+C` is delivered by crossterm as a
+`KeyEvent` and *never becomes SIGINT* — and `TUI-088` established there is no global `Ctrl+C`
+binding to catch it either. So both the signal path and the key path are dead, and the working
+hard-exit is stranded behind them.
 
-### 3.1 Establish the curve
+### 2.5 Why it is progressive
 
-Drive a session to N turns and record **frame time** and **RSS** against turn count. If frame time
-climbs roughly linearly with turns, Candidate A is live and `TUI-090`'s fix should be applied and
-re-measured **before** investigating further. If RSS climbs without frame time, look at B.
+Nothing here grows unboundedly on its own; `TUI-090` supplies the slowdown that makes the wedge
+reachable. Its confirmed mechanism keeps the inline viewport pinned at `term_h`, and every turn
+pushes blank rows into native scrollback (~31 per turn, measured in its repro). Frame cost and
+terminal-side cost climb with turn count, arm bodies take longer, and the window in which any
+contended `.await` can stall widens — until one does not return.
 
-### 3.2 Settle the starvation question
-
-Determine whether the render and the key reader share a task. Instrument the input path with a
-timestamp per key event and the render with per-frame duration, then compare: if key timestamps
-gap exactly across long frames, render is blocking input directly. If keys stop while frames
-continue, a lock is the culprit.
-
-### 3.3 Capture the wedged state
-
-When it locks, capture a backtrace of every thread (`sample <pid>` on macOS, or attach `lldb`). A
-blocked event loop and a deadlock look identical from outside and completely different in a
-backtrace. **This single capture is worth more than any amount of reasoning from the source.**
-
-### 3.4 Rules
-
-- **A real terminal is required.** `TestBackend` cannot express frame time, RSS, input latency, or
-  "the viewport did not shrink". It is the reason `TUI-090` survived 96 rows of static analysis and
-  a full assembled-render suite.
-- **Instrument once and read**, per [`../handoff/03-verification.md`](../handoff/03-verification.md).
-  Do **not** re-run repeatedly to characterise the hang — that method cost this project a day on a
-  "deadlock" that turned out to be a network call.
-
----
-
-## 4. Why the existing suite never caught it
-
-Every TUI test drives a fixed-size `TestBackend` for a small number of turns. The suite therefore
-cannot represent any of this bug's observables: elapsed frame time, memory growth, input
-responsiveness, or a viewport that fails to shrink. It is not that the tests are wrong — the harness
-has **no way to encode the question**, which is the same structural blindness `TUI-090`'s file
-documents.
-
-Any fix must ship with a check that would fail on a regression. Given the above, that check is
-unlikely to be a `TestBackend` unit test; the headless VT-replay harness `TUI-090` used
-(`src/tests/inline_stacking.rs`) is the closer precedent.
+**Already ruled out — do not re-check:** `TranscriptView::pending` is emptied by `drain_committed`
+via `std::mem::take` (`transcript.rs:553-556`); `active_tools` is drained at `transcript.rs:899`
+and `:935`; all five tickers set `MissedTickBehavior::Skip` (`app.rs:7908-7934`), so no tick burst;
+`FooterGitBranch::poll` (`footer_data.rs:143`) is a `stat` fingerprint that returns early and draws
+nothing when unchanged.
 
 ---
 
-## 5. Acceptance criteria
+## 3. Required change 1 — an escape hatch that cannot be blocked
 
-1. A **measured curve** of frame time and RSS against turn count, recorded in this file.
-2. A **thread backtrace of the wedged process**, recorded in this file.
-3. The mechanism named, with the code path, and this file's *Kind* and *Confidence* updated.
-4. If it proves to be `TUI-090`: this file is closed as a duplicate and the row re-pointed — **not**
-   fixed separately.
-5. If independent: a fix plus a regression check that fails without it, and a live-terminal session
-   of ≥50 turns showing flat frame time and responsive input.
-6. `TUI-088` closed alongside, or explicitly deferred with the owner's agreement — while this bug
-   exists, the interrupt key is the only escape from it.
+**Where:** [`crates/cyrup-tui/src/app.rs`](../../../crates/cyrup-tui/src/app.rs), inside
+`crossterm_input_stream`'s reader thread.
+
+The reader thread is already independent of the async runtime and already sees every key before
+anything else. It is the only place in the process guaranteed to still be running when the loop is
+wedged. **The escalation is recognised there, at the source, and does not travel through the
+channel.**
+
+Mirror `signals.rs`'s escalation exactly — first press requests teardown, second press hard-exits —
+so keyboard and signal behave identically:
+
+```rust
+// In the reader thread, immediately after an event is read and BEFORE it is handed to
+// EscapeReassembler / StrayReplyFilter (a held/reassembled key must not delay the escape).
+//
+// Raw mode means Ctrl+C never becomes SIGINT (`signals.rs:189` can therefore never fire from the
+// keyboard). This reproduces that handler's contract on the key path: first = cooperative cancel,
+// second = unconditional exit from a context the run loop cannot block.
+const ESCALATE: [KeyCode; 2] = [KeyCode::Char('c'), KeyCode::Char('d')];
+if let Event::Key(k) = &ev
+    && k.modifiers.contains(KeyModifiers::CONTROL)
+    && ESCALATE.contains(&k.code)
+{
+    if escalated.swap(true, Ordering::SeqCst) {
+        // Second press: the cooperative path already failed. Reap and leave.
+        cyrup_tools::ops::local::kill_tracked_detached_children();
+        let _ = crossterm::terminal::disable_raw_mode();
+        std::process::exit(130);
+    }
+    cancel.cancel();          // cooperative: unblocks the loop's `cancel` arm (#1, biased first)
+    // fall through: still forward the key so the normal Quit/abort path runs when the loop is live
+}
+```
+
+`escalated` is an `AtomicBool` owned by the thread closure. `disable_raw_mode` before exit is
+mandatory — exiting raw leaves the user's terminal unusable, which is how this bug currently ends.
+
+**This is the load-bearing half of the task.** With it, no future wedge can trap the user.
+
+## 4. Required change 2 — `Ctrl+C` gets a real binding (closes `TUI-088`)
+
+**Where:** [`crates/cyrup-tui/src/keymap.rs`](../../../crates/cyrup-tui/src/keymap.rs), the global
+chord table, alongside the existing `ctrl_code` families.
+
+Bind `Ctrl+C` to the interrupt action pi binds it to — abort the running turn when one is running,
+otherwise the quit escalation. Derive the exact split from pi's interactive keybinding table before
+writing it; `TUI-067`/`TUI-068` are the same class (chord parses, destination missing) and should be
+checked in the same pass.
+
+## 5. Required change 3 — the loop stops sharing fate with input
+
+**Where:** [`crates/cyrup-tui/src/app.rs`](../../../crates/cyrup-tui/src/app.rs), `App::run`.
+
+Every `.await` in an arm body is a place the sole input drain can stop. Two changes, both required:
+
+**5a — bound every await.** Wrap each awaiting arm body in `tokio::time::timeout`. On elapse, log
+the arm and continue the loop rather than hanging. This converts an indefinite wedge into a visible,
+recoverable stall **and names the offending await in the log the first time it fires** — which is
+how the specific culprit gets identified without a prior repro:
+
+```rust
+maybe_ev = events.next() => {
+    let Some(ev) = maybe_ev else { continue };
+    // A wedged handler must degrade the session, never the process. The elapsed branch is the
+    // diagnostic: it names the arm and the event kind that stalled.
+    if tokio::time::timeout(ARM_BUDGET, self.ingest_session_event(&ev, &session))
+        .await
+        .is_err()
+    {
+        tracing::error!(arm = "events", kind = ev.kind(), "run-loop arm exceeded budget");
+    }
+    // …
+}
+```
+
+`ARM_BUDGET` is a module const; 5s is generous for any handler that is not broken.
+
+**5b — long work is spawned, not awaited inline.** Any arm body whose work is unbounded by nature
+(a command execution, a session build, a runtime swap) must `tokio::spawn` and return its result
+through an existing channel arm. The loop's job is ordering and drawing, not executing.
 
 ---
 
-## 6. Evidence appendix
+## 6. Definition of done
 
-Owner reports, verbatim, 2026-08-15 live use:
+1. `Ctrl+C` and `Ctrl+D` exit the TUI **while the loop is wedged** — verified by wedging it (a
+   `sleep` injected into an arm body is sufficient) and pressing the key.
+2. On that exit the terminal is left in **cooked mode** — the shell prompt works normally, no
+   `reset` required.
+3. First press requests cooperative teardown; second press exits unconditionally. Same contract as
+   `signals.rs:209-219`.
+4. `Ctrl+C` has a global binding; `TUI-088` closes with it.
+5. Every awaiting arm in `App::run` is budget-bounded, and an exceeded budget logs the arm name and
+   continues rather than hanging.
+6. A long live session no longer wedges; if it still degrades, that residue belongs to `TUI-090` and
+   is tracked there, **not reopened here**.
+
+---
+
+## 7. Sequencing
+
+`TUI-090` is confirmed and supplies the slowdown that makes this reachable. Land its fix, then this
+one; re-measure a long session before opening any further TUI performance item.
+
+---
+
+## 8. Evidence appendix
+
+Owner reports, verbatim:
 
 ```
 the terminal is super fast and smooth but freezes up over time
@@ -164,9 +231,17 @@ terminal gets totally locked up and can't even be killed with ctrl+d
 which is currently the only way to exit the terminal since ctrl+c is borked up
 ```
 
-Ruled-out accumulators, verified at HEAD:
+Read at HEAD:
 
 ```
-transcript.rs:553-556   drain_committed → std::mem::take(&mut self.pending)
-transcript.rs:899, :935 self.active_tools.drain(..)
+app.rs:8019          App::run — tokio::select!, biased;, 21 arms, 16 .await in arm bodies
+app.rs:8069          arm #5: maybe_in = input.next() => … AppAction::Quit => break
+app.rs:8449          arm #19: maybe_ev = events.next() => self.ingest_session_event(..).await
+app.rs:8777          crossterm_input_stream — dedicated std::thread, unbounded channel
+app.rs:7908-7934     all five tickers set MissedTickBehavior::Skip
+signals.rs:189       spawn_abort_on_signal — correct escalation, unreachable in raw mode
+signals.rs:216-218   second signal: kill_tracked_detached_children() + process::exit
+footer_data.rs:143   FooterGitBranch::poll — stat fingerprint, early return, no draw
+transcript.rs:553    drain_committed — std::mem::take(&mut self.pending)
+transcript.rs:899    active_tools.drain(..)
 ```
