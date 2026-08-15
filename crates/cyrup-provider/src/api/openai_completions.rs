@@ -370,7 +370,32 @@ pub(crate) fn build_body_with_env(
         obj.insert("store".to_string(), json!(false));
     }
 
-    if let Some(max) = opts.max_tokens {
+    // PROV-069 — an output ceiling is ALWAYS sent: the caller's when it supplied one, otherwise the
+    // model's own `max_tokens` from the catalog.
+    //
+    // [CYRUP-DELTA] Upstream sends this key only when the caller supplies one
+    // (`ai/src/api/openai-completions.ts:716`, `if (options?.maxTokens)`), and nothing in cyrup's
+    // turn path ever does — `GenConfig::max_tokens` has no production writer, so the key was never
+    // emitted and the server applied its OWN default ceiling. On Together that default truncates a
+    // reply mid-sentence within a few hundred tokens, on every turn, with `finish_reason: length`,
+    // while the session sits at ~3% of a 1M context window. The catalog's `max_tokens` — ported for
+    // all 1087 rows and covered by tests — reached no request at all.
+    //
+    // The fallback is upstream's OWN rule, taken from the two APIs where it is explicit rather than
+    // invented here: `anthropic-messages.ts:989` sends `options?.maxTokens ?? model.maxTokens`, and
+    // `adjustMaxTokensForThinking` (`simple-options.ts:61-64`) documents the same intent in words —
+    // "Undefined means no explicit caller cap. Use the model cap and fit thinking inside it."
+    // Applying it here makes the three wire paths agree instead of leaving this one uncapped.
+    //
+    // A caller-supplied value still wins, so `maxTokens` in settings / `modelOverrides` keeps its
+    // precedence. When neither exists (`max_tokens == 0`, the modelless fallback), nothing is sent
+    // and upstream's behaviour is unchanged.
+    let ceiling = opts.max_tokens.or(if model.max_tokens > 0 {
+        Some(model.max_tokens)
+    } else {
+        None
+    });
+    if let Some(max) = ceiling {
         match compat.max_tokens_field {
             MaxTokensField::MaxTokens => {
                 obj.insert("max_tokens".to_string(), json!(max));
@@ -2623,6 +2648,42 @@ mod tests {
         let tiny = format!("c|{}", "d".repeat(60));
         let out = normalize_tool_call_id(&m, &tiny);
         assert_eq!(out, format!("c_{}", &short_hash(&tiny)[..8]));
+    }
+
+    /// PROV-069 — the production path: NO caller cap, so the MODEL's `max_tokens` must reach the
+    /// wire. Reported from live use — every reply truncated mid-sentence with `finish_reason:
+    /// length` at ~3% of a 1M context window.
+    ///
+    /// RED before the fix, and this is the test the suite was missing rather than getting wrong:
+    /// `GenConfig::max_tokens` has no production writer (`grep -rn '\.max_tokens(' crates/ | grep -v
+    /// tests` is empty), so `opts.max_tokens` is always `None` in the product, the key was never
+    /// emitted, and the server applied its own small default. Every OTHER wire test here supplies
+    /// `max_tokens: Some(...)` by hand — which proves serialisation and hides the one path that
+    /// actually ships.
+    #[test]
+    fn with_no_caller_cap_the_models_own_max_tokens_reaches_the_body() {
+        let ctx = Context { system_prompt: None, messages: vec![], tools: vec![] };
+
+        // Exactly what the turn path passes today: nothing.
+        let body = build_body(&model(), &ctx, &StreamOptions::default());
+        assert_eq!(
+            body["max_tokens"], 131_072,
+            "the catalog's max_tokens must reach the request, not sit decorative: {body}"
+        );
+
+        // A caller cap still wins, so a `maxTokens` setting / modelOverrides keeps precedence.
+        let capped =
+            build_body(&model(), &ctx, &StreamOptions { max_tokens: Some(256), ..Default::default() });
+        assert_eq!(capped["max_tokens"], 256, "an explicit caller cap beats the model's");
+
+        // Modelless fallback (`max_tokens: 0`) sends nothing, leaving upstream behaviour unchanged.
+        let mut modelless = model();
+        modelless.max_tokens = 0;
+        let none = build_body(&modelless, &ctx, &StreamOptions::default());
+        assert!(
+            none.get("max_tokens").is_none(),
+            "a zero model ceiling means unknown — send no key: {none}"
+        );
     }
 
     #[test]
