@@ -42,8 +42,20 @@ impl EditTool {
         opts: EditOpts,
     ) -> Self {
         // Byte-for-byte Pi's TypeBox emission (edit.ts:33-53): verbatim descriptions on every
-        // property, and `additionalProperties:false` on BOTH the top object and the nested edit
-        // object — `edit` is the ONLY tool whose source passes `{ additionalProperties: false }`.
+        // property, and NO `additionalProperties` on either the top object or the nested edit
+        // object. Both `Type.Object(...)` calls pass `{}` as their options argument (edit.ts:41
+        // and edit.ts:52) — an EMPTY object, not `{ additionalProperties: false }` — and TypeBox
+        // only spreads what it is given, so neither level emits the keyword. Verified by running
+        // both literals under the `typebox` version pi's own `package.json` pins at v0.83.0
+        // (1.3.7) and under the copy vendored in the pi checkout (1.1.38); both print
+        // `{"type":"object","required":["path","edits"],"properties":{…}}` with no
+        // `additionalProperties` at either level. Adding it here was NOT inert: `parameters()` is
+        // copied verbatim into the model-facing schema (`cyrup-agent/src/agent.rs:813`) and the
+        // OpenAI Chat Completions and Google adapters forward it untouched
+        // (`api/openai_completions.rs:816`, `api/google_generative_ai.rs:859`, the latter as
+        // `parametersJsonSchema`, which Gemini enforces), so the extra keyword forbade exactly the
+        // legacy flat `{path, oldText, newText}` shape that [`Self::prepare_arguments`] below —
+        // pi's `prepareEditArguments` (edit.ts:94-118) — exists to accept.
         let params = serde_json::json!({
             "type": "object",
             "required": ["path", "edits"],
@@ -57,13 +69,11 @@ impl EditTool {
                         "properties": {
                             "oldText": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call." },
                             "newText": { "type": "string", "description": "Replacement text for this targeted edit." }
-                        },
-                        "additionalProperties": false
+                        }
                     },
                     "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."
                 }
-            },
-            "additionalProperties": false
+            }
         });
         Self { fs, locks, cwd, opts, params }
     }
