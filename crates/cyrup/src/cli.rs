@@ -565,6 +565,21 @@ impl Cli {
             list.retain(|name| !name.is_empty());
         }
     }
+
+    /// Strip the NUL marker [`crate::diagnostics::apply_arg_leniency`] puts in front of a
+    /// `-p ---…` escape-hatch message (pi args.ts:140-146 — `next.startsWith("---")`), restoring the
+    /// token to the literal prompt word the user typed. SEAM-107.
+    ///
+    /// Runs after the clap parse, beside [`Self::normalize_list_flags`], and before any consumer
+    /// reads `positionals` — including `split_positionals`, so the restored word is classified as a
+    /// message or an `@file` on its real spelling.
+    pub fn restore_escaped_positionals(&mut self) {
+        for token in &mut self.positionals {
+            if let Some(rest) = token.strip_prefix(crate::diagnostics::ESCAPED_MESSAGE_PREFIX) {
+                *token = rest.to_string();
+            }
+        }
+    }
 }
 
 /// Resolve a `--session`/`--session-id`/`--fork` reference (a path or a bare id) to a session file
@@ -889,6 +904,17 @@ const KNOWN_VALUE_LONG_FLAGS: &[&str] = &[
 /// and the built-in tool names. `extension_flags` are the flags loaded extensions registered; the bin
 /// passes an empty slice today (the loaded-extension flag tier is the outer extension layer,
 /// ledgered), but the injection point is preserved 1:1.
+///
+/// SEAM-111 — the Commands block had drifted from `args.ts:226-235` in three places, and **two of
+/// them understated what actually ships**:
+///
+/// * `update` read `Update cyrup (use --all for cyrup and extensions)`, dropping pi's model-catalog
+///   clause (`args.ts:232`). `cyrup update --models` exists now (SEAM-100 landed it —
+///   `subcommands.rs`'s `UpdateTargetSel::Models`), so the clause is true and is restored verbatim.
+/// * `config` read `cyrup config` with no `[-l]` and no Tab hint (`args.ts:234`), yet BOTH ship:
+///   `-l` is parsed at `subcommands.rs`'s config arm and Tab switches write scope in the picker. The
+///   two least guessable parts of `config` were invisible from the top-level help and — until
+///   SEAM-079 — from `config --help` as well.
 pub fn render_help(extension_flags: &[ExtensionFlag]) -> String {
     const APP: &str = "cyrup";
     const CFG: &str = ".cyrup";
@@ -920,9 +946,9 @@ Commands:
   {APP} install <source> [-l]     Install extension source and add to settings
   {APP} remove <source> [-l]      Remove extension source from settings
   {APP} uninstall <source> [-l]   Alias for remove
-  {APP} update [source|self|pi]   Update {APP} (use --all for {APP} and extensions)
+  {APP} update [source|self|pi]   Update {APP}, extensions, or model catalogs
   {APP} list                      List installed extensions from settings
-  {APP} config                    Open TUI to enable/disable package resources
+  {APP} config [-l]               Open TUI to enable/disable package resources (Tab switches scope)
   {APP} auth <command>            Print credentials for external clients
   {APP} <command> --help          Show help for install/remove/uninstall/update/list/config/auth
 
@@ -1110,6 +1136,93 @@ mod tests {
         let mut full = vec!["cyrup".to_string()];
         full.extend(normalize_short_aliases(args.iter().map(|s| s.to_string())));
         Cli::try_parse_from(full).expect("parse")
+    }
+
+    /// The whole pre-clap pipeline `main.rs` runs, in `main.rs`'s order: short-alias normalization →
+    /// [`crate::diagnostics::apply_arg_leniency`] → [`partition_extension_flags`] → clap →
+    /// [`Cli::normalize_list_flags`] → [`Cli::restore_escaped_positionals`]. The plain [`parse`]
+    /// helper above skips the first two, which is exactly where SEAM-103/105/107 live.
+    fn parse_like_main(args: &[&str]) -> Cli {
+        let raw = normalize_short_aliases(args.iter().map(|s| s.to_string()));
+        let (lenient, _) = crate::diagnostics::apply_arg_leniency(&raw);
+        let (clean, extension_flags) = partition_extension_flags(&lenient);
+        let mut full = vec!["cyrup".to_string()];
+        full.extend(clean);
+        let mut cli = Cli::try_parse_from(full).expect("parse");
+        cli.extension_flags = extension_flags;
+        cli.normalize_list_flags();
+        cli.restore_escaped_positionals();
+        cli
+    }
+
+    /// SEAM-105 end-to-end — the divergence was only ever visible through the REPEATED form, and
+    /// only after clap had appended (pi `result.tools = …`, args.ts:121-124).
+    #[test]
+    fn repeated_list_flags_resolve_to_the_last_occurrence() {
+        // Presence before absence: the comma form keeps both, under both spellings.
+        assert_eq!(parse_like_main(&["--tools", "read,bash"]).tools, vec![
+            "read".to_string(),
+            "bash".to_string()
+        ]);
+        assert_eq!(parse_like_main(&["-t", "read,bash"]).tools, vec![
+            "read".to_string(),
+            "bash".to_string()
+        ]);
+        // …and the repeated form keeps only the last.
+        assert_eq!(
+            parse_like_main(&["--tools", "read", "--tools", "bash"]).tools,
+            vec!["bash".to_string()]
+        );
+        assert_eq!(
+            parse_like_main(&["--models", "a", "--models", "b"]).models,
+            vec!["b".to_string()]
+        );
+        assert_eq!(
+            parse_like_main(&["--exclude-tools", "x", "-xt", "y"]).exclude_tools,
+            vec!["y".to_string()]
+        );
+    }
+
+    /// SEAM-107 end-to-end — `-p ---weird` must send `---weird` as the PROMPT and register no
+    /// extension flag (pi args.ts:140-146). Before the fix the token reached
+    /// [`partition_extension_flags`] and became the flag `-weird`, which the unknown-flag gate then
+    /// killed the run over.
+    #[test]
+    fn print_escape_hatch_makes_a_dashed_token_the_prompt() {
+        let cli = parse_like_main(&["-p", "---weird"]);
+        assert!(cli.print);
+        assert_eq!(cli.positionals, vec!["---weird".to_string()]);
+        assert!(cli.extension_flags.is_empty(), "{:?}", cli.extension_flags);
+        // The marker never survives into the prompt.
+        assert!(!cli.positionals[0].contains('\0'));
+        // It keeps its POSITION among the messages rather than being pushed to the end.
+        let cli = parse_like_main(&["-p", "---weird", "and", "more"]);
+        assert_eq!(
+            cli.positionals,
+            vec!["---weird".to_string(), "and".to_string(), "more".to_string()]
+        );
+        // Presence before absence: a genuine unknown long flag is STILL captured.
+        let cli = parse_like_main(&["-p", "--weird"]);
+        assert_eq!(cli.extension_flags.len(), 1);
+        assert_eq!(cli.extension_flags[0].name, "weird");
+    }
+
+    /// SEAM-103 end-to-end — `--list-models @foo` lists the catalog (an empty search) and leaves
+    /// `@foo` in the file args (pi args.ts:171-177).
+    #[test]
+    fn list_models_leaves_a_following_file_arg_alone() {
+        let cli = parse_like_main(&["--list-models", "@notes.md"]);
+        assert_eq!(cli.list_models.as_deref(), Some(""));
+        assert_eq!(cli.positionals, vec!["@notes.md".to_string()]);
+        assert_eq!(
+            crate::split_positionals(&cli.positionals).0,
+            vec!["notes.md".to_string()]
+        );
+        // Presence before absence: a real pattern still filters.
+        assert_eq!(
+            parse_like_main(&["--list-models", "gpt"]).list_models.as_deref(),
+            Some("gpt")
+        );
     }
 
     fn dirs() -> ConfigDirs {
@@ -1511,6 +1624,32 @@ mod tests {
         }]);
         assert!(with_ext.contains("Extension CLI Flags:"));
         assert!(with_ext.contains("--plan"));
+    }
+
+    /// SEAM-111 — the Commands block against pi's `args.ts:226-235`, on the three clauses that had
+    /// drifted. Two of them UNDERSTATED the shipped surface: `-l` and the Tab hint describe behaviour
+    /// that has always worked, and the model-catalog clause became true when SEAM-100 landed
+    /// `cyrup update --models`.
+    #[test]
+    fn the_top_level_commands_block_states_the_shipped_surface() {
+        let help = render_help(&[]);
+        assert!(
+            help.contains("cyrup config [-l]"),
+            "`-l` ships (subcommands.rs's config arm) but was unadvertised: {help}"
+        );
+        assert!(
+            help.contains("(Tab switches scope)"),
+            "Tab switches write scope in the picker (pi args.ts:234): {help}"
+        );
+        assert!(
+            help.contains("Update cyrup, extensions, or model catalogs"),
+            "pi's `update` clause names all three targets (args.ts:232), and `--models` now exists"
+        );
+        // The clause is only honest because the command it names is real.
+        assert!(
+            crate::subcommands::render_command_help(crate::subcommands::PackageCommand::Update)
+                .contains("--models")
+        );
     }
 
     /// The env block and the read set must be the SAME set, in both directions (SEAM-102 /

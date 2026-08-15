@@ -147,7 +147,15 @@ pub(crate) async fn run_bash(
     // `bash` tool already did (`cyrup-tools/src/tools/bash.rs`); this seam did not, so `!!cmd` and
     // the RPC `executeBash` saw a DIFFERENT environment from the identical command run as a tool.
     env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));
-    // [CYRUP-DELTA, value only] `AI_AGENT` names WHICH agent is running (`"pi"` upstream).
+    // [CYRUP-DELTA — KEY *and* value; the key is a FORWARD-PORT from `cli.ts:14` @v0.84.1, which is
+    // AHEAD of the ported tag] `AI_AGENT` does not exist anywhere in pi @v0.83.0
+    // (`git -C pi grep -n AI_AGENT v0.83.0 -- packages/` → 0 hits; `cli.ts:13` @v0.83.0 sets only
+    // `PI_CODING_AGENT`). So cyrup writes a variable into every bash child that the ported baseline
+    // never wrote, and the value additionally names WHICH agent is running (`"pi"` upstream).
+    // Deliberate: the marker is how a hook or a script tells an agent shell from a human one, and
+    // dropping it would leave the v0.84.1 uplift with a hole. Stated here rather than only in the
+    // prose above (CFG-069) so a later v0.84.1 uplift reads this as ALREADY-PORTED-EARLY and not as
+    // already-done-at-tag. Same class as the `working-start`/`working-stop` precedent.
     env.push(("AI_AGENT".to_string(), "cyrup".to_string()));
     let mut buffer = BashOutputBuffer::new();
     // ONE sink, shared by both branches: pi's `onChunk` wrapper is built once and handed to

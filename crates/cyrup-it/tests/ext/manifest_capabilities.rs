@@ -339,6 +339,44 @@ async fn ui_effects_are_dropped_when_the_manifest_denies_ui() {
     let _ = std::fs::remove_dir_all(&granted);
 }
 
+/// EXT-065 — the `ui` grant reaches `add-autocomplete-provider`.
+///
+/// It did not before: the import was declared on `interface registration`, whose host impl calls the
+/// UNGATED `guest_of`, so a guest with `"ui": false` still stacked a provider onto the core input
+/// editor. Upstream declares `addAutocompleteProvider` inside `ExtensionUIContext`
+/// (`extensions/types.ts:225` @v0.83.0), so the move to `interface ui` restores pi's placement AND
+/// puts the call behind the grant with no new enforcement code.
+///
+/// Asserted on the REGISTRY, not on the guest's own error text: the import is fire-and-forget and
+/// returns nothing, so "the guest was told no" is unobservable — what matters is that the host never
+/// recorded the provider. The fixture registers exactly one (`cyrup-ext-sdk/src/example.rs`
+/// `api.add_autocomplete_provider(...)`), so the granted run is the control that proves the denial
+/// above is the grant and not a missing registration.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_autocomplete_provider_is_refused_when_the_manifest_denies_ui() {
+    let denied =
+        project_with_caps("acp-deny", r#"{ "fs": [], "exec": false, "net": false, "ui": false }"#);
+    let (host, _rec) = load(&denied).await;
+    assert!(
+        host.registry().autocomplete_providers().expect("registry readable").is_empty(),
+        "a guest with no `ui` grant stacked an autocomplete provider onto the core input editor \
+         (EXT-065)"
+    );
+    drop(host);
+    let _ = std::fs::remove_dir_all(&denied);
+
+    let granted = project_with_caps("acp-grant", r#"{ "ui": true }"#);
+    let (host, _rec) = load(&granted).await;
+    assert_eq!(
+        host.registry().autocomplete_providers().expect("registry readable").len(),
+        1,
+        "the same fixture WITH the ui grant registers its one provider — so the refusal above is \
+         the grant, not an absent registration"
+    );
+    drop(host);
+    let _ = std::fs::remove_dir_all(&granted);
+}
+
 // ---------------------------------------------------------------------------------------------
 // fs (EXT-055)
 // ---------------------------------------------------------------------------------------------

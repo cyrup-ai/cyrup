@@ -5,8 +5,29 @@
 use crate::error::ExtError;
 use std::path::Path;
 
-/// The manifest file name inside an extension directory (arch-08 §4.2). Pi's analog is the
-/// `pi` field of `package.json` (`loader.ts:596` @v0.83.0).
+/// The manifest file name inside an extension directory (arch-08 §4.2).
+///
+/// EXT-070 — this used to call itself "Pi's analog … the `pi` field of `package.json`
+/// (`loader.ts:596`)", and BOTH halves of that sentence were wrong.
+///
+/// (a) The two files are **disjoint**: they share zero keys. `extension.json` is
+/// `{id, version, world, entry, capabilities{fs, exec, net, ui}}` — identity, WIT world version and
+/// sandbox grant — and is 100% cyrup-original as a schema, because pi has no per-extension manifest
+/// and no capability model at all (a pi extension is a `.ts` file with ambient Node authority). It
+/// exists here because of the WASM sandbox (ADR-0002). pi's `interface PiManifest` is
+/// `{extensions?, skills?, prompts?, themes?}` — resource PATHS — declared at
+/// `pi/packages/coding-agent/src/core/extensions/loader.ts:561-566` @v0.83.0 and read off the `pi`
+/// key at `:572-573`.
+///
+/// (b) Those four pi keys **are** fully ported — just not here. They live in another crate, as
+/// `ManifestResources` in `crates/cyrup-resources/src/package/manifest.rs`, which also carries the
+/// two cyrup-originals bolted onto them (a fifth `agents` key, and acceptance of a `cyrup`
+/// package.json key beside `pi`, with `pi` winning on collision — EXT-063). A reader who finds only
+/// this file concludes pi's manifest is unported; the enumeration that filed EXT-070 did exactly
+/// that until the second crate turned up.
+///
+/// (`loader.ts:596` is `const packageJsonPath = path.join(dir, "package.json");` — a path join, not
+/// the field read the old citation claimed.)
 pub const MANIFEST_FILE: &str = "extension.json";
 
 /// The on-disk `extension.json` (arch-08 §4.2).
@@ -184,7 +205,18 @@ impl Capabilities {
 ///   `core/tools/tool-definition-wrapper.ts:14`). A 0.6 guest calls `register-tool` with the
 ///   nine-field record the 0.7 host no longer accepts, so it fails to LINK — the same failure
 ///   mode as a stale export, hence the bump.
-pub const HOST_WORLD: &str = "cyrup:ext@0.7";
+/// - 0.7 → 0.8: the ext-rpc surface-enumeration batch, both directions again. EXPORT RENAMES —
+///   `events.on-tool-exec-{start,update,end}` became `on-tool-execution-*`, the only three exports
+///   in the 33-event mapping whose names were not a mechanical kebab-case of pi's
+///   (`tool_execution_start`/`_update`/`_end`, `extensions/types.ts:1223-1225` @v0.83.0, EXT-069);
+///   and `events.on-session-tree`'s parameter became `event-json` (EXT-068 — the payload is pi's
+///   four-field `SessionTreeEvent` leaf transition, `types.ts:646-652`, not a tree dump). IMPORT
+///   MOVE — `add-autocomplete-provider` left `interface registration` for `interface ui`, which is
+///   what puts it behind this file's own `capabilities.ui` grant (EXT-065; upstream declares it
+///   inside `ExtensionUIContext`, `types.ts:225`). A 0.7 guest imports it from the old interface
+///   and fails to LINK. IMPORT ADDITION — `ui.theme-get-json` (EXT-066), which would not have
+///   required a bump on its own.
+pub const HOST_WORLD: &str = "cyrup:ext@0.8";
 
 impl ExtensionManifest {
     /// Parse from JSON bytes.

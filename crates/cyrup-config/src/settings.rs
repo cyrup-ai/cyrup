@@ -1235,12 +1235,20 @@ impl SettingsStore for InMemorySettingsStore {
     }
 }
 
-/// The layered settings facade (arch-07 §3.3). Holds the three layers + a memoized merge.
+/// The layered settings facade (arch-07 §3.3). Holds the two layers + a memoized merge.
+///
+/// **Exactly two persistent layers, `global ◁ project`, matching pi's
+/// `this.settings = deepMergeSettings(this.globalSettings, this.projectSettings)`
+/// (settings-manager.ts:305, and again at `:466`, `:503` @v0.83.0).** There is no CLI tier
+/// upstream: the ONLY way to push a value above the project layer is the transient
+/// [`Self::apply_overrides`] (`applyOverrides`, settings-manager.ts:508-510), which merges onto the
+/// already-merged view and is discarded by the next recompute. CFG-059 removed a third persistent
+/// `cli` layer that sat above project, was stripped by `strip_global_only`, and survived every
+/// `reload()` / `set_project_trusted()` — three properties upstream's override path does not have.
 pub struct SettingsManager {
     store: Arc<dyn SettingsStore>,
     global: Settings,
     project: Settings,
-    cli: Settings,
     effective: EffectiveSettings,
     project_trusted: bool,
     load_errors: Vec<ScopedError>,
@@ -1259,12 +1267,11 @@ impl SettingsManager {
     /// Load global unconditionally; load project ONLY if `project_trusted` (R-07-002). A parse
     /// error degrades that scope to empty and records a `ScopedError` (R-00-009) plus the
     /// per-scope write latch (CFG-001).
-    pub fn load(store: Arc<dyn SettingsStore>, cli: Settings, project_trusted: bool) -> Self {
+    pub fn load(store: Arc<dyn SettingsStore>, project_trusted: bool) -> Self {
         let mut mgr = Self {
             store,
             global: Settings::default(),
             project: Settings::default(),
-            cli,
             effective: EffectiveSettings::default(),
             project_trusted,
             load_errors: Vec::new(),
@@ -1323,14 +1330,11 @@ impl SettingsManager {
     }
 
     fn recompute(&mut self) {
-        // Strip global-only keys from project + cli before merge.
+        // Strip global-only keys from project before merge.
         let mut project = self.project.clone();
-        let mut cli = self.cli.clone();
         strip_global_only(&mut project);
-        strip_global_only(&mut cli);
 
         let merged = deep_merge(&self.global.to_value(), &project.to_value());
-        let merged = deep_merge(&merged, &cli.to_value());
         let merged = match merged {
             Value::Object(obj) => Settings::from_map(obj),
             _ => Settings::default(),
@@ -1360,12 +1364,27 @@ impl SettingsManager {
         Ok(())
     }
 
-    /// `applyOverrides` (Pi settings-manager.ts:503-505): deep-merge additional overrides on top of
+    /// `applyOverrides` (Pi settings-manager.ts:508-510): deep-merge additional overrides on top of
     /// the current effective settings at runtime. These overrides are NOT persisted and are
     /// transient — any subsequent `reload`/`set_project_trusted` recomputes the merge from the
-    /// global/project/cli layers and discards them (matching Pi, where `applyOverrides` mutates the
-    /// in-memory `this.settings` that `loadSettings` later rebuilds).
+    /// global/project layers and discards them (matching Pi, where `applyOverrides` mutates the
+    /// in-memory `this.settings` that `reload()` later rebuilds at `:503`).
+    ///
+    /// This is the ONLY override path above the project layer, and the seam an embedder or a test
+    /// harness uses — upstream's own callers are `examples/sdk/10-settings.ts:17`,
+    /// `test/test-harness.ts:395` (`applyOverrides(options.settings)`) and
+    /// `test/utilities.ts:258` (`options.settingsOverrides`); there are ZERO production callers at
+    /// v0.83.0, which is why CFG-059 deleted cyrup's persistent `cli` tier rather than keeping it.
+    ///
+    /// Global-only keys are stripped from the overrides. Upstream expresses global-only-ness at the
+    /// GETTER — `getGlobalSettings()` returns `this.globalSettings`, never `this.settings`
+    /// (settings-manager.ts:442-444) — so `applyOverrides`, which only ever touches `this.settings`,
+    /// cannot influence `defaultProjectTrust` or `httpProxy` upstream either. cyrup implements the
+    /// same guarantee at the merge, so the strip has to happen on this path too or CFG-057's fix
+    /// would be reachable through an override.
     pub fn apply_overrides(&mut self, overrides: &Settings) {
+        let mut overrides = overrides.clone();
+        strip_global_only(&mut overrides);
         let merged = deep_merge(&self.effective.raw().to_value(), &overrides.to_value());
         let merged = match merged {
             Value::Object(obj) => Settings::from_map(obj),
@@ -1694,7 +1713,7 @@ mod tests {
             SettingsScope::Global,
             r#"{ "shellPath": "~/bin/bash", "sessionDir": "~/sessions" }"#,
         );
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         let effective = mgr.effective();
 
         let shell = effective.shell_path().expect("shellPath is configured");
@@ -1712,7 +1731,7 @@ mod tests {
         // A bare `~` expands to the home dir itself, and an absolute path is untouched.
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, r#"{ "shellPath": "~" }"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(
             mgr.effective().shell_path().as_deref(),
             Some(home.to_string_lossy().as_ref())
@@ -1720,7 +1739,7 @@ mod tests {
 
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, r#"{ "shellPath": "/bin/zsh" }"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(mgr.effective().shell_path().as_deref(), Some("/bin/zsh"));
     }
 
@@ -1737,19 +1756,19 @@ mod tests {
         // whitespace-only configured editor is treated as unset -> VISUAL
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, r#"{ "externalEditor": "   " }"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(mgr.effective().external_editor(&env), "vim");
 
         // empty-string configured editor is treated as unset -> VISUAL
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, r#"{ "externalEditor": "" }"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(mgr.effective().external_editor(&env), "vim");
 
         // empty configured editor with no VISUAL/EDITOR -> platform default
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, r#"{ "externalEditor": "  " }"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(
             mgr.effective()
                 .external_editor(&crate::env::EnvVars::default()),
@@ -1762,7 +1781,7 @@ mod tests {
             SettingsScope::Global,
             r#"{ "externalEditor": "code --wait" }"#,
         );
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(mgr.effective().external_editor(&env), "code --wait");
     }
 
@@ -1807,25 +1826,76 @@ mod tests {
         assert_eq!(reparsed.get("defaultModel"), Some(&serde_json::json!("x")));
     }
 
+    /// CFG-059 — the precedence MODEL is pi's: exactly two persistent layers, `global ◁ project`,
+    /// and the only tier above project is the TRANSIENT `applyOverrides`.
+    ///
+    /// Presence before absence: the override is first shown to WIN over project (so this is a
+    /// statement about precedence, not a dead call), and only then shown not to survive a
+    /// recompute. The old shape of this test asserted a third `cli` layer that outranked project
+    /// AND persisted; pi has no such tier — `applyOverrides` has exactly two v0.83.0 call sites
+    /// (`examples/sdk/10-settings.ts:17`, `test/test-harness.ts:395`) and zero production callers.
     #[test]
-    fn cli_then_project_then_global_resolution() {
-        // A-07-1
+    fn project_outranks_global_and_the_only_tier_above_project_is_transient() {
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(
             SettingsScope::Global,
             r#"{ "defaultModel": "g", "theme": "light" }"#,
         );
         store.seed(SettingsScope::Project, r#"{ "defaultModel": "p" }"#);
-        let mut cli = Settings::new();
-        cli.set_field("defaultModel", "c").unwrap();
 
-        let mgr = SettingsManager::load(store.clone(), cli, true);
+        // Two layers: project wins for its own key, global still supplies the rest.
+        let mut mgr = SettingsManager::load(store.clone(), true);
+        assert_eq!(mgr.effective().default_model(), Some("p".to_string()));
+        assert_eq!(mgr.effective().theme(), Some("light".to_string()));
+
+        // PRESENCE: an override outranks the project layer while it is applied.
+        let mut overrides = Settings::new();
+        overrides.set_field("defaultModel", "c").unwrap();
+        mgr.apply_overrides(&overrides);
         assert_eq!(mgr.effective().default_model(), Some("c".to_string()));
         assert_eq!(mgr.effective().theme(), Some("light".to_string()));
 
-        // without CLI, project wins
-        let mgr2 = SettingsManager::load(store, Settings::new(), true);
-        assert_eq!(mgr2.effective().default_model(), Some("p".to_string()));
+        // ABSENCE: it is not a layer — every recompute path drops it and project wins again.
+        mgr.reload().unwrap();
+        assert_eq!(mgr.effective().default_model(), Some("p".to_string()));
+        mgr.apply_overrides(&overrides);
+        mgr.set_project_trusted(false);
+        assert_eq!(mgr.effective().default_model(), Some("g".to_string()));
+        mgr.set_project_trusted(true);
+        assert_eq!(mgr.effective().default_model(), Some("p".to_string()));
+    }
+
+    /// CFG-059 × CFG-057 — an override cannot supply a global-only key. Upstream expresses
+    /// global-only-ness at the getter (`getGlobalSettings()` returns `this.globalSettings`,
+    /// settings-manager.ts:442-444) and `applyOverrides` only ever touches `this.settings`, so
+    /// upstream's override path cannot reach `httpProxy` / `defaultProjectTrust` either. cyrup
+    /// implements the same guarantee at the merge, so the strip has to cover this path too.
+    #[test]
+    fn an_override_cannot_supply_a_global_only_key() {
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Global,
+            r#"{ "httpProxy": "http://global:8080", "defaultModel": "g" }"#,
+        );
+        let mut mgr = SettingsManager::load(store, false);
+
+        let overrides = Settings::parse(
+            r#"{ "httpProxy": "http://override:9", "defaultProjectTrust": "always", "defaultModel": "o" }"#,
+        )
+        .unwrap();
+        mgr.apply_overrides(&overrides);
+
+        // PRESENCE: a non-global-only key from the same override document DID land.
+        assert_eq!(mgr.effective().default_model(), Some("o".to_string()));
+        // ABSENCE: the two global-only keys did not.
+        assert_eq!(
+            mgr.effective().http_proxy(&crate::env::EnvVars::default()),
+            Some("http://global:8080".to_string())
+        );
+        assert_eq!(
+            mgr.effective().default_project_trust(),
+            DefaultProjectTrust::Ask
+        );
     }
 
     #[test]
@@ -1843,7 +1913,7 @@ mod tests {
             SettingsScope::Project,
             r#"{ "skills": ["p-skill-a", "p-skill-b"], "prompts": ["p-prompt"] }"#,
         );
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
 
         // Each layer reports ONLY its own list (no merge).
         assert_eq!(mgr.global().skill_paths(), vec!["g-skill".to_string()]);
@@ -1873,7 +1943,7 @@ mod tests {
         store.seed(SettingsScope::Global, r#"{ "defaultModel": "g" }"#);
         store.seed(SettingsScope::Project, r#"{ "defaultModel": "p" }"#);
 
-        let mut mgr = SettingsManager::load(store, Settings::new(), false);
+        let mut mgr = SettingsManager::load(store, false);
         assert_eq!(mgr.effective().default_model(), Some("g".to_string()));
         mgr.set_project_trusted(true);
         assert_eq!(mgr.effective().default_model(), Some("p".to_string()));
@@ -1893,7 +1963,7 @@ mod tests {
             SettingsScope::Project,
             r#"{ "defaultProjectTrust": "never" }"#,
         );
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(
             mgr.effective().default_project_trust(),
             DefaultProjectTrust::Always
@@ -1916,7 +1986,7 @@ mod tests {
             SettingsScope::Project,
             r#"{ "httpProxy": "http://project:9090" }"#,
         );
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(
             mgr.effective().http_proxy(&crate::env::EnvVars::default()),
             Some("http://global:8080".to_string())
@@ -1928,7 +1998,7 @@ mod tests {
             SettingsScope::Project,
             r#"{ "httpProxy": "http://project:9090" }"#,
         );
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
         assert_eq!(
             mgr.effective().http_proxy(&crate::env::EnvVars::default()),
             None
@@ -1942,7 +2012,7 @@ mod tests {
             SettingsScope::Global,
             r#"{ "futureKey": 42, "defaultModel": "old" }"#,
         );
-        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        let mut mgr = SettingsManager::load(store.clone(), false);
         mgr.set(SettingsScope::Global, "defaultModel", "new")
             .unwrap();
         let raw = store.read(SettingsScope::Global).unwrap().unwrap();
@@ -1954,7 +2024,7 @@ mod tests {
     #[test]
     fn project_write_requires_trust() {
         let store = Arc::new(InMemorySettingsStore::new());
-        let mut mgr = SettingsManager::load(store, Settings::new(), false);
+        let mut mgr = SettingsManager::load(store, false);
         let err = mgr.set(SettingsScope::Project, "defaultModel", "x");
         assert!(matches!(err, Err(ConfigError::Untrusted)));
     }
@@ -2113,7 +2183,7 @@ mod tests {
             SettingsScope::Global,
             r#"{ "terminal": { "imageWidthCells": 40 } }"#,
         );
-        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        let mut mgr = SettingsManager::load(store.clone(), false);
         mgr.set_show_images(false).unwrap();
         let raw = store.read(SettingsScope::Global).unwrap().unwrap();
         let s = Settings::parse(&raw).unwrap();
@@ -2130,7 +2200,7 @@ mod tests {
     #[test]
     fn setters_clamp() {
         let store = Arc::new(InMemorySettingsStore::new());
-        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        let mut mgr = SettingsManager::load(store.clone(), false);
         mgr.set_editor_padding_x(9.0).unwrap();
         assert_eq!(mgr.effective().editor_padding_x(), 3);
         mgr.set_autocomplete_max_visible(1.0).unwrap();
@@ -2489,7 +2559,7 @@ mod tests {
     fn apply_overrides_deep_merges_onto_effective() {
         // settings-manager.ts:503-505 — runtime overrides deep-merge onto the effective view.
         let store = Arc::new(InMemorySettingsStore::new());
-        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        let mut mgr = SettingsManager::load(store.clone(), false);
         assert!(mgr.effective().compaction_enabled());
         assert_eq!(mgr.effective().compaction_reserve_tokens(), 16384);
 
@@ -2512,7 +2582,7 @@ mod tests {
     fn enable_analytics_generates_tracking_id() {
         // settings-manager.ts:943-951
         let store = Arc::new(InMemorySettingsStore::new());
-        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        let mut mgr = SettingsManager::load(store.clone(), false);
         assert!(mgr.effective().tracking_id().is_none());
         mgr.set_enable_analytics(true).unwrap();
         assert!(mgr.effective().enable_analytics());
@@ -2544,7 +2614,7 @@ mod tests {
     fn malformed_global() -> (Arc<InMemorySettingsStore>, SettingsManager) {
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, MALFORMED);
-        let mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        let mgr = SettingsManager::load(store.clone(), false);
         (store, mgr)
     }
 
@@ -2645,7 +2715,7 @@ mod tests {
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, r#"{ "theme": "dark" }"#);
         store.seed(SettingsScope::Project, MALFORMED);
-        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), true);
+        let mut mgr = SettingsManager::load(store.clone(), true);
 
         assert!(mgr.load_error(SettingsScope::Project).is_some());
         assert!(
@@ -2675,7 +2745,7 @@ mod tests {
         // write and surface the refusal rather than starting from an empty document.
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Global, r#"{ "theme": "dark" }"#);
-        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        let mut mgr = SettingsManager::load(store.clone(), false);
         assert!(
             mgr.load_error(SettingsScope::Global).is_none(),
             "loaded clean"
@@ -2741,7 +2811,7 @@ mod tests {
     fn cfg001_an_absent_file_is_still_created() {
         // The refusal must not break first-run: `None` (no file) is not a parse failure.
         let store = Arc::new(InMemorySettingsStore::new());
-        let mut mgr = SettingsManager::load(store.clone(), Settings::new(), false);
+        let mut mgr = SettingsManager::load(store.clone(), false);
         assert!(mgr.load_error(SettingsScope::Global).is_none());
 
         mgr.set(SettingsScope::Global, "theme", "light").unwrap();

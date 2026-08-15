@@ -90,7 +90,11 @@ impl SessionFactory {
         self
     }
 
-    /// CLI-scoped settings overrides (highest precedence).
+    /// Transient settings overrides re-applied to every session this factory builds — pi's
+    /// `SettingsManager.applyOverrides` (settings-manager.ts:508-510 @v0.83.0). NOT a settings
+    /// layer: `SettingsManager` holds only pi's two scopes, and these are discarded by any
+    /// recompute, exactly as upstream's override of `this.settings` is (CFG-059). See
+    /// [`SessionBuilder::cli_settings`], which this forwards to.
     #[must_use]
     pub fn cli_settings(mut self, settings: Settings) -> Self {
         self.cli_settings = settings;

@@ -884,8 +884,17 @@ impl ExtensionRegistry {
         Ok(())
     }
 
-    /// Opt a registered command into argument autocomplete (EXT-035) — the registry-backed native
-    /// analog of the guest's `registration.add-autocomplete` import.
+    /// Opt a registered command into argument autocomplete — the registry table behind BOTH tiers'
+    /// `add-autocomplete` (the native `InitApi` call and, since EXT-065's neighbouring fix, the
+    /// guest's `registration.add-autocomplete` import).
+    ///
+    /// [CYRUP-DELTA] EXT-062: pi has no `addAutocomplete` CALL. Upstream this is a FIELD on the
+    /// command's own options bag — `getArgumentCompletions?: (argumentPrefix: string) =>
+    /// AutocompleteItem[] | null | Promise<…>` on `RegisteredCommand`
+    /// (`extensions/types.ts:1166` @v0.83.0) — passed inline to `registerCommand`. A closure cannot
+    /// cross a component boundary (and a WIT record cannot carry one), so it inverts into a flag
+    /// plus a separate `argument-completions` export, exactly as `tool-descriptor.prepare-arguments`
+    /// and `.has-renderer` do. `EXT-035` / `R-08-021` are cyrup requirement ids, not pi citations.
     pub fn add_command_autocomplete(
         &self,
         owner: ExtensionId,

@@ -533,7 +533,12 @@ impl SessionBuilder {
         self
     }
 
-    /// CLI-scoped settings overrides (highest precedence).
+    /// Transient settings overrides applied on top of the merged `global ◁ project` view — pi's
+    /// `SettingsManager.applyOverrides` (settings-manager.ts:508-510 @v0.83.0), the seam its SDK
+    /// example (`examples/sdk/10-settings.ts:17`) and test harness (`test/test-harness.ts:395`)
+    /// use. They are NOT a persistent layer: `SettingsManager` holds exactly the two scopes pi
+    /// holds, and anything set here is discarded by a later recompute, exactly as upstream's
+    /// override of `this.settings` is (CFG-059).
     #[must_use]
     pub fn cli_settings(mut self, settings: Settings) -> Self {
         self.cli_settings = settings;
@@ -588,11 +593,7 @@ impl SessionBuilder {
 
         // ---- 1. settings + trust (cyrup-config) ------------------------------------------------
         // Load global first (project untrusted) to read defaultProjectTrust, then decide trust.
-        let mut settings = SettingsManager::load(
-            self.settings_store.clone(),
-            self.cli_settings.clone(),
-            false,
-        );
+        let mut settings = SettingsManager::load(self.settings_store.clone(), false);
         let default_trust = settings.effective().default_project_trust();
         let has_resources = has_trust_requiring_resources(&cwd, &cfg.home);
         // Pi's `shouldResolveProjectTrust` guard (main.ts:676-678): only pay for a pre-trust
@@ -665,6 +666,17 @@ impl SessionBuilder {
             },
         };
         settings.set_project_trusted(trusted);
+        // Embedder-supplied overrides are applied HERE, after the trust decision has settled the
+        // two persistent layers — pi's `applyOverrides` (settings-manager.ts:508-510), the same
+        // shape its own harness uses (`test/test-harness.ts:395`:
+        // `settingsManager.applyOverrides(options.settings)`). CFG-059: these used to be a THIRD
+        // persistent layer inside `SettingsManager` that outranked project and survived every
+        // recompute; upstream has no CLI settings tier, so the tier is gone and the transient
+        // override path is the only one left. Applying after `set_project_trusted` matters: that
+        // call recomputes from the layers, which would discard an override applied before it.
+        if !self.cli_settings.is_empty() {
+            settings.apply_overrides(&self.cli_settings);
+        }
 
         // ---- 2. auth (cyrup-config) ------------------------------------------------------------
         let auth = self
@@ -2435,7 +2447,7 @@ mod tests {
     /// ONLY thing that loads instead of a layer over the full package.
     #[test]
     fn a_project_autoload_false_entry_is_a_delta_over_the_global_entry_not_a_replacement() {
-        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_config::{InMemorySettingsStore, SettingsManager, SettingsScope};
         use cyrup_resources::InstallScope;
         use std::sync::Arc;
 
@@ -2445,7 +2457,7 @@ mod tests {
             r#"{"packages":[{"source":"npm:pi-tools","autoload":false,"extensions":["-extensions/foo.ts"]}]}"#,
         );
         store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
 
         let (pkgs, errors) = super::configured_packages_from_settings(&mgr, Path::new("/proj"), Path::new("/home/u/.cyrup/agent"));
         assert!(errors.is_empty(), "{errors:?}");
@@ -2466,7 +2478,7 @@ mod tests {
     /// user entry, package-manager.ts:1694-1698).
     #[test]
     fn a_plain_project_entry_still_shadows_the_global_one() {
-        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_config::{InMemorySettingsStore, SettingsManager, SettingsScope};
         use cyrup_resources::InstallScope;
         use std::sync::Arc;
 
@@ -2476,7 +2488,7 @@ mod tests {
             r#"{"packages":[{"source":"npm:pi-tools","skills":["skills/a"]}]}"#,
         );
         store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools"]}"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
 
         let (pkgs, _) = super::configured_packages_from_settings(&mgr, Path::new("/proj"), Path::new("/home/u/.cyrup/agent"));
         assert_eq!(pkgs.len(), 1, "{pkgs:?}");
@@ -2492,14 +2504,14 @@ mod tests {
     /// project one replaced the global one, so `<agent_dir>/pack`'s skills/prompts/themes vanished.
     #[test]
     fn the_same_relative_local_source_in_both_scopes_is_two_packages() {
-        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_config::{InMemorySettingsStore, SettingsManager, SettingsScope};
         use cyrup_resources::InstallScope;
         use std::sync::Arc;
 
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Project, r#"{"packages":["./pack"]}"#);
         store.seed(SettingsScope::Global, r#"{"packages":["./pack"]}"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
 
         let (pkgs, errors) = super::configured_packages_from_settings(
             &mgr,
@@ -2522,7 +2534,7 @@ mod tests {
     /// source-string key got right and must not lose.
     #[test]
     fn the_same_absolute_local_source_in_both_scopes_is_still_one_package() {
-        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_config::{InMemorySettingsStore, SettingsManager, SettingsScope};
         use cyrup_resources::InstallScope;
         use std::sync::Arc;
 
@@ -2531,7 +2543,7 @@ mod tests {
         // A different SPELLING of the same absolute path: `resolvePath` normalizes `.`/`..` before
         // the comparison, which a string key cannot do.
         store.seed(SettingsScope::Global, r#"{"packages":["/shared/sub/../pack"]}"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
 
         let (pkgs, _) = super::configured_packages_from_settings(
             &mgr,
@@ -2547,14 +2559,14 @@ mod tests {
     /// source-string key loaded both.
     #[test]
     fn two_npm_versions_of_one_package_dedupe_to_the_project_entry() {
-        use cyrup_config::{InMemorySettingsStore, Settings, SettingsManager, SettingsScope};
+        use cyrup_config::{InMemorySettingsStore, SettingsManager, SettingsScope};
         use cyrup_resources::InstallScope;
         use std::sync::Arc;
 
         let store = Arc::new(InMemorySettingsStore::new());
         store.seed(SettingsScope::Project, r#"{"packages":["npm:pi-tools@2"]}"#);
         store.seed(SettingsScope::Global, r#"{"packages":["npm:pi-tools@1"]}"#);
-        let mgr = SettingsManager::load(store, Settings::new(), true);
+        let mgr = SettingsManager::load(store, true);
 
         let (pkgs, _) = super::configured_packages_from_settings(
             &mgr,

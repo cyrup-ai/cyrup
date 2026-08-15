@@ -408,7 +408,7 @@ impl RefreshOptions {
 ///
 /// Concurrent refreshes of the SAME provider collapse onto one in-flight fetch via
 /// [`RefreshDedup`] — Pi's `inflightRefresh ??= …` memo, cleared in its `finally`
-/// (`remote-catalog-provider.ts:47,56,117`).
+/// (`remote-catalog-provider.ts:50,56,117` @v0.83.0; the declaration is `:50`, not `:47`).
 pub struct RemoteCatalog {
     base_url: String,
     store: Arc<dyn ModelsStore>,

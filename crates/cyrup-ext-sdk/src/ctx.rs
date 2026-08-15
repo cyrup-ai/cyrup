@@ -988,6 +988,22 @@ impl Ui {
         #[cfg(not(target_arch = "wasm32"))]
         None
     }
+    /// The ACTIVE theme's colours, in the same serialized shape [`Self::theme_by_name`] returns
+    /// (Pi's `readonly theme: Theme` property, `extensions/types.ts:266` @v0.83.0). `None` when the
+    /// host has no theme to report.
+    ///
+    /// EXT-066: [`Self::theme`] returns only the NAME, so the live theme used to be the one theme a
+    /// guest could not read the colours of — a renderer had to call `theme()` then
+    /// `theme_by_name()`, which is two round trips and races a theme switch between them.
+    pub fn theme_json(&self) -> Option<Value> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return crate::guest::bindings::cyrup::ext::ui::theme_get_json().map(parse_json);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        None
+    }
+
     /// Every available theme as `{name, path}` (Pi `getAllThemes(): {name, path}[]`,
     /// `extensions/types.ts:269` @v0.83.0). `path` is null for a built-in theme — EXT-021: this
     /// returned bare names, so a guest could neither tell a built-in from a file-backed theme nor

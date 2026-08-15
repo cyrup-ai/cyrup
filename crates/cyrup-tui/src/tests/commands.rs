@@ -270,3 +270,121 @@ fn the_builtin_command_metadata_matches_pi() {
     assert!(by("login").has_arg_completion);
     assert!(by("model").has_arg_completion);
 }
+
+/// TUI-075 — the `/` menu's dynamic blocks are in pi's display order: prompt templates BEFORE
+/// extension commands, skills last (`interactive-mode.ts:625` @v0.83.0,
+/// `[...slashCommands, ...templateCommands, ...extensionCommands, ...skillCommandList]`).
+///
+/// The catalog this list is built from emits the blocks in the opposite order (extensions first,
+/// `cyrup-session-svc/src/session.rs:2503`), because it is also the RPC `get_commands` payload; the
+/// reorder therefore belongs here, at the one consumer that displays it. Order is user-visible: an
+/// empty `/` query returns the list unfiltered on both sides.
+#[test]
+fn the_dynamic_command_blocks_are_ordered_prompt_then_extension_then_skill() {
+    // Catalog order deliberately mirrors `slash_command_catalog()`: extensions, prompts, skills.
+    let catalog = vec![
+        serde_json::json!({
+            "name": "ext-one",
+            "description": "first extension command",
+            "source": "extension",
+            "sourceInfo": { "path": "e", "source": "extension", "scope": "temporary", "origin": "top-level" },
+        }),
+        serde_json::json!({
+            "name": "ext-two",
+            "description": "second extension command",
+            "source": "extension",
+            "sourceInfo": { "path": "e", "source": "extension", "scope": "temporary", "origin": "top-level" },
+        }),
+        serde_json::json!({
+            "name": "review",
+            "description": "prompt template",
+            "source": "prompt",
+            "sourceInfo": { "path": "/p/review.md", "source": "local", "scope": "project", "origin": "top-level" },
+        }),
+        serde_json::json!({
+            "name": "skill:deploy",
+            "description": "a skill",
+            "source": "skill",
+            "sourceInfo": { "path": "/u/deploy", "source": "local", "scope": "user", "origin": "top-level" },
+        }),
+    ];
+
+    let reg = crate::CommandRegistry::with_dynamic(crate::dynamic_commands_from_catalog(&catalog));
+    let dynamic: Vec<(&str, crate::CommandSource)> = reg
+        .commands()
+        .iter()
+        .filter(|c| c.source != crate::CommandSource::Builtin)
+        .map(|c| (c.name.as_ref(), c.source))
+        .collect();
+
+    assert_eq!(
+        dynamic,
+        vec![
+            ("review", crate::CommandSource::Prompt),
+            ("ext-one", crate::CommandSource::Extension),
+            ("ext-two", crate::CommandSource::Extension),
+            ("skill:deploy", crate::CommandSource::Skill),
+        ],
+        "pi lists prompt templates before extension commands, and the sort must be STABLE so the \
+         catalog's own within-block order (extension LOAD order) survives"
+    );
+    // Presence before absence: the builtins are still first, so this is a reorder of the dynamic
+    // tail rather than a list that lost its head.
+    assert_eq!(reg.commands()[0].source, crate::CommandSource::Builtin);
+}
+
+/// TUI-085 — a row with NO `sourceInfo` gets NO tag, and its description is passed through
+/// unprefixed: pi's `getAutocompleteSourceTag` returns `undefined` for a missing `sourceInfo`
+/// (`interactive-mode.ts:498-500` @v0.83.0) and `prefixAutocompleteDescription` then returns the
+/// description as-is (`:524-526`).
+///
+/// cyrup used to default the missing scope to `"temporary"`, rendering `[t] desc` — a provenance
+/// claim upstream does not make, and one that may be false. A wrong tag is worse than no tag.
+#[test]
+fn a_dynamic_command_without_source_info_is_not_tagged() {
+    let catalog = vec![
+        serde_json::json!({
+            "name": "bare",
+            "description": "no provenance at all",
+            "source": "extension",
+        }),
+        // The control: an identical row WITH `sourceInfo` still gets its tag, so the assertion
+        // above is about the missing key and not about tagging having been switched off.
+        serde_json::json!({
+            "name": "tagged",
+            "description": "has provenance",
+            "source": "extension",
+            "sourceInfo": { "path": "e", "source": "extension", "scope": "project", "origin": "top-level" },
+        }),
+    ];
+
+    let dynamic = crate::dynamic_commands_from_catalog(&catalog);
+    assert_eq!(dynamic.len(), 2);
+    assert_eq!(dynamic[0].description, "no provenance at all");
+    assert_eq!(dynamic[1].description, "[p] has provenance");
+}
+
+/// TUI-079 — `getPathCommandArgument` (`interactive-mode.ts:5450-5477` @v0.83.0), all four cases.
+///
+/// The defect this pins is silent: `/export "my session.html"` used to write a file whose name
+/// literally contained the quote characters, because dispatch handed the whole trimmed remainder
+/// through as the path. Quoting a path that contains spaces is the first thing a user tries.
+#[test]
+fn a_path_command_argument_is_one_quote_aware_token() {
+    let arg = crate::commands::path_command_argument;
+
+    // Quoted: the quotes are stripped and the inner spaces survive.
+    assert_eq!(arg("\"my session.html\"").as_deref(), Some("my session.html"));
+    assert_eq!(arg("'my session.html'").as_deref(), Some("my session.html"));
+    // Unquoted: the token ends at the first whitespace — a second word is NOT part of the path.
+    assert_eq!(arg("a.html junk").as_deref(), Some("a.html"));
+    assert_eq!(arg("a.html").as_deref(), Some("a.html"));
+    // An unterminated quote is a REFUSAL upstream (`return undefined`), not a best-effort path.
+    assert_eq!(arg("\"a b"), None);
+    assert_eq!(arg("'a b"), None);
+    // Empty / whitespace-only is the no-argument case.
+    assert_eq!(arg(""), None);
+    assert_eq!(arg("   "), None);
+    // A quote INSIDE an unquoted token is not special — only a LEADING quote opens a quoted token.
+    assert_eq!(arg("a\"b.html").as_deref(), Some("a\"b.html"));
+}

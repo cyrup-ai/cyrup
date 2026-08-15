@@ -417,11 +417,7 @@ mod tests {
         )
         .unwrap();
 
-        let settings = SettingsManager::load(
-            file_settings_store(&dirs),
-            cyrup_config::Settings::new(),
-            false,
-        );
+        let settings = SettingsManager::load(file_settings_store(&dirs), false);
         let dirs = apply_settings_session_dir(dirs, &settings);
 
         assert_eq!(dirs.session_dir, configured);
@@ -438,11 +434,7 @@ mod tests {
         std::fs::create_dir_all(&dirs.agent_dir).unwrap();
         std::fs::write(settings_path(&dirs), "{\"theme\":\"dark\"}").unwrap();
 
-        let settings = SettingsManager::load(
-            file_settings_store(&dirs),
-            cyrup_config::Settings::new(),
-            false,
-        );
+        let settings = SettingsManager::load(file_settings_store(&dirs), false);
         let default_dir = dirs.session_dir.clone();
         let dirs = apply_settings_session_dir(dirs, &settings);
 

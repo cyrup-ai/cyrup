@@ -1,4 +1,4 @@
-// cyrup:ext@0.7.0 — the versioned WIT world (arch-08 §4.1).
+// cyrup:ext@0.8.0 — the versioned WIT world (arch-08 §4.1).
 //
 // Single source of truth, shared verbatim by the host (`wasmtime::component::bindgen!`)
 // and the guest (`wit-bindgen` in cyrup-ext-sdk). Open-shaped values (tool params, message
@@ -33,7 +33,16 @@
 // `registration.register-tool` import (PROV-011 / EXT-024), and the `events.on-terminal-input`
 // EXPORT was ADDED alongside the `ui.subscribe-terminal-input`/`ui.unsubscribe-terminal-input`
 // imports (EXT-021). Either one alone forces the bump.
-package cyrup:ext@0.7.0;
+//
+// 0.7 -> 0.8 is the ext-rpc surface-enumeration batch, and it hits both directions too. EXPORTS:
+// `events.on-tool-exec-{start,update,end}` were RENAMED to `on-tool-execution-*` to match pi's event
+// names mechanically (EXT-069), and `events.on-session-tree`'s parameter was renamed `tree-json` ->
+// `event-json` because the payload is pi's four-field LEAF TRANSITION, not a tree dump (EXT-068).
+// IMPORTS: `add-autocomplete-provider` MOVED from `interface registration` to `interface ui`, which
+// is what puts it behind the manifest's `capabilities.ui` grant (EXT-065), and `ui.theme-get-json`
+// was ADDED so a guest can read the colours of the theme that is actually active (EXT-066). Each of
+// the four forces the bump on its own.
+package cyrup:ext@0.8.0;
 
 // ---------------------------------------------------------------------------
 // Serializable mirrors of cyrup-core. JSON-as-string at the seam (arch-08 §4.1).
@@ -352,14 +361,20 @@ interface events {
   // message_update (Pi MessageUpdateEvent, types.ts:717-722): the full in-flight `message` AND the
   // `assistant-message-event` delta (carried here as `delta-json`). HIGH-FREQ, gated.
   on-message-update:        func(message-json: string, delta-json: string);   // HIGH-FREQ, gated
-  on-tool-exec-start:       func(call-id: string, name: string, args-json: string);
+  // EXT-069: these three used to be spelled `on-tool-exec-{start,update,end}` — the ONLY three
+  // exports in the 33-event mapping whose name was not a mechanical kebab-case of pi's event name
+  // (`tool_execution_start` / `_update` / `_end`, `extensions/types.ts:1223`, `:1224`, `:1225`
+  // @v0.83.0), so a name-based cross-check of the catalog reported three false gaps and needed a
+  // three-entry exception list. Do not re-abbreviate them: every such exception is a place a real
+  // gap can hide. The rename re-signed the world (0.7 -> 0.8).
+  on-tool-execution-start:  func(call-id: string, name: string, args-json: string);
   // tool_execution_update (pi `ToolExecutionUpdateEvent`, extensions/types.ts:770-776 @v0.83.0):
   // `{type, toolCallId, toolName, args, partialResult}` — FIVE fields; cyrup used to drop `toolName`
   // AND `args`, forcing every observer to keep its own callId->name map (EXT-014).
-  on-tool-exec-update:      func(call-id: string, name: string, args-json: string, chunk-json: string); // HIGH-FREQ, gated
+  on-tool-execution-update: func(call-id: string, name: string, args-json: string, chunk-json: string); // HIGH-FREQ, gated
   // tool_execution_end (pi `ToolExecutionEndEvent`, extensions/types.ts:779-785 @v0.83.0):
   // `{type, toolCallId, toolName, result, isError}`.
-  on-tool-exec-end:         func(call-id: string, name: string, result-json: string, is-error: bool);
+  on-tool-execution-end:    func(call-id: string, name: string, result-json: string, is-error: bool);
 
   // --- 5.1/5.2 startup & session lifecycle ---
   // session_start (pi `SessionStartEvent`, extensions/types.ts:562-569 @v0.83.0): the `reason`
@@ -400,6 +415,14 @@ interface events {
   // handler may VETO via `block` or return a compaction override via `mutate` (Pi
   // SessionBeforeCompactResult.compaction = a CompactionResult) — the override's summary/details land
   // in the appended compaction entry (fromExtension). All payloads cross as serde_json strings.
+  //
+  // [CYRUP-DELTA] EXT-067: pi's `SessionBeforeCompactEvent` (`extensions/types.ts:592-602` @v0.83.0)
+  // carries a SIXTH member this signature has no parameter for — `signal: AbortSignal;` at `:601`.
+  // It is NOT dropped: it is the same `AbortSignal`-as-a-poll port already written up at
+  // `ctx-state.is-run-cancelled` below, and a handler doing real work here (summarizing, calling a
+  // model) is expected to poll that between units of work. Stated here because both this comment and
+  // `on-session-before-tree`'s enumerate the OTHER payload fields exhaustively, which made the
+  // absence read as an oversight rather than the decision it is.
   on-session-before-compact: func(preparation-json: string, branch-entries-json: string, custom-instructions: option<string>, reason: string, will-retry: bool) -> hook-outcome;
   // session_compact (Pi SessionCompactEvent, types.ts:589-598): the produced `compaction-entry` (its
   // `summary` field carries the summary text), whether an extension drove it (`from-extension`), the
@@ -409,8 +432,21 @@ interface events {
   // (TreePreparation, compaction.ts) — targetId/oldLeafId/commonAncestorId/entriesToSummarize/
   // userWantsSummary/customInstructions?/label?. A handler may VETO via `block` or return a
   // summary/customInstructions/label override via `mutate` (Pi SessionBeforeTreeResult).
+  //
+  // [CYRUP-DELTA] EXT-067: pi's `SessionBeforeTreeEvent` (`extensions/types.ts:639-643` @v0.83.0)
+  // also carries `signal: AbortSignal;` at `:642`, ported as the `ctx-state.is-run-cancelled` poll —
+  // see the identical note on `on-session-before-compact` above.
   on-session-before-tree:    func(preparation-json: string) -> hook-outcome;
-  on-session-tree:           func(tree-json: string);
+  // session_tree (pi `SessionTreeEvent`, `extensions/types.ts:646-652` @v0.83.0). EXT-068: this was
+  // the ONE event export with no comment and no citation, and its parameter name said `tree-json`,
+  // which reads as a tree DUMP. It is not — upstream's event is a LEAF TRANSITION with four fields,
+  // and all four ride inside this blob: `newLeafId: string | null`, `oldLeafId: string | null`,
+  // `summaryEntry?: BranchSummaryEntry`, `fromExtension?: boolean`, serialized by
+  // `cyrup-session-svc/src/session.rs` at the `agent-session.ts:2877` notify site with exactly those
+  // camelCase keys. `fromExtension` is the re-entrancy guard: without it a tree-watching guest cannot
+  // tell a navigation it caused from one the user made. The parameter was renamed `tree-json` ->
+  // `event-json` to stop the blob being read as a dump; that re-signed the world (0.7 -> 0.8).
+  on-session-tree:           func(event-json: string);
 
   // --- inter-extension event bus delivery (Pi `pi.events.on` listener, event-bus.ts:18-27) ---
   // The host invokes this on a guest that declared a `bus.subscribe(topic)` when ANY loaded guest
@@ -458,10 +494,15 @@ interface registration {
   // keyed by its custom-type, and the two surfaces are told apart by the HOST's registry table.
   // A fourth export would invalidate every already-built guest component for no behavioural gain.
   register-entry-renderer:   func(custom-type: string);
+  // [CYRUP-DELTA] EXT-062: pi has no `addAutocomplete` CALL. The upstream thing this declares is a
+  // FIELD on the command's own options bag — `getArgumentCompletions?: (argumentPrefix: string) =>
+  // AutocompleteItem[] | null | Promise<…>` on `RegisteredCommand`
+  // (`extensions/types.ts:1166` @v0.83.0) — which a guest passes inline to `registerCommand`. A WIT
+  // record cannot carry a closure, so the closure inverts into (a) this flag, declaring that the
+  // named command HAS argument completions, and (b) the `argument-completions` export the host calls
+  // to obtain them. Same inversion, same reason, as `tool-descriptor.prepare-arguments` and
+  // `.has-renderer` above (R-08-021 / EXT-035 is the internal id, not a pi citation).
   add-autocomplete:          func(command: string);
-  // global autocomplete provider stacking (Pi addAutocompleteProvider, types.ts:218): records that
-  // the guest contributes one more stacked provider; the host folds them via `autocomplete-suggest`.
-  add-autocomplete-provider: func();
   // declares the subscription bitset: which §5 event kinds this guest handles.
   subscribe:                 func(event-kinds: list<u8>);
 }
@@ -563,8 +604,22 @@ interface ui {
   // `opts-json` is the `ExtensionWidgetOptions` bag; `{}` = pi's default `"aboveEditor"`.
   set-widget: func(key: string, content-json: option<string>, opts-json: string);
 
-  // --- chrome (Pi `setHeader` `types.ts:190`, `setFooter` `:183`, `setTitle` `:193` @v0.83.0;
+  // --- chrome (Pi `setHeader` `types.ts:190`, `setFooter` `:183-187`, `setTitle` `:193` @v0.83.0;
   //     EXT-036: the range `:130-150` this line used to cite is the dialog/notify block above) ---
+  //
+  // [CYRUP-DELTA] EXT-064 / TUI-033 — TWO collapses live in these two signatures, and neither is
+  // visible from the pi lines they cite:
+  //   (1) FACTORY -> STRING. Upstream both take a component FACTORY re-invoked by the draw path
+  //       (`setFooter(factory: ((tui, theme, footerData) => Component) | undefined)` at `:183-187`,
+  //       `setHeader(factory: ((tui, theme) => Component) | undefined)` at `:190`); a factory cannot
+  //       cross a component boundary, so cyrup takes the rendered text once.
+  //   (2) `undefined` -> `""`. Upstream restores the built-in chrome by passing `undefined`; WIT
+  //       `string` has no such value here, so the EMPTY STRING carries "restore the built-in".
+  // Consequence, stated because nothing else in the tree states it: pi hands the footer factory a
+  // `ReadonlyFooterDataProvider` (the git branch plus the `setStatus` segments other extensions set,
+  // `:179-181`), and cyrup has NO analog — so an extension footer cannot render either. That half of
+  // EXT-064 is open; it needs a data channel (a `ui.footer-data` import or extra `set-footer`
+  // parameters) and should batch with EXT-006's render-path widening.
   set-header: func(content: string);
   set-footer: func(content: string);
   set-title:  func(title: string);
@@ -585,10 +640,32 @@ interface ui {
   get-editor-text:   func() -> string;
   set-editor-text:   func(text: string);
   paste-editor-text: func(text: string);
+  // Pi `addAutocompleteProvider(factory: AutocompleteProviderFactory)` (`extensions/types.ts:225`
+  // @v0.83.0, documented at `:224` "Stack additional autocomplete behavior on top of the built-in
+  // provider"). Argument-less for the same closure-cannot-cross-a-component-boundary reason as
+  // `registration.add-autocomplete` — this records that the guest contributes one more stacked
+  // provider, and the host folds them in through the `autocomplete-suggest` export.
+  //
+  // EXT-065: this used to live on `interface registration`, which is NOT gated by the manifest's
+  // `capabilities.ui` grant — so an extension declaring no UI grant could still stack a provider
+  // onto the core input editor. Upstream declares it INSIDE `ExtensionUIContext` (`:131-282`), i.e.
+  // `ctx.ui.addAutocompleteProvider(...)`, so moving it here restores both pi's placement and the
+  // grant, with no new enforcement code: every `ui.*` import goes through `ui_guest_of`. Moving an
+  // import between interfaces re-signs the world (0.7 -> 0.8). Do not move it back.
+  add-autocomplete-provider: func();
   // --- theme read/list/switch ---
   // Pi's live theme is the readonly `theme: Theme` property (`extensions/types.ts:266` @v0.83.0);
-  // `theme-get` returns its NAME, the only part that survives the serde seam.
+  // `theme-get` returns its NAME.
   theme-get:  func() -> option<string>;
+  // EXT-066: the live theme used to be the ONE theme a guest could not read the colours of — this
+  // line claimed the name was "the only part that survives the serde seam" while the sibling
+  // `theme-get-by-name` below serialized a whole `Theme` in the same direction, so the two lines
+  // contradicted each other and a renderer wanting the host's palette had to make two round trips
+  // (racy if the theme changes between them) or hard-code one. `theme-get-json` returns the ACTIVE
+  // theme in exactly the shape `theme-get-by-name` produces; `none` when no backend supplies one.
+  // Upstream needs no such call because `theme` is a plain property (`extensions/types.ts:266`
+  // @v0.83.0, "Get the current theme for styling"). New export ⇒ the 0.7 -> 0.8 bump.
+  theme-get-json: func() -> option<string>;
   // Pi `getAllThemes(): { name: string; path: string | undefined }[]`
   // (`extensions/types.ts:269` @v0.83.0). EXT-021: cyrup returned a bare json array of NAMES, so a
   // guest could not tell a built-in theme from a file-backed one or locate the file to read it.
