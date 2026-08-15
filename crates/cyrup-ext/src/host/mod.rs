@@ -23,8 +23,8 @@ pub use epoch::EpochDriver;
 pub use limits::StoreLimits;
 pub use live::{LiveExtension, WasmTool};
 pub use overlay::{
-    InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome,
-    OverlaySpan,
+    CustomOption, CustomSpec, InteractiveOverlay, OverlayColor, OverlayKey, OverlayKeyCode,
+    OverlayLine, OverlayOutcome, OverlaySpan, SpecOverlay,
 };
 pub use services::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, ExecOutput, FsCaps, GuestState,

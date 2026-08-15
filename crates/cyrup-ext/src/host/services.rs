@@ -221,10 +221,20 @@ pub trait HostServices: Send + Sync {
     }
     /// A custom overlay component; returns an optional serialized result (Pi `custom()`).
     ///
-    /// One-shot and NON-interactive: the spec goes out, an optional result comes back, and nothing
-    /// in between routes a keystroke. For a component the host must actually DRIVE — pi's
-    /// `ctx.ui.custom(factory, { overlay: true, … })` (`interactive-mode.ts:2719`, the only
-    /// `showOverlay` consumer upstream has) — use [`Self::open_overlay`].
+    /// The WASM tier's route to pi's `ctx.ui.custom(factory, …)`: `spec` is a
+    /// [`crate::host::CustomSpec`] — what the guest wants painted — and the returned string is the
+    /// [`crate::host::CustomOption::id`] the human chose, or `None` for a dismissal. A guest cannot
+    /// hand over a component factory across the component boundary, so it hands over the component's
+    /// CONTENT and the host owns the keyboard; see [`crate::host::CustomSpec`] for the `[CYRUP-DELTA]`.
+    ///
+    /// A NATIVE extension does not come here at all: it hands the host a real
+    /// `Box<dyn `[`crate::host::InteractiveOverlay`]`>` through [`Self::open_overlay`] and keeps
+    /// per-keystroke control — the direct analogue of pi's `{ overlay: true }` branch
+    /// (`interactive-mode.ts:2719`, the only `showOverlay` consumer upstream has).
+    ///
+    /// Denied by default (`None`), which is also the honest answer with no interactive surface
+    /// attached — pi's own RPC mode answers this verb `undefined` unconditionally
+    /// ("Custom UI not supported in RPC mode", `modes/rpc/rpc-mode.ts:228-231` @v0.84.2).
     fn custom(&self, _spec: &Value) -> Option<String> {
         None
     }

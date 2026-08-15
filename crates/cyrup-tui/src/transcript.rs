@@ -280,6 +280,20 @@ pub struct TranscriptView {
     /// body. Read when a thinking run is rendered live and frozen into [`Entry::Thinking::hidden`]
     /// when it commits.
     hide_thinking: bool,
+    /// An extension's `setHiddenThinkingLabel(label?)` override (Pi `this.hiddenThinkingLabel`,
+    /// `interactive-mode.ts:436` @v0.84.2 — as are `:435` and `:2118-2129` below); `None` is
+    /// [`HIDDEN_THINKING_LABEL`], upstream's `defaultHiddenThinkingLabel` (`:435`).
+    ///
+    /// Read at PAINT time rather than frozen into [`Entry::Thinking`], because upstream's setter
+    /// re-labels everything already on screen: it walks `chatContainer.children` and calls
+    /// `setHiddenThinkingLabel` on every `AssistantMessageComponent`, plus the streaming one
+    /// (`:2118-2129`). cyrup reproduces that for the live block and for every entry still inside the
+    /// viewport. **[CYRUP-DELTA]** entries already flushed to the terminal's NATIVE scrollback via
+    /// `insert_before` cannot be repainted at all (they are the terminal's cells now, not cyrup's),
+    /// so an extension that relabels mid-session changes the live and pending rows and leaves
+    /// scrolled-off history as it was written — the same architectural limit every other retroactive
+    /// restyle on this path already has.
+    hidden_thinking_label: Option<String>,
     /// Tool executions for the active turn, rendered live in the viewport until the turn ends, then
     /// committed (`tool-execution.ts` keeps tool components live in the message region). Honors the
     /// shared `tool_expanded` flag so `Ctrl+O` visibly expands/collapses in-flight tool output.
@@ -679,6 +693,22 @@ impl TranscriptView {
     /// Whether the reasoning body is collapsed to the `Thinking...` label (test/inspection access).
     pub fn hide_thinking_block(&self) -> bool {
         self.hide_thinking
+    }
+
+    /// Pi `setHiddenThinkingLabel(label?)` (`extensions/types.ts:167` @v0.83.0; the interactive body
+    /// is `interactive-mode.ts:2118-2129` @v0.84.2, which assigns `label ?? this.defaultHiddenThinkingLabel`
+    /// and re-broadcasts to every already-mounted assistant component). `None` restores
+    /// [`HIDDEN_THINKING_LABEL`]. See [`Self::hidden_thinking_label`] for why this is paint-time
+    /// state rather than a value frozen at commit.
+    pub fn set_hidden_thinking_label(&mut self, label: Option<String>) {
+        self.hidden_thinking_label = label;
+    }
+
+    /// The label a collapsed reasoning block currently renders — the extension's override, else
+    /// [`HIDDEN_THINKING_LABEL`]. Read by the shell when flushing committed entries to scrollback,
+    /// so a pending entry and the live block cannot disagree.
+    pub fn hidden_thinking_label(&self) -> &str {
+        self.hidden_thinking_label.as_deref().unwrap_or(HIDDEN_THINKING_LABEL)
     }
 
     /// Record a tool starting (live in the viewport): name + the raw call args (`ToolExecutionStart`).
@@ -1144,6 +1174,7 @@ impl TranscriptView {
                 self.hide_thinking,
                 width.saturating_sub(self.output_pad * 2),
                 theme,
+                self.hidden_thinking_label(),
             );
             if !td.is_empty() {
                 pad_lines(&mut td, self.output_pad);
@@ -1192,6 +1223,9 @@ impl TranscriptView {
                     expand_key: self.expand_key(),
                     cwd: self.cwd.as_deref(),
                     tools_expanded: self.tool_expanded,
+                    // A tool block draws no reasoning, so this is inert here — carried only so the
+                    // bag has one construction shape.
+                    hidden_thinking_label: None,
                 },
             ));
         }
@@ -1252,10 +1286,11 @@ fn thinking_lines(
     hidden: bool,
     width: usize,
     theme: &UiTheme,
+    label: &str,
 ) -> Vec<Line<'static>> {
     let style = theme.thinking_text_style();
     if hidden {
-        return vec![Line::styled(HIDDEN_THINKING_LABEL.to_string(), style)];
+        return vec![Line::styled(label.to_string(), style)];
     }
     let body = text.trim();
     if body.is_empty() {
@@ -1367,6 +1402,15 @@ pub(crate) struct ImageOpts<'a> {
     /// what renders. The branch/compaction summary arms of [`entry_lines`] read it here for exactly
     /// that reason. Defaults to `false`, Pi's own initial value.
     pub tools_expanded: bool,
+    /// The LIVE `this.hiddenThinkingLabel` (`interactive-mode.ts:436`), for exactly the reason
+    /// `tools_expanded` above is here: upstream never freezes it onto a message, it re-broadcasts to
+    /// every mounted assistant component on each `setHiddenThinkingLabel` (`:2118-2129` @v0.84.2), so the
+    /// value in force at PAINT time is what renders. `None` ⇒ [`HIDDEN_THINKING_LABEL`].
+    ///
+    /// (This struct's name has been narrower than its contents since `expand_key`/`cwd`/
+    /// `tools_expanded` joined it; it is the per-paint bag for everything an [`Entry`] cannot carry
+    /// on itself.)
+    pub hidden_thinking_label: Option<&'a str>,
 }
 
 impl Default for ImageOpts<'_> {
@@ -1378,6 +1422,7 @@ impl Default for ImageOpts<'_> {
             expand_key: EXPAND_KEY,
             cwd: None,
             tools_expanded: false,
+            hidden_thinking_label: None,
         }
     }
 }
@@ -2784,7 +2829,13 @@ pub(crate) fn entry_lines(
         Entry::Thinking { text, hidden } => {
             // The reasoning section (`assistant-message.ts:139-165`), padded like every other
             // assistant-side block. `hidden` was frozen at commit time (see [`Entry::Thinking`]).
-            let mut out = thinking_lines(text, *hidden, width.saturating_sub(output_pad * 2), theme);
+            let mut out = thinking_lines(
+                text,
+                *hidden,
+                width.saturating_sub(output_pad * 2),
+                theme,
+                images.hidden_thinking_label.unwrap_or(HIDDEN_THINKING_LABEL),
+            );
             if out.is_empty() {
                 return out;
             }

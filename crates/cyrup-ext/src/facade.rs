@@ -162,6 +162,25 @@ pub struct ExtensionHost {
     /// every dispatch entry point drains after its subscriber loop — not just the two command-tier
     /// call sites that used to be the only drain.
     fanout: Arc<BusFanout>,
+    /// Tools that carry their OWN `render_call`/`render_result`, keyed by tool name — the SDK half
+    /// of upstream's one renderer map, consulted by [`Self::render_tool_call_outcome`].
+    ///
+    /// Upstream keeps a SINGLE map: `_toolDefinitions` is the built-in table overlaid by a loop
+    /// over `allCustomTools` = `extensionRunner.getAllRegisteredTools()` **followed by** the SDK
+    /// `_customTools` (`core/agent-session.ts:2471-2495` @v0.84.2), and the resolver reads
+    /// `session.getToolDefinition(name)?.renderCall` out of it
+    /// (`modes/interactive/components/tool-execution.ts:84-91`, via `interactive-mode.ts:1996`).
+    /// cyrup's extension tier is keyed in [`ExtensionRegistry`] by the OWNING extension, which a
+    /// plain `Arc<dyn Tool>` has none of, so the two halves cannot share one table here.
+    ///
+    /// **Precedence follows upstream's write order, not the table split.** `_customTools` is spread
+    /// LAST into `allCustomTools` and the loop is a plain `definitionRegistry.set(name, …)`, so on
+    /// a name collision the SDK tool overwrites the extension-registered one — which is why
+    /// [`Self::render_tool_call_outcome`] consults THIS table first and the extension registry
+    /// second.
+    native_tool_renderers: RwLock<std::collections::HashMap<String, Arc<dyn Tool>>>,
+    /// Counts [`Self::invalidate_live`] calls — see [`Self::live_invalidations`].
+    live_invalidations: std::sync::atomic::AtomicU64,
 }
 
 /// The native routing table, shared between the facade and the bus fan-out.
@@ -232,6 +251,8 @@ impl ExtensionHost {
             wasm: None,
             #[cfg(feature = "wasm-host")]
             live,
+            native_tool_renderers: RwLock::new(std::collections::HashMap::new()),
+            live_invalidations: std::sync::atomic::AtomicU64::new(0),
             bus,
             ctx_source: RwLock::new(None),
             active_tool_source: RwLock::new(None),
@@ -888,9 +909,38 @@ impl ExtensionHost {
         self.render_tool_call_outcome(tool_name, call).await.into_option()
     }
 
+    /// Register a tool that supplies its own `render_call`/`render_result` — the SDK half of
+    /// upstream's renderer map. See [`Self::native_tool_renderers`].
+    ///
+    /// Called by `SessionBuilder` for every configured custom tool, mirroring upstream spreading
+    /// `this._customTools` into `allCustomTools` (`core/agent-session.ts:2474-2477` @v0.84.2).
+    /// Registering is unconditional and cheap: `Tool::render_call`/`render_result` default to
+    /// `None`, and a tool that takes both defaults resolves to [`RenderOutcome::None`], i.e. the
+    /// built-in shell — exactly as a definition without a `renderCall` does upstream.
+    pub fn register_native_tool_renderer(&self, tool: Arc<dyn Tool>) {
+        if let Ok(mut g) = self.native_tool_renderers.write() {
+            g.insert(tool.name().to_string(), tool);
+        }
+    }
+
+    /// The registered native tool for `tool_name`, if any.
+    fn native_tool_renderer(&self, tool_name: &str) -> Option<Arc<dyn Tool>> {
+        self.native_tool_renderers.read().ok().and_then(|g| g.get(tool_name).cloned())
+    }
+
     /// [`Self::render_tool_call`] keeping the FAULT distinct from "no renderer" — see
     /// [`RenderOutcome`].
+    ///
+    /// Tiers, in upstream's order (`tool-execution.ts:84-91`; see
+    /// [`Self::native_tool_renderers`] for why the SDK tier is consulted FIRST): the tool's own
+    /// `render_call`, then the extension that registered a renderer for this name. `None` from
+    /// both leaves the caller to draw the built-in shell.
     pub async fn render_tool_call_outcome(&self, tool_name: &str, call: &Value) -> RenderOutcome {
+        if let Some(tool) = self.native_tool_renderer(tool_name)
+            && let Some(text) = tool.render_call(call)
+        {
+            return RenderOutcome::Rendered(Value::String(text));
+        }
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
@@ -910,6 +960,11 @@ impl ExtensionHost {
         tool_name: &str,
         result: &Value,
     ) -> RenderOutcome {
+        if let Some(tool) = self.native_tool_renderer(tool_name)
+            && let Some(text) = tool.render_result(result)
+        {
+            return RenderOutcome::Rendered(Value::String(text));
+        }
         let Some(owner) = self.registry.tool_renderer_owner(tool_name).ok().flatten() else {
             return RenderOutcome::None;
         };
@@ -1243,10 +1298,27 @@ impl ExtensionHost {
         RenderOutcome::None
     }
 
-    /// Whether ANY extension registered a renderer for this tool name (Pi
-    /// `hasRendererDefinition`, tool-execution.ts:81-112) — the cheap check a UI makes before
+    /// Whether anything outside the built-in table can render this tool name (Pi
+    /// `hasRendererDefinition`, tool-execution.ts:104-106) — the cheap check a UI makes before
     /// paying for a guest round trip.
+    ///
+    /// Covers BOTH non-built-in tiers, because upstream's single `getToolDefinition(name)` lookup
+    /// does: an extension-registered renderer, or a tool that carries its own
+    /// (see [`Self::native_tool_renderers`]). Answering only for the extension tier is what kept
+    /// `Tool::render_call` unreachable — `cyrup_tui::app::extension_render` early-returns on a
+    /// `false` here, so a custom tool's renderer was never invoked even after the resolver knew
+    /// how to call it.
+    ///
+    /// COARSE on the native tier, and deliberately: whether `Tool::render_call` will return
+    /// `Some` cannot be known without calling it, so any registered custom tool answers `true` and
+    /// a tool that overrides neither method costs one resolution returning
+    /// [`RenderOutcome::None`]. Upstream's gate is coarser still — `hasRendererDefinition()` is
+    /// `builtInToolDefinition !== undefined || toolDefinition !== undefined`
+    /// (`tool-execution.ts:104-106`), true for every tool that has a definition at all.
     pub fn has_tool_renderer(&self, tool_name: &str) -> bool {
+        if self.native_tool_renderers.read().is_ok_and(|g| g.contains_key(tool_name)) {
+            return true;
+        }
         self.registry.tool_renderer_owner(tool_name).ok().flatten().is_some()
     }
 
@@ -1817,6 +1889,7 @@ impl ExtensionHost {
     /// guests there is nothing to invalidate, so the native-only arm is a genuine no-op.
     #[cfg(feature = "wasm-host")]
     pub fn invalidate_live(&self, reason: Option<String>) {
+        self.live_invalidations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if let Ok(g) = self.live.read() {
             for ext in g.values() {
                 ext.guest().invalidate(reason.clone());
@@ -1826,8 +1899,29 @@ impl ExtensionHost {
 
     /// Native-only build: no live guest instances exist, so there is nothing to mark stale. See the
     /// `wasm-host` twin above for the contract.
+    ///
+    /// It still COUNTS — [`Self::live_invalidations`] records that the teardown contract was
+    /// honoured, which is a property of the caller, not of whether a guest happened to be loaded.
+    /// Counting on one arm only would make the seam's own test pass or fail on a feature flag.
     #[cfg(not(feature = "wasm-host"))]
-    pub fn invalidate_live(&self, _reason: Option<String>) {}
+    pub fn invalidate_live(&self, _reason: Option<String>) {
+        self.live_invalidations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// How many times [`Self::invalidate_live`] has run on this host.
+    ///
+    /// The observable for the invalidation seam. Marking a guest stale is otherwise only visible
+    /// THROUGH a live guest (`GuestState::stale_reason`), so on a host with no wasm instances —
+    /// every unit test, and the whole `--no-default-features` build — a caller that forgets to
+    /// invalidate is indistinguishable from one that does. That is exactly how
+    /// `AgentSession::dispose_with` went a long time without invalidating at all. This counts the
+    /// CALL, so the contract can be asserted without standing up a guest.
+    ///
+    /// Monotonic and saturating in practice (it is a `u64` bumped once per teardown); the ordering
+    /// is `Relaxed` because nothing is published through it.
+    pub fn live_invalidations(&self) -> u64 {
+        self.live_invalidations.load(std::sync::atomic::Ordering::Relaxed)
+    }
 
     /// Hot reload (`/reload`, R-08-005): emit `session_shutdown{reload}` to the live set, cache-bust
     /// (drop the dispatcher + registry + live table + loaded ids), re-discover + re-load across the

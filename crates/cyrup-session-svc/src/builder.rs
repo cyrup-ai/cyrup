@@ -1331,6 +1331,20 @@ impl SessionBuilder {
         // into `_baseToolDefinitions` and wraps that whole map, agent-session.ts:2507-2515), so a
         // custom tool that widens the active set also derives `addedToolNames`. `active_tools`
         // above already returned WRAPPED handles for the built-ins + extension tools.
+        // Each SDK custom tool is also the SDK half of upstream's renderer map: `allCustomTools`
+        // spreads `this._customTools` into the very map `getToolDefinition(name)` reads, so a
+        // custom tool's own `renderCall`/`renderResult` reaches the transcript
+        // (`core/agent-session.ts:2471-2495`, resolved at
+        // `modes/interactive/components/tool-execution.ts:83-101` @v0.83.0). Registering here is
+        // what gives `Tool::render_call`/`Tool::render_result` a reader at all — before this they
+        // were overridable methods nothing in the workspace ever called, so a custom tool that
+        // supplied its own rendering had it silently discarded and drew the generic shell.
+        // Registered UNWRAPPED: the renderer belongs to the tool the caller configured, and
+        // `wrap_tool`'s active-set diffing has nothing to add to a pure render call (the wrapper
+        // delegates both methods through anyway, `cyrup-ext/src/wrapper.rs`).
+        for tool in &cfg.custom_tools {
+            ext_host.register_native_tool_renderer(tool.clone());
+        }
         registry_tools.extend(cfg.custom_tools.iter().map(|t| ext_host.wrap_tool(t.clone())));
         registry_tools.extend(active_tools.iter().cloned());
         let contributions: std::collections::BTreeMap<String, ToolPromptContribution> = registry_tools

@@ -2699,11 +2699,21 @@ impl AgentSession {
         //
         // cyrup reached exactly this position and then never invalidated: `invalidate_live` had
         // ONE caller in the workspace, `ExtensionHost::reload`. So `/new`, `/resume`, `/fork` and
-        // `/switch` all left every live guest un-stale and still subscribed, and its handlers went
-        // on receiving events on the bus the REPLACEMENT session's set is listening on — pi's
-        // `assertActive` refusal never fired. `None` takes the ported default stale text
-        // (`GuestState::invalidate`); the call is a no-op on the `--no-default-features` arm, which
-        // is why it needs no `#[cfg]` here.
+        // `/switch` all left every live guest of the OUTGOING session un-stale and still
+        // subscribed, and pi's `assertActive` refusal never fired for a call still in flight on
+        // one of them: it could go on emitting and subscribing, and go on being reached by its own
+        // host's dispatch, after the session it belongs to was torn down.
+        //
+        // What that does NOT mean — a claim that stood here and was wrong — is that those handlers
+        // received events destined for the REPLACEMENT session's set. `SharedBus` is per host
+        // (`ExtensionHost::new` builds its own, `cyrup-ext/src/facade.rs`) and the replacement gets
+        // a fresh host from `SessionBuilder::build`, so the two sets never shared a bus and there
+        // was no cross-talk between them. The damage is confined to the outgoing set acting on
+        // after its session is gone, which is what `assertActive` exists to stop.
+        //
+        // `None` takes the ported default stale text (`GuestState::invalidate`); the call is a
+        // no-op on the `--no-default-features` arm, which is why it needs no `#[cfg]` here. See
+        // `impl Drop for AgentSession` for the backstop covering the paths that never get here.
         self.services.ext_host.invalidate_live(None);
         self.session_cancel.cancel();
     }
@@ -4942,6 +4952,68 @@ impl AgentSession {
             reserve_tokens: self.compaction_settings.reserve_tokens,
             keep_recent_tokens: self.compaction_settings.keep_recent_tokens,
         }
+    }
+}
+
+/// Mark this session's extension instances stale when the session itself goes away — the backstop
+/// for every path that never reaches the tail of [`AgentSession::dispose_with`].
+///
+/// **[CYRUP-DELTA]** vs pi `AgentSession.dispose()` → `this._extensionRunner.invalidate(...)`
+/// (`core/agent-session.ts:850-852` @v0.84.2). Upstream has NO destructor half at all, and cannot:
+/// JavaScript gives a class no deterministic finalizer, so `invalidate` is reachable only from the
+/// one explicit `dispose()` call. Rust does give one, and the ported call site sits behind three
+/// `.await`s a dropped future never resumes past (see below), so the upstream mechanism alone is
+/// strictly weaker HERE than it is there. This adds the half the language makes available; it
+/// changes no observable behaviour on any path that does reach `dispose_with`, because
+/// `GuestState::invalidate` is first-reason-wins (pi `extensions/loader.ts:207`).
+///
+/// # Why a `Drop` as well as the ordered call
+///
+/// `dispose_with` invalidates at pi's exact position: after `session_shutdown` has been fanned out
+/// and every handler has finished, after the host's `before_session_invalidate` hook, and before
+/// the session token is cancelled (pi `teardownCurrent` → `this.session.dispose()` →
+/// `this._extensionRunner.invalidate(<stale text>)`, `core/agent-session-runtime.ts:176-177` +
+/// `core/agent-session.ts:850-852` @v0.84.2). That ORDER is the contract, so this `Drop` is not a
+/// replacement for it — it is the same relationship [`CompactionCancelGuard`] has with the
+/// hand-written clears, and for the identical reason.
+///
+/// Three of `dispose_with`'s statements are `.await`s (`abort_and_settle`, `fanout_emit`,
+/// `dispatch_notify`), and everything after them — the hook, the invalidation, the cancel — runs
+/// only if the future is polled to completion. A Rust future can be dropped at any `.await`, and
+/// this crate already documents callers that do exactly that to a session future: the
+/// `tokio::time::timeout` around the `cyrup-sdk` handle and `run_rpc`'s `select!` dropping the
+/// driver when the write pump reports a broken pipe (`cyrup-modes/src/rpc.rs:668-676`) — see
+/// [`CompactionCancelGuard`]'s doc, which names both. `dispatch_notify` is the worst of the three
+/// to be cut at: it awaits extension handlers, including guest calls across the wasm boundary, so
+/// it is the statement most likely to be slow enough to be raced or to unwind on a native
+/// extension's panic. In any of those cases the outgoing instances stayed un-stale forever and
+/// pi's `assertActive` refusal never fired for a call still in flight on one of them.
+///
+/// A session that is DROPPED WITHOUT `dispose` at all is the same hole reached from the other side.
+/// `cyrup_sdk::Session::close` documents that dropping a `Session` without calling it is silent,
+/// and correctly explains that `Drop` cannot do the async half — `session_shutdown` is dispatched
+/// and awaited. Invalidation is the SYNC half, and is therefore precisely the part a `Drop` can
+/// still honour; this closes that half without disturbing the documented contract for the rest.
+///
+/// # Why this is safe to do unconditionally
+///
+/// * **Idempotent.** `GuestState::invalidate` is `if state.staleMessage) return;` — the FIRST
+///   reason wins (pi `extensions/loader.ts:207`), so running after a normal `dispose_with` is a
+///   no-op and cannot overwrite a more specific reason with the default text.
+/// * **Correctly scoped.** It cannot stale the REPLACEMENT session's extensions, because a session
+///   does not share its host: every replacement path goes through `SessionFactory::build*` →
+///   `SessionBuilder::build`, which constructs a fresh `ExtensionHost` (`builder.rs`, `let
+///   ext_host = Arc::new(host)`) and loads its own guest set into it. That mirrors upstream, where
+///   each `createRuntime` builds a new `DefaultResourceLoader` and `await resourceLoader.reload()`
+///   hands the replacement a fresh `createExtensionRuntime()` whose `staleMessage` is unset
+///   (`core/agent-session-services.ts:154`, `core/resource-loader.ts:283`,
+///   `core/extensions/loader.ts:174-178`). This is why pi can invalidate on every teardown without
+///   disabling the session that follows, and why cyrup can too.
+/// * **A no-op without live guests**, including the whole `--no-default-features` arm, where
+///   `ExtensionHost::invalidate_live` is a `#[cfg]`'d empty body.
+impl Drop for AgentSession {
+    fn drop(&mut self) {
+        self.services.ext_host.invalidate_live(None);
     }
 }
 

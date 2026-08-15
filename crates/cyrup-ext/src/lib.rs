@@ -201,6 +201,7 @@ pub use host::{
     CannedResponses, ControlOp, DenyServices, DialogOptions, EpochDriver, ExecOutput, FsCaps,
     DENIED_EXEC, DENIED_NET, DENIED_UI,
     GuestState, HostServices, HttpRequest, HttpResponse, HttpStreamResponse, HumanInteractionGuard,
+    CustomOption, CustomSpec, SpecOverlay,
     HumanInteractionLock, InteractiveOverlay, LiveExtension, NotifyKind, OAuthEvent,
     OverlayColor, OverlayKey, OverlayKeyCode, OverlayLine, OverlayOutcome, OverlaySpan,
     ProcSpawnSpec, RecordingServices, StoreLimits, UiChrome, WasmTool,
