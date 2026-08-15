@@ -75,6 +75,12 @@ impl Tool for BashTool {
     fn name(&self) -> &str {
         "bash"
     }
+    /// TOOL-045 — pi declares `label` explicitly beside `name` on every built-in
+    /// `ToolDefinition` and the two are equal for all seven (`bash.ts:325-326` @v0.83.0). See
+    /// [`super::ReadTool::label`] for why the trait default was not left to stand in.
+    fn label(&self) -> Option<&str> {
+        Some("bash")
+    }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
     }
@@ -100,6 +106,19 @@ impl Tool for BashTool {
     /// promptGuidelines: exposeSessionEnvironment ? [...bashToolSystemPromptContribution.guidelines] : undefined,
     /// ```
     ///
+    /// **[CYRUP-DELTA — version lag, AHEAD of the ported tag; wording only]** (TOOL-043). The
+    /// string below opens `"You can inspect …"`, which is **v0.84.1 `bash.ts:47`** verbatim. The
+    /// ported baseline is v0.83.0, where `bash.ts:330` reads the bare imperative
+    /// `"Inspect PI_* environment variables for current model and session details."` — re-derived
+    /// at both tags this pass, not carried from the ledger. So cyrup ships a model-facing prompt
+    /// string the ported tag never shipped. Deliberate and kept: v0.84.0 softened an instruction
+    /// into a statement of availability and cyrup is already on the later wording everywhere it
+    /// appears (`tests/pi_schema.rs` pins it), so reverting would be a second divergence rather
+    /// than none. Tagged so a later v0.84.x uplift reads this as ALREADY-PORTED-EARLY instead of
+    /// as already-done-at-tag, and so a prompt-string parity sweep finds it by the `CYRUP-DELTA`
+    /// grep instead of re-deriving the whole analysis. Same class as the `AI_AGENT` forward-port
+    /// in `execute` below.
+    ///
     /// VERSION LAG, not a port bug: at v0.83.0 (`bash.ts:329-331`) the guideline read
     /// `"Inspect PI_* environment variables for current model and session details."` — a bare
     /// imperative. v0.84.0 softened it to `"You can inspect ..."`, turning an instruction into a
@@ -108,6 +127,16 @@ impl Tool for BashTool {
     /// hoist is a TS refactor with no behavioural content, and the `snippet` string is byte-identical
     /// across the two tags. The `exposeSessionEnvironment` gate is unchanged (v0.84.1 bash.ts:334):
     /// the guideline exists precisely because the variables do.
+    ///
+    /// **[CYRUP-DELTA — deliberate, value only; the variable-family name inside the string]**
+    /// (TOOL-043). Upstream names `PI_*` (v0.83.0 `bash.ts:330`, v0.84.1 `bash.ts:47`); cyrup names
+    /// `CYRUP_*`. This is a forced divergence, not a rebrand: the sentence is a pointer to the
+    /// variables THIS tool injects into its own child, and `config::session_env_scrub_keys` DELETES
+    /// the five `PI_*` session names from that child unconditionally (`config.rs`, applied at
+    /// `execute` below), so the upstream literal would point the model at variables cyrup
+    /// guarantees are absent. Reasoning in full below; tagged here because the rationale being
+    /// present is not the same as the divergence being FINDABLE, and `CYRUP-DELTA` is the grep
+    /// this project's parity sweeps run.
     ///
     /// `PI_*` -> `CYRUP_*` is deliberate and is NOT a blind rebrand of user-environment advice: this
     /// sentence names the variables THIS TOOL injects into its own child, and cyrup's

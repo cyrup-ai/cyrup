@@ -308,6 +308,14 @@ fn role_with_toolcall(m: &AgentMessage) -> &'static str {
         }
         AgentMessage::ToolResult(_) => "toolResult",
         AgentMessage::Custom { .. } => "custom",
+        // SESS-043 — the pi role tag is carried on the variant, so this reports what pi's
+        // `message.role` would.
+        AgentMessage::App { role, .. } => match role.as_str() {
+            "bashExecution" => "bashExecution",
+            "branchSummary" => "branchSummary",
+            "compactionSummary" => "compactionSummary",
+            _ => "app",
+        },
     }
 }
 

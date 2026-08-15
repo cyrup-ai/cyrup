@@ -320,7 +320,7 @@ fn refresh(
 /// unreachable remote — an offline `cyrup update`, an expired token, a deleted branch — DELETED the
 /// installed working tree of every git package it touched, while [`refresh`] went on to report
 /// those packages as updated.
-fn git_clone(
+pub(crate) fn git_clone(
     url: &str,
     dir: &std::path::Path,
     ref_name: Option<String>,

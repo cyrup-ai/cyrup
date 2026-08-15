@@ -8,26 +8,65 @@ use cyrup_provider::StreamEvent;
 use serde_json::Value;
 
 /// A message in the agent transcript: a real LLM message (`user`/`assistant`/`toolResult`) OR an
-/// app/extension `Custom` message that is NOT sent to the model (func-02 R-02-052). `convert_to_llm`
-/// is responsible for dropping/transforming `Custom`.
-#[derive(Clone, Debug, PartialEq, serde::Deserialize)]
-#[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
+/// app/extension message that is NOT sent to the model verbatim (func-02 R-02-052).
+/// `convert_to_llm` is responsible for dropping/transforming the app roles.
+///
+/// Pi's base union is `type AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages]`
+/// (`packages/agent/src/types.ts:319` @v0.83.0), where `CustomAgentMessages` is an EMPTY interface
+/// (`:310-312`) that the app fills by declaration merging. cyrup's coding-agent layer merges the
+/// same four roles pi's does — `bashExecution`, `custom`, `branchSummary`, `compactionSummary`
+/// (`packages/coding-agent/src/core/messages.ts:68-77` @v0.83.0). [`AgentMessage::Custom`] is the
+/// typed arm for `custom` because extensions construct it directly through `sendMessage`;
+/// [`AgentMessage::App`] carries the other three, which only ever enter the transcript as a whole
+/// raw context projection handed over by `cyrup-session` (SESS-043).
+#[derive(Clone, Debug, PartialEq)]
 pub enum AgentMessage {
     User {
         content: Vec<Content>,
-        #[serde(default)]
         timestamp: Option<i64>,
     },
     Assistant(AssistantMessage),
     ToolResult(ToolResultMessage),
-    /// App/extension role, never serialized into the LLM request (func-02 R-02-052).
+    /// App/extension role, never serialized into the LLM request verbatim (func-02 R-02-052).
     Custom {
         kind: String,
         payload: Value,
-        #[serde(default)]
         timestamp: Option<i64>,
     },
+    /// SESS-043 — one of pi's declaration-merged coding-agent roles that this crate has no type
+    /// for, held as its pi wire object (the `role` key included) so every field round-trips
+    /// unread.
+    ///
+    /// Field ORDER does not survive: `serde_json::Map` is a `BTreeMap` without the `preserve_order`
+    /// feature, so the keys are sorted on the way in and pi's declaration order cannot be restored
+    /// on the way out. That is why this variant is confined to the in-memory transcript — the two
+    /// surfaces where byte-shape is load-bearing (the session file, and the extension
+    /// `session_before_compact` payload) both serialize
+    /// `cyrup_session::agent_message::AgentMessage` through its hand-written `SerializeMap`, which
+    /// spells pi's order out and never sees an `App`.
+    ///
+    /// This crate is cyrup's `pi-agent-core` counterpart and, exactly like pi's, must not know the
+    /// coding-agent's message shapes: `BashExecutionMessage` / `BranchSummaryMessage` /
+    /// `CompactionSummaryMessage` are declared one layer up in `cyrup-session`
+    /// (`agent_message.rs`), which depends on this crate and not the other way round. The layer
+    /// that constructs an `App` is the layer that renders it — `cyrup-session-svc`'s
+    /// `convert_to_llm` hook, which is cyrup's `convertToLlm` (`coding-agent/src/core/sdk.ts:301`
+    /// @v0.83.0) — so the payload is opaque here and never inspected.
+    App {
+        /// The pi `role` discriminant: `bashExecution`, `branchSummary` or `compactionSummary`.
+        role: String,
+        /// The full pi wire object for the message, `role` included.
+        payload: serde_json::Map<String, Value>,
+    },
 }
+
+/// The three declaration-merged roles [`AgentMessage::App`] carries
+/// (`coding-agent/src/core/messages.ts:68-77` @v0.83.0, minus `custom`, which has its own arm).
+///
+/// Deserialization of any OTHER unknown role still fails, exactly as it did before `App` existed —
+/// pi's union is closed over the merged set too, and widening the tolerance would silently swallow
+/// a genuinely malformed transcript.
+pub const APP_MESSAGE_ROLES: [&str; 3] = ["bashExecution", "branchSummary", "compactionSummary"];
 
 impl serde::Serialize for AgentMessage {
     /// Manual serializer so the `role` discriminant appears EXACTLY ONCE — the same defect, and the
@@ -69,7 +108,65 @@ impl serde::Serialize for AgentMessage {
             AgentMessage::Custom { kind, payload, timestamp } => {
                 TaggedNonAssistant::Custom { kind, payload, timestamp }.serialize(serializer)
             }
+            // SESS-043 — the payload IS the pi wire object (`role` included), so it is emitted as
+            // it stands; `role` is held out separately only so this crate can classify without
+            // parsing. Key order is `serde_json::Map`'s, not pi's — see the variant's docs.
+            AgentMessage::App { payload, .. } => payload.serialize(serializer),
         }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for AgentMessage {
+    /// Mirror of [`AgentMessage`]'s serializer. Byte-for-byte the old derive
+    /// (`tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase"`) for the four
+    /// typed arms, plus SESS-043's [`AgentMessage::App`] fallback for exactly the three
+    /// declaration-merged roles in [`APP_MESSAGE_ROLES`].
+    ///
+    /// Written by hand rather than derived because an internally-tagged derive has no way to route
+    /// a set of tag values into one catch-all variant. Every other unknown role still errors, and
+    /// the two `timestamp` fields keep the derive's `#[serde(default)]`, because both are
+    /// `Option<i64>` and `serde_json::from_value` supplies `None` for an absent key.
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::Error as _;
+
+        /// The four typed arms, attribute-for-attribute the old derive.
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "role", rename_all = "camelCase", rename_all_fields = "camelCase")]
+        enum Typed {
+            User {
+                content: Vec<Content>,
+                #[serde(default)]
+                timestamp: Option<i64>,
+            },
+            Assistant(AssistantMessage),
+            ToolResult(ToolResultMessage),
+            Custom {
+                kind: String,
+                payload: Value,
+                #[serde(default)]
+                timestamp: Option<i64>,
+            },
+        }
+
+        let v = Value::deserialize(d)?;
+        if let Some(role) = v.get("role").and_then(Value::as_str)
+            && APP_MESSAGE_ROLES.contains(&role)
+        {
+            let role = role.to_string();
+            let Value::Object(payload) = v else {
+                // Unreachable: `v.get` only yields on an object.
+                return Err(D::Error::custom("agent message must be a JSON object"));
+            };
+            return Ok(AgentMessage::App { role, payload });
+        }
+        Ok(match serde_json::from_value::<Typed>(v).map_err(D::Error::custom)? {
+            Typed::User { content, timestamp } => AgentMessage::User { content, timestamp },
+            Typed::Assistant(a) => AgentMessage::Assistant(a),
+            Typed::ToolResult(t) => AgentMessage::ToolResult(t),
+            Typed::Custom { kind, payload, timestamp } => {
+                AgentMessage::Custom { kind, payload, timestamp }
+            }
+        })
     }
 }
 

@@ -666,3 +666,136 @@ fn truncation_details_serialize_in_pis_shape() {
     let v = serde_json::to_value(&long.info).unwrap();
     assert_eq!(v["truncatedBy"], serde_json::json!("lines"));
 }
+
+// ---------------------------------------------------------------------------------------------
+// TOOL-043 — bash's `promptGuidelines` diverges from the ported tag TWICE, and both deltas must
+// carry a `[CYRUP-DELTA]` tag.
+// ---------------------------------------------------------------------------------------------
+
+/// The two divergences, each re-derived at its tag this pass rather than carried from the ledger:
+///
+/// * **wording** — cyrup emits `"You can inspect …"`, which is v0.84.1 `bash.ts:47` verbatim. The
+///   ported baseline is v0.83.0, where `bash.ts:330` reads the bare imperative
+///   `"Inspect PI_* environment variables for current model and session details."`. cyrup is
+///   AHEAD of the ported tag on a model-facing prompt string.
+/// * **variable family** — upstream says `PI_*` at both tags; cyrup says `CYRUP_*`, because
+///   `config::session_env_scrub_keys` deletes the five `PI_*` session names from the child.
+///
+/// Neither is being reverted. What was missing is that neither was FINDABLE: the rationale was
+/// present in prose, but `[CYRUP-DELTA` is the grep this project's parity sweeps run to enumerate
+/// accepted divergences, and a divergence that only a full re-derivation can rediscover gets
+/// re-derived — which is how this item was filed in the first place.
+///
+/// This is a source scan for the same reason `no_inherited_harness_stdio.rs` is: the artifact
+/// under test is source text (a doc annotation), so no runtime observation can see it. RED before
+/// the fix — `grep -rn '\[CYRUP-DELTA' crates/cyrup-tools/src/tools/bash.rs` returned exactly one
+/// hit, the `AI_AGENT` one in `execute`, and zero in the `prompt_guidelines` block.
+#[test]
+fn bash_prompt_guideline_deltas_are_tagged_cyrup_delta() {
+    let src = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/tools/bash.rs"),
+    )
+    .expect("crates/cyrup-tools/src/tools/bash.rs is readable");
+
+    // Presence before absence: anchor on the real declaration, so a renamed/moved method fails
+    // loudly here instead of making every assertion below vacuous.
+    let guidelines_at =
+        src.find("fn prompt_guidelines(").expect("`BashTool::prompt_guidelines` still exists");
+    let snippet_at =
+        src.find("fn prompt_snippet(").expect("`BashTool::prompt_snippet` still exists");
+    assert!(
+        snippet_at < guidelines_at,
+        "the doc block scanned below is the one BETWEEN prompt_snippet and prompt_guidelines"
+    );
+    let doc = &src[snippet_at..guidelines_at];
+
+    // The string itself is unchanged, and it is still gated on `expose_session_environment`
+    // (v0.84.1 bash.ts:334) — pinned byte-for-byte in `pi_schema.rs`. Re-asserted here only so a
+    // future edit cannot satisfy this test by deleting the guideline instead of tagging it.
+    assert!(
+        doc.contains("CYRUP_*") || src.contains("You can inspect CYRUP_* environment variables"),
+        "the guideline under audit must still be the CYRUP_* one"
+    );
+
+    let tags: Vec<&str> = doc.match_indices("[CYRUP-DELTA").map(|(i, _)| &doc[i..]).collect();
+    assert_eq!(
+        tags.len(),
+        2,
+        "TOOL-043: the guideline carries TWO independent divergences (v0.84.0 wording; PI_* -> \
+         CYRUP_*) and each needs its own `[CYRUP-DELTA]` tag. Found {} in the doc block.",
+        tags.len()
+    );
+
+    assert!(
+        doc.contains("[CYRUP-DELTA — version lag, AHEAD of the ported tag; wording only]"),
+        "the wording delta must be tagged as a version-lag-AHEAD, so a later v0.84.x uplift reads \
+         it as already-ported-early rather than as already-done-at-tag"
+    );
+    assert!(
+        doc.contains("[CYRUP-DELTA — deliberate, value only; the variable-family name inside the \
+                      string]"),
+        "the PI_* -> CYRUP_* rename must be tagged as a deliberate value-only delta"
+    );
+    // Each tag must name the upstream symbol it diverges from (the `[CYRUP-DELTA]` contract).
+    assert!(doc.contains("bash.ts:47"), "the wording delta must cite v0.84.1 bash.ts:47");
+    assert!(doc.contains("bash.ts:330"), "the wording delta must cite v0.83.0 bash.ts:330");
+}
+
+/// TOOL-044 limb 3 — `details.truncation.content`.
+///
+/// pi's `TruncationResult` declares `content` first (`truncate.ts:17` @v0.83.0) and every call
+/// site stores the object WHOLE, so the truncated text is in `details` a second time:
+/// `read.ts:294`/`:305`, `grep.ts:348`, `find.ts:199`/`:336`, `ls.ts:193`, and for `bash` both the
+/// streaming `details` (`bash.ts:356`) and the final one (`:409`) — the latter two via
+/// `snapshot.truncation = {...tailTruncation, …}` (`output-accumulator.ts:100-107`), where the
+/// spread is what carries `content` across.
+///
+/// RED before the fix: `serde_json::to_value(&info)` had no `content` member at all on either
+/// branch. Asserted over the SERIALIZED value rather than the struct because the serialized form
+/// is what reaches the session file, which is the interop surface this whole item is about.
+///
+/// Both branches are covered on purpose. Only asserting the truncated one would be satisfiable by
+/// writing `content` only when `truncated` is set — which pi does not do: pi's no-truncation
+/// branch (`truncate.ts:87-101`) returns the input content verbatim inside the same object.
+#[test]
+fn truncation_details_carry_pis_content_field() {
+    use crate::truncate::{truncate_head, truncate_tail, TruncOpts};
+
+    // (1) Untruncated: pi returns the INPUT verbatim, trailing newline included.
+    let short = truncate_head("one\ntwo\n", TruncOpts::new(2000, 50 * 1024));
+    assert!(!short.info.truncated, "fixture must be untruncated for this branch to be reachable");
+    let v = serde_json::to_value(&short.info).unwrap();
+    assert_eq!(
+        v["content"],
+        serde_json::json!("one\ntwo\n"),
+        "an untruncated TruncationResult still carries `content`, verbatim. Got: {v}"
+    );
+
+    // (2) Head-truncated: `content` is the kept prefix, and it agrees with `Truncated::content`
+    // — cyrup splits pi's one struct into two, so the two copies must never disagree.
+    let long = truncate_head(&"x\n".repeat(10), TruncOpts::new(3, 50 * 1024));
+    assert!(long.info.truncated);
+    let v = serde_json::to_value(&long.info).unwrap();
+    assert_eq!(v["content"], serde_json::json!(long.content.clone()));
+    assert_eq!(v["content"], serde_json::json!("x\nx\nx"));
+
+    // (3) Tail-truncated (`bash`'s path) — same invariant from the other end.
+    let tail = truncate_tail(&"y\n".repeat(10), TruncOpts::new(2, 50 * 1024));
+    assert!(tail.info.truncated);
+    let v = serde_json::to_value(&tail.info).unwrap();
+    assert_eq!(v["content"], serde_json::json!(tail.content.clone()));
+    assert_eq!(v["content"], serde_json::json!("y\ny"));
+
+    // (4) The first-line-exceeds-limit branch reports an EMPTY content, not an absent key
+    // (`truncate.ts:103-119` returns `content: ""`).
+    let wide = truncate_head("aaaaaaaaaa\nb\n", TruncOpts::new(2000, 4));
+    assert!(wide.info.first_line_exceeds_limit);
+    let v = serde_json::to_value(&wide.info).unwrap();
+    assert_eq!(v["content"], serde_json::json!(""));
+
+    // (5) An older cyrup session record has no `content` key; loading it must not hard-fail.
+    let mut legacy = serde_json::to_value(&short.info).unwrap();
+    legacy.as_object_mut().unwrap().remove("content");
+    let back: crate::truncate::Truncation = serde_json::from_value(legacy).unwrap();
+    assert_eq!(back.content, "", "the read side defaults; the write side never omits it");
+}

@@ -158,3 +158,64 @@ fn osc52_is_emitted_when_remote_even_after_a_local_success() {
     assert!(crate::clipboard::osc52_required(true, false));
     assert!(!crate::clipboard::osc52_required(false, true), "local success, local session");
 }
+
+// ------------------------------------------------------------------ the READ side (DRIFT-045) --
+
+use crate::clipboard::{clipboard_read_plan, ClipboardRead};
+
+/// A Wayland session: `WAYLAND_DISPLAY` set (which also makes `isWaylandSession()` true).
+fn wayland() -> ClipboardEnv {
+    ClipboardEnv {
+        wayland_display: true,
+        wayland_session: true,
+        ..ClipboardEnv::default()
+    }
+}
+
+/// **DRIFT-045.** Pi `readClipboardText` (`clipboard.ts:52-69` @v0.84.2) tries `wl-paste` before
+/// the native backend, and ONLY on Linux, in a Wayland session, with `WAYLAND_DISPLAY` set — the
+/// three-way conjunction at `:53`. The branch is new in this delta (pi `bfc679d5e`).
+///
+/// **Red before the fix:** neither `clipboard_read_plan` nor `ClipboardRead` existed —
+/// `grep -rnE 'read_clipboard_text|wl-paste' crates --include='*.rs'` returned 0 across the
+/// workspace — so this test did not compile.
+#[test]
+fn the_wayland_read_branch_is_gated_on_pis_three_way_conjunction() {
+    assert_eq!(
+        clipboard_read_plan("linux", &wayland()),
+        vec![ClipboardRead::WlPaste, ClipboardRead::Native],
+        "`platform() === \"linux\" && isWaylandSession() && WAYLAND_DISPLAY` (clipboard.ts:53)",
+    );
+
+    // Each conjunct removed in turn drops the branch and leaves the native read alone.
+    let x11 = ClipboardEnv { x11_display: true, ..ClipboardEnv::default() };
+    assert_eq!(clipboard_read_plan("linux", &x11), vec![ClipboardRead::Native]);
+    let session_but_no_socket =
+        ClipboardEnv { wayland_session: true, ..ClipboardEnv::default() };
+    assert_eq!(
+        clipboard_read_plan("linux", &session_but_no_socket),
+        vec![ClipboardRead::Native],
+        "a Wayland session with no WAYLAND_DISPLAY has no socket for wl-paste",
+    );
+    for os in ["macos", "windows", "freebsd"] {
+        assert_eq!(
+            clipboard_read_plan(os, &wayland()),
+            vec![ClipboardRead::Native],
+            "{os}: pi's read gate is the literal `platform() === \"linux\"`",
+        );
+    }
+}
+
+/// The READ gate is deliberately NARROWER than the write side's `[CYRUP-DELTA]`, which widened
+/// pi's `p !== "linux"` to "macOS or Windows" so the BSDs would not take a silently-failing native
+/// write. There is no such hazard on a read: a failed read yields no text, which is exactly what a
+/// missing helper yields, so the literal port is also the safe one. Stated as a test so the two
+/// gates are not "made consistent" by a later reader.
+#[test]
+fn the_read_gate_and_the_write_gate_are_allowed_to_disagree_on_freebsd() {
+    assert_eq!(clipboard_read_plan("freebsd", &wayland()), vec![ClipboardRead::Native]);
+    assert!(
+        !clipboard_write_plan("freebsd", &wayland()).contains(&ClipboardWrite::Native),
+        "the write side excludes freebsd from the native step; the read side does not",
+    );
+}

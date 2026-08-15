@@ -117,7 +117,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 |---|---|---|
 | CFG-001 | **closed** | Re-confirmed at HEAD. `ensure_scope_writable` (`settings.rs:1329-1337`) latches per scope, is called first by `set` (`:1349`) and `set_nested` (`:1404`), and both re-check inside `with_lock`, returning `SettingsWriteRefused` on mid-write corruption (`:1367-1377`, `:1414-1418`). pi `settings-manager.ts` `save()` early-returns on `globalSettingsLoadError` @v0.83.0. Residual hole is CFG-030 (now low). |
 | CFG-002 | **closed** | `pub oauth: Option<ModelsJsonOauth>` at `model.rs:1481-1487`, enum `Radius` only at `:1453-1458` matching pi's `Type.Literal("radius")` (`model-config.ts:194` @v0.83.0); oauth-without-baseUrl rejected at `:1843-1848` with pi's exact string; `config.oauth.is_none()` added to the empty-block guard (~`:1859`); the `oauth === "radius"` baseUrl special-case honoured (~`:1876-1880`). Launch-predicate half closed separately as CFG-022. |
-| CFG-003 | still open | `discovery.rs:325-340` still carries the `[CYRUP-DELTA]` "no network install during session assembly"; git/oci resolve only through `installed_dir`. |
+| CFG-003 | **closed 2026-08-15** | The `[CYRUP-DELTA]` "no network install during session assembly" is gone from `resolve_configured_package`'s doc; the git arm now installs behind `DiscoveryConfig::install_missing_packages`. See the Open-items row for the full disposition, including the two deltas that remain and the struck "three-crate async restructuring" blocker. |
 | CFG-004 | **superseded** (by CFG-025) | Residual is entirely CFG-025, still open. **Cite corrected:** the extension push is `add_local_entries` at `discovery.rs:1373-1379`, NOT `:1242-1246` (that is the SKILL.md walk). Id kept, never reused. |
 | CFG-005 | partially closed | `login.rs` (1721 lines, new) ports login/logout/env-key login/status/selectors; refresh at `cyrup-provider/src/auth/resolve.rs:146-239`. Residual: the two **multi-prompt** api-key logins (cloudflare, google-vertex). Maintainer-deprioritised — filed, not scheduled. Remains open below at medium. |
 | CFG-006 | partially closed | `retry.provider.*` now threaded (`builder.rs:1223-1234`). `websocketConnectTimeoutMs` still inert. Remains open below at medium. |
@@ -242,6 +242,23 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 > **ROUTING — of the eleven rows still open, EIGHT have their fix site outside `cyrup-config`/`cyrup-resources`:** `CFG-038`, `CFG-045`, `CFG-021`, `CFG-051`'s residual, `CFG-014` and `CFG-015` are **cyrup-tui**; `CFG-042`'s residual and `CFG-039` are **cyrup-provider**. Only `CFG-052` is in-area; `CFG-003` and `CFG-020` are three-crate restructurings. **Six of the thirteen rows sweep 6 opened were already closed at HEAD or had stale headline evidence** — re-verify before scheduling.
 
+> ### 2026-08-15 — `cyrup-resources` slice (packages / skills / prompts / themes)
+>
+> Three rows left the open set from this crate; the `cyrup-config` half of the file was another
+> agent's slice in the same pass, so **no global count is restated here** — recount the table.
+> **`CFG-003` FIXED** (the area's last `L`, and it was not an `L`: its stated three-crate blocker is
+> struck in its row as false). **`CFG-054` and `CFG-055` REFUTED** — both were already closed at
+> HEAD `68bbd39` with tests, and the refutation is the finding: two of the three rows this slice was
+> given were stale, which is the same ~12% error rate `00-residual-ledger.md` publishes. Nothing was
+> "fixed" for either. The ROUTING note above is now stale on `CFG-003` (no longer a restructuring,
+> no longer open) and on `CFG-052` (closed as refuted); its cyrup-tui / cyrup-provider entries
+> stand.
+>
+> **One measurement worth keeping for whoever schedules `CFG-020`:** the same "async restructuring"
+> phrasing that was wrong for `CFG-003` is attached to `CFG-020`. It was wrong here because the
+> install path is synchronous end to end (`install_blocking`, `git_clone`) and only the *wrapper*
+> is `async`. Check that before pricing `CFG-020` as an `L`.
+
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | ~~CFG-035~~ | ~~high~~ **CLOSED 2026-08-14** | not-ported | M | `.cyrup/SYSTEM.md` and `APPEND_SYSTEM.md` are never discovered — the trust-gated project system-prompt override is inert — **CLOSED 2026-08-14**: sweep 2 — the area's only `high`. The DISCOVERY half landed in `crates/cyrup-resources/src/discovery.rs` (`discover_system_prompt_file` / `discover_append_system_prompt_file` over a shared `discover_prompt_override`, both on `DiscoveryReport`), so `grep -rn 'SYSTEM\.md' crates/` no longer returns five hits none of which read a file; trust gates the PROJECT candidate only, so an untrusted project falls through to `<agent_dir>/SYSTEM.md` rather than to nothing. The WIRING half landed CONCURRENTLY in area 08 (`cyrup-session-svc/src/builder.rs:1219-1258`), including pi's REPLACE-not-accumulate rule for the append leg. **The one residual — the doc line at `cyrup-session/src/prompt/overrides.rs:15-16` — is re-filed against area 03 as SESS-035's residual rather than holding this item open.** |
@@ -262,7 +279,7 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 | ~~CFG-006~~ | ~~medium~~ **CLOSED 2026-08-14 — REFUTED** | not-ported | M | `websocketConnectTimeoutMs` never reaches the HTTP/stream layer — **REFUTED, CLOSED 2026-08-14**: sweep 6 — closed at HEAD by an earlier sweep; the row was stale. The item's cyrup evidence ("`grep -rn websocket_connect_timeout_ms crates/` returns exactly three lines — nothing assigns it") no longer holds: `crates/cyrup-session-svc/src/builder.rs:1481-1482` reads `eff.websocket_connect_timeout_ms()` onto the agent builder, cyrup-agent threads it to `StreamOptions` (`agent.rs:866`, `:2350-2355`), and `crates/cyrup-session-svc/src/tests/round8_postrun.rs:341` (`websocket_connect_timeout_setting_reaches_the_providers_stream_options`) pins it end to end. **The item's Verify note about residual test debt from the CLOSED retry half — nothing proves `max_retry_delay_ms` reaches the retry loop (blind spot 6) — is untouched and is RE-FILED as `CFG-053` rather than closed with this row.** |
 | CFG-039 | medium | upstream-drift | M | models.json `samplingParams` on model definitions and modelOverrides is silently dropped — **2026-08-14, still open — HARD-BLOCKED, re-verified by sweep 6**: `sampling_params` still does not exist on `cyrup_provider::Model`. **Area 01 must add the provider-side field FIRST**; landing a config-only field recreates AGENT-021's exact defect (a field a later layer drops). Deliberately not taken by sweeps 2 or 6. |
 | CFG-020 | medium | not-ported | L | No `ModelRuntime` type and no availability snapshot — **2026-08-14, still open**: sweeps 2 and 6 — not reached; L, three crates, requires reading `model-runtime.ts` at v0.84.1 (+356 lines). Not tail-sized. **Its prerequisite mechanism — the revision-checked snapshot in `FileModelsStore` — is now complete except for CFG-042's cancellation parameter.** |
-| CFG-003 | medium | not-ported | L | Settings `packages` are resolved but never auto-installed — **2026-08-14, still open**: sweep 2 corrected the premise and sweep 6 re-read and confirmed it. Auto-install is **UNCONDITIONAL** unless `isOfflineModeEnabled()` is true or the optional `onMissing` callback answers "skip"/"error" (`package-manager.ts:1260-1271` @v0.83.0) — sweep 1's "gated on an opt-in setting that does not exist" is wrong at the tag. The real blocker is structural: `discover_blocking` is synchronous inside `spawn_blocking`, `PackageManager::install` is async gix, and pi's `onMissing` prompt belongs to the session-svc builder — a **three-crate async restructuring**, which is what makes it L. |
+| ~~CFG-003~~ | ~~medium~~ **CLOSED 2026-08-15** | not-ported | ~~L~~ S | Settings `packages` are resolved but never auto-installed — **CLOSED 2026-08-15**: the git arm is ported. **The "three-crate async restructuring" blocker was FALSE and is struck**: `discover_blocking` is synchronous *inside* `spawn_blocking` and `PackageManager::install`'s body is the synchronous `install_blocking` (`install.rs`) — `git_clone` is blocking gix, not async — so the install runs on the thread discovery is already on, with no future to drop mid-clone and no `.await` between the clone and the walk. And pi has **no prompt on this path at all**: the session path is `packageManager.resolve()` with NO `onMissing` (`resource-loader.ts:403` and `:549` @v0.83.0), so `installMissing` (`package-manager.ts:1260-1271`) installs unconditionally unless `isOfflineModeEnabled()` (`:42-46`); the ONLY `onMissing` caller upstream is the startup-theme pass, which answers `"skip"` (`cli/startup-ui.ts:73`). Ported: `install_declared_git_package` in `crates/cyrup-resources/src/discovery.rs` (pi `installGit`'s fresh-clone path `:1831-1837` — `ensureGitIgnore(gitRoot)` then the clone — reusing `package::install::{ensure_git_ignore, git_clone}`), wired into `resolve_configured_package`'s git arm exactly where pi's `if (!existsSync(installedPath))` sits (`:1287-1291`). The gate is one field, `DiscoveryConfig::install_missing_packages`, carrying BOTH of upstream's halves: `true` = pi's resource-loader caller, `false` = pi's startup-ui caller, and `false` is the default so no caller gets unasked-for network. Threaded `SessionConfig::install_missing_packages` → `builder.rs` → discovery, set by the bin to `!(--offline‖CYRUP_OFFLINE‖PI_OFFLINE)` (`crates/cyrup/src/main.rs`, beside `to_session_config_with_diagnostics`) — pi's only gate, so no settings key was invented. **No registry row is written** (pi has no registry; the declaration IS the record, and a row would make `cyrup remove` fight `settings.json`). **Two `[CYRUP-DELTA]`s remain, both stated in-source:** a declined install is a loud diagnostic where pi `continue`s silently (`:1290`), and a FAILED install is a diagnostic where pi's `throw` (`:1849`) takes the whole session build down. Note also that pi puts **no timeout on `git clone`** (`runCommand`, `:2628-2638`, has no `timeoutMs` — `NETWORK_TIMEOUT_MS` is applied only to the capture variants), so cyrup is not the more blocking of the two. Tests: `cfg003_an_open_gate_attempts_the_install_and_reports_its_failure` (RED at HEAD — the message was "run `cyrup install`", proving the arm was never entered), `cfg003_install_declared_git_package_materializes_the_tree` (real gix clone over `file://`; **coverage, not red-before** — new API) and the closed-gate half folded into `cfg003_uninstallable_settings_declared_package_is_an_error_diagnostic`, plus `cfg003_the_install_gate_reaches_discovery_in_both_directions` in `cyrup-session-svc/src/tests/settings_resolve.rs` for the threading. **HERMETICITY CONSTRAINT worth keeping:** a settings string can never name a LOCAL git repo, because `file://` is local to `isLocalPath` (paths.ts:41-55) on both sides — the only loopback spelling that reaches the git arm is `git:localhost/<u>/<r>` (→ `https://localhost/...`), which is why the end-to-end tests assert a FAILED clone and the successful clone is driven one layer down. **RESIDUAL, explicitly not closed:** the bin's one-line `config.install_missing_packages = !overrides.offline` has no test — there is no seam to drive it without spawning the binary — and the npm/OCI arms stay unsupported (R-09-021, CFG-009). |
 | ~~CFG-005~~ | ~~medium~~ **CLOSED 2026-08-14 — REFUTED** | not-ported | L | Two multi-prompt api-key login flows unported (`ApiKeyAuth` has no `login` member) — **REFUTED, CLOSED 2026-08-14**: sweep 1 closed the flows; sweep 6 verified the recorded residual is FALSE at HEAD on both counts. `EnvKeyAuth` has `supports_login` (unconditionally true, per `envApiKeyAuth` always defining `login`, pi `auth/helpers.ts:12-15` @v0.83.0) and a verbatim `login` at `crates/cyrup-provider/src/auth/helpers.rs:50-75`, and `api_key_strategy_supports_login` is **deleted** — the two things ADR-0010 step 2 was blocking on. Pinned by `crates/cyrup-provider/src/tests/api_key_login.rs`. |
 | ~~CFG-009~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | An `npm:` package source fails with the misleading message "unsupported source (OCI deferred)" — **CLOSED 2026-08-14**: sweep 1 — the message half is fixed and the variant is `ResourceError::UnsupportedNpm`; any other area file quoting "unsupported source (OCI deferred)" for an npm source is stale. The "Dangling consequence" line (`EffectiveSettings::npm_command()` has zero consumers) is unchanged and points at CFG-015. |
 | ~~CFG-013~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `TrustStore::nearest` reads trust.json without the file lock — **CLOSED 2026-08-14**: sweep 1. |
@@ -284,15 +301,15 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 | CFG-053 | low | test-defect | S | `max_retry_delay_ms` is verified structurally only — nothing proves it reaches the retry loop (blind spot 6) — **FILED 2026-08-14 (sweep 6), open.** Re-filed from `CFG-006`'s Verify note when that row closed, rather than being closed with it: the `retry.provider.*` assignment at `crates/cyrup-session-svc/src/builder.rs` is asserted at the assignment site, and no test drives a retrying provider and observes the delay ceiling actually taking effect. Sibling of the `websocketConnectTimeoutMs` half, which IS pinned end to end (`round8_postrun.rs:341`). |
 | ~~CFG-052~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED, and its premise is struck** | parity-bug | S | `parse_git_url` rejects the `github:user/repo` shorthand that `is_local_path` has already classified as NON-local — **CLOSED AS REFUTED 2026-08-14 (sweep 8), which is a correction to the ANALYSIS and must survive: this is not a defect, it is a faithful port of upstream's own inconsistency.** The row asserts "Upstream's `parseGitUrl` reaches `hostedGitInfo.fromUrl`, which resolves the `github:`/`gitlab:`/`bitbucket:` shorthands". **False at v0.83.0.** `parseGitUrl` opens with `if (!hasGitPrefix && !/^(https?\|ssh\|git):\/\//i.test(url)) return null;` (`packages/coding-agent/src/utils/git.ts:172-179`) and its **own doc comment** says verbatim: *"Without git: prefix, only accept explicit protocol URLs."* (`:165-171`). `github:owner/repo` has no `git:` prefix and no `://`, so **upstream returns null BEFORE reaching `fromUrl`**. pi's `parseSource` then takes `isLocalPath` → false (`utils/paths.ts:36-55` lists `github:`) → `parseGitUrl` → null → `return { type: "local", path: source }` (`core/package-manager.ts:1435-1459`). **So upstream ALSO classifies it non-local and then stores it as a local path.** cyrup's `git_url.rs:285-287` + `has_protocol_prefix` at `:367-373` and `source.rs:59-67` are verbatim ports. The "internally inconsistent state" the row describes is **upstream's**, and it was ALREADY pinned before this sweep by `cfg052_a_github_shorthand_is_a_local_path_exactly_as_upstream_leaves_it` (`crates/cyrup-resources/src/tests/resources.rs:2241`), which does presence-before-absence — `git:owner/repo` MUST still resolve through the hosted-git-info table, so the `None` below it is about the missing prefix and not a dead parser — covers all three shorthands, and cites `git.ts:177-179` and `package-manager.ts:1459`. **Superseded original text follows.** — ~~**FILED 2026-08-14 (sweep 6), open.**~~ `crates/cyrup-resources/src/package/git_url.rs::parse_git_url` returns `None` for `github:user/repo`: `has_git_prefix` is false (the prefix is `github:`, not `git:`) and `has_protocol_prefix` accepts only https/http/ssh/git schemes — so the source falls through to `PackageSource::Path` and to `package_identity`'s **local** arm. Upstream's `parseGitUrl` reaches `hostedGitInfo.fromUrl`, which resolves the `github:`/`gitlab:`/`bitbucket:` shorthands. `is_local_path` already treats `github:` as non-local (`paths.ts:41-55`), so cyrup is in an internally inconsistent state: not a local path, and stored as one. **Two functions ported from two different upstream files whose domains no longer meet.** Found while closing CFG-026 and deliberately filed rather than fixed (out of that item's scope); CFG-026's tests were kept off the shorthand rather than encode the current behaviour. |
 | CFG-021 | low | upstream-drift | L | `tuiMode` / `fullscreenScrollbar` not modelled — **2026-08-14, still open**: sweeps 2 and 6 — unchanged; waits on the alt-screen renderer (ADR-0005 / area 07). `grep -rni 'tuiMode\|fullscreenScrollbar' crates` is still zero. The settings half alone would be another inert key — the exact failure this area's Coverage section records. *(Its restatement of the "three keys with zero occurrences" claim is stale for `showCacheMissNotices` — see CFG-014.)* |
-| CFG-054 | low | cyrup-original | S | Installed package working tree lands under a doubled `packages/packages/` segment — **filed 2026-08-14** by a documentation audit; the registry path was verified empirically, the working-tree path read from `store.rs:26-40`. |
-| CFG-055 | medium | cyrup-original | S | `cyrup remove` may not match the `PackageId` that `cyrup install` stored — **filed 2026-08-14**; cyrup side only, the upstream leg is not established. |
+| ~~CFG-054~~ | ~~low~~ **CLOSED 2026-08-15 — REFUTED (already closed at HEAD)** | cyrup-original | S | Installed package working tree lands under a doubled `packages/packages/` segment — **the row was STALE; verified fixed at HEAD `68bbd39` before any work was attempted.** `PackageStore::packages_root(Global)` is `self.global_dir.clone()` (`crates/cyrup-resources/src/package/store.rs`), carrying a CFG-054 note that names the fix and the reason the `.join("packages")` was dropped rather than re-rooting the store at `agent_dir` (keeping `CYRUP_PACKAGE_DIR` meaningful), and citing pi's own flat roots (`join(this.agentDir,"git")` `package-manager.ts:2050`, npm `:1970`). The migration the item did not ask for is there too — `migrate_legacy_doubled_packages_root` (same file) with a completion notice through `output_guard::emit_stray_line`, called from `run_migrations` (`crates/cyrup/src/migrations.rs`) **and** from `subcommands::run`, because the package verbs are dispatched before migrations (`main.rs`). Pinned by `a_global_package_tree_and_its_registry_sit_at_the_same_level` and `the_legacy_doubled_root_is_migrated_once_and_never_clobbers`. |
+| ~~CFG-055~~ | ~~medium~~ **CLOSED 2026-08-15 — REFUTED (already closed at HEAD)** | cyrup-original | S | `cyrup remove` may not match the `PackageId` that `cyrup install` stored — **the row was STALE; verified fixed at HEAD `68bbd39`.** `remove_candidate_ids` (`crates/cyrup/src/subcommands.rs`) routes the argument through `PackageSource::parse` → `package_id()` FIRST and keeps `PackageId::from(raw)` as a fallback for rows an older build wrote, and `update`'s positional target uses the same normalization. **The upstream leg the row said was "not established" IS established in-source:** pi matches on a normalized key too — `packageSourcesMatch` (`package-manager.ts:1418-1422` @v0.83.0) compares `getSourceMatchKeyForSettings` against `getSourceMatchKeyForInput` (`:1362-1383`), both reducing to `git:<host>/<path>` / `local:<resolved>`, and `update` goes through `getPackageIdentity` (`:1051`). Pinned by `remove_matches_the_normalized_id_install_wrote_with_a_raw_fallback`. |
 | ~~CFG-056~~ | ~~high~~ **CLOSED 2026-08-14 — FIXED THIS PASS** | parity-bug | S | `defaultThinkingLevel`'s unset-fallback was `off`; pi's is `medium`, so every default session started with reasoning disabled — **FIXED 2026-08-14** (surface-enumeration sweep, settings.json surface). `crates/cyrup-config/src/defaults.rs` is new and ports pi's one-export `core/defaults.ts`; `EffectiveSettings::default_thinking_level()` now returns `Option<ModelThinkingLevel>` as pi's getter returns `ThinkingLevel \| undefined`, and the three `builder.rs` sites plus `model.rs`'s `default_level` name the fallback explicitly. |
 | ~~CFG-057~~ | ~~medium~~ **CLOSED 2026-08-14 — FIXED THIS PASS** | parity-bug | S | `httpProxy` was read from the MERGED view, so a project `.cyrup/settings.json` could rewrite the session's egress; pi reads it off the global document only — **FIXED 2026-08-14**: one entry in `GLOBAL_ONLY_KEYS` plus a red-before test. |
 | CFG-058 | medium | not-ported | S | `websocketConnectTimeoutMs` has no 15 000 ms default at the connect site, so an unset key means an unbounded WebSocket handshake — **filed 2026-08-14** (settings.json surface). **FIX SITE: `crates/cyrup-provider` — NOT cyrup-config.** `CFG-006` closed the THREADING half and did not verify the default. |
-| CFG-059 | medium | cyrup-original | M | A third, persistent `cli` settings layer sits above project in the precedence chain; pi has no CLI settings tier at all — **filed 2026-08-14** (settings.json surface). Inert today (no binary call site), but it is a divergence in the precedence MODEL. |
-| CFG-060 | low | cyrup-original | S | `EffectiveSettings::http_proxy`'s env fallback inverts pi's `??=` precedence — the setting wins over an ambient `HTTP_PROXY` where upstream lets the ambient value win — **filed 2026-08-14** (env-var surface). Distinct axis from `PROV-047`. Also retires the `NO_PROXY` case-folding false positive. |
-| CFG-061 | low | cyrup-original | S | `EffectiveSettings::packages()` discards the whole array on one malformed entry, reporting "no packages configured" — **filed 2026-08-14** (settings.json surface). Dead but wrong-shaped; the live path (`packages_with_errors`) is correct. |
-| CFG-062 | low | parity-bug | S | Clearing a string/array settings key writes JSON `null`; pi's `JSON.stringify` drops the key, and the two merge differently — **filed 2026-08-14** (settings.json surface). LATENT: no production caller passes `None` to `set` today. |
+| ~~CFG-059~~ | ~~medium~~ **CLOSED 2026-08-15 — REFUTED (already closed at HEAD)** | cyrup-original | M | A third, persistent `cli` settings layer sits above project in the precedence chain; pi has no CLI settings tier at all — **CLOSED AS REFUTED 2026-08-15** (batch B, cyrup-config slice): the row was stale, the layer is gone. `SettingsManager::load(store, project_trusted)` takes TWO arguments at HEAD (`crates/cyrup-config/src/settings.rs`), the struct has exactly `global` + `project` + `effective`, `recompute` merges `global ◁ project` only, and `grep -rn 'cli_settings' crates/` no longer resolves to a settings LAYER: the surviving `SessionBuilder::cli_settings` / `SessionFactory::cli_settings` setters route to the transient `apply_overrides` at `cyrup-session-svc/src/builder.rs:677-678` (`if !self.cli_settings.is_empty() { settings.apply_overrides(&self.cli_settings) }`), which is pi's `applyOverrides` (`settings-manager.ts:508-510` @v0.83.0) — merged onto the already-merged view and discarded by the next recompute. The removal is documented in place on the `SettingsManager` doc comment and on `apply_overrides`, both of which name CFG-059. Nothing was changed this pass. |
+| ~~CFG-060~~ | ~~low~~ **CLOSED 2026-08-15** | cyrup-original | S | `EffectiveSettings::http_proxy`'s env fallback inverts pi's `??=` precedence — **CLOSED 2026-08-15** (batch B): confirmed at HEAD (`.or_else(\|\| env.http_proxy.clone())`) and closed by taking the item's SECOND option — **the env leg and the `&EnvVars` parameter are deleted**, so the accessor is now pi's `getGlobalSettings().httpProxy` and nothing else (`main.ts:537`/`:801` @v0.83.0). Inverting the `or_else`, the item's first option, would have been a NEW divergence and the argument is kept in-source: `applyHttpProxySettings` fills `HTTP_PROXY` and `HTTPS_PROXY` **independently** (`http-dispatcher.ts:43-48`), so with an ambient `HTTP_PROXY` and a set `httpProxy` upstream still routes https targets through the SETTING; returning the ambient value from this accessor would have installed it as `configure_http_proxy`'s value for both names and lost the setting for https entirely. The ambient-wins half of `??=` stays where it was already ported once — `get_proxy_env` (`cyrup-provider/src/utils/node_http_proxy.rs`) consults `configured_http_proxy()` only after all four ambient lookups miss. Both call sites dropped their `EnvVars::default()` argument (`crates/cyrup/src/main.rs`, `crates/cyrup-session-svc/src/builder.rs`) and the two comments that explained why it was passed are rewritten rather than left stale. Test: `http_proxy_is_the_setting_alone_and_takes_no_environment` — **labelled in-file as COVERAGE, not proof**: the fix is a signature removal, so no test can be written against the pre-fix API. |
+| ~~CFG-061~~ | ~~low~~ **CLOSED 2026-08-15** | cyrup-original | S | `EffectiveSettings::packages()` discards the whole array on one malformed entry — **CLOSED 2026-08-15** (batch B): confirmed at HEAD and routed through the per-entry port. `EffectiveSettings::packages()` is now `self.merged.packages()` and a new `EffectiveSettings::packages_with_errors()` exposes the diagnostics, matching pi's `getPackages` (`settings-manager.ts:969-971` @v0.83.0 — `[...(this.settings.packages ?? [])]`, a verbatim copy that never parses, so a bad entry travels downstream and is rejected alone). RED-before test `one_malformed_package_entry_does_not_discard_the_other_nine` (ten entries, entry 3 a number → 9 + 1 diagnostic; pre-fix 0 + silence). |
+| ~~CFG-062~~ | ~~low~~ **CLOSED 2026-08-15 — one clause of its Impact REFUTED** | parity-bug | S | Clearing a string/array settings key writes JSON `null`; pi's `JSON.stringify` drops the key — **CLOSED 2026-08-15** (batch B). **Write half — real, confirmed, fixed on BOTH paths.** `SettingsManager::set` now removes the key when the serialized value is `Value::Null`, and `set_value_at_path` (shared by `set_nested` and `persist_nested`) does the same at a nested LEAF — the item named only `set`, but `persistScopedSettings` writes the nested object through the same `JSON.stringify(mergedSettings, null, 2)` (`settings-manager.ts:605` @v0.83.0), which omits undefined-valued properties at every depth, so the nested path had the identical defect. Upstream clearing setters: `setShellPath` `:883-887`, `setShellCommandPrefix` `:914-918`, `setNpmCommand` `:924-928`. RED-before test `clearing_a_key_removes_it_rather_than_writing_json_null` (also asserts the parent object survives an emptied leaf). No production caller passes `Null` today (`persist_nested`'s two callers write an array and a bool), so this closes the latency before a clear path exists, as the item's Fix asked. **Merge half — REFUTED, and the refutation is the durable finding.** The Impact's "cyrup has no such [undefined] skip" is unrepresentable: `serde_json` has no `undefined`, so a key absent from the project map is structurally skipped and pi's `:139-141` guard has no Rust counterpart to be missing. And "pi has no way to express that state at all" is false — a hand-written `"npmCommand": null` in a project file parses to `null`, `overrideValue === undefined` is false, so pi's `deepMergeSettings` takes the null too and `getNpmCommand`'s `this.settings.npmCommand ? … : undefined` reads it as unset. cyrup's `deep_merge` `(_, over) => over.clone()` and `npm_command`'s `as_array` do exactly the same. Pinned as a NEGATIVE test, `a_project_null_blanks_a_global_value_on_both_sides`, so nobody "fixes" the merge toward a divergence. |
 | CFG-063 | low | not-ported | S | `PI_TUI_DEBUG` and `PI_DEBUG_REDRAW` — the two upstream render-debug env vars — have no counterpart, so the cursor/viewport bug class has no instrument — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** Sibling of `TUI-040`. |
 | CFG-064 | low | not-ported | S | `isWindowsTerminalSession()` is unported — `SSH_CLIENT` / `SSH_CONNECTION` / `SSH_TTY` are read nowhere — so Ctrl+Backspace degrades to Backspace on Windows Terminal, and the bug direction flips over SSH — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** |
 | CFG-065 | low | not-ported | S | `isWslEnvironment()` (`WSL_DISTRO_NAME` / `WSL_INTEROP`) and its git-HEAD polling fallback are unported, so the footer branch indicator goes stale on `/mnt/<drive>` repos where inotify never fires — **filed 2026-08-14** (env-var surface). **FIX SITE: `crates/cyrup-tui` (area 07).** |
@@ -572,11 +589,27 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — assert the registry is composed once per invalidation rather than once per query, and that `main.rs` and `AgentSession` return identical `configured_providers` for a models.json-only provider. **Whoever schedules this must read `model-runtime.ts` at v0.84.1, not v0.83.0** — the port target is materially larger than this item was originally written against, and `CredentialSynchronizationError` / `enqueueCredentialOperation` are area-01 PARITY-GAPS items that interlock with it.
 
-## CFG-003 — Settings `packages` are resolved but never auto-installed
+## CFG-003 — Settings `packages` are resolved but never auto-installed — **CLOSED 2026-08-15**
 
-**Kind** not-ported · **Severity** medium · **Effort** L · **Confidence** confirmed
+**Kind** not-ported · **Severity** medium · **Effort** ~~L~~ S · **Confidence** confirmed
 
-**cyrup** — `cyrup/crates/cyrup-resources/src/discovery.rs:325-340` still carries the `[CYRUP-DELTA]` doc "cyrup performs no network install during session assembly". `resolve_configured_package` (`:341-419`) resolves git/oci ONLY through an already-materialized `cyrup install` tree via `installed_dir` (`:384-399`); anything else becomes the loud diagnostic at `:403-413`. The read/filter/discover half landed and is fine.
+> **CLOSED 2026-08-15.** The full disposition is in the Open-items row. Three things below are
+> corrected rather than deleted, because each one misdirected an earlier pass:
+>
+> 1. **The `Fix`'s "gated on an explicit opt-in setting" is WRONG and was not followed.** Upstream's
+>    only gate is `isOfflineModeEnabled()` (`package-manager.ts:42-46`, `PI_OFFLINE`) plus an
+>    optional `onMissing` callback the session path does not pass (`resource-loader.ts:403`, `:549`
+>    @v0.83.0). Inventing a settings key would have been the divergence, not the safety.
+> 2. **The `Fix`'s "git/oci" is WRONG on the OCI half.** pi's `installParsedSource` handles npm and
+>    git only (`:1347-1356`); there is no OCI arm upstream to port, and cyrup has no OCI fetcher
+>    (R-09-021).
+> 3. **The `Verify` is unrunnable as written** — "a local bare git remote declared in settings"
+>    cannot reach the git arm at all: `isLocalPath` (paths.ts:41-55) calls a `file://` URL LOCAL on
+>    both sides, so a settings entry naming a local repo is resolved as a path, never cloned. The
+>    landed tests split that: `git:localhost/...` end to end for the arm, a direct `file://` clone
+>    one layer down for the mechanism.
+
+**cyrup** — ~~`cyrup/crates/cyrup-resources/src/discovery.rs:325-340` still carries the `[CYRUP-DELTA]` doc "cyrup performs no network install during session assembly". `resolve_configured_package` (`:341-419`) resolves git/oci ONLY through an already-materialized `cyrup install` tree via `installed_dir` (`:384-399`); anything else becomes the loud diagnostic at `:403-413`.~~ **Stale — that delta is deleted and the git arm installs (2026-08-15).** The read/filter/discover half landed and is fine.
 
 **upstream** — `pi/packages/coding-agent/src/core/package-manager.ts:1240-1283` @v0.83.0 `resolvePackageSources` defines `installMissing` (`:1244-1251`) and calls it for both the npm branch and the git branch.
 
@@ -875,7 +908,12 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — settings round-trip test once the mode exists, plus a `/settings` row assertion.
 
-## CFG-054 — installed package working tree lands under a doubled `packages/packages/` segment
+## CFG-054 — installed package working tree lands under a doubled `packages/packages/` segment — **CLOSED 2026-08-15 (REFUTED: already fixed at HEAD)**
+
+> The evidence below described HEAD `04c1ba2`-era code and is stale at `68bbd39`. `packages_root`
+> no longer doubles, and a startup migration moves trees an older build wrote. See the Open-items
+> row. **The `Fix` paragraph's two options were both live when written; the first was taken.**
+
 
 **Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
 
@@ -889,7 +927,14 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — `CYRUP_AGENT_DIR=$(mktemp -d) cyrup install git:github.com/<u>/<r>`, then assert the clone directory and `packages.json` sit at the same level.
 
-## CFG-055 — `cyrup remove` may not match the `PackageId` that `cyrup install` stored
+## CFG-055 — `cyrup remove` may not match the `PackageId` that `cyrup install` stored — **CLOSED 2026-08-15 (REFUTED: already fixed at HEAD)**
+
+> Stale at `68bbd39`: `remove_candidate_ids` normalizes first and falls back to the raw id, and
+> `update`'s positional target does the same. **The "upstream leg not established" caveat is
+> discharged, not inherited** — pi normalizes too (`packageSourcesMatch`,
+> `package-manager.ts:1418-1422` @v0.83.0 over `getSourceMatchKeyFor{Settings,Input}`
+> `:1362-1383`). See the Open-items row.
+
 
 **Kind** cyrup-original · **Severity** medium · **Effort** S · **Confidence** confirmed on the cyrup side; upstream leg not established
 
@@ -945,7 +990,22 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — a test that constructs `StreamOptions` with `websocket_connect_timeout_ms: None` and asserts the connect deadline is 15 s, plus one asserting `Some(0)` disables it rather than meaning "immediately".
 
-## CFG-059 — A third, persistent `cli` settings layer that pi does not have
+## CFG-059 — A third, persistent `cli` settings layer that pi does not have — **CLOSED 2026-08-15 (REFUTED: already closed at HEAD)**
+
+> **CLOSED 2026-08-15 (batch B, cyrup-config slice) as REFUTED — already closed at HEAD, nothing was
+> changed this pass. Everything below is the filing text and is now wrong about the code.**
+> `SettingsManager::load` takes `(store, project_trusted)` — two arguments, no `cli` — the struct
+> holds exactly `global` + `project` + `effective`, and `recompute()` merges `global ◁ project`
+> only, applying `strip_global_only` to the project layer alone. The row's seam citations
+> (`builder.rs:369/435/538/593`, `factory.rs:30/49/95/154/185`) still resolve, but they are no
+> longer a settings LAYER: `SessionBuilder::cli_settings` now feeds the transient
+> `apply_overrides` at `crates/cyrup-session-svc/src/builder.rs:677-678`
+> (`if !self.cli_settings.is_empty() { settings.apply_overrides(&self.cli_settings) }`), which is
+> pi's `applyOverrides` (`settings-manager.ts:508-510` @v0.83.0) — merged onto the already-merged
+> view and discarded by the next `recompute()`. The item's own preferred remedy ("deleting is the
+> smaller change today") is what landed; both the `SettingsManager` doc comment and the
+> `apply_overrides` doc comment name CFG-059 as the reason.
+
 
 **Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** confirmed
 
@@ -959,7 +1019,40 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — if kept: a test pinning that a `cli` value outranks a project value and survives `reload()`. If deleted: assert `SettingsManager::load` no longer takes the layer and that `apply_overrides` is the only override path.
 
-## CFG-060 — `EffectiveSettings::http_proxy`'s env fallback inverts pi's `??=` precedence
+## CFG-060 — `EffectiveSettings::http_proxy`'s env fallback inverts pi's `??=` precedence — **CLOSED 2026-08-15**
+
+> **CLOSED 2026-08-15 (batch B).** Confirmed at HEAD exactly as filed — the body ended
+> `.or_else(|| env.http_proxy.clone())` and both production callers passed `EnvVars::default()` to
+> defeat it. Closed by the item's SECOND option: **the env leg and the `&EnvVars` parameter are
+> deleted**, leaving `EffectiveSettings::http_proxy(&self)` as pi's `getGlobalSettings().httpProxy`
+> and nothing more (`main.ts:537`, `:801` @v0.83.0), with the trim/empty filter kept because
+> `applyHttpProxySettings` opens `const proxy = httpProxy?.trim(); if (!proxy) return;`
+> (`http-dispatcher.ts:43-48`).
+>
+> **Why the item's FIRST option — inverting the `or_else` so env wins — would have been a new
+> divergence, recorded so it is not re-proposed.** `??=` fills `HTTP_PROXY` and `HTTPS_PROXY`
+> *independently*. With an ambient `HTTP_PROXY=A` and `"httpProxy": "S"`, upstream leaves
+> `HTTP_PROXY` at `A` and sets `HTTPS_PROXY` to `S`, so an **https** target proxies through the
+> SETTING. An inverted accessor would have returned `A` and handed it to `configure_http_proxy`,
+> making `A` the configured proxy for both names and losing `S` for https targets entirely. The
+> ambient-wins half of `??=` is already ported, once, in `get_proxy_env`
+> (`crates/cyrup-provider/src/utils/node_http_proxy.rs`), which consults `configured_http_proxy()`
+> only after all four ambient lookups miss — including that function's own recorded corner about an
+> ambient empty string.
+>
+> Call sites updated: `crates/cyrup/src/main.rs` (the bootstrap `configure_http_proxy`) and
+> `crates/cyrup-session-svc/src/builder.rs` (`apply_http_proxy_settings`); the comments at both
+> sites explaining why `EnvVars::default()` was passed are rewritten, not left stale.
+>
+> **Test honesty:** `http_proxy_is_the_setting_alone_and_takes_no_environment`
+> (`crates/cyrup-config/src/settings.rs`) is labelled IN-FILE as coverage, not proof. The fix is a
+> signature removal, so no test can be written against the pre-fix API — the pre-fix behaviour it
+> replaces (`http_proxy(&EnvVars { http_proxy: Some("http://ambient:3128"), .. })` returning
+> `Some("http://ambient:3128")` with no `httpProxy` key anywhere) is stated in the test's doc
+> comment instead of implied by a red run that cannot exist.
+>
+> The `NO_PROXY` case-folding note below stands and is still a retired false positive.
+
 
 **Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
 
@@ -975,7 +1068,20 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Note — a retired false positive, recorded so nobody re-derives it.** `NO_PROXY`, `HTTP_PROXY`, `FTP_PROXY` etc. never appear as string literals on EITHER side: pi's `getProxyEnv(key)` lowercases and uppercases the key at runtime (`packages/ai/src/utils/node-http-proxy.ts:13-23`, consumed at `:38` and `:103-106`) and cyrup does the same (`crates/cyrup-provider/src/utils/node_http_proxy.rs:50-56`). A literal-grep diff reports `NO_PROXY` as missing in cyrup; it is fully handled. The same trap will fire for any future case-folded lookup.
 
-## CFG-061 — `EffectiveSettings::packages()` discards the whole array on one malformed entry
+## CFG-061 — `EffectiveSettings::packages()` discards the whole array on one malformed entry — **CLOSED 2026-08-15**
+
+> **CLOSED 2026-08-15 (batch B).** Confirmed at HEAD. `EffectiveSettings::packages()` is now
+> `self.merged.packages()` — delegating to the per-entry `Settings::packages_with_errors` the item
+> names as the correct live path — and a new `EffectiveSettings::packages_with_errors()` exposes the
+> diagnostics so a future caller inherits the error channel rather than the silence. Upstream cite
+> **re-derived at v0.83.0**: `getPackages` is `settings-manager.ts:969-971`, not `:953-955` as the
+> old in-code comment said (`:953-955` at that tag is `getTrackingId()`); it is
+> `[...(this.settings.packages ?? [])]`, a verbatim copy that never parses, which is why a malformed
+> entry survives to be rejected individually downstream. RED before:
+> `one_malformed_package_entry_does_not_discard_the_other_nine` asserts 9 packages + 1 indexed
+> diagnostic from a ten-entry array whose fourth entry is the number `42`; the pre-fix blanket
+> `from_value::<Vec<PackageSource>>(v.clone()).ok().unwrap_or_default()` returned zero and no error.
+
 
 **Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
 
@@ -989,7 +1095,35 @@ Covers `cyrup/crates/cyrup-config` (settings, auth store, trust, model resolutio
 
 **Verify** — a ten-entry array with one malformed row must yield nine packages and one diagnostic, not zero and silence.
 
-## CFG-062 — Clearing a string/array settings key writes JSON `null`; pi drops the key
+## CFG-062 — Clearing a string/array settings key writes JSON `null`; pi drops the key — **CLOSED 2026-08-15 (write half fixed; the Impact's merge clause REFUTED)**
+
+> **CLOSED 2026-08-15 (batch B). The write half was real and is fixed on BOTH paths; the Impact's
+> merge clause is REFUTED and that refutation is the durable finding.**
+>
+> **Write half — fixed.** `SettingsManager::set` removes the key when `serde_json::to_value(value)`
+> is `Value::Null`, instead of inserting it. **The item named only `set`; `set_value_at_path` — the
+> shared leaf writer behind `set_nested` AND `persist_nested` — had the identical defect** and now
+> removes a `Null` leaf too, because `persistScopedSettings` serializes the nested object through
+> the same `JSON.stringify(mergedSettings, null, 2)` (`settings-manager.ts:605` @v0.83.0) that omits
+> undefined-valued properties at every depth. RED before:
+> `clearing_a_key_removes_it_rather_than_writing_json_null` — pre-fix the written document contained
+> `"shellPath": null` and `"terminal": { "showImages": null }`; it also asserts the parent object
+> survives an emptied leaf. Still LATENT as filed: `persist_nested`'s two production callers write
+> an array (`crates/cyrup/src/subcommands.rs`) and a selector value
+> (`crates/cyrup-session-svc/src/session.rs`), neither `Null`.
+>
+> **Merge half — REFUTED on both of its clauses.** (a) *"cyrup has no such skip"* — pi's
+> `overrideValue === undefined` guard (`settings-manager.ts:139-141` @v0.83.0; the same guard at
+> `:149-152` of v0.84.1's `deepMergeObjects`) has no Rust counterpart to be missing: `serde_json`
+> cannot represent `undefined`, so a key absent from the project map is structurally skipped by
+> iterating the map at all. (b) *"a project `npmCommand: null` blanks the global value where pi has
+> no way to express that state"* — a hand-written `"npmCommand": null` in a project settings file
+> parses to `null`, `overrideValue === undefined` is false, so pi's merge takes the null as well,
+> and `getNpmCommand`'s `this.settings.npmCommand ? [...] : undefined` (`:920-922`) then reads it as
+> unset. cyrup's `deep_merge` `(_, over) => over.clone()` and `npm_command`'s `as_array` do exactly
+> the same thing. Pinned as a NEGATIVE test — `a_project_null_blanks_a_global_value_on_both_sides` —
+> so a later pass does not "fix" the merge into a divergence.
+
 
 **Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
 

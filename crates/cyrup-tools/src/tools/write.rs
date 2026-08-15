@@ -50,6 +50,12 @@ impl Tool for WriteTool {
     fn name(&self) -> &str {
         "write"
     }
+    /// TOOL-045 — pi declares `label` explicitly beside `name` on every built-in
+    /// `ToolDefinition` and the two are equal for all seven (`write.ts:187-188` @v0.83.0). See
+    /// [`super::ReadTool::label`] for why the trait default was not left to stand in.
+    fn label(&self) -> Option<&str> {
+        Some("write")
+    }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
     }

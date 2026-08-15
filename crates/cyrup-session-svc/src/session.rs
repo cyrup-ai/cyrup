@@ -34,8 +34,8 @@ use crate::bash::{bash_message_payload, run_bash, BashOptions, BashResult};
 use crate::compact::DynSummarizer;
 use crate::error::SessionServiceError;
 use crate::event::{
-    core_message_to_agent, AgentSessionEvent, InputSource, PromptAccepted, PromptOptions,
-    StreamingBehavior, SummarizationRetrySource, UserInput,
+    core_message_to_agent, raw_message_to_agent, AgentSessionEvent, InputSource, PromptAccepted,
+    PromptOptions, StreamingBehavior, SummarizationRetrySource, UserInput,
 };
 use crate::host_services::InjectMessage;
 use crate::provider_swap::ProviderSwap;
@@ -1697,7 +1697,10 @@ impl AgentSession {
             )
             .await;
         // Estimate the rebuilt context size for the result payload (Pi `estimateMessagesTokens`).
-        let compacted_ctx = guard.build_context();
+        // SESS-043 — the RAW projection, which is both the estimate basis below AND the transcript
+        // pi re-seeds from (`this.agent.state.messages = sessionContext.messages`). It used to be
+        // `build_context()`, the `convertToLlm`-flattened twin.
+        let compacted_raw = guard.build_context_raw();
         // Pi measures `estimatedTokensAfter` over the RAW `AgentMessage` context, NOT the
         // `convertToLlm`-flattened one: `estimateMessagesTokens(sessionContext.messages)`
         // (agent-session.ts:1876 manual / :2157 auto) sums `estimateTokens` (compaction.ts:266-300)
@@ -1714,8 +1717,7 @@ impl AgentSession {
         // `tokens_before` on the SAME `compaction_end` event, which `prepare_compaction` already
         // computes over the raw projection (cyrup-session/src/compaction/prepare.rs).
         let estimated_tokens_after: u64 = u64::from(
-            guard
-                .build_context_raw()
+            compacted_raw
                 .iter()
                 .map(cyrup_session::compaction::tokens::estimate_agent_message)
                 .fold(0u32, u32::saturating_add),
@@ -1735,8 +1737,15 @@ impl AgentSession {
         //
         // `navigate_tree` already did exactly this (`:1857-1862`, citing `agent-session.ts:2871`);
         // the two compaction paths were the ones that built the context only to COUNT it.
+        //
+        // SESS-043 — seeded from the RAW projection. Folding `build_context().messages` through
+        // `core_message_to_agent` produced a transcript of a different LENGTH and different roles
+        // from pi's: `convertToLlm` DROPS every `excludeFromContext` (`!!`) bash message and
+        // rewrites each summary into wrapper prose, so pi's `messages.slice(0, -1)` arithmetic
+        // (`agent-session.ts:2008`, `:2188`, `:2703`) and every agent-state token estimate ran over
+        // a different list.
         let compacted_messages: Vec<AgentMessage> =
-            compacted_ctx.messages.iter().map(core_message_to_agent).collect();
+            compacted_raw.iter().map(raw_message_to_agent).collect();
         self.agent.set_messages(compacted_messages).await;
         // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
@@ -2201,10 +2210,13 @@ impl AgentSession {
         };
 
         // Rebuild the agent transcript from the navigated context (agent-session.ts:2871).
-        let ctx = guard.build_context();
+        // SESS-043 — the RAW projection, matching pi's `this.agent.state.messages =
+        // sessionContext.messages` (`agent-session.ts:3067-3068` @v0.83.0); see the two compaction
+        // re-seeds for why the flattened twin gave the wrong list.
+        let raw = guard.build_context_raw();
         let new_leaf_id = guard.leaf_id().cloned();
         drop(guard);
-        let msgs: Vec<AgentMessage> = ctx.messages.iter().map(core_message_to_agent).collect();
+        let msgs: Vec<AgentMessage> = raw.iter().map(raw_message_to_agent).collect();
         self.agent.set_messages(msgs).await;
 
         // session_tree notify (agent-session.ts:2877). cyrup collapses the Pi payload into one
@@ -4759,9 +4771,13 @@ impl AgentSession {
             // correctly, so the two disagreed inside one crate.
             // `raw_context_messages()` is `build_context_raw()` — `buildSessionContext(pathEntries)
             // .messages` (`session-manager.ts:389-403`), the same basis `Compactor::should_compact`
-            // uses. It stands in for pi's `this.agent.state.messages` because
-            // `cyrup_agent::AgentMessage` is a NARROWER enum that cannot carry the
-            // bash/branch-summary/compaction-summary roles at all (SESS-043 is the widening).
+            // uses. It stands in for pi's `this.agent.state.messages`, and since SESS-043 that is
+            // an equality rather than an approximation on every path that re-seeds the transcript:
+            // the three re-seed sites now assign this exact list. It stays the basis (rather than
+            // reading the agent back) because a live cyrup session ALSO appends its own
+            // `!`-execution results straight onto the transcript as `AgentMessage::Custom`
+            // (`record_bash_result`), which the session file — and therefore this projection —
+            // holds as the authoritative copy.
             let messages = self.raw_context_messages().await;
             let estimate = cyrup_session::compaction::estimate_context_tokens_raw(&messages);
             let Some(last_usage_index) = estimate.last_usage_index else {
@@ -4902,7 +4918,10 @@ impl AgentSession {
         // Pi agent-session.ts:2045: estimate the rebuilt context for the result payload. Hoisted
         // out of the `Ok(Some(_))` arm (as `compact` already does) so the manager guard is released
         // on ONE path, before the retry queue is flushed.
-        let compacted_ctx = guard.build_context();
+        // SESS-043 — the RAW projection, which is both the estimate basis below AND the transcript
+        // pi re-seeds from (`this.agent.state.messages = sessionContext.messages`). It used to be
+        // `build_context()`, the `convertToLlm`-flattened twin.
+        let compacted_raw = guard.build_context_raw();
         // Pi measures `estimatedTokensAfter` over the RAW `AgentMessage` context, NOT the
         // `convertToLlm`-flattened one: `estimateMessagesTokens(sessionContext.messages)`
         // (agent-session.ts:1876 manual / :2157 auto) sums `estimateTokens` (compaction.ts:266-300)
@@ -4919,8 +4938,7 @@ impl AgentSession {
         // `tokens_before` on the SAME `compaction_end` event, which `prepare_compaction` already
         // computes over the raw projection (cyrup-session/src/compaction/prepare.rs).
         let estimated_tokens_after: u64 = u64::from(
-            guard
-                .build_context_raw()
+            compacted_raw
                 .iter()
                 .map(cyrup_session::compaction::tokens::estimate_agent_message)
                 .fold(0u32, u32::saturating_add),
@@ -4940,8 +4958,15 @@ impl AgentSession {
         //
         // `navigate_tree` already did exactly this (`:1857-1862`, citing `agent-session.ts:2871`);
         // the two compaction paths were the ones that built the context only to COUNT it.
+        //
+        // SESS-043 — seeded from the RAW projection. Folding `build_context().messages` through
+        // `core_message_to_agent` produced a transcript of a different LENGTH and different roles
+        // from pi's: `convertToLlm` DROPS every `excludeFromContext` (`!!`) bash message and
+        // rewrites each summary into wrapper prose, so pi's `messages.slice(0, -1)` arithmetic
+        // (`agent-session.ts:2008`, `:2188`, `:2703`) and every agent-state token estimate ran over
+        // a different list.
         let compacted_messages: Vec<AgentMessage> =
-            compacted_ctx.messages.iter().map(core_message_to_agent).collect();
+            compacted_raw.iter().map(raw_message_to_agent).collect();
         self.agent.set_messages(compacted_messages).await;
         // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.

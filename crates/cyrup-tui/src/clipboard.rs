@@ -230,6 +230,131 @@ pub(crate) async fn copy_to_clipboard(text: &str) -> bool {
     copied
 }
 
+// ------------------------------------------------------------------ the READ side (DRIFT-045) --
+
+/// Pi `READ_CLIPBOARD_OPTIONS.timeout` (`clipboard.ts:39` @v0.84.2). Same 5 s as the write side,
+/// spelled separately because upstream spells it separately.
+const CLIPBOARD_READ_TIMEOUT: Duration = Duration::from_millis(5000);
+
+/// One attempt in Pi `readClipboardText`'s two-step chain (`clipboard.ts:52-69` @v0.84.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClipboardRead {
+    /// `execFileSync("wl-paste", ["--no-newline", "--type", "text"], READ_CLIPBOARD_OPTIONS)`
+    /// (`clipboard.ts:42-48`). Added upstream by pi `bfc679d5e`: the native addon is X11-oriented,
+    /// so on Wayland it reads nothing.
+    WlPaste,
+    /// `await clipboard.getText()` (`clipboard.ts:65`) — `arboard` here, the same backend the
+    /// Ctrl+V **image** read already uses.
+    Native,
+}
+
+/// The ordered read chain for `os` under `env` — Pi `readClipboardText`'s branch structure with
+/// the execution stripped out, for the same reason [`clipboard_write_plan`] is a pure function.
+///
+/// The Wayland gate is Pi's three-way conjunction verbatim: `platform() === "linux" &&
+/// isWaylandSession() && process.env.WAYLAND_DISPLAY` (`clipboard.ts:53`). Note this is a
+/// *narrower* platform test than the write side's `[CYRUP-DELTA]`, and deliberately so: a failed
+/// read degrades to "no text", never to the silent false success that justified widening the write
+/// arm off `p !== "linux"`.
+pub(crate) fn clipboard_read_plan(os: &str, env: &ClipboardEnv) -> Vec<ClipboardRead> {
+    let mut steps = Vec::new();
+    if os == "linux" && env.wayland_session && env.wayland_display {
+        steps.push(ClipboardRead::WlPaste);
+    }
+    steps.push(ClipboardRead::Native);
+    steps
+}
+
+/// Pi `readWaylandClipboardText` (`clipboard.ts:42-49`), whose return type is the three-state
+/// `ClipboardReadResult = { ok: true; text: string | null } | { ok: false }` (`:35`).
+///
+/// That third state is load-bearing and is why this returns `Option<Option<String>>` rather than
+/// `Option<String>`: `readClipboardText` returns `result.text` whenever `ok` — **including when the
+/// clipboard is empty** — and only falls through to the native backend when `wl-paste` itself
+/// *failed* (`clipboard.ts:54-58`). Collapsing "ok but empty" into "failed" would make an empty
+/// Wayland clipboard silently fall back to a stale X11 selection.
+///
+/// * `None` — `wl-paste` is missing, timed out, or exited non-zero (Pi's `catch` → `{ ok: false }`).
+/// * `Some(None)` — ran, produced nothing (Pi's `text || null`).
+/// * `Some(Some(text))` — ran, produced text.
+fn read_wayland_clipboard_text() -> Option<Option<String>> {
+    let out = run_capture("wl-paste", &["--no-newline", "--type", "text"])?;
+    Some(Some(out).filter(|t| !t.is_empty()))
+}
+
+/// Run `bin args` to completion and capture stdout — Pi's `execFileSync(..., { encoding: "utf8",
+/// maxBuffer: 50MB, timeout: 5000 })` (`clipboard.ts:36-40`). `None` on a spawn failure, a
+/// non-zero exit, non-UTF-8 output, or the timeout.
+///
+/// `[CYRUP-DELTA]`, second half, stated rather than smoothed: Node's `timeout` KILLS the child
+/// (`execFileSync` sends `killSignal`, SIGTERM by default). This does not — it stops WAITING. A
+/// `wl-paste` that hangs forever therefore survives this call, along with the helper thread
+/// holding it, where upstream would have reaped a terminated one. Not fixed here because
+/// `Command::output()` consumes the `Child`, so killing from outside needs a raw pid and a
+/// platform-specific signal, and a hung `wl-paste --no-newline` is not a state either side has
+/// been observed in; the caller's 5 s bound is upstream's either way.
+///
+/// `[CYRUP-DELTA]` — the wait happens on a helper thread and the result comes back over a channel,
+/// where Node has a timeout built into `execFileSync`. `std::process::Command::output()` reads the
+/// pipe to EOF (so a 50 MB clipboard cannot deadlock on a full pipe buffer, which a `try_wait`
+/// poll loop over a piped stdout would) but has no timeout of its own; `recv_timeout` supplies it.
+/// The helper thread outlives the timeout only until the child exits, and it holds the `Child`, so
+/// the process is still reaped rather than left a zombie. Behaviour matches upstream: the caller
+/// waits at most 5 s and a hung helper yields "no text".
+fn run_capture(bin: &str, args: &[&str]) -> Option<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let bin = bin.to_string();
+    let args: Vec<String> = args.iter().map(|a| (*a).to_string()).collect();
+    // A failure to spawn the thread leaves `rx` disconnected, which `recv_timeout` reports at once.
+    let _ = std::thread::Builder::new()
+        .name("cyrup-clipboard-read".to_string())
+        .spawn(move || {
+            let out = std::process::Command::new(bin)
+                .args(args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output();
+            let _ = tx.send(out);
+        });
+    match rx.recv_timeout(CLIPBOARD_READ_TIMEOUT) {
+        Ok(Ok(out)) if out.status.success() => String::from_utf8(out.stdout).ok(),
+        // A missing helper, a non-zero exit, or the timeout — all Pi's `catch` (`clipboard.ts:46`).
+        _ => None,
+    }
+}
+
+/// Read plain text from the system clipboard — Pi `readClipboardText` (`clipboard.ts:52-69`
+/// @v0.84.2). `None` when the clipboard holds no text or on any error (Pi returns `null` for both).
+///
+/// Synchronous where upstream is `async`, and that is the faithful shape rather than a shortcut:
+/// pi's Wayland branch is `execFileSync`, i.e. it blocks its event loop too, and its native branch
+/// is an addon call that resolves immediately. The one caller
+/// ([`crate::app::App::handle_input`]) is on the render thread for the same reason pi's is on the
+/// event loop.
+pub(crate) fn read_clipboard_text() -> Option<String> {
+    let env = ClipboardEnv::from_process();
+    for step in clipboard_read_plan(std::env::consts::OS, &env) {
+        match step {
+            // `if (result.ok) return result.text` (`clipboard.ts:55-57`) — an `ok` result WINS,
+            // empty or not; only a failure continues to the native step.
+            ClipboardRead::WlPaste => {
+                if let Some(text) = read_wayland_clipboard_text() {
+                    return text;
+                }
+            }
+            // `const text = await clipboard.getText(); return text || null` (`clipboard.ts:64-67`),
+            // wrapped in Pi's `catch { return null }`.
+            ClipboardRead::Native => {
+                return arboard::Clipboard::new()
+                    .and_then(|mut c| c.get_text())
+                    .ok()
+                    .filter(|t| !t.is_empty());
+            }
+        }
+    }
+    None
+}
+
 /// Write an escape straight to stdout and flush — the same shape as
 /// [`crate::write_terminal_progress`], for the same reason: a buffered stdout would hold the
 /// sequence until the next frame, and the terminal is the consumer, not the ratatui buffer.

@@ -93,6 +93,16 @@ pub struct SessionConfig {
     /// leaves this at the default, so a non-default `--package-dir`/`CYRUP_PACKAGE_DIR` is not yet
     /// threaded here (closing that residual is a one-line bin edit, outside this crate's scope).
     pub package_dir: PathBuf,
+    /// Whether this build may CLONE a settings-declared git package whose working tree is missing
+    /// (CFG-003), i.e. `cyrup_resources::DiscoveryConfig::install_missing_packages` — see that
+    /// field for the upstream mapping (`true` = pi's `resolve()` from the resource loader,
+    /// resource-loader.ts:403 @v0.83.0; `false` = pi's `resolve(async () => "skip")`,
+    /// cli/startup-ui.ts:73).
+    ///
+    /// Defaults to `false` so an SDK embedder's `build()` performs no network I/O it did not ask
+    /// for. The bin sets it to `!(--offline || CYRUP_OFFLINE || PI_OFFLINE)` (`main.rs`), which is
+    /// pi's own gate — `isOfflineModeEnabled()`, package-manager.ts:42-46, consulted at `:1261`.
+    pub install_missing_packages: bool,
     /// Runtime mode (drives non-prompting trust + the extension `ctx.mode`/`ctx.hasUI`).
     pub app_mode: AppMode,
     /// Model selection pattern (`provider/id[:level]`); `None` ⇒ settings default ⇒ first catalog.
@@ -206,6 +216,7 @@ impl SessionConfig {
             cwd_override: None,
             home: agent_dir.clone(),
             package_dir: agent_dir.join("packages"),
+            install_missing_packages: false,
             agent_dir,
             session_dir: None,
             app_mode: AppMode::Print,
@@ -1021,6 +1032,13 @@ impl SessionBuilder {
         // Project entries are pushed first so they win the shared package precedence rank (:887-893).
         let (configured_packages, package_errors) = configured_packages_from_settings(&settings, &cwd, &cfg.agent_dir);
         disc.configured_packages = configured_packages;
+        // CFG-003: pi's session path calls `packageManager.resolve()` with NO `onMissing`
+        // (resource-loader.ts:403 and :549 @v0.83.0), so a declared git package with no working tree
+        // is CLONED during assembly unless `isOfflineModeEnabled()` (package-manager.ts:1260-1271).
+        // The flag is threaded rather than read here because `cyrup-resources` performs no env
+        // lookups and this crate has no `NetworkPolicy`; the bin resolves `--offline`/`CYRUP_OFFLINE`
+        // /`PI_OFFLINE` and sets it (`cyrup/src/main.rs`).
+        disc.install_missing_packages = cfg.install_missing_packages;
         let report = discover(&disc, cancel.token()).await?;
         // TUI-006: the discovery pass's structured diagnostics (shadowed same-name skills, a
         // configured path that does not exist, a malformed frontmatter) used to be dropped on the
@@ -1486,10 +1504,10 @@ impl SessionBuilder {
         // `configureHttpDispatcher(getHttpIdleTimeoutMs())`, main.ts:744-745). The `httpProxy` setting
         // becomes a provider-scoped `HTTP_PROXY`/`HTTPS_PROXY` overlay (Pi `StreamOptions.env`) that the
         // provider's proxy resolver honors; the idle timeout becomes the request `timeout_ms`. The
-        // setting-only read (empty `EnvVars` for the fallback) mirrors Pi reading the setting value.
-        if let Some(overlay) =
-            apply_http_proxy_settings(eff.http_proxy(&cyrup_config::EnvVars::default()))
-        {
+        // read is setting-only, mirroring Pi's `getGlobalSettings().httpProxy`; the ambient-wins half
+        // of pi's `??=` lives in `node_http_proxy::get_proxy_env` (CFG-060, which deleted the
+        // accessor's `EnvVars` argument — this call passed `EnvVars::default()` to defeat it).
+        if let Some(overlay) = apply_http_proxy_settings(eff.http_proxy()) {
             agent_builder = agent_builder.provider_env(overlay);
         }
         // PROV-006. Pi's `configureHttpDispatcher(getHttpIdleTimeoutMs())` installs a PROCESS-GLOBAL

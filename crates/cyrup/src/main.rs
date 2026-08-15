@@ -159,11 +159,12 @@ async fn run() -> anyhow::Result<i32> {
     // chat and a silently-direct login — the exact split PROV-047 names.
     //
     // `projectTrusted: false` is pi's, verbatim, and is why the store is loaded untrusted here; the
-    // key is `GLOBAL_ONLY` besides (CFG-057). `EnvVars::default()` is passed to the accessor rather
-    // than the real environment so the SETTING alone is installed: pi's `??=` gives an ambient
-    // `HTTP_PROXY`/`HTTPS_PROXY` precedence, and that precedence lives in the resolver
-    // (`node_http_proxy::get_proxy_env`, which consults `configured_http_proxy` only after all four
-    // ambient lookups miss). Passing the real env here would invert it (CFG-060).
+    // key is `GLOBAL_ONLY` besides (CFG-057). The accessor installs the SETTING alone — pi's `??=`
+    // gives an ambient `HTTP_PROXY`/`HTTPS_PROXY` precedence, and that precedence lives in the
+    // resolver (`node_http_proxy::get_proxy_env`, which consults `configured_http_proxy` only after
+    // all four ambient lookups miss). CFG-060 deleted the `EnvVars` argument this call used to pass
+    // as `EnvVars::default()`: the accessor's env fallback was dead here and would have inverted the
+    // precedence for any caller that passed a real environment.
     //
     // pi's paired `configureHttpDispatcher()` with no argument installs `DEFAULT_HTTP_IDLE_TIMEOUT_MS`
     // — which is already the initial value of cyrup's process-global
@@ -173,9 +174,7 @@ async fn run() -> anyhow::Result<i32> {
         let env = EnvVars::from_process();
         if let Ok(dirs) = ConfigDirs::resolve(&CliConfigOverrides::default(), &env) {
             let bootstrap = SettingsManager::load(file_settings_store(&dirs), false);
-            cyrup_provider::configure_http_proxy(
-                bootstrap.effective().http_proxy(&EnvVars::default()),
-            );
+            cyrup_provider::configure_http_proxy(bootstrap.effective().http_proxy());
         }
     }
 
@@ -493,6 +492,14 @@ async fn run() -> anyhow::Result<i32> {
     // EXISTING but unreadable file warns and falls back to being used as literal text — never fatal.
     let (mut config, prompt_diagnostics) = cli.to_session_config_with_diagnostics(&dirs, mode);
     report_diagnostics(&prompt_diagnostics);
+    // CFG-003: a package declared in `settings.json` whose working tree is missing is CLONED during
+    // session assembly, exactly as Pi's resource loader does — `packageManager.resolve()` with no
+    // `onMissing` (resource-loader.ts:403,549 @v0.83.0) reaches `installMissing`
+    // (package-manager.ts:1260-1271), which installs unless `isOfflineModeEnabled()` (`:42-46`).
+    // That predicate is `PI_OFFLINE` upstream and `--offline`/`CYRUP_OFFLINE`/`PI_OFFLINE` here,
+    // already folded into `overrides.offline` above. It is the ONLY gate upstream has, so no
+    // settings key or extra flag is invented for it.
+    config.install_missing_packages = !overrides.offline;
 
     // Non-interactive session-resolution depth (Pi `createSessionManager`, main.ts:254-350): a
     // `--session`/`--fork` partial-UUID prefix match, a global cross-project search, a

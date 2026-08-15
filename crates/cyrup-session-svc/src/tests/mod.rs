@@ -4,6 +4,7 @@
 mod abort_settles;
 mod added_tool_names_producer;
 mod agent_settled;
+mod agent_transcript_raw_seed;
 mod attribution_follows_model;
 mod base_system_prompt;
 mod bash_session_env_wiring;

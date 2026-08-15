@@ -61,8 +61,10 @@ fn the_other_arms_are_byte_unchanged_and_still_tagged() {
 
 #[test]
 fn every_arm_still_round_trips() {
-    // MIRROR: removing the outer tag must not break `Deserialize`, which is still derived and
-    // reads `role`. If this regressed, transcripts would stop loading.
+    // MIRROR: removing the outer tag must not break `Deserialize`, which reads `role`. If this
+    // regressed, transcripts would stop loading. SESS-043 replaced the derived `Deserialize` with a
+    // hand-written one so the three declaration-merged roles can share one `App` arm; the four
+    // typed arms below are the check that it stayed byte-compatible with the derive.
     for msg in [
         AgentMessage::Assistant(assistant()),
         AgentMessage::user_text("hello"),
@@ -86,4 +88,45 @@ fn a_user_message_keeps_its_null_timestamp_key() {
     // duplicate-role fix is credited for it.
     let raw = serde_json::to_string(&AgentMessage::user_text("hi")).unwrap();
     assert!(raw.contains(r#""timestamp":null"#), "null timestamp key retained: {raw}");
+}
+
+/// SESS-043 — a declaration-merged coding-agent role rides through `AgentMessage::App` as its pi
+/// wire object and re-emits every field of it, `role` included and still exactly once.
+///
+/// **Coverage, not proof:** the `App` variant is new in this change, so no pre-fix form of this
+/// test can be red. What it pins is the property the layering depends on — this crate never parses
+/// the payload, so no field may be added, dropped or rewritten in transit (`cyrup-session` owns the
+/// shapes; see `coding-agent/src/core/messages.ts:68-77` @v0.83.0).
+///
+/// **Field ORDER is deliberately not asserted, and the limit is real rather than cosmetic.**
+/// `serde_json::Map` is a `BTreeMap` unless the `preserve_order` feature is on, so parsing into
+/// `App` already sorts the keys and no serializer can put pi's declaration order back. That is why
+/// `App` is confined to the in-memory transcript: the two places byte-shape is load-bearing —
+/// the session file and the extension `session_before_compact` payload — both go through
+/// `cyrup_session::agent_message::AgentMessage`'s hand-written `SerializeMap`, which emits pi's
+/// declaration order explicitly and never sees an `App`.
+#[test]
+fn an_app_message_round_trips_its_pi_wire_object() {
+    let wire = r#"{"role":"compactionSummary","summary":"did the thing","tokensBefore":41,"timestamp":9}"#;
+    let msg: AgentMessage = serde_json::from_str(wire).expect("a merged role parses");
+    let AgentMessage::App { ref role, .. } = msg else {
+        panic!("a merged role must land in App, got {msg:?}");
+    };
+    assert_eq!(role, "compactionSummary");
+    let raw = serde_json::to_string(&msg).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&raw).unwrap(),
+        serde_json::from_str::<serde_json::Value>(wire).unwrap(),
+        "every field survives the crossing unchanged: {raw}"
+    );
+    assert_eq!(raw.matches(r#""role""#).count(), 1, "still exactly one role key: {raw}");
+}
+
+/// The `App` fallback is closed over pi's four merged roles (`custom` has its own typed arm), so a
+/// genuinely unknown role still fails to parse exactly as it did before `App` existed. Widening
+/// that tolerance would turn a corrupt transcript into a silently-empty turn.
+#[test]
+fn an_unknown_role_is_still_a_parse_error() {
+    let err = serde_json::from_str::<AgentMessage>(r#"{"role":"nonsense","x":1}"#);
+    assert!(err.is_err(), "an unrecognized role must not be swallowed: {err:?}");
 }
