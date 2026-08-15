@@ -19,6 +19,7 @@
 
 pub mod auth;
 pub mod config_value;
+pub mod defaults;
 pub mod env;
 pub mod env_keys;
 pub mod error;
@@ -46,6 +47,7 @@ pub use config_value::{
     resolve_config_value_or_throw_async, resolve_config_value_uncached, resolve_headers,
     resolve_headers_or_throw,
 };
+pub use defaults::DEFAULT_THINKING_LEVEL;
 pub use env::{CacheRetention, CliConfigOverrides, ConfigDirs, EnvVars};
 pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError};

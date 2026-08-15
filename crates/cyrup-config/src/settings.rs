@@ -191,8 +191,22 @@ impl PackageSource {
     }
 }
 
-/// A key that is only honoured in the GLOBAL scope; stripped from project/CLI before merge.
-const GLOBAL_ONLY_KEYS: &[&str] = &["defaultProjectTrust"];
+/// Keys that are only honoured in the GLOBAL scope; stripped from project/CLI before merge.
+///
+/// Upstream expresses this by reading them off the raw global document rather than the merged view
+/// — `getGlobalSettings()` (settings-manager.ts:442-444 @v0.83.0) returns `this.globalSettings`,
+/// not `this.settings`, so a key read through it can never be supplied by a project. Exactly two
+/// production keys are read that way at v0.83.0:
+///
+/// - `defaultProjectTrust` (§4.8).
+/// - `httpProxy` — `applyHttpProxySettings(bootstrapSettingsManager.getGlobalSettings().httpProxy)`
+///   at `main.ts:537` and `applyHttpProxySettings(settingsManager.getGlobalSettings().httpProxy)`
+///   at `main.ts:801`, documented as such in `packages/coding-agent/docs/settings.md:87` —
+///   "HTTP proxy URL applied as `HTTP_PROXY` and `HTTPS_PROXY`. Global setting only." CFG-057: this
+///   was missing, so a project `.cyrup/settings.json` could rewrite the session's egress. Note the
+///   neighbouring `httpIdleTimeoutMs` IS merged upstream (`getHttpIdleTimeoutMs` reads
+///   `this.settings`) — this is a per-key upstream decision, not a category.
+const GLOBAL_ONLY_KEYS: &[&str] = &["defaultProjectTrust", "httpProxy"];
 
 /// A settings document (one scope). Wraps a JSON object so unknown / not-yet-modelled keys are
 /// preserved across a load→save round-trip (R-07-004).
@@ -374,7 +388,7 @@ impl Settings {
     }
 }
 
-/// Remove keys that are only honoured globally (§4.8: `defaultProjectTrust`).
+/// Remove keys that are only honoured globally (see [`GLOBAL_ONLY_KEYS`]).
 fn strip_global_only(settings: &mut Settings) {
     for k in GLOBAL_ONLY_KEYS {
         settings.obj.remove(*k);
@@ -545,13 +559,22 @@ impl EffectiveSettings {
     }
 
     /// `getDefaultThinkingLevel` reads the `defaultThinkingLevel` settings key (Pi
-    /// settings-manager.ts:84,735-737). Pi returns `undefined` when unset; we map that to the
-    /// type's default so the consumer always has a concrete level.
-    pub fn default_thinking_level(&self) -> ModelThinkingLevel {
+    /// settings-manager.ts:84, and the getter itself at `:740-742` @v0.83.0 —
+    /// `getDefaultThinkingLevel(): ThinkingLevel | undefined { return
+    /// this.settings.defaultThinkingLevel; }`).
+    ///
+    /// **Returns `None` when unset, exactly as upstream returns `undefined`.** CFG-056: this used
+    /// to end `.unwrap_or_default()`, collapsing "unset" into `ModelThinkingLevel::default()` =
+    /// `Off` at the settings layer — so every user who had never written the key started every
+    /// session with reasoning DISABLED where Pi starts at
+    /// [`crate::DEFAULT_THINKING_LEVEL`] (`medium`). Keeping the `Option` is the mechanism that
+    /// keeps it correct: it forces each consumer to spell `?? DEFAULT_THINKING_LEVEL` in the
+    /// source the way Pi's six call sites do, instead of hiding the choice inside a `Default` impl
+    /// no reviewer of the consumer can see.
+    pub fn default_thinking_level(&self) -> Option<ModelThinkingLevel> {
         self.merged
             .get("defaultThinkingLevel")
             .and_then(|v| serde_json::from_value::<ModelThinkingLevel>(v.clone()).ok())
-            .unwrap_or_default()
     }
 
     pub fn hide_thinking_block(&self) -> bool {
@@ -1877,6 +1900,41 @@ mod tests {
         );
     }
 
+    /// CFG-057 — RED before the fix. Pi reads `httpProxy` off the raw GLOBAL document
+    /// (`main.ts:537` / `:801`, both `getGlobalSettings().httpProxy`) and documents it as
+    /// "Global setting only." (`packages/coding-agent/docs/settings.md:87` @v0.83.0), so a
+    /// project `.cyrup/settings.json` must not be able to rewrite the session's egress — not even
+    /// a TRUSTED one, since approving a project is not approving a proxy.
+    #[test]
+    fn http_proxy_is_global_only() {
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Global,
+            r#"{ "httpProxy": "http://global:8080" }"#,
+        );
+        store.seed(
+            SettingsScope::Project,
+            r#"{ "httpProxy": "http://project:9090" }"#,
+        );
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+        assert_eq!(
+            mgr.effective().http_proxy(&crate::env::EnvVars::default()),
+            Some("http://global:8080".to_string())
+        );
+
+        // And with no global value the project one supplies nothing at all.
+        let store = Arc::new(InMemorySettingsStore::new());
+        store.seed(
+            SettingsScope::Project,
+            r#"{ "httpProxy": "http://project:9090" }"#,
+        );
+        let mgr = SettingsManager::load(store, Settings::new(), true);
+        assert_eq!(
+            mgr.effective().http_proxy(&crate::env::EnvVars::default()),
+            None
+        );
+    }
+
     #[test]
     fn set_field_preserves_unknown_keys() {
         let store = Arc::new(InMemorySettingsStore::new());
@@ -2088,12 +2146,28 @@ mod tests {
         let s = EffectiveSettings::from_settings(
             Settings::parse(r#"{ "defaultThinkingLevel": "high" }"#).unwrap(),
         );
-        assert_eq!(s.default_thinking_level(), ModelThinkingLevel::High);
+        assert_eq!(s.default_thinking_level(), Some(ModelThinkingLevel::High));
         // The legacy/wrong key must NOT be honoured.
         let s = EffectiveSettings::from_settings(
             Settings::parse(r#"{ "defaultModelThinkingLevel": "high" }"#).unwrap(),
         );
-        assert_eq!(s.default_thinking_level(), ModelThinkingLevel::default());
+        assert_eq!(s.default_thinking_level(), None);
+    }
+
+    /// CFG-056 — RED before the fix, which returned `ModelThinkingLevel::default()` (= `Off`) for
+    /// an unset key. Pi's getter returns `undefined` (settings-manager.ts:740-742 @v0.83.0) and
+    /// every consumer falls back to `DEFAULT_THINKING_LEVEL` = `"medium"`
+    /// (`core/defaults.ts:3`), so the unset case must NOT be `Off` and must NOT be decided here.
+    #[test]
+    fn unset_default_thinking_level_is_none_and_falls_back_to_medium() {
+        let s = EffectiveSettings::from_settings(Settings::parse("{}").unwrap());
+        assert_eq!(s.default_thinking_level(), None);
+        assert_eq!(
+            s.default_thinking_level()
+                .unwrap_or(crate::DEFAULT_THINKING_LEVEL),
+            ModelThinkingLevel::Medium,
+        );
+        assert_ne!(crate::DEFAULT_THINKING_LEVEL, ModelThinkingLevel::default());
     }
 
     /// PROV-002 / pi `test/max-thinking.test.ts` ("is accepted by CLI and settings"): a settings
@@ -2103,12 +2177,13 @@ mod tests {
         let s = EffectiveSettings::from_settings(
             Settings::parse(r#"{ "defaultThinkingLevel": "max" }"#).unwrap(),
         );
-        assert_eq!(s.default_thinking_level(), ModelThinkingLevel::Max);
-        // A genuinely unknown level still degrades to the default rather than erroring.
+        assert_eq!(s.default_thinking_level(), Some(ModelThinkingLevel::Max));
+        // A genuinely unknown level still degrades to "unset" rather than erroring, and the
+        // consumer's `DEFAULT_THINKING_LEVEL` fallback then applies (CFG-056).
         let s = EffectiveSettings::from_settings(
             Settings::parse(r#"{ "defaultThinkingLevel": "ultra" }"#).unwrap(),
         );
-        assert_eq!(s.default_thinking_level(), ModelThinkingLevel::default());
+        assert_eq!(s.default_thinking_level(), None);
     }
 
     #[test]

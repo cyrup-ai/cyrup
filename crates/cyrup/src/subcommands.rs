@@ -4,12 +4,16 @@
 //! instead of falling through to the interactive/one-shot CLI. Wired to the cyrup-resources
 //! [`PackageManager`].
 //!
-//! This is a 1:1 port of `parsePackageCommand` + `handlePackageCommand` (package-manager-cli.ts):
-//! per-command `--help`, the `invalidOption`/`missingOptionValue`/`invalidArgument`/
-//! `conflictingOptions` diagnostics (each with a usage line + exit 1), the `update` target matrix
-//! (`--self`/`--extensions`/`--all`/`--extension <source>` combos), the User/Project-grouped `list`
-//! with `(filtered)` tags + dim installed paths, and the saved-trust-store lookup + project-write
-//! guard. The interactive trust prompt + the binary self-update are the gated tails (residual ledger).
+//! This is a 1:1 port of `parsePackageCommand` + `handlePackageCommand` + `handleConfigCommand`
+//! (package-manager-cli.ts): per-command `--help`, the `invalidOption`/`missingOptionValue`/
+//! `invalidArgument`/`conflictingOptions` diagnostics (each with a usage line + exit 1), the
+//! `update` target matrix (`--self`/`--extensions`/`--models`/`--all`/`--extension <source>`
+//! combos) including the foreground catalog refresh `--models` dispatches to
+//! (`refreshModelCatalogs`, `:397-423` → [`crate::provider::refresh_model_catalogs`]), the
+//! User/Project-grouped `list` with `(filtered)` tags + dim installed paths, and the
+//! saved-trust-store lookup + project-write guard. The interactive trust prompt is the gated tail
+//! (residual ledger); the binary self-update lands on upstream's own "this installation cannot
+//! self-update" branch, since cyrup has no release endpoint to fetch from.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -73,12 +77,16 @@ impl PackageCommand {
     }
 }
 
-/// The `update` target (Pi `UpdateTarget = {all} | {self} | {extensions, source?}`).
+/// The `update` target (Pi `UpdateTarget = {all} | {self} | {extensions, source?} | {models}`,
+/// package-manager-cli.ts:35 @v0.83.0).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum UpdateTargetSel {
     All,
     SelfUpdate,
     Extensions(Option<String>),
+    /// `--models` — refresh the model catalogs and nothing else (pi `{ type: "models" }`,
+    /// dispatched at `package-manager-cli.ts:726-735` before any settings/trust work).
+    Models,
 }
 
 /// A parsed package command + its diagnostics (Pi `PackageCommandOptions`,
@@ -122,6 +130,7 @@ pub fn parse_package_command(argv: &[String]) -> Option<ParsedCommand> {
     let mut source: Option<String> = None;
     let mut self_flag = false;
     let mut extensions_flag = false;
+    let mut models_flag = false;
     let mut all_flag = false;
     let mut extension_flag_source: Option<String> = None;
 
@@ -146,6 +155,15 @@ pub fn parse_package_command(argv: &[String]) -> Option<ParsedCommand> {
             "--extensions" => {
                 if command == PackageCommand::Update {
                     extensions_flag = true;
+                } else {
+                    invalid_option.get_or_insert_with(|| arg.clone());
+                }
+            }
+            // pi package-manager-cli.ts:250-257 — accepted for `update` only, an `invalidOption`
+            // everywhere else, exactly like `--self`/`--extensions`.
+            "--models" => {
+                if command == PackageCommand::Update {
+                    models_flag = true;
                 } else {
                     invalid_option.get_or_insert_with(|| arg.clone());
                 }
@@ -208,9 +226,11 @@ pub fn parse_package_command(argv: &[String]) -> Option<ParsedCommand> {
     let mut update_target: Option<UpdateTargetSel> = None;
     let mut show_extensions_skipped_note = false;
     if command == PackageCommand::Update {
-        if all_flag && (self_flag || extensions_flag || extension_flag_source.is_some()) {
+        if all_flag && (self_flag || extensions_flag || models_flag || extension_flag_source.is_some())
+        {
             conflicting_options.get_or_insert_with(|| {
-                "--all cannot be combined with --self, --extensions, or --extension".to_string()
+                "--all cannot be combined with --self, --extensions, --models, or --extension"
+                    .to_string()
             });
         }
         if all_flag && source.is_some() {
@@ -219,7 +239,22 @@ pub fn parse_package_command(argv: &[String]) -> Option<ParsedCommand> {
             });
         }
 
-        if let Some(ext_source) = extension_flag_source.clone() {
+        // `--models` is checked FIRST (pi `:329`), so it owns the target whenever it is present and
+        // its own two conflict messages are the ones a user sees.
+        if models_flag {
+            if self_flag || extensions_flag || all_flag || extension_flag_source.is_some() {
+                conflicting_options.get_or_insert_with(|| {
+                    "--models cannot be combined with --self, --extensions, --all, or --extension"
+                        .to_string()
+                });
+            }
+            if source.is_some() {
+                conflicting_options.get_or_insert_with(|| {
+                    "--models cannot be combined with a positional source".to_string()
+                });
+            }
+            update_target = Some(UpdateTargetSel::Models);
+        } else if let Some(ext_source) = extension_flag_source.clone() {
             if self_flag || extensions_flag || all_flag {
                 conflicting_options.get_or_insert_with(|| {
                     "--extension cannot be combined with --self, --extensions, or --all".to_string()
@@ -283,7 +318,7 @@ pub fn usage(command: PackageCommand) -> String {
         PackageCommand::Install => format!("{APP} install <source> [-l] [--approve|--no-approve]"),
         PackageCommand::Remove => format!("{APP} remove <source> [-l] [--approve|--no-approve]"),
         PackageCommand::Update => format!(
-            "{APP} update [source|self|pi] [--self|--extensions|--all] [--extension <source>] [--approve|--no-approve] [--force]"
+            "{APP} update [source|self|pi] [--self|--extensions|--models|--all] [--extension <source>] [--approve|--no-approve] [--force]"
         ),
         PackageCommand::List => format!("{APP} list [--approve|--no-approve]"),
     }
@@ -293,28 +328,86 @@ pub fn usage(command: PackageCommand) -> String {
 pub fn render_command_help(command: PackageCommand) -> String {
     const APP: &str = "cyrup";
     const CFG: &str = ".cyrup";
+    const REPO: &str = SELF_UPDATE_REPO;
     match command {
         PackageCommand::Install => format!(
             // The Pi `npm:@foo/bar` example is dropped here: `PackageSource::parse` hard-rejects the
             // `npm:` channel in the Rust port (source.rs:79-81 — no JS runtime, R-09-021), so an
             // `install npm:@foo/bar` is guaranteed to error. Advertising it in cyrup's OWN help would be
-            // dead-but-advertised (gap-analysis 13-cyrup §D). The remaining git/https/ssh/path examples
-            // mirror Pi's list (package-manager-cli.ts:104-110) minus that unsupported channel.
-            "Usage:\n  {}\n\nInstall a package and add it to settings.\n\nOptions:\n  -l, --local       Install project-locally ({CFG}/settings.json)\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n\nExamples:\n  {APP} install git:github.com/user/repo\n  {APP} install git:git@github.com:user/repo\n  {APP} install https://github.com/user/repo\n  {APP} install ssh://git@github.com/user/repo\n  {APP} install ./local/path\n",
+            // dead-but-advertised. The remaining git/https/ssh/path examples mirror Pi's list
+            // (package-manager-cli.ts:104-110) minus that unsupported channel.
+            //
+            // SEAM-076 — the summary + `-l` lines used to name `settings.json`, which is pi's storage
+            // (`installAndPersist` → `addSourceToSettings`, package-manager.ts:817-841 @v0.83.0) and
+            // NOT cyrup's: the only write this path makes is `lock::save` into the package registry
+            // (`cyrup-resources/src/package/install.rs:152-158`), the deliberate divergence recorded
+            // at `cyrup-session-svc/src/builder.rs:936-945`. A user who followed the old text edited a
+            // file the installer never touches, and a hand-added `packages` entry there is a SECOND,
+            // additive channel (`cyrup-config/src/settings.rs:343-373`) — a duplicate, not a fix.
+            "Usage:\n  {}\n\nInstall a package and record it in the package registry.\n\nOptions:\n  -l, --local       Install project-locally ({CFG}/packages.json)\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n\nExamples:\n  {APP} install git:github.com/user/repo\n  {APP} install git:git@github.com:user/repo\n  {APP} install https://github.com/user/repo\n  {APP} install ssh://git@github.com/user/repo\n  {APP} install ./local/path\n",
             usage(command)
         ),
         PackageCommand::Remove => format!(
-            "Usage:\n  {}\n\nRemove a package and its source from settings.\nAlias: {APP} uninstall <source> [-l]\n\nOptions:\n  -l, --local       Remove from project settings ({CFG}/settings.json)\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n\nExamples:\n  {APP} remove npm:@foo/bar\n  {APP} uninstall npm:@foo/bar\n",
+            // SEAM-076 (the registry, not settings — see the install arm) and SEAM-077: pi's two
+            // examples are BOTH `npm:` (package-manager-cli.ts:145-146 @v0.83.0), a channel
+            // `PackageSource::parse` hard-rejects here (`source.rs:79-81`), so the only two examples
+            // this help showed named a source class that can never have been installed. They are the
+            // git + path forms the install help already uses, which `parse` accepts.
+            "Usage:\n  {}\n\nRemove a package and its source from the package registry.\nAlias: {APP} uninstall <source> [-l]\n\nOptions:\n  -l, --local       Remove from the project registry ({CFG}/packages.json)\n  -a, --approve     Trust project-local files for this command\n  -na, --no-approve Ignore project-local files for this command\n\nExamples:\n  {APP} remove git:github.com/user/repo\n  {APP} uninstall ./local/path\n",
             usage(command)
         ),
+        // SEAM-078 — `--self`/`--all`/`--force` and the bare/`pi` short forms all resolve to the
+        // self-update stub ([`self_update_unavailable`]), so they are marked unavailable here rather
+        // than described as functional, and the stub's remedy names the route that actually works for
+        // a source install. `--models` IS implemented (pi `refreshModelCatalogs`,
+        // package-manager-cli.ts:397-423) and is described exactly as upstream describes it (`:159`,
+        // `:169`).
         PackageCommand::Update => format!(
-            "Usage:\n  {}\n\nUpdate {APP} and installed packages.\n\nOptions:\n  --self                  Update {APP} only (default when no target is given)\n  --extensions            Update installed packages only\n  --all                   Update {APP} and installed packages\n  --extension <source>    Update one package only\n  -a, --approve           Trust project-local files for this command\n  -na, --no-approve       Ignore project-local files for this command\n  --force                 Reinstall {APP} even if the current version is latest\n\nShort forms:\n  {APP} update                Update {APP} only\n  {APP} update --all          Update {APP} and all extensions\n  {APP} update <source>       Update one package\n  {APP} update pi             Update {APP} only (self works as alias to pi)\n",
+            "Usage:\n  {}\n\nUpdate installed packages or model catalogs. Self-update is unavailable in this build.\n\nOptions:\n  --self                  Update {APP} only (UNAVAILABLE — see below; default when no target is given)\n  --extensions            Update installed packages only\n  --models                Refresh model catalogs only\n  --all                   Update {APP} (UNAVAILABLE) and installed packages\n  --extension <source>    Update one package only\n  -a, --approve           Trust project-local files for this command\n  -na, --no-approve       Ignore project-local files for this command\n  --force                 Reinstall {APP} even if the current version is latest (UNAVAILABLE)\n\nShort forms:\n  {APP} update                Update {APP} only (UNAVAILABLE)\n  {APP} update --all          Update {APP} (UNAVAILABLE) and all extensions\n  {APP} update --extensions   Update all installed packages\n  {APP} update --models       Refresh model catalogs only\n  {APP} update <source>       Update one package\n  {APP} update pi             Update {APP} only (self works as alias to pi, UNAVAILABLE)\n\nSelf-update: this build cannot replace its own binary. Update it with:\n  cargo install --git {REPO} {APP}\n",
             usage(command)
         ),
         PackageCommand::List => format!(
             "Usage:\n  {}\n\nList installed packages from user and project settings.\n\nOptions:\n  -a, --approve      Trust project-local files for this command\n  -na, --no-approve  Ignore project-local files for this command\n",
             usage(command)
         ),
+    }
+}
+
+/// The repository a from-source install is updated from — the ONE route that works for this build
+/// (`docs/guide/getting-started/install.md:22`). Read off the manifest so it cannot drift.
+const SELF_UPDATE_REPO: &str = env!("CARGO_PKG_REPOSITORY");
+
+/// `cyrup config`'s usage line (Pi `CONFIG_COMMAND_USAGE`, package-manager-cli.ts:92).
+const CONFIG_COMMAND_USAGE: &str = "cyrup config [-l] [--approve|--no-approve]";
+
+/// `cyrup config --help` (Pi `printConfigCommandHelp`, package-manager-cli.ts:94-107).
+///
+/// SEAM-079 — this had no counterpart at all: `-h`/`--help` fell through the flag scan and the
+/// interactive picker opened instead (in a pipeline, the `No configurable …` line and exit 0). The
+/// `config` verb is the one whose flags are least guessable, and it was the one that could not be
+/// asked.
+pub fn render_config_help() -> String {
+    const CFG: &str = ".cyrup";
+    format!(
+        "Usage:\n  {CONFIG_COMMAND_USAGE}\n\nOpen the resource configuration TUI to enable or disable skills, prompts and themes.\nWithout -l, starts in global settings (~/{CFG}/agent/settings.json).\nPress Tab in the TUI to switch between global and project-local modes.\n\nOptions:\n  -l, --local       Edit project overrides ({CFG}/settings.json)\n  -a, --approve     Trust project-local files for this command with -l\n  -na, --no-approve Ignore project-local files for this command with -l\n\nEach toggle writes a `+pattern` (load) or `-pattern` (unload) entry into the matching\nskills/prompts/themes array of the settings file for the active write scope.\n"
+    )
+}
+
+/// Pi's `printSelfUpdateUnavailable` (package-manager-cli.ts:424-436 @v0.83.0) with the one
+/// instruction that is true for this build.
+///
+/// SEAM-078 — the old line was `Self-update is not available in this build; update cyrup via your
+/// package manager.` printed on stdout with exit 0. There is no package manager for the only
+/// supported install path, so the remedy named nothing a user could run, and the exit code said the
+/// requested update had happened. Upstream prints to stderr, names a concrete route, echoes the
+/// executable's location, and sets `process.exitCode = 1` (`:428-435`, `:855`).
+fn self_update_unavailable() {
+    eprintln!("error: cyrup cannot self-update this installation.");
+    eprintln!("Update it with: cargo install --git {SELF_UPDATE_REPO} cyrup");
+    // `const entrypoint = process.argv[1]; if (entrypoint) { … }` (`:431-435`).
+    if let Ok(exe) = std::env::current_exe() {
+        eprintln!();
+        eprintln!("Location of cyrup executable: {}", exe.display());
     }
 }
 
@@ -347,6 +440,33 @@ pub async fn dispatch(
 ) -> Result<Option<i32>> {
     // `config` is handled specially (Pi `handleConfigCommand`).
     if argv.first().map(String::as_str) == Some("config") {
+        // `if (rest.includes("-h") || rest.includes("--help")) { printConfigCommandHelp(); return
+        // true; }` (package-manager-cli.ts:612-615) — FIRST, before any flag scan, so `config
+        // --help` never reaches the picker (SEAM-079).
+        let rest = &argv[1..];
+        if rest.iter().any(|a| a == "-h" || a == "--help") {
+            print!("{}", render_config_help());
+            return Ok(Some(0));
+        }
+        // The rest of upstream's scan (`:619-637`): every argument is either a known flag, an
+        // unknown option, or an unexpected positional — the last two are diagnostics with the
+        // config usage line and exit 1. Without them an unknown `config` flag was silently ignored
+        // and the picker opened anyway.
+        for arg in rest {
+            match arg.as_str() {
+                "-l" | "--local" | "-a" | "--approve" | "-na" | "--no-approve" => {}
+                other if other.starts_with('-') => {
+                    eprintln!("Unknown option {other} for \"config\".");
+                    eprintln!("Use \"cyrup --help\" or \"{CONFIG_COMMAND_USAGE}\".");
+                    return Ok(Some(1));
+                }
+                other => {
+                    eprintln!("Unexpected argument {other}.");
+                    eprintln!("Usage: {CONFIG_COMMAND_USAGE}");
+                    return Ok(Some(1));
+                }
+            }
+        }
         // Resolve trust the same way the other verbs do (Pi `createCommandSettingsManager`): the
         // `--approve`/`-a` override, else the saved decision for this folder. Project-scope toggles
         // require trust to persist (R-07-004).
@@ -403,6 +523,25 @@ pub async fn dispatch(
         return Ok(Some(1));
     }
 
+    // `cyrup update --models` (Pi package-manager-cli.ts:726-735): dispatched HERE — after the
+    // diagnostics, before the settings-manager/trust block at `:737-752` — because a catalog refresh
+    // touches no project resource and so must not be gated on project trust or pay for a settings
+    // load. Upstream's `catch` renders `Error: {message}` and sets exit 1 (`:729-733`).
+    if opts.command == PackageCommand::Update
+        && opts.update_target == Some(UpdateTargetSel::Models)
+    {
+        return Ok(Some(match crate::provider::refresh_model_catalogs(dirs).await {
+            Ok(()) => {
+                println!("Model catalogs refreshed");
+                0
+            }
+            Err(message) => {
+                eprintln!("Error: {message}");
+                1
+            }
+        }));
+    }
+
     // Saved-trust lookup + override (Pi createCommandSettingsManager); the interactive trust prompt
     // for trust-requiring project resources is the gated outer layer (residual ledger #19).
     let trust_override = opts.project_trust_override.or(cli_trust_override);
@@ -423,6 +562,11 @@ pub async fn dispatch(
 
 /// Execute a parsed command against the package manager rooted at the resolved dirs.
 async fn run(opts: &ParsedCommand, dirs: &ConfigDirs, trusted: bool) -> Result<i32> {
+    // CFG-054 — the package verbs are dispatched BEFORE `run_migrations` (main.rs:145-154), so the
+    // doubled-root repair has to be reachable from here too: otherwise the first command a user runs
+    // after upgrading (`cyrup list`, `cyrup update --extensions`) would work against the new layout
+    // while every already-installed tree still sat under the old one.
+    crate::migrations::migrate_packages_root(&dirs.package_dir);
     let store = PackageStore::new(dirs.package_dir.clone(), Some(dirs.cwd.clone()));
     let manager = PackageManager::new(store);
     let cancel = CancelToken::new();
@@ -444,13 +588,19 @@ async fn run(opts: &ParsedCommand, dirs: &ConfigDirs, trusted: bool) -> Result<i
         }
         PackageCommand::Remove => {
             let source = opts.source.clone().unwrap_or_default();
-            let id = PackageId::from(source.as_str());
-            match manager.remove(&id).await {
+            let mut removed = Err(());
+            for id in remove_candidate_ids(&source) {
+                if manager.remove(&id).await.is_ok() {
+                    removed = Ok(());
+                    break;
+                }
+            }
+            match removed {
                 Ok(()) => {
                     println!("Removed {source}");
                     Ok(0)
                 }
-                Err(_) => {
+                Err(()) => {
                     eprintln!("No matching package found for {source}");
                     Ok(1)
                 }
@@ -462,6 +612,39 @@ async fn run(opts: &ParsedCommand, dirs: &ConfigDirs, trusted: bool) -> Result<i
         }
         PackageCommand::Update => run_update(opts, &manager, cancel).await,
     }
+}
+
+/// The [`PackageId`]s a `remove`/`update <source>` argument may name, most-normalized first
+/// (CFG-055).
+///
+/// `install` records the id `PackageSource::parse(source).package_id()` produces —
+/// `git:<host>/<user>/<repo>` with the scheme, `git@`, trailing `/` and `.git` stripped, or
+/// `path:<canonical-abs-path>` (`cyrup-resources/src/package/source.rs:105-116`, `:175-188`). This
+/// used to key the lookup off `PackageId::from(<raw argument>)`, so every spelling that normalizes —
+/// an `https://` URL, an `scp`-style `git@host:u/r`, a relative path, a `.git` suffix — missed the
+/// row `install` had written: `cyrup remove` said `No matching package found` (or, for a `path:`
+/// row, silently left it in place) with no way for the user to learn the id, because `cyrup list`
+/// prints the source display and never the id.
+///
+/// Upstream matches on a NORMALIZED key too, and this is its shape: `packageSourcesMatch`
+/// (`package-manager.ts:1418-1422` @v0.83.0) compares `getSourceMatchKeyForSettings(existing)`
+/// against `getSourceMatchKeyForInput(input)` (`:1362-1383`), both of which reduce a git source to
+/// `git:<host>/<path>` and a local one to `local:<resolved>` before comparing — never the raw
+/// string. `update`'s positional target does the same through `getPackageIdentity(source)`
+/// (`:1051`).
+///
+/// The raw id is kept as a FALLBACK so a registry row written by an older build — whose id is
+/// whatever string was typed — is still removable.
+fn remove_candidate_ids(source: &str) -> Vec<PackageId> {
+    let mut ids = Vec::new();
+    if let Ok(parsed) = PackageSource::parse(source) {
+        ids.push(parsed.package_id());
+    }
+    let raw = PackageId::from(source);
+    if !ids.contains(&raw) {
+        ids.push(raw);
+    }
+    ids
 }
 
 /// `list`: User/Project-grouped, `(filtered)`-tagged, dim-installed-path block (Pi
@@ -517,8 +700,10 @@ fn print_list(manager: &PackageManager, dirs: &ConfigDirs) {
     }
 }
 
-/// `update`: the target matrix (Pi package-manager-cli.ts:705-763). The self/binary update is the
-/// deferred distribution tail (residual ledger #26): it reports rather than downloading.
+/// `update`: the target matrix (Pi package-manager-cli.ts:705-763), minus the `models` target, which
+/// [`dispatch`] answers before this is reached (upstream `:726-735`). The self/binary update is the
+/// deferred distribution tail (residual ledger #26): it reports failure rather than downloading
+/// (SEAM-078).
 async fn run_update(
     opts: &ParsedCommand,
     manager: &PackageManager,
@@ -531,6 +716,9 @@ async fn run_update(
     if opts.show_extensions_skipped_note {
         println!("Extensions are skipped. Run cyrup update --extensions to update extensions.");
     }
+    // `updateTargetIncludesExtensions`/`IncludesSelf` (package-manager-cli.ts:389-395): `Models` is
+    // in NEITHER, and never reaches here anyway — `dispatch` returns on it upstream at `:726-735`
+    // and here for the same reason.
     let includes_extensions = matches!(
         target,
         UpdateTargetSel::All | UpdateTargetSel::Extensions(_)
@@ -545,12 +733,25 @@ async fn run_update(
         };
         let report = match &update_source {
             Some(src) => {
-                manager
-                    .update(
-                        UpdateTarget::One(PackageId::from(src.as_str())),
-                        cancel.clone(),
-                    )
-                    .await?
+                // The same normalization `remove` uses (CFG-055): upstream keys this target off
+                // `getPackageIdentity(source)` (`package-manager.ts:1051`), not the raw argument,
+                // so `cyrup update https://github.com/u/r` matches the row `install git:…` wrote.
+                // The registry is walked once per candidate; the first id that matches anything
+                // wins, and the raw fallback keeps legacy rows updatable.
+                let mut report = None;
+                for id in remove_candidate_ids(src) {
+                    let r = manager.update(UpdateTarget::One(id), cancel.clone()).await?;
+                    let matched = !r.updated.is_empty()
+                        || !r.failed.is_empty()
+                        || !r.skipped_pinned.is_empty();
+                    if matched || report.is_none() {
+                        report = Some(r);
+                    }
+                    if matched {
+                        break;
+                    }
+                }
+                report.unwrap_or_default()
             }
             None => manager.update(UpdateTarget::All, cancel.clone()).await?,
         };
@@ -569,10 +770,12 @@ async fn run_update(
         }
     }
     if includes_self {
-        // The binary self-update (download + replace) is the deferred distribution tail; report.
-        println!(
-            "Self-update is not available in this build; update cyrup via your package manager."
-        );
+        // The binary self-update (download + replace) is the deferred distribution tail: it needs a
+        // cyrup release endpoint, which does not exist (`update_check.rs:14-23`). Upstream's own
+        // "this installation cannot self-update" branch is what that maps onto — stderr, a route
+        // the user can actually run, and exit 1 (SEAM-078).
+        self_update_unavailable();
+        code = 1;
     }
     Ok(code)
 }
@@ -1019,6 +1222,92 @@ mod tests {
         );
     }
 
+    /// `cyrup update --models` — the whole target, from the flag to the two conflict messages.
+    ///
+    /// RED before this pass: `--models` fell through to the `other if other.starts_with('-')` arm,
+    /// so the shipped binary answered `Unknown option --models for "update".` and exit 1 — there was
+    /// NO CLI route to refresh the model catalogs at all. Upstream has had one since
+    /// `package-manager-cli.ts:250-257` (the flag), `:329-337` (this matrix) and `:726-735` (the
+    /// dispatch) @v0.83.0.
+    #[test]
+    fn update_models_is_a_target_with_pis_two_conflict_messages() {
+        let models = parse_package_command(&v(&["update", "--models"])).unwrap();
+        assert_eq!(models.update_target, Some(UpdateTargetSel::Models));
+        assert!(models.invalid_option.is_none(), "--models is a known update flag");
+        assert!(models.conflicting_options.is_none());
+        // It is NOT the bare-update path, so pi's extensions-skipped note must stay silent.
+        assert!(!models.show_extensions_skipped_note);
+
+        // `:330-333` — combined with another target flag. (`--all` is checked EARLIER, at `:321`,
+        // and `conflictingOptions ??=` keeps the first message, so `--all --models` reports the
+        // `--all` sentence; that case is asserted below.)
+        for other in ["--self", "--extensions"] {
+            let c = parse_package_command(&v(&["update", "--models", other])).unwrap();
+            assert_eq!(
+                c.conflicting_options.as_deref(),
+                Some(
+                    "--models cannot be combined with --self, --extensions, --all, or --extension"
+                ),
+                "expected pi's --models conflict message for {other}"
+            );
+        }
+        let with_ext = parse_package_command(&v(&["update", "--models", "--extension", "p"])).unwrap();
+        assert!(with_ext.conflicting_options.is_some());
+
+        // `:334-336` — combined with a positional source.
+        let with_source = parse_package_command(&v(&["update", "--models", "pkg"])).unwrap();
+        assert_eq!(
+            with_source.conflicting_options.as_deref(),
+            Some("--models cannot be combined with a positional source")
+        );
+
+        // `--all`'s own message names `--models` too (`:322-323`).
+        let all_models = parse_package_command(&v(&["update", "--all", "--models"])).unwrap();
+        assert_eq!(
+            all_models.conflicting_options.as_deref(),
+            Some("--all cannot be combined with --self, --extensions, --models, or --extension")
+        );
+
+        // Not an `update` flag anywhere else (`:251-255`).
+        for verb in ["install", "remove", "list"] {
+            let c = parse_package_command(&v(&[verb, "--models"])).unwrap();
+            assert_eq!(c.invalid_option.as_deref(), Some("--models"));
+        }
+
+        // …and it is advertised in both the usage line and the help body (`:86`, `:159`, `:169`).
+        assert!(usage(PackageCommand::Update).contains("--models"));
+        let help = render_command_help(PackageCommand::Update);
+        assert!(help.contains("--models                Refresh model catalogs only"));
+        assert!(help.contains("cyrup update --models"));
+    }
+
+    /// `--models` never reaches the package/self update body: upstream returns from `dispatch` at
+    /// `package-manager-cli.ts:726-735`, before the settings manager is even built, and
+    /// `updateTargetIncludesSelf`/`IncludesExtensions` (`:389-395`) exclude it on both sides. Were
+    /// the arm to fall through, a `cyrup update --models` would print the self-update stub.
+    ///
+    /// The refresh itself is driven end to end — force flag, 15s bound, error report — against a
+    /// loopback origin in `tests/catalog_refresh_modes.rs`; it must not be exercised from here,
+    /// because the real `refresh_model_catalogs` resolves its provider set from the process
+    /// environment (`AuthStore::has_auth(id, None)`), so a developer with `ANTHROPIC_API_KEY` set
+    /// would have this test issue live requests to `https://pi.dev`.
+    #[test]
+    fn update_models_is_neither_a_self_nor_an_extensions_target() {
+        let target = parse_package_command(&v(&["update", "--models"]))
+            .unwrap()
+            .update_target
+            .unwrap();
+        assert_eq!(target, UpdateTargetSel::Models);
+        assert!(!matches!(
+            target,
+            UpdateTargetSel::All | UpdateTargetSel::SelfUpdate
+        ));
+        assert!(!matches!(
+            target,
+            UpdateTargetSel::All | UpdateTargetSel::Extensions(_)
+        ));
+    }
+
     #[test]
     fn update_conflict_and_missing_value_diagnostics() {
         let conflict = parse_package_command(&v(&["update", "--all", "--self"])).unwrap();
@@ -1045,6 +1334,185 @@ mod tests {
         assert!(render_command_help(PackageCommand::Install).contains("Install a package"));
         assert!(render_command_help(PackageCommand::Update).contains("--extension <source>"));
         assert!(usage(PackageCommand::Install).contains("install <source>"));
+    }
+
+    /// SEAM-076 — the `install`/`remove` help described a write this port does not make. cyrup's
+    /// installer writes ONE file, the package registry (`lock::save(&reg_path, &reg)`,
+    /// `cyrup-resources/src/package/install.rs:152-158`); `SettingsManager` is reached only by
+    /// `cyrup config`. The help said "settings" because that is where pi writes
+    /// (`addSourceToSettings`, `package-manager.ts:817-841` @v0.83.0) — the mechanism divergence is
+    /// deliberate (`cyrup-session-svc/src/builder.rs:936-945`), the text was simply stale, and a
+    /// user who followed it into `settings.json` could add a `packages` entry through a SECOND,
+    /// additive channel and end up with a duplicate.
+    ///
+    /// SEAM-077 — the remove help's ONLY two examples were `npm:` sources (pi's, `:145-146`), and
+    /// `PackageSource::parse` hard-rejects that prefix (`source.rs:79-81`), so neither could name
+    /// anything installable. Assert presence (a working example) before absence (`npm:`).
+    #[test]
+    fn install_and_remove_help_name_the_registry_and_only_installable_examples() {
+        let install = render_command_help(PackageCommand::Install);
+        let remove = render_command_help(PackageCommand::Remove);
+
+        assert!(install.contains("record it in the package registry"));
+        assert!(remove.contains("from the package registry"));
+        assert!(install.contains("packages.json"), "the -l flag names the file it writes");
+        assert!(remove.contains("packages.json"));
+        for (name, text) in [("install", &install), ("remove", &remove)] {
+            assert!(
+                !text.contains("settings"),
+                "{name} help must not claim a settings write it never makes: {text}"
+            );
+        }
+
+        // Every example the remove help shows must be a source `parse` accepts…
+        let examples: Vec<&str> = remove
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("cyrup remove "))
+            .chain(remove.lines().filter_map(|l| l.trim().strip_prefix("cyrup uninstall ")))
+            .collect();
+        assert!(!examples.is_empty(), "the remove help must keep working examples");
+        for example in &examples {
+            assert!(
+                PackageSource::parse(example).is_ok(),
+                "remove help example {example:?} is rejected by PackageSource::parse"
+            );
+        }
+        // …which is exactly what `npm:` is not.
+        assert!(!remove.contains("npm:"), "npm sources cannot be installed, so they cannot be removed");
+    }
+
+    /// SEAM-078 — `--self`, `--all`, `--force` and the bare/`pi` short forms all land on the
+    /// self-update stub, so the help may not present them as functional, and the stub itself must
+    /// name a route that WORKS. The old text pointed at "your package manager", which does not exist
+    /// for the only supported install path (`cargo install --git …`), and the command exited 0 as if
+    /// the update had happened.
+    ///
+    /// Pi's shape for an installation it cannot update in place is `printSelfUpdateUnavailable`
+    /// (`package-manager-cli.ts:424-436`): stderr, a concrete instruction, the executable's
+    /// location, and `process.exitCode = 1` (`:855`).
+    #[tokio::test]
+    async fn self_update_is_advertised_as_unavailable_and_exits_nonzero() {
+        let help = render_command_help(PackageCommand::Update);
+        assert!(help.contains("Self-update is unavailable in this build"));
+        assert!(
+            help.contains(&format!("cargo install --git {SELF_UPDATE_REPO} cyrup")),
+            "the help must name the route that works: {help}"
+        );
+        assert!(!help.contains("package manager"), "there is no package manager for this build");
+        for flag in ["--self ", "--all ", "--force "] {
+            let line = help
+                .lines()
+                .find(|l| l.trim_start().starts_with(flag.trim_end()))
+                .unwrap_or_else(|| panic!("no help line for {flag}"));
+            assert!(
+                line.contains("UNAVAILABLE"),
+                "{flag} is documented as functional over a stub: {line}"
+            );
+        }
+
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        // Every self-reaching spelling reports failure rather than a silent success.
+        for args in [
+            vec!["update"],
+            vec!["update", "--self"],
+            vec!["update", "self"],
+            vec!["update", "pi"],
+        ] {
+            assert_eq!(
+                dispatch(&v(&args), &d, None).await.unwrap(),
+                Some(1),
+                "{args:?} did nothing but exited 0"
+            );
+        }
+    }
+
+    /// SEAM-079 — `cyrup config --help` ran the interactive picker: the flag fell through the scan
+    /// (there was none) and, in a pipeline, printed `No configurable skills, prompts, or themes
+    /// found.` and exited 0, which reads as success.
+    ///
+    /// Upstream handles `-h`/`--help` FIRST (`package-manager-cli.ts:612-615`), before the flag scan
+    /// (`:619-637`) and before the trust guard (`:648-652`) — which is what this test's `-l` case
+    /// pins: with `-l` and no saved trust, the pre-fix path reached the guard and exited 1, so the
+    /// help branch running first is directly observable.
+    #[tokio::test]
+    async fn config_help_prints_usage_instead_of_opening_the_picker() {
+        let help = render_config_help();
+        assert!(help.starts_with("Usage:\n  cyrup config [-l] [--approve|--no-approve]"));
+        // The three flags a user cannot otherwise discover, plus the marker convention the toggles
+        // write (`config-selector.ts:471-480`).
+        assert!(help.contains("-l, --local"));
+        assert!(help.contains("--approve"));
+        assert!(help.contains("--no-approve"));
+        assert!(help.contains("+pattern"));
+        assert!(help.contains("-pattern"));
+
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        assert_eq!(dispatch(&v(&["config", "--help"]), &d, None).await.unwrap(), Some(0));
+        assert_eq!(dispatch(&v(&["config", "-h"]), &d, None).await.unwrap(), Some(0));
+        // `--help` wins over the untrusted-project guard, i.e. it is checked first (`:612` < `:648`).
+        assert_eq!(
+            dispatch(&v(&["config", "-l", "--help"]), &d, None).await.unwrap(),
+            Some(0),
+            "help must be answered before the trust guard"
+        );
+        assert_eq!(
+            dispatch(&v(&["config", "-l"]), &d, None).await.unwrap(),
+            Some(1),
+            "…and without --help the guard still fires (the discriminator for the assertion above)"
+        );
+
+        // The rest of upstream's scan (`:626-636`): an unknown option and an unexpected positional
+        // are diagnostics, not silently-ignored arguments.
+        assert_eq!(dispatch(&v(&["config", "--bogus"]), &d, None).await.unwrap(), Some(1));
+        assert_eq!(dispatch(&v(&["config", "skills"]), &d, None).await.unwrap(), Some(1));
+    }
+
+    /// CFG-055 — `remove`/`update <source>` must key off the id `install` STORED, not the string the
+    /// user typed. Upstream compares normalized match keys on both sides
+    /// (`packageSourcesMatch` → `getSourceMatchKeyForInput`, `package-manager.ts:1362-1383`,
+    /// `:1418-1422` @v0.83.0), so an https URL removes a package recorded from an scp-style remote.
+    #[test]
+    fn remove_matches_the_normalized_id_install_wrote_with_a_raw_fallback() {
+        let installed = |source: &str| PackageSource::parse(source).unwrap().package_id();
+        // Every accepted spelling of one repository resolves to the id `install` records…
+        let canonical = installed("git:github.com/user/repo");
+        for spelling in [
+            "https://github.com/user/repo",
+            "https://github.com/user/repo.git",
+            "ssh://git@github.com/user/repo",
+            "git:git@github.com:user/repo",
+            "git:github.com/user/repo/",
+        ] {
+            assert_eq!(
+                installed(spelling),
+                canonical,
+                "{spelling} installs as a different id than git:github.com/user/repo"
+            );
+            assert!(
+                remove_candidate_ids(spelling).contains(&canonical),
+                "remove {spelling} would never reach the row install wrote"
+            );
+            // The pre-fix behaviour, kept only as a FALLBACK for rows an older build wrote.
+            assert!(remove_candidate_ids(spelling).contains(&PackageId::from(spelling)));
+            assert_eq!(
+                remove_candidate_ids(spelling).first(),
+                Some(&canonical),
+                "the normalized id must be tried first"
+            );
+        }
+        // A relative path install records `path:<canonical-abs>`; the raw string never matched it.
+        let tmp = tempfile::tempdir().unwrap();
+        let pkg = tmp.path().join("pkg");
+        std::fs::create_dir_all(&pkg).unwrap();
+        let rel = pkg.to_string_lossy().to_string();
+        assert_eq!(remove_candidate_ids(&rel).first(), Some(&installed(&rel)));
+        assert_ne!(
+            remove_candidate_ids(&rel).first(),
+            Some(&PackageId::from(rel.as_str())),
+            "a path id is canonicalized, so the raw argument cannot be the primary key"
+        );
     }
 
     #[test]

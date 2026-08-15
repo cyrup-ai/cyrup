@@ -6192,14 +6192,20 @@ impl SubagentToolParams {
 /// `ParallelTaskSchema` (`schemas.ts:133-152`).
 ///
 /// Fields with a [`SingleStepSpec`] home reach the child today: `agent`/`task`/`cwd`/`model`/
-/// `as`(named output)/`outputMode`/`reads`/`acceptance`/`outputSchema`, plus `count` (a fan-out
-/// WIDTH multiplier applied by expansion, never a per-step spec field). `output` (the output FILE
-/// path) is parsed because it drives duplicate-output-path rejection (pi
-/// `findDuplicateParallelOutputPath`), even though the file-output HANDOFF itself is Tier-2 plumbing
-/// (`exec/output.rs`, `output_path` currently unset); `progress`/`skill`/`phase`/`label` are parsed
-/// (so the shape is accepted) but not yet plumbed to the child (Tier 4/5) — see this task's own gap
-/// note. `#[serde(default)]` on every optional field keeps parsing permissive, matching pi's
-/// TypeBox `Type.Optional` shape.
+/// `skill`/`as`(named output)/`output`/`outputMode`/`reads`/`acceptance`/`outputSchema`, plus
+/// `count` (a fan-out WIDTH multiplier applied by expansion, never a per-step spec field).
+/// `output` doubles as the input to duplicate-output-path rejection (pi
+/// `findDuplicateParallelOutputPath`) and as the step's `output_path`.
+///
+/// `skill` joined that list with the SUBA-N03-shaped fix in [`tool_task_to_spec`] — it had been
+/// parsed and then hardcoded away, which is why the note here used to group it with the genuinely
+/// unplumbed fields. `progress`/`phase`/`label` remain parsed (so the shape is accepted) but have
+/// no [`SingleStepSpec`] home yet: pi carries `progress` as a per-step behaviour override
+/// (`subagent-executor.ts:3176`) and `phase`/`label` as status/graph render labels
+/// (`schemas.ts:136-137` @v0.43.0), and neither has a field on this port's step spec to land on.
+///
+/// `#[serde(default)]` on every optional field keeps parsing permissive, matching pi's TypeBox
+/// `Type.Optional` shape.
 #[derive(Clone, Debug, Default, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ToolTaskItem {
@@ -6236,8 +6242,9 @@ struct ToolTaskItem {
 
 impl ToolTaskItem {
     /// Read every parsed field at least once so the workspace `dead_code` lint (under `-D warnings`)
-    /// stays satisfied for the fields not yet plumbed to the child (`progress`/`skill`/`phase`/
-    /// `label`) — the same self-documenting pattern [`SubagentToolParams::provided_keys`] uses.
+    /// stays satisfied for the fields not yet plumbed to the child (`progress`/`phase`/`label` —
+    /// `skill` is now threaded by [`tool_task_to_spec`] and no longer needs this to stay live)
+    /// — the same self-documenting pattern [`SubagentToolParams::provided_keys`] uses.
     /// Returns the per-item keys actually supplied, for diagnostics.
     fn provided_keys(&self) -> Vec<&'static str> {
         let mut keys = vec!["agent"];
@@ -6367,7 +6374,30 @@ fn tool_output_path_string(output: Option<&serde_json::Value>) -> Option<String>
 /// `ExecSingleStepExecutor::run_single`'s `model_override`), exactly as the slash `[model=…]` path.
 fn tool_task_to_spec(item: &ToolTaskItem) -> SingleStepSpec {
     SingleStepSpec {
-        skills: None,
+        // SUBA-N03 shape, third path: pi's `ParallelTaskSchema` advertises `skill`
+        // (`extension/schemas.ts:146` @v0.43.0, the same `SkillOverride` the top-level `skill`
+        // param uses) and HONOURS it — `const skillOverrides = params.tasks.map((task) =>
+        // normalizeSkillInput(task.skill))` feeds the per-task step override at
+        // `runs/foreground/subagent-executor.ts:2399,2404` (the `runInBackground` lowering) and
+        // again at `:3169-3170,:3177` (`...(skillOverrides[index] !== undefined ? { skills:
+        // skillOverrides[index] } : {})`, the foreground parallel lowering).
+        //
+        // This was hardcoded `None`, so every `tasks[]` element's `skill` — and every
+        // `chain[].parallel[]` element's — was deserialized into `ToolTaskItem::skill`, counted by
+        // `ToolTaskItem::provided_keys`, and then dropped on the floor: the child ran with its
+        // persona's own `skills:` list no matter what the call asked for, and `skill: false` (pi's
+        // "no skills at all" form) could not turn them off. Exactly the advertised-and-silently-
+        // dropped defect SUBA-041/SUBA-N03 exist to remove, surviving on a third path.
+        //
+        // `normalize_skill_input` is the SAME normalization the SINGLE path uses (pi's own
+        // `normalizeSkillInput`), so the tri-state survives intact: `None` = omitted, inherit the
+        // persona's `skills:`; `Some(vec![])` = explicit `skill: false`, no skills; `Some(names)` =
+        // replace the persona's list. `SingleStepSpec::skills` is read on BOTH outcomes — the
+        // foreground walk (`extension.rs` graph lowering) and the detached hop-2 runner
+        // (`background/runner_main.rs:2549`) — and lands on `RunOptions::skills`, whose
+        // `opts.skills ?? agent.skills` fallthrough (`exec/mod.rs:3650`, pi `execution.ts:1413`)
+        // is what makes the empty list mean "none" rather than "unset".
+        skills: normalize_skill_input(item.skill.as_ref()),
         session_dir: None,
         agent: item.agent.clone(),
         task: item.task.clone().unwrap_or_default(),
@@ -13366,6 +13396,55 @@ mod tests {
         assert_eq!(parse_tool_acceptance(None), None);
         assert_eq!(parse_tool_acceptance(Some(&serde_json::Value::Null)), None);
         assert_eq!(parse_tool_acceptance(Some(&serde_json::json!(""))), None);
+    }
+
+    /// SUBA-N03 shape, third path: a `tasks[]` / `chain[].parallel[]` item's advertised `skill`
+    /// reaches its [`SingleStepSpec`], in every one of pi's three states.
+    ///
+    /// pi advertises `skill` on `ParallelTaskSchema` (`extension/schemas.ts:146` @v0.43.0) and
+    /// honours it — `params.tasks.map((task) => normalizeSkillInput(task.skill))` feeds the
+    /// per-task step override at `runs/foreground/subagent-executor.ts:2399,2404` and again at
+    /// `:3169-3170,:3177`. `tool_task_to_spec` hardcoded `skills: None`, so the field was
+    /// deserialized, counted by `provided_keys`, and then dropped: the child ran with its persona's
+    /// own `skills:` regardless, and `skill: false` could not switch them off.
+    ///
+    /// The tri-state is the whole point, so all three states are asserted — and PRESENCE first:
+    /// a fix that mapped every input to `Some(vec![])` would silence a persona's skills everywhere
+    /// and still pass a `skill: false`-only test.
+    #[test]
+    fn a_tasks_item_carries_its_skill_override_onto_its_step_spec() {
+        let spec_for = |skill: serde_json::Value| {
+            let mut obj = serde_json::json!({ "agent": "builder", "task": "fix it" });
+            obj.as_object_mut().expect("object").insert("skill".to_string(), skill);
+            let item: ToolTaskItem =
+                serde_json::from_value(obj).expect("a well-formed tasks[] item");
+            tool_task_to_spec(&item).skills
+        };
+
+        // PRESENCE: an explicit list replaces the persona's own `skills:` (pi `Some(names)`).
+        assert_eq!(
+            spec_for(serde_json::json!(["rust", "testing"])),
+            Some(vec!["rust".to_string(), "testing".to_string()]),
+            "an explicit per-task skill list must reach the step spec"
+        );
+        // pi's comma-string form normalizes identically on this path, via `normalize_skill_input`.
+        assert_eq!(
+            spec_for(serde_json::json!("rust, testing")),
+            Some(vec!["rust".to_string(), "testing".to_string()])
+        );
+        // ABSENCE: `skill: false` is pi's explicit "no skills at all" — an EMPTY list, which is
+        // what `opts.skills ?? agent.skills` needs to see to suppress the persona's own list.
+        assert_eq!(
+            spec_for(serde_json::json!(false)),
+            Some(Vec::new()),
+            "`skill: false` must be the explicit empty list, not `None`"
+        );
+        // Omitted stays `None` — "no override, inherit the persona's `skills:`". Distinct from the
+        // empty list above; collapsing the two would break the fallthrough in the other direction.
+        let omitted: ToolTaskItem =
+            serde_json::from_value(serde_json::json!({ "agent": "builder", "task": "fix it" }))
+                .expect("a well-formed tasks[] item");
+        assert_eq!(tool_task_to_spec(&omitted).skills, None);
     }
 
     /// SUBA-N04: pi `validateExecutionAcceptance` (`runs/shared/acceptance.ts:288-310` @v0.34.0)

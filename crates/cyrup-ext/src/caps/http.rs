@@ -274,12 +274,24 @@ impl HttpCaps {
     /// pi's `httpProxy` / the ambient `HTTP_PROXY`-family variables select one for this target
     /// (PROV-047).
     ///
-    /// A malformed proxy setting is a WARNING and falls back to the direct client rather than
-    /// failing the guest's request: upstream a bad proxy URL surfaces at connect time as an
-    /// ordinary transport failure of that one request, and the wire APIs' own resolver already
-    /// reports the typed error on the provider path — refusing every extension HTTP call because
-    /// of an unrelated setting would be a strictly larger blast radius than upstream has.
-    async fn client_for(&self, url: &str) -> reqwest::Client {
+    /// A proxy the resolver REFUSES (a SOCKS/PAC `httpProxy`, an unparseable proxy URL —
+    /// `node-http-proxy.ts:89`/`:102-108`) fails this one request instead of quietly connecting
+    /// direct.
+    ///
+    /// CYRUP-DELTA — pi has no decision to make here and cyrup does. Upstream, extension `fetch`
+    /// runs on the GLOBAL `EnvHttpProxyAgent` (`coding-agent/src/core/http-dispatcher.ts:79-105`
+    /// @v0.83.0), whose `ProxyAgent` handles `socks5:`/`socks:` itself
+    /// (`undici/lib/dispatcher/proxy-agent.js:143,167`) — so a SOCKS `httpProxy` upstream is
+    /// PROXIED, and upstream never sends this request direct under any proxy setting. cyrup's
+    /// ported resolver rejects SOCKS by design (`node-http-proxy.ts:89`, ported verbatim as
+    /// [`cyrup_provider::UNSUPPORTED_PROXY_PROTOCOL_MESSAGE`]), so it cannot reproduce the tunnel.
+    /// Of the two remaining options, erroring is the one closer to upstream: a direct connection is
+    /// egress the operator explicitly told us to route through a proxy, made without announcing
+    /// itself, on a path where every other cyrup egress path (provider streams, OAuth, catalog
+    /// refresh — all of which surface the resolver's typed error through
+    /// `build_client_for_target`) already refuses. A warning in a log the guest never sees is not
+    /// an announcement.
+    async fn client_for(&self, url: &str) -> Result<reqwest::Client, String> {
         let resolved = cyrup_provider::utils::node_http_proxy::resolve_http_proxy_url_for_target(
             url,
             &cyrup_provider::auth::types::EnvAuthContext,
@@ -288,37 +300,33 @@ impl HttpCaps {
         .await;
         let proxy_url = match resolved {
             Ok(Some(u)) => u,
-            Ok(None) => return self.client.clone(),
-            Err(e) => {
-                tracing::warn!(error = %e, "ignoring proxy setting for extension HTTP request");
-                return self.client.clone();
-            }
+            Ok(None) => return Ok(self.client.clone()),
+            Err(e) => return Err(e.to_string()),
         };
         self.client_through(&proxy_url)
     }
 
     /// The cached client that routes through `proxy_url`, building it on first use. Split out of
-    /// [`Self::client_for`] so the cache and the fallback are testable without mutating the
+    /// [`Self::client_for`] so the cache and the failure arm are testable without mutating the
     /// PROCESS-GLOBAL proxy setting — doing that from a unit test would race every other HTTP test
     /// in this crate, which talks to local mock servers a proxy would swallow.
-    fn client_through(&self, proxy_url: &reqwest::Url) -> reqwest::Client {
+    ///
+    /// A build failure errors for the same reason [`Self::client_for`] does: the resolver said this
+    /// request belongs on a proxy, so the alternative is unannounced direct egress.
+    fn client_through(&self, proxy_url: &reqwest::Url) -> Result<reqwest::Client, String> {
         let key = proxy_url.to_string();
         if let Ok(guard) = self.proxied.lock()
             && let Some(c) = guard.get(&key)
         {
-            return c.clone();
+            return Ok(c.clone());
         }
         let built = reqwest::Proxy::all(proxy_url.clone())
             .and_then(|p| client_builder().proxy(p).build())
-            .map_err(|e| {
-                tracing::warn!(error = %e, "proxy client build failed; using a direct connection");
-            })
-            .ok();
-        let Some(built) = built else { return self.client.clone() };
+            .map_err(|e| format!("could not build a client for the configured proxy {key}: {e}"))?;
         if let Ok(mut guard) = self.proxied.lock() {
             guard.insert(key, built.clone());
         }
-        built
+        Ok(built)
     }
 
     fn build_request(
@@ -397,7 +405,7 @@ impl HttpCaps {
             // reqwest's own request-level timeout doubling up with the outer `tokio::time::timeout`
             // above is intentional, redundant-but-harmless belt-and-suspenders — see
             // [`Self::build_request`]'s doc for why [`Self::request_stream`] below must NOT do this.
-            let client = self.client_for(req.url.as_str()).await;
+            let client = self.client_for(req.url.as_str()).await?;
             let resp =
                 self.build_request(&client, req, true)?.send().await.map_err(|e| e.to_string())?;
             let status = resp.status().as_u16();
@@ -464,7 +472,7 @@ impl HttpCaps {
         // request-level timeout, which would keep running as a TOTAL-request timer and silently kill
         // the long-lived body stream this function hands back, contradicting this function's own
         // documented contract (see [`Self::build_request`]'s doc for the full `reqwest` internals).
-        let client = self.client_for(req.url.as_str()).await;
+        let client = self.client_for(req.url.as_str()).await?;
         let resp =
             tokio::time::timeout(effective_timeout, self.build_request(&client, req, false)?.send())
             .await
@@ -1538,7 +1546,7 @@ mod tests {
         // No proxy configured and none in the ambient env for this target ⇒ the direct client.
         // (`cyrup_provider::stream::sse::configure_http_proxy` is untouched by this test, so the
         // resolver falls through to the ambient environment, which carries no proxy in CI.)
-        let direct = caps.client_for("https://example.invalid/x").await;
+        let direct = caps.client_for("https://example.invalid/x").await.expect("no proxy resolves");
         assert!(
             caps.proxied.lock().expect("cache lock").is_empty(),
             "the no-proxy path must not populate the per-proxy cache"
@@ -1548,13 +1556,13 @@ mod tests {
         // A resolved proxy takes the other branch: a client built through `client_builder()` (so
         // the no-auto-decompression contract still holds) and memoized under the proxy URL.
         let proxy = reqwest::Url::parse("http://proxy.internal:3128").expect("proxy url");
-        let first = caps.client_through(&proxy);
+        let first = caps.client_through(&proxy).expect("an http proxy builds");
         assert_eq!(
             caps.proxied.lock().expect("cache lock").len(),
             1,
             "the proxied client must be cached under its proxy URL"
         );
-        let _second = caps.client_through(&proxy);
+        let _second = caps.client_through(&proxy).expect("an http proxy builds");
         assert_eq!(
             caps.proxied.lock().expect("cache lock").len(),
             1,
@@ -1563,9 +1571,57 @@ mod tests {
 
         // A second, different proxy gets its own entry — the cache is keyed, not a single slot.
         let other = reqwest::Url::parse("http://other.internal:8080").expect("proxy url");
-        let _third = caps.client_through(&other);
+        let _third = caps.client_through(&other).expect("an http proxy builds");
         assert_eq!(caps.proxied.lock().expect("cache lock").len(), 2);
         drop(first);
+    }
+
+    /// PROV-047 — a proxy setting the resolver REFUSES must fail the guest's request, never fall
+    /// through to a direct connection.
+    ///
+    /// BEFORE: `client_for` logged `tracing::warn!("ignoring proxy setting for extension HTTP
+    /// request")` and returned the DIRECT client. An operator who set `httpProxy` to a SOCKS URL
+    /// (the resolver's one refusal, `node-http-proxy.ts:89`) got extension HTTP that silently
+    /// egressed straight past the proxy their network policy exists to enforce, while every other
+    /// egress path in the process — provider streams, OAuth, catalog refresh, all on
+    /// `build_client_for_target` — refused the same setting outright. Upstream never connects
+    /// direct here either: extension `fetch` runs on the global `EnvHttpProxyAgent`, whose
+    /// `ProxyAgent` tunnels `socks5:` itself (`undici/lib/dispatcher/proxy-agent.js:143,167`).
+    ///
+    /// The setting is process-global, so this test both sets and clears it; the clear is in `Drop`
+    /// so a failing assertion cannot leak it into the loopback tests around it.
+    #[tokio::test]
+    async fn a_proxy_the_resolver_refuses_fails_the_request_instead_of_connecting_directly() {
+        struct ClearOnDrop;
+        impl Drop for ClearOnDrop {
+            fn drop(&mut self) {
+                cyrup_provider::configure_http_proxy(None);
+            }
+        }
+
+        let caps = HttpCaps::new();
+        let _restore = ClearOnDrop;
+        cyrup_provider::configure_http_proxy(Some("socks5://127.0.0.1:1080".to_string()));
+
+        let err = caps
+            .client_for("https://example.invalid/x")
+            .await
+            .expect_err("a SOCKS httpProxy must fail the request, not silently go direct");
+        assert!(
+            err.contains(cyrup_provider::UNSUPPORTED_PROXY_PROTOCOL_MESSAGE),
+            "the guest must be told WHICH setting refused it, got {err:?}"
+        );
+        assert!(
+            caps.proxied.lock().expect("cache lock").is_empty(),
+            "a refused proxy must not be cached"
+        );
+
+        // The same call with the setting cleared resolves to the direct client again — so the
+        // refusal above is the SETTING's doing, not this URL's.
+        cyrup_provider::configure_http_proxy(None);
+        caps.client_for("https://example.invalid/x")
+            .await
+            .expect("with no proxy configured the direct client is handed back");
     }
 
     /// `Accept-Encoding` defaults must match real `fetch()`'s request-header algorithm exactly

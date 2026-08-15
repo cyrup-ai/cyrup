@@ -1832,16 +1832,25 @@ fn resolve_model(
 
     // 4. Thinking level: explicit option → restored from session → settings default; clamped to the
     //    chosen model's supported levels (Pi sdk.ts:223-242).
+    //    CFG-056: `getDefaultThinkingLevel()` returns `ThinkingLevel | undefined` upstream
+    //    (settings-manager.ts:740-742) and each of Pi's sites names the fallback explicitly —
+    //    `settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL` (sdk.ts:230, :235).
+    //    `DEFAULT_THINKING_LEVEL` is `"medium"` (core/defaults.ts:3), NOT the type's `Off` zero.
+    let settings_default = || {
+        settings
+            .effective()
+            .default_thinking_level()
+            .unwrap_or(cyrup_config::DEFAULT_THINKING_LEVEL)
+    };
     let mut thinking = cfg.thinking_level.or(parsed_thinking);
     if thinking.is_none() && has_existing_session {
         thinking = Some(if has_thinking_entry {
-            thinking_level_from_str(&existing.thinking_level)
-                .unwrap_or_else(|| settings.effective().default_thinking_level())
+            thinking_level_from_str(&existing.thinking_level).unwrap_or_else(settings_default)
         } else {
-            settings.effective().default_thinking_level()
+            settings_default()
         });
     }
-    let thinking = thinking.unwrap_or_else(|| settings.effective().default_thinking_level());
+    let thinking = thinking.unwrap_or_else(settings_default);
     // Pi sdk.ts:238-242: `if (!model) { thinkingLevel = "off"; } else { thinkingLevel =
     // clampThinkingLevel(model, thinkingLevel); }` — a modelless session has nothing to clamp
     // against, so the level is forced off rather than carried from settings.

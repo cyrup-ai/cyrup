@@ -259,3 +259,30 @@ async fn a_follow_up_queued_during_compaction_uses_the_follow_up_label() {
     let s = screen(&app);
     assert!(s.contains("Follow-up: LATER"), "follow-up mode must use pi's label:\n{s}");
 }
+
+/// The hint is `getAppKeyDisplay("app.message.dequeue")` (`interactive-mode.ts:3987`), i.e. resolved
+/// from the LIVE keymap on every repaint — so a user who rebinds the action is told the key they
+/// actually have.
+///
+/// The stock-chord assertion above cannot see this: it stays green against a hardcoded `"Alt+Up"`.
+/// This drives the rebind through the real `keybindings.json` seam and asserts on painted cells.
+#[test]
+fn the_dequeue_hint_follows_a_rebind_of_app_message_dequeue() {
+    let mut app = new_app();
+    let issues = app
+        .load_keybindings_json(r#"{ "app.message.dequeue": "ctrl+g" }"#)
+        .expect("a one-key rebind must load");
+    assert!(issues.is_empty(), "the fixture must be a clean rebind, not a diagnostic: {issues:?}");
+
+    queued(&mut app, &["ALPHA"], &[]);
+    app.draw().unwrap();
+    let s = screen(&app);
+    assert!(
+        s.contains("↳ Ctrl+G to edit all queued messages"),
+        "the hint must name the REBOUND key — a hardcoded chord would still read Alt+Up here:\n{s}"
+    );
+    assert!(
+        !s.contains("Alt+Up") && !s.contains("Option+Up"),
+        "…and must not also advertise the default it no longer has:\n{s}"
+    );
+}

@@ -198,6 +198,93 @@ pub fn spawn_model_catalog_refresh_with(
     }))
 }
 
+/// The 15-second budget `cyrup update --models` gives the whole refresh (Pi
+/// `refreshModelCatalogs`'s `setTimeout(() => controller.abort(), 15_000)`,
+/// `packages/coding-agent/src/package-manager-cli.ts:404`).
+const MODELS_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// **`cyrup update --models`** — the FOREGROUND, forced catalog refresh (Pi `refreshModelCatalogs`,
+/// `packages/coding-agent/src/package-manager-cli.ts:397-423` @v0.83.0, dispatched from `:726-735`).
+///
+/// This is the only entry point that is neither of the two background triggers
+/// ([`restore_model_catalog`], [`spawn_model_catalog_refresh`]): the user asked for it, so it is
+/// awaited, it bypasses the 4h freshness window (`force: true`, `:409` ⇒
+/// [`RefreshOptions::forced`]), and — unlike the fire-and-forget path — every per-provider error is
+/// REPORTED rather than swallowed (`:414-417`).
+///
+/// Three upstream details are load-bearing:
+///
+/// - **The whole refresh is bounded** by one 15s abort (`:403-404`), not a per-request timeout, and
+///   an abort is an ERROR (`Model catalog refresh timed out.`, `:411-413`) rather than a silent
+///   partial success.
+/// - **Only providers with a resolvable credential are fetched.** Upstream never fans out over every
+///   built-in: `Models.refresh` bails per provider at `packages/ai/src/models.ts:296` (`if
+///   (!credential) return;`), so a fresh install with no `auth.json` issues zero requests and still
+///   succeeds. Same predicate as `main.rs`'s background trigger — [`cyrup_config::AuthStore`].
+/// - **No offline gate.** `refreshModelCatalogs` passes `allowNetwork: true` unconditionally
+///   (`:407`) and `Models.refresh` has no `isOfflineModeEnabled()` check — that check exists only on
+///   the PACKAGE update path (`package-manager.ts:1080`). An explicit `cyrup update --models` is a
+///   request for the network, so [`NetworkPolicy`] is deliberately not consulted here.
+///
+/// The refreshed catalogs land in `<agent_dir>/models-store.json`, which is what
+/// [`restore_model_catalog`] reads on every later run — including offline ones.
+///
+/// Returns `Err(message)` with the string the caller renders as pi's `Error: {message}`.
+pub async fn refresh_model_catalogs(dirs: &cyrup_config::ConfigDirs) -> Result<(), String> {
+    let auth = cyrup_config::AuthStore::at(dirs.agent_dir.join("auth.json"));
+    let configured: Vec<String> = cyrup_provider::all_providers()
+        .iter()
+        .filter(|p| auth.has_auth(p.id(), None))
+        .map(|p| p.id().as_str().to_string())
+        .collect();
+    refresh_model_catalogs_with(remote_catalog(dirs), configured).await
+}
+
+/// [`refresh_model_catalogs`] over an injected [`RemoteCatalog`] and provider set — the same
+/// transport seam [`spawn_model_catalog_refresh_with`] exposes, and for the same reason: the base URL
+/// is the only place this subsystem can be redirected (Pi's `catalogBaseUrl`), so the force flag, the
+/// 15s bound and the error report can be proven against a loopback listener instead of
+/// `https://pi.dev`. The credential-gated provider list is resolved by the caller because it is the
+/// half that reads the real `auth.json` and the process environment.
+pub async fn refresh_model_catalogs_with(
+    catalog: Arc<RemoteCatalog>,
+    configured: Vec<String>,
+) -> Result<(), String> {
+    let errors = {
+        let refs: Vec<&str> = configured.iter().map(String::as_str).collect();
+        match tokio::time::timeout(
+            MODELS_REFRESH_TIMEOUT,
+            catalog.refresh_providers(&refs, RefreshOptions::forced()),
+        )
+        .await
+        {
+            Ok(errors) => errors,
+            // `if (result.aborted) throw new Error("Model catalog refresh timed out.")` (`:411-413`).
+            Err(_elapsed) => return Err("Model catalog refresh timed out.".to_string()),
+        }
+    };
+
+    if !errors.is_empty() {
+        // `Could not refresh model catalogs: ${details}` where `details` joins `${provider}:
+        // ${error.message}` with `"; "` (`:415-417`).
+        let details = errors
+            .iter()
+            .map(|(provider, err)| format!("{provider}: {err}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(format!("Could not refresh model catalogs: {details}"));
+    }
+
+    // The freshly persisted catalogs are the overlay this process would read from here on. Nothing
+    // else runs in a `cyrup update --models` process, but installing it keeps the in-memory view and
+    // the store from disagreeing for any caller that follows.
+    let all_ids = all_provider_ids();
+    let all_refs: Vec<&str> = all_ids.iter().map(String::as_str).collect();
+    let overlay = catalog.load_overlay(&all_refs).await;
+    install_catalog_overlay((!overlay.is_empty()).then(|| Arc::new(overlay)));
+    Ok(())
+}
+
 /// The composed registry (built-ins + `models.json`) over an optional runtime `--api-key`
 /// credential. Composition errors are the caller's to surface —
 /// [`models_json_composition_errors`] is the once-at-startup view.

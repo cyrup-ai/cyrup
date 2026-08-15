@@ -54,8 +54,8 @@ pub use package::source::{PackageSource, PinRef};
 pub use package::{
     ConfiguredPackage, DisabledSet, InstalledPackage, InstalledPackages, ManifestResources,
     PackageFilter, PackageStore, ParsedGitUrl, ResolvedManifest, ResourceSelector, SECURITY_CAVEAT,
-    SecurityNotice, UpdateReport, UpdateTarget, has_unsafe_git_install_part, package_identity,
-    parse_git_url, resolve_manifest,
+    SecurityNotice, UpdateReport, UpdateTarget, has_unsafe_git_install_part,
+    migrate_legacy_doubled_packages_root, package_identity, parse_git_url, resolve_manifest,
 };
 pub use prompt::{PromptTemplate, expand_prompt_template, parse_command_args, substitute_args};
 pub use scope::{InstallScope, ResourceOrigin, ResourceScope};

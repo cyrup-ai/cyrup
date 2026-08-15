@@ -242,6 +242,14 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 
 > **SUPERSEDED — RECOUNTED 2026-08-14 (sweeps 3-6 reconciliation) — counted set: 0 critical, 0 high, 14 medium, 21 low = 35.** 36 rows are now marked CLOSED. `TUI-062` is new (filed by sweep 6 from another partition, partially closed). This area had no sweep-2 pass; see the reconciliation block above for the residuals other areas filed here.
 
+> **AMENDED 2026-08-14 (documentation audit) — two rows added, `TUI-063` and `TUI-064`; the area's counted set becomes 0 critical, 0 high, 14 medium, 23 low = 37.** Both came from reading the shipped `--help` and the TUI input paths against the code while writing user documentation, not from the backlog. `TUI-064` is a prerequisite for observing `TUI-017` end to end.
+
+> **AMENDED 2026-08-14 (sweep 10 — mechanical surface enumeration) — 23 rows added, `TUI-065` … `TUI-087`; three of them (`TUI-069`, `TUI-070`, `TUI-074`) are FIXED in the same pass and are therefore not counted. The area's counted set becomes 0 critical, 0 high, 17 medium, 40 low = 57, across 96 rows (39 closed-or-fixed, 57 open, 3 partially).** These came from enumerating two finite surfaces MECHANICALLY on both sides and diffing in both directions, not from reading the backlog: **keybinding ids and their default chords** (73 upstream = 31 `tui.*` + 42 `app.*`, confirmed against pi's own shipped `docs/keybindings.md` table) and **slash commands, their argument parsing and their argument completion** (25 dispatch names on each side). Both surfaces were enumerated **completely**, so this filing is exhaustive for them.
+>
+> Three results are worth carrying forward. (1) **The chord-parse audit sweep 9 prompted came back clean**: all 58 distinct default key-spec strings upstream ships parse under `Key::parse` at HEAD, including `ctrl+-`, `ctrl+]`, `ctrl+alt+]` and the `f1`…`f12` family sweep 9 fixed — so neither newly-found id is a *dead chord*, both are *missing destinations* (`TUI-067`, `TUI-068`), and the only spec-vocabulary hole left is `clear` (`TUI-073`), which no upstream default uses. (2) **The `cyrup-original` class is the one this area had no habit of tracking**: `TUI-065` exists only because TUI-028's closure said the two invented ids "are listed as a new gap" and no row was ever added, and `TUI-066` exists because TUI-028's closure deliberately *preserved* three invented vocabularies whose only tracking row then closed. (3) **The slash surface's 9-missing / 9-differing yield on a 25-command surface** came almost entirely from argument handling — arity, quoting, hints, completion and the argument-less forms — which is the half of a command that no autocomplete list shows.
+>
+> Filed with no id, each for a stated reason: `/model` and `/login` argument completion → **TUI-012**; the `has_arg_completion` bool-vs-supplier shape and its request-time-vs-item-time consequence → **TUI-012**; extension `getArgumentCompletions` threading → **EXT-013** (routed, area 06); `getBuiltInCommandConflictDiagnostics` → **TUI-006**; the forward-ported `tui.editor.historyPrevious`/`historyNext` ids → **TUI-035** (closed).
+
 
 > **⚠ ROUTING — 2026-08-14 (sweeps 3-6 reconciliation). ELEVEN OPEN ROWS FILED IN OTHER AREA FILES HAVE THEIR FIX SITE IN `crates/cyrup-tui`.** Their ids stay in their own files (ids are never renumbered or moved) and they are **not counted here**, but a cyrup-tui assignment that ignores them will keep leaving the cheapest work in the backlog undone. Ranked by sweep 6's own assessment:
 >
@@ -331,6 +339,31 @@ This area covers `cyrup/crates/cyrup-tui` (the interactive chat UI: transcript, 
 | TUI-056 | low | parity-bug | S | The context-usage meter resets to `0.0%` after an aborted turn while the conversation is still in the transcript — **new, observed 2026-08-13** |
 | TUI-057 | low | port-divergence | M | Slash-command palette submission is inconsistent — sometimes one Enter, sometimes two, sometimes a trailing space suppresses it — **new, observed 2026-08-13, low confidence** |
 | TUI-062 | low — **PARTIALLY CLOSED 2026-08-14** | parity-bug | S | `showWarning`'s `Warning: ` prefix lives INSIDE pi's function but OUTSIDE cyrup's renderer, making it a per-caller obligation that one of three callers had dropped — **FILED AND PARTIALLY CLOSED 2026-08-14 (sweep 6, found while fixing `CFG-051`; the work was done from another partition and the design half belongs to whoever owns cyrup-tui).** pi's `showWarning` builds `Warning: ${warningMessage}` inside the function (`interactive-mode.ts:3885-3889` @v0.83.0), while cyrup's `Entry::Warning` renders its text **verbatim**, so every cyrup caller must supply the prefix. Two of three did (`app.rs:3626`, `:7821`); `main.rs`'s `modelFallbackMessage` push did not, so **a credential-less first run rendered a bare "No models available…" where pi renders "Warning: No models available…"**. That call site is fixed. **RESIDUAL, two halves, both cyrup-tui's:** (a) the in-tree citation at `crates/cyrup-tui/src/transcript.rs:2965-2971` cites `interactive-mode.ts:3956-3960` for `showWarning`; at v0.83.0 it is `:3885-3889` — a wrong cite of the version-lag kind, uncorrected; (b) the DESIGN question — prefix in the renderer (pi's shape, one place) vs. at each caller (cyrup's current shape, N places, already broken once). **This is the general class "a mechanism ported one level up or down, so the invariant quietly becomes optional"** — see the JS→Rust register in `00-residual-ledger.md`. |
+| TUI-063 | low | cyrup-original | S | `CYRUP_SHARE_VIEWER_URL` is advertised in `cyrup --help` and read by nothing — **filed 2026-08-14** by a documentation audit; a grep over `crates/` returns the help line and no other occurrence. |
+| TUI-064 | low | not-ported | M | The attached-image strip has no production callers — **filed 2026-08-14**; `attach_image`/`attach_image_path` are called only from three unit tests, so the strip is dead surface and `TUI-017` cannot be observed end to end. |
+| TUI-065 | low | cyrup-original | S | `app.pageUp` / `app.pageDown` are cyrup-invented ids, and each now resolves in **two** keymaps at once, so one config entry rebinds two actions — **filed 2026-08-14** (sweep 10, keybinding-id surface). TUI-028's closure said these "are listed as a new gap"; **no row was ever added** — this is it. |
+| TUI-066 | low | cyrup-original | S | The cyrup-only keybinding-id and key-spec vocabulary TUI-028's closure deliberately preserved — 5 `tui.autocomplete.*`, 19 bare `editor.*` aliases, 10 `Key::parse` tokens pi's `KeyId` has no word for — is tracked nowhere — **filed 2026-08-14** |
+| TUI-067 | low | parity-bug | S | `tui.input.copy` migrates correctly and is then silently dropped by `merge_entries`: `EditorAction::from_id` has no arm, so pi's one "do not consume this key" id is inert — **filed 2026-08-14**; named only inside TUI-028's prose (`:692`), never in its Fix, so its closure did not cover it |
+| TUI-068 | medium | not-ported | S | `app.session.deleteNoninvasive` is unbound **and** unbindable — Ctrl+Backspace in `/resume` hits a modifier-blind `Backspace` catch-all and does nothing — **filed 2026-08-14**; the chord parses, so this is a missing destination, not a dead spec |
+| TUI-069 | **FIXED 2026-08-14** | parity-bug | S | ~~`/hotkeys` printed `Shift+Tab/Shift+Shift+Tab/Shift+Tab` for `app.thinking.cycle`, whose middle entry is not a chord and does not round-trip through `Key::parse`~~ |
+| TUI-070 | **FIXED 2026-08-14** | parity-bug | S | ~~The page keys rendered as `Pageup` / `Pagedown` where pi renders `PageUp` / `PageDown`; masked inside `/tree` by the `pgup`/`pgdn` rewrite~~ |
+| TUI-071 | low | port-divergence | S | Three platform-conditional upstream defaults are bound unconditionally: `app.clipboard.pasteImage` (both `ctrl+v` and `alt+v` everywhere), `app.suspend` (no win32 gate), `app.tree.foldOrUp`/`unfoldOrDown` (key order fixed at alt-first) — **filed 2026-08-14**; none carries the `CYRUP-DELTA` cite a forced difference requires |
+| TUI-072 | low | upstream-drift | S | Four editor key sets carry their v0.84.1 extras (`ctrl+home`, `ctrl+end`, `ctrl+pageup`, `ctrl+pagedown`) against a v0.83.0 baseline, changing the `/hotkeys` cells — **filed 2026-08-14**; disclosed in-code, never in the ledger |
+| TUI-073 | low | parity-bug | S | `clear` is a valid pi `KeyId` that `Key::parse` rejects with a generic parse failure — **filed 2026-08-14**; the residual of a chord-parse audit in which **all 58 upstream default key specs parse**, so no default chord is dead |
+| TUI-074 | **FIXED 2026-08-14** | parity-bug | S | ~~Dispatch arity: cyrup accepted an argument on all 25 slash commands where pi accepts one on 6, so `/quit now` quit, `/copy that` copied and `/new session` started a new session instead of reaching the agent~~ — also records the registry-vs-if-chain mechanism substitution that caused it |
+| TUI-075 | low | parity-bug | S | The `/` menu lists extension commands before prompt templates; pi lists builtins → prompts → extensions → skills — **filed 2026-08-14** |
+| TUI-076 | low | parity-bug | S | The builtin-collision filter keys on `invocation_name`, so a suffixed duplicate (`model:1`) survives into the menu as a command `dispatch_names` will never route — **filed 2026-08-14**; the diagnostic half is TUI-006, do not double-book |
+| TUI-077 | low | parity-bug | S | A slash-argument context falls through to path completion (pi's slash branch is terminal), and the name/argument split uses Unicode whitespace where pi splits on a literal space — **filed 2026-08-14**; land with TUI-012 |
+| TUI-078 | low | parity-bug | M | A prompt template's `argument-hint` is parsed by cyrup-resources and dropped at the `slash_command_catalog` seam, so the `/` menu shows a bare description — **filed 2026-08-14** |
+| TUI-079 | low | not-ported | S | `/export` and `/import` take the whole remainder as the path; pi parses one quote-aware token (`getPathCommandArgument`), so `/export "my session.html"` writes a file with the quotes in its name — **filed 2026-08-14** |
+| TUI-080 | low | not-ported | S | `/name` with no argument is a getter upstream; cyrup always prints usage, never reads the stored name, and echoes the INPUT rather than the normalized stored name — **filed 2026-08-14** |
+| TUI-081 | medium | not-ported | S | `/import` replaces the live session with no confirmation — a mistyped path destroys the in-flight conversation; the `cancelled` arm the code already has is unreachable — **filed 2026-08-14** |
+| TUI-082 | medium | parity-bug | S | Bare `/export` writes no file — it dumps the raw HTML into the transcript where pi writes to the session directory and names the path — **filed 2026-08-14**; distinct from DRIFT-041 |
+| TUI-083 | low | parity-bug | S | `/quit`'s description is the literal `"Quit cyrup"` where pi templates `Quit ${APP_NAME}`; the templating mechanism is unported — **filed 2026-08-14** |
+| TUI-084 | low | parity-bug | S | The argument-less usage strings for `/import` and `/name` diverge in wording and in severity channel (pi's error/warning → cyrup's neutral status) — **filed 2026-08-14**; the channel half is a caller-side instance of TUI-062 |
+| TUI-085 | low | parity-bug | S | A dynamic command with no `sourceInfo` is tagged `[t]`; pi leaves the description unprefixed — **filed 2026-08-14**; unreachable through cyrup's own catalog, live in a `pub fn` |
+| TUI-086 | low | cyrup-original | S | `CommandSource::Builtin` is a fourth variant of an upstream three-value union (pi's builtins are a different type with no `source` field), and `autocomplete_source_tag` is public where pi's is a private method — **filed 2026-08-14** |
+| TUI-087 | low | stale-port | S | Eight upstream citations in `commands.rs` do not resolve at v0.83.0, including a **fabricated** `AgentSession::expand_slash_command` and a comment contradicted by the code six lines below it — **filed 2026-08-14** |
 
 ## TUI-042 — The undo snapshot omits the paste registry — undoing a delete over a `[paste #N …]` marker silently drops the pasted content from the submitted message
 
@@ -1683,6 +1716,462 @@ The conversation is still in the transcript and still in the session file, but t
 **Fix** — split the two, exactly as upstream does, and route `history_older`/`history_newer` to the internal form; the external form gets the snapshot + registry reset. Small, but it changes a `pub` method's contract, so it is filed rather than folded into the paste-registry batch.
 
 **Verify** — `set_text` after a large paste leaves `expanded_text()` unable to resolve a hand-retyped marker; a `set_text` that changes the content is undoable with Ctrl+-.
+
+
+## TUI-063 — `CYRUP_SHARE_VIEWER_URL` is advertised in `--help` and read by nothing
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/cli.rs:1077` prints `CYRUP_SHARE_VIEWER_URL           - Base URL for /share command` in the environment section of `cyrup --help`. A grep over `crates/` for `CYRUP_SHARE_VIEWER_URL` or `SHARE_VIEWER` returns **that line and nothing else**; the `/share` handler (`crates/cyrup-tui/src/app.rs:4879`) never consults it.
+
+**upstream** — pi exposes a share-viewer base URL; the cyrup-side consumer was never built. The upstream symbol and tag were **not re-read this pass**.
+
+**Impact** — a user who sets the variable to point `/share` at a self-hosted viewer gets no effect and no diagnostic; the gist is still produced against the default. This is precisely the *advertised but unimplemented* shape `README.md` blind spot 5 names, and it was invisible to area 12's env-var sweep because that sweep is delta-scoped to v0.83.0→v0.84.1 and cannot see a cyrup-invented variable.
+
+**Fix** — either consume the variable in the `/share` handler when composing the viewer link, or delete the help line. Deleting is the smaller change and is exactly what `crates/cyrup/src/subcommands.rs:297-302` did for the dead npm install example.
+
+**Verify** — set `CYRUP_SHARE_VIEWER_URL` to a sentinel host, run `/share`, and assert the emitted link uses it; or assert the help text no longer names it.
+
+
+## TUI-064 — the attached-image strip has no production callers
+
+**Kind** not-ported · **Severity** low · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `App::attach_image` (`crates/cyrup-tui/src/app.rs:1255`) and `App::attach_image_path` (`:1261`) are `pub` and populate `pending_images`, which the layout renders as its own region. The only callers in the workspace are three unit tests (`crates/cyrup-tui/src/tests/image.rs:54`, `:79`, `:115`). No input path reaches them: `Ctrl+V` writes the clipboard image to a temp `.png` and inserts the **path as text** (`app.rs:1279-1298`), and an `@file` mention likewise passes a path.
+
+**upstream** — pi populates its attachment strip from the paste and mention paths. Tag and line **not re-read this pass**; establish before fixing.
+
+**Impact** — the strip is dead surface in the shipped binary. `TUI-017` audits how that strip *renders* — Halfblocks without a protocol, the invented placeholder glyph, the missing 60-cell cap — and implicitly assumes it is populated. **`TUI-017` is marked CLOSED, and this item is the falsification condition its closure did not write down:** with no production caller, that closure can only have been validated against unit tests driving `attach_image` directly, never against a user pasting an image. That is the third failure mode the third edition names — *a closure validated against the wrong signal* — and it is the same shape that reopened `TOOL-042` by measurement. This item does **not** reopen `TUI-017` on its own; it records what would. Filed separately rather than folded in because the fix sites differ.
+
+**Fix** — call `attach_image_path` from the clipboard-paste handler, and from `@`-mention acceptance when the resolved path is an image, **alongside** (not instead of) inserting the path text — the current text-path behaviour is deliberate, since it keeps the raster out of context until the agent reads it.
+
+**Verify** — paste an image and assert `pending_images` is non-empty and the strip occupies rows; keep `TUI-017`'s rendering assertions on top. Per this directory's own caveat, TUI work is not done until run in a real terminal.
+
+
+## TUI-065 — `app.pageUp` / `app.pageDown` are cyrup-invented ids, and each now resolves in **two** keymaps at once
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:270-271` (`"app.pageUp" => Some(Action::PageUp)`, `"app.pageDown" => …`), `Action` variants at `:191-194`, default-bound at `:647-648` (`Key::plain(KeyCode::PageUp) → Action::PageUp`); the **same two strings** are also accepted as `EditorAction` aliases at `:403-404`.
+
+**upstream** — pi has no `app.*` page id at either v0.83.0 or v0.84.1. Paging is `tui.editor.pageUp` / `tui.editor.pageDown` (`pi/packages/tui/src/keybindings.ts:89-90`), and pi's own `/hotkeys` reads it off the editor map (`getEditorKeyDisplay("tui.editor.pageUp")`).
+
+**Impact** — half of this was known: TUI-028's closure note says it "absorbed TUI-008's `app.pageUp`/`app.pageDown` spelling complaint" and that the two ids "stay as cyrup-original ids on the global map and are listed as a new gap" — **but no row was ever added, so nothing tracks them.** This item is that row. The **new** half is a consequence of TUI-028's alias work landing: `app.pageUp` now resolves in TWO maps at once, so `{"app.pageUp": "f5"}` rebinds both the global transcript scroll and the editor caret page, and stock `PageUp` is bound in both `Keymap::default` and `EditorKeymap::default`. Which one fires is decided by `App` routing order rather than by any upstream rule, and `load_keybindings_json` fans one document out to six maps, so a single config entry moves two different actions.
+
+**Fix** — decide one owner for the id. Either (a) accept `app.pageUp`/`app.pageDown` on the **global** map only and delete the `EditorAction::from_id` aliases at `:403-404`, leaving `tui.editor.pageUp`/`pageDown` as the editor spelling pi uses; or (b) delete the `app.*` spelling outright and let the deferral logic at `app.rs:1685-1687` route the editor id to the transcript when the editor is empty. (a) is the smaller change and keeps shipped configs working. Whichever is chosen, the surviving cyrup-only id must be recorded in TUI-066's list and kept out of user documentation.
+
+**Verify** — a keymap test asserting that one JSON document containing `app.pageUp` changes exactly one map, and that `Keymap::default()` and `EditorKeymap::default()` do not both claim bare `PageUp`.
+
+
+## TUI-066 — the cyrup-only keybinding-id and key-spec vocabulary that TUI-028's closure deliberately preserved is tracked nowhere
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — three invented vocabularies survive at HEAD, all of them by a deliberate decision recorded in TUI-028's closure ("must NOT delete the `editor.*` arms … which are what keeps shipped-cyrup configs working"), and none of them carried by an open row once TUI-028 closed:
+
+1. **`tui.autocomplete.previous` / `.next` / `.accept` / `.acceptSubmit` / `.cancel`** — `crates/cyrup-tui/src/keymap.rs:845-881` (`AutocompleteAction` + `from_id`), defaults at `:895-901`. Upstream has no `tui.autocomplete.*` family at all; pi's popup reuses `tui.select.up/down/confirm/cancel` and `tui.input.tab` (`pi/packages/tui/src/components/editor.ts:664-712` @v0.83.0). The doc comment at `keymap.rs:862-869` states this honestly, and TUI-028 added pi's ids alongside, so a pi-shaped config now works — the five originals survive as do-not-break-shipped-config aliases.
+2. **The bare `editor.*` namespace, 19 aliases** (`editor.cursorUp` … `editor.tab`) — `keymap.rs:360-412`, the middle alternative of each `|`-arm. These match **neither** pi's modern `tui.editor.*` **nor** pi's legacy bare `cursorUp`, so they are a cyrup-only third spelling.
+3. **`Key::parse` spec tokens pi's `KeyId` does not contain** — `backtab`, `del`, `ins`, `pgup`, `pgdn`, `control`, `option`, `meta`, `cmd`, `command` (`keymap.rs:502-532`: modifier arms `:502-505`, key arms `:508`, `:518`, `:521-522`, `:532`).
+
+**upstream** — pi's `ModifierName` is exactly `ctrl|shift|alt|super` (`keys.ts:143`) and `SpecialKey` (`keys.ts:109-139`) has no `backtab`/`del`/`ins`/`pgup`/`pgdn`.
+
+**Impact** — cyrup accepts a strict superset of pi's id and key-spec vocabulary, so a `keybindings.json` that works in cyrup can be rejected by pi's TS types and would silently never match at pi runtime. Low impact in behaviour — nobody writes `pgdn` — but this is invented surface that ships, and the class matters: an id or token a user learns from cyrup is not portable, and the ledger had no row for any of it after TUI-028 closed. Not a defect to remove; a defect to leave **unrecorded**.
+
+**Fix** — no code change is proposed. Record the three lists in one place (this item is that place) and add a single-line assertion in `keymap.rs` next to each alias block naming this id, so a future pass reading the code finds the ledger row. If cyrup ever publishes a user-facing keybinding-id reference, it must list **only** the 73 upstream ids; the aliases stay accepted and undocumented.
+
+**Verify** — a keymap test enumerating the accepted-id set and asserting that every id outside pi's 73 appears in this item's list, so a new invented id fails loudly.
+
+
+## TUI-067 — `tui.input.copy` migrates correctly and is then silently dropped: it has no `EditorAction` destination
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `EditorAction::from_id` (`crates/cyrup-tui/src/keymap.rs:356-415`) has no arm for `tui.input.copy`; all 24 arms were checked. The entry migrates correctly — `crates/cyrup-config/src/keybindings.rs:70` and `:142` both carry it — and is then dropped by `merge_entries`' `let Some(action) = from_id(&id) else { continue }` (`keymap.rs:128`) **with no diagnostic**.
+
+**upstream** — `pi/packages/tui/src/keybindings.ts:34` (id) and `:121` (`defaultKeys: "ctrl+c"`, "Copy selection"); consumed at `pi/packages/tui/src/components/editor.ts:654` `if (kb.matches(data, "tui.input.copy")) { return; }`; doc row `pi/packages/coding-agent/docs/keybindings.md:73`.
+
+**Impact** — this is the ONE id whose whole job is to tell the editor *not* to consume a key, so the app tier gets it. Upstream, rebinding `tui.input.copy` to `ctrl+q` makes the editor forward Ctrl+Q to the parent. In cyrup the rebind is accepted, migrated, and discarded. Stock behaviour is accidentally right — `EditorKeymap::default()` binds no `ctrl+c`, so it falls through to `Action::Clear` — so this is **config-inertness, not a default-chord break**, which is why it stayed invisible: TUI-028 named it only inside its prose ("`tui.input.copy` also has no cyrup destination at all", `07-cyrup-tui.md:692`) and its Fix section never listed it, so TUI-028's closure did not cover it and no step ever owned it.
+
+**Fix** — add `EditorAction::PassThrough` (name it for what it does upstream: the editor declines the key) with a `"tui.input.copy" | "input.copy"` arm in `from_id`, bound to nothing by default, and have `InputEditor::handle_input` return early when it resolves — the port of `editor.ts:654`'s bare `return`.
+
+**Verify** — editor test: with `{"tui.input.copy": "ctrl+q"}` merged, Ctrl+Q is not consumed by the editor and reaches the global keymap; without the rebind, nothing changes.
+
+
+## TUI-068 — `app.session.deleteNoninvasive` is unbound **and** unbindable: Ctrl+Backspace does nothing in `/resume`
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `SessionAction` has 5 variants and `SessionAction::from_id` (`crates/cyrup-tui/src/keymap.rs:1055-1064`) 5 arms — ToggleSort / ToggleNamedFilter / Delete / TogglePath / Rename — and `SessionKeymap::default()` (`:1078-1084`) 5 bindings. `deleteNoninvasive` is in none of them, so the default `ctrl+backspace` is unbound AND unbindable. The chord itself is **not** the f1..f12 failure mode sweep 9 found: `Key::parse("ctrl+backspace")` resolves through the `"ctrl"` modifier arm (`:502`) and the `"backspace"` key arm (`:518`), so the spec parses and only the destination is missing.
+
+**upstream** — `pi/packages/coding-agent/src/core/keybindings.ts:42` (id) and `:151-154` (`defaultKeys: "ctrl+backspace"`, "Delete session when query is empty"); consumed at `pi/packages/coding-agent/src/modes/interactive/components/session-selector.ts:592-600`; rename entry `deleteSessionNoninvasive` at `:268`; doc row `pi/packages/coding-agent/docs/keybindings.md:105`.
+
+**Impact** — in `/resume` with an empty search query, upstream Ctrl+Backspace opens the delete-confirmation for the highlighted session (`session-selector.ts:599` `startDeleteConfirmationForSelectedSession()`). In cyrup the event falls to the catch-all at `session_selector.rs:1013` — `if key.code == KeyCode::Backspace { self.backspace(); }`, which **does not check modifiers** — so Ctrl+Backspace runs a no-op backspace on an already-empty query and the user sees nothing happen. The non-empty-query half (forward to the input, re-filter) is also absent. The id was invisible to nine sweeps because it *does* appear in `crates/cyrup-config/src/keybindings.rs:106,178` and in CFG-048's prose at `05-cyrup-config-and-resources.md:381` — but only as evidence for the **rename table**, never as an unbound action.
+
+**Fix** — add `SessionAction::DeleteNoninvasive` with the `"app.session.deleteNoninvasive"` arm in `from_id`, default `ctrl+backspace` in `SessionKeymap::default()`, and port `session-selector.ts:592-600`: on an empty query start the delete confirmation for the selected session; otherwise fall through to the query input and re-filter. Resolve it **before** the `KeyCode::Backspace` catch-all at `session_selector.rs:1013`, which today swallows the modifier.
+
+**Verify** — session-selector test: Ctrl+Backspace with an empty query opens the delete confirmation; with a non-empty query it edits the query and leaves the list alive; a `{"app.session.deleteNoninvasive": "ctrl+k"}` rebind moves the behaviour.
+
+
+## TUI-069 — `/hotkeys` printed `Shift+Tab/Shift+Shift+Tab/Shift+Tab` for `app.thinking.cycle`
+
+> ## FIXED 2026-08-14 — `crates/cyrup-tui/src/keymap.rs`
+>
+> Two changes, both in the label path only; no binding was added or removed. (1) `Key::label` no
+> longer prepends `shift+` when the code is `KeyCode::BackTab`, because `BackTab`'s own base label is
+> already `shift+tab` — the doubled form is not a chord any terminal reports and `Key::parse` reads it
+> back as plain `Tab`+SHIFT, so the label did not round-trip. (2) The five `keys_label` bodies now go
+> through one `join_key_labels` helper that skips a label already emitted, which is what makes the
+> three-way binding render as pi's single cell.
+>
+> **RED before, at HEAD:** `Keymap::default().keys_label(Action::ThinkingCycle)` was
+> `Some("shift+tab/shift+shift+tab/shift+tab")` and the `/hotkeys` cell
+> `Shift+Tab/Shift+Shift+Tab/Shift+Tab`. **GREEN after:** `Some("shift+tab")` → `Shift+Tab`, byte-for-byte
+> pi's cell. Test: `hotkey_cells_match_pis_key_text_for_shift_tab_and_the_page_keys`
+> (`crates/cyrup-tui/src/tests/keybindings.rs`), which also pins the `BackTab`+SHIFT label directly.
+>
+> **Execution caveat, stated rather than implied:** the RED values above are derived by reading the
+> code at HEAD (the label path is a pure function of the binding table, so they are mechanically
+> certain), and the new test compiles under `cargo check -p cyrup-tui --all-targets`. This pass's
+> test rules forbid `cargo test`, so the suite was **not executed** here — a reviewer with a green
+> light to run tests should do so before treating the row as verified.
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:653-655` binds three keys to `Action::ThinkingCycle` (`BackTab`, `BackTab`+SHIFT, `Tab`+SHIFT) — defensible, since a terminal reports Shift+Tab three ways depending on the keyboard protocol. But `/hotkeys` renders through `keys_label` (all keys, `/`-joined — `app.rs:2537-2538` `g = |a| format_key_text(&km.keys_label(a)…, true)`, row at `app.rs:2572`, argument at `:2613`), and `Key::label` rendered `KeyCode::BackTab` as the literal `"shift+tab"` while **also** prepending its own `shift+` for the SHIFT modifier (`:588-590`).
+
+**upstream** — `pi/packages/coding-agent/src/core/keybindings.ts:73-76` — `defaultKeys: "shift+tab"`, a SINGLE key; rendered by `keyDisplayText` → `formatKeys(getKeys(id))` → `keys.join("/")` (`keybinding-hints.ts:29-40`), i.e. exactly `Shift+Tab`.
+
+**Impact** — the `/hotkeys` cell read `Shift+Tab/Shift+Shift+Tab/Shift+Tab` where pi prints `Shift+Tab`. The middle entry is not a real chord, and a label that does not round-trip through `Key::parse` is a label that lies everywhere hints are drawn. No backlog row existed: a grep for `shift+shift` / `Shift+Shift` across `docs/gap-analysis/` returned nothing.
+
+**Verify** — done, above. Per this directory's standing caveat the cell should also be read once in a real terminal, since `/hotkeys` is a rendered surface.
+
+
+## TUI-070 — the page keys render as `Pageup` / `Pagedown` where pi renders `PageUp` / `PageDown`
+
+> ## FIXED 2026-08-14 — `crates/cyrup-tui/src/keymap.rs`
+>
+> `Key::label` now emits upstream's camelCase `pageUp` / `pageDown`. `Key::parse` lowercases every
+> token before matching (`:504`), so the label still round-trips — which is the only property the
+> old in-code comment at `:519-520` was defending; it never considered display. The two
+> `TreeKeymap::first_key_label` rewrite arms (`"pageup" => "pgup"`) were retargeted in the same edit.
+>
+> **RED before:** `Key::plain(KeyCode::PageUp).label()` was `"pageup"` and `format_key_part`
+> capitalizes only the first character, so the `/hotkeys` "Scroll by page" cell read `Pageup`.
+> **GREEN after:** `"pageUp"` → `PageUp`. Test:
+> `hotkey_cells_match_pis_key_text_for_shift_tab_and_the_page_keys`
+> (`crates/cyrup-tui/src/tests/keybindings.rs`), which asserts the label, the parse round-trip and the
+> rendered cell.
+>
+> **Execution caveat, stated rather than implied:** the RED values above are derived by reading the
+> code at HEAD (the label path is a pure function of the binding table, so they are mechanically
+> certain), and the new test compiles under `cargo check -p cyrup-tui --all-targets`. This pass's
+> test rules forbid `cargo test`, so the suite was **not executed** here — a reviewer with a green
+> light to run tests should do so before treating the row as verified.
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `Key::label` emitted the lowercased `"pageup"` / `"pagedown"` (`crates/cyrup-tui/src/keymap.rs:615-616`); `format_key_part` (`crates/cyrup-tui/src/chrome.rs:41-56`) then capitalizes only the first character.
+
+**upstream** — `pi/packages/tui/src/keybindings.ts:89-90` `defaultKeys: "pageUp"` / `"pageDown"`; `formatKeys` joins the raw `KeyId` strings and `formatKeyPart` only upper-cases the FIRST character (`keybinding-hints.ts:12-15`), so pi's `/hotkeys` cell is `PageUp`.
+
+**Impact** — every hint naming a page key was one character wrong. Inside `/tree` the divergence was masked by `TreeKeymap::first_key_label`, whose `"pageup" => "pgup"` rewrite (`:1240-1241`) replaced the token before it was ever capitalized — which is why the defect survived: the one surface with a test was the one surface that could not show it.
+
+**Verify** — done, above.
+
+
+## TUI-071 — three platform-conditional upstream defaults are bound unconditionally in cyrup
+
+**Kind** port-divergence · **Severity** low · **Effort** S · **Confidence** confirmed
+
+Upstream computes three default key sets from `process.platform`. cyrup binds all three unconditionally, so on some platform each one differs from pi's. None carries a `CYRUP-DELTA` row naming pi's file:line, which the hard rules require for a forced difference.
+
+1. **`app.clipboard.pasteImage` — one platform key upstream, two keys on every platform in cyrup.** `crates/cyrup-tui/src/keymap.rs:670-671` binds BOTH `ctrl+v` and `alt+v`. Consequences: (a) on non-Windows, `alt+v` is stolen from the editor, which upstream never does; (b) `/hotkeys` shows `Ctrl+V/Alt+V` (via `keys_label`, `app.rs:2623`) where pi shows one key. The comment at `keymap.rs:666-669` declares the intent but cites no upstream line.
+   **upstream** — `pi/packages/coding-agent/src/core/keybindings.ts:111-114` — `defaultKeys: process.platform === "win32" ? "alt+v" : "ctrl+v"` — exactly one key is ever bound.
+2. **`app.suspend` — no win32 gate.** `keymap.rs:644` binds `ctrl+z` unconditionally, and `grep -rn 'Action::Suspend' crates/` shows no `cfg(windows)` guard anywhere on the path (`keymap.rs:269,644`; `app.rs:2356,2612,7612`). On Windows the chord is bound and its `/hotkeys` row is populated where upstream leaves both empty.
+   **upstream** — `pi/packages/coding-agent/src/core/keybindings.ts:69-72` — `defaultKeys: process.platform === "win32" ? [] : "ctrl+z"`; doc row `packages/coding-agent/docs/keybindings.md` reads "`ctrl+z` (none on Windows)".
+3. **`app.tree.foldOrUp` / `app.tree.unfoldOrDown` — key ORDER is platform-dependent upstream, fixed in cyrup.** `keymap.rs:1197-1200` always puts `alt` first. The key SET is right on both platforms, so behaviour is unaffected; only display diverges, and only on Linux/Windows — `TreeKeymap::first_key_label` (`:1231`) takes `getKeys(id)[0]`, matching pi's `formatHelpKeys` (`tree-selector.ts:1238-1253`), so `/tree`'s help row shows `Option+←` where pi shows `Ctrl+←`.
+   **upstream** — `pi/packages/coding-agent/src/core/keybindings.ts:119-126` — `process.platform === "darwin" ? ["alt+left","ctrl+left"] : ["ctrl+left","alt+left"]` (and the mirror for right). The shipped doc table lists the NON-darwin order: `packages/coding-agent/docs/keybindings.md` rows read "`ctrl+left`, `alt+left`".
+
+**Impact** — (2) and (3) are display-only or Windows-only. (1) is behavioural on the primary target: Alt+V is taken from the editor on macOS and Linux, which upstream never does. Filed as one item because the three share a fix site (`Keymap::default` / `TreeKeymap::default`) and one decision: does cyrup key off `cfg!(windows)` / `cfg!(target_os = "macos")` the way pi keys off `process.platform`?
+
+**Fix** — port the conditionals literally: `if cfg!(windows) { alt+v } else { ctrl+v }`; `if !cfg!(windows) { ctrl+z }`; and order the tree keys `darwin ? [alt, ctrl] : [ctrl, alt]`. If the pasteImage double-binding is kept deliberately, it needs a `CYRUP-DELTA` comment naming `core/keybindings.ts:111-114` and an item saying so — the current comment is an intent statement with no citation.
+
+**Verify** — keymap tests asserting the bound set per `cfg!`, plus `keys_label(Action::ClipboardPasteImage)` returning one key on non-Windows and `keys_label(Action::Suspend)` returning `None` under `cfg(windows)`.
+
+
+## TUI-072 — four editor key sets carry their v0.84.1 extras against a v0.83.0 baseline
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs` adds `ctrl+home`, `ctrl+end` (`:1302`, `:1305`) and `ctrl+pageup`, `ctrl+pagedown` (`:1312`, `:1314`) to `tui.editor.cursorLineStart` / `cursorLineEnd` / `pageUp` / `pageDown`. These are the **v0.84.1** sets. The in-code comment at `:1298-1310` already discloses this as version lag rather than a port bug.
+
+**upstream** — `pi/packages/tui/src/keybindings.ts:73-80` @v0.83.0 — `["home","ctrl+a"]` / `["end","ctrl+e"]`; `:89-90` — `"pageUp"` / `"pageDown"` (single key).
+
+**Impact** — it changes the `/hotkeys` cells (`Home/Ctrl+Home/Ctrl+A` vs pi's `Home/Ctrl+A`) and it inflates any cyrup-side key count taken against the ported tag. Nothing is broken; the reason for the row is that a *forward*-ported default is exactly as invisible as a missing one, and the ledger had no record of these four. Recorded for completeness with the same disposition as TUI-035's forward-ported `tui.editor.historyPrevious` / `historyNext` ids, which are the other half of the same drift and are already closed.
+
+**Fix** — none required while cyrup deliberately tracks the newer sets. When the baseline moves to v0.84.1 this row closes with no code change; if the baseline stays at v0.83.0, drop the four extra keys and the `/hotkeys` cells match again.
+
+**Verify** — a keymap test pinning the four key sets against whichever tag is declared the baseline, so the next upstream change to them fails loudly.
+
+
+## TUI-073 — `clear` is a valid pi `KeyId` that `Key::parse` rejects
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/keymap.rs:530-531` deliberately omits it ("crossterm's `KeyCode` has no counterpart"). Consequence: `{"app.interrupt": "clear"}` is accepted by pi and produces a `KeybindingIssue` in cyrup — the multi-character token falls to the `_ => Err(TuiError::KeySpec)` arm at `:546`.
+
+**upstream** — `pi/packages/tui/src/keys.ts:119` (`SpecialKey` member), with real sequence tables at `:379`, `:399`, `:413`, `:429-430` and a real `matchesKey` arm at `:990-994`.
+
+**Impact** — spec-vocabulary only: **no upstream DEFAULT uses `clear`**, so no default chord is dead, and the other 39 `SpecialKey`s all parse — including `insert` and `f1`…`f12` (`:532-541`, sweep 9's fix, verified present at HEAD). The failure is confined to a hand-written config that names the key: pi binds it, cyrup reports the entry as an issue and leaves the action on its previous binding. This is the residual of the chord-parse audit run over this surface: **all 58 distinct default key-spec strings pi ships parse under `Key::parse`**, including `ctrl+-`, `ctrl+]` and `ctrl+alt+]` (which reach the single-char fallback at `:542-548`), so `clear` is the only spec-vocabulary hole left.
+
+**Fix** — either map it to the closest crossterm code and document the approximation, or keep rejecting it and say so in the diagnostic (`unsupported key "clear"` rather than a generic parse failure) so the user is not left guessing whether they typo'd. The second is honest and is one line.
+
+**Verify** — `Key::parse("clear")` yields the specific unsupported-key diagnostic, and a config naming it reports exactly one issue while every other entry still applies (CFG-038's contract).
+
+
+## TUI-074 — dispatch arity: cyrup accepted an argument on all 25 slash commands where pi accepts one on 6, so `/quit now` quit
+
+> ## FIXED 2026-08-14 — `crates/cyrup-tui/src/commands.rs`
+>
+> `match_command` now takes the `"name "`-prefix branch only for the six names in the new
+> `ARGUMENT_DISPATCH_NAMES` const; every other name is exact-match, which is upstream's guard. The
+> registry abstraction is kept — this is the data the uniform matcher was missing, not a rewrite.
+>
+> **RED before, at HEAD:** `CommandRegistry::new().dispatch("/quit now")` returned
+> `Dispatch::Command { name: "quit", arg: Some("now") }`; likewise `/copy that`, `/new session`,
+> `/trust me`, `/tree left`, `/debug on`. **GREEN after:** all six are `Dispatch::Prompt`, and the six
+> argument-taking commands are unchanged. Test:
+> `only_pis_six_argument_commands_accept_trailing_text` (`crates/cyrup-tui/src/tests/commands.rs`).
+> The existing suite exercised only prefix-accepting commands (`/model`, `/compact`), which is why
+> nothing pinned the nineteen exact-only guards.
+>
+> **Execution caveat, stated rather than implied:** the RED values above are derived by reading the
+> code at HEAD (the label path is a pure function of the binding table, so they are mechanically
+> certain), and the new test compiles under `cargo check -p cyrup-tui --all-targets`. This pass's
+> test rules forbid `cargo test`, so the suite was **not executed** here — a reviewer with a green
+> light to run tests should do so before treating the row as verified.
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `match_command` (`crates/cyrup-tui/src/commands.rs:240-253`) applied exact-or-`"name "`-prefix **uniformly** to all 25 `dispatch_names`, and the crate's own doc at `:205` claimed this matched `interactive-mode.ts`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts:2666-2793` @v0.83.0 — compare `:2666` `if (text === "/settings")` against `:2676` `if (text === "/model" || text.startsWith("/model "))`. pi accepts an argument on exactly 6 of its 25 dispatch names: `/model`, `/export`, `/import`, `/name`, `/login`, `/compact`. The other 19 — `/settings`, `/scoped-models`, `/share`, `/copy`, `/session`, `/changelog`, `/hotkeys`, `/fork`, `/clone`, `/tree`, `/trust`, `/logout`, `/new`, `/reload`, `/resume`, `/quit`, `/debug`, `/arminsayshi`, `/dementedelves` — are strict equality, so `/quit now` is NOT a command and is sent to the model as a prompt.
+
+**Impact** — `/quit now` quit, `/copy that` copied, `/new session` started a new session and `/trust me` opened the trust selector, every one of which pi forwards to the agent verbatim. The user-visible cost is a destroyed prompt: text the user typed and expected the model to see was swallowed by a command.
+
+**Also recorded here, per the port-fidelity rule** — the *mechanism* was substituted. pi has no registry object and no dispatch enum; `setupEditorSubmitHandler` (`interactive-mode.ts:2660-2793`) is 25 hand-written `if (text === "/x" …)` guards in source order. `CommandRegistry` / `Dispatch` (`commands.rs:122-254`) is reasonable Rust and is kept, but it is the direct cause of this divergence: a uniform matcher cannot express a per-command mix of exact-only and prefix-accepting guards without carrying the arity as data, which is what the fix adds. No separate id is filed for the substitution; this paragraph is its record.
+
+**Verify** — done, above.
+
+
+## TUI-075 — the `/` menu lists extension commands before prompt templates; pi lists prompts first
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `CommandRegistry::with_dynamic` (`crates/cyrup-tui/src/commands.rs:184-188`) appends `slash_command_catalog` rows in catalog order, and the catalog emits extensions first (`crates/cyrup-session-svc/src/session.rs:2503` extensions, `:2517` prompts, `:2526` skills). Result: builtins → extension commands → prompt templates → skill commands.
+
+**upstream** — `pi/…/interactive-mode.ts:625` @v0.83.0 — `[...slashCommands, ...templateCommands, ...extensionCommands, ...skillCommandList]`, i.e. builtins → prompt templates → extension commands → skill commands.
+
+**Impact** — order is user-visible: both sides' fuzzy filter returns `items` unchanged for an empty query (pi `fuzzy.ts:100-102`; cyrup `fuzzy.rs::filter`), so pressing `/` alone shows the two middle blocks swapped. A user with several extensions has to scroll past them to reach their own prompt templates, which upstream puts first.
+
+**Fix** — sort the merged dynamic rows by source into pi's order (prompt → extension → skill) inside `with_dynamic`, or emit the catalog in that order in `session.rs:2503-2526`. Prefer `with_dynamic`: the catalog is also the RPC `get_commands` payload, whose order is pi's RPC order and should not be changed to fix an interactive-mode display.
+
+**Verify** — a registry test with one prompt, one extension and one skill row asserting the emitted order, and an autocomplete test asserting the `/`-with-empty-query list.
+
+
+## TUI-076 — the builtin-collision filter keys on `invocation_name`, so a suffixed duplicate survives into the menu and never dispatches
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `CommandRegistry::with_dynamic` (`crates/cyrup-tui/src/commands.rs:182-188`) filters the catalog row's `name` against the builtin set — but that field is already the **invocation name** (`crates/cyrup-session-svc/src/session.rs:2506`).
+
+**upstream** — `pi/…/interactive-mode.ts:600-608` @v0.83.0 — `.filter((cmd) => !builtinCommandNames.has(cmd.name))` **then** `.map((cmd) => ({ name: cmd.invocationName, … }))`: pi filters on the extension command's ORIGINAL `name` and only then maps to `invocationName`.
+
+**Impact** — if two extensions both register `model` (invocation names `model:1` and `model:2` per `runner.ts:598-641`), pi drops BOTH from autocomplete; cyrup keeps both, so the `/` menu offers two commands that `dispatch_names` will never route — they fall through to `Dispatch::Prompt` and are sent to the model as literal text. An advertised command that cannot run is the same shape as TUI-063, one level in.
+
+**Fix** — carry the original `name` alongside `invocation_name` on the catalog row (pi has both on the object it filters), and filter on the original before the merge. Lands next to TUI-006, which owns the *diagnostic* for the same collision — this item is the *filtering*; do not book them twice.
+
+**Verify** — registry test: two dynamic rows whose original name is `model` and whose invocation names are `model:1`/`model:2` are both absent from `commands()`.
+
+
+## TUI-077 — a slash-argument context falls through to path completion, and the name/argument split rule is not pi's
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `slash_context` (`crates/cyrup-tui/src/autocomplete.rs:141`) returns `None` on any whitespace **or** on an empty fuzzy result, and `Autocomplete::compute` (`:88-93`) then falls into `path_context`. Two divergences follow:
+
+1. **Fallthrough.** pi's slash branch is terminal: once `!force && textBeforeCursor.startsWith("/")`, every path out of the branch returns — a filtered command list, argument suggestions, or `null` — and it never reaches `extractPathPrefix`. Observable: with a popup already open (`was_open`), typing `/export ./sr` pops a FILE list in cyrup where pi shows nothing until Tab; and `/Users/dav` eventually pops a path list in cyrup where pi closes the popup.
+2. **The split rule.** pi splits on `textBeforeCursor.indexOf(" ")` — a literal SPACE only, so a TAB character typed into the editor keeps pi in the command-name branch. cyrup uses `before.contains(char::is_whitespace)`, which also catches tab, no-break space and the rest of Unicode whitespace.
+
+**upstream** — `pi/packages/tui/src/autocomplete.ts:308-359` @v0.83.0 — the whole `if (!options.force && textBeforeCursor.startsWith("/"))` block, whose no-completions exit is `return null` at `:347` and `:352`; the split itself at `:309`, `:339-340` (`slice(1, spaceIndex)` / `slice(spaceIndex + 1)`).
+
+**Impact** — (1) is visible today: a path popup appears under a slash line that upstream leaves closed. (2) is cosmetic today and is filed with it because it is the same three lines and because TUI-012's argument-completion port must not inherit a different split rule than pi's.
+
+**Fix** — make the slash branch terminal in `compute`: when `before` starts with `/` and `!force`, return whatever the slash path produced (including `None`) without trying `path_context`. Split on `' '` rather than `char::is_whitespace`. Land with TUI-012, which adds the argument branch this makes room for.
+
+**Verify** — autocomplete tests: `/export ./sr` and `/Users/dav` produce no path completions while `./sr` alone still does; a tab-containing `/mo\tdel` stays in the command-name branch.
+
+
+## TUI-078 — a prompt template's `argument-hint` is parsed, then dropped at the catalog seam
+
+**Kind** parity-bug · **Severity** low · **Effort** M · **Confidence** confirmed
+
+**cyrup** — the TUI gets prompt templates through `slash_command_catalog` (`crates/cyrup-session-svc/src/session.rs:2517-2523`), which never emits an `argumentHint` key, and `dynamic_commands_from_catalog_gated` (`crates/cyrup-tui/src/commands.rs:356`) hardcodes `argument_hint: None`. The data **exists and is parsed** — `crates/cyrup-resources/src/prompt.rs:35`, `:72` `argument_hint`, asserted at `tests/resources.rs:342` as `Some("<pr> [focus]")` — it is dropped at the seam between them.
+
+**upstream** — `pi/…/interactive-mode.ts:596` @v0.83.0 — `...(cmd.argumentHint && { argumentHint: cmd.argumentHint })` on `templateCommands`, sourced from `prompt-templates.ts:125` (`frontmatter["argument-hint"]`).
+
+**Impact** — a user's `/review-pr` template shows a bare description in the `/` menu where pi shows `<pr> [focus] — …`. The user cannot see what the template expects without opening the file. Root cause is structural, and worth stating because it decides the fix: cyrup feeds the interactive menu from the **RPC catalog** (pi's RPC shape carries no `argumentHint` either), whereas pi builds it from `session.promptTemplates` directly.
+
+**Fix** — add `argumentHint` to the catalog row for prompt (and extension) sources and read it in `dynamic_commands_from_catalog_gated`. Adding a field to the RPC payload is the smaller deviation than giving the TUI a second data path; note in the RPC area that the field is a cyrup addition to `get_commands` so it is not read as parity drift there.
+
+**Verify** — a catalog→registry test asserting a template with `argument-hint: "<pr> [focus]"` reaches `SlashCommand::argument_hint`, plus the rendered `/` row.
+
+
+## TUI-079 — `/export` and `/import` take the whole remainder as the path; pi parses one quote-aware token
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `CommandRegistry::dispatch`'s whole trimmed remainder is passed straight through (`crates/cyrup-tui/src/commands.rs:248-249` → `app.rs:2079-2080`). No port of pi's helper exists anywhere: `grep -rn 'path_command_argument' crates/` is empty.
+
+**upstream** — `pi/…/interactive-mode.ts:5449-5476` @v0.83.0 `getPathCommandArgument`: strips a leading `"`/`'` to its matching close; otherwise truncates at the first `/\s/`; returns `undefined` on an unterminated quote. Called at `:5435` and `:5480`.
+
+**Impact** — `/export "my session.html"` writes a file whose name literally includes the quote characters; `/export a.html junk` writes to the path `a.html junk`; an unterminated quote that pi **rejects** is accepted as a path. Quoting a path with spaces is the obvious thing a user tries, and it silently produces a wrongly-named file rather than an error.
+
+**Fix** — port `getPathCommandArgument` verbatim into `commands.rs` (it is a pure string function) and apply it in the `/export` and `/import` arms only — it is not a general dispatch rule, and `/name`, `/compact`, `/model`, `/login` take their remainder whole upstream.
+
+**Verify** — unit tests over the helper for all four cases (`"a b.html"`, `a.html junk`, `'a b'`, unterminated `"a b`), plus an app test that `/export "my session.html"` writes exactly that filename.
+
+
+## TUI-080 — `/name` with no argument is a getter upstream; cyrup always prints usage, and never reports the stored name
+
+**Kind** not-ported · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:2083-2089` unconditionally prints `usage: /name <session name>` and never reads the current name, so the only way to see the session's display name is `/session`. The normalization warning is also absent: `C::SetName` (`app.rs:4855-4858`) prints `session name → {name}` echoing the **input**, not what was actually stored, so a normalized name is reported back wrongly.
+
+**upstream** — `pi/…/interactive-mode.ts:5632-5644` @v0.83.0 `handleNameCommand`: empty arg + a name set ⇒ appends `Session name: ${currentName}` to the chat container; only when NO name is set does it warn `Usage: /name <name>`. It also warns when the name is normalized (`:5648-5650`).
+
+**Impact** — a user who types `/name` to check the session's name is told they used the command wrong. Worse, after `/name My Session!` the transcript claims the name is `My Session!` even when the store normalized it, so the value the user believes is set is not the value `/resume` will show.
+
+**Fix** — port the three branches: empty arg + name set → push `Session name: {current}`; empty arg + no name → the usage warning; non-empty → set, then echo **the stored name** and warn when it differs from the input. The getter needs the current name on the session handle, which `/session` already reads.
+
+**Verify** — app tests for all three branches, including a name that normalizes, asserting the echoed string is the stored one.
+
+
+## TUI-081 — `/import` replaces the live session with no confirmation
+
+**Kind** not-ported · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/app.rs:4956-4965` calls `rt.import_from_jsonl(path, None)` immediately. Its own `Ok(r) if r.cancelled` arm handles a cancellation the TUI never offers a way to trigger.
+
+**upstream** — `pi/…/interactive-mode.ts:5485` @v0.83.0 — `await this.showExtensionConfirm("Import session", \`Replace current session with ${inputPath}?\`)`, and `showStatus("Import cancelled")` on decline.
+
+**Impact** — a mistyped `/import` destroys the live session with no prompt. The user's in-flight conversation is replaced by the imported one; there is no undo surface. Rated medium rather than low because the loss is of user data and the guard exists upstream precisely to prevent it.
+
+**Fix** — call the existing confirm dialog (the same one extension confirms use) before `import_from_jsonl`, with pi's title and body strings, and push `Import cancelled` on decline — which finally makes the dead `cancelled` arm reachable.
+
+**Verify** — app test: `/import p.jsonl` opens a confirm dialog; declining leaves the session untouched and pushes `Import cancelled`; accepting imports.
+
+
+## TUI-082 — bare `/export` writes no file: it dumps the raw HTML into the transcript
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed
+
+**cyrup** — the no-path branch (`crates/cyrup-tui/src/app.rs:4834-4848`) calls `push_block("Session (HTML)", html)`.
+
+**upstream** — `pi/…/interactive-mode.ts:5435-5446` @v0.83.0 (`exportToHtml(outputPath)` with `outputPath === undefined`) → `pi/packages/coding-agent/src/core/agent-session.ts:3215-3231`, documented `@param outputPath Optional output path (defaults to session directory)`; the handler then shows `Session exported to: ${filePath}`.
+
+**Impact** — bare `/export`, the most likely invocation, produces **no artifact** and floods scrollback with HTML source. The user is given no path, so they cannot find a file that was never written. Distinct from `DRIFT-041`, which is about the quality of the HTML that gets rendered, not about whether a file is written — do not fold them.
+
+**Fix** — default the output path to the session directory the way `agent-session.ts:3215-3231` does, write the file, and push `Session exported to: {path}`. The `push_block` fallback should go entirely; there is no upstream branch it corresponds to.
+
+**Verify** — app test: bare `/export` writes a `.html` under the session directory and the status names that path; the transcript contains no HTML source.
+
+
+## TUI-083 — `/quit`'s description is a hardcoded literal where pi templates the app name
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup-tui/src/commands.rs:82` hardcodes `"Quit cyrup"`; `grep -rn 'APP_NAME|app_name' crates/cyrup-config/src crates/cyrup-core/src` finds no counterpart constant.
+
+**upstream** — `pi/packages/coding-agent/src/core/slash-commands.ts:41` @v0.83.0 + `config.ts:489` — the description is built as `Quit ${APP_NAME}` where `APP_NAME = piConfigName || "pi"`, i.e. a user running under a renamed config sees their own app name.
+
+**Impact** — low today, because cyrup has no config-name override. The row exists because the **mechanism** is unported, not the string: the moment a config-name override is added, this line is wrong and nothing will point at it. TUI-025 already fixed three sibling literals in this table by re-reading pi's strings; it did not notice that this one is not a string upstream at all.
+
+**Fix** — introduce the `APP_NAME` constant (config-name override falling back to `"cyrup"`) where cyrup's config name would live, and build the description from it. If the override is not wanted, say so at the call site and cite `config.ts:489`, so the difference is a decision rather than an oversight.
+
+**Verify** — a registry test asserting the description tracks the constant rather than a literal.
+
+
+## TUI-084 — the argument-less usage strings for `/import` and `/name` diverge in wording and in severity channel
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `/import` with no arg: `usage: /import <path>` via `push_status` (`app.rs:4966`). `/name` with no arg: `usage: /name <session name>` via `push_status` (`app.rs:2086`).
+
+**upstream** — `pi/…/interactive-mode.ts:5482` and `:5639` @v0.83.0 — `/import`: `Usage: /import <path.jsonl>` via `showError`; `/name` with no arg **and no name set**: `Usage: /name <name>` via `showWarning`.
+
+**Impact** — three string divergences (casing, the dropped `.jsonl` constraint, `<session name>` vs `<name>`) plus a **severity-channel** divergence: upstream's error/warning become a neutral status, so the line is not coloured or prefixed as a problem. That channel question is the same one `TUI-062` records for `showWarning`'s `Warning: ` prefix — this item is a caller-side instance of it, and the two should be settled together.
+
+**Fix** — match pi's strings verbatim and route them through the error/warning entry kinds rather than `push_status`. `/name`'s branch also depends on TUI-080: upstream only reaches the usage warning when **no name is set**.
+
+**Verify** — app tests asserting the exact strings and the entry kind for both commands.
+
+
+## TUI-085 — a dynamic command with no `sourceInfo` is tagged `[t]`; pi leaves the description unprefixed
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `dynamic_commands_from_catalog_gated` defaults a missing `sourceInfo.scope` to `"temporary"` → tag `t` and **always** prefixes (`crates/cyrup-tui/src/commands.rs:344-355`), so a `sourceInfo`-less row renders `[t] desc`.
+
+**upstream** — `pi/…/interactive-mode.ts:497-528` @v0.83.0 — `getAutocompleteSourceTag` returns `undefined` for a missing `sourceInfo` (`:498-500`), and `prefixAutocompleteDescription` then returns the description **unprefixed** (`:523-526`).
+
+**Impact** — unreachable through cyrup's own catalog, which always emits `sourceInfo`. Recorded because the divergence lives in a `pub fn` any future caller can hit, and because a wrong provenance tag is worse than none: `[t]` claims the command came from a temporary scope it may not have.
+
+**Fix** — make the scope `Option`, return `None` from the tag helper when `sourceInfo` is absent, and skip the prefix in that case.
+
+**Verify** — a unit test over `dynamic_commands_from_catalog_gated` with a row carrying no `sourceInfo`, asserting the description is unprefixed.
+
+
+## TUI-086 — two slash-command structures have no upstream counterpart: `CommandSource::Builtin` and a public `autocomplete_source_tag`
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** —
+
+1. **`CommandSource::Builtin`** (`crates/cyrup-tui/src/commands.rs:21`). pi's `SlashCommandSource` is exactly `"extension" | "prompt" | "skill"` (`core/slash-commands.ts:4`), and `BuiltinSlashCommand` (`:13-17`) has **no `source` field at all** — builtins are a different type. cyrup unified the two into one struct, which forces a fourth variant.
+2. **`autocomplete_source_tag` is exported from the crate** (`commands.rs:263`). pi's `getAutocompleteSourceTag` is a private method on `InteractiveMode` (`interactive-mode.ts:497`).
+
+**Impact** — (1) means `CommandSource` is **not** the port of `SlashCommandSource`: anything that serializes it will emit a value pi has no word for, which matters the moment a command list crosses the RPC or WIT boundary. The unification is defensible and internally consistent; the hazard is treating the enum as pi's. (2) is harmless in itself but widens the public surface past pi's and invites callers upstream has no counterpart for — the same shape as `ToolInfo::source`, a field pi has no word for.
+
+**Fix** — no behavioural change proposed. Document on `CommandSource` that `Builtin` is cyrup-only and must never be serialized as a `SlashCommandSource`; make `autocomplete_source_tag` `pub(crate)` unless a cross-crate caller exists (there is none at HEAD).
+
+**Verify** — a compile-level check that no serializer reaches `CommandSource`, and `cargo check -p cyrup-tui --all-targets` after the visibility narrowing.
+
+
+## TUI-087 — `commands.rs`'s upstream citations do not resolve at v0.83.0, and one names a symbol that does not exist
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — the file mixes v0.84.1-era offsets into a v0.83.0 port, and one citation is to a function that was never written. All verifiable with `git -C pi show v0.83.0:<path> | grep -n`:
+
+| cite | at `commands.rs` | actually, at v0.83.0 |
+|---|---|---|
+| `core/slash-commands.ts:18-41` | `:3-5` | the table is `:19-42`, path `packages/coding-agent/src/core/slash-commands.ts` |
+| `interactive-mode.ts:2549-2734` (`setupEditorSubmitHandler`) | `:3-5` | `:2660-2846` |
+| `interactive-mode.ts:2657-2671` (hidden commands) | `:86` | `:2769-2783` |
+| `interactive-mode.ts:536-559` (`getAutocompleteSourceTag`) | `:256` | `:497-520` |
+| `interactive-mode.ts:561-567` (`prefixAutocompleteDescription`) | `:279` | `:522-528` |
+| `rpc-mode.ts:676-690` | `:311` | path is `modes/rpc/rpc-mode.ts` |
+| "only `/model` in Pi, `:498-528`" | `:43` | **wrong on both halves** — pi has TWO commands with `getArgumentCompletions` at v0.83.0 (`:555` model, `:582` login, and the code six lines below the comment already gives `/login` an `arg_cmd`), and `:498-528` lands on `getAutocompleteSourceTag`/`prefixAutocompleteDescription`, not on either completer |
+| `AgentSession::expand_slash_command` | `:317` | **no such function.** `grep -rn 'expand_slash_command' crates/ --include='*.rs'` returns only this comment; the real functions are `expand_input_text` and `expand_skill_command` (`crates/cyrup-session-svc/src/session.rs:1208`, `:1216`) |
+
+The `:610-622` skill-gate cite is the one that does resolve.
+
+**Impact** — a fabricated symbol reference inside a doc comment that is otherwise making a correct behavioural claim is the same class as the fabricated pi citation on `working-start`/`working-stop`: the claim reads as verified and cannot be checked, and the next reader either trusts it or re-derives the whole seam. The stale offsets are the milder half — they cost a reader one `grep` each — but they are how a v0.84.1 reading silently becomes the baseline.
+
+**Fix** — retarget all eight to v0.83.0, and replace `expand_slash_command` with the two real function names. Pure comment edit, no behaviour.
+
+**Verify** — every cite in `commands.rs` resolves under `git -C pi show v0.83.0:<path>`; ideally a script that extracts `path:line` pairs from the crate's comments and checks them, since this is the third area to hit the same class.
 
 
 ## Coverage

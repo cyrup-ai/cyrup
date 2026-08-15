@@ -474,3 +474,72 @@ fn opencode_go_minimax_m3_display_name_matches_upstream() {
     let m = pick(&selection(), "opencode-go", "minimax-m3");
     assert_eq!(m.name, "MiniMax-M3");
 }
+
+// ------------------------------------------------------------- invented compat flags (PROV-061) --
+
+/// **PROV-061.** The two `openai-completions` rows in `fireworks.json` carried
+/// `sendSessionAffinityHeaders: true` and `supportsLongCacheRetention: false`, and pi carries
+/// NEITHER at either provenance revision: `git show 91585d9a:packages/ai/src/providers/fireworks.models.ts`
+/// and `git show b0c2a90e:...` both give `compat: {"supportsStore":false,"supportsDeveloperRole":false}`
+/// for `accounts/fireworks/models/glm-5p2` (`:61-68`) and `accounts/fireworks/routers/glm-5p2-fast`
+/// (`:224-231`). That made it invention, not provenance lag — the flag block was pattern-matched
+/// from the fourteen `anthropic-messages` rows in the same file, where it is legitimate.
+///
+/// It was not inert. `openai-completions`' affinity gate is `if (sessionId && compat.sendSessionAffinityHeaders)`
+/// (pi `api/openai-completions.ts:647`, ported at `api/openai_completions.rs:249-260`), and
+/// `detect_compat` gives `send_session_affinity_headers: false` for fireworks
+/// (`api/compat.rs:491`), so the catalog value alone decided it: cyrup emitted `session_id`,
+/// `x-client-request-id` and `x-session-affinity` to Fireworks on both models, on every request
+/// carrying a session id, where pi emits none.
+///
+/// The assertion is stated over the whole provider rather than the two ids, so re-introducing the
+/// pattern-match on a future `openai-completions` row fails here too. The `anthropic-messages` rows
+/// are deliberately excluded: `sendSessionAffinityHeaders: true` IS upstream's value for all
+/// fourteen of them.
+#[test]
+fn fireworks_openai_completions_rows_carry_no_invented_affinity_or_cache_flags() {
+    let models = selection();
+    let rows: Vec<Model> = models
+        .get_models(Some("fireworks"))
+        .into_iter()
+        .filter(|m| m.api.as_str() == "openai-completions")
+        .collect();
+
+    assert_eq!(
+        rows.len(),
+        2,
+        "fireworks ships exactly two openai-completions rows (glm-5p2, glm-5p2-fast); \
+         if that changed, re-derive this test's scope against pi's fireworks.models.ts"
+    );
+
+    for m in rows {
+        let compat = m
+            .compat
+            .as_ref()
+            .unwrap_or_else(|| panic!("fireworks/{} lost its compat block entirely", m.id));
+        assert_eq!(
+            compat.send_session_affinity_headers, None,
+            "fireworks/{} declares sendSessionAffinityHeaders; pi's fireworks.models.ts declares \
+             it on no openai-completions row at either provenance revision, and the flag alone \
+             makes cyrup emit session_id / x-client-request-id / x-session-affinity",
+            m.id
+        );
+        assert_eq!(
+            compat.supports_long_cache_retention, None,
+            "fireworks/{} declares supportsLongCacheRetention; pi declares it on no fireworks row",
+            m.id
+        );
+        assert_eq!(
+            compat.supports_store,
+            Some(false),
+            "fireworks/{} must keep pi's supportsStore: false",
+            m.id
+        );
+        assert_eq!(
+            compat.supports_developer_role,
+            Some(false),
+            "fireworks/{} must keep pi's supportsDeveloperRole: false",
+            m.id
+        );
+    }
+}

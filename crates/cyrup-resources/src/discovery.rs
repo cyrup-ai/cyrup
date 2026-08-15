@@ -150,11 +150,11 @@ pub struct DiscoveryConfig {
     /// The `PackageStore` global root — the value the `install` subcommand passes as the store's
     /// `global_dir` when it records an install (`PackageStore::new(dirs.package_dir, …)`, cyrup
     /// subcommands.rs:396; Pi `dirs.package_dir`, env.rs:156-160). Used to resolve installed
-    /// **Global**-scope package working trees, i.e. `<package_global_dir>/packages/<id>`. Kept
-    /// DISTINCT from `global_dir` (which roots the loose global resources at `<global_dir>/skills`,
-    /// `/prompts`, `/themes`) because the bin passes its `package_dir` — not `agent_dir` — as the
-    /// store root, so a Global package's tree lives one level deeper than a naive
-    /// `<global_dir>/packages/<id>` guess. Defaults to `<global_dir>/packages` (the bin's own default
+    /// **Global**-scope package working trees, i.e. `<package_global_dir>/<id>` (CFG-054 — this was
+    /// `<package_global_dir>/packages/<id>` until [`PackageStore::packages_root`] stopped doubling
+    /// the segment). Kept DISTINCT from `global_dir` (which roots the loose global resources at
+    /// `<global_dir>/skills`, `/prompts`, `/themes`) because the bin passes its `package_dir` — not
+    /// `agent_dir` — as the store root. Defaults to `<global_dir>/packages` (the bin's own default
     /// for `package_dir`), so callers that don't set a custom `--package-dir`/`CYRUP_PACKAGE_DIR`
     /// resolve installed Global packages correctly with no extra wiring.
     pub package_global_dir: PathBuf,

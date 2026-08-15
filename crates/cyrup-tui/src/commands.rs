@@ -86,6 +86,18 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
 /// (`interactive-mode.ts:2657-2671`): `/debug` + the two easter eggs.
 pub const HIDDEN_COMMANDS: &[&str] = &["debug", "arminsayshi", "dementedelves"];
 
+/// TUI-074 — the **only** dispatch names that accept an argument
+/// (`interactive-mode.ts:2666-2793` @v0.83.0).
+///
+/// `setupEditorSubmitHandler` is a hand-written if-chain, and its guards are not uniform: six
+/// commands are `text === "/x" || text.startsWith("/x ")` — `/model` (`:2676`), `/export` (`:2682`),
+/// `/import` (`:2687`), `/name` (`:2702`), `/login` (`:2742`) and `/compact` (`:2758`) — while the
+/// other nineteen, `/settings` (`:2666`) through `/quit` (`:2789`), are strict equality. So
+/// upstream `/quit now` is **not** the quit command: it falls past the whole chain and is sent to
+/// the model as a prompt. Matching that requires this list; a uniform matcher cannot express it.
+const ARGUMENT_DISPATCH_NAMES: &[&str] =
+    &["model", "export", "import", "name", "login", "compact"];
+
 const fn cmd(
     name: &'static str,
     description: &'static str,
@@ -204,8 +216,9 @@ impl CommandRegistry {
     ///
     /// Order (load-bearing, matching `interactive-mode.ts:2554-2734`):
     /// 1. `trim()`; empty → [`Dispatch::Empty`].
-    /// 2. A slash command via **exact-or-`"name "`-prefix** match (so `/modelX` is NOT `/model`).
-    ///    The argument is `text[name.len()+1..].trim()`, `None` when empty.
+    /// 2. A slash command via **exact** match, plus the `"name "`-prefix form for the six names in
+    ///    [`ARGUMENT_DISPATCH_NAMES`] (so `/modelX` is NOT `/model`, and `/quit now` is NOT
+    ///    `/quit`). The argument is `text[name.len()+1..].trim()`, `None` when empty.
     /// 3. `!`/`!!` → [`Dispatch::Bash`] (checked **after** the slash table, **before** the prompt
     ///    fallback). An empty body falls through to a prompt.
     /// 4. Everything else (incl. unknown `/foo`) → [`Dispatch::Prompt`].
@@ -235,12 +248,19 @@ impl CommandRegistry {
         Dispatch::Prompt(trimmed.to_string())
     }
 
-    /// Match `slash` (the text **after** the leading `/`) against a recognized command using
-    /// exact-or-`"name "`-prefix semantics. Returns `(name, arg)` with the trimmed argument.
+    /// Match `slash` (the text **after** the leading `/`) against a recognized command. Exact match
+    /// for every name; the additional `"name "`-prefix form **only** for the six names in
+    /// [`ARGUMENT_DISPATCH_NAMES`], which is the set upstream's if-chain guards with
+    /// `|| text.startsWith("/x ")`. Returns `(name, arg)` with the trimmed argument.
     fn match_command(&self, slash: &str) -> Option<(&'static str, Option<String>)> {
         for &name in &self.dispatch_names {
             if slash == name {
                 return Some((name, None));
+            }
+            if !ARGUMENT_DISPATCH_NAMES.contains(&name) {
+                // Strict equality upstream, so `/quit now`, `/copy that`, `/new session` and
+                // `/trust me` are prompts, not commands (`interactive-mode.ts:2666-2793`).
+                continue;
             }
             // `"name "`-prefixed: an argument follows. `strip_prefix(name)` then a leading space.
             if let Some(rest) = slash.strip_prefix(name)

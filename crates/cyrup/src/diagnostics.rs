@@ -187,12 +187,19 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
             i += 2;
             continue;
         }
-        // An unknown single-dash option (`-x`, `-5`, `-tfoo`, …) — Pi `Unknown option` error
+        // An unknown single-dash option (`-x`, `-5`, `-tfoo`, `-`, …) — Pi `Unknown option` error
         // (args.ts:202-203). A bare `--`-prefixed token is left for the extension-flag capture / clap;
         // an `@file` and a plain positional are left untouched.
+        //
+        // SEAM-104: there is deliberately NO length guard. Pi's predicate is exactly
+        // `arg.startsWith("-") && !arg.startsWith("--")` (args.ts:202), which the one-character
+        // token `-` satisfies, and its final arm is `else if (!arg.startsWith("-"))` (`:204`), so a
+        // bare `-` can never reach `result.messages`. cyrup previously required `arg.len() > 1`,
+        // letting `-` fall through to the positionals and become the PROMPT — a bare `cyrup -`
+        // started a real agent turn and issued a provider request where pi exits 1 without
+        // contacting anything.
         if arg.starts_with('-')
             && !arg.starts_with("--")
-            && arg.len() > 1
             && !KNOWN_SHORT_FLAGS.contains(&arg.as_str())
         {
             diagnostics.push(Diagnostic::error(format!("Unknown option: {arg}")));
@@ -285,6 +292,23 @@ mod tests {
         let (_clean, diags) = apply_arg_leniency(&v(&["-tfoo"]));
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].level, DiagnosticLevel::Error);
+    }
+
+    /// SEAM-104 — RED before the fix, which carried an `arg.len() > 1` guard that Pi does not have.
+    /// `arg.startsWith("-") && !arg.startsWith("--")` (args.ts:202 @v0.83.0) matches the
+    /// one-character token `-`, and Pi's message arm is `else if (!arg.startsWith("-"))` (`:204`),
+    /// so a bare dash is an exit-1 error upstream and is NEVER carried through as a prompt.
+    #[test]
+    fn bare_single_dash_is_an_unknown_option_not_a_prompt() {
+        let (clean, diags) = apply_arg_leniency(&v(&["-"]));
+        assert!(clean.is_empty(), "a bare `-` must not survive as a message: {clean:?}");
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].level, DiagnosticLevel::Error);
+        assert_eq!(diags[0].message, "Unknown option: -");
+        // `--` still belongs to clap / the extension-flag capture, not to this arm.
+        let (clean, diags) = apply_arg_leniency(&v(&["--"]));
+        assert_eq!(clean, v(&["--"]));
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

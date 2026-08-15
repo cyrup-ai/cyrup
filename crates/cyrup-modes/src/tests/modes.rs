@@ -1066,6 +1066,66 @@ async fn rpc_extension_ui_request_response_round_trips() {
     rpc.await.unwrap();
 }
 
+/// SEAM-086 — a malformed `extension_ui_response` is SWALLOWED, never answered.
+///
+/// pi's `handleInputLine` intercepts on the `type` discriminant alone and `return`s unconditionally
+/// (`packages/coding-agent/src/modes/rpc/rpc-mode.ts:763-777` @v0.83.0):
+///
+/// ```ts
+/// if (… parsed.type === "extension_ui_response") {
+///     const response = parsed as RpcExtensionUIResponse;
+///     const pending = pendingExtensionRequests.get(response.id);
+///     if (pending) { pendingExtensionRequests.delete(response.id); pending.resolve(response); }
+///     return;
+/// }
+/// ```
+///
+/// so an envelope with no `id`, a non-string `id`, or an `id` matching nothing produces **no output
+/// line at all**. cyrup decided the intercept on the id instead, so those three lines fell through
+/// to `dispatch` and were answered with an `Unknown command: extension_ui_response` error response —
+/// an extra stdout line a client can observe. RED before the fix on the first of the three cases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rpc_malformed_extension_ui_response_is_swallowed_not_answered() {
+    use tokio::io::{AsyncWriteExt, BufReader};
+
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let runtime = build_runtime(&fx, faux).await;
+
+    let (mut client_tx, server_rx) = tokio::io::duplex(64 * 1024);
+    let (server_tx, client_rx) = tokio::io::duplex(64 * 1024);
+    let mut client_reader = BufReader::new(client_rx);
+
+    let rpc = tokio::spawn(async move {
+        let reader = BufReader::new(server_rx);
+        let mut writer = server_tx;
+        run_rpc(&runtime, reader, &mut writer).await.expect("rpc mode runs");
+    });
+
+    // Three malformed/unmatched envelopes, each of which pi swallows: no `id` at all, a non-string
+    // `id`, and a well-formed string `id` that matches no pending dialog.
+    for line in [
+        "{\"type\":\"extension_ui_response\",\"value\":\"x\"}\n",
+        "{\"type\":\"extension_ui_response\",\"id\":42,\"value\":\"x\"}\n",
+        "{\"type\":\"extension_ui_response\",\"id\":\"ext-ui-999\",\"value\":\"x\"}\n",
+    ] {
+        client_tx.write_all(line.as_bytes()).await.unwrap();
+    }
+
+    // A sentinel command AFTER them. Because the loop services stdin lines in order, the first line
+    // the client reads back is the sentinel's response iff none of the three produced output.
+    client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"sentinel\"}\n").await.unwrap();
+    let first = read_json_line(&mut client_reader).await;
+    assert_eq!(
+        first["command"], "get_state",
+        "a malformed extension_ui_response must produce NO stdout line; got {first} first"
+    );
+    assert_eq!(first["id"], "sentinel");
+
+    drop(client_tx);
+    rpc.await.unwrap();
+}
+
 /// The fire-and-forget half of the `ui` capability (`notify`/`set-status`/`set-widget`/`set-title`/
 /// `set-editor-text`/`paste-editor-text`) must ALSO reach the RPC client, exactly like Pi's own
 /// `notify`/`setStatus`/`setWidget`/`setTitle`/`setEditorText` RPC handlers, each of which just calls

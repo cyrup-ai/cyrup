@@ -53,7 +53,10 @@
 //!
 //! # Contract
 //!
-//! Pi ships this as a documented break, `coding-agent/docs/rpc.md:952-956`:
+//! Pi ships this as a documented break, `coding-agent/docs/rpc.md:952-956` **@v0.84.1** (SEAM-085 —
+//! the version tag is load-bearing: at the ported v0.83.0 baseline `docs/rpc.md:952-956` is the
+//! *streaming example*, which shows `"message":{...}` and `"partial":{...}` on every delta, i.e. the
+//! exact opposite of the contract quoted below):
 //!
 //! > `message_update` intentionally omits the former cumulative `message` field and
 //! > `assistantMessageEvent.partial`. Clients that need a live partial message must assemble it from

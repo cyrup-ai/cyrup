@@ -50,6 +50,50 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 
 ## 0. Census — every open item in the twelve area files, by class
 
+> **SUPERSEDED — FOURTH EDITION 2026-08-14 (after the surface enumeration). Every census below this
+> block, including the third edition's, enumerates a set that no longer exists.**
+>
+> **Open set: 237 work items — 0 critical, 5 high, 88 medium, 144 low** (was 145 = 0/2/61/82), plus
+> the same **10 `tracker` rows**. **606 rows across the twelve tables: 360 carry a full closure marker
+> and 36 more a partial one — 396 of 606 (65%).** Derived row by row from the twelve `## Open items`
+> tables **in the working tree** — the four surface writers' filings are not committed yet; the last
+> code commit is `5990e86`. The counting rule is the third edition's, and it was validated by
+> re-running it against the same twelve files at commit `e5c6933`, where it reproduces
+> **503 / 349 / 35 / 145 = 0/2/61/82** exactly. **`13-cyrup-mcp.md`, `13a`–`13i` and
+> `MCP-PORT-METHODOLOGY.md` are owned by another team and are excluded from every figure in this
+> file** — as they always have been, though it was never written down.
+>
+> **The ninth pass was not a sweep. It enumerated nine finite pi SURFACES mechanically and diffed
+> both directions: 191 findings — 67 missing in cyrup, 66 cyrup-original, 58 differing in shape —
+> against the 10-25 a late-stage sweep produces. 93 ids were filed, 11 closed on arrival.** Five of
+> the nine surfaces were walked completely; four state exactly what they could not reach. See
+> `00-residual-ledger.md`'s fourth-edition block for the re-run recipe, the incomplete-surface list
+> and the `cyrup-original` count. **No ID was renumbered, merged or deleted; `SEAM-087`…`SEAM-099` are
+> deliberately unallocated — do not "recover" them.**
+>
+> **THE ABOVE-MEDIUM SET IS NOW FIVE ROWS, NOT TWO. §0a below is stale in a way that costs work.**
+> Joining `PROV-047` and `SESS-040`: **`PROV-054`** (xai `grok-4.5` routed over `openai-completions`
+> where pi uses `openai-responses` — and it is the xai *default* model), **`PROV-055`** (opencode's
+> `sessionAffinityFormat: "openai-nosession"` missing on all 16 `openai-responses` rows, so cyrup
+> leaks a `session_id` header pi suppresses) and **`PROV-056`** (kimi-coding's `forceAdaptiveThinking`
+> ×3 and `allowEmptySignature` ×1 — two wire divergences per request on every model of the provider).
+> **All three are catalog DATA and share ONE fix site with `PROV-057`…`PROV-059`:** they close through
+> `PROV-018`/`PROV-060`'s bulk regeneration in the commit that rewrites `catalog_manifest.json`.
+> **Do not schedule them individually** — that produces six agents each hand-patching one catalog row
+> and each invalidating the manifest.
+>
+> **§6 q5 (OQ-5) IS REFUTED and is corrected in place below.** Catalog accuracy IS statically
+> auditable; the "two-line re-export" premise holds only from `a9f6a3159` onward, and its direct
+> parent `b0c2a90e` — cyrup's own stated provenance floor — still carries the full data literals.
+> Filed as `PROV-060`.
+>
+> **§5's "21 `cyrup-original` items in the census" is likewise stale: the class is now 46 open rows
+> (68 filed), and it has its own section in the ledger.** 66 of this pass's 191 findings are surfaces
+> cyrup has and pi does not — the class through which divergence enters while everyone is looking at
+> parity.
+>
+> *Superseded third-edition census follows.*
+
 > **SUPERSEDED — THIRD EDITION 2026-08-14 (after sweeps 7-8). The census below enumerates a set that
 > no longer exists, and so does the second-edition block beneath it.** **Eight** whole-backlog sweeps
 > have landed. The current set, re-derived row by row from the twelve `## Open items` tables, is
@@ -194,6 +238,12 @@ Where the re-audit moved an item to a different class, the id moves section and 
 
 ## 0a. Everything above medium, in one table
 
+> **SUPERSEDED — FOURTH EDITION 2026-08-14. The above-medium set is FIVE rows: `SESS-040`,
+> `PROV-047`, and the three new catalog highs `PROV-054` / `PROV-055` / `PROV-056`** — all three
+> found by the provider-surface enumeration, all three wire divergences on live request paths, and
+> all three closing through ONE bulk catalog regeneration rather than individually. Tabled at the top
+> of `00-residual-ledger.md`. Everything below in this section is older still.
+
 > **SUPERSEDED — SECOND EDITION 2026-08-14 (after sweeps 3-6). The current above-medium set is TWO
 > rows — `SESS-040` and `PROV-047` — tabled at the top of `00-residual-ledger.md`.** `SEAM-061`
 > closed as REFUTED: sweep 6 found it already landed at HEAD in **both** crates
@@ -252,6 +302,15 @@ closes: `AGENT-020`+`AGENT-030`, `TUI-042`+`TUI-043`+`TUI-044`, `SEAM-047`+`SEAM
 ---
 
 ## 1. Port bugs — upstream had it at the tag cyrup ported; cyrup does not
+
+> **⚠ INCOMPLETE AS OF 2026-08-14 (fourth edition), and stated rather than implied. The class
+> sections §1–§4 were NOT regenerated for the 93 ids the surface enumeration filed.** They enumerate
+> the pre-enumeration set. The 93 new ids carry no `PB-nn` / `UW-nn` / `VL-nn` entry number and are
+> **not** listed below — they are in their area files, with the counts and the cross-cutting reading
+> in `00-residual-ledger.md`'s fourth-edition block. Regenerating these sections is a pass of its own
+> (67 of the 191 findings are `missingInCyrup`, i.e. §1 material; 58 are `differingShape`, which this
+> taxonomy has no home for at all — **that is itself a finding about the taxonomy**). **Do not read
+> the absence of an id from §1 as evidence that no port bug was filed for it.**
 
 **These rank above everything else in this document at equal severity.** They are not version lag:
 the behaviour was available to be ported and was not.
@@ -909,9 +968,24 @@ Also dead on **both** sides, so purely cosmetic: `crates/cyrup-provider/src/lega
 (mirrors pi's own deprecated shim) and `nested_events.rs`'s `is_top_level_async_dir` /
 `nested_artifact_env` (upstream's `nested-events.ts` definitions have no call sites at v0.43.0 either).
 
-**Do not confuse this section with the 21 `cyrup-original` items in the census.** Those are invented
+**Do not confuse this section with the `cyrup-original` items in the census.** Those are invented
 *behaviour*, not dead code — they run, they diverge from pi, and each needs a decision (delete, or
-justify with a `[CYRUP-DELTA]` note). Three of them are now the highest-severity invented surface in
+justify with a `[CYRUP-DELTA]` note).
+
+> **UPDATED 2026-08-14 (fourth edition): the class is no longer 21 items. It is 46 open rows out of
+> 68 filed, and it now has its own section and its own count in `00-residual-ledger.md`.** 66 of the
+> surface enumeration's 191 findings are surfaces cyrup has and pi does not — 31 of them newly filed
+> and open. **Rate them by REACHABILITY**: an advertised-but-dead surface (`TUI-063` —
+> `CYRUP_SHARE_VIEWER_URL` is in `--help` and read by nothing; `EXT-071` — a WIT comment advertising a
+> `ToolInfo.source` field that was already removed from the emitted object) outranks an internal
+> helper, and a mechanism port the language forces (a WASM guest cannot hand a function back, so
+> pi's callback values necessarily become WIT exports) is not divergence at all. **The most dangerous
+> members are the ones other analysis has already built on**: `SEAM-080`'s cyrup-invented
+> `model_changed` RPC line is reasoned about as upstream by two existing backlog items, exactly as
+> `SEAM-100`'s missing `cyrup update --models` was. By area the open set is 05 → 14, 08 → 11,
+> 06 → 8, 01 → 5, 07 → 5, 04 → 1, 09 → 1, 11 → 1.
+
+Three of them are the highest-severity invented surface in
 the port, and two of those are the whole reason this class needs a decision rather than a backlog
 slot:
 - **`EXT-054` (UW-13) — *critical***: an advertised per-extension sandbox that grants nothing.
@@ -928,7 +1002,7 @@ Also in this class: `TOOL-038` (on Windows with no bash, `bash` silently falls b
 2. **The compact-read `docs` arm (PB-4).** Upstream resolves against `dirname(getReadmePath())` — the shipped npm package tree. A Rust binary ships no such tree beside it. Porting the behaviour requires deciding what cyrup's "shipped docs root" is (embedded? install-relative? nothing?). Area 04 states the blocker precisely: **a packaged-docs locator has to exist before the arm can be written.**
 3. **Windows (PB-19).** The broker's Unix-only bind is unambiguous, but `crates/` carries 161 `cfg(unix)` sites against 6 `cfg(windows)`, so this may be a property of the whole port. If Windows is out of scope for the binary, PB-19 reduces to its second half (the client resolves TCP targets a cyrup broker never serves, and the ported listen resolver is dead) — still real, but smaller. **This question also governs `DRIFT-046` (`normalizeWindowsShellPath`), `TOOL-036` (the win32 leg of `normalizePath`) and `TOOL-038`** (the `cmd.exe` fallback), so answer it once for all four. Note that `TOOL-036`'s `~`/`os.homedir()` half is a v0.83.0 parity bug on **every** platform and does not wait on this answer.
 4. **SDK-surface parity vs behavioural parity.** `VL-P5`/`DRIFT-047` (telemetry), `SESS-038` (`session-backends/sqlite-node`), `SEAM-058` (`packages/{server,protocol,client}`) and `PROV-031` are all embedder-facing with no user-visible symptom in the cyrup binary. Is SDK-surface parity in scope, or do we track it separately? **Four separate area files asked this independently**, which is the signal that it needs deciding rather than re-litigating per item. `SESS-038` and `SEAM-058` are now trackers, as is `AGENT-028` (the other owner of the telemetry half), precisely because the answer — not more analysis — is what unblocks them.
-5. **Catalog accuracy (VL-P25 / `PROV-004` / `DRIFT-009`) is not *statically* auditable — but it IS auditable.** pi generates `providers/data/*.json` and gitignores the output (`pi/.gitignore:11`); every `*.models.ts` at v0.84.1 is a two-line re-export, so no pricing, context-window, `maxTokens` or compat-flag claim about the 35 embedded catalogs can be checked by reading this workspace. **The generator itself is committed at both tags** (§4), so the honest options are: accept structural parity only, or run pi's `generate:models` / `diff:model-catalog` and diff the result. **`PROV-018`'s `xtask` generator is the highest-leverage tooling item in the port** for exactly this reason, and `DRIFT-009` now defers to it rather than proposing the lossier pi.dev-artifact path.
+5. **REFUTED 2026-08-14 (fourth edition) — CATALOG ACCURACY *IS* STATICALLY AUDITABLE, and this question is no longer open on its stated premise.** Filed as **`PROV-060`**. The "every `*.models.ts` is a two-line re-export" premise below is true only from **`a9f6a3159`** onward — the single commit that both gitignored `providers/data/` and converted the files to re-exports. Its **direct parent `b0c2a90e` still carries the full data literals, and `b0c2a90e` is the revision cyrup's own `catalog_manifest.json` names as its provenance floor.** `git log --oneline b0c2a90e..a9f6a3159` returns exactly one commit. So the whole catalog is checkable with `git show b0c2a90e:packages/ai/src/providers/<name>.models.ts` plus a short parser — no generator run, no `npm install`, no network. **It was done in this pass: 35/35 catalogs parsed, 1072 upstream models vs 1078 cyrup, 1027 compared field-by-field, yielding 25 missing models (`PROV-057`), 16 extra (`PROV-058`), 28 compat-flag differences and 119 non-compat field differences (`PROV-059`) — including the wire-API mismatch that is now the high `PROV-054`.** Nine sweeps inherited the "unverifiable" verdict; the data was one `git show` away the whole time. **`PROV-018`'s `xtask` generator is still the right fix site** — the same recipe is the drift check it needs — but it is no longer blocked on an unanswerable question. **Two caveats travel with every catalog claim derived this way:** `b0c2a90e` is **13 days earlier than v0.83.0**, so a clean refresh still leaves an unmeasurable residue and *"catalog parity at v0.83.0" is a claim about `b0c2a90e` plus an unbounded delta*; and a regeneration will **re-introduce** groq `qwen/qwen3-32b`'s deliberately-removed `thinkingLevelMap` (`PROV-064`) unless the generator carries a named exception list. *The original question is retained below for provenance; its factual premise is dead.* ~~**Catalog accuracy (VL-P25 / `PROV-004` / `DRIFT-009`) is not *statically* auditable — but it IS auditable.**~~ pi generates `providers/data/*.json` and gitignores the output (`pi/.gitignore:11`); every `*.models.ts` at v0.84.1 is a two-line re-export, so no pricing, context-window, `maxTokens` or compat-flag claim about the 35 embedded catalogs can be checked by reading this workspace. **The generator itself is committed at both tags** (§4), so the honest options are: accept structural parity only, or run pi's `generate:models` / `diff:model-catalog` and diff the result. **`PROV-018`'s `xtask` generator is the highest-leverage tooling item in the port** for exactly this reason, and `DRIFT-009` now defers to it rather than proposing the lossier pi.dev-artifact path.
 6. **The first-run wizard (UW-2).** The standing trap list says it is "deliberately unreachable"; the code says `is_official_distribution()` is **true** for this build and the gate can fire into an empty `if` body. One of the two is wrong — and **as of the 2026-08-13 live run it is the trap list**: the gate was measured firing (the `xp` badge proves `CYRUP_EXPERIMENTAL=1` was read, the empty agent dir proves `settings_path` did not exist) straight into the empty body, on a pty where the sibling selectors rendered fine. Treat this as a product decision awaiting an answer, not as a documentation discrepancy. Decide whether the wizard ships (wire `startup.rs:256`) or does not (delete the predicate and the dead function, and correct the trap list) — it cannot stay in this state, because the current shape is the worst of both. **ANSWERED 2026-08-13 by ADR-0011: it ships.** `startup.rs`'s wizard is wired at pi's call position with pi's full condition, nothing was deleted, and the trap-list entry was struck from `README.md`. See `UW-2` above for the code, the tests, and the live run that is still owed. This question is closed; note for the record that the escalation token in `UW-2` used to read "OQ-6", which is wrong under both namespaces — this is `PARITY-PLAN` §7 **OQ-9** / `PARITY-GAPS` §6 q6.
 7. **pi's agent-harness v2 (VL-P22 / `AGENT-028` / `DRIFT-040` / `SESS-038`).** ~11.4k insertions / ~10.9k deletions in `packages/agent/src/harness/**` in this delta — an `agent-harness.ts` rewrite, a new 667-line `reducer.ts`, a new `session/` subtree with its own JSONL codec/repo/storage/state and a 993-line conformance suite, and a new typed telemetry layer. **No area file owns it and nobody has measured it.** Do we (a) absorb it, (b) track interop only (read harness-v2-written sessions, keep writing the coding-agent format), or (c) declare it out of scope until pi's own `coding-agent` migrates? The torn-tail bug inside VL-P22 is small and should be fixed regardless of the answer. **`AGENT-028` and `SESS-038` are the same question in two files and must be answered together.**
 8. **NEW — the alt-screen/TUI-mode scope decision (VL-P19 / `TUI-019`, filed in area 07 as `OQ-07-1`).** The previous edition held `TUI-019` at *low* "as a deliberate ADR-0001 divergence". That justification is dead twice over: ADR-0001 is **unreadable in this workspace** (§7), and even a real ADR would not hold it down, because a mechanism difference that costs behaviour stays as work. It is now rated on consequence — *medium*, for no fullscreen mode, no mouse scroll, no scrollbar and no jump-to-prompt, four normal-path features — and the underlying question is what needs a human: **does cyrup ship a fullscreen TUI mode at all?** (a) port it (effort **L+**, an application layer on ratatui's native alt-screen/mouse support), (b) support the flag and settings key as accepted no-ops with an explicit not-supported message, or (c) declare it out of scope and say so in the flag's error text. **`SEAM-051` and `CFG-021` must be fixed under every one of those answers and must not wait on it** — today the flag's default value makes the binary refuse to start.

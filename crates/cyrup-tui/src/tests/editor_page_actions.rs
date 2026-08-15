@@ -217,8 +217,19 @@ fn the_hotkeys_table_names_the_editor_page_binding() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(text.contains("Scroll by page"), "the row is present:\n{text}");
+    // The `KeyId` is camelCase upstream — `"tui.editor.pageUp": { defaultKeys: ["pageUp",
+    // "ctrl+pageUp"] }` (`tui/src/keybindings.ts:108-109` @v0.84.1; `:89-90` @v0.83.0 has the bare
+    // `"pageUp"`), `keys.ts:122-123` spells the id itself `pageUp`/`pageDown`, `getKeys` returns
+    // those strings verbatim (`keybindings.ts:202-204`), and `formatKeyPart` upper-cases only the
+    // FIRST character (`keybinding-hints.ts:12-15`). So pi's cell is `PageUp/Ctrl+PageUp`, never the
+    // fully-lowercased `Pageup` this once asserted.
     assert!(
-        text.contains("`Pageup/Ctrl+Pageup` / `Pagedown/Ctrl+Pagedown`"),
+        text.contains("`PageUp/Ctrl+PageUp` / `PageDown/Ctrl+PageDown`"),
         "and names every key bound to the editor page action:\n{text}"
+    );
+    // Pin the whole row, so the keys and the action can never drift apart or swap columns.
+    assert!(
+        text.contains("| `PageUp/Ctrl+PageUp` / `PageDown/Ctrl+PageDown` | Scroll by page |"),
+        "the row is upstream's, verbatim (`interactive-mode.ts:5808` @v0.83.0):\n{text}"
     );
 }

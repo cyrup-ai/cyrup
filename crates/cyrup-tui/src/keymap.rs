@@ -517,7 +517,8 @@ impl Key {
                 "backspace" => code = Some(KeyCode::Backspace),
                 "delete" | "del" => code = Some(KeyCode::Delete),
                 // Upstream `KeyId` spells these `pageUp`/`pageDown` (`tui/src/keys.ts:122-123`);
-                // `label()` emits the lowercased `pageup`/`pagedown`, so both round-trip.
+                // `label()` emits that same camelCase spelling and every token here is lowercased
+                // before matching, so both spellings parse and the label round-trips.
                 "pageup" | "pgup" => code = Some(KeyCode::PageUp),
                 "pagedown" | "pgdn" => code = Some(KeyCode::PageDown),
                 // `insert` and `f1`…`f12` are `SpecialKey`s upstream (`tui/src/keys.ts:118`,
@@ -585,7 +586,15 @@ impl Key {
         if self.mods.contains(KeyModifiers::ALT) {
             s.push_str("alt+");
         }
-        if self.mods.contains(KeyModifiers::SHIFT) {
+        // TUI-069. `KeyCode::BackTab` IS shift+tab — its base label below already carries the modifier, so a
+        // SHIFT flag on the same event must NOT print a second `shift+`. Upstream can never produce
+        // the doubled form: `app.thinking.cycle` declares the single key `"shift+tab"`
+        // (`coding-agent/src/core/keybindings.ts:73-76` @v0.83.0) and `formatKeys` prints
+        // `getKeys(id)` verbatim (`keybinding-hints.ts:29-40`), so `/hotkeys` reads `Shift+Tab`.
+        // Without this guard the `BackTab`+SHIFT binding at [`Keymap::default`] labelled itself
+        // `shift+shift+tab`, which is not a chord any terminal reports and which [`Key::parse`]
+        // reads back as plain `Tab`+SHIFT — a label that does not round-trip.
+        if self.mods.contains(KeyModifiers::SHIFT) && self.code != KeyCode::BackTab {
             s.push_str("shift+");
         }
         if self.mods.contains(KeyModifiers::SUPER) {
@@ -612,8 +621,13 @@ impl Key {
             KeyCode::End => "end".to_string(),
             KeyCode::Backspace => "backspace".to_string(),
             KeyCode::Delete => "delete".to_string(),
-            KeyCode::PageUp => "pageup".to_string(),
-            KeyCode::PageDown => "pagedown".to_string(),
+            // TUI-070. Upstream's `KeyId` is camelCase — `defaultKeys: "pageUp"` / `"pageDown"`
+            // (`tui/src/keybindings.ts:89-90` @v0.83.0) — and `formatKeyPart` upper-cases only the
+            // FIRST character (`keybinding-hints.ts:12-15`), so pi's /hotkeys cell reads `PageUp`.
+            // The lowercased spelling rendered `Pageup` / `Pagedown` there. `Key::parse` lowercases
+            // its tokens before matching (`:504`), so the camelCase label still round-trips.
+            KeyCode::PageUp => "pageUp".to_string(),
+            KeyCode::PageDown => "pageDown".to_string(),
             KeyCode::Insert => "insert".to_string(),
             // Without this arm the `Debug` fallback below renders `KeyCode::F(9)` as `f(9)`, which
             // `Key::parse` cannot read back — a label that does not round-trip is a label that
@@ -725,13 +739,7 @@ impl Keymap {
     /// keys shows both instead of silently hiding the second. The app-tier twin of
     /// [`SelectKeymap::keys_label`].
     pub fn keys_label(&self, action: Action) -> Option<String> {
-        let keys: Vec<String> =
-            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys.join("/"))
-        }
+        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
     }
 
     /// Rebind `action` to exactly `keys`, dropping any keys it was previously bound to **and** taking
@@ -752,6 +760,26 @@ impl Keymap {
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
         merge_entries(json, Action::from_id, |action, keys| self.set_action(action, keys))
     }
+}
+
+/// Join the labels of every key bound to one action, `/`-separated — Pi's `formatKeys`, i.e.
+/// `keys.join("/")` over `getKeybindings().getKeys(id)` (`keybinding-hints.ts:29-40`). `None` when
+/// the action is unbound (upstream's `keys.length === 0` → `""`).
+///
+/// **A label already emitted is skipped (TUI-069).** Upstream's key list cannot hold the same chord twice —
+/// it is the literal `defaultKeys` array or the user's own list. cyrup's default map instead binds
+/// ONE chord under several crossterm spellings, because a terminal reports Shift+Tab three ways
+/// depending on the keyboard protocol (`Keymap::default`'s three `Action::ThinkingCycle` entries).
+/// That is a transport detail; surfacing it would make `/hotkeys` read `Shift+Tab/Shift+Tab/…`
+/// where pi prints one cell.
+fn join_key_labels<'a>(keys: impl Iterator<Item = &'a Key>) -> Option<String> {
+    let mut labels: Vec<String> = Vec::new();
+    for label in keys.map(Key::label) {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
+    }
+    (!labels.is_empty()).then(|| labels.join("/"))
 }
 
 /// The configurable selector binding table (spec/tui/05 §10). Defaults mirror Pi's `tui.select.*`
@@ -813,13 +841,7 @@ impl SelectKeymap {
     /// This is what a `keyHint("tui.select.cancel", …)` renders: with the stock bindings
     /// (`tui/src/keybindings.ts:149-152`) it is `escape/ctrl+c`, not just the first key.
     pub fn keys_label(&self, action: SelectAction) -> Option<String> {
-        let keys: Vec<String> =
-            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys.join("/"))
-        }
+        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -1006,13 +1028,7 @@ impl ModelsKeymap {
     /// (`scoped-models-selector.ts:197-205`), which is the only place upstream calls `keyText` on
     /// an `app.models.*` id.
     pub fn keys_label(&self, action: ModelsAction) -> Option<String> {
-        let keys: Vec<String> =
-            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys.join("/"))
-        }
+        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -1096,13 +1112,7 @@ impl SessionKeymap {
     /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound (upstream's
     /// `keys.length === 0` → `""`).
     pub fn keys_label(&self, action: SessionAction) -> Option<String> {
-        let keys: Vec<String> =
-            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys.join("/"))
-        }
+        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
     }
 
     /// Rebind `action` to exactly `keys`.
@@ -1237,8 +1247,8 @@ impl TreeKeymap {
             None => ("", raw.as_str()),
         };
         let base = match base {
-            "pageup" => "pgup",
-            "pagedown" => "pgdn",
+            "pageUp" => "pgup",
+            "pageDown" => "pgdn",
             "up" => "↑",
             "down" => "↓",
             "left" => "←",
@@ -1377,13 +1387,7 @@ impl EditorKeymap {
     /// key, e.g. `tui.input.newLine`'s stock `["shift+enter", "ctrl+j"]`
     /// (pi `tui/src/keybindings.ts:137`) renders as `shift+enter/ctrl+j`.
     pub fn keys_label(&self, action: EditorAction) -> Option<String> {
-        let keys: Vec<String> =
-            self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k.label()).collect();
-        if keys.is_empty() {
-            None
-        } else {
-            Some(keys.join("/"))
-        }
+        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
     }
 
     /// **All** keys bound to `action` — the key set behind [`Self::keys_label`], handed out so a

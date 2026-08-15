@@ -258,6 +258,104 @@ async fn compact_aborted_in_flight_errors_with_pi_s_bare_compaction_cancelled() 
         Some((true, None)),
         "compaction_end must carry aborted:true with no errorMessage"
     );
+
+    // SESS-040/042 — the DURABLE half of the cancel, and the one the live repro caught cyrup
+    // getting wrong: "a `compaction` entry with a full summary was appended to the session file"
+    // for the run in which Escape was pressed. pi re-tests the abort signal immediately before
+    // `appendCompaction` (`agent-session.ts:1868-1870`), so an aborted compaction leaves the
+    // session file byte-identical. cyrup's equivalent guard is
+    // `cyrup-session/src/compaction/mod.rs:297`; without a caller for `abort_compaction` it could
+    // never fire, which is exactly why it must be asserted from the abort path and not in
+    // isolation.
+    let compaction_entries = session
+        .entries_json()
+        .await
+        .into_iter()
+        .filter(|e| e.get("type").and_then(serde_json::Value::as_str) == Some("compaction"))
+        .count();
+    assert_eq!(
+        compaction_entries, 0,
+        "an aborted compaction must append NOTHING — the user said stop and the session file is \
+         durable state (agent-session.ts:1868-1870)"
+    );
+
+    // …and the token slot must be empty again, so the next prompt is not diverted into the
+    // compaction queue by a stale `is_compacting()`.
+    assert!(
+        !session.is_compacting(),
+        "the cancel token must be released once the aborted compaction settles"
+    );
+}
+
+/// SESS-040 — a `compact()` future DROPPED mid-flight must not wedge `is_compacting()` at true.
+///
+/// This is the JS→Rust guarantee gap, not a hypothetical: pi's `compact` is an `async fn` and an
+/// `async fn` ALWAYS settles, so its clear of `this._compactionAbortController` cannot be skipped.
+/// cyrup's `AgentSession::compact` is a public API whose body is one 10-20 s provider call, and two
+/// shipped callers can drop it at an `.await` — `run_rpc`'s `select!` drops the whole driver when
+/// the write pump reports a broken pipe (`cyrup-modes/src/rpc.rs:668-676`), and any embedder that
+/// wraps the `cyrup-sdk` handle (`cyrup-sdk/src/handle.rs:285`) in a `tokio::time::timeout` does the
+/// same. The hand-written clears at each `return` cannot run then.
+///
+/// What the user sees when it leaks: `is_compacting()` answers true forever, and the TUI's Submit
+/// arm consults it before anything else, so every prompt typed afterwards is diverted into the
+/// compaction queue and drained by a `compaction_end` that can never arrive. The session accepts
+/// input and silently sends none of it. The fix is `CompactionCancelGuard`'s `Drop`.
+#[tokio::test]
+async fn a_dropped_compaction_future_releases_the_cancel_token() {
+    let fx = fixture();
+    // 1 token/s, so the summarization is unambiguously still in flight when the future is dropped.
+    let faux = Arc::new(FauxProvider::with_config(FauxConfig {
+        tokens_per_second: Some(1.0),
+        ..FauxConfig::default()
+    }));
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("a")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("b")], StopReason::Stop),
+        faux_assistant_message(
+            vec![faux_text(
+                "this summary is deliberately long so that the compaction summarization is still \
+                 streaming when the caller's future is dropped out from under it",
+            )],
+            StopReason::Stop,
+        ),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(aggressive_compaction_settings())
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+    let _ = session.prompt("tell me two").await.expect("prompt 2");
+    session.wait_for_idle().await;
+
+    {
+        // The literal shape of `run_rpc`'s race: the compaction is one arm, something else wins,
+        // and the arm's future is dropped where it stands.
+        let mut compacting = std::pin::pin!(session.compact(None));
+        tokio::select! {
+            _ = &mut compacting => panic!(
+                "the summarization streams at 1 token/s — it cannot have settled inside 800 ms, \
+                 so this test would no longer be dropping an IN-FLIGHT future"
+            ),
+            () = tokio::time::sleep(Duration::from_millis(800)) => {}
+        }
+        assert!(
+            session.is_compacting(),
+            "precondition: the compaction must be in flight with its token installed"
+        );
+    } // `compacting` dropped here, at whatever `.await` it was parked on.
+
+    assert!(
+        !session.is_compacting(),
+        "a DROPPED compact() future must release the cancel token — leaving it installed makes \
+         `is_compacting()` true forever, and the TUI then swallows every later prompt into the \
+         compaction queue with no `compaction_end` ever coming to drain it"
+    );
 }
 
 /// SESS-041 — `abortCompaction` must cancel the **auto** compaction too.

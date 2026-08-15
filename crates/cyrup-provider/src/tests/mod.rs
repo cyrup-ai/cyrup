@@ -5,7 +5,10 @@ mod anthropic_sensitive_stop;
 mod api_key_login;
 mod builtin_oauth;
 mod catalog_data;
+mod oauth_http_proxy;
 mod overflow_estimate_parity;
 mod remote_catalog;
 mod sampling_params;
 mod thinking_max;
+
+pub(crate) mod proxy_setting;

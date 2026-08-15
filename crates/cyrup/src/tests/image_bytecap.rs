@@ -1,4 +1,4 @@
-//! Image byte-cap integration test (gap-analysis 13-cyrup §I): drive the assembled `@file` input
+//! Image byte-cap integration test: drive the assembled `@file` input
 //! path (`build_inputs`, the exact fn `main.rs` calls) with a dense sub-2000px image whose PNG base64
 //! exceeds Pi's 4.5MB inline cap, and assert the attached `Content::Image` is re-encoded BELOW the cap
 //! — i.e. the JPEG-quality re-encode ladder (Pi `resizeImageInProcess`, image-resize-core.ts:59-164)

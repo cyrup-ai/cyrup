@@ -608,3 +608,61 @@ async fn grep_context_path_reads_only_files_that_matched() {
         "exactly the one matching file, once (pi's `fileCache`, grep.ts:205/:215)"
     );
 }
+
+// ------------------------------------------------- TOOL-044: the serialized `details.truncation` --
+
+/// **TOOL-044.** `details.truncation` is persisted on `ToolResultMessage` (pi
+/// `packages/ai/src/types.ts:415-420`), so its serialized shape is interop surface. Two divergences
+/// from pi's `TruncationResult` (`core/tools/truncate.ts:15-38` @v0.83.0) are pinned here.
+///
+/// 1. **`truncatedBy` is `"lines" | "bytes" | null` — always present** (`truncate.ts:21`). cyrup
+///    carried `skip_serializing_if = "Option::is_none"`, so on an untruncated result the key was
+///    absent, not null. RED before: `serde_json::to_value(..)` had no `truncatedBy` member at all.
+/// 2. **`maxLines` on the byte-only path is `Number.MAX_SAFE_INTEGER`**, passed literally at all
+///    four of pi's byte-only call sites (`grep.ts:335`, `find.ts:189`, `find.ts:324`,
+///    `ls.ts:182`) and copied verbatim into the record. cyrup passed `usize::MAX`, writing
+///    `18446744073709551615` where pi writes `9007199254740991`. RED before on the equality.
+///
+/// The `content` field pi also carries (`truncate.ts:17`) is the item's stated residual and is
+/// deliberately NOT asserted here — see the doc comment on `crate::truncate::Truncation`.
+#[test]
+fn truncation_details_serialize_in_pis_shape() {
+    use crate::truncate::{MAX_SAFE_INTEGER, TruncOpts, truncate_head};
+
+    // (1) An untruncated result must still carry an explicit `truncatedBy: null`.
+    let short = truncate_head("one\ntwo\n", TruncOpts::new(2000, 50 * 1024));
+    assert!(!short.info.truncated, "fixture must be untruncated for the null case to be reachable");
+    let v = serde_json::to_value(&short.info).unwrap();
+    let obj = v.as_object().unwrap();
+    assert!(
+        obj.contains_key("truncatedBy"),
+        "pi's TruncationResult always carries truncatedBy (truncate.ts:21); cyrup dropped the key \
+         when it was None. Got: {v}"
+    );
+    assert!(
+        obj["truncatedBy"].is_null(),
+        "an untruncated result reports truncatedBy: null, not a value. Got: {v}"
+    );
+
+    // (2) The byte-only sentinel is JS's MAX_SAFE_INTEGER, not usize::MAX.
+    assert_eq!(
+        MAX_SAFE_INTEGER, 9_007_199_254_740_991,
+        "Number.MAX_SAFE_INTEGER is 2^53 - 1"
+    );
+    let bytes_only = truncate_head("a\nb\nc\n", TruncOpts::bytes_only(50 * 1024));
+    assert_eq!(
+        bytes_only.info.max_lines, MAX_SAFE_INTEGER,
+        "byte-only callers (grep/find/ls) must record pi's maxLines sentinel"
+    );
+    let v = serde_json::to_value(&bytes_only.info).unwrap();
+    assert_eq!(
+        v["maxLines"], serde_json::json!(9_007_199_254_740_991u64),
+        "the serialized record is what reaches the session file. Got: {v}"
+    );
+
+    // And the truncated case still reports a real value, so (1) did not just blanket-null it.
+    let long = truncate_head(&"x\n".repeat(10), TruncOpts::new(3, 50 * 1024));
+    assert!(long.info.truncated);
+    let v = serde_json::to_value(&long.info).unwrap();
+    assert_eq!(v["truncatedBy"], serde_json::json!("lines"));
+}

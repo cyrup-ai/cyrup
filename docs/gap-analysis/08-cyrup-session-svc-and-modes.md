@@ -221,7 +221,11 @@ This is the **complete** open set for area 08 — one table, deliberately. The `
 2026-08-12 pass starting its new ids at `SEAM-047`. See the repair-pass note in the header block for
 the check that establishes it. Do not "recover" them.
 
-> **RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set: 0 critical, 0 high, 3 medium, 3 low = 6** (`SEAM-058` remains under `## Trackers` and is not counted). The table carries **45 rows: 39 fully closed, 6 open (3 of them partially closed)**. Sweep 8 closed **`SEAM-017`** as REFUTED/already-done — the port is 1262 lines at HEAD and the row said "not started". `SEAM-020`'s residual **size** is corrected (it is three parts, not one line, and one of them is a type mismatch); `SEAM-057` was declined by a third sweep as an owner decision; and `SEAM-015`, `SEAM-S03`, `SEAM-048` and `SEAM-073` had their out-of-area routings **re-confirmed rather than re-derived** — none of the four is schedulable against area 08. *(Previous edition: 0 / 0 / 3 / 4 = 7, 38 closed.)*
+> **RECOUNTED 2026-08-14 (ext-rpc surface enumeration, fourth edition) — counted set: 0 critical, 0 high, 9 medium, 17 low = 26** (`SEAM-058` remains under `## Trackers` and is not counted). The table carries **68 rows: 42 fully closed, 26 open (4 of them partially closed).** These totals include a CONCURRENT pass's `SEAM-100`…`SEAM-111` (the CLI-flag surface enumeration), which landed in this table while this block was being written; no ID collides and nothing was renumbered. **This pass's own delta is +4 medium, +1 low** (`SEAM-080`, `-081`, `-083`, `-084` medium; `-082` low), with `SEAM-085` and `SEAM-086` closed on arrival. Seven items were filed this pass — **`SEAM-080`…`SEAM-086`** — from a MECHANICAL two-sided enumeration of the RPC protocol surface (commands, response envelopes and data shapes, event types, `extension_ui_request`/`response` shapes, and the whole `RpcClient` method surface) against pi `modes/rpc/` @v0.83.0. **`SEAM-085` and `SEAM-086` close on arrival** (both fixed this pass) and do not move the open counts, so the pass adds 4 medium + 1 low.
+>
+> **The third-edition counts below were stale and are superseded, not disputed:** they read `3 medium, 3 low = 6` over `45 rows` and predate `SEAM-076`…`SEAM-079`, which a later sweep filed into this table without recounting the block. Re-derived mechanically over the table this pass (excluding the blockquoted routing table, whose rows repeat ids): pre-existing open was **10** — `SEAM-015`, `SEAM-048`, `SEAM-S03`, `SEAM-078` (medium) and `SEAM-020`, `SEAM-057`, `SEAM-073`, `SEAM-076`, `SEAM-077`, `SEAM-079` (low) — plus this pass's 5 and the concurrent CLI pass's 11 = **26**. The `**43 items — 0 critical, 8 high, 20 medium, 15 low**` line below the table is older still and is a *cumulative filed* count, not an open count; do not read it as either.
+>
+> **SUPERSEDED — RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set: 0 critical, 0 high, 3 medium, 3 low = 6** (`SEAM-058` remains under `## Trackers` and is not counted). The table carries **45 rows: 39 fully closed, 6 open (3 of them partially closed)**. Sweep 8 closed **`SEAM-017`** as REFUTED/already-done — the port is 1262 lines at HEAD and the row said "not started". `SEAM-020`'s residual **size** is corrected (it is three parts, not one line, and one of them is a type mismatch); `SEAM-057` was declined by a third sweep as an owner decision; and `SEAM-015`, `SEAM-S03`, `SEAM-048` and `SEAM-073` had their out-of-area routings **re-confirmed rather than re-derived** — none of the four is schedulable against area 08. *(Previous edition: 0 / 0 / 3 / 4 = 7, 38 closed.)*
 
 > **ROUTING, RE-CONFIRMED 2026-08-14 (sweep 8) — four of the six remaining rows have NO fix site in area 08's crates, and each was re-read rather than re-derived.** Scheduling any of them against a `cyrup-session-svc`/`cyrup-modes` agent produces a blocked pass — the exact failure the ledger's orchestration section names.
 >
@@ -235,6 +239,65 @@ the check that establishes it. Do not "recover" them.
 > **SUPERSEDED — RECOUNTED 2026-08-14 (sweeps 3-6 reconciliation) — counted set: 0 critical, **0 high**, 3 medium, 4 low = 7** (`SEAM-058` remains under `## Trackers` and is not counted). 38 rows are now marked CLOSED. `SEAM-020` is re-rated medium → low with the reason in its row. **Sweep 6 closed the area's last high, `SEAM-061`, as REFUTED — it was already closed at HEAD in both crates.** *(Previous edition: 0 / 1 / 3 / 4 = 8, 35 closed.)*
 >
 > **ROUTING: neither of this area's two remaining mediums has its fix site in `cyrup-session-svc` or `cyrup-modes`.** `SEAM-015` needs `crates/cyrup-tools` + an area-06 capability decision; `SEAM-S03` needs the `crates/cyrup-tools` half alone. `SEAM-048`'s residual is `crates/cyrup-ext/src/facade.rs`. `SEAM-073`'s half (a) is `crates/cyrup-config/src/lock.rs`. `SEAM-020`'s residual (`render_help(&[])` at `crates/cyrup/src/main.rs:216`) and `SEAM-017` are in-area.
+
+> **AMENDED 2026-08-14 (documentation audit) — four rows added, `SEAM-076`…`SEAM-079`; the area's counted set becomes 0 critical, 0 high, 4 medium, 6 low = 10.** All four are CLI-surface defects found by reading the shipped `--help` against the code while writing user documentation, and three were confirmed by running the binary. `SEAM-079` lands inside this area's own declared blind spot (c), which is the second time that blind spot has produced an item — consider driving the `config` body rather than re-declaring it.
+
+> ### AMENDED 2026-08-14 (mechanical CLI-surface enumeration) — `SEAM-100` … `SEAM-111`
+>
+> **Twelve rows added; one of them (`SEAM-104`) was FIXED in the same pass and is already closed, so
+> this block contributes +1 medium and +10 low to the open set** (was 0/0/4/6 = 10 before this pass
+> and the concurrent one; **this block alone takes it to 0 critical, 0 high, 5 medium, 16 low = 21**).
+> No id was renumbered, merged or deleted.
+>
+> **DO NOT quote 21 as the area total.** The concurrent `SEAM-080` … `SEAM-086` block landed in the
+> same table during this pass and carries its own delta. The single reconciler must re-derive the
+> area total from the table itself rather than adding the two blocks' claims together — this note
+> states only what THIS block changed.
+>
+> **`SEAM-087` … `SEAM-099` are unallocated ON PURPOSE — do not "recover" them.** A second
+> surface-enumeration agent was filing `SEAM-080` … `SEAM-086` (the ext-RPC surface) into this file
+> **concurrently** with this pass. Rather than risk two agents minting the same id — the one
+> unrecoverable error in this directory — this pass moved its own block to `SEAM-100` and left a
+> deliberate gap. Same precedent, same rule as `SEAM-035` … `SEAM-046`.
+>
+> **Where these came from.** The CLI surface was enumerated MECHANICALLY on both sides — every flag,
+> subcommand, flag-value enum and help-text line at `pi v0.83.0` (`cli/args.ts` `parseArgs` +
+> `printHelp`, `main.ts` dispatch order, `package-manager-cli.ts`, `cli/credential-print.ts`) against
+> every cyrup entry (79 upstream vs 86 cyrup) — and diffed in BOTH directions, rather than by
+> re-reading the backlog. Eight upstream entries are missing in cyrup, nine cyrup entries have no
+> upstream counterpart, and four differ in shape. **Six findings were confirmed by RUNNING the
+> shipped binary** (`update --models`, `config --bogus`, `config zzz`, `--list-models @foo`, bare
+> `-`, `auth`), which is the standard `REPRO-LOG.md` sets and is still rare for this directory. One
+> probe had a side effect worth flagging: **`cyrup -` started a real agent turn and issued a provider
+> request** — that is `SEAM-104`, now fixed.
+>
+> **`SEAM-100` is the highest-value single row on the surface**: `cyrup update --models` does not
+> exist at all, *and area 05 already reasons about lock contention against a concurrent
+> `cyrup update --models`.* A gap that other analysis has already built on top of will not be
+> revealed by closing the items above it.
+>
+> **Findings from the same enumeration that got no new id, and why** — recorded so nobody re-derives
+> them: `--json` / `--rpc` / `--output-format` → `SEAM-057` (declined by three sweeps as an owner
+> decision; **one detail is added to its body by this pass** — `--output-format` is absent from
+> `diagnostics.rs`'s `VALUE_LONG_FLAGS`, so unlike every other value-taking flag its value is not
+> passed through arg-leniency verbatim); `--tui-mode` → `SEAM-051` / ADR-0005; `auth check` and its
+> three flags → `SEAM-050`; `--help` being printed before extensions load, so the Extension CLI Flags
+> block is structurally always empty → **`SEAM-020`'s residual**, which already names it as three
+> parts and not one; the `--offline` help line naming `CYRUP_OFFLINE` and the env block advertising a
+> dead `CYRUP_SHARE_VIEWER_URL` → `TUI-063` (the dropped `(default: …)` half is folded into
+> `SEAM-102`).
+>
+> **Three carve-outs were CLOSED rather than left open.** (1) The extension-registered flag TIER is
+> dynamic, but `git -C pi grep -n 'registerFlag' v0.83.0 -- packages/coding-agent/src/extensions/`
+> returns zero hits — every `registerFlag` caller lives under `examples/` — so pi's shipped default
+> flag surface has no extension entries and the tier is empty on both sides. (2) `rpc-entry.ts` and
+> `bun/cli.ts` are separate binary ENTRY POINTS, not argv verbs, and contribute no flags. (3)
+> `git -C pi grep -nE 'argv\[2\]|process\.argv' v0.83.0` confirms pi has no hidden argv verbs at all,
+> which is what makes cyrup's two (`SEAM-109`) inventions rather than divergences.
+>
+> **NOT DONE, and named rather than implied:** not all 86 cyrup entries were exercised against the
+> binary — six targeted probes plus `update -h` and `list`. The remaining rows rest on reading the
+> code at the cited lines.
 
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
@@ -283,6 +346,29 @@ the check that establishes it. Do not "recover" them.
 | ~~SEAM-060~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | `get_tree` drops pi's `labelTimestamp` — **CLOSED 2026-08-14**: sweep 1 — `cyrup_session::manager::TreeNode` gained `label_timestamp` from area 03 during the same pass, so the "the underlying TreeNode needs the field first" precondition is satisfied and `tree_json` now emits it. |
 | ~~SEAM-069~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Trust prompt's saved-decision line never distinguishes an inherited ancestor decision — **CLOSED 2026-08-14**: sweep 1. |
 | ~~SEAM-070~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | `process.title` role suffix unported — rpc and subagent children are indistinguishable in `ps` — **CLOSED 2026-08-14**: sweep 1. |
+| SEAM-076 | low | cyrup-original | S | `install`/`remove` help claims the source is written to settings; it is written to `packages.json` — **filed 2026-08-14** by a documentation audit, verified by running the binary against an isolated agent dir. |
+| SEAM-077 | low | cyrup-original | S | `cyrup remove --help` still advertises an `npm:` example that `install` hard-rejects — **filed 2026-08-14**; the install help had this example deliberately removed, the remove help was missed. |
+| SEAM-078 | medium | cyrup-original | M | `cyrup update` advertises four self-update flags over an unimplemented stub, and its remedy names a package manager that does not exist for the only supported install path — **filed 2026-08-14**; cross-references the release-feed poll rejected in area 12. |
+| SEAM-079 | low | cyrup-original | S | `cyrup config --help` runs the picker instead of printing help — **filed 2026-08-14**; lands inside this area's own Coverage blind spot (c). |
+| SEAM-100 | medium | not-ported | M | `cyrup update --models` does not exist — there is no CLI route to refresh model catalogs, and the backlog already assumes there is one — **filed 2026-08-14** (CLI surface enumeration); **verified by running the shipped binary.** Absorbs every downstream divergence in `update`'s usage string, help body and conflict messages. |
+| SEAM-101 | low | parity-bug | S | The `config` subcommand accepts unknown options and stray arguments silently and exits 0; pi prints an error and exits 1 — **filed 2026-08-14**; verified by running the binary. Distinct from `SEAM-079`, which covers only the `--help` half. |
+| SEAM-102 | low | parity-bug | S | `--help`'s Environment Variables block omits seven provider keys cyrup genuinely reads — the exact INVERSE of `TUI-063` — and drops the documented share-viewer default — **filed 2026-08-14** (CLI + env surfaces). One invariant, two directions, one fix. |
+| SEAM-103 | low | parity-bug | S | `--list-models` swallows a following `@file` token as its search pattern; pi excludes `@` tokens and routes them to `fileArgs` — **filed 2026-08-14**; verified by running the binary. |
+| ~~SEAM-104~~ | ~~low~~ **CLOSED 2026-08-14 — FIXED THIS PASS** | parity-bug | S | A bare `-` fell through to the positionals and became the PROMPT, so `cyrup -` started a real agent turn and issued a provider request where pi exits 1 without contacting anything — **FIXED 2026-08-14**: the non-upstream `arg.len() > 1` guard is deleted from `crates/cyrup/src/diagnostics.rs` and a red-before test pins both `-` and `--`. |
+| SEAM-105 | low | parity-bug | S | Repeated `--models` / `--tools` / `--exclude-tools` APPEND under clap; pi ASSIGNS, so the last occurrence replaces the earlier value — **filed 2026-08-14** (CLI surface). Only the repeated-flag form diverges; the comma-separated form is identical. |
+| SEAM-106 | low | parity-bug | S | `--export` runs downstream of four guards pi runs it upstream of, so `--export … --api-key K` and `--export … --fork X --continue` error where pi exports and exits 0 — **filed 2026-08-14** (CLI surface). Also takes its optional path from positionals that still hold `@file` tokens. |
+| SEAM-107 | low | parity-bug | S | `-p`/`--print`'s `next.startsWith("---")` escape hatch is unported, so `-p ---weird` becomes an extension flag named `-weird` instead of the prompt — **filed 2026-08-14** (CLI surface). The narrowest item on the surface; recorded for completeness, not as a scheduling candidate. |
+| SEAM-108 | low | upstream-drift | S | The `auth` command surface is v0.84.1-shaped against a v0.83.0 port: three verbs not two, `--provider` OR `--model` where upstream requires `--model`, and two error sentences that name the wrong set — **filed 2026-08-14** (CLI surface). `SEAM-050` closed by LANDING this surface; this row records what landing it diverged from. |
+| SEAM-109 | low | cyrup-original | S | Two hidden argv verbs, `__subagent-runner` and `__intercom-broker`, with no pi counterpart at the argv level — pi has no argv verbs at all — **filed 2026-08-14** (CLI surface). Defensible single-binary analogs; filed so an invented user-reachable command surface is not mistaken for parity. |
+| SEAM-110 | low | cyrup-original | S | `cyrup update <source>` accepts a third self alias, `cyrup`, that pi's two-alias check does not — and the help advertises the `pi` alias while never mentioning the `cyrup` one — **filed 2026-08-14** (CLI surface). |
+| SEAM-111 | low | parity-bug | S | The top-level help's Commands block drops the model-catalog clause from `update`, and the `[-l]` argument and Tab-switches-scope hint from `config` — two of the three omissions UNDERSTATE the shipped surface — **filed 2026-08-14** (CLI surface). |
+| SEAM-080 | medium | cyrup-original | M | `model_changed` is a cyrup-invented line on the RPC stdout stream, and two backlog items already reason about it as an upstream event — **filed 2026-08-14 (ext-rpc surface enumeration)**: pi has no `model_changed` `AgentSessionEvent`; a `set_model`/`cycle_model` over RPC writes a line pi never writes. Invented surface that has already propagated into this file's own reasoning — `SEAM-032`'s and `SEAM-033`'s Impact paragraphs both cite it as an upstream event. |
+| SEAM-081 | medium | cyrup-original | M | `session_start` and `session_shutdown` reach RPC stdout as protocol lines; upstream both are extension-runner events that `session.subscribe` never sees — **filed 2026-08-14**: cyrup routes them onto the same fanout the RPC loop subscribes to. **Load-bearing:** `SEAM-047`'s acceptance test (`:351`) and `12-upstream-drift-pi-core.md:323` both propose asserting a `session_shutdown` line on stdout, which would pin a cyrup-invented wire line as required behaviour. |
+| SEAM-082 | low | cyrup-original | S | `RpcClient::attach(reader, writer)` is a cyrup-original constructor path — **filed 2026-08-14**: pi's `RpcClient` has only `start()`, which always spawns a child. Benign and self-disclosed; filed so the client's API delta is KNOWN rather than assumed 1:1. |
+| SEAM-083 | medium | parity-bug | S | The `bash` response always emits `"fullOutputPath":null`, and `"exitCode":null` for a killed command, where pi drops both keys — **filed 2026-08-14**: `SEAM-053`'s class in a payload this file's own `## Coverage` *Not audited* paragraph names as unread ("`BashResult`" is in its list of inner element shapes that "remain largely unread on both sides"). A client using the natural `"fullOutputPath" in data` idiom takes the truncated branch on **every** bash response. |
+| SEAM-084 | medium | parity-bug | S | `get_commands` extension entries carry a `sourceInfo.source` of `"extension"` — a value that exists nowhere upstream — drop `baseDir` entirely, and always emit `description` — **filed 2026-08-14**: three divergences surviving `SEAM-055`, which fixed only `path`. pi emits `"local"` (or the `<prefix:…>` segment) and `path.dirname(resolvedPath)`. |
+| ~~SEAM-085~~ | ~~low~~ **FILED AND CLOSED 2026-08-14** | stale-port | S | The `message_update` v0.84.1 projection is disclosed, but four of its supporting citations were **v0.84.1 line numbers presented against v0.83.0 paths with no version tag** — **FIXED 2026-08-14 (ext-rpc surface enumeration)**: `rpc.rs:304-305` and `:328-329` asserted `Pi's output(toJsonEvent(event)) (rpc-mode.ts:356)` where v0.83.0's `:355` is a bare `output(event)`, `:356` is the `agent_settled` line, and `toJsonEvent` is not in the tree at all; `json_event.rs:56` cited `coding-agent/docs/rpc.md:952-956` for the omission contract where v0.83.0's `:952-956` is the streaming example that SHOWS `message` and `partial` — the exact opposite. All now carry `@v0.84.1` plus what the same line is at the ported tag. Comment-only. |
+| ~~SEAM-086~~ | ~~low~~ **FILED AND CLOSED 2026-08-14** | parity-bug | S | An `extension_ui_response` with a missing or non-string `id` was answered with an `Unknown command: extension_ui_response` error response where pi writes nothing — **FIXED 2026-08-14 (ext-rpc surface enumeration)**: the intercept now keys on the `type` discriminant alone and always `continue`s, as pi's unconditional `return` does (`rpc-mode.ts:763-777` @v0.83.0). Test `rpc_malformed_extension_ui_response_is_swallowed_not_answered` (`crates/cyrup-modes/src/tests/modes.rs`), RED before. |
 
 **43 items — 0 critical, 8 high, 20 medium, 15 low.** (SEAM-071, SEAM-072 and SEAM-073 were added by
 the later suite-verification pass, SEAM-072 closed on arrival; the 40/7/19/14 counts below predate
@@ -1050,6 +1136,8 @@ at all**, so this fix must add one, not merely correct one.)* Add a `delete_sess
 
 **Verify** — Register a native extension declaring a boolean flag named `json`; run `cyrup --json` and assert the extension observes the flag (or, if the aliases are removed, that `cyrup --json` with no such extension exits 1 with `Unknown option(s): --json`).
 
+**AMENDMENT 2026-08-14 (mechanical CLI-surface enumeration) — one detail this item does not carry.** `--output-format` is in `KNOWN_VALUE_LONG_FLAGS` (`cli.rs:862` at HEAD) but is **absent from `diagnostics.rs`'s `VALUE_LONG_FLAGS`** (`:71-89`). Every other value-taking long flag is listed there, which is what makes arg-leniency pass the flag AND its next token through verbatim; without it, `cyrup --output-format -x` reports `Unknown option: -x` instead of treating `-x` as the flag's value. So the third invented flag is not merely undiscoverable — it behaves unlike every real value-taking flag in the same parser. **No new id: this is the same three flags and the same decision `SEAM-057` already carries.** Whichever way the owner decides, this line goes with it — if the aliases are kept, `--output-format` belongs in `VALUE_LONG_FLAGS`; if they are deleted, the omission disappears with them. Line numbers here are HEAD's; the body above cites the older `cli.rs:103-111` / `:762-764` offsets.
+
 ## SEAM-058 — pi's experimental server/client command tree, create-harness.ts and remote-session.ts have no counterpart
 
 **`tracker`** — not counted in this area's 40 open items. **Kind** tracking *(was upstream-drift)* · **Severity** n/a *(was low)* · **Effort** n/a until triggered · **Confidence** high
@@ -1366,6 +1454,367 @@ stderr, empty stdout.
 **Fix** — Two independent halves. (a) Give `FileLock::drop` a best-effort `std::fs::remove_file(&self.path)` after the unlock, or hold the lock on `models-store.json` itself rather than a sidecar. (b) Find and join (or cancel) whatever performs a models-store access after `AgentSession` drop — instrument `FileLock::acquire` with a `tracing::trace!` carrying a backtrace and re-run `-p cyrup-session-svc` to name it; that half is the real defect and (a) only hides it.
 
 **Verify** — `ls $TMPDIR | wc -l` before and after `cargo test -p cyrup-session-svc` differs by 0. Today it differs by 14.
+
+## SEAM-076 — `install` / `remove` help claims the source is written to settings
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/subcommands.rs:303` prints `Install a package and add it to settings.` and `:307` prints `Remove a package and its source from settings.` The `run()` path (`:425-465`) constructs only a `PackageStore` + `PackageManager`; the sole write is `lock::save(&reg_path, &reg)` into `packages.json` (`crates/cyrup-resources/src/package/install.rs:148-153`). `SettingsManager` is imported at `:18` but used only by `cyrup config` (`:591`). **Verified empirically:** installing a local package under an isolated `CYRUP_AGENT_DIR` created `<agent_dir>/packages/packages.json` and wrote no settings file.
+
+**upstream** — pi's install *does* write the source into settings, which is where the string comes from. cyrup deliberately uses a separate file-backed registry, recorded at `crates/cyrup-session-svc/src/builder.rs:936-945`. The mechanism divergence is intended; only the help text is stale.
+
+**Impact** — a user following the help inspects or edits `settings.json`, finds nothing, and may hand-add a `packages` entry — which is a **different, additive** channel (`crates/cyrup-config/src/settings.rs:343-373`), producing a duplicate rather than a correction.
+
+**Fix** — reword both lines to name the registry, e.g. `Install a package and record it in the package registry.`
+
+**Verify** — `cyrup install ./p` under an isolated agent dir; assert `settings.json` is absent or unchanged, `packages.json` gained the row, and the help text no longer says "settings".
+
+## SEAM-077 — `cyrup remove --help` advertises an `npm:` example that `install` rejects
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/subcommands.rs:307` shows the remove examples `cyrup remove npm:@foo/bar` and `cyrup uninstall npm:@foo/bar`. `PackageSource::parse` hard-rejects any `npm:` prefix with `ResourceError::UnsupportedNpm` (`crates/cyrup-resources/src/package/source.rs:78-81`) — there is no JS runtime. The comment at `subcommands.rs:297-302` records that the npm example was **deliberately deleted from the install help for exactly this reason**; the remove help was not given the same treatment and carries it twice.
+
+**upstream** — pi supports npm sources, hence the examples. `CFG-009` (closed) owns the error-message half; `PARITY-GAPS` PB-7 / OQ-1 own the channel decision. Neither touches help text.
+
+**Impact** — the only two examples the remove help shows are for a source class that can never have been installed, so a user copying either gets a failure with no working example to fall back on.
+
+**Fix** — replace both npm examples with the git and path forms the install help already uses.
+
+**Verify** — assert `cyrup remove --help` contains no `npm:` and at least one example `PackageSource::parse` accepts.
+
+**Note** — the comment at `subcommands.rs:301` cites `gap-analysis 13-cyrup §D`, a document that does not exist in this directory. Two other source files cite it as well (`crates/cyrup/src/tests/image_bytecap.rs:1`, `crates/cyrup-session-svc/src/tests/install_noop.rs:1`). Per `README.md`'s third-edition rule — *grep the SOURCE for `AREA-NNN` citations at every reconciliation* — those three citations need an owner or an explicit strike.
+
+## SEAM-078 — `cyrup update` advertises four self-update flags over an unimplemented stub
+
+**Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/subcommands.rs:285-289` documents `--self`, `--all`, `--force` and the bare `cyrup update` / `cyrup update pi` forms as updating cyrup itself. Every one of those paths reaches `:573-575`, which prints `Self-update is not available in this build; update cyrup via your package manager.` and stops. **Observed:** `cyrup update` prints `Extensions are skipped. Run cyrup update --extensions to update extensions.` followed by that line.
+
+**upstream** — pi implements self-update against a release feed. The release-feed **poll** was deliberately excluded with a written rationale (`crates/cyrup/src/update_check.rs:14-23` — no cyrup release endpoint exists) and is recorded as *rejected, flagged for a human* in `12-upstream-drift-pi-core.md`'s rejected list; `TUI-S11` records the same split. **Neither covers the `update` subcommand's own advertised surface**, which is what this item files.
+
+**Impact** — the remedy is wrong for the only supported install path: there is no package manager, so a user who follows the message has no route at all. The correct instruction today is to re-run `cargo install --git https://github.com/cyrup-ai/cyrup cyrup`. Four advertised flags resolve to a stub.
+
+**Fix** — smallest correct change is to reword the stub to name a route that works from a source install, and to mark the four flags as unavailable in `--help` rather than documenting them as functional. Implementing self-update is blocked on the same missing release endpoint as the rejected poll and should remain an owner decision, not agent work.
+
+**Verify** — assert `cyrup update --self` exits with a message naming a working route, and that `--help` does not present the flags as functional.
+
+## SEAM-079 — `cyrup config --help` runs the picker instead of printing help
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — the top-level help advertises `cyrup <command> --help   Show help for install/remove/uninstall/update/list/config/auth`, but the `config` handler (`crates/cyrup/src/subcommands.rs:590-675`) has no `--help` branch; the flag falls through and the interactive picker runs. **Observed:** `cyrup config --help` printed `No configurable skills, prompts, or themes found.`
+
+**upstream** — not re-read this pass. This area's own `## Coverage` already declares the blind spot: *"(c) `cyrup config` (`subcommands.rs:590-675`) was checked against `ConfigSelectorOptions` but its interactive body was not driven."*
+
+**Impact** — the one subcommand whose flag set is least guessable — `-l`/`--local`, `--approve`/`--no-approve`, and the `+pattern`/`-pattern` marker semantics it writes into the `skills`/`prompts`/`themes` arrays — is the one that cannot be asked. In a terminal it silently enters a full-screen picker; in a pipeline it emits the no-resources line and exits 0, which reads as success.
+
+**Fix** — add a `--help`/`-h` branch at the top of the `config` handler mirroring the other five subcommands, documenting `-l` and the marker convention.
+
+**Verify** — `cyrup config --help` prints usage and exits without entering the picker.
+
+## SEAM-080 — `model_changed` is a cyrup-invented line on the RPC stdout stream, and two backlog items already reason about it as upstream
+
+**Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** confirmed · **filed 2026-08-14 (ext-rpc surface enumeration)**
+
+**cyrup** — `AgentSessionEvent::ModelChanged` is declared at `crates/cyrup-session-svc/src/event.rs:236-239` with its wire tag `"model_changed"` at `:361`, and emitted at `crates/cyrup-session-svc/src/session.rs:4285-4289` via `fanout_emit` — the same fanout `crates/cyrup-modes/src/rpc.rs:888-910` subscribes to and writes out. So an RPC `set_model` or `cycle_model` writes `{"type":"model_changed","provider":…,"model":…}` to stdout **in addition to** its `response`.
+
+**upstream** — pi has no `model_changed` `AgentSessionEvent`. The union is `packages/coding-agent/src/core/agent-session.ts:139-181 @v0.83.0`; it carries `thinking_level_changed` and `session_info_changed` but nothing for the model. `git grep -n 'model_changed\|modelChanged' v0.83.0 -- packages/` hits only `core/cache-stats.ts:22`/`:88` (a boolean field on a cache-miss record) and `interactive-mode.ts:3469`, which reads that field — nothing that is ever an event.
+
+**Impact** — a wire line pi never writes, on the protocol surface whose whole value is that a client written against pi's docs works against cyrup. Worse than merely unknown: **this file's own reasoning already treats it as upstream** — `SEAM-032`'s Impact paragraph and `SEAM-033`'s Impact paragraph, both in this file, list `model_changed` alongside the genuine `session_info_changed` as an event whose loss matters. An invented surface has propagated into the backlog that is supposed to detect invented surfaces, which is the failure mode the `cyrup-original` class exists to catch.
+
+**Fix** — decide, then write the decision down. Either (a) filter `ModelChanged` off the RPC/json wire the way `SessionReplaced` already is at `rpc.rs:908` and `:931`, keeping it as an internal fanout event the TUI consumes — the change is one match arm at each of the two write sites; or (b) keep it on the wire as a documented cyrup extension, with a `CYRUP-DELTA` at `event.rs:236-239` stating that pi has no such event and naming what a pi-written client does with an unknown `type`. Do **not** leave it undecided: whichever way it goes, `SEAM-032`'s and `SEAM-033`'s Impact paragraphs must stop citing it as upstream.
+
+**Verify** — drive `set_model` over RPC and assert the exact set of stdout lines matches what pi emits for the same command; add the assertion beside the existing RPC wire tests in `crates/cyrup-modes/src/tests/modes.rs`.
+
+## SEAM-081 — `session_start` and `session_shutdown` reach RPC stdout; upstream both are extension-runner events `session.subscribe` never sees
+
+**Kind** cyrup-original · **Severity** medium · **Effort** M · **Confidence** confirmed · **filed 2026-08-14 (ext-rpc surface enumeration)**
+
+**cyrup** — `AgentSessionEvent::SessionStart` (`crates/cyrup-session-svc/src/event.rs:262-265`, tag at `:365`) is emitted at `crates/cyrup-session-svc/src/session.rs:2798` via `fanout_emit`; `SessionShutdown` (tag at `event.rs:266`) at `session.rs:2655`, likewise. Both therefore land on the stream `crates/cyrup-modes/src/rpc.rs:888-910` writes to stdout.
+
+**upstream** — both names exist at `v0.83.0`, but as **extension events, not session events**. `session_start` is declared at `core/extensions/types.ts:563` and subscribed via `on(event: "session_start", …)` at `types.ts:1192`; every construction site is a `sessionStartEvent:` config field or an `extensionRunner.emit` (`agent-session-runtime.ts:218`/`:251`/`:305`/`:328`/`:347`/`:391`, `agent-session.ts:389`/`:2622`). `session_shutdown` is declared at `types.ts:617`, subscribed at `:1204`, and emitted through `emitSessionShutdownEvent(this._extensionRunner, …)` (`agent-session.ts:2604`) behind `runner.ts:195`'s `hasHandlers("session_shutdown")` gate. **Neither is in the `AgentSessionEvent` union** (`agent-session.ts:139-181`), so `session.subscribe(...)` never sees them and `rpc-mode.ts:355`'s `output(event)` can never write them.
+
+**Impact** — two more stdout lines pi never writes, from the same cause: cyrup routes extension-tier lifecycle events onto the session fanout instead of keeping the two tiers separate. Distinct from SEAM-025, which is about the extension-tier events losing pi's session-file fields — that item assumes the events are correctly *scoped* and disputes only their payload.
+
+**LOAD-BEARING — read before scheduling SEAM-047.** `SEAM-047`'s Verify line proposes asserting *"that a `session_shutdown` line was written to stdout first"* as the acceptance test for the SIGTERM fix. **That would pin a cyrup-invented wire line as required behaviour**, permanently. Whoever lands SEAM-047 must either resolve this item first or re-express the assertion against something pi actually writes. The correct form is already sitting one file over: `12-upstream-drift-pi-core.md:327` — the SAME defect, filed as upstream drift — words its (b) clause as *"a registered extension observed `session_shutdown`"*, which is exactly right, because upstream's `session_shutdown` **is** an extension-tier event. The stdout wording is area 08's alone and is the one to change.
+
+**Also known, and NOT a defect: `session_replaced`.** `AgentSessionEvent::SessionReplaced` (`event.rs:271-273`, tag at `:367`, emitted at `crates/cyrup-session-svc/src/subscriber.rs:90`) is wholly cyrup-invented — its doc cites internal `R-11-021` / arch-11 §3.2, not a pi file — but it is explicitly filtered out at **both** RPC write sites (`rpc.rs:908` and the EOF drain at `:931`), so it never reaches stdout. It is an internal rebind signal, correctly contained. Recorded here so the third invented event on this enum is KNOWN and nobody files it as a fourth item.
+
+**Fix** — same decision shape as SEAM-080, and it should be taken together with it: filter both off the wire at `rpc.rs:908`/`:931` (the `SessionReplaced` guard is the pattern to extend, and doing so keeps the extension-tier emission intact for guests), or keep them as documented cyrup extensions with a `CYRUP-DELTA` at their declarations naming `types.ts:563`/`:617` and stating explicitly that upstream's are extension-runner events.
+
+**Verify** — start and cleanly shut down an RPC session and assert the stdout line set matches pi's for the same lifecycle; assert a loaded extension still receives `session_start`/`session_shutdown` at the extension tier either way.
+
+## SEAM-082 — `RpcClient::attach(reader, writer)` is a cyrup-original constructor path
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed · **filed 2026-08-14 (ext-rpc surface enumeration)**
+
+**cyrup** — `RpcClient::attach(reader, writer)` at `crates/cyrup-modes/src/rpc_client.rs:471-492`, factoring the transport half out of the spawn path so tests can drive an in-memory duplex pair. Self-disclosed at `:464-470`, which cites `rpc-client.ts:127-129` and `:580` as the pair it decomposes. `spawn()` (`:505`) is the faithful `start()` port alongside it.
+
+**upstream** — pi's `RpcClient` has no `attach`. Its only constructor path is `start()` (`packages/coding-agent/src/modes/rpc/rpc-client.ts:73-139 @v0.83.0`), which always spawns `node <cliPath> --mode rpc`.
+
+**Impact** — benign: it adds no wire surface, and the client's other 32 commands, 3 helpers, 4 lifecycle methods, constants (30_000 request / 60_000 idle / 100ms start settle / 1_000ms SIGTERM grace), `req_${n}` id format, `RpcClientOptions` (6/6), `ModelInfo` (4/4) and `ForkMessage` (2/2) were all enumerated this pass and match exactly. Filed so the one API delta is KNOWN rather than assumed to be 1:1 — the enumeration found it precisely because nobody had written it down.
+
+**Fix** — none as a repair. Confirm the existing note at `:464-470` states in terms that `attach` has **no** upstream counterpart (rather than only naming what it decomposes), so the next auditor does not re-derive it.
+
+**Verify** — `grep -n 'attach' crates/cyrup-modes/src/rpc_client.rs` — the doc block says cyrup-original explicitly.
+
+## SEAM-083 — The `bash` response emits `fullOutputPath` and `exitCode` as explicit `null` where pi omits the keys
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed · **filed 2026-08-14 (ext-rpc surface enumeration)**
+
+**cyrup** — `BashResult` (`crates/cyrup-session-svc/src/bash.rs:28-53`) carries `#[serde(default)]` on `exit_code: Option<i32>` (`:37-38`) and `full_output_path: Option<String>` (`:51-52`) but **no `skip_serializing_if`**, and the struct has no container-level skip. The handler arm (`crates/cyrup-modes/src/rpc.rs:1345-1349`) is a bare `serde_json::to_value(result)`, so the struct's serde attributes **are** the wire contract. Every `{"type":"response","command":"bash",…}` therefore carries `"fullOutputPath":null`, and a killed or signalled command carries `"exitCode":null`.
+
+**upstream** — `pi/packages/coding-agent/src/core/bash-executor.ts:29-40 @v0.83.0` — `exitCode: number | undefined;` (`:33`, a required key whose `undefined` value `JSON.stringify` **drops**) and `fullOutputPath?: string;` (`:39`, optional). `packages/coding-agent/docs/rpc.md:473-479` shows the normal response with **no `fullOutputPath` key at all**, and `:482-495` shows it appearing only when the output was truncated.
+
+**Impact** — a client written against pi's docs uses the natural `"fullOutputPath" in data` / `data.fullOutputPath !== undefined` test to decide whether the output was truncated, and under cyrup that test is **true on every single bash response**, so it takes the truncated branch every time and goes looking for a temp file that does not exist. This is exactly SEAM-053's class, in a payload no sweep has reached: this file's `## Coverage` *Not audited* paragraph lists `BashResult` by name among the inner RPC element shapes that *"remain largely unread on both sides"*, and SEAM-053's own method — comparing `rpc-types.ts` payloads against their handler arm — is blind to `bash`, whose arm is a bare `serde_json::to_value(result)`. Confirmed NEW: `grep` for `fullOutputPath`/`exitCode` across `docs/gap-analysis/` returns only unrelated process-exit-code items.
+
+**Fix** — add `#[serde(skip_serializing_if = "Option::is_none")]` to both fields in `crates/cyrup-session-svc/src/bash.rs`, matching what SEAM-053 did for the other envelopes. Audit the remaining `BashResult` fields (`output`, `cancelled`, `truncated`) against `bash-executor.ts:29-40` in the same edit — they are required on both sides, but the enumeration reached only the two optionals. **FIX SITE: `crates/cyrup-session-svc/src/bash.rs`** — inside area 08's crates, schedulable here.
+
+**Verify** — assert `"fullOutputPath"` is **absent** from a normal `bash` response and **present** when the output was truncated; assert `"exitCode"` is absent for a cancelled/killed command and present otherwise. RED on the first assertion today.
+
+## SEAM-084 — `get_commands` extension entries carry a fabricated `sourceInfo.source`, drop `baseDir`, and always emit `description`
+
+**Kind** parity-bug · **Severity** medium · **Effort** S · **Confidence** confirmed · **filed 2026-08-14 (ext-rpc surface enumeration)**
+
+**cyrup** — the extension branch of `get_commands` hard-codes the whole `sourceInfo` object at `crates/cyrup-session-svc/src/session.rs:2508-2511`: `"source": "extension"`, `"scope": "temporary"`, `"origin": "top-level"`, with **no `baseDir`**. The prompt-template and skill branches (`:2519`, `:2527`) do carry real provenance via `origin.source_info_json(...)`, so only the extension branch is synthesized.
+
+**upstream** — `pi/packages/coding-agent/src/core/extensions/loader.ts:434-443 @v0.83.0`:
+
+```ts
+const source =
+    extensionPath.startsWith("<") && extensionPath.endsWith(">")
+        ? extensionPath.slice(1, -1).split(":")[0] || "temporary"
+        : "local";
+const baseDir = extensionPath.startsWith("<") ? undefined : path.dirname(resolvedPath);
+…
+sourceInfo: createSyntheticSourceInfo(extensionPath, { source, baseDir }),
+```
+
+with `SourceInfo = {path, source, scope, origin, baseDir?}` at `core/source-info.ts:6-12` and the `scope`/`origin` defaults at `:24-40`. `rpc-mode.ts:681-686` passes `sourceInfo: command.sourceInfo` straight through (its sibling top-level `source: "extension"` at `:684` is a **different field** and is correct in cyrup). `RegisteredCommand.description` is optional — `description?: string`, `core/extensions/types.ts:1163-1168` — so an undescribed command omits the key.
+
+**Impact** — three divergences survive `SEAM-055`, which closed 2026-08-14 having fixed only `path` (see its body in this file). (a) **`source`** — pi emits `"local"` for a filesystem-loaded extension or the `<prefix:…>` segment for a synthetic one, and **never** the literal `"extension"`, so cyrup reports inside `sourceInfo` a value that exists nowhere upstream, and a client grouping by `sourceInfo.source` cannot separate a local extension from a synthetic one. (b) **`baseDir`** — pi emits `path.dirname(resolvedPath)` for every filesystem extension; cyrup omits the key, so a client resolving a command's assets relative to its extension directory has nothing to resolve against. (c) **`description`** — `CommandDescriptor.description` is a non-optional `String` (`crates/cyrup-ext/src/registry.rs:94-98`) and always serializes, emitting `""` where pi omits the key.
+
+**Fix** — carry the real provenance through `ResolvedCommand` the way the prompt/skill branches already do: derive `source` as pi does (the `<prefix:…>` split, else `"local"`), populate `baseDir` from the extension's resolved directory for filesystem-loaded extensions and omit it for synthetic ones, and make the emitted `description` omit-when-empty. The owner id is already threaded (SEAM-055's fix), so this is the same one change extended. **FIX SITE: `crates/cyrup-session-svc/src/session.rs:2502-2515`**, plus an optional-description signal from `crates/cyrup-ext/src/registry.rs` (area 06's crate) if the empty-vs-absent distinction is to be exact.
+
+**Verify** — load a filesystem extension registering a described and an undescribed command; assert `sourceInfo.source == "local"`, `sourceInfo.baseDir` equals the extension's directory, and the undescribed command's entry has **no** `description` key.
+
+## SEAM-085 — The `message_update` projection is disclosed, but four of its citations were v0.84.1 lines presented against v0.83.0 paths
+
+**Kind** stale-port · **Severity** low · **Effort** S · **Confidence** confirmed · **FILED AND CLOSED 2026-08-14 (ext-rpc surface enumeration)**
+
+**cyrup** — the wire shape itself is **not** in dispute and is not a gap: `crates/cyrup-modes/src/rpc.rs:337-347` routes `RpcOut::Event` through `crate::to_json_event`, which (`crates/cyrup-modes/src/json_event.rs:91-111`) rebuilds `message_update` as a fresh two-key object — dropping the outer `message` — and strips `partial` from the inner event (`:122-186`). That is v0.84.1 behaviour deliberately forward-ported; `json_event.rs:1-7` discloses it in terms (*"the file does NOT exist at v0.83.0 … VERSION LAG, not a port bug"*) and `PARITY-GAPS.md:870` records it as already ported. Recorded here for the two-sided table: measured against the ported tag, cyrup's `message_update` is missing two fields pi's is documented to carry (`docs/rpc.md:915-955` @v0.83.0 shows the wire line WITH the outer `message` and the inner `partial` on every delta).
+
+**The defect — mis-citation, and it is FIXED.** Four supporting citations named a v0.83.0 path with a v0.84.1 line number and no version tag:
+
+- `rpc.rs:304-305` asserted ``Pi's `output(toJsonEvent(event))` (rpc-mode.ts:356)`` and `:328-329` repeated `(rpc-mode.ts:356)`. At `v0.83.0`, `rpc-mode.ts:355` is a bare `output(event);` and `:356` is `if (event.type === "agent_settled") {` — neither says what was claimed — and `git grep -n toJsonEvent v0.83.0 -- packages/` is **empty**: `modes/json-event.ts` does not exist at the ported tag. At `v0.84.1`, `:356` **is** `output(toJsonEvent(event));`.
+- `json_event.rs:56` cited `coding-agent/docs/rpc.md:952-956` for the omission contract. At `v0.83.0` that range is the *streaming example*, which shows `"message":{...}` and `"partial":{...}` on every delta — the exact opposite of the quoted contract. At `v0.84.1` it is the contract.
+- (`json_event.rs:51-52` cites the same two call sites but names `v0.84.1` in the adjacent `git grep` invocation, so it resolves correctly and was left alone.)
+
+**Impact** — the project's rule is that an in-tree pi citation is the evidence a port matches upstream. A v0.84.1 line presented as v0.83.0 is the more dangerous form of a bad citation than a stale one, because it resolves to *real text at some tag*, so a checker that does not pin the version reads as confirming a claim it contradicts at the tag actually named.
+
+**Fix — DONE 2026-08-14** — all three sites now carry `@v0.84.1` **and** state what the same line is at the ported baseline, so the version cannot be dropped again without the sentence going obviously wrong. Comment-only; no behaviour change.
+
+**Verify** — `grep -n 'rpc-mode.ts:356\|rpc.md:952-956' crates/cyrup-modes/src/` — every occurrence carries an explicit version tag. `cargo check -p cyrup-modes --all-targets` green.
+
+## SEAM-086 — A malformed `extension_ui_response` was answered with an error response where pi writes nothing
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed · **FILED AND CLOSED 2026-08-14 (ext-rpc surface enumeration)**
+
+**cyrup (as found)** — the stdin intercept was `extension_ui_response_id` (`crates/cyrup-modes/src/rpc.rs:1505-1511`), which returned `None` unless `id` was present **and** a JSON string (`value.get("id").and_then(Value::as_str)`). On `None` the line fell through the `if let Some(id)` at `rpc.rs:798-805` into the ordinary command path, where `dispatch` (`:1032-1037`) saw an unrecognized `type` and emitted `{"type":"response","command":"extension_ui_response","success":false,"error":"Unknown command: extension_ui_response"}`.
+
+**upstream** — `pi/packages/coding-agent/src/modes/rpc/rpc-mode.ts:763-777 @v0.83.0`:
+
+```ts
+if (… parsed.type === "extension_ui_response") {
+    const response = parsed as RpcExtensionUIResponse;
+    const pending = pendingExtensionRequests.get(response.id);
+    if (pending) { pendingExtensionRequests.delete(response.id); pending.resolve(response); }
+    return;
+}
+```
+
+The intercept tests **only** `type`, never `id`, and `return`s unconditionally — so a malformed or unmatched envelope produces **no output line**.
+
+**Impact** — an extra stdout line a client can observe, on a protocol whose contract is that a client written against pi's docs works unmodified. Low severity because it requires a malformed envelope, but the matched and unmatched-but-string-id cases already behaved correctly (`rpc.rs:799-804` silently drops when `pending.remove` misses, as pi does), so only this one case diverged — and the rest of the RPC surface enumerated clean: commands 32/32 with every camelCase param spelling matching `rpc-types.ts:20-73`, event types with nothing missing, `extension_ui_request` methods 9/9 including the `set_editor_text` snake_case outlier, `extension_ui_response` shapes 3/3, `RpcSessionState` 12/12 in pi's declaration order, the `assistantMessageEvent` tag set 12/12, and the `extension_error` envelope identical.
+
+**Fix — DONE 2026-08-14** — `extension_ui_response_id` now returns `Option<Option<String>>`: the outer `Some` means "this is an `extension_ui_response`, intercept it" and is decided by the `type` tag alone; the inner `Option` is the correlation id. The call site always `continue`s and only looks up `pending` when the id is a string, so all three malformed/unmatched cases are swallowed exactly as pi's unconditional `return` swallows them.
+
+**Verify** — `rpc_malformed_extension_ui_response_is_swallowed_not_answered` (`crates/cyrup-modes/src/tests/modes.rs`) writes three envelopes pi swallows — no `id`, a numeric `id`, and a string `id` matching no pending dialog — followed by a `get_state` sentinel, and asserts the first line the client reads back is the sentinel's response. RED before the fix on the first case.
+
+## SEAM-100 — `cyrup update --models` does not exist, and the backlog already assumes it does
+
+**Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** confirmed — **verified by running the shipped binary**
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/package-manager-cli.ts:250-257` (the `--models` arm), `:329-337` (target selection + its two conflict messages), `:397-423` (`refreshModelCatalogs`), `:726-735` (the dispatch branch in `handlePackageCommand`). Supporting text at `:86` (the usage string), `:154`, `:159`, `:169` (the help body), `:322-323` and `:331-332` (the two conflict messages).
+
+**cyrup** — `parse_package_command` (`crates/cyrup/src/subcommands.rs:129-206`) has no `--models` arm at all, and `UpdateTargetSel` (`subcommands.rs:78-82`) has only `All` / `SelfUpdate` / `Extensions`. The token therefore falls into the catch-all at `subcommands.rs:194-196`. **Observed:** `cyrup update --models` prints `Unknown option --models for "update".`
+
+**Impact** — **there is no CLI route to refresh model catalogs.** That is the item; everything below is downstream of it, and is folded into this row rather than filed separately so the fix lands as one piece:
+
+- **Conflict messages.** pi's joined list is `--all cannot be combined with --self, --extensions, --models, or --extension` (`:322-323`); cyrup emits `--all cannot be combined with --self, --extensions, or --extension` (`subcommands.rs:213`). pi's second, models-specific message — `--models cannot be combined with --self, --extensions, --all, or --extension` (`:331-332`) — has no cyrup counterpart at all.
+- **Usage string.** pi's (`:86`) is `… [--self|--extensions|--models|--all] …`; cyrup's (`subcommands.rs:286`) drops `--models`.
+- **Help body.** pi lists `--models   Refresh model catalogs only` (`:159`) and the short form `pi update --models   Refresh model catalogs only` (`:169`); cyrup's (`subcommands.rs:311`) has neither, and its summary line reads `Update cyrup and installed packages.` against pi's `Update pi, installed packages, or model catalogs.` (`:154`).
+
+**Compounding, and the reason this is the highest-value single item on the CLI surface:** *the existing backlog already reasons as though the command ships.* `docs/gap-analysis/05-cyrup-config-and-resources.md` argues about lock contention "against any concurrent `cyrup update --models`" in `CFG-042`'s region. A gap that other analysis has already built on top of is worse than an ordinary gap, because closing the items above it will not reveal it.
+
+**Fix** — add the `--models` arm to `parse_package_command`, a `Models` variant to `UpdateTargetSel`, the two conflict messages, the usage/help text, and a `refresh_model_catalogs` port of `package-manager-cli.ts:397-423` wired into the dispatch. The catalog-refresh half is the real work; the parse half is small and **must not land alone** — an accepted flag over a stub is `SEAM-078` again.
+
+**Verify** — `cyrup update --models` refreshes and exits 0; `cyrup update --models --all` prints pi's exact second conflict message and exits 1; `cyrup update --help` names `--models` in both the options list and the short forms; and a test asserting the summary line matches pi's.
+
+## SEAM-101 — The `config` subcommand accepts unknown options and stray arguments silently
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed — **verified by running the shipped binary**
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/package-manager-cli.ts:626-636` — `Unknown option ${arg} for "config".` / `Unexpected argument ${arg}.`, both setting `process.exitCode = 1`; usage string `CONFIG_COMMAND_USAGE` at `:92`.
+
+**cyrup** — the `config` path (`crates/cyrup/src/subcommands.rs:349-366`) scans argv for `-l`/`--local` and the trust flags and then unconditionally runs the picker; there is no rejection arm. **Observed:** `cyrup config --bogus` and `cyrup config zzz` both open the picker and exit 0.
+
+**Impact** — a typo in a config invocation silently does something other than what was asked, and exits 0 while doing it. Every other cyrup subcommand rejects unknown options; `config` is the exception.
+
+**Fix** — add the two rejection arms at the top of the `config` handler, using pi's exact two sentences and exit 1. **Distinct from `SEAM-079`**, which covers only the `--help` half of the same handler — but both land in the same twenty lines and should go to one agent.
+
+**Verify** — `cyrup config --bogus` prints `Unknown option --bogus for "config".` and exits 1; `cyrup config zzz` prints `Unexpected argument zzz.` and exits 1; neither enters the picker.
+
+## SEAM-102 — `--help`'s environment block and the read set are not the same set, in BOTH directions
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/cli/args.ts:343` (`ANTHROPIC_AUTH_TOKEN`), `:373` (`QWEN_TOKEN_PLAN_API_KEY`), `:374` (`QWEN_TOKEN_PLAN_CN_API_KEY`), `:375` (`XIAOMI_API_KEY`), `:376` (`XIAOMI_TOKEN_PLAN_CN_API_KEY`), `:377` (`XIAOMI_TOKEN_PLAN_AMS_API_KEY`), `:378` (`XIAOMI_TOKEN_PLAN_SGP_API_KEY`) — seven rows of a 45-row block (`:342-389`). Also `:389`, whose row reads `PI_SHARE_VIEWER_URL              - Base URL for /share command (default: https://pi.dev/session/)`, with the default itself at `packages/coding-agent/src/config.ts:502` (`DEFAULT_SHARE_VIEWER_URL = "https://pi.dev/session/"`).
+
+**cyrup** — `render_help`'s env block (`crates/cyrup/src/cli.rs:1037-1077`) lists 38 names against pi's 45; after accounting for the four `PI_*`→`CYRUP_*` rebrands, exactly those seven are absent (`grep -c ANTHROPIC_AUTH_TOKEN crates/cyrup/src/cli.rs` → 0, likewise each). **All seven are genuinely implemented** — `crates/cyrup-provider/src/env_api_keys.rs:44` (`ANTHROPIC_AUTH_TOKEN`), `:53-54` (both `QWEN_TOKEN_PLAN` keys), `:84-86` and the adjacent Xiaomi arms. Separately, `cli.rs:1077` is `CYRUP_SHARE_VIEWER_URL           - Base URL for /share command`, dropping pi's `(default: …)` parenthetical (pi `args.ts:389`).
+
+**Impact** — a user with a working credential is told by `--help` that cyrup does not read it. **This is the exact INVERSE of `TUI-063`**, where `CYRUP_SHARE_VIEWER_URL` is advertised and read by nothing. Both are failures of one invariant — *the help block and the read set must be the same set* — and the documentation audit that produced `TUI-063` caught only the direction that leaves a dead row. The dropped default matters for the same reason: restoring `TUI-063`'s read without restoring the documented default would leave the help text unable to say what happens when the var is unset.
+
+**Fix** — generate the env block from the `env_api_keys` table rather than maintaining a parallel literal list, and restore the `(default: …)` parenthetical on the share-viewer row alongside `TUI-063`'s read.
+
+**Verify** — the whole two-sided check is one `comm(1)`: `git -C pi show v0.83.0:packages/coding-agent/src/cli/args.ts | sed -n '342,390p' | grep -oE '^  [A-Za-z_{][A-Za-z0-9_{}:<]*'` against the same grep over `cli.rs`, name-mapped. Land it as a test so the invariant cannot rot again.
+
+## SEAM-103 — `--list-models` swallows a following `@file` token as its search pattern
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed — **verified by running the shipped binary**
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/cli/args.ts:171-177` — `if (i + 1 < args.length && !args[i + 1].startsWith("-") && !args[i + 1].startsWith("@"))`.
+
+**cyrup** — `#[arg(long = "list-models", num_args = 0..=1, default_missing_value = "")]` (`crates/cyrup/src/cli.rs:268`); clap's optional-value consumption has no `@`-guard. **Observed:** `cyrup --list-models @foo` prints `No models matching "@foo"`, where pi lists the whole configured catalog and routes `@foo` to `fileArgs`.
+
+**Impact** — `pi --list-models @notes.md` and `cyrup --list-models @notes.md` give different output: upstream shows the catalog and keeps the file attachment, cyrup shows an empty result and loses it.
+
+**Fix** — pre-filter in `apply_arg_leniency` (or a dedicated arm) so an `@`-prefixed token following `--list-models` is not offered to clap as the optional value, matching pi's two-part guard exactly (`-` and `@`).
+
+**Verify** — `cyrup --list-models @foo` lists the configured catalog and leaves `@foo` in the file args; `cyrup --list-models gpt` still filters.
+
+## SEAM-104 — A bare `-` became the prompt instead of `Unknown option: -` — **CLOSED 2026-08-14 (FIXED THIS PASS)**
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed — **verified by running the shipped binary**
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/cli/args.ts:202-203` — `arg.startsWith("-") && !arg.startsWith("--")` matches the one-character token `-` and pushes an error diagnostic, which `main.ts:567-568` turns into exit 1. Its message arm is the *next* branch, `else if (!arg.startsWith("-"))` (`:204`), so `-` can never reach `result.messages`.
+
+**cyrup (as filed)** — the unknown-short detector required `arg.len() > 1` (`crates/cyrup/src/diagnostics.rs:193-197`), so a bare `-` fell through to the positionals and became the PROMPT. **Observed on the shipped binary: `cyrup -` did not error — it started a real agent turn and issued a provider request.**
+
+**Impact** — a spend-money-on-a-typo divergence: pi exits 1 without contacting anything.
+
+**Fix — LANDED 2026-08-14.** The `arg.len() > 1` guard is deleted; the predicate is now pi's, verbatim. The `--`-prefixed case is still excluded by the existing `!arg.starts_with("--")`, so the extension-flag capture is untouched, and `KNOWN_SHORT_FLAGS` cannot contain `-`. A comment at the site records that there is deliberately NO length guard and why, so it is not "tidied" back in.
+
+**Verify** — `bare_single_dash_is_an_unknown_option_not_a_prompt` in `crates/cyrup/src/diagnostics.rs` asserts `-` yields exactly one error diagnostic reading `Unknown option: -`, that it does NOT survive into the cleaned argv, and — presence before absence — that `--` still passes through untouched with no diagnostic. RED before the change. `cargo check -p cyrup --all-targets` clean.
+
+## SEAM-105 — Repeated `--models` / `--tools` / `--exclude-tools` append; pi replaces
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/cli/args.ts:114` (`result.models = …`), `:121-124` (`result.tools = …`), `:125-129` (`result.excludeTools = …`) — all three ASSIGN, so a repeated flag replaces the earlier value.
+
+**cyrup** — all three are declared as `Vec<String>` with `value_delimiter = ','` (`crates/cyrup/src/cli.rs:176`, `:195`, `:198`), so clap APPENDS across repeats.
+
+**Impact** — `--tools read --tools bash` yields `{read}` under pi and `{read,bash}` under cyrup; `--models a --models b` yields `[b]` vs `[a,b]`. Only the repeated-flag form diverges — the single comma-separated form is identical, which is why every existing test passes.
+
+**Fix** — keep the `Vec` for the comma form but take only the LAST occurrence group, e.g. by reading clap's occurrence structure (`ArgMatches::get_occurrences`) or by post-processing argv before clap sees it, alongside the other leniency rules in `diagnostics.rs`.
+
+**Verify** — three tests, one per flag, asserting `--tools read --tools bash` resolves to exactly `{bash}` while `--tools read,bash` still resolves to both.
+
+## SEAM-106 — `--export` runs after four guards pi runs it before
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/main.ts:578-590` — the export branch sits immediately after the `--version` exit and BEFORE `resolveAppMode` (`:592`), the RPC `@file` guard (`:598-601`), `validateForkFlags` / `validateSessionIdFlags` (`:603-604`) and the `--api-key requires a model` check (`:757-761`).
+
+**cyrup** — export runs at `crates/cyrup/src/main.rs:350-352`, downstream of all four: session-flag validation at `:221`, the RPC `@file` guard at `:247`, and the `--api-key requires a model` bail at `:344-346`.
+
+**Impact** — `cyrup --export s.jsonl --api-key K` and `cyrup --export s.jsonl --fork X --continue` both error where pi performs the export and exits 0. Export is the operation a user reaches for when the session is already in a bad state, so the guards fire on exactly the invocations that need it most. Separately, `--export` takes its optional output path from `cli.positionals.first()` (`:351`), which — unlike pi's `parsed.messages[0]` — still contains `@file` tokens, so `cyrup --export @notes.md` writes to a file named `@notes.md`.
+
+**Fix** — move the export branch to immediately after the `--version` exit, matching pi's dispatch order, and take the path from the message list after `@file` partitioning rather than from raw positionals.
+
+**Verify** — `--export out.jsonl --api-key K` exits 0 with the file written; `--export out.jsonl --fork X --continue` likewise; `--export @notes.md` does not create `@notes.md`.
+
+## SEAM-107 — `-p`'s `---` escape hatch is unported
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/cli/args.ts:140-146` — after `--print`/`-p`, `if (next !== undefined && !next.startsWith("@") && (!next.startsWith("-") || next.startsWith("---")))` the token is pushed as a MESSAGE and consumed. The `next.startsWith("---")` clause is the escape hatch that lets a prompt legitimately begin with dashes.
+
+**cyrup** — `--print` is a plain clap bool (`crates/cyrup/src/cli.rs:133-134`), so `---weird` after `-p` reaches `partition_extension_flags` (`cli.rs:762-802`) and is captured as an extension flag named `-weird` instead of becoming the prompt.
+
+**Impact** — the narrowest item on this surface: it only fires for a prompt whose first token begins with three or more dashes. Recorded for completeness of the enumeration rather than as a scheduling candidate — but it is a real path by which a prompt is silently reinterpreted as a flag.
+
+**Fix** — port the three-part condition into the `-p`/`--print` handling in `diagnostics.rs` so a `---`-prefixed following token is consumed as the message.
+
+**Verify** — `cyrup -p ---weird` treats `---weird` as the prompt and registers no extension flag.
+
+## SEAM-108 — The `auth` surface is v0.84.1-shaped against a v0.83.0 port
+
+**Kind** upstream-drift · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/cli/credential-print.ts:24-30` (`printCredentialPrintHelp` — TWO verbs, usage spelled `pi auth print-api-key --model <model> [--provider <provider>]`, i.e. model REQUIRED and provider optional), `:38-40` (the unknown-verb sentence, naming two verbs), `:66-76` (`validateCredentialPrintArgs`, which rejects a missing `--model` with `Credential printing requires --model <model>` and whose unknown-flag error is `Credential printing only accepts --provider and --model`).
+
+**cyrup** — `crates/cyrup/src/credential_print.rs` shows three verbs (`:46-47`, `:176-183`), spells the usage `cyrup auth print-api-key [--provider <provider>] [--model <model>]` (`:79`) and requires provider OR model (`:314-321`); the unknown-verb sentence names three verbs (`:226-230`) and the unknown-flag error is `Unknown option --X for "auth print-api-key".`
+
+**Impact** — `cyrup auth print-api-key --provider openai` SUCCEEDS where `pi v0.83.0 auth print-api-key --provider openai` errors. `SEAM-050` (closed) filed the v0.84.1 `auth` surface as unported and closed by landing it; this row records what landing it diverged FROM, so the divergence is known rather than implied by a closed row. The forward-port itself is deliberate and documented in-file — **this is not a request to revert it.**
+
+**Fix** — none unless the owner wants strict v0.83.0 behaviour. What is owed is a `[CYRUP-DELTA]` at the argument-validation site stating that the required-argument rule, the verb count and the two error sentences are v0.84.1's and not the ported tag's, so a later fidelity pass against `credential-print.ts` does not read them as defects.
+
+**Verify** — assert the delta line exists and names `@v0.84.1`; assert the three-verb help and the provider-OR-model rule are covered by tests that cite it.
+
+## SEAM-109 — Two hidden argv verbs with no upstream counterpart
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `__subagent-runner --config <path>` (`crates/cyrup/src/main.rs:124-129`; `crates/cyrup/src/subagent_runner_cmd.rs:50-52`, `is_selected` matching `argv[1]`) and `__intercom-broker` (`crates/cyrup/src/main.rs:136-141`; `crates/cyrup/src/intercom_broker_cmd.rs:22-24`).
+
+**upstream** — pi has **no argv verbs at all**: `git -C pi grep -nE 'argv\[2\]|process\.argv' v0.83.0` finds none. `pi-subagents` spawns a SEPARATE script (`src/runs/background/async-execution.ts:492`, `:516` — node + jiti on `subagent-runner.ts` with a config path), never a hidden verb on the pi binary. `packages/coding-agent/src/rpc-entry.ts` and `bun/cli.ts` are separate binary ENTRY POINTS, not argv verbs — `rpc-entry.ts:12` just prepends `--mode rpc` and `bun/cli.ts:1-15` sets `process.title` and re-imports `../cli.ts`, contributing no flags.
+
+**Impact** — the single-binary re-exec is a defensible Rust analog of a mechanism that cannot be ported literally (there is no `node` to hand a script to). But it is an invented, user-reachable command surface: it is deliberately absent from `--help` (`main.rs:117-118`) and from `SUBCOMMANDS` (`subcommands.rs:31`), which makes it undiscoverable rather than absent. Not a defect — filed so it is enumerated rather than assumed to be parity, per this sweep's rule that an invented surface must be KNOWN.
+
+**Fix** — none proposed. What is owed is a `[CYRUP-DELTA]` at each verb naming `async-execution.ts:492`/`:516` as the mechanism it replaces and stating that the verb is intentionally undocumented.
+
+**Verify** — assert both handlers reject when `argv[1]` does not match exactly, and that neither name appears in `--help` or `SUBCOMMANDS`.
+
+## SEAM-110 — `update <source>` accepts a third self alias that pi does not, and advertises the wrong one
+
+**Kind** cyrup-original · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**cyrup** — `crates/cyrup/src/subcommands.rs:235` — `let source_is_self = src == "self" || src == "pi" || src == "cyrup";`
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/package-manager-cli.ts:348` — `source === "self" || source === "pi"`. Exactly two.
+
+**Impact** — the rebranded third alias is the obviously right call for a fork named cyrup, and the superset is harmless. What is not harmless is the help text: `subcommands.rs:311` still reads `cyrup update pi   Update cyrup only (self works as alias to pi)` — it advertises the `pi` alias and never mentions the `cyrup` one, so the alias a user would actually guess is the one undocumented.
+
+**Fix** — reword the short-forms line to name `cyrup` (keeping `self`/`pi` as accepted legacy spellings), and record the superset in a `[CYRUP-DELTA]` citing `:348`.
+
+**Verify** — `cyrup update cyrup` behaves as `--self`; `cyrup update --help` names the `cyrup` alias.
+
+## SEAM-111 — The top-level help's Commands block understates the shipped surface
+
+**Kind** parity-bug · **Severity** low · **Effort** S · **Confidence** confirmed
+
+**upstream** — `pi v0.83.0 packages/coding-agent/src/cli/args.ts:232` and `:234`: `pi update [source|self|pi]   Update pi, extensions, or model catalogs` and `pi config [-l]   Open TUI to enable/disable package resources (Tab switches scope)`.
+
+**cyrup** — `crates/cyrup/src/cli.rs:923` and `:925`: `cyrup update [source|self|pi]   Update cyrup (use --all for cyrup and extensions)` and `cyrup config   Open TUI to enable/disable package resources`.
+
+**Impact** — three omissions, and **two of them understate what actually ships**: `-l` IS supported (`subcommands.rs:360`) and Tab DOES switch scope, yet neither is advertised at the top level — so the two least guessable parts of `config` are invisible from both the top-level help and (per `SEAM-079`) `config --help`. The third omission, the model-catalog clause, is honest today only because `SEAM-100` is open.
+
+**Fix** — restore `[-l]` and the Tab hint on the `config` line; restore the model-catalog clause on the `update` line **together with `SEAM-100`**, not before it.
+
+**Verify** — assert `cyrup --help` contains `[-l]` and `Tab switches scope`; assert the `update` line names model catalogs only once the command exists.
 
 ## Coverage
 

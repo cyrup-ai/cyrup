@@ -82,9 +82,7 @@
 		"baseUrl": "https://api.fireworks.ai/inference/v1",
 		"compat": {
 			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"sendSessionAffinityHeaders": true,
-			"supportsLongCacheRetention": false
+			"supportsDeveloperRole": false
 		},
 		"reasoning": true,
 		"thinkingLevelMap": {
@@ -317,9 +315,7 @@
 		"baseUrl": "https://api.fireworks.ai/inference/v1",
 		"compat": {
 			"supportsStore": false,
-			"supportsDeveloperRole": false,
-			"sendSessionAffinityHeaders": true,
-			"supportsLongCacheRetention": false
+			"supportsDeveloperRole": false
 		},
 		"reasoning": true,
 		"thinkingLevelMap": {

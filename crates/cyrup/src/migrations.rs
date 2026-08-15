@@ -39,6 +39,11 @@ pub fn run_migrations(dirs: &ConfigDirs) -> MigrationResult {
     // migrations.ts:312 — between `migrateToolsToBin()` (`:311`) and `migrateExtensionSystem()`
     // (`:313`). Every failure mode is swallowed inside the callee, as Pi's `try { … } catch {}` does.
     cyrup_config::migrate_keybindings_config_file(&dirs.agent_dir);
+    // CFG-054 — a cyrup-only migration (pi has no two-level package root to unwind): move Global
+    // package working trees out of the doubled `<package_dir>/packages/` segment. Runs here so a
+    // plain `cyrup` start repairs the layout, and again inside the package subcommands
+    // (`subcommands::run`), which are dispatched BEFORE this function (main.rs:145-154).
+    migrate_packages_root(&dirs.package_dir);
     let deprecation_warnings = migrate_extension_system(&dirs.agent_dir, &dirs.cwd);
     MigrationResult {
         migrated_auth_providers,
@@ -208,6 +213,25 @@ fn migrate_tools_to_bin(agent_dir: &Path, bin_dir: &Path) -> bool {
         crate::output_guard::emit_stray_line("Migrated managed binaries tools/ → bin/");
     }
     moved_any
+}
+
+/// CFG-054 — unwind the doubled `<package_dir>/packages/<id>` working-tree layout a pre-fix build
+/// wrote, announcing it exactly once (the same `movedAny`-gated notice shape as
+/// [`migrate_tools_to_bin`], Pi migrations.ts:213-215): after the fix the tree resolves at
+/// `<package_dir>/<id>`, so without the move every installed git package's resources would silently
+/// stop loading while its registry row — whose path never doubled — stayed put.
+///
+/// Idempotent and best-effort; `0` for every fresh install, which is one `read_dir` on a missing
+/// path.
+pub(crate) fn migrate_packages_root(package_dir: &Path) -> usize {
+    let moved = cyrup_resources::migrate_legacy_doubled_packages_root(package_dir);
+    if moved > 0 {
+        crate::output_guard::emit_stray_line(&format!(
+            "Migrated {moved} installed package(s) out of {}",
+            package_dir.join("packages").display()
+        ));
+    }
+    moved
 }
 
 /// Migrate a `commands/` resource dir to `prompts/` for global + project bases, then collect
@@ -583,6 +607,28 @@ mod tests {
         );
         assert!(!tools.join("rg").exists(), "the stale source is still removed");
         assert!(d.bin_dir().join("rg").exists());
+    }
+
+    /// CFG-054 — `run_migrations` must unwind the doubled package root, or upgrading silently
+    /// unloads every installed git package: `PackageStore::package_dir` now resolves
+    /// `<package_dir>/<id>` while the tree an older build cloned still sits at
+    /// `<package_dir>/packages/<id>`, and the registry row that names it — whose own path never
+    /// doubled — keeps claiming the package is installed.
+    #[test]
+    fn migrates_installed_packages_out_of_the_doubled_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = dirs(tmp.path());
+        let legacy = d.package_dir.join("packages").join("git-github.com-acme-pack");
+        std::fs::create_dir_all(&legacy).unwrap();
+        std::fs::write(legacy.join("SKILL.md"), "x").unwrap();
+
+        run_migrations(&d);
+
+        let moved = d.package_dir.join("git-github.com-acme-pack");
+        assert!(moved.join("SKILL.md").exists(), "the tree must move up one level");
+        assert!(!d.package_dir.join("packages").exists());
+        // Idempotent: the second run has nothing to move, so it says nothing.
+        assert_eq!(migrate_packages_root(&d.package_dir), 0);
     }
 
     /// CFG-048 — Pi's FIFTH `runMigrations` call (`migrations.ts:312`, between `migrateToolsToBin()`

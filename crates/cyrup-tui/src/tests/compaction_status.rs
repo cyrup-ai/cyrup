@@ -81,7 +81,7 @@ async fn compact_does_not_run_on_the_run_loops_task() {
     app.draw().unwrap();
     let immediately = screen(&app);
     assert!(
-        !immediately.contains("compact error") && !immediately.contains("Compacted from"),
+        !immediately.contains("Compaction failed") && !immediately.contains("Compacted from"),
         "the outcome must NOT have been applied by `execute_command` — that is the inline await \
          this item is about:\n{immediately}"
     );
@@ -92,7 +92,7 @@ async fn compact_does_not_run_on_the_run_loops_task() {
     app.draw().unwrap();
     let after = screen(&app);
     assert!(
-        after.contains("compact error") || after.contains("Compacted from"),
+        after.contains("Compaction failed") || after.contains("Compacted from"),
         "applying the outcome renders exactly what the inline path used to:\n{after}"
     );
 }
@@ -108,6 +108,15 @@ async fn the_band_is_armed_for_the_whole_compaction_window() {
         app.draw().unwrap();
         let s = screen(&app);
         assert!(s.contains("Compacting context..."), "band missing mid-compaction:\n{s}");
+        // SESS-040's Verify line: the band does not merely appear, it must carry the affordance it
+        // advertises — `Compacting context... (${keyText("app.interrupt")} to cancel)`
+        // (`status-indicator.ts:78-82`), built from the LIVE keymap. Asserting only the message
+        // would pass while the advertised half was missing, which is the failure mode this whole
+        // item is about.
+        assert!(
+            s.contains("Compacting context... (escape to cancel)"),
+            "the band must advertise the cancel key it now actually honours:\n{s}"
+        );
     }
     app.ingest_event(&AgentSessionEvent::CompactionEnd {
         reason: CompactionReason::Manual,
@@ -133,7 +142,7 @@ async fn without_a_channel_the_outcome_is_still_applied_inline() {
     app.draw().unwrap();
     let s = screen(&app);
     assert!(
-        s.contains("compact error") || s.contains("Compacted from"),
+        s.contains("Compaction failed") || s.contains("Compacted from"),
         "the inline fallback must still render the outcome:\n{s}"
     );
 }
@@ -191,4 +200,33 @@ async fn a_failed_or_cancelled_compaction_is_not_announced_as_complete() {
     app.draw().unwrap();
     let s = screen(&app);
     assert!(!s.contains("compaction complete"), "manual failure claimed success:\n{s}");
+
+    // (d) SESS-040 — and the manual path that DOES render must not call the user's own cancel an
+    // error. pi's manual branches are `showError("Compaction cancelled")` when `aborted`
+    // (`interactive-mode.ts:3099-3100`) and `showError(errorMessage)` otherwise (`:3116-3117`),
+    // where `errorMessage` is the `Compaction failed: …` its catch builds
+    // (`agent-session.ts:1908-1917`). cyrup rendered both as the dim status line
+    // `compact error: …`, so pressing the Escape the band advertises reported the cancel as an
+    // error, in a channel pi never uses for either branch.
+    let mut app = new_app();
+    app.apply_compact_outcome(Err("Compaction cancelled".to_string()));
+    app.draw().unwrap();
+    let s = screen(&app);
+    assert!(s.contains("Compaction cancelled"), "pi's bare cancel copy is missing:\n{s}");
+    assert!(
+        !s.contains("compact error"),
+        "a deliberate cancel must not be prefixed as an error:\n{s}"
+    );
+
+    // …and a genuine manual failure keeps pi's wrapper, which cyrup already emits verbatim on the
+    // event — this path was the one that disagreed with it.
+    let mut app = new_app();
+    app.apply_compact_outcome(Err("Nothing to compact (session too small)".to_string()));
+    app.draw().unwrap();
+    let s = screen(&app);
+    assert!(
+        s.contains("Compaction failed: Nothing to compact (session too small)"),
+        "pi's manual failure copy (agent-session.ts:1908-1917) is missing:\n{s}"
+    );
+    assert!(!s.contains("compact error"), "the cyrup-only prefix is still rendered:\n{s}");
 }
