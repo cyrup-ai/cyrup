@@ -87,8 +87,9 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = opencode_models();
-        // pi `opencode.models.ts` @91585d9a (51 — adds claude-fable-5, grok-4.5, hy3-free).
-        assert_eq!(models.len(), 51);
+        // pi `opencode.models.ts` @`b0c2a90e` (54). The three cyrup lacked at `91585d9a` are the
+        // GPT-5.6 trio (`luna`/`sol`/`terra`) — PROV-057/PROV-060.
+        assert_eq!(models.len(), 54);
         assert!(models.iter().all(|m| m.provider.as_str() == "opencode"));
         assert!(models.iter().all(|m| !m.base_url.is_empty()));
         // The catalog spans all four wire protocols this provider declares (Pi opencode.ts:8-23).

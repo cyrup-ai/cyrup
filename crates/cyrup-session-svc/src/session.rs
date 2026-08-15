@@ -1212,12 +1212,31 @@ impl AgentSession {
             let model = Self::lock(&self.compaction_model)
                 .clone()
                 .ok_or(SessionServiceError::NoModelSelected)?;
-            if !self.has_configured_auth(&model) {
-                return Err(SessionServiceError::NoConfiguredAuth(format!(
-                    "{}/{}",
-                    model.provider.as_str(),
-                    model.id.as_str()
-                )));
+            // PROV-037 — pi's refusal is a THREE-branch decision, not one
+            // (`agent-session.ts:1182-1195` @v0.83.0):
+            //
+            //   const hasConfiguredAuth =
+            //       this._modelRuntime.hasConfiguredAuth(this.model.provider) ||
+            //       (await this._modelRuntime.checkAuth(this.model.provider)) !== undefined;
+            //   if (!hasConfiguredAuth) {
+            //       if (this._modelRuntime.isUsingOAuth(...)) throw new Error(`Authentication failed…`);
+            //       throw new Error(formatNoApiKeyFoundMessage(this.model.provider));
+            //   }
+            //
+            // cyrup consulted only the cached `has_configured_auth` and reported its own
+            // `no configured auth for model: p/m`. Two consequences, both user-visible: a provider
+            // whose credential is present but outside the cached configured set was refused where
+            // pi re-checks and PROCEEDS, and an expired OAuth token produced a message that named
+            // neither the provider nor `/login`.
+            if !self.has_configured_auth(&model) && !self.recheck_provider_auth(&model).await {
+                let provider = model.provider.as_str();
+                return Err(SessionServiceError::AuthPreflightRefused(
+                    if self.provider_is_oauth_backed(&model.provider).await {
+                        crate::auth_guidance::format_oauth_reauthenticate_message(provider)
+                    } else {
+                        crate::auth_guidance::format_no_api_key_found_message(provider)
+                    },
+                ));
             }
         }
         // 4. Pre-send compaction check on the last assistant turn (agent-session.ts:1080-1083).
@@ -2989,6 +3008,45 @@ impl AgentSession {
         )
     }
 
+    /// pi's `checkAuth` SECOND CHANCE — `(await this._modelRuntime.checkAuth(provider)) !== undefined`
+    /// (`agent-session.ts:1184` @v0.83.0). PROV-037.
+    ///
+    /// [`Self::has_configured_auth`] is the cached, synchronous `hasConfiguredAuth` half
+    /// (`model-runtime.ts:372-374`, a `Set` lookup on a snapshot). This is the live half upstream
+    /// ORs with it, and the OR is the whole point: a credential that exists but is not in the
+    /// cached set — an `auth.json` written by `cyrup auth` in another terminal after this session
+    /// started, an `/login` in a sibling process — lets the turn PROCEED where cyrup refused it.
+    ///
+    /// `[CYRUP-DELTA]` **mechanism.** pi re-runs `Models.checkAuth`, which resolves the provider's
+    /// auth strategy from scratch. Reaching `cyrup_provider::Models::check_auth` from here would
+    /// mean composing a whole registry per refusal (the session holds one installed `Provider`, not
+    /// a `Models`), and the only reason upstream's re-check can differ from its cached answer is
+    /// that the SNAPSHOT is stale — so this refreshes the snapshot ([`AuthStore::reload`], pi's own
+    /// `AuthStorage.reload`, `auth-storage.ts:204-215`) and re-asks the same predicate. That covers
+    /// every credential source `has_configured_auth` knows and reproduces the observable
+    /// difference; what it does not cover is a provider whose auth is ambient in a way
+    /// `provider_is_configured` cannot see (Bedrock's IAM chain, Vertex ADC), which is a gap in the
+    /// PREDICATE and identical before and after this call.
+    ///
+    /// Runs only on the refusal path, so the file read costs nothing on a normal turn.
+    async fn recheck_provider_auth(&self, model: &Model) -> bool {
+        self.services.auth.reload();
+        self.has_configured_auth(model)
+    }
+
+    /// pi `ModelRuntime.isUsingOAuth(providerId)` — `this.snapshot.auth.get(providerId)?.type ===
+    /// "oauth"` (`model-runtime.ts:368-370` @v0.83.0). PROV-037.
+    ///
+    /// Reads the STORED credential's type, which is exactly what upstream's snapshot holds. A read
+    /// failure or an absent credential is `false`, so the refusal falls to the api-key message —
+    /// the same direction upstream's `?.` takes.
+    async fn provider_is_oauth_backed(&self, provider: &ProviderId) -> bool {
+        matches!(
+            self.services.auth.read(provider).await,
+            Ok(Some(cyrup_config::Credential::Oauth { .. }))
+        )
+    }
+
     /// Public view of [`Self::full_model_registry`] — every model the session can resolve, before
     /// the configured-auth filter [`Self::available_model_catalog`] applies.
     pub fn full_model_catalog(&self) -> Vec<Model> {
@@ -3895,6 +3953,30 @@ impl AgentSession {
             mgr.session_file().map(|p| p.display().to_string()),
             context_usage,
         )
+    }
+
+    /// Per-model cost/token breakdown for `/session` (Pi `getUsageCostBreakdown(entries)`, called
+    /// from `handleSessionCommand` at `interactive-mode.ts:5665` @v0.83.0). PROV-036.
+    ///
+    /// Reads the SAME `mgr.entries()` [`Self::session_stats`] reads — every entry, including
+    /// history a compaction replaced — so the rows sum to `SessionStats::cost` exactly.
+    pub async fn usage_cost_breakdown(&self) -> Vec<crate::state::UsageCostBreakdownEntry> {
+        let mgr = self.manager.lock().await;
+        crate::state::usage_cost_breakdown(mgr.entries())
+    }
+
+    /// Session-wide prompt-cache waste for `/session` (Pi `computeCacheWaste(entries,
+    /// this.session.modelRuntime)`, `interactive-mode.ts:5660` @v0.83.0). PROV-035.
+    ///
+    /// The price source is the session's full model registry, which is what pi's `modelRuntime`
+    /// argument resolves `getModel(provider, id)?.cost.cacheRead` against. A model the registry
+    /// does not know prices at `0`, exactly as pi's `?? undefined` fallback does — so an unknown
+    /// model still contributes its MISSED TOKENS, just no dollar figure.
+    pub async fn cache_waste(&self) -> cyrup_provider::cache_stats::CacheWasteTotals {
+        let models = self.full_model_registry();
+        let mgr = self.manager.lock().await;
+        let scan = crate::state::cache_scan_entries(mgr.entries());
+        cyrup_provider::cache_stats::compute_cache_waste(&scan, &models)
     }
 
     /// The `contextUsage` sub-object of [`Self::session_stats`], in Pi's `ContextUsage` shape

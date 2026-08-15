@@ -66,8 +66,9 @@ pub use cache_stats::{
 };
 pub use catalog::{builtin_catalog, load_catalog};
 pub use collection::{
-    CreateModelsOptions, EXTENDED_THINKING_LEVELS, Models, clamp_thinking_level, create_models,
-    get_supported_thinking_levels, has_api, models_are_equal,
+    CreateModelsOptions, EXTENDED_THINKING_LEVELS, Models, ModelsRefreshOptions,
+    ModelsRefreshResult, clamp_thinking_level, create_models, get_supported_thinking_levels,
+    has_api, models_are_equal,
 };
 pub use config_provider::ConfigProvider;
 pub use context::{
@@ -95,7 +96,7 @@ pub use remote_catalog::{
     CatalogOverlay, DEFAULT_CATALOG_BASE_URL, REMOTE_CATALOG_REFRESH_INTERVAL_MS, RefreshOptions,
     RemoteCatalog, RemoteCatalogProvider, merge_models, parse_catalog, remote_models,
 };
-pub use provider::Provider;
+pub use provider::{Provider, RefreshModelsContext};
 pub use providers::all::{
     BUILTIN_CATALOG_MANIFEST_JSON, all_images_providers, all_providers, all_providers_with,
     all_providers_with_overlay, builtin_model_data_generated_at, default_images_models,

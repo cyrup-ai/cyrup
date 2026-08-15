@@ -690,10 +690,13 @@ async fn an_overlay_not_newer_than_the_builtin_manifest_is_discarded_whole() {
 
 #[test]
 fn the_builtin_manifest_stamp_agrees_with_the_documented_provenance() {
-    // `src/tests/catalog_data.rs` documents the embedded catalogs as two extractions: 31 files from
-    // pi `91585d9a` (its commit timestamp is 2026-07-10T14:34:43Z) and four — amazon-bedrock,
-    // github-copilot, google-vertex, openai-codex — from pi `b0c2a90e`
-    // (`git log -1 --format=%ct b0c2a90e` = 1784278803, i.e. 2026-07-17T09:00:03Z).
+    // The embedded catalogs USED to be two extractions — 31 files from pi `91585d9a` (commit
+    // timestamp 2026-07-10T14:34:43Z) and four (amazon-bedrock, github-copilot, google-vertex,
+    // openai-codex) from `b0c2a90e` (`git log -1 --format=%ct b0c2a90e` = 1784278803, i.e.
+    // 2026-07-17T09:00:03Z). Since PROV-060 there is ONE: `cargo run -p xtask -- gen-catalogs`
+    // generates all 35 from `b0c2a90e`, so the stamp below now describes every file rather than
+    // the newest of a split. The value does not move — `b0c2a90e` was already the later of the two
+    // — which is why this test is unchanged by that refresh.
     //
     // PROV-039 moved the stamp from the EARLIER revision to the LATER one, and this test still
     // pinned the earlier value. The later one is the only correct choice for what the field is

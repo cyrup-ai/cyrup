@@ -340,10 +340,40 @@ fn format_status(status: &RunStatus, paths: &RunPaths) -> String {
 /// "neither file exists" not-found case).
 async fn inspect_paths(paths: &RunPaths) -> Result<Option<String>, SubagentError> {
     match reconcile_before_control_op(paths).await {
-        Ok(status) => Ok(Some(format_status(&status, paths))),
+        // SUBA-057 — pi `run-status.ts:332-345`: a dismissed run answers with the display-dismissed
+        // report instead of the ordinary one. `reconcile_before_control_op` has already erased the
+        // marker if an authoritative `ResultFile` arrived, so reaching here means the dismissal is
+        // still the truest thing known about this run.
+        Ok(status) => Ok(Some(match status.display_dismissed_at {
+            Some(dismissed_at) => {
+                format_display_dismissed_status(status.run_id.as_str(), dismissed_at)
+            }
+            None => format_status(&status, paths),
+        })),
         Err(SubagentError::Spawn(e)) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// SUBA-057 — pi's display-dismissed single-run report (`runs/background/run-status.ts:342-345`
+/// @v0.47.1), reached upstream when reconciliation returns a `null` status but the on-disk record
+/// still carries `displayDismissedAt`.
+///
+/// Rendered by `{action:"status", id}` for a run the operator dismissed, in place of the ordinary
+/// [`format_status`] report. It exists so an id-addressed lookup of a dismissed run is answered
+/// honestly — "you dismissed this, and nothing was killed" — rather than with either a stale
+/// `running` report or a bare "not found", both of which would be lies about the same record.
+///
+/// The timestamp goes through this module's own [`format_iso8601_millis`] — the same millisecond-
+/// precision UTC renderer every other cyrup-written timestamp uses — matching upstream's
+/// `new Date(displayDismissedAt).toISOString()`.
+#[must_use]
+pub fn format_display_dismissed_status(run_id: &str, dismissed_at_epoch_millis: i64) -> String {
+    let dismissed = format_iso8601_millis(dismissed_at_epoch_millis);
+    format!(
+        "Run: {run_id}\nState: display-dismissed\nDismissed: {dismissed}\nNo running work was \
+         terminated."
+    )
 }
 
 /// Resolve a run-id selector (exact id, or a unique dir-name prefix) against `async_root`/
@@ -592,6 +622,17 @@ pub async fn list_active_runs(
         let Ok(status) = reconcile_before_control_op(&paths).await else {
             continue;
         };
+        // SUBA-057 — pi `if (status.displayDismissedAt !== undefined) { …; continue; }`
+        // (`async-status.ts:455-458` @v0.47.1), applied in pi's own position: FIRST, ahead of both
+        // the session filter and the state filter. This one `continue` is what actually makes a
+        // dismissed run disappear from `/subagents-fleet` and from `{action:"status"}` with no id,
+        // since both render from this list. It is display-only: nothing about the run's `state` or
+        // its files is changed, and `reconcile_before_control_op` above has already erased the
+        // marker if a real `ResultFile` arrived in the meantime, so a run that genuinely finished
+        // after being dismissed is NOT hidden here.
+        if status.display_dismissed_at.is_some() {
+            continue;
+        }
         // pi `if (options.sessionId && status.sessionId !== options.sessionId) continue;`
         // (`async-status.ts:432`), applied AFTER the state filter for the same reason pi applies it
         // there: both are cheap rejections that run before any further per-run work.

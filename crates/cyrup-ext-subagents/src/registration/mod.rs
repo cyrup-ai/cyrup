@@ -27,8 +27,12 @@
 //!
 //! 1. **Inline per-call tool/slash-command overrides** — a caller-supplied value for this one
 //!    invocation (e.g. `model=...` on `/run`, or a `subagent` tool-call parameter).
-//! 2. **`subagents.agentOverrides.<name>`/`subagents.defaultModel`** from `cyrup-config`'s
-//!    effective (CLI ▷ project ▷ global) settings view — [`SubagentsSettingsView`].
+//! 2. **`subagents.agentOverrides.<name>`/`subagents.defaultModel`** from the layered
+//!    agent-`settings.json` pair — project (`<project_root>/.cyrup/agents/settings.json`) beats
+//!    user (`~/.cyrup/agents/settings.json`), pi `agents/agents.ts:924-931` @v0.43.0 — as
+//!    resolved by [`crate::discovery::load_layered_subagent_settings`] and viewed through
+//!    [`SubagentsSettingsView`]. SUBA-071: this is the crate's ONLY settings store; it is not
+//!    `cyrup-config`'s `~/.cyrup/agent/settings.json`, which this crate never reads.
 //! 3. **`config.json`'s** `maxSubagentSpawnsPerSession`/`globalConcurrencyLimit`/etc. —
 //!    [`SubagentExtensionConfig`].
 //! 4. **Agent-frontmatter defaults** — `AgentDefinition`'s own parsed fields
@@ -59,6 +63,11 @@ pub mod authority;
 
 pub mod doctor;
 
+/// SUBA-055 — `action: "guide"` and the packaged, version-matched documentation set it serves
+/// (pi `extension/subagent-guide.ts` @v0.47.1). Embedded with `include_str!` rather than read from
+/// a package root; see the module doc's `[CYRUP-DELTA]`.
+pub mod guide;
+
 pub mod profiles;
 
 /// The 12 slash-command descriptors and their pure argument parsers (R-SA-129):
@@ -70,6 +79,12 @@ pub mod profiles;
 /// (agent-name existence validation, actual `InitApi` registration, and the single shared
 /// dispatch path itself, R-SA-130).
 pub mod slash_commands;
+
+/// SUBA-025 — the `subagent` tool description RESOLVER (`pi-subagents/src/extension/
+/// tool-description.ts`, in-baseline at v0.34.0): `toolDescriptionMode`, the 50 KiB-capped
+/// `subagent-tool-description.md` file override, and the mandatory safety-guidance appender that
+/// a custom description cannot drop. See [`tool_description`] for the full subsystem doc.
+pub mod tool_description;
 
 /// `/subagent-cost`'s recursive dual-shape token/cost usage accounting (R-SA-140):
 /// [`cost::compute_recursive_cost`] sums usage recursively through nested subagent-of-subagent
@@ -259,6 +274,20 @@ pub struct SubagentExtensionConfig {
     /// does not take the whole extension down at load. `None` (the key omitted) is unbudgeted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_budget: Option<serde_json::Value>,
+    /// SUBA-025 — pi `ExtensionConfig.toolDescriptionMode?: ToolDescriptionMode`, read at
+    /// `extension/index.ts:458` (@v0.34.0) / `:540` (@v0.43.0) as
+    /// `description: buildSubagentToolDescription(config)`.
+    ///
+    /// Carried RAW, exactly like [`Self::turn_budget`] and for the SAME upstream reason: pi's
+    /// `resolveToolDescriptionMode` (`tool-description.ts:104`) does not throw on a bad value — it
+    /// `console.warn`s and degrades to `"full"`. A parsed enum here would either reject the whole
+    /// `config.json` at load (which upstream does not) or silently drop the key without the
+    /// warning (which is the accepted-and-ignored defect this item exists to close).
+    ///
+    /// `None` (the key omitted) is pi's `"full"` default. Resolved through
+    /// [`tool_description::build_subagent_tool_description`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_description_mode: Option<serde_json::Value>,
 }
 
 /// SUBA-059 — pi's `Pick<ArtifactConfig, "cleanupDays">` (`shared/types.ts:1859` @v0.47.1): the
@@ -309,6 +338,8 @@ impl Default for SubagentExtensionConfig {
             artifact_dir: None,
             authority_policy: None,
             turn_budget: None,
+            // SUBA-025 — pi's `mode === undefined => "full"` (`tool-description.ts:106`).
+            tool_description_mode: None,
         }
     }
 }
@@ -621,21 +652,34 @@ impl ProactiveSkillSubagents {
 // SubagentsSettingsView (func-SA §4.7; arch-SA §3.8) — tier 2 of R-SA-133
 // -------------------------------------------------------------------------------------------
 
-/// The namespaced `subagents` slice of `cyrup-config::Settings` (func-SA §4.7
-/// `SubagentsSettingsView`; arch-SA §3.8), as read via `SettingsManager::effective().get(
-/// "subagents")` and written back (for the narrow cases this extension mutates settings at all,
-/// e.g. named-profile load, R-SA-141) via `SettingsManager::set_nested(scope, &["subagents",
-/// ...], value)`.
+/// The namespaced `subagents` settings slice — tier **2** of R-SA-133's five-tier precedence,
+/// below inline per-call overrides and above this extension's own `config.json` (tier 3).
 ///
-/// This is tier **2** of R-SA-133's five-tier precedence — below inline per-call overrides, above
-/// `config.json` (tier 3). It is deliberately a **distinct on-disk store** from
-/// [`SubagentExtensionConfig`] (arch-SA §4.6): `SubagentExtensionConfig` lives in a
-/// crate-owned `config.json` file under the extension's own config directory, while this view is
-/// backed by `cyrup-config`'s already-layered (global ◁ project ◁ CLI) `Settings` document under
-/// the `"subagents"` top-level key. No new schema registration is required inside `cyrup-config`
-/// itself for this — the key is read/written through that crate's already-untyped,
-/// extension-namespaced design (`Settings::get`/`SettingsManager::set_nested`), exactly as arch-SA
-/// §4.6 specifies.
+/// # There is exactly ONE on-disk source for this, and its precedence is upstream's (SUBA-071)
+///
+/// This doc comment used to say the view was "read via `SettingsManager::effective().get(
+/// \"subagents\")` and written back via `SettingsManager::set_nested`". **No such read or write
+/// has ever existed in this crate** — `rg 'SettingsManager|effective\(\)' crates/cyrup-ext-subagents/src`
+/// matches only prose — and the claim caused **SUBA-071** to be filed against a two-store
+/// divergence that is not there. The stale sentence is deleted rather than softened, because a
+/// doc comment describing a read path that does not exist is indistinguishable, to a reader, from
+/// one that does.
+///
+/// The single real source is the pair of `subagents`-blocked `settings.json` files the discovery
+/// path reads — `~/.cyrup/agents/settings.json` (user) and `<project_root>/.cyrup/agents/settings.json`
+/// (project) — layered by [`crate::discovery::load_layered_subagent_settings`] with **project
+/// beating user on every scalar and every per-agent override name**. That is upstream's own rule
+/// and upstream's own pair of files: pi resolves `subagents.defaultModel` at
+/// `agents/agents.ts:924-931` @v0.43.0 (`projectSettings.defaultModel !== undefined` → project
+/// scope, else user), `defaultThinking` at `:949-951` and `defaultExtensions` at `:969-971`, from
+/// `getUserAgentSettingsPath()` (`:674-676`) and `getProjectAgentSettingsPath(cwd)` (`:678-681`).
+/// So there is nothing to merge and no precedence to invent: [`Self::from_subagent_settings`] is
+/// the ONLY constructor that carries real data, and its input is that already-layered result.
+///
+/// `~/.cyrup/agent/settings.json` — `cyrup_config::Dirs::settings_path()`, the binary's own
+/// layered settings document — is a **different file that this crate never reads**. See
+/// [`profiles`]'s R-SA-141 note for the one place a store-based writer was deleted for aiming at
+/// it.
 ///
 /// Distinct in shape from [`crate::discovery::types::SubagentSettings`] (which `discovery/`'s own
 /// `parse_subagent_settings` produces for the discovery/merge pipeline's consumption,

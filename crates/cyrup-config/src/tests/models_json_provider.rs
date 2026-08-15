@@ -482,16 +482,19 @@ async fn nested_compat_objects_deep_merge_instead_of_replacing_the_routing_block
         .open_router_routing
         .clone()
         .expect("openRouterRouting must survive the merge");
+    // PROV-066: `openRouterRouting` is now the typed `OpenRouterRouting` rather than a bare
+    // `serde_json::Value`, so these read fields instead of map keys. `merge_compat` still merges
+    // over the SERIALIZED form, which is what makes the deep merge below indifferent to the change.
     assert_eq!(
-        routing.get("order"),
-        Some(&serde_json::json!(["alpha", "beta"])),
+        routing.order.as_deref(),
+        Some(&["alpha".to_string(), "beta".to_string()][..]),
         "the provider layer's routing ORDER must survive a model-level partial override — this is \
-         the field that goes out as the request's `provider.order`; routing was {routing}"
+         the field that goes out as the request's `provider.order`; routing was {routing:?}"
     );
     assert_eq!(
-        routing.get("allow_fallbacks"),
-        Some(&serde_json::json!(true)),
-        "the model layer still wins per field: {routing}"
+        routing.allow_fallbacks,
+        Some(true),
+        "the model layer still wins per field: {routing:?}"
     );
     // The same rule for chatTemplateKwargs, which `build_chat_template_kwargs`
     // (`api/openai_completions.rs:515-525`) copies into the request body.

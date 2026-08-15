@@ -36,9 +36,11 @@ pub struct WireProvider {
     store: Arc<dyn CredentialStore>,
     auth_ctx: Arc<dyn AuthContext>,
     registry: Arc<ApiRegistry>,
-    /// Pi `createProvider({ baseUrl })` (`models.ts:78` @v0.83.0) — PROV-017.
+    /// Pi `createProvider({ baseUrl })` (`CreateProviderOptions.baseUrl`, `models.ts:537` @v0.83.0;
+    /// the `Provider.baseUrl` it feeds is `:79`) — PROV-017.
     base_url: Option<String>,
-    /// Pi `createProvider({ headers })` (`models.ts:79` @v0.83.0) — PROV-017.
+    /// Pi `createProvider({ headers })` (`CreateProviderOptions.headers`, `models.ts:538` @v0.83.0;
+    /// the `Provider.headers` it feeds is `:80`) — PROV-017.
     headers: Option<crate::HeaderMap>,
     /// Pi `createProvider({ filterModels })` — the option `models.ts:545`/`:618` transports onto
     /// the constructed provider, applied by `Models.getAvailable()` at `:407`. PROV-032.
@@ -165,7 +167,7 @@ impl Provider for WireProvider {
 
             // 1. Resolve auth (failures → terminal Error, never thrown — R-01-018). The
             // provider-scoped env overlay (Pi `options.env`) participates in env-key resolution /
-            // base-url (Pi `applyAuth`, models.ts:240-241).
+            // base-url (Pi `applyAuth`, `models.ts:482` @v0.83.0).
             let overrides = AuthOverrides {
                 api_key: options.api_key.as_deref(),
                 env: options.env.as_ref(),
@@ -203,7 +205,8 @@ impl Provider for WireProvider {
 
             // Merge the per-request env overlay into the resolved env so the request path
             // (cache-retention / base-url resolution) sees it, with `options.env` winning per key
-            // (Pi `applyAuth`, models.ts:252: `{ ...(resolution.env ?? {}), ...(options.env ?? {}) }`).
+            // (Pi `applyAuth`, `models.ts:481` @v0.83.0:
+            // `{ ...(resolution.env ?? {}), ...(options.env ?? {}) }`).
             if let Some(req_env) = &options.env {
                 let merged = auth_result.env.get_or_insert_with(Default::default);
                 for (k, v) in req_env {

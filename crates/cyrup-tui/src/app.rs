@@ -5137,10 +5137,16 @@ impl<B: Backend> App<B> {
                 None => self.state.transcript.push_status("no assistant message to copy"),
             },
             C::SessionInfo => {
-                // Pi's `/session` renderer (interactive-mode.ts:5724-5763) reads exactly these
-                // fields off `getSessionStats()`; cyrup renders them as its own markdown table.
+                // Pi's `/session` renderer (`handleSessionCommand`, interactive-mode.ts:5656-5717
+                // @v0.83.0) reads exactly these fields off `getSessionStats()`; cyrup renders them
+                // as its own markdown table.
                 let stats = session.session_stats().await;
-                let body = format!(
+                // PROV-036 / PROV-035 — the two things pi computes here that cyrup did not:
+                // `getUsageCostBreakdown(entries)` (`:5665`) and
+                // `computeCacheWaste(entries, this.session.modelRuntime)` (`:5660`).
+                let breakdown = session.usage_cost_breakdown().await;
+                let cache_waste = session.cache_waste().await;
+                let mut body = format!(
                     "| Field | Value |\n|-------|-------|\n\
                      | file | {} |\n| id | {} |\n\
                      | messages | {} |\n| user | {} |\n| assistant | {} |\n\
@@ -5162,6 +5168,39 @@ impl<B: Backend> App<B> {
                     stats.tokens.total,
                     stats.cost,
                 );
+                // `if (stats.cost > 0 || cacheWaste.missedTokens > 0) { … }` (`:5696`). Both
+                // additions live under pi's one guard, so a zero-cost session gains no rows.
+                if stats.cost > 0.0 || cache_waste.missed_tokens > 0 {
+                    // `if (usageBreakdown.length > 1)` (`:5699`) — a single-model session shows the
+                    // total only, because a one-row breakdown restates it.
+                    if breakdown.len() > 1 {
+                        for entry in &breakdown {
+                            body.push_str(&format!(
+                                "| {} | ${:.3} ({} tokens) |\n",
+                                entry.key, entry.cost, entry.tokens
+                            ));
+                        }
+                    }
+                    // `if (cacheWaste.missedTokens > 0)` (`:5704-5711`): the `$` figure only when
+                    // `missedCost >= 0.0001`, else tokens + miss count alone. The label and the
+                    // singular/plural of "miss" are pi's strings verbatim.
+                    if cache_waste.missed_tokens > 0 {
+                        let miss_label = if cache_waste.miss_count == 1 {
+                            "1 miss".to_string()
+                        } else {
+                            format!("{} misses", cache_waste.miss_count)
+                        };
+                        let detail = format!("{} tokens, {miss_label}", cache_waste.missed_tokens);
+                        body.push_str(&if cache_waste.missed_cost >= 0.0001 {
+                            format!(
+                                "| Cache Re-billed | ${:.3} ({detail}) |\n",
+                                cache_waste.missed_cost
+                            )
+                        } else {
+                            format!("| Cache Re-billed | {detail} |\n")
+                        });
+                    }
+                }
                 self.state.transcript.push_block("Session", body);
             }
             // Session-lifecycle ops drive the `AgentSessionRuntime` (arch-11 §3.4): the op rebuilds

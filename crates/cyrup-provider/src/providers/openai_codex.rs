@@ -21,10 +21,12 @@
 //! "feat(ai): separate generated model data") the data moved to
 //! `packages/ai/src/providers/data/openai-codex.json`, which `.gitignore:11` excludes — so at the
 //! ported tag `v0.83.0` the catalog is not obtainable from the repository at all, and `b0c2a90e` is
-//! the closest knowable snapshot to it. This is the same revision
-//! `providers/catalog/github-copilot.json` was extracted from; see that module's note for why a
-//! revision newer than `providers/catalog_manifest.json`'s `91585d9a` cannot violate the manifest's
-//! staleness *floor* invariant (`providers/all.rs:76-83`).
+//! the closest knowable snapshot to it. **Since 2026-08-15 that is true of EVERY embedded catalog,
+//! not just this one:** all 35 are generated from `b0c2a90e` by
+//! `cargo run -p xtask -- gen-catalogs` (PROV-018/PROV-060), so the "four newer files among 31
+//! older ones" split this note used to describe is gone, and `catalog_manifest.json` records one
+//! revision with a per-provider source map. Do not hand-edit this file — `gen-catalogs --check`
+//! fails if you do.
 //!
 //! # What is not here
 //!
@@ -140,8 +142,13 @@ pub fn openai_codex_auth() -> ProviderAuth {
 
 /// Construct the Codex provider over the given credential store + shared api registry.
 ///
-/// The registry must provide the `openai-codex-responses` impl; none is registered today (see the
-/// module note), so this provider resolves models and auth but cannot yet stream.
+/// The registry must provide the `openai-codex-responses` impl. **`crate::api::register_builtins`
+/// registers it** (`api/mod.rs`, `crate::known_api::OPENAI_CODEX_RESPONSES` →
+/// `openai_codex_responses::factory`), so any provider built over
+/// [`crate::api::builtin_registry`] streams. PROV-041: this doc previously claimed "none is
+/// registered today … cannot yet stream", which was false at the tree it was written against and
+/// is the kind of citation `CLAUDE.md` makes the provenance record — see
+/// [`prov041_openai_codex_responses_is_registered`].
 pub fn openai_codex_provider_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,
@@ -539,6 +546,27 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    /// PROV-041 — the doc above [`openai_codex_provider_with`] used to assert that no
+    /// `openai-codex-responses` impl "is registered today", which made a reader conclude the Codex
+    /// provider could resolve auth and never stream. This turns the corrected claim into a
+    /// property, so the doc cannot go stale in that direction again.
+    ///
+    /// **Red before the fix:** the doc comment, not the code, was the defect — this test passed
+    /// against the false comment. It is the guard the corrected comment now cites, and it goes red
+    /// the moment the registration is dropped (which is the state the old comment described).
+    #[test]
+    fn prov041_openai_codex_responses_is_registered() {
+        let reg = crate::api::builtin_registry();
+        let api = cyrup_core::ApiId::from(crate::known_api::OPENAI_CODEX_RESPONSES);
+        assert!(
+            reg.contains(&api),
+            "openai-codex-responses is not registered — the doc on openai_codex_provider_with \
+             claims it is (PROV-041)"
+        );
+        let imp = reg.get(&api).expect("registered => constructible");
+        assert_eq!(imp.api(), &api);
+    }
+
     /// An [`AuthContext`] over a fixed map — also how the loopback tests keep proxy resolution
     /// deterministic (an ambient `HTTPS_PROXY` must not reroute a loopback request).
     struct MapEnv(BTreeMap<String, String>);
@@ -604,6 +632,16 @@ mod tests {
     ///    which is `272000` at BOTH tags (v0.84.1 `…:2541`, v0.83.0 `…:2352`). cyrup had `372000`
     ///    — a transposed digit that inflated the window by 100k and would let compaction defer past
     ///    the real limit.
+    ///
+    /// **Both values are now PINNED by the catalog generator, and this test is what they are pinned
+    /// against** (`xtask/src/main.rs` `DELTAS`). `openai-codex.json` is regenerated from
+    /// `b0c2a90e`, which is 13 days older than the ported tag and still carries `372000` and the
+    /// pre-cut prices, so a bare regeneration would revert both. The codex rows are **hardcoded in
+    /// `ai/scripts/generate-models.ts`** rather than fetched from models.dev, and that script IS in
+    /// git at v0.83.0 — so for these rows the ported tag is directly readable and beats `b0c2a90e`.
+    /// This also **REFUTES PROV-059(d)**, which reads the same `372000` off `b0c2a90e` and files
+    /// cyrup's `272000` as a 100k understatement: v0.83.0's comment at `…:2349` says in words
+    /// "GPT-5.6 follows Codex's 272k catalog limit (formerly 372k)".
     #[test]
     fn the_gpt_5_6_codex_rows_match_the_upstream_literals() {
         let models = openai_codex_models();

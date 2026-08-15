@@ -250,6 +250,16 @@ pub struct RunnerConfig {
     /// "unbudgeted", which is every run that does not ask for a budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-021 — the run-level USAGE budget (pi `AsyncExecutionParams.usageBudget`,
+    /// `runs/background/async-execution.ts:167`/`:216`, carried onto the runner as
+    /// `config.usageBudget`, `subagent-runner.ts:172`). Like [`Self::turn_budget`] it is resolved
+    /// once by the orchestrator and applies to the WHOLE async run — upstream's own words for the
+    /// workflow case are "A workflow usageBudget is enforced once across the workflow".
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize, and `None` is
+    /// unbudgeted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
     /// The effective `subagents.modelScope` policy in force for this run (SUBA-003), resolved ONCE
     /// by the orchestrator from its own discovery pass
     /// ([`crate::discovery::AgentDiscoveryResult::model_scope`]) and carried verbatim into the
@@ -1275,6 +1285,9 @@ async fn run_inner(
         share: config.share,
         // SUBA-008 — the run-level turn budget reaches every step from the one-shot config.
         turn_budget: config.turn_budget,
+        // SUBA-021 — and so does the run-level usage budget, for the same reason and by the same
+        // route (pi `ctx.usageBudget` ← `config.usageBudget`, `subagent-runner.ts:172`).
+        usage_budget: config.usage_budget,
         artifacts_dir: config.artifacts_dir.clone(),
         artifact_config: config.artifact_config,
         // G90 (pi `subagent-runner.ts:2313,2600,2797` @v0.34.0): the async run dir every
@@ -1993,6 +2006,8 @@ fn step_result_to_single_result(step: &RunnerStep, result: &StepResult) -> Singl
         RunnerStep::ParallelGroup(_) | RunnerStep::DynamicGroup(_) => String::new(),
     };
     SingleResult {
+        // SUBA-021: no usage budget on this path (see the field doc).
+        usage_budget: None,
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
@@ -2047,6 +2062,8 @@ fn imported_root_to_single_result(
     imported: &control::ImportedAsyncRootResult,
 ) -> SingleResult {
     SingleResult {
+        // SUBA-021: no usage budget on this path (see the field doc).
+        usage_budget: None,
         turn_budget: None,
         turn_budget_exceeded: false,
         wrap_up_requested: false,
@@ -2177,6 +2194,10 @@ pub(crate) struct ExecSingleStepExecutor {
     /// `runSubagentProcess({ … turnBudget: ctx.turnBudget })`, `subagent-runner.ts:1091`/`:1409`).
     /// `None` is unbudgeted.
     pub(crate) turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-021 — the run-level USAGE budget, carried from [`RunnerConfig::usage_budget`] and
+    /// threaded onto every dispatched step's [`crate::exec::RunOptions::usage_budget`]. `None` is
+    /// unbudgeted.
+    pub(crate) usage_budget: Option<crate::exec::usage_budget::UsageBudgetConfig>,
     /// SUBA-N03 — where this run's per-step artifact quadruple is written (pi `ctx.artifactsDir`,
     /// `runs/background/subagent-runner.ts:879-890,1117-1125` @v0.34.0 @v0.34.0), paired with
     /// [`Self::artifact_config`]. `None` disables artifact writing outright, which is exactly pi's
@@ -2276,6 +2297,9 @@ impl ExecSingleStepExecutor {
             // it is upstream. The SINGLE-mode tool path does not build this executor; it passes
             // its own `RunOptions::turn_budget` directly.
             turn_budget: None,
+            // SUBA-021: same as `turn_budget` — the foreground chain/parallel slash surfaces
+            // advertise no `usageBudget` param upstream either, so a foreground walk is unbudgeted.
+            usage_budget: None,
             artifacts_dir: None,
             artifact_config: crate::artifacts::ArtifactConfig::default(),
             // G90: a foreground walk has no async run directory, hence no steer inbox — the same
@@ -2328,6 +2352,21 @@ impl ExecSingleStepExecutor {
         self.run_dir
             .as_deref()
             .map(|run_dir| control::step_steer_inbox_dir(run_dir, index))
+    }
+
+    /// SUBA-049 — the RETURN half of [`Self::steer_inbox_for`], derived from the same run dir and
+    /// the same flat index so the request hop and the acknowledgment hop cannot address different
+    /// children (pi `steerAckDir: steerAcksDir(asyncDir, fi)` / `steerCapabilityPath:
+    /// steerCapabilityPath(asyncDir, fi)`, `runs/shared/pi-args.ts:766-768,764-765` @v0.43.0).
+    #[must_use]
+    pub(crate) fn steer_ack_dir_for(&self, index: usize) -> Option<PathBuf> {
+        self.run_dir.as_deref().map(|run_dir| control::steer_acks_dir(run_dir, index))
+    }
+
+    /// SUBA-049 — this child's capability file, same derivation as [`Self::steer_ack_dir_for`].
+    #[must_use]
+    pub(crate) fn steer_capability_path_for(&self, index: usize) -> Option<PathBuf> {
+        self.run_dir.as_deref().map(|run_dir| control::steer_capability_path(run_dir, index))
     }
 }
 
@@ -2492,6 +2531,10 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             }
         });
         let opts = RunOptions {
+            // SUBA-021 — the RUN-level usage budget applied per step, exactly as `turn_budget`
+            // below is (pi applies one `AsyncExecutionParams.usageBudget` across the whole run
+            // rather than giving each step a fresh one).
+            usage_budget: self.usage_budget,
             // SUBA-008 — pi `turnBudget: ctx.turnBudget` on every step's `runSubagentProcess`
             // call (`subagent-runner.ts:1409`): the RUN-level budget, applied per step, exactly
             // as upstream applies one `AsyncExecutionParams.turnBudget` to every step of an async
@@ -2597,6 +2640,14 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // directory by construction. `None` for a foreground executor (no async run dir).
             steer_inbox_dir: self
                 .steer_inbox_for(self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst)),
+            // SUBA-049: the return path, keyed off the SAME flat index as the inbox above — see
+            // `steer_ack_dir_for`'s doc for why the derivation is shared rather than re-written.
+            steer_ack_dir: self.steer_ack_dir_for(
+                self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst),
+            ),
+            steer_capability_path: self.steer_capability_path_for(
+                self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst),
+            ),
             // SUBA-N05: the run's resolved live-control config, threaded from
             // [`RunnerConfig::control`] (background) or [`ExecSingleStepExecutor::with_control`]
             // (foreground chain/parallel) — pi `controlConfig: input.controlConfig` on the
@@ -3161,6 +3212,8 @@ async fn finish_run(
 
     if !error.is_empty() && results.is_empty() {
         results.push(SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
@@ -3344,6 +3397,8 @@ mod tests {
 
         // The executor built for THIS run, exactly as `run` builds it.
         let executor = ExecSingleStepExecutor {
+            // SUBA-021: unbudgeted on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             depth: DepthEnvelope {
                 current_depth: 0,
@@ -3534,6 +3589,7 @@ mod tests {
                 id: format!("id-{ts}"),
                 ts,
                 message: message.to_string(),
+                mode: None,
                 target_index: None,
                 source: None,
             };
@@ -3599,6 +3655,8 @@ mod tests {
         // The executor carries an EMPTY persona map — exactly the state that must NOT dispatch a
         // placeholder.
         let executor = ExecSingleStepExecutor {
+            // SUBA-021: unbudgeted on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             depth: DepthEnvelope {
                 current_depth: 0,
@@ -3664,6 +3722,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            // SUBA-021: unbudgeted on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
@@ -3717,6 +3777,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("real tempdir");
         let cfg_path = dir.path().join("runner-config.json");
         let config = RunnerConfig {
+            // SUBA-021: unbudgeted on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
@@ -3842,6 +3904,8 @@ mod tests {
             .expect("pre-create a blocking file where the control dir needs to go");
 
         let config = RunnerConfig {
+            // SUBA-021: unbudgeted on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
@@ -3926,6 +3990,8 @@ mod tests {
             status.clone(),
             RunState::Complete,
             vec![SingleResult {
+                // SUBA-021: no usage budget on this path (see the field doc).
+                usage_budget: None,
                 turn_budget: None,
                 turn_budget_exceeded: false,
                 wrap_up_requested: false,
@@ -4311,6 +4377,8 @@ mod tests {
     #[test]
     fn promoting_stopped_children_leaves_already_settled_ones_alone() {
         let settled = |agent: &str, interrupted: bool, output: Option<&str>| SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
@@ -4411,6 +4479,8 @@ mod tests {
             cwd: dir.path().to_path_buf(),
             session_file: None,
             results: vec![SingleResult {
+                // SUBA-021: no usage budget on this path (see the field doc).
+                usage_budget: None,
                 turn_budget: None,
                 turn_budget_exceeded: false,
                 wrap_up_requested: false,
@@ -4450,6 +4520,8 @@ mod tests {
             .expect("mkdir results_dir");
 
         let config = RunnerConfig {
+            // SUBA-021: unbudgeted on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).

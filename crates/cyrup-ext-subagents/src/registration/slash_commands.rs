@@ -115,6 +115,10 @@ pub enum SlashCommandName {
     /// then issues the same call for whichever the user picks (`:791`). Also NOT one of R-SA-129's
     /// twelve, and registered by the same `registerSlashCommands` call.
     SubagentsStop,
+    /// SUBA-055 / SUBA-066 — `/subagents-guide [topic]` (pi `slash-commands.ts:706` @v0.47.1). The
+    /// user-facing half of the `guide` action: same reader, same packaged documents, same
+    /// unknown-topic message.
+    SubagentsGuide,
 }
 
 impl SlashCommandName {
@@ -142,6 +146,7 @@ impl SlashCommandName {
             SlashCommandName::ChainPrompts => "chain-prompts",
             SlashCommandName::SubagentsFleet => "subagents-fleet",
             SlashCommandName::SubagentsStop => "subagents-stop",
+            SlashCommandName::SubagentsGuide => "subagents-guide",
         }
     }
 
@@ -263,6 +268,14 @@ pub const SLASH_COMMANDS: &[SlashCommandDescriptor] = &[
         name: SlashCommandName::SubagentsStop,
         usage: "Usage: /subagents-stop [run-id]",
         description: "Stop a current-session async subagent run",
+    },
+    // SUBA-066: `/subagents-guide` (`slash-commands.ts:706-707` @v0.47.1). `description` is
+    // upstream's verbatim; `usage` is upstream's own error text (`:713`), reused as the usage line
+    // so the two cannot drift — it is the sentence the user is shown when they get it wrong.
+    SlashCommandDescriptor {
+        name: SlashCommandName::SubagentsGuide,
+        usage: "Usage: /subagents-guide [topic]",
+        description: "Show a packaged subagents guide topic",
     },
 ];
 
@@ -1800,11 +1813,16 @@ mod tests {
     /// `registerSlashCommands` registers DIRECTLY, three lines above that
     /// `registerPromptWorkflowCommands` hop. G77 adds a FOURTH, `pi.registerCommand(
     /// "subagents-stop", …)` (`slash-commands.ts:751-792` @v0.43.0), registered by that same
-    /// `registerSlashCommands` call. This table registers all sixteen, so the count is sixteen.
-    /// The twelve are still pinned exactly, as a prefix, below.
+    /// `registerSlashCommands` call. SUBA-066 adds a FIFTH, `pi.registerCommand("subagents-guide",
+    /// …)` (`slash-commands.ts:706-719` @v0.47.1). This table registers all seventeen, so the count
+    /// is seventeen. The twelve are still pinned exactly, as a prefix, below.
+    ///
+    /// **Pre-SUBA-066 this asserted `+ 4` and the tail had four entries**, because
+    /// `/subagents-guide` did not exist — a user who read pi's docs and typed it got an unknown
+    /// command.
     #[test]
-    fn slash_commands_table_has_the_twelve_plus_the_four_extra_commands() {
-        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 4);
+    fn slash_commands_table_has_the_twelve_plus_the_five_extra_commands() {
+        assert_eq!(SLASH_COMMANDS.len(), R_SA_129_COMMAND_COUNT + 5);
         let tail: Vec<&str> = SLASH_COMMANDS
             .iter()
             .skip(R_SA_129_COMMAND_COUNT)
@@ -1812,7 +1830,39 @@ mod tests {
             .collect();
         assert_eq!(
             tail,
-            ["prompt-workflow", "chain-prompts", "subagents-fleet", "subagents-stop"]
+            [
+                "prompt-workflow",
+                "chain-prompts",
+                "subagents-fleet",
+                "subagents-stop",
+                "subagents-guide",
+            ]
+        );
+    }
+
+    /// SUBA-055/SUBA-066: the slash surface and the tool surface must resolve the SAME topics. A
+    /// command that advertises a topic list its reader rejects is the advertise-vs-dispatch defect
+    /// this crate keeps closing, one layer out.
+    ///
+    /// Pre-fix: `SlashCommandName` had no `SubagentsGuide` variant, so this did not compile.
+    #[test]
+    fn the_guide_command_is_named_and_described_as_upstream_names_it() {
+        let descriptor = SLASH_COMMANDS
+            .iter()
+            .find(|d| d.name == SlashCommandName::SubagentsGuide)
+            .expect("the guide command must be in the registration table");
+        assert_eq!(descriptor.name.as_str(), "subagents-guide");
+        assert_eq!(
+            descriptor.description, "Show a packaged subagents guide topic",
+            "pi `slash-commands.ts:707` @v0.47.1, verbatim"
+        );
+        assert_eq!(
+            descriptor.usage, "Usage: /subagents-guide [topic]",
+            "pi's own error text (`:713`), reused as the usage line so the two cannot drift"
+        );
+        assert_eq!(
+            SlashCommandName::from_str_exact("subagents-guide"),
+            Some(SlashCommandName::SubagentsGuide)
         );
     }
 

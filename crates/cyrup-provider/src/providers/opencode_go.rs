@@ -77,8 +77,9 @@ mod tests {
     #[test]
     fn catalog_parses_verbatim_with_expected_count() {
         let models = opencode_go_models();
-        // Every entry in Pi's `opencode-go.models.ts` (13 models).
-        assert_eq!(models.len(), 13);
+        // Every entry in pi's `opencode-go.models.ts` @`b0c2a90e` (15 models). `grok-4.5` and
+        // `kimi-k3` were added after cyrup's `91585d9a` snapshot (PROV-057/PROV-060).
+        assert_eq!(models.len(), 15);
         assert!(models.iter().all(|m| m.provider.as_str() == "opencode-go"));
         assert!(models.iter().any(|m| m.api.as_str() == ANTHROPIC_MESSAGES));
         assert!(models.iter().any(|m| m.api.as_str() == OPENAI_COMPLETIONS));

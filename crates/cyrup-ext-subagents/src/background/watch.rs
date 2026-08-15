@@ -1078,6 +1078,8 @@ mod tests {
     /// A `SingleResult` that was terminated by an explicit stop.
     fn stopped_child() -> crate::exec::SingleResult {
         crate::exec::SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,
@@ -1446,6 +1448,8 @@ mod tests {
 
     fn child_result(agent: &str, final_output: Option<&str>, exit_code: i32) -> SingleResult {
         SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,

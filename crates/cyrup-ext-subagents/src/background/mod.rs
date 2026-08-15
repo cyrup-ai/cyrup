@@ -927,6 +927,29 @@ pub struct RunStatus {
     pub steps: Vec<StepStatus>,
     /// Per-parallel-group child status, for any `ParallelGroup`/`DynamicGroup` steps.
     pub parallel_groups: Option<Vec<ParallelGroupStatus>>,
+    /// SUBA-057 — pi `AsyncStatus.displayDismissedAt?: number` (`shared/types.ts:1293-1294`
+    /// @v0.47.1, whose own doc comment reads *"Display-only dismissal marker for a reload-orphaned
+    /// workflow."*). Epoch milliseconds, stamped by
+    /// [`SubagentExecutor::control_dismiss`](crate::extension::SubagentExecutor::control_dismiss)
+    /// (pi `dismissRecoveredWorkflow`, `runs/foreground/async-dismiss-action.ts:66`).
+    ///
+    /// **Display-only, and terminates nothing.** Its whole contract is that three readers honour it
+    /// and one erases it:
+    ///
+    /// * [`crate::background::reconcile::reconcile`] returns
+    ///   [`ReconcileAction::DisplayDismissed`](crate::background::reconcile::ReconcileAction::DisplayDismissed)
+    ///   for a dismissed run instead of a normal outcome — pi's `return { status: null, … }`
+    ///   (`stale-run-reconciler.ts:359-361`);
+    /// * [`crate::background::run_status::list_active_runs`] drops it from the active set (pi
+    ///   `async-status.ts:455-458`), which is what makes it vanish from `/subagents-fleet` and
+    ///   `{action:"status"}`;
+    /// * the single-run status view renders the `State: display-dismissed` report instead (pi
+    ///   `run-status.ts:332-345`);
+    /// * and a genuine terminal repair from a [`ResultFile`] **clears** it (pi `delete
+    ///   terminalStatus.displayDismissedAt`, `stale-run-reconciler.ts:169`), so a dismissed run
+    ///   whose result lands later comes back with its real outcome rather than staying hidden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_dismissed_at: Option<i64>,
     /// Run-wide live activity roll-ups + the workflow-graph snapshot (pi's top-level
     /// `statusPayload` telemetry, `subagent-runner.ts:2085-2120`) — flattened so its members
     /// serialize at the same top level of `status.json` pi writes them at.
@@ -958,6 +981,8 @@ impl RunStatus {
             pending_appends: None,
             steps: Vec::new(),
             parallel_groups: None,
+            // SUBA-057: a freshly minted run has never been display-dismissed.
+            display_dismissed_at: None,
             telemetry: RunTelemetry::default(),
         }
     }
@@ -2739,6 +2764,8 @@ mod tests {
         let history_path = home.path().join("run-history.jsonl");
 
         let ok = SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,

@@ -575,10 +575,13 @@ mod tests {
 
     #[test]
     fn ai_gateway_catalog_parses_with_expected_api_mix() {
-        // Pi `cloudflare-ai-gateway.models.ts`: 38 models = 18 anthropic-messages + 4
-        // openai-completions + 16 openai-responses, all carrying the dual account/gateway placeholders.
+        // pi `cloudflare-ai-gateway.models.ts` @`b0c2a90e`: 42 models = 18 anthropic-messages + 5
+        // openai-completions + 19 openai-responses, all carrying the dual account/gateway
+        // placeholders. cyrup's `91585d9a` snapshot held 38: the GPT-5.6 trio (openai-responses)
+        // and `workers-ai/@cf/zai-org/glm-5.2` (openai-completions) landed in the week between the
+        // two revisions and were never picked up (PROV-057/PROV-060).
         let models = cloudflare_ai_gateway_models();
-        assert_eq!(models.len(), 38);
+        assert_eq!(models.len(), 42);
         assert!(
             models
                 .iter()
@@ -586,8 +589,8 @@ mod tests {
         );
         let count = |api: &str| models.iter().filter(|m| m.api.as_str() == api).count();
         assert_eq!(count(crate::known_api::ANTHROPIC_MESSAGES), 18);
-        assert_eq!(count(OPENAI_COMPLETIONS), 4);
-        assert_eq!(count(crate::known_api::OPENAI_RESPONSES), 16);
+        assert_eq!(count(OPENAI_COMPLETIONS), 5);
+        assert_eq!(count(crate::known_api::OPENAI_RESPONSES), 19);
         assert!(models.iter().all(|m| {
             let b = m.base_url.as_str();
             b.contains("{CLOUDFLARE_ACCOUNT_ID}") && b.contains("{CLOUDFLARE_GATEWAY_ID}")
@@ -778,6 +781,6 @@ mod tests {
         let p = cloudflare_ai_gateway_provider();
         assert_eq!(p.id(), &ProviderId::from("cloudflare-ai-gateway"));
         assert_eq!(p.name(), "Cloudflare AI Gateway");
-        assert_eq!(p.models().len(), 38);
+        assert_eq!(p.models().len(), 42);
     }
 }

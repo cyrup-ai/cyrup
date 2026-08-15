@@ -189,39 +189,15 @@ impl FleetActionResult {
     }
 }
 
-/// pi `SteerDeliveryMode` (`runs/background/control-channel.ts`), cycled by `Tab` in the steer
-/// prompt (`fleet.ts:628`). See delta 1 for its current cyrup transport status.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum SteerDeliveryMode {
-    /// pi `"steer"` — the default (`fleet.ts:488,543`).
-    #[default]
-    Steer,
-    /// pi `"follow_up"`.
-    FollowUp,
-    /// pi `"auto"`.
-    Auto,
-}
-
-impl SteerDeliveryMode {
-    /// The wire/display string (pi's own union members, shown at `fleet.ts:559`).
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Steer => "steer",
-            Self::FollowUp => "follow_up",
-            Self::Auto => "auto",
-        }
-    }
-    /// pi's `modes[(modes.indexOf(this.steerMode) + 1) % modes.length]` (`fleet.ts:628-629`).
-    #[must_use]
-    pub const fn next(self) -> Self {
-        match self {
-            Self::Steer => Self::FollowUp,
-            Self::FollowUp => Self::Auto,
-            Self::Auto => Self::Steer,
-        }
-    }
-}
+/// pi `SteerDeliveryMode` (`runs/background/control-channel.ts:63` @v0.43.0), cycled by `Tab` in
+/// the steer prompt (`fleet.ts:628`).
+///
+/// SUBA-049 collapsed this into the ONE definition. It used to be a second, independently-declared
+/// enum in this file, kept because `control_steer` had no mode argument to hand it to — which meant
+/// the crate carried two copies of a three-member wire union whose only job is to agree with each
+/// other. It now re-exports [`crate::background::control::SteerDeliveryMode`], the type the request
+/// record itself is serialized from, so the `Tab` cycle and the on-disk value cannot drift.
+pub use crate::background::control::SteerDeliveryMode;
 
 /// The address one fleet action targets — pi's `{ runId, asyncDir, index? }` argument bundle
 /// (`fleet.ts:49-51`).

@@ -436,8 +436,14 @@ pub(crate) fn build_body_with_env(
 
     // OpenRouter / Vercel AI Gateway routing preferences (read from raw `model.compat`).
     if let Some(c) = &model.compat {
-        if let Some(routing) = &c.open_router_routing {
-            obj.insert("provider".to_string(), routing.clone());
+        // PROV-066: the typed `OpenRouterRouting` serializes back to the same JSON object the
+        // `Value` form carried, so the wire payload is unchanged; `to_value` on a plain struct of
+        // primitives cannot fail, and if it somehow did, omitting the key is the safe direction
+        // (OpenRouter routes by its own defaults) rather than sending a partial object.
+        if let Some(routing) = &c.open_router_routing
+            && let Ok(value) = serde_json::to_value(routing)
+        {
+            obj.insert("provider".to_string(), value);
         }
         if let Some(vg) = &c.vercel_gateway_routing
             && (vg.only.is_some() || vg.order.is_some())

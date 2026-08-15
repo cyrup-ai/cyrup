@@ -40,6 +40,17 @@ pub enum SessionServiceError {
     #[error("no configured auth for model: {0}")]
     NoConfiguredAuth(String),
 
+    /// The pre-send auth preflight refused, carrying **pi's own message text verbatim** — either
+    /// `formatNoApiKeyFoundMessage(provider)` (`auth-guidance.ts:22-25`, thrown at
+    /// `core/agent-session.ts:1194`) or the OAuth-expiry variant (`:1188-1192`). PROV-037.
+    ///
+    /// Distinct from [`SessionServiceError::NoConfiguredAuth`] on purpose: that variant's text is
+    /// cyrup's own `no configured auth for model: p/m` and is what `set_model_resolved` and the
+    /// provider-install path still report. This one is the SUBMIT-time refusal a user reads, so it
+    /// is upstream's string and nothing else — the `Display` is `{0}` with no prefix.
+    #[error("{0}")]
+    AuthPreflightRefused(String),
+
     /// A prompt / manual compaction was attempted on a session that has NO model — pi
     /// `if (!this.model) { throw new Error(formatNoModelSelectedMessage()); }`
     /// (agent-session.ts:1178-1180 for `prompt`, :1790-1792 for `compact`).

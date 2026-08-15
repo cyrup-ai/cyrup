@@ -197,6 +197,13 @@ pub async fn reconcile_before_control_op(paths: &RunPaths) -> Result<RunStatus, 
             // error for what is fundamentally a repair operation, not a normal mutation.
             if status.state.can_transition_to(result.state) {
                 let _ = status.advance_state(result.state);
+                // SUBA-057 — pi `delete terminalStatus.displayDismissedAt`
+                // (`stale-run-reconciler.ts:169`). This is the in-place twin of the
+                // `terminal_status_from_result` branch just below (which builds a fresh record and
+                // therefore never carries the marker), so it has to erase the marker explicitly:
+                // an authoritative `ResultFile` proves the dismissed run was not orphaned after
+                // all, and a dismissal must not outlive that proof.
+                status.display_dismissed_at = None;
             } else {
                 status = terminal_status_from_result(&result, status.pid);
             }
@@ -259,11 +266,22 @@ fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStat
         pending_appends: None,
         steps: Vec::new(),
         parallel_groups: None,
+        // SUBA-057 — pi `delete terminalStatus.displayDismissedAt`
+        // (`stale-run-reconciler.ts:169`): a status rebuilt from an authoritative `ResultFile` is a
+        // real terminal outcome, so the display-only dismissal marker must NOT survive it. This
+        // constructor builds the record from scratch, so the marker is simply never set.
+        display_dismissed_at: None,
         telemetry: crate::background::RunTelemetry::default(),
     }
 }
 
-async fn read_status_file(path: &Path) -> Result<Option<RunStatus>, SubagentError> {
+/// Reads `status.json` RAW — no reconciliation, no repair, no write.
+///
+/// SUBA-057 made this `pub(crate)`: [`crate::extension::SubagentExecutor::control_dismiss`] must
+/// judge upstream's five refusals against the record exactly as it sits on disk (pi's `readStatus`,
+/// `shared/utils.ts`, is likewise a plain read), and routing that through
+/// [`reconcile_before_control_op`] would let the liveness probe rewrite the record first.
+pub(crate) async fn read_status_file(path: &Path) -> Result<Option<RunStatus>, SubagentError> {
     match tokio::fs::read(path).await {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
@@ -830,6 +848,17 @@ pub struct SteerRequest {
     pub ts: i64,
     /// The guidance itself, already trimmed and known non-empty.
     pub message: String,
+    /// SUBA-049 — how this request should reach the child (pi `SteerRequest.mode`,
+    /// `control-channel.ts:71` @v0.43.0).
+    ///
+    /// **`None` means `steer`, and the absence is on the wire on purpose.** Upstream writes the key
+    /// only when the mode is present AND not the default (`requestAsyncSteer`'s
+    /// `...(payload.mode && payload.mode !== "steer" ? { mode: payload.mode } : {})`,
+    /// `control-channel.ts:329`), so a default-mode request is byte-identical to one minted before
+    /// this field existed. `skip_serializing_if` reproduces that exactly, which is what keeps a
+    /// request written by this build readable by a runner that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<SteerDeliveryMode>,
     /// The specific child (flat step index) this is aimed at. `None` means "every currently
     /// running child", which is what the runner fans it out to.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -915,6 +944,32 @@ pub async fn request_async_steer(
     target_index: Option<usize>,
     source: Option<&str>,
 ) -> Result<PathBuf, SubagentError> {
+    request_async_steer_with_mode(run_dir, message, None, target_index, source)
+        .await
+        .map(|(path, _)| path)
+}
+
+/// SUBA-049 — [`request_async_steer`] plus the delivery `mode`, returning the MINTED REQUEST ID
+/// alongside the path.
+///
+/// The id is returned rather than re-derived because it is the correlation key for the whole return
+/// path: the caller needs it to wait for the child's [`SteerAck`], and re-reading it back off the
+/// file name would mean parsing a base64url segment out of a path — a second, silently-divergent
+/// copy of [`steer_request_file_name`]'s format.
+///
+/// `mode == Some(SteerDeliveryMode::Steer)` is normalised to `None` on the wire, matching upstream's
+/// own conditional spread — see [`SteerRequest::mode`].
+///
+/// # Errors
+///
+/// As [`request_async_steer`].
+pub async fn request_async_steer_with_mode(
+    run_dir: &Path,
+    message: &str,
+    mode: Option<SteerDeliveryMode>,
+    target_index: Option<usize>,
+    source: Option<&str>,
+) -> Result<(PathBuf, String), SubagentError> {
     let message = message.trim();
     if message.is_empty() {
         return Err(SubagentError::Management("steer message must not be empty.".to_string()));
@@ -926,10 +981,13 @@ pub async fn request_async_steer(
         id: next_steer_request_id(),
         ts: now_epoch_millis(),
         message: message.to_string(),
+        mode: mode.filter(|m| *m != SteerDeliveryMode::Steer),
         target_index,
         source: source.map(str::to_string),
     };
-    write_steer_request_to_dir(&steer_requests_dir(run_dir), &request).await
+    let id = request.id.clone();
+    let path = write_steer_request_to_dir(&steer_requests_dir(run_dir), &request).await?;
+    Ok((path, id))
 }
 
 /// Runner side: pi `enqueueStepSteer` (`runs/background/control-channel.ts:345-349`) — hand one accepted request to
@@ -999,6 +1057,397 @@ pub async fn consume_steer_requests_from_dir(dir: &Path) -> Vec<SteerRequest> {
 /// pi `consumeSteerRequests` (`runs/background/control-channel.ts:462-464`): drain the RUN-level queue.
 pub async fn consume_steer_requests(run_dir: &Path) -> Vec<SteerRequest> {
     consume_steer_requests_from_dir(&steer_requests_dir(run_dir)).await
+}
+
+// =================================================================================================
+// SUBA-049 — the RETURN half of the steer channel: delivery mode, capability, acknowledgment
+//
+// Before this, `action: "steer"` was fire-and-forget in the strongest sense: the parent wrote a
+// request file and answered success, and NOTHING anywhere wrote back. A steer aimed at a child that
+// had never started a turn, a child whose host cannot inject messages at all, and a steer that was
+// delivered and acted on were three indistinguishable outcomes at the tool boundary.
+//
+// pi `runs/background/control-channel.ts:63-104,154-253,396-415` @v0.43.0.
+// =================================================================================================
+
+/// pi `SteerDeliveryMode` (`control-channel.ts:63` @v0.43.0) — how a steer should reach the child.
+///
+/// The distinction is real and observable: `Steer` injects at the next safe point INSIDE the
+/// running turn, `FollowUp` parks the message until the turn boundary, and `Auto` picks between the
+/// two by whether a turn is currently in flight. Without it the caller could only ever get the
+/// interrupting form, which is the wrong one for "here is extra context for when you finish".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SteerDeliveryMode {
+    /// pi `"steer"` — the default. Interrupt at the next safe point.
+    #[default]
+    #[serde(rename = "steer")]
+    Steer,
+    /// pi `"follow_up"` — wait for the next turn boundary.
+    #[serde(rename = "follow_up")]
+    FollowUp,
+    /// pi `"auto"` — follow up mid-turn, deliver immediately between turns.
+    #[serde(rename = "auto")]
+    Auto,
+}
+
+impl SteerDeliveryMode {
+    /// Parse the wire value. `None` for anything else, so the CALLER decides whether an
+    /// unrecognised mode is a refusal (the tool boundary) or a silently-defaulted field (a request
+    /// read off disk, where upstream's `validSteerRequest` (`control-channel.ts:196`) already
+    /// rejected the whole record).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim() {
+            "steer" => Some(Self::Steer),
+            "follow_up" => Some(Self::FollowUp),
+            "auto" => Some(Self::Auto),
+            _ => None,
+        }
+    }
+
+    /// The wire value, for a refusal message or a round-trip.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Steer => "steer",
+            Self::FollowUp => "follow_up",
+            Self::Auto => "auto",
+        }
+    }
+
+    /// pi's `modes[(modes.indexOf(this.steerMode) + 1) % modes.length]` (`tui/fleet.ts:628-629`) —
+    /// the `Tab` cycle in the FleetView steer prompt. Lives on the wire type rather than beside the
+    /// widget so the cycle can only ever produce a value the control channel can carry.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Steer => Self::FollowUp,
+            Self::FollowUp => Self::Auto,
+            Self::Auto => Self::Steer,
+        }
+    }
+}
+
+/// pi `MAX_STEER_QUEUE_SIZE` (`control-channel.ts:99` @v0.43.0) — the cap on a child's pending
+/// follow-up queue. A request that arrives with the queue full is acknowledged `failed` rather than
+/// dropped, which is the entire reason the ack path exists.
+pub const MAX_STEER_QUEUE_SIZE: usize = 20;
+
+/// pi `SteerDeliveryStatus` (`control-channel.ts:64` @v0.43.0). Distinct from
+/// [`SteerAckState`]: the STATE says what happened to the request, the STATUS says which
+/// delivery path carried it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SteerDeliveryStatus {
+    /// Injected into the live turn.
+    #[serde(rename = "delivered")]
+    Delivered,
+    /// Parked for the next turn boundary.
+    #[serde(rename = "queued")]
+    Queued,
+}
+
+/// The three outcomes a child reports for one steer request (pi's `state` argument to the
+/// `acknowledge` closure, `subagent-prompt-runtime.ts:348` @v0.43.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SteerAckState {
+    /// The child injected it into a live turn.
+    #[serde(rename = "delivered")]
+    Delivered,
+    /// The child accepted it and will deliver it at the next turn boundary.
+    #[serde(rename = "queued")]
+    Queued,
+    /// The child could not take it at all — no steering capability, or the follow-up queue is full.
+    #[serde(rename = "failed")]
+    Failed,
+}
+
+impl SteerAckState {
+    /// The word the tool's answer uses for this outcome (pi's `stateText`,
+    /// `runs/foreground/async-steering-action.ts`'s final `return`).
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Delivered => "delivered",
+            Self::Queued => "queued",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+/// pi `SteerAck` (`control-channel.ts:86-95` @v0.43.0) — the child's answer for one request.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerAck {
+    /// Always `"steer-ack"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Always `1`.
+    pub protocol_version: u32,
+    /// The [`SteerRequest::id`] being answered.
+    pub request_id: String,
+    /// The flat child index that answered.
+    pub index: usize,
+    /// What happened.
+    pub state: SteerAckState,
+    /// A human sentence, already trimmed. For a refusal this is the REASON, and it is what the
+    /// tool surfaces — e.g. upstream's `Follow-up queue is full (20 messages).`
+    pub message: String,
+    /// Wall-clock time of the acknowledgment (epoch milliseconds).
+    pub ts: i64,
+    /// Which delivery path carried it, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery_status: Option<SteerDeliveryStatus>,
+}
+
+/// pi `SteerCapability` (`control-channel.ts:77-84` @v0.43.0) — the child announcing, once, whether
+/// it can be steered at all and under which pid.
+///
+/// This is what turns "the steer was never acknowledged" into two distinguishable facts: a child
+/// that published `supported: false` cannot take guidance and never will, while a child with no
+/// capability file at all has not reached its runtime yet.
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SteerCapability {
+    /// Always `"steer-capability"`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Always `1`.
+    pub protocol_version: u32,
+    /// The flat child index this capability describes.
+    pub index: usize,
+    /// The child's own pid, so a stale capability file from a dead process is detectable.
+    pub pid: u32,
+    /// When the child became ready (epoch milliseconds).
+    pub ready_at: i64,
+    /// Whether the child's host can inject messages at all.
+    pub supported: bool,
+}
+
+/// `<run_dir>/control/steer-capabilities/` (pi `steerCapabilitiesDir`, `control-channel.ts:154-156`).
+#[must_use]
+pub fn steer_capabilities_dir(run_dir: &Path) -> PathBuf {
+    control_inbox_dir(run_dir).join("steer-capabilities")
+}
+
+/// `<run_dir>/control/steer-capabilities/<index>.json` (pi `steerCapabilityPath`, `:158-161`).
+#[must_use]
+pub fn steer_capability_path(run_dir: &Path, index: usize) -> PathBuf {
+    steer_capabilities_dir(run_dir).join(format!("{index}.json"))
+}
+
+/// `<run_dir>/control/steer-acks/<index>/` (pi `steerAcksDir`, `control-channel.ts:163-166`).
+#[must_use]
+pub fn steer_acks_dir(run_dir: &Path, index: usize) -> PathBuf {
+    control_inbox_dir(run_dir).join("steer-acks").join(index.to_string())
+}
+
+/// pi `steerAckFileName` (`control-channel.ts:168-170`): `base64url(requestId).json`.
+fn steer_ack_file_name(request_id: &str) -> String {
+    use base64::Engine as _;
+    format!(
+        "{}.json",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(request_id.as_bytes())
+    )
+}
+
+/// pi `steerAckWritePath` (`control-channel.ts:229-238`): the ack for one request is written under a
+/// name that encodes `(ts, state-order, state)` so a plain lexicographic listing replays the
+/// acknowledgments for a request in the order they happened, and a `queued` ack that is later
+/// followed by a `delivered` one does not overwrite it.
+///
+/// The state ORDER (`queued` = 0, `delivered` = 1, `failed` = 2) is upstream's, and it is not
+/// alphabetical by accident: it is the lifecycle order, so the LAST name for a request is its final
+/// outcome even when two acks share a millisecond.
+async fn steer_ack_write_path(dir: &Path, ack: &SteerAck) -> Result<PathBuf, SubagentError> {
+    let stem = steer_ack_file_name(&ack.request_id);
+    let stem = stem.strip_suffix(".json").unwrap_or(stem.as_str()).to_string();
+    let order = match ack.state {
+        SteerAckState::Queued => '0',
+        SteerAckState::Delivered => '1',
+        SteerAckState::Failed => '2',
+    };
+    let ts = format!("{:013}", ack.ts.max(0));
+    let state = ack.state.as_str();
+    for suffix in 0..1_000u32 {
+        let tail = if suffix == 0 { String::new() } else { format!("-{suffix}") };
+        let candidate = dir.join(format!("{stem}-{ts}-{order}-{state}{tail}.json"));
+        if !tokio::fs::try_exists(&candidate).await.unwrap_or(false) {
+            return Ok(candidate);
+        }
+    }
+    Err(SubagentError::Management("steer acknowledgment queue is full.".to_string()))
+}
+
+/// pi `writeSteerAckAt` (`control-channel.ts:240-249` @v0.43.0) — the CHILD side of the return path.
+///
+/// Every validation upstream performs is performed here, in upstream's order, except the ones Rust's
+/// types already discharge: `index` cannot be negative or non-integer (`usize`), and `ts` cannot be
+/// non-finite. What survives is the request-id shape (no whitespace, ≤ 256 bytes) and the message
+/// shape (non-blank after trimming, ≤ 1000 chars) — both of which are reachable, because both come
+/// from data rather than from types.
+///
+/// # Errors
+///
+/// [`SubagentError::Management`] for an invalid request id or message, [`SubagentError::Spawn`] for
+/// an I/O failure.
+pub async fn write_steer_ack_at(
+    dir: &Path,
+    ack: &SteerAck,
+) -> Result<PathBuf, SubagentError> {
+    if ack.request_id.is_empty()
+        || ack.request_id.len() > 256
+        || ack.request_id.chars().any(char::is_whitespace)
+    {
+        return Err(SubagentError::Management(
+            "steer acknowledgment requestId is invalid.".to_string(),
+        ));
+    }
+    if ack.ts <= 0 {
+        return Err(SubagentError::Management(
+            "steer acknowledgment ts must be a finite timestamp.".to_string(),
+        ));
+    }
+    let trimmed = ack.message.trim();
+    if trimmed.is_empty() || ack.message.chars().count() > 1000 {
+        return Err(SubagentError::Management(
+            "steer acknowledgment message is invalid.".to_string(),
+        ));
+    }
+    let record = SteerAck {
+        kind: "steer-ack".to_string(),
+        protocol_version: 1,
+        message: trimmed.to_string(),
+        ..ack.clone()
+    };
+    let path = steer_ack_write_path(dir, &record).await?;
+    write_control_request(&path, &record).await?;
+    Ok(path)
+}
+
+/// pi `writeSteerAck` (`control-channel.ts:251-253`) — the same, addressed by run dir + index.
+///
+/// # Errors
+///
+/// As [`write_steer_ack_at`].
+pub async fn write_steer_ack(run_dir: &Path, ack: &SteerAck) -> Result<PathBuf, SubagentError> {
+    write_steer_ack_at(&steer_acks_dir(run_dir, ack.index), ack).await
+}
+
+/// pi `writeSteerCapabilityAt` (`control-channel.ts:216-223`).
+///
+/// # Errors
+///
+/// [`SubagentError::Management`] for a zero pid or a non-positive `ready_at`,
+/// [`SubagentError::Spawn`] for an I/O failure.
+pub async fn write_steer_capability_at(
+    path: &Path,
+    capability: &SteerCapability,
+) -> Result<(), SubagentError> {
+    if capability.pid == 0 {
+        return Err(SubagentError::Management(
+            "steer capability pid must be a positive integer.".to_string(),
+        ));
+    }
+    if capability.ready_at <= 0 {
+        return Err(SubagentError::Management(
+            "steer capability readyAt must be a finite timestamp.".to_string(),
+        ));
+    }
+    let record = SteerCapability {
+        kind: "steer-capability".to_string(),
+        protocol_version: 1,
+        ..capability.clone()
+    };
+    write_control_request(path, &record).await
+}
+
+/// Non-consuming read of one child's published capability. `None` when the child has not reached
+/// its runtime yet, or when the file is unreadable/malformed — all three are the same actionable
+/// fact for the caller ("no capability has been published for this child").
+pub async fn read_steer_capability(run_dir: &Path, index: usize) -> Option<SteerCapability> {
+    let bytes = tokio::fs::read(steer_capability_path(run_dir, index)).await.ok()?;
+    let parsed: SteerCapability = serde_json::from_slice(&bytes).ok()?;
+    (parsed.kind == "steer-capability" && parsed.protocol_version == 1).then_some(parsed)
+}
+
+/// pi `consumeSteerAcks` (`control-channel.ts:396-415` @v0.43.0): drain EVERY child's ack directory
+/// under this run, deleting each record as it is read.
+///
+/// Deleting on read is the consumption primitive, exactly as it is for requests: an ack left on disk
+/// would be re-reported on every poll forever. A record that fails to parse is deleted too — an
+/// undeletable one is skipped, because failing to remove it means another consumer owns it.
+///
+/// The returned list is ordered by `(index, file name)`, and the file name encodes `(ts, state)` —
+/// see [`steer_ack_write_path`] — so a request's own acknowledgments arrive in lifecycle order.
+pub async fn consume_steer_acks(run_dir: &Path) -> Vec<SteerAck> {
+    take_steer_acks(run_dir, None).await
+}
+
+/// SUBA-049 — [`consume_steer_acks`] narrowed to ONE request id.
+///
+/// This exists because of a difference in who drains the channel. Upstream's RUNNER consumes every
+/// ack as it arrives (`watchControlInbox`'s `onSteerAck`, `control-channel.ts:660`) and folds it
+/// into `status.steering`, so the parent's wait reads a projection rather than the files. cyrup's
+/// runner has no such fold, so the PARENT reads the files directly — and an unfiltered drain would
+/// then make two concurrent `steer` calls destroy each other's acknowledgments, each consuming the
+/// other's answer and reporting `pending`.
+///
+/// Filtering on the request id removes that race entirely: a waiter only ever removes records it is
+/// the addressee of, and every other request's answer stays on disk for its own waiter.
+///
+/// [CYRUP-DELTA: a narrowing of pi's `consumeSteerAcks`, not a new channel. `request_id: None` IS
+/// pi's function.]
+pub async fn take_steer_acks(run_dir: &Path, request_id: Option<&str>) -> Vec<SteerAck> {
+    let root = control_inbox_dir(run_dir).join("steer-acks");
+    let Ok(mut index_entries) = tokio::fs::read_dir(&root).await else {
+        return Vec::new();
+    };
+    let mut index_dirs: Vec<(usize, PathBuf)> = Vec::new();
+    while let Ok(Some(entry)) = index_entries.next_entry().await {
+        // pi filters the index directories with `/^\d+$/`; a `usize` parse is the same predicate.
+        if let Ok(index) = entry.file_name().to_string_lossy().parse::<usize>() {
+            index_dirs.push((index, entry.path()));
+        }
+    }
+    index_dirs.sort_by_key(|(index, _)| *index);
+
+    let mut out: Vec<SteerAck> = Vec::new();
+    for (_, dir) in index_dirs {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        let mut names: Vec<std::ffi::OsString> = Vec::new();
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let name = entry.file_name();
+            if name.to_string_lossy().ends_with(".json") {
+                names.push(name);
+            }
+        }
+        names.sort();
+        for name in names {
+            let path = dir.join(&name);
+            let parsed = tokio::fs::read(&path)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<SteerAck>(&bytes).ok())
+                .filter(|a| a.kind == "steer-ack" && a.protocol_version == 1);
+            // A record addressed to somebody else is left EXACTLY as it was found — not read past,
+            // not touched. An unparseable record is removed regardless of the filter, because it
+            // belongs to nobody and would otherwise be re-read on every poll forever.
+            if let (Some(wanted), Some(ack)) = (request_id, parsed.as_ref())
+                && ack.request_id != wanted
+            {
+                continue;
+            }
+            if tokio::fs::remove_file(&path).await.is_err() {
+                continue;
+            }
+            if let Some(ack) = parsed {
+                out.push(ack);
+            }
+        }
+    }
+    out
 }
 
 /// Non-consuming read of a pending [`TimeoutRequest`] — [`check_control_inbox_now`]'s sibling,
@@ -2149,7 +2598,12 @@ fn output_from_terminal_status(
 // self-contained rather than introducing a shared time-utility module for one three-line helper)
 // =================================================================================================
 
-fn now_epoch_millis() -> i64 {
+/// SUBA-049 raised this from private to `pub(crate)`: the child-side steering inbox
+/// (`crate::prompt_runtime::SteeringInbox`) stamps every [`SteerAck`] and [`SteerCapability`] with
+/// it, and those records are compared against [`SteerRequest::ts`] — two independently-written
+/// clocks would make a "the ack predates the request" diagnostic meaningless.
+#[must_use]
+pub(crate) fn now_epoch_millis() -> i64 {
     match SystemTime::now().duration_since(UNIX_EPOCH) {
         Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
         Err(_) => 0,
@@ -2344,6 +2798,7 @@ mod tests {
                     id,
                     ts,
                     message: message.to_string(),
+                    mode: None,
                     target_index: None,
                     source: None,
                 },
@@ -2551,6 +3006,8 @@ mod tests {
         }
         fn child(exit_code: i32, stopped: bool) -> crate::exec::SingleResult {
             crate::exec::SingleResult {
+                // SUBA-021: no usage budget on this path (see the field doc).
+                usage_budget: None,
                 turn_budget: None,
                 turn_budget_exceeded: false,
                 wrap_up_requested: false,
@@ -3306,6 +3763,8 @@ mod tests {
 
     fn imported_child(agent: &str, output: Option<&str>, exit_code: i32, error: Option<&str>) -> SingleResult {
         SingleResult {
+            // SUBA-021: no usage budget on this path (see the field doc).
+            usage_budget: None,
             turn_budget: None,
             turn_budget_exceeded: false,
             wrap_up_requested: false,

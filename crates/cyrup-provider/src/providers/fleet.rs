@@ -152,11 +152,15 @@ mod tests {
         ("deepseek", 2),
         ("groq", 7),
         ("huggingface", 49),
-        ("moonshotai", 9),
-        ("moonshotai-cn", 9),
+        ("moonshotai", 10),
+        ("moonshotai-cn", 10),
         ("nvidia", 20),
-        ("openrouter", 270),
-        ("xai", 8),
+        ("openrouter", 271),
+        // PROV-058: pi's generator drops five xai ids via `XAI_BUILTIN_EXCLUDED_MODEL_IDS`
+        // (`ai/scripts/generate-models.ts:379-385` @v0.83.0, consumed at `:2078`) — `grok-3`,
+        // `grok-3-fast`, `grok-4.20-0309-non-reasoning`, `grok-4.20-0309-reasoning` and
+        // `grok-code-fast-1`. cyrup shipped all five until the catalogs were regenerated.
+        ("xai", 3),
         ("xiaomi", 6),
         // The three token-plan catalogs dropped to 3 in pi `cc2db980`, which stopped cloning the
         // API-billing Xiaomi catalog into every region (see `catalog_data.rs`, PROV-004).
@@ -173,9 +177,18 @@ mod tests {
             let spec = fleet_spec(id).unwrap_or_else(|| panic!("no spec for {id}"));
             let models = spec.models();
             assert_eq!(models.len(), *count, "catalog count mismatch for {id}");
-            // Every model is openai-completions and tagged with the provider id.
+            // Every model is openai-completions and tagged with the provider id — EXCEPT
+            // `xai/grok-4.5`, which pi routes over the Responses API (PROV-054). The fleet is
+            // named for the protocol its members mostly speak, not one they all speak:
+            // `WireProvider` dispatches per `model.api` (`wire.rs:215`), so a single Responses row
+            // inside an otherwise-completions catalog is exactly what upstream has and what cyrup
+            // must reproduce. The carve-out is spelled as an id, not a count, so a SECOND row
+            // drifting off the completions protocol still fails here.
             assert!(
-                models.iter().all(|m| m.api.as_str() == OPENAI_COMPLETIONS),
+                models
+                    .iter()
+                    .all(|m| m.api.as_str() == OPENAI_COMPLETIONS
+                        || (*id == "xai" && m.id.as_str() == "grok-4.5")),
                 "{id} api"
             );
             assert!(
@@ -254,6 +267,16 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
     }
 
+    /// `[CYRUP-DELTA]` — pi `GROQ_MODELS["qwen/qwen3-32b"].thinkingLevelMap`
+    /// (`groq.models.ts` @`b0c2a90e`; the override that puts it there is
+    /// `ai/scripts/generate-models.ts:837` @v0.83.0). cyrup ships the v0.84.1 behaviour instead,
+    /// and PROV-064 asked for this tag specifically so the divergence is findable by the mechanism
+    /// the project uses to find accepted divergences. It is also load-bearing now: the catalogs are
+    /// generated from `b0c2a90e` (PROV-060), which HAS the map, so the generator carries this as an
+    /// explicit entry in its `DELTAS` table (`xtask/src/main.rs`) and refuses to run if upstream
+    /// ever stops setting the key — a silently stale exception being exactly as dangerous as a
+    /// silently reverted one.
+    ///
     /// VERSION LAG (v0.83.0 → v0.84.1): Groq models get NO `thinkingLevelMap` from the generator
     /// itself (v0.84.1 `ai/scripts/generate-models.ts:1470-1492` builds the row without one) —
     /// the only source is a single override, which upstream RETARGETED from `qwen/qwen3-32b`
