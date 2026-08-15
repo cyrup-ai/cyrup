@@ -4,7 +4,7 @@ cyrup exists because four TypeScript projects did the hard part first. Every arc
 worth defending in this codebase was made by someone else, in another language, and proved out in
 use before a line of Rust was written.
 
-The source carries **18,827 citations** naming the exact upstream file and line a given Rust item
+The source carries **19,260 citations** naming the exact upstream file and line a given Rust item
 mirrors. That index is not decoration — it is how equivalence gets audited, and it is a standing
 record of authorship. When cyrup is right about something subtle, it is because one of the projects
 below was right about it first.
@@ -26,8 +26,10 @@ What made it worth following closely, rather than merely referencing:
   that look simple — the guard that runs *before* both queue drains, for instance, is load-bearing
   in a way that only becomes obvious when you get it wrong.
 - **A vendor-neutral provider layer that is honest about vendors.** Per-provider compat flags, wire
-  APIs kept distinct from providers, and catalogs as data. cyrup ports 23 providers over 10 wire
-  APIs and the seams held.
+  APIs kept distinct from providers, and catalogs as data. cyrup registers 35 of pi's 38 built-in
+  providers over the same 10 chat wire APIs, and the seams held. The three that are not registered —
+  `qwen-token-plan`, `qwen-token-plan-cn` and `radius` — have a guard test asserting their absence,
+  so a half-finished provider cannot quietly answer requests it cannot serve.
 - **Sessions as an append-only JSONL tree.** Simple enough to inspect with `tail`, structured enough
   to fork and resume.
 - **Restraint about scope.** pi ships no permission system of its own, which is what makes the

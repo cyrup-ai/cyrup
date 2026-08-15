@@ -39,11 +39,18 @@ A dotted key name in the tables below means a nested object. `compaction.enabled
 |---|---|---|---|
 | `defaultProvider` | string | *unset* | Provider used when none is selected. |
 | `defaultModel` | string | *unset* | Model used when none is selected. |
-| `defaultThinkingLevel` | `off`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max` | `"off"` | Starting thinking level. |
+| `defaultThinkingLevel` | `off`\|`minimal`\|`low`\|`medium`\|`high`\|`xhigh`\|`max` | `"medium"` | Starting thinking level. See below. |
 | `enabledModels` | string[] | *unset* | Restricts the `Ctrl+P` cycling set. See below. |
 
 `defaultProvider` and `defaultModel` are only used together, and only when that provider has
 authentication configured. See [Models and thinking](../guides/models.md).
+
+**`defaultThinkingLevel` defaults to `medium`, not `off`.** With the key absent the settings layer
+reports "unset" and each consumer falls back to the same constant, `medium` — so a fresh install
+starts sessions with reasoning on. Earlier builds collapsed "unset" into `off` and disabled
+reasoning for anyone who had never written the key; if you added `"defaultThinkingLevel": "medium"`
+to work around that, the line is now redundant but harmless. Write `"off"` if you actually want
+reasoning off by default.
 
 ## Appearance and the terminal interface
 
@@ -98,7 +105,7 @@ others. They apply to providers that take a token budget rather than an effort s
 | `transport` | `sse`\|`websocket`\|`websocket-cached`\|`auto` | `"auto"` | Preferred transport for providers that offer more than one. |
 | `httpIdleTimeoutMs` | number \| numeric string \| `"disabled"` | `300000` | Longest idle gap while awaiting HTTP headers or body. See below. |
 | `websocketConnectTimeoutMs` | number \| numeric string | *unset* | WebSocket connect timeout. See below. |
-| `httpProxy` | string | *unset* | Proxy URL; blank or whitespace falls through to the proxy environment variables. |
+| `httpProxy` | string | *unset* | Proxy URL. **Global scope only** — see below. Blank or whitespace falls through to the proxy environment variables. |
 | `retry.enabled` | bool | `true` | Retry failed requests. |
 | `retry.maxRetries` | integer | `3` | Retry attempts cyrup makes. |
 | `retry.baseDelayMs` | integer | `2000` | Base backoff delay. |
@@ -108,6 +115,17 @@ others. They apply to providers that take a token budget rather than an effort s
 
 With `httpProxy` unset, cyrup reads `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy` in
 that order.
+
+**`httpProxy` is honoured only in the global file.** Like `defaultProjectTrust`, it is stripped from
+the project layer before the merge, so a checked-in `.cyrup/settings.json` cannot redirect a
+session's egress — even in a trusted project. A project-layer `httpProxy` contributes nothing at
+all.
+
+The setting is installed at process start, before any subcommand is dispatched and before a session
+exists, so the pre-session network paths honour it too: `cyrup update --models`, `cyrup auth check`
+and `cyrup auth print-bearer-token`'s OAuth refresh. Earlier builds configured the proxy only when
+a session was built, so those three went direct to the network and reported success. An ambient
+`HTTP_PROXY`/`HTTPS_PROXY` still wins over the setting at the point a request is made.
 
 ## Telemetry and privacy
 
@@ -160,8 +178,10 @@ config` writes those markers to enable and disable individual resources without 
 |---|---|---|---|
 | `warnings.anthropicExtraUsage` | bool | *unset* | Anthropic paid-extra-usage warning toggle. |
 
-No default is applied when this key is absent; what an unset value means to its consumer is not
-established.
+The settings layer keeps the key's three states apart — `true`, `false` and absent. The one place
+that reads it, the `Warnings` submenu under `/settings`, shows an absent key as on. **Nothing emits
+the warning yet.** Toggling the row writes `warnings.anthropicExtraUsage` and nothing else changes,
+because the warning it would suppress is not built in this release.
 
 ## packages
 
@@ -230,8 +250,8 @@ cyrup falls back to `$VISUAL`, then `$EDITOR`, then `nano` — `notepad` on Wind
 
 ## defaultProjectTrust
 
-This key is **global scope only**. It is stripped from project settings before the merge, so a
-repository cannot declare itself trusted.
+This key is **global scope only**. It and `httpProxy` are the two keys stripped from project
+settings before the merge, so a repository cannot declare itself trusted or redirect your egress.
 
 - `ask` — prompt on first use of a folder that has project resources.
 - `always` — trust any folder with no saved decision.
@@ -304,7 +324,9 @@ cyrup config          # global scope
 cyrup config -l       # project scope, requires a trusted project
 ```
 
-`-l` (or `--local`) is the only route to a project-scope write.
+`-l` (or `--local`) opens the picker already in project scope. `Tab` switches scope from inside the
+picker, but only in a trusted project — in an untrusted one the binding is not armed and the hint is
+not shown, which is the same rule that makes `cyrup config -l` refuse there.
 
 ## Other files in the agent directory
 
@@ -321,7 +343,7 @@ cyrup config -l       # project scope, requires a trusted project
 | `prompts/` | Prompt templates. |
 | `extensions/` | Globally loaded extensions. |
 | `sessions/` | Session storage, unless `sessionDir` moves it. |
-| `packages/` | Installed packages and their registry. |
+| `packages/` | Installed packages and their registry: `packages.json` plus one directory per package id, directly under `packages/`. |
 
 `CYRUP_AGENT_DIR` relocates all of these together. See
 [Environment variables](environment.md).

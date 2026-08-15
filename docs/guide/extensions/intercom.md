@@ -65,12 +65,18 @@ access control: anyone who can read the socket can talk to your sessions.
 | `confirmSend` | bool | `false` | Confirm before sending |
 | `replyHint` | bool | `true` | Include a reply hint with delivered messages |
 | `status` | string | *unset* | Custom suffix on the status display |
-| `brokerCommand` | string | `"npx"` | Informational only on cyrup |
-| `brokerArgs` | string[] | `["--no-install","tsx"]` | Informational only |
+| `brokerCommand` | string | `"npx"` | Command that launches the broker; the default is a sentinel, see below |
+| `brokerArgs` | string[] | `["--no-install","tsx"]` | Arguments for it; the default is a sentinel |
 
-`brokerCommand` and `brokerArgs` do nothing here. cyrup starts the broker by re-executing its own
-binary, so those two keys are carried for compatibility and ignored. Changing them will not change
-what runs.
+`brokerCommand` and `brokerArgs` still carry pi's Node-flavoured defaults, and while **both** are
+left at exactly those values cyrup ignores them and starts the broker by re-executing its own binary
+with the `__intercom-broker` subcommand — there is no `npx` or `tsx` involved. Change either one away
+from that default and cyrup takes you at your word: it runs `brokerCommand` with `brokerArgs`
+followed by `__intercom-broker`. So they are a live setting, not a compatibility stub; the pair only
+looks inert because its default is the "unconfigured" sentinel.
+
+`CYRUP_INTERCOM_BROKER_BINARY` wins over both. When it is set, that binary is run with
+`__intercom-broker` and nothing else — `brokerArgs` is dropped.
 
 `stableId` is worth setting if you keep the same session role open across restarts. Without it a
 session's address changes every time you start cyrup, so anything holding a reference to it has to

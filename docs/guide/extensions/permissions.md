@@ -49,6 +49,15 @@ because someone else may have.
 The two "agent" layers apply only when a call runs under a named agent persona — see
 [Subagents](subagents.md).
 
+**Those two layers read a different directory from the one subagents reads.** The permission system
+looks for `<name>.md` under `~/.cyrup/agent/agents/` and `<project>/.cyrup/agent/agents/` — the
+singular `agent` directory. Subagents discovers its personas under `~/.cyrup/agents`, `~/.agents`,
+`<project>/.agents` and `<project>/.cyrup/agents` — no `agent` segment. The two sets do not overlap,
+so a `permission:` block in the persona file subagents actually runs is **not** picked up as a policy
+layer; to have it enforced you need a file of the same name under the permission system's `agents/`
+directory as well. The arming rule above reads the same permission-system directory, so a populated
+subagents home does not arm the extension either.
+
 ## Writing a policy
 
 Start from the shipped example. With the extension armed, `/permission-system example` prints it,

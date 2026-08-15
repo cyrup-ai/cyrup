@@ -54,9 +54,22 @@ Re-run the install command. cargo rebuilds from the current tip and replaces the
 cargo install --git https://github.com/cyrup-ai/cyrup cyrup
 ```
 
-`cyrup update` does not update cyrup itself. It prints `Self-update is not available in this build;
-update cyrup via your package manager.` and stops. `cyrup update --extensions` is a different
-operation — it updates installed [packages](../extensions/overview.md), not the binary.
+`cyrup update` does not update cyrup itself. The self-update path writes three lines to stderr and
+exits 1:
+
+```text
+error: cyrup cannot self-update this installation.
+Update it with: cargo install --git https://github.com/cyrup-ai/cyrup cyrup
+
+Location of cyrup executable: /Users/you/.cargo/bin/cyrup
+```
+
+That covers bare `cyrup update`, `--self`, `--all`, `--force`, and the three positional aliases
+`cyrup update cyrup` / `self` / `pi`.
+
+Two `update` targets do work, and neither touches the binary: `cyrup update --extensions` updates
+installed [packages](../extensions/overview.md), and `cyrup update --models` refreshes the remote
+model catalogs for the providers you have authenticated.
 
 ## Building from a clone
 

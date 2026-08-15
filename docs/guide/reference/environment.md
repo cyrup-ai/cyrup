@@ -20,7 +20,7 @@ literal string `1`. Each table below says which rule applies.
 
 | Variable | `PI_*` alias | Values | Default | Meaning |
 |---|---|---|---|---|
-| `CYRUP_AGENT_DIR` | `PI_CODING_AGENT_DIR` | path | `~/.cyrup/agent` | The agent directory, holding `settings.json`, `auth.json`, `trust.json` and friends |
+| `CYRUP_AGENT_DIR` | `CYRUP_CODING_AGENT_DIR`, then `PI_CODING_AGENT_DIR` | path | `~/.cyrup/agent` | The agent directory, holding `settings.json`, `auth.json`, `trust.json` and friends |
 | `CYRUP_SESSION_DIR` | `PI_CODING_AGENT_SESSION_DIR` | path | `<agent dir>/sessions` | Session storage root; beats the `sessionDir` setting, loses to `--session-dir` |
 | `CYRUP_PACKAGE_DIR` | `PI_PACKAGE_DIR` | path | `<agent dir>/packages` | Installed-package root |
 | `CYRUP_OFFLINE` | `PI_OFFLINE` | `1`, `true`, `yes` | off | Disable startup network operations; same as `--offline` |
@@ -52,25 +52,40 @@ CYRUP_TELEMETRY= cyrup "summarise the diff"
 
 ## The three directory variables that are not synonyms
 
-`CYRUP_AGENT_DIR`, `CYRUP_CODING_AGENT_DIR` and `CYRUP_HOME` look interchangeable and are not. They
-are read by different parts of cyrup and mean different directories.
+`CYRUP_AGENT_DIR`, `CYRUP_CODING_AGENT_DIR` and `CYRUP_HOME` look interchangeable and are not. Their
+defaults differ, and only two of the three overlap at all.
 
 | Variable | Read by | Default | Relocates |
 |---|---|---|---|
 | `CYRUP_AGENT_DIR` | the config layer | `~/.cyrup/agent` | `settings.json`, `auth.json`, `trust.json`, `models.json`, themes, prompts, sessions, packages |
-| `CYRUP_CODING_AGENT_DIR` | intercom and subagents only | `~/.cyrup` — no `agent` segment | the intercom broker socket and config, and the subagent directories those two crates resolve |
+| `CYRUP_CODING_AGENT_DIR` | intercom and subagents, and the config layer as a fallback | `~/.cyrup` — no `agent` segment | the intercom broker socket and config, the subagent directories those two crates resolve, and the agent directory when `CYRUP_AGENT_DIR` is unset |
 | `CYRUP_HOME` | subagents, intercom and the permission system only | `$HOME` | the home directory those three use to derive `~/.cyrup/...` paths |
 
 Three consequences worth internalising:
 
 **`CYRUP_HOME` does not move your configuration.** Setting it leaves `settings.json`, `auth.json`
-and `trust.json` exactly where they were. Only `CYRUP_AGENT_DIR` moves those. If `CYRUP_HOME` is set
-to something unusable, the three extensions that read it fall back to the temporary directory.
+and `trust.json` exactly where they were. Only the two agent-dir variables move those. If
+`CYRUP_HOME` is set to something unusable, the three extensions that read it fall back to the
+temporary directory.
 
-`CYRUP_CODING_AGENT_DIR` is not the same directory as `CYRUP_AGENT_DIR` even when both are set to the
-same value — it carries no `agent` segment, so the defaults differ by one path component. An
-absolute value is used verbatim; a relative value is joined onto the current directory; a blank value
-is ignored.
+**The config layer reads both agent-dir spellings, in that order: `CYRUP_AGENT_DIR`, then
+`CYRUP_CODING_AGENT_DIR`, then `PI_CODING_AGENT_DIR`.** That is deliberate — intercom and subagents
+only ever read the long spelling, so setting the long one alone puts core and those two extensions
+under the same root rather than splitting them. Setting `CYRUP_AGENT_DIR` wins for core and leaves
+the extensions on their own default. The two variables still mean different directories when unset:
+the long one defaults to `~/.cyrup` with no `agent` segment.
+
+Intercom resolves the long spelling itself: an absolute value is used verbatim, a relative value is
+joined onto the current directory, a blank value is ignored.
+
+**With neither variable set, intercom does not land on its own `~/.cyrup` default.** A running
+session hands intercom the agent directory the config layer already resolved, so the broker socket,
+pid file and config sit under `~/.cyrup/agent/intercom/` — matching
+[Intercom](../extensions/intercom.md), not the `~/.cyrup` in the Default column above. That column
+describes the fallback inside intercom's and subagents' own resolvers, which a session never reaches;
+it applies to a broker process started with no `CYRUP_CODING_AGENT_DIR` in its environment, and the
+spawner always sets one. Setting either variable moves the intercom directory with the agent
+directory, so the two stay together.
 
 `PI_CODING_AGENT_DIR` — note the `PI_` prefix — is the alias for `CYRUP_AGENT_DIR`, not for
 `CYRUP_CODING_AGENT_DIR`. The names cross over.
@@ -94,6 +109,21 @@ or `.cyrup/subagents/config.json` exists. Intercom switches on when
 exists, when the policy `agents/` directory is non-empty, or when its `config.json` differs from the
 template cyrup generates — which means unsetting the variable is not enough to turn it off once a
 policy file is on disk. Set `"enabled": false` in the extension's `config.json` for that.
+
+## The share viewer
+
+| Variable | Alias | Default | Meaning |
+|---|---|---|---|
+| `CYRUP_SHARE_VIEWER_URL` | *none* | `https://pi.dev/session/` | Base URL of the viewer link `/share` prints |
+
+`/share` publishes the session as a secret GitHub gist and then reports two lines: `Share URL:
+<base>#<gist id>` and `Gist: <the gist URL>`. This variable replaces the base. It has no `PI_*`
+alias, and an empty value counts as unset — `CYRUP_SHARE_VIEWER_URL=` falls back to the default
+rather than producing a bare `#<id>`.
+
+The default is the one pi ships, carried over unchanged; cyrup only concatenates the base and the
+gist id and prints the result, and makes no request to it. Whether that viewer renders your gist is
+between you and whoever runs it — point the variable at your own if you host one.
 
 ## Provider credentials
 
@@ -173,9 +203,13 @@ route all three of these must hold: `GOOGLE_APPLICATION_CREDENTIALS` points at a
 `QWEN_TOKEN_PLAN_API_KEY`, `QWEN_TOKEN_PLAN_CN_API_KEY`, `RADIUS_API_KEY` and `BASETEN_API_KEY`
 exist in the credential resolver, mapped to the ids `qwen-token-plan`, `qwen-token-plan-cn`,
 `qwen-token-plan-individual`, `radius` and `baseten`. **None of those is a valid `--provider`
-value** — there is no built-in provider behind them. They are reachable only by declaring a provider
-with that id yourself in `models.json`. If you find one of these names in the wild, exporting it on
-its own does nothing.
+value** — no built-in provider is registered for any of them. They are reachable only by declaring a
+provider with that id yourself in `models.json`. If you find one of these names in the wild,
+exporting it on its own does nothing.
+
+Two of them, `QWEN_TOKEN_PLAN_API_KEY` and `QWEN_TOKEN_PLAN_CN_API_KEY`, are listed in `cyrup
+--help`'s environment block. That block is pinned to the resolver's table, which does read them —
+it is not a claim that a provider exists to use them.
 
 ## Subagents
 
@@ -230,7 +264,9 @@ Read only when [intercom](../extensions/intercom.md) is installed.
 | `CYRUP_INTERCOM_STABLE_ID` | string | Restart-stable registration id for this session |
 | `CYRUP_INTERCOM_BROKER_BINARY` | path | Override the broker binary |
 
-`CYRUP_CODING_AGENT_DIR` (above) decides where intercom keeps its socket, pid file and config.
+Intercom keeps its socket, pid file and config in an `intercom/` directory under the resolved agent
+directory — `~/.cyrup/agent/intercom/` by default, moved by either `CYRUP_AGENT_DIR` or
+`CYRUP_CODING_AGENT_DIR` (above).
 
 ## Diagnostics
 
@@ -267,6 +303,27 @@ agent processes. They are process plumbing, not configuration; do not set them y
 | Variable | Meaning |
 |---|---|
 | `VISUAL`, then `EDITOR` | The external editor, when the `externalEditor` setting is unset. Falls back to `nano`, or `notepad` on Windows |
-| `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy` | Proxy URL, checked in that order, when the `httpProxy` setting is unset or blank |
-| `NO_PROXY`, `ALL_PROXY` | Honoured by the model catalog fetch |
-| `HOME` | The home directory, used to derive `~/.cyrup/agent` when `CYRUP_AGENT_DIR` is unset |
+| `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`, `http_proxy` | Proxy URL. See below |
+| `NO_PROXY`, `ALL_PROXY` | Proxy exemptions and the scheme-agnostic fallback. See below |
+| `HOME` | The home directory, used to derive `~/.cyrup/agent` when no agent-dir variable is set |
+
+### The proxy variables
+
+Two different pieces of code read these, and they disagree about case order — worth knowing if you
+have set only one spelling.
+
+The `httpProxy` setting's own accessor falls back to `HTTPS_PROXY`, `HTTP_PROXY`, `https_proxy`,
+`http_proxy` in exactly that order, and takes the first one set to a non-empty value.
+
+The resolver that decides the proxy for an actual request works per-scheme and per-name, lowercase
+before uppercase: for an `https://` target it reads `https_proxy` then `HTTPS_PROXY`, and only then
+falls back to the `httpProxy` setting — so an ambient variable always beats the setting. If neither
+is set it tries `all_proxy`/`ALL_PROXY`. `NO_PROXY`/`no_proxy` is consulted first and exempts the
+target outright: `*` disables proxying entirely, an entry beginning with `.` or `*` matches by
+suffix, anything else is an exact hostname, and a `:port` suffix limits the entry to that port. A
+proxy URL that is not HTTP or HTTPS — a SOCKS or PAC URL — is a transport error rather than being
+silently ignored.
+
+That resolver covers provider streaming requests, the OAuth flows, and the model catalog fetch. The
+`httpProxy` setting is installed before any subcommand runs, so those paths honour it even when no
+session exists. See [`httpProxy`](settings.md#network-transport-and-retry).

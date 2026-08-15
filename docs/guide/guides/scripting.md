@@ -99,7 +99,8 @@ binary are always the floor, so an offline run has a full model list.
 
 ## What talks to the network, and when
 
-Two things, both at startup, both optional.
+Two things happen on their own, both at startup, both optional. One more happens only when you ask
+for it.
 
 **The package update check** runs in interactive mode only. For each installed package that came
 from a git source it runs `git rev-parse HEAD` locally and `git ls-remote` against the origin, four
@@ -111,11 +112,39 @@ anything else.
 revalidation, and caches the result in `~/.cyrup/agent/models-store.json`. It runs only in
 interactive and rpc modes, only for providers you have actually authenticated, and it is
 fire-and-forget — every error is swallowed and you fall back to the embedded catalogs. `-p` and
-`--mode json` issue zero catalog requests, and an unconfigured cyrup fetches nothing at all. It
-honours `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY`.
+`--mode json` issue zero catalog requests, and an unconfigured cyrup fetches nothing at all.
+
+**`cyrup update --models`** is the third. It refreshes the catalogs for every authenticated provider
+in the foreground with a 15-second budget, printing `Model catalogs refreshed` on success, or
+`Error: Could not refresh model catalogs: <provider>: <reason>` and exit `1` on failure. The budget
+covers the whole pass, not each request, and overrunning it is a failure of its own —
+`Error: Model catalog refresh timed out.` and exit `1`, not a partial success. Because you asked for
+it explicitly, `--offline` does not suppress it.
 
 There is no self-update check and no release feed. cyrup never phones home to ask about its own
 version.
+
+## Proxies
+
+cyrup's outbound requests — inference, the catalog fetch, OAuth refreshes — resolve their proxy
+through one path, which reads `HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY` and `NO_PROXY` in either
+case. The `httpProxy` setting stands in for `HTTP_PROXY`/`HTTPS_PROXY` when neither is exported.
+
+**The setting is installed before any subcommand runs**, from the global `settings.json` alone. That
+matters in a script: `cyrup update --models` fetches catalogs, and `cyrup auth check` /
+`cyrup auth print-bearer-token` refresh an expired OAuth token unless you pass `--no-refresh` — all
+before any session exists, and all through the proxy.
+
+Two consequences worth knowing:
+
+- `httpProxy` is read from `~/.cyrup/agent/settings.json` only. A project `.cyrup/settings.json`
+  supplies nothing, trusted or not, so checking a repository out cannot redirect your egress.
+- An exported `HTTP_PROXY`/`HTTPS_PROXY` wins over the setting, so the environment of the run is
+  still the last word.
+
+SOCKS and PAC proxy URLs are rejected rather than ignored: the request fails with `Unsupported proxy
+protocol. SOCKS and PAC proxy URLs are not supported; use an HTTP or HTTPS proxy URL.`, followed by
+`Got <scheme>`.
 
 ## Exporting a session
 
@@ -126,6 +155,11 @@ cyrup --export ~/.cyrup/agent/sessions/0f3a....jsonl report.html
 Reads a session file, renders it to standalone HTML, and exits. The output path is optional — the
 default is the input path with an `.html` extension. On success it prints `Exported to: <path>`; on
 failure it prints the error and exits `1`. See [Sessions](sessions.md) for finding the file.
+
+It runs before the session-flag validation, so it still works when the rest of the command line does
+not: `cyrup --export s.jsonl --api-key K` and `cyrup --export s.jsonl --fork X --continue` both
+export and exit `0`. An `@file` argument is left as a file reference and is never taken for the
+output path.
 
 ## Environment variables
 

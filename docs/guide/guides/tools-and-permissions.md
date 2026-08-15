@@ -12,7 +12,7 @@ Seven tools ship in the binary.
 |---|---|
 | `read` | Read a file. Text and images (jpg, png, gif, webp, bmp); images arrive as attachments. |
 | `write` | Write a file, creating parent directories and overwriting what is there. |
-| `edit` | Replace exact text in one file. Each edit must match a unique, non-overlapping region. |
+| `edit` | Replace exact text in one file. One call carries a list of edits, each matching a unique, non-overlapping region of the original. |
 | `bash` | Run a shell command in the working directory and return stdout and stderr. |
 | `grep` | Search file contents for a regex or literal. Respects `.gitignore`. |
 | `find` | Find files by glob pattern. Respects `.gitignore`. |
@@ -25,6 +25,16 @@ full text is written to a temp file and the path is reported.
 **Only four are active by default:** `read`, `bash`, `edit`, and `write`. `grep`, `find` and `ls` are
 registered but off, so the model reaches for `bash` to search unless you turn them on with `--tools`.
 
+Two details that matter if you read session files or debug a provider rejection:
+
+- Every result carries a `details.truncation` record into the session JSONL — total and emitted line
+  and byte counts, the caps in force, and `truncatedBy`, which is `"lines"`, `"bytes"`, or `null`
+  when nothing was cut. The field is always present, so a reader never has to infer truncation from
+  a missing key.
+- No built-in tool schema sets `additionalProperties`. That is deliberate: schemas go to the model
+  verbatim and some providers enforce them (Gemini does), which would reject the legacy flat
+  `{path, oldText, newText}` shape `edit` accepts and folds into a one-entry `edits` list.
+
 ## Narrowing the tool set
 
 Four flags shape what is available, and all four apply to built-in, extension and custom tools
@@ -35,10 +45,21 @@ alike.
 | `--tools <names>` | `-t` | Allowlist. Only the named tools are active. |
 | `--exclude-tools <names>` | `-xt` | Denylist. The named tools are removed. |
 | `--no-tools` | `-nt` | Start with nothing active. |
-| `--no-builtin-tools` | `-nbt` | Drop the default built-ins, keep extension and custom tools. |
+| `--no-builtin-tools` | `-nbt` | Drop the four default built-ins. |
 
 Names are comma-separated and trimmed, so `--tools "read, grep"` works. An explicit `--tools`
-allowlist wins over `--no-tools` and `--no-builtin-tools`.
+allowlist wins over `--no-tools` and `--no-builtin-tools`, and `--exclude-tools` is applied on top
+of whatever survives, so a name in both lists is removed.
+
+**Repeating a flag replaces it — it does not add to it.** `--tools read --tools bash` gives you
+`bash` alone; write `--tools read,bash` for both. The same last-one-wins rule applies to
+`--exclude-tools` and to `--models`.
+
+`--no-builtin-tools` drops exactly the four tools that are on by default — `read`, `bash`, `edit`,
+`write` — and leaves extension and custom tools alone. Note what that does *not* cover: `grep`,
+`find` and `ls` are not in the default set, so the flag does not remove them and they come out
+active. A run with `-nbt` is a read-only search session, not an empty one. For empty, use
+`--no-tools`.
 
 The read-only review session:
 
@@ -72,6 +93,22 @@ Untrusted, cyrup still loads your global configuration, your global extensions, 
 passed on the command line with `-e`. What it will not load is project settings, project context
 files, project extensions, and project packages. An untrusted `.cyrup/settings.json` is not read at
 all, and writes to it are refused.
+
+You are told. In the terminal interface an untrusted project prints a warning-coloured banner after
+the initial replay:
+
+```text
+This project is not trusted. Project .cyrup resources and packages are ignored. Use /trust to save a
+trust decision, then restart cyrup.
+```
+
+It prints again after any `/resume`, `/fork` or `/import` that swaps sessions. A swap can bring a
+different working directory and trust decision with it, so the question is re-asked every time —
+including when the session you land on is in the same untrusted folder.
+
+Saving a decision only records it: `/trust` answers
+`project trust → trusted (/reload to apply to this session)`, so run `/reload` (or restart) before
+the project's resources are actually loaded.
 
 ### The prompt
 
@@ -120,11 +157,17 @@ The permission system is the second gate, and it is optional. It turns every too
 allow / ask / deny decision driven by a policy file, and it can shape the tool set and sanitise the
 system prompt on top of that.
 
-**It arms itself if a policy file merely exists.** `CYRUP_PERMISSION_SYSTEM=1` turns it on, but so
-does the presence of `~/.cyrup/agent/cyrup-permissions.jsonc` or
-`.cyrup/agent/cyrup-permissions.jsonc` in the repository — dropping a policy file into a project is
-enough. Removing the environment variable does not disarm it; to switch it off with a policy file
-present, set `"enabled": false` in `~/.cyrup/agent/cyrup-permission-system/config.json`.
+**It arms itself if a policy artefact merely exists.** `CYRUP_PERMISSION_SYSTEM=1` turns it on, and
+so does any of these, in the agent directory or in `.cyrup/agent/` in the repository:
+
+- a `cyrup-permissions.jsonc` policy file — dropping one into a project is enough;
+- a non-empty `agents/` directory, since an agent file's `permission:` front matter is an enforced
+  policy layer;
+- a `cyrup-permission-system/config.json` whose contents differ from the template cyrup writes for
+  itself (an untouched template does not count, so the system cannot latch itself on).
+
+Removing the environment variable does not disarm it; to switch it off with a policy file present,
+set `"enabled": false` in `~/.cyrup/agent/cyrup-permission-system/config.json`.
 
 When a rule says `ask`, you get a dialog naming the tool and what it wants to do, with four choices:
 

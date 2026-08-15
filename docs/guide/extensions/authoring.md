@@ -71,10 +71,15 @@ fn build() -> ExtensionApi {
 cyrup_ext_sdk::export_extension!(build);
 ```
 
-`export_extension!` emits every guest export the world requires — initialisation, all 33 hooks,
-tool execution, command execution, argument completions, call and result renderers, argument
-preparation and markdown transformation — each routed to whatever you registered on the
-`ExtensionApi`. You register what you care about and ignore the rest.
+`export_extension!` emits every guest export the world requires — initialisation, all 34 `on-*`
+hooks, tool execution, command execution, argument completions, call and result renderers, argument
+preparation, markdown transformation, autocomplete suggestions, bus delivery, shortcut execution and
+the six provider exports — each routed to whatever you registered on the `ExtensionApi`. You register
+what you care about and ignore the rest.
+
+(Thirty-three of the hooks mirror pi's `pi.on(...)` event catalog one for one. The thirty-fourth,
+`on-terminal-input`, is the guest half of a callback pi registers as a closure; a closure cannot
+cross a component boundary, so here it is an export.)
 
 The macro compiles to nothing on non-wasm targets, so your crate still builds and tests on the host.
 That is the point of keeping `rlib` in `crate-type`.
@@ -96,7 +101,7 @@ post-processes it.
 {
   "id": "my-ext",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.7",
+  "world": "cyrup:ext@0.8",
   "entry": "crates/my-ext",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
@@ -117,9 +122,14 @@ post-processes it.
 
 ### World compatibility
 
-The host world is `cyrup:ext@0.7`. A manifest's `world` must declare the **same major version** as
-the host and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.7` is the
+The host world is `cyrup:ext@0.8`. A manifest's `world` must declare the **same major version** as
+the host and a **minor version at least** the host's. Against today's host, `cyrup:ext@0.8` is the
 value to write; an older minor is a mismatch, and so is a different major.
+
+The minor moves whenever an export is added, removed or re-signed, and whenever an import is removed
+or re-signed — both of those break an already-built guest at link time. A purely additive import does
+not move it. That is why the rule is one-directional: a *higher* minor than the host is accepted,
+a lower one is refused.
 
 A mismatch gives you a clear version error naming the problem. It does not become a link failure
 inside the WebAssembly runtime, so you find out what is wrong from the message rather than from a

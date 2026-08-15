@@ -6,16 +6,17 @@ A coding agent in Rust, inspired by the [Pi](https://github.com/earendil-works/p
 It takes Pi's design — a minimal core, everything-is-an-extension, an agent that can extend itself —
 and rebuilds it on a Rust backbone with WebAssembly extensions.
 
-> **Status:** not a released product. 19 crates, ~543k lines of Rust. The agent loop, provider
+> **Status:** not a released product. 19 crates, ~551k lines of Rust. The agent loop, provider
 > layer, tool set, session tree, TUI, extension host and all four run modes are real and wired end
-> to end. Both gates are green: 6,740 unit tests in ~18s, 473 integration tests in ~92s. Behavioural
-> equivalence work is tracked openly in [`docs/gap-analysis/`](docs/gap-analysis/README.md).
+> to end. Both gates are green: 6,855 unit tests (7 skipped) in ~18s, 473 integration tests in ~92s.
+> Behavioural equivalence work is tracked openly in
+> [`docs/gap-analysis/`](docs/gap-analysis/README.md).
 
 ## Inspired by, not transliterated from
 
-cyrup follows Pi's behaviour closely and cites it obsessively — there are **18,827 citations** in
+cyrup follows Pi's behaviour closely and cites it obsessively — there are **19,260 citations** in
 the source pointing at the exact upstream `.ts` file and line a given Rust item mirrors. That index
-is how equivalence gets audited: `grep -rn "agent-loop.ts:670" crates` finds the code that answers
+is how equivalence gets audited: `grep -rn "agent-loop.ts:226" crates` finds the code that answers
 for it.
 
 But Rust is not TypeScript, and pretending otherwise produces bugs rather than fidelity. Where the
@@ -57,7 +58,7 @@ session tree in memory and repaints a terminal. That workload rewards the things
 ## Extensions are WebAssembly components
 
 Pi loads TypeScript at runtime through `jiti`. cyrup runs extensions as **WASM components** under
-Wasmtime, against a versioned WIT world (`cyrup:ext@0.7.0`). That buys three things a dynamic-import
+Wasmtime, against a versioned WIT world (`cyrup:ext@0.8.0`). That buys three things a dynamic-import
 model cannot:
 
 **A real sandbox.** An extension declares what it needs — filesystem roots, process execution,
@@ -92,7 +93,7 @@ Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, 
 | Crate | Role |
 |-------|------|
 | `cyrup-core` | shared substrate: ids, `Content`/`Message`, `EventStream<T>`, `CancelToken`, the `Tool` trait |
-| `cyrup-provider` | vendor-neutral LLM layer — 23 built-in providers, 10 wire APIs, auth, streaming, catalogs, images |
+| `cyrup-provider` | vendor-neutral LLM layer — 35 built-in chat providers, 10 wire APIs, auth, streaming, catalogs, images |
 | `cyrup-agent` | the turn loop: tool execution, hooks, steering and follow-up queues, abort |
 | `cyrup-tools` | built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) over an `FsOps`/`ProcOps` seam |
 | `cyrup-session` | JSONL session tree, compaction, system-prompt and context assembly |
@@ -116,7 +117,7 @@ Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, 
 ```sh
 cargo check --workspace --all-targets   # type-check everything, including tests
 cargo clippy --workspace --all-targets  # REQUIRED — the no-panic policy only fires here
-cargo nextest run --workspace           # the everyday gate: ~6,740 tests, ~18s
+cargo nextest run --workspace           # the everyday gate: 6,855 tests (7 skipped), ~18s
 ```
 
 `cargo clippy` is not optional. The no-panic policy is expressed as `[workspace.lints.clippy]`
@@ -129,22 +130,29 @@ hang.
 
 ## Testing
 
-Every crate holds **unit tests only**, inline under `crates/*/src/`. Integration tests — the ones
-that spawn the binary, drive a subagent, load a WASM component or open a broker socket — live in one
-gated harness crate:
+Almost all tests are **unit tests inline under `crates/*/src/`**. The heavy integration tests — the
+ones that spawn the binary, drive a subagent, load a WASM component or open a broker socket — live in
+one gated harness crate:
 
 ```sh
 cargo build -p cyrup-ext-sdk --target wasm32-wasip2
-cargo nextest run -p cyrup-it --features it        # ~473 tests, ~92s
+cargo nextest run -p cyrup-it --features it        # 473 tests, ~92s
 ```
 
 `cyrup-it` is behind `required-features = ["it"]`, so the everyday gate never builds it. Its
 `build.rs` resolves the fixture binaries and the WASM component **once** via
-`cargo build --message-format=json`.
+`cargo build --message-format json-render-diagnostics`.
 
-This layout is deliberate and was earned. The suite previously had 310 files under `crates/*/tests/`
-— and because Cargo makes every such file its own binary and process, a full run took hours to
-execute roughly two minutes of assertions. It is now 7 in-crate binaries plus 8 gated targets.
+Ten integration binaries remain in-crate under `crates/*/tests/`, and each is there because it needs
+a process of its own: it mutates the process environment (`cyrup-tools/tests/bash_env_scrub.rs`,
+`cyrup/tests/first_time_setup.rs`), spawns the shipped `cyrup` binary
+(`cyrup/tests/bootstrap_http_proxy.rs`, `cyrup/tests/export_dispatch_order.rs`), or pins a
+whole-crate wiring proof next to the crate it proves.
+
+This layout is deliberate and was earned. The suite previously had 310 integration binaries under
+`crates/*/tests/` — and because Cargo makes every such file its own binary and process, a full run
+took hours to execute roughly two minutes of assertions. It is now 10 in-crate binaries plus 7 gated
+`cyrup-it` targets.
 
 Two conventions worth knowing:
 
@@ -162,16 +170,31 @@ is [`docs/gap-analysis/`](docs/gap-analysis/README.md), with the execution order
 
 Two things about that ledger are worth stating up front. It is largely a **static** analysis — items
 are evidenced by reading both sources, not by running anything — and its own measured error rate is
-about **12%**: of roughly 430 items worked, ~53 turned out not to match the code at HEAD. Treat
+about **12%**: of roughly 465 rows worked, ~56 turned out not to match the code at HEAD. Treat
 every entry as a lead to verify, not a fact. Items that *have* been observed against a running
 binary are marked in [`REPRO-LOG.md`](docs/gap-analysis/REPRO-LOG.md).
 
 Currently open, in brief:
 
-- Some upstream behaviour is still unported or partial; see the ledger for the live count.
-- Alternate-screen/fullscreen TUI mode is decided-in-scope ([ADR-0005](docs/adr/)) and not yet built;
-  `--tui-mode fullscreen` says so explicitly rather than failing obscurely.
-- Every upstream has moved since the version cyrup tracks. Diff the tracked tag against upstream
+- The ledger's last full reconciliation (2026-08-14, at commit `5990e86`) counted **237 open items —
+  0 critical, 5 high, 88 medium, 144 low**. Two of those five highs are not in fact open, and the
+  area files were never re-derived against the code: compaction is cancellable from the TUI again —
+  the Escape dispatch landed in `380c713`, *before* that reconciliation, so `SESS-040`'s "no dispatch
+  site" note was already false when it was counted — and `httpProxy` is now applied at bootstrap,
+  before any subcommand can egress (`PROV-047`, closed at HEAD in `350bdb5`). So the area files
+  overstate the high count by two.
+- **The three remaining highs are all one thing:** stale provider-catalog data (`PROV-054`/`055`/
+  `056` — `xai/grok-4.5` on the wrong wire API, an `opencode` header pi suppresses, two `kimi-coding`
+  wire divergences). They close together through a catalog regeneration, not as three hand edits.
+- **MCP is not built.** There is no `crates/cyrup-mcp`; `docs/gap-analysis/13*` scopes the port of
+  `pi-mcp-adapter` and is excluded from every count above, including the 237.
+- Three of pi's built-in providers — `qwen-token-plan`, `qwen-token-plan-cn`, `radius` — are not
+  registered (`PROV-014`). A guard test asserts their absence so a half-finished provider cannot
+  silently answer requests it cannot serve.
+- Alternate-screen/fullscreen TUI mode is decided-in-scope
+  ([ADR-0005](docs/adr/ADR-0005-alt-screen-tui-mode.md)) and not yet built;
+  `--tui-mode fullscreen` prints that it is falling back to regular rather than failing obscurely.
+- Every upstream has moved past the baseline cyrup ported. Diff the ported baseline against upstream
   `HEAD` before treating a difference as a defect.
 
 ## Upstreams
@@ -180,12 +203,18 @@ cyrup tracks four TypeScript projects. The core is [`earendil-works/pi`](https:/
 three optional subsystems follow standalone Pi extensions, since Pi core deliberately ships no
 permission system of its own.
 
-| upstream | followed by | tracked version |
-|---|---|---|
-| `earendil-works/pi` | most crates | v0.83.0 |
-| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | ~v0.43.0 |
-| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.7.1 |
-| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 |
+| upstream | followed by | ported baseline | latest tag |
+|---|---|---|---|
+| `earendil-works/pi` | most crates | v0.83.0 | v0.84.2 |
+| `nicobailon/pi-subagents` | `cyrup-ext-subagents` | ~v0.43.0 *(inferred — the crate records no version string)* | v0.49.0 |
+| `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.7.1, with every v0.8.0 behavioural change absorbed | v0.8.0 |
+| `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | v0.10.1 |
+
+The right-hand column moves without warning; re-measure it with `git tag --sort=-v:refname` rather
+than trusting this table. The window between the two columns is measured and filed, not ignored —
+[`ADR-0006`](docs/adr/ADR-0006-upstream-chase-cadence.md) records it per upstream and says where the
+resulting items live. The measured windows there stop at pi v0.84.1 and pi-subagents v0.47.1 — pi
+has cut one tag past that, pi-subagents two (v0.48.0, then v0.49.0).
 
 These are mature, maintained projects and the reference implementations of their own behaviour —
 if you are choosing between them and cyrup, use them. [`ACKNOWLEDGEMENTS.md`](ACKNOWLEDGEMENTS.md)

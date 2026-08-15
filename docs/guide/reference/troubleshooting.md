@@ -1,8 +1,8 @@
 # Troubleshooting
 
 Symptoms you are likely to hit, and what to do about each. If your problem is not here, `/debug`
-and the debug log at the end of this page are the fastest way to find out what cyrup thinks is
-going on.
+and the tracing output described at the end of this page are the fastest way to find out what cyrup
+thinks is going on.
 
 ## "No models available" on startup, or `--list-models` prints nothing
 
@@ -62,6 +62,16 @@ and does accept `on`, which is why `on` appears to work for some variables and n
 The project is untrusted. An untrusted folder's `.cyrup/settings.json` is not read at all, and its
 extensions, skills, prompts, themes and context files are skipped.
 
+The interface says so directly. In an untrusted project it prints a warning banner after the initial
+replay, and again after any `/resume`, `/fork` or `/import` that swaps sessions — the swap can bring
+a different working directory and a different trust decision with it, so the answer is re-evaluated
+each time:
+
+```text
+This project is not trusted. Project .cyrup resources and packages are ignored. Use /trust to save
+a trust decision, then restart cyrup.
+```
+
 Run `/trust` inside the session to see and change the decision for the folder, or start the run
 with `--approve` for a one-off override that is not saved:
 
@@ -98,9 +108,10 @@ and `trust.json` follow `CYRUP_AGENT_DIR`:
 CYRUP_AGENT_DIR=/opt/cyrup-agent cyrup
 ```
 
-`CYRUP_HOME` and `CYRUP_CODING_AGENT_DIR` are read by the native extensions only, and they mean
-different directories again. The three are compared side by side in
-[Environment variables](environment.md).
+`CYRUP_HOME` is read by the native extensions only. `CYRUP_CODING_AGENT_DIR` does move the config —
+the config layer accepts it as a fallback when `CYRUP_AGENT_DIR` is unset — but it means a different
+directory, `~/.cyrup` with no `agent` segment, and it also moves the intercom and subagent trees.
+The three are compared side by side in [Environment variables](environment.md).
 
 ## Subagent files are not discovered
 
@@ -113,19 +124,32 @@ or it sits under a path segment named `skills`. See [Subagents](../extensions/su
 
 ## `cyrup update` does not update cyrup
 
-Self-update is not implemented; `cyrup update` prints as much and updates nothing. Reinstall from
-source to upgrade:
+Self-update is not implemented. Every self-update route — bare `cyrup update`, `--self`, `--all`,
+`--force`, and the `cyrup`/`self`/`pi` positionals — prints three lines to stderr and exits 1:
 
-```sh
-cargo install --git https://github.com/cyrup-ai/cyrup
+```text
+error: cyrup cannot self-update this installation.
+Update it with: cargo install --git https://github.com/cyrup-ai/cyrup cyrup
+
+Location of cyrup executable: /path/to/cyrup
 ```
 
-`cyrup update <source>` and `cyrup update --extensions` do work — they update installed packages.
+Bare `cyrup update` and `cyrup update --force` print one more line first, on stdout:
+`Extensions are skipped. Run cyrup update --extensions to update extensions.` That is not a second
+error — it is the note that neither of those two forms selected a package target.
+
+Run that `cargo install` line to upgrade. The `--help` for `update` says the same, marking the four
+unavailable routes.
+
+`cyrup update <source>`, `cyrup update --extension <source>` and `cyrup update --extensions` do work
+— they update installed packages. So does `cyrup update --models`, which refreshes the remote model
+catalogs and prints `Model catalogs refreshed`.
 
 ## `cyrup install npm:...` fails
 
 npm sources are rejected outright. cyrup has no JavaScript runtime, so there is nothing to run an
-npm package with. The `cyrup remove` help text still shows an `npm:` example; ignore it.
+npm package with. Neither `cyrup install --help` nor `cyrup remove --help` offers an `npm:` example
+any more — both show a git source and a local path.
 
 Install from git or from a local path instead:
 
@@ -210,7 +234,12 @@ CYRUP_TIMING=1 cyrup
 active theme and its generation, the thinking level, whether images are enabled, and the streaming
 state.
 
-The debug log is at `~/.cyrup/agent/debug.log`.
+**There is no debug log file.** cyrup's tracing output goes to stderr, at `warn` by default and at
+`debug` under `--verbose`. `RUST_LOG` overrides both, so redirect stderr if you want it on disk:
+
+```sh
+RUST_LOG=debug cyrup -p "hello" 2> cyrup.log
+```
 
 When the permission system is on and `debug` is enabled — `/permission-system debug on` — every
 decision is appended as JSONL to

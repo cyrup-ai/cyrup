@@ -92,7 +92,7 @@ understand two-level nesting.
 | `maxSubagentDepth` | Per-agent recursion ceiling |
 | `completionGuard` | `false` disables the completion-mutation guard for this agent |
 | `toolBudget` | Tool-call budget enforced inside the child |
-| `turnBudget` | Turn budget applied when the call site omits one |
+| `turnBudget` | Assistant-turn budget applied when the call site omits one — see below |
 | `memory` | Persistent-memory scope folded into the child's prompt |
 | `async` | Run in the background by default when the call site does not say |
 | `timeoutMs` | Default run timeout when the call site does not say |
@@ -100,6 +100,34 @@ understand two-level nesting.
 **Unrecognised keys are preserved, not dropped.** They round-trip through cyrup's own agent editing
 intact. That is how a `permission:` block rides along in an agent file and gets enforced by
 [the permission system](permissions.md) as its own policy layer.
+
+### Turn budgets
+
+`turnBudget` caps how many assistant turns a child may take. It is two numbers, written as **inline
+JSON on one line** — the frontmatter parser hands the value to a JSON reader, so a nested YAML block
+is not accepted here:
+
+```markdown
+turnBudget: {"maxTurns": 12, "graceTurns": 1}
+```
+
+`maxTurns` is a soft limit — reaching it earns the child a one-time note asking it to wrap up, and
+kills nothing. `graceTurns` is how many further assistant turns are tolerated after that before the
+child is aborted and its partial output returned. Omitting `graceTurns` means `1`.
+
+Three layers supply it, in this order: the `subagent` tool call's own `turnBudget` parameter, then
+this frontmatter key, then `subagents.turnBudget` in the extension `config.json`. The first one
+present wins.
+
+Validation is strict. `maxTurns` must be an integer at least 1, `graceTurns` an integer at least 0,
+and any other key inside the object is rejected by name — including `hard`, which is not supported.
+An invalid `turnBudget:` in an agent file **skips that whole agent file** rather than degrading to
+unbudgeted, and logs a warning naming the agent. An invalid one in `config.json` is carried raw and
+surfaces at the call that would have used it, not at load.
+
+The enforcement is parent-side: the supervising process counts the child's assistant turns off its
+event stream. It will not abort mid-tool-call — a run that hits the hard limit while tool work is in
+flight ends as *termination-deferred* with a note saying so, rather than throwing the work away.
 
 ## Where agent files live
 
@@ -216,6 +244,9 @@ individual runs rather than the one-line summary. `/subagents-stop` ends a run y
 | `waitTool` | bool or `{enabled}` | enabled | The `wait` tool gate |
 | `missions` | object | *unset* | Durable mission store; `{"enabled": false}` stops automatic mission creation |
 | `artifactConfig.cleanupDays` | number | `7` | Artifact retention; `0` disables cleanup |
+| `artifactDir` | `"project"`, `"session"`, `"temp"` | `project` | Where artifact files are written; an invalid value fails config load |
+| `authorityPolicy` | object | *unset* | Per-action authority decisions, e.g. for `stop`/`steer`; an invalid block fails config load |
+| `turnBudget` | object | *unset* | `{maxTurns, graceTurns}` applied when neither the call site nor the agent file supplies one |
 
 A missing file means all defaults. A malformed file warns on stderr —
 `cyrup: warning: ... is not valid subagents config JSON ...; using defaults` — and cyrup carries on

@@ -5,7 +5,10 @@ context files, the system prompt, skills, and prompt templates. This page covers
 how to add your own, and how to turn any of them off.
 
 All project-scoped resources are gated on trust. In a folder you have not trusted, cyrup loads only
-your global configuration — see [Tools and permissions](tools-and-permissions.md#project-trust).
+your global configuration and says so with a banner in the transcript
+(`This project is not trusted. Project .cyrup resources and packages are ignored…`) — see
+[Tools and permissions](tools-and-permissions.md#project-trust). That banner is the first thing to
+check when project settings, skills or extensions appear not to load.
 
 ## Context files
 
@@ -136,10 +139,20 @@ each. Toggling one writes a `+pattern` or `-pattern` entry into the correspondin
 `prompts` or `themes` array in your global settings, replacing any earlier entry for the same
 pattern.
 
+With nothing to configure it says so — `No configurable skills, prompts, or themes found.` — and
+exits.
+
 `cyrup config -l` opens the same picker in project write scope, so toggles land in
-`.cyrup/settings.json` instead. `Tab` switches between the two scopes while the picker is open, but
-only in a trusted project — writing project settings in an untrusted folder is refused, and the
-picker reports which changes could not be saved. `--approve` gets you past that for one run.
+`.cyrup/settings.json` instead. It requires a trusted project: in an untrusted folder it refuses
+before opening, with `Project is not trusted. Use --approve to modify local resource config.` and
+exit 1. `--approve` gets you past that for one run.
+
+`Tab` switches between the two scopes while the picker is open, and is offered only in a trusted
+project for the same reason. If a write fails anyway, the picker closes and reports
+`Some changes could not be saved: <error>` on stderr with exit 1 rather than pretending they landed.
+
+`cyrup config --help` prints the flags; an unknown flag or a stray argument is an error rather than
+being ignored.
 
 Packages are the other way skills and prompt templates arrive: a package can ship any of them
 alongside its extensions, and they are discovered without you listing a path. See

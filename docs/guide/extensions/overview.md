@@ -24,7 +24,7 @@ Every extension ships an `extension.json` manifest that declares what it needs:
 {
   "id": "todo",
   "version": "1.0.0",
-  "world": "cyrup:ext@0.7",
+  "world": "cyrup:ext@0.8",
   "capabilities": {
     "fs": ["read:.", "write:.cyrup/todo"],
     "exec": false,
@@ -86,9 +86,17 @@ exists but is malformed behaves the same way and additionally warns you, naming 
 you the extension now has no declared capabilities. If an extension you wrote suddenly cannot touch
 the filesystem, that warning is the first thing to look for.
 
-An extension that fails to load for any reason other than project trust stops startup with an error.
-So does a name collision — two extensions registering the same tool or the same command-line flag is
-a fatal conflict, not a silent override.
+A genuine load fault — a component that will not instantiate, a built-in whose initialisation fails —
+is reported as `Error: Failed to load extension "<path>": <error>` and stops startup with exit 1,
+along with the line `Hint: Start without extensions using "cyrup -ne".` A name collision is fatal
+the same way: two
+extensions registering the same tool or the same command-line flag produces
+`Tool "<name>" conflicts with <owner>` / `Flag "--<name>" conflicts with <owner>`, and the first
+registration is the one that runs — not a silent override.
+
+Three things are reported but *not* fatal: the project-trust skip above, a malformed
+`extension.json` (which falls back to the zero-capability path), and a `-e` argument that names
+nothing loadable. Those are warnings; startup continues.
 
 ## Loading one extension explicitly
 
@@ -108,8 +116,8 @@ cyrup --no-extensions
 ```
 
 `-ne` is accepted as a short form. This is broader than it sounds. It stops cyrup scanning the
-project root and the global root, drops the extensions contributed by installed packages, and
-disables all three native extensions described below.
+project root and the global root, drops everything the `extensions` array of `settings.json` and
+installed packages contribute, and disables all three native extensions described below.
 
 What it does *not* disable is anything you passed with `-e`. Explicit paths always load. That
 combination — everything off except the one component you name — is the usual way to test an
@@ -118,6 +126,11 @@ extension you are working on:
 ```sh
 cyrup --no-extensions -e ./target/wasm32-wasip2/debug/my_ext.wasm
 ```
+
+One further carve-out applies only inside a [subagent](subagents.md) child process: a child run with
+`--no-extensions` keeps the permission system, the subagents runtime and its prompt runtime, because
+its parent re-injects those deliberately. Turning the permission gate off in a parent therefore does
+not turn it off in that parent's children. Intercom is not on that list and does go away.
 
 ## The three native extensions
 

@@ -11,9 +11,10 @@ cyrup [options] [@files...] [messages...]
 cyrup install <source> [-l] [--approve|--no-approve]
 cyrup remove <source>  [-l] [--approve|--no-approve]
 cyrup uninstall <source> [-l] [--approve|--no-approve]
-cyrup update [source|self|pi] [--self|--extensions|--all] [--extension <source>] [--force]
+cyrup update [source|cyrup|self|pi] [--self|--extensions|--models|--all] [--extension <source>]
+             [--approve|--no-approve] [--force]
 cyrup list [--approve|--no-approve]
-cyrup config [-l]
+cyrup config [-l] [--approve|--no-approve]
 
 cyrup auth print-api-key      [--provider <p>] [--model <m>]
 cyrup auth print-bearer-token [--provider <p>] [--model <m>] [--min-expiry <duration>]
@@ -53,11 +54,12 @@ referenced where it sits; it is not copied.
 `-l` requires the project to be trusted. In an untrusted project it prints `Project is not trusted.
 Use --approve to modify local package config.` and exits 1.
 
-**Installing does not touch `settings.json`.** The help text says a package is "added to settings";
-it is not. Installed packages are recorded in a separate `packages.json` registry — under the
-package directory for a global install, and at `.cyrup/packages.json` for `-l`. The `packages` array
-in `settings.json` is a different, hand-authored channel that you maintain yourself; `cyrup install`
-never writes to it, and `cyrup remove` never removes from it.
+**Installing does not touch `settings.json`.** Installed packages are recorded in a separate
+`packages.json` registry — under the package directory for a global install, and at
+`.cyrup/packages.json` for `-l`. The `packages` array in `settings.json` is a different,
+hand-authored channel that you maintain yourself; `cyrup install` never writes to it, and
+`cyrup remove` never removes from it. `cyrup install --help` says exactly this: "Install a package
+and record it in the package registry".
 
 ### cyrup remove
 
@@ -68,13 +70,17 @@ cyrup remove git:github.com/user/repo
 ```
 
 Flags are the same as `install`: `-l`/`--local`, `-a`/`--approve`, `-na`/`--no-approve`. As with
-`install`, the change lands in `packages.json`, not in `settings.json`, despite what the help text
-says. The `npm:` examples printed by `cyrup remove --help` cannot be produced by `cyrup install` in
-this build.
+`install`, the change lands in `packages.json`, not in `settings.json`.
+
+The source you pass does not have to be spelled the way you installed it. `remove` normalises the
+argument the same way `install` did before looking it up — an `https://` URL, an `scp`-style
+`git@host:user/repo`, a `.git` suffix or a relative path all resolve to the id the registry holds —
+and falls back to the literal string for rows written by older builds. A source that matches
+nothing prints `No matching package found for <source>` and exits 1.
 
 ### cyrup update
 
-Updates installed packages.
+Updates installed packages, or refreshes the model catalogs.
 
 ```sh
 cyrup update --extensions
@@ -82,21 +88,47 @@ cyrup update --extensions
 
 | Flag | Argument | Meaning |
 |---|---|---|
-| `--self` | — | Target cyrup itself (the default when no target is given) |
+| `--self` | — | Target cyrup itself (the default when no target is given) — unavailable, see below |
 | `--extensions` | — | Update installed packages only |
+| `--models` | — | Refresh the remote model catalogs only |
 | `--all` | — | Update cyrup and installed packages |
 | `--extension` | `<source>` | Update one package only; may be given once |
-| `--force` | — | Reinstall cyrup even when the current version is the latest |
+| `--force` | — | Reinstall cyrup even when the current version is the latest — unavailable |
 | `-a`, `--approve` | — | Trust project-local files for this command |
 | `-na`, `--no-approve` | — | Ignore project-local files for this command |
 
-A bare source argument updates that one package: `cyrup update git:github.com/user/repo`.
-`cyrup update pi` is an alias for `--self`.
+A bare source argument updates that one package: `cyrup update git:github.com/user/repo`. It is
+normalised the same way `cyrup remove`'s argument is. Three positional spellings mean cyrup itself:
+`cyrup update cyrup`, `cyrup update self` and `cyrup update pi` all select the self-update target.
+`--models`, `--extension`, `--all` and a positional source are mutually exclusive; combining them
+prints the conflict and the usage line, and exits 1.
 
-**`cyrup update` cannot update cyrup itself in this build.** Any self-update target prints
-`Self-update is not available in this build; update cyrup via your package manager.` Reinstall from
-source to upgrade — see [Install](../getting-started/install.md). Packages pinned to a tag or commit
-are skipped by `--extensions` and `--all`.
+`cyrup update --models` refreshes the remote model catalog for every authenticated provider and
+prints `Model catalogs refreshed`, or `Error: <message>` and exit 1. It is dispatched before the
+trust and settings work the other targets do, so it needs neither a trusted project nor any package
+state.
+
+**`cyrup update` cannot update cyrup itself in this build.** Any self-update target — bare
+`cyrup update`, `--self`, `--all`, `--force`, or a `cyrup`/`self`/`pi` positional — prints three
+lines to stderr and exits 1:
+
+```text
+error: cyrup cannot self-update this installation.
+Update it with: cargo install --git https://github.com/cyrup-ai/cyrup cyrup
+
+Location of cyrup executable: /path/to/cyrup
+```
+
+An invocation that names no target at all — bare `cyrup update`, and `cyrup update --force`, since
+`--force` selects nothing on its own — prints one line on stdout ahead of those three:
+`Extensions are skipped. Run cyrup update --extensions to update extensions.` Naming any target,
+`--self` included, suppresses it. `--all` does its package work first and reaches the stub after, so
+it exits 1 even when every package updated cleanly.
+
+`cyrup update --help` says the same thing: it leads with "Self-update is unavailable in this build"
+and marks the four self-update routes `(UNAVAILABLE)`. Reinstall from source to upgrade — see
+[Install](../getting-started/install.md). Packages pinned to a tag or commit are skipped by
+`--extensions` and `--all`.
 
 ### cyrup list
 
@@ -121,7 +153,13 @@ cyrup config
 ```
 
 `-l`/`--local` writes to the project `settings.json` instead of the global one, and requires the
-project to be trusted. `cyrup config` has no `--help` of its own — passing it runs the picker.
+project to be trusted; without it the command prints `Project is not trusted. Use --approve to
+modify local resource config.` and exits 1. `Tab` inside the picker switches the write scope
+between global and project.
+
+`cyrup config -h` / `--help` prints its own usage block and exits 0 — the flag no longer falls
+through and opens the picker. Any other flag prints `Unknown option <flag> for "config".` and a
+stray positional prints `Unexpected argument <arg>.`; both exit 1.
 
 ### cyrup auth
 
@@ -188,6 +226,12 @@ An invalid `--thinking` value does not abort the run: cyrup warns, drops the fla
 with no level set. Model patterns, globs and the `:level` suffix are covered in
 [Models and thinking](../guides/models.md).
 
+`--list-models` lists only models whose provider has credentials configured, so an empty listing
+means nothing is authenticated rather than that the catalog is broken. Its search pattern is
+optional, and cyrup only claims the following token when it starts with neither `-` nor `@` —
+`cyrup --list-models @notes.md` lists the whole catalog and leaves `@notes.md` as a file argument,
+while `cyrup --list-models gpt` filters. With no match it prints `No models matching "<pattern>"`.
+
 ### Session
 
 | Flag | Argument | Meaning |
@@ -211,12 +255,19 @@ cyrup --continue "what did we decide about the retry policy?"
 non-empty, alphanumeric at both ends, and otherwise made only of letters, digits, `-`, `_` and `.`.
 `--name` must be non-empty after trimming.
 
-`--export` takes an optional second positional as the output path; without one it writes alongside
-the input with an `.html` extension.
+`--export` takes an optional output path — the first *message* positional, so an `@file` token in
+the same command line is never mistaken for it. Without a path it writes alongside the input with
+an `.html` extension. On success it prints `Exported to: <path>`; on failure, `Error: <message>` and
+exit 1.
 
 ```sh
 cyrup --export session.jsonl output.html
 ```
+
+`--export` runs and exits immediately after `--version`, before the session-flag validators, the
+RPC `@file` guard and the `--api-key requires a model` check. So it still exports when the rest of
+the command line is contradictory — `cyrup --export s.jsonl --fork X --continue` writes the HTML
+rather than erroring — which is the state a session is usually in when you reach for it.
 
 More in [Sessions](../guides/sessions.md).
 
@@ -234,6 +285,10 @@ More in [Sessions](../guides/sessions.md).
 Precedence when several are given: `rpc`, then `json`, then `print`. A non-TTY stdin or stdout
 selects print mode on its own, which is what makes `cyrup -p` redundant inside a pipe.
 
+A token beginning with `---` immediately after `-p`/`--print` is taken as the prompt, not as a flag:
+`cyrup -p ---weird` sends the literal text `---weird`. It keeps its place among the positionals. A
+genuine unknown long flag (`--weird`) is still captured as an extension flag.
+
 `--tui-mode fullscreen` parses but the alternate-screen renderer is not built in this release; cyrup
 warns and falls back to `regular`.
 
@@ -245,14 +300,28 @@ extension cannot register a flag of the same name and receive it. See
 
 | Flag | Argument | Meaning |
 |---|---|---|
-| `-nt`, `--no-tools` | — | Disable all tools by default, built-in and extension |
-| `-nbt`, `--no-builtin-tools` | — | Disable built-in tools but keep extension and custom tools |
+| `-nt`, `--no-tools` | — | Disable every tool, built-in and extension |
+| `-nbt`, `--no-builtin-tools` | — | Drop the four default built-ins; see below |
 | `-t`, `--tools` | `<tools>` | Comma-separated allowlist of tool names |
 | `-xt`, `--exclude-tools` | `<tools>` | Comma-separated denylist of tool names |
 
-The built-in tool names are `read`, `bash`, `edit`, `write`, `grep`, `find` and `ls`. Values are
-comma-split and trimmed, so `--tools "read, grep"` works. `--no-tools` wins over
-`--no-builtin-tools` when both are given.
+Seven built-in tools are registered — `read`, `bash`, `edit`, `write`, `grep`, `find` and `ls` — but
+**only four of them are active in a default session**: `read`, `bash`, `edit` and `write`. `grep`,
+`find` and `ls` are registered and reachable; they simply are not in the default active set, so name
+them to switch them on: `--tools read,grep,find`.
+
+`--no-builtin-tools` is narrower than its name suggests. It drops exactly those four defaults, and
+the active set becomes everything that is *not* one of them — `grep`, `find` and `ls` included,
+alongside extension and custom tools. Use `--no-tools` for a run with no tools at all; it wins over
+`--no-builtin-tools` when both are given. `--exclude-tools` is applied last, on top of whichever set
+the other three produced.
+
+Values are comma-split and trimmed, so `--tools "read, grep"` works.
+
+**A repeated `--tools`, `-t`, `--exclude-tools` or `--models` replaces the earlier one — it does not
+append.** `--tools read --tools bash` enables `bash` alone. The comma form is the way to name
+several: `--tools read,bash`. The `=` spelling counts as an occurrence too, so
+`--tools read --tools=bash` is also just `bash`.
 
 ```sh
 cyrup --tools read,grep,find,ls -p "review the code in src/"
@@ -353,9 +422,13 @@ to use `/login`.
 
 An unrecognised `--flag` is not an error. It is captured and handed to loaded extensions, so
 `--help` output varies with what you have installed: an extension that registers `--plan` adds that
-line to the help body. An unrecognised single-dash flag is still a usage error.
+line to the help body. An unrecognised single-dash flag is still a usage error, and that includes a
+bare `-`: `cyrup -` prints `Unknown option: -` and exits 1 without contacting a provider. A bare
+`--` is left alone for the extension-flag capture.
 
 Two subcommands, `__intercom-broker` and `__subagent-runner`, exist so cyrup can re-execute itself as
 a child process. They are not part of the user-facing surface and should not be called directly.
 
-`cyrup --help` also lists `CYRUP_SHARE_VIEWER_URL`. Nothing in this build reads it.
+`cyrup --help` also lists `CYRUP_SHARE_VIEWER_URL`. It is read — by `/share`, as the base of the
+viewer link — and the help row now carries its default,
+`https://pi.dev/session/`. See [Environment variables](environment.md).
