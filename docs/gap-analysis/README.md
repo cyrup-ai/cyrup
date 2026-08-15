@@ -197,6 +197,50 @@ the evidence.
 | [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline | **16** | 0 | 0 |
 | | **total** | **145** | **0** | **2** |
 
+## Area 13 — the MCP adapter port
+
+A **fifth upstream**, `pi-mcp-adapter` v2.25.0 (~24k lines of TypeScript, 203 paths), which has never
+been ported. Its count is deliberately **kept out of the total above**: the twelve areas measure drift
+in code that exists, while area 13 specifies code that does not exist yet, and adding 433
+forward-looking port units to 145 backward-looking defects would produce a number nobody can plan
+against.
+
+| file | area | port units | crit | high |
+|---|---|---:|---:|---:|
+| [`13-cyrup-mcp.md`](13-cyrup-mcp.md) | **the port — thesis, scope, seam map, architecture, and the one canonical table of every unit. Start here.** | **433** | 21 | 146 |
+| [`MCP-PORT-METHODOLOGY.md`](MCP-PORT-METHODOLOGY.md) | **how it is executed and verified — fidelity rules, thirteen phases, the ADR docket** | — | — | — |
+| [`13a-mcp-activation.md`](13a-mcp-activation.md) | activation, lifecycle and the host seam | 50 | | |
+| [`13b-mcp-config.md`](13b-mcp-config.md) | configuration, the type model and errors | 50 | | |
+| [`13c-mcp-servers.md`](13c-mcp-servers.md) | server manager, transports and the metadata cache | 50 | | |
+| [`13d-mcp-proxy-modes.md`](13d-mcp-proxy-modes.md) | proxy modes and search ranking | 36 | | |
+| [`13e-mcp-tools.md`](13e-mcp-tools.md) | tool registration, approval, output guard and rendering | 53 | | |
+| [`13f-mcp-credentials.md`](13f-mcp-credentials.md) | credential storage, keychain and consent | 41 | | |
+| [`13g-mcp-oauth.md`](13g-mcp-oauth.md) | the OAuth 2.1 flow and the callback server | 49 | | |
+| [`13h-mcp-tui.md`](13h-mcp-tui.md) | the TUI panels, slash commands and prompts | 54 | | |
+| [`13i-mcp-protocol-and-verification.md`](13i-mcp-protocol-and-verification.md) | sampling, elicitation, tracing and verification | 50 | | |
+
+**The port is an extension and changes nothing in cyrup's core** — `crates/cyrup-mcp` is a native
+built-in crate, the same shape as `cyrup-ext-subagents`, linking `rmcp` 3.1.2 (client-only) directly.
+**Four surfaces are cut by owner decision** — the legacy HTTP+SSE transport, MCP Apps, the raw
+unix-socket transport, and `mcpScript`/the JavaScript worker — which is why there is **no section 09**
+(it would have held MCP Apps) and why the port contains no hand-written protocol code and no
+JavaScript engine question.
+
+**Area 13 carries no line numbers and no commit shas, deliberately, and the rest of this directory is
+the cautionary tale that produced that rule.** Its first edition pinned cyrup line citations; the
+repository advanced a commit *during* the analysis, and a completeness critique then measured **37% of
+those citations sitting on already-drifted files**, with 21 of 25 hand-checked citations wrong for the
+revision a reader would actually use. Area 13 references cyrup by **symbol and file** only. Caveat
+inherited from the whole directory: it is a static analysis, nothing was built or run, and every
+`verify` line is a design rather than an observation.
+
+**Area 13 also produced a finding about cyrup rather than about the port.**
+`ExtensionHost::refresh_tools` returns the *guest* materializer's verdict, and under the default
+`wasm-host` feature that materializer reads a different map than a natively late-registered tool is
+written into — so the tool never reaches the running agent, and `take_tools_dirty`'s `swap` destroys
+the signal rather than deferring it. Dormant only because `register_late_tool` has zero callers
+anywhere in the workspace. Filed as `MCP-037a`.
+
 *Third edition, 2026-08-14 (after sweeps 7-8). Changed from the second edition: area 05 12 → 9
 (`CFG-045`, `CFG-051`, `CFG-052`), area 06 24 → 23 (`EXT-060`), area 08 7 → 6 (`SEAM-017`), area 09
 20 → 17 (`SUBA-008`, `SUBA-030`, `SUBA-035`). Area 04 holds at 5 in a changed composition —
@@ -243,6 +287,7 @@ tree is not in this workspace, so exact alignment with it is unverified.
 | `pi-subagents/` | `9e9fd13` | **≈v0.43.0** (inferred — the crate records no version string) | **v0.47.1** | 151 files, +10 254 / −1 333 |
 | `pi-permission-system/` | `9affcc9` | **v0.7.1** | **v0.8.0** | 28 files, +4 023 / −1 851 |
 | `pi-intercom/` | `30dcbdd` | **v0.9.2** — *not v0.7.0; every prior doc had this wrong* | **v0.10.1** | true window `v0.9.2..v0.10.1` = 24 files, +2 495 / −700 |
+| `pi-mcp-adapter/` | `14c0e6c` = `v2.25.0-4-g14c0e6c` | **not ported** — area 13 is the plan | **v2.25.0** (tagged 2026-08-13) | 203 paths / 164 `.ts` at the tag, ~24 200 lines; drift to HEAD is 17 files, +543 / −69 |
 
 Three standing hazards in this table. **(a)** The intercom baseline is the one that bites in both
 directions: diffing from v0.6.0 or v0.7.0 reports a pile of already-done work as debt, and

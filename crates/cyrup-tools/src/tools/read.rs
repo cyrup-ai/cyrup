@@ -33,8 +33,9 @@ impl ReadTool {
     pub fn new(fs: Arc<dyn FsOps>, cwd: PathBuf, opts: ReadOpts) -> Self {
         // Schema is byte-for-byte Pi's TypeBox emission (read.ts:20-24): verbatim property
         // descriptions, `type:"number"` (not integer), NO `minimum`, and NO `additionalProperties`
-        // (TypeBox only sets it where the source passes `{ additionalProperties: false }` — that is
-        // `edit` alone). This object IS the model-facing `input_schema`.
+        // (TypeBox only sets it where the source passes `{ additionalProperties: false }`, which NO
+        // built-in does — `edit` passes an empty `{}`, see `edit.rs`). This object IS the
+        // model-facing `input_schema`.
         let params = serde_json::json!({
             "type": "object",
             "required": ["path"],

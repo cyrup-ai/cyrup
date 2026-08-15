@@ -17,7 +17,10 @@
 //!
 //! The audit (gap 04, UM-1) found the prior hand-written schemas diverged on: paraphrased
 //! descriptions, `type:"integer"` (Pi: `"number"`), added `minimum`, and `additionalProperties`
-//! present on 6 tools (Pi sets it on `edit` ONLY). Comparing parsed `serde_json::Value`s is the
+//! present on 6 tools. That last one was under-corrected: it was left standing on `edit` (both
+//! levels) on the belief that `edit` alone opts in. It does not — `Type.Object(props, {})`
+//! (edit.ts:41,52) passes an EMPTY options object, so NO built-in emits the keyword. Comparing
+//! parsed `serde_json::Value`s is the
 //! correct JSON byte-diff: two JSON documents are equal iff identical content, independent of the
 //! provider's key-ordering at serialize time.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
@@ -52,7 +55,7 @@ const PI_GREP: &str = r#"{"type":"object","required":["pattern"],"properties":{"
 const PI_FIND: &str = r#"{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"},"path":{"type":"string","description":"Directory to search in (default: current directory)"},"limit":{"type":"number","description":"Maximum number of results (default: 1000)"}}}"#;
 const PI_LS: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"number","description":"Maximum number of entries to return (default: 500)"}}}"#;
 const PI_WRITE: &str = r#"{"type":"object","required":["path","content"],"properties":{"path":{"type":"string","description":"Path to the file to write (relative or absolute)"},"content":{"type":"string","description":"Content to write to the file"}}}"#;
-const PI_EDIT: &str = r#"{"type":"object","required":["path","edits"],"properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","required":["oldText","newText"],"properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}},"additionalProperties":false},"description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."}},"additionalProperties":false}"#;
+const PI_EDIT: &str = r#"{"type":"object","required":["path","edits"],"properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","required":["oldText","newText"],"properties":{"oldText":{"type":"string","description":"Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call."},"newText":{"type":"string","description":"Replacement text for this targeted edit."}}},"description":"One or more targeted replacements. Each edit is matched against the original file, not incrementally. Do not include overlapping or nested edits. If two changes touch the same block or nearby lines, merge them into one edit instead."}}}"#;
 
 fn assert_schema(tool_name: &str, got: &serde_json::Value, pi_json: &str) {
     let want: serde_json::Value = serde_json::from_str(pi_json).expect("Pi JSON parses");
@@ -275,16 +278,26 @@ fn schema_scalar_types_are_number_no_minimum_no_extra_additional_properties() {
     let p = read.parameters();
     assert_eq!(p["properties"]["offset"]["type"], "number"); // Pi: number, NOT integer
     assert!(p["properties"]["offset"].get("minimum").is_none()); // Pi adds no minimum
-    assert!(p.get("additionalProperties").is_none()); // Pi sets it on edit ONLY
+    assert!(p.get("additionalProperties").is_none()); // Pi never emits it — on ANY built-in
 
     let ls = LsTool::new(fs(), cwd(), LsOpts::default());
     // ls has NO required key at all (both properties optional) — TypeBox omits empty `required`.
     assert!(ls.parameters().get("required").is_none());
 
+    // `edit` was long believed to be the one built-in that emits `additionalProperties:false`,
+    // on the strength of its two-argument `Type.Object(props, {})` calls (edit.ts:33-53). That
+    // second argument is an EMPTY options object, and TypeBox spreads only what it is handed, so
+    // neither the top object nor the nested edit object carries the keyword. Re-derived by
+    // evaluating both literals under typebox 1.3.7 (pi's `package.json` pin at v0.83.0) and 1.1.38
+    // (the copy vendored in the pi checkout) — identical output, no `additionalProperties` at
+    // either level. The keyword is not inert on the wire: `parameters()` is copied verbatim into
+    // the model-facing schema (`cyrup-agent/src/agent.rs:813`) and forwarded untouched by the
+    // OpenAI Chat Completions and Google adapters, so pinning its ABSENCE at both levels is what
+    // keeps the legacy flat `{path, oldText, newText}` shape (`EditTool::prepare_arguments`,
+    // pi `prepareEditArguments` edit.ts:94-118) emittable by a schema-constrained model.
     let edit = EditTool::new(fs(), locks(), cwd(), Default::default());
-    assert_eq!(edit.parameters()["additionalProperties"], false);
-    assert_eq!(
-        edit.parameters()["properties"]["edits"]["items"]["additionalProperties"],
-        false
-    );
+    assert!(edit.parameters().get("additionalProperties").is_none());
+    assert!(edit.parameters()["properties"]["edits"]["items"]
+        .get("additionalProperties")
+        .is_none());
 }
