@@ -36,7 +36,8 @@ pub const MANIFEST_FILE: &str = "extension.json";
 pub struct ExtensionManifest {
     pub id: String,
     pub version: String,
-    /// WIT world compatibility, e.g. `cyrup:ext@0.7` (see [`HOST_WORLD`]).
+    /// WIT world compatibility, e.g. `cyrup:ext@0.8` (see [`HOST_WORLD`], which is the value a
+    /// manifest written today should carry — this example rotted two bumps behind it once already).
     pub world: String,
     /// Source entry for a Tier-1 build; absent for a prebuilt `.wasm` package.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,7 +216,20 @@ impl Capabilities {
 ///   what puts it behind this file's own `capabilities.ui` grant (EXT-065; upstream declares it
 ///   inside `ExtensionUIContext`, `types.ts:225`). A 0.7 guest imports it from the old interface
 ///   and fails to LINK. IMPORT ADDITION — `ui.theme-get-json` (EXT-066), which would not have
-///   required a bump on its own.
+///   required a bump on its own — and `world.wit`'s header used to claim it DID, which EXT-061
+///   corrected in favour of this entry.
+/// - 0.8, still 0.8: IMPORT ADDITION — `ctx-state.get-system-prompt-options` (EXT-061; pi
+///   `ctx.getSystemPromptOptions(): BuildSystemPromptOptions` on `ExtensionCommandContext`,
+///   `extensions/types.ts:355` @v0.83.0), the last unaccounted-for member of pi's extension API
+///   surface. Deliberately NOT a bump, and the reasoning is worth keeping because it was worked out
+///   the wrong way round first: [`ExtensionManifest::check_world`] passes when the GUEST's minor is
+///   `>=` the host's, so the version gate defends one direction only — an OLD guest against a NEW
+///   host. An added import cannot fail that direction at all (the host merely offers an import the
+///   guest never calls). The direction it COULD fail — a guest built against a newer world than the
+///   host it runs on — is accepted by the gate whatever the numbers are, because a bump raises the
+///   host's FLOOR, not its ceiling. So bumping here would refuse every already-built 0.8 guest and
+///   prevent nothing. The ABI fingerprint (`build/abi.rs`), not the version, is what stops a STALE
+///   cached artifact being served across this edit.
 pub const HOST_WORLD: &str = "cyrup:ext@0.8";
 
 impl ExtensionManifest {

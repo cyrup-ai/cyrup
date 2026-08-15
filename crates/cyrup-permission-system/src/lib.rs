@@ -83,6 +83,7 @@ pub mod jsonc;
 pub mod logging;
 pub mod manager;
 pub mod ordered;
+pub mod runtime_api;
 pub mod sanitize;
 pub mod skill;
 pub mod status;
@@ -103,7 +104,7 @@ pub use ext_config::ExtensionConfig;
 pub use extension::{
     is_installed, permission_extension_for_env, PermissionSystemExtension, CHILD_ENV_VAR,
     EXTENSION_ID, INSTALL_ENV_VAR, PERMISSIONS_EXAMPLE_CONFIG, PERMISSIONS_JSON_SCHEMA,
-    PERMISSION_SYSTEM_COMMAND, POLICY_AGENT_DIR_ENV_KEY,
+    PERMISSION_REQUEST_EVENT_CHANNEL, PERMISSION_SYSTEM_COMMAND, POLICY_AGENT_DIR_ENV_KEY,
 };
 pub use forwarding::{
     process_forwarded_requests, resolve_child_wait_timeout, spawn_forwarding_watcher,
@@ -113,6 +114,11 @@ pub use forwarding::{
 };
 pub use logging::AuditTrail;
 pub use manager::{ManagerPaths, PermissionManager};
+// PERM-011 half A: the publish seam, so a second extension can read/flip yolo mode without
+// holding this extension (pi `globalThis.__piPermissionSystem`, `yolo-mode-api.ts:20-43`).
+pub use runtime_api::{
+    register_runtime_api, runtime_api, unregister_runtime_api, PermissionSystemRuntimeApi,
+};
 pub use types::{
     CheckSource, PermissionCheckResult, PermissionState,
 };

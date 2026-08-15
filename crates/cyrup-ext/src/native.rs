@@ -118,6 +118,13 @@ pub struct HostCtxRich {
     pub context_usage: Option<serde_json::Value>,
     /// The active system prompt (Pi `ctx.getSystemPrompt()`).
     pub system_prompt: Option<String>,
+    /// The BAG that built [`Self::system_prompt`] — pi `ctx.getSystemPromptOptions()`
+    /// (`extensions/types.ts:355` @v0.83.0), shape at `core/system-prompt.ts:8-25`. `None` when no
+    /// session backend supplied one; [`HostCtx::system_prompt_options`] then answers pi's own
+    /// no-backend default. Present on the NATIVE tier for the same reason `cwd` had to be (EXT-044):
+    /// a capability only one of cyrup's two tiers can express is a divergence from cyrup, not just
+    /// from pi (EXT-061).
+    pub system_prompt_options: Option<serde_json::Value>,
 }
 
 impl HostCtx {
@@ -175,6 +182,25 @@ impl HostCtx {
     /// The active system prompt (Pi `ctx.getSystemPrompt()`).
     pub fn system_prompt(&self) -> Option<&str> {
         self.rich.system_prompt.as_deref()
+    }
+
+    /// The base system-prompt construction options (pi `ctx.getSystemPromptOptions()`,
+    /// `extensions/types.ts:355` @v0.83.0) — EXT-061, the native half of the WIT
+    /// `ctx-state.get-system-prompt-options` import.
+    ///
+    /// COMMAND-tier, because that is where upstream declares it: `getSystemPrompt()` is on the base
+    /// `ExtensionContext` (`:346`) and this is on `ExtensionCommandContext` (`:353-387`). An
+    /// event-tier caller gets [`ExtError::Deadlock`] rather than a bag, matching what the WIT tier
+    /// gate hands a guest.
+    ///
+    /// With no bag attached the answer is pi's own no-backend default — `() => ({ cwd: this.cwd })`
+    /// (`core/extensions/runner.ts:287`, re-bound at `:350`) — so a built-in always reads a
+    /// well-formed bag, never `{}` and never an "unavailable" it has to special-case.
+    pub fn system_prompt_options(&self) -> Result<serde_json::Value, ExtError> {
+        self.require_command_tier()?;
+        Ok(self.rich.system_prompt_options.clone().unwrap_or_else(|| {
+            serde_json::json!({ "cwd": self.cwd.to_string_lossy().into_owned() })
+        }))
     }
 
     pub fn tier(&self) -> CtxTier {
@@ -376,12 +402,21 @@ impl InitApi {
 
     /// Opt a registered command into argument autocomplete (EXT-035; the native analog of the
     /// guest's `registration.add-autocomplete` import).
+    ///
+    /// [CYRUP-DELTA] EXT-062: pi has no `addAutocomplete` CALL. Upstream this is a FIELD on the
+    /// command's own options bag — `getArgumentCompletions?: (argumentPrefix: string) =>
+    /// AutocompleteItem[] | null | Promise<…>` on `RegisteredCommand`
+    /// (`extensions/types.ts:1166` @v0.83.0) — passed inline to `registerCommand`. A WIT record
+    /// cannot carry a closure, so the closure inverts into a flag plus an export; the native tier
+    /// keeps the same shape as the WASM tier so the two do not diverge from each other. Same
+    /// inversion as `tool-descriptor.prepare-arguments` and `.has-renderer`.
     pub fn add_autocomplete(&mut self, command: impl Into<String>) {
         self.autocomplete.push(command.into());
     }
 
     /// Stack one global autocomplete provider (EXT-035; pi `addAutocompleteProvider`,
-    /// `extensions/types.ts:218`).
+    /// `extensions/types.ts:225` @v0.83.0 — EXT-072 cluster A: the `:218` this cited is
+    /// `getEditorText`'s doc line).
     pub fn add_autocomplete_provider(&mut self) {
         self.autocomplete_providers += 1;
     }
@@ -742,6 +777,9 @@ pub(crate) fn rich_from_services(svc: &dyn crate::host::HostServices) -> HostCtx
         is_project_trusted: svc.is_project_trusted(),
         context_usage: Some(svc.context_usage()),
         system_prompt: svc.system_prompt(),
+        // EXT-061: the native tier reads the SAME backend accessor the WIT import does, so a
+        // built-in and a guest cannot disagree about the bag.
+        system_prompt_options: svc.system_prompt_options(),
     }
 }
 

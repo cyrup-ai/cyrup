@@ -26,6 +26,7 @@ pub mod inbound;
 pub mod paths;
 pub mod project_target;
 pub mod relay;
+pub mod resources;
 pub mod reply_tracker;
 pub mod seams;
 pub mod session_state;

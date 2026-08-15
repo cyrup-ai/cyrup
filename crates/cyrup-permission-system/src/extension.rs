@@ -98,6 +98,23 @@ pub const EXTENSION_ID: &str = "cyrup-permission-system";
 /// v0.8.0 `index.ts:1502`).
 pub const PERMISSION_SYSTEM_COMMAND: &str = "permission-system";
 
+/// PERM-011 half B / pi `PERMISSION_REQUEST_EVENT_CHANNEL` (v0.8.0 `index.ts:150`). This is the
+/// topic a second extension subscribes to in order to observe every gated request and its outcome.
+///
+/// \[CYRUP-DELTA] The channel NAME diverges: upstream's literal is
+/// `"pi-permission-system:permission-request"`, and this is
+/// `"cyrup-permission-system:permission-request"`. It is the same rebrand every other identifier in
+/// this crate carries ([`EXTENSION_ID`], the config dir, the log prefixes), and it is load-bearing
+/// rather than cosmetic — the string IS the subscription key, so a guest ported verbatim from a pi
+/// extension subscribes to a topic nothing publishes. Recorded here explicitly because a bus topic
+/// is exactly the kind of constant a name-level parity diff scores as "present on both sides".
+pub const PERMISSION_REQUEST_EVENT_CHANNEL: &str = "cyrup-permission-system:permission-request";
+
+/// The `error` recorded on a `permission_request.event_emit_failed` entry when no host backend is
+/// attached to emit through. See [`PermissionSystemExtension::emit_permission_request_event`] for
+/// why this stands in for upstream's thrown-exception message.
+const NO_EVENT_BACKEND_ERROR: &str = "No host services backend is attached to emit through.";
+
 /// The `source` label the `/permission-system` handler passes to
 /// [`PermissionSystemExtension::set_yolo_mode`], so a `yolo_mode.updated` entry says which surface
 /// moved the flag (pi `options.source`, `yolo-mode-api.ts:3`).
@@ -376,6 +393,74 @@ pub struct PermissionSystemExtension {
     /// retained `permissionForwardingContext`, `index.ts:1114`). See
     /// [`crate::forwarding::SharedHasUi`].
     has_ui: forwarding::SharedHasUi,
+    /// PERM-011 half A — a `Weak` handle on this extension's own `Arc`, installed by
+    /// [`Self::into_shared`]. It exists so the published runtime API
+    /// ([`crate::runtime_api`]) can call back into these methods without the process-global
+    /// registry OWNING the extension: pi's registered object is a bag of closures over module
+    /// scope, whose lifetime is the realm's, and a `Weak` is the Rust spelling that does not
+    /// outlive the session. Unset when the extension was built by value (unit tests), in which
+    /// case nothing is published — see [`Self::publish_runtime_api`].
+    self_ref: OnceLock<std::sync::Weak<PermissionSystemExtension>>,
+    /// PERM-011 half A — pi's module-scope `let runtimeApi: PiPermissionSystemRuntimeApi | null`
+    /// (`index.ts:159`), which holds what `registerPiPermissionSystemRuntimeApi` returned
+    /// (`:1481`) purely so `session_shutdown` can hand it back to the identity-guarded
+    /// unregister (`:1868-1870`).
+    runtime_api: Mutex<Option<Arc<dyn crate::runtime_api::PermissionSystemRuntimeApi>>>,
+}
+
+/// PERM-011 half A — the object published on the process-global registry, i.e. cyrup's spelling of
+/// pi's `{getYoloMode, setYoloMode, toggleYoloMode}` literal (`index.ts:1481-1485`).
+///
+/// It is a distinct type rather than an `impl` on the extension because the registry must hold a
+/// handle that does NOT keep a finished session's extension alive; see the CYRUP-DELTA on
+/// [`crate::runtime_api`]. The three methods delegate straight to the ported inherent methods, so
+/// there is exactly ONE implementation of each behaviour — in particular of `set_yolo_mode`'s
+/// persist-failure invariant.
+struct PublishedRuntimeApi {
+    ext: std::sync::Weak<PermissionSystemExtension>,
+}
+
+impl crate::runtime_api::PermissionSystemRuntimeApi for PublishedRuntimeApi {
+    /// pi `getYoloMode: () => extensionConfig.yoloMode` (`index.ts:1482`). A dropped extension
+    /// reports `false` — "no gate is running, so nothing is being auto-approved" — which is the
+    /// fail-CLOSED reading of the flag.
+    fn get_yolo_mode(&self) -> bool {
+        self.ext.upgrade().is_some_and(|ext| ext.yolo_mode())
+    }
+
+    /// pi `setYoloMode: setYoloModeFromRuntimeApi` (`index.ts:1483`).
+    fn set_yolo_mode(
+        &self,
+        enabled: bool,
+        options: &YoloModeControlOptions,
+    ) -> YoloModeControlResult {
+        match self.ext.upgrade() {
+            Some(ext) => ext.set_yolo_mode(enabled, options),
+            None => Self::gone(),
+        }
+    }
+
+    /// pi `toggleYoloMode: (options) => setYoloModeFromRuntimeApi(!extensionConfig.yoloMode,
+    /// options)` (`index.ts:1484`).
+    fn toggle_yolo_mode(&self, options: &YoloModeControlOptions) -> YoloModeControlResult {
+        match self.ext.upgrade() {
+            Some(ext) => ext.toggle_yolo_mode(options),
+            None => Self::gone(),
+        }
+    }
+}
+
+impl PublishedRuntimeApi {
+    /// The extension is gone: report the SAME shape a refused persist reports — nothing changed,
+    /// nothing was written, and the reason is stated (`yolo-mode-api.ts:6-11`).
+    fn gone() -> YoloModeControlResult {
+        YoloModeControlResult {
+            yolo_mode: false,
+            changed: false,
+            persisted: false,
+            error: Some(crate::runtime_api::EXTENSION_GONE_ERROR.to_string()),
+        }
+    }
 }
 
 impl PermissionSystemExtension {
@@ -814,6 +899,90 @@ impl PermissionSystemExtension {
         self.set_yolo_mode(!self.yolo_mode(), options)
     }
 
+    /// PERM-011 half A / pi `runtimeApi = registerPiPermissionSystemRuntimeApi({getYoloMode,
+    /// setYoloMode, toggleYoloMode})` (`index.ts:1481-1485`): publish the three-method control
+    /// surface on the process-global registry, and keep what the registry handed back so
+    /// `session_shutdown` can retract exactly this registration (pi's module-scope `runtimeApi`,
+    /// `:159`).
+    ///
+    /// Called from `init` — cyrup's analog of upstream's activation body, which is where the
+    /// registration sits: AFTER the `enabled` early return (`:1475-1477`, cyrup's
+    /// [`permission_extension_for_env`] returning `None`) and before any handler registration.
+    ///
+    /// A no-op when [`Self::self_ref`] was never installed, i.e. the extension was built by value
+    /// rather than through [`Self::into_shared`]. That is the honest state and not a silent
+    /// failure: an extension that was never activated has published nothing upstream either.
+    fn publish_runtime_api(&self) {
+        let Some(weak) = self.self_ref.get() else { return };
+        let api: Arc<dyn crate::runtime_api::PermissionSystemRuntimeApi> =
+            Arc::new(PublishedRuntimeApi { ext: weak.clone() });
+        *guard(&self.runtime_api) = Some(crate::runtime_api::register_runtime_api(api));
+    }
+
+    /// PERM-011 half A / pi `unregisterPiPermissionSystemRuntimeApi(runtimeApi ?? undefined);
+    /// runtimeApi = null;` (`index.ts:1868-1870`), in `session_shutdown`.
+    ///
+    /// The handle is passed so the registry's identity guard can decline to clear a NEWER
+    /// registration — the whole reason pi stores the returned object rather than calling the
+    /// argumentless form.
+    fn retract_runtime_api(&self) {
+        let published = guard(&self.runtime_api).take();
+        crate::runtime_api::unregister_runtime_api(published.as_ref());
+    }
+
+    /// PERM-011 half B / pi `emitPermissionRequestEvent` (`index.ts:1518-1529`): put one
+    /// permission-request event on the inter-extension bus, and — exactly as upstream does in its
+    /// `catch` — record a `permission_request.event_emit_failed` debug entry if it cannot be
+    /// delivered.
+    ///
+    /// \[CYRUP-DELTA] pi's failure mode is `pi.events.emit` THROWING; cyrup's
+    /// [`cyrup_ext::HostServices::emit_event`] cannot fail, so the one way an emit can be lost is
+    /// that no host backend is attached (a by-value extension, or a session that never bound one).
+    /// That is the same class of loss — "the event did not reach the bus" — so it takes the same
+    /// entry, with the reason in upstream's `error` key. The three keys pi puts on the entry
+    /// (`requestId`, `source`, `state`) are its own (`:1522-1527`).
+    fn emit_permission_request_event(&self, payload: &Value, request_id: &str, source: &str, state: &str) {
+        if let Some(services) = self.host_services.get() {
+            services.emit_event(PERMISSION_REQUEST_EVENT_CHANNEL, payload);
+            return;
+        }
+        self.write_debug_entry(
+            "permission_request.event_emit_failed",
+            &json!({
+                "requestId": request_id,
+                "source": source,
+                "state": state,
+                "error": NO_EVENT_BACKEND_ERROR,
+            }),
+        );
+    }
+
+    /// PERM-011 half B / pi `emitPermissionStateEvent(details, state)` (`index.ts:1531-1546`): the
+    /// `PermissionRequestEvent` projection of a prompt's details, in upstream's key order
+    /// (`:1536-1545`), plus the `state`.
+    ///
+    /// \[CYRUP-DELTA] pi hands the listener a live JS object, so its optional fields are `undefined`
+    /// and vanish under `JSON.stringify`; cyrup's payload is a [`Value`], which has no `undefined`,
+    /// so an absent field is `null`. Nothing else about the shape differs — the key set and their
+    /// order are upstream's.
+    fn emit_permission_state_event(&self, details: &DedupDetails, state: &str) {
+        let payload = json!({
+            "requestId": details.request_id,
+            "source": details.source,
+            "state": state,
+            "message": details.message,
+            "toolCallId": details.tool_call_id,
+            "toolName": details.tool_name,
+            "skillName": details.skill_name,
+            "path": details.path,
+            "command": details.command,
+            "target": details.target,
+            "toolInput": details.tool_input,
+            "agentName": details.agent_name,
+        });
+        self.emit_permission_request_event(&payload, &details.request_id, &details.source, state);
+    }
+
     /// The `/permission-system` handler body (pi `index.ts:1504-1511` via
     /// `createPermissionSystemCommandHandler`, `common.ts:188-198`), reached from
     /// [`NativeExtension::execute_command`].
@@ -853,10 +1022,11 @@ impl PermissionSystemExtension {
     /// have a caller. That was the wrong trade: it changed the emitted debug event
     /// (`yolo_mode.updated` instead of `config.saved`) and the error surface, distorting ported
     /// behaviour to satisfy a reachability rule. [`Self::set_yolo_mode`],
-    /// [`Self::toggle_yolo_mode`] and [`Self::yolo_mode`] are therefore correctly ported and
-    /// currently UNREACHABLE — `cyrup-ext` has no extension-provided-API registry for one extension
-    /// to call another's methods, which is the actual missing piece. Tracked as G133b in
-    /// `docs/gap-analysis/PARITY-GAPS.md`; see [`crate::yolo_api`].
+    /// [`Self::toggle_yolo_mode`] and [`Self::yolo_mode`] belong to the OTHER surface, and
+    /// PERM-011 half A has now given them upstream's own publish seam: they are registered on the
+    /// process-global [`crate::runtime_api`] registry (pi's `globalThis.__piPermissionSystem`,
+    /// `yolo-mode-api.ts:20-43`) by [`Self::publish_runtime_api`], so a second extension reaches
+    /// them through `crate::runtime_api::runtime_api()` — never through this command.
     ///
     /// Returns `Some(text)` for output the session surfaces as an **Info** notification, and `None`
     /// when this handler has ALREADY notified at its own level — the convention documented on
@@ -1127,7 +1297,24 @@ impl PermissionSystemExtension {
             controller,
             logger,
             has_ui: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            self_ref: OnceLock::new(),
+            runtime_api: Mutex::new(None),
         }
+    }
+
+    /// PERM-011 half A — wrap in an `Arc` and record a `Weak` back-reference, so `init` can publish
+    /// the runtime API on [`crate::runtime_api`].
+    ///
+    /// This is the ONE constructor step that cannot happen inside [`Self::from_parts_full`]: the
+    /// `Weak` can only be taken once the value is inside its `Arc`. Every production path
+    /// ([`permission_extension_for_env`]) goes through here; a by-value extension (unit tests)
+    /// simply publishes nothing, which is the honest state — pi publishes at extension activation,
+    /// and a test that never activates one has no realm-global either.
+    #[must_use]
+    pub fn into_shared(self) -> Arc<Self> {
+        let arc = Arc::new(self);
+        let _ = arc.self_ref.set(Arc::downgrade(&arc));
+        arc
     }
 
     /// pi `writeDebugEntry` (`index.ts:171-176`): the diagnostic stream, with the logger's own
@@ -1676,6 +1863,9 @@ impl PermissionSystemExtension {
                     "decisionScope": "yolo_mode",
                 }),
             );
+            // PERM-011 half B / pi `emitPermissionStateEvent(details, "approved")`
+            // (`index.ts:1606`) — between the review entry and the flush, upstream's position.
+            self.emit_permission_state_event(details, "approved");
             self.logger.flush();
             let decision = PermissionPromptDecision {
                 approved: true,
@@ -1691,6 +1881,11 @@ impl PermissionSystemExtension {
         // pi `index.ts:1843` — recorded BEFORE the dialog opens, so a session killed mid-prompt
         // still leaves evidence of what was asked.
         self.review_permission_decision("permission_request.waiting", details, json!({}));
+        // PERM-011 half B / pi `emitPermissionStateEvent(details, "waiting")` (`index.ts:1612`),
+        // immediately after the review entry and BEFORE the dialog opens — an external observer
+        // learns a human is being asked while they are still being asked, which is the whole point
+        // of the `waiting` state.
+        self.emit_permission_state_event(details, "waiting");
         let human_lock = self.host_services.get().and_then(|s| s.human_interaction_lock());
         let _human_guard = match human_lock {
             Some(lock) => Some(lock.acquire().await),
@@ -1724,6 +1919,9 @@ impl PermissionSystemExtension {
                     "approvalScope": if d.approved && always { scope.clone() } else { Value::Null },
                 }),
             );
+            // PERM-011 half B / pi `emitPermissionStateEvent(details, decision.approved ?
+            // "approved" : "denied")` (`index.ts:1626`).
+            self.emit_permission_state_event(details, if d.approved { "approved" } else { "denied" });
             // pi `:1637` — the `decisionPromise` settles, so the entry registered above flips from
             // pending to resolved and BOTH the next identical request and any concurrent follower
             // already awaiting it see this decision.
@@ -2323,6 +2521,11 @@ impl NativeExtension for PermissionSystemExtension {
                 completions: vec!["debug".to_string(), "yoloMode".to_string()],
             },
         );
+        // PERM-011 half A / pi `runtimeApi = registerPiPermissionSystemRuntimeApi(…)`
+        // (`index.ts:1481-1485`). Upstream registers it in the activation body, one statement
+        // before the command registration above; this is that same body. Retracted in
+        // `session_shutdown` (`:1868-1870`).
+        self.publish_runtime_api();
         Ok(())
     }
 
@@ -2508,6 +2711,16 @@ impl NativeExtension for PermissionSystemExtension {
                 self.invalidate_agent_start_cache();
                 // pi `resetShownWarnings()` (`index.ts:2125`).
                 self.warnings.reset();
+                // PERM-011 half A / pi `unregisterPiPermissionSystemRuntimeApi(runtimeApi ??
+                // undefined); … runtimeApi = null;` (`index.ts:1868` and `:1870`): upstream runs it
+                // after `resetShownWarnings()` (`:1866`) and before the polling teardown
+                // (`stopForwardedPermissionPolling`, `:1872`), which is where it sits here. The one
+                // neighbour that differs is `invalidateAgentStartCache()` — pi runs it at `:1871`,
+                // AFTER the unregister, and this handler already ran it above; that ordering is
+                // this port's, predates PERM-011 and is unobservable (the cache and the published
+                // slot share no state). A session that has ended must not leave a control surface
+                // published that can still flip yolo mode.
+                self.retract_runtime_api();
                 self.stop_forwarding_watcher();
                 // PERM-001 / pi `delete process.env[SUBAGENT_PARENT_SESSION_ENV]`
                 // (`pi-subagents/src/extension/index.ts:619` @v0.34.0): drop the published anchor so a stale
@@ -2714,14 +2927,20 @@ pub fn permission_extension_for_env(
         // CHILD: forward asks up to the parent (§7.4). The parent-session anchor
         // `CYRUP_SUBAGENT_PARENT_SESSION` (emitted by `cyrup-ext-subagents`, `exec/mod.rs`
         // `PARENT_SESSION_ENV_VAR`) addresses the parent's inbox; the `ForwardingAskChannel` reads it.
-        return Some(Arc::new(PermissionSystemExtension::new_forwarding_child_with_config(
-            agent_dir, cwd, config,
-        )));
+        // `into_shared` rather than `Arc::new` (PERM-011 half A): it installs the `Weak`
+        // back-reference the published runtime API borrows through, so `init` has something to
+        // publish. A child publishes too — upstream's registration is in the activation body,
+        // which runs in both roles.
+        return Some(
+            PermissionSystemExtension::new_forwarding_child_with_config(agent_dir, cwd, config)
+                .into_shared(),
+        );
     }
     // PARENT: in-session dialog + the forwarding watcher (installed on SessionStart).
-    Some(Arc::new(PermissionSystemExtension::new_forwarding_parent_with_config(
-        agent_dir, cwd, config,
-    )))
+    Some(
+        PermissionSystemExtension::new_forwarding_parent_with_config(agent_dir, cwd, config)
+            .into_shared(),
+    )
 }
 
 #[cfg(test)]
@@ -2971,15 +3190,10 @@ mod tests {
     ///
     /// The lock is `crate::ext_config::env_lock` — the same one the mutator holds — and it is taken
     /// in a SYNCHRONOUS frame around `block_on` rather than inside an `async` test body, so the
-    /// guard is never held across an `.await` point.
+    /// guard is never held across an `.await` point. That frame is
+    /// [`crate::ext_config::with_env_lock`]; this is the local spelling of it.
     fn with_config_env_lock<F: std::future::Future>(body: F) -> F::Output {
-        let _lock =
-            crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(body)
+        crate::ext_config::with_env_lock(body)
     }
 
     fn bash_call(call_id: &str) -> HostEvent {
@@ -3840,11 +4054,28 @@ mod tests {
     /// `else if (!result.warning) { lastConfigWarning = null; }`), so a session that loads a good
     /// `config.json` and then finds a corrupt one reports the corruption — the case the count-based
     /// assertion above could never distinguish from the policy warning firing twice.
-    #[tokio::test]
-    async fn a_config_warning_re_arms_after_a_clean_load_clears_the_memo() {
-        let _guard = crate::ext_config::env_lock()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ///
+    /// Driven through `with_config_env_lock` like every other env-locked test in this module: the
+    /// guard belongs in the synchronous frame, not inside the `async` body where it would be stored
+    /// in the future's state across all three `.await`s below.
+    #[test]
+    fn a_config_warning_re_arms_after_a_clean_load_clears_the_memo() {
+        with_config_env_lock(a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body());
+    }
+
+    /// RED BEFORE THE FIX, at COMPILE time. `std::sync::MutexGuard` is `!Send`, so while the guard
+    /// was taken at the top of this test's `async` body it was captured in that body's future and
+    /// this assertion did not compile. It compiles now because the guard lives on
+    /// `with_config_env_lock`'s stack frame instead — which is exactly the property fixed.
+    /// Constructing an `async fn`'s future runs none of its body, so this touches no config file
+    /// and no environment variable and needs no lock of its own.
+    #[test]
+    fn the_env_locked_body_does_not_carry_the_guard_across_its_awaits() {
+        fn assert_send<F: Send>(_: F) {}
+        assert_send(a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body());
+    }
+
+    async fn a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body() {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
@@ -4307,5 +4538,144 @@ mod tests {
         );
 
         ext.stop_forwarding_watcher();
+    }
+
+    // ==================================================================== PERM-011 (both halves)
+
+    /// A [`HostServices`] that records every [`HostServices::emit_event`] — the consumer's whole
+    /// view of the bus, standing in for a second extension's subscription.
+    #[derive(Default)]
+    struct RecordingBus {
+        events: Mutex<Vec<(String, Value)>>,
+    }
+
+    impl RecordingBus {
+        fn taken(&self) -> Vec<(String, Value)> {
+            guard(&self.events).clone()
+        }
+    }
+
+    impl HostServices for RecordingBus {
+        fn emit_event(&self, topic: &str, payload: &Value) {
+            guard(&self.events).push((topic.to_string(), payload.clone()));
+        }
+    }
+
+    /// PERM-011 half A — the publish seam, end to end through the extension.
+    ///
+    /// **Pre-fix this test cannot compile, let alone pass**: `crate::runtime_api` did not exist and
+    /// there was no spelling under which a holder of nothing but the crate could reach
+    /// `yolo_mode`/`set_yolo_mode`/`toggle_yolo_mode`. The assertion that makes it a behaviour test
+    /// rather than an API-shape test is the last one before shutdown: flipping the flag through the
+    /// PUBLISHED handle must move the live config the gate itself reads.
+    #[test]
+    fn init_publishes_the_yolo_control_surface_and_shutdown_retracts_it() {
+        // BOTH locks are taken in this SYNCHRONOUS frame, for the reason `with_config_env_lock`
+        // documents: a guard taken inside the async body would be held across every `.await`.
+        let _registry = crate::runtime_api::test_registry_lock();
+        with_config_env_lock(init_publishes_the_yolo_control_surface_and_shutdown_retracts_it_body());
+    }
+
+    async fn init_publishes_the_yolo_control_surface_and_shutdown_retracts_it_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        // `into_shared` is what production uses (`permission_extension_for_env`); it installs the
+        // `Weak` the published handle borrows through.
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone()).into_shared();
+
+        assert!(
+            crate::runtime_api::runtime_api().is_none(),
+            "nothing is published before activation (pi registers inside the extension body)"
+        );
+        init_ext(&ext).await;
+
+        // From here on, the test holds ONLY the module path — no extension handle is used to drive
+        // the API, which is exactly the position a second extension is in.
+        let api = crate::runtime_api::runtime_api().expect("init must publish the runtime API");
+        assert!(!api.get_yolo_mode(), "pi `getYoloMode` reads the live config");
+
+        let result = api.toggle_yolo_mode(&YoloModeControlOptions::transient("second-extension"));
+        assert!(result.changed && result.yolo_mode, "the toggle must report the move: {result:?}");
+        assert!(!result.persisted, "`persist: false` is in-memory only (index.ts:1433)");
+        assert!(
+            ext.yolo_mode(),
+            "the flip must reach the config the GATE reads, not a copy — this is the half of \
+             PERM-011 that makes the published methods more than a shape"
+        );
+
+        let ctx = event_ctx(agent_dir.clone());
+        let _ = ext
+            .on_event(
+                &HostEvent::SessionShutdown { reason: "exit".to_string(), target_session_file: None },
+                &ctx,
+            )
+            .await;
+        assert!(
+            crate::runtime_api::runtime_api().is_none(),
+            "pi `unregisterPiPermissionSystemRuntimeApi(runtimeApi)` (index.ts:1868) — a finished \
+             session must not leave a live control surface published"
+        );
+    }
+
+    /// PERM-011 half B — the permission-request event channel, on the yolo auto-approval path
+    /// (pi `emitPermissionStateEvent(details, "approved")`, `index.ts:1606`).
+    ///
+    /// Pre-fix, `grep -rn 'events.emit\|emit_event' crates/cyrup-permission-system/src` returned
+    /// zero and this test saw an EMPTY recording: no observer could tell that a tool call had been
+    /// gated at all. It asserts the topic, the state and the full projection of the details, since
+    /// the payload IS the interface.
+    #[test]
+    fn a_gated_request_is_published_on_the_permission_request_channel() {
+        with_config_env_lock(a_gated_request_is_published_on_the_permission_request_channel_body());
+    }
+
+    async fn a_gated_request_is_published_on_the_permission_request_channel_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent_dir = dir.path().to_path_buf();
+        let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
+        let bus = Arc::new(RecordingBus::default());
+        ext.set_host_services(bus.clone());
+        // Yolo on: `prompt_decision` takes pi's `shouldAutoApprovePermissionState` arm
+        // (`index.ts:1598-1608`), which needs no human and still emits.
+        guard(&ext.config).yolo_mode = true;
+
+        let details = DedupDetails {
+            request_id: "req-perm011".to_string(),
+            source: "tool_call".to_string(),
+            agent_name: Some("reviewer".to_string()),
+            message: "Allow bash?".to_string(),
+            tool_call_id: Some("call-1".to_string()),
+            tool_name: Some("bash".to_string()),
+            skill_name: None,
+            path: None,
+            command: Some("git status".to_string()),
+            target: None,
+            tool_input: json!({ "command": "git status" }),
+        };
+        let ctx = headless_ctx(dir.path());
+        let outcome = ext.prompt_decision(&details, &ctx).await;
+        assert!(
+            matches!(outcome, AskOutcome::Decided(ref d) if d.approved),
+            "fixture precondition: the yolo arm must approve, or nothing reaches the emit"
+        );
+
+        let events = bus.taken();
+        assert_eq!(events.len(), 1, "exactly one state event per decision: {events:?}");
+        let (topic, payload) = &events[0];
+        assert_eq!(topic, PERMISSION_REQUEST_EVENT_CHANNEL);
+        assert_eq!(payload["state"], json!("approved"));
+        assert_eq!(payload["requestId"], json!("req-perm011"));
+        assert_eq!(payload["source"], json!("tool_call"));
+        assert_eq!(payload["message"], json!("Allow bash?"));
+        assert_eq!(payload["toolCallId"], json!("call-1"));
+        assert_eq!(payload["toolName"], json!("bash"));
+        assert_eq!(payload["command"], json!("git status"));
+        assert_eq!(payload["agentName"], json!("reviewer"));
+        assert_eq!(payload["toolInput"], json!({ "command": "git status" }));
+        // pi's optional fields are `undefined`; cyrup's are `null` (the CYRUP-DELTA on
+        // `emit_permission_state_event`) — pinned so the mapping is not "tidied" into absent keys.
+        assert_eq!(payload["skillName"], Value::Null);
+        assert_eq!(payload["path"], Value::Null);
+        assert_eq!(payload["target"], Value::Null);
     }
 }

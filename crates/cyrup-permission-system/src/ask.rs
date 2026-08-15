@@ -470,21 +470,44 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn forwarding_channel_denies_when_no_parent_anchor() {
-        // No `CYRUP_SUBAGENT_PARENT_SESSION` set in this test env ⇒ null target ⇒ fail-closed deny
-        // (pi `index.ts:1000-1005` @v0.8.0), never a hang, never an allow.
-        //
-        // PERM-020 — the process-wide env lock is held across the ENTIRE body, not just the two
-        // mutations. In Rust 2024 `set_var`/`remove_var` are `unsafe` because they race any
-        // concurrent `getenv`, and this crate's other tests call `getenv` constantly:
-        // `ExtensionConfig::resolve_config_path` reads `CONFIG_PATH_ENV_KEY`, `resolve_logs_dir`
-        // reads `LOGS_DIR_ENV_KEY`, and `ForwardingAskChannel::confirm` below reads
-        // `PARENT_SESSION_ENV_VAR` and `AGENT_NAME_ENV_VAR` itself. Unsynchronized, that pairing is
-        // undefined behaviour rather than mere flakiness. `ext_config::env_lock()` is the same lock
-        // every other env-touching test in this crate takes.
-        let _env_guard =
-            crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    /// No `CYRUP_SUBAGENT_PARENT_SESSION` set in this test env ⇒ null target ⇒ fail-closed deny
+    /// (pi `index.ts:1000-1005` @v0.8.0), never a hang, never an allow.
+    ///
+    /// PERM-020 — the process-wide env lock is held across the ENTIRE body, not just the two
+    /// mutations. In Rust 2024 `set_var`/`remove_var` are `unsafe` because they race any concurrent
+    /// `getenv`, and this crate's other tests call `getenv` constantly:
+    /// `ExtensionConfig::resolve_config_path` reads `CONFIG_PATH_ENV_KEY`, `resolve_logs_dir` reads
+    /// `LOGS_DIR_ENV_KEY`, and `ForwardingAskChannel::confirm` below reads `PARENT_SESSION_ENV_VAR`
+    /// and `AGENT_NAME_ENV_VAR` itself. Unsynchronized, that pairing is undefined behaviour rather
+    /// than mere flakiness.
+    ///
+    /// The span is unchanged; where the guard LIVES is not. It is taken by
+    /// [`crate::ext_config::with_env_lock`] in the synchronous frame around `block_on` — the same
+    /// lock instance every other env-touching test in this crate takes — instead of inside the
+    /// `async` body, where the `MutexGuard` would be captured in the future's state across
+    /// `confirm().await` (`clippy::await_holding_lock`).
+    #[test]
+    fn forwarding_channel_denies_when_no_parent_anchor() {
+        crate::ext_config::with_env_lock(forwarding_channel_denies_when_no_parent_anchor_body());
+    }
+
+    /// RED BEFORE THE FIX — and red at COMPILE time, which is the strongest form available for this
+    /// defect.
+    ///
+    /// `std::sync::MutexGuard` is `!Send`. While the guard was taken at the top of the `async` test
+    /// body it was captured in that body's future, so the future was `!Send` and this assertion did
+    /// not compile ("`MutexGuard<'_, ()>` cannot be sent between threads safely ... required
+    /// because it appears within the type of the future"). It compiles now precisely because the
+    /// guard no longer lives in the future's state — which is the whole content of the fix, not a
+    /// proxy for it. Nothing is awaited here: constructing an `async fn`'s future runs none of its
+    /// body, so this test touches no environment variable and needs no lock of its own.
+    #[test]
+    fn the_env_locked_body_does_not_carry_the_guard_across_its_await() {
+        fn assert_send<F: Send>(_: F) {}
+        assert_send(forwarding_channel_denies_when_no_parent_anchor_body());
+    }
+
+    async fn forwarding_channel_denies_when_no_parent_anchor_body() {
         let dir = tempfile::tempdir().unwrap();
         let ch = ForwardingAskChannel::new(
             dir.path().to_path_buf(),
@@ -494,8 +517,9 @@ mod tests {
         );
         // Guard against an ambient anchor leaking in from a parallel test process.
         let restore = std::env::var(cyrup_ext_subagents::PARENT_SESSION_ENV_VAR).ok();
-        // SAFETY: test-local, immediately restored, and serialized by `env_lock` above so no other
-        // test in this binary observes the mutation. Rust 2024 requires `unsafe` for env mutation.
+        // SAFETY: test-local, immediately restored, and serialized by `env_lock` — held by the
+        // enclosing `with_env_lock` frame for this whole body — so no other test in this binary
+        // observes the mutation. Rust 2024 requires `unsafe` for env mutation.
         unsafe { std::env::remove_var(cyrup_ext_subagents::PARENT_SESSION_ENV_VAR) };
         let out = ch.confirm("Permission Required", "run bash 'rm -rf /'?", PromptOpts::default()).await;
         if let Some(v) = restore {

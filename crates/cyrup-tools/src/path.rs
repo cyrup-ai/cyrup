@@ -96,20 +96,51 @@ fn expand_home(path: &str) -> String {
 fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     {
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            return Some(PathBuf::from(profile));
-        }
-        // libuv's `uv_os_homedir` falls back to the account's profile directory; the
-        // `HOMEDRIVE`+`HOMEPATH` pair is the environment-visible spelling of the same thing.
-        if let (Some(drive), Some(path)) =
-            (std::env::var_os("HOMEDRIVE"), std::env::var_os("HOMEPATH"))
-        {
-            let mut joined = std::ffi::OsString::from(drive);
-            joined.push(path);
-            return Some(PathBuf::from(joined));
+        if let Some(home) = windows_home_from(
+            std::env::var_os("USERPROFILE"),
+            std::env::var_os("HOMEDRIVE"),
+            std::env::var_os("HOMEPATH"),
+        ) {
+            return Some(home);
         }
     }
     std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// The Windows arm of [`home_dir`], as a pure function of the three variables it reads, so the
+/// precedence is testable on every platform without mutating a live process environment (env
+/// mutation is `unsafe` under edition 2024 and races every other test in the binary). CFG-072.
+///
+/// **[CYRUP-DELTA — the `HOMEDRIVE`/`HOMEPATH` fallback WIDENS home resolution past upstream]**
+/// pi resolves a home two ways and neither reads this pair: `normalizePath` calls Node's
+/// `homedir()` (`utils/paths.ts:67` @v0.83.0, `:88` @v0.84.1 — `const home = options.homeDir ??
+/// homedir();`), and the display paths read `process.env.HOME || process.env.USERPROFILE`
+/// (`modes/interactive/components/footer.ts:114`, `components/tree-selector.ts:940` @v0.83.0).
+/// `git -C pi grep -c HOMEDRIVE v0.83.0 -- packages/` → 0; same for `HOMEPATH`. Node's `homedir()`
+/// is libuv's `uv_os_homedir`, which checks `USERPROFILE` and then falls back to a *syscall*
+/// (`GetUserProfileDirectoryW`), not to this pair — so `HOMEDRIVE`+`HOMEPATH` is the
+/// environment-visible spelling of the same directory rather than a literal port of that fallback.
+///
+/// **Kept, not dropped**, and stated here because the divergence runs in the direction nobody
+/// looks: on a Windows configuration with `USERPROFILE` and `HOME` both unset but the pair set,
+/// cyrup expands `~` and pi leaves it literal. That makes a "same input, different output" report
+/// unreproducible upstream unless the extra branch is findable, and `CYRUP-DELTA` is the grep this
+/// project's parity sweeps run. Ordering is upstream's: `USERPROFILE` first, always.
+#[cfg(any(windows, test))]
+fn windows_home_from(
+    userprofile: Option<std::ffi::OsString>,
+    homedrive: Option<std::ffi::OsString>,
+    homepath: Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if let Some(profile) = userprofile {
+        return Some(PathBuf::from(profile));
+    }
+    if let (Some(drive), Some(path)) = (homedrive, homepath) {
+        let mut joined = drive;
+        joined.push(path);
+        return Some(PathBuf::from(joined));
+    }
+    None
 }
 
 /// `normalizeWindowsShellPath` (v0.84.1 `paths.ts:67-73`): convert Git Bash / MSYS / Cygwin / WSL
@@ -277,7 +308,7 @@ pub fn resolve_read_path(path: &str, cwd: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -453,5 +484,66 @@ mod tests {
         let cwd = Path::new("/work");
         assert_eq!(resolve_to_cwd("/c/Users/x/f.txt", cwd), PathBuf::from("/c/Users/x/f.txt"));
         assert_eq!(resolve_to_cwd("/mnt/c/f.txt", cwd), PathBuf::from("/mnt/c/f.txt"));
+    }
+
+    /// CFG-072 — the `HOMEDRIVE`/`HOMEPATH` fallback and its precedence, pinned as a pure function
+    /// so the assertion runs on every platform rather than only on a Windows runner.
+    ///
+    /// pi reads NEITHER variable at v0.83.0 (`git -C pi grep -c HOMEDRIVE v0.83.0 -- packages/`
+    /// → 0): `normalizePath` calls Node's `homedir()` (`utils/paths.ts:67`), and the display paths
+    /// read `process.env.HOME || process.env.USERPROFILE` (`footer.ts:114`,
+    /// `tree-selector.ts:940`). So the third case below is the DIVERGENCE: cyrup resolves a home
+    /// where pi resolves none.
+    ///
+    /// RED before this pass on its first line, for a mechanical reason that is the point of the
+    /// item: `windows_home_from` did not exist — the branch was three inlined statements inside
+    /// `home_dir`'s `#[cfg(windows)]` block, unreachable from any test compiled for a unix host and
+    /// carrying no `[CYRUP-DELTA]`. The extraction is what makes the widening assertable at all.
+    #[test]
+    fn cfg072_homedrive_homepath_is_the_documented_fallback_after_userprofile() {
+        use std::ffi::OsString;
+        let os = |s: &str| Some(OsString::from(s));
+
+        // `USERPROFILE` wins outright — upstream's own order (`footer.ts:114`), never overtaken.
+        assert_eq!(
+            windows_home_from(os(r"C:\Users\up"), os("D:"), os(r"\Users\hd")),
+            Some(PathBuf::from(r"C:\Users\up")),
+        );
+        // ... including when only it is set.
+        assert_eq!(windows_home_from(os(r"C:\Users\up"), None, None), Some(PathBuf::from(r"C:\Users\up")));
+
+        // THE DIVERGENCE: no `USERPROFILE`, but the pair is set. pi resolves nothing here; cyrup
+        // joins the pair verbatim, with no separator inserted (`HOMEPATH` carries its own leading
+        // backslash).
+        assert_eq!(
+            windows_home_from(None, os("D:"), os(r"\Users\hd")),
+            Some(PathBuf::from(r"D:\Users\hd")),
+        );
+
+        // BOTH halves are required: a half-set pair must not widen resolution further still, and
+        // must fall through to the `HOME` lookup in `home_dir` rather than fabricating a path.
+        assert_eq!(windows_home_from(None, os("D:"), None), None);
+        assert_eq!(windows_home_from(None, None, os(r"\Users\hd")), None);
+        assert_eq!(windows_home_from(None, None, None), None);
+    }
+
+    /// CFG-072's other half: the widening has to be FINDABLE by the grep the parity sweeps run.
+    /// RED before this pass — the only comment on the branch was "libuv's `uv_os_homedir` falls
+    /// back to the account's profile directory; the `HOMEDRIVE`+`HOMEPATH` pair is the
+    /// environment-visible spelling of the same thing", which carries no `CYRUP-DELTA` marker and
+    /// does not say that pi reads neither name.
+    #[test]
+    fn cfg072_the_widening_carries_a_delta_naming_what_it_extends() {
+        let src = include_str!("path.rs");
+        let at = src.find("fn windows_home_from").expect("the extracted Windows arm");
+        let doc = &src[..at];
+        let doc = &doc[doc.rfind("[CYRUP-DELTA").expect("a delta annotation on the widening")..];
+
+        for needle in ["HOMEDRIVE", "HOMEPATH", "USERPROFILE", "homedir()", "v0.83.0"] {
+            assert!(
+                doc.contains(needle),
+                "the delta must name `{needle}` — what cyrup reads, and what pi reads instead; got: {doc}"
+            );
+        }
     }
 }

@@ -149,7 +149,25 @@ Closed this pass: **10**. Reopened: **0**. Newly filed: **7**.
 > table above; `PERM-S01`/`S02`/`S03` are intercom/subagents concerns and **area 11 owns them going
 > forward**. Per structural defect A in `00-residual-ledger.md`, treat this count as a **floor**.
 
-> **RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set UNCHANGED at 0 critical, 0 high, 2 medium, 2 low = 4** (23 rows: 18 closed, 4 open, 1 `tracker`). **Sweep 8 landed nothing here, and that is the correct outcome: all four remaining rows are routed out of this crate or blocked on something an agent must not do unilaterally.** Re-confirmed by reading, not re-derived:
+> **RECOUNTED 2026-08-15 — counted set: 0 critical · 0 high · 0 medium · 1 low = 1** (23 rows: 21
+> closed, 1 open, 1 `tracker`). `PERM-011`, `PERM-012` and `PERM-022` all closed this pass;
+> `PERM-032` is the only open row and is BLOCKED on a live provider call, though its cyrup-side
+> hypothesis has now been narrowed offline (see its row).
+>
+> **The "none of the four counted rows is area-10 work" routing was WRONG about `PERM-011`, and the
+> error is worth generalising.** Three consecutive reconciliations routed it to area 06 on the
+> premise that half A "needs a native-extension runtime-API registry so a second extension can call
+> `yolo_mode`/`set_yolo_mode`/`toggle_yolo_mode`", with "neither seam exists" as the reason not to
+> attempt it. Upstream's seam is not a registry: it is a single assignment to
+> `globalThis.__piPermissionSystem` (`yolo-mode-api.ts:20-43` @v0.8.0). A JS realm-global is a
+> host-specific FACILITY for "a process-global slot", and Rust has one — a `static`. The port landed
+> entirely inside `crates/cyrup-permission-system`. Half B *did* need a new seam, and it turned out
+> to be one default-implemented method on `HostServices` plus five lines in the builder — not a
+> subsystem. **Routing an item out of an area on a seam-shaped premise is only safe once the
+> upstream MECHANISM has been read at the tag; "the host lacks X" is a claim about cyrup that the
+> upstream citation may not even be asking for.**
+>
+> **Superseded — RECOUNTED 2026-08-14 (sweeps 7-8 reconciliation, third edition) — counted set UNCHANGED at 0 critical, 0 high, 2 medium, 2 low = 4** (23 rows: 18 closed, 4 open, 1 `tracker`). **Sweep 8 landed nothing here, and that is the correct outcome: all four remaining rows are routed out of this crate or blocked on something an agent must not do unilaterally.** Re-confirmed by reading, not re-derived:
 >
 > | row | verdict 2026-08-14 (sweep 8) |
 > |---|---|
@@ -167,20 +185,20 @@ Closed this pass: **10**. Reopened: **0**. Newly filed: **7**.
 | ID | Severity | Kind | Effort | Title |
 |---|---|---|---|---|
 | ~~PERM-009~~ | ~~**critical**~~ | parity-bug | S | **FIXED 2026-08-13** — bash arm deleted; the bypass no longer reproduces in the shipped binary |
-| PERM-032 | low | *unclassified — lead* | M | A permission-**denied** tool result breaks the next provider request on `together/openai/gpt-oss-20b` (3/3), while two other models handle it fine — **new, observed 2026-08-13, low confidence** — **2026-08-14, still open**: sweep 1 + 2 — unclassified, and unchanged for the same reason both passes gave: the item forbids scheduling work before a decisive experiment that requires a live provider call, and TOGETHER_API_KEY/TOGETHER_AI_API_KEY are exported in this environment, so spawning the binary risks a real network call. Note `HookOutcome::Block` gained a `terminate` field (EXT-049) since it was filed, so the request-body diff must be re-baselined against the current block shape. |
+| PERM-032 | low | *unclassified — lead* | M | A permission-**denied** tool result breaks the next provider request on `together/openai/gpt-oss-20b` (3/3), while two other models handle it fine — **new, observed 2026-08-13, low confidence** — **2026-08-15, still open (BLOCKED), but NARROWED offline**: the item's suspicion is "the shape of the message cyrup synthesises to represent a denied tool call". That half can be checked without a network call, and it does not hold. `BeforeOutcome::Block` reaches `cyrup-agent`'s `immediate_error` (`agent.rs:1120-1136`, `:1156-1194`), which builds pi's `createErrorToolResult` verbatim — `content: [text(reason)]`, `details: {}` (the empty-object literal, AGENT-009), `usage: None`, `added_tool_names: []`, `is_error: true` — and a THROWING TOOL takes the sibling arm in `finalize` (`:1234-1240`) producing the **identical field set**. So a denied call and a failed `read` differ on the wire only in the TEXT of one content block, which is exactly the control the item reports as working. The remaining hypotheses are therefore about the CONTENT (the gate's denial sentence) or about Together-side gpt-oss-20b harmony handling — not about a divergent block-path shape. **Still blocked on the live half** (dump the real request body for the turn after a block on that model), for the reason three prior sweeps gave: `TOGETHER_API_KEY`/`TOGETHER_AI_API_KEY` are exported here, so spawning the binary risks a real network call. — **2026-08-14**: sweep 1 + 2 — unclassified, and unchanged for the same reason both passes gave: the item forbids scheduling work before a decisive experiment that requires a live provider call, and TOGETHER_API_KEY/TOGETHER_AI_API_KEY are exported in this environment, so spawning the binary risks a real network call. Note `HookOutcome::Block` gained a `terminate` field (EXT-049) since it was filed, so the request-body diff must be re-baselined against the current block shape. |
 | ~~PERM-023~~ | ~~high~~ **CLOSED 2026-08-14** | cyrup-original | S | Install probe ignores agent-scoped `permission:` frontmatter the manager enforces — the gate never attaches — **CLOSED 2026-08-14**: sweep 1 — the area's remaining `high`. `is_installed` now recognises a non-empty `<policy_dir>/agents/` or `<cwd>/.cyrup/agent/agents/`; helper `dir_has_entry`; tests `agent_markdown_frontmatter_alone_installs_the_gate` + `project_scoped_agent_markdown_also_installs_the_gate`. The item's line citations were correct in substance but the numbers have shifted. |
 | ~~PERM-007~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | `/permission-system` renders text where upstream opens a live settings overlay — **CLOSED 2026-08-14**: sweep 2 — the recorded blocker is DISCHARGED. `config-modal.ts` ported as `crates/cyrup-permission-system/src/config_modal.rs`: (1) a `ConfigController` carrying pi's own `{getConfig, setConfig, getConfigPath}` (config-modal.ts:8-12, registered index.ts:1504-1511), with the BODY of `save_extension_config` moved onto it verbatim (normalize → write → only then touch memory) and the extension delegating, so there is ONE implementation of the ordering contract; `last_config_warning` became `Arc<Mutex<..>>` so the controller clears the same memo. (2) `PermissionSystemSettingsOverlay` implementing `cyrup_ext::host::overlay::InteractiveOverlay`, porting `SettingsList` with upstream's verbatim strings — wrapping navigation, Enter OR Space cycling the ON_OFF ring, Esc cancel, the `enableSearch` label filter that resets selection, the scroll indicator, the wrapped description and hint lines — and `run_permission_system_command`'s bare arm now calls `HostServices::open_overlay`, with the text dump surviving only as pi's own `if (!ctx.hasUI)` fallback. The commit loop is pi's literally, including the unconditional `current = controller.getConfig()` re-read that makes a refused write snap the row back. **STRIKE the item's remark that the seam is unreachable — `open_overlay` was reachable all along.** One `[CYRUP-DELTA]`: pi notifies inline through `ctx.ui.notify` while the modal is on screen; cyrup's overlay is handed to the host BY VALUE, so a `last_error` slot on the controller raises the same single error toast one frame later. |
 | ~~PERM-008~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | The forwarding path writes no audit entries — 8 review + 3 debug sites unported — **CLOSED 2026-08-14**: sweep 1 + 2 — sweep 1 landed the mechanism: a new `logging::AuditTrail` porting pi's MODULE-SCOPE `extensionLogger`/`reportedLoggingWarnings`/`loggingWarningReporter` trio (index.ts:160-164), held as an `Arc` by the extension, the `ForwardingAskChannel` and the watcher; eleven sites. Sweep 2 discharged the outstanding Verify recipe with `src/tests/forwarding_audit_trail.rs`, which reads the JSONL back and asserts the entries LAND, in order, on the right stream, with upstream's per-entry shapes. **⚠ AMENDED 2026-08-14 (sweep 6) — THE "REFUTED ONE THIRD OF THE RECIPE" CONCLUSION IS ITSELF WRONG, AND THE TEST IT PRODUCED PINNED CYRUP-INVENTED SILENCE.** The OBSERVATION about the caller is accurate and is kept: pi's `if (!request) { safeDeleteFile(...); continue; }` at v0.8.0 `index.ts:1144-1147` carries no log call above it, unlike every branch below. **The conclusion drawn from it is struck:** upstream raises the entry ONE FRAME DOWN, inside `readForwardedPermissionRequest` — `Failed to read forwarded permission request '{path}'` in its catch (`:942`) and `Ignoring invalid forwarded permission request format in '{path}'` when well-formed JSON fails the field ladder (`:928`). Upstream is NOT silent. The test `an_off_session_request_warns_while_a_malformed_one_is_deleted_silently` had frozen cyrup's silence in place as if it were parity; it is now `an_off_session_request_and_a_malformed_one_each_warn`, asserting TWO warnings in scan order and pinning the `error`-key presence/absence per call site, with the reasoning recorded so the inversion is not re-applied. **No assertion was weakened — it was widened from one entry to two.** This is the worked example for the Citation-hazard section: **reading the CALLER and not the CALLEE produced a wrong pin that then had to be un-pinned; an ABSENCE claim is only as good as the frame depth of the citation behind it.** The census gap this exposed is filed as **`PERM-033`**. |
 | ~~PERM-033~~ | ~~medium~~ **FILED AND CLOSED 2026-08-14** | not-ported | S | Sixteen of upstream's twenty-eight forwarding audit sites are unported, so every filesystem and binding failure on the spool path is silent — **FILED AND CLOSED 2026-08-14**: sweep 6, found by the assigned pi-permission-system v0.7.1→v0.8.0 delta sweep. `PERM-008` landed the `AuditTrail` mechanism and ELEVEN forwarding call sites; upstream has ~28, and sixteen error paths in `crates/cyrup-permission-system/src/forwarding.rs` swallowed their failure silently. **The missing set:** the fs helpers (chmod / mkdir / inspect / rmdir / unlink), BOTH reader diagnostics, and BOTH response-binding rejections. **The last of those is the security-relevant one** — a forged or misaddressed response was discarded leaving only an all-null `response_received` entry, so nothing named it. Ported, each as pi's literal string: `set_restrictive_mode` now takes a description and warns `Failed to restrict {description} permissions for '{path}'` (`:746-752`); new `ensure_directory_exists` warns/errors `Failed to create {description} directory '{path}'` (`:754-763`); `ensure_location` rewritten onto it with pi's three literal descriptions AND **pi's non-short-circuiting evaluation** — `:803-805` are three unconditional bindings ANDed at `:808`, so a broken spool reports ALL THREE causes, which `Iterator::all` would have reduced to one (hence a fold); new `try_remove_directory_if_empty` warns `Failed to inspect …` / `Failed to remove empty …` while ignoring ENOENT/ENOTEMPTY (`:823-849`, `:851-855`); new `safe_delete_file` warns `Failed to delete {description} file '{path}'` on non-ENOENT (`:857-867`), now backing both the temp cleanup in `write_json_atomic` (`:983-987`) and the malformed-request delete in `process_forwarded_requests`; new `response_is_bound_logged` raises pi's TWO distinct rejection warnings — `is not bound to request` / `does not match target session` (`:879-898`). `write_json_atomic`, `ensure_location` and `cleanup_location_if_empty` gained an `Option<&AuditTrail>` (pi's logger is module-scope; cyrup's is an owned handle and the crate's own tests hold none — every production path passes `Some`). `read_request`/`read_response` (`:906-948`, `:950-977`) kept their signatures for the out-of-crate caller in `cyrup-it` and gained `_with_audit` twins. Tests: `crates/cyrup-permission-system/src/tests/forwarding_audit_trail.rs::a_structurally_invalid_request_warns_about_its_format`, `::a_forged_and_a_misaddressed_response_are_each_named_in_the_trail`, plus the corrected `an_off_session_request_and_a_malformed_one_each_warn` (a deliberate RED→GREEN: it asserted ONE entry before the fix and TWO after — **if the gate goes red on that name, the fix did not take, rather than the test being wrong**). |
-| PERM-011 | medium | not-ported | M | Yolo runtime API has no publish seam; permission-request event channel absent — **2026-08-14, still open**: sweep 1 + 2 — unchanged. The named sub-defect (yolo_api.rs's false claim that the three methods are reached through the `/permission-system` command) is fixed; the doc now names the missing publish seam and the event channel as halves A and B. **Both halves land in cyrup-ext (area 06): half A needs a native-extension runtime-API registry so a second extension can call `yolo_mode`/`set_yolo_mode`/`toggle_yolo_mode`; half B needs an event accessor on `SharedBus`. Neither seam exists.** |
-| PERM-012 | medium | not-ported | M | `registerModelOptionCompatibilityGuard` (temperature stripping) has no cyrup counterpart — **2026-08-14, still open**: sweep 1 — citations refreshed to HEAD: openai_responses.rs:396-397, openai_codex_responses.rs:757-758, azure_openai_responses.rs:409-410, compat.rs:171 (`supports_temperature`), anthropic_messages.rs:256/:741 (its only consumers). |
+| ~~PERM-011~~ | ~~medium~~ **CLOSED 2026-08-15** | not-ported | M | Yolo runtime API has no publish seam; permission-request event channel absent — **CLOSED 2026-08-15**: BOTH halves, and **the routing note that sent this to area 06 was wrong about half A**. *Half A* — upstream's publish seam is not a host registry at all: `registerPiPermissionSystemRuntimeApi` writes ONE object into `globalThis.__piPermissionSystem` (`yolo-mode-api.ts:20-43` @v0.8.0), i.e. a process-global single slot. Rust has one — a `static` — so the faithful port needed nothing from `cyrup-ext`: new `crates/cyrup-permission-system/src/runtime_api.rs` (`PermissionSystemRuntimeApi` trait + `register_runtime_api`/`unregister_runtime_api`/`runtime_api()` over a `static Mutex<Option<Arc<dyn …>>>`), published from `init` at upstream's position (`index.ts:1481-1485`, one statement before the command registration) and retracted in the `SessionShutdown` arm (`:1868-1870`) **with pi's identity guard**, so session A's late shutdown cannot delete session B's registration. One `[CYRUP-DELTA]`: the published handle borrows the extension through a `Weak` (installed by the new `PermissionSystemExtension::into_shared`, which `permission_extension_for_env` now uses), so a call arriving after teardown reports `EXTENSION_GONE_ERROR` instead of answering from a stale copy — pi's closures cannot express that and would lie. *Half B* — `HostServices::emit_event` added to `cyrup-ext` (default no-op, outside every cfg, alongside the other late-bound seams), implemented by `LiveHostServices` over the host's ONE `SharedBus` (`attach_event_bus`, wired in `builder.rs` right after `ExtensionHost` is built and before the native load loop), and `PERMISSION_REQUEST_EVENT_CHANNEL` + `emit_permission_request_event` / `emit_permission_state_event` ported into `extension.rs`, fired at pi's three points (`:1606` yolo-approved, `:1612` waiting, `:1626` approved/denied). pi's `catch` → `permission_request.event_emit_failed` is kept for the one way a cyrup emit can be lost (no backend attached). Tests: `runtime_api.rs` (publish/read/flip, the stale-unregister identity guard, the argumentless clear) and `extension.rs::init_publishes_the_yolo_control_surface_and_shutdown_retracts_it` + `::a_gated_request_is_published_on_the_permission_request_channel`. **The stale in-tree docs the item named are corrected** (`yolo_api.rs`'s "not ported, and why", and `run_permission_system_command`'s "currently UNREACHABLE"). |
+| ~~PERM-012~~ | ~~medium~~ **CLOSED 2026-08-15** | not-ported | M | `registerModelOptionCompatibilityGuard` (temperature stripping) has no cyrup counterpart — **CLOSED 2026-08-15**: ported into `cyrup-provider` as the item's Fix directed. `api/compat.rs` gains `unsupported_temperature_reason` / `temperature_is_supported` — upstream's four arms in order with their verbatim reason strings, over `TEMPERATURE_UNSUPPORTED_APIS` / `TEMPERATURE_UNSUPPORTED_PROVIDERS` / `OPENAI_RESPONSES_APIS` and `hasModelToken`'s WHOLE-TOKEN split (`model-option-compatibility.ts:11-25,54-83` @v0.8.0) — and the three inserts are gated on it (`openai_responses.rs`, `azure_openai_responses.rs`, `openai_codex_responses.rs`). One `[CYRUP-DELTA]`, recorded on the function: pi wraps the api PROVIDER because a JS extension cannot reach the request builder (`:98-168`); cyrup owns the builder, so the key is simply not written, which also means the rule applies whether or not the permission extension is loaded. **A pre-existing test pinned the unguarded behaviour** — `openai_codex_responses.rs::optional_fields_appear_only_when_set` asserted `body["temperature"] == 0.25` on an api upstream never lets carry temperature; it now asserts absence and is the RED half. New tests: three arms + the `codexify` non-token control + the `openai-completions` scope control in `compat.rs`, and reasoning/non-reasoning pairs in both Responses builders. |
 | ~~PERM-014~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | Concurrent-duplicate ask collapse implemented in `dedup.rs` but never wired — **CLOSED 2026-08-14**: sweep 1 — `dedup.rs:13-16`'s module doc is now TRUE (it was the stale-doc instance the Citation-hazard section calls out). Test `two_concurrent_identical_asks_collapse_to_one_prompt`. Citations corrected to v0.8.0: :1580-1596 lookup, :1632-1634 remember, :1637 await, :1638-1642 catch (the item cites v0.7.1 offsets). |
-| ~~PERM-020~~ | ~~medium~~ **CLOSED 2026-08-14** | test-defect | S | Two env-mutating test sites still not serialized on a lock — **CLOSED 2026-08-14**: sweep 1 — BOTH sites. `ask.rs` takes `ext_config::env_lock()` for the whole test body; `tests/prompt_dedup.rs` got its own `static ENV_LOCK` + `env_guard()` taken by every test in the binary. The "Known incomplete-fix trap" note at the file's end is discharged. Remaining exposure recorded as a new gap: `tests/forwarding_persist.rs` still mutates `CYRUP_SUBAGENT_CHILD` unlocked and is safe only because it is a single-test binary. |
+| ~~PERM-020~~ | ~~medium~~ **CLOSED 2026-08-14** | test-defect | S | Two env-mutating test sites still not serialized on a lock — **CLOSED 2026-08-14**: sweep 1 — BOTH sites. `ask.rs` takes `ext_config::env_lock()` for the whole test body; `tests/prompt_dedup.rs` got its own `static ENV_LOCK` + `env_guard()` taken by every test in the binary. The "Known incomplete-fix trap" note at the file's end is discharged. Remaining exposure recorded as a new gap: `tests/forwarding_persist.rs` still mutates `CYRUP_SUBAGENT_CHILD` unlocked and is safe only because it is a single-test binary. **FOLLOW-ON CLOSED 2026-08-15** — that fix took the guards at the top of `async` test bodies, so all five `clippy::await_holding_lock` sites in the workspace were this item's own; the guards now live in a synchronous `with_env_lock` frame around `block_on`. See the PERM-020 section. |
 | ~~PERM-013~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | M | `before_agent_start` result caching not ported — **CLOSED 2026-08-14**: sweep 1 — new module `src/agent_start_cache.rs`; `PermissionManager::policy_cache_stamp` is now `pub` (as upstream's is at permission-manager.ts:781); `invalidate_agent_start_cache` is called from session_start, the resources_discover reload branch and session_shutdown. One `[CYRUP-DELTA]`: the cyrup-only registry-unavailable arm bypasses the cache rather than keying on an empty tool list. |
 | PERM-017 | **tracker** *(re-classified 2026-08-14 — revisit-trigger, not counted)* | not-ported | S | Forwarding-root agent-dir env overrides not ported (documented as deliberate) — **MOVED OUT OF THE COUNTED SET 2026-08-14**: sweep 6 — the row read as open work; the body is explicit that it is a **revisit trigger** ("No action while the middle levels remain meaningless", Verify "n/a until triggered"), which is the Trackers contract. Re-derived at the tag: `permission-forwarding.ts:62-92` @v0.8.0 resolves five levels, the three middle ones (`PI_DELEGATED_AUTH_RUNTIME_DIR`, `PI_MULTI_AUTH_RUNTIME_DIR`, `PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR`) all guarded by `options.isSubagent`, and the v0.7.1→v0.8.0 diff of that file is a pure `normalizeAgentName` extraction — **no level added or removed**. cyrup has no delegated/multi-auth runtime dir, so there is nothing to resolve. Leaving it counted overstated area 10's remaining work by 20%. |
 | ~~PERM-019~~ | ~~low~~ **CLOSED 2026-08-14** | cyrup-original | S | Install state inferred from a byte-exact template comparison — **CLOSED 2026-08-14**: sweep 1. |
 | ~~PERM-021~~ | ~~low~~ **CLOSED 2026-08-14** | test-defect | S | PERM-003 test's re-arm assertion covers only the policy warning — **CLOSED 2026-08-14**: sweep 1. |
-| PERM-022 | low | test-defect | S | Spool test's child bound is shorter than the poll window — **2026-08-14, still open**: sweep 1 — RETARGETED: the file moved to `crates/cyrup-it/tests/permission/forwarding_spawn_env.rs` and the 8_000 is now at :288 (sibling 20_000 at :345). Ownership follows the code, so this is now a cyrup-it item. |
+| ~~PERM-022~~ | ~~low~~ **CLOSED 2026-08-15** | test-defect | S | Spool test's child bound is shorter than the poll window — **CLOSED 2026-08-15**: **verified ALREADY FIXED at HEAD, no edit needed** — the row was stale, not the code. `crates/cyrup-it/tests/permission/forwarding_spawn_env.rs:295` spawns the child with `20_000` (matching its sibling at `:361`) and carries a `PERM-022:` comment at `:292` giving the reason ("its own bound has to outlive that window by construction"); `grep '8_000'` over the file returns nothing. `crates/cyrup-it/tests/permission/main.rs:10` and `forwarding_common.rs:7` both record the 8 000-vs-20 000 divergence as the thing this item came out of. Note `cyrup-it` is `required-features = ["it"]` and **does not currently compile** for reasons unrelated to this item (`RunOptions`/`RunnerConfig`/`BackgroundStepsSpec` gained `usage_budget`, `steer_ack_dir`, `steer_capability_path` in other crates and the fixtures were not updated — 35 `E0063`s across the permission/intercom/subagents binaries). That is a separate, unfiled cyrup-it gap. |
 | ~~PERM-024~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | Extension config not refreshed on `before_agent_start` — **CLOSED 2026-08-14**: sweep 1 — `refresh_config_and_manager` was SPLIT as the item's own Fix suggested: the BeforeAgentStart arm calls the config half only (`refresh_extension_config`), matching pi's `refreshExtensionConfig`, so the per-turn manager rebuild the item worried about does not happen and PERM-013's cache survives. |
 | ~~PERM-025~~ | ~~low~~ **CLOSED 2026-08-14** | not-ported | S | Policy-root env override `PI_PERMISSION_SYSTEM_POLICY_AGENT_DIR` has no cyrup analog — **CLOSED 2026-08-14**: sweep 1 — `extension::POLICY_AGENT_DIR_ENV_KEY` = `CYRUP_PERMISSION_SYSTEM_POLICY_AGENT_DIR`, helper `policy_agent_dir`, routed through both `manager_paths_for`'s four global paths and `is_installed`'s global probe. Retires the item's scope note against PERM-017: the two no longer share a hole. |
 | ~~PERM-026~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | A `resources_discover` reload never re-syncs the yolo status pill — **CLOSED 2026-08-14**: sweep 1 — the status sync moved into the new `refresh_extension_config` at pi's exact position inside `applyExtensionConfigSideEffects` (status → warning memo → config.loaded), and the now-duplicate syncs were removed from BOTH the SessionStart arm and `on_before_agent_start` (the item only anticipated the first). |
@@ -341,6 +359,50 @@ Neither tag has a bash branch. So cyrup's branch is an **in-baseline parity bug,
 
 ## PERM-011 — Yolo runtime API has no publish seam; permission-request event channel absent
 
+> ## CLOSED 2026-08-15 — both halves, and the routing was wrong about half A
+>
+> **Half A did not need `cyrup-ext` at all.** Three reconciliation blocks routed this item out of
+> area 10 on the premise that it "needs a native-extension runtime-API registry". Read at the tag,
+> upstream's publish seam is not a registry: `registerPiPermissionSystemRuntimeApi` assigns ONE
+> object to `globalThis.__piPermissionSystem` and `getPiPermissionSystemRuntimeApi` reads it back
+> (`yolo-mode-api.ts:20-43` @v0.8.0). `globalThis` is JavaScript's spelling of *a process-global*,
+> and every consumer in cyrup is in the same process, so the faithful port is a `static` in this
+> crate — `crates/cyrup-permission-system/src/runtime_api.rs`. This is the generalisable lesson from
+> the citation-hazard list: **an item routed away as "needs a host seam" deserves the upstream
+> mechanism read first — a host-specific FACILITY (a JS realm global) is not the mechanism.**
+>
+> - Published from `init` at pi's position (`index.ts:1481-1485`, immediately before the command
+>   registration) and retracted in the `SessionShutdown` arm (`:1868-1870`), carrying pi's
+>   **identity guard** so a late shutdown from a finished session cannot delete the registration a
+>   newer session installed over it.
+> - One `[CYRUP-DELTA]`: the published handle borrows the extension through a `Weak`
+>   (`PermissionSystemExtension::into_shared`, now used by `permission_extension_for_env`), so a
+>   call arriving after teardown reports `EXTENSION_GONE_ERROR` rather than answering out of a
+>   captured copy. pi's closures keep their captured state alive and would answer from it.
+>
+> **Half B** needed one genuinely new seam, and it is one line of trait surface, not a subsystem:
+> `HostServices::emit_event` (default no-op) in `cyrup-ext`, implemented by `LiveHostServices` over
+> the host's ONE `SharedBus` (`attach_event_bus`, wired in `builder.rs` immediately after the
+> `ExtensionHost` is built — the ordering is forced, since the host takes the backend — and before
+> the native load loop). It sits outside every cfg for the same reason `bus.rs` does: which tier an
+> extension runs in is not something the coordination channel may know. On top of it,
+> `PERMISSION_REQUEST_EVENT_CHANNEL` (rebranded `cyrup-permission-system:permission-request`),
+> `emit_permission_request_event` (with pi's `catch` → `permission_request.event_emit_failed`) and
+> `emit_permission_state_event`, fired at pi's three points: `:1606` (yolo auto-approved), `:1612`
+> (waiting, before the dialog opens) and `:1626` (approved/denied).
+>
+> **Tests.** `runtime_api.rs`: publish → read → flip through the module path alone; the stale-
+> unregister identity guard; the argumentless clear. `extension.rs`:
+> `init_publishes_the_yolo_control_surface_and_shutdown_retracts_it` (the load-bearing assertion is
+> that a flip through the PUBLISHED handle moves the config the gate reads) and
+> `a_gated_request_is_published_on_the_permission_request_channel` (topic, state, and the full
+> payload projection including the `null`-for-`undefined` mapping). Both were red pre-fix in the
+> strongest sense available: the symbols did not exist.
+>
+> **Stale in-tree docs corrected**, as the item's Fix asked: `yolo_api.rs`'s "What is NOT ported,
+> and why" block, and `run_permission_system_command`'s "currently UNREACHABLE … `cyrup-ext` has no
+> extension-provided-API registry".
+
 **Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
 
 **cyrup** — The methods exist as inherent methods on the extension: `extension.rs:608` `yolo_mode` (pi `index.ts:1481`), `:628` `set_yolo_mode` (pi `setYoloModeFromRuntimeApi`, `index.ts:1421-1468` — cyrup reproduces the persist-failure invariant: on save failure the live config is untouched and `changed:false, persisted:false` is returned), `:693` `toggle_yolo_mode`, with the option/result shapes in `yolo_api.rs`. **Open half A**: there is no publish seam, so `set_yolo_mode`'s only caller is `toggle_yolo_mode` (`:694`) and `toggle_yolo_mode` has none; `yolo_api.rs:7-19` admits this — and its claim at `:16` that the three methods are "reached through the `/permission-system` command" is contradicted by `extension.rs:721-728`, which routes the command through `save_extension_config` and never through `set_yolo_mode` (the same doc-asserts-wiring-that-does-not-exist pattern PERM-014 calls out). **Open half B**: the event channel is entirely absent — `grep -rn 'events.emit\|emit_event\|permission-request' crates/cyrup-permission-system/src` returns 0.
@@ -354,6 +416,41 @@ Neither tag has a bash branch. So cyrup's branch is an **in-baseline parity bug,
 **Verify** — From a second extension, toggle yolo mode and assert the next ask auto-approves; subscribe to the permission-request channel and assert an event is observed for a gated call, with a matching state event on the decision.
 
 ## PERM-012 — `registerModelOptionCompatibilityGuard` (temperature stripping) has no cyrup counterpart
+
+> ## CLOSED 2026-08-15
+>
+> Landed in `cyrup-provider`, as the item's Fix directed. `api/compat.rs` gains
+> `unsupported_temperature_reason` — upstream's `getUnsupportedTemperatureReason`
+> (`model-option-compatibility.ts:62-83` @v0.8.0) arm for arm, in order, with the four reason
+> strings verbatim — over ported `TEMPERATURE_UNSUPPORTED_APIS` / `TEMPERATURE_UNSUPPORTED_PROVIDERS`
+> / `OPENAI_RESPONSES_APIS` (`:11-25`) and `hasModelToken` (`:58-60`), plus the
+> `temperature_is_supported` predicate the three builders call. The inserts at
+> `openai_responses.rs`, `azure_openai_responses.rs` and `openai_codex_responses.rs` are gated on it.
+>
+> **The token split is load-bearing and is tested as such.** `hasModelToken` splits the lowercased
+> id on runs of non-`[a-z0-9]` and compares WHOLE tokens, so `gpt-5.5-codex` strips and `codexify-4`
+> does not; a `contains()` reading would silently strip temperature from an unrelated model.
+> `normalizeIdentifier` also trims+lowercases the provider for the LOOKUP while the reported string
+> quotes the RAW `model.provider` (`:70-72`) — asserted, because it is the kind of asymmetry a
+> tidy-up would erase.
+>
+> **`[CYRUP-DELTA]` — the seam, not the rule.** pi cannot edit the request body from inside an
+> extension, so it re-registers each guarded api with a wrapping `streamSimple` that blanks
+> `options.temperature` and installs an `onPayload` stripper (`:89-168`), lazily from
+> `index.ts:1485-1497` and awaited as the first statement of `session_start` (`:1829`). That is a
+> host-specific facility, not the mechanism; cyrup owns the builder, so the key is simply never
+> written. The wire bodies are identical. The one observable difference is that cyrup applies the
+> rule whether or not the permission-system extension is loaded, where pi applies it only once that
+> extension has activated — a user could notice only by unloading the permission system and getting
+> the provider's 400 back, which is not a behaviour worth reproducing.
+>
+> **A pre-existing test pinned the unguarded behaviour and is the RED half.**
+> `openai_codex_responses.rs::optional_fields_appear_only_when_set` asserted
+> `body["temperature"] == 0.25` on an api that is in upstream's `TEMPERATURE_UNSUPPORTED_APIS`; it
+> now asserts the key is absent. New: the four arms + the `codexify` non-token control + the
+> `openai-completions` scope control (`compat.rs`), and reasoning/non-reasoning pairs in both
+> Responses builders — the non-reasoning half exists so "temperature is gone" cannot pass by the
+> builder having stopped emitting the key at all.
 
 **Kind** not-ported · **Severity** medium · **Effort** M · **Confidence** high
 
@@ -437,6 +534,58 @@ Neither tag has a bash branch. So cyrup's branch is an **in-baseline parity bug,
 
 **Verify** — Run the crate's unit and integration tests repeatedly at high `--test-threads`, ideally under `cargo +nightly miri` or with `RUST_BACKTRACE` env-race instrumentation; assert no order-dependent failures and no unsynchronized `setenv`/`getenv` pairing remains (grep `src/ tests/` for `set_var`/`remove_var` and check each for a held lock).
 
+> ## FOLLOW-ON CLOSED 2026-08-15 — the fix's guards were held across `.await`; moved to a synchronous frame
+>
+> **The five `clippy::await_holding_lock` sites in the whole workspace were all this item's.** The
+> 2026-08-14 fix took `env_lock()` (and the new `tests/prompt_dedup.rs` `ENV_LOCK`) at the **top of
+> `async` test bodies**, which stores a `std::sync::MutexGuard` in the generated future's state.
+> Re-derived at HEAD from `cargo clippy -p cyrup-permission-system --all-targets`: `src/ask.rs:486`,
+> `src/extension.rs:4054`, `tests/prompt_dedup.rs:163`, `:225`, `:331`.
+>
+> **REFUTED — the framing that these are production paths.** All five are test-only. `env_lock()`
+> (`ext_config.rs:767-771`) is `#[cfg(test)]`, so it **does not exist** in a non-test build and no
+> shipped code path can take it; the `src/` sites are inside `#[cfg(test)] mod tests` (clippy reports
+> them only against the *lib test* target, never the lib). There is **no re-entrancy hazard on the
+> prompt or forwarding path**, and the reason is that PERM-014 already closed it deliberately:
+> `prompt_decision` (`extension.rs:1808-1818`) calls `DedupCache::lookup`, which returns an **owned**
+> `Lookup::Pending`, so the `dedup` mutex is released before `pending.wait().await` — the code even
+> says so at `:1816-1817`. `PendingOwner` (`dedup.rs:170-201`) holds the sole `watch::Sender`, so a
+> future cancelled mid-dialog closes the channel on drop and every follower fails **closed** instead
+> of parking forever — the `Drop`/`watch` shape rule 10 asks for, already present. pi has no locks
+> because JS has no cancellation at an `await`; cyrup's extra machinery is the correct translation,
+> not a divergence.
+>
+> **Still fixed, because the test-side hazard is real.** A `std::sync::Mutex` is not reentrant and
+> has no deadlock detection, and a guard stored in a future is released only when the runtime drops
+> that future — including down cancellation paths no test wrote. That converts a test failure into a
+> **hung binary**, which is strictly worse. The guard also made every one of those futures `!Send`.
+>
+> **Fix** — one helper, `ext_config::with_env_lock` (`ext_config.rs`, beside `env_lock` so the same
+> lock instance serializes every module), taking the guard in the synchronous frame around
+> `block_on`. `extension.rs`'s existing `with_config_env_lock` — which had documented exactly this
+> reasoning and measured it (8 failures in 300 runs before the lock, 0 in 300 after) — is now a thin
+> delegate, and the five sites were split into `#[test] fn X() { with_env_lock(X_body()) }` +
+> `async fn X_body()`. `tests/prompt_dedup.rs` gets the same shape over its own `ENV_LOCK`
+> (crate-private `env_lock` is unreachable from an integration binary) and `env_guard()` is gone.
+> **The lock spans exactly what it did before** — every `.await` in every body still runs under it,
+> which it must, because the gate calls `getenv` on the decision path. Only where the guard *lives*
+> changed. The runtime is `new_current_thread`, which is what `#[tokio::test]` built anyway, so
+> `two_concurrent_identical_asks_collapse_to_one_prompt`'s `tokio::spawn` + `settle()` determinism is
+> unchanged. **No `#[allow]` was added.**
+>
+> **Red before, at COMPILE time** — `the_env_locked_body_does_not_carry_the_guard_across_its_await`
+> (`src/ask.rs`), `the_env_locked_body_does_not_carry_the_guard_across_its_awaits`
+> (`src/extension.rs`) and `env_locked_bodies_do_not_carry_the_guard_across_their_awaits`
+> (`tests/prompt_dedup.rs`) apply `fn assert_send<F: Send>(_: F)` to each body's future. This is not
+> a proxy for the fix, it *is* the fix: `MutexGuard` is `!Send`. **Measured**, by reinstating the old
+> shape in `tests/prompt_dedup.rs` and re-running clippy: `error: future cannot be sent between
+> threads safely ... the trait Send is not implemented for std::sync::MutexGuard<'_, ()> ... note:
+> future is not Send as this value is used across an await`. Reverted; the file is byte-identical to
+> the committed version.
+>
+> **Verified** — `cargo clippy --workspace --all-targets`: `await_holding_lock` **5 → 0**, 0 errors.
+> Per the task rules the suite itself was not run.
+
 ## PERM-021 — PERM-003 test's re-arm assertion covers only the policy warning
 
 **Kind** test-defect · **Severity** low · **Effort** S · **Confidence** high
@@ -452,6 +601,24 @@ Neither tag has a bash branch. So cyrup's branch is an **in-baseline parity bug,
 **Verify** — Break only the policy file and assert the config-channel assertion fails; break only `config.json` after a clean load and assert the config assertion fires.
 
 ## PERM-022 — Spool test's child bound is shorter than the poll window
+
+> ## CLOSED 2026-08-15 — verified already fixed at HEAD; the ROW was stale, not the code
+>
+> No edit was made, and none was needed. At HEAD
+> `crates/cyrup-it/tests/permission/forwarding_spawn_env.rs:295` reads
+> `spawn_child(agent_dir.path(), &parent_id, &sentinel, 20_000)`, matching its sibling at `:361`,
+> with a `PERM-022:` comment at `:292` recording the reason. `grep '8_000'` over the file returns
+> nothing, and both `main.rs:10` and `forwarding_common.rs:7` name the 8 000-vs-20 000 divergence as
+> the thing this item came out of. The three prior reconciliation blocks that carried this row
+> forward as open (and re-derived its line numbers) were reading a fix that had already landed.
+>
+> **Unrelated finding, recorded so it is not lost:** `cyrup-it` is `required-features = ["it"]`, so
+> the gate never builds it — and it **does not currently compile**. `cargo check -p cyrup-it
+> --features it --all-targets` reports 35 `E0063`s: `RunOptions` is missing `steer_ack_dir`,
+> `steer_capability_path` and `usage_budget`, `RunnerConfig` and `BackgroundStepsSpec` are missing
+> `usage_budget`, across the `permission`, `intercom` and `subagents` binaries. None of it is
+> area-10 work and none of it is caused by this pass; it is the predictable cost of a test tier the
+> gate does not build.
 
 **Kind** test-defect · **Severity** low · **Effort** S · **Confidence** high
 
@@ -686,4 +853,4 @@ change and two deliberate non-changes:
 
 **Taken on trust / uncheckable.** `spec/` is absent from this workspace, so PERM-019's install-probe design cannot be checked against a requirement of record — absence was treated as neither confirming nor refuting. ~~The PERM-009 half of this note — "if a mandate really requires `bash` to stay exposed under a tool-level deny, someone must say so and say what re-gates execution" — was flagged as **the one open question in the area that needs a human**.~~ **Resolved 2026-08-13 by deletion, no human needed:** `docs/adr/ADR-0008` retires `R-NN-NNN`/`spec/` citations as authority outright, and its OQ-6 found the branch justified by a prose phrase rather than any requirement text. The branch is gone, so nothing needs to re-gate execution — `bash` is no longer exposed under a tool-level deny. PERM-025's fail-open consequence is reasoned from `is_installed`'s structure and was **downgraded** on that basis: no cyrup deployment can relocate the policy root while the key is unread, and no spawn site writes an isolated `CYRUP_AGENT_DIR`, so there is no trigger today.
 
-**Known incomplete-fix trap.** PERM-020 names two sites in different compilation units (`src/ask.rs` and `tests/prompt_dedup.rs`); a patch that touches only `ask.rs` will look closed while the integration-binary site remains, and the other nine integration-test binaries were **not** swept for the same unlocked-`set_var` shape — only those grep surfaced.
+**Known incomplete-fix trap.** PERM-020 names two sites in different compilation units (`src/ask.rs` and `tests/prompt_dedup.rs`); a patch that touches only `ask.rs` will look closed while the integration-binary site remains, and the other nine integration-test binaries were **not** swept for the same unlocked-`set_var` shape — only those grep surfaced. **Both named sites are closed (2026-08-14) and the follow-on defect the fix introduced is closed too (2026-08-15, `await_holding_lock`, see the PERM-020 section).** The trap generalises, and the generalisation is the part worth keeping: *a fix that adds a lock to serialize tests is not finished when the lock is added.* Where the guard is taken decides whether it can be held across an `.await`, and the shape that reads most naturally — `let _g = lock();` at the top of an `async` test body — is the wrong one. Take it in a synchronous frame around `block_on` (`ext_config::with_env_lock`). The unswept exposure is unchanged: `tests/forwarding_persist.rs` still mutates `CYRUP_SUBAGENT_CHILD` unlocked, and any new lock added there must use `with_env_lock`'s shape, not `env_guard()`'s old one.

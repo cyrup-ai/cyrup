@@ -18,6 +18,7 @@ mod custom_tool_render;
 mod delete_session_file_trash;
 mod dispose_invalidates;
 mod fork_non_persisted;
+mod get_commands_source_info;
 mod fork_parent_and_unsaved_guard;
 mod install_noop;
 mod late_seams;

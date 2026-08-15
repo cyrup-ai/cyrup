@@ -31,7 +31,7 @@ mod tests;
 
 pub use error::ModesError;
 pub use json::run_json;
-pub use json_event::{to_json_event, JsonAgentSessionEvent};
+pub use json_event::{is_upstream_wire_event, to_json_event, JsonAgentSessionEvent};
 pub use print::{run_print, PrintOptions};
 pub use raw_stdout::{flush_raw_stdout, write_raw_stdout, RAW_STDOUT_RETRY_DELAY_MS};
 pub use rpc::{run_rpc, QueueModeArg, RpcOut, RpcResponse, SessionCommand};

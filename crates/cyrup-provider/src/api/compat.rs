@@ -771,6 +771,103 @@ pub fn sanitize_surrogates(text: &str) -> String {
     text.to_string()
 }
 
+// --- model-option compatibility: temperature (PERM-012) ---------------------------------------
+//
+// A 1:1 port of `pi-permission-system/src/model-option-compatibility.ts` @v0.8.0 (`9affcc9`) —
+// upstream's `TEMPERATURE_UNSUPPORTED_APIS` / `TEMPERATURE_UNSUPPORTED_PROVIDERS` /
+// `OPENAI_RESPONSES_APIS` (`:11-25`), `normalizeIdentifier` (`:54-56`), `hasModelToken`
+// (`:58-60`) and `getUnsupportedTemperatureReason` (`:62-83`).
+//
+// **[CYRUP-DELTA] — the seam, not the rule.** Upstream cannot edit the request body from inside an
+// extension, so it wraps the api provider: `registerModelOptionCompatibilityGuard` (`:164-168`)
+// re-registers each guarded api with a `streamSimple` that blanks `options.temperature` and
+// installs an `onPayload` hook running `stripUnsupportedTemperatureFromPayload` (`:89-96`,
+// `:98-124`), lazily from `index.ts:1485-1497` and awaited first thing in `session_start`
+// (`:1829`). That indirection exists only because pi's permission-system is a JS package with no
+// access to the request builder; it is a HOST-SPECIFIC FACILITY, not the mechanism. cyrup owns the
+// builder, so the same rule is applied where the key is written — the three `*_responses.rs` body
+// builders gate their `temperature` insert on [`unsupported_temperature_reason`]. The wire bodies
+// are identical; what differs is that cyrup applies it whether or not the permission-system
+// extension is loaded, where pi applies it only once that extension has run `session_start`. A
+// user cannot notice the difference except by unloading the permission system and getting pi's
+// provider error back, which is not a behaviour worth reproducing.
+
+/// `TEMPERATURE_UNSUPPORTED_APIS` (`model-option-compatibility.ts:20-22` @v0.8.0) — apis that never
+/// accept `temperature`, whatever the model.
+const TEMPERATURE_UNSUPPORTED_APIS: &[&str] = &[crate::known_api::OPENAI_CODEX_RESPONSES];
+
+/// `TEMPERATURE_UNSUPPORTED_PROVIDERS` (`model-option-compatibility.ts:23-25` @v0.8.0).
+const TEMPERATURE_UNSUPPORTED_PROVIDERS: &[&str] = &["openai-codex"];
+
+/// `OPENAI_RESPONSES_APIS` (`model-option-compatibility.ts:16-19` @v0.8.0) — the two Responses apis
+/// on which the per-MODEL rules (a `codex` id token, or a reasoning model) apply.
+const OPENAI_RESPONSES_APIS: &[&str] = &[
+    crate::known_api::OPENAI_RESPONSES,
+    crate::known_api::AZURE_OPENAI_RESPONSES,
+];
+
+/// `normalizeIdentifier` (`model-option-compatibility.ts:54-56` @v0.8.0).
+fn normalize_identifier(value: &str) -> String {
+    value.trim().to_lowercase()
+}
+
+/// `hasModelToken` (`model-option-compatibility.ts:58-60` @v0.8.0):
+/// `normalizeIdentifier(modelId).split(/[^a-z0-9]+/).includes(token)`.
+///
+/// The split is on runs of non-`[a-z0-9]`, so the match is on a whole TOKEN — `gpt-5.5-codex`
+/// matches `codex`, `codexify` does not. Rust's `split` on a char predicate yields the same pieces
+/// (including the empty leading/trailing ones a JS regex split produces, which cannot equal a
+/// non-empty token either way).
+fn has_model_token(model_id: &str, token: &str) -> bool {
+    normalize_identifier(model_id)
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|piece| piece == token)
+}
+
+/// `getUnsupportedTemperatureReason(model)` (`model-option-compatibility.ts:62-83` @v0.8.0).
+///
+/// `Some(reason)` means the outgoing request body must omit `temperature` entirely; the string is
+/// upstream's verbatim (it is user-facing nowhere in cyrup today, but it is the reason of record
+/// and diverging from it would make the two implementations impossible to diff).
+pub fn unsupported_temperature_reason(model: &Model) -> Option<String> {
+    let api = model.api.as_str();
+    if TEMPERATURE_UNSUPPORTED_APIS.contains(&api) {
+        return Some(format!("api '{api}' does not support temperature"));
+    }
+
+    let provider = normalize_identifier(model.provider.as_str());
+    if TEMPERATURE_UNSUPPORTED_PROVIDERS.contains(&provider.as_str()) {
+        // pi reports the RAW provider here (`model.provider`), not the normalized one (`:71`).
+        return Some(format!(
+            "provider '{}' does not support temperature",
+            model.provider.as_str()
+        ));
+    }
+
+    if OPENAI_RESPONSES_APIS.contains(&api) && has_model_token(model.id.as_str(), "codex") {
+        return Some(format!(
+            "model '{}' does not support temperature",
+            model.id.as_str()
+        ));
+    }
+
+    if OPENAI_RESPONSES_APIS.contains(&api) && model.reasoning {
+        return Some(format!(
+            "reasoning model '{}' accepts only the provider default temperature",
+            model.id.as_str()
+        ));
+    }
+
+    None
+}
+
+/// `stripUnsupportedTemperatureFromPayload` composed with the guard
+/// (`model-option-compatibility.ts:89-124` @v0.8.0), expressed as the predicate a body builder
+/// wants: may this request carry `temperature` at all?
+pub fn temperature_is_supported(model: &Model) -> bool {
+    unsupported_temperature_reason(model).is_none()
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -1083,5 +1180,123 @@ mod tests {
         let long = "a".repeat(100);
         assert_eq!(clamp_openai_prompt_cache_key(&long).chars().count(), 64);
         assert_eq!(clamp_openai_prompt_cache_key("short"), "short");
+    }
+
+    // --- PERM-012: `getUnsupportedTemperatureReason` (`model-option-compatibility.ts:62-83`
+    // @v0.8.0). Every arm, in upstream's order, with its verbatim reason string — the strings are
+    // what make the two implementations diffable, so they are asserted rather than just the
+    // Some/None. Red at HEAD~: the whole function did not exist.
+
+    fn temp_model(api: &str, provider: &str, id: &str, reasoning: bool) -> Model {
+        Model {
+            api: api.into(),
+            provider: provider.into(),
+            id: id.into(),
+            reasoning,
+            ..base_model(provider, "", id)
+        }
+    }
+
+    #[test]
+    fn the_codex_responses_api_never_supports_temperature() {
+        let m = temp_model(
+            crate::known_api::OPENAI_CODEX_RESPONSES,
+            "openai-codex",
+            "gpt-5.5-codex",
+            false,
+        );
+        assert_eq!(
+            unsupported_temperature_reason(&m).as_deref(),
+            Some("api 'openai-codex-responses' does not support temperature")
+        );
+        assert!(!temperature_is_supported(&m));
+    }
+
+    /// The provider arm fires even on an api that is NOT in either api set — upstream checks the
+    /// provider unconditionally (`:69-72`), after the api check and before the two Responses-only
+    /// rules.
+    #[test]
+    fn the_openai_codex_provider_never_supports_temperature() {
+        let m = temp_model(
+            crate::known_api::OPENAI_COMPLETIONS,
+            "openai-codex",
+            "some-model",
+            false,
+        );
+        assert_eq!(
+            unsupported_temperature_reason(&m).as_deref(),
+            Some("provider 'openai-codex' does not support temperature")
+        );
+    }
+
+    /// `normalizeIdentifier` trims + lowercases the provider for the LOOKUP, while the reported
+    /// string is the RAW `model.provider` (`:70-72`).
+    #[test]
+    fn the_provider_lookup_normalizes_but_the_reason_quotes_the_raw_id() {
+        let m = temp_model(
+            crate::known_api::OPENAI_COMPLETIONS,
+            "  OpenAI-Codex ",
+            "some-model",
+            false,
+        );
+        assert_eq!(
+            unsupported_temperature_reason(&m).as_deref(),
+            Some("provider '  OpenAI-Codex ' does not support temperature")
+        );
+    }
+
+    #[test]
+    fn a_codex_token_in_the_id_strips_on_both_responses_apis() {
+        for api in [
+            crate::known_api::OPENAI_RESPONSES,
+            crate::known_api::AZURE_OPENAI_RESPONSES,
+        ] {
+            let m = temp_model(api, "openai", "gpt-5.5-codex", false);
+            assert_eq!(
+                unsupported_temperature_reason(&m).as_deref(),
+                Some("model 'gpt-5.5-codex' does not support temperature"),
+                "api {api}"
+            );
+        }
+    }
+
+    /// `hasModelToken` splits on runs of non-`[a-z0-9]` and compares WHOLE tokens (`:58-60`), so a
+    /// model whose id merely CONTAINS the substring is untouched. A `contains()` implementation
+    /// would silently strip temperature from it.
+    #[test]
+    fn a_codex_substring_that_is_not_a_token_does_not_strip() {
+        let m = temp_model(
+            crate::known_api::OPENAI_RESPONSES,
+            "openai",
+            "codexify-4",
+            false,
+        );
+        assert_eq!(unsupported_temperature_reason(&m), None);
+        assert!(temperature_is_supported(&m));
+    }
+
+    #[test]
+    fn a_reasoning_model_on_a_responses_api_strips() {
+        let m = temp_model(crate::known_api::OPENAI_RESPONSES, "openai", "gpt-5", true);
+        assert_eq!(
+            unsupported_temperature_reason(&m).as_deref(),
+            Some("reasoning model 'gpt-5' accepts only the provider default temperature")
+        );
+    }
+
+    /// The rule is scoped to the two Responses apis: the SAME reasoning model on
+    /// `openai-completions` keeps its temperature, because upstream's last two arms are both
+    /// guarded by `OPENAI_RESPONSES_APIS.has(model.api)` (`:74`, `:78`).
+    #[test]
+    fn a_reasoning_model_on_another_api_is_untouched() {
+        let m = temp_model(crate::known_api::OPENAI_COMPLETIONS, "openai", "gpt-5", true);
+        assert_eq!(unsupported_temperature_reason(&m), None);
+    }
+
+    #[test]
+    fn an_ordinary_responses_model_is_untouched() {
+        let m = temp_model(crate::known_api::OPENAI_RESPONSES, "openai", "gpt-4o", false);
+        assert_eq!(unsupported_temperature_reason(&m), None);
+        assert!(temperature_is_supported(&m));
     }
 }

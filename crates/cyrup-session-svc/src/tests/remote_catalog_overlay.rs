@@ -58,6 +58,7 @@ async fn seed_store(agent_dir: &Path, models: Vec<serde_json::Value>) {
                 checked_at: Some(newer),
                 etag: Some("\"v1\"".into()),
             },
+            None,
         )
         .await
         .unwrap();
@@ -165,6 +166,7 @@ async fn a_corrupt_or_stale_cache_leaves_the_session_exactly_as_it_is_today() {
                 checked_at: Some(older),
                 etag: None,
             },
+            None,
         )
         .await
         .unwrap();
@@ -186,6 +188,7 @@ async fn a_corrupt_or_stale_cache_leaves_the_session_exactly_as_it_is_today() {
                 checked_at: Some(newer),
                 etag: Some("\"empty\"".into()),
             },
+            None,
         )
         .await
         .unwrap();

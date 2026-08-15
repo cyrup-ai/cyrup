@@ -482,7 +482,7 @@ impl RemoteCatalog {
     pub async fn load_overlay(&self, provider_ids: &[&str]) -> CatalogOverlay {
         let mut entries: Vec<(String, Vec<Model>)> = Vec::new();
         for id in provider_ids {
-            let stored = self.store.read(id).await.ok().flatten();
+            let stored = self.store.read(id, None).await.ok().flatten();
             // Pi filters the overlay to `model.provider === provider.id` (`:59`): a body that
             // mislabels its provider must not leak into another provider's catalog.
             let models: Vec<Model> = remote_models(stored.as_ref(), self.local_generated_at)
@@ -561,7 +561,7 @@ impl RemoteCatalog {
         // materialized by `load_overlay`, so the read here exists for the freshness window and the
         // validator — but the ordering matters for the same reason: nothing below can make an
         // offline run lose its persisted overlay.
-        let stored = self.store.read(provider_id).await.ok().flatten();
+        let stored = self.store.read(provider_id, None).await.ok().flatten();
 
         if !options.allow_network {
             return Ok(());
@@ -626,6 +626,7 @@ impl RemoteCatalog {
                         checked_at: Some(checked_at),
                         ..entry
                     },
+                    None,
                 )
                 .await;
             return Ok(());
@@ -644,6 +645,7 @@ impl RemoteCatalog {
                         etag: None,
                         ..stored.unwrap_or_default()
                     },
+                    None,
                 )
                 .await;
             return Ok(());
@@ -661,6 +663,7 @@ impl RemoteCatalog {
                         checked_at: Some(checked_at),
                         ..stored.unwrap_or_default()
                     },
+                    None,
                 )
                 .await;
             return Err(ProviderError::Http {
@@ -703,6 +706,7 @@ impl RemoteCatalog {
                     last_modified: Some(last_modified),
                     etag,
                 },
+                None,
             )
             .await;
         Ok(())
@@ -957,6 +961,7 @@ mod tests {
                     checked_at: Some(2),
                     etag: None,
                 },
+                None,
             )
             .await
             .unwrap();

@@ -770,6 +770,32 @@ pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Drive `body` to completion with [`env_lock`] held for the WHOLE body, from a **synchronous**
+/// frame.
+///
+/// The lock genuinely has to span the awaits: `ForwardingAskChannel::confirm`,
+/// `ExtensionConfig::resolve_config_path` and `logging::resolve_logs_dir` all call `getenv` on the
+/// decision path, so a critical section that ended at the first `.await` would not close the
+/// `set_var`/`getenv` race the lock exists for. What must NOT happen is holding the guard from
+/// *inside* an `async` body, which is what `clippy::await_holding_lock` flags: there the
+/// `MutexGuard` becomes part of the generated future's state, so it makes the future `!Send`, it is
+/// owned by whichever thread last resumed the future rather than by one identifiable thread, and it
+/// is released only when the runtime gets around to dropping the future — including on cancellation
+/// paths a test never wrote. Taking it here, around `block_on`, gives the body byte-identical
+/// coverage while the guard lives on ONE stack frame that cannot be suspended or moved.
+///
+/// This is the single instance `extension.rs`'s `with_config_env_lock`, `ask.rs` and this module's
+/// own tests all funnel through — a per-module helper over a per-module lock would not serialize
+/// anything, since `cargo test` runs the crate's unit tests as threads in one process.
+#[cfg(test)]
+// Test-only helper: a current-thread runtime that fails to build means a broken test host, and
+// there is no caller that could do anything else with the error.
+#[allow(clippy::unwrap_used)]
+pub(crate) fn with_env_lock<F: std::future::Future>(body: F) -> F::Output {
+    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body)
+}
+
 #[cfg(test)]
 thread_local! {
     /// How many times [`ExtensionConfig::load_with_result`] has run **on the current thread**.

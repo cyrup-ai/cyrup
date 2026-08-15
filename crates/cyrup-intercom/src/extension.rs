@@ -494,6 +494,11 @@ impl NativeExtension for IntercomExtension {
             // `pi.on("model_select")` (`v0.10.1 index.ts:1471-1481`) → presence carrying the new
             // model, so `intercom{list}` shows which worker is on which model.
             EventKind::ModelSelect,
+            // ICOM-004 — the bundled `skills/pi-intercom/SKILL.md`. pi declares it statically in
+            // `package.json`'s `pi` block (`"skills": ["./skills"]`, `package.json:26-28`) and its
+            // resource discovery loads it on install; cyrup's discovery ASKS each loaded extension,
+            // so the declaration is this subscription plus the answer in [`Self::on_event`].
+            EventKind::ResourcesDiscover,
         ]);
         Ok(())
     }
@@ -656,6 +661,26 @@ impl NativeExtension for IntercomExtension {
                 // `pi.on("turn_end") -> replyTracker.endTurn()` (`v0.10.1 index.ts:1416-1424`).
                 self.state.tracker.lock().unwrap_or_else(|e| e.into_inner()).end_turn();
                 HookOutcome::Noop
+            }
+            // ICOM-004 — hand cyrup's resource discovery the bundled skill
+            // (`resources/skills/pi-intercom/SKILL.md`, the port of pi's
+            // `skills/pi-intercom/SKILL.md` @ v0.10.1). pi has no event for this: it declares the
+            // directory in `package.json` (`"pi": { "skills": ["./skills"] }`, `package.json:26-28`)
+            // and pi's installer walks it. cyrup's host ASKS, so the same declaration is made here,
+            // in exactly the shape `cyrup-ext-subagents` already answers with
+            // (`extension.rs:11014-11031`) — `Noop` when nothing ships, so a relocated install with
+            // no resources root is silent rather than advertising an empty list.
+            HostEvent::ResourcesDiscover { .. } => {
+                let skill_paths: Vec<String> = crate::resources::bundled_skill_files()
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect();
+                if skill_paths.is_empty() {
+                    return HookOutcome::Noop;
+                }
+                HookOutcome::Handled(cyrup_ext::HandledValue(serde_json::json!({
+                    "skillPaths": skill_paths,
+                })))
             }
             _ => HookOutcome::Noop,
         }
@@ -827,6 +852,44 @@ mod tests {
         )
         .expect("a default config builds an extension");
         (dir, ext)
+    }
+
+    /// ICOM-004 — the bundled operational skill is DECLARED to cyrup's resource discovery.
+    ///
+    /// Both halves are asserted because either alone is inert: without the subscription the host
+    /// never dispatches `ResourcesDiscover` to this extension (`Subscriptions::contains` gates the
+    /// dispatch), and without the `on_event` arm the subscription answers `Noop` and the shipped
+    /// `SKILL.md` is a file nobody reads. Pre-fix BOTH were absent — `init` subscribed 11 kinds,
+    /// none of them `ResourcesDiscover`, and `on_event`'s catch-all returned `Noop` — so this test
+    /// fails on the first assertion.
+    #[tokio::test]
+    async fn the_bundled_skill_is_declared_to_resource_discovery() {
+        let (dir, ext) = test_extension();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.expect("init");
+        assert!(
+            api.subscriptions().contains(EventKind::ResourcesDiscover),
+            "the extension must be dispatched `ResourcesDiscover` to answer it at all"
+        );
+
+        let ctx = HostCtx::event(cyrup_ext::ExtMode::Print, false, dir.path().to_path_buf());
+        let ev = HostEvent::ResourcesDiscover {
+            cwd: dir.path().display().to_string(),
+            reason: "startup".to_string(),
+        };
+        let answered = match ext.on_event(&ev, &ctx).await {
+            HookOutcome::Handled(cyrup_ext::HandledValue(v)) => Some(v),
+            _ => None,
+        };
+        let value = answered.expect("discovery must be answered with the bundled skill paths");
+        let paths = value["skillPaths"].as_array().expect("skillPaths is a list");
+        assert_eq!(paths.len(), 1, "exactly the one bundled skill: {paths:?}");
+        let path = std::path::PathBuf::from(paths[0].as_str().expect("a path string"));
+        assert!(path.is_file(), "the declared path must exist on disk: {path:?}");
+        assert!(
+            path.ends_with("skills/pi-intercom/SKILL.md"),
+            "the declared path is the ported skill: {path:?}"
+        );
     }
 
     /// ICOM-028 — the durable `intercom_message` entry is DRAWN, not swallowed. Reads the payload

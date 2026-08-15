@@ -54,6 +54,62 @@ impl PromptRebuilder {
             .insert(tool.name().to_string(), crate::builder::tool_contribution(tool));
     }
 
+    /// The base bag itself, serialized as pi's `BuildSystemPromptOptions` — what
+    /// `ctx.getSystemPromptOptions()` hands a command handler (EXT-061).
+    ///
+    /// Upstream this is not derived at all: `_rebuildSystemPrompt` ASSIGNS
+    /// `this._baseSystemPromptOptions` on its way to building the string
+    /// (`core/agent-session.ts:1044-1053` @v0.83.0) and `getSystemPromptOptions` returns that field
+    /// verbatim (`:2436`). cyrup keeps the same two halves in one place — [`Self::base`] plus the
+    /// active set — so the bag a guest reads is BY CONSTRUCTION the bag the next
+    /// [`Self::rebuild`] would use, rather than a second snapshot that can drift from it.
+    ///
+    /// Key set and derivation, matching `:1021-1053`:
+    /// - `selectedTools` — the ACTIVE names (pi's `validToolNames`), not `base.selected_tools`,
+    ///   which is cleared on the rebuild base by design.
+    /// - `toolSnippets` — `{name: snippet}` over the active tools that have one.
+    /// - `promptGuidelines` — each active tool's guidelines in active order, then cyrup's
+    ///   free-floating [`PromptInputs::prompt_guidelines`], which upstream has no channel for.
+    /// - `customPrompt` / `appendSystemPrompt` — omitted when unset, as pi omits `undefined`.
+    /// - `cwd`, `contextFiles` (`{path, content}`), `skills`.
+    fn base_options(&self, active: &[String]) -> serde_json::Value {
+        let mut snippets = serde_json::Map::new();
+        let mut guidelines: Vec<String> = Vec::new();
+        for name in active {
+            if let Some(c) = self.contributions.get(name) {
+                if let Some(s) = c.snippet.as_ref() {
+                    snippets.insert(name.clone(), serde_json::Value::String(s.to_string()));
+                }
+                guidelines.extend(c.guidelines.iter().map(|g| g.to_string()));
+            }
+        }
+        guidelines.extend(self.base.prompt_guidelines.iter().map(|g| g.to_string()));
+
+        let mut bag = serde_json::Map::new();
+        if let Some(custom) = self.base.custom_prompt.as_ref() {
+            bag.insert("customPrompt".into(), serde_json::Value::String(custom.to_string()));
+        }
+        bag.insert("selectedTools".into(), serde_json::json!(active));
+        bag.insert("toolSnippets".into(), serde_json::Value::Object(snippets));
+        bag.insert("promptGuidelines".into(), serde_json::json!(guidelines));
+        if let Some(append) = self.base.append_system_prompt.as_ref() {
+            bag.insert("appendSystemPrompt".into(), serde_json::Value::String(append.to_string()));
+        }
+        bag.insert("cwd".into(), serde_json::json!(self.base.cwd));
+        bag.insert(
+            "contextFiles".into(),
+            serde_json::json!(
+                self.base
+                    .context_files
+                    .iter()
+                    .map(|f| serde_json::json!({"path": f.path, "content": f.content.to_string()}))
+                    .collect::<Vec<_>>()
+            ),
+        );
+        bag.insert("skills".into(), serde_json::json!(self.base.skills.as_ref()));
+        serde_json::Value::Object(bag)
+    }
+
     /// Rebuild the base system prompt for `active` tools, pulling each tool's contribution from the
     /// precomputed map (Pi `_rebuildSystemPrompt`, agent-session.ts:2304-2396).
     fn rebuild(&self, active: &[String]) -> String {
@@ -86,6 +142,13 @@ impl DynamicToolState {
             registry_tools.into_iter().map(|t| (t.name().to_string(), t)).collect();
         let active = active.into_iter().map(|t| t.name().to_string()).collect();
         Self { registry, active, rebuilder }
+    }
+
+    /// The base system-prompt options bag for the CURRENT active set (EXT-061) — pi
+    /// `_baseSystemPromptOptions` (`core/agent-session.ts:1044-1053` @v0.83.0), returned to a
+    /// command handler by `ctx.getSystemPromptOptions()` (`:2436`).
+    pub(crate) fn base_prompt_options(&self) -> serde_json::Value {
+        self.rebuilder.base_options(&self.active)
     }
 
     /// Names of the currently-active tools (Pi `getActiveToolNames`).

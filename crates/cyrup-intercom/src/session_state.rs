@@ -503,10 +503,8 @@ impl SharedIntercomState {
         });
         // `clearNamePollTimer()` at the head of `startNamePoll` (`v0.10.1 index.ts:818`): a runtime
         // replacement must not leave two pollers running.
-        let previous = std::mem::replace(
-            &mut *self.name_poll_task.lock().unwrap_or_else(|e| e.into_inner()),
-            Some(handle),
-        );
+        let previous =
+            self.name_poll_task.lock().unwrap_or_else(|e| e.into_inner()).replace(handle);
         if let Some(previous) = previous {
             previous.abort();
         }

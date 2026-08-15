@@ -779,7 +779,15 @@ pub fn build_request_body(
     );
     obj.insert("parallel_tool_calls".to_string(), json!(true));
 
-    if let Some(temp) = opts.temperature {
+    // PERM-012. `openai-codex-responses` is in upstream's `TEMPERATURE_UNSUPPORTED_APIS`
+    // (`pi-permission-system/src/model-option-compatibility.ts:20-22` @v0.8.0), so the key is
+    // NEVER written on this route regardless of the model — the first arm of
+    // `getUnsupportedTemperatureReason` (`:65-67`). The `filter` is the whole api-level rule; it
+    // is expressed through the shared predicate so the three Responses builders cannot drift.
+    if let Some(temp) = opts
+        .temperature
+        .filter(|_| crate::api::compat::temperature_is_supported(model))
+    {
         obj.insert("temperature".to_string(), json!(temp));
     }
     if let Some(tier) = codex.service_tier.as_deref() {
@@ -1589,7 +1597,15 @@ mod tests {
         };
         let body = build_request_body(&model, &ctx, &so, &codex, Some("sess-9")).unwrap();
 
-        assert_eq!(body["temperature"], json!(0.25));
+        // PERM-012: `temperature` is the ONE optional field that never appears on this api, set or
+        // not — `openai-codex-responses` is in upstream's `TEMPERATURE_UNSUPPORTED_APIS`
+        // (`model-option-compatibility.ts:20-22` @v0.8.0). This assertion was
+        // `assert_eq!(body["temperature"], json!(0.25))` before the guard landed, i.e. it pinned
+        // the unguarded behaviour; it is the RED half of the fix.
+        assert!(
+            body.get("temperature").is_none(),
+            "codex-responses must never carry temperature, even when the caller sets one: {body}"
+        );
         assert_eq!(body["service_tier"], json!("priority"));
         assert_eq!(body["text"], json!({ "verbosity": "high" }));
         assert_eq!(body["prompt_cache_key"], json!("sess-9"));

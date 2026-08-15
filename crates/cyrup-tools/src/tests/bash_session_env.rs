@@ -257,3 +257,52 @@ async fn identity_markers_survive_expose_session_environment_off() {
         .unwrap();
     assert!(first_text(&r).contains("[true][cyrup][]"), "got: {}", first_text(&r));
 }
+
+/// CFG-069 — `AI_AGENT` is a FORWARD-PORT: the key does not exist at the ported tag at all
+/// (`git -C pi grep -n AI_AGENT v0.83.0 -- packages/` → 0 hits; `cli.ts:13` @v0.83.0 sets only
+/// `PI_CODING_AGENT`), and arrives at `cli.ts:14` @v0.84.1 — re-derived at both tags this pass.
+/// The `bash` TOOL is one of the three sites that writes it into a child, so its delta annotation
+/// has to name the KEY and the TAG, not only the VALUE. Otherwise a later v0.84.1 uplift reads the
+/// site as already-done-at-tag and never records that cyrup ran ahead of the baseline — exactly the
+/// `working-start`/`working-stop` precedent.
+///
+/// RED before this pass: the annotation above the push read `[CYRUP-DELTA, value only] AI_AGENT
+/// names WHICH agent is running (`"pi"` upstream), so cyrup names itself. The key and its semantics
+/// are pi's verbatim.` — it carried neither `@v0.84.1` nor the absent-at-v0.83.0 fact, so both the
+/// tag assertion and the v0.83.0 assertion below failed. (`bash.rs`'s prose block names the tag,
+/// but the assertion is deliberately scoped to the `[CYRUP-DELTA` marker itself, because
+/// `CYRUP-DELTA` is the grep this project's parity sweeps run.)
+///
+/// Presence before absence: `PI_CODING_AGENT`, which IS at the ported tag, must still be pushed
+/// beside it — this test must not be satisfiable by deleting the forward-ported marker.
+///
+/// Mirrors `cyrup-session-svc`'s `the_forward_ported_ai_agent_marker_names_its_key_and_its_tag`,
+/// which pins the immediate-bash seam's copy of the same annotation.
+#[test]
+fn cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag() {
+    let src = include_str!("../tools/bash.rs");
+
+    assert!(
+        src.contains(r#"env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));"#),
+        "the at-tag marker `PI_CODING_AGENT` (cli.ts:13 @v0.83.0) must still be pushed"
+    );
+
+    let push = r#"env.push(("AI_AGENT".to_string(), "cyrup".to_string()));"#;
+    let at = src.find(push).expect("`AI_AGENT` is pushed into the bash tool's child env");
+    // The annotation is the comment block immediately above the push.
+    let annotation = &src[..at];
+    let annotation = &annotation[annotation.rfind("[CYRUP-DELTA").expect("a delta annotation")..];
+
+    assert!(
+        annotation.contains("@v0.84.1"),
+        "the delta line must state the TAG the key comes from; got: {annotation}"
+    );
+    assert!(
+        annotation.contains("AI_AGENT"),
+        "the delta line must name the KEY, not only its value; got: {annotation}"
+    );
+    assert!(
+        annotation.contains("v0.83.0"),
+        "the delta line must state that the key is ABSENT at the ported tag; got: {annotation}"
+    );
+}

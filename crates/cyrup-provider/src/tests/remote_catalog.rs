@@ -214,7 +214,7 @@ async fn first_refresh_fetches_and_persists_body_etag_and_timestamps() {
     // No cached body yet, so no validator may be sent.
     assert!(!head.to_lowercase().contains("if-none-match"));
 
-    let stored = store.read("groq").await.unwrap().expect("entry persisted");
+    let stored = store.read("groq", None).await.unwrap().expect("entry persisted");
     assert_eq!(stored.models.len(), 1);
     assert_eq!(stored.models[0].id.as_str(), "remote-only");
     // The etag is stored VERBATIM, quotes included.
@@ -238,6 +238,7 @@ async fn a_second_refresh_inside_the_four_hour_window_issues_no_request() {
                 checked_at: Some(now_ms()),
                 etag: Some("\"v1\"".into()),
             },
+            None,
         )
         .await
         .unwrap();
@@ -259,8 +260,9 @@ async fn a_second_refresh_inside_the_four_hour_window_issues_no_request() {
             "groq",
             ModelsStoreEntry {
                 checked_at: Some(now_ms() - REMOTE_CATALOG_REFRESH_INTERVAL_MS - 1),
-                ..store.read("groq").await.unwrap().unwrap()
+                ..store.read("groq", None).await.unwrap().unwrap()
             },
+            None,
         )
         .await
         .unwrap();
@@ -281,7 +283,7 @@ async fn force_bypasses_the_window_and_a_304_moves_only_checked_at() {
         checked_at: Some(1),
         etag: Some("W/\"v7\"".into()),
     };
-    store.write("groq", before.clone()).await.unwrap();
+    store.write("groq", before.clone(), None).await.unwrap();
     let catalog = catalog(store.clone(), &origin.base_url);
 
     catalog
@@ -293,7 +295,7 @@ async fn force_bypasses_the_window_and_a_304_moves_only_checked_at() {
     let head = origin.request_heads()[0].to_lowercase();
     assert!(head.contains("if-none-match: w/\"v7\""), "{head}");
 
-    let after = store.read("groq").await.unwrap().unwrap();
+    let after = store.read("groq", None).await.unwrap().unwrap();
     assert_eq!(after.models, before.models, "a 304 must not touch the body");
     assert_eq!(after.etag, before.etag);
     assert_eq!(after.last_modified, before.last_modified);
@@ -315,6 +317,7 @@ async fn a_304_is_never_requested_without_a_cached_body() {
                 checked_at: Some(1),
                 etag: Some("\"stale\"".into()),
             },
+            None,
         )
         .await
         .unwrap();
@@ -344,6 +347,7 @@ async fn a_404_or_501_clears_the_overlay_and_never_errors() {
                     checked_at: Some(1),
                     etag: Some("\"v1\"".into()),
                 },
+                None,
             )
             .await
             .unwrap();
@@ -358,7 +362,7 @@ async fn a_404_or_501_clears_the_overlay_and_never_errors() {
             .refresh_provider("groq", RefreshOptions::forced())
             .await
             .unwrap_or_else(|e| panic!("{status} must not error: {e}"));
-        let after = store.read("groq").await.unwrap().unwrap();
+        let after = store.read("groq", None).await.unwrap().unwrap();
         assert_eq!(after.last_modified, Some(0), "{status}");
         assert_eq!(after.etag, None, "{status}");
         // `lastModified: 0` is below the builtin stamp, so the staleness guard drops the overlay:
@@ -380,7 +384,7 @@ async fn a_500_keeps_the_etag_and_surfaces_an_error() {
         checked_at: Some(1),
         etag: Some("\"v1\"".into()),
     };
-    store.write("groq", before.clone()).await.unwrap();
+    store.write("groq", before.clone(), None).await.unwrap();
 
     let err = catalog(store.clone(), &origin.base_url)
         .refresh_provider("groq", RefreshOptions::forced())
@@ -392,7 +396,7 @@ async fn a_500_keeps_the_etag_and_surfaces_an_error() {
         "{err}"
     );
 
-    let after = store.read("groq").await.unwrap().unwrap();
+    let after = store.read("groq", None).await.unwrap().unwrap();
     assert_eq!(after.models, before.models, "the cached body survives");
     assert_eq!(
         after.etag, before.etag,
@@ -411,7 +415,7 @@ async fn a_garbage_body_errors_without_destroying_the_cached_overlay() {
         checked_at: Some(1),
         etag: Some("\"v1\"".into()),
     };
-    store.write("groq", before.clone()).await.unwrap();
+    store.write("groq", before.clone(), None).await.unwrap();
 
     let err = catalog(store.clone(), &origin.base_url)
         .refresh_provider("groq", RefreshOptions::forced())
@@ -419,7 +423,7 @@ async fn a_garbage_body_errors_without_destroying_the_cached_overlay() {
         .expect_err("an unparseable body is an error");
     assert!(err.to_string().contains("Invalid model catalog"), "{err}");
     assert_eq!(
-        store.read("groq").await.unwrap().unwrap().models,
+        store.read("groq", None).await.unwrap().unwrap().models,
         before.models,
         "a bad body must never overwrite the good one"
     );
@@ -439,7 +443,7 @@ async fn a_dead_origin_is_a_transport_error_and_writes_nothing() {
         .expect_err("a dead origin is an error");
     assert_eq!(err.code(), "transport", "{err}");
     assert!(
-        store.read("groq").await.unwrap().is_none(),
+        store.read("groq", None).await.unwrap().is_none(),
         "a transport failure must not fabricate a store entry"
     );
 }
@@ -459,6 +463,7 @@ async fn cache_only_issues_no_request_yet_still_loads_the_persisted_overlay() {
                 checked_at: Some(1), // long stale: only `allow_network` keeps the request away
                 etag: Some("\"v1\"".into()),
             },
+            None,
         )
         .await
         .unwrap();
@@ -673,18 +678,18 @@ async fn an_overlay_not_newer_than_the_builtin_manifest_is_discarded_whole() {
     };
 
     // Older than the embedded catalogs (an overlay persisted BEFORE an upgrade): discarded.
-    store.write("groq", entry(generated_at - 1)).await.unwrap();
+    store.write("groq", entry(generated_at - 1), None).await.unwrap();
     let catalog = Arc::new(
         RemoteCatalog::new(store.clone()).with_local_generated_at(Some(generated_at)),
     );
     assert!(catalog.load_overlay(&["groq"]).await.is_empty());
 
     // Exactly equal: still discarded (Pi uses `<=`).
-    store.write("groq", entry(generated_at)).await.unwrap();
+    store.write("groq", entry(generated_at), None).await.unwrap();
     assert!(catalog.load_overlay(&["groq"]).await.is_empty());
 
     // Strictly newer: kept.
-    store.write("groq", entry(generated_at + 1)).await.unwrap();
+    store.write("groq", entry(generated_at + 1), None).await.unwrap();
     assert_eq!(catalog.load_overlay(&["groq"]).await.models_for("groq").len(), 1);
 }
 
@@ -770,11 +775,12 @@ async fn a_provider_scoped_store_cannot_see_another_providers_catalog() {
                 models: vec![serde_json::from_value(model_json("secret", 1)).unwrap()],
                 ..Default::default()
             },
+            None,
         )
         .await
         .unwrap();
     let scoped = ProviderModelsStore::new(store, "xai");
-    assert!(scoped.read().await.unwrap().is_none());
+    assert!(scoped.read(None).await.unwrap().is_none());
 }
 
 #[test]

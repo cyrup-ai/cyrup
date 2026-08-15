@@ -285,6 +285,17 @@ pub fn parse_credential_print_command(
 /// `credential-print.ts:66-76`). `positionals` is cyrup's combined carrier for Pi's `messages` +
 /// `fileArgs`; `extension_flags` is Pi's `unknownFlags`.
 ///
+/// **[CYRUP-DELTA] (SEAM-108) — this whole validation surface is `@v0.84.1`'s, not the ported tag's,
+/// and that is deliberate.** cyrup ports pi at **v0.83.0**; `SEAM-050` closed by landing v0.84.1's
+/// `auth` command tree wholesale, so THREE things here disagree with `credential-print.ts` at the
+/// baseline a later fidelity pass would read: the required-argument rule, the verb COUNT (three —
+/// `print-api-key`, `print-bearer-token`, `check` (`:42-47` above) — where v0.83.0's
+/// `printCredentialPrintHelp` (`credential-print.ts:24-30`) shows two), and the two error sentences
+/// below. Under v0.83.0, `cyrup auth print-api-key --provider openai` would be REJECTED with
+/// `Credential printing requires --model <model>` (`credential-print.ts:67-68`); it succeeds here.
+/// This is a forward-port, not a defect — **do not "restore" v0.83.0's shape** without an owner
+/// decision that also reverts `SEAM-050`.
+///
 /// SEAM-050 changed three things to match v0.84.1, which routes BOTH print verbs through this same
 /// function (`credential-print.ts:24` calls `validateAuthCommandArgs(args, kind)`):
 /// * an unmatched flag is now `Unknown option --X for "auth print-api-key".` (`:99-102`) rather than
@@ -981,6 +992,41 @@ mod tests {
         assert_eq!(mk("ready").exit_code(), 0);
         assert_eq!(mk("not_ready").exit_code(), 1);
         assert_eq!(mk("invalid").exit_code(), 2);
+    }
+
+    /// SEAM-108 — the whole `auth` surface is v0.84.1-shaped against a v0.83.0 port, and that has to
+    /// be SAID in-source, not merely be true. The three behaviours below are all deliberate
+    /// forward-ports (they came in with SEAM-050); without a delta naming the tag, the next fidelity
+    /// pass reading `credential-print.ts` @v0.83.0 finds three "defects" and reverts them.
+    ///
+    /// RED before this pass: no `[CYRUP-DELTA]` mentioning SEAM-108 existed anywhere in this file.
+    /// Reads the module's own source at compile time, which is the only way to assert on a doc block.
+    #[test]
+    fn the_v0_84_1_forward_port_is_declared_as_a_cyrup_delta() {
+        let src = include_str!("credential_print.rs");
+        let delta = src
+            .lines()
+            .find(|l| l.contains("[CYRUP-DELTA]") && l.contains("SEAM-108"))
+            .expect("the argument-validation site must carry a [CYRUP-DELTA] naming SEAM-108");
+        assert!(
+            delta.contains("v0.84.1"),
+            "the delta must name the tag it forward-ported FROM: {delta}"
+        );
+        // …and it must say which tag is the ported baseline, or it does not tell an auditor which
+        // side of the comparison to distrust.
+        let block: String = src
+            .lines()
+            .skip_while(|l| !(l.contains("[CYRUP-DELTA]") && l.contains("SEAM-108")))
+            .take(12)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(block.contains("v0.83.0"), "the delta must name the ported baseline too: {block}");
+        for owed in ["verb", "requires --model", "print-api-key"] {
+            assert!(
+                block.contains(owed),
+                "the delta must name what diverges (`{owed}` missing): {block}"
+            );
+        }
     }
 
     /// SEAM-050 — v0.84.1 routes the PRINT verbs through `validateAuthCommandArgs` too

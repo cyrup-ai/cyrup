@@ -1,5 +1,6 @@
 //! The ergonomic guest API (arch-08 §3.6) — the Rust analog of Pi's `ExtensionAPI` (the `pi` object
-//! an extension factory receives, types.ts:1128-1356). An author subscribes to any of the 30 events
+//! an extension factory receives, types.ts:1185-1420 @v0.83.0; EXT-072 corrected `:1128-1356`). An
+//! author subscribes to any of the 33 events
 //! with a typed handler `(event, &Ctx) -> Outcome`, registers tools/commands/shortcuts/flags/
 //! providers/renderers/autocomplete, and the SDK lowers all of it onto the `cyrup:ext` WIT world.
 //!
@@ -48,14 +49,16 @@ mod kind {
     pub const SESSION_COMPACT: u8 = 27;
     pub const SESSION_BEFORE_TREE: u8 = 28;
     pub const SESSION_TREE: u8 = 29;
-    /// `agent_settled` (Pi `AgentSettledEvent`, extensions/types.ts:721-725; subscribed at
-    /// types.ts:1225) — the run has FULLY settled: no retry, post-run compaction or queued
+    /// `agent_settled` (pi `AgentSettledEvent`, extensions/types.ts:721-725 @v0.83.0; subscribed at
+    /// `:1217` — EXT-073: the `:1225` this cited is `tool_execution_end`'s overload) — the run has
+    /// FULLY settled: no retry, post-run compaction or queued
     /// continuation will follow (SEAM-005).
     pub const AGENT_SETTLED: u8 = 30;
     /// `before_provider_headers` (pi `extensions/types.ts:686-689` @v0.83.0, subscribed at
     /// `:1212`) — EXT-009.
     pub const BEFORE_PROVIDER_HEADERS: u8 = 31;
-    /// `session_info_changed` (pi `extensions/types.ts:571-575` @v0.83.0, subscribed at `:1203`)
+    /// `session_info_changed` (pi `extensions/types.ts:571-575` @v0.83.0, subscribed at `:1193` —
+    /// EXT-073: `:1203` is `session_compact`)
     /// — EXT-011.
     pub const SESSION_INFO_CHANGED: u8 = 32;
 }
@@ -239,7 +242,8 @@ pub struct RegisteredTool {
     pub exec: Box<dyn ToolExec>,
 }
 
-// --- command execution (Pi `RegisteredCommand.handler`, types.ts:1105-1111; R-08-016) ---
+// --- command execution (pi `RegisteredCommand.handler`, types.ts:1167 @v0.83.0, the interface at
+// `:1162-1168`; EXT-072 corrected `:1105-1111`; R-08-016) ---
 
 /// A slash-command body supplied by the guest author. Runs at COMMAND tier (the [`CommandCtx`]
 /// exposes the session-control ops); `args` is the raw argument string; returns optional text.
@@ -256,7 +260,8 @@ where
     }
 }
 
-/// A dynamic argument completer (Pi `getArgumentCompletions(prefix)`, types.ts:1108).
+/// A dynamic argument completer (pi `getArgumentCompletions(prefix)`, types.ts:1166 @v0.83.0;
+/// EXT-072: `:1108` is `cancel?: boolean`).
 pub type ArgCompleter = Box<dyn Fn(&str) -> Vec<String> + 'static>;
 
 /// A registered slash command: its descriptor, its handler, and an optional dynamic argument
@@ -267,9 +272,11 @@ pub struct RegisteredCommand {
     pub completions: Option<ArgCompleter>,
 }
 
-// --- keyboard shortcuts (Pi `registerShortcut`, types.ts:1198-1205; R-08-017) ---
+// --- keyboard shortcuts (pi `registerShortcut`, types.ts:1250-1256 @v0.83.0; EXT-072: the
+// `:1198-1205` this cited is inside the `on(event: …)` overload block; R-08-017) ---
 
-/// A keyboard-shortcut body supplied by the guest author (Pi `options.handler(ctx)`, types.ts:1203).
+/// A keyboard-shortcut body supplied by the guest author (pi `options.handler(ctx)`,
+/// types.ts:1254 @v0.83.0; EXT-072: `:1203` is `session_compact`'s overload).
 /// Invoked across the `execute-shortcut` export when the registered `KeyId` fires; receives the base
 /// [`Ctx`] (Pi hands the shortcut handler the general `ExtensionContext`).
 pub trait ShortcutExec: 'static {
@@ -430,11 +437,13 @@ pub struct ExtensionApi {
     /// half of `registerProvider` (sdk gap #1). Invoked across the `provider-*` exports.
     pub(crate) provider_handlers: HashMap<String, ProviderHandlers>,
     pub(crate) renderers: Vec<RegisteredRenderer>,
-    /// Custom-ENTRY renderers (Pi `registerEntryRenderer`, types.ts:1295). A SEPARATE list from
+    /// Custom-ENTRY renderers (pi `registerEntryRenderer`, types.ts:1295 @v0.84.1 / `:1279`
+    /// @v0.83.0 — cite the tag, EXT-036's version-lag class). A SEPARATE list from
     /// [`Self::renderers`], mirroring upstream's disjoint `messageRenderers`/`entryRenderers` maps
-    /// (types.ts:1703-1704); on the wire an entry still travels over `render-call`.
+    /// (types.ts:1702 and `:1704` @v0.84.1 — the two maps are NOT adjacent, `:1703` between them is
+    /// `markdownTransformer`); on the wire an entry still travels over `render-call`.
     pub(crate) entry_renderers: Vec<RegisteredRenderer>,
-    /// EXT-019: at most one per extension (Pi `extension.markdownTransformer`, types.ts:1703
+    /// EXT-019: at most one per extension (pi `extension.markdownTransformer`, types.ts:1703 @v0.84.1
     /// @v0.84.1).
     pub(crate) markdown_transformer: Option<Box<dyn MarkdownTransformer>>,
     /// EXT-021: this extension's raw terminal-input handler, if it subscribed. AT MOST ONE —
@@ -515,7 +524,8 @@ impl ExtensionApi {
     }
 
     /// Register a slash command (R-08-016). The handler runs at command tier (session ops allowed).
-    /// Mirrors Pi's `registerCommand(name, {description, handler})` (types.ts:1105).
+    /// Mirrors pi's `registerCommand(name, {description, handler})` (types.ts:1247 @v0.83.0;
+    /// EXT-072 corrected `:1105`).
     pub fn register_command(
         &mut self,
         name: impl Into<String>,
@@ -529,7 +539,8 @@ impl ExtensionApi {
     }
 
     /// Register a slash command with a dynamic argument completer (Pi `getArgumentCompletions`,
-    /// types.ts:1108): the completer is called with the current argument prefix.
+    /// types.ts:1166 @v0.83.0; EXT-072 corrected `:1108`): the completer is called with the current
+    /// argument prefix.
     pub fn register_command_with_completions(
         &mut self,
         name: impl Into<String>,
@@ -548,7 +559,8 @@ impl ExtensionApi {
     }
 
     /// Register a keyboard shortcut with a handler (R-08-017). Mirrors Pi's
-    /// `registerShortcut(key, {description, handler})` (types.ts:1198-1205): the `key`+`description`
+    /// `registerShortcut(key, {description, handler})` (types.ts:1250-1256 @v0.83.0; EXT-072
+    /// corrected `:1198-1205`): the `key`+`description`
     /// cross the seam for display, the `handler` is stored guest-side and runs via the
     /// `execute-shortcut` export when the `KeyId` fires.
     pub fn register_shortcut(
@@ -585,7 +597,8 @@ impl ExtensionApi {
     }
 
     /// Register a custom LLM provider with dynamic OAuth + `streamSimple` callbacks (Pi
-    /// `registerProvider({oauth, streamSimple})`, types.ts:1337; sdk gap #1). The static `config`
+    /// `registerProvider({oauth, streamSimple})`, types.ts:1401 @v0.83.0, the `ProviderConfig` bag at
+    /// `:1427-1464`; EXT-072 corrected `:1337`; sdk gap #1). The static `config`
     /// crosses the seam to register models; the [`ProviderHandlers`] stay guest-side and are invoked
     /// across the `provider-*` exports. The config's `oauth`/`hasStreamSimple` markers are auto-filled
     /// from the handlers so the host knows which callbacks exist.
@@ -661,7 +674,8 @@ impl ExtensionApi {
     }
 
     /// Register a custom ENTRY renderer (Pi `pi.registerEntryRenderer(customType, renderer)`,
-    /// types.ts:1295) — the TUI-only surface for entries appended with `append_entry`, which do NOT
+    /// types.ts:1295 @v0.84.1 / `:1279` @v0.83.0) — the TUI-only surface for entries appended with
+    /// `append_entry`, which do NOT
     /// participate in LLM context.
     ///
     /// The renderer is invoked through [`MessageRenderer::render_call`], since an entry crosses the
@@ -716,7 +730,8 @@ impl ExtensionApi {
         self.bus_subscriptions.push((topic.into(), Box::new(handler)));
     }
 
-    // --- the 30 event subscriptions (Pi `pi.on`, types.ts:1133-1171) ---
+    // --- the 33 event subscriptions (pi `pi.on`, types.ts:1190-1231 @v0.83.0; EXT-072 corrected
+    // the count AND the range, which cited the message-rendering block) ---
 
     pub fn on_tool_call(&mut self, f: impl Fn(ToolCallEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::TOOL_CALL, Box::new(move |a, c| {
@@ -733,7 +748,8 @@ impl ExtensionApi {
                 content: json(arg(a, 3)),
                 is_error: arg(a, 4) == "true",
                 details: opt_json(arg(a, 5)),
-                // Pi `ToolResultEventBase.usage` (types.ts:919-921); empty arg = Pi `undefined`.
+                // pi `ToolResultEventBase.usage` (types.ts:920-921 @v0.83.0; `:919` is `isError`);
+                // empty arg = pi `undefined`.
                 usage: opt_json(arg(a, 6)),
             };
             f(ev, c).into_raw()
@@ -872,7 +888,8 @@ impl ExtensionApi {
     pub fn on_agent_end(&mut self, f: impl Fn(AgentEndEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::AGENT_END, notify(move |a, c| f(AgentEndEvent { messages: json(arg(a, 0)) }, c)));
     }
-    /// Pi `on("agent_settled", handler)` (extensions/types.ts:1225). Fires ONCE per run, after every
+    /// pi `on("agent_settled", handler)` (extensions/types.ts:1217 @v0.83.0; EXT-073: `:1225` is
+    /// `tool_execution_end`). Fires ONCE per run, after every
     /// automatic retry / post-run compaction / queued continuation has finished — unlike
     /// [`Self::on_agent_end`], which fires once per `agent.prompt`/`agent.continue`.
     pub fn on_agent_settled(&mut self, f: impl Fn(&Ctx) + 'static) {
@@ -1090,7 +1107,9 @@ impl ExtensionApi {
             .and_then(|r| r.renderer.render_result(result, &Ctx::new()))
     }
 
-    // --- provider OAuth + streamSimple callbacks (Pi types.ts:1380-1392; sdk gap #1) ---
+    // --- provider OAuth + streamSimple callbacks (pi `ProviderConfig`, types.ts:1427-1464 @v0.83.0
+    // — `streamSimple` `:1437`, `oauth` `:1450-1463`; EXT-072: `:1380-1392` is `@example` JSDoc;
+    // sdk gap #1) ---
 
     fn oauth_of(&self, id: &str) -> Result<&crate::provider::OAuthProvider, String> {
         self.provider_handlers
@@ -1154,7 +1173,8 @@ impl ExtensionApi {
     }
 
     /// Fold the stacked autocomplete providers over the host's built-in `base` suggestions (Pi the
-    /// `AutocompleteProviderFactory` chain, types.ts:117; sdk gap #2). Each provider sees the previous
+    /// `AutocompleteProviderFactory` chain, types.ts:124 @v0.83.0; EXT-072: `:117` is a
+    /// `WorkingIndicatorOptions` doc line; sdk gap #2). Each provider sees the previous
     /// ("current") result; `None` defers to it.
     pub fn autocomplete_suggest(
         &self,

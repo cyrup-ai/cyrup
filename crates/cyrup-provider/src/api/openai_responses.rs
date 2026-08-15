@@ -421,7 +421,15 @@ pub(crate) fn try_build_params(
             json!(max.max(OPENAI_RESPONSES_MIN_OUTPUT_TOKENS)),
         );
     }
-    if let Some(temp) = opts.temperature {
+    // PERM-012. pi strips `temperature` for a `codex`-token id and for any reasoning model on this
+    // api — `getUnsupportedTemperatureReason` (`pi-permission-system/src/
+    // model-option-compatibility.ts:74-80` @v0.8.0), applied through a provider wrapper because a
+    // JS extension cannot reach this builder. cyrup can, so the key simply is not written; see
+    // [`crate::api::compat::unsupported_temperature_reason`] for the CYRUP-DELTA on the seam.
+    if let Some(temp) = opts
+        .temperature
+        .filter(|_| crate::api::compat::temperature_is_supported(model))
+    {
         obj.insert("temperature".to_string(), json!(temp));
     }
 
@@ -1817,6 +1825,69 @@ mod tests {
         assert_eq!(body["input"][0]["role"], "user");
         assert_eq!(body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(body["input"][0]["content"][0]["text"], "hi");
+    }
+
+    /// PERM-012 — pi's `getUnsupportedTemperatureReason` strips `temperature` for a REASONING
+    /// model on this api (`pi-permission-system/src/model-option-compatibility.ts:78-80`
+    /// @v0.8.0). Before the guard landed this body carried `"temperature": 0.7`, so this test is
+    /// red at HEAD~: `model()` is `reasoning: true`.
+    #[test]
+    fn a_reasoning_model_never_carries_temperature() {
+        let m = model();
+        assert!(m.reasoning, "fixture must be a reasoning model for this to bite");
+        let opts = StreamOptions {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = build_params(&m, &user_ctx("hi"), &opts, None);
+        assert!(
+            body.get("temperature").is_none(),
+            "a reasoning model accepts only the provider default temperature: {body}"
+        );
+    }
+
+    /// The control for the test above: the SAME api and the same request, with the one field the
+    /// rule reads flipped. Without this, the assertion above would also pass if the builder had
+    /// simply stopped emitting `temperature` at all.
+    #[test]
+    fn a_non_reasoning_model_still_carries_temperature() {
+        let m = Model {
+            reasoning: false,
+            ..model()
+        };
+        let opts = StreamOptions {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = build_params(&m, &user_ctx("hi"), &opts, None);
+        // `StreamOptions::temperature` is `Option<f32>` (`stream.rs:165`), so the serialized number
+        // is the f32 widened to f64 — `0.699999988079071`, not the f64 literal `0.7`. Compare
+        // against the same widening rather than the literal; asserting `json!(0.7)` here fails on a
+        // value that is byte-for-byte what the wire carries.
+        assert_eq!(
+            body.get("temperature").and_then(Value::as_f64),
+            Some(f64::from(0.7_f32))
+        );
+    }
+
+    /// The id-token arm (`model-option-compatibility.ts:74-76` @v0.8.0): a `codex` TOKEN in the
+    /// model id strips temperature even off a non-reasoning model on this api.
+    #[test]
+    fn a_codex_token_in_the_model_id_strips_temperature() {
+        let m = Model {
+            id: "gpt-5.5-codex".into(),
+            reasoning: false,
+            ..model()
+        };
+        let opts = StreamOptions {
+            temperature: Some(0.7),
+            ..Default::default()
+        };
+        let body = build_params(&m, &user_ctx("hi"), &opts, None);
+        assert!(
+            body.get("temperature").is_none(),
+            "`gpt-5.5-codex` splits to a `codex` token: {body}"
+        );
     }
 
     #[test]

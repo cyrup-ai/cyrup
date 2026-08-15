@@ -1959,7 +1959,15 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     // Written unconditionally (never merely omitted) for the same reason as the fanout flag above:
     // the overlay is applied over an INHERITED environment, so these must be asserted, not assumed.
     env_overlay.insert("PI_CODING_AGENT".to_string(), "true".to_string());
-    // [CYRUP-DELTA, value only] `AI_AGENT` names WHICH agent is running (`"pi"` upstream).
+    // [CYRUP-DELTA — KEY *and* value; the key is a FORWARD-PORT from `cli.ts:14` @v0.84.1, which is
+    // AHEAD of the ported tag] `AI_AGENT` does not exist anywhere in pi @v0.83.0
+    // (`git -C pi grep -n AI_AGENT v0.83.0 -- packages/` → 0 hits; `cli.ts:13` @v0.83.0 sets only
+    // `PI_CODING_AGENT`), so cyrup writes a variable into every re-exec'd subagent child — and its
+    // whole subtree — that the ported baseline never wrote. The value additionally names WHICH
+    // agent is running (`"pi"` upstream). Deliberate and kept; stated on the delta line itself
+    // rather than only in the prose above (CFG-069) so a later v0.84.1 uplift reads this as
+    // ALREADY-PORTED-EARLY and not as already-done-at-tag. Same class as the
+    // `working-start`/`working-stop` precedent.
     env_overlay.insert("AI_AGENT".to_string(), "cyrup".to_string());
     // Permission input (1) (port doc §4 / pi `resolveAgentName`, `pi-permission-system/src/index.ts:2033-2047` @v0.7.1): thread the
     // resolved persona name to the child as [`AGENT_NAME_ENV_VAR`] so its permission companion's
@@ -6859,6 +6867,48 @@ mod tests {
             env.get("AI_AGENT").map(String::as_str),
             Some("cyrup"),
             "`AI_AGENT` (pi `cli.ts:14`) names WHICH agent is running; the key is pi's verbatim"
+        );
+    }
+
+    /// CFG-069 — the third and last of the three sites that write `AI_AGENT` into a child.
+    ///
+    /// The key does not exist at the ported tag at all (`git -C pi grep -n AI_AGENT v0.83.0 --
+    /// packages/` → 0; `cli.ts:13` @v0.83.0 sets only `PI_CODING_AGENT`); it arrives at
+    /// `cli.ts:14` @v0.84.1 — re-derived at both tags this pass. So the delta annotation must name
+    /// the KEY and the TAG, not only the VALUE, or a later v0.84.1 uplift reads the site as
+    /// already-done-at-tag and never records that cyrup ran ahead of the baseline.
+    ///
+    /// RED before this pass: the annotation above the insert read `[CYRUP-DELTA, value only]
+    /// `AI_AGENT` names WHICH agent is running (`"pi"` upstream).` — one line, carrying neither
+    /// `@v0.84.1` nor the absent-at-v0.83.0 fact.
+    ///
+    /// Mirrors `cyrup-tools`' `cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag`
+    /// and `cyrup-session-svc`'s `the_forward_ported_ai_agent_marker_names_its_key_and_its_tag`.
+    #[test]
+    fn cfg069_the_spawn_overlay_delta_names_the_forward_ported_key_and_its_tag() {
+        let src = include_str!("mod.rs");
+
+        assert!(
+            src.contains(r#"env_overlay.insert("PI_CODING_AGENT".to_string(), "true".to_string());"#),
+            "the at-tag marker `PI_CODING_AGENT` (cli.ts:13 @v0.83.0) must still be written"
+        );
+
+        let insert = r#"env_overlay.insert("AI_AGENT".to_string(), "cyrup".to_string());"#;
+        let at = src.find(insert).expect("`AI_AGENT` is written into the spawn overlay");
+        let annotation = &src[..at];
+        let annotation = &annotation[annotation.rfind("[CYRUP-DELTA").expect("a delta annotation")..];
+
+        assert!(
+            annotation.contains("@v0.84.1"),
+            "the delta line must state the TAG the key comes from; got: {annotation}"
+        );
+        assert!(
+            annotation.contains("AI_AGENT"),
+            "the delta line must name the KEY, not only its value; got: {annotation}"
+        );
+        assert!(
+            annotation.contains("v0.83.0"),
+            "the delta line must state that the key is ABSENT at the ported tag; got: {annotation}"
         );
     }
 

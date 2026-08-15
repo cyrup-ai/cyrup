@@ -90,7 +90,8 @@ pub use images::{
 };
 pub use model::{Modality, Model, ModelCost, ModelCostTier};
 pub use models_store::{
-    InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ProviderModelsStore,
+    InMemoryModelsStore, ModelsStore, ModelsStoreEntry, ModelsStoreOperationOptions,
+    ProviderModelsStore,
 };
 pub use remote_catalog::{
     CatalogOverlay, DEFAULT_CATALOG_BASE_URL, REMOTE_CATALOG_REFRESH_INTERVAL_MS, RefreshOptions,

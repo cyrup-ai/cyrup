@@ -47,8 +47,8 @@ pub enum EventKind {
     SessionCompact = 27,
     SessionBeforeTree = 28,
     SessionTree = 29,
-    /// `agent_settled` (Pi `AgentSettledEvent`, extensions/types.ts:721-725; subscribed at
-    /// types.ts:1225). Fired once an agent run has FULLY settled — no automatic retry, post-run
+    /// `agent_settled` (pi `AgentSettledEvent`, extensions/types.ts:721-725 @v0.83.0; subscribed at
+    /// `:1217` — EXT-073: the `:1225` this cited is `tool_execution_end`'s overload). Fired once an agent run has FULLY settled — no automatic retry, post-run
     /// compaction or queued continuation will follow. Pi emits it from the `finally` of
     /// `_runAgentPrompt` (agent-session.ts:1063-1072) via `_emitAgentSettled` (:581-588), which
     /// notifies the extension runner FIRST and the session subscribers second (SEAM-005).
@@ -58,7 +58,7 @@ pub enum EventKind {
     /// EXT-009.
     BeforeProviderHeaders = 31,
     /// `session_info_changed` (pi `SessionInfoChangedEvent`, extensions/types.ts:571-575 @v0.83.0,
-    /// subscribed at :1203). EXT-011.
+    /// subscribed at `:1193` — EXT-073: `:1203` is `session_compact`'s overload). EXT-011.
     SessionInfoChanged = 32,
 }
 

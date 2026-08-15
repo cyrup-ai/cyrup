@@ -234,6 +234,10 @@ impl bindings::cyrup::ext::registration::Host for HostState {
         guest.add_renderer(custom_type);
     }
 
+    /// [CYRUP-DELTA] EXT-062: cyrup-original CALL for an upstream FIELD —
+    /// `RegisteredCommand.getArgumentCompletions?` (`extensions/types.ts:1166` @v0.83.0), which a pi
+    /// guest passes inline to `registerCommand`. A WIT record cannot carry a closure, so the flag
+    /// crosses here and the closure stays guest-side behind the `get-argument-completions` export.
     async fn add_autocomplete(&mut self, command: String) {
         let Ok(guest) = guest_of(self) else { return };
         // Record it in the SHARED registry as well as in `GuestState`, for the reason spelled out on
@@ -561,7 +565,7 @@ impl bindings::cyrup::ext::models::Host for HostState {
     async fn set_model(&mut self, model_json: String) {
         let Ok(guest) = guest_of(self) else { return };
         // GAP-11: `setModel` is allowed from ANY handler, matching Pi — Pi binds `setModel` with only
-        // `assertActive` (loader.ts:342-345), reachable from any handler, and it takes effect
+        // `assertActive` (loader.ts:359-362), reachable from any handler, and it takes effect
         // (agent-session.ts:1476-1490). We therefore do NOT gate this on the command tier. The op is
         // QUEUED (`control` is a synchronous mpsc push that touches no wasm store, host_services.rs
         // `control`) and applied at the store-free turn-boundary drain
@@ -580,7 +584,7 @@ impl bindings::cyrup::ext::models::Host for HostState {
     async fn set_thinking_level(&mut self, level: String) -> Result<(), String> {
         let guest = guest_of(self)?;
         // GAP-11: `setThinkingLevel` is allowed from ANY handler, matching Pi — Pi binds it with only
-        // `assertActive` (loader.ts:352-354; the runner emit is void/non-awaited,
+        // `assertActive` (loader.ts:369-372; the runner emit is void/non-awaited,
         // agent-session.ts:1541-1572) and it takes effect. We no longer gate on the command tier.
         //
         // The op is QUEUED (`control` is a synchronous mpsc push that touches no wasm store,
@@ -1218,6 +1222,26 @@ impl bindings::cyrup::ext::ctx_state::Host for HostState {
     async fn get_system_prompt(&mut self) -> String {
         guest_of(self).ok().and_then(|g| g.services.system_prompt()).unwrap_or_default()
     }
+    /// pi `ctx.getSystemPromptOptions()` (`extensions/types.ts:355` @v0.83.0) — the BAG behind the
+    /// string `get_system_prompt` returns (EXT-061).
+    ///
+    /// The one COMMAND-tier member of this interface, and the gate is upstream's own placement:
+    /// `getSystemPrompt()` is on the base `ExtensionContext` (`:346`), `getSystemPromptOptions()`
+    /// on `ExtensionCommandContext` (`:353-387`). An event-tier call gets the observable
+    /// deadlock-guard error, never a silent empty bag.
+    ///
+    /// With no backend the answer is pi's own no-backend default, `() => ({ cwd: this.cwd })`
+    /// (`core/extensions/runner.ts:287`, re-bound at `:350` @v0.83.0) — NOT an error and not `{}`.
+    /// That is what keeps this from being the declared-capability-with-a-dead-implementation shape
+    /// (EXT-066's finding): the import answers something upstream-correct on every backend.
+    async fn get_system_prompt_options(&mut self) -> Result<String, String> {
+        let guest = guest_of(self)?;
+        guest.require_command_tier()?;
+        let bag = guest.services.system_prompt_options().unwrap_or_else(|| {
+            serde_json::json!({ "cwd": guest.cwd().to_string_lossy().into_owned() })
+        });
+        Ok(bag.to_string())
+    }
     /// pi `ctx.cwd` (extensions/types.ts:315 @v0.83.0) — on the BASE `ExtensionContext`, so every
     /// handler and every tool `execute` can read it, not just command handlers (EXT-044). Sourced
     /// from the `HostConfig.cwd` copy `GuestState` takes at load time — the same value the native
@@ -1461,7 +1485,8 @@ impl LiveExtension {
     }
 
     /// Execute a guest-registered slash command (R-08-016). Mirrors Pi's
-    /// `RegisteredCommand.handler(args, ctx)` (types.ts:1109): runs at COMMAND tier (session-control
+    /// `RegisteredCommand.handler(args, ctx)` (types.ts:1167 @v0.83.0; EXT-072: `:1109` is
+    /// `skipConversationRestore`): runs at COMMAND tier (session-control
     /// ops are legal), passes the raw `args` string, returns the optional text result. A guest fault
     /// is contained as a typed `ExtError`.
     pub async fn execute_command(
@@ -1564,7 +1589,7 @@ impl LiveExtension {
     }
 
     /// Dynamic argument completions for a guest command (Pi `getArgumentCompletions(prefix)`,
-    /// types.ts:1108). A fault is surfaced as a typed `ExtError`.
+    /// types.ts:1166 @v0.83.0; EXT-072 corrected `:1108`). A fault is surfaced as a typed `ExtError`.
     pub async fn argument_completions(
         &self,
         name: &str,
