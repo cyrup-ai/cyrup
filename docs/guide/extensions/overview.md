@@ -127,7 +127,7 @@ commands and UI, and `--no-extensions` turns them off along with everything else
 
 **All three are off by default.** Each one arms on its own environment variable *or* on the mere
 presence of its config file. The config-file half is the one that surprises people — you can turn a
-native extension on without ever setting a variable, just by creating a file.
+native extension on without ever setting a variable, by creating a file and nothing else.
 
 [Subagents](subagents.md) delegates work to child `cyrup` processes, each with its own persona,
 model, tool set and depth budget. Runs go in the foreground or the background, in chains, in

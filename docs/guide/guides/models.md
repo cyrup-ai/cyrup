@@ -165,8 +165,8 @@ Each model declares which levels it supports:
 
 - A model that does not reason at all supports only `off`.
 - `off` through `high` are available unless the model explicitly marks one unsupported.
-- **`xhigh` and `max` exist only where a model declares them.** They are not universally available,
-  and a model synthesised by the unknown-id fallback never has them.
+- `xhigh` and `max` exist only where a model declares them. They are not universally available, and
+  a model synthesised by the unknown-id fallback never has them.
 
 Requests are clamped rather than rejected. Ask for a level a model does not support and you get the
 nearest supported level above it, or failing that the nearest below. `Shift+Tab` cycles only the
@@ -177,9 +177,9 @@ levels the active model actually supports; with no model installed the offered s
 
 Providers fall into two families and cyrup translates for both.
 
-**Token-budget providers** get a thinking-token budget: roughly 1k for `minimal`, 2k for `low`, 8k
-for `medium`, and 16k for `high`. These providers have no separate `xhigh` or `max`, so both collapse
-to `high`. Override the budgets in settings:
+Token-budget providers get a thinking-token budget: roughly 1k for `minimal`, 2k for `low`, 8k for
+`medium`, and 16k for `high`. These providers have no separate `xhigh` or `max`, so both collapse to
+`high`. Override the budgets in settings:
 
 ```json
 {
@@ -187,7 +187,7 @@ to `high`. Override the budgets in settings:
 }
 ```
 
-**Effort-string providers** get a reasoning-effort string mapped from the level by the model's own
+Effort-string providers get a reasoning-effort string mapped from the level by the model's own
 declaration — `high` becomes `reasoning_effort: "high"`, and so on.
 
 The starting level for every session comes from `defaultThinkingLevel`, which defaults to `off`:

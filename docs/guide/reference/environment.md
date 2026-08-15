@@ -139,8 +139,10 @@ credential, then the environment variable, then a key configured in `models.json
 | `zai` | `ZAI_API_KEY` |
 | `zai-coding-cn` | `ZAI_CODING_CN_API_KEY` |
 
-`ANTHROPIC_AUTH_TOKEN` is not honoured. Use `ANTHROPIC_API_KEY`, `ANTHROPIC_OAUTH_TOKEN`, or
-`/login`.
+Anthropic reads a third variable, `ANTHROPIC_AUTH_TOKEN`, and checks it **before** the other two.
+It is sent as an `Authorization: Bearer` header rather than as an API key, which is what
+Anthropic-compatible gateways expect. Because it never travels as `x-api-key`, it does not appear
+in the api-key table above — but it is honoured, and it wins if set.
 
 An API-key value may be a template: a leading `!` runs the rest as a shell command and uses its
 trimmed output, and `$VAR` or `${VAR}` interpolates. Write `$$` or `$!` for a literal.

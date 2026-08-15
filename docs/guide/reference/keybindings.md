@@ -1,7 +1,9 @@
 # Keys and slash commands
 
 Every key cyrup binds by default, every built-in slash command, and how to rebind them. `/hotkeys`
-prints an abbreviated version of this inside the session, resolved from your live bindings.
+prints an abbreviated version of this inside the session, resolved from your live bindings. For
+what the screen is telling you while you use these, see
+[The terminal interface](../guides/tui.md).
 
 Keys are written `Ctrl+P`, `Shift+Tab`, `Alt+Enter`. **On macOS, `Alt` is the Option key.**
 
@@ -40,8 +42,8 @@ Shortcuts registered by extensions are matched after this table and before the e
 4. A `!` or `!!` bash block is running — cancel it.
 5. The buffer starts with `!` — clear the buffer.
 6. The buffer is empty — start a 500 ms double-`Esc` window. A second `Esc` fires
-   `doubleEscapeAction`: `fork` opens the fork picker, `tree` (the default) opens the session tree,
-   `none` does nothing.
+   the [`doubleEscapeAction` setting](settings.md): `fork` opens the fork picker, `tree` (the
+   default) opens the session tree, `none` does nothing.
 7. Otherwise nothing happens.
 
 With the autocomplete popup open, `Esc` only dismisses the popup.
@@ -199,7 +201,7 @@ label editor is open it captures every key.
 | `/copy` | — | Copy the last agent message to the clipboard |
 | `/name` | session name | Set the session's display name |
 | `/session` | — | Print a table of file, id, message and tool counts, tokens and cost |
-| `/changelog` | — | Show what's new |
+| `/changelog` | — | Show the "What's New" block; this build ships no entries |
 | `/hotkeys` | — | Print the shortcut tables into the transcript |
 | `/fork` | — | Fork from an earlier user message |
 | `/clone` | — | Duplicate the session at the current position |

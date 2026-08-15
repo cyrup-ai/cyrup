@@ -106,6 +106,11 @@ or pin a set in settings:
 Bare entries are paths to load. Entries prefixed `+` or `-` are enable and disable overrides for a
 discovered skill by name or pattern; `cyrup config` writes those for you.
 
+When two skills share a name, exactly one wins, in this order: a path listed in project settings, an
+auto-discovered project skill, a path listed in global settings, an auto-discovered global skill, a
+package skill, and last a `--skill` argument. A package skill therefore beats one you named on the
+command line, which surprises people the first time.
+
 ## Prompt templates
 
 A prompt template is a markdown file that becomes a slash command named after the file. `/name args`
@@ -139,3 +144,26 @@ picker reports which changes could not be saved. `--approve` gets you past that 
 Packages are the other way skills and prompt templates arrive: a package can ship any of them
 alongside its extensions, and they are discovered without you listing a path. See
 [Installing extensions](../extensions/managing.md).
+
+## The off switches
+
+Each kind of project context has a flag that disables discovery for one run, and each takes a short
+form:
+
+| Flag | Short | Disables |
+|---|---|---|
+| `--no-context-files` | `-nc` | `AGENTS.md` and `CLAUDE.md` |
+| `--no-skills` | `-ns` | Skill discovery and loading |
+| `--no-prompt-templates` | `-np` | Prompt-template discovery |
+| `--no-themes` | — | Theme discovery |
+| `--no-extensions` | `-ne` | Extension discovery; explicit `-e` paths still load |
+
+They stack, so a run with none of your standing instructions is:
+
+```sh
+cyrup -nc -ns -np -p "summarise what this repository does, from the code alone"
+```
+
+That is the useful shape for reproducing a report, or for checking whether a bad answer came from
+the model or from something you told it three months ago.
+
