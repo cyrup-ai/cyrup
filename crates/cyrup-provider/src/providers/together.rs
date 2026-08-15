@@ -254,6 +254,38 @@ pub fn together_models() -> Vec<Model> {
             Some(m()),
             together_compat(false, Some(ThinkingFormat::Together)),
         ),
+        // Kimi K3 — a cyrup ADDITION, not a port. Upstream's Together catalog stops at K2.7-Code;
+        // K3 shipped 2026-07-26, after the pinned revision, and is the current flagship on this
+        // provider. Parity with pi is a floor, not a ceiling: shipping a model users want is a
+        // product decision, and it is recorded here rather than prevented.
+        //
+        // Values MEASURED from `GET https://api.together.xyz/v1/models` on 2026-08-15, not inferred:
+        // `context_length: 1000000`, `pricing.input: 3`, `pricing.output: 15`,
+        // `pricing.cached_input: 0.3`, `display_name: "Kimi K3"`. Input modalities are text+image.
+        //
+        // `max_tokens` is the one value the endpoint does NOT expose (there is no
+        // `max_output_tokens` field). 131_072 matches K2.7-Code and is accepted by the provider —
+        // verified with a live request, which returned `finish_reason: stop` rather than an error.
+        // It is a ceiling, not a promise: if K3's real limit is lower the server stops earlier and
+        // reports `length` honestly.
+        //
+        // `thinking_level_map` is deliberately `None` rather than the `m()` the K2.x rows carry.
+        // `m()` sets minimal/low/medium to explicit nulls, and `get_supported_thinking_levels`
+        // (`collection.rs:794-807`) reads an explicit null as UNSUPPORTED — which is why those rows
+        // offer only `off` and `high` (PROV-068). `None` leaves every rung implicit, so the full
+        // ladder is selectable. If PROV-068 resolves the other way (null meaning "supported, send
+        // no provider value"), this row still behaves correctly.
+        model(
+            "moonshotai/Kimi-K3",
+            "Kimi K3",
+            true,
+            true,
+            cost(3.0, 15.0, 0.3),
+            1_000_000,
+            131_072,
+            None,
+            together_compat(false, Some(ThinkingFormat::Together)),
+        ),
         model(
             "moonshotai/Kimi-K2.7-Code",
             "Kimi K2.7 Code",
@@ -407,10 +439,19 @@ mod tests {
     }
 
     #[test]
-    fn full_catalog_ported_verbatim_from_pi() {
+    fn full_catalog_ported_from_pi_plus_recorded_additions() {
         let models = together_models();
-        // Every model id present in Pi's `together.models.ts` (20 entries).
-        assert_eq!(models.len(), 20);
+        // Pi's `together.models.ts` (20 entries) PLUS every deliberate cyrup addition, which must
+        // be named here so an ACCIDENTAL extra row still fails. Parity is a floor, not a ceiling:
+        // this test guards against unintended drift, not against shipping a better catalog.
+        const ADDITIONS: &[&str] = &["moonshotai/Kimi-K3"];
+        assert_eq!(models.len(), 20 + ADDITIONS.len());
+        for id in ADDITIONS {
+            assert!(
+                models.iter().any(|m| m.id.as_str() == *id),
+                "recorded addition {id} is missing — remove it from ADDITIONS or restore the row"
+            );
+        }
         let find = |id: &str| {
             models
                 .iter()
