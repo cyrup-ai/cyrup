@@ -16,19 +16,28 @@ The `theme` setting takes three kinds of value.
 An explicit name — `"dark"`, `"light"`, or the name of a custom theme — is used verbatim, with no
 terminal probing at all.
 
-The auto pair, spelled `"light/dark"`, means "match the terminal": cyrup detects your terminal's
-polarity and picks the matching half, re-detecting when it changes.
+An auto pair — any two theme names with exactly one slash between them, `"light/dark"` being the
+obvious one — means "match the terminal": cyrup detects your terminal's polarity at startup and
+picks the matching half. It detects **once, at boot**, and does not re-theme when the terminal
+changes afterwards. (Terminals can push a colour-scheme notification, but nothing in cyrup consumes
+it, and enabling it without a consumer would feed escape sequences into your prompt as stray
+keystrokes. Committed transcript rows have also already gone to the terminal's own scrollback and
+could not be recoloured anyway.)
 
 Leaving `theme` unset also detects polarity, and if the detection is high-confidence, cyrup writes
 the result back into your settings. That is why an untouched install ends up with a concrete
 `theme` value after the first run.
 
-Detection tries the terminal's own background-colour queries first and falls back to `COLORFGBG`.
-Terminals that answer none of these get the default.
+Detection asks the terminal what it prefers before guessing at it: for an auto pair, the
+colour-scheme query first, then the background-colour query, then `COLORFGBG`. With no `theme`
+setting at all only the background-colour query and `COLORFGBG` are consulted. Terminals that answer
+none of these get the default.
 
 ## Writing a custom theme
 
-A theme is a JSON file with four fields:
+A theme is a JSON file with four fields. `colors` is a **closed set of 51 required roles**: a file
+that omits any of them does not load at all. The excerpt below shows the shape; it is not a complete
+file, and would be rejected as written. The full role list is in the table further down.
 
 ```json
 {
@@ -65,10 +74,10 @@ A theme is a JSON file with four fields:
 }
 ```
 
-`vars` is your own palette. `colors` assigns those colours to roles — around fifty of them, covering
-text and borders, status colours, message and tool-block backgrounds, markdown, syntax
-highlighting, diffs, and one colour per thinking level. `export` styles the HTML that `/export` and
-`/share` produce.
+`vars` is your own palette. `colors` assigns those colours to roles, covering text and borders,
+status colours, message and tool-block backgrounds, markdown, syntax highlighting, diffs, and one
+colour per thinking level. `export` styles the HTML that `/export` and `/share` produce; its three
+keys are optional, as is `vars`.
 
 Every colour value may be:
 
@@ -77,22 +86,48 @@ Every colour value may be:
 - an empty string, meaning inherit
 - an integer from 0 to 255, resolved through the xterm-256 palette
 
-The roles fall into groups, which is the practical way to work through them:
+These are the 51 roles, grouped the way the schema declares them. Every one of them must be present
+in `colors`:
 
-| Group | Covers |
+| Group | Roles |
 |---|---|
-| `text`, `accent`, `muted`, `dim`, `success`, `error`, `warning` | The base palette everything else falls back on |
-| `border`, `borderAccent`, `borderMuted` | Rules around the editor and selectors |
-| `userMessageBg`, `customMessageBg`, `selectedBg`, `tool*Bg` | Block backgrounds in the transcript |
-| `md*` | Rendered markdown: headings, links, code, quotes, lists |
-| `syntax*` | Syntax highlighting inside code blocks |
-| `toolDiffAdded`, `toolDiffRemoved`, `toolDiffContext` | Diffs from the `edit` and `write` tools |
-| `thinkingOff` … `thinkingMax` | One colour per thinking level, used for the editor border |
-| `bashMode` | The editor border while the buffer starts with `!` |
+| Core UI | `accent`, `border`, `borderAccent`, `borderMuted`, `success`, `error`, `warning`, `muted`, `dim`, `text`, `thinkingText` |
+| Backgrounds and content text | `selectedBg`, `userMessageBg`, `userMessageText`, `customMessageBg`, `customMessageText`, `customMessageLabel`, `toolPendingBg`, `toolSuccessBg`, `toolErrorBg`, `toolTitle`, `toolOutput` |
+| Markdown | `mdHeading`, `mdLink`, `mdLinkUrl`, `mdCode`, `mdCodeBlock`, `mdCodeBlockBorder`, `mdQuote`, `mdQuoteBorder`, `mdHr`, `mdListBullet` |
+| Tool diffs | `toolDiffAdded`, `toolDiffRemoved`, `toolDiffContext` |
+| Syntax highlighting | `syntaxComment`, `syntaxKeyword`, `syntaxFunction`, `syntaxVariable`, `syntaxString`, `syntaxNumber`, `syntaxType`, `syntaxOperator`, `syntaxPunctuation` |
+| Thinking-level borders | `thinkingOff`, `thinkingMinimal`, `thinkingLow`, `thinkingMedium`, `thinkingHigh`, `thinkingXhigh` |
+| Bash mode | `bashMode` |
 
-A role you do not name inherits. So does a reference to a `vars` key that does not exist, or one
-that forms a cycle — an unresolvable reference degrades to inherit rather than failing to load. You
-can start from a handful of roles and fill in the rest as they bother you.
+`thinkingMax` is the one optional role: leave it out and the `max` level borrows `thinkingXhigh`.
+Extra keys are allowed — their values are still checked for validity — but nothing reads them.
+
+**Naming a role is required; giving it a colour is not.** Set a role to `""` and it inherits the
+terminal's own colour, which is how you decline one without dropping it. A reference to a `vars` key
+that does not exist, or one that forms a cycle, degrades to inherit too — that case does not fail
+the load.
+
+A file that is missing required roles is reported like this and then skipped:
+
+```text
+Invalid theme "/Users/you/.cyrup/agent/themes/harbour.json":
+
+Missing required color tokens:
+  - syntaxOperator
+  - toolOutput
+
+Please add these colors to your theme's "colors" object.
+See the built-in themes (dark.json, light.json) for reference values.
+```
+
+That message is built but **nothing prints it today** — a theme that fails validation is dropped
+during discovery and the failure is not surfaced anywhere. If a theme you wrote never appears, an
+incomplete `colors` object is the first thing to check. (The message names `dark.json` and
+`light.json`, which are compiled into the binary rather than shipped as files; the role table above
+is the reference it means.)
+
+The other way a file is rejected is a `name` containing `/` — that character is reserved for the
+auto pair.
 
 ## Where theme files go
 
@@ -122,7 +157,7 @@ cyrup --theme ./design/harbour.json
 ## Selecting a custom theme
 
 **The `/settings` theme picker only lists the two compiled-in themes.** Custom themes do not appear
-in it, no matter where the file lives. To use one, set `theme` to its `name` in
+in it, no matter where the file lives. To name one, set `theme` to its `name` in
 `~/.cyrup/agent/settings.json` directly:
 
 ```json
@@ -132,6 +167,14 @@ in it, no matter where the file lives. To use one, set `theme` to its `name` in
 ```
 
 The name that matters is the `name` field inside the file, not the filename.
+
+**Naming a custom theme does not paint the interface with it at boot.** The startup theme resolver
+only knows the two compiled-in themes and falls back to `dark` for any other name, so a fresh run
+with `"theme": "harbour"` comes up in the built-in dark palette. What the name *does* do is pick the
+file cyrup watches: the theme is discovered, validated and listed in the startup resources panel, and
+the first save of that file after startup repaints the whole interface with its colours (see
+[Hot reload](#hot-reload) below). Editing and saving the file once is the working way to get a custom
+theme onto the screen today; there is no way to boot straight into one.
 
 ## Hot reload
 

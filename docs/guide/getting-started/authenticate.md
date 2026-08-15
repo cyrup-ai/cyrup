@@ -79,7 +79,7 @@ The twelve you are most likely to want:
 
 | Provider | Environment variable |
 |---|---|
-| `anthropic` | `ANTHROPIC_API_KEY` (`ANTHROPIC_OAUTH_TOKEN` is checked first) |
+| `anthropic` | `ANTHROPIC_API_KEY` (`ANTHROPIC_AUTH_TOKEN`, then `ANTHROPIC_OAUTH_TOKEN`, are checked first) |
 | `openai` | `OPENAI_API_KEY` |
 | `google` | `GEMINI_API_KEY` |
 | `openrouter` | `OPENROUTER_API_KEY` |
@@ -93,6 +93,11 @@ The twelve you are most likely to want:
 | `amazon-bedrock` | *(ambient AWS credentials)* |
 
 Note that `google` reads `GEMINI_API_KEY`, not `GOOGLE_API_KEY`.
+
+`ANTHROPIC_AUTH_TOKEN` is the one variable that is discovered but never turned into an API key: it
+has to travel as `Authorization: Bearer`, so cyrup skips past it when picking a literal key and
+falls through to `ANTHROPIC_OAUTH_TOKEN` or `ANTHROPIC_API_KEY`. Setting it alone still makes the
+provider report as configured.
 
 `amazon-bedrock` and `google-vertex` have no key variable of their own — they use whatever cloud
 credentials are already ambient in your shell, an AWS profile or access keys for Bedrock and

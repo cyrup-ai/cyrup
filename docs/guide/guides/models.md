@@ -20,8 +20,11 @@ cyrup --model openai/gpt-4o "explain this repo"
   carries the same id, cyrup falls through to partial matching rather than erroring.
 - **A partial name** — `sonnet`, `opus-4-6`. Any substring that identifies a model.
 - **A `:level` suffix** — `sonnet:high`, `anthropic/claude-opus-4-6:max`. The token is split on its
-  last colon and the tail must be one of the seven thinking levels; anything else is treated as part
-  of the model id, and resolution fails.
+  last colon and the tail must be one of the seven thinking levels. A tail that is not a level stays
+  part of the model id: on a known provider you end up with a custom model whose id still carries the
+  suffix (type `anthropic/claude-opus-4-6:hgih` and you get the `anthropic` provider with the model
+  id `claude-opus-4-6:hgih` — the provider prefix is stripped, the bad suffix is not), and otherwise
+  you get `Model "…" not found. Use --list-models to see available models.`
 
 `--provider` selects the provider separately, so `--provider openai --model gpt-4o` is equivalent to
 the prefixed form. A redundant prefix (`--provider openai --model openai/gpt-4o`) is stripped rather
@@ -32,7 +35,9 @@ than rejected.
 
 ### When the model is not in the catalog
 
-An unknown provider is a hard error that lists every provider id cyrup knows.
+An unknown provider is a hard error:
+`Unknown provider "acme". Use --list-models to see available providers/models.` The provider name is
+matched case-insensitively against the providers that have models in your registry.
 
 An unknown *model* on a *known* provider is not. cyrup synthesises a custom model id, warns
 `Model "<pattern>" not found for provider "<provider>". Using custom model id.`, and sends the
@@ -65,9 +70,14 @@ argument the whole list prints. With an argument you get a fuzzy filter: the que
 whitespace and `/` and every token must match, so `--list-models anthropic/sonnet` and
 `--list-models anthropic sonnet` are the same search.
 
+A following token that starts with `-` or `@` is *not* taken as the pattern. `cyrup --list-models
+@notes.md` lists the whole catalog and keeps `@notes.md` as a file attachment for the run; only a
+plain word (`--list-models gpt`) filters.
+
 **`--list-models` shows only providers you have authenticated.** It is a list of what you can use
-right now, not a catalog of what exists. An empty result usually means no credentials, not no
-models.
+right now, not a catalog of what exists. With no configured provider at all you get
+`No models available.` and the `/login` guidance instead of a table — the usual cause is missing
+credentials, not a missing model.
 
 ## Switching models in a session
 
@@ -157,7 +167,8 @@ Set one for a run with `--thinking high`, or attach it to a model with `--model 
 current level, so you can see your reasoning depth without looking anywhere else.
 
 A misspelled `--thinking` value is not a usage error. cyrup warns
-`Invalid thinking level "...". Valid values: ...`, drops the flag, and runs with no level set.
+`Invalid thinking level "...". Valid values: ...`, drops both the flag and its value, and the run
+starts at the default level as if you had not passed it.
 
 ### Availability is per model
 
@@ -170,8 +181,8 @@ Each model declares which levels it supports:
 
 Requests are clamped rather than rejected. Ask for a level a model does not support and you get the
 nearest supported level above it, or failing that the nearest below. `Shift+Tab` cycles only the
-levels the active model actually supports; with no model installed the offered set is `off` through
-`high`.
+levels the active model actually supports. On a model that does not reason — and in a session with
+no model at all — it changes nothing and prints `Current model does not support thinking`.
 
 ### What a level does at the provider
 
@@ -190,13 +201,21 @@ Token-budget providers get a thinking-token budget: roughly 1k for `minimal`, 2k
 Effort-string providers get a reasoning-effort string mapped from the level by the model's own
 declaration — `high` becomes `reasoning_effort: "high"`, and so on.
 
-The starting level for every session comes from `defaultThinkingLevel`, which defaults to `off`:
+The starting level for a new session comes from `defaultThinkingLevel`. **With the key unset that is
+`medium`** — a fresh install reasons at medium depth without you configuring anything. (It used to
+be `off`, because the settings getter folded "unset" into the type's zero value; every consumer now
+names `medium` explicitly.)
+
+Set the key to move that starting point. `"off"` is how you turn reasoning off by default:
 
 ```json
 {
-  "defaultThinkingLevel": "medium"
+  "defaultThinkingLevel": "off"
 }
 ```
+
+Two things override it. A resumed session keeps the level recorded in its own transcript, and a
+session that ends up with no model is forced to `off` whatever the setting says.
 
 **`CYRUP_REASONING_LEVEL` does not set the thinking level.** cyrup *exports* it into the environment
 of every shell command the agent runs, so a script can see what depth it was invoked at. Setting it
@@ -230,5 +249,18 @@ trimmed stdout becomes the key, and `$VAR` / `${VAR}` interpolate from the envir
 
 Alongside `models`, a provider block accepts `headers`, `compat` for protocol quirks, and
 `modelOverrides` for patching individual models — including the built-in ones — with a different
-`contextWindow`, `maxTokens`, `reasoning` flag, or `thinkingLevelMap`. A provider declared here is
-selectable with `--provider` and appears in `--list-models` once its key resolves.
+`contextWindow`, `maxTokens`, `reasoning` flag, `thinkingLevelMap`, or `samplingParams`. A provider
+declared here is selectable with `--provider` and appears in `--list-models` once its key resolves.
+
+`samplingParams` is the escape hatch for parameters cyrup does not model — `top_p`, `top_k`,
+`min_p`, `repetition_penalty`, anything your server accepts:
+
+```json
+{ "id": "internal-large", "samplingParams": { "top_p": 0.95, "min_p": 0.05 } }
+```
+
+The map is written onto the request body **last**, so a key here beats the `temperature` and
+`max_tokens` cyrup would otherwise send. A `modelOverrides` entry merges into it per key rather than
+replacing it, so a `top_p`-only patch leaves `min_p` alone. Only the three OpenAI-compatible wire
+protocols apply it (`openai-completions`, `openai-responses`, `azure-openai-responses`); every other
+api — including `openai-codex-responses` — ignores it silently.

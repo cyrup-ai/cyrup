@@ -18,7 +18,9 @@ Copilot and more — behind one set of flags. You authenticate once and switch b
 keystroke.
 
 Seven built-in tools (`read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`) that you can narrow to
-an allowlist, or turn off entirely for a read-only review session.
+an allowlist, or turn off entirely for a read-only review session. Four of the seven — `read`,
+`bash`, `edit`, `write` — are active in a default session; `grep`, `find` and `ls` are registered but
+off until you name them.
 
 Extensions as WebAssembly components, sandboxed by a capability manifest the host enforces. An
 extension gets filesystem, process, network or UI access only if it declared that it needs it.

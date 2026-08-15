@@ -64,10 +64,12 @@ available, cyrup says so and falls back to your default.
 
 `/resume` inside a running session opens the same picker. It is dense, so it is worth learning.
 
-Type anything to filter. Two prefixes change how the search works:
+Type anything to filter. Unquoted words are fuzzy-matched and every word has to match; `"a phrase"`
+in double quotes has to appear as a literal substring instead. The two forms combine in one query.
 
-- `re:pattern` treats the rest as a regular expression.
-- `"phrase"` matches the phrase exactly.
+The hint row also advertises `re:<pattern> regex`, and that one **does not work**: cyrup recognises
+the `re:` prefix but has no regex engine wired to it, so a `re:` query matches nothing at all and
+you get an empty list with no explanation. Use the fuzzy and phrase forms instead.
 
 The keys, all shown in the two hint rows above the search box:
 
@@ -120,8 +122,8 @@ Both leave the original session untouched, and both write a new session file in 
 
 | Key | Effect |
 |---|---|
-| `Alt+Left` | Fold the current node, or move up |
-| `Alt+Right` | Unfold, or move down |
+| `Alt+Left` (or `Ctrl+Left`) | Fold the current node, or move up |
+| `Alt+Right` (or `Ctrl+Right`) | Unfold, or move down |
 | `Ctrl+D` | Default filter |
 | `Ctrl+T` | Hide tool calls |
 | `Ctrl+U` | User messages only |
@@ -171,6 +173,10 @@ Those instructions are added to the summarisation prompt as additional focus —
 summary rather than replacing it. Run `/compact` at a natural boundary, when the current piece of
 work is finished, rather than mid-task.
 
+`Esc` cancels a compaction that is running. A deliberate cancel prints `Compaction cancelled`; a
+compaction that actually failed prints `Compaction failed: <reason>`. Both go to the error channel,
+and the two are worth telling apart — the first is you, the second is not.
+
 Four settings control the behaviour:
 
 | Key | Default | Meaning |
@@ -193,7 +199,14 @@ of compacting. Do that only if you would rather fork than summarise.
 
 A target ending in `.jsonl` writes the raw transcript, message for message. Any other target
 produces styled HTML — readable, self-contained, suitable for sending to someone. With no target at
-all, the HTML is rendered into the transcript instead of written to disk.
+all you still get a file: `cyrup-session-<session file stem>.html`, written in the directory cyrup
+was started from. Either way the status line is `Session exported to: <path>`. A session running
+with `--no-session` has no file to name the export after, so bare `/export` refuses it with
+`export error: cannot export an in-memory session to HTML`.
+
+`/export` takes exactly one path token, quote-aware: `/export "my notes.html"` writes `my
+notes.html`, an unmatched quote is treated as no argument at all, and anything after the first
+unquoted space is ignored.
 
 From outside cyrup:
 
@@ -203,16 +216,28 @@ cyrup --export session.jsonl notes.html
 
 `--export` names the session file to convert; the optional second argument is where the HTML goes,
 defaulting to the input filename with an `.html` extension. It converts and exits without starting
-a session, so it works on any session file, not just the current one.
+a session, so it works on any session file, not just the current one. It runs before the flag
+validation the rest of the command line goes through, which is deliberate — you reach for `--export`
+when a session is already in a state you cannot launch, and `cyrup --export s.jsonl --fork X
+--continue` still exports. An `@file` argument is never mistaken for the output path.
 
 `/import <path>` takes a `.jsonl` transcript, copies it into the current project's session
 directory, and resumes it. That is the other half of the raw export — the way to move a
-conversation between machines. The file you point at is left where it is.
+conversation between machines. The file you point at is left where it is. It takes the same one
+quote-aware token `/export` does, and with no argument it answers `Usage: /import <path.jsonl>`.
 
-`/share` renders the session to HTML and publishes it as a secret GitHub gist, then prints the URL.
-It shells out to the `gh` CLI, so `gh` has to be installed and logged in; the gist belongs to
-whichever account `gh` is authenticated as. "Secret" means unlisted, not private — anyone with the
-URL can read it, so check what is in the transcript first.
+`/share` renders the session to HTML and publishes it as a secret GitHub gist, then prints two
+lines — a viewer link and the gist itself:
+
+```text
+Share URL: https://pi.dev/session/#a1b2c3d4
+Gist: https://gist.github.com/you/a1b2c3d4
+```
+
+The viewer base is `https://pi.dev/session/` and `CYRUP_SHARE_VIEWER_URL` overrides it. `/share`
+shells out to the `gh` CLI, so `gh` has to be installed and logged in; the gist belongs to whichever
+account `gh` is authenticated as. "Secret" means unlisted, not private — anyone with the URL can
+read it, so check what is in the transcript first.
 
 `/copy` puts the last agent message on your clipboard, which is what you want far more often than
 a full export.
@@ -224,4 +249,9 @@ role, tool calls and results, input, output, cache-read and cache-write tokens, 
 quickest way to answer "how much has this conversation cost me" and "which file am I actually in".
 
 `/name <session name>` sets the display name, which is what the footer and the `/resume` picker
-show. `--name` does the same at launch.
+show. `--name` does the same at launch. The name is re-read from the session after the write and
+echoed back as `Session name set: <name>`, so if the store normalised what you typed you are told:
+`Session name was normalized from "…" to "…"`.
+
+Bare `/name` is a getter — it prints `Session name: <name>`. Only when the session has no name at
+all does it fall back to the warning `Usage: /name <name>`.

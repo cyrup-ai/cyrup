@@ -13,9 +13,22 @@ cyrup
 The screen is a transcript with an input editor at the bottom and a status line showing the current
 model and thinking level.
 
-If the project carries a `.cyrup/` directory or an `.agents/skills` folder, cyrup asks whether you
-trust it before loading anything from it. Answer *Trust* for your own repositories; an untrusted
-project still works, it just ignores that project's settings and extensions.
+If the project carries something trust-requiring, cyrup asks whether you trust it before loading
+anything from it. That means a `.cyrup/` holding any of `settings.json`, `extensions`, `skills`,
+`prompts`, `themes`, `SYSTEM.md` or `APPEND_SYSTEM.md` — or an `.agents/skills` directory in this
+folder or any ancestor short of your home directory. Answer *Trust* for your own repositories.
+
+An untrusted project still works, it just ignores that project's settings, resources and packages.
+It says so: the transcript opens with the warning line
+
+```text
+This project is not trusted. Project .cyrup resources and packages are ignored. Use /trust to save a
+trust decision, then restart cyrup.
+```
+
+and repeats it after any `/resume`, `/fork` or `/import` that swaps sessions — the check is re-run on
+every swap, so it reappears even when the session you swap to is in the same untrusted folder. If
+your project settings are not taking effect, that banner is the first thing to look for.
 
 ## Ask something
 

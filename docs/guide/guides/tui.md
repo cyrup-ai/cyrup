@@ -15,8 +15,9 @@ Top to bottom, the screen is a transcript, a status band, an input editor, and a
 Everything that has happened, in order: your messages, the model's response streaming in
 token by token, thinking blocks, tool executions, the output of `!` commands, and compaction
 summaries. Rows that are finished scroll into your terminal's own scrollback, so your normal
-scroll wheel and `Cmd+F` work on them. `PageUp` and `PageDown` scroll by ten lines within cyrup
-itself.
+scroll wheel and `Cmd+F` work on them. `PageUp` and `PageDown` scroll the live region by ten lines —
+unless your editor buffer is more than one line tall, in which case they page the cursor through
+what you are writing instead.
 
 On a fresh session, before you submit anything, the bottom of the transcript holds a hint bar:
 
@@ -24,8 +25,10 @@ On a fresh session, before you submit anything, the bottom of the transcript hol
 escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o more
 ```
 
-Below it, a line offering `Ctrl+O` for full startup help and loaded resources. The bar disappears
-on your first submission and does not come back.
+Below it, a line offering `Ctrl+O` for full startup help and loaded resources, and a closing line
+saying cyrup can explain its own features. The keys in the bar are read from your live keymap, so a
+rebind shows up here. The whole block disappears on your first submission and does not come back;
+on a short terminal it sheds its outer lines first, so the hint bar itself survives down to one row.
 
 ### The status band
 
@@ -35,20 +38,22 @@ when work starts. When something is running you get a braille spinner and a mess
 | Spinner message | What is happening |
 |---|---|
 | `Working...` | A turn is streaming |
-| retry message | The request failed and cyrup is retrying |
-| compaction message | Context is being compacted |
-| branch-summary message | A `/tree` branch is being summarised |
+| `Retrying (2/5) in 8s...` | The request failed and cyrup is counting down to a retry |
+| `Compacting context...` | Context is being compacted |
+| `Summarizing branch...` | A `/tree` branch is being summarised |
 
-The last three carry a `(<key> to cancel)` hint resolved from your live keymap.
+The last three carry a `(<key> to cancel)` hint resolved from your live keymap. `Working...` does
+not — there is nothing to say that `Esc` does not already do.
 
 ### The input editor
 
 A block of text between two horizontal rules, with no prompt glyph. It grows as you type, up to
 about a third of the terminal height.
 
-**The rule colour is a mode signal.** Green means the buffer starts with `!` — you are about to
-run a shell command, not talk to the model. Otherwise the rules take the colour of your current
-thinking level, so the border tells you your reasoning depth without looking anywhere else.
+**The rule colour is a mode signal.** The `bashMode` colour — green in both built-in themes — means
+the buffer starts with `!`: you are about to run a shell command, not talk to the model. Otherwise
+the rules take the colour of your current thinking level, so the border tells you your reasoning
+depth without looking anywhere else.
 
 ### The footer
 
@@ -58,7 +63,7 @@ the session name after a bullet. It truncates from the right with `...`.
 The second line is usage on the left and model on the right:
 
 ```text
-↑12.4k ↓3.1k R98k W12k CH76.3% $0.184 41.2%/200k (auto)          anthropic claude-sonnet-4-5 • high
+↑12.4k ↓3.1k R98k W12k CH76.3% $0.184 41.2%/200k (auto)        (anthropic) claude-sonnet-4-5 • high
 ```
 
 - `↑` input tokens and `↓` output tokens, summed across every turn in the session.
@@ -67,15 +72,21 @@ The second line is usage on the left and model on the right:
 - `CH` the cache hit rate of the most recent turn.
 - `$` the running cost. ` (sub)` after it means the cost is covered by a provider subscription.
 - `41.2%/200k` — how much of the model's context window is occupied, and how big that window is.
-  ` (auto)` means automatic compaction is on.
+  ` (auto)` means automatic compaction is on. Just after a compaction the occupancy is unknown until
+  the next response and the segment reads `?/200k`.
 
 **Watch the context percentage.** It turns amber above 70% and red above 90%. When it goes amber,
 finish the thought you are on and then run `/compact` at a natural boundary — you get a much
 better summary from a deliberate compaction than from the automatic one that fires when you run
 out of room mid-task. See [Sessions](sessions.md) for what compaction actually does.
 
-The right cluster is provider, model, and thinking level. A bold `xp` appears in the left cluster
-when experimental features are enabled.
+The right cluster is model and thinking level, with the provider in parentheses in front of it —
+that prefix appears only when you have more than one provider configured and only when the row is
+wide enough for it. A bold `xp` appears in the left cluster when experimental features are enabled
+(`CYRUP_EXPERIMENTAL=1`).
+
+A third footer line appears when an extension publishes a status; it is the only line cyrup leaves
+unstyled, so an extension's own colours survive.
 
 ## Interrupting
 
@@ -123,6 +134,8 @@ full list is in [Keys and slash commands](../reference/keybindings.md).
 is whatever `/scoped-models` says, or every available model if you have not scoped it. You can
 switch mid-conversation; the session keeps going.
 
+`Ctrl+L` opens the model selector directly — the same picker `/model` opens, unfiltered.
+
 `Shift+Tab` cycles the thinking level on the live model. The editor border changes colour to match
 and the footer's right cluster updates. See [Models and thinking](models.md).
 
@@ -130,6 +143,13 @@ and the footer's right cluster updates. See [Models and thinking](models.md).
 
 `Ctrl+O` toggles tool and bash output between collapsed and expanded, for the whole transcript.
 Collapsed is the default so a noisy `cargo build` does not bury the conversation.
+
+`Ctrl+T` hides and shows thinking blocks, reporting `Thinking blocks: hidden` or
+`Thinking blocks: visible` and persisting the choice as the `hideThinkingBlock` setting. It changes
+the block that is streaming and everything after it — rows already committed have gone to your
+terminal's own scrollback and keep the form they were drawn with.
+
+`Ctrl+X` copies the last assistant message to the clipboard, exactly as `/copy` does.
 
 ## Things you can type that are not prose
 
@@ -162,8 +182,10 @@ Typing `@` opens a fuzzy file picker over the whole tree — no `Tab` needed. Ac
 `@path` followed by a space. Paths with whitespace are quoted automatically as `@"my file.md"`, and
 typing an opening quote yourself lets you keep typing across spaces.
 
-The candidate list comes from `fd` when it is available and a bounded directory walk otherwise,
-capped at 2000 files, with `.git`, `node_modules`, `target` and `.cyrup` skipped.
+The candidate list is capped at 2000 files. It comes from `fd` when that is installed, which means
+your `.gitignore` is respected and `.git` is excluded; without `fd` cyrup falls back to a bounded
+in-process walk that ignores `.gitignore` and skips `.git`, `node_modules`, `target`, `.cyrup` and
+`.jj` by name.
 
 A bare path token — anything containing `/`, or starting with `.` or `~/` — opens a directory-scan
 popup instead. Directories complete without a trailing space so you can keep drilling down.
@@ -183,21 +205,35 @@ restored when you submit — the marker is a display convenience, not a truncati
 
 ## Queueing work while the agent is busy
 
-You do not have to wait for a turn to finish. Type your next instruction and press `Alt+Enter` to
-queue it. Each queued message gets a dim row above the status band:
+You do not have to wait for a turn to finish. Which queue a message lands in depends on the key:
+plain `Enter` during a streaming turn **steers** it, and `Alt+Enter` queues a **follow-up**. When
+nothing is streaming, `Alt+Enter` is an ordinary submit.
+
+Each queued message gets a dim row above the status band, and below them a hint naming the key that
+pulls them back:
 
 ```text
 Steering: also check the windows path handling
 Follow-up: then write a test for it
+↳ Alt+Up to edit all queued messages
 ```
+
+(On macOS that hint reads `Option+Up`.)
 
 **Steering** messages are delivered into the turn that is currently running — use them to redirect
 work in flight. **Follow-up** messages wait for the current turn to end and then start the next
 one. Both default to `one-at-a-time` delivery, so a queue of three gets handed over one per turn
 rather than all at once; `steeringMode` and `followUpMode` change that to `all`.
 
+Anything you submit while a compaction is running goes into a third queue and is delivered when the
+compaction finishes — an extension's own command still runs immediately.
+
 `Alt+Up` pulls every queued message back into the editor for editing. Aborting a turn with `Esc`
-does the same thing automatically.
+does the same thing automatically. Swapping session — `/resume`, `/fork`, `/import` — clears all
+three queues: they belonged to the session you left.
+
+A queued message is **not** written into the transcript until the turn that carries it starts. If
+you see it above the editor rather than in the conversation, it has not been sent yet.
 
 ## Slash commands
 
@@ -206,11 +242,11 @@ does the same thing automatically.
 | `/settings` | — | Open the settings grid |
 | `/model` | `provider/model` | Exact match switches directly; anything else opens the picker |
 | `/scoped-models` | — | Choose which models `Ctrl+P` cycles through |
-| `/export` | optional path | `.jsonl` writes the raw transcript; any other path writes styled HTML; no path renders the HTML into the transcript |
+| `/export` | optional path | `.jsonl` writes the raw transcript; any other path writes styled HTML; no path writes `cyrup-session-<file stem>.html` in the current directory |
 | `/import` | path to `.jsonl` | Import a session and resume it |
-| `/share` | — | Publish the session as a secret GitHub gist |
+| `/share` | — | Publish the session as a secret GitHub gist and print the viewer link |
 | `/copy` | — | Copy the last agent message to the clipboard |
-| `/name` | session name | Set the session's display name |
+| `/name` | optional session name | With a name, sets the session's display name; bare, prints the current one |
 | `/session` | — | Print a stats table for the current session |
 | `/changelog` | — | Push a "What's New" block into the transcript; there are no entries yet |
 | `/hotkeys` | — | Print the current keybindings into the transcript |
@@ -226,6 +262,12 @@ does the same thing automatically.
 | `/reload` | — | Reload keybindings, extensions, skills, prompts, themes and context files |
 | `/quit` | — | Quit |
 
+**Only six commands take an argument at all:** `/model`, `/export`, `/import`, `/name`, `/login` and
+`/compact`. Every other name matches on exact equality, so `/quit now`, `/copy that` and `/new
+session` are not commands — the whole line is sent to the model as a prompt. `/export` and `/import`
+take one quote-aware token (`/export "my session.html"` works, and the quotes are stripped); the
+other four take the rest of the line whole.
+
 The session commands — `/resume`, `/fork`, `/clone`, `/tree`, `/compact`, `/export` — are covered in
 depth in [Sessions](sessions.md), and `/trust` in
 [Project context and skills](project-context.md).
@@ -237,7 +279,8 @@ key again".
 There is no `/theme` or `/think` command — the theme lives in `/settings` and the thinking level
 on `Shift+Tab`.
 
-Extensions, prompt templates, and skills add their own commands to the completion list. Skills
+Extensions, prompt templates, and skills add their own commands to the completion list, in that
+order after the builtins: prompt templates first, then extension commands, then skills. Skills
 appear as `/skill:<name>` and can be turned off with the `enableSkillCommands` setting.
 
 ## Autocomplete
@@ -261,8 +304,18 @@ Every key resolves through a table, and you can replace any of them. Bindings li
 }
 ```
 
-Each id you set replaces that action's entire key set. Unknown ids are ignored. The full id list
-and the key-spec grammar are in [Keys and slash commands](../reference/keybindings.md).
+Each id you set replaces that action's entire key set. The full id list and the key-spec grammar are
+in [Keys and slash commands](../reference/keybindings.md). Four ids — `app.session.new`,
+`app.session.tree`, `app.session.fork` and `app.session.resume` — ship with no default key at all,
+so they exist only if you bind them.
+
+A bad entry costs you that entry and nothing else. A value that is neither a string nor a list of
+strings leaves that action on its default; an unparseable key spec drops that one key and the other
+keys in the same list still apply. Each rejection is reported by binding id —
+`warning: <path>: ignoring <id>: <reason>` at startup, `keybindings: ignoring <id>: <reason>` after
+a `/reload` — and the rest of the file takes effect. An id no keymap owns is skipped without a
+message. Only JSON that does not parse, or a top level that is not an object, drops the whole
+document.
 
 Run `/reload` to apply an edit without restarting. It resets every map to its defaults before
 merging your file, so deleting an entry restores the default binding.

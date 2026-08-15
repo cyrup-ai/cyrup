@@ -26,7 +26,7 @@ SOFTWARE.
 THIRD-PARTY NOTICES
 
 cyrup is a Rust reimplementation whose behaviour is derived from four
-MIT-licensed TypeScript projects. Its source contains 18,827 citations
+MIT-licensed TypeScript projects. Its source contains 19,260 citations
 identifying the specific upstream file and line each Rust item mirrors. Those
 upstream projects are licensed as follows, and their copyright notices are
 reproduced here under the terms of the MIT License:
