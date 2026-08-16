@@ -435,7 +435,7 @@ pub struct AppState {
     /// Set when the user requested quit; the run loop observes it.
     pub should_quit: bool,
     /// Timestamp of the last `Ctrl+C` press, for the double-tap-to-exit gate (Pi `handleCtrlC`,
-    /// interactive-mode.ts:3361-3369): a second `Ctrl+C` within 500 ms exits; otherwise it clears the
+    /// interactive-mode.ts:3797-3805): a second `Ctrl+C` within 500 ms exits; otherwise it clears the
     /// editor and records the press time. `None` until the first press.
     last_sigint: Option<std::time::Instant>,
     /// Timestamp of the last Escape on an EMPTY editor, for Pi's 500 ms double-Escape window
@@ -2529,7 +2529,7 @@ impl<B: Backend> App<B> {
                 // end and does nothing.
                 AppAction::Redraw
             }
-            // `app.clear` (Ctrl+C, Pi `handleCtrlC` interactive-mode.ts:3361-3369): a second Ctrl+C
+            // `app.clear` (Ctrl+C, Pi `handleCtrlC` interactive-mode.ts:3797-3805): a second Ctrl+C
             // within 500 ms of the previous one EXITS — there is NO emptiness gate (Pi does not require
             // the editor to be empty; that is `Ctrl+D`'s rule, not `Ctrl+C`'s). Otherwise clear the
             // editor buffer and record the press time.
@@ -9845,7 +9845,7 @@ mod ctrl_c_tests {
         InputEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
     }
 
-    /// F10 — Pi `handleCtrlC` (interactive-mode.ts:3361-3369): a second Ctrl+C within 500 ms exits,
+    /// F10 — Pi `handleCtrlC` (interactive-mode.ts:3797-3805): a second Ctrl+C within 500 ms exits,
     /// with NO emptiness gate (the first press clears the editor and records the time even when the
     /// buffer is non-empty; only the timing — not emptiness — gates the exit).
     #[test]
