@@ -923,10 +923,17 @@ pub struct App<B: Backend> {
     /// live `!` bash block). During a turn the viewport pins at this floor and stops tracking
     /// per-tool content churn, so the terminal is reconstructed (`resize_viewport` → `reanchor_inline`)
     /// only on GENUINE geometry changes (terminal resize, editor multi-line growth, selector/overlay/
-    /// band) and the two idle↔active transitions per turn — never per completed tool. That stable
-    /// height is what lets ratatui cell-diff the message churn inside a fixed viewport with no full
-    /// repaint, eliminating the per-tool-call FLICKER. Reset to `0` the instant the turn goes idle so
-    /// the region collapses back to the compact editor/footer (the void-fix is preserved).
+    /// band), the two idle↔active transitions per turn, and COMMIT-FLUSH frames — never per tool
+    /// event. That stable height is what lets ratatui cell-diff the message churn inside a fixed
+    /// viewport with no full repaint, eliminating the per-tool-call FLICKER.
+    ///
+    /// The floor is RELEASED back down to the remaining content height on any frame that will flush a
+    /// commit (TUI-090): a mid-turn commit moves content OUT of the live region, and a viewport left
+    /// pinned above the remainder makes `Terminal::insert_before` send the flush directly to native
+    /// scrollback invisibly (ratatui-core `inline.rs:66-67` — "if the viewport takes up the whole
+    /// screen, all lines will be inserted directly into the scrollback buffer"). The release is what
+    /// keeps pi's scroll-into-history VISIBLE. Reset to `0` the instant the turn goes idle so the
+    /// region collapses back to the compact editor/footer (the void-fix is preserved).
     live_floor: u16,
     /// Where a spawned `/tree` navigation posts its outcome back to the run loop. Installed by
     /// [`App::install_tree_nav_channel`], which [`App::run`] calls once at startup. `None` when no
@@ -1987,7 +1994,20 @@ impl<B: Backend> App<B> {
         // per-tool FLICKER. Idle: drop the floor and size to the live content so the region collapses
         // to the compact editor/footer (void-fix).
         let turn_active = self.state.status.streaming || self.state.transcript.has_bash();
+        // TUI-090 — a commit pending flush means content has LEFT the live region (a finished tool, the
+        // finalized assistant text). If the floor is still pinned above the remaining content, the
+        // viewport is stale-full and `insert_before` sends the flush straight to native scrollback
+        // invisibly (ratatui-core inline.rs:66-67). Release the floor to the REMAINING content height on
+        // exactly the frames that will flush, so the shrink (resize_viewport, which runs before
+        // flush_committed below precisely so the insert lands above the correctly-anchored viewport)
+        // puts the flushed lines ON the screen, directly above the live tail. Between commits
+        // the floor stays grow-only — no per-tool-event reconstruction (the FLICKER fix is preserved);
+        // the release costs one shrink per COMMIT, which is the frame that visually requires it.
+        let flush_pending = !self.state.transcript.pending().is_empty();
         let desired = if turn_active {
+            if flush_pending && raw < self.live_floor {
+                self.live_floor = raw;
+            }
             self.live_floor = self.live_floor.max(raw).min(term_h);
             self.live_floor
         } else {
@@ -9915,14 +9935,18 @@ mod live_floor_tests {
         assert!(grown > idle, "viewport should grow for the live tool tail ({grown} vs idle {idle})");
 
         // The finished tools commit to native scrollback mid-turn (SCREEN-FILL fix): the live content
-        // collapses, but the floor HOLDS the viewport height so no reconstruction is triggered.
+        // collapses — and with a commit PENDING FLUSH the floor RELEASES to the remaining content
+        // height (TUI-090), so the flush lands on screen above the shrunken viewport instead of
+        // invisibly in scrollback. The grow-only hold now applies only BETWEEN commits (nothing
+        // pending flush); this is the one frame per commit where a shrink is visually required.
         app.transcript_mut().commit_finished_leading_tools();
         assert_eq!(app.state().transcript.active_tools().len(), 0, "finished tools left the tail");
         app.draw().unwrap();
         assert_eq!(
             app.viewport_height(),
-            grown,
-            "grow-only floor must hold the height across the mid-turn commit (no per-tool reconstruct)"
+            idle,
+            "with a commit pending flush and the live tail gone, the floor releases to the \
+             remaining content height (the compact chrome) so the flush stays visible (TUI-090)"
         );
 
         // Turn goes idle (AgentEnd clears `status.streaming`): the floor resets and the region
