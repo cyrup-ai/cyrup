@@ -8,6 +8,11 @@
 //! preserved (prompt-templates.ts:108); `description` comes from frontmatter or the first non-empty
 //! body line truncated to 60 chars (prompt-templates.ts:110-119); `argument-hint` is read from
 //! frontmatter (prompt-templates.ts:124).
+//!
+//! [CYRUP-DELTA] Pi derives `name` from the basename only (prompt-templates.ts:108) and scans
+//! roots non-recursively (prompt-templates.ts:136); cyrup namespaces the name by the template's
+//! path relative to the scan root (`flux/new.md` under a root -> `/flux/new`), the semantics of
+//! code-puppy's `_command_name_from_path` (spec/namespaced-prompt-templates.md).
 
 use std::path::{Path, PathBuf};
 
@@ -25,8 +30,9 @@ const DESCRIPTION_TRUNCATE: usize = 60;
 pub struct PromptTemplate {
     /// Normalized registry key (lower-cased) used for precedence/collision (R-09-024).
     pub key: ResourceKey,
-    /// The command name = file basename minus `.md`, **case preserved**
-    /// (prompt-templates.ts:108). `/name` matching is case-sensitive on this.
+    /// The command name = path relative to the scan root minus `.md`, components joined with
+    /// `/`, **case preserved** ([CYRUP-DELTA] spec/namespaced-prompt-templates.md; Pi uses the
+    /// basename only, prompt-templates.ts:108). `/name` matching is case-sensitive on this.
     pub name: String,
     /// From frontmatter `description`, or the first non-empty body line truncated to 60 chars +
     /// `...` (prompt-templates.ts:110-119).
@@ -42,20 +48,54 @@ pub struct PromptTemplate {
 
 impl PromptTemplate {
     /// Load a template from a markdown file (prompt-templates.ts:103-132).
-    pub fn load(
+    ///
+    /// The name is the file's path relative to `root`, `.md` stripped, components joined
+    /// with `/`, case preserved. [CYRUP-DELTA] Pi derives the name from the basename only
+    /// (prompt-templates.ts:108) and scans roots non-recursively (prompt-templates.ts:136);
+    /// cyrup namespaces by relative path so a directory of templates becomes a `/ns/name`
+    /// command family — the semantics of code-puppy's `_command_name_from_path`
+    /// (spec/namespaced-prompt-templates.md). Callers without a meaningful root use
+    /// [`Self::load`], which relativizes against the file's own parent and therefore
+    /// reproduces Pi's basename behavior exactly.
+    pub fn load_with_root(
         path: &Path,
+        root: &Path,
         scope: ResourceScope,
         origin: ResourceOrigin,
     ) -> Result<PromptTemplate, ResourceError> {
         let raw = std::fs::read_to_string(path)?;
         let (frontmatter, body) = parse_frontmatter(&raw);
 
-        // name = basename minus `.md`, case preserved (prompt-templates.ts:108).
-        let name = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|f| f.strip_suffix(".md").unwrap_or(f).to_string())
-            .unwrap_or_default();
+        // Name = root-relative path, `.md` stripped from the leaf, components joined with
+        // `/`. Both failure modes map to the same Manifest error the basename derivation
+        // produces today: a non-UTF-8 component, and an empty leaf stem (a file literally
+        // named `.md`). NB: the stem comes from `file_name` + `strip_suffix`, NOT
+        // `Path::file_stem` — `file_stem(".md")` is `Some(".md")` (dotfiles have no
+        // extension), which would silently load `/flux/.md` as `flux/` instead of erroring.
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let leaf = rel.file_name().and_then(|s| s.to_str()).unwrap_or_default();
+        let stem = leaf.strip_suffix(".md").unwrap_or(leaf);
+        let mut parts: Vec<&str> = Vec::new();
+        let mut utf8_ok = true;
+        for c in rel.parent().map(|p| p.components()).into_iter().flatten() {
+            match c.as_os_str().to_str() {
+                Some(s) => parts.push(s),
+                None => {
+                    utf8_ok = false;
+                    break;
+                }
+            }
+        }
+        let name = if utf8_ok && !stem.is_empty() {
+            let mut n = parts.join("/");
+            if !n.is_empty() {
+                n.push('/');
+            }
+            n.push_str(stem);
+            n
+        } else {
+            String::new()
+        };
         let key = ResourceKey::normalize(&name);
         if key.is_empty() {
             return Err(ResourceError::Manifest(format!(
@@ -82,6 +122,17 @@ impl PromptTemplate {
             scope,
             origin,
         })
+    }
+
+    /// Single-file load: the name is the basename — the path is relativized against its own
+    /// parent, reproducing Pi's derivation exactly (prompt-templates.ts:108).
+    pub fn load(
+        path: &Path,
+        scope: ResourceScope,
+        origin: ResourceOrigin,
+    ) -> Result<PromptTemplate, ResourceError> {
+        let root = path.parent().unwrap_or(path);
+        Self::load_with_root(path, root, scope, origin)
     }
 
     /// Expand this template against a raw args string (everything after `/name `), tokenizing it

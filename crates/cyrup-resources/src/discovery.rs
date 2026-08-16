@@ -1750,7 +1750,17 @@ fn load_one_skill(
     }
 }
 
-/// Prompt dirs are scanned **non-recursively** — only direct `.md` children (prompt-templates.ts:137-174).
+/// Deepest namespace nesting a prompt root will scan (spec/namespaced-prompt-templates.md
+/// §3.3). The root itself is depth 0; a directory at depth 8 is still scanned, its
+/// subdirectories are refused with a warning.
+const MAX_PROMPT_NAMESPACE_DEPTH: usize = 8;
+
+/// Prompt dirs are scanned **recursively** — subdirectories become command namespaces, so
+/// `flux/new.md` under a root registers as `/flux/new` (spec/namespaced-prompt-templates.md).
+/// [CYRUP-DELTA] Pi's `loadTemplatesFromDir` is non-recursive (prompt-templates.ts:136-174);
+/// the recursion and skip rules mirror code-puppy's `_is_in_skipped_namespace`
+/// (customizable_commands/register_callbacks.py), plus the skills walker's `node_modules`
+/// carve-out.
 fn scan_prompt_root(
     root: &Path,
     scope: ResourceScope,
@@ -1758,19 +1768,84 @@ fn scan_prompt_root(
     out: &mut Vec<PromptTemplate>,
     warnings: &mut Vec<ResourceWarning>,
 ) {
-    for md in direct_children(root, "md") {
-        let origin = ResourceOrigin::LooseFile {
-            scope,
-            root: origin_root.to_path_buf(),
+    scan_prompt_dir(root, root, scope, origin_root, 0, out, warnings);
+}
+
+/// Recursive prompt scan. Skip rules: no descent into `.`- or `_`-prefixed dirs or
+/// `node_modules`; directory symlinks are never followed (cycle-proof by construction);
+/// file symlinks load when the target is a regular `.md` file (Pi's own symlink handling,
+/// prompt-templates.ts:150-160). Children are sorted per directory for deterministic
+/// first-wins tie-breaking.
+#[allow(clippy::too_many_arguments)]
+fn scan_prompt_dir(
+    dir: &Path,
+    root: &Path,
+    scope: ResourceScope,
+    origin_root: &Path,
+    depth: usize,
+    out: &mut Vec<PromptTemplate>,
+    warnings: &mut Vec<ResourceWarning>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut children: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    children.sort();
+
+    for path in children {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
         };
-        match PromptTemplate::load(&md, scope, origin) {
-            Ok(t) => out.push(t),
-            Err(e) => warnings.push(ResourceWarning::new(
-                ResourceKind::Prompt,
-                md,
-                e.to_string(),
-            )),
+        let ft = meta.file_type();
+
+        if ft.is_symlink() {
+            if path.is_file() && path.extension().is_some_and(|e| e == "md") {
+                load_one_prompt(&path, root, scope, origin_root, out, warnings);
+            }
+            continue;
         }
+
+        if ft.is_dir() {
+            if name.starts_with('.') || name.starts_with('_') || name == "node_modules" {
+                continue;
+            }
+            if depth >= MAX_PROMPT_NAMESPACE_DEPTH {
+                warnings.push(ResourceWarning::new(
+                    ResourceKind::Prompt,
+                    path,
+                    "namespace depth exceeds 8",
+                ));
+                continue;
+            }
+            scan_prompt_dir(&path, root, scope, origin_root, depth + 1, out, warnings);
+        } else if ft.is_file() && path.extension().is_some_and(|e| e == "md") {
+            load_one_prompt(&path, root, scope, origin_root, out, warnings);
+        }
+    }
+}
+
+/// Load one template, namespaced against `root`; a load error becomes a warning — the same
+/// swallow-and-warn policy the flat scan had.
+fn load_one_prompt(
+    path: &Path,
+    root: &Path,
+    scope: ResourceScope,
+    origin_root: &Path,
+    out: &mut Vec<PromptTemplate>,
+    warnings: &mut Vec<ResourceWarning>,
+) {
+    let origin = ResourceOrigin::LooseFile {
+        scope,
+        root: origin_root.to_path_buf(),
+    };
+    match PromptTemplate::load_with_root(path, root, scope, origin) {
+        Ok(t) => out.push(t),
+        Err(e) => warnings.push(ResourceWarning::new(
+            ResourceKind::Prompt,
+            path,
+            e.to_string(),
+        )),
     }
 }
 

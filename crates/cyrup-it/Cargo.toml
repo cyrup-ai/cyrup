@@ -92,7 +92,11 @@ cyrup-ext               = { workspace = true }
 cyrup-session-svc       = { workspace = true }
 cyrup-modes             = { workspace = true }
 cyrup-sdk               = { workspace = true }
-cyrup-tui               = { workspace = true }
+# `scrollback-accumulator` arms the test-only `AppState::scrollback` mirror (TUI-092 F1) for
+# `tests/bin/wasm_renderer_screen.rs`'s `scrollback_text()` assertions. A dev edge only — this
+# crate has no `[lib]`/`[dependencies]`, so the feature can never reach the `cyrup` binary's
+# production build of `cyrup-tui`.
+cyrup-tui               = { workspace = true, features = ["scrollback-accumulator"] }
 cyrup-intercom          = { workspace = true }
 cyrup-permission-system = { workspace = true }
 cyrup-ext-subagents     = { workspace = true }

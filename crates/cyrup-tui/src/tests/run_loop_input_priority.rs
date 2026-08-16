@@ -25,7 +25,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 /// `app.rs` verbatim, at compile time.
-const APP_SRC: &str = include_str!("../app.rs");
+const APP_SRC: &str = include_str!("../app/run.rs");
 
 /// In the run loop's cancel-racing `select!`, the cancel arm is first, the input arm is second,
 /// and every ticker arm sits below both.

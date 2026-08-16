@@ -1,0 +1,466 @@
+use super::*;
+
+use super::run::RunCtx;
+
+/// How an arm handler leaves the run loop: continue polling, break the loop, or return `Ok(())`: continue polling, break the loop, or return `Ok(())`
+/// from [`App::run`] outright (the two control-flow exits the inline arm bodies used to take).
+pub(crate) enum RunFlow {
+    Continue,
+    Break,
+    ReturnOk,
+}
+
+impl App<CrosstermBackend<Stdout>> {
+    /// The boot-time UI seed (§7.2): the `/` menu registry, every persisted setting's
+    /// first-frame application, the window title, the auth/context snapshots and the
+    /// project-trust banner — moved verbatim from `App::run`'s setup. The session-swap
+    /// arm re-reads the same settings inline (it is the loop's control flow and stays
+    /// in `run.rs`).
+    pub(crate) async fn seed_session_ui(
+        &mut self,
+        session: &Arc<AgentSession>,
+        runtime: Option<&Arc<AgentSessionRuntime>>,
+    ) {
+        // The `/` menu's dynamic half (pi `interactive-mode.ts:1240-1300`). `slash_command_catalog()`
+        // already merges registered extension commands, prompt templates and skills — it was just
+        // never consumed outside RPC mode, so the interactive `/` list showed builtins only while an
+        // RPC client saw everything from the SAME session. Re-installed on session swap below, for
+        // the same reason the sinks are: a replacement session brings different extensions.
+        // …gated by `enableSkillCommands`, which Pi applies at exactly this seam
+        // (`interactive-mode.ts:613`) and nowhere else.
+        self.state
+            .editor
+            .set_registry(crate::commands::CommandRegistry::with_dynamic(
+                crate::commands::dynamic_commands_from_catalog_gated(
+                    &session.slash_command_catalog(),
+                    session.services().settings.effective().enable_skill_commands(),
+                ),
+            ));
+        // `editorPaddingX` + `showHardwareCursor` — Pi seeds both while CONSTRUCTING the editor and
+        // the TUI (`interactive-mode.ts:459` `new TUI(terminal, getShowHardwareCursor(), …)` and
+        // `:470-474` `new CustomEditor(…, { paddingX: getEditorPaddingX(), … })`), so the very first
+        // frame must already honour them. Re-applied on `/settings` cycle and on session swap below.
+        {
+            let eff = session.services().settings.effective();
+            self.state.editor.set_padding_x(eff.editor_padding_x());
+            self.state
+                .editor
+                .set_show_hardware_cursor(
+                    eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::from_process()),
+                );
+        }
+        // Honor the persisted `outputPad` at boot (Pi seeds `this.outputPad = getOutputPad()`,
+        // interactive-mode.ts:440): the transcript defaults to Pi's `1`, but a configured `0` must take
+        // effect on the first frame. Re-read after each session swap below (a swap resets the transcript).
+        self.state
+            .transcript
+            .set_output_pad(session.services().settings.effective().output_pad().max(0) as usize);
+        // Same for `hideThinkingBlock` (Pi seeds `this.hideThinkingBlock = getHideThinkingBlock()`
+        // before constructing any `AssistantMessageComponent`): the very first reasoning block must
+        // already honour the persisted setting.
+        self.state
+            .transcript
+            .set_hide_thinking_block(session.services().settings.effective().hide_thinking_block());
+        // `terminal.showImages` / `terminal.imageWidthCells` govern how a tool result's `image`
+        // content blocks render (TUI-007) — seed both before the first frame.
+        let eff = session.services().settings.effective();
+        self.state.show_images = eff.show_images();
+        self.state.transcript.set_show_images(self.state.show_images);
+        self.state
+            .transcript
+            .set_image_width_cells(eff.image_width_cells().clamp(1, u16::MAX as i64) as u16);
+        // TUI-009 — `doubleEscapeAction` had no consumer at all; the Escape chain reads it out of
+        // `AppState` because `apply_action` has no session in hand.
+        self.state.double_escape_action = eff.double_escape_action();
+        // TUI-032 — the `Warnings` submenu is built from this cache.
+        self.state.warn_anthropic_extra_usage =
+            eff.warnings().anthropic_extra_usage.unwrap_or(true);
+        // `terminal.showTerminalProgress` — the gate on the OSC 9;4 taskbar indicator. Pi re-reads
+        // it at each of its five call sites (`interactive-mode.ts:2865`/`:3057`/`:3076`/`:3090`/
+        // `:6041`); cyrup caches it here and re-seeds it on a `/settings` flip and on a session swap,
+        // which is the same liveness. Seeding only — never arms, since Pi arms only from an
+        // `agent_start`/`compaction_start`.
+        self.state.terminal_progress = crate::TerminalProgress::with_enabled(
+            eff.show_terminal_progress(),
+        );
+        // The automatic window title (Pi `updateTerminalTitle`, interactive-mode.ts:818-826, called
+        // at `:860` right after `init()`): `cyrup - <session name> - <cwd basename>`. Both inputs are
+        // read from the LIVE session here — the name Pi reads via `sessionManager.getSessionName()`
+        // and the cwd via `getCwd()` (the runtime's, which a `/resume` of a session recorded
+        // elsewhere moves; the process cwd is the fallback seeded in `AppState::new`). Refreshed on
+        // `session_info_changed` (`ingest_event`) and on every session swap (the `session_swapped`
+        // arm below), which is exactly Pi's `:2901` / `:1761` call sites.
+        // X7(b) — through [`Self::set_title_cwd`], NOT a bare `state.title_cwd = …`. That funnel is
+        // what also lands the value on the transcript as Pi's `ToolRenderContext.cwd`
+        // (`tool-execution.ts:126`), which `read`'s compact classification resolves its path against
+        // (`read.ts:336`, `resolveToCwd(rawPath, cwd)`). Assigning the field directly left
+        // `transcript.cwd()` at `None`, so the classification silently fell back to the PROCESS cwd
+        // — which is exactly what the paragraph above says can differ after a `/resume`.
+        if let Some(rt) = runtime.as_ref() {
+            self.set_title_cwd(rt.cwd().to_path_buf());
+        }
+        self.state.status.set_session_name(session.session_name().await);
+        if let Some(title) = self.update_terminal_title() {
+            write_terminal_title(&title);
+        }
+        // The footer's ` (sub)` marker (`footer.ts:138-145`). pi answers it per repaint from
+        // `modelRuntime.snapshot.auth`, which the runtime has already loaded by the time the first
+        // frame draws; cyrup reads `auth.json` once, here, so the very FIRST frame of a session
+        // started with a stored Pro/Max credential already shows the marker. Refreshed again on
+        // every credential change (`finish_login`, the `/logout` arm) and on session swap below.
+        self.refresh_auth_snapshot(session).await;
+        // …and, for the same reason, the context segment: upstream's `render()` reads
+        // `getContextUsage()` per frame (`footer.ts:108`), so a `/resume`d session shows its
+        // occupancy on the very first frame rather than only after the next assistant message.
+        self.refresh_context_usage(session).await;
+        // TUI-N04 — Pi's `renderInitialMessages()` runs `renderProjectTrustWarningIfNeeded()`
+        // straight after the replay (`interactive-mode.ts:3479-3485`). cyrup's replay is the
+        // caller's (`crates/cyrup/src/main.rs` for a `--resume`/`--continue` boot, the
+        // `session_swapped` arm below for a `/resume`/`/fork`/`/import`), so the check lands HERE
+        // rather than inside `replay_session_*`: pi's call is UNconditional, while cyrup's replay is
+        // skipped entirely when `raw_context_messages()` is empty — and a fresh session in an
+        // untrusted project is precisely the case that most needs the banner.
+        self.render_project_trust_warning_if_needed(session);
+    }
+
+    /// The loop-head budget diagnostic (TUI-092): surface an arm that blew [`ARM_BUDGET`]
+    /// on the previous iteration, drained on the first healthy iteration after it.
+    pub(crate) fn drain_over_budget_arm(&mut self) {
+            // TUI-092 — surface an arm that blew [`ARM_BUDGET`] on the previous iteration. Recorded
+            // by [`ArmGuard`]'s `Drop` (which cannot draw: it runs inside the arm, on a raw-mode
+            // terminal the frame owns) and drained HERE, on the first healthy iteration after it,
+            // so the diagnostic reaches the user as an ordinary transcript line. `push_warning`
+            // queues into `TranscriptView::pending`; every arm below ends in `draw_synchronized`,
+            // which paints it.
+            if let Ok(mut over) = OVER_BUDGET_ARM.lock()
+                && let Some(arm) = over.take()
+            {
+                self.state.transcript.push_warning(format!(
+                    "Warning: run-loop arm `{arm}` exceeded its {ARM_BUDGET:?} budget"
+                ));
+            }
+    }
+
+    pub(crate) fn on_spinner_tick(&mut self) -> Result<(), TuiError> {
+                    // The live `!` block's glyph and a running bash tool's `Elapsed` footer are
+                    // re-derived from `Instant::now()` inside `lines()` — invalidate so this tick
+                    // re-materialises them (once, not 3×). Quiet turns hit the cache and stay free.
+                    if self.state.transcript.bash_running()
+                        || self.state.transcript.has_running_elapsed_tool()
+                    {
+                        self.state.transcript.bump_render_tick();
+                    }
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_dialog_countdown_tick(&mut self) -> Result<(), TuiError> {
+                    self.tick_extension_dialog_countdown();
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_elapsed_tick(&mut self) -> Result<(), TuiError> {
+                    // Pi's `context.invalidate()` → `ui.requestRender()`: the `Elapsed` figure is
+                    // computed from `started_at` inside `lines()`, so the render cache must be
+                    // invalidated for the repaint to show a fresh value.
+                    self.state.transcript.bump_render_tick();
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_git_branch_poll(&mut self) -> Result<(), TuiError> {
+                    // Pi repaints only when the branch actually CHANGED (`notifyBranchChange` fires
+                    // inside `if (this.cachedBranch !== nextBranch)`); an unchanged `stat` draws
+                    // nothing.
+                    if self.poll_footer_git_branch() {
+                        self.draw_synchronized()?;
+                    }
+        Ok(())
+    }
+
+    pub(crate) fn on_bash_msg(&mut self, ctx: &mut RunCtx, msg: BashMsg) -> Result<(), TuiError> {
+                    // TUI-092 F3 — drain every queued BashMsg BEFORE drawing: a chatty `!` run
+                    // otherwise pays one full frame per output chunk. `try_recv`, not
+                    // `now_or_never`: `bash_rx` is the concrete `UnboundedReceiver` in scope, so
+                    // the drain is synchronous and constructs no future.
+                    let mut pending = std::collections::VecDeque::from([msg]);
+                    if let Some(rx) = ctx.bash_rx.as_mut() {
+                        while let Ok(msg) = rx.try_recv() {
+                            pending.push_back(msg);
+                        }
+                    }
+                    while let Some(msg) = pending.pop_front() {
+                        match msg {
+                            BashMsg::Chunk(chunk) => self.state.transcript.bash_append(&chunk),
+                            BashMsg::Done { exit_code, cancelled, truncated, full_output_path } => {
+                                // X13 — Pi's completion arm verbatim (`interactive-mode.ts:6347-6353`):
+                                //   this.bashComponent.setComplete(
+                                //       result.exitCode, result.cancelled,
+                                //       result.truncated ? {truncated:true, content:result.output} : undefined,
+                                //       result.fullOutputPath);
+                                // All FOUR fields, so `Output truncated. Full output: …`
+                                // (`bash-execution.ts:195-199`) is reachable in a LIVE session and not
+                                // only on replay. Recording into the session is NOT done here: it is
+                                // `executeBash`'s own `recordBashResult` (agent-session.ts:2628-2643),
+                                // which `AgentSession::execute_bash` already performs — with the
+                                // `truncated`/`fullOutputPath` fields intact, which is what puts the
+                                // warning back on the block after a `/resume`.
+                                self.state.transcript.bash_complete(
+                                    exit_code,
+                                    cancelled,
+                                    truncated,
+                                    full_output_path,
+                                );
+                                self.state.transcript.commit_bash();
+                                ctx.bash_rx = None;
+                                // `Done` is terminal — the producer sends it last and drops its
+                                // sender, so nothing legitimately follows it in the queue.
+                                break;
+                            }
+                        }
+                    }
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_overlay_ticked(&mut self) -> Result<(), TuiError> {
+                    // Pi's `setInterval(() => { this.invalidate(); this.tui.requestRender(); })`
+                    // (`fleet.ts:516-520`): let the component re-collect, and repaint only when it
+                    // says the frame actually changed — the same "no-op edge costs no draw" rule the
+                    // git-branch poll arm above follows.
+                    let mut changed = false;
+                    for overlay in self.state.overlays.iter_mut() {
+                        changed |= overlay.tick();
+                    }
+                    if changed {
+                        self.draw_synchronized()?;
+                    }
+        Ok(())
+    }
+
+    pub(crate) fn on_overlay_request(&mut self, ctx: &mut RunCtx, req: cyrup_session_svc::OverlayRequest) -> Result<(), TuiError> {
+                    // An extension handed over an interactive modal (Pi `ctx.ui.custom(factory,
+                    // { overlay: true, … })`). Its calling task is BLOCKED on the one-shot inside
+                    // `req.done` until the `ExtensionOverlay` we build here is dropped, which
+                    // happens on `Close` (`handle_overlay_key` pops it), on a session swap
+                    // (`rebind_session` clears the stack) or on quit.
+                    let cyrup_session_svc::OverlayRequest { overlay, done } = req;
+                    let adapter = ExtensionOverlay::new(overlay, done);
+                    // Arm the shared tick at THIS overlay's cadence before pushing, so the very
+                    // first refresh lands one interval from now rather than immediately.
+                    let refresh_ms = Overlay::refresh_ms(&adapter);
+                    ctx.overlay_tick = (refresh_ms > 0).then(|| {
+                        let period = std::time::Duration::from_millis(refresh_ms);
+                        // `interval_at`, not `interval`: the latter's first tick resolves
+                        // IMMEDIATELY, which would re-collect and repaint the frame we are about to
+                        // draw below for no reason.
+                        let mut interval =
+                            tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        interval
+                    });
+                    self.state.overlays.push(Box::new(adapter));
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_ui_request(&mut self, req: UiRequest) -> Result<(), TuiError> {
+                    // A loaded guest opened a `ui.*` dialog (L4 review §2.1). EVERY kind, including
+                    // `editor` (L4 review §3 — an INLINE dialog is now the default, matching Pi's
+                    // `ExtensionEditorComponent`; `$VISUAL`/`$EDITOR` is reachable only via the
+                    // dialog's own `Ctrl+G`, `AppAction::OpenExternalEditorForSelector`, above), opens
+                    // the matching input-slot selector via `open_extension_dialog` and waits for a
+                    // future key event to confirm/cancel it (`AppState::pending_ui_reply`).
+                    self.open_extension_dialog(req);
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_ui_effect(&mut self, ctx: &mut RunCtx, effect: UiEffect) -> Result<(), TuiError> {
+                    // The fire-and-forget counterpart of the `ui_rx` arm above: a loaded guest pushed
+                    // a `ui.*` mutator and did NOT block on a reply, so there is nothing to answer —
+                    // just apply it and redraw (Pi's mutators end in `this.ui.requestRender()`).
+                    if let UiEffect::SetTitle { title } = &effect {
+                        // Pi `setTitle` reaches the terminal, not a component
+                        // (`interactive-mode.ts:2238` → `terminal.ts:504-507`), so it is written here
+                        // on the crossterm path rather than inside the backend-generic
+                        // `apply_ui_effect`.
+                        write_terminal_title(title);
+                    }
+                    let reframe = matches!(effect, UiEffect::SetWorkingIndicator { .. });
+                    self.apply_ui_effect(effect);
+                    if reframe {
+                        // TUI-030 — pi's `Loader.setIndicator` re-arms its `setInterval` with the
+                        // extension's `intervalMs` (`loader.ts:69` → `:77-80` @v0.84.2). cyrup has
+                        // no timer per indicator: the run loop's single tick IS the animation
+                        // clock, so the
+                        // new period has to replace it here, next to the `SetTitle` write above and
+                        // for the same reason — it is run-loop state `apply_ui_effect` cannot reach.
+                        // Without this a `frames`-heavy indicator with a 40 ms `intervalMs` would
+                        // still only be sampled every 80 ms.
+                        ctx.spinner = tokio::time::interval(self.state.indicator.spinner_period());
+                        ctx.spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_ext_error(&mut self, err: cyrup_ext::ExtensionError) -> Result<(), TuiError> {
+                    // A guest handler faulted and the dispatcher CONTAINED it (R-08-036). Pi shows
+                    // it: `onError: (error) => this.showExtensionError(...)`
+                    // (`interactive-mode.ts:1700-1701`). Without this arm the fault reached only
+                    // `tracing`, so a broken extension silently ate its hook — or silently denied a
+                    // tool — with nothing on screen (TUI-S02).
+                    self.show_extension_error(&err);
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_shortcut_status(&mut self, msg: String) -> Result<(), TuiError> {
+                    self.state.transcript.push_status(msg);
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_compact_outcome(&mut self, outcome: CompactOutcome) -> Result<(), TuiError> {
+                    // A spawned `/compact` settled (TUI-055). The band was cleared by the
+                    // `compaction_end` event that preceded this message on the `events` stream.
+                    self.apply_compact_outcome(outcome);
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_lifecycle_outcome(&mut self, outcome: LifecycleOutcome) -> Result<(), TuiError> {
+                    // A spawned `/new`, `/reload`, `/import`, `/resume` or `/fork` settled
+                    // (TUI-092 §5b.2). On success the generation-watch arm has usually already
+                    // re-bound the UI off the runtime's bump, captioned by the optimistic
+                    // `pending_swap_status`; this arm carries the residue that needs `&mut self`
+                    // (the `/fork` editor re-seed, the `/reload` keybinding rebuild) and clears that
+                    // caption if the op turned out to have failed.
+                    self.apply_lifecycle_outcome(outcome);
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_queue_drain(&mut self, ctx: &mut RunCtx, drained: QueueDrain) -> Result<(), TuiError> {
+                    // A spawned take-all settled (TUI-092 §5b.1). Everything that used to follow
+                    // `drain_queue().await` inline happens here, in the same order: the
+                    // `clearAllQueues` interleave, the editor restore, then the abort.
+                    self.apply_queue_drain(drained, &ctx.session);
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_package_updates(&mut self, ctx: &mut RunCtx, maybe_updates: Option<Vec<String>>) -> Result<(), TuiError> {
+                    // Pi `:851-855` — `if (updates.length > 0) this.showPackageUpdateNotification(updates)`.
+                    // The producer only ever sends a non-empty list and then drops its sender, so the
+                    // receiver is retired here and the arm goes permanently pending: exactly one
+                    // notification per session, as upstream's single `.then()` gives.
+                    ctx.package_update_rx = None;
+                    if let Some(packages) = maybe_updates {
+                        self.state.transcript.push_package_updates(&packages);
+                        self.draw_synchronized()?;
+                    }
+        Ok(())
+    }
+
+    pub(crate) fn on_tmux_warning(&mut self, warning: &'static str) -> Result<(), TuiError> {
+                    // Pi `:866-868` — `showWarning`, whose copy is `Warning: {message}`
+                    // (`interactive-mode.ts:3885-3889`), the same framing the extension `notify`
+                    // path uses in `apply_ui_effect`.
+                    self.state.transcript.push_warning(format!("Warning: {warning}"));
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) async fn on_theme_switch(&mut self, ctx: &mut RunCtx, theme: cyrup_resources::Theme) -> Result<(), TuiError> {
+                    let _arm = ArmGuard::enter("theme_switch");
+                    // SEAM-T01 — a guest called `ctx.ui().set_theme(name)` and the name RESOLVED
+                    // (`TuiThemeAccess::set` rejected it otherwise, which is where pi's
+                    // `{success: false, error}` comes from). Pi's handler does two things
+                    // (`interactive-mode.ts:2406-2417` @v0.84.2): `themeController.setThemeName`,
+                    // which repaints, and — guarded on the value actually differing —
+                    // `settingsManager.setTheme(name)`, which persists. Both are done here, and both
+                    // are the SAME pair the `/settings → theme` confirm arm runs
+                    // (`SelectorKind::Theme` in `apply_selection`), so an extension switch and a
+                    // human switch cannot drift apart.
+                    let name = theme.key.as_str().to_string();
+                    // `from_theme_data`, not `UiTheme::builtin`: the listing this name came from is
+                    // the session's whole discovered set, so a file-backed custom theme is
+                    // switchable exactly as upstream's is, and would otherwise silently render as
+                    // `dark` (`UiTheme::builtin`'s unknown-name fallback).
+                    let projected = UiTheme::from_theme_data(&theme.data, 0);
+                    self.set_theme(projected);
+                    // [CYRUP-DELTA] vs `interactive-mode.ts:2412`: upstream guards the persist with
+                    // `if (this.settingsManager.getTheme() !== themeOrName)`. That guard is a pure
+                    // write-avoidance — writing the same value yields the same file — and cyrup
+                    // cannot evaluate it correctly here: the session's `SettingsManager` is a boot
+                    // snapshot that `ApplySetting` does not refresh (its own arm says the effective
+                    // view is re-read on `/reload`), so a stale read would SKIP a write that is
+                    // genuinely needed after an earlier switch. Persisting unconditionally is what
+                    // the human `/settings → theme` confirm arm already does, for the same reason.
+                    self.execute_command(
+                        AppCommand::ApplySetting { id: "theme".to_string(), value: name },
+                        &ctx.session,
+                        ctx.runtime.as_ref(),
+                    )
+                    .await;
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_login_msg(&mut self, msg: crate::login_dialog::LoginUiMsg) -> Result<(), TuiError> {
+                    // The spawned `/login` flow wants something: a prompt rendered, progress shown,
+                    // or the whole login settled (Pi's `prompt`/`notify` callbacks +
+                    // the `try`/`catch` around `loginProvider`, `interactive-mode.ts:5367-5374`,
+                    // `:5285-5296`). Answers travel back over the one-shot the message carried.
+                    self.apply_login_msg(msg);
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) async fn on_tree_nav_msg(&mut self, ctx: &mut RunCtx, msg: TreeNavMsg) -> Result<(), TuiError> {
+                    let _arm = ArmGuard::enter("tree_nav");
+                    // A spawned `/tree` navigation settled (Pi `interactive-mode.ts:4805-4820`). An
+                    // ABORTED summarization asks for the tree to be re-shown at the same entry, which
+                    // needs the session (`session_dag`), so it comes back as a follow-up command.
+                    if let Some(cmd) = self.apply_tree_nav_outcome(msg) {
+                        self.execute_command(cmd, &ctx.session, ctx.runtime.as_ref()).await;
+                    }
+                    self.draw_synchronized()?;
+        Ok(())
+    }
+
+    pub(crate) fn on_theme_changed(&mut self, ok: bool, theme_rx: &Option<tokio::sync::watch::Receiver<Arc<ThemeData>>>) -> Result<(), TuiError> {
+                    if ok && let Some(rx) = theme_rx.as_ref() {
+                        let data = rx.borrow().clone();
+                        self.set_theme(UiTheme::from_theme_data(&data, 0));
+                        self.draw_synchronized()?;
+                    }
+        Ok(())
+    }
+    /// The tmux keyboard-setup diagnostic (Pi `checkTmuxKeyboardSetup`, interactive-mode.ts:940-988,
+    /// wired at `:865-869`). Spawned, never awaited: Pi starts it alongside the version/package
+    /// checks and shows the warning whenever it settles, so a wedged `tmux show` (bounded at 2 s)
+    /// delays no frame. The sender is kept alive by the run loop (in [`RunCtx`]) for the same reason
+    /// `shortcut_status_tx` is: a closed channel would make its `select!` arm's `Some(..)` pattern
+    /// fail on every iteration.
+    pub(crate) fn spawn_tmux_keyboard_check()
+        -> (
+            tokio::sync::mpsc::UnboundedSender<&'static str>,
+            tokio::sync::mpsc::UnboundedReceiver<&'static str>,
+        )
+    {
+        let (tmux_warning_tx, tmux_warning_rx) =
+            tokio::sync::mpsc::unbounded_channel::<&'static str>();
+        let tx = tmux_warning_tx.clone();
+        tokio::spawn(async move {
+            if let Some(warning) = crate::tmux::check_keyboard_setup().await {
+                let _ = tx.send(warning);
+            }
+        });
+        (tmux_warning_tx, tmux_warning_rx)
+    }
+
+}

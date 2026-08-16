@@ -23,7 +23,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 /// `app.rs` verbatim, at compile time.
-const APP_SRC: &str = include_str!("../app.rs");
+const APP_SRC: &str = include_str!("../app/run.rs");
 
 /// Every `tokio::select!` in `app.rs` that races the app cancel token declares `biased;` as its
 /// first statement (comments in between are fine — the check ignores them).

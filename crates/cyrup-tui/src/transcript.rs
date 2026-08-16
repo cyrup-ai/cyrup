@@ -338,6 +338,30 @@ pub struct TranscriptView {
     /// `Box(outputPad, 1)`, assistant-message.ts:103, user-message.ts:31). Toggled live from
     /// `/settings` → "Output padding" (F12). Left-indents each message line; `0` renders flush-left.
     output_pad: usize,
+    /// Monotonic invalidation counter for the render cache (TUI-092 F2), bumped by EVERY public
+    /// `&mut self` mutator that changes what `lines()` would emit — see the bump list below.
+    /// `page_up`/`page_down` and `drain_committed` deliberately do NOT bump: scroll is applied at
+    /// paint time, and a flush does not change the live region.
+    render_generation: u64,
+    /// The materialised active region, valid iff its key matches
+    /// `(render_generation, width, theme.generation)` at request time. NOT an `Option`: the
+    /// workspace no-panic lints (Cargo.toml [workspace.lints.clippy]: unwrap/expect/panic = deny)
+    /// forbid the `expect("just populated")` an `Option` forces on the re-borrow, and the
+    /// derived `Default` is provably what `lines()` emits for a default view (empty everything →
+    /// empty lines, height 0), so the first call simply misses on `width` and populates.
+    render_cache: RenderCache,
+}
+
+/// One materialisation of the active region: the styled lines plus their wrapped display height,
+/// keyed by everything `lines()` + `wrapped_height()` read that is not `self` — the width and the
+/// theme generation — plus the content generation that covers every `self` field.
+#[derive(Default)]
+struct RenderCache {
+    generation: u64,
+    width: usize,
+    theme_generation: u64,
+    lines: Vec<Line<'static>>,
+    wrapped_height: usize,
 }
 
 impl TranscriptView {
@@ -367,12 +391,14 @@ impl TranscriptView {
     /// it (already-scrolled-off native scrollback is immutable, an accepted consequence of the
     /// content-sized-viewport architecture).
     pub fn set_output_pad(&mut self, pad: usize) {
+        self.bump_render_generation();
         self.output_pad = pad;
     }
 
     /// Set `terminal.showImages` (Pi `ToolExecutionComponent.showImages`): rasterize a tool result's
     /// `image` blocks inline, or fall back to Pi's `[Image: …]` text stand-in.
     pub fn set_show_images(&mut self, show: bool) {
+        self.bump_render_generation();
         self.show_images = show;
     }
 
@@ -385,6 +411,7 @@ impl TranscriptView {
     /// gate at `tool-execution.ts:331`). Off ⇒ a tool result's `image` blocks take the same
     /// `[Image: …]` text branch `showImages: false` takes, rather than rasterizing anyway.
     pub fn set_graphical_images(&mut self, graphical: bool) {
+        self.bump_render_generation();
         self.graphical_images = graphical;
     }
 
@@ -397,6 +424,7 @@ impl TranscriptView {
     /// Set `terminal.imageWidthCells` (Pi `maxWidthCells`): the cell width an inline image is
     /// clamped to. `0` is coerced to 1 so a degenerate setting cannot produce a zero-width raster.
     pub fn set_image_width_cells(&mut self, cells: u16) {
+        self.bump_render_generation();
         self.image_width_cells = cells.max(1);
     }
 
@@ -432,6 +460,7 @@ impl TranscriptView {
         cancel_hint: Option<String>,
         expand_hint: Option<String>,
     ) {
+        self.bump_render_generation();
         self.bash = Some(BashExecution::new(command, excluded));
         self.bash_cancel_hint = cancel_hint;
         self.bash_expand_hint = expand_hint;
@@ -439,6 +468,7 @@ impl TranscriptView {
 
     /// Append a streamed chunk to the live bash block (`appendOutput`). No-op if none is live.
     pub fn bash_append(&mut self, chunk: &str) {
+        self.bump_render_generation();
         if let Some(b) = self.bash.as_mut() {
             b.append_output(chunk);
         }
@@ -457,6 +487,7 @@ impl TranscriptView {
         truncated: bool,
         full_output_path: Option<String>,
     ) {
+        self.bump_render_generation();
         if let Some(b) = self.bash.as_mut() {
             b.set_complete(exit_code, cancelled, truncated, full_output_path);
         }
@@ -466,6 +497,7 @@ impl TranscriptView {
     /// (`interactive-mode.ts:6357` `setComplete(undefined, false)`), and the shape the interactive
     /// `!` runner uses while it has no spool file to point at.
     pub fn bash_complete_simple(&mut self, exit_code: Option<i32>, cancelled: bool) {
+        self.bump_render_generation();
         self.bash_complete(exit_code, cancelled, false, None);
     }
 
@@ -486,6 +518,7 @@ impl TranscriptView {
 
     /// Toggle the live bash block's expansion (`Ctrl+O`); returns the new state if a block is live.
     pub fn toggle_bash_expanded(&mut self) -> Option<bool> {
+        self.bump_render_generation();
         self.bash.as_mut().map(|b| {
             let next = !b.expanded();
             b.set_expanded(next);
@@ -500,6 +533,7 @@ impl TranscriptView {
     /// a fan-out upstream, not a choice between the bash block and the tool blocks. No-op when no
     /// block is live.
     pub fn set_bash_expanded(&mut self, expanded: bool) {
+        self.bump_render_generation();
         if let Some(b) = self.bash.as_mut() {
             b.set_expanded(expanded);
         }
@@ -508,6 +542,7 @@ impl TranscriptView {
     /// Commit the live bash block to scrollback (called once it has finished). A still-running block
     /// is committed as-is (e.g. on interrupt). No-op when none is live.
     pub fn commit_bash(&mut self) {
+        self.bump_render_generation();
         if let Some(b) = self.bash.take() {
             self.pending.push(Entry::Bash(b));
         }
@@ -539,6 +574,7 @@ impl TranscriptView {
         truncated: bool,
         full_output_path: Option<String>,
     ) {
+        self.bump_render_generation();
         let mut b = BashExecution::new(command, excluded);
         if !output.is_empty() {
             b.append_output(output);
@@ -583,6 +619,7 @@ impl TranscriptView {
     /// message that trails a skill block is added at `:3513-3521` with its own **unconditional**
     /// spacer, so it always carries one.
     pub fn push_user(&mut self, text: impl Into<String>) {
+        self.bump_render_generation();
         let text = text.into();
         let lead_spacer = self.chat_has_children();
         if let Some(block) = parse_skill_block(&text) {
@@ -619,6 +656,7 @@ impl TranscriptView {
 
     /// Append a chunk of assistant text to the in-flight streaming buffer (R-10-028 streaming).
     pub fn push_assistant_delta(&mut self, delta: &str) {
+        self.bump_render_generation();
         match &mut self.streaming {
             Some(buf) => buf.push_str(delta),
             None => self.streaming = Some(delta.to_string()),
@@ -634,6 +672,7 @@ impl TranscriptView {
     /// produces no `Markdown` child and no leading `Spacer(1)`. Testing `!t.is_empty()` let `"   "`
     /// through and gave it a blank upstream never emits.
     pub fn commit_assistant(&mut self, text: Option<String>) {
+        self.bump_render_generation();
         let final_text = text.or_else(|| self.streaming.take());
         self.streaming = None;
         if let Some(t) = final_text
@@ -647,6 +686,7 @@ impl TranscriptView {
     /// reasoning buffer too — an aborted turn shows neither its partial answer nor its partial
     /// thinking.
     pub fn discard_streaming(&mut self) {
+        self.bump_render_generation();
         self.streaming = None;
         self.thinking = None;
     }
@@ -656,6 +696,7 @@ impl TranscriptView {
     /// turn as their own section (`assistant-message.ts:115-166`), so the buffer is kept apart from
     /// the answer text.
     pub fn push_thinking_delta(&mut self, delta: &str) {
+        self.bump_render_generation();
         match &mut self.thinking {
             Some(buf) => buf.push_str(delta),
             None => self.thinking = Some(delta.to_string()),
@@ -674,6 +715,7 @@ impl TranscriptView {
     ///
     /// The `hideThinkingBlock` choice is frozen into the entry here — see [`Entry::Thinking`].
     pub fn commit_thinking(&mut self, text: Option<String>) {
+        self.bump_render_generation();
         let final_text = text.or_else(|| self.thinking.take());
         self.thinking = None;
         if let Some(t) = final_text
@@ -687,6 +729,7 @@ impl TranscriptView {
     /// the live reasoning block and every entry committed afterwards; already-flushed scrollback is
     /// immutable (see [`Entry::Thinking`]).
     pub fn set_hide_thinking_block(&mut self, hide: bool) {
+        self.bump_render_generation();
         self.hide_thinking = hide;
     }
 
@@ -701,6 +744,7 @@ impl TranscriptView {
     /// [`HIDDEN_THINKING_LABEL`]. See [`Self::hidden_thinking_label`] for why this is paint-time
     /// state rather than a value frozen at commit.
     pub fn set_hidden_thinking_label(&mut self, label: Option<String>) {
+        self.bump_render_generation();
         self.hidden_thinking_label = label;
     }
 
@@ -718,6 +762,7 @@ impl TranscriptView {
     /// hand — see [`ToolRun::call_id`]. This id-less form pairs its result by tool name alone, which
     /// cannot distinguish two concurrent calls to the same tool.
     pub fn push_tool_start(&mut self, name: impl Into<String>, args: Value) {
+        self.bump_render_generation();
         self.push_tool_start_rendered(name, None, args, None);
     }
 
@@ -735,6 +780,7 @@ impl TranscriptView {
         args: Value,
         rendered: Option<String>,
     ) {
+        self.bump_render_generation();
         self.active_tools.push(ToolRun {
             name: name.into(),
             call_id,
@@ -758,6 +804,7 @@ impl TranscriptView {
     /// (`this.pendingTools.get(event.toolCallId)`, interactive-mode.ts:3104); `None` falls back to
     /// the latest still-running tool.
     pub fn push_tool_update(&mut self, call_id: Option<&str>, partial: Option<Value>) {
+        self.bump_render_generation();
         let run = match call_id {
             Some(id) => self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id)),
             None => self.active_tools.iter_mut().rev().find(|r| !r.done),
@@ -796,6 +843,7 @@ impl TranscriptView {
     /// late preview by comparing `previewArgsKey` against the request key (`:381`), and once the
     /// result is in it is the result diff that renders (`formatEditResult`, `:220-226`).
     pub fn set_edit_preview(&mut self, call_id: Option<&str>, preview: Result<String, String>) {
+        self.bump_render_generation();
         let run = match call_id {
             Some(id) => {
                 self.active_tools.iter_mut().find(|r| !r.done && r.call_id.as_deref() == Some(id))
@@ -814,6 +862,7 @@ impl TranscriptView {
     /// Prefer [`Self::push_tool_end_rendered`] with the result's `toolCallId` — see
     /// [`ToolRun::call_id`] and [`Self::pending_run_mut`].
     pub fn push_tool_end(&mut self, name: impl Into<String>, is_error: bool, result: Option<Value>) {
+        self.bump_render_generation();
         self.push_tool_end_rendered(name, None, is_error, result, None);
     }
 
@@ -831,6 +880,7 @@ impl TranscriptView {
         result: Option<Value>,
         rendered: Option<String>,
     ) {
+        self.bump_render_generation();
         let name = name.into();
         // Decode the result's `image` content blocks ONCE here (`tool-execution.ts:331-350`), not on
         // every frame — a screenshot-sized PNG must never be re-decoded per redraw.
@@ -896,6 +946,7 @@ impl TranscriptView {
     /// Commit the active turn's tool executions into scrollback (called when the turn ends). Each
     /// becomes an [`Entry::Tool`]; still-running tools are committed as-is (marked done).
     pub fn commit_tools(&mut self) {
+        self.bump_render_generation();
         for mut run in self.active_tools.drain(..) {
             run.done = true;
             self.pending.push(Entry::Tool(run));
@@ -924,6 +975,7 @@ impl TranscriptView {
     /// keeps `streaming` clear whenever a tool finishes, so this guard is a safety net that also holds
     /// under interleaving.
     pub fn commit_finished_leading_tools(&mut self) {
+        self.bump_render_generation();
         if self.streaming.is_some() {
             return;
         }
@@ -944,6 +996,7 @@ impl TranscriptView {
 
     /// Toggle the tool-output expansion (`Ctrl+O`); returns the new state.
     pub fn toggle_tool_expanded(&mut self) -> bool {
+        self.bump_render_generation();
         self.tool_expanded = !self.tool_expanded;
         self.tool_expanded
     }
@@ -954,6 +1007,7 @@ impl TranscriptView {
     /// return` early-out, `:3888`), which the caller uses to decide whether to echo Pi's
     /// `Tool output: expanded|collapsed` status line.
     pub fn set_tool_expanded(&mut self, expanded: bool) -> bool {
+        self.bump_render_generation();
         let changed = self.tool_expanded != expanded;
         self.tool_expanded = expanded;
         changed
@@ -1100,6 +1154,7 @@ impl TranscriptView {
     /// render. cyrup's transcript holds no keymap, so the app pushes the resolved label here
     /// whenever bindings change (X9). `None` restores cyrup's default binding label.
     pub fn set_expand_hint(&mut self, label: Option<String>) {
+        self.bump_render_generation();
         self.expand_hint = label;
     }
 
@@ -1112,6 +1167,7 @@ impl TranscriptView {
     /// (`tool-execution.ts:126`), which `read`'s compact classification resolves its path against
     /// (`read.ts:336`). `None` falls back to the process cwd.
     pub fn set_cwd(&mut self, cwd: Option<std::path::PathBuf>) {
+        self.bump_render_generation();
         self.cwd = cwd;
     }
 
@@ -1131,17 +1187,58 @@ impl TranscriptView {
     /// `examples/extensions/custom-header.ts:22` (X1). The buffer is run through
     /// [`trim_partial_closing_fence`](crate::markdown::trim_partial_closing_fence) so a streaming code
     /// fence does not flicker open/closed (`markdown.ts:25-48`).
+    /// Invalidate the render cache. Called by every mutator on the bump list below; the next
+    /// [`cached_render`](Self::cached_render) misses on the generation key and recomputes once.
+    /// `wrapping_add`: a plain `+ 1` is a debug-build overflow panic (denied lints aside) after
+    /// 2^64 bumps; wrapping can only alias a cache entry built 2^64 generations ago, which no
+    /// session survives to observe.
+    fn bump_render_generation(&mut self) {
+        self.render_generation = self.render_generation.wrapping_add(1);
+    }
+
+    /// Invalidate the render cache for a timer-driven repaint (TUI-092 F2): the live `!`/`!!`
+    /// block's spinner glyph ([`BashExecution::render_lines`] → `started.elapsed()`,
+    /// bash.rs:204) and a running bash tool's `Elapsed …` footer (`render_bash`,
+    /// transcript.rs:2157) are computed from wall-clock time INSIDE `lines()`, so a frame that
+    /// mutates nothing must still re-materialise while time-derived content is live. Called by
+    /// the run loop's spinner tick (gated on `bash_running()`) and elapsed tick (gated on
+    /// `has_running_elapsed_tool()`) — never on content-quiet frames, which stay free.
+    pub fn bump_render_tick(&mut self) {
+        self.bump_render_generation();
+    }
+
+    /// The materialised active region, recomputed only when (generation, width, theme) changed.
+    /// The borrows are strictly sequential — check, build, assign, lend — so this is plain NLL,
+    /// no Polonius case, and the final reborrow needs no `unwrap`/`expect` (no-panic policy):
+    /// `render_cache` is a value, not an `Option`.
+    fn cached_render(&mut self, width: usize, theme: &UiTheme) -> &RenderCache {
+        let stale = self.render_cache.generation != self.render_generation
+            || self.render_cache.width != width
+            || self.render_cache.theme_generation != theme.generation;
+        if stale {
+            let lines = self.lines(width, theme); // the current body, unchanged
+            // Measure WRAPPED display rows, not logical lines: `markdown::render` emits ONE
+            // un-wrapped `Line` per prose paragraph, so counting `lines.len()` under-counts a long
+            // streaming paragraph. `wrapped_height` measures with the SAME word-wrap `render`
+            // applies (`Paragraph::line_count`). (Moved verbatim from the old `content_height`
+            // body, transcript.rs:1138-1143.)
+            let wrapped_height = wrapped_height(&lines, width);
+            self.render_cache = RenderCache {
+                generation: self.render_generation,
+                width,
+                theme_generation: theme.generation,
+                lines,
+                wrapped_height,
+            };
+        }
+        &self.render_cache
+    }
+
     /// The number of visual lines the active turn occupies at `width` — the message region's content
     /// height, used to **content-size** the inline viewport (ADR-0001 commitment #1, audit #1) so the
     /// empty turn never balloons into a void. `0` when nothing is streaming.
-    pub fn content_height(&self, width: usize, theme: &UiTheme) -> usize {
-        // Measure WRAPPED display rows, not logical lines: `markdown::render` emits ONE un-wrapped
-        // `Line` per prose paragraph (width is only consumed for tables/hr/code), so counting
-        // `lines().len()` under-counts a long streaming paragraph and the region is sized too short —
-        // clipping the newest text. `wrapped_height` measures with the SAME word-wrap
-        // `render` applies (`Paragraph::line_count`), so the active turn grows + stays tail-anchored
-        // (spec/tui/01 §3 overflow; the doc at [`TranscriptView::render`]).
-        wrapped_height(&self.lines(width, theme), width)
+    pub fn content_height(&mut self, width: usize, theme: &UiTheme) -> usize {
+        self.cached_render(width, theme).wrapped_height
     }
 
     fn lines(&self, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
@@ -3251,11 +3348,14 @@ impl Component for TranscriptView {
     /// the streaming partial is a wrapped `Paragraph` filling the region, tail-anchored so the newest
     /// text stays visible as it grows (spec/tui/01 §3 overflow).
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
-        let lines = self.lines(area.width as usize, theme);
+        let width = area.width as usize;
+        let (total, lines) = {
+            let cache = self.cached_render(width, theme);
+            (cache.lines.len(), cache.lines.clone())
+        };
         // Auto-scroll: keep the tail (newest text) visible when content exceeds the region height,
         // minus any user page-up offset (clamped so it can never scroll past the top).
         let inner_h = area.height as usize;
-        let total = lines.len();
         let max_scroll = total.saturating_sub(inner_h);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
         let scroll = max_scroll.saturating_sub(self.scroll_offset).min(u16::MAX as usize) as u16;
@@ -4939,5 +5039,388 @@ mod x_group_tests {
         assert_eq!(lang("a.yml"), Some("yaml"));
         assert_eq!(lang("nodots"), None, "`split(\".\").pop()` yields the whole name ⇒ no match");
         assert_eq!(lang("a.nope"), None);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod render_cache_tests {
+    //! The TUI-092 F2 render cache: key handling, the bump discipline, and the one invariant that
+    //! makes it safe — **a key hit is byte-identical to a fresh `lines()` compute on every frame**.
+    //! These tests live inside the module (not `src/tests/`) precisely so they can read and poison
+    //! the private `render_cache` / `render_generation` fields: the poison-sentinel pattern proves
+    //! a hit serves the STORED entry (no recompute), which no black-box observation can distinguish.
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// The impossible height planted into the cache to prove a hit serves the stored entry.
+    const POISON_HEIGHT: usize = 4242;
+
+    fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
+        let buf = terminal.backend().buffer();
+        let area = buf.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The core invariant, asserted after every step of a simulated turn: the cached entry equals
+    /// a fresh `lines()` + `wrapped_height()` compute at the same key.
+    fn assert_fresh(view: &mut TranscriptView, theme: &UiTheme, step: &str) {
+        let fresh = view.lines(80, theme);
+        let fresh_h = wrapped_height(&fresh, 80);
+        let cache = view.cached_render(80, theme);
+        assert_eq!(cache.lines, fresh, "stale cached lines after {step}");
+        assert_eq!(cache.wrapped_height, fresh_h, "stale cached height after {step}");
+        assert_eq!(view.content_height(80, theme), fresh_h, "stale content_height after {step}");
+    }
+
+    #[test]
+    fn a_default_view_starts_unprimed() {
+        let view = TranscriptView::new();
+        assert_eq!(view.render_generation, 0);
+        assert_eq!(view.render_cache.generation, 0);
+        assert_eq!(view.render_cache.width, 0);
+        assert!(view.render_cache.lines.is_empty());
+        assert_eq!(view.render_cache.wrapped_height, 0);
+    }
+
+    #[test]
+    fn the_first_content_height_populates_the_cache() {
+        let mut view = TranscriptView::new();
+        let theme = UiTheme::dark();
+        view.push_assistant_delta("hello **world**");
+        let h = view.content_height(80, &theme);
+        let fresh = view.lines(80, &theme);
+        assert_eq!(h, wrapped_height(&fresh, 80));
+        assert_eq!(view.render_cache.lines, fresh);
+        assert_eq!(view.render_cache.width, 80);
+        assert_eq!(view.render_cache.generation, view.render_generation);
+        assert_eq!(view.render_cache.theme_generation, theme.generation);
+    }
+
+    #[test]
+    fn a_key_hit_serves_the_cached_entry_without_recomputing() {
+        let mut view = TranscriptView::new();
+        let theme = UiTheme::dark();
+        view.push_assistant_delta("real content");
+        let _ = view.content_height(80, &theme);
+        view.render_cache.wrapped_height = POISON_HEIGHT;
+        assert_eq!(
+            view.content_height(80, &theme),
+            POISON_HEIGHT,
+            "same (generation, width, theme.generation) must hit and serve the stored entry"
+        );
+    }
+
+    #[test]
+    fn a_content_bump_misses_and_recomputes() {
+        let mut view = TranscriptView::new();
+        let theme = UiTheme::dark();
+        view.push_assistant_delta("real content");
+        let _ = view.content_height(80, &theme);
+        view.render_cache.wrapped_height = POISON_HEIGHT;
+        let generation = view.render_generation;
+        view.push_assistant_delta(" more");
+        assert!(
+            view.render_generation > generation,
+            "a bump-list mutator must advance the generation"
+        );
+        let fresh = view.lines(80, &theme);
+        assert_eq!(
+            view.content_height(80, &theme),
+            wrapped_height(&fresh, 80),
+            "the frame after a bump must re-materialise, not serve the poisoned entry"
+        );
+    }
+
+    #[test]
+    fn a_width_change_misses_and_recomputes() {
+        let mut view = TranscriptView::new();
+        let theme = UiTheme::dark();
+        view.push_assistant_delta("real content");
+        let _ = view.content_height(80, &theme);
+        view.render_cache.wrapped_height = POISON_HEIGHT;
+        let fresh = view.lines(81, &theme);
+        assert_eq!(view.content_height(81, &theme), wrapped_height(&fresh, 81));
+        assert_eq!(view.render_cache.width, 81);
+    }
+
+    #[test]
+    fn a_theme_generation_change_misses_and_recomputes() {
+        let mut view = TranscriptView::new();
+        let theme = UiTheme::dark();
+        view.push_assistant_delta("real content");
+        let _ = view.content_height(80, &theme);
+        view.render_cache.wrapped_height = POISON_HEIGHT;
+        let mut theme2 = theme.clone();
+        theme2.generation = theme.generation.wrapping_add(1);
+        let fresh = view.lines(80, &theme);
+        assert_eq!(view.content_height(80, &theme2), wrapped_height(&fresh, 80));
+        assert_eq!(view.render_cache.theme_generation, theme2.generation);
+    }
+
+    /// The bump census: every public mutator that changes what `lines()` emits must advance the
+    /// generation. Each case is `(name, setup, measured call)` — the setup (unmeasured) puts the
+    /// view in the state the measured call needs (a live bash block, a running tool, …), so the
+    /// assertion pins the MEASURED call's own bump. Delegating pairs (`push_tool_start` →
+    /// `push_tool_start_rendered`, `bash_complete_simple` → `bash_complete`, `push_tool_end` →
+    /// `push_tool_end_rendered`) advance the generation more than once, so the assertion is `>`.
+    #[test]
+    fn every_bump_list_mutator_advances_the_generation() {
+        type Step = (&'static str, fn(&mut TranscriptView), fn(&mut TranscriptView));
+        fn noop(_: &mut TranscriptView) {}
+        fn live_bash(v: &mut TranscriptView) {
+            v.start_bash("ls", false, None, None);
+        }
+        fn live_tool(v: &mut TranscriptView) {
+            v.push_tool_start("read", serde_json::json!({}));
+        }
+        let steps: Vec<Step> = vec![
+            ("set_output_pad", noop, |v| v.set_output_pad(2)),
+            ("set_show_images", noop, |v| v.set_show_images(false)),
+            ("set_graphical_images", noop, |v| v.set_graphical_images(false)),
+            ("set_image_width_cells", noop, |v| v.set_image_width_cells(30)),
+            ("set_expand_hint", noop, |v| v.set_expand_hint(Some("ctrl+x".to_string()))),
+            ("set_cwd", noop, |v| v.set_cwd(Some(std::path::PathBuf::from("/tmp")))),
+            ("start_bash", noop, |v| v.start_bash("ls", false, None, None)),
+            ("bash_append", live_bash, |v| v.bash_append("chunk")),
+            ("bash_complete", live_bash, |v| v.bash_complete(Some(0), false, false, None)),
+            ("bash_complete_simple", live_bash, |v| v.bash_complete_simple(Some(0), false)),
+            ("toggle_bash_expanded", live_bash, |v| {
+                v.toggle_bash_expanded();
+            }),
+            ("set_bash_expanded", live_bash, |v| v.set_bash_expanded(true)),
+            ("commit_bash", live_bash, |v| v.commit_bash()),
+            ("push_bash_execution", noop, |v| {
+                v.push_bash_execution("ls", false, "out", Some(0), false, false, None);
+            }),
+            ("push_user", noop, |v| v.push_user("hi")),
+            ("push_assistant_delta", noop, |v| v.push_assistant_delta("a")),
+            ("commit_assistant", |v| v.push_assistant_delta("a"), |v| {
+                v.commit_assistant(None);
+            }),
+            ("discard_streaming", |v| v.push_assistant_delta("a"), |v| v.discard_streaming()),
+            ("push_thinking_delta", noop, |v| v.push_thinking_delta("t")),
+            ("commit_thinking", |v| v.push_thinking_delta("t"), |v| {
+                v.commit_thinking(None);
+            }),
+            ("set_hide_thinking_block", noop, |v| v.set_hide_thinking_block(true)),
+            ("set_hidden_thinking_label", noop, |v| {
+                v.set_hidden_thinking_label(Some("L".to_string()));
+            }),
+            ("push_tool_start", noop, |v| v.push_tool_start("read", serde_json::json!({}))),
+            ("push_tool_start_rendered", noop, |v| {
+                v.push_tool_start_rendered("read", None, serde_json::json!({}), None);
+            }),
+            ("push_tool_update", live_tool, |v| {
+                v.push_tool_update(None, Some(serde_json::json!({ "content": [] })));
+            }),
+            ("set_edit_preview", live_tool, |v| v.set_edit_preview(None, Ok("diff".to_string()))),
+            ("push_tool_end", noop, |v| v.push_tool_end("read", false, None)),
+            ("push_tool_end_rendered", noop, |v| {
+                v.push_tool_end_rendered("read", None, false, None, None);
+            }),
+            ("commit_tools", live_tool, |v| v.commit_tools()),
+            ("commit_finished_leading_tools", |v| v.push_tool_end("read", false, None), |v| {
+                v.commit_finished_leading_tools();
+            }),
+            ("toggle_tool_expanded", noop, |v| {
+                v.toggle_tool_expanded();
+            }),
+            ("set_tool_expanded", noop, |v| {
+                v.set_tool_expanded(true);
+            }),
+        ];
+        assert_eq!(steps.len(), 32, "the bump census is 32 mutators — update both together");
+        for (name, setup, call) in steps {
+            let mut view = TranscriptView::new();
+            setup(&mut view);
+            let generation = view.render_generation;
+            call(&mut view);
+            assert!(
+                view.render_generation > generation,
+                "{name} must bump the render generation"
+            );
+        }
+    }
+
+    /// The exemption census: scroll-only and pending-only methods must NOT bump — a spurious bump
+    /// costs one recompute per call, and these fire on paths that must stay free (every
+    /// PageUp/PageDown, every status line).
+    #[test]
+    fn exempt_methods_never_advance_the_generation() {
+        type Step = (&'static str, fn(&mut TranscriptView), fn(&mut TranscriptView));
+        fn noop(_: &mut TranscriptView) {}
+        let steps: Vec<Step> = vec![
+            ("page_up", noop, |v| v.page_up(1)),
+            ("page_down", |v| v.page_up(2), |v| v.page_down(1)),
+            ("drain_committed", |v| v.push_user("q"), |v| {
+                v.drain_committed();
+            }),
+            ("push_status", noop, |v| v.push_status("s")),
+            ("push_loaded_resources", noop, |v| {
+                v.push_loaded_resources(vec![crate::startup::StartupLine::default()]);
+            }),
+            ("push_error", noop, |v| v.push_error("e")),
+            ("push_warning", noop, |v| v.push_warning("w")),
+            ("push_block", noop, |v| v.push_block("t", "m")),
+            ("push_package_updates", noop, |v| v.push_package_updates(&["pkg".to_string()])),
+            ("push_skill_invocation", noop, |v| v.push_skill_invocation("n", "c")),
+            ("push_custom_message", noop, |v| v.push_custom_message("l", "b")),
+            ("push_custom_message_rendered", noop, |v| {
+                v.push_custom_message_rendered("l", "b", Rendered::None);
+            }),
+            ("push_branch_summary", noop, |v| v.push_branch_summary("s")),
+            ("push_compaction_summary", noop, |v| v.push_compaction_summary(7, "s")),
+        ];
+        assert_eq!(steps.len(), 14, "the exemption census is 14 methods — update both together");
+        for (name, setup, call) in steps {
+            let mut view = TranscriptView::new();
+            setup(&mut view);
+            let generation = view.render_generation;
+            call(&mut view);
+            assert_eq!(
+                view.render_generation, generation,
+                "{name} is exempt and must NOT bump the render generation"
+            );
+        }
+        // Non-vacuous: the pending-pushers really did push (drain collects them all).
+        let mut view = TranscriptView::new();
+        view.push_status("s");
+        view.push_loaded_resources(vec![crate::startup::StartupLine::default()]);
+        view.push_error("e");
+        view.push_warning("w");
+        view.push_block("t", "m");
+        view.push_package_updates(&["pkg".to_string()]);
+        view.push_skill_invocation("n", "c");
+        view.push_custom_message("l", "b");
+        view.push_custom_message_rendered("l", "b", Rendered::None);
+        view.push_branch_summary("s");
+        view.push_compaction_summary(7, "s");
+        assert_eq!(view.drain_committed().len(), 11, "every pending-pusher landed one entry");
+    }
+
+    #[test]
+    fn bump_render_tick_advances_once_and_invalidates() {
+        let mut view = TranscriptView::new();
+        let theme = UiTheme::dark();
+        view.push_assistant_delta("real content");
+        let _ = view.content_height(80, &theme);
+        view.render_cache.wrapped_height = POISON_HEIGHT;
+        let generation = view.render_generation;
+        view.bump_render_tick();
+        assert_eq!(
+            view.render_generation,
+            generation + 1,
+            "a timer tick advances the generation by exactly one"
+        );
+        let fresh = view.lines(80, &theme);
+        assert_eq!(
+            view.content_height(80, &theme),
+            wrapped_height(&fresh, 80),
+            "the frame after a tick bump must re-materialise (the wall-clock inputs live in lines())"
+        );
+    }
+
+    #[test]
+    fn the_cache_never_serves_stale_lines_across_a_turn() {
+        let mut view = TranscriptView::new();
+        let theme = UiTheme::dark();
+        assert_fresh(&mut view, &theme, "fresh view");
+        view.push_user("read main.rs please");
+        assert_fresh(&mut view, &theme, "push_user");
+        view.push_thinking_delta("let me ");
+        assert_fresh(&mut view, &theme, "push_thinking_delta");
+        view.push_thinking_delta("think");
+        assert_fresh(&mut view, &theme, "more thinking");
+        view.push_assistant_delta("partial **mark");
+        assert_fresh(&mut view, &theme, "push_assistant_delta");
+        view.push_assistant_delta("down** text");
+        assert_fresh(&mut view, &theme, "more streaming");
+        view.push_tool_start("read", serde_json::json!({ "file_path": "main.rs" }));
+        assert_fresh(&mut view, &theme, "push_tool_start");
+        view.push_tool_update(None, Some(serde_json::json!({ "content": [] })));
+        assert_fresh(&mut view, &theme, "push_tool_update");
+        view.set_edit_preview(None, Ok("@@ diff".to_string()));
+        assert_fresh(&mut view, &theme, "set_edit_preview");
+        view.push_tool_end("read", false, Some(serde_json::json!({ "content": [] })));
+        assert_fresh(&mut view, &theme, "push_tool_end");
+        view.commit_finished_leading_tools();
+        assert_fresh(&mut view, &theme, "commit_finished_leading_tools");
+        view.start_bash("ls -la", false, None, None);
+        assert_fresh(&mut view, &theme, "start_bash");
+        view.bash_append("total 4");
+        assert_fresh(&mut view, &theme, "bash_append");
+        view.bash_complete_simple(Some(0), false);
+        assert_fresh(&mut view, &theme, "bash_complete_simple");
+        view.commit_bash();
+        assert_fresh(&mut view, &theme, "commit_bash");
+        view.commit_assistant(None);
+        assert_fresh(&mut view, &theme, "commit_assistant");
+        view.commit_thinking(None);
+        assert_fresh(&mut view, &theme, "commit_thinking");
+        view.commit_tools();
+        assert_fresh(&mut view, &theme, "commit_tools");
+        view.discard_streaming();
+        assert_fresh(&mut view, &theme, "discard_streaming");
+        view.toggle_tool_expanded();
+        assert_fresh(&mut view, &theme, "toggle_tool_expanded");
+        view.set_output_pad(0);
+        assert_fresh(&mut view, &theme, "set_output_pad");
+        // Exempt paths change nothing `lines()` emits, so the invariant holds across them too.
+        view.page_up(2);
+        assert_fresh(&mut view, &theme, "page_up (exempt)");
+        view.page_down(1);
+        assert_fresh(&mut view, &theme, "page_down (exempt)");
+        view.push_status("a status line");
+        assert_fresh(&mut view, &theme, "push_status (exempt)");
+        view.bump_render_tick();
+        assert_fresh(&mut view, &theme, "bump_render_tick");
+    }
+
+    #[test]
+    fn render_paints_the_cached_lines_not_a_recompute() {
+        let mut view = TranscriptView::new();
+        let theme = UiTheme::dark();
+        view.push_assistant_delta("real-streamed-text");
+        let mut terminal = Terminal::new(TestBackend::new(40, 6)).unwrap();
+        // Prime the cache at the paint width, then poison it: the paint must show the SENTINEL,
+        // proving `Component::render` reads the cache instead of re-running `lines()`.
+        let _ = view.content_height(40, &theme);
+        view.render_cache.lines = vec![Line::from("SENTINEL-LINE")];
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                view.render(frame, area, &theme);
+            })
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(text.contains("SENTINEL-LINE"), "paint must come from the cache:\n{text}");
+        assert!(
+            !text.contains("real-streamed-text"),
+            "a cache hit must not recompute the markdown:\n{text}"
+        );
+        // A content bump invalidates: the next paint re-materialises the real stream.
+        view.push_assistant_delta("-tail");
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                view.render(frame, area, &theme);
+            })
+            .unwrap();
+        let text = buffer_text(&terminal);
+        assert!(
+            text.contains("real-streamed-text-tail"),
+            "the post-bump paint must re-materialise:\n{text}"
+        );
     }
 }

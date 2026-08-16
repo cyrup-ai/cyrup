@@ -2,3 +2,6 @@
 **/*.rs.bk
 Cargo.lock.bak
 .DS_Store
+
+# Scratch/reference dumps — ignore `tmp` directories at any level
+tmp/
