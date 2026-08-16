@@ -174,3 +174,72 @@ fn an_unrescued_enter_still_submits() {
     let action = app.handle_input(&InputEvent::Key(enter()));
     assert_eq!(action, AppAction::Submit("hello".to_string()));
 }
+
+/// The Shift+Enter rescue inside the real reader-thread mapping (G63; `terminal.ts:316-327`).
+///
+/// `map_event_on` is where the input thread actually normalizes a key event, so these drive THAT
+/// with a synthesized `process.platform` / `TERM_PROGRAM` / native helper. The macOS and Windows
+/// probe bodies are unimplemented and unexercised — see `tests/native_shift_enter.rs`.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+mod native_shift_enter_mapping_tests {
+    use crate::app::*;
+    use crate::native_modifiers::ModifierKey;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use crate::InputEvent;
+    use ratatui::crossterm::event::Event;
+
+    fn enter() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn mapped_key(ev: Option<InputEvent>) -> KeyEvent {
+        match ev {
+            Some(InputEvent::Key(k)) => k,
+            other => panic!("expected a key event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_reader_rewrites_a_bare_enter_on_apple_terminal_when_shift_is_held() {
+        let mapped = map_event_on(enter(), "darwin", Some("Apple_Terminal"), |k| {
+            k == ModifierKey::Shift
+        });
+        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+    }
+
+    #[test]
+    fn the_reader_leaves_a_plain_enter_alone_when_shift_is_up() {
+        let mapped = map_event_on(enter(), "darwin", Some("Apple_Terminal"), |_| false);
+        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn the_reader_never_probes_on_a_platform_that_encodes_modifiers() {
+        let mapped =
+            map_event_on(enter(), "linux", None, |_| panic!("the probe must not run on linux"));
+        assert_eq!(mapped_key(mapped), KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn non_key_events_are_unaffected() {
+        assert!(matches!(
+            map_event_on(Event::Resize(10, 20), "darwin", Some("Apple_Terminal"), |_| true),
+            Some(InputEvent::Resize(10, 20))
+        ));
+        assert!(
+            map_event_on(
+                Event::Key(KeyEvent {
+                    kind: ratatui::crossterm::event::KeyEventKind::Release,
+                    ..KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+                }),
+                "win32",
+                None,
+                |_| true
+            )
+            .is_none(),
+            "releases are still filtered out"
+        );
+    }
+}
+

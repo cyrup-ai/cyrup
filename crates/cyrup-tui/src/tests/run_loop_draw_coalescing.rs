@@ -29,7 +29,12 @@
 use futures::{FutureExt, StreamExt};
 
 /// `app.rs` verbatim, at compile time.
-const APP_SRC: &str = include_str!("../app.rs");
+const APP_SRC: &str = include_str!("../app/run.rs");
+/// The arm bodies the `select!` skeleton dispatches to (§7.2): the channel/timer handlers live in
+/// `run_arms.rs`, the input/events drain handlers and the nested `AppAction` dispatch in
+/// `run_action.rs`.
+const ARMS_SRC: &str = include_str!("../app/run_arms.rs");
+const ACTION_SRC: &str = include_str!("../app/run_action.rs");
 
 /// The body of one run-loop arm: from the arm's first line to the start of the next arm.
 fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
@@ -58,10 +63,18 @@ fn the_run_loop_is_labelled_so_a_drained_quit_can_exit_it() {
         1,
         "the run loop must carry exactly one `'run` label"
     );
-    let input = arm_body(APP_SRC, "maybe_in = input.next() => {", "_ = spinner.tick()");
+    // The exit is a two-hop chain in the §7.2 skeleton: `dispatch_run_action` maps
+    // `AppAction::Quit` to `RunFlow::Break` (run_action.rs), and the select! arm maps
+    // `RunFlow::Break` to `break 'run` (run.rs) — still no further draw, still mid-drain.
+    let input = arm_body(APP_SRC, "maybe_in = input.next()", "_ = ctx.spinner.tick()");
     assert!(
-        input.contains("AppAction::Quit => break 'run"),
+        input.contains("RunFlow::Break => break 'run"),
         "a drained `Quit` must leave the run loop mid-drain with no further draw:\n{input}"
+    );
+    let dispatch = arm_body(ACTION_SRC, "AppAction::Quit", "AppAction::Suspend");
+    assert!(
+        dispatch.contains("return Ok(RunFlow::Break)"),
+        "`AppAction::Quit` must surface as `RunFlow::Break` for the arm's `break 'run`:\n{dispatch}"
     );
 }
 
@@ -69,7 +82,7 @@ fn the_run_loop_is_labelled_so_a_drained_quit_can_exit_it() {
 /// 100 deltas in one wakeup cost 100 state folds and 1 frame, not 100 frames.
 #[test]
 fn the_events_arm_drains_every_ready_event_then_draws_once() {
-    let arm = arm_body(APP_SRC, "maybe_ev = events.next() => {", "ok = theme_changed");
+    let arm = arm_body(ACTION_SRC, "fn on_session_event(", "ok = theme_changed");
     assert_eq!(
         arm.matches("draw_synchronized()").count(),
         1,
@@ -82,7 +95,7 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
         1,
         "exactly one events guard must bracket the whole drain:\n{arm}"
     );
-    let first = pos(arm, "let Some(first) = maybe_ev else { continue };");
+    let first = pos(arm, "let Some(first) = maybe_ev else { return Ok(RunFlow::Continue) };");
     let guard = pos(arm, "ArmGuard::enter(\"events\")");
     let drain = pos(arm, "events.next().now_or_never()");
     let draw = pos(arm, "draw_synchronized()");
@@ -94,14 +107,15 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
     // the by-value swap (which moves `ev`) stays a one-line change.
     let info = pos(arm, "let info_changed = matches!(ev, AgentSessionEvent::SessionInfoChanged { .. });");
     let settled = pos(arm, "let settled = matches!(ev, AgentSessionEvent::AgentSettled);");
-    let ingest = pos(arm, "self.ingest_session_event(&ev, &session).await;");
+    let ingest = pos(arm, "self.ingest_session_event(&ev, &ctx.session).await;");
     assert!(
         info < ingest && settled < ingest,
         "the event-kind booleans must be computed BEFORE the ingest call:\n{arm}"
     );
     // A guest's shutdown is still honored the moment it is detected, mid-drain.
     assert!(
-        pos(arm, "should_honor_extension_shutdown(&session, settled)") < pos(arm, "return Ok(());"),
+        pos(arm, "should_honor_extension_shutdown(&ctx.session, settled)")
+            < pos(arm, "return Ok(RunFlow::ReturnOk);"),
         "the extension-shutdown return stays immediate:\n{arm}"
     );
 }
@@ -111,7 +125,7 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
 /// backlog's PROCESSING (the reader thread's channel stays unbounded by design).
 #[test]
 fn the_input_arm_drains_every_queued_key_then_draws_once() {
-    let arm = arm_body(APP_SRC, "maybe_in = input.next() => {", "_ = spinner.tick()");
+    let arm = arm_body(ACTION_SRC, "fn on_input_event(", "fn on_session_event(");
     assert_eq!(
         arm.matches("draw_synchronized()").count(),
         1,
@@ -139,7 +153,7 @@ fn the_input_arm_drains_every_queued_key_then_draws_once() {
 /// never sees is not service").
 #[test]
 fn the_input_arm_marks_each_serviced_key_after_the_single_draw() {
-    let arm = arm_body(APP_SRC, "maybe_in = input.next() => {", "_ = spinner.tick()");
+    let arm = arm_body(ACTION_SRC, "fn on_input_event(", "fn on_session_event(");
     let draw = pos(arm, "draw_synchronized()");
     let marks_loop = pos(arm, "for _ in 0..serviced {");
     let mark = pos(arm, "mark_input_serviced();");
@@ -155,7 +169,7 @@ fn the_input_arm_marks_each_serviced_key_after_the_single_draw() {
 /// receiver.
 #[test]
 fn the_bash_arm_drains_with_try_recv_then_draws_once() {
-    let arm = arm_body(APP_SRC, "Some(msg) = bash_next => {", "() = overlay_ticked");
+    let arm = arm_body(ARMS_SRC, "fn on_bash_msg(", "fn on_overlay_ticked(");
     assert_eq!(
         arm.matches("draw_synchronized()").count(),
         1,
@@ -165,7 +179,7 @@ fn the_bash_arm_drains_with_try_recv_then_draws_once() {
     let draw = pos(arm, "draw_synchronized()");
     assert!(drain < draw, "the try_recv drain precedes the single draw:\n{arm}");
     assert!(
-        arm.contains("bash_rx = None;") && arm.contains("break;"),
+        arm.contains("ctx.bash_rx = None;") && arm.contains("break;"),
         "the terminal `Done` still clears the receiver and ends the drain:\n{arm}"
     );
 }
@@ -174,12 +188,12 @@ fn the_bash_arm_drains_with_try_recv_then_draws_once() {
 /// drain happens inside them, not by reordering arms or adding draws elsewhere.
 #[test]
 fn one_wakeup_one_frame_across_the_three_high_frequency_arms() {
-    for (arm, next) in [
-        ("maybe_in = input.next() => {", "_ = spinner.tick()"),
-        ("Some(msg) = bash_next => {", "() = overlay_ticked"),
-        ("maybe_ev = events.next() => {", "ok = theme_changed"),
+    for (src, arm, next) in [
+        (ACTION_SRC, "fn on_input_event(", "fn on_session_event("),
+        (ARMS_SRC, "fn on_bash_msg(", "fn on_overlay_ticked("),
+        (ACTION_SRC, "fn on_session_event(", "ok = theme_changed"),
     ] {
-        let body = arm_body(APP_SRC, arm, next);
+        let body = arm_body(src, arm, next);
         assert_eq!(
             body.matches("draw_synchronized()").count(),
             1,

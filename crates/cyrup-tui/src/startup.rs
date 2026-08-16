@@ -386,6 +386,52 @@ pub(crate) fn startup_lines(
     out
 }
 
+/// Render the `/arminsayshi` XBM bitmap as half-block art (`armin.ts`: 31×36, LSB-first, `1` =
+/// background, `0` = foreground; two vertical pixels packed per cell into `█`/`▀`/`▄`/space). A pure,
+/// deterministic transcript block (the animation effects are omitted as non-testable chrome).
+pub(crate) fn armin_art() -> String {
+    const WIDTH: usize = 31;
+    const HEIGHT: usize = 36;
+    const BYTES_PER_ROW: usize = WIDTH.div_ceil(8);
+    const BITS: [u8; 144] = [
+        255, 255, 255, 127, 255, 240, 255, 127, 255, 237, 255, 127, 255, 219, 255, 127, 255, 183,
+        255, 127, 255, 119, 254, 127, 63, 248, 254, 127, 223, 255, 254, 127, 223, 63, 252, 127,
+        159, 195, 251, 127, 111, 252, 244, 127, 247, 15, 247, 127, 247, 255, 247, 127, 247, 255,
+        227, 127, 247, 7, 232, 127, 239, 248, 103, 112, 15, 255, 187, 111, 241, 0, 208, 91, 253,
+        63, 236, 83, 193, 255, 239, 87, 159, 253, 238, 95, 159, 252, 174, 95, 31, 120, 172, 95, 63,
+        0, 80, 108, 127, 0, 220, 119, 255, 192, 63, 120, 255, 1, 248, 127, 255, 3, 156, 120, 255,
+        7, 140, 124, 255, 15, 206, 120, 255, 255, 207, 127, 255, 255, 207, 120, 255, 255, 223, 120,
+        255, 255, 223, 125, 255, 255, 63, 126, 255, 255, 255, 127,
+    ];
+    // `1` (background) → false; `0` (foreground) → true. Out-of-range rows are background.
+    let pixel = |x: usize, y: usize| -> bool {
+        if y >= HEIGHT {
+            return false;
+        }
+        let byte_index = y * BYTES_PER_ROW + x / 8;
+        match BITS.get(byte_index) {
+            Some(byte) => ((byte >> (x % 8)) & 1) == 0,
+            None => false,
+        }
+    };
+    let mut out = String::new();
+    let rows = HEIGHT.div_ceil(2);
+    for row in 0..rows {
+        for x in 0..WIDTH {
+            let upper = pixel(x, row * 2);
+            let lower = pixel(x, row * 2 + 1);
+            out.push(match (upper, lower) {
+                (true, true) => '█',
+                (true, false) => '▀',
+                (false, true) => '▄',
+                (false, false) => ' ',
+            });
+        }
+        out.push('\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
@@ -471,3 +517,4 @@ mod tests {
         assert!(lines.iter().any(|l| l.contains("✗ package/review (skipped)")), "{lines:?}");
     }
 }
+

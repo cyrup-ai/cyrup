@@ -127,10 +127,17 @@ fn a_replayed_bash_execution_replays_its_truncation_warning() {
 /// the funnel call. It fails on the bare-assignment form.
 #[test]
 fn no_production_site_assigns_title_cwd_outside_the_funnel() {
-    let src = std::fs::read_to_string(
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app.rs"),
-    )
-    .expect("app.rs is readable");
+    let app_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app");
+    let mut entries: Vec<_> = std::fs::read_dir(&app_dir)
+        .expect("src/app is readable")
+        .map(|e| e.expect("dir entry").path())
+        .collect();
+    entries.sort();
+    let src = entries
+        .iter()
+        .map(|p| std::fs::read_to_string(p).expect("app module file is readable"))
+        .collect::<Vec<_>>()
+        .join("\n");
 
     let assignments: Vec<&str> = src
         .lines()

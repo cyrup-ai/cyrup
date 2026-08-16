@@ -25,7 +25,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 /// `app.rs` and `transcript.rs` verbatim, at compile time.
-const APP_SRC: &str = include_str!("../app.rs");
+const APP_SRC: &str = include_str!("../app/run.rs");
+const ARMS_SRC: &str = include_str!("../app/run_arms.rs");
 const TRANSCRIPT_SRC: &str = include_str!("../transcript.rs");
 
 /// The body of one run-loop arm: from the arm's first line to the start of the next arm.
@@ -43,23 +44,30 @@ fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
 /// its zero-materialisation tick (the F2 win).
 #[test]
 fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
-    let arm = arm_body(APP_SRC, "_ = spinner.tick()", "_ = dialog_countdown.tick()");
+    let arm = arm_body(APP_SRC, "_ = ctx.spinner.tick()", "_ = dialog_countdown.tick()");
     assert!(
-        arm.contains("bash_running()") && arm.contains("has_running_elapsed_tool()"),
-        "the spinner arm's bump must be gated on live time-derived content \
-         (`bash_running()` covers the `!` block's glyph, `has_running_elapsed_tool()` the \
-         tool's `Elapsed` footer):\n{arm}"
+        arm.contains("bash_running()"),
+        "the spinner arm's guard must cover the `!` block's live glyph (`bash_running()`):\n{arm}"
     );
-    let bump = arm
+    // …and the handler additionally gates the bump on the tool's `Elapsed` footer
+    // (`has_running_elapsed_tool()`), inside `on_spinner_tick` (run_arms.rs).
+    assert!(
+        arm_body(ARMS_SRC, "fn on_spinner_tick(", "fn on_dialog_countdown_tick(")
+            .contains("has_running_elapsed_tool()"),
+        "the spinner bump must also be gated on the tool's live `Elapsed` footer"
+    );
+    // …and the arm's handler (`on_spinner_tick`, run_arms.rs) owns the bump-then-repaint body.
+    let body = arm_body(ARMS_SRC, "fn on_spinner_tick(", "fn on_dialog_countdown_tick(");
+    let bump = body
         .find("bump_render_tick()")
-        .unwrap_or_else(|| panic!("the spinner arm must invalidate the render cache:\n{arm}"));
-    let draw = arm
+        .unwrap_or_else(|| panic!("the spinner arm must invalidate the render cache:\n{body}"));
+    let draw = body
         .find("draw_synchronized()")
-        .unwrap_or_else(|| panic!("the spinner arm must repaint:\n{arm}"));
+        .unwrap_or_else(|| panic!("the spinner arm must repaint:\n{body}"));
     assert!(
         bump < draw,
         "the bump must precede the draw, so the very next `cached_render` misses once and the \
-         frame re-materialises:\n{arm}"
+         frame re-materialises:\n{body}"
     );
 }
 
@@ -68,15 +76,21 @@ fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
 #[test]
 fn the_elapsed_tick_bumps_before_repainting() {
     let arm = arm_body(APP_SRC, "_ = elapsed_tick.tick()", "_ = git_branch_poll.tick()");
-    let bump = arm
+    assert!(
+        arm.contains("has_running_elapsed_tool()"),
+        "the elapsed arm stays gated on a live `Elapsed` footer:\n{arm}"
+    );
+    // The arm's handler (`on_elapsed_tick`, run_arms.rs) owns the bump-then-repaint body.
+    let body = arm_body(ARMS_SRC, "fn on_elapsed_tick(", "fn on_git_branch_poll(");
+    let bump = body
         .find("bump_render_tick()")
-        .unwrap_or_else(|| panic!("the elapsed arm must invalidate the render cache:\n{arm}"));
-    let draw = arm
+        .unwrap_or_else(|| panic!("the elapsed arm must invalidate the render cache:\n{body}"));
+    let draw = body
         .find("draw_synchronized()")
-        .unwrap_or_else(|| panic!("the elapsed arm must repaint:\n{arm}"));
+        .unwrap_or_else(|| panic!("the elapsed arm must repaint:\n{body}"));
     assert!(
         bump < draw,
-        "the bump must precede the draw, so the repaint shows a fresh `Elapsed` figure:\n{arm}"
+        "the bump must precede the draw, so the repaint shows a fresh `Elapsed` figure:\n{body}"
     );
 }
 
