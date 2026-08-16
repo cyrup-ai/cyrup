@@ -5,3 +5,6 @@ Cargo.lock.bak
 
 # Scratch/reference dumps — ignore `tmp` directories at any level
 tmp/
+
+# Ad-hoc session batch/workflow driver scripts — scratch automation, not repo content
+/.workflows/
