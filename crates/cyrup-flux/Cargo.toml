@@ -1,0 +1,33 @@
+[package]
+name = "cyrup-flux"
+description = "Flux: structured, file-persisted AI development pipeline (native cyrup-ext extension; port of code-puppy flux)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+# The bundled prompt/skill tree is shipped content, not build input — `cargo package` drops it
+# unless it is named. Declaring `include` makes it the WHOLE manifest, hence the explicit
+# src/Cargo.toml entries alongside it (the `cyrup-permission-system/Cargo.toml:14-20` pattern).
+include = [
+    "src/**/*.rs",
+    "resources/**",
+    "Cargo.toml",
+]
+
+[lints]
+workspace = true
+
+[dependencies]
+# NB: no `default-features = false` — `HostServices`, `InteractiveOverlay` and the overlay
+# value types are `wasm-host`-gated re-exports (cyrup-ext/src/lib.rs:199-207) that FLUX_09 and
+# FLUX_10 require.
+cyrup-core = { workspace = true }
+cyrup-ext = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# FLUX_10's `ask_user_question` hops the blocking `HostServices::select` call off the async
+# executor with `spawn_blocking`.
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync"] }

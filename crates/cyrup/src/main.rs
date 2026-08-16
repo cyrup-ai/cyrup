@@ -716,6 +716,16 @@ async fn run() -> anyhow::Result<i32> {
         ) {
             factory_builder = factory_builder.with_native_extension(ext);
         }
+        // Flux (spec/flux.md §3.4.5): the pipeline's bundled prompt templates + the three native
+        // renderers. Attached unconditionally at the top level — unlike subagents/intercom/
+        // permission-system there is no install gate, because the whole point of moving flux into the
+        // binary is that it works with no install step. `flux_extension_for_env` still returns `None`
+        // inside a subagent CHILD: a child re-execs this binary in Print/Json mode, and contributing
+        // 15 templates plus a skill to every child would put the skill into every child's system
+        // prompt for a pipeline the child is not running.
+        if let Some(ext) = cyrup_flux::flux_extension_for_env() {
+            factory_builder = factory_builder.with_native_extension(ext);
+        }
         let factory = Arc::new(factory_builder);
         // SEAM-075: this arm deliberately has NO modelless hard stop. pi gates it on the MODE —
         // `if (appMode !== "interactive" && !session.model) { … process.exit(1); }`
@@ -913,6 +923,13 @@ async fn run() -> anyhow::Result<i32> {
             ) {
                 factory_builder = factory_builder.with_native_extension(ext);
             }
+            // Flux (spec/flux.md §3.4.5): the pipeline's bundled prompt templates + the three native
+            // renderers. Attached unconditionally at the top level — no install gate — and skipped
+            // inside a subagent CHILD by `flux_extension_for_env` for the same reason as the
+            // Interactive arm above.
+            if let Some(ext) = cyrup_flux::flux_extension_for_env() {
+                factory_builder = factory_builder.with_native_extension(ext);
+            }
             let factory = Arc::new(factory_builder);
             // SEAM-033 — `create_unannounced` (pi's `createAgentSessionRuntime`, which never emits
             // `session_start`, agent-session-runtime.ts:414-432), so `apply_post_build` below can
@@ -1034,6 +1051,13 @@ async fn run() -> anyhow::Result<i32> {
                 dirs.agent_dir.clone(),
                 session_cwd,
             ) {
+                factory_builder = factory_builder.with_native_extension(ext);
+            }
+            // Flux (spec/flux.md §3.4.5): the pipeline's bundled prompt templates + the three native
+            // renderers. Attached unconditionally at the top level — no install gate — and skipped
+            // inside a subagent CHILD by `flux_extension_for_env` for the same reason as the
+            // Interactive arm above.
+            if let Some(ext) = cyrup_flux::flux_extension_for_env() {
                 factory_builder = factory_builder.with_native_extension(ext);
             }
             let factory = Arc::new(factory_builder);
