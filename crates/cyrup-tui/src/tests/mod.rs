@@ -67,6 +67,7 @@ mod render;
 mod render_cache_tick;
 mod rich_messages;
 mod run_loop_cancel_bias;
+mod run_loop_draw_coalescing;
 mod run_loop_input_priority;
 mod runtime_swap;
 mod scoped_models;
