@@ -64,6 +64,7 @@ mod package_update_notice;
 mod pending_messages;
 mod project_trust_banner;
 mod render;
+mod render_cache_tick;
 mod rich_messages;
 mod run_loop_cancel_bias;
 mod run_loop_input_priority;
