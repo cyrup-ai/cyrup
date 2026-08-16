@@ -95,8 +95,8 @@ mod tests;
 pub use app::{
     crossterm_input_stream, extension_render, gist_id_from_url, reanchor_inline_region, render,
     share_viewer_url, share_viewer_url_from, should_honor_extension_shutdown, tree_node_from_dag,
-    App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget,
-    LoginProviderSource, RebuildBackend, TreeNavMsg,
+    App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, LifecycleEffects,
+    LifecycleOutcome, LoginProviderSource, QueueDrain, QueueDrainReason, RebuildBackend, TreeNavMsg,
 };
 pub use auth_select::{
     format_auth_selector_provider_type, format_status_indicator, login_selector_rows,

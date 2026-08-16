@@ -975,6 +975,100 @@ pub struct App<B: Backend> {
     /// inline, exactly as `/tree` does — correct, just without a live band, because there is no loop
     /// to paint one.
     compact_tx: Option<tokio::sync::mpsc::UnboundedSender<CompactOutcome>>,
+    /// Where a spawned [`AgentSession::drain_queue`](cyrup_session_svc::AgentSession::drain_queue)
+    /// hands its take-all back to the run loop (TUI-092 §5b.1).
+    ///
+    /// `drain_queue` ends in `emit_queue_update().await` (`cyrup-session-svc/src/session.rs:1495`),
+    /// which fans the `QueueUpdate` out through `Fanout::emit` (`subscriber.rs:64-76`) — an
+    /// **awaited send into every live subscription**, and those channels are
+    /// `mpsc::channel(CHANNEL_CAPACITY)` with `CHANNEL_CAPACITY = 1024` (`subscriber.rs:23`), i.e.
+    /// BOUNDED. One of those subscriptions is `App::run`'s own `events` stream
+    /// (`AgentSession::subscribe` → `subscribe_persistent`). So awaiting `drain_queue` **on the run
+    /// loop's task** closes a cycle: the loop blocks inside a send into the very channel that only
+    /// the loop drains. With the channel full it never returns — and `Fanout::emit` discards the
+    /// send result (`let _ = …`), so nothing is logged when it happens. `Escape` during a streaming
+    /// turn and `Alt+Up` both reached it.
+    ///
+    /// Fixed in the TUI, not the session layer: `Fanout::emit`'s awaited send IS its contract
+    /// ("backpressure → slows the agent, never drops", `subscriber.rs:63`), and spawning it there
+    /// would reorder `QueueUpdate` and drop that backpressure for RPC mode and every SDK observer
+    /// too. The defect is that the TUI awaited a session call on the one task that must stay free to
+    /// drain the session's events.
+    ///
+    /// `None` (an embedder or a test driving `execute_command` directly) falls back to awaiting
+    /// inline, exactly as `/tree` and `/compact` do — correct, because without a run loop there is
+    /// no `events` subscription for the fan-out to block on.
+    queue_drain_tx: Option<tokio::sync::mpsc::UnboundedSender<QueueDrain>>,
+    /// Where a spawned session-lifecycle op (`/new`, `/reload`, `/import`, `/resume`, `/fork`) hands
+    /// its outcome back to the run loop (TUI-092 §5b.2).
+    ///
+    /// These five `execute_command` arms each `.await` an `AgentSessionRuntime` op that dispatches
+    /// `HostEvent::Session{Start,Shutdown,BeforeSwitch,BeforeFork}` to every live extension's hook,
+    /// and a guest hook handler is handed the SAME `Ctx` a tool/shortcut handler gets — so it CAN
+    /// call `ctx.ui().*`, which parks its calling task in `LiveHostServices`'
+    /// `block_in_place` + `block_on` (`cyrup-session-svc/src/host_services.rs`) until THIS loop
+    /// answers `ui_rx`. Awaited inline, that made the blocked task and the loop that must unblock it
+    /// the same task: `block_in_place` frees a worker THREAD for other tasks, never this task's own
+    /// other `select!` branches. A genuine, permanent self-deadlock — and `tokio::time::timeout`
+    /// cannot rescue it, because a parked `poll()` is never polled again (proven in-repo:
+    /// `cyrup-ext/src/dispatch.rs:499` wraps the same call in a budget that still cannot fire).
+    ///
+    /// This is the residual `execute_command`'s own doc comment used to flag and defer. It is closed
+    /// the way that comment prescribed — the runtime `.await` runs off-task and only the
+    /// `self.state` mutation comes back here — which is the same shape `C::Compact` and `/tree`
+    /// already use.
+    ///
+    /// `None` (an embedder or a test driving `execute_command` directly) falls back to awaiting
+    /// inline: correct there, because with no run loop there is no `ui_rx` arm for a guest dialog to
+    /// be waiting on in the first place.
+    lifecycle_tx: Option<tokio::sync::mpsc::UnboundedSender<LifecycleOutcome>>,
+}
+
+/// The `&mut self` work a settled session-lifecycle op still owes the run loop (TUI-092 §5b.2).
+///
+/// Deliberately tiny: `pending_swap_status` is set OPTIMISTICALLY before the spawn (see
+/// [`App::dispatch_lifecycle`]), so a successful op needs nothing from here in the common case.
+#[derive(Debug, Default)]
+pub struct LifecycleEffects {
+    /// `/fork` with `position: "before"` re-seeds the editor with the anchor text
+    /// (`RuntimeForkResult::selected_text`).
+    pub selected_text: Option<String>,
+    /// `/reload` rebuilds the keymaps from this agent dir. Runs AFTER the session reload, which is
+    /// Pi's order (`interactive-mode.ts:5386`, session reload then `this.keybindings.reload()`).
+    pub reload_keybindings_in: Option<PathBuf>,
+}
+
+/// What a spawned session-lifecycle op hands back (TUI-092 §5b.2).
+///
+/// `Err` carries an ALREADY-RENDERED status line — the per-command cancellation string or error
+/// wording Pi uses — so the run loop needs no context to display it, and the optimistic
+/// `pending_swap_status` is cleared with it.
+#[derive(Debug)]
+pub struct LifecycleOutcome(pub Result<LifecycleEffects, String>);
+
+/// Why a [`QueueDrain`] was requested — it decides what the run loop does with the result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QueueDrainReason {
+    /// `Escape` while streaming (`AppAction::InterruptRestoreQueued`, Pi `onEscape`
+    /// interactive-mode.ts:2636-2637): restore to the editor, then abort the run and any bash child.
+    Interrupt,
+    /// `Alt+Up` (`AppAction::Dequeue`, Pi `handleDequeue` interactive-mode.ts:3587-3594): restore to
+    /// the editor and report how many came back. No abort.
+    Dequeue,
+    /// The `/tree` pre-step (Pi `:4781-4785`). The abort is issued by the spawning task itself,
+    /// immediately after the drain and before `navigate_tree`, so only the editor restore is left
+    /// for the loop.
+    TreeNav,
+}
+
+/// What a spawned [`AgentSession::drain_queue`](cyrup_session_svc::AgentSession::drain_queue) hands
+/// back — Pi's `(steering, followUp)` pair plus the reason, so
+/// [`App::apply_queue_drain`] can finish the job on the loop task (TUI-092 §5b.1).
+#[derive(Clone, Debug)]
+pub struct QueueDrain {
+    pub steering: Vec<String>,
+    pub follow_up: Vec<String>,
+    pub reason: QueueDrainReason,
 }
 
 /// What a spawned `/compact` hands back to the run loop — the `Ok`/`Err` of
@@ -1033,6 +1127,8 @@ impl<B: Backend> App<B> {
             login_tx: None,
             login_providers: None,
             compact_tx: None,
+            queue_drain_tx: None,
+            lifecycle_tx: None,
         })
     }
 
@@ -2962,6 +3058,181 @@ impl<B: Backend> App<B> {
         rx
     }
 
+    /// Install the off-task queue-drain channel and hand back its receiver (TUI-092 §5b.1).
+    ///
+    /// [`App::run`] calls this once at startup, exactly like [`Self::install_compact_channel`].
+    /// Without it `Escape` and `Alt+Up` await `AgentSession::drain_queue` on the run loop's own
+    /// task, and that call ends in an awaited send into the BOUNDED channel the loop itself is the
+    /// only drain of — a self-deadlock, not a slow path. See [`Self::queue_drain_tx`] for the full
+    /// cycle. `pub` so a test can drive the spawned path without standing up a run loop.
+    pub fn install_queue_drain_channel(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<QueueDrain> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<QueueDrain>();
+        self.queue_drain_tx = Some(tx);
+        rx
+    }
+
+    /// Finish a settled [`QueueDrain`] on the run loop's task (TUI-092 §5b.1).
+    ///
+    /// Everything here was inline in the `Escape` / `Alt+Up` arms and in
+    /// [`Self::begin_tree_navigation`] before the split, in exactly this order — only the
+    /// `drain_queue().await` itself moved off-task. `take_compaction_queue` and
+    /// `restore_queued_to_editor` are `&mut self` and could not move anyway; the abort is
+    /// deliberately kept AFTER the restore, which is Pi's own order
+    /// (`restoreQueuedMessagesToEditor({abort: true})`, interactive-mode.ts:2636-2637 — restore
+    /// first, "and only then abort"), and safely so because the queues were already taken
+    /// atomically by the drain that produced this message.
+    ///
+    /// Shared by every reason so the interleave cannot drift between them, mirroring
+    /// [`Self::apply_compact_outcome`].
+    pub fn apply_queue_drain(&mut self, drained: QueueDrain, session: &Arc<AgentSession>) {
+        let QueueDrain { steering, follow_up, reason } = drained;
+        // TUI-031 — Pi's `clearAllQueues` (`interactive-mode.ts:3959-3971`) drains the SESSION's two
+        // queues AND `compactionQueuedMessages`, in `[...steering, ...compactionSteering]` /
+        // `[...followUp, ...compactionFollowUp]` order. Without the second source an Escape
+        // mid-compaction left the compaction queue holding messages the user believed they had just
+        // taken back. `/tree` keeps Pi's narrower `[...steering, ...followUp]` (`:4781-4785`).
+        let queued: Vec<String> = if reason == QueueDrainReason::TreeNav {
+            steering.into_iter().chain(follow_up).collect()
+        } else {
+            let compaction = self.take_compaction_queue();
+            steering
+                .into_iter()
+                .chain(compaction.iter().filter(|m| !m.follow_up).map(|m| m.text.clone()))
+                .chain(follow_up)
+                .chain(compaction.iter().filter(|m| m.follow_up).map(|m| m.text.clone()))
+                .collect()
+        };
+        let restored = self.restore_queued_to_editor(&queued);
+        match reason {
+            QueueDrainReason::Interrupt => {
+                session.abort();
+                // Also kill a running bash child (the block was already marked cancelled in
+                // `apply_action`); the reader task's terminal `Done` clears `bash_rx`.
+                session.abort_bash();
+            }
+            QueueDrainReason::Dequeue => match restored {
+                0 => self.state.transcript.push_status("No queued messages to restore"),
+                n => self.state.transcript.push_status(format!(
+                    "Restored {n} queued message{} to editor",
+                    if n > 1 { "s" } else { "" }
+                )),
+            },
+            // The abort already happened in the spawning task, ahead of `navigate_tree`.
+            QueueDrainReason::TreeNav => {}
+        }
+    }
+
+    /// Install the off-task session-lifecycle channel and hand back its receiver (TUI-092 §5b.2).
+    ///
+    /// [`App::run`] calls this once at startup, exactly like [`Self::install_compact_channel`].
+    /// Without it `/new`, `/reload`, `/import`, `/resume` and `/fork` await their runtime op on the
+    /// run loop's own task, where a guest session-lifecycle hook that opens a `ui.*` dialog
+    /// deadlocks the loop against itself. See [`Self::lifecycle_tx`]. `pub` so a test can drive the
+    /// spawned path without standing up a run loop.
+    pub fn install_lifecycle_channel(
+        &mut self,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<LifecycleOutcome> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<LifecycleOutcome>();
+        self.lifecycle_tx = Some(tx);
+        rx
+    }
+
+    /// Apply a settled session-lifecycle op on the run loop's task (TUI-092 §5b.2).
+    ///
+    /// On failure or cancellation the OPTIMISTIC `pending_swap_status` is cleared before the status
+    /// line is shown: no generation bump follows a failed op, so nothing would ever consume it and
+    /// it would otherwise surface against the NEXT swap, attributing this command's message to an
+    /// unrelated one.
+    ///
+    /// Shared by the spawned and inline paths so the two cannot drift, mirroring
+    /// [`Self::apply_compact_outcome`].
+    pub fn apply_lifecycle_outcome(&mut self, outcome: LifecycleOutcome) {
+        let effects = match outcome.0 {
+            Ok(effects) => effects,
+            Err(status) => {
+                self.state.pending_swap_status = None;
+                self.state.transcript.push_status(status);
+                return;
+            }
+        };
+        if let Some(text) = effects.selected_text {
+            self.state.editor.set_text(&text);
+        }
+        if let Some(agent_dir) = effects.reload_keybindings_in {
+            // TUI-051 — Pi's ordering: session reload first, THEN `this.keybindings.reload()`
+            // (`interactive-mode.ts:5386`). A malformed document must not wipe the live keymap
+            // silently, so the error is surfaced; the maps have already been reset to defaults by
+            // then, which is also what pi's replace-semantics `rebuild()` leaves behind.
+            // CFG-038 — a rejected ENTRY is reported by id and the rest of the document still
+            // applies; only an unusable DOCUMENT keeps the old whole-file wording.
+            match self.reload_keybindings_from(&agent_dir) {
+                Err(e) => self.state.transcript.push_status(format!("keybindings error: {e}")),
+                Ok(issues) => {
+                    for issue in issues {
+                        self.state.transcript.push_status(format!("keybindings: ignoring {issue}"));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Run a session-lifecycle op off the run loop's task whenever one is servicing
+    /// [`Self::lifecycle_tx`], and finish it through [`Self::apply_lifecycle_outcome`]
+    /// (TUI-092 §5b.2).
+    ///
+    /// The caller sets `pending_swap_status` OPTIMISTICALLY before calling this, because the
+    /// runtime's generation bump and this channel are two independent paths: once the op is spawned,
+    /// the `session_swapped` arm can fire BEFORE the outcome message arrives, and it reads
+    /// `pending_swap_status` to caption the swap. Setting it after the fact would leave that arm
+    /// painting an unattributed swap. [`Self::apply_lifecycle_outcome`] clears it if the op turns
+    /// out to have failed or been cancelled.
+    ///
+    /// `None` — an embedder or a test with no run loop — awaits inline, exactly as `/compact` does.
+    async fn dispatch_lifecycle(
+        &mut self,
+        op: impl std::future::Future<Output = LifecycleOutcome> + Send + 'static,
+    ) {
+        match self.lifecycle_tx.clone() {
+            Some(tx) => {
+                tokio::spawn(async move {
+                    let _ = tx.send(op.await);
+                });
+            }
+            None => {
+                let outcome = op.await;
+                self.apply_lifecycle_outcome(outcome);
+            }
+        }
+    }
+
+    /// Take-all both session queues and finish through [`Self::apply_queue_drain`], off the run
+    /// loop's task whenever one is servicing [`Self::queue_drain_tx`] (TUI-092 §5b.1).
+    ///
+    /// `None` — an embedder or a test driving the action directly — awaits inline, exactly as
+    /// `/compact` and `/tree` do. That is correct there and only there: with no run loop there is no
+    /// `events` subscription for `drain_queue`'s fan-out to block against.
+    async fn dispatch_queue_drain(
+        &mut self,
+        session: &Arc<AgentSession>,
+        reason: QueueDrainReason,
+    ) {
+        match self.queue_drain_tx.clone() {
+            Some(tx) => {
+                let session = session.clone();
+                tokio::spawn(async move {
+                    let (steering, follow_up) = session.drain_queue().await;
+                    let _ = tx.send(QueueDrain { steering, follow_up, reason });
+                });
+            }
+            None => {
+                let (steering, follow_up) = session.drain_queue().await;
+                self.apply_queue_drain(QueueDrain { steering, follow_up, reason }, session);
+            }
+        }
+    }
+
     /// Render a settled `/compact` — the summary message on success, Pi's reason string on refusal.
     ///
     /// Shared by the inline and spawned paths so the two cannot drift; the run loop calls it from
@@ -3515,13 +3786,6 @@ impl<B: Backend> App<B> {
         summarize: bool,
         custom_instructions: Option<String>,
     ) {
-        // Pi `:4781-4785` — `restoreQueuedMessagesToEditor()` then `session.abort()`.
-        if session.is_streaming().await {
-            let (steering, follow_up) = session.drain_queue().await;
-            let queued: Vec<String> = steering.into_iter().chain(follow_up).collect();
-            self.restore_queued_to_editor(&queued);
-            session.abort();
-        }
         let opts = NavigateTreeOptions {
             summarize,
             custom_instructions,
@@ -3530,7 +3794,14 @@ impl<B: Backend> App<B> {
         let entry = cyrup_core::EntryId::from(target.as_str());
         let Some(tx) = self.tree_nav_tx.clone() else {
             // No run loop (unit/embedder driving `execute_command` directly): await inline. Safe
-            // for the non-summarizing path, which makes no model call.
+            // for the non-summarizing path, which makes no model call — and safe for the drain,
+            // because with no run loop there is no `events` subscription for its fan-out to block
+            // against (see [`Self::queue_drain_tx`]).
+            // Pi `:4781-4785` — `restoreQueuedMessagesToEditor()` then `session.abort()`.
+            if session.is_streaming().await {
+                self.dispatch_queue_drain(session, QueueDrainReason::TreeNav).await;
+                session.abort();
+            }
             let outcome = session.navigate_tree(entry, opts).await.map_err(|e| e.to_string());
             self.apply_tree_nav_outcome(TreeNavMsg { target, outcome });
             return;
@@ -3544,7 +3815,26 @@ impl<B: Backend> App<B> {
                 .set(IndicatorKind::BranchSummary, Some("Summarizing branch...".to_string()));
         }
         let session = session.clone();
+        // TUI-092 §5b.1 — Pi's pre-step (`:4781-4785`, "the user committed to navigating: stop the
+        // active response") moves INTO this task rather than staying on the loop. Both of its awaits
+        // belong off-task: `is_streaming` is cheap but `drain_queue` ends in an awaited send into
+        // this loop's own BOUNDED `events` channel, so awaiting it on the loop is the §5b.1
+        // self-deadlock. Sequencing is preserved exactly — the drain and the abort still complete
+        // BEFORE `navigate_tree` starts, because they are statements in this same task. Only the
+        // editor restore travels back to the loop, over `queue_drain_tx`.
+        let drain_tx = self.queue_drain_tx.clone();
         tokio::spawn(async move {
+            if session.is_streaming().await {
+                let (steering, follow_up) = session.drain_queue().await;
+                if let Some(drain_tx) = drain_tx {
+                    let _ = drain_tx.send(QueueDrain {
+                        steering,
+                        follow_up,
+                        reason: QueueDrainReason::TreeNav,
+                    });
+                }
+                session.abort();
+            }
             let outcome = session.navigate_tree(entry, opts).await.map_err(|e| e.to_string());
             let _ = tx.send(TreeNavMsg { target, outcome });
         });
@@ -4254,22 +4544,20 @@ impl<B: Backend> App<B> {
     /// [`open_data_selector`](Self::open_data_selector); lifecycle/IO commands call the matching
     /// session method and surface a status line / info block. Errors degrade to a status line.
     ///
-    /// KNOWN RESIDUAL (L4 review §2.1): this is still awaited **inline** in `App::run`'s `select!`
-    /// loop, unlike [`AppAction::ExtensionShortcut`] (spawned — see that arm's comment for the
-    /// deadlock this avoids). None of the match arms below call a guest capability directly, but a
-    /// FEW `.await` a session-lifecycle op (`Reload`/`NewSession`/`Import`/the `Session`/`UserMessage`
-    /// `ConfirmSelection` switch+fork paths/`Compact`) that dispatches `HostEvent::Session{Start,
-    /// Shutdown,BeforeSwitch,BeforeFork,Compact}` to every live extension's hook
-    /// (`session.rs` `dispatch_notify`/`vetoed`), and a guest SDK hook handler is handed the SAME
-    /// `Ctx` a tool/shortcut handler gets (`cyrup-ext-sdk/src/ctx.rs`), so it COULD call
-    /// `ctx.ui().*` mid-hook. If one ever does, this call site would deadlock exactly like the
-    /// shortcut path did before the fix above — closing that residual needs restructuring
-    /// `execute_command`'s state-mutating match arms so only the actual session/runtime `.await` runs
-    /// off-task (mirroring the `bash_rx`/`shortcut_status_rx` channel-back pattern), which is a much
-    /// larger refactor deliberately out of scope here. No Pi extension in the wild is known to call a
-    /// UI dialog from a session-lifecycle hook (tool/shortcut/command handlers are the realistic
-    /// corpus, both of which are deadlock-safe today), so this is a documented, narrow, follow-up-
-    /// tracked gap rather than a silently-dropped one.
+    /// This is still CALLED inline from `App::run`'s `select!` loop, but it no longer AWAITS
+    /// guest-reentrant work there: every arm that drives a session-lifecycle op
+    /// (`Reload`/`NewSession`/`Import`/the `Session`/`UserMessage` `ConfirmSelection` switch+fork
+    /// paths/`Compact`) now runs that `.await` off-task and applies its `self.state` mutation from a
+    /// channel-back arm — [`Self::dispatch_lifecycle`] and [`Self::lifecycle_tx`], which is the
+    /// restructuring TUI-092 §5b.2 prescribed and the L4 review §2.1 residual deferred. The hazard
+    /// it closed is real and worth keeping in view: those ops dispatch
+    /// `HostEvent::Session{Start,Shutdown,BeforeSwitch,BeforeFork,Compact}` to every live
+    /// extension's hook (`session.rs` `dispatch_notify`/`vetoed`), a guest SDK hook handler is
+    /// handed the SAME `Ctx` a tool/shortcut handler gets (`cyrup-ext-sdk/src/ctx.rs`), and a
+    /// `ctx.ui().*` call from inside one parks its task in `block_in_place` until the run loop
+    /// answers `ui_rx` — which the run loop could not do while awaiting the op that was waiting for
+    /// it. Any NEW arm added here that awaits a runtime or session-lifecycle op must go through
+    /// [`Self::dispatch_lifecycle`] for the same reason.
     pub async fn execute_command(
         &mut self,
         cmd: AppCommand,
@@ -4736,18 +5024,24 @@ impl<B: Backend> App<B> {
                 // `fork_at_entry` (no swap).
                 let entry = cyrup_core::EntryId::from(value.as_str());
                 match runtime {
-                    Some(rt) => match rt.fork(entry, ForkPosition::Before).await {
-                        Ok(r) if r.cancelled => {
-                            self.state.transcript.push_status("fork cancelled")
-                        }
-                        Ok(r) => {
-                            if let Some(text) = r.selected_text {
-                                self.state.editor.set_text(&text);
-                            }
-                            self.state.pending_swap_status = Some("forked from message".into());
-                        }
-                        Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
-                    },
+                    // TUI-092 §5b.2 — SPAWNED: `fork` dispatches `HostEvent::SessionBeforeFork` to
+                    // every live extension, and a guest hook that opens a `ui.*` dialog parks its
+                    // task until this loop answers `ui_rx`. Awaited here that is a self-deadlock.
+                    Some(rt) => {
+                        self.state.pending_swap_status = Some("forked from message".into());
+                        let rt = Arc::clone(rt);
+                        self.dispatch_lifecycle(async move {
+                            LifecycleOutcome(match rt.fork(entry, ForkPosition::Before).await {
+                                Ok(r) if r.cancelled => Err("fork cancelled".to_string()),
+                                Ok(r) => Ok(LifecycleEffects {
+                                    selected_text: r.selected_text,
+                                    ..LifecycleEffects::default()
+                                }),
+                                Err(e) => Err(format!("fork error: {e}")),
+                            })
+                        })
+                        .await;
+                    }
                     None => match session.fork_at_entry(&entry, ForkPosition::Before).await {
                         Ok(_) => self.state.transcript.push_status("forked from message"),
                         Err(e) => self.state.transcript.push_status(format!("fork error: {e}")),
@@ -4860,15 +5154,21 @@ impl<B: Backend> App<B> {
                 // asserts the resumed cwd still exists, rebuilds cwd-bound services, and bumps the
                 // generation; the UI re-binds on the bump. Without a runtime, surface the path.
                 match runtime {
-                    Some(rt) => match rt.switch_session(value.clone()).await {
-                        Ok(r) if r.cancelled => {
-                            self.state.transcript.push_status("resume cancelled")
-                        }
-                        Ok(_) => {
-                            self.state.pending_swap_status = Some(format!("resumed {value}"));
-                        }
-                        Err(e) => self.state.transcript.push_status(format!("resume error: {e}")),
-                    },
+                    // TUI-092 §5b.2 — SPAWNED: `switch_session` dispatches
+                    // `HostEvent::SessionBeforeSwitch` to every live extension; see the `/fork` arm
+                    // above for the deadlock awaiting it here would reintroduce.
+                    Some(rt) => {
+                        self.state.pending_swap_status = Some(format!("resumed {value}"));
+                        let rt = Arc::clone(rt);
+                        self.dispatch_lifecycle(async move {
+                            LifecycleOutcome(match rt.switch_session(value).await {
+                                Ok(r) if r.cancelled => Err("resume cancelled".to_string()),
+                                Ok(_) => Ok(LifecycleEffects::default()),
+                                Err(e) => Err(format!("resume error: {e}")),
+                            })
+                        })
+                        .await;
+                    }
                     None => self
                         .state
                         .transcript
@@ -5232,70 +5532,78 @@ impl<B: Backend> App<B> {
             // runtime (SDK/embedder), surface the request so the path is real (no silent drop).
             C::NewSession => match runtime {
                 // `/new` (handleClearCommand): start a fresh session in the same cwd (Pi `newSession`).
-                Some(rt) => match rt.new_session().await {
-                    Ok(r) if r.cancelled => {
-                        self.state.transcript.push_status("new session cancelled")
-                    }
-                    Ok(_) => self.state.pending_swap_status = Some("started a new session".into()),
-                    Err(e) => self.state.transcript.push_status(format!("new session error: {e}")),
-                },
+                //
+                // TUI-092 §5b.2 — SPAWNED: `new_session` dispatches `HostEvent::SessionShutdown`
+                // then `SessionStart` to every live extension; see the `/fork` arm for the
+                // self-deadlock awaiting it on this task would reintroduce.
+                Some(rt) => {
+                    self.state.pending_swap_status = Some("started a new session".into());
+                    let rt = Arc::clone(rt);
+                    self.dispatch_lifecycle(async move {
+                        LifecycleOutcome(match rt.new_session().await {
+                            Ok(r) if r.cancelled => Err("new session cancelled".to_string()),
+                            Ok(_) => Ok(LifecycleEffects::default()),
+                            Err(e) => Err(format!("new session error: {e}")),
+                        })
+                    })
+                    .await;
+                }
                 None => self.state.transcript.push_status("starting new session…"),
             },
             C::Reload => match runtime {
                 // `/reload` (handleReloadCommand): rebuild the active session in place (Pi `reload`,
                 // agent-session.ts:2451) — re-reads settings/resources/keybindings, resets the
                 // provider, preserves the persisted transcript.
+                // TUI-092 §5b.2 — SPAWNED: `reload` dispatches `HostEvent::SessionShutdown` then
+                // `SessionStart` to every live extension; see the `/fork` arm for the self-deadlock
+                // awaiting it on this task would reintroduce. The keybinding rebuild is `&mut self`
+                // and stays on the loop, carried back as an effect so TUI-051's ordering — session
+                // reload FIRST, then `this.keybindings.reload()` — is preserved exactly.
                 Some(rt) => {
                     let agent_dir = session.services().agent_dir.clone();
-                    match rt.reload(None).await {
                     // TUI-025 — Pi's own sentence, `interactive-mode.ts:5418-5423` @v0.83.0.
                     // cyrup's `"reloaded resources"` said nothing about WHAT was reloaded, and the
                     // `/` menu's own help string for the command was a second, different wording.
                     // The `; saved project trust` variant is TUI-037's — it needs the implicit-trust
                     // write, which lives in `crates/cyrup`.
-                    Ok(()) => {
-                        // TUI-051 — Pi's ordering: session reload first, THEN
-                        // `this.keybindings.reload()` (`interactive-mode.ts:5386`). A malformed
-                        // document must not wipe the live keymap silently, so the error is
-                        // surfaced; the maps have already been reset to defaults by then, which is
-                        // also what pi's replace-semantics `rebuild()` leaves behind.
-                        // CFG-038 — a rejected ENTRY is now reported by id and the rest of the
-                        // document still applies; only an unusable DOCUMENT keeps the old
-                        // whole-file wording.
-                        match self.reload_keybindings_from(&agent_dir) {
-                            Err(e) => self
-                                .state
-                                .transcript
-                                .push_status(format!("keybindings error: {e}")),
-                            Ok(issues) => {
-                                for issue in issues {
-                                    self.state
-                                        .transcript
-                                        .push_status(format!("keybindings: ignoring {issue}"));
-                                }
-                            }
-                        }
-                        self.state.pending_swap_status = Some(
-                            "Reloaded keybindings, extensions, skills, prompts, themes, and \
-                             context files"
-                                .into(),
-                        )
-                    }
-                    Err(e) => self.state.transcript.push_status(format!("reload error: {e}")),
-                    }
+                    self.state.pending_swap_status = Some(
+                        "Reloaded keybindings, extensions, skills, prompts, themes, and \
+                         context files"
+                            .into(),
+                    );
+                    let rt = Arc::clone(rt);
+                    self.dispatch_lifecycle(async move {
+                        LifecycleOutcome(match rt.reload(None).await {
+                            Ok(()) => Ok(LifecycleEffects {
+                                reload_keybindings_in: Some(agent_dir),
+                                ..LifecycleEffects::default()
+                            }),
+                            Err(e) => Err(format!("reload error: {e}")),
+                        })
+                    })
+                    .await;
                 }
                 None => self.state.transcript.push_status("reloading resources…"),
             },
             C::Import(p) => match (runtime, p) {
                 // `/import <path>` (handleImportCommand): copy + resume a JSONL session (Pi
                 // `importFromJsonl`, agent-session-runtime.ts:353).
-                (Some(rt), Some(path)) => match rt.import_from_jsonl(path.clone(), None).await {
-                    Ok(r) if r.cancelled => self.state.transcript.push_status("import cancelled"),
-                    Ok(_) => {
-                        self.state.pending_swap_status = Some(format!("imported session {path}"))
-                    }
-                    Err(e) => self.state.transcript.push_status(format!("import error: {e}")),
-                },
+                //
+                // TUI-092 §5b.2 — SPAWNED: `import_from_jsonl` dispatches `HostEvent::SessionStart`
+                // to every live extension; see the `/fork` arm for the self-deadlock awaiting it on
+                // this task would reintroduce.
+                (Some(rt), Some(path)) => {
+                    self.state.pending_swap_status = Some(format!("imported session {path}"));
+                    let rt = Arc::clone(rt);
+                    self.dispatch_lifecycle(async move {
+                        LifecycleOutcome(match rt.import_from_jsonl(path, None).await {
+                            Ok(r) if r.cancelled => Err("import cancelled".to_string()),
+                            Ok(_) => Ok(LifecycleEffects::default()),
+                            Err(e) => Err(format!("import error: {e}")),
+                        })
+                    })
+                    .await;
+                }
                 // TUI-084 — pi's string and pi's CHANNEL: `Usage: /import <path.jsonl>` through
                 // `showError` (`interactive-mode.ts:5482` @v0.83.0). cyrup dropped the `.jsonl`
                 // constraint, lowercased the word, and routed a real error to the neutral status
@@ -7613,6 +7921,12 @@ impl App<CrosstermBackend<Stdout>> {
     /// `raise` would need an unsafe shim + a new dep; the `kill` path needs neither). Unix-only; on
     /// other platforms it degrades to a redraw.
     pub fn suspend(&mut self) -> Result<(), TuiError> {
+        // TUI-092 — announce a BY-DESIGN block to the input reader's wedge detector for the whole
+        // of this call. The run loop stops servicing input here until the user `fg`s us, which is
+        // indistinguishable from a wedge by observation alone; the flag is what tells the reader
+        // not to escalate a working `Ctrl+Z` into an app exit. Held across the SIGTSTP and the
+        // re-entry below, and dropped only once raw mode and the viewport are back.
+        let _released = TerminalReleased::enter();
         self.restore()?;
         #[cfg(unix)]
         {
@@ -7695,6 +8009,12 @@ impl App<CrosstermBackend<Stdout>> {
         initial: &str,
         editor_cmd: &str,
     ) -> Result<Option<String>, TuiError> {
+        // TUI-092 — a BY-DESIGN block, exactly as in [`Self::suspend`]: `run_editor_over_file` is a
+        // blocking `Command::status()` that can own the terminal for minutes, during which the run
+        // loop services no input. The flag stops the input reader's wedge detector from escalating
+        // a `Ctrl+C` typed inside `$EDITOR` into an app exit. Taken FIRST so the early `return
+        // Ok(None)` below is covered too, and dropped by `Drop` on every exit path.
+        let _released = TerminalReleased::enter();
         let mut tmp = std::env::temp_dir();
         tmp.push(format!("cyrup-editor-{}.pi.md", std::process::id()));
         if std::fs::write(&tmp, initial).is_err() {
@@ -7972,12 +8292,37 @@ impl App<CrosstermBackend<Stdout>> {
         // `tree_nav_rx`: a 10–20 s provider call awaited on THIS task freezes every other arm, so
         // the compaction status band Pi shows for the whole operation never reaches a frame.
         let mut compact_rx = self.install_compact_channel();
+        // The queue take-all channel (TUI-092 §5b.1). Installed for the same reason as `compact_rx`
+        // and, before it, `tree_nav_rx`: `AgentSession::drain_queue` awaits a send into every live
+        // subscription's BOUNDED channel — one of which is the `events` receiver THIS task is the
+        // sole drain of — so awaiting it here is a self-deadlock, reachable from an ordinary
+        // `Escape` or `Alt+Up` on a busy session.
+        let mut queue_drain_rx = self.install_queue_drain_channel();
+        // The session-lifecycle channel (TUI-092 §5b.2). Installed for the same reason as the two
+        // above: `/new`, `/reload`, `/import`, `/resume` and `/fork` each dispatch a
+        // `HostEvent::Session*` hook to every live extension, and a guest that answers one by
+        // opening a `ui.*` dialog parks its task until THIS loop services `ui_rx` — which it cannot
+        // do while awaiting the op that is waiting for it.
+        let mut lifecycle_rx = self.install_lifecycle_channel();
         // The startup package-update check's answer channel, moved out of `self` so the `select!`
         // arm's borrow does not collide with the `&mut self` the other arms take — the same
         // run-loop-local shape as `bash_rx` / `tree_nav_rx`. `None` when the binary wired no channel
         // (offline / `--offline` / `CYRUP_SKIP_VERSION_CHECK`), in which case the arm never resolves.
         let mut package_update_rx = self.package_update_rx.take();
         loop {
+            // TUI-092 — surface an arm that blew [`ARM_BUDGET`] on the previous iteration. Recorded
+            // by [`ArmGuard`]'s `Drop` (which cannot draw: it runs inside the arm, on a raw-mode
+            // terminal the frame owns) and drained HERE, on the first healthy iteration after it,
+            // so the diagnostic reaches the user as an ordinary transcript line. `push_warning`
+            // queues into `TranscriptView::pending`; every arm below ends in `draw_synchronized`,
+            // which paints it.
+            if let Ok(mut over) = OVER_BUDGET_ARM.lock()
+                && let Some(arm) = over.take()
+            {
+                self.state.transcript.push_warning(format!(
+                    "Warning: run-loop arm `{arm}` exceeded its {ARM_BUDGET:?} budget"
+                ));
+            }
             let theme_changed = async {
                 match theme_rx.as_mut() {
                     Some(rx) => rx.changed().await.is_ok(),
@@ -8031,42 +8376,32 @@ impl App<CrosstermBackend<Stdout>> {
                 // arms are all `if`-guarded and idempotent (a skipped tick is re-armed by
                 // `MissedTickBehavior::Skip`), and every channel arm keeps its message queued for
                 // the next poll. `src/tests/run_loop_cancel_bias.rs` pins this.
+                //
+                // THE ORDERING RULE IS NOW STRONGER THAN "cancel first" — it is **cancel, then
+                // input, then everything else**, and the second half is as load-bearing as the
+                // first (TUI-092 §2.5). `biased;` takes the FIRST ready arm, so any arm above
+                // `input.next()` that is ready on every poll starves it *permanently*. The spinner
+                // ticker is exactly that: armed for the whole of a streaming turn and re-ready
+                // every 80 ms (`SPINNER_INTERVAL`, `status_indicator.rs:48`), so as soon as one
+                // `draw_synchronized` costs more than a tick — which is what growing transcripts
+                // do — the input arm is never reached again and the keyboard dies while the screen
+                // keeps animating. Do NOT "tidy" the input arm back down among the tickers.
                 biased;
                 _ = cancel.cancelled() => break,
-                // The live `!`/`!!` block owns a `Loader` of its own (`bash-execution.ts:55-61`)
-                // with its own `setInterval` (`loader.ts:77-80`), so its spinner animates whether or
-                // not a turn is streaming — hence the second condition (X4).
-                _ = spinner.tick(),
-                    if self.state.indicator.is_active()
-                        || self.state.transcript.bash_running() =>
-                {
-                    self.draw_synchronized()?;
-                }
-                _ = dialog_countdown.tick(),
-                    if self.state.pending_ui_reply.as_ref().is_some_and(|p| p.deadline.is_some()) =>
-                {
-                    self.tick_extension_dialog_countdown();
-                    self.draw_synchronized()?;
-                }
-                _ = progress_keepalive.tick(), if self.state.terminal_progress.keepalive() => {
-                    // Pure terminal output, no UI state — Pi's interval writes the escape and
-                    // nothing else, so this arm deliberately does NOT redraw.
-                    self.tick_terminal_progress_keepalive();
-                }
-                _ = elapsed_tick.tick(), if self.state.transcript.has_running_elapsed_tool() => {
-                    // Pi's `context.invalidate()` → `ui.requestRender()`: nothing to mutate, the
-                    // `Elapsed` figure is computed from `started_at` at render time.
-                    self.draw_synchronized()?;
-                }
-                _ = git_branch_poll.tick(), if self.state.git_branch.in_repo() => {
-                    // Pi repaints only when the branch actually CHANGED (`notifyBranchChange` fires
-                    // inside `if (this.cachedBranch !== nextBranch)`); an unchanged `stat` draws
-                    // nothing.
-                    if self.poll_footer_git_branch() {
-                        self.draw_synchronized()?;
-                    }
-                }
+                // Input outranks every ticker (TUI-092 §2.5/§5c). `biased;` takes the FIRST
+                // ready arm, and the spinner re-arms every `SPINNER_INTERVAL` (80 ms,
+                // `status_indicator.rs:48`) for the whole of a streaming turn — so the moment one
+                // `draw_synchronized` costs more than a tick, a spinner arm placed ABOVE this one
+                // is always ready when the loop comes round and this arm is never polled again.
+                // The loop keeps drawing; the keyboard is dead, progressively, exactly as reported.
+                // No `.await` has to hang for that to happen.
+                //
+                // Nothing is lost by demoting the tickers: they are `if`-guarded and idempotent,
+                // `MissedTickBehavior::Skip` re-arms a skipped tick, and this arm ends in
+                // `draw_synchronized()` anyway — so servicing a key repaints the frame the spinner
+                // would have drawn.
                 maybe_in = input.next() => {
+                    let _arm = ArmGuard::enter("input");
                     let Some(ev) = maybe_in else { break };
                     match self.handle_input(&ev) {
                         AppAction::Quit => break,
@@ -8097,17 +8432,14 @@ impl App<CrosstermBackend<Stdout>> {
                             // `[...followUp, ...compactionFollowUp]` order. Without the second
                             // source an Escape mid-compaction left the compaction queue holding
                             // messages the user believed they had just taken back.
-                            let (steering, follow_up) = session.drain_queue().await;
-                            let compaction = self.take_compaction_queue();
-                            let queued: Vec<String> = steering
-                                .into_iter()
-                                .chain(compaction.iter().filter(|m| !m.follow_up).map(|m| m.text.clone()))
-                                .chain(follow_up)
-                                .chain(compaction.iter().filter(|m| m.follow_up).map(|m| m.text.clone()))
-                                .collect();
-                            self.restore_queued_to_editor(&queued);
-                            session.abort();
-                            session.abort_bash();
+                            //
+                            // TUI-092 §5b.1 — the take-all is SPAWNED, not awaited here.
+                            // `drain_queue` ends in an awaited send into every subscription's
+                            // BOUNDED channel, one of which is this loop's own `events` receiver:
+                            // awaiting it on this task is a self-deadlock the moment that channel is
+                            // full. The interleave, the editor restore and the abort all still
+                            // happen, in this exact order, in `apply_queue_drain`.
+                            self.dispatch_queue_drain(&session, QueueDrainReason::Interrupt).await;
                         }
                         AppAction::AbortCompaction => {
                             session.abort_compaction();
@@ -8201,25 +8533,12 @@ impl App<CrosstermBackend<Stdout>> {
                             // One atomic take-all (Pi's `clearAllQueues()` returns what it drained),
                             // not a read-then-clear pair — the split form loses any message queued
                             // between the two calls.
-                            let (steering, follow_up) = session.drain_queue().await;
-                            // TUI-031 — `clearAllQueues` again (`interactive-mode.ts:3959-3971`).
-                            let compaction = self.take_compaction_queue();
-                            let queued: Vec<String> = steering
-                                .into_iter()
-                                .chain(compaction.iter().filter(|m| !m.follow_up).map(|m| m.text.clone()))
-                                .chain(follow_up)
-                                .chain(compaction.iter().filter(|m| m.follow_up).map(|m| m.text.clone()))
-                                .collect();
-                            match self.restore_queued_to_editor(&queued) {
-                                0 => self
-                                    .state
-                                    .transcript
-                                    .push_status("No queued messages to restore"),
-                                n => self.state.transcript.push_status(format!(
-                                    "Restored {n} queued message{} to editor",
-                                    if n > 1 { "s" } else { "" }
-                                )),
-                            }
+                            //
+                            // TUI-092 §5b.1 — spawned for the same reason as the Escape arm above:
+                            // `drain_queue`'s fan-out awaits a send into this loop's own bounded
+                            // `events` channel. `apply_queue_drain` does the `clearAllQueues`
+                            // interleave, the restore and Pi's status line.
+                            self.dispatch_queue_drain(&session, QueueDrainReason::Dequeue).await;
                         }
                         AppAction::Command(cmd) => {
                             self.execute_command(cmd, &session, runtime.as_ref()).await;
@@ -8256,6 +8575,45 @@ impl App<CrosstermBackend<Stdout>> {
                         AppAction::Redraw | AppAction::None => {}
                     }
                     self.draw_synchronized()?;
+                    // TUI-092 — the liveness beacon the input reader's wedge detector watches.
+                    // LAST, so it means "serviced", not "started", and deliberately after the draw:
+                    // a frame the user never sees is not service. This is the ONLY place it is
+                    // bumped — counting loop iterations instead would call a spinner-starved loop
+                    // healthy, which is the very state the escape hatch exists for.
+                    mark_input_serviced();
+                }
+                // The live `!`/`!!` block owns a `Loader` of its own (`bash-execution.ts:55-61`)
+                // with its own `setInterval` (`loader.ts:77-80`), so its spinner animates whether or
+                // not a turn is streaming — hence the second condition (X4).
+                _ = spinner.tick(),
+                    if self.state.indicator.is_active()
+                        || self.state.transcript.bash_running() =>
+                {
+                    self.draw_synchronized()?;
+                }
+                _ = dialog_countdown.tick(),
+                    if self.state.pending_ui_reply.as_ref().is_some_and(|p| p.deadline.is_some()) =>
+                {
+                    self.tick_extension_dialog_countdown();
+                    self.draw_synchronized()?;
+                }
+                _ = progress_keepalive.tick(), if self.state.terminal_progress.keepalive() => {
+                    // Pure terminal output, no UI state — Pi's interval writes the escape and
+                    // nothing else, so this arm deliberately does NOT redraw.
+                    self.tick_terminal_progress_keepalive();
+                }
+                _ = elapsed_tick.tick(), if self.state.transcript.has_running_elapsed_tool() => {
+                    // Pi's `context.invalidate()` → `ui.requestRender()`: nothing to mutate, the
+                    // `Elapsed` figure is computed from `started_at` at render time.
+                    self.draw_synchronized()?;
+                }
+                _ = git_branch_poll.tick(), if self.state.git_branch.in_repo() => {
+                    // Pi repaints only when the branch actually CHANGED (`notifyBranchChange` fires
+                    // inside `if (this.cachedBranch !== nextBranch)`); an unchanged `stat` draws
+                    // nothing.
+                    if self.poll_footer_git_branch() {
+                        self.draw_synchronized()?;
+                    }
                 }
                 Some(msg) = bash_next => {
                     match msg {
@@ -8378,6 +8736,23 @@ impl App<CrosstermBackend<Stdout>> {
                     self.apply_compact_outcome(outcome);
                     self.draw_synchronized()?;
                 }
+                Some(outcome) = lifecycle_rx.recv() => {
+                    // A spawned `/new`, `/reload`, `/import`, `/resume` or `/fork` settled
+                    // (TUI-092 §5b.2). On success the generation-watch arm has usually already
+                    // re-bound the UI off the runtime's bump, captioned by the optimistic
+                    // `pending_swap_status`; this arm carries the residue that needs `&mut self`
+                    // (the `/fork` editor re-seed, the `/reload` keybinding rebuild) and clears that
+                    // caption if the op turned out to have failed.
+                    self.apply_lifecycle_outcome(outcome);
+                    self.draw_synchronized()?;
+                }
+                Some(drained) = queue_drain_rx.recv() => {
+                    // A spawned take-all settled (TUI-092 §5b.1). Everything that used to follow
+                    // `drain_queue().await` inline happens here, in the same order: the
+                    // `clearAllQueues` interleave, the editor restore, then the abort.
+                    self.apply_queue_drain(drained, &session);
+                    self.draw_synchronized()?;
+                }
                 maybe_updates = package_updates => {
                     // Pi `:851-855` — `if (updates.length > 0) this.showPackageUpdateNotification(updates)`.
                     // The producer only ever sends a non-empty list and then drops its sender, so the
@@ -8397,6 +8772,7 @@ impl App<CrosstermBackend<Stdout>> {
                     self.draw_synchronized()?;
                 }
                 Some(theme) = theme_switch_rx.recv() => {
+                    let _arm = ArmGuard::enter("theme_switch");
                     // SEAM-T01 — a guest called `ctx.ui().set_theme(name)` and the name RESOLVED
                     // (`TuiThemeAccess::set` rejected it otherwise, which is where pi's
                     // `{success: false, error}` comes from). Pi's handler does two things
@@ -8438,6 +8814,7 @@ impl App<CrosstermBackend<Stdout>> {
                     self.draw_synchronized()?;
                 }
                 Some(msg) = tree_nav_rx.recv() => {
+                    let _arm = ArmGuard::enter("tree_nav");
                     // A spawned `/tree` navigation settled (Pi `interactive-mode.ts:4805-4820`). An
                     // ABORTED summarization asks for the tree to be re-shown at the same entry, which
                     // needs the session (`session_dag`), so it comes back as a follow-up command.
@@ -8448,6 +8825,12 @@ impl App<CrosstermBackend<Stdout>> {
                 }
                 maybe_ev = events.next() => {
                     let Some(ev) = maybe_ev else { continue };
+                    // TUI-092 — names this arm for its duration; the input reader's wedge detector
+                    // reads it, and an overrun is reported on the next healthy iteration. Nothing is
+                    // interrupted: a `tokio::time::timeout` here would be inert against the real
+                    // wedge (a `block_in_place`d task is never polled again) AND would silently
+                    // destroy the compaction queue `ingest_session_event` takes before it awaits.
+                    let _arm = ArmGuard::enter("events");
                     // EXT-006: fold through the extension-aware path so a registered renderer
                     // actually draws the block (a custom message / a tool row). No renderer for the
                     // event's key ⇒ a sync pre-check short-circuits and this is the old behavior.
@@ -8482,6 +8865,7 @@ impl App<CrosstermBackend<Stdout>> {
                     }
                 }
                 swapped = session_swapped => {
+                    let _arm = ArmGuard::enter("session_swapped");
                     // A runtime replacement (a `/new`/`/resume`/`/fork`/`/reload`/`/import` op, or a
                     // runtime-side `SessionReplaced`, R-11-021) installed a new active session: drop
                     // the stale subscription, subscribe the NEW session's event stream, and re-bind
@@ -8752,6 +9136,269 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// trade every terminal app makes to tell `ESC` from an escape *sequence*.
 const HELD_FLUSH_INTERVAL: Duration = Duration::from_millis(20);
 
+// ------------------------------------------------- TUI-092: the unblockable escape hatch ----
+//
+// The run loop is one tokio task and the sole drain of the input channel, so any handler that
+// stops returning also stops input being read — and the exit keys are downstream of the thing
+// that broke. The reader thread below is an `std::thread`: it is the one context in the process
+// still running when the loop is wedged, so it is where the escape lives.
+
+/// Bumped by [`App::run`]'s input arm once it has finished servicing one [`InputEvent`]. The reader
+/// thread reads it to tell a run loop that is still SERVICING INPUT from one that is merely still
+/// ITERATING — a distinction that is not academic here, because `biased;` lets the 80 ms spinner arm
+/// starve the input arm indefinitely once a frame costs more than a tick (TUI-092 §2.5, the defect
+/// the arm order in `App::run` now fixes). Anything counted outside the input arm would call that
+/// state healthy.
+///
+/// A process-global `static` rather than a threaded-through `Arc`, for the same reason
+/// [`crate::terminal_progress`]'s `PROGRESS_ARMED` is one (`terminal_progress.rs:84`): there is
+/// exactly one interactive run loop per process, and [`crossterm_input_stream`] has a single
+/// production caller (`crates/cyrup/src/main.rs`). Threading a handle through both would change two
+/// public signatures — and `EventStream<T>` is `Pin<Box<dyn Stream + Send>>`
+/// (`cyrup-core/src/lib.rs:44`), so there is nowhere to smuggle one back — purely to express a
+/// singleton. `Relaxed` is sufficient: the reader only asks "is this the value I saw", and never
+/// orders other memory against it.
+static INPUT_SERVICED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// One input event has been fully serviced.
+fn mark_input_serviced() {
+    INPUT_SERVICED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many input events the run loop has serviced, read from the reader thread.
+fn input_serviced() -> u64 {
+    INPUT_SERVICED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Set for as long as the run loop has deliberately handed the terminal to a child process, so the
+/// watchdog does not read a by-design block as a wedge.
+///
+/// A first-party flag owned by the loop, **not** an inference from
+/// `crossterm::terminal::is_raw_mode_enabled()`. The inference looks equivalent and is not: it is
+/// only true in the steady state, it says nothing on a console editor that keeps raw mode on, and a
+/// `Ctrl+Z` suspend re-enables raw mode *before* the loop resumes servicing — so the probe would
+/// read "raw, and not servicing" for the whole `fg` resume window and promote a working feature
+/// into an app exit.
+static TERMINAL_RELEASED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// RAII marker for the two paths that block the run loop by design: [`App::suspend`] and
+/// [`App::edit_in_external_editor`]. A guard rather than a pair of calls because both bodies return
+/// early on `?`.
+struct TerminalReleased;
+
+impl TerminalReleased {
+    fn enter() -> Self {
+        TERMINAL_RELEASED.store(true, std::sync::atomic::Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for TerminalReleased {
+    fn drop(&mut self) {
+        TERMINAL_RELEASED.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Whether the loop is blocked by design right now.
+fn terminal_released() -> bool {
+    TERMINAL_RELEASED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The budget an arm body of [`App::run`] is expected to finish inside.
+///
+/// Sized off the healthy ceiling, not off intuition: the `events` arm can legitimately spend
+/// 2 × [`EXTENSION_RENDER_TIMEOUT`] = 4 s on a single event (two `run_renderer` calls per
+/// `EntryAppended`). 8 s is twice that, so a working-but-slow guest renderer never files a report.
+///
+/// This is a REPORTING threshold only. It bounds nothing and cannot promote anything — the escape
+/// hatch is driven entirely by unserviced chords, never by elapsed time — so an arm that
+/// legitimately runs long (a lifecycle hook fan-out is N extensions × `DEFAULT_INVOKE_BUDGET`,
+/// `cyrup-ext/src/dispatch.rs:21`) costs a transcript warning and nothing else.
+const ARM_BUDGET: Duration = Duration::from_secs(8);
+
+/// The arm currently executing, and since when — written by [`ArmGuard`], read by the input
+/// reader's watchdog so a hard exit can name what the loop was stuck in. `&'static str` only, so the
+/// critical section is two assignments and the reader never allocates.
+static ACTIVE_ARM: std::sync::Mutex<Option<(&'static str, std::time::Instant)>> =
+    std::sync::Mutex::new(None);
+
+/// The last arm to exceed [`ARM_BUDGET`], drained by the run loop into the transcript on its next
+/// healthy iteration — so the report reaches the user without ever writing to a raw-mode terminal
+/// from a `Drop`.
+static OVER_BUDGET_ARM: std::sync::Mutex<Option<&'static str>> = std::sync::Mutex::new(None);
+
+/// Marks an arm body as entered for as long as it is held, and records an overrun on the way out.
+///
+/// A guard rather than a pair of calls precisely because these bodies exit by `break`, `continue`,
+/// `return` and `?` as often as they fall off the end — `Drop` covers all five paths.
+struct ArmGuard(&'static str, std::time::Instant);
+
+impl ArmGuard {
+    fn enter(arm: &'static str) -> Self {
+        let now = std::time::Instant::now();
+        if let Ok(mut slot) = ACTIVE_ARM.lock() {
+            *slot = Some((arm, now));
+        }
+        Self(arm, now)
+    }
+}
+
+impl Drop for ArmGuard {
+    fn drop(&mut self) {
+        if let Ok(mut slot) = ACTIVE_ARM.lock() {
+            *slot = None;
+        }
+        if self.1.elapsed() >= ARM_BUDGET
+            && let Ok(mut over) = OVER_BUDGET_ARM.lock()
+        {
+            *over = Some(self.0);
+        }
+    }
+}
+
+/// Unserviced escalate chords that mean "leave now, unconditionally".
+///
+/// Three, because chord #1 carries its own HEAD meaning and must not be a stage: `Ctrl+C` clears
+/// the editor (`Action::Clear`, pi's `handleCtrlC`) and `Ctrl+D` is forward-delete on a non-empty
+/// buffer. #2 is the cooperative cancel, #3 is the hard exit — `crates/cyrup/src/signals.rs`'s two
+/// deliveries, reproduced on the key path because raw mode means `Ctrl+C` never becomes SIGINT.
+const PANIC_PRESSES: u32 = 3;
+
+/// The minimum spacing between chords that [`PANIC_PRESSES`] will count.
+///
+/// Load-bearing, not a nicety. A terminal's key auto-repeat delivers a held `Ctrl+D` as a stream of
+/// ordinary press events at roughly 30 ms intervals — the `KeyEventKind::Press` filter in
+/// [`is_escalate_chord`] cannot tell those from real presses, because on unix they ARE real presses
+/// (`REPORT_EVENT_TYPES` is not pushed, so `Repeat` never appears). Without a floor, leaning on
+/// `Ctrl+D` — which is forward-delete on a non-empty buffer and a delete key inside `/resume` —
+/// would spend all three presses in under 100 ms and hard-exit a perfectly healthy app. 250 ms is
+/// below any human double-tap (pi's own `Ctrl+C` window is 500 ms) and an order of magnitude above
+/// auto-repeat.
+const PANIC_MIN_GAP: Duration = Duration::from_millis(250);
+
+/// `Ctrl+C` or `Ctrl+D`, pressed — not auto-repeated, not released.
+///
+/// The `kind` filter is load-bearing **on Windows**, where crossterm sets `KeyEventKind`
+/// unconditionally (`kind` is "Only set if: Unix: `REPORT_EVENT_TYPES` … Windows: always",
+/// crossterm 0.29 `event.rs:941-946`), so one physical press would otherwise arrive as a press AND
+/// a release and burn two of [`PANIC_PRESSES`]. This check necessarily runs BEFORE [`map_event`],
+/// which is where `Release` is normally filtered. On unix `kind` is only populated under
+/// `REPORT_EVENT_TYPES`, which [`App::into_stdout`] does not push — it pushes
+/// `DISAMBIGUATE_ESCAPE_CODES` alone — so every unix event already arrives as `Press`.
+fn is_escalate_chord(ev: &Event) -> bool {
+    matches!(
+        ev,
+        Event::Key(k)
+            if k.kind == KeyEventKind::Press
+                && k.modifiers.contains(KeyModifiers::CONTROL)
+                && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('d'))
+    )
+}
+
+/// Leave now, from the one context a wedged run loop cannot block.
+///
+/// Order is [`App::drain_and_restore`]'s followed by `signals.rs`'s repeat watcher's. The drain must
+/// precede the restore — `stdin_is_drainable` (`drain.rs`) requires raw mode to still be on — and it
+/// matters here more than anywhere: the user has just pressed the chord three times, and those bytes
+/// would otherwise land in the parent shell. `try_lock`, never `lock`: this path must not be able to
+/// block on a poisoned or contended mutex.
+fn hard_exit_from_reader() -> ! {
+    let _ = crate::drain::drain_stdin_before_exit();
+    crate::panic_hook::restore_terminal_best_effort();
+    // Cooked mode again, so stderr is readable rather than a staircase. This line is the whole
+    // diagnostic yield of a wedge: it names the arm that never returned.
+    if let Ok(slot) = ACTIVE_ARM.try_lock()
+        && let Some((arm, since)) = *slot
+    {
+        eprintln!("cyrup: run loop wedged in arm `{arm}` for {:?}", since.elapsed());
+    }
+    cyrup_tools::kill_tracked_detached_children();
+    // `ShutdownSignal::Interrupt.exit_code()` — the shell's `128 + SIGINT` (`signals.rs`).
+    std::process::exit(130)
+}
+
+/// How far up the escalation ladder the unserviced escalate chords have climbed.
+///
+/// There is no timer in here, deliberately. "Promote once a chord has gone unserviced for N
+/// seconds" needs an N above the longest LEGITIMATE inline stall, and no such constant exists: a
+/// session-lifecycle hook fan-out is N extensions × `DEFAULT_INVOKE_BUDGET` and a swap replay is M
+/// messages × [`EXTENSION_RENDER_TIMEOUT`], both scaling with the user's configuration. Every
+/// transition here is instead caused by a chord the run loop was then shown not to have serviced,
+/// so the ladder cannot be climbed by a slow-but-working operation no matter how long it takes.
+#[derive(Clone, Copy, Debug)]
+enum Escalation {
+    /// Nothing outstanding.
+    Idle,
+    /// `presses` chords have been forwarded, each at least [`PANIC_MIN_GAP`] after the last, with
+    /// the run loop's serviced count stuck at `serviced` throughout. `last` is the previous counted
+    /// chord, for the auto-repeat floor. At `presses == 2` the cooperative cancel has already fired.
+    Armed { serviced: u64, last: std::time::Instant, presses: u32 },
+}
+
+impl Escalation {
+    /// Keep the reader thread alive past `cancel` so the next chord can still reach
+    /// [`Self::on_press`] — see the loop condition in [`crossterm_input_stream`].
+    const fn holds_open(self) -> bool {
+        !matches!(self, Self::Idle)
+    }
+
+    /// A chord was just read. The caller forwards it regardless of what this returns.
+    fn on_press(self, cancel: &CancelToken) -> Self {
+        // Checked here as well as in `tick`: a burst of chords can arrive between two reader
+        // iterations, so a by-design block must disarm on the press path too, or the ladder could
+        // be climbed from inside `$EDITOR`.
+        if terminal_released() {
+            return Self::Idle;
+        }
+        let serviced = input_serviced();
+        let now = std::time::Instant::now();
+        let Self::Armed { serviced: seen, last, presses } = self else {
+            // Chord #1: no evidence of anything yet. Arm and let the normal path handle it.
+            return Self::Armed { serviced, last: now, presses: 1 };
+        };
+        // The loop drained input since the last chord: it IS servicing, and that chord already did
+        // its HEAD job (cleared the editor, deleted a char, quit). Back to the bottom of the ladder.
+        if seen != serviced {
+            return Self::Armed { serviced, last: now, presses: 1 };
+        }
+        // Auto-repeat floor: a held key is a stream of genuine `Press` events on unix, so only
+        // deliberately-spaced chords climb.
+        if now.duration_since(last) < PANIC_MIN_GAP {
+            return Self::Armed { serviced: seen, last, presses };
+        }
+        let presses = presses.saturating_add(1);
+        if presses >= PANIC_PRESSES {
+            // Chord #3 against a loop that has serviced nothing since chord #1.
+            hard_exit_from_reader();
+        }
+        // Chord #2: the cooperative half of `signals.rs`'s escalation. Unblocks the loop's `cancel`
+        // arm if it can still run at all; if it cannot, chord #3 leaves.
+        cancel.cancel();
+        Self::Armed { serviced: seen, last: now, presses }
+    }
+
+    /// One reader iteration with no chord. Disarms only — it can never promote.
+    fn tick(self) -> Self {
+        let Self::Armed { serviced, .. } = self else {
+            return self;
+        };
+        // The loop deliberately released the terminal: `Ctrl+G` external editor
+        // ([`App::edit_in_external_editor`], which `restore()`s and then blocks in
+        // `Command::status()`) or `Ctrl+Z` suspend ([`App::suspend`], SIGTSTP until `fg`). Both stop
+        // the loop servicing input for minutes BY DESIGN, and the chord belongs to the child that
+        // now owns the tty.
+        //
+        // Read from the loop's own flag, NOT from `is_raw_mode_enabled()`: `suspend` re-enables raw
+        // mode BEFORE it redraws and resumes servicing, so the probe would report "raw, and not
+        // servicing" across the whole `fg` resume. [`TerminalReleased`] is cleared by its `Drop`,
+        // i.e. only once the loop is genuinely back.
+        if terminal_released() || input_serviced() != serviced {
+            return Self::Idle;
+        }
+        self
+    }
+}
+
 /// A terminal input stream backed by a blocking `event::read()` reader thread (the async crossterm
 /// `EventStream` feature is not enabled in this build; arch-10 §5 fallback). Maps `crossterm::Event`
 /// to [`InputEvent`] and forwards over an unbounded channel; stops when `cancel` fires.
@@ -8781,7 +9428,18 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
         let mut filter = StrayReplyFilter::new();
         let mut reassembled: Vec<Event> = Vec::new();
         let mut released: Vec<Event> = Vec::new();
-        'reader: while !cancel.is_cancelled() {
+        let mut escalation = Escalation::Idle;
+        // TUI-092 — NOT `while !cancel.is_cancelled()`. This thread now FIRES that token
+        // (`Escalation::on_press`), and the old condition would retire the one reader still able to
+        // see the NEXT chord at the exact moment that chord becomes the only way out.
+        //
+        // `!tx.is_closed()` is the LEADING conjunct, and that ordering is the whole safety
+        // argument: the receiver is dropped when `App::run` returns, so a real SIGTERM/SIGHUP
+        // teardown (`signals.rs` → the biased cancel arm → `drain_and_restore` → return) still ends
+        // this thread even with an escalation armed. `holds_open()` can only extend the reader's
+        // life across the window where teardown has been REQUESTED but has not COMPLETED — which is
+        // precisely the window a wedged teardown must remain escapable in.
+        'reader: while !tx.is_closed() && (!cancel.is_cancelled() || escalation.holds_open()) {
             let wait = if reassembler.is_holding() || filter.is_holding() {
                 HELD_FLUSH_INTERVAL
             } else {
@@ -8790,6 +9448,16 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
             match event::poll(wait) {
                 Ok(true) => match event::read() {
                     Ok(ev) => {
+                        // TUI-092 — recognised BEFORE `EscapeReassembler`/`StrayReplyFilter`: a
+                        // machine mid-hold would otherwise delay the one chord that exists to
+                        // escape a wedge by up to `HELD_FLUSH_INTERVAL`, and could swallow it into
+                        // a reassembled sequence. Read-only on a borrow; the event is pushed below
+                        // unchanged, so neither machine's state is disturbed. It must also run
+                        // before the `tx.send` at the foot of this loop, which starts failing the
+                        // moment the run loop breaks and drops the receiver.
+                        if is_escalate_chord(&ev) {
+                            escalation = escalation.on_press(&cancel);
+                        }
                         reassembler.push(ev, &mut reassembled);
                         for ev in reassembled.drain(..) {
                             filter.push(ev, &mut released);
@@ -8807,6 +9475,11 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
                 }
                 Err(_) => break,
             }
+            // TUI-092 — the disarm tick, on EVERY iteration (at most one `INPUT_POLL_INTERVAL`
+            // apart). It never promotes; it only drops a stale ladder once the loop resumes
+            // servicing input or announces a by-design block, so a chord pressed before a `Ctrl+Z`
+            // is not still armed minutes later.
+            escalation = escalation.tick();
             for ev in released.drain(..) {
                 if let Some(mapped) = map_event(ev)
                     && tx.send(mapped).is_err()

@@ -789,6 +789,26 @@ impl LiveHostServices {
     /// `block_in_place` + `block_on` pattern the `exec` grant uses ([`Self::exec`]); requires a
     /// multi-threaded runtime, which interactive/rpc guarantee
     /// (`#[tokio::main(flavor = "multi_thread")]`, main.rs:40).
+    ///
+    /// That multi-threaded runtime is NECESSARY but not SUFFICIENT. The other half is a caller-side
+    /// INVARIANT THE TUI RUN LOOP UPHOLDS (TUI-092 §5b.2/§5b.4) — no caller may reach this from the
+    /// interactive run-loop task — and it is load-bearing, not hygiene: `block_in_place` frees the
+    /// worker THREAD for other tasks, never the calling TASK's own `poll()`, which stays parked
+    /// inside this call. If the parked task is `App::run`'s loop, that loop can never come round to
+    /// service `ui_rx` and answer the one-shot below — the reply this waits for is one only the
+    /// blocked task could deliver. Self-deadlock, not a slow path, and it takes the keyboard with
+    /// it: the same loop is the sole input-channel drain (TUI-092 §2.1). `opts.timeout_ms` is NOT
+    /// the safety net — its countdown is armed INSIDE the `block_on`, so it bounds only the
+    /// dialogs that carry one (`editor` never does; it passes `DialogOptions::default()`) — and no
+    /// OUTER timer can bound any of them, because `tokio::time::timeout` polls its inner future
+    /// FIRST and a `poll()` that never returns is never re-entered, so its `Sleep` is never polled
+    /// (`cyrup-ext/src/dispatch.rs:499` wraps this same class of call in
+    /// `tokio::time::timeout(self.budget, call)` and the budget still cannot fire). Enforced at the
+    /// call sites in `cyrup-tui`: `app.rs`'s `AppAction::Submit` (:8142), `AppAction::FollowUp`
+    /// (:8163) and `AppAction::ExtensionShortcut` (:8230) arms all `tokio::spawn` the
+    /// guest-reentrant work, and `AppAction::Command` (:8224) now reaches the runtime through a
+    /// channel-back instead of awaiting `App::execute_command` inline on the loop task. Same
+    /// invariant, same reasons, as [`HostServices::open_overlay`]'s.
     fn ui_roundtrip(
         &self,
         kind: UiKind,
@@ -1030,16 +1050,39 @@ impl HostServices for LiveHostServices {
             // The renderer's run loop is gone — degrade exactly as `ui_roundtrip` does.
             return false;
         }
-        // Block this task (NOT the run loop's — every caller of a native command handler is a
-        // SPAWNED task, `app.rs`'s `AppAction::Submit`/`ExtensionShortcut` arms) until the renderer
-        // tears the modal down. `block_in_place` frees the worker thread meanwhile, the same
-        // pattern [`Self::ui_roundtrip`] and the `exec` grant use; both interactive entry points run
-        // on the multi-threaded runtime this requires.
+        // Block THIS task until the renderer tears the modal down. `block_in_place` frees the
+        // worker thread meanwhile, the same pattern [`Self::ui_roundtrip`] and the `exec` grant
+        // use; both interactive entry points run on the multi-threaded runtime this requires.
         //
-        // Deliberately NO timeout: an overlay is a modal the human is looking at, and pi's
-        // `await ctx.ui.custom(...)` has no timer either. A dropped sender (renderer gone, session
-        // swapped, app quit) resolves `done_rx` as `Err`, which is still a resolution — the block
-        // cannot outlive the renderer.
+        // INVARIANT THE TUI RUN LOOP UPHOLDS (TUI-092 §5b.2/§5b.4) — no caller may reach this from
+        // the interactive run-loop task. Load-bearing, not hygiene: `block_in_place` frees the
+        // worker THREAD for other tasks, never the calling TASK's own `poll()`, which stays parked
+        // inside this call. If the parked task is `App::run`'s loop, that loop can never come round
+        // to service `overlay_rx` and resolve `done_tx` — the reply this waits for is one only the
+        // blocked task could deliver. Self-deadlock, not a slow path, and it takes the keyboard
+        // with it: the same loop is the sole input-channel drain (TUI-092 §2.1), so Ctrl+C/Ctrl+D
+        // die with it. Nothing here can check the invariant (the host side sees only `&self`), so
+        // it is stated here and enforced at the call sites in `cyrup-tui`: `app.rs`'s
+        // `AppAction::Submit` (:8142), `AppAction::FollowUp` (:8163) and
+        // `AppAction::ExtensionShortcut` (:8230) arms all `tokio::spawn` the guest-reentrant work,
+        // and `AppAction::Command` (:8224) — which used to `.await` `App::execute_command` INLINE
+        // on the loop task (TUI-092 culprit C: its session-lifecycle arms dispatch
+        // `HostEvent::Session{Start,Shutdown,BeforeSwitch,BeforeFork}` to guest hooks, and a hook
+        // that calls `ctx.ui().*` lands exactly here) — now reaches the runtime through a
+        // channel-back, so that `.await` runs on a spawned task.
+        //
+        // A TIMEOUT CANNOT RESCUE A VIOLATION. `tokio::time::timeout` polls its inner future FIRST;
+        // a `poll()` that never returns is never re-entered, so the outer `Sleep` is never polled
+        // and the deadline is never consulted. `cyrup-ext/src/dispatch.rs:499` already wraps this
+        // very class of call — every `HostEvent` hook, the session-lifecycle ones included — in
+        // `tokio::time::timeout(self.budget, call)`, and the budget STILL cannot fire. The
+        // caller-side invariant is the only thing holding this up.
+        //
+        // Deliberately NO timeout here either: an overlay is a modal the human is looking at, and
+        // pi's `await ctx.ui.custom(...)` has no timer either (and per the paragraph above a timer
+        // would buy no safety anyway). A dropped sender (renderer gone, session swapped, app quit)
+        // resolves `done_rx` as `Err`, which is still a resolution — the block cannot outlive the
+        // renderer.
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async move {
                 let _ = done_rx.await;
