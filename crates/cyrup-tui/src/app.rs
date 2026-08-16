@@ -435,7 +435,7 @@ pub struct AppState {
     /// Set when the user requested quit; the run loop observes it.
     pub should_quit: bool,
     /// Timestamp of the last `Ctrl+C` press, for the double-tap-to-exit gate (Pi `handleCtrlC`,
-    /// interactive-mode.ts:3361-3369): a second `Ctrl+C` within 500 ms exits; otherwise it clears the
+    /// interactive-mode.ts:3797-3805): a second `Ctrl+C` within 500 ms exits; otherwise it clears the
     /// editor and records the press time. `None` until the first press.
     last_sigint: Option<std::time::Instant>,
     /// Timestamp of the last Escape on an EMPTY editor, for Pi's 500 ms double-Escape window
@@ -923,10 +923,17 @@ pub struct App<B: Backend> {
     /// live `!` bash block). During a turn the viewport pins at this floor and stops tracking
     /// per-tool content churn, so the terminal is reconstructed (`resize_viewport` → `reanchor_inline`)
     /// only on GENUINE geometry changes (terminal resize, editor multi-line growth, selector/overlay/
-    /// band) and the two idle↔active transitions per turn — never per completed tool. That stable
-    /// height is what lets ratatui cell-diff the message churn inside a fixed viewport with no full
-    /// repaint, eliminating the per-tool-call FLICKER. Reset to `0` the instant the turn goes idle so
-    /// the region collapses back to the compact editor/footer (the void-fix is preserved).
+    /// band), the two idle↔active transitions per turn, and COMMIT-FLUSH frames — never per tool
+    /// event. That stable height is what lets ratatui cell-diff the message churn inside a fixed
+    /// viewport with no full repaint, eliminating the per-tool-call FLICKER.
+    ///
+    /// The floor is RELEASED back down to the remaining content height on any frame that will flush a
+    /// commit (TUI-090): a mid-turn commit moves content OUT of the live region, and a viewport left
+    /// pinned above the remainder makes `Terminal::insert_before` send the flush directly to native
+    /// scrollback invisibly (ratatui-core `inline.rs:66-67` — "if the viewport takes up the whole
+    /// screen, all lines will be inserted directly into the scrollback buffer"). The release is what
+    /// keeps pi's scroll-into-history VISIBLE. Reset to `0` the instant the turn goes idle so the
+    /// region collapses back to the compact editor/footer (the void-fix is preserved).
     live_floor: u16,
     /// Where a spawned `/tree` navigation posts its outcome back to the run loop. Installed by
     /// [`App::install_tree_nav_channel`], which [`App::run`] calls once at startup. `None` when no
@@ -1987,7 +1994,20 @@ impl<B: Backend> App<B> {
         // per-tool FLICKER. Idle: drop the floor and size to the live content so the region collapses
         // to the compact editor/footer (void-fix).
         let turn_active = self.state.status.streaming || self.state.transcript.has_bash();
+        // TUI-090 — a commit pending flush means content has LEFT the live region (a finished tool, the
+        // finalized assistant text). If the floor is still pinned above the remaining content, the
+        // viewport is stale-full and `insert_before` sends the flush straight to native scrollback
+        // invisibly (ratatui-core inline.rs:66-67). Release the floor to the REMAINING content height on
+        // exactly the frames that will flush, so the shrink (resize_viewport, which runs before
+        // flush_committed below precisely so the insert lands above the correctly-anchored viewport)
+        // puts the flushed lines ON the screen, directly above the live tail. Between commits
+        // the floor stays grow-only — no per-tool-event reconstruction (the FLICKER fix is preserved);
+        // the release costs one shrink per COMMIT, which is the frame that visually requires it.
+        let flush_pending = !self.state.transcript.pending().is_empty();
         let desired = if turn_active {
+            if flush_pending && raw < self.live_floor {
+                self.live_floor = raw;
+            }
             self.live_floor = self.live_floor.max(raw).min(term_h);
             self.live_floor
         } else {
@@ -2529,7 +2549,7 @@ impl<B: Backend> App<B> {
                 // end and does nothing.
                 AppAction::Redraw
             }
-            // `app.clear` (Ctrl+C, Pi `handleCtrlC` interactive-mode.ts:3361-3369): a second Ctrl+C
+            // `app.clear` (Ctrl+C, Pi `handleCtrlC` interactive-mode.ts:3797-3805): a second Ctrl+C
             // within 500 ms of the previous one EXITS — there is NO emptiness gate (Pi does not require
             // the editor to be empty; that is `Ctrl+D`'s rule, not `Ctrl+C`'s). Otherwise clear the
             // editor buffer and record the press time.
@@ -9845,7 +9865,7 @@ mod ctrl_c_tests {
         InputEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
     }
 
-    /// F10 — Pi `handleCtrlC` (interactive-mode.ts:3361-3369): a second Ctrl+C within 500 ms exits,
+    /// F10 — Pi `handleCtrlC` (interactive-mode.ts:3797-3805): a second Ctrl+C within 500 ms exits,
     /// with NO emptiness gate (the first press clears the editor and records the time even when the
     /// buffer is non-empty; only the timing — not emptiness — gates the exit).
     #[test]
@@ -9915,14 +9935,18 @@ mod live_floor_tests {
         assert!(grown > idle, "viewport should grow for the live tool tail ({grown} vs idle {idle})");
 
         // The finished tools commit to native scrollback mid-turn (SCREEN-FILL fix): the live content
-        // collapses, but the floor HOLDS the viewport height so no reconstruction is triggered.
+        // collapses — and with a commit PENDING FLUSH the floor RELEASES to the remaining content
+        // height (TUI-090), so the flush lands on screen above the shrunken viewport instead of
+        // invisibly in scrollback. The grow-only hold now applies only BETWEEN commits (nothing
+        // pending flush); this is the one frame per commit where a shrink is visually required.
         app.transcript_mut().commit_finished_leading_tools();
         assert_eq!(app.state().transcript.active_tools().len(), 0, "finished tools left the tail");
         app.draw().unwrap();
         assert_eq!(
             app.viewport_height(),
-            grown,
-            "grow-only floor must hold the height across the mid-turn commit (no per-tool reconstruct)"
+            idle,
+            "with a commit pending flush and the live tail gone, the floor releases to the \
+             remaining content height (the compact chrome) so the flush stays visible (TUI-090)"
         );
 
         // Turn goes idle (AgentEnd clears `status.streaming`): the floor resets and the region
@@ -9933,6 +9957,94 @@ mod live_floor_tests {
             app.viewport_height(),
             idle,
             "idle viewport must collapse back to the compact region after the turn"
+        );
+    }
+
+    /// The TUI-090 release's other half: it fires ONLY on frames that will flush a commit. Content
+    /// shrink with NOTHING pending flush — e.g. the user deleting editor text mid-turn — must hold
+    /// the floor, or every shrink would force a `resize_viewport`/`reanchor_inline` reconstruction
+    /// for mere content churn: the per-event FLICKER the floor exists to kill.
+    #[test]
+    fn the_floor_holds_when_content_shrinks_with_nothing_pending_flush() {
+        let mut app = App::new(TestBackend::new(80, 30), UiTheme::dark()).unwrap();
+        app.status_mut().set_model("anthropic/claude-opus-4-8");
+        app.draw().unwrap();
+
+        // A multi-line editor makes the live region taller without any transcript content; a live
+        // tool tail pins the floor above that.
+        app.editor_mut().set_text("line 1\nline 2\nline 3\nline 4\nline 5");
+        app.status_mut().set_streaming(true);
+        for i in 0..8u32 {
+            let name = format!("read_{i}");
+            app.transcript_mut()
+                .push_tool_start(name.clone(), serde_json::json!({ "path": format!("file_{i}.md") }));
+            app.transcript_mut().push_tool_end(
+                name,
+                false,
+                Some(serde_json::json!({ "content": [{ "type": "text", "text": format!("body {i}") }] })),
+            );
+        }
+        app.draw().unwrap();
+        let grown = app.viewport_height();
+
+        // The user deletes the editor text mid-turn: the live region's content shrinks, but no
+        // commit has happened, so nothing is pending flush. The floor must HOLD.
+        app.editor_mut().clear();
+        assert!(
+            app.state().transcript.pending().is_empty(),
+            "no commit has happened, so nothing can be pending flush"
+        );
+        app.draw().unwrap();
+        assert_eq!(
+            app.viewport_height(),
+            grown,
+            "the floor must hold across content shrink with nothing pending flush (FLICKER fix); \
+             the TUI-090 release fires only on frames that will flush a commit"
+        );
+    }
+
+    /// The release only fires DOWNWARD. On a flush frame whose REMAINING live content is taller
+    /// than the pinned floor — a small tool tail commits while the streaming answer has already
+    /// grown past it — `raw < live_floor` is false, nothing is stale, and the floor must grow to
+    /// the content exactly as it does between commits. Releasing here would clip a growing turn.
+    #[test]
+    fn the_floor_grows_rather_than_releases_on_a_flush_frame_when_the_tail_grew() {
+        let mut app = App::new(TestBackend::new(80, 30), UiTheme::dark()).unwrap();
+        app.status_mut().set_model("anthropic/claude-opus-4-8");
+        app.draw().unwrap();
+
+        // A small finished-tool tail pins the floor low.
+        app.status_mut().set_streaming(true);
+        for i in 0..2u32 {
+            let name = format!("read_{i}");
+            app.transcript_mut()
+                .push_tool_start(name.clone(), serde_json::json!({ "path": format!("file_{i}.md") }));
+            app.transcript_mut().push_tool_end(
+                name,
+                false,
+                Some(serde_json::json!({ "content": [{ "type": "text", "text": format!("body {i}") }] })),
+            );
+        }
+        app.draw().unwrap();
+        let low = app.viewport_height();
+
+        // The tools commit (production order: `ToolExecutionEnd` commits while no assistant
+        // message is streaming — `commit_finished_leading_tools` early-returns otherwise), and
+        // the assistant text THEN streams tall ahead of the next frame: a flush IS pending, but
+        // the remaining live content (the streaming partial) outgrows the pinned floor.
+        app.transcript_mut().commit_finished_leading_tools();
+        assert!(
+            !app.state().transcript.pending().is_empty(),
+            "the commit is pending flush on this frame"
+        );
+        app.transcript_mut()
+            .push_assistant_delta(&"a streamed answer line\n".repeat(30));
+        app.draw().unwrap();
+        let grown = app.viewport_height();
+        assert!(
+            grown > low,
+            "with a flush pending but the live tail TALLER than the floor, the floor must grow to \
+             the content ({grown} > {low}) — the TUI-090 release only fires downward"
         );
     }
 }
