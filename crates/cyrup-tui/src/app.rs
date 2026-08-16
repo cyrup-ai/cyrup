@@ -1115,8 +1115,8 @@ impl<B: Backend> App<B> {
     /// inline region swallowing the whole screen. No alternate screen is entered.
     pub fn new(backend: B, theme: UiTheme) -> Result<Self, TuiError> {
         let size = backend.size().map_err(|e| TuiError::Backend(e.to_string()))?;
-        let state = AppState::new(theme);
-        let height = live_region_height(&state, size.width, size.height.max(1));
+        let mut state = AppState::new(theme);
+        let height = live_region_height(&mut state, size.width, size.height.max(1));
         let terminal = Terminal::with_options(
             backend,
             TerminalOptions { viewport: Viewport::Inline(height.max(1)) },
@@ -1983,7 +1983,7 @@ impl<B: Backend> App<B> {
         if let Some(active) = self.state.selector.as_mut() {
             active.inner.set_terminal_height(term_h);
         }
-        let raw = live_region_height(&self.state, term_w, term_h);
+        let raw = live_region_height(&mut self.state, term_w, term_h);
         // Grow-only hysteresis GATED on the turn being active. `status.streaming` is set on
         // `AgentStart` and cleared on `AgentEnd`, so it spans the WHOLE multi-step turn including the
         // gaps between tools (it is NOT `transcript.has_active()`, which flickers false between tools
@@ -7492,7 +7492,7 @@ fn header_rows(state: &AppState) -> u16 {
         .unwrap_or(0)
 }
 
-fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 10] {
+fn region_constraints(state: &mut AppState, width: u16, avail: u16) -> [u16; 10] {
     let avail = avail.max(1);
     let max_editor = avail.saturating_sub(2).max(3);
     // A selector owns the slot at its desired height; otherwise the editor sizes to its line count +
@@ -7629,7 +7629,7 @@ fn region_constraints(state: &AppState, width: u16, avail: u16) -> [u16; 10] {
 /// The inline-viewport height = the sum of the live-region rows (audit #1). Driven by
 /// [`region_constraints`] against the **terminal** height so the content-sized viewport never
 /// exceeds the screen.
-fn live_region_height(state: &AppState, width: u16, term_height: u16) -> u16 {
+fn live_region_height(state: &mut AppState, width: u16, term_height: u16) -> u16 {
     // A floating overlay (hotkeys/help; spec/tui/05 §2) is a modal that draws *over* the whole live
     // region — it needs the full screen to center its box, so the inline viewport expands to the
     // terminal height while one is open (the editor/footer still render behind it).
@@ -8609,6 +8609,14 @@ impl App<CrosstermBackend<Stdout>> {
                     if self.state.indicator.is_active()
                         || self.state.transcript.bash_running() =>
                 {
+                    // The live `!` block's glyph and a running bash tool's `Elapsed` footer are
+                    // re-derived from `Instant::now()` inside `lines()` — invalidate so this tick
+                    // re-materialises them (once, not 3×). Quiet turns hit the cache and stay free.
+                    if self.state.transcript.bash_running()
+                        || self.state.transcript.has_running_elapsed_tool()
+                    {
+                        self.state.transcript.bump_render_tick();
+                    }
                     self.draw_synchronized()?;
                 }
                 _ = dialog_countdown.tick(),
@@ -8623,8 +8631,10 @@ impl App<CrosstermBackend<Stdout>> {
                     self.tick_terminal_progress_keepalive();
                 }
                 _ = elapsed_tick.tick(), if self.state.transcript.has_running_elapsed_tool() => {
-                    // Pi's `context.invalidate()` → `ui.requestRender()`: nothing to mutate, the
-                    // `Elapsed` figure is computed from `started_at` at render time.
+                    // Pi's `context.invalidate()` → `ui.requestRender()`: the `Elapsed` figure is
+                    // computed from `started_at` inside `lines()`, so the render cache must be
+                    // invalidated for the repaint to show a fresh value.
+                    self.state.transcript.bump_render_tick();
                     self.draw_synchronized()?;
                 }
                 _ = git_branch_poll.tick(), if self.state.git_branch.in_repo() => {
