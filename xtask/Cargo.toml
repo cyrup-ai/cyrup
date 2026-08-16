@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+# The catalog generator (PROV-018 / PROV-060). Deliberately DEPENDENCY-FREE: it shells out to
+# `git show` and parses the recovered TypeScript data literals with the hand-written scanner in
+# `src/tsdata.rs`. In particular it does NOT pull `serde_json`, because the only serde_json feature
+# that preserves object key order (`preserve_order`) is unified across the whole workspace build
+# graph and would silently change `serde_json::Map` for every crate that ships in the binary.
+[dependencies]
+
+[lints]
+workspace = true

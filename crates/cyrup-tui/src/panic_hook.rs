@@ -30,7 +30,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ratatui::crossterm::ExecutableCommand;
 use ratatui::crossterm::event::{DisableBracketedPaste, PopKeyboardEnhancementFlags};
-use ratatui::crossterm::terminal::disable_raw_mode;
+use ratatui::crossterm::terminal::{EndSynchronizedUpdate, disable_raw_mode};
 
 /// Undo everything [`crate::App::into_stdout`] turned on, best-effort and in reverse order.
 ///
@@ -47,10 +47,26 @@ use ratatui::crossterm::terminal::disable_raw_mode;
 ///
 /// It DOES clear the OSC 9;4 progress indicator, which is not a terminal *mode* like the other
 /// three: it is state the terminal emulator keeps on the app's behalf, and it survives the process
-/// and every `stty sane`/`reset` a user would reach for. See the first statement below.
+/// and every `stty sane`/`reset` a user would reach for. See that statement below.
+///
+/// It DOES also close any open synchronized update (DECSET 2026) — ahead of the OSC 9;4 clear and
+/// of everything else, because an exit taken mid-frame leaves the terminal buffering every write
+/// that follows, this function's own included. See the first statement below.
 pub fn restore_terminal_best_effort() {
     let mut out = io::stdout();
-    // The OSC 9;4 taskbar indicator, first — Pi's `ProcessTerminal.stop()` clears it ahead of every
+    // Close the synchronized update FIRST, before this function writes anything else.
+    // [`crate::App::draw_synchronized`] (`app.rs:7593-7606`) brackets every frame in
+    // `BeginSynchronizedUpdate` … `EndSynchronizedUpdate`, and both a hard exit through the TUI-092
+    // input-reader escape hatch and a panic can land INSIDE that window — are LIKELY to, in fact,
+    // since the wedge the escape hatch exists for is a run loop stuck mid-frame. With the closing
+    // marker never emitted DECSET 2026 stays set and the terminal simply stops painting: the OSC
+    // 9;4 clear below, the mode resets after it, the panic message the chained hook prints and the
+    // user's next shell prompt are all held back until the terminal's own BSU timeout expires. That
+    // is the whole reason it precedes the progress clear rather than following it. Unconditional,
+    // because ending an update that never began is a no-op — and `panic = "abort"` means no unwind
+    // will ever emit the closing marker on our behalf.
+    let _ = out.execute(EndSynchronizedUpdate);
+    // The OSC 9;4 taskbar indicator next — Pi's `ProcessTerminal.stop()` clears it ahead of every
     // other teardown step (`tui/src/terminal.ts:407-409`, `if (this.clearProgressInterval())`), and
     // it is the one piece of state here that OUTLIVES the process: raw mode and bracketed paste die
     // with the tty settings a `reset` restores, but a progress indicator this process lit stays lit

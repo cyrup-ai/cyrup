@@ -66,6 +66,7 @@ mod project_trust_banner;
 mod render;
 mod rich_messages;
 mod run_loop_cancel_bias;
+mod run_loop_input_priority;
 mod runtime_swap;
 mod scoped_models;
 mod selection_fidelity;

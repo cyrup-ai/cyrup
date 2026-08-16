@@ -22,6 +22,7 @@ members = [
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",
     "crates/cyrup-it",
+    "xtask",
 ]
 # cyrup-it is the workspace's ONE integration-test crate (docs/TEST-ARCHITECTURE.md §2): it holds
 # only the seam tests — the ones that spawn a binary, drive a subagent child, load a live wasm
