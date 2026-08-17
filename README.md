@@ -6,11 +6,14 @@ A coding agent in Rust, inspired by the [Pi](https://github.com/earendil-works/p
 It takes Pi's design — a minimal core, everything-is-an-extension, an agent that can extend itself —
 and rebuilds it on a Rust backbone with WebAssembly extensions.
 
-> **Status:** not a released product. 19 crates, ~551k lines of Rust. The agent loop, provider
+> **Status:** not a released product. 20 crates, ~578k lines of Rust. The agent loop, provider
 > layer, tool set, session tree, TUI, extension host and all four run modes are real and wired end
-> to end. Both gates are green: 6,855 unit tests (7 skipped) in ~18s, 473 integration tests in ~92s.
+> to end, and now so is Flux — a structured, file-persisted `new → ask → split → aug → exec → qa →
+> tests → commit → create-pr` development pipeline ported straight into the binary as a native
+> extension. Both gates are green: 6,855+ unit tests in ~18s, 473 integration tests in ~92s.
 > Behavioural equivalence work is tracked openly in
-> [`docs/gap-analysis/`](docs/gap-analysis/README.md).
+> [`docs/gap-analysis/`](docs/gap-analysis/README.md). The full user guide is in
+> [`docs/guide/`](docs/guide/introduction.md) — see [Documentation](#documentation) below.
 
 ## Inspired by, not transliterated from
 
@@ -79,11 +82,13 @@ The tradeoff is honest and worth stating: values cross the boundary as data, not
 Pi hands an extension a live object, cyrup passes a serialized value or an explicit round-trip. That
 is a genuine constraint on API shape, and it is documented as such rather than hidden.
 
-Three larger subsystems ship as **native built-in extensions** rather than WASM — subagent
-delegation, the permission gate, and the intercom broker — because they supervise OS processes and
-own Unix sockets. All three are **default off**, each arming on its own env flag
-(`CYRUP_SUBAGENTS` / `CYRUP_PERMISSION_SYSTEM` / `CYRUP_INTERCOM`) or on the presence of its config
-file. Note that dropping a policy file into a repository is enough to arm the permission gate.
+Four larger subsystems ship as **native built-in extensions** rather than WASM — subagent
+delegation, the permission gate, the intercom broker, and Flux — because the first three supervise
+OS processes and own Unix sockets, and Flux's whole point is to work with no install step at all.
+The first three are **default off**, each arming on its own env flag (`CYRUP_SUBAGENTS` /
+`CYRUP_PERMISSION_SYSTEM` / `CYRUP_INTERCOM`) or on the presence of its config file — note that
+dropping a policy file into a repository is enough to arm the permission gate. Flux is the
+exception: it attaches unconditionally, and turns itself off only inside a subagent child process.
 
 ## Workspace layout
 
@@ -108,9 +113,29 @@ Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, 
 | `cyrup-ext-subagents` | OS-subprocess subagent delegation (the largest crate) |
 | `cyrup-permission-system` | runtime allow / ask / deny policy over every tool call |
 | `cyrup-intercom` | Unix-socket broker for supervisor↔subagent coordination |
+| `cyrup-flux` | the Flux structured development pipeline, on by default |
 | `cyrup-ext-sdk` | guest SDK for authoring extensions (`wasm32-wasip2`) |
 | `cyrup-test-support` | faux provider + differential / interop / golden harnesses |
 | `cyrup-it` | the integration-test harness crate (gated, see below) |
+
+## Documentation
+
+The full user guide lives under [`docs/guide/`](docs/guide/introduction.md), written as an
+[mdBook](https://rust-lang.github.io/mdBook/) (`book.toml` at the repo root). Install `mdbook` and
+run it locally:
+
+```sh
+cargo install mdbook
+mdbook serve   # http://localhost:3000, live-reloads on save
+mdbook build   # renders static HTML into target/guide
+```
+
+Start at [Introduction](docs/guide/introduction.md), or jump straight to a topic:
+
+- [Install](docs/guide/getting-started/install.md) / [Connect a provider](docs/guide/getting-started/authenticate.md) / [Your first session](docs/guide/getting-started/first-session.md)
+- [The terminal interface](docs/guide/guides/tui.md), [sessions](docs/guide/guides/sessions.md), [models and thinking](docs/guide/guides/models.md), [tools and permissions](docs/guide/guides/tools-and-permissions.md)
+- [How extensions work](docs/guide/extensions/overview.md), [subagents](docs/guide/extensions/subagents.md), [the permission system](docs/guide/extensions/permissions.md), [intercom](docs/guide/extensions/intercom.md), [**Flux**](docs/guide/extensions/flux.md)
+- [Command-line reference](docs/guide/reference/cli.md), [`settings.json`](docs/guide/reference/settings.md), [environment variables](docs/guide/reference/environment.md)
 
 ## Build
 
