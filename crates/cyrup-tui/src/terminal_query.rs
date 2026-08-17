@@ -320,7 +320,10 @@ pub fn find_cell_size_report(buffer: &str) -> Option<(u16, u16)> {
 /// `CSI <row> ; <col> R` → 0-based `(col, row)` — the DSR cursor-position report. A leading `?`
 /// (DECXCPR) is tolerated but not required, since real terminals answer the plain `CSI 6 n` query
 /// with the plain form. Digits-only, non-empty fields, like [`parse_cell_size_report`]; a `0` row or
-/// column is rejected rather than underflowed (CPR coordinates are 1-based).
+/// column is rejected via `checked_sub` rather than underflowed — CPR coordinates are 1-based, and
+/// a bare `- 1` inside `bool::then_some`'s EAGERLY-evaluated argument would subtract-with-overflow
+/// (a debug-build panic) on a malformed `0` from an adversarial or merely buggy terminal, which
+/// R-00-009 forbids on any path reachable from terminal input.
 pub fn parse_cursor_position_report(data: &str) -> Option<(u16, u16)> {
     let body = data.strip_prefix("\x1b[")?;
     let body = body.strip_prefix('?').unwrap_or(body);
@@ -335,7 +338,7 @@ pub fn parse_cursor_position_report(data: &str) -> Option<(u16, u16)> {
     }
     let row: u16 = row.parse().ok()?;
     let col: u16 = col.parse().ok()?;
-    (row > 0 && col > 0).then_some((col - 1, row - 1))
+    Some((col.checked_sub(1)?, row.checked_sub(1)?))
 }
 
 /// Locate a `CSI <row> ; <col> R` report anywhere inside a raw read (which also carries the DA1
@@ -582,6 +585,36 @@ mod tests {
     }
 
     #[test]
+    fn cursor_position_report_forms() {
+        // `CSI <row> ; <col> R` is ROW then COLUMN, 1-based; the tuple here is 0-based `(col, row)`
+        // — the order `ratatui::layout::Position { x, y }` wants.
+        assert_eq!(parse_cursor_position_report("\x1b[12;40R"), Some((39, 11)));
+        assert_eq!(parse_cursor_position_report("\x1b[1;1R"), Some((0, 0)), "top-left is (0, 0)");
+        // DECXCPR's leading `?` is tolerated even though cyrup never sends the DECXCPR query.
+        assert_eq!(parse_cursor_position_report("\x1b[?12;40R"), Some((39, 11)));
+        // CPR coordinates are 1-based; a `0` is rejected rather than underflowed.
+        assert_eq!(parse_cursor_position_report("\x1b[0;5R"), None, "row 0 cannot underflow");
+        assert_eq!(parse_cursor_position_report("\x1b[5;0R"), None, "col 0 cannot underflow");
+        // Shape rejections: no terminator, missing field, non-numeric field, wrong introducer.
+        assert_eq!(parse_cursor_position_report("\x1b[12;40"), None, "missing R terminator");
+        assert_eq!(parse_cursor_position_report("\x1b[12R"), None, "missing `;`");
+        assert_eq!(parse_cursor_position_report("\x1b[;40R"), None, "empty row field");
+        assert_eq!(parse_cursor_position_report("\x1b[12;R"), None, "empty col field");
+        assert_eq!(parse_cursor_position_report("\x1b[a;40R"), None, "non-digit row field");
+        assert_eq!(parse_cursor_position_report("12;40R"), None, "missing CSI introducer");
+        assert_eq!(parse_cursor_position_report("\x1b[6n"), None, "the QUERY is not a report");
+    }
+
+    #[test]
+    fn cursor_position_is_found_alongside_the_sentinel_answer() {
+        // What a real xterm sends back for `CSI 6 n` + `CSI c`, in one read — the exact wire shape
+        // `exchange(CURSOR_POSITION_QUERY, ..)` produces.
+        assert_eq!(find_cursor_position_report("\x1b[12;40R\x1b[?62;1;2c"), Some((39, 11)));
+        assert_eq!(find_cursor_position_report("\x1b[?62;1;2c"), None, "DA1 only ⇒ no position");
+        assert_eq!(find_cursor_position_report(""), None);
+    }
+
+    #[test]
     fn color_scheme_report_forms() {
         assert_eq!(parse_color_scheme_report("\x1b[?997;1n"), Some(TerminalTheme::Dark));
         assert_eq!(parse_color_scheme_report("\x1b[?997;2n"), Some(TerminalTheme::Light));
@@ -672,6 +705,17 @@ mod tests {
         assert_eq!(StdinTerminalProbe.query_background_color(Duration::from_secs(30)), None);
         assert_eq!(StdinTerminalProbe.query_color_scheme(Duration::from_secs(30)), None);
         assert_eq!(StdinTerminalProbe.query_cell_size(Duration::from_secs(30)), None);
+        assert_eq!(StdinTerminalProbe.query_cursor_position(Duration::from_secs(30)), None);
         assert!(started.elapsed() < Duration::from_secs(1), "the probe must not block");
+    }
+
+    /// The trait's default [`TerminalProbe::query_cursor_position`] (TUI-093) answers `None`
+    /// regardless of timeout — the same contract [`query_color_scheme`](TerminalProbe::query_color_scheme)
+    /// and [`query_cell_size`](TerminalProbe::query_cell_size) already have, exercised here through
+    /// [`NoTerminalProbe`], which overrides none of the three and so calls the default directly.
+    #[test]
+    fn the_default_cursor_position_probe_answers_none() {
+        assert_eq!(NoTerminalProbe.query_cursor_position(Duration::from_millis(1)), None);
+        assert_eq!(NoTerminalProbe.query_cursor_position(Duration::from_secs(30)), None);
     }
 }
