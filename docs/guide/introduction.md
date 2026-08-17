@@ -27,7 +27,10 @@ extension gets filesystem, process, network or UI access only if it declared tha
 
 Three larger subsystems ship built in and default off: **subagents** for delegating work to child
 agent processes, **the permission system** for allow/ask/deny policy over every tool call, and
-**intercom** for coordination between concurrent sessions.
+**intercom** for coordination between concurrent sessions. A fourth, **Flux**, ships built in too
+but is on by default: a structured, file-persisted development pipeline (`new → ask → split → aug →
+exec → qa → tests → commit → create-pr`) driven by `/flux/*` commands — see
+[Flux](extensions/flux.md).
 
 ## Where to start
 

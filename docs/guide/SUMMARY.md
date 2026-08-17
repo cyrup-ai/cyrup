@@ -25,6 +25,7 @@
 - [Subagents](extensions/subagents.md)
 - [The permission system](extensions/permissions.md)
 - [Intercom](extensions/intercom.md)
+- [Flux: the structured pipeline](extensions/flux.md)
 - [Writing an extension](extensions/authoring.md)
 
 # Reference
