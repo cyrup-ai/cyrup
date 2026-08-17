@@ -10,7 +10,7 @@ pub(crate) enum RunFlow {
     ReturnOk,
 }
 
-impl App<CrosstermBackend<Stdout>> {
+impl App<InlineBackend<Stdout>> {
     /// The boot-time UI seed (§7.2): the `/` menu registry, every persisted setting's
     /// first-frame application, the window title, the auth/context snapshots and the
     /// project-trust banner — moved verbatim from `App::run`'s setup. The session-swap

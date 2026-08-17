@@ -35,7 +35,7 @@ pub(crate) fn run_editor_over_file(editor_cmd: &str, path: &std::path::Path) -> 
     None
 }
 
-impl App<CrosstermBackend<Stdout>> {
+impl App<InlineBackend<Stdout>> {
     /// Build the production app: raw mode on, bracketed paste + Kitty keyboard flags enabled
     /// (best-effort, with graceful fallback, R-ARCH-TUI-008), inline viewport on stdout.
     ///
@@ -62,7 +62,25 @@ impl App<CrosstermBackend<Stdout>> {
         // `crate::terminal_query`'s for the read's timeout/input-safety contract). The recorded
         // outcome is what the re-entry paths below re-apply and what the startup diagnostics read.
         let _ = crate::keyboard_protocol::negotiate();
-        App::new(CrosstermBackend::new(out), theme)
+        // TUI-093 — the ONE cursor-position query this process makes, in the SAME pre-reader-thread
+        // window as the Kitty negotiation just above (see `crate::terminal_query`'s timeout /
+        // input-safety contract). Hard-bounded at 100 ms, consumes nothing when the terminal is
+        // silent, and cannot race `crossterm_input_stream` because that thread does not exist yet.
+        // From here on `InlineBackend` tracks the cursor itself and NOTHING queries the terminal for
+        // it again — the fix for the mid-session "cursor position could not be read" crash, which
+        // came from ratatui's `CrosstermBackend::get_cursor_position` racing that reader thread on
+        // every commit flush, window resize and live-region height change.
+        use crate::terminal_query::TerminalProbe as _;
+        let probed_row = crate::terminal_query::StdinTerminalProbe
+            .query_cursor_position(crate::terminal_query::CURSOR_POSITION_TIMEOUT)
+            .map(|(_, row)| row);
+        let mut backend = InlineBackend::with_anchor(out, ratatui::layout::Position::ORIGIN);
+        // A silent/absent terminal falls back to the bottom row — where `App::draw`'s first
+        // `resize_viewport` bottom-anchors the region anyway (`reanchor_inline_region` with
+        // `old_height` 0).
+        let bottom = backend.size().map(|s| s.height.saturating_sub(1)).unwrap_or(0);
+        backend.set_anchor(ratatui::layout::Position::new(0, probed_row.unwrap_or(bottom).min(bottom)));
+        App::new(backend, theme)
     }
 
     /// Draw one frame wrapped in synchronized-output markers (CSI 2026, R-10-002 / R-ARCH-TUI-004).

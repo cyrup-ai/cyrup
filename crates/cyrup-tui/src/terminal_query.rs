@@ -16,6 +16,17 @@
 //!   `CSI ? 997 ; 2 n` (light) — [`parse_color_scheme_report`]. Note the **query** is `996` and the
 //!   **report** is `997`.
 //!
+//! A fourth query is cyrup-original, not a Pi port — Pi's hand-rolled renderer never needs it, but
+//! ratatui's inline viewport does:
+//!
+//! * **DSR `CSI 6 n`** — the cursor-position report (`find_cursor_position_report`). Asked EXACTLY
+//!   ONCE, at boot, through the same bounded `exchange` as the three probes above, to seed
+//!   [`crate::InlineBackend`]'s tracked cursor anchor (TUI-093). After that single call cyrup never
+//!   asks the terminal where the cursor is again — the backend answers from the anchor it already
+//!   knows, because `crossterm::cursor::position()` would otherwise race
+//!   [`crate::app::crossterm_input_stream`]'s permanent reader thread on every commit flush, window
+//!   resize and live-region height change, which is what produced the crash this exists to fix.
+//!
 //! Both probes are optional: `COLORFGBG` remains the fallback ([`TerminalTheme::detect`]) exactly as
 //! in Pi's `catch` arms (`theme.ts:783-787`, `:797-800`).
 //!
@@ -91,6 +102,15 @@ pub const CELL_SIZE_QUERY: &str = "\x1b[16t";
 /// Pi's own 100 ms figure (`theme-controller.ts:41,53`).
 pub const CELL_SIZE_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// `CSI 6 n` — DSR cursor-position report; cyrup-original (TUI-093), not a Pi sequence. The reply is
+/// `CSI <row> ; <col> R`, 1-based ([`parse_cursor_position_report`]). Asked ONCE, at boot, to seed
+/// [`crate::InlineBackend`]'s anchor; after that cyrup tracks the cursor itself and the terminal is
+/// never asked again — see the module docs for why asking on every frame crashed the app.
+pub const CURSOR_POSITION_QUERY: &str = "\x1b[6n";
+
+/// The cursor-position probe's budget — the same 100 ms figure as the other three probes.
+pub const CURSOR_POSITION_TIMEOUT: Duration = Duration::from_millis(100);
+
 /// `CSI c` — Primary Device Attributes, appended to every query as the ordering sentinel (see the
 /// module docs). Not a Pi sequence: Pi's event-loop lets it settle a promise instead.
 const DEVICE_ATTRIBUTES_QUERY: &str = "\x1b[c";
@@ -117,6 +137,15 @@ pub trait TerminalProbe {
     /// terminal that does not answer leaves the image layer on its default cell
     /// (`terminal-image.ts:37`'s `{widthPx: 9, heightPx: 18}`; ratatui-image's is `10x20`).
     fn query_cell_size(&self, timeout: Duration) -> Option<(u16, u16)> {
+        let _ = timeout;
+        None
+    }
+
+    /// `CSI 6 n` → the cursor's 0-based `(col, row)`. cyrup-original (TUI-093), not a Pi port: seeds
+    /// [`crate::InlineBackend`]'s anchor at boot so the terminal is never queried for its cursor
+    /// again. Optional like the three probes above: a terminal that stays silent leaves the caller
+    /// on its own fallback (the live viewport's bottom row).
+    fn query_cursor_position(&self, timeout: Duration) -> Option<(u16, u16)> {
         let _ = timeout;
         None
     }
@@ -288,6 +317,38 @@ pub fn find_cell_size_report(buffer: &str) -> Option<(u16, u16)> {
     parse_cell_size_report(rest.get(..=end)?)
 }
 
+/// `CSI <row> ; <col> R` → 0-based `(col, row)` — the DSR cursor-position report. A leading `?`
+/// (DECXCPR) is tolerated but not required, since real terminals answer the plain `CSI 6 n` query
+/// with the plain form. Digits-only, non-empty fields, like [`parse_cell_size_report`]; a `0` row or
+/// column is rejected rather than underflowed (CPR coordinates are 1-based).
+pub fn parse_cursor_position_report(data: &str) -> Option<(u16, u16)> {
+    let body = data.strip_prefix("\x1b[")?;
+    let body = body.strip_prefix('?').unwrap_or(body);
+    let body = body.strip_suffix('R')?;
+    let (row, col) = body.split_once(';')?;
+    if row.is_empty()
+        || col.is_empty()
+        || !row.bytes().all(|b| b.is_ascii_digit())
+        || !col.bytes().all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let row: u16 = row.parse().ok()?;
+    let col: u16 = col.parse().ok()?;
+    (row > 0 && col > 0).then_some((col - 1, row - 1))
+}
+
+/// Locate a `CSI <row> ; <col> R` report anywhere inside a raw read (which also carries the DA1
+/// sentinel reply) and parse it into 0-based `(col, row)` — the same single-frame scan shape as
+/// [`find_cell_size_report`] (only one reply is ever expected: the boot probe issues exactly one
+/// `CSI 6 n`, so there is no burst to fold like [`find_color_scheme_report`]'s "last wins").
+pub fn find_cursor_position_report(buffer: &str) -> Option<(u16, u16)> {
+    let start = buffer.find("\x1b[")?;
+    let rest = buffer.get(start..)?;
+    let end = rest.find('R')?;
+    parse_cursor_position_report(rest.get(..=end)?)
+}
+
 /// Locate the `CSI ? 997 ; N n` report(s) anywhere inside a raw read and parse them.
 ///
 /// Pi can anchor ([`parse_color_scheme_report`]) because its dispatcher hands
@@ -374,6 +435,10 @@ impl TerminalProbe for StdinTerminalProbe {
 
     fn query_cell_size(&self, timeout: Duration) -> Option<(u16, u16)> {
         find_cell_size_report(&exchange(CELL_SIZE_QUERY, timeout)?)
+    }
+
+    fn query_cursor_position(&self, timeout: Duration) -> Option<(u16, u16)> {
+        find_cursor_position_report(&exchange(CURSOR_POSITION_QUERY, timeout)?)
     }
 }
 

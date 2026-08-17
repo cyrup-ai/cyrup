@@ -24,7 +24,7 @@ pub(crate) struct RunCtx {
     pub(crate) shortcut_status_tx: tokio::sync::mpsc::UnboundedSender<String>,
 }
 
-impl App<CrosstermBackend<Stdout>> {
+impl App<InlineBackend<Stdout>> {
     /// The interactive event loop: `select!` over terminal input, the agent event stream, theme
     /// hot-reload, and cancellation (arch-10 §5). Renders with synchronized output. Submissions are
     /// routed to `session` (steer while streaming, else a fresh prompt; R-10-030).
