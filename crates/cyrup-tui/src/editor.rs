@@ -2941,4 +2941,470 @@ mod tests {
             }
         }
     }
+
+    // ------------------------------------------------------------- CMDHINT_01 --------------------
+
+    /// A registry seeded with one dynamic prompt template carrying an `argument_hint`, mirroring
+    /// what `dynamic_commands_from_catalog_gated` produces for a real `/flux/aug`-shaped command.
+    fn registry_with_hinted_dynamic(name: &'static str, hint: &'static str) -> CommandRegistry {
+        CommandRegistry::with_dynamic(vec![crate::commands::SlashCommand {
+            name: std::borrow::Cow::Borrowed(name),
+            description: std::borrow::Cow::Borrowed("test command"),
+            argument_hint: Some(std::borrow::Cow::Borrowed(hint)),
+            source: crate::commands::CommandSource::Prompt,
+            has_arg_completion: false,
+        }])
+    }
+
+    /// A registry with the same dynamic command but NO argument hint.
+    fn registry_with_hintless_dynamic(name: &'static str) -> CommandRegistry {
+        CommandRegistry::with_dynamic(vec![crate::commands::SlashCommand {
+            name: std::borrow::Cow::Borrowed(name),
+            description: std::borrow::Cow::Borrowed("test command"),
+            argument_hint: None,
+            source: crate::commands::CommandSource::Prompt,
+            has_arg_completion: false,
+        }])
+    }
+
+    // ---- command_highlight: still typing the name (prefix rule) ----------------------------
+
+    #[test]
+    fn still_typing_a_valid_prefix_highlights_the_whole_line_with_no_ghost() {
+        let mut ed = InputEditor::new();
+        ed.set_text("/mod");
+        let h = ed.command_highlight().expect("\"/mod\" is a live prefix of \"model\"");
+        assert_eq!(h.token, 0..4);
+        assert_eq!(h.ghost, None, "the popup is open; the ghost only appears after an exact match");
+    }
+
+    #[test]
+    fn a_non_prefix_query_does_not_highlight() {
+        let mut ed = InputEditor::new();
+        ed.set_text("/zzz");
+        assert_eq!(ed.command_highlight(), None);
+    }
+
+    #[test]
+    fn a_bare_slash_does_not_highlight() {
+        let mut ed = InputEditor::new();
+        ed.set_text("/");
+        assert_eq!(ed.command_highlight(), None, "an empty query is never a prefix confirmation");
+    }
+
+    #[test]
+    fn text_not_starting_with_slash_never_highlights() {
+        let mut ed = InputEditor::new();
+        ed.set_text("hello model");
+        assert_eq!(ed.command_highlight(), None);
+    }
+
+    #[test]
+    fn the_highlight_grows_per_keystroke_while_still_a_prefix() {
+        let mut ed = InputEditor::new();
+        for (text, expect_some) in
+            [("/", false), ("/m", true), ("/mo", true), ("/mod", true), ("/model", true)]
+        {
+            ed.set_text(text);
+            assert_eq!(
+                ed.command_highlight().is_some(),
+                expect_some,
+                "{text:?} should{} highlight",
+                if expect_some { "" } else { " not" }
+            );
+        }
+    }
+
+    // ---- command_highlight: exact match + whitespace (freeze rule) --------------------------
+
+    #[test]
+    fn whitespace_after_an_exact_match_freezes_the_token_and_shows_the_ghost() {
+        let mut ed = InputEditor::new();
+        ed.set_text("/model ");
+        let h = ed.command_highlight().expect("exact match on a known builtin");
+        assert_eq!(h.token, 0..6, "token is just \"/model\", not the trailing space");
+        assert_eq!(h.ghost.as_deref(), Some("<provider/model>"));
+    }
+
+    #[test]
+    fn the_ghost_disappears_once_a_real_argument_character_is_typed() {
+        let mut ed = InputEditor::new();
+        ed.set_text("/model ");
+        assert!(ed.command_highlight().unwrap().ghost.is_some());
+        ed.set_text("/model o");
+        let h = ed.command_highlight().expect("the token itself is still an exact match");
+        assert_eq!(h.token, 0..6, "the highlight survives continued argument typing");
+        assert_eq!(h.ghost, None, "the argument zone is no longer empty");
+    }
+
+    #[test]
+    fn the_ghost_reappears_when_the_buffer_is_edited_back_to_empty() {
+        // No dismissal flag: this is recomputed fresh every call, so re-emptying the argument zone
+        // brings the ghost straight back.
+        let mut ed = InputEditor::new();
+        ed.set_text("/model o");
+        assert_eq!(ed.command_highlight().unwrap().ghost, None);
+        ed.set_text("/model ");
+        assert_eq!(ed.command_highlight().unwrap().ghost.as_deref(), Some("<provider/model>"));
+    }
+
+    #[test]
+    fn two_spaces_still_count_as_an_empty_argument_zone() {
+        let mut ed = InputEditor::new();
+        ed.set_text("/model  ");
+        assert_eq!(ed.command_highlight().unwrap().ghost.as_deref(), Some("<provider/model>"));
+    }
+
+    #[test]
+    fn a_prefix_that_is_not_an_exact_command_shows_nothing_after_whitespace() {
+        // "/flux " — "flux" is not itself a registered command (only "flux/aug" etc. would be, as
+        // dynamic commands), so once whitespace follows, there is no exact match and nothing shows.
+        let mut ed = InputEditor::new();
+        ed.set_text("/flux ");
+        assert_eq!(ed.command_highlight(), None);
+    }
+
+    #[test]
+    fn an_unknown_command_followed_by_an_argument_shows_nothing() {
+        let mut ed = InputEditor::new();
+        ed.set_text("/bogus");
+        assert_eq!(ed.command_highlight(), None, "\"bogus\" is not a prefix of any builtin");
+        ed.set_text("/bogus thing");
+        assert_eq!(ed.command_highlight(), None);
+    }
+
+    #[test]
+    fn dynamic_commands_participate_in_both_rules() {
+        let mut ed = InputEditor::new();
+        ed.set_registry(registry_with_hinted_dynamic(
+            "flux/aug",
+            "todo_file | number_of_agents | additional_instructions",
+        ));
+        // Prefix rule, over a dynamic (non-builtin) name.
+        ed.set_text("/flux");
+        assert_eq!(ed.command_highlight().unwrap().token, 0..5);
+        // Exact match + ghost, over the same dynamic name.
+        ed.set_text("/flux/aug ");
+        let h = ed.command_highlight().unwrap();
+        assert_eq!(h.token, 0..9);
+        assert_eq!(
+            h.ghost.as_deref(),
+            Some("todo_file | number_of_agents | additional_instructions"),
+            "the hint is used WHOLE and unsplit, never tokenized on \"|\""
+        );
+        // `/fa` is a fuzzy subsequence of "flux/aug" but not a real prefix.
+        ed.set_text("/fa");
+        assert_eq!(ed.command_highlight(), None);
+    }
+
+    #[test]
+    fn a_hintless_dynamic_command_freezes_with_no_ghost() {
+        let mut ed = InputEditor::new();
+        ed.set_registry(registry_with_hintless_dynamic("greet"));
+        ed.set_text("/greet ");
+        let h = ed.command_highlight().expect("exact match");
+        assert_eq!(h.ghost, None);
+    }
+
+    // ---- command_highlight: the split_command newline boundary ------------------------------
+
+    #[test]
+    fn a_soft_newline_terminates_the_token_exactly_like_whitespace() {
+        // `/flux/aug` + soft-newline + `NOTIFS`: split_command's boundary is the implicit `\n`
+        // ending line 0, so this must freeze on `/flux/aug`, not stay in "still typing" mode.
+        let mut ed = InputEditor::new();
+        ed.set_registry(registry_with_hinted_dynamic("flux/aug", "<hint>"));
+        ed.set_text("/flux/aug\nNOTIFS");
+        let h = ed.command_highlight().expect("exact match via the newline boundary");
+        assert_eq!(h.token, 0..9, "token is \"/flux/aug\" only");
+        assert_eq!(h.ghost, None, "line 1 holds a non-whitespace argument, so the zone is not empty");
+    }
+
+    #[test]
+    fn a_soft_newline_with_an_empty_continuation_still_ghosts() {
+        let mut ed = InputEditor::new();
+        ed.set_registry(registry_with_hinted_dynamic("flux/aug", "<hint>"));
+        // Multi-line buffer whose only continuation line is blank.
+        ed.set_text("/flux/aug\n");
+        let h = ed.command_highlight().expect("exact match");
+        assert_eq!(h.ghost.as_deref(), Some("<hint>"));
+    }
+
+    // ---- style_zones ------------------------------------------------------------------------
+
+    fn vl(logical: usize, start: usize, len: usize) -> VisualLine {
+        VisualLine { logical, start, len }
+    }
+
+    #[test]
+    fn style_zones_plain_when_there_is_no_token() {
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        let zones = style_zones(&vl(0, 0, 7), 7, None, base, accent);
+        assert_eq!(zones, [Some((0, 7, base)), None, None]);
+    }
+
+    #[test]
+    fn style_zones_plain_off_logical_line_zero() {
+        // Only logical line 0 ever carries a command token, so a token on another logical line's
+        // visual-line window is ignored even if the range would otherwise overlap.
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        let zones = style_zones(&vl(1, 0, 6), 6, Some(&(0..6)), base, accent);
+        assert_eq!(zones, [Some((0, 6, base)), None, None]);
+    }
+
+    #[test]
+    fn style_zones_splits_a_token_fully_inside_one_window() {
+        // "/model " — token 0..6 inside a 7-char window.
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        let zones = style_zones(&vl(0, 0, 7), 7, Some(&(0..6)), base, accent);
+        // Head zone is always absent (`a == 0` under the invariant `token.start == 0`).
+        assert_eq!(zones, [None, Some((0, 6, accent)), Some((6, 1, base))]);
+    }
+
+    #[test]
+    fn style_zones_covers_the_whole_window_when_the_token_extends_past_it() {
+        // A window that is entirely inside a longer token (the wrapped-token case): the whole
+        // segment is accent, with no tail zone.
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        // Token 0..20 (a long wrapped command name), window is visual line 1: chars 8..14 of the
+        // logical line.
+        let zones = style_zones(&vl(0, 8, 6), 6, Some(&(0..20)), base, accent);
+        assert_eq!(zones, [None, Some((0, 6, accent)), None]);
+    }
+
+    #[test]
+    fn style_zones_a_token_spanning_two_visual_lines_covers_both_windows_fully() {
+        // A 14-char token wrapped into two 7-char visual lines: both windows must come back fully
+        // accent, proving the highlight survives the wrap.
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        let token = 0..14;
+        let first = style_zones(&vl(0, 0, 7), 7, Some(&token), base, accent);
+        let second = style_zones(&vl(0, 7, 7), 7, Some(&token), base, accent);
+        assert_eq!(first, [None, Some((0, 7, accent)), None]);
+        assert_eq!(second, [None, Some((0, 7, accent)), None]);
+    }
+
+    #[test]
+    fn style_zones_plain_when_the_window_is_entirely_past_the_token() {
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        // Token 0..6, window starts at 6 (right after the token) — no overlap.
+        let zones = style_zones(&vl(0, 6, 4), 4, Some(&(0..6)), base, accent);
+        assert_eq!(zones, [Some((0, 4, base)), None, None]);
+    }
+
+    // ---- spans_for_segment -------------------------------------------------------------------
+
+    fn span_texts(spans: &[Span<'static>]) -> Vec<String> {
+        spans.iter().map(|s| s.content.to_string()).collect()
+    }
+
+    #[test]
+    fn spans_for_segment_with_no_cursor_emits_one_span_per_zone() {
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        let cursor_style = base.add_modifier(Modifier::REVERSED);
+        let seg: Vec<char> = "/model ".chars().collect();
+        let zones = [None, Some((0usize, 6usize, accent)), Some((6usize, 1usize, base))];
+        let spans = spans_for_segment(&seg, &zones, None, cursor_style, base);
+        assert_eq!(span_texts(&spans), vec!["/model".to_string(), " ".to_string()]);
+        assert_eq!(spans[0].style, accent);
+        assert_eq!(spans[1].style, base);
+    }
+
+    #[test]
+    fn spans_for_segment_end_of_line_caret_is_a_reversed_trailing_space() {
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        let cursor_style = base.add_modifier(Modifier::REVERSED);
+        let seg: Vec<char> = "/model ".chars().collect();
+        let zones = [None, Some((0usize, 6usize, accent)), Some((6usize, 1usize, base))];
+        // Cursor at seg.len() (end of line): the caret is the trailing reversed space, appended
+        // AFTER the ordinary zone spans.
+        let spans = spans_for_segment(&seg, &zones, Some(seg.len()), cursor_style, base);
+        let last = spans.last().unwrap();
+        assert_eq!(last.content.as_ref(), " ");
+        assert_eq!(last.style, cursor_style);
+    }
+
+    #[test]
+    fn spans_for_segment_cursor_inside_the_accent_zone_splits_it() {
+        let base = Style::default();
+        let accent = Style::default().fg(ratatui::style::Color::Cyan);
+        let cursor_style = base.add_modifier(Modifier::REVERSED);
+        let seg: Vec<char> = "/model ".chars().collect();
+        let zones = [None, Some((0usize, 6usize, accent)), Some((6usize, 1usize, base))];
+        // Cursor at column 2 ("/m|odel "), inside the accent zone.
+        let spans = spans_for_segment(&seg, &zones, Some(2), cursor_style, base);
+        assert_eq!(span_texts(&spans), vec!["/m", "o", "del", " "]);
+        assert_eq!(spans[0].style, accent, "before-cursor part of the accent zone stays accent");
+        assert_eq!(spans[1].style, cursor_style, "the cursor cell is reversed");
+        assert_eq!(spans[2].style, accent, "after-cursor part of the accent zone stays accent");
+        assert_eq!(spans[3].style, base, "the tail zone is unaffected");
+    }
+
+    #[test]
+    fn spans_for_segment_empty_visual_line_emits_one_empty_base_span() {
+        let base = Style::default();
+        let cursor_style = base.add_modifier(Modifier::REVERSED);
+        let seg: Vec<char> = Vec::new();
+        let zones = [Some((0usize, 0usize, base)), None, None];
+        let spans = spans_for_segment(&seg, &zones, None, cursor_style, base);
+        assert_eq!(span_texts(&spans), vec![String::new()]);
+        assert_eq!(spans[0].style, base, "a blank NON-cursor soft-newline row must not carry a caret");
+    }
+
+    #[test]
+    fn spans_for_segment_empty_visual_line_with_cursor_is_the_reversed_caret() {
+        let base = Style::default();
+        let cursor_style = base.add_modifier(Modifier::REVERSED);
+        let seg: Vec<char> = Vec::new();
+        let zones = [Some((0usize, 0usize, base)), None, None];
+        let spans = spans_for_segment(&seg, &zones, Some(0), cursor_style, base);
+        assert_eq!(span_texts(&spans), vec![" ".to_string()]);
+        assert_eq!(spans[0].style, cursor_style);
+    }
+
+    // ---- ghost_span ---------------------------------------------------------------------------
+
+    #[test]
+    fn ghost_span_renders_whole_when_it_fits() {
+        let dim = Style::default().add_modifier(Modifier::DIM);
+        let span = ghost_span("<provider/model>", 40, dim).unwrap();
+        assert_eq!(span.content.as_ref(), "<provider/model>");
+        assert_eq!(span.style, dim);
+    }
+
+    #[test]
+    fn ghost_span_none_when_no_columns_are_available() {
+        let dim = Style::default();
+        assert!(ghost_span("<hint>", 0, dim).is_none());
+    }
+
+    #[test]
+    fn ghost_span_single_column_is_just_an_ellipsis() {
+        let dim = Style::default();
+        let span = ghost_span("<hint>", 1, dim).unwrap();
+        assert_eq!(span.content.as_ref(), "…");
+    }
+
+    #[test]
+    fn ghost_span_clips_with_a_trailing_ellipsis_when_it_overflows() {
+        let dim = Style::default();
+        let span = ghost_span("todo_file | number_of_agents | additional_instructions", 10, dim)
+            .unwrap();
+        assert_eq!(span.content.as_ref(), "todo_file…");
+        assert_eq!(display_width(&span.content), 10, "never overruns its budget");
+    }
+
+    #[test]
+    fn ghost_span_exact_fit_needs_no_ellipsis() {
+        let dim = Style::default();
+        let span = ghost_span("abc", 3, dim).unwrap();
+        assert_eq!(span.content.as_ref(), "abc");
+    }
+
+    // ---- assembled render: highlight + ghost actually reach the frame -----------------------
+
+    #[test]
+    fn render_paints_the_token_in_accent_and_the_ghost_in_dim() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let theme = UiTheme::default();
+        let mut ed = InputEditor::new();
+        ed.set_text("/model ");
+        let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        term.draw(|f| {
+            let area = Rect { x: 0, y: 0, width: 40, height: 4 };
+            ed.render(f, area, &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        // Row 1 is the first text row inside the top-bordered block.
+        let accent = theme.accent_style();
+        let dim = theme.dim_style();
+        // "/model" (6 cells) must all carry the accent foreground.
+        for x in 0..6u16 {
+            assert_eq!(
+                buf.cell((x, 1)).unwrap().fg,
+                accent.fg.unwrap(),
+                "column {x} of \"/model\" should be accent-colored"
+            );
+        }
+        // Somewhere after the caret, the dim ghost text "<provider/model>" must appear.
+        let row1: String = (0..40).map(|x| buf.cell((x, 1)).unwrap().symbol().to_string()).collect();
+        assert!(row1.contains("<provider/model>"), "ghost text missing from row: {row1:?}");
+        // And at least one of the ghost's cells carries the dim foreground.
+        let ghost_start = row1.find('<').expect("ghost text present");
+        assert_eq!(
+            buf.cell((ghost_start as u16, 1)).unwrap().fg,
+            dim.fg.unwrap(),
+            "the ghost text must render in dim_style()"
+        );
+    }
+
+    #[test]
+    fn render_shows_no_highlight_or_ghost_for_an_unknown_command() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let theme = UiTheme::default();
+        let mut ed = InputEditor::new();
+        ed.set_text("/bogus thing");
+        let mut term = Terminal::new(TestBackend::new(40, 4)).unwrap();
+        term.draw(|f| {
+            let area = Rect { x: 0, y: 0, width: 40, height: 4 };
+            ed.render(f, area, &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let base = theme.base_style();
+        let base_fg = base.fg.unwrap_or(ratatui::style::Color::Reset);
+        for x in 0..12u16 {
+            assert_eq!(
+                buf.cell((x, 1)).unwrap().fg,
+                base_fg,
+                "column {x} of an unrecognized command must render in the plain base style"
+            );
+        }
+    }
+
+    #[test]
+    fn render_never_grows_a_row_for_a_clipped_ghost() {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::Rect;
+        use ratatui::Terminal;
+
+        let theme = UiTheme::default();
+        let mut ed = InputEditor::new();
+        ed.set_registry(registry_with_hinted_dynamic(
+            "flux/aug",
+            "todo_file | number_of_agents | additional_instructions",
+        ));
+        ed.set_text("/flux/aug ");
+        // A narrow area: the ghost must clip with "…" rather than wrap onto a second row.
+        let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        term.draw(|f| {
+            let area = Rect { x: 0, y: 0, width: 20, height: 4 };
+            ed.render(f, area, &theme);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        let row1: String = (0..20).map(|x| buf.cell((x, 1)).unwrap().symbol().to_string()).collect();
+        assert!(row1.trim_end().ends_with('…'), "the ghost should clip with an ellipsis: {row1:?}");
+        // Only ONE text row was used — the ghost did not push content onto row 2.
+        let row2: String = (0..20).map(|x| buf.cell((x, 2)).unwrap().symbol().to_string()).collect();
+        assert!(
+            row2.trim().is_empty() || row2.trim_start_matches('─').trim().is_empty(),
+            "the ghost must not grow the editor's row count: {row2:?}"
+        );
+    }
 }

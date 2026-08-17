@@ -671,15 +671,15 @@ interface ui {
   // focus". EXT-036: `:175` is the closing paren of the `setWidget` component-factory overload).
   custom:     func(spec-json: string) -> option<string>;
   // --- editor buffer access (Pi `pasteToEditor` `types.ts:213`, `setEditorText` `:216`,
-  //     `getEditorText` `:219` @v0.83.0).
+  // `getEditorText` `:219` @v0.83.0).
   //
-  //     EXT-036, NAME correction: this line used to read "getEditorText/setEditorText/
-  //     pasteEditorText, types.ts:200-230". There is no `pasteEditorText` upstream — the pi name is
-  //     `pasteToEditor` — so the citation named a function that does not exist, which is exactly
-  //     the fabrication class EXT-036 was filed for, and the `:200-230` range was wide enough to
-  //     hide it. The WIT import stays spelled `paste-editor-text`: renaming it would RE-SIGN an
-  //     import and force a HOST_WORLD bump for a comment fix. That spelling is therefore a
-  //     [CYRUP-DELTA] against `types.ts:213` — cyrup's import name, pi's semantics. ---
+  // EXT-036, NAME correction: this line used to read "getEditorText/setEditorText/
+  // pasteEditorText, types.ts:200-230". There is no `pasteEditorText` upstream — the pi name is
+  // `pasteToEditor` — so the citation named a function that does not exist, which is exactly
+  // the fabrication class EXT-036 was filed for, and the `:200-230` range was wide enough to
+  // hide it. The WIT import stays spelled `paste-editor-text`: renaming it would RE-SIGN an
+  // import and force a HOST_WORLD bump for a comment fix. That spelling is therefore a
+  // [CYRUP-DELTA] against `types.ts:213` — cyrup's import name, pi's semantics. ---
   get-editor-text:   func() -> string;
   set-editor-text:   func(text: string);
   paste-editor-text: func(text: string);
