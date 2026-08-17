@@ -164,6 +164,20 @@ fn slash_context(registry: &CommandRegistry, before: &str) -> Option<Autocomplet
     Some(Autocomplete { context: CompletionContext::Slash, prefix: before.to_string(), completions, list })
 }
 
+/// Whether `query` (the text after the leading `/`) is a real PREFIX of at least one registered
+/// command name.
+///
+/// CMDHINT_01 — deliberately **not** the fuzzy matcher `slash_context` uses (`fuzzy::filter`,
+/// `fuzzy.rs:143`). Fuzzy is right for a *suggestion list* — it splits the query on `/` as well as
+/// whitespace (`:144`) and scores non-contiguous subsequences — and wrong for this signal, which
+/// claims "what you typed is literally the start of a real command": `/fa` fuzzy-matches `flux/aug`
+/// (`f`→`a` is a subsequence) and must NOT be highlighted as a real path segment. An empty query (a
+/// bare `/`) is false — `fuzzy::filter` returns EVERYTHING for it (`:145-151`), which is correct for
+/// the popup and meaningless as a confirmation.
+pub fn is_command_prefix(registry: &CommandRegistry, query: &str) -> bool {
+    !query.is_empty() && registry.commands().iter().any(|c| c.name.as_ref().starts_with(query))
+}
+
 /// Path delimiters that bound the trailing token (`PATH_DELIMITERS`, `autocomplete.ts:7`).
 const PATH_DELIMS: [char; 5] = [' ', '\t', '"', '\'', '='];
 

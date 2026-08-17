@@ -2619,12 +2619,25 @@ impl AgentSession {
         }
         // Prompt templates.
         for t in self.services.resources.prompts.winners() {
-            out.push(serde_json::json!({
+            let mut row = serde_json::json!({
                 "name": t.name,
                 "description": t.description,
                 "source": "prompt",
                 "sourceInfo": t.origin.source_info_json(&t.path),
-            }));
+            });
+            // CMDHINT_01 — pi's INTERACTIVE registry carries `argumentHint` from the template itself
+            // (`interactive-mode.ts:685-689`, spread-if-truthy; the sibling builtin carrier is `:640-644`).
+            // pi's `get_commands` RPC omits it entirely (zero `argumentHint` in `rpc-mode.ts`) because
+            // interactive mode never reads that RPC — but cyrup's TUI builds its registry from THIS catalog
+            // (`app/run_arms.rs:31-38`), so without the key the hint is unreachable in the one mode pi shows
+            // it in. Additive: the key is ABSENT when `None`, exactly as `JSON.stringify` drops the spread.
+            // `PromptTemplate::argument_hint` is already empty-filtered at parse (`prompt.rs:112-113`).
+            if let Some(hint) = t.argument_hint.as_deref()
+                && let Some(obj) = row.as_object_mut()
+            {
+                obj.insert("argumentHint".into(), serde_json::Value::from(hint));
+            }
+            out.push(row);
         }
         // Skills (`/skill:<name>`).
         for s in self.services.resources.skills.winners() {

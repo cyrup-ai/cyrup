@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use unicode_segmentation::UnicodeSegmentation;
 
 use ratatui::layout::Rect;
-use ratatui::style::Modifier;
+use ratatui::style::{Modifier, Style};   // editor.rs:26 — CMDHINT_01 needs the named type
 use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
@@ -208,9 +208,87 @@ pub struct VisualLine {
     pub len: usize,
 }
 
+/// The persistent command-token highlight and argument-hint ghost, computed fresh from the buffer
+/// on every render (CMDHINT_01 — cyrup-original; pi renders neither. Its `argumentHint` reaches
+/// exactly one site upstream, the popup description at `tui/src/autocomplete.ts:315`).
+///
+/// Ranges are **char** indices into `lines[0]`, never bytes: the buffer is `Vec<Vec<char>>`
+/// (`editor.rs:98`) and the wrap map ([`VisualLine`]) is char-based, so a byte range would
+/// mis-slice the instant a command name or its preceding text contains a non-ASCII char.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandHighlight {
+    /// Char range within `lines[0]` (always starting at 0, including the leading `/`) to render in
+    /// [`crate::UiTheme::accent_style`].
+    pub token: std::ops::Range<usize>,
+    /// The command's unmodified, **unsplit** `argument_hint` (`SlashCommand::argument_hint` is a
+    /// `Option<Cow<'static, str>>`, `commands.rs:50`; owned `String` here so the highlight borrows
+    /// nothing from the registry), to draw as dim ghost text after the buffer's last visual line.
+    /// `None` when there is no exact match, no hint, or the argument zone already holds a
+    /// non-whitespace char.
+    pub ghost: Option<String>,
+}
+
 impl Default for InputEditor {
     fn default() -> Self {
         InputEditor::new()
+    }
+}
+
+impl InputEditor {
+    /// The command-token highlight + argument-hint ghost for the current buffer (CMDHINT_01).
+    ///
+    /// Pure: a function of `lines[0]` and the registry alone, recomputed per render. NOT cached
+    /// alongside `self.autocomplete` — the popup's lifetime is the very thing this outlives, and 26
+    /// state-replacing paths never call `update_autocomplete()` at all: `set_text_internal`
+    /// (`:486-495` ← `:1469`, `:1500`, `:1504` history recall **and `:480`**, deliberately, per
+    /// TUI-061), its public caller `set_text` (`:472-481`, 8 app call sites — `app/tree_nav.rs:199`,
+    /// `app/session_bind.rs:327`, `app/channels.rs:149`, `app/extension_ui.rs:320`,
+    /// `app/selectors.rs:395`, `app/crossterm.rs:148`, `extension_editor.rs:58`, `:292`), and
+    /// `set_registry` (`:326-328`), which fires on session rebind/`/reload` (`app/run.rs:400`),
+    /// session swap (`app/run_arms.rs:33`) and the `enableSkillCommands` settings toggle
+    /// (`app/execute_misc.rs:217`). A cached copy would describe a buffer or a registry that no longer
+    /// exists — and `close_selector` (`app/selectors.rs:390-397`) can replace both around one frame.
+    ///
+    /// Scope is **logical line 0** only, and the token boundary is `split_command`'s
+    /// (`cyrup-resources/src/prompt.rs:178-190`, pi `prompt-templates.ts:271`): the leading run of
+    /// non-whitespace chars after `/`, where the implicit `\n` ending line 0 IS whitespace.
+    pub fn command_highlight(&self) -> Option<CommandHighlight> {
+        let line0 = self.lines.first()?;
+        if line0.first() != Some(&'/') {
+            return None;
+        }
+        // The token boundary: first whitespace CHAR index in line 0, or — when line 0 has none but the
+        // buffer continues — line 0's end, because `split_command` finds that `\n`. `None` means the
+        // name is still being typed with nothing after it.
+        let boundary = line0
+            .iter()
+            .position(|c| c.is_whitespace())
+            .or_else(|| (self.lines.len() > 1).then_some(line0.len()));
+        let head: String = line0.iter().take(boundary.unwrap_or(line0.len())).skip(1).collect();
+        match boundary {
+            // Still typing the name: highlight while it is an honest prefix. No ghost — the popup is
+            // open and already showing the full hint + description.
+            None => crate::autocomplete::is_command_prefix(&self.registry, &head)
+                .then_some(CommandHighlight { token: 0..line0.len(), ghost: None }),
+            // Whitespace follows: the highlight FREEZES on `/name` iff that name is an EXACT registered
+            // command — `registry.get`, NOT `match_command`/`dispatch_names`, which hold builtins plus
+            // `HIDDEN_COMMANDS` only (`commands.rs:189-197`, `:297-312`, `:429-434`) and would drop
+            // every prompt template, extension command and skill. Those still run, expanded
+            // server-side by `expand_input_text` (`cyrup-session-svc/src/session.rs:1255-1258`). An
+            // unknown or partial name (`/flux `, `/bogus `) gets nothing — honest, and identical to
+            // today's silent fallback to a literal prompt (`commands.rs:277`).
+            Some(i) => {
+                let cmd = self.registry.get(&head)?;
+                // The argument zone is "empty" when it holds no NON-whitespace char anywhere in the
+                // buffer — line 0 past the token, and every later (soft-newline) line. Whitespace-only
+                // is still empty, so `/model  ` with two spaces keeps its ghost.
+                let zone_empty = line0.iter().skip(i).all(|c| c.is_whitespace())
+                    && self.lines.iter().skip(1).all(|l| l.iter().all(|c| c.is_whitespace()));
+                let ghost =
+                    zone_empty.then_some(cmd.argument_hint.as_deref()).flatten().map(str::to_string);
+                Some(CommandHighlight { token: 0..i, ghost })
+            }
+        }
     }
 }
 
@@ -2115,6 +2193,146 @@ fn display_width(s: &str) -> usize {
     Span::raw(s).width()
 }
 
+/// Split one visual line's `seg_len` chars into styled zones (CMDHINT_01).
+///
+/// `token` is a char range in the LOGICAL line; `vl` gives the window this visual line slices out of
+/// it. Returns at most three `(start_in_seg, len, style)` zones — `base` head, `accent` token, `base`
+/// tail — covering `0..seg_len` contiguously and left-to-right; `None` slots are absent zones. Only
+/// the visual line(s) overlapping the token produce a non-trivial split — every other line gets one
+/// `base` zone, exactly what the code did before. This is the one genuinely new geometry case: a
+/// long command name wrapped by `word_wrap_line` across two visual lines must stay highlighted on
+/// both. `word_wrap_line` returns `(start, len)` pairs that tile the logical line exactly (`:2296`
+/// pushes the final `(chunk_start, n - chunk_start)`; `visual_line_map:551-552` converts them), so
+/// every char lands in exactly one window and the intersection below is total.
+///
+/// The HEAD zone is unreachable under today's invariant and kept deliberately: `token.start` is
+/// always 0 (the `/` is char 0 of line 0), so `lo == win_start` and `a == 0` on every window. Keeping
+/// the slot makes this a total function of an arbitrary contiguous range rather than one that
+/// silently assumes a zero start — do not "simplify" it away, and do not be alarmed when manual
+/// testing never exercises it.
+///
+/// A fixed ARRAY, not a `Vec`: called once per VISIBLE visual line on every frame (~20/frame), and
+/// the ≤ 3 bound is structural, so the heap allocation buys nothing. See the perf section.
+fn style_zones(
+    vl: &VisualLine,
+    seg_len: usize,
+    token: Option<&std::ops::Range<usize>>,
+    base: Style,
+    accent: Style,
+) -> [Option<(usize, usize, Style)>; 3] {
+    let plain = [Some((0usize, seg_len, base)), None, None];
+    // Only logical line 0 ever carries a command token.
+    let Some(tok) = token.filter(|_| vl.logical == 0) else { return plain };
+    let win_start = vl.start;
+    let win_end = win_start.saturating_add(seg_len);
+    let lo = tok.start.max(win_start);
+    let hi = tok.end.min(win_end);
+    if lo >= hi {
+        return plain;
+    }
+    let (a, b) = (lo.saturating_sub(win_start), hi.saturating_sub(win_start));
+    [
+        (a > 0).then_some((0, a, base)),
+        Some((a, b.saturating_sub(a), accent)),
+        (b < seg_len).then_some((b, seg_len.saturating_sub(b), base)),
+    ]
+}
+
+/// Build one visual line's spans from its style zones, overlaying the reverse-video soft cursor when
+/// `cursor` is `Some(col_within_seg)` (CMDHINT_01 restructure of the old cursor-overlay body).
+///
+/// The cursor cell is one whole GRAPHEME, not one char — pi takes `afterGraphemes[0].segment`
+/// (`editor.ts:555-559`), so a ZWJ emoji inverts as a unit. The cluster is therefore measured
+/// against the WHOLE remaining segment, never the zone, exactly as the code being replaced does.
+/// That cannot straddle a zone edge; see the straddle proof in the task notes — the short form is
+/// that the only non-trivial zone edge sits on a whitespace char, and no grapheme cluster spans
+/// whitespace (GB3's `CR LF` is the sole exception and the buffer cannot contain `\r`). The `after`
+/// slice is still clamped to the zone, which costs one `saturating_sub` and makes the property
+/// enforced rather than merely argued.
+fn spans_for_segment(
+    seg: &[char],
+    zones: &[Option<(usize, usize, Style)>],
+    cursor: Option<usize>,
+    cursor_style: Style,
+    base: Style,
+) -> Vec<Span<'static>> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    // `.flatten()` skips absent zones; the remaining ones are still left-to-right, which is what the
+    // resulting span order depends on.
+    for &(start, len, style) in zones.iter().flatten() {
+        let end = start.saturating_add(len);
+        match cursor.filter(|c| *c >= start && *c < end) {
+            Some(c) => {
+                let before: String =
+                    seg.iter().skip(start).take(c.saturating_sub(start)).collect();
+                if !before.is_empty() {
+                    spans.push(Span::styled(before, style));
+                }
+                let tail: String = seg.iter().skip(c).collect();
+                match tail.graphemes(true).next() {
+                    Some(g) => {
+                        let after_at = c.saturating_add(g.chars().count());
+                        spans.push(Span::styled(g.to_string(), cursor_style));
+                        let after: String = seg
+                            .iter()
+                            .skip(after_at)
+                            .take(end.saturating_sub(after_at))
+                            .collect();
+                        if !after.is_empty() {
+                            spans.push(Span::styled(after, style));
+                        }
+                    }
+                    None => spans.push(Span::styled(" ", cursor_style)),
+                }
+            }
+            None => {
+                let text: String = seg.iter().skip(start).take(len).collect();
+                if !text.is_empty() {
+                    spans.push(Span::styled(text, style));
+                }
+            }
+        }
+    }
+    // End-of-line caret: the cursor sits one past the last char (pi `editor.ts:563`). This is also
+    // the whole-line case for an empty visual line, whose only zone is zero-length — the loop above
+    // takes the `None` arm there (`0 >= 0 && 0 < 0` is false) and emits nothing, so this push is the
+    // caret's only producer for an empty buffer.
+    if cursor == Some(seg.len()) {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    if spans.is_empty() {
+        // An empty visual line that is NOT the cursor's. Today's code pushes an empty `base` span
+        // here — keep `base`, not `cursor_style`, or a blank soft-newline row grows a stray caret.
+        spans.push(Span::styled(String::new(), base));
+    }
+    spans
+}
+
+/// The dim ghost span for `hint`, clipped to `available` columns (CMDHINT_01).
+///
+/// Structurally safe by two independent mechanisms, which is why this is an affordance rather than a
+/// layout guard: (1) the render `Paragraph` has **no** `.wrap(…)`, so ratatui truncates a
+/// too-long `Line` instead of reflowing it — the ghost can never add a row; (2) the editor's height
+/// comes from the wrap map of REAL buffer content (`visual_line_count`, `:567-571` ←
+/// `app/layout.rs:71-77`), which the ghost is not part of. Clipped to `available - 1` chars plus `…`;
+/// a single column is `…`.
+fn ghost_span(hint: &str, available: usize, style: Style) -> Option<Span<'static>> {
+    if available == 0 {
+        return None;
+    }
+    let n = hint.chars().count();
+    let text = if n <= available {
+        hint.to_string()
+    } else if available == 1 {
+        "…".to_string()
+    } else {
+        let mut s: String = hint.chars().take(available.saturating_sub(1)).collect();
+        s.push('…');
+        s
+    };
+    Some(Span::styled(text, style))
+}
+
 /// Whether a grapheme counts as whitespace — Pi's `isWhitespaceChar`, which is literally
 /// `/\s/.test(char)` (`utils.ts:943-945`), i.e. *contains* a whitespace code point rather than *is*
 /// one, hence `any` and not `all`.
@@ -2469,35 +2687,41 @@ impl Component for InputEditor {
         }
         self.scroll_offset = self.scroll_offset.min(map.len().saturating_sub(max_visible));
         let mut lines: Vec<Line> = Vec::with_capacity(max_visible);
+        let highlight = self.command_highlight();          // computed ONCE per frame
+        let accent = theme.accent_style();
+        let dim = theme.dim_style();
+        let last_vi = map.len().saturating_sub(1);
+        // The Block's inner width — the true drawable span for the ghost. NOT `self.view_width`:
+        // `layout_width` subtracts one column for the caret when `paddingX == 0`, so `view_width`
+        // under-counts the inner area by one in the default configuration. The formula is exactly
+        // `area.width - 2 * pad` because the Block carries `Borders::TOP | BOTTOM` only — no side
+        // border steals a column — and `Padding::horizontal(pad)` with `pad = effective_padding(...)`.
+        let inner_w = usize::from(area.width.saturating_sub(pad.saturating_mul(2))).max(1);
         for (vi, vl) in map.iter().enumerate().skip(self.scroll_offset).take(max_visible) {
-            let mut spans: Vec<Span> = Vec::new();
             // The chars this visual line slices out of its logical line.
             let seg: Vec<char> = self
                 .lines
                 .get(vl.logical)
                 .map(|l| l.iter().skip(vl.start).take(vl.len).copied().collect())
                 .unwrap_or_default();
-            if vi == cursor_vl {
-                // Cursor column within THIS visual line (0 at a wrap boundary; == len at line end).
-                let vcol = self.col.saturating_sub(vl.start).min(seg.len());
-                let before: String = seg.iter().take(vcol).collect();
-                spans.push(Span::styled(before, base));
-                // The highlighted cell is one whole GRAPHEME, not one `char`: Pi takes
-                // `afterGraphemes[0].segment` and slices the rest past it (`editor.ts:555-559`), so a
-                // ZWJ emoji is inverted as a unit instead of leaving its continuation chars
-                // un-highlighted beside a reversed base character.
-                let rest: String = seg.iter().skip(vcol).collect();
-                match rest.graphemes(true).next() {
-                    Some(g) => {
-                        spans.push(Span::styled(g.to_string(), cursor_style));
-                        let after: String = rest.chars().skip(g.chars().count()).collect();
-                        spans.push(Span::styled(after, base));
-                    }
-                    // End-of-line caret: a reverse-video space (Pi `editor.ts:563`).
-                    None => spans.push(Span::styled(" ", cursor_style)),
+            let zones = style_zones(vl, seg.len(), highlight.as_ref().map(|h| &h.token), base, accent);
+            let cursor = (vi == cursor_vl).then(|| self.col.saturating_sub(vl.start).min(seg.len()));
+            let mut spans = spans_for_segment(&seg, &zones, cursor, cursor_style, base);
+            // The ghost trails the buffer's LAST visual line, after the real content and AFTER the
+            // caret cell. It is not buffer content, so it never joins the cursor split and the cursor
+            // can never sit inside it. Deliberately after the caret, not under it: cyrup's caret is a
+            // reverse-video BLOCK, and a dim hint char inverted beneath it would read as
+            // already-typed text — the opposite of what a placeholder must say.
+            if vi == last_vi
+                && let Some(hint) = highlight.as_ref().and_then(|h| h.ghost.as_deref())
+            {
+                // Charge COLUMNS, not chars — and take them from the spans just built, so the caret
+                // cell (a `" "` span, or the inverted grapheme) is counted by construction rather
+                // than re-derived, and no intermediate `String` is allocated.
+                let used: usize = spans.iter().map(Span::width).sum();
+                if let Some(span) = ghost_span(hint, inner_w.saturating_sub(used), dim) {
+                    spans.push(span);
                 }
-            } else {
-                spans.push(Span::styled(seg.iter().collect::<String>(), base));
             }
             lines.push(Line::from(spans));
         }

@@ -127,7 +127,7 @@ pub use chrome::{
     key_hint_spans, render_compact_hints, truncate_to_visual_lines, BorderedLoader, VisualTruncate,
     COMPACT_HINT_ROWS, STARTUP_ONBOARDING,
 };
-pub use editor::{EditorOutcome, InputEditor, VisualLine};
+pub use editor::{CommandHighlight, EditorOutcome, InputEditor, VisualLine};
 pub use footer_data::{
     find_git_paths, resolve_branch as resolve_git_branch, FooterGitBranch, GitPaths,
     POLL_INTERVAL as GIT_BRANCH_POLL_INTERVAL,
