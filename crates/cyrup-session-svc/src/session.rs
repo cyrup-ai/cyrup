@@ -2619,12 +2619,25 @@ impl AgentSession {
         }
         // Prompt templates.
         for t in self.services.resources.prompts.winners() {
-            out.push(serde_json::json!({
+            let mut row = serde_json::json!({
                 "name": t.name,
                 "description": t.description,
                 "source": "prompt",
                 "sourceInfo": t.origin.source_info_json(&t.path),
-            }));
+            });
+            // CMDHINT_01 — pi's INTERACTIVE registry carries `argumentHint` from the template itself
+            // (`interactive-mode.ts:685-689`, spread-if-truthy; the sibling builtin carrier is `:640-644`).
+            // pi's `get_commands` RPC omits it entirely (zero `argumentHint` in `rpc-mode.ts`) because
+            // interactive mode never reads that RPC — but cyrup's TUI builds its registry from THIS catalog
+            // (`app/run_arms.rs:31-38`), so without the key the hint is unreachable in the one mode pi shows
+            // it in. Additive: the key is ABSENT when `None`, exactly as `JSON.stringify` drops the spread.
+            // `PromptTemplate::argument_hint` is already empty-filtered at parse (`prompt.rs:112-113`).
+            if let Some(hint) = t.argument_hint.as_deref()
+                && let Some(obj) = row.as_object_mut()
+            {
+                obj.insert("argumentHint".into(), serde_json::Value::from(hint));
+            }
+            out.push(row);
         }
         // Skills (`/skill:<name>`).
         for s in self.services.resources.skills.winners() {
@@ -4072,7 +4085,7 @@ impl AgentSession {
 
     /// `true` when this branch's occupied-token count can be trusted — i.e. there is no compaction
     /// on the branch, or an assistant has responded since the latest one (Pi
-    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3178-3195).
+    /// `getContextUsage`'s `hasPostCompactionUsage` scan, agent-session.ts:3181-3193).
     ///
     /// Scans backwards from the branch tail to the compaction boundary, matching Pi's loop
     /// direction, and accepts the first assistant that neither aborted nor errored and whose usage
@@ -4083,16 +4096,24 @@ impl AgentSession {
         use cyrup_session::AgentMessage;
 
         let guard = self.manager.lock().await;
-        let entries = guard.entries();
-        let Some(compaction_idx) = entries
+        // Pi scans `sessionManager.getBranch()` (agent-session.ts:3174, indexed at :3181-3193) —
+        // the ACTIVE BRANCH — not `getEntries()`. `entries()` is the flat append-only store
+        // (`manager.rs:818`): after a `/fork` or a `/tree` navigation it also holds the abandoned
+        // branch, so `rposition` could latch an OFF-BRANCH compaction as the boundary and `skip`
+        // could then count an off-branch assistant as post-compaction usage — printing a stale
+        // pre-compaction occupancy as current, the exact failure this guard exists to prevent.
+        // `branch_path(None)` is cyrup's `getBranch()`, and is O(branch-depth) rather than O(all
+        // entries) besides (TUI-092 F4 C2).
+        let path = guard.branch_path(None);
+        let Some(compaction_idx) = path
             .iter()
             .rposition(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
         else {
             // No compaction on this branch: the last assistant usage is current by construction.
             return true;
         };
-        entries
-            .iter()
+        path.iter()
+            .copied()
             .skip(compaction_idx + 1)
             .rev()
             .filter_map(|e| match e {
@@ -4113,32 +4134,73 @@ impl AgentSession {
     }
 
     /// Context-window occupancy from the last assistant turn (Pi `getContextUsage`,
-    /// agent-session.ts:2977).
+    /// agent-session.ts:3164-3208 @v0.83.0).
+    ///
+    /// Answers from a **reverse walk of the active branch's entries** — Pi's own
+    /// `sessionManager.getBranch()` shape (`:3174`) — never from a rebuilt message list. The
+    /// previous body called [`Self::messages`], i.e. `build_context()` →
+    /// `build_context_messages()`, which deep-clones every message on the branch (tool payloads
+    /// included) purely so this function could reverse the vector, take the first assistant, and
+    /// drop the rest: O(session history) of allocation on **every** `MessageEnd`, awaited on the
+    /// TUI run-loop task (TUI-092 F4).
     pub async fn context_usage(&self) -> crate::state::ContextUsage {
-        let messages = self.messages().await;
-        let last = messages.iter().rev().find_map(|m| match m {
-            Message::Assistant(a) => Some(a),
-            _ => None,
-        });
+        use cyrup_core::StopReason;
+        use cyrup_session::entry::{Entry, KnownEntry};
+        use cyrup_session::AgentMessage;
+
         // Pi `getContextUsage`: `const model = this.model; if (!model) return undefined;`
-        // (agent-session.ts:3165-3166) and `if (contextWindow <= 0) return undefined;` (:3168-3169). cyrup's return type is non-optional, so the modelless case
-        // degrades to a zero window, which `from_last_assistant` already renders as fraction 0.0 —
-        // the same "unknown occupancy" the TUI shows for an undefined usage.
+        // (agent-session.ts:3165-3166) and `if (contextWindow <= 0) return undefined;` (:3168-3169).
+        // Taken FIRST, exactly as Pi orders it — the model read precedes `getBranch()` at :3174 — so
+        // the `compaction_model` leaf lock is released before the async `manager` guard is acquired
+        // and no lock-nesting question arises at all. cyrup's return type is non-optional, so the
+        // modelless case degrades to a zero window, which `from_last_assistant` already renders as
+        // fraction 0.0 — the same "unknown occupancy" the TUI shows for an undefined usage.
         let window = { Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window) };
+
+        let guard = self.manager.lock().await;
+        // The last assistant ON THE ACTIVE BRANCH, by parent-link walk — the same answer
+        // `messages().await.iter().rev().find_map(..)` gave, without building or cloning the
+        // branch's whole message list to get it.
+        //
+        // `StopReason::Deferred` is skipped because the OLD path could not return one:
+        // `push_as_message`'s first arm drops a deferred assistant from the built context
+        // (`cyrup-session/src/context.rs:62`, `is_deferred_assistant` at `:114-120`). A deferred
+        // turn is a durable provider handle with empty content, not a settled context measurement
+        // (`cyrup-core/src/message.rs:172-188`), so its `usage` must not drive the footer. cyrup
+        // cannot produce one yet, but a Pi-written session carrying one must still read identically
+        // (R-00-013). `filter_map(..).find(..)` — not `find_map` — so a deferred tail does not stop
+        // the scan; same shape as the neighbour `has_post_compaction_usage`.
+        let last = guard
+            .branch_path(None)
+            .into_iter()
+            .rev()
+            .filter_map(|e| match e {
+                Entry::Known(KnownEntry::Message {
+                    message: AgentMessage::Core(Message::Assistant(a)),
+                    ..
+                }) => Some(a),
+                _ => None,
+            })
+            .find(|a| a.stop_reason != StopReason::Deferred);
         crate::state::ContextUsage::from_last_assistant(last, window)
     }
 
-    /// A serializable snapshot of the session for RPC `get_state` (Pi `state` getter,
-    /// agent-session.ts:753).
+    /// A serializable snapshot of the session for RPC `get_state`.
+    ///
+    /// cyrup-original in shape: Pi's `RpcSessionState` (`modes/rpc/rpc-types.ts:95-108`, built at
+    /// `modes/rpc/rpc-mode.ts:446-461`) carries twelve scalars and NO occupancy or stats, and Pi's
+    /// `state` getter is `return this.agent.state` (agent-session.ts:863-865). The extra `stats` /
+    /// `context_usage` fields are cyrup's.
     pub async fn state_view(&self) -> crate::state::SessionStateView {
         let stats = self.session_stats().await;
         let messages = self.messages().await;
-        let last = messages.iter().rev().find_map(|m| match m {
-            Message::Assistant(a) => Some(a),
-            _ => None,
-        });
-        let window = { Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window) };
-        let context_usage = crate::state::ContextUsage::from_last_assistant(last, window);
+        // ONE producer for occupancy, as upstream has: Pi's `getSessionStats` does not re-derive it
+        // either, it returns `contextUsage: this.getContextUsage()` (agent-session.ts:3170).
+        // Deriving it inline here duplicated the pre-F4 windowed-build scan, so it disagreed with
+        // `GetContextUsage` whenever a compaction's kept window held no assistant while an earlier
+        // pre-compaction assistant existed — including every unresolvable-v1 `first_kept_entry_id`
+        // session, whose kept window is empty by construction (`cyrup-session/src/context.rs:166-172`).
+        let context_usage = self.context_usage().await;
         let model = Self::lock(&self.model).clone();
         crate::state::SessionStateView {
             session_id: self.session_id.to_string(),

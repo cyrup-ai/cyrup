@@ -71,6 +71,10 @@ cyrup-permission-system = { workspace = true }
 # `__intercom-broker` subcommand (`intercom_broker_cmd.rs`) that re-execs into the standalone broker
 # process (`cyrup_intercom::broker::run`), mirroring the `__subagent-runner` hop.
 cyrup-intercom = { workspace = true }
+# Flux (spec/flux.md §3.4.5): the pipeline's bundled prompt templates + the three native
+# renderers. Attached unconditionally at the top level (no install gate) at all three session
+# construction sites below, matching the sibling extension seams above.
+cyrup-flux = { workspace = true }
 # Package + config subcommands (Pi `package-manager-cli.ts`) drive the resources package manager.
 cyrup-resources = { workspace = true }
 # The provider seam. **NO `features = ["faux"]` HERE** (PROV-052): this is a NORMAL dependency, and

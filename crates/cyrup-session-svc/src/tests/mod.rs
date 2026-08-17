@@ -10,6 +10,7 @@ mod base_system_prompt;
 mod bash_session_env_wiring;
 mod before_session_invalidate;
 mod build_containment_and_flag_diagnostics;
+mod cmdhint01_argument_hint;
 mod compact_refusals;
 mod compaction_tokens_after;
 mod control_ops;

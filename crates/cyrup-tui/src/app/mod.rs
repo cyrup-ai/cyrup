@@ -47,7 +47,7 @@ mod tree_nav;
 mod state;
 
 pub use action::{AppAction, AppCommand, CycleDirection};
-pub use backend::{RebuildBackend, reanchor_inline_region};
+pub use backend::{InlineBackend, RebuildBackend, reanchor_inline_region};
 pub(crate) use bash_spawn::{BashMsg, spawn_session_bash};
 pub(crate) use event_extract::{
     assistant_message_from_event, context_usage_may_have_moved,

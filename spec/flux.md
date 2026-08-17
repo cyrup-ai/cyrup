@@ -15,9 +15,44 @@
 >    (all 18 command files, all 3 renderer scripts, the installer, and the dispatch engine),
 >    plus Pi's [`../tmp/pi/prompt-templates.ts`](../tmp/pi/prompt-templates.ts). Every porting
 >    rule below cites the exact source file.
-> 3. **No core changes are required at all.** Phase 1 is a pure content package; Phase 2 is a
->    new native-extension crate plus one wiring line. This plan touches **zero** existing
->    `crates/*/src` files except `crates/cyrup/src/main.rs` (one `with_native_extension` call).
+> 3. **No core changes are required at all.** All of it is one new crate plus its wiring. This
+>    plan touches **zero** existing `crates/*/src` files except `crates/cyrup/src/main.rs`.
+
+---
+
+## ⚠️ ARCHITECTURE CORRECTION — read before §3
+
+**One home: `crates/cyrup-flux`.** Everything — the 15 prompt templates, the `flux` skill, the
+reference docs, the three native renderers, the `ctrl+f` overlay and the `ask_user_question` tool
+— lives in a single crate inside the cyrup workspace, and reaches sessions through the
+extension's `ResourcesDiscover` contribution.
+
+The two-phase split this document describes below — a standalone **git repo** `cyrup-flux`
+installed with `cyrup install` (§3.3 "Phase 1"), later duplicated into a crate named
+`cyrup-ext-flux` and kept `rsync`-synchronised with it (§3.4.1 "Bundling") — is **superseded**.
+There is no separate repo, no `cyrup.toml`, no `cyrup install`, and no second copy to keep in
+sync.
+
+Read the rest of this document with these substitutions:
+
+| this document says | read as |
+|---|---|
+| the `cyrup-flux` **package** / **package repo** | `crates/cyrup-flux/resources/` |
+| the `cyrup-ext-flux` **crate** | `crates/cyrup-flux` |
+| `cyrup.toml` `[resources]` declaration | the `ResourcesDiscover` hook (§3.4.1) |
+| `cyrup install <path>` / `cyrup list` | nothing — the content ships with the binary |
+| "Phase 1" / "Phase 2" | one continuous sequence of tasks |
+| §3.4.5 "One block in `main.rs`" | **three** blocks, one per `AppMode` |
+| §3.4.1's `fn name(&self) -> &str` | `fn id(&self) -> ExtensionId` |
+
+Everything else here — §0 research, §1 source analysis, §3.1 naming, §3.2 state model, §3.3's
+per-file porting rules 1–9, §3.4.2–3.4.4's renderer/tool designs, §5 risks — is unchanged and
+still authoritative. Section numbers are preserved because the task files cite them.
+
+**The executable plan is [`flux/README.md`](flux/README.md) and `flux/FLUX_01.md` …
+`flux/FLUX_12.md`** (twelve tasks; the old thirteenth existed only to synchronise the two homes).
+Where a task file and this document disagree, the task file wins — it was re-verified against the
+live tree and this one was not.
 
 ---
 
@@ -38,7 +73,7 @@ file itself is not in `spec/`) is fully implemented:
   (`crates/cyrup-resources/src/discovery.rs:1772-1830`): descends into subdirectories, skips
   `.`- and `_`-prefixed dirs and `node_modules` (so `prompts/flux/_docs/` never registers —
   the exact code-puppy `_SKIP_DIR_PREFIXES = ("_", ".")` semantic,
-  [`../tmp/code-puppy/customizable_commands.py`](../tmp/code-puppy/customizable_commands.py)),
+  [`../tmp/code-puppy/customizable_commands/register_callbacks.py`](../tmp/code-puppy/customizable_commands/register_callbacks.py)),
   caps depth at `MAX_PROMPT_NAMESPACE_DEPTH = 8` (`discovery.rs:1756`), never follows directory
   symlinks (cycle-proof), loads file symlinks to regular `.md` targets, and sorts children per
   directory for deterministic first-wins tie-breaking.
@@ -161,7 +196,7 @@ not a tool). The `subagent` tool (foreground/background/parallel fan-out, chains
 | `flux_cheatsheet.py` (248 lines) | [`../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_cheatsheet.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_cheatsheet.py) |
 | `flux_about.py` (154 lines) | [`../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_about.py`](../tmp/code-puppy/flux_bootstrap/bundled/scripts/flux_about.py) |
 | `installer.py` + `register_callbacks.py` (flux_bootstrap) | [`../tmp/code-puppy/flux_bootstrap/`](../tmp/code-puppy/flux_bootstrap/) |
-| `customizable_commands` dispatch engine | [`../tmp/code-puppy/customizable_commands.py`](../tmp/code-puppy/customizable_commands.py) |
+| `customizable_commands` dispatch engine | [`../tmp/code-puppy/customizable_commands/register_callbacks.py`](../tmp/code-puppy/customizable_commands/register_callbacks.py) |
 | Pi `prompt-templates.ts` | [`../tmp/pi/prompt-templates.ts`](../tmp/pi/prompt-templates.ts) |
 
 ---
@@ -198,7 +233,7 @@ registration (Phase 2) — nothing of it is ported.**
 
 ### 1.2 Dispatch — `customizable_commands` plugin
 
-[`../tmp/code-puppy/customizable_commands.py`](../tmp/code-puppy/customizable_commands.py) is
+[`../tmp/code-puppy/customizable_commands/register_callbacks.py`](../tmp/code-puppy/customizable_commands/register_callbacks.py) is
 the engine cyrup's prompt-template system already replaces:
 
 - Recursively loads `*.md` from `~/.code_puppy/commands/` (global, trusted) and project dirs.
@@ -382,21 +417,25 @@ the `done/<SESSION_TS>` move semantics **exactly as in code-puppy**. Rationale:
   code-puppy's variants (`status: complete` from split, missing frontmatter, odd `done/`
   dirnames passed through by `format_timestamp`).
 
-### 3.3 Phase 1 — the `cyrup-flux` package (pure content, no core changes)
+### 3.3 The bundled content set (pure content, no core changes)
 
-Deliverable: a git repo `cyrup-flux` installable via `cyrup install git:<url>` (and
-`cyrup install <local-path>` for development):
+> **SUPERSEDED FRAMING** (see the correction banner at the top): the deliverable is not a git repo
+> and is not installed. It is the crate's bundled resource tree,
+> `crates/cyrup-flux/resources/`, contributed via `ResourcesDiscover`. The `cyrup.toml` block and
+> the `cyrup install` validation below no longer apply. **Porting rules 1–9 are unchanged and are
+> the authoritative per-file work list** — FLUX_02–FLUX_05 apply them verbatim.
+
+Deliverable, as the task files implement it (`crates/cyrup-flux/resources/`):
 
 ```
-cyrup-flux/
-├── cyrup.toml
+crates/cyrup-flux/resources/
 ├── prompts/
 │   └── flux/
 │       ├── new.md  ask.md  split.md  aug.md  exec.md  qa.md
 │       ├── tests.md  commit.md  create-pr.md  review.md
 │       ├── address-feedback.md  auto-pilot.md  rebase.md
 │       ├── squash-commits.md  config.md
-│       └── _docs/            # README.md pipeline.md cheatsheet.md synopsis.md (never registers)
+│       └── _docs/            # README pipeline cheatsheet synopsis about (never registers)
 └── skills/
     └── flux/
         ├── SKILL.md          # pipeline overview + when-to-use (distilled from _docs/)
@@ -404,21 +443,18 @@ cyrup-flux/
 ```
 
 (status/cheatsheet/about are intentionally absent from `prompts/` — they must not invoke the
-model; they land as native commands in Phase 2. A template named `flux/status` would also be
-shadowed by the native command once Phase 2 lands — §0.2 — so shipping it in Phase 1 would be
-dead weight with a misleading body.)
+model; they are native commands. A template named `flux/status` would also be permanently
+shadowed by the native command — §0.2 — so shipping one would be dead weight with a misleading
+body.)
 
-**`cyrup.toml`:**
+**No manifest.** The tree above is reached by the extension's `ResourcesDiscover` contribution
+(§3.4.1), which hands the host the `prompts` DIRECTORY and the `skills/flux/SKILL.md` FILE.
+There is no `cyrup.toml`: this is a crate, not an installable package. The superseded manifest
+this section used to prescribe was:
 
 ```toml
-[package]
-name = "cyrup-flux"
-version = "1.0.0"
-description = "Flux — structured, file-persisted AI development pipeline (new → ask → split → aug → exec → qa → tests → commit → create-pr)"
-
-[resources]
-prompts = ["prompts"]
-skills = ["skills"]
+# SUPERSEDED — do not create this file.
+# [package] name = "cyrup-flux" …  [resources] prompts = ["prompts"]  skills = ["skills"]
 ```
 
 **Per-file porting rules** (apply to all 15 templates; source files cited in §4):
@@ -464,8 +500,8 @@ skills = ["skills"]
    in the package; the only remaining hits must be `ask_user_question` inside `FLUX-GAP`
    comments. Also `rg -n '//flux' prompts/` and confirm every cross-reference is single-slash.
 
-**Phase 1 smoke validation (manual, definitional):** install locally
-(`cyrup install <path-to-cyrup-flux>`), then in a scratch repo run
+**Smoke validation (manual, definitional):** build and install the binary
+(`cargo build -p cyrup && cargo install --path crates/cyrup --force`), then in a scratch repo run
 `cyrup -p "/flux/new add a dark mode toggle"` and confirm: the template expands through the
 same preflight path (§0.2), the agent creates
 `~/.flux/<flattened-scratch>/todo/DARK_MODE.md` with `stage: new, status: done` frontmatter and
@@ -474,9 +510,15 @@ writes `session.env`. Then walk `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/
 `done/<SESSION_TS>/` move on a 10/10. Phase 1 is done when the full pipeline A loop runs
 end-to-end against a scratch repo with correct on-disk state transitions.
 
-### 3.4 Phase 2 — native extension `cyrup-ext-flux` (new crate)
+### 3.4 The native extension crate
 
-Deliverable: `crates/cyrup-ext-flux`, a **default-on built-in** wired in
+> **NAME CORRECTION**: the crate is **`crates/cyrup-flux`**, not `cyrup-ext-flux`, and it holds
+> the bundled content of §3.3 as well as the native surfaces below — there is no second home.
+> Two further corrections verified against the live tree: `NativeExtension`'s first method is
+> `fn id(&self) -> ExtensionId` (not `fn name(&self) -> &str`), and the wiring in §3.4.5 is
+> **three** blocks in `main.rs`, one per `AppMode`, not one. See `flux/FLUX_01.md` Facts 1 and 3.
+
+Deliverable: `crates/cyrup-flux`, a **default-on built-in** wired in
 [`crates/cyrup/src/main.rs`](../crates/cyrup/src/main.rs) next to the subagents wiring
 (`main.rs:692-717`) via `factory_builder.with_native_extension(...)`. Modeled on
 `cyrup-ext-subagents`' structure but far smaller. Default-on is the decision (not an option):
@@ -486,10 +528,10 @@ crate is small and inert until invoked.
 Crate layout:
 
 ```
-crates/cyrup-ext-flux/
+crates/cyrup-flux/
 ├── Cargo.toml
 ├── resources/
-│   ├── prompts/flux/       # the 15 templates + _docs/ (single source; see "bundling" below)
+│   ├── prompts/flux/       # the 15 templates + _docs/ (the ONLY home; see "bundling" below)
 │   └── skills/flux/        # SKILL.md + reference/
 └── src/
     ├── lib.rs              # flux_extension() constructor
@@ -521,7 +563,9 @@ pub struct FluxExtension {
 
 #[async_trait::async_trait]
 impl NativeExtension for FluxExtension {
-    fn name(&self) -> &str { "cyrup-ext-flux" }
+    // CORRECTED: the trait's first method is `fn id(&self) -> ExtensionId` (native.rs:459).
+    // `fn name(&self) -> &str` does not exist on `NativeExtension` — see flux/FLUX_01.md Fact 1.
+    fn id(&self) -> ExtensionId { self.id.clone() }   // id: "cyrup-flux"
 
     async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
         api.subscribe(&[EventKind::ResourcesDiscover]);
@@ -586,11 +630,15 @@ impl NativeExtension for FluxExtension {
 
 **Bundling = single source of truth.** The 15 templates + `_docs/` + skill live in the crate's
 `resources/` tree and are contributed at `ResourceScope::Discovered` (rank 6 — a floor, never
-an override; a user/project/package `flux/*` template still wins, §0.4). The standalone
-`cyrup-flux` package from Phase 1 remains the distribution channel for users who want to pin,
-audit, or override the content; both channels carry identical files (the package repo vendors
-the crate's `resources/` tree — keep them in sync by making the crate the canonical home and
-the package a copy, synced at release).
+an override; a user/project/package `flux/*` template still wins, §0.4).
+
+> **SUPERSEDED**: the sentences that followed described a standalone `cyrup-flux` package as a
+> second distribution channel to be kept `rsync`-identical with the crate. There is no second
+> channel and nothing to keep in sync — `resources/` is the only home. A user who wants to pin,
+> audit or override does it the way cyrup already supports: a same-named `flux/*` template at
+> user or project scope, which outranks this crate's `Discovered`-scope floor. The
+> **directory-contribution** rule above is the load-bearing part of this section and is
+> unchanged.
 
 #### 3.4.2 `/flux/status` — Rust port of `flux_status.py`
 
@@ -733,17 +781,26 @@ impl cyrup_core::Tool for AskUserQuestionTool {
 
 #### 3.4.5 Wiring
 
-One block in [`crates/cyrup/src/main.rs`](../crates/cyrup/src/main.rs), after the subagents
-attach (`main.rs:692-717`), same seam:
+**THREE** blocks in [`crates/cyrup/src/main.rs`](../crates/cyrup/src/main.rs) — one per
+`AppMode`, each after that arm's permission-system attach: the interactive arm
+(`main.rs:635` → `:692-717`), the `AppMode::Rpc` arm (`:895-914`) and the
+`AppMode::Print | AppMode::Json` arm (`:1015-1037`). Attaching in only one makes flux work in
+the TUI and vanish everywhere else. Same seam in all three:
 
 ```rust
-factory_builder = factory_builder.with_native_extension(cyrup_ext_flux::flux_extension());
+// `flux_extension_for_env()` returns `None` inside a subagent CHILD (`CYRUP_SUBAGENT_CHILD`),
+// so a child does not pay for 15 templates + a skill in its system prompt.
+if let Some(ext) = cyrup_flux::flux_extension_for_env() {
+    factory_builder = factory_builder.with_native_extension(ext);
+}
 ```
 
-Add `cyrup-ext-flux` to the workspace `Cargo.toml` members and to `crates/cyrup/Cargo.toml`
-dependencies. No other existing file changes.
+Add `cyrup-flux` to the workspace `Cargo.toml` `members` **and `default-members`** (a crate
+outside `default-members` is skipped by a bare `cargo check`/`cargo clippy`) and to
+`[workspace.dependencies]`, then to `crates/cyrup/Cargo.toml` dependencies. No other existing
+file changes.
 
-### 3.5 Phase 3 — parallel exec hardening
+### 3.5 Parallel exec hardening
 
 `/flux/exec 3` / `/flux/aug 2` / `/flux/qa 2` map to N parallel foreground `subagent` calls:
 
@@ -826,26 +883,35 @@ Every row's source is under
 
 ## 6. Work items
 
-| # | Item | Where | Effort |
-|---|---|---|---|
-| ~~0~~ | ~~Precursor: recursive prompt scanner~~ | **DONE** — landed in `cyrup-resources` (§0.1) | — |
-| 1 | Port 15 command templates to `prompts/flux/*.md` (§3.3 rules 1–9) | new `cyrup-flux` package repo | M |
-| 2 | `flux` skill from `_docs/` (§3.3 rule 8) | same package | S |
-| 3 | `cyrup.toml` manifest (§3.3) + Phase 1 smoke validation | same package | S |
-| 4 | `cyrup-ext-flux` crate: state model + status/cheatsheet/about renderers (§3.4.1–3.4.3) | `crates/cyrup-ext-flux` | M |
-| 5 | `ask_user_question` native tool + `FLUX-GAP` sweep (§3.4.4) | `crates/cyrup-ext-flux` + package | S |
-| 6 | `ctrl+f` status overlay (§3.4.3) | `crates/cyrup-ext-flux` | S |
-| 7 | Wire extension in `main.rs` + workspace manifests (§3.4.5) | `crates/cyrup` | XS |
-| 8 | Bundle prompts/skill as built-in resources — **directory contribution** (§3.4.1) | `crates/cyrup-ext-flux` | S |
-| 9 | Parallel-exec alignment with `subagent` semantics (§3.5) | package prompts | S |
+> **SUPERSEDED by [`flux/README.md`](flux/README.md)'s twelve-task table.** The rows below are
+> kept for their effort sizing and section cross-references only; every "package" cell means
+> `crates/cyrup-flux/resources/`, and every `cyrup-ext-flux` cell means `crates/cyrup-flux`.
+> Items 3 and 8 have merged into FLUX_01 (there is no manifest to write and no second home to
+> bundle into).
 
-No cyrup core changes remain. Phase 1 (items 1–3) ships the whole interactive pipeline as a
-pure content package; Phase 2 (items 4–8) makes it first-class; Phase 3 (item 9) hardens
-parallel execution.
+| # | Item | Where | Effort | task |
+|---|---|---|---|---|
+| ~~0~~ | ~~Precursor: recursive prompt scanner~~ | **DONE** — landed in `cyrup-resources` (§0.1) | — | — |
+| 1 | Port 15 command templates to `resources/prompts/flux/*.md` (§3.3 rules 1–9) | `crates/cyrup-flux` | M | 02–05 |
+| 2 | `flux` skill from `_docs/` (§3.3 rule 8) | same crate | S | 06 |
+| 3 | ~~`cyrup.toml` manifest~~ → crate scaffold + workspace registration | `crates/cyrup-flux` | S | 01 |
+| 4 | State model + status/cheatsheet/about renderers (§3.4.1–3.4.3) | `crates/cyrup-flux` | M | 07–08 |
+| 5 | `ask_user_question` native tool + `FLUX-GAP` sweep (§3.4.4) | `crates/cyrup-flux` | S | 10–11 |
+| 6 | `ctrl+f` status overlay (§3.4.3) | `crates/cyrup-flux` | S | 09 |
+| 7 | Wire extension in `main.rs` (×3 arms) + workspace manifests (§3.4.5) | `crates/cyrup` | XS | 01 |
+| 8 | Bundle prompts/skill as built-in resources — **directory contribution** (§3.4.1) | `crates/cyrup-flux` | S | 01 |
+| 9 | Parallel-exec alignment with `subagent` semantics (§3.5) | bundled prompts | S | 12 |
+
+No cyrup core changes remain.
 
 ## 7. Definition of done
 
-- **Phase 1 (package)**: `cyrup install <path>` then, in a scratch repo, the full pipeline-A
+> **The "Phase 1 (package)" heading below is superseded.** There is no install step: the content
+> ships with the binary from FLUX_01 onward. Read "`cyrup install <path>` then" as "with the
+> binary built and installed, then". Every on-disk state transition it lists is unchanged and is
+> still the acceptance bar.
+
+- **Content set**: with the binary built, in a scratch repo the full pipeline-A
   loop — `/flux/new` → `/flux/ask` → `/flux/split` → `/flux/aug` → `/flux/exec` → `/flux/qa` —
   runs end-to-end with correct on-disk transitions: task file created with `stage: new,
   status: done`; per-step frontmatter `stage`/`status`/`updated` rewrites; subtask files from
@@ -853,7 +919,8 @@ parallel execution.
   `done/<SESSION_TS>/` with `stage: qa, status: completed`; a <10 QA leaving `needs-rework`
   with a rewritten body. The §3.3-rule-9 `rg` sweeps are clean. `cyrup -p "/flux/new …"`
   expands the template (same preflight path, §0.2).
-- **Phase 2 (native crate)**: with the extension wired per §3.4.5 and **no package installed**,
+- **Native crate**: with the extension wired per §3.4.5 (three `main.rs` arms) and **nothing
+  installed**,
   `/flux/new` … `/flux/config` are available out of the box (bundled `Discovered`-scope
   templates registered under their `flux/<step>` names — the directory-contribution check,
   §3.4.1); `/flux/status` prints the aligned glyph table reflecting a hand-built
@@ -862,5 +929,5 @@ parallel execution.
   their rendered bodies; `ctrl+f` opens and ESC closes the status overlay in the TUI;
   `ask_user_question` appears in the model's tool list and a `/flux/ask` run uses it (no
   `FLUX-GAP` markers remain in the bundled templates).
-- **Phase 3**: `/flux/exec 2` on a two-task fixture runs both tasks via foreground `subagent`
-  fan-out with per-file frontmatter transitions as each completes.
+- **Parallel exec**: `/flux/exec 2` on a two-task fixture runs both tasks via foreground
+  `subagent` fan-out with per-file frontmatter transitions as each completes.

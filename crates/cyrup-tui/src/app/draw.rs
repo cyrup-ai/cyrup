@@ -75,8 +75,15 @@ impl<B: Backend> App<B> {
             raw
         };
         if desired != self.viewport_height {
-            self.resize_viewport(desired)?;
-            self.viewport_height = desired;
+            // TUI-093 — NOT `?`. A frame at the previous height is a cosmetic defect; propagating
+            // here unwinds ~40 `draw_synchronized()?` call sites out of `App::run` and ENDS THE
+            // SESSION (main.rs `anyhow!("tui: {e}")` → `eprintln!("cyrup: {err:#}")`).
+            // `viewport_height` is committed only on success, so the next frame retries the same
+            // reconstruction rather than getting stuck believing it already happened.
+            match self.resize_viewport(desired) {
+                Ok(()) => self.viewport_height = desired,
+                Err(e) => self.state.transcript.push_status(format!("viewport resize failed: {e}")),
+            }
         }
         self.flush_committed()?;
         let App { terminal, state, .. } = self;

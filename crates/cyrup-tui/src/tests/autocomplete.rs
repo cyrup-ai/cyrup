@@ -372,3 +372,63 @@ fn a_quote_that_does_not_start_a_token_is_not_a_quoted_prefix() {
     // ordinary split runs and the trailing token is everything after the last `"`.
     assert_eq!(crate::mention_query("foo\"bar").as_deref(), None);
 }
+
+// ---- CMDHINT_01: is_command_prefix -----------------------------------------------------------
+
+/// `is_command_prefix` is a strict `starts_with`, so a genuine command-name prefix matches and a
+/// full exact name also matches (a name is trivially a prefix of itself).
+#[test]
+fn is_command_prefix_matches_a_genuine_prefix_and_the_full_name() {
+    let reg = CommandRegistry::new();
+    assert!(crate::autocomplete::is_command_prefix(&reg, "mod"), "\"mod\" prefixes \"model\"");
+    assert!(crate::autocomplete::is_command_prefix(&reg, "model"), "a full name is its own prefix");
+    assert!(crate::autocomplete::is_command_prefix(&reg, "se"), "\"se\" prefixes \"settings\"");
+}
+
+/// A query matching no registered name at all — including one that IS a fuzzy subsequence match —
+/// is not a prefix. No builtin starts with `"fa"`.
+#[test]
+fn is_command_prefix_rejects_a_non_prefix() {
+    let reg = CommandRegistry::new();
+    assert!(!crate::autocomplete::is_command_prefix(&reg, "fa"));
+    assert!(!crate::autocomplete::is_command_prefix(&reg, "zzz"));
+    // Case matters: registry names are lowercase, `starts_with` is byte-exact.
+    assert!(!crate::autocomplete::is_command_prefix(&reg, "MOD"));
+}
+
+/// An empty query is false, even though a bare `/` opens a full, unfiltered popup
+/// (`fuzzy::filter` returns everything for an empty query, `fuzzy.rs:145-151`) — the two questions
+/// are deliberately different: "is there anything to show" vs "does this confirm a real command".
+#[test]
+fn is_command_prefix_rejects_the_empty_query() {
+    let reg = CommandRegistry::new();
+    assert!(!crate::autocomplete::is_command_prefix(&reg, ""));
+}
+
+/// The counterexample the doc comment cites: fuzzy-matching is lenient enough to match a
+/// non-contiguous subsequence (`f`→`a` inside `flux/aug`) where `is_command_prefix` correctly does
+/// not. Proven against a REAL dynamic command name, not just an absence in the builtin table.
+#[test]
+fn fuzzy_matches_where_is_command_prefix_does_not() {
+    let flux_aug = SlashCommand {
+        name: std::borrow::Cow::Borrowed("flux/aug"),
+        description: std::borrow::Cow::Borrowed("Augment a task"),
+        argument_hint: None,
+        source: CommandSource::Prompt,
+        has_arg_completion: false,
+    };
+    let reg = CommandRegistry::with_dynamic(vec![flux_aug]);
+    assert!(reg.get("flux/aug").is_some(), "the dynamic command registered");
+
+    // `is_command_prefix`: "fa" is not the start of "flux/aug".
+    assert!(!crate::autocomplete::is_command_prefix(&reg, "fa"));
+
+    // `fuzzy::filter` (what the popup itself uses): "fa" IS a subsequence of "flux/aug", so the
+    // popup surfaces it — correct for a suggestion list, wrong as a highlight confirmation.
+    let matches = crate::fuzzy_filter(reg.commands(), "fa", |c| c.name.as_ref());
+    assert!(
+        matches.iter().any(|m| reg.commands()[m.index].name == "flux/aug"),
+        "fuzzy::filter should still match \"fa\" against \"flux/aug\" (subsequence f→a): {matches:?}"
+    );
+}
+

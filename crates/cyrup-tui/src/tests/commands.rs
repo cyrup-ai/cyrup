@@ -245,6 +245,82 @@ fn a_builtin_wins_a_name_collision_with_a_dynamic_command() {
     assert_eq!(reg.commands().iter().filter(|c| c.name == "model").count(), 1);
 }
 
+/// CMDHINT_01 — a prompt-template row's `argumentHint` key reaches `SlashCommand::argument_hint`,
+/// while extension and skill rows never carry the key in a REAL catalog (no upstream analog; only
+/// `slash_command_catalog()`'s prompt arm ever writes it) and default to `None`. This is the second
+/// half of the plumbing whose first half is `AgentSession::slash_command_catalog()` (tested at
+/// `cyrup-session-svc/src/tests/cmdhint01_argument_hint.rs`) — that test proves the JSON key is
+/// EMITTED only for prompt rows; this one proves it is CONSUMED and turned into the
+/// `Cow<'static, str>` the editor ghost reads.
+///
+/// Deliberately NOT tested here: an extension/skill row that carries `argumentHint` anyway.
+/// `dynamic_commands_from_catalog_gated` reads `row.get("argumentHint")` unconditionally rather than
+/// gating on `source == "prompt"` — the task's own analysis proves that's correct, because the
+/// invariant is enforced at the PRODUCER (only the prompt arm ever writes the key), and a redundant
+/// consumer-side guard would be dead code. Asserting the consumer ignores a hand-crafted
+/// out-of-contract row would test a guard the design explicitly does not have.
+#[test]
+fn dynamic_command_argument_hint_reaches_slash_command() {
+    let catalog = vec![
+        serde_json::json!({
+            "name": "deploy",
+            "description": "Deploy runbook",
+            "source": "prompt",
+            "sourceInfo": { "path": "/p/.cyrup/prompts/deploy.md", "source": "local", "scope": "project", "origin": "top-level" },
+            "argumentHint": "<env> [--dry-run]",
+        }),
+        // A hintless prompt row — no `argumentHint` key at all.
+        serde_json::json!({
+            "name": "greet",
+            "description": "Say hello",
+            "source": "prompt",
+            "sourceInfo": { "path": "/p/.cyrup/prompts/greet.md", "source": "local", "scope": "project", "origin": "top-level" },
+        }),
+        // A REAL extension row, exactly as `slash_command_catalog()` actually emits one — no
+        // `argumentHint` key at all, because only the prompt arm ever writes it.
+        serde_json::json!({
+            "name": "subagent-status",
+            "description": "Inspect running subagents",
+            "source": "extension",
+            "sourceInfo": { "path": "", "source": "extension", "scope": "temporary", "origin": "top-level" },
+        }),
+        // A REAL skill row, same story.
+        serde_json::json!({
+            "name": "skill:deploy",
+            "description": "Deploy runbook",
+            "source": "skill",
+            "sourceInfo": { "path": "/u/.cyrup/skills/deploy", "source": "npm:acme-skills", "scope": "user", "origin": "top-level" },
+        }),
+        // An empty-string hint must be filtered to `None`, matching pi's truthiness spread even
+        // though the producer (`prompt.rs:112-113`) already guarantees non-empty in practice.
+        serde_json::json!({
+            "name": "blank-hint",
+            "description": "Has an empty hint",
+            "source": "prompt",
+            "sourceInfo": { "path": "/p/.cyrup/prompts/blank-hint.md", "source": "local", "scope": "project", "origin": "top-level" },
+            "argumentHint": "",
+        }),
+    ];
+
+    let dynamic = crate::dynamic_commands_from_catalog(&catalog);
+    let by = |name: &str| dynamic.iter().find(|c| c.name == name).expect(name);
+    assert_eq!(by("deploy").argument_hint.as_deref(), Some("<env> [--dry-run]"));
+    assert_eq!(by("greet").argument_hint, None);
+    assert_eq!(
+        by("subagent-status").argument_hint, None,
+        "a real catalog never sets argumentHint on an extension row"
+    );
+    assert_eq!(
+        by("skill:deploy").argument_hint, None,
+        "a real catalog never sets argumentHint on a skill row"
+    );
+    assert_eq!(by("blank-hint").argument_hint, None, "an empty-string hint filters to None");
+
+    // And it is genuinely usable end to end: the merged registry's `get()` returns the hint.
+    let reg = crate::CommandRegistry::with_dynamic(dynamic);
+    assert_eq!(reg.get("deploy").unwrap().argument_hint.as_deref(), Some("<env> [--dry-run]"));
+}
+
 /// TUI-025 — the slash-command metadata was one baseline behind.
 ///
 /// pi v0.84.1 `packages/coding-agent/src/core/slash-commands.ts`: `:21`

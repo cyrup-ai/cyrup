@@ -21,6 +21,7 @@ members = [
     "crates/cyrup-ext-subagents",
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",
+    "crates/cyrup-flux",
     "crates/cyrup-it",
     "xtask",
 ]
@@ -77,6 +78,7 @@ default-members = [
     "crates/cyrup-ext-subagents",
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",
+    "crates/cyrup-flux",
 ]
 
 [workspace.package]
@@ -113,6 +115,7 @@ cyrup-session-svc  = { path = "crates/cyrup-session-svc",  version = "0.0.0" }
 cyrup-ext-subagents = { path = "crates/cyrup-ext-subagents", version = "0.0.0" }
 cyrup-permission-system = { path = "crates/cyrup-permission-system", version = "0.0.0" }
 cyrup-intercom     = { path = "crates/cyrup-intercom",     version = "0.0.0" }
+cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.0.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---

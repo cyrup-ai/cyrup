@@ -95,8 +95,9 @@ mod tests;
 pub use app::{
     crossterm_input_stream, extension_render, gist_id_from_url, reanchor_inline_region, render,
     share_viewer_url, share_viewer_url_from, should_honor_extension_shutdown, tree_node_from_dag,
-    App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, LifecycleEffects,
-    LifecycleOutcome, LoginProviderSource, QueueDrain, QueueDrainReason, RebuildBackend, TreeNavMsg,
+    App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, InlineBackend,
+    LifecycleEffects, LifecycleOutcome, LoginProviderSource, QueueDrain, QueueDrainReason,
+    RebuildBackend, TreeNavMsg,
 };
 pub use auth_select::{
     format_auth_selector_provider_type, format_status_indicator, login_selector_rows,
@@ -126,7 +127,7 @@ pub use chrome::{
     key_hint_spans, render_compact_hints, truncate_to_visual_lines, BorderedLoader, VisualTruncate,
     COMPACT_HINT_ROWS, STARTUP_ONBOARDING,
 };
-pub use editor::{EditorOutcome, InputEditor, VisualLine};
+pub use editor::{CommandHighlight, EditorOutcome, InputEditor, VisualLine};
 pub use footer_data::{
     find_git_paths, resolve_branch as resolve_git_branch, FooterGitBranch, GitPaths,
     POLL_INTERVAL as GIT_BRANCH_POLL_INTERVAL,

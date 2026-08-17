@@ -228,7 +228,7 @@ fn emit_argv_echo(out: &mut impl Write) {
         let _ = writeln!(out, "{line}");
     }
     for pair in args.windows(2) {
-        let (flag, path) = (&pair[0], &pair[1]);
+        let [flag, path] = pair else { continue };
         if flag != "--system-prompt" && flag != "--append-system-prompt" {
             continue;
         }

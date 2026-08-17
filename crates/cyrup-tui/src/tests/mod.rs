@@ -70,6 +70,7 @@ mod pending_messages;
 mod project_trust_banner;
 mod render;
 mod render_cache_tick;
+mod resize_viewport_failure;
 mod rich_messages;
 mod run_loop_cancel_bias;
 mod run_loop_draw_coalescing;

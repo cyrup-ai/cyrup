@@ -3,7 +3,7 @@ use super::*;
 use super::run::RunCtx;
 use super::run_arms::RunFlow;
 
-impl App<CrosstermBackend<Stdout>> {
+impl App<InlineBackend<Stdout>> {
     /// The nested `AppAction` dispatch of the run loop's input arm (§7.2): the twelve-way match
     /// that routes a mapped action to its session effect. Arm bodies moved verbatim from
     /// `App::run`; control-flow exits surface as [`RunFlow`].

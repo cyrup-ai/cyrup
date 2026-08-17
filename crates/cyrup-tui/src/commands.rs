@@ -467,7 +467,16 @@ pub fn dynamic_commands_from_catalog_gated(
                     description,
                     tag.as_deref(),
                 )),
-                argument_hint: None,
+                // CMDHINT_01 — prompt templates carry `argument-hint` frontmatter
+                // (`cyrup-resources/src/prompt.rs:41,112-113`); extension commands and skills have no upstream
+                // analog (`interactive-mode.ts:691-698` forwards a completer, not a hint; `cyrup-ext/src/registry.rs:94-98`
+                // has no such field), so only `source:"prompt"` rows can produce one. The empty-string filter
+                // matches pi's `&&`-spread truthiness test even though the producer already guarantees non-empty.
+                argument_hint: row
+                    .get("argumentHint")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|h| !h.is_empty())
+                    .map(|h| Cow::Owned(h.to_string())),
                 source: kind,
                 // EXT-013 / TUI-012: still hardcoded, and it CANNOT be resolved in this crate —
                 // `slash_command_catalog()` (`cyrup-session-svc/src/session.rs:2503-2532`) emits no

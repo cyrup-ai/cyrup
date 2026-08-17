@@ -1050,6 +1050,47 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    // ------------------------------------------------------------- process-global proxy setting
+    //
+    // `cyrup_provider::configure_http_proxy` writes a PROCESS-GLOBAL (`stream::sse::HTTP_PROXY_SETTING`),
+    // and `HttpCaps::client_for` (unlike `client_through`, deliberately split out for this exact
+    // reason — see its own doc comment) reads it on every call. `cyrup-provider`'s OWN test suite hit
+    // this identical hazard first and fixed it with the same shape of guard
+    // (`cyrup-provider/src/tests/proxy_setting.rs`); that guard is `pub(crate)` to `cyrup-provider`
+    // and gated by ITS `#[cfg(test)]`, so it does not exist in the `cyrup-provider` artifact this
+    // crate's OWN test binary links against — a separate, crate-local guard is required here.
+    //
+    // Scope of what this actually fixes: it serializes the ONE test that mutates the setting
+    // (`a_proxy_the_resolver_refuses_fails_the_request_instead_of_connecting_directly`) against the
+    // specific tests PROVEN to race it (reproduced under `cargo test -p cyrup-ext --features
+    // wasm-host`, i.e. the full crate suite, where dozens of OTHER threads are runnable
+    // concurrently): the two `client_for`-observing tests below, plus
+    // `close_stream_racing_an_in_flight_poll_does_not_free_the_cap_slot_early` and
+    // `poll_racing_close_does_not_resurrect_the_closed_handle`, which reach `client_for`
+    // transitively through `request_stream`. It does not retrofit every one of this file's other
+    // `request`/`request_stream` tests onto the guard — the same trade-off `proxy_setting.rs` makes
+    // for the analogous reason: the writer's critical section is now as short as a single
+    // `configure_http_proxy` + one resolver `.await` + its own assertions, not the whole multi-second
+    // suite, so an UNGUARDED test would need to land its own `client_for` call inside that narrow
+    // window to race it — empirically no longer observed (see the fix's own verification) even
+    // though it is not a mathematical impossibility for a test not listed above.
+    static PROXY_SETTING_GUARD: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Take the serialization guard. Hold the returned value for the life of the test.
+    async fn proxy_setting_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        PROXY_SETTING_GUARD.lock().await
+    }
+
+    /// Clears the process-global `httpProxy` setting in `Drop` — never only on the success path, so
+    /// a panicking assertion cannot leave it set for whichever test (guarded or not) runs next.
+    struct ClearProxySettingOnDrop;
+
+    impl Drop for ClearProxySettingOnDrop {
+        fn drop(&mut self) {
+            cyrup_provider::configure_http_proxy(None);
+        }
+    }
+
     /// Spawn a raw-TCP mock HTTP/1.1 server: accepts one connection, drains the request, then writes
     /// each of `parts` as a separate flushed write with a small delay between them (so a real client
     /// observes them as distinct reads, proving genuine incremental delivery — no external network
@@ -1076,6 +1117,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_returns_the_real_status_and_body() {
+        let _serial = proxy_setting_guard().await;
         let body = b"hello from the mock server".to_vec();
         let headers = format!("Content-Type: text/plain\r\nContent-Length: {}\r\n", body.len());
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![body.clone()]).await;
@@ -1153,6 +1195,7 @@ mod tests {
     /// decompression strips both).
     #[tokio::test]
     async fn request_transparently_decodes_a_real_gzip_content_encoding() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"hello decompression world, repeated for a real ratio: \
             hello decompression world, hello decompression world"
             .to_vec();
@@ -1199,6 +1242,7 @@ mod tests {
     /// must still round-trip byte-for-byte to the guest, matching real `fetch()`.
     #[tokio::test]
     async fn request_decodes_an_uppercase_content_encoding_and_preserves_its_original_casing() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"case-insensitive decompression world, repeated: \
             case-insensitive decompression world, case-insensitive decompression world"
             .to_vec();
@@ -1233,6 +1277,7 @@ mod tests {
     /// decompress identically to `gzip`, not fall through to the unrecognized-token identity path.
     #[tokio::test]
     async fn request_decodes_the_x_gzip_legacy_alias() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"x-gzip legacy alias decompression world, repeated: \
             x-gzip legacy alias decompression world, x-gzip legacy alias decompression world"
             .to_vec();
@@ -1257,6 +1302,7 @@ mod tests {
     /// draining chunks via `request_stream`/`poll_stream_chunk`, not just the buffered path.
     #[tokio::test]
     async fn request_stream_decodes_the_x_gzip_legacy_alias() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"streaming x-gzip legacy alias world, repeated: \
             streaming x-gzip legacy alias world, streaming x-gzip legacy alias world"
             .to_vec();
@@ -1294,6 +1340,7 @@ mod tests {
     /// for a `nullBodyStatus` response).
     #[tokio::test]
     async fn request_with_a_304_and_a_stale_content_encoding_returns_the_empty_body_undecoded() {
+        let _serial = proxy_setting_guard().await;
         let headers = "Content-Type: text/plain\r\nContent-Encoding: gzip\r\n".to_string();
         let url = spawn_mock("HTTP/1.1 304 Not Modified", headers, vec![]).await;
 
@@ -1324,6 +1371,7 @@ mod tests {
     /// to immediate EOF with no decode attempted, matching the buffered path above.
     #[tokio::test]
     async fn request_stream_with_a_304_and_a_stale_content_encoding_opens_and_drains_to_eof() {
+        let _serial = proxy_setting_guard().await;
         let headers = "Content-Type: text/plain\r\nContent-Encoding: gzip\r\n".to_string();
         let url = spawn_mock("HTTP/1.1 304 Not Modified", headers, vec![]).await;
 
@@ -1344,6 +1392,7 @@ mod tests {
     /// (undici's exact guard: `request.method !== 'HEAD'`) — decoding it must never be attempted.
     #[tokio::test]
     async fn request_head_with_a_content_encoding_header_returns_the_empty_body_undecoded() {
+        let _serial = proxy_setting_guard().await;
         let headers = "Content-Type: text/plain\r\nContent-Encoding: gzip\r\nContent-Length: 12345\r\n"
             .to_string();
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![]).await;
@@ -1365,6 +1414,7 @@ mod tests {
     /// `HttpCaps::request`, matching real `fetch()` byte-for-byte.
     #[tokio::test]
     async fn request_transparently_decodes_a_real_chained_gzip_then_brotli_content_encoding() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"chained decompression world, repeated for a real ratio: \
             chained decompression world, chained decompression world"
             .to_vec();
@@ -1405,6 +1455,7 @@ mod tests {
     /// buffered `request` path.
     #[tokio::test]
     async fn request_stream_transparently_decodes_a_real_chained_gzip_then_brotli_content_encoding() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"streaming chained decompression world, repeated for a real ratio: \
             streaming chained decompression world, streaming chained decompression world"
             .to_vec();
@@ -1452,6 +1503,7 @@ mod tests {
     /// merely a unit check of the resolver function.
     #[tokio::test]
     async fn request_with_an_unrecognized_content_encoding_token_discards_the_whole_chain_not_just_that_stage() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"this must NOT be gzip-decoded when an unknown token poisons the chain";
         let gzipped = compress(Coding::Gzip, plaintext).await;
 
@@ -1479,6 +1531,7 @@ mod tests {
     /// real-server, real-gzip proof; same expected fully-raw result.
     #[tokio::test]
     async fn request_with_a_trailing_unrecognized_content_encoding_token_also_discards_the_whole_chain() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"an outermost unknown coding must poison the chain before gzip is even seen";
         let gzipped = compress(Coding::Gzip, plaintext).await;
 
@@ -1503,6 +1556,7 @@ mod tests {
     /// concatenate back to the still-gzip-compressed bytes, not the plaintext.
     #[tokio::test]
     async fn request_stream_with_an_unrecognized_content_encoding_token_discards_the_whole_chain() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"streaming: this must NOT be gzip-decoded when an unknown token is present";
         let gzipped = compress(Coding::Gzip, plaintext).await;
 
@@ -1541,6 +1595,7 @@ mod tests {
     /// distinctness assertion below would hold for a `client_for` that proxied everything.
     #[tokio::test]
     async fn a_resolved_proxy_yields_a_distinct_cached_client_and_no_proxy_yields_the_direct_one() {
+        let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::new();
 
         // No proxy configured and none in the ambient env for this target ⇒ the direct client.
@@ -1592,15 +1647,9 @@ mod tests {
     /// so a failing assertion cannot leak it into the loopback tests around it.
     #[tokio::test]
     async fn a_proxy_the_resolver_refuses_fails_the_request_instead_of_connecting_directly() {
-        struct ClearOnDrop;
-        impl Drop for ClearOnDrop {
-            fn drop(&mut self) {
-                cyrup_provider::configure_http_proxy(None);
-            }
-        }
-
+        let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::new();
-        let _restore = ClearOnDrop;
+        let _restore = ClearProxySettingOnDrop;
         cyrup_provider::configure_http_proxy(Some("socks5://127.0.0.1:1080".to_string()));
 
         let err = caps
@@ -1692,6 +1741,7 @@ mod tests {
     /// ever runs.
     #[tokio::test]
     async fn request_rejects_a_content_encoding_chain_over_the_max_depth() {
+        let _serial = proxy_setting_guard().await;
         let headers = "Content-Type: application/octet-stream\r\n\
             Content-Encoding: gzip, br, deflate, zstd, gzip, br\r\n\
             Content-Length: 3\r\n"
@@ -1718,6 +1768,7 @@ mod tests {
     /// checking the depth cap would hang past that bound; the fixed ordering rejects immediately.
     #[tokio::test]
     async fn request_rejects_the_content_encoding_depth_cap_before_downloading_the_body() {
+        let _serial = proxy_setting_guard().await;
         let headers = "Content-Type: application/octet-stream\r\n\
             Content-Encoding: gzip, br, deflate, zstd, gzip, br\r\n"
             .to_string();
@@ -1757,6 +1808,7 @@ mod tests {
     /// `reject(...)` happening before the response promise ever resolves.
     #[tokio::test]
     async fn request_stream_rejects_a_content_encoding_chain_over_the_max_depth() {
+        let _serial = proxy_setting_guard().await;
         let headers = "Content-Type: application/octet-stream\r\n\
             Content-Encoding: gzip, br, deflate, zstd, gzip, br\r\n\
             Content-Length: 3\r\n"
@@ -1781,6 +1833,7 @@ mod tests {
     /// `Content-Encoding: zstd` + original compressed `Content-Length`.
     #[tokio::test]
     async fn request_stream_transparently_decodes_a_real_zstd_content_encoding() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"streaming zstd decompression world, repeated for a real ratio: \
             streaming zstd decompression world, streaming zstd decompression world"
             .to_vec();
@@ -1835,6 +1888,7 @@ mod tests {
     /// strictly-better outcome than today's hard failure.
     #[tokio::test]
     async fn request_lenient_decodes_a_truncated_gzip_body_recovering_most_of_the_plaintext() {
+        let _serial = proxy_setting_guard().await;
         let plaintext: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         let gzipped = compress(Coding::Gzip, &plaintext).await;
         let truncated = gzipped[..gzipped.len() - 8].to_vec(); // strip the trailing CRC32+ISIZE
@@ -1872,6 +1926,7 @@ mod tests {
     /// truncated zstd stream (`decode_stream_one`'s doc: "clean end, empty output, no error").
     #[tokio::test]
     async fn request_lenient_decodes_a_tiny_truncated_gzip_body_to_an_empty_but_non_error_result() {
+        let _serial = proxy_setting_guard().await;
         let plaintext = b"hello decompression world, repeated for a real ratio: \
             hello decompression world, hello decompression world"
             .to_vec();
@@ -1906,6 +1961,7 @@ mod tests {
     #[tokio::test]
     async fn request_stream_lenient_decodes_a_truncated_gzip_body_recovering_most_of_the_plaintext()
     {
+        let _serial = proxy_setting_guard().await;
         let plaintext: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
         let gzipped = compress(Coding::Gzip, &plaintext).await;
         let truncated = gzipped[..gzipped.len() - 8].to_vec();
@@ -1950,6 +2006,7 @@ mod tests {
     /// "decoder" errors apart.
     #[tokio::test]
     async fn request_stream_poll_still_hard_fails_on_a_genuine_mid_stream_transport_failure() {
+        let _serial = proxy_setting_guard().await;
         let headers = "Content-Type: text/plain\r\nContent-Length: 100\r\n".to_string();
         // Only 10 of the promised 100 bytes are ever sent before the mock server's connection
         // (and so the underlying TCP stream) closes.
@@ -1983,6 +2040,7 @@ mod tests {
     /// (`request_rejects_a_declared_content_length_over_the_cap` already covers the wire side).
     #[tokio::test]
     async fn request_rejects_a_decompression_bomb_over_the_cap() {
+        let _serial = proxy_setting_guard().await;
         // Highly compressible: one repeated byte, decompressed size deliberately over the cap.
         let huge = vec![b'x'; MAX_RESPONSE_BODY_BYTES + 4096];
         let gzipped = compress_at(Coding::Gzip, async_compression::Level::Best, &huge).await;
@@ -2009,6 +2067,7 @@ mod tests {
 
     #[tokio::test]
     async fn request_stream_yields_real_chunks_in_order_then_eof() {
+        let _serial = proxy_setting_guard().await;
         let parts: Vec<Vec<u8>> =
             vec![b"chunk-one-".to_vec(), b"chunk-two-".to_vec(), b"chunk-three".to_vec()];
         let total: usize = parts.iter().map(Vec::len).sum();
@@ -2046,6 +2105,7 @@ mod tests {
     /// `TotalTimeoutBody` firing mid-read). Post-fix: the full 10 bytes drain successfully.
     #[tokio::test]
     async fn request_stream_survives_a_slow_body_past_an_explicit_non_zero_timeout_ms() {
+        let _serial = proxy_setting_guard().await;
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
@@ -2099,6 +2159,7 @@ mod tests {
     /// hardcoded default.
     #[tokio::test]
     async fn request_stream_exposes_real_status_and_headers_before_draining_the_body() {
+        let _serial = proxy_setting_guard().await;
         let body = b"unauthorized-body-still-streamable".to_vec();
         let headers = format!(
             "Content-Type: text/event-stream\r\nMcp-Session-Id: sess-42\r\nContent-Length: {}\r\n",
@@ -2135,6 +2196,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_stream_invalidates_the_handle() {
+        let _serial = proxy_setting_guard().await;
         let url = spawn_mock("HTTP/1.1 200 OK", "Content-Length: 0\r\n".into(), vec![]).await;
         let caps = HttpCaps::new();
         let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
@@ -2154,6 +2216,7 @@ mod tests {
     /// at the moment `close_stream` runs.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn poll_racing_close_does_not_resurrect_the_closed_handle() {
+        let _serial = proxy_setting_guard().await;
         let body = b"the one real chunk".to_vec();
         let server_body = body.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
@@ -2214,6 +2277,7 @@ mod tests {
     /// whether the cap was (wrongly) freed early by the racing `close_stream`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn close_stream_racing_an_in_flight_poll_does_not_free_the_cap_slot_early() {
+        let _serial = proxy_setting_guard().await;
         let body = b"the delayed chunk".to_vec();
         let server_body = body.clone();
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
@@ -2299,6 +2363,7 @@ mod tests {
     /// being tested is identical regardless of the configured limit's value.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn request_stream_rejects_once_the_open_stream_cap_is_reached() {
+        let _serial = proxy_setting_guard().await;
         const SMALL_CAP: usize = 4;
         let url = spawn_persistent_mock().await;
         let caps = HttpCaps::with_max_open_streams(SMALL_CAP);
@@ -2363,6 +2428,7 @@ mod tests {
     /// the mock never sends a body byte, so there is no sleep and no scheduling race.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_poll_does_not_wedge_the_handle_or_leak_its_cap_slot() {
+        let _serial = proxy_setting_guard().await;
         use futures::FutureExt;
 
         let caps = HttpCaps::with_max_open_streams(1);
@@ -2408,6 +2474,7 @@ mod tests {
     /// this to be observed, proving the cap is enforced off the header alone.
     #[tokio::test]
     async fn request_rejects_a_declared_content_length_over_the_cap() {
+        let _serial = proxy_setting_guard().await;
         let headers = format!("Content-Length: {}\r\n", MAX_RESPONSE_BODY_BYTES as u64 + 1);
         let url = spawn_mock("HTTP/1.1 200 OK", headers, vec![b"short".to_vec()]).await;
         let caps = HttpCaps::new();
@@ -2422,6 +2489,7 @@ mod tests {
     /// arrive — a real, over-the-cap body is actually streamed from the mock server here.
     #[tokio::test]
     async fn request_rejects_a_body_that_exceeds_the_cap_with_no_content_length_header() {
+        let _serial = proxy_setting_guard().await;
         let oversized = vec![b'x'; MAX_RESPONSE_BODY_BYTES + 4096];
         let url = spawn_mock("HTTP/1.1 200 OK", String::new(), vec![oversized]).await;
         let caps = HttpCaps::new();
@@ -2435,6 +2503,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_transport_failure_is_an_err_not_a_panic() {
+        let _serial = proxy_setting_guard().await;
         // Bind then immediately drop to get a refused-connection address (no server listening).
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -2453,6 +2522,7 @@ mod tests {
     /// fire on its own.
     #[tokio::test]
     async fn request_falls_back_to_a_bounded_timeout_when_the_guest_gives_none() {
+        let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_request_timeout(Duration::from_millis(100));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -2490,6 +2560,7 @@ mod tests {
     /// not near-zero.
     #[tokio::test]
     async fn request_timeout_ms_zero_falls_back_to_the_bounded_timeout_not_an_instant_one() {
+        let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_request_timeout(Duration::from_millis(150));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -2522,6 +2593,7 @@ mod tests {
     /// Same finding, `request_stream`'s initial connect+headers phase.
     #[tokio::test]
     async fn request_stream_timeout_ms_zero_falls_back_to_the_bounded_timeout_not_an_instant_one() {
+        let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_request_timeout(Duration::from_millis(150));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -2554,6 +2626,7 @@ mod tests {
     /// Same finding, `request_stream`'s initial connect+headers phase.
     #[tokio::test]
     async fn request_stream_falls_back_to_a_bounded_timeout_when_the_guest_gives_none() {
+        let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_request_timeout(Duration::from_millis(100));
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
@@ -2616,6 +2689,7 @@ mod tests {
     /// `streamableHttp.js:75-105`) this capability exists to serve.
     #[tokio::test]
     async fn poll_stream_chunk_idle_timeout_does_not_kill_the_stream() {
+        let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::with_poll_idle_timeout(Duration::from_millis(80));
         let url = spawn_idle_then_chunk_mock(b"first", Duration::from_millis(400), b"second").await;
         let req = HttpRequest { method: "GET".into(), url, ..Default::default() };
