@@ -8,3 +8,13 @@ tmp/
 
 # Ad-hoc session batch/workflow driver scripts — scratch automation, not repo content
 /.workflows/
+
+# cyrup-ext-subagents runtime state — project-scoped by upstream design (pi-subagents'
+# `.pi-subagents` default, `PROJECT_ARTIFACT_ROOT`; see docs/gap-analysis/09-cyrup-ext-subagents.md
+# §SUBA-072 for why `.cyrup-subagents/` itself is correct-as-is, not a bug) but never repo content —
+# upstream's own artifacts.ts tells consumers to .npmignore/.gitignore the equivalent directory.
+.cyrup-subagents/
+# Per-attempt raw-stdout tee scratch dir (docs/gap-analysis/bugs/SUBA-072-scratch-dir-project-scope.md
+# tracks relocating this under the global `~/.cyrup`/OS-temp root instead of the project cwd; ignored
+# here in the meantime so it does not show up as untracked noise or get committed by accident).
+.cyrup-subagent-scratch/
