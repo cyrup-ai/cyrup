@@ -16,7 +16,7 @@ workspace = true
 # feature exists so `tests/wasm_renderer_screen.rs` — the EXT-006 end-to-end that draws a LIVE WASM
 # guest's serialized widget tree onto real terminal cells — can `#![cfg(feature = "wasm-host")]`
 # itself out of a native-only build instead of failing to compile there.
-default = ["wasm-host"]
+default = ["wasm-host", "scrolling-regions"]
 wasm-host = ["cyrup-ext/wasm-host", "cyrup-session-svc/wasm-host"]
 # Retains every committed line in `AppState::scrollback` for test/inspection assertions. OFF in
 # production: the accumulator costs memory ∝ total session output and is never read outside tests
@@ -25,7 +25,9 @@ wasm-host = ["cyrup-ext/wasm-host", "cyrup-session-svc/wasm-host"]
 # `tests/zzz_scratch_perf_probe.rs` (self-gated) and `cyrup-it`'s `tests/bin/wasm_renderer_screen.rs`
 # (via the dev-dependency edge).
 scrollback-accumulator = []
-# Passthrough for ratatui's DECSTBM `insert_before` (TUI-092-F5). OFF here; flipping it also compiles
+# Passthrough for ratatui's DECSTBM `insert_before` (TUI-092-F5). ON by default: no terminal in
+# cyrup's supported matrix lacks DECSTBM, and this retires ratatui's own documented tmux
+# clear+scroll garbage hazard rather than introducing one. Flipping it also compiles
 # `InlineBackend`'s two `scroll_region_*` delegations (`app/backend.rs`), which are already written
 # behind this same feature so the F5 flip stays the one-line change its own doc promises.
 scrolling-regions = ["ratatui/scrolling-regions"]

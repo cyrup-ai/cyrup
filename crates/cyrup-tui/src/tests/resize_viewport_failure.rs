@@ -109,6 +109,16 @@ impl Backend for FlakyBackend {
     fn flush(&mut self) -> io::Result<()> {
         Backend::flush(&mut self.inner).map_err(infallible)
     }
+
+    #[cfg(feature = "scrolling-regions")]
+    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
+        self.inner.scroll_region_up(region, amount).map_err(infallible)
+    }
+
+    #[cfg(feature = "scrolling-regions")]
+    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
+        self.inner.scroll_region_down(region, amount).map_err(infallible)
+    }
 }
 
 impl RebuildBackend for FlakyBackend {

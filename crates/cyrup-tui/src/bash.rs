@@ -9,6 +9,7 @@
 //! process (`tokio::process`) and feeds it via [`append_output`](BashExecution::append_output) /
 //! [`set_complete`](BashExecution::set_complete), so the same logic is exercised headlessly in tests.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use ratatui::style::Modifier;
@@ -19,6 +20,13 @@ use crate::theme::UiTheme;
 
 /// Preview-line limit when not expanded (`bash-execution.ts:19`, matches tool-execution behavior).
 pub const PREVIEW_LINES: usize = 20;
+
+/// The live block retains at most the LAST `MAX_OUTPUT_LINES` output lines — the same bound the
+/// executor applies to a recorded result ([`cyrup_tools::truncate::DEFAULT_MAX_LINES`]); earlier
+/// lines are counted, not kept (TUI-092 F6). Deliberately equal to
+/// [`BashExecution::context_truncated`]'s own former `MAX_LINES`, so hitting the ring cap and
+/// hitting the context-truncation threshold are the same event.
+const MAX_OUTPUT_LINES: usize = 2000;
 
 /// The lifecycle of a bash run (`bash-execution.ts:24`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -41,8 +49,15 @@ pub struct BashExecution {
     command: String,
     /// `true` for `!!` (excluded from agent context → dim border instead of bash-green).
     excluded: bool,
-    /// Accumulated output, one logical line per element (`outputLines`).
-    output_lines: Vec<String>,
+    /// Accumulated output, one logical line per element (`outputLines`), bounded to the last
+    /// [`MAX_OUTPUT_LINES`] — earlier lines are evicted from the front in [`Self::append_output`]
+    /// and counted in `omitted_lines`, never rendered again (TUI-092 F6). Pure render state:
+    /// nothing persists from here (the session record is built independently by
+    /// `cyrup-session-svc`'s `BashOutputBuffer`), so the bound is display-only.
+    output_lines: VecDeque<String>,
+    /// Count of lines evicted from the front of `output_lines` so far. Rendered as a one-line dim
+    /// omission notice ahead of the retained window whenever non-zero (TUI-092 F6).
+    omitted_lines: usize,
     status: BashStatus,
     /// The exit code once finished (`None` while running or if the process was signalled).
     exit_code: Option<i32>,
@@ -70,7 +85,8 @@ impl BashExecution {
         BashExecution {
             command: command.into(),
             excluded,
-            output_lines: Vec::new(),
+            output_lines: VecDeque::new(),
+            omitted_lines: 0,
             status: BashStatus::Running,
             exit_code: None,
             expanded: false,
@@ -102,7 +118,7 @@ impl BashExecution {
 
     /// The raw accumulated output (`getOutput`), `\n`-joined.
     pub fn output(&self) -> String {
-        self.output_lines.join("\n")
+        self.output_lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n")
     }
 
     /// Set the expansion state (`Ctrl+O`, `setExpanded`).
@@ -121,11 +137,22 @@ impl BashExecution {
     pub fn append_output(&mut self, chunk: &str) {
         let clean = crate::ansi::strip_ansi(chunk).replace("\r\n", "\n").replace('\r', "\n");
         let new_lines: Vec<&str> = clean.split('\n').collect();
-        if let (Some(last), Some(first)) = (self.output_lines.last_mut(), new_lines.first()) {
+        if let (Some(last), Some(first)) = (self.output_lines.back_mut(), new_lines.first()) {
             last.push_str(first);
             self.output_lines.extend(new_lines.iter().skip(1).map(|s| (*s).to_string()));
         } else {
             self.output_lines.extend(new_lines.iter().map(|s| (*s).to_string()));
+        }
+        // TUI-092 F6 — evict after EVERY chunk, so memory is bounded continuously through a
+        // long-running command rather than only at completion. `drain` in one batch rather than a
+        // `pop_front` loop: the replay feeder ([`crate::transcript::Transcript::push_bash_execution`])
+        // hands the entire recorded output to a SINGLE call, where the excess can be thousands of
+        // lines. Front-eviction never touches the back element, so the continuation-merge invariant
+        // above survives it.
+        let excess = self.output_lines.len().saturating_sub(MAX_OUTPUT_LINES);
+        if excess > 0 {
+            self.output_lines.drain(..excess);
+            self.omitted_lines += excess;
         }
     }
 
@@ -176,11 +203,13 @@ impl BashExecution {
     /// boolean needs no tail walk, only the two totals. Byte length is UTF-8 (`Buffer.byteLength`),
     /// which is `str::len()` here.
     fn context_truncated(&self) -> bool {
-        /// `truncate.ts:11` `DEFAULT_MAX_LINES`.
-        const MAX_LINES: usize = 2000;
         /// `truncate.ts:12` `DEFAULT_MAX_BYTES` (50 KB).
         const MAX_BYTES: usize = 50 * 1024;
-        if self.output_lines.len() > MAX_LINES {
+        // TUI-092 F6 — ring eviction already means more logical lines existed than were kept: the
+        // direct replacement for the old `self.output_lines.len() > MAX_LINES` check, which became
+        // unreachable once `output_lines` is itself bounded to `MAX_OUTPUT_LINES` (= that
+        // `MAX_LINES`, `truncate.ts:11` `DEFAULT_MAX_LINES`).
+        if self.omitted_lines > 0 {
             return true;
         }
         // `\n`-joined, matching `getOutput`/`updateDisplay`'s `this.outputLines.join("\n")`.
@@ -254,18 +283,40 @@ impl BashExecution {
         // lines the collapsed form would have hidden. cyrup zeroed it when expanded, so the collapse
         // hint was dead code that could never render.
         let body_width = width.saturating_sub(2).max(1);
-        let joined = self.output_lines.join("\n");
+        let joined = self.output_lines.iter().map(String::as_str).collect::<Vec<_>>().join("\n");
         let vt = crate::chrome::truncate_to_visual_lines(&joined, PREVIEW_LINES, body_width);
         let hidden = vt.skipped;
-        let visible: Vec<String> =
-            if self.expanded { self.output_lines.clone() } else { vt.lines };
-        if !visible.is_empty() {
+        // `visible` must stay `Vec<String>`: the other arm is `vt.lines: Vec<String>`, so a
+        // `VecDeque::clone()` would not unify (TUI-092 F6).
+        let visible: Vec<String> = if self.expanded {
+            self.output_lines.iter().cloned().collect()
+        } else {
+            vt.lines
+        };
+        if !visible.is_empty() || self.omitted_lines > 0 {
             // X3 — the output `Text` is constructed with a **leading newline**:
             // `new Text(`\n${displayText}`, 1, 0)` (`bash-execution.ts:146`), and the collapsed arm
             // feeds `truncateToVisualLines` the same `` `\n${styledOutput}` `` (`:150`, `:156`).
             // `wrapTextWithAnsi` splits on `\n` (`utils.ts:839`), so row 0 is empty — a blank row
-            // between the command and its output that cyrup never emitted.
+            // between the command and its output that cyrup never emitted. ONE shared leading blank
+            // covers the TUI-092 F6 omission notice and the retained window together: they are one
+            // logical `Text` group.
             out.push(Line::default());
+            if self.omitted_lines > 0 {
+                // TUI-092 F6 — one dim row ahead of the retained window, in BOTH the collapsed and
+                // expanded views (this branch runs regardless of `self.expanded`). Span-styled, not
+                // `Line`-styled: [`crate::transcript::wrap_line`] rebuilds wrapped rows from their
+                // cells' styles, so a `Line`-level style would survive only the un-wrapped case —
+                // the same rule as the X13 warning row below.
+                out.extend(crate::transcript::text_lines_of(
+                    &Line::from(vec![Span::styled(
+                        format!("… ({} earlier lines omitted) …", self.omitted_lines),
+                        theme.dim_style(),
+                    )]),
+                    width,
+                    1,
+                ));
+            }
             for line in &visible {
                 // Same `new Text(…, 1, 0)` (`bash-execution.ts:146`/`:156`). The collapsed arm's rows
                 // already fit `body_width` (`truncate_to_visual_lines` wrapped them there), so this
