@@ -66,7 +66,7 @@ fn the_run_loop_is_labelled_so_a_drained_quit_can_exit_it() {
     // The exit is a two-hop chain in the §7.2 skeleton: `dispatch_run_action` maps
     // `AppAction::Quit` to `RunFlow::Break` (run_action.rs), and the select! arm maps
     // `RunFlow::Break` to `break 'run` (run.rs) — still no further draw, still mid-drain.
-    let input = arm_body(APP_SRC, "maybe_in = input.next()", "_ = ctx.spinner.tick()");
+    let input = arm_body(APP_SRC, "maybe_in = input.next()", "swapped = session_swapped");
     assert!(
         input.contains("RunFlow::Break => break 'run"),
         "a drained `Quit` must leave the run loop mid-drain with no further draw:\n{input}"
@@ -88,20 +88,22 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
         1,
         "the events arm must draw exactly once per wakeup:\n{arm}"
     );
-    // One guard brackets the WHOLE drain — the reader thread's wedge detector keeps seeing a
-    // single "events" span, not N — and a closed stream (`continue`) is not named to it.
+    // ONE guard brackets the WHOLE drain — the reader thread's wedge detector keeps seeing a
+    // single "events" span, not N. A closed stream can no longer enter this handler at all: the
+    // `select!` arm's `Some(ev) = events.next()` pattern (`run.rs`) is refutable, so a `None` from
+    // a dead subscription disables the branch instead of matching it — there is no closed-stream
+    // early return to name any more.
     assert_eq!(
         arm.matches("ArmGuard::enter(\"events\")").count(),
         1,
         "exactly one events guard must bracket the whole drain:\n{arm}"
     );
-    let first = pos(arm, "let Some(first) = maybe_ev else { return Ok(RunFlow::Continue) };");
     let guard = pos(arm, "ArmGuard::enter(\"events\")");
     let drain = pos(arm, "events.next().now_or_never()");
     let draw = pos(arm, "draw_synchronized()");
     assert!(
-        first < guard && guard < drain && drain < draw,
-        "let-else, then ONE guard, then the now_or_never drain, then the single draw:\n{arm}"
+        guard < drain && drain < draw,
+        "ONE guard, then the now_or_never drain, then the single draw:\n{arm}"
     );
     // F8 readiness: the two `matches!` booleans are computed ahead of the by-ref ingest call so
     // the by-value swap (which moves `ev`) stays a one-line change.

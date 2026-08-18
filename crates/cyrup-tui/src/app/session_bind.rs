@@ -30,8 +30,14 @@ impl<B: Backend> App<B> {
         // The new session starts idle, so drop the prior turn's grow-only height floor; the next
         // `draw` collapses the viewport to the compact idle region (void-fix).
         self.live_floor = 0;
-        let msg = self.state.pending_swap_status.take().unwrap_or_else(|| "session replaced".into());
-        self.state.transcript.push_status(msg);
+        // Tone is per-command (`/new` alone gets pi's accent `handleClearCommand` receipt;
+        // `/resume`/`/fork`/`/reload`/`/import` and a runtime-side swap with no caption keep
+        // today's dim `showStatus` styling).
+        match self.state.pending_swap_status.take() {
+            Some(SwapCaption::Receipt(text)) => self.state.transcript.push_receipt(text),
+            Some(SwapCaption::Status(text)) => self.state.transcript.push_status(text),
+            None => self.state.transcript.push_status("session replaced"),
+        }
     }
 
     /// Seed the transcript from a session's persisted conversation — Pi's `renderInitialMessages()`

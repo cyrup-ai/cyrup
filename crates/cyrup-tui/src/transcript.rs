@@ -64,6 +64,13 @@ pub enum Entry {
     Tool(ToolRun),
     /// A status / notification line (model change, compaction, queue, …).
     Status(String),
+    /// pi's accent swap receipt: `Spacer(1)` + `Text(fg("accent", …), paddingX 1, paddingY 1)`
+    /// (`interactive-mode.ts:6322-6324`, `handleClearCommand`). `Text.render` emits `paddingY`
+    /// blanks above AND below (`packages/tui/src/components/text.ts:90-98`), which is the whole
+    /// difference from [`Self::Status`] — rows `["", "", " ✓ New session started", ""]` versus
+    /// `Status`'s `["", " msg"]`. `/new` alone uses this; every other session-swap caption stays
+    /// `Status`.
+    Receipt(String),
     /// An `error`-styled notice appended after an assistant turn that did not finish cleanly
     /// (`assistant-message.ts:175-201`): the max-output-token truncation notice, the abort wording,
     /// or `Error: {message}`. Rendered as a blank spacer + one error-coloured line, matching Pi's
@@ -1026,6 +1033,13 @@ impl TranscriptView {
     /// Record a status / notification line.
     pub fn push_status(&mut self, text: impl Into<String>) {
         self.pending.push(Entry::Status(text.into()));
+    }
+
+    /// Record pi's accent swap receipt (`handleClearCommand`, `interactive-mode.ts:6316-6329`) —
+    /// `/new`'s `✓ New session started`. Distinct from [`push_status`](Self::push_status): the
+    /// accent colour and the trailing blank ([`Entry::Receipt`]).
+    pub fn push_receipt(&mut self, text: impl Into<String>) {
+        self.pending.push(Entry::Receipt(text.into()));
     }
 
     /// Push the startup loaded-resources / diagnostics panel (Pi `showLoadedResources`,
@@ -3108,6 +3122,18 @@ pub(crate) fn entry_lines(
             // `chatContainer.children.length` test.
             let mut out = vec![Line::default()];
             out.extend(text_lines(text, width, 1, theme.dim_style()));
+            out
+        }
+        Entry::Receipt(text) => {
+            // pi's `handleClearCommand` (`interactive-mode.ts:6316-6329`): `Spacer(1)` +
+            // `Text(theme.fg("accent", message), paddingX=1, paddingY=1)`. `Text.render` emits
+            // `paddingY` blanks ABOVE **and** below (`packages/tui/src/components/text.ts:90-98`),
+            // so the rows are `["", "", " ✓ New session started", ""]` — the leading `Spacer(1)`
+            // plus the `Text`'s own leading blank, the accent-styled line, then the trailing blank
+            // — distinct from [`Entry::Status`]'s `["", " msg"]`.
+            let mut out = vec![Line::default(), Line::default()];
+            out.extend(text_lines(text, width, 1, theme.accent_style()));
+            out.push(Line::default());
             out
         }
         Entry::Warning(text) => {

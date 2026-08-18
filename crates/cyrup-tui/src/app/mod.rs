@@ -93,7 +93,7 @@ pub(crate) use crossterm::resolve_external_editor;
 #[cfg(test)]
 pub(crate) use crossterm::run_editor_over_file;
 pub use tree_nav::tree_node_from_dag;
-pub use state::{ActiveSelector, AppState, ShortcutSpec};
+pub use state::{ActiveSelector, AppState, ShortcutSpec, SwapCaption};
 pub(crate) use state::{
     BRANCH_SUMMARY_CUSTOM, BRANCH_SUMMARY_NONE, BRANCH_SUMMARY_YES, PendingTreeNav,
     PendingUiReply, countdown_title, default_ui_reply,
