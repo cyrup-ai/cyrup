@@ -195,7 +195,16 @@ impl App<InlineBackend<Stdout>> {
         ctx: &mut RunCtx,
         maybe_in: Option<InputEvent>,
         input: &mut EventStream<InputEvent>,
+        events: &mut EventStream<AgentSessionEvent>,
     ) -> Result<RunFlow, TuiError> {
+                    // SEAM-022, `rpc.rs:836-844`: a replacement may have landed since this arm last
+                    // ran (the `session_swapped` arm settles anything caused BY one of the keys this
+                    // very call is about to service). Settle it BEFORE the keys are serviced, so a
+                    // submitted prompt reaches the session the runtime is actually serving and never
+                    // the disposed one.
+                    if ctx.gen_rx.as_mut().is_some_and(|rx| rx.has_changed().unwrap_or(false)) {
+                        self.on_session_swapped(ctx, events).await?;
+                    }
                     let _arm = ArmGuard::enter("input");
                     let Some(first) = maybe_in else { return Ok(RunFlow::Break) };
                     // TUI-092 F3 — drain every queued key BEFORE drawing: key auto-repeat (30–60/s)
@@ -233,10 +242,9 @@ impl App<InlineBackend<Stdout>> {
     pub(crate) async fn on_session_event(
         &mut self,
         ctx: &mut RunCtx,
-        maybe_ev: Option<AgentSessionEvent>,
+        ev: AgentSessionEvent,
         events: &mut EventStream<AgentSessionEvent>,
     ) -> Result<RunFlow, TuiError> {
-                    let Some(first) = maybe_ev else { return Ok(RunFlow::Continue) };
                     // TUI-092 — names this arm for its duration; the input reader's wedge detector
                     // reads it, and an overrun is reported on the next healthy iteration. Nothing is
                     // interrupted: a `tokio::time::timeout` here would be inert against the real
@@ -250,7 +258,13 @@ impl App<InlineBackend<Stdout>> {
                     // channel's CHANNEL_CAPACITY (1024) + awaited sends; backstopped by ARM_BUDGET.
                     // `now_or_never` polls once and drops the `Next` future — cancel-safe on tokio
                     // mpsc, so a pending poll loses nothing.
-                    let mut pending = std::collections::VecDeque::from([first]);
+                    //
+                    // A closed stream can no longer enter this handler at all: `select!`'s
+                    // `Some(ev) = events.next()` pattern (`run.rs`) is refutable, so a `None` from a
+                    // dead subscription (every session swap ends the old one, `subscriber.rs:89-93`)
+                    // disables the branch instead of matching it — there is no seed to drain, and no
+                    // early-return path needed for one.
+                    let mut pending = std::collections::VecDeque::from([ev]);
                     while let Some(Some(ev)) = events.next().now_or_never() {
                         pending.push_back(ev);
                     }

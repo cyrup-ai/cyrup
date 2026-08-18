@@ -422,15 +422,15 @@ impl<B: Backend> App<B> {
                     self.state.transcript.push_status(format!("entry appended → {ty}"));
                 }
             }
-            // Session lifecycle (runtime replacement, arch-11 §3.4): surface a status line. The TUI
-            // re-subscribes to the runtime's new generation on `SessionReplaced` (R-11-021); the
-            // re-subscription itself is driven by the app's runtime watch, not this transcript hook.
-            AgentSessionEvent::SessionStart { reason, .. } => {
-                self.state.transcript.push_status(format!("session started ({reason})"));
-            }
-            AgentSessionEvent::SessionShutdown { reason } => {
-                self.state.transcript.push_status(format!("session shutdown ({reason})"));
-            }
+            // pi routes `session_start`/`session_shutdown` to EXTENSIONS ONLY — declared
+            // `extensions/types.ts:563`/`:632`, subscribed via `on("session_start", …)` at
+            // `:1221`/`:1234`, emitted solely to `extensionRunner`
+            // (`agent-session-runtime.ts:172`, `:400`; `agent-session.ts:2706`, `:2725`;
+            // `extensions/runner.ts:189-196`). The interactive UI never receives them, so it
+            // renders nothing — no test asserts these strings (verified). cyrup used to push a
+            // status line for each; the `session shutdown (new)` banner a frozen `/new` left on
+            // screen was that invention. Kept as documented no-op arms for match exhaustiveness.
+            AgentSessionEvent::SessionStart { .. } | AgentSessionEvent::SessionShutdown { .. } => {}
             AgentSessionEvent::SessionReplaced { .. } => {
                 self.state.status.set_streaming(false);
                 self.state.indicator.idle();

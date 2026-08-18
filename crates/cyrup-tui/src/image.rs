@@ -16,15 +16,31 @@
 //! `▀` cells with fg/bg colors into the frame buffer, so it renders to **any** backend — including
 //! `ratatui::backend::TestBackend` — which is what makes the inline-image path snapshot-testable.
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+
 use image::DynamicImage;
 use ratatui::layout::{Rect, Size};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use ratatui_image::picker::{Picker, ProtocolType};
+use ratatui_image::protocol::Protocol;
 use ratatui_image::{FontSize, Image, Resize};
 
 use crate::theme::UiTheme;
+
+/// Identifies one attachment-strip image for protocol-cache purposes: its display label plus
+/// source pixel dimensions (the same identity [`ImageBlock`]'s `PartialEq` already uses) and the
+/// exact terminal-cell size it was last encoded at. Two blocks with the same label+dimensions
+/// but different target sizes (e.g. after a terminal resize) get distinct entries — resize changes
+/// what `new_protocol` must produce.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct ImageCacheKey {
+    label: String,
+    dimensions: (u32, u32),
+    size: (u16, u16),
+}
 
 /// The terminal's image-protocol capability + font-cell geometry (`terminal-image.ts` probe).
 ///
@@ -33,6 +49,13 @@ use crate::theme::UiTheme;
 /// always-available [`ProtocolType::Halfblocks`] raster ([`ImageRenderer::halfblocks`]).
 pub struct ImageRenderer {
     picker: Picker,
+    /// Built protocols keyed by (image identity, target size) — building one is a raster clone +
+    /// resize + encode, so it happens on CHANGE, not per frame (TUI-092 F7). One entry per
+    /// currently-pending attachment; `render_images` calls `render` through `&AppState`, so this
+    /// needs interior mutability. Entries for images no longer in `pending_images` simply stop
+    /// being read once `render` is no longer called with their key (`clear_images`,
+    /// `app/shell.rs`), so there is no separate invalidation hook to keep in sync.
+    protocol_cache: Mutex<HashMap<ImageCacheKey, Protocol>>,
 }
 
 impl Default for ImageRenderer {
@@ -47,7 +70,7 @@ impl ImageRenderer {
     /// A renderer that always uses the Unicode half-block raster (`terminal-image.ts` fallback). Needs
     /// no terminal query — used by tests and as the safe default.
     pub fn halfblocks() -> Self {
-        ImageRenderer { picker: Picker::halfblocks() }
+        ImageRenderer { picker: Picker::halfblocks(), protocol_cache: Mutex::new(HashMap::new()) }
     }
 
     /// Choose the image protocol from the **environment**, not an APC round-trip (feature #7; Pi
@@ -104,7 +127,7 @@ impl ImageRenderer {
             Some(ImageProtocol::Iterm2) => ProtocolType::Iterm2,
             None => ProtocolType::Halfblocks,
         });
-        ImageRenderer { picker }
+        ImageRenderer { picker, protocol_cache: Mutex::new(HashMap::new()) }
     }
 
     /// The font cell the geometry is computed against, in pixels (`(width, height)`) — the measured
@@ -170,11 +193,35 @@ impl ImageRenderer {
             return;
         }
         let size = Size::new(area.width, area.height);
-        match self.picker.new_protocol(block.image.clone(), size, Resize::Fit(None)) {
-            Ok(protocol) => frame.render_widget(Image::new(&protocol).allow_clipping(true), area),
-            // Encoding can fail on a degenerate area / unsupported pixel format — never panic, fall
-            // back to the placeholder so the message still renders.
-            Err(_) => frame.render_widget(Paragraph::new(block.placeholder_line(theme)), area),
+        let key = ImageCacheKey {
+            label: block.label().to_string(),
+            dimensions: block.dimensions(),
+            size: (area.width, area.height),
+        };
+        // TUI-092 F7 — memoise the built protocol keyed on (image identity, target size), so an
+        // attachment redrawn at an unchanged key across consecutive frames costs zero further
+        // raster clones/resizes/encodes. A poisoned lock (a prior panic mid-render) degrades to an
+        // empty-cache read rather than propagating: a stale/missing entry only costs one rebuild,
+        // never correctness (no-panic policy — this module must not `.unwrap()` a lock).
+        let mut cache = match self.protocol_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if !cache.contains_key(&key) {
+            match self.picker.new_protocol(block.image.clone(), size, Resize::Fit(None)) {
+                Ok(protocol) => {
+                    cache.insert(key.clone(), protocol);
+                }
+                // Encoding can fail on a degenerate area / unsupported pixel format — never panic,
+                // fall back to the placeholder so the message still renders.
+                Err(_) => {
+                    frame.render_widget(Paragraph::new(block.placeholder_line(theme)), area);
+                    return;
+                }
+            }
+        }
+        if let Some(protocol) = cache.get(&key) {
+            frame.render_widget(Image::new(protocol).allow_clipping(true), area);
         }
     }
 }

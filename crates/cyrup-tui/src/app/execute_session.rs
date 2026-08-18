@@ -223,7 +223,8 @@ impl<B: Backend> App<B> {
                 // then `SessionStart` to every live extension; see the `/fork` arm for the
                 // self-deadlock awaiting it on this task would reintroduce.
                 Some(rt) => {
-                    self.state.pending_swap_status = Some("started a new session".into());
+                    self.state.pending_swap_status =
+                        Some(SwapCaption::Receipt("\u{2713} New session started".into()));
                     let rt = Arc::clone(rt);
                     self.dispatch_lifecycle(async move {
                         LifecycleOutcome(match rt.new_session().await {
@@ -253,11 +254,11 @@ impl<B: Backend> App<B> {
                     // `/` menu's own help string for the command was a second, different wording.
                     // The `; saved project trust` variant is TUI-037's — it needs the implicit-trust
                     // write, which lives in `crates/cyrup`.
-                    self.state.pending_swap_status = Some(
+                    self.state.pending_swap_status = Some(SwapCaption::Status(
                         "Reloaded keybindings, extensions, skills, prompts, themes, and \
                          context files"
                             .into(),
-                    );
+                    ));
                     let rt = Arc::clone(rt);
                     self.dispatch_lifecycle(async move {
                         LifecycleOutcome(match rt.reload(None).await {
@@ -281,7 +282,8 @@ impl<B: Backend> App<B> {
                 // to every live extension; see the `/fork` arm for the self-deadlock awaiting it on
                 // this task would reintroduce.
                 (Some(rt), Some(path)) => {
-                    self.state.pending_swap_status = Some(format!("imported session {path}"));
+                    self.state.pending_swap_status =
+                        Some(SwapCaption::Status(format!("imported session {path}")));
                     let rt = Arc::clone(rt);
                     self.dispatch_lifecycle(async move {
                         LifecycleOutcome(match rt.import_from_jsonl(path, None).await {
@@ -334,7 +336,8 @@ impl<B: Backend> App<B> {
                     // every live extension, and a guest hook that opens a `ui.*` dialog parks its
                     // task until this loop answers `ui_rx`. Awaited here that is a self-deadlock.
                     Some(rt) => {
-                        self.state.pending_swap_status = Some("forked from message".into());
+                        self.state.pending_swap_status =
+                            Some(SwapCaption::Status("forked from message".into()));
                         let rt = Arc::clone(rt);
                         self.dispatch_lifecycle(async move {
                             LifecycleOutcome(match rt.fork(entry, ForkPosition::Before).await {
@@ -365,7 +368,8 @@ impl<B: Backend> App<B> {
                     // `HostEvent::SessionBeforeSwitch` to every live extension; see the `/fork` arm
                     // above for the deadlock awaiting it here would reintroduce.
                     Some(rt) => {
-                        self.state.pending_swap_status = Some(format!("resumed {value}"));
+                        self.state.pending_swap_status =
+                            Some(SwapCaption::Status(format!("resumed {value}")));
                         let rt = Arc::clone(rt);
                         self.dispatch_lifecycle(async move {
                             LifecycleOutcome(match rt.switch_session(value).await {

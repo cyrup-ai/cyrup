@@ -93,8 +93,8 @@ async fn new_session_command_swaps_and_rebinds_the_ui() {
     app.draw().unwrap();
     let scrollback = app.scrollback_text();
     assert!(
-        scrollback.contains("started a new session"),
-        "rebind surfaces the swap status: {scrollback}"
+        scrollback.contains("\u{2713} New session started"),
+        "rebind surfaces the swap receipt: {scrollback}"
     );
     assert!(app.active_selector_kind().is_none(), "rebind clears any open selector");
 }

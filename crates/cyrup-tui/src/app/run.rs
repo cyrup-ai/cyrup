@@ -275,11 +275,26 @@ impl App<InlineBackend<Stdout>> {
                 // `MissedTickBehavior::Skip` re-arms a skipped tick, and this arm ends in
                 // `draw_synchronized()` anyway — so servicing a key repaints the frame the spinner
                 // would have drawn.
-                maybe_in = input.next() => match self.on_input_event(&mut ctx, maybe_in, &mut input).await? {
+                maybe_in = input.next() => match self.on_input_event(&mut ctx, maybe_in, &mut input, &mut events).await? {
                     RunFlow::Break => break 'run,
                     RunFlow::ReturnOk => return Ok(()),
                     RunFlow::Continue => {}
                 },
+                // POSITION #3 IS LOAD-BEARING. This arm used to be LAST, below `events.next()` —
+                // and `Fanout::invalidate` (`subscriber.rs:89-93`) drops every sender on a swap, so
+                // that arm went permanently `Ready(None)`. Under `biased;` an irrefutable
+                // `maybe_ev = events.next()` binding matched that `None` and won every poll, so this
+                // arm was never reached: no re-subscribe, no rebind, the loop stayed bound to the
+                // DISPOSED session (the TUI up, dead — `/new` prints its banner and nothing after it
+                // ever responds) while one worker hot-spun at 100%. The rule is now **cancel, input,
+                // rebind, then everything else** — the rebind must outrank every arm that can be
+                // ready on every poll (the tickers as well as a closed events stream). Pinned by
+                // `run_loop_swap_arm_reachable.rs`; do NOT "tidy" it back down.
+                swapped = session_swapped => {
+                    if swapped {
+                        self.on_session_swapped(&mut ctx, &mut events).await?;
+                    }
+                }
                 _ = ctx.spinner.tick(),
                     if self.state.indicator.is_active()
                         || self.state.transcript.bash_running() =>
@@ -317,162 +332,21 @@ impl App<InlineBackend<Stdout>> {
                 Some(theme) = theme_switch_rx.recv() => self.on_theme_switch(&mut ctx, theme).await?,
                 Some(msg) = login_rx.recv() => self.on_login_msg(msg)?,
                 Some(msg) = tree_nav_rx.recv() => self.on_tree_nav_msg(&mut ctx, msg).await?,
-                maybe_ev = events.next() => match self.on_session_event(&mut ctx, maybe_ev, &mut events).await? {
+                // A refutable pattern: a `None` from a closed stream does NOT match `Some(ev)`, so
+                // `select!` DISABLES this branch and keeps waiting on the others instead of
+                // completing forever. `Fanout::invalidate` (`subscriber.rs:89-93`) drops every
+                // sender on a session-swap, so this stream goes permanently `Ready(None)` on every
+                // replacement path (`/new`, `/resume`, `/fork`, `/reload`, `/import`, and a
+                // runtime-side `SessionReplaced`) — with the old irrefutable `maybe_ev =` binding a
+                // dead stream made THIS arm ready forever and, under `biased;`, starved every arm
+                // below it. The swap arm above re-subscribes `events` to the new session's stream
+                // before this arm is polled again.
+                Some(ev) = events.next() => match self.on_session_event(&mut ctx, ev, &mut events).await? {
                     RunFlow::Break => break 'run,
                     RunFlow::ReturnOk => return Ok(()),
                     RunFlow::Continue => {}
                 },
                 ok = theme_changed => self.on_theme_changed(ok, &theme_rx)?,
-                swapped = session_swapped => {
-                    let _arm = ArmGuard::enter("session_swapped");
-                    // A runtime replacement (a `/new`/`/resume`/`/fork`/`/reload`/`/import` op, or a
-                    // runtime-side `SessionReplaced`, R-11-021) installed a new active session: drop
-                    // the stale subscription, subscribe the NEW session's event stream, and re-bind
-                    // the UI. Honors a runtime-driven swap identically to a UI-driven one.
-                    if swapped && let Some(rt) = ctx.runtime.as_ref() {
-                        let new_session = rt.session().await;
-                        events = new_session.subscribe();
-                        ctx.session = new_session;
-                        self.rebind_session();
-                        // TUI-030 — `rebind_session` ran `reset_extension_ui`, whose
-                        // `reset_extension_working_state` drops the outgoing extension's
-                        // `setWorkingIndicator` options (pi's `this.setWorkingIndicator()` with no
-                        // argument, `interactive-mode.ts:2212` @v0.84.2). Upstream that call
-                        // re-arms `Loader`'s own `setInterval` back to `DEFAULT_INTERVAL_MS`
-                        // (`loader.ts:67-69` → `:77-80`); cyrup has no per-indicator timer — the run
-                        // loop's single tick IS the animation clock — so the period has to be
-                        // re-read here, exactly as the `SetWorkingIndicator` effect arm above
-                        // re-reads it. Without this a guest that asked for `intervalMs: 1000` would
-                        // leave the NEXT session's built-in Braille spinner sampled once a second.
-                        ctx.spinner = tokio::time::interval(self.state.indicator.spinner_period());
-                        ctx.spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        // Pi re-titles the window from the newly bound session (`bindSession` →
-                        // `updateTerminalTitle`, interactive-mode.ts:1761): a `/new`, `/resume` or
-                        // `/fork` almost always changes the name, and a swap must never leave the
-                        // previous session's name in the tab. The cwd is the runtime's factory base
-                        // and does not move with the swap, so only the name is re-read.
-                        self.state.status.set_session_name(ctx.session.session_name().await);
-                        if let Some(title) = self.update_terminal_title() {
-                            write_terminal_title(&title);
-                        }
-                        // The replacement session brings its own `AuthStore` (a `/resume` of a
-                        // session recorded under a different agent dir reads a different
-                        // `auth.json`), so the cached snapshot the ` (sub)` marker answers from is
-                        // re-read here for the same reason the ui sinks are re-installed.
-                        self.refresh_auth_snapshot(&ctx.session).await;
-                        // …and the context segment, which is a property of the NEW branch's entries
-                        // and its model's window (`footer.ts:108-111`).
-                        self.refresh_context_usage(&ctx.session).await;
-                        // The swapped-in session owns a fresh `LiveHostServices`; re-install the ui
-                        // sink so a post-swap guest dialog still reaches this loop (L4 review §2.1,
-                        // same re-install this run loop's `AppAction::Command` rebind mirrors from
-                        // `crates/cyrup-modes/src/rpc.rs`'s `run_rpc`).
-                        Self::install_ui_sinks(
-                            &ctx.session.services().host_services,
-                            ctx.ui_tx.clone(),
-                            ctx.ui_effect_tx.clone(),
-                        );
-                        Self::install_overlay_sink(
-                            &ctx.session.services().host_services,
-                            ctx.overlay_tx.clone(),
-                        );
-                        // ...and the two read-back seams (SEAM-T01/T02). The theme half additionally
-                        // has to be REBUILT rather than merely re-attached: it answers
-                        // `getAllThemes`/`getTheme` out of the session's resource snapshot, and a
-                        // swap (`/reload` above all) is exactly when a newly discovered theme
-                        // appears — pi re-runs `setRegisteredThemes(resourceLoader.getThemes())` on
-                        // the same events (`interactive-mode.ts:1910`, `:5787`).
-                        self.install_extension_readbacks(
-                            &ctx.session.services().host_services,
-                            Arc::clone(&ctx.session.services().resources),
-                            ctx.theme_switch_tx.clone(),
-                        );
-                        // ...and the fault listener, whose `ExtensionHost` is likewise brand new on
-                        // the swapped-in session (Pi re-binds `onError` from `rebindSession`, and
-                        // `crates/cyrup-modes/src/rpc.rs`'s `rebind_session` does the same).
-                        Self::install_error_listener(
-                            &ctx.session.services().ext_host,
-                            ctx.ext_error_tx.clone(),
-                        );
-                        // ...and the same for the `/` menu: a replacement session can load a
-                        // DIFFERENT extension set (`/reload` exists precisely to change it), so a
-                        // registry built from the previous session's catalog would be stale.
-                        self.state.editor.set_registry(
-                            crate::commands::CommandRegistry::with_dynamic(
-                                crate::commands::dynamic_commands_from_catalog_gated(
-                                    &ctx.session.slash_command_catalog(),
-                                    ctx.session
-                                        .services()
-                                        .settings
-                                        .effective()
-                                        .enable_skill_commands(),
-                                ),
-                            ),
-                        );
-                        // `rebind_session` reset the transcript to Pi's default pad; re-read the
-                        // swapped-in session's `outputPad` so a configured value survives the swap.
-                        self.state.transcript.set_output_pad(
-                            ctx.session.services().settings.effective().output_pad().max(0) as usize,
-                        );
-                        self.state.transcript.set_hide_thinking_block(
-                            ctx.session.services().settings.effective().hide_thinking_block(),
-                        );
-                        let eff = ctx.session.services().settings.effective();
-                        self.state.show_images = eff.show_images();
-                        self.state.transcript.set_show_images(self.state.show_images);
-                        // Re-read the progress gate for the swapped-in session's settings, for the
-                        // same reason as the image rows beside it. Any indicator the OUTGOING
-                        // session lit is dropped with its state; the swap arrives between turns.
-                        self.state.terminal_progress =
-                            crate::TerminalProgress::with_enabled(eff.show_terminal_progress());
-                        self.state.transcript.set_image_width_cells(
-                            eff.image_width_cells().clamp(1, u16::MAX as i64) as u16,
-                        );
-                        // `editorPaddingX` / `showHardwareCursor` are per-settings-layer, and a swap
-                        // can move the project scope (`/resume` of a session recorded elsewhere), so
-                        // re-apply both — Pi does exactly this from `rebindSession`
-                        // (`interactive-mode.ts:1721-1732`: `ui.setShowHardwareCursor(...)` then
-                        // `defaultEditor.setPaddingX(getEditorPaddingX())`).
-                        self.state.editor.set_padding_x(eff.editor_padding_x());
-                        self.state.editor.set_show_hardware_cursor(
-                            eff.show_hardware_cursor(&cyrup_session_svc::EnvVars::from_process()),
-                        );
-                        // TUI-009 — same liveness as the rows above: a swap can move the settings
-                        // scope, so re-read `doubleEscapeAction` for the swapped-in session.
-                        self.state.double_escape_action = eff.double_escape_action();
-        // TUI-032 — the `Warnings` submenu is built from this cache.
-        self.state.warn_anthropic_extra_usage =
-            eff.warnings().anthropic_extra_usage.unwrap_or(true);
-                                        // TUI-003: seed the view from the swapped-in session's conversation (Pi
-                        // re-runs `renderInitialMessages()` after a tree/fork navigation,
-                        // interactive-mode.ts:1737-1742). Without this a `/resume`, `/fork` or
-                        // `/import` leaves the user staring at an empty transcript while the
-                        // session file holds the whole history. `raw_context_messages` (NOT
-                        // `messages()`) is Pi's `buildContextEntries()` projection: roles intact,
-                        // so a compaction/branch summary, a `custom` message and a `!` run each
-                        // reach their own component instead of replaying as user prose.
-                        let restored = ctx.session.raw_context_messages().await;
-                        if !restored.is_empty() {
-                            // X11 — with extensions: the swapped-in session brings its own host,
-                            // and Pi resolves `getMessageRenderer` on the replay walk too
-                            // (`interactive-mode.ts:3471`).
-                            let ext_host = ctx.session.services().ext_host.clone();
-                            self.replay_session_with_extensions(&restored, &ext_host).await;
-                        }
-                        // TUI-N04 — the same statement `renderInitialMessages()` runs after its
-                        // replay (`interactive-mode.ts:3485`), and it must run here too: a
-                        // `/resume` of a session recorded in a DIFFERENT project swaps the cwd and
-                        // the trust decision with it, so the banner's answer changes on the swap.
-                        self.render_project_trust_warning_if_needed(&ctx.session);
-                        // The swapped-in session owns a fresh extension host; re-source its
-                        // registered shortcuts (R-08-017) so a post-swap press still routes.
-                        // EXT-040: `shortcut_specs()` carries the description `/hotkeys` renders;
-                        // `shortcut_keys()` drops it.
-                        let shortcuts = ctx.session.services().ext_host.shortcut_specs();
-                        self.state.set_extension_shortcuts(shortcuts);
-                        self.draw_synchronized()?;
-                    }
-                }
             }
             if self.state.should_quit {
                 break;

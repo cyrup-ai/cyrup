@@ -1,5 +1,17 @@
 use super::*;
 
+/// The two shapes pi renders a post-swap receipt in — the caption a session-lifecycle command
+/// sets OPTIMISTICALLY before the swap, consumed by [`App::rebind_session`] once the runtime's
+/// generation bump lands.
+pub enum SwapCaption {
+    /// `showStatus` — `Spacer(1)` + `Text(fg("dim", …), 1, 0)` (`interactive-mode.ts:3483-3496`).
+    /// `/resume`, `/fork`, `/reload`, `/import` and a runtime-side swap all use this dim tone.
+    Status(String),
+    /// `handleClearCommand`'s accent receipt — `Spacer(1)` + `Text(fg("accent", …), paddingX 1,
+    /// paddingY 1)` (`interactive-mode.ts:6322-6324`). `/new` alone uses this tone.
+    Receipt(String),
+}
+
 /// All retained UI state (the data half of the `state -> frame` split).
 pub struct AppState {
     pub transcript: TranscriptView,
@@ -115,11 +127,11 @@ pub struct AppState {
     /// submenu, which is opened from a selector outcome with no session in hand. Pi's default is
     /// `true` (`settings-selector.ts:134` `(this.state.anthropicExtraUsage ?? true)`). TUI-032.
     pub warn_anthropic_extra_usage: bool,
-    /// A status line to show **after** the next runtime session-swap re-binds the UI (the swap
+    /// A status/receipt to show **after** the next runtime session-swap re-binds the UI (the swap
     /// resets the transcript, so a pre-swap status would be wiped). Set by the session-lifecycle
     /// command handlers (`/new`/`/resume`/`/fork`/`/reload`/`/import`); consumed by
     /// [`App::rebind_session`] once the generation bump fires and the new session is installed.
-    pub pending_swap_status: Option<String>,
+    pub pending_swap_status: Option<SwapCaption>,
     /// Committed lines already emitted to native scrollback via `Terminal::insert_before`
     /// (R-ARCH-TUI-003). Test/inspection only — OFF in production builds (TUI-092 F1).
     #[cfg(any(test, feature = "scrollback-accumulator"))]
