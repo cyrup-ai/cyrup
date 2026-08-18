@@ -327,69 +327,12 @@ mod tests {
         assert_eq!(out.host_str(), Some("fallback"));
     }
 
-    // ------------------------------------------------------------------ PROV-047
-
-    /// The `httpProxy` SETTING must reach the resolver, not just the `provider_env` overlay the
-    /// streaming APIs happen to receive. Upstream this is automatic because
-    /// `applyHttpProxySettings` writes `process.env.HTTP_PROXY`
-    /// (`coding-agent/src/core/http-dispatcher.ts:43-48`); here it is
-    /// `sse::configure_http_proxy`, consulted at the same layer.
-    ///
-    /// These four assertions run as one test on purpose: the setting is process-global, so two
-    /// `#[test]`s writing it would race inside the shared test binary. The same reason is why the
-    /// test takes [`crate::tests::proxy_setting::guard`] — other modules write the setting too
-    /// (`tests/oauth_http_proxy.rs`) — and why the clear happens in
-    /// [`crate::tests::proxy_setting::ClearOnDrop`] rather than only on the success path below: a
-    /// panicking assertion here previously left `configure_http_proxy` set for the remainder of the
-    /// test binary, silently rerouting every later loopback test in this crate.
-    #[tokio::test]
-    async fn the_http_proxy_setting_reaches_the_resolver_and_yields_to_everything_above_it() {
-        let _serial = crate::tests::proxy_setting::guard().await;
-        let _restore = crate::tests::proxy_setting::ClearOnDrop;
-        let none = ctx([]);
-
-        // (1) Unset ⇒ unchanged behaviour: no setting, no ambient var, no proxy.
-        crate::stream::sse::configure_http_proxy(None);
-        assert!(
-            resolve_http_proxy_url_for_target("https://api.example.com/", &none, None)
-                .await
-                .expect("ok")
-                .is_none()
-        );
-
-        // (2) Set ⇒ the request that previously bypassed the proxy now uses it. This is the
-        // whole of PROV-047's user-visible failure: OAuth login on a proxy-only network.
-        crate::stream::sse::configure_http_proxy(Some("http://corp-proxy:3128".to_string()));
-        let out = resolve_http_proxy_url_for_target("https://api.example.com/", &none, None)
-            .await
-            .expect("ok")
-            .expect("the configured proxy applies");
-        assert_eq!(out.host_str(), Some("corp-proxy"));
-        assert_eq!(out.port(), Some(3128));
-
-        // (3) `??=` — an ambient variable WINS over the setting.
-        let ambient = ctx([("https_proxy", "http://ambient:9")]);
-        let out = resolve_http_proxy_url_for_target("https://api.example.com/", &ambient, None)
-            .await
-            .expect("ok")
-            .expect("proxy");
-        assert_eq!(
-            out.host_str(),
-            Some("ambient"),
-            "process.env.HTTPS_PROXY ??= proxy does not overwrite an existing value"
-        );
-
-        // (4) `NO_PROXY` still bypasses — the setting is a value for HTTP(S)_PROXY, not an
-        // override of the resolver. PROV-047's negative Verify clause.
-        let bypass = ctx([("no_proxy", "api.example.com")]);
-        assert!(
-            resolve_http_proxy_url_for_target("https://api.example.com/", &bypass, None)
-                .await
-                .expect("ok")
-                .is_none(),
-            "NO_PROXY must beat the configured setting"
-        );
-
-        crate::stream::sse::configure_http_proxy(None);
-    }
+    // PROV-047's `the_http_proxy_setting_reaches_the_resolver_and_yields_to_everything_above_it`
+    // test used to live here. It mutates `crate::stream::sse`'s process-global
+    // `HTTP_PROXY_SETTING`, which makes it a hazard to every OTHER concurrently-running test in
+    // this crate's shared unit-test binary that builds a real client without its own explicit
+    // `http_proxy`/`https_proxy` override (most of this crate's loopback-mock tests) — the same
+    // class of bug documented in `crates/cyrup-provider/tests/oauth_http_proxy.rs`'s module doc
+    // comment, which is where this test was moved to (a separate `cargo test` OS process, so the
+    // global mutation cannot leak into this binary at all). See that file for the full test.
 }
