@@ -114,6 +114,7 @@ Dependencies point downward only. `cyrup-core` depends on nothing in-workspace, 
 | `cyrup-permission-system` | runtime allow / ask / deny policy over every tool call |
 | `cyrup-intercom` | Unix-socket broker for supervisor↔subagent coordination |
 | `cyrup-flux` | the Flux structured development pipeline, on by default |
+| `cyrup-mcp` | MCP client — servers, tools, OAuth, and the `/mcp` surface (in progress) |
 | `cyrup-ext-sdk` | guest SDK for authoring extensions (`wasm32-wasip2`) |
 | `cyrup-test-support` | faux provider + differential / interop / golden harnesses |
 | `cyrup-it` | the integration-test harness crate (gated, see below) |
@@ -211,8 +212,12 @@ Currently open, in brief:
 - **The three remaining highs are all one thing:** stale provider-catalog data (`PROV-054`/`055`/
   `056` — `xai/grok-4.5` on the wrong wire API, an `opencode` header pi suppresses, two `kimi-coding`
   wire divergences). They close together through a catalog regeneration, not as three hand edits.
-- **MCP is not built.** There is no `crates/cyrup-mcp`; `docs/gap-analysis/13*` scopes the port of
-  `pi-mcp-adapter` and is excluded from every count above, including the 237.
+- **MCP is partially built.** `crates/cyrup-mcp` now exists and carries the spine of the
+  `pi-mcp-adapter` port — activation, config, server lifecycle, the rmcp client and tool
+  registration. `docs/gap-analysis/13*` enumerates the port as **425 units**; units not yet written
+  carry a `TODO(MCP-NNN)` in the source against their id. The 13\* series is excluded from every
+  count above, including the 237, because it tracks a port in flight rather than a gap in a shipped
+  crate.
 - Three of pi's built-in providers — `qwen-token-plan`, `qwen-token-plan-cn`, `radius` — are not
   registered (`PROV-014`). A guard test asserts their absence so a half-finished provider cannot
   silently answer requests it cannot serve.
@@ -224,9 +229,9 @@ Currently open, in brief:
 
 ## Upstreams
 
-cyrup tracks four TypeScript projects. The core is [`earendil-works/pi`](https://github.com/earendil-works/pi);
-three optional subsystems follow standalone Pi extensions, since Pi core deliberately ships no
-permission system of its own.
+cyrup tracks five TypeScript projects. The core is [`earendil-works/pi`](https://github.com/earendil-works/pi);
+four optional subsystems follow standalone Pi extensions, since Pi core deliberately ships no
+permission system and no MCP client of its own.
 
 | upstream | followed by | ported baseline | latest tag |
 |---|---|---|---|
@@ -234,6 +239,7 @@ permission system of its own.
 | `nicobailon/pi-subagents` | `cyrup-ext-subagents` | ~v0.43.0 *(inferred — the crate records no version string)* | v0.49.0 |
 | `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.7.1, with every v0.8.0 behavioural change absorbed | v0.8.0 |
 | `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | v0.10.1 |
+| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.26.0 *(port in flight — see `docs/gap-analysis/13*`)* | v2.26.0 |
 
 The right-hand column moves without warning; re-measure it with `git tag --sort=-v:refname` rather
 than trusting this table. The window between the two columns is measured and filed, not ignored —

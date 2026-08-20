@@ -1,10 +1,10 @@
 # Acknowledgements
 
-cyrup exists because four TypeScript projects did the hard part first. Every architectural decision
+cyrup exists because five TypeScript projects did the hard part first. Every architectural decision
 worth defending in this codebase was made by someone else, in another language, and proved out in
 use before a line of Rust was written.
 
-The source carries **19,260 citations** naming the exact upstream file and line a given Rust item
+The source carries **20,561 citations** naming the exact upstream file and line a given Rust item
 mirrors. That index is not decoration — it is how equivalence gets audited, and it is a standing
 record of authorship. When cyrup is right about something subtle, it is because one of the projects
 below was right about it first.
@@ -83,6 +83,40 @@ of bypasses and nothing else. cyrup had added a bash bypass that upstream does n
 was that a configured `tools.bash: deny` could be defeated by a narrower command rule — and the fix
 was simply to match upstream. A specification tight enough to be *compared* against is worth more
 than one that is merely documented.
+
+## pi-mcp-adapter — the tool bridge
+
+**[nicobailon/pi-mcp-adapter](https://github.com/nicobailon/pi-mcp-adapter)** ·
+MIT © 2026 Nico Bailon
+
+*MCP (Model Context Protocol) adapter extension for the Pi coding agent.*
+
+Connects an agent to MCP servers: transports, server lifecycle, tool and prompt registration,
+credentials, OAuth, and a `/mcp` surface for managing it all. 172 files of TypeScript, and the
+subsystem cyrup is furthest from finishing — `cyrup-mcp` is a port in flight
+(`docs/gap-analysis/13*` enumerates it as 425 units).
+
+Two decisions in it are worth naming because they are easy to get wrong and expensive to fix later:
+
+- **The entire tool surface registers synchronously, from disk caches, before anything connects.**
+  `installMcpAdapter` reads the config and the metadata cache and registers every direct tool, the
+  `mcp` gateway, the slash commands and one command per cached prompt — with no subprocess spawned
+  and nothing awaited. The effect is that a session opens instantly with the same surface it had
+  last time, and the system prompt does not change shape between a cold start and a warm one. An
+  adapter that registered after connecting would make the model's tool list depend on server
+  latency.
+- **That registration path cannot fail, and is written so it cannot.** Every disk read in it is
+  defensive. Porting it made the reason concrete: in cyrup a native extension whose `init()` returns
+  `Err` is a fatal startup diagnostic, so a stray `{{{` in a user's `mcp.json` would take the whole
+  agent down on a normal path. Upstream had already decided that degrading to an empty surface is
+  the only acceptable behaviour.
+
+The port also caught something upstream gets for free and Rust does not: server key order in
+`mcp.json` is significant — it is connect order, `/mcp` listing order, and the collision tie-break —
+and JavaScript object insertion order preserves it without anyone having to say so. The natural Rust
+path through `serde_json::Value` sorts those keys and silently destroys it. That is not an upstream
+subtlety so much as an upstream *affordance*, but it is only visible if you read the original
+closely enough to notice what it never had to state.
 
 ---
 
