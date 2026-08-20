@@ -21,12 +21,14 @@
 //! # Forward declarations, and how they get replaced
 //!
 //! Five collaborator types below ([`McpServerManager`], [`OAuthRuntime`],
-//! [`AuthStorageOptions`], [`ServerToolMetadata`], [`PromptMetadata`]) are declared **here** because
+//! [`AuthStorageOptions`], [`ServerToolMetadata`], [`PromptMetadata`]) were declared **here** because
 //! `state.ts` is likewise a pure type file that names them as imports, and because
 //! [`McpState`] cannot be landed without them. The unit that builds each subsystem replaces the
 //! declaration with a one-line `pub use crate::<module>::<Type>;` at that point, which keeps
 //! `crate::state::<Type>` a valid path for everything already written against it. Each one names
-//! its owning unit.
+//! its owning unit. Cut 2 discharged two of the five: [`OAuthRuntime`] is now
+//! [`crate::oauth::McpOAuthRuntime`] and [`AuthStorageOptions`] is now
+//! [`crate::credentials::AuthStorageOptions`].
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -234,22 +236,19 @@ pub struct McpServerManager {
 /// `oauth.ts`'s `createOAuthRuntime(signal)`: the flow registry, its own generation counter and the
 /// four in-flight maps.
 ///
-/// **Forward declaration (13g / MCP-280…MCP-330 replace it).**
-#[derive(Debug, Default)]
-#[non_exhaustive]
-pub struct OAuthRuntime {}
+/// **Landed by 13g (MCP-301).** The forward declaration is gone; `crate::state::OAuthRuntime` stays
+/// a valid path for everything already written against it, and now names the real runtime.
+pub use crate::oauth::McpOAuthRuntime as OAuthRuntime;
 
 /// `mcp-auth.ts`'s `getAuthStorageOptions(settings.oauthDir, cwd)` — where credentials live.
 /// `$MCP_OAUTH_DIR` (trimmed) outranks the configured dir, which outranks
 /// `<agent_dir>/mcp-oauth`.
 ///
-/// **Forward declaration (13f / MCP-260…MCP-279 replace it).**
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct AuthStorageOptions {
-    /// The resolved storage root.
-    pub base_dir: std::path::PathBuf,
-}
+/// **Landed by 13f (MCP-265).** Note the shape change the real type brings: `base_dir` is
+/// `Option<PathBuf>`, and **absent is not the same as `<agent_dir>/mcp-oauth`** — the precedence
+/// ladder in [`crate::credentials::McpAuthStore::auth_base_dir`] is what turns absent into that, so
+/// pre-resolving it here would defeat `$MCP_OAUTH_DIR`.
+pub use crate::credentials::AuthStorageOptions;
 
 /// `tool-metadata.ts`'s per-server metadata: the tools, their schemas, their resolved names, and
 /// the prefix they were named under.

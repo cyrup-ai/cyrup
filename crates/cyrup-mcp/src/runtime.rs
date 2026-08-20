@@ -142,11 +142,24 @@ pub async fn initialize_mcp(
     let _runtime_signal =
         crate::abort::combine(&owner.token(), snapshot.initial_signal.as_ref());
 
-    // Steps 2-4.
-    let auth_storage_options =
-        AuthStorageOptions { base_dir: dirs.default_oauth_dir() };
+    // Steps 2-4. `getAuthStorageOptions(settings.oauthDir, cwd)` — and **only** `settings.oauthDir`:
+    // `$MCP_OAUTH_DIR` and the `<agent_dir>/mcp-oauth` default are the store's own precedence ladder
+    // ([`crate::credentials::McpAuthStore::auth_base_dir`]), so pre-resolving a base dir here would
+    // pin the lowest rung and make the environment override unreachable (MCP-265).
+    let auth_storage_options = AuthStorageOptions::from_settings(
+        config
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.oauth_dir.as_deref()),
+        &snapshot.cwd,
+    );
     let owns_oauth_runtime = options.oauth_runtime.is_none();
-    let oauth_runtime = options.oauth_runtime.clone().unwrap_or_default();
+    // `createOAuthRuntime(signal)` under the generation's own token, so a session replacement
+    // aborts every in-flight login it started and disturbs no other's (MCP-301, MCP-344).
+    let oauth_runtime = options
+        .oauth_runtime
+        .clone()
+        .unwrap_or_else(|| crate::oauth::create_oauth_runtime(Some(&owner.token())));
     let manager = Arc::new(McpServerManager { cwd: snapshot.cwd.clone() });
 
     // Step 7. `hasPendingAuth` is the OAuth runtime's, so an authenticating server is never reaped.
@@ -200,7 +213,13 @@ pub async fn initialize_mcp(
     // Steps 10 and 12 — registered in this order so the LIFO run order is
     // `gracefulShutdown` -> `shutdownOAuth`.
     if owns_oauth_runtime {
-        owner.add_cleanup(Box::new(move || Box::pin(async move { Ok(()) })));
+        let oauth_runtime = Arc::clone(&state.oauth_runtime);
+        owner.add_cleanup(Box::new(move || {
+            Box::pin(async move {
+                crate::oauth::shutdown_oauth(&oauth_runtime).await;
+                Ok(())
+            })
+        }));
     }
     owner.add_cleanup(Box::new(move || {
         Box::pin(async move {

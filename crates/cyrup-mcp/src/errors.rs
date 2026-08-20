@@ -82,6 +82,38 @@ pub enum McpError {
     #[error("MCP runtime cleanup failed: {0}")]
     RuntimeCleanupFailed(CleanupErrors),
 
+    /// The OS secure credential store was unreachable, or the record it held was unusable
+    /// (13f / MCP-277, MCP-291).
+    ///
+    /// **This class must stay distinguishable from an ordinary failure all the way up.** Section
+    /// 07's refresh driver rethrows a store failure and swallows every other refresh error into
+    /// `None`; a broken keychain that arrives as an ordinary `Server`/`Other` failure therefore
+    /// becomes an infinite silent re-auth loop. [`crate::credentials::AuthStoreError`] carries the
+    /// `operation` discriminant and a redacting `Debug`, so nothing secret rides along.
+    #[error("{0}")]
+    CredentialStore(
+        #[from]
+        #[source]
+        crate::credentials::AuthStoreError,
+    ),
+
+    /// `new AggregateError([error, cleanupError], phase)` — the OAuth flow's three cleanup phases
+    /// (MCP-345), where a credential-store failure during cleanup must not hide the OAuth error
+    /// that caused it, nor be hidden by it.
+    ///
+    /// `phase` is one of [`crate::oauth::PHASE_STARTUP_CLEANUP`],
+    /// [`crate::oauth::PHASE_COMPLETION_CLEANUP`] or
+    /// [`crate::oauth::PHASE_CANCELLATION_CLEANUP`]. The rendering is the phase followed by every
+    /// child message, joined exactly as [`CleanupErrors`] joins its own — which is what
+    /// `formatTerminalError` does to an `AggregateError`.
+    #[error("{phase}: {errors}")]
+    OAuthAggregate {
+        /// The aggregate's own message — upstream's second `AggregateError` argument.
+        phase: &'static str,
+        /// The primary error followed by the cleanup error, in that order.
+        errors: CleanupErrors,
+    },
+
     /// Anything not yet given a class by MCP-089. Kept so a port unit can land a call site before
     /// the taxonomy unit lands its variant, rather than inventing a class name that will not match.
     #[error("{0}")]
@@ -100,7 +132,10 @@ impl McpError {
     /// MCP-124 extends the match arm as it lands the other four aggregates.
     #[must_use]
     pub fn is_cleanup_failure(&self) -> bool {
-        if matches!(self, McpError::RuntimeCleanupFailed(_)) {
+        if matches!(
+            self,
+            McpError::RuntimeCleanupFailed(_) | McpError::OAuthAggregate { .. }
+        ) {
             return true;
         }
         let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(self);
@@ -109,7 +144,10 @@ impl McpError {
         for _ in 0..32 {
             let Some(err) = source else { return false };
             if let Some(mcp) = err.downcast_ref::<McpError>()
-                && matches!(mcp, McpError::RuntimeCleanupFailed(_))
+                && matches!(
+                    mcp,
+                    McpError::RuntimeCleanupFailed(_) | McpError::OAuthAggregate { .. }
+                )
             {
                 return true;
             }
@@ -130,9 +168,43 @@ impl McpError {
     pub fn aborted_default() -> Self {
         McpError::Aborted(crate::owner::DEFAULT_STOP_REASON.to_string())
     }
+
+    /// `new AggregateError([primary, cleanup], phase)` (MCP-345) — the two-child aggregate the
+    /// OAuth flow raises when a cleanup fails while another error is already in flight.
+    #[must_use]
+    pub fn oauth_aggregate(phase: &'static str, primary: McpError, cleanup: McpError) -> Self {
+        McpError::OAuthAggregate {
+            phase,
+            errors: CleanupErrors::from(vec![primary, cleanup]),
+        }
+    }
+
+    /// Whether this error — or anything in its `source()` chain — is a *credential store* failure.
+    ///
+    /// The refresh driver's discriminator: a store failure is rethrown, everything else becomes
+    /// `None` and triggers a re-auth. Walks the chain for the same reason
+    /// [`Self::is_cleanup_failure`] does, and with the same depth cap.
+    #[must_use]
+    pub fn is_credential_store_failure(&self) -> bool {
+        if matches!(self, McpError::CredentialStore(_)) {
+            return true;
+        }
+        let mut source: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(self);
+        for _ in 0..32 {
+            let Some(err) = source else { return false };
+            if let Some(mcp) = err.downcast_ref::<McpError>()
+                && matches!(mcp, McpError::CredentialStore(_))
+            {
+                return true;
+            }
+            source = std::error::Error::source(err);
+        }
+        false
+    }
 }
 
-/// The collected failures of one LIFO cleanup pass (MCP-005).
+/// The collected failures of one LIFO cleanup pass (MCP-005), and the children of an
+/// [`McpError::OAuthAggregate`] (MCP-345).
 ///
 /// `Display` reproduces `formatTerminalError`'s aggregate walk: the child messages joined with
 /// `": "`, **deduplicated** by its `seen` set — two cleanups failing with the same message render

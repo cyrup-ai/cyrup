@@ -1179,9 +1179,17 @@ pub fn build_proxy_description(
     cache: Option<&MetadataCache>,
     direct_specs: &[DirectToolSpec],
 ) -> String {
+    // **The head literal must stay byte-identical to `crate::proxy::build_proxy_description`'s.**
+    // `direct-tools.ts:240` is `"…Non-MCP Pi tools should be called directly…"`; the one rebrand is
+    // `Pi` → `cyrup`, and this copy had dropped the word entirely. Because
+    // `McpExtension::proxy_tool_description` re-registers the gateway tool only when the
+    // description *changed*, a one-word difference between the cache-built description (here) and
+    // the live-metadata one (there) meant the guard could never fire — so every reconnect
+    // re-registered the tool and invalidated the provider's prompt-cache prefix, which is the exact
+    // cost `settings.freezeDirectTools` exists to avoid.
     let global_prefix = config.tool_prefix();
     let mut desc = String::from(
-        "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. Non-MCP tools should be called directly, not through mcp.\n",
+        "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. Non-MCP cyrup tools should be called directly, not through mcp.\n",
     );
 
     // 2. Direct tools, grouped by server in first-appearance order (a JS `Map`).
@@ -2210,7 +2218,7 @@ mod tests {
 
         let description = build_proxy_description(&config, Some(&cache), &specs);
         let expected = concat!(
-            "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. Non-MCP tools should be called directly, not through mcp.\n",
+            "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. Non-MCP cyrup tools should be called directly, not through mcp.\n",
             "\nDirect tools available (call as normal tools): alpha (2)\n",
             "\nServers: beta (3 tools)\n",
             "\nDisabled servers (enable with /mcp enable <server> and /reload): off\n",
@@ -2502,4 +2510,26 @@ mod tests {
         let changed = DirectToolSpec { description: "two".to_string(), ..spec };
         assert_ne!(first, direct_tool_fingerprint(&changed));
     }
+    /// The gateway tool's description is built twice — from the disk cache here, and from live
+    /// metadata in [`crate::proxy::build_proxy_description`]. `McpExtension::proxy_tool_description`
+    /// re-registers the tool only when the text *changed*, so if the two heads ever differ the
+    /// guard never fires and every reconnect invalidates the provider's prompt-cache prefix.
+    #[test]
+    fn both_proxy_descriptions_share_one_head_line() {
+        let from_cache = build_proxy_description(&McpConfig::default(), None, &[]);
+        let from_live = crate::proxy::build_proxy_description(
+            &McpConfig::default(),
+            &indexmap::IndexMap::new(),
+            &[],
+        );
+        let head = |text: &str| text.lines().next().unwrap_or_default().to_string();
+        assert_eq!(head(&from_cache), head(&from_live));
+        // …and it is `direct-tools.ts:240` with the single `Pi` → `cyrup` rebrand.
+        assert_eq!(
+            head(&from_cache),
+            "MCP gateway — server status, tool search/describe, auth, and single MCP tool calls. \
+             Non-MCP cyrup tools should be called directly, not through mcp."
+        );
+    }
+
 }

@@ -399,6 +399,7 @@ pub const CACHE_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 #[serde(rename_all = "camelCase")]
 pub struct CachedTool {
     /// The server-side tool name, unprefixed. `serializeTools` drops any tool without one.
+    #[serde(default)]
     pub name: String,
     /// The tool description, verbatim from `tools/list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,8 +426,10 @@ pub struct CachedTool {
 pub struct CachedResource {
     /// The resource URI — the `read_*` tool's payload. `serializeResources` drops a resource
     /// missing either this or `name`.
+    #[serde(default)]
     pub uri: String,
     /// The resource name, which `resourceNameToToolName` sanitises into the tool name.
+    #[serde(default)]
     pub name: String,
     /// Falls back to `` `Read resource: ${uri}` `` at reconstruction time, not here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,6 +441,7 @@ pub struct CachedResource {
 #[serde(rename_all = "camelCase")]
 pub struct CachedPromptArgument {
     /// The argument name. An argument without one is dropped by `serializePrompts`.
+    #[serde(default)]
     pub name: String,
     /// Shown in the slash command's help.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,6 +456,7 @@ pub struct CachedPromptArgument {
 #[serde(rename_all = "camelCase")]
 pub struct CachedPrompt {
     /// The server-side prompt name, which `formatPromptCommandName` turns into the command.
+    #[serde(default)]
     pub name: String,
     /// The human-facing title, if the server sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,11 +481,22 @@ pub struct CachedPrompt {
 pub struct ServerCacheEntry {
     /// [`compute_server_hash`] over the server definition this metadata was captured from. The
     /// entry is discarded the moment it stops matching.
+    ///
+    /// `#[serde(default)]` on this and the two below is **not** cosmetic. `metadata-cache.ts`
+    /// reads every member with `??`, so a cache written by an older build — or by a version that
+    /// had not yet learned to write `resources` — still loads. Without the defaults a single
+    /// missing key makes [`load_metadata_cache`] return `None` for the **whole file**, while
+    /// [`crate::registration`]'s lenient reader over the same bytes returns everything: the `/mcp`
+    /// panel would show no cached data for servers whose tools are registered and working. See the
+    /// report's note on unifying the two cache readers.
+    #[serde(default)]
     pub config_hash: String,
     /// Every tool the server advertised, unfiltered — `includeTools`/`excludeTools` are applied at
     /// reconstruction so a config edit does not require a reconnect.
+    #[serde(default)]
     pub tools: Vec<CachedTool>,
     /// Every resource the server advertised.
+    #[serde(default)]
     pub resources: Vec<CachedResource>,
     /// Every prompt the server advertised, when the server implements `prompts/list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1266,4 +1282,32 @@ mod tests {
             )
         );
     }
+    /// The two readers of `mcp-cache.json` must agree about what is present. Before integration
+    /// this file's reader was strict where `crate::registration`'s is lenient, so a cache missing
+    /// one key made the panel see nothing while the registered surface saw everything.
+    #[test]
+    fn a_cache_missing_optional_keys_still_loads_here_and_in_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let path = dirs.metadata_cache();
+        // No `resources`, no `configHash`, a tool with only a name.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{CACHE_VERSION},"servers":{{"linear":{{"tools":[{{"name":"list_issues"}}],"cachedAt":1}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cache = load_metadata_cache(&path).expect("a partial cache still loads");
+        let entry = cache.servers.get("linear").expect("the server survives");
+        assert_eq!(entry.tools.len(), 1);
+        assert!(entry.resources.is_empty());
+        assert_eq!(entry.config_hash, "");
+
+        // And the lenient reader agrees, which is the invariant that matters.
+        let other = crate::registration::load_metadata_cache(&dirs).expect("both readers agree");
+        assert_eq!(other.servers.get("linear").map(|e| e.tools().len()), Some(1));
+    }
+
 }

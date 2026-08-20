@@ -641,8 +641,16 @@ pub struct ServerEntry {
     pub exclude_tools: Option<Vec<String>>,
     /// Extra ranking keywords per tool. Ranking-only: they never appear in a schema, in `describe`
     /// output, or in the metadata cache.
+    ///
+    /// `IndexMap`, NOT `BTreeMap`, and the distinction is a correctness one rather than a taste
+    /// one. Upstream's `resolveSearchKeywords` walks `Object.entries(searchKeywords)`, i.e. **key
+    /// insertion order**, and unions the values of every glob key that matches the tool. Under a
+    /// `BTreeMap` those keys come back sorted, so whenever two globs both match one tool the union
+    /// is assembled in a different order than upstream produces — and that order is observable, it
+    /// is the order keywords are scored and reported in. Same family as the `mcp_servers` ordering
+    /// trap this module already documents.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
-    pub search_keywords: Option<BTreeMap<String, Vec<String>>>,
+    pub search_keywords: Option<IndexMap<String, Vec<String>>>,
     /// Which of this server's tools skip the approval prompt. Present beats the global.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub approve_tools: Option<BoolOrList>,
@@ -1528,6 +1536,29 @@ pub fn to_server_entries(
             let message = format!(
                 "MCP server \"{name}\" in {} requests `httpTransport: \"sse\"`; rmcp ships no SSE \
                  client transport (Cut 1), so the entry is ignored.",
+                path.display()
+            );
+            tracing::warn!("{message}");
+            diagnostics.push(ConfigDiagnostic {
+                path: path.to_path_buf(),
+                server: Some(name.clone()),
+                message,
+            });
+            continue;
+        }
+        // MCP-302 — the twelve `extractOAuthConfig` guards, run over the **raw** block.
+        //
+        // This has to happen here, before `raw_to::<ServerEntry>`, because every `ServerEntry`
+        // field is `lenient`: a `clientId: 42` is silently *dropped* by the deserializer, so the
+        // server would go on to authenticate as an anonymous client instead of reporting
+        // `OAuth clientId must be a string`. Nine of the twelve messages are unreachable any other
+        // way. The whole entry is rejected, matching the `socket` and `httpTransport` arms above
+        // and for the same reason: a half-honoured override is worse than none.
+        if let Some(raw_oauth) = raw_entry.get("oauth")
+            && let Err(error) = crate::oauth::validate_oauth_block(raw_oauth)
+        {
+            let message = format!(
+                "MCP server \"{name}\" in {}: {error}; the entry is ignored.",
                 path.display()
             );
             tracing::warn!("{message}");
@@ -5029,5 +5060,60 @@ mod tests {
             .expect("detected");
         assert!(!cursor.active, "detected, listed, and NOT merged");
         assert_eq!(cursor.server_count, 2);
+    }
+
+    // --- MCP-302: the twelve `extractOAuthConfig` guards run at CONFIG LOAD --------------------
+
+    /// Every `ServerEntry` field is `lenient`, so a wrong-typed `oauth` member is silently dropped
+    /// by the deserializer. Nine of MCP-302's twelve messages are unreachable unless the raw block
+    /// is validated *before* that — this pins the hook that `to_server_entries` now performs.
+    #[test]
+    fn a_wrong_typed_oauth_block_is_rejected_at_load_with_the_field_named() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+
+        fixture.write(
+            &fixture.user_path(),
+            "{\"mcpServers\":{\"bad\":{\"url\":\"https://x.example/mcp\",\"oauth\":{\"clientId\":42}},\
+             \"good\":{\"url\":\"https://y.example/mcp\",\"oauth\":{\"clientId\":\"cid\"}}}}",
+        );
+        let loaded = context.load();
+
+        // The offending entry is dropped — NOT silently half-honoured as an anonymous client.
+        assert!(!loaded.config.mcp_servers.contains_key("bad"));
+        // Its neighbour is untouched: the rejection is per-entry, like the `socket` and
+        // `httpTransport: "sse"` arms.
+        assert!(loaded.config.mcp_servers.contains_key("good"));
+
+        let diagnostic = loaded
+            .diagnostics
+            .iter()
+            .find(|d| d.server.as_deref() == Some("bad"))
+            .expect("a named diagnostic");
+        assert!(
+            diagnostic.message.contains("OAuth clientId must be a string"),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn oauth_false_and_a_well_typed_block_both_load_clean() {
+        let fixture = Fixture::new();
+        let context = fixture.context();
+        fixture.write(
+            &fixture.user_path(),
+            "{\"mcpServers\":{\"off\":{\"url\":\"https://x.example/mcp\",\"oauth\":false},\
+             \"on\":{\"url\":\"https://y.example/mcp\",\"oauth\":{\"scope\":\"a b\",\
+             \"authorizationParams\":{\"audience\":\"api\"}}}}}",
+        );
+        let loaded = context.load();
+        assert!(loaded.config.mcp_servers.contains_key("off"));
+        assert!(loaded.config.mcp_servers.contains_key("on"));
+        assert!(
+            loaded.diagnostics.iter().all(|d| !d.message.contains("OAuth ")),
+            "{:?}",
+            loaded.diagnostics
+        );
     }
 }

@@ -108,6 +108,15 @@ pub struct McpExtension {
     /// which the runtime has no reachable handle to install [`crate::registration::McpToolDispatch`]
     /// into and every registered MCP tool would answer `MCP not initialized` forever (MCP-214).
     dispatch: Mutex<Option<Arc<ToolDispatch>>>,
+    /// `resolveMcpToolRenderOptions(settings)`, resolved **once, at load**, from the same early
+    /// config `init` registered the surface from (MCP-238).
+    ///
+    /// Upstream resolves it at `installMcpAdapter` time and closes over the result, so
+    /// `toolResultRendering` and `collapsedResultLines` are frozen for the session: a transcript
+    /// whose rows changed shape halfway through because the user edited `mcp.json` would be a
+    /// port defect, not a feature. Re-resolved on each `init` — i.e. once per generation — which is
+    /// exactly upstream's "once per adapter install".
+    render_options: Mutex<crate::renderers::McpToolRenderOptions>,
     /// The home directory the six-source ladder's three tool-agnostic global rungs
     /// (`~/.config/mcp/mcp.json`, `~/.agents/mcp.json`, `~/.agents/mcp/mcp.json`) and all seven
     /// import families resolve against. `None` ⇒ [`crate::config::home_dir`], which is production.
@@ -145,6 +154,7 @@ impl McpExtension {
             proxy_tool_description: Mutex::new(None),
             direct_tools_frozen: AtomicBool::new(false),
             dispatch: Mutex::new(None),
+            render_options: Mutex::new(crate::renderers::McpToolRenderOptions::default()),
             home: None,
         }
     }
@@ -187,6 +197,16 @@ impl McpExtension {
     #[must_use]
     pub fn owner(&self) -> Option<Arc<McpRuntimeOwner>> {
         self.owner.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// The frozen-at-load tool-result render options (MCP-238). A poisoned slot degrades to the
+    /// compact default rather than refusing to draw a row.
+    #[must_use]
+    pub fn render_options(&self) -> crate::renderers::McpToolRenderOptions {
+        self.render_options
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or_default()
     }
 
     /// Whether `settings.freezeDirectTools` has taken effect (MCP-036).
@@ -400,6 +420,14 @@ impl NativeExtension for McpExtension {
         if let Ok(mut slot) = self.dispatch.lock() {
             *slot = Some(Arc::clone(&surface.dispatch));
         }
+        // MCP-238 — resolved from the SAME early config the surface was registered from, and never
+        // re-read after this point.
+        if let Ok(mut slot) = self.render_options.lock() {
+            *slot = config.settings.as_ref().map_or_else(
+                crate::renderers::McpToolRenderOptions::default,
+                crate::renderers::resolve_mcp_tool_render_options,
+            );
+        }
 
         // Every registered tool needs its renderer DECLARED here — cyrup splits upstream's per-tool
         // `renderCall`/`renderResult` arguments into a declaration plus a name-keyed serve, so a
@@ -436,6 +464,33 @@ impl NativeExtension for McpExtension {
             // MCP-045 fills the `isError` override.
             _ => HookOutcome::Noop,
         }
+    }
+
+    /// `renderCall` for every name [`crate::registration::register_surface`] declared a renderer
+    /// for — the gateway tool and each direct tool (MCP-237, MCP-241, MCP-243).
+    ///
+    /// [`crate::renderers::render_call`] splits on
+    /// [`crate::registration::PROXY_TOOL_NAME`]: the gateway gets
+    /// `formatMcpProxyToolCallLines`' seven branches, everything else gets
+    /// `formatMcpDirectToolCallLines`.
+    fn render_call(&self, key: &str, call: &serde_json::Value) -> Option<serde_json::Value> {
+        crate::renderers::render_call(key, call, self.render_options())
+    }
+
+    /// `renderResult` (MCP-239, MCP-240, MCP-242).
+    ///
+    /// `toolsExpanded` is read from [`cyrup_ext::host::HostServices`] here rather than inside the
+    /// renderer, which is what keeps [`crate::renderers::render_result`] a pure, synchronous
+    /// projection — the host calls it on the UI's event path and an `async` renderer would stall
+    /// the frame. A headless build has no services and collapses, which is the correct default.
+    fn render_result(&self, key: &str, result: &serde_json::Value) -> Option<serde_json::Value> {
+        crate::renderers::render_result(
+            key,
+            result,
+            self.render_options(),
+            self.host_services()
+                .is_some_and(|services| services.tools_expanded()),
+        )
     }
 
     /// Bind the live capability backend. Called **before** [`Self::init`], which is what makes an
@@ -487,6 +542,52 @@ mod tests {
         let ext = extension();
         let mut api = InitApi::new();
         assert!(ext.init(&mut api).await.is_ok());
+    }
+
+    /// The renderer seam: `init` must *declare* a renderer for every tool it registers AND the
+    /// extension must actually *serve* one, or every MCP row falls back to the host's own framing.
+    /// Cut 2 landed `renderers.rs`; this pins that it is reachable through the trait.
+    #[tokio::test]
+    async fn the_registered_renderers_are_served_not_just_declared() {
+        use serde_json::json;
+
+        let ext = extension();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+
+        // The gateway tool's call row — `formatMcpProxyToolCallLines`' `tool @ server` head.
+        let proxy = ext
+            .render_call(
+                crate::registration::PROXY_TOOL_NAME,
+                &json!({ "tool": "list_issues", "server": "linear", "args": {} }),
+            )
+            .expect("the gateway tool must render its own call row");
+        assert!(
+            proxy.to_string().contains("mcp call list_issues @ linear"),
+            "{proxy}"
+        );
+
+        // Any other name takes the direct-tool formatter, which leads with the prefixed name.
+        let direct = ext
+            .render_call("linear_list_issues", &json!({ "state": "open" }))
+            .expect("a direct tool must render its own call row");
+        assert!(direct.to_string().contains("linear_list_issues"), "{direct}");
+
+        // The result side renders for both, and a headless build (no `HostServices`) collapses.
+        assert!(
+            ext.render_result(
+                crate::registration::PROXY_TOOL_NAME,
+                &json!({ "content": [{ "type": "text", "text": "ok" }] })
+            )
+            .is_some()
+        );
+
+        // MCP-238: the options are resolved once at `init`, from that generation's config.
+        assert_eq!(
+            ext.render_options().result_rendering,
+            crate::config::ToolResultRendering::Compact,
+            "no `mcp.json` on disk means the compact default"
+        );
     }
 
     #[tokio::test]
