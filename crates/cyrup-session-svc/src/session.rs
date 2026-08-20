@@ -1723,30 +1723,6 @@ impl AgentSession {
                 .fold(0u32, u32::saturating_add),
         );
         drop(guard);
-        // pi `agent-session.ts:1874-1876` (manual `compact`) / `:2155-2157` (`_runAutoCompaction`):
-        // re-seed the AGENT's in-memory transcript from the compacted context. `appendCompaction`
-        // only writes the JSONL entry — this assignment is what actually shrinks the next request.
-        //
-        // Without it `/compact` reported success and the TUI re-rendered a compacted transcript
-        // from the session, while the very next turn still shipped the ENTIRE pre-compaction
-        // history to the provider: zero token reduction, full cost. Overflow recovery was worse
-        // than useless — `check_compaction` set `overflow_recovery_attempted`, `continue_run()`
-        // resent the unchanged context, it overflowed again, and the one-shot latch reported "Try
-        // reducing context or switching to a larger-context model", blaming the model for a
-        // compaction that had never taken effect.
-        //
-        // `navigate_tree` already did exactly this (`:1857-1862`, citing `agent-session.ts:2871`);
-        // the two compaction paths were the ones that built the context only to COUNT it.
-        //
-        // SESS-043 — seeded from the RAW projection. Folding `build_context().messages` through
-        // `core_message_to_agent` produced a transcript of a different LENGTH and different roles
-        // from pi's: `convertToLlm` DROPS every `excludeFromContext` (`!!`) bash message and
-        // rewrites each summary into wrapper prose, so pi's `messages.slice(0, -1)` arithmetic
-        // (`agent-session.ts:2008`, `:2188`, `:2703`) and every agent-state token estimate ran over
-        // a different list.
-        let compacted_messages: Vec<AgentMessage> =
-            compacted_raw.iter().map(raw_message_to_agent).collect();
-        self.agent.set_messages(compacted_messages).await;
         // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
         drop(compactor);
@@ -1755,6 +1731,47 @@ impl AgentSession {
 
         match result {
             Ok(Some(entry)) => {
+                // SEAM-112 — the re-seed is on the SUCCESS PATH ONLY. pi orders it
+                // `appendCompaction(...)` → `this.agent.state.messages = sessionContext.messages;`
+                // (agent-session.ts:1952-1955 manual / :2275-2280 auto), both of them AFTER the
+                // `signal.aborted` early-return, so a cancelled / declined / failed compaction
+                // leaves `agent.state.messages` exactly as the run found it.
+                //
+                // cyrup ran it unconditionally, before `match result`. That resurrected work a
+                // failed compaction had no right to restore: overflow recovery calls
+                // `drop_trailing_assistant` (`:4775-4781`) to remove the overflow response from the
+                // agent transcript BEFORE compacting, but the response is already persisted (it was
+                // written on `message_end`), so an aborted or erroring compaction re-seeded it
+                // straight back out of the session file — the exact state `Agent::continue_run`
+                // rejects with `ContinueFromAssistant`.
+                //
+                // pi `agent-session.ts:1955` (manual `compact`) / `:2280` (`_runAutoCompaction`):
+                // re-seed the AGENT's in-memory transcript from the compacted context.
+                // `appendCompaction` only writes the JSONL entry — this assignment is what actually
+                // shrinks the next request.
+                //
+                // Without it `/compact` reported success and the TUI re-rendered a compacted
+                // transcript from the session, while the very next turn still shipped the ENTIRE
+                // pre-compaction history to the provider: zero token reduction, full cost. Overflow
+                // recovery was worse than useless — `check_compaction` set
+                // `overflow_recovery_attempted`, `continue_run()` resent the unchanged context, it
+                // overflowed again, and the one-shot latch reported "Try reducing context or
+                // switching to a larger-context model", blaming the model for a compaction that had
+                // never taken effect.
+                //
+                // `navigate_tree` already did exactly this (`:1857-1862`, citing
+                // `agent-session.ts:2871`); the two compaction paths were the ones that built the
+                // context only to COUNT it.
+                //
+                // SESS-043 — seeded from the RAW projection. Folding `build_context().messages`
+                // through `core_message_to_agent` produced a transcript of a different LENGTH and
+                // different roles from pi's: `convertToLlm` DROPS every `excludeFromContext` (`!!`)
+                // bash message and rewrites each summary into wrapper prose, so pi's
+                // `messages.slice(0, -1)` arithmetic (`agent-session.ts:2008`, `:2188`, `:2703`)
+                // and every agent-state token estimate ran over a different list.
+                let compacted_messages: Vec<AgentMessage> =
+                    compacted_raw.iter().map(raw_message_to_agent).collect();
+                self.agent.set_messages(compacted_messages).await;
                 let cr = crate::state::CompactionResult {
                     summary: entry.summary.clone(),
                     first_kept_entry_id: entry.first_kept_entry_id.to_string(),
@@ -5047,30 +5064,6 @@ impl AgentSession {
                 .fold(0u32, u32::saturating_add),
         );
         drop(guard);
-        // pi `agent-session.ts:1874-1876` (manual `compact`) / `:2155-2157` (`_runAutoCompaction`):
-        // re-seed the AGENT's in-memory transcript from the compacted context. `appendCompaction`
-        // only writes the JSONL entry — this assignment is what actually shrinks the next request.
-        //
-        // Without it `/compact` reported success and the TUI re-rendered a compacted transcript
-        // from the session, while the very next turn still shipped the ENTIRE pre-compaction
-        // history to the provider: zero token reduction, full cost. Overflow recovery was worse
-        // than useless — `check_compaction` set `overflow_recovery_attempted`, `continue_run()`
-        // resent the unchanged context, it overflowed again, and the one-shot latch reported "Try
-        // reducing context or switching to a larger-context model", blaming the model for a
-        // compaction that had never taken effect.
-        //
-        // `navigate_tree` already did exactly this (`:1857-1862`, citing `agent-session.ts:2871`);
-        // the two compaction paths were the ones that built the context only to COUNT it.
-        //
-        // SESS-043 — seeded from the RAW projection. Folding `build_context().messages` through
-        // `core_message_to_agent` produced a transcript of a different LENGTH and different roles
-        // from pi's: `convertToLlm` DROPS every `excludeFromContext` (`!!`) bash message and
-        // rewrites each summary into wrapper prose, so pi's `messages.slice(0, -1)` arithmetic
-        // (`agent-session.ts:2008`, `:2188`, `:2703`) and every agent-state token estimate ran over
-        // a different list.
-        let compacted_messages: Vec<AgentMessage> =
-            compacted_raw.iter().map(raw_message_to_agent).collect();
-        self.agent.set_messages(compacted_messages).await;
         // Close the retry queue (the compactor owns the emitter) and flush it — with the manager
         // guard already released — so every `summarization_retry_*` lands BEFORE `compaction_end`.
         drop(compactor);
@@ -5078,6 +5071,40 @@ impl AgentSession {
         match result {
             Ok(Some(entry)) => {
                 cancel_slot.clear();
+                // SEAM-112 — the re-seed is on the SUCCESS PATH ONLY. pi runs
+                // `appendCompaction(...)` → `this.agent.state.messages = sessionContext.messages;`
+                // at `agent-session.ts:2275-2280`, AFTER the `signal.aborted` early-return at
+                // `:2260-2275`, so a cancelled / declined / failed auto-compaction leaves
+                // `agent.state.messages` exactly as the run found it.
+                //
+                // cyrup ran it unconditionally, before `match result`, which mattered most on the
+                // path that reaches here: `check_compaction` (`:4868`) calls `drop_trailing_assistant`
+                // (`:4775-4781`) to strip the overflow response from the agent transcript BEFORE
+                // compacting, but that response was already persisted on `message_end`, so an
+                // aborted or erroring compaction re-seeded it straight back out of the session
+                // file — the exact state `Agent::continue_run` rejects with `ContinueFromAssistant`.
+                //
+                // pi `agent-session.ts:2280`: re-seed the AGENT's in-memory transcript from the
+                // compacted context. `appendCompaction` only writes the JSONL entry — this
+                // assignment is what actually shrinks the next request.
+                //
+                // Without it auto-compaction reported success while the very next turn still
+                // shipped the ENTIRE pre-compaction history to the provider: zero token reduction,
+                // full cost. Overflow recovery was worse than useless — `check_compaction` set
+                // `overflow_recovery_attempted`, `continue_run()` resent the unchanged context, it
+                // overflowed again, and the one-shot latch reported "Try reducing context or
+                // switching to a larger-context model", blaming the model for a compaction that had
+                // never taken effect.
+                //
+                // SESS-043 — seeded from the RAW projection. Folding `build_context().messages`
+                // through `core_message_to_agent` produced a transcript of a different LENGTH and
+                // different roles from pi's: `convertToLlm` DROPS every `excludeFromContext` (`!!`)
+                // bash message and rewrites each summary into wrapper prose, so pi's
+                // `messages.slice(0, -1)` arithmetic (`agent-session.ts:2008`, `:2188`, `:2703`)
+                // and every agent-state token estimate ran over a different list.
+                let compacted_messages: Vec<AgentMessage> =
+                    compacted_raw.iter().map(raw_message_to_agent).collect();
+                self.agent.set_messages(compacted_messages).await;
                 let cr = crate::state::CompactionResult {
                     summary: entry.summary.clone(),
                     first_kept_entry_id: entry.first_kept_entry_id.to_string(),
@@ -5112,6 +5139,41 @@ impl AgentSession {
                     error_message: None,
                 })
                 .await;
+                // SEAM-112 — pi `agent-session.ts:2307-2317`, positioned exactly here (after the
+                // `compaction_end` emit, before the `return true`), with upstream's own reasoning:
+                // "The overflow response was persisted on message_end before _checkCompaction()
+                // removed it from agent state. Rebuilding state from the new compaction can restore
+                // that kept entry, leaving an assistant as the final message. agent.continue()
+                // rejects that state, so remove the retriable error or truncated-length response
+                // again before continuing the interrupted turn."
+                //
+                // Concretely on cyrup's side: `check_compaction` (`:4868`) calls
+                // `drop_trailing_assistant`, then this run's re-seed above pulls the SAME response
+                // back out of the session file (it was written on `message_end`). Without this
+                // re-drop `handle_post_agent_run` (`:867-869`) returns `true`,
+                // `Agent::continue_run` (cyrup-agent/src/agent.rs:1985-2026) sees a trailing
+                // assistant with both queues empty and returns `ContinueFromAssistant`, and
+                // `drive_run` (`:803`) breaks — overflow recovery compacts and never retries.
+                //
+                // The predicate is pi's exact one — `stopReason === "error" || === "length"` — and
+                // is deliberately NARROWER than [`Self::drop_trailing_assistant`]'s "any trailing
+                // assistant", which would also swallow a legitimately-completed `Stop`/`ToolUse`
+                // turn that the compaction happened to leave last. Do not reuse that helper here.
+                if will_retry {
+                    let mut msgs = self.agent.snapshot().await.messages;
+                    let retriable_tail = matches!(
+                        msgs.last(),
+                        Some(AgentMessage::Assistant(a))
+                            if matches!(
+                                a.stop_reason,
+                                cyrup_core::StopReason::Error | cyrup_core::StopReason::Length
+                            )
+                    );
+                    if retriable_tail {
+                        msgs.pop();
+                        self.agent.set_messages(msgs).await;
+                    }
+                }
                 Ok(true)
             }
             Ok(None) => {

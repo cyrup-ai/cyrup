@@ -161,9 +161,24 @@ fn production_child_env(cwd: &Path, parent_id: &str) -> std::collections::HashMa
     };
     let opts = RunOptions {
         turn_budget: None,
+        // SUBA-021: pi's `usageBudget` is an OPTIONAL tool param (`extension/schemas.ts:324`
+        // @v0.52.0) threaded to the runner as `usageBudget?: UsageBudgetConfig`
+        // (`runs/background/subagent-runner.ts:193`) — upstream has no default budget, so a call
+        // that does not ask for one runs unbudgeted. This fixture asks for none.
+        usage_budget: None,
         enforce_hard_turn_limit: false,
         // G90's steer inbox: `None` is the foreground shape.
         steer_inbox_dir: None,
+        // SUBA-049: the RETURN half of that same steer channel, and `None` for the same reason —
+        // pi mints both paths only where an async run directory exists (`subagent-runner.ts:3820-3821`
+        // @v0.52.0) or for a workflow's foreground steering dir (`workflow-foreground-steering.ts:180-186`),
+        // and a plain foreground delegation like this one has neither. Load-bearing for what this
+        // file proves: both sides gate the key on presence (`if (input.steerCapabilityPath)` /
+        // `if (input.steerAckDir)`, `runs/shared/pi-args.ts:815-818` @v0.52.0; `exec::mod.rs:2227-2250`),
+        // so `None` keeps `env_overlay` byte-identical to a real foreground child's — the overlay
+        // these tests then apply verbatim to the spawned child.
+        steer_ack_dir: None,
+        steer_capability_path: None,
         // SUBA-003: no `subagents.modelScope` policy in this fixture — enforcement off.
         model_scope: None,
         cwd: cwd.to_path_buf(),
