@@ -611,9 +611,14 @@ pub fn matches_tool_pattern(candidates: &IndexSet<String>, patterns: Option<&[St
 /// candidates overall than it matches of mine — which is why the caller's set spans every server
 /// including this one, and why a naive `any(matches)` would report a self-match as a collision.
 ///
-/// The memoisation upstream carries (`matchingCountByPattern`, `matcherByPattern`) is a performance
-/// detail of rebuilding the index per tool; [`build_proxy_description`] builds it once, so the
-/// counts are recomputed per pattern instead of per tool. `additionalCurrentCandidatesByToolName`
+/// **Not memoised, unlike upstream post-`14c0e6c`.** Upstream hoists `matcherByPattern` and
+/// `matchingCountByPattern` onto a `ToolSelectorCandidateIndex` built once per filtered server
+/// (`types.ts:811-829`); this free function takes a bare `&IndexSet` and so recompiles the glob and
+/// re-walks the whole candidate set once per **(tool, pattern)** pair — not, as an earlier revision
+/// of this comment claimed, once per pattern. Only reached when a pattern matches a legacy-only
+/// candidate, so it is a cost, never a behaviour difference; the planned close is to delete this
+/// function in favour of [`crate::registration::CandidateIndex`], which is the memoising port, when
+/// MCP-207 collapses the two selector paths (see MCP-249). `additionalCurrentCandidatesByToolName`
 /// has no caller on this path and is not modelled.
 fn index_has_other_current_match(
     all_candidates: &IndexSet<String>,
@@ -3697,6 +3702,72 @@ pub struct CachedServerEntry {
     pub instructions: Option<String>,
 }
 
+/// `direct-tools.ts:259` `hasToolFilters` (upstream `faf55f7`) — does this server declare a tool
+/// selector at all?
+///
+/// Upstream tests `Array.isArray(x) && x.length > 0` on both fields, so a JSON `null`, a non-array
+/// and `[]` all read as "no filter" — which is exactly `Option<Vec<String>>` plus the emptiness
+/// check. The predicate has to be *cheap* and *total*: it is the guard that decides whether the
+/// collision scan runs at all.
+///
+/// [`crate::registration`] carries a private twin for the cache-side copy of `buildProxyDescription`;
+/// the two collapse into one when MCP-207 merges this file's simple candidate-set form into 13e's
+/// memoised [`crate::registration::CandidateIndex`].
+fn server_has_tool_filters(definition: &ServerEntry) -> bool {
+    definition.include_tools.as_ref().is_some_and(|list| !list.is_empty())
+        || definition.exclude_tools.as_ref().is_some_and(|list| !list.is_empty())
+}
+
+/// The MCP-198 cross-server collision set: every *current-form* name candidate of every enabled
+/// server that has a cache entry — including the server being filtered, whose own candidates are
+/// subtracted by match *count* inside [`index_has_other_current_match`] rather than pre-deleted.
+///
+/// **Empty unless some server declares a selector.** `direct-tools.ts:257-262`, upstream `faf55f7`
+/// ("avoid O(tools²) startup collision scan when no tool filters are configured"): [`is_tool_allowed`]
+/// short-circuits on absent/empty `includeTools` *and* `excludeTools` before it ever reads the set,
+/// so building one nothing consults is pure startup cost — the report behind that commit had 14
+/// servers / ~800 tools, where the equivalent scan cost ~2.6s of synchronous startup and dominated
+/// `pi`'s 3.66s launch. This description is regenerated on every metadata update, so the waste was
+/// per-reconnect, not once.
+///
+/// Returning an empty set rather than `Option` is safe *because* this gate and the per-server gate
+/// in [`build_proxy_description`] test the identical predicate: no server can consult a set that
+/// was never built. One build serves the whole call, where upstream rebuilds an identical index per
+/// filtered server (it is not parameterised by the server being filtered).
+fn collision_candidates(
+    config: &McpConfig,
+    cache: &IndexMap<String, CachedServerEntry>,
+    prefix: ToolPrefix,
+) -> IndexSet<String> {
+    let mut all_candidates: IndexSet<String> = IndexSet::new();
+    if !config.mcp_servers.values().any(server_has_tool_filters) {
+        return all_candidates;
+    }
+    for (other_server, other_definition) in &config.mcp_servers {
+        let Some(other_entry) = cache.get(other_server) else { continue };
+        if other_definition.is_disabled() {
+            continue;
+        }
+        let other_prefix = resolve_tool_prefix(Some(other_definition), prefix);
+        for tool in &other_entry.tools {
+            // `isUiToolVisibleToModel` **survives the MCP Apps cut**: dropping it would expose to
+            // the model tools the server explicitly marked app-only.
+            if !is_ui_tool_visible_to_model(tool.ui_visibility.as_deref()) {
+                continue;
+            }
+            all_candidates
+                .extend(get_tool_name_candidates(&tool.name, other_server, other_prefix, false));
+        }
+        if other_definition.expose_resources() {
+            for (name, _) in &other_entry.resources {
+                let base = format!("read_{}", resource_name_to_tool_name(name));
+                all_candidates.extend(get_tool_name_candidates(&base, other_server, other_prefix, false));
+            }
+        }
+    }
+    all_candidates
+}
+
 /// `direct-tools.ts:234` `buildProxyDescription(config, cache, directSpecs)`.
 ///
 /// Six blocks in this exact order, each appended only when non-empty:
@@ -3709,12 +3780,13 @@ pub struct CachedServerEntry {
 ///    the **absence** of a trailing newline on the final `Mode:` line.
 ///
 /// **MCP-198 — the counts are an O(servers × tools) cross-server computation, not a per-server
-/// filter.** `getOtherCurrentCandidates` builds the set of name candidates produced by *every other*
+/// filter.** [`collision_candidates`] builds the set of name candidates produced by *every other*
 /// cache-valid, enabled server (including `read_<resource>` names when `exposeResources !== false`)
 /// and hands it to `isToolAllowed` as its collision set, so adding an unrelated server can change a
-/// third server's advertised count. Computed **once per call** here rather than once per tool
-/// (upstream rebuilds it per tool, which is O(n²) but observationally identical). Simplifying it to
-/// a per-server `includeTools`/`excludeTools` filter would silently differ from pi's for any
+/// third server's advertised count. Built **once per call**, and **not at all** unless some server
+/// declares a selector (`direct-tools.ts:257`, upstream `faf55f7`; upstream builds one index per
+/// *filtered* server and, before that commit, rebuilt it per *tool* — the O(tools²) scan). Simplifying
+/// it to a per-server `includeTools`/`excludeTools` filter would silently differ from pi's for any
 /// workspace with overlapping tool names.
 ///
 /// **Post-cut edits, both deliberate:** the header's `use mcpScript.` sentence is removed (Cut 4)
@@ -3746,30 +3818,9 @@ pub fn build_proxy_description(
         ));
     }
 
-    // MCP-198 · the cross-server candidate-collision set, built once.
-    let mut all_candidates: IndexSet<String> = IndexSet::new();
-    for (other_server, other_definition) in &config.mcp_servers {
-        let Some(other_entry) = cache.get(other_server) else { continue };
-        if other_definition.is_disabled() {
-            continue;
-        }
-        let other_prefix = resolve_tool_prefix(Some(other_definition), prefix);
-        for tool in &other_entry.tools {
-            // `isUiToolVisibleToModel` **survives the MCP Apps cut**: dropping it would expose to
-            // the model tools the server explicitly marked app-only.
-            if !is_ui_tool_visible_to_model(tool.ui_visibility.as_deref()) {
-                continue;
-            }
-            all_candidates
-                .extend(get_tool_name_candidates(&tool.name, other_server, other_prefix, false));
-        }
-        if other_definition.expose_resources() {
-            for (name, _) in &other_entry.resources {
-                let base = format!("read_{}", resource_name_to_tool_name(name));
-                all_candidates.extend(get_tool_name_candidates(&base, other_server, other_prefix, false));
-            }
-        }
-    }
+    // MCP-198 · the cross-server candidate-collision set — built once, and only when a selector
+    // exists to read it. See [`collision_candidates`].
+    let all_candidates = collision_candidates(config, cache, prefix);
 
     // 3 · Per-server proxy counts.
     let mut server_summaries: Vec<String> = Vec::new();
@@ -3779,11 +3830,10 @@ pub fn build_proxy_description(
         }
         let entry = cache.get(server_name);
         let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
-        // Upstream builds the collision index only when the server actually has filters; without
-        // filters `isToolAllowed` never consults it, so the two are observationally identical.
-        let has_filters = definition.include_tools.as_ref().is_some_and(|list| !list.is_empty())
-            || definition.exclude_tools.as_ref().is_some_and(|list| !list.is_empty());
-        let collision = if has_filters { Some(&all_candidates) } else { None };
+        // `direct-tools.ts:284` — the set is consulted only when *this* server declares a selector.
+        // [`collision_candidates`] tests the same predicate across every server before it builds
+        // anything, so `Some(&all_candidates)` here can never name a set that was skipped.
+        let collision = server_has_tool_filters(definition).then_some(&all_candidates);
 
         let tool_count = entry.map_or(0, |entry| {
             entry
@@ -3949,6 +3999,18 @@ pub fn mcp_tool_schema() -> &'static Value {
     })
 }
 
+/// `Some` for **any** present value including `null`; `None` only when the key is absent.
+///
+/// This is JavaScript's `"args" in params` / `params.args !== undefined` distinction, which serde's
+/// `Option<Value>` erases by mapping a present `null` onto `None`. Only [`McpToolParams::args`]
+/// needs it — see the field's own note.
+fn present_value<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Value::deserialize(deserializer).map(Some)
+}
+
 /// The twelve gateway parameters, deserialised.
 ///
 /// `limit`/`offset` are `f64` because the schema says `number` and [`paginate`] reproduces JS's
@@ -3959,6 +4021,15 @@ pub struct McpToolParams {
     /// Tool name to call.
     pub tool: Option<String>,
     /// Arguments as a JSON object, or a JSON string encoding one.
+    ///
+    /// [`present_value`], not serde's own `Option`, because this field is the **only** one whose
+    /// presence is load-bearing twice over: `parseArgs` rejects an explicit `null` (`index.ts:880`)
+    /// and `1bf3671`'s rescue tests `params.args !== undefined` (`index.ts:903`). Serde folds a
+    /// present `null` into `None`, which would answer `mcp({ args: null })` with a status envelope
+    /// where upstream throws. The sibling `Option` fields keep the plain mapping: their modes are
+    /// selected by `!== undefined` too, but no upstream arm distinguishes an explicit `null` from
+    /// an absent key for them.
+    #[serde(default, deserialize_with = "present_value")]
     pub args: Option<Value>,
     /// Server name to connect.
     pub connect: Option<String>,
@@ -4007,7 +4078,10 @@ impl McpToolParams {
 fn parse_args(value: Option<&Value>) -> Result<Option<Value>, ToolError> {
     let Some(value) = value else { return Ok(None) };
     let parsed: Value = match value {
-        Value::Null => return Ok(None),
+        // NOT an early `Ok(None)`: upstream's only early return is `value === undefined || value
+        // === ""` (`index.ts:865`). A present `null` falls through to the object test, where
+        // `typeof null === "object"` is defeated by the explicit `args === null` clause and it
+        // throws `got null` (`index.ts:880-882`).
         Value::String(text) if text.is_empty() => return Ok(None),
         Value::String(text) => serde_json::from_str(text)
             .map_err(|error| ToolError::new(format!("Invalid args JSON: {error}")))?,
@@ -5329,6 +5403,52 @@ mod tests {
         assert_eq!(resource_name_to_tool_name("__A B__"), "a_b");
     }
 
+    /// `faf55f7` — the cross-server collision scan does not run *at all* when no server declares a
+    /// selector.
+    ///
+    /// Upstream proves this by mocking `getToolNameCandidates` and asserting zero calls
+    /// (`__tests__/collision-scan-lazy.test.ts`). The Rust equivalent is to assert the scan's
+    /// product: [`collision_candidates`] is the only thing on this path that expands candidates, so
+    /// an empty set is proof the scan was *skipped*, not merely fast — two servers whose tool names
+    /// collide would otherwise both be indexed.
+    #[test]
+    fn collision_scan_is_skipped_when_no_server_declares_a_selector() {
+        let mut cache: IndexMap<String, CachedServerEntry> = IndexMap::new();
+        for server in ["a", "b"] {
+            cache.insert(
+                server.to_string(),
+                CachedServerEntry {
+                    tools: vec![ToolMetadata::new(format!("{server}_search"), "search", "Search")],
+                    resources: Vec::new(),
+                    instructions: None,
+                },
+            );
+        }
+
+        let unfiltered = config_with(&[("a", stdio("npx")), ("b", stdio("npx"))]);
+        assert!(
+            collision_candidates(&unfiltered, &cache, unfiltered.tool_prefix()).is_empty(),
+            "no includeTools/excludeTools anywhere — the O(tools²) scan must not run",
+        );
+
+        // Positive control: one selector on one server re-arms the scan for the whole call, and the
+        // set spans the filtered server too — a tool's own candidates are subtracted by match count
+        // inside `index_has_other_current_match`, never by omitting them here.
+        let filtered =
+            ServerEntry { exclude_tools: Some(vec!["a_search".to_string()]), ..stdio("npx") };
+        let armed = config_with(&[("a", filtered), ("b", stdio("npx"))]);
+        let candidates = collision_candidates(&armed, &cache, armed.tool_prefix());
+        assert!(candidates.contains("b_search"), "{candidates:?}");
+        assert!(candidates.contains("a_search"), "{candidates:?}");
+
+        // …and skipping it changes nothing the model reads: the counts are identical either way,
+        // which is the whole claim — a pure startup-cost fix, not a behaviour change.
+        let described = build_proxy_description(&unfiltered, &cache, &[]);
+        assert!(described.contains("\nServers: a (1 tools), b (1 tools)\n"), "{described}");
+        let described = build_proxy_description(&armed, &cache, &[]);
+        assert!(described.contains("\nServers: b (1 tools)\n"), "{described}");
+    }
+
     // ---- MCP-159 · the regex path's rejection codes ---------------------------------------------------
 
     #[test]
@@ -5441,6 +5561,153 @@ mod tests {
             .await
             .expect_err("a bad `args` is an Err(ToolError), never a details.error code");
         assert_eq!(error.message, "Invalid args: expected a JSON object, got array");
+    }
+
+    /// `index.ts:886-906` (upstream `1bf3671` "fix: recover nested mcp proxy args", #364) — a model
+    /// that wraps the WHOLE gateway request in `args` used to match no arm and silently get status
+    /// back. The rescue re-reads `args` as the params object and re-parses ITS `args`, so a nested
+    /// request dispatches exactly as if it had been passed top-level.
+    #[tokio::test]
+    async fn gateway_params_nested_inside_args_are_rescued_and_dispatched() {
+        let config = config_with(&[("srv", stdio("a"))]);
+        let tools: Vec<ToolMetadata> = (0..5)
+            .map(|index| {
+                ToolMetadata::new(
+                    format!("srv_report_{index}"),
+                    format!("report_{index}"),
+                    "Reporting",
+                )
+            })
+            .collect();
+        let (ctx, _env) = ctx_with(config, &[("srv", tools)], &[], FakeEnv::default());
+        let (_keep, rx) = tokio::sync::watch::channel(InitPhase::Ready(ctx));
+        let gate = Arc::new(ProxyInitGate::new(rx));
+        let tool = McpTool::new(String::new(), &McpSettings::default(), gate);
+
+        // A JSON-STRING nesting. `search` AND its `limit` come out of the rescued object, so the
+        // page is 3 wide rather than the 12-wide default — proof the whole object, not just the
+        // dispatch key, is what dispatch now reads.
+        let rescued = tool
+            .execute(
+                ToolCallId::from("call-1"),
+                json!({"args": "{\"search\":\"report\",\"limit\":3}"}),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
+            .await
+            .expect("a rescued request dispatches like a top-level one");
+        let details = rescued.details.expect("details");
+        assert_eq!(details["mode"], json!("search"), "`status` would mean the rescue never ran");
+        assert_eq!(details["count"], json!(5));
+        assert_eq!(details["nextOffset"], json!(3), "`limit: 3` came from the nested object");
+
+        // An OBJECT nesting reaches the later arms too.
+        let described = tool
+            .execute(
+                ToolCallId::from("call-2"),
+                json!({"args": {"describe": "srv_report_0"}}),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
+            .await
+            .expect("a rescued request dispatches like a top-level one");
+        assert_eq!(described.details.expect("details")["mode"], json!("describe"));
+
+        // `parsedArgs = parseArgs(nestedParams.args)` — the INNER `args` is parsed a second time, so
+        // a broken inner string throws instead of searching with the outer object still in hand.
+        let error = tool
+            .execute(
+                ToolCallId::from("call-3"),
+                json!({"args": {"search": "report", "args": "{"}}),
+                CancelToken::new(),
+                Box::new(|_| {}),
+            )
+            .await
+            .expect_err("the nested `args` is re-parsed after the rescue");
+        assert!(error.message.starts_with("Invalid args JSON: "), "{}", error.message);
+    }
+
+    /// `index.ts:902` and `index.ts:905` — an `args` that is NOT a gateway request is a hard error, never a silent
+    /// status. Both throw sites carry the same sentence: a parsed-but-modeless object, and an `args`
+    /// that parses to nothing (`""`) yet was still supplied.
+    #[tokio::test]
+    async fn non_gateway_params_nested_inside_args_are_rejected_before_the_gate() {
+        // A gate that never initialises: status would still RETURN an envelope here, so an `Err`
+        // also proves the rescue runs ahead of the init gate.
+        let (_keep, rx) = tokio::sync::watch::channel(InitPhase::NotInitialized);
+        let gate = Arc::new(ProxyInitGate::new(rx));
+        let tool = McpTool::new(String::new(), &McpSettings::default(), gate);
+        const NESTED: &str = "Gateway params were nested inside `args`; pass them top-level (for example, mcp({ search: \"...\" }) or mcp({ tool: \"...\", args: {} })).";
+
+        for params in [
+            json!({"args": "{\"query\":\"screenshot\"}"}),
+            json!({"args": {}}),
+            // `parseArgs("")` yields nothing, but `params.args !== undefined` still holds.
+            json!({"args": ""}),
+        ] {
+            let error = tool
+                .execute(
+                    ToolCallId::from("call-1"),
+                    params.clone(),
+                    CancelToken::new(),
+                    Box::new(|_| {}),
+                )
+                .await
+                .expect_err("a modeless `args` is thrown, never answered with status");
+            assert_eq!(error.message, NESTED, "{params}");
+        }
+
+        // No `args` at all is NOT the nested case — it is plain status, which the dead gate reports.
+        let status = tool
+            .execute(ToolCallId::from("call-2"), json!({}), CancelToken::new(), Box::new(|_| {}))
+            .await
+            .expect("a bare call is status, not the nested error");
+        assert_eq!(status.details.expect("details")["error"], json!("not_initialized"));
+    }
+
+    /// `index.ts:880-882` — `parseArgs(null)` is NOT `parseArgs(undefined)`. `typeof null ===
+    /// "object"` is why upstream spells the null test separately, and `1bf3671`'s
+    /// `params.args !== undefined` arm (`index.ts:903`) makes the distinction load-bearing a second
+    /// time. Serde maps a present `null` onto `None`, so without
+    /// [`super::present_value`] both arms would miss and the call would answer with a status
+    /// envelope instead of throwing.
+    #[tokio::test]
+    async fn an_explicit_null_args_is_thrown_where_an_absent_args_is_status() {
+        let (_keep, rx) = tokio::sync::watch::channel(InitPhase::NotInitialized);
+        let gate = Arc::new(ProxyInitGate::new(rx));
+        let tool = McpTool::new(String::new(), &McpSettings::default(), gate);
+
+        // Modeless AND with a gateway mode: `parseArgs` runs first either way, so both throw the
+        // args sentence rather than the nested one or a status envelope.
+        for params in [json!({"args": null}), json!({"tool": "demo_run", "args": null})] {
+            let error = tool
+                .execute(
+                    ToolCallId::from("call-null"),
+                    params.clone(),
+                    CancelToken::new(),
+                    Box::new(|_| {}),
+                )
+                .await
+                .expect_err("an explicit null `args` throws");
+            assert_eq!(
+                error.message, "Invalid args: expected a JSON object, got null",
+                "{params}"
+            );
+        }
+
+        // The absent key still reaches status — the two are distinguished, not merged the other way.
+        let status = tool
+            .execute(ToolCallId::from("call-absent"), json!({}), CancelToken::new(), Box::new(|_| {}))
+            .await
+            .expect("an absent `args` is status");
+        assert_eq!(status.details.expect("details")["error"], json!("not_initialized"));
+
+        // And the mapping is exactly "present or not" at the serde layer.
+        let present: McpToolParams =
+            serde_json::from_value(json!({"args": null})).expect("null is a valid args value");
+        assert_eq!(present.args, Some(Value::Null));
+        let absent: McpToolParams = serde_json::from_value(json!({})).expect("args is optional");
+        assert_eq!(absent.args, None);
     }
 
     // ---- MCP-154 · `executeStatus` ------------------------------------------------------------------

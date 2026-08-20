@@ -7,11 +7,27 @@
 //! ([`ImportKind`], MCP-056/057), discovery, conflicts and the panel fingerprint (MCP-059), and the
 //! six atomic writers with their preview twins (MCP-061…MCP-065).
 //!
-//! Upstream is `pi-mcp-adapter` **v2.25.0** `config.ts` (1226 lines) plus `types.ts`. The working
-//! checkout in `~/cyrup.ai/pi-mcp-adapter` has moved on to v2.26.0, which added `bearerTokenStore`
-//! and `requestHeadersCommand` to `URL_BOUND_AUTH_FIELDS` and rewrote `mergeServerMaps`' first two
-//! rules; **this port targets v2.25.0**, the version the plan was written from, so every `file:line`
-//! citation below is against `git show v2.25.0:config.ts`.
+//! Upstream is `pi-mcp-adapter` **v2.25.0** `config.ts` (1226 lines) plus `types.ts`, retargeted
+//! to **v2.26.1**; every `file:line` citation below is against `git show v2.25.0:config.ts` unless
+//! it names a later version explicitly.
+//!
+//! **`config.ts` is fully reconciled to v2.26.1 and nothing is outstanding.** The whole delta is
+//! `+4/-4` in four one-line hunks: the `getConfigDirName` import, `PROJECT_PI_CONFIG_NAME` losing
+//! its `.pi/` prefix, `getProjectPiConfigPath` composing the dir name (all three commit `4ab5a40`,
+//! already ported as [`PROJECT_OVERRIDE_DIR`] + [`PROJECT_OVERRIDE_NAME`]), and
+//! [`URL_BOUND_AUTH_FIELDS`] gaining `requestHeadersCommand` (commit `2a2db3c`, ported with
+//! [`HttpRequestHeadersCommand`]). `types.ts` contributes `warnOnLargeDirectTools` (`76a4ea3`) and
+//! the `ServerEntry` field, both ported.
+//!
+//! An earlier revision of this header listed `bearerTokenStore` and "the rewrite of
+//! `mergeServerMaps`' first two rules" as outstanding v2.26.0 work. **Neither exists.**
+//! `git grep bearerTokenStore v2.26.1` is empty — the symbol appears at no upstream tag — and
+//! `mergeServerMaps`' rules are byte-identical between v2.25.0 and v2.26.1. Both were removed rather
+//! than left as phantom work items for the next reader to hunt.
+//!
+//! One real gap remains, and it is *not* a missing upstream feature: a malformed
+//! `requestHeadersCommand` fails **open** here, because [`lenient`] degrades it to `None` and the
+//! server then connects unsigned. See [`HttpRequestHeadersCommand`] and plan unit **MCP-069a**.
 //!
 //! # Four rules the code below encodes, and one it cannot
 //!
@@ -508,6 +524,7 @@ static EMPTY_SETTINGS: McpSettings = McpSettings {
     idle_timeout: None,
     request_timeout_ms: None,
     direct_tools: None,
+    warn_on_large_direct_tools: None,
     tool_result_rendering: None,
     collapsed_result_lines: None,
     approve_tools: None,
@@ -557,12 +574,52 @@ impl McpConfig {
     }
 }
 
+/// `HttpRequestHeadersCommand` (`types.ts:359-369`, upstream **v2.26.0** commit `2a2db3c`) — a
+/// trusted executable run for **every** outbound HTTP request on this server.
+///
+/// `headers` is resolved once at connect; this is resolved per request, because a caller-bound
+/// signature (HMAC over the body, DPoP, SigV4) is a function of the exact bytes about to be sent.
+/// The engine — the JSON envelope on stdin, the JSON header object on stdout, and the fail-closed
+/// process-tree reaping that stops a signing helper outliving its request — is
+/// [`crate::request_headers_command`].
+///
+/// # Why every field is optional when upstream types `command` as required
+///
+/// Upstream's `command: string` is a TypeScript type, not a check: `validateConfig` never inspects
+/// this block, and `resolvedCommand` is what throws
+/// `"HTTP request headers command requires a non-empty command"` — at **connect** time, not at
+/// parse. Module rule 1 puts the predicate at the read site, and rule 4 forbids a malformed value
+/// taking the file down, so the field is `Option<String>` and
+/// [`crate::request_headers_command::resolve_request_headers_command`] raises upstream's sentence.
+/// `timeoutMs` is `f64` for the same reason [`ServerEntry::idle_timeout`] is: it arrives from
+/// `JSON.parse`, and `Number.isInteger` is checked at the read site.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HttpRequestHeadersCommand {
+    /// The executable, `interpolateEnvVars`'d. Spawned directly — **not** through a shell, unlike
+    /// the `!`-prefixed `headers` secret form.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Arguments, each `interpolateEnvVars`'d.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub args: Option<Vec<String>>,
+    /// Environment overrides layered over the adapter's own environment, each value
+    /// `interpolateEnvVars`'d. No `!`-secret resolution: upstream uses `interpolateEnvVars`, not
+    /// `resolveCommandSecret`, so a leading `!` here is literal.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub env: Option<BTreeMap<String, String>>,
+    /// Per-invocation timeout in **milliseconds**; defaults to `10_000` and must be an integer in
+    /// `1..=60000`.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<f64>,
+}
+
 /// One `mcpServers` entry — upstream `ServerEntry` (`ServerDefinition` is an alias).
 ///
 /// Upstream carries 28 fields; `socket` is **Cut 3** (the raw framed unix-socket transport, which
-/// rmcp does not implement), leaving the 27 below. README documents 25 of them — `httpTransport`,
-/// `pluginDataDir` and `literalEnv` are set only by [`crate::agent_plugin`] and are never
-/// hand-written.
+/// rmcp does not implement), leaving the 27 below, plus `requestHeadersCommand` from the v2.26.1
+/// retarget. README documents 26 of them — `httpTransport`, `pluginDataDir` and `literalEnv` are
+/// set only by [`crate::agent_plugin`] and are never hand-written.
 ///
 /// Every field goes through [`lenient`]: a wrong-typed field degrades to `None` rather than taking
 /// the whole file down (module header, rule 4). There is deliberately **no**
@@ -594,6 +651,12 @@ pub struct ServerEntry {
     /// `computeServerHash` pre-image, and one of `URL_BOUND_AUTH_FIELDS`.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub headers: Option<BTreeMap<String, String>>,
+    /// Add or replace HTTP headers by running a trusted command **for each request**
+    /// (`types.ts:383`, v2.26.0). Part of the `computeServerHash` pre-image, and one of
+    /// `URL_BOUND_AUTH_FIELDS` — it signs requests to *one* endpoint, so it must not follow a
+    /// higher-precedence source that only repointed `url`.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub request_headers_command: Option<HttpRequestHeadersCommand>,
     /// `"oauth" | "bearer" | false`. **Absent** is not `false`: it means "auto-detect OAuth for a
     /// `url` server".
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
@@ -769,6 +832,12 @@ pub struct McpSettings {
     /// Default `false`. Per-server `directTools` that is merely *present* wins over this.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub direct_tools: Option<bool>,
+    /// Default `true`, tested `!== false` (`types.ts:509`, `direct-tools.ts:227`; upstream
+    /// `76a4ea3`, issue #358). Silences the "75+ direct tools resolved" advisory and **nothing
+    /// else** — it is not a cap and never drops a spec, so the user who deliberately registered 75
+    /// tools keeps all 75 and just stops being told about it once per resolve.
+    #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
+    pub warn_on_large_direct_tools: Option<bool>,
     /// Default `"compact"`, via `=== "boxed" ? "boxed" : "compact"`.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
     pub tool_result_rendering: Option<ToolResultRendering>,
@@ -945,6 +1014,15 @@ impl McpSettings {
     #[must_use]
     pub fn direct_tools(&self) -> bool {
         self.direct_tools == Some(true)
+    }
+
+    /// `settings?.warnOnLargeDirectTools !== false` (`direct-tools.ts:227`). A literal `false` is
+    /// the *only* value that silences the large-direct-tools advisory: an absent `settings` block,
+    /// an absent key, and a non-boolean (already `None` after [`lenient`]) all still warn, which is
+    /// what keeps the default loud for the accidental 75-tool set this advisory exists to catch.
+    #[must_use]
+    pub fn warn_on_large_direct_tools(&self) -> bool {
+        self.warn_on_large_direct_tools != Some(false)
     }
 
     /// `settings?.toolResultRendering === "boxed" ? "boxed" : "compact"`.
@@ -1621,7 +1699,8 @@ fn push_load_warning(path: &Path, error: &str, diagnostics: &mut Vec<ConfigDiagn
 ///
 /// Present as data purely so the exhaustiveness test in this module can assert it against the
 /// struct's field list; [`merge_entry`] clears the fields by name, not by lookup.
-pub const URL_BOUND_AUTH_FIELDS: [&str; 3] = ["headers", "bearerToken", "bearerTokenEnv"];
+pub const URL_BOUND_AUTH_FIELDS: [&str; 4] =
+    ["headers", "bearerToken", "bearerTokenEnv", "requestHeadersCommand"];
 
 /// `mergeServerMaps`' per-entry half — **the security core of this module** (MCP-053).
 ///
@@ -1666,6 +1745,9 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
         base_entry.headers = None;
         base_entry.bearer_token = None;
         base_entry.bearer_token_env = None;
+        // v2.26.0 (`config.ts:474`): a per-request signing command is bound to the endpoint it was
+        // configured for just as tightly as a static header is, so it goes with them.
+        base_entry.request_headers_command = None;
         if base_entry.oauth != Some(OAuthSetting::Disabled(false)) {
             base_entry.oauth = None;
         }
@@ -1678,6 +1760,7 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
         cwd,
         url,
         headers,
+        request_headers_command,
         auth,
         bearer_token,
         bearer_token_env,
@@ -1708,6 +1791,9 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
         cwd: cwd.clone().or(base_entry.cwd),
         url: url.clone().or(base_entry.url),
         headers: headers.clone().or(base_entry.headers),
+        request_headers_command: request_headers_command
+            .clone()
+            .or(base_entry.request_headers_command),
         auth: auth.clone().or(base_entry.auth),
         bearer_token: bearer_token.clone().or(base_entry.bearer_token),
         bearer_token_env: bearer_token_env.clone().or(base_entry.bearer_token_env),
@@ -1786,6 +1872,9 @@ pub fn merge_settings(base: Option<&McpSettings>, next: Option<&McpSettings>) ->
         idle_timeout: next.idle_timeout.or(base.idle_timeout),
         request_timeout_ms: next.request_timeout_ms.or(base.request_timeout_ms),
         direct_tools: next.direct_tools.or(base.direct_tools),
+        warn_on_large_direct_tools: next
+            .warn_on_large_direct_tools
+            .or(base.warn_on_large_direct_tools),
         tool_result_rendering: next.tool_result_rendering.or(base.tool_result_rendering),
         collapsed_result_lines: next.collapsed_result_lines.or(base.collapsed_result_lines),
         approve_tools: next.approve_tools.clone().or(base.approve_tools),
@@ -5115,5 +5204,92 @@ mod tests {
             "{:?}",
             loaded.diagnostics
         );
+    }
+
+    // -- MCP-053 -----------------------------------------------------------------------------
+
+    /// `requestHeadersCommand` is one of [`URL_BOUND_AUTH_FIELDS`] (v2.26.0 `config.ts:474`), so a
+    /// higher-precedence source that supplies only a new `url` must **not** inherit it: the command
+    /// signs requests to the endpoint it was configured for, and following the server to a new one
+    /// would hand the signature — and whatever `${REQUEST_SECRET}` it interpolates — to a different
+    /// host. Upstream's
+    /// `"drops an inherited request headers command when a url-only override repoints the server"`
+    /// (`__tests__/config.test.ts:903-921`).
+    #[test]
+    fn a_url_only_override_drops_an_inherited_request_headers_command() {
+        let base: ServerEntry = serde_json::from_str(
+            r#"{ "url": "https://a.example/mcp", "bearerToken": "s3cret",
+                 "requestHeadersCommand": { "command": "sign-old-url",
+                                            "args": ["${REQUEST_SECRET}"] } }"#,
+        )
+        .unwrap();
+
+        // Repointed: everything URL-bound goes, the entry is the override alone.
+        let repointed: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://b.example/mcp" }"#).unwrap();
+        let merged = merge_entry(Some(&base), &repointed);
+        assert_eq!(merged.request_headers_command, None);
+        assert_eq!(merged.bearer_token, None);
+        assert_eq!(merged.url.as_deref(), Some("https://b.example/mcp"));
+        let serialized = serde_json::to_string(&merged).unwrap();
+        assert!(!serialized.contains("REQUEST_SECRET"), "{serialized}");
+
+        // The SAME url is not a repoint: the command is inherited exactly as `headers` is.
+        let same: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://a.example/mcp", "debug": true }"#).unwrap();
+        let kept = merge_entry(Some(&base), &same);
+        assert_eq!(
+            kept.request_headers_command
+                .as_ref()
+                .and_then(|command| command.command.as_deref()),
+            Some("sign-old-url")
+        );
+
+        // Rule 4: a wrong-typed block degrades to `None` rather than taking the entry — and the
+        // rest of the entry survives, so the server still loads (unsigned, and it will fail closed
+        // at connect rather than at parse).
+        let malformed: ServerEntry = serde_json::from_str(
+            r#"{ "url": "https://c.example/mcp", "requestHeadersCommand": "sign-me" }"#,
+        )
+        .unwrap();
+        assert_eq!(malformed.request_headers_command, None);
+        assert_eq!(malformed.url.as_deref(), Some("https://c.example/mcp"));
+
+        // An override that re-supplies the command wins, because `definition` spreads last.
+        let resupplied: ServerEntry = serde_json::from_str(
+            r#"{ "url": "https://b.example/mcp",
+                 "requestHeadersCommand": { "command": "sign-new-url" } }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            merge_entry(Some(&base), &resupplied)
+                .request_headers_command
+                .as_ref()
+                .and_then(|command| command.command.as_deref()),
+            Some("sign-new-url")
+        );
+    }
+
+    /// The constant and the fields [`merge_entry`] actually clears must not drift apart — the whole
+    /// reason `URL_BOUND_AUTH_FIELDS` exists as data.
+    #[test]
+    fn url_bound_auth_fields_matches_what_the_merge_clears() {
+        let base: ServerEntry = serde_json::from_str(
+            r#"{ "url": "https://a.example/mcp", "headers": { "X-Key": "k" },
+                 "bearerToken": "t", "bearerTokenEnv": "TOK",
+                 "requestHeadersCommand": { "command": "sign" } }"#,
+        )
+        .unwrap();
+        let repointed: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://b.example/mcp" }"#).unwrap();
+        let merged = merge_entry(Some(&base), &repointed);
+
+        // Serialising the merged entry names exactly the fields that survived, so a field added to
+        // the constant but forgotten in `merge_entry` shows up here as a leftover key.
+        let serialized = serde_json::to_string(&merged).unwrap();
+        for field in URL_BOUND_AUTH_FIELDS {
+            assert!(!serialized.contains(field), "{field} survived a url repoint: {serialized}");
+        }
+        assert_eq!(URL_BOUND_AUTH_FIELDS.len(), 4);
     }
 }

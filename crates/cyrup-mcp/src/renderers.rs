@@ -1700,7 +1700,13 @@ pub fn collect_collapsed_result_lines(
                 return false;
             }
             self.lines.push(line.to_string());
-            self.remaining -= length + 1;
+            // `tool-result-renderer.ts:383` is a bare `remainingChars -= line.length + 1`, which
+            // reaches `-1` when the pushed line is exactly as long as the budget. That `-1` is only
+            // ever read by `:348`'s `remainingChars <= 0`, which stops the walk — so saturating at
+            // `0` reproduces it exactly, and is the ONLY faithful spelling here: `usize` has no
+            // `-1`, a wrapped `usize::MAX` never satisfies this port's `remaining == 0` guard, and
+            // the budget would silently become unbounded (release) or panic (debug).
+            self.remaining = self.remaining.saturating_sub(length + 1);
             true
         }
     }
@@ -2155,6 +2161,25 @@ mod tests {
         let blanks = "\n".repeat(100);
         let display = format_mcp_tool_result_lines(&[text(&format!("{blanks}useful"))], false, 1, 50);
         assert_eq!(display.lines, vec!["(leading blank output omitted)", "…"]);
+        assert!(display.truncated);
+    }
+
+    #[test]
+    fn a_line_that_lands_exactly_on_the_char_budget_does_not_underflow() {
+        // Regression, found while reconciling `6686b12` (which only supplies context here).
+        // `tool-result-renderer.ts:383` lets `remainingChars` fall to `-1` when a pushed line is
+        // exactly as long as the budget, and catches it on the next call with `remainingChars <= 0`
+        // (`:348`). `usize` has no `-1`: the port's guard is `remaining == 0`, which a wrapped
+        // `usize::MAX` never satisfies, so the budget would become unbounded (release) or panic
+        // (debug). `saturating_sub` lands on `0`, which is the same guard upstream's `-1` trips.
+        let display = format_mcp_tool_result_lines(&[text("abcde")], false, 3, 5);
+        assert_eq!(display.lines, vec!["abcde"]);
+        assert!(!display.truncated);
+
+        // The budget really is spent: a second line is refused rather than admitted by a
+        // wrapped-around `remaining`.
+        let display = format_mcp_tool_result_lines(&[text("abcde\nfghij")], false, 3, 5);
+        assert_eq!(display.lines, vec!["abcde"]);
         assert!(display.truncated);
     }
 

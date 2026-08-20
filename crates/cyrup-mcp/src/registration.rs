@@ -95,15 +95,29 @@ pub const MCP_COMMAND: &str = "mcp";
 /// `/mcp-auth` — the OAuth flow's interactive entry point.
 pub const MCP_AUTH_COMMAND: &str = "mcp-auth";
 
-/// The three session-lifecycle seams the extension subscribes to.
+/// The four seams the extension subscribes to.
 ///
 /// * [`EventKind::SessionStart`] — the generation bump and the runtime build (MCP-008).
+/// * [`EventKind::Input`] — `index.ts:489-511`'s pre-turn keep-alive convergence: the *turn* is
+///   what must not start against a keep-alive server whose catalog went stale, so the gate hangs
+///   off the submission, not off a timer.
 /// * [`EventKind::SessionShutdown`] — **the only teardown point**, and where the metadata flush
 ///   lives (MCP-009, MCP-014).
 /// * [`EventKind::ToolResult`] — `error-signal.ts`'s `toolErrorOverride`, which re-flags a returned
 ///   MCP failure as an error (MCP-045).
-pub const SUBSCRIBED_EVENTS: &[EventKind] =
-    &[EventKind::SessionStart, EventKind::SessionShutdown, EventKind::ToolResult];
+///
+/// The `input` seam is **not** in 13a: the plan was written against v2.25.0, whose `index.ts` had
+/// only the other three `pi.on` registrations. Upstream `48799fa` ("converge stale keep-alive tool
+/// catalogs", #374) added the fourth, and it is load-bearing rather than an optimisation — without
+/// the subscription [`McpExtension::on_input`][crate::extension::McpExtension::on_input] is dead
+/// code and `ensureConverged` is reachable only from the 30-second timer, which is exactly the
+/// window the fix closes.
+pub const SUBSCRIBED_EVENTS: &[EventKind] = &[
+    EventKind::SessionStart,
+    EventKind::Input,
+    EventKind::SessionShutdown,
+    EventKind::ToolResult,
+];
 
 /// `direct-tools.ts`'s `BUILTIN_NAMES` — the eight names a formatted MCP tool name may never take
 /// (MCP-212). Note `cyrup_tools::registry`'s own built-in list has **seven** entries and omits
@@ -112,7 +126,9 @@ pub const SUBSCRIBED_EVENTS: &[EventKind] =
 pub const BUILTIN_NAMES: [&str; 8] = ["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"];
 
 /// `direct-tools.ts`'s `DIRECT_TOOLS_ADVISORY_THRESHOLD`. At or above this many resolved specs the
-/// resolver warns once: every direct tool costs prompt context on every turn (MCP-246).
+/// resolver warns once: every direct tool costs prompt context on every turn (MCP-246). The warning
+/// is suppressible with `settings.warnOnLargeDirectTools: false`; the threshold itself is not a cap
+/// and never drops a spec.
 pub const DIRECT_TOOLS_ADVISORY_THRESHOLD: usize = 75;
 
 /// `direct-tools.ts`'s `INSTRUCTIONS_SNIPPET_LENGTH` — how much of a server's `instructions` the
@@ -1145,10 +1161,13 @@ pub fn resolve_direct_tools(
         }
     }
 
-    if specs.len() >= DIRECT_TOOLS_ADVISORY_THRESHOLD {
-        // RESIDUAL: upstream gates this on `settings.warnOnLargeDirectTools !== false`, a 23rd
-        // settings key that `crate::config::McpSettings` does not carry yet. Reported to the config
-        // owner; until it lands the advisory is unconditional, which is upstream's default.
+    // `direct-tools.ts:227` (upstream `76a4ea3`, issue #358): the settings test runs FIRST and is
+    // `!== false`, so an absent block still warns. This gates the *message* only — the advisory has
+    // never been a cap, so suppressing it changes nothing about which specs register. That is the
+    // whole point: the person who hit it meant to register 75 tools and wants the line to stop.
+    if config.settings_or_default().warn_on_large_direct_tools()
+        && specs.len() >= DIRECT_TOOLS_ADVISORY_THRESHOLD
+    {
         tracing::warn!(
             "MCP: {} direct tools resolved. Each direct tool adds prompt context; README guidance recommends targeted sets of 5-20 tools and using the proxy or an explicit string[] when 75+ direct tools would be registered.",
             specs.len()
@@ -2057,6 +2076,103 @@ mod tests {
         assert!(!matches_tool_pattern(&candidates, &[]));
     }
 
+    /// `types.ts:848` `indexHasOtherCurrentMatch`, mirroring the three cases upstream added to
+    /// `__tests__/resolve-server-from-tool-name.test.ts` in `14c0e6c` ("share filtered selector
+    /// candidate scans", issue #354).
+    ///
+    /// The rule [`CandidateIndex`] exists to enforce: a **legacy-only** alias selects a tool only
+    /// when it does not also name some *other* tool's current name. For
+    /// `("do-thing", "my-server", Server)` the current set keeps the hyphen
+    /// (`my-server_do-thing`), so `my_server_do_thing` is legacy-only — it excludes when nothing
+    /// else answers to it, and must not once another server's tool does.
+    ///
+    /// The glob arm is why `14c0e6c` compares **counts** instead of asking `any(matches)`: the
+    /// index spans every server *including this one*, because upstream stopped subtracting the
+    /// tool's own candidates when building it. A pattern that reaches only my own candidates is
+    /// therefore not a collision, which is what `current_only` pins — a naive `any` would read the
+    /// self-match as someone else and silently stop excluding.
+    #[test]
+    fn the_candidate_index_separates_other_tools_from_my_own() {
+        let no_patterns: Option<&[String]> = None;
+        let empty_patterns: &[String] = &[];
+        let exclude = ["my_server_do_thing".to_string()];
+
+        // Legacy-only alias, nobody else answers to it → the exclusion lands.
+        let mut lonely = CandidateIndex::new(HashSet::new());
+        assert!(!is_tool_allowed(
+            "do-thing",
+            "my-server",
+            ToolPrefix::Server,
+            no_patterns,
+            Some(&exclude),
+            Some(&mut lonely),
+        ));
+        // Same alias, but it is another tool's *current* name → the exclusion is suppressed.
+        let mut collision = CandidateIndex::new(HashSet::from(["my_server_do_thing".to_string()]));
+        assert!(is_tool_allowed(
+            "do-thing",
+            "my-server",
+            ToolPrefix::Server,
+            no_patterns,
+            Some(&exclude),
+            Some(&mut collision),
+        ));
+
+        // An absent or empty selector must never touch the memo tables: `is_tool_allowed`
+        // short-circuits before `matches_tool_selector` builds a candidate set at all.
+        let mut untouched = CandidateIndex::new(HashSet::from(["my_server_do_other".to_string()]));
+        for patterns in [no_patterns, Some(empty_patterns)] {
+            assert!(is_tool_allowed(
+                "do-thing",
+                "my-server",
+                ToolPrefix::Server,
+                no_patterns,
+                patterns,
+                Some(&mut untouched),
+            ));
+        }
+        assert!(untouched.matcher.is_empty());
+        assert!(untouched.matching_count.is_empty());
+
+        // Glob: one *other* candidate matches and none of mine do → collision. Both the compiled
+        // matcher and the whole-index match count are memoised once and reused by the second call.
+        let glob = ["my_server_do_*".to_string()];
+        let mut globbed = CandidateIndex::new(HashSet::from([
+            "my_server_do_other".to_string(),
+            "unrelated".to_string(),
+        ]));
+        for _ in 0..2 {
+            assert!(is_tool_allowed(
+                "do-thing",
+                "my-server",
+                ToolPrefix::Server,
+                no_patterns,
+                Some(&glob),
+                Some(&mut globbed),
+            ));
+        }
+        assert_eq!(globbed.matching_count.get("my_server_do_*"), Some(&1));
+        assert_eq!(globbed.matcher.len(), 1);
+
+        // The same glob over an index holding only my own current candidates: `total > mine` is
+        // false, so it is not a collision and the legacy alias excludes.
+        let mut current_only = CandidateIndex::new(tool_name_candidates(
+            "do-thing",
+            "my-server",
+            ToolPrefix::Server,
+            false,
+        ));
+        assert!(!is_tool_allowed(
+            "do-thing",
+            "my-server",
+            ToolPrefix::Server,
+            no_patterns,
+            Some(&glob),
+            Some(&mut current_only),
+        ));
+        assert_eq!(current_only.matcher.len(), 1);
+    }
+
     // --- MCP-212, the critical -----------------------------------------------------------------
 
     #[test]
@@ -2199,6 +2315,45 @@ mod tests {
         );
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
         assert_eq!(names, vec!["a_t"]);
+    }
+
+    // --- MCP-246 -------------------------------------------------------------------------------
+
+    /// `__tests__/direct-tools.test.ts` — "warns by default without capping when resolved direct
+    /// tools exceed the README threshold" and "suppresses the large direct-tools advisory when
+    /// configured" (upstream `76a4ea3`, issue #358).
+    ///
+    /// The advisory itself is a `tracing::warn!` and this crate installs no subscriber in tests, so
+    /// upstream's `expect(warn).not.toHaveBeenCalled()` has no direct analogue. What is asserted is
+    /// both halves that are observable: the threshold is **not** a cap — all 75 specs resolve with
+    /// the advisory on *or* off — and the `!== false` three-way that decides whether it is emitted,
+    /// read at the same call site the resolver reads it from.
+    #[test]
+    fn the_large_direct_tools_advisory_is_suppressible_and_never_caps() {
+        let mut config = config_of(&[("huge", entry(true))]);
+        let tools: Vec<CachedTool> = (0..DIRECT_TOOLS_ADVISORY_THRESHOLD)
+            .map(|index| cached_tool(&format!("tool_{index}")))
+            .collect();
+        let cache = cache_of(&[("huge", cache_entry(tools))]);
+
+        // Default: loud, and every configured tool still registers.
+        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        assert_eq!(specs.len(), DIRECT_TOOLS_ADVISORY_THRESHOLD);
+        assert!(config.settings_or_default().warn_on_large_direct_tools());
+
+        // Suppressed: byte-identical spec list, no advisory.
+        config.settings = Some(McpSettings {
+            warn_on_large_direct_tools: Some(false),
+            ..McpSettings::default()
+        });
+        let suppressed = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        assert_eq!(suppressed, specs);
+        assert!(!config.settings_or_default().warn_on_large_direct_tools());
+
+        // `!== false`, not `=== true`: a present-and-`true` key is still loud.
+        config.settings =
+            Some(McpSettings { warn_on_large_direct_tools: Some(true), ..McpSettings::default() });
+        assert!(config.settings_or_default().warn_on_large_direct_tools());
     }
 
     // --- MCP-213 -------------------------------------------------------------------------------

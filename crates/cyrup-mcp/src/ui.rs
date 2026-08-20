@@ -4720,16 +4720,61 @@ pub fn shared_config_notice_lines(
 // 11 · Entry points — how a panel actually reaches the terminal (MCP-369, MCP-391, MCP-394)
 // =================================================================================================
 
+// WHY NEITHER ENTRY POINT BELOW CARRIES UPSTREAM'S `canRenderPanel` GUARD
+// (`commands.ts:31-42` @v2.26.1, upstream `5787ecd` "don't hang MCP panels outside TUI mode").
+//
+// `openMcpPanel`/`openMcpSetup`/`openMcpAuthPanel` used to gate on `ctx.hasUI` alone, which pi
+// documents as true in TUI **and RPC** modes, and then awaited the panel through
+// `new Promise(resolve => ctx.ui.custom(factory, …))`. Outside the terminal `ctx.ui.custom()` is a
+// headless stub that returns *without ever invoking the factory*, so `done`/`resolve` never fire,
+// the promise never settles, and `/mcp` hangs forever for a host embedding the adapter over
+// `pi --mode rpc` — no output, no response, calling command blocked. v2.26.1 added
+// `canRenderPanel(ctx) = ctx.hasUI && ctx.mode === "tui"` in front of every overlay.
+//
+// cyrup cannot reach that state, and not by accident: `HostServices::open_overlay` is a
+// `bool`-returning call rather than a promise, and the live implementation answers `false`
+// **without blocking** whenever no renderer is attached — headless print/json, rpc, or a bare
+// embedder (`crates/cyrup-session-svc/src/host_services.rs:1043-1048`; the trait default at
+// `crates/cyrup-ext/src/host/services.rs:254-256` is likewise `false`). The mode test is therefore
+// already made, by the host, as a capability probe instead of a string comparison, and the two
+// entry points below hand the caller the same "no overlay, fall back to text" signal upstream now
+// returns early: `None` from [`open_mcp_panel`], `false` from [`open_mcp_setup_panel`]. The port's
+// own spelling of upstream's predicate — `hasUI && mode === "tui"`, which `commands.ts` duplicated
+// from `init.ts`'s `isTuiMode` — is [`crate::runtime::ContextSnapshot::is_tui_mode`].
+//
+// What the `/mcp` dispatcher still owes (MCP-394) is the *fallback output* v2.26.1 chose per
+// command, one arm per guard: `/mcp` and `/mcp status` re-render `showStatus()` as text
+// (`commands.ts:553-557`), while `/mcp setup` (`:415-418`) and `/mcp-auth`'s picker (`:612-615`)
+// notify at `info` with [`panel_unavailable_message`] / [`auth_panel_unavailable_message`].
+
 /// `openMcpAuthPanel`'s `noticeLines` (MCP-391), rendered under the search row.
 pub const AUTH_PANEL_NOTICE: &str =
     "Select an OAuth MCP server and press Enter or ctrl+a to authenticate.";
 
 /// `openMcpSetup`'s refusal when the session has a UI but not a *terminal* one — `{mode}` is
 /// `HostCtx::mode`. Exposed here because the text belongs to the panel, not to the dispatcher.
+///
+/// `commands.ts:415-418` @v2.26.1 (upstream `5787ecd`); see the section note above for why the
+/// guard that emits it is a host capability probe here rather than a mode string comparison.
 #[must_use]
 pub fn panel_unavailable_message(mode: &str) -> String {
     format!(
         "The interactive MCP setup panel is only available in the terminal UI (current mode: {mode}). Edit .mcp.json directly, or run /mcp status to review servers."
+    )
+}
+
+/// `openMcpAuthPanel`'s refusal — the `/mcp-auth` twin of [`panel_unavailable_message`]
+/// (`commands.ts:612-615` @v2.26.1, upstream `5787ecd`).
+///
+/// The two texts are **not** interchangeable, which is why this is a second function and not a
+/// parameter: the setup refusal sends the user to `.mcp.json` and `/mcp status` because the thing
+/// they wanted (editing the server table) has no non-overlay form, whereas the auth refusal names
+/// `/mcp-auth <server>` — the picker's whole job is choosing a server, and once the server is named
+/// on the command line the OAuth flow itself needs no overlay and runs in every mode.
+#[must_use]
+pub fn auth_panel_unavailable_message(mode: &str) -> String {
+    format!(
+        "The interactive MCP auth panel is only available in the terminal UI (current mode: {mode}). Use /mcp-auth <server> to authenticate a specific server."
     )
 }
 
@@ -5945,5 +5990,37 @@ mod tests {
             ..OnboardingState::default()
         };
         assert!(shared_config_notice_lines(&summary, &shown_with_old_fingerprint).0.is_empty());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Entry points — the two non-TUI refusals (`__tests__/commands-panel-non-tui.test.ts`
+    // @v2.26.1, upstream `5787ecd`)
+    // ---------------------------------------------------------------------------------------
+
+    #[test]
+    fn the_two_non_tui_refusals_are_byte_exact_and_name_different_escape_hatches() {
+        // `commands.ts:416` @v2.26.1 — `/mcp setup` outside the terminal.
+        assert_eq!(
+            panel_unavailable_message("rpc"),
+            "The interactive MCP setup panel is only available in the terminal UI (current mode: rpc). Edit .mcp.json directly, or run /mcp status to review servers."
+        );
+        // `commands.ts:613` @v2.26.1 — the `/mcp-auth` picker outside the terminal.
+        assert_eq!(
+            auth_panel_unavailable_message("print"),
+            "The interactive MCP auth panel is only available in the terminal UI (current mode: print). Use /mcp-auth <server> to authenticate a specific server."
+        );
+
+        // The upstream test asserts only `stringContaining("/mcp-auth <server>")` on the auth arm,
+        // because the point of that arm is the escape hatch it offers, not the sentence: an auth
+        // refusal that pointed at `.mcp.json` would leave the user editing a file that cannot hold
+        // an OAuth token. Pin the distinction, not just the bytes.
+        let auth = auth_panel_unavailable_message("json");
+        assert!(auth.contains("/mcp-auth <server>"), "{auth}");
+        assert!(!auth.contains(".mcp.json"), "{auth}");
+        assert!(panel_unavailable_message("json").contains(".mcp.json"));
+
+        // Both interpolate `HostCtx::mode` verbatim — the user needs to know which mode refused.
+        assert!(panel_unavailable_message("json").contains("current mode: json"));
+        assert!(auth.contains("current mode: json"));
     }
 }

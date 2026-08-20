@@ -124,6 +124,93 @@ landed, so the *class* stays auditable rather than merely closed.
 | Kimi K3 (`2add245`) — `moonshotai/Kimi-K3` hand-added to `cyrup-provider/src/providers/together.rs`, with the guard widened to `20 + ADDITIONS.len()` (`:447-448`) | in-source only | **FILED 2026-08-19 as `PROV-070`** (`01-…`, `cyrup-original`, low). The **first deliberate divergence from the pinned `b0c2a90e` catalog**, and `PROV-018`/`PROV-060`'s whole design is REGENERATION — a row living only in `together.rs` is exactly what the next regeneration drops |
 | `crates/cyrup-flux` (`67b73a0`) | `spec/flux.md`, `docs/guide/extensions/flux.md` | **AREA OPENED 2026-08-19 — [`14-cyrup-flux.md`](14-cyrup-flux.md), 7 rows (4 medium, 3 low).** An entire 1 513-line shipped crate that appeared in no count in this directory; the scope-gap note below records why it needed its own numbered file rather than a row in area 06 |
 
+## The suite was de-flaked 2026-08-19 — an unattended pipeline now depends on it, and two hazards remain OUTSIDE that work
+
+**Recorded here because it is not a parity finding and belongs to no area file, but every overnight
+run in this repo now rests on it.** The changes are all `#[cfg(test)]`-gated or in `tests/` files; no
+production path was altered, nothing was `#[ignore]`d, and the working tree carries them at the time
+of writing. **Do not "clean up" a lock that looks unused — each one below is the only thing
+serialising a writer against a reader that has no idea it exists.**
+
+**Both rows that were FILED as flakes are refuted as stated, and one of them hid a real flake with a
+different cause.** (a) `cyrup-ext` / `caps::http::tests::*` was **already fixed at HEAD** —
+`PROXY_SETTING_GUARD` (`crates/cyrup-ext/src/caps/http.rs:1077`) is taken through
+`proxy_setting_guard()` (`:1080-1082`) by **36 of that module's 37 tests**; the one that does not is
+`build_request_defaults_accept_encoding_scheme_conditionally_and_identity_for_range` (`:1684`), a
+pure unit test that touches no client. Baseline before anything was changed: **5/5 clean, 289
+passed**; no change made. (b) `cyrup-provider`'s *"`configure_http_proxy` shared across parallel
+tests"* **cannot** be the cause — the only test that calls it lives in a separate integration binary
+(`crates/cyrup-provider/tests/oauth_http_proxy.rs`), i.e. a separate OS process, deliberately, and
+that file's module doc says so at `:8-30`. **The flake is real, though, and was reproduced: 6 of 25
+lib-binary runs failed**, every time as `1117 passed; 1 failed` — the exact filed symptom — always
+`utils::refresh::tests::a_lost_publish_race_does_not_start_a_second_fetch`
+(`crates/cyrup-provider/src/utils/refresh.rs:227`), `left: 2, right: 1`. The cause is the TEST's
+release timing, not process-global state and not a defect in `RefreshDedup`: the `Barrier` ordered
+the two callers' ENTRY into the publish region, but the winner's fetch was released as soon as it
+signalled "started", so the winner could complete and empty the memo while the loser was still
+descheduled between `gate.wait()` and its `self.inflight.lock()` — at which point starting a second
+fetch is *correct*, per pi's `finally`. Fixed by releasing only after both callers have reached their
+first `Poll::Pending`, which is the one signal observable for the LOSER too.
+
+**Six unguarded sites were found by matching every process-global writer against its READERS — which
+is where all six gaps were — and all six are fixed.** The worst two are worth naming because neither
+is a flake in the ordinary sense. **`crates/cyrup-ext-subagents/src/spawn/signal.rs` +
+`spawn/mod.rs` failed 100% deterministically under a shell BACKGROUND job**, which is how an
+overnight pipeline launches a suite: POSIX makes `SIG_IGN` survive `execve`, and a shell running a
+non-interactive *asynchronous* command sets `SIGINT`/`SIGQUIT` to `SIG_IGN` for it (XCU 2.11), so the
+test binary and every `sleep`/`sh` child inherited an ignored SIGINT and stage 1 of the escalation
+ladder physically could not end the child. Measured on one binary at one commit: foreground
+`2 passed, 0 failed, 0.00s`; backgrounded `0 passed, 2 failed, 30.01s` (`left: Sigterm, right:
+Sigint`), burning the full injected grace twice. The repair is `ensure_sigint_reaches_children`
+(`spawn/signal.rs:545`), which **probes first** and only registers a real handler when SIGINT is not
+deliverable, so an interactive `cargo test` does not lose Ctrl-C. **`crates/cyrup-tui/src/tests/markdown.rs`
+was a TOCTOU on `image::CAPABILITIES`**: the writer held `CAPS_LOCK`, the *reader* did not, and it
+reads the global twice and asserts the two agree — a pin landing between them fails a correct
+renderer. The remaining four: `crates/cyrup-provider/src/stream/sse.rs` held a 1 s
+`HTTP_IDLE_TIMEOUT_MS` (`:56`) across a multi-second leg, which every `build_client` in the crate
+reads; `crates/cyrup-tui/src/panic_hook.rs:75-76` reads and clears `PROGRESS_ARMED` under a
+different mutex than `terminal_progress`'s tests used; and `crates/cyrup-tools/tests/shell_interpreter.rs`
+carried a `SAFETY:` comment claiming it was the only test in its binary, untrue since a sibling
+landed. The two new locks follow the existing in-repo idiom (`panic_hook::HOOK_LOCK`,
+`cyrup_permission_system::ext_config::env_lock`) rather than inventing one:
+`caps_lock()` (`crates/cyrup-tui/src/tests/image_capabilities.rs:236`) and `lock_progress_armed()`
+(`crates/cyrup-tui/src/terminal_progress.rs:109-110`). **21 further global-state clusters were
+audited and are already correct** — including all 384 `cyrup-it` env sites under `ENV_MUTATION_LOCK`,
+which `cargo test --workspace` does not even build (`required-features = ["it"]`).
+
+**Evidence: `-p cyrup-provider` went 6/25 FAILED → 30/30 ok; `-p cyrup-ext-subagents` backgrounded
+went 2/2 FAILED (30.0 s) → 5/5 ok (~6 s); `--workspace --exclude cyrup-tui --no-fail-fast`
+backgrounded went 2/2 FAILED → 5/5 with zero test failures; foreground `--workspace` final: 5 996
+passed, 0 failed, 48 binaries.**
+
+**TWO HAZARDS FOUND AND DELIBERATELY NOT FIXED — both block the merge gate, and neither is in the
+de-flaking class.**
+
+1. **`cyrup-session-svc` aborts its whole 311-test binary with SIGABRT, and when it fires 311
+   passing tests are reported as ZERO.** **This is the single worst remaining pipeline hazard.** It
+   is **not** a parallelism race: it reproduces in the foreground (3 of 10 runs, `rc=134`) and at
+   `--test-threads=1` (2 of 3). The faulting frame is third-party, on a runtime thread of its own —
+   `wasmtime::runtime::vm::sys::unix::machports::handler_thread` → `abort`, stderr
+   `mach_msg failed with 268451845 (10004005)`, i.e. the macOS Mach exception-handler thread for wasm
+   traps. Minimal reproducer (~0.09 s, roughly 2 in 6): the two tests
+   `tests::round3::clone_at_creates_new_file_and_runtime_surfaces_fallback` and
+   `tests::round3::drift029_abort_bash_cancels_every_in_flight_command` run together at
+   `--test-threads=1`; either alone is 8/8 and 3/3 clean. **No lock this repo can add fixes it — it
+   needs its own investigation.**
+2. **`crates/cyrup-tui/tests/zzz_scratch_perf_probe.rs` does not compile at HEAD**, so
+   `cargo test -p cyrup-tui` and `cargo test --workspace` cannot build. Its `impl Backend for
+   CaptureBackend` (`:62`) is missing `scroll_region_up`/`scroll_region_down` after a ratatui bump —
+   the sibling harness has both (`crates/cyrup-tui/src/tests/inline_stacking.rs:128`, `:132`).
+   Pre-existing and unrelated, so it was left under the no-unrelated-fixes rule; it is a one-line
+   fix and it is blocking the gate. Verification therefore ran as `-p cyrup-tui --lib --test
+   experimental_marker --test share_viewer_url` plus `--workspace --exclude cyrup-tui`.
+
+**One stale citation found while auditing and left in place** (documentation only, no behaviour):
+`crates/cyrup-ext/src/caps/http.rs:1059` cites `cyrup-provider/src/tests/proxy_setting.rs`, which no
+longer exists — it is `crates/cyrup-provider/tests/oauth_http_proxy.rs` — and the same comment's
+claim at `:1070-1071` that it *"does not retrofit every one of this file's other `request`/
+`request_stream` tests onto the guard"* is no longer true: 36 of 37 now hold it.
+
 ---
 
 # RECONCILED 2026-08-14 (fourth edition) — the ninth pass was an ENUMERATION, not a sweep: nine finite pi surfaces walked end to end, 191 findings, 93 ids filed

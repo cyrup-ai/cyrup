@@ -22,18 +22,156 @@ exists.
 > checkout (seven commits past the `rmcp-v3.1.2` tag), and every claim about it below was checked
 > against that source rather than against docs.rs.
 >
-> **433 port units — 21 critical · 146 high · 171 medium · 60 low · 35 n/a**, plus one `tracker`
-> row excluded from every count. By verdict: 298
+> **436 port units — 22 critical · 147 high · 172 medium · 60 low · 35 n/a**, plus one `tracker`
+> row excluded from every count. By verdict: 301
 > hand-written, 37 `rmcp`, 34 extension-owned, 27 host-verb, 17 open-decision, 11 cut, **9
-> host-addition covering exactly three distinct host surfaces**. Thirty-one rulings are open.
+> host-addition covering exactly three distinct host surfaces**. Thirty-two rulings are open.
+> (**433 at v2.25.0**; the v2.26.1 retarget of 2026-08-20 added three — MCP-027a, MCP-069a, MCP-115a
+> — and the open ruling MCP-069a carries.)
 > **Four surfaces are cut by owner decision** — the legacy HTTP+SSE transport, MCP Apps, the raw
 > unix-socket transport, and `mcpScript`/the JavaScript worker — which removes ~14% of the package and,
 > as a consequence, **every line of hand-written protocol code and every JavaScript engine question**.
 >
 > Counts are computed from the nine section files, which are the source of truth; where a unit's
 > header carries a compound verdict (`hand-written` + `host-verb`), the census counts the
-> **first-listed** one, so the seven verdict buckets sum to exactly 433. Ten units carry a
+> **first-listed** one, so the seven verdict buckets sum to exactly 436. Ten units carry a
 > host-addition leg somewhere in a compound verdict; they are named in full below.
+>
+> **RETARGETED 2026-08-20 — the port now targets `pi-mcp-adapter` v2.26.1, not v2.25.0.** Everything
+> below this blockquote was authored against v2.25.0 and is **still cited that way on purpose**. Read
+> *Retarget — v2.25.0 → v2.26.1* immediately below before acting on any unit.
+
+---
+
+## Retarget — v2.25.0 → v2.26.1
+
+**Dated 2026-08-20.** Upstream tagged v2.26.0 and then v2.26.1 after this plan was written. The port
+target moved to **v2.26.1**; the plan did not move with it, and this section — not a rewritten body —
+is the record of the difference.
+
+### Rule 1: the v2.25.0 citations in this plan are correct and must not be blind-rewritten
+
+This document and its nine section files cite `v2.25.0` **51 times** and reference upstream by
+`file:line` throughout. Those line numbers are correct **as of the v2.25.0 tag**, which is the tree
+they were read from (`git show v2.25.0:<path>` — see *Coverage · Read*). A version-string
+search-and-replace would leave every one of those citations pointing at a line that has since moved,
+**silently invalidating all 51** while looking like an update. It is a strictly worse state than the
+honest one: a citation that says v2.25.0 and means it.
+
+So the rule for anyone working a unit is:
+
+1. A `file:line` in a unit body resolves against **v2.25.0**. `git show v2.25.0:<path>` is how you
+   read it, exactly as the author did.
+2. Before implementing, check that file against **v2.26.1** as well —
+   `git diff v2.25.0..v2.26.1 -- <path>`. If it is untouched — and it is for every production file
+   except the seventeen named in the delta table below — the unit is unaffected and you are done.
+3. If it *is* touched, the delta table below tells you what changed and who owns it.
+
+Only the *delta table*, the *amendments* and the *new units* in this section are written at v2.26.1.
+Where an inline count elsewhere in the plan would now mislead an implementer into building the wrong
+thing, it carries a short `**v2.26.1:**` annotation beside the original rather than a replacement.
+
+### The delta, measured
+
+`git diff v2.25.0..v2.26.1` is **42 files, +2,879 / −163**. Twenty-one of those files are tests and
+account for **+1,725 / −31** on their own. Real source change is **17 files, +1,118 / −124**, and the
+single largest item is one new file (`request-headers-command.ts`, 336 lines — 30% of the source
+delta by itself). Seventeen changed files out of ~60 production files means **the plan's other
+forty-odd file citations are untouched between the two tags**. This is one new feature plus
+evolution — not a rewrite, and not a re-plan.
+
+Four numbers in `types.ts` / `config.ts` / `metadata-cache.ts` moved, all four because of that one
+feature. Verified by counting both tags, not by reading a changelog:
+
+| | v2.25.0 | v2.26.1 | where the plan carries the old number — **annotated in place, not replaced** |
+|---|---:|---:|---|
+| `McpSettings` keys | 23 | **24** (`warnOnLargeDirectTools`) | `13-cyrup-mcp.md` §*What the adapter actually is* table, and *Coverage · Read* |
+| `ServerEntry` fields | 28 | **29** (`requestHeadersCommand`) | same table; `13b-mcp-config.md` MCP-069 |
+| `URL_BOUND_AUTH_FIELDS` | 3 | **4** (`requestHeadersCommand`) | `13b-mcp-config.md` §*mergeServerMaps* step 3 |
+| `computeServerHash` identity keys | 14 (13 post-Cut-3) | **15 (14 post-Cut-3)** | `13b-mcp-config.md` MCP-070 ("11 vs 13 post-cut") |
+
+`URL_BOUND_AUTH_FIELDS` is the one that is not merely a count: an implementer who copies the plan's
+three-element array ships a **credential-leak bug**, because a higher-precedence config source that
+repoints `url` would carry the lower-precedence server's request-signing command to the new endpoint.
+The crate already has the four-element array; the plan's step 3 is annotated in place.
+
+### How this was reconciled, and why most of it was already done
+
+Cuts 1 and 2 of the port were written by agents reading the upstream **working tree**
+(`v2.26.0-12-gc5dbb81`), not the v2.25.0 tag. The port is therefore *ahead of its own plan* in
+several places — `dirs.rs` cites `getConfigDirName()` (`agent-dir.ts:5`), a symbol that did not exist
+at v2.25.0 and that the plan never mentions. Eleven upstream changes were reconciled one at a time
+against `crates/cyrup-mcp` on the rule **determine whether the crate already has it; port only what
+is genuinely missing**. Seven were already present in whole or in part.
+
+| upstream commit | subject | verdict | where |
+|---|---|---|---|
+| `2a2db3c` + `91f9943` | per-request HTTP header commands; header-command result union | **NEWLY PORTED** | new `src/request_headers_command.rs` (1,284 lines, 13 tests); `config.rs` (`HttpRequestHeadersCommand`, `ServerEntry` field, `URL_BOUND_AUTH_FIELDS`, `merge_entry`); `dirs.rs` (15th hash key + golden vectors); `Cargo.toml` (`http`, `sse-stream`, `nix`) |
+| `76a4ea3` | suppress the large-direct-tools advisory | **NEWLY PORTED** | `config.rs` `warn_on_large_direct_tools` + accessor + merge arm; `registration.rs:1168` gate, replacing a `RESIDUAL` comment that named the exact missing key |
+| `48799fa` | converge stale keep-alive tool catalogs | **MIXED** — `lifecycle.ts` (+281/−35, the substance) was already ported arm-for-arm from the working tree; the fourth `pi.on("input")` registration was **missing and is newly ported** (`registration.rs` `SUBSCRIBED_EVENTS`, `extension.rs::on_input`). Its `sendMessage` half is **not** done — see MCP-027a |
+| `5bcd6c5` | scope session tool approvals to arguments | **NEWLY PORTED** as the mechanism (`state.rs::approval_cache_key`, the `server\0tool\0sha256(stableStringify(args))` triple). Its caller, MCP-232, is still an open unit; MCP-232's spec **prescribed the pre-commit bug** and was corrected in `13e-mcp-tools.md` |
+| `5787ecd` | do not hang MCP panels outside TUI mode | **MOSTLY ALREADY PORTED / INAPPLICABLE.** The hang is structurally impossible here — `HostServices::open_overlay` returns `false` instead of blocking, and `ContextSnapshot::is_tui_mode()` already *is* `canRenderPanel`. The `/mcp setup` refusal string was already present; the `/mcp-auth` one was missing and is newly ported (`ui.rs::auth_panel_unavailable_message`) |
+| `1bf3671` | recover nested mcp proxy args | **ALREADY PORTED**, line for line (`proxy.rs:4242-4265`). Two end-to-end tests upstream shipped with it had no counterpart and were added. One fidelity gap in its blast radius **was** fixed here: `args: null` — see *Fixed in passing* |
+| `6686b12` | compact MCP input previews | **ALREADY PORTED (2 of 3) + INAPPLICABLE (1 of 3).** The leading-blank skip and the `(leading blank output omitted)` placeholder are byte-exact in `renderers.rs`. `compactInputPreview` depends on the call-row→result-row stash cut as **MCP-243**, and the defect it fixes does not exist here: `render_call` already prints the full 1,500-char argument body upstream's compact row had lost |
+| `4ab5a40` | honor rebranded Pi config directories | **ALREADY PORTED / INAPPLICABLE.** All three `getConfigDirName()` call sites map to `PROJECT_OVERRIDE_DIR` + `PROJECT_OVERRIDE_NAME`, already split the post-commit way. The `piConfig` manifest half is a host-rebranding facility; cyrup **is** the rebranded distribution and resolves it at compile time — a cut recorded in `dirs.rs:26-31` before v2.26 existed |
+| `faf55f7` | skip the O(tools²) startup collision scan | **MIXED** — `registration.rs` had it at the *post*-commit shape for both call sites; `proxy.rs`'s second `build_proxy_description` (which upstream does not have) was only half-gated and is **newly fixed** (`collision_candidates`, `server_has_tool_filters`) |
+| `14c0e6c` | share filtered selector candidate scans | **ALREADY PORTED** (`registration.rs::CandidateIndex` is `createToolSelectorCandidateIndex`, count-based self-subtraction and all). The tests upstream shipped with it had no counterpart and were added. `ui.rs` correctly still takes the `Set` branch — `mcp-panel.ts` does too |
+
+**Net: 4 newly ported, 2 mixed (part ported here), 4 already ported or inapplicable.** No unit in the
+plan was invalidated; four were amended and three new ones were filed.
+
+### Fixed in passing — two defects the reconciliation surfaced
+
+Both were found by reading v2.26.1 against the crate, neither belongs to any single upstream commit,
+and both are closed:
+
+1. **`renderers.rs` — a reachable `usize` underflow.** `tool-result-renderer.ts:383` lets
+   `remainingChars` fall to `-1` and catches it next call with `remainingChars <= 0` (`:348`). `usize`
+   has no `-1`: a pushed line exactly as long as the remaining budget wrapped to `usize::MAX`, which
+   the port's `remaining == 0` guard never satisfies, so the char budget silently became unbounded in
+   release and **panicked in debug** — reproduced at `renderers.rs:1703`, against a crate that denies
+   `panic`. `saturating_sub` lands on `0`, which is the same guard upstream's `-1` trips. Pinned by
+   `a_line_that_lands_exactly_on_the_char_budget_does_not_underflow`.
+2. **`proxy.rs` — `mcp({ args: null })` answered with status instead of throwing.** Serde folds a
+   present JSON `null` into `None`, erasing the `!== undefined` distinction that `parseArgs`
+   (`index.ts:880-882`) and `1bf3671`'s own rescue arm (`index.ts:903`) both depend on. Closed with a
+   `present_value` deserializer on the one field where presence is load-bearing. Pinned by
+   `an_explicit_null_args_is_thrown_where_an_absent_args_is_status`.
+
+### Three new units — filed, NOT done
+
+These are the parts of the delta that are genuinely missing and are **not** inline fixes. They are
+real, open work; nothing below is implemented.
+
+| id | severity | file | why it is a unit and not a patch |
+|---|---|---|---|
+| **MCP-069a** | **critical** | `13b-mcp-config.md` | a malformed `requestHeadersCommand` **fails open** — the server connects unsigned where upstream refuses. Closing it reverses `config.rs`'s rule 4 for one field, so it needs the port owner's ruling, not a patch |
+| **MCP-115a** | high | `13c-mcp-servers.md` | the `RequestHeadersCommandClient` decorator is built and tested but has **no caller**: `connectHttpClient` has no Rust counterpart yet. Blocked on an unported module, not deferred |
+| **MCP-027a** | medium | `13a-mcp-activation.md` | `sendMessage`'s `triggerTurn` pre-turn convergence gate is **inexpressible** in today's `SendMessage` type alias, which takes no options at all |
+
+### Four amendments to existing units
+
+- **MCP-232** (`13e`) — its spec prescribed the pre-`5bcd6c5` two-part key and said the difference "is
+  not observable". At v2.26.1 it is: the key is a triple including an args hash. Corrected in place.
+- **MCP-207** (`13e`) — `buildToolMetadata` must be ported in its post-`14c0e6c` form, with
+  `additionalCurrentCandidatesByToolName` and the `hasCandidate` / `totalMatchingCount` arms. Porting
+  the v2.25.0 shape then optimising is a second port, not a first.
+- **MCP-069 / MCP-070 / `mergeServerMaps` step 3** (`13b`) — annotated with the four moved counts.
+- **§*What the adapter actually is*** and **§*Coverage · Read*** (this file) — annotated likewise.
+
+### What is still outstanding, stated plainly
+
+Beyond the three units above: `request_headers_command.rs` records **five deliberate divergences** in
+its own module header (a per-connection `CancelToken` for a per-request `AbortSignal`; rmcp's refusal
+of reserved header names; a derived `Authorization` that *appends* to `auth_header` rather than
+replacing it; case-variant duplicate header names resolving last-wins rather than comma-joined; and
+one error sentence with no upstream fixed text). The `Authorization` one is a real behavioural
+difference — a bearer-configured server would send two `Authorization` headers — and it is folded into
+**MCP-115a**, because there is no connect path to observe or test it through until that unit lands.
+
+`proxy.rs::index_has_other_current_match` has `14c0e6c`'s semantics without its memo tables, so it
+recompiles the glob per **(tool, pattern)** pair. Cost only, never behaviour; the planned close is
+deletion in favour of `registration.rs::CandidateIndex` when MCP-207 collapses the two selector paths.
 
 ---
 
@@ -290,7 +428,7 @@ a normal path; "peripheral" means it degrades an affordance.
 | **Server manager & transports** | `server-manager.ts`, `session-recovery.ts`, `lifecycle.ts`, `runtime-owner.ts`, `abort.ts`, `mcp-probe.ts`, `mcp-trace.ts` | 2,000 | load-bearing | five race guards, generation fencing, four lifecycle modes, terminated-session recovery |
 | **OAuth & keychain** | `mcp-auth.ts`, `mcp-auth-flow.ts`, `mcp-oauth-provider.ts`, `mcp-callback-server.ts`, `oauth.ts`, `oauth-handler.ts`, `mcp-keyring-helper.cjs` | 3,236 | load-bearing | the second-largest subsystem; collapses hardest onto rmcp, but the storage half does not collapse at all |
 | **TUI panels** | `mcp-panel.ts`, `mcp-setup-panel.ts`, `panel-keys.ts` | 1,734 | peripheral | fully interactive: server list, tool tree, fuzzy filter, token estimates, direct-tool toggles, save |
-| **Types & naming** | `types.ts` | 859 | load-bearing | 23 settings keys, 28 server-entry fields, four prefix modes, the 18-expression candidate set, glob filtering |
+| **Types & naming** | `types.ts` | 859 | load-bearing | 23 settings keys, 28 server-entry fields, four prefix modes, the 18-expression candidate set, glob filtering (**v2.26.1: 24 and 29** — `warnOnLargeDirectTools`, `requestHeadersCommand`) |
 | **Activation** | `index.ts`, `init.ts`, `state.ts` | 1,609 | load-bearing | the extension entry, `initializeMcp`, the lifecycle generation counter |
 | **Commands** | `commands.ts` | 627 | load-bearing | `/mcp` eight-way switch, `/mcp-auth`, the non-TUI text listings |
 | **Direct tools & registration** | `direct-tools.ts`, `tool-registrar.ts`, `tool-metadata.ts`, `resource-tools.ts`, `ui-tool-visibility.ts` (kept half) | 1,175 | load-bearing | the executor state machine, binary-resource materialisation, `buildProxyDescription` |
@@ -1233,6 +1371,7 @@ enumerated in full above rather than inferred from this column.
 | `MCP-025` | high | S | `hand-written` | Startup connect notifications, terminal sanitising, and skipped-tool warnings | `13a-mcp-activation.md` |
 | `MCP-026` | low | S | `hand-written` | The `MCP_DIRECT_TOOLS` cache-bootstrap pass inside `initialize` | `13a-mcp-activation.md` |
 | `MCP-027` | medium | S | `hand-written` | Lifecycle callbacks (reconnect, reconnect-failure, idle shutdown) | `13a-mcp-activation.md` |
+| `MCP-027a` | medium | S | `hand-written` | `sendMessage`'s `triggerTurn` pre-turn convergence gate **(v2.26.1 retarget, 2026-08-20)** | `13a-mcp-activation.md` |
 | `MCP-028` | medium | S | `hand-written` | `updateServerMetadata` | `13a-mcp-activation.md` |
 | `MCP-029` | high | M | `hand-written` | `updateMetadataCache` write rules | `13a-mcp-activation.md` |
 | `MCP-030` | low | S | `hand-written` | `notifyToolMetadataUpdated` must never let a hook break a connect | `13a-mcp-activation.md` |
@@ -1276,6 +1415,7 @@ enumerated in full above rather than inferred from this column.
 | `MCP-067` | medium | S | `hand-written` | Port the settings merge as a one-level key merge | `13b-mcp-config.md` |
 | `MCP-068` | high | S | `hand-written` | Port env-var overrides, including the `__none__` sentinel | `13b-mcp-config.md` |
 | `MCP-069` | high | M | `hand-written` | Port `ServerEntry` as a typed struct | `13b-mcp-config.md` |
+| `MCP-069a` | critical | S | `hand-written` + `open-decision` | Fail **closed** on a malformed `requestHeadersCommand` **(v2.26.1 retarget, 2026-08-20)** | `13b-mcp-config.md` |
 | `MCP-070` | high | M | `hand-written` | Enforce the absent-vs-null hash pre-image contract | `13b-mcp-config.md` |
 | `MCP-071` | high | S | `hand-written` | Port `ToolPrefix` with all four modes and `sanitizeServerPrefix` | `13b-mcp-config.md` |
 | `MCP-072` | high | S | `hand-written` | Port `formatToolName` / `resolveToolPrefix` | `13b-mcp-config.md` |
@@ -1322,6 +1462,7 @@ enumerated in full above rather than inferred from this column.
 | `MCP-113` | medium | S | `hand-written` | Transport selection and mutual exclusion | `13c-mcp-servers.md` |
 | `MCP-114` | high | M | `extension-owned` | HTTP header, bearer and command-secret resolution | `13c-mcp-servers.md` |
 | `MCP-115` | high | M | `hand-written` | Implicit-vs-explicit OAuth provider state machine and the attempt loop | `13c-mcp-servers.md` |
+| `MCP-115a` | high | S | `hand-written` | Wire the per-request header command into `connectHttpClient` **(v2.26.1 retarget, 2026-08-20)** | `13c-mcp-servers.md` |
 | `MCP-116` | high | S | `hand-written` | needs-auth connection state and one-shot credential invalidation | `13c-mcp-servers.md` |
 | `MCP-117` | medium | S | `rmcp` | Protocol-revision negotiation | `13c-mcp-servers.md` |
 | `MCP-118` | medium | S | `rmcp` | Client capability advertisement (sampling / elicitation form+url) | `13c-mcp-servers.md` |
@@ -1645,9 +1786,9 @@ enumerated in full above rather than inferred from this column.
 
 | § | published as | subject | range | units | note |
 |---|---|---|---|---:|---|
-| 01 | `13a-mcp-activation.md` | Activation, lifecycle and the host seam | `MCP-001`…`MCP-049` | 50 | includes `MCP-037a` (Finding 1) |
-| 02 | `13b-mcp-config.md` | Configuration, the type model and errors | `MCP-050`…`MCP-099` | 50 | |
-| 03 | `13c-mcp-servers.md` | Server manager, transports and the metadata cache | `MCP-100`…`MCP-149` | 50 | |
+| 01 | `13a-mcp-activation.md` | Activation, lifecycle and the host seam | `MCP-001`…`MCP-049` | 51 | includes `MCP-037a` (Finding 1) and `MCP-027a` (v2.26.1 retarget) |
+| 02 | `13b-mcp-config.md` | Configuration, the type model and errors | `MCP-050`…`MCP-099` | 51 | includes `MCP-069a` (v2.26.1 retarget) |
+| 03 | `13c-mcp-servers.md` | Server manager, transports and the metadata cache | `MCP-100`…`MCP-149` | 51 | includes `MCP-115a` (v2.26.1 retarget) |
 | 04 | `13d-mcp-proxy-modes.md` | Proxy modes and search ranking | `MCP-151`…`MCP-199` | 36 | **14 ids deleted, not cut** — see below |
 | 05 | `13e-mcp-tools.md` | Tool registration, approval, output guard and rendering | `MCP-200`…`MCP-249` | 53 | includes `MCP-214a`, `MCP-217a`, `MCP-217b` |
 | 06 | `13f-mcp-credentials.md` | Credential storage, keychain and consent | `MCP-250`…`MCP-291` | 41 | `MCP-279` was retired as dead scaffolding |
@@ -1655,7 +1796,7 @@ enumerated in full above rather than inferred from this column.
 | 08 | `13h-mcp-tui.md` | The TUI panels, slash commands and prompts | `MCP-350`…`MCP-399` | 54 | includes `MCP-350a`, `MCP-363a`, `MCP-385a`, `MCP-394a`, `MCP-395a`, `MCP-397a`; `MCP-373` retired under Cut 2; `MCP-350` is a `tracker` and is excluded from the count (55 bodies, 54 counted) |
 | — | — | **there is no section 09.** `MCP-400`…`MCP-449` is unallocated | — | 0 | the surface it would have held is MCP Apps, which is Cut 2 |
 | 10 | `13i-mcp-protocol-and-verification.md` | Sampling, elicitation, tracing and verification | `MCP-450`…`MCP-499` | 50 | |
-| | | **total** | | **433** | |
+| | | **total** | | **436** | |
 
 **Fourteen ids were deleted from section 04 and are not scheduled anywhere.** They are not `cut`
 records and must not be re-filed as work: `MCP-150` (a tool-surface index tracker, dead scaffolding),
@@ -1666,6 +1807,14 @@ is deleted rather than kept as an auditable `cut` record precisely so that no ph
 it. `MCP-373` (`glimpse-ui.ts`) was retired the same way inside section 08 and is recorded in that
 file's *Out of scope*. Numbering gaps in this table are therefore **not** evidence of a deletion on
 their own — this paragraph and the section files' own *Out of scope* blocks are the record.
+
+**This is also why the v2.26.1 retarget filed `MCP-027a` / `MCP-069a` / `MCP-115a` with letter
+suffixes rather than taking free ids.** Every unallocated number is either a deliberate deletion that
+must never be re-filed as work (`MCP-150`, `MCP-166`, `MCP-179`…`MCP-190`, `MCP-292`…`MCP-299`) or the
+reserved `MCP-400`…`MCP-449` block that would have been section 09 (MCP Apps, Cut 2). The letter
+suffix is the established form for a unit discovered after its range was allocated — `MCP-037a`,
+`MCP-214a`, `MCP-217a`, `MCP-217b`, `MCP-350a`, `MCP-363a` — and it keeps each new unit in the section
+file that owns its subject.
 
 ---
 
@@ -1679,7 +1828,8 @@ enumerated and censused; the ones carrying behavioural contracts the port must s
 proxy-mode suites, the ranking suite, the OAuth `node:test` suite, the storage and cache suites) were
 read. `conformance/` — `driver.ts`, `run.sh`, `baseline-client.yml`, `README.md`. `README.md` and
 `OAUTH.md` were read and cross-checked against the code, which produced two findings on their own:
-`README` documents 22 of 23 settings keys and 25 of 28 server-entry fields, and `OAUTH.md` carries
+`README` documents 22 of 23 settings keys and 25 of 28 server-entry fields (**v2.26.1: 23 of 24 and
+26 of 29**), and `OAUTH.md` carries
 eight divergences from the implementation.
 
 **rmcp 3.1.2**, from the local checkout — `crates/rmcp/Cargo.toml` (the real feature graph),

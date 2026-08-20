@@ -175,6 +175,11 @@ deep-merged; `mcpServers = mergeServerMaps(base.mcpServers, next.mcpServers)`.
    `URL_BOUND_AUTH_FIELDS = ["headers", "bearerToken", "bearerTokenEnv"]` and, unless
    `baseEntry.oauth === false`, delete `oauth`. An explicit `oauth: false` survives a URL change —
    the disable is not credential material.
+   > **v2.26.1 — the array is FOUR elements.** `2a2db3c` appends `"requestHeadersCommand"`. Do not
+   > implement the three-element form above: a request-signing command is bound to exactly one
+   > endpoint, so a higher-precedence source that repoints `url` while inheriting this field would
+   > carry the lower-precedence server's signing command to the new host. `config.rs` already has
+   > `[&str; 4]`; this is a note for anyone re-reading the spec, not open work.
 4. `merged[name] = { ...baseEntry, ...definition }` — **shallow, per-field**. A partial override
    inherits every field it does not mention. Credentials re-supplied by `definition` still apply,
    because `definition` spreads last.
@@ -1151,7 +1156,8 @@ where upstream is `resolve(configured)`.
 `CYRUP_AGENT_DIR`.
 
 **MCP-069 — Port `ServerEntry` as a typed struct** · high · M · `hand-written`
-**upstream** — `types.ts` `ServerEntry` (28 fields), `OAuthConfig` (10), `isServerDisabled`, the
+**upstream** — `types.ts` `ServerEntry` (28 fields; **v2.26.1: 29**, adding `requestHeadersCommand` —
+already ported, see the retarget section of `13-cyrup-mcp.md`), `OAuthConfig` (10), `isServerDisabled`, the
 `ServerDefinition` alias.
 **behavior** — the §6 table, including the "only literal `true` disables" rule and the connect-time
 validation errors (three of them in `resolveServerUrl` alone).
@@ -1167,6 +1173,45 @@ never connect. The exactly-one-transport message loses `, or socket`.
 **verify** — unit: round-trip a fixture with all 26 live fields; a `socket` entry and an
 `httpTransport: "sse"` entry each produce the named diagnostic; a two-transport entry parses but
 fails the connect-time check with the exact message.
+
+**MCP-069a — Fail CLOSED on a malformed `requestHeadersCommand`** · critical · S · `hand-written` + `open-decision`
+*Filed 2026-08-20 by the v2.25.0 → v2.26.1 retarget. NOT implemented.*
+**upstream** — `request-headers-command.ts:153-190` `resolvedCommand` throws **five** sentences. It is
+called twice: **eagerly** by `createRequestHeadersCommandFetch` at connect (`:309`, comment
+"Validate static configuration before the first request") and again per request (`:196`). The eager
+call is the one that matters here — a malformed block fails the **connection**, so the server never
+exists to send an unsigned request. The five sentences: `"HTTP request headers command must be an object"` (non-object, `null`, or an
+array, `:160`), `"… requires a non-empty command"` (`:163`), `"… args must be strings"` (`:166`),
+`"… env values must be strings"` (`:173`), `"… timeoutMs must be an integer between 1 and 60000"`
+(`:177`).
+**behavior** — this is the one module in the adapter whose entire contract is fail-closed. A user who
+writes `"requestHeadersCommand": "sign.sh"` (a string, not an object) has asked for every request to
+be signed and got the shape wrong. Upstream refuses. **The port connects the server unsigned.**
+`crate::config::lenient` degrades any wrong-typed field to `None`, so the whole block vanishes at
+parse time, `resolve_request_headers_command` is never reached, and only **two** of upstream's five
+sentences have any input at all — the crate's own test is named
+`the_two_reachable_configuration_throws_carry_upstreams_sentences`. Same for a non-array `args`, a
+non-object `env`, and a non-numeric `timeoutMs`.
+**cyrup** — the fix is not "stop using `lenient` here": this file's rule 4 (a malformed value must
+not take the whole config down) is deliberate and correct for every *other* field, and an entry that
+refuses to *parse* would take its 28 siblings with it. The shape that satisfies both is a
+hand-written `Deserialize` for `HttpRequestHeadersCommand` that **never errors** and instead records
+the defect — `defect: Option<&'static str>`, `#[serde(skip)]`, carrying the exact upstream sentence —
+which `resolve_request_headers_command` raises as its first check, at connect, where upstream throws.
+`ServerEntry.request_headers_command` must then deserialize a present-but-non-object value into
+`Some(defect)` rather than `None`, which is the whole point and the part `lenient` cannot express.
+**Two rulings the port owner must make before this is built**, which is why it is `open-decision` and
+not a patch: (1) does rule 4 get a named exception for fail-closed fields, or does this field get a
+bespoke reader; (2) `computeServerHash`'s pre-image renders the *malformed* value upstream
+(`stableStringify` emits `"sign.sh"`) and `undefined` here — unobservable while the entry refuses to
+connect, but it is a hash divergence and should be recorded either way (MCP-070).
+**verify** — unit: each of `"requestHeadersCommand": "sign.sh"`, `[]`, `{"args": 3}`,
+`{"env": {"K": 1}}` parses without taking the file down, and each raises upstream's byte-exact
+sentence from `resolve_request_headers_command`; the sibling entries in the same file still load.
+cyrup-it: a server so configured reports the sentence and **does not connect**, rather than
+connecting and sending unsigned requests.
+*Blocked-by:* nothing. Observable end to end only once MCP-115a lands, but the parse-and-raise halves
+are testable today.
 
 **MCP-070 — Enforce the absent-vs-null hash pre-image contract** · high · M · `hand-written`
 **upstream** — `metadata-cache.ts` `computeServerHash` + `stableStringify`: 14 identity fields, `url`
@@ -1545,7 +1590,9 @@ functions; `config.ts`'s source list and `parseJsonConfig`.
 `cyrup-mcp` (writer) and `cyrup_ext_subagents::exec::mcp_direct_tools` (reader). Any disagreement
 makes `mcp:` subagent selectors resolve to nothing, silently.
 **cyrup** — the reader diverges on seven counts, each indexed to its own unit: absent-field encoding
-(`null` vs `undefined`, MCP-070); hash field set (11 vs 13 post-cut, and raw vs resolved `url`,
+(`null` vs `undefined`, MCP-070); hash field set (11 vs 13 post-cut — **v2.26.1: 11 vs 14**, the
+15th upstream key `requestHeadersCommand` less Cut-3's `socket`; every server hash changed once as a
+result, exactly as it did upstream — and raw vs resolved `url`,
 MCP-070); config sources (4 vs 6, MCP-052); strict JSON vs JSONC (MCP-051); entry merge (wholesale vs
 per-field, MCP-053); settings merge (wholesale vs one-level, MCP-067); `ToolPrefix` and filtering
 (3 vs 4 modes, `-→_` vs preserve-and-hex-escape, no glob support — MCP-071, MCP-072, MCP-075,

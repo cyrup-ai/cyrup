@@ -331,7 +331,7 @@ Wiring, in order:
 | 6 | **elicitation gate**: `settings.elicitation !== false && hasUI`, and only if `ui` exists; `allowUrl: mode === "tui"` |
 | 7 | `lifecycle = new McpLifecycleManager(manager, serverName => hasPendingAuth(serverName, undefined, oauthRuntime))` |
 | 8 | allocate the live maps/sets: `toolMetadata`, `resourceCounts`, `promptMetadata`, `promptMetadataLive`, `serverInstructions`, `failureTracker`, `failureMessages`, `approvedToolCalls` (~~`uiResourceHandler`, `consentManager`~~ — **CUT 2**) |
-| 9 | build `state: McpExtensionState`. `openBrowser` is `owner.throwIfInactive(); await openUrl(pi, url, process.env.BROWSER, owner.signal); owner.throwIfInactive()` — guarded on **both** sides of the await. `sendMessage` is `if (!owner.isActive()) return;` then `pi.sendMessage(...)` |
+| 9 | build `state: McpExtensionState`. `openBrowser` is `owner.throwIfInactive(); await openUrl(pi, url, process.env.BROWSER, owner.signal); owner.throwIfInactive()` — guarded on **both** sides of the await. `sendMessage` is `if (!owner.isActive()) return;` then `pi.sendMessage(...)` — **v2.26.1 replaces this two-line body with a `triggerTurn` convergence gate; build MCP-027a, not this cell** |
 | 10 | if `ownsOAuthRuntime`: `owner.addCleanup(() => shutdownOAuth(oauthRuntime))` |
 | 11 | `manager.setMetadataListChangedListener((serverName, reason) => { if (!owner.isActive()) return; updateServerMetadata; updateMetadataCache(state, serverName, {preserveEmptyResources:false}); notifyToolMetadataUpdated(state, serverName, reason); updateStatusBar(state); })` |
 | 12 | `owner.addCleanup(() => lifecycle.gracefulShutdown())` |
@@ -1647,6 +1647,34 @@ any user action.
 **cyrup** — direct port. Every callback body opens with the owner guard, which is what keeps a
 generation-N timer from writing into generation N+1.
 **verify** — unit: stop the owner, then fire each callback; assert no state mutation and no notify.
+
+**MCP-027a — `sendMessage`'s `triggerTurn` pre-turn convergence gate** · medium · S · `hand-written`
+*Filed 2026-08-20 by the v2.25.0 → v2.26.1 retarget. NOT implemented.*
+**upstream** — `init.ts:181-195` at v2.26.1 (commit `48799fa`). At v2.25.0 `state.sendMessage` was two
+lines — `if (!owner.isActive()) return; pi.sendMessage(message, options)` — which is what §8 step 9
+above still describes. `48799fa` replaced it: the owner-guarded send becomes a `deliver` closure, and
+when `options?.triggerTurn` is set the send is **deferred behind
+`lifecycle.ensureConverged(owner.signal)`**, delivering on success and, on failure, logging
+`` `MCP: pre-turn keep-alive convergence failed: ${sanitizeTerminalText(detail)}` `` at debug and
+delivering **anyway**. An abort or an inactive owner is swallowed silently.
+**behavior** — a message that starts a turn must not start it against a stale keep-alive tool catalog.
+This is the same defect `pi.on("input")` closes for user-typed turns (already ported —
+`registration.rs` `SUBSCRIBED_EVENTS` carries `EventKind::Input`, handler at `extension.rs:344`);
+this is its half for turns the extension itself triggers. Note the failure mode is deliberately
+fail-*open*: convergence failing must not swallow the message.
+**cyrup** — this is currently **inexpressible**. `pub type SendMessage = Arc<dyn Fn(String) + Send +
+Sync>` (`state.rs:55`) takes no options at all, so there is no `triggerTurn` to branch on. The type
+alias must grow the flag — `Arc<dyn Fn(String, bool) + Send + Sync>` or a small `SendMessageOptions`
+struct — which touches the alias, both `state.rs` structs that hold it (`:113`, `:144`), the builder
+at `runtime.rs:189`, and every call site. The fenced host handle already carries the flag
+(`owner.rs:423`), so nothing new is needed from the host. Deliver-on-failure must be a real arm, not a
+`?`: swallowing the message on a convergence error is the one outcome upstream rules out.
+**verify** — unit: with `triggerTurn` unset the send is synchronous and does **not** await
+convergence; with it set, a convergence that resolves delivers after it, and a convergence that
+**rejects** still delivers, exactly once, with one debug line. Stopping the owner between the await
+and the delivery drops the message silently.
+*Note for whoever fills `runtime::initialize_mcp`:* §8 step 9's `sendMessage` row above is the
+v2.25.0 shape and is correct as such — implement **this** unit's shape, not that row's.
 
 **MCP-028 — `updateServerMetadata`** · medium · S · `hand-written`
 **upstream** — `init.ts` (§17): the two bail guards; **if the definition is now disabled, delete every
