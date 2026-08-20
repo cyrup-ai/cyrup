@@ -267,7 +267,7 @@ pub struct AppState {
     /// Pi can answer that question synchronously at footer-render time because the snapshot is an
     /// in-memory map the runtime keeps warm; cyrup's equivalent read
     /// ([`cyrup_config::login::stored_credentials`]) parses `auth.json` and is `async`, while the
-    /// footer is folded from a **sync** `&mut self` (`ingest_event_rendered`). So the map is cached
+    /// footer is folded from a **sync** `&mut self` (`ingest_event_rendered_owned`). So the map is cached
     /// here and refreshed at exactly the points pi's own snapshot moves: session bind/swap and a
     /// settled `/login` or `/logout` (each of which ends in `footer.invalidate()`,
     /// `interactive-mode.ts:5449`, `:5475`). See [`App::refresh_auth_snapshot`].

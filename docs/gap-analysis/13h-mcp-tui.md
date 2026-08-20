@@ -2573,7 +2573,7 @@ renderer depends on.
 `mark_tools_dirty`, `take_tools_dirty`, `resolve_shortcuts`); `cyrup_ext::host::live`'s
 `LiveExtension::argument_completions`; the `wasm-host` gate on `cyrup_ext::host`;
 `crates/cyrup-tui/src/overlay.rs`'s `ExtensionOverlay`, its geometry constants, `box_rect`, `Drop`,
-`to_ratatui_line`/`span`/`color`, `to_overlay_key`; `crates/cyrup-tui/src/app.rs`'s overlay input
+`to_ratatui_line`/`span`/`color`, `to_overlay_key`; `crates/cyrup-tui/src/app/extension_ui.rs`'s overlay input
 routing, `handle_overlay_key`, `/copy`, `copy_to_clipboard`, `read_clipboard_image_to_temp`, and the
 three registry-install sites; `crates/cyrup-tui/src/commands.rs`'s `SlashCommand`,
 `CommandRegistry::with_dynamic`, `dynamic_commands_from_catalog_gated`;

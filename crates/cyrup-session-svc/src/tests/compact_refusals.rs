@@ -20,13 +20,20 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cyrup_core::{ExtensionId, StopReason};
+use cyrup_core::{AssistantMessage, ExtensionId, StopReason};
 use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxConfig, FauxProvider};
+use cyrup_provider::faux::{
+    faux_assistant_message, faux_assistant_message_with, faux_text, FauxConfig, FauxMessageOptions,
+    FauxProvider,
+};
 use cyrup_provider::Provider;
 use crate::{AgentSessionEvent, SessionBuilder, SessionConfig};
 use futures::StreamExt;
 use tempfile::TempDir;
+
+fn kinds(events: &[AgentSessionEvent]) -> Vec<&'static str> {
+    events.iter().map(AgentSessionEvent::kind).collect()
+}
 
 struct Fixture {
     _tmp: TempDir,
@@ -457,6 +464,94 @@ async fn abort_compaction_also_cancels_an_auto_compaction() {
     );
 
     let _ = tokio::time::timeout(Duration::from_secs(20), running).await;
+}
+
+/// SEAM-112 — a compaction that FAILS must leave `agent.state.messages` exactly as it found it.
+///
+/// pi orders the re-seed strictly on the success path: `appendCompaction(...)` then
+/// `this.agent.state.messages = sessionContext.messages;` (`agent-session.ts:2275-2280` auto,
+/// `:1952-1955` manual), both AFTER the `signal.aborted` early-return and both inside the `try`,
+/// so a cancelled, declined or throwing compaction never touches the agent transcript.
+///
+/// cyrup ran the re-seed unconditionally, before `match result`. That is only observable where the
+/// agent transcript and the session file legitimately DISAGREE, and the overflow path is exactly
+/// that place: `check_compaction` (`session.rs:4851`) calls `drop_trailing_assistant` to strip the
+/// overflow response from the agent transcript before compacting, but that response was already
+/// persisted on `message_end`, so re-seeding from `build_context_raw()` pulled it straight back.
+///
+/// **RED before the fix:** the transcript ends with the `stop_reason: Error` overflow assistant
+/// again — the precise state `Agent::continue_run` refuses with `ContinueFromAssistant`
+/// (`cyrup-agent/src/agent.rs:2004-2029`), i.e. a failed overflow compaction poisoned the session
+/// for the retry that follows it.
+#[tokio::test]
+async fn a_failed_overflow_compaction_leaves_the_agent_transcript_untouched() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(aggressive_compaction_settings())
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    // Turn 1: an ordinary answer, so the branch has something to compact.
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("first answer worth some tokens")],
+        StopReason::Stop,
+    )]);
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+
+    // Turn 2: a context-overflow error attributed to the SAME model the session runs (pi's
+    // `_checkCompaction` same-model guard), so the post-run loop drops the trailing assistant and
+    // enters `run_auto_compaction(Overflow, will_retry: true)`. The NEXT scripted response is the
+    // summarization call — an error, so the compaction fails.
+    let model = session.model().expect("session must have a resolved model");
+    faux.set_responses(vec![
+        AssistantMessage::errored(
+            model.provider.clone(),
+            model.model.as_str(),
+            None,
+            StopReason::Error,
+            "context_length_exceeded",
+        ),
+        faux_assistant_message_with(
+            Vec::new(),
+            StopReason::Error,
+            FauxMessageOptions {
+                error_message: Some("summarizer exploded".into()),
+                ..Default::default()
+            },
+        ),
+    ]);
+
+    let stream = session.prompt("tell me two").await.expect("prompt 2");
+    session.wait_for_idle().await;
+    let events: Vec<AgentSessionEvent> = stream.collect().await;
+
+    // The compaction really STARTED — i.e. `prepare` produced a preparation and the re-seed site
+    // was reached. Without this the test could pass on a path that never re-seeds at all.
+    let started_overflow = events.iter().any(|e| {
+        matches!(
+            e,
+            AgentSessionEvent::CompactionStart { reason } if *reason == crate::CompactionReason::Overflow
+        )
+    });
+    assert!(started_overflow, "the overflow compaction must start: {:?}", kinds(&events));
+    // …and really FAILED: no result on the end event.
+    let failed = events.iter().any(|e| {
+        matches!(e, AgentSessionEvent::CompactionEnd { result, .. } if result.is_none())
+    });
+    assert!(failed, "the summarization error must fail the compaction: {:?}", kinds(&events));
+
+    let transcript = session.agent_messages().await;
+    assert!(
+        !matches!(transcript.last(), Some(cyrup_agent::AgentMessage::Assistant(_))),
+        "a failed compaction must not resurrect the overflow response `drop_trailing_assistant` \
+         had just removed (agent-session.ts:2275-2280 puts the re-seed on the success path only); \
+         transcript = {transcript:?}"
+    );
 }
 
 /// The point of compaction: it must shrink what the NEXT request sends to the provider.

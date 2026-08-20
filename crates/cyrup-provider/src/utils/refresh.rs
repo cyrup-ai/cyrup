@@ -206,43 +206,78 @@ mod tests {
     /// The barrier pins the interleaving that is otherwise a narrow window: both callers are held
     /// inside the closure (the synchronous half, which merely BUILDS the future) until each has
     /// passed the fast-path check, and only then are they released to contend for the publish lock.
+    ///
+    /// The barrier alone is NOT enough, and that gap was a real flake — one run in four of
+    /// `cargo test -p cyrup-provider` on a loaded box, reported as `1117 passed; 1 failed`. The
+    /// barrier orders the two callers' ENTRY into the publish region; it says nothing about when the
+    /// loser leaves it. Releasing the winner's fetch as soon as the winner announced "started" (the
+    /// signal this test used to wait on) let the winner run to completion — and completion drops
+    /// [`MemoClear`], emptying the memo — while the loser was still descheduled between
+    /// `gate.wait()` and its `self.inflight.lock()`. The loser then found an EMPTY memo and
+    /// correctly, per Pi's `finally`, started a second fetch: `count == 2`, a scheduling artifact
+    /// rather than the defect this test exists to catch.
+    ///
+    /// So the release now waits for BOTH callers to finish deciding. The signal is each caller's
+    /// first `Poll::Pending`: [`RefreshDedup::run`] has no await point anywhere between its entry
+    /// and `shared.await` — fast path, generation, closure, publish, all synchronous — and the
+    /// future it ends up awaiting is parked on `held`, so the first `Pending` is exactly "this
+    /// caller has published or adopted". It is observable for the LOSER too, which is the whole
+    /// point: any signal sent from inside the fetch body only ever fires for the winner.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_lost_publish_race_does_not_start_a_second_fetch() {
+        use std::future::poll_fn;
+
         let dedup = Arc::new(RefreshDedup::new());
         let count = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new(std::sync::Barrier::new(2));
-        let (tx, rx) = tokio::sync::watch::channel(false);
-        let tx = Arc::new(tx);
+        // Holds the winner's fetch open — and therefore its memo published — until released below.
+        let (release, held) = tokio::sync::watch::channel(false);
+        // One permit per caller that has reached its first `Pending`, i.e. finished deciding.
+        let decided = Arc::new(tokio::sync::Semaphore::new(0));
 
         let callers = (0..2).map(|_| {
             let dedup = Arc::clone(&dedup);
             let count = Arc::clone(&count);
             let gate = Arc::clone(&gate);
-            let tx = Arc::clone(&tx);
-            let mut rx = rx.clone();
+            let decided = Arc::clone(&decided);
+            let mut held = held.clone();
             tokio::spawn(async move {
-                dedup
-                    .run(move || {
-                        // Synchronous: both callers have cleared the fast path by the time either
-                        // returns a future, so they collide on the publish.
-                        gate.wait();
-                        async move {
-                            count.fetch_add(1, Ordering::SeqCst);
-                            // Hold the fetch open so a second one would overlap observably.
-                            let _ = tx.send(true);
-                            let _ = rx.changed().await;
-                            Ok(())
-                        }
-                    })
-                    .await
+                let mut call = Box::pin(dedup.run(move || {
+                    // Synchronous: both callers have cleared the fast path by the time either
+                    // returns a future, so they collide on the publish.
+                    gate.wait();
+                    async move {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        // Hold the fetch open so a second one would overlap observably.
+                        let _ = held.changed().await;
+                        Ok(())
+                    }
+                }));
+                // Announce the publish decision, then hand the poll result straight back — this
+                // wrapper observes `run`, it does not alter it.
+                let mut announced = false;
+                poll_fn(|cx| {
+                    let polled = call.as_mut().poll(cx);
+                    if polled.is_pending() && !announced {
+                        announced = true;
+                        decided.add_permits(1);
+                    }
+                    polled
+                })
+                .await
             })
         });
         let joined = futures::future::join_all(callers);
 
-        // Release the fetch once it has actually started.
-        let mut started = rx.clone();
-        let _ = started.changed().await;
-        let _ = tx.send(false);
+        // Both callers have published-or-adopted; only now may the winner's fetch settle. A caller
+        // that wrongly started its OWN fetch also parks and reports here, so the broken case still
+        // reaches the assertion below instead of hanging.
+        let permits = decided
+            .acquire_many(2)
+            .await
+            .expect("the semaphore is never closed");
+        drop(permits);
+        let _ = release.send(true);
 
         for result in joined.await {
             result.expect("task").expect("refresh ok");

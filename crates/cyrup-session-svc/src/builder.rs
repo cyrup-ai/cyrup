@@ -36,7 +36,7 @@ use cyrup_tools::{
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::error::SessionServiceError;
-use crate::event::core_message_to_agent;
+use crate::event::raw_message_to_agent;
 use crate::provider_swap::{ProviderResolver, ProviderSwap};
 use crate::services::AgentSessionServices;
 use crate::session::AgentSession;
@@ -775,6 +775,21 @@ impl SessionBuilder {
         };
         let session_id = manager.session_id().clone();
         let existing = manager.build_context();
+        // SEAM-112 — the RAW projection, taken here beside `existing` so BOTH reads see the same
+        // manager state (pi calls `buildSessionContext()` ONCE, sdk.ts:190, and reuses the result
+        // at :374). `existing` stays because `resolve_model` below restores the saved model +
+        // thinking level from it (pi sdk.ts:191-242); `existing_raw` is what seeds the agent
+        // transcript at step 7. See the comment there for why the flattened twin was wrong.
+        let existing_raw = manager.build_context_raw();
+        // Deliberately still the FLATTENED list. pi reads `existingSession.messages.length > 0`
+        // off the raw projection (sdk.ts:191), and the two agree on every session cyrup writes:
+        // `push_as_raw` (cyrup-session/src/context.rs:215-246) maps each context-visible entry to
+        // exactly ONE raw message, and the single raw arm that can flatten to zero — a
+        // `BashExecution` with `excludeFromContext` (`push_llm`, cyrup-session/src/agent_message.rs:
+        // 191-197) — is never written by cyrup, whose `!!` executions persist as `custom_message`
+        // entries ([`crate::AgentSession::record_bash_result`], session.rs:5550-5562) and so
+        // survive the flattening as `custom`. Only a foreign file whose ONLY context entries are
+        // `role:"bashExecution"` message entries could split the two, which is its own row.
         let has_existing_session = !existing.messages.is_empty();
         // Pi `hasThinkingEntry` (sdk.ts:189): does the resumed branch carry a thinking_level_change?
         let has_thinking_entry = manager
@@ -1404,9 +1419,27 @@ impl SessionBuilder {
         host_services.update_prompt_state(Some(system_prompt.clone()), settings.project_trusted());
 
         // ---- 7. seed the agent transcript from the resumed branch (R-04-011). The manager was
-        // created at step 2b; `existing` already holds its context.
+        // created at step 2b; `existing_raw` already holds its context.
+        //
+        // SEAM-112 (SESS-043 residual) — seeded from the RAW projection, roles intact. pi's build
+        // path is `const existingSession = sessionManager.buildSessionContext();` (sdk.ts:190) then
+        // `agent.state.messages = existingSession.messages;` (sdk.ts:374), and `buildSessionContext`
+        // is `buildContextEntries(...).flatMap(sessionEntryToContextMessages)`
+        // (session-manager.ts:461-469) — the projection BEFORE `convertToLlm`, whose
+        // `sessionEntryToContextMessages` (`:383-407`) returns `custom` / `branchSummary` /
+        // `compactionSummary` roles UNTOUCHED. `convertToLlm` is applied one layer out, at the
+        // request boundary only (sdk.ts:301).
+        //
+        // Folding `build_context().messages` through `core_message_to_agent` produced a transcript
+        // of a different LENGTH and different roles from pi's: `convertToLlm` DROPS every
+        // `excludeFromContext` (`!!`) bash message and rewrites each summary into wrapper prose, so
+        // pi's `messages.slice(0, -1)` arithmetic (`agent-session.ts:2008`, `:2188`, `:2703`) and
+        // every agent-state token estimate ran over a different list. This was the LAST seed site
+        // still on the flattened twin; the three re-seeds (`session.rs`'s `compact`,
+        // `navigate_tree` and `run_auto_compaction`) already match pi's `agent-session.ts:1955`,
+        // `:3206` and `:2280` respectively.
         let seed: Vec<cyrup_agent::AgentMessage> =
-            existing.messages.iter().map(core_message_to_agent).collect();
+            existing_raw.iter().map(raw_message_to_agent).collect();
 
         // ---- 8. extension host seams (cyrup-ext) — the host itself was built at step 4b ---------
         // (`active_tools` was computed above, ahead of the dynamic-tool registry.)

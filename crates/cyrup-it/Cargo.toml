@@ -100,6 +100,11 @@ cyrup-tui               = { workspace = true, features = ["scrollback-accumulato
 cyrup-intercom          = { workspace = true }
 cyrup-permission-system = { workspace = true }
 cyrup-ext-subagents     = { workspace = true }
+# The `pi-mcp-adapter` port (gap-analysis 13). `tests/mcp/` builds a REAL `AgentSession` with the
+# adapter attached the way `crates/cyrup/src/main.rs` attaches it, so it needs the extension type by
+# name. A dev edge only — this crate has no `[lib]`/`[dependencies]`, so it cannot reach the
+# shipping binary's feature unification (the PROV-052 trap the header documents).
+cyrup-mcp               = { workspace = true }
 # The GUEST sdk, on the HOST target. Two reasons it is here: `tests/ext/ergonomic.rs` drives its
 # ergonomic dispatch layer directly (the crate is `["cdylib", "rlib"]` precisely so that layer is
 # host-testable — crates/cyrup-ext-sdk/Cargo.toml:19), and `tests/ext/build_tier1.rs` uses it as the
@@ -188,6 +193,14 @@ required-features = ["it"]
 [[test]]
 name              = "permission"
 path              = "tests/permission/main.rs"
+required-features = ["it"]
+
+[[test]]
+# `crates/cyrup-mcp`'s seam: the adapter is a NATIVE built-in whose whole contract is what it puts
+# into a live session's tool registry at `init` time, so its proof has to be an assembled
+# `AgentSession` rather than an `InitApi` double — which is what MCP-001's verify paragraph asks for.
+name              = "mcp"
+path              = "tests/mcp/main.rs"
 required-features = ["it"]
 
 [[test]]

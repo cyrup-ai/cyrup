@@ -213,3 +213,54 @@ async fn human_allow_always_persists_a_session_rule_so_the_next_call_needs_no_di
         "only the FIRST call prompted; the always-decision persisted a session rule for the second"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn human_allow_always_survives_into_a_later_turn_of_the_same_session() {
+    // PERM-034 — the SAME always-rule, read back a TURN LATER instead of a tool-call later.
+    //
+    // The sibling test above proves the store write is visible to a second call inside ONE
+    // `prompt()`. That is a weaker claim than the one the always-* options actually make, and it is
+    // not the shape users report against: the complaint is always "I approved it, and it asked me
+    // again LATER". Between two turns a session runs a whole extra lap of the hook pipeline, so a
+    // store hung off the wrong lifetime — rebuilt per prompt, per hook registration, per extension
+    // re-init — would pass the sibling and fail here. Nothing else in this suite crosses a turn
+    // boundary, so nothing else can catch that class of regression.
+    //
+    // Why one turn boundary is the whole proof: `SessionApprovalStore::clear` is reachable from
+    // exactly two triggers, SessionStart and SessionShutdown (`extension.rs:2617`/`:2705`), matching
+    // pi's `session_start` / `session_shutdown` handlers (`index.ts:1830`, `:1864`) — and pi's
+    // `resources_discover` reload (`:1844-1859`) deliberately does NOT clear it. `session_start`
+    // fires once per session, latched by `start_announced.swap(true)`
+    // (`cyrup-session-svc/src/session.rs:2941`), so a second `prompt()` on this same session must
+    // leave the store standing. If a future change re-announces start per turn, or re-installs the
+    // extension mid-session, that latch breaks and this test goes red — which is the point.
+    let (harness, executed, selects, _dir) = interactive_harness("Allow Always", &["echo hi"]).await;
+
+    // Turn 1: the human is asked once and picks "Allow Always".
+    harness.run("first turn").await.unwrap();
+    assert_eq!(
+        selects.load(Ordering::SeqCst),
+        1,
+        "the first turn's call is ask-tier, so it must surface exactly one dialog"
+    );
+
+    // Turn 2: a byte-identical command on the SAME session. `append_responses` extends the
+    // consumable queue (`harness.rs:161-164`) so this is a genuinely separate `prompt()` — a new
+    // run, new tool_call_id, new hook pass — not another call spliced into the first run.
+    harness.append_responses(vec![
+        FauxResponse::tool_call("bash", serde_json::json!({ "command": "echo hi" })),
+        FauxResponse::text("done"),
+    ]);
+    harness.run("second turn").await.unwrap();
+
+    assert_eq!(
+        executed.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        vec!["echo hi".to_string(), "echo hi".to_string()],
+        "both turns executed: turn 1 after the human allowed-always, turn 2 via the surviving rule"
+    );
+    assert_eq!(
+        selects.load(Ordering::SeqCst),
+        1,
+        "STILL one dialog after a second turn: the always-rule outlived the turn that created it"
+    );
+}

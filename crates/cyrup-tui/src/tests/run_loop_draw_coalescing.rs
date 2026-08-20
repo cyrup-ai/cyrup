@@ -105,11 +105,12 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
         guard < drain && drain < draw,
         "ONE guard, then the now_or_never drain, then the single draw:\n{arm}"
     );
-    // F8 readiness: the two `matches!` booleans are computed ahead of the by-ref ingest call so
-    // the by-value swap (which moves `ev`) stays a one-line change.
+    // TUI-092 F8 (landed): the ingest is the BY-VALUE one, so each dequeued event's payloads move
+    // into the transcript instead of being cloned per event — and the two `matches!` booleans are
+    // therefore read ahead of it, because the call consumes `ev`.
     let info = pos(arm, "let info_changed = matches!(ev, AgentSessionEvent::SessionInfoChanged { .. });");
     let settled = pos(arm, "let settled = matches!(ev, AgentSessionEvent::AgentSettled);");
-    let ingest = pos(arm, "self.ingest_session_event(&ev, &ctx.session).await;");
+    let ingest = pos(arm, "self.ingest_session_event_owned(ev, &ctx.session).await;");
     assert!(
         info < ingest && settled < ingest,
         "the event-kind booleans must be computed BEFORE the ingest call:\n{arm}"

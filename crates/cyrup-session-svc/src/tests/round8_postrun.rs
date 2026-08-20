@@ -174,6 +174,107 @@ async fn assembled_run_triggers_post_run_overflow_compaction() {
     assert!(!ks.contains(&"auto_retry_start"), "overflow must NOT be retried: {ks:?}");
 }
 
+/// SEAM-112 — after a successful OVERFLOW compaction the interrupted turn must actually be RETRIED.
+///
+/// pi `agent-session.ts:2307-2317`, its own comment: *"The overflow response was persisted on
+/// message_end before _checkCompaction() removed it from agent state. Rebuilding state from the new
+/// compaction can restore that kept entry, leaving an assistant as the final message.
+/// agent.continue() rejects that state, so remove the retriable error or truncated-length response
+/// again before continuing the interrupted turn."*
+///
+/// cyrup's `run_auto_compaction` had no such re-drop, so the chain broke at its last link:
+/// `check_compaction` dropped the trailing assistant, the compaction's re-seed pulled it back out
+/// of the session file, `handle_post_agent_run` returned `true`, and `Agent::continue_run`
+/// (`cyrup-agent/src/agent.rs:2004-2029`) saw `last_is_assistant` with both queues empty and
+/// returned `ContinueFromAssistant` — which `drive_run` (`session.rs:797`) turns into a silent
+/// `break`. Overflow recovery compacted and then simply stopped: the user's turn never ran.
+///
+/// **RED before the fix:** exactly ONE `agent_end` (the overflow turn), `call_count == 3`
+/// (turn 1 + the overflow turn + the summarization) and no retried answer — the third scripted
+/// response is never requested.
+#[tokio::test]
+async fn a_successful_overflow_compaction_retries_the_interrupted_turn() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let provider: Arc<dyn Provider> = faux.clone();
+    // keepRecentTokens/reserveTokens at 0 so the two-turn branch really has a preparation.
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field(
+        "compaction",
+        serde_json::json!({"enabled": true, "keepRecentTokens": 0, "reserveTokens": 0}),
+    )
+    .unwrap();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    // Turn 1: an ordinary answer, so the branch has something to compact.
+    faux.set_responses(vec![faux_assistant_message(
+        vec![faux_text("first answer worth some tokens")],
+        StopReason::Stop,
+    )]);
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+
+    // Turn 2 overflows on the SAME model (pi's `_checkCompaction` same-model guard) with a
+    // stop reason other than `Stop`, which is pi's `willRetry` predicate (`agent-session.ts:2032`):
+    // `check_compaction` drops the trailing assistant and compacts with `willRetry: true`.
+    // Response 2 is the summarization; response 3 is the answer the RETRY must fetch.
+    let model = session.model().expect("session must have a resolved model");
+    faux.set_responses(vec![
+        AssistantMessage::errored(
+            model.provider.clone(),
+            model.model.as_str(),
+            None,
+            StopReason::Error,
+            "context_length_exceeded",
+        ),
+        faux_assistant_message(vec![faux_text("CONTEXT SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("RETRIED ANSWER")], StopReason::Stop),
+    ]);
+
+    let stream = session.prompt("tell me two").await.expect("prompt accepted");
+    session.wait_for_idle().await;
+    let events: Vec<AgentSessionEvent> = stream.collect().await;
+    let ks = kinds(&events);
+
+    // The compaction ran, succeeded, and carried pi's `willRetry` through to its end event.
+    let end = events.iter().find_map(|e| match e {
+        AgentSessionEvent::CompactionEnd { reason, result, will_retry, .. } => {
+            Some((*reason, result.is_some(), *will_retry))
+        }
+        _ => None,
+    });
+    assert_eq!(
+        end,
+        Some((crate::CompactionReason::Overflow, true, true)),
+        "the overflow compaction must SUCCEED and report willRetry:true: {ks:?}"
+    );
+
+    // …and the interrupted turn was then actually driven. Two `agent_end`s: the overflow turn and
+    // the continuation.
+    let agent_ends = ks.iter().filter(|k| **k == "agent_end").count();
+    assert_eq!(
+        agent_ends, 2,
+        "overflow recovery must compact AND retry — one agent_end means `continue_run` refused the \
+         restored trailing assistant (pi re-drops it, agent-session.ts:2312-2317): {ks:?}"
+    );
+    assert_eq!(
+        faux.call_count(),
+        4,
+        "turn 1 + the overflow turn + the summarization + the RETRY; 3 means the retry never \
+         reached the provider"
+    );
+    assert_eq!(
+        session.last_assistant_text().await.as_deref(),
+        Some("RETRIED ANSWER"),
+        "the user's interrupted turn must end on the retried answer, not on the overflow error"
+    );
+}
+
 // ============================================================================ unbound = legacy ====
 
 /// An UNBOUND (plain by-value) session keeps the legacy single-turn behavior: the post-run loop does

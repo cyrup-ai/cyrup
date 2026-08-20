@@ -8,6 +8,12 @@
 //! (`:383-408`) with every role intact. `convertToLlm`
 //! (`coding-agent/src/core/messages.ts:148-195`) is applied later, once, at the request boundary.
 //!
+//! SEAM-112 adds the FOURTH and last one: the build/resume seed, pi `sdk.ts:190` + `:374`
+//! (`const existingSession = sessionManager.buildSessionContext();` … `agent.state.messages =
+//! existingSession.messages;`). It is the same `buildSessionContext` call, so it carries the same
+//! raw roles — and it was the one site cyrup still fed from the flattened twin after SESS-043
+//! converted the other three (`session.rs:1748`, `:2219`, `:5072`).
+//!
 //! cyrup folded `build_context().messages` — the already-flattened projection — through
 //! `core_message_to_agent`, whose target enum had no `bashExecution` / `branchSummary` /
 //! `compactionSummary` arms at all. The transcript therefore had a different LENGTH and different
@@ -160,6 +166,144 @@ async fn compaction_reseeds_the_transcript_from_pi_s_raw_context() {
             .iter()
             .any(|t| t.starts_with("The conversation history before this point was compacted")),
         "the wrapper prose reappears at the LLM boundary, where pi puts it: {wrapped:?}"
+    );
+}
+
+/// SEAM-112 — the **build/resume** seed (pi `sdk.ts:190` + `:374`), the fourth and last site.
+///
+/// pi resumes with `const existingSession = sessionManager.buildSessionContext();` (sdk.ts:190) and
+/// then `agent.state.messages = existingSession.messages;` (sdk.ts:374) — the SAME raw projection
+/// the three re-seed sites use, roles intact (`session-manager.ts:461-469` composed with
+/// `:383-407`, which returns `custom` / `branchSummary` / `compactionSummary` untouched).
+///
+/// **RED before the fix on assertions (1) and (2).** `builder.rs` seeded from
+/// `manager.build_context()` folded through `core_message_to_agent`, i.e. the
+/// `convertToLlm`-flattened twin, whose target enum has no `bashExecution` / `compactionSummary`
+/// role at all: the bash execution arrived as a plain `user` turn holding the STRINGIFIED wire
+/// object (`cyrup-session/src/agent_message.rs:200`'s `custom_to_message`) and the retained summary
+/// as a `user` turn holding `COMPACTION_SUMMARY_PREFIX … SUFFIX`. This is the resume half of the
+/// defect `compaction_reseeds_the_transcript_from_pi_s_raw_context` pins for `/compact`; before
+/// SEAM-112 the two paths disagreed with each other about what a transcript even contains.
+///
+/// The `!!` execution is placed AFTER the compaction on purpose: with `keepRecentTokens: 0` an
+/// earlier one would be summarized away, and it is the message whose ROLE the two projections
+/// disagree about most visibly.
+#[tokio::test]
+async fn resuming_a_session_seeds_the_transcript_from_pi_s_raw_context() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("first answer")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("second answer")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("CONTEXT SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("TURN PREFIX SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("EXTRA SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("EXTRA SUMMARY")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider.clone(), base_config(&fx))
+        .cli_settings(aggressive_compaction_settings())
+        .build()
+        .await
+        .expect("build");
+    let file = session.session_file().await.expect("a persisted session to resume from");
+
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+    let _ = session.prompt("tell me two").await.expect("prompt 2");
+    session.wait_for_idle().await;
+    let _ = session.compact(None).await.expect("compaction succeeds");
+    // `!!` — present in pi's RAW context and dropped only by `convertToLlm` (`messages.ts:152-156`).
+    let _ = session
+        .execute_bash(
+            "echo excluded-from-context",
+            crate::BashOptions { exclude_from_context: true, id: None, operations: None },
+            None,
+        )
+        .await
+        .expect("immediate bash");
+    drop(session);
+
+    let mut resume_cfg = base_config(&fx);
+    resume_cfg.target = crate::SessionTarget::Resume(file);
+    let resumed = SessionBuilder::new(provider, resume_cfg)
+        .cli_settings(aggressive_compaction_settings())
+        .build()
+        .await
+        .expect("resume");
+
+    let raw = resumed.raw_context_messages().await;
+    assert!(
+        raw.iter().any(|m| matches!(m, Raw::CompactionSummary(_))),
+        "the resumed branch must lead with a compactionSummary, else the two projections cannot \
+         differ and this test is vacuous (raw = {raw:?})"
+    );
+    assert!(
+        raw.iter()
+            .any(|m| matches!(m, Raw::Custom(c) if c.custom_type == "bashExecution")),
+        "the `!!` execution must be in the RAW context — pi's `sessionEntryToContextMessages` \
+         projects a `custom_message` entry as `createCustomMessage(entry.customType, …)` \
+         (session-manager.ts:396-400) and drops it only at the request boundary (raw = {raw:?})"
+    );
+
+    let transcript = resumed.agent_messages().await;
+    // (1) The `!!` execution survived the seed with its ROLE. pi's `sessionEntryToContextMessages`
+    //     returns `createCustomMessage(entry.customType, …)` for a `custom_message` entry
+    //     (`session-manager.ts:396-400`), so `bashExecution` rides the `custom` arm — the same
+    //     shape `record_bash_result` produces for a LIVE execution, which is why
+    //     `a_live_bash_execution_renders_like_a_reseeded_one…` above can compare the two.
+    //     Pre-fix the role was gone: `build_context()` had already flattened it to a `user` turn.
+    assert!(
+        transcript.iter().any(|m| matches!(
+            m,
+            cyrup_agent::AgentMessage::Custom { kind, .. } if kind == "bashExecution"
+        )),
+        "a resumed transcript holds the excluded bash execution as a bashExecution, exactly as \
+         `sessionEntryToContextMessages` returns it (sdk.ts:190,374); got {transcript:?}"
+    );
+    // (2) …and the compaction summary is a compactionSummary carrying pi's bare `summary` field,
+    //     not the `COMPACTION_SUMMARY_PREFIX … SUFFIX` prose the LLM projection adds.
+    let summaries: Vec<_> = transcript
+        .iter()
+        .filter_map(|m| match m {
+            cyrup_agent::AgentMessage::App { role, payload } if role == "compactionSummary" => {
+                Some(payload.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(summaries.len(), 1, "one retained compactionSummary; got {transcript:?}");
+    let summary = summaries[0]["summary"].as_str().expect("pi's `summary` field");
+    assert!(
+        !summary.starts_with("The conversation history before this point was compacted"),
+        "the raw projection stores the bare summary; the wrapper belongs to convertToLlm only \
+         (got {summary:?})"
+    );
+
+    // (3) The seed is pi's IDENTITY assignment (sdk.ts:374): element-for-element the raw
+    //     projection, so `messages.slice(0, -1)` arithmetic indexes the same turns on a resumed
+    //     session as on a live one.
+    assert_eq!(
+        transcript.len(),
+        raw.len(),
+        "`agent.state.messages = existingSession.messages` is an identity (sdk.ts:374); \
+         got {transcript:?}"
+    );
+
+    // (4) The flattening now happens ONCE, at the request boundary, exactly where pi puts it: the
+    //     wrapper prose reappears there, and the `!!` output is dropped there
+    //     (`convertToLlm`'s `case \"bashExecution\"`, messages.ts:152-156).
+    let at_boundary = coding_agent_convert_to_llm(&transcript);
+    let rendered: Vec<String> = at_boundary.iter().map(text_of).collect();
+    assert!(
+        rendered
+            .iter()
+            .any(|t| t.starts_with("The conversation history before this point was compacted")),
+        "the wrapper prose belongs at the LLM boundary, not in the transcript: {rendered:?}"
+    );
+    assert!(
+        !rendered.iter().any(|t| t.contains("excluded-from-context")),
+        "`!!` output must never reach the model, on a resumed session either: {rendered:?}"
     );
 }
 

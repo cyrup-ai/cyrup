@@ -276,10 +276,13 @@ impl App<InlineBackend<Stdout>> {
                         // EXT-006: fold through the extension-aware path so a registered renderer
                         // actually draws the block (a custom message / a tool row). No renderer for the
                         // event's key ⇒ a sync pre-check short-circuits and this is the old behavior.
-                        // `ingest_session_event` adds the footer's context-usage refresh, which needs the
-                        // session this arm holds (`footer.ts:108`).
-                        // F8 swaps this one call to `ingest_session_event_owned(ev, &session)`.
-                        self.ingest_session_event(&ev, &ctx.session).await;
+                        // `ingest_session_event_owned` adds the footer's context-usage refresh, which
+                        // needs the session this arm holds (`footer.ts:108`).
+                        // TUI-092 F8 — the OWNED ingest: this drain owns every event it dequeued, so
+                        // the payloads (`args` / `partial_result` / `result` / the queue vectors) MOVE
+                        // into the transcript instead of being cloned per event, which cost CPU
+                        // proportional to payload size on the one path event rate multiplies.
+                        self.ingest_session_event_owned(ev, &ctx.session).await;
                         // A rename recomputed the window title inside `ingest_event`; the OSC 0 write is
                         // this loop's (Pi `session_info_changed` → `updateTerminalTitle`, `:2900-2903`).
                         // Gated on the event kind so no other event pays for a title recomputation.

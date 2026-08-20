@@ -119,9 +119,9 @@ pub(crate) fn read_clipboard_image_to_temp() -> Option<std::path::PathBuf> {
 /// The largest `edit` target that gets a synchronous pre-execution preview.
 ///
 /// Pi's `computeEditsDiff` is `async` and its result lands via `context.invalidate()`, so an
-/// enormous file only costs it a late repaint. cyrup's fold ([`App::ingest_event_rendered`]) is
-/// synchronous — it mutates `&mut self` from a `select!` arm — so the read+diff happens on the UI
-/// thread and an unbounded one would stall the frame. Source files an `edit` targets are orders of
+/// enormous file only costs it a late repaint. cyrup's fold
+/// ([`App::ingest_event_rendered_owned`]) is synchronous — it mutates `&mut self` from a `select!`
+/// arm — so the read+diff happens on the UI thread and an unbounded one would stall the frame. Source files an `edit` targets are orders of
 /// magnitude under this; above it the preview is simply skipped and the post-write `details.diff`
 /// renders as before, which is the pre-preview behaviour, not a regression.
 pub(crate) const MAX_EDIT_PREVIEW_BYTES: u64 = 4 * 1024 * 1024;

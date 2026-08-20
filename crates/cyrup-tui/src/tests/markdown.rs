@@ -144,6 +144,14 @@ fn inline_code_bold_and_links() {
     // (`markdown.rs`), so pinning it to `render_markdown_with_hyperlinks(…, hyperlinks_supported())`
     // keeps `render_markdown` itself under test: moving the link arm to a test-only override, or
     // changing which capability `render` dispatches on, breaks this and nothing else here.
+    //
+    // `image::CAPABILITIES` is process-wide and `tests::image_capabilities` PINS it (to
+    // `hyperlinks: true`, then to `false`, then resets) to exercise both branches. Both reads below
+    // — the direct one and the one `render_markdown` makes for itself — must therefore see the same
+    // value, or this assertion fails on a renderer that is behaving perfectly. That is a real race,
+    // not a hypothetical: libtest runs these two tests on parallel threads in one process. The
+    // writer already takes this lock; enrolling the reader is what actually closes it.
+    let _caps = super::image_capabilities::caps_lock();
     let detected = crate::hyperlinks_supported();
     assert_eq!(
         render_markdown(src, 80, &theme),
