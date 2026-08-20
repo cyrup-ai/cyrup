@@ -68,6 +68,16 @@ impl Backend for CaptureBackend {
     {
         self.inner.draw(content)
     }
+    // Required since TUI-092 F5 turned on ratatui's `scrolling-regions` feature (`425ef9f`), which
+    // added both methods to `Backend`. Delegated to the inner crossterm backend exactly as the
+    // production `InlineBackend` does (`src/app/backend.rs:193`, `:198`) — this probe captures the
+    // real byte stream, so it must emit the same escapes the real backend would.
+    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
+        self.inner.scroll_region_up(region, amount)
+    }
+    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
+        self.inner.scroll_region_down(region, amount)
+    }
     fn append_lines(&mut self, n: u16) -> io::Result<()> {
         self.cursor_y = self.cursor_y.saturating_add(n).min(H.saturating_sub(1));
         self.inner.append_lines(n)

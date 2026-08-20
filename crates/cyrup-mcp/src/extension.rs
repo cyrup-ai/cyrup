@@ -22,7 +22,7 @@
 //! the fingerprints. The fingerprint diff (MCP-036) suppresses re-registration only *within* a
 //! session, never across an `init()`.
 //!
-//! # The division of labour across the three entry points
+//! # The division of labour across the four entry points
 //!
 //! * **`init()` performs registration only** — read the config and the cache, register the tools,
 //!   commands, renderers and the flag, subscribe, spawn the pre-warm task. **No teardown of a
@@ -30,6 +30,9 @@
 //! * **`on_event(SessionShutdown)` is the only teardown point**, and it is where the metadata flush
 //!   lives.
 //! * **`on_event(SessionStart)` is the generation bump** and builds the new runtime.
+//! * **`on_event(Input)` gates the turn** on one keep-alive convergence pass — `index.ts:489-511`,
+//!   added upstream by `48799fa` after 13a was written. It owns no state and bumps nothing; it only
+//!   spends time, so that the turn about to be built sees a current tool catalog.
 //!
 //! Putting teardown in `init()` would kill generation N's MCP children before N's own shutdown
 //! flush ran — and if the build then failed, generation N would stay live with a torn-down MCP
@@ -108,6 +111,15 @@ pub struct McpExtension {
     /// which the runtime has no reachable handle to install [`crate::registration::McpToolDispatch`]
     /// into and every registered MCP tool would answer `MCP not initialized` forever (MCP-214).
     dispatch: Mutex<Option<Arc<ToolDispatch>>>,
+    /// `resolveMcpToolRenderOptions(settings)`, resolved **once, at load**, from the same early
+    /// config `init` registered the surface from (MCP-238).
+    ///
+    /// Upstream resolves it at `installMcpAdapter` time and closes over the result, so
+    /// `toolResultRendering` and `collapsedResultLines` are frozen for the session: a transcript
+    /// whose rows changed shape halfway through because the user edited `mcp.json` would be a
+    /// port defect, not a feature. Re-resolved on each `init` — i.e. once per generation — which is
+    /// exactly upstream's "once per adapter install".
+    render_options: Mutex<crate::renderers::McpToolRenderOptions>,
     /// The home directory the six-source ladder's three tool-agnostic global rungs
     /// (`~/.config/mcp/mcp.json`, `~/.agents/mcp.json`, `~/.agents/mcp/mcp.json`) and all seven
     /// import families resolve against. `None` ⇒ [`crate::config::home_dir`], which is production.
@@ -145,6 +157,7 @@ impl McpExtension {
             proxy_tool_description: Mutex::new(None),
             direct_tools_frozen: AtomicBool::new(false),
             dispatch: Mutex::new(None),
+            render_options: Mutex::new(crate::renderers::McpToolRenderOptions::default()),
             home: None,
         }
     }
@@ -187,6 +200,16 @@ impl McpExtension {
     #[must_use]
     pub fn owner(&self) -> Option<Arc<McpRuntimeOwner>> {
         self.owner.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// The frozen-at-load tool-result render options (MCP-238). A poisoned slot degrades to the
+    /// compact default rather than refusing to draw a row.
+    #[must_use]
+    pub fn render_options(&self) -> crate::renderers::McpToolRenderOptions {
+        self.render_options
+            .lock()
+            .map(|slot| *slot)
+            .unwrap_or_default()
     }
 
     /// Whether `settings.freezeDirectTools` has taken effect (MCP-036).
@@ -279,6 +302,80 @@ impl McpExtension {
             tracing::debug!(
                 "MCP: session start for generation {my_generation} superseded before initialization"
             );
+        }
+    }
+
+    /// `pi.on("input", …)` (`index.ts:489-511`) — converge the keep-alive servers **before** the
+    /// submission becomes a turn.
+    ///
+    /// Upstream `48799fa` (#374, "converge stale keep-alive tool catalogs"). The 30-second health
+    /// check already reconnects a dead keep-alive server and re-lists a drifted one, but a user who
+    /// submits 200 ms after a remote server rotated its session gets a turn built on the *previous*
+    /// catalog — the model is offered tools that no longer exist and misses ones that now do. This
+    /// handler closes that window by making the submission itself await one convergence pass.
+    ///
+    /// Four properties are the port, and none is decoration:
+    ///
+    /// 1. **The owner is captured once, before the first await** (`const inputOwner = currentOwner`,
+    ///    `index.ts:490`) and re-checked after (`:503`). A session replacement mid-pass must not let
+    ///    a dead generation's convergence gate the live generation's turn.
+    /// 2. **A build in flight is waited for, bounded** by [`crate::proxy::INIT_WAIT_TIMEOUT_MS`]
+    ///    (`index.ts:493-499`) — the same gate `mcp()` dispatch uses. A timeout `return`s rather
+    ///    than failing: an input must never be swallowed because MCP was slow to start.
+    /// 3. **`ensureConverged` is awaited, not spawned** (`:506`). Fire-and-forget would reintroduce
+    ///    the very race the commit fixes, and the single-flight slot inside
+    ///    [`McpLifecycleManager::ensure_converged`][crate::lifecycle::McpLifecycleManager::ensure_converged]
+    ///    is what keeps a burst of submissions from launching rival passes.
+    /// 4. **Every failure is swallowed at `debug`** (`:507-511`), and an abort is not even logged.
+    ///    A keep-alive server that cannot come back must degrade the turn, never block it.
+    ///
+    /// cyrup dispatches `Input` as an awaited emission before the turn is built
+    /// (`cyrup-session-svc`'s `emit_input_event`), so awaiting here has upstream's exact effect.
+    ///
+    /// **One host difference, deliberately not compensated.** `cyrup_ext::dispatch`'s
+    /// `DEFAULT_INVOKE_BUDGET` caps every native handler at 5 s and, on expiry, skips it and lets
+    /// the action proceed; upstream's `await` is unbounded. The degradation is in the same
+    /// direction as upstream's own `catch` — the turn continues against a possibly-stale catalog
+    /// rather than hanging — and a pass is bounded near that anyway, because `refreshTools` carries
+    /// `KEEP_ALIVE_REFRESH_TIMEOUT_MS = 5_000` per server across
+    /// [`KEEP_ALIVE_CHECK_CONCURRENCY`][crate::lifecycle::KEEP_ALIVE_CHECK_CONCURRENCY] workers.
+    /// Buying back the unbounded wait would mean holding the input thread past the budget, which is
+    /// a worse failure than the one it fixes.
+    async fn on_input(&self) {
+        // `const inputOwner = currentOwner; if (!inputOwner?.isActive()) return;`
+        let Some(owner) = self.owner().filter(|owner| owner.is_active()) else {
+            return;
+        };
+
+        // `if (!state && initPromise) { try { await awaitWithTimeout(...) } catch { return } }`
+        if self.state().is_none()
+            && let Some(task) = self.init_task.lock().ok().and_then(|slot| slot.clone())
+        {
+            let waited = tokio::time::timeout(
+                std::time::Duration::from_millis(crate::proxy::INIT_WAIT_TIMEOUT_MS),
+                (*task).clone(),
+            )
+            .await;
+            // Upstream's bare `catch { return }` covers BOTH arms: the timeout and a rejected
+            // build. Neither is this handler's to report — `startInitialization` already did.
+            if !matches!(waited, Ok(Ok(_))) {
+                return;
+            }
+        }
+
+        // `const inputState = state; if (!inputState || !inputOwner.isActive()) return;` — the
+        // post-await re-read, and the owner re-check that goes with it.
+        let Some(state) = self.state() else { return };
+        if !owner.is_active() {
+            return;
+        }
+
+        if let Err(error) = state.lifecycle.ensure_converged(owner.token()).await {
+            // `if (!isAbortError(error, inputOwner.signal))` — a cancelled pass is the expected
+            // shape of a session ending mid-submission, not a fault worth a line.
+            if !crate::abort::is_abort_error(&error, Some(&owner.token())) {
+                tracing::debug!("MCP: keep-alive convergence failed before input: {error}");
+            }
         }
     }
 
@@ -400,6 +497,14 @@ impl NativeExtension for McpExtension {
         if let Ok(mut slot) = self.dispatch.lock() {
             *slot = Some(Arc::clone(&surface.dispatch));
         }
+        // MCP-238 — resolved from the SAME early config the surface was registered from, and never
+        // re-read after this point.
+        if let Ok(mut slot) = self.render_options.lock() {
+            *slot = config.settings.as_ref().map_or_else(
+                crate::renderers::McpToolRenderOptions::default,
+                crate::renderers::resolve_mcp_tool_render_options,
+            );
+        }
 
         // Every registered tool needs its renderer DECLARED here — cyrup splits upstream's per-tool
         // `renderCall`/`renderResult` arguments into a declaration plus a name-keyed serve, so a
@@ -418,15 +523,23 @@ impl NativeExtension for McpExtension {
         Ok(())
     }
 
-    /// The three subscribed seams (see [`crate::registration::SUBSCRIBED_EVENTS`]).
+    /// The four subscribed seams (see [`crate::registration::SUBSCRIBED_EVENTS`]).
     ///
     /// `ToolResult` is `error-signal.ts`'s `toolErrorOverride`: a returned MCP failure is re-flagged
     /// as an error with `HookOutcome::Mutate(EventPatch::ToolResult { is_error: Some(true), .. })`,
     /// whose `apply_patch` leaves `content` and `details` untouched when `None` (MCP-045).
+    ///
+    /// `Input` is [`Self::on_input`] — `index.ts:489-511`'s pre-turn convergence. It returns
+    /// [`HookOutcome::Noop`] because upstream's handler returns nothing: it gates the turn by
+    /// *taking time*, and never transforms the submission's text or images.
     async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
         match ev {
             HostEvent::SessionStart { reason, .. } => {
                 self.on_session_start(reason).await;
+                HookOutcome::Noop
+            }
+            HostEvent::Input { .. } => {
+                self.on_input().await;
                 HookOutcome::Noop
             }
             HostEvent::SessionShutdown { reason, .. } => {
@@ -436,6 +549,33 @@ impl NativeExtension for McpExtension {
             // MCP-045 fills the `isError` override.
             _ => HookOutcome::Noop,
         }
+    }
+
+    /// `renderCall` for every name [`crate::registration::register_surface`] declared a renderer
+    /// for — the gateway tool and each direct tool (MCP-237, MCP-241, MCP-243).
+    ///
+    /// [`crate::renderers::render_call`] splits on
+    /// [`crate::registration::PROXY_TOOL_NAME`]: the gateway gets
+    /// `formatMcpProxyToolCallLines`' seven branches, everything else gets
+    /// `formatMcpDirectToolCallLines`.
+    fn render_call(&self, key: &str, call: &serde_json::Value) -> Option<serde_json::Value> {
+        crate::renderers::render_call(key, call, self.render_options())
+    }
+
+    /// `renderResult` (MCP-239, MCP-240, MCP-242).
+    ///
+    /// `toolsExpanded` is read from [`cyrup_ext::host::HostServices`] here rather than inside the
+    /// renderer, which is what keeps [`crate::renderers::render_result`] a pure, synchronous
+    /// projection — the host calls it on the UI's event path and an `async` renderer would stall
+    /// the frame. A headless build has no services and collapses, which is the correct default.
+    fn render_result(&self, key: &str, result: &serde_json::Value) -> Option<serde_json::Value> {
+        crate::renderers::render_result(
+            key,
+            result,
+            self.render_options(),
+            self.host_services()
+                .is_some_and(|services| services.tools_expanded()),
+        )
     }
 
     /// Bind the live capability backend. Called **before** [`Self::init`], which is what makes an
@@ -487,6 +627,52 @@ mod tests {
         let ext = extension();
         let mut api = InitApi::new();
         assert!(ext.init(&mut api).await.is_ok());
+    }
+
+    /// The renderer seam: `init` must *declare* a renderer for every tool it registers AND the
+    /// extension must actually *serve* one, or every MCP row falls back to the host's own framing.
+    /// Cut 2 landed `renderers.rs`; this pins that it is reachable through the trait.
+    #[tokio::test]
+    async fn the_registered_renderers_are_served_not_just_declared() {
+        use serde_json::json;
+
+        let ext = extension();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+
+        // The gateway tool's call row — `formatMcpProxyToolCallLines`' `tool @ server` head.
+        let proxy = ext
+            .render_call(
+                crate::registration::PROXY_TOOL_NAME,
+                &json!({ "tool": "list_issues", "server": "linear", "args": {} }),
+            )
+            .expect("the gateway tool must render its own call row");
+        assert!(
+            proxy.to_string().contains("mcp call list_issues @ linear"),
+            "{proxy}"
+        );
+
+        // Any other name takes the direct-tool formatter, which leads with the prefixed name.
+        let direct = ext
+            .render_call("linear_list_issues", &json!({ "state": "open" }))
+            .expect("a direct tool must render its own call row");
+        assert!(direct.to_string().contains("linear_list_issues"), "{direct}");
+
+        // The result side renders for both, and a headless build (no `HostServices`) collapses.
+        assert!(
+            ext.render_result(
+                crate::registration::PROXY_TOOL_NAME,
+                &json!({ "content": [{ "type": "text", "text": "ok" }] })
+            )
+            .is_some()
+        );
+
+        // MCP-238: the options are resolved once at `init`, from that generation's config.
+        assert_eq!(
+            ext.render_options().result_rendering,
+            crate::config::ToolResultRendering::Compact,
+            "no `mcp.json` on disk means the compact default"
+        );
     }
 
     #[tokio::test]
@@ -574,5 +760,138 @@ mod tests {
         ext.on_session_shutdown("quit").await;
         assert_eq!(ext.generation(), 1);
         assert!(ext.state().is_none() && ext.owner().is_none());
+    }
+
+    // ── `pi.on("input")` — pre-turn keep-alive convergence (`index.ts:489-511`, `48799fa`) ────
+
+    /// A submission with a state and a live owner must actually drive one convergence pass.
+    ///
+    /// The observation point is the **reconnect-failure callback**: with the manager seam still
+    /// unbound (`ManagerSupervisor`'s MCP-100 bodies), a keep-alive server has no connection and
+    /// `connect` fails, so `reportConnectionFailure` fires exactly once per pass. That the callback
+    /// ran at all is the proof the handler reached `ensureConverged` — which is the whole of the
+    /// fix, and the half that a missing [`crate::registration::SUBSCRIBED_EVENTS`] entry or a
+    /// spawned-instead-of-awaited call would silently drop.
+    #[tokio::test]
+    async fn an_input_converges_the_keep_alive_servers_before_the_turn() {
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let state = input_state(Arc::clone(&owner));
+        state.lifecycle.register_server(
+            "linear",
+            crate::config::ServerEntry {
+                lifecycle: Some(crate::config::ServerLifecycle::KeepAlive),
+                url: Some("https://mcp.linear.app/sse".to_string()),
+                ..Default::default()
+            },
+            None,
+        );
+        state.lifecycle.mark_keep_alive("linear");
+
+        let converged = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&converged);
+        state
+            .lifecycle
+            .set_reconnect_failure_callback(Arc::new(move |name, _error| {
+                assert_eq!(name, "linear");
+                flag.store(true, Ordering::Release);
+            }));
+
+        let ext = extension();
+        *ext.owner.lock().unwrap() = Some(Arc::clone(&owner));
+        *ext.state.lock().unwrap() = Some(Arc::clone(&state));
+
+        assert!(matches!(
+            ext.on_event(&input_event(), &event_ctx()).await,
+            HookOutcome::Noop
+        ));
+        assert!(
+            converged.load(Ordering::Acquire),
+            "the submission must await one convergence pass, not merely schedule one"
+        );
+    }
+
+    /// The two guards that make the handler safe on a dead or unbuilt generation
+    /// (`index.ts:490-491`, `:502`). Neither may panic, and neither may converge.
+    #[tokio::test]
+    async fn an_input_with_no_owner_or_a_stopped_owner_converges_nothing() {
+        let ext = extension();
+        // `if (!inputOwner?.isActive()) return` with `currentOwner === undefined`.
+        assert!(matches!(
+            ext.on_event(&input_event(), &event_ctx()).await,
+            HookOutcome::Noop
+        ));
+
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let state = input_state(Arc::clone(&owner));
+        state.lifecycle.register_server(
+            "linear",
+            crate::config::ServerEntry {
+                lifecycle: Some(crate::config::ServerLifecycle::KeepAlive),
+                ..Default::default()
+            },
+            None,
+        );
+        state.lifecycle.mark_keep_alive("linear");
+        let converged = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&converged);
+        state
+            .lifecycle
+            .set_reconnect_failure_callback(Arc::new(move |_name, _error| {
+                flag.store(true, Ordering::Release);
+            }));
+
+        *ext.owner.lock().unwrap() = Some(Arc::clone(&owner));
+        *ext.state.lock().unwrap() = Some(state);
+        owner.begin_stop(Some("session replaced")).await.unwrap();
+
+        let _ = ext.on_event(&input_event(), &event_ctx()).await;
+        assert!(
+            !converged.load(Ordering::Acquire),
+            "a replaced generation must not gate the live session's turn"
+        );
+    }
+
+    /// The subscription is half the fix: `on_input` is unreachable without it.
+    #[test]
+    fn the_input_seam_is_subscribed() {
+        assert!(
+            crate::registration::SUBSCRIBED_EVENTS.contains(&cyrup_ext::EventKind::Input),
+            "`index.ts:489` is a fourth `pi.on` registration, not a variant of the other three"
+        );
+    }
+
+    fn input_event() -> HostEvent {
+        HostEvent::Input {
+            text: "ship it".to_string(),
+            images: Vec::new(),
+            source: cyrup_ext::InputEventSource::Interactive,
+            streaming_behavior: None,
+        }
+    }
+
+    fn event_ctx() -> HostCtx {
+        HostCtx::event(cyrup_ext::native::ExtMode::Tui, true, PathBuf::from("/w"))
+    }
+
+    fn input_state(owner: Arc<McpRuntimeOwner>) -> Arc<McpState> {
+        use futures::FutureExt;
+
+        let manager = Arc::new(crate::state::McpServerManager::default());
+        let lifecycle = Arc::new(crate::lifecycle::McpLifecycleManager::new(
+            Arc::clone(&manager),
+            Arc::new(|_| false),
+        ));
+        Arc::new(McpState::new(crate::state::McpStateParts {
+            owner,
+            manager,
+            lifecycle,
+            config: McpConfig::default(),
+            programmatic_config: None,
+            oauth_runtime: crate::oauth::create_oauth_runtime(None),
+            auth_storage_options: crate::credentials::AuthStorageOptions::default(),
+            ui: None,
+            open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
+            send_message: Arc::new(|_| {}),
+        }))
     }
 }

@@ -953,6 +953,18 @@ The `getToolUiResourceUri` / `extractToolUiStreamMode` steps and their `failedTo
 (MCP-209); the `uiVisibility` step stays (MCP-208).
 **verify** — a server with two tools whose sanitized names collide asserts the second is dropped; a
 hidden tool followed by a visible tool of the same formatted name asserts the visible one survives.
+**Retargeted to v2.26.1:** port the **post-`14c0e6c` / post-`faf55f7`** shape, not the v2.25.0 one.
+Three things move together and porting them separately is a second port, not a first: (a) the
+cross-server candidate scan is gated on `hasToolFilters` and hoisted to **once per filtered server**,
+never per tool — `registration.rs::CandidateIndex` is already that port and this unit should *use*
+it, not build a second one; (b) `additionalCurrentCandidatesByToolName` is a per-tool-name map
+hoisted out of the loop, feeding `buildToolMetadata`'s two speculative arms (`knownMetadata` absent,
+`includeMissingConfiguredCandidates`) — recorded as deliberately absent at `registration.rs:366`
+because this unit is its only caller; (c) `indexHasOtherCurrentMatch` gains `hasCandidate` and
+`totalMatchingCount`. Landing this unit is also the moment to **delete**
+`proxy.rs::index_has_other_current_match`, which has the semantics without the memo tables and
+recompiles the glob per (tool, pattern) pair. `metadata-cache.ts::reconstructToolMetadata` carries
+the same `hasToolFilters` gate and lands with it.
 
 **MCP-208 — `extractUiToolVisibility` / `isUiToolVisibleToModel` (the kept half of a cut file)** · medium · S · **hand-written**
 **upstream** — `ui-tool-visibility.ts`. Two **fail-closed** paths: a non-array `visibility` and an array
@@ -1382,7 +1394,10 @@ between the two scopes.
 **MCP-232 — `ensureToolCallApproved` and the approval dialog** · **critical** · M · **host-verb**
 **upstream** — `tool-approval.ts` `ensureToolCallApproved`: NUL-separated session cache key, the exact
 dialog title/body/options, the 500-char argument preview, and the fail-closed default where any
-non-`"Allow …"` answer denies.
+non-`"Allow …"` answer denies. **Retargeted to v2.26.1:** the key is a **triple** —
+`` `${serverName}\u0000${toolMeta.originalName}\u0000${argsHash}` `` (`tool-approval.ts:151-152`),
+`argsHash` being `sha256(stableStringify(args ?? {}))` in hex. `5bcd6c5` (v2.26.1, issue #367) added
+the third field.
 **behavior** — the user's last line of defence before an MCP tool runs with model-chosen arguments. Two
 distinct failure modes make this `critical`: a dialog whose cancellation is read as approval is a
 permission bypass, and a headless run that silently proceeds instead of returning
@@ -1393,12 +1408,21 @@ returns `None` when there is no interactive surface — which maps onto **both**
 does, or the two collapse into one. Run the dialog under `HostServices::human_interaction_lock` (the one
 session-scoped `HumanInteractionLock`) so a permission prompt and an MCP approval can never both be on
 screen, and under `HostCtx::begin_human_wait` so the dispatcher's invocation-budget watchdog is suspended
-and the gate cannot fail **open** on a timeout. A `HashSet<(String, String)>` keyed on
-`(server, original_tool)` is cleaner than the NUL-joined string and is not observable; keep it
-per-session, cleared on `EventKind::SessionShutdown`. Argument sanitisation is MCP-235.
+and the gate cannot fail **open** on a timeout. ~~A `HashSet<(String, String)>` keyed on
+`(server, original_tool)` is cleaner than the NUL-joined string and is not observable~~ — **wrong at
+v2.26.1, and the correction is the point of `5bcd6c5`:** that pair is precisely the pre-`5bcd6c5` key,
+and dropping the argument hash means one *Allow for session* on a harmless payload approves every
+later call to the tool (approve `read_file {path: "README.md"}`, and `~/.ssh/id_rsa` never prompts).
+Key the existing `McpState::approved_tool_calls: Mutex<HashSet<String>>` with
+**`state::approval_cache_key(server, original_tool, args)`**, which is already ported
+(`crates/cyrup-mcp/src/state.rs`) over `dirs::stable_stringify` — the same
+`metadata-cache.ts:344` walk `tool-approval.ts:23-32` copies, so sorted object keys make a reordered
+payload one approval while array order stays significant. Keep the set per-session, cleared on
+`EventKind::SessionShutdown`. Argument sanitisation is MCP-235.
 **verify** — cyrup-it (live pty): a gated tool, answer `Deny` → `details.error == "approval_denied"`;
-answer `Allow for session`, call again → no second prompt. Unit: no UI → `approval_required_headless`,
-and a cancelled dialog with a UI → `denied` (the two must not be confused).
+answer `Allow for session`, call again **with the same arguments** → no second prompt, then call with
+**different** arguments → it prompts again. Unit: no UI → `approval_required_headless`, and a
+cancelled dialog with a UI → `denied` (the two must not be confused).
 
 **MCP-233 — Drop the cross-extension approval broker; `before_tool_call` is the broker** · medium · S · **host-verb**
 **upstream** — `tool-approval.ts` `requestBrokerApproval` and `types.ts`'s approval event types: a

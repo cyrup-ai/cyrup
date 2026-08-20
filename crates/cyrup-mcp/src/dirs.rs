@@ -72,7 +72,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::config::ServerEntry;
+use crate::config::{HttpRequestHeadersCommand, ServerEntry};
 use crate::errors::{McpError, McpResult};
 
 /// `getAppName()`'s value for this distribution. Reaches the wire in the OAuth dynamic client
@@ -399,6 +399,7 @@ pub const CACHE_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 #[serde(rename_all = "camelCase")]
 pub struct CachedTool {
     /// The server-side tool name, unprefixed. `serializeTools` drops any tool without one.
+    #[serde(default)]
     pub name: String,
     /// The tool description, verbatim from `tools/list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,8 +426,10 @@ pub struct CachedTool {
 pub struct CachedResource {
     /// The resource URI — the `read_*` tool's payload. `serializeResources` drops a resource
     /// missing either this or `name`.
+    #[serde(default)]
     pub uri: String,
     /// The resource name, which `resourceNameToToolName` sanitises into the tool name.
+    #[serde(default)]
     pub name: String,
     /// Falls back to `` `Read resource: ${uri}` `` at reconstruction time, not here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,6 +441,7 @@ pub struct CachedResource {
 #[serde(rename_all = "camelCase")]
 pub struct CachedPromptArgument {
     /// The argument name. An argument without one is dropped by `serializePrompts`.
+    #[serde(default)]
     pub name: String,
     /// Shown in the slash command's help.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -452,6 +456,7 @@ pub struct CachedPromptArgument {
 #[serde(rename_all = "camelCase")]
 pub struct CachedPrompt {
     /// The server-side prompt name, which `formatPromptCommandName` turns into the command.
+    #[serde(default)]
     pub name: String,
     /// The human-facing title, if the server sent one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -476,11 +481,22 @@ pub struct CachedPrompt {
 pub struct ServerCacheEntry {
     /// [`compute_server_hash`] over the server definition this metadata was captured from. The
     /// entry is discarded the moment it stops matching.
+    ///
+    /// `#[serde(default)]` on this and the two below is **not** cosmetic. `metadata-cache.ts`
+    /// reads every member with `??`, so a cache written by an older build — or by a version that
+    /// had not yet learned to write `resources` — still loads. Without the defaults a single
+    /// missing key makes [`load_metadata_cache`] return `None` for the **whole file**, while
+    /// [`crate::registration`]'s lenient reader over the same bytes returns everything: the `/mcp`
+    /// panel would show no cached data for servers whose tools are registered and working. See the
+    /// report's note on unifying the two cache readers.
+    #[serde(default)]
     pub config_hash: String,
     /// Every tool the server advertised, unfiltered — `includeTools`/`excludeTools` are applied at
     /// reconstruction so a config edit does not require a reconnect.
+    #[serde(default)]
     pub tools: Vec<CachedTool>,
     /// Every resource the server advertised.
+    #[serde(default)]
     pub resources: Vec<CachedResource>,
     /// Every prompt the server advertised, when the server implements `prompts/list`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -644,7 +660,10 @@ pub fn now_ms() -> i64 {
 /// **No resolver is reached at hash time.** `resolveCommandSecret` — the `!`-prefixed form that
 /// *does* spawn a process — is reached only at connect/auth time, never during discovery, merge,
 /// preview, hashing or rendering. Keeping that timing is MCP-083's security property.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// **No `Eq`.** [`Self::request_headers_command`] carries `timeoutMs`, which is `f64` because it
+/// arrived from `JSON.parse` — the same reason [`ServerEntry`] itself is `PartialEq` only.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct ResolvedIdentity {
     /// `interpolateEnvRecord(definition.env)`.
     pub env: Option<BTreeMap<String, String>>,
@@ -656,6 +675,13 @@ pub struct ResolvedIdentity {
     pub headers: Option<BTreeMap<String, String>>,
     /// `resolveBearerToken(definition)`.
     pub bearer_token: Option<String>,
+    /// `definition.requestHeadersCommand` with `command`, every `args` element and every `env`
+    /// value `interpolateEnvVars`'d, `timeoutMs` copied through (`metadata-cache.ts:94-101`,
+    /// upstream v2.26.0). Interpolated for the same reason `headers` is: the digest has to change
+    /// when `$MCP_SIGNER_ACTOR` changes even though the config text did not, which is precisely what
+    /// upstream's `"hashes the effective per-request header command"` test asserts
+    /// (`__tests__/direct-tools.test.ts:357-379`).
+    pub request_headers_command: Option<HttpRequestHeadersCommand>,
 }
 
 impl ResolvedIdentity {
@@ -674,6 +700,7 @@ impl ResolvedIdentity {
             url: entry.url.clone(),
             headers: entry.headers.clone(),
             bearer_token: entry.bearer_token.clone(),
+            request_headers_command: entry.request_headers_command.clone(),
         }
     }
 }
@@ -695,8 +722,8 @@ pub enum HashValue {
     /// A number. `f64` is the faithful model: every number in the pre-image arrived through
     /// `JSON.parse`, which produces IEEE-754 doubles, and Rust's `f64` `Display` is the same
     /// shortest-round-trip form `String(n)` produces. It diverges only at |n| ≥ 1e21, where JS
-    /// switches to exponential notation — unreachable in this pre-image, which carries no numbers
-    /// at all post-Cut-3.
+    /// switches to exponential notation — unreachable in this pre-image, whose one numeric field
+    /// (`requestHeadersCommand.timeoutMs`) is bounded at 60000 by its own read-site validation.
     Number(f64),
     /// A string, rendered through `JSON.stringify`'s escaping.
     String(String),
@@ -784,16 +811,24 @@ fn json_quote(s: &str) -> String {
 
 /// `computeServerHash`'s identity object (`metadata-cache.ts:82`), post-Cut-3.
 ///
-/// **Thirteen fields, and the list is the specification.** Upstream builds fourteen; `socket` is
-/// gone with Cut 3 (a config that could carry it no longer exists in the port, so no cyrup hash
-/// needs to encode it) and that is a *recorded* divergence from the v2.25.0 pre-image, not an
+/// **Fourteen fields, and the list is the specification.** Upstream v2.26.0 builds fifteen;
+/// `socket` is gone with Cut 3 (a config that could carry it no longer exists in the port, so no
+/// cyrup hash needs to encode it) and that is a *recorded* divergence from the pre-image, not an
 /// oversight. Everything else is verbatim, including the fields that are **not** here: `lifecycle`,
 /// `idleTimeout`, `requestTimeoutMs` and `debug` are runtime behaviour, they do not change which
 /// tools a server exposes, and hashing them would evict every cache entry on an unrelated edit.
 ///
-/// Upstream v2.26.0 adds a fifteenth field, `requestHeadersCommand`. The plan is pinned at v2.25.0
-/// and neither [`ServerEntry`] nor this pre-image carries it; adding it later is an
-/// on-disk-contract change that must land in the reader at the same time.
+/// # `requestHeadersCommand` is the fourteenth, and adding it invalidated every cache entry once
+///
+/// `stableStringify` emits a key whose value is absent as the literal `undefined` rather than
+/// dropping it, so widening the object changes the digest of **every** server, not just of one that
+/// configures a signing command. Upstream took exactly that hit at v2.26.0 (`metadata-cache.ts:94`);
+/// the alternative — omitting the key when the field is absent — would have left two adapters
+/// disagreeing about the digest of the same config, which is worse than one cold cache.
+///
+/// Note the nested object is emitted **whole** whenever the field is present: `args`, `env` and
+/// `timeoutMs` each render as `undefined` inside it when they are absent, and
+/// [`stable_stringify`] sorts its four keys just as it sorts the outer ones.
 ///
 /// Returned as the pre-image rather than the digest so a conformance test can assert the bytes —
 /// a hash mismatch tells you nothing about *which* field disagreed.
@@ -806,6 +841,10 @@ pub fn server_identity_pre_image(entry: &ServerEntry, resolved: &ResolvedIdentit
         ("cwd".to_string(), opt_string(resolved.cwd.as_deref())),
         ("url".to_string(), opt_string(resolved.url.as_deref())),
         ("headers".to_string(), opt_string_map(resolved.headers.as_ref())),
+        (
+            "requestHeadersCommand".to_string(),
+            opt_request_headers_command(resolved.request_headers_command.as_ref()),
+        ),
         ("auth".to_string(), opt_serde(entry.auth.as_ref())),
         ("protocolVersion".to_string(), opt_serde(entry.protocol_version.as_ref())),
         ("bearerToken".to_string(), opt_string(resolved.bearer_token.as_deref())),
@@ -829,7 +868,11 @@ pub fn compute_server_hash(entry: &ServerEntry, resolved: &ResolvedIdentity) -> 
 }
 
 /// `createHash("sha256").update(bytes).digest("hex")`.
-fn hex_sha256(bytes: &[u8]) -> String {
+///
+/// Crate-visible because it has a second caller: [`crate::state::approval_cache_key`] takes the same
+/// digest over the same [`stable_stringify`] pre-image (`tool-approval.ts:151`), and a second
+/// hand-rolled hex loop is the kind of near-duplicate that drifts.
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);
@@ -850,6 +893,24 @@ fn opt_string(value: Option<&str>) -> HashValue {
 fn opt_string_list(value: Option<&Vec<String>>) -> HashValue {
     value.map_or(HashValue::Undefined, |items| {
         HashValue::Array(items.iter().map(|s| HashValue::String(s.clone())).collect())
+    })
+}
+
+/// `undefined` for absent, the four-key nested object otherwise (`metadata-cache.ts:94-101`).
+///
+/// The values arrive **already interpolated** on [`ResolvedIdentity::request_headers_command`] —
+/// this function only shapes them, exactly as its `headers` sibling does.
+fn opt_request_headers_command(value: Option<&HttpRequestHeadersCommand>) -> HashValue {
+    value.map_or(HashValue::Undefined, |command| {
+        HashValue::Object(vec![
+            ("command".to_string(), opt_string(command.command.as_deref())),
+            ("args".to_string(), opt_string_list(command.args.as_ref())),
+            ("env".to_string(), opt_string_map(command.env.as_ref())),
+            (
+                "timeoutMs".to_string(),
+                command.timeout_ms.map_or(HashValue::Undefined, HashValue::Number),
+            ),
+        ])
     })
 }
 
@@ -1027,12 +1088,13 @@ mod tests {
                 r#""command":"npx","cwd":"/home/u/work","#,
                 r#""env":{"API_TOKEN":"s3cret","NODE_ENV":"production"},"#,
                 r#""excludeTools":["danger_*"],"exposeResources":false,"headers":undefined,"#,
-                r#""includeTools":undefined,"protocolVersion":undefined,"url":undefined}"#
+                r#""includeTools":undefined,"protocolVersion":undefined,"#,
+                r#""requestHeadersCommand":undefined,"url":undefined}"#
             )
         );
         assert_eq!(
             compute_server_hash(&entry, &resolved),
-            "a615fb56a8e4e0b32fc0fe8d4020422f2b68fe70f3758a29a655f02597d985cd"
+            "4dd46c1fd26680867fe6c5ffdde2ab0f0a35972cd9c211bf6dd68d1f304eb277"
         );
     }
 
@@ -1064,18 +1126,18 @@ mod tests {
                 r#""env":undefined,"excludeTools":[],"exposeResources":true,"#,
                 r#""headers":{"Accept":"application/json","X-Api-Key":"k"},"#,
                 r#""includeTools":["a","b"],"protocolVersion":"2026-07-28","#,
-                r#""url":"https://api.example.com/mcp"}"#
+                r#""requestHeadersCommand":undefined,"url":"https://api.example.com/mcp"}"#
             )
         );
         assert_eq!(
             compute_server_hash(&entry, &resolved),
-            "3132fc7312000677fa760f26236fb4bc534d5bb7a080c72e80416198781087fa"
+            "572dcbaa24a3a82d42f90a86ebb8039227f999a1b14078b35dfa9f40cb872356"
         );
     }
 
     /// The empty definition — the case that makes the `undefined`-vs-`null` divergence total. Every
-    /// one of the thirteen fields is absent, so a writer that emitted `null` would differ in
-    /// thirteen places at once.
+    /// one of the fourteen fields is absent, so a writer that emitted `null` would differ in
+    /// fourteen places at once.
     #[test]
     fn golden_vector_empty_definition() {
         let entry = ServerEntry::default();
@@ -1083,7 +1145,70 @@ mod tests {
         assert!(!server_identity_pre_image(&entry, &resolved).contains("null"));
         assert_eq!(
             compute_server_hash(&entry, &resolved),
-            "0a0f1e413316895cefba6c3dcdcb44d3b9c0b8e91591be79d39fc0afe2d089ef"
+            "671c1578e5f4c763aac0deb77dc2a99f55688f80ed687a652e5259319937794e"
+        );
+    }
+
+    /// The fourteenth field (v2.26.0, `metadata-cache.ts:94-101`) — the only nested object and the
+    /// only *number* in the whole pre-image.
+    ///
+    /// Cross-checked on node 22 against upstream's own `stableStringify(identity)` with `socket`
+    /// removed, the same way the three vectors above are. The two properties it pins are the nested
+    /// object's shape (four keys, sorted, `undefined` for each absent member) and the fact that the
+    /// pre-image carries the **interpolated** command — which is what upstream's
+    /// `"hashes the effective per-request header command"` test asserts
+    /// (`__tests__/direct-tools.test.ts:357-379`).
+    #[test]
+    fn golden_vector_request_headers_command() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{
+                "url": "https://api.example.com/mcp",
+                "requestHeadersCommand": {
+                    "command": "node",
+                    "args": ["sign.mjs", "${MCP_SIGNER_ACTOR}"],
+                    "env": { "ACTOR": "$env:MCP_SIGNER_ACTOR" },
+                    "timeoutMs": 2500
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let with_actor = |actor: &str| ResolvedIdentity {
+            request_headers_command: Some(HttpRequestHeadersCommand {
+                command: Some("node".to_string()),
+                args: Some(vec!["sign.mjs".to_string(), actor.to_string()]),
+                env: Some(BTreeMap::from([("ACTOR".to_string(), actor.to_string())])),
+                timeout_ms: Some(2500.0),
+            }),
+            ..ResolvedIdentity::verbatim(&entry)
+        };
+        let resolved = with_actor("actor-one");
+
+        assert_eq!(
+            server_identity_pre_image(&entry, &resolved),
+            concat!(
+                r#"{"args":undefined,"auth":undefined,"bearerToken":undefined,"#,
+                r#""bearerTokenEnv":undefined,"command":undefined,"cwd":undefined,"#,
+                r#""env":undefined,"excludeTools":undefined,"exposeResources":undefined,"#,
+                r#""headers":undefined,"includeTools":undefined,"protocolVersion":undefined,"#,
+                r#""requestHeadersCommand":{"args":["sign.mjs","actor-one"],"command":"node","#,
+                r#""env":{"ACTOR":"actor-one"},"timeoutMs":2500},"#,
+                r#""url":"https://api.example.com/mcp"}"#
+            )
+        );
+        assert_eq!(
+            compute_server_hash(&entry, &resolved),
+            "bace6621c33527429d57a79c02fd7280efaba5f88f71b42f9c1aa955808234af"
+        );
+
+        // `timeoutMs` renders as `2500`, never `2500.0` — the pre-image is JS numbers.
+        assert!(server_identity_pre_image(&entry, &resolved).contains(r#""timeoutMs":2500}"#));
+
+        // A change to `$MCP_SIGNER_ACTOR` alone must evict the cached metadata, even though the
+        // config text is untouched.
+        assert_ne!(
+            compute_server_hash(&entry, &resolved),
+            compute_server_hash(&entry, &with_actor("actor-two"))
         );
     }
 
@@ -1266,4 +1391,32 @@ mod tests {
             )
         );
     }
+    /// The two readers of `mcp-cache.json` must agree about what is present. Before integration
+    /// this file's reader was strict where `crate::registration`'s is lenient, so a cache missing
+    /// one key made the panel see nothing while the registered surface saw everything.
+    #[test]
+    fn a_cache_missing_optional_keys_still_loads_here_and_in_registration() {
+        let dir = tempfile::tempdir().unwrap();
+        let dirs = McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let path = dirs.metadata_cache();
+        // No `resources`, no `configHash`, a tool with only a name.
+        std::fs::write(
+            &path,
+            format!(
+                r#"{{"version":{CACHE_VERSION},"servers":{{"linear":{{"tools":[{{"name":"list_issues"}}],"cachedAt":1}}}}}}"#
+            ),
+        )
+        .unwrap();
+
+        let cache = load_metadata_cache(&path).expect("a partial cache still loads");
+        let entry = cache.servers.get("linear").expect("the server survives");
+        assert_eq!(entry.tools.len(), 1);
+        assert!(entry.resources.is_empty());
+        assert_eq!(entry.config_hash, "");
+
+        // And the lenient reader agrees, which is the invariant that matters.
+        let other = crate::registration::load_metadata_cache(&dirs).expect("both readers agree");
+        assert_eq!(other.servers.get("linear").map(|e| e.tools().len()), Some(1));
+    }
+
 }

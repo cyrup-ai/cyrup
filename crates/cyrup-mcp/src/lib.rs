@@ -1,8 +1,18 @@
 //! cyrup-mcp — the `pi-mcp-adapter` port, as one native `cyrup_ext::NativeExtension`.
 //!
-//! Upstream is `pi-mcp-adapter` v2.25.0 (172 files, ~54k lines of TypeScript); the plan is
-//! `docs/gap-analysis/13-cyrup-mcp.md` plus its section files `13a`..`13i`. Every module below
-//! cites the upstream file it ports and the port unit (`MCP-nnn`) that owns it.
+//! Upstream is `pi-mcp-adapter` **v2.26.1** (retargeted 2026-08-20 from v2.25.0, which is the tag
+//! the plan was authored against); the plan is `docs/gap-analysis/13-cyrup-mcp.md` plus its section
+//! files `13a`..`13i`. Every module below cites the upstream file it ports and the port unit
+//! (`MCP-nnn`) that owns it.
+//!
+//! **Reading a citation.** A bare `file:line` in this crate resolves against **v2.25.0**, because
+//! that is the tree the plan was read from; a citation written `@v2.26.1` resolves against the newer
+//! tag. The version strings were deliberately *not* search-and-replaced: the plan carries 51 v2.25.0
+//! citations whose line numbers are correct only at that tag, and rewriting the string without
+//! re-resolving every line would silently invalidate all of them. The full retarget record — what
+//! was already ported, what was inapplicable, what is newly ported, and the three units filed as
+//! still-open work (MCP-027a, MCP-069a, MCP-115a) — is the *Retarget* section at the top of
+//! `docs/gap-analysis/13-cyrup-mcp.md`.
 //!
 //! # The thesis: this is an extension, and the port changes nothing in core
 //!
@@ -90,6 +100,18 @@
 //! | [`agent_plugin`] | `agent-plugin-loader.ts` | the sandboxed third-party plugin translator |
 //! | [`dirs`] | `agent-dir.ts` | `<agent_dir>` and every adapter-owned path under it |
 //! | [`onboarding`] | `onboarding-state.ts` | `<agent_dir>/mcp-onboarding.json` |
+//! | [`request_headers_command`] | `request-headers-command.ts` | per-request HTTP header commands (v2.26.0) |
+//!
+//! Cut 2 adds the five modules that make that surface *do* something — the gateway tool, the
+//! credential store, the OAuth flow, the result renderers and the panels:
+//!
+//! | module | upstream | owns |
+//! |---|---|---|
+//! | [`proxy`] | `proxy-modes.ts`, `mcp-tool.ts` | the `mcp` gateway tool and its nine modes (13d) |
+//! | [`credentials`] | `mcp-auth.ts` | the keychain-backed credential store (13f) |
+//! | [`oauth`] | `oauth.ts`, `mcp-auth-flow.ts`, `mcp-callback-server.ts` | the OAuth 2.1 flow runtime (13g) |
+//! | [`renderers`] | `tool-result-renderer.ts`, `mcp-output-guard.ts`, `tool-registrar.ts` | result rendering, the output guard, resource materialization (13e/13h) |
+//! | [`ui`] | `mcp-panel.ts`, `mcp-setup-panel.ts` | `/mcp`, `/mcp-auth` and the setup panel (13h) |
 //!
 //! No-panic policy (arch-00 §8) is enforced crate-wide via `[workspace.lints]`; this crate-level
 //! `#![deny(...)]` mirrors `cyrup-ext`'s own explicit restatement of that convention, and matters
@@ -109,16 +131,51 @@
 pub mod abort;
 pub mod agent_plugin;
 pub mod config;
+pub mod credentials;
 pub mod dirs;
 pub mod errors;
 pub mod extension;
 pub mod lifecycle;
+pub mod oauth;
 pub mod onboarding;
 pub mod owner;
+pub mod proxy;
 pub mod registration;
+pub mod request_headers_command;
+pub mod renderers;
 pub mod runtime;
 pub mod state;
+pub mod ui;
 
 pub use errors::{CleanupErrors, McpError, McpResult};
 pub use extension::{mcp_extension_for_env, McpExtension, EXTENSION_ID};
 pub use state::McpState;
+
+// -------------------------------------------------------------------------------------------------
+// Cut 2 surface. Each `pub use` below is the entry point one of the five cut-2 modules asked for at
+// integration; the module itself stays `pub` so the long tail (33-method `ProxyEnv`, the panel
+// models, the renderer primitives) is reachable by path without a hundred-line re-export block.
+// -------------------------------------------------------------------------------------------------
+
+/// The credential store (13f) — `mcp-auth.ts`'s keychain-backed `AuthEntry` record.
+pub use credentials::{AuthEntry, AuthStoreError, McpAuthStore, OAuthCredentialStatus};
+/// The OAuth flow runtime (13g) — `oauth.ts` / `mcp-auth-flow.ts`.
+pub use oauth::{
+    authenticate, complete_auth, complete_auth_from_input, create_oauth_runtime, get_auth_status,
+    get_valid_token, has_pending_auth, initialize_oauth, remove_auth, shutdown_oauth, start_auth,
+    supports_oauth, AuthStatus, AuthenticateOptions, HttpAuthProviderState, McpOAuthRuntime,
+    McpOAuthStorage,
+};
+/// The `mcp` gateway tool and its nine modes (13d) — `proxy-modes.ts` / `mcp-tool.ts`.
+pub use proxy::{McpErrorCode, McpTool, ProxyCtx, ProxyEnv, MCP_TOOL_NAME};
+/// Tool-result rendering and the MCP output guard (13e/13h) — `tool-result-renderer.ts`,
+/// `mcp-output-guard.ts`, `tool-registrar.ts`.
+pub use renderers::{
+    guard_mcp_output, render_call, render_result, GuardedMcpOutput, MaterializedResources,
+    McpContentBlock, McpOutputGuardOptions, McpToolRenderOptions,
+};
+/// The `/mcp` panel and the setup panel (13h) — `mcp-panel.ts` / `mcp-setup-panel.ts`.
+pub use ui::{
+    open_mcp_panel, open_mcp_setup_panel, DirectToolsChange, McpPanelModel, McpPanelResult,
+    McpSetupPanelModel,
+};

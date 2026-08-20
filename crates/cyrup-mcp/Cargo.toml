@@ -165,6 +165,32 @@ opener = "0.8.5"
 # `cyrup-tui` use.
 ratatui = "0.30.2"
 
+# --- per-request HTTP header commands (v2.26.0 `request-headers-command.ts`) ---------------------
+# Named ONLY because `rmcp::transport::streamable_http_client::StreamableHttpClient` — the trait the
+# header-command decorator wraps — spells `HashMap<HeaderName, HeaderValue>` and
+# `BoxStream<Result<Sse, SseError>>` in its own method signatures. Everywhere else this crate
+# deliberately reaches these types through inference rather than naming them (see
+# `runtime::build_http_transport_config`); a trait impl leaves no such option. Both versions are
+# already resolved in this lock file transitively through rmcp's
+# `transport-streamable-http-client-reqwest`, so neither adds a resolution surface.
+http = "1.4.2"
+sse-stream = "0.2.5"
+
+# `killpg(SIGSTOP)`/`kill(SIGKILL)` over the signing command's process group and over every
+# descendant the 50 ms `ps` sweep found. That freeze-then-kill sweep IS the upstream feature's
+# security property — a signing helper must not outlive the request that spawned it — and it is not
+# expressible through `std::process::Child::kill`, which reaches the direct child only.
+# `#![forbid(unsafe_code)]` rules out `libc::killpg`; `nix`'s wrappers are safe, and this is the same
+# `{ workspace = true, features = ["signal", "process"] }` line `cyrup-ext-subagents`,
+# `cyrup-intercom` and `cyrup-modes` already carry, so no new resolution surface.
+#
+# TARGET-GATED, unlike those three. `request-headers-command.ts`'s own `USE_PROCESS_GROUP` is
+# `platform !== "win32"` and its Windows arm is `taskkill /T /F`, which needs no signals; this crate
+# already carries `#[cfg(windows)]` arms in `credentials` for the native keyring, and an ungated
+# `nix` would take Windows out of the build entirely.
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, features = ["signal", "process"] }
+
 [dev-dependencies]
 tempfile = { workspace = true }
 # `#[tokio::test(start_paused = true)]` + `tokio::time::advance`: the virtual clock the health-check

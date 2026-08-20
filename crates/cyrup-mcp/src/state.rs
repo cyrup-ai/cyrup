@@ -21,12 +21,14 @@
 //! # Forward declarations, and how they get replaced
 //!
 //! Five collaborator types below ([`McpServerManager`], [`OAuthRuntime`],
-//! [`AuthStorageOptions`], [`ServerToolMetadata`], [`PromptMetadata`]) are declared **here** because
+//! [`AuthStorageOptions`], [`ServerToolMetadata`], [`PromptMetadata`]) were declared **here** because
 //! `state.ts` is likewise a pure type file that names them as imports, and because
 //! [`McpState`] cannot be landed without them. The unit that builds each subsystem replaces the
 //! declaration with a one-line `pub use crate::<module>::<Type>;` at that point, which keeps
 //! `crate::state::<Type>` a valid path for everything already written against it. Each one names
-//! its owning unit.
+//! its owning unit. Cut 2 discharged two of the five: [`OAuthRuntime`] is now
+//! [`crate::oauth::McpOAuthRuntime`] and [`AuthStorageOptions`] is now
+//! [`crate::credentials::AuthStorageOptions`].
 
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
@@ -34,9 +36,11 @@ use std::sync::{Arc, Mutex};
 use futures::future::BoxFuture;
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::watch;
 
 use crate::config::McpConfig;
+use crate::dirs::{hex_sha256, stable_stringify, HashValue};
 use crate::errors::McpResult;
 use crate::lifecycle::McpLifecycleManager;
 use crate::owner::{McpRuntimeOwner, OwnedServices};
@@ -48,6 +52,15 @@ pub type OpenBrowser = Arc<dyn Fn(String) -> BoxFuture<'static, McpResult<()>> +
 
 /// `state.sendMessage` — `if (!owner.isActive()) return;` then `pi.sendMessage(...)`. Returns
 /// nothing: upstream's send is fire-and-forget, and the owner check is the whole guard.
+///
+/// **This is the v2.25.0 shape and it is incomplete at v2.26.1 — see plan unit MCP-027a.**
+/// `48799fa` rewrote `init.ts:181-195`: the owner-guarded send became a `deliver` closure, and a
+/// caller passing `options.triggerTurn` now has its message deferred behind
+/// `lifecycle.ensureConverged(owner.signal)` so a turn cannot start against a stale keep-alive tool
+/// catalog (delivering anyway, with one debug line, if convergence fails). This alias takes **no
+/// options at all**, so that branch is not merely unported — it is inexpressible. Closing it changes
+/// the alias, both structs that hold it, the builder at `runtime.rs:189` and every call site, which
+/// is why it is a unit rather than an edit here.
 pub type SendMessage = Arc<dyn Fn(String) + Send + Sync>;
 
 /// `state.onToolMetadataUpdated(serverName, reason)` — installed by `startInitialization` *after*
@@ -205,6 +218,58 @@ impl McpState {
     }
 }
 
+/// The session approval cache key — `tool-approval.ts:151-152`.
+///
+/// Upstream builds `` `${serverName}\u0000${toolMeta.originalName}\u0000${argsHash}` `` where
+/// `argsHash` is `createHash("sha256").update(stableStringify(args ?? {})).digest("hex")`. The set
+/// it keys is [`McpState::approved_tool_calls`].
+///
+/// # The argument hash is the whole point
+///
+/// Upstream `5bcd6c5` (v2.26.1, issue #367) added it. Before it the key was just
+/// `` `${serverName}\u0000${toolMeta.originalName}` ``, so one **Allow for session** on a harmless
+/// payload silently approved every later call to that tool for the rest of the session — approve
+/// `read_file {path: "README.md"}` once and `read_file {path: "~/.ssh/id_rsa"}` never prompts again.
+/// That is a privilege escalation the user believes they granted a *narrow* permission to prevent,
+/// which is why the approval is scoped to the payload the dialog actually displayed.
+///
+/// # Why the pre-image is `dirs`' `stable_stringify`, not a JSON serialiser
+///
+/// `tool-approval.ts:23-32`'s `stableStringify` is a verbatim copy of `metadata-cache.ts:344`, which
+/// this crate already ports as [`crate::dirs::stable_stringify`] — sorted object keys, preserved
+/// array order, the literal word `undefined` for an absent value. Serialising with `serde_json`
+/// instead would make the digest depend on whether the `preserve_order` feature happens to be
+/// unified into the build graph, and a second hand-rolled copy of the same walk is the silent drift
+/// MCP-070 exists to prevent.
+///
+/// The key sort is what makes `{id, type}` and `{type, id}` **one** approval: a model re-emitting
+/// its own arguments in a different order is asking to do the identical thing and must not
+/// re-prompt. Array order stays significant — `["a", "b"]` and `["b", "a"]` are not always the same
+/// request.
+///
+/// `args ?? {}` — an absent `args` and `args: {}` are one approval, so [`Value::Null`] (this port's
+/// spelling of `undefined`) hashes as the empty object rather than as `null`.
+///
+/// # Caller
+///
+/// MCP-232's `ensureToolCallApproved`, which is **not yet ported**: it looks this key up before
+/// prompting and inserts it on `Allow for session` (`tool-approval.ts:154`, `:161`, `:191`).
+/// `13e-mcp-tools.md`'s MCP-232 text predates v2.26.1 and prescribes a `HashSet<(String, String)>`
+/// keyed on `(server, original_tool)`, calling the loss of the NUL-joined form "not observable" — at
+/// v2.26.1 that pair **is** the defect `5bcd6c5` fixed. The key is a triple.
+#[must_use]
+pub fn approval_cache_key(server: &str, original_tool: &str, args: &Value) -> String {
+    let pre_image = if args.is_null() {
+        // `args ?? {}`. Deliberately not `HashValue::from_json(Value::Null)`, which renders `null`
+        // and would give "no arguments" a different approval from "empty arguments".
+        stable_stringify(&HashValue::Object(Vec::new()))
+    } else {
+        stable_stringify(&HashValue::from_json(args.clone()))
+    };
+    let args_hash = hex_sha256(pre_image.as_bytes());
+    format!("{server}\u{0}{original_tool}\u{0}{args_hash}")
+}
+
 impl std::fmt::Debug for McpState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("McpState")
@@ -234,22 +299,19 @@ pub struct McpServerManager {
 /// `oauth.ts`'s `createOAuthRuntime(signal)`: the flow registry, its own generation counter and the
 /// four in-flight maps.
 ///
-/// **Forward declaration (13g / MCP-280…MCP-330 replace it).**
-#[derive(Debug, Default)]
-#[non_exhaustive]
-pub struct OAuthRuntime {}
+/// **Landed by 13g (MCP-301).** The forward declaration is gone; `crate::state::OAuthRuntime` stays
+/// a valid path for everything already written against it, and now names the real runtime.
+pub use crate::oauth::McpOAuthRuntime as OAuthRuntime;
 
 /// `mcp-auth.ts`'s `getAuthStorageOptions(settings.oauthDir, cwd)` — where credentials live.
 /// `$MCP_OAUTH_DIR` (trimmed) outranks the configured dir, which outranks
 /// `<agent_dir>/mcp-oauth`.
 ///
-/// **Forward declaration (13f / MCP-260…MCP-279 replace it).**
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct AuthStorageOptions {
-    /// The resolved storage root.
-    pub base_dir: std::path::PathBuf,
-}
+/// **Landed by 13f (MCP-265).** Note the shape change the real type brings: `base_dir` is
+/// `Option<PathBuf>`, and **absent is not the same as `<agent_dir>/mcp-oauth`** — the precedence
+/// ladder in [`crate::credentials::McpAuthStore::auth_base_dir`] is what turns absent into that, so
+/// pre-resolving it here would defeat `$MCP_OAUTH_DIR`.
+pub use crate::credentials::AuthStorageOptions;
 
 /// `tool-metadata.ts`'s per-server metadata: the tools, their schemas, their resolved names, and
 /// the prefix they were named under.
@@ -303,4 +365,87 @@ pub struct McpStatusSnapshot {
     pub failed: Vec<String>,
     /// Servers waiting on an OAuth flow.
     pub pending_auth: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::approval_cache_key;
+    use serde_json::{json, Value};
+
+    /// `__tests__/tool-approval.test.ts` "caches only Allow for session decisions", as rewritten by
+    /// `5bcd6c5`: three calls, **two** approvals. The reordered payload is the same request; the
+    /// changed `id` is a new one and must prompt again.
+    ///
+    /// The reordering half holds whichever map backing `serde_json` was built with, because
+    /// [`crate::dirs::stable_stringify`] sorts the keys itself.
+    #[test]
+    fn a_session_approval_is_scoped_to_its_arguments() {
+        let approved = approval_cache_key(
+            "demo",
+            "search-records",
+            &json!({"record": {"id": "safe", "type": "demo"}}),
+        );
+        let reordered = approval_cache_key(
+            "demo",
+            "search-records",
+            &json!({"record": {"type": "demo", "id": "safe"}}),
+        );
+        let other = approval_cache_key(
+            "demo",
+            "search-records",
+            &json!({"record": {"id": "other", "type": "demo"}}),
+        );
+
+        assert_eq!(approved, reordered, "the same payload in a different key order is one request");
+        assert_ne!(approved, other, "a changed argument must not inherit an earlier approval (#367)");
+    }
+
+    /// `stableStringify(args ?? {})` — `mcp({tool})` and `mcp({tool, args: {}})` are one approval,
+    /// and neither is an approval of a payload that actually carries a key.
+    #[test]
+    fn absent_arguments_hash_as_the_empty_object() {
+        assert_eq!(
+            approval_cache_key("demo", "search-records", &Value::Null),
+            approval_cache_key("demo", "search-records", &json!({}))
+        );
+        assert_ne!(
+            approval_cache_key("demo", "search-records", &Value::Null),
+            approval_cache_key("demo", "search-records", &json!({"query": ""}))
+        );
+    }
+
+    /// The two fields the key had before `5bcd6c5` still separate approvals: approving a tool on one
+    /// server has never approved the same tool name on another.
+    #[test]
+    fn the_server_and_the_tool_still_separate_approvals() {
+        let args = json!({"query": "x"});
+        let base = approval_cache_key("demo", "search-records", &args);
+        assert_ne!(base, approval_cache_key("other", "search-records", &args));
+        assert_ne!(base, approval_cache_key("demo", "delete-records", &args));
+    }
+
+    /// Array order is not sorted away — `stableStringify` maps arrays elementwise. Deleting
+    /// `["a", "b"]` is not always deleting `["b", "a"]`, and neither approval covers the other.
+    #[test]
+    fn array_order_stays_significant() {
+        assert_ne!(
+            approval_cache_key("demo", "delete-records", &json!({"ids": ["a", "b"]})),
+            approval_cache_key("demo", "delete-records", &json!({"ids": ["b", "a"]}))
+        );
+    }
+
+    /// The shape: `server`, `NUL`, `tool`, `NUL`, 64 lower-case hex. Upstream's separator is `NUL`
+    /// precisely because no server or tool name can contain one, so no two `(server, tool)` pairs
+    /// can join into the same string.
+    #[test]
+    fn the_key_is_two_nul_separated_names_and_a_sha256() {
+        let key = approval_cache_key("demo", "search-records", &json!({"query": "x"}));
+        let mut fields = key.split('\u{0}');
+        assert_eq!(fields.next(), Some("demo"));
+        assert_eq!(fields.next(), Some("search-records"));
+        let digest = fields.next().unwrap_or_default();
+        assert_eq!(digest.len(), 64);
+        assert!(digest.chars().all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)));
+        assert_eq!(fields.next(), None);
+    }
 }

@@ -1319,6 +1319,52 @@ loop terminates on the preceding `throw err`.
 construction, and that no keychain read happened before the first 401. A permanent-401 fixture yields
 `needs-auth` rather than an error.
 
+**MCP-115a — Wire the per-request header command into `connectHttpClient`** · high · S · hand-written
+*Filed 2026-08-20 by the v2.25.0 → v2.26.1 retarget. NOT implemented.*
+**upstream** — `server-manager.ts:868-870` and `:895-896` @v2.26.1 (import at `:61`; commit
+`2a2db3c`). Three lines, inside `connectHttpClient`:
+`const requestFetch = definition.requestHeadersCommand ? createRequestHeadersCommandFetch(definition.requestHeadersCommand) : undefined;`
+built **once per connect**, then spread into the `attempt` closure's `transportOptions` as
+`...(requestFetch !== undefined ? { fetch: requestFetch } : {})` — so it applies to **both** transport
+kinds and survives the implicit-OAuth retry, because `attempt` is what MCP-115's ladder re-enters.
+The factory itself (`request-headers-command.ts:304-336`) does two things worth porting exactly:
+it calls `resolvedCommand(config)` **eagerly, at factory time** ("Validate static configuration
+before the first request", `:309`) so a malformed block fails the **connect**, not the first request;
+and its returned `fetch` runs the command on **every** outbound request with a
+`HttpRequestCommandEnvelope` (`{version:1, method, url: request.url, bodyBase64}`) on stdin, merging
+the JSON header object from stdout with `headers.set(name, value)` over the request's own headers.
+**behavior** — `headers` is resolved once at connect; this is resolved per request, because a
+caller-bound signature (HMAC over the body, DPoP, SigV4) is a function of the exact bytes about to be
+sent. Without the wiring, a server configured with `requestHeadersCommand` connects and sends
+**unsigned** requests, and every such server 401s against a gateway that requires the signature.
+**cyrup** — the engine is **already built and tested**: `crate::request_headers_command`
+(1,284 lines, 13 tests) ports the whole of `request-headers-command.ts`. Upstream's seam is a
+`fetch` override; rmcp's equivalent seam is the `StreamableHttpClient` trait, so the port is a
+**decorator** — `RequestHeadersCommandClient` implements all five trait methods — rather than a
+function returning a `FetchLike`. That is a mechanism substitution, and it is the right one: rmcp has
+no `fetch` to replace. The eager-validation half already matches upstream —
+`RequestHeadersCommandClient::new` runs `resolve_request_headers_command(&config)?` before it
+returns, which is `:309`'s eager `resolvedCommand`.
+It has **no caller**, because `connectHttpClient` has no Rust counterpart yet — this unit, MCP-100
+and MCP-123…MCP-126 are all unbuilt, and `runtime.rs:789 http_transport_with_client` is a seam with
+no production caller either. Landing this is one arm at the transport-construction site:
+`http_transport_with_client(RequestHeadersCommandClient::new(client, cfg, ct)?, config)`. Build it
+inside the retry closure, not above it, so it composes with MCP-115's ladder the way `requestFetch`
+does. Cut 1 removes upstream's SSE arm, so only the streamable-http kind needs it here.
+**Fold in the `Authorization` divergence while you are here** (recorded as divergence 3 in the
+module header): upstream's `headers.set` **replaces**, so a derived `Authorization` overwrites the
+bearer one; the decorator currently *appends* to rmcp's separate `auth_header` argument, so a
+bearer-configured server with a signing command would send **two** `Authorization` headers.
+`apply_derived` can match upstream exactly by clearing `auth_header` when the derived set contains
+`authorization` (case-insensitively). It is untestable until this unit exists, which is why it is
+here and not fixed in place.
+**verify** — cyrup-it: a fixture server that 401s unless a per-request HMAC header is present
+connects and calls a tool successfully; the helper is invoked **once per request**, not once per
+connection; a bearer + signing-command server sends exactly one `Authorization`, the derived one.
+Unit: a failing helper aborts the request with upstream's sentence rather than sending unsigned.
+*Blocked-by:* MCP-115 / MCP-123…MCP-126 (`connectHttpClient` itself). This is blocked by an unported
+dependency, not deferred.
+
 **MCP-116 — `needs-auth` connection state and one-shot credential invalidation** · high · S · hand-written
 **upstream** — `ServerConnection.credentialsInvalidated`, `connect`'s step-7 carry-forward, the HTTP
 ladder's needs-auth exit, and `createConnection`'s catch-path downgrade.

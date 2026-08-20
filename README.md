@@ -239,7 +239,7 @@ permission system and no MCP client of its own.
 | `nicobailon/pi-subagents` | `cyrup-ext-subagents` | ~v0.43.0 *(inferred — the crate records no version string)* | v0.49.0 |
 | `MasuRii/pi-permission-system` | `cyrup-permission-system` | v0.7.1, with every v0.8.0 behavioural change absorbed | v0.8.0 |
 | `nicobailon/pi-intercom` | `cyrup-intercom` | v0.9.2 | v0.10.1 |
-| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.26.0 *(port in flight — see `docs/gap-analysis/13*`)* | v2.26.0 |
+| `nicobailon/pi-mcp-adapter` | `cyrup-mcp` | v2.25.0 *(port in flight — `docs/gap-analysis/13*` cites v2.25.0 throughout)* | v2.26.1 |
 
 The right-hand column moves without warning; re-measure it with `git tag --sort=-v:refname` rather
 than trusting this table. The window between the two columns is measured and filed, not ignored —

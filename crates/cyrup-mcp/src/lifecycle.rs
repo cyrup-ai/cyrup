@@ -98,7 +98,11 @@ pub const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(30);
 /// `settings.idleTimeout`'s default, in **minutes** — `globalIdleTimeout = 10 * 60 * 1000`
 /// (`lifecycle.ts:29`). Applied as `typeof settings.idleTimeout === "number" ? … : 10`, so an
 /// explicit `0` is honoured and means "never idle out".
-pub const DEFAULT_IDLE_TIMEOUT_MINUTES: f64 = 10.0;
+///
+/// **De-duplicated at integration**: this and `config.rs`'s constant were two `10.0`s that the
+/// health-check loop and `McpSettings::idle_timeout()` each read independently. One definition
+/// means a future change to the default cannot land on only one side of that pair.
+pub use crate::config::DEFAULT_IDLE_TIMEOUT_MINUTES;
 
 /// `KEEP_ALIVE_RETRY_BASE_MS = 30_000` (`lifecycle.ts:14`) — the first retry delay after a
 /// keep-alive server fails to come up.
@@ -1666,12 +1670,14 @@ pub fn shutdown_previous_generation(
 
 /// `shutdownOAuth(runtime)` (`mcp-auth-flow.ts`; 13g OA-5) — the flow registry's teardown.
 ///
-/// TODO(MCP-280…MCP-330): call the real `shutdown_oauth` once `OAuthRuntime` is more than
-/// `state.rs`'s forward declaration. Until then the `None` arm is exact and the `Some` arm is the
-/// one hole: an OAuth listener registered by a previous generation is not torn down.
+/// Landed by 13g (MCP-308): bumps the generation, aborts every in-flight login for *this* runtime,
+/// clears the pending maps, and — only when this was the last live runtime in the process — stops
+/// the shared loopback listener. [`crate::oauth::shutdown_oauth`] is infallible by construction
+/// (its cleanup failures are logged, not returned), so the `McpResult` here is the join's shape,
+/// not a real error channel.
 async fn shutdown_oauth(runtime: Option<Arc<OAuthRuntime>>) -> McpResult<()> {
-    if runtime.is_some() {
-        tracing::debug!("MCP: OAuth runtime shutdown is pending 13g (MCP-280…MCP-330)");
+    if let Some(runtime) = runtime {
+        crate::oauth::shutdown_oauth(&runtime).await;
     }
     Ok(())
 }
@@ -2414,7 +2420,7 @@ mod tests {
             lifecycle,
             config: McpConfig::default(),
             programmatic_config: None,
-            oauth_runtime: Arc::new(OAuthRuntime::default()),
+            oauth_runtime: crate::oauth::create_oauth_runtime(None),
             auth_storage_options: AuthStorageOptions::default(),
             ui: None,
             open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
@@ -2545,7 +2551,7 @@ mod tests {
             PreviousGeneration {
                 state: Some(state),
                 owner: Some(owner),
-                oauth: Some(Arc::new(OAuthRuntime::default())),
+                oauth: Some(crate::oauth::create_oauth_runtime(None)),
             },
             SESSION_SHUTDOWN_STOP_REASON,
             SESSION_SHUTDOWN_STATE_REASON,
