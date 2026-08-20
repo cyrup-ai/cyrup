@@ -271,10 +271,17 @@ pub fn together_models() -> Vec<Model> {
         //
         // `thinking_level_map` is deliberately `None` rather than the `m()` the K2.x rows carry.
         // `m()` sets minimal/low/medium to explicit nulls, and `get_supported_thinking_levels`
-        // (`collection.rs:794-807`) reads an explicit null as UNSUPPORTED — which is why those rows
-        // offer only `off` and `high` (PROV-068). `None` leaves every rung implicit, so the full
-        // ladder is selectable. If PROV-068 resolves the other way (null meaning "supported, send
-        // no provider value"), this row still behaves correctly.
+        // (`collection.rs:814-827`) reads an explicit null as UNSUPPORTED — which is why those rows
+        // offer only `off` and `high`. PROV-068 asked whether that reading was inverted. It is NOT:
+        // upstream is `if (mapped === null) return false` (`ai/src/models.ts:668` @v0.83.0), and the
+        // K2.6 map is asserted to be exactly `{minimal: null, low: null, medium: null}`
+        // (`ai/test/together-models.test.ts:24`). A two-rung ladder is the CORRECT rendering of a
+        // `thinkingFormat: "together"` row with `supportsReasoningEffort: false` — the wire carries
+        // only `reasoning: { enabled }`, so `off`/`high` are the only rungs that exist. The K2.x
+        // rows stay as-is; PROV-068 is closed with no code change.
+        //
+        // `None` here is a separate judgement about K3, not a hedge on the above: K3 is a cyrup
+        // addition with no upstream row, so there is no upstream null to narrow it.
         model(
             "moonshotai/Kimi-K3",
             "Kimi K3",

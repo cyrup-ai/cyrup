@@ -1,24 +1,25 @@
 # TUI-092 — The TUI degrades over the life of a session and ends in a total lockup
 
-> **Status** — **OPEN, round 2 — SEVEN OF EIGHT FIXES LANDED; `F8` DID NOT.** Round 1 landed on
+> **Status** — **ALL EIGHT FIXES LANDED — `F8` closed 2026-08-20.** Round 1 landed on
 > 2026-08-15 and measurably improved the app; it did not eliminate the defect. Round 2's audit
 > (§5) is **done** — every collection, cache, buffer, channel, task, subscription and terminal-side
-> write path in `crates/cyrup-tui` was classified against the owner's bar — and `F1`–`F7` are all in
-> the tree at HEAD, each verified line by line in §6.
+> write path in `crates/cyrup-tui` was classified against the owner's bar — and `F1`–`F8` are all in
+> the tree, each verified line by line in §6.
 >
-> **`F8` (by-value ingest) WAS NEVER WRITTEN, although `e6f298d` (*"…land TUI-092 F5-F8"*) deleted its
-> task file.** That commit's diff touches only `crates/cyrup-tui/src/image.rs` (F7), a
-> `cyrup-provider` proxy test and four deleted markdown files. At HEAD
-> [`app/run_action.rs:281`](../../../crates/cyrup-tui/src/app/run_action.rs#L281) still reads
-> ``// F8 swaps this one call to `ingest_session_event_owned(ev, &session)`.`` and `:282` is still
-> `self.ingest_session_event(&ev, &ctx.session).await;` — by reference;
-> `ingest_event_rendered` still takes `ev: &AgentSessionEvent`
-> ([`app/events_fold.rs:7-11`](../../../crates/cyrup-tui/src/app/events_fold.rs#L7));
-> `grep -rn ingest_session_event_owned crates/` matches that comment and nothing else — the function
-> was never declared; and every clone F8 named survives — `args.clone()`
-> (`app/events_fold.rs:141`), `partial_result.clone()` (`:163`), `result.clone()` (`:173`),
-> `(steering.clone(), follow_up.clone())` (`:190`). **A deleted task file is not a landed fix.**
-> §7 property 3 is therefore HALF-MET.
+> **`F8` (by-value ingest) HAD NEVER BEEN WRITTEN** — `e6f298d` (*"…land TUI-092 F5-F8"*) deleted its
+> task file while its diff touched only `crates/cyrup-tui/src/image.rs` (F7), a `cyrup-provider`
+> proxy test and four deleted markdown files. **It is now written** (2026-08-20): the fold is
+> `ingest_event_rendered_owned(&mut self, ev: AgentSessionEvent, …)`
+> ([`app/events_fold.rs:20-22`](../../../crates/cyrup-tui/src/app/events_fold.rs#L20)), the run loop
+> calls `self.ingest_session_event_owned(ev, &ctx.session).await;`
+> ([`app/run_action.rs:285`](../../../crates/cyrup-tui/src/app/run_action.rs#L285)), and all four
+> clones the row named are gone — `args` moves at
+> [`:175-180`](../../../crates/cyrup-tui/src/app/events_fold.rs#L175), `partial_result` at
+> [`:189`](../../../crates/cyrup-tui/src/app/events_fold.rs#L189), `result` at
+> [`:195-201`](../../../crates/cyrup-tui/src/app/events_fold.rs#L195) and both queue vectors at
+> [`:216`](../../../crates/cyrup-tui/src/app/events_fold.rs#L216). `grep -rn 'args.clone()\|partial_result.clone()\|result.clone()\|steering.clone()' crates/cyrup-tui/src/app/events_fold.rs`
+> now returns nothing. **§7 property 3 is MET.** *(A deleted task file was never a landed fix — that
+> lesson stands and is restated in §6.1.)*
 >
 > **RE-BASELINED 2026-08-19 against HEAD (`4fb5e40`).** Every anchor in §5.0/§5.9/§6 was re-read in
 > the tree. `40821ed` split `crates/cyrup-tui/src/app.rs` into `crates/cyrup-tui/src/app/` (33
@@ -38,7 +39,7 @@
 > **Kind** `cyrup-original` · **Severity** **high** — *no longer "pending the escape-hatch answer in
 > §8": §8 Q1's `critical` branch is REFUTED IN CODE (see §8), so **high** is settled. Any area file
 > still carrying `critical` for this row is stale against this file.* · **Effort** **M** *(remaining
-> scope: `F8` alone)*
+> code scope: none — all eight fixes are in the tree)*
 
 **Reported from live use** by the owner, 2026-08-15, after round 1 shipped.
 
@@ -122,7 +123,7 @@ in §6.
 | F5 | ratatui `scrolling-regions` is **off**: every commit flush ends in `Terminal::clear()` → the next frame is a **full viewport repaint**, not a cell diff | bytes/frame spike per commit | 2 (commit cadence during a turn) | **YES** — `425ef9f` (no dedicated test) |
 | F6 | `BashExecution::output_lines` accumulates **every** output line of a live `!`/`!!` run; the session-side sink forwards every chunk uncapped | memory ∝ run output | 2→3 during chatty runs | **YES** — `8f10804` (no dedicated test) |
 | F7 | `ImageRenderer::render` re-encodes the image protocol (raster clone + resize + base64) **every frame** per attached image | CPU/frame ∝ attached image px | 2 while attachments sit | **YES** — `e6f298d` (no dedicated test) |
-| F8 | The run loop's event ingest **clones** `args` / `partial_result` / `result` / queue vectors per event instead of moving them | CPU/event ∝ payload size | 3 | **NO — NOT LANDED.** `e6f298d` deleted its task file without writing the change; see the status block and §6 |
+| F8 | The run loop's event ingest **clones** `args` / `partial_result` / `result` / queue vectors per event instead of moving them | CPU/event ∝ payload size | 3 | **YES** — 2026-08-20, by-value ingest end to end (no dedicated test; the structural guard in `run_loop_draw_coalescing.rs` pins the call site) |
 
 The compounding is the lockup: F2 makes frames expensive; F3 multiplies expensive frames by event
 rate; F5 makes every commit frame a full repaint; F4 makes the stall grow with every turn; F1 grows
@@ -176,7 +177,7 @@ pre-fix shape misleads worse than one that is merely misnumbered.
 | F5 | feature [`cyrup-tui/Cargo.toml:33`](../../../crates/cyrup-tui/Cargo.toml#L33) (`scrolling-regions = ["ratatui/scrolling-regions"]`), **ON by default** at [`:19`](../../../crates/cyrup-tui/Cargo.toml#L19); the two backend delegations the flip compiles are [`app/backend.rs:192-200`](../../../crates/cyrup-tui/src/app/backend.rs#L192) | ratatui dispatches on the feature at [`tmp/ratatui-core-0.1.2/src/terminal/inline.rs:113`](../../../tmp/ratatui-core-0.1.2/src/terminal/inline.rs#L113); the no-regions `self.clear()?` is [`inline.rs:212`](../../../tmp/ratatui-core-0.1.2/src/terminal/inline.rs#L212) (tmux-workaround comment `:209-211`), and `insert_before_scrolling_regions` starts at [`:228`](../../../tmp/ratatui-core-0.1.2/src/terminal/inline.rs#L228); crossterm's `scroll_region_up`/`down` impls are [`tmp/ratatui-crossterm-0.1.2/src/lib.rs:362`](../../../tmp/ratatui-crossterm-0.1.2/src/lib.rs#L362)–`383`. The flip is ON by default precisely because it retires ratatui's own documented tmux clear+scroll garbage hazard rather than introducing one. |
 | F6 | `output_lines: VecDeque<String>` [`bash.rs:57`](../../../crates/cyrup-tui/src/bash.rs#L57); `omitted_lines: usize` [`:60`](../../../crates/cyrup-tui/src/bash.rs#L60); `append_output` [`:137`](../../../crates/cyrup-tui/src/bash.rs#L137) with the front eviction at [`:152-155`](../../../crates/cyrup-tui/src/bash.rs#L152); `MAX_OUTPUT_LINES = 2000` [`:29`](../../../crates/cyrup-tui/src/bash.rs#L29); the one dim omission row at [`:305-313`](../../../crates/cyrup-tui/src/bash.rs#L305) | 2000 is deliberately the SAME bound [`cyrup-tools/src/truncate.rs:11`](../../../crates/cyrup-tools/src/truncate.rs#L11)'s `DEFAULT_MAX_LINES` applies to a finished result, so the live block and the finished one agree. The session-side sink still forwards every chunk — its own bound is `ROLLING_MAX_BYTES` (`DEFAULT_MAX_BYTES * 2` = 100 KB, [`cyrup-session-svc/src/bash.rs:294`](../../../crates/cyrup-session-svc/src/bash.rs#L294), evicted at [`:330`](../../../crates/cyrup-session-svc/src/bash.rs#L330)) plus the temp-file spill, and it applies to the result preview, not to the live rows. |
 | F7 | `ImageRenderer` [`image.rs:50`](../../../crates/cyrup-tui/src/image.rs#L50) now holds `protocol_cache: Mutex<HashMap<ImageCacheKey, Protocol>>` [`:58`](../../../crates/cyrup-tui/src/image.rs#L58); key type `ImageCacheKey` [`:33`](../../../crates/cyrup-tui/src/image.rs#L33); `render(&self, …)` [`:175`](../../../crates/cyrup-tui/src/image.rs#L175); the memoised `new_protocol(block.image.clone(), …)` [`:211`](../../../crates/cyrup-tui/src/image.rs#L211), reached only on a miss ([`:210`](../../../crates/cyrup-tui/src/image.rs#L210)); `render_images` [`app/render.rs:227`](../../../crates/cyrup-tui/src/app/render.rs#L227) | `Picker::new_protocol` returns an owned, reusable `Protocol` ([`tmp/ratatui-image-11.0.6/src/picker.rs:256`](../../../tmp/ratatui-image-11.0.6/src/picker.rs#L256)) — caching it is the library's own `StatefulImage` pattern. `render` is still `&self`, so the cache is interior-mutable, and a poisoned lock degrades to `into_inner()` rather than propagating ([`:206-209`](../../../crates/cyrup-tui/src/image.rs#L206)) under the no-panic policy. **The eviction half of the original row is no longer true as written:** `pending_images.clear()` now lives in `App::clear_images` ([`app/shell.rs:361-363`](../../../crates/cyrup-tui/src/app/shell.rs#L361)) and has **no production caller at all** — see §5.9, which restates that bound. |
-| F8 | **NOT LANDED.** The borrow `ev: &AgentSessionEvent` [`app/events_fold.rs:9`](../../../crates/cyrup-tui/src/app/events_fold.rs#L9) (fn `ingest_event_rendered` at [`:7`](../../../crates/cyrup-tui/src/app/events_fold.rs#L7)); the four surviving clones [`:141`](../../../crates/cyrup-tui/src/app/events_fold.rs#L141) (`args.clone()`), [`:163`](../../../crates/cyrup-tui/src/app/events_fold.rs#L163) (`partial_result.clone()`), [`:173`](../../../crates/cyrup-tui/src/app/events_fold.rs#L173) (`result.clone()`), [`:190`](../../../crates/cyrup-tui/src/app/events_fold.rs#L190) (`(steering.clone(), follow_up.clone())`); the un-swapped call [`app/run_action.rs:282`](../../../crates/cyrup-tui/src/app/run_action.rs#L282) under the still-future-tense comment at [`:281`](../../../crates/cyrup-tui/src/app/run_action.rs#L281) | The receiving transcript APIs already consume by value — `push_tool_start_rendered(…, args: Value, …)` [`transcript.rs:783`](../../../crates/cyrup-tui/src/transcript.rs#L783), `push_tool_update(…, partial: Option<Value>)` [`:813`](../../../crates/cyrup-tui/src/transcript.rs#L813), `push_tool_end_rendered(…, result: Option<Value>, …)` [`:882`](../../../crates/cyrup-tui/src/transcript.rs#L882) — so the clones exist **only** because the ingest path borrows `&ev`, exactly as diagnosed. **Nothing about the fix was invalidated; it was simply never written.** `f22efab` even pre-staged the call site for it: `info_changed`/`settled` are computed BEFORE the ingest call ([`app/run_action.rs:274-275`](../../../crates/cyrup-tui/src/app/run_action.rs#L274)) so the owned swap stays a one-line change. |
+| F8 | **LANDED 2026-08-20.** The fold is by value — `ingest_event_rendered_owned(&mut self, ev: AgentSessionEvent, …)` [`app/events_fold.rs:20-22`](../../../crates/cyrup-tui/src/app/events_fold.rs#L20) — and the arms MOVE the payloads: `args` [`:175-180`](../../../crates/cyrup-tui/src/app/events_fold.rs#L175), `partial_result` [`:189`](../../../crates/cyrup-tui/src/app/events_fold.rs#L189), `result` [`:195-201`](../../../crates/cyrup-tui/src/app/events_fold.rs#L195), `(steering, follow_up)` [`:216`](../../../crates/cyrup-tui/src/app/events_fold.rs#L216). The run loop calls the owned ingest at [`app/run_action.rs:285`](../../../crates/cyrup-tui/src/app/run_action.rs#L285) → `ingest_session_event_owned` [`app/events.rs:90`](../../../crates/cyrup-tui/src/app/events.rs#L90) → `ingest_event_with_extensions_owned` [`:49`](../../../crates/cyrup-tui/src/app/events.rs#L49) → the fold. The by-reference entry points survive as thin `ev.clone()` wrappers for the ~253 in-crate test call sites and `cyrup-it`'s renderer-screen bin ([`app/events.rs:17`](../../../crates/cyrup-tui/src/app/events.rs#L17), [`:35`](../../../crates/cyrup-tui/src/app/events.rs#L35), [`:80`](../../../crates/cyrup-tui/src/app/events.rs#L80)), so no production path pays a clone. Two hoists the move forces, both order-preserving: `context_usage_may_have_moved(&ev)` is read before the fold consumes `ev` ([`app/events.rs:100`](../../../crates/cyrup-tui/src/app/events.rs#L100)) and the `edit` diff is computed before the row is pushed ([`app/events_fold.rs:160-165`](../../../crates/cyrup-tui/src/app/events_fold.rs#L160)) — the two transcript mutations still run push-then-`set_edit_preview`. **What it replaced:** the borrow `ev: &AgentSessionEvent` [`app/events_fold.rs:9`](../../../crates/cyrup-tui/src/app/events_fold.rs#L9) (fn `ingest_event_rendered` at [`:7`](../../../crates/cyrup-tui/src/app/events_fold.rs#L7)); the four surviving clones [`:141`](../../../crates/cyrup-tui/src/app/events_fold.rs#L141) (`args.clone()`), [`:163`](../../../crates/cyrup-tui/src/app/events_fold.rs#L163) (`partial_result.clone()`), [`:173`](../../../crates/cyrup-tui/src/app/events_fold.rs#L173) (`result.clone()`), [`:190`](../../../crates/cyrup-tui/src/app/events_fold.rs#L190) (`(steering.clone(), follow_up.clone())`); the un-swapped call [`app/run_action.rs:282`](../../../crates/cyrup-tui/src/app/run_action.rs#L282) under the still-future-tense comment at [`:281`](../../../crates/cyrup-tui/src/app/run_action.rs#L281) | The receiving transcript APIs already consume by value — `push_tool_start_rendered(…, args: Value, …)` [`transcript.rs:783`](../../../crates/cyrup-tui/src/transcript.rs#L783), `push_tool_update(…, partial: Option<Value>)` [`:813`](../../../crates/cyrup-tui/src/transcript.rs#L813), `push_tool_end_rendered(…, result: Option<Value>, …)` [`:882`](../../../crates/cyrup-tui/src/transcript.rs#L882) — so the clones exist **only** because the ingest path borrows `&ev`, exactly as diagnosed. **Nothing about the fix was invalidated; it was simply never written.** `f22efab` had pre-staged the call site: `info_changed`/`settled` are computed BEFORE the ingest call ([`app/run_action.rs:274-275`](../../../crates/cyrup-tui/src/app/run_action.rs#L274)), which is why the swap was one line. |
 
 **Hyperlink convention:** every path is relative to this directory (`docs/gap-analysis/bugs/`), so
 `../../../crates/…` resolves into the workspace root and `../../../tmp/…` into the vendored
@@ -237,7 +238,7 @@ actually landed, which is **not** the order the plan proposed.
 | 4 | **F5** — `scrolling-regions` | the one-line feature flip, **on by default**, so `insert_before_scrolling_regions` — not the `clear()` path — serves every flush; it also compiles `InlineBackend`'s two `scroll_region_*` delegations | `425ef9f` | [`cyrup-tui/Cargo.toml:19`](../../../crates/cyrup-tui/Cargo.toml#L19)+[`:33`](../../../crates/cyrup-tui/Cargo.toml#L33); [`app/backend.rs:192-200`](../../../crates/cyrup-tui/src/app/backend.rs#L192) |
 | 5 | **F6** — bash output ring | `VecDeque` + `MAX_OUTPUT_LINES = 2000` front eviction + `omitted_lines` counter + one dim `… (N earlier lines omitted) …` row | `8f10804` | [`bash.rs:29`](../../../crates/cyrup-tui/src/bash.rs#L29), [`:57`](../../../crates/cyrup-tui/src/bash.rs#L57), [`:152-155`](../../../crates/cyrup-tui/src/bash.rs#L152), [`:305-313`](../../../crates/cyrup-tui/src/bash.rs#L305) |
 | 6 | **F7** — `ImageRenderer` protocol cache | the built `Protocol` memoised in a `Mutex<HashMap<ImageCacheKey, Protocol>>` keyed on (image identity, target size); a poisoned lock degrades to `into_inner()` rather than propagating | `e6f298d` | [`image.rs:33`](../../../crates/cyrup-tui/src/image.rs#L33), [`:50`](../../../crates/cyrup-tui/src/image.rs#L50), [`:58`](../../../crates/cyrup-tui/src/image.rs#L58), [`:201-224`](../../../crates/cyrup-tui/src/image.rs#L201) |
-| — | **F8** — by-value ingest | **NOTHING. NOT LANDED.** `e6f298d`'s subject claims "…land TUI-092 F5-F8" and its diff deletes `TUI-092-F8-by-value-ingest.md`, but the code change was never written | *(none — the task file was deleted without a fix)* | The proof is the absence: `grep -rn ingest_session_event_owned crates/` matches ONLY the future-tense comment that names it, [`app/run_action.rs:281-282`](../../../crates/cyrup-tui/src/app/run_action.rs#L281) still carries the future-tense comment above the by-reference call, and all four clones survive at [`app/events_fold.rs:141`](../../../crates/cyrup-tui/src/app/events_fold.rs#L141)/[`:163`](../../../crates/cyrup-tui/src/app/events_fold.rs#L163)/[`:173`](../../../crates/cyrup-tui/src/app/events_fold.rs#L173)/[`:190`](../../../crates/cyrup-tui/src/app/events_fold.rs#L190) |
+| 7 | **F8** — by-value ingest | the fold takes the event by value (`ingest_event_rendered_owned`) and its arms MOVE `args` / `partial_result` / `result` / `steering` / `follow_up` into the transcript and `session_queue`; the run loop's drained events arm calls `ingest_session_event_owned(ev, …)`; the by-reference `ingest_event` / `ingest_event_with_extensions` / `ingest_session_event` remain as thin `ev.clone()` wrappers so the ~253 test call sites (and `cyrup-it`'s bin) compile untouched and no production path clones | 2026-08-20 *(uncommitted in the working tree when this row was written — verify by the anchors, not by a subject line)* | `grep -rn ingest_session_event_owned crates/` now hits the declaration [`app/events.rs:90`](../../../crates/cyrup-tui/src/app/events.rs#L90) and the call [`app/run_action.rs:285`](../../../crates/cyrup-tui/src/app/run_action.rs#L285); the fold [`app/events_fold.rs:20-22`](../../../crates/cyrup-tui/src/app/events_fold.rs#L20); the four ex-clone sites [`:175-180`](../../../crates/cyrup-tui/src/app/events_fold.rs#L175)/[`:189`](../../../crates/cyrup-tui/src/app/events_fold.rs#L189)/[`:195-201`](../../../crates/cyrup-tui/src/app/events_fold.rs#L195)/[`:216`](../../../crates/cyrup-tui/src/app/events_fold.rs#L216); the structural guard [`src/tests/run_loop_draw_coalescing.rs:113`](../../../crates/cyrup-tui/src/tests/run_loop_draw_coalescing.rs#L113) |
 
 **F5, F6 and F7 landed with no dedicated test** — `grep -rl 'TUI-092' crates/cyrup-tui/src/tests/`
 returns only `escalation.rs` (round 1's escape hatch), `render_cache_tick.rs` (F2),
@@ -247,9 +248,12 @@ untested fixes are each a small, structurally-verifiable change (a feature flag,
 the silence as coverage.
 
 **DO NOT TRUST A COMMIT SUBJECT AS LANDING EVIDENCE.** F8 is the standing counter-example: the
-subject said it landed and the task file was deleted to prove it. Before closing any row here, grep
-for the *artifact the fix was supposed to create* — for F8 that is `ingest_session_event_owned`, and
-its only occurrence in the workspace is the comment promising to write it.
+subject said it landed and the task file was deleted to prove it, while the only occurrence of
+`ingest_session_event_owned` in the whole workspace was the comment promising to write it.
+Before closing any row here, grep for the *artifact the fix was supposed to create* — for F8 that
+grep now returns a declaration ([`app/events.rs:90`](../../../crates/cyrup-tui/src/app/events.rs#L90))
+and a call ([`app/run_action.rs:285`](../../../crates/cyrup-tui/src/app/run_action.rs#L285)), which is
+what closing a row is allowed to mean.
 
 **Do not touch (applies to every remaining edit on this row, `F8` included):**
 
@@ -275,10 +279,11 @@ its only occurrence in the workspace is the comment promising to write it.
 
 ---
 
-## 7. Definition of done (aggregate) — SCORED AT HEAD, 2026-08-19
+## 7. Definition of done (aggregate) — SCORED AT HEAD, 2026-08-19; property 3 RE-SCORED 2026-08-20
 
 Expressed as code properties of the patched tree, not as test coverage. The bar is that **all seven**
-hold; **six do, and one is half-met**, which is exactly the shape a missing F8 produces.
+hold, and **all seven now do** — property 3, the shape a missing F8 produced, closed when the
+by-value ingest landed.
 
 1. **MET — no production allocation scales with total committed output.** `scrollback` exists only
    under `#[cfg(any(test, feature = "scrollback-accumulator"))]`
@@ -294,15 +299,16 @@ hold; **six do, and one is half-met**, which is exactly the shape a missing F8 p
    materialisation, never three. Timer-driven repaints stay correct via `bump_render_tick`
    ([`:1220`](../../../crates/cyrup-tui/src/transcript.rs#L1220)), gated on `bash_running()` / `has_running_elapsed_tool()` so
    content-quiet frames stay free. F7 supplies the image half. — F2 + F7
-3. **HALF-MET — one wakeup, one frame; but the events arm still CLONES.** The drain landed: all
+3. **MET — one wakeup, one frame, and the events arm MOVES each payload.** The drain landed: all
    three arms drain before a single `draw_synchronized()`
    ([`app/run_action.rs:218`](../../../crates/cyrup-tui/src/app/run_action.rs#L218)/[`:230`](../../../crates/cyrup-tui/src/app/run_action.rs#L230),
-   [`:267-270`](../../../crates/cyrup-tui/src/app/run_action.rs#L267)/[`:298`](../../../crates/cyrup-tui/src/app/run_action.rs#L298),
-   [`app/run_arms.rs:353`](../../../crates/cyrup-tui/src/app/run_arms.rs#L353)/[`:387`](../../../crates/cyrup-tui/src/app/run_arms.rs#L387)). **The
-   move did not** — the second clause of this property, "*and the events arm moves (not clones) each
-   payload*", is false at HEAD: [`app/run_action.rs:282`](../../../crates/cyrup-tui/src/app/run_action.rs#L282) still passes
-   `&ev`, and `args` / `partial_result` / `result` / the queue vectors are still cloned per event.
-   **This is the one open property in the row.** — F3 (met) + F8 (**not landed**)
+   [`:267-270`](../../../crates/cyrup-tui/src/app/run_action.rs#L267)/[`:301`](../../../crates/cyrup-tui/src/app/run_action.rs#L301),
+   [`app/run_arms.rs:353`](../../../crates/cyrup-tui/src/app/run_arms.rs#L353)/[`:387`](../../../crates/cyrup-tui/src/app/run_arms.rs#L387)). So
+   did the move: [`app/run_action.rs:285`](../../../crates/cyrup-tui/src/app/run_action.rs#L285) passes the dequeued
+   `ev` **by value** into `ingest_session_event_owned`, and the fold
+   ([`app/events_fold.rs:20`](../../../crates/cyrup-tui/src/app/events_fold.rs#L20)) moves `args` /
+   `partial_result` / `result` / the queue vectors into the transcript rather than cloning them per
+   event. — F3 + F8
 4. **MET — no per-event work walks history.** `context_usage` holds one manager lock and does one
    reverse branch scan with zero message clones
    ([`cyrup-session-svc/src/session.rs:4160`](../../../crates/cyrup-session-svc/src/session.rs#L4160),

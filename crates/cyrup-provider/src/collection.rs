@@ -784,6 +784,26 @@ fn level_key(level: ModelThinkingLevel) -> &'static str {
 /// supports only `off`. A `thinkingLevelMap` value of `null` marks a level unsupported; `xhigh` and
 /// `max` additionally require an explicit (non-`undefined`) map entry (Pi `models.ts:669`
 /// @v0.83.0; PROV-041 corrected `:670`, the `return true` fall-through beneath it).
+///
+/// PROV-068 asked whether an explicit `null` instead means "supported, but sent with no
+/// provider-specific value". It does NOT — that meaning belongs to ABSENCE. `thinkingLevelMap` is
+/// three-way, and Pi keeps all three cases distinct at BOTH ends, filter and wire:
+///   - absent    → supported; wire sends the generic level name, because the lookup is defaulted
+///                 (`model.thinkingLevelMap?.[level] ?? options.reasoningEffort`,
+///                 `api/openai-completions.ts:875` @v0.84.2). THIS is "no mapped value".
+///   - `Some(v)` → supported; wire sends `v` in place of the level name (`:882`).
+///   - `null`    → the rung does not exist on this model; the wire emits NOTHING for it, gated
+///                 BEFORE any default: `else if (model.thinkingLevelMap?.off !== null)`
+///                 (`api/openai-completions.ts:870`, `:884`, `:905`; `openai-responses.ts:333`;
+///                 `anthropic-messages.ts:1087`) — the off-switch is suppressed, not defaulted.
+/// `if (mapped === null) return false` (`models.ts:668` @v0.83.0; unchanged at `:907` @v0.84.2) is
+/// simply the filter half of that same three-way, so `Some(None) => false` below is correct as
+/// written. Upstream pins it by test: `{off,minimal,low,medium: null, xhigh: "max"}` yields exactly
+/// `["high", "xhigh"]` (`coding-agent/test/model-registry.test.ts:1064-1071`), and
+/// `{xhigh: null, max: "max"}` yields `[off,minimal,low,medium,high,max]`
+/// (`ai/test/max-thinking.test.ts:59-66`). Reading `null` as "supported" would offer `off` on every
+/// `{"off": null}` row — gpt-5, gemini-3-flash, claude-fable-5 — models that cannot stop reasoning,
+/// and the wire would still send no off-parameter, so the rung would silently do nothing.
 pub fn get_supported_thinking_levels(model: &Model) -> Vec<ModelThinkingLevel> {
     if !model.reasoning {
         return vec![ModelThinkingLevel::Off];

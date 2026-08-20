@@ -136,7 +136,7 @@ pub struct TerminalProgress {
     /// [`Self::take_pending`].
     ///
     /// Pi has no equivalent because `ui.terminal.setProgress` writes to stdout synchronously from
-    /// inside the event handler. Cyrup's session-event fold ([`crate::App::ingest_event_rendered`])
+    /// inside the event handler. Cyrup's session-event fold ([`crate::App::ingest_event_rendered_owned`])
     /// is a pure state transition that the run loop turns into terminal output one step later — the
     /// same split [`crate::AppState::terminal_title`] uses — so the transition has to be parked
     /// somewhere in between. Draining is what guarantees a write happens once per transition rather

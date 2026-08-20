@@ -96,7 +96,7 @@ unicode-segmentation = { workspace = true }
 serde_json = { workspace = true }
 # Already a transitive dep (via cyrup-session-svc) and previously a dev-dep only; promoted to a
 # direct dependency for `edit`'s PRE-EXECUTION diff preview (Pi `computeEditsDiff`,
-# edit-diff.ts:514-547, fired from `renderCall` at edit.ts:377-386). `App::ingest_event_rendered`
+# edit-diff.ts:514-547, fired from `renderCall` at edit.ts:377-386). `ingest_event_rendered_owned`
 # calls `cyrup_tools::tools::edit_diff::compute_edits_diff` on `ToolExecutionStart` so the diff is
 # rendered before the write lands — the preview MUST share the tool's own matching core, or it
 # would show a diff the tool then contradicts. Points downward: cyrup-tools sits below cyrup-tui.

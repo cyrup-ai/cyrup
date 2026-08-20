@@ -4,12 +4,30 @@ impl<B: Backend> App<B> {
     /// `rendered` is what a custom-MESSAGE / tool-row renderer produced (already collapsed to
     /// `Option<String>`, since both surfaces swallow a renderer throw upstream). `entry` is the
     /// three-state custom-ENTRY outcome, which does NOT collapse — see [`extension_render_entry`].
-    pub(crate) fn ingest_event_rendered(
+    ///
+    /// TUI-092 F8 — the fold consumes the event **by value**. The run loop's events arm owns every
+    /// event it dequeues (`run_action.rs`'s `pending.pop_front()`), and the transcript APIs the
+    /// payloads land in already take them by value — `push_tool_start_rendered(…, args: Value, …)`
+    /// (`transcript.rs:783`), `push_tool_update(…, partial: Option<Value>)` (`:813`),
+    /// `push_tool_end_rendered(…, result: Option<Value>, …)` (`:882`) — so a borrowed fold could
+    /// only ever `clone()` its way across that seam: CPU per event proportional to payload size, on
+    /// the path a chatty turn hits hardest (a `ToolExecutionEnd` carrying a large `result` JSON was
+    /// copied in full on every tool completion, and it compounds with event rate). The arms below
+    /// MOVE `args` / `partial_result` / `result` / `steering` / `follow_up` instead. The
+    /// by-reference entry points ([`Self::ingest_event`], [`Self::ingest_event_with_extensions`])
+    /// survive as thin `ev.clone()` wrappers for the in-crate test call sites, which then pay a
+    /// clone no production path pays.
+    pub(crate) fn ingest_event_rendered_owned(
         &mut self,
-        ev: &AgentSessionEvent,
+        ev: AgentSessionEvent,
         rendered: Option<String>,
         entry_rendered: crate::transcript::Rendered,
     ) {
+        // The arms that need the WHOLE event again (the serde projections in `event_extract.rs`)
+        // bind nothing, so `ev` is still fully initialised inside them and `&ev` is legal there;
+        // the arms that consume a payload move exactly the fields they consume. Fold ORDER is
+        // untouched — this is the same match, arm for arm and statement for statement, with the
+        // single documented exception in `ToolExecutionStart` below.
         match ev {
             AgentSessionEvent::AgentStart => {
                 // Pi `case "agent_start"` (`interactive-mode.ts:2865-2867`): the FIRST statement of
@@ -55,7 +73,7 @@ impl<B: Backend> App<B> {
             // thing this arm has to reproduce is the LIFETIME — the bit `message_end` reads to know
             // an assistant message is open and unfinalized (`:3182`).
             AgentSessionEvent::MessageStart { .. } => {
-                match message_role_from_event(ev).as_deref() {
+                match message_role_from_event(&ev).as_deref() {
                     Some("assistant") => self.state.streaming_assistant = true,
                     // Pi `:2915-2918`: `event.message.role === "user"` →
                     // `this.addMessageToChat(event.message)` then
@@ -66,7 +84,7 @@ impl<B: Backend> App<B> {
                     // The `queue_update` that drains the queue arrives around this event, so the row
                     // and the bubble hand off without ever both being on screen.
                     Some("user") => {
-                        if let Some(text) = user_message_text_from_event(ev)
+                        if let Some(text) = user_message_text_from_event(&ev)
                             && !text.trim().is_empty()
                         {
                             self.state.transcript.push_user(text);
@@ -92,7 +110,7 @@ impl<B: Backend> App<B> {
                 // cumulative footer totals must include it (`footer.ts:99-101`). This is the
                 // `toolResult` branch and, like upstream, must NOT restate the `CH` segment —
                 // assistant usage goes through `add_usage` in [`Self::finalize_assistant_message`].
-                if let Some(u) = tool_result_usage_from_event(ev) {
+                if let Some(u) = tool_result_usage_from_event(&ev) {
                     self.state.status.add_usage_totals(&u);
                 }
                 // `if (event.message.role === "user") break;` (`:3181`) plus the
@@ -101,14 +119,14 @@ impl<B: Backend> App<B> {
                 // producer that does deliver a terminal `StreamEvent::Done` inside `message_update`
                 // cannot commit the same text twice.
                 if self.state.streaming_assistant
-                    && let Some(message) = assistant_message_from_event(ev)
+                    && let Some(message) = assistant_message_from_event(&ev)
                 {
                     self.finalize_assistant_message(&message);
                 }
                 // The `AgentMessage` type lives in `cyrup-agent` (a dev-dep here, not a direct dep), so
                 // the `Custom` arm is detected via its serde projection (`tag = "role"`,
                 // `rename_all_fields = camelCase`) rather than a direct match — no dependency ripple.
-                if let Some((kind, body)) = custom_message_from_event(ev) {
+                if let Some((kind, body)) = custom_message_from_event(&ev) {
                     // EXT-006: `rendered` is the text the extension that registered a renderer for
                     // this custom type produced; absent one it is `None` and the default
                     // `[kind] body` framing draws (Pi `CustomMessageComponent`).
@@ -123,9 +141,28 @@ impl<B: Backend> App<B> {
                 }
             }
             AgentSessionEvent::MessageUpdate { assistant_message_event, .. } => {
-                self.ingest_stream_event(assistant_message_event);
+                self.ingest_stream_event(&assistant_message_event);
             }
             AgentSessionEvent::ToolExecutionStart { tool_call_id, tool_name, args } => {
+                // Pi's `edit` renderCall fires `computeEditsDiff` the moment the streamed arguments
+                // are complete (edit.ts:377-386) so the diff is on screen while the call is still
+                // pending. `ToolExecutionStart` IS that moment here: cyrup emits it with the full
+                // arguments and BEFORE `prepare`, i.e. before the `before_tool_call` permission gate
+                // (`cyrup-agent/src/agent.rs:1181/1334`), so the preview is up for the whole time an
+                // approval prompt is waiting — and nothing has been written yet.
+                //
+                // TUI-092 F8 — the diff is COMPUTED here, ahead of the row, because the push below
+                // MOVES `args` into the transcript. Only the read+diff moved earlier, and it touches
+                // no UI state ([`edit_preview`] reads the file and diffs it); the two TRANSCRIPT
+                // mutations still run in their original order — `push_tool_start_rendered` and then
+                // `set_edit_preview`, which resolves the row it attaches to by `call_id`
+                // (`transcript.rs:852`) and so must still follow the push that creates it.
+                let preview = if tool_name == "edit" {
+                    let cwd = self.state.title_cwd.clone();
+                    edit_preview(&args, &cwd)
+                } else {
+                    None
+                };
                 // Hand the raw call args to the transcript so each built-in renders its Pi-specific
                 // `renderCall` header (path+range / `$ command` / `/pattern/` / …), not a generic
                 // one-liner (transcript.rs `tool_lines` dispatch).
@@ -136,41 +173,30 @@ impl<B: Backend> App<B> {
                 // EXT-006: an extension that declared a renderer for THIS tool supplies the call
                 // header; `None` keeps the built-in per-tool dispatch.
                 self.state.transcript.push_tool_start_rendered(
-                    tool_name.clone(),
+                    tool_name,
                     Some(tool_call_id.as_str().to_string()),
-                    args.clone(),
+                    args,
                     rendered,
                 );
-                // Pi's `edit` renderCall fires `computeEditsDiff` the moment the streamed arguments
-                // are complete (edit.ts:377-386) so the diff is on screen while the call is still
-                // pending. `ToolExecutionStart` IS that moment here: cyrup emits it with the full
-                // arguments and BEFORE `prepare`, i.e. before the `before_tool_call` permission gate
-                // (`cyrup-agent/src/agent.rs:1181/1334`), so the preview is up for the whole time an
-                // approval prompt is waiting — and nothing has been written yet.
-                if tool_name == "edit" {
-                    let cwd = self.state.title_cwd.clone();
-                    if let Some(preview) = edit_preview(args, &cwd) {
-                        self.state
-                            .transcript
-                            .set_edit_preview(Some(tool_call_id.as_str()), preview);
-                    }
+                if let Some(preview) = preview {
+                    self.state.transcript.set_edit_preview(Some(tool_call_id.as_str()), preview);
                 }
             }
             AgentSessionEvent::ToolExecutionUpdate { tool_call_id, partial_result, .. } => {
                 // Pi: `this.pendingTools.get(event.toolCallId)` (interactive-mode.ts:3104).
                 self.state
                     .transcript
-                    .push_tool_update(Some(tool_call_id.as_str()), Some(partial_result.clone()));
+                    .push_tool_update(Some(tool_call_id.as_str()), Some(partial_result));
             }
             AgentSessionEvent::ToolExecutionEnd { tool_call_id, tool_name, is_error, result } => {
                 // The full `{content, details, terminate}` result flows through so `renderResult` can
                 // reach each tool's `details` (edit `diff`, bash/read truncation, …), and the
                 // `toolCallId` routes it to the run that made THIS call (`:3113`).
                 self.state.transcript.push_tool_end_rendered(
-                    tool_name.clone(),
+                    tool_name,
                     Some(tool_call_id.as_str()),
-                    *is_error,
-                    Some(result.clone()),
+                    is_error,
+                    Some(result),
                     rendered,
                 );
                 // Progressively flush finished tools to native scrollback mid-turn so the inline
@@ -187,7 +213,7 @@ impl<B: Backend> App<B> {
             // (`status.set_queued`) and, since the fidelity pass deleted the `{n} queued` footer
             // segment, rendered it nowhere; the texts were dropped on the floor here.
             AgentSessionEvent::QueueUpdate { steering, follow_up } => {
-                self.state.session_queue = (steering.clone(), follow_up.clone());
+                self.state.session_queue = (steering, follow_up);
                 // TUI-031 — the region shows the UNION of the session's queues and the compaction
                 // queue, as `getAllQueuedMessages` does (`interactive-mode.ts:3942-3953`).
                 self.rebuild_pending_messages();
@@ -258,14 +284,14 @@ impl<B: Backend> App<B> {
                 // `showError`, so the residual this comment used to record (a manual abort reading
                 // `compact error: …` where pi reads `Compaction cancelled`) is closed.
                 if !matches!(reason, CompactionReason::Manual) {
-                    if *aborted {
+                    if aborted {
                         self.state.transcript.push_status("Auto-compaction cancelled");
                     } else if let Some(msg) = error_message {
-                        self.state.transcript.push_error(msg.clone());
+                        self.state.transcript.push_error(msg);
                     } else if let Some(res) = result {
                         self.state
                             .transcript
-                            .push_compaction_summary(res.tokens_before, res.summary.clone());
+                            .push_compaction_summary(res.tokens_before, res.summary);
                     }
                 }
                 // TUI-031 — `void this.flushCompactionQueue({ willRetry: event.willRetry })` is the
@@ -289,7 +315,7 @@ impl<B: Backend> App<B> {
                 // chat write. The mirrored `• Retrying (1/3) in 30s...` row was cyrup-only, and
                 // being a snapshot of a ticking countdown it froze at whatever second it was
                 // pushed.
-                self.state.indicator.set_retry(*attempt, *max_attempts, *delay_ms);
+                self.state.indicator.set_retry(attempt, max_attempts, delay_ms);
             }
             AgentSessionEvent::SummarizationRetryScheduled {
                 attempt,
@@ -303,8 +329,8 @@ impl<B: Backend> App<B> {
                 // `showError(event.errorMessage)` then `showStatusIndicator(new
                 // RetryStatusIndicator(...))` (`interactive-mode.ts:3367-3374`) — the error goes to
                 // the chat, the countdown stays in the band (X18).
-                self.state.transcript.push_error(error_message.clone());
-                self.state.indicator.set_retry(*attempt, *max_attempts, *delay_ms);
+                self.state.transcript.push_error(error_message);
+                self.state.indicator.set_retry(attempt, max_attempts, delay_ms);
             }
             AgentSessionEvent::SummarizationRetryAttemptStart { source } => {
                 // Pi `interactive-mode.ts:3231-3240`: clear the retry indicator and RECREATE the
@@ -351,13 +377,13 @@ impl<B: Backend> App<B> {
                 }
                 self.state
                     .transcript
-                    .push_status(if *success { "retry succeeded" } else { "retry ended" });
+                    .push_status(if success { "retry succeeded" } else { "retry ended" });
             }
             AgentSessionEvent::ModelChanged { provider, model } => {
                 let label = format!("{provider}/{model}");
                 self.state.status.set_model(label.clone());
                 // Feed the provider into the footer right cluster (`(provider)` prefix, footer.ts:191).
-                self.state.status.set_provider(Some(provider.clone()));
+                self.state.status.set_provider(Some(provider));
                 // …and re-answer `usingSubscription` for the NEW provider (`footer.ts:139-141`).
                 // pi gets this for free — `model_changed` calls `footer.invalidate()`
                 // (`interactive-mode.ts:3070`) and the flag is recomputed inside `render()`. cyrup
@@ -386,14 +412,14 @@ impl<B: Backend> App<B> {
                 // footer's location line (` • {name}`, footer.ts:116-130) and the window title. The
                 // recomputed title is written by the crossterm run loop (see
                 // [`Self::update_terminal_title`]).
-                self.state.status.set_session_name(name.clone());
+                self.state.status.set_session_name(name);
                 let _ = self.update_terminal_title();
             }
             AgentSessionEvent::EntryAppended { entry } => {
                 // A loaded extension appended a custom (non-LLM) entry to the tree (Pi
                 // `entry_appended`, agent-session.ts:140 → `addCustomEntryToChat(event.entry)`,
                 // interactive-mode.ts:3105/3431-3450).
-                let ty = custom_entry_type(entry);
+                let ty = custom_entry_type(&entry);
                 // X15 — `addCustomEntryToChat` is entirely a renderer question:
                 //
                 // ```ts

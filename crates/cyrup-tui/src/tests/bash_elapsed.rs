@@ -10,7 +10,7 @@
 //! and the number appeared only after the fact.
 //!
 //! These tests drive the assembled `App` through the same transcript calls
-//! `App::ingest_event_rendered` makes for `ToolExecutionStart` / `ToolExecutionUpdate` /
+//! `App::ingest_event_rendered_owned` makes for `ToolExecutionStart` / `ToolExecutionUpdate` /
 //! `ToolExecutionEnd` (`app.rs`), and assert on the rendered frame.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
