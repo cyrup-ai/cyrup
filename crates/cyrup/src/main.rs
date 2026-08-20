@@ -703,6 +703,21 @@ async fn run() -> anyhow::Result<i32> {
         if let Some(ic) = intercom_ext {
             factory_builder = factory_builder.with_native_extension(ic);
         }
+        // MCP adapter (gap-analysis 13a, MCP-001): the `pi-mcp-adapter` port. Attached
+        // UNCONDITIONALLY — upstream is an installed npm package present in every session of every
+        // mode, so there is no install gate to mirror; `--no-extensions` switches it off through
+        // `NativeExtension::is_ambient() -> true`, which is the seam pi's own `noExtensions` uses on
+        // the PATH tier that package lives in. It is NOT skipped inside a subagent child either: a
+        // child resolves its `mcp:` tool selectors against the parent's `mcp-cache.json` and pins the
+        // servers it needs with `MCP_DIRECT_TOOLS`. The `None` programmatic config is
+        // `createMcpAdapter()`'s own default — discovery, not a caller-supplied config.
+        if let Some(ext) = cyrup_mcp::mcp_extension_for_env(
+            &dirs.agent_dir,
+            None,
+            session_cwd.clone(),
+        ) {
+            factory_builder = factory_builder.with_native_extension(ext);
+        }
         // Permission system (port doc §4): the opt-in allow/ask/deny gate over tool calls, attached
         // via the SAME `.with_native_extension(...)` seam. `permission_extension_for_env` selects the
         // role by the `CYRUP_SUBAGENT_CHILD` signal — a subagent child loads the gate with the
@@ -916,6 +931,21 @@ async fn run() -> anyhow::Result<i32> {
             if let Some(ic) = intercom_ext {
                 factory_builder = factory_builder.with_native_extension(ic);
             }
+            // MCP adapter (gap-analysis 13a, MCP-001): the `pi-mcp-adapter` port. Attached
+            // UNCONDITIONALLY — upstream is an installed npm package present in every session of every
+            // mode, so there is no install gate to mirror; `--no-extensions` switches it off through
+            // `NativeExtension::is_ambient() -> true`, which is the seam pi's own `noExtensions` uses on
+            // the PATH tier that package lives in. It is NOT skipped inside a subagent child either: a
+            // child resolves its `mcp:` tool selectors against the parent's `mcp-cache.json` and pins the
+            // servers it needs with `MCP_DIRECT_TOOLS`. The `None` programmatic config is
+            // `createMcpAdapter()`'s own default — discovery, not a caller-supplied config.
+            if let Some(ext) = cyrup_mcp::mcp_extension_for_env(
+                &dirs.agent_dir,
+                None,
+                session_cwd.clone(),
+            ) {
+                factory_builder = factory_builder.with_native_extension(ext);
+            }
             // Permission system (port doc §4): opt-in allow/ask/deny gate; same seam + child-gating.
             if let Some(ext) = cyrup_permission_system::permission_extension_for_env(
                 dirs.agent_dir.clone(),
@@ -1042,6 +1072,21 @@ async fn run() -> anyhow::Result<i32> {
             }
             if let Some(ic) = intercom_ext {
                 factory_builder = factory_builder.with_native_extension(ic);
+            }
+            // MCP adapter (gap-analysis 13a, MCP-001): the `pi-mcp-adapter` port. Attached
+            // UNCONDITIONALLY — upstream is an installed npm package present in every session of every
+            // mode, so there is no install gate to mirror; `--no-extensions` switches it off through
+            // `NativeExtension::is_ambient() -> true`, which is the seam pi's own `noExtensions` uses on
+            // the PATH tier that package lives in. It is NOT skipped inside a subagent child either: a
+            // child resolves its `mcp:` tool selectors against the parent's `mcp-cache.json` and pins the
+            // servers it needs with `MCP_DIRECT_TOOLS`. The `None` programmatic config is
+            // `createMcpAdapter()`'s own default — discovery, not a caller-supplied config.
+            if let Some(ext) = cyrup_mcp::mcp_extension_for_env(
+                &dirs.agent_dir,
+                None,
+                session_cwd.clone(),
+            ) {
+                factory_builder = factory_builder.with_native_extension(ext);
             }
             // Permission system (port doc §4): opt-in allow/ask/deny gate; same seam + role selection.
             // The one-shot print/json mode is exactly what a spawned subagent child re-execs into, so

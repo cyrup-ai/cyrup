@@ -189,10 +189,11 @@ fn the_colorterm_hint_is_an_equality_not_a_substring() {
 /// (`packages/tui/src/terminal-image.ts:137-139`) and `setCapabilities(caps)` (`:142-144`,
 /// doc-commented "Override the cached capabilities. Useful in tests to exercise both code paths").
 ///
-/// Serialized with the other cache-touching test in this file because the cache is process-wide.
+/// Serialized against every other test in this binary that OBSERVES the cache, because the cache is
+/// process-wide — see [`caps_lock`].
 #[test]
 fn set_capabilities_pins_both_branches_and_reset_drops_the_pin() {
-    let _guard = CAPS_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = caps_lock();
 
     crate::set_capabilities(crate::TerminalCapabilities {
         images: Some(crate::ImageProtocol::Kitty),
@@ -217,5 +218,21 @@ fn set_capabilities_pins_both_branches_and_reset_drops_the_pin() {
     crate::reset_capabilities_cache();
 }
 
-/// The process-wide cache makes these tests order-dependent; one lock serializes them.
+/// The process-wide cache makes every test that touches it order-dependent; one lock serializes
+/// them.
 static CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Take [`CAPS_LOCK`], ignoring poisoning — same device as `crate::panic_hook`'s `HOOK_LOCK` and
+/// `crate::drain`'s `DRAIN_LOCK`: a sibling that panicked has already reported its own failure, and
+/// refusing the lock here would turn that into a second, misleading one.
+///
+/// `pub(crate)` rather than file-private, and that is the whole point of this accessor. The writer
+/// above is not the only test that depends on `image::CAPABILITIES`: `render_markdown` reaches
+/// `hyperlinks_supported()` through `markdown::render_with_default_style` (`markdown.rs:126`), so
+/// `tests::markdown::inline_code_bold_and_links` READS the same global — and it read it TWICE, once
+/// directly and once inside `render_markdown`, asserting the two agree. A pin landing between those
+/// two reads makes a correct renderer disagree with itself. A lock the reader cannot name does not
+/// serialize anything, which is what a file-private `static` amounted to here.
+pub(crate) fn caps_lock() -> std::sync::MutexGuard<'static, ()> {
+    CAPS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}

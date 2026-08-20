@@ -813,14 +813,47 @@ mod tests {
         server.abort();
     }
 
+    /// Puts [`HTTP_IDLE_TIMEOUT_MS`] back to [`DEFAULT_HTTP_IDLE_TIMEOUT_MS`] on `Drop`, never only
+    /// on the success path.
+    ///
+    /// A perturbed global that leaks past a PANICKING assertion is a far worse hazard than the
+    /// transient one below: it is not a window at all but a permanent retune of every client the
+    /// rest of this binary builds — `1234`, or `0` (unbounded), applied to every later
+    /// [`build_client`]/[`build_client_for`] in the process, long after the test that set it has
+    /// already reported its own failure.
+    struct RestoreIdleTimeoutOnDrop;
+
+    impl Drop for RestoreIdleTimeoutOnDrop {
+        fn drop(&mut self) {
+            configure_http_idle_timeout(DEFAULT_HTTP_IDLE_TIMEOUT_MS);
+        }
+    }
+
     /// The global default is what protects every caller that does not pass an override — this is
     /// the setting Pi installs with `configureHttpDispatcher` at startup — plus the `0 = disabled`
     /// and `None = inherit` resolution rules.
     ///
     /// One test, not three: `HTTP_IDLE_TIMEOUT_MS` is process-global, and cargo runs this module's
     /// tests concurrently in one process, so splitting it would let the cases race each other.
-    /// The window in which the global is perturbed is kept short and generous (1 s) so a concurrent
-    /// test elsewhere in the crate that builds a client cannot be starved by it.
+    ///
+    /// # Keeping the perturbation invisible to the rest of the binary
+    ///
+    /// The hazard is not this test failing, it is this test making an UNRELATED one fail: every
+    /// [`build_client`] and [`build_client_for`] in the crate reads this global, so while it holds
+    /// `1_000` any bystander client is built with a 1 s `read_timeout` against its own loopback
+    /// mock. The previous shape left it perturbed across the whole `open_sse` leg — seconds of real
+    /// awaits, i.e. seconds during which any of this crate's other loopback tests could be built
+    /// short — and reasoned that 1 s was "generous" enough not to starve them, which is a bet on
+    /// machine load rather than a guarantee.
+    ///
+    /// It is not a bet worth taking, and it does not have to be, because the global is consulted
+    /// exactly ONCE per client: `with_idle_timeout` reads it inside `build_client()` and bakes the
+    /// resulting `read_timeout` into the built client (the same reason `configure_http_idle_timeout`
+    /// documents that already-built clients keep the timeout they were built with). So the setting
+    /// only has to survive that one SYNCHRONOUS call, and the restore moves to immediately after it
+    /// — before the stalling server is ever awaited. Every window in this test is now await-free:
+    /// no other task on this runtime can observe one at all, and a bystander on another thread
+    /// would have to land inside a single `ClientBuilder::build()`. The seconds-long window is gone.
     #[tokio::test]
     async fn the_process_global_timeout_applies_when_no_override_is_given() {
         assert_eq!(
@@ -833,21 +866,31 @@ mod tests {
             "a process that never calls `configure_http_idle_timeout` is still bounded"
         );
 
-        // Resolution rules.
-        configure_http_idle_timeout(1234);
-        assert_eq!(resolve_idle_timeout(None), Some(Duration::from_millis(1234)));
-        assert_eq!(resolve_idle_timeout(Some(0)), None, "0 disables, not 0ms");
-        assert_eq!(
-            resolve_idle_timeout(Some(50)),
-            Some(Duration::from_millis(50))
-        );
-        configure_http_idle_timeout(0);
-        assert_eq!(resolve_idle_timeout(None), None, "a disabled global disables");
-
-        // ...and the global actually reaches a client built with no override.
-        configure_http_idle_timeout(1_000);
+        // The stalling server is set up BEFORE the global is touched, so the await it costs is not
+        // spent with the global perturbed.
         let (url, server) = spawn_stalling_server(None).await;
-        let client = build_client().expect("client");
+
+        let client = {
+            let _restore = RestoreIdleTimeoutOnDrop;
+
+            // Resolution rules.
+            configure_http_idle_timeout(1234);
+            assert_eq!(resolve_idle_timeout(None), Some(Duration::from_millis(1234)));
+            assert_eq!(resolve_idle_timeout(Some(0)), None, "0 disables, not 0ms");
+            assert_eq!(
+                resolve_idle_timeout(Some(50)),
+                Some(Duration::from_millis(50))
+            );
+            configure_http_idle_timeout(0);
+            assert_eq!(resolve_idle_timeout(None), None, "a disabled global disables");
+
+            // ...and the global actually reaches a client built with no override. `build_client`
+            // is synchronous and reads the global exactly here; `_restore` puts the default back
+            // at the end of this block, so everything below runs at the default again.
+            configure_http_idle_timeout(1_000);
+            build_client().expect("client")
+        };
+
         let err = expect_err(
             tokio::time::timeout(
                 Duration::from_secs(20),
@@ -865,8 +908,13 @@ mod tests {
             "a silent peer",
         );
         assert!(matches!(err, ProviderError::Transport(_)), "got {err:?}");
+        assert_eq!(
+            http_idle_timeout_ms(),
+            DEFAULT_HTTP_IDLE_TIMEOUT_MS,
+            "the global is back at its default for the rest of the binary, and the 1 s timeout that \
+             just fired came from the client it was baked into — not from a still-perturbed global"
+        );
 
-        configure_http_idle_timeout(DEFAULT_HTTP_IDLE_TIMEOUT_MS);
         server.abort();
     }
 

@@ -75,6 +75,11 @@ cyrup-intercom = { workspace = true }
 # renderers. Attached unconditionally at the top level (no install gate) at all three session
 # construction sites below, matching the sibling extension seams above.
 cyrup-flux = { workspace = true }
+# The MCP adapter (gap-analysis 13, the `pi-mcp-adapter` port): registered as a native built-in at
+# all three session construction sites below. Upstream is an INSTALLED PACKAGE present in every
+# session of every mode, so `mcp_extension_for_env` attaches unconditionally and `--no-extensions`
+# reaches it through `NativeExtension::is_ambient() -> true` rather than through the gate.
+cyrup-mcp = { workspace = true }
 # Package + config subcommands (Pi `package-manager-cli.ts`) drive the resources package manager.
 cyrup-resources = { workspace = true }
 # The provider seam. **NO `features = ["faux"]` HERE** (PROV-052): this is a NORMAL dependency, and

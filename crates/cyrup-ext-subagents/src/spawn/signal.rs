@@ -511,6 +511,121 @@ fn send_signal(pid: u32, signal: nix::sys::signal::Signal) {
     let _ = nix::sys::signal::kill(target, signal);
 }
 
+/// Make sure a child spawned from THIS process can actually be killed by `SIGINT` — repairing the
+/// process's own disposition first if the environment handed us one that cannot.
+///
+/// **The defect this exists for.** POSIX makes `SIG_IGN` — unlike a handler — survive `execve`
+/// (XSH `exec`: "signals set to the default action ... shall be set to the default action ...
+/// signals set to be caught ... shall be set to the default action"; ignored signals stay ignored).
+/// And a shell running a NON-INTERACTIVE asynchronous command sets `SIGINT` and `SIGQUIT` to
+/// `SIG_IGN` for it (XCU 2.11 "Signals and Error Handling"). Put together: whenever this suite runs
+/// as a background job — `cargo test &`, `nohup`, and the process supervisors most unattended CI /
+/// agent harnesses use — the whole test binary inherits `SIGINT = SIG_IGN`, and so does every
+/// `sleep`/`sh` child the two stage-1 tests below spawn. `sh -c 'trap - INT; exec …'` does not help:
+/// the same clause forbids a non-interactive shell from resetting a signal it inherited ignored.
+///
+/// The failure is not a flake but a deterministic one, and an expensive one: measured on this file's
+/// own two stage-1 assertions, `0.00 s / 2 passed` in the foreground became `30.01 s / 2 failed`
+/// with `left: Sigterm, right: Sigint` under `&` — the ladder correctly escalated past a rung that
+/// physically could not end the child, after sitting out its full injected grace.
+///
+/// **The repair.** Registering a real handler overwrites `SIG_IGN` via `sigaction`, and a CAUGHT
+/// signal *is* reset to `SIG_DFL` by `execve` — so every child spawned after this call obeys
+/// `SIGINT` again. This crate is `#![forbid(unsafe_code)]`, which rules out `nix::sys::signal::signal`
+/// and `sigaction` (both `unsafe fn`); tokio's `signal` feature is already a dependency and its
+/// registry is the safe lever onto the same syscall.
+///
+/// **Why it probes first.** The handler is process-global and permanent — nothing can put `SIG_DFL`
+/// back without `unsafe` — so installing it unconditionally would take a developer's Ctrl-C away
+/// from an interactive `cargo test` run that never needed the repair. The probe is one `sleep 1`
+/// child, signalled and reaped: `status.signal() == SIGINT` means the disposition is already sound
+/// and this function does nothing at all. It costs milliseconds in the healthy case (the probe dies
+/// at once), at most one second in the broken one, and runs once per process.
+#[cfg(all(test, unix))]
+pub(crate) fn ensure_sigint_reaches_children() {
+    static REPAIRED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    REPAIRED.get_or_init(|| {
+        if !sigint_kills_a_probe_child() {
+            catch_sigint_for_the_rest_of_the_process();
+        }
+    });
+}
+
+/// The probe half of [`ensure_sigint_reaches_children`]: spawn a short-lived child, `SIGINT` it, and
+/// report whether the OS really killed it with that signal.
+///
+/// A spawn or wait failure reports `true` — "assume sound". The alternative, repairing on a failed
+/// probe, would install a permanent process-global handler on the strength of an unrelated error;
+/// and a genuinely broken disposition still announces itself in the assertion these tests already
+/// make, which is a far better diagnostic than a silent side effect.
+#[cfg(all(test, unix))]
+fn sigint_kills_a_probe_child() -> bool {
+    use std::os::unix::process::ExitStatusExt as _;
+
+    let spawned = std::process::Command::new("sleep")
+        .arg("1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let Ok(mut probe) = spawned else {
+        return true;
+    };
+    // The bare pid, never the negated one: this probe is NOT a group leader (no `process_group(0)`),
+    // so it shares the test runner's group and `kill(-pgid, SIGINT)` would signal the runner itself.
+    let pid = nix::unistd::Pid::from_raw(probe.id() as nix::libc::pid_t);
+    let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGINT);
+    match probe.wait() {
+        // An ignored SIGINT leaves `sleep 1` to exit normally a second later: `signal()` is `None`.
+        Ok(status) => status.signal() == Some(nix::libc::SIGINT),
+        Err(_) => true,
+    }
+}
+
+/// The repair half of [`ensure_sigint_reaches_children`]: install a process-global `SIGINT` handler
+/// and keep it serviced for the lifetime of the process.
+///
+/// The dedicated thread and its own current-thread runtime are load-bearing. `#[tokio::test]` builds
+/// and DROPS a runtime per test, while the handler this installs is permanent — a receiver parked on
+/// a runtime that is about to be torn down would leave the handler live with nothing listening, and
+/// a Ctrl-C would then be swallowed for the remainder of the run. This thread outlives every test
+/// runtime and reproduces the default action the handler displaced: terminate with `128 + SIGINT`,
+/// the status a shell reports for an interrupted process.
+///
+/// The rendezvous is required, not cosmetic: a child spawned before `sigaction` has actually run
+/// would still inherit `SIG_IGN`, so the caller must not proceed until the handler is installed.
+/// Dropping the sender is the "installed" edge; it is also the edge for every path that gives up
+/// (runtime build failure, registration failure), so the caller can never block forever.
+#[cfg(all(test, unix))]
+fn catch_sigint_for_the_rest_of_the_process() {
+    let (installed_tx, installed_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::Builder::new()
+        .name("sigint-disposition-repair".to_string())
+        .spawn(move || {
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread().enable_all().build()
+            else {
+                return;
+            };
+            runtime.block_on(async move {
+                let Ok(mut sigint) =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                else {
+                    return;
+                };
+                // `sigaction` has run by the time `signal()` returns `Ok`, so the disposition is
+                // repaired here — release the caller before parking on the stream.
+                drop(installed_tx);
+                if sigint.recv().await.is_some() {
+                    std::process::exit(128 + nix::libc::SIGINT);
+                }
+            });
+        });
+    if thread.is_ok() {
+        // `Err(RecvError)` is the sender being dropped, which is exactly the signal being waited on.
+        let _ = installed_rx.recv();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -692,6 +807,11 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminate_stops_at_sigint_for_a_normal_child() {
+        // The premise of every assertion below — see that function for the inherited-`SIG_IGN`
+        // failure it repairs, which is deterministic rather than flaky whenever the suite runs as a
+        // background job.
+        ensure_sigint_reaches_children();
+
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("30");
         cmd.stdin(std::process::Stdio::null());

@@ -92,6 +92,28 @@ pub fn progress_is_armed() -> bool {
     PROGRESS_ARMED.load(Ordering::Relaxed)
 }
 
+/// Serializes every TEST that reads or writes [`PROGRESS_ARMED`], across modules.
+///
+/// It lives here, outside `mod tests` and `pub(crate)`, for the reason
+/// `cyrup_permission_system::ext_config::env_lock` states for its own: a lock declared inside one
+/// module's `tests` is a DIFFERENT instance from anything another module could reach, so it cannot
+/// serialize the two against each other — and `cargo test` runs this crate's unit tests as threads
+/// in ONE process.
+///
+/// The second toucher is not in this file and is easy to miss: `panic_hook::restore_terminal_best_effort`
+/// (`panic_hook.rs:75-76`) reads [`progress_is_armed`] and, when it is set, calls
+/// [`write_terminal_progress`]`(false)` — so `panic_hook`'s two restoration tests clear this global
+/// from another thread. Landing between `write_terminal_progress(true)` and the
+/// `assert!(progress_is_armed())` that follows it turns a correct implementation into a failure.
+#[cfg(test)]
+pub(crate) fn lock_progress_armed() -> std::sync::MutexGuard<'static, ()> {
+    static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // Poisoning is recovered from rather than propagated: a sibling that panicked has already
+    // reported its own failure, and refusing the lock here would turn that into a second,
+    // misleading one. Same device as [`crate::panic_hook`]'s `HOOK_LOCK`.
+    GLOBAL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// Write the OSC 9;4 progress sequence — Pi `ProcessTerminal.setProgress`
 /// (`tui/src/terminal.ts:509-523`).
 ///
@@ -322,7 +344,7 @@ mod tests {
     /// Serialised via [`GLOBAL_LOCK`]: [`PROGRESS_ARMED`] is process-global and libtest threads.
     #[test]
     fn shutdown_follows_the_terminal_not_the_setting() {
-        let _g = lock_global();
+        let _g = crate::terminal_progress::lock_progress_armed();
         PROGRESS_ARMED.store(false, Ordering::Relaxed);
         let mut p = TerminalProgress::with_enabled(true);
         assert!(!p.shutdown(), "a session that never armed progress emits no exit sequence");
@@ -345,7 +367,7 @@ mod tests {
     /// stdout; the sequences are invisible control codes.
     #[test]
     fn writing_tracks_the_global_armed_bit() {
-        let _g = lock_global();
+        let _g = crate::terminal_progress::lock_progress_armed();
         write_terminal_progress(false);
         assert!(!progress_is_armed());
         write_terminal_progress(true);
@@ -354,10 +376,4 @@ mod tests {
         assert!(!progress_is_armed());
     }
 
-    /// [`PROGRESS_ARMED`] is process-global; the two tests that touch it must not interleave.
-    static GLOBAL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    fn lock_global() -> std::sync::MutexGuard<'static, ()> {
-        GLOBAL_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
 }

@@ -22,6 +22,7 @@ members = [
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",
     "crates/cyrup-flux",
+    "crates/cyrup-mcp",
     "crates/cyrup-it",
     "xtask",
 ]
@@ -79,6 +80,7 @@ default-members = [
     "crates/cyrup-permission-system",
     "crates/cyrup-intercom",
     "crates/cyrup-flux",
+    "crates/cyrup-mcp",
 ]
 
 [workspace.package]
@@ -116,6 +118,7 @@ cyrup-ext-subagents = { path = "crates/cyrup-ext-subagents", version = "0.0.0" }
 cyrup-permission-system = { path = "crates/cyrup-permission-system", version = "0.0.0" }
 cyrup-intercom     = { path = "crates/cyrup-intercom",     version = "0.0.0" }
 cyrup-flux         = { path = "crates/cyrup-flux",         version = "0.0.0" }
+cyrup-mcp          = { path = "crates/cyrup-mcp",          version = "0.0.0" }
 
 # --- standardized external deps (arch-00 §7). Versions are inert until a crate
 #     references them via `dep.workspace = true`; verify/bump on first use. ---
@@ -240,6 +243,14 @@ ratatui-image        = { version = "11.0.6", default-features = false, features 
 # cyrup-tui. Already in the graph transitively (tempfile/is-terminal); only `event` (poll) is enabled.
 rustix               = { version = "1.1", default-features = false, features = ["std", "event"] }
 
+# Atomic, lock-free `Arc` slot. Promoted here from the crate-local pins in `cyrup-resources` and
+# `cyrup-session` when `cyrup-mcp` became the third consumer (gap-analysis 13a, MCP-004): a
+# `tokio_util::sync::CancellationToken` carries no payload where `AbortController.abort(new
+# Error(reason))` does, so the MCP runtime owner stores the stop REASON in an `ArcSwapOption<String>`
+# written immediately before `token.cancel()` — that is what lets `throw_if_inactive` reproduce
+# `signal.reason` and keeps `isAbortError`'s reason arm working.
+arc-swap             = { version = "1.9.2" }
+
 # Additional standardized externals (arch-00 §7 / §7.1) are added to this table
 # when first used, to avoid pinning versions ahead of need:
 #   schemars, reqwest(rustls)+eventsource-stream, rustls, webpki-roots,
@@ -247,7 +258,7 @@ rustix               = { version = "1.1", default-features = false, features = [
 #   wasmtime(component-model,async,epoch,pooling-allocator), wasmtime-wasi, wit-bindgen,
 #   ignore, globset, grep/grep-searcher/grep-regex, clap, tracing, tracing-subscriber,
 #   time, uuid, fs4, oauth2, sha2, base64, parking_lot, dashmap,
-#   arc-swap, indexmap, similar, image, smallvec, rustc-hash, directories, blake3,
+#   indexmap, similar, image, smallvec, rustc-hash, directories, blake3,
 #   toml, serde_yml, gix, notify, slotmap, pulldown-cmark, syntect, camino, bytes, memchr,
 #   landlock, seccompiler.
 

@@ -1759,6 +1759,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn terminate_delegates_to_the_real_signal_escalation_ladder() {
+        // The premise of the stage-1 assertion below: a process that inherited `SIGINT = SIG_IGN`
+        // (any `cargo test &` / unattended run) passes it straight to this `sh` child, which then
+        // cannot die at rung 1 no matter how correct the ladder is. See
+        // [`signal::ensure_sigint_reaches_children`].
+        signal::ensure_sigint_reaches_children();
+
         let dir = tempfile::tempdir().expect("real tempdir");
         let spec = ChildSpawnSpec {
             command: sh_command("while true; do sleep 1; done"),

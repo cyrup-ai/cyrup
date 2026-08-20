@@ -12,7 +12,7 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-arc-swap = "1.9.2"
+arc-swap = { workspace = true }
 # `cyrup_config::paths::normalize_path` — the single port of Pi `normalizePath`
 # (`coding-agent/src/utils/paths.ts:57-78`). Settings-declared resource paths and local package
 # sources go through the identical function as the settings/env/CLI dir tiers, so `~/team-skills`

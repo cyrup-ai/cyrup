@@ -1,0 +1,174 @@
+[package]
+name = "cyrup-mcp"
+description = "MCP adapter: the pi-mcp-adapter port as a native cyrup-ext extension (gap-analysis 13)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# --- the host seam ---------------------------------------------------------------------------
+# `NativeExtension`/`InitApi`/`HostCtx`/`HostServices` — the whole attachment surface (13a "How it
+# lands"). `cyrup-ext`'s `wasm-host` feature is DEFAULT-ON and `HostServices` lives behind it, so
+# this crate names the trait unqualified exactly as `cyrup-ext-subagents` does.
+cyrup-ext = { workspace = true }
+# `CancelToken` (= `tokio_util::sync::CancellationToken`) is the runtime owner's abort signal
+# (MCP-004) and `Tool`/`ToolError`/`ToolResult` are the direct-tool/proxy-tool boundary.
+cyrup-core = { workspace = true }
+# `ConfigDirs::agent_dir` is `<agent_dir>` — the one directory `mcp.json`, `mcp-cache.json`,
+# `mcp-onboarding.json`, `agent-plugin-data/` and `mcp-oauth/` all hang off (13a §26, MCP-048).
+# Also the keybindings read `ui/keys.rs` needs so a user's `mcp.panel.save` is honoured (MCP-363).
+cyrup-config = { workspace = true }
+# JSONC parsing for `mcp.json` — `cyrup_permission_system::jsonc` is `pub` and is the SAME parser
+# `cyrup_permission_system::manager::read_configured_mcp_server_names` already runs over that exact
+# file, so both crates parse it identically BY CONSTRUCTION (13 "The rest of the dependency set";
+# upstream `strip-json-comments`). Re-porting `strip-json-comments` here would let the permission
+# gate and the adapter disagree about which servers exist — silently.
+cyrup-permission-system = { workspace = true }
+# Sampling (`ClientHandler::create_message`) resolves a model through the provider catalog, and the
+# OAuth loopback listener is `cyrup_provider::auth::oauth::callback` — REUSED, not rebuilt (13
+# "`cyrup-provider` — sampling, and the callback server"). `cyrup-ext` already depends on
+# `cyrup-provider`, so this adds no layering.
+cyrup-provider = { workspace = true }
+# The output guard's dual byte/line truncation and temp-file spill are `cyrup_tools::truncate` /
+# `cyrup_tools::output` (13 "The rest of the dependency set"). Same crate `cyrup-ext` depends on.
+cyrup-tools = { workspace = true }
+
+# --- the MCP protocol ------------------------------------------------------------------------
+# The official Rust MCP SDK, CLIENT-ONLY. The feature set is SETTLED (13 "The dependency decision"):
+#
+# * `default-features = false` is MANDATORY — rmcp's `default = ["base64", "macros", "server"]` and
+#   `server` drags `transport-async-rw`, `schemars`, `pastey` and `uuid` in for a role the adapter
+#   never plays: it is a client and never runs an MCP *server*. `base64` returns transitively
+#   through `client-side-sse`, so nothing is lost.
+# * `transport-child-process` is the stdio child (pulls `process-wrap`, new to the lock);
+#   `transport-streamable-http-client-reqwest` is the HTTP transport (pulls `sse-stream`, new).
+# * `reqwest` is named EXPLICITLY: both `auth` and the streamable-HTTP feature select only the
+#   private `__reqwest`, which turns the dependency on without choosing a TLS backend. Cargo would
+#   unify onto the workspace `reqwest`'s `rustls` today, but relying on another crate's feature
+#   selection for your TLS backend is not a contract.
+# * `auth` = `["dep:async-trait", "dep:oauth2", "__reqwest", "dep:url"]`; `oauth2` 5.0.0 is already
+#   in this lock file and rmcp requires `"5.0"`, so there is no new resolution surface.
+# * `elicitation` is deliberately ABSENT. Every `#[cfg(feature = "elicitation")]` in rmcp is
+#   SERVER-side; the whole client half (`ClientHandler::create_elicitation`, `ElicitRequestParams`,
+#   the `ElicitationSchema` family, `ElicitResult`, `ElicitationCapability`) is unconditional under
+#   `client`. Enabling it would add `url` for nothing.
+# * `which-command` stays off: `cyrup_ext::caps::proc::npx_resolver` already does far more than
+#   `which` for the one command shape that needs it.
+#
+# NB the `default-features = false` consequence a reader hits on their first line:
+# `ClientCapabilities` is `#[non_exhaustive]` and its `builder()` is generated behind
+# `server`/`macros`, neither of which this set selects — so build it with `Default` + field
+# assignment, never `builder()` and never a struct literal. Same for `SamplingCapability` and
+# `ElicitationCapability`; `StoredCredentials`/`StoredAuthorizationState` are `#[non_exhaustive]`
+# WITHOUT `Default` and must go through their constructors.
+rmcp = { version = "3.1.2", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+    "auth",
+] }
+
+# --- runtime ---------------------------------------------------------------------------------
+tokio = { workspace = true, features = ["process", "io-util", "fs", "sync", "time", "macros", "rt-multi-thread"] }
+# `CancellationToken` itself is re-exported as `cyrup_core::CancelToken`; this edge is for the
+# `child_token()`/`DropGuard` composition MCP-007's `combine` builds on.
+tokio-util = { workspace = true }
+# MCP-005 joins the LIFO cleanup stack with `futures::future::join_all` so one failing cleanup never
+# prevents the others from running, and MCP-011's `initPromise` identity check needs `Shared`.
+futures = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = "0.1.44"
+# MCP-004: a `CancellationToken` carries no payload, but `AbortController.abort(new Error(reason))`
+# does — `signal.reason` is rethrown verbatim by `throwIfAborted()`. The reason is stored in an
+# `ArcSwapOption<String>` written immediately BEFORE `token.cancel()` so `throw_if_inactive`
+# reproduces it. Already a crate-local pin in `cyrup-resources` and `cyrup-session`; promoted to
+# `[workspace.dependencies]` here rather than adding a third copy.
+arc-swap = { workspace = true }
+
+# --- config, naming, validation ----------------------------------------------------------------
+# WHATWG URL parsing for `resolveServerUrl` (which THROWS on an invalid URL after interpolation,
+# 13b §6) and for the Agent Plugin loader's URL containment rules (MCP-047: no `${`/`$env:`/
+# `{env:`, no userinfo, no fragment, plain `http:` only for loopback).
+url = { workspace = true }
+# `agent-plugin-loader.ts`'s plugin-name character class, the glob→regex tool filters, and
+# `executeSearch`'s caller-supplied `regex: true` pattern. Rust's `regex` is a finite automaton with
+# a LINEAR-TIME matching guarantee, which is why upstream's `recheck` ReDoS gate has no port — see
+# 13 "The `recheck` residual, stated precisely" for the three things that residual costs.
+regex = "1.12.4"
+# The Codex host-config import family reads `~/.codex/config.toml` (upstream `smol-toml`). Already
+# in the tree via `cyrup-resources`; pinned here rather than promoted because this is its second and
+# last consumer.
+toml = "1.1.2"
+# Parent-side JSON-Schema validation of a server's `outputSchema` against `structuredContent`.
+# **rmcp does NOT do this** — there is no validator hook on `Peer<RoleClient>`, unlike the TS SDK's
+# `jsonSchemaValidator` client option that `json-schema-validator.ts` supplies — so it is
+# hand-written here, dispatching on `$schema` across draft-07 AND 2020-12 with
+# `should_validate_formats(true)` on both (upstream `ajv` + `ajv-formats`). Default features stay
+# off: the workspace comment on remote/file `$ref` resolution applies identically.
+jsonschema = { workspace = true }
+# `computeServerHash` — the 64-hex config-identity digest stamped into `mcp-cache.json`. It MUST be
+# byte-identical to the digest `cyrup_ext_subagents::exec::mcp_direct_tools` already computes when
+# it READS that file, or every `mcp:` subagent tool selector silently resolves to nothing
+# (13 "`cyrup-ext-subagents` — the hardest external constraint in the port").
+sha2 = "0.11.0"
+# OAuth PKCE S256 verifier/challenge encoding and the keychain blob-chunking manifest.
+base64 = { workspace = true }
+# `mcp.json`'s `mcpServers` object is iterated with `Object.entries(...)`, which yields **insertion
+# order**, and that order is user-visible: it is the order servers connect in, the order they appear
+# in `/mcp`, and the tie-break the tool-name collision resolver uses. A `BTreeMap` would sort them —
+# one of the six ways `cyrup_ext_subagents::exec::mcp_direct_tools`' drifted copy of this grammar
+# already diverges (13 "`cyrup-ext-subagents` — the hardest external constraint"). `IndexMap` keeps
+# the file's own order. Already resolved in this lock file transitively.
+indexmap = { version = "2.14.0", features = ["serde"] }
+# `String.prototype.localeCompare` for MCP-059's conflict ordering (`config.ts` sorts the conflict
+# list with it). Node's default collation is ICU root, NOT code-point order, so `str::cmp` puts
+# `"A"` before `"a"` where Node puts `"a"` first. Pure-Rust UCA, and the SAME
+# `Collator::new(Tailoring::default(), false, true)` configuration already proven against Node in
+# `cyrup-tools/src/tools/ls.rs:214` and `cyrup-config/src/model.rs:3123` — a third hand-rolled
+# approximation is exactly the drift those two exist to prevent.
+feruca = { workspace = true }
+# Opaque per-connection request/trace ids. `v7`'s sortable timestamp prefix is what the trace writer
+# wants; the workspace default already selects it.
+uuid = { workspace = true }
+
+# --- credentials and the browser ---------------------------------------------------------------
+# `@napi-rs/keyring` is a napi binding of THIS Rust library, so the store semantics port near 1:1 —
+# two `keyring_core::Error` `Display` strings are byte-identical to the strings upstream's
+# fault-injection store fabricates. What does not come free: Windows blob chunking and the Linux
+# keyring-revoked recovery (both hand-written here). New to the lock file.
+# Default features, which is `v1` — `apple-native-keyring-store/keychain`,
+# `windows-native-keyring-store`, and `zbus-secret-service-keyring-store` on Linux. The two
+# platform-native stores are settled; **the Linux backend is an OPEN RULING** (13 "Open rulings",
+# OPEN-1) between secret-service and `linux-keyutils`, and the `keyctl session -` re-exec that
+# `mcp-keyring-helper.cjs` performs points at the latter. `v1` is taken as the documented default
+# rather than as a decision: when OPEN-1 lands, this line is where it lands.
+keyring = "4.1.6"
+# The OAuth authorization URL and the `Url` elicitation mode. Upstream has BOTH an exec dispatch
+# (`$BROWSER`, `utils.ts`'s `execOpen` platform table) and a direct `open` import; the port has both,
+# with the `$BROWSER` arms kept in `cyrup-mcp` ahead of the `opener::open` fallback (13a §9).
+opener = "0.8.5"
+
+# --- panels ------------------------------------------------------------------------------------
+# `ui/` builds `ratatui::text::Line`/`Span` values that a live terminal owner paints through
+# `HostServices::open_overlay`. DIRECT `ratatui`, and deliberately **no `cyrup-tui` dependency** —
+# the same crate-boundary rule `cyrup-ext-subagents` follows, and the same pinned version it and
+# `cyrup-tui` use.
+ratatui = "0.30.2"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# `#[tokio::test(start_paused = true)]` + `tokio::time::advance`: the virtual clock the health-check
+# single-flight test (MCP-034) and the 60-second failure backoff (MCP-024) are asserted against, so
+# neither has to sleep for real. Additive to the runtime features above; nothing outside
+# `#[cfg(test)]` references it.
+tokio = { workspace = true, features = ["test-util"] }

@@ -141,6 +141,11 @@ mod tests {
     #[test]
     fn the_previous_hook_still_runs_after_restoration() {
         let _guard = lock_hook();
+        // The chained hook runs [`restore_terminal_best_effort`], which CLEARS the process-global
+        // `PROGRESS_ARMED` — see [`crate::terminal_progress::lock_progress_armed`] for the
+        // cross-module race that closes. Taken after `HOOK_LOCK`, always in that order, so the two
+        // locks cannot cycle.
+        let _armed = crate::terminal_progress::lock_progress_armed();
         let seen = Arc::new(AtomicUsize::new(0));
         let flag = Arc::clone(&seen);
 
@@ -165,6 +170,9 @@ mod tests {
     /// hook that panicked would abort while handling an abort.
     #[test]
     fn restoration_is_safe_without_a_tty_and_is_idempotent() {
+        // Same reason as above: each call clears `PROGRESS_ARMED` when it is set, and
+        // `terminal_progress`'s own tests assert on that bit from a sibling thread.
+        let _armed = crate::terminal_progress::lock_progress_armed();
         restore_terminal_best_effort();
         restore_terminal_best_effort();
     }
