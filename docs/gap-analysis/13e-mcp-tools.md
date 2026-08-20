@@ -772,7 +772,7 @@ they carry no behaviour of their own.
 flattens the tree to a plain `String` through a fixed vocabulary (bare string, `text`, `markdown`,
 `truncated-text`, `spacer`, `box`/`container`, `hstack`, bare array) under two named limits that
 bound what a `render_result` may legally emit — `MAX_WIDGET_DEPTH = 16` and
-`EXTENSION_RENDER_TIMEOUT = 2 s`, both in `crates/cyrup-tui/src/app.rs`. A tree deeper than
+`EXTENSION_RENDER_TIMEOUT = 2 s`, both in `crates/cyrup-tui/src/app/extension_render.rs`. A tree deeper than
 `MAX_WIDGET_DEPTH` is not partially drawn: `flatten_widget` returns `None` and `rendered_text` falls
 back to the pretty-printed JSON of the **whole** tree, so one over-deep node costs the entire
 rendering. A renderer that has not answered within `EXTENSION_RENDER_TIMEOUT` is **aborted** (not

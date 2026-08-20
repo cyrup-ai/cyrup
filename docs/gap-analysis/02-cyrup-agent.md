@@ -120,7 +120,7 @@ turns AGENT-029 from latent into live.
 | AGENT-003 | still-open | low. Both channels still `try_send`-and-discard (`agent.rs:1236-1239`, `:1355`). Unchanged upstream at v0.84.1. |
 | AGENT-004 | **closed** | f777e44. `added_tool_names` on `cyrup_core::ToolResult` (`crates/cyrup-core/src/tool.rs:33-39`), carried through `finalize` (`agent.rs:1049-1051`, `:1127`) into `result_value_of` (`agent.rs:136-141`, omit-when-empty) and the transcript (`crates/cyrup-agent/src/event.rs:103-107`, `skip_serializing_if = "Vec::is_empty"`). Matches the conditional spread at `agent-loop.ts:787`. |
 | AGENT-005 | **closed** | f777e44. `usage: Option<Usage>` on `ToolResult` (`tool.rs:28-32`), read by the after-hook (`crates/cyrup-agent/src/hooks.rs:64-67`), replace-not-merge patchable via `AfterOverride.usage` (`hooks.rs:89-92`) applied at `agent.rs:1095-1097`. Matches `agent-loop.ts:742`. |
-| AGENT-006 | **closed** *(this pass)* | All four sites now bind and interpolate the error: `agent.rs:992` (before-hook), `agent.rs:1106-1118` (after-hook), `agent.rs:691` and `:696` (transform_context / convert_to_llm). Pinned by `crates/cyrup-agent/tests/hook_failure_text.rs`. A workspace grep for the four hardcoded placeholders returns exactly one hit — a comment at `hook_failure_text.rs:19` describing the old bug. |
+| AGENT-006 | **closed** *(this pass)* | All four sites now bind and interpolate the error: `agent.rs:992` (before-hook), `agent.rs:1106-1118` (after-hook), `agent.rs:691` and `:696` (transform_context / convert_to_llm). Pinned by `crates/cyrup-agent/src/tests/hook_failure_text.rs`. A workspace grep for the four hardcoded placeholders returns exactly one hit — a comment at `hook_failure_text.rs:19` describing the old bug. |
 | AGENT-007 | **closed** *(this pass)* | `RunCtx::emit_run_failure` (`agent.rs:415-435`) emits MessageStart/MessageEnd/TurnEnd/AgentEnd over an `errored_assistant` whose stop reason is `Aborted` iff cancelled (`:420-421`) and whose `new_messages` is replaced with the single failure (`:434`); called from both post-turn error arms (`agent.rs:616-619`, `:649-652`). Matches `handleRunFailure` (`agent.ts:496-512` @v0.83.0, `:511-527` @v0.84.1). The bare-`agent_end` arms are gone. The *other* caller of the old shape — the `transform_context`/`convert_to_llm` path — is a different call site this item never named and is filed as **AGENT-025**. |
 | AGENT-008 | **closed** | 6d29542. `ThinkingLevel::Max` / `ModelThinkingLevel::Max` (`crates/cyrup-core/src/message.rs:38`, `:55`), mapped at `:68`/`:86`, serialized `"max"`; ladder `EXTENDED_THINKING_LEVELS: [ModelThinkingLevel; 7]` (`crates/cyrup-provider/src/collection.rs:410-418`). Matches pi's seven-value `ThinkingLevel`. |
 | AGENT-009 | still-open | medium. Widened this pass: **four** producers pass `details: None`, not two, and the JSONL transcript *omits* `details` where pi writes `"details":{}`. |
@@ -137,7 +137,7 @@ turns AGENT-029 from latent into live.
 | AGENT-S01 | **partially-closed** *(this pass)* | The session-level model switch is fixed: `StateInner.headers` is live (`state.rs:80-85`), `Agent::set_headers` exists (`agent.rs:1503-1505`), `stream_assistant` reads it per turn (`agent.rs:733`), and both session model-change paths recompute (`crates/cyrup-session-svc/src/session.rs:2792`, `:3896`). Two residual paths remain, filed as **AGENT-021** (low-level API) and **AGENT-029** (per-turn model override). Not counted again in the open-severity tally. |
 | AGENT-S02 | still-open | low. `subscribe` still returns `()` (`agent.rs:1485-1487`) and `on_event` takes no token. Rationale corrected: v0.84.1 **deleted** `_reconnectToAgent` and the compact-time disconnect, so the surviving upstream consumers are disposal (`agent-session.ts:395`, `:829-831`) and the rpc-mode backpressure listener (`modes/rpc/rpc-mode.ts:355-361`, `:732-733`). |
 | AGENT-S03 | still-open | low. `GenerationConfig` still has no `metadata` field; `StreamOptions` is closed with `..Default::default()` at `agent.rs:744`. |
-| AGENT-S04 | **partially-closed** *(this pass)* | Agent-side wiring is complete: `StateInner.transport` (`state.rs:86-95`), `Agent::set_transport` (`agent.rs:1510-1512`), run-start snapshot overlay (`agent.rs:1703`, `:1712`) matching `agent.ts:454`, reaching `StreamOptions.transport` at `agent.rs:734`, TUI row wired at `crates/cyrup-tui/src/app.rs:4114` → `session.rs:3140-3142`. Still dead downstream — nothing in `crates/cyrup-provider` reads it — which is **an area-01 provider gap, not an agent gap**; handed off. Not counted again in the open-severity tally. |
+| AGENT-S04 | **partially-closed** *(this pass)* | Agent-side wiring is complete: `StateInner.transport` (`state.rs:86-95`), `Agent::set_transport` (`agent.rs:1510-1512`), run-start snapshot overlay (`agent.rs:1703`, `:1712`) matching `agent.ts:454`, reaching `StreamOptions.transport` at `agent.rs:734`, TUI row wired at `crates/cyrup-tui/src/app/execute_misc.rs:229-230` → `session.rs:3654-3658`. Still dead downstream — nothing in `crates/cyrup-provider` reads it — which is **an area-01 provider gap, not an agent gap**; handed off. Not counted again in the open-severity tally. |
 | AGENT-020 | **new** | **low** *(raised to critical 2026-08-12, then LOWERED critical → low on 2026-08-13 when the raise's justification was refuted by measurement)*. `continue_run` drains the steering/follow-up queue before the run-active check. The code path is real and unchanged at HEAD, but the loss it predicts does not occur on the path the TUI uses: typing during a live stream queued and delivered the message 5/5 times, including four attempts timed at the settle boundary. Latent race, not data loss. |
 | AGENT-021 | **new** | medium. `loop_fn::build_run_ctx` hardcodes `headers: None` — a regression introduced by AGENT-S01's own fix. |
 | AGENT-022 | **new** | medium. `BeforeToolCallResult.terminate` (v0.84.1 drift) unrepresentable. |
@@ -283,7 +283,7 @@ push each message back to the front of the queue (add `PendingQueue::push_front`
 before propagating. Prefer the restore form — it is correct even if a run starts between the check
 and the claim.
 
-**Verify** — Test in `crates/cyrup-agent/tests/agent_loop.rs`: build an agent whose transcript ends
+**Verify** — Test in `crates/cyrup-agent/src/tests/agent_loop.rs`: build an agent whose transcript ends
 with an assistant message, `agent.steer(user_text("keep-me"))`, start a long-running `prompt()` so
 the latch is held, then call `continue_run()` and assert it returns `Err(AgentError::RunActive)`
 **and** that `agent.has_queued_messages()` is still true. The second assertion fails today. Add the
@@ -371,7 +371,7 @@ Fix the transcript half in the same change so `details` serializes as `{}`.
 **Verify** — Assert the serialized `tool_execution_end.result` for a not-found tool has
 `details == {}` and no `terminate` key, and that the JSONL tool-result entry carries `"details":{}`.
 `gap26_tool_execution_end_result_includes_terminate`
-(`crates/cyrup-agent/tests/model_boundary.rs`) asserts `terminate == true` for a tool that genuinely
+(`crates/cyrup-agent/src/tests/model_boundary.rs`) asserts `terminate == true` for a tool that genuinely
 sets it — pi emits that too, so it survives the fix.
 
 ## AGENT-016 — Panicking tool in a parallel batch vanishes (unwind builds only)
@@ -409,7 +409,7 @@ match pi's single try/catch. Belt-and-braces: after the drain, synthesize an `im
 any still-`None` slot in a batch that was not cancelled. Whether release should unwind is a separate
 profile-policy question, out of scope here.
 
-**Verify** — Test in `crates/cyrup-agent/tests/agent_loop.rs`: two parallel calls, tool A panics
+**Verify** — Test in `crates/cyrup-agent/src/tests/agent_loop.rs`: two parallel calls, tool A panics
 `"boom-42"`, tool B returns normally. Assert (1) two `tool_execution_end`, A's with `is_error` and
 content containing `boom-42`; (2) two tool-result `message_end` in source order; (3)
 `turn_end.tool_results.len() == 2`; (4) `pending_tool_calls` empty before `agent_end`. Repeat under
@@ -449,7 +449,7 @@ deliberate, documented `systemPrompt` exception at `hooks.rs:158-160` alone.
 **Verify** — Test in `crates/cyrup-session-svc/tests/` with a recording `StreamFn` capturing
 `ModelRef` and `StreamOptions.reasoning` per request; drive a two-turn run and change model /
 thinking level from a subscriber on the first `tool_execution_end`; assert request #2 carries the new
-values. `crates/cyrup-agent/tests/turn_tool_refresh.rs` is the working template for the tools half.
+values. `crates/cyrup-agent/src/tests/turn_tool_refresh.rs` is the working template for the tools half.
 
 **Caveat from the refuter** — the doc at `hooks.rs:154-156` is *accurate* about cyrup's own behaviour
 (an extension's model / thinking_level do survive the spread there). What is false is the preceding
@@ -491,7 +491,7 @@ same seeding `AgentBuilder::build` does at `agent.rs:1989`. Nothing else changes
 already reads it per turn.
 
 **Verify** — Test in `crates/cyrup-agent/tests/` using the recording `StreamFn` template from
-`crates/cyrup-agent/tests/model_boundary.rs:679-720`
+`crates/cyrup-agent/src/tests/model_boundary.rs:679-720`
 (`set_headers_repoints_the_next_requests_header_overlay`): drive `run_agent_loop` with
 `gen_config.headers = Some(map!["x-probe" => "42"])` and assert the captured `StreamOptions.headers`
 on request #1 contains `x-probe`. It is `None` today.
@@ -586,7 +586,7 @@ coupling: shipping AGENT-017 apart from this creates the leak.
 (`crates/cyrup-session-svc/src/session.rs:2734`, which already computes this correctly per model),
 and call it in `stream_assistant` at `agent.rs:733` with the live `model` instead of reading
 `state.headers`. Keep `Agent::set_headers` as the static-overlay input the resolver merges over, so
-the existing two call sites and `crates/cyrup-agent/tests/model_boundary.rs:691-720` keep passing.
+the existing two call sites and `crates/cyrup-agent/src/tests/model_boundary.rs:691-720` keep passing.
 Do this in the same change as AGENT-017.
 
 **Verify** — Recording `StreamFn` capturing `(ModelRef, StreamOptions.headers)` per request; a
@@ -648,7 +648,7 @@ any golden/differential fixture recorded from pi.
 line is the site.
 
 **Verify** — Assert the exact strings in the emitted tool result.
-`crates/cyrup-session-svc/tests/mid_run_tool_anchoring.rs:235` is a **comment** quoting the current
+`crates/cyrup-session-svc/src/tests/mid_run_tool_anchoring.rs:235` is a **comment** quoting the current
 wrong string; the assertion below it does not match on text, so only the comment needs updating.
 
 ## AGENT-011 — `state.error_message` gated wrongly and invents a message
@@ -805,7 +805,7 @@ provider payloads.
 the `AgentEnd` arm into `SettlementGuard::drop` (`agent.rs:1437-1452`), mirroring pi's `finishRun`.
 
 **Verify** — Reducer unit test: `reduce(MessageStart{ AgentMessage::user_text("hi") })` →
-`streaming_message.is_some()`. Integration test in `crates/cyrup-agent/tests/agent_loop.rs` with a
+`streaming_message.is_some()`. Integration test in `crates/cyrup-agent/src/tests/agent_loop.rs` with a
 subscriber snapshotting `pending_tool_calls` inside its `agent_end` handler on a run aborted
 mid-batch, asserting the set is non-empty.
 
@@ -818,7 +818,7 @@ unambiguous.
 
 **Kind** test-defect · **Severity** low · **Effort** S · **Confidence** confirmed
 
-**cyrup** — `crates/cyrup-agent/tests/agent_loop.rs:327`:
+**cyrup** — `crates/cyrup-agent/src/tests/agent_loop.rs:327`:
 `assert!(elapsed < Duration::from_millis(115), …)` where `elapsed` spans `prompt` →
 `handle.finished()` → `wait_for_idle()` (`:276-281`) — faux-provider streaming and every subscriber
 await, not just the tool bodies — while the two `SpanTool`s sleep 80ms and 50ms (`:264-265`), leaving
@@ -854,7 +854,7 @@ fails under that condition while the code is correct.
 
 > **Severity corrected medium → low this pass.** The drift is real, but `grep -rn '\.reset()' crates`
 > finds **no production caller** of `Agent::reset` anywhere in the tree — the only call site is
-> `crates/cyrup-agent/tests/model_boundary.rs:649`. This is an SDK-surface-only hazard, the class
+> `crates/cyrup-agent/src/tests/model_boundary.rs:649`. This is an SDK-surface-only hazard, the class
 > this file rates low for AGENT-S02/S03. The fix is still a two-line guard.
 
 **cyrup** — `crates/cyrup-agent/src/agent.rs:1601-1616`: the doc at `:1601-1603` says "Clear
@@ -972,7 +972,7 @@ which reaches the RPC/JSON wire and every extension guest via `crates/cyrup-ext/
 (b) Cancelling a run while a slow `transform_context` (the compaction / context-budget hook is
 exactly this) is in flight yields `stopReason: "error"` and a red error state where pi reports a
 clean `"aborted"`. Neither is pinned by a test:
-`crates/cyrup-agent/tests/hook_failure_text.rs:260-311` asserts only `error_message` and
+`crates/cyrup-agent/src/tests/hook_failure_text.rs:260-311` asserts only `error_message` and
 `StopReason::Error`.
 
 **Fix** — Delete `emit_error_assistant` (`agent.rs:859-877`) and route both `Err` arms in
@@ -1194,7 +1194,7 @@ key falls through to the static one.
 **Impact** — (a) An empty text content block is not merely cosmetic: Anthropic's Messages API rejects
 a request containing one with a 400, so an extension returning `block(some(""))` breaks the next
 provider request rather than producing pi's default message. (b) is SDK-only today — no production
-`ApiKeyResolver` impl exists (only `crates/cyrup-agent/tests/agent_loop.rs:880` and
+`ApiKeyResolver` impl exists (only `crates/cyrup-agent/src/tests/agent_loop.rs:880` and
 `crates/cyrup-sdk/tests/embedder_seams.rs:208`) — which is why the pair is low overall.
 
 **Fix** — Port the falsiness, not just the `Option`: at `agent.rs:995` use
@@ -1275,7 +1275,7 @@ now confined to the two residual paths above.
 
 **Fix** — See AGENT-021 and AGENT-029. Nothing further is needed on the session path.
 
-**Verify** — `crates/cyrup-agent/tests/model_boundary.rs:679-720`
+**Verify** — `crates/cyrup-agent/src/tests/model_boundary.rs:679-720`
 (`set_headers_repoints_the_next_requests_header_overlay`) pins the closed half; the residual halves
 have their own verification sketches in AGENT-021 / AGENT-029.
 
@@ -1352,8 +1352,8 @@ matches.
 live (`crates/cyrup-agent/src/state.rs:86-95`), `Agent::set_transport` exists
 (`agent.rs:1510-1512`), `start_run` overlays it into the run's `GenerationConfig` at `agent.rs:1703`
 / `:1712` (pi's run-start snapshot, `agent.ts:454`), and it reaches `StreamOptions.transport` at
-`agent.rs:734`; the TUI row is wired through `crates/cyrup-tui/src/app.rs:4114` →
-`crates/cyrup-session-svc/src/session.rs:3140-3142`. **Still open downstream**:
+`agent.rs:734`; the TUI row is wired through `crates/cyrup-tui/src/app/execute_misc.rs:229-230` →
+`crates/cyrup-session-svc/src/session.rs:3654-3658`. **Still open downstream**:
 `grep -rn '\.transport' crates/cyrup-provider/src/api/*.rs crates/cyrup-provider/src/stream/*.rs`
 returns nothing, so no cyrup wire API acts on the value and every request resolves to SSE.
 
@@ -1440,7 +1440,7 @@ passes), `state.rs`, `hooks.rs`, `event.rs`, `queue.rs`, `loop_fn.rs`, `subscrib
 (155-200) and `tool.rs` (25-60); `crates/cyrup-session-svc/src/hooks.rs` (128-215) and `session.rs`
 (600-745, 2730-2800, 3140-3145, 3200-3205, 3880-3900); `crates/cyrup-ext/wit/world.wit`;
 `crates/cyrup-ext/src/hooks.rs`; `crates/cyrup-provider/src/stream.rs` (170-200, 400-420, 500-525);
-`crates/cyrup-config/src/settings.rs` (700-720); `crates/cyrup-agent/tests/agent_loop.rs` (250-360),
+`crates/cyrup-config/src/settings.rs` (700-720); `crates/cyrup-agent/src/tests/agent_loop.rs` (250-360),
 `hook_failure_text.rs` (1-80, 241-311), `model_boundary.rs` (640-720); plus `cyrup/Cargo.toml`
 profiles (`[profile.release] panic = "abort"` at `:222`; the `:62` `panic = "deny"` is an unrelated
 clippy lint). Targeted greps across all 18 crates for: `sampling_params`, `metadata`, `transport`,

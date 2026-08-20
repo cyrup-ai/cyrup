@@ -1,13 +1,59 @@
 # cyrup gap analysis
 
-A verified ledger of every behavioral difference between the **cyrup** Rust port and its four
-TypeScript upstreams, written to be used as a work-item backlog.
+A verified ledger of every behavioral difference between the **cyrup** Rust port and its upstreams,
+written to be used as a work-item backlog.
+
+**Five upstreams are ported, not four** *(corrected 2026-08-19)*: the four TypeScript ones — `pi`,
+`pi-subagents`, `pi-permission-system`, `pi-intercom` — plus **`code_puppy_core_plugins`, which is
+Python**, ported as `crates/cyrup-flux` and measured in [`14-cyrup-flux.md`](14-cyrup-flux.md). A
+sixth, `pi-mcp-adapter`, is TypeScript and **not** ported (area 13, below). The hard rule
+`git -C <repo> show <tag>:<path>` applies to all of them; only the language differs.
 
 **Start at [`PARITY-GAPS.md`](PARITY-GAPS.md)** — it is organised by gap class (port bug / unwired /
 version lag / reverse lag / deletion candidate / open question), opens with **§0a: every item above
 medium in one table**, and shows the shape of the remaining distance.
 [`00-residual-ledger.md`](00-residual-ledger.md) ranks and suggests an order. The numbered files hold
 the evidence.
+
+> **RECONCILED 2026-08-19 (fifth edition) against cyrup HEAD `4fb5e40`.** This edition corrects two
+> things and deliberately recounts nothing. **(1) The above-medium set turned over completely.** All
+> five rows the fourth edition named — `SESS-040`, `PROV-047`, `PROV-054`, `PROV-055`, `PROV-056` —
+> closed on 2026-08-15, and what replaced them is six rows it had no entry for, **three of them rated
+> `critical` on arrival**: `SEAM-112` (`/resume` yields a broken session and bash calls repeat
+> endlessly), `PERM-034` ("Allow Always" does not stick), `TUI-092` (progressive TUI lockup —
+> **de-escalated to `high` inside this batch**, because `Ctrl+D` and `Ctrl+C` are both bound at
+> HEAD), plus the highs `PROV-068`, `TUI-091` and `SEAM-113`. The set stands at **2 critical +
+> 4 high**, and **`0 critical, 5 high` below is false in both directions.**
+>
+> **Every one of the six was filed from LIVE USE, not from reading.** Nine sweeps and a nine-surface
+> enumeration produced an above-medium set of five wire-or-wiring defects a reader can see; four days
+> of running the binary produced three rows rated `critical` on arrival, none of which any reading
+> pass had a row for. The Caveats section's TUI rule generalises: **the above-medium set is what a
+> static method is structurally worst at populating**, and the counter is hours in a real terminal,
+> not a better sweep.
+>
+> **(2) No recount is published, and the third reason is the important one.** The twelve tables were
+> being edited by other writers in the same batch; `crates/cyrup-flux` had no area file until this
+> batch opened [`14-cyrup-flux.md`](14-cyrup-flux.md), so the denominator was wrong too; and **the
+> counting rule stated in `00-residual-ledger.md` is not reproducible by a second reader** — an
+> independent implementation of it, run over the twelve files at the fixed commit `e5c6933`, returns
+> `500 rows / 153 open = 0/2/63/88`, which is the SECOND edition's figure, not the third's
+> `503 / 145 = 0/2/61/82` that the same commit is supposed to reproduce. **Publish the script, not
+> the rule.** Four editions have rested on a validation a prose rule cannot carry.
+>
+> **Two structural items this edition adds.** `crates/cyrup-tui/src/app.rs` was deleted by `40821ed`,
+> so every `app.rs:NNNN` citation in this directory is unresolvable rather than stale; and a full
+> citation audit measured **78.6% of the directory's `.rs` citations dangling** — see Caveats for the
+> numbers, the cause and the CI guard that ends the class. **And five pieces of landed work carried
+> no row at all until this batch filed them** — `TUI-093`, `TUI-094`, `CMDHINT_01` (which closed
+> `TUI-078` and became `TUI-095`), the `npt_*` recursive prompt scan (`CFG-077`) and the Kimi K3
+> catalog addition (`PROV-070`), plus the whole `cyrup-flux` crate. The fourth edition's "grep the
+> SOURCE for `AREA-NNN` citations" rule does not catch an id that lives only in a **commit subject**,
+> which is what hid every one of them. **Extend the rule to commit subjects** — and do not read a
+> commit subject as landing evidence either: `e6f298d` says "land TUI-092 F5-F8" and deleted F8's
+> task file without ever making the code change.
+>
+> *Superseded fourth-edition figures and the earlier stack, retained for provenance:*
 
 > **Re-baselined 2026-08-12 against cyrup `04c1ba2`** (last code commit; docs HEAD `a9000b1`, branch
 > `david/cyrup`, tree clean). All twelve area files were re-audited against a **named upstream tag**
@@ -218,26 +264,39 @@ the evidence.
 
 ## Contents
 
-| file | area | open items | crit | high |
+> **THE `open items` COLUMN IS STALE AS OF 2026-08-19 AND THE `crit`/`high` COLUMNS ARE CORRECTED IN
+> PLACE.** The counts are the fourth edition's, derived 2026-08-14; five closing batches landed on
+> 2026-08-15 and none reconciled this table, so treat the middle column as a fourth-edition record
+> rather than a current figure and recount from the tables. The `crit` and `high` cells were re-derived
+> by NAME on 2026-08-19 at `4fb5e40` — six rows, each read in its area table — because a planner acts
+> on those two columns first and every cell in them was wrong: `PROV-047`, `PROV-054`, `PROV-055`,
+> `PROV-056` and `SESS-040` all closed on 2026-08-15, while `SEAM-112`, `PERM-034` and `TUI-092`
+> opened as `critical` in a class this table published as empty. `TUI-092` is counted here at the
+> `high` its severity cell was corrected to inside this batch; it read `critical` when this
+> correction was first measured, and if that de-escalation is ever reverted, area 07 and the total
+> each gain a critical and lose a high.
+
+| file | area | open items *(2026-08-14, stale)* | crit *(2026-08-19)* | high *(2026-08-19)* |
 |---|---|---:|---:|---:|
 | [`../PARITY-PLAN.md`](../PARITY-PLAN.md) | **the execution plan derived from this directory — 30 batches, the next three moves, deferrals and open questions** | — | — | — |
 | [`../adr/README.md`](../adr/README.md) | **decisions of record — where the nine open questions of `PARITY-PLAN.md` §7 were settled (eleven ADRs), plus the ledger changes those decisions imply** | — | — | — |
 | [`PARITY-GAPS.md`](PARITY-GAPS.md) | **the same items grouped by gap class — read first.** Its §0 census and §0a above-medium table are **superseded 2026-08-14** (they enumerate the 448-item set); the class taxonomy, the per-entry fix sketches and §7 Method are current | — | — | — |
 | [`REPRO-LOG.md`](REPRO-LOG.md) | **the first execution of this binary — 17 items driven through a real pty or headless, 16 confirmed / 1 refuted / 0 blocked, plus the real suite numbers (6387, not the inherited 3932) and 9 new items filed from what the binary was seen doing.** Every row carries a transcript. **Read this before trusting a severity: only 3 of 17 items survived a live run unchanged.** | — | — | — |
 | [`00-residual-ledger.md`](00-residual-ledger.md) | ranked cross-cutting view | — | — | — |
-| [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | **23** | 0 | 4 |
+| [`01-cyrup-core-and-provider.md`](01-cyrup-core-and-provider.md) | wire APIs, providers, auth, streaming, catalogs, cost | **23** | 0 | ~~4~~ **1** |
 | [`02-cyrup-agent.md`](02-cyrup-agent.md) | the turn loop, tool dispatch, hooks, abort | **2** | 0 | 0 |
-| [`03-cyrup-session.md`](03-cyrup-session.md) | JSONL session tree, compaction, system prompt | **8** | 0 | 1 |
+| [`03-cyrup-session.md`](03-cyrup-session.md) | JSONL session tree, compaction, system prompt | **8** | 0 | ~~1~~ **0** |
 | [`04-cyrup-tools.md`](04-cyrup-tools.md) | the built-in tool set | **8** | 0 | 0 |
 | [`05-cyrup-config-and-resources.md`](05-cyrup-config-and-resources.md) | settings, model resolution, trust, skills, packages | **30** | 0 | 0 |
 | [`06-cyrup-ext.md`](06-cyrup-ext.md) | extension host, WIT world, event catalog | **35** | 0 | 0 |
-| [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | **57** | 0 | 0 |
-| [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | **26** | 0 | 0 |
+| [`07-cyrup-tui.md`](07-cyrup-tui.md) | terminal UI application layer | **57** | 0 | ~~0~~ **2** |
+| [`08-cyrup-session-svc-and-modes.md`](08-cyrup-session-svc-and-modes.md) | the integration seam, RPC, CLI, print/json modes | **26** | ~~0~~ **1** | ~~0~~ **1** |
 | [`09-cyrup-ext-subagents.md`](09-cyrup-ext-subagents.md) | subagent delegation | **19** | 0 | 0 |
-| [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | **4** | 0 | 0 |
+| [`10-cyrup-permission-system.md`](10-cyrup-permission-system.md) | allow / ask / deny gate | **4** | ~~0~~ **1** | 0 |
 | [`11-cyrup-intercom.md`](11-cyrup-intercom.md) | supervisor↔subagent broker | **9** | 0 | 0 |
 | [`12-upstream-drift-pi-core.md`](12-upstream-drift-pi-core.md) | pi core drift since the ported baseline | **16** | 0 | 0 |
-| | **total** | **237** | **0** | **5** |
+| [`14-cyrup-flux.md`](14-cyrup-flux.md) | the Flux pipeline — the fifth ported upstream, and the first that is neither pi nor TypeScript. **Opened 2026-08-19; no prior edition's count includes it** | **7** | 0 | 0 |
+| | **total** | ~~**237**~~ *recount* | ~~**0**~~ **2** | ~~**5**~~ **4** |
 
 ## Area 13 — the MCP adapter port
 
@@ -295,7 +354,11 @@ against a directory average of 76%) — no sweep since 3 has owned it, which is 
 rather than a difficulty one.**
 
 Counts are the `## Open items` table of each file, re-derived 2026-08-14 (**third edition, after
-sweeps 7-8**), row by row with the counting rule stated in `00-residual-ledger.md`. **One row,
+sweeps 7-8**), row by row with the counting rule stated in `00-residual-ledger.md`. **They were NOT
+re-derived on 2026-08-19 and the fifth edition explains why** — the tables were being edited in the
+same batch, area 14 did not exist when they were taken, and **the counting rule is not reproducible
+by a second reader**: an independent implementation of it returns the *second* edition's figures at
+the *third* edition's commit. Publish the script with the next recount. **One row,
 `AGENT-S04`, carries `*(partially-closed)*` in place of a severity and is therefore in neither the
 open total nor the closed one** — that has been true for three editions and is recorded rather than
 silently rated. **Every file now carries exactly one such table** — area 03's second table was the last
@@ -383,17 +446,23 @@ because both directions were diffed, and they were 66 of 191.
 
 | repo | HEAD | cyrup ported baseline | latest tag | delta |
 |---|---|---|---|---|
-| `cyrup/` | **`e5c6933`** — third edition, 2026-08-14 (docs `0097149`, branch `david/cyrup`). *Superseded: `bdcb0d0` at the second edition, `380c713` at the first, `04c1ba2` at the re-baseline.* | — | — | 18 crates, ~482k lines of Rust under `crates/` |
+| `cyrup/` | **`4fb5e40`** — fifth edition, 2026-08-19, branch `david/cyrup`. *Superseded: `e5c6933` at the third edition (docs `0097149`), `bdcb0d0` at the second, `380c713` at the first, `04c1ba2` at the re-baseline.* | — | — | 18 crates, ~482k lines of Rust under `crates/` |
 | `pi/` | `581d75a89` = `v0.84.1-117-g581d75a89` | **v0.83.0** | **v0.84.1** | 627 files, +52 291 / −17 556 |
 | `pi-subagents/` | `9e9fd13` | **≈v0.43.0** (inferred — the crate records no version string) | **v0.47.1** | 151 files, +10 254 / −1 333 |
 | `pi-permission-system/` | `9affcc9` | **v0.7.1** | **v0.8.0** | 28 files, +4 023 / −1 851 |
 | `pi-intercom/` | `30dcbdd` | **v0.9.2** — *not v0.7.0; every prior doc had this wrong* | **v0.10.1** | true window `v0.9.2..v0.10.1` = 24 files, +2 495 / −700 |
+| `code_puppy_core_plugins/` | `8de5184` | **v0.0.6** — *not recorded anywhere in `crates/cyrup-flux`; see `FLUX-007`* | **v0.0.6** | Python, not TypeScript. Ported surface is `flux_bootstrap/` — 18 bundled commands, 4 `_docs` files, 3 renderer scripts. cyrup ships 15 templates + 3 native renderers = the same 18 |
 | `pi-mcp-adapter/` | `14c0e6c` = `v2.25.0-4-g14c0e6c` | **not ported** — area 13 is the plan | **v2.25.0** (tagged 2026-08-13) | 203 paths / 164 `.ts` at the tag, ~24 200 lines; drift to HEAD is 17 files, +543 / −69 |
 
 Three standing hazards in this table. **(a)** The intercom baseline is the one that bites in both
 directions: diffing from v0.6.0 or v0.7.0 reports a pile of already-done work as debt, and
-`crates/cyrup-intercom/src/lib.rs:2` still says v0.6.0 (tracked as `ICOM-012`). Diff
-`v0.9.2..v0.10.1`. **(b)** pi HEAD is **117 commits past v0.84.1**, so that range is unanalysed by
+~~`crates/cyrup-intercom/src/lib.rs:2` still says v0.6.0 (tracked as `ICOM-012`).~~ **CORRECTED
+2026-08-19: that claim is FALSE and was numerically valid, which is why no renumber pass could see
+it.** `crates/cyrup-intercom/src/lib.rs:1-3` reads *"a 1:1 source port of `pi-intercom` **v0.9.2**,
+with the v0.9.3/v0.10.x deltas listed in `docs/gap-analysis/11-cyrup-intercom.md` ported
+item-by-item"* — the crate agrees with this table. Re-verify `ICOM-012`'s premise in area 11 before
+scheduling it. **The class this belongs to is the one a citation audit cannot reach: a true line
+number carrying an untrue claim.** Diff `v0.9.2..v0.10.1`. **(b)** pi HEAD is **117 commits past v0.84.1**, so that range is unanalysed by
 construction — items in it are deliberately not filed, because the hard rules require citing a named
 tag. **(c)** A classification turns on which side of the **ported** tag a symbol landed, and a commit
 hash does not answer that. Settle presence with `git cat-file -e <tag>:<path>` before writing
@@ -704,8 +773,8 @@ anybody until the repair pass: `packages/tui/src`'s input pipeline, `packages/co
   application has layout and empty-state bugs. No `TUI-*` item — nor `SESS-040`, nor the pre-launch
   surfaces in `SEAM-061`…`SEAM-067` — is done until it has been **run in a real terminal**.
   **Vindicated 2026-08-13.** `TUI-055` (no indicator renders for the entire 10–20 s of a compaction)
-  is invisible to every static read: the source at `app.rs:4615-4639` sets the indicator and looks
-  correct. Only running it shows the band never reaches the screen. `TUI-N13` is the mirror image —
+  is invisible to every static read: the source — the `CompactionStart` arm, now
+  `app/events_fold.rs:195-223` — sets the indicator and looks correct. Only running it shows the band never reaches the screen. `TUI-N13` is the mirror image —
   a deterministic macOS-only test failure that four passes missed because the first measurement was
   piped through `tail`. **Validate your instrument as a first-class step:** that pass produced three
   instrument errors (`tail` hiding a red, `pgrep -f` matching its own pattern and inventing 22
@@ -730,8 +799,22 @@ anybody until the repair pass: `packages/tui/src`'s input pipeline, `packages/co
   existed; `PROV-005` named xAI/Groq/DeepSeek as missing when they were always implemented; `SEAM-019`
   named two CLI flags (`--ui-mode`, `--alt`) that exist at neither tag. Expect a similar residue.
   **Treat every item as a lead to verify, not a fact.**
+- **Citations in this directory are 78.6% dangling, measured 2026-08-19 at `4fb5e40`** — 4 119 of
+  the 5 241 scoreable non-`app.rs` `.rs` citations (of 6 249 total, counting the 1 914 relative
+  `` `:NNN` `` continuations no pass has ever touched) point at a line that no longer holds what the
+  prose says. The cause is concentrated, not diffuse: **3 336 of the 4 335 absolute citations (77%)
+  were written in one commit, `72cd292` on 2026-08-13**, and `git rev-list --count 72cd292..HEAD` is
+  105 with `+137 184 / −33 380` across `crates/`. Treat a citation as a lead, not an address. The
+  repair is mechanical — recover the cited line's TEXT from the commit that last touched the doc line
+  and re-find it at HEAD, which resolves 69% uniquely — and the standing guard is a CI check that
+  resolves every `<file>.rs:<line>` and fails on any line or range end past EOF.
+- **`crates/cyrup-tui/src/app.rs` does not exist.** `40821ed` split it into
+  `crates/cyrup-tui/src/app/` (33 modules), so every `app.rs:NNNN` in this directory is
+  unresolvable rather than merely stale, and the only honest repair is to re-find the symbol.
 - Do not "fix" a citation by shifting it. A previous renumber-by-uniform-shift pass introduced errors
-  at 15% while looking verified. Re-resolve the line by reading the file at the named tag — and
+  at 15% while looking verified. **Now measured: only 14% of same-file citation groups share a single
+  offset — `transcript.rs` drifts in six distinct bands, `cyrup-session-svc/src/session.rs` in 65 —
+  so a per-file `sed` corrupts more citations than it fixes.** Re-resolve the line by reading the file at the named tag — and
   **never write "identical at both tags"**: the repair pass found ~25 citations quoting a v0.84.1
   offset while asserting it held at v0.83.0, including one on the highest-ranked item in the backlog.
   Byte-identical bodies do not imply identical line numbers, and the shift is often non-uniform

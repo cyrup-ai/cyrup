@@ -100,9 +100,11 @@ now filed in its own right as `ICOM-053`**; it just no longer has that particula
 | row | status at `380c713` (0a) | status at `bdcb0d0` |
 |---|---|---|
 | `SEAM-061` | "STILL OPEN, and now the top of the whole backlog" | **FIXED — and it was already fixed when 0a said otherwise.** Sweep 6 found both halves live at HEAD: `cyrup-tui/src/session_selector.rs:154`, `:276`, `:313`, `:1918`, `:1985` (including upstream's un-wired `onToggleScope` semantics, where Tab is *swallowed* rather than ignored) and `crates/cyrup/src/main.rs:1354` taking pi's **two** loaders, handed to the picker at `startup_ui.rs:191-201` (`cli/session-picker.ts:15-19` @v0.83.0). **The §3 transcript for this row is NO LONGER current behaviour.** |
-| `SESS-040` | "STILL OPEN, the cheapest of the three remaining highs" | **STILL OPEN — and now one of only TWO highs in the entire backlog** (with `PROV-047`). Unchanged: the indicator advertises "(esc to cancel)" and nothing dispatches. Its §3 transcript IS still current behaviour. |
+| `SESS-040` | "STILL OPEN, the cheapest of the three remaining highs" | ~~**STILL OPEN — and now one of only TWO highs in the entire backlog** (with `PROV-047`). Unchanged: the indicator advertises "(esc to cancel)" and nothing dispatches. Its §3 transcript IS still current behaviour.~~ **STALE — CORRECTED 2026-08-19 at `4fb5e40`.** `SESS-040` is CLOSED as REFUTED (`03-cyrup-session.md`, 2026-08-15) and the dispatch this cell says is missing exists at HEAD: the Escape chain returns `AppAction::AbortCompaction` (variant at `crates/cyrup-tui/src/app/action.rs:35`) whenever `self.state.compacting` (`app/input.rs:144-146` — checked AHEAD of pi's four-branch chain, because the rebind shadows it), and `app/run_action.rs:53-54` services it with `ctx.session.abort_compaction()` (`cyrup-session-svc/src/session.rs:1900`). Pinned at `crates/cyrup-tui/src/tests/escape_chain.rs:233`/`:244`. **§3's transcript is not current behaviour either**: `state.compacting` is armed by the `CompactionStart` arm at `app/events_fold.rs:222`, which sets the band on the line above it (`:220`), and `TUI-055` — the reason the band never reached the screen — closed 2026-08-14. `PROV-047` is closed as well: `cyrup-session-svc/src/builder.rs:296-299` (`apply_http_proxy_settings`, called from `:1516`) and `crates/cyrup/src/main.rs:177` are both live production call sites of `cyrup_provider::configure_http_proxy`. |
 
-**Sixteen of the seventeen are now fixed; one — `SESS-040` — is open.**
+~~**Sixteen of the seventeen are now fixed; one — `SESS-040` — is open.**~~ **SEVENTEEN of seventeen,
+re-derived 2026-08-19 at `4fb5e40`** — `SESS-040` closed as REFUTED 2026-08-15; see the row above for the
+dispatch chain it said did not exist.
 
 ### A new measurement risk this log should own
 
@@ -208,7 +210,7 @@ coherent. The one-provider case renders the singular form (`…: anthropic`).
 **New regression pin:** `the_migrated_credential_notice_renders_first_and_verbatim_in_the_transcript`
 in `crates/cyrup-tui/src/transcript.rs` — pushes both production warnings through
 `TranscriptView::push_warning` in `run_interactive` order and renders them through `entry_lines`,
-the production path `app.rs:1851` uses; asserts the notice renders BEFORE `modelFallbackMessage`
+the production path `app/draw.rs:164-167` uses (`App::flush_committed`; `app.rs:1851` before the `40821ed` split); asserts the notice renders BEFORE `modelFallbackMessage`
 (pi `:874-876` before `:883-885`), carries exactly ONE `Warning: ` (the renderer must not re-prefix
 a verbatim `Entry::Warning` — TUI-062), and lands in the warning colour. **Mutation-verified:**
 re-prefixing the renderer and swapping the colour to `dim` fails it with
@@ -264,6 +266,42 @@ weakened to make it go away:** the 500 ms `leak-timeout` tripwire is untouched, 
 `#[ignore]`d, and no retry was added. The open question this log hands back is whether nextest's
 leak detector can time out on a saturated box — which is a harness question, not a cyrup one, and
 is the next instrument to build rather than a line to relax.
+
+---
+
+## 0d. AMENDMENT 2026-08-19 — the seventeen are discharged, and every `app.rs` citation in this log is dead
+
+> **Still a measurement, still not re-measured.** cyrup HEAD is now **`4fb5e40`** (this log ran at
+> `0c76986`). Nothing below was driven again; this amendment records which of the log's own claims
+> are no longer true of the code, so no reader mistakes a 2026-08-13 transcript for HEAD behaviour.
+
+**The one row §0b left open is closed.** `SESS-040` was struck as REFUTED on 2026-08-15 and the
+dispatch §0b said did not exist is at `crates/cyrup-tui/src/app/input.rs:144-146` →
+`app/run_action.rs:53-54` → `cyrup-session-svc/src/session.rs:1900`, pinned by
+`crates/cyrup-tui/src/tests/escape_chain.rs:233`/`:244`. `TUI-055` — the reason this log recorded a
+band that *never reached the screen* — closed 2026-08-14, and `PROV-047`, the other high §0b named,
+closed 2026-08-15 (`cyrup-session-svc/src/builder.rs:296-299`, `crates/cyrup/src/main.rs:177`).
+**Seventeen of seventeen.** The row cells above carry the corrections individually.
+
+**`crates/cyrup-tui/src/app.rs` NO LONGER EXISTS**, and this log carried five citations into it.
+`40821ed` split the 10 607-line file into `crates/cyrup-tui/src/app/` (33 modules). All five were
+re-resolved by symbol against HEAD and rewritten in place — `app.rs:1851` → `app/draw.rs:164-167`
+(`App::flush_committed`); `app.rs:6044` → `app/render.rs:86-90` (the status band); the
+`CompactionStart` arm → `app/events_fold.rs:195-223`; the `/resume` delete caller →
+`app/execute_session.rs:15-33`; and §2's `test-defect` row, which an automated remap had turned into
+`app/render.rs:7` — a renderer, not a test — → `crates/cyrup-tui/src/tests/bash_live_run.rs:67`.
+**Two of the five were WRONG rather than merely stale**, because a mechanical remap of a citation
+that was already wrong is still wrong. **Read the same warning §0a issued about
+`crates/<crate>/tests/<x>.rs` as applying to `app.rs` now:** a line number into a deleted file is not
+stale, it is unresolvable, and the only honest repair is to re-find the symbol and read the target.
+
+**Standing hazard this log is the right place to record.** A citation audit at `4fb5e40` measured
+**78.6% of the `.rs` citations in this directory pointing at a line that no longer holds what the
+prose says** (6 249 citations; 4 119 of the 5 241 scoreable non-`app.rs` ones dangling), because 77%
+of them were written in one commit — `72cd292`, 2026-08-13, the day after this log ran — and 105
+commits and +137 184 lines have landed in `crates/` since. **Do not fix one by shifting it**: only
+14% of same-file citation groups share a single offset, `transcript.rs` alone drifts in six distinct
+bands, and `cyrup-session-svc/src/session.rs` in 65. Re-find the symbol, or delete the claim.
 
 ---
 
@@ -427,7 +465,7 @@ prove the repaired test still goes red.
 | what | class | why | filed |
 |---|---|---|---|
 | `crates/cyrup/src/input.rs`, `main.rs`, `lib.rs` | **production, parity fix** | `build_inputs` read the process's own stdin internally; pi reads `stdinContent` in `main` (`main.ts:819-826`) and **passes it in** (`:828-832`, declared `:169-172`). cyrup had fused the descriptor-owning step into prompt assembly, so any test driving `build_inputs` hung forever on an inherited pipe. Restored pi's split. | `SEAM-072` |
-| `crates/cyrup-tui/src/app.rs:7652` | `test-defect` | `a_live_bash_run_names_its_spool_file` parsed a spool path out of **one** rendered line; the status block is word-wrapped and macOS `TMPDIR` (`/var/folders/<2>/<30>/T/`) pushes the row to exactly 120 columns, so the path wraps. Green on Linux (`/tmp`), red on every macOS host. The wrap is faithful to pi (`bash-execution.ts:201` @v0.83.0). Fixed by flattening whitespace before parsing; **assertion unchanged**. | `TUI-N13` |
+| `crates/cyrup-tui/src/tests/bash_live_run.rs:67` | `test-defect` | `a_live_bash_run_names_its_spool_file` parsed a spool path out of **one** rendered line; the status block is word-wrapped and macOS `TMPDIR` (`/var/folders/<2>/<30>/T/`) pushes the row to exactly 120 columns, so the path wraps. Green on Linux (`/tmp`), red on every macOS host. The wrap is faithful to pi (`bash-execution.ts:201` @v0.83.0). Fixed by flattening whitespace before parsing; **assertion unchanged**. | `TUI-N13` |
 | `crates/cyrup-ext/src/caps/proc.rs` | `test-defect` | Asserted `buffered <= MAX_PIPE_BUFFER_BYTES` exactly; the pump's real invariant is one chunk looser (`wait_for_room` returns at `len < CAP`, then a full 8 KiB read appends). Overshoot measured at 4412 bytes — a partial chunk, i.e. the bounded behaviour the test exists to prove. Named the chunk, loosened by exactly one chunk, and **added** a plateau assertion so the test still discriminates. | `EXT-N01` |
 | test fixtures (`image_auto_resize_file_args.rs`, `image_bytecap.rs`, intercom env) | `test-defect` | consequences of the two above | `ICOM-051` |
 
@@ -653,7 +691,8 @@ A failed delete is **visually identical** to a successful one, and the user is l
 session is gone when it is not.
 
 **Correction applied** — the item says cyrup "additionally reports success unconditionally". That is
-accurate for the in-app `/resume` path (`app.rs:4025` prints "deleted session"), but the pre-launch
+accurate for the in-app `/resume` path as it stood (the `C::DeleteSession` arm, now
+`app/execute_session.rs:15-33`, printed "deleted session" either way), but the pre-launch
 `--resume` picker measured here prints **nothing at all** — no success text, no failure text; the
 only feedback is the row disappearing. On this surface the defect is a *missing status line* as well
 as a swallowed error, and the Fix must add a status channel to `startup_ui.rs`'s `on_apply` for pi's
@@ -1134,7 +1173,8 @@ crates/cyrup-session-svc/src/command.rs:116:  C::AbortCompaction => { self.abort
 **Correction applied** — Impact rewritten. "cyrup shows a cancel key that does nothing. The user
 presses Escape, the indicator keeps spinning" becomes: *cyrup shows **nothing at all** — for the full
 10–18 s the status band is empty, so there is no `(esc to cancel)` suffix either*. The in-tree
-citations at `app.rs:4615-4639` and `app.rs:6044` are accurate **as source** but describe a band that
+citations — the `CompactionStart` arm, now `app/events_fold.rs:195-223`, and the band, now
+`app/render.rs:86-90` — are accurate **as source** but describe a band that
 never reaches the screen. That non-render is a **separate defect** (`TUI-055`) and is cross-referenced
 on the item, because `SESS-040`'s Fix landing alone still leaves the user with an unlabelled blank
 screen. Verify gains an assertion that the band actually renders during compaction.

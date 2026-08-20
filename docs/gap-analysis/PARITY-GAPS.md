@@ -50,6 +50,22 @@ numbers and file existence both mislead. §7 says how much of this was first-han
 
 ## 0. Census — every open item in the twelve area files, by class
 
+> **CORRECTED 2026-08-19 against cyrup HEAD `4fb5e40`, and NOT recounted — read why.** The
+> `0 critical / 5 high` headline below is false: all five of those rows closed on 2026-08-15, and the
+> twelve area tables carried **three unstruck `critical` severity cells** when this correction was
+> measured (`SEAM-112`, `PERM-034`, `TUI-092`) and three unstruck `high` ones (`PROV-068`, `TUI-091`,
+> `SEAM-113`) — **2 + 4** after `TUI-092`'s de-escalation landed later in the same batch. See
+> §0a, which tables them. **The 237/606 figures are stale by roughly a hundred rows** — five closing
+> batches landed on 2026-08-15 without reconciling this file — and no replacement total is published
+> here **because the twelve tables were being edited by other writers in the same batch that produced
+> this correction**, which is the same reason `00-residual-ledger.md`'s fourth edition declines to
+> restate area 05's count mid-batch ("*deliberately NOT restated by one slice mid-batch; recount the
+> table*"). Recount from the tables, with the rule stated below, once the batch settles.
+> **A second reason a recount must be run rather than adjusted:** `crates/cyrup-flux` — 9 files,
+> 1 513 lines, shipped, with a spec and a rustbook chapter — had **no area file at all** until this
+> batch opened [`14-cyrup-flux.md`](14-cyrup-flux.md) with 7 rows, so every figure in this file
+> predates a whole shipped surface. The denominator moved, not just the numerator.
+>
 > **SUPERSEDED — FOURTH EDITION 2026-08-14 (after the surface enumeration). Every census below this
 > block, including the third edition's, enumerates a set that no longer exists.**
 >
@@ -238,11 +254,41 @@ Where the re-audit moved an item to a different class, the id moves section and 
 
 ## 0a. Everything above medium, in one table
 
-> **SUPERSEDED — FOURTH EDITION 2026-08-14. The above-medium set is FIVE rows: `SESS-040`,
-> `PROV-047`, and the three new catalog highs `PROV-054` / `PROV-055` / `PROV-056`** — all three
-> found by the provider-surface enumeration, all three wire divergences on live request paths, and
-> all three closing through ONE bulk catalog regeneration rather than individually. Tabled at the top
-> of `00-residual-ledger.md`. Everything below in this section is older still.
+> **SUPERSEDED — FIFTH EDITION 2026-08-19, against cyrup HEAD `4fb5e40`. ALL FIVE ROWS OF THE
+> FOURTH EDITION'S ABOVE-MEDIUM SET ARE CLOSED, AND THE SET THAT REPLACED THEM OPENED WITH THREE
+> CRITICALS — a class the fourth edition published as empty.** Read this block before planning; the
+> two below it name work that no longer exists.
+>
+> **Closed, each verified in its area table and, for the two the cross-cutting files kept alive, in
+> the code:** `PROV-047` (`01-cyrup-core-and-provider.md`, CLOSED 2026-08-15 —
+> `cyrup-session-svc/src/builder.rs:296-299`
+> calls `cyrup_provider::configure_http_proxy(proxy.clone())` unconditionally, including with `None`,
+> reached from `:1516`, and `crates/cyrup/src/main.rs:177` is the bootstrap call deliberately ABOVE
+> the package/credential pre-dispatches that can egress before a session exists — so the "inert until
+> one line lands" residual is DISCHARGED); `SESS-040` (`03-…`, REFUTED 2026-08-15 — see §2's UW-12
+> entry for the dispatch chain); and `PROV-054`/`PROV-055`/`PROV-056`, all three CLOSED 2026-08-15
+> in area 01, through exactly the one bulk catalog regeneration this block predicted.
+>
+> **The current above-medium set is SIX rows — 2 `critical` + 4 `high` — and it is entirely disjoint
+> from the old one.** It opened 3 + 3 and became 2 + 4 when `TUI-092` was de-escalated inside this
+> batch. Every one of the six was filed from LIVE USE on 2026-08-15 or later — the first cohort in
+> this directory's history that no reading pass produced:
+>
+> | id | area | sev | one line |
+> |---|---|---|---|
+> | `SEAM-112` | 08 | **crit** | `/resume` produces a broken session: nothing renders and bash tool calls repeat endlessly — the repetition means tool results are not reaching the model, so it is at minimum a context/session-rebuild fault, not the display bug it resembles |
+> | `PERM-034` | 10 | **crit** | *(renumbered from `PERM-033` on 2026-08-19 — id collision; see area 10.)* "Allow Always" does not stick — the same tool/command is re-prompted within one session, which makes the permission gate unusable. Both halves are wired (`extension.rs:1717`/`:2023` write, `:1464`/`:1634`/`:2211` read), so it is **not** the dead-seam class |
+> | `TUI-092` | 07 | ~~crit~~ **high** | The TUI degrades from smooth to a total lockup. **Its severity cell was corrected `critical` → `high` inside this batch**; its own bug file's `**Severity**` header has said `high` since round 2 (`bugs/TUI-092-progressive-lockup.md`); the three clauses that justified `critical` are all false at HEAD — Ctrl+D is bound (`keymap.rs:655` → `app/input.rs:126-129` → `app/run_action.rs:16`), Ctrl+C is bound (`keymap.rs:656` → `app/input.rs:219-231`), and `TUI-088` is CLOSED |
+> | `PROV-068` | 01 | high | An explicit `null` in `thinkingLevelMap` reads as UNSUPPORTED, collapsing most reasoning models to two rungs (`cyrup-provider/src/collection.rs:794-807`) |
+> | `TUI-091` | 07 | high | Reasoning blocks never render although every layer is wired — and as of 2026-08-19 the row has **zero live hypotheses**; its last named candidate is refuted in the area file |
+> | `SEAM-113` | 08 | high | A model chosen with `/model` does not survive into the next session |
+>
+> **The lesson is the one this directory keeps re-learning from the other side.** Nine reading passes
+> and one nine-surface enumeration produced a five-row above-medium set of which every row was a
+> *wire or wiring* defect a reader can see; four days of live use produced three rows rated
+> `critical` on arrival, none of which any reading pass had a row for. `README.md`'s caveat — "no `TUI-*` item is done until it has been run in a real
+> terminal" — generalises past the TUI: **the above-medium set is the part of this backlog a static
+> method is worst at populating.**
 
 > **SUPERSEDED — SECOND EDITION 2026-08-14 (after sweeps 3-6). The current above-medium set is TWO
 > rows — `SESS-040` and `PROV-047` — tabled at the top of `00-residual-ledger.md`.** `SEAM-061`
@@ -311,6 +357,16 @@ closes: `AGENT-020`+`AGENT-030`, `TUI-042`+`TUI-043`+`TUI-044`, `SEAM-047`+`SEAM
 > (67 of the 191 findings are `missingInCyrup`, i.e. §1 material; 58 are `differingShape`, which this
 > taxonomy has no home for at all — **that is itself a finding about the taxonomy**). **Do not read
 > the absence of an id from §1 as evidence that no port bug was filed for it.**
+>
+> **AND DO NOT READ AN ENTRY'S PRESENCE AS EVIDENCE THAT IT IS OPEN — added 2026-08-19.** §1–§4 are
+> a class-organised RENDERING of the area files at the edition that produced them; the owning area
+> file's `## Open items` table is the only authority on status. Repairing this file's citations at
+> `4fb5e40` walked past three specimens in a single pass — **PB-39** (`SEAM-063`, session delete via
+> `trash`) closed 2026-08-14 and the seam now reports pi's own three strings from
+> `app/execute_session.rs:24-32`; **PB-29** (`TUI-031`) closed 2026-08-14 with the compaction guard at
+> `app/run_action.rs:68-82`; **UW-12** (`SESS-040`) closed 2026-08-15. Each entry now carries a dated
+> `CLOSED` bullet, but they were found incidentally and **the rest of §1–§4 was not audited for
+> status**. Check the area file before scheduling any entry here.
 
 **These rank above everything else in this document at equal severity.** They are not version lag:
 the behaviour was available to be ported and was not.
@@ -335,7 +391,7 @@ the behaviour was available to be ported and was not.
 
 **PB-4 · Compact-read classification has no `docs` arm** — *low* · area 04 `TOOL-017`
 - upstream: `pi/packages/coding-agent/src/core/tools/read.ts:98` @v0.83.0 (`getPiDocsClassification`, resolving against `dirname(getReadmePath())`), called from `:130` — **present at the ported tag**, so this is not lag
-- cyrup: `crates/cyrup-tui/src/transcript.rs:2265` (`compact_read_classification` — `skill` and `resource` arms complete, no `docs` arm; the doc at `:2258-2263` states why)
+- cyrup: `crates/cyrup-tui/src/transcript.rs:2468` (`compact_read_classification` — `skill` and `resource` arms complete, no `docs` arm; the doc at `:2461-2467` states why, and names the missing seam: `getReadmePath` has no counterpart in `crates/`) *(citation re-resolved by symbol 2026-08-19; `:2265` is now a closing brace)*
 - observable: reading cyrup's own shipped README/docs/examples renders as an ordinary file read. **Blocked on a decision, not on code** — see OQ-2. Area 04 confirms it is TOOL-017's residual and that it needs a packaged-docs locator to exist first.
 
 **PB-5 · `PI_CODING_AGENT` is never stamped into the environment (and `AI_AGENT` is the v0.84.1 half)** — *low* · area 04 `TOOL-031`
@@ -345,8 +401,8 @@ the behaviour was available to be ported and was not.
 
 **PB-6 · Changelog-on-upgrade is absent; `lastChangelogVersion` is never read or written** — *medium* · area 05 `CFG-015`, area 07 `TUI-011`
 - upstream: `modes/interactive/interactive-mode.ts:997` @v0.83.0 (`getLastChangelogVersion`), `:998-999` (`getChangelogPath` / `parseChangelog`), `:1003` and `:1010` (`setLastChangelogVersion(VERSION)`); getter/setter at `core/settings-manager.ts:660` and `:664`
-- cyrup: `crates/cyrup-config/src/settings.rs:994` (`last_changelog_version`) has zero callers workspace-wide and no setter exists; `/changelog` is hardcoded at `crates/cyrup-tui/src/app.rs:1824` to `push_block("What's New", "No changelog entries found.")`
-- observable: after upgrading, pi shows the new entries once and records the version; cyrup shows nothing. The `collapseChangelog` settings row (`app.rs:5667`) toggles a value nothing reads. (`enableInstallTelemetry`, the row beside it, **does** have live consumers — `cyrup-config/src/policy.rs:25-27`, `cyrup-session-svc/src/builder.rs:1145` — so it is not part of this claim.)
+- cyrup: `crates/cyrup-config/src/settings.rs:994` (`last_changelog_version`) has zero callers workspace-wide and no setter exists; `/changelog` is hardcoded at `crates/cyrup-tui/src/app/submit.rs:111-113` to `push_block("What's New", "No changelog entries found.")` *(was `app.rs:1824` before the `40821ed` split)*
+- observable: after upgrading, pi shows the new entries once and records the version; cyrup shows nothing. The `collapseChangelog` settings row (`app/settings_rows.rs:115`) toggles a value nothing reads. (`enableInstallTelemetry`, the row beside it, **does** have live consumers — `cyrup-config/src/policy.rs:25-27`, `cyrup-session-svc/src/builder.rs:1145` — so it is not part of this claim.)
 
 **PB-7 · The npm package channel is unported, and `npmCommand` is inert** — *large* · area 05 `CFG-009` / `CFG-015`
 - upstream: `core/package-manager.ts:1720` (`getNpmCommand`) with install/update/list through `:1740` (`runNpmCommand`), `:1745` (`getGitDependencyInstallArgs`), `:1753` (`runNpmCommandSync`); manifest kinds at `core/pi-manifest.ts:3-9` — a package may ship `extensions`, **`skills`, `prompts` and `themes`**
@@ -386,12 +442,13 @@ the behaviour was available to be ported and was not.
 
 **PB-28 · `/tree` has no text search, and its four action keys are the characters pi types INTO that search — `e` persists the typed text as a label** — ***critical*** **(raised from high this pass)** · area 07 `TUI-027`
 - upstream: `modes/interactive/components/tree-selector.ts:113`, `:1079-1100` — `z`/`x`/`e`/`t` are ordinary characters typed into the tree's text filter
-- cyrup: `crates/cyrup-tui/src/tree_selector.rs:850-889` binds them as actions, and `e` opens the inline label editor, which captures all keys. **Corrected trace this pass** — the persistence is two hops past the local star update (`update_node_label`, `:529-533`): the confirm arm returns `SelectorOutcome::Apply(entry_id + FIELD_SEP + label)` (`:540-546`) → `app.rs:3306-3307` splits it → `app.rs:3763-3767` calls `host_services.set_label` → `manager.append_label`, the same live path an extension's `setLabel` uses. The seven `app.tree.filter.*` ids are unknown to `TreeAction::from_id` (`:887-895`), so a pi-shaped `keybindings.json` cannot fix it
+- cyrup: `crates/cyrup-tui/src/tree_selector.rs:850-889` binds them as actions, and `e` opens the inline label editor, which captures all keys. **Corrected trace this pass** — the persistence is two hops past the local star update (`update_node_label`, `:529-533`): the confirm arm returns `SelectorOutcome::Apply(entry_id + FIELD_SEP + label)` (`:540-546`) → `app/selectors.rs:201-208` splits it on `FIELD_SEP` into `AppCommand::SetEntryLabel` → `app/execute.rs:288-298` calls `session.services().host_services.set_label(&entry_id, (!label.is_empty()).then_some(label.as_str()))` → `manager.append_label`, the same live path an extension's `setLabel` uses. *(Trace re-resolved by symbol 2026-08-19: the middle hop was cited as `app.rs:3306-3307` → `app/tree_nav.rs`, and `tree_nav.rs` has no part in it — the `40821ed` remap carried the wrong module forward.)* The seven `app.tree.filter.*` ids are unknown to `TreeAction::from_id` (`:887-895`), so a pi-shaped `keybindings.json` cannot fix it
 - observable: a pi user typing a filter word into `/tree` silently renames a session branch **in the session JSONL**. Corruption of persisted user data on a normal path.
 
 **PB-29 · A prompt typed during compaction is dispatched immediately instead of queued** — *high* · area 07 `TUI-031` · **supersedes VL-P11**, which filed the same defect as lag and at *small*
 - upstream: `modes/interactive/interactive-mode.ts:3023-3033`, `:4230-4236` — `queueCompactionMessage` with a visible status; the session-level throw is `core/agent-session.ts:1133-1137`
-- cyrup: the TUI never consults `is_compacting` (`app.rs:6606-6626` branches on `is_streaming` only) **and** `AgentSession::prepare` has no compaction guard either (`session.rs:849-900`); `is_compacting` exists at `session.rs:4110` and its one production consumer is an RPC status field (`cyrup-modes/src/rpc.rs:1428`)
+- cyrup: the TUI never consults `is_compacting` (the `AppAction::Submit` arm, now `app/run_action.rs:83-103`, branched on `is_streaming` only) **and** `AgentSession::prepare` has no compaction guard either (`session.rs:849-900`); `is_compacting` exists at `session.rs:4110` and its one production consumer is an RPC status field (`cyrup-modes/src/rpc.rs:1428`)
+- **CLOSED — verify before scheduling.** Area 07 struck `TUI-031` on 2026-08-14 and the guard is at HEAD (`4fb5e40`): `app/run_action.rs:68-82` is a `Submit` arm guarded `if ctx.session.is_compacting() && !is_extension_command(…)` sitting **above** the streaming arm, routing to `queue_compaction_message(text, false)`, with pi's identical follow-up gate at `:116-117`
 - observable: the turn is assembled from a context the compaction is mid-rewrite of. Not "rejected instead of accepted" — **wrong context, silently**. Note `TUI-016`: there is currently no surface that would *show* a queued message, so the queue and its indicator ship together.
 
 **PB-30 · First SIGTERM/SIGHUP neither tears down nor exits 143/129 — `--mode rpc` cannot be stopped by a supervisor** — *high* · area 08 `SEAM-047`, area 12 `DRIFT-049` (**duplicate — schedule once, in area 08**)
@@ -431,7 +488,8 @@ the behaviour was available to be ported and was not.
 
 **PB-39 · Session delete permanently unlinks where pi routes through `trash`, and the failure is swallowed** — *high* · area 08 `SEAM-063` (new this pass)
 - upstream: `modes/interactive/components/session-selector.ts:645-680` @v0.83.0 (identical at v0.84.1) — `deleteSessionFile` runs `spawnSync("trash", …)` **first** with a `["--", path]` guard (`:649`), treats exit-0 **or** the file having vanished as success with `method:"trash"` (`:666-668`), falls back to `unlink` (`:672-674`), and on failure returns `{ok:false,error}` with a `trash: …` hint (`:675-679`); the caller reports which happened
-- cyrup: two bare `std::fs::remove_file` sites — `startup_ui.rs:133-137`, which additionally `let _`s the `io::Result`, and `cyrup-session-svc/src/session.rs:3343-3347`, whose caller (`app.rs:4025`) prints "deleted session" either way. `rg -ni 'trash' crates/` returns nothing
+- cyrup: two bare `std::fs::remove_file` sites — `startup_ui.rs:133-137`, which additionally `let _`s the `io::Result`, and `cyrup-session-svc/src/session.rs:3343-3347`, whose caller (the `C::DeleteSession` arm, now `app/execute_session.rs:15-33`) prints "deleted session" either way. `rg -ni 'trash' crates/` returns nothing
+- **CLOSED — do not schedule.** Area 08 struck `SEAM-063` on 2026-08-14 and the seam is at HEAD: `delete_session_file` returns a method, and `app/execute_session.rs:24-32` pushes pi's own `"Session moved to trash"` / `"Session deleted"` / `Failed to delete: {e}` strings (`session-selector.ts:846`/`:849` @v0.83.0). The pre-launch `--resume` half — the residual `REPRO-LOG.md` §3 measured — is the part to re-check
 - observable: for every user with `trash` installed, pi's delete is recoverable and cyrup's is not — one confirmed keypress destroys a conversation JSONL with no undo, on the same screen whose *reversible* action (PB-38) is the broken one. A failed delete on a read-only volume looks identical to a successful one.
 
 **PB-40 · The pre-launch trust prompt drops both "(this session only)" options — every answer is persisted** — *high* · area 08 `SEAM-064` (new this pass)
@@ -569,7 +627,7 @@ the behaviour was available to be ported and was not.
 
 **PB-18 · `/permission-system` prints text instead of opening the settings modal** — *medium* · = area 10 `PERM-007`
 - upstream: `src/config-modal.ts:63-122` @v0.8.0 (`openPermissionSystemSettingsModal` — `ctx.ui.custom<void>` overlay at `:66` with a live `onChange`→`setConfig` loop), registered at `src/index.ts:1502-1512`. Same shape at v0.7.1
-- cyrup: `extension.rs:737` (`run_permission_system_command`) parses `<setting> <value>` and returns a `String`. **The in-tree rationale at `:699-706` ("HostServices exposes no custom-overlay seam") is STALE**: `HostServices::open_overlay` is `cyrup-ext/src/host/services.rs:224`, implemented at `cyrup-session-svc/src/host_services.rs:676`, driven by `cyrup-tui/src/app.rs:6310`, and already consumed in production by `cyrup-ext-subagents/src/extension.rs:9908` — with no `cyrup-tui` dependency in the consuming crate
+- cyrup: `extension.rs:1038` (`run_permission_system_command`) parses `<setting> <value>` and returns a `String`. **The in-tree rationale ("HostServices exposes no custom-overlay seam") was STALE and has since been corrected in place — `extension.rs:998` now says "One exists:" and names it.** The seam: `HostServices::open_overlay` is `cyrup-ext/src/host/services.rs:254`, implemented at `cyrup-session-svc/src/host_services.rs:1043`, driven by `App::on_overlay_request` (`cyrup-tui/src/app/run_arms.rs:406-430`, which pushes onto `state.overlays` at `:427`), and already consumed in production by `cyrup-ext-subagents/src/extension.rs:11376` — with no `cyrup-tui` dependency in the consuming crate *(all five citations re-resolved by symbol 2026-08-19; the `app/events_fold.rs:441` one was a bad `40821ed` remap and lands on a doc comment)*
 - observable: `/permission-system` opens a live two-row modal in pi; in cyrup it prints a status paragraph and the user must retype `/permission-system debug on`. A straight port onto an existing seam. Area 10 adds the missing companion: `PERM-024` (config not refreshed on `before_agent_start`) is what makes the modal feel instantaneous once it lands.
 
 > **Area 10's second fail-open is not a port bug and so is not in this section**: `PERM-023` (*high*,
@@ -651,7 +709,7 @@ was rendered in the settings list — and nothing else read it.
 
 **UW-1 · The native modifier probe has no production caller, so the Apple-Terminal Shift+Enter rescue never fires** — *medium*
 - upstream: `pi/packages/tui/src/native-modifiers.ts:21-56` (`loadNativeModifiersHelper` loads the prebuilt darwin/win32 addon), consumed at `packages/tui/src/terminal.ts:6` and used at `:324`
-- cyrup: `crates/cyrup-tui/src/native_modifiers.rs:62` (`set_native_modifier_probe`) — the only call workspace-wide is `crates/cyrup-tui/tests/native_shift_enter.rs:138`. The consumer side IS wired: `app.rs:7174` calls `is_native_modifier_pressed` on the production `map_event` path
+- cyrup: `crates/cyrup-tui/src/native_modifiers.rs:62` (`set_native_modifier_probe`) — the only call workspace-wide is `crates/cyrup-tui/src/tests/native_shift_enter.rs:138`. The consumer side IS wired: `app/input_reader.rs:403` calls `is_native_modifier_pressed` on the production `map_event_on` path *(`app/settings_rows.rs:110` was a bad `40821ed` remap — that line is an idle-timeout description)*
 - observable: with no probe installed the predicate always answers false, so on macOS Apple Terminal Shift+Enter still submits instead of inserting a newline — the exact defect the ported code exists to fix. Mechanism note: pi `require`s a prebuilt `.node` addon; cyrup needs an OS query (`CGEventSourceKeyState`/`GetKeyState`), which is FFI and cannot live inside `#![forbid(unsafe_code)]` `cyrup-tui` — the injectable seam exists precisely for that and is fed by nothing. *(Area 07 did not restate this item; `native_modifiers.rs` is one of fifteen files that did not exist at the older baseline. The citations above are at `04c1ba2`.)*
 
 **UW-2 · The first-run setup wizard is gated but never invoked — the `if` body is empty** — *small* · **observed 2026-08-13** (live-terminal; [`REPRO-LOG.md`](REPRO-LOG.md)) · **FIXED 2026-08-13**
@@ -710,7 +768,8 @@ was rendered in the settings list — and nothing else read it.
 
 **UW-12 · Compaction cannot be cancelled from the shipped binary, and the indicator advertises the dead key** — *high* · = area 03 `SESS-040` (+ `SESS-041`, `SESS-042`)
 - upstream: `modes/interactive/interactive-mode.ts:3074-3085` @v0.83.0 rebinds Escape on `compaction_start`, restoring it at `:3088-3095`
-- cyrup: that rebind was never ported — `cyrup-tui/src/app.rs:4615-4639` handles `CompactionStart` by setting the indicator and nothing else; `AbortCompaction` (`cyrup-tui/src/command.rs:32`, `:116-118`) has **zero production callers**, `AgentSession::abort_compaction` (`session.rs:1677-1681`) likewise; and the indicator band at `app.rs:6044` prints "(esc to cancel)"
+- cyrup: that rebind was never ported — the `CompactionStart` arm (now `app/events_fold.rs:195-223`) handled it by setting the indicator and nothing else; `AbortCompaction` (`cyrup-session-svc/src/command.rs:32`, `:116-118`) had **zero production callers**, `AgentSession::abort_compaction` likewise; and the indicator band (now `app/render.rs:86-90`) prints "(esc to cancel)"
+- **CLOSED — do not schedule.** Area 03 struck `SESS-040` as REFUTED on 2026-08-15 and the whole chain is at HEAD (`4fb5e40`): `app/events_fold.rs:222` arms `state.compacting` beside the band at `:220`; `app/input.rs:144-146` returns `AppAction::AbortCompaction` on Escape ahead of pi's four-branch chain, exactly as `interactive-mode.ts:3080-3086` shadows it; `app/run_action.rs:53-54` calls `ctx.session.abort_compaction()` (`session.rs:1900`). Pinned at `cyrup-tui/src/tests/escape_chain.rs:233`/`:244`, band at `tests/compaction_status.rs`. `REPRO-LOG.md`'s "one of seventeen still open" is corrected in the same direction
 - observable: the provider call bills and `append_compaction` mutates the session file regardless of what the user presses. Two adjacent defects make it worse and **must ship together**: `abort_compaction()` never cancels an AUTO compaction (`SESS-041`), and there is no abort re-check before `append_compaction`, so even a cancelled compaction is written (`SESS-042`) — both are latent *only* because this has no caller. **Verification must include a live terminal run**, not a driven event loop (standing TUI rule).
 
 **UW-13 · `ExtensionManifest.capabilities` is parsed and never read — the per-extension WASM sandbox grant is inert** — ***critical*** **(raised from high this pass)** · = area 06 `EXT-054` (+ `EXT-055`)
@@ -739,7 +798,7 @@ The delivery half of `ui.setWidget` / `ui.setHeader` / `ui.setFooter` is live al
 `doubleEscapeAction` is offered in `/settings` and the Escape handler has no double-escape and no bash-mode-exit branch (`CFG-045`, and `TUI-009` is its TUI half). `CFG-015` carries five unconsumed settings accessors including `lastChangelogVersion` and `collapseChangelog` (PB-6's home). `CFG-044`'s `get_auth_status` is dead. Adjacent: `AGENT-031` / `CFG-006` (`websocketConnectTimeoutMs` parsed, never reaching the HTTP layer), `AGENT-S03` (`StreamOptions.metadata` unreachable from the agent loop), `SESS-033` (`inputs_fingerprint` has no caller and its doc claims otherwise), `PROV-032` (`filter_github_copilot_models`, zero production callers), `SEAM-048` (pi's `name:N` command disambiguation is dead code), `TOOL-015` / `EXT-024` (nothing reads `render_kind`), `EXT-025` (`reload()` plus four `emit_*` facade methods).
 
 **UW-19 · `keybindings.json` is read exactly once, at boot, and no other surface ever reads it** — *medium* · **new this edition** · area 07 `TUI-051`, area 08 `SEAM-067`, area 05 `CFG-048`
-Three findings, one wiring hole. `/reload` (`cyrup-tui/src/app.rs:4235-4241`) calls only `rt.reload`; `load_keybindings_json` has exactly **one** non-test caller — `crates/cyrup/src/main.rs:1626`, at boot — while both the command's help text and its in-source comment claim keybindings are re-read (`TUI-051`). The **pre-launch** selectors (`--resume` picker, trust prompt, config selector) never load it at all and print hint rows naming the built-in keys (`SEAM-067`). And pi's sixth startup migration, `migrateKeybindingsConfigFile` → `migrateKeybindingsConfig` (`core/keybindings.ts:289-309`, **59** legacy names, also applied at read time at `keybindings.ts:366`), is not ported at write time or read time, so every legacy name is silently inert (`CFG-048`; `crates/cyrup/src/migrations.rs:26-33` makes four calls, pi's `runMigrations` six). **Ordering matters: `CFG-048` must precede `TUI-028`**, or the `editor.*`→`tui.editor.*` namespace rename breaks every config written against shipped cyrup.
+Three findings, one wiring hole. `/reload` (`cyrup-tui/src/app/execute_session.rs:241-268`, `rt.reload(None).await` at `:264`) calls only `rt.reload`; `load_keybindings_json` has exactly **one** non-test caller — `crates/cyrup/src/main.rs:1626`, at boot — while both the command's help text and its in-source comment claim keybindings are re-read (`TUI-051`). The **pre-launch** selectors (`--resume` picker, trust prompt, config selector) never load it at all and print hint rows naming the built-in keys (`SEAM-067`). And pi's sixth startup migration, `migrateKeybindingsConfigFile` → `migrateKeybindingsConfig` (`core/keybindings.ts:289-309`, **59** legacy names, also applied at read time at `keybindings.ts:366`), is not ported at write time or read time, so every legacy name is silently inert (`CFG-048`; `crates/cyrup/src/migrations.rs:26-33` makes four calls, pi's `runMigrations` six). **Ordering matters: `CFG-048` must precede `TUI-028`**, or the `editor.*`→`tui.editor.*` namespace rename breaks every config written against shipped cyrup.
 
 **UW-20 · The faithful fuzzy matcher is ported and unused; `--list-models` hand-rolls a lossier one** — *low* · **new this edition** · area 08 `SEAM-068`
 The port of pi's `fuzzy.ts` exists and has no caller on the `--list-models <search>` path, which uses a hand-written filter that drops matches pi returns. Same shape as UW-1: a correct port sitting beside the code that should call it. Ships naturally with `SEAM-020` (the same command prints the whole compiled catalog rather than the auth-configured one, and its no-models-available branch is therefore unreachable).
@@ -786,7 +845,7 @@ HEAD and is the place to work from** — the citation here is the load-bearing p
 | VL-P16 | Management HTTP fetches are not retried | `utils/management-http.ts:25-68` (2 extra attempts, retryable set `:3`), callers `remote-catalog-provider.ts:81`, `version-check.ts:57`, `tools-manager.ts:109`/`:127` | `cyrup-provider/src/remote_catalog.rs:544-547` — one `send()`; any transport error or 5xx is terminal | 01 (re-confirmed open) |
 | VL-P17 | Terminal colour-scheme and background probes run sequentially | `modes/interactive/theme/theme.ts:796-810` (both promises started, then awaited) | `cyrup-tui/src/theme.rs:1334-1343` — early return, then fall through | **unowned** — see below |
 | VL-P18 | `tui.editor.historyPrevious` / `historyNext` not rebindable | `packages/tui/src/keybindings.ts:68-75` (both `defaultKeys: []`), consumed `components/editor.ts:768-777` | `cyrup-tui/src/keymap.rs:157-186` — 24 ids, neither history id | 07 `TUI-035` (verified absent at v0.83.0 — genuine lag) |
-| VL-P19 | The fullscreen (alternate-screen) TUI program is entirely absent | `packages/tui/src/tui-alt-screen.ts` (1047 lines, new at v0.84.1) + `components/scroll-view.ts` (195) + `alt-screen-flash.ts` (51); flag `cli/args.ts:180-193`; settings `settings-manager.ts:135-136`; switch `interactive-mode.ts:345`; 8 `tui.altScreen.*` bindings `keybindings.ts:43-50` | no alt-screen module; `app.rs:7202` is `Event::Mouse(_) => None`; no `tui_mode` anywhere | 08 **`SEAM-051` — now *high*, effort S, and the most urgent row in this table**: `--tui-mode regular`, the flag's *default* value, is captured by `partition_extension_flags` and every mode exits 1. 07 `TUI-019` (**re-rated low → medium**; the ADR-0001 justification is struck — see OQ-8), 05 `CFG-021` (`tuiMode`/`fullscreenScrollbar` settings), 12 `DRIFT-022` *(now a tracker)*. **`SEAM-051` and `CFG-021` must be fixed under either answer to OQ-8; they do not wait on it.** **Mechanism note**: ratatui supports the alternate screen and mouse capture natively; the gap is the application layer. |
+| VL-P19 | The fullscreen (alternate-screen) TUI program is entirely absent | `packages/tui/src/tui-alt-screen.ts` (1047 lines, new at v0.84.1) + `components/scroll-view.ts` (195) + `alt-screen-flash.ts` (51); flag `cli/args.ts:180-193`; settings `settings-manager.ts:135-136`; switch `interactive-mode.ts:345`; 8 `tui.altScreen.*` bindings `keybindings.ts:43-50` | no alt-screen module; `app/input_reader.rs:431` is `Event::Mouse(_) => None`; no `tui_mode` anywhere | 08 **`SEAM-051` — now *high*, effort S, and the most urgent row in this table**: `--tui-mode regular`, the flag's *default* value, is captured by `partition_extension_flags` and every mode exits 1. 07 `TUI-019` (**re-rated low → medium**; the ADR-0001 justification is struck — see OQ-8), 05 `CFG-021` (`tuiMode`/`fullscreenScrollbar` settings), 12 `DRIFT-022` *(now a tracker)*. **`SEAM-051` and `CFG-021` must be fixed under either answer to OQ-8; they do not wait on it.** **Mechanism note**: ratatui supports the alternate screen and mouse capture natively; the gap is the application layer. |
 | VL-P20 | Mermaid fences not rendered; `markdown.mermaid` is not a setting | `modes/interactive/components/mermaid.ts:14-30`; setting `settings-manager.ts:61` (getter `:1251`) | `cyrup-tui/src/markdown.rs:964-965` — the only two "mermaid" occurrences are a comment quoting upstream's predicate | 07 `TUI-034`, 05 `CFG-040` |
 | VL-P21 | `registerMarkdownTransformer` and the transform pipeline are absent | `core/extensions/types.ts:1153`, `:1292`, `:1703`; pipeline `components/markdown-transform.ts:3-29` (fail-open per transformer, width-aware) | `cyrup-ext/wit/world.wit` has no transformer import/export; `markdown.rs` has no transform seam | 06 `EXT-019` (re-scoped to the v0.84.1 `MarkdownTransformContext` shape), 07 `TUI-034`, 12 `DRIFT-015`. **VL-P20 has nowhere to attach until this lands** — upstream ships mermaid AS a registered transformer. |
 | VL-P22 | A torn session-JSONL tail is never repaired; fork is not published atomically | `packages/agent/src/harness/session/jsonl/storage.ts:33-46`, `:83-90`, `:93-95`, `:99-109` | `cyrup-session/src/manager.rs:851-888` (`load` skips malformed lines, returns `recovered`) and `:114-117`, where the rewrite is gated `if migrated && !recovered` — a recovered file is provably never rewritten. `store.rs:68-82` stages+renames for full rewrites; `create_exclusive` (`:86-116`) writes straight to the destination fd | **ownerless and growing** — see below |
@@ -920,8 +979,8 @@ most of them come out of auditing what the *closing* code does — which is the 
 **Subsystems that were "absent" and are now ported and wired**
 - `watchdog/` — 18 modules under `crates/cyrup-ext-subagents/src/watchdog/` (~18k lines), including a real stdio LSP client. Wiring: `register_main_watchdog` at `extension.rs:9055`, nine subscriptions `:9338-9352`, `/subagents-watchdog` `:9326`, four `watchdog.*` verbs `:7567-7570`. *(Two no-op agents remain — UW-4, UW-5.)*
 - `missions/` — 7 modules; six `mission.*` verbs, params parsed `:5423-5432`, goal-continuation notices from the `agent_end` handler. *(Write half of workflow state remains — UW-8.)*
-- The interactive fleet inspector — `tui/fleet_overlay.rs:177` implements `InteractiveOverlay`; `extension.rs:9898`/`:9908` construct and open it, driven by `cyrup-tui/src/app.rs:6310`. **This is the seam PB-9 and PB-18 should now use.**
-- The persistent fleet status widget (`set_widget` at `extension.rs:9489`, `:9889`, `:9978`); subagent tool renderers (`:9616`, `:9646`, consumed at `app.rs:5220-5221`); terminal-run **revival** (`background/control.rs:1214` → `extension.rs:4232`); agent **aliases** end to end with the verbatim `Ambiguous agent alias '…': …` message.
+- The interactive fleet inspector — `tui/fleet_overlay.rs:177` implements `InteractiveOverlay`; `extension.rs:11366`/`:11376` construct it and call `services.open_overlay(Box::new(overlay))`, driven by `App::on_overlay_request` (`cyrup-tui/src/app/run_arms.rs:406-430`). **This is the seam PB-9 and PB-18 should now use.**
+- The persistent fleet status widget (`set_widget` at `extension.rs:9489`, `:9889`, `:9978`); subagent tool renderers (consumed through the ONE dispatch site, `run_renderer` at `app/extension_render.rs:153-166`; `Which::ToolCall`/`Which::ToolResult` at `:162`/`:163`); terminal-run **revival** (`background/control.rs:1214` → `extension.rs:4232`); agent **aliases** end to end with the verbatim `Ambiguous agent alias '…': …` message.
 - The child-side prompt runtime, the structured-output capture channel, the control/activity pipeline, the async deadline + cascade, agent memory, prompt workflows, the **native supervisor channel** (`native_supervisor.rs`, 2251 lines) and the tool-budget enforcer (`exec/tool_budget.rs`, 388 lines).
 - All 11 OAuth login flows (`crates/cyrup-provider/src/auth/oauth/`), driven from `/login`. *(Two of them are unreachable — UW-11. And nine of the eleven were not audited against upstream at all; area 01 flags `PROV-003`'s closure as deliberately weak.)*
 - The 2-model `seed.json` stub is **physically gone** (`PROV-007`): the six production sites now go through `cyrup-provider/src/catalog.rs:38-44` `builtin_catalog()`, guarded at `:52-75`.

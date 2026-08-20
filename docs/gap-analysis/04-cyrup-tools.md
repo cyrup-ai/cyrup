@@ -88,10 +88,10 @@ This area covers `crates/cyrup-tools` — the seven built-in tools (`read`, `wri
 
 | ID | Status | Note |
 |---|---|---|
-| TOOL-001 | closed | Re-attacked a third time. `crates/cyrup-tools/tests/pi_schema.rs:139-215` asserts `description()`/`prompt_snippet()`/`prompt_guidelines()` for all seven **through the `Arc<dyn Tool>` vtable** against verbatim pi constants (`pi_schema.rs:95-136`). Six of seven byte-compare against v0.84.1 directly; the seventh is covered by the whole-diff read (no description literal changed v0.83.0→v0.84.1). Reachability re-verified at the real site: `crates/cyrup-agent/src/agent.rs:714` `description: t.description().to_string()` inside the `ToolDef` build — the older `:656` cite is stale. |
+| TOOL-001 | closed | Re-attacked a third time. `crates/cyrup-tools/src/tests/pi_schema.rs:139-215` asserts `description()`/`prompt_snippet()`/`prompt_guidelines()` for all seven **through the `Arc<dyn Tool>` vtable** against verbatim pi constants (`pi_schema.rs:95-136`). Six of seven byte-compare against v0.84.1 directly; the seventh is covered by the whole-diff read (no description literal changed v0.83.0→v0.84.1). Reachability re-verified at the real site: `crates/cyrup-agent/src/agent.rs:714` `description: t.description().to_string()` inside the `ToolDef` build — the older `:656` cite is stale. |
 | TOOL-002 | closed | `EditTool::prepare_arguments` at `crates/cyrup-tools/src/tools/edit.rs:132-134` → `normalize_args` (`:83-109`). Re-attacked at the *semantic* level this pass, not just presence: pi appends the legacy pair to a **copy** of any existing `edits` array (`edit.ts:124-125`) and strips `oldText`/`newText` via `{...rest, edits}` (`:126-127`); `edit.rs:95-106` does exactly that, pinned by four unit tests at `edit.rs:249-328`. |
 | TOOL-003 | closed | `prompt_snippet` (`crates/cyrup-core/src/tool.rs:112-114`) and `prompt_guidelines` (`:120-122`) on the vtable; all seven built-ins override them (`read.rs:67-72`, `write.rs:65-70`, `edit.rs:143-159`, `bash.rs:88-126`, `grep.rs:105-107`, `find.rs:86-88`, `ls.rs:61-63`). The one hole this item recorded — bash's guideline — is closed by TOOL-008 (`bash.rs:120-126`, gated on `expose_session_environment` == `bash.ts:334`). The `&[&str]` return type remains the guest-side defect, tracked as TOOL-021. |
-| TOOL-004 | **closed this pass** | `cfe351e`. `FsOps::write_in_place` declared at `crates/cyrup-tools/src/ops/mod.rs:299` (contract doc `:279-298`), implemented at `ops/local.rs:73-96` (`OpenOptions::write(true).create(true).truncate(true)` — no temp file, no rename), called from `write.rs:89` and `edit.rs:221`. `write_atomic` is gone from the mutator path. Upstream is `edit.ts:95` / `write.ts:223`. Proven by `crates/cyrup-tools/tests/write_semantics.rs:76`, `:105`, `:132`, `:165`, `:197`, `:232`, `:314`. |
+| TOOL-004 | **closed this pass** | `cfe351e`. `FsOps::write_in_place` declared at `crates/cyrup-tools/src/ops/mod.rs:299` (contract doc `:279-298`), implemented at `ops/local.rs:73-96` (`OpenOptions::write(true).create(true).truncate(true)` — no temp file, no rename), called from `write.rs:89` and `edit.rs:221`. `write_atomic` is gone from the mutator path. Upstream is `edit.ts:95` / `write.ts:223`. Proven by `crates/cyrup-tools/src/tests/write_semantics.rs:76`, `:105`, `:132`, `:165`, `:197`, `:232`, `:314`. |
 | TOOL-005 | closed | `crates/cyrup-tools/src/tools/grep.rs:222-225` `BinaryDetection::quit(b'\x00')`, with the `convert`-vs-`quit` `[CYRUP-DELTA]` at `:208-221`. Upstream `grep.ts:220-223` builds rg's argv with no `--text`/`-a`, so rg's default quit-on-NUL applies. |
 | TOOL-006 | still-open | `write`/`edit` still declare `ExecMode::Sequential`; the whole batch is still routed serially at `agent.rs:888`. |
 | TOOL-007 | still-open | `protect_paths: true` still hardcoded at `builder.rs:208`, still bypassed by `bash` (`:646` leaves `proc` undecorated), still no flag or setting, and `isolation/mod.rs:3-6` still asserts the opposite of the wiring. **Cross-linked to TOOL-039 by the 2026-08-12 repair pass** — both are decisions about what `bash` is allowed to be, and taking them separately produces an incoherent shell surface. |
@@ -304,7 +304,7 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 
 **Fix** — Delete both `execution_mode` overrides.
 
-**Verify** — Assert `ExecMode::Parallel` for both in `crates/cyrup-tools/tests/pi_schema.rs`, plus an agent-level test that a batch of one `edit` and two `read`s yields `sequential == false` at `agent.rs:880-883`.
+**Verify** — Assert `ExecMode::Parallel` for both in `crates/cyrup-tools/src/tests/pi_schema.rs`, plus an agent-level test that a batch of one `edit` and two `read`s yields `sequential == false` at `agent.rs:880-883`.
 
 ## TOOL-007 — `write`/`edit` to `.env`, `.git/`, `node_modules/` blocked by default, no pi analog, and `bash` bypasses it
 
@@ -316,7 +316,7 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 
 **Impact** — A silent, undocumented, unoverridable refusal on three common paths. The model is told nothing about the restriction (no description text, no guideline), so it retries or routes around it via `bash` — which succeeds, making the guard security theatre while still costing a failed turn.
 
-**Fix** — Decide deliberately: either flip `builder.rs:208` to `false` and expose a flag/setting, or keep it on and (a) surface it in the `write`/`edit` descriptions plus a `prompt_guidelines` entry, (b) decorate `ProcOps` so `bash` is covered, (c) correct `isolation/mod.rs:3-6`. Sibling `confine_to_cwd` is correctly `false` and needs no change. Note `default_bash_rm_rf_runs_without_any_gate` (`crates/cyrup-tools/tests/isolation.rs`) is NOT a test defect — it builds `Backend::default()` directly and is accurate for `bash`.
+**Fix** — Decide deliberately: either flip `builder.rs:208` to `false` and expose a flag/setting, or keep it on and (a) surface it in the `write`/`edit` descriptions plus a `prompt_guidelines` entry, (b) decorate `ProcOps` so `bash` is covered, (c) correct `isolation/mod.rs:3-6`. Sibling `confine_to_cwd` is correctly `false` and needs no change. Note `default_bash_rm_rf_runs_without_any_gate` (`crates/cyrup-tools/src/tests/isolation.rs`) is NOT a test defect — it builds `Backend::default()` directly and is accurate for `bash`.
 
 **Verify** — With the guard on: assert `write` to `.env` is refused AND `bash 'echo x >> .env'` is refused. With it off: assert both succeed and no `ProtectedFs` is in the chain.
 
@@ -326,7 +326,7 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 
 > **Partially closed.** The item's primary defect — a per-`ToolRegistry` mutation queue — is closed by `7fd0d9c`. The ID stays open for the secondary defect it also recorded. **The residual is written up in full as TOOL-032; fix it once, not twice.** Severity is retained at the auditor's rating; note that the residual considered on its own is rated low under TOOL-032.
 
-**cyrup** — Closed half: `crates/cyrup-tools/src/lock.rs:29-30` `static FILE_MUTATION_LOCKS: LazyLock<Arc<DashMap<..>>>`, attached by `new()` at `:78-80`, with `Default` hand-written as an alias for `new()` at `:44-51` precisely so a derived `Default` cannot silently re-create per-owner domains. Revert-proved by `lock.rs:164-187` `independent_handles_share_one_lock_per_path` (`Arc::ptr_eq` on the maps AND `via_b.try_lock().is_err()` while `a` holds it) and by `crates/cyrup-tools/tests/cross_registry_mutation_lock.rs:144`, `:208`, `:262`. Open half: `lock.rs:85-87` `fn key()` still calls the BLOCKING `std::fs::canonicalize`, invoked at `:96` from inside the async `guard()` (`:91-107`), which both mutators await (`write.rs:83`, `edit.rs:189`).
+**cyrup** — Closed half: `crates/cyrup-tools/src/lock.rs:29-30` `static FILE_MUTATION_LOCKS: LazyLock<Arc<DashMap<..>>>`, attached by `new()` at `:78-80`, with `Default` hand-written as an alias for `new()` at `:44-51` precisely so a derived `Default` cannot silently re-create per-owner domains. Revert-proved by `lock.rs:164-187` `independent_handles_share_one_lock_per_path` (`Arc::ptr_eq` on the maps AND `via_b.try_lock().is_err()` while `a` holds it) and by `crates/cyrup-tools/src/tests/cross_registry_mutation_lock.rs:144`, `:208`, `:262`. Open half: `lock.rs:85-87` `fn key()` still calls the BLOCKING `std::fs::canonicalize`, invoked at `:96` from inside the async `guard()` (`:91-107`), which both mutators await (`write.rs:83`, `edit.rs:189`).
 
 **upstream** — `pi/packages/coding-agent/src/core/tools/file-mutation-queue.ts:4` keeps `fileMutationQueues` at MODULE level (the half cyrup now matches), and `getMutationQueueKey` (`:16-26`) is `async` with `await realpath(...)` — never blocking (the half cyrup does not).
 
@@ -364,7 +364,7 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 
 **Fix** — Widen the trait return type rather than working around it: `fn prompt_guidelines(&self) -> Vec<&str>` (or `Cow<'_, [&str]>`) in `crates/cyrup-core/src/tool.rs:120-122`. The built-ins that declare guidelines keep their const arrays with a trivial `.to_vec()`; `RegisteredTool` (`crates/cyrup-ext/src/wrapper.rs:107-111`) forwards unchanged; `WasmTool` becomes `self.descriptor.prompt_guidelines.iter().map(String::as_str).collect()`. The prompt builder at `builder.rs:1606` already maps into owned values, so nothing downstream changes.
 
-**Verify** — Register a guest tool declaring two guidelines, assert both appear in the built system prompt. `crates/cyrup-tools/tests/pi_schema.rs:139-215` must stay green unchanged.
+**Verify** — Register a guest tool declaring two guidelines, assert both appear in the built system prompt. `crates/cyrup-tools/src/tests/pi_schema.rs:139-215` must stay green unchanged.
 
 ## TOOL-022 — `renderShell`, `prepareArguments` and `label` never reach a guest tool's behavior
 
@@ -417,14 +417,16 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 > `edit` — which today gets the framed form with `edit_bg_style` — is supposed to be. That is not
 > derivable from the source alone.
 >
-> *(3) Measured size.* `crates/cyrup-tui/src/transcript.rs` is 4900+ lines and `app.rs` 9000+;
-> the change touches `ToolRun` (`transcript.rs:183-213`), both `push_tool_start_rendered` call
-> sites (`app.rs:1692`, `:5651`) plus 14 test call sites, `tool_lines`' `bg` selection
+> *(3) Measured size.* `crates/cyrup-tui/src/transcript.rs` is 5450+ lines, and `app.rs` no longer
+> exists — `40821ed` split it into the 33-file `crates/cyrup-tui/src/app/` tree, 10.5k lines total;
+> the change touches `ToolRun` (`transcript.rs:183-213`), both production `push_tool_start_rendered`
+> call sites — the replay path (`app/session_bind.rs:210`) and the live `ToolStart` fold
+> (`app/events_fold.rs:138`) — plus the test call sites, `tool_lines`' `bg` selection
 > (`transcript.rs:1362-1366`), `finalize_block`, and a new producer. The producer is NOT
 > `cyrup-session-svc` as the sweep-8 correction says: pi's own component looks the BUILT-IN table up
 > locally (`createAllToolDefinitions(cwd)[toolName]`, `tool-execution.ts:57`) and only the
 > REGISTERED definition comes from outside, and cyrup-tui already holds
-> `&Arc<cyrup_ext::ExtensionHost>` at `app.rs:5416`, whose `registry().guest_tool_descriptors()`
+> `&Arc<cyrup_ext::ExtensionHost>` at `app/events.rs:28`, whose `registry().guest_tool_descriptors()`
 > exposes `ToolDescriptor.render_shell` (`cyrup-ext/src/registry.rs:44`, `:605`). **So the
 > `cyrup-session-svc` limb the sweep-8 correction added is probably not needed at all** — routing
 > it as a three-crate change would over-scope it.
@@ -609,7 +611,7 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 
 > **Partially closed.** The vacuity this item was filed for is genuinely repaired; what remains is a naming and strength problem.
 
-**cyrup** — Repaired half: `crates/cyrup-tools/tests/tools.rs:375-421` — the two racing payloads are now `"AAAA"` (`:395`) and `"BBBBBBBBBBBBBBBB"` (`:407`), DIFFERENT lengths, and the comment at `:380-388` records why this now bites (the backend is an in-place `O_TRUNC` write per TOOL-004, so any interleaving leaves a short read, a tail, or a truncated prefix and the disjunction assertion at `:417-420` can genuinely fail). The two cases the item asked for landed as separate files rather than folded in: `crates/cyrup-tools/tests/cross_registry_mutation_lock.rs:208` is the EDIT read-modify-write case, `:144` and `:262` the cross-registry and different-file cases. Residual: the test still names "serializes" while observing no ordering, and its guarantee is probabilistic — an interleaving that happens not to occur on a given run leaves it green.
+**cyrup** — Repaired half: `crates/cyrup-tools/src/tests/tools.rs:375-421` — the two racing payloads are now `"AAAA"` (`:395`) and `"BBBBBBBBBBBBBBBB"` (`:407`), DIFFERENT lengths, and the comment at `:380-388` records why this now bites (the backend is an in-place `O_TRUNC` write per TOOL-004, so any interleaving leaves a short read, a tail, or a truncated prefix and the disjunction assertion at `:417-420` can genuinely fail). The two cases the item asked for landed as separate files rather than folded in: `crates/cyrup-tools/src/tests/cross_registry_mutation_lock.rs:208` is the EDIT read-modify-write case, `:144` and `:262` the cross-registry and different-file cases. Residual: the test still names "serializes" while observing no ordering, and its guarantee is probabilistic — an interleaving that happens not to occur on a given run leaves it green.
 
 **upstream** — `pi/packages/coding-agent/src/core/tools/file-mutation-queue.ts:4` module-level map; `write.ts:212` / `edit.ts:316` wrap the whole read-modify-write in `withFileMutationQueue`. The property that actually needs guarding is mutual exclusion, not the surviving byte pattern.
 
@@ -623,7 +625,7 @@ launched with `CYRUP_SHELL` set in the parent's environment does **not** see it 
 
 **Kind** test-defect · **Severity** low · **Effort** S · **Confidence** medium (analytic)
 
-**cyrup** — `crates/cyrup-tools/tests/tools.rs:769-790`, unchanged. Runs `sleep 30` with `"timeout": 2.5` (`:776`) and asserts at `:785-789` `elapsed >= Duration::from_millis(2300) && elapsed < Duration::from_millis(4000)`. The lower bound is safe. The upper bound leaves only ~1.5s of slack for scheduling, the SIGTERM→grace→SIGKILL escalation and process reaping, under an arbitrarily loaded `cargo test --workspace`. The load-independent part — `msg.contains("Command timed out after 2.5 seconds")` at `:784` — is what actually pins the float-seconds parsing (`resolve_timeout_ms`, `crates/cyrup-tools/src/tools/bash.rs:36-47`) and needs no timing at all.
+**cyrup** — `crates/cyrup-tools/src/tests/tools.rs:769-790`, unchanged. Runs `sleep 30` with `"timeout": 2.5` (`:776`) and asserts at `:785-789` `elapsed >= Duration::from_millis(2300) && elapsed < Duration::from_millis(4000)`. The lower bound is safe. The upper bound leaves only ~1.5s of slack for scheduling, the SIGTERM→grace→SIGKILL escalation and process reaping, under an arbitrarily loaded `cargo test --workspace`. The load-independent part — `msg.contains("Command timed out after 2.5 seconds")` at `:784` — is what actually pins the float-seconds parsing (`resolve_timeout_ms`, `crates/cyrup-tools/src/tools/bash.rs:36-47`) and needs no timing at all.
 
 **upstream** — Not a parity question: the ported behavior is correct. Same class as TOOL-020 and TOOL-030.
 
