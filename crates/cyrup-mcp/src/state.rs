@@ -333,16 +333,14 @@ impl std::fmt::Debug for McpState {
 // =================================================================================================
 
 /// `server-manager.ts`'s `McpServerManager`: the connection table, the five race guards, the
-/// generation fencing, transport construction and `withSessionRecovery`.
+/// generation fencing and the teardown.
 ///
-/// **Forward declaration (13c / MCP-091…MCP-140 replace it with `pub use crate::manager::…`).**
-#[derive(Debug, Default)]
-#[non_exhaustive]
-pub struct McpServerManager {
-    /// The session working directory `new McpServerManager(cwd)` is constructed with — the base
-    /// every `resolveConfigPath` resolves against.
-    pub cwd: std::path::PathBuf,
-}
+/// **Landed by 13c (MCP-100 / MCP-116 / MCP-125 / MCP-126 / MCP-131 / MCP-134).** The forward
+/// declaration is gone; `crate::state::McpServerManager` stays a valid path for everything already
+/// written against it, and now names the real manager. What it does *not* yet own is
+/// `createConnection` itself — that is the [`crate::server_manager::ConnectionFactory`] seam, and
+/// the units behind it (MCP-101/103/114/115/119) are still open.
+pub use crate::server_manager::McpServerManager;
 
 /// `oauth.ts`'s `createOAuthRuntime(signal)`: the flow registry, its own generation counter and the
 /// four in-flight maps.

@@ -146,6 +146,7 @@ pub mod request_headers_command;
 pub mod renderers;
 pub mod runtime;
 pub mod secrets;
+pub mod server_manager;
 pub mod state;
 pub mod ui;
 

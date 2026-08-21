@@ -146,7 +146,7 @@ pub async fn initialize_mcp(
         .then(|| snapshot.services.clone())
         .flatten()
         .map(|services| Arc::new(OwnedServices::new(services, Arc::clone(&owner))));
-    let _runtime_signal =
+    let runtime_signal =
         crate::abort::combine(&owner.token(), snapshot.initial_signal.as_ref());
 
     // Steps 2-4. `getAuthStorageOptions(settings.oauthDir, cwd)` — and **only** `settings.oauthDir`:
@@ -167,7 +167,27 @@ pub async fn initialize_mcp(
         .oauth_runtime
         .clone()
         .unwrap_or_else(|| crate::oauth::create_oauth_runtime(Some(&owner.token())));
-    let manager = Arc::new(McpServerManager { cwd: snapshot.cwd.clone() });
+    let manager = Arc::new(McpServerManager::new(snapshot.cwd.clone()));
+    // Step 4's setters, now that `McpServerManager` is real (MCP-100). Four of the eight are
+    // resolvable here; the other four are not this step's:
+    //
+    // * `setMetadataListChangedListener` is **step 11** — installed after the state commits, so a
+    //   hook fired mid-build cannot see a half-installed surface (MCP-011/MCP-030);
+    // * `setSamplingConfig` / `setElicitationConfig` are steps 5-6's gates (MCP-118/MCP-121/MCP-122)
+    //   and are wired with their handlers, not here;
+    // * `setTraceConfig` has no counterpart at all — `mcp-trace.ts` is MCP-133, unported.
+    //
+    // `runtimeSignal` is combined **once per generation**, which is what makes
+    // `crate::abort::combine`'s one-forwarder-task-per-pair cost affordable (13a §8).
+    manager.set_runtime_signal(Some(runtime_signal));
+    manager.set_default_request_timeout_ms(
+        config
+            .settings
+            .as_ref()
+            .and_then(|settings| settings.request_timeout_ms),
+    );
+    manager.set_auth_storage_options(auth_storage_options.clone());
+    manager.set_oauth_runtime(Arc::clone(&oauth_runtime));
 
     // Step 7. `hasPendingAuth` is the OAuth runtime's, so an authenticating server is never reaped.
     let lifecycle = Arc::new(McpLifecycleManager::new(Arc::clone(&manager), Arc::new(|_| false)));
