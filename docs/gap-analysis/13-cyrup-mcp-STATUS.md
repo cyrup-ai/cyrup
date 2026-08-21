@@ -26,6 +26,59 @@ any single row below as a lead rather than a verdict.
 **What this is not.** No row here was verified by building or running anything; every ruling is a
 reading of source. `cut` and `open-decision` units are reported `not-applicable` and are NOT work.
 
+## Update — 2026-08-21, wave 1 (MCP-141 / 142 / 146 / 370)
+
+The census below is **as of the audit** and is not rewritten by later work; this section records what
+has moved since, so the two are never in conflict.
+
+All four units concerned one file — `crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs`, the
+in-tree READER of the metadata cache, which was never upgraded when `cyrup-mcp`'s writer was. Landed:
+the identity pre-image is now the writer's key set in the same *resolved* forms, `stable_stringify`
+renders an absent field as the bare `undefined` (a three-state `HashValue` mirroring the writer's,
+replacing `serde_json::Value`), resource tools are `read_` not `get_`, `ToolPrefix` carries upstream's
+four modes, and the server prefix preserves hyphens. `cyrup-mcp` was added to that crate's
+**`[dev-dependencies]` only**, so the conformance tests assert against the writer itself rather than
+against constants copied out of it — drift is now impossible rather than merely detectable.
+
+| unit | was | now | what remains |
+|---|---|---|---|
+| `MCP-142` | partial | **implemented** | — |
+| `MCP-146` | partial | **implemented** | — |
+| `MCP-141` | partial | **partial** | `socket`; the resolve-vs-`verbatim` split; upstream-faithful vectors — all three below |
+| `MCP-370` | partial | **partial** | `includeTools` and glob `excludeTools` still unported in the reader, so it over-approximates what the adapter registers |
+
+**Three things wave 1 did NOT fix, stated so they are not mistaken for done.**
+
+1. **`socket` — now measured, not argued.** Upstream's `computeServerHash` builds a **15**-key
+   identity whose third key is `socket` (`metadata-cache.ts:89`), and its `stableStringify` walks
+   `Object.keys()`, so an absent socket is still emitted as `"socket":undefined`. Neither Rust side
+   emits the key. Running upstream's own functions on node 22 against the stdio fixture gives
+   `2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4`; cyrup gives
+   `4dd46c1f…`, and removing upstream's `socket` member yields cyrup's pre-image byte for byte — so
+   that one key is the entire difference. This contradicts 13c-mcp-servers.md:1753 ("Keep `socket` …
+   in the pre-image despite Cut 3"), and it is a **deliberate, pre-existing writer choice** whose own
+   golden vectors say "with `socket` unset". It is left alone because reversing it changes every
+   digest in the field and is the owner's call, not a porter's. It is now pinned by
+   `the_socket_key_is_the_one_divergence_from_upstreams_own_digest`, which fails the moment someone
+   lands `socket` — i.e. the divergence can no longer drift silently.
+
+2. **The reader resolves; the writer does not.** The reader now interpolates `env`/`headers`/`url`,
+   expands a leading `~` in `cwd`, and falls back to `bearerTokenEnv` for `bearerToken` — all exactly
+   as upstream does. The writer's two production call sites still pass `ResolvedIdentity::verbatim`,
+   which resolves nothing (its own `TODO(MCP-082, MCP-084)`). So the two agree only for definitions
+   free of `${VAR}`/`$env:VAR`, of a `~`-prefixed `cwd`, and of `bearerTokenEnv`-supplied tokens.
+   **The reader is the upstream-correct side here**; the fix belongs in MCP-082/084 on the writer,
+   and hashing raw in the reader to match would un-upstream the one side that is now right.
+
+3. **The "golden" vectors are cyrup-internal, not upstream-faithful.** They are upstream's algorithm
+   run with `socket` removed — the caveat the writer's vectors carry and which wave 1's first draft
+   dropped, making the comment claim more than it delivered. Corrected in place; the real upstream
+   digest is pinned alongside as above.
+
+Verified: `cargo nextest run --workspace` 7697/7698 (the one failure is the pre-existing
+`cyrup-modes rpc_cycle_model_spans_the_full_auth_filtered_registry`, unrelated and documented
+elsewhere), `cargo clippy --workspace --all-targets` exit 0 with no new warnings in the changed file.
+
 ## Census
 
 | status | units | meaning |
@@ -330,11 +383,11 @@ divergence inside something that already exists, which is why they read as `part
 | `MCP-139` | high | `hand-written` | **partial** | Metadata cache: path, schema, version, load and merge-save | Three real gaps. (1) **The agent-dir consolidation did not happen.** `npx_resolver::agent_dir` (/home/user/cyrup/crates/cyrup-ext/src/caps/proc/npx_resolver.rs, anchored on `caps::proc::host_home_dir`) and `mcp_direct_tools::resolve_agent_dir`/`home_dir` … |
 | `MCP-140` | high | `hand-written` | **partial** | Metadata cache: serialisers and reconstructors | The **serialisers are absent**. Nothing converts a live MCP tool/resource/prompt list into `CachedTool`/`CachedResource`/`CachedPrompt`: grepping all 19 files for a `ServerCacheEntry {` construction outside tests returns nothing (only dirs.rs:1254/1342, registration.rs:1981, ui.rs:5049 — all … |
 | `MCP-141` | critical | `hand-written` | **partial** | computeServerHash must hash all 14 fields; the in-tree reader hashes 11 | Three gaps, each independently fatal to the contract. (1) **The reader was not upgraded.** `cyrup_ext_subagents::exec::mcp_direct_tools::compute_mcp_server_hash` (/home/user/cyrup/crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs:531-584) still hashes **11** keys — `protocolVersion`, … |
-| `MCP-142` | critical | `hand-written` | **partial** | stableStringify emits the bare token `undefined`, not `null` | The **reader still emits `null`**: `mcp_direct_tools::stable_stringify` (/home/user/cyrup/crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs:796-825) maps `Value::Null => "null"`, and every absent field is materialised as `Value::Null` by `opt_str_value` (:587-589), by … |
+| `MCP-142` | critical | `hand-written` | **implemented** (wave 1) | stableStringify emits the bare token `undefined`, not `null` | The **reader still emits `null`**: `mcp_direct_tools::stable_stringify` (/home/user/cyrup/crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs:796-825) maps `Value::Null => "null"`, and every absent field is materialised as `Value::Null` by `opt_str_value` (:587-589), by … |
 | `MCP-143` | high | `hand-written` | **partial** | interpolateEnvVars is missing its third pattern {env:NAME} | Both in-tree copies the unit names are unchanged. (1) `cyrup_ext::caps::proc::interpolate_env_vars_with` (/home/user/cyrup/crates/cyrup-ext/src/caps/proc.rs:148-156) is still `interpolate_braces` (:157) + `interpolate_dollar_env` (:180) — two patterns; grepping proc.rs for `{env:` returns nothing. … |
 | `MCP-144` | high | `hand-written` | **partial** | !/!! secret-expression semantics in hashed values | Two call sites still bypass it. (1) `mcp_direct_tools::interpolate_env_record` (/home/user/cyrup/crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs:696-712) calls plain `interpolate_env_vars` and additionally **drops non-string values** (`if let Some(text) = value.as_str()` at :706) where … |
 | `MCP-145` | high | `hand-written` | **partial** | isServerCacheValid including the throw-to-false rule | The throw arm is unreachable in practice: no fallible hasher is ever installed (`install_server_hasher` at registration.rs:754 has no production caller, and registration.rs:746-752 documents that without one the hash comparison is **skipped entirely**), and `compute_server_hash` cannot fail because … |
-| `MCP-146` | critical | `hand-written` | **partial** | Resource tool naming: read_ upstream vs get_ in the in-tree reader | The reader was **not** changed: `cyrup_ext_subagents::exec::mcp_direct_tools::resolve_direct_tool_names` still builds `format!("get_{}", resource_name_to_tool_name(name))` at /home/user/cyrup/crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs:466, and the test at :1044 still asserts … |
+| `MCP-146` | critical | `hand-written` | **implemented** (wave 1) | Resource tool naming: read_ upstream vs get_ in the in-tree reader | The reader was **not** changed: `cyrup_ext_subagents::exec::mcp_direct_tools::resolve_direct_tool_names` still builds `format!("get_{}", resource_name_to_tool_name(name))` at /home/user/cyrup/crates/cyrup-ext-subagents/src/exec/mcp_direct_tools.rs:466, and the test at :1044 still asserts … |
 | `MCP-147` | medium | `hand-written` | **implemented** | Direct-tool selector parsing and the missing-server gate | /home/user/cyrup/crates/cyrup-mcp/src/registration.rs:835-853 `parse_direct_tool_selectors` strips trailing `/`, then for a slash-bearing selector … |
 | `MCP-148` | n/a | `rmcp` | **implemented** | The protocol layer is rmcp, client-only | /home/user/cyrup/crates/cyrup-mcp/Cargo.toml declares exactly the settled set: `rmcp = { version = "3.1.2", default-features = false, features = … |
 | `MCP-149` | n/a | `hand-written` | **not-applicable** | Tracker: section 03 index and cross-section edges | No work item of its own; the three out-of-crate changes it indexes are all still outstanding and are filed under MCP-103, MCP-139 and … |

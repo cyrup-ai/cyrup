@@ -20,6 +20,57 @@
 //! directory context is factored into an injectable [`McpDirs`] — [`McpDirs::from_env`] reproduces
 //! pi's env/home resolution for production, while tests inject a hermetic [`McpDirs`] pointing at a
 //! tempdir (the faithful equivalent of pi's tests setting `PI_CODING_AGENT_DIR`).
+//!
+//! # The metadata cache is a shared on-disk contract, and `cyrup-mcp` is its writer
+//!
+//! `<agent_dir>/mcp-cache.json` has exactly two participants: `cyrup_mcp::dirs` writes it, this
+//! module reads it. Three things they must agree on byte-for-byte live in the writer:
+//! `cyrup_mcp::dirs::server_identity_pre_image` (the 14-key `configHash` pre-image),
+//! `cyrup_mcp::dirs::stable_stringify` (the token grammar that pre-image is rendered in) and
+//! `cyrup_mcp::registration::{server_prefix, format_tool_name}` (the name a direct tool is actually
+//! registered under). The writer was retargeted at upstream v2.26.1 and this reader was not, so the
+//! two disagreed **silently**: every cached entry failed hash validation (so `mcp:` selectors
+//! resolved to nothing) and every resource-backed tool resolved to a name the adapter never
+//! registers. This module now mirrors all three:
+//!
+//! * MCP-141 — the identity pre-image is the same **14** keys, in the same *resolved* forms, as
+//!   `server_identity_pre_image` (upstream `computeServerHash`, `metadata-cache.ts:82` @ v2.26.1).
+//! * MCP-142 — `stable_stringify` renders an **absent** field as the bare nine-character token
+//!   `undefined` (`metadata-cache.ts:344`), which is why `HashValue` exists instead of
+//!   `serde_json::Value`.
+//! * MCP-146 — a resource-backed tool is `read_<name>`, never `get_<name>`
+//!   (`tool-metadata.ts:46` and `:119`).
+//! * MCP-370 — `ToolPrefix` carries upstream's **four** modes and the server prefix goes through
+//!   `sanitizeServerPrefix` (`types.ts:667`/`:675`), which **preserves hyphens**.
+//!
+//! ## What this module is NOT byte-identical to, stated exactly
+//!
+//! Three separate divergences survive this change. Two are filed and deliberately out of scope:
+//! `interpolate_env_vars` is missing upstream's third `{env:NAME}` pattern (MCP-143), and the
+//! `!`/`!!` secret grammar is not applied to hashed values (MCP-144).
+//!
+//! **The third is wider than the other two and is NOT a property of this file.** This reader
+//! RESOLVES the six resolvable identity fields, exactly as upstream does — `env` and `headers`
+//! through `interpolate_env_record`, `cwd` through `resolve_config_path` (which expands a leading
+//! `~`), `url` through `resolve_server_url`, `bearerToken` through `resolve_bearer_token` (which
+//! falls back to the *value* of `bearerTokenEnv`). The writer's two production call sites
+//! (`cyrup_mcp::ui` :1758/:5050) still pass `ResolvedIdentity::verbatim`, which resolves NOTHING —
+//! its own `TODO(MCP-082, MCP-084)` says so. So the two sides agree only for a definition whose
+//! `env`/`headers`/`url`/`cwd`/`requestHeadersCommand` contain no `${VAR}` and no `$env:VAR`, whose
+//! `cwd` has no leading `~`, and which does not rely on `bearerTokenEnv` to supply `bearerToken`.
+//! For anything else the reader is upstream-correct and the WRITER is the lagging side; the fix
+//! belongs in MCP-082/MCP-084, not here, and hashing raw here to match `verbatim` would be
+//! deliberately un-upstreaming the one side that is currently right.
+//!
+//! **And neither side matches upstream on `socket`.** `computeServerHash` builds a **15**-key
+//! identity whose third key is `socket: resolveConfigPath(definition.socket)`
+//! (`metadata-cache.ts:89`), and upstream's `stableStringify` walks `Object.keys()`, so an absent
+//! `socket` is still emitted as `"socket":undefined` rather than dropped. `ServerEntry` has no
+//! `socket` field at all post-Cut-3, and both Rust pre-images omit the key entirely — a deliberate,
+//! documented choice on the writer (`cyrup_mcp::dirs` golden vectors say "with `socket` unset"),
+//! but one that contradicts 13c-mcp-servers.md:1753 ("Keep `socket` … in the pre-image despite Cut
+//! 3") and puts every cyrup digest one key away from pi's. Measured, not inferred: see
+//! `the_socket_key_is_the_one_divergence_from_upstreams_own_digest` below, which pins both digests.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -40,12 +91,22 @@ const CACHE_MAX_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
 /// formatted MCP name colliding with one of these is dropped rather than emitted.
 const BUILTIN_TOOL_NAMES: [&str; 8] = ["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"];
 
-/// The server-name → tool-name prefixing mode (pi `ToolPrefix = "server" | "none" | "short"`).
+/// The server-name → tool-name prefixing mode — upstream `types.ts:460`
+/// `ToolPrefix = "server" | "none" | "short" | "mcp"`, and the twin of
+/// `cyrup_mcp::config::ToolPrefix`.
+///
+/// **MCP-370.** This enum had three variants: `"mcp"` — upstream's fourth mode, which names a tool
+/// `mcp__<server>_<tool>` — was folded into [`ToolPrefix::Server`] by `get_tool_prefix`'s catch-all
+/// arm. A user who set `settings.toolPrefix: "mcp"` therefore got `<server>_<tool>` out of this
+/// resolver while `cyrup_mcp::registration::server_prefix` registered `mcp__<server>_<tool>`, and
+/// this file was the only `ToolPrefix` in the tree, so upstream's fourth mode had no representation
+/// in cyrup at all.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ToolPrefix {
     Server,
     None,
     Short,
+    Mcp,
 }
 
 /// The adapter/host families whose native MCP config a pi `imports` array can pull servers from
@@ -104,6 +165,32 @@ impl ImportKind {
     }
 }
 
+/// The `requestHeadersCommand` block of a server definition (upstream `types.ts:383`, v2.26.0),
+/// mirroring `cyrup_mcp::config::HttpRequestHeadersCommand`. Modeled here **only** because it is the
+/// fourteenth key of the config-identity pre-image (MCP-141) — this resolver never runs it, and the
+/// engine that does lives in `cyrup_mcp::request_headers_command`.
+///
+/// Every field is optional for the same reason the adapter's copy makes them optional: upstream's
+/// `command: string` is a TypeScript type, not a check, and the non-empty-command diagnostic is
+/// raised at connect time. `timeoutMs` is `f64` because it arrived from `JSON.parse` and must render
+/// through the JS number grammar (`2500`, never `2500.0`).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct RequestHeadersCommand {
+    /// The executable, `interpolateEnvVars`'d into the pre-image.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Arguments, each `interpolateEnvVars`'d into the pre-image.
+    #[serde(default)]
+    pub args: Option<Vec<String>>,
+    /// Environment overrides. Raw JSON like [`ServerEntry::env`], because `computeServerHash` runs
+    /// it through the same `interpolateEnvRecord` (`metadata-cache.ts:94-101`).
+    #[serde(default)]
+    pub env: Option<BTreeMap<String, Value>>,
+    /// Per-invocation timeout in milliseconds.
+    #[serde(default, rename = "timeoutMs")]
+    pub timeout_ms: Option<f64>,
+}
+
 /// One MCP server definition as read from an `mcp.json` (pi `ServerEntry`). Only the fields that
 /// participate in resolution and the config-identity hash are modeled; every other key (e.g.
 /// `directTools`, adapter-private fields) is ignored on deserialize. Public so this crate's tests
@@ -125,15 +212,31 @@ pub struct ServerEntry {
     pub url: Option<String>,
     #[serde(default)]
     pub headers: Option<BTreeMap<String, Value>>,
+    /// Per-request header-signing command (upstream v2.26.0). Hashed, never executed here — see
+    /// [`RequestHeadersCommand`]. The fourteenth identity key (MCP-141).
+    #[serde(default, rename = "requestHeadersCommand")]
+    pub request_headers_command: Option<RequestHeadersCommand>,
     /// `"oauth" | "bearer" | false` in pi — held raw and folded verbatim into the identity hash.
     #[serde(default)]
     pub auth: Option<Value>,
+    /// `"legacy" | "auto" | "2026-07-28"` in pi — held raw and folded verbatim into the identity
+    /// hash, exactly as [`Self::auth`] is. Part of the config identity (MCP-141) because pinning a
+    /// protocol revision changes what the server advertises; not otherwise used by this resolver.
+    #[serde(default, rename = "protocolVersion")]
+    pub protocol_version: Option<Value>,
     #[serde(default, rename = "bearerToken")]
     pub bearer_token: Option<String>,
     #[serde(default, rename = "bearerTokenEnv")]
     pub bearer_token_env: Option<String>,
     #[serde(default, rename = "exposeResources")]
     pub expose_resources: Option<bool>,
+    /// The glob-or-exact allowlist upstream applies **before** [`Self::exclude_tools`]. Part of the
+    /// config identity (MCP-141): editing it changes which tools the adapter registers, so it must
+    /// evict the cache. It is deliberately **not** applied by this resolver's own filtering yet —
+    /// that, and upstream's 18-expression `getToolNameCandidates` with its glob matching, are the
+    /// remaining half of MCP-370 (`isToolAllowed`, `types.ts`).
+    #[serde(default, rename = "includeTools")]
+    pub include_tools: Option<Vec<String>>,
     #[serde(default, rename = "excludeTools")]
     pub exclude_tools: Option<Vec<String>>,
 }
@@ -463,7 +566,14 @@ fn resolve_direct_tool_names(
                 continue;
             };
             let _ = uri; // presence-checked above, exactly as pi requires a non-empty uri
-            let base_name = format!("get_{}", resource_name_to_tool_name(name));
+            // `read_`, not `get_` (MCP-146). Upstream builds
+            // `` `read_${resourceNameToToolName(resource.name)}` `` at BOTH resource sites of
+            // `tool-metadata.ts` (`:46` in the collision-candidate scan, `:119` in the emission
+            // loop), and `cyrup_mcp::registration` registers exactly that name. A `get_`-prefixed
+            // name matches no registered tool and no `excludeTools` entry a user would ever write —
+            // and supporting both is not an option, because the child's `--tools` allowlist is an
+            // exact string match and two names would then denote one tool.
+            let base_name = format!("read_{}", resource_name_to_tool_name(name));
             if !whole_server && !tool_filter.map(|f| f.contains(&base_name)).unwrap_or(false) {
                 continue;
             }
@@ -523,59 +633,87 @@ fn is_server_cache_valid(entry: &ServerCacheEntry, definition: &ServerEntry) -> 
     now_ms().saturating_sub(cached_at) <= CACHE_MAX_AGE_MS
 }
 
-/// Compute the stable config-identity hash for a server definition (pi `computeMcpServerHash`):
-/// a SHA-256 over the sorted-key JSON of the resolution-relevant fields (with env/headers/cwd/
-/// bearer-token interpolated against the process environment, exactly as pi does). Exported so a
-/// cache writer (and this crate's tests) stamp the same `configHash` the resolver validates.
+/// The config-identity **pre-image** for a server definition — the exact byte sequence
+/// [`compute_mcp_server_hash`] digests, and the shared contract with the cache writer's
+/// `cyrup_mcp::dirs::server_identity_pre_image` (upstream `computeServerHash`,
+/// `metadata-cache.ts:82` @ v2.26.1).
+///
+/// # Fourteen keys, and the list is the specification (MCP-141)
+///
+/// This function built **eleven**: `protocolVersion`, `includeTools` and `requestHeadersCommand`
+/// were missing, so editing any of them left a stale tool list looking valid — and, far worse, the
+/// eleven-key pre-image is one the writer never produces, so no `cyrup-mcp`-written cache entry
+/// could validate here at all.
+///
+/// Upstream builds **fifteen**: its first key is `socket: resolveConfigPath(definition.socket)`.
+/// `socket` is Cut 3 in this tree — `cyrup_mcp::config::ServerEntry` has no such field, the raw
+/// framed unix-socket transport does not exist here, and a config that could carry it cannot be
+/// written — so both sides omit it. That is a recorded divergence from pi's digests, not an
+/// oversight. (13c's MCP-141 text says to keep `socket` in the pre-image "despite Cut 3"; the
+/// writer that actually shipped does not, and a reader that disagreed with the in-tree writer in
+/// order to agree with a field neither crate can express would break the only contract that exists
+/// here. The consequence is that a cache written by pi itself is not hash-compatible with cyrup's,
+/// which costs one cold start.)
+///
+/// # Five of the fourteen are hashed in their *resolved* form
+///
+/// `env` and `headers` (`interpolateEnvRecord`), `cwd` (`resolveConfigPath`), `url`
+/// (`resolveServerUrl` — MCP-141's fourth gap: this took `definition.url` **raw**) and `bearerToken`
+/// (`resolveBearerToken`). The digest has to change when `$API_HOST` changes even though the config
+/// text did not; that is the entire point of hashing the resolved form.
+///
+/// Returned separately from the digest for the reason the writer returns it separately: a hash
+/// mismatch tells you nothing about *which* field disagreed, and the conformance tests below assert
+/// the bytes.
 #[must_use]
-pub fn compute_mcp_server_hash(definition: &ServerEntry) -> String {
+pub fn server_identity_pre_image(definition: &ServerEntry) -> String {
     let home = home_dir();
     let env = |name: &str| std::env::var(name).ok();
-    let mut identity = serde_json::Map::new();
-    identity.insert("command".to_string(), opt_str_value(definition.command.as_deref()));
-    identity.insert(
-        "args".to_string(),
-        definition
-            .args
-            .as_ref()
-            .map(|a| Value::Array(a.iter().map(|s| Value::String(s.clone())).collect()))
-            .unwrap_or(Value::Null),
-    );
-    identity.insert("env".to_string(), interpolate_env_record(definition.env.as_ref(), &env));
-    identity.insert(
-        "cwd".to_string(),
-        opt_str_value(resolve_config_path(definition.cwd.as_deref(), &home, &env).as_deref()),
-    );
-    identity.insert("url".to_string(), opt_str_value(definition.url.as_deref()));
-    identity.insert(
-        "headers".to_string(),
-        interpolate_env_record(definition.headers.as_ref(), &env),
-    );
-    identity.insert("auth".to_string(), definition.auth.clone().unwrap_or(Value::Null));
-    identity.insert(
-        "bearerToken".to_string(),
-        opt_str_value(resolve_bearer_token(definition, &env).as_deref()),
-    );
-    identity.insert(
-        "bearerTokenEnv".to_string(),
-        opt_str_value(definition.bearer_token_env.as_deref()),
-    );
-    identity.insert(
-        "exposeResources".to_string(),
-        definition.expose_resources.map(Value::Bool).unwrap_or(Value::Null),
-    );
-    identity.insert(
-        "excludeTools".to_string(),
-        definition
-            .exclude_tools
-            .as_ref()
-            .map(|a| Value::Array(a.iter().map(|s| Value::String(s.clone())).collect()))
-            .unwrap_or(Value::Null),
-    );
+    let identity = HashValue::Object(vec![
+        ("command".to_string(), opt_string(definition.command.as_deref())),
+        ("args".to_string(), opt_string_list(definition.args.as_ref())),
+        ("env".to_string(), interpolate_env_record(definition.env.as_ref(), &env)),
+        (
+            "cwd".to_string(),
+            opt_string(resolve_config_path(definition.cwd.as_deref(), &home, &env).as_deref()),
+        ),
+        (
+            "url".to_string(),
+            opt_string(resolve_server_url(definition.url.as_deref(), &env).as_deref()),
+        ),
+        ("headers".to_string(), interpolate_env_record(definition.headers.as_ref(), &env)),
+        (
+            "requestHeadersCommand".to_string(),
+            request_headers_command_value(definition.request_headers_command.as_ref(), &env),
+        ),
+        ("auth".to_string(), HashValue::from_optional_json(definition.auth.clone())),
+        (
+            "protocolVersion".to_string(),
+            HashValue::from_optional_json(definition.protocol_version.clone()),
+        ),
+        (
+            "bearerToken".to_string(),
+            opt_string(resolve_bearer_token(definition, &env).as_deref()),
+        ),
+        ("bearerTokenEnv".to_string(), opt_string(definition.bearer_token_env.as_deref())),
+        (
+            "exposeResources".to_string(),
+            definition.expose_resources.map_or(HashValue::Undefined, HashValue::Bool),
+        ),
+        ("includeTools".to_string(), opt_string_list(definition.include_tools.as_ref())),
+        ("excludeTools".to_string(), opt_string_list(definition.exclude_tools.as_ref())),
+    ]);
+    stable_stringify(&identity)
+}
 
-    let serialized = stable_stringify(&Value::Object(identity));
+/// Compute the stable config-identity hash for a server definition (pi `computeMcpServerHash`, and
+/// the twin of `cyrup_mcp::dirs::compute_server_hash`): SHA-256 over
+/// [`server_identity_pre_image`], hex-encoded. Exported so a cache writer (and this crate's tests)
+/// stamp the SAME `configHash` the resolver validates.
+#[must_use]
+pub fn compute_mcp_server_hash(definition: &ServerEntry) -> String {
     let mut hasher = Sha256::new();
-    hasher.update(serialized.as_bytes());
+    hasher.update(server_identity_pre_image(definition).as_bytes());
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
@@ -584,30 +722,134 @@ pub fn compute_mcp_server_hash(definition: &ServerEntry) -> String {
     hex
 }
 
-fn opt_str_value(value: Option<&str>) -> Value {
-    value.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null)
+/// `undefined` for an absent field, a JSON string otherwise (`cyrup_mcp::dirs::opt_string`).
+fn opt_string(value: Option<&str>) -> HashValue {
+    value.map_or(HashValue::Undefined, |s| HashValue::String(s.to_string()))
 }
 
+/// `undefined` for absent, an array of JSON strings otherwise. An **empty** array is not absent:
+/// `excludeTools: []` hashes differently from an omitted `excludeTools`.
+fn opt_string_list(value: Option<&Vec<String>>) -> HashValue {
+    value.map_or(HashValue::Undefined, |items| {
+        HashValue::Array(items.iter().map(|s| HashValue::String(s.clone())).collect())
+    })
+}
+
+/// The fourteenth identity key (`metadata-cache.ts:94-101`): `undefined` when the field is absent,
+/// otherwise the four-key nested object with `command`, every `args` element and every `env` value
+/// interpolated and `timeoutMs` copied through. Interpolated for the same reason `headers` is — the
+/// digest must change when `$MCP_SIGNER_ACTOR` changes even though the config text did not, which is
+/// what upstream's `"hashes the effective per-request header command"` test asserts
+/// (`__tests__/direct-tools.test.ts:357-379`).
+///
+/// Note the nested object is emitted **whole** whenever the field is present: each absent member
+/// renders as `undefined` inside it, and [`stable_stringify`] sorts its four keys just as it sorts
+/// the outer ones.
+fn request_headers_command_value(
+    value: Option<&RequestHeadersCommand>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> HashValue {
+    let Some(command) = value else {
+        return HashValue::Undefined;
+    };
+    HashValue::Object(vec![
+        (
+            "command".to_string(),
+            command
+                .command
+                .as_deref()
+                .map_or(HashValue::Undefined, |c| HashValue::String(interpolate_env_vars(c, env))),
+        ),
+        (
+            "args".to_string(),
+            command.args.as_ref().map_or(HashValue::Undefined, |args| {
+                HashValue::Array(
+                    args.iter().map(|a| HashValue::String(interpolate_env_vars(a, env))).collect(),
+                )
+            }),
+        ),
+        ("env".to_string(), interpolate_env_record(command.env.as_ref(), env)),
+        (
+            "timeoutMs".to_string(),
+            command.timeout_ms.map_or(HashValue::Undefined, HashValue::Number),
+        ),
+    ])
+}
+
+/// The value half of `resolveServerUrl` (`utils.ts:167`): an absent `url` stays absent, otherwise
+/// the URL is interpolated and the **resolved** string is what the digest covers (MCP-141, which
+/// this took raw).
+///
+/// Upstream also *throws* here — on a missing environment variable, or a URL that no longer parses
+/// after interpolation — and `isServerCacheValid` catches that throw into `false`. That arm is
+/// MCP-145 and is deliberately not ported: this function has no error channel, and it needs none to
+/// be safe, because a definition whose hash the *writer* cannot compute never gets a cache entry
+/// written for it, so the worst this reader can do is compute a digest that matches nothing and skip
+/// the server — which is the same outcome the throw produces.
+fn resolve_server_url(url: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
+    Some(interpolate_env_vars(url?, env))
+}
+
+/// `settings.toolPrefix` → the prefixing mode. Upstream's `validateConfig` never validates this key
+/// (it is a bare cast), so an unrecognised value falls through to the `"server"` default exactly as
+/// `getServerPrefix`'s final `return` does — but `"mcp"` is a real mode (`types.ts:460`), and
+/// folding it into [`ToolPrefix::Server`] renamed every tool of a `toolPrefix: "mcp"` config
+/// (MCP-370).
 fn get_tool_prefix(value: Option<&str>) -> ToolPrefix {
     match value {
         Some("none") => ToolPrefix::None,
         Some("short") => ToolPrefix::Short,
+        Some("mcp") => ToolPrefix::Mcp,
         _ => ToolPrefix::Server,
     }
 }
 
+/// Port of `sanitizeServerPrefix` (`types.ts:667`) at its default `preserveProviderValid = true` —
+/// the twin of `cyrup_mcp::registration::sanitize_server_prefix(name, true)`. `[A-Za-z0-9_-]`
+/// survives verbatim; every other code point becomes `_<lowercase hex code point>_`. Iteration is by
+/// `char` because upstream's is by `Array.from`, i.e. by code point.
+///
+/// **MCP-370.** This module folded `-` into `_` instead, so `chrome-devtools` produced the prefix
+/// `chrome_devtools` while `cyrup_mcp::registration` registers `chrome-devtools`: every `mcp:`
+/// selector naming a hyphenated server (which is most of them) expanded to names the child's tool
+/// registry never had, and the subagent silently started with no MCP tools at all. Folding also
+/// **collides** two distinct servers (`a-b` and `a_b`) onto one prefix, which the escape form does
+/// not.
+///
+/// The legacy grammar (`preserve_provider_valid = false`, `github_2d_mcp`) is not ported: upstream
+/// uses it only to build the alias candidates of `getToolNameCandidates`, which this module does not
+/// implement — see [`is_tool_excluded`].
+fn sanitize_server_prefix(server_name: &str) -> String {
+    let mut out = String::with_capacity(server_name.len());
+    for ch in server_name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+            out.push(ch);
+        } else {
+            out.push('_');
+            out.push_str(&format!("{:x}", ch as u32));
+            out.push('_');
+        }
+    }
+    out
+}
+
+/// Port of `getServerPrefix` (`types.ts:675`), and the twin of
+/// `cyrup_mcp::registration::server_prefix`.
 fn get_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
     match mode {
         ToolPrefix::None => String::new(),
         ToolPrefix::Short => {
-            let short = strip_mcp_suffix(server_name).replace('-', "_");
+            let short = sanitize_server_prefix(strip_mcp_suffix(server_name));
             if short.is_empty() {
                 "mcp".to_string()
             } else {
                 short
             }
         }
-        ToolPrefix::Server => server_name.replace('-', "_"),
+        // `mcp__<server>_<tool>` — one underscore between server and tool. The double-underscore
+        // form belongs to prompt slash commands (`formatPromptCommandName`), not to tool names.
+        ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix(server_name)),
+        ToolPrefix::Server => sanitize_server_prefix(server_name),
     }
 }
 
@@ -624,12 +866,21 @@ fn strip_mcp_suffix(server_name: &str) -> &str {
     }
 }
 
+/// Port of `formatToolName` (`types.ts:692`), and the twin of
+/// `cyrup_mcp::registration::format_tool_name`: the server prefix, an underscore, and the tool name
+/// with **dots** replaced by underscores.
+///
+/// Dots only — a hyphen inside the *tool* name survives, which is exactly why upstream's legacy
+/// candidate set exists. This module dropped the `.` → `_` substitution along with the server-prefix
+/// grammar (MCP-370): a server-side tool named `fs.read` resolved to `<server>_fs.read` here while
+/// the adapter registers `<server>_fs_read`.
 fn format_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> String {
     let server_prefix = get_server_prefix(server_name, prefix);
+    let sanitized = tool_name.replace('.', "_");
     if server_prefix.is_empty() {
-        tool_name.to_string()
+        sanitized
     } else {
-        format!("{server_prefix}_{tool_name}")
+        format!("{server_prefix}_{sanitized}")
     }
 }
 
@@ -642,11 +893,17 @@ fn is_tool_excluded(
     let Some(exclude_tools) = exclude_tools.filter(|e| !e.is_empty()) else {
         return false;
     };
+    // `getToolNameCandidates` (`types.ts:775`) builds the bare name plus one formatted name per
+    // mode; [`ToolPrefix::Mcp`] joins the list here because MCP-370 gave this module upstream's
+    // fourth mode. Upstream's other 13 expressions — the legacy `-`-folding grammar and its
+    // aliases — stay unported, as does `isToolAllowed`'s glob matching and `includeTools`; that is
+    // the remaining half of MCP-370 and is not widened here.
     let candidates: HashSet<String> = [
         normalize_tool_name(tool_name),
         normalize_tool_name(&format_tool_name(tool_name, server_name, prefix)),
         normalize_tool_name(&format_tool_name(tool_name, server_name, ToolPrefix::Server)),
         normalize_tool_name(&format_tool_name(tool_name, server_name, ToolPrefix::Short)),
+        normalize_tool_name(&format_tool_name(tool_name, server_name, ToolPrefix::Mcp)),
     ]
     .into_iter()
     .collect();
@@ -692,21 +949,27 @@ fn resource_name_to_tool_name(name: &str) -> String {
 }
 
 /// Interpolate a `Record<string, unknown>`, keeping only string-typed values and expanding env
-/// references in each (pi `interpolateEnvRecord`). Absent/empty maps yield JSON `null`.
+/// references in each (pi `interpolateEnvRecord`, `utils.ts:107`). An **absent** map is `undefined`
+/// (MCP-142), never `null`; a present map is an object, even when every value was dropped.
+///
+/// [`BTreeMap`] iterates in key order, which is the order [`stable_stringify`] would impose anyway.
 fn interpolate_env_record(
     values: Option<&BTreeMap<String, Value>>,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Value {
+) -> HashValue {
     let Some(values) = values else {
-        return Value::Null;
+        return HashValue::Undefined;
     };
-    let mut resolved = serde_json::Map::new();
-    for (key, value) in values {
-        if let Some(text) = value.as_str() {
-            resolved.insert(key.clone(), Value::String(interpolate_env_vars(text, env)));
-        }
-    }
-    Value::Object(resolved)
+    HashValue::Object(
+        values
+            .iter()
+            .filter_map(|(key, value)| {
+                value
+                    .as_str()
+                    .map(|text| (key.clone(), HashValue::String(interpolate_env_vars(text, env))))
+            })
+            .collect(),
+    )
 }
 
 /// Expand `${NAME}` then `$env:NAME` references against `env` (pi `interpolateEnvVars`). An absent
@@ -790,33 +1053,119 @@ fn resolve_bearer_token(
     definition.bearer_token_env.as_deref().and_then(env)
 }
 
-/// Stable, key-sorted JSON stringification (pi `stableStringify`) — the pre-image the config hash
-/// is taken over. Deterministic across runs (object keys sorted), so a cache writer and this
-/// resolver agree on `configHash`.
-fn stable_stringify(value: &Value) -> String {
+/// One node of the config-identity pre-image (`metadata-cache.ts:344`'s input), mirroring
+/// `cyrup_mcp::dirs::HashValue` variant for variant.
+///
+/// This is deliberately **not** `serde_json::Value` and must not become it (MCP-142): JS
+/// distinguishes an **absent** property from one explicitly set to `null`, `stableStringify` renders
+/// the first as the bare token `undefined` and the second as `null`, and the digest differs.
+/// Collapsing absence onto `Value::Null` — which is what this module's `opt_str_value`, its
+/// `interpolate_env_record` absent arm and its four `.unwrap_or(Value::Null)` arms did — made every
+/// absent key of every server hash as `null`, so nothing the writer stamps could ever match.
+#[derive(Clone, Debug, PartialEq)]
+enum HashValue {
+    /// JS `undefined` — an absent property. Renders as the nine characters `undefined`.
+    Undefined,
+    /// JS `null` — a property explicitly set to null. Renders as `null`.
+    ///
+    /// Unreachable from a top-level identity field, and that is not an accident to be fixed here:
+    /// `Option<Value>` maps a JSON `null` onto `None`, so `"auth": null` arrives as
+    /// [`HashValue::Undefined`] — exactly as it does in `cyrup-mcp`, whose `lenient` reader cannot
+    /// preserve explicit-null-vs-absent either. It *is* reachable inside a raw `auth` /
+    /// `protocolVersion` value (`"auth": [null]`), and it keeps the token grammar total.
+    Null,
+    /// A boolean.
+    Bool(bool),
+    /// A number. `f64` is the faithful model: every number in the pre-image arrived through
+    /// `JSON.parse`, which produces IEEE-754 doubles, and Rust's `f64` `Display` is the same
+    /// shortest-round-trip form `String(n)` produces — so `timeoutMs: 2500` renders `2500`, where
+    /// routing it through `serde_json::Number` would have produced `2500.0`.
+    Number(f64),
+    /// A string, rendered through `JSON.stringify`'s escaping.
+    String(String),
+    /// An array. Elements keep their order and an `Undefined` element stays `undefined` — JS
+    /// `JSON.stringify` would have written `null` there, which is one more reason this cannot be
+    /// routed through a JSON serialiser.
+    Array(Vec<HashValue>),
+    /// An object. Keys are sorted at render time, never here.
+    Object(Vec<(String, HashValue)>),
+}
+
+impl HashValue {
+    /// Lift a `serde_json::Value` — every variant maps across, and `Value::Null` becomes
+    /// [`HashValue::Null`], **not** [`HashValue::Undefined`].
+    fn from_json(value: Value) -> HashValue {
+        match value {
+            Value::Null => HashValue::Null,
+            Value::Bool(b) => HashValue::Bool(b),
+            Value::Number(n) => n.as_f64().map_or(HashValue::Null, HashValue::Number),
+            Value::String(s) => HashValue::String(s),
+            Value::Array(items) => {
+                HashValue::Array(items.into_iter().map(HashValue::from_json).collect())
+            }
+            Value::Object(map) => HashValue::Object(
+                map.into_iter().map(|(k, v)| (k, HashValue::from_json(v))).collect(),
+            ),
+        }
+    }
+
+    /// `undefined` for `None`, [`from_json`](Self::from_json) for `Some` — the shape every optional
+    /// identity field takes.
+    fn from_optional_json(value: Option<Value>) -> HashValue {
+        value.map_or(HashValue::Undefined, HashValue::from_json)
+    }
+}
+
+/// Stable, key-sorted stringification (pi `stableStringify`, `metadata-cache.ts:344`) — the
+/// pre-image the config hash is taken over, and the byte-for-byte twin of
+/// `cyrup_mcp::dirs::stable_stringify`.
+///
+/// Deliberately **not valid JSON**. Upstream's scalar branch is
+/// `const serialized = JSON.stringify(value); return serialized === undefined ? "undefined" : serialized;`
+/// and `JSON.stringify(undefined)` returns the JS value `undefined`, so an absent property renders
+/// as the literal nine-character token `undefined` (MCP-142) and only an explicit JSON null renders
+/// as `null`. Object keys are sorted (`Object.keys(obj).sort()`); arrays keep their order. Strings
+/// go through `serde_json`, whose escaping matches `JSON.stringify` byte for byte for every `str`.
+///
+/// The key sort is byte-wise UTF-8 where JS sorts by UTF-16 code unit. The two agree on every ASCII
+/// key — which is every key of the identity object — and can differ only between a `U+E000..U+FFFF`
+/// key and an astral-plane one inside a user's `env` or `headers` map.
+fn stable_stringify(value: &HashValue) -> String {
     match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(b) => b.to_string(),
-        Value::Number(n) => n.to_string(),
-        Value::String(_) => serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string()),
-        Value::Array(arr) => {
-            let parts: Vec<String> = arr.iter().map(stable_stringify).collect();
+        HashValue::Undefined => "undefined".to_string(),
+        HashValue::Null => "null".to_string(),
+        HashValue::Bool(true) => "true".to_string(),
+        HashValue::Bool(false) => "false".to_string(),
+        HashValue::Number(n) => {
+            // `JSON.stringify(NaN) === "null"`, and likewise for ±Infinity.
+            if n.is_finite() {
+                format!("{n}")
+            } else {
+                "null".to_string()
+            }
+        }
+        HashValue::String(s) => json_quote(s),
+        HashValue::Array(items) => {
+            let parts: Vec<String> = items.iter().map(stable_stringify).collect();
             format!("[{}]", parts.join(","))
         }
-        Value::Object(map) => {
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            let parts: Vec<String> = keys
+        HashValue::Object(entries) => {
+            let mut sorted: Vec<&(String, HashValue)> = entries.iter().collect();
+            sorted.sort_by(|a, b| a.0.cmp(&b.0));
+            let parts: Vec<String> = sorted
                 .into_iter()
-                .map(|key| {
-                    let key_json = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".to_string());
-                    let val_json = map.get(key).map(stable_stringify).unwrap_or_else(|| "null".to_string());
-                    format!("{key_json}:{val_json}")
-                })
+                .map(|(key, val)| format!("{}:{}", json_quote(key), stable_stringify(val)))
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
     }
+}
+
+/// `JSON.stringify(s)` for a string. Serialising a `&str` cannot fail; the fallback exists because
+/// this crate denies `unwrap`, and an empty string is the least surprising thing to hash if the
+/// impossible happens.
+fn json_quote(s: &str) -> String {
+    serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
 fn now_ms() -> i64 {
@@ -971,11 +1320,16 @@ mod tests {
             None,
             None,
         );
+        // `chrome-devtools_…`, NOT `chrome_devtools_…` (MCP-370). The old expectation encoded this
+        // module's `server_name.replace('-', "_")`, but `getServerPrefix` → `sanitizeServerPrefix`
+        // (`types.ts:667`/`:675`) keeps `-`, and `cyrup_mcp::registration::format_tool_name`
+        // registers the hyphenated name — so the name this test used to assert is one no tool
+        // registry in the tree ever holds.
         assert_eq!(
             resolve(&fixture, &["chrome-devtools"]),
             vec![
-                "chrome_devtools_take_screenshot".to_string(),
-                "chrome_devtools_click".to_string()
+                "chrome-devtools_take_screenshot".to_string(),
+                "chrome-devtools_click".to_string()
             ]
         );
     }
@@ -1003,10 +1357,18 @@ mod tests {
     #[test]
     fn matches_adapter_prefix_modes_for_direct_mcp_names() {
         // pi: "matches adapter prefix modes for direct MCP names".
+        //
+        // Two changes (MCP-370): `server` mode keeps the hyphen (the old `linear_mcp_list_issues`
+        // was this module's `-` → `_` folding, which the adapter does not do), and `mcp` — upstream's
+        // fourth mode, `types.ts:460` — is asserted at all for the first time. It used to fall
+        // through `get_tool_prefix`'s catch-all into `server`, so a `toolPrefix: "mcp"` config
+        // resolved to `linear-mcp_list_issues` while the adapter registered
+        // `mcp__linear-mcp_list_issues`.
         for (prefix, expected) in [
-            ("server", "linear_mcp_list_issues"),
+            ("server", "linear-mcp_list_issues"),
             ("short", "linear_list_issues"),
             ("none", "list_issues"),
+            ("mcp", "mcp__linear-mcp_list_issues"),
         ] {
             let fixture = make_fixture();
             write_mcp_fixture(
@@ -1037,11 +1399,20 @@ mod tests {
             None,
             None,
         );
+        // Both names changed, for two independent reasons:
+        //   * `browser-mcp_…` rather than `browser_mcp_…` — MCP-370, as above.
+        //   * `read_console_logs` rather than `get_console_logs` — MCP-146. `get_` appears **zero**
+        //     times in upstream's resource-tool naming; `tool-metadata.ts:46` and `:119` both build
+        //     `` `read_${resourceNameToToolName(resource.name)}` ``, and that is the name
+        //     `cyrup_mcp::registration` registers and that a user's `excludeTools` entry must match.
+        //     The old expectation asserted a name nothing in the tree produces or accepts.
+        // `excludeTools: ["browser_click"]` still suppresses `click`: it matches the `short`-mode
+        // candidate `browser_click` under `normalize_tool_name`.
         assert_eq!(
             resolve(&fixture, &["browser-mcp"]),
             vec![
-                "browser_mcp_navigate".to_string(),
-                "browser_mcp_get_console_logs".to_string()
+                "browser-mcp_navigate".to_string(),
+                "browser-mcp_read_console_logs".to_string()
             ]
         );
     }
@@ -1088,9 +1459,11 @@ mod tests {
             Some(fixture.project_dir.join(".mcp.json")),
             None,
         );
+        // `project-mcp_inspect` — MCP-370's hyphen rule again; the config-source resolution this
+        // test actually covers is unchanged.
         assert_eq!(
             resolve(&fixture, &["project-mcp"]),
-            vec!["project_mcp_inspect".to_string()]
+            vec!["project-mcp_inspect".to_string()]
         );
     }
 
@@ -1113,6 +1486,440 @@ mod tests {
         assert_eq!(strip_mcp_suffix("chrome-devtools"), "chrome-devtools");
         assert_eq!(get_server_prefix("linear-mcp", ToolPrefix::Short), "linear");
         assert_eq!(get_server_prefix("mcp", ToolPrefix::Short), "mcp");
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Conformance with the cache WRITER — MCP-141/142/146/370.
+    //
+    // `cyrup-mcp` is a DEV-dependency (see this crate's `Cargo.toml`): the two crates share an
+    // on-disk file, not a type, so only a test can hold them together. These assert against the
+    // writer's own functions rather than against constants copied out of its tests, except where a
+    // constant is the upstream-generated golden vector — that one is pinned on both sides so a
+    // change that "fixes" both implementations at once still fails.
+    // ---------------------------------------------------------------------------------------
+
+    use cyrup_mcp::config::{ServerEntry as WriterServerEntry, ToolPrefix as WriterToolPrefix};
+    use cyrup_mcp::dirs::{
+        ResolvedIdentity, compute_server_hash, server_identity_pre_image as writer_pre_image,
+    };
+
+    /// All fourteen identity fields set at once, hashed by BOTH implementations (MCP-141/142).
+    ///
+    /// Fails on the pre-committed code twice over: this module emitted **eleven** keys (no
+    /// `protocolVersion`, no `includeTools`, no `requestHeadersCommand`) and rendered every absent
+    /// field as `null` where the writer renders `undefined`. In production that meant
+    /// `is_server_cache_valid` rejected every entry `cyrup-mcp` writes, so every `mcp:` selector a
+    /// subagent declared resolved to nothing — with no error anywhere.
+    ///
+    /// The fixture carries no interpolation token and no `!` secret marker on purpose:
+    /// `ResolvedIdentity::verbatim` is the writer's placeholder until its own TODO(MCP-082,
+    /// MCP-084) lands the real resolvers, while this side already resolves. Where both resolve to
+    /// the input they agree today; MCP-143 (`{env:NAME}`) and MCP-144 (`!`/`!!`) are what remain
+    /// before they agree for every input.
+    #[test]
+    fn reader_and_writer_agree_on_the_fourteen_field_pre_image() {
+        const DEFINITION: &str = r#"{
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+            "env": { "NODE_ENV": "production", "API_TOKEN": "s3cret" },
+            "cwd": "/home/u/work",
+            "url": "https://api.example.com/mcp",
+            "headers": { "X-Api-Key": "k", "Accept": "application/json" },
+            "requestHeadersCommand": {
+                "command": "node",
+                "args": ["sign.mjs", "actor-one"],
+                "env": { "ACTOR": "actor-one" },
+                "timeoutMs": 2500
+            },
+            "auth": "bearer",
+            "protocolVersion": "2026-07-28",
+            "bearerToken": "tok",
+            "bearerTokenEnv": "TOK_ENV",
+            "exposeResources": false,
+            "includeTools": ["a", "b"],
+            "excludeTools": ["danger_*"],
+            "lifecycle": "eager",
+            "requestTimeoutMs": 30000,
+            "debug": true
+        }"#;
+        let reader: ServerEntry = serde_json::from_str(DEFINITION).expect("reader entry");
+        let writer: WriterServerEntry = serde_json::from_str(DEFINITION).expect("writer entry");
+        let resolved = ResolvedIdentity::verbatim(&writer);
+
+        let pre_image = server_identity_pre_image(&reader);
+        assert_eq!(pre_image, writer_pre_image(&writer, &resolved));
+        assert_eq!(compute_mcp_server_hash(&reader), compute_server_hash(&writer, &resolved));
+
+        // Fourteen keys, named — a count alone would not say which one went missing.
+        for key in [
+            "args",
+            "auth",
+            "bearerToken",
+            "bearerTokenEnv",
+            "command",
+            "cwd",
+            "env",
+            "excludeTools",
+            "exposeResources",
+            "headers",
+            "includeTools",
+            "protocolVersion",
+            "requestHeadersCommand",
+            "url",
+        ] {
+            assert!(pre_image.contains(&format!("\"{key}\":")), "missing {key} in {pre_image}");
+        }
+        // `timeoutMs` renders as a JS number: `2500`, never `2500.0`.
+        assert!(pre_image.contains(r#""timeoutMs":2500}"#), "{pre_image}");
+        // The three runtime-only keys are outside the identity, so editing them must NOT evict.
+        assert!(!pre_image.contains("lifecycle"), "{pre_image}");
+        assert!(!pre_image.contains("debug"), "{pre_image}");
+    }
+
+    /// The `socket` divergence, measured against upstream rather than argued about.
+    ///
+    /// `computeServerHash` (`metadata-cache.ts:86-109` @ v2.26.1) builds a **15**-key identity whose
+    /// third key is `socket: resolveConfigPath(definition.socket)`, and `stableStringify` walks
+    /// `Object.keys()` — which includes keys holding `undefined` — so upstream emits
+    /// `"socket":undefined` even for a definition that never mentions a socket. `ServerEntry` has no
+    /// `socket` field post-Cut-3 and neither Rust pre-image emits the key, so **every** cyrup digest
+    /// differs from pi's by exactly that one member.
+    ///
+    /// Both constants below were produced by running upstream's own `stableStringify` +
+    /// `computeServerHash` on node 22 against `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`),
+    /// using the same fixture as the vector above. The test exists so the divergence is a pinned,
+    /// visible fact rather than a comment: if someone lands `socket` (13c-mcp-servers.md:1753 asks
+    /// for it), this test fails and tells them the two digests just converged.
+    #[test]
+    fn the_socket_key_is_the_one_divergence_from_upstreams_own_digest() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                "env": { "NODE_ENV": "production", "API_TOKEN": "s3cret" },
+                "cwd": "/home/u/work",
+                "exposeResources": false,
+                "excludeTools": ["danger_*"],
+                "lifecycle": "eager",
+                "requestTimeoutMs": 30000,
+                "debug": true
+            }"#,
+        )
+        .expect("entry");
+
+        // What upstream actually emits for this fixture, verbatim from node 22.
+        const UPSTREAM_PRE_IMAGE: &str = concat!(
+            r#"{"args":["-y","@modelcontextprotocol/server-filesystem","/tmp"],"#,
+            r#""auth":undefined,"bearerToken":undefined,"bearerTokenEnv":undefined,"#,
+            r#""command":"npx","cwd":"/home/u/work","#,
+            r#""env":{"API_TOKEN":"s3cret","NODE_ENV":"production"},"#,
+            r#""excludeTools":["danger_*"],"exposeResources":false,"headers":undefined,"#,
+            r#""includeTools":undefined,"protocolVersion":undefined,"#,
+            r#""requestHeadersCommand":undefined,"socket":undefined,"url":undefined}"#
+        );
+        const UPSTREAM_DIGEST: &str =
+            "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4";
+
+        let ours = server_identity_pre_image(&entry);
+
+        // The difference is exactly one member, and it is `socket`.
+        assert_ne!(ours, UPSTREAM_PRE_IMAGE, "if these are equal, `socket` landed");
+        assert!(!ours.contains("\"socket\""), "we omit the key entirely: {ours}");
+        assert!(UPSTREAM_PRE_IMAGE.contains(r#""socket":undefined"#));
+        assert_eq!(
+            UPSTREAM_PRE_IMAGE.replace(r#""socket":undefined,"#, ""),
+            ours,
+            "removing upstream's `socket` member must yield our pre-image exactly — any other \
+             difference is a second, unrecorded divergence"
+        );
+        assert_ne!(compute_mcp_server_hash(&entry), UPSTREAM_DIGEST);
+    }
+
+    /// The cross-crate golden vector, asserted here and in
+    /// `cyrup_mcp::dirs::tests::golden_vector_stdio_server`.
+    ///
+    /// **Read the caveat before trusting the word "golden".** These constants are upstream's
+    /// `stableStringify` + `computeServerHash` run on node 22 **with the `socket` key removed from
+    /// the identity** — the deviation the writer's own vectors document and this one inherits. They
+    /// are therefore byte-compatible with *cyrup*, not with pi: upstream's real digest for this very
+    /// fixture is `2190558e…`, pinned in
+    /// `the_socket_key_is_the_one_divergence_from_upstreams_own_digest`. What this test proves is
+    /// that the two Rust implementations agree on *what* they hash; it does not prove either matches
+    /// upstream.
+    ///
+    /// The cross-crate test above proves the two implementations agree; this proves *what* they
+    /// agree on. Note what a plain stdio server's pre-image is mostly made of: nine `undefined`
+    /// tokens. That is the whole of MCP-142 in one string.
+    #[test]
+    fn pre_image_matches_the_upstream_generated_golden_vector() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                "env": { "NODE_ENV": "production", "API_TOKEN": "s3cret" },
+                "cwd": "/home/u/work",
+                "exposeResources": false,
+                "excludeTools": ["danger_*"],
+                "lifecycle": "eager",
+                "requestTimeoutMs": 30000,
+                "debug": true
+            }"#,
+        )
+        .expect("entry");
+        assert_eq!(
+            server_identity_pre_image(&entry),
+            concat!(
+                r#"{"args":["-y","@modelcontextprotocol/server-filesystem","/tmp"],"#,
+                r#""auth":undefined,"bearerToken":undefined,"bearerTokenEnv":undefined,"#,
+                r#""command":"npx","cwd":"/home/u/work","#,
+                r#""env":{"API_TOKEN":"s3cret","NODE_ENV":"production"},"#,
+                r#""excludeTools":["danger_*"],"exposeResources":false,"headers":undefined,"#,
+                r#""includeTools":undefined,"protocolVersion":undefined,"#,
+                r#""requestHeadersCommand":undefined,"url":undefined}"#
+            )
+        );
+        assert_eq!(
+            compute_mcp_server_hash(&entry),
+            "4dd46c1fd26680867fe6c5ffdde2ab0f0a35972cd9c211bf6dd68d1f304eb277"
+        );
+
+        // The HTTP half, which pins the two enum-valued keys and a non-empty `includeTools` next to
+        // an EMPTY `excludeTools` — `[]` is not absent, and hashing it as absent would let an edit
+        // that empties the list go unnoticed.
+        let http: ServerEntry = serde_json::from_str(
+            r#"{
+                "url": "https://api.example.com/mcp",
+                "headers": { "X-Api-Key": "k", "Accept": "application/json" },
+                "auth": "bearer",
+                "protocolVersion": "2026-07-28",
+                "bearerToken": "!tok",
+                "bearerTokenEnv": "TOK_ENV",
+                "exposeResources": true,
+                "includeTools": ["a", "b"],
+                "excludeTools": []
+            }"#,
+        )
+        .expect("http entry");
+        assert_eq!(
+            compute_mcp_server_hash(&http),
+            "572dcbaa24a3a82d42f90a86ebb8039227f999a1b14078b35dfa9f40cb872356"
+        );
+    }
+
+    /// MCP-142 pinned at the token level and at the digest level.
+    ///
+    /// `stable_stringify` mapped `Value::Null => "null"` and had no way to say `undefined` at all,
+    /// so the empty definition — fourteen absent fields — hashed as fourteen `null`s. This is the
+    /// case where the divergence is total: every single key disagreed with the writer.
+    #[test]
+    fn an_absent_field_is_undefined_and_an_explicit_null_is_null() {
+        assert_eq!(
+            stable_stringify(&HashValue::Object(vec![
+                ("b".to_string(), HashValue::Undefined),
+                ("a".to_string(), HashValue::Null),
+            ])),
+            "{\"a\":null,\"b\":undefined}"
+        );
+        // An `undefined` ELEMENT survives in an array, where `JSON.stringify` would write `null`.
+        assert_eq!(
+            stable_stringify(&HashValue::Array(vec![
+                HashValue::Number(1.0),
+                HashValue::Undefined,
+                HashValue::Null,
+            ])),
+            "[1,undefined,null]"
+        );
+
+        let empty = ServerEntry::default();
+        let pre_image = server_identity_pre_image(&empty);
+        assert!(!pre_image.contains("null"), "{pre_image}");
+        assert_eq!(pre_image.matches("undefined").count(), 14, "{pre_image}");
+        assert_eq!(
+            compute_mcp_server_hash(&empty),
+            "671c1578e5f4c763aac0deb77dc2a99f55688f80ed687a652e5259319937794e"
+        );
+        let writer_empty = WriterServerEntry::default();
+        assert_eq!(
+            compute_mcp_server_hash(&empty),
+            compute_server_hash(&writer_empty, &ResolvedIdentity::verbatim(&writer_empty))
+        );
+    }
+
+    /// The three keys MCP-141 added: editing any one of them must change the digest, or a config
+    /// edit leaves a stale tool list looking valid. Each of these three assertions failed before.
+    #[test]
+    fn the_three_added_identity_keys_evict_the_cache() {
+        let base: ServerEntry = serde_json::from_str(r#"{ "command": "x" }"#).expect("base");
+        for changed_json in [
+            r#"{ "command": "x", "protocolVersion": "auto" }"#,
+            r#"{ "command": "x", "includeTools": ["a"] }"#,
+            r#"{ "command": "x", "requestHeadersCommand": { "command": "sign" } }"#,
+        ] {
+            let changed: ServerEntry = serde_json::from_str(changed_json).expect("changed");
+            assert_ne!(
+                compute_mcp_server_hash(&base),
+                compute_mcp_server_hash(&changed),
+                "{changed_json}"
+            );
+            let writer_base: WriterServerEntry =
+                serde_json::from_str(r#"{ "command": "x" }"#).expect("writer base");
+            let writer_changed: WriterServerEntry =
+                serde_json::from_str(changed_json).expect("writer changed");
+            assert_eq!(
+                compute_mcp_server_hash(&changed),
+                compute_server_hash(&writer_changed, &ResolvedIdentity::verbatim(&writer_changed)),
+                "{changed_json}"
+            );
+            assert_eq!(
+                compute_mcp_server_hash(&base),
+                compute_server_hash(&writer_base, &ResolvedIdentity::verbatim(&writer_base))
+            );
+        }
+    }
+
+    /// `url` is hashed **resolved**, not as written (MCP-141's fourth gap) — the property that makes
+    /// the cache track an `$API_HOST` change. `CYRUP_HOME`/`HOME` is always set in this process, so
+    /// it is the one variable a hermetic test can rely on.
+    #[test]
+    fn the_url_is_hashed_after_interpolation() {
+        let literal: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://x.example/${HOME}/mcp" }"#).expect("literal");
+        let pre_image = server_identity_pre_image(&literal);
+        assert!(!pre_image.contains("${HOME}"), "{pre_image}");
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(pre_image.contains(&format!("https://x.example/{home}/mcp")), "{pre_image}");
+    }
+
+    /// MCP-370's shared table: the same `(server, tool, mode)` triples through this module's
+    /// formatter and through `cyrup_mcp::registration`'s — the one that actually names the
+    /// registered tool. Hyphens, a non-ASCII code point, a dotted tool name, the `-mcp` suffix, and
+    /// all four modes.
+    ///
+    /// Before this change three of the four modes produced the wrong name for any hyphenated server
+    /// and the fourth mode did not exist, so this table could not even be written.
+    #[test]
+    fn reader_and_writer_agree_on_every_prefix_mode() {
+        let modes = [
+            (ToolPrefix::Server, WriterToolPrefix::Server),
+            (ToolPrefix::None, WriterToolPrefix::None),
+            (ToolPrefix::Short, WriterToolPrefix::Short),
+            (ToolPrefix::Mcp, WriterToolPrefix::Mcp),
+        ];
+        for (server, tool) in [
+            ("chrome-devtools", "take_screenshot"),
+            ("linear-mcp", "list_issues"),
+            ("github", "search.repositories"),
+            ("naïve", "click"),
+            ("mcp", "ping"),
+        ] {
+            for (reader_mode, writer_mode) in modes {
+                assert_eq!(
+                    get_server_prefix(server, reader_mode),
+                    cyrup_mcp::registration::server_prefix(server, writer_mode),
+                    "prefix {server} / {reader_mode:?}"
+                );
+                assert_eq!(
+                    format_tool_name(tool, server, reader_mode),
+                    cyrup_mcp::registration::format_tool_name(tool, server, writer_mode),
+                    "name {server}/{tool} / {reader_mode:?}"
+                );
+            }
+        }
+        // Spelled out, so the table above cannot agree on something wrong in both crates.
+        assert_eq!(
+            format_tool_name("take_screenshot", "chrome-devtools", ToolPrefix::Server),
+            "chrome-devtools_take_screenshot"
+        );
+        assert_eq!(
+            format_tool_name("list_issues", "linear-mcp", ToolPrefix::Mcp),
+            "mcp__linear-mcp_list_issues"
+        );
+        // `sanitizeServerPrefix` hex-escapes what it cannot keep: `ï` is U+00EF.
+        assert_eq!(get_server_prefix("naïve", ToolPrefix::Server), "na_ef_ve");
+        // …and `formatToolName` folds dots in the TOOL name, hyphens survive.
+        assert_eq!(
+            format_tool_name("search.repositories", "github", ToolPrefix::Server),
+            "github_search_repositories"
+        );
+        assert_eq!(
+            format_tool_name("web-search", "github", ToolPrefix::Server),
+            "github_web-search"
+        );
+    }
+
+    /// The whole contract, end to end: `cyrup-mcp` writes `mcp-cache.json` — its own
+    /// `ServerCacheEntry`, its own `configHash` — and this resolver reads it.
+    ///
+    /// This is the production failure the four units describe. Before the change the entry was
+    /// rejected outright by `is_server_cache_valid` (the digests could not match), so the selector
+    /// expanded to nothing; and had it matched, the resource tool would have come out as
+    /// `browser_mcp_get_console_logs` — a name `cyrup_mcp::registration` never registers.
+    #[test]
+    fn a_cache_written_by_cyrup_mcp_resolves_through_this_reader() {
+        let fixture = make_fixture();
+        // `includeTools` participates in the digest (MCP-141); this resolver does not yet FILTER on
+        // it (the remaining half of MCP-370), which is why every cached tool below still appears.
+        let definition = serde_json::json!({
+            "command": "npx",
+            "args": ["browser-mcp"],
+            "protocolVersion": "auto",
+            "includeTools": ["click", "navigate"]
+        });
+        write_json(
+            &fixture.agent_dir.join("mcp.json"),
+            &serde_json::json!({ "mcpServers": { "browser-mcp": definition } }),
+        );
+
+        let writer_entry: WriterServerEntry =
+            serde_json::from_value(definition).expect("writer entry");
+        let mut cache = cyrup_mcp::dirs::MetadataCache::default();
+        cache.servers.insert(
+            "browser-mcp".to_string(),
+            cyrup_mcp::dirs::ServerCacheEntry {
+                config_hash: compute_server_hash(
+                    &writer_entry,
+                    &ResolvedIdentity::verbatim(&writer_entry),
+                ),
+                tools: vec![cyrup_mcp::dirs::CachedTool {
+                    name: "click".to_string(),
+                    ..cyrup_mcp::dirs::CachedTool::default()
+                }],
+                resources: vec![cyrup_mcp::dirs::CachedResource {
+                    uri: "resource://console".to_string(),
+                    name: "Console Logs".to_string(),
+                    ..cyrup_mcp::dirs::CachedResource::default()
+                }],
+                cached_at: now_ms(),
+                ..cyrup_mcp::dirs::ServerCacheEntry::default()
+            },
+        );
+        cyrup_mcp::dirs::save_metadata_cache(&fixture.agent_dir.join("mcp-cache.json"), &cache)
+            .expect("save cache");
+
+        let resolved = resolve(&fixture, &["browser-mcp"]);
+        assert_eq!(
+            resolved,
+            vec![
+                "browser-mcp_click".to_string(),
+                "browser-mcp_read_console_logs".to_string()
+            ]
+        );
+        // …and those are exactly the names the writer would register for the same metadata.
+        assert_eq!(
+            resolved,
+            vec![
+                cyrup_mcp::registration::format_tool_name(
+                    "click",
+                    "browser-mcp",
+                    WriterToolPrefix::Server
+                ),
+                cyrup_mcp::registration::format_tool_name(
+                    "read_console_logs",
+                    "browser-mcp",
+                    WriterToolPrefix::Server
+                ),
+            ]
+        );
     }
 
     #[test]

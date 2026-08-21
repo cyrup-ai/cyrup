@@ -1500,11 +1500,11 @@ enumerated in full above rather than inferred from this column.
 | `MCP-139` | high | M | `hand-written` | Metadata cache: path, schema, version, load and merge-save | `13c-mcp-servers.md` | **partial** |
 | `MCP-140` | high | M | `hand-written` | Metadata cache: serialisers and reconstructors | `13c-mcp-servers.md` | **partial** |
 | `MCP-141` | critical | M | `hand-written` | computeServerHash must hash all 14 fields; the in-tree reader hashes 11 | `13c-mcp-servers.md` | **partial** |
-| `MCP-142` | critical | S | `hand-written` | stableStringify emits the bare token `undefined`, not `null` | `13c-mcp-servers.md` | **partial** |
+| `MCP-142` | critical | S | `hand-written` | stableStringify emits the bare token `undefined`, not `null` | `13c-mcp-servers.md` | done |
 | `MCP-143` | high | S | `hand-written` | interpolateEnvVars is missing its third pattern {env:NAME} | `13c-mcp-servers.md` | **partial** |
 | `MCP-144` | high | S | `hand-written` | !/!! secret-expression semantics in hashed values | `13c-mcp-servers.md` | **partial** |
 | `MCP-145` | high | S | `hand-written` | isServerCacheValid including the throw-to-false rule | `13c-mcp-servers.md` | **partial** |
-| `MCP-146` | critical | S | `hand-written` | Resource tool naming: read_ upstream vs get_ in the in-tree reader | `13c-mcp-servers.md` | **partial** |
+| `MCP-146` | critical | S | `hand-written` | Resource tool naming: read_ upstream vs get_ in the in-tree reader | `13c-mcp-servers.md` | done |
 | `MCP-147` | medium | S | `hand-written` | Direct-tool selector parsing and the missing-server gate | `13c-mcp-servers.md` | done |
 | `MCP-148` | n/a | n/a | `rmcp` | The protocol layer is rmcp, client-only | `13c-mcp-servers.md` | done |
 | `MCP-149` | n/a | S | `hand-written` | Tracker: section 03 index and cross-section edges | `13c-mcp-servers.md` | n/a |

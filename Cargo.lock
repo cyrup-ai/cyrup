@@ -1383,6 +1383,7 @@ dependencies = [
  "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
+ "cyrup-mcp",
  "cyrup-provider",
  "cyrup-resources",
  "cyrup-session",
