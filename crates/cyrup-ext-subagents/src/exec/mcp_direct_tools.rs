@@ -1323,9 +1323,51 @@ fn resolve_config_path(
         return Some(home.to_string_lossy().into_owned());
     }
     if let Some(rest) = resolved.strip_prefix("~/").or_else(|| resolved.strip_prefix("~\\")) {
-        return Some(home.join(rest).to_string_lossy().into_owned());
+        return Some(node_path_join(home, rest).to_string_lossy().into_owned());
     }
     Some(resolved)
+}
+
+/// node's `path.join(base, rest)`, which is NOT `Path::join` — see the twin in
+/// `cyrup_mcp::dirs::node_path_join`, which this MUST stay byte-identical to.
+///
+/// Three differences, all of which change the digest: node never lets `rest` act absolute
+/// (`path.join("/home/u", "/x")` is `/home/u/x`, where `Path::join` yields `/x` and loses the home
+/// directory entirely — `"~//x"` strips to exactly that `rest`); node normalizes, collapsing
+/// repeated separators and folding `.`/`..` lexically; and node drops a trailing separator unless
+/// the result is the root.
+///
+/// This is duplicated rather than shared because `cyrup-mcp` is a `[dev-dependency]` of this crate,
+/// so production code here cannot call it. The cross-crate conformance tests hold the copies
+/// together.
+fn node_path_join(base: &Path, rest: &str) -> PathBuf {
+    let base = base.to_string_lossy().replace('\\', "/");
+    let rest = rest.replace('\\', "/");
+    let absolute = base.starts_with('/');
+
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in base.split('/').chain(rest.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if matches!(parts.last(), Some(&last) if last != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+
+    let joined = parts.join("/");
+    if absolute {
+        PathBuf::from(format!("/{joined}"))
+    } else if joined.is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(joined)
+    }
 }
 
 /// `resolveBearerToken(definition)` (`utils.ts:199`) — `bearerToken` wins over `bearerTokenEnv`.
@@ -1886,6 +1928,45 @@ mod tests {
     /// `computeServerHash` on node 22 against `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`),
     /// using the same fixture as the vector above. The test exists so the divergence is a pinned,
     /// visible fact rather than a comment: if someone lands `socket` (13c-mcp-servers.md:1753 asks
+    /// The third `lenient` divergence, and the worst-behaved: on a non-string `env`/`headers`
+    /// member the two crates return OPPOSITE cache-validity answers, not merely different digests.
+    ///
+    /// Measured on node 22: `computeServerHash({command:"x",env:{K:5}})` THROWS
+    /// (`value.startsWith is not a function`), and `isServerCacheValid` catches it and returns
+    /// `false`. This reader reproduces that faithfully. The writer holds `env`/`headers` as
+    /// `Option<BTreeMap<String, String>>` behind `deserialize_with = "lenient"`, which drops the
+    /// whole map when any member fails to fit — so it hashes `"env":undefined`, produces a digest,
+    /// and calls the entry VALID.
+    ///
+    /// Same root cause as the `auth`/`protocolVersion` pin above: the writer's config types discard
+    /// what upstream keeps. The fix is on the writer (hold the raw value, or carry a
+    /// "had a non-string member" flag through `lenient`), which is a 13b type-model change and so
+    /// the owner's call. **If this starts failing, that landed — delete it.**
+    #[test]
+    fn a_non_string_env_member_makes_the_two_crates_disagree_on_validity() {
+        const JSON: &str = r#"{"command":"x","env":{"K":5}}"#;
+        let env = |_: &str| None;
+        let home = Path::new("/home/u");
+
+        // The reader refuses to hash it at all — upstream's throw.
+        let reader: ServerEntry = serde_json::from_str(JSON).expect("reader entry");
+        assert!(
+            server_identity_pre_image_with(&reader, &env, home).is_err(),
+            "reader must reproduce upstream's throw on a non-string env member"
+        );
+
+        // The writer drops the map and hashes happily.
+        let writer: WriterServerEntry = serde_json::from_str(JSON).expect("writer entry");
+        let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(|_: &str| None);
+        let resolved =
+            ResolvedIdentity::resolve(&writer, &writer_env, home).expect("writer resolve");
+        let theirs = writer_pre_image(&writer, &resolved);
+        assert!(
+            theirs.contains(r#""env":undefined"#),
+            "writer's `lenient` drops the whole map: {theirs}"
+        );
+    }
+
     /// The `auth` / `protocolVersion` digest divergence, pinned rather than rediscovered.
     ///
     /// Upstream hashes both keys verbatim (`metadata-cache.ts:103-104`) and validates neither at

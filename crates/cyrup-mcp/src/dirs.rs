@@ -314,9 +314,62 @@ pub fn resolve_config_path_tail(interpolated: &str, home: &Path) -> PathBuf {
     if let Some(rest) =
         interpolated.strip_prefix("~/").or_else(|| interpolated.strip_prefix("~\\"))
     {
-        return home.join(rest);
+        return node_path_join(home, rest);
     }
     PathBuf::from(interpolated)
+}
+
+/// node's `path.join(base, rest)`, which is NOT `Path::join`. Upstream reaches `resolveConfigPath`'s
+/// `~` arm through it (`utils.ts:187`), and the two differ in three ways that all change the digest:
+///
+/// * **`rest` is never absolute.** `path.join("/home/u", "/x")` is `/home/u/x`; `Path::join` throws
+///   the base away and yields `/x`. `"~//x"` strips to `rest = "/x"`, so this was silently hashing a
+///   `cwd` of `/x` — the home directory gone entirely, for a perfectly ordinary config typo.
+/// * **The result is normalized.** node collapses repeated separators and folds `.` and `..`
+///   lexically, so `"~/a//b"` is `/home/u/a/b` and `"~/.."` is `/home`. `Path::join` preserves all
+///   of it verbatim.
+/// * **A trailing separator is dropped** unless the result is the root, so `"~/"` is `/home/u`, not
+///   `/home/u/`.
+///
+/// Lexical only — it never touches the filesystem, exactly as node's does, so it cannot follow a
+/// symlink or differ between a machine where the path exists and one where it does not.
+///
+/// `cyrup_ext_subagents::exec::mcp_direct_tools::resolve_config_path` carries the same logic and
+/// must keep carrying it: that crate depends on this one only as a `[dev-dependency]`, so the
+/// production reader cannot call this function. The cross-crate conformance tests are what hold the
+/// two copies together.
+#[must_use]
+pub fn node_path_join(base: &Path, rest: &str) -> PathBuf {
+    let base = base.to_string_lossy().replace('\\', "/");
+    let rest = rest.replace('\\', "/");
+    let absolute = base.starts_with('/');
+
+    let mut parts: Vec<&str> = Vec::new();
+    for segment in base.split('/').chain(rest.split('/')) {
+        match segment {
+            // `path.join` drops empty segments (so `a//b` collapses) and `.` outright.
+            "" | "." => {}
+            ".." => {
+                // Pop a real segment; on a relative path with nothing to pop, `..` survives, which
+                // is what node does (`path.join("a", "../../b")` is `../b`).
+                if matches!(parts.last(), Some(&last) if last != "..") {
+                    parts.pop();
+                } else if !absolute {
+                    parts.push("..");
+                }
+            }
+            other => parts.push(other),
+        }
+    }
+
+    let joined = parts.join("/");
+    if absolute {
+        PathBuf::from(format!("/{joined}"))
+    } else if joined.is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(joined)
+    }
 }
 
 /// node's `path.resolve(base, raw)` — join when `raw` is relative, then fold `.` and `..`
@@ -1218,6 +1271,47 @@ fn opt_serde<T: Serialize>(value: Option<&T>) -> HashValue {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
+    /// node's `path.join` semantics, pinned against values measured by running upstream's own
+    /// `resolveConfigPath` on node 22 (pi-mcp-adapter @ v2.26.1, `fafae21`) with `HOME=/home/u`.
+    ///
+    /// Every one of these hashed differently before `node_path_join` existed, because the `~` arm
+    /// was a bare `Path::join`. The first row is the one that matters most: `"~//x"` strips to
+    /// `rest = "/x"`, and `Path::join` treats an absolute `rest` as a REPLACEMENT — so a `cwd` of
+    /// `~//x` hashed as `/x`, with the user's home directory silently gone.
+    #[test]
+    fn the_tilde_arm_has_node_path_join_semantics_not_rust_ones() {
+        let home = Path::new("/home/u");
+        // (input, what upstream's resolveConfigPath returns on node 22)
+        for (input, expected) in [
+            ("~//x", "/home/u/x"),
+            ("~/", "/home/u"),
+            ("~\\", "/home/u"),
+            ("~/..", "/home"),
+            ("~/./x", "/home/u/x"),
+            ("~/a//b", "/home/u/a/b"),
+            // Unchanged by the fix, kept so a future rewrite cannot regress the ordinary cases.
+            ("~", "/home/u"),
+            ("~/work", "/home/u/work"),
+            ("/absolute", "/absolute"),
+            ("relative/x", "relative/x"),
+        ] {
+            assert_eq!(
+                resolve_config_path_tail(input, home),
+                PathBuf::from(expected),
+                "resolveConfigPath({input:?}) must match node"
+            );
+        }
+    }
+
+    /// `..` may not climb out of an absolute root, and survives on a relative path — both node
+    /// behaviours, and both reachable from a config that over-uses `../`.
+    #[test]
+    fn node_path_join_clamps_dotdot_at_the_root_and_keeps_it_when_relative() {
+        assert_eq!(node_path_join(Path::new("/home/u"), "../../../.."), PathBuf::from("/"));
+        assert_eq!(node_path_join(Path::new("a"), "../../b"), PathBuf::from("../b"));
+        assert_eq!(node_path_join(Path::new("/"), "x"), PathBuf::from("/x"));
+    }
+
     use super::*;
 
     #[test]
