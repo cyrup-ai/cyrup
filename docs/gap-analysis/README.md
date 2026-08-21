@@ -311,6 +311,7 @@ against. **The exclusion runs both ways and is now stated in every cross-cutting
 | file | area | port units | crit | high |
 |---|---|---:|---:|---:|
 | [`13-cyrup-mcp.md`](13-cyrup-mcp.md) | **the port — thesis, scope, seam map, architecture, and the one canonical table of every unit. Start here.** | **433** | 21 | 146 |
+| [`13-cyrup-mcp-STATUS.md`](13-cyrup-mcp-STATUS.md) | **what is actually BUILT — per-unit implementation status against the plan, audited 2026-08-21 at v2.26.1. 198 of 437 units carry open work.** | 437 | | |
 | [`MCP-PORT-METHODOLOGY.md`](MCP-PORT-METHODOLOGY.md) | **how it is executed and verified — fidelity rules, thirteen phases, the ADR docket** | — | — | — |
 | [`13a-mcp-activation.md`](13a-mcp-activation.md) | activation, lifecycle and the host seam | 50 | | |
 | [`13b-mcp-config.md`](13b-mcp-config.md) | configuration, the type model and errors | 50 | | |
