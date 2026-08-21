@@ -64,12 +64,12 @@
 //! `crates/cyrup-mcp` is a native built-in crate compiled into the binary, not a WASM guest; it
 //! links `rmcp`, `keyring` and `opener` directly and runs `std::process::Command` itself. The
 //! `HostServices::exec` gate is the *guest* capability model and does not apply here, which is why
-//! [`resolve_command_secret`] spawns a shell directly and [`OpenerLauncher`] calls `opener::open`.
+//! [`crate::secrets::resolve_command_secret`] spawns a shell directly and [`OpenerLauncher`] calls
+//! `opener::open`.
 //! The prompt/notify verbs a command surface needs are injected as callbacks
 //! ([`AuthenticateOptions::on_authorization_input`]) so this module never names `HostServices`.
 
 use std::collections::{HashMap, HashSet};
-use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
@@ -93,160 +93,18 @@ use crate::errors::{McpError, McpResult};
 // ===================================================================================================
 // 1 · Environment interpolation and `!command` secrets — `utils.ts` (MCP-342, MCP-349)
 // ===================================================================================================
+//
+// The engine moved to [`crate::secrets`] when MCP-083's other two call sites landed. It was written
+// here because the OAuth `clientSecret` was its first caller, but `utils.ts` is imported by three
+// subsystems, and leaving it here would have made the stdio transport depend on the OAuth flow for
+// a shell spawn. Every name below is re-exported rather than relocated so `crate::oauth::…` paths —
+// including `request_headers_command`'s `use crate::oauth::interpolate_env_vars` — keep resolving,
+// and so this section still reads as the place `utils.ts` landed.
 
-/// `interpolateEnvVars(value)` (`utils.ts:74`) — expand the **three** placeholder forms, in order,
-/// each falling back to the empty string on a missing variable:
-///
-/// ```text
-/// 1.  ${VAR}       /\$\{(\w+)\}/g
-/// 2.  $env:VAR     /\$env:(\w+)/g
-/// 3.  {env:VAR}    /\{env:(\w+)\}/g      <- the form both existing cyrup copies are missing
-/// ```
-///
-/// **MCP-342.** `cyrup_ext::caps::proc::interpolate_env_vars` (currently `pub(crate)`) and the
-/// private copy in `cyrup_ext_subagents::exec::mcp_direct_tools` each implement only the first two
-/// forms, so a `{env:VAR}`-bearing `clientId` would reach the authorization server literally. That
-/// is a parity defect in both, not a visibility problem; this is the third implementation and the
-/// only complete one. The shared-implementation consolidation is filed in the report.
-///
-/// One deliberate character-class divergence: JavaScript's `\w` is ASCII-only while Rust's `regex`
-/// crate makes `\w` Unicode-aware, so the patterns spell the class out as `[A-Za-z0-9_]` to keep
-/// the two engines matching the same names.
-#[must_use]
-pub fn interpolate_env_vars(value: &str) -> String {
-    crate::credentials::interpolate_env_vars_with(value, |name| std::env::var(name).ok())
-}
-
-/// **De-duplicated at integration (MCP-082, MCP-342).** The engine is
-/// [`crate::credentials::interpolate_env_vars_with`] — one implementation for the whole crate, so
-/// an `oauth` block and a `bearerToken` cannot disagree about what `${VAR}` means. The three-pass
-/// chaining moved with it.
-pub use crate::credentials::interpolate_env_vars_with;
-
-/// `interpolateSecretExpression(value)` (`utils.ts:102`) — `!!X` becomes `X` interpolated (one `!`
-/// removed), a single leading `!` is preserved verbatim for the command resolver, and everything
-/// else is interpolated.
-#[must_use]
-pub fn interpolate_secret_expression(value: &str) -> String {
-    // One implementation, in `credentials.rs` (MCP-084); this is its process-env arity, which is
-    // upstream's own one-argument signature.
-    crate::credentials::interpolate_secret_expression(value, &PROCESS_ENV)
-}
-
-/// The process environment, resolved once. `credentials::process_env()` allocates an `Arc` per
-/// call; the interpolators run per config field, so the handle is hoisted.
-static PROCESS_ENV: std::sync::LazyLock<crate::credentials::EnvFn> =
-    std::sync::LazyLock::new(crate::credentials::process_env);
-
-/// `COMMAND_SECRET_TIMEOUT_MS` (`utils.ts:116`).
-pub const COMMAND_SECRET_TIMEOUT: Duration = Duration::from_secs(10);
-/// `COMMAND_SECRET_MAX_OUTPUT_BYTES` (`utils.ts:117`) — 1 MiB.
-pub const COMMAND_SECRET_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
-/// How often the wait loop polls the child while the wall clock runs.
-const COMMAND_SECRET_POLL: Duration = Duration::from_millis(10);
-
-/// `resolveCommandSecret(value, context)` (`utils.ts:123`) — MCP-349.
-///
-/// * `!!X` ⇒ interpolate `X` with one `!` stripped, **no subprocess**;
-/// * a value not starting with `!` ⇒ plain interpolation;
-/// * otherwise run `value[1..]` **through a shell** and take its trimmed stdout.
-///
-/// `shell: true` upstream means the string goes to `/bin/sh -c` (or `cmd.exe /C`); a port that
-/// spawned the argv directly would change which configs work, so the shell is reproduced. **stderr
-/// is discarded**, exactly as upstream's `stdio: ["ignore","pipe","ignore"]` does — a failing
-/// command's diagnostics never reach the user, only its exit code does.
-///
-/// The five failure strings are the contract and all carry the caller's `context` verbatim; for
-/// this subsystem that string is ``MCP server "{name}" OAuth clientSecret``.
-///
-/// Synchronous, as upstream is. **Named delta (MCP-349):** upstream calls `clientInformation()` —
-/// and therefore this resolver — up to three times per token leg, so one token request can spawn
-/// the user's secret command three times. Under `rmcp` the secret is applied once at
-/// `configure_client` time and reused, so the port resolves it **once per configuration**.
-///
-/// **Named delta:** `windowsHide` has no direct equivalent without reaching for
-/// `std::os::windows::process::CommandExt::creation_flags`; the Windows arm spawns `cmd /C`
-/// without it.
-pub fn resolve_command_secret(value: &str, context: &str) -> McpResult<String> {
-    if let Some(rest) = value.strip_prefix("!!") {
-        return Ok(interpolate_env_vars(&format!("!{rest}")));
-    }
-    let Some(command) = value.strip_prefix('!') else {
-        return Ok(interpolate_env_vars(value));
-    };
-
-    let failure = |reason: &str| McpError::other(format!("Failed to resolve {context}: {reason}"));
-
-    #[cfg(windows)]
-    let (shell, flag) = ("cmd", "/C");
-    #[cfg(not(windows))]
-    let (shell, flag) = ("/bin/sh", "-c");
-
-    let mut child = std::process::Command::new(shell)
-        .arg(flag)
-        .arg(command)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map_err(|_| failure("command failed to start"))?;
-
-    // The child's stdout must be drained on another thread: a command that fills the pipe buffer
-    // would otherwise block forever while this thread polls `try_wait`, and upstream's `maxBuffer`
-    // has no such deadlock because libuv reads continuously.
-    let stdout = child.stdout.take();
-    let reader = std::thread::spawn(move || -> (Vec<u8>, bool) {
-        let Some(mut stdout) = stdout else {
-            return (Vec::new(), false);
-        };
-        let mut buffer = Vec::new();
-        // One byte past the cap is enough to *detect* the overflow, which is all upstream's
-        // `ENOBUFS` does.
-        let mut limited = (&mut stdout).take((COMMAND_SECRET_MAX_OUTPUT_BYTES + 1) as u64);
-        let _ = limited.read_to_end(&mut buffer);
-        let overflowed = buffer.len() > COMMAND_SECRET_MAX_OUTPUT_BYTES;
-        // Drain the rest so the child is never wedged on a full pipe while we wait for it.
-        let mut sink = Vec::new();
-        let _ = stdout.read_to_end(&mut sink);
-        (buffer, overflowed)
-    });
-
-    let started = std::time::Instant::now();
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break Some(status),
-            Ok(None) => {}
-            Err(_) => break None,
-        }
-        if started.elapsed() >= COMMAND_SECRET_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
-            break None;
-        }
-        std::thread::sleep(COMMAND_SECRET_POLL);
-    };
-
-    let (buffer, overflowed) = reader.join().unwrap_or((Vec::new(), false));
-
-    let Some(status) = status else {
-        return Err(failure("command timed out after 10 seconds"));
-    };
-    if overflowed {
-        return Err(failure("command output exceeded 1 MiB"));
-    }
-    if !status.success() {
-        let code = status
-            .code()
-            .map_or_else(|| "unknown".to_string(), |code| code.to_string());
-        return Err(failure(&format!("command exited with code {code}")));
-    }
-
-    let resolved = String::from_utf8_lossy(&buffer).trim().to_string();
-    if resolved.is_empty() {
-        return Err(failure("command returned empty output"));
-    }
-    Ok(resolved)
-}
+pub use crate::secrets::{
+    interpolate_env_vars, interpolate_env_vars_with, interpolate_secret_expression,
+    resolve_command_secret, COMMAND_SECRET_MAX_OUTPUT_BYTES, COMMAND_SECRET_TIMEOUT,
+};
 
 // ===================================================================================================
 // 2 · `extractOAuthConfig` — the validation gate and its twelve messages (MCP-302, MCP-332)

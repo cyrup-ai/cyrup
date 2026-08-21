@@ -135,9 +135,16 @@ pub async fn initialize_mcp(
 
     // MCP-015's two derivations. The fenced handle is built BEFORE anything asynchronous can hold
     // it, which is the whole point: what crosses the await is already inert-on-stop.
+    // `const rawUi = hasUI ? ctx.ui : undefined` (`init.ts:104-106`). The `has_ui` gate is
+    // load-bearing and not cosmetic: `McpState::dialog()` is `None` exactly when this is `None`, and
+    // that is the ONLY thing that distinguishes "this session has no interactive UI" from "the user
+    // was asked and declined". Deriving `ui` straight from `snapshot.services` — which the host
+    // supplies whether or not a human can see it — made `NoInteractiveSession` unreachable in
+    // production and collapsed MCP-232's two answers into one (the safe one, but the wrong one).
     let ui = snapshot
-        .services
-        .clone()
+        .has_ui
+        .then(|| snapshot.services.clone())
+        .flatten()
         .map(|services| Arc::new(OwnedServices::new(services, Arc::clone(&owner))));
     let _runtime_signal =
         crate::abort::combine(&owner.token(), snapshot.initial_signal.as_ref());
@@ -606,11 +613,12 @@ pub fn with_stderr_tail(base: &str, tail: &VecDeque<u8>) -> String {
 
 /// Everything the stdio spawn needs, **already resolved**.
 ///
-/// The resolution itself is deliberately not here. `interpolateEnvVars` (MCP-143), the `!`/`!!`
-/// command-secret grammar (MCP-144), `resolveEnv`'s full-environment copy and the npx/npm rewrite
-/// (MCP-103) all belong to `secrets` / the connection builder; what this module owns is the point
-/// where resolved values become a running child. Keeping the split here is what lets the spawn stay
-/// a pure function of its inputs and be unit-tested without a shell.
+/// The resolution itself is deliberately not here — it is [`crate::secrets`], and
+/// [`Self::resolve`] is the seam. `resolveEnv`'s full-environment copy and the `!`/`!!`
+/// command-secret grammar are [`crate::secrets::resolve_stdio_env`] (MCP-083); `interpolateEnvVars`
+/// over `args` and the npx/npm rewrite of `command`/`args` (MCP-103) stay with the caller, which is
+/// why [`Self::resolve`] takes them already-built. Keeping the split here is what lets
+/// [`spawn_stdio_transport`] stay a pure function of its inputs and be unit-tested without a shell.
 pub struct StdioTransportSpec {
     /// Post-npx-resolution executable: `resolved.isJs ? "node" : resolved.binPath`, else
     /// `definition.command` untouched. Never interpolated — upstream interpolates `args`, not
@@ -634,6 +642,45 @@ pub struct StdioTransportSpec {
     /// `definition.debug`. `true` ⇒ stderr is **inherited** by the host terminal and there is no
     /// tail; `false` ⇒ piped, and the returned handle feeds [`append_stderr_tail`].
     pub debug: bool,
+}
+
+impl StdioTransportSpec {
+    /// §3.3 step 7's `env` and the two fields read straight off the definition, resolved — the
+    /// MCP-083 half of the stdio pre-flight.
+    ///
+    /// `command`, `args` and `cwd` arrive already-built because each belongs to a different unit:
+    /// the npx/npm rewrite is MCP-103's, `interpolateEnvVars` over `args` is MCP-082's, and
+    /// `resolveConfigPath(definition.cwd) ?? this.defaultCwd` is MCP-084's plus the manager's
+    /// default. `env` is the one field that can execute a user's shell command, and it is the one
+    /// this constructor owns.
+    ///
+    /// `base` is upstream's `process.env` — [`crate::secrets::process_env_snapshot`] in production,
+    /// an explicit map in a test.
+    ///
+    /// # Errors
+    ///
+    /// The first `env` value whose `!command` fails, carrying
+    /// `` MCP server "{server}" stdio env "{key}" `` — see [`crate::secrets::resolve_env`].
+    pub fn resolve(
+        entry: &ServerEntry,
+        server_name: &str,
+        command: String,
+        args: Vec<String>,
+        cwd: Option<PathBuf>,
+        base: &HashMap<String, String>,
+    ) -> McpResult<Self> {
+        Ok(Self {
+            command,
+            args,
+            env: crate::secrets::resolve_stdio_env(entry, server_name, base)?,
+            cwd,
+            // `if (definition.pluginDataDir) mkdirSync(...)` (`server-manager.ts:488`) — used raw,
+            // NOT `resolveConfigPath`'d, because only `agent_plugin` writes it and it writes an
+            // absolute path it built itself.
+            plugin_data_dir: entry.plugin_data_dir.as_deref().map(PathBuf::from),
+            debug: entry.debug == Some(true),
+        })
+    }
 }
 
 /// Spawn the child and hand back rmcp's stdio transport plus, in non-debug mode, the stderr handle.
@@ -693,16 +740,21 @@ pub fn spawn_stdio_transport(
 
 /// Everything the HTTP transport needs, **already resolved** (§3.4 steps 1–7).
 ///
-/// `resolveServerUrl`'s three throws, `resolveCommandSecretsRecord` over the headers, the
-/// `bearerToken`/`bearerTokenEnv` ladder and the `new Headers()` injection guard are MCP-114's, in
-/// `secrets`. What arrives here is the finished pre-flight.
+/// Steps 2–6 — `resolveCommandSecretsRecord` over the headers, the `bearerToken`/`bearerTokenEnv`
+/// ladder and the `new Headers()` injection guard — are [`crate::secrets::resolve_http_secrets`]
+/// (MCP-083), and [`Self::resolve`] is the seam onto it. Step 1, `resolveServerUrl`'s three throws,
+/// is still MCP-084's and is why `url` arrives as a parameter. What reaches
+/// [`build_http_transport_config`] is the finished pre-flight.
 pub struct HttpTransportSpec {
     /// The `mcpServers` key, for the error strings.
     pub server: String,
     /// `resolveServerUrl(definition)` — interpolated and already proven to parse.
     pub url: String,
-    /// The resolved header set **in file order** (`IndexMap`/`Vec` rather than a sorted map: a
-    /// server that reads two same-named headers positionally would otherwise see them reordered).
+    /// The resolved header set, as an ordered `Vec` rather than a map so the transport cannot
+    /// reorder it again. **Named delta:** upstream's order is `Object.entries(definition.headers)`,
+    /// i.e. the order the keys were written in `mcp.json`, while [`ServerEntry::headers`] is a
+    /// `BTreeMap` and hands them over alphabetically. Header *semantics* do not depend on order,
+    /// so the only observable consequence is the order they appear on the wire.
     /// `Authorization` is *not* in here when a bearer token resolved — see [`Self::bearer_token`].
     pub headers: Vec<(String, String)>,
     /// The bearer token **without** the `Bearer ` prefix.
@@ -713,6 +765,35 @@ pub struct HttpTransportSpec {
     /// is what keeps the SSE `GET` stream and the session `DELETE` authorized too — both are issued
     /// by the transport worker, not by the caller, and only `auth_header` reaches them.
     pub bearer_token: Option<String>,
+}
+
+impl HttpTransportSpec {
+    /// §3.4 steps 2–6 applied to a definition — the MCP-083 half of the HTTP pre-flight.
+    ///
+    /// `url` arrives already-resolved: step 1 is `resolveServerUrl`, whose three throws are MCP-084's
+    /// and which must run **before** this, since a URL with a missing environment variable has to
+    /// fail before a secret command is ever spawned for it.
+    ///
+    /// # Errors
+    ///
+    /// A header or bearer `!command` that failed — carrying
+    /// `` MCP server "{server}" HTTP header "{key}" `` or `` MCP server "{server}" HTTP bearer
+    /// token `` — or the injection guard's invalid-header-value sentence. See
+    /// [`crate::secrets::resolve_http_secrets`].
+    pub fn resolve(
+        entry: &ServerEntry,
+        server_name: &str,
+        url: String,
+        env: &crate::credentials::EnvFn,
+    ) -> McpResult<Self> {
+        let resolved = crate::secrets::resolve_http_secrets(entry, server_name, env)?;
+        Ok(Self {
+            server: server_name.to_string(),
+            url,
+            headers: resolved.headers,
+            bearer_token: resolved.bearer_token,
+        })
+    }
 }
 
 /// Build the streamable-HTTP transport's configuration
@@ -745,11 +826,12 @@ pub struct HttpTransportSpec {
 ///
 /// # Errors
 ///
-/// [`McpError::Server`] when a header name or value is not representable on the wire. MCP-114 has
-/// already validated the command-sourced ones with the exact upstream sentence; this arm therefore
-/// only fires for a *statically configured* header that upstream would have let through to `fetch`
-/// and failed on later — a **recorded divergence**: cyrup rejects it at transport construction, with
-/// a message that does not falsely blame a command.
+/// [`McpError::Server`] when a header name or value is not representable on the wire.
+/// [`crate::secrets::resolve_http_secrets`] has already validated the command-sourced ones with the
+/// exact upstream sentence (MCP-083, §3.4 step 6); this arm therefore only fires for a *statically
+/// configured* header that upstream would have let through to `fetch` and failed on later — a
+/// **recorded divergence**: cyrup rejects it at transport construction, with a message that does not
+/// falsely blame a command.
 pub fn build_http_transport_config(
     spec: &HttpTransportSpec,
 ) -> McpResult<StreamableHttpClientTransportConfig> {
@@ -1755,6 +1837,105 @@ mod wire_tests {
         };
         let err = build_http_transport_config(&spec).unwrap_err();
         assert!(err.to_string().contains("X-A"), "the offending header is named: {err}");
+    }
+
+    // --- MCP-083, the two deferred call sites -----------------------------------------------------
+
+    #[test]
+    fn the_stdio_spec_resolves_its_env_through_secrets_and_reports_the_failing_key() {
+        let base: HashMap<String, String> =
+            [("HOST_ONLY".to_string(), "kept".to_string())].into_iter().collect();
+
+        let mut e = entry();
+        e.command = Some("/bin/true".to_string());
+        e.env = Some(
+            [
+                ("TOKEN".to_string(), "!printf hunter2".to_string()),
+                ("PLAIN".to_string(), "x".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        e.plugin_data_dir = Some("/tmp/cyrup-mcp-plugin-data".to_string());
+
+        let spec = StdioTransportSpec::resolve(
+            &e,
+            "srv",
+            "/bin/true".to_string(),
+            vec!["--x".to_string()],
+            None,
+            &base,
+        )
+        .unwrap();
+        assert_eq!(spec.env.get("TOKEN").map(String::as_str), Some("hunter2"));
+        assert_eq!(spec.env.get("PLAIN").map(String::as_str), Some("x"));
+        assert_eq!(
+            spec.env.get("HOST_ONLY").map(String::as_str),
+            Some("kept"),
+            "`resolveEnv` copies the WHOLE base environment before layering"
+        );
+        assert_eq!(spec.plugin_data_dir.as_deref(), Some(std::path::Path::new("/tmp/cyrup-mcp-plugin-data")));
+        assert!(!spec.debug, "`debug` absent is `false`, i.e. stderr piped");
+
+        // A failing secret is an error carrying the `stdio env` context string — never an empty
+        // environment variable the child would silently authenticate with.
+        e.env = Some([("TOKEN".to_string(), "!exit 9".to_string())].into_iter().collect());
+        // `StdioTransportSpec` is not `Debug` (it carries a resolved environment), so the failure is
+        // destructured rather than `unwrap_err`'d — the same shape the spawn tests above use.
+        let Err(err) = StdioTransportSpec::resolve(
+            &e,
+            "srv",
+            "/bin/true".to_string(),
+            Vec::new(),
+            None,
+            &base,
+        ) else {
+            panic!("an unresolvable stdio env secret must never become a value");
+        };
+        assert_eq!(
+            err.to_string(),
+            "Failed to resolve MCP server \"srv\" stdio env \"TOKEN\": command exited with code 9"
+        );
+    }
+
+    #[test]
+    fn the_http_spec_resolves_headers_and_the_bearer_through_secrets() {
+        use crate::config::{AuthKind, AuthMode};
+
+        let env = crate::credentials::process_env();
+        let mut e = entry();
+        e.url = Some("https://example.test/mcp".to_string());
+        e.headers = Some(
+            [("X-Token".to_string(), "!printf abc".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        e.auth = Some(AuthMode::Named(AuthKind::Bearer));
+        e.bearer_token = Some("!printf hunter2".to_string());
+
+        let spec = HttpTransportSpec::resolve(
+            &e,
+            "srv",
+            "https://example.test/mcp".to_string(),
+            &env,
+        )
+        .unwrap();
+        assert_eq!(spec.server, "srv");
+        assert_eq!(
+            spec.headers,
+            vec![("X-Token".to_string(), "abc".to_string())],
+            "the header command ran and its stdout is the value"
+        );
+        assert_eq!(
+            spec.bearer_token.as_deref(),
+            Some("hunter2"),
+            "WITHOUT the `Bearer ` prefix, which `auth_header` adds"
+        );
+
+        // And the resolved spec still passes the transport builder unchanged.
+        let config = build_http_transport_config(&spec).unwrap();
+        assert_eq!(config.auth_header.as_deref(), Some("hunter2"));
+        assert_eq!(config.custom_headers.len(), 1);
     }
 
     // --- MCP-128 --------------------------------------------------------------------------------
