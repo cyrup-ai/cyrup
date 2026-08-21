@@ -20,7 +20,7 @@ use cyrup_core::{
 use cyrup_provider::stream::{DoneReason, ErrorReason};
 use cyrup_provider::{
     open_sse, parse_streaming_json_object, CacheRetention, Context, HeaderMap,
-    ProviderError, SseRequest, StreamEvent, StreamOptions, ThinkingBudgets, Transport,
+    ProviderEnv, ProviderError, SseRequest, StreamEvent, StreamOptions, ThinkingBudgets, Transport,
 };
 use cyrup_core::{ModelThinkingLevel, SessionId, ThinkingLevel};
 use futures::StreamExt;
@@ -327,6 +327,15 @@ pub struct ProxyStreamOptions {
     pub auth_token: String,
     /// Proxy server URL, e.g. `https://genai.example.com` (Pi `proxyUrl`, proxy.ts:78-79).
     pub proxy_url: String,
+    /// Provider-scoped environment overlay (Pi `options.env`) consulted when resolving whether the
+    /// request to [`Self::proxy_url`] is itself routed through an HTTP proxy. Local-only: never
+    /// serialized into the request body.
+    ///
+    /// The ported resolver has always supported this overlay winning over the ambient process env
+    /// (`node_http_proxy::get_proxy_env`), but this transport had no way to express it — it called
+    /// the ambient-only [`cyrup_provider::build_client_for`], so `http(s)_proxy`/`no_proxy` for the
+    /// proxy hop could only ever come from the host. `None` keeps exactly that behavior.
+    pub env: Option<ProviderEnv>,
 }
 
 /// The serializable request-options body (Pi `ProxySerializableStreamOptions`, proxy.ts:59-71 /
@@ -474,7 +483,17 @@ async fn run_proxy(
     // `httpProxy` setting entirely and let reqwest's own competing env detection decide for the
     // env-var case. `build_client_for` runs `resolveHttpProxyUrlForTarget` (node-http-proxy.ts:92-112)
     // against the proxy-stream URL, so the same authority decides here as for provider streams.
-    let client = match cyrup_provider::build_client_for(&url).await {
+    // `build_client_for_target` rather than `build_client_for` so the provider-scoped overlay in
+    // `options.env` participates in the decision, exactly as it does for provider streams. With
+    // `env: None` the two are identical — same `EnvAuthContext`, same ported resolver.
+    let client = match cyrup_provider::build_client_for_target(
+        &url,
+        &cyrup_provider::EnvAuthContext,
+        options.env.as_ref(),
+        None,
+    )
+    .await
+    {
         Ok(c) => c,
         Err(e) => {
             let _ = tx.send(error_terminal(&builder, &cancel, e.to_string())).await;
@@ -703,11 +722,21 @@ fn error_terminal(
 pub struct ProxyStreamFn {
     proxy_url: String,
     auth_token: String,
+    env: Option<ProviderEnv>,
 }
 
 impl ProxyStreamFn {
     pub fn new(proxy_url: impl Into<String>, auth_token: impl Into<String>) -> Self {
-        Self { proxy_url: proxy_url.into(), auth_token: auth_token.into() }
+        Self { proxy_url: proxy_url.into(), auth_token: auth_token.into(), env: None }
+    }
+
+    /// Attach a provider-scoped environment overlay (Pi `options.env`) used when deciding whether
+    /// the hop to the proxy server is itself proxied. See [`ProxyStreamOptions::env`]; without one,
+    /// that decision is made purely from the ambient process environment.
+    #[must_use]
+    pub fn with_env(mut self, env: ProviderEnv) -> Self {
+        self.env = Some(env);
+        self
     }
 
     /// Map the agent's provider-level [`StreamOptions`] onto [`ProxyStreamOptions`] — the cyrup
@@ -742,6 +771,7 @@ impl ProxyStreamFn {
             cancel: opts.cancel.clone(),
             auth_token: self.auth_token.clone(),
             proxy_url: self.proxy_url.clone(),
+            env: self.env.clone(),
         }
     }
 }

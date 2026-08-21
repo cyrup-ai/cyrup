@@ -444,10 +444,23 @@ mod tests {
         let ctx = ImagesContext {
             input: vec![Content::text("a small red circle")],
         };
-        let env: crate::auth::types::ProviderEnv =
-            [("all_proxy".to_string(), "socks5://proxy.local:1080".to_string())]
-                .into_iter()
-                .collect();
+        // Pin the whole proxy quartet in the overlay rather than inheriting any of it.
+        //
+        // `get_proxy_for_url` consults `{scheme}_proxy` BEFORE `all_proxy`, and an overlay only
+        // wins where it supplies a non-empty value — an absent key falls through to the ambient env
+        // (Pi's `env?.[n] || process.env[n]`; an empty overlay value falls through too, so emptiness
+        // cannot mask). So on a host with an ambient `https_proxy` — this project's CI container has
+        // one — the real proxy was selected before `all_proxy` was ever read, the request was sent
+        // for real, and the SOCKS rejection this test exists to pin never happened. Setting
+        // `https_proxy` too keeps SOCKS the resolved proxy whichever key wins, and `no_proxy` names
+        // a host that is not the target so an ambient exemption cannot skip proxying altogether.
+        let env: crate::auth::types::ProviderEnv = [
+            ("all_proxy".to_string(), "socks5://proxy.local:1080".to_string()),
+            ("https_proxy".to_string(), "socks5://proxy.local:1080".to_string()),
+            ("no_proxy".to_string(), "never-matches.invalid".to_string()),
+        ]
+        .into_iter()
+        .collect();
         let opts = ImagesOptions {
             api_key: Some("test-key".to_string()),
             env: Some(env),

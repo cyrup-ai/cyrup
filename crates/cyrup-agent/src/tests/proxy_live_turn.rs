@@ -380,7 +380,22 @@ async fn prov047_the_proxy_transport_routes_through_the_configured_http_proxy() 
     let _restore = ClearHttpProxyOnDrop;
     cyrup_provider::configure_http_proxy(Some(proxy_url));
 
-    let sf: Arc<dyn StreamFn> = Arc::new(ProxyStreamFn::new(target.clone(), "test-token"));
+    // Pin `no_proxy` for this request instead of inheriting the host's.
+    //
+    // The proxy TARGET is necessarily loopback (the recording server above), and the ported
+    // resolver honors `no_proxy` for the hop — correctly, and 1:1 with Pi. So on any machine whose
+    // ambient `no_proxy` exempts loopback, the resolver declined to proxy and the turn died on the
+    // dead port: the assertions below were reading the developer's shell, not PROV-047. Debian's
+    // default `no_proxy` and this project's CI container both list `127.0.0.1`.
+    //
+    // A non-empty overlay wins over the ambient value (`node_http_proxy::get_proxy_env`), so
+    // naming a host that is NOT the target pins "nothing here is exempt" hermetically, without
+    // scrubbing the process env.
+    let mut env = cyrup_provider::ProviderEnv::new();
+    env.insert("no_proxy".to_string(), "never-matches.invalid".to_string());
+
+    let sf: Arc<dyn StreamFn> =
+        Arc::new(ProxyStreamFn::new(target.clone(), "test-token").with_env(env));
     let agent = Agent::builder(model_ref(), sf).build();
     let handle = agent.prompt("ping through the proxy").await.unwrap();
     let new = handle.finished().await;

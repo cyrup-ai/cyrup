@@ -292,10 +292,26 @@ impl HttpCaps {
     /// `build_client_for_target`) already refuses. A warning in a log the guest never sees is not
     /// an announcement.
     async fn client_for(&self, url: &str) -> Result<reqwest::Client, String> {
+        self.client_for_with_env(url, None).await
+    }
+
+    /// [`Self::client_for`] with an explicit provider-scoped environment overlay (Pi `options.env`).
+    ///
+    /// The ported resolver has always let a non-empty overlay win over the ambient process env
+    /// (`node_http_proxy::get_proxy_env`), but this call site could not express one, so which branch
+    /// it took was decided entirely by the host. That made the no-proxy assertion in
+    /// `a_resolved_proxy_yields_a_distinct_cached_client_and_no_proxy_yields_the_direct_one`
+    /// a statement about the developer's shell: it held only while nothing set `HTTP(S)_PROXY`, and
+    /// this project's own CI container sets one. `None` is exactly the previous behavior.
+    async fn client_for_with_env(
+        &self,
+        url: &str,
+        env: Option<&cyrup_provider::auth::types::ProviderEnv>,
+    ) -> Result<reqwest::Client, String> {
         let resolved = cyrup_provider::utils::node_http_proxy::resolve_http_proxy_url_for_target(
             url,
             &cyrup_provider::auth::types::EnvAuthContext,
-            None,
+            env,
         )
         .await;
         let proxy_url = match resolved {
@@ -1598,10 +1614,19 @@ mod tests {
         let _serial = proxy_setting_guard().await;
         let caps = HttpCaps::new();
 
-        // No proxy configured and none in the ambient env for this target ⇒ the direct client.
-        // (`cyrup_provider::stream::sse::configure_http_proxy` is untouched by this test, so the
-        // resolver falls through to the ambient environment, which carries no proxy in CI.)
-        let direct = caps.client_for("https://example.invalid/x").await.expect("no proxy resolves");
+        // No proxy resolvable for this target ⇒ the direct client.
+        //
+        // This used to rely on the ambient environment "carrying no proxy in CI" — which is not
+        // true of this project's own container, where `HTTPS_PROXY` is set and the resolver
+        // therefore DID return a proxy, populating the cache and failing the assertion below. Pin
+        // the decision in an overlay instead: `no_proxy` naming the target exempts it, so the
+        // resolver yields `None` on every host, which is the branch this assertion is about.
+        let mut no_proxy_env = cyrup_provider::auth::types::ProviderEnv::new();
+        no_proxy_env.insert("no_proxy".to_string(), "example.invalid".to_string());
+        let direct = caps
+            .client_for_with_env("https://example.invalid/x", Some(&no_proxy_env))
+            .await
+            .expect("no proxy resolves");
         assert!(
             caps.proxied.lock().expect("cache lock").is_empty(),
             "the no-proxy path must not populate the per-proxy cache"
@@ -1652,8 +1677,22 @@ mod tests {
         let _restore = ClearProxySettingOnDrop;
         cyrup_provider::configure_http_proxy(Some("socks5://127.0.0.1:1080".to_string()));
 
+        // Pin the proxy keys in an overlay rather than letting the ambient env decide which one
+        // the resolver sees. `get_proxy_env` consults the overlay, then the ambient env, and only
+        // then the process-global `httpProxy` setting — so on a host that exports `HTTPS_PROXY`
+        // (this project's CI container does) the ambient value was selected and the SOCKS setting
+        // above was never reached: `client_for` returned a perfectly good http-proxied client and
+        // the refusal this test exists to pin never happened. Naming the same SOCKS URL in the
+        // overlay makes it the resolved proxy on every host; `no_proxy` names a non-target host so
+        // an ambient exemption cannot skip proxying altogether.
+        let mut socks_env = cyrup_provider::auth::types::ProviderEnv::new();
+        for k in ["http_proxy", "https_proxy", "all_proxy"] {
+            socks_env.insert(k.to_string(), "socks5://127.0.0.1:1080".to_string());
+        }
+        socks_env.insert("no_proxy".to_string(), "never-matches.invalid".to_string());
+
         let err = caps
-            .client_for("https://example.invalid/x")
+            .client_for_with_env("https://example.invalid/x", Some(&socks_env))
             .await
             .expect_err("a SOCKS httpProxy must fail the request, not silently go direct");
         assert!(
@@ -1665,12 +1704,16 @@ mod tests {
             "a refused proxy must not be cached"
         );
 
-        // The same call with the setting cleared resolves to the direct client again — so the
-        // refusal above is the SETTING's doing, not this URL's.
+        // The same call with no proxy resolvable resolves to the direct client again — so the
+        // refusal above is the PROXY's doing, not this URL's. Exempt the target in the overlay so
+        // "nothing resolves" holds on a host that exports a proxy, as clearing the process-global
+        // setting alone no longer guarantees.
         cyrup_provider::configure_http_proxy(None);
-        caps.client_for("https://example.invalid/x")
+        let mut exempt_env = cyrup_provider::auth::types::ProviderEnv::new();
+        exempt_env.insert("no_proxy".to_string(), "example.invalid".to_string());
+        caps.client_for_with_env("https://example.invalid/x", Some(&exempt_env))
             .await
-            .expect("with no proxy configured the direct client is handed back");
+            .expect("with no proxy resolvable the direct client is handed back");
     }
 
     /// `Accept-Encoding` defaults must match real `fetch()`'s request-header algorithm exactly

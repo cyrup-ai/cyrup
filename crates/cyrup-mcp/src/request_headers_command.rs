@@ -1274,9 +1274,24 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn descendant_discovery_finds_this_processs_own_children() {
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 5"])
+        // Spawn `sleep` DIRECTLY rather than via `/bin/sh -c "sleep 5"`, and null BOTH pipes.
+        //
+        // Via a shell this test leaked, and whether it leaked depended on which `/bin/sh` the
+        // machine has. `bash -c "sleep 5"` execs the simple command, so the spawned pid *is*
+        // `sleep` and `child.kill()` reaps it. `dash` — `/bin/sh` on Debian-family images, which
+        // is what CI runs — forks instead, so the pid is the shell and `sleep` is a GRANDCHILD:
+        // `kill` killed only the shell and left `sleep` orphaned for its full 5s. Because only
+        // `stdout` was redirected, that orphan inherited the harness's stderr and held the pipe
+        // open, which is exactly the "leaky test" shape `.config/nextest.toml` arms its 500ms
+        // detector against — a deterministic LEAK-FAIL on dash, green on bash.
+        //
+        // No shell means no grandchild to orphan, so `kill` is authoritative; nulling stderr as
+        // well as stdout means the child holds no harness pipe even if teardown were to race.
+        // The assertion is unchanged: `sleep` is still a direct child of this process.
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
             .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let self_pid = i32::try_from(std::process::id()).unwrap();
