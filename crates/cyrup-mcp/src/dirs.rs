@@ -58,11 +58,18 @@
 //! first-class [`HashValue::Undefined`] variant instead of collapsing absence onto
 //! `serde_json::Value::Null`: collapsing it is exactly the divergence MCP-070 exists to close.
 //!
-//! **Reciprocal change owed (MCP-070 option (b), MCP-094).** The existing reader inserts
-//! `Value::Null` for absent fields, renders that as `"null"`, hashes **11** keys rather than the 13
-//! below, and uses the **raw** `definition.url` instead of `resolveServerUrl`'s output. It must be
-//! upgraded in the same change as the first cache write, or no `cyrup-mcp`-written entry will ever
-//! validate. The golden vectors in this module's tests are the shared conformance fixture.
+//! **The reciprocal change has landed (MCP-070 option (b), MCP-094, MCP-141/142/143/144/145).**
+//! `cyrup_ext_subagents::exec::mcp_direct_tools` now builds the same fourteen keys in the same
+//! resolved forms, renders an absent field as the bare `undefined` token, and carries the same
+//! `try`/`catch` on an unhashable definition. Neither side owns the contract alone: that crate takes
+//! `cyrup-mcp` as a **dev-dependency** and asserts its pre-image, its digest and its tool names
+//! against the functions below rather than against constants copied out of them, so the two cannot
+//! drift apart without a test failing.
+//!
+//! One residue is named rather than hidden: [`home_dir`] here is `$HOME`, the reader's is
+//! `CYRUP_HOME` → `HOME`, so a `cwd` beginning with `~` hashes differently under a `CYRUP_HOME` that
+//! is not `HOME`. That is MCP-139's agent-dir axis 3, whose fix is a single shared resolver
+//! spanning this crate, `cyrup_ext`'s `npx_resolver` and that reader.
 
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -73,6 +80,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use crate::config::{HttpRequestHeadersCommand, ServerEntry};
+use crate::credentials::EnvFn;
 use crate::errors::{McpError, McpResult};
 
 /// `getAppName()`'s value for this distribution. Reaches the wire in the OAuth dynamic client
@@ -242,6 +250,31 @@ pub fn agents_global_configs(home: &Path) -> [PathBuf; 2] {
         home.join(".agents").join(MCP_CONFIG_FILE),
         home.join(".agents").join("mcp").join(MCP_CONFIG_FILE),
     ]
+}
+
+/// node's `os.homedir()` — the home `resolveConfigPath` expands `~` against (`utils.ts:190`).
+///
+/// **Not a fourth agent-dir resolver.** This is `<home>`, not `<agent_dir>`; [`McpDirs`] still
+/// takes its agent dir from `cyrup_config::ConfigDirs` and this module still refuses to re-resolve
+/// it (see the module header). The one thing that needs a home and cannot be handed one is
+/// [`crate::registration::default_server_hasher`]: [`ServerHasher`](crate::registration::ServerHasher)
+/// is a bare `fn` pointer with nowhere to carry state, and it exists precisely so
+/// `is_server_cache_valid` stays a two-argument predicate.
+///
+/// `$HOME` first, then `$USERPROFILE`, then empty — which is what node does on each platform, minus
+/// the `getpwuid` fallback that has no `std` equivalent and that a process without `$HOME` would
+/// need. An empty home only matters for a `cwd` that starts with `~`, and there it yields the
+/// remainder unrooted rather than a wrong absolute path.
+///
+/// **This is not the home the in-tree reader uses.** `mcp_direct_tools::home_dir` is
+/// `CYRUP_HOME` → `HOME` → tempdir, so the two differ exactly when `CYRUP_HOME` is set to something
+/// other than `HOME` — MCP-139's agent-dir axis 3, whose fix is the single shared resolver that
+/// unit specifies and that lives outside this crate.
+#[must_use]
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map_or_else(PathBuf::new, PathBuf::from)
 }
 
 /// `agent-dir.ts`'s `~` expansion, reproduced exactly because it is *not* the same as a shell's:
@@ -507,8 +540,26 @@ pub struct ServerCacheEntry {
     pub instructions: Option<String>,
     /// `Date.now()` at capture, in **milliseconds**. `0` is treated as absent — upstream's guard is
     /// the falsy test `!entry.cachedAt`, which rejects `0` as well as `undefined`.
-    #[serde(default)]
+    ///
+    /// The custom deserialiser is MCP-145's `typeof entry.cachedAt !== "number"` arm made
+    /// non-destructive: a plain `i64` makes `"cachedAt": "1760000000000"` a **parse error**, which
+    /// [`load_metadata_cache`] turns into `None` for the whole file, where upstream rejects only
+    /// that one entry. Anything that is not a JSON number lands on `0`, which the falsy test
+    /// already rejects. See [`crate::registration::lenient_epoch_ms`], its twin on the lenient
+    /// reader over the same bytes.
+    #[serde(default, deserialize_with = "lenient_epoch_ms")]
     pub cached_at: i64,
+}
+
+/// `i64` epoch milliseconds that answers `0` for **any** non-number instead of failing the parse —
+/// see [`ServerCacheEntry::cached_at`]. `0` is upstream's falsy `cachedAt`, i.e. "invalid entry".
+fn lenient_epoch_ms<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0))
 }
 
 /// The whole on-disk cache — `types.ts:648` `MetadataCache`.
@@ -588,6 +639,140 @@ pub fn save_metadata_cache(path: &Path, cache: &MetadataCache) -> McpResult<()> 
         let _ = std::fs::remove_file(&temp);
         McpError::Io { path: path.to_path_buf(), source }
     })
+}
+
+// -------------------------------------------------------------------------------------------
+// The serialisers — live discovery result → cache entry (`metadata-cache.ts`; MCP-140)
+// -------------------------------------------------------------------------------------------
+
+/// `extractUiToolVisibility(meta)` (`ui-tool-visibility.ts:3`) — the `_meta.ui.visibility` array,
+/// normalised.
+///
+/// Five arms, and the two that return an **empty** vector rather than `None` are the load-bearing
+/// ones: `Some(vec![])` means "the server said something about visibility that this client does not
+/// understand", and [`crate::registration::is_ui_tool_visible_to_model`] answers `false` for it —
+/// fail-closed. `None` means "the server said nothing", which is visible. Collapsing the two would
+/// expose to the model every tool a server marked app-only with a spelling we do not know.
+///
+/// * no `_meta`, or `_meta.ui` missing / not an object / an array ⇒ `None`
+/// * `_meta.ui.visibility` absent ⇒ `None`
+/// * `visibility` present but not an array ⇒ `Some(vec![])`
+/// * any element that is neither `"model"` nor `"app"` ⇒ `Some(vec![])` — the **whole** list is
+///   discarded on one bad element, not just that element
+/// * otherwise the elements, deduplicated, in first-occurrence order
+///
+/// **Cut 2 keeps this.** MCP Apps went, but the *filter* stays: a cache written by an
+/// upstream-compatible producer still has to hide what the server hid (§3.17's "Cut-2 seam inside
+/// the schema").
+#[must_use]
+pub fn extract_ui_tool_visibility(meta: Option<&Value>) -> Option<Vec<String>> {
+    let ui = meta?.as_object()?.get("ui")?;
+    // `Array.isArray(ui)` is excluded explicitly upstream; `as_object` already rejects an array,
+    // and it also rejects the `null` that `!ui` catches.
+    let visibility = ui.as_object()?.get("visibility")?;
+    let Some(entries) = visibility.as_array() else {
+        return Some(Vec::new());
+    };
+    let mut values: Vec<String> = Vec::new();
+    for entry in entries {
+        let Some(name) = entry.as_str().filter(|n| *n == "model" || *n == "app") else {
+            return Some(Vec::new());
+        };
+        if !values.iter().any(|seen| seen == name) {
+            values.push(name.to_string());
+        }
+    }
+    Some(values)
+}
+
+/// `serializeTools(tools)` (`metadata-cache.ts:281`) — `tools/list` → [`CachedTool`].
+///
+/// `filter(t => t?.name)` is a **truthiness** test, so a tool whose name is the empty string is
+/// dropped as well as one with no name at all; `rmcp`'s `Tool::name` is a non-optional
+/// `Cow<'static, str>`, so emptiness is the whole of that filter here.
+///
+/// Every optional field is emitted **only when defined** — the object-spread form
+/// `...(x !== undefined ? { x } : {})`, which never writes an explicit `null`. In Rust that is
+/// `Option` plus the `skip_serializing_if` already on [`CachedTool`].
+///
+/// **Two Cut-2 fields are never written.** `uiResourceUri` (upstream's `tryGetToolUiResourceUri`)
+/// and `uiStreamMode` (`extractToolUiStreamMode`) belong to MCP Apps, which is cut whole; their
+/// *names* stay reserved in the on-disk schema so a pi-written cache round-trips, and
+/// [`CACHE_VERSION`] is deliberately not bumped to drop them. `uiVisibility` is **not** cut — see
+/// [`extract_ui_tool_visibility`].
+///
+/// `inputSchema` is always present on `rmcp`'s `Tool` (an `Arc<JsonObject>`, not an `Option`), so
+/// the "only when defined" rule has nothing to suppress; it is written raw and unnormalised,
+/// because `normalizeDirectToolInputSchema` runs at registration, not at cache time (MCP-087).
+#[must_use]
+pub fn serialize_tools(tools: &[rmcp::model::Tool]) -> Vec<CachedTool> {
+    tools
+        .iter()
+        .filter(|tool| !tool.name.is_empty())
+        .map(|tool| CachedTool {
+            name: tool.name.to_string(),
+            description: tool.description.as_ref().map(std::string::ToString::to_string),
+            input_schema: Some(Value::Object((*tool.input_schema).clone())),
+            ui_resource_uri: None,
+            ui_visibility: extract_ui_tool_visibility(
+                tool.meta.as_ref().map(|meta| Value::Object(meta.0.clone())).as_ref(),
+            ),
+            ui_stream_mode: None,
+        })
+        .collect()
+}
+
+/// `serializeResources(resources)` (`metadata-cache.ts:299`) — `resources/list` → [`CachedResource`].
+///
+/// `filter(r => r?.name && r?.uri)` needs **both** truthy: a resource missing either one would
+/// produce a `read_` tool that cannot be named or cannot be read, so it is dropped here rather than
+/// at reconstruction. `description` is the only optional member; the
+/// `` `Read resource: ${uri}` `` fallback belongs to the *reconstructor*, not here, so an absent
+/// description round-trips as absent.
+#[must_use]
+pub fn serialize_resources(resources: &[rmcp::model::Resource]) -> Vec<CachedResource> {
+    resources
+        .iter()
+        .filter(|resource| !resource.name.is_empty() && !resource.uri.is_empty())
+        .map(|resource| CachedResource {
+            uri: resource.uri.clone(),
+            name: resource.name.clone(),
+            description: resource.description.clone(),
+        })
+        .collect()
+}
+
+/// `serializePrompts(prompts)` (`metadata-cache.ts:309`) — `prompts/list` → [`CachedPrompt`].
+///
+/// `(prompts ?? [])` then `filter(prompt => prompt?.name)`, and each argument filtered on
+/// `argument?.name` in turn — a nameless argument is dropped, it does not drop the prompt.
+///
+/// **`arguments` is emitted only when `Array.isArray(prompt.arguments)`**, which is why
+/// [`CachedPrompt::arguments`] is `Option<Vec<_>>` and not `Vec<_>`: a server that sends no
+/// `arguments` key round-trips as absent, while one that sends `[]` round-trips as an empty array.
+/// Flattening the two would be invisible in the file and visible in the slash command's help.
+#[must_use]
+pub fn serialize_prompts(prompts: &[rmcp::model::Prompt]) -> Vec<CachedPrompt> {
+    prompts
+        .iter()
+        .filter(|prompt| !prompt.name.is_empty())
+        .map(|prompt| CachedPrompt {
+            name: prompt.name.clone(),
+            title: prompt.title.clone(),
+            description: prompt.description.clone(),
+            arguments: prompt.arguments.as_ref().map(|arguments| {
+                arguments
+                    .iter()
+                    .filter(|argument| !argument.name.is_empty())
+                    .map(|argument| CachedPromptArgument {
+                        name: argument.name.clone(),
+                        description: argument.description.clone(),
+                        required: argument.required,
+                    })
+                    .collect()
+            }),
+        })
+        .collect()
 }
 
 /// `isServerCacheValid(entry, definition, maxAgeMs)` (`metadata-cache.ts:114`), with the digest
@@ -685,13 +870,18 @@ pub struct ResolvedIdentity {
 }
 
 impl ResolvedIdentity {
-    /// The five fields copied **verbatim** off the definition, with no resolver applied.
+    /// The six fields copied **verbatim** off the definition, with no resolver applied.
     ///
     /// Correct only for a definition in which none of them contains an interpolation token
-    /// (`${VAR}`, `$VAR`, `{env:VAR}`), a `~`, or a `!`/`!!` secret marker — and wrong, silently,
-    /// for any that does. It exists so the cache writer and these tests have a call site that
-    /// compiles before MCP-082 and MCP-084 land; every production caller must replace it with the
-    /// real resolvers. TODO(MCP-082, MCP-084): delete this constructor once they exist.
+    /// (`${VAR}`, `$env:VAR`, `{env:VAR}`), a `~`, or a `!`/`!!` secret marker — and wrong,
+    /// silently, for any that does.
+    ///
+    /// **Kept, no longer a placeholder (MCP-141).** [`Self::resolve`] below is the real constructor
+    /// and is what every production caller now uses; this one survives as the *fixture* form, so a
+    /// golden vector can pin a pre-image without depending on the ambient environment or on a home
+    /// directory. For a definition with no token, no `~` and no `!`, the two are equal by
+    /// construction — which is exactly what `resolve_and_verbatim_agree_when_nothing_needs_resolving`
+    /// asserts, and why the golden vectors below stayed byte-identical across MCP-141.
     #[must_use]
     pub fn verbatim(entry: &ServerEntry) -> Self {
         Self {
@@ -703,6 +893,97 @@ impl ResolvedIdentity {
             request_headers_command: entry.request_headers_command.clone(),
         }
     }
+
+    /// `computeServerHash`'s six resolver calls, run for real (`metadata-cache.ts:86-108` @
+    /// v2.26.1) — MCP-141 leg (b), which closes the split where the in-tree *reader* resolved and
+    /// this *writer* did not.
+    ///
+    /// | field | upstream | here |
+    /// |---|---|---|
+    /// | `env` | `interpolateEnvRecord` | [`crate::secrets::interpolate_env_record`] |
+    /// | `cwd` | `resolveConfigPath` | [`crate::credentials::interpolate_env_vars`] + [`resolve_config_path_tail`] |
+    /// | `url` | `resolveServerUrl` — **throws** | [`crate::credentials::resolve_server_url`] — the one `Err` arm |
+    /// | `headers` | `interpolateEnvRecord` | [`crate::secrets::interpolate_env_record`] |
+    /// | `bearerToken` | `resolveBearerToken` | [`crate::credentials::resolve_bearer_token`] |
+    /// | `requestHeadersCommand` | `interpolateEnvVars` ×3 + `interpolateEnvRecord` | same, below |
+    ///
+    /// **`env`/`headers` go through `interpolateSecretExpression`, not plain interpolation**
+    /// (MCP-144). `!!x` is un-escaped to the literal `!x` — the value the child will actually see —
+    /// while a bare `!cmd` is hashed as its own text and **never executed**: hashing happens on the
+    /// discovery, merge, preview and panel paths, and a resolver that spawned there would run
+    /// arbitrary shell out of a repo's `.mcp.json` merely because the user listed their config.
+    /// [`crate::secrets::resolve_command_secret`] — the form that does spawn — is unreachable from
+    /// here by construction.
+    ///
+    /// **The only failure is the URL.** Every other resolver is total, so an `Err` from this
+    /// constructor means exactly one thing: `resolveServerUrl` threw, and
+    /// [`crate::registration::is_server_cache_valid`] must answer `false` (MCP-145). That is the
+    /// sole mechanism keeping a `url: "https://x/${MISSING}"` server out of the cold-start direct
+    /// tool surface.
+    ///
+    /// `env` and `home` are arguments rather than ambient reads for the reason every other seam in
+    /// this crate takes them: edition 2024 makes `std::env::set_var` `unsafe`, so a test that pinned
+    /// a variable could not undo it, and a hash fixture that read the real environment would not be
+    /// a fixture. Production passes [`crate::secrets::PROCESS_ENV`] and
+    /// `cyrup_config::ConfigDirs::home`.
+    pub fn resolve(entry: &ServerEntry, env: &EnvFn, home: &Path) -> McpResult<Self> {
+        Ok(Self {
+            env: crate::secrets::interpolate_env_record(entry.env.as_ref(), env),
+            cwd: entry.cwd.as_deref().map(|raw| resolve_config_path(raw, env, home)),
+            url: crate::credentials::resolve_server_url(entry.url.as_deref(), env)?,
+            headers: crate::secrets::interpolate_env_record(entry.headers.as_ref(), env),
+            bearer_token: crate::credentials::resolve_bearer_token(
+                entry.bearer_token.as_deref(),
+                entry.bearer_token_env.as_deref(),
+                env,
+            ),
+            request_headers_command: entry.request_headers_command.as_ref().map(|command| {
+                // `metadata-cache.ts:94-101` — `command` and each `args` element go through plain
+                // `interpolateEnvVars` (NOT the secret grammar: upstream does not call
+                // `interpolateSecretExpression` here), `env` through `interpolateEnvRecord`, and
+                // `timeoutMs` is copied through untouched.
+                HttpRequestHeadersCommand {
+                    command: command
+                        .command
+                        .as_deref()
+                        .map(|c| crate::credentials::interpolate_env_vars(c, env)),
+                    args: command.args.as_ref().map(|args| {
+                        args.iter()
+                            .map(|a| crate::credentials::interpolate_env_vars(a, env))
+                            .collect()
+                    }),
+                    env: crate::secrets::interpolate_env_record(command.env.as_ref(), env),
+                    timeout_ms: command.timeout_ms,
+                }
+            }),
+        })
+    }
+}
+
+/// `resolveConfigPath(value)` (`utils.ts:187`) **whole** — interpolate, then expand `~`.
+///
+/// The two halves live apart in this crate ([`crate::credentials::interpolate_env_vars`] is the
+/// crate's single interpolation engine, [`resolve_config_path_tail`] is the `~` rule), and every
+/// caller that wants upstream's function wants both in that order. Returns a `String`, not a
+/// `PathBuf`, because the hash pre-image is a **JSON string** and a lossy `PathBuf` round-trip on a
+/// non-UTF-8 path would change the digest.
+#[must_use]
+pub fn resolve_config_path(raw: &str, env: &EnvFn, home: &Path) -> String {
+    let interpolated = crate::credentials::interpolate_env_vars(raw, env);
+    resolve_config_path_tail(&interpolated, home).to_string_lossy().into_owned()
+}
+
+/// [`compute_server_hash`] with the resolvers applied — `computeServerHash(definition)` end to end
+/// (MCP-141), and the function [`crate::registration::is_server_cache_valid`]'s default hasher is.
+///
+/// `Err` is upstream's `throw`, which every caller maps to "this cache entry is not valid"
+/// (MCP-145). It has exactly one source: [`crate::credentials::resolve_server_url`].
+pub fn try_compute_server_hash(
+    entry: &ServerEntry,
+    env: &EnvFn,
+    home: &Path,
+) -> McpResult<String> {
+    Ok(compute_server_hash(entry, &ResolvedIdentity::resolve(entry, env, home)?))
 }
 
 /// One node of `stableStringify`'s input (`metadata-cache.ts:344`).
@@ -935,7 +1216,7 @@ fn opt_serde<T: Serialize>(value: Option<&T>) -> HashValue {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -1394,6 +1675,372 @@ mod tests {
     /// The two readers of `mcp-cache.json` must agree about what is present. Before integration
     /// this file's reader was strict where `crate::registration`'s is lenient, so a cache missing
     /// one key made the panel see nothing while the registered surface saw everything.
+
+    // -------------------------------------------------------------------------------------
+    // MCP-141 leg (b) / MCP-143 / MCP-144 — the resolvers actually run now
+    // -------------------------------------------------------------------------------------
+
+    /// The fixture environment the resolved vectors below were generated against.
+    fn vector_env() -> EnvFn {
+        std::sync::Arc::new(|name: &str| match name {
+            "HOST" => Some("a.example".to_string()),
+            "TOK_ENV" => Some("from-env".to_string()),
+            _ => None,
+        })
+    }
+
+    /// `/home/u` — the `homedir()` the node run that produced the vectors below saw
+    /// (`process.env.HOME = "/home/u"` before importing, asserted by printing `homedir()`).
+    fn vector_home() -> PathBuf {
+        PathBuf::from("/home/u")
+    }
+
+    /// The four golden vectors above use [`ResolvedIdentity::verbatim`]; this proves that is not a
+    /// weaker assertion. None of their fields carries an interpolation token, a `~` or a `!`, so
+    /// the real resolvers are the identity on them — which is why MCP-141 leg (b) could land
+    /// without moving a single pinned digest.
+    #[test]
+    fn resolve_and_verbatim_agree_when_nothing_needs_resolving() {
+        for json in [
+            r#"{ "command": "npx", "args": ["-y", "x"], "env": { "A": "1" }, "cwd": "/home/u/work",
+                 "exposeResources": false, "excludeTools": ["danger_*"] }"#,
+            r#"{ "url": "https://api.example.com/mcp", "headers": { "X": "k" }, "auth": "bearer",
+                 "protocolVersion": "2026-07-28", "bearerToken": "!tok", "bearerTokenEnv": "TOK_ENV" }"#,
+            r#"{}"#,
+        ] {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            let resolved = ResolvedIdentity::resolve(&entry, &vector_env(), &vector_home())
+                .expect("hashable");
+            assert_eq!(resolved, ResolvedIdentity::verbatim(&entry), "{json}");
+        }
+    }
+
+    /// **The vector that proves the resolvers run**, and the one MCP-141 leg (b) exists for.
+    ///
+    /// Every resolver is exercised at once: all three interpolation forms (MCP-143) in `env`, the
+    /// `!!` escape and the `!` marker (MCP-144), a `~`-prefixed and interpolated `cwd`, an
+    /// interpolated `url`, an interpolated header beside a literal-`!` header, and a `bearerToken`
+    /// supplied by `bearerTokenEnv`.
+    ///
+    /// **Provenance.** Both constants come from *running upstream* on node 22 against
+    /// `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`): `computeServerHash` for the digest, and
+    /// `metadata-cache.ts:344`'s `stableStringify` over `computeServerHash`'s own identity literal —
+    /// built from upstream's real `interpolateEnvRecord` / `resolveConfigPath` / `resolveServerUrl` /
+    /// `resolveBearerToken` — for the pre-image. The reconstruction was proved faithful by asserting
+    /// `sha256(preImage) === computeServerHash(definition)` for this and every other fixture before
+    /// the `socket` member was removed.
+    ///
+    /// **And the caveat the writer's other vectors carry applies here too**: the two constants below
+    /// are upstream's algorithm with `socket` REMOVED, so they are byte-compatible with cyrup and
+    /// not with pi. Upstream's own digest for this same fixture is
+    /// `ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3`, which differs by exactly
+    /// the `"socket":undefined` member — the standing divergence pinned in
+    /// `cyrup_ext_subagents::exec::mcp_direct_tools`'s
+    /// `the_socket_key_is_the_one_divergence_from_upstreams_own_digest`.
+    #[test]
+    fn the_resolved_identity_golden_vector() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{
+                "command": "npx",
+                "args": ["-y", "srv"],
+                "env": {
+                    "PLAIN": "p",
+                    "INTERP": "${HOST}",
+                    "BRACE": "{env:HOST}",
+                    "DOLLAR": "$env:HOST",
+                    "ESCAPED": "!!${HOST}",
+                    "MARKER": "!op read x"
+                },
+                "cwd": "~/work/${HOST}",
+                "url": "https://${HOST}/mcp",
+                "headers": { "X-Host": "{env:HOST}", "X-Lit": "!keep" },
+                "bearerTokenEnv": "TOK_ENV",
+                "exposeResources": false,
+                "includeTools": ["a"],
+                "excludeTools": ["b"]
+            }"#,
+        )
+        .unwrap();
+        let resolved =
+            ResolvedIdentity::resolve(&entry, &vector_env(), &vector_home()).expect("hashable");
+
+        assert_eq!(
+            server_identity_pre_image(&entry, &resolved),
+            concat!(
+                r#"{"args":["-y","srv"],"auth":undefined,"bearerToken":"from-env","#,
+                r#""bearerTokenEnv":"TOK_ENV","command":"npx","cwd":"/home/u/work/a.example","#,
+                r#""env":{"BRACE":"a.example","DOLLAR":"a.example","ESCAPED":"!a.example","#,
+                r#""INTERP":"a.example","MARKER":"!op read x","PLAIN":"p"},"#,
+                r#""excludeTools":["b"],"exposeResources":false,"#,
+                r#""headers":{"X-Host":"a.example","X-Lit":"!keep"},"includeTools":["a"],"#,
+                r#""protocolVersion":undefined,"requestHeadersCommand":undefined,"#,
+                r#""url":"https://a.example/mcp"}"#
+            )
+        );
+        assert_eq!(
+            try_compute_server_hash(&entry, &vector_env(), &vector_home()).expect("hashable"),
+            "c273715eef4b2fb58f5db61d54793b01abd262edd7e59a5c7b189fddf910bd3c"
+        );
+
+        // …and the same definition under `verbatim` is a DIFFERENT digest — which is the whole
+        // point: the writer used to stamp that one while the reader validated against this one.
+        assert_ne!(
+            compute_server_hash(&entry, &ResolvedIdentity::verbatim(&entry)),
+            try_compute_server_hash(&entry, &vector_env(), &vector_home()).expect("hashable")
+        );
+    }
+
+    /// MCP-144 on the two `bearerToken` arms, pinned by digest.
+    ///
+    /// `!!${HOST}` loses exactly **one** `!` and interpolates the rest, so it hashes as the value
+    /// the transport will send; `!op read tok` hashes as its own text and is never executed. Both
+    /// digests are node-generated the same way as the vector above.
+    #[test]
+    fn the_secret_expression_grammar_is_in_the_digest() {
+        let escaped: ServerEntry = serde_json::from_str(
+            r#"{ "url": "https://api.example.com/mcp", "bearerToken": "!!${HOST}" }"#,
+        )
+        .unwrap();
+        let resolved =
+            ResolvedIdentity::resolve(&escaped, &vector_env(), &vector_home()).expect("hashable");
+        assert_eq!(resolved.bearer_token.as_deref(), Some("!a.example"));
+        assert_eq!(
+            compute_server_hash(&escaped, &resolved),
+            "bdc09d452a319a074bd61da2a05dc54a98e5e1d95e619c4a731220f64fa520fa"
+        );
+
+        let marker: ServerEntry = serde_json::from_str(
+            r#"{ "url": "https://api.example.com/mcp", "bearerToken": "!op read tok" }"#,
+        )
+        .unwrap();
+        let resolved =
+            ResolvedIdentity::resolve(&marker, &vector_env(), &vector_home()).expect("hashable");
+        assert_eq!(resolved.bearer_token.as_deref(), Some("!op read tok"));
+        assert_eq!(
+            compute_server_hash(&marker, &resolved),
+            "ffcfe72aaf2b4d1e699de1c1be95f7c623f69f9cea8f2dd864b8ef33f9d44414"
+        );
+    }
+
+    /// MCP-141's stated behaviour — "a URL server referencing a missing variable must never be
+    /// cache-valid" — and MCP-145's catcher.
+    ///
+    /// All three messages are byte-exact against a node 22 run of `utils.ts` @ v2.26.1: the singular
+    /// and plural forms of the missing-variable throw (`"https://x/${NOPE}"` and
+    /// `"https://x/${NOPE}/${ALSONOPE}"`) and the post-interpolation parse failure (`"${HOST}"`,
+    /// which interpolates to the bare host `a.example` and is not a URL).
+    #[test]
+    fn an_unresolvable_url_throws_and_the_throw_reaches_the_cache_predicate() {
+        let cases = [
+            (
+                r#"{ "url": "https://x.example/${NOPE}/mcp" }"#,
+                "Missing environment variable in MCP server URL: NOPE",
+            ),
+            (
+                r#"{ "url": "https://x.example/${NOPE}/{env:ALSONOPE}" }"#,
+                "Missing environment variables in MCP server URL: NOPE, ALSONOPE",
+            ),
+            (
+                r#"{ "url": "$env:HOST" }"#,
+                "Invalid MCP server URL after environment interpolation: a.example",
+            ),
+        ];
+        for (json, message) in cases {
+            let entry: ServerEntry = serde_json::from_str(json).unwrap();
+            let error = try_compute_server_hash(&entry, &vector_env(), &vector_home())
+                .expect_err(json)
+                .to_string();
+            assert_eq!(error, message, "{json}");
+        }
+
+        // The third pattern raises the throw too — `getMissingEnvVars` scans all three forms
+        // (MCP-143), so `{env:MISSING}` in a URL is as fatal as `${MISSING}`.
+        let brace: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://x.example/{env:NOPE}" }"#).unwrap();
+        assert!(try_compute_server_hash(&brace, &vector_env(), &vector_home()).is_err());
+    }
+
+    // -------------------------------------------------------------------------------------
+    // MCP-140 — the serialisers
+    // -------------------------------------------------------------------------------------
+
+    #[test]
+    fn serialize_tools_drops_nameless_tools_and_writes_only_defined_fields() {
+        let mut described = rmcp::model::Tool::new(
+            "search",
+            "find things",
+            std::sync::Arc::new(
+                serde_json::json!({ "type": "object" }).as_object().unwrap().clone(),
+            ),
+        );
+        described.meta = Some(rmcp::model::MetaObject(
+            serde_json::json!({ "ui": { "visibility": ["model", "model", "app"] } })
+                .as_object()
+                .unwrap()
+                .clone(),
+        ));
+        let bare = rmcp::model::Tool::new(
+            "bare",
+            "",
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+        let nameless = rmcp::model::Tool::new(
+            "",
+            "dropped",
+            std::sync::Arc::new(serde_json::Map::new()),
+        );
+
+        let cached = serialize_tools(&[described, bare, nameless]);
+        assert_eq!(cached.len(), 2, "the nameless tool is filtered out");
+        assert_eq!(cached[0].name, "search");
+        assert_eq!(cached[0].description.as_deref(), Some("find things"));
+        // Deduplicated, in first-occurrence order.
+        assert_eq!(
+            cached[0].ui_visibility.as_deref(),
+            Some(["model".to_string(), "app".to_string()].as_slice())
+        );
+        // Both Cut-2 fields stay absent — never `null`, and never a bumped CACHE_VERSION.
+        assert!(cached[0].ui_resource_uri.is_none());
+        assert!(cached[0].ui_stream_mode.is_none());
+        assert!(cached[1].ui_visibility.is_none(), "no `_meta` means visible, not hidden");
+
+        let json = serde_json::to_string(&cached[1]).unwrap();
+        assert!(!json.contains("uiVisibility"), "{json}");
+        assert!(!json.contains("null"), "an absent field is omitted, never written as null: {json}");
+    }
+
+    /// `extractUiToolVisibility`'s fail-closed arms — the two that answer `Some(vec![])` rather
+    /// than `None`, which [`crate::registration::is_ui_tool_visible_to_model`] reads as "hidden".
+    #[test]
+    fn ui_visibility_extraction_fails_closed_on_anything_unrecognised() {
+        let visibility = |value: serde_json::Value| extract_ui_tool_visibility(Some(&value));
+        assert_eq!(visibility(serde_json::json!({})), None, "no `ui` key");
+        assert_eq!(visibility(serde_json::json!({ "ui": ["model"] })), None, "`ui` is an array");
+        assert_eq!(visibility(serde_json::json!({ "ui": null })), None);
+        assert_eq!(visibility(serde_json::json!({ "ui": { "other": 1 } })), None);
+        assert_eq!(
+            visibility(serde_json::json!({ "ui": { "visibility": "model" } })),
+            Some(Vec::new()),
+            "present but not an array is NOT absent"
+        );
+        assert_eq!(
+            visibility(serde_json::json!({ "ui": { "visibility": ["model", "future"] } })),
+            Some(Vec::new()),
+            "one unrecognised element discards the whole list"
+        );
+        assert_eq!(
+            visibility(serde_json::json!({ "ui": { "visibility": [] } })),
+            Some(Vec::new())
+        );
+        for empty in [Some(Vec::new()), None] {
+            assert_eq!(
+                crate::registration::is_ui_tool_visible_to_model(
+                    empty.as_ref().map(|v: &Vec<String>| serde_json::json!(v)).as_ref()
+                ),
+                empty.is_none(),
+                "an empty list must hide, an absent list must show"
+            );
+        }
+    }
+
+    #[test]
+    fn serialize_resources_needs_both_a_name_and_a_uri() {
+        let good = rmcp::model::Resource::new("file:///a", "My File")
+            .with_description("the a file");
+        let no_description = rmcp::model::Resource::new("file:///b", "B");
+        let no_name = rmcp::model::Resource::new("file:///c", "");
+        let no_uri = rmcp::model::Resource::new("", "D");
+
+        let cached = serialize_resources(&[good, no_description, no_name, no_uri]);
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].uri, "file:///a");
+        assert_eq!(cached[0].name, "My File");
+        assert_eq!(cached[0].description.as_deref(), Some("the a file"));
+        // The `Read resource: {uri}` fallback belongs to the reconstructor, not here.
+        assert!(cached[1].description.is_none());
+    }
+
+    #[test]
+    fn serialize_prompts_keeps_absent_and_empty_arguments_distinct() {
+        let no_arguments = rmcp::model::Prompt::new("plain", Some("d"), None);
+        let empty_arguments = rmcp::model::Prompt::new("empty", None::<String>, Some(Vec::new()));
+        let with_arguments = rmcp::model::Prompt::new(
+            "args",
+            None::<String>,
+            Some(vec![
+                rmcp::model::PromptArgument::new("topic")
+                    .with_description("what about")
+                    .with_required(true),
+                rmcp::model::PromptArgument::new(""),
+            ]),
+        );
+        let nameless = rmcp::model::Prompt::new("", None::<String>, None);
+
+        let cached = serialize_prompts(&[no_arguments, empty_arguments, with_arguments, nameless]);
+        assert_eq!(cached.len(), 3, "only the nameless prompt is dropped");
+        assert!(cached[0].arguments.is_none(), "absent stays absent");
+        assert_eq!(cached[1].arguments.as_deref().map(<[_]>::len), Some(0), "`[]` stays `[]`");
+        let arguments = cached[2].arguments.as_deref().expect("arguments");
+        assert_eq!(arguments.len(), 1, "the nameless argument is dropped, the prompt is not");
+        assert_eq!(arguments[0].name, "topic");
+        assert_eq!(arguments[0].required, Some(true));
+
+        // Absent and empty are different BYTES, which is the only place the difference shows.
+        assert!(!serde_json::to_string(&cached[0]).unwrap().contains("arguments"));
+        assert!(serde_json::to_string(&cached[1]).unwrap().contains(r#""arguments":[]"#));
+    }
+
+    // -------------------------------------------------------------------------------------
+    // MCP-139 / MCP-145 — save over a corrupt file, and the two `cachedAt` rules
+    // -------------------------------------------------------------------------------------
+
+    /// §3.17's save contract on the path the merge cannot take: a file that does not parse, or
+    /// declares a foreign version, is **replaced** rather than merged, so the result holds only the
+    /// new servers — and it is a valid file afterwards.
+    #[test]
+    fn a_save_over_a_corrupt_file_replaces_it_with_only_the_new_servers() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mcp-cache.json");
+
+        for corrupt in ["{ not json", "", "null", r#"{"version":9,"servers":{"old":{}}}"#] {
+            std::fs::write(&path, corrupt).unwrap();
+            save_metadata_cache(&path, &cache_with(&["fresh"])).unwrap();
+
+            let loaded = load_metadata_cache(&path).expect("valid after the replace");
+            assert_eq!(loaded.version, CACHE_VERSION);
+            assert_eq!(loaded.servers.len(), 1, "{corrupt}");
+            assert!(loaded.servers.contains_key("fresh"), "{corrupt}");
+            assert!(!loaded.servers.contains_key("old"), "a foreign version is not merged");
+            assert!(
+                std::fs::read_dir(temp.path()).unwrap().count() == 1,
+                "the pid-suffixed temp file must be gone"
+            );
+        }
+    }
+
+    /// MCP-145's two `cachedAt` rules on the writer's own reader.
+    #[test]
+    fn cached_at_must_be_a_number_and_max_age_zero_disables_the_age_check() {
+        let year = 365 * 24 * 60 * 60 * 1000;
+        let old = entry_with("h", now_ms() - year);
+        assert!(!is_server_cache_valid(&old, "h", CACHE_MAX_AGE_MS), "a year is older than 7 days");
+        assert!(is_server_cache_valid(&old, "h", 0), "`maxAgeMs = 0` disables the age check");
+
+        // A JSON string `cachedAt` must invalidate THIS entry without costing the file its others.
+        let file = serde_json::json!({
+            "version": CACHE_VERSION,
+            "servers": {
+                "bad": { "configHash": "h", "cachedAt": "1760000000000", "tools": [], "resources": [] },
+                "good": { "configHash": "h", "cachedAt": 1_760_000_000_000_i64, "tools": [], "resources": [] }
+            }
+        });
+        let parsed: MetadataCache = serde_json::from_str(&file.to_string()).expect("still parses");
+        assert_eq!(parsed.servers.len(), 2, "one bad entry must not lose the whole file");
+        assert_eq!(parsed.servers["bad"].cached_at, 0, "a non-number lands on the falsy value");
+        assert!(!is_server_cache_valid(&parsed.servers["bad"], "h", 0));
+        assert!(is_server_cache_valid(&parsed.servers["good"], "h", 0));
+    }
+
     #[test]
     fn a_cache_missing_optional_keys_still_loads_here_and_in_registration() {
         let dir = tempfile::tempdir().unwrap();

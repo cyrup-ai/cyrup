@@ -42,25 +42,44 @@
 //!   (`tool-metadata.ts:46` and `:119`).
 //! * MCP-370 — `ToolPrefix` carries upstream's **four** modes and the server prefix goes through
 //!   `sanitizeServerPrefix` (`types.ts:667`/`:675`), which **preserves hyphens**.
+//! * MCP-143 — `interpolate_env_vars` runs upstream's **three** chained passes; the third,
+//!   `{env:NAME}`, was missing.
+//! * MCP-144 — hashed values go through the `!`/`!!` secret grammar
+//!   ([`interpolate_secret_expression`]), so `!!x` un-escapes to the literal `!x` and a bare `!cmd`
+//!   is hashed verbatim and **never executed**.
+//! * MCP-145 — the hash is fallible and [`is_server_cache_valid_with_age`] is upstream's
+//!   `try`/`catch`: an unresolvable `url` or a non-string `env` value makes the entry invalid
+//!   rather than producing a digest upstream would never produce.
+//!
+//! The writer's side of the same contract closed with them: `ResolvedIdentity::resolve`
+//! (MCP-141 leg (b)) replaced `ResolvedIdentity::verbatim` at every production call site, so both
+//! sides now hash the *resolved* forms and `reader_and_writer_agree_once_every_resolver_actually_runs`
+//! asserts one node-generated vector through both implementations.
 //!
 //! ## What this module is NOT byte-identical to, stated exactly
 //!
-//! Three separate divergences survive this change. Two are filed and deliberately out of scope:
-//! `interpolate_env_vars` is missing upstream's third `{env:NAME}` pattern (MCP-143), and the
-//! `!`/`!!` secret grammar is not applied to hashed values (MCP-144).
+//! **A digest divergence survives on `auth` and `protocolVersion`.** Upstream hashes both verbatim —
+//! `auth: definition.auth`, `protocolVersion: definition.protocolVersion` (`metadata-cache.ts:103-104`)
+//! — and `config.ts` validates neither at load; `Invalid MCP protocolVersion` is thrown at CONNECT
+//! time, long after the digest is taken. This reader holds both raw (`Option<Value>`) and so matches
+//! upstream. The writer types them (`cyrup_mcp::config::{AuthMode, ProtocolVersionSetting}`) behind
+//! `deserialize_with = "lenient"`, which drops any value the type does not accept to `None`, and
+//! `ProtocolVersionSetting` accepts only `"legacy" | "auto" | "2026-07-28"`. So for a server pinned
+//! to any OTHER real MCP revision — `"2025-06-18"`, say — the reader hashes the literal and the
+//! writer hashes `undefined`, and that server's cache entry can never validate. It fails safe (a
+//! re-discovery, not a wrong answer) and it is silent, which is why it is pinned by
+//! `a_protocol_revision_the_writers_enum_rejects_diverges_on_the_digest` below rather than left to
+//! be rediscovered. The fix is a passthrough arm on the writer's two enums so the raw value survives
+//! to the pre-image — a change to the config type model (13b), hence the owner's call, not a
+//! porter's.
 //!
-//! **The third is wider than the other two and is NOT a property of this file.** This reader
-//! RESOLVES the six resolvable identity fields, exactly as upstream does — `env` and `headers`
-//! through `interpolate_env_record`, `cwd` through `resolve_config_path` (which expands a leading
-//! `~`), `url` through `resolve_server_url`, `bearerToken` through `resolve_bearer_token` (which
-//! falls back to the *value* of `bearerTokenEnv`). The writer's two production call sites
-//! (`cyrup_mcp::ui` :1758/:5050) still pass `ResolvedIdentity::verbatim`, which resolves NOTHING —
-//! its own `TODO(MCP-082, MCP-084)` says so. So the two sides agree only for a definition whose
-//! `env`/`headers`/`url`/`cwd`/`requestHeadersCommand` contain no `${VAR}` and no `$env:VAR`, whose
-//! `cwd` has no leading `~`, and which does not rely on `bearerTokenEnv` to supply `bearerToken`.
-//! For anything else the reader is upstream-correct and the WRITER is the lagging side; the fix
-//! belongs in MCP-082/MCP-084, not here, and hashing raw here to match `verbatim` would be
-//! deliberately un-upstreaming the one side that is currently right.
+//! **A second, narrower divergence is a path one, not a digest one.** The home this
+//! module anchors `~` against ([`home_dir`]: `CYRUP_HOME` → `HOME` → tempdir) is not the home the
+//! writer's default hasher uses (`cyrup_mcp::dirs::home_dir`: `HOME` → `USERPROFILE`), so with
+//! `CYRUP_HOME` set to something other than `HOME` the two disagree — but only for a server whose
+//! `cwd` actually starts with `~`. That is the narrow tail of MCP-139's agent-dir axis 3, whose fix
+//! is the one shared agent-dir resolver that unit specifies, spanning `cyrup_ext`'s `npx_resolver`
+//! as well as this file.
 //!
 //! **And neither side matches upstream on `socket`.** `computeServerHash` builds a **15**-key
 //! identity whose third key is `socket: resolveConfigPath(definition.socket)`
@@ -202,8 +221,10 @@ pub struct ServerEntry {
     pub command: Option<String>,
     #[serde(default)]
     pub args: Option<Vec<String>>,
-    /// `Record<string, unknown>` in pi; non-string values are dropped by interpolation, so this is
-    /// held as raw JSON and filtered to strings at hash time (matching `interpolateEnvRecord`).
+    /// `Record<string, unknown>` in pi, so this is held as raw JSON. A non-string value makes
+    /// `interpolateEnvRecord` **throw** (`value.startsWith is not a function`), which
+    /// [`is_server_cache_valid_with_age`] turns into "not cache-valid" — it is not filtered out
+    /// (MCP-144).
     #[serde(default)]
     pub env: Option<BTreeMap<String, Value>>,
     #[serde(default)]
@@ -281,8 +302,28 @@ struct ServerCacheEntry {
     tools: Option<Vec<CachedTool>>,
     #[serde(default)]
     resources: Option<Vec<CachedResource>>,
-    #[serde(default, rename = "cachedAt")]
+    /// Epoch milliseconds. Upstream rejects a falsy or non-numeric value
+    /// (`!entry.cachedAt || typeof entry.cachedAt !== "number"`), and so does
+    /// [`is_server_cache_valid_with_age`].
+    ///
+    /// The custom deserialiser is that `typeof` arm made non-destructive: a plain `Option<i64>`
+    /// turns `"cachedAt": "1760000000000"` into a serde **error**, which fails
+    /// `serde_json::from_str::<MetadataCache>` and costs every other server in the file its cached
+    /// tools. Upstream casts the parsed JSON without validating it and rejects only the one bad
+    /// entry. Anything that is not a JSON integer becomes `None` here, which this entry — and only
+    /// this entry — fails on. (MCP-145; `cyrup_mcp::dirs` and `cyrup_mcp::registration` carry the
+    /// same deserialiser over the same bytes.)
+    #[serde(default, rename = "cachedAt", deserialize_with = "lenient_epoch_ms")]
     cached_at: Option<i64>,
+}
+
+/// `Option<i64>` epoch milliseconds that answers `None` for **any** non-integer instead of failing
+/// the parse — see [`ServerCacheEntry::cached_at`].
+fn lenient_epoch_ms<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?.and_then(|value| value.as_i64()))
 }
 
 /// The whole on-disk metadata cache (pi `MetadataCache`).
@@ -623,14 +664,60 @@ fn parse_selections(selections: &[String]) -> (HashSet<String>, HashMap<String, 
     (servers, tools)
 }
 
+/// `isServerCacheValid(entry, definition, maxAgeMs)` (`metadata-cache.ts:114` @ v2.26.1) at the
+/// module's own [`CACHE_MAX_AGE_MS`] — the arity every call site here uses.
 fn is_server_cache_valid(entry: &ServerCacheEntry, definition: &ServerEntry) -> bool {
-    if entry.config_hash.as_deref() != Some(compute_mcp_server_hash(definition).as_str()) {
-        return false;
-    }
-    let Some(cached_at) = entry.cached_at else {
+    is_server_cache_valid_with_age(entry, definition, CACHE_MAX_AGE_MS)
+}
+
+/// `isServerCacheValid` with upstream's third parameter, and with its **throw-to-false** rule
+/// (MCP-145).
+///
+/// ```text
+/// let configHash; try { configHash = computeServerHash(definition) } catch { return false }
+/// if (!entry || entry.configHash !== configHash) return false;
+/// if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
+/// if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return false;
+/// return true;
+/// ```
+///
+/// Four rejections, in upstream's order:
+///
+/// 1. **The hash throws.** `computeServerHash` runs inside a `try`, and *any* throw means invalid.
+///    [`compute_mcp_server_hash`] now has that error channel — `resolveServerUrl` rejects a URL
+///    naming an unset variable or one that no longer parses after interpolation, and
+///    `interpolateEnvRecord` rejects a non-string `env`/`headers` value. Until MCP-145 this
+///    function had no such arm at all, because the hash could not fail: a
+///    `url: "https://x/${MISSING}"` server therefore hashed its *raw* text, and if a cache entry
+///    for it existed the subagent registered direct tools for a server no call could ever reach.
+/// 2. A `configHash` mismatch — absent counts as a mismatch.
+/// 3. A **falsy or non-numeric** `cachedAt`. `!entry.cachedAt` rejects `0` as well as absent (this
+///    accepted `0`), and the `typeof` test rejects a JSON string, which
+///    [`ServerCacheEntry::cached_at`]'s deserialiser turns into `None`.
+/// 4. An age over `max_age_ms`, checked **only when that limit is positive** — `0` disables the age
+///    check entirely, which is upstream's documented way to validate a definition without regard to
+///    freshness. This module had no parameter at all and treated the constant as a hard floor.
+fn is_server_cache_valid_with_age(
+    entry: &ServerCacheEntry,
+    definition: &ServerEntry,
+    max_age_ms: i64,
+) -> bool {
+    // The `catch { return false }`. This is the whole of MCP-145: a definition whose identity
+    // cannot be computed is never cache-valid, and it is never an error the caller sees.
+    let Ok(config_hash) = compute_mcp_server_hash(definition) else {
         return false;
     };
-    now_ms().saturating_sub(cached_at) <= CACHE_MAX_AGE_MS
+    if entry.config_hash.as_deref() != Some(config_hash.as_str()) {
+        return false;
+    }
+    // `!entry.cachedAt` is a falsy test on a number, so `0` is rejected alongside absent.
+    let Some(cached_at) = entry.cached_at.filter(|ms| *ms != 0) else {
+        return false;
+    };
+    if max_age_ms > 0 && now_ms().saturating_sub(cached_at) > max_age_ms {
+        return false;
+    }
+    true
 }
 
 /// The config-identity **pre-image** for a server definition — the exact byte sequence
@@ -665,26 +752,37 @@ fn is_server_cache_valid(entry: &ServerCacheEntry, definition: &ServerEntry) -> 
 /// Returned separately from the digest for the reason the writer returns it separately: a hash
 /// mismatch tells you nothing about *which* field disagreed, and the conformance tests below assert
 /// the bytes.
-#[must_use]
-pub fn server_identity_pre_image(definition: &ServerEntry) -> String {
-    let home = home_dir();
-    let env = |name: &str| std::env::var(name).ok();
+pub fn server_identity_pre_image(definition: &ServerEntry) -> Result<String, IdentityError> {
+    server_identity_pre_image_with(definition, &|name| std::env::var(name).ok(), &home_dir())
+}
+
+/// [`server_identity_pre_image`] against an injected environment and home directory.
+///
+/// The production arity above reads `std::env` and [`home_dir`]; this one exists because edition
+/// 2024 makes `std::env::set_var` `unsafe` (so a test cannot pin `$API_HOST` and put it back) and
+/// because the cross-crate conformance tests must drive **both** implementations from one table —
+/// `cyrup_mcp::dirs::ResolvedIdentity::resolve` takes the same two seams for the same reason.
+pub fn server_identity_pre_image_with(
+    definition: &ServerEntry,
+    env: &dyn Fn(&str) -> Option<String>,
+    home: &Path,
+) -> Result<String, IdentityError> {
     let identity = HashValue::Object(vec![
         ("command".to_string(), opt_string(definition.command.as_deref())),
         ("args".to_string(), opt_string_list(definition.args.as_ref())),
-        ("env".to_string(), interpolate_env_record(definition.env.as_ref(), &env)),
+        ("env".to_string(), interpolate_env_record(definition.env.as_ref(), env)?),
         (
             "cwd".to_string(),
-            opt_string(resolve_config_path(definition.cwd.as_deref(), &home, &env).as_deref()),
+            opt_string(resolve_config_path(definition.cwd.as_deref(), home, env).as_deref()),
         ),
         (
             "url".to_string(),
-            opt_string(resolve_server_url(definition.url.as_deref(), &env).as_deref()),
+            opt_string(resolve_server_url(definition.url.as_deref(), env)?.as_deref()),
         ),
-        ("headers".to_string(), interpolate_env_record(definition.headers.as_ref(), &env)),
+        ("headers".to_string(), interpolate_env_record(definition.headers.as_ref(), env)?),
         (
             "requestHeadersCommand".to_string(),
-            request_headers_command_value(definition.request_headers_command.as_ref(), &env),
+            request_headers_command_value(definition.request_headers_command.as_ref(), env)?,
         ),
         ("auth".to_string(), HashValue::from_optional_json(definition.auth.clone())),
         (
@@ -693,7 +791,7 @@ pub fn server_identity_pre_image(definition: &ServerEntry) -> String {
         ),
         (
             "bearerToken".to_string(),
-            opt_string(resolve_bearer_token(definition, &env).as_deref()),
+            opt_string(resolve_bearer_token(definition, env).as_deref()),
         ),
         ("bearerTokenEnv".to_string(), opt_string(definition.bearer_token_env.as_deref())),
         (
@@ -703,21 +801,53 @@ pub fn server_identity_pre_image(definition: &ServerEntry) -> String {
         ("includeTools".to_string(), opt_string_list(definition.include_tools.as_ref())),
         ("excludeTools".to_string(), opt_string_list(definition.exclude_tools.as_ref())),
     ]);
-    stable_stringify(&identity)
+    Ok(stable_stringify(&identity))
+}
+
+/// One of `computeServerHash`'s `throw`s, carrying upstream's own message.
+///
+/// Every producer is a resolver upstream lets throw out of the identity literal, and every consumer
+/// is [`is_server_cache_valid_with_age`]'s `catch`, which answers `false`. It is a distinct type
+/// rather than a `String` so a caller cannot accidentally render it as a user-facing failure: there
+/// is no path in this module on which an unhashable server is an *error* — it is simply a server
+/// with no usable cache entry, exactly as upstream treats it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdentityError(pub String);
+
+impl std::fmt::Display for IdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
 }
 
 /// Compute the stable config-identity hash for a server definition (pi `computeMcpServerHash`, and
 /// the twin of `cyrup_mcp::dirs::compute_server_hash`): SHA-256 over
 /// [`server_identity_pre_image`], hex-encoded. Exported so a cache writer (and this crate's tests)
 /// stamp the SAME `configHash` the resolver validates.
-#[must_use]
-pub fn compute_mcp_server_hash(definition: &ServerEntry) -> String {
+pub fn compute_mcp_server_hash(definition: &ServerEntry) -> Result<String, IdentityError> {
+    Ok(hex_sha256(&server_identity_pre_image(definition)?))
+}
+
+/// [`compute_mcp_server_hash`] against an injected environment and home — see
+/// [`server_identity_pre_image_with`].
+pub fn compute_mcp_server_hash_with(
+    definition: &ServerEntry,
+    env: &dyn Fn(&str) -> Option<String>,
+    home: &Path,
+) -> Result<String, IdentityError> {
+    Ok(hex_sha256(&server_identity_pre_image_with(definition, env, home)?))
+}
+
+/// `createHash("sha256").update(preImage).digest("hex")`.
+fn hex_sha256(pre_image: &str) -> String {
+    use std::fmt::Write as _;
     let mut hasher = Sha256::new();
-    hasher.update(server_identity_pre_image(definition).as_bytes());
+    hasher.update(pre_image.as_bytes());
     let digest = hasher.finalize();
     let mut hex = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        hex.push_str(&format!("{byte:02x}"));
+        // Writing to a `String` is infallible; the result is discarded rather than unwrapped.
+        let _ = write!(hex, "{byte:02x}");
     }
     hex
 }
@@ -748,11 +878,11 @@ fn opt_string_list(value: Option<&Vec<String>>) -> HashValue {
 fn request_headers_command_value(
     value: Option<&RequestHeadersCommand>,
     env: &dyn Fn(&str) -> Option<String>,
-) -> HashValue {
+) -> Result<HashValue, IdentityError> {
     let Some(command) = value else {
-        return HashValue::Undefined;
+        return Ok(HashValue::Undefined);
     };
-    HashValue::Object(vec![
+    Ok(HashValue::Object(vec![
         (
             "command".to_string(),
             command
@@ -768,26 +898,125 @@ fn request_headers_command_value(
                 )
             }),
         ),
-        ("env".to_string(), interpolate_env_record(command.env.as_ref(), env)),
+        // `interpolateEnvRecord`, so a non-string value throws here too — the nested `env` is not a
+        // laxer map than the outer one.
+        ("env".to_string(), interpolate_env_record(command.env.as_ref(), env)?),
         (
             "timeoutMs".to_string(),
             command.timeout_ms.map_or(HashValue::Undefined, HashValue::Number),
         ),
-    ])
+    ]))
 }
 
-/// The value half of `resolveServerUrl` (`utils.ts:167`): an absent `url` stays absent, otherwise
-/// the URL is interpolated and the **resolved** string is what the digest covers (MCP-141, which
-/// this took raw).
+/// `resolveServerUrl(definition)` (`utils.ts:167`) — interpolate, validate, **or throw** (MCP-145).
 ///
-/// Upstream also *throws* here — on a missing environment variable, or a URL that no longer parses
-/// after interpolation — and `isServerCacheValid` catches that throw into `false`. That arm is
-/// MCP-145 and is deliberately not ported: this function has no error channel, and it needs none to
-/// be safe, because a definition whose hash the *writer* cannot compute never gets a cache entry
-/// written for it, so the worst this reader can do is compute a digest that matches nothing and skip
-/// the server — which is the same outcome the throw produces.
-fn resolve_server_url(url: Option<&str>, env: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    Some(interpolate_env_vars(url?, env))
+/// Wave 1 landed the value half only: an absent `url` stayed absent and a present one was
+/// interpolated, so the digest tracked `$API_HOST` (MCP-141's fourth gap). The error channel was
+/// deliberately omitted then, on the argument that a definition the *writer* cannot hash never gets
+/// a cache entry, so the worst this reader could do was compute a digest matching nothing. That
+/// argument does not hold: a cache entry can also come from a co-installed `pi-mcp-adapter`, or
+/// from cyrup itself *before* the variable was unset, and in either case this reader would validate
+/// it against a raw-text digest and register direct tools for a server no call can reach — exactly
+/// what upstream's `try`/`catch` exists to prevent. MCP-145 is the catcher; this is what it catches.
+///
+/// Three arms:
+///
+/// * absent ⇒ `Ok(None)` (upstream's `definition.url == null`, which is `null` *and* `undefined`);
+/// * any placeholder naming an **unset** variable ⇒
+///   `Missing environment variable{s} in MCP server URL: {names}`, singular/plural on the count,
+///   names in first-occurrence order;
+/// * a resolved string `new URL()` rejects ⇒
+///   `Invalid MCP server URL after environment interpolation: {resolved}`.
+///
+/// Upstream's fourth arm, `MCP server URL must be a string`, is absorbed by the type system:
+/// [`ServerEntry::url`] is `Option<String>`, so a non-string `url` is dropped by serde before it
+/// reaches here. All three message forms were produced by **running `utils.ts` on node 22** at tag
+/// `v2.26.1` (`fafae21`), not transcribed.
+///
+/// `url::Url::parse` is the WHATWG parser `new URL()` is; measured against node on the cases that
+/// matter, both accept `unix:///tmp/s.sock`, `x:y` and `mailto:a@b` and both reject `//x/y` and
+/// `/abs/path`.
+fn resolve_server_url(
+    url: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<Option<String>, IdentityError> {
+    let Some(url) = url else {
+        return Ok(None);
+    };
+    let missing = missing_env_vars(url, env);
+    if !missing.is_empty() {
+        let plural = if missing.len() == 1 { "" } else { "s" };
+        return Err(IdentityError(format!(
+            "Missing environment variable{plural} in MCP server URL: {}",
+            missing.join(", ")
+        )));
+    }
+    let resolved = interpolate_env_vars(url, env);
+    if url::Url::parse(&resolved).is_err() {
+        return Err(IdentityError(format!(
+            "Invalid MCP server URL after environment interpolation: {resolved}"
+        )));
+    }
+    Ok(Some(resolved))
+}
+
+/// `getMissingEnvVars(value)` (`utils.ts:83`) — every placeholder name whose variable is unset, in
+/// first-occurrence order, deduplicated.
+///
+/// **One scan over the three alternatives, not three chained passes.** That asymmetry with
+/// [`interpolate_env_vars`] is upstream's: this function *scans* where the interpolator
+/// *substitutes*, so it must never see a later pass's output. The scanner is written on top of
+/// [`expand_pattern`]'s own name grammar so the two cannot disagree about what a name is — a
+/// second, hand-rolled parser here is precisely how `{env:NAME}` came to be missing from one and
+/// not the other.
+///
+/// `undefined`-vs-empty matters: upstream tests `process.env[name] === undefined`, so a variable set
+/// to the empty string counts as **present** and is not reported.
+///
+/// The scan is one left-to-right pass that tries the three alternatives **in order at each start
+/// position** and skips one character when none matches — which is what a regex alternation does,
+/// and it is why this is not three [`expand_pattern`] passes: three passes would report every
+/// `${…}` name before every `{env:…}` name, and upstream joins the names in the order it *found*
+/// them, so `https://x/{env:B}/${A}` must say `B, A` and not `A, B`.
+fn missing_env_vars(value: &str, env: &dyn Fn(&str) -> Option<String>) -> Vec<String> {
+    let mut missing: Vec<String> = Vec::new();
+    let mut rest = value;
+    while !rest.is_empty() {
+        if let Some((name, consumed)) = match_placeholder(rest) {
+            if env(name).is_none() && !missing.iter().any(|seen| seen == name) {
+                missing.push(name.to_string());
+            }
+            rest = rest.get(consumed..).unwrap_or("");
+        } else {
+            let step = rest.chars().next().map_or(1, char::len_utf8);
+            rest = rest.get(step..).unwrap_or("");
+        }
+    }
+    missing
+}
+
+/// The three alternatives of `getMissingEnvVars`'s regex, tried in source order at one position:
+/// `${NAME}`, `$env:NAME`, `{env:NAME}`. Returns the captured name and the byte length consumed.
+///
+/// `\w+` is greedy but must be followed by the closing delimiter, and `\w` never matches `}` — so
+/// "the maximal run of name characters, then the delimiter" is the same language as "everything up
+/// to the first `}`, all of it name characters".
+fn match_placeholder(rest: &str) -> Option<(&str, usize)> {
+    for (open, close) in [("${", true), ("$env:", false), ("{env:", true)] {
+        let Some(after) = rest.strip_prefix(open) else {
+            continue;
+        };
+        let name_len = after.find(|c: char| !is_word_char(c)).unwrap_or(after.len());
+        if name_len == 0 {
+            continue;
+        }
+        if close && after.get(name_len..name_len + 1) != Some("}") {
+            continue;
+        }
+        let name = after.get(..name_len)?;
+        return Some((name, open.len() + name_len + usize::from(close)));
+    }
+    None
 }
 
 /// `settings.toolPrefix` → the prefixing mode. Upstream's `validateConfig` never validates this key
@@ -948,35 +1177,91 @@ fn resource_name_to_tool_name(name: &str) -> String {
     result
 }
 
-/// Interpolate a `Record<string, unknown>`, keeping only string-typed values and expanding env
-/// references in each (pi `interpolateEnvRecord`, `utils.ts:107`). An **absent** map is `undefined`
-/// (MCP-142), never `null`; a present map is an object, even when every value was dropped.
+/// `interpolateEnvRecord(values)` (`utils.ts:107`) — [`interpolate_secret_expression`] applied per
+/// value, `undefined` in / `undefined` out. An **absent** map is `undefined` (MCP-142), never
+/// `null`; a present map is an object.
+///
+/// **Two changes, both MCP-144, both digest-visible.**
+///
+/// 1. Each value goes through the `!`/`!!` grammar, not plain interpolation. `!!x` un-escapes to the
+///    literal `!x` — the value the child will actually see — and a bare `!cmd` is hashed as its own
+///    text and never executed. This function ran plain `interpolate_env_vars`, so `!!${HOME}` hashed
+///    as `!!${HOME}`-interpolated rather than as `!` + home, and disagreed with the writer for every
+///    such value.
+/// 2. A **non-string value is a throw**, not a dropped key. Upstream calls `value.startsWith(…)`
+///    unconditionally; measured on node 22 against v2.26.1, `interpolateEnvRecord({ k: 5 })` throws
+///    `value.startsWith is not a function` and `{ k: null }` throws
+///    `Cannot read properties of null (reading 'startsWith')` — either way `computeServerHash`
+///    throws and [`is_server_cache_valid_with_age`] answers `false`. This silently *dropped* the
+///    key, producing a digest for an object upstream never produces, so an `env: { "N": 5 }` server
+///    validated a cache entry it should have been denied.
 ///
 /// [`BTreeMap`] iterates in key order, which is the order [`stable_stringify`] would impose anyway.
 fn interpolate_env_record(
     values: Option<&BTreeMap<String, Value>>,
     env: &dyn Fn(&str) -> Option<String>,
-) -> HashValue {
+) -> Result<HashValue, IdentityError> {
     let Some(values) = values else {
-        return HashValue::Undefined;
+        return Ok(HashValue::Undefined);
     };
-    HashValue::Object(
-        values
-            .iter()
-            .filter_map(|(key, value)| {
-                value
-                    .as_str()
-                    .map(|text| (key.clone(), HashValue::String(interpolate_env_vars(text, env))))
-            })
-            .collect(),
-    )
+    let mut entries: Vec<(String, HashValue)> = Vec::with_capacity(values.len());
+    for (key, value) in values {
+        let Some(text) = value.as_str() else {
+            // The message is upstream's own TypeError, which reaches nothing but the `catch`.
+            return Err(IdentityError(if value.is_null() {
+                "Cannot read properties of null (reading 'startsWith')".to_string()
+            } else {
+                "value.startsWith is not a function".to_string()
+            }));
+        };
+        entries.push((
+            key.clone(),
+            HashValue::String(interpolate_secret_expression(text, env)),
+        ));
+    }
+    Ok(HashValue::Object(entries))
 }
 
-/// Expand `${NAME}` then `$env:NAME` references against `env` (pi `interpolateEnvVars`). An absent
-/// variable expands to the empty string.
+/// `interpolateSecretExpression(value)` (`utils.ts:102`) — the `!` / `!!` command-marker grammar
+/// (MCP-144), and the twin of `cyrup_mcp::credentials::interpolate_secret_expression`.
+///
+/// * `!!x` — an **escaped** literal `!`: upstream is `interpolateEnvVars(value.slice(1))`, which
+///   drops exactly **one** `!`, so `!!x` yields `!x` and `!!!x` yields `!!x`. Stripping both — the
+///   obvious `strip_prefix("!!")` — deletes the escape and turns an escaped literal into a bare
+///   value.
+/// * `!x` — a command marker, returned **verbatim**. Hashing must never run a command: this module
+///   resolves a subagent's tool selectors from config found on disk, and a resolver that executed
+///   `!` here would run arbitrary shell out of a repository's `.mcp.json` merely because a subagent
+///   was spawned in that directory. Upstream's executing form, `resolveCommandSecret`, is reachable
+///   only from connect/auth paths and has no counterpart in this crate at all.
+/// * anything else — interpolated.
+fn interpolate_secret_expression(value: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
+    if value.starts_with("!!") {
+        return interpolate_env_vars(value.get(1..).unwrap_or_default(), env);
+    }
+    if value.starts_with('!') {
+        return value.to_string();
+    }
+    interpolate_env_vars(value, env)
+}
+
+/// `interpolateEnvVars(value)` (`utils.ts:74`) — **three** chained passes, `${NAME}` then
+/// `$env:NAME` then `{env:NAME}`, each falling back to the empty string on a missing variable.
+///
+/// **The third pass is MCP-143.** It had two, so `{env:GITHUB_TOKEN}` in an `env` value, a header, a
+/// URL, a `cwd` or a `bearerToken` reached the digest as an 18-character literal — and the writer,
+/// which has had all three since MCP-082, hashed the expanded value. Two failure modes, and the
+/// silent one is the expensive one: the child gets a literal placeholder, *and* the config hash
+/// differs, so no cache entry validates and the subagent's `mcp:` selectors resolve to nothing.
+///
+/// Order matters because each pass runs over the previous pass's **output**, which is observable:
+/// with `A="$env:B"` and `B="2"`, `"${A}"` resolves to `"2"`, where a single alternation would leave
+/// `$env:B` literal. (Measured on node 22 at v2.26.1 — that is also why the scan in
+/// [`missing_env_vars`] is deliberately *not* three passes.)
 fn interpolate_env_vars(value: &str, env: &dyn Fn(&str) -> Option<String>) -> String {
     let after_braces = expand_pattern(value, "${", Some("}"), env);
-    expand_pattern(&after_braces, "$env:", None, env)
+    let after_dollar_env = expand_pattern(&after_braces, "$env:", None, env);
+    expand_pattern(&after_dollar_env, "{env:", Some("}"), env)
 }
 
 /// Expand `<open><NAME><close?>` references, where `NAME` is `[A-Za-z0-9_]+`. When `close` is
@@ -1043,14 +1328,25 @@ fn resolve_config_path(
     Some(resolved)
 }
 
+/// `resolveBearerToken(definition)` (`utils.ts:199`) — `bearerToken` wins over `bearerTokenEnv`.
+///
+/// `bearerToken` present ⇒ [`interpolate_secret_expression`] (MCP-144: this called plain
+/// `interpolate_env_vars`, so `!!x` hashed as `!!x` where the writer hashes `!x`, and a `!cmd`
+/// marker was interpolated instead of passed through); else `process.env[bearerTokenEnv]` when
+/// `bearerTokenEnv` is **truthy** — an empty string is not, which the `filter` below reproduces
+/// rather than relying on `env("")` happening to return `None`.
 fn resolve_bearer_token(
     definition: &ServerEntry,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
     if let Some(token) = definition.bearer_token.as_deref() {
-        return Some(interpolate_env_vars(token, env));
+        return Some(interpolate_secret_expression(token, env));
     }
-    definition.bearer_token_env.as_deref().and_then(env)
+    definition
+        .bearer_token_env
+        .as_deref()
+        .filter(|name| !name.is_empty())
+        .and_then(env)
 }
 
 /// One node of the config-identity pre-image (`metadata-cache.ts:344`'s input), mirroring
@@ -1291,7 +1587,7 @@ mod tests {
                 "version": 1,
                 "servers": {
                     server_name: {
-                        "configHash": compute_mcp_server_hash(&entry),
+                        "configHash": compute_mcp_server_hash(&entry).expect("fixture definitions are hashable"),
                         "cachedAt": cached_at.unwrap_or_else(now_ms),
                         "tools": tools_json,
                         "resources": resources_json,
@@ -1511,11 +1807,12 @@ mod tests {
     /// `is_server_cache_valid` rejected every entry `cyrup-mcp` writes, so every `mcp:` selector a
     /// subagent declared resolved to nothing — with no error anywhere.
     ///
-    /// The fixture carries no interpolation token and no `!` secret marker on purpose:
-    /// `ResolvedIdentity::verbatim` is the writer's placeholder until its own TODO(MCP-082,
-    /// MCP-084) lands the real resolvers, while this side already resolves. Where both resolve to
-    /// the input they agree today; MCP-143 (`{env:NAME}`) and MCP-144 (`!`/`!!`) are what remain
-    /// before they agree for every input.
+    /// The fixture carries no interpolation token and no `!` secret marker on purpose, so it can be
+    /// hashed through the writer's `ResolvedIdentity::verbatim` — the resolvers are the identity on
+    /// such a definition, which keeps this vector independent of the ambient environment. The case
+    /// where they are *not* the identity is
+    /// `reader_and_writer_agree_once_every_resolver_actually_runs`, which drives both sides from one
+    /// injected environment and home.
     #[test]
     fn reader_and_writer_agree_on_the_fourteen_field_pre_image() {
         const DEFINITION: &str = r#"{
@@ -1546,9 +1843,9 @@ mod tests {
         let writer: WriterServerEntry = serde_json::from_str(DEFINITION).expect("writer entry");
         let resolved = ResolvedIdentity::verbatim(&writer);
 
-        let pre_image = server_identity_pre_image(&reader);
+        let pre_image = server_identity_pre_image(&reader).expect("hashable");
         assert_eq!(pre_image, writer_pre_image(&writer, &resolved));
-        assert_eq!(compute_mcp_server_hash(&reader), compute_server_hash(&writer, &resolved));
+        assert_eq!(compute_mcp_server_hash(&reader).expect("hashable"), compute_server_hash(&writer, &resolved));
 
         // Fourteen keys, named — a count alone would not say which one went missing.
         for key in [
@@ -1589,6 +1886,60 @@ mod tests {
     /// `computeServerHash` on node 22 against `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`),
     /// using the same fixture as the vector above. The test exists so the divergence is a pinned,
     /// visible fact rather than a comment: if someone lands `socket` (13c-mcp-servers.md:1753 asks
+    /// The `auth` / `protocolVersion` digest divergence, pinned rather than rediscovered.
+    ///
+    /// Upstream hashes both keys verbatim (`metadata-cache.ts:103-104`) and validates neither at
+    /// load — `config.ts` has no check for either, and `Invalid MCP protocolVersion` is thrown at
+    /// CONNECT time, long after the digest. This reader holds them raw and so matches upstream. The
+    /// writer types them behind `deserialize_with = "lenient"`, which silently drops any value its
+    /// enum rejects; `ProtocolVersionSetting` knows only `"legacy" | "auto" | "2026-07-28"`.
+    ///
+    /// `"2025-06-18"` is a real MCP protocol revision and is exactly the shape of value a user
+    /// pins. For such a server the two sides hash different pre-images, so `is_server_cache_valid`
+    /// rejects every entry and the server re-discovers its whole surface every session — silently,
+    /// and forever. It fails SAFE (a re-discovery, never a wrong tool), which is precisely why it
+    /// survived two separate audits without anything visibly breaking.
+    ///
+    /// The fix is a passthrough arm on the writer's two enums so the raw value reaches the
+    /// pre-image; that is a change to the config type model (13b) and so the owner's call. Until
+    /// then this test states the cost. **If it starts failing, the divergence closed — delete it.**
+    #[test]
+    fn a_protocol_revision_the_writers_enum_rejects_diverges_on_the_digest() {
+        const JSON: &str = r#"{"url":"https://api.example.com/mcp","protocolVersion":"2025-06-18"}"#;
+        let env = |_: &str| None;
+        let home = Path::new("/home/u");
+
+        let reader: ServerEntry = serde_json::from_str(JSON).expect("reader entry");
+        let ours = server_identity_pre_image_with(&reader, &env, home).expect("reader pre-image");
+
+        let writer: WriterServerEntry = serde_json::from_str(JSON).expect("writer entry");
+        let writer_env: cyrup_mcp::credentials::EnvFn =
+            std::sync::Arc::new(|_: &str| None);
+        let resolved =
+            ResolvedIdentity::resolve(&writer, &writer_env, home).expect("writer resolve");
+        let theirs = writer_pre_image(&writer, &resolved);
+
+        // The reader keeps what the user wrote — this is upstream's behaviour.
+        assert!(
+            ours.contains(r#""protocolVersion":"2025-06-18""#),
+            "reader must hash the literal revision: {ours}"
+        );
+        // The writer's `lenient` deserialiser has already thrown it away.
+        assert!(
+            theirs.contains(r#""protocolVersion":undefined"#),
+            "writer drops any revision its enum rejects: {theirs}"
+        );
+        assert_ne!(ours, theirs, "if these agree, the passthrough arm landed");
+
+        // And the divergence is confined to that one member: strip it from both and they agree,
+        // which is what proves this is the ONLY thing wrong for such a server.
+        assert_eq!(
+            ours.replace(r#""protocolVersion":"2025-06-18""#, ""),
+            theirs.replace(r#""protocolVersion":undefined"#, ""),
+            "any other difference would be a second, unrecorded divergence"
+        );
+    }
+
     /// for it), this test fails and tells them the two digests just converged.
     #[test]
     fn the_socket_key_is_the_one_divergence_from_upstreams_own_digest() {
@@ -1620,7 +1971,7 @@ mod tests {
         const UPSTREAM_DIGEST: &str =
             "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4";
 
-        let ours = server_identity_pre_image(&entry);
+        let ours = server_identity_pre_image(&entry).expect("hashable");
 
         // The difference is exactly one member, and it is `socket`.
         assert_ne!(ours, UPSTREAM_PRE_IMAGE, "if these are equal, `socket` landed");
@@ -1632,7 +1983,7 @@ mod tests {
             "removing upstream's `socket` member must yield our pre-image exactly — any other \
              difference is a second, unrecorded divergence"
         );
-        assert_ne!(compute_mcp_server_hash(&entry), UPSTREAM_DIGEST);
+        assert_ne!(compute_mcp_server_hash(&entry).expect("hashable"), UPSTREAM_DIGEST);
     }
 
     /// The cross-crate golden vector, asserted here and in
@@ -1667,7 +2018,7 @@ mod tests {
         )
         .expect("entry");
         assert_eq!(
-            server_identity_pre_image(&entry),
+            server_identity_pre_image(&entry).expect("hashable"),
             concat!(
                 r#"{"args":["-y","@modelcontextprotocol/server-filesystem","/tmp"],"#,
                 r#""auth":undefined,"bearerToken":undefined,"bearerTokenEnv":undefined,"#,
@@ -1679,7 +2030,7 @@ mod tests {
             )
         );
         assert_eq!(
-            compute_mcp_server_hash(&entry),
+            compute_mcp_server_hash(&entry).expect("hashable"),
             "4dd46c1fd26680867fe6c5ffdde2ab0f0a35972cd9c211bf6dd68d1f304eb277"
         );
 
@@ -1701,7 +2052,7 @@ mod tests {
         )
         .expect("http entry");
         assert_eq!(
-            compute_mcp_server_hash(&http),
+            compute_mcp_server_hash(&http).expect("hashable"),
             "572dcbaa24a3a82d42f90a86ebb8039227f999a1b14078b35dfa9f40cb872356"
         );
     }
@@ -1731,16 +2082,16 @@ mod tests {
         );
 
         let empty = ServerEntry::default();
-        let pre_image = server_identity_pre_image(&empty);
+        let pre_image = server_identity_pre_image(&empty).expect("hashable");
         assert!(!pre_image.contains("null"), "{pre_image}");
         assert_eq!(pre_image.matches("undefined").count(), 14, "{pre_image}");
         assert_eq!(
-            compute_mcp_server_hash(&empty),
+            compute_mcp_server_hash(&empty).expect("hashable"),
             "671c1578e5f4c763aac0deb77dc2a99f55688f80ed687a652e5259319937794e"
         );
         let writer_empty = WriterServerEntry::default();
         assert_eq!(
-            compute_mcp_server_hash(&empty),
+            compute_mcp_server_hash(&empty).expect("hashable"),
             compute_server_hash(&writer_empty, &ResolvedIdentity::verbatim(&writer_empty))
         );
     }
@@ -1757,8 +2108,8 @@ mod tests {
         ] {
             let changed: ServerEntry = serde_json::from_str(changed_json).expect("changed");
             assert_ne!(
-                compute_mcp_server_hash(&base),
-                compute_mcp_server_hash(&changed),
+                compute_mcp_server_hash(&base).expect("hashable"),
+                compute_mcp_server_hash(&changed).expect("hashable"),
                 "{changed_json}"
             );
             let writer_base: WriterServerEntry =
@@ -1766,12 +2117,12 @@ mod tests {
             let writer_changed: WriterServerEntry =
                 serde_json::from_str(changed_json).expect("writer changed");
             assert_eq!(
-                compute_mcp_server_hash(&changed),
+                compute_mcp_server_hash(&changed).expect("hashable"),
                 compute_server_hash(&writer_changed, &ResolvedIdentity::verbatim(&writer_changed)),
                 "{changed_json}"
             );
             assert_eq!(
-                compute_mcp_server_hash(&base),
+                compute_mcp_server_hash(&base).expect("hashable"),
                 compute_server_hash(&writer_base, &ResolvedIdentity::verbatim(&writer_base))
             );
         }
@@ -1784,7 +2135,7 @@ mod tests {
     fn the_url_is_hashed_after_interpolation() {
         let literal: ServerEntry =
             serde_json::from_str(r#"{ "url": "https://x.example/${HOME}/mcp" }"#).expect("literal");
-        let pre_image = server_identity_pre_image(&literal);
+        let pre_image = server_identity_pre_image(&literal).expect("hashable");
         assert!(!pre_image.contains("${HOME}"), "{pre_image}");
         let home = std::env::var("HOME").unwrap_or_default();
         assert!(pre_image.contains(&format!("https://x.example/{home}/mcp")), "{pre_image}");
@@ -1922,14 +2273,280 @@ mod tests {
         );
     }
 
-    #[test]
-    fn interpolate_env_vars_expands_both_forms() {
-        let env = |name: &str| match name {
-            "FOO" => Some("bar".to_string()),
+    /// The fixture environment every resolved vector below was generated against, and the `homedir()`
+    /// the node run saw (`process.env.HOME = "/home/u"`, asserted by printing `homedir()`).
+    fn vector_env(name: &str) -> Option<String> {
+        match name {
+            "HOST" => Some("a.example".to_string()),
+            "TOK_ENV" => Some("from-env".to_string()),
+            "A" => Some("1".to_string()),
+            "B" => Some("2".to_string()),
+            "C" => Some("3".to_string()),
+            "A_B" => None,
+            "CHAIN" => Some("$env:B".to_string()),
+            "CHAIN2" => Some("{env:C}".to_string()),
+            "café" => Some("unicode".to_string()),
             _ => None,
+        }
+    }
+
+    fn vector_home() -> PathBuf {
+        PathBuf::from("/home/u")
+    }
+
+    /// MCP-143 — `interpolateEnvVars`'s **three** chained passes.
+    ///
+    /// Every expectation below is the literal output of upstream's own `interpolateEnvVars`
+    /// (`utils.ts:74` @ v2.26.1) run on node 22 with `A=1 B=2 C=3` and `café=unicode` set; nothing
+    /// here is reasoned about. Three of them are worth naming:
+    ///
+    /// * `"a${A}-b$env:B-c{env:C}-d"` needs the third pass, which this function did not have. (The
+    ///   version of this case in 13c's MCP-143 text, `"a${A}b$env:Bc{env:C}d"` → `"a1b2c3d"`, is
+    ///   **wrong**: `\w+` is greedy, so `$env:Bc` names the unset variable `Bc` and node actually
+    ///   returns `"a1b3d"`. Measured, not argued.)
+    /// * `"${CHAIN}"` with `CHAIN="$env:B"` resolves to `"2"` — pass 2 runs over pass 1's output.
+    /// * `"$env:café"` resolves to `"é"`: JavaScript's `\w` is ASCII-only, so the name is `caf`.
+    ///   Rust's `regex` makes `\w` Unicode-aware, which is why the writer spells the class out and
+    ///   why this module's `is_word_char` is ASCII.
+    #[test]
+    fn interpolate_env_vars_expands_all_three_forms() {
+        let cases = [
+            ("a${A}b", "a1b"),
+            ("$env:A", "1"),
+            ("{env:A}", "1"),
+            ("a${A}-b$env:B-c{env:C}-d", "a1-b2-c3-d"),
+            ("a${A}b$env:Bc{env:C}d", "a1b3d"),
+            ("${NOPE}", ""),
+            ("$env:NOPE", ""),
+            ("{env:NOPE}", ""),
+            ("{env:}", "{env:}"),
+            ("{env:-}", "{env:-}"),
+            ("${}", "${}"),
+            ("$env:", "$env:"),
+            ("{env:A", "{env:A"),
+            ("env:A}", "env:A}"),
+            ("${A}${B}{env:C}", "123"),
+            ("{env:A}{env:B}", "12"),
+            ("$ENV:A", "$ENV:A"),
+            ("{ENV:A}", "{ENV:A}"),
+            ("${A_B}", ""),
+            ("prefix{env:A}suffix", "prefix1suffix"),
+            ("${CHAIN}", "2"),
+            ("${CHAIN2}", "3"),
+            ("${café}", "${café}"),
+            ("$env:café", "é"),
+            ("{env:café}", "{env:café}"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(interpolate_env_vars(input, &vector_env), expected, "input {input:?}");
+        }
+    }
+
+    /// MCP-144 — `interpolateSecretExpression`'s three arms, and the two call sites that bypassed
+    /// it.
+    ///
+    /// `!!x` drops exactly **one** `!` (so `!!!x` becomes `!!x`), a bare `!` is returned verbatim
+    /// and never executed, and anything else interpolates. All four outputs are node-measured
+    /// through upstream's `interpolateEnvRecord`.
+    #[test]
+    fn the_secret_expression_grammar_covers_both_hashed_call_sites() {
+        assert_eq!(interpolate_secret_expression("!!${HOST}", &vector_env), "!a.example");
+        assert_eq!(interpolate_secret_expression("!op read x", &vector_env), "!op read x");
+        assert_eq!(interpolate_secret_expression("!!!x", &vector_env), "!!x");
+        assert_eq!(interpolate_secret_expression("{env:HOST}", &vector_env), "a.example");
+
+        // Call site 1 — `env` / `headers`.
+        let values = BTreeMap::from([
+            ("ESCAPED".to_string(), Value::String("!!${HOST}".to_string())),
+            ("MARKER".to_string(), Value::String("!op read x".to_string())),
+        ]);
+        assert_eq!(
+            interpolate_env_record(Some(&values), &vector_env).expect("all strings"),
+            HashValue::Object(vec![
+                ("ESCAPED".to_string(), HashValue::String("!a.example".to_string())),
+                ("MARKER".to_string(), HashValue::String("!op read x".to_string())),
+            ])
+        );
+
+        // Call site 2 — `bearerToken`.
+        let escaped: ServerEntry =
+            serde_json::from_str(r#"{ "bearerToken": "!!${HOST}" }"#).expect("entry");
+        assert_eq!(resolve_bearer_token(&escaped, &vector_env).as_deref(), Some("!a.example"));
+        let marker: ServerEntry =
+            serde_json::from_str(r#"{ "bearerToken": "!op read tok" }"#).expect("entry");
+        assert_eq!(resolve_bearer_token(&marker, &vector_env).as_deref(), Some("!op read tok"));
+        // An empty `bearerTokenEnv` is falsy upstream, so it supplies nothing.
+        let empty: ServerEntry =
+            serde_json::from_str(r#"{ "bearerTokenEnv": "" }"#).expect("entry");
+        assert_eq!(resolve_bearer_token(&empty, &vector_env), None);
+    }
+
+    /// The whole-identity cross-crate vector with every resolver exercised at once: all three
+    /// interpolation forms (MCP-143), the `!!` escape and the `!` marker (MCP-144), a `~`-prefixed
+    /// and interpolated `cwd`, an interpolated `url`, and a `bearerToken` supplied by
+    /// `bearerTokenEnv`.
+    ///
+    /// This is the fixture the *previous* wave could not write: `ResolvedIdentity::verbatim` was the
+    /// writer's only constructor, so anything carrying a token made the two sides disagree by
+    /// construction. `ResolvedIdentity::resolve` (MCP-141 leg (b)) is what makes it assertable.
+    ///
+    /// **Provenance, stated exactly.** The constant is upstream's `computeServerHash` algorithm run
+    /// on node 22 against `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`) **with the `socket`
+    /// member removed** — the standing writer divergence, so this is byte-compatible with cyrup and
+    /// not with pi. Upstream's real digest for the same fixture is
+    /// `ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3`, which differs by exactly
+    /// `"socket":undefined`; see `the_socket_key_is_the_one_divergence_from_upstreams_own_digest`.
+    /// The pre-image was produced by running upstream's own `stableStringify` over
+    /// `computeServerHash`'s identity literal, built from upstream's real resolvers, and was proved
+    /// faithful by asserting `sha256(preImage) === computeServerHash(definition)` before `socket`
+    /// was dropped.
+    #[test]
+    fn reader_and_writer_agree_once_every_resolver_actually_runs() {
+        const DEFINITION: &str = r#"{
+            "command": "npx",
+            "args": ["-y", "srv"],
+            "env": {
+                "PLAIN": "p",
+                "INTERP": "${HOST}",
+                "BRACE": "{env:HOST}",
+                "DOLLAR": "$env:HOST",
+                "ESCAPED": "!!${HOST}",
+                "MARKER": "!op read x"
+            },
+            "cwd": "~/work/${HOST}",
+            "url": "https://${HOST}/mcp",
+            "headers": { "X-Host": "{env:HOST}", "X-Lit": "!keep" },
+            "bearerTokenEnv": "TOK_ENV",
+            "exposeResources": false,
+            "includeTools": ["a"],
+            "excludeTools": ["b"]
+        }"#;
+        const PRE_IMAGE: &str = concat!(
+            r#"{"args":["-y","srv"],"auth":undefined,"bearerToken":"from-env","#,
+            r#""bearerTokenEnv":"TOK_ENV","command":"npx","cwd":"/home/u/work/a.example","#,
+            r#""env":{"BRACE":"a.example","DOLLAR":"a.example","ESCAPED":"!a.example","#,
+            r#""INTERP":"a.example","MARKER":"!op read x","PLAIN":"p"},"#,
+            r#""excludeTools":["b"],"exposeResources":false,"#,
+            r#""headers":{"X-Host":"a.example","X-Lit":"!keep"},"includeTools":["a"],"#,
+            r#""protocolVersion":undefined,"requestHeadersCommand":undefined,"#,
+            r#""url":"https://a.example/mcp"}"#
+        );
+        const DIGEST: &str = "c273715eef4b2fb58f5db61d54793b01abd262edd7e59a5c7b189fddf910bd3c";
+
+        let reader: ServerEntry = serde_json::from_str(DEFINITION).expect("reader entry");
+        let writer: WriterServerEntry = serde_json::from_str(DEFINITION).expect("writer entry");
+        let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(vector_env);
+        let resolved = ResolvedIdentity::resolve(&writer, &writer_env, &vector_home())
+            .expect("this url resolves");
+
+        let ours = server_identity_pre_image_with(&reader, &vector_env, &vector_home())
+            .expect("hashable");
+        assert_eq!(ours, PRE_IMAGE);
+        assert_eq!(ours, writer_pre_image(&writer, &resolved));
+        assert_eq!(
+            compute_mcp_server_hash_with(&reader, &vector_env, &vector_home()).expect("hashable"),
+            DIGEST
+        );
+        assert_eq!(compute_server_hash(&writer, &resolved), DIGEST);
+
+        // The digest the writer used to stamp — `verbatim`, no resolvers — is a different one, and
+        // that difference is the production bug both sides now avoid.
+        assert_ne!(compute_server_hash(&writer, &ResolvedIdentity::verbatim(&writer)), DIGEST);
+    }
+
+    /// MCP-145 — the throw arm, on the two things that can throw, plus the two `cachedAt` rules and
+    /// the `maxAgeMs` parameter.
+    ///
+    /// The messages are byte-exact against a node 22 run of `utils.ts` @ v2.26.1.
+    #[test]
+    fn an_unhashable_definition_is_never_cache_valid() {
+        let unresolvable: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://x.example/${NOPE}/mcp" }"#).expect("entry");
+        assert_eq!(
+            compute_mcp_server_hash_with(&unresolvable, &vector_env, &vector_home())
+                .expect_err("must throw")
+                .to_string(),
+            "Missing environment variable in MCP server URL: NOPE"
+        );
+        // Two missing names pluralise and keep FIRST-OCCURRENCE order across the three forms, which
+        // is why `missing_env_vars` is one scan and not three passes.
+        let two: ServerEntry =
+            serde_json::from_str(r#"{ "url": "https://x.example/{env:BEE}/${AYE}" }"#)
+                .expect("entry");
+        assert_eq!(
+            compute_mcp_server_hash_with(&two, &vector_env, &vector_home())
+                .expect_err("must throw")
+                .to_string(),
+            "Missing environment variables in MCP server URL: BEE, AYE"
+        );
+        let unparseable: ServerEntry =
+            serde_json::from_str(r#"{ "url": "$env:HOST" }"#).expect("entry");
+        assert_eq!(
+            compute_mcp_server_hash_with(&unparseable, &vector_env, &vector_home())
+                .expect_err("must throw")
+                .to_string(),
+            "Invalid MCP server URL after environment interpolation: a.example"
+        );
+        // A non-string `env` value is upstream's other throw — `value.startsWith is not a function`
+        // — where this module used to silently drop the key.
+        let non_string: ServerEntry =
+            serde_json::from_str(r#"{ "command": "x", "env": { "N": 5 } }"#).expect("entry");
+        assert_eq!(
+            compute_mcp_server_hash_with(&non_string, &vector_env, &vector_home())
+                .expect_err("must throw")
+                .to_string(),
+            "value.startsWith is not a function"
+        );
+
+        // …and every one of them makes the entry invalid rather than erroring out of the resolver.
+        // The `configHash` is irrelevant: there is no hash to compare it against.
+        for definition in [&unresolvable, &two, &unparseable, &non_string] {
+            let entry = ServerCacheEntry {
+                config_hash: Some("0".repeat(64)),
+                cached_at: Some(now_ms()),
+                ..ServerCacheEntry::default()
+            };
+            assert!(!is_server_cache_valid(&entry, definition));
+            assert!(!is_server_cache_valid_with_age(&entry, definition, 0), "even with no TTL");
+        }
+    }
+
+    /// `!entry.cachedAt` is falsy-testing a number, and `maxAgeMs > 0` gates the age check.
+    #[test]
+    fn cached_at_zero_is_rejected_and_max_age_zero_disables_the_age_check() {
+        let definition: ServerEntry =
+            serde_json::from_str(r#"{ "command": "x" }"#).expect("entry");
+        let hash = compute_mcp_server_hash(&definition).expect("hashable");
+        let with_stamp = |cached_at: Option<i64>| ServerCacheEntry {
+            config_hash: Some(hash.clone()),
+            cached_at,
+            ..ServerCacheEntry::default()
         };
-        assert_eq!(interpolate_env_vars("a-${FOO}-b", &env), "a-bar-b");
-        assert_eq!(interpolate_env_vars("a-$env:FOO-b", &env), "a-bar-b");
-        assert_eq!(interpolate_env_vars("a-${MISSING}-b", &env), "a--b");
+
+        assert!(!is_server_cache_valid(&with_stamp(Some(0)), &definition), "0 is falsy");
+        assert!(!is_server_cache_valid(&with_stamp(None), &definition));
+        assert!(is_server_cache_valid(&with_stamp(Some(now_ms())), &definition));
+
+        let year = 365 * 24 * 60 * 60 * 1000;
+        let ancient = with_stamp(Some(now_ms() - year));
+        assert!(!is_server_cache_valid(&ancient, &definition));
+        assert!(
+            is_server_cache_valid_with_age(&ancient, &definition, 0),
+            "`maxAgeMs = 0` disables the age check entirely"
+        );
+
+        // A JSON string `cachedAt` must cost this entry and nothing else — a plain `Option<i64>`
+        // would have failed the whole file's parse.
+        let cache: MetadataCache = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "servers": {
+                "bad":  { "configHash": hash, "cachedAt": "1760000000000" },
+                "good": { "configHash": hash, "cachedAt": now_ms() }
+            }
+        }))
+        .expect("the file still parses");
+        assert_eq!(cache.servers.len(), 2);
+        assert!(!is_server_cache_valid(&cache.servers["bad"], &definition));
+        assert!(is_server_cache_valid(&cache.servers["good"], &definition));
     }
 }

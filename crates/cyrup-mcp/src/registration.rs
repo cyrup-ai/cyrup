@@ -635,10 +635,35 @@ pub struct ServerCacheEntry {
     pub prompts: Option<Vec<CachedPrompt>>,
     #[serde(default)]
     pub instructions: Option<String>,
-    /// Epoch milliseconds. Upstream rejects a non-number outright; a missing or non-numeric value
-    /// deserialises to `None` here and reaches the same verdict.
-    #[serde(default)]
+    /// Epoch milliseconds. Upstream rejects a non-number outright
+    /// (`!entry.cachedAt || typeof entry.cachedAt !== "number"`), and so does
+    /// [`is_server_cache_valid`].
+    ///
+    /// **The custom deserialiser is the whole point (MCP-145).** A plain `Option<f64>` does not
+    /// turn `"cachedAt": "1760000000000"` into `None` — serde *errors*, the error propagates out of
+    /// `serde_json::from_str::<MetadataCache>`, and [`load_metadata_cache`] answers `None` for the
+    /// **entire file**. Upstream casts the parsed JSON without validating it and rejects only the
+    /// one bad entry, so a foreign writer's malformed `cachedAt` would have cost every other
+    /// server's cached tools here and none upstream. [`lenient_epoch_ms`] restores that: anything
+    /// that is not a finite JSON number becomes `None`, which this entry — and only this entry —
+    /// fails on.
+    #[serde(default, deserialize_with = "lenient_epoch_ms")]
     pub cached_at: Option<f64>,
+}
+
+/// `Option<f64>` that answers `None` for **any** non-number instead of failing the parse — see
+/// [`ServerCacheEntry::cached_at`].
+///
+/// A JSON `null` and an absent key both arrive as `None` (the `#[serde(default)]` covers absence);
+/// a non-finite number cannot survive `serde_json`'s own number grammar, but `as_f64().filter(…)`
+/// keeps the predicate total anyway.
+fn lenient_epoch_ms<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?
+        .and_then(|value| value.as_f64())
+        .filter(|ms| ms.is_finite()))
 }
 
 impl ServerCacheEntry {
@@ -745,18 +770,52 @@ static SERVER_HASHER: OnceLock<ServerHasher> = OnceLock::new();
 /// Returns `false` when a hasher was already installed (set-once, like the upstream module-scope
 /// import it stands in for).
 ///
-/// **Until one is installed** the hash comparison is *skipped* and validity rests on the entry's
-/// `cachedAt` age alone. That is a deliberate, temporary widening: it can register a direct tool
-/// whose server definition changed since the cache was written (upstream would have skipped the
-/// server, and the model would see the proxy tool instead). It cannot register a name the current
-/// config's filters disallow, and it cannot bypass [`BUILTIN_NAMES`] — both of those run against
-/// the live config, not the cache.
+/// **The seam is now an override, not a prerequisite (MCP-145).** It shipped with no production
+/// installer, and the consequence was documented here and unfixed: the hash comparison was
+/// *skipped entirely*, so validity rested on `cachedAt` alone and a server whose definition had
+/// changed since the cache was written still registered its stale direct tools — upstream would
+/// have skipped the server and shown the proxy tool instead. [`default_server_hasher`] closes that:
+/// nothing has to be installed for the comparison to happen, and installing something only
+/// *replaces* the default (a test double, or a future caller that wants a different `home`).
+///
+/// This is deliberately not "call `dirs::compute_server_hash` inline". The digest has to be
+/// byte-identical to the one `cyrup_ext_subagents::exec::mcp_direct_tools` computes over the same
+/// file, so there is exactly one implementation of it in the crate and this module reaches it
+/// through one named function rather than minting a rival.
 pub fn install_server_hasher(hasher: ServerHasher) -> bool {
     SERVER_HASHER.set(hasher).is_ok()
 }
 
-fn server_hasher() -> Option<ServerHasher> {
-    SERVER_HASHER.get().copied()
+/// `computeServerHash(definition)` as [`is_server_cache_valid`] uses it when nothing was installed
+/// — the crate's real digest, with upstream's throw expressed as `None`.
+///
+/// `None` has exactly one source: [`crate::credentials::resolve_server_url`] rejected the `url`
+/// (a placeholder naming an unset variable, or a string `new URL()` cannot parse). Upstream wraps
+/// `computeServerHash` in a `try` and answers "not valid" on a throw, which is the sole mechanism
+/// keeping a `url: "https://x/${MISSING}"` server out of the cold-start direct-tool surface.
+///
+/// # `home`
+///
+/// `resolveConfigPath(definition.cwd)` expands a leading `~`, so the digest depends on a home
+/// directory. This uses [`crate::dirs::home_dir`] — node's `homedir()`, i.e. `$HOME`. The in-tree
+/// **reader** anchors on `CYRUP_HOME` → `HOME` → tempdir
+/// (`mcp_direct_tools::home_dir`), so the two agree unless `CYRUP_HOME` is set to something other
+/// than `HOME`, and then only for a server whose `cwd` actually starts with `~`. That residue is
+/// the narrow tail of MCP-139's agent-dir axis 3 and closing it needs the one shared resolver that
+/// unit asks for, which lives outside this crate.
+#[must_use]
+pub fn default_server_hasher(definition: &ServerEntry) -> Option<String> {
+    crate::dirs::try_compute_server_hash(
+        definition,
+        &crate::secrets::PROCESS_ENV,
+        &crate::dirs::home_dir(),
+    )
+    .ok()
+}
+
+/// The installed hasher, or [`default_server_hasher`].
+fn server_hasher() -> ServerHasher {
+    SERVER_HASHER.get().copied().unwrap_or(default_server_hasher as ServerHasher)
 }
 
 fn now_ms() -> f64 {
@@ -777,26 +836,42 @@ pub fn load_metadata_cache(dirs: &McpDirs) -> Option<MetadataCache> {
     Some(cache)
 }
 
-/// `metadata-cache.ts` `isServerCacheValid`: the config-identity hash must match (when a hasher is
-/// installed — see [`install_server_hasher`]), `cachedAt` must be a number, and the entry must be
-/// younger than `max_age_ms` when that is positive.
+/// `isServerCacheValid(entry, definition, maxAgeMs)` (`metadata-cache.ts:114`) — MCP-145, all four
+/// rejections, in upstream's order.
+///
+/// ```text
+/// let configHash; try { configHash = computeServerHash(definition) } catch { return false }
+/// if (!entry || entry.configHash !== configHash) return false;
+/// if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
+/// if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return false;
+/// return true;
+/// ```
+///
+/// 1. **The throw arm.** `computeServerHash` runs inside a `try` and **any** throw means invalid.
+///    [`server_hasher`] answers `None` for it. This is not a defensive nicety: it is the only
+///    thing that keeps a `url: "https://x/${MISSING}"` server out of the cold-start direct-tool
+///    surface, where it would advertise tools no call could ever reach.
+/// 2. A `configHash` that does not match. Absent counts as not matching.
+/// 3. A **falsy or non-numeric** `cachedAt` — `!entry.cachedAt` rejects `0` as well as absent, and
+///    the `typeof` test rejects a JSON string, which [`lenient_epoch_ms`] turns into `None`.
+/// 4. An age over `max_age_ms`, checked **only when that limit is positive** — so `0` disables the
+///    age check entirely and a year-old entry is accepted.
 #[must_use]
 pub fn is_server_cache_valid(
     entry: &ServerCacheEntry,
     definition: &ServerEntry,
     max_age_ms: f64,
 ) -> bool {
-    if let Some(hasher) = server_hasher() {
-        // Upstream wraps `computeServerHash` in a try/catch and answers `false` on a throw —
-        // `resolveServerUrl` throws on an uninterpolatable URL. `None` is that throw.
-        let Some(hash) = hasher(definition) else {
-            return false;
-        };
-        if entry.config_hash.as_deref() != Some(hash.as_str()) {
-            return false;
-        }
+    // Upstream wraps `computeServerHash` in a try/catch and answers `false` on a throw —
+    // `resolveServerUrl` throws on an uninterpolatable URL. `None` is that throw.
+    let Some(hash) = server_hasher()(definition) else {
+        return false;
+    };
+    if entry.config_hash.as_deref() != Some(hash.as_str()) {
+        return false;
     }
-    let Some(cached_at) = entry.cached_at.filter(|value| value.is_finite()) else {
+    // `!entry.cachedAt` is falsy-testing a number, so `0` is rejected alongside absent.
+    let Some(cached_at) = entry.cached_at.filter(|value| value.is_finite() && *value != 0.0) else {
         return false;
     };
     if max_age_ms > 0.0 && now_ms() - cached_at > max_age_ms {
@@ -1975,21 +2050,39 @@ mod tests {
         CachedTool { name: name.to_string(), ..CachedTool::default() }
     }
 
-    /// A cache entry that is always valid: no hasher is installed in tests, so only `cachedAt`
-    /// matters.
+    /// A cache entry with a **placeholder** `configHash`; [`cache_of`] overwrites it with the real
+    /// digest of the definition it is paired with.
+    ///
+    /// It used to carry the literal `"hash"` and be described as "always valid: no hasher is
+    /// installed in tests". That was true and it was the bug: with no installed hasher
+    /// `is_server_cache_valid` skipped the comparison entirely, so these fixtures never exercised
+    /// it. MCP-145 gave the predicate a default hasher, and the fixtures now have to agree with the
+    /// digest the production path computes.
     fn cache_entry(tools: Vec<CachedTool>) -> ServerCacheEntry {
         ServerCacheEntry {
-            config_hash: Some("hash".to_string()),
+            config_hash: None,
             tools: Some(tools),
             cached_at: Some(now_ms()),
             ..ServerCacheEntry::default()
         }
     }
 
-    fn cache_of(servers: &[(&str, ServerCacheEntry)]) -> MetadataCache {
+    /// Build a cache whose entries carry the REAL `configHash` of the matching definition in
+    /// `config` — the digest [`default_server_hasher`] computes, not a stand-in.
+    ///
+    /// An entry whose `config_hash` a test already set (a deliberate mismatch) is left alone, so
+    /// "this entry is stale" stays expressible.
+    fn cache_of(config: &McpConfig, servers: &[(&str, ServerCacheEntry)]) -> MetadataCache {
         let mut cache = MetadataCache { version: METADATA_CACHE_VERSION, ..Default::default() };
         for (name, entry) in servers {
-            cache.servers.insert((*name).to_string(), entry.clone());
+            let mut entry = entry.clone();
+            if entry.config_hash.is_none() {
+                entry.config_hash = config
+                    .mcp_servers
+                    .get(*name)
+                    .and_then(default_server_hasher);
+            }
+            cache.servers.insert((*name).to_string(), entry);
         }
         cache
     }
@@ -2180,7 +2273,7 @@ mod tests {
         let mut definition = entry(true);
         definition.tool_prefix = Some(ToolPrefix::None);
         let config = config_of(&[("s", definition)]);
-        let cache = cache_of(&[("s", cache_entry(vec![cached_tool("read"), cached_tool("ok")]))]);
+        let cache = cache_of(&config, &[("s", cache_entry(vec![cached_tool("read"), cached_tool("ok")]))]);
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::None, None);
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
@@ -2193,7 +2286,7 @@ mod tests {
         definition.tool_prefix = Some(ToolPrefix::None);
         let config = config_of(&[("s", definition)]);
         let tools: Vec<CachedTool> = BUILTIN_NAMES.iter().map(|n| cached_tool(n)).collect();
-        let cache = cache_of(&[("s", cache_entry(tools))]);
+        let cache = cache_of(&config, &[("s", cache_entry(tools))]);
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::None, None);
         assert!(specs.is_empty(), "resolved {specs:?}");
@@ -2206,7 +2299,7 @@ mod tests {
         let mut b = entry(true);
         b.tool_prefix = Some(ToolPrefix::None);
         let config = config_of(&[("a", a), ("b", b)]);
-        let cache = cache_of(&[
+        let cache = cache_of(&config, &[
             ("a", cache_entry(vec![cached_tool("dup")])),
             ("b", cache_entry(vec![cached_tool("dup")])),
         ]);
@@ -2225,7 +2318,7 @@ mod tests {
     #[test]
     fn direct_tools_false_skips_the_server_entirely() {
         let config = config_of(&[("s", entry(false))]);
-        let cache = cache_of(&[("s", cache_entry(vec![cached_tool("t")]))]);
+        let cache = cache_of(&config, &[("s", cache_entry(vec![cached_tool("t")]))]);
         assert!(resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None).is_empty());
     }
 
@@ -2237,7 +2330,7 @@ mod tests {
         let mut malformed = cached_tool("malformed");
         malformed.ui_visibility = Some(json!("model"));
         let cache =
-            cache_of(&[("s", cache_entry(vec![hidden, malformed, cached_tool("visible")]))]);
+            cache_of(&config, &[("s", cache_entry(vec![hidden, malformed, cached_tool("visible")]))]);
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
@@ -2253,7 +2346,7 @@ mod tests {
             name: "My File".to_string(),
             description: None,
         }]);
-        let cache = cache_of(&[("s", entry_with_resource)]);
+        let cache = cache_of(&config, &[("s", entry_with_resource)]);
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         assert_eq!(specs.len(), 1);
@@ -2267,7 +2360,7 @@ mod tests {
         let mut definition = entry(true);
         definition.exclude_tools = Some(vec!["s_gone".to_string()]);
         let config = config_of(&[("s", definition)]);
-        let cache = cache_of(&[("s", cache_entry(vec![cached_tool("gone"), cached_tool("kept")]))]);
+        let cache = cache_of(&config, &[("s", cache_entry(vec![cached_tool("gone"), cached_tool("kept")]))]);
 
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
@@ -2279,8 +2372,140 @@ mod tests {
         let mut stale = cache_entry(vec![cached_tool("t")]);
         stale.cached_at = Some(now_ms() - METADATA_CACHE_MAX_AGE_MS - 1000.0);
         let config = config_of(&[("s", entry(true))]);
-        let cache = cache_of(&[("s", stale)]);
+        let cache = cache_of(&config, &[("s", stale)]);
         assert!(resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None).is_empty());
+    }
+
+
+    // --- MCP-145: the hash comparison, the throw arm, and the two `cachedAt` rules -------------
+
+    /// The seam had no production installer, so `is_server_cache_valid` **skipped the hash
+    /// comparison entirely** and a server whose definition had changed since the cache was written
+    /// still registered its stale direct tools. This is that hole, closed: with nothing installed,
+    /// a foreign `configHash` is now rejected and the real one is accepted.
+    #[test]
+    fn the_config_hash_is_compared_without_anything_being_installed() {
+        let definition = entry(true);
+        let mut stale = cache_entry(vec![cached_tool("t")]);
+        stale.config_hash = Some("0".repeat(64));
+        assert!(
+            !is_server_cache_valid(&stale, &definition, METADATA_CACHE_MAX_AGE_MS),
+            "a mismatched digest must invalidate even with no installed hasher"
+        );
+
+        let mut fresh = cache_entry(vec![cached_tool("t")]);
+        fresh.config_hash = default_server_hasher(&definition);
+        assert!(is_server_cache_valid(&fresh, &definition, METADATA_CACHE_MAX_AGE_MS));
+
+        // …and it tracks the definition: adding an identity field evicts the entry.
+        let mut edited = definition.clone();
+        edited.include_tools = Some(vec!["a".to_string()]);
+        assert!(!is_server_cache_valid(&fresh, &edited, METADATA_CACHE_MAX_AGE_MS));
+        // …while a runtime-only field does not.
+        let mut noisy = definition.clone();
+        noisy.debug = Some(true);
+        assert!(is_server_cache_valid(&fresh, &noisy, METADATA_CACHE_MAX_AGE_MS));
+    }
+
+    /// The throw arm — upstream's `try { computeServerHash } catch { return false }`, and the sole
+    /// mechanism keeping a URL server with a missing environment variable out of the cold-start
+    /// direct-tool surface.
+    ///
+    /// The variable name is deliberately one nothing sets; the assertion is not that the hash is
+    /// wrong but that there **is** no hash, so no `configHash` — not even one copied out of the
+    /// entry itself — can make the entry valid.
+    #[test]
+    fn a_url_naming_a_missing_variable_is_never_cache_valid() {
+        let definition = ServerEntry {
+            url: Some("https://x.example/${CYRUP_MCP_145_DEFINITELY_UNSET}/mcp".to_string()),
+            direct_tools: Some(BoolOrList::All(true)),
+            ..ServerEntry::default()
+        };
+        assert!(default_server_hasher(&definition).is_none(), "the hash must throw");
+
+        let mut anything = cache_entry(vec![cached_tool("t")]);
+        anything.config_hash = Some("0".repeat(64));
+        assert!(!is_server_cache_valid(&anything, &definition, METADATA_CACHE_MAX_AGE_MS));
+        // Even `maxAgeMs = 0`, which disables the age check, cannot rescue it: the throw is first.
+        assert!(!is_server_cache_valid(&anything, &definition, 0.0));
+
+        // And the server therefore reports as MISSING a cache entry, which is what keeps the proxy
+        // tool registered for it (MCP-218).
+        let config = config_of(&[("u", definition)]);
+        let mut cache = MetadataCache { version: METADATA_CACHE_VERSION, ..Default::default() };
+        cache.servers.insert("u".to_string(), anything);
+        assert_eq!(
+            missing_configured_direct_tool_servers(&config, Some(&cache), None),
+            vec!["u".to_string()]
+        );
+        assert!(resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None).is_empty());
+    }
+
+    /// `!entry.cachedAt` is a falsy test on a number, and `maxAgeMs > 0` gates the age check —
+    /// upstream's two remaining rejections, neither of which this predicate applied.
+    #[test]
+    fn cached_at_zero_is_rejected_and_max_age_zero_disables_the_age_check() {
+        let definition = entry(true);
+        let hash = default_server_hasher(&definition);
+
+        let mut zero = cache_entry(vec![cached_tool("t")]);
+        zero.config_hash = hash.clone();
+        zero.cached_at = Some(0.0);
+        assert!(
+            !is_server_cache_valid(&zero, &definition, METADATA_CACHE_MAX_AGE_MS),
+            "`cachedAt: 0` is falsy upstream, so it is absent"
+        );
+        // …and it is rejected by the FALSY test, not by the age check: with `maxAgeMs = 0` there is
+        // no age check left to hide behind, and an `is_finite()`-only guard would accept it.
+        assert!(!is_server_cache_valid(&zero, &definition, 0.0));
+
+        let mut ancient = cache_entry(vec![cached_tool("t")]);
+        ancient.config_hash = hash;
+        ancient.cached_at = Some(now_ms() - METADATA_CACHE_MAX_AGE_MS * 52.0);
+        assert!(!is_server_cache_valid(&ancient, &definition, METADATA_CACHE_MAX_AGE_MS));
+        assert!(
+            is_server_cache_valid(&ancient, &definition, 0.0),
+            "`maxAgeMs = 0` disables the age check entirely"
+        );
+    }
+
+    /// A malformed `cachedAt` from a foreign writer must cost that entry and nothing else.
+    ///
+    /// With a plain `Option<f64>` serde *errors* on a JSON string, the error propagates out of
+    /// `from_str::<MetadataCache>`, and `load_metadata_cache` answers `None` for the whole file —
+    /// so every other server in it silently loses its cached tools. Upstream casts without
+    /// validating and rejects only the bad entry.
+    #[test]
+    fn a_string_cached_at_invalidates_one_entry_not_the_whole_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let agent_dir = temp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).expect("mkdir");
+        let definition = entry(true);
+        let hash = default_server_hasher(&definition).expect("no url, so no throw");
+        std::fs::write(
+            agent_dir.join("mcp-cache.json"),
+            serde_json::to_string(&json!({
+                "version": METADATA_CACHE_VERSION,
+                "servers": {
+                    "bad":  { "configHash": hash, "cachedAt": "1760000000000",
+                              "tools": [{ "name": "t" }], "resources": [] },
+                    "good": { "configHash": hash, "cachedAt": now_ms(),
+                              "tools": [{ "name": "t" }], "resources": [] }
+                }
+            }))
+            .expect("serialize"),
+        )
+        .expect("write");
+
+        let dirs = McpDirs::new(agent_dir, temp.path().to_path_buf());
+        let cache = load_metadata_cache(&dirs).expect("the file still loads");
+        assert_eq!(cache.servers.len(), 2);
+        assert!(cache.servers["bad"].cached_at.is_none(), "a JSON string is not a number");
+
+        let config = config_of(&[("bad", definition.clone()), ("good", definition)]);
+        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        let names: Vec<&str> = specs.iter().map(|s| s.prefixed_name.as_str()).collect();
+        assert_eq!(names, vec!["good_t"], "only the malformed entry is lost");
     }
 
     // --- MCP-219 -------------------------------------------------------------------------------
@@ -2302,7 +2527,7 @@ mod tests {
     #[test]
     fn the_env_override_outranks_the_config() {
         let config = config_of(&[("a", entry(false)), ("b", entry(false))]);
-        let cache = cache_of(&[
+        let cache = cache_of(&config, &[
             ("a", cache_entry(vec![cached_tool("t")])),
             ("b", cache_entry(vec![cached_tool("t")])),
         ]);
@@ -2334,7 +2559,7 @@ mod tests {
         let tools: Vec<CachedTool> = (0..DIRECT_TOOLS_ADVISORY_THRESHOLD)
             .map(|index| cached_tool(&format!("tool_{index}")))
             .collect();
-        let cache = cache_of(&[("huge", cache_entry(tools))]);
+        let cache = cache_of(&config, &[("huge", cache_entry(tools))]);
 
         // Default: loud, and every configured tool still registers.
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
@@ -2364,7 +2589,7 @@ mod tests {
         let config = config_of(&[("alpha", entry(true)), ("beta", entry(false)), ("off", disabled)]);
         let mut alpha = cache_entry(vec![cached_tool("one"), cached_tool("two")]);
         alpha.instructions = Some("  Use   alpha   carefully.  ".to_string());
-        let cache = cache_of(&[
+        let cache = cache_of(&config, &[
             ("alpha", alpha),
             ("beta", cache_entry(vec![cached_tool("b1"), cached_tool("b2"), cached_tool("b3")])),
         ]);
@@ -2399,7 +2624,7 @@ mod tests {
     #[test]
     fn proxy_description_is_deterministic() {
         let config = config_of(&[("a", entry(true)), ("b", entry(true)), ("c", entry(true))]);
-        let cache = cache_of(&[
+        let cache = cache_of(&config, &[
             ("a", cache_entry(vec![cached_tool("t1"), cached_tool("t2")])),
             ("b", cache_entry(vec![cached_tool("t3")])),
             ("c", cache_entry(vec![cached_tool("t4")])),
@@ -2423,7 +2648,7 @@ mod tests {
         assert!(should_register_proxy_tool(&config, None, &[], None));
 
         // Warm cache with a complete direct surface: the setting is finally honoured.
-        let cache = cache_of(&[("s", cache_entry(vec![cached_tool("t")]))]);
+        let cache = cache_of(&config, &[("s", cache_entry(vec![cached_tool("t")]))]);
         let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
         assert_eq!(specs.len(), 1);
         assert!(!should_register_proxy_tool(&config, Some(&cache), &specs, None));
@@ -2432,7 +2657,7 @@ mod tests {
     #[test]
     fn a_server_wanting_direct_tools_without_a_cache_entry_is_missing() {
         let config = config_of(&[("warm", entry(true)), ("cold", entry(true))]);
-        let cache = cache_of(&[("warm", cache_entry(vec![cached_tool("t")]))]);
+        let cache = cache_of(&config, &[("warm", cache_entry(vec![cached_tool("t")]))]);
         assert_eq!(
             missing_configured_direct_tool_servers(&config, Some(&cache), None),
             vec!["cold".to_string()]
@@ -2551,7 +2776,7 @@ mod tests {
             },
             CachedPrompt { name: String::new(), ..CachedPrompt::default() },
         ]);
-        let cache = cache_of(&[("gh-mcp", server)]);
+        let cache = cache_of(&config, &[("gh-mcp", server)]);
 
         let prompts = resolve_cached_prompts(&config, Some(&cache));
         assert_eq!(prompts.len(), 1, "a nameless prompt is skipped, not registered");
@@ -2602,19 +2827,17 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let agent_dir = temp.path().join("agent");
         std::fs::create_dir_all(&agent_dir).expect("mkdir");
-        let mut prompts_entry = cache_entry(vec![cached_tool("one"), cached_tool("two")]);
-        prompts_entry.prompts = Some(vec![CachedPrompt {
-            name: "brief".to_string(),
-            ..CachedPrompt::default()
-        }]);
-        let cache = cache_of(&[("srv", prompts_entry)]);
+        let config = config_of(&[("srv", entry(true))]);
+        // The on-disk `configHash` has to be the digest the loader will recompute — with a
+        // placeholder it validated only because no hasher was installed (MCP-145).
+        let config_hash = default_server_hasher(&entry(true)).expect("no url, so no throw");
         std::fs::write(
             agent_dir.join("mcp-cache.json"),
             serde_json::to_string(&json!({
                 "version": METADATA_CACHE_VERSION,
                 "servers": {
                     "srv": {
-                        "configHash": "hash",
+                        "configHash": config_hash,
                         "cachedAt": now_ms(),
                         "tools": [{ "name": "one" }, { "name": "two" }],
                         "resources": [],
@@ -2625,11 +2848,10 @@ mod tests {
             .expect("serialize"),
         )
         .expect("write");
-        drop(cache);
         let dirs = McpDirs::new(agent_dir, temp.path().to_path_buf());
 
         let mut api = InitApi::new();
-        let surface = register_surface(&mut api, &dirs, &config_of(&[("srv", entry(true))]));
+        let surface = register_surface(&mut api, &dirs, &config);
 
         assert_eq!(
             surface.tool_names,

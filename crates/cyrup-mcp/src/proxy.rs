@@ -1515,6 +1515,13 @@ pub trait ProxyEnv: Send + Sync {
     /// `Ok(None)` is a falsy URL (a stdio server); `Err` is the **throw** — a missing `${VAR}` or a
     /// URL that will not parse after interpolation. [`attempt_auto_auth`] treats those differently
     /// and the distinction is load-bearing.
+    ///
+    /// **The implementation exists: [`crate::credentials::resolve_server_url`]** (MCP-084), which
+    /// carries upstream's three byte-exact messages and is the same function
+    /// [`crate::dirs::ResolvedIdentity::resolve`] hashes through. A production implementor must
+    /// delegate to it rather than mint a second copy — the config digest and the connect path have
+    /// to agree about what a server's URL *is*, or a server connects to one host and caches under
+    /// another.
     fn resolve_server_url(&self, definition: &ServerEntry) -> McpResult<Option<String>>;
     /// `authenticate(server, url, definition, {authStorageOptions?, signal?, runtime})`.
     async fn authenticate(
