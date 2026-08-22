@@ -1,0 +1,35 @@
+---
+stage: new
+status: done
+updated: 2026-08-22 18:31
+---
+
+# Split selector.rs Into A Package And Make It The One Home For Selector Chrome
+
+> Identified by the `cyrup-tui` hygiene audit (6-dimension fan-out, adversarially verified).
+> **Priority:** medium · **Effort:** medium
+
+## Description
+
+`crates/cyrup-tui/src/selector.rs` (1,484 lines, no inline test module) is the crate's shared selector *contract* — 11 sibling modules import from it and there are 13 `impl Selector for` sites — but it also carries two unrelated concrete selectors, while three pieces of chrome that belong in it are copy-pasted across eight files. Do both halves in one session: split the file, then land the shared helpers in the new `selector/mod.rs` and delete the copies.
+
+**(A) Split.** Convert to `src/selector/mod.rs` keeping the module doc (`:1-14`), the `use` block (`:16-26`), `INPUT_PROMPT` (`:41`), `input_line_spans` (`:46`), `search_input_spans` (`:59`), `caret_cell` (`:99`), `title_lines` (`:122`), `title_wrapped_height` (`:133`), `stack_rows` (`:189`), `SelectorKind` + impl (`:204-422`), `SelectorOutcome` (`:424`), `pub trait Selector` (`:455-514`), and both `border_rule_line` (`:1474`) and `border_rule` (`:1481`). All five existing `pub(crate)` items are in this half, so the seam is already explicit. Then two siblings, each opening `use super::*;`: `selector/list.rs` for `ListSelector`, its inherent impl and `impl Selector for ListSelector` (`:515-884`, including the named constructors `thinking` `:711`, `show_images` `:734`, `theme` `:746`), and `selector/checkbox.rs` for `SCOPED_MODELS_ALL` (`:885`), `ModelRow` (`:889`), `CheckboxSelector` (`:910`), `ModelItem` (`:938`) and its two impls (`:945-1479`). The two blocks are contiguous and non-interleaved. Re-export from mod.rs (`pub use list::ListSelector; pub use checkbox::{CheckboxSelector, SCOPED_MODELS_ALL};`) so every existing `use crate::selector::…` keeps compiling — the same pattern `src/app/mod.rs:47-63` uses. Child modules can already see private parent items, so nothing staying in mod.rs needs a visibility change and no `pub(super)` is required here.
+
+**(B) Centred window.** Add `pub(crate) fn centered_window(selected: usize, len: usize, max: usize) -> (usize, usize)` next to `stack_rows`, documented against `select-list.ts:86-90`, implementing `start = clamp(selected - max/2, 0, len - max); end = min(start + max, len)`. Replace all eight semantically identical bodies: `select_list.rs:180-190`, `config_selector.rs:426-435`, `oauth_selector.rs:192-201`, `session_selector.rs:546-551`, `model_selector.rs:311-317`, `settings_selector.rs:336-345`, `selector/checkbox.rs` (was `:1257-1263`), `user_message_selector.rs:91-98`. The only differences are cosmetic (an up-front `total <= visible` guard, `saturating_sub` vs a redundant `.min(len)`). Do NOT touch the seven `(i/N)` scroll rows that follow them — three style/truncation variants exist, each carrying its own upstream citation (e.g. `settings_selector.rs:386-388` notes the readout counts FILTERED rows), and a parameterised helper would strand those notes.
+
+**(C) Border rule.** Promote `border_rule` (the `Paragraph` form) to `pub(crate)` and add `pub(crate) fn rule_line(width: u16, style: Style) -> Line<'static>` that both wrap. Delete the five reimplementations — `config_selector.rs:858`, `tree_selector.rs:1066`, `settings_selector.rs:832` and `:837`, `model_selector.rs:527`, `chrome.rs:385` — all of which are `"─".repeat(width.max(1) as usize)` styled `theme.border_style()`, and three of which already say in their doc comment that they mirror `selector::border_rule` (`tree_selector.rs:1065`, `chrome.rs:384`, `settings_selector.rs:831`). Replace the inline closure at `text_input.rs:156` (`let rule = |w: u16| "─".repeat(w.max(1) as usize);`) with the shared call. `config_selector.rs:785,794`, `tree_selector.rs:951,980` and `chrome.rs:358,380` render a Paragraph into a carved rect, which is why the Paragraph form must become `pub(crate)`. Re-express `session_selector.rs:1037` as `rule_line(width, theme.accent_style())`, keeping its S13 doc comment (`:1033-1036`, citing `session-selector.ts:738,746`) in place so the accent exception stays visible.
+
+**(D) Stop rebuilding UiTheme for measurement.** `app/layout.rs:53-54` calls `active.inner.desired_height(width)` every frame a selector owns the input slot, and nine call sites answer it by rendering the body against a throwaway `UiTheme::default()`: `config_selector.rs:418`, `model_selector.rs:427` and `:431`, `oauth_selector.rs:286`, `selector/checkbox.rs` (was `:1358`), `session_selector.rs:828` and `:831`, `settings_selector.rs:463`, `user_message_selector.rs:162`. `UiTheme::default()` (`theme.rs:144-147`) reaches `builtin_or_static` (`theme.rs:212`) -> `cyrup-resources/src/theme.rs:693-701`, which re-parses both `BUILTIN_DARK_JSON` and `BUILTIN_LIGHT_JSON` (~4.5 KB) on every call with no cache, then builds a ~51-entry `BTreeMap<String, _>`. Add `UiTheme::default_ref() -> &'static UiTheme` backed by a `std::sync::LazyLock<UiTheme>` in `theme.rs` and swap all nine measurement arguments to it. The measured value is style-independent, so nothing observable changes. Do NOT add the `Selector::lines` trait seam — that is a whole-trait API change for no measured win.
+
+## Acceptance Criteria
+
+- [ ] `src/selector.rs` no longer exists; `src/selector/{mod.rs,list.rs,checkbox.rs}` do, and no file in `src/selector/` exceeds ~700 lines
+- [ ] Every pre-existing `use crate::selector::{ListSelector, CheckboxSelector, SCOPED_MODELS_ALL}` import elsewhere in the crate compiles unchanged (no import edits outside the deleted-helper call sites)
+- [ ] `grep -rn 'fn window' crates/cyrup-tui/src/` returns no per-selector copies; all eight call sites use `centered_window`
+- [ ] `grep -rn '"─".repeat' crates/cyrup-tui/src/` returns hits only inside `src/selector/mod.rs`
+- [ ] `grep -rn 'UiTheme::default()' crates/cyrup-tui/src/` returns no hits inside any `desired_height` body; `default_ref()` is used instead
+- [ ] `cargo build -p cyrup-tui` emits 0 warnings, `cargo test -p cyrup-tui` passes 1270 tests, `cargo clippy -p cyrup-tui --all-targets` shows only escape_reassembly.rs:972
+
+## Evidence
+
+crates/cyrup-tui/src/selector.rs:1-26,41,46,59,99,122,133,189,204-422,424,455-514,515-884,885-1479,1474,1481 (verified: 1,484 lines, 0 inline test mods, 5 pub(crate) items all in the contract half); window copies select_list.rs:180-190, config_selector.rs:426-435, oauth_selector.rs:192-201, session_selector.rs:546-551, model_selector.rs:311-317, settings_selector.rs:336-345, selector.rs:1257-1263, user_message_selector.rs:91-98; border copies config_selector.rs:858, tree_selector.rs:1065-1066, settings_selector.rs:831-837, model_selector.rs:527, chrome.rs:384-385, text_input.rs:156, accent exception session_selector.rs:1033-1038; theme rebuild app/layout.rs:53-54, theme.rs:144-147,190,212, cyrup-resources/src/theme.rs:693-701, sites config_selector.rs:418, model_selector.rs:427,431, oauth_selector.rs:286, selector.rs:1358, session_selector.rs:828,831, settings_selector.rs:463, user_message_selector.rs:162
