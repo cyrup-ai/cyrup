@@ -64,7 +64,7 @@ fn check_opt_string_min1(
     let here = child(at, key);
     match v.as_str() {
         None => push_err(errs, &here, schema_msg::STRING),
-        Some(s) if s.is_empty() => push_err(errs, &here, schema_msg::MIN_LENGTH_1),
+        Some("") => push_err(errs, &here, schema_msg::MIN_LENGTH_1),
         Some(_) => {}
     }
 }
@@ -204,7 +204,7 @@ fn check_model_definition(
         None => push_err(errs, &child(at, "id"), schema_msg::REQUIRED),
         Some(v) => match v.as_str() {
             None => push_err(errs, &child(at, "id"), schema_msg::STRING),
-            Some(s) if s.is_empty() => push_err(errs, &child(at, "id"), schema_msg::MIN_LENGTH_1),
+            Some("") => push_err(errs, &child(at, "id"), schema_msg::MIN_LENGTH_1),
             Some(_) => {}
         },
     }

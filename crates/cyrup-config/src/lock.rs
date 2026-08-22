@@ -13,8 +13,6 @@ use crate::error::ConfigError;
 /// atomic `rename` over the target (the lock inode is never replaced).
 pub struct FileLock {
     file: File,
-    #[allow(dead_code)]
-    path: PathBuf,
 }
 
 impl FileLock {
@@ -28,14 +26,10 @@ impl FileLock {
             .read(true)
             .write(true)
             .truncate(false)
-            .open(&lock_path)?;
-        FileExt::lock(&file).map_err(|_| ConfigError::Lock {
-            path: lock_path.clone(),
-        })?;
-        Ok(Self {
-            file,
-            path: lock_path,
-        })
+            .open(&lock_path)
+            .map_err(|e| io_err(&lock_path, e))?;
+        FileExt::lock(&file).map_err(|_| ConfigError::Lock { path: lock_path })?;
+        Ok(Self { file })
     }
 }
 
@@ -62,12 +56,12 @@ pub fn ensure_dir(dir: &Path) -> Result<(), ConfigError> {
     if dir.as_os_str().is_empty() || dir.exists() {
         return Ok(());
     }
-    std::fs::create_dir_all(dir)?;
+    std::fs::create_dir_all(dir).map_err(|e| io_err(dir, e))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(dir, perms)?;
+        std::fs::set_permissions(dir, perms).map_err(|e| io_err(dir, e))?;
     }
     Ok(())
 }
@@ -98,16 +92,26 @@ pub fn write_atomic(path: &Path, bytes: &[u8], secret: bool) -> Result<(), Confi
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let mut f = opts.open(&tmp_path)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
+        let mut f = opts.open(&tmp_path).map_err(|e| io_err(&tmp_path, e))?;
+        f.write_all(bytes).map_err(|e| io_err(&tmp_path, e))?;
+        f.sync_all().map_err(|e| io_err(&tmp_path, e))?;
         #[cfg(unix)]
         if secret {
             use std::os::unix::fs::PermissionsExt;
-            f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            f.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| io_err(&tmp_path, e))?;
         }
     }
 
-    std::fs::rename(&tmp_path, path)?;
+    std::fs::rename(&tmp_path, path).map_err(|e| io_err(path, e))?;
     Ok(())
+}
+
+/// Tag an `io::Error` with the path whose syscall produced it, so the rendered error names
+/// the file the operator has to go look at.
+fn io_err(path: &Path, source: std::io::Error) -> ConfigError {
+    ConfigError::Io {
+        path: path.to_path_buf(),
+        source,
+    }
 }

@@ -102,7 +102,12 @@ impl TrustStore {
         let text = match std::fs::read_to_string(&self.path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-            Err(e) => return Err(ConfigError::Io(e)),
+            Err(e) => {
+                return Err(ConfigError::Io {
+                    path: self.path.clone(),
+                    source: e,
+                });
+            }
         };
         if text.trim().is_empty() {
             return Ok(BTreeMap::new());

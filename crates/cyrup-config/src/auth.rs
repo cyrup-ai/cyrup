@@ -161,7 +161,10 @@ impl AuthStore {
         match std::fs::read_to_string(&self.path) {
             Ok(text) => parse_auth(&text),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AuthFile::new()),
-            Err(e) => Err(AuthError::Io(e)),
+            Err(e) => Err(AuthError::Io {
+                path: self.path.clone(),
+                source: e,
+            }),
         }
     }
 
@@ -291,8 +294,7 @@ impl AuthStore {
         let mut text =
             serde_json::to_string_pretty(&Value::Object(obj)).map_err(AuthError::Parse)?;
         text.push('\n');
-        crate::lock::write_atomic(&self.path, text.as_bytes(), true)
-            .map_err(|e| AuthError::Lock(e.to_string()))?;
+        crate::lock::write_atomic(&self.path, text.as_bytes(), true)?;
 
         drop(flock);
         // Pi assigns the just-written document onto `this.data` inside `modify`
@@ -512,25 +514,6 @@ pub fn resolve_auth(
         }));
     }
     Ok(None)
-}
-
-/// OAuth PKCE (S256) helpers (R-07-016). Correct, pure transforms; callers supply randomness.
-pub mod pkce {
-    use base64::Engine;
-    use sha2::{Digest, Sha256};
-
-    /// Encode raw random bytes as a PKCE `code_verifier` (RFC 7636 base64url, no padding).
-    pub fn verifier_from_bytes(bytes: &[u8]) -> String {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
-    }
-
-    /// Compute the S256 `code_challenge` for a `code_verifier`.
-    pub fn challenge(verifier: &str) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(verifier.as_bytes());
-        let digest = hasher.finalize();
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
-    }
 }
 
 #[cfg(test)]
@@ -940,15 +923,5 @@ mod tests {
         // deleting a provider drops it from the list.
         s.delete(&ProviderId::from("openai")).await.unwrap();
         assert_eq!(s.list().unwrap(), vec!["anthropic".to_string()]);
-    }
-
-    #[test]
-    fn pkce_challenge_is_stable() {
-        // RFC 7636 appendix B test vector.
-        let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-        assert_eq!(
-            pkce::challenge(verifier),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
     }
 }

@@ -36,8 +36,18 @@ pub enum ConfigError {
         scope: SettingsScope,
         message: String,
     },
-    #[error("io: {0}")]
-    Io(#[from] std::io::Error),
+    /// A settings VALUE failed validation (Pi `parseTimeoutSetting` throws).
+    #[error("Invalid {key} setting: {value}")]
+    InvalidSetting { key: String, value: String },
+    /// An in-memory settings lock was poisoned by a panic in another thread.
+    #[error("settings lock poisoned")]
+    LockPoisoned,
+    #[error("io on {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("serde: {0}")]
     Serde(#[from] serde_json::Error),
     #[error("lock contention on {path}")]
@@ -52,14 +62,22 @@ pub enum ConfigError {
 /// credential and never falls back to the environment (R-07-017 / A-07-5).
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    #[error("auth store io: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("auth store io on {path}: {source}")]
+    Io {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("auth file parse: {0}")]
     Parse(#[source] serde_json::Error),
     #[error("oauth refresh failed (credential preserved): {0}")]
     Oauth(String),
     #[error("lock: {0}")]
     Lock(String),
+    /// Credential-file I/O that went through the crate's locked / atomic write path
+    /// ([`crate::lock::write_atomic`]), which returns [`ConfigError`], not `io::Error`.
+    #[error("auth store: {0}")]
+    Config(#[from] ConfigError),
     #[error("cancelled")]
     Cancelled,
 }
