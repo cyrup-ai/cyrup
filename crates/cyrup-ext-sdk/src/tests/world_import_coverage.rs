@@ -30,12 +30,59 @@ const WORLD: &str = include_str!("../../wit/world.wit");
 
 /// Every `.rs` file in this crate that may hold a binding call, concatenated.
 const SDK_SOURCES: &str = concat!(
-    include_str!("../ctx.rs"),
+    include_str!("../ctx/base.rs"),
+    include_str!("../ctx/command.rs"),
+    include_str!("../ctx/exec.rs"),
+    include_str!("../ctx/fs.rs"),
+    include_str!("../ctx/http.rs"),
+    include_str!("../ctx/mod.rs"),
+    include_str!("../ctx/models.rs"),
+    include_str!("../ctx/proc.rs"),
+    include_str!("../ctx/session.rs"),
+    include_str!("../ctx/tool_call.rs"),
+    include_str!("../ctx/tools.rs"),
+    include_str!("../ctx/ui.rs"),
+    include_str!("../ctx/with_session.rs"),
     include_str!("../guest.rs"),
     include_str!("../provider.rs"),
     include_str!("../api.rs"),
     include_str!("../widget.rs"),
 );
+
+/// `SDK_SOURCES` is a hand-maintained `include_str!` list, and `src/ctx/` is a DIRECTORY of one
+/// submodule per WIT import interface. A new submodule nobody adds to the list puts its binding
+/// calls outside the coverage check below — and `exec`, `ext-fs`, `http-client` and `proc` are
+/// called from `ctx` and nowhere else, so the whole of four interfaces rides on that list being
+/// complete. Containment is checked on CONTENT, not on the file name, because `include_str!`
+/// inlines the content and only the content proves the file is actually in there.
+///
+/// This is the same shape as [`every_world_interface_is_classified`] one level down: a guard whose
+/// job is to notice the thing nobody is looking at.
+#[test]
+fn every_ctx_submodule_is_in_sdk_sources() {
+    let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ctx"));
+    let mut missing: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("src/ctx is a directory") {
+        let path = entry.expect("readable dir entry").path();
+        if path.extension().is_none_or(|x| x != "rs") {
+            continue;
+        }
+        let body = std::fs::read_to_string(&path).expect("readable source file");
+        let probe: String = body.chars().take(200).collect();
+        if !probe.is_empty() && !SDK_SOURCES.contains(probe.as_str()) {
+            missing.push(path.display().to_string());
+        }
+    }
+    assert!(
+        !missing.is_empty() || SDK_SOURCES.contains("mod base;"),
+        "the `src/ctx/` scan found nothing to check, so this guard would be vacuous"
+    );
+    assert!(
+        missing.is_empty(),
+        "these `src/ctx/` submodules are not in SDK_SOURCES, so their binding calls are invisible \
+         to `every_declared_world_import_has_a_caller_in_the_sdk`: {missing:?}"
+    );
+}
 
 /// The `func` names declared inside `interface <name> { … }`.
 fn declared_funcs(interface: &str) -> Vec<String> {

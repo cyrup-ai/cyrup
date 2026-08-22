@@ -217,17 +217,31 @@ fn the_cache_key_tracks_the_wit_and_sdk_sources_outside_the_extension_crate() {
 /// they are byte-identical by test and a fix applied to one only would pass every other pin here.
 fn cited_files() -> Vec<PathBuf> {
     let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    vec![
+    let mut files = vec![
         crate_dir.join("wit/world.wit"),
         crate_dir.join("../cyrup-ext-sdk/wit/world.wit"),
-        crate_dir.join("../cyrup-ext-sdk/src/ctx.rs"),
         crate_dir.join("../cyrup-ext-sdk/src/api.rs"),
         crate_dir.join("src/host/services.rs"),
         crate_dir.join("src/host/live.rs"),
         crate_dir.join("src/event.rs"),
         crate_dir.join("src/native.rs"),
         crate_dir.join("src/registry.rs"),
-    ]
+    ];
+    // The SDK's `ctx` is a DIRECTORY of submodules, one per WIT import interface, and the pi
+    // citations that used to sit in a single `ctx.rs` moved with the items that carry them.
+    // Enumerate rather than naming files, so a later submodule cannot fall outside this lint by
+    // being added and not listed here.
+    let ctx_dir = crate_dir.join("../cyrup-ext-sdk/src/ctx");
+    let mut ctx: Vec<PathBuf> = std::fs::read_dir(&ctx_dir)
+        .unwrap_or_else(|e| panic!("read {}: {e}", ctx_dir.display()))
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
+        .collect();
+    assert!(!ctx.is_empty(), "no `.rs` files under {} — the citation lint would be blind to the \
+         SDK's whole context surface", ctx_dir.display());
+    ctx.sort();
+    files.append(&mut ctx);
+    files
 }
 
 /// A gap-analysis id on the SAME line marks a deliberate quotation of a struck value — the
