@@ -15,11 +15,16 @@ workspace = true
 # ON by default (matching cyrup-ext), so the default entry path spins up the Wasmtime engine, loads
 # live wasm extensions with `LiveHostServices` injected, and routes guest-registered slash commands
 # through the real run path (`_tryExecuteExtensionCommand`, agent-session.ts:1148-1172). The
-# wasm32-wasip2 guest toolchain drives the full end-to-end (see tests/wasm_slash_command.rs).
+# wasm32-wasip2 guest toolchain drives the full end-to-end (see
+# crates/cyrup-it/tests/session_svc/wasm_slash_command.rs).
 default = ["wasm-host"]
 # Forwards to cyrup-ext's `wasm-host` feature (Wasmtime Component Model host). Disable for a
 # native-only build (no wasmtime); the native-command routing + control→session-effect bridge still
-# compile and are exercised.
+# compile and are exercised. The forwarding only bites because the `cyrup-ext` dependency below is
+# spelled out with `default-features = false` (cyrup-ext's own default is `["wasm-host"]`, and a
+# workspace-inherited entry cannot turn that off). Caveat: this guarantee holds for a
+# `-p cyrup-session-svc --no-default-features` build only — in a whole-workspace build cargo's
+# feature unification still enables `cyrup-ext/wasm-host` as soon as any sibling asks for it.
 wasm-host = ["cyrup-ext/wasm-host"]
 
 [dependencies]
@@ -30,35 +35,30 @@ cyrup-tools = { workspace = true }
 cyrup-session = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }
-cyrup-ext = { workspace = true }
+# Spelled out instead of `workspace = true` on purpose: cargo refuses `default-features = false` on a
+# workspace-inherited entry, and without it cyrup-ext's own `default = ["wasm-host"]` drags wasmtime
+# in no matter what this crate's `wasm-host` feature says. Path/version match the root
+# `[workspace.dependencies]` entry (Cargo.toml:111) — do not flip that entry instead; 13 crates
+# inherit it and would all silently lose the wasm host.
+cyrup-ext = { path = "../cyrup-ext", version = "0.0.0", default-features = false }
 thiserror = { workspace = true }
-# Version-pinned directly here, matching cyrup-ext/Cargo.toml:29 (the workspace has no `tracing`
-# alias). Used for the non-fatal diagnostics the builder must surface rather than drop silently.
+# Version-pinned directly here, matching cyrup-ext (the workspace has no `tracing` alias). Used for
+# the non-fatal diagnostics the builder must surface rather than drop silently.
 tracing = "0.1.44"
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-futures = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 time = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
-tempfile = { workspace = true }
 futures = { workspace = true }
-async-trait = { workspace = true }
-serde_json = { workspace = true }
-cyrup-core = { workspace = true }
-cyrup-agent = { workspace = true }
-cyrup-ext = { workspace = true }
-cyrup-session = { workspace = true }
-cyrup-config = { workspace = true }
-cyrup-tools = { workspace = true }
+tempfile = { workspace = true }
 # Lock-neutral: cyrup-provider is already a dependency; `faux` pulls no new crate.
 cyrup-provider = { workspace = true, features = ["faux"] }
-# `tests/read_image_auto_resize.rs` builds a real >2000px PNG fixture and compares the `read` tool's
-# attached base64 against the file's own bytes. Both are already in the lockfile (`image` via
+# `src/tests/read_image_auto_resize.rs` builds a real >2000px PNG fixture and compares the `read`
+# tool's attached base64 against the file's own bytes. Both are already in the lockfile (`image` via
 # cyrup-tools' default `inline-images`, `base64` via cyrup-provider), so this adds no new crate.
 image = { workspace = true }
 base64 = { workspace = true }

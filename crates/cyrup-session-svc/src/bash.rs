@@ -113,8 +113,29 @@ impl std::fmt::Debug for BashOptions {
     }
 }
 
-/// Run `command` against `proc` in `cwd`, streaming combined output to `on_chunk`, honoring `cancel`
-/// (Pi `executeBashWithOperations`). The default local backend kills the whole tree on cancel.
+/// What to run and where — the inputs [`run_bash`] resolves the command against, grouped so the
+/// per-call control inputs (`cancel`, the chunk sink) stay separate parameters. Bundling them is
+/// what keeps `run_bash` under clippy's argument limit without silencing `too_many_arguments`:
+/// nothing here is a caller-facing knob, so this is deliberately NOT [`BashOptions`], which carries
+/// `exclude_from_context`/`id` that this seam never sees and none of the fields below.
+pub(crate) struct RunBashArgs<'a> {
+    /// The session's process backend, used when `operations` is `None`.
+    pub proc: &'a Arc<dyn ProcOps>,
+    /// The shell resolved by the caller from the live `shellPath` setting.
+    pub shell: &'a ShellConfig,
+    /// Per-call execution backend override; see the field doc on [`BashOptions::operations`].
+    pub operations: Option<&'a dyn cyrup_tools::ops::BashOperations>,
+    /// Working directory for the command.
+    pub cwd: PathBuf,
+    /// The command line handed to the backend.
+    pub command: String,
+    /// When set, prepended to the child `PATH` exactly like the agent-loop `bash` tool.
+    pub bin_dir: Option<&'a std::path::Path>,
+}
+
+/// Run `command` against `proc` in `cwd` (both from `args`, see [`RunBashArgs`]), streaming combined
+/// output to `on_chunk`, honoring `cancel` (Pi `executeBashWithOperations`). The default local
+/// backend kills the whole tree on cancel.
 ///
 /// `bin_dir`, when set, is prepended to the child `PATH` exactly like the agent-loop `bash` tool
 /// (Pi `createLocalBashOperations`'s `env: env ?? getShellEnv()`, `core/tools/bash.ts:100`, which
@@ -136,15 +157,11 @@ impl std::fmt::Debug for BashOptions {
 /// (`executeBashWithOperations(command, cwd, operations, {onChunk, signal})`, `bash-executor.ts`).
 /// `None` takes the `??`'s right-hand branch, which is `proc`/`shell` exactly as before.
 pub(crate) async fn run_bash(
-    proc: &Arc<dyn ProcOps>,
-    shell: &ShellConfig,
-    operations: Option<&dyn cyrup_tools::ops::BashOperations>,
-    cwd: PathBuf,
-    command: String,
-    bin_dir: Option<&std::path::Path>,
+    args: RunBashArgs<'_>,
     cancel: cyrup_core::CancelToken,
     mut on_chunk: BashChunkSink,
 ) -> Result<BashResult, cyrup_core::ToolError> {
+    let RunBashArgs { proc, shell, operations, cwd, command, bin_dir } = args;
     // Pi's immediate-bash seam (`executeBashWithOperations`, bash-executor.ts) does NOT resolve a
     // spawn context and never touches the SESSION env — only the `bash` TOOL does
     // (`resolveSpawnContext`, bash.ts:158-184). So no scrub, no session-key injection here.
@@ -216,7 +233,6 @@ pub(crate) async fn run_bash(
             proc.exec(spec, cancel, None, &mut sink).await
         }
     };
-    drop(sink);
     let (output, truncated, full_output_path) = buffer.finish();
 
     match status {

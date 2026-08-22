@@ -27,9 +27,9 @@
 //! the `UiEffect::Notify` that `LiveHostServices::notify` publishes to the sink a mode attaches via
 //! `set_ui_effect_sink` (`host_services.rs:419-431`, :641-645).
 //!
-//! Deliberately native, not wasm: `tests/wasm_slash_command.rs` covers the guest route and pays a
-//! nested `cargo build` for it. A native `Arc<dyn NativeExtension>` needs no build step, so these
-//! run in milliseconds and add no fixture-target directory to `/tmp`.
+//! Deliberately native, not wasm: `crates/cyrup-it/tests/session_svc/wasm_slash_command.rs` covers
+//! the guest route and pays a nested `cargo build` for it. A native `Arc<dyn NativeExtension>` needs
+//! no build step, so these run in milliseconds and add no fixture-target directory to `/tmp`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;

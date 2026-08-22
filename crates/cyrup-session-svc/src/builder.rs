@@ -2448,7 +2448,7 @@ mod tests {
     /// SEAM-074, the regression that motivated it: an INLINE extension whose id happens to collide
     /// with a shipped built-in's still survives `--no-extensions`. The predicate used to match on a
     /// hardcoded id list, so a hand-injected `FailingExt { id: "subagents" }` was silently dropped
-    /// from the load — which is exactly what `tests/build_containment_and_flag_diagnostics.rs`'s
+    /// from the load — which is exactly what `src/tests/build_containment_and_flag_diagnostics.rs`'s
     /// `the_failure_reaches_the_panel_and_the_exit_channel_together` does, and it went RED: the
     /// native never loaded, so its init failure reached neither the `[Extension issues]` panel nor
     /// the fatal exit channel. pi cannot have that bug — it separates the tiers by ORIGIN

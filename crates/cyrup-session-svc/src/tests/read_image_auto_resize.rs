@@ -141,7 +141,7 @@ async fn read_tool_result(session: &AgentSession) -> (String, String) {
 async fn run_read(fx: &Fixture) -> (String, String) {
     let session = session_for(fx).await;
     // The returned stream is the caller's optional event view; the run itself is driven by the
-    // session (same idiom as `tests/compaction_tokens_after.rs`), so settle on `wait_for_idle`.
+    // session (same idiom as `src/tests/compaction_tokens_after.rs`), so settle on `wait_for_idle`.
     let _events = session.prompt("look at big.png").await.expect("prompt");
     session.wait_for_idle().await;
     read_tool_result(&session).await

@@ -574,8 +574,12 @@ async fn compaction_before_compact_override_lands_in_entry() {
 /// to `executeBashWithOperations` whichever backend the `??` resolved (`agent-session.ts:2779-2789`),
 /// so an overriding backend's bytes must go through the SAME sanitize → rolling-buffer → temp-spill
 /// pipeline. A port that wired the override straight to the result would return the escape verbatim.
+/// One recorded `exec` call: the command line, the cwd it was handed, and the child env as
+/// (key, value) pairs — i.e. exactly what `BashExecOptions` carried into the override.
+type SeenExec = (String, PathBuf, Vec<(String, String)>);
+
 struct RecordingBashOps {
-    seen: Mutex<Vec<(String, PathBuf, Vec<(String, String)>)>>,
+    seen: Mutex<Vec<SeenExec>>,
 }
 
 #[async_trait::async_trait]

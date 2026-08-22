@@ -235,8 +235,8 @@ async fn live_host_services_control_reaches_a_real_session_effect() {
     // which encoded the defect: `apply_pending_control` returned the runtime-tier ops "for the
     // runtime to act on", and its only production caller did `let _deferred = …`. Nothing ever
     // acted. `apply_pending_control` is now a SINK — a runtime-tier op is routed to the installed
-    // `RuntimeActions` (see `tests/control_ops.rs` for the positive, end-to-end proof), and on a
-    // BARE session like this one — built straight from `SessionBuilder`, never installed into an
+    // `RuntimeActions` (see `src/tests/control_ops.rs` for the positive, end-to-end proof), and on
+    // a BARE session like this one — built straight from `SessionBuilder`, never installed into an
     // `AgentSessionRuntime` — there is no host to route to, so the op is REPORTED (a `tracing::warn`
     // naming `SessionServiceError::NoRuntimeHost("reload")`) rather than silently dropped. What is
     // asserted here is that the drain consumes it and leaves the session healthy.

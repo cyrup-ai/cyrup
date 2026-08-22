@@ -11,7 +11,7 @@ use cyrup_core::CancelToken;
 use cyrup_ext::{HostEvent, Reduced};
 use cyrup_tools::ShellConfig;
 
-use crate::bash::{BashOptions, BashResult, bash_message_payload, run_bash};
+use crate::bash::{BashOptions, BashResult, RunBashArgs, bash_message_payload, run_bash};
 use crate::error::SessionServiceError;
 use crate::event::AgentSessionEvent;
 
@@ -120,12 +120,14 @@ impl AgentSession {
         // (agent-session.ts:2782): a caller-supplied backend replaces the local one for THIS call
         // only. `run_bash` takes the `??` whole — `None` is the local branch it always took.
         let outcome = run_bash(
-            &self.proc,
-            &shell,
-            options.operations.as_deref(),
-            cwd,
-            resolved_command,
-            Some(bin_dir.as_path()),
+            RunBashArgs {
+                proc: &self.proc,
+                shell: &shell,
+                operations: options.operations.as_deref(),
+                cwd,
+                command: resolved_command,
+                bin_dir: Some(bin_dir.as_path()),
+            },
             cancel,
             sink,
         )

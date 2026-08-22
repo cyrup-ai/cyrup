@@ -291,8 +291,8 @@ impl AgentSession {
     /// state is what the guest's `models`/`session`/`control` imports reach. Behind the `wasm-host`
     /// feature (ON by default — the host is built with the Wasmtime engine). A guest that registers a
     /// slash command via this seam executes through the real run path end-to-end (proven by
-    /// `tests/wasm_slash_command.rs`: `prompt("/greet …")` → `_tryExecuteExtensionCommand` → the
-    /// guest's `execute-command` export).
+    /// `crates/cyrup-it/tests/session_svc/wasm_slash_command.rs`: `prompt("/greet …")` →
+    /// `_tryExecuteExtensionCommand` → the guest's `execute-command` export).
     /// EXT-059 — `caps` is REQUIRED, not implied. This used to call
     /// [`cyrup_ext::ExtensionHost::load_wasm`], which is `load_wasm_with_caps(…,
     /// &Capabilities::host_granted())`: a byte-level load with a TOTAL grant, chosen silently by a

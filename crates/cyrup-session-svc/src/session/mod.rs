@@ -47,7 +47,7 @@ pub use types::{
     NavigateTreeOptions, NavigateTreeOutcome, ScopedModel, SessionDagKind, SessionDagNode,
 };
 
-// `tests/delete_session_file_trash.rs` names this through `crate::session::trash_args`; the
+// `src/tests/delete_session_file_trash.rs` names this through `crate::session::trash_args`; the
 // re-export is `cfg(test)` because nothing in a normal build reaches it (`delete_session_file_at`
 // calls it from inside `files`), and an unconditional one would be an unused import.
 #[cfg(test)]
@@ -307,6 +307,10 @@ pub struct AgentSession {
 
 impl AgentSession {
     /// Build from the assembled parts (called by [`crate::SessionBuilder::build`]).
+    // Policy for this crate's wide functions: fold the parameters into a params struct where they
+    // describe one subject (see `crate::bash::RunBashArgs`); allow the lint only where the
+    // parameters ARE already the assembled parts and a struct would just be a second spelling of
+    // the field list below — which is this one caller, `SessionBuilder::build`, and only it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         agent: Arc<Agent>,

@@ -1,9 +1,9 @@
 //! The runtime model-catalog overlay reaches a LIVE session (DRIFT-007).
 //!
-//! `cyrup-provider`'s own `tests/remote_catalog.rs` proves the fetch/merge/failure semantics. This
-//! file proves the wiring: that `<agent_dir>/models-store.json` — the file a background refresh
-//! writes — is picked up by [`AgentSession::full_model_catalog`], the registry `/model`, model
-//! resolution and every enumeration path actually read.
+//! `crates/cyrup-provider/src/tests/remote_catalog.rs` proves the fetch/merge/failure semantics.
+//! This file proves the wiring: that `<agent_dir>/models-store.json` — the file a background
+//! refresh writes — is picked up by [`AgentSession::full_model_catalog`], the registry `/model`,
+//! model resolution and every enumeration path actually read.
 //!
 //! **No network.** Nothing here issues a request: the store is written directly, exactly as a
 //! completed refresh would have left it, and the session only ever reads it from disk.
