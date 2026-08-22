@@ -867,7 +867,7 @@ pub fn build() -> ExtensionApi {
     );
 
     // A command exercising `confirm`'s `message` body (Pi `confirm(title, message, opts)`,
-    // rpc-types.ts:240 @v0.83.0; L4 review §2.6): threads live through `ctx.rs` -> WIT `confirm` -> the host
+    // rpc-types.ts:240 @v0.83.0; L4 review §2.6): threads live through `ctx/ui.rs` -> WIT `confirm` -> the host
     // backend, distinct from the prompt/title (not dismissed, so the backend actually sees it).
     api.register_command(
         "confirmdemo",
@@ -889,7 +889,7 @@ pub fn build() -> ExtensionApi {
     );
 
     // A command exercising `input`'s `placeholder` (Pi `input(title, placeholder, opts)`,
-    // rpc-types.ts:241-248 @v0.83.0; L4 review §2.7): threads live through `ctx.rs` -> WIT `input` -> the host
+    // rpc-types.ts:241-248 @v0.83.0; L4 review §2.7): threads live through `ctx/ui.rs` -> WIT `input` -> the host
     // backend, distinct from the prompt/title.
     api.register_command(
         "inputdemo",

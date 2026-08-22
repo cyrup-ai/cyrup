@@ -297,7 +297,7 @@ pub trait HostServices: Send + Sync {
     // EXT-036: every citation in this block used to sit ~6 lines low
     // (`types.ts:136,142,164,177,184,187,210,275`, `rpc-mode.ts:149,163,196`) — the SAME uniform
     // offset as the `interface ui` cluster in `world.wit` and the `Ui` cluster in
-    // `cyrup-ext-sdk/src/ctx.rs`. Note the tell: the citations ADDED by the EXT-021/EXT-047 pass
+    // `cyrup-ext-sdk/src/ctx/`. Note the tell: the citations ADDED by the EXT-021/EXT-047 pass
     // just above (`:151`, `:154`, `:164`, `:167`, `:170-175`) are all EXACT, so the rot is
     // confined to the original import of this block and is not a systematic misreading.
     /// A notification toast (Pi `notify(message, type?)`, `types.ts:142` @v0.83.0).
