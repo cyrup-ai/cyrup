@@ -113,6 +113,19 @@ required-features = ["test-fixtures"]
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# CROSS-CRATE CONFORMANCE, TEST-ONLY (MCP-141/142/146/370). `exec/mcp_direct_tools.rs` is the READER
+# of `<agent_dir>/mcp-cache.json`; `cyrup-mcp` is its WRITER, and the two also have to agree on the
+# name a direct MCP tool is registered under. They share an on-disk file rather than a type — on
+# purpose, because resolving a subagent's `mcp:` selectors must not drag the whole MCP adapter
+# (rmcp, reqwest, oauth2) into a spawn — so nothing but a test can prove the two implementations of
+# that contract still produce the same bytes. They silently did not, for four separate reasons, until
+# this dependency existed to catch it: `mcp_direct_tools::tests` now asserts its `configHash`
+# pre-image, its digest and its tool names against `cyrup_mcp::dirs` / `cyrup_mcp::registration`
+# themselves rather than against constants copied out of that crate's tests, which is the difference
+# between drift being impossible and drift being merely detectable. Dev-only: `[dependencies]` above
+# is unchanged, so no production layering is introduced (and `crates/cyrup`, the one binary that
+# links both, already depends on `cyrup-mcp` directly).
+cyrup-mcp = { workspace = true }
 # SUBA-032: `#[tokio::test(start_paused = true)]` + `tokio::time::advance` — the virtual clock that
 # replaces `tui/notices.rs`'s three real-clock sleeps around a 60 ms debounce, whose load-bearing
 # assertion landed 15 ms inside the deadline and flaked under machine load. Dev-only: the feature

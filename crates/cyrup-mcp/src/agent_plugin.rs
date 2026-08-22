@@ -866,7 +866,7 @@ fn translate_stdio_server(
                 .map(|value| expand_plugin_placeholders(value, &plugin_root_str, &plugin_data_str))
                 .collect(),
         ),
-        env: Some(resolved_env),
+        env: Some(resolved_env.into()),
         cwd: Some(cwd.to_string_lossy().into_owned()),
         plugin_data_dir: Some(plugin_data_str),
         // The other half of the containment: with `literalEnv` set, the connect path performs no
@@ -917,7 +917,7 @@ fn translate_http_server(
         // Set EXPLICITLY, never left to default: the connect path must not be able to fall back to
         // another transport for a third-party endpoint.
         http_transport: Some(HttpTransport::StreamableHttp),
-        headers,
+        headers: headers.map(Into::into),
         ..ServerEntry::default()
     })
 }
@@ -1772,7 +1772,7 @@ mod tests {
         );
         // The pair that makes env interpolation inert, and the pair it injects.
         assert_eq!(server.entry.literal_env, Some(true));
-        let env = server.entry.env.as_ref().map_or_else(BTreeMap::new, Clone::clone);
+        let env = server.entry.env.as_deref().map_or_else(BTreeMap::new, Clone::clone);
         assert_eq!(
             env.get(PLUGIN_ROOT_VAR).map(String::as_str),
             Some(root.to_string_lossy().as_ref())

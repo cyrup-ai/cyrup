@@ -37,6 +37,17 @@ exists.
 > **first-listed** one, so the seven verdict buckets sum to exactly 436. Ten units carry a
 > host-addition leg somewhere in a compound verdict; they are named in full below.
 >
+> **IMPLEMENTATION STATUS IS NOT IN THIS DOCUMENT — it is in
+> [13-cyrup-mcp-STATUS.md](13-cyrup-mcp-STATUS.md).** The canonical table below records what the port
+> must BUILD; it has never recorded what is BUILT, and the `status` column added to it on 2026-08-21
+> is a summary of that file, not a second source of truth. As of that audit, against v2.26.1:
+> **212 units implemented · 100 partial · 98 missing · 27 not-applicable** — so **198 of 437 units
+> carry open work**, including 8 of the 22 `critical` ones. The weakest surface is `13i` (protocol and
+> verification, 31 of 50 units with no implementation at all); the most critical-or-high open work sits
+> in `13c` (servers and the metadata cache, 23). Read the STATUS file before acting on any unit here:
+> it carries the evidence, and it is explicit that no ruling in it was verified by building or running
+> anything.
+
 > **RETARGETED 2026-08-20 — the port now targets `pi-mcp-adapter` v2.26.1, not v2.25.0.** Everything
 > below this blockquote was authored against v2.25.0 and is **still cited that way on purpose**. Read
 > *Retarget — v2.25.0 → v2.26.1* immediately below before acting on any unit.
@@ -1342,445 +1353,445 @@ thirty-odd others — this table and the census show the **first-listed** one, s
 buckets sum to the total. The one place that loses information is the host-addition legs, so they are
 enumerated in full above rather than inferred from this column.
 
-| id | sev | eff | verdict | title | § |
-|---|---|---|---|---|---|
-| `MCP-001` | n/a | M | `hand-written` | Stand up `crates/cyrup-mcp` and attach it at the session-build arms | `13a-mcp-activation.md` |
-| `MCP-002` | low | S | `host-verb` | Read `--mcp-config` from argv directly, and register the flag for `--help` | `13a-mcp-activation.md` |
-| `MCP-003` | critical | L | `host-verb` | Register the entire tool/command surface from disk caches inside `init()`, and never fail | `13a-mcp-activation.md` |
-| `MCP-004` | high | M | `hand-written` | Port `McpRuntimeOwner` | `13a-mcp-activation.md` |
-| `MCP-005` | medium | S | `hand-written` | Reverse-order cleanup, the aggregate error, and the late-cleanup path | `13a-mcp-activation.md` |
-| `MCP-006` | medium | M | `extension-owned` | Port `createOwnedUi` as a fenced services handle | `13a-mcp-activation.md` |
-| `MCP-007` | medium | S | `hand-written` | Port the abort helpers (combineAbortSignals, isAbortError, throwIfAborted, abortable) | `13a-mcp-activation.md` |
-| `MCP-008` | high | M | `hand-written` | The `session_start` generation protocol, abort-before-await | `13a-mcp-activation.md` |
-| `MCP-009` | high | S | `hand-written` | The `session_shutdown` handler | `13a-mcp-activation.md` |
-| `MCP-010` | high | S | `hand-written` | `shutdownState`, preserving the metadata-flush error | `13a-mcp-activation.md` |
-| `MCP-011` | high | M | `hand-written` | `startInitialization`'s triple staleness check and metadata-update hook install | `13a-mcp-activation.md` |
-| `MCP-012` | medium | S | `extension-owned` | `startLoadTimeInitialization` — the eager/keep-alive pre-warm | `13a-mcp-activation.md` |
-| `MCP-013` | low | S | `hand-written` | The `MCP_DIRECT_TOOLS` blocking wait at session start | `13a-mcp-activation.md` |
-| `MCP-014` | high | M | `hand-written` | Re-`init` per session, and the build-before-dispose inversion | `13a-mcp-activation.md` |
-| `MCP-015` | medium | S | `extension-owned` | Snapshot every context value before the first await in `initialize` | `13a-mcp-activation.md` |
-| `MCP-016` | medium | M | `hand-written` | The sampling and elicitation wiring gates | `13a-mcp-activation.md` |
-| `MCP-017` | medium | S | `hand-written` | Register owner cleanups in the exact LIFO order, plus the list-changed listener | `13a-mcp-activation.md` |
-| `MCP-018` | low | S | `hand-written` | The zero-enabled-servers early return | `13a-mcp-activation.md` |
-| `MCP-019` | medium | S | `hand-written` | Metadata-cache bootstrap: file-absent means connect everything once | `13a-mcp-activation.md` |
-| `MCP-020` | medium | S | `hand-written` | Per-server lifecycle registration and idle-override derivation | `13a-mcp-activation.md` |
-| `MCP-021` | medium | M | `hand-written` | Rehydrate tool/resource/prompt/instruction metadata from a hash-valid cache entry | `13a-mcp-activation.md` |
-| `MCP-022` | medium | M | `hand-written` | The bounded startup connect pass | `13a-mcp-activation.md` |
-| `MCP-023` | high | M | `hand-written` | The two-pass startup metadata build | `13a-mcp-activation.md` |
-| `MCP-024` | medium | S | `hand-written` | Failure tracking with a 60-second backoff | `13a-mcp-activation.md` |
-| `MCP-025` | high | S | `hand-written` | Startup connect notifications, terminal sanitising, and skipped-tool warnings | `13a-mcp-activation.md` |
-| `MCP-026` | low | S | `hand-written` | The `MCP_DIRECT_TOOLS` cache-bootstrap pass inside `initialize` | `13a-mcp-activation.md` |
-| `MCP-027` | medium | S | `hand-written` | Lifecycle callbacks (reconnect, reconnect-failure, idle shutdown) | `13a-mcp-activation.md` |
-| `MCP-027a` | medium | S | `hand-written` | `sendMessage`'s `triggerTurn` pre-turn convergence gate **(v2.26.1 retarget, 2026-08-20)** | `13a-mcp-activation.md` |
-| `MCP-028` | medium | S | `hand-written` | `updateServerMetadata` | `13a-mcp-activation.md` |
-| `MCP-029` | high | M | `hand-written` | `updateMetadataCache` write rules | `13a-mcp-activation.md` |
-| `MCP-030` | low | S | `hand-written` | `notifyToolMetadataUpdated` must never let a hook break a connect | `13a-mcp-activation.md` |
-| `MCP-031` | medium | S | `hand-written` | `flushMetadataCache` on shutdown | `13a-mcp-activation.md` |
-| `MCP-032` | low | S | `host-verb` | `updateStatusBar` — the three footer verbosities | `13a-mcp-activation.md` |
-| `MCP-033` | medium | M | `hand-written` | `lazyConnect` | `13a-mcp-activation.md` |
-| `MCP-034` | medium | M | `hand-written` | `McpLifecycleManager` — the health-check state machine | `13a-mcp-activation.md` |
-| `MCP-035` | high | S | `hand-written` | `gracefulShutdown` — memoised, and it waits for the in-flight check | `13a-mcp-activation.md` |
-| `MCP-036` | medium | M | `hand-written` | `syncDirectTools`: the fingerprint diff, the re-activation path, and the renderer declaration | `13a-mcp-activation.md` |
-| `MCP-037` | high | M | `host-addition` | HA-1: a native extension has no handle to `ExtensionHost::register_late_tool` | `13a-mcp-activation.md` |
-| `MCP-037a` | critical | S | `host-addition` | HA-1b: `refresh_tools` drops the native tier's dirty flag in the `wasm-host` build | `13a-mcp-activation.md` |
-| `MCP-038` | medium | S | `host-verb` | `deactivateTools`: the optional `unregisterTool` primary path and the `setActiveTools` fallback | `13a-mcp-activation.md` |
-| `MCP-039` | medium | S | `host-addition` | MCP prompts as slash commands registered after `init` | `13a-mcp-activation.md` |
-| `MCP-040` | medium | L | `host-verb` | The `/mcp` command handler | `13a-mcp-activation.md` |
-| `MCP-041` | medium | M | `host-addition` | HA-2: `/mcp`'s dynamic argument completions have no native path and no TUI consumer | `13a-mcp-activation.md` |
-| `MCP-042` | medium | M | `host-verb` | The `/mcp-auth` command handler | `13a-mcp-activation.md` |
-| `MCP-043` | high | L | `hand-written` | The `mcp` gateway tool: registration, the init wait, and the dispatch order | `13a-mcp-activation.md` |
-| `MCP-044` | n/a | S | `cut` | The `mcpScript` tool | `13a-mcp-activation.md` |
-| `MCP-045` | medium | S | `host-verb` | The `tool_result` `isError` override | `13a-mcp-activation.md` |
-| `MCP-046` | medium | S | `hand-written` | The abort call-site discipline inside the runtime | `13a-mcp-activation.md` |
-| `MCP-047` | critical | M | `hand-written` | Port `agent-plugin-loader.ts` | `13a-mcp-activation.md` |
-| `MCP-048` | high | S | `open-decision` | Agent-directory resolution, and whether `~/.pi/agent` is a migration source | `13a-mcp-activation.md` |
-| `MCP-049` | medium | M | `hand-written` | Port `cli.js init` as a `cyrup mcp init` subcommand | `13a-mcp-activation.md` |
-| `MCP-050` | n/a | M | `extension-owned` | Create `cyrup-mcp` and its config module skeleton | `13b-mcp-config.md` |
-| `MCP-051` | high | S | `extension-owned` | Read `mcp.json` as JSONC, not JSON | `13b-mcp-config.md` |
-| `MCP-052` | high | M | `hand-written` | Port the six-source precedence ladder | `13b-mcp-config.md` |
-| `MCP-053` | critical | M | `hand-written` | Port `mergeServerMaps`, including URL-bound credential stripping | `13b-mcp-config.md` |
-| `MCP-054` | n/a | S | `cut` | socket ⇄ command/url transport-swap stripping | `13b-mcp-config.md` |
-| `MCP-055` | medium | S | `hand-written` | Port `expandImports` / `mergeImports` | `13b-mcp-config.md` |
-| `MCP-056` | medium | M | `hand-written` | Port the 7 host-config import families | `13b-mcp-config.md` |
-| `MCP-057` | medium | M | `hand-written` | Port the `opencode` multi-file merge and entry translation | `13b-mcp-config.md` |
-| `MCP-058` | medium | S | `hand-written` | Port `hostConfigDiscovery` and `loadDiscoveredHostConfigs` | `13b-mcp-config.md` |
-| `MCP-059` | medium | M | `hand-written` | Port `getMcpDiscoverySummary`, conflicts and the fingerprint | `13b-mcp-config.md` |
-| `MCP-060` | low | S | `hand-written` | Port RepoPrompt detection and `KNOWN_SERVER_PRESETS` | `13b-mcp-config.md` |
-| `MCP-061` | high | S | `extension-owned` | Port the atomic raw-config writer | `13b-mcp-config.md` |
-| `MCP-062` | low | S | `hand-written` | Port `buildUnifiedDiff` (LCS) and `ConfigWritePreview` | `13b-mcp-config.md` |
-| `MCP-063` | high | M | `hand-written` | Port `writeProjectServerDisabledOverride` | `13b-mcp-config.md` |
-| `MCP-064` | medium | M | `hand-written` | Port `getServerProvenance` and `writeDirectToolsConfig` | `13b-mcp-config.md` |
-| `MCP-065` | low | S | `hand-written` | Port `ensureCompatibilityImports`, starter config and shared-entry writers | `13b-mcp-config.md` |
-| `MCP-066` | high | M | `hand-written` | Port `McpSettings` as a permissive struct with per-site defaults | `13b-mcp-config.md` |
-| `MCP-067` | medium | S | `hand-written` | Port the settings merge as a one-level key merge | `13b-mcp-config.md` |
-| `MCP-068` | high | S | `hand-written` | Port env-var overrides, including the `__none__` sentinel | `13b-mcp-config.md` |
-| `MCP-069` | high | M | `hand-written` | Port `ServerEntry` as a typed struct | `13b-mcp-config.md` |
-| `MCP-069a` | critical | S | `hand-written` + `open-decision` | Fail **closed** on a malformed `requestHeadersCommand` **(v2.26.1 retarget, 2026-08-20)** | `13b-mcp-config.md` |
-| `MCP-070` | high | M | `hand-written` | Enforce the absent-vs-null hash pre-image contract | `13b-mcp-config.md` |
-| `MCP-071` | high | S | `hand-written` | Port `ToolPrefix` with all four modes and `sanitizeServerPrefix` | `13b-mcp-config.md` |
-| `MCP-072` | high | S | `hand-written` | Port `formatToolName` / `resolveToolPrefix` | `13b-mcp-config.md` |
-| `MCP-073` | high | S | `hand-written` | Port `resolveServerFromToolName` with its ambiguity fail-safe | `13b-mcp-config.md` |
-| `MCP-074` | medium | S | `hand-written` | Port `sanitizePromptName` / `formatPromptCommandName` | `13b-mcp-config.md` |
-| `MCP-075` | high | M | `hand-written` | Port `getToolNameCandidates` (the legacy candidate set) | `13b-mcp-config.md` |
-| `MCP-076` | high | M | `hand-written` | Port glob matching and `isToolIncluded`/`isToolExcluded`/`isToolAllowed` | `13b-mcp-config.md` |
-| `MCP-077` | high | S | `hand-written` | Port the metadata/cache type model | `13b-mcp-config.md` |
-| `MCP-078` | medium | S | `extension-owned` | Port the status-snapshot types | `13b-mcp-config.md` |
-| `MCP-079` | medium | S | `hand-written` | Port the tool-approval decision and origin types | `13b-mcp-config.md` |
-| `MCP-080` | n/a | S | `cut` | MCP-UI type surface in `types.ts` | `13b-mcp-config.md` |
-| `MCP-081` | medium | S | `hand-written` | Port `McpAdapterOptions` / programmatic config mode | `13b-mcp-config.md` |
-| `MCP-082` | high | S | `hand-written` | Port `interpolateEnvVars` including the `{env:VAR}` form | `13b-mcp-config.md` |
-| `MCP-083` | critical | M | `extension-owned` | Port `!` / `!!` command-secret resolution | `13b-mcp-config.md` |
-| `MCP-084` | high | S | `hand-written` | Port `resolveServerUrl` / `resolveConfigPath` / `resolveBearerToken` | `13b-mcp-config.md` |
-| `MCP-085` | medium | M | `hand-written` | Port terminal sanitisation and error flattening | `13b-mcp-config.md` |
-| `MCP-086` | medium | S | `extension-owned` | Port the browser/path open dispatch | `13b-mcp-config.md` |
-| `MCP-087` | medium | S | `hand-written` | Port `parallelLimit`, argv scan, `toStringRecord`, `normalizeDirectToolInputSchema` | `13b-mcp-config.md` |
-| `MCP-088` | medium | S | `host-verb` | Port `formatMcpStatus` and `formatAuthRequiredMessage` | `13b-mcp-config.md` |
-| `MCP-089` | medium | S | `hand-written` | Port the error taxonomy | `13b-mcp-config.md` |
-| `MCP-090` | low | S | `extension-owned` | Port the logger as a `tracing` adapter | `13b-mcp-config.md` |
-| `MCP-091` | medium | M | `hand-written` | Port `renderTsShape` | `13b-mcp-config.md` |
-| `MCP-092` | high | S | `hand-written` | Port the dual-dialect JSON Schema validator | `13b-mcp-config.md` |
-| `MCP-093` | medium | S | `hand-written` | Register the `ajv-formats` formats `jsonschema` does not ship | `13b-mcp-config.md` |
-| `MCP-094` | high | L | `hand-written` | Reconcile `mcp_direct_tools` with this section's contract | `13b-mcp-config.md` |
-| `MCP-095` | n/a | S | `extension-owned` | JSONC parser home | `13b-mcp-config.md` |
-| `MCP-096` | high | S | `open-decision` | Project trust and the two project-scoped config sources | `13b-mcp-config.md` |
-| `MCP-097` | low | S | `hand-written` | Port `getConfigDiscoveryPaths` and `findAvailableImportConfigs` | `13b-mcp-config.md` |
-| `MCP-098` | medium | S | `hand-written` | Preserve `renderTsShape`'s re-entrant alias emission | `13b-mcp-config.md` |
-| `MCP-099` | low | S | `hand-written` | Reproduce `buildConfigWritePreview`'s reserialised "before" text | `13b-mcp-config.md` |
-| `MCP-100` | high | L | `hand-written` | McpServerManager: the five race guards and the full public API | `13c-mcp-servers.md` |
-| `MCP-101` | high | M | `rmcp` | stdio transport: spawn, env resolution, cwd, plugin data dir | `13c-mcp-servers.md` |
-| `MCP-102` | medium | S | `rmcp` | stderr tail capture and failure-message enrichment | `13c-mcp-servers.md` |
-| `MCP-103` | medium | S | `extension-owned` | Wire npx/npm resolution into the connection builder | `13c-mcp-servers.md` |
-| `MCP-104` | medium | S | `hand-written` | npx cache: bump to CACHE_VERSION = 2 and port clearLegacyCache | `13c-mcp-servers.md` |
-| `MCP-105` | high | M | `hand-written` | npx resolver: exact package-version pinning is missing | `13c-mcp-servers.md` |
-| `MCP-106` | low | S | `hand-written` | npx resolver: cache key must be [command, packageSpec, binName] | `13c-mcp-servers.md` |
-| `MCP-107` | medium | S | `hand-written` | npx resolver: no cancellation path | `13c-mcp-servers.md` |
-| `MCP-108` | low | S | `hand-written` | npx resolver: entry-level cache validation and Windows npm resolution | `13c-mcp-servers.md` |
-| `MCP-109` | high | S | `rmcp` | Streamable HTTP client transport | `13c-mcp-servers.md` |
-| `MCP-110` | n/a | n/a | `cut` | Legacy HTTP+SSE transport and the shouldFallbackToSse ladder | `13c-mcp-servers.md` |
-| `MCP-111` | n/a | n/a | `cut` | Unix-domain-socket transport | `13c-mcp-servers.md` |
-| `MCP-112` | n/a | S | `rmcp` | MCP NDJSON framing | `13c-mcp-servers.md` |
-| `MCP-113` | medium | S | `hand-written` | Transport selection and mutual exclusion | `13c-mcp-servers.md` |
-| `MCP-114` | high | M | `extension-owned` | HTTP header, bearer and command-secret resolution | `13c-mcp-servers.md` |
-| `MCP-115` | high | M | `hand-written` | Implicit-vs-explicit OAuth provider state machine and the attempt loop | `13c-mcp-servers.md` |
-| `MCP-115a` | high | S | `hand-written` | Wire the per-request header command into `connectHttpClient` **(v2.26.1 retarget, 2026-08-20)** | `13c-mcp-servers.md` |
-| `MCP-116` | high | S | `hand-written` | needs-auth connection state and one-shot credential invalidation | `13c-mcp-servers.md` |
-| `MCP-117` | medium | S | `rmcp` | Protocol-revision negotiation | `13c-mcp-servers.md` |
-| `MCP-118` | medium | S | `rmcp` | Client capability advertisement (sampling / elicitation form+url) | `13c-mcp-servers.md` |
-| `MCP-119` | high | M | `rmcp` | Paginated discovery with capability gating and per-list failure policy | `13c-mcp-servers.md` |
-| `MCP-120` | medium | S | `rmcp` | list_changed refresh with identity guards | `13c-mcp-servers.md` |
-| `MCP-121` | n/a | n/a | `cut` | Adapter-private UI stream-patch notification handler | `13c-mcp-servers.md` |
-| `MCP-122` | medium | S | `hand-written` | URL-elicitation acceptance tracking and completion notice | `13c-mcp-servers.md` |
-| `MCP-123` | medium | S | `rmcp` | Connect-time abort and once-only transport cleanup | `13c-mcp-servers.md` |
-| `MCP-124` | high | S | `hand-written` | Error taxonomy and containsCleanupFailure | `13c-mcp-servers.md` |
-| `MCP-125` | high | S | `hand-written` | reconnect: guards, single-flight, identity, in-flight preservation | `13c-mcp-servers.md` |
-| `MCP-126` | high | M | `hand-written` | close / closeAll: generations, attempt aborts, late-name sweep | `13c-mcp-servers.md` |
-| `MCP-127` | medium | S | `hand-written` | Idle and in-flight accounting | `13c-mcp-servers.md` |
-| `MCP-128` | medium | S | `rmcp` | Request options: timeout normalisation and owned signal | `13c-mcp-servers.md` |
-| `MCP-129` | medium | S | `rmcp` | getPrompt / readResource accounting and disabled re-check | `13c-mcp-servers.md` |
-| `MCP-130` | medium | S | `hand-written` | Startup connect concurrency limit | `13c-mcp-servers.md` |
-| `MCP-131` | high | S | `rmcp` | Child-process cleanup and orphan avoidance | `13c-mcp-servers.md` |
-| `MCP-132` | medium | M | `extension-owned` | MCP endpoint probe (three-strategy ladder) | `13c-mcp-servers.md` |
-| `MCP-133` | medium | S | `hand-written` | Probe-enriched HTTP connect failures | `13c-mcp-servers.md` |
-| `MCP-134` | high | S | `rmcp` | isTerminatedSession predicate | `13c-mcp-servers.md` |
-| `MCP-135` | high | M | `hand-written` | withSessionRecovery retry wrapper | `13c-mcp-servers.md` |
-| `MCP-136` | n/a | S | `hand-written` | Tracker: what survives a restart | `13c-mcp-servers.md` |
-| `MCP-137` | medium | S | `hand-written` | Status snapshot construction | `13c-mcp-servers.md` |
-| `MCP-138` | low | S | `extension-owned` | Publish the status snapshot | `13c-mcp-servers.md` |
-| `MCP-139` | high | M | `hand-written` | Metadata cache: path, schema, version, load and merge-save | `13c-mcp-servers.md` |
-| `MCP-140` | high | M | `hand-written` | Metadata cache: serialisers and reconstructors | `13c-mcp-servers.md` |
-| `MCP-141` | critical | M | `hand-written` | computeServerHash must hash all 14 fields; the in-tree reader hashes 11 | `13c-mcp-servers.md` |
-| `MCP-142` | critical | S | `hand-written` | stableStringify emits the bare token `undefined`, not `null` | `13c-mcp-servers.md` |
-| `MCP-143` | high | S | `hand-written` | interpolateEnvVars is missing its third pattern {env:NAME} | `13c-mcp-servers.md` |
-| `MCP-144` | high | S | `hand-written` | !/!! secret-expression semantics in hashed values | `13c-mcp-servers.md` |
-| `MCP-145` | high | S | `hand-written` | isServerCacheValid including the throw-to-false rule | `13c-mcp-servers.md` |
-| `MCP-146` | critical | S | `hand-written` | Resource tool naming: read_ upstream vs get_ in the in-tree reader | `13c-mcp-servers.md` |
-| `MCP-147` | medium | S | `hand-written` | Direct-tool selector parsing and the missing-server gate | `13c-mcp-servers.md` |
-| `MCP-148` | n/a | n/a | `rmcp` | The protocol layer is rmcp, client-only | `13c-mcp-servers.md` |
-| `MCP-149` | n/a | S | `hand-written` | Tracker: section 03 index and cross-section edges | `13c-mcp-servers.md` |
-| `MCP-151` | high | M | `host-verb` | Register the `mcp` tool with the exact JSON Schema | `13d-mcp-proxy-modes.md` |
-| `MCP-152` | high | M | `hand-written` | Port `buildProxyDescription` and re-register on change | `13d-mcp-proxy-modes.md` |
-| `MCP-153` | high | M | `hand-written` | Port mode dispatch: precedence, args coercion, init gate | `13d-mcp-proxy-modes.md` |
-| `MCP-154` | medium | S | `hand-written` | Port `executeStatus` | `13d-mcp-proxy-modes.md` |
-| `MCP-155` | medium | S | `hand-written` | Port `executeList` | `13d-mcp-proxy-modes.md` |
-| `MCP-156` | low | S | `hand-written` | Port `executeInstructions` | `13d-mcp-proxy-modes.md` |
-| `MCP-157` | medium | M | `hand-written` | Port `executeDescribe` | `13d-mcp-proxy-modes.md` |
-| `MCP-158` | high | M | `hand-written` | Port `executeSearch` match selection | `13d-mcp-proxy-modes.md` |
-| `MCP-159` | medium | S | `hand-written` | Port the regex search path onto a linear-time engine | `13d-mcp-proxy-modes.md` |
-| `MCP-160` | medium | M | `hand-written` | Port `executeSearch` rendering, pagination footer and connecting hint | `13d-mcp-proxy-modes.md` |
-| `MCP-161` | high | M | `hand-written` | Port `executeConnect` | `13d-mcp-proxy-modes.md` |
-| `MCP-162` | high | M | `hand-written` | Port `attemptAutoAuth` and the single-shot latch | `13d-mcp-proxy-modes.md` |
-| `MCP-163` | critical | L | `hand-written` | Port `executeCall`'s resolution state machine (phases 1-5) | `13d-mcp-proxy-modes.md` |
-| `MCP-164` | high | L | `hand-written` | Port `executeCall`'s invocation paths and result shaping | `13d-mcp-proxy-modes.md` |
-| `MCP-165` | medium | M | `hand-written` | Port `executeCall`'s error taxonomy | `13d-mcp-proxy-modes.md` |
-| `MCP-167` | medium | M | `hand-written` | Port `executeAuthStart` and `formatManualAuthInstructions` | `13d-mcp-proxy-modes.md` |
-| `MCP-168` | medium | S | `hand-written` | Port `executeAuthComplete` | `13d-mcp-proxy-modes.md` |
-| `MCP-169` | high | S | `hand-written` | Freeze the `details.error` vocabulary as a conformance table | `13d-mcp-proxy-modes.md` |
-| `MCP-170` | high | S | `extension-owned` | Use insertion-ordered maps for servers and metadata | `13d-mcp-proxy-modes.md` |
-| `MCP-171` | low | M | `open-decision` | Decide the `localeCompare` tie-break | `13d-mcp-proxy-modes.md` |
-| `MCP-172` | high | S | `hand-written` | Port `normalizeSearchText` and `tokenize` | `13d-mcp-proxy-modes.md` |
-| `MCP-173` | high | M | `hand-written` | Port `scoreToolMatch` field scoring | `13d-mcp-proxy-modes.md` |
-| `MCP-174` | medium | M | `hand-written` | Port keyword scoring and `resolveSearchKeywords` | `13d-mcp-proxy-modes.md` |
-| `MCP-175` | high | S | `hand-written` | Port the coverage gate and final bonuses | `13d-mcp-proxy-modes.md` |
-| `MCP-176` | high | S | `hand-written` | Port `rankToolMatches` and `paginate` | `13d-mcp-proxy-modes.md` |
-| `MCP-177` | low | S | `hand-written` | Port keyword resolution inside the regex search path | `13d-mcp-proxy-modes.md` |
-| `MCP-178` | high | M | `open-decision` | Port `rankSuggestions`, and settle the `getServerPrefix` conflict | `13d-mcp-proxy-modes.md` |
-| `MCP-191` | high | M | `open-decision` | `auth-start` / `auth-complete` derive no distinct permission targets | `13d-mcp-proxy-modes.md` |
-| `MCP-192` | medium | S | `host-verb` | Satisfy the permission system's contracts on the `mcp` tool | `13d-mcp-proxy-modes.md` |
-| `MCP-193` | medium | M | `host-addition` | Reach `register_late_tool` from a native extension | `13d-mcp-proxy-modes.md` |
-| `MCP-194` | low | S | `open-decision` | Tool-schema property order is alphabetised by `serde_json` | `13d-mcp-proxy-modes.md` |
-| `MCP-195` | medium | S | `hand-written` | Port the ranking conformance suite (11 cases) | `13d-mcp-proxy-modes.md` |
-| `MCP-196` | high | L | `hand-written` | Port the proxy-mode conformance suites (47 cases) | `13d-mcp-proxy-modes.md` |
-| `MCP-197` | medium | S | `host-verb` | Port the render binding, including the `toolResultRendering` fork | `13d-mcp-proxy-modes.md` |
-| `MCP-198` | medium | M | `hand-written` | Port the cross-server candidate-collision set behind the description's counts | `13d-mcp-proxy-modes.md` |
-| `MCP-199` | low | S | `host-verb` | Wire native-tool detection to `all_tool_names` | `13d-mcp-proxy-modes.md` |
-| `MCP-200` | high | M | `hand-written` | The four-mode server-prefix / tool-name formatter | `13e-mcp-tools.md` |
-| `MCP-201` | high | M | `hand-written` | getToolNameCandidates, including the legacy arm | `13e-mcp-tools.md` |
-| `MCP-202` | high | M | `hand-written` | matchesToolPattern / matchesToolSelector / isToolAllowed | `13e-mcp-tools.md` |
-| `MCP-203` | medium | S | `hand-written` | resourceNameToToolName and the read_ resource base name | `13e-mcp-tools.md` |
-| `MCP-204` | medium | S | `hand-written` | resolveServerFromToolName with its ambiguity fail-safe | `13e-mcp-tools.md` |
-| `MCP-205` | high | M | `open-decision` | Reconcile mcp_direct_tools.rs with pi-mcp-adapter naming | `13e-mcp-tools.md` |
-| `MCP-206` | low | S | `hand-written` | sanitizePromptName / formatPromptCommandName | `13e-mcp-tools.md` |
-| `MCP-207` | high | L | `hand-written` | buildToolMetadata | `13e-mcp-tools.md` |
-| `MCP-208` | medium | S | `hand-written` | extractUiToolVisibility / isUiToolVisibleToModel (kept half) | `13e-mcp-tools.md` |
-| `MCP-209` | n/a | S | `cut` | getToolUiResourceUri / extractToolUiStreamMode and the UI spec fields | `13e-mcp-tools.md` |
-| `MCP-210` | medium | S | `hand-written` | findToolByName, getToolNames, totalToolCount | `13e-mcp-tools.md` |
-| `MCP-211` | medium | M | `hand-written` | formatSchema and its four helpers | `13e-mcp-tools.md` |
-| `MCP-212` | critical | L | `hand-written` | resolveDirectTools, including the builtin-collision drop | `13e-mcp-tools.md` |
-| `MCP-213` | high | M | `hand-written` | buildProxyDescription | `13e-mcp-tools.md` |
-| `MCP-214` | high | L | `hand-written` | The direct-tool execute state machine | `13e-mcp-tools.md` |
-| `MCP-214a` | high | M | `hand-written` | recoverAuthConnection and the per-server request options | `13e-mcp-tools.md` |
-| `MCP-215` | medium | M | `hand-written` | attemptDirectAutoAuth and the auth message templates | `13e-mcp-tools.md` |
-| `MCP-216` | medium | M | `host-verb` | The direct-tool registration shape | `13e-mcp-tools.md` |
-| `MCP-217` | high | L | `host-addition` | Post-init dynamic tool (and command) registration | `13e-mcp-tools.md` |
-| `MCP-217a` | medium | S | `hand-written` | freezeDirectTools and the frozen-surface escape hatches | `13e-mcp-tools.md` |
-| `MCP-217b` | low | S | `host-verb` | The tool-surface refresh notification | `13e-mcp-tools.md` |
-| `MCP-218` | medium | S | `hand-written` | syncProxyTool's registration/deactivation predicate | `13e-mcp-tools.md` |
-| `MCP-219` | medium | S | `hand-written` | MCP_DIRECT_TOOLS, __none__ and parseDirectToolSelectors | `13e-mcp-tools.md` |
-| `MCP-220` | high | M | `hand-written` | transformMcpContent for every standard MCP content type | `13e-mcp-tools.md` |
-| `MCP-221` | medium | S | `hand-written` | transformMcpResourceContents | `13e-mcp-tools.md` |
-| `MCP-222` | high | S | `hand-written` | resolveMcpResultContent and the structured-content fallback | `13e-mcp-tools.md` |
-| `MCP-223` | high | M | `hand-written` | Binary-resource materialization with its four limits | `13e-mcp-tools.md` |
-| `MCP-224` | medium | M | `hand-written` | The materialized-resource cleanup drain and retry | `13e-mcp-tools.md` |
-| `MCP-225` | medium | S | `hand-written` | resolveMcpOutputGuardOptions and the MCP_OUTPUT_GUARD kill switch | `13e-mcp-tools.md` |
-| `MCP-226` | high | M | `hand-written` | guardMcpOutput's normalize / affix / passthrough path | `13e-mcp-tools.md` |
-| `MCP-227` | high | M | `hand-written` | The truncation arithmetic and notice format | `13e-mcp-tools.md` |
-| `MCP-228` | high | S | `hand-written` | saveArtifact's private-directory spill | `13e-mcp-tools.md` |
-| `MCP-229` | medium | M | `hand-written` | boundMcpResult and the result-summary schema | `13e-mcp-tools.md` |
-| `MCP-230` | medium | S | `hand-written` | Record the output guard's actual security contract | `13e-mcp-tools.md` |
-| `MCP-231` | high | M | `hand-written` | isToolCallApprovalRequired | `13e-mcp-tools.md` |
-| `MCP-232` | critical | M | `host-verb` | ensureToolCallApproved and the approval dialog | `13e-mcp-tools.md` |
-| `MCP-233` | medium | S | `host-verb` | Drop the approval broker; before_tool_call is the broker | `13e-mcp-tools.md` |
-| `MCP-234` | high | M | `open-decision` | Direct MCP tools do not reach the mcp permission category | `13e-mcp-tools.md` |
-| `MCP-235` | high | S | `hand-written` | sanitizeTerminalText / stripOscSequences | `13e-mcp-tools.md` |
-| `MCP-236` | medium | S | `hand-written` | Give the mcp tool its prompt guideline | `13e-mcp-tools.md` |
-| `MCP-237` | medium | S | `hand-written` | The call-row formatters | `13e-mcp-tools.md` |
-| `MCP-238` | low | S | `host-verb` | resolveMcpToolRenderOptions and the renderShell selection | `13e-mcp-tools.md` |
-| `MCP-239` | medium | M | `hand-written` | collectCollapsedResultLines / formatMcpToolResultLines / blockToLines | `13e-mcp-tools.md` |
-| `MCP-240` | low | S | `hand-written` | formatMcpToolResultIdentity | `13e-mcp-tools.md` |
-| `MCP-241` | low | M | `hand-written` | The compact result row without a render width | `13e-mcp-tools.md` |
-| `MCP-242` | low | S | `host-verb` | Expanded rendering without a per-row expansion flag | `13e-mcp-tools.md` |
-| `MCP-243` | low | S | `hand-written` | The compact call-row suppression has no cyrup equivalent | `13e-mcp-tools.md` |
-| `MCP-244` | low | S | `hand-written` | The renderer contract carries no theme | `13e-mcp-tools.md` |
-| `MCP-245` | low | S | `extension-owned` | Width-aware truncation is not needed | `13e-mcp-tools.md` |
-| `MCP-246` | low | S | `extension-owned` | Route the five collision/advisory warnings | `13e-mcp-tools.md` |
-| `MCP-247` | high | S | `hand-written` | The mcp proxy tool's parameter schema | `13e-mcp-tools.md` |
-| `MCP-248` | n/a | S | `hand-written` | Tracker: registration, approval, guard and rendering | `13e-mcp-tools.md` |
-| `MCP-249` | high | S | `hand-written` | Freeze the details schema this subsystem emits | `13e-mcp-tools.md` |
-| `MCP-250` | high | M | `hand-written` | The `AuthEntry` record and its strict normalization | `13f-mcp-credentials.md` |
-| `MCP-251` | high | S | `hand-written` | Derive the keychain account and legacy directory from `sha256-<hex>` of the server name | `13f-mcp-credentials.md` |
-| `MCP-252` | high | M | `extension-owned` | Add the OS keyring backend and map its error taxonomy | `13f-mcp-credentials.md` |
-| `MCP-253` | high | M | `hand-written` | The chunking manifest write path | `13f-mcp-credentials.md` |
-| `MCP-254` | high | S | `hand-written` | The chunked read path and the `AuthStoreError` taxonomy | `13f-mcp-credentials.md` |
-| `MCP-255` | medium | S | `hand-written` | Stale-chunk cleanup ordering and its error-swallowing | `13f-mcp-credentials.md` |
-| `MCP-256` | high | M | `hand-written` | The legacy plaintext import-and-delete path (and the record translator) | `13f-mcp-credentials.md` |
-| `MCP-257` | high | M | `hand-written` | The process-lifetime auth-entry cache and its three external invalidation points | `13f-mcp-credentials.md` |
-| `MCP-258` | medium | S | `extension-owned` | Fault-injection backends behind an explicit selector | `13f-mcp-credentials.md` |
-| `MCP-259` | low | S | `hand-written` | Honour the auth-cache disable switch | `13f-mcp-credentials.md` |
-| `MCP-260` | high | M | `hand-written` | Re-exec under `keyctl session -` via a hidden `__mcp-keyring-helper` subcommand | `13f-mcp-credentials.md` |
-| `MCP-261` | medium | S | `hand-written` | The helper's one-shot JSON stdio protocol | `13f-mcp-credentials.md` |
-| `MCP-262` | medium | S | `hand-written` | The revoked-keyring cause-chain predicate | `13f-mcp-credentials.md` |
-| `MCP-263` | low | S | `hand-written` | Emit the two credential-store-unavailable messages verbatim | `13f-mcp-credentials.md` |
-| `MCP-264` | critical | M | `hand-written` | URL binding and the mutators' sibling-purge rule | `13f-mcp-credentials.md` |
-| `MCP-265` | high | S | `hand-written` | `inspectAuthForUrl`'s three-state status and its fail-open/fail-closed split | `13f-mcp-credentials.md` |
-| `MCP-266` | medium | S | `hand-written` | The accessor surface section 07 consumes | `13f-mcp-credentials.md` |
-| `MCP-267` | medium | S | `rmcp` | Expiry arithmetic | `13f-mcp-credentials.md` |
-| `MCP-268` | high | M | `hand-written` | Serialize read-modify-write per server | `13f-mcp-credentials.md` |
-| `MCP-269` | medium | S | `hand-written` | MCP credentials never reach `auth.json` | `13f-mcp-credentials.md` |
-| `MCP-270` | low | S | `extension-owned` | The embedder facade (`oauth.ts`) | `13f-mcp-credentials.md` |
-| `MCP-271` | n/a | S | `rmcp` | The MCP-SDK `OAuthTokens` conversion | `13f-mcp-credentials.md` |
-| `MCP-272` | n/a | S | `cut` | `ConsentManager` | `13f-mcp-credentials.md` |
-| `MCP-273` | n/a | S | `cut` | `ConsentError` | `13f-mcp-credentials.md` |
-| `MCP-274` | n/a | S | `cut` | Consent state is process-scoped and must not be persisted | `13f-mcp-credentials.md` |
-| `MCP-275` | medium | S | `hand-written` | Compact JSON serialization | `13f-mcp-credentials.md` |
-| `MCP-276` | n/a | S | `extension-owned` | The non-string server-name guards do not port | `13f-mcp-credentials.md` |
-| `MCP-277` | critical | S | `hand-written` | Prove the absence of secret leakage through `Debug`, logs and errors | `13f-mcp-credentials.md` |
-| `MCP-278` | medium | M | `hand-written` | The storage acceptance suite (17 tests) | `13f-mcp-credentials.md` |
-| `MCP-280` | high | S | `hand-written` | The keychain service name, and what happens to a co-installed pi-mcp-adapter | `13f-mcp-credentials.md` |
-| `MCP-281` | medium | M | `hand-written` | Adopt the keychain-mandatory posture | `13f-mcp-credentials.md` |
-| `MCP-282` | low | S | `hand-written` | Env-var namespace for the surviving switches | `13f-mcp-credentials.md` |
-| `MCP-283` | medium | M | `hand-written` | The cache acceptance suite (13 tests) | `13f-mcp-credentials.md` |
-| `MCP-284` | medium | S | `hand-written` | The parse-error wrapping asymmetry between read and remove | `13f-mcp-credentials.md` |
-| `MCP-285` | medium | S | `hand-written` | Remove-path chunk cleanup is fatal, not best-effort | `13f-mcp-credentials.md` |
-| `MCP-286` | low | S | `hand-written` | Bound `chunkCount` on read | `13f-mcp-credentials.md` |
-| `MCP-287` | medium | S | `hand-written` | The subprocess timeout path and the unreachable ladder rung | `13f-mcp-credentials.md` |
-| `MCP-288` | low | S | `rmcp` | The three `expiresAt` predicates | `13f-mcp-credentials.md` |
-| `MCP-289` | n/a | S | `extension-owned` | Create the `cyrup-mcp` crate | `13f-mcp-credentials.md` |
-| `MCP-290` | medium | S | `hand-written` | Persist the DCR client record rmcp's `StoredCredentials` drops | `13f-mcp-credentials.md` |
-| `MCP-291` | high | M | `hand-written` | Implement `rmcp::transport::auth::{CredentialStore, StateStore}` over the keychain | `13f-mcp-credentials.md` |
-| `MCP-300` | n/a | S | `hand-written` | The OAuth subsystem as one shippable unit | `13g-mcp-oauth.md` |
-| `MCP-301` | high | M | `hand-written` | Flow ownership: runtime, generation counter, four maps | `13g-mcp-oauth.md` |
-| `MCP-302` | medium | M | `hand-written` | extractOAuthConfig and its twelve validation messages | `13g-mcp-oauth.md` |
-| `MCP-303` | medium | S | `hand-written` | parseOAuthRedirectUri's loopback-only validation | `13g-mcp-oauth.md` |
-| `MCP-304` | high | S | `hand-written` | Callback endpoint configuration and MCP_OAUTH_CALLBACK_PORT | `13g-mcp-oauth.md` |
-| `MCP-305` | high | M | `hand-written` | The bind / rebind / strict-port state machine | `13g-mcp-oauth.md` |
-| `MCP-306` | critical | M | `hand-written` | The callback request handler's eight branches | `13g-mcp-oauth.md` |
-| `MCP-307` | medium | M | `hand-written` | The three callback pages, including host branding | `13g-mcp-oauth.md` |
-| `MCP-308` | high | M | `hand-written` | Listener lifetime: reserve, wait, cancel, stop, restart, process exit | `13g-mcp-oauth.md` |
-| `MCP-309` | medium | S | `hand-written` | The discovery trigger: proactive probe or reactive challenge | `13g-mcp-oauth.md` |
-| `MCP-310` | n/a | S | `rmcp` | RFC 9728 protected-resource metadata discovery | `13g-mcp-oauth.md` |
-| `MCP-311` | n/a | S | `rmcp` | RFC 8414 + OIDC discovery and the issuer echo check | `13g-mcp-oauth.md` |
-| `MCP-312` | medium | S | `rmcp` | RFC 7591 dynamic client registration | `13g-mcp-oauth.md` |
-| `MCP-313` | medium | S | `hand-written` | Client metadata and the host-branding defaults | `13g-mcp-oauth.md` |
-| `MCP-314` | high | S | `hand-written` | Restore the full client configuration after initialize_from_store | `13g-mcp-oauth.md` |
-| `MCP-315` | high | M | `hand-written` | The keychain-backed CredentialStore, and the expiry arithmetic | `13g-mcp-oauth.md` |
-| `MCP-316` | high | S | `hand-written` | authorizationParams' reserved-key guard and the no-browser-mid-turn fence | `13g-mcp-oauth.md` |
-| `MCP-317` | n/a | S | `rmcp` | PKCE and the authorization URL | `13g-mcp-oauth.md` |
-| `MCP-318` | high | M | `rmcp` | Token endpoint, client authentication, and the retry policy | `13g-mcp-oauth.md` |
-| `MCP-319` | n/a | S | `rmcp` | RFC 8707 resource binding | `13g-mcp-oauth.md` |
-| `MCP-320` | n/a | S | `rmcp` | Flow-state custody across the browser hop | `13g-mcp-oauth.md` |
-| `MCP-321` | high | M | `hand-written` | The storage read/write surface this flow consumes | `13g-mcp-oauth.md` |
-| `MCP-322` | low | S | `rmcp` | Issuer binding of stored credentials | `13g-mcp-oauth.md` |
-| `MCP-323` | medium | S | `rmcp` | The RFC 9207 gate in completeAuth, including keepPendingForRetry | `13g-mcp-oauth.md` |
-| `MCP-324` | high | M | `rmcp` | getValidToken's refresh path and its fall-through | `13g-mcp-oauth.md` |
-| `MCP-325` | medium | S | `rmcp` | The client_credentials grant | `13g-mcp-oauth.md` |
-| `MCP-326` | high | M | `hand-written` | The manual/headless leg: parsing and the callback-versus-paste race | `13g-mcp-oauth.md` |
-| `MCP-327` | low | S | `extension-owned` | Browser launch | `13g-mcp-oauth.md` |
-| `MCP-328` | high | L | `hand-written` | startAuth's ordering, stale-registration checks and aggregate cleanup | `13g-mcp-oauth.md` |
-| `MCP-329` | medium | S | `hand-written` | The 5-minute abandoned-flow timer and its state guard | `13g-mcp-oauth.md` |
-| `MCP-330` | high | M | `hand-written` | authenticate's in-flight dedup and its cleanup boundary | `13g-mcp-oauth.md` |
-| `MCP-331` | high | M | `hand-written` | completeAuth and completeAuthFromInput | `13g-mcp-oauth.md` |
-| `MCP-332` | medium | S | `hand-written` | supportsOAuth, getAuthStatus, removeAuth | `13g-mcp-oauth.md` |
-| `MCP-333` | high | M | `rmcp` | The connect-path 401 classification | `13g-mcp-oauth.md` |
-| `MCP-334` | medium | M | `host-verb` | The /mcp-auth command surface and its eleven messages | `13g-mcp-oauth.md` |
-| `MCP-335` | medium | M | `hand-written` | auth-start / auth-complete and auto-auth | `13g-mcp-oauth.md` |
-| `MCP-336` | n/a | S | `extension-owned` | Callback-listener ownership: settled as reuse | `13g-mcp-oauth.md` |
-| `MCP-337` | n/a | S | `rmcp` | The rmcp split: verified, settled | `13g-mcp-oauth.md` |
-| `MCP-338` | n/a | S | `extension-owned` | Browser-open mechanism: settled on opener | `13g-mcp-oauth.md` |
-| `MCP-339` | medium | S | `open-decision` | Bind localhost or 127.0.0.1 | `13g-mcp-oauth.md` |
-| `MCP-340` | low | S | `open-decision` | The stale hardcoded client version in the discovery probe | `13g-mcp-oauth.md` |
-| `MCP-341` | medium | S | `hand-written` | Ship a corrected OAuth document | `13g-mcp-oauth.md` |
-| `MCP-342` | medium | S | `hand-written` | A reachable, three-form interpolate_env_vars | `13g-mcp-oauth.md` |
-| `MCP-343` | n/a | S | `rmcp` | Non-unix entropy: dissolved | `13g-mcp-oauth.md` |
-| `MCP-344` | medium | S | `hand-written` | The process-shared listener refcount | `13g-mcp-oauth.md` |
-| `MCP-345` | medium | S | `hand-written` | Preserve both errors when cleanup fails | `13g-mcp-oauth.md` |
-| `MCP-346` | low | S | `extension-owned` | The public token API | `13g-mcp-oauth.md` |
-| `MCP-347` | n/a | L | `hand-written` | The executable spec as the acceptance suite | `13g-mcp-oauth.md` |
-| `MCP-349` | high | S | `extension-owned` | resolveCommandSecret's subprocess mechanism | `13g-mcp-oauth.md` |
-| `MCP-350` | — | — | `tracker` | Section-08 tracker: poll-repaint replaces push-repaint; the overlay pair is the whole substrate — **excluded from every count** | `13h-mcp-tui.md` |
-| `MCP-350a` | high | S | `extension-owned` | Stash the `HostServices` handle so panels and commands can reach the host — prerequisite for all of section 08 | `13h-mcp-tui.md` |
-| `MCP-351` | high | M | `hand-written` | `McpPanel`'s construction from config plus validated cache | `13h-mcp-tui.md` |
-| `MCP-352` | high | M | `hand-written` | `getOtherCurrentCandidates` and the include/exclude engine it feeds | `13h-mcp-tui.md` |
-| `MCP-353` | high | M | `hand-written` | `rebuildVisibleItems`: the flattened list plus the filter state machine | `13h-mcp-tui.md` |
-| `MCP-354` | medium | S | `hand-written` | `fuzzyScore` | `13h-mcp-tui.md` |
-| `MCP-355` | critical | M | `hand-written` | The panel's top-level key dispatch, in order | `13h-mcp-tui.md` |
-| `MCP-356` | medium | S | `hand-written` | The description-search modal | `13h-mcp-tui.md` |
-| `MCP-357` | high | S | `hand-written` | The discard-confirmation modal | `13h-mcp-tui.md` |
-| `MCP-358` | critical | S | `hand-written` | Toggling, dirty tracking and the tri-state `buildResult` | `13h-mcp-tui.md` |
-| `MCP-359` | high | M | `hand-written` | In-panel OAuth (`authenticateServer`) on the sync overlay seam | `13h-mcp-tui.md` |
-| `MCP-360` | high | M | `hand-written` | In-panel reconnect and `rebuildServerTools` | `13h-mcp-tui.md` |
-| `MCP-361` | medium | S | `extension-owned` | `ctrl+y` copies a server's failure message | `13h-mcp-tui.md` |
-| `MCP-362` | medium | S | `host-verb` | The 60 s inactivity auto-cancel | `13h-mcp-tui.md` |
-| `MCP-363` | high | M | `extension-owned` | `panel-keys.ts`: resolve the three canonical ids and `mcp.panel.save` | `13h-mcp-tui.md` |
-| `MCP-363a` | medium | S | `open-decision` | Where the canonical select-key defaults live | `13h-mcp-tui.md` |
-| `MCP-364` | critical | M | `hand-written` | The terminal-injection sanitizers | `13h-mcp-tui.md` |
-| `MCP-365` | low | S | `hand-written` | `estimateTokens` and the footer statistics | `13h-mcp-tui.md` |
-| `MCP-366` | medium | L | `hand-written` | The panel frame layout | `13h-mcp-tui.md` |
-| `MCP-367` | medium | M | `hand-written` | The row renderers, status labels and word wrap | `13h-mcp-tui.md` |
-| `MCP-368` | low | M | `host-addition` | Overlay geometry: the requested column counts, and the silent height clip (HA-3) | `13h-mcp-tui.md` |
-| `MCP-369` | critical | S | `host-verb` | `McpPanelResult` escaping an `open_overlay` that returns only `bool` | `13h-mcp-tui.md` |
-| `MCP-370` | critical | M | `open-decision` | Tool/resource/prompt name formatting versus the in-tree consumer | `13h-mcp-tui.md` |
-| `MCP-371` | medium | M | `hand-written` | `McpSetupPanel`'s screen model and dynamic action list | `13h-mcp-tui.md` |
-| `MCP-372` | medium | M | `hand-written` | The imports and paths sub-screens | `13h-mcp-tui.md` |
-| `MCP-374` | medium | M | `hand-written` | `runAction`, the busy latch and the notice model | `13h-mcp-tui.md` |
-| `MCP-375` | medium | M | `hand-written` | The per-action preview builders | `13h-mcp-tui.md` |
-| `MCP-376` | medium | S | `hand-written` | `formatWritePreview` and `formatPreview` | `13h-mcp-tui.md` |
-| `MCP-377` | low | S | `hand-written` | The compact-width action window | `13h-mcp-tui.md` |
-| `MCP-378` | low | S | `hand-written` | The two summary lines | `13h-mcp-tui.md` |
-| `MCP-379` | medium | S | `hand-written` | `KNOWN_SERVER_PRESETS` | `13h-mcp-tui.md` |
-| `MCP-380` | low | S | `hand-written` | The onboarding-state file | `13h-mcp-tui.md` |
-| `MCP-381` | high | M | `hand-written` | `/mcp`: registration, the owner-fenced prologue and the eight-way switch | `13h-mcp-tui.md` |
-| `MCP-382` | medium | M | `host-addition` | HA-2: `/mcp`'s dynamic argument completions have no native path, no label and no consumer | `13h-mcp-tui.md` |
-| `MCP-383` | medium | S | `hand-written` | Port `showStatus` | `13h-mcp-tui.md` |
-| `MCP-384` | low | S | `hand-written` | Port `showTools` | `13h-mcp-tui.md` |
-| `MCP-385` | medium | S | `hand-written` | Port `showPrompts` | `13h-mcp-tui.md` |
-| `MCP-385a` | low | S | `hand-written` | `/mcp prompts` opens each group with a `{serverName}:` header row | `13h-mcp-tui.md` |
-| `MCP-386` | high | M | `hand-written` | Port `reconnectServer` / `reconnectServers` | `13h-mcp-tui.md` |
-| `MCP-387` | high | M | `hand-written` | Port `/mcp setup` and the reload-after-write flow | `13h-mcp-tui.md` |
-| `MCP-388` | high | S | `hand-written` | Port `logoutServer` | `13h-mcp-tui.md` |
-| `MCP-389` | medium | S | `hand-written` | Port `/mcp disable` and `/mcp enable` | `13h-mcp-tui.md` |
-| `MCP-390` | high | L | `host-verb` | Port `authenticateServer` and `/mcp-auth` | `13h-mcp-tui.md` |
-| `MCP-391` | medium | S | `host-verb` | Port `openMcpAuthPanel` | `13h-mcp-tui.md` |
-| `MCP-392` | high | M | `hand-written` | Port `buildMcpPanelCallbacks`'s connection-status derivation | `13h-mcp-tui.md` |
-| `MCP-393` | low | S | `hand-written` | Port the shared-config notice and its one-shot state | `13h-mcp-tui.md` |
-| `MCP-394` | critical | M | `hand-written` | Port `openMcpPanel`'s orchestration and the direct-tools write-back | `13h-mcp-tui.md` |
-| `MCP-394a` | medium | S | `hand-written` | A change for a server with no provenance entry is silently dropped | `13h-mcp-tui.md` |
-| `MCP-395` | high | L | `host-addition` | HA-1's command leg: MCP prompts are slash commands, and there is no late command registration | `13h-mcp-tui.md` |
-| `MCP-395a` | medium | S | `hand-written` | Cache-time prompt resolution and command naming | `13h-mcp-tui.md` |
-| `MCP-396` | medium | S | `hand-written` | Port `parsePromptArgs`'s bash-style tokenizer | `13h-mcp-tui.md` |
-| `MCP-397` | medium | S | `hand-written` | Port `resolvePromptArgs` and the usage message | `13h-mcp-tui.md` |
-| `MCP-397a` | low | S | `hand-written` | An explicit empty named value for a declared optional argument is still sent | `13h-mcp-tui.md` |
-| `MCP-398` | high | M | `host-verb` | Port the prompt command handler | `13h-mcp-tui.md` |
-| `MCP-399` | medium | S | `hand-written` | Port `formatPromptResult` and `extractMessageText` | `13h-mcp-tui.md` |
-| `MCP-450` | high | M | `hand-written` | handleSamplingRequest as a pure function of an options bag | `13i-mcp-protocol-and-verification.md` |
-| `MCP-451` | medium | S | `hand-written` | The six unsupported-sampling-feature rejections, in order (task becomes structural) | `13i-mcp-protocol-and-verification.md` |
-| `MCP-452` | high | M | `extension-owned` | resolveSamplingModel candidate ordering and the sequential auth probe | `13i-mcp-protocol-and-verification.md` |
-| `MCP-453` | high | M | `extension-owned` | Run the nested completion via cyrup-provider directly | `13i-mcp-protocol-and-verification.md` |
-| `MCP-454` | medium | S | `extension-owned` | Source the candidate set from the whole configured catalogue | `13i-mcp-protocol-and-verification.md` |
-| `MCP-455` | critical | M | `host-verb` | The two sampling approval gates and their formatters | `13i-mcp-protocol-and-verification.md` |
-| `MCP-456` | medium | M | `hand-written` | convertSamplingMessage, convertAssistantResult, mapStopReason | `13i-mcp-protocol-and-verification.md` |
-| `MCP-457` | low | S | `rmcp` | Sampling capability advertisement and handler-before-connect | `13i-mcp-protocol-and-verification.md` |
-| `MCP-458` | high | M | `host-verb` | Bind sampling's model and cancellation to the live runtime owner | `13i-mcp-protocol-and-verification.md` |
-| `MCP-459` | low | S | `hand-written` | truncateAtWord with UTF-16 length semantics | `13i-mcp-protocol-and-verification.md` |
-| `MCP-460` | low | S | `rmcp` | Elicitation dispatch; absent/unknown mode falls to form | `13i-mcp-protocol-and-verification.md` |
-| `MCP-461` | high | M | `hand-written` | handleFormElicitation's gate, review loop and edit picker | `13i-mcp-protocol-and-verification.md` |
-| `MCP-462` | low | S | `rmcp` | Iterate requestedSchema.properties in document order | `13i-mcp-protocol-and-verification.md` |
-| `MCP-463` | medium | S | `hand-written` | collectValidField's per-field re-prompt loop | `13i-mcp-protocol-and-verification.md` |
-| `MCP-464` | high | M | `hand-written` | coerceAndValidateFormValues, including JS Number() semantics | `13i-mcp-protocol-and-verification.md` |
-| `MCP-465` | high | M | `hand-written` | Final schema assertion with format as an assertion, not an annotation | `13i-mcp-protocol-and-verification.md` |
-| `MCP-466` | medium | S | `hand-written` | The label-uniquifying and humanising helpers | `13i-mcp-protocol-and-verification.md` |
-| `MCP-467` | high | M | `hand-written` | handleUrlElicitation, including the three -32602 rejections | `13i-mcp-protocol-and-verification.md` |
-| `MCP-468` | medium | S | `rmcp` | Advertise elicitation {form, url?} with allowUrl == (mode == tui) | `13i-mcp-protocol-and-verification.md` |
-| `MCP-469` | medium | S | `rmcp` | The notifications/elicitation/complete dedupe and its notice | `13i-mcp-protocol-and-verification.md` |
-| `MCP-470` | medium | S | `hand-written` | handleUrlElicitationRequired for the -32042 elicitation array | `13i-mcp-protocol-and-verification.md` |
-| `MCP-471` | high | S | `host-verb` | Hold the dispatcher budget and the interaction lock across every dialog | `13i-mcp-protocol-and-verification.md` |
-| `MCP-472` | low | S | `rmcp` | The three URL rejections carry JSON-RPC -32602 | `13i-mcp-protocol-and-verification.md` |
-| `MCP-473` | medium | S | `hand-written` | The McpTraceEvent schema v1, exact key set and insertion order | `13i-mcp-protocol-and-verification.md` |
-| `MCP-474` | high | S | `hand-written` | redactTraceText, dead third branch and all | `13i-mcp-protocol-and-verification.md` |
-| `MCP-475` | low | S | `hand-written` | traceId, messageKind, messageBytes | `13i-mcp-protocol-and-verification.md` |
-| `MCP-476` | medium | M | `hand-written` | McpTraceWriter: latching caps, injectable fs, serialized append queue | `13i-mcp-protocol-and-verification.md` |
-| `MCP-477` | low | S | `open-decision` | Trace file path derivation, and .pi to .cyrup | `13i-mcp-protocol-and-verification.md` |
-| `MCP-478` | low | S | `hand-written` | isMcpTraceEnabled and the reduced transport-kind enum | `13i-mcp-protocol-and-verification.md` |
-| `MCP-479` | medium | M | `hand-written` | TracingTransport<T> over rmcp::transport::Transport | `13i-mcp-protocol-and-verification.md` |
-| `MCP-480` | medium | S | `hand-written` | Wire the trace writer lifecycle into the server manager | `13i-mcp-protocol-and-verification.md` |
-| `MCP-481` | low | S | `hand-written` | The trace settings surface (settings.trace object, per-server trace bool) | `13i-mcp-protocol-and-verification.md` |
-| `MCP-482` | n/a | S | `hand-written` | Tracker: the upstream verification surface, with the cut census | `13i-mcp-protocol-and-verification.md` |
-| `MCP-483` | high | S | `hand-written` | Adopt the MCP conformance harness as the port's protocol gate | `13i-mcp-protocol-and-verification.md` |
-| `MCP-484` | high | M | `hand-written` | A hidden cyrup mcp conformance-driver subcommand | `13i-mcp-protocol-and-verification.md` |
-| `MCP-485` | medium | S | `hand-written` | A sequential runner with post-hoc log assertions | `13i-mcp-protocol-and-verification.md` |
-| `MCP-486` | medium | S | `hand-written` | Re-derive the expected-failures baseline; do not copy it | `13i-mcp-protocol-and-verification.md` |
-| `MCP-487` | low | S | `hand-written` | Allocate the ephemeral callback port in Rust | `13i-mcp-protocol-and-verification.md` |
-| `MCP-488` | n/a | S | `hand-written` | Record what conformance does not cover | `13i-mcp-protocol-and-verification.md` |
-| `MCP-489` | medium | M | `open-decision` | The fate of the eight surviving fixture MCP servers | `13i-mcp-protocol-and-verification.md` |
-| `MCP-490` | high | L | `hand-written` | Port the unit-testable share of the vitest suite | `13i-mcp-protocol-and-verification.md` |
-| `MCP-491` | medium | M | `open-decision` | A home for the MCP seam tests without breaking the 7-target cap | `13i-mcp-protocol-and-verification.md` |
-| `MCP-492` | high | M | `hand-written` | Port the node:test OAuth suite as a serialised group | `13i-mcp-protocol-and-verification.md` |
-| `MCP-493` | low | S | `hand-written` | A Cargo/manifest policy test pinning the rmcp feature set | `13i-mcp-protocol-and-verification.md` |
-| `MCP-494` | medium | S | `open-decision` | The CI gate's shape, including the conformance step | `13i-mcp-protocol-and-verification.md` |
-| `MCP-495` | medium | S | `hand-written` | Reconcile the test-time environment contract with cyrup's isolation rules | `13i-mcp-protocol-and-verification.md` |
-| `MCP-496` | high | M | `hand-written` | Live-pty verification for the elicitation dialogs and sampling gates | `13i-mcp-protocol-and-verification.md` |
-| `MCP-497` | n/a | S | `cut` | Coverage tracking | `13i-mcp-protocol-and-verification.md` |
-| `MCP-498` | medium | M | `hand-written` | The two child-process host harnesses | `13i-mcp-protocol-and-verification.md` |
-| `MCP-499` | medium | M | `open-decision` | A trace-JSONL differential harness against the TS adapter | `13i-mcp-protocol-and-verification.md` |
+| id | sev | eff | verdict | title | § | status |
+|---|---|---|---|---|---|---|
+| `MCP-001` | n/a | M | `hand-written` | Stand up `crates/cyrup-mcp` and attach it at the session-build arms | `13a-mcp-activation.md` | done |
+| `MCP-002` | low | S | `host-verb` | Read `--mcp-config` from argv directly, and register the flag for `--help` | `13a-mcp-activation.md` | done |
+| `MCP-003` | critical | L | `host-verb` | Register the entire tool/command surface from disk caches inside `init()`, and never fail | `13a-mcp-activation.md` | done |
+| `MCP-004` | high | M | `hand-written` | Port `McpRuntimeOwner` | `13a-mcp-activation.md` | done |
+| `MCP-005` | medium | S | `hand-written` | Reverse-order cleanup, the aggregate error, and the late-cleanup path | `13a-mcp-activation.md` | done |
+| `MCP-006` | medium | M | `extension-owned` | Port `createOwnedUi` as a fenced services handle | `13a-mcp-activation.md` | **partial** |
+| `MCP-007` | medium | S | `hand-written` | Port the abort helpers (combineAbortSignals, isAbortError, throwIfAborted, abortable) | `13a-mcp-activation.md` | done |
+| `MCP-008` | high | M | `hand-written` | The `session_start` generation protocol, abort-before-await | `13a-mcp-activation.md` | **partial** |
+| `MCP-009` | high | S | `hand-written` | The `session_shutdown` handler | `13a-mcp-activation.md` | **partial** |
+| `MCP-010` | high | S | `hand-written` | `shutdownState`, preserving the metadata-flush error | `13a-mcp-activation.md` | **partial** |
+| `MCP-011` | high | M | `hand-written` | `startInitialization`'s triple staleness check and metadata-update hook install | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-012` | medium | S | `extension-owned` | `startLoadTimeInitialization` — the eager/keep-alive pre-warm | `13a-mcp-activation.md` | **partial** |
+| `MCP-013` | low | S | `hand-written` | The `MCP_DIRECT_TOOLS` blocking wait at session start | `13a-mcp-activation.md` | **partial** |
+| `MCP-014` | high | M | `hand-written` | Re-`init` per session, and the build-before-dispose inversion | `13a-mcp-activation.md` | **partial** |
+| `MCP-015` | medium | S | `extension-owned` | Snapshot every context value before the first await in `initialize` | `13a-mcp-activation.md` | **partial** |
+| `MCP-016` | medium | M | `hand-written` | The sampling and elicitation wiring gates | `13a-mcp-activation.md` | **partial** |
+| `MCP-017` | medium | S | `hand-written` | Register owner cleanups in the exact LIFO order, plus the list-changed listener | `13a-mcp-activation.md` | **partial** |
+| `MCP-018` | low | S | `hand-written` | The zero-enabled-servers early return | `13a-mcp-activation.md` | **partial** |
+| `MCP-019` | medium | S | `hand-written` | Metadata-cache bootstrap: file-absent means connect everything once | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-020` | medium | S | `hand-written` | Per-server lifecycle registration and idle-override derivation | `13a-mcp-activation.md` | **partial** |
+| `MCP-021` | medium | M | `hand-written` | Rehydrate tool/resource/prompt/instruction metadata from a hash-valid cache entry | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-022` | medium | M | `hand-written` | The bounded startup connect pass | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-023` | high | M | `hand-written` | The two-pass startup metadata build | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-024` | medium | S | `hand-written` | Failure tracking with a 60-second backoff | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-025` | high | S | `hand-written` | Startup connect notifications, terminal sanitising, and skipped-tool warnings | `13a-mcp-activation.md` | **partial** |
+| `MCP-026` | low | S | `hand-written` | The `MCP_DIRECT_TOOLS` cache-bootstrap pass inside `initialize` | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-027` | medium | S | `hand-written` | Lifecycle callbacks (reconnect, reconnect-failure, idle shutdown) | `13a-mcp-activation.md` | **partial** |
+| `MCP-027a` | medium | S | `hand-written` | `sendMessage`'s `triggerTurn` pre-turn convergence gate **(v2.26.1 retarget, 2026-08-20)** | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-028` | medium | S | `hand-written` | `updateServerMetadata` | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-029` | high | M | `hand-written` | `updateMetadataCache` write rules | `13a-mcp-activation.md` | **partial** |
+| `MCP-030` | low | S | `hand-written` | `notifyToolMetadataUpdated` must never let a hook break a connect | `13a-mcp-activation.md` | **partial** |
+| `MCP-031` | medium | S | `hand-written` | `flushMetadataCache` on shutdown | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-032` | low | S | `host-verb` | `updateStatusBar` — the three footer verbosities | `13a-mcp-activation.md` | **partial** |
+| `MCP-033` | medium | M | `hand-written` | `lazyConnect` | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-034` | medium | M | `hand-written` | `McpLifecycleManager` — the health-check state machine | `13a-mcp-activation.md` | done |
+| `MCP-035` | high | S | `hand-written` | `gracefulShutdown` — memoised, and it waits for the in-flight check | `13a-mcp-activation.md` | done |
+| `MCP-036` | medium | M | `hand-written` | `syncDirectTools`: the fingerprint diff, the re-activation path, and the renderer declaration | `13a-mcp-activation.md` | **partial** |
+| `MCP-037` | high | M | `host-addition` | HA-1: a native extension has no handle to `ExtensionHost::register_late_tool` | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-037a` | critical | S | `host-addition` | HA-1b: `refresh_tools` drops the native tier's dirty flag in the `wasm-host` build | `13a-mcp-activation.md` | done |
+| `MCP-038` | medium | S | `host-verb` | `deactivateTools`: the optional `unregisterTool` primary path and the `setActiveTools` fallback | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-039` | medium | S | `host-addition` | MCP prompts as slash commands registered after `init` | `13a-mcp-activation.md` | **partial** |
+| `MCP-040` | medium | L | `host-verb` | The `/mcp` command handler | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-041` | medium | M | `host-addition` | HA-2: `/mcp`'s dynamic argument completions have no native path and no TUI consumer | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-042` | medium | M | `host-verb` | The `/mcp-auth` command handler | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-043` | high | L | `hand-written` | The `mcp` gateway tool: registration, the init wait, and the dispatch order | `13a-mcp-activation.md` | **partial** |
+| `MCP-044` | n/a | S | `cut` | The `mcpScript` tool | `13a-mcp-activation.md` | n/a |
+| `MCP-045` | medium | S | `host-verb` | The `tool_result` `isError` override | `13a-mcp-activation.md` | **partial** |
+| `MCP-046` | medium | S | `hand-written` | The abort call-site discipline inside the runtime | `13a-mcp-activation.md` | **partial** |
+| `MCP-047` | critical | M | `hand-written` | Port `agent-plugin-loader.ts` | `13a-mcp-activation.md` | done |
+| `MCP-048` | high | S | `open-decision` | Agent-directory resolution, and whether `~/.pi/agent` is a migration source | `13a-mcp-activation.md` | done |
+| `MCP-049` | medium | M | `hand-written` | Port `cli.js init` as a `cyrup mcp init` subcommand | `13a-mcp-activation.md` | **MISSING** |
+| `MCP-050` | n/a | M | `extension-owned` | Create `cyrup-mcp` and its config module skeleton | `13b-mcp-config.md` | done |
+| `MCP-051` | high | S | `extension-owned` | Read `mcp.json` as JSONC, not JSON | `13b-mcp-config.md` | done |
+| `MCP-052` | high | M | `hand-written` | Port the six-source precedence ladder | `13b-mcp-config.md` | done |
+| `MCP-053` | critical | M | `hand-written` | Port `mergeServerMaps`, including URL-bound credential stripping | `13b-mcp-config.md` | done |
+| `MCP-054` | n/a | S | `cut` | socket ⇄ command/url transport-swap stripping | `13b-mcp-config.md` | n/a |
+| `MCP-055` | medium | S | `hand-written` | Port `expandImports` / `mergeImports` | `13b-mcp-config.md` | done |
+| `MCP-056` | medium | M | `hand-written` | Port the 7 host-config import families | `13b-mcp-config.md` | done |
+| `MCP-057` | medium | M | `hand-written` | Port the `opencode` multi-file merge and entry translation | `13b-mcp-config.md` | done |
+| `MCP-058` | medium | S | `hand-written` | Port `hostConfigDiscovery` and `loadDiscoveredHostConfigs` | `13b-mcp-config.md` | done |
+| `MCP-059` | medium | M | `hand-written` | Port `getMcpDiscoverySummary`, conflicts and the fingerprint | `13b-mcp-config.md` | done |
+| `MCP-060` | low | S | `hand-written` | Port RepoPrompt detection and `KNOWN_SERVER_PRESETS` | `13b-mcp-config.md` | done |
+| `MCP-061` | high | S | `extension-owned` | Port the atomic raw-config writer | `13b-mcp-config.md` | done |
+| `MCP-062` | low | S | `hand-written` | Port `buildUnifiedDiff` (LCS) and `ConfigWritePreview` | `13b-mcp-config.md` | done |
+| `MCP-063` | high | M | `hand-written` | Port `writeProjectServerDisabledOverride` | `13b-mcp-config.md` | done |
+| `MCP-064` | medium | M | `hand-written` | Port `getServerProvenance` and `writeDirectToolsConfig` | `13b-mcp-config.md` | done |
+| `MCP-065` | low | S | `hand-written` | Port `ensureCompatibilityImports`, starter config and shared-entry writers | `13b-mcp-config.md` | done |
+| `MCP-066` | high | M | `hand-written` | Port `McpSettings` as a permissive struct with per-site defaults | `13b-mcp-config.md` | done |
+| `MCP-067` | medium | S | `hand-written` | Port the settings merge as a one-level key merge | `13b-mcp-config.md` | done |
+| `MCP-068` | high | S | `hand-written` | Port env-var overrides, including the `__none__` sentinel | `13b-mcp-config.md` | **partial** |
+| `MCP-069` | high | M | `hand-written` | Port `ServerEntry` as a typed struct | `13b-mcp-config.md` | done |
+| `MCP-069a` | critical | S | `hand-written` + `open-decision` | Fail **closed** on a malformed `requestHeadersCommand` **(v2.26.1 retarget, 2026-08-20)** | `13b-mcp-config.md` | n/a |
+| `MCP-070` | high | M | `hand-written` | Enforce the absent-vs-null hash pre-image contract | `13b-mcp-config.md` | **partial** |
+| `MCP-071` | high | S | `hand-written` | Port `ToolPrefix` with all four modes and `sanitizeServerPrefix` | `13b-mcp-config.md` | done |
+| `MCP-072` | high | S | `hand-written` | Port `formatToolName` / `resolveToolPrefix` | `13b-mcp-config.md` | done |
+| `MCP-073` | high | S | `hand-written` | Port `resolveServerFromToolName` with its ambiguity fail-safe | `13b-mcp-config.md` | **MISSING** |
+| `MCP-074` | medium | S | `hand-written` | Port `sanitizePromptName` / `formatPromptCommandName` | `13b-mcp-config.md` | done |
+| `MCP-075` | high | M | `hand-written` | Port `getToolNameCandidates` (the legacy candidate set) | `13b-mcp-config.md` | **partial** |
+| `MCP-076` | high | M | `hand-written` | Port glob matching and `isToolIncluded`/`isToolExcluded`/`isToolAllowed` | `13b-mcp-config.md` | **partial** |
+| `MCP-077` | high | S | `hand-written` | Port the metadata/cache type model | `13b-mcp-config.md` | done |
+| `MCP-078` | medium | S | `extension-owned` | Port the status-snapshot types | `13b-mcp-config.md` | **partial** |
+| `MCP-079` | medium | S | `hand-written` | Port the tool-approval decision and origin types | `13b-mcp-config.md` | **partial** |
+| `MCP-080` | n/a | S | `cut` | MCP-UI type surface in `types.ts` | `13b-mcp-config.md` | n/a |
+| `MCP-081` | medium | S | `hand-written` | Port `McpAdapterOptions` / programmatic config mode | `13b-mcp-config.md` | done |
+| `MCP-082` | high | S | `hand-written` | Port `interpolateEnvVars` including the `{env:VAR}` form | `13b-mcp-config.md` | done |
+| `MCP-083` | critical | M | `extension-owned` | Port `!` / `!!` command-secret resolution | `13b-mcp-config.md` | **partial** |
+| `MCP-084` | high | S | `hand-written` | Port `resolveServerUrl` / `resolveConfigPath` / `resolveBearerToken` | `13b-mcp-config.md` | **partial** |
+| `MCP-085` | medium | M | `hand-written` | Port terminal sanitisation and error flattening | `13b-mcp-config.md` | **partial** |
+| `MCP-086` | medium | S | `extension-owned` | Port the browser/path open dispatch | `13b-mcp-config.md` | **partial** |
+| `MCP-087` | medium | S | `hand-written` | Port `parallelLimit`, argv scan, `toStringRecord`, `normalizeDirectToolInputSchema` | `13b-mcp-config.md` | **partial** |
+| `MCP-088` | medium | S | `host-verb` | Port `formatMcpStatus` and `formatAuthRequiredMessage` | `13b-mcp-config.md` | done |
+| `MCP-089` | medium | S | `hand-written` | Port the error taxonomy | `13b-mcp-config.md` | **partial** |
+| `MCP-090` | low | S | `extension-owned` | Port the logger as a `tracing` adapter | `13b-mcp-config.md` | **partial** |
+| `MCP-091` | medium | M | `hand-written` | Port `renderTsShape` | `13b-mcp-config.md` | **MISSING** |
+| `MCP-092` | high | S | `hand-written` | Port the dual-dialect JSON Schema validator | `13b-mcp-config.md` | **MISSING** |
+| `MCP-093` | medium | S | `hand-written` | Register the `ajv-formats` formats `jsonschema` does not ship | `13b-mcp-config.md` | **MISSING** |
+| `MCP-094` | high | L | `hand-written` | Reconcile `mcp_direct_tools` with this section's contract | `13b-mcp-config.md` | **MISSING** |
+| `MCP-095` | n/a | S | `extension-owned` | JSONC parser home | `13b-mcp-config.md` | done |
+| `MCP-096` | high | S | `open-decision` | Project trust and the two project-scoped config sources | `13b-mcp-config.md` | n/a |
+| `MCP-097` | low | S | `hand-written` | Port `getConfigDiscoveryPaths` and `findAvailableImportConfigs` | `13b-mcp-config.md` | done |
+| `MCP-098` | medium | S | `hand-written` | Preserve `renderTsShape`'s re-entrant alias emission | `13b-mcp-config.md` | **MISSING** |
+| `MCP-099` | low | S | `hand-written` | Reproduce `buildConfigWritePreview`'s reserialised "before" text | `13b-mcp-config.md` | done |
+| `MCP-100` | high | L | `hand-written` | McpServerManager: the five race guards and the full public API | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-101` | high | M | `rmcp` | stdio transport: spawn, env resolution, cwd, plugin data dir | `13c-mcp-servers.md` | **partial** |
+| `MCP-102` | medium | S | `rmcp` | stderr tail capture and failure-message enrichment | `13c-mcp-servers.md` | **partial** |
+| `MCP-103` | medium | S | `extension-owned` | Wire npx/npm resolution into the connection builder | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-104` | medium | S | `hand-written` | npx cache: bump to CACHE_VERSION = 2 and port clearLegacyCache | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-105` | high | M | `hand-written` | npx resolver: exact package-version pinning is missing | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-106` | low | S | `hand-written` | npx resolver: cache key must be [command, packageSpec, binName] | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-107` | medium | S | `hand-written` | npx resolver: no cancellation path | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-108` | low | S | `hand-written` | npx resolver: entry-level cache validation and Windows npm resolution | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-109` | high | S | `rmcp` | Streamable HTTP client transport | `13c-mcp-servers.md` | **partial** |
+| `MCP-110` | n/a | n/a | `cut` | Legacy HTTP+SSE transport and the shouldFallbackToSse ladder | `13c-mcp-servers.md` | n/a |
+| `MCP-111` | n/a | n/a | `cut` | Unix-domain-socket transport | `13c-mcp-servers.md` | n/a |
+| `MCP-112` | n/a | S | `rmcp` | MCP NDJSON framing | `13c-mcp-servers.md` | done |
+| `MCP-113` | medium | S | `hand-written` | Transport selection and mutual exclusion | `13c-mcp-servers.md` | done |
+| `MCP-114` | high | M | `extension-owned` | HTTP header, bearer and command-secret resolution | `13c-mcp-servers.md` | **partial** |
+| `MCP-115` | high | M | `hand-written` | Implicit-vs-explicit OAuth provider state machine and the attempt loop | `13c-mcp-servers.md` | **partial** |
+| `MCP-115a` | high | S | `hand-written` | Wire the per-request header command into `connectHttpClient` **(v2.26.1 retarget, 2026-08-20)** | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-116` | high | S | `hand-written` | needs-auth connection state and one-shot credential invalidation | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-117` | medium | S | `rmcp` | Protocol-revision negotiation | `13c-mcp-servers.md` | done |
+| `MCP-118` | medium | S | `rmcp` | Client capability advertisement (sampling / elicitation form+url) | `13c-mcp-servers.md` | done |
+| `MCP-119` | high | M | `rmcp` | Paginated discovery with capability gating and per-list failure policy | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-120` | medium | S | `rmcp` | list_changed refresh with identity guards | `13c-mcp-servers.md` | **partial** |
+| `MCP-121` | n/a | n/a | `cut` | Adapter-private UI stream-patch notification handler | `13c-mcp-servers.md` | n/a |
+| `MCP-122` | medium | S | `hand-written` | URL-elicitation acceptance tracking and completion notice | `13c-mcp-servers.md` | **partial** |
+| `MCP-123` | medium | S | `rmcp` | Connect-time abort and once-only transport cleanup | `13c-mcp-servers.md` | **partial** |
+| `MCP-124` | high | S | `hand-written` | Error taxonomy and containsCleanupFailure | `13c-mcp-servers.md` | **partial** |
+| `MCP-125` | high | S | `hand-written` | reconnect: guards, single-flight, identity, in-flight preservation | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-126` | high | M | `hand-written` | close / closeAll: generations, attempt aborts, late-name sweep | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-127` | medium | S | `hand-written` | Idle and in-flight accounting | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-128` | medium | S | `rmcp` | Request options: timeout normalisation and owned signal | `13c-mcp-servers.md` | **partial** |
+| `MCP-129` | medium | S | `rmcp` | getPrompt / readResource accounting and disabled re-check | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-130` | medium | S | `hand-written` | Startup connect concurrency limit | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-131` | high | S | `rmcp` | Child-process cleanup and orphan avoidance | `13c-mcp-servers.md` | **partial** |
+| `MCP-132` | medium | M | `extension-owned` | MCP endpoint probe (three-strategy ladder) | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-133` | medium | S | `hand-written` | Probe-enriched HTTP connect failures | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-134` | high | S | `rmcp` | isTerminatedSession predicate | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-135` | high | M | `hand-written` | withSessionRecovery retry wrapper | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-136` | n/a | S | `hand-written` | Tracker: what survives a restart | `13c-mcp-servers.md` | n/a |
+| `MCP-137` | medium | S | `hand-written` | Status snapshot construction | `13c-mcp-servers.md` | **MISSING** |
+| `MCP-138` | low | S | `extension-owned` | Publish the status snapshot | `13c-mcp-servers.md` | **partial** |
+| `MCP-139` | high | M | `hand-written` | Metadata cache: path, schema, version, load and merge-save | `13c-mcp-servers.md` | **partial** |
+| `MCP-140` | high | M | `hand-written` | Metadata cache: serialisers and reconstructors | `13c-mcp-servers.md` | **partial** |
+| `MCP-141` | critical | M | `hand-written` | computeServerHash must hash all 14 fields; the in-tree reader hashes 11 | `13c-mcp-servers.md` | **partial** |
+| `MCP-142` | critical | S | `hand-written` | stableStringify emits the bare token `undefined`, not `null` | `13c-mcp-servers.md` | done |
+| `MCP-143` | high | S | `hand-written` | interpolateEnvVars is missing its third pattern {env:NAME} | `13c-mcp-servers.md` | **partial** |
+| `MCP-144` | high | S | `hand-written` | !/!! secret-expression semantics in hashed values | `13c-mcp-servers.md` | **partial** |
+| `MCP-145` | high | S | `hand-written` | isServerCacheValid including the throw-to-false rule | `13c-mcp-servers.md` | **partial** |
+| `MCP-146` | critical | S | `hand-written` | Resource tool naming: read_ upstream vs get_ in the in-tree reader | `13c-mcp-servers.md` | done |
+| `MCP-147` | medium | S | `hand-written` | Direct-tool selector parsing and the missing-server gate | `13c-mcp-servers.md` | done |
+| `MCP-148` | n/a | n/a | `rmcp` | The protocol layer is rmcp, client-only | `13c-mcp-servers.md` | done |
+| `MCP-149` | n/a | S | `hand-written` | Tracker: section 03 index and cross-section edges | `13c-mcp-servers.md` | n/a |
+| `MCP-151` | high | M | `host-verb` | Register the `mcp` tool with the exact JSON Schema | `13d-mcp-proxy-modes.md` | done |
+| `MCP-152` | high | M | `hand-written` | Port `buildProxyDescription` and re-register on change | `13d-mcp-proxy-modes.md` | done |
+| `MCP-153` | high | M | `hand-written` | Port mode dispatch: precedence, args coercion, init gate | `13d-mcp-proxy-modes.md` | done |
+| `MCP-154` | medium | S | `hand-written` | Port `executeStatus` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-155` | medium | S | `hand-written` | Port `executeList` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-156` | low | S | `hand-written` | Port `executeInstructions` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-157` | medium | M | `hand-written` | Port `executeDescribe` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-158` | high | M | `hand-written` | Port `executeSearch` match selection | `13d-mcp-proxy-modes.md` | done |
+| `MCP-159` | medium | S | `hand-written` | Port the regex search path onto a linear-time engine | `13d-mcp-proxy-modes.md` | done |
+| `MCP-160` | medium | M | `hand-written` | Port `executeSearch` rendering, pagination footer and connecting hint | `13d-mcp-proxy-modes.md` | done |
+| `MCP-161` | high | M | `hand-written` | Port `executeConnect` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-162` | high | M | `hand-written` | Port `attemptAutoAuth` and the single-shot latch | `13d-mcp-proxy-modes.md` | done |
+| `MCP-163` | critical | L | `hand-written` | Port `executeCall`'s resolution state machine (phases 1-5) | `13d-mcp-proxy-modes.md` | done |
+| `MCP-164` | high | L | `hand-written` | Port `executeCall`'s invocation paths and result shaping | `13d-mcp-proxy-modes.md` | **partial** |
+| `MCP-165` | medium | M | `hand-written` | Port `executeCall`'s error taxonomy | `13d-mcp-proxy-modes.md` | done |
+| `MCP-167` | medium | M | `hand-written` | Port `executeAuthStart` and `formatManualAuthInstructions` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-168` | medium | S | `hand-written` | Port `executeAuthComplete` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-169` | high | S | `hand-written` | Freeze the `details.error` vocabulary as a conformance table | `13d-mcp-proxy-modes.md` | done |
+| `MCP-170` | high | S | `extension-owned` | Use insertion-ordered maps for servers and metadata | `13d-mcp-proxy-modes.md` | done |
+| `MCP-171` | low | M | `open-decision` | Decide the `localeCompare` tie-break | `13d-mcp-proxy-modes.md` | done |
+| `MCP-172` | high | S | `hand-written` | Port `normalizeSearchText` and `tokenize` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-173` | high | M | `hand-written` | Port `scoreToolMatch` field scoring | `13d-mcp-proxy-modes.md` | done |
+| `MCP-174` | medium | M | `hand-written` | Port keyword scoring and `resolveSearchKeywords` | `13d-mcp-proxy-modes.md` | **partial** |
+| `MCP-175` | high | S | `hand-written` | Port the coverage gate and final bonuses | `13d-mcp-proxy-modes.md` | done |
+| `MCP-176` | high | S | `hand-written` | Port `rankToolMatches` and `paginate` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-177` | low | S | `hand-written` | Port keyword resolution inside the regex search path | `13d-mcp-proxy-modes.md` | done |
+| `MCP-178` | high | M | `open-decision` | Port `rankSuggestions`, and settle the `getServerPrefix` conflict | `13d-mcp-proxy-modes.md` | done |
+| `MCP-191` | high | M | `open-decision` | `auth-start` / `auth-complete` derive no distinct permission targets | `13d-mcp-proxy-modes.md` | **partial** |
+| `MCP-192` | medium | S | `host-verb` | Satisfy the permission system's contracts on the `mcp` tool | `13d-mcp-proxy-modes.md` | done |
+| `MCP-193` | medium | M | `host-addition` | Reach `register_late_tool` from a native extension | `13d-mcp-proxy-modes.md` | **MISSING** |
+| `MCP-194` | low | S | `open-decision` | Tool-schema property order is alphabetised by `serde_json` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-195` | medium | S | `hand-written` | Port the ranking conformance suite (11 cases) | `13d-mcp-proxy-modes.md` | done |
+| `MCP-196` | high | L | `hand-written` | Port the proxy-mode conformance suites (47 cases) | `13d-mcp-proxy-modes.md` | **partial** |
+| `MCP-197` | medium | S | `host-verb` | Port the render binding, including the `toolResultRendering` fork | `13d-mcp-proxy-modes.md` | done |
+| `MCP-198` | medium | M | `hand-written` | Port the cross-server candidate-collision set behind the description's counts | `13d-mcp-proxy-modes.md` | done |
+| `MCP-199` | low | S | `host-verb` | Wire native-tool detection to `all_tool_names` | `13d-mcp-proxy-modes.md` | done |
+| `MCP-200` | high | M | `hand-written` | The four-mode server-prefix / tool-name formatter | `13e-mcp-tools.md` | done |
+| `MCP-201` | high | M | `hand-written` | getToolNameCandidates, including the legacy arm | `13e-mcp-tools.md` | done |
+| `MCP-202` | high | M | `hand-written` | matchesToolPattern / matchesToolSelector / isToolAllowed | `13e-mcp-tools.md` | done |
+| `MCP-203` | medium | S | `hand-written` | resourceNameToToolName and the read_ resource base name | `13e-mcp-tools.md` | done |
+| `MCP-204` | medium | S | `hand-written` | resolveServerFromToolName with its ambiguity fail-safe | `13e-mcp-tools.md` | **MISSING** |
+| `MCP-205` | high | M | `open-decision` | Reconcile mcp_direct_tools.rs with pi-mcp-adapter naming | `13e-mcp-tools.md` | n/a |
+| `MCP-206` | low | S | `hand-written` | sanitizePromptName / formatPromptCommandName | `13e-mcp-tools.md` | done |
+| `MCP-207` | high | L | `hand-written` | buildToolMetadata | `13e-mcp-tools.md` | **MISSING** |
+| `MCP-208` | medium | S | `hand-written` | extractUiToolVisibility / isUiToolVisibleToModel (kept half) | `13e-mcp-tools.md` | **partial** |
+| `MCP-209` | n/a | S | `cut` | getToolUiResourceUri / extractToolUiStreamMode and the UI spec fields | `13e-mcp-tools.md` | n/a |
+| `MCP-210` | medium | S | `hand-written` | findToolByName, getToolNames, totalToolCount | `13e-mcp-tools.md` | done |
+| `MCP-211` | medium | M | `hand-written` | formatSchema and its four helpers | `13e-mcp-tools.md` | **MISSING** |
+| `MCP-212` | critical | L | `hand-written` | resolveDirectTools, including the builtin-collision drop | `13e-mcp-tools.md` | done |
+| `MCP-213` | high | M | `hand-written` | buildProxyDescription | `13e-mcp-tools.md` | done |
+| `MCP-214` | high | L | `hand-written` | The direct-tool execute state machine | `13e-mcp-tools.md` | **MISSING** |
+| `MCP-214a` | high | M | `hand-written` | recoverAuthConnection and the per-server request options | `13e-mcp-tools.md` | **partial** |
+| `MCP-215` | medium | M | `hand-written` | attemptDirectAutoAuth and the auth message templates | `13e-mcp-tools.md` | **partial** |
+| `MCP-216` | medium | M | `host-verb` | The direct-tool registration shape | `13e-mcp-tools.md` | done |
+| `MCP-217` | high | L | `host-addition` | Post-init dynamic tool (and command) registration | `13e-mcp-tools.md` | **MISSING** |
+| `MCP-217a` | medium | S | `hand-written` | freezeDirectTools and the frozen-surface escape hatches | `13e-mcp-tools.md` | **partial** |
+| `MCP-217b` | low | S | `host-verb` | The tool-surface refresh notification | `13e-mcp-tools.md` | **MISSING** |
+| `MCP-218` | medium | S | `hand-written` | syncProxyTool's registration/deactivation predicate | `13e-mcp-tools.md` | done |
+| `MCP-219` | medium | S | `hand-written` | MCP_DIRECT_TOOLS, __none__ and parseDirectToolSelectors | `13e-mcp-tools.md` | done |
+| `MCP-220` | high | M | `hand-written` | transformMcpContent for every standard MCP content type | `13e-mcp-tools.md` | done |
+| `MCP-221` | medium | S | `hand-written` | transformMcpResourceContents | `13e-mcp-tools.md` | done |
+| `MCP-222` | high | S | `hand-written` | resolveMcpResultContent and the structured-content fallback | `13e-mcp-tools.md` | done |
+| `MCP-223` | high | M | `hand-written` | Binary-resource materialization with its four limits | `13e-mcp-tools.md` | done |
+| `MCP-224` | medium | M | `hand-written` | The materialized-resource cleanup drain and retry | `13e-mcp-tools.md` | **partial** |
+| `MCP-225` | medium | S | `hand-written` | resolveMcpOutputGuardOptions and the MCP_OUTPUT_GUARD kill switch | `13e-mcp-tools.md` | **partial** |
+| `MCP-226` | high | M | `hand-written` | guardMcpOutput's normalize / affix / passthrough path | `13e-mcp-tools.md` | done |
+| `MCP-227` | high | M | `hand-written` | The truncation arithmetic and notice format | `13e-mcp-tools.md` | done |
+| `MCP-228` | high | S | `hand-written` | saveArtifact's private-directory spill | `13e-mcp-tools.md` | done |
+| `MCP-229` | medium | M | `hand-written` | boundMcpResult and the result-summary schema | `13e-mcp-tools.md` | done |
+| `MCP-230` | medium | S | `hand-written` | Record the output guard's actual security contract | `13e-mcp-tools.md` | done |
+| `MCP-231` | high | M | `hand-written` | isToolCallApprovalRequired | `13e-mcp-tools.md` | **MISSING** |
+| `MCP-232` | critical | M | `host-verb` | ensureToolCallApproved and the approval dialog | `13e-mcp-tools.md` | **partial** |
+| `MCP-233` | medium | S | `host-verb` | Drop the approval broker; before_tool_call is the broker | `13e-mcp-tools.md` | done |
+| `MCP-234` | high | M | `open-decision` | Direct MCP tools do not reach the mcp permission category | `13e-mcp-tools.md` | n/a |
+| `MCP-235` | high | S | `hand-written` | sanitizeTerminalText / stripOscSequences | `13e-mcp-tools.md` | done |
+| `MCP-236` | medium | S | `hand-written` | Give the mcp tool its prompt guideline | `13e-mcp-tools.md` | done |
+| `MCP-237` | medium | S | `hand-written` | The call-row formatters | `13e-mcp-tools.md` | done |
+| `MCP-238` | low | S | `host-verb` | resolveMcpToolRenderOptions and the renderShell selection | `13e-mcp-tools.md` | done |
+| `MCP-239` | medium | M | `hand-written` | collectCollapsedResultLines / formatMcpToolResultLines / blockToLines | `13e-mcp-tools.md` | done |
+| `MCP-240` | low | S | `hand-written` | formatMcpToolResultIdentity | `13e-mcp-tools.md` | done |
+| `MCP-241` | low | M | `hand-written` | The compact result row without a render width | `13e-mcp-tools.md` | done |
+| `MCP-242` | low | S | `host-verb` | Expanded rendering without a per-row expansion flag | `13e-mcp-tools.md` | done |
+| `MCP-243` | low | S | `hand-written` | The compact call-row suppression has no cyrup equivalent | `13e-mcp-tools.md` | done |
+| `MCP-244` | low | S | `hand-written` | The renderer contract carries no theme | `13e-mcp-tools.md` | done |
+| `MCP-245` | low | S | `extension-owned` | Width-aware truncation is not needed | `13e-mcp-tools.md` | n/a |
+| `MCP-246` | low | S | `extension-owned` | Route the five collision/advisory warnings | `13e-mcp-tools.md` | done |
+| `MCP-247` | high | S | `hand-written` | The mcp proxy tool's parameter schema | `13e-mcp-tools.md` | done |
+| `MCP-248` | n/a | S | `hand-written` | Tracker: registration, approval, guard and rendering | `13e-mcp-tools.md` | n/a |
+| `MCP-249` | high | S | `hand-written` | Freeze the details schema this subsystem emits | `13e-mcp-tools.md` | **partial** |
+| `MCP-250` | high | M | `hand-written` | The `AuthEntry` record and its strict normalization | `13f-mcp-credentials.md` | done |
+| `MCP-251` | high | S | `hand-written` | Derive the keychain account and legacy directory from `sha256-<hex>` of the server name | `13f-mcp-credentials.md` | done |
+| `MCP-252` | high | M | `extension-owned` | Add the OS keyring backend and map its error taxonomy | `13f-mcp-credentials.md` | done |
+| `MCP-253` | high | M | `hand-written` | The chunking manifest write path | `13f-mcp-credentials.md` | done |
+| `MCP-254` | high | S | `hand-written` | The chunked read path and the `AuthStoreError` taxonomy | `13f-mcp-credentials.md` | done |
+| `MCP-255` | medium | S | `hand-written` | Stale-chunk cleanup ordering and its error-swallowing | `13f-mcp-credentials.md` | done |
+| `MCP-256` | high | M | `hand-written` | The legacy plaintext import-and-delete path (and the record translator) | `13f-mcp-credentials.md` | done |
+| `MCP-257` | high | M | `hand-written` | The process-lifetime auth-entry cache and its three external invalidation points | `13f-mcp-credentials.md` | done |
+| `MCP-258` | medium | S | `extension-owned` | Fault-injection backends behind an explicit selector | `13f-mcp-credentials.md` | done |
+| `MCP-259` | low | S | `hand-written` | Honour the auth-cache disable switch | `13f-mcp-credentials.md` | done |
+| `MCP-260` | high | M | `hand-written` | Re-exec under `keyctl session -` via a hidden `__mcp-keyring-helper` subcommand | `13f-mcp-credentials.md` | **partial** |
+| `MCP-261` | medium | S | `hand-written` | The helper's one-shot JSON stdio protocol | `13f-mcp-credentials.md` | done |
+| `MCP-262` | medium | S | `hand-written` | The revoked-keyring cause-chain predicate | `13f-mcp-credentials.md` | done |
+| `MCP-263` | low | S | `hand-written` | Emit the two credential-store-unavailable messages verbatim | `13f-mcp-credentials.md` | done |
+| `MCP-264` | critical | M | `hand-written` | URL binding and the mutators' sibling-purge rule | `13f-mcp-credentials.md` | done |
+| `MCP-265` | high | S | `hand-written` | `inspectAuthForUrl`'s three-state status and its fail-open/fail-closed split | `13f-mcp-credentials.md` | done |
+| `MCP-266` | medium | S | `hand-written` | The accessor surface section 07 consumes | `13f-mcp-credentials.md` | done |
+| `MCP-267` | medium | S | `rmcp` | Expiry arithmetic | `13f-mcp-credentials.md` | done |
+| `MCP-268` | high | M | `hand-written` | Serialize read-modify-write per server | `13f-mcp-credentials.md` | done |
+| `MCP-269` | medium | S | `hand-written` | MCP credentials never reach `auth.json` | `13f-mcp-credentials.md` | **partial** |
+| `MCP-270` | low | S | `extension-owned` | The embedder facade (`oauth.ts`) | `13f-mcp-credentials.md` | done |
+| `MCP-271` | n/a | S | `rmcp` | The MCP-SDK `OAuthTokens` conversion | `13f-mcp-credentials.md` | done |
+| `MCP-272` | n/a | S | `cut` | `ConsentManager` | `13f-mcp-credentials.md` | n/a |
+| `MCP-273` | n/a | S | `cut` | `ConsentError` | `13f-mcp-credentials.md` | n/a |
+| `MCP-274` | n/a | S | `cut` | Consent state is process-scoped and must not be persisted | `13f-mcp-credentials.md` | n/a |
+| `MCP-275` | medium | S | `hand-written` | Compact JSON serialization | `13f-mcp-credentials.md` | done |
+| `MCP-276` | n/a | S | `extension-owned` | The non-string server-name guards do not port | `13f-mcp-credentials.md` | n/a |
+| `MCP-277` | critical | S | `hand-written` | Prove the absence of secret leakage through `Debug`, logs and errors | `13f-mcp-credentials.md` | done |
+| `MCP-278` | medium | M | `hand-written` | The storage acceptance suite (17 tests) | `13f-mcp-credentials.md` | **partial** |
+| `MCP-280` | high | S | `hand-written` | The keychain service name, and what happens to a co-installed pi-mcp-adapter | `13f-mcp-credentials.md` | done |
+| `MCP-281` | medium | M | `hand-written` | Adopt the keychain-mandatory posture | `13f-mcp-credentials.md` | done |
+| `MCP-282` | low | S | `hand-written` | Env-var namespace for the surviving switches | `13f-mcp-credentials.md` | done |
+| `MCP-283` | medium | M | `hand-written` | The cache acceptance suite (13 tests) | `13f-mcp-credentials.md` | **partial** |
+| `MCP-284` | medium | S | `hand-written` | The parse-error wrapping asymmetry between read and remove | `13f-mcp-credentials.md` | done |
+| `MCP-285` | medium | S | `hand-written` | Remove-path chunk cleanup is fatal, not best-effort | `13f-mcp-credentials.md` | done |
+| `MCP-286` | low | S | `hand-written` | Bound `chunkCount` on read | `13f-mcp-credentials.md` | done |
+| `MCP-287` | medium | S | `hand-written` | The subprocess timeout path and the unreachable ladder rung | `13f-mcp-credentials.md` | **partial** |
+| `MCP-288` | low | S | `rmcp` | The three `expiresAt` predicates | `13f-mcp-credentials.md` | done |
+| `MCP-289` | n/a | S | `extension-owned` | Create the `cyrup-mcp` crate | `13f-mcp-credentials.md` | done |
+| `MCP-290` | medium | S | `hand-written` | Persist the DCR client record rmcp's `StoredCredentials` drops | `13f-mcp-credentials.md` | done |
+| `MCP-291` | high | M | `hand-written` | Implement `rmcp::transport::auth::{CredentialStore, StateStore}` over the keychain | `13f-mcp-credentials.md` | done |
+| `MCP-300` | n/a | S | `hand-written` | The OAuth subsystem as one shippable unit | `13g-mcp-oauth.md` | **partial** |
+| `MCP-301` | high | M | `hand-written` | Flow ownership: runtime, generation counter, four maps | `13g-mcp-oauth.md` | done |
+| `MCP-302` | medium | M | `hand-written` | extractOAuthConfig and its twelve validation messages | `13g-mcp-oauth.md` | done |
+| `MCP-303` | medium | S | `hand-written` | parseOAuthRedirectUri's loopback-only validation | `13g-mcp-oauth.md` | done |
+| `MCP-304` | high | S | `hand-written` | Callback endpoint configuration and MCP_OAUTH_CALLBACK_PORT | `13g-mcp-oauth.md` | done |
+| `MCP-305` | high | M | `hand-written` | The bind / rebind / strict-port state machine | `13g-mcp-oauth.md` | done |
+| `MCP-306` | critical | M | `hand-written` | The callback request handler's eight branches | `13g-mcp-oauth.md` | done |
+| `MCP-307` | medium | M | `hand-written` | The three callback pages, including host branding | `13g-mcp-oauth.md` | done |
+| `MCP-308` | high | M | `hand-written` | Listener lifetime: reserve, wait, cancel, stop, restart, process exit | `13g-mcp-oauth.md` | done |
+| `MCP-309` | medium | S | `hand-written` | The discovery trigger: proactive probe or reactive challenge | `13g-mcp-oauth.md` | **partial** |
+| `MCP-310` | n/a | S | `rmcp` | RFC 9728 protected-resource metadata discovery | `13g-mcp-oauth.md` | done |
+| `MCP-311` | n/a | S | `rmcp` | RFC 8414 + OIDC discovery and the issuer echo check | `13g-mcp-oauth.md` | done |
+| `MCP-312` | medium | S | `rmcp` | RFC 7591 dynamic client registration | `13g-mcp-oauth.md` | done |
+| `MCP-313` | medium | S | `hand-written` | Client metadata and the host-branding defaults | `13g-mcp-oauth.md` | **partial** |
+| `MCP-314` | high | S | `hand-written` | Restore the full client configuration after initialize_from_store | `13g-mcp-oauth.md` | done |
+| `MCP-315` | high | M | `hand-written` | The keychain-backed CredentialStore, and the expiry arithmetic | `13g-mcp-oauth.md` | done |
+| `MCP-316` | high | S | `hand-written` | authorizationParams' reserved-key guard and the no-browser-mid-turn fence | `13g-mcp-oauth.md` | done |
+| `MCP-317` | n/a | S | `rmcp` | PKCE and the authorization URL | `13g-mcp-oauth.md` | done |
+| `MCP-318` | high | M | `rmcp` | Token endpoint, client authentication, and the retry policy | `13g-mcp-oauth.md` | done |
+| `MCP-319` | n/a | S | `rmcp` | RFC 8707 resource binding | `13g-mcp-oauth.md` | done |
+| `MCP-320` | n/a | S | `rmcp` | Flow-state custody across the browser hop | `13g-mcp-oauth.md` | done |
+| `MCP-321` | high | M | `hand-written` | The storage read/write surface this flow consumes | `13g-mcp-oauth.md` | done |
+| `MCP-322` | low | S | `rmcp` | Issuer binding of stored credentials | `13g-mcp-oauth.md` | done |
+| `MCP-323` | medium | S | `rmcp` | The RFC 9207 gate in completeAuth, including keepPendingForRetry | `13g-mcp-oauth.md` | done |
+| `MCP-324` | high | M | `rmcp` | getValidToken's refresh path and its fall-through | `13g-mcp-oauth.md` | **partial** |
+| `MCP-325` | medium | S | `rmcp` | The client_credentials grant | `13g-mcp-oauth.md` | done |
+| `MCP-326` | high | M | `hand-written` | The manual/headless leg: parsing and the callback-versus-paste race | `13g-mcp-oauth.md` | **partial** |
+| `MCP-327` | low | S | `extension-owned` | Browser launch | `13g-mcp-oauth.md` | done |
+| `MCP-328` | high | L | `hand-written` | startAuth's ordering, stale-registration checks and aggregate cleanup | `13g-mcp-oauth.md` | done |
+| `MCP-329` | medium | S | `hand-written` | The 5-minute abandoned-flow timer and its state guard | `13g-mcp-oauth.md` | done |
+| `MCP-330` | high | M | `hand-written` | authenticate's in-flight dedup and its cleanup boundary | `13g-mcp-oauth.md` | done |
+| `MCP-331` | high | M | `hand-written` | completeAuth and completeAuthFromInput | `13g-mcp-oauth.md` | done |
+| `MCP-332` | medium | S | `hand-written` | supportsOAuth, getAuthStatus, removeAuth | `13g-mcp-oauth.md` | done |
+| `MCP-333` | high | M | `rmcp` | The connect-path 401 classification | `13g-mcp-oauth.md` | done |
+| `MCP-334` | medium | M | `host-verb` | The /mcp-auth command surface and its eleven messages | `13g-mcp-oauth.md` | **partial** |
+| `MCP-335` | medium | M | `hand-written` | auth-start / auth-complete and auto-auth | `13g-mcp-oauth.md` | done |
+| `MCP-336` | n/a | S | `extension-owned` | Callback-listener ownership: settled as reuse | `13g-mcp-oauth.md` | done |
+| `MCP-337` | n/a | S | `rmcp` | The rmcp split: verified, settled | `13g-mcp-oauth.md` | done |
+| `MCP-338` | n/a | S | `extension-owned` | Browser-open mechanism: settled on opener | `13g-mcp-oauth.md` | done |
+| `MCP-339` | medium | S | `open-decision` | Bind localhost or 127.0.0.1 | `13g-mcp-oauth.md` | n/a |
+| `MCP-340` | low | S | `open-decision` | The stale hardcoded client version in the discovery probe | `13g-mcp-oauth.md` | n/a |
+| `MCP-341` | medium | S | `hand-written` | Ship a corrected OAuth document | `13g-mcp-oauth.md` | **MISSING** |
+| `MCP-342` | medium | S | `hand-written` | A reachable, three-form interpolate_env_vars | `13g-mcp-oauth.md` | **partial** |
+| `MCP-343` | n/a | S | `rmcp` | Non-unix entropy: dissolved | `13g-mcp-oauth.md` | n/a |
+| `MCP-344` | medium | S | `hand-written` | The process-shared listener refcount | `13g-mcp-oauth.md` | done |
+| `MCP-345` | medium | S | `hand-written` | Preserve both errors when cleanup fails | `13g-mcp-oauth.md` | done |
+| `MCP-346` | low | S | `extension-owned` | The public token API | `13g-mcp-oauth.md` | done |
+| `MCP-347` | n/a | L | `hand-written` | The executable spec as the acceptance suite | `13g-mcp-oauth.md` | **partial** |
+| `MCP-349` | high | S | `extension-owned` | resolveCommandSecret's subprocess mechanism | `13g-mcp-oauth.md` | done |
+| `MCP-350` | — | — | `tracker` | Section-08 tracker: poll-repaint replaces push-repaint; the overlay pair is the whole substrate — **excluded from every count** | `13h-mcp-tui.md` | n/a |
+| `MCP-350a` | high | S | `extension-owned` | Stash the `HostServices` handle so panels and commands can reach the host — prerequisite for all of section 08 | `13h-mcp-tui.md` | done |
+| `MCP-351` | high | M | `hand-written` | `McpPanel`'s construction from config plus validated cache | `13h-mcp-tui.md` | done |
+| `MCP-352` | high | M | `hand-written` | `getOtherCurrentCandidates` and the include/exclude engine it feeds | `13h-mcp-tui.md` | done |
+| `MCP-353` | high | M | `hand-written` | `rebuildVisibleItems`: the flattened list plus the filter state machine | `13h-mcp-tui.md` | done |
+| `MCP-354` | medium | S | `hand-written` | `fuzzyScore` | `13h-mcp-tui.md` | done |
+| `MCP-355` | critical | M | `hand-written` | The panel's top-level key dispatch, in order | `13h-mcp-tui.md` | done |
+| `MCP-356` | medium | S | `hand-written` | The description-search modal | `13h-mcp-tui.md` | done |
+| `MCP-357` | high | S | `hand-written` | The discard-confirmation modal | `13h-mcp-tui.md` | done |
+| `MCP-358` | critical | S | `hand-written` | Toggling, dirty tracking and the tri-state `buildResult` | `13h-mcp-tui.md` | done |
+| `MCP-359` | high | M | `hand-written` | In-panel OAuth (`authenticateServer`) on the sync overlay seam | `13h-mcp-tui.md` | done |
+| `MCP-360` | high | M | `hand-written` | In-panel reconnect and `rebuildServerTools` | `13h-mcp-tui.md` | done |
+| `MCP-361` | medium | S | `extension-owned` | `ctrl+y` copies a server's failure message | `13h-mcp-tui.md` | done |
+| `MCP-362` | medium | S | `host-verb` | The 60 s inactivity auto-cancel | `13h-mcp-tui.md` | **partial** |
+| `MCP-363` | high | M | `extension-owned` | `panel-keys.ts`: resolve the three canonical ids and `mcp.panel.save` | `13h-mcp-tui.md` | done |
+| `MCP-363a` | medium | S | `open-decision` | Where the canonical select-key defaults live | `13h-mcp-tui.md` | done |
+| `MCP-364` | critical | M | `hand-written` | The terminal-injection sanitizers | `13h-mcp-tui.md` | done |
+| `MCP-365` | low | S | `hand-written` | `estimateTokens` and the footer statistics | `13h-mcp-tui.md` | done |
+| `MCP-366` | medium | L | `hand-written` | The panel frame layout | `13h-mcp-tui.md` | done |
+| `MCP-367` | medium | M | `hand-written` | The row renderers, status labels and word wrap | `13h-mcp-tui.md` | done |
+| `MCP-368` | low | M | `host-addition` | Overlay geometry: the requested column counts, and the silent height clip (HA-3) | `13h-mcp-tui.md` | **partial** |
+| `MCP-369` | critical | S | `host-verb` | `McpPanelResult` escaping an `open_overlay` that returns only `bool` | `13h-mcp-tui.md` | done |
+| `MCP-370` | critical | M | `open-decision` | Tool/resource/prompt name formatting versus the in-tree consumer | `13h-mcp-tui.md` | **partial** |
+| `MCP-371` | medium | M | `hand-written` | `McpSetupPanel`'s screen model and dynamic action list | `13h-mcp-tui.md` | done |
+| `MCP-372` | medium | M | `hand-written` | The imports and paths sub-screens | `13h-mcp-tui.md` | done |
+| `MCP-374` | medium | M | `hand-written` | `runAction`, the busy latch and the notice model | `13h-mcp-tui.md` | done |
+| `MCP-375` | medium | M | `hand-written` | The per-action preview builders | `13h-mcp-tui.md` | done |
+| `MCP-376` | medium | S | `hand-written` | `formatWritePreview` and `formatPreview` | `13h-mcp-tui.md` | done |
+| `MCP-377` | low | S | `hand-written` | The compact-width action window | `13h-mcp-tui.md` | **partial** |
+| `MCP-378` | low | S | `hand-written` | The two summary lines | `13h-mcp-tui.md` | done |
+| `MCP-379` | medium | S | `hand-written` | `KNOWN_SERVER_PRESETS` | `13h-mcp-tui.md` | done |
+| `MCP-380` | low | S | `hand-written` | The onboarding-state file | `13h-mcp-tui.md` | done |
+| `MCP-381` | high | M | `hand-written` | `/mcp`: registration, the owner-fenced prologue and the eight-way switch | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-382` | medium | M | `host-addition` | HA-2: `/mcp`'s dynamic argument completions have no native path, no label and no consumer | `13h-mcp-tui.md` | **partial** |
+| `MCP-383` | medium | S | `hand-written` | Port `showStatus` | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-384` | low | S | `hand-written` | Port `showTools` | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-385` | medium | S | `hand-written` | Port `showPrompts` | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-385a` | low | S | `hand-written` | `/mcp prompts` opens each group with a `{serverName}:` header row | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-386` | high | M | `hand-written` | Port `reconnectServer` / `reconnectServers` | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-387` | high | M | `hand-written` | Port `/mcp setup` and the reload-after-write flow | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-388` | high | S | `hand-written` | Port `logoutServer` | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-389` | medium | S | `hand-written` | Port `/mcp disable` and `/mcp enable` | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-390` | high | L | `host-verb` | Port `authenticateServer` and `/mcp-auth` | `13h-mcp-tui.md` | **partial** |
+| `MCP-391` | medium | S | `host-verb` | Port `openMcpAuthPanel` | `13h-mcp-tui.md` | **partial** |
+| `MCP-392` | high | M | `hand-written` | Port `buildMcpPanelCallbacks`'s connection-status derivation | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-393` | low | S | `hand-written` | Port the shared-config notice and its one-shot state | `13h-mcp-tui.md` | done |
+| `MCP-394` | critical | M | `hand-written` | Port `openMcpPanel`'s orchestration and the direct-tools write-back | `13h-mcp-tui.md` | **partial** |
+| `MCP-394a` | medium | S | `hand-written` | A change for a server with no provenance entry is silently dropped | `13h-mcp-tui.md` | done |
+| `MCP-395` | high | L | `host-addition` | HA-1's command leg: MCP prompts are slash commands, and there is no late command registration | `13h-mcp-tui.md` | **partial** |
+| `MCP-395a` | medium | S | `hand-written` | Cache-time prompt resolution and command naming | `13h-mcp-tui.md` | done |
+| `MCP-396` | medium | S | `hand-written` | Port `parsePromptArgs`'s bash-style tokenizer | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-397` | medium | S | `hand-written` | Port `resolvePromptArgs` and the usage message | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-397a` | low | S | `hand-written` | An explicit empty named value for a declared optional argument is still sent | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-398` | high | M | `host-verb` | Port the prompt command handler | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-399` | medium | S | `hand-written` | Port `formatPromptResult` and `extractMessageText` | `13h-mcp-tui.md` | **MISSING** |
+| `MCP-450` | high | M | `hand-written` | handleSamplingRequest as a pure function of an options bag | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-451` | medium | S | `hand-written` | The six unsupported-sampling-feature rejections, in order (task becomes structural) | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-452` | high | M | `extension-owned` | resolveSamplingModel candidate ordering and the sequential auth probe | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-453` | high | M | `extension-owned` | Run the nested completion via cyrup-provider directly | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-454` | medium | S | `extension-owned` | Source the candidate set from the whole configured catalogue | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-455` | critical | M | `host-verb` | The two sampling approval gates and their formatters | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-456` | medium | M | `hand-written` | convertSamplingMessage, convertAssistantResult, mapStopReason | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-457` | low | S | `rmcp` | Sampling capability advertisement and handler-before-connect | `13i-mcp-protocol-and-verification.md` | done |
+| `MCP-458` | high | M | `host-verb` | Bind sampling's model and cancellation to the live runtime owner | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-459` | low | S | `hand-written` | truncateAtWord with UTF-16 length semantics | `13i-mcp-protocol-and-verification.md` | done |
+| `MCP-460` | low | S | `rmcp` | Elicitation dispatch; absent/unknown mode falls to form | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-461` | high | M | `hand-written` | handleFormElicitation's gate, review loop and edit picker | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-462` | low | S | `rmcp` | Iterate requestedSchema.properties in document order | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-463` | medium | S | `hand-written` | collectValidField's per-field re-prompt loop | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-464` | high | M | `hand-written` | coerceAndValidateFormValues, including JS Number() semantics | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-465` | high | M | `hand-written` | Final schema assertion with format as an assertion, not an annotation | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-466` | medium | S | `hand-written` | The label-uniquifying and humanising helpers | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-467` | high | M | `hand-written` | handleUrlElicitation, including the three -32602 rejections | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-468` | medium | S | `rmcp` | Advertise elicitation {form, url?} with allowUrl == (mode == tui) | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-469` | medium | S | `rmcp` | The notifications/elicitation/complete dedupe and its notice | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-470` | medium | S | `hand-written` | handleUrlElicitationRequired for the -32042 elicitation array | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-471` | high | S | `host-verb` | Hold the dispatcher budget and the interaction lock across every dialog | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-472` | low | S | `rmcp` | The three URL rejections carry JSON-RPC -32602 | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-473` | medium | S | `hand-written` | The McpTraceEvent schema v1, exact key set and insertion order | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-474` | high | S | `hand-written` | redactTraceText, dead third branch and all | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-475` | low | S | `hand-written` | traceId, messageKind, messageBytes | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-476` | medium | M | `hand-written` | McpTraceWriter: latching caps, injectable fs, serialized append queue | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-477` | low | S | `open-decision` | Trace file path derivation, and .pi to .cyrup | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-478` | low | S | `hand-written` | isMcpTraceEnabled and the reduced transport-kind enum | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-479` | medium | M | `hand-written` | TracingTransport<T> over rmcp::transport::Transport | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-480` | medium | S | `hand-written` | Wire the trace writer lifecycle into the server manager | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-481` | low | S | `hand-written` | The trace settings surface (settings.trace object, per-server trace bool) | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-482` | n/a | S | `hand-written` | Tracker: the upstream verification surface, with the cut census | `13i-mcp-protocol-and-verification.md` | done |
+| `MCP-483` | high | S | `hand-written` | Adopt the MCP conformance harness as the port's protocol gate | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-484` | high | M | `hand-written` | A hidden cyrup mcp conformance-driver subcommand | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-485` | medium | S | `hand-written` | A sequential runner with post-hoc log assertions | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-486` | medium | S | `hand-written` | Re-derive the expected-failures baseline; do not copy it | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-487` | low | S | `hand-written` | Allocate the ephemeral callback port in Rust | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-488` | n/a | S | `hand-written` | Record what conformance does not cover | `13i-mcp-protocol-and-verification.md` | done |
+| `MCP-489` | medium | M | `open-decision` | The fate of the eight surviving fixture MCP servers | `13i-mcp-protocol-and-verification.md` | n/a |
+| `MCP-490` | high | L | `hand-written` | Port the unit-testable share of the vitest suite | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-491` | medium | M | `open-decision` | A home for the MCP seam tests without breaking the 7-target cap | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-492` | high | M | `hand-written` | Port the node:test OAuth suite as a serialised group | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-493` | low | S | `hand-written` | A Cargo/manifest policy test pinning the rmcp feature set | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-494` | medium | S | `open-decision` | The CI gate's shape, including the conformance step | `13i-mcp-protocol-and-verification.md` | n/a |
+| `MCP-495` | medium | S | `hand-written` | Reconcile the test-time environment contract with cyrup's isolation rules | `13i-mcp-protocol-and-verification.md` | **partial** |
+| `MCP-496` | high | M | `hand-written` | Live-pty verification for the elicitation dialogs and sampling gates | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-497` | n/a | S | `cut` | Coverage tracking | `13i-mcp-protocol-and-verification.md` | n/a |
+| `MCP-498` | medium | M | `hand-written` | The two child-process host harnesses | `13i-mcp-protocol-and-verification.md` | **MISSING** |
+| `MCP-499` | medium | M | `open-decision` | A trace-JSONL differential harness against the TS adapter | `13i-mcp-protocol-and-verification.md` | n/a |
 
 ### Where the units live
 

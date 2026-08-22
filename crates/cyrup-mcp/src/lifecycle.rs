@@ -237,13 +237,23 @@ pub trait ConnectionSupervisor: Send + Sync + 'static {
 
 /// The adapter from [`ConnectionSupervisor`] onto the real [`McpServerManager`].
 ///
-/// **This is the whole integration surface between this file and 13c.** Every body below is a
-/// one-line delegation once `server_manager.rs` exists; until then each returns the closed-fail
-/// answer for its operation — `None` / `false` / an error naming the missing unit — so a
-/// misconfigured build is loud rather than quietly inert.
+/// **This is the whole integration surface between this file and 13c.** Six of the eight bodies are
+/// now one-line delegations onto [`crate::server_manager`] (MCP-100 / MCP-125 / MCP-126 / MCP-127);
+/// `impl ServerConnectionRef for ServerConnection` lives with the record itself, so an
+/// `Arc<ServerConnection>` upcasts straight into a [`ConnectionHandle`] and `Arc::ptr_eq` on it is
+/// the same identity the manager's own maps compare.
 ///
-/// TODO(MCP-100, MCP-125, MCP-126, MCP-127, MCP-134): bind these to `McpServerManager` and add
-/// `impl ServerConnectionRef for ServerConnection` here. Nothing else in this module changes.
+/// Two are still unbound, and both are unbound for a reason that is not this unit's to fix:
+///
+/// * `refresh_tools` needs `McpServerManager::refreshTools` — **MCP-120** — which needs a live
+///   `Peer` and therefore the discovery unit (MCP-119).
+/// * `should_reconnect_after_refresh` needs *typed* evidence (an HTTP status, a protocol code) that
+///   [`McpError`] does not carry. The predicate itself **is** landed —
+///   [`crate::server_manager::is_terminated_session`], MCP-134 — and takes
+///   [`crate::server_manager::TerminatedSessionEvidence`]; what is missing is the refresh path that
+///   would produce it. Matching on a rendered message instead is exactly what
+///   `session-recovery.ts`'s doc comment forbids ("does NOT match broad error messages"), so this
+///   arm fails closed until MCP-120 lands.
 #[derive(Debug)]
 pub struct ManagerSupervisor {
     manager: Arc<McpServerManager>,
@@ -276,30 +286,39 @@ impl ManagerSupervisor {
 }
 
 impl ConnectionSupervisor for ManagerSupervisor {
-    fn get_connection(&self, _name: &str) -> Option<ConnectionHandle> {
-        // TODO(MCP-100): `self.manager.get_connection(name)`.
-        None
+    fn get_connection(&self, name: &str) -> Option<ConnectionHandle> {
+        self.manager
+            .get_connection(name)
+            .map(|connection| connection as ConnectionHandle)
     }
 
     fn connect<'a>(
         &'a self,
         name: &'a str,
-        _definition: &'a ServerEntry,
-        _token: CancelToken,
+        definition: &'a ServerEntry,
+        token: CancelToken,
     ) -> BoxFuture<'a, McpResult<ConnectionHandle>> {
-        // TODO(MCP-100): `self.manager.connect(name, definition, Some(&token)).await`.
-        Box::pin(async move { Err(Self::unbound("connect", name)) })
+        Box::pin(async move {
+            self.manager
+                .connect(name, definition, Some(&token))
+                .await
+                .map(|connection| connection as ConnectionHandle)
+        })
     }
 
     fn reconnect<'a>(
         &'a self,
         name: &'a str,
-        _definition: &'a ServerEntry,
-        _stale: &'a ConnectionHandle,
-        _token: CancelToken,
+        definition: &'a ServerEntry,
+        stale: &'a ConnectionHandle,
+        token: CancelToken,
     ) -> BoxFuture<'a, McpResult<ConnectionHandle>> {
-        // TODO(MCP-125): `self.manager.reconnect(name, definition, stale, Some(&token)).await`.
-        Box::pin(async move { Err(Self::unbound("reconnect", name)) })
+        Box::pin(async move {
+            self.manager
+                .reconnect(name, definition, stale, Some(&token))
+                .await
+                .map(|connection| connection as ConnectionHandle)
+        })
     }
 
     fn refresh_tools<'a>(
@@ -308,32 +327,27 @@ impl ConnectionSupervisor for ManagerSupervisor {
         _connection: &'a ConnectionHandle,
         _token: CancelToken,
     ) -> BoxFuture<'a, McpResult<ToolRefreshResult>> {
-        // TODO(MCP-100): `self.manager.refresh_tools(name, connection, Some(&token)).await`.
+        // Still unbound: `refreshTools` is MCP-120 and needs the live `Peer` MCP-119's discovery
+        // produces. See this type's doc comment.
         Box::pin(async move { Err(Self::unbound("refresh_tools", name)) })
     }
 
-    fn close<'a>(&'a self, _name: &'a str) -> BoxFuture<'a, McpResult<()>> {
-        // TODO(MCP-126): `self.manager.close(name).await`.
-        Box::pin(async move { Ok(()) })
+    fn close<'a>(&'a self, name: &'a str) -> BoxFuture<'a, McpResult<()>> {
+        Box::pin(async move { self.manager.close(name).await })
     }
 
     fn close_all(&self) -> BoxFuture<'_, McpResult<()>> {
-        // TODO(MCP-126): `self.manager.close_all().await`. Until this is bound,
-        // `graceful_shutdown` joins the health check and then closes nothing — the one place in
-        // this file where an unbound body is a *silent* no-op rather than a loud error, because
-        // upstream's own `if (typeof this.manager.closeAll === "function")` guard makes a missing
-        // `closeAll` legal (`lifecycle.ts:406-408`).
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move { self.manager.close_all().await })
     }
 
-    fn is_idle(&self, _name: &str, _timeout: Duration) -> bool {
-        // TODO(MCP-127): `self.manager.is_idle(name, timeout)`.
-        false
+    fn is_idle(&self, name: &str, timeout: Duration) -> bool {
+        self.manager.is_idle(name, timeout)
     }
 
     fn should_reconnect_after_refresh(&self, _error: &McpError, _had_session_id: bool) -> bool {
-        // TODO(MCP-134): `session_recovery::is_terminated_session(error, had_session_id)
-        //   || matches!(error, McpError::NotConnected | McpError::ConnectionClosed)`.
+        // Fails closed pending MCP-120; the predicate itself is
+        // `crate::server_manager::is_terminated_session`. See this type's doc comment for why a
+        // message match is not an acceptable stand-in.
         false
     }
 }

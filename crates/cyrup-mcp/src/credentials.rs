@@ -108,6 +108,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::dirs::McpDirs;
+use crate::errors::{McpError, McpResult};
 
 // ---------------------------------------------------------------------------------------------
 // §6.1 Constants — reproduced literally (MCP-282 for the env namespace)
@@ -3323,11 +3324,14 @@ pub fn interpolate_env_vars_with<F>(value: &str, lookup: F) -> String
 where
     F: Fn(&str) -> Option<String>,
 {
+    // The class is spelled out rather than written `\w` — see this module's `ENV_NAME` note. Rust's
+    // `regex` makes `\w` Unicode-aware, JavaScript's does not, and a `${café}` would interpolate
+    // here and stay literal upstream.
     static PATTERNS: LazyLock<[Option<Regex>; 3]> = LazyLock::new(|| {
         [
-            Regex::new(r"\$\{(\w+)\}").ok(),
-            Regex::new(r"\$env:(\w+)").ok(),
-            Regex::new(r"\{env:(\w+)\}").ok(),
+            Regex::new(r"\$\{([A-Za-z0-9_]+)\}").ok(),
+            Regex::new(r"\$env:([A-Za-z0-9_]+)").ok(),
+            Regex::new(r"\{env:([A-Za-z0-9_]+)\}").ok(),
         ]
     });
     let mut out = std::borrow::Cow::Borrowed(value);
@@ -3397,6 +3401,99 @@ pub fn resolve_bearer_token(
 #[must_use]
 pub fn is_command_secret(value: &str) -> bool {
     value.starts_with('!') && !value.starts_with("!!")
+}
+
+/// `getMissingEnvVars(value)` (`utils.ts:83`) — every placeholder name in `value` whose variable is
+/// **unset**, in first-occurrence order, deduplicated.
+///
+/// **One alternation, not three passes**, and that asymmetry with
+/// [`interpolate_env_vars_with`] is upstream's: `getMissingEnvVars` *scans* where
+/// `interpolateEnvVars` *substitutes*, so it must not see a later pass's output. `match[1] ?? match[2]
+/// ?? match[3]` picks whichever of the three alternatives fired, and the `Set` is what makes
+/// `https://x/${A}/${A}` report `A` once. Upstream's `[...set]` is insertion order, so the
+/// `IndexSet`-shaped `Vec` + `contains` below reproduces the *order* the error message prints in,
+/// which a `BTreeSet` would silently re-sort.
+///
+/// `undefined`-vs-empty matters: upstream tests `process.env[name] === undefined`, so a variable set
+/// to the empty string is **present** and not reported — which is why the lookup's `Option` is
+/// tested rather than its contents.
+///
+/// The character class is spelled `[A-Za-z0-9_]` rather than `\w` for the reason
+/// [`interpolate_env_vars_with`] gives: Rust's `regex` makes `\w` Unicode-aware and JavaScript's
+/// `\w` is ASCII-only, so `${café}` interpolates in one engine and stays literal in the other. Run
+/// on node 22 against v2.26.1: `interpolateEnvVars("${café}")` is `"${café}"` and
+/// `interpolateEnvVars("$env:café")` is `"é"` — the ASCII prefix `caf` is the name.
+#[must_use]
+pub fn missing_env_vars(value: &str, env: &EnvFn) -> Vec<String> {
+    static PATTERN: LazyLock<Option<Regex>> = LazyLock::new(|| {
+        Regex::new(r"\$\{([A-Za-z0-9_]+)\}|\$env:([A-Za-z0-9_]+)|\{env:([A-Za-z0-9_]+)\}").ok()
+    });
+    let Some(pattern) = PATTERN.as_ref() else {
+        return Vec::new();
+    };
+    let mut missing: Vec<String> = Vec::new();
+    for captures in pattern.captures_iter(value) {
+        let Some(name) = (1..=3).find_map(|group| captures.get(group)).map(|m| m.as_str()) else {
+            continue;
+        };
+        if env(name).is_none() && !missing.iter().any(|seen| seen == name) {
+            missing.push(name.to_string());
+        }
+    }
+    missing
+}
+
+/// `resolveServerUrl(definition)` (`utils.ts:167`) — the identity field that can **throw**, and the
+/// only reason [`crate::dirs::compute_server_hash`] is fallible at all (MCP-084, MCP-141, MCP-145).
+///
+/// Four arms, in upstream's order:
+///
+/// 1. `definition.url == null` (JS loose equality, so `null` *and* `undefined`) ⇒ `Ok(None)`.
+/// 2. a non-string `url` ⇒ `MCP server URL must be a string`. **Absorbed by the type system here**:
+///    `ServerEntry::url` is `Option<String>`, so a non-string is rejected by the deserialiser
+///    (MCP-066) and this arm has no Rust counterpart. Named so the missing string is accounted for
+///    rather than looking like an omission.
+/// 3. any placeholder naming an **unset** variable ⇒
+///    `Missing environment variable{s} in MCP server URL: {names}` — singular/plural on the count,
+///    names joined with `", "` in first-occurrence order.
+/// 4. a resolved string `new URL()` rejects ⇒
+///    `Invalid MCP server URL after environment interpolation: {resolved}`.
+///
+/// All three message forms were produced by **running upstream on node 22** (`utils.ts` @ v2.26.1,
+/// `fafae21`), not transcribed: `"https://x/${NOPE}"` gives `Missing environment variable in MCP
+/// server URL: NOPE`, `"https://x/${NOPE}/${ALSONOPE}"` gives `Missing environment variables in MCP
+/// server URL: NOPE, ALSONOPE`, and `"not a url"` gives `Invalid MCP server URL after environment
+/// interpolation: not a url`.
+///
+/// # Why the throw matters more than the message
+///
+/// `computeServerHash` calls this **inside** `isServerCacheValid`'s `try`, so a URL server whose
+/// `${VAR}` is unset is never cache-valid — that is the sole mechanism keeping such a server out of
+/// the cold-start direct-tool surface, where it would otherwise register tools it can never call
+/// (MCP-145).
+///
+/// `url::Url::parse` is the WHATWG URL parser, which is what `new URL()` is; the two agree on the
+/// cases that matter here — a scheme-relative `//x/y` and a bare path `/abs/path` are rejected by
+/// both, and `unix:///tmp/s.sock`, `x:y` and `mailto:a@b` are accepted by both (measured on node 22).
+pub fn resolve_server_url(url: Option<&str>, env: &EnvFn) -> McpResult<Option<String>> {
+    let Some(url) = url else {
+        return Ok(None);
+    };
+    let missing = missing_env_vars(url, env);
+    if !missing.is_empty() {
+        let plural = if missing.len() == 1 { "" } else { "s" };
+        return Err(McpError::Config(format!(
+            "Missing environment variable{plural} in MCP server URL: {}",
+            missing.join(", ")
+        )));
+    }
+    let resolved = interpolate_env_vars(url, env);
+    if url::Url::parse(&resolved).is_err() {
+        return Err(McpError::Config(format!(
+            "Invalid MCP server URL after environment interpolation: {resolved}"
+        )));
+    }
+    Ok(Some(resolved))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -4730,6 +4827,117 @@ mod tests {
         assert_eq!(
             interpolate_env_vars("[${B}][$env:B][{env:B}][${NOPE}]", &env),
             "[resolved][resolved][resolved][]"
+        );
+    }
+
+    /// JavaScript's `\w` is **ASCII-only** and Rust's `regex` makes `\w` Unicode-aware, so the
+    /// engine spells the class out as `[A-Za-z0-9_]`. Written `\w`, `${café}` interpolated here and
+    /// stayed literal upstream — a silent digest divergence on any config with a non-ASCII variable
+    /// name (MCP-082/MCP-143).
+    ///
+    /// Both expectations are node 22 output from upstream's own `interpolateEnvVars` (`utils.ts:74`
+    /// @ v2.26.1) with `café` set: `"${café}"` comes back untouched, and `"$env:café"` becomes
+    /// `"é"` — the ASCII run `caf` is the name, the rest is literal text.
+    #[test]
+    fn the_placeholder_name_class_is_ascii_exactly_as_javascripts_is() {
+        let env: EnvFn = Arc::new(|key: &str| match key {
+            "café" => Some("unicode".to_string()),
+            "caf" => None,
+            _ => None,
+        });
+        assert_eq!(interpolate_env_vars("${café}", &env), "${café}");
+        assert_eq!(interpolate_env_vars("$env:café", &env), "é");
+        assert_eq!(interpolate_env_vars("{env:café}", &env), "{env:café}");
+    }
+
+    // -- MCP-084: `resolveServerUrl`, the one identity resolver that throws ----------------------
+
+    /// `getMissingEnvVars` + `resolveServerUrl` (`utils.ts:83`, `:167`).
+    ///
+    /// Every expectation is node 22 output from upstream at v2.26.1, including the three message
+    /// forms. The two properties worth naming: the scan is **one alternation over all three
+    /// syntaxes**, so a `{env:MISSING}` throws exactly as a `${MISSING}` does; and it reports names
+    /// in **first-occurrence order**, deduplicated, which is the order the message prints.
+    #[test]
+    fn resolve_server_url_interpolates_and_throws_the_way_upstream_does() {
+        let env: EnvFn = Arc::new(|key: &str| match key {
+            "HOST" => Some("a.example".to_string()),
+            "EMPTY" => Some(String::new()),
+            _ => None,
+        });
+
+        assert_eq!(resolve_server_url(None, &env).expect("absent"), None);
+        assert_eq!(
+            resolve_server_url(Some("https://api.example.com/mcp"), &env)
+                .expect("already absolute")
+                .as_deref(),
+            Some("https://api.example.com/mcp")
+        );
+        assert_eq!(
+            resolve_server_url(Some("https://${HOST}/mcp"), &env)
+                .expect("resolves")
+                .as_deref(),
+            Some("https://a.example/mcp")
+        );
+        // Set-but-empty is PRESENT: upstream tests `=== undefined`, not truthiness.
+        assert_eq!(
+            resolve_server_url(Some("https://x.example/${EMPTY}a"), &env)
+                .expect("EMPTY is set")
+                .as_deref(),
+            Some("https://x.example/a")
+        );
+
+        for (url, message) in [
+            (
+                "https://x.example/${NOPE}",
+                "Missing environment variable in MCP server URL: NOPE",
+            ),
+            (
+                "https://x.example/$env:NOPE",
+                "Missing environment variable in MCP server URL: NOPE",
+            ),
+            (
+                "https://x.example/{env:NOPE}",
+                "Missing environment variable in MCP server URL: NOPE",
+            ),
+            (
+                "https://x.example/${NOPE}/${ALSONOPE}",
+                "Missing environment variables in MCP server URL: NOPE, ALSONOPE",
+            ),
+            (
+                "https://x.example/${NOPE}/${NOPE}",
+                "Missing environment variable in MCP server URL: NOPE",
+            ),
+            (
+                "not a url",
+                "Invalid MCP server URL after environment interpolation: not a url",
+            ),
+            (
+                "${HOST}",
+                "Invalid MCP server URL after environment interpolation: a.example",
+            ),
+        ] {
+            assert_eq!(
+                resolve_server_url(Some(url), &env).expect_err(url).to_string(),
+                message,
+                "{url}"
+            );
+        }
+
+        // The parser is WHATWG on both sides: measured against node's `new URL`, these four are
+        // accepted and these two are rejected.
+        for accepted in ["unix:///tmp/s.sock", "x:y", "mailto:a@b", "ws://x"] {
+            assert!(resolve_server_url(Some(accepted), &env).is_ok(), "{accepted}");
+        }
+        for rejected in ["//x/y", "/abs/path"] {
+            assert!(resolve_server_url(Some(rejected), &env).is_err(), "{rejected}");
+        }
+
+        assert_eq!(missing_env_vars("no placeholders", &env), Vec::<String>::new());
+        assert_eq!(
+            missing_env_vars("{env:B}/${A}", &env),
+            vec!["B".to_string(), "A".to_string()],
+            "first-occurrence order across the three forms"
         );
     }
 

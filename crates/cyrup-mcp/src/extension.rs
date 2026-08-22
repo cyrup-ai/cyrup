@@ -532,8 +532,8 @@ impl NativeExtension for McpExtension {
     /// `Input` is [`Self::on_input`] — `index.ts:489-511`'s pre-turn convergence. It returns
     /// [`HookOutcome::Noop`] because upstream's handler returns nothing: it gates the turn by
     /// *taking time*, and never transforms the submission's text or images.
-    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
-        match ev {
+    async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
+        let outcome = match ev {
             HostEvent::SessionStart { reason, .. } => {
                 self.on_session_start(reason).await;
                 HookOutcome::Noop
@@ -548,7 +548,22 @@ impl NativeExtension for McpExtension {
             }
             // MCP-045 fills the `isError` override.
             _ => HookOutcome::Noop,
+        };
+        // MCP-471 — record the dispatch context so a consent dialog opened LATER, from a path that
+        // carries no `HostCtx` of its own (`Tool::execute` for the gateway and the direct tools,
+        // `ClientHandler::create_message` for sampling), can still take the `#[must_use]`
+        // `begin_human_wait` guard. `HumanWaitGate::begin` is private to `cyrup-ext` and reachable
+        // only through a ctx, so this is the only producer there can be.
+        //
+        // AFTER the match, not before: on a `SessionStart` the state does not exist until
+        // `on_session_start` has awaited the build, and the very first thing that could open a
+        // dialog cannot run before that returns. See `McpState::human_wait_ctx` for why storing a
+        // ctx past its own dispatch is sound (the gate is one shared `Arc` per native handle, and
+        // the fields that go stale are never read through this slot).
+        if let Some(state) = self.state() {
+            state.set_human_wait_ctx(ctx);
         }
+        outcome
     }
 
     /// `renderCall` for every name [`crate::registration::register_surface`] declared a renderer
@@ -848,6 +863,38 @@ mod tests {
         assert!(
             !converged.load(Ordering::Acquire),
             "a replaced generation must not gate the live session's turn"
+        );
+    }
+
+    /// MCP-471's producer half: every dispatch records its ctx on the committed state, so a consent
+    /// dialog opened later from a ctx-less path (`Tool::execute`, `ClientHandler::create_message`)
+    /// can still take the P-3 budget-forgiveness guard.
+    ///
+    /// Recorded **after** the handler runs, because on a `SessionStart` there is no state to record
+    /// onto until the build has returned — hence the "no state, no record, no panic" arm first.
+    #[tokio::test]
+    async fn every_dispatch_records_its_ctx_for_a_later_consent_dialog() {
+        let ext = extension();
+        // No committed state yet: the record is skipped, and the dispatch is unaffected.
+        assert!(matches!(ext.on_event(&input_event(), &event_ctx()).await, HookOutcome::Noop));
+
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let state = input_state(Arc::clone(&owner));
+        *ext.owner.lock().unwrap() = Some(Arc::clone(&owner));
+        *ext.state.lock().unwrap() = Some(Arc::clone(&state));
+        assert!(
+            state.human_wait_ctx.lock().unwrap().is_none(),
+            "nothing recorded before the first dispatch"
+        );
+
+        let ctx = event_ctx();
+        let _ = ext.on_event(&input_event(), &ctx).await;
+
+        let recorded = state.human_wait_ctx.lock().unwrap().clone().expect("the ctx is recorded");
+        assert!(
+            Arc::ptr_eq(&recorded.human_wait_gate(), &ctx.human_wait_gate()),
+            "the recorded clone must carry the SAME `HumanWaitGate` the dispatcher polls, or the \
+             guard suspends a budget nobody is watching"
         );
     }
 

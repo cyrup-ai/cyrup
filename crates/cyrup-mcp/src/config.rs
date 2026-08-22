@@ -489,6 +489,141 @@ where
 // 4 · The typed model — `types.ts` (MCP-066, MCP-069)
 // ===================================================================================================
 
+/// A `Record<string, string>` config block — `env`, `headers` and `requestHeadersCommand.env` — held
+/// so that a **non-string member is remembered rather than dropped** (MCP-144).
+///
+/// # Why this is not a bare `BTreeMap<String, String>` behind [`lenient`]
+///
+/// It was, and that was one of the four hashing divergences from upstream.
+/// `interpolateEnvRecord(values)` (`utils.ts:107`) calls
+/// `interpolateSecretExpression(value)` → `value.startsWith("!!")` on **every** member
+/// unconditionally, so one non-string member makes `computeServerHash`
+/// (`metadata-cache.ts:90`, `:93`, `:98`) **throw**, and `isServerCacheValid`
+/// (`metadata-cache.ts:114`) catches that to `false`: the entry is simply never cache-valid.
+/// Measured by running `utils.ts` on node 22 against `tmp/pi-mcp-adapter` @ tag `v2.26.1`
+/// (`fafae21`) — `interpolateEnvRecord({ k: 5 })` throws `value.startsWith is not a function`,
+/// `{ k: true }`, `{ k: [1] }` and `{ k: { a: 1 } }` throw the same, and
+/// `interpolateEnvRecord({ k: null })` throws
+/// `Cannot read properties of null (reading 'startsWith')`.
+///
+/// `deserialize_with = "lenient"` over a `BTreeMap<String, String>` dropped the **whole map**, so
+/// this crate hashed `"env":undefined`, produced a perfectly good digest, and called the entry
+/// **valid** — while `cyrup_ext_subagents::exec::mcp_direct_tools`, which holds the raw JSON and
+/// reproduces the throw, called the same entry **invalid**. Two crates in one tree returning
+/// opposite answers about one cache entry is worse than either answer on its own, and it is the
+/// only one of the four divergences that is not merely a digest mismatch.
+///
+/// So the type keeps three views of the same block:
+///
+/// * [`std::ops::Deref`] to the **string** members, which is what every consumer wants and is byte-identical
+///   to what the old `BTreeMap<String, String>` held for a well-formed map. Read sites move from
+///   `entry.env.as_ref()` to `entry.env.as_deref()` and are otherwise untouched.
+/// * [`Self::unhashable`] — `Some(message)` when at least one member was not a string, carrying
+///   upstream's own TypeError text. [`crate::dirs::ResolvedIdentity::resolve`] turns it into the
+///   `Err` that is upstream's throw, so the digest never exists.
+/// * The **raw** members, so a write-back through `raw_from` round-trips a member this port cannot
+///   use instead of erasing it. The old field erased the entire block on every write.
+///
+/// # The one named micro-delta
+///
+/// Upstream throws on the first offending member in `Object.entries` (**insertion**) order; both
+/// Rust sides iterate in **key** order, because both hold the block in a [`BTreeMap`]. The two can
+/// disagree only about *which* message a block carrying both a `null` member and a non-null
+/// non-string member produces — never about *whether* it throws, and the message reaches nothing
+/// but a `catch`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StringRecord {
+    /// Every member exactly as written, so [`Serialize`] is lossless.
+    raw: BTreeMap<String, RawJson>,
+    /// The string-valued members — the [`std::ops::Deref`] target, and the only view a consumer sees.
+    values: BTreeMap<String, String>,
+    /// `Some(upstream's TypeError text)` when [`Self::raw`] holds a member [`Self::values`] could
+    /// not take. Derived, never stored independently.
+    unhashable: Option<String>,
+}
+
+impl StringRecord {
+    /// Split a raw block into the string view and the throw, exactly as `interpolateEnvRecord`
+    /// would when it walked it.
+    fn from_raw(raw: BTreeMap<String, RawJson>) -> Self {
+        let mut values = BTreeMap::new();
+        let mut unhashable = None;
+        for (key, value) in &raw {
+            if let RawJson::String(text) = value {
+                let _ = values.insert(key.clone(), text.clone());
+            } else if unhashable.is_none() {
+                // The two messages node actually raises; see the type's doc comment.
+                unhashable = Some(
+                    if matches!(value, RawJson::Null) {
+                        "Cannot read properties of null (reading 'startsWith')"
+                    } else {
+                        "value.startsWith is not a function"
+                    }
+                    .to_string(),
+                );
+            }
+        }
+        Self { raw, values, unhashable }
+    }
+
+    /// The string-valued members. Same map the field used to be.
+    #[must_use]
+    pub fn values(&self) -> &BTreeMap<String, String> {
+        &self.values
+    }
+
+    /// `Some(message)` when `interpolateEnvRecord` would throw on this block — upstream's own
+    /// TypeError text, which reaches nothing but `isServerCacheValid`'s `catch`.
+    #[must_use]
+    pub fn unhashable(&self) -> Option<&str> {
+        self.unhashable.as_deref()
+    }
+}
+
+impl std::ops::Deref for StringRecord {
+    type Target = BTreeMap<String, String>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.values
+    }
+}
+
+impl From<BTreeMap<String, String>> for StringRecord {
+    fn from(values: BTreeMap<String, String>) -> Self {
+        Self {
+            raw: values
+                .iter()
+                .map(|(key, value)| (key.clone(), RawJson::String(value.clone())))
+                .collect(),
+            values,
+            unhashable: None,
+        }
+    }
+}
+
+impl FromIterator<(String, String)> for StringRecord {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
+        Self::from(iter.into_iter().collect::<BTreeMap<String, String>>())
+    }
+}
+
+impl Serialize for StringRecord {
+    /// The **raw** members, so an unusable member survives a write instead of being erased.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for StringRecord {
+    /// A JSON **object** of anything. A non-object still fails, which is what makes [`lenient`]
+    /// drop `"env": "abc"` exactly as it did before this type existed. (Upstream would hash
+    /// `Object.entries("abc")`, i.e. `{"0":"a","1":"b","2":"c"}` — a fifth, separate divergence
+    /// that is not this change's business and is recorded in `13c-mcp-servers.md`'s MCP-144 notes.)
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self::from_raw(BTreeMap::<String, RawJson>::deserialize(deserializer)?))
+    }
+}
+
 /// The merged view of every `mcp.json` source — upstream `McpConfig`.
 ///
 /// `mcpServers` is an [`IndexMap`] because `Object.entries(...)` yields **insertion order**, and
@@ -606,8 +741,14 @@ pub struct HttpRequestHeadersCommand {
     /// Environment overrides layered over the adapter's own environment, each value
     /// `interpolateEnvVars`'d. No `!`-secret resolution: upstream uses `interpolateEnvVars`, not
     /// `resolveCommandSecret`, so a leading `!` here is literal.
+    ///
+    /// A [`StringRecord`] for the same reason [`ServerEntry::env`] is: `computeServerHash` runs the
+    /// **nested** env through `interpolateEnvRecord` too (`metadata-cache.ts:98`), so a non-string
+    /// member here throws exactly as one in the outer map does. The nested block is not a laxer map
+    /// than the outer one, and `cyrup_ext_subagents::exec::mcp_direct_tools` already treats it that
+    /// way.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
-    pub env: Option<BTreeMap<String, String>>,
+    pub env: Option<StringRecord>,
     /// Per-invocation timeout in **milliseconds**; defaults to `10_000` and must be an integer in
     /// `1..=60000`.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
@@ -637,8 +778,13 @@ pub struct ServerEntry {
     pub args: Option<Vec<String>>,
     /// Environment, layered over the full `process.env` and passed through
     /// `resolveCommandSecretsRecord` — unless [`Self::literal_env`] is set.
+    ///
+    /// A [`StringRecord`], **not** a `BTreeMap<String, String>`: a single non-string member makes
+    /// upstream's `computeServerHash` throw, and dropping the whole map (which is all `lenient`
+    /// could do over a plain map) made this crate call an entry cache-valid that the in-tree reader
+    /// called invalid. See [`StringRecord`] for the measurement and the consequence.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
-    pub env: Option<BTreeMap<String, String>>,
+    pub env: Option<StringRecord>,
     /// Working directory, `resolveConfigPath`'d (interpolation + `~`); falls back to the session
     /// cwd.
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
@@ -649,8 +795,11 @@ pub struct ServerEntry {
     pub url: Option<String>,
     /// Extra request headers, `!`-secret-resolved and interpolated. Part of the
     /// `computeServerHash` pre-image, and one of `URL_BOUND_AUTH_FIELDS`.
+    ///
+    /// A [`StringRecord`] for the same reason [`Self::env`] is — `computeServerHash` runs both
+    /// through the same `interpolateEnvRecord` (`metadata-cache.ts:90` and `:93`).
     #[serde(default, deserialize_with = "lenient", skip_serializing_if = "Option::is_none")]
-    pub headers: Option<BTreeMap<String, String>>,
+    pub headers: Option<StringRecord>,
     /// Add or replace HTTP headers by running a trusted command **for each request**
     /// (`types.ts:383`, v2.26.0). Part of the `computeServerHash` pre-image, and one of
     /// `URL_BOUND_AUTH_FIELDS` — it signs requests to *one* endpoint, so it must not follow a
@@ -1216,29 +1365,137 @@ pub enum HttpTransport {
     Sse,
 }
 
-/// `protocolVersion`. `undefined` and `Legacy` are byte-identical on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// `protocolVersion`. `undefined` and [`Legacy`](Self::Legacy) are byte-identical on the wire.
+///
+/// # The fourth variant, and why the enum is no longer closed
+///
+/// `resolveVersionNegotiation` (`server-manager.ts:82-95`) is a `switch` with a `default:` arm that
+/// **throws** `` `Invalid MCP protocolVersion: ${String(definition.protocolVersion)}` `` — at
+/// CONNECT time. `config.ts` validates the field not at all, and `computeServerHash`
+/// (`metadata-cache.ts:104`) hashes whatever the file said, verbatim, long before any of that.
+///
+/// A three-variant closed enum behind [`lenient`] therefore got this wrong twice over. A real
+/// revision like `"2025-06-18"` — exactly the shape of value a user pins — was silently discarded
+/// by the deserialiser, so this crate hashed `"protocolVersion":undefined` while
+/// `cyrup_ext_subagents::exec::mcp_direct_tools` (which holds the field raw, as upstream does)
+/// hashed `"protocolVersion":"2025-06-18"`. The digests could never match, so every cache entry for
+/// such a server was rejected and the server re-discovered its whole surface every session —
+/// silently, and forever. And because the value was gone by parse time, the connect-time throw
+/// upstream *does* perform never happened either: the server quietly negotiated as `legacy`.
+///
+/// [`Other`](Self::Other) fixes both halves. The value survives to the digest, and
+/// [`crate::runtime::version_negotiation`] raises upstream's sentence on it — at connect, which is
+/// where upstream raises it. **The deserialiser validates nothing**, which is the whole constraint:
+/// a value it rejected could neither be hashed nor be reported.
+///
+/// `Copy` is gone with the payload; the two read sites take it by reference.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ProtocolVersionSetting {
-    /// Send no `versionNegotiation` at all. The default.
-    #[serde(rename = "legacy")]
+    /// `"legacy"` — send no `versionNegotiation` at all. The default.
     Legacy,
-    /// rmcp `ClientLifecycleMode::Auto` — negotiate, with a legacy fallback.
-    #[serde(rename = "auto")]
+    /// `"auto"` — rmcp `ClientLifecycleMode::Auto`: negotiate, with a legacy fallback.
     Auto,
-    /// Pin the revision. Maps to rmcp `ClientLifecycleMode::Discover`.
-    #[serde(rename = "2026-07-28")]
+    /// `"2026-07-28"` — pin the revision. Maps to rmcp `ClientLifecycleMode::Discover`.
     V20260728,
+    /// Anything else the file contained, held **verbatim** for the digest.
+    ///
+    /// `switch` has no case for it, so it is `resolveVersionNegotiation`'s `default:` — a connect
+    /// error, never a parse error.
+    Other(RawJson),
+}
+
+impl ProtocolVersionSetting {
+    /// `String(definition.protocolVersion)` — the interpolation in upstream's throw.
+    ///
+    /// Every form below was produced by running `` `Invalid MCP protocolVersion: ${String(v)}` ``
+    /// on node 22, not reasoned about: `"2025-06-18"` → `2025-06-18`, `5` → `5`, `1.5` → `1.5`,
+    /// `true` → `true`, `null` → `null`, `[1,2]` → `1,2`, `{a:1}` → `[object Object]`, `""` → the
+    /// empty string. `Array.prototype.join` renders a `null` element as the empty string, which is
+    /// why the array arm maps `Null` to `""` rather than to `"null"`.
+    #[must_use]
+    pub fn as_js_string(&self) -> String {
+        match self {
+            ProtocolVersionSetting::Legacy => "legacy".to_string(),
+            ProtocolVersionSetting::Auto => "auto".to_string(),
+            ProtocolVersionSetting::V20260728 => "2026-07-28".to_string(),
+            ProtocolVersionSetting::Other(raw) => js_string(raw),
+        }
+    }
+}
+
+/// JS `String(value)` for a parsed JSON value — see [`ProtocolVersionSetting::as_js_string`], whose
+/// throw is its only caller.
+fn js_string(value: &RawJson) -> String {
+    match value {
+        RawJson::Null => "null".to_string(),
+        RawJson::Bool(true) => "true".to_string(),
+        RawJson::Bool(false) => "false".to_string(),
+        RawJson::Number(number) => number.to_string(),
+        RawJson::String(text) => text.clone(),
+        // `Array.prototype.join(",")`, in which `null` and `undefined` render as the empty string.
+        RawJson::Array(items) => items
+            .iter()
+            .map(|item| if matches!(item, RawJson::Null) { String::new() } else { js_string(item) })
+            .collect::<Vec<_>>()
+            .join(","),
+        RawJson::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+impl Serialize for ProtocolVersionSetting {
+    /// Round-trips the file: a known revision as its own token, anything else as it was written.
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            ProtocolVersionSetting::Legacy => serializer.serialize_str("legacy"),
+            ProtocolVersionSetting::Auto => serializer.serialize_str("auto"),
+            ProtocolVersionSetting::V20260728 => serializer.serialize_str("2026-07-28"),
+            ProtocolVersionSetting::Other(raw) => raw.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ProtocolVersionSetting {
+    /// **Total** — it accepts every JSON value there is, because upstream's `config.ts` accepts
+    /// every JSON value there is. Hand-written rather than `#[serde(untagged)]` so the three known
+    /// variants keep their names and their unit shape at every call site.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let raw = RawJson::deserialize(deserializer)?;
+        Ok(match raw.as_str() {
+            Some("legacy") => ProtocolVersionSetting::Legacy,
+            Some("auto") => ProtocolVersionSetting::Auto,
+            Some("2026-07-28") => ProtocolVersionSetting::V20260728,
+            _ => ProtocolVersionSetting::Other(raw),
+        })
+    }
 }
 
 /// `auth: "oauth" | "bearer" | false`. Untagged with a `bool` arm because only the literal `false`
 /// is legal — `true` is not a variant, it is a value the entry simply never satisfies.
+///
+/// # The third arm exists for the digest, and for nothing else
+///
+/// `computeServerHash` (`metadata-cache.ts:103`) folds `definition.auth` into the identity object
+/// **verbatim**, and `config.ts` validates it not at all — every consumer is a `===` comparison
+/// that an unknown value simply fails. Behind [`lenient`], a two-variant enum turned `auth:
+/// "basic"` (or `5`, or an object) into `None`, so this crate hashed `"auth":undefined` where
+/// `cyrup_ext_subagents::exec::mcp_direct_tools`, which holds the field raw, hashed the value —
+/// and the two digests could never match for such a server.
+///
+/// [`Other`](Self::Other) is last in the untagged list, so `"oauth"`, `"bearer"` and every boolean
+/// still land on the two arms that have meaning; it catches only what those reject. Every consumer
+/// tests equality against a named variant ([`crate::oauth`], [`crate::secrets`]), and
+/// `Other` equals none of them — which is exactly what a TypeScript `===` against an unknown
+/// string does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum AuthMode {
     /// `"oauth"` / `"bearer"`.
     Named(AuthKind),
-    /// The literal `false`.
+    /// The literal `false` — and `true`, which is tolerated exactly as TypeScript's structural cast
+    /// tolerates it and satisfies no read site.
     Disabled(bool),
+    /// Anything else the file contained, held **verbatim** for the digest and matched by nothing.
+    Other(RawJson),
 }
 
 /// The two named `auth` values.
@@ -1813,7 +2070,7 @@ pub fn merge_entry(base: Option<&ServerEntry>, over: &ServerEntry) -> ServerEntr
         http_transport: http_transport.or(base_entry.http_transport),
         plugin_data_dir: plugin_data_dir.clone().or(base_entry.plugin_data_dir),
         literal_env: literal_env.or(base_entry.literal_env),
-        protocol_version: protocol_version.or(base_entry.protocol_version),
+        protocol_version: protocol_version.clone().or(base_entry.protocol_version),
         disabled: disabled.or(base_entry.disabled),
     }
 }
@@ -5149,6 +5406,91 @@ mod tests {
             .expect("detected");
         assert!(!cursor.active, "detected, listed, and NOT merged");
         assert_eq!(cursor.server_count, 2);
+    }
+
+    // --- MCP-144/141: what `lenient` is allowed to discard, and what it is not -----------------
+
+    /// The three fields `lenient` used to silently discard, and which `computeServerHash` hashes
+    /// verbatim.
+    ///
+    /// Upstream's `config.ts` validates none of `auth`, `protocolVersion`, `env` or `headers` at
+    /// load — `validateConfig` only checks that an entry is a non-array object — and
+    /// `computeServerHash` (`metadata-cache.ts:90`, `:93`, `:103`, `:104`) folds all four into the
+    /// identity object as written. A closed enum or a `BTreeMap<String, String>` behind [`lenient`]
+    /// therefore threw away exactly the values the digest is *supposed* to be sensitive to, and
+    /// `cyrup_ext_subagents::exec::mcp_direct_tools` — which holds them raw, as upstream does — could
+    /// never agree with this crate about such a server.
+    ///
+    /// This is the parse-side half of the fix; the digest half is pinned cross-crate in that
+    /// module, and the connect-side half in
+    /// [`crate::runtime::version_negotiation`]'s
+    /// `wire_tests::an_unknown_revision_throws_upstreams_sentence_at_connect`.
+    #[test]
+    fn the_deserialiser_keeps_what_upstream_hashes_and_validates_none_of_it() {
+        let entry: ServerEntry = serde_json::from_str(
+            r#"{
+                "command": "x",
+                "auth": "basic",
+                "protocolVersion": "2025-06-18",
+                "env": { "GOOD": "1", "BAD": 5 },
+                "headers": { "X-Ok": "y", "X-Bad": null }
+            }"#,
+        )
+        .expect("a wrong-typed field never fails the parse");
+
+        // `auth` and `protocolVersion` survive verbatim…
+        assert_eq!(entry.auth, Some(AuthMode::Other(RawJson::String("basic".to_string()))));
+        assert_eq!(
+            entry.protocol_version,
+            Some(ProtocolVersionSetting::Other(RawJson::String("2025-06-18".to_string())))
+        );
+        // …and neither satisfies any read site, which is what a TypeScript `===` against an unknown
+        // value does.
+        assert_ne!(entry.auth, Some(AuthMode::Named(AuthKind::Oauth)));
+        assert_ne!(entry.auth, Some(AuthMode::Disabled(false)));
+
+        // `env`/`headers` keep their usable members AND the throw, instead of vanishing whole.
+        let env = entry.env.as_ref().expect("the map is not dropped");
+        assert_eq!(env.get("GOOD").map(String::as_str), Some("1"));
+        assert_eq!(env.len(), 1);
+        assert_eq!(env.unhashable(), Some("value.startsWith is not a function"));
+        let headers = entry.headers.as_ref().expect("the map is not dropped");
+        assert_eq!(headers.get("X-Ok").map(String::as_str), Some("y"));
+        assert_eq!(
+            headers.unhashable(),
+            Some("Cannot read properties of null (reading 'startsWith')")
+        );
+
+        // And a write-back round-trips the file rather than erasing what it cannot use. The old
+        // `Option<BTreeMap<String, String>>` dropped both blocks entirely on every write.
+        let written = serialize_raw_config(&raw_from(&entry));
+        assert!(written.contains(r#""BAD": 5"#), "{written}");
+        assert!(written.contains(r#""X-Bad": null"#), "{written}");
+        assert!(written.contains(r#""auth": "basic""#), "{written}");
+        assert!(written.contains(r#""protocolVersion": "2025-06-18""#), "{written}");
+    }
+
+    /// A well-formed record is byte-identical to the `BTreeMap<String, String>` it replaced, and
+    /// carries no throw — the property that kept every existing digest and every consumer intact.
+    #[test]
+    fn a_well_formed_record_is_unchanged_by_the_new_type() {
+        let entry: ServerEntry =
+            serde_json::from_str(r#"{ "command": "x", "env": { "B": "2", "A": "1" } }"#)
+                .expect("entry");
+        let env = entry.env.as_ref().expect("present");
+        assert_eq!(env.unhashable(), None);
+        assert_eq!(
+            env.values(),
+            &BTreeMap::from([("A".to_string(), "1".to_string()), ("B".to_string(), "2".to_string())])
+        );
+        // `Deref` is the whole compatibility story: `.get`, `.len`, `.iter` all reach the strings.
+        assert_eq!(env.get("A").map(String::as_str), Some("1"));
+        assert_eq!(entry.env.as_deref(), Some(env.values()));
+
+        // A non-object still degrades to `None`, exactly as it did before — `lenient`'s rule 4.
+        let odd: ServerEntry =
+            serde_json::from_str(r#"{ "command": "x", "env": "not-a-map" }"#).expect("entry");
+        assert_eq!(odd.env, None);
     }
 
     // --- MCP-302: the twelve `extractOAuthConfig` guards run at CONFIG LOAD --------------------

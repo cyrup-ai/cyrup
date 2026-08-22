@@ -56,7 +56,7 @@ use super::pkce::generate_pkce;
 use super::query::{encode_query, parse_query};
 use super::{OAuthError, now_ms, oauth_credential};
 use crate::auth::OAuthAuth;
-use crate::auth::types::{Credential, EnvAuthContext, ModelAuth};
+use crate::auth::types::{Credential, EnvAuthContext, ModelAuth, ProviderEnv};
 use crate::error::AuthError;
 use cyrup_core::CancelToken;
 use std::fmt::Write as _;
@@ -386,6 +386,11 @@ pub struct AnthropicOAuth {
     /// is what upstream's module-level `CALLBACK_HOST` const does (`anthropic.ts:32`).
     callback_host: Option<String>,
     callback_port: u16,
+    /// Provider-scoped environment overlay (Pi `options.env`) consulted when resolving whether the
+    /// token/authorize request is itself routed through an HTTP proxy. `None` (the default, and
+    /// every production construction) resolves purely from the ambient process environment, which
+    /// is the pre-existing behavior. See [`Self::with_env`].
+    env: Option<ProviderEnv>,
 }
 
 impl Default for AnthropicOAuth {
@@ -402,6 +407,7 @@ impl AnthropicOAuth {
             token_url: TOKEN_URL.to_string(),
             callback_host: None,
             callback_port: CALLBACK_PORT,
+            env: None,
         }
     }
 
@@ -419,7 +425,18 @@ impl AnthropicOAuth {
             token_url: token_url.into(),
             callback_host: Some(callback_host.into()),
             callback_port,
+            env: None,
         }
+    }
+
+    /// Attach a provider-scoped environment overlay used when deciding whether the OAuth hop is
+    /// itself proxied. The ported resolver has always let a non-empty overlay win over the ambient
+    /// process env (`node_http_proxy::get_proxy_env`); this makes that reachable here, so a caller
+    /// — or a test — can pin `http(s)_proxy`/`no_proxy` instead of inheriting the host's.
+    #[must_use]
+    pub fn with_env(mut self, env: ProviderEnv) -> Self {
+        self.env = Some(env);
+        self
     }
 
     /// The browser URL the user must open — `anthropic.ts:239-251`. Parameter order is upstream's
@@ -443,9 +460,16 @@ impl AnthropicOAuth {
     /// nor the `httpProxy` setting, so every OAuth token exchange and silent refresh bypassed a
     /// configured proxy while provider streaming used it.
     async fn client(&self, target_url: &str) -> Result<reqwest::Client, OAuthError> {
-        crate::stream::sse::build_client_for(target_url)
-            .await
-            .map_err(|e| OAuthError::Failed(e.to_string()))
+        // `build_client_for_target` rather than `build_client_for` so `self.env` participates.
+        // With `env: None` the two are identical — same `EnvAuthContext`, same ported resolver.
+        crate::stream::sse::build_client_for_target(
+            target_url,
+            &crate::auth::types::EnvAuthContext,
+            self.env.as_ref(),
+            None,
+        )
+        .await
+        .map_err(|e| OAuthError::Failed(e.to_string()))
     }
 
     /// 1:1 port of `exchangeAuthorizationCode` (`anthropic.ts:190-227`).
