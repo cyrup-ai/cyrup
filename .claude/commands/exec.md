@@ -18,9 +18,10 @@ description: Execute task(s) - single file or N in parallel
 **Argument:** `$ARGUMENTS`
 
 ```bash
-FLUX_ROOT="${FLUX_ROOT:-$HOME/.flux}"
-FLUX_DIR=$(printf '%s' "$(pwd -P)" | tr -cs 'a-zA-Z0-9' '-')
-FLUX_BASE="$FLUX_ROOT/$FLUX_DIR"
+# Project-local and checked in: the task queue travels with the repo, so it is visible in
+# review, survives a fresh clone, and is the same for everyone. Resolves from the repo root,
+# so it is identical no matter which subdirectory the command runs from.
+FLUX_BASE="${FLUX_BASE:-$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)/.flux}"
 mkdir -p "$FLUX_BASE/todo" "$FLUX_BASE/done" "$FLUX_BASE/review" "$FLUX_BASE/research"
 echo "FLUX_BASE=$FLUX_BASE"
 ls -1 "$FLUX_BASE/todo/"*.md 2>/dev/null || true
@@ -79,9 +80,10 @@ updated: <today's date and time, YYYY-MM-DD HH:MM>
 Act as a `$STACK` expert SOFTWARE ARTISAN.
 
 ```bash
-FLUX_ROOT="${FLUX_ROOT:-$HOME/.flux}"
-FLUX_DIR=$(printf '%s' "$(pwd -P)" | tr -cs 'a-zA-Z0-9' '-')
-FLUX_BASE="$FLUX_ROOT/$FLUX_DIR"
+# Project-local and checked in: the task queue travels with the repo, so it is visible in
+# review, survives a fresh clone, and is the same for everyone. Resolves from the repo root,
+# so it is identical no matter which subdirectory the command runs from.
+FLUX_BASE="${FLUX_BASE:-$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)/.flux}"
 echo "FLUX_BASE=$FLUX_BASE"
 ```
 

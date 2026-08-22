@@ -1,0 +1,3 @@
+# Per-machine scratch, not shared state.
+session.env
+stack.env

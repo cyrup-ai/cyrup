@@ -7,21 +7,26 @@ description: Create a new task file from a description or Jira ticket
 
 **Argument:** `$ARGUMENTS`
 
-## STEP 1: Check for leftover task files
+## STEP 1: Show the existing queue
 
 ```bash
-FLUX_ROOT="${FLUX_ROOT:-$HOME/.flux}"
-FLUX_DIR=$(printf '%s' "$(pwd -P)" | tr -cs 'a-zA-Z0-9' '-')
-FLUX_BASE="$FLUX_ROOT/$FLUX_DIR"
+# Project-local and checked in: the task queue travels with the repo, so it is visible in
+# review, survives a fresh clone, and is the same for everyone. Resolves from the repo root,
+# so it is identical no matter which subdirectory the command runs from.
+FLUX_BASE="${FLUX_BASE:-$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)/.flux}"
 mkdir -p "$FLUX_BASE/todo" "$FLUX_BASE/done" "$FLUX_BASE/review" "$FLUX_BASE/research"
 echo "FLUX_BASE=$FLUX_BASE"
-ls "$FLUX_BASE/todo/"*.md 2>/dev/null || true
+ls -1 "$FLUX_BASE/todo/"*.md 2>/dev/null | wc -l | tr -d ' ' | xargs -I{} echo "Tasks already queued: {}"
+ls -1 "$FLUX_BASE/todo/"*.md 2>/dev/null || true
 ```
 
-If files are found, use `ask_user_question`: "Found existing task files in `$FLUX_BASE/todo/`. What would you like to do with them?"
+**This command ADDS to the queue. It never clears it.** `todo/` is meant to stack — queue as many
+tasks as you like and work them in any order. Existing files are listed for context only: do not
+offer to delete, move or back them up, and do not treat a non-empty `todo/` as a problem to resolve
+before continuing.
 
-- `Discard them` → `rm "$FLUX_BASE/todo/"*.md`
-- `Back them up` → `mkdir -p "$FLUX_BASE/todo-bkp" && mv "$FLUX_BASE/todo/"*.md "$FLUX_BASE/todo-bkp/"`
+Two other commands remove a task file, and neither is this one: `/qa` moves a finished task to
+`$FLUX_BASE/done/<session>/`, and `/split` replaces a task with its subtasks, deleting the original.
 
 ## STEP 2: Detect argument type
 
@@ -55,6 +60,9 @@ Read the **Summary**, **Description**, and **Acceptance Criteria** fields from t
 
 #### 3.3 Write task file at `$FLUX_BASE/todo/<TICKET-ID>.md`
 
+If that file already exists the ticket is already queued. Do not silently overwrite it — it may
+carry local edits from `/ask` or `/aug`. Ask whether to refresh it from Jira or leave it as is.
+
 ```markdown
 ---
 stage: new
@@ -84,6 +92,16 @@ updated: <YYYY-MM-DD HH:MM>
 #### 3.1 Generate filename
 
 Take 3-4 significant words, UPPER_SNAKE_CASE, append `.md` (e.g. "add dark mode toggle" → `DARK_MODE.md`)
+
+Because the queue stacks, that name may already be taken. Check before writing:
+
+```bash
+ls -1 "$FLUX_BASE/todo/<FILENAME>.md" 2>/dev/null && echo "__TAKEN__" || echo "__FREE__"
+```
+
+If taken, do NOT overwrite — an existing queued task is someone's unstarted work. Pick a more
+specific name from the request (`DARK_MODE.md` → `DARK_MODE_TOGGLE.md`), and if that collides too,
+suffix `_2`, `_3`. Say which name you settled on and that the original was left untouched.
 
 #### 3.2 Clarify if needed
 
