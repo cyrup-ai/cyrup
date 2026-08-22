@@ -28,14 +28,8 @@ impl App<InlineBackend<Stdout>> {
         // the same reason the sinks are: a replacement session brings different extensions.
         // …gated by `enableSkillCommands`, which Pi applies at exactly this seam
         // (`interactive-mode.ts:613`) and nowhere else.
-        self.state
-            .editor
-            .set_registry(crate::commands::CommandRegistry::with_dynamic(
-                crate::commands::dynamic_commands_from_catalog_gated(
-                    &session.slash_command_catalog(),
-                    session.services().settings.effective().enable_skill_commands(),
-                ),
-            ));
+        let gate = session.services().settings.effective().enable_skill_commands();
+        self.rebuild_command_registry(session, gate);
         // `editorPaddingX` + `showHardwareCursor` — Pi seeds both while CONSTRUCTING the editor and
         // the TUI (`interactive-mode.ts:459` `new TUI(terminal, getShowHardwareCursor(), …)` and
         // `:470-474` `new CustomEditor(…, { paddingX: getEditorPaddingX(), … })`), so the very first
@@ -210,15 +204,18 @@ impl App<InlineBackend<Stdout>> {
         // session (Pi re-binds `onError` from `rebindSession`, and `crates/cyrup-modes/src/rpc.rs`'s
         // `rebind_session` does the same).
         Self::install_error_listener(&ctx.session.services().ext_host, ctx.ext_error_tx.clone());
+        // ...and HA-1's command listener, for the same reason: the old host's subscribers do not
+        // reach the new one, so a late command on the replacement session would never rebuild.
+        Self::install_commands_listener(
+            &ctx.session.services().ext_host,
+            ctx.commands_changed_tx.clone(),
+        );
         // ...and the same for the `/` menu: a replacement session can load a DIFFERENT extension set
         // (`/reload` exists precisely to change it), so a registry built from the previous session's
         // catalog would be stale.
-        self.state.editor.set_registry(crate::commands::CommandRegistry::with_dynamic(
-            crate::commands::dynamic_commands_from_catalog_gated(
-                &ctx.session.slash_command_catalog(),
-                ctx.session.services().settings.effective().enable_skill_commands(),
-            ),
-        ));
+        let gate = ctx.session.services().settings.effective().enable_skill_commands();
+        let swapped = Arc::clone(&ctx.session);
+        self.rebuild_command_registry(&swapped, gate);
         // `rebind_session` reset the transcript to Pi's default pad; re-read the swapped-in
         // session's `outputPad` so a configured value survives the swap.
         self.state

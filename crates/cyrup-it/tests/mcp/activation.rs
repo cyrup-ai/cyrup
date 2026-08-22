@@ -106,10 +106,16 @@ fn config(fx: &Fixture, no_extensions: bool) -> SessionConfig {
 }
 
 /// The adapter exactly as `crates/cyrup/src/main.rs` attaches it — `McpExtension::with_config(dirs,
-/// None)`, which is `mcp_extension_for_env`'s entire body — with only the home pinned.
+/// None)` through `into_arc`, which is `mcp_extension_for_env`'s entire body — with only the home
+/// pinned.
+///
+/// `into_arc` rather than a bare `Arc::new`: it is what binds the extension's self-handle, and
+/// without it this fixture would differ from production in precisely the field that decides
+/// whether the `onToolMetadataUpdated` listener can install — so a test of the late path would
+/// take the unbound branch and pass for the wrong reason.
 fn adapter(fx: &Fixture) -> Arc<dyn cyrup_ext::NativeExtension> {
     let dirs = cyrup_mcp::dirs::McpDirs::new(fx.agent_dir.clone(), fx.cwd.clone());
-    Arc::new(McpExtension::with_config(dirs, None).with_home(fx.agent_dir.clone()))
+    McpExtension::with_config(dirs, None).with_home(fx.agent_dir.clone()).into_arc()
         as Arc<dyn cyrup_ext::NativeExtension>
 }
 

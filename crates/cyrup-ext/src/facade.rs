@@ -17,7 +17,7 @@ use crate::loader::LoadExtensionsResult;
 #[cfg(feature = "wasm-host")]
 use crate::manifest::{Capabilities, HOST_WORLD};
 use crate::native::{ExtMode, HostCtx, InitApi, NativeExtension, NativeHandle};
-use crate::registry::ExtensionRegistry;
+use crate::registry::{CommandDescriptor, ExtensionRegistry};
 use crate::subscriber::ExtSubscriber;
 use cyrup_agent::{EventSubscriber, Hooks};
 use cyrup_core::{CancelToken, Content, ExtensionId, Message, Tool};
@@ -117,6 +117,49 @@ impl Default for HostConfig {
     }
 }
 
+/// The host's [`crate::native::LateRegistrar`] implementation — one per loaded native, handed to it
+/// before `init` (HA-1 / MCP-037).
+///
+/// Holds the `Arc<ExtensionRegistry>` rather than the host, which is what makes this a narrow
+/// capability instead of a back-door: the registry does not own the host, so there is no cycle to
+/// break with a `Weak`, and the handle can reach registration and nothing else.
+///
+/// `owner` is bound HERE, at construction, not passed by the caller. An extension holding this
+/// cannot register under another extension's id — which the alternative shape (handing out a
+/// `Weak<ExtensionHost>` and letting the extension call `register_late_tool(owner, tool)`) would
+/// have allowed, since that `owner` is just a parameter.
+struct HostLateRegistrar {
+    registry: Arc<ExtensionRegistry>,
+    owner: ExtensionId,
+    /// Fires after a command registration so a snapshot consumer can rebuild. Held as a callback
+    /// rather than a host handle for the same reason as `registry` above.
+    on_commands_changed: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl crate::native::LateRegistrar for HostLateRegistrar {
+    fn register_tool(&self, tool: Arc<dyn Tool>) -> Result<(), ExtError> {
+        // The same call `register_late_tool` makes. `register_tool_inner` raises the tools-dirty
+        // flag, `refresh_tools` reports it (MCP-037a), `AgentSession::refresh_extension_tools`
+        // merges and `push_active_tools` rewrites the agent's tool array and the system prompt at
+        // the next turn boundary. Every step of that already existed; this call is what was missing.
+        self.registry.register_tool(self.owner.clone(), tool)
+    }
+
+    fn register_command(&self, name: String, desc: CommandDescriptor) -> Result<(), ExtError> {
+        self.registry.register_command(self.owner.clone(), name, desc)?;
+        (self.on_commands_changed)();
+        Ok(())
+    }
+
+    fn register_tool_renderer(&self, tool_name: String) -> Result<(), ExtError> {
+        self.registry.register_tool_renderer(self.owner.clone(), tool_name)
+    }
+
+    fn owner(&self) -> ExtensionId {
+        self.owner.clone()
+    }
+}
+
 /// The extension host facade (arch-08 §3.1).
 pub struct ExtensionHost {
     dispatcher: Arc<Dispatcher>,
@@ -153,6 +196,17 @@ pub struct ExtensionHost {
     /// arm does. Set by [`Self::set_ctx_source`], which
     /// [`Self::load_native_with_services`] calls for the `wasm-host` path.
     ctx_source: RwLock<Option<Arc<dyn crate::native::HostCtxSource>>>,
+    /// Subscribers notified after a command registration lands from a LIVE handler (HA-1's command
+    /// leg, MCP-039/MCP-395). Tools need no such list — they have the tools-dirty flag and
+    /// `AgentSession`'s turn-boundary poll — but commands have neither: `resolved_commands()` is
+    /// read live by the RPC catalog, while the TUI `/` menu is a SNAPSHOT rebuilt at exactly three
+    /// points (session start, session swap, the `enableSkillCommands` toggle), none of them
+    /// extension-driven. Without this a late command is invocable by typing it in full and
+    /// invisible in the menu.
+    ///
+    /// Shaped after [`Self::add_error_listener`], which is already feature-independent and already
+    /// consumed by the TUI through an `UnboundedSender`.
+    commands_listeners: Arc<RwLock<Vec<crate::CommandsListener>>>,
     /// The live `getActiveTools` source the registered-tool wrapper diffs against (Pi
     /// `ExtensionRunner.getActiveTools`, runner.ts:664-667). `None` until a session attaches one
     /// via [`Self::set_active_tool_source`], in which case [`Self::active_tools`] hands tools back
@@ -255,6 +309,7 @@ impl ExtensionHost {
             live_invalidations: std::sync::atomic::AtomicU64::new(0),
             bus,
             ctx_source: RwLock::new(None),
+            commands_listeners: Arc::new(RwLock::new(Vec::new())),
             active_tool_source: RwLock::new(None),
             fanout,
         }
@@ -353,6 +408,13 @@ impl ExtensionHost {
         ext: Arc<dyn NativeExtension>,
         id: ExtensionId,
     ) -> Result<(), ExtError> {
+        // HA-1: bind the late-registration handle BEFORE `init`, for the same reason
+        // `set_host_services` binds before it (P-1) — an `init`-spawned background task must
+        // already hold it when it runs. Bound HERE, in the shared body, rather than in
+        // `load_native_with_services`: that method is `cfg(feature = "wasm-host")`, and the whole
+        // point of `LateRegistrar` being feature-independent is that both build arms get one.
+        ext.set_late_registrar(self.late_registrar_for(id.clone()));
+
         let mut api = InitApi::new();
         ext.init(&mut api).await?;
         let (
@@ -648,6 +710,68 @@ impl ExtensionHost {
         tool: Arc<dyn Tool>,
     ) -> Result<(), ExtError> {
         self.registry.register_tool(owner, tool)
+    }
+
+    // NOTE on callers: this is the EMBEDDER-facing door — a host that already holds the
+    // `ExtensionHost` and is registering on some extension's behalf. An EXTENSION reaches the same
+    // `ExtensionRegistry::register_tool` through [`crate::native::LateRegistrar`], which is handed
+    // to it at load with its own id already bound, so it cannot pass an `owner` it does not own.
+    // Two doors, one call; neither is dead.
+
+    /// The command sibling of [`Self::register_late_tool`] (MCP-039 / MCP-395). The registry half
+    /// already existed and already handled re-registration in place; this is the facade verb that
+    /// was missing, plus the notification a snapshot consumer needs.
+    pub fn register_late_command(
+        &self,
+        owner: ExtensionId,
+        name: impl Into<String>,
+        desc: CommandDescriptor,
+    ) -> Result<(), ExtError> {
+        self.registry.register_command(owner, name, desc)?;
+        self.notify_commands_changed();
+        Ok(())
+    }
+
+    /// Build the per-extension [`crate::native::LateRegistrar`] handed to a native before `init`.
+    fn late_registrar_for(&self, owner: ExtensionId) -> Arc<dyn crate::native::LateRegistrar> {
+        // The notifier closes over the SHARED listener list, not over the host: a registrar
+        // outlives nothing it should keep alive, and holds no path back to the facade.
+        let listeners = Arc::clone(&self.commands_listeners);
+        Arc::new(HostLateRegistrar {
+            registry: Arc::clone(&self.registry),
+            owner,
+            on_commands_changed: Arc::new(move || {
+                let subscribers = match listeners.read() {
+                    Ok(g) => g.clone(),
+                    Err(_) => return,
+                };
+                for l in subscribers {
+                    l();
+                }
+            }),
+        })
+    }
+
+    /// Subscribe to late COMMAND registrations (HA-1's command leg). Modelled on
+    /// [`Self::add_error_listener`]: the TUI forwards into an `UnboundedSender` it already pumps
+    /// and rebuilds its `/` menu from `slash_command_catalog()`, which is already live.
+    pub fn add_commands_listener(&self, listener: crate::CommandsListener) {
+        if let Ok(mut g) = self.commands_listeners.write() {
+            g.push(listener);
+        }
+    }
+
+    /// Fire every [`Self::add_commands_listener`] subscriber. A poisoned lock drops the
+    /// notification rather than panicking a live handler: the command IS registered either way,
+    /// and the menu re-syncs at the next session swap.
+    fn notify_commands_changed(&self) {
+        let listeners = match self.commands_listeners.read() {
+            Ok(g) => g.clone(),
+            Err(_) => return,
+        };
+        for l in listeners {
+            l();
+        }
     }
 
     /// Aggregate the `project_trust` decision across extensions (Pi `emitProjectTrustEvent`,

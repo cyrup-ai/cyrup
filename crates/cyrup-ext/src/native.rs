@@ -681,6 +681,20 @@ pub trait NativeExtension: Send + Sync {
     /// because the [`crate::host::HostServices`] trait itself only exists with the capability host.
     #[cfg(feature = "wasm-host")]
     fn set_host_services(&self, _services: Arc<dyn crate::host::HostServices>) {}
+
+    /// Late-bind the post-`init` registration handle (HA-1 / MCP-037). Called by
+    /// `ExtensionHost::load_native_inner` BEFORE [`Self::init`], for the same reason
+    /// [`Self::set_host_services`] binds before it: an `init`-spawned background task must already
+    /// hold the handle when it runs.
+    ///
+    /// The default is a no-op — a built-in whose whole surface is known at `init` simply ignores
+    /// it. One that discovers tools later (cyrup-mcp connecting a server mid-session) STASHES the
+    /// `Arc` in its own interior-mutable slot, exactly as [`Self::set_host_services`] is stashed.
+    ///
+    /// Deliberately NOT `cfg(feature = "wasm-host")`, unlike the method above: [`LateRegistrar`] is
+    /// typed against nothing behind that feature precisely so both build arms have it. See the
+    /// trait's own doc, and EXT-060 for what the gated version of this mistake cost last time.
+    fn set_late_registrar(&self, _registrar: Arc<dyn LateRegistrar>) {}
 }
 
 /// Wraps a `NativeExtension` into the unified [`Extension`] handle, applying panic containment
@@ -725,6 +739,51 @@ pub struct NativeHandle {
 pub trait HostCtxSource: Send + Sync {
     /// Snapshot the rich fields as of RIGHT NOW (re-read per dispatch, never cached).
     fn rich(&self) -> HostCtxRich;
+}
+
+/// The post-`init` registration handle (HA-1 / MCP-037). pi's `api.registerTool` and
+/// `api.registerCommand` are legal from ANY live handler — the api object an extension captured at
+/// load is the same object for the session's life (`extensions/loader.ts:267-289` @v0.83.0), and
+/// `registerTool` ends with an unconditional `runtime.refreshTools()`. A native extension had no
+/// equivalent: its only host handles are the `Arc<dyn HostServices>` late-bound by
+/// [`NativeExtension::set_host_services`] and the per-dispatch [`HostCtx`], and `HostServices`'
+/// five tool-shaped verbs (`active_tools`, `all_tool_names`, `set_active_tools`, `all_tools`,
+/// `commands`) are all read-or-restrict — none ADDS, and `set_active_tools` cannot activate a name
+/// that was never registered. The WASM tier reaches the same registry through its `registration`
+/// WIT import, so this was a two-tier asymmetry in one verb, not an absent capability.
+///
+/// [`InitApi`] is a COLLECTOR — it accumulates into `Vec`s that `load_native_inner` drains once —
+/// which is why it is `&mut` and only exists during `init`. This writes THROUGH to the registry
+/// immediately. That is the whole difference between the two.
+///
+/// **Feature-independent, deliberately**, and this is load-bearing rather than stylistic: the
+/// obvious shape — a sibling of [`NativeExtension::set_host_services`] — inherits that method's
+/// `cfg(feature = "wasm-host")`, and so does its only caller
+/// [`crate::ExtensionHost::load_native_with_services`]. EXT-060 records what that costs: the
+/// EXT-005 rich-ctx fix was typed against [`crate::host::HostServices`], so a
+/// `--no-default-features` build silently lost the whole fix with no diagnostic. [`HostCtxSource`]
+/// above is the repair, and this trait is the same repair applied before the fact — the manifest
+/// explicitly invites a host built without Wasmtime, and whether a native can register a tool must
+/// not depend on which host features were compiled in.
+pub trait LateRegistrar: Send + Sync {
+    /// pi `api.registerTool` from a live handler. Lands in the executable tool map and raises the
+    /// tools-dirty flag; [`crate::ExtensionHost::refresh_tools`] reports it and the next turn
+    /// boundary surfaces it to the model.
+    fn register_tool(&self, tool: Arc<dyn Tool>) -> Result<(), ExtError>;
+
+    /// pi `api.registerCommand` from a live handler. Re-registering an existing name UPDATES it in
+    /// place rather than appending a second row — see [`crate::registry::ExtensionRegistry::register_command`].
+    fn register_command(&self, name: String, desc: CommandDescriptor) -> Result<(), ExtError>;
+
+    /// Declare that this extension renders the tool named `tool_name` (MCP-036). Split from
+    /// [`Self::register_tool`] for the same reason [`InitApi`] splits them: a native tool is an
+    /// already-executable `Arc<dyn Tool>` with no descriptor to carry `has_renderer`.
+    fn register_tool_renderer(&self, tool_name: String) -> Result<(), ExtError>;
+
+    /// The extension this handle registers on behalf of. The host binds it at construction, so an
+    /// extension holding the handle cannot register under another extension's id — the reason this
+    /// is a narrow capability rather than a `Weak<ExtensionHost>`.
+    fn owner(&self) -> ExtensionId;
 }
 
 /// Adapts the injected [`crate::host::HostServices`] backend to [`HostCtxSource`] — the live rich

@@ -163,6 +163,11 @@ pub use contract::{
     EventPatch, HandledValue, HookOutcome, Reduced, TerminalInputDecision, TerminalInputResult,
 };
 pub use dispatch::{Dispatcher, ErrorListener, ExtensionError};
+
+/// Notified after a command registration lands from a LIVE handler (HA-1's command leg). Takes no
+/// argument: the consumer rebuilds from `slash_command_catalog()`, which is already live, so the
+/// signal carries no payload worth threading. Sibling of [`ErrorListener`].
+pub type CommandsListener = std::sync::Arc<dyn Fn() + Send + Sync>;
 pub use error::ExtError;
 pub use event::{EventKind, HostEvent, InputEventSource, InputStreamingBehavior, Subscriptions};
 pub use extension::{ExtKind, Extension};
@@ -179,7 +184,7 @@ pub use loader::{
 pub use manifest::{Capabilities, ExtensionManifest, FsGrant, HOST_WORLD, MANIFEST_FILE};
 pub use native::{
     CtxTier, ExtMode, HostCtx, HostCtxRich, HostCtxSource, HumanWaitGate, HumanWaitGuard, InitApi,
-    NativeExtension, NativeHandle,
+    LateRegistrar, NativeExtension, NativeHandle,
 };
 /// EXT-060: the `HostServices` -> [`native::HostCtxSource`] adapter is only meaningful when the
 /// capability backend exists, but the TRAIT it feeds is unconditional.

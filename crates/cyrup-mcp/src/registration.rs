@@ -1476,10 +1476,18 @@ pub trait McpToolDispatch: Send + Sync + 'static {
 
 /// The slot every tool registered in one `init()` pass shares.
 ///
-/// Set-once per pass, because a pass mints fresh tool objects anyway (cyrup re-runs `init` on the
-/// *same* `Arc<dyn NativeExtension>` for each session generation — see the crate docs' ordering
-/// inversion). [`RegisteredSurface::dispatch`] hands the same `Arc` back to the caller, which
-/// installs the real dispatch once [`crate::state::McpState`] exists.
+/// Set-once per GENERATION — not per pass. cyrup re-runs `init` on the *same*
+/// `Arc<dyn NativeExtension>` for each session generation (see the crate docs' ordering
+/// inversion), and each of those mints a fresh executor because it mints fresh tool objects.
+/// A LIVE re-sync (`McpExtension::sync_tool_surface`) is a second pass INSIDE one generation and
+/// must reuse the generation's existing `Arc`: `install` is a `OnceLock::set`, so a tool bound to a
+/// freshly-defaulted slot nobody can install answers `MCP not initialized` for the rest of the
+/// session. That is why [`register_surface`] takes the executor as an explicit parameter rather
+/// than defaulting one — the choice of executor is the caller's, and making it invisible is
+/// precisely how it went wrong.
+///
+/// [`RegisteredSurface::dispatch`] echoes the same `Arc` back, and whoever owns the generation
+/// installs the real dispatch into it once [`crate::state::McpState`] exists.
 #[derive(Default)]
 pub struct ToolDispatch {
     slot: OnceLock<Arc<dyn McpToolDispatch>>,
@@ -1923,6 +1931,137 @@ pub struct RegisteredSurface {
     pub dispatch: Arc<ToolDispatch>,
 }
 
+/// Where a registration pass writes its surface (HA-1 / MCP-037).
+///
+/// [`register_surface`] is upstream's `syncToolSurface` + `syncPromptCommands`: it resolves the
+/// config and cache into a tool/command set. Upstream runs that ONE function from `init` and from
+/// every live path (`onToolMetadataUpdated`, `mcp({connect})`, `/mcp reconnect`) because
+/// `pi.registerTool` is legal from anywhere. cyrup has two different write targets for the same
+/// resolution — [`InitApi`] during `init`, [`cyrup_ext::LateRegistrar`] after — so the resolution
+/// is made generic over the target instead of being written twice.
+///
+/// Forking it was the alternative and is the wrong one: two resolution paths drift, and
+/// reader/writer drift is exactly the failure class that produced this crate's `socket`,
+/// `null`/`undefined` and `get_`/`read_` divergences. One path, two sinks.
+pub trait SurfaceSink {
+    fn register_tool(&mut self, tool: Arc<dyn cyrup_core::Tool>);
+    fn register_command(&mut self, name: String, desc: cyrup_ext::CommandDescriptor);
+    fn register_tool_renderer(&mut self, tool_name: String);
+
+    /// Declare the event subscription bitset. Load-time only: the bitset is read once when the
+    /// extension is wired into the dispatcher, so a late pass has nothing to change and the late
+    /// sink no-ops it. Upstream has the same asymmetry — `api.on(...)` mutates a handler map the
+    /// runner already holds, while the subscription itself was fixed at load.
+    fn subscribe(&mut self, _kinds: &[cyrup_ext::EventKind]) {}
+
+    /// Declare a CLI flag. Load-time only for the same reason and with the same upstream
+    /// precedent: flags are parsed before any handler can run, so registering one late could not
+    /// affect the parse.
+    fn register_flag(&mut self, _name: String, _spec: serde_json::Value) {}
+
+    /// Whether a direct tool whose fingerprint is `fingerprint` needs (re-)registering.
+    ///
+    /// This is upstream's `if (previous !== fingerprint)` in `syncDirectTools`, and it is the
+    /// SINK's business rather than the resolver's: `init` builds a fresh surface and registers
+    /// everything, while a live re-sync must register only what changed, because re-registering
+    /// identical bytes still rewrites the agent's tool array and the base system prompt and so
+    /// invalidates the provider's prompt-cache prefix. One resolution pass, two policies.
+    fn should_register_tool(&self, _name: &str, _fingerprint: &str) -> bool {
+        true
+    }
+
+    /// Whether the proxy tool's description differs from the one it is currently registered with
+    /// (`syncProxyTool`'s own comparison, MCP-043).
+    fn should_register_proxy(&self, _description: &str) -> bool {
+        true
+    }
+
+    /// Whether a prompt command still needs registering (`registeredPromptCommands`' dedup set).
+    fn should_register_prompt_command(&self, _name: &str) -> bool {
+        true
+    }
+
+    /// Whether this pass should register the FIXED commands — `/mcp` and `/mcp-auth`.
+    ///
+    /// True for `init`, false for a live re-sync. They neither appear nor change with the
+    /// discovered surface, so re-registering them on every reconnect is churn plus a spurious
+    /// `/` menu rebuild.
+    ///
+    /// A DISTINCT gate from [`Self::should_register_prompt_command`], not a reuse of it: that one
+    /// consults `registeredPromptCommands`, which is seeded only from the per-server prompt specs
+    /// and so never contains either fixed name — the gate could not have held them back however it
+    /// was seeded, because they are not prompt commands.
+    fn register_fixed_commands(&self) -> bool {
+        true
+    }
+}
+
+impl SurfaceSink for InitApi {
+    fn register_tool(&mut self, tool: Arc<dyn cyrup_core::Tool>) {
+        InitApi::register_tool(self, tool);
+    }
+    fn register_command(&mut self, name: String, desc: cyrup_ext::CommandDescriptor) {
+        InitApi::register_command(self, name, desc);
+    }
+    fn register_tool_renderer(&mut self, tool_name: String) {
+        InitApi::register_tool_renderer(self, tool_name);
+    }
+    fn subscribe(&mut self, kinds: &[cyrup_ext::EventKind]) {
+        InitApi::subscribe(self, kinds);
+    }
+    fn register_flag(&mut self, name: String, spec: serde_json::Value) {
+        InitApi::register_flag(self, name, spec);
+    }
+}
+
+/// The post-`init` sink. Writes straight through to the registry; a failure is logged and the pass
+/// continues, because one tool that will not register must not cost the other seven their
+/// registration — upstream's `syncDirectTools` loop has no failure mode at all
+/// (`pi.registerTool` returns `void`), so aborting the pass would be a cyrup-only behaviour.
+pub struct LateSink {
+    pub registrar: Arc<dyn cyrup_ext::LateRegistrar>,
+    /// `registeredDirectTools` as of the last pass — `prefixedName -> fingerprint`.
+    pub known_tools: indexmap::IndexMap<String, String>,
+    /// `proxyToolDescription` as of the last pass.
+    pub known_proxy: Option<String>,
+    /// `registeredPromptCommands` as of the last pass.
+    pub known_commands: indexmap::IndexMap<String, String>,
+}
+
+impl SurfaceSink for LateSink {
+    fn should_register_tool(&self, name: &str, fingerprint: &str) -> bool {
+        self.known_tools.get(name).map(String::as_str) != Some(fingerprint)
+    }
+
+    fn should_register_proxy(&self, description: &str) -> bool {
+        self.known_proxy.as_deref() != Some(description)
+    }
+
+    fn should_register_prompt_command(&self, name: &str) -> bool {
+        !self.known_commands.contains_key(name)
+    }
+
+    fn register_fixed_commands(&self) -> bool {
+        false
+    }
+
+    fn register_tool(&mut self, tool: Arc<dyn cyrup_core::Tool>) {
+        if let Err(e) = self.registrar.register_tool(tool) {
+            tracing::warn!(error = %e, "MCP: late tool registration failed");
+        }
+    }
+    fn register_command(&mut self, name: String, desc: cyrup_ext::CommandDescriptor) {
+        if let Err(e) = self.registrar.register_command(name, desc) {
+            tracing::warn!(error = %e, "MCP: late command registration failed");
+        }
+    }
+    fn register_tool_renderer(&mut self, tool_name: String) {
+        if let Err(e) = self.registrar.register_tool_renderer(tool_name) {
+            tracing::warn!(error = %e, "MCP: late tool-renderer declaration failed");
+        }
+    }
+}
+
 /// Register the whole surface from disk caches. **Infallible by construction** — see the module
 /// docs. There is no `?`, no `unwrap`, and no `Err` path in this function or anything it calls.
 ///
@@ -1930,12 +2069,18 @@ pub struct RegisteredSurface {
 /// commands (upstream line-order first, so a prompt command named `mcp` could never displace the
 /// real `/mcp`), then the `--mcp-config` flag, then `/mcp` and `/mcp-auth`, then
 /// `syncDirectTools` and finally `syncProxyTool`.
-pub fn register_surface(
-    api: &mut InitApi,
+pub fn register_surface<S: SurfaceSink + ?Sized>(
+    api: &mut S,
     dirs: &McpDirs,
     config: &McpConfig,
+    // The executor every tool this pass registers will read. `init` mints one per GENERATION; a
+    // live re-sync passes the generation's EXISTING one, or its tools can never execute. See
+    // [`ToolDispatch`] — this used to be defaulted here, which silently bound a re-sync's tools to
+    // an empty slot nothing could install.
+    dispatch: Arc<ToolDispatch>,
 ) -> RegisteredSurface {
-    let mut surface = RegisteredSurface::default();
+    let mut surface =
+        RegisteredSurface { dispatch: Arc::clone(&dispatch), ..RegisteredSurface::default() };
     api.subscribe(SUBSCRIBED_EVENTS);
 
     // `loadMetadataCache()` — `readFileSync`, defensive, `null` on anything unexpected.
@@ -1956,7 +2101,6 @@ pub fn register_surface(
         if env_raw.is_none() || env_is_none_sentinel { None } else { env_selectors.as_deref() };
 
     let render_kind = tool_render_kind(config.settings.as_ref());
-    let dispatch = Arc::clone(&surface.dispatch);
 
     // --- prompt commands, one per cached prompt (MCP-206) --------------------------------------
     let mut seen_commands: HashSet<String> = HashSet::new();
@@ -1970,22 +2114,31 @@ pub fn register_surface(
             );
             continue;
         }
-        api.register_command(spec.command_name.clone(), prompt_command_descriptor(&spec));
-        surface.command_names.push(spec.command_name.clone());
+        // `registeredPromptCommands` is a dedup SET upstream, not a fingerprint diff: a prompt
+        // command's descriptor does not vary once its name is known, so an already-registered name
+        // is skipped outright rather than compared.
+        if api.should_register_prompt_command(&spec.command_name) {
+            api.register_command(spec.command_name.clone(), prompt_command_descriptor(&spec));
+            surface.command_names.push(spec.command_name.clone());
+        }
         surface.prompt_commands.push(spec);
     }
 
     // --- the flag (MCP-002) --------------------------------------------------------------------
     api.register_flag(
-        MCP_CONFIG_FLAG,
+        MCP_CONFIG_FLAG.to_string(),
         json!({ "description": "Path to MCP config file", "type": "string" }),
     );
 
     // --- /mcp and /mcp-auth --------------------------------------------------------------------
-    api.register_command(MCP_COMMAND, mcp_command_descriptor());
-    surface.command_names.push(MCP_COMMAND.to_string());
-    api.register_command(MCP_AUTH_COMMAND, mcp_auth_command_descriptor());
-    surface.command_names.push(MCP_AUTH_COMMAND.to_string());
+    // Registered once per generation, by `init`. A live re-sync skips them: they do not vary with
+    // the discovered surface, so re-registering would be churn and a spurious `/` menu rebuild.
+    if api.register_fixed_commands() {
+        api.register_command(MCP_COMMAND.to_string(), mcp_command_descriptor());
+        surface.command_names.push(MCP_COMMAND.to_string());
+        api.register_command(MCP_AUTH_COMMAND.to_string(), mcp_auth_command_descriptor());
+        surface.command_names.push(MCP_AUTH_COMMAND.to_string());
+    }
 
     // --- syncDirectTools (MCP-212 / MCP-216) ----------------------------------------------------
     let direct_specs = if env_is_none_sentinel {
@@ -1994,27 +2147,43 @@ pub fn register_surface(
         resolve_direct_tools(config, cache.as_ref(), config.tool_prefix(), env_selectors.as_deref())
     };
     for spec in &direct_specs {
+        let fingerprint = direct_tool_fingerprint(spec);
+        // The fingerprint is recorded for EVERY resolved spec, registered or not: it is the
+        // extension's memory of what the model is currently shown, and a spec skipped because it
+        // is unchanged is still shown. Recording only the registered ones would make the next
+        // pass believe every skipped tool had gone away.
         surface
             .direct_tool_fingerprints
-            .insert(spec.prefixed_name.clone(), direct_tool_fingerprint(spec));
+            .insert(spec.prefixed_name.clone(), fingerprint.clone());
+        if !api.should_register_tool(&spec.prefixed_name, &fingerprint) {
+            continue;
+        }
         surface.tool_names.push(spec.prefixed_name.clone());
         api.register_tool(Arc::new(DirectTool::new(
             spec.clone(),
             render_kind,
             Arc::clone(&dispatch),
         )));
+        // MCP-036: declared HERE, beside the registration, rather than in a second loop the caller
+        // runs. A tool registered on the LATE path has no caller loop — the same pass is the whole
+        // registration — so a renderer declared anywhere else would silently not exist for it.
+        api.register_tool_renderer(spec.prefixed_name.clone());
     }
 
     // --- syncProxyTool (MCP-213 / MCP-218 / MCP-247) --------------------------------------------
     if should_register_proxy_tool(config, cache.as_ref(), &direct_specs, missing_override) {
         let description = build_proxy_description(config, cache.as_ref(), &direct_specs);
-        api.register_tool(Arc::new(ProxyTool::new(
-            description.clone(),
-            render_kind,
-            Arc::clone(&dispatch),
-        )));
-        surface.tool_names.push(PROXY_TOOL_NAME.to_string());
-        surface.proxy_description = Some(description);
+        // Recorded before the gate, for the same reason the fingerprints are.
+        surface.proxy_description = Some(description.clone());
+        if api.should_register_proxy(&description) {
+            api.register_tool(Arc::new(ProxyTool::new(
+                description.clone(),
+                render_kind,
+                Arc::clone(&dispatch),
+            )));
+            api.register_tool_renderer(PROXY_TOOL_NAME.to_string());
+            surface.tool_names.push(PROXY_TOOL_NAME.to_string());
+        }
     }
 
     surface.direct_tools = direct_specs;
@@ -2810,7 +2979,12 @@ mod tests {
         let dirs = McpDirs::new(agent_dir, temp.path().to_path_buf());
 
         let mut api = InitApi::new();
-        let surface = register_surface(&mut api, &dirs, &config_of(&[("s", entry(true))]));
+        let surface = register_surface(
+            &mut api,
+            &dirs,
+            &config_of(&[("s", entry(true))]),
+            Arc::new(ToolDispatch::default()),
+        );
 
         assert!(surface.direct_tools.is_empty(), "a corrupt cache means no direct tools");
         assert_eq!(surface.tool_names, vec![PROXY_TOOL_NAME.to_string()]);
@@ -2851,7 +3025,8 @@ mod tests {
         let dirs = McpDirs::new(agent_dir, temp.path().to_path_buf());
 
         let mut api = InitApi::new();
-        let surface = register_surface(&mut api, &dirs, &config);
+        let surface =
+            register_surface(&mut api, &dirs, &config, Arc::new(ToolDispatch::default()));
 
         assert_eq!(
             surface.tool_names,

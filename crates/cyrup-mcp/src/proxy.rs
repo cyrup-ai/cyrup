@@ -4300,18 +4300,23 @@ pub struct McpTool {
 impl McpTool {
     /// Construct the tool with a description produced by [`build_proxy_description`].
     ///
-    /// **MCP-193 / `HA-1`**: the description is frozen here because
+    /// **MCP-193 / `HA-1`**: the description is frozen *per instance* because
     /// `Tool::description(&self) -> &str` returns a *borrowed* `&str`, so an `RwLock` cannot satisfy
-    /// the signature without leaking. Re-registration is the mechanism upstream uses
-    /// (`syncProxyTool` → `pi.registerTool`), and cyrup's equivalent —
-    /// `ExtensionHost::register_late_tool` → `refresh_tools` →
-    /// `AgentSession::{refresh_extension_tools, push_active_tools}` — is complete and reaches a live
-    /// agent at every turn boundary; what a *native* extension lacks is the handle. Until it has
-    /// one, a cold `mcp-cache.json` means the first session's description names no servers and
-    /// `mcp({connect:"x"})` cannot refresh it within that session. Every mode still functions and
-    /// the next session is correct — that is scheduling, not severity. It also means
-    /// `settings.disableProxyTool` must be treated as unsupported until then, because hiding a tool
-    /// you cannot re-register is one-way.
+    /// the signature without leaking. That is not a limitation, because re-registration — not
+    /// mutation — is the mechanism upstream uses (`syncProxyTool` → `pi.registerTool`), and it now
+    /// exists here too: `McpExtension::sync_tool_surface` re-runs the resolution pass through
+    /// `LateRegistrar` → `ExtensionHost::register_late_tool` → `refresh_tools` →
+    /// `AgentSession::{refresh_extension_tools, push_active_tools}`, minting a FRESH `McpTool` with
+    /// the new description and reaching the live agent at the next turn boundary.
+    ///
+    /// `syncProxyTool`'s description comparison is honoured by the sink's `should_register_proxy`,
+    /// so an unchanged description does not re-register and does not invalidate the provider's
+    /// prompt-cache prefix.
+    ///
+    /// HISTORICAL, and no longer true: this doc used to record that a cold `mcp-cache.json` left
+    /// the first session's description naming no servers with no way to refresh it, and that
+    /// `settings.disableProxyTool` therefore had to be treated as unsupported because hiding a tool
+    /// you cannot re-register is one-way. Both followed from the missing handle, which HA-1 supplies.
     #[must_use]
     pub fn new(description: String, settings: &McpSettings, gate: Arc<ProxyInitGate>) -> Self {
         let render_kind = match settings.tool_result_rendering() {
