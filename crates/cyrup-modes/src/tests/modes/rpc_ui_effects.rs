@@ -37,8 +37,8 @@ async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
 
     // notify → `{method:"notify", message, notifyType}` (rpc-mode.ts:149-157). None of these calls
     // block: `HostServices::notify` is a plain sync fire-and-forget send, called directly (no
-    // `spawn_blocking` needed, unlike the blocking `confirm`/`input`/`select`/`editor` dialogs in
-    // `rpc_ui_dialogs`).
+    // `spawn_blocking` needed, unlike the blocking `confirm`/`input`/`select`/`editor` half of the
+    // capability, whose transport `rpc_ui_dialogs` exercises).
     host_services.notify("careful now", NotifyKind::Warning);
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["type"], "extension_ui_request");

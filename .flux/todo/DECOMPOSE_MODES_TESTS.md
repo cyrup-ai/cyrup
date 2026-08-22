@@ -1,7 +1,7 @@
 ---
-stage: qa
-status: needs-rework
-updated: 2026-08-22 17:50
+stage: exec
+status: done
+updated: 2026-08-22 18:00
 ---
 
 # modes.rs comment rework — one line left
