@@ -1,7 +1,7 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 06:00
+updated: 2026-08-22 18:28
 ---
 
 # Fix The 961 rustdoc Warnings
@@ -63,6 +63,36 @@ deliberate cross-references in explanatory docs.
 Suggest working crate-by-crate, largest first, so progress is measurable. Consider
 `#![warn(rustdoc::broken_intra_doc_links)]` and a CI gate once the count is near zero — otherwise
 it grows straight back.
+
+## DECISION (recorded 2026-08-22) — plain code spans, with one deterministic carve-out
+
+The maintainer delegated the policy call for the 442 `public documentation for X links to private
+item Y` warnings. It goes to **turning those links into plain code spans**, applied uniformly.
+
+Why not promote the items to `pub`: it would grow the public API of 14 crates for a formatting
+reason, and every promoted item becomes something downstream can depend on and that the next
+refactor has to keep. cyrup-core is the worked example — its five warnings are all links to the
+`de_*` content deserializers, which are private **on purpose**; the crate's own docs explain that
+they exist to be named by serde attributes, not called. Promoting them to satisfy rustdoc would
+invert a deliberate design decision to silence a lint.
+
+Why not case-by-case: the task itself warns against it, and 442 individual judgment calls across 14
+crates will not come out consistent.
+
+**The one carve-out, stated as a rule rather than a judgment** so it stays uniform: if the linked
+item is already publicly reachable by another path — re-exported at the crate root, or `pub` in a
+private module that is itself re-exported — then the link is not wrong, only mis-addressed. Fix the
+path to the public one instead of downgrading it to a code span. This is deterministic (either a
+public path exists or it does not), so it does not reopen the case-by-case debate.
+
+**Order of work.** Do the 494 `unresolved link` warnings FIRST, as the task says. They are the ones
+that make docs actively wrong — a doc naming an API that does not exist, like the recorded
+`ToolCall::is_cancelled`. The 442 private-item links are cosmetic by comparison: they point at
+something real that the reader merely cannot click.
+
+**Regrowth gate.** After the sweep, add `#![warn(rustdoc::private_intra_doc_links)]` plus
+`#![warn(rustdoc::broken_intra_doc_links)]` at each crate root and a `cargo doc --workspace
+--no-deps` CI step, so the count cannot climb back.
 
 ## Acceptance Criteria
 
