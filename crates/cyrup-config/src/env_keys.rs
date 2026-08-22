@@ -6,19 +6,57 @@
 
 use std::collections::HashMap;
 
-/// Lookup a provider-scoped value, falling back to the process environment, treating empty as unset
+/// The ambient tier consulted by [`provider_env_value`] when the scoped overlay does not supply a
+/// value: the real process environment in production, a fixed map under test.
+///
+/// This seam exists because without it the overlay is only half a seam. `provider_env_value` is
+/// `env?.[name] || process.env[name]` (Pi `getProviderEnvValue`), so an overlay can only ever ADD a
+/// value — it cannot express "this var is unset", and every assertion that a var is absent silently
+/// became an assertion about the machine running the suite. That is not hypothetical: it is why
+/// `bedrock_ambient_credentials_sentinel` failed on any host with ambient `AWS_SECRET_ACCESS_KEY`,
+/// and why `find_and_get_from_scoped_env_map` had to read the ambient value and assert agreement
+/// with it instead of asserting the contract. This crate is `#![forbid(unsafe_code)]` and
+/// `std::env::remove_var` is unsafe in Rust 2024, so the ambient value cannot be scrubbed
+/// in-process — it has to be injectable instead.
+///
+/// `cyrup-provider`'s twin of this module already gets exactly this seam from
+/// [`AuthContext::env`](cyrup_provider::auth::types::AuthContext), which is why its
+/// `bedrock_ambient_credentials_detected` is hermetic where this module's was not. Same shape,
+/// same precedence — overlay first, then ambient, empty treated as unset at both tiers.
+#[derive(Clone, Copy)]
+enum Ambient<'a> {
+    /// Production: read the real process environment.
+    Process,
+    /// Test: read a fixed map, so "unset" is a property of the fixture, not of the host.
+    /// Only ever constructed under `cfg(test)` — production always resolves through
+    /// [`Self::Process`], so this carries no runtime cost and changes no shipped behavior.
+    #[cfg_attr(not(test), allow(dead_code))]
+    Fixed(&'a HashMap<String, String>),
+}
+
+impl Ambient<'_> {
+    fn get(self, name: &str) -> Option<String> {
+        match self {
+            Self::Process => std::env::var(name).ok().filter(|v| !v.is_empty()),
+            Self::Fixed(map) => map.get(name).filter(|v| !v.is_empty()).cloned(),
+        }
+    }
+}
+
+/// Lookup a provider-scoped value, falling back to the ambient environment, treating empty as unset
 /// (Pi `getProviderEnvValue`). `env` is an optional override map (used in tests / scoped configs).
-fn provider_env_value(name: &str, env: Option<&HashMap<String, String>>) -> Option<String> {
+fn provider_env_value(
+    name: &str,
+    env: Option<&HashMap<String, String>>,
+    ambient: Ambient<'_>,
+) -> Option<String> {
     if let Some(map) = env
         && let Some(v) = map.get(name)
         && !v.is_empty()
     {
         return Some(v.clone());
     }
-    match std::env::var(name) {
-        Ok(v) if !v.is_empty() => Some(v),
-        _ => None,
-    }
+    ambient.get(name)
 }
 
 /// Canonical API-key env-var name(s) for a provider (Pi `getApiKeyEnvVars`, :64-110). `None` for
@@ -90,18 +128,26 @@ pub fn api_key_env_vars(provider: &str) -> Option<&'static [&'static str]> {
 /// Find the configured env-var name(s) that can supply an API key for `provider` (Pi `findEnvKeys`,
 /// :119-127). Only reports actual key vars (excludes ambient AWS/ADC sources). `None` when none set.
 pub fn find_env_keys(provider: &str, env: Option<&HashMap<String, String>>) -> Option<Vec<String>> {
+    find_env_keys_in(provider, env, Ambient::Process)
+}
+
+fn find_env_keys_in(
+    provider: &str,
+    env: Option<&HashMap<String, String>>,
+    ambient: Ambient<'_>,
+) -> Option<Vec<String>> {
     let vars = api_key_env_vars(provider)?;
     let found: Vec<String> = vars
         .iter()
-        .filter(|v| provider_env_value(v, env).is_some())
+        .filter(|v| provider_env_value(v, env, ambient).is_some())
         .map(|v| v.to_string())
         .collect();
     if found.is_empty() { None } else { Some(found) }
 }
 
 /// Whether the default Vertex ADC credentials file exists (Pi `hasVertexAdcCredentials`, :31-62).
-fn has_vertex_adc_credentials(env: Option<&HashMap<String, String>>) -> bool {
-    if let Some(explicit) = provider_env_value("GOOGLE_APPLICATION_CREDENTIALS", env) {
+fn has_vertex_adc_credentials(env: Option<&HashMap<String, String>>, ambient: Ambient<'_>) -> bool {
+    if let Some(explicit) = provider_env_value("GOOGLE_APPLICATION_CREDENTIALS", env, ambient) {
         return std::path::Path::new(&explicit).exists();
     }
     let home = directories::BaseDirs::new()
@@ -120,31 +166,39 @@ fn has_vertex_adc_credentials(env: Option<&HashMap<String, String>>) -> bool {
 /// Get an API key for `provider` from known env vars (Pi `getEnvApiKey`, :136-177). Returns the
 /// sentinel `"<authenticated>"` for Vertex/Bedrock when their ambient credentials are configured.
 pub fn get_env_api_key(provider: &str, env: Option<&HashMap<String, String>>) -> Option<String> {
-    if let Some(keys) = find_env_keys(provider, env)
+    get_env_api_key_in(provider, env, Ambient::Process)
+}
+
+fn get_env_api_key_in(
+    provider: &str,
+    env: Option<&HashMap<String, String>>,
+    ambient: Ambient<'_>,
+) -> Option<String> {
+    if let Some(keys) = find_env_keys_in(provider, env, ambient)
         && let Some(first) = keys.first()
     {
-        return provider_env_value(first, env);
+        return provider_env_value(first, env, ambient);
     }
 
     if provider == "google-vertex" {
-        let has_credentials = has_vertex_adc_credentials(env);
-        let has_project = provider_env_value("GOOGLE_CLOUD_PROJECT", env).is_some()
-            || provider_env_value("GCLOUD_PROJECT", env).is_some();
-        let has_location = provider_env_value("GOOGLE_CLOUD_LOCATION", env).is_some();
+        let has_credentials = has_vertex_adc_credentials(env, ambient);
+        let has_project = provider_env_value("GOOGLE_CLOUD_PROJECT", env, ambient).is_some()
+            || provider_env_value("GCLOUD_PROJECT", env, ambient).is_some();
+        let has_location = provider_env_value("GOOGLE_CLOUD_LOCATION", env, ambient).is_some();
         if has_credentials && has_project && has_location {
             return Some("<authenticated>".to_string());
         }
     }
 
     if provider == "amazon-bedrock" {
-        let has_aws_keys = provider_env_value("AWS_ACCESS_KEY_ID", env).is_some()
-            && provider_env_value("AWS_SECRET_ACCESS_KEY", env).is_some();
-        if provider_env_value("AWS_PROFILE", env).is_some()
+        let has_aws_keys = provider_env_value("AWS_ACCESS_KEY_ID", env, ambient).is_some()
+            && provider_env_value("AWS_SECRET_ACCESS_KEY", env, ambient).is_some();
+        if provider_env_value("AWS_PROFILE", env, ambient).is_some()
             || has_aws_keys
-            || provider_env_value("AWS_BEARER_TOKEN_BEDROCK", env).is_some()
-            || provider_env_value("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", env).is_some()
-            || provider_env_value("AWS_CONTAINER_CREDENTIALS_FULL_URI", env).is_some()
-            || provider_env_value("AWS_WEB_IDENTITY_TOKEN_FILE", env).is_some()
+            || provider_env_value("AWS_BEARER_TOKEN_BEDROCK", env, ambient).is_some()
+            || provider_env_value("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", env, ambient).is_some()
+            || provider_env_value("AWS_CONTAINER_CREDENTIALS_FULL_URI", env, ambient).is_some()
+            || provider_env_value("AWS_WEB_IDENTITY_TOKEN_FILE", env, ambient).is_some()
         {
             return Some("<authenticated>".to_string());
         }
@@ -265,24 +319,26 @@ mod tests {
             Some("sk-openai")
         );
         // An empty scoped map does NOT mean "unset": `provider_env_value` falls back to the
-        // process environment, faithfully to Pi's `getProviderEnvValue`, which is
+        // ambient environment, faithfully to Pi's `getProviderEnvValue`, which is
         // `env?.[name] || process.env[name] || …` (`ai/src/utils/provider-env.ts:44-52`).
-        // Asserting `None` here asserted a property of the shell the suite happened to run in —
-        // it passed only while nothing set `OPENAI_API_KEY`, and failed the moment something did.
-        // Assert the fallback agreement instead, which is hermetic and pins the ported contract.
         //
-        // This crate is `#![forbid(unsafe_code)]` and `std::env::remove_var` is unsafe in Rust
-        // 2024, so the test cannot scrub the ambient value — reading it is safe and sufficient.
+        // This used to read the real `OPENAI_API_KEY` and assert the two agreed, because the
+        // ambient tier was hardcoded to the process env and could not be scrubbed (this crate is
+        // `#![forbid(unsafe_code)]` and `std::env::remove_var` is unsafe in Rust 2024). That made
+        // the assertion tautological whenever the var was set. With [`Ambient`] injectable the
+        // fallback is pinned directly, against a fixture rather than against the host.
         let empty = env_of(&[]);
-        let ambient = std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|v| !v.is_empty());
+        let ambient_map = env_of(&[("OPENAI_API_KEY", "sk-ambient")]);
+        let ambient = Ambient::Fixed(&ambient_map);
         assert_eq!(
-            find_env_keys("openai", Some(&empty)),
-            ambient.as_ref().map(|_| vec!["OPENAI_API_KEY".to_string()]),
-            "an empty scoped map must defer to the process env, not report unset"
+            find_env_keys_in("openai", Some(&empty), ambient),
+            Some(vec!["OPENAI_API_KEY".to_string()]),
+            "an empty scoped map must defer to the ambient env, not report unset"
         );
-        assert_eq!(get_env_api_key("openai", Some(&empty)), ambient);
+        assert_eq!(
+            get_env_api_key_in("openai", Some(&empty), ambient).as_deref(),
+            Some("sk-ambient")
+        );
     }
 
     #[test]
@@ -300,12 +356,54 @@ mod tests {
 
     #[test]
     fn bedrock_ambient_credentials_sentinel() {
+        // Pinned against an EMPTY ambient tier, so "missing secret" is a property of the fixture.
+        // Read against the real process env this asserted a property of the host: any machine with
+        // an ambient `AWS_SECRET_ACCESS_KEY` (every developer with AWS creds, and this project's
+        // own CI container) completed the IAM pair through the `||` fallback and got the sentinel
+        // where the test demanded `None`.
+        let none = env_of(&[]);
+        let ambient = Ambient::Fixed(&none);
+
         let env = env_of(&[("AWS_PROFILE", "default")]);
         assert_eq!(
-            get_env_api_key("amazon-bedrock", Some(&env)).as_deref(),
+            get_env_api_key_in("amazon-bedrock", Some(&env), ambient).as_deref(),
             Some("<authenticated>")
         );
         let env = env_of(&[("AWS_ACCESS_KEY_ID", "id")]); // missing secret → not authenticated
-        assert_eq!(get_env_api_key("amazon-bedrock", Some(&env)), None);
+        assert_eq!(get_env_api_key_in("amazon-bedrock", Some(&env), ambient), None);
+        // …and the pair completed is authenticated, which the old shape could not distinguish
+        // from the ambient leak above.
+        let env = env_of(&[("AWS_ACCESS_KEY_ID", "id"), ("AWS_SECRET_ACCESS_KEY", "sec")]);
+        assert_eq!(
+            get_env_api_key_in("amazon-bedrock", Some(&env), ambient).as_deref(),
+            Some("<authenticated>")
+        );
+    }
+
+    /// The ambient tier is consulted only when the overlay does not supply the value, and an
+    /// injected ambient behaves exactly like the process env would (Pi `env?.[n] || process.env[n]`).
+    #[test]
+    fn overlay_wins_over_ambient_and_empty_overlay_defers_to_it() {
+        let ambient_map = env_of(&[("OPENAI_API_KEY", "sk-ambient")]);
+        let ambient = Ambient::Fixed(&ambient_map);
+
+        // Overlay present and non-empty → overlay wins.
+        let overlay = env_of(&[("OPENAI_API_KEY", "sk-overlay")]);
+        assert_eq!(
+            get_env_api_key_in("openai", Some(&overlay), ambient).as_deref(),
+            Some("sk-overlay")
+        );
+        // Overlay empty-valued → falls through to ambient (JS `||` skips empty strings).
+        let overlay = env_of(&[("OPENAI_API_KEY", "")]);
+        assert_eq!(
+            get_env_api_key_in("openai", Some(&overlay), ambient).as_deref(),
+            Some("sk-ambient")
+        );
+        // Nothing anywhere → genuinely unset, now assertable without consulting the host.
+        let empty = env_of(&[]);
+        assert_eq!(
+            get_env_api_key_in("openai", Some(&empty), Ambient::Fixed(&empty)),
+            None
+        );
     }
 }

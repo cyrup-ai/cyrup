@@ -69,7 +69,7 @@ use crate::config::{
     ServerProvenance, SourceId, SourceKind, ToolPrefix,
 };
 use crate::dirs::{
-    compute_server_hash, CachedTool, MetadataCache, ResolvedIdentity, ServerCacheEntry,
+    CachedTool, MetadataCache, ServerCacheEntry,
     CACHE_MAX_AGE_MS,
 };
 use crate::onboarding::OnboardingState;
@@ -1428,17 +1428,17 @@ pub trait McpPanelCallbacks: Send + Sync + 'static {
 
 /// `computeServerHash(definition)` as an injectable seam.
 ///
-/// The digest's five identity fields go through resolvers (`resolveServerUrl` can **throw**, which
-/// upstream maps to "this cache entry is invalid") that this module does not own, so the panel is
-/// handed the function rather than calling it. `None` falls back to
-/// [`ResolvedIdentity::verbatim`], which is correct only for a definition with no interpolation
-/// token, no tilde and no secret marker.
+/// The digest's six identity fields go through resolvers (`resolveServerUrl` can **throw**, which
+/// upstream maps to "this cache entry is invalid"), so the panel is handed the function rather than
+/// calling it — a caller with its own `home` or its own environment can substitute one. `None` is
+/// [`crate::registration::default_server_hasher`], the crate's real digest with the throw expressed
+/// as `None` (MCP-141, MCP-145).
 pub type ServerHashFn = Arc<dyn Fn(&ServerEntry) -> Option<String> + Send + Sync>;
 
 /// Construction inputs that are not the config, the cache or the provenance map.
 ///
 /// The derived `Default` is upstream's `options = {}` arm: no notice lines, not `authOnly`, the
-/// no-manager key defaults, and the verbatim hasher.
+/// no-manager key defaults, and the crate's own hasher.
 #[derive(Default)]
 pub struct PanelOptions {
     /// `options.noticeLines` — the shared-config notice, rendered under the search row.
@@ -1449,11 +1449,10 @@ pub struct PanelOptions {
     pub keys: PanelKeys,
     /// `computeServerHash(definition)`, which `isServerCacheValid` compares `configHash` against.
     ///
-    /// Injected rather than called directly because the hash's five identity fields go through
-    /// resolvers (`resolveServerUrl` can **throw**, which upstream maps to "invalid cache") that
-    /// this module does not own. `None` falls back to
-    /// [`ResolvedIdentity::verbatim`], which is correct only for definitions with no interpolation
-    /// token, no tilde and no secret marker.
+    /// Injected rather than called directly because the hash's six identity fields go through
+    /// resolvers (`resolveServerUrl` can **throw**, which upstream maps to "invalid cache").
+    /// `None` is [`crate::registration::default_server_hasher`] — the real digest, resolvers and
+    /// all (MCP-141, MCP-145).
     pub server_hash: Option<ServerHashFn>,
 }
 
@@ -1753,9 +1752,15 @@ impl McpPanelModel {
     /// `cache?.servers?.[name]` **only if** `isServerCacheValid(entry, definition)`.
     fn valid_entry(&self, server_name: &str, definition: &ServerEntry) -> Option<&ServerCacheEntry> {
         let entry = self.cache.as_ref()?.servers.get(server_name)?;
+        // MCP-141 leg (b): the `None` arm used to be `ResolvedIdentity::verbatim`, which resolves
+        // nothing — so a panel opened against a server whose `env`/`headers`/`url`/`bearerToken`
+        // carries a `${VAR}`, a `~`-prefixed `cwd`, or a `!!` escape computed a digest the writer
+        // never stamps, and every such server rendered as having no cached data. The default now
+        // runs the real resolvers, and its `Option` carries `resolveServerUrl`'s throw the same way
+        // an injected hasher's does.
         let hash = match self.server_hash.as_ref() {
             Some(hasher) => hasher(definition)?,
-            None => compute_server_hash(definition, &ResolvedIdentity::verbatim(definition)),
+            None => crate::registration::default_server_hasher(definition)?,
         };
         crate::dirs::is_server_cache_valid(entry, &hash, CACHE_MAX_AGE_MS).then_some(entry)
     }
@@ -5045,9 +5050,15 @@ mod tests {
     }
 
     /// A cache entry whose `configHash` matches `definition`, so `isServerCacheValid` accepts it.
+    ///
+    /// Stamped with the same [`crate::registration::default_server_hasher`] the panel's `None`
+    /// hasher arm now calls, rather than with a `ResolvedIdentity::verbatim` digest that happened
+    /// to agree for these token-free fixtures — so the fixture cannot drift away from the predicate
+    /// it is meant to satisfy.
     fn valid_cache_entry(definition: &ServerEntry, tools: &[&str]) -> ServerCacheEntry {
         ServerCacheEntry {
-            config_hash: compute_server_hash(definition, &ResolvedIdentity::verbatim(definition)),
+            config_hash: crate::registration::default_server_hasher(definition)
+                .expect("no url, so the hash cannot throw"),
             tools: tools
                 .iter()
                 .map(|name| CachedTool {

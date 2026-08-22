@@ -9,6 +9,11 @@
 //! * `uiResourceHandler`, `consentManager`, `uiServer`, `completedUiSessions` — all **Cut 2**
 //!   (MCP Apps / the UI extension, entirely).
 //!
+//! One field is **added**: [`McpState::human_wait_ctx`], which has no upstream counterpart because
+//! the mechanism it feeds (the dispatcher's invocation budget, MCP-471) has no upstream
+//! counterpart either. It is documented as field 21 and marked as cyrup-only at its definition so
+//! the twenty/25 accounting above stays checkable.
+//!
 //! # Shape: one `Arc<McpState>`, interior mutability per field
 //!
 //! Upstream is a mutable JavaScript record captured by a dozen closures, mutated freely because the
@@ -126,6 +131,24 @@ pub struct McpState {
     /// **no consumer for that exists in cyrup**, so the snapshot stays an in-crate
     /// [`tokio::sync::watch`] rather than inventing a bus topic nothing reads.
     pub status_events: watch::Sender<McpStatusSnapshot>,
+    /// 21 · **Not one of `McpExtensionState`'s fields** — a cyrup-only slot MCP-471 needs.
+    ///
+    /// The last [`cyrup_ext::HostCtx`] this extension was dispatched with, recorded so a consent
+    /// dialog opened later — from `Tool::execute`, or from an rmcp background task — can still take
+    /// the `#[must_use]` [`cyrup_ext::HostCtx::begin_human_wait`] guard. There is no other route to
+    /// one: `HumanWaitGate::begin` is private to `cyrup-ext` and reachable only through a ctx, and
+    /// neither `cyrup_core::Tool::execute` nor `rmcp::ClientHandler` carries one.
+    ///
+    /// Storing a ctx and using it after its dispatch returned is sound because the field that
+    /// matters is shared, not per-dispatch: `NativeHandle::dispatch_ctx` clones one stable base ctx
+    /// per call, so every clone carries the **same** `Arc<HumanWaitGate>` — the very one
+    /// `Extension::human_wait_gate` hands the dispatcher's watchdog. The rich fields
+    /// (`model`, `is_idle`, the context-usage snapshot) go stale in a stored clone and are
+    /// deliberately never read through this slot.
+    ///
+    /// Written by [`Self::set_human_wait_ctx`] from `McpExtension::on_event`; read by
+    /// [`Self::dialog`].
+    pub human_wait_ctx: Mutex<Option<cyrup_ext::HostCtx>>,
 }
 
 /// The collaborators [`McpState::new`] cannot default — everything else it allocates itself, which
@@ -179,7 +202,32 @@ impl McpState {
             send_message: parts.send_message,
             on_tool_metadata_updated: Mutex::new(None),
             status_events,
+            human_wait_ctx: Mutex::new(None),
         }
+    }
+
+    /// Record the dispatch context whose P-3 gate a later consent dialog must signal through
+    /// (MCP-471). Idempotent and cheap — every handler ctx of one native handle shares the one
+    /// `HumanWaitGate`, so overwriting the slot never changes which gate is signalled.
+    ///
+    /// A poisoned lock degrades to "not recorded", which costs the budget forgiveness and nothing
+    /// else; it must never fail an event dispatch.
+    pub fn set_human_wait_ctx(&self, ctx: &cyrup_ext::HostCtx) {
+        if let Ok(mut slot) = self.human_wait_ctx.lock() {
+            *slot = Some(ctx.clone());
+        }
+    }
+
+    /// The one constructor for a human dialog in this crate (MCP-471): the generation's **fenced**
+    /// services handle plus the recorded P-3 context.
+    ///
+    /// `None` is upstream's `!state.ui` — a headless generation, which every consent gate must read
+    /// as "cannot ask", never as "approved".
+    #[must_use]
+    pub fn dialog(&self) -> Option<crate::owner::McpDialog> {
+        let ui = self.ui.as_ref()?;
+        let ctx = self.human_wait_ctx.lock().ok().and_then(|slot| slot.clone());
+        Some(crate::owner::McpDialog::fenced(ui).with_human_wait(ctx))
     }
 
     /// `publishMcpStatusSnapshot(state)` — into the in-crate watch channel. A `watch` send with no
@@ -285,16 +333,14 @@ impl std::fmt::Debug for McpState {
 // =================================================================================================
 
 /// `server-manager.ts`'s `McpServerManager`: the connection table, the five race guards, the
-/// generation fencing, transport construction and `withSessionRecovery`.
+/// generation fencing and the teardown.
 ///
-/// **Forward declaration (13c / MCP-091…MCP-140 replace it with `pub use crate::manager::…`).**
-#[derive(Debug, Default)]
-#[non_exhaustive]
-pub struct McpServerManager {
-    /// The session working directory `new McpServerManager(cwd)` is constructed with — the base
-    /// every `resolveConfigPath` resolves against.
-    pub cwd: std::path::PathBuf,
-}
+/// **Landed by 13c (MCP-100 / MCP-116 / MCP-125 / MCP-126 / MCP-131 / MCP-134).** The forward
+/// declaration is gone; `crate::state::McpServerManager` stays a valid path for everything already
+/// written against it, and now names the real manager. What it does *not* yet own is
+/// `createConnection` itself — that is the [`crate::server_manager::ConnectionFactory`] seam, and
+/// the units behind it (MCP-101/103/114/115/119) are still open.
+pub use crate::server_manager::McpServerManager;
 
 /// `oauth.ts`'s `createOAuthRuntime(signal)`: the flow registry, its own generation counter and the
 /// four in-flight maps.

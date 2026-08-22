@@ -100,6 +100,7 @@
 //! | [`agent_plugin`] | `agent-plugin-loader.ts` | the sandboxed third-party plugin translator |
 //! | [`dirs`] | `agent-dir.ts` | `<agent_dir>` and every adapter-owned path under it |
 //! | [`onboarding`] | `onboarding-state.ts` | `<agent_dir>/mcp-onboarding.json` |
+//! | [`secrets`] | `utils.ts` | `${VAR}` interpolation and the `!`/`!!` command-secret grammar |
 //! | [`request_headers_command`] | `request-headers-command.ts` | per-request HTTP header commands (v2.26.0) |
 //!
 //! Cut 2 adds the five modules that make that surface *do* something — the gateway tool, the
@@ -144,6 +145,8 @@ pub mod registration;
 pub mod request_headers_command;
 pub mod renderers;
 pub mod runtime;
+pub mod secrets;
+pub mod server_manager;
 pub mod state;
 pub mod ui;
 
@@ -165,6 +168,14 @@ pub use oauth::{
     get_valid_token, has_pending_auth, initialize_oauth, remove_auth, shutdown_oauth, start_auth,
     supports_oauth, AuthStatus, AuthenticateOptions, HttpAuthProviderState, McpOAuthRuntime,
     McpOAuthStorage,
+};
+/// Environment interpolation and the `!`/`!!` command-secret grammar (13b, MCP-082/MCP-083) —
+/// `utils.ts`. `resolve_command_secret` is the ONLY function in the crate that spawns a shell for a
+/// configured value, and it is reachable only from a connect/auth path; every other caller wants
+/// `interpolate_env_record`, which unescapes `!!` and leaves `!` unexecuted.
+pub use secrets::{
+    interpolate_env_record, resolve_command_secret, resolve_command_secrets_record, resolve_env,
+    resolve_http_secrets, resolve_stdio_env, ResolvedHttpSecrets,
 };
 /// The `mcp` gateway tool and its nine modes (13d) — `proxy-modes.ts` / `mcp-tool.ts`.
 pub use proxy::{McpErrorCode, McpTool, ProxyCtx, ProxyEnv, MCP_TOOL_NAME};

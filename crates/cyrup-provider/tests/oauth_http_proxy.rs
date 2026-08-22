@@ -141,7 +141,18 @@ async fn prov047_an_oauth_token_refresh_routes_through_the_configured_http_proxy
     let _restore = ClearOnDrop;
     cyrup_provider::stream::sse::configure_http_proxy(Some(proxy_url));
 
-    let flow = AnthropicOAuth::with_endpoints(&authorize_url, &token_url, "127.0.0.1", 0);
+    // Pin `no_proxy` for this refresh instead of inheriting the host's. The token endpoint is
+    // necessarily loopback (the dead port above), and the ported resolver honors `no_proxy` for the
+    // hop — correctly, and 1:1 with Pi. So on any machine whose ambient `no_proxy` exempts loopback
+    // (Debian's default and this project's CI container both list `127.0.0.1`) the resolver declined
+    // to proxy, the client connected straight to the dead port, and the assertions below were
+    // reading the developer's shell rather than PROV-047. A non-empty overlay wins over the ambient
+    // value, so naming a host that is NOT the target pins "nothing here is exempt" hermetically.
+    let mut env = cyrup_provider::ProviderEnv::new();
+    env.insert("no_proxy".to_string(), "never-matches.invalid".to_string());
+
+    let flow =
+        AnthropicOAuth::with_endpoints(&authorize_url, &token_url, "127.0.0.1", 0).with_env(env);
     let credential = flow
         .refresh_token("stored-refresh-token")
         .await
