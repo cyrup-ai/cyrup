@@ -25,8 +25,8 @@ tasks as you like and work them in any order. Existing files are listed for cont
 offer to delete, move or back them up, and do not treat a non-empty `todo/` as a problem to resolve
 before continuing.
 
-Draining the queue is `/qa`'s job — it moves a finished task to `$FLUX_BASE/done/<session>/`.
-Nothing else removes a task file.
+Two other commands remove a task file, and neither is this one: `/qa` moves a finished task to
+`$FLUX_BASE/done/<session>/`, and `/split` replaces a task with its subtasks, deleting the original.
 
 ## STEP 2: Detect argument type
 
