@@ -1,7 +1,7 @@
 ---
-stage: aug
+stage: exec
 status: done
-updated: 2026-08-22 18:25
+updated: 2026-08-22 18:50
 ---
 
 # Tighten Visibility After the Bedrock Decomposition

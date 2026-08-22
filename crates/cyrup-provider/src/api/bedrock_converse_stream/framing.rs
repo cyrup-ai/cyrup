@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 /// One decoded event-stream message: its headers and its (JSON) payload.
 pub(super) struct EventFrame {
-    pub(super) headers: BTreeMap<String, String>,
-    pub(super) payload: Vec<u8>,
+    headers: BTreeMap<String, String>,
+    payload: Vec<u8>,
 }
 
 impl EventFrame {
@@ -27,12 +27,12 @@ impl EventFrame {
 /// silently interpreted, because the SDK would have rejected it.
 #[derive(Default)]
 pub(super) struct EventStreamDecoder {
-    pub(super) buffer: Vec<u8>,
+    buffer: Vec<u8>,
 }
 
 /// The largest frame accepted, guarding a corrupt length prefix from provoking a huge allocation.
 /// AWS's own limit for an event-stream message is 16 MiB.
-pub(super) const MAX_EVENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
+const MAX_EVENT_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 impl EventStreamDecoder {
     pub(super) fn push(&mut self, chunk: &[u8]) {
@@ -88,7 +88,7 @@ impl EventStreamDecoder {
 
 /// Read a big-endian `u32` at `offset`, or `None` when out of range (no indexing — the workspace
 /// denies `clippy::indexing_slicing`).
-pub(super) fn be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+fn be_u32(bytes: &[u8], offset: usize) -> Option<u32> {
     let slice = bytes.get(offset..offset + 4)?;
     let mut buf = [0u8; 4];
     for (dst, src) in buf.iter_mut().zip(slice.iter()) {

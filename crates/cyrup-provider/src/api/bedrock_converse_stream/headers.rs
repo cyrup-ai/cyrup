@@ -6,11 +6,11 @@ use crate::HeaderMap;
 use std::collections::BTreeMap;
 
 /// pi `RESERVED_HEADER_EXACT` (`bedrock-converse-stream.ts:373`).
-pub(super) const RESERVED_HEADER_EXACT: [&str; 2] = ["authorization", "host"];
+const RESERVED_HEADER_EXACT: [&str; 2] = ["authorization", "host"];
 
 /// pi `isReservedHeader` (`bedrock-converse-stream.ts:375-378`): case-insensitive, and every
 /// `x-amz-*` key is reserved because it participates in the SigV4 canonical request.
-pub(super) fn is_reserved_header(key: &str) -> bool {
+fn is_reserved_header(key: &str) -> bool {
     let lower = key.to_lowercase();
     lower.starts_with("x-amz-") || RESERVED_HEADER_EXACT.contains(&lower.as_str())
 }

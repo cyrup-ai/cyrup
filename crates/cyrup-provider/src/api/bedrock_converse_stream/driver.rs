@@ -30,12 +30,12 @@ use std::collections::BTreeMap;
 
 /// Response media type of `ConverseStream` — the AWS binary event stream the SDK decodes for
 /// upstream and [`EventStreamDecoder`] decodes here.
-pub(super) const EVENT_STREAM_MEDIA_TYPE: &str = "application/vnd.amazon.eventstream";
+const EVENT_STREAM_MEDIA_TYPE: &str = "application/vnd.amazon.eventstream";
 
 /// Retries after the first attempt on the Bedrock route. The AWS SDK v3 **standard** retry mode
 /// makes 3 attempts, and pi's client config (`bedrock-converse-stream.ts:150-222` @v0.83.0) never
 /// overrides `maxAttempts`/`retryStrategy`, so that is what pi inherits per turn (PROV-043).
-pub(super) const BEDROCK_STANDARD_MODE_RETRIES: u32 = 2;
+const BEDROCK_STANDARD_MODE_RETRIES: u32 = 2;
 
 /// pi's `stream()` try block (`bedrock-converse-stream.ts:222-303`).
 pub(super) async fn run_inner(

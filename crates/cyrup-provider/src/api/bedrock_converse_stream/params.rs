@@ -122,7 +122,7 @@ pub(super) fn resolve_cache_retention(
 }
 
 /// pi `buildAdditionalModelRequestFields` (`bedrock-converse-stream.ts:1039-1087`).
-pub(super) fn build_additional_model_request_fields(
+fn build_additional_model_request_fields(
     model: &Model,
     opts: &StreamOptions,
     bedrock: &BedrockOptions,
@@ -188,7 +188,7 @@ pub(super) fn build_additional_model_request_fields(
 /// The custom lookup uses the CLAMPED level (`xhigh`/`max` → `high`, because custom budgets only
 /// cover the token-based rungs) while the default table is keyed by the ORIGINAL level — which is
 /// why `xhigh` and `max` both default to 16384 rather than falling back to `high`'s entry.
-pub(super) fn default_thinking_budget(level: ThinkingLevel, opts: &StreamOptions) -> u64 {
+fn default_thinking_budget(level: ThinkingLevel, opts: &StreamOptions) -> u64 {
     let budgets = opts.thinking_budgets.as_ref();
     let custom = match level {
         ThinkingLevel::Minimal => budgets.and_then(|b| b.minimal),

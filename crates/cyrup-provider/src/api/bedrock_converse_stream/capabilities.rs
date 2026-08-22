@@ -10,7 +10,7 @@ use cyrup_core::ThinkingLevel;
 /// pi `getModelMatchCandidates` (`bedrock-converse-stream.ts:580-586`): for the model id and (when
 /// present) the model name, the lower-cased value plus the value with every run of `[\s_.:]`
 /// collapsed to a single `-`.
-pub(super) fn model_match_candidates(model: &Model) -> Vec<String> {
+fn model_match_candidates(model: &Model) -> Vec<String> {
     let mut values = vec![model.id.as_str().to_lowercase()];
     if !model.name.is_empty() {
         values.push(model.name.to_lowercase());
@@ -48,7 +48,7 @@ pub(super) fn supports_adaptive_thinking(model: &Model) -> bool {
 }
 
 /// pi `supportsNativeXhighEffort` (`bedrock-converse-stream.ts:602-612`).
-pub(super) fn supports_native_xhigh_effort(model: &Model) -> bool {
+fn supports_native_xhigh_effort(model: &Model) -> bool {
     const NEEDLES: [&str; 5] = ["opus-4-7", "opus-4-8", "opus-5", "sonnet-5", "fable-5"];
     let candidates = model_match_candidates(model);
     candidates

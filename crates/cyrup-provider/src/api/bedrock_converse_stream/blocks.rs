@@ -28,7 +28,7 @@ pub(super) enum Block {
 }
 
 impl Block {
-    pub(super) fn index(&self) -> i64 {
+    fn index(&self) -> i64 {
         match self {
             Block::Text { index, .. }
             | Block::Thinking { index, .. }
@@ -85,7 +85,7 @@ impl Decoder {
     }
 }
 
-pub(super) fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
+fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
     blocks
         .iter()
         .map(|b| match b {
@@ -119,7 +119,7 @@ pub(super) fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
 }
 
 /// Current unix time in milliseconds (0 on a clock error — never panics).
-pub(super) fn now_millis() -> i64 {
+fn now_millis() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))

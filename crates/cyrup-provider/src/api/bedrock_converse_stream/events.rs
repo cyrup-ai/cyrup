@@ -94,7 +94,7 @@ pub(super) async fn dispatch_frame(
 
 /// pi `handleContentBlockStart` (`bedrock-converse-stream.ts:451-472`). Only `toolUse` starts a
 /// block; text and reasoning blocks are created lazily by the first delta.
-pub(super) async fn handle_content_block_start(
+async fn handle_content_block_start(
     payload: &Value,
     dec: &mut Decoder,
     model: &Model,
@@ -131,7 +131,7 @@ pub(super) async fn handle_content_block_start(
 }
 
 /// pi `handleContentBlockDelta` (`bedrock-converse-stream.ts:474-530`).
-pub(super) async fn handle_content_block_delta(
+async fn handle_content_block_delta(
     payload: &Value,
     dec: &mut Decoder,
     model: &Model,
@@ -260,7 +260,7 @@ pub(super) async fn handle_content_block_delta(
 }
 
 /// pi `handleContentBlockStop` (`bedrock-converse-stream.ts:547-573`).
-pub(super) async fn handle_content_block_stop(
+async fn handle_content_block_stop(
     payload: &Value,
     dec: &mut Decoder,
     model: &Model,
@@ -307,7 +307,7 @@ pub(super) async fn handle_content_block_stop(
 }
 
 /// pi `handleMetadata` (`bedrock-converse-stream.ts:532-545`).
-pub(super) fn handle_metadata(payload: &Value, dec: &mut Decoder) {
+fn handle_metadata(payload: &Value, dec: &mut Decoder) {
     let Some(usage) = payload.get("usage") else {
         return;
     };

@@ -24,7 +24,7 @@ pub(super) const EMPTY_TEXT_PLACEHOLDER: &str = "<empty>";
 /// The `ttl` value is the SDK's `CacheTTL.ONE_HOUR`, whose wire form is Bedrock's `"1h"` — the same
 /// spelling Anthropic's own `cache_control.ttl` uses and which cyrup's `anthropic-messages` port
 /// already emits.
-pub(super) fn cache_point(cache_retention: CacheRetention) -> Value {
+fn cache_point(cache_retention: CacheRetention) -> Value {
     let mut point = Map::new();
     point.insert("type".to_string(), json!("default"));
     if cache_retention == CacheRetention::Long {
@@ -69,7 +69,7 @@ pub(super) fn normalize_tool_call_id(id: &str) -> String {
 }
 
 /// pi `createNonBlankTextBlock` (`bedrock-converse-stream.ts:737-740`).
-pub(super) fn non_blank_text_block(text: &str) -> Option<Value> {
+fn non_blank_text_block(text: &str) -> Option<Value> {
     let sanitized = sanitize_surrogates(text);
     if sanitized.trim().is_empty() {
         None
@@ -79,7 +79,7 @@ pub(super) fn non_blank_text_block(text: &str) -> Option<Value> {
 }
 
 /// pi `createRequiredTextBlock` (`bedrock-converse-stream.ts:742-744`).
-pub(super) fn required_text_block(text: &str) -> Value {
+fn required_text_block(text: &str) -> Value {
     non_blank_text_block(text).unwrap_or_else(|| json!({ "text": EMPTY_TEXT_PLACEHOLDER }))
 }
 
@@ -89,7 +89,7 @@ pub(super) fn required_text_block(text: &str) -> Value {
 /// re-encodes it as base64, so the bytes on the wire are the same. The decode is still performed
 /// here because it is the check that makes upstream's `atob` throw on a malformed payload, and the
 /// canonical re-encode normalises whitespace/padding the same way the SDK's serializer does.
-pub(super) fn create_image_block(mime_type: &str, data: &str) -> Result<Value, String> {
+fn create_image_block(mime_type: &str, data: &str) -> Result<Value, String> {
     let format = match mime_type {
         "image/jpeg" | "image/jpg" => "jpeg",
         "image/png" => "png",
@@ -105,7 +105,7 @@ pub(super) fn create_image_block(mime_type: &str, data: &str) -> Result<Value, S
 }
 
 /// pi `convertToolResultContent` (`bedrock-converse-stream.ts:746-758`).
-pub(super) fn convert_tool_result_content(content: &[Content]) -> Result<Vec<Value>, String> {
+fn convert_tool_result_content(content: &[Content]) -> Result<Vec<Value>, String> {
     let mut result = Vec::new();
     for c in content {
         match c {

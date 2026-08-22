@@ -10,7 +10,7 @@ use crate::stream::StreamOptions;
 /// The dummy credential pair upstream installs when `AWS_BEDROCK_SKIP_AUTH=1`
 /// (`bedrock-converse-stream.ts:186-189`).
 pub(super) const SKIP_AUTH_ACCESS_KEY: &str = "dummy-access-key";
-pub(super) const SKIP_AUTH_SECRET_KEY: &str = "dummy-secret-key";
+const SKIP_AUTH_SECRET_KEY: &str = "dummy-secret-key";
 
 /// Static AWS credentials (pi `BedrockRuntimeClientConfig["credentials"]`).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -155,7 +155,7 @@ pub(super) fn configured_bedrock_region(
 }
 
 /// pi `getConfiguredBedrockCredentials` (`bedrock-converse-stream.ts:988-1000`).
-pub(super) fn configured_bedrock_credentials(env: &EnvSource<'_>) -> Option<AwsCredentials> {
+fn configured_bedrock_credentials(env: &EnvSource<'_>) -> Option<AwsCredentials> {
     let access_key_id = env.get("AWS_ACCESS_KEY_ID")?;
     let secret_access_key = env.get("AWS_SECRET_ACCESS_KEY")?;
     Some(AwsCredentials {
@@ -193,7 +193,7 @@ pub(super) fn standard_bedrock_endpoint_region(base_url: &str) -> Option<String>
 }
 
 /// pi `shouldUseExplicitBedrockEndpoint` (`bedrock-converse-stream.ts:1016-1027`).
-pub(super) fn should_use_explicit_bedrock_endpoint(
+fn should_use_explicit_bedrock_endpoint(
     base_url: &str,
     configured_region: Option<&str>,
     has_ambient_profile: bool,
@@ -209,7 +209,7 @@ pub(super) fn should_use_explicit_bedrock_endpoint(
 ///
 /// `[CYRUP-DELTA]` hand-rolled for the same no-`regex` reason as above. Greedy scanning is exact
 /// here: both capture classes are terminated by a literal `:`, which is not in either class.
-pub(super) fn arn_region(model_id: &str) -> Option<String> {
+fn arn_region(model_id: &str) -> Option<String> {
     let rest = model_id.strip_prefix("arn:aws")?;
     // `(?:-[a-z0-9-]+)?` then `:bedrock:`.
     let rest = match rest.strip_prefix(':') {
@@ -278,7 +278,7 @@ pub(super) fn shared_profile_credentials(
 
 /// Extract `aws_access_key_id` / `aws_secret_access_key` / `aws_session_token` from one INI
 /// section. Returns `None` unless both required keys are present.
-pub(super) fn parse_ini_profile(text: &str, section: &str) -> Option<AwsCredentials> {
+fn parse_ini_profile(text: &str, section: &str) -> Option<AwsCredentials> {
     let mut in_section = false;
     let mut access_key_id: Option<String> = None;
     let mut secret_access_key: Option<String> = None;

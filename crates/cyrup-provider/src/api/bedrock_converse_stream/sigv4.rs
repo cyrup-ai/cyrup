@@ -5,7 +5,7 @@ use super::url::{uri_encode, url_authority, url_path};
 use std::collections::BTreeMap;
 
 /// The SigV4 service name for the Bedrock runtime endpoint.
-pub(super) const SIGV4_SERVICE: &str = "bedrock";
+const SIGV4_SERVICE: &str = "bedrock";
 
 /// HMAC-SHA256 (RFC 2104) over cyrup's dependency-free SHA-256
 /// ([`crate::auth::oauth::sha256`], itself written because the crate carries no hashing dependency).
@@ -64,7 +64,7 @@ pub(super) fn sigv4_timestamps(epoch_seconds: u64) -> (String, String) {
 
 /// Howard Hinnant's `civil_from_days`, the inverse of the `days_from_civil` cyrup already uses in
 /// [`crate::utils::http_date`].
-pub(super) fn civil_from_days(z: i64) -> (i64, u32, u32) {
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;
