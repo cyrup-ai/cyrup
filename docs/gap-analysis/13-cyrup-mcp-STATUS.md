@@ -44,40 +44,307 @@ against constants copied out of it — drift is now impossible rather than merel
 |---|---|---|---|
 | `MCP-142` | partial | **implemented** | — |
 | `MCP-146` | partial | **implemented** | — |
-| `MCP-141` | partial | **partial** | `socket`; the resolve-vs-`verbatim` split; upstream-faithful vectors — all three below |
+| `MCP-141` | partial | **partial** | `socket`, the vectors and the `lenient` cluster are CLOSED (below); `ResolvedIdentity::resolve` is the writer's production constructor |
 | `MCP-370` | partial | **partial** | `includeTools` and glob `excludeTools` still unported in the reader, so it over-approximates what the adapter registers |
 
-**Three things wave 1 did NOT fix, stated so they are not mistaken for done.**
+### The four hashing divergences are CLOSED (later wave)
 
-1. **`socket` — now measured, not argued.** Upstream's `computeServerHash` builds a **15**-key
+Every cyrup digest now equals the digest a stock `pi-mcp-adapter` @ `v2.26.1` (`fafae21`) computes
+for the same definition, measured by running upstream's own `stableStringify` + `computeServerHash`
+on node 22 rather than by reasoning about them. This was free to do only because
+`cyrup_mcp::dirs::save_metadata_cache` still has **no production call site** — its five callers are
+all tests — so no deployed digest had to be invalidated.
+
+1. **`socket` — the missing 15th key. CLOSED.** Upstream's `computeServerHash` builds a **15**-key
    identity whose third key is `socket` (`metadata-cache.ts:89`), and its `stableStringify` walks
    `Object.keys()`, so an absent socket is still emitted as `"socket":undefined`. Neither Rust side
-   emits the key. Running upstream's own functions on node 22 against the stdio fixture gives
-   `2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4`; cyrup gives
-   `4dd46c1f…`, and removing upstream's `socket` member yields cyrup's pre-image byte for byte — so
-   that one key is the entire difference. This contradicts 13c-mcp-servers.md:1753 ("Keep `socket` …
-   in the pre-image despite Cut 3"), and it is a **deliberate, pre-existing writer choice** whose own
-   golden vectors say "with `socket` unset". It is left alone because reversing it changes every
-   digest in the field and is the owner's call, not a porter's. It is now pinned by
-   `the_socket_key_is_the_one_divergence_from_upstreams_own_digest`, which fails the moment someone
-   lands `socket` — i.e. the divergence can no longer drift silently.
+   emitted the key, so *every* cyrup digest differed from pi's by exactly that member. Both now emit
+   `"socket": undefined` unconditionally, which is complete as well as correct: `to_server_entries`
+   rejects any entry that configures a socket (MCP-054), so the value can only ever be
+   `resolveConfigPath(undefined)`. Upstream's digest for the stdio fixture is
+   `2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4`; cyrup produced `4dd46c1f…`
+   and now produces upstream's, pinned by
+   `the_socket_key_is_no_longer_a_divergence_from_upstream`. 13c-mcp-servers.md:1753 ("Keep `socket`
+   … in the pre-image despite Cut 3") was right and is now satisfied.
 
-2. **The reader resolves; the writer does not.** The reader now interpolates `env`/`headers`/`url`,
-   expands a leading `~` in `cwd`, and falls back to `bearerTokenEnv` for `bearerToken` — all exactly
-   as upstream does. The writer's two production call sites still pass `ResolvedIdentity::verbatim`,
-   which resolves nothing (its own `TODO(MCP-082, MCP-084)`). So the two agree only for definitions
-   free of `${VAR}`/`$env:VAR`, of a `~`-prefixed `cwd`, and of `bearerTokenEnv`-supplied tokens.
-   **The reader is the upstream-correct side here**; the fix belongs in MCP-082/084 on the writer,
-   and hashing raw in the reader to match would un-upstream the one side that is now right.
+2. **The `lenient` cluster — three divergences, one root cause. CLOSED.** `config.rs` read `auth`,
+   `protocolVersion`, `env` and `headers` behind `deserialize_with = "lenient"`, which silently drops
+   any value the Rust type rejects. Upstream hashes all four verbatim and validates none of them at
+   load. `AuthMode::Other` and `ProtocolVersionSetting::Other` now carry the raw value into the
+   pre-image, and `cyrup_mcp::config::StringRecord` carries `env`/`headers` (and
+   `requestHeadersCommand.env`) with their **throw** — upstream's `interpolateEnvRecord` raises a
+   TypeError on a non-string member and `isServerCacheValid` catches it to `false`, which the reader
+   always reproduced and the writer did not: it dropped the map, hashed `"env":undefined`, and called
+   the entry VALID. That one was the two crates giving *opposite* answers, not merely different
+   digests. **Connect-time validation is unchanged in kind and now actually happens**:
+   `Invalid MCP protocolVersion` is raised by `runtime::version_negotiation` — which is where
+   `resolveVersionNegotiation` raises it — and never by the deserialiser.
 
-3. **The "golden" vectors are cyrup-internal, not upstream-faithful.** They are upstream's algorithm
-   run with `socket` removed — the caveat the writer's vectors carry and which wave 1's first draft
-   dropped, making the comment claim more than it delivered. Corrected in place; the real upstream
-   digest is pinned alongside as above.
+3. **A fifth divergence, found by measuring the four.** `mcp_direct_tools`'s `ServerEntry` holds
+   `auth` and `protocolVersion` as `Option<Value>`, and serde's derived `Option<T>` reads a JSON
+   `null` as `None` — so `auth: null` hashed as `"auth":undefined` where upstream hashes
+   `"auth":null` (`d5e9d0fe71ad5cc5d6a82b93d537f69ee59809f7f10e1f5c1f26c1d0a97e28e4`, node 22).
+   Here the **writer** was the correct side. A `present_or_absent` deserialiser closes it. It
+   surfaced only because the new differential table asserts both implementations against
+   *upstream's* digest rather than against each other.
+
+4. **The golden vectors are upstream-faithful.** Every constant in `cyrup_mcp::dirs` and in
+   `mcp_direct_tools` was regenerated by running upstream's own functions on node 22 and now
+   **includes `socket`**, so the word "golden" no longer carries a caveat. Each reconstruction of the
+   identity literal was proved faithful by asserting
+   `sha256(preImage) === computeServerHash(definition)` against upstream's exported function on the
+   same run.
+
+**What wave 1 left open and is still open.**
+
+* **The reader resolves; so does the writer now** (`ResolvedIdentity::resolve` replaced
+  `::verbatim` at every production call site), so this one is closed too. `::verbatim` survives only
+  as the fixture constructor, and its doc comment says what it cannot express.
+* **MCP-370's filtering half** — `includeTools` and glob `excludeTools` are hashed by both sides but
+  still not *applied* by the reader, so it over-approximates what the adapter registers.
 
 Verified: `cargo nextest run --workspace` 7697/7698 (the one failure is the pre-existing
 `cyrup-modes rpc_cycle_model_spans_the_full_auth_filtered_registry`, unrelated and documented
 elsewhere), `cargo clippy --workspace --all-targets` exit 0 with no new warnings in the changed file.
+
+## Update — 2026-08-22, wave 5 (the transport and connection units)
+
+`createConnection` has a body. `McpServerManager`'s [`ConnectionFactory`] seam — the one wave 4 left
+filled with `UnbuiltConnectionFactory` — is now `cyrup_mcp::runtime::ConnectionBuilder`, and
+`initialize_mcp` is where it is installed (`runtime.rs:170-186`), so a configured server connects
+for real against a real child and a real HTTP server for the first time. Landed in `runtime.rs`,
+`errors.rs`, `request_headers_command.rs` and (for MCP-105) `cyrup-ext`'s `npx_resolver.rs`.
+
+**How far that reaches, stated exactly.** `initialize_mcp` has no non-test caller:
+`grep -rn 'initialize_mcp(' --include=*.rs` over the repo returns its definition
+(`runtime.rs:125`) and one call, `runtime.rs:403`, which is inside the `#[cfg(test)]` module opening
+at `runtime.rs:325`. The production entry point that would reach it,
+`McpExtension::on_session_start` (`extension.rs:279-300`), is still MCP-008/MCP-011's empty body and
+calls nothing. So this wave fills the seam and makes it reachable — it does **not** yet make a
+configured server connect from a live session. An earlier draft of this section said "in production
+for the first time"; that was wrong and is corrected here rather than quietly dropped, because the
+next reader would otherwise have taken it as evidence that MCP-008/MCP-011 were no longer on the
+critical path.
+
+| unit | was | now | what remains |
+|---|---|---|---|
+| `MCP-101` | partial | **implemented** | — |
+| `MCP-105` | missing | **implemented** | — |
+| `MCP-109` | partial | **implemented** | its own verify line's `@modelcontextprotocol/conformance` client baseline was **not run** — the transport is proven against a hand-rolled loopback fixture instead |
+| `MCP-113` | implemented | **implemented** | `select_transport` now has a caller — `ConnectionBuilder::create_connection` — but that caller is only installed at `initialize_mcp`, which is itself still test-only pending MCP-008/MCP-011 in `extension.rs::on_session_start`. Its census-row note ("no production caller yet") therefore still stands |
+| `MCP-114` | partial | **implemented** | four of its five verify bullets are asserted on the wire here; the `bearerTokenEnv` fallback and the `HTTP bearer token` context string were already asserted in `secrets.rs`'s own tests and are not re-asserted |
+| `MCP-115` | partial | **partial** | the ladder, its arm order and the 401 predicate are done — the predicate covering a **bare** 401 as well, which it did not until review-pass item 5; the *provider* is a seam (`HttpAuthProvider`) whose production binding is section 05's, and `skipIssuerMetadataValidation` is read and consumed by nothing because rmcp's streamable-HTTP config has no such field |
+| `MCP-115a` | missing | **implemented** | — |
+| `MCP-128` | partial | **partial** | its connect half now lands — `request_options.timeout` bounds the handshake on both arms (review-pass item 4), where before it was built by the manager and read by nothing. The manager-side `setDefaultRequestTimeoutMs` / `getRequestOptions` half is unchanged from its census note |
+| `MCP-124` | partial | **implemented** | — (this row said `implemented \| —` before the `ManagerError` half landed, and was wrong: see review-pass item 2) |
+
+**What each one actually did.**
+
+* **MCP-101.** `ConnectionBuilder::connect_stdio` in upstream's order: `createClient` (so an invalid
+  `protocolVersion` throws before a child exists), `args.map(interpolateEnvVars)`, the abort check,
+  `mkdirSync(pluginDataDir)`, `resolveConfigPath(cwd) ?? defaultCwd`, `resolveEnv`, the stderr
+  drain. Six tests spawn real children and read the environment back out of them.
+* **MCP-105.** `parse_package_spec` + `EXACT_PACKAGE_VERSION_RE` replace `extract_package_name`,
+  threaded into both the cache-hit predicate and `find_cached_package_dir`'s version filter. The
+  29-row parse table was produced by running upstream's own `parsePackageSpec` on node 22.
+* **MCP-109/114.** The transport is constructed for real — `reqwest` is now a declared dependency of
+  `cyrup-mcp` (no new resolution surface; rmcp already resolves onto the workspace's `0.13.4`)
+  because wrapping the client is what the header-command decorator needs. `resolve_server_url` and
+  `resolve_http_secrets` were already written and are now wired.
+* **MCP-115.** The four-arm ladder, in upstream's order, with `crate::oauth::on_unauthorized` as
+  arms 4-5. **The 401 predicate is hand-written and the plan said it should not be**: rmcp's
+  `ClientInitializeError::auth_challenge()` matches `AuthRequiredError` (401) *and*
+  `InsufficientScopeError` (403), while upstream's `isUnauthorizedHttpError` is 401 only — using it
+  as-is would turn every scope-denied 403 into a `needs-auth`.
+* **MCP-115a.** `RequestHeadersCommandClient` is built once per connect (matching
+  `server-manager.ts:868-870`, which is *outside* `attempt`) and used by every attempt. **Divergence
+  3 of that module is closed**: `apply_derived` now clears rmcp's `auth_header` when the derived set
+  carries an `authorization`, so a bearer-configured server with a signing command sends one
+  `Authorization`, the derived one. Measured before the fix as
+  `["Bearer static-bearer", "Signature derived"]`.
+* **MCP-124.** The five aggregate variants, their byte-exact heads, and a structural
+  `is_cleanup_failure` — **and, since the review pass below, the `ManagerError` half**: an
+  `Aggregate` raised by `disposeConnection`/`closeAll` is now mapped onto the matching `McpError`
+  variant by `From<&ManagerError>` instead of flattened to `Other`, and `ManagerError::Display`
+  routes through `errors::render_aggregate_texts`. Without those two, the type that actually reaches
+  a user through `closeAll` kept neither the class nor the rendering the unit was filed to fix.
+
+**What this wave leaves open, stated so it is not mistaken for closed.**
+
+* **`McpError::SetupFailed`'s only producer today is a narrow race.** The arm that raises it is
+  `createConnection`'s catch after a *post-handshake* step fails and the cleanup after it also
+  fails. `ConnectionBuilder::post_handshake`'s own abort check is such a step, so a `close` that
+  races a settled handshake **and** whose `resource.close()` then fails does raise it against a real
+  server — pinned by `an_abort_whose_own_cleanup_fails_is_a_setup_failure`. What is missing is
+  *upstream's* producer, discovery (MCP-119), which cannot land through this seam at all:
+  `NewConnection` has no field for tools/resources/prompts and `ServerConnection::new` hardcodes
+  them empty. Widening that seam is `server_manager.rs`'s change. (An earlier draft of this bullet
+  said the variant had "no producer" and "cannot fire against a real server". That was too strong;
+  the reachable case is narrow, not empty.)
+* **`McpError::AbortCleanupFailed` and `McpError::HttpCleanupFailed` have no producer either**, for
+  a different reason: `serve_client_with_lifecycle_and_ct` closes the transport on every failure
+  path and reports one error, so this port has no separate cleanup outcome to observe. That is
+  MCP-123's residual verbatim.
+* **`McpConnection`'s `Peer` is unreachable through `ConnectionResource`.** The trait exposes
+  `close`/`has_session_id`/`child_pid`/`stderr_detail` and nothing else, so nothing outside
+  `runtime.rs` can issue a request on a connection the builder made. Same seam, same owner.
+* **MCP-103 is still unported**, so an `npx` server's tracked child is still the npm launcher. The
+  call site is marked in `connect_stdio`.
+* **A failed handshake SIGKILLs its child with no graceful window.** Nothing on that path calls
+  `close()`; `serve_client_with_ct_inner` drops the transport and `ChildWithCleanup::drop` spawns a
+  fire-and-forget `kill()`. Upstream's catch runs `client.close()`, and the TS SDK escalates
+  close-stdin → 2 s → SIGTERM → 2 s → SIGKILL. Bounded to the failed-connect path — a successful
+  connection tears down through `graceful_shutdown` — and pinned by
+  `a_failed_handshake_leaves_no_child_behind`, which also guards against the child leaking outright.
+* **`secrets::resolve_command_secret` takes no `EnvFn`**, so `ConnectionBuilder::with_environment`'s
+  environment reaches `args`, `cwd`, the URL and the bearer ladder but not `env`/`headers` values.
+  In production both are `process.env` and nothing diverges; in a test they are two seams.
+
+Verified: `cargo check --workspace --all-targets` clean; `cargo nextest run --workspace` 7850/7851,
+the one failure being the pre-existing `cyrup-modes
+rpc_cycle_model_spans_the_full_auth_filtered_registry`. Clippy on `cyrup-mcp`/`cyrup-ext`: 2 warning
+sites, both pre-existing and both measured against the tree with this wave's block sliced out.
+rustdoc warnings 34 → 34 (`cyrup-mcp`) and 39 → 39 (`cyrup-ext`).
+
+### Wave 5 review pass — six defects found in the wave's own output, and what changed
+
+Every item below was **measured before the fix and re-measured after**, and each carries a test that
+fails on the pre-fix tree. Two of them were false statements already written into the source and the
+first draft of this section; those are corrected in place rather than appended to, because a wrong
+comment outlives a wrong line of code — the next reader trusts it instead of checking.
+
+| # | defect | where | now |
+|---|---|---|---|
+| 1 | "`initialize_mcp` installs it, so a configured server actually connects in production" — it has no non-test caller | this section's preamble, `runtime.rs:170-186`, the `MCP-113` row | corrected above; the builder is installed **at** `initialize_mcp`, which is test-only pending MCP-008/MCP-011 |
+| 2 | `MCP-124` marked `implemented \| —` while the aggregates the manager actually raises had no typed variant, rendered head-prefixed, and lost their class at the public boundary | `server_manager.rs` `ManagerError` | `From<&ManagerError>` maps `Aggregate` (and a carried `Mcp(<aggregate>)`) onto the `McpError` variants; `Display` routes through `errors::render_aggregate_texts`; the five head constants are now **re-exported** from `errors.rs` instead of redefined, so the dispatch cannot drift |
+| 3 | an OAuth token and a config-supplied `Authorization` both went on the wire | `runtime.rs::http_attempt` | the configured header wins and the token is dropped, matching `_commonHeaders`' spread order. Measured before: `["Bearer from-store", "Static abc123"]` |
+| 4 | `requestTimeoutMs` never reached the handshake — a server that accepts and never answers `initialize` hung `connect` forever | `runtime.rs`, both arms | `connect_client_bounded` applies `request_options.timeout`; a lapse raises upstream's byte-exact `Request timed out`. Ablation: with the budget ignored, the two `wedged` tests do not terminate |
+| 5 | a bare 401 (no `WWW-Authenticate`) was a hard error instead of `needs-auth`, and the doc at the site asserted the opposite | `runtime.rs::unauthorized_challenge` | widened with `bare_unauthorized`; the 403/`InsufficientScope` exclusion is unchanged and separately pinned |
+| 6 | `has_session_id` was a hardcoded `true` under a comment claiming it was a live read | `runtime.rs::http_attempt` | a real read: `SessionIdProbe` wraps the HTTP client and records the `Mcp-Session-Id` the handshake response carried. A stateless server now reads `false` and stops tripping the session-recovery gate |
+
+**Why 3 keeps recurring, written down because it is the transferable part.** rmcp carries the bearer
+in a separate `auth_header` channel from the custom-header map, and *both* channels append —
+`RequestBuilder::bearer_auth` and `builder.header(name, value)`. Upstream has one `Headers` object
+with `set` semantics. So parity is not the default: **every path that can produce an `Authorization`
+has to clear the other channel explicitly.** Wave 2 fixed instance one in
+`secrets::resolve_http_secrets` (a resolved `bearerToken` strips a configured `Authorization`),
+MCP-115a fixed instance two in `request_headers_command::apply_derived`, and this pass fixed the
+third. There is no reason to think a fourth producer would be born correct.
+
+**Also landed in this pass**, from the review's minor findings:
+
+* **`StdioTransportSpec::resolve` now runs under `spawn_blocking`.** It reaches
+  `secrets::resolve_command_secret`, a `std::process::Command` spawn polled with
+  `std::thread::sleep` and bounded by a 10-second timeout. Run inline it held a tokio worker for up
+  to ten seconds inside the manager's single-flight connect future, where `close`/`close_all`'s
+  abort could not preempt it — a guarantee wave 4 measured against `UnbuiltConnectionFactory`, which
+  returned instantly and so could not have caught this. Upstream's `spawnSync` blocks node's whole
+  event loop, so leaving it inline was arguable parity; it was still the one way this
+  `createConnection` body could weaken a guarantee the rest of the crate relies on. Measured on a
+  one-worker runtime: a 200 ms timer over a connect carrying a 1-second `!command` env value fired
+  at 1.019 s inline and at 0.2 s under `spawn_blocking`.
+* **`SetupFailed`'s residual restated** (see the bullet above).
+* **`close_inner`'s "Blocker, stated plainly" note** at `server_manager.rs` was stale in its first
+  half (`is_cleanup_failure` does match all seven now) and true in its second; both halves are
+  rewritten to what the code does.
+
+### Still open — a 401 rmcp never turns into an error at all (found by the confirming pass)
+
+**MCP-115 / F5 is incomplete, and the gap is invisible from this crate's own code.** The bare-401
+fix works for a 401 with no body. It does NOT work for a 401 carrying
+`Content-Type: application/json` and a parseable JSON-RPC error, because rmcp applies its
+JSON-RPC-error shortcut to **every** non-success status, not just 400:
+`rmcp-3.1.4/src/transport/common/reqwest/streamable_http_client.rs:278-293` returns
+`Ok(StreamableHttpPostResponse::Json(..))` for that case, so the
+`Err(UnexpectedServerResponse("HTTP {status}: {body}"))` at `:296` — which `runtime.rs:2063`
+prefix-matches — is never constructed. `bare_unauthorized` cannot fix this: it is never called.
+
+MEASURED through the real `ConnectionBuilder::connect_http_client` against a loopback fixture
+answering `initialize` with `401` + a JSON-RPC error body: the connect ends as a hard failure and
+the OAuth ladder is never reached. A server that answers this way — which is legal, and which the
+MCP spec's own error shape encourages — can never authenticate.
+
+Fix shape: catch the status before rmcp collapses it, in the client-decorator seam this crate
+already occupies (`SessionIdProbe` / `RequestHeadersCommandClient`), raising the unauthorized shape
+whenever the response was HTTP 401 regardless of body; or carry the status out of the decorator into
+the ladder. The ladder tests need a `json_rpc_body` mode on `FixtureOptions` alongside
+`challenge: false` — the fixture's inability to produce this shape is exactly why it went unseen.
+
+Not fixed here because it is a second, distinct mechanism from the one F5 addressed and wants its
+own measured pass. It fails SAFE (a hard connect error, never a wrongly-authenticated request).
+
+### Still open after the review pass — items outside this unit's files
+
+Each was measured and is recorded here so it is not lost; none is fixed, because each lives in a
+file this unit does not own.
+
+* **`config.rs:618-621`'s cross-reference is dangling.** `StringRecord`'s `Deserialize` doc defers a
+  residual to "`13c-mcp-servers.md`'s MCP-144 notes"; that block records only that
+  `interpolate_env_record` drops non-string values, and says nothing about the non-object-`env`
+  case. Measured on node 22 @ v2.26.1: `computeServerHash({command:"x",env:"abc"})` =
+  `01ed7340…`, the writer produces `f0211144…` (upstream's digest for the same definition with `env`
+  **absent**). Same family, also unrecorded: `env: []`, `env: 5`, `env: true` all hash as `{}`
+  upstream (`1d224401…`) and as absent here. The same doc calls this "a fifth" divergence while this
+  file and the wave report call `auth: null` the fifth and this the sixth. Fix: record it in 13c's
+  MCP-144 block, or repoint `config.rs:621`.
+* **That residual is described as writer-only and is not.** The **writer** degrades to `None`; the
+  **reader** drops the whole server from the direct-tool surface —
+  `mcp_direct_tools.rs::extract_server_map` skips any entry `serde_json::from_value::<ServerEntry>`
+  rejects, and `env: Option<BTreeMap<String, Value>>` rejects a string, array, number or bool.
+  Measured over six definitions, the reader keeps three where upstream keeps six. `args: [1,"b"]`
+  and `command: 5` behave identically — one root cause (typed reader fields with no `lenient`
+  equivalent), not three items.
+* **`StringRecord` opened an unnamed connect-path divergence.** `secrets.rs:386` passes
+  `entry.env.as_deref()`, which `Deref`s to the string members only, so
+  `env: {"GOOD":"1","BAD":5}` now spawns the child with `GOOD=1`; before the retype `lenient`
+  dropped the whole block and it spawned with none. Upstream does neither — measured,
+  `resolveCommandSecretsRecord({GOOD:"1",BAD:5}, …)` throws `value.startsWith is not a function`
+  and refuses the connect. The hash side is correct on both crates. Fix: route
+  `resolve_stdio_env`/`resolve_http_secrets` through `StringRecord::unhashable()`, or name the
+  divergence in `StringRecord`'s doc.
+* **`registration.rs:792` and `:865-866` are stale.** Both say the hasher's `None` "has exactly one
+  source" (`resolve_server_url`); `ResolvedIdentity::resolve` has had a second `Err` arm since the
+  hashing wave, and `dirs.rs:1082-1085` already says "**two**". Behaviour is correct — `Option::ok()`
+  swallows both — so this is docs only, in a crate whose house style is that comments carry the
+  specification. `registration.rs` is untouched by wave 5.
+* **The same class loss still applies to `McpError::CredentialStore` across `ManagerError`.**
+  `From<&ManagerError>` now rebuilds the aggregates and keeps `Aborted`/`Config`/`Server`, but a
+  credential-store failure raised inside the factory (`ConnectionBuilder::connect_http_client`'s
+  `self.auth.authorize(..)?`) still arrives as `McpError::Other` and
+  `is_credential_store_failure()` answers `false` for it. It cannot be fixed the same way:
+  `AuthStoreError` is `#[non_exhaustive]` and not `Clone`, so the one-way `&ManagerError ->
+  McpError` door cannot reconstruct it, and the type lives in `credentials.rs`. The class matters
+  for the same reason the doc on the variant gives — section 07's refresh driver rethrows a store
+  failure and swallows everything else — but no consumer of `is_credential_store_failure` currently
+  sits downstream of this conversion, so it is a latent hazard rather than a live bug. Fix shape:
+  make `AuthStoreError` `Clone`, or give `ManagerError` a `CredentialStore` arm.
+* **`13c-mcp-servers.md:1110-1113`'s MCP-100 attribution is wrong.** It says
+  `MCP connection for <name> was closed while connecting` is reachable "when the generation advanced
+  **without** the attempt being aborted (what `reconnect`/`closeAll` can produce)". Upstream writes
+  `closeGenerations` at exactly two places, `server-manager.ts:1098` and `:1146`, and **both** abort
+  the attempt controller on the next line; `reconnect` never touches it (`doReconnect` delegates to
+  `this.close(name)`, which aborts). The only window is between `connect`'s generation read at
+  `:279` and its `connectAttempts.set` at `:286`. The measured half of that bullet is sound.
+
+Verified after the review pass: `cargo check --workspace --all-targets` clean;
+`cargo nextest run --workspace --no-fail-fast` 7858/7859, the one failure still the pre-existing
+`cyrup-modes rpc_cycle_model_spans_the_full_auth_filtered_registry`; `cyrup-mcp` alone 612/612.
+Clippy on `cyrup-mcp`: 2 diagnostics, both pre-existing (`dirs.rs:1863`'s empty line after a doc
+comment, and `result_large_err` on `connect_client`, whose `ClientInitializeError` is returned
+unflattened on purpose — see its doc). rustdoc warnings for `cyrup-mcp` 34 → 33.
+
+Every fix in this pass is pinned by a test that fails on the pre-fix tree. The ablations, run one at
+a time:
+
+| fix | ablation | result |
+|---|---|---|
+| duplicate `Authorization` | restore `if config.auth_header.is_none()` | `an_oauth_token_never_joins_a_configured_authorization_header` fails with `left: ["Bearer from-store", "Static abc123"]` |
+| handshake timeout | ignore the budget in `connect_client_bounded` | both `wedged` tests never terminate (`timeout 90` kills the run, exit 124) |
+| bare 401 | drop the `bare_unauthorized` arm | `a_bare_401_with_no_challenge_still_reaches_the_oauth_ladder` fails |
+| `has_session_id` | restore the hardcoded `true` | `a_stateless_http_server_reports_no_session_id` fails |
+| MCP-124 rendering | restore head-prefixed `ManagerError::Display` | `close_all_aggregates_only_cleanup_failures` fails with `"MCP manager cleanup failed: MCP connection cleanup failed: client close failed"` |
+| MCP-124 class | drop the `Aggregate` / `Mcp(<aggregate>)` arms of `From<&ManagerError>` | `close_rethrows_a_pending_connects_setup_failure_and_swallows_everything_else` fails with `Other("connect ECONNREFUSED: transport close failed")` |
+| `spawn_blocking` | inline `StdioTransportSpec::resolve` | `a_slow_env_command_does_not_hold_the_worker_carrying_the_connect` fails: the 200 ms timer fires at 1.019 s |
 
 ## Census
 

@@ -59,7 +59,7 @@
 //! `serde_json::Value::Null`: collapsing it is exactly the divergence MCP-070 exists to close.
 //!
 //! **The reciprocal change has landed (MCP-070 option (b), MCP-094, MCP-141/142/143/144/145).**
-//! `cyrup_ext_subagents::exec::mcp_direct_tools` now builds the same fourteen keys in the same
+//! `cyrup_ext_subagents::exec::mcp_direct_tools` now builds the same fifteen keys in the same
 //! resolved forms, renders an absent field as the bare `undefined` token, and carries the same
 //! `try`/`catch` on an unhashable definition. Neither side owns the contract alone: that crate takes
 //! `cyrup-mcp` as a **dev-dependency** and asserts its pre-image, its digest and its tool names
@@ -935,13 +935,19 @@ impl ResolvedIdentity {
     /// directory. For a definition with no token, no `~` and no `!`, the two are equal by
     /// construction — which is exactly what `resolve_and_verbatim_agree_when_nothing_needs_resolving`
     /// asserts, and why the golden vectors below stayed byte-identical across MCP-141.
+    ///
+    /// It also cannot express upstream's **throw**: it is infallible, so an entry whose `env` or
+    /// `headers` carries a non-string member (`interpolateEnvRecord`'s `value.startsWith` TypeError
+    /// — see [`crate::config::StringRecord`]) hashes here as its string members alone. That is the
+    /// second thing this constructor is wrong about, and for the same reason as the first: it does
+    /// not run the resolvers. [`Self::resolve`] does both.
     #[must_use]
     pub fn verbatim(entry: &ServerEntry) -> Self {
         Self {
-            env: entry.env.clone(),
+            env: entry.env.as_deref().cloned(),
             cwd: entry.cwd.clone(),
             url: entry.url.clone(),
-            headers: entry.headers.clone(),
+            headers: entry.headers.as_deref().cloned(),
             bearer_token: entry.bearer_token.clone(),
             request_headers_command: entry.request_headers_command.clone(),
         }
@@ -968,11 +974,20 @@ impl ResolvedIdentity {
     /// [`crate::secrets::resolve_command_secret`] — the form that does spawn — is unreachable from
     /// here by construction.
     ///
-    /// **The only failure is the URL.** Every other resolver is total, so an `Err` from this
-    /// constructor means exactly one thing: `resolveServerUrl` threw, and
-    /// [`crate::registration::is_server_cache_valid`] must answer `false` (MCP-145). That is the
-    /// sole mechanism keeping a `url: "https://x/${MISSING}"` server out of the cold-start direct
-    /// tool surface.
+    /// **Two things can fail, and both are upstream throws.** `resolveServerUrl` rejects a URL
+    /// naming an unset variable or one that no longer parses after interpolation; and
+    /// `interpolateEnvRecord` rejects an `env`, `headers` or `requestHeadersCommand.env` block
+    /// carrying a non-string member, because `interpolateSecretExpression` calls `value.startsWith`
+    /// on it unconditionally ([`crate::config::StringRecord`] carries that throw, and
+    /// `interpolate_env_record` raises it). Either way
+    /// [`crate::registration::is_server_cache_valid`] must answer `false` (MCP-145). Between them
+    /// they are the whole mechanism keeping a `url: "https://x/${MISSING}"` or an `env: { N: 5 }`
+    /// server out of the cold-start direct tool surface.
+    ///
+    /// The second arm is new. While `env`/`headers` were a `BTreeMap<String, String>` behind
+    /// `lenient`, a non-string member dropped the entire map, this constructor succeeded, and the
+    /// entry was called VALID — the opposite of the answer
+    /// `cyrup_ext_subagents::exec::mcp_direct_tools` gave for the same bytes.
     ///
     /// `env` and `home` are arguments rather than ambient reads for the reason every other seam in
     /// this crate takes them: edition 2024 makes `std::env::set_var` `unsafe`, so a test that pinned
@@ -981,36 +996,70 @@ impl ResolvedIdentity {
     /// `cyrup_config::ConfigDirs::home`.
     pub fn resolve(entry: &ServerEntry, env: &EnvFn, home: &Path) -> McpResult<Self> {
         Ok(Self {
-            env: crate::secrets::interpolate_env_record(entry.env.as_ref(), env),
+            env: interpolate_env_record(entry.env.as_ref(), env)?,
             cwd: entry.cwd.as_deref().map(|raw| resolve_config_path(raw, env, home)),
             url: crate::credentials::resolve_server_url(entry.url.as_deref(), env)?,
-            headers: crate::secrets::interpolate_env_record(entry.headers.as_ref(), env),
+            headers: interpolate_env_record(entry.headers.as_ref(), env)?,
             bearer_token: crate::credentials::resolve_bearer_token(
                 entry.bearer_token.as_deref(),
                 entry.bearer_token_env.as_deref(),
                 env,
             ),
-            request_headers_command: entry.request_headers_command.as_ref().map(|command| {
-                // `metadata-cache.ts:94-101` — `command` and each `args` element go through plain
-                // `interpolateEnvVars` (NOT the secret grammar: upstream does not call
-                // `interpolateSecretExpression` here), `env` through `interpolateEnvRecord`, and
-                // `timeoutMs` is copied through untouched.
-                HttpRequestHeadersCommand {
-                    command: command
-                        .command
-                        .as_deref()
-                        .map(|c| crate::credentials::interpolate_env_vars(c, env)),
-                    args: command.args.as_ref().map(|args| {
-                        args.iter()
-                            .map(|a| crate::credentials::interpolate_env_vars(a, env))
-                            .collect()
-                    }),
-                    env: crate::secrets::interpolate_env_record(command.env.as_ref(), env),
-                    timeout_ms: command.timeout_ms,
-                }
-            }),
+            request_headers_command: entry
+                .request_headers_command
+                .as_ref()
+                .map(|command| -> McpResult<HttpRequestHeadersCommand> {
+                    // `metadata-cache.ts:94-101` — `command` and each `args` element go through
+                    // plain `interpolateEnvVars` (NOT the secret grammar: upstream does not call
+                    // `interpolateSecretExpression` here), `env` through `interpolateEnvRecord` —
+                    // which is why the nested `env` throws on a non-string member exactly as the
+                    // outer one does — and `timeoutMs` is copied through untouched.
+                    Ok(HttpRequestHeadersCommand {
+                        command: command
+                            .command
+                            .as_deref()
+                            .map(|c| crate::credentials::interpolate_env_vars(c, env)),
+                        args: command.args.as_ref().map(|args| {
+                            args.iter()
+                                .map(|a| crate::credentials::interpolate_env_vars(a, env))
+                                .collect()
+                        }),
+                        env: interpolate_env_record(command.env.as_ref(), env)?
+                            .map(crate::config::StringRecord::from),
+                        timeout_ms: command.timeout_ms,
+                    })
+                })
+                .transpose()?,
         })
     }
+}
+
+/// `interpolateEnvRecord(values)` (`utils.ts:107`) **with upstream's throw** — the resolver
+/// `computeServerHash` applies to `env`, `headers` and `requestHeadersCommand.env`
+/// (`metadata-cache.ts:90`, `:93`, `:98`).
+///
+/// [`crate::secrets::interpolate_env_record`] is the value half and is total, because by the time it
+/// is called every member is already a [`String`]. The half that can fail is the one the *type*
+/// carries: [`crate::config::StringRecord::unhashable`] is `Some` exactly when upstream's
+/// `value.startsWith(…)` would have been called on something that is not a string, and upstream's
+/// TypeError is what it holds. Raising it here — rather than silently hashing the string members —
+/// is what makes [`crate::registration::is_server_cache_valid`] answer `false` for such an entry,
+/// which is the answer `cyrup_ext_subagents::exec::mcp_direct_tools` has always given.
+///
+/// # Errors
+///
+/// The block carried a member that is not a string.
+fn interpolate_env_record(
+    values: Option<&crate::config::StringRecord>,
+    env: &EnvFn,
+) -> McpResult<Option<BTreeMap<String, String>>> {
+    if let Some(message) = values.and_then(crate::config::StringRecord::unhashable) {
+        return Err(McpError::Config(message.to_string()));
+    }
+    Ok(crate::secrets::interpolate_env_record(
+        values.map(crate::config::StringRecord::values),
+        env,
+    ))
 }
 
 /// `resolveConfigPath(value)` (`utils.ts:187`) **whole** — interpolate, then expand `~`.
@@ -1030,7 +1079,10 @@ pub fn resolve_config_path(raw: &str, env: &EnvFn, home: &Path) -> String {
 /// (MCP-141), and the function [`crate::registration::is_server_cache_valid`]'s default hasher is.
 ///
 /// `Err` is upstream's `throw`, which every caller maps to "this cache entry is not valid"
-/// (MCP-145). It has exactly one source: [`crate::credentials::resolve_server_url`].
+/// (MCP-145). It has **two** sources, both of them resolvers upstream lets throw out of the identity
+/// literal: [`crate::credentials::resolve_server_url`], and `interpolateEnvRecord` on an `env`,
+/// `headers` or `requestHeadersCommand.env` block carrying a non-string member
+/// ([`crate::config::StringRecord`]).
 pub fn try_compute_server_hash(
     entry: &ServerEntry,
     env: &EnvFn,
@@ -1143,16 +1195,33 @@ fn json_quote(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-/// `computeServerHash`'s identity object (`metadata-cache.ts:82`), post-Cut-3.
+/// `computeServerHash`'s identity object (`metadata-cache.ts:82`).
 ///
-/// **Fourteen fields, and the list is the specification.** Upstream v2.26.0 builds fifteen;
-/// `socket` is gone with Cut 3 (a config that could carry it no longer exists in the port, so no
-/// cyrup hash needs to encode it) and that is a *recorded* divergence from the pre-image, not an
-/// oversight. Everything else is verbatim, including the fields that are **not** here: `lifecycle`,
-/// `idleTimeout`, `requestTimeoutMs` and `debug` are runtime behaviour, they do not change which
-/// tools a server exposes, and hashing them would evict every cache entry on an unrelated edit.
+/// **Fifteen fields, and the list is the specification.** Everything is verbatim, including the
+/// fields that are **not** here: `lifecycle`, `idleTimeout`, `requestTimeoutMs` and `debug` are
+/// runtime behaviour, they do not change which tools a server exposes, and hashing them would evict
+/// every cache entry on an unrelated edit.
 ///
-/// # `requestHeadersCommand` is the fourteenth, and adding it invalidated every cache entry once
+/// # `socket` is the fifteenth, and it is emitted `undefined` unconditionally
+///
+/// Upstream's third key is `socket: resolveConfigPath(definition.socket)`
+/// (`metadata-cache.ts:89`), and `stableStringify` walks `Object.keys()` — which includes keys
+/// holding `undefined` — so upstream emits `"socket":undefined` for **every** definition, including
+/// one that never mentions a socket. This pre-image omitted the key entirely, on the argument that
+/// Cut 3 removed the field; the consequence was that every digest cyrup produced differed from pi's
+/// by exactly that one member, for every server in every config, forever.
+///
+/// Emitting the key unconditionally is both correct and complete here, and not a compromise:
+/// [`crate::config::to_server_entries`] **rejects** any entry carrying `socket` with a named Cut-3
+/// diagnostic, so a `ServerEntry` that reached this function can only ever have had
+/// `socket: undefined` — which is precisely `resolveConfigPath(undefined)`.
+///
+/// Measured, not argued. Upstream's own digest for the plain-stdio golden fixture below is
+/// `2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4`; before this key landed cyrup
+/// produced `4dd46c1f…`, and deleting upstream's `socket` member from its pre-image yielded cyrup's
+/// byte for byte. The two now agree; `golden_vector_stdio_server` pins it.
+///
+/// # `requestHeadersCommand` is v2.26.0's addition, and it invalidated every cache entry once
 ///
 /// `stableStringify` emits a key whose value is absent as the literal `undefined` rather than
 /// dropping it, so widening the object changes the digest of **every** server, not just of one that
@@ -1173,6 +1242,12 @@ pub fn server_identity_pre_image(entry: &ServerEntry, resolved: &ResolvedIdentit
         ("args".to_string(), opt_string_list(entry.args.as_ref())),
         ("env".to_string(), opt_string_map(resolved.env.as_ref())),
         ("cwd".to_string(), opt_string(resolved.cwd.as_deref())),
+        // `socket: resolveConfigPath(definition.socket)` (`metadata-cache.ts:89`). Always
+        // `undefined`: `to_server_entries` rejects any entry that configures a socket (Cut 3), so
+        // the field cannot be present, and `resolveConfigPath(undefined)` is `undefined`. The KEY
+        // must still be emitted — `stableStringify` walks `Object.keys()`, so upstream writes
+        // `"socket":undefined` rather than dropping it, and omitting it moved every cyrup digest.
+        ("socket".to_string(), HashValue::Undefined),
         ("url".to_string(), opt_string(resolved.url.as_deref())),
         ("headers".to_string(), opt_string_map(resolved.headers.as_ref())),
         (
@@ -1239,7 +1314,7 @@ fn opt_request_headers_command(value: Option<&HttpRequestHeadersCommand>) -> Has
         HashValue::Object(vec![
             ("command".to_string(), opt_string(command.command.as_deref())),
             ("args".to_string(), opt_string_list(command.args.as_ref())),
-            ("env".to_string(), opt_string_map(command.env.as_ref())),
+            ("env".to_string(), opt_string_map(command.env.as_deref())),
             (
                 "timeoutMs".to_string(),
                 command.timeout_ms.map_or(HashValue::Undefined, HashValue::Number),
@@ -1431,12 +1506,18 @@ mod tests {
     }
 
     /// The golden vector MCP-070 asks for: a fixed `ServerEntry`, its exact pre-image, and its exact
-    /// 64-hex `configHash`, generated by running `metadata-cache.ts`'s `stableStringify` +
-    /// `computeServerHash` verbatim on node 22 with `socket` unset.
+    /// 64-hex `configHash`.
     ///
-    /// `cyrup_ext_subagents::exec::mcp_direct_tools::compute_mcp_server_hash` must assert the same
-    /// two constants once MCP-070 option (b) lands there. Today it produces neither: it writes
-    /// `null` where this writes `undefined`, and it hashes 11 keys.
+    /// **Provenance.** Both constants are **upstream's own**, produced by running
+    /// `metadata-cache.ts`'s `stableStringify` + `computeServerHash` on node 22 against
+    /// `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`), and they now **include the `socket` key**
+    /// — the fifteenth member, which upstream emits as `"socket":undefined` for every definition
+    /// and which this pre-image used to drop. Before that key landed this vector read
+    /// `4dd46c1fd26680867fe6c5ffdde2ab0f0a35972cd9c211bf6dd68d1f304eb277`, which was cyrup's digest
+    /// and nobody else's; it is now byte-identical to pi's for the same definition.
+    ///
+    /// `cyrup_ext_subagents::exec::mcp_direct_tools::compute_mcp_server_hash` asserts the same two
+    /// constants in `pre_image_matches_the_upstream_generated_golden_vector`.
     #[test]
     fn golden_vector_stdio_server() {
         let entry: ServerEntry = serde_json::from_str(
@@ -1464,17 +1545,20 @@ mod tests {
                 r#""env":{"API_TOKEN":"s3cret","NODE_ENV":"production"},"#,
                 r#""excludeTools":["danger_*"],"exposeResources":false,"headers":undefined,"#,
                 r#""includeTools":undefined,"protocolVersion":undefined,"#,
-                r#""requestHeadersCommand":undefined,"url":undefined}"#
+                r#""requestHeadersCommand":undefined,"socket":undefined,"url":undefined}"#
             )
         );
         assert_eq!(
             compute_server_hash(&entry, &resolved),
-            "4dd46c1fd26680867fe6c5ffdde2ab0f0a35972cd9c211bf6dd68d1f304eb277"
+            "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4"
         );
     }
 
     /// The HTTP half of the golden vector — `auth`, `protocolVersion`, `headers` and a `bearerToken`
     /// all present, so the two enum-valued identity fields are pinned on the wire.
+    ///
+    /// Upstream-generated on node 22 the same way as the vector above, and **including `socket`**
+    /// (it read `572dcbaa…` while the key was missing).
     #[test]
     fn golden_vector_http_server() {
         let entry: ServerEntry = serde_json::from_str(
@@ -1501,34 +1585,42 @@ mod tests {
                 r#""env":undefined,"excludeTools":[],"exposeResources":true,"#,
                 r#""headers":{"Accept":"application/json","X-Api-Key":"k"},"#,
                 r#""includeTools":["a","b"],"protocolVersion":"2026-07-28","#,
-                r#""requestHeadersCommand":undefined,"url":"https://api.example.com/mcp"}"#
+                r#""requestHeadersCommand":undefined,"socket":undefined,"#,
+                r#""url":"https://api.example.com/mcp"}"#
             )
         );
         assert_eq!(
             compute_server_hash(&entry, &resolved),
-            "572dcbaa24a3a82d42f90a86ebb8039227f999a1b14078b35dfa9f40cb872356"
+            "5ee9972ca350254322d2c8aa519f273144f1f80b256e1cfce5a1af21e3e75970"
         );
     }
 
     /// The empty definition — the case that makes the `undefined`-vs-`null` divergence total. Every
-    /// one of the fourteen fields is absent, so a writer that emitted `null` would differ in
-    /// fourteen places at once.
+    /// one of the fifteen fields is absent, so a writer that emitted `null` would differ in fifteen
+    /// places at once.
+    ///
+    /// Upstream-generated on node 22 and **including `socket`**: fifteen `undefined` tokens, not
+    /// fourteen (the digest read `671c1578…` while the key was missing).
     #[test]
     fn golden_vector_empty_definition() {
         let entry = ServerEntry::default();
         let resolved = ResolvedIdentity::verbatim(&entry);
-        assert!(!server_identity_pre_image(&entry, &resolved).contains("null"));
+        let pre_image = server_identity_pre_image(&entry, &resolved);
+        assert!(!pre_image.contains("null"));
+        assert_eq!(pre_image.matches("undefined").count(), 15, "{pre_image}");
+        assert!(pre_image.contains(r#""socket":undefined"#), "{pre_image}");
         assert_eq!(
             compute_server_hash(&entry, &resolved),
-            "671c1578e5f4c763aac0deb77dc2a99f55688f80ed687a652e5259319937794e"
+            "a04128961dff1d77f5ea95dd5ddb01415888636efe2d32cf950c78b34e54c3fa"
         );
     }
 
-    /// The fourteenth field (v2.26.0, `metadata-cache.ts:94-101`) — the only nested object and the
+    /// The field v2.26.0 added (`metadata-cache.ts:94-101`) — the only nested object and the
     /// only *number* in the whole pre-image.
     ///
-    /// Cross-checked on node 22 against upstream's own `stableStringify(identity)` with `socket`
-    /// removed, the same way the three vectors above are. The two properties it pins are the nested
+    /// Upstream-generated on node 22 against upstream's own `stableStringify(identity)`, the same
+    /// way the three vectors above are, and **including `socket`** (it read `bace6621…` while the
+    /// key was missing). The two properties it pins are the nested
     /// object's shape (four keys, sorted, `undefined` for each absent member) and the fact that the
     /// pre-image carries the **interpolated** command — which is what upstream's
     /// `"hashes the effective per-request header command"` test asserts
@@ -1552,7 +1644,7 @@ mod tests {
             request_headers_command: Some(HttpRequestHeadersCommand {
                 command: Some("node".to_string()),
                 args: Some(vec!["sign.mjs".to_string(), actor.to_string()]),
-                env: Some(BTreeMap::from([("ACTOR".to_string(), actor.to_string())])),
+                env: Some(BTreeMap::from([("ACTOR".to_string(), actor.to_string())]).into()),
                 timeout_ms: Some(2500.0),
             }),
             ..ResolvedIdentity::verbatim(&entry)
@@ -1567,13 +1659,13 @@ mod tests {
                 r#""env":undefined,"excludeTools":undefined,"exposeResources":undefined,"#,
                 r#""headers":undefined,"includeTools":undefined,"protocolVersion":undefined,"#,
                 r#""requestHeadersCommand":{"args":["sign.mjs","actor-one"],"command":"node","#,
-                r#""env":{"ACTOR":"actor-one"},"timeoutMs":2500},"#,
+                r#""env":{"ACTOR":"actor-one"},"timeoutMs":2500},"socket":undefined,"#,
                 r#""url":"https://api.example.com/mcp"}"#
             )
         );
         assert_eq!(
             compute_server_hash(&entry, &resolved),
-            "bace6621c33527429d57a79c02fd7280efaba5f88f71b42f9c1aa955808234af"
+            "7adc765f97381e1b0635190f397ef162364d648de67dc6c2be17942f6c0e3179"
         );
 
         // `timeoutMs` renders as `2500`, never `2500.0` — the pre-image is JS numbers.
@@ -1822,15 +1914,13 @@ mod tests {
     /// built from upstream's real `interpolateEnvRecord` / `resolveConfigPath` / `resolveServerUrl` /
     /// `resolveBearerToken` — for the pre-image. The reconstruction was proved faithful by asserting
     /// `sha256(preImage) === computeServerHash(definition)` for this and every other fixture before
-    /// the `socket` member was removed.
+    /// the `socket` member landed.
     ///
-    /// **And the caveat the writer's other vectors carry applies here too**: the two constants below
-    /// are upstream's algorithm with `socket` REMOVED, so they are byte-compatible with cyrup and
-    /// not with pi. Upstream's own digest for this same fixture is
-    /// `ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3`, which differs by exactly
-    /// the `"socket":undefined` member — the standing divergence pinned in
-    /// `cyrup_ext_subagents::exec::mcp_direct_tools`'s
-    /// `the_socket_key_is_the_one_divergence_from_upstreams_own_digest`.
+    /// **Both constants include `socket`**, so they are upstream's, unqualified: `ac61954a…` is the
+    /// digest a stock `pi-mcp-adapter` computes for this definition, and it is the digest cyrup
+    /// computes for it. While the key was missing this vector read
+    /// `c273715eef4b2fb58f5db61d54793b01abd262edd7e59a5c7b189fddf910bd3c`, which differed from
+    /// upstream by exactly the `"socket":undefined` member.
     #[test]
     fn the_resolved_identity_golden_vector() {
         let entry: ServerEntry = serde_json::from_str(
@@ -1868,12 +1958,12 @@ mod tests {
                 r#""excludeTools":["b"],"exposeResources":false,"#,
                 r#""headers":{"X-Host":"a.example","X-Lit":"!keep"},"includeTools":["a"],"#,
                 r#""protocolVersion":undefined,"requestHeadersCommand":undefined,"#,
-                r#""url":"https://a.example/mcp"}"#
+                r#""socket":undefined,"url":"https://a.example/mcp"}"#
             )
         );
         assert_eq!(
             try_compute_server_hash(&entry, &vector_env(), &vector_home()).expect("hashable"),
-            "c273715eef4b2fb58f5db61d54793b01abd262edd7e59a5c7b189fddf910bd3c"
+            "ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3"
         );
 
         // …and the same definition under `verbatim` is a DIFFERENT digest — which is the whole
@@ -1888,7 +1978,8 @@ mod tests {
     ///
     /// `!!${HOST}` loses exactly **one** `!` and interpolates the rest, so it hashes as the value
     /// the transport will send; `!op read tok` hashes as its own text and is never executed. Both
-    /// digests are node-generated the same way as the vector above.
+    /// digests are upstream-generated on node 22 the same way as the vector above, and both
+    /// **include `socket`** (they read `bdc09d45…` and `ffcfe72a…` while the key was missing).
     #[test]
     fn the_secret_expression_grammar_is_in_the_digest() {
         let escaped: ServerEntry = serde_json::from_str(
@@ -1900,7 +1991,7 @@ mod tests {
         assert_eq!(resolved.bearer_token.as_deref(), Some("!a.example"));
         assert_eq!(
             compute_server_hash(&escaped, &resolved),
-            "bdc09d452a319a074bd61da2a05dc54a98e5e1d95e619c4a731220f64fa520fa"
+            "1369c625f92c11b211de41532e1f86e9395a38c2afcb2a9d0f11b1a75d6a80bb"
         );
 
         let marker: ServerEntry = serde_json::from_str(
@@ -1912,7 +2003,7 @@ mod tests {
         assert_eq!(resolved.bearer_token.as_deref(), Some("!op read tok"));
         assert_eq!(
             compute_server_hash(&marker, &resolved),
-            "ffcfe72aaf2b4d1e699de1c1be95f7c623f69f9cea8f2dd864b8ef33f9d44414"
+            "b47379b5afec6de30b426546be3fa984693110d3d3e7fa412b94747e359a5d2b"
         );
     }
 

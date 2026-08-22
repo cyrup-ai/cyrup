@@ -927,8 +927,14 @@ object:                             keys sorted lexicographically; `{${`${JSON.s
 ```
 
 The `undefined` branch emits the **bare 9-character token `undefined`**, which is not valid JSON.
-Since the identity object always carries all 14 keys and a typical server sets two or three, the
+Since the identity object always carries every key and a typical server sets two or three, the
 pre-image for a plain stdio server is exactly (no line breaks in the real pre-image):
+
+> **Count note.** "14" was written before v2.26.0 added `requestHeadersCommand`; at `v2.26.1`
+> (`fafae21`) the identity object has **15** keys and the listing below is missing that one.
+> `socket` — which the listing *does* carry, correctly — is the fifteenth in the Rust port, and both
+> `cyrup_mcp::dirs::server_identity_pre_image` and `mcp_direct_tools`'s twin now emit it. Verified by
+> running upstream's own `computeServerHash` on node 22, not by counting the prose.
 
 ```
 {"args":["-y","@modelcontextprotocol/server-filesystem"],"auth":undefined,"bearerToken":undefined,
@@ -1100,10 +1106,18 @@ error path. `combineAbortSignals` has no analogue (`RunCancel::child` is parent�
 the connect-attempt handle. Identity guards are `Arc::ptr_eq`. Blocking-ness: nothing else in the
 section runs until this exists.
 **verify** — connect twice concurrently, assert one transport is created; fire `close` mid-connect and
-assert the resolved connection is disposed and `MCP connection for <name> was closed while connecting`
-is raised; call `reconnect` with a stale handle after another `connect` won and assert the fresh
-connection is returned untouched; assert `get_all_connections()` returns a snapshot a subsequent
-`close` does not mutate.
+assert the resolved connection is disposed and the **abort reason** `` `MCP connection <name> was
+closed` `` is raised — *not* `` `MCP connection for <name> was closed while connecting` ``. That
+second string is reachable only when the generation advanced **without** the attempt being aborted
+(what `reconnect`/`closeAll` can produce), because step 10 runs `throwIfAborted(attemptSignal)`
+*before* it, and `close` aborts the attempt controller with that reason
+(`server-manager.ts:1099`, `:1147`). MEASURED, not read: replaying step 10
+(`server-manager.ts:288-296`) on node 22 against `tmp/pi-mcp-adapter` @ `v2.26.1` (`fafae21`), with
+upstream's own `combineAbortSignals` and `throwIfAborted`, yields `MCP connection filesystem was
+closed` for a close racing a connect and `MCP connection for filesystem was closed while connecting`
+for the generation-only case. Assert both. Then call `reconnect` with a stale handle after another
+`connect` won and assert the fresh connection is returned untouched; assert `get_all_connections()`
+returns a snapshot a subsequent `close` does not mutate.
 
 **MCP-101 — stdio transport: spawn, env resolution, cwd, plugin data dir** · high · M · rmcp + extension-owned
 **upstream** — `server-manager.ts`'s stdio branch of `createConnection`, plus `resolveEnv` and
@@ -1320,7 +1334,12 @@ construction, and that no keychain read happened before the first 401. A permane
 `needs-auth` rather than an error.
 
 **MCP-115a — Wire the per-request header command into `connectHttpClient`** · high · S · hand-written
-*Filed 2026-08-20 by the v2.25.0 → v2.26.1 retarget. NOT implemented.*
+*Filed 2026-08-20 by the v2.25.0 → v2.26.1 retarget. **IMPLEMENTED 2026-08-22** (wave 5), together
+with MCP-101/109/113/114/115 — see `13-cyrup-mcp-STATUS.md`'s wave-5 section. One correction to the
+`cyrup` note below: the decorator is built **once per connect**, above the retry closure, because
+that is where `server-manager.ts:868-870` builds `requestFetch`; building it inside would re-run
+`:309`'s eager validation per attempt. It is still shared by every attempt, which is what the note
+was asking for. The `Authorization` fold-in is done and divergence 3 is closed.*
 **upstream** — `server-manager.ts:868-870` and `:895-896` @v2.26.1 (import at `:61`; commit
 `2a2db3c`). Three lines, inside `connectHttpClient`:
 `const requestFetch = definition.requestHeadersCommand ? createRequestHeadersCommandFetch(definition.requestHeadersCommand) : undefined;`
@@ -1482,6 +1501,12 @@ that succeeds while an abort fired concurrently still awaits the cleanup before 
 process-table assertion that no child survives an aborted connect.
 
 **MCP-124 — Error taxonomy and `containsCleanupFailure`** · high · S · hand-written
+*IMPLEMENTED 2026-08-22 (wave 5). One measured correction to the `cyrup` note below: `Display` must
+NOT render the head. `formatTerminalError` (`utils.ts:229-236`) recurses into `.errors` and `.cause`
+first and pushes the aggregate's own message only `if (messages.length === countBefore)`, so a
+non-empty aggregate renders as its children alone — measured on node 22 over five shapes. The head
+is `error.message`, which is a different projection and is what `server-manager.ts:591/918/939`
+compare; `McpError::aggregate_head` exposes it. The five heads are still byte-exact.*
 **upstream** — the five aggregate messages and `containsCleanupFailure`.
 **behavior** — §3.12. During shutdown, an ordinary connect failure is expected and swallowed; a
 *teardown* failure must surface. The discriminator is an iterative walk of the error graph (an
@@ -1754,6 +1779,22 @@ outside `cyrup-mcp`. Keep `socket` and `protocolVersion` in the pre-image despit
 lands as **four** coordinated edits: the field set (this item), the `undefined` token (MCP-142), the
 `{env:NAME}` pattern (MCP-143) and the `!`/`!!` semantics (MCP-144) — each of which independently
 changes the digest for essentially every server. `sha2` is the in-tree hashing convention.
+
+> **SATISFIED (and the instruction above was right).** The first wave shipped the pre-image without
+> `socket` and recorded the omission as a deliberate Cut-3 divergence. It was not one: upstream's
+> `stableStringify` walks `Object.keys()`, so a `socket` holding `undefined` is still emitted as
+> `"socket":undefined` rather than dropped, and every cyrup digest therefore differed from pi's by
+> exactly that member — for every server, in every config. Both pre-images now emit
+> `"socket": undefined` unconditionally, which is correct **and** complete, because
+> `to_server_entries` rejects any entry that configures a socket (MCP-054), so the value can only
+> ever be `resolveConfigPath(undefined)`. Measured, not argued: upstream's digest for the plain
+> stdio golden fixture is `2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4`, cyrup
+> produced `4dd46c1f…`, and the two are now equal — pinned in
+> `mcp_direct_tools::tests::the_socket_key_is_no_longer_a_divergence_from_upstream`. The same wave
+> closed `protocolVersion` (and `auth`, and `env`/`headers`) on the writer side by giving the
+> config types passthrough arms, so `lenient` no longer discards a value the digest depends on;
+> `Invalid MCP protocolVersion` still throws, at connect, where `resolveVersionNegotiation` throws
+> it.
 **verify** — a golden-vector table of 8 server definitions with their expected SHA-256 hex, generated
 by running the TypeScript at v2.25.0 once and committed as a fixture. This is the only way to prove
 byte-compatibility and it must exist before either implementation is trusted.

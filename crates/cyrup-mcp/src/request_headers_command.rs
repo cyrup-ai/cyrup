@@ -65,9 +65,17 @@
 //!    `validate_custom_header`, which refuses those two and `Last-Event-Id` with
 //!    `StreamableHttpError::ReservedHeaderConflict`. A command that derives one of them fails the
 //!    request here where upstream would have sent it.
-//! 3. **`Authorization` is appended, not replaced.** When a bearer token resolved, rmcp owns that
-//!    header through `auth_header` and applies it with `bearer_auth`; a derived `Authorization`
-//!    arrives as a *second* header value rather than replacing the first.
+//! 3. ~~**`Authorization` is appended, not replaced.**~~ **CLOSED** by MCP-115a. Upstream's
+//!    `headers.set(name, value)` (`request-headers-command.ts:320`) *replaces*, so a derived
+//!    `Authorization` overwrites the configured bearer one. rmcp keeps the bearer in a separate
+//!    `auth_header` argument that `bearer_auth` applies alongside the custom-header map, so the two
+//!    used to go on the wire together — MEASURED against a loopback fixture, which received
+//!    `["Bearer static-bearer", "Signature derived"]` where upstream sends one value.
+//!    `apply_derived` now clears `auth_header` whenever the derived set contains
+//!    `authorization` (case-insensitively, because HTTP field names are), which is upstream's
+//!    replace semantics exactly. The residual is narrower and named: rmcp's `bearer_auth` and the
+//!    custom-header map are still two channels, so a derived header named anything *other* than
+//!    `authorization` cannot displace the bearer — and upstream's `set` could not either.
 //! 4. **Duplicate names differing only in case.** `new Headers([["X-A","1"],["x-a","2"]])` joins to
 //!    `x-a: 1, 2`; a `HashMap<HeaderName, _>` keeps the last. `serde_json` without `preserve_order`
 //!    also sorts the object's keys, so "last" is the byte-greater name rather than the last written.
@@ -235,7 +243,8 @@ pub fn resolve_request_headers_command(
         args: config.args.iter().flatten().map(|arg| interpolate_env_vars(arg)).collect(),
         env: config
             .env
-            .iter()
+            .as_deref()
+            .into_iter()
             .flatten()
             .map(|(key, value)| (key.clone(), interpolate_env_vars(value)))
             .collect(),
@@ -872,13 +881,32 @@ impl<C> RequestHeadersCommandClient<C> {
     }
 }
 
-/// `headers.set(name, value)` for each derived header (`request-headers-command.ts:325`) — replace,
-/// never append. See divergences 2–4 in the module header for what rmcp does with the result.
+/// `headers.set(name, value)` for each derived header (`request-headers-command.ts:320`) — replace,
+/// never append. See divergences 2 and 4 in the module header for what rmcp does with the result.
+///
+/// # Why `auth_header` is an argument
+///
+/// `set` replaces, and the header it most often replaces is `Authorization` — a signing helper
+/// deriving a SigV4 or DPoP header is *the* use case. rmcp does not keep `Authorization` in
+/// `custom_headers`: a configured `bearerToken` rides in the separate `auth_header` argument, which
+/// its reqwest client applies with `RequestBuilder::bearer_auth`, and reqwest's `bearer_auth`
+/// **appends**. Inserting a derived `authorization` into `custom_headers` therefore used to put
+/// BOTH on the wire — measured on a loopback fixture as
+/// `["Bearer static-bearer", "Signature derived"]`. Clearing `auth_header` when the derived set
+/// carries an `authorization` is what makes the two channels behave like upstream's one `Headers`
+/// object.
 fn apply_derived(
     custom_headers: &mut HashMap<HeaderName, HeaderValue>,
+    auth_header: &mut Option<String>,
     derived: Vec<(HeaderName, HeaderValue)>,
 ) {
     for (name, value) in derived {
+        // `HeaderName` is already lowercase-normalised by `http`, so this comparison is exact
+        // rather than a case-folding heuristic — but it is written against `AUTHORIZATION` rather
+        // than the literal so a future `HeaderName` representation change cannot silently break it.
+        if name == http::header::AUTHORIZATION {
+            *auth_header = None;
+        }
         let _ = custom_headers.insert(name, value);
     }
 }
@@ -904,7 +932,7 @@ where
         uri: Arc<str>,
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
-        auth_header: Option<String>,
+        mut auth_header: Option<String>,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         // `request.clone().arrayBuffer()` — the exact bytes the POST will carry. rmcp's reqwest
@@ -912,7 +940,7 @@ where
         // same document byte for byte.
         let body = serde_json::to_vec(&message).map_err(StreamableHttpError::Deserialize)?;
         let derived = self.derive("POST", &uri, &body).await.map_err(transport_error)?;
-        apply_derived(&mut custom_headers, derived);
+        apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner
             .post_message(uri, message, session_id, auth_header, custom_headers)
             .await
@@ -923,13 +951,13 @@ where
         uri: Arc<str>,
         message: ClientJsonRpcMessage,
         session_id: Option<Arc<str>>,
-        auth_header: Option<String>,
+        mut auth_header: Option<String>,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
         let body = serde_json::to_vec(&message).map_err(StreamableHttpError::Deserialize)?;
         let derived = self.derive("POST", &uri, &body).await.map_err(transport_error)?;
-        apply_derived(&mut custom_headers, derived);
+        apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner
             .post_message_with_max_sse_event_size(
                 uri,
@@ -947,11 +975,11 @@ where
         uri: Arc<str>,
         session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
-        auth_header: Option<String>,
+        mut auth_header: Option<String>,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
         let derived = self.derive("GET", &uri, &[]).await.map_err(transport_error)?;
-        apply_derived(&mut custom_headers, derived);
+        apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner
             .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
             .await
@@ -962,12 +990,12 @@ where
         uri: Arc<str>,
         session_id: Option<Arc<str>>,
         last_event_id: Option<String>,
-        auth_header: Option<String>,
+        mut auth_header: Option<String>,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
         max_sse_event_size: usize,
     ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
         let derived = self.derive("GET", &uri, &[]).await.map_err(transport_error)?;
-        apply_derived(&mut custom_headers, derived);
+        apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner
             .get_stream_with_max_sse_event_size(
                 uri,
@@ -984,11 +1012,11 @@ where
         &self,
         uri: Arc<str>,
         session_id: Arc<str>,
-        auth_header: Option<String>,
+        mut auth_header: Option<String>,
         mut custom_headers: HashMap<HeaderName, HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
         let derived = self.derive("DELETE", &uri, &[]).await.map_err(transport_error)?;
-        apply_derived(&mut custom_headers, derived);
+        apply_derived(&mut custom_headers, &mut auth_header, derived);
         self.inner.delete_session(uri, session_id, auth_header, custom_headers).await
     }
 }
@@ -1068,10 +1096,13 @@ mod tests {
         let entry = HttpRequestHeadersCommand {
             command: Some("${CYRUP_MCP_RHC_TEST_MISSING}signer".to_string()),
             args: Some(vec!["--actor=$env:CYRUP_MCP_RHC_TEST_MISSING".to_string()]),
-            env: Some(BTreeMap::from([(
-                "ACTOR".to_string(),
-                "{env:CYRUP_MCP_RHC_TEST_MISSING}x".to_string(),
-            )])),
+            env: Some(
+                BTreeMap::from([(
+                    "ACTOR".to_string(),
+                    "{env:CYRUP_MCP_RHC_TEST_MISSING}x".to_string(),
+                )])
+                .into(),
+            ),
             timeout_ms: None,
         };
         let resolved = resolve_request_headers_command(&entry).unwrap();
@@ -1150,7 +1181,7 @@ mod tests {
         // Reads the envelope off stdin and echoes the decoded body straight back as a header, which
         // is upstream's `readEnvelope` fixture in one line of shell.
         let entry = HttpRequestHeadersCommand {
-            env: Some(BTreeMap::from([("TEST_ACTOR".to_string(), "actor-123".to_string())])),
+            env: Some(BTreeMap::from([("TEST_ACTOR".to_string(), "actor-123".to_string())]).into()),
             ..sh(
                 r#"body=$(sed -n 's/.*"bodyBase64":"\([^"]*\)".*/\1/p' | base64 -d)
                    printf '{"x-derived-body":"%s","x-derived-actor":"%s"}' "$body" "$TEST_ACTOR""#,

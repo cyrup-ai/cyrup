@@ -4208,12 +4208,12 @@ mod tests {
         headers.insert("x-tenant".to_string(), "acme".to_string());
         assert!(supports_oauth(&http(ServerEntry {
             auth: Some(AuthMode::Named(AuthKind::Oauth)),
-            headers: Some(headers.clone()),
+            headers: Some(headers.clone().into()),
             ..base.clone()
         })));
         // headers alone disable auto-detection.
         assert!(!supports_oauth(&http(ServerEntry {
-            headers: Some(headers),
+            headers: Some(headers.into()),
             ..base.clone()
         })));
         // auth === undefined
@@ -4798,16 +4798,20 @@ mod tests {
     // --- MCP-345: both errors survive a failing cleanup -------------------------------------------
 
     #[test]
-    fn an_aggregate_renders_the_phase_and_both_messages() {
+    fn an_aggregate_renders_both_child_messages_and_drops_the_phase() {
         let aggregate = aggregate_error(
             PHASE_STARTUP_CLEANUP,
             McpError::other("port in use"),
             McpError::other("keychain locked"),
         );
-        assert_eq!(
-            aggregate.to_string(),
-            "OAuth startup cleanup failed: port in use: keychain locked"
-        );
+        // MEASURED, node 22, upstream's own `formatTerminalError` on
+        // `new AggregateError([Error("port in use"), Error("keychain locked")],
+        //   "OAuth startup cleanup failed")` → `"port in use: keychain locked"`.
+        // The phase is the aggregate's `.message`, and `formatTerminalError` pushes `.message`
+        // only when no child contributed text (`utils.ts:249`). This test used to assert the
+        // phase-prefixed form; it was pinning a divergence.
+        assert_eq!(aggregate.to_string(), "port in use: keychain locked");
+        assert_eq!(aggregate.aggregate_head(), Some(PHASE_STARTUP_CLEANUP));
         // The structure survives, not just the rendering.
         assert!(matches!(
             &aggregate,

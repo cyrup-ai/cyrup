@@ -41,6 +41,36 @@ const CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// `npx-resolver.ts:229` `FORCE_CACHE_TIMEOUT_MS`.
 const FORCE_CACHE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// `npx-resolver.ts:10` `EXACT_PACKAGE_VERSION_RE` — MCP-105.
+///
+/// ```text
+/// /^\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?$/
+/// ```
+///
+/// Two deliberate spelling changes, both because the two engines disagree about what the *source*
+/// means rather than about what the pattern should match:
+///
+/// * `\d` is spelled `[0-9]`. JavaScript's `\d` is ASCII-only; Rust's `regex` makes it
+///   Unicode-aware, so `\d+` there would accept `١.٢.٣` and pin a version npm can never produce.
+///   The same substitution is made — for `\w`, and for the same reason — in
+///   `cyrup_mcp::credentials::interpolate_env_vars`.
+/// * `^`/`$` are spelled `\A`/`\z`, which is explicitness rather than a fix: Rust's `$` without
+///   `multi_line` already anchors to the end of the haystack, exactly as JavaScript's does without
+///   `m`. MEASURED, because the obvious worry turns out to be moot in a more interesting way:
+///   `parsePackageSpec("pkg@1.2.3\n")` pins to `"1.2.3"` upstream — `spec.trim()` removes the
+///   newline before the pattern runs — so only an INTERIOR newline ever reaches these anchors.
+static EXACT_PACKAGE_VERSION: OnceLock<regex::Regex> = OnceLock::new();
+
+fn exact_package_version_re() -> &'static regex::Regex {
+    #[allow(clippy::expect_used)]
+    EXACT_PACKAGE_VERSION.get_or_init(|| {
+        regex::Regex::new(
+            r"\A[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?\z",
+        )
+        .expect("EXACT_PACKAGE_VERSION_RE is a literal and compiles")
+    })
+}
+
 /// `npx-resolver.ts:22-26` `NpxResolution`.
 #[derive(Debug, Clone)]
 pub(super) struct NpxResolution {
@@ -88,10 +118,16 @@ pub(super) fn resolve_npx_binary(command: &str, args: &[String]) -> Option<NpxRe
         _ => return None,
     };
 
+    // `const packageSpec = parsePackageSpec(parsed.packageSpec);` — computed BEFORE the cache is
+    // consulted, because its `exactVersion` is part of the hit predicate (MCP-105).
+    let package_spec = parse_package_spec(&parsed.package_spec);
     let cache_key = cache_key(command, args);
     if let Some(cached) = load_cache().and_then(|c| c.entries.get(&cache_key).cloned())
-        && now_ms().saturating_sub(cached.resolved_at) < CACHE_TTL_MS
-        && Path::new(&cached.resolved_bin).exists()
+        && cache_entry_is_usable(
+            &cached,
+            package_spec.as_ref().and_then(|spec| spec.exact_version.as_deref()),
+            now_ms(),
+        )
     {
         return Some(NpxResolution {
             bin_path: cached.resolved_bin,
@@ -265,8 +301,11 @@ fn resolve_from_npm_cache_at(
     package_spec: &str,
     bin_name: Option<&str>,
 ) -> Option<NpxCacheEntry> {
-    let package_name = extract_package_name(package_spec)?;
-    let package_dir = find_cached_package_dir(cache_dir, &package_name)?;
+    // `const parsedSpec = parsePackageSpec(packageSpec); if (!parsedSpec) return null;`
+    let parsed = parse_package_spec(package_spec)?;
+    let package_name = parsed.package_name;
+    let package_dir =
+        find_cached_package_dir(cache_dir, &package_name, parsed.exact_version.as_deref())?;
 
     let package_json_path = package_dir.join("package.json");
     if !package_json_path.is_file() {
@@ -404,24 +443,104 @@ fn build_bin_candidates(package_name: &str, explicit_bin: Option<&str>) -> Vec<S
     candidates.into_iter().filter(|c| !c.is_empty() && seen.insert(c.clone())).collect()
 }
 
-/// `npx-resolver.ts:268-282` `extractPackageName`.
-fn extract_package_name(spec: &str) -> Option<String> {
+/// `npx-resolver.ts:60-66` — the cache-hit predicate, as a pure function so it can be asserted
+/// without a filesystem or a clock (MCP-105).
+///
+/// ```text
+/// cached
+/// && Date.now() - cached.resolvedAt < CACHE_TTL_MS
+/// && existsSync(cached.resolvedBin)
+/// && (!packageSpec?.exactVersion || cached.packageVersion === packageSpec.exactVersion)
+/// ```
+///
+/// The fourth clause is MCP-105's, and without it a cache entry recorded for `pkg@2.0.0` satisfies
+/// a later `pkg@1.0.0` for a whole day — the entry keys on `[command, packageSpec, binName]`, so
+/// the two DO occupy different slots, but an entry written before a `package.json` changed under it
+/// does not. `cached.packageVersion` absent (`None`) never equals a requested exact version, which
+/// is `undefined === "1.0.0"` upstream: also false.
+fn cache_entry_is_usable(cached: &NpxCacheEntry, exact_version: Option<&str>, now: u64) -> bool {
+    if now.saturating_sub(cached.resolved_at) >= CACHE_TTL_MS {
+        return false;
+    }
+    if !Path::new(&cached.resolved_bin).exists() {
+        return false;
+    }
+    match exact_version {
+        None => true,
+        Some(wanted) => cached.package_version.as_deref() == Some(wanted),
+    }
+}
+
+/// `npx-resolver.ts:37-40` `ParsedPackageSpec` — MCP-105.
+///
+/// Upstream replaced `extractPackageName` with this: the name alone was never enough, because a
+/// spec that names an EXACT version has to pin, and one that names a range must not. This port had
+/// only the name half, so `npx -y pkg@1.0.0` happily resolved to whichever `_npx` copy had the
+/// newest mtime — including `pkg@2.0.0`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedPackageSpec {
+    package_name: String,
+    /// `Some` only when the requested version is a full semver after normalisation. `^1.2.0`,
+    /// `~1.2.0`, `1.2`, `latest` and `""` all carry `None` and pin nothing.
+    exact_version: Option<String>,
+}
+
+/// `npx-resolver.ts:304-338` `parsePackageSpec` — MCP-105, replacing `extractPackageName`.
+///
+/// Every arm below was MEASURED against upstream's own function on node 22 (`v2.26.1`, `fafae21`)
+/// over 29 specs; the table is reproduced in `parse_package_spec_matches_upstream_case_for_case`.
+/// The three that a reading gets wrong:
+///
+/// * `pkg@01.2.3` DOES pin, to the literal `"01.2.3"` — the pattern is `\d+`, not a semver
+///   validator, and npm's own `version` field would have to match that string byte for byte.
+/// * `"  spaced@1.0.0  "` trims first, so the name is `spaced`.
+/// * `pkg@=v1.2.3` normalises to `1.2.3`: one leading `=` then one leading `v`/`V`, in that order.
+///   `pkg@vv1.2.3` therefore pins nothing.
+fn parse_package_spec(spec: &str) -> Option<ParsedPackageSpec> {
     let trimmed = spec.trim();
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed.starts_with('@') {
+
+    let (package_name, requested_version): (&str, Option<&str>) = if trimmed.starts_with('@') {
+        // `const slashIndex = trimmed.indexOf("/"); if (slashIndex < 0) return null;`
         let slash_index = trimmed.find('/')?;
+        // `const atIndex = trimmed.lastIndexOf("@");` — always `>= 0` here, since index 0 is `@`.
         let at_index = trimmed.rfind('@').unwrap_or(0);
         if at_index > slash_index {
-            return trimmed.get(..at_index).map(str::to_string);
+            (trimmed.get(..at_index)?, trimmed.get(at_index + 1..))
+        } else {
+            (trimmed, None)
         }
-        return Some(trimmed.to_string());
+    } else {
+        match trimmed.find('@') {
+            Some(at_index) => (trimmed.get(..at_index)?, trimmed.get(at_index + 1..)),
+            None => (trimmed, None),
+        }
+    };
+
+    // `if (!packageName) return null;`
+    if package_name.is_empty() {
+        return None;
     }
-    match trimmed.find('@') {
-        Some(at_index) => trimmed.get(..at_index).map(str::to_string),
-        None => Some(trimmed.to_string()),
-    }
+
+    // `requestedVersion?.replace(/^=/, "").replace(/^v/i, "")` — ONE `=`, then ONE `v` or `V`.
+    let normalized = requested_version.map(|version| {
+        let version = version.strip_prefix('=').unwrap_or(version);
+        version
+            .strip_prefix('v')
+            .or_else(|| version.strip_prefix('V'))
+            .unwrap_or(version)
+    });
+
+    Some(ParsedPackageSpec {
+        package_name: package_name.to_string(),
+        // `...(normalizedVersion && RE.test(normalizedVersion) ? { exactVersion } : {})` — the
+        // `&&` is a truthiness test, so an empty string carries nothing.
+        exact_version: normalized
+            .filter(|version| !version.is_empty() && exact_package_version_re().is_match(version))
+            .map(str::to_string),
+    })
 }
 
 /// `npx-resolver.ts:284-290` `defaultBinName`.
@@ -437,8 +556,18 @@ fn default_bin_name(package_name: &str) -> String {
     }
 }
 
-/// `npx-resolver.ts:292-317` `findCachedPackageDir`.
-fn find_cached_package_dir(cache_dir: &Path, package_name: &str) -> Option<PathBuf> {
+/// `npx-resolver.ts:348-381` `findCachedPackageDir` — MCP-105 added `exactVersion`.
+///
+/// The directory list is ordered newest-mtime-first and the FIRST candidate holding the package
+/// wins. With `exact_version` set, a candidate whose `package.json` `version` is not that string is
+/// skipped instead — which is the whole of the pin: `npx -y pkg@1.0.0` must resolve to the 1.0.0
+/// copy even when a 2.0.0 copy was installed more recently. A `package.json` that cannot be read or
+/// parsed is skipped too (upstream's `catch { continue }`), NOT treated as a match.
+fn find_cached_package_dir(
+    cache_dir: &Path,
+    package_name: &str,
+    exact_version: Option<&str>,
+) -> Option<PathBuf> {
     let npx_dir = cache_dir.join("_npx");
     if !npx_dir.is_dir() {
         return None;
@@ -464,9 +593,24 @@ fn find_cached_package_dir(cache_dir: &Path, package_name: &str) -> Option<PathB
         for part in &package_path_parts {
             pkg_dir = pkg_dir.join(part);
         }
-        if pkg_dir.join("package.json").is_file() {
-            return Some(pkg_dir);
+        let package_json = pkg_dir.join("package.json");
+        if !package_json.is_file() {
+            continue;
         }
+        if let Some(wanted) = exact_version {
+            // `const pkg = JSON.parse(readFileSync(...)); if (pkg.version !== exactVersion) continue;`
+            let Some(version) = fs::read_to_string(&package_json)
+                .ok()
+                .and_then(|raw| serde_json::from_str::<PackageJson>(&raw).ok())
+                .and_then(|pkg| pkg.version)
+            else {
+                continue;
+            };
+            if version != wanted {
+                continue;
+            }
+        }
+        return Some(pkg_dir);
     }
     None
 }
@@ -719,24 +863,143 @@ mod tests {
         assert!(parse_npm_exec_args(&args(&["exec", "--package", "", "--", "mybin"])).is_none());
     }
 
+    fn name_of(spec: &str) -> Option<String> {
+        parse_package_spec(spec).map(|parsed| parsed.package_name)
+    }
+
+    // The four `extractPackageName` cases, kept as-is against its replacement: MCP-105 removed the
+    // function upstream but not the behaviour, and these are the rows that would regress if
+    // `parse_package_spec` got the `@scope` split wrong.
     #[test]
     fn extract_package_name_scoped_with_version() {
-        assert_eq!(extract_package_name("@foo/bar@1.2.3").as_deref(), Some("@foo/bar"));
+        assert_eq!(name_of("@foo/bar@1.2.3").as_deref(), Some("@foo/bar"));
     }
 
     #[test]
     fn extract_package_name_scoped_no_version() {
-        assert_eq!(extract_package_name("@foo/bar").as_deref(), Some("@foo/bar"));
+        assert_eq!(name_of("@foo/bar").as_deref(), Some("@foo/bar"));
     }
 
     #[test]
     fn extract_package_name_unscoped_with_version() {
-        assert_eq!(extract_package_name("bar@1.2.3").as_deref(), Some("bar"));
+        assert_eq!(name_of("bar@1.2.3").as_deref(), Some("bar"));
     }
 
     #[test]
     fn extract_package_name_scoped_missing_slash_is_none() {
-        assert!(extract_package_name("@foo").is_none());
+        assert!(name_of("@foo").is_none());
+    }
+
+    /// Every one of these 29 rows was produced by running upstream's own `parsePackageSpec`
+    /// (`tmp/pi-mcp-adapter/npx-resolver.ts:304`, `v2.26.1` = `fafae21`) on node 22, over a copy of
+    /// the module with the function re-exported; the copy was deleted afterwards and the upstream
+    /// checkout verified clean. Nothing here is transcribed from the regex by eye — the three rows
+    /// that would have been wrong if it were are marked.
+    #[test]
+    fn parse_package_spec_matches_upstream_case_for_case() {
+        // (spec, packageName or None, exactVersion or None)
+        let table: &[(&str, Option<&str>, Option<&str>)] = &[
+            ("pkg", Some("pkg"), None),
+            ("pkg@1.2.3", Some("pkg"), Some("1.2.3")),
+            ("pkg@^1.2.0", Some("pkg"), None),
+            ("pkg@~1.2.0", Some("pkg"), None),
+            ("pkg@=1.2.3", Some("pkg"), Some("1.2.3")),
+            ("pkg@v1.2.3", Some("pkg"), Some("1.2.3")),
+            ("pkg@V1.2.3", Some("pkg"), Some("1.2.3")),
+            ("pkg@=v1.2.3", Some("pkg"), Some("1.2.3")),
+            ("pkg@1.2.3-beta.1", Some("pkg"), Some("1.2.3-beta.1")),
+            ("pkg@1.2.3+build.5", Some("pkg"), Some("1.2.3+build.5")),
+            ("pkg@1.2.3-rc.1+build.5", Some("pkg"), Some("1.2.3-rc.1+build.5")),
+            ("pkg@1.2", Some("pkg"), None),
+            ("pkg@latest", Some("pkg"), None),
+            ("pkg@", Some("pkg"), None),
+            ("pkg@1.2.3.4", Some("pkg"), None),
+            // SURPRISE 1: leading zeros PIN, and pin to the literal string.
+            ("pkg@01.2.3", Some("pkg"), Some("01.2.3")),
+            ("@scope/name", Some("@scope/name"), None),
+            ("@scope/name@1.2.3", Some("@scope/name"), Some("1.2.3")),
+            ("@scope/name@^1.0.0", Some("@scope/name"), None),
+            ("@scope", None, None),
+            ("@", None, None),
+            ("", None, None),
+            // SURPRISE 2: the spec is trimmed before anything else.
+            ("  spaced@1.0.0  ", Some("spaced"), Some("1.0.0")),
+            ("pkg@-1.2.3", Some("pkg"), None),
+            ("pkg@1.2.3-", Some("pkg"), None),
+            ("pkg@1.2.3+", Some("pkg"), None),
+            ("@scope/name@=V2.0.0", Some("@scope/name"), Some("2.0.0")),
+            // SURPRISE 3: exactly ONE `v` is stripped, so `vv` pins nothing.
+            ("pkg@vv1.2.3", Some("pkg"), None),
+            ("pkg@ 1.2.3", Some("pkg"), None),
+        ];
+        for (spec, name, version) in table {
+            let parsed = parse_package_spec(spec);
+            assert_eq!(
+                parsed.as_ref().map(|parsed| parsed.package_name.as_str()),
+                *name,
+                "packageName for {spec:?}"
+            );
+            assert_eq!(
+                parsed
+                    .as_ref()
+                    .and_then(|parsed| parsed.exact_version.as_deref()),
+                *version,
+                "exactVersion for {spec:?}"
+            );
+        }
+    }
+
+    /// A `\d`-shaped trap Rust would fall into and JavaScript would not: `regex`'s `\d` is
+    /// Unicode-aware, so a pattern written with `\d` would accept Arabic-Indic digits and pin a
+    /// "version" npm cannot have produced. MEASURED against upstream on node 22:
+    /// `parsePackageSpec("pkg@\u{661}.\u{662}.\u{663}")` is `{"packageName":"pkg"}` — no pin.
+    ///
+    /// The trailing-newline rows are the other half of the measurement and they corrected the
+    /// comment above the pattern: `"pkg@1.2.3\n"` DOES pin upstream, to `"1.2.3"`, because
+    /// `spec.trim()` removes the newline before the pattern ever sees it. The `\A`/`\z` anchors
+    /// are therefore belt-and-braces rather than a fix for a real divergence — Rust's `$` does not
+    /// match before a trailing newline either — and only an INTERIOR newline reaches the pattern.
+    #[test]
+    fn only_ascii_digits_can_pin_a_version() {
+        let pin = |spec: &str| {
+            parse_package_spec(spec)
+                .expect("a name is still parsed")
+                .exact_version
+        };
+        assert_eq!(pin("pkg@\u{661}.\u{662}.\u{663}"), None);
+        // Trimmed before parsing, so this pins — upstream does the same.
+        assert_eq!(pin("pkg@1.2.3\n").as_deref(), Some("1.2.3"));
+        // An interior newline or tab is what the anchors actually exclude.
+        assert_eq!(pin("pkg@1.2.3\nx"), None);
+        assert_eq!(pin("pkg@1.2.3\tx"), None);
+    }
+
+    /// `npx-resolver.ts:60-66`'s fourth clause. The entry's own `packageVersion` is what decides,
+    /// and an entry that never recorded one can never satisfy a pinned request.
+    #[test]
+    fn a_cache_entry_recorded_for_another_version_is_rejected() {
+        let entry = NpxCacheEntry {
+            // The predicate calls `existsSync`, so point it at something that exists.
+            resolved_bin: std::env::current_exe()
+                .expect("a test binary exists")
+                .to_string_lossy()
+                .into_owned(),
+            resolved_at: 1_000,
+            package_version: Some("2.0.0".to_string()),
+            is_js: false,
+        };
+        // A range (no exact version) accepts whatever is cached — upstream's `!packageSpec?.exactVersion`.
+        assert!(cache_entry_is_usable(&entry, None, 1_000));
+        // The matching pin accepts.
+        assert!(cache_entry_is_usable(&entry, Some("2.0.0"), 1_000));
+        // A different pin rejects. THIS is the arm that did not exist before MCP-105.
+        assert!(!cache_entry_is_usable(&entry, Some("1.0.0"), 1_000));
+        // An entry with no recorded version can never satisfy a pin.
+        let unversioned = NpxCacheEntry { package_version: None, ..entry.clone() };
+        assert!(cache_entry_is_usable(&unversioned, None, 1_000));
+        assert!(!cache_entry_is_usable(&unversioned, Some("1.0.0"), 1_000));
+        // And the TTL still governs, pin or no pin.
+        assert!(!cache_entry_is_usable(&entry, Some("2.0.0"), 1_000 + CACHE_TTL_MS));
     }
 
     #[test]
@@ -806,6 +1069,70 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    /// MCP-105's verify line, as a hermetic fixture: **two versions of the same package in `_npx`,
+    /// with the WRONG one carrying the newer mtime**.
+    ///
+    /// Without the version filter, `findCachedPackageDir`'s newest-mtime-first walk returns the
+    /// 2.0.0 copy for every request, so `npx -y pkg@1.0.0` launches 2.0.0 — silently, and for as
+    /// long as that directory stays newest. The three assertions are the three behaviours: a pin
+    /// selects by version, a RANGE still selects by mtime (upstream does not resolve ranges), and a
+    /// pin for a version that is not installed resolves to nothing rather than to the nearest thing.
+    #[cfg(unix)]
+    #[test]
+    fn an_exact_version_pins_past_a_newer_wrong_one() {
+        let root = std::env::temp_dir().join(format!(
+            "cyrup-npx-pin-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+
+        let install = |hash: &str, version: &str| {
+            let hash_dir = root.join("_npx").join(hash);
+            let pkg_dir = hash_dir.join("node_modules").join("widget");
+            fs::create_dir_all(&pkg_dir).expect("mkdir");
+            fs::write(
+                pkg_dir.join("package.json"),
+                format!(r#"{{"name":"widget","version":"{version}","bin":{{"widget":"cli.js"}}}}"#),
+            )
+            .expect("package.json");
+            fs::write(pkg_dir.join("cli.js"), "#!/usr/bin/env node\n").expect("cli.js");
+            hash_dir
+        };
+
+        // 1.0.0 first, then 2.0.0 — so the 2.0.0 directory is the newer one and wins the mtime sort.
+        let old_dir = install("aaa", "1.0.0");
+        std::thread::sleep(Duration::from_millis(1100));
+        let new_dir = install("bbb", "2.0.0");
+        let mtime_of = |dir: &Path| {
+            dir.metadata()
+                .and_then(|meta| meta.modified())
+                .unwrap_or(UNIX_EPOCH)
+        };
+        assert!(
+            mtime_of(&new_dir) > mtime_of(&old_dir),
+            "the fixture is only meaningful if the WRONG copy is the newer one"
+        );
+
+        // A range pins nothing, so the newest-mtime copy wins — upstream's unchanged behaviour.
+        let ranged = resolve_from_npm_cache_at(&root, "widget@^1.0.0", None).expect("resolves");
+        assert_eq!(ranged.package_version.as_deref(), Some("2.0.0"));
+        assert!(ranged.resolved_bin.contains("bbb"));
+
+        // An exact version pins past it. THIS is the bug MCP-105 closes.
+        let pinned = resolve_from_npm_cache_at(&root, "widget@1.0.0", None).expect("resolves");
+        assert_eq!(pinned.package_version.as_deref(), Some("1.0.0"));
+        assert!(
+            pinned.resolved_bin.contains("aaa"),
+            "expected the 1.0.0 copy, got {}",
+            pinned.resolved_bin
+        );
+
+        // A pin for something that is not installed resolves to NOTHING — never to the nearest.
+        assert!(resolve_from_npm_cache_at(&root, "widget@3.0.0", None).is_none());
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

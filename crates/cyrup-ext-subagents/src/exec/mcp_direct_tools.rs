@@ -25,7 +25,7 @@
 //!
 //! `<agent_dir>/mcp-cache.json` has exactly two participants: `cyrup_mcp::dirs` writes it, this
 //! module reads it. Three things they must agree on byte-for-byte live in the writer:
-//! `cyrup_mcp::dirs::server_identity_pre_image` (the 14-key `configHash` pre-image),
+//! `cyrup_mcp::dirs::server_identity_pre_image` (the 15-key `configHash` pre-image),
 //! `cyrup_mcp::dirs::stable_stringify` (the token grammar that pre-image is rendered in) and
 //! `cyrup_mcp::registration::{server_prefix, format_tool_name}` (the name a direct tool is actually
 //! registered under). The writer was retargeted at upstream v2.26.1 and this reader was not, so the
@@ -33,7 +33,7 @@
 //! resolved to nothing) and every resource-backed tool resolved to a name the adapter never
 //! registers. This module now mirrors all three:
 //!
-//! * MCP-141 — the identity pre-image is the same **14** keys, in the same *resolved* forms, as
+//! * MCP-141 — the identity pre-image is the same **15** keys, in the same *resolved* forms, as
 //!   `server_identity_pre_image` (upstream `computeServerHash`, `metadata-cache.ts:82` @ v2.26.1).
 //! * MCP-142 — `stable_stringify` renders an **absent** field as the bare nine-character token
 //!   `undefined` (`metadata-cache.ts:344`), which is why `HashValue` exists instead of
@@ -56,40 +56,50 @@
 //! sides now hash the *resolved* forms and `reader_and_writer_agree_once_every_resolver_actually_runs`
 //! asserts one node-generated vector through both implementations.
 //!
-//! ## What this module is NOT byte-identical to, stated exactly
+//! ## The four hashing divergences that used to live here are closed
 //!
-//! **A digest divergence survives on `auth` and `protocolVersion`.** Upstream hashes both verbatim —
-//! `auth: definition.auth`, `protocolVersion: definition.protocolVersion` (`metadata-cache.ts:103-104`)
-//! — and `config.ts` validates neither at load; `Invalid MCP protocolVersion` is thrown at CONNECT
-//! time, long after the digest is taken. This reader holds both raw (`Option<Value>`) and so matches
-//! upstream. The writer types them (`cyrup_mcp::config::{AuthMode, ProtocolVersionSetting}`) behind
-//! `deserialize_with = "lenient"`, which drops any value the type does not accept to `None`, and
-//! `ProtocolVersionSetting` accepts only `"legacy" | "auto" | "2026-07-28"`. So for a server pinned
-//! to any OTHER real MCP revision — `"2025-06-18"`, say — the reader hashes the literal and the
-//! writer hashes `undefined`, and that server's cache entry can never validate. It fails safe (a
-//! re-discovery, not a wrong answer) and it is silent, which is why it is pinned by
-//! `a_protocol_revision_the_writers_enum_rejects_diverges_on_the_digest` below rather than left to
-//! be rediscovered. The fix is a passthrough arm on the writer's two enums so the raw value survives
-//! to the pre-image — a change to the config type model (13b), hence the owner's call, not a
-//! porter's.
+//! Three of them were the writer's config types discarding what upstream keeps, and the fourth was
+//! a key both sides dropped. All four moved every digest, and all four were free to fix only while
+//! `cyrup_mcp::dirs::save_metadata_cache` still had no production call site — no deployed cache had
+//! to be invalidated.
 //!
-//! **A second, narrower divergence is a path one, not a digest one.** The home this
+//! 1. **`socket`.** Upstream's identity object has **15** keys, and its third is
+//!    `socket: resolveConfigPath(definition.socket)` (`metadata-cache.ts:89`). `stableStringify`
+//!    walks `Object.keys()`, so an absent `socket` is emitted as `"socket":undefined` rather than
+//!    dropped. Both Rust pre-images omitted the key, so every cyrup digest differed from pi's by
+//!    exactly that member. Both now emit it unconditionally — `socket` is Cut 3 and
+//!    `cyrup_mcp::config::to_server_entries` rejects any entry configuring one, so the value can
+//!    only be `undefined`. `the_socket_key_is_no_longer_a_divergence_from_upstream` pins cyrup's
+//!    digest against upstream's own, measured on node 22.
+//! 2. **`auth`** — the writer's `AuthMode` gained a verbatim `Other` arm, so `auth: "basic"` reaches
+//!    the pre-image instead of being dropped to `undefined` by `lenient`.
+//! 3. **`protocolVersion`** — likewise `ProtocolVersionSetting::Other`, so a real revision such as
+//!    `"2025-06-18"` is hashed as written. `Invalid MCP protocolVersion` is still raised, at
+//!    **connect**, by `cyrup_mcp::runtime::version_negotiation` — which is where upstream raises it,
+//!    and which the deserialiser must not pre-empt.
+//! 4. **`env` / `headers`** — the worst of the four, because the two crates returned *opposite*
+//!    answers rather than merely different digests. Upstream's `interpolateEnvRecord` throws on a
+//!    non-string member and `isServerCacheValid` catches it to `false`, which is what this reader
+//!    has always done; the writer's `lenient` dropped the whole map, hashed `"env":undefined` and
+//!    called the entry VALID. `cyrup_mcp::config::StringRecord` now carries the throw.
+//!
+//! A **fifth** turned up while measuring the four, and it was this module's: `auth` and
+//! `protocolVersion` are `Option<Value>` here, and serde's derived `Option<T>` reads a JSON `null`
+//! as `None` — so `auth: null` hashed as `"auth":undefined` where upstream hashes `"auth":null`,
+//! and the writer (whose `lenient` keeps the raw value) was the correct side. `present_or_absent`
+//! is the fix. It was found by `reader_writer_and_upstream_agree_across_the_edge_cases`, which
+//! compares both implementations against *upstream's* digest rather than against each other — the
+//! reader-versus-writer tables agreed happily while both were one key away from pi.
+//!
+//! ## What this module is still NOT byte-identical to, stated exactly
+//!
+//! **A narrow divergence remains, and it is a path one, not a digest one.** The home this
 //! module anchors `~` against ([`home_dir`]: `CYRUP_HOME` → `HOME` → tempdir) is not the home the
 //! writer's default hasher uses (`cyrup_mcp::dirs::home_dir`: `HOME` → `USERPROFILE`), so with
 //! `CYRUP_HOME` set to something other than `HOME` the two disagree — but only for a server whose
 //! `cwd` actually starts with `~`. That is the narrow tail of MCP-139's agent-dir axis 3, whose fix
 //! is the one shared agent-dir resolver that unit specifies, spanning `cyrup_ext`'s `npx_resolver`
 //! as well as this file.
-//!
-//! **And neither side matches upstream on `socket`.** `computeServerHash` builds a **15**-key
-//! identity whose third key is `socket: resolveConfigPath(definition.socket)`
-//! (`metadata-cache.ts:89`), and upstream's `stableStringify` walks `Object.keys()`, so an absent
-//! `socket` is still emitted as `"socket":undefined` rather than dropped. `ServerEntry` has no
-//! `socket` field at all post-Cut-3, and both Rust pre-images omit the key entirely — a deliberate,
-//! documented choice on the writer (`cyrup_mcp::dirs` golden vectors say "with `socket` unset"),
-//! but one that contradicts 13c-mcp-servers.md:1753 ("Keep `socket` … in the pre-image despite Cut
-//! 3") and puts every cyrup digest one key away from pi's. Measured, not inferred: see
-//! `the_socket_key_is_the_one_divergence_from_upstreams_own_digest` below, which pins both digests.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -186,7 +196,7 @@ impl ImportKind {
 
 /// The `requestHeadersCommand` block of a server definition (upstream `types.ts:383`, v2.26.0),
 /// mirroring `cyrup_mcp::config::HttpRequestHeadersCommand`. Modeled here **only** because it is the
-/// fourteenth key of the config-identity pre-image (MCP-141) — this resolver never runs it, and the
+/// a key of the config-identity pre-image (MCP-141) — this resolver never runs it, and the
 /// engine that does lives in `cyrup_mcp::request_headers_command`.
 ///
 /// Every field is optional for the same reason the adapter's copy makes them optional: upstream's
@@ -234,16 +244,19 @@ pub struct ServerEntry {
     #[serde(default)]
     pub headers: Option<BTreeMap<String, Value>>,
     /// Per-request header-signing command (upstream v2.26.0). Hashed, never executed here — see
-    /// [`RequestHeadersCommand`]. The fourteenth identity key (MCP-141).
+    /// [`RequestHeadersCommand`]. One of the fifteen identity keys (MCP-141).
     #[serde(default, rename = "requestHeadersCommand")]
     pub request_headers_command: Option<RequestHeadersCommand>,
     /// `"oauth" | "bearer" | false` in pi — held raw and folded verbatim into the identity hash.
-    #[serde(default)]
+    ///
+    /// `present_or_absent`, not a bare `#[serde(default)]`: serde's own `Option<T>` impl maps a
+    /// JSON `null` to `None`, and this field is one of the two where the difference is a digest.
+    #[serde(default, deserialize_with = "present_or_absent")]
     pub auth: Option<Value>,
     /// `"legacy" | "auto" | "2026-07-28"` in pi — held raw and folded verbatim into the identity
     /// hash, exactly as [`Self::auth`] is. Part of the config identity (MCP-141) because pinning a
     /// protocol revision changes what the server advertises; not otherwise used by this resolver.
-    #[serde(default, rename = "protocolVersion")]
+    #[serde(default, rename = "protocolVersion", deserialize_with = "present_or_absent")]
     pub protocol_version: Option<Value>,
     #[serde(default, rename = "bearerToken")]
     pub bearer_token: Option<String>,
@@ -260,6 +273,26 @@ pub struct ServerEntry {
     pub include_tools: Option<Vec<String>>,
     #[serde(default, rename = "excludeTools")]
     pub exclude_tools: Option<Vec<String>>,
+}
+
+/// `Some(value)` for a key that is **present**, including one whose value is JSON `null` — the
+/// distinction `stableStringify` renders as `null` versus the bare token `undefined` (MCP-142).
+///
+/// Serde's derived `Option<T>` reads a JSON `null` as `None`, which collapses the two. That is
+/// harmless for a field nobody hashes and wrong for [`ServerEntry::auth`] and
+/// [`ServerEntry::protocol_version`], which `computeServerHash` folds in verbatim
+/// (`metadata-cache.ts:103-104`): measured on node 22 @ `v2.26.1`, `computeServerHash({command:"x",
+/// auth:null})` is `d5e9d0fe71ad5cc5d6a82b93d537f69ee59809f7f10e1f5c1f26c1d0a97e28e4` over a
+/// pre-image carrying `"auth":null`, while the same definition without the key hashes a pre-image
+/// carrying `"auth":undefined`. This reader produced the second for both.
+///
+/// `#[serde(default)]` still supplies `None` for an **absent** key, because serde calls a field's
+/// `deserialize_with` only when the key is there.
+fn present_or_absent<'de, D>(deserializer: D) -> Result<Option<Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Value::deserialize(deserializer)?))
 }
 
 /// Optional `settings` block of an `mcp.json` (pi `McpConfig.settings`).
@@ -725,24 +758,26 @@ fn is_server_cache_valid_with_age(
 /// `cyrup_mcp::dirs::server_identity_pre_image` (upstream `computeServerHash`,
 /// `metadata-cache.ts:82` @ v2.26.1).
 ///
-/// # Fourteen keys, and the list is the specification (MCP-141)
+/// # Fifteen keys, and the list is the specification (MCP-141)
 ///
 /// This function built **eleven**: `protocolVersion`, `includeTools` and `requestHeadersCommand`
 /// were missing, so editing any of them left a stale tool list looking valid — and, far worse, the
 /// eleven-key pre-image is one the writer never produces, so no `cyrup-mcp`-written cache entry
 /// could validate here at all.
 ///
-/// Upstream builds **fifteen**: its first key is `socket: resolveConfigPath(definition.socket)`.
-/// `socket` is Cut 3 in this tree — `cyrup_mcp::config::ServerEntry` has no such field, the raw
-/// framed unix-socket transport does not exist here, and a config that could carry it cannot be
-/// written — so both sides omit it. That is a recorded divergence from pi's digests, not an
-/// oversight. (13c's MCP-141 text says to keep `socket` in the pre-image "despite Cut 3"; the
-/// writer that actually shipped does not, and a reader that disagreed with the in-tree writer in
-/// order to agree with a field neither crate can express would break the only contract that exists
-/// here. The consequence is that a cache written by pi itself is not hash-compatible with cyrup's,
-/// which costs one cold start.)
+/// The fifteenth is `socket: resolveConfigPath(definition.socket)` (`metadata-cache.ts:89`), and it
+/// is emitted **`undefined` unconditionally**. `stableStringify` walks `Object.keys()`, which
+/// includes keys holding `undefined`, so upstream writes `"socket":undefined` for every definition
+/// — one that never mentions a socket included. Both Rust pre-images used to drop the key, which
+/// made every cyrup digest differ from pi's by exactly that member, for every server, forever; the
+/// standing note in 13c-mcp-servers.md:1753 ("Keep `socket` … in the pre-image despite Cut 3") is
+/// what this now satisfies. There is nothing to read: `socket` is Cut 3, neither
+/// `cyrup_mcp::config::ServerEntry` nor [`ServerEntry`] has the field, and
+/// `cyrup_mcp::config::to_server_entries` rejects any entry that configures one — so
+/// `resolveConfigPath(definition.socket)` can only ever be `resolveConfigPath(undefined)`, which is
+/// `undefined`.
 ///
-/// # Five of the fourteen are hashed in their *resolved* form
+/// # Five of the fifteen are hashed in their *resolved* form
 ///
 /// `env` and `headers` (`interpolateEnvRecord`), `cwd` (`resolveConfigPath`), `url`
 /// (`resolveServerUrl` — MCP-141's fourth gap: this took `definition.url` **raw**) and `bearerToken`
@@ -775,6 +810,10 @@ pub fn server_identity_pre_image_with(
             "cwd".to_string(),
             opt_string(resolve_config_path(definition.cwd.as_deref(), home, env).as_deref()),
         ),
+        // `socket: resolveConfigPath(definition.socket)` (`metadata-cache.ts:89`) — always
+        // `undefined`, and the KEY is what matters: `stableStringify` emits a key whose value is
+        // `undefined` rather than dropping it, so omitting it moved every digest off upstream's.
+        ("socket".to_string(), HashValue::Undefined),
         (
             "url".to_string(),
             opt_string(resolve_server_url(definition.url.as_deref(), env)?.as_deref()),
@@ -865,7 +904,7 @@ fn opt_string_list(value: Option<&Vec<String>>) -> HashValue {
     })
 }
 
-/// The fourteenth identity key (`metadata-cache.ts:94-101`): `undefined` when the field is absent,
+/// The `requestHeadersCommand` identity key (`metadata-cache.ts:94-101`): `undefined` when the field is absent,
 /// otherwise the four-key nested object with `command`, every `args` element and every `env` value
 /// interpolated and `timeoutMs` copied through. Interpolated for the same reason `headers` is — the
 /// digest must change when `$MCP_SIGNER_ACTOR` changes even though the config text did not, which is
@@ -1841,7 +1880,8 @@ mod tests {
         ResolvedIdentity, compute_server_hash, server_identity_pre_image as writer_pre_image,
     };
 
-    /// All fourteen identity fields set at once, hashed by BOTH implementations (MCP-141/142).
+    /// All fifteen identity fields set at once, hashed by BOTH implementations (MCP-141/142), and
+    /// pinned against upstream's own digest for the same definition — `socket` included.
     ///
     /// Fails on the pre-committed code twice over: this module emitted **eleven** keys (no
     /// `protocolVersion`, no `includeTools`, no `requestHeadersCommand`) and rendered every absent
@@ -1856,7 +1896,7 @@ mod tests {
     /// `reader_and_writer_agree_once_every_resolver_actually_runs`, which drives both sides from one
     /// injected environment and home.
     #[test]
-    fn reader_and_writer_agree_on_the_fourteen_field_pre_image() {
+    fn reader_and_writer_agree_on_the_fifteen_field_pre_image() {
         const DEFINITION: &str = r#"{
             "command": "npx",
             "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
@@ -1889,7 +1929,7 @@ mod tests {
         assert_eq!(pre_image, writer_pre_image(&writer, &resolved));
         assert_eq!(compute_mcp_server_hash(&reader).expect("hashable"), compute_server_hash(&writer, &resolved));
 
-        // Fourteen keys, named — a count alone would not say which one went missing.
+        // Fifteen keys, named — a count alone would not say which one went missing.
         for key in [
             "args",
             "auth",
@@ -1904,10 +1944,18 @@ mod tests {
             "includeTools",
             "protocolVersion",
             "requestHeadersCommand",
+            "socket",
             "url",
         ] {
             assert!(pre_image.contains(&format!("\"{key}\":")), "missing {key} in {pre_image}");
         }
+        // Upstream's own digest for this definition, measured on node 22 @ `v2.26.1` (`fafae21`).
+        // While `socket` was missing the two crates agreed with each other here and with nobody
+        // else, which is exactly the failure mode a reader-versus-writer assertion cannot see.
+        assert_eq!(
+            compute_mcp_server_hash(&reader).expect("hashable"),
+            "fa28f264c176c38a612395e65601f0646a3faba71cdc834b095c488c9a5bd63c"
+        );
         // `timeoutMs` renders as a JS number: `2500`, never `2500.0`.
         assert!(pre_image.contains(r#""timeoutMs":2500}"#), "{pre_image}");
         // The three runtime-only keys are outside the identity, so editing them must NOT evict.
@@ -1915,115 +1963,28 @@ mod tests {
         assert!(!pre_image.contains("debug"), "{pre_image}");
     }
 
-    /// The `socket` divergence, measured against upstream rather than argued about.
+    /// **`socket` is no longer a divergence** — cyrup's digest IS upstream's, measured.
     ///
     /// `computeServerHash` (`metadata-cache.ts:86-109` @ v2.26.1) builds a **15**-key identity whose
     /// third key is `socket: resolveConfigPath(definition.socket)`, and `stableStringify` walks
     /// `Object.keys()` — which includes keys holding `undefined` — so upstream emits
-    /// `"socket":undefined` even for a definition that never mentions a socket. `ServerEntry` has no
-    /// `socket` field post-Cut-3 and neither Rust pre-image emits the key, so **every** cyrup digest
-    /// differs from pi's by exactly that one member.
+    /// `"socket":undefined` even for a definition that never mentions a socket. Neither Rust
+    /// pre-image emitted the key, so **every** cyrup digest differed from pi's by exactly that one
+    /// member. Both now emit it unconditionally, which is the whole of 13c-mcp-servers.md:1753
+    /// ("Keep `socket` … in the pre-image despite Cut 3"): `ServerEntry` has no `socket` field
+    /// post-Cut-3 and `cyrup_mcp::config::to_server_entries` rejects any entry that configures one,
+    /// so `resolveConfigPath(definition.socket)` can only ever be `resolveConfigPath(undefined)`.
     ///
     /// Both constants below were produced by running upstream's own `stableStringify` +
     /// `computeServerHash` on node 22 against `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`),
-    /// using the same fixture as the vector above. The test exists so the divergence is a pinned,
-    /// visible fact rather than a comment: if someone lands `socket` (13c-mcp-servers.md:1753 asks
-    /// The third `lenient` divergence, and the worst-behaved: on a non-string `env`/`headers`
-    /// member the two crates return OPPOSITE cache-validity answers, not merely different digests.
-    ///
-    /// Measured on node 22: `computeServerHash({command:"x",env:{K:5}})` THROWS
-    /// (`value.startsWith is not a function`), and `isServerCacheValid` catches it and returns
-    /// `false`. This reader reproduces that faithfully. The writer holds `env`/`headers` as
-    /// `Option<BTreeMap<String, String>>` behind `deserialize_with = "lenient"`, which drops the
-    /// whole map when any member fails to fit — so it hashes `"env":undefined`, produces a digest,
-    /// and calls the entry VALID.
-    ///
-    /// Same root cause as the `auth`/`protocolVersion` pin above: the writer's config types discard
-    /// what upstream keeps. The fix is on the writer (hold the raw value, or carry a
-    /// "had a non-string member" flag through `lenient`), which is a 13b type-model change and so
-    /// the owner's call. **If this starts failing, that landed — delete it.**
+    /// using the same fixture as the cross-crate vector above, and both **include `socket`**. The
+    /// reconstruction that produced the pre-image was proved faithful by asserting
+    /// `sha256(preImage) === computeServerHash(definition)` against upstream's own exported
+    /// function on the same run. This is the positive form of a test that used to assert the two
+    /// sides differ; before the key landed cyrup's digest here was
+    /// `4dd46c1fd26680867fe6c5ffdde2ab0f0a35972cd9c211bf6dd68d1f304eb277`.
     #[test]
-    fn a_non_string_env_member_makes_the_two_crates_disagree_on_validity() {
-        const JSON: &str = r#"{"command":"x","env":{"K":5}}"#;
-        let env = |_: &str| None;
-        let home = Path::new("/home/u");
-
-        // The reader refuses to hash it at all — upstream's throw.
-        let reader: ServerEntry = serde_json::from_str(JSON).expect("reader entry");
-        assert!(
-            server_identity_pre_image_with(&reader, &env, home).is_err(),
-            "reader must reproduce upstream's throw on a non-string env member"
-        );
-
-        // The writer drops the map and hashes happily.
-        let writer: WriterServerEntry = serde_json::from_str(JSON).expect("writer entry");
-        let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(|_: &str| None);
-        let resolved =
-            ResolvedIdentity::resolve(&writer, &writer_env, home).expect("writer resolve");
-        let theirs = writer_pre_image(&writer, &resolved);
-        assert!(
-            theirs.contains(r#""env":undefined"#),
-            "writer's `lenient` drops the whole map: {theirs}"
-        );
-    }
-
-    /// The `auth` / `protocolVersion` digest divergence, pinned rather than rediscovered.
-    ///
-    /// Upstream hashes both keys verbatim (`metadata-cache.ts:103-104`) and validates neither at
-    /// load — `config.ts` has no check for either, and `Invalid MCP protocolVersion` is thrown at
-    /// CONNECT time, long after the digest. This reader holds them raw and so matches upstream. The
-    /// writer types them behind `deserialize_with = "lenient"`, which silently drops any value its
-    /// enum rejects; `ProtocolVersionSetting` knows only `"legacy" | "auto" | "2026-07-28"`.
-    ///
-    /// `"2025-06-18"` is a real MCP protocol revision and is exactly the shape of value a user
-    /// pins. For such a server the two sides hash different pre-images, so `is_server_cache_valid`
-    /// rejects every entry and the server re-discovers its whole surface every session — silently,
-    /// and forever. It fails SAFE (a re-discovery, never a wrong tool), which is precisely why it
-    /// survived two separate audits without anything visibly breaking.
-    ///
-    /// The fix is a passthrough arm on the writer's two enums so the raw value reaches the
-    /// pre-image; that is a change to the config type model (13b) and so the owner's call. Until
-    /// then this test states the cost. **If it starts failing, the divergence closed — delete it.**
-    #[test]
-    fn a_protocol_revision_the_writers_enum_rejects_diverges_on_the_digest() {
-        const JSON: &str = r#"{"url":"https://api.example.com/mcp","protocolVersion":"2025-06-18"}"#;
-        let env = |_: &str| None;
-        let home = Path::new("/home/u");
-
-        let reader: ServerEntry = serde_json::from_str(JSON).expect("reader entry");
-        let ours = server_identity_pre_image_with(&reader, &env, home).expect("reader pre-image");
-
-        let writer: WriterServerEntry = serde_json::from_str(JSON).expect("writer entry");
-        let writer_env: cyrup_mcp::credentials::EnvFn =
-            std::sync::Arc::new(|_: &str| None);
-        let resolved =
-            ResolvedIdentity::resolve(&writer, &writer_env, home).expect("writer resolve");
-        let theirs = writer_pre_image(&writer, &resolved);
-
-        // The reader keeps what the user wrote — this is upstream's behaviour.
-        assert!(
-            ours.contains(r#""protocolVersion":"2025-06-18""#),
-            "reader must hash the literal revision: {ours}"
-        );
-        // The writer's `lenient` deserialiser has already thrown it away.
-        assert!(
-            theirs.contains(r#""protocolVersion":undefined"#),
-            "writer drops any revision its enum rejects: {theirs}"
-        );
-        assert_ne!(ours, theirs, "if these agree, the passthrough arm landed");
-
-        // And the divergence is confined to that one member: strip it from both and they agree,
-        // which is what proves this is the ONLY thing wrong for such a server.
-        assert_eq!(
-            ours.replace(r#""protocolVersion":"2025-06-18""#, ""),
-            theirs.replace(r#""protocolVersion":undefined"#, ""),
-            "any other difference would be a second, unrecorded divergence"
-        );
-    }
-
-    /// for it), this test fails and tells them the two digests just converged.
-    #[test]
-    fn the_socket_key_is_the_one_divergence_from_upstreams_own_digest() {
+    fn the_socket_key_is_no_longer_a_divergence_from_upstream() {
         let entry: ServerEntry = serde_json::from_str(
             r#"{
                 "command": "npx",
@@ -2053,34 +2014,213 @@ mod tests {
             "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4";
 
         let ours = server_identity_pre_image(&entry).expect("hashable");
+        assert_eq!(ours, UPSTREAM_PRE_IMAGE, "byte-for-byte, or the key moved again");
+        assert!(ours.contains(r#""socket":undefined"#), "{ours}");
+        assert_eq!(compute_mcp_server_hash(&entry).expect("hashable"), UPSTREAM_DIGEST);
 
-        // The difference is exactly one member, and it is `socket`.
-        assert_ne!(ours, UPSTREAM_PRE_IMAGE, "if these are equal, `socket` landed");
-        assert!(!ours.contains("\"socket\""), "we omit the key entirely: {ours}");
-        assert!(UPSTREAM_PRE_IMAGE.contains(r#""socket":undefined"#));
-        assert_eq!(
-            UPSTREAM_PRE_IMAGE.replace(r#""socket":undefined,"#, ""),
-            ours,
-            "removing upstream's `socket` member must yield our pre-image exactly — any other \
-             difference is a second, unrecorded divergence"
+        // The writer agrees with both, which is the property the shared cache file depends on.
+        let writer: WriterServerEntry = serde_json::from_str(
+            r#"{
+                "command": "npx",
+                "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+                "env": { "NODE_ENV": "production", "API_TOKEN": "s3cret" },
+                "cwd": "/home/u/work",
+                "exposeResources": false,
+                "excludeTools": ["danger_*"],
+                "lifecycle": "eager",
+                "requestTimeoutMs": 30000,
+                "debug": true
+            }"#,
+        )
+        .expect("writer entry");
+        let resolved = ResolvedIdentity::verbatim(&writer);
+        assert_eq!(writer_pre_image(&writer, &resolved), UPSTREAM_PRE_IMAGE);
+        assert_eq!(compute_server_hash(&writer, &resolved), UPSTREAM_DIGEST);
+    }
+
+    /// The third `lenient` divergence, and the one that used to be worst-behaved: on a non-string
+    /// `env`/`headers` member the two crates returned OPPOSITE cache-validity answers, not merely
+    /// different digests. They now give the same answer, and it is upstream's.
+    ///
+    /// Measured on node 22 @ v2.26.1: `computeServerHash({command:"x",env:{K:5}})` THROWS
+    /// `value.startsWith is not a function`, `{command:"x",headers:{K:null}}` THROWS
+    /// `Cannot read properties of null (reading 'startsWith')`, and a non-string member in
+    /// `requestHeadersCommand.env` throws the same way — `isServerCacheValid` catches every one of
+    /// them and returns `false`. This reader always reproduced that. The writer held `env`/`headers`
+    /// as `Option<BTreeMap<String, String>>` behind `deserialize_with = "lenient"`, which dropped
+    /// the whole map when any member failed to fit — so it hashed `"env":undefined`, produced a
+    /// digest, and called the entry VALID.
+    ///
+    /// `cyrup_mcp::config::StringRecord` is the fix: it keeps the string members for every consumer
+    /// *and* the throw for the hash, and `ResolvedIdentity::resolve` raises it. This is the positive
+    /// form of a test that used to assert the two sides disagree.
+    #[test]
+    fn a_non_string_record_member_makes_both_crates_refuse_the_hash() {
+        let home = Path::new("/home/u");
+        let env = |_: &str| None;
+        let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(|_: &str| None);
+
+        for (json, message) in [
+            (r#"{"command":"x","env":{"K":5}}"#, "value.startsWith is not a function"),
+            (
+                r#"{"command":"x","headers":{"K":null}}"#,
+                "Cannot read properties of null (reading 'startsWith')",
+            ),
+            (
+                r#"{"url":"https://api.example.com/mcp",
+                    "requestHeadersCommand":{"command":"sign","env":{"K":5}}}"#,
+                "value.startsWith is not a function",
+            ),
+        ] {
+            // The reader refuses to hash it at all — upstream's throw.
+            let reader: ServerEntry = serde_json::from_str(json).expect("reader entry");
+            assert_eq!(
+                server_identity_pre_image_with(&reader, &env, home)
+                    .expect_err(json)
+                    .to_string(),
+                message,
+                "{json}"
+            );
+
+            // …and so does the writer, with the same sentence.
+            let writer: WriterServerEntry = serde_json::from_str(json).expect("writer entry");
+            assert_eq!(
+                ResolvedIdentity::resolve(&writer, &writer_env, home)
+                    .expect_err(json)
+                    .to_string(),
+                message,
+                "{json}"
+            );
+
+            // The consequence that actually matters: `isServerCacheValid` answers `false` on BOTH
+            // sides, for an entry whose stamped hash could not have come from anywhere.
+            let entry = ServerCacheEntry {
+                config_hash: Some("whatever".to_string()),
+                cached_at: Some(now_ms()),
+                ..ServerCacheEntry::default()
+            };
+            assert!(!is_server_cache_valid_with_age(&entry, &reader, 0), "{json}");
+            assert!(
+                cyrup_mcp::dirs::try_compute_server_hash(&writer, &writer_env, home).is_err(),
+                "{json}"
+            );
+        }
+
+        // And the string members still reach every consumer — the map is not dropped, only the
+        // digest is refused.
+        let mixed: WriterServerEntry =
+            serde_json::from_str(r#"{"command":"x","env":{"GOOD":"1","BAD":5}}"#)
+                .expect("writer entry");
+        let record = mixed.env.as_ref().expect("the map survives");
+        assert_eq!(record.get("GOOD").map(String::as_str), Some("1"));
+        assert_eq!(record.len(), 1, "only the string members are usable");
+        assert_eq!(record.unhashable(), Some("value.startsWith is not a function"));
+    }
+
+    /// The `protocolVersion` digest divergence, closed and pinned against upstream's own digest.
+    ///
+    /// Upstream hashes the key verbatim (`metadata-cache.ts:104`) and `config.ts` validates it not
+    /// at all; `Invalid MCP protocolVersion` is thrown at CONNECT time, long after the digest. This
+    /// reader always held the field raw and so always matched upstream. The writer typed it behind
+    /// `deserialize_with = "lenient"`, which silently dropped any value its enum rejected, and
+    /// `ProtocolVersionSetting` knew only `"legacy" | "auto" | "2026-07-28"`.
+    ///
+    /// `"2025-06-18"` is a real MCP protocol revision and is exactly the shape of value a user pins.
+    /// For such a server the two sides hashed different pre-images, so `is_server_cache_valid`
+    /// rejected every entry and the server re-discovered its whole surface every session —
+    /// silently, and forever. It failed SAFE (a re-discovery, never a wrong tool), which is
+    /// precisely why it survived two separate audits without anything visibly breaking.
+    ///
+    /// `ProtocolVersionSetting::Other` closes it. The constants are upstream's own, from node 22 @
+    /// `v2.26.1`, and include `socket`. **The deserialiser still validates nothing** — the throw
+    /// moved to connect, where upstream performs it; see
+    /// `cyrup_mcp::runtime`'s `wire_tests::an_unknown_revision_throws_upstreams_sentence_at_connect`.
+    #[test]
+    fn a_protocol_revision_the_writer_used_to_reject_now_agrees_on_the_digest() {
+        const JSON: &str = r#"{"url":"https://api.example.com/mcp","protocolVersion":"2025-06-18"}"#;
+        const UPSTREAM_PRE_IMAGE: &str = concat!(
+            r#"{"args":undefined,"auth":undefined,"bearerToken":undefined,"#,
+            r#""bearerTokenEnv":undefined,"command":undefined,"cwd":undefined,"env":undefined,"#,
+            r#""excludeTools":undefined,"exposeResources":undefined,"headers":undefined,"#,
+            r#""includeTools":undefined,"protocolVersion":"2025-06-18","#,
+            r#""requestHeadersCommand":undefined,"socket":undefined,"#,
+            r#""url":"https://api.example.com/mcp"}"#
         );
-        assert_ne!(compute_mcp_server_hash(&entry).expect("hashable"), UPSTREAM_DIGEST);
+        const UPSTREAM_DIGEST: &str =
+            "9825a7ed2a651688c432bdab4dbbf2139581f641cad0c97ee3052cc64336ec81";
+        let env = |_: &str| None;
+        let home = Path::new("/home/u");
+
+        let reader: ServerEntry = serde_json::from_str(JSON).expect("reader entry");
+        let ours = server_identity_pre_image_with(&reader, &env, home).expect("reader pre-image");
+
+        let writer: WriterServerEntry = serde_json::from_str(JSON).expect("writer entry");
+        let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(|_: &str| None);
+        let resolved =
+            ResolvedIdentity::resolve(&writer, &writer_env, home).expect("writer resolve");
+        let theirs = writer_pre_image(&writer, &resolved);
+
+        // Both keep what the user wrote, and it is what upstream keeps.
+        assert!(ours.contains(r#""protocolVersion":"2025-06-18""#), "{ours}");
+        assert!(theirs.contains(r#""protocolVersion":"2025-06-18""#), "{theirs}");
+        assert_eq!(ours, theirs, "if these differ, the passthrough arm regressed");
+        assert_eq!(ours, UPSTREAM_PRE_IMAGE);
+        assert_eq!(compute_mcp_server_hash(&reader).expect("hashable"), UPSTREAM_DIGEST);
+        assert_eq!(compute_server_hash(&writer, &resolved), UPSTREAM_DIGEST);
+    }
+
+    /// The `auth` half of the same divergence, and its own upstream-generated vector.
+    ///
+    /// `auth` is hashed verbatim (`metadata-cache.ts:103`) and validated nowhere; every consumer is
+    /// a `===` comparison an unknown value simply fails. Behind `lenient`, the writer's two-variant
+    /// `AuthMode` turned `auth: "basic"` into `None` and hashed `"auth":undefined`, while this
+    /// reader — holding the field raw, as upstream does — hashed the value. `AuthMode::Other` closes
+    /// it. Constants from node 22 @ `v2.26.1`, `socket` included.
+    #[test]
+    fn an_auth_value_the_writer_used_to_reject_now_agrees_on_the_digest() {
+        const JSON: &str = r#"{"url":"https://api.example.com/mcp","auth":"basic"}"#;
+        const UPSTREAM_DIGEST: &str =
+            "0926c8b8e6711e6d59143d0a409ea51a3ef76a1006057ffa28d4be20835137b8";
+        let home = Path::new("/home/u");
+
+        let reader: ServerEntry = serde_json::from_str(JSON).expect("reader entry");
+        let writer: WriterServerEntry = serde_json::from_str(JSON).expect("writer entry");
+        let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(|_: &str| None);
+        let resolved =
+            ResolvedIdentity::resolve(&writer, &writer_env, home).expect("writer resolve");
+        let theirs = writer_pre_image(&writer, &resolved);
+
+        assert!(theirs.contains(r#""auth":"basic""#), "{theirs}");
+        assert_eq!(
+            server_identity_pre_image_with(&reader, &|_: &str| None, home).expect("hashable"),
+            theirs
+        );
+        assert_eq!(compute_server_hash(&writer, &resolved), UPSTREAM_DIGEST);
+        assert_eq!(compute_mcp_server_hash(&reader).expect("hashable"), UPSTREAM_DIGEST);
+
+        // `"oauth"`, `"bearer"` and the two booleans still land on the arms that have meaning, so
+        // the passthrough widened nothing: `Other` catches only what those reject.
+        for (json, expected) in [
+            (r#"{"auth":"oauth"}"#, cyrup_mcp::config::AuthMode::Named(cyrup_mcp::config::AuthKind::Oauth)),
+            (r#"{"auth":"bearer"}"#, cyrup_mcp::config::AuthMode::Named(cyrup_mcp::config::AuthKind::Bearer)),
+            (r#"{"auth":false}"#, cyrup_mcp::config::AuthMode::Disabled(false)),
+        ] {
+            let parsed: WriterServerEntry = serde_json::from_str(json).expect("writer entry");
+            assert_eq!(parsed.auth, Some(expected), "{json}");
+        }
     }
 
     /// The cross-crate golden vector, asserted here and in
     /// `cyrup_mcp::dirs::tests::golden_vector_stdio_server`.
     ///
-    /// **Read the caveat before trusting the word "golden".** These constants are upstream's
-    /// `stableStringify` + `computeServerHash` run on node 22 **with the `socket` key removed from
-    /// the identity** — the deviation the writer's own vectors document and this one inherits. They
-    /// are therefore byte-compatible with *cyrup*, not with pi: upstream's real digest for this very
-    /// fixture is `2190558e…`, pinned in
-    /// `the_socket_key_is_the_one_divergence_from_upstreams_own_digest`. What this test proves is
-    /// that the two Rust implementations agree on *what* they hash; it does not prove either matches
-    /// upstream.
+    /// **Upstream-generated, and no longer carrying a caveat.** Both constants are upstream's own
+    /// `stableStringify` + `computeServerHash` run on node 22 against `tmp/pi-mcp-adapter` at tag
+    /// `v2.26.1` (`fafae21`), and they now **include the `socket` key** — so they are byte-compatible
+    /// with pi as well as with `cyrup_mcp::dirs`. While the key was missing this vector read
+    /// `4dd46c1f…`, a digest only cyrup produced.
     ///
     /// The cross-crate test above proves the two implementations agree; this proves *what* they
-    /// agree on. Note what a plain stdio server's pre-image is mostly made of: nine `undefined`
+    /// agree on. Note what a plain stdio server's pre-image is mostly made of: ten `undefined`
     /// tokens. That is the whole of MCP-142 in one string.
     #[test]
     fn pre_image_matches_the_upstream_generated_golden_vector() {
@@ -2107,12 +2247,12 @@ mod tests {
                 r#""env":{"API_TOKEN":"s3cret","NODE_ENV":"production"},"#,
                 r#""excludeTools":["danger_*"],"exposeResources":false,"headers":undefined,"#,
                 r#""includeTools":undefined,"protocolVersion":undefined,"#,
-                r#""requestHeadersCommand":undefined,"url":undefined}"#
+                r#""requestHeadersCommand":undefined,"socket":undefined,"url":undefined}"#
             )
         );
         assert_eq!(
             compute_mcp_server_hash(&entry).expect("hashable"),
-            "4dd46c1fd26680867fe6c5ffdde2ab0f0a35972cd9c211bf6dd68d1f304eb277"
+            "2190558e470a75c0f992989bd1799b374e669deecb8093e4118a1a9419068cf4"
         );
 
         // The HTTP half, which pins the two enum-valued keys and a non-empty `includeTools` next to
@@ -2134,15 +2274,91 @@ mod tests {
         .expect("http entry");
         assert_eq!(
             compute_mcp_server_hash(&http).expect("hashable"),
-            "572dcbaa24a3a82d42f90a86ebb8039227f999a1b14078b35dfa9f40cb872356"
+            "5ee9972ca350254322d2c8aa519f273144f1f80b256e1cfce5a1af21e3e75970"
         );
+    }
+
+    /// The differential table: one fixture set, three implementations, one digest each.
+    ///
+    /// Every constant below is `computeServerHash(definition)` evaluated on node 22 against
+    /// `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`), with `HOME=/home/u` and no other variable
+    /// set — **upstream's answer**, `socket` included. The test asserts that this reader and
+    /// `cyrup_mcp::dirs` both reproduce it. It exists because the four divergences this wave closed
+    /// were each invisible on the *other* implementations' fixtures: a table that only ever compared
+    /// reader against writer agreed happily while both were one key away from pi.
+    ///
+    /// The rows are chosen for the edges, not the middle: an **empty** map (`{}` is not `undefined`),
+    /// an explicit JSON `null` on `auth` (which `null` renders as, and `undefined` does not), the
+    /// tolerated `auth: true`, an `auth` that is an object, a numeric `protocolVersion`, and an `env`
+    /// carrying non-ASCII and both characters `JSON.stringify` escapes.
+    #[test]
+    fn reader_writer_and_upstream_agree_across_the_edge_cases() {
+        const HOME: &str = "/home/u";
+        for (json, upstream_digest) in [
+            (
+                r#"{"command":"x","env":{}}"#,
+                "1d224401e4ab9a3e11e3490649da48a3fd946b49869464320b97b423c7f2893b",
+            ),
+            (
+                r#"{"command":"x","auth":null}"#,
+                "d5e9d0fe71ad5cc5d6a82b93d537f69ee59809f7f10e1f5c1f26c1d0a97e28e4",
+            ),
+            (
+                r#"{"command":"x","auth":true}"#,
+                "ae49caf49c8f178b01c20e367d4d4bd5efa81862550adefca79f016e243fde43",
+            ),
+            (
+                r#"{"command":"x","auth":{"mode":"custom"}}"#,
+                "e20d021bf5d47780b216e45f26e49802817d04ebfc3421ece1bb56f9e7d0aa32",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":5}"#,
+                "df7fbe03ab78e1275d5feac1fcd776d4360c04f291ce8a569c6cb65ad241a150",
+            ),
+            (
+                r#"{"command":"x","protocolVersion":"auto"}"#,
+                "4aa154797d547787f9172441c48461ecaaf4483f8dc0071fb5fd4fc60fc62d2d",
+            ),
+            (
+                r#"{"url":"https://a.example/mcp","headers":{}}"#,
+                "2a32f29f637d9dfda066a90f3c4991bf25c5fcea8d9f8d17f92924328a7f1a27",
+            ),
+            (
+                "{\"command\":\"x\",\"env\":{\"K\":\"café ☃\",\"Q\":\"a\\\"b\\nc\"}}",
+                "c05ec96dfb2a8e5f33558d675c5a4d0d62dfbb41ab77728fe5edb8260a2fd1ec",
+            ),
+        ] {
+            let reader: ServerEntry = serde_json::from_str(json).expect("reader entry");
+            let writer: WriterServerEntry = serde_json::from_str(json).expect("writer entry");
+            let reader_env = |_: &str| None;
+            let writer_env: cyrup_mcp::credentials::EnvFn = std::sync::Arc::new(|_: &str| None);
+            let resolved = ResolvedIdentity::resolve(&writer, &writer_env, Path::new(HOME))
+                .expect("writer resolve");
+
+            let ours = server_identity_pre_image_with(&reader, &reader_env, Path::new(HOME))
+                .expect("reader pre-image");
+            assert_eq!(ours, writer_pre_image(&writer, &resolved), "{json}");
+            assert_eq!(
+                compute_mcp_server_hash_with(&reader, &reader_env, Path::new(HOME))
+                    .expect("hashable"),
+                upstream_digest,
+                "reader disagrees with upstream on {json}\n  pre-image: {ours}"
+            );
+            assert_eq!(
+                compute_server_hash(&writer, &resolved),
+                upstream_digest,
+                "writer disagrees with upstream on {json}"
+            );
+        }
     }
 
     /// MCP-142 pinned at the token level and at the digest level.
     ///
     /// `stable_stringify` mapped `Value::Null => "null"` and had no way to say `undefined` at all,
-    /// so the empty definition — fourteen absent fields — hashed as fourteen `null`s. This is the
-    /// case where the divergence is total: every single key disagreed with the writer.
+    /// so the empty definition — fifteen absent fields — hashed as fifteen `null`s. This is the
+    /// case where the divergence is total: every single key disagreed with the writer. The digest is
+    /// upstream's own, from node 22 @ `v2.26.1`, and includes `socket` (it read `671c1578…` while
+    /// the key was missing).
     #[test]
     fn an_absent_field_is_undefined_and_an_explicit_null_is_null() {
         assert_eq!(
@@ -2165,10 +2381,10 @@ mod tests {
         let empty = ServerEntry::default();
         let pre_image = server_identity_pre_image(&empty).expect("hashable");
         assert!(!pre_image.contains("null"), "{pre_image}");
-        assert_eq!(pre_image.matches("undefined").count(), 14, "{pre_image}");
+        assert_eq!(pre_image.matches("undefined").count(), 15, "{pre_image}");
         assert_eq!(
             compute_mcp_server_hash(&empty).expect("hashable"),
-            "671c1578e5f4c763aac0deb77dc2a99f55688f80ed687a652e5259319937794e"
+            "a04128961dff1d77f5ea95dd5ddb01415888636efe2d32cf950c78b34e54c3fa"
         );
         let writer_empty = WriterServerEntry::default();
         assert_eq!(
@@ -2471,16 +2687,14 @@ mod tests {
     /// writer's only constructor, so anything carrying a token made the two sides disagree by
     /// construction. `ResolvedIdentity::resolve` (MCP-141 leg (b)) is what makes it assertable.
     ///
-    /// **Provenance, stated exactly.** The constant is upstream's `computeServerHash` algorithm run
-    /// on node 22 against `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`) **with the `socket`
-    /// member removed** — the standing writer divergence, so this is byte-compatible with cyrup and
-    /// not with pi. Upstream's real digest for the same fixture is
-    /// `ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3`, which differs by exactly
-    /// `"socket":undefined`; see `the_socket_key_is_the_one_divergence_from_upstreams_own_digest`.
-    /// The pre-image was produced by running upstream's own `stableStringify` over
-    /// `computeServerHash`'s identity literal, built from upstream's real resolvers, and was proved
-    /// faithful by asserting `sha256(preImage) === computeServerHash(definition)` before `socket`
-    /// was dropped.
+    /// **Provenance, stated exactly.** Both constants are upstream's, produced by running
+    /// `computeServerHash` on node 22 against `tmp/pi-mcp-adapter` at tag `v2.26.1` (`fafae21`), and
+    /// they **include `socket`** — so `ac61954a…` is the digest a stock `pi-mcp-adapter` computes
+    /// for this definition, not merely the one cyrup computes. The pre-image came from running
+    /// upstream's own `stableStringify` over `computeServerHash`'s identity literal, built from
+    /// upstream's real resolvers, and was proved faithful by asserting
+    /// `sha256(preImage) === computeServerHash(definition)` against upstream's exported function on
+    /// the same run. While the key was missing this vector read `c273715e…`.
     #[test]
     fn reader_and_writer_agree_once_every_resolver_actually_runs() {
         const DEFINITION: &str = r#"{
@@ -2510,9 +2724,9 @@ mod tests {
             r#""excludeTools":["b"],"exposeResources":false,"#,
             r#""headers":{"X-Host":"a.example","X-Lit":"!keep"},"includeTools":["a"],"#,
             r#""protocolVersion":undefined,"requestHeadersCommand":undefined,"#,
-            r#""url":"https://a.example/mcp"}"#
+            r#""socket":undefined,"url":"https://a.example/mcp"}"#
         );
-        const DIGEST: &str = "c273715eef4b2fb58f5db61d54793b01abd262edd7e59a5c7b189fddf910bd3c";
+        const DIGEST: &str = "ac61954adda845c50a6c691e7ac291e2546dfcc6158b8d6a1b7785ce47356de3";
 
         let reader: ServerEntry = serde_json::from_str(DEFINITION).expect("reader entry");
         let writer: WriterServerEntry = serde_json::from_str(DEFINITION).expect("writer entry");

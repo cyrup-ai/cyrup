@@ -176,6 +176,20 @@ ratatui = "0.30.2"
 http = "1.4.2"
 sse-stream = "0.2.5"
 
+# --- the HTTP client the streamable transport runs on (MCP-109/MCP-114/MCP-115) -----------------
+# Named for the same reason `http` and `sse-stream` are: the moment `runtime::connect_http_client`
+# has to WRAP the client — `RequestHeadersCommandClient` (MCP-115a) and, when section 05 lands it,
+# `rmcp::transport::auth::AuthClient` — a concrete `C: StreamableHttpClient` has to be nameable, and
+# `StreamableHttpClientTransport::from_config`'s tuned client is private to rmcp. So this crate
+# builds the identical client itself (`build_http_client`) and hands it to `with_client`.
+#
+# No new resolution surface: rmcp's `transport-streamable-http-client-reqwest` already resolves onto
+# `reqwest 0.13.4` in this lock file, which is the workspace pin — verified in `Cargo.lock`
+# (`rmcp 3.1.4` depends on `reqwest 0.13.4`). `default-features = false` + `rustls` comes from the
+# workspace line; picking TLS explicitly is the same argument the `rmcp` block above makes for
+# naming the `reqwest` feature rather than inheriting `__reqwest`.
+reqwest = { workspace = true }
+
 # `killpg(SIGSTOP)`/`kill(SIGKILL)` over the signing command's process group and over every
 # descendant the 50 ms `ps` sweep found. That freeze-then-kill sweep IS the upstream feature's
 # security property — a signing helper must not outlive the request that spawned it — and it is not

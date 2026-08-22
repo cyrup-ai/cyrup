@@ -131,34 +131,21 @@ pub fn server_not_connected_message(name: &str) -> String {
     format!("Server \"{name}\" is not connected")
 }
 
-/// `new AggregateError(failures, "MCP connection cleanup failed")` — `server-manager.ts:1136`.
-/// MEASURED against the real `disposeConnection`: a `client.close()` that throws yields exactly this
-/// head with the thrown message as its single child, and `containsCleanupFailure` returns `true` for
-/// it and `false` for a plain `Error` carrying the same text.
-pub const CONNECTION_CLEANUP_FAILED: &str = "MCP connection cleanup failed";
-
-/// `new AggregateError(failures, "MCP manager cleanup failed")` — `server-manager.ts:1174`.
-pub const MANAGER_CLEANUP_FAILED: &str = "MCP manager cleanup failed";
-
-/// `new AggregateError(errors, \`MCP connection setup failed\`)` — `server-manager.ts:600`.
+/// The five `server-manager.ts` aggregate heads.
 ///
-/// Raised by `createConnection`, i.e. by the [`ConnectionFactory`] seam, **not** by this file — so
-/// it is a constant here and nothing in this module produces it yet. It is landed because
-/// [`ManagerError::is_cleanup_failure`] is the structural stand-in for upstream's
-/// `/cleanup failed|setup failed/`, and that predicate is what
-/// [`McpServerManager::close_inner`]'s pending-connect rethrow arm tests. See the note on that arm
-/// for what still cannot fire.
-pub const CONNECTION_SETUP_FAILED: &str = "MCP connection setup failed";
-
-/// `new AggregateError(errors, "MCP connection abort cleanup failed")` — `server-manager.ts:668`.
-/// Raised by `connectClientWithAbort`'s abort path, which lives behind the [`ConnectionFactory`]
-/// seam (MCP-114/MCP-115). See [`CONNECTION_SETUP_FAILED`].
-pub const CONNECTION_ABORT_CLEANUP_FAILED: &str = "MCP connection abort cleanup failed";
-
-/// `new AggregateError(errors, "MCP HTTP connection cleanup failed")` — `server-manager.ts:923`.
-/// Raised by the HTTP attempt ladder, behind the [`ConnectionFactory`] seam (MCP-115). See
-/// [`CONNECTION_SETUP_FAILED`].
-pub const HTTP_CONNECTION_CLEANUP_FAILED: &str = "MCP HTTP connection cleanup failed";
+/// They used to be five `pub const` definitions in this file, byte-identical to `errors.rs`'s own —
+/// a duplication that was harmless only while nothing compared the two. [`From<&ManagerError>`]
+/// now dispatches on the head to pick an [`McpError`] aggregate variant, so a drift between the two
+/// copies would silently route a real teardown failure to [`McpError::Other`] instead. Re-exported
+/// rather than redefined so that cannot happen: there is one definition, in `errors.rs`, and
+/// `crate::server_manager::CONNECTION_CLEANUP_FAILED` still resolves for every existing caller.
+///
+/// MEASURED against the real `disposeConnection`: a `client.close()` that throws yields exactly the
+/// [`CONNECTION_CLEANUP_FAILED`] head with the thrown message as its single child, and
+/// `containsCleanupFailure` returns `true` for it and `false` for a plain `Error` carrying the same
+/// text.
+pub use crate::errors::{CONNECTION_ABORT_CLEANUP_FAILED, CONNECTION_CLEANUP_FAILED,
+    CONNECTION_SETUP_FAILED, HTTP_CONNECTION_CLEANUP_FAILED, MANAGER_CLEANUP_FAILED};
 
 /// `MAX_CAPTURED_STDERR_BYTES` / `MAX_CAPTURED_STDERR_LINES` live in [`crate::runtime`]; re-exported
 /// so a reader of this file finds the tail policy the stderr pump enforces.
@@ -176,14 +163,19 @@ pub use crate::runtime::{MAX_CAPTURED_STDERR_BYTES, MAX_CAPTURED_STDERR_LINES};
 /// `close`'s no-connection arm re-throws a pending connect's failure *only* when it is a teardown
 /// failure (`containsCleanupFailure`), and `closeAll` filters its aggregate the same way. Upstream
 /// decides that with `/cleanup failed|setup failed/` over `AggregateError.message`;
-/// [`McpError::is_cleanup_failure`] is the structural replacement, but it currently matches only
-/// `RuntimeCleanupFailed` and `OAuthAggregate` — the five `server-manager.ts` aggregates are
-/// **MCP-124's** unit, in `errors.rs`, which this unit does not own.
+/// [`McpError::is_cleanup_failure`] is the structural replacement.
 ///
-/// **Blocker, stated plainly:** until MCP-124 lands those variants, an aggregate raised here renders
-/// into [`McpError::Other`] at the public boundary and `McpError::is_cleanup_failure` cannot see it.
-/// Nothing outside this module needs to, today — both consumers are internal — but a future caller
-/// that does will need MCP-124 first, not a second regex.
+/// The type stays local anyway, for a reason that has nothing to do with the taxonomy: the
+/// single-flight maps hand **one** failure to every waiter, so the internal error has to be
+/// `Arc`-shared, and [`McpError`] is deliberately not `Clone` (it carries an [`std::io::Error`]).
+///
+/// **The blocker this note used to record is closed.** MCP-124 landed the five variants, and
+/// [`From<&ManagerError>`] now maps an [`ManagerError::Aggregate`] onto the matching
+/// [`McpError`] aggregate by head instead of flattening it to [`McpError::Other`] — so
+/// `McpError::is_cleanup_failure` sees a teardown failure raised here, which is the entire point of
+/// the unit. `Display` routes through [`crate::errors::render_aggregate_texts`] for the same
+/// reason: the rendering a user sees must be `formatTerminalError`'s, and this type is the one that
+/// actually reaches them through `closeAll`.
 #[derive(Debug)]
 pub enum ManagerError {
     /// An ordinary failure: anything [`McpError`] already models.
@@ -258,16 +250,25 @@ impl ManagerError {
 }
 
 impl std::fmt::Display for ManagerError {
+    /// `formatTerminalError`'s aggregate arm, shared verbatim with [`McpError`]'s seven aggregates
+    /// through [`crate::errors::render_aggregate_texts`].
+    ///
+    /// This used to be `write!("{head}")` followed by `": {child}"` per child — head-prefixed. That
+    /// is the rendering MCP-124 measured as wrong and removed from `McpError`, and leaving it here
+    /// meant `closeAll` printed `"MCP manager cleanup failed: client close failed"` where upstream
+    /// prints `"client close failed"`: the head is dropped as soon as one child contributes text,
+    /// and children are de-duplicated. MEASURED on node 22 —
+    /// `AggregateError([Error("connect ECONNREFUSED"), Error("keychain unavailable")], "MCP
+    /// connection setup failed")` renders `connect ECONNREFUSED: keychain unavailable`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ManagerError::Mcp(error) => write!(f, "{error}"),
-            ManagerError::Aggregate { head, children } => {
-                write!(f, "{head}")?;
-                for child in children {
-                    write!(f, ": {child}")?;
-                }
-                Ok(())
-            }
+            ManagerError::Aggregate { head, children } => f.write_str(
+                &crate::errors::render_aggregate_texts(
+                    head,
+                    children.iter().map(std::string::ToString::to_string),
+                ),
+            ),
         }
     }
 }
@@ -285,17 +286,122 @@ impl std::error::Error for ManagerError {}
 /// a user cancellation from being recorded as a connect failure and poisoning the next 60 seconds of
 /// that server's availability (MCP-024). `Config` and `Server` round-trip too because `/mcp` renders
 /// them; everything else keeps its rendered text and loses only its class.
+///
+/// # The aggregate class is preserved too — MCP-124's actual point
+///
+/// An aggregate that loses its class here is an aggregate `McpError::is_cleanup_failure` cannot
+/// see, and that predicate is the *whole* reason the five variants exist: `close`'s no-connection
+/// arm re-throws a pending connect's failure only when it is a teardown failure, and `closeAll`
+/// filters its children the same way. Both aggregate shapes are therefore rebuilt rather than
+/// rendered:
+///
+/// * [`ManagerError::Aggregate`] — dispatched on its head onto the matching [`McpError`] variant.
+///   The heads are the re-exported `errors.rs` constants, so this match is on the same items the
+///   producers pass, not on two copies of a string literal.
+/// * `ManagerError::Mcp(<an aggregate>)` — the shape a factory error takes
+///   (`factory.create(..).map_err(ManagerError::mcp)`), which is how `createConnection`'s
+///   [`McpError::SetupFailed`] arrives. Rebuilt through [`McpError::aggregate_head`] /
+///   [`McpError::aggregate_children`] because [`McpError`] is not [`Clone`].
+///
+/// The walk is depth-capped for the same reason [`McpError::is_cleanup_failure`] is: these trees
+/// are built by this crate, but a bounded walk is the cheap way to keep a pathological one from
+/// spinning a shutdown. Past the cap the error degrades to its rendered text, never to a hang.
 impl From<&ManagerError> for McpError {
     fn from(error: &ManagerError) -> Self {
-        match error {
-            ManagerError::Mcp(McpError::Aborted(reason)) => McpError::Aborted(reason.clone()),
-            ManagerError::Mcp(McpError::Config(message)) => McpError::Config(message.clone()),
-            ManagerError::Mcp(McpError::Server { server, message }) => McpError::Server {
-                server: server.clone(),
-                message: message.clone(),
-            },
-            other => McpError::Other(other.to_string()),
+        rebuild_manager_error(error, AGGREGATE_REBUILD_DEPTH)
+    }
+}
+
+/// Depth cap for [`From<&ManagerError>`]'s aggregate rebuild. Matches `errors.rs`'s own budget.
+const AGGREGATE_REBUILD_DEPTH: u32 = 1024;
+
+fn rebuild_manager_error(error: &ManagerError, depth: u32) -> McpError {
+    let Some(remaining) = depth.checked_sub(1) else {
+        return McpError::Other(error.to_string());
+    };
+    match error {
+        ManagerError::Mcp(McpError::Aborted(reason)) => McpError::Aborted(reason.clone()),
+        ManagerError::Mcp(McpError::Config(message)) => McpError::Config(message.clone()),
+        ManagerError::Mcp(McpError::Server { server, message }) => McpError::Server {
+            server: server.clone(),
+            message: message.clone(),
+        },
+        ManagerError::Mcp(inner) => match (inner.aggregate_head(), inner.aggregate_children()) {
+            (Some(head), Some(children)) => {
+                let rebuilt = children
+                    .iter()
+                    .map(|child| rebuild_mcp_error(child, remaining))
+                    .collect::<Vec<_>>();
+                aggregate_with_head(head, crate::errors::CleanupErrors::from(rebuilt), inner)
+            }
+            _ => McpError::Other(inner.to_string()),
+        },
+        ManagerError::Aggregate { head, children } => {
+            let rebuilt = children
+                .iter()
+                .map(|child| rebuild_manager_error(child, remaining))
+                .collect::<Vec<_>>();
+            aggregate_with_head(head, crate::errors::CleanupErrors::from(rebuilt), error)
         }
+    }
+}
+
+fn rebuild_mcp_error(error: &McpError, depth: u32) -> McpError {
+    let Some(remaining) = depth.checked_sub(1) else {
+        return McpError::Other(error.to_string());
+    };
+    match error {
+        McpError::Aborted(reason) => McpError::Aborted(reason.clone()),
+        McpError::Config(message) => McpError::Config(message.clone()),
+        McpError::Server { server, message } => McpError::Server {
+            server: server.clone(),
+            message: message.clone(),
+        },
+        other => match (other.aggregate_head(), other.aggregate_children()) {
+            (Some(head), Some(children)) => {
+                let rebuilt = children
+                    .iter()
+                    .map(|child| rebuild_mcp_error(child, remaining))
+                    .collect::<Vec<_>>();
+                aggregate_with_head(head, crate::errors::CleanupErrors::from(rebuilt), other)
+            }
+            _ => McpError::Other(other.to_string()),
+        },
+    }
+}
+
+/// The head → variant dispatch. `fallback` is rendered only for a head this crate does not raise,
+/// which today is unreachable — every producer passes one of the six constants.
+fn aggregate_with_head(
+    head: &str,
+    children: crate::errors::CleanupErrors,
+    fallback: &dyn std::fmt::Display,
+) -> McpError {
+    match head {
+        CONNECTION_ABORT_CLEANUP_FAILED => McpError::AbortCleanupFailed(children),
+        CONNECTION_SETUP_FAILED => McpError::SetupFailed(children),
+        HTTP_CONNECTION_CLEANUP_FAILED => McpError::HttpCleanupFailed(children),
+        CONNECTION_CLEANUP_FAILED => McpError::ConnectionCleanupFailed(children),
+        MANAGER_CLEANUP_FAILED => McpError::ManagerCleanupFailed(children),
+        crate::errors::RUNTIME_CLEANUP_FAILED => McpError::RuntimeCleanupFailed(children),
+        // The OAuth flow's three phases are the seventh aggregate. They cannot be raised by this
+        // module, but they can be *carried* by it — a credential-store failure during a connect
+        // arrives as an `McpError::OAuthAggregate` inside `ManagerError::Mcp`, and that class is
+        // load-bearing all the way up (section 07 rethrows a store failure and swallows everything
+        // else, so a downgrade here is an infinite silent re-auth loop).
+        crate::oauth::PHASE_STARTUP_CLEANUP => McpError::OAuthAggregate {
+            phase: crate::oauth::PHASE_STARTUP_CLEANUP,
+            errors: children,
+        },
+        crate::oauth::PHASE_COMPLETION_CLEANUP => McpError::OAuthAggregate {
+            phase: crate::oauth::PHASE_COMPLETION_CLEANUP,
+            errors: children,
+        },
+        crate::oauth::PHASE_CANCELLATION_CLEANUP => McpError::OAuthAggregate {
+            phase: crate::oauth::PHASE_CANCELLATION_CLEANUP,
+            errors: children,
+        },
+        _ => McpError::Other(fallback.to_string()),
     }
 }
 
@@ -2136,15 +2242,17 @@ impl McpServerManager {
                     // once.
                     if let Some((_, pending)) = tables.close_promises.get(name) {
                         Step::AwaitPendingClose(pending.clone())
-                    // The pending-connect rethrow. Stated plainly, because it is currently
-                    // unreachable: its guard is `error.is_cleanup_failure()` on an error produced
-                    // by the external [`ConnectionFactory`], which returns [`McpError`], so the
-                    // test degrades to `McpError::is_cleanup_failure` (`errors.rs:135-138`) —
-                    // `RuntimeCleanupFailed | OAuthAggregate` only. Upstream's regex would match
-                    // the [`CONNECTION_SETUP_FAILED`] aggregate `createConnection` raises, which is
-                    // exactly the error that flows down this arm. It cannot fire until MCP-124
-                    // gives `McpError` the aggregate variants; the arm is ported so that landing
-                    // MCP-124 is the whole of the change.
+                    // The pending-connect rethrow. Its guard is `error.is_cleanup_failure()` on an
+                    // error produced by the external [`ConnectionFactory`], which returns
+                    // [`McpError`] and reaches here as `ManagerError::Mcp(..)`, so the test is
+                    // `McpError::is_cleanup_failure` — which since MCP-124 matches all seven
+                    // aggregates including the [`CONNECTION_SETUP_FAILED`] one `createConnection`
+                    // raises. The MECHANISM is therefore live, and it is proved end to end through
+                    // the real manager by `a_pending_connect_that_failed_cleanup_is_rethrown_by_
+                    // close`. What is still missing is a *production* producer of `SetupFailed`
+                    // against a real server: `ConnectionBuilder::post_handshake` has one narrow one
+                    // (an abort racing a successful handshake whose own teardown then fails), and
+                    // discovery — upstream's producer, MCP-119 — has not landed.
                     } else if let Some(pending) = tables.connect_promises.get(name).cloned() {
                         Step::AwaitPendingConnect(pending)
                     } else {
@@ -3576,15 +3684,29 @@ mod tests {
         assert!(connecting.await.unwrap().is_err());
         closing.await.unwrap().expect("an ordinary connect failure never fails a close");
 
-        // A cleanup failure → re-raised, with the byte-exact head.
+        // A cleanup failure → re-raised, keeping its CLASS across the public boundary and
+        // rendering the way `formatTerminalError` renders. Both halves are the MCP-124 fix:
+        //
+        // * `to_string()` is the child alone. The head is dropped as soon as one child has text, so
+        //   `starts_with(CONNECTION_CLEANUP_FAILED)` — what this test asserted while
+        //   `ManagerError::Display` was head-prefixed — was pinning the wrong rendering.
+        // * the variant is `ConnectionCleanupFailed`, not `Other`. Before the mapping in
+        //   `From<&ManagerError>` this arrived as `McpError::Other` and `is_cleanup_failure()` was
+        //   `false` for a genuine teardown failure — the blocker MCP-124 was filed to remove.
         let manager = manager_with_failing_close();
         manager.connect("s", &entry(), None).await.unwrap();
         let error = manager.close("s").await.expect_err("the client close failed");
-        assert!(
-            error.to_string().starts_with(CONNECTION_CLEANUP_FAILED),
-            "expected the `MCP connection cleanup failed` head, got {error}"
+        assert_eq!(
+            error.to_string(),
+            "client close failed",
+            "`formatTerminalError` drops the head once a child contributes text"
         );
-        assert!(error.to_string().contains("client close failed"));
+        assert_eq!(error.aggregate_head(), Some(CONNECTION_CLEANUP_FAILED));
+        assert!(
+            matches!(error, McpError::ConnectionCleanupFailed(_)),
+            "the aggregate must keep its class at the public boundary, got {error:?}"
+        );
+        assert!(error.is_cleanup_failure());
     }
 
     fn manager_with_failing_close() -> Arc<McpServerManager> {
@@ -3716,9 +3838,25 @@ mod tests {
         let failing = manager_with_failing_close();
         failing.connect("a", &entry(), None).await.unwrap();
         let error = failing.close_all().await.expect_err("the client close failed");
+        assert_eq!(
+            error.to_string(),
+            "client close failed",
+            "the head surfaces only when no child contributes text"
+        );
+        assert_eq!(error.aggregate_head(), Some(MANAGER_CLEANUP_FAILED));
         assert!(
-            error.to_string().starts_with(MANAGER_CLEANUP_FAILED),
-            "expected the `MCP manager cleanup failed` head, got {error}"
+            matches!(error, McpError::ManagerCleanupFailed(_)),
+            "got {error:?}"
+        );
+        assert!(error.is_cleanup_failure());
+        // The nesting survives too: `closeAll`'s children are `disposeConnection`'s aggregates.
+        assert!(
+            error
+                .aggregate_children()
+                .is_some_and(|children| children
+                    .iter()
+                    .any(|child| matches!(child, McpError::ConnectionCleanupFailed(_)))),
+            "expected a nested `MCP connection cleanup failed`, got {error:?}"
         );
 
         // An ordinary connect failure during shutdown is expected and must not surface.

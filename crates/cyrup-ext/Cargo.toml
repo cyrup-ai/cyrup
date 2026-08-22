@@ -34,6 +34,14 @@ serde.workspace = true
 serde_json.workspace = true
 tracing = "0.1.44"
 dashmap.workspace = true
+# `EXACT_PACKAGE_VERSION_RE` (`npx-resolver.ts:10`), the only regular expression in this crate.
+# MCP-105 pins `npx -y pkg@1.2.3` to the `_npx` copy whose `package.json` version is exactly
+# `1.2.3`, and the discriminator between "an exact version" and "a range" is upstream's pattern —
+# reproduced rather than approximated, because `pkg@1.2` and `pkg@^1.2.0` must pin NOTHING while
+# `pkg@1.2.3-rc.1+build.5` must pin. No new resolution surface: `regex` is already a per-crate
+# dependency of `cyrup-mcp` and `cyrup-permission-system` at the same major, and Rust's `regex` is a
+# finite automaton with a linear-time matching guarantee.
+regex = "1.12.4"
 # The `http-client` capability grant (arch-08 §3.2 draft; pi-mcp-adapter-port.md §3.2), backing
 # `caps::http::HttpCaps` — a real `reqwest`-based engine. Optional (bundled into `wasm-host`) so a
 # `--no-default-features` build of the native-only foundation pulls neither wasmtime nor reqwest.

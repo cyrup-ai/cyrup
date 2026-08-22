@@ -383,7 +383,7 @@ pub fn resolve_stdio_env(
     base: &HashMap<String, String>,
 ) -> McpResult<HashMap<String, String>> {
     resolve_env(
-        entry.env.as_ref(),
+        entry.env.as_deref(),
         server_name,
         entry.literal_env == Some(true),
         base,
@@ -461,12 +461,13 @@ pub fn resolve_http_secrets(
     // Step 2 — the raw values, before resolution, so `!!x` (an escaped literal) never counts.
     let has_command_header = entry
         .headers
-        .iter()
+        .as_deref()
+        .into_iter()
         .flatten()
         .any(|(_, value)| crate::credentials::is_command_secret(value));
 
     // Step 3.
-    let mut headers: Vec<(String, String)> = resolve_command_secrets_record(entry.headers.as_ref(), |key| {
+    let mut headers: Vec<(String, String)> = resolve_command_secrets_record(entry.headers.as_deref(), |key| {
         format!("MCP server \"{server_name}\" HTTP header \"{key}\"")
     })?
     .unwrap_or_default()
@@ -570,7 +571,7 @@ mod tests {
     fn http_entry(headers: &[(&str, &str)]) -> ServerEntry {
         ServerEntry {
             url: Some("https://example.test/mcp".to_string()),
-            headers: Some(record(headers)),
+            headers: Some(record(headers).into()),
             ..ServerEntry::default()
         }
     }
