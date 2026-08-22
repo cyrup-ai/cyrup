@@ -1,7 +1,7 @@
 ---
-stage: new
+stage: exec
 status: done
-updated: 2026-08-22 19:32
+updated: 2026-08-22 23:21
 ---
 
 # Close The Drift Between Public Signatures And lib.rs Re-exports
