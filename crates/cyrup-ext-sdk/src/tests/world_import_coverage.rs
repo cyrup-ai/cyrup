@@ -62,20 +62,26 @@ const SDK_SOURCES: &str = concat!(
 fn every_ctx_submodule_is_in_sdk_sources() {
     let dir = std::path::Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/src/ctx"));
     let mut missing: Vec<String> = Vec::new();
+    let mut scanned = 0usize;
     for entry in std::fs::read_dir(dir).expect("src/ctx is a directory") {
         let path = entry.expect("readable dir entry").path();
         if path.extension().is_none_or(|x| x != "rs") {
             continue;
         }
+        scanned += 1;
         let body = std::fs::read_to_string(&path).expect("readable source file");
         let probe: String = body.chars().take(200).collect();
         if !probe.is_empty() && !SDK_SOURCES.contains(probe.as_str()) {
             missing.push(path.display().to_string());
         }
     }
+    // Non-vacuity: a scan that finds nothing satisfies the containment loop trivially, so the COUNT
+    // is the only thing that proves this guard did any work. The literal is one per submodule plus
+    // `mod.rs`, not `> 0`, so deleting a submodule without deleting its `include_str!` line is
+    // caught here too — the direction the containment check cannot see.
     assert!(
-        !missing.is_empty() || SDK_SOURCES.contains("mod base;"),
-        "the `src/ctx/` scan found nothing to check, so this guard would be vacuous"
+        scanned >= 13,
+        "the `src/ctx/` scan found only {scanned} `.rs` file(s) — this guard would be vacuous"
     );
     assert!(
         missing.is_empty(),

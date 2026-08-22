@@ -1,7 +1,7 @@
 ---
-stage: qa
-status: needs-rework
-updated: 2026-08-22 16:24
+stage: exec
+status: done
+updated: 2026-08-22 16:44
 ---
 
 # Decompose ctx.rs Into Submodules — Outstanding Rework

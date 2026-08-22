@@ -2,6 +2,10 @@
 //! `control` ops pi puts on the BASE `ExtensionContext` (`abort`/`shutdown`), plus [`ExtMode`] and
 //! the [`Ctx`] type itself. The rest of `impl Ctx` lives beside the WIT interface each slice
 //! fronts — `tools`, `exec`, `fs`, `http`, `proc`.
+//!
+//! [`Ctx::register_tool`] also lives here rather than in `tools`: it fronts no WIT import at all —
+//! it hands a descriptor to the guest's own `register_tool_late` for the host to pick up at its
+//! next tool refresh — so it belongs with the type rather than with the `ext-tools` introspection.
 
 use serde::Serialize;
 
