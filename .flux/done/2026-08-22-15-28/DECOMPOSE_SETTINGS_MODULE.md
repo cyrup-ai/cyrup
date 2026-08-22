@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 19:42
+stage: qa
+status: completed
+updated: 2026-08-22 21:05
 ---
 
 # Decompose settings.rs Into A src/settings/ Module Tree
@@ -65,3 +65,24 @@ no new tests.
 - [ ] `grep -rn 'fn string_list' crates/cyrup-config/src/settings/` returns no match; the four `EffectiveSettings` getters delegate to `Settings::layer_string_list`, now `pub(crate)`
 - [ ] `cargo build --workspace` succeeds with no changes to any file outside `crates/cyrup-config/src/`
 - [ ] `cargo test -p cyrup-config` shows the same pass/fail set as before the move
+
+## Outcome — completed
+
+Landed in `749cbb9`, merged to `main` via #46 (squashed into `7e221a3`).
+
+`settings.rs` (3,089 lines) became `src/settings/`: seven production submodules — `types` 179,
+`layer` 212, `migrate` 72, `merge` 23, `effective` 621, `store` 127, `manager` 538 — plus a
+three-way test split and a 37-line `mod.rs`. Largest file 621, under the ~900 cap.
+
+All six acceptance criteria met. The facade re-exports **20** items as required, the count having
+been re-derived from the real file rather than trusted: the 16 in `lib.rs` plus `ThinkingBudgets`,
+`Warnings`, `ProviderRetrySettings` and `BranchSummarySettings`, which are reachable only as
+`cyrup_config::settings::X` and would otherwise have silently left the public API. `src/lib.rs` is
+byte-identical. `grep -rn 'fn string_list' src/settings/` returns nothing — the four
+`EffectiveSettings` getters delegate to `Settings::layer_string_list`, now `pub(crate)`.
+
+The move was verified verbatim rather than assumed: `types`, `migrate`, `merge`, `store` and
+`manager` diff byte-identical against their original line ranges; `layer` differs only in the ten
+intended lines (nine visibility widenings and one doc-link rewrite).
+
+Every line number and count cited in this task file checked out against the real file.

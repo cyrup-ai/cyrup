@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 19:42
+stage: qa
+status: completed
+updated: 2026-08-22 21:05
 ---
 
 # Fix Error Variants That Mislabel Or Silently Swallow Config Failures
@@ -81,3 +81,33 @@ from `io::Error` exist outside `lock.rs`.
 - [ ] `grep -c 'ConfigError::Trust' src/settings.rs` returns 0
 - [ ] `ConfigError::Io` and `AuthError::Io` carry the offending path and render it in their `#[error(...)]` string; all six sites supply it
 - [ ] `cargo build -p cyrup-config` and `cargo test -p cyrup-config` pass with no failures beyond those in `TEST_FAILURES.md`; the `trust.rs:646` `matches!` assertion still compiles
+
+## Outcome — completed
+
+Landed in `a7aa779`, merged to `main` via #46 (squashed into `7e221a3`).
+
+All four failure classes fixed. `let _ = crate::lock::write_atomic` is gone from `models_store.rs`,
+as are all three `FileLock::acquire(&self.path).ok()` sites; `grep -c 'ConfigError::Trust'` over the
+settings layer returns 0; `AuthError::Lock` is now constructed only at the `FileLock::acquire` site
+(`auth.rs:273`).
+
+**This carried a breaking public API change, called out in #46's description.** `ConfigError::Io`
+and `AuthError::Io` became struct variants `{ path, source }`, which deletes both
+`From<std::io::Error>` impls. That is the only way to carry the path this task asked for. Nothing
+outside `cyrup-config` matches either variant, so `cargo check --workspace` stayed green.
+
+**One test was renamed and its assertion tightened**, which a reviewer should not mistake for a
+weakening: `an_unwritable_path_is_not_an_error` → `an_unwritable_path_fails_the_write_and_reads_as_no_overlay`.
+The old test asserted the very bug this task fixed, so it had to change with the behaviour.
+
+**Left deliberately undone:** `models_store.rs:301` still swallows a serialization failure via
+`if let Ok(value) = serde_json::to_value(&entry)`. It sits outside this task's acceptance criteria
+and was not folded in. Worth its own task.
+
+## Correction to this task file's evidence
+
+The final acceptance criterion (line 82) says "all six sites supply it" for `ConfigError::Io`. The
+count was wrong — there were **eight** construction sites, not six. All eight were handled. Two of
+the six named, `env.rs:243` and `env.rs:247`, turned out to be `std::env::current_dir()` failures
+with no path to name; they were routed to `ConfigError::Dir` instead, which is the semantically
+correct variant, with the io error's text preserved in the message.
