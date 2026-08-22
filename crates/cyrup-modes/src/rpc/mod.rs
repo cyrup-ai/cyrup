@@ -27,327 +27,27 @@ use std::sync::Arc;
 
 use cyrup_session_svc::{
     AgentSession, AgentSessionEvent, AgentSessionRuntime, BashOptions, Content, EntryId,
-    EventStream, ForkPosition, InputSource, ModelThinkingLevel, NotifyKind, PromptAccepted,
-    PromptOptions, QueueMode, StreamingBehavior, UiEffect, UiKind, UiReply, UiRequest, UserInput,
+    EventStream, ForkPosition, InputSource, NotifyKind, PromptAccepted,
+    PromptOptions, UiEffect, UiKind, UiReply, UiRequest, UserInput,
 };
 use futures::stream::FuturesUnordered;
 use futures::{FutureExt, StreamExt};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::ModesError;
 
+mod jsonl;
+pub(crate) mod types;
+
+use jsonl::{read_lines, write_out};
+use types::queue_mode_str;
+pub use types::{QueueModeArg, RpcOut, RpcResponse, SessionCommand};
+
 // ---------------------------------------------------------------------------------------------
-// Wire types
+// Extension dialogs + run-loop support
 // ---------------------------------------------------------------------------------------------
-
-/// The queue-drain mode argument (`all` | `one-at-a-time`; Pi `set_steering_mode`/`set_follow_up_mode`,
-/// rpc-types.ts:41-42).
-#[derive(Clone, Copy, Debug, serde::Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum QueueModeArg {
-    All,
-    OneAtATime,
-}
-
-impl From<QueueModeArg> for QueueMode {
-    fn from(m: QueueModeArg) -> Self {
-        match m {
-            QueueModeArg::All => QueueMode::All,
-            QueueModeArg::OneAtATime => QueueMode::OneAtATime,
-        }
-    }
-}
-
-/// Render a [`QueueMode`] back to its Pi wire string.
-fn queue_mode_str(mode: QueueMode) -> &'static str {
-    match mode {
-        QueueMode::All => "all",
-        QueueMode::OneAtATime => "one-at-a-time",
-    }
-}
-
-/// An incoming RPC request (`type`-tagged snake_case to match Pi clients; camelCase fields per the
-/// wire; R-11-014, rpc-types.ts:20-72).
-///
-/// The request `id` is **not** a variant field: exactly as Pi reads `const id = command.id` once at
-/// the top of `handleCommand` (rpc-mode.ts:383), cyrup recovers it from the raw parsed line in
-/// [`dispatch`] (`raw_id`), preserved as-sent (string **or** number — Pi types `id?: string` but an
-/// opaque number passes through untouched, R-11-015; #10). Keeping `id` off the variant means a
-/// numeric-`id` command still deserializes and **executes** rather than tripping payload
-/// validation. Unknown command types deserialize to [`SessionCommand::Unknown`] via `#[serde(other)]`
-/// (detected in [`dispatch`], never reaching [`handle`]); a required field that is missing/wrong-typed
-/// yields a serde error — both produce a `success:false` response, never a panic (R-00-009).
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum SessionCommand {
-    // ---- Prompting ----
-    /// Submit a prompt. While streaming, `streamingBehavior` is required (R-11-016).
-    Prompt {
-        message: String,
-        #[serde(default)]
-        images: Vec<Content>,
-        #[serde(default, rename = "streamingBehavior")]
-        streaming_behavior: Option<StreamingBehavior>,
-    },
-    /// Enqueue a steering message (delivered after the current tool batch).
-    Steer {
-        message: String,
-        #[serde(default)]
-        images: Vec<Content>,
-    },
-    /// Enqueue a follow-up message (delivered after the agent goes idle).
-    FollowUp {
-        message: String,
-        #[serde(default)]
-        images: Vec<Content>,
-    },
-    /// Interrupt the active run (idempotent).
-    Abort,
-    /// Start a fresh session in the same cwd, optionally recording a `parentSession`.
-    NewSession {
-        #[serde(default, rename = "parentSession")]
-        parent_session: Option<String>,
-    },
-
-    // ---- State ----
-    /// Query the full snapshot of session state (rpc-types.ts:94-107).
-    GetState,
-
-    // ---- Model ----
-    /// Switch the active model by `provider` + `modelId`.
-    SetModel {
-        provider: String,
-        #[serde(rename = "modelId")]
-        model_id: String,
-    },
-    /// Cycle to the next model in the scoped/available set.
-    CycleModel,
-    /// List the available models.
-    GetAvailableModels,
-
-    // ---- Thinking ----
-    /// Set the thinking level (`off`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`).
-    SetThinkingLevel { level: ModelThinkingLevel },
-    /// Cycle to the next thinking level.
-    CycleThinkingLevel,
-    /// The thinking levels the ACTIVE model supports (`rpc-types.ts:39`, handler
-    /// `rpc-mode.ts:507-510`, response `{levels}` at `rpc-types.ts:158-164`). SEAM-014.
-    GetAvailableThinkingLevels,
-
-    // ---- Queue modes ----
-    /// Set the steering drain mode.
-    SetSteeringMode { mode: QueueModeArg },
-    /// Set the follow-up drain mode.
-    SetFollowUpMode { mode: QueueModeArg },
-
-    // ---- Compaction ----
-    /// Compact the current branch.
-    Compact {
-        #[serde(default, rename = "customInstructions")]
-        custom_instructions: Option<String>,
-    },
-    /// Toggle auto-compaction.
-    SetAutoCompaction { enabled: bool },
-
-    // ---- Retry ----
-    /// Toggle auto-retry.
-    SetAutoRetry { enabled: bool },
-    /// Abort the pending auto-retry.
-    AbortRetry,
-
-    // ---- Bash ----
-    /// Run an immediate bash command out of the agent loop.
-    Bash {
-        command: String,
-        #[serde(default, rename = "excludeFromContext")]
-        exclude_from_context: bool,
-    },
-    /// Cancel a running bash command.
-    AbortBash,
-
-    // ---- Session ----
-    /// Aggregate transcript statistics for the current branch.
-    GetSessionStats,
-    /// Export the current branch to a standalone HTML document.
-    ExportHtml {
-        #[serde(default, rename = "outputPath")]
-        output_path: Option<String>,
-    },
-    /// Resume a session file, rebuilding cwd-bound services.
-    SwitchSession {
-        #[serde(rename = "sessionPath")]
-        session_path: String,
-    },
-    /// Fork at an entry into a new branched session (`position:"before"` returns the anchor text).
-    Fork {
-        #[serde(rename = "entryId")]
-        entry_id: String,
-    },
-    /// Clone the current leaf at-position into a new session.
-    Clone,
-    /// The user-message fork anchors on the current branch.
-    GetForkMessages,
-    /// The persisted entries on the current branch (optionally `since` an entry id).
-    GetEntries {
-        #[serde(default)]
-        since: Option<String>,
-    },
-    /// The full session tree.
-    GetTree,
-    /// The text of the last assistant message.
-    GetLastAssistantText,
-    /// Set the session display name (trimmed; empty rejected).
-    SetSessionName { name: String },
-
-    // ---- Messages ----
-    /// Query the persisted transcript on the current branch.
-    GetMessages,
-
-    // ---- Commands ----
-    /// List the slash commands available for invocation via a prompt.
-    GetCommands,
-
-    /// Any unrecognized `type` (R-00-009). Detected in [`dispatch`]; never reaches [`handle`].
-    #[serde(other)]
-    Unknown,
-}
-
-/// A correlated reply to a [`SessionCommand`] (arch-11 §3.5).
-///
-/// Field order is the exact byte layout Pi's `success`/`error` helpers emit
-/// (`{ id, type, command, success, data|error }`, rpc-mode.ts:63-76): `id` **first** (omitted when
-/// absent, so an id-less response byte-matches Pi's `{ type, command, ... }`), then the `type` tag,
-/// the echoed `command`, the `success` flag, and finally the mutually-exclusive `data`/`error`. The
-/// `command` is an owned `String` because the unknown-command / malformed-payload error paths echo
-/// the caller's **real** `type` string, not one of the fixed verb literals (#7/#8).
-#[derive(Debug, serde::Serialize)]
-pub struct RpcResponse {
-    /// Echoed request `id` for correlation, preserved as-is (string or number; R-11-015). Emitted
-    /// first to match Pi's object literal (`{ id, type: "response", … }`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<Value>,
-    /// Always `"response"`.
-    #[serde(rename = "type")]
-    pub kind: &'static str,
-    /// Echoed command name (a fixed verb, or the caller's real `type` on the error paths).
-    pub command: String,
-    pub success: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Value>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
-
-/// The read direction of the same wire object, for [`crate::RpcClient`] (SEAM-017). Pi shares ONE
-/// `RpcResponse` type between its host and its client (`rpc-types.ts`, imported by both
-/// `rpc-mode.ts` and `rpc-client.ts:15`), so cyrup shares one too rather than growing a second,
-/// drift-prone client-side mirror.
-///
-/// Hand-written because `kind` is a `&'static str` — the tag is a constant of the type, not data —
-/// so the derive cannot produce a `Deserialize`. The `type` key is read and discarded (a
-/// `type` other than `"response"` never reaches here: the client tests it before deserializing,
-/// exactly as Pi's `handleLine` does at `rpc-client.ts:512`), and every field is defaulted so a
-/// truncated or partial response object degrades to `success:false` rather than failing the parse
-/// and silently dropping a correlated reply.
-impl<'de> serde::Deserialize<'de> for RpcResponse {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(serde::Deserialize)]
-        struct Wire {
-            #[serde(default)]
-            id: Option<Value>,
-            #[serde(default)]
-            command: String,
-            #[serde(default)]
-            success: bool,
-            #[serde(default)]
-            data: Option<Value>,
-            #[serde(default)]
-            error: Option<String>,
-        }
-        let wire = Wire::deserialize(deserializer)?;
-        Ok(Self {
-            id: wire.id,
-            kind: "response",
-            command: wire.command,
-            success: wire.success,
-            data: wire.data,
-            error: wire.error,
-        })
-    }
-}
-
-impl RpcResponse {
-    fn ok(command: impl Into<String>, id: Option<Value>, data: Option<Value>) -> Self {
-        Self { id, kind: "response", command: command.into(), success: true, data, error: None }
-    }
-
-    fn err(command: impl Into<String>, id: Option<Value>, error: impl Into<String>) -> Self {
-        Self {
-            id,
-            kind: "response",
-            command: command.into(),
-            success: false,
-            data: None,
-            error: Some(error.into()),
-        }
-    }
-}
-
-/// The two top-level shapes written on the protocol stream (arch-11 §3.5).
-///
-/// Serialized untagged: a `response` carries `"type":"response"`; an event carries its own
-/// `AgentSessionEvent` `type` tag (`agent_start`, `tool_execution_end`, …) — distinct, so a client
-/// dispatches on `type`. The event is boxed (it is the larger variant).
-///
-/// [`RpcOut::Event`] serializes through [`crate::to_json_event`], NOT through
-/// [`AgentSessionEvent`]'s own `Serialize` — Pi's `output(toJsonEvent(event))`
-/// (`rpc-mode.ts:356` **@v0.84.1**; at the ported v0.83.0 baseline that line is
-/// `if (event.type === "agent_settled")` and `:355` is a bare `output(event)` — `toJsonEvent` does
-/// not exist at the tag. See [`crate::json_event`] for the version-lag rationale, SEAM-085).
-/// The `Serialize` impl is hand-written for exactly that reason (see below); the variant keeps its
-/// `Box<AgentSessionEvent>` payload so the projection stays a wire concern and no public signature
-/// changes.
-#[derive(Debug)]
-pub enum RpcOut {
-    Response(RpcResponse),
-    Event(Box<AgentSessionEvent>),
-    /// A synchronous extension dialog request (`ui.{confirm,input,select,editor}`) emitted on stdout
-    /// for the RPC client to render + answer via an `extension_ui_response` (Pi
-    /// `createExtensionUIContext` → `output({type:"extension_ui_request", …})`, rpc-mode.ts:128-160,
-    /// 253-268). Carries the pre-shaped Pi wire object so field names/order match byte-for-byte.
-    ExtensionUiRequest(Value),
-    /// A contained extension fault surfaced to the client (Pi `bindExtensions({onError})`,
-    /// rpc-mode.ts:347-349: `output({type:"extension_error", extensionPath, event, error})`). Carries
-    /// the pre-shaped `{type:"extension_error", extensionPath, event, error}` wire object; emitted on
-    /// stdout each time the dispatcher contains + skips a guest handler fault (R-08-036). Untagged, so
-    /// the embedded `"type":"extension_error"` is the discriminant a client dispatches on.
-    ExtensionError(Value),
-}
-
-/// Untagged serialization — each variant serializes as its inner value and nothing else, exactly as
-/// `#[serde(untagged)]` did — with ONE difference: [`RpcOut::Event`] routes through
-/// [`crate::to_json_event`], so the rpc stdout stream carries the delta-only `message_update` Pi
-/// emits (`rpc-mode.ts:356` **@v0.84.1** — see above) rather than the cumulative snapshots.
-///
-/// Hand-written rather than derived because the projection has to happen at the point of writing:
-/// `RpcOut::Event` is constructed from an [`AgentSessionEvent`] the driver has in hand (`:807`,
-/// `:830`), which is the analog of Pi's `output(event)` call site, and the projection borrows rather
-/// than owning. Keeping the payload type and moving the projection into the serializer means the two
-/// wire writers ([`crate::run_json`] and [`write_out`]) share ONE projection with no copy to drift.
-/// The match is exhaustive so a new variant cannot silently skip it.
-impl serde::Serialize for RpcOut {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match self {
-            RpcOut::Response(response) => response.serialize(serializer),
-            RpcOut::Event(event) => crate::to_json_event(event).serialize(serializer),
-            RpcOut::ExtensionUiRequest(value) | RpcOut::ExtensionError(value) => {
-                value.serialize(serializer)
-            }
-        }
-    }
-}
 
 /// A pending extension dialog awaiting its `extension_ui_response` (mirrors Pi's
 /// `pendingExtensionRequests` map, rpc-mode.ts:79-82). `kind` is retained so a `{value}`/`{confirmed}`/
@@ -695,11 +395,18 @@ where
     };
     // Leaving the block dropped `driver` and with it the sender, so the pump's channel is now
     // closed and it will return as soon as the backlog is on the wire.
-    driven?;
-    match pump_failed {
+    //
+    // The driver's outcome is HELD, not `?`-ed, until that flush has happened: it may be the reader's
+    // I/O error, and the responses/events the driver drained onto the queue on its way out are still
+    // in flight behind it. Reporting first would drop them. On the (unchanged) success path this is
+    // the same sequence as before — pump to completion, then surface whichever half failed, driver
+    // first since a severed input is the root cause of anything the writer then saw.
+    let pumped = match pump_failed {
         Some(res) => res,
         None => pump.await,
-    }
+    };
+    driven?;
+    pumped
 }
 
 /// Own `writer` for the whole run and drain [`run_rpc`]'s emission queue onto it — cyrup's spelling
@@ -777,10 +484,18 @@ where
     let mut gen_rx = runtime.watch_generation();
 
     // Dedicated reader task → mpsc of raw JSONL lines (strict LF framing; cancel-safe vs. events).
+    // The handle is KEPT (not detached) so [`read_lines`]'s own failure — a broken pipe, an `EIO` on a
+    // serial/socket fd, a supervisor tearing the input fd down — can be surfaced instead of being
+    // indistinguishable from the client closing stdin cleanly.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<String>(64);
-    let reader_task = tokio::spawn(read_lines(reader, cmd_tx));
+    let mut reader_task = Some(tokio::spawn(read_lines(reader, cmd_tx)));
 
     let mut reader_open = true;
+    // Whether the reader task ENDED BY ITSELF (EOF, receiver dropped, or a read error). The command
+    // channel closing is the exact signal of that, since the task owns the only sender. Kept distinct
+    // from `reader_open`, which the `ctx.shutdown()` path below ALSO clears while the task is still
+    // parked on input — joining the handle is only safe when this flag is set.
+    let mut reader_ended = false;
     // True from the moment a run is accepted until its `agent_settled` is observed (SEAM-005 — the
     // whole run, not just the first agent loop).
     let mut in_flight = false;
@@ -863,7 +578,12 @@ where
                             dispatches.push(dispatch_owned(runtime, Arc::clone(&session), line));
                         }
                     }
-                    None => reader_open = false,
+                    None => {
+                        // The sender is gone: `read_lines` returned. Its outcome (clean EOF vs. a
+                        // read error) is read from the join handle at the shutdown break below.
+                        reader_open = false;
+                        reader_ended = true;
+                    }
                 }
             }
             Some(dispatched) = dispatches.next(), if !dispatches.is_empty() => {
@@ -967,12 +687,31 @@ where
             while let Ok(wire) = error_rx.try_recv() {
                 let _ = out.send(RpcOut::ExtensionError(wire));
             }
+            // Only NOW — after everything already queued has been handed to `write_pump` — look at
+            // how the reader ended. A genuine transport failure is not an EOF: propagating it is what
+            // lets `cyrup --mode rpc` exit non-zero (and an embedder awaiting `run_rpc` learn the
+            // session was cut off) instead of returning `Ok(())` as if the client had closed stdin.
+            // Awaiting cannot block here: `reader_ended` is set from the channel-closed arm ALONE, so
+            // the task has already returned. The `ctx.shutdown()` path above, where the task is still
+            // parked on input, never sets it — hence no deadlock.
+            if reader_ended && let Some(handle) = reader_task.take() {
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => return Err(ModesError::Io(e)),
+                    // Aborted or panicked: there is no `io::Error` to report and the input stream is
+                    // over either way, so fall through to the clean shutdown.
+                    Err(_) => {}
+                }
+            }
             break;
         }
     }
 
-    // The reader task ends on its own at EOF; this just reaps it.
-    reader_task.abort();
+    // The reader task ends on its own at EOF — in which case it was already taken + joined above.
+    // This reaps the other case: the `ctx.shutdown()` path, where it is still parked on input.
+    if let Some(handle) = reader_task {
+        handle.abort();
+    }
     Ok(())
 }
 
@@ -1626,61 +1365,12 @@ async fn state_view(session: &AgentSession) -> Value {
     Value::Object(state)
 }
 
-/// Serialize one protocol record and write it as a single LF-terminated line, flushed immediately so
-/// the peer never waits on buffering (R-11-013).
-async fn write_out<W: AsyncWrite + Unpin>(writer: &mut W, out: &RpcOut) -> Result<(), ModesError> {
-    let mut line = serde_json::to_string(out)?;
-    line.push('\n');
-    // TOOL-037 note — pi's RPC writer is `writeRawStdout` (`rpc-mode.ts:60`), whose retry loop
-    // (`core/output-guard.ts:36-41`) covers `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS`. This sink is a tokio
-    // `AsyncWrite`, not a `std::io::Write`: the executor's own readiness machinery IS that loop —
-    // a would-block registers a waker and re-polls instead of surfacing the error — so
-    // `crate::raw_stdout`'s explicit sleep-and-retry is the SYNC-sink half only and would be a
-    // second, worse implementation here. `ENOBUFS` likewise reaches the caller as a genuine error
-    // on both sides.
-    writer.write_all(line.as_bytes()).await?;
-    writer.flush().await?;
-    Ok(())
-}
-
-/// Read strict-LF JSONL lines from `reader` and forward **every** record over `tx`. Splits on
-/// `\n` only; a trailing `\r` is stripped (CRLF tolerance). Ends at EOF or when the receiver drops.
-///
-/// SEAM-054 — an EMPTY line is forwarded like any other, because pi forwards it: `emitLine` is
-/// invoked for every newline-delimited slice with no emptiness filter (`modes/rpc/jsonl.ts:25-41`
-/// @v0.84.1, the emit at `:38`), it reaches `handleInputLine` (`rpc-mode.ts:748-762`), `JSON.parse("")`
-/// throws, and pi answers `error(undefined, "parse", "Failed to parse command: …")` on stdout
-/// (`:752-758`). Dropping it here made cyrup silent for an input class pi replies to, so any client
-/// correlating n-lines-in to n-responses-out desynchronised. [`dispatch`]'s existing
-/// `serde_json::from_str` failure arm produces pi's exact response with no id.
-async fn read_lines<R: AsyncBufRead + Unpin>(mut reader: R, tx: mpsc::Sender<String>) {
-    let mut buf = Vec::new();
-    loop {
-        buf.clear();
-        match reader.read_until(b'\n', &mut buf).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                if buf.last() == Some(&b'\n') {
-                    buf.pop();
-                }
-                if buf.last() == Some(&b'\r') {
-                    buf.pop();
-                }
-                let line = String::from_utf8_lossy(&buf).into_owned();
-                if tx.send(line).await.is_err() {
-                    break;
-                }
-            }
-            Err(_) => break,
-        }
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
     use cyrup_ext::DialogOptions;
+    use cyrup_session_svc::ModelThinkingLevel;
 
     /// PROV-002: the RPC surface must accept `max`. `SessionCommand` is serde-driven, so this
     /// pins that an RPC client can actually reach the top rung (and that a bogus level still

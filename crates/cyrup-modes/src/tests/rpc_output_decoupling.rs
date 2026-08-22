@@ -30,10 +30,7 @@
 //! merely records). The first proves a later command is still serviced while the writer is stalled;
 //! the second pins the property the fix must not break — nothing queued during the stall is lost.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
-
 use std::io;
-use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -44,10 +41,11 @@ use cyrup_core::StopReason;
 use crate::run_rpc;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSessionRuntime, SessionConfig, SessionFactory};
+use cyrup_session_svc::{AgentSessionRuntime, SessionFactory};
 use serde_json::Value;
-use tempfile::TempDir;
 use tokio::io::{AsyncWrite, AsyncWriteExt, BufReader};
+
+use super::support::{base_config_no_ext, create_runtime, fixture, parse_lines, Fixture};
 
 // ---------------------------------------------------------------------------------------------
 // A genuinely stalled peer
@@ -128,23 +126,8 @@ impl AsyncWrite for StalledWriter {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Fixture
+// The runtime under test
 // ---------------------------------------------------------------------------------------------
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
 
 async fn runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
     let faux = Arc::new(FauxProvider::new());
@@ -153,21 +136,9 @@ async fn runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
         StopReason::Stop,
     )]);
     let provider: Arc<dyn Provider> = faux;
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
+    let cfg = base_config_no_ext(fx);
     let target = cfg.target.clone();
-    let factory = SessionFactory::new(provider, cfg);
-    AgentSessionRuntime::create(Arc::new(factory), target).await.expect("build runtime")
-}
-
-fn parse_lines(bytes: &[u8]) -> Vec<Value> {
-    String::from_utf8(bytes.to_vec())
-        .expect("utf8 output")
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str::<Value>(l).expect("each line is a complete json record"))
-        .collect()
+    create_runtime(SessionFactory::new(provider, cfg), target).await
 }
 
 /// Poll `f` until it returns true or `budget` elapses. Used instead of a fixed sleep so the test

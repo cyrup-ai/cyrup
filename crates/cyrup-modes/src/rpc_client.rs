@@ -83,7 +83,7 @@
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{json, Map, Value};
@@ -93,7 +93,7 @@ use tokio::sync::oneshot;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
-use crate::rpc::RpcResponse;
+use crate::rpc::types::RpcResponse;
 
 // ---------------------------------------------------------------------------------------------
 // Constants — pi's literals
@@ -212,9 +212,14 @@ pub struct RpcClientOptions {
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelInfo {
+    /// Provider id the model is served by (wire key `provider`) — the `provider` argument of
+    /// [`RpcClient::set_model`].
     pub provider: String,
+    /// Model id (wire key `id`) — the `model_id` argument of [`RpcClient::set_model`].
     pub id: String,
+    /// Context window in tokens (wire key `contextWindow` — camelCase via the `rename_all`).
     pub context_window: u64,
+    /// Whether this is a reasoning model (wire key `reasoning`).
     pub reasoning: bool,
 }
 
@@ -222,7 +227,10 @@ pub struct ModelInfo {
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkMessage {
+    /// Transcript entry id of the fork point (wire key `entryId` — camelCase via the `rename_all`)
+    /// — the `entry_id` argument of [`RpcClient::fork`].
     pub entry_id: String,
+    /// The entry's message text, for presenting the fork point to a user (wire key `text`).
     pub text: String,
 }
 
@@ -274,10 +282,7 @@ impl ClientInner {
     }
 
     fn set_exit_error(&self, error: RpcClientError) {
-        let mut slot = match self.exit_error.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut slot = lock_ignoring_poison(&self.exit_error);
         // pi keeps the FIRST error it latched: `this.exitError ?? new Error(...)` on the stdin path
         // (`rpc-client.ts:121`). The exit/error handlers overwrite, but they fire once each.
         if slot.is_none() {
@@ -288,20 +293,14 @@ impl ClientInner {
     /// The latched exit error, re-rendered (pi rethrows the same `Error` object; `RpcClientError` is
     /// not `Clone`, so the stored variant is reconstructed).
     fn exit_error(&self) -> Option<RpcClientError> {
-        let slot = match self.exit_error.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let slot = lock_ignoring_poison(&self.exit_error);
         slot.as_ref().map(clone_error)
     }
 
     /// pi `rejectPendingRequests` (`rpc-client.ts:532-537`): settle every in-flight request and empty
     /// the map. Dropping the senders is the settle — see mechanism gap 3 in the module docs.
     fn reject_pending_requests(&self) {
-        let mut map = match self.pending.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut map = lock_ignoring_poison(&self.pending);
         map.clear();
     }
 
@@ -309,10 +308,7 @@ impl ClientInner {
     /// with the lock released before the first callback — mechanism gap 2 in the module docs.
     fn dispatch_event(&self, event: &Value) {
         let snapshot: Vec<Listener> = {
-            let guard = match self.listeners.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
+            let guard = lock_ignoring_poison(&self.listeners);
             guard.iter().map(|(_, l)| Arc::clone(l)).collect()
         };
         for listener in snapshot {
@@ -332,22 +328,16 @@ impl ClientInner {
             // number (R-11-015). `id_key` renders both the way `send` registered them.
             if let Some(key) = data.get("id").and_then(id_key) {
                 let waiting = {
-                    let mut map = match self.pending.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
+                    let mut map = lock_ignoring_poison(&self.pending);
                     map.remove(&key)
                 };
                 if let Some(tx) = waiting {
-                    match serde_json::from_value::<RpcResponse>(data) {
-                        // The receiver may already be gone (the caller's future was dropped); pi's
-                        // resolve on a settled promise is likewise a no-op.
-                        Ok(response) => {
-                            let _ = tx.send(response);
-                        }
-                        // A malformed `response` line is not a response — fall through to nothing,
-                        // exactly as pi's `JSON.parse` catch swallows a bad line.
-                        Err(_) => {}
+                    // The receiver may already be gone (the caller's future was dropped); pi's
+                    // resolve on a settled promise is likewise a no-op. A malformed `response` line
+                    // is not a response — fall through to nothing, exactly as pi's `JSON.parse`
+                    // catch swallows a bad line.
+                    if let Ok(response) = serde_json::from_value::<RpcResponse>(data) {
+                        let _ = tx.send(response);
                     }
                     return;
                 }
@@ -415,10 +405,7 @@ struct PendingGuard {
 
 impl Drop for PendingGuard {
     fn drop(&mut self) {
-        let mut map = match self.inner.pending.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut map = lock_ignoring_poison(&self.inner.pending);
         map.remove(&self.id);
     }
 }
@@ -434,10 +421,7 @@ pub struct EventSubscription {
 
 impl Drop for EventSubscription {
     fn drop(&mut self) {
-        let mut list = match self.inner.listeners.lock() {
-            Ok(g) => g,
-            Err(p) => p.into_inner(),
-        };
+        let mut list = lock_ignoring_poison(&self.inner.listeners);
         list.retain(|(id, _)| *id != self.id);
     }
 }
@@ -566,17 +550,31 @@ impl RpcClient {
         // pi: `childProcess.stderr?.on("data", …)` — accumulate AND passthrough (`:101-104`).
         let inner = Arc::clone(&client.inner);
         let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                {
-                    let mut buf = match inner.stderr.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    buf.push_str(&line);
-                    buf.push('\n');
+            // Read BYTES and decode lossily, the way the host-side reader does
+            // (`rpc.rs`'s `String::from_utf8_lossy`). A line-strict `lines()` pump ends
+            // permanently on the first non-UTF-8 byte, and this buffer is the only diagnostic
+            // payload `ProcessExited`/`ProcessError`/`RequestTimeout`/… carry — so the failure
+            // it would truncate is exactly the one whose explanation the embedder needs. pi's
+            // `on("data")` accumulates raw bytes and has no decode failure mode at all.
+            let mut reader = BufReader::new(stderr);
+            let mut bytes = Vec::new();
+            loop {
+                bytes.clear();
+                match reader.read_until(b'\n', &mut bytes).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        let decoded = String::from_utf8_lossy(&bytes);
+                        let line = decoded.strip_suffix('\n').unwrap_or(&decoded);
+                        let line = line.strip_suffix('\r').unwrap_or(line);
+                        {
+                            let mut buf = lock_ignoring_poison(&inner.stderr);
+                            buf.push_str(line);
+                            buf.push('\n');
+                        }
+                        eprintln!("{line}");
+                    }
+                    Err(_) => break, // the pipe is gone; nothing left to collect
                 }
-                eprintln!("{line}");
             }
         });
         if let Ok(mut slot) = client.stderr_task.lock() {
@@ -614,11 +612,7 @@ impl RpcClient {
     /// For an [`RpcClient::attach`]ed client there is no child to signal; the reader is detached and
     /// the writer dropped, which is the whole of "stop" for that transport.
     pub async fn stop(&self) {
-        if let Ok(mut slot) = self.reader_task.lock() {
-            if let Some(handle) = slot.take() {
-                handle.abort();
-            }
-        }
+        abort_task(&self.reader_task);
         // Closing the write half is what makes an in-process host observe EOF and return.
         *self.inner.stdin.lock().await = None;
 
@@ -645,11 +639,7 @@ impl RpcClient {
         *guard = None;
         drop(guard);
 
-        if let Ok(mut slot) = self.stderr_task.lock() {
-            if let Some(handle) = slot.take() {
-                handle.abort();
-            }
-        }
+        abort_task(&self.stderr_task);
         // pi `this.pendingRequests.clear()` (`:165`) — see mechanism gap 3.
         self.inner.reject_pending_requests();
     }
@@ -663,10 +653,7 @@ impl RpcClient {
     {
         let id = self.inner.next_listener_id.fetch_add(1, Ordering::SeqCst);
         {
-            let mut list = match self.inner.listeners.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
+            let mut list = lock_ignoring_poison(&self.inner.listeners);
             list.push((id, Arc::new(listener)));
         }
         EventSubscription {
@@ -686,19 +673,13 @@ impl RpcClient {
     /// unless the corresponding presence is asserted first.
     #[cfg(test)]
     pub(crate) fn listener_count(&self) -> usize {
-        match self.inner.listeners.lock() {
-            Ok(g) => g.len(),
-            Err(p) => p.into_inner().len(),
-        }
+        lock_ignoring_poison(&self.inner.listeners).len()
     }
 
     /// How many requests are awaiting a correlated response. Test-only, for the same reason.
     #[cfg(test)]
     pub(crate) fn pending_count(&self) -> usize {
-        match self.inner.pending.lock() {
-            Ok(g) => g.len(),
-            Err(p) => p.into_inner().len(),
-        }
+        lock_ignoring_poison(&self.inner.pending).len()
     }
 
     // -----------------------------------------------------------------------------------------
@@ -1027,10 +1008,7 @@ impl RpcClient {
         let slot = Mutex::new(Some(tx));
         let subscription = self.on_event(move |event| {
             if event_type(event) == Some(AGENT_SETTLED) {
-                let mut guard = match slot.lock() {
-                    Ok(g) => g,
-                    Err(p) => p.into_inner(),
-                };
+                let mut guard = lock_ignoring_poison(&slot);
                 if let Some(tx) = guard.take() {
                     let _ = tx.send(());
                 }
@@ -1044,19 +1022,16 @@ impl RpcClient {
         let (tx, rx) = oneshot::channel();
         let state = Mutex::new((Vec::<Value>::new(), Some(tx)));
         let subscription = self.on_event(move |event| {
-            let mut guard = match state.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
+            let mut guard = lock_ignoring_poison(&state);
             let (events, tx) = &mut *guard;
             if tx.is_none() {
                 return;
             }
             events.push(event.clone());
-            if event_type(event) == Some(AGENT_SETTLED) {
-                if let Some(tx) = tx.take() {
-                    let _ = tx.send(std::mem::take(events));
-                }
+            if event_type(event) == Some(AGENT_SETTLED)
+                && let Some(tx) = tx.take()
+            {
+                let _ = tx.send(std::mem::take(events));
             }
         });
         (subscription, rx)
@@ -1101,10 +1076,7 @@ impl RpcClient {
 
         let (tx, rx) = oneshot::channel();
         {
-            let mut map = match self.inner.pending.lock() {
-                Ok(g) => g,
-                Err(p) => p.into_inner(),
-            };
+            let mut map = lock_ignoring_poison(&self.inner.pending);
             map.insert(id.clone(), tx);
         }
         // Registered before the first `.await` ⇒ the removal must be RAII. See mechanism gap 1.
@@ -1159,22 +1131,32 @@ impl Drop for RpcClient {
     /// reader/stderr pumps are aborted here. Any spawned child is left alone unless [`Self::stop`]
     /// was called, matching pi.
     fn drop(&mut self) {
-        if let Ok(mut slot) = self.reader_task.lock() {
-            if let Some(handle) = slot.take() {
-                handle.abort();
-            }
-        }
-        if let Ok(mut slot) = self.stderr_task.lock() {
-            if let Some(handle) = slot.take() {
-                handle.abort();
-            }
-        }
+        abort_task(&self.reader_task);
+        abort_task(&self.stderr_task);
     }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Free helpers
 // ---------------------------------------------------------------------------------------------
+
+/// Take a `std::sync::Mutex` the way every call site in this file wants it: a poisoned lock still
+/// yields its guard. A panic in one holder does not invalidate any of the state guarded here — a
+/// pending map, a listener list, a stderr buffer — so recovering the inner value is what every one
+/// of these locks did individually before this helper collapsed them.
+fn lock_ignoring_poison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Abort a background pump and forget its handle. A poisoned slot is left alone, exactly as each of
+/// the four hand-written copies of this block did.
+fn abort_task(slot: &Mutex<Option<JoinHandle<()>>>) {
+    if let Ok(mut guard) = slot.lock()
+        && let Some(handle) = guard.take()
+    {
+        handle.abort();
+    }
+}
 
 /// Build a command body without its `id` — pi's `RpcCommandBody` (`rpc-client.ts:25`). `images` is
 /// spread in only when present, because pi passes `images` as an optional property and
@@ -1259,13 +1241,27 @@ fn process_exit_error(inner: &ClientInner, status: &std::process::ExitStatus) ->
 /// is reported by [`RpcClient::spawn`]'s own start check (`:134-138`) — which is the path where a
 /// non-zero code actually tells the embedder something. Everything else about the message, including
 /// the accumulated stderr that usually carries the real cause, is pi's.
+///
+/// A read or decode FAILURE is a different termination and is reported as one: `next_line` yields
+/// `Err(InvalidData)` for a non-UTF-8 byte and `Err` for any read failure, so collapsing it into the
+/// EOF arm would hand the embedder `code=null signal=null` — "the agent process exited" — for a
+/// child that is alive and healthy, and drop the real cause. The [`RpcClientError::Io`] latched here
+/// wins because [`ClientInner::set_exit_error`] is first-error-wins, so the `ProcessExited` tail
+/// below is a no-op on this path while still settling the in-flight requests.
 async fn read_lines<R>(inner: Arc<ClientInner>, reader: R)
 where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
     let mut lines = reader.lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        inner.handle_line(&line);
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => inner.handle_line(&line),
+            Ok(None) => break, // clean EOF — the host is gone
+            Err(e) => {
+                inner.set_exit_error(RpcClientError::Io(e));
+                break;
+            }
+        }
     }
     inner.set_exit_error(RpcClientError::ProcessExited {
         code: "null".to_string(),

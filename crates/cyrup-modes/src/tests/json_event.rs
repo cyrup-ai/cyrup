@@ -8,68 +8,26 @@
 //!
 //! Every test drives the REAL adapter over a scripted `FauxProvider` and asserts on the produced
 //! bytes, so it is the wire that is under test, not the projection helper in isolation.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
 
 use std::io::Cursor;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyrup_core::StopReason;
 use crate::{run_json, run_rpc};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
 use cyrup_provider::Provider;
-use cyrup_session_svc::{
-    AgentSessionRuntime, InputSource, SessionConfig, SessionFactory, UserInput,
-};
+use cyrup_session_svc::{AgentSessionRuntime, InputSource, SessionFactory, UserInput};
 use serde_json::Value;
-use tempfile::TempDir;
 
-// ----------------------------------------------------------------------------------------------
-// Fixture (same shape as `modes.rs`)
-// ----------------------------------------------------------------------------------------------
+use super::support::{base_config, create_runtime, fixture, kind, parse_lines, Fixture};
 
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture {
-        _tmp: tmp,
-        cwd,
-        agent_dir,
-    }
-}
-
+/// The plain runtime: no provider resolver and no native extension, because nothing here drives a
+/// model command or an extension — just the two one-shot adapters over a scripted provider.
 async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> Arc<AgentSessionRuntime> {
     let provider: Arc<dyn Provider> = faux;
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
+    let cfg = base_config(fx);
     let target = cfg.target.clone();
-    let factory = Arc::new(SessionFactory::new(provider, cfg));
-    AgentSessionRuntime::create(factory, target)
-        .await
-        .expect("build runtime")
-}
-
-fn parse_lines(bytes: &[u8]) -> Vec<Value> {
-    String::from_utf8(bytes.to_vec())
-        .expect("utf8")
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str::<Value>(l).expect("each line is one JSON object"))
-        .collect()
+    create_runtime(SessionFactory::new(provider, cfg), target).await
 }
 
 /// Run one prompt through json mode and return the RAW emitted lines, byte for byte.
@@ -103,10 +61,6 @@ async fn run_once_raw(responses: Vec<cyrup_core::AssistantMessage>) -> Vec<Strin
 async fn run_once(responses: Vec<cyrup_core::AssistantMessage>) -> Vec<Value> {
     let raw = run_once_raw(responses).await;
     parse_lines(raw.join("\n").as_bytes())
-}
-
-fn kind(v: &Value) -> &str {
-    v.get("type").and_then(Value::as_str).unwrap_or("<none>")
 }
 
 fn updates(lines: &[Value]) -> Vec<&Value> {

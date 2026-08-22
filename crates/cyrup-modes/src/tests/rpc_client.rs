@@ -13,8 +13,6 @@
 //! * a re-entered handler in Rust can re-take a held `Mutex` and hang with no deadlock detection;
 //! * host EOF must fail an in-flight request, because a Rust caller has no `exit` event to observe.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
