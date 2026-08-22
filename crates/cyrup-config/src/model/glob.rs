@@ -2,6 +2,24 @@
 //! `[...]`, globstar `**`, brace lists and ranges, backslash escaping, the dot-rule, and the
 //! full extglob set. Depends on nothing but `std`.
 
+/// Input bounds. This matcher is reachable from a user-supplied `--models` pattern
+/// ([`super::resolver`] enters the glob branch on any `*`, `?` or `[`), and both its recursions and
+/// its brace expansion are otherwise unbounded. Every limit here FAILS CLOSED — an over-large input
+/// yields `false` or a truncated expansion, never a panic and never a `Result` — because
+/// [`glob_match`] returns `bool` and has no error channel. All four sit orders of magnitude above
+/// any real model pattern, so no case in the captured Pi/minimatch parity table is affected.
+///
+/// Longest pattern accepted. Bounds [`m`]'s recursion transitively: `m` recurses at most once per
+/// pattern character, so a bounded pattern is a bounded stack.
+const MAX_PATTERN_LEN: usize = 4096;
+/// Deepest `{...}` nesting expanded. Beyond it the brace is left literal, exactly as an unbalanced
+/// brace already is.
+const MAX_BRACE_DEPTH: usize = 32;
+/// Ceiling on strings produced by one brace expansion, capping the sibling cross-product.
+const MAX_EXPANSIONS: usize = 4096;
+/// Ceiling on items from one `{a..b}` range.
+const MAX_RANGE_ITEMS: usize = 4096;
+
 /// `minimatch`-style glob matcher (Pi uses `minimatch(.., { nocase: true })`,
 /// model-resolver.ts:282). Faithful to minimatch's path-segment semantics: `*`/`?`/`[...]` do NOT
 /// cross `/` (they match within a single segment), `**` is a globstar matching zero or more whole
@@ -13,6 +31,10 @@
 /// Case-insensitive. No external dep. Verified byte-for-byte against Pi's `minimatch` on a large
 /// captured table (see `glob_matches_pi_minimatch_byte_for_byte`).
 pub(super) fn glob_match(pattern: &str, text: &str) -> bool {
+    // Fail closed on a pattern too large to match safely (see [`MAX_PATTERN_LEN`]).
+    if pattern.len() > MAX_PATTERN_LEN {
+        return false;
+    }
     let pat_lower = pattern.to_ascii_lowercase();
     let text_lower = text.to_ascii_lowercase();
     // minimatch `parseNegate` (default `nonegate:false`): strip a run of leading `!` from the WHOLE
@@ -384,6 +406,14 @@ fn split_top_alternatives(body: &[char]) -> Vec<Vec<char>> {
 /// unbalanced or comma-less/range-less brace is left literal (matching brace-expansion's
 /// "single element" behavior).
 fn brace_expand(s: &str) -> Vec<String> {
+    brace_expand_at(s, 0)
+}
+
+fn brace_expand_at(s: &str, depth: usize) -> Vec<String> {
+    // Past the depth bound the brace is left literal — the same fallback an unbalanced brace takes.
+    if depth >= MAX_BRACE_DEPTH {
+        return vec![s.to_string()];
+    }
     let chars: Vec<char> = s.chars().collect();
     // First UNESCAPED `{`.
     let mut open = None;
@@ -432,7 +462,7 @@ fn brace_expand(s: &str) -> Vec<String> {
     let collect = |range: &[char]| -> String { range.iter().collect() };
     let pre: String = collect(chars.get(..open).unwrap_or(&[]));
     let post: String = collect(chars.get(close + 1..).unwrap_or(&[]));
-    let post_expanded = brace_expand(&post);
+    let post_expanded = brace_expand_at(&post, depth + 1);
 
     // The brace body (between `{` and `}`).
     let body = chars.get(open + 1..close).unwrap_or(&[]);
@@ -459,9 +489,12 @@ fn brace_expand(s: &str) -> Vec<String> {
     };
 
     let mut out = Vec::new();
-    for opt in options {
-        for opt_expanded in brace_expand(&opt) {
+    'expand: for opt in options {
+        for opt_expanded in brace_expand_at(&opt, depth + 1) {
             for tail in &post_expanded {
+                if out.len() >= MAX_EXPANSIONS {
+                    break 'expand;
+                }
                 out.push(format!("{pre}{opt_expanded}{tail}"));
             }
         }
@@ -497,13 +530,25 @@ fn expand_brace_range(body: &[char]) -> Option<Vec<String>> {
         let mut x = a;
         if a <= b {
             while x <= b {
+                if out.len() >= MAX_RANGE_ITEMS {
+                    break;
+                }
                 out.push(format_range_num(x, padded, width));
-                x += step;
+                match x.checked_add(step) {
+                    Some(next) => x = next,
+                    None => break,
+                }
             }
         } else {
             while x >= b {
+                if out.len() >= MAX_RANGE_ITEMS {
+                    break;
+                }
                 out.push(format_range_num(x, padded, width));
-                x -= step;
+                match x.checked_sub(step) {
+                    Some(next) => x = next,
+                    None => break,
+                }
             }
         }
         return Some(out);
@@ -525,21 +570,33 @@ fn expand_brace_range(body: &[char]) -> Option<Vec<String>> {
         let mut x = a;
         if a <= b {
             while x <= b {
+                if out.len() >= MAX_RANGE_ITEMS {
+                    break;
+                }
                 out.push(
                     char::from_u32(x as u32)
                         .map(String::from)
                         .unwrap_or_default(),
                 );
-                x += step;
+                match x.checked_add(step) {
+                    Some(next) => x = next,
+                    None => break,
+                }
             }
         } else {
             while x >= b {
+                if out.len() >= MAX_RANGE_ITEMS {
+                    break;
+                }
                 out.push(
                     char::from_u32(x as u32)
                         .map(String::from)
                         .unwrap_or_default(),
                 );
-                x -= step;
+                match x.checked_sub(step) {
+                    Some(next) => x = next,
+                    None => break,
+                }
             }
         }
         return Some(out);

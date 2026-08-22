@@ -158,13 +158,20 @@ fn file_revision(path: &Path) -> Option<String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        // Pi's `mtimeNs`/`ctimeNs` are nanoseconds SINCE EPOCH. `mtime_nsec()` is only the
+        // sub-second fraction (0..1e9), so it has to be composed with its whole-seconds counterpart
+        // — otherwise these two fields mean something different from the contract documented above,
+        // and from what the `#[cfg(not(unix))]` branch below already produces via `as_nanos()`.
+        // Saturating because a far-future mtime must degrade rather than overflow.
+        let epoch_nanos =
+            |secs: i64, frac: i64| secs.saturating_mul(1_000_000_000).saturating_add(frac);
         Some(format!(
             "{}:{}:{}:{}:{}",
             meta.dev(),
             meta.ino(),
             meta.size(),
-            meta.mtime_nsec(),
-            meta.ctime_nsec()
+            epoch_nanos(meta.mtime(), meta.mtime_nsec()),
+            epoch_nanos(meta.ctime(), meta.ctime_nsec())
         ))
     }
     #[cfg(not(unix))]
@@ -298,12 +305,18 @@ impl ModelsStore for FileModelsStore {
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
         let _guard = crate::lock::FileLock::acquire(&self.path).map_err(store_err)?;
         let mut all = self.read_all();
-        if let Ok(value) = serde_json::to_value(&entry) {
-            all.insert(provider_id.to_string(), value);
-            self.write_all(&all).map_err(store_err)?;
-            // `if (latest) this.updateReadState(this.readState, latest)` (models-store.ts:134).
-            self.update_read_state(&all, None);
-        }
+        // Serializing `entry` cannot fail today (every field bottoms out in a plain derive over
+        // String-keyed maps, and serde_json maps a non-finite f64 to `Value::Null` rather than
+        // erroring). It was still wrong to discard: the old `if let Ok(..)` skipped the insert AND
+        // returned `Ok(())`, telling the caller a catalog update had persisted when nothing was
+        // written. `store_err` takes a `ConfigError`, so the serde error is carried through
+        // `ConfigError::Serde` (error.rs:52) rather than dropped.
+        let value = serde_json::to_value(&entry)
+            .map_err(|e| store_err(crate::error::ConfigError::Serde(e)))?;
+        all.insert(provider_id.to_string(), value);
+        self.write_all(&all).map_err(store_err)?;
+        // `if (latest) this.updateReadState(this.readState, latest)` (models-store.ts:134).
+        self.update_read_state(&all, None);
         Ok(())
     }
 
