@@ -12,9 +12,9 @@
 //! This is a faithful 1:1 port of `resolve-config-value.ts` (287 lines).
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read as _};
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -403,20 +403,60 @@ fn bash_shell_config(shell: &str) -> ShellConfig {
     }
 }
 
+/// Bound on the `where`/`which` probe, mirroring Pi's `spawnSync` 5s timeout
+/// (utils/shell.ts:39). Matches `BASH_PROBE_TIMEOUT` in `cyrup-tools`'s port of the same source
+/// (`crates/cyrup-tools/src/ops/shell.rs:62`).
+const BASH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Port of `findBashOnPath` (utils/shell.ts:23-58): locate `bash` via `where bash.exe` (win32, with
-/// an existence check since `where` can report stale paths) or `which bash` (unix, trusted). Pi
-/// caps the lookup at 5s; `Command::output` blocks, but `where`/`which` return promptly.
+/// an existence check since `where` can report stale paths) or `which bash` (unix, trusted).
+///
+/// Bounded at [`BASH_PROBE_TIMEOUT`], as Pi's `spawnSync` timeout is: a `which` wedged on a stale
+/// automount or an unreachable network PATH entry must not wedge the caller indefinitely. Node kills
+/// the child on expiry and reports a non-zero status, which lands in Pi's `result.status === 0`
+/// guard (shell.ts:48) — i.e. "no bash on PATH" — so expiry maps to `None` here rather than to an
+/// error.
 fn find_bash_on_path() -> Option<String> {
     let (program, arg) = if cfg!(windows) {
         ("where", "bash.exe")
     } else {
         ("which", "bash")
     };
-    let output = Command::new(program).arg(arg).output().ok()?;
-    if !output.status.success() {
+    // stdout is piped and read only after the child exits. Both probes emit at most a handful of
+    // short lines, far under a pipe buffer, so this cannot deadlock on a full pipe; `spawnSync` has
+    // the same shape.
+    let mut child = Command::new(program)
+        .arg(arg)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+
+    let deadline = Instant::now() + BASH_PROBE_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    if !status.success() {
         return None;
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut stdout = String::new();
+    child.stdout.take()?.read_to_string(&mut stdout).ok()?;
     let first = stdout
         .lines()
         .next()
