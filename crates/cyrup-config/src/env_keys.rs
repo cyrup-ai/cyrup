@@ -370,10 +370,16 @@ mod tests {
             Some("<authenticated>")
         );
         let env = env_of(&[("AWS_ACCESS_KEY_ID", "id")]); // missing secret → not authenticated
-        assert_eq!(get_env_api_key_in("amazon-bedrock", Some(&env), ambient), None);
+        assert_eq!(
+            get_env_api_key_in("amazon-bedrock", Some(&env), ambient),
+            None
+        );
         // …and the pair completed is authenticated, which the old shape could not distinguish
         // from the ambient leak above.
-        let env = env_of(&[("AWS_ACCESS_KEY_ID", "id"), ("AWS_SECRET_ACCESS_KEY", "sec")]);
+        let env = env_of(&[
+            ("AWS_ACCESS_KEY_ID", "id"),
+            ("AWS_SECRET_ACCESS_KEY", "sec"),
+        ]);
         assert_eq!(
             get_env_api_key_in("amazon-bedrock", Some(&env), ambient).as_deref(),
             Some("<authenticated>")

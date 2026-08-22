@@ -15,7 +15,12 @@ pub fn load_custom_models(path: &Path) -> Result<Vec<Model>, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(ConfigError::Io(e)),
+        Err(e) => {
+            return Err(ConfigError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
     };
     if text.trim().is_empty() {
         return Ok(Vec::new());
@@ -89,7 +94,12 @@ pub fn load_models_file(path: &Path) -> Result<ModelFile, ConfigError> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ModelFile::default()),
-        Err(e) => return Err(ConfigError::Io(e)),
+        Err(e) => {
+            return Err(ConfigError::Io {
+                path: path.to_path_buf(),
+                source: e,
+            });
+        }
     };
     if text.trim().is_empty() {
         return Ok(ModelFile::default());

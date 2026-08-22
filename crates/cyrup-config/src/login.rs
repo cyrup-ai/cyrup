@@ -297,7 +297,6 @@ pub fn credential_from_provider(value: cyrup_provider::Credential) -> Credential
     }
 }
 
-
 /// `ModelRuntime.getProviderAuthStatus` (`model-runtime.ts:428-437`) over the file store:
 /// runtime `--api-key` → stored credential → environment variable → nothing.
 ///
@@ -793,8 +792,8 @@ mod tests {
     )]
 
     use super::*;
-    use cyrup_provider::auth::oauth::ScriptedInteraction;
     use cyrup_provider::auth::OAuthAuth;
+    use cyrup_provider::auth::oauth::ScriptedInteraction;
     use cyrup_provider::{AuthError as ProviderAuthError, CredentialStore, ModelAuth};
     use std::sync::Arc;
 
@@ -818,7 +817,9 @@ mod tests {
         ) -> Result<cyrup_provider::Credential, OAuthError> {
             // Consume one scripted answer so a test can drive a cancel through the flow.
             interaction
-                .prompt(cyrup_provider::auth::oauth::AuthPrompt::text("paste the code"))
+                .prompt(cyrup_provider::auth::oauth::AuthPrompt::text(
+                    "paste the code",
+                ))
                 .await?;
             Ok(self.credential.clone())
         }
@@ -1664,7 +1665,10 @@ mod tests {
             )),
         );
         let options = login_provider_options(&[hf], None);
-        assert_eq!(options[0].method_name.as_deref(), Some("Hugging Face token"));
+        assert_eq!(
+            options[0].method_name.as_deref(),
+            Some("Hugging Face token")
+        );
         assert!(
             options[0].supports_login,
             "`envApiKeyAuth` always defines `login` (`ai/src/auth/helpers.ts:12-15`)"

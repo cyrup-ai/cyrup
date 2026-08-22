@@ -336,7 +336,12 @@ pub fn migrate_keybindings_config_file(agent_dir: &Path) {
 // `cargo clippy -p cyrup-config --all-targets` is RED on 14 deny-level diagnostics in this file
 // alone — and because clippy lints do not fire under `cargo build`/`cargo check`, a check-only
 // gate never saw any of them.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -355,15 +360,9 @@ mod tests {
     fn migration_table_has_pis_59_entries_and_is_injective() {
         // keybindings.ts:209-269 @v0.83.0 — 21 editor + 4 input + 6 select + 28 app.
         assert_eq!(KEYBINDING_NAME_MIGRATIONS.len(), 59);
-        let legacy: BTreeSet<&str> = KEYBINDING_NAME_MIGRATIONS
-            .iter()
-            .map(|(l, _)| *l)
-            .collect();
+        let legacy: BTreeSet<&str> = KEYBINDING_NAME_MIGRATIONS.iter().map(|(l, _)| *l).collect();
         assert_eq!(legacy.len(), 59, "legacy names must be unique");
-        let modern: BTreeSet<&str> = KEYBINDING_NAME_MIGRATIONS
-            .iter()
-            .map(|(_, m)| *m)
-            .collect();
+        let modern: BTreeSet<&str> = KEYBINDING_NAME_MIGRATIONS.iter().map(|(_, m)| *m).collect();
         assert_eq!(modern.len(), 59, "the rename must be injective");
 
         let by_prefix = |prefix: &str| {
@@ -500,7 +499,10 @@ mod tests {
         migrate_keybindings_config_file(dir.path());
         assert_eq!(std::fs::read_to_string(&path).expect("read back"), after);
         let after_mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
-        assert_eq!(before_mtime, after_mtime, "clean file must not be rewritten");
+        assert_eq!(
+            before_mtime, after_mtime,
+            "clean file must not be rewritten"
+        );
     }
 
     #[test]

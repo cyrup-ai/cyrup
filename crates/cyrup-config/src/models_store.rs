@@ -13,10 +13,16 @@
 //!
 //! # Failure posture
 //!
-//! Every method returns `Ok` on any recoverable problem. A missing file, a truncated file, a file
-//! full of JSON that is not a store, an unwritable directory — all of them mean "no cached overlay",
-//! which degrades cleanly to the compiled-in catalogs. The cache is an accelerator; it is never
-//! allowed to be the reason a user sees fewer models or a failed start.
+//! READS degrade, WRITES report. A missing file, a truncated file, a file full of JSON that is not
+//! a store, one malformed provider entry — all of them mean "no cached overlay", which falls back
+//! cleanly to the compiled-in catalogs. The cache is an accelerator; it is never allowed to be the
+//! reason a user sees fewer models or a failed start.
+//!
+//! A write or a delete that could not reach disk, or that could not take the cross-process lock, is
+//! a different thing: nothing was persisted, and the in-memory snapshot would otherwise be re-stamped
+//! to a state the file does not hold. Those surface as [`ProviderError::ModelSource`] so the caller
+//! decides what a lost catalog write is worth. A silent `Ok(())` is no longer how this store says it
+//! failed.
 
 use std::path::{Path, PathBuf};
 
@@ -177,6 +183,11 @@ fn file_revision(path: &Path) -> Option<String> {
     }
 }
 
+/// A `models-store.json` persistence failure. func-01 R-01-017 code `model_source`.
+fn store_err(e: crate::error::ConfigError) -> ProviderError {
+    ProviderError::ModelSource(Box::new(e))
+}
+
 impl FileModelsStore {
     /// `this.path = normalizePath(path)` (models-store.ts:53 @v0.84.1) — so
     /// `FileModelsStore::new("~/alt/models-store.json")` targets the home dir rather than a literal
@@ -213,20 +224,21 @@ impl FileModelsStore {
 
     /// `readLatest` (models-store.ts:81-108 @v0.84.1): answer from the snapshot when the file's
     /// revision is unchanged, otherwise reload under the cross-process lock and re-stamp it.
-    fn read_latest(&self) -> OrderedObject {
+    fn read_latest(&self) -> Result<OrderedObject, crate::error::ConfigError> {
         let revision = file_revision(&self.path);
         if revision.is_some()
             && let Ok(state) = self.read_state.read()
             && revision == state.revision
         {
-            return state.data.clone();
+            return Ok(state.data.clone());
         }
         // The lock is advisory and cross-process: a concurrent `cyrup update --models` in another
-        // terminal must not be observed mid-rename.
-        let _guard = crate::lock::FileLock::acquire(&self.path).ok();
+        // terminal must not be observed mid-rename. A lock we could not take is not a degraded
+        // read — it is an unserialized one, so it reaches the caller rather than being `.ok()`-ed.
+        let _guard = crate::lock::FileLock::acquire(&self.path)?;
         let data = self.read_all();
         self.update_read_state(&data, file_revision(&self.path));
-        data
+        Ok(data)
     }
 
     /// `updateReadState` (models-store.ts:65-68 @v0.84.1). A `write`/`delete` passes `None` for the
@@ -239,14 +251,14 @@ impl FileModelsStore {
         }
     }
 
-    fn write_all(&self, entries: &OrderedObject) {
+    fn write_all(&self, entries: &OrderedObject) -> Result<(), crate::error::ConfigError> {
         // `JSON.stringify(current, null, 2)` (models-store.ts:130, `:141`) in FILE order — CFG-042 —
         // plus the trailing newline every other cyrup config file gets (upstream writes none).
         let mut text = entries.stringify();
         text.push('\n');
         // 0600 + 0700 parent, matching Pi's `FileAuthStorageBackend`. The catalog itself is not
         // secret, but the file lives in the agent dir beside credentials and inherits its posture.
-        let _ = crate::lock::write_atomic(&self.path, text.as_bytes(), true);
+        crate::lock::write_atomic(&self.path, text.as_bytes(), true)
     }
 }
 
@@ -260,7 +272,7 @@ impl ModelsStore for FileModelsStore {
         // CFG-042 residual. Pi checks the signal TWICE on this path, and both are ported:
         // once at the head of `readLatest` (`models-store.ts:85` @v0.84.1) …
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
-        let latest = self.read_latest();
+        let latest = self.read_latest().map_err(store_err)?;
         // … and once after it returns, before the entry is handed back (`:121`). Upstream's second
         // check catches an abort raised while the shared reload was in flight; here `read_latest`
         // is synchronous, so it catches an abort raised while this task was descheduled across the
@@ -284,11 +296,11 @@ impl ModelsStore for FileModelsStore {
         // this crate's `FileLock` an abort after acquisition would additionally block every other
         // process for the duration of a write nobody wants.
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
-        let _guard = crate::lock::FileLock::acquire(&self.path).ok();
+        let _guard = crate::lock::FileLock::acquire(&self.path).map_err(store_err)?;
         let mut all = self.read_all();
         if let Ok(value) = serde_json::to_value(&entry) {
             all.insert(provider_id.to_string(), value);
-            self.write_all(&all);
+            self.write_all(&all).map_err(store_err)?;
             // `if (latest) this.updateReadState(this.readState, latest)` (models-store.ts:134).
             self.update_read_state(&all, None);
         }
@@ -302,10 +314,10 @@ impl ModelsStore for FileModelsStore {
     ) -> Result<(), ProviderError> {
         // `models-store.ts:143` — same placement as `write`, before the lock.
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
-        let _guard = crate::lock::FileLock::acquire(&self.path).ok();
+        let _guard = crate::lock::FileLock::acquire(&self.path).map_err(store_err)?;
         let mut all = self.read_all();
         if all.remove(provider_id) {
-            self.write_all(&all);
+            self.write_all(&all).map_err(store_err)?;
             self.update_read_state(&all, None);
         }
         Ok(())
@@ -355,7 +367,13 @@ mod tests {
             Some("\"v1\"")
         );
         assert_eq!(
-            reopened.read("xai", None).await.unwrap().unwrap().etag.as_deref(),
+            reopened
+                .read("xai", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
             Some("\"v2\"")
         );
 
@@ -390,7 +408,13 @@ mod tests {
         // `write` clears the revision (`updateReadState(this.readState, latest)`,
         // models-store.ts:127 — no third argument), so THIS read is the one that stamps it.
         assert_eq!(
-            store.read("groq", None).await.unwrap().unwrap().etag.as_deref(),
+            store
+                .read("groq", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
             Some("\"v1\"")
         );
         let stamped = file_revision(&path);
@@ -406,11 +430,19 @@ mod tests {
             serde_json::to_value(entry("\"from-snapshot\"")).unwrap(),
         );
         assert!(
-            std::fs::read_to_string(&path).unwrap().contains("\\\"v1\\\""),
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("\\\"v1\\\""),
             "the file still says v1 — only the snapshot was changed"
         );
         assert_eq!(
-            store.read("groq", None).await.unwrap().unwrap().etag.as_deref(),
+            store
+                .read("groq", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
             Some("\"from-snapshot\""),
             "an unchanged revision must be answered from `readState.data`, not re-read"
         );
@@ -424,7 +456,13 @@ mod tests {
         .unwrap();
         assert_ne!(file_revision(&path), stamped);
         assert_eq!(
-            store.read("groq", None).await.unwrap().unwrap().etag.as_deref(),
+            store
+                .read("groq", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
             Some("\"v2\"")
         );
     }
@@ -441,7 +479,13 @@ mod tests {
         let store = FileModelsStore::new(&path);
         store.write("groq", entry("\"v1\""), None).await.unwrap();
         assert_eq!(
-            store.read("groq", None).await.unwrap().unwrap().etag.as_deref(),
+            store
+                .read("groq", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
             Some("\"v1\"")
         );
 
@@ -497,11 +541,23 @@ mod tests {
 
         // Presence before absence: the values really did survive the reorder-free rewrite.
         assert_eq!(
-            store.read("zai", None).await.unwrap().unwrap().etag.as_deref(),
+            store
+                .read("zai", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
             Some("\"z\"")
         );
         assert_eq!(
-            store.read("groq", None).await.unwrap().unwrap().etag.as_deref(),
+            store
+                .read("groq", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
             Some("\"g\"")
         );
 
@@ -581,20 +637,33 @@ mod tests {
         let partial = FileModelsStore::new(&path);
         assert!(partial.read("groq", None).await.unwrap().is_none());
         assert_eq!(
-            partial.read("xai", None).await.unwrap().unwrap().etag.as_deref(),
+            partial
+                .read("xai", None)
+                .await
+                .unwrap()
+                .unwrap()
+                .etag
+                .as_deref(),
             Some("\"ok\"")
         );
     }
 
     #[tokio::test]
-    async fn an_unwritable_path_is_not_an_error() {
-        // A directory where a file should be: every write fails, every read is empty, nothing panics
-        // and nothing propagates — the run degrades to the embedded catalogs.
+    async fn an_unwritable_path_fails_the_write_and_reads_as_no_overlay() {
+        // A directory where a file should be. The READ still degrades to "no overlay": the sidecar
+        // `as-a-dir.lock` opens fine, and reading a directory as text yields an empty object. The
+        // WRITE cannot reach disk, and now says so instead of returning `Ok(())` over a rename that
+        // never happened. The delete finds nothing to remove, so it never calls `write_all` and is
+        // still `Ok`.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("as-a-dir");
         std::fs::create_dir(&path).unwrap();
         let store: Arc<dyn ModelsStore> = Arc::new(FileModelsStore::new(&path));
-        store.write("groq", entry("\"v1\""), None).await.unwrap();
+        let err = store
+            .write("groq", entry("\"v1\""), None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ProviderError::ModelSource(_)), "got: {err:?}");
         assert!(store.read("groq", None).await.unwrap().is_none());
         store.delete("groq", None).await.unwrap();
     }

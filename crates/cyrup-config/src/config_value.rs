@@ -553,12 +553,11 @@ pub async fn resolve_config_value_async(
     }
     let config = config.to_string();
     let env = env.cloned();
-    match tokio::task::spawn_blocking(move || resolve_config_value(&config, env.as_ref())).await {
-        Ok(v) => v,
-        // A panic in the blocking body is "unresolvable", the same answer the sync path gives for
-        // a command that fails.
-        Err(_) => None,
-    }
+    // A panic in the blocking body is "unresolvable", the same answer the sync path gives for
+    // a command that fails.
+    tokio::task::spawn_blocking(move || resolve_config_value(&config, env.as_ref()))
+        .await
+        .unwrap_or_default()
 }
 
 /// Async entry point for [`resolve_config_value_or_throw`]. See

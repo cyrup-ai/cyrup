@@ -240,11 +240,15 @@ impl ConfigDirs {
             // `this.cwd = resolvePath(cwd)` (session-manager.ts:876 @v0.83.0). Same rule here:
             // lexical resolve against the process cwd, no filesystem access, no symlink resolution.
             Some(p) => {
-                let base = std::env::current_dir().map_err(ConfigError::Io)?;
+                let base = std::env::current_dir().map_err(|e| {
+                    ConfigError::Dir(format!("could not determine current directory: {e}"))
+                })?;
                 crate::paths::resolve_path_from_base(&p.to_string_lossy(), &base)
             }
             // pi `main.ts:534`: `const cwd = process.cwd();` — verbatim.
-            None => std::env::current_dir().map_err(ConfigError::Io)?,
+            None => std::env::current_dir().map_err(|e| {
+                ConfigError::Dir(format!("could not determine current directory: {e}"))
+            })?,
         };
 
         Ok(Self {
@@ -524,10 +528,7 @@ mod telemetry_tristate_tests {
             .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
             .collect();
         EnvVars::from_lookup(move |key| {
-            owned
-                .iter()
-                .find(|(k, _)| k == key)
-                .map(|(_, v)| v.clone())
+            owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
         })
     }
 
@@ -571,11 +572,8 @@ mod telemetry_tristate_tests {
         let unset = NetworkPolicy::resolve(&settings, &env_with(&[]), &cli);
         assert!(unset.install_telemetry, "unset falls through to settings");
 
-        let emptied = NetworkPolicy::resolve(
-            &settings,
-            &env_with(&[("CYRUP_TELEMETRY", "")]),
-            &cli,
-        );
+        let emptied =
+            NetworkPolicy::resolve(&settings, &env_with(&[("CYRUP_TELEMETRY", "")]), &cli);
         assert!(
             !emptied.install_telemetry,
             "`CYRUP_TELEMETRY= cyrup …` must ship no install telemetry"
