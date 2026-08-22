@@ -18,7 +18,7 @@
 //   `GenerationConfig.thinking_budgets` into `cyrup_provider::StreamOptions.thinking_budgets`
 //   (anthropic-messages.ts:792-797 lowers it per-level). The unified `reasoning` level is forwarded
 //   alongside it.
-// - Proxy `StreamFn` (Pi `streamProxy`, proxy.ts): PORTED in `proxy.rs` — the wire enum
+// - Proxy `StreamFn` (Pi `streamProxy`, proxy.ts): PORTED in `proxy/` — the wire enum
 //   (`ProxyAssistantMessageEvent`), client-side partial rebuild (`ProxyMessageBuilder`, Pi
 //   `processProxyEvent`), options/body (`ProxyStreamOptions`/`buildProxyRequestOptions`), and the
 //   `POST {proxyUrl}/api/stream` bearer-SSE transport (`stream_proxy`/`ProxyStreamFn`). Transport
@@ -39,11 +39,6 @@ pub use prompt::PromptInput;
 
 // `crate::agent::{EntryStart, RunCtx}` — the paths `crate::loop_fn` imports; keep them resolving.
 pub(crate) use run::{EntryStart, RunCtx};
-
-// Scope-only import: `SettlementGuard` appears in the `running_tx` doc below and resolved
-// implicitly while it lived in the same file as `Agent`.
-#[allow(unused_imports)]
-use lifecycle::SettlementGuard;
 
 use crate::hooks::Hooks;
 use crate::queue::{PendingQueue, ToolExecution};
@@ -69,7 +64,7 @@ pub struct Agent {
     key_resolver: Option<Arc<dyn ApiKeyResolver>>,
     cancel_slot: Arc<Mutex<Option<RunCancel>>>,
     /// The SINGLE run-in-flight latch (R-02-045..048). `start_run` claims it with an atomic
-    /// compare-and-set (`watch::Sender::send_if_modified`), [`SettlementGuard`] releases it, and
+    /// compare-and-set (`watch::Sender::send_if_modified`), [`lifecycle::SettlementGuard`] releases it, and
     /// both [`Agent::wait_for_idle`] and [`Agent::is_running`] read it — so "the waiter observed
     /// idle" and "a new run may start" are the same fact, never two facts written in sequence.
     running_tx: watch::Sender<bool>,

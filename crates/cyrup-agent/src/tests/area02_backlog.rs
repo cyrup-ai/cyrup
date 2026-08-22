@@ -4,13 +4,6 @@
 //! baseline) or, for the `upstream-drift` items, at `v0.84.1`; the citation sits on each test.
 //! Offline throughout — the faux provider and in-test tools only.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic
-)]
-
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
@@ -20,35 +13,22 @@ use crate::loop_fn::{run_agent_loop, AgentContext, AgentEventSink, AgentLoopConf
 use crate::state::{reduce, GenerationConfig, StateInner};
 use crate::{
     Agent, AgentError, AgentEvent, AgentMessage, ApiKeyResolver, BeforeOutcome, BeforeToolCall,
-    HookError, Hooks, ProviderStreamFn, StreamFn, ToolExecution, ToolResultMessage,
+    HookError, Hooks, StreamFn, ToolExecution,
 };
 use crate::{EventSubscriber, PendingQueue};
 use cyrup_core::{
-    AssistantMessage, CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, ProviderId,
-    RunCancel, StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
+    AssistantMessage, CancelToken, Content, ModelRef, ModelThinkingLevel, ProviderId, RunCancel,
+    StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
-use cyrup_provider::{Context, Provider, ProviderError, StreamEvent, StreamOptions};
+use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
+use cyrup_provider::ProviderError;
 use serde_json::{json, Value};
+
+use super::support::{self, *};
 
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
-
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
-
-fn obj_schema() -> Value {
-    json!({ "type": "object", "properties": {}, "additionalProperties": true })
-}
-
-fn faux_stream_fn(responses: Vec<AssistantMessage>) -> Arc<dyn StreamFn> {
-    let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(responses);
-    let provider: Arc<dyn Provider> = faux;
-    Arc::new(ProviderStreamFn::new(provider))
-}
 
 /// The `StreamOptions` fields these tests discriminate on.
 #[derive(Clone, Default)]
@@ -59,74 +39,15 @@ struct Captured {
     websocket_connect_timeout_ms: Option<u64>,
 }
 
-struct RecordingStreamFn {
-    inner: Arc<dyn StreamFn>,
-    captured: Arc<Mutex<Vec<Captured>>>,
-}
-
-impl StreamFn for RecordingStreamFn {
-    fn stream(
-        &self,
-        model: &ModelRef,
-        ctx: &Context,
-        opts: &StreamOptions,
-    ) -> EventStream<StreamEvent> {
-        self.captured.lock().unwrap().push(Captured {
-            api_key: opts.api_key.clone(),
-            headers: opts.headers.clone(),
-            metadata: opts.metadata.clone(),
-            websocket_connect_timeout_ms: opts.websocket_connect_timeout_ms,
-        });
-        self.inner.stream(model, ctx, opts)
-    }
-}
-
 fn recording_stream_fn(
     responses: Vec<AssistantMessage>,
 ) -> (Arc<dyn StreamFn>, Arc<Mutex<Vec<Captured>>>) {
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> =
-        Arc::new(RecordingStreamFn { inner: faux_stream_fn(responses), captured: captured.clone() });
-    (sf, captured)
-}
-
-#[derive(Default)]
-struct Recorder {
-    events: Mutex<Vec<AgentEvent>>,
-}
-
-#[async_trait::async_trait]
-impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
-        self.events.lock().unwrap().push(event.clone());
-    }
-}
-
-impl Recorder {
-    fn snapshot(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap().clone()
-    }
-    fn turn_starts(&self) -> usize {
-        self.snapshot().iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count()
-    }
-    fn end_results(&self) -> Vec<Value> {
-        self.snapshot()
-            .into_iter()
-            .filter_map(|e| match e {
-                AgentEvent::ToolExecutionEnd { result, .. } => Some(result),
-                _ => None,
-            })
-            .collect()
-    }
-    fn tool_result_messages(&self) -> Vec<ToolResultMessage> {
-        self.snapshot()
-            .into_iter()
-            .filter_map(|e| match e {
-                AgentEvent::MessageEnd { message: AgentMessage::ToolResult(t) } => Some(t),
-                _ => None,
-            })
-            .collect()
-    }
+    support::recording_stream_fn(responses, |_model, _ctx, opts| Captured {
+        api_key: opts.api_key.clone(),
+        headers: opts.headers.clone(),
+        metadata: opts.metadata.clone(),
+        websocket_connect_timeout_ms: opts.websocket_connect_timeout_ms,
+    })
 }
 
 /// A subscriber that aborts the run the first time it sees `pred`.
@@ -273,9 +194,9 @@ async fn agent009_error_result_has_empty_details_object_and_no_terminate_key() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("ghost", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let agent = Agent::builder(model_ref(), sf).build();
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -305,9 +226,9 @@ async fn agent009_plain_success_result_omits_details_and_terminate() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let agent = Agent::builder(model_ref(), sf).tools(vec![OkTool::new("t", false)]).build();
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -329,9 +250,9 @@ async fn agent010_tool_not_found_string_is_pis() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("ghost", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let agent = Agent::builder(model_ref(), sf).build();
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -379,7 +300,7 @@ async fn agent010_032_blocked_reason_falls_back_on_none_and_on_empty_string() {
         let sf = faux_stream_fn(vec![
             faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
             faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-        ]);
+        ]).1;
         let agent = Agent::builder(model_ref(), sf)
             .tools(vec![OkTool::new("t", false)])
             .hooks(Arc::new(BlockWith {
@@ -388,7 +309,7 @@ async fn agent010_032_blocked_reason_falls_back_on_none_and_on_empty_string() {
                 calls: Arc::new(AtomicUsize::new(0)),
             }))
             .build();
-        let rec = Arc::new(Recorder::default());
+        let rec = Arc::new(EventRecorder::default());
         agent.subscribe(rec.clone());
         agent.prompt("go").await.unwrap().finished().await;
         agent.wait_for_idle().await;
@@ -416,7 +337,7 @@ async fn agent012_before_tool_call_still_runs_on_a_cancelled_run_and_abort_beats
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let calls = Arc::new(AtomicUsize::new(0));
     let agent = Arc::new(
         Agent::builder(model_ref(), sf)
@@ -428,7 +349,7 @@ async fn agent012_before_tool_call_still_runs_on_a_cancelled_run_and_abort_beats
             }))
             .build(),
     );
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     // Cancel while the batch is being prepared: the abort lands before `prepare` is entered.
     agent.subscribe(abort_on(&agent, |e| matches!(e, AgentEvent::ToolExecutionStart { .. })));
@@ -472,7 +393,7 @@ async fn agent015_022_blocked_terminate_survives_an_abort_that_leaves_a_slot_unp
         ),
         // Only consumed if the batch WRONGLY fails to terminate.
         faux_assistant_message(vec![faux_text("second turn")], StopReason::Stop),
-    ]);
+    ]).1;
     let agent = Arc::new(
         Agent::builder(model_ref(), sf)
             .tools(vec![OkTool::new("a", false), OkTool::new("b", false)])
@@ -484,7 +405,7 @@ async fn agent015_022_blocked_terminate_survives_an_abort_that_leaves_a_slot_unp
             }))
             .build(),
     );
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.subscribe(abort_on(&agent, |e| matches!(e, AgentEvent::ToolExecutionEnd { .. })));
 
@@ -605,7 +526,7 @@ async fn agent018_settlement_clears_pending_tool_calls() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let agent = Agent::builder(model_ref(), sf).tools(vec![OkTool::new("t", false)]).build();
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -726,7 +647,7 @@ async fn agent023_reset_is_refused_while_a_run_is_in_flight() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("park", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let entered = Arc::new(tokio::sync::Notify::new());
     let tool = Arc::new(ParkingTool {
@@ -789,7 +710,7 @@ async fn agent034_busy_entry_points_carry_pis_per_entry_point_message() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("park", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let (tx, rx) = tokio::sync::oneshot::channel();
     let entered = Arc::new(tokio::sync::Notify::new());
     let tool = Arc::new(ParkingTool {
@@ -834,7 +755,7 @@ async fn agent034_busy_entry_points_carry_pis_per_entry_point_message() {
     );
 
     // (3) `reset` — pi agent.ts:335 @v0.84.1 (the AGENT-023 drift).
-    let busy_reset = agent.reset().await.err().expect("a reset is refused");
+    let busy_reset = agent.reset().await.expect_err("a reset is refused");
     assert!(matches!(busy_reset, AgentError::RunActive(crate::BusyEntry::Reset)));
     assert_eq!(
         busy_reset.to_string(),
@@ -888,24 +809,13 @@ fn agent034_continue_validation_messages_are_surface_specific() {
 // payload: `agent_end.messages == [failureMessage]`, and `aborted` when the run was cancelled.
 // ===========================================================================
 
-struct FailingTransform;
-
-#[async_trait::async_trait]
-impl Hooks for FailingTransform {
-    async fn transform_context(
-        &self,
-        _msgs: Vec<AgentMessage>,
-        _cancel: CancelToken,
-    ) -> Result<Vec<AgentMessage>, HookError> {
-        Err(HookError::new("compaction budget exceeded"))
-    }
-}
-
 #[tokio::test]
 async fn agent025_transform_failure_agent_end_carries_only_the_failure_message() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("x")], StopReason::Stop)]);
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(FailingTransform)).build();
-    let rec = Arc::new(Recorder::default());
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("x")], StopReason::Stop)]).1;
+    let agent = Agent::builder(model_ref(), sf)
+        .hooks(Arc::new(FailingTransform::new("compaction budget exceeded")))
+        .build();
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     let returned = agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -954,10 +864,10 @@ impl Hooks for CancelAwareTransform {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent025_transform_failure_after_abort_reports_aborted() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("x")], StopReason::Stop)]);
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("x")], StopReason::Stop)]).1;
     let agent =
         Arc::new(Agent::builder(model_ref(), sf).hooks(Arc::new(CancelAwareTransform)).build());
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     // `transform_context` runs after the prompt's `message_end`, so aborting there parks the hook.
     agent.subscribe(abort_on(&agent, |e| {
@@ -1001,11 +911,11 @@ async fn burst_delivers_all(execution: ToolExecution) {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("burst", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let tool = Arc::new(BurstTool { name: "burst".into(), params: obj_schema(), n: N });
     let agent =
         Agent::builder(model_ref(), sf).tools(vec![tool]).tool_execution(execution).build();
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
     agent.wait_for_idle().await;
@@ -1041,9 +951,9 @@ async fn agent_s02_subscribe_returns_a_working_detach_handle() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_text("one")], StopReason::Stop),
         faux_assistant_message(vec![faux_text("two")], StopReason::Stop),
-    ]);
+    ]).1;
     let agent = Agent::builder(model_ref(), sf).build();
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let sub = agent.subscribe(rec.clone());
 
     agent.prompt("go").await.unwrap().finished().await;
@@ -1083,7 +993,7 @@ async fn agent_s02_on_event_receives_the_runs_abort_signal() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let agent = Arc::new(
         Agent::builder(model_ref(), sf).tools(vec![OkTool::new("t", false)]).build(),
     );
@@ -1141,7 +1051,7 @@ async fn agent024_post_turn_hooks_observe_the_runs_abort_signal() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("t", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
-    ]);
+    ]).1;
     let seen = Arc::new(Mutex::new(Vec::new()));
     let agent = Arc::new(
         Agent::builder(model_ref(), sf)

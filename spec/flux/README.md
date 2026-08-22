@@ -115,7 +115,14 @@ model as a prompt, so a typo silently becomes a paid API call.
 ```bash
 cargo build -p cyrup-flux && cargo build -p cyrup
 cargo clippy --workspace --all-targets --features test-fixtures; echo "exit=$?"   # MUST be 0
+cargo clippy -p cyrup-agent --all-targets --no-deps -- -D warnings; echo "exit=$?"   # MUST be 0 — cyrup-agent is warning-clean; keep it that way
 ```
+
+The first line exits 0 on warn-level diagnostics, so only the deny-flagged second line can actually
+fail. It is scoped to `cyrup-agent` because other crates are not warning-clean yet — `--no-deps` is
+required for that scoping, since the deny flag otherwise reaches the workspace path dependencies too.
+It carries no `--features` flag because `cyrup-agent` declares none; its target set is the same
+either way.
 
 Clippy is mandatory on every task that touches `src/`: the workspace's no-panic lints
 (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`) are **clippy-only** and never fire

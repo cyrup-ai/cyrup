@@ -6,36 +6,27 @@
 //! `has_queued_messages`, `reset` (refused mid-run since AGENT-023), `prompt_with_images`).
 //! Each closes a gap from
 //! spec/gap-analysis/03-cyrup-agent.md and cites the Pi behavior it mirrors.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::print_stdout
-)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    Agent, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall, EventSubscriber, Hooks,
-    HookError, PostTurn, ProviderStreamFn, StreamFn, TurnUpdate,
+    Agent, AgentEvent, AgentMessage, BeforeOutcome, BeforeToolCall, HookError, Hooks, PostTurn,
+    StreamFn, TurnUpdate,
 };
 use cyrup_core::{
-    CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, StopReason, Tool, ToolCallId,
-    ToolError, ToolResult, ToolUpdateSink,
+    CancelToken, Content, ModelRef, ModelThinkingLevel, StopReason, Tool, ToolCallId, ToolError,
+    ToolResult, ToolUpdateSink,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_thinking, faux_tool_call, FauxProvider};
-use cyrup_provider::{CacheRetention, Context, Provider, StreamEvent, StreamOptions, Transport};
+use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_thinking, faux_tool_call};
+use cyrup_provider::{CacheRetention, Transport};
 use serde_json::{json, Value};
+
+use super::support::{self, *};
 
 // ----------------------------------------------------------------------------
 // Wiring
 // ----------------------------------------------------------------------------
-
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
 
 /// What the agent forwarded into one provider call.
 #[derive(Clone, Default)]
@@ -58,68 +49,27 @@ struct Captured {
     model: Option<ModelRef>,
 }
 
-/// A `StreamFn` that records the forwarded `Context`/`StreamOptions`, then delegates to a faux
+/// Records the forwarded `Context`/`StreamOptions` of every call, then delegates to a faux
 /// provider for the actual event stream.
-struct RecordingStreamFn {
-    inner: Arc<dyn StreamFn>,
-    captured: Arc<Mutex<Vec<Captured>>>,
-}
-
-impl StreamFn for RecordingStreamFn {
-    fn stream(
-        &self,
-        model: &ModelRef,
-        ctx: &Context,
-        opts: &StreamOptions,
-    ) -> EventStream<StreamEvent> {
-        self.captured.lock().unwrap().push(Captured {
-            tools: ctx.tools.iter().map(|t| (t.name.clone(), t.description.clone())).collect(),
-            reasoning: opts.reasoning,
-            temperature: opts.temperature,
-            max_tokens: opts.max_tokens,
-            cache_retention: opts.cache_retention,
-            transport: opts.transport,
-            max_retry_delay_ms: opts.max_retry_delay_ms,
-            max_retries: opts.max_retries,
-            api_key: opts.api_key.clone(),
-            system_prompt: ctx.system_prompt.clone(),
-            env: opts.env.clone(),
-            timeout_ms: opts.timeout_ms,
-            headers: opts.headers.clone(),
-            model: Some(model.clone()),
-        });
-        self.inner.stream(model, ctx, opts)
-    }
-}
-
 fn recording_stream_fn(
     responses: Vec<cyrup_core::AssistantMessage>,
 ) -> (Arc<dyn StreamFn>, Arc<Mutex<Vec<Captured>>>) {
-    let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(responses);
-    let provider: Arc<dyn Provider> = faux;
-    let inner: Arc<dyn StreamFn> = Arc::new(ProviderStreamFn::new(provider));
-    let captured = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> = Arc::new(RecordingStreamFn { inner, captured: captured.clone() });
-    (sf, captured)
-}
-
-#[derive(Default)]
-struct Recorder {
-    events: Mutex<Vec<AgentEvent>>,
-}
-
-#[async_trait::async_trait]
-impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
-        self.events.lock().unwrap().push(event.clone());
-    }
-}
-
-impl Recorder {
-    fn snapshot(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap().clone()
-    }
+    support::recording_stream_fn(responses, |model, ctx, opts| Captured {
+        tools: ctx.tools.iter().map(|t| (t.name.clone(), t.description.clone())).collect(),
+        reasoning: opts.reasoning,
+        temperature: opts.temperature,
+        max_tokens: opts.max_tokens,
+        cache_retention: opts.cache_retention,
+        transport: opts.transport,
+        max_retry_delay_ms: opts.max_retry_delay_ms,
+        max_retries: opts.max_retries,
+        api_key: opts.api_key.clone(),
+        system_prompt: ctx.system_prompt.clone(),
+        env: opts.env.clone(),
+        timeout_ms: opts.timeout_ms,
+        headers: opts.headers.clone(),
+        model: Some(model.clone()),
+    })
 }
 
 // ----------------------------------------------------------------------------
@@ -192,10 +142,6 @@ impl Tool for TerminateTool {
     ) -> Result<ToolResult, ToolError> {
         Ok(ToolResult { content: vec![Content::text("bye")], details: None, terminate: true, ..Default::default() })
     }
-}
-
-fn obj_schema() -> Value {
-    json!({ "type": "object" })
 }
 
 // ----------------------------------------------------------------------------
@@ -385,7 +331,7 @@ async fn gap9_10_11_streaming_partial_keeps_distinct_blocks() {
         calls: Arc::new(AtomicUsize::new(0)),
     });
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
 
@@ -514,7 +460,7 @@ async fn gap26_tool_execution_end_result_includes_terminate() {
         StopReason::ToolUse,
     )]);
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
 
@@ -551,7 +497,7 @@ async fn gap19_continue_from_assistant_skips_initial_steering_poll() {
     agent.steer(AgentMessage::user_text("steer-1"));
     agent.steer(AgentMessage::user_text("steer-2"));
 
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     agent.continue_run().await.unwrap().finished().await;
 
@@ -594,21 +540,12 @@ async fn gap19_continue_from_assistant_skips_initial_steering_poll() {
 // Gap #20: synthetic closing sequence when the run task unwinds (a hook panics).
 // ----------------------------------------------------------------------------
 
-struct PanicHook;
-
-#[async_trait::async_trait]
-impl Hooks for PanicHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
-        panic!("hook exploded");
-    }
-}
-
 #[tokio::test]
 async fn gap20_run_failure_emits_synthetic_closing_sequence() {
     let (sf, _captured) =
         recording_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(PanicHook)).build();
-    let rec = Arc::new(Recorder::default());
+    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(PanicHook::new("hook exploded"))).build();
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     let new = agent.prompt("go").await.unwrap().finished().await;
 

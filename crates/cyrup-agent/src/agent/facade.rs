@@ -41,6 +41,7 @@ impl Subscription {
 }
 
 impl Agent {
+    #[must_use]
     pub fn builder(model: ModelRef, stream_fn: Arc<dyn StreamFn>) -> AgentBuilder {
         AgentBuilder::new(model, stream_fn)
     }
@@ -149,6 +150,7 @@ impl Agent {
         self.clear_follow_up_queue();
     }
 
+    #[must_use]
     pub fn drain_queues_for_restore(&self) -> (Vec<AgentMessage>, Vec<AgentMessage>) {
         (lock(&self.steering).take_all(), lock(&self.follow_up).take_all())
     }

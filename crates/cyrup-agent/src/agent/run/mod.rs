@@ -5,12 +5,6 @@ mod stream;
 mod tools;
 mod turn;
 
-// Scope-only imports: these two names appear in intra-doc links below and resolved implicitly
-// while this code lived in the same file as `Agent` and `emit_standalone`.
-#[allow(unused_imports)]
-use super::lifecycle::emit_standalone;
-#[allow(unused_imports)]
-use super::Agent;
 use super::message::errored_assistant;
 use super::util::{lock, panic_message};
 use super::HeaderFn;
@@ -84,7 +78,7 @@ pub(crate) struct RunCtx {
 }
 
 impl RunCtx {
-    /// Assemble a run context from already-built shared handles. Used by [`Agent::start_run`] and by
+    /// Assemble a run context from already-built shared handles. Used by [`super::Agent::start_run`] and by
     /// the low-level free-function loop (`crate::loop_fn`) so both drive the identical, tested loop.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -138,13 +132,13 @@ impl RunCtx {
     }
 
     /// The header overlay for `model` — pi's `transformHeaders` result for the request it is about
-    /// to make (`sdk.ts:318-327` @v0.83.0). Falls back to the static [`Agent::set_headers`] overlay
+    /// to make (`sdk.ts:318-327` @v0.83.0). Falls back to the static [`super::Agent::set_headers`] overlay
     /// when no resolver is installed or the resolver has no opinion about this model.
     fn headers_for(&self, model: &ModelRef) -> Option<cyrup_provider::HeaderMap> {
-        if let Some(f) = &self.header_fn {
-            if let Some(h) = f(model) {
-                return Some(h);
-            }
+        if let Some(f) = &self.header_fn
+            && let Some(h) = f(model)
+        {
+            return Some(h);
         }
         lock(&self.state).headers.clone()
     }
@@ -193,8 +187,8 @@ impl RunCtx {
     /// `error.message`) followed by `message_start` → `message_end` → `turn_end` (with NO tool
     /// results) → `agent_end` carrying `[failureMessage]` and nothing else (agent.ts:508-511).
     ///
-    /// The post-unwind twin of this path lives at [`Agent::run`]'s `catch_unwind` arm, which must
-    /// synthesize the same quartet through [`emit_standalone`] because its `RunCtx` is already gone;
+    /// The post-unwind twin of this path lives at [`super::Agent::run`]'s `catch_unwind` arm, which must
+    /// synthesize the same quartet through [`super::lifecycle::emit_standalone`] because its `RunCtx` is already gone;
     /// here the live `RunCtx` is intact, so emission goes through the ordinary [`RunCtx::emit`] and
     /// the reducer records `error_message`/`stop_reason` exactly as it does for a streamed message.
     ///

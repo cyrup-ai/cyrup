@@ -10,117 +10,24 @@
 //! - #4 abort returns the ACCUMULATED partial content with `stopReason:"aborted"` (agent-loop.ts:344).
 //! - #6 the loop stops consuming the stream on the `done` terminal — a post-terminal event yields no
 //!   stray `message_update` (agent-loop.ts:342-355).
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::print_stdout
-)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    Agent, AgentEvent, AgentMessage, EventSubscriber, HookError, Hooks, PostTurn, ProviderStreamFn,
+    Agent, AgentEvent, AgentMessage, EventSubscriber, HookError, Hooks, PostTurn,
     StreamFn, TurnUpdate,
 };
 use cyrup_core::{
     CancelToken, Content, EventStream, Message, ModelRef, StopReason, Tool, ToolCallId, ToolError,
     ToolResult, ToolUpdate, ToolUpdateSink,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
-use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
+use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
+use cyrup_provider::{Context, StreamEvent, StreamOptions};
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
-
-// ---------------------------------------------------------------------------
-// A StreamFn that records the full LLM payload (Context.messages) of every call, then delegates to
-// a faux provider for the actual stream — so we can byte-check the assembled payload.
-// ---------------------------------------------------------------------------
-
-struct PayloadRecordingStreamFn {
-    inner: Arc<dyn StreamFn>,
-    payloads: Arc<Mutex<Vec<Vec<Message>>>>,
-}
-
-impl StreamFn for PayloadRecordingStreamFn {
-    fn stream(
-        &self,
-        model: &ModelRef,
-        ctx: &Context,
-        opts: &StreamOptions,
-    ) -> EventStream<StreamEvent> {
-        self.payloads.lock().unwrap().push(ctx.messages.clone());
-        self.inner.stream(model, ctx, opts)
-    }
-}
-
-/// Captured LLM payloads: one `Vec<Message>` per provider request.
-type PayloadLog = Arc<Mutex<Vec<Vec<Message>>>>;
-
-fn payload_recording(
-    responses: Vec<cyrup_core::AssistantMessage>,
-) -> (Arc<dyn StreamFn>, PayloadLog) {
-    let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(responses);
-    let provider: Arc<dyn Provider> = faux;
-    let inner: Arc<dyn StreamFn> = Arc::new(ProviderStreamFn::new(provider));
-    let payloads = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> =
-        Arc::new(PayloadRecordingStreamFn { inner, payloads: payloads.clone() });
-    (sf, payloads)
-}
-
-#[derive(Default)]
-struct Recorder {
-    events: Mutex<Vec<AgentEvent>>,
-}
-
-#[async_trait::async_trait]
-impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
-        self.events.lock().unwrap().push(event.clone());
-    }
-}
-
-impl Recorder {
-    fn snapshot(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
-struct EchoTool {
-    name: String,
-    params: Value,
-}
-
-#[async_trait::async_trait]
-impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn parameters(&self) -> &Value {
-        &self.params
-    }
-    async fn execute(
-        &self,
-        _call_id: ToolCallId,
-        _params: Value,
-        _cancel: CancelToken,
-        _on_update: ToolUpdateSink,
-    ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("ok")], details: None, terminate: false, ..Default::default() })
-    }
-}
-
-fn obj_schema() -> Value {
-    json!({ "type": "object" })
-}
+use super::support::*;
 
 fn user_text_of(m: &Message) -> Option<String> {
     match m {
@@ -177,7 +84,7 @@ async fn miss1_context_override_isolated_from_observable_state() {
         faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let tool = Arc::new(EchoTool { name: "echo".into(), params: obj_schema() });
+    let tool = EchoTool::named("echo");
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![tool])
         .hooks(Arc::new(ContextOverrideHook { turns: AtomicUsize::new(0) }))
@@ -240,7 +147,7 @@ async fn miss1_mid_run_set_messages_does_not_leak_into_loop_payload() {
         faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let tool = Arc::new(EchoTool { name: "echo".into(), params: obj_schema() });
+    let tool = EchoTool::named("echo");
     let agent = Arc::new(Agent::builder(model_ref(), sf).tools(vec![tool]).build());
     let meddler = Arc::new(Meddler { agent: Mutex::new(Some(agent.clone())), fired: AtomicUsize::new(0) });
     agent.subscribe(meddler);
@@ -275,7 +182,7 @@ async fn miss3_timestamps_reach_llm_payload() {
         faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let tool = Arc::new(EchoTool { name: "echo".into(), params: obj_schema() });
+    let tool = EchoTool::named("echo");
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
     agent.prompt("go").await.unwrap().finished().await;
 
@@ -305,15 +212,6 @@ async fn miss3_timestamps_reach_llm_payload() {
 // Miss #2/#3 — synthetic failure message: one empty text block + Date.now() (Pi handleRunFailure).
 // ===========================================================================
 
-struct PanicHook;
-
-#[async_trait::async_trait]
-impl Hooks for PanicHook {
-    async fn prepare_next_turn(&self, _ctx: PostTurn<'_>, _cancel: CancelToken) -> Result<Option<TurnUpdate>, HookError> {
-        panic!("boom");
-    }
-}
-
 #[tokio::test]
 async fn miss2_3_synthetic_failure_has_empty_text_block_and_timestamp() {
     let before = std::time::SystemTime::now()
@@ -322,8 +220,8 @@ async fn miss2_3_synthetic_failure_has_empty_text_block_and_timestamp() {
         .as_millis() as i64;
     let (sf, _payloads) =
         payload_recording(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
-    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(PanicHook)).build();
-    let rec = Arc::new(Recorder::default());
+    let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(PanicHook::new("boom"))).build();
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     let new = agent.prompt("go").await.unwrap().finished().await;
 
@@ -443,7 +341,7 @@ impl StreamFn for PostTerminalStreamFn {
 #[tokio::test]
 async fn miss6_no_message_update_after_terminal() {
     let agent = Agent::builder(model_ref(), Arc::new(PostTerminalStreamFn)).build();
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     agent.subscribe(rec.clone());
     let new = agent.prompt("go").await.unwrap().finished().await;
 
@@ -521,7 +419,7 @@ async fn residual1_tool_update_partial_result_carries_terminate_byte_for_byte() 
         faux_assistant_message(vec![faux_text("ok")], StopReason::Stop),
     ]);
     let tool = Arc::new(UpdatingTool { name: "upd".into(), params: obj_schema() });
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
     agent.subscribe(rec.clone());
 

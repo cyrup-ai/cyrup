@@ -13,7 +13,6 @@
 //! reach the very next provider request, they are STICKY like every other `TurnUpdate` field
 //! (agent-loop.ts:226-239), and a tool introduced this way is genuinely EXECUTED — which is the
 //! precondition a `ToolResult::added_tool_names` anchor asserts.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,19 +26,17 @@ use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, Fa
 use cyrup_provider::{Context, StreamEvent, StreamOptions};
 use serde_json::{json, Value};
 
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
+use super::support::model_ref;
 
 /// What the agent actually offered the model on one request: the tool names and the system prompt.
 type Requests = Arc<Mutex<Vec<(Vec<String>, String)>>>;
 
-struct Recorder {
+struct ToolRequestSpy {
     inner: Arc<dyn StreamFn>,
     seen: Requests,
 }
 
-impl StreamFn for Recorder {
+impl StreamFn for ToolRequestSpy {
     fn stream(
         &self,
         model: &ModelRef,
@@ -59,7 +56,7 @@ fn recording(responses: Vec<cyrup_core::AssistantMessage>) -> (Arc<dyn StreamFn>
     faux.set_responses(responses);
     let seen: Requests = Arc::new(Mutex::new(Vec::new()));
     let sf: Arc<dyn StreamFn> =
-        Arc::new(Recorder { inner: Arc::new(crate::ProviderStreamFn::new(faux)), seen: seen.clone() });
+        Arc::new(ToolRequestSpy { inner: Arc::new(crate::ProviderStreamFn::new(faux)), seen: seen.clone() });
     (sf, seen)
 }
 

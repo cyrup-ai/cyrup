@@ -30,6 +30,7 @@ pub struct AgentBuilder {
 }
 
 impl AgentBuilder {
+    #[must_use]
     pub fn new(model: ModelRef, stream_fn: Arc<dyn StreamFn>) -> Self {
         Self {
             system_prompt: String::new(),
@@ -53,51 +54,61 @@ impl AgentBuilder {
         }
     }
 
+    #[must_use]
     pub fn system_prompt(mut self, s: impl Into<String>) -> Self {
         self.system_prompt = s.into();
         self
     }
 
+    #[must_use]
     pub fn thinking_level(mut self, t: ModelThinkingLevel) -> Self {
         self.thinking_level = t;
         self
     }
 
+    #[must_use]
     pub fn tools(mut self, tools: Vec<Arc<dyn Tool>>) -> Self {
         self.tools = tools;
         self
     }
 
+    #[must_use]
     pub fn messages(mut self, messages: Vec<AgentMessage>) -> Self {
         self.messages = messages;
         self
     }
 
+    #[must_use]
     pub fn hooks(mut self, hooks: Arc<dyn Hooks>) -> Self {
         self.hooks = Some(hooks);
         self
     }
 
+    #[must_use]
     pub fn key_resolver(mut self, r: Arc<dyn ApiKeyResolver>) -> Self {
         self.key_resolver = Some(r);
         self
     }
 
+    #[must_use]
     pub fn steering_mode(mut self, mode: QueueMode) -> Self {
         self.steering_mode = mode;
         self
     }
 
+    #[must_use]
     pub fn follow_up_mode(mut self, mode: QueueMode) -> Self {
         self.follow_up_mode = mode;
         self
     }
 
+    #[must_use]
     pub fn tool_execution(mut self, mode: ToolExecution) -> Self {
         self.tool_execution = mode;
         self
     }
 
+    #[must_use]
     pub fn session_id(mut self, id: SessionId) -> Self {
         self.session_id = Some(id);
         self
@@ -106,42 +117,49 @@ impl AgentBuilder {
     // --- generation params + telemetry (Pi `AgentOptions`, agent.ts:96-116) ---
 
     /// Sampling temperature forwarded to the provider (Pi `SimpleStreamOptions.temperature`).
+    #[must_use]
     pub fn temperature(mut self, t: f32) -> Self {
         self.gen_config.temperature = Some(t);
         self
     }
 
     /// Max output tokens forwarded to the provider (Pi `SimpleStreamOptions.maxTokens`).
+    #[must_use]
     pub fn max_tokens(mut self, n: u64) -> Self {
         self.gen_config.max_tokens = Some(n);
         self
     }
 
     /// Prompt-cache retention preference (Pi `SimpleStreamOptions.cacheRetention`).
+    #[must_use]
     pub fn cache_retention(mut self, r: cyrup_provider::CacheRetention) -> Self {
         self.gen_config.cache_retention = Some(r);
         self
     }
 
     /// Per-request header overlay (Pi `SimpleStreamOptions.headers`).
+    #[must_use]
     pub fn headers(mut self, h: cyrup_provider::HeaderMap) -> Self {
         self.gen_config.headers = Some(h);
         self
     }
 
     /// Preferred transport (Pi `AgentOptions.transport`, agent.ts:113).
+    #[must_use]
     pub fn transport(mut self, t: cyrup_provider::Transport) -> Self {
         self.gen_config.transport = Some(t);
         self
     }
 
     /// Cap (ms) on server-requested retry delays (Pi `AgentOptions.maxRetryDelayMs`, agent.ts:114).
+    #[must_use]
     pub fn max_retry_delay_ms(mut self, ms: u64) -> Self {
         self.gen_config.max_retry_delay_ms = Some(ms);
         self
     }
 
     /// Max client-side retry attempts (Pi `SimpleStreamOptions.maxRetries`).
+    #[must_use]
     pub fn max_retries(mut self, n: u32) -> Self {
         self.gen_config.max_retries = Some(n);
         self
@@ -150,6 +168,7 @@ impl AgentBuilder {
     /// Per-level custom thinking token budgets (Pi `AgentOptions.thinkingBudgets`, agent.ts:112).
     /// Forwarded into `cyrup_provider::StreamOptions.thinking_budgets`; budget-based providers honor
     /// it, others ignore it.
+    #[must_use]
     pub fn thinking_budgets(mut self, b: cyrup_provider::ThinkingBudgets) -> Self {
         self.gen_config.thinking_budgets = Some(b);
         self
@@ -157,6 +176,7 @@ impl AgentBuilder {
 
     /// Static API-key fallback used when no dynamic [`ApiKeyResolver`] yields one (Pi `config.apiKey`
     /// fallback, agent-loop.ts:301-302).
+    #[must_use]
     pub fn api_key(mut self, key: impl Into<String>) -> Self {
         self.gen_config.api_key = Some(key.into());
         self
@@ -165,6 +185,7 @@ impl AgentBuilder {
     /// Provider-scoped env overlay forwarded into `StreamOptions.env` (Pi `StreamOptions.env`,
     /// types.ts:184): the session builder seeds it with the `httpProxy` setting so the provider's
     /// proxy resolver honors the configured proxy (Pi `applyHttpProxySettings`, main.ts:744).
+    #[must_use]
     pub fn provider_env(mut self, env: cyrup_provider::ProviderEnv) -> Self {
         self.gen_config.env = Some(env);
         self
@@ -172,6 +193,7 @@ impl AgentBuilder {
 
     /// Provider request metadata forwarded into `StreamOptions.metadata` (Pi
     /// `SimpleStreamOptions.metadata`, e.g. Anthropic `user_id`). AGENT-S03.
+    #[must_use]
     pub fn metadata(mut self, m: serde_json::Map<String, Value>) -> Self {
         self.gen_config.metadata = Some(m);
         self
@@ -181,6 +203,7 @@ impl AgentBuilder {
     /// `StreamOptions.websocket_connect_timeout_ms` (Pi
     /// `SimpleStreamOptions.websocketConnectTimeoutMs`, `packages/ai/src/types.ts:159`; the session
     /// seeds it from `settingsManager.getWebSocketConnectTimeoutMs()` in `sdk.ts`). AGENT-031.
+    #[must_use]
     pub fn websocket_connect_timeout_ms(mut self, ms: u64) -> Self {
         self.gen_config.websocket_connect_timeout_ms = Some(ms);
         self
@@ -192,6 +215,7 @@ impl AgentBuilder {
     /// Honored by the shared SSE transport for every wire API — see
     /// [`GenConfig::timeout_ms`](crate::state::GenConfig::timeout_ms) for the exact semantics
     /// (idle, not total; `0` disables).
+    #[must_use]
     pub fn timeout_ms(mut self, ms: u64) -> Self {
         self.gen_config.timeout_ms = Some(ms);
         self
@@ -199,6 +223,7 @@ impl AgentBuilder {
 
     /// Telemetry: inspect/replace the provider payload before sending (Pi `AgentOptions.onPayload`,
     /// agent.ts:102).
+    #[must_use]
     pub fn on_payload(mut self, f: cyrup_provider::OnPayload) -> Self {
         self.gen_config.on_payload = Some(f);
         self
@@ -206,11 +231,13 @@ impl AgentBuilder {
 
     /// Telemetry: invoked after the HTTP response arrives, before its body is read (Pi
     /// `AgentOptions.onResponse`, agent.ts:103).
+    #[must_use]
     pub fn on_response(mut self, f: cyrup_provider::OnResponseHook) -> Self {
         self.gen_config.on_response = Some(f);
         self
     }
 
+    #[must_use]
     pub fn build(self) -> Agent {
         let (running_tx, running_rx) = watch::channel(false);
         let state = StateInner {

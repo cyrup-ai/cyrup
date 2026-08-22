@@ -24,7 +24,7 @@ pub struct GenerationConfig {
     ///
     /// This is only the BUILD-TIME seed: pi keeps `transport` as a mutable public field on the
     /// `Agent` (`agent.ts:204`) that `/settings` writes live (`interactive-mode.ts:4213-4216`), so
-    /// the authoritative value lives in [`StateInner::transport`] and this seeds it in
+    /// the authoritative value lives in `StateInner::transport` and this seeds it in
     /// `AgentBuilder::build`.
     pub transport: Option<Transport>,
     /// Cap (ms) on server-requested retry delays (Pi `AgentOptions.maxRetryDelayMs`, agent.ts:114).
@@ -85,7 +85,7 @@ pub struct GenerationConfig {
 
 /// Live agent state (arch-02 §4.1). Mutated only by the loop's reducer ([`reduce`]) and the
 /// `Agent` setters; the state lock is never held across a subscriber `await`.
-pub struct StateInner {
+pub(crate) struct StateInner {
     pub system_prompt: String,
     pub model: ModelRef,
     pub thinking_level: ModelThinkingLevel,
@@ -114,7 +114,7 @@ pub struct StateInner {
 }
 
 impl StateInner {
-    pub fn snapshot(&self) -> AgentStateSnapshot {
+    pub(crate) fn snapshot(&self) -> AgentStateSnapshot {
         AgentStateSnapshot {
             system_prompt: self.system_prompt.clone(),
             model: self.model.clone(),
@@ -155,7 +155,7 @@ pub struct AgentStateSnapshot {
 ///   preflight that runs after the assistant `message_end` barrier, R-02-033).
 /// - `pendingToolCalls` tracks ids between tool start..end (R-02-041).
 /// - `errorMessage` is set on an error/aborted turn (R-02-042).
-pub fn reduce(st: &mut StateInner, ev: &AgentEvent) {
+pub(crate) fn reduce(st: &mut StateInner, ev: &AgentEvent) {
     match ev {
         // AGENT-018 — no role check. pi is `case "message_start": this._state.streamingMessage =
         // event.message; break;` (`packages/agent/src/agent.ts:531-533` @v0.83.0, `:546-548`

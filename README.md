@@ -143,12 +143,19 @@ Start at [Introduction](docs/guide/introduction.md), or jump straight to a topic
 ```sh
 cargo check --workspace --all-targets   # type-check everything, including tests
 cargo clippy --workspace --all-targets  # REQUIRED — the no-panic policy only fires here
+cargo clippy -p cyrup-agent --all-targets --no-deps -- -D warnings  # cyrup-agent is warning-clean; keep it that way
 cargo nextest run --workspace           # the everyday gate: 6,855 tests (7 skipped), ~18s
 ```
 
 `cargo clippy` is not optional. The no-panic policy is expressed as `[workspace.lints.clippy]`
 denials, and **clippy tool lints do not fire under `cargo build` or `cargo test`.** There is no CI
 in this repository, so nothing runs these for you.
+
+The second clippy line is the strict gate. The workspace form exits 0 on warn-level diagnostics, so
+warning-level lints are only enforceable behind the deny flag. It is scoped to `cyrup-agent`, which
+is warning-clean today; other crates are not (`cyrup-provider` carries 23), so a workspace-wide deny
+would fail on arrival. `--no-deps` is what keeps the scope honest: without it the deny flag also
+applies to the workspace path dependencies clippy compiles on the way in.
 
 Edition 2024, `resolver = "3"`, stable toolchain. A cold first build compiles the full dependency
 graph (wasmtime, cranelift, gix, reqwest/rustls) — budget a few minutes and don't mistake it for a

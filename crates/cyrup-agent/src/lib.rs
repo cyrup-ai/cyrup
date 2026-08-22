@@ -8,6 +8,12 @@
 //! is enforced crate-wide via `[workspace.lints]`.
 #![forbid(unsafe_code)]
 
+// MODULE-VISIBILITY POLICY. These modules are `pub` because downstream crates (notably
+// cyrup-session-svc) browse them by path, so the module path is a second public API: anything
+// `pub` inside them escapes the crate whether or not it is named below. The rule is therefore —
+// every `pub` item inside these modules IS public API and MUST appear in the root `pub use` list
+// that follows, which is the audit checklist for this crate's surface. An item that should not be
+// public gets `pub(crate)` at its definition rather than being merely omitted from the list.
 pub mod agent;
 pub mod error;
 pub mod event;
@@ -38,9 +44,20 @@ pub use state::{AgentStateSnapshot, GenerationConfig};
 pub use stream_fn::{ApiKeyResolver, ProviderStreamFn, StreamFn};
 pub use subscriber::EventSubscriber;
 
-// Re-export the load-bearing provider/core types the agent's public API exposes, so downstream
-// crates can drive the agent without depending on cyrup-provider directly for these.
-pub use cyrup_provider::{Context, StreamEvent, StreamOptions, ToolDef};
+// THIRD-PARTY RE-EXPORT POLICY. Every `cyrup_provider`/`cyrup_core` type that appears in a public
+// signature of this crate is re-exported here, so a downstream crate can drive the agent — builder
+// setters, `Agent` setters, `ProviderStreamFn` — without depending on cyrup-provider or cyrup-core
+// directly. A type that appears in no public signature does NOT belong in these lists. On a name
+// collision with a cyrup-agent item above, the cyrup-agent name wins and the third-party one is
+// dropped (none today).
+pub use cyrup_provider::{
+    CacheRetention, Context, HeaderMap, OnPayload, OnResponseHook, Provider, ProviderEnv,
+    StreamEvent, StreamOptions, ThinkingBudgets, Transport,
+};
+pub use cyrup_core::{
+    AssistantMessage, CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, ProviderId,
+    SessionId, StopReason, Tool, ToolCallId,
+};
 
 #[cfg(test)]
 mod tests;

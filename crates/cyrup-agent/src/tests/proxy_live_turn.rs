@@ -10,7 +10,6 @@
 //!
 //! No network / tokens: transports are a scripted `FauxProvider`-backed spy or a loopback SSE server
 //! on a `std::net` OS thread (the workspace `tokio` has no `net` feature, so std net is used).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -21,9 +20,7 @@ use cyrup_core::{Content, EventStream, ModelRef, StopReason};
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
 
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "anthropic".into(), api: Some("anthropic-messages".into()), model: "claude".into() }
-}
+use super::support::anthropic_model_ref;
 
 fn assistant_text(m: &AgentMessage) -> String {
     match m {
@@ -44,12 +41,12 @@ fn assistant_text(m: &AgentMessage) -> String {
 // 1. A custom StreamFn serves a live Agent turn.
 // ----------------------------------------------------------------------------------------------
 
-struct RecordingStreamFn {
+struct HitCountingStreamFn {
     inner: ProviderStreamFn,
     hits: Arc<AtomicUsize>,
 }
 
-impl StreamFn for RecordingStreamFn {
+impl StreamFn for HitCountingStreamFn {
     fn stream(
         &self,
         model: &ModelRef,
@@ -69,12 +66,12 @@ async fn injected_stream_fn_serves_a_live_agent_turn() {
         StopReason::Stop,
     )]);
     let hits = Arc::new(AtomicUsize::new(0));
-    let sf: Arc<dyn StreamFn> = Arc::new(RecordingStreamFn {
+    let sf: Arc<dyn StreamFn> = Arc::new(HitCountingStreamFn {
         inner: ProviderStreamFn::new(faux as Arc<dyn Provider>),
         hits: hits.clone(),
     });
 
-    let agent = Agent::builder(model_ref(), sf).build();
+    let agent = Agent::builder(anthropic_model_ref(), sf).build();
     let handle = agent.prompt("hi").await.unwrap();
     let new = handle.finished().await;
     agent.wait_for_idle().await;
@@ -140,7 +137,7 @@ async fn proxy_stream_fn_streams_a_live_agent_turn() {
     let proxy_url = spawn_proxy_server(frames);
 
     let sf: Arc<dyn StreamFn> = Arc::new(ProxyStreamFn::new(proxy_url, "test-token"));
-    let agent = Agent::builder(model_ref(), sf).build();
+    let agent = Agent::builder(anthropic_model_ref(), sf).build();
     let handle = agent.prompt("ping the proxy").await.unwrap();
     let new = handle.finished().await;
     agent.wait_for_idle().await;
@@ -234,7 +231,7 @@ async fn agent035_aborted_proxy_stream_reports_pis_request_aborted_by_user() {
         cancel: Some(token),
         ..Default::default()
     };
-    let mut stream = crate::stream_proxy(model_ref(), Context::default(), opts);
+    let mut stream = crate::stream_proxy(anthropic_model_ref(), Context::default(), opts);
 
     // Deterministic rendezvous: cancel only once the transport has actually delivered a body
     // frame, so the abort is observed BETWEEN reads — pi's `proxy.ts:186-190` position — with no
@@ -396,7 +393,7 @@ async fn prov047_the_proxy_transport_routes_through_the_configured_http_proxy() 
 
     let sf: Arc<dyn StreamFn> =
         Arc::new(ProxyStreamFn::new(target.clone(), "test-token").with_env(env));
-    let agent = Agent::builder(model_ref(), sf).build();
+    let agent = Agent::builder(anthropic_model_ref(), sf).build();
     let handle = agent.prompt("ping through the proxy").await.unwrap();
     let new = handle.finished().await;
     agent.wait_for_idle().await;
