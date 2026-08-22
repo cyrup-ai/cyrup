@@ -3,9 +3,12 @@
 //! the [`Ctx`] type itself. The rest of `impl Ctx` lives beside the WIT interface each slice
 //! fronts — `tools`, `exec`, `fs`, `http`, `proc`.
 //!
-//! [`Ctx::register_tool`] also lives here rather than in `tools`: it fronts no WIT import at all —
-//! it hands a descriptor to the guest's own `register_tool_late` for the host to pick up at its
-//! next tool refresh — so it belongs with the type rather than with the `ext-tools` introspection.
+//! [`Ctx::register_tool`] sits here too. It does reach a WIT import — the descriptor crosses
+//! `registration.register-tool` — but only through `crate::guest::register_tool_late`, which also
+//! stores the tool in the guest's `LATE_TOOLS` so `execute-tool` can find its executor by name: a
+//! `Box<dyn ToolExec>` cannot cross the component boundary. It is that guest-side half, not the
+//! import, that keeps it out of `tools`, where every method wraps `ext-tools`/`registration` and
+//! nothing else.
 
 use serde::Serialize;
 

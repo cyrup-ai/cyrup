@@ -77,8 +77,10 @@ fn every_ctx_submodule_is_in_sdk_sources() {
     }
     // Non-vacuity: a scan that finds nothing satisfies the containment loop trivially, so the COUNT
     // is the only thing that proves this guard did any work. The literal is one per submodule plus
-    // `mod.rs`, not `> 0`, so deleting a submodule without deleting its `include_str!` line is
-    // caught here too — the direction the containment check cannot see.
+    // `mod.rs` rather than `> 0` so that REMOVING a submodule is deliberate too: dropping the file
+    // and its `include_str!` line together leaves the containment loop passing over a smaller tree,
+    // and only the count notices. (The opposite slip — dropping the file but keeping the
+    // `include_str!` — needs no guard here; it does not compile.)
     assert!(
         scanned >= 13,
         "the `src/ctx/` scan found only {scanned} `.rs` file(s) — this guard would be vacuous"
