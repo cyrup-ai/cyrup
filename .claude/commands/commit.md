@@ -96,7 +96,7 @@ Summarize completion. In amend mode, note "Amended previous commit" instead of "
 
 Then propose the next step: `/create-pr` (include arguments if needed).
 
-Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

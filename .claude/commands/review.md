@@ -418,7 +418,7 @@ Then propose the next step:
 - if the review was posted in STEP 13: nothing further — the PR now carries the findings
 - if user is reviewing someone else's PR and did not post: `share the zip with the author`
 
-Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

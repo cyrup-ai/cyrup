@@ -200,7 +200,7 @@ After QA completes, present the user with two options:
 `/review` → `/address-feedback` → `/ask all` → `/exec` → `/qa` → `/commit`
 Start here to review your own changes before creating a PR.
 
-Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

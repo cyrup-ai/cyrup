@@ -19,7 +19,7 @@ Resolve `$ARGUMENTS` before starting:
 
 Execute each step in sequence. For each step: announce `▶ Step: /<command>`, execute all its instructions with correct arguments, announce `✓ Step: /<command> complete`, carry output artifacts forward.
 
-### 2.1 — `/new`
+### 2.1 — `/task`
 
 Pass resolved task description. Output: task file name (e.g. `NOTIFS`) — carry forward.
 
