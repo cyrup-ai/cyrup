@@ -474,9 +474,10 @@ async fn a_mid_run_added_tool_is_still_permission_gated() {
 
 // ------------------------------------------------------- the gate the permission system uses ----
 
-/// A native extension that denies one tool by NAME from its `tool_call` handler — a minimal stand-in
-/// for `PermissionSystemExtension`, which subscribes to the same `EventKind::ToolCall` and decides in
-/// `decide()` (cyrup-permission-system/src/extension.rs `init`: "ToolCall is the deciding gate").
+/// A native extension that denies one tool by NAME from its `tool_call` handler — a minimal
+/// stand-in for `PermissionSystemExtension`, which subscribes to the same `EventKind::ToolCall` and
+/// decides in `decide()` (cyrup-permission-system/src/extension/native.rs `init`: "ToolCall is the
+/// deciding gate").
 struct DenyByName(&'static str);
 
 #[async_trait::async_trait]

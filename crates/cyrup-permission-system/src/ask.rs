@@ -286,17 +286,19 @@ fn compact_permission_prompt_for_select(value: &str) -> String {
 
 /// The CHILD-side ask-forwarding channel (pi `confirmPermission` subagent branch →
 /// `waitForForwardedPermissionApproval`, `index.ts:1514-1518,1255-1355`). Installed as the gate's
-/// `ask_channel` on a subagent child (`extension.rs` `new_forwarding_child`). When an ask-tier
-/// decision fires with no local human, [`Self::confirm`] hands the prompt `message` to
+/// `ask_channel` on a subagent child (`extension/construct.rs` `new_forwarding_child`). When an
+/// ask-tier decision fires with no local human, [`Self::confirm`] hands the prompt `message` to
 /// [`crate::forwarding::wait_for_forwarded_approval`], which writes a nonce-bound REQUEST into the
-/// PARENT session's spool (addressed by the `CYRUP_SUBAGENT_PARENT_SESSION` anchor) and BLOCKS on the
-/// bound RESPONSE up to `timeout` (pi's `PERMISSION_FORWARDING_TIMEOUT_MS`, 10-min default;
+/// PARENT session's spool (addressed by the `CYRUP_SUBAGENT_PARENT_SESSION` anchor) and BLOCKS on
+/// the bound RESPONSE up to `timeout` (pi's `PERMISSION_FORWARDING_TIMEOUT_MS`, 10-min default;
 /// [`crate::forwarding::resolve_child_wait_timeout`]). Any failure (no anchor, spool unavailable,
-/// timeout) resolves to a DENY decision — so the gate always fail-CLOSES, never hangs, never allows.
+/// timeout) resolves to a DENY decision — so the gate always fail-CLOSES, never hangs, never
+/// allows.
 ///
 /// The blocking wait is awaited by the gate UNDER a [`cyrup_ext::HostCtx::begin_human_wait`] P-3
-/// guard (`extension.rs` `resolve_ask`), so the dispatcher's 5s invocation budget is SUSPENDED for
-/// the (remote-human-latency, ≫5s) forward instead of firing and fail-OPENing the child's tool.
+/// guard (`extension/prompt.rs` `resolve_ask`), so the dispatcher's 5s invocation budget is
+/// SUSPENDED for the (remote-human-latency, ≫5s) forward instead of firing and fail-OPENing the
+/// child's tool.
 pub struct ForwardingAskChannel {
     /// The agent dir whose `sessions/permission-forwarding/…` subtree is the shared spool root (pi
     /// `PI_AGENT_DIR`; both parent and child resolve the same path).
@@ -344,7 +346,7 @@ impl AskChannel for ForwardingAskChannel {
             .unwrap_or_else(|| "unknown".to_string());
         // pi `getActiveAgentName(ctx) || … || "unknown"` (`index.ts:1284`). In cyrup's process-per-
         // subagent model the child IS its persona for its whole lifetime, so its active agent name is
-        // the `CYRUP_SUBAGENT_AGENT_NAME` spawn anchor (the SAME var `extension.rs`
+        // the `CYRUP_SUBAGENT_AGENT_NAME` spawn anchor (the SAME var `extension/env.rs`
         // `resolve_agent_name_from_env` reads for the policy layers); absent/blank ⇒ `"unknown"`,
         // matching pi's `|| "unknown"` fallback. Display-only metadata in the parent prompt, never
         // part of the nonce binding.

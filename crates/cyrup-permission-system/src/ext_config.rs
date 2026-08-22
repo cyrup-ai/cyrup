@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use crate::jsonc;
 
 /// pi `CONFIG_PATH_ENV_KEY` (`extension-config.ts:43`), renamed to this crate's `CYRUP_` env-var
-/// convention (see `extension.rs::INSTALL_ENV_VAR`, `forwarding.rs::FORWARDING_AGENT_DIR_ENV`).
+/// convention (see `extension/env.rs::INSTALL_ENV_VAR`, `forwarding.rs::FORWARDING_AGENT_DIR_ENV`).
 pub const CONFIG_PATH_ENV_KEY: &str = "CYRUP_PERMISSION_SYSTEM_CONFIG_PATH";
 
 /// pi `PermissionSystemExtensionConfig` (`extension-config.ts:10-16`); defaults `{true, false,
@@ -784,9 +784,10 @@ pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
 /// paths a test never wrote. Taking it here, around `block_on`, gives the body byte-identical
 /// coverage while the guard lives on ONE stack frame that cannot be suspended or moved.
 ///
-/// This is the single instance `extension.rs`'s `with_config_env_lock`, `ask.rs` and this module's
-/// own tests all funnel through — a per-module helper over a per-module lock would not serialize
-/// anything, since `cargo test` runs the crate's unit tests as threads in one process.
+/// This is the single instance `extension/tests/support.rs`'s `with_config_env_lock`, `ask.rs` and
+/// this module's own tests all funnel through — a per-module helper over a per-module lock would
+/// not serialize anything, since `cargo test` runs the crate's unit tests as threads in one
+/// process.
 #[cfg(test)]
 // Test-only helper: a current-thread runtime that fails to build means a broken test host, and
 // there is no caller that could do anything else with the error.

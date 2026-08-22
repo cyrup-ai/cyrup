@@ -1513,7 +1513,7 @@ fn push_unique(vec: &mut Vec<String>, item: String) {
 /// **[CYRUP-DELTA]** pi prefixes the file with `<active_agent name="…"/>` (`:576-578`) so its
 /// in-process `@gotgenes/pi-permission-system` can resolve per-agent policy from the prompt text.
 /// cyrup's permission companion resolves the same name from `CYRUP_SUBAGENT_AGENT_NAME` instead
-/// (`cyrup-permission-system/src/extension.rs:2249-2263`, `resolve_agent_name_from_env`), because
+/// (`cyrup-permission-system/src/extension/env.rs`, `resolve_agent_name_from_env`), because
 /// cyrup's subagent is a separate PROCESS that IS its persona for its whole lifetime, so the tag
 /// would be a second, weaker channel for a fact the env already carries.
 ///

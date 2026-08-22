@@ -7,8 +7,9 @@
 //! boundary (the `before_tool_call` gate is, `gate.rs`); it removes the model's incentive to attempt a
 //! call it would only be blocked on, and keeps the advertised skill list honest.
 //!
-//! Wired at the live `before_agent_start` seam in `extension.rs` (`on_event(BeforeAgentStart)` returns
-//! the sanitized prompt as a `[mutate]` and shapes the active tools via `HostServices::set_active_tools`).
+//! Wired at the live `before_agent_start` seam in `extension/agent_start.rs` (reached from
+//! `extension/native.rs`'s `on_event(BeforeAgentStart)` arm, which returns the sanitized prompt as
+//! a `[mutate]` and shapes the active tools via `HostServices::set_active_tools`).
 
 pub mod skills;
 pub mod tools;

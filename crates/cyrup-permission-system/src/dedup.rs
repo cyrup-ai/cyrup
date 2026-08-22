@@ -11,7 +11,7 @@
 //! and awaits the SAME still-pending promise instead of opening a second dialog
 //! (`getCachedPermissionPromptDecision`, v0.8.0 `index.ts:465-481`, called from `:1580-1596`).
 //! [`DedupCache`] carries this via
-//! [`DedupCache::begin_pending`]/[`Lookup::Pending`]/[`Pending::wait`], and `extension.rs`'s
+//! [`DedupCache::begin_pending`]/[`Lookup::Pending`]/[`Pending::wait`], and `extension/prompt.rs`'s
 //! `prompt_decision` USES it (PERM-014): it calls [`DedupCache::lookup`], awaits a
 //! [`Lookup::Pending`] rather than prompting again, registers with [`DedupCache::begin_pending`]
 //! BEFORE awaiting the human, and settles through [`PendingOwner::resolve`] or
@@ -19,13 +19,13 @@
 //! remain for a caller that only ever stores an already-resolved decision; neither is on the live
 //! gate path any more.
 //!
-//! Wired into `extension.rs`'s `prompt_decision` — the port of pi's `promptPermission`, and the
-//! single place EVERY ask surface funnels through. pi puts the cache inside `promptPermission` itself
-//! (`index.ts:1798-1815` lookup, `:1890-1892` store) rather than at any one call site, so all three
-//! surfaces — skill-read (`index.ts:2282`), external-directory (`:2369`) and the main check
-//! (`:2469`) — dedup identically; cyrup matches that placement. `prompt_decision` computes the cache
-//! key from its [`DedupDetails`], checks the cache BEFORE invoking the [`crate::ask::AskChannel`],
-//! and remembers the resolved decision after.
+//! Wired into `extension/prompt.rs`'s `prompt_decision` — the port of pi's `promptPermission`, and
+//! the single place EVERY ask surface funnels through. pi puts the cache inside `promptPermission`
+//! itself (`index.ts:1798-1815` lookup, `:1890-1892` store) rather than at any one call site, so
+//! all three surfaces — skill-read (`index.ts:2282`), external-directory (`:2369`) and the main
+//! check (`:2469`) — dedup identically; cyrup matches that placement. `prompt_decision` computes
+//! the cache key from its [`DedupDetails`], checks the cache BEFORE invoking the
+//! [`crate::ask::AskChannel`], and remembers the resolved decision after.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
