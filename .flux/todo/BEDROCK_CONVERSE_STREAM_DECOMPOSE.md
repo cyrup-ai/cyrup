@@ -1,7 +1,7 @@
 ---
-stage: aug
+stage: exec
 status: done
-updated: 2026-08-22 17:05
+updated: 2026-08-22 17:55
 ---
 
 # Decompose Bedrock Converse Stream Into Submodules
