@@ -718,7 +718,7 @@ async fn trust_settings_and_session_list_seams() {
 
 #[test]
 fn extension_discovery_roots_honor_no_extensions_and_explicit_paths() {
-    use crate::extension_discovery_roots;
+    use crate::builder::extension_discovery_roots;
 
     // Default: project + global roots scanned, no configured paths.
     let mut cfg = SessionConfig::new(PathBuf::from("/work"), PathBuf::from("/agent"));

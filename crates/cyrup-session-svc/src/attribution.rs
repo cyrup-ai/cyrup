@@ -114,7 +114,7 @@ fn session_headers(model: &Model, session_id: Option<&SessionId>) -> Option<Vec<
 /// `extra` overlays (later overlays win), returning `None` when the merged map is empty (Pi
 /// `mergeProviderAttributionHeaders`, provider-attribution.ts:90-108). The value type matches the
 /// provider [`HeaderMap`] (`Option<String>`; a `None` value suppresses a default header).
-pub fn merge_provider_attribution_headers(
+pub(crate) fn merge_provider_attribution_headers(
     model: &Model,
     telemetry_enabled: bool,
     session_id: Option<&SessionId>,

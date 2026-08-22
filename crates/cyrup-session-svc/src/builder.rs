@@ -143,8 +143,8 @@ pub struct SessionConfig {
     pub no_extensions: bool,
     /// Explicit `--extension <path>` resources to load as pre-trust *configured* extensions (Pi
     /// `resourceLoaderOptions.additionalExtensionPaths`, main.ts:660). Each may be a single extension
-    /// dir or a directory of extensions. Threaded into [`extension_discovery_roots`] regardless of
-    /// `no_extensions`.
+    /// dir or a directory of extensions. Threaded into the crate-internal
+    /// `extension_discovery_roots` regardless of `no_extensions`.
     pub extra_extension_paths: Vec<PathBuf>,
     /// Explicit `--skill <path>` resources to append to discovery (Pi `additionalSkillPaths`,
     /// resource-loader.ts:421). Merged into the discovered registry before skill-pointer derivation.
@@ -2162,7 +2162,7 @@ fn natives_to_load(
 /// project (`<cwd>/.cyrup/extensions`) + global (`<agentDir>/extensions`) discovery roots; explicit
 /// `--extension`/`-e` paths are always loaded (Pi: "explicit -e paths still work" — they are pre-trust
 /// *configured* roots). Pure + side-effect-free so it is unit-testable without a wasm host.
-pub fn extension_discovery_roots(cfg: &SessionConfig) -> cyrup_ext::DiscoveryRoots {
+pub(crate) fn extension_discovery_roots(cfg: &SessionConfig) -> cyrup_ext::DiscoveryRoots {
     if cfg.no_extensions {
         cyrup_ext::DiscoveryRoots {
             project_cwd: None,

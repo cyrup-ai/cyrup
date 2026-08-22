@@ -274,7 +274,7 @@ struct LiveSnapshot {
 /// A separate trait rather than more snapshot fields because these are LIVE — a mirrored `is_idle`
 /// would be stale exactly when it matters (mid-run, which is when a handler asks). Attached by
 /// `AgentSession::into_shared` over a weak self-handle, so it never keeps the session alive.
-pub trait SessionActivity: Send + Sync {
+pub(crate) trait SessionActivity: Send + Sync {
     /// Whether no agent run (including the post-run retry/compaction/continuation loop) is in
     /// flight (Pi `isIdle`).
     fn is_idle(&self) -> bool;
@@ -296,7 +296,7 @@ pub trait SessionActivity: Send + Sync {
 /// `getCommands()` must see a command an extension registered a moment ago, and `getAllTools()`
 /// must see a tool `refreshTools` just merged. Attached by `AgentSession::into_shared` over a weak
 /// self-handle, so it never keeps the session alive.
-pub trait SessionCatalog: Send + Sync {
+pub(crate) trait SessionCatalog: Send + Sync {
     /// pi `getCommands(): SlashCommandInfo[]` — `[...extensionCommands, ...templates, ...skills]`,
     /// extension rows keyed on `command.invocationName` (`core/agent-session.ts:2332-2354`
     /// @v0.83.0; type `SlashCommandInfo`, `core/slash-commands.ts:6-11`). That is exactly
@@ -333,7 +333,8 @@ pub trait SessionCatalog: Send + Sync {
 /// defaults `None` / `json!([])` / `None` are already pi's headless answers, and
 /// [`LiveHostServices::set_theme`] returns pi's own `"UI not available"` string.
 ///
-/// A trait rather than more [`LiveSnapshot`] fields for the reason [`SessionActivity`] is one: the
+/// A trait rather than more [`LiveSnapshot`] fields for the reason the crate-internal
+/// `SessionActivity` is one: the
 /// active theme is LIVE (an extension asking mid-session must see a `/settings → theme` switch the
 /// user made a keystroke ago), and `set` is a real ACTION whose success/failure pi returns
 /// synchronously. Attached by the interactive TUI only, over handles that do not keep the app
@@ -710,7 +711,7 @@ impl LiveHostServices {
 
     /// Attach the live session's activity readback + interrupt (EXT-005). Installed by
     /// `AgentSession::into_shared` over a weak self-handle.
-    pub fn attach_session_activity(&self, activity: Arc<dyn SessionActivity>) {
+    pub(crate) fn attach_session_activity(&self, activity: Arc<dyn SessionActivity>) {
         *Self::lock(&self.activity) = Some(activity);
     }
 
@@ -718,7 +719,7 @@ impl LiveHostServices {
     /// source behind [`HostServices::commands`] and the extension-tool provenance half of
     /// [`HostServices::all_tools`]. Installed by `AgentSession::into_shared` over a weak
     /// self-handle, exactly like [`Self::attach_session_activity`].
-    pub fn attach_session_catalog(&self, catalog: Arc<dyn SessionCatalog>) {
+    pub(crate) fn attach_session_catalog(&self, catalog: Arc<dyn SessionCatalog>) {
         *Self::lock(&self.catalog) = Some(catalog);
     }
 

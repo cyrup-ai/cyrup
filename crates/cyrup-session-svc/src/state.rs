@@ -167,7 +167,7 @@ pub struct UsageCostBreakdownEntry {
 
 /// The literal bucket name pi gives usage it cannot attribute to a model (`usage-totals.ts:47`,
 /// `:50`). It is a user-visible string and is byte-identical on purpose.
-pub const TOOLS_SUMMARIES_KEY: &str = "Tools/summaries";
+pub(crate) const TOOLS_SUMMARIES_KEY: &str = "Tools/summaries";
 
 /// Group attributable assistant usage by model, and everything else into one bucket — 1:1 with pi
 /// `getUsageCostBreakdown` (`core/usage-totals.ts:37-70` @v0.83.0). PROV-036.
@@ -184,7 +184,7 @@ pub const TOOLS_SUMMARIES_KEY: &str = "Tools/summaries";
 ///
 /// The totals this sums are the same ones [`SessionStats::add_usage`] sums, so
 /// `breakdown.iter().map(|e| e.cost).sum()` equals `SessionStats::cost` exactly.
-pub fn usage_cost_breakdown(entries: &[Entry]) -> Vec<UsageCostBreakdownEntry> {
+pub(crate) fn usage_cost_breakdown(entries: &[Entry]) -> Vec<UsageCostBreakdownEntry> {
     use std::collections::BTreeMap;
 
     // Insertion-ordered, because the final `sort` is by cost and a stable sort must not reorder
@@ -242,7 +242,7 @@ pub fn usage_cost_breakdown(entries: &[Entry]) -> Vec<UsageCostBreakdownEntry> {
 /// `Compaction`/`BranchSummary` are pi's resets (`cache-stats.ts:110-115`); an assistant message is
 /// a settled turn; everything else — user messages, tool results, settings entries — is ignored and
 /// specifically NOT a reset.
-pub fn cache_scan_entries(entries: &[Entry]) -> Vec<cyrup_provider::cache_stats::CacheScanEntry<'_>> {
+pub(crate) fn cache_scan_entries(entries: &[Entry]) -> Vec<cyrup_provider::cache_stats::CacheScanEntry<'_>> {
     use cyrup_provider::cache_stats::CacheScanEntry;
     entries
         .iter()

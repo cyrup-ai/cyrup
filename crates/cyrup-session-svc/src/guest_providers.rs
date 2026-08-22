@@ -11,7 +11,7 @@
 //! each guest registration as a `ConfigProvider` (via [`cyrup_ext::ProviderRegistration::build_provider`])
 //! and holds it behind an `Arc`. The [`AgentSession`](crate::AgentSession) then UNIONs these providers'
 //! catalogs into `full_model_registry()` / `available_model_catalog()` and installs the owning provider
-//! into the [`crate::ProviderSwap`] on a matching `set_model`, so the registered model is both
+//! into the [`crate::provider_swap::ProviderSwap`] on a matching `set_model`, so the registered model is both
 //! SELECTABLE and STREAMABLE in the assembled run.
 
 use std::collections::BTreeMap;

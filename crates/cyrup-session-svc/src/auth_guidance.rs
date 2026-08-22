@@ -12,7 +12,7 @@
 //! absolute prefix pi derives from `getDocsPath()` is environment-cosmetic).
 
 /// Pi `getProviderLoginHelp` (auth-guidance.ts:6-11).
-pub fn get_provider_login_help() -> String {
+pub(crate) fn get_provider_login_help() -> String {
     "Use /login to log into a provider via OAuth or API key. See:\n  docs/providers.md\n  docs/models.md"
         .to_string()
 }
@@ -22,7 +22,7 @@ pub fn get_provider_login_help() -> String {
 /// This is the `modelFallbackMessage` a modelless session carries (sdk.ts:216-218) — a WARNING the
 /// interactive front-end shows (interactive-mode.ts:883-884), and the stderr text the bin prints
 /// before `exit(1)` in every NON-interactive mode (main.ts:852-855).
-pub fn format_no_models_available_message() -> String {
+pub(crate) fn format_no_models_available_message() -> String {
     format!("No models available. {}", get_provider_login_help())
 }
 
@@ -30,13 +30,13 @@ pub fn format_no_models_available_message() -> String {
 ///
 /// Thrown by `prompt`/`compact` when the session has no model (agent-session.ts:1178-1180,
 /// :1790-1792) — the error a first-run user sees if they type before running `/login` + `/model`.
-pub fn format_no_model_selected_message() -> String {
+pub(crate) fn format_no_model_selected_message() -> String {
     format!("No model selected.\n\n{}\n\nThen use /model to select a model.", get_provider_login_help())
 }
 
 /// pi `UNKNOWN_PROVIDER` (auth-guidance.ts:4). A model whose provider could not be identified is
 /// named "the selected model" rather than the literal string `unknown`.
-pub const UNKNOWN_PROVIDER: &str = "unknown";
+pub(crate) const UNKNOWN_PROVIDER: &str = "unknown";
 
 /// Pi `formatNoApiKeyFoundMessage` (auth-guidance.ts:22-25). PROV-037.
 ///
@@ -47,7 +47,7 @@ pub const UNKNOWN_PROVIDER: &str = "unknown";
 ///
 /// cyrup previously answered all of these with its own `no configured auth for model: p/m`, which
 /// named no remedy — `grep -rn 'No API key found' crates/` returned zero.
-pub fn format_no_api_key_found_message(provider: &str) -> String {
+pub(crate) fn format_no_api_key_found_message(provider: &str) -> String {
     let provider_display = if provider == UNKNOWN_PROVIDER { "the selected model" } else { provider };
     format!("No API key found for {provider_display}.\n\n{}", get_provider_login_help())
 }
@@ -59,7 +59,7 @@ pub fn format_no_api_key_found_message(provider: &str) -> String {
 /// different fixes: this one names the provider, distinguishes expiry from a network outage, and
 /// tells the user the exact command to run. Not a function upstream — the string is built inline at
 /// both sites — but it is built identically at both, so it is factored here rather than duplicated.
-pub fn format_oauth_reauthenticate_message(provider: &str) -> String {
+pub(crate) fn format_oauth_reauthenticate_message(provider: &str) -> String {
     format!(
         "Authentication failed for \"{provider}\". Credentials may have expired or network is \
          unavailable. Run '/login {provider}' to re-authenticate."

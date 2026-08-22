@@ -15,9 +15,13 @@
 //!   `wait_for_idle` — with durable persistence across every turn.
 //! - [`SessionServiceError`] aggregates the subsystem errors.
 #![forbid(unsafe_code)]
+// The re-export list below is hand-curated; this is the compiler check that keeps it honest —
+// a `pub` item no path out of this crate can reach is either missing from that list or should
+// never have been `pub`.
+#![warn(unreachable_pub)]
 
 mod attribution;
-pub mod auth_guidance;
+mod auth_guidance;
 mod bash;
 mod builder;
 mod command;
@@ -39,14 +43,12 @@ mod subscriber;
 mod tests;
 mod tools;
 
-pub use attribution::merge_provider_attribution_headers;
 // `BashChunkSink` is exported alongside them because it is the `on_chunk` parameter type of the
 // public `execute_bash`/`execute_bash_with_user_event`: a front-end that streams a `!`/`!!` run's
 // output (the interactive TUI does) has to name it to build the sink.
 pub use bash::{BashChunkSink, BashOptions, BashResult};
 pub use builder::{
-    extension_discovery_roots, ExtensionFlagValue, NoTools, SessionBuilder, SessionConfig,
-    SessionTarget, TrustPromptFn,
+    ExtensionFlagValue, NoTools, SessionBuilder, SessionConfig, SessionTarget, TrustPromptFn,
 };
 pub use command::{SessionCommand, SessionCommandOutput};
 pub use error::SessionServiceError;
@@ -60,6 +62,10 @@ pub use event::{
 /// without it a consumer cannot match on the seam's own event without taking a direct
 /// `cyrup-provider` dependency. `cyrup-modes`' wire projection is the first such consumer.
 pub use cyrup_provider::StreamEvent;
+/// The return type of the public `AgentSession::cache_waste`. Re-exported for the same reason
+/// [`StreamEvent`] is: without it a consumer cannot name what that method hands back without
+/// taking a direct `cyrup-provider` dependency.
+pub use cyrup_provider::cache_stats::CacheWasteTotals;
 pub use factory::SessionFactory;
 pub use guest_providers::GuestProviderRegistry;
 pub use cyrup_ext::NotifyKind;
@@ -67,10 +73,10 @@ pub use host_services::{
     ControlSink, EditorTextMirror, InjectMessage, InjectSink, LiveHostServices, OverlayRequest,
     OverlaySink, ThemeAccess, UiEffect, UiEffectSink, UiKind, UiReply, UiRequest, UiSink,
 };
-pub use provider_swap::{ProviderResolver, ProviderSwap};
+pub use provider_swap::ProviderResolver;
 pub use runtime::{
-    AgentSessionRuntime, NewSessionOptions, RuntimeActions, RuntimeDiagnostic, RuntimeForkResult,
-    SwitchResult, SwitchSessionOptions,
+    AgentSessionRuntime, BeforeSessionInvalidate, NewSessionOptions, RuntimeActions,
+    RuntimeDiagnostic, RuntimeForkResult, SwitchResult, SwitchSessionOptions,
 };
 pub use services::{AgentSessionServices, ExtensionLoadDiagnostic, StartupDiagnostics};
 pub use session::{
@@ -80,7 +86,7 @@ pub use session::{
 };
 pub use state::{
     CompactionResult, ContextUsage, SessionStateView, SessionStats, StatsContextUsage,
-    StatsTokens,
+    StatsTokens, UsageCostBreakdownEntry,
 };
 pub use tools::ToolInfo;
 // The compaction `reason` carried by `AgentSessionEvent::Compaction{Start,End}` (so a front-end can
@@ -128,6 +134,12 @@ pub use cyrup_agent::QueueMode;
 /// Re-exported so an embedder can name the custom-transport seam types
 /// ([`SessionBuilder::stream_fn`]/[`SessionBuilder::key_resolver`], Pi `AgentOptions.streamFn`) and
 /// the built-in proxy transport ([`ProxyStreamFn`]) without a direct `cyrup-agent` dependency.
+///
+/// These are NOT reachability-dead: `stream_fn` and `key_resolver` are public methods that take
+/// `Arc<dyn cyrup_agent::StreamFn>` / `Arc<dyn cyrup_agent::ApiKeyResolver>`, so an embedder who
+/// cannot name them cannot call those methods without the direct dependency this facade exists to
+/// spare them. `unreachable_pub` cannot defend this — it only sees THIS crate's `pub` items, never
+/// a foreign type in a public signature.
 pub use cyrup_agent::{ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamFn};
 /// Re-exported so an embedder can name the synthetic-resource override closures' element types
 /// ([`SessionBuilder::skills_override`]/[`SessionBuilder::context_files_override`]) without a direct
@@ -135,5 +147,7 @@ pub use cyrup_agent::{ApiKeyResolver, ProxyStreamFn, ProxyStreamOptions, StreamF
 pub use cyrup_resources::SkillPointer;
 pub use cyrup_session::prompt::{ContextFile, ContextScope};
 /// Re-exported so front-ends can name the thinking level [`AgentSession::set_thinking_level`] takes
-/// and the entry id the RPC `fork` targets without a direct `cyrup-core` dependency.
-pub use cyrup_core::{Content, EntryId, ModelThinkingLevel};
+/// and the entry id the RPC `fork` targets without a direct `cyrup-core` dependency. [`Tool`] is
+/// here because it is the element type of the public [`SessionConfig::custom_tools`] field — an
+/// embedder registering a custom tool cannot spell that field without it.
+pub use cyrup_core::{Content, EntryId, ModelThinkingLevel, Tool};

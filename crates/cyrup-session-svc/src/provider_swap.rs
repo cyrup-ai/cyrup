@@ -30,7 +30,7 @@ pub trait ProviderResolver: Send + Sync {
 /// The agent streams through this (`impl StreamFn`); swapping the inner provider on a cross-provider
 /// `/model` select makes the SAME loop stream against the new provider — 1:1 with Pi switching
 /// model+provider live, without rebuilding the agent.
-pub struct ProviderSwap {
+pub(crate) struct ProviderSwap {
     /// The currently-installed provider (the offline faux default, or a resolved real provider).
     inner: Mutex<Arc<dyn Provider>>,
     /// The bin's provider resolver seam (`select_provider`). `None` in contexts that never swap
@@ -41,12 +41,12 @@ pub struct ProviderSwap {
 
 impl ProviderSwap {
     /// Wrap `initial` as the currently-installed provider, with an optional swap `resolver`.
-    pub fn new(initial: Arc<dyn Provider>, resolver: Option<Arc<dyn ProviderResolver>>) -> Self {
+    pub(crate) fn new(initial: Arc<dyn Provider>, resolver: Option<Arc<dyn ProviderResolver>>) -> Self {
         Self { inner: Mutex::new(initial), resolver }
     }
 
     /// The currently-installed provider (cheap `Arc` clone). Poison-safe (no panic).
-    pub fn current(&self) -> Arc<dyn Provider> {
+    pub(crate) fn current(&self) -> Arc<dyn Provider> {
         match self.inner.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -54,21 +54,16 @@ impl ProviderSwap {
     }
 
     /// Install `provider` as the current one. Poison-safe (no panic).
-    pub fn store(&self, provider: Arc<dyn Provider>) {
+    pub(crate) fn store(&self, provider: Arc<dyn Provider>) {
         match self.inner.lock() {
             Ok(mut guard) => *guard = provider,
             Err(poisoned) => *poisoned.into_inner() = provider,
         }
     }
 
-    /// Whether a swap resolver is wired (cross-provider selects are only possible when it is).
-    pub fn has_resolver(&self) -> bool {
-        self.resolver.is_some()
-    }
-
     /// Resolve the provider owning `provider_id` (installing its credentials) and install it as the
     /// current provider. Errors when no resolver is wired or the resolver fails.
-    pub fn resolve_and_store(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
+    pub(crate) fn resolve_and_store(&self, provider_id: &str) -> Result<Arc<dyn Provider>, String> {
         let resolver = self.resolver.as_ref().ok_or_else(|| {
             format!(
                 "cannot switch to provider '{provider_id}': no provider resolver is configured for this session"
@@ -113,7 +108,6 @@ mod tests {
         let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
         let swap = ProviderSwap::new(faux.clone(), None);
         assert_eq!(swap.current().id().as_str(), "faux");
-        assert!(!swap.has_resolver());
     }
 
     #[test]
