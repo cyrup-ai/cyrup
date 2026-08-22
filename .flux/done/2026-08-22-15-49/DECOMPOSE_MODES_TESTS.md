@@ -1,7 +1,7 @@
 ---
-stage: exec
-status: done
-updated: 2026-08-22 18:00
+stage: qa
+status: completed
+updated: 2026-08-22 18:15
 ---
 
 # modes.rs comment rework — one line left
