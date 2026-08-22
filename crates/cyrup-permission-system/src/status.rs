@@ -1,8 +1,8 @@
 //! Port of pi `status.ts` — the single status pill the extension surfaces: a `"yolo"` segment keyed
 //! by [`EXTENSION_ID`] when `yoloMode` is on, cleared otherwise. Driven through the live UI-effect
 //! seam [`cyrup_ext::HostServices::set_status`] (pi `ui.setStatus(key, text?)`), synced at
-//! `session_start`/`before_agent_start` and cleared at `session_shutdown` (pi `index.ts:2122`), from
-//! `extension.rs`.
+//! `session_start`/`before_agent_start` and cleared at `session_shutdown` (pi `index.ts:2122`),
+//! from `extension/config.rs` and `extension/native.rs`.
 
 use std::sync::Arc;
 

@@ -2,7 +2,7 @@
 //! overlay (`applyPatternApprovalState`), the approval subject (`getPatternApprovalSubject`), the
 //! config evaluation rule (`createConfigEvaluationRule`), and the model-facing reason formatters
 //! (`formatDenyReason` / `formatUserDeniedReason` / the ask-unavailable reason). The orchestration
-//! that CALLS these (the async gate on every `tool_call`) lives in `extension.rs`.
+//! that CALLS these (the async gate on every `tool_call`) lives in `extension/decide.rs`.
 
 use serde_json::{Map, Value};
 
@@ -20,7 +20,8 @@ const PATH_BEARING_TOOLS: [&str; 6] = ["read", "write", "edit", "find", "grep", 
 /// EMPTY STRING is indistinguishable from an absent field. Rust's `Option` is not: a
 /// `Some(String::new())` passes `.is_some()`/`if let Some(_)` and leaks `command ''` into
 /// model-facing denial text, or makes an approval subject the empty string (which
-/// `extension.rs`'s `!subject.is_empty()` guard then silently drops).
+/// `extension/decide.rs`'s and `extension/prompt.rs`'s `!subject.is_empty()` guards then silently
+/// drop).
 ///
 /// This is reachable, not theoretical: [`crate::manager::PermissionManager::check`]'s bash branch
 /// mirrors pi's `const command = typeof record.command === "string" ? record.command : ""` and
@@ -101,7 +102,7 @@ pub fn has_structured_edit_payload(input: &Map<String, Value>) -> bool {
 /// payload ([`has_structured_edit_payload`], pi `hasStructuredEditPayload`), OR the broader
 /// [`is_likely_filesystem_tool_name`] heuristic — so a non-builtin filesystem tool (`read_file`,
 /// `grep_files`, `fs_search`, a `*_read`/`*_write`/`*_search`/`*_list`) is recognized as
-/// path-bearing. This is an ENFORCEMENT input, not merely cosmetic: `extension.rs`'s
+/// path-bearing. This is an ENFORCEMENT input, not merely cosmetic: `extension/decide.rs`'s
 /// external-directory guard skips the whole ask/deny check when this returns `None`, so a
 /// filesystem-like tool that went unrecognized would reach a path OUTSIDE the working directory
 /// ungated.
@@ -933,7 +934,7 @@ mod tests {
     /// top-level `oldText`+`newText` when there is no `edits` array, so pi's
     /// `getPathBearingToolPath` (`index.ts:227-230`) returns the path for a tool whose NAME says
     /// nothing filesystem-ish. The old `contains_key("edits")` test said `false`, so
-    /// `extension.rs:1267-1273`'s external-directory guard was skipped entirely and the path
+    /// `extension/decide.rs`'s `resolve_external_directory` guard was skipped entirely and the path
     /// reached the main check ungated by the `external_directory` special policy.
     #[test]
     fn top_level_old_new_text_is_a_structured_edit_payload_without_an_edits_key() {

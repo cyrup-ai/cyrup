@@ -1,11 +1,12 @@
 //! Port of pi `skill-prompt-sanitizer.ts` — `resolveSkillPromptEntries` (and its parse). The system
-//! prompt advertises skills in `<available_skills>` blocks; a skill the policy resolves to `ask`/`deny`
-//! must NOT be advertised (advertising a capability the gate would only block pollutes the context and
-//! invites the model to attempt it), yet its ENFORCEMENT entry must survive so the `before_tool_call`
-//! skill-read gate (`extension.rs` `resolve_skill_read` → `skill::find_skill_path_match`) still governs
-//! reads of its files. This module does ONE parse of the `<available_skills>` blocks and feeds BOTH
-//! consumers from it (pi's `resolveSkillPromptEntries` returns `{ entries, prompt }`, `index.ts:2175`):
-//! the flat enforcement entry list AND the hide-sanitized prompt.
+//! prompt advertises skills in `<available_skills>` blocks; a skill the policy resolves to
+//! `ask`/`deny` must NOT be advertised (advertising a capability the gate would only block pollutes
+//! the context and invites the model to attempt it), yet its ENFORCEMENT entry must survive so the
+//! `before_tool_call` skill-read gate (`extension/decide.rs` `resolve_skill_read` →
+//! `skill::find_skill_path_match`) still governs reads of its files. This module does ONE parse of
+//! the `<available_skills>` blocks and feeds BOTH consumers from it (pi's
+//! `resolveSkillPromptEntries` returns `{ entries, prompt }`, `index.ts:2175`): the flat
+//! enforcement entry list AND the hide-sanitized prompt.
 
 use serde_json::json;
 
