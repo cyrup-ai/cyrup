@@ -136,12 +136,17 @@ async fn manual_compaction_reports_tokens_after_over_pi_s_raw_context() {
 }
 
 /// The auto/overflow path (`_runAutoCompaction`, agent-session.ts:2157) computes the field with the
-/// same expression, and the two blocks are byte-identical in `session.rs` — a fix applied to only
-/// one site would leave the other reporting the flattened number. Assert on the source so a future
-/// edit cannot silently un-fix half of it.
+/// same expression, and the two blocks are byte-identical — a fix applied to only one site would
+/// leave the other reporting the flattened number. Assert on the source so a future edit cannot
+/// silently un-fix half of it. The two paths live in `session/compaction.rs` (manual `/compact`)
+/// and `session/auto_compaction.rs` (the threshold/overflow trigger).
 #[test]
 fn both_compaction_paths_measure_the_raw_projection() {
-    let src = include_str!("../session.rs");
+    let src = [
+        include_str!("../session/compaction.rs"),
+        include_str!("../session/auto_compaction.rs"),
+    ]
+    .concat();
     let sites = src.matches("let estimated_tokens_after: u64").count();
     assert_eq!(
         sites, 2,

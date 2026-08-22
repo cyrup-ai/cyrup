@@ -1,7 +1,7 @@
 ---
-stage: aug
+stage: exec
 status: done
-updated: 2026-08-22 16:23
+updated: 2026-08-22 16:49
 ---
 
 # Decompose cyrup-session-svc src/session.rs Into Submodules
