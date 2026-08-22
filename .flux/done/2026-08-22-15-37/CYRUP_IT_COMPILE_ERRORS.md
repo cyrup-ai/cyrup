@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 14:00
+stage: qa
+status: completed
+updated: 2026-08-22 23:21
 ---
 
 # Fix All Errors In `cyrup-it --features it`

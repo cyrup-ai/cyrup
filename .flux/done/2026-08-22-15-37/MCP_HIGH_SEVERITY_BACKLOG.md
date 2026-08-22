@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 06:00
+stage: qa
+status: completed
+updated: 2026-08-22 23:21
 ---
 
 # Plan The Remaining High-Severity cyrup-mcp Backlog

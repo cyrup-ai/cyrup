@@ -1,7 +1,7 @@
 ---
 stage: qa
-status: needs-rework
-updated: 2026-08-22 18:06
+status: completed
+updated: 2026-08-22 23:21
 ---
 
 # Guard cyrup-core's Narrowed tokio Feature Set Against Silent Re-Widening
