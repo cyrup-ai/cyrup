@@ -53,6 +53,13 @@ pub use types::{
 #[cfg(test)]
 pub(crate) use files::trash_args;
 
+// Doc-only: the `Drop` rationale below is written against the guard that plays the same role for
+// the compaction cancel slot. `CompactionCancelGuard` is `pub(super)` and never re-exported, so
+// rustdoc still reports `links to private item` — which is the warning this link carried before
+// the split, and is `CARGO_DOC_WARNINGS.md`'s to resolve, not this task's.
+#[cfg(doc)]
+use compaction::CompactionCancelGuard;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 

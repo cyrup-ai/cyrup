@@ -4,6 +4,12 @@
 //! Split out of `session.rs` verbatim; these are the types [`crate`] re-exports alongside
 //! [`super::AgentSession`] itself.
 
+// Doc-only: the types below document themselves against the seam that produces them, but none of
+// them names `AgentSession` in code. `cfg(doc)` keeps the intra-doc links resolvable without an
+// `unused_imports` warning in a normal build.
+#[cfg(doc)]
+use super::AgentSession;
+
 use cyrup_core::{EntryId, ModelThinkingLevel, SessionId};
 use cyrup_provider::Model;
 

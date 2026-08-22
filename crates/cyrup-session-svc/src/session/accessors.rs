@@ -18,6 +18,11 @@ use crate::services::AgentSessionServices;
 
 use super::AgentSession;
 
+// Doc-only — see `types.rs`. `model_catalog`'s doc names the swappable provider; the original
+// `session.rs` had it in scope via `use crate::provider_swap::ProviderSwap` (session.rs:41).
+#[cfg(doc)]
+use crate::provider_swap::ProviderSwap;
+
 impl AgentSession {
     /// The current model address, or `None` when the session has no model at all.
     ///

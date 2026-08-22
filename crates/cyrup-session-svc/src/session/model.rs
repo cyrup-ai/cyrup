@@ -1,9 +1,9 @@
 //! Model selection, the model catalogs and model cycling.
 //!
 //! Pi `agent-session.ts` `setModel`/`scopedModels`/`cycleModel` + sdk.ts's provider install.
-//! Resolving a `/model` pattern, installing the owning provider into the live [`ProviderSwap`],
-//! the configured-auth checks that gate a candidate, attribution headers, and the `cycle_model`
-//! rotation over the scoped or available set.
+//! Resolving a `/model` pattern, installing the owning provider into the live
+//! [`crate::ProviderSwap`], the configured-auth checks that gate a candidate, attribution headers,
+//! and the `cycle_model` rotation over the scoped or available set.
 
 use cyrup_core::{ModelId, ModelRef, ModelThinkingLevel, ProviderId};
 use cyrup_ext::HostEvent;
