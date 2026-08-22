@@ -17,9 +17,7 @@
 //!
 //! Both tests assert OBSERVABLE behavior: that the future completes inside a timeout, and that a
 //! `get_state` issued after the swap reports the NEW session's id.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,36 +29,15 @@ use cyrup_ext::{
 use crate::run_rpc;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget};
+use cyrup_session_svc::{AgentSessionRuntime, SessionFactory, SessionTarget};
 use serde_json::{json, Value};
-use tempfile::TempDir;
 use tokio::io::AsyncWriteExt;
 
+use super::support::{base_config_no_ext, create_runtime, fixture, parse_lines, Fixture};
+
 // ---------------------------------------------------------------------------------------------
-// Fixture
+// Runtime builders
 // ---------------------------------------------------------------------------------------------
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
 
 fn faux_ok() -> Arc<dyn Provider> {
     let faux = Arc::new(FauxProvider::new());
@@ -69,25 +46,15 @@ fn faux_ok() -> Arc<dyn Provider> {
 }
 
 async fn build_runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
-    let factory = Arc::new(SessionFactory::new(faux_ok(), base_config(fx)));
-    AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("build runtime")
+    create_runtime(SessionFactory::new(faux_ok(), base_config_no_ext(fx)), SessionTarget::New).await
 }
 
 async fn build_runtime_with(
     fx: &Fixture,
     ext: Arc<dyn NativeExtension>,
 ) -> Arc<AgentSessionRuntime> {
-    let factory = Arc::new(SessionFactory::new(faux_ok(), base_config(fx)).with_native_extension(ext));
-    AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("build runtime")
-}
-
-fn parse_lines(bytes: &[u8]) -> Vec<Value> {
-    String::from_utf8(bytes.to_vec())
-        .expect("utf8 output")
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str::<Value>(l).expect("valid json line"))
-        .collect()
+    let factory = SessionFactory::new(faux_ok(), base_config_no_ext(fx)).with_native_extension(ext);
+    create_runtime(factory, SessionTarget::New).await
 }
 
 /// Feed `lines` to `run_rpc` over a REAL async pipe whose write half is then DROPPED (a genuine
@@ -307,10 +274,9 @@ async fn build_retrying_runtime(fx: &Fixture) -> Arc<AgentSessionRuntime> {
         faux_assistant_message(vec![faux_text("must not appear")], StopReason::Stop),
     ]);
     let provider: Arc<dyn Provider> = faux;
-    let factory = Arc::new(
-        SessionFactory::new(provider, base_config(fx)).cli_settings(slow_retry_settings()),
-    );
-    AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("build runtime")
+    let factory =
+        SessionFactory::new(provider, base_config_no_ext(fx)).cli_settings(slow_retry_settings());
+    create_runtime(factory, SessionTarget::New).await
 }
 
 /// The RPC `abort` verb, end to end, against a session sitting in provider-retry backoff.

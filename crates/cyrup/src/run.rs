@@ -103,6 +103,11 @@ pub async fn dispose_session(session: &AgentSession) {
 /// Drives the [`AgentSessionRuntime`] host so the session-replacing commands
 /// (`new_session`/`switch_session`/`fork`/`clone`) rebuild the active session and rebind (Pi
 /// `rpc-mode.ts` `runtimeHost`).
+///
+/// A read failure on `reader` (a broken pipe, an `EIO` on a serial/socket fd, a supervisor tearing
+/// the input fd down) propagates out of [`run_rpc`] and therefore out of here, so a command stream
+/// severed mid-protocol exits non-zero instead of being indistinguishable from a client that closed
+/// stdin cleanly. The runtime is disposed either way, before the error is returned.
 pub async fn run_rpc_dispatch<R, W>(
     runtime: &AgentSessionRuntime,
     reader: R,

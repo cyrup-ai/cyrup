@@ -1,6 +1,9 @@
-//! Shared fixtures for the mode-adapter suite: a tempdir project + agent dir, the wired
-//! [`AgentSessionRuntime`] builders every case drives, the JSONL sink readers the assertions parse
-//! with, and the in-memory duplex transport that stands in for real stdio.
+//! Shared fixtures for the whole crate-internal test tree: a tempdir project + agent dir, the
+//! wired [`AgentSessionRuntime`] builders every case drives, the JSONL sink readers the assertions
+//! parse with, and the in-memory duplex transport that stands in for real stdio.
+//!
+//! Lives at `tests::support` (not under `tests::modes`) because the `rpc_*` and `json_event`
+//! siblings drive the same runtime over the same wire and each used to carry its own copy.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -8,7 +11,7 @@ use std::sync::Arc;
 use crate::run_rpc;
 use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSessionRuntime, SessionConfig, SessionFactory};
+use cyrup_session_svc::{AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -33,6 +36,15 @@ pub(super) fn base_config(fx: &Fixture) -> SessionConfig {
     cfg
 }
 
+/// [`base_config`] with the ambient extension tree switched OFF — the host-seam and
+/// output-decoupling suites pin loop mechanics, so whatever extensions happen to be installed on
+/// the developer's machine must not join the session and emit events into the wire under test.
+pub(super) fn base_config_no_ext(fx: &Fixture) -> SessionConfig {
+    let mut cfg = base_config(fx);
+    cfg.no_extensions = true;
+    cfg
+}
+
 /// A [`cyrup_session_svc::ProviderResolver`] that hands back an offline faux provider for any id —
 /// stands in for the binary's `select_provider` seam so a cross-provider `set_model` can complete.
 pub(super) struct AnyFauxResolver;
@@ -41,6 +53,12 @@ impl cyrup_session_svc::ProviderResolver for AnyFauxResolver {
     fn resolve(&self, _provider_id: &str) -> Result<Arc<dyn Provider>, String> {
         Ok(Arc::new(FauxProvider::new()))
     }
+}
+
+/// The one place a test runtime is actually built: every per-file builder is a thin wrapper that
+/// only differs in how it dresses the [`SessionFactory`] before handing it over.
+pub(super) async fn create_runtime(factory: SessionFactory, target: SessionTarget) -> Arc<AgentSessionRuntime> {
+    AgentSessionRuntime::create(Arc::new(factory), target).await.expect("build runtime")
 }
 
 /// Build the multi-session runtime host the RPC adapter drives (Pi `rpc-mode.ts` `runtimeHost`).
@@ -57,11 +75,9 @@ pub(super) async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> Arc<
     let provider: Arc<dyn Provider> = faux;
     let cfg = base_config(fx);
     let target = cfg.target.clone();
-    let factory = Arc::new(
-        SessionFactory::new(provider, cfg)
-            .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>),
-    );
-    AgentSessionRuntime::create(factory, target).await.expect("build runtime")
+    let factory = SessionFactory::new(provider, cfg)
+        .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>);
+    create_runtime(factory, target).await
 }
 
 /// Build the RPC runtime with a native extension registered into every session it builds.
@@ -73,8 +89,7 @@ pub(super) async fn build_runtime_with_ext(
     let provider: Arc<dyn Provider> = faux;
     let cfg = base_config(fx);
     let target = cfg.target.clone();
-    let factory = Arc::new(SessionFactory::new(provider, cfg).with_native_extension(ext));
-    AgentSessionRuntime::create(factory, target).await.expect("build runtime")
+    create_runtime(SessionFactory::new(provider, cfg).with_native_extension(ext), target).await
 }
 
 /// Parse the produced sink bytes into one `serde_json::Value` per non-empty LF-delimited line.
@@ -88,6 +103,12 @@ pub(super) fn parse_lines(bytes: &[u8]) -> Vec<Value> {
 
 pub(super) fn type_of(v: &Value) -> &str {
     v.get("type").and_then(Value::as_str).unwrap_or("")
+}
+
+/// [`type_of`] with a self-describing default, for the json-event suite's `match kind(line)` arms
+/// where a type-less record should read as `<none>` rather than as an empty string.
+pub(super) fn kind(v: &Value) -> &str {
+    v.get("type").and_then(Value::as_str).unwrap_or("<none>")
 }
 
 /// Read one non-empty JSONL record from an async reader (test helper for the interactive RPC flow).

@@ -14,9 +14,17 @@
 //! - [`RpcClient`] — the OTHER end of that protocol (Pi `modes/rpc/rpc-client.ts`, SEAM-017): a
 //!   typed, id-correlated client that either spawns the agent in RPC mode or attaches to an
 //!   already-open transport, so an embedder never hand-rolls NDJSON framing.
+//! - [`to_json_event`] / [`is_upstream_wire_event`] — the shared wire projection both [`run_json`]
+//!   and [`run_rpc`] write every event through: the projection to the [`JsonAgentSessionEvent`]
+//!   shape that actually goes on the stream, plus the filter that keeps cyrup-only events off it.
+//!   Public so an embedder decoding the stream can reuse the same rules.
+//! - [`write_raw_stdout`] / [`flush_raw_stdout`] — the retrying protocol-stream writer the sync
+//!   sinks write through ([`run_print`], [`run_json`]; the rpc sink is a tokio `AsyncWrite` whose
+//!   own readiness machinery plays that role), so a transient `EAGAIN`/`EWOULDBLOCK`/`ENOBUFS` on a
+//!   non-blocking pipe never drops a protocol line (TOOL-037).
 //!
-//! All three are adapters over the same seam — no mode reaches behaviour the others structurally
-//! cannot (the "one seam" invariant).
+//! The three modes are adapters over the same seam — no mode reaches behaviour the others
+//! structurally cannot (the "one seam" invariant).
 #![forbid(unsafe_code)]
 
 mod error;

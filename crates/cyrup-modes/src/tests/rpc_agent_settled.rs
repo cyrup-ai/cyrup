@@ -10,9 +10,7 @@
 //!    (rpc-mode.ts:355-358) — and nowhere else. So the test holds the client's write half OPEN (no
 //!    EOF, the loop's only other exit) and asserts `run_rpc` returns anyway. Without the
 //!    `agent_settled` arm the adapter would run forever.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -23,10 +21,10 @@ use cyrup_ext::{CommandDescriptor, ExtError, HostCtx, HostEvent, HookOutcome, In
 use crate::run_rpc;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use cyrup_session_svc::{AgentSessionRuntime, SessionConfig, SessionFactory};
-use serde_json::Value;
-use tempfile::TempDir;
+use cyrup_session_svc::{AgentSessionRuntime, SessionFactory};
 use tokio::io::{AsyncWriteExt, BufReader};
+
+use super::support::{base_config_no_ext, create_runtime, fixture, parse_lines, type_of, Fixture};
 
 /// A native built-in exposing `/quitnow`, which calls the base-context `ctx.shutdown()` (Pi
 /// `ctx.shutdown()`, extensions/types.ts:344 → `runner.shutdown()`, runner.ts:656-662).
@@ -100,28 +98,6 @@ impl QuitExt {
     }
 }
 
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
-
 fn faux_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![
@@ -136,26 +112,13 @@ async fn runtime_with(
     ext: Option<Arc<QuitExt>>,
 ) -> Arc<AgentSessionRuntime> {
     let provider: Arc<dyn Provider> = faux_ok();
-    let cfg = base_config(fx);
+    let cfg = base_config_no_ext(fx);
     let target = cfg.target.clone();
     let mut factory = SessionFactory::new(provider, cfg);
     if let Some(e) = ext {
         factory = factory.with_native_extension(e as Arc<dyn NativeExtension>);
     }
-    AgentSessionRuntime::create(Arc::new(factory), target).await.expect("build runtime")
-}
-
-fn parse_lines(bytes: &[u8]) -> Vec<Value> {
-    String::from_utf8(bytes.to_vec())
-        .expect("utf8 output")
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .map(|l| serde_json::from_str::<Value>(l).expect("each line is valid json"))
-        .collect()
-}
-
-fn type_of(v: &Value) -> &str {
-    v.get("type").and_then(Value::as_str).unwrap_or("")
+    create_runtime(factory, target).await
 }
 
 /// An RPC client sees `agent_settled` on the wire, once per run, after the run's last `agent_end`.

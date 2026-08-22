@@ -12,7 +12,6 @@ authors.workspace = true
 workspace = true
 
 [dependencies]
-async-trait.workspace = true
 cyrup-core = { workspace = true }
 cyrup-ext = { workspace = true }
 # TOOL-037: pi's `writeRawStdout` retries `ENOBUFS`, which Rust has no `io::ErrorKind` for.
@@ -23,7 +22,6 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror = { workspace = true }
 tokio.workspace = true
-tokio-stream.workspace = true
 
 # SEAM-017: `RpcClient::stop` sends Pi's graceful `SIGTERM` before escalating to `SIGKILL`
 # (rpc-client.ts:149-156). `tokio::process::Child::kill` is SIGKILL-only and `libc::kill` is
@@ -37,4 +35,6 @@ cyrup-provider = { workspace = true, features = ["faux"] }
 # SEAM-024: the RPC `abort` test drives a session into a long auto-retry backoff, which needs the
 # `retry.baseDelayMs` knob off the settings seam. Test-only.
 cyrup-config = { workspace = true }
+# The RPC seam tests declare their own `NativeExtension` impls, whose trait methods are async.
+async-trait.workspace = true
 tempfile.workspace = true
