@@ -1,6 +1,7 @@
 [package]
 name = "cyrup-agent"
 description = "Turn-based agent loop: events, tool execution, hooks, queues (arch-02)"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,11 +1,6 @@
-//! cyrup-agent — the turn-based agent loop (arch-02; conformance: func-02).
-//!
-//! Ordered event stream, parallel/sequential tool execution, the `Hooks` mutating seam +
-//! notify-only `EventSubscriber`, steering/follow-up queues, abort/idle, and managed agent state.
-//!
-//! Entry point: [`Agent`] (built via [`AgentBuilder`]). The loop is provider-agnostic — it talks to
-//! a [`StreamFn`] (use [`ProviderStreamFn`] to wrap a `cyrup_provider::Provider`). No-panic policy
-//! is enforced crate-wide via `[workspace.lints]`.
+// The crate's rustdoc front page IS the README, so the two can never drift apart and every
+// ```rust block in it is compiled as a doctest by `cargo test -p cyrup-agent`.
+#![doc = include_str!("../README.md")]
 #![forbid(unsafe_code)]
 
 // MODULE-VISIBILITY POLICY. These modules are `pub` because downstream crates (notably
