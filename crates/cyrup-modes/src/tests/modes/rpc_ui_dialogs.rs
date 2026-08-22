@@ -201,7 +201,7 @@ async fn rpc_extension_ui_request_times_out_to_the_default_when_client_never_res
     // SEAM-030 — the `started.elapsed() < 2s` margin that used to follow is DELETED: it carried no
     // semantic content the `timeout(5s)` + `assert!(!resolved)` above does not already carry (the
     // dialog demonstrably settled on its own, unanswered), and it was the most flake-prone
-    // assertion in this file.
+    // assertion in the whole modes suite.
 
     // The loop is still alive and serving requests — the abandoned dialog never hung the session.
     client_tx.write_all(b"{\"type\":\"get_state\",\"id\":\"after\"}\n").await.unwrap();

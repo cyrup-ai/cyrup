@@ -1,7 +1,8 @@
 //! The RPC verb surface (R-11-011…016): each case scripts a request stream into `run_rpc` over a
 //! `Cursor` and asserts on the response envelopes and event lines it writes back — the prompt /
-//! abort / state / commands core, `fork`, the extended model-thinking-stats-session surface, and
-//! the shapes pi's `RpcSessionState` and `SessionStats` pin key-for-key.
+//! abort / state / commands core, `fork`, the extended model-thinking-stats-session surface,
+//! `compact`'s refusal path, and the shapes pi's `RpcSessionState` and `SessionStats` pin
+//! key-for-key.
 
 use std::io::Cursor;
 use std::sync::Arc;

@@ -1,7 +1,8 @@
-//! The fire-and-forget half of the `ui` capability: `notify`/`setStatus`/`setWidget`/`setTitle`/
-//! `set_editor_text` reach the wire with no correlated response, `set-header`/`set-footer`/
-//! `set-tools-expanded` deliberately never do, and each emitted request carries pi's own field
-//! shape — absent keys where pi's `JSON.stringify` drops an `undefined` property, never `null`.
+//! The fire-and-forget half of the `ui` capability (blocking half: [`super::rpc_ui_dialogs`]):
+//! `notify`/`setStatus`/`setWidget`/`setTitle`/`set_editor_text` reach the wire with no correlated
+//! response, `set-header`/`set-footer`/`set-tools-expanded` deliberately never do, and each emitted
+//! request carries pi's own field shape — absent keys where pi's `JSON.stringify` drops an
+//! `undefined` property, never `null`.
 
 use std::sync::Arc;
 
@@ -12,7 +13,8 @@ use cyrup_provider::faux::FauxProvider;
 /// `set-editor-text`/`paste-editor-text`) must ALSO reach the RPC client, exactly like Pi's own
 /// `notify`/`setStatus`/`setWidget`/`setTitle`/`setEditorText` RPC handlers, each of which just calls
 /// `output({type:"extension_ui_request", id, method, ...})` inline with no correlated response
-/// expected (`rpc-mode.ts:149-241`) — unlike `confirm`/`input`/`select`/`editor` above, none of these
+/// expected (`rpc-mode.ts:149-241`) — unlike the blocking `confirm`/`input`/`select`/`editor`
+/// half of the capability, whose transport [`super::rpc_ui_dialogs`] exercises, none of these
 /// calls block on a reply, so no `extension_ui_response` is ever sent back for them in this test.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
@@ -35,7 +37,8 @@ async fn rpc_fire_and_forget_ui_effects_reach_the_wire() {
 
     // notify → `{method:"notify", message, notifyType}` (rpc-mode.ts:149-157). None of these calls
     // block: `HostServices::notify` is a plain sync fire-and-forget send, called directly (no
-    // `spawn_blocking` needed, unlike `confirm`/`input`/`select`/`editor` above).
+    // `spawn_blocking` needed, unlike the blocking `confirm`/`input`/`select`/`editor` dialogs in
+    // `rpc_ui_dialogs`).
     host_services.notify("careful now", NotifyKind::Warning);
     let req = read_json_line(&mut client_reader).await;
     assert_eq!(req["type"], "extension_ui_request");

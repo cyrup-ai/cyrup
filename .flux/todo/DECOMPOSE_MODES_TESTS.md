@@ -1,7 +1,7 @@
 ---
-stage: aug
+stage: exec
 status: done
-updated: 2026-08-22 17:15
+updated: 2026-08-22 17:35
 ---
 
 # Decompose modes.rs Test File Into Submodules — comment rework
