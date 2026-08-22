@@ -16,7 +16,7 @@ impl<B: Backend> App<B> {
     /// it closed is real and worth keeping in view: those ops dispatch
     /// `HostEvent::Session{Start,Shutdown,BeforeSwitch,BeforeFork,Compact}` to every live
     /// extension's hook (`session.rs` `dispatch_notify`/`vetoed`), a guest SDK hook handler is
-    /// handed the SAME `Ctx` a tool/shortcut handler gets (`cyrup-ext-sdk/src/ctx.rs`), and a
+    /// handed the SAME `Ctx` a tool/shortcut handler gets (`cyrup-ext-sdk/src/ctx/`), and a
     /// `ctx.ui().*` call from inside one parks its task in `block_in_place` until the run loop
     /// answers `ui_rx` — which the run loop could not do while awaiting the op that was waiting for
     /// it. Any NEW arm added here that awaits a runtime or session-lifecycle op must go through
