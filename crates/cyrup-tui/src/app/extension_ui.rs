@@ -254,6 +254,25 @@ impl<B: Backend> App<B> {
         ));
     }
 
+    /// The extension seam HA-1 adds: a command registered from a LIVE handler (an MCP prompt
+    /// surfacing when its server connects mid-session).
+    ///
+    /// The tool leg needs no equivalent — a late tool raises the registry's dirty flag and
+    /// `AgentSession`'s turn-boundary refresh polls it. Commands have no such poll: the RPC catalog
+    /// reads `resolved_commands()` live, but the TUI `/` menu is a snapshot, so without this the
+    /// command is invocable by typing it in full and absent from the menu until a session swap.
+    ///
+    /// Carries no payload for the same reason: the handler rebuilds from
+    /// `session.slash_command_catalog()`, which is already the live truth.
+    pub fn install_commands_listener(
+        ext_host: &cyrup_ext::ExtensionHost,
+        changed: tokio::sync::mpsc::UnboundedSender<()>,
+    ) {
+        ext_host.add_commands_listener(std::sync::Arc::new(move || {
+            let _ = changed.send(());
+        }));
+    }
+
     /// Render one contained extension fault into the transcript — Pi `showExtensionError`
     /// (`interactive-mode.ts:2545-2560`), whose copy is
     /// `Extension "${extensionPath}" error: ${error}` in the `error` colour.

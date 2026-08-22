@@ -1,6 +1,43 @@
 use super::*;
 
 impl<B: Backend> App<B> {
+    /// A command was registered from a live extension handler (HA-1). Re-read the catalog.
+    ///
+    /// Coalescing is the channel's: several registrations in one burst — an MCP server exposing
+    /// eight prompts on connect — each send a `()`, and each rebuild re-reads the same live
+    /// catalog, so a late one is never wrong, only redundant. Rebuilding is a map walk over an
+    /// already-materialised `Vec`, which is why this is not worth debouncing.
+    pub(crate) fn on_commands_changed(&mut self, ctx: &super::run::RunCtx) {
+        let gate = ctx.session.services().settings.effective().enable_skill_commands();
+        let session = std::sync::Arc::clone(&ctx.session);
+        self.rebuild_command_registry(&session, gate);
+    }
+
+    /// Rebuild the `/` menu's dynamic half from the session's live catalog.
+    ///
+    /// ONE implementation, four callers: boot ([`Self::seed_session_ui`]), session swap, the
+    /// `enableSkillCommands` toggle, and — since HA-1 — a late command registration arriving from a
+    /// live extension handler. The first three set the registry at fixed points in the loop's
+    /// control flow; the fourth is the one that made a shared method worth extracting, because a
+    /// fourth open-coded copy is how the three drift apart.
+    ///
+    /// `slash_command_catalog()` reads `resolved_commands()` live, so nothing needs to be
+    /// invalidated first — the rebuild simply re-reads the truth.
+    pub(crate) fn rebuild_command_registry(
+        &mut self,
+        session: &Arc<AgentSession>,
+        enable_skill_commands: bool,
+    ) {
+        self.state
+            .editor
+            .set_registry(crate::commands::CommandRegistry::with_dynamic(
+                crate::commands::dynamic_commands_from_catalog_gated(
+                    &session.slash_command_catalog(),
+                    enable_skill_commands,
+                ),
+            ));
+    }
+
     /// The remaining [`Self::execute_command`] arms (§7.1): login, model/thinking cycling,
     /// settings writes, and the small session conveniences. Arm bodies moved verbatim.
     pub(crate) async fn execute_misc_command(&mut self, cmd: AppCommand, session: &Arc<AgentSession>) {
@@ -212,14 +249,9 @@ impl<B: Backend> App<B> {
                 // (`interactive-mode.ts:613`); Pi rebuilds the autocomplete provider on the change,
                 // so rebuild the registry from the SAME catalog with the new gate.
                 if id == "enableSkillCommands" {
-                    self.state
-                        .editor
-                        .set_registry(crate::commands::CommandRegistry::with_dynamic(
-                            crate::commands::dynamic_commands_from_catalog_gated(
-                                &session.slash_command_catalog(),
-                                value == "true",
-                            ),
-                        ));
+                    // The NEW gate value, not the effective one: the setting has not been
+                    // committed yet at this point.
+                    self.rebuild_command_registry(session, value == "true");
                 }
                 // `transport` is live in Pi too, and it is the ONLY row whose live half touches the
                 // agent rather than the UI: `onTransportChange` persists the setting AND assigns

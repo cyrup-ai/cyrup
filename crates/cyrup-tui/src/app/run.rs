@@ -19,6 +19,8 @@ pub(crate) struct RunCtx {
     pub(crate) ui_tx: tokio::sync::mpsc::UnboundedSender<UiRequest>,
     pub(crate) ui_effect_tx: tokio::sync::mpsc::UnboundedSender<UiEffect>,
     pub(crate) ext_error_tx: tokio::sync::mpsc::UnboundedSender<cyrup_ext::ExtensionError>,
+    /// HA-1's re-install handle, kept beside `ext_error_tx` for the same reason.
+    pub(crate) commands_changed_tx: tokio::sync::mpsc::UnboundedSender<()>,
     pub(crate) overlay_tx: tokio::sync::mpsc::UnboundedSender<cyrup_session_svc::OverlayRequest>,
     pub(crate) theme_switch_tx: tokio::sync::mpsc::UnboundedSender<cyrup_resources::Theme>,
     pub(crate) shortcut_status_tx: tokio::sync::mpsc::UnboundedSender<String>,
@@ -70,6 +72,11 @@ impl App<InlineBackend<Stdout>> {
         // `ui_tx` is: a replacement session brings a fresh `ExtensionHost`.
         let (ext_error_tx, mut ext_error_rx) =
             tokio::sync::mpsc::unbounded_channel::<cyrup_ext::ExtensionError>();
+        // The SIXTH extension seam (HA-1): a command registered from a live handler. Re-installed
+        // on session swap below, for the same reason `ext_error_tx` is — a replacement session
+        // brings a fresh `ExtensionHost`, and a listener on the old one notifies nothing.
+        let (commands_changed_tx, mut commands_changed_rx) =
+            tokio::sync::mpsc::unbounded_channel::<()>();
         // The FOURTH extension seam: an interactive modal an extension owns the state of and this
         // loop owns the terminal for (Pi `ctx.ui.custom(factory, { overlay: true, … })`,
         // `interactive-mode.ts:2719`). `LiveHostServices::open_overlay` blocks the extension's OWN
@@ -105,6 +112,10 @@ impl App<InlineBackend<Stdout>> {
         // `select!` arm below expresses as a `pending()` future rather than a spinning interval.
         let overlay_tick: Option<tokio::time::Interval> = None;
         Self::install_error_listener(&session.services().ext_host, ext_error_tx.clone());
+        Self::install_commands_listener(
+            &session.services().ext_host,
+            commands_changed_tx.clone(),
+        );
         self.seed_session_ui(&session, runtime.as_ref()).await;
         self.draw_synchronized()?;
         // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
@@ -192,6 +203,7 @@ impl App<InlineBackend<Stdout>> {
             ui_tx,
             ui_effect_tx,
             ext_error_tx,
+            commands_changed_tx,
             overlay_tx,
             theme_switch_tx,
             shortcut_status_tx,
@@ -323,6 +335,7 @@ impl App<InlineBackend<Stdout>> {
                 Some(req) = ui_rx.recv() => self.on_ui_request(req)?,
                 Some(effect) = ui_effect_rx.recv() => self.on_ui_effect(&mut ctx, effect)?,
                 Some(err) = ext_error_rx.recv() => self.on_ext_error(err)?,
+                Some(()) = commands_changed_rx.recv() => self.on_commands_changed(&ctx),
                 Some(msg) = shortcut_status_rx.recv() => self.on_shortcut_status(msg)?,
                 Some(outcome) = compact_rx.recv() => self.on_compact_outcome(outcome)?,
                 Some(outcome) = lifecycle_rx.recv() => self.on_lifecycle_outcome(outcome)?,

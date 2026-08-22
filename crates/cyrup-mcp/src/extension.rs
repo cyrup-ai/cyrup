@@ -111,6 +111,21 @@ pub struct McpExtension {
     /// which the runtime has no reachable handle to install [`crate::registration::McpToolDispatch`]
     /// into and every registered MCP tool would answer `MCP not initialized` forever (MCP-214).
     dispatch: Mutex<Option<Arc<ToolDispatch>>>,
+    /// The post-`init` registration handle (HA-1 / MCP-037), stashed the same way
+    /// [`Self::set_host_services`] stashes its backend. `None` on a host that never bound one
+    /// (a test harness constructing the extension directly), which every caller treats as
+    /// "the surface is whatever `init` registered" — the pre-HA-1 behaviour, degraded gracefully.
+    late_registrar: Mutex<Option<Arc<dyn cyrup_ext::LateRegistrar>>>,
+    /// A `Weak` to this extension, bound by [`Self::into_arc`] — which is construction itself, not
+    /// a step a caller can forget. Every `Arc<McpExtension>` in the tree comes through it.
+    ///
+    /// The `onToolMetadataUpdated` listener lives in [`McpState`], which this extension owns, so
+    /// the listener cannot hold a STRONG handle without cycling. It cannot take one from its
+    /// caller either: every construction site coerces to `Arc<dyn NativeExtension>` in the same
+    /// expression that builds the `Arc`, and every holder downstream — including
+    /// `crates/cyrup/src/main.rs` — has only the trait object, which does not downcast back.
+    /// Binding the `Weak` at construction is what makes [`Self::install_surface_sync`] callable.
+    self_weak: OnceLock<std::sync::Weak<McpExtension>>,
     /// `resolveMcpToolRenderOptions(settings)`, resolved **once, at load**, from the same early
     /// config `init` registered the surface from (MCP-238).
     ///
@@ -133,6 +148,111 @@ pub struct McpExtension {
 }
 
 impl McpExtension {
+    /// `syncToolSurface` (MCP-036 / MCP-043) — re-resolve the surface and register what CHANGED,
+    /// from a live handler.
+    ///
+    /// Call after anything that can change the discovered surface: `/mcp reconnect`,
+    /// `mcp({connect:"x"})`, a lazy first call that connects, a `tools/list_changed` notification.
+    ///
+    /// A no-op returning `false` when no registrar was bound (HA-1 absent, or a test harness), so
+    /// every caller can call it unconditionally and get the pre-HA-1 behaviour rather than an
+    /// error.
+    ///
+    /// The FINGERPRINT DIFF is the point, not an optimisation. Re-registering a tool with identical
+    /// bytes still rewrites `Agent::set_tools` and the base system prompt, which invalidates the
+    /// provider's prompt-cache prefix — so upstream compares `directToolFingerprint` and registers
+    /// only on a difference, and `syncProxyTool` compares the description string for the same
+    /// reason. Registering unconditionally here would be correct and expensive on every reconnect.
+    pub fn sync_tool_surface(&self) -> bool {
+        let Some(registrar) = self.late_registrar.lock().ok().and_then(|g| g.clone()) else {
+            return false;
+        };
+
+        // `settings.freezeDirectTools`: once latched, a reconnect never rebuilds the surface and
+        // only `mcp({connect})` rediscovers — upstream logs exactly that advice when it fires.
+        if self.direct_tools_frozen() {
+            return false;
+        }
+
+        // REUSE this generation's executor. `init` stashed it and whoever owns the generation
+        // installs into it; a fresh one would be an empty `OnceLock` nothing can install, so every
+        // tool this pass registers would answer `MCP not initialized` forever.
+        //
+        // `None` means `init` has not run this generation. Refuse rather than mint: minting IS the
+        // defect, and a caller that sees `false` has lost nothing — the surface is still whatever
+        // `init` will register when it runs.
+        //
+        // Checked HERE, with the other two cheap guards, and before the config load below: it is a
+        // lock and a clone, while the load re-reads `mcp.json` and `mcp-cache.json` from disk.
+        let Some(dispatch) = self.dispatch() else {
+            tracing::debug!("MCP: no executor for this generation yet; surface sync skipped");
+            return false;
+        };
+
+        // Re-read config AND cache from disk, exactly as `init` does: a reconnect that discovered
+        // new tools wrote them to `mcp-cache.json`, and that file is the whole input to
+        // `resolve_direct_tools`. Reusing the captured early config would resolve the surface the
+        // session started with, which is the bug this method exists to fix.
+        let config = self.programmatic_config.clone().unwrap_or_else(|| {
+            let explicit = crate::config::config_path_from_argv(std::env::args()).map(PathBuf::from);
+            let mut ctx =
+                crate::config::ConfigContext::new(self.dirs.clone(), explicit.as_deref());
+            if let Some(home) = self.home.clone() {
+                ctx = ctx.with_home(home);
+            }
+            ctx.load().config
+        });
+
+        // Seed the sink with what the model is CURRENTLY shown, so the pass registers only
+        // differences. These three slots are the extension's memory of the last pass.
+        let mut sink = crate::registration::LateSink {
+            registrar,
+            known_tools: self
+                .registered_direct_tools
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
+            known_proxy: self.proxy_tool_description.lock().ok().and_then(|g| g.clone()),
+            known_commands: self
+                .registered_prompt_commands
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default(),
+        };
+        let surface: RegisteredSurface =
+            crate::registration::register_surface(&mut sink, &self.dirs, &config, dispatch);
+
+        // ADOPT the new surface, exactly as `init` does: these slots ARE the diff's input next
+        // time, so a pass that registers and forgets would re-register everything on every call.
+        if let Ok(mut slot) = self.registered_direct_tools.lock() {
+            *slot = surface.direct_tool_fingerprints.clone();
+        }
+        if let Ok(mut slot) = self.registered_prompt_commands.lock() {
+            *slot = surface
+                .prompt_commands
+                .iter()
+                .map(|spec| (spec.command_name.clone(), spec.server_name.clone()))
+                .collect();
+        }
+        if let Ok(mut slot) = self.proxy_tool_description.lock() {
+            slot.clone_from(&surface.proxy_description);
+        }
+        // `self.dispatch` is deliberately NOT touched. This pass reused the generation's
+        // executor rather than minting one, so there is nothing new to adopt — and replacing the
+        // handle would discard the installed instance, which MCP-214 calls the ONLY handle to the
+        // `Arc<ToolDispatch>` that this generation's tools closed over.
+
+        let changed = !surface.tool_names.is_empty() || !surface.command_names.is_empty();
+        if changed {
+            tracing::debug!(
+                "MCP: surface re-synced — {} tool(s), {} command(s) re-registered",
+                surface.tool_names.len(),
+                surface.command_names.len()
+            );
+        }
+        changed
+    }
+
     /// Construct the adapter for an already-resolved `<agent_dir>` and session `cwd`.
     #[must_use]
     pub fn new(dirs: McpDirs) -> Self {
@@ -157,9 +277,30 @@ impl McpExtension {
             proxy_tool_description: Mutex::new(None),
             direct_tools_frozen: AtomicBool::new(false),
             dispatch: Mutex::new(None),
+            late_registrar: Mutex::new(None),
+            self_weak: OnceLock::new(),
             render_options: Mutex::new(crate::renderers::McpToolRenderOptions::default()),
             home: None,
         }
+    }
+
+    /// Wrap into the `Arc` an extension is used as, binding the self-handle in the same step.
+    ///
+    /// The ONLY supported way to build an `Arc<McpExtension>`. `self_weak` cannot be bound
+    /// after the fact from outside this crate — it is private — and binding it is what makes
+    /// [`Self::install_surface_sync`] able to install the `onToolMetadataUpdated` listener at all.
+    ///
+    /// Folding it into construction is deliberate rather than convenient. `mcp_extension_for_env`
+    /// and the `cyrup-it` harness each built their own `Arc`, the harness's doc comment asserted
+    /// the two were identical, and once the binding was added to one of them they silently were
+    /// not — the harness kept compiling and its tests kept passing, on the unbound branch. A
+    /// public setter would have fixed that instance and left the next constructor free to forget.
+    /// One constructor cannot diverge.
+    pub fn into_arc(self) -> Arc<Self> {
+        let ext = Arc::new(self);
+        // Infallible: `ext` was created on the line above, so nothing else holds the `OnceLock`.
+        let _ = ext.self_weak.set(Arc::downgrade(&ext));
+        ext
     }
 
     /// Pin the home directory the config ladder's home-anchored rungs resolve against (see
@@ -263,6 +404,38 @@ impl McpExtension {
     #[must_use]
     pub fn dispatch(&self) -> Option<Arc<ToolDispatch>> {
         self.dispatch.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// Wire `onToolMetadataUpdated` -> `syncToolSurface` (HA-1's production caller).
+    ///
+    /// This is `startInitialization`'s **step 11**, `setMetadataListChangedListener` — installed
+    /// after the state commits, so a hook firing mid-build cannot observe a half-installed surface
+    /// (the ordering `runtime.rs:200` documents). `runtime::initialize_mcp` calls this on the
+    /// committed [`McpState`] exactly as it calls [`Self::dispatch`] for MCP-214's dispatcher.
+    ///
+    /// Upstream's chain is `manager.setMetadataListChangedListener(...)` ->
+    /// `onToolMetadataUpdated` -> `syncToolSurface` -> `pi.registerTool`. Every link now exists on
+    /// the cyrup side; this call is the one that closes it. `execute_connect` already fires the
+    /// notification (`proxy.rs:2881`, `notify_tool_metadata_updated(server, "proxy-connect")`), so
+    /// once this listener is installed a mid-session connect surfaces its tools at the next turn
+    /// boundary without a restart.
+    ///
+    /// Weak on the extension so the listener — owned by the state, which the extension owns —
+    /// cannot form a cycle that keeps either alive.
+    pub fn install_surface_sync(&self, state: &Arc<McpState>) {
+        let Some(weak) = self.self_weak.get().cloned() else {
+            // Built without `into_arc` — the in-crate unit tests hold the value directly rather
+            // than as an `Arc`. Nothing to install: with no self handle the listener could not
+            // call back.
+            tracing::debug!("MCP: no self handle bound; surface sync listener not installed");
+            return;
+        };
+        state.set_tool_metadata_listener(Some(Arc::new(move |server: &str, reason: &str| {
+            let Some(ext) = weak.upgrade() else { return };
+            if ext.sync_tool_surface() {
+                tracing::debug!(server, reason, "MCP: tool surface re-synced after metadata update");
+            }
+        })));
     }
 
     /// `session_start`'s generation protocol, abort-before-await (MCP-008).
@@ -460,8 +633,14 @@ impl NativeExtension for McpExtension {
             ctx.load().config
         });
 
-        let surface: RegisteredSurface =
-            crate::registration::register_surface(api, &self.dirs, &config);
+        // A NEW generation gets a NEW executor: this pass mints fresh tool objects, and the
+        // dispatch they read is installed once this generation's `McpState` exists.
+        let surface: RegisteredSurface = crate::registration::register_surface(
+            api,
+            &self.dirs,
+            &config,
+            Arc::new(crate::registration::ToolDispatch::default()),
+        );
         tracing::debug!(
             "MCP: registered {} tool(s) and {} command(s) from disk",
             surface.tool_names.len(),
@@ -506,12 +685,11 @@ impl NativeExtension for McpExtension {
             );
         }
 
-        // Every registered tool needs its renderer DECLARED here — cyrup splits upstream's per-tool
-        // `renderCall`/`renderResult` arguments into a declaration plus a name-keyed serve, so a
-        // tool without this call has an unreachable renderer (MCP-036).
-        for name in &surface.tool_names {
-            api.register_tool_renderer(name.clone());
-        }
+        // Renderers are DECLARED inside `register_surface`, beside each registration (MCP-036).
+        // They used to be declared here, in a second loop over `surface.tool_names` — which worked
+        // only because `init` was the sole caller. HA-1 gave the same pass a second, late caller
+        // with no such loop, so a declaration that lives outside the pass exists on one path and
+        // not the other.
 
         // `startLoadTimeInitialization` (MCP-012): pre-warm ONLY when some enabled server declares
         // `lifecycle: "eager" | "keep-alive"`. Everything else connects lazily on first call, which
@@ -598,6 +776,15 @@ impl NativeExtension for McpExtension {
     fn set_host_services(&self, services: Arc<dyn cyrup_ext::host::HostServices>) {
         let _ = self.host_services.set(services);
     }
+
+    /// Bind the post-`init` registration handle (HA-1 / MCP-037). Also called before
+    /// [`Self::init`], and for the same reason: `init` may pre-warm an eager server, and the
+    /// connection that completes must be able to surface the tools it discovered.
+    fn set_late_registrar(&self, registrar: Arc<dyn cyrup_ext::LateRegistrar>) {
+        if let Ok(mut slot) = self.late_registrar.lock() {
+            *slot = Some(registrar);
+        }
+    }
 }
 
 /// The construction gate — `cyrup_mcp::mcp_extension_for_env(...)`, mirroring
@@ -622,7 +809,9 @@ pub fn mcp_extension_for_env(
     cwd: PathBuf,
 ) -> Option<Arc<dyn NativeExtension>> {
     let dirs = McpDirs::new(agent_dir.to_path_buf(), cwd);
-    Some(Arc::new(McpExtension::with_config(dirs, config)) as Arc<dyn NativeExtension>)
+    // `into_arc` — never a bare `Arc::new` — because it is what binds the self-handle the metadata
+    // listener needs, and this coercion to `Arc<dyn NativeExtension>` is one-way.
+    Some(McpExtension::with_config(dirs, config).into_arc() as Arc<dyn NativeExtension>)
 }
 
 #[cfg(test)]
