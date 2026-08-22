@@ -207,13 +207,13 @@ Use the single-task mode steps above as each subagent's `task` string, substitut
 ## HARD CONSTRAINTS
 
 - **Path**: All `write`/`edit` file paths MUST use the exact `FLUX_BASE` value printed by the STEP 1 bash output (e.g. `FLUX_BASE=/Users/...`). Copy it character-for-character — never reconstruct it from `cwd` or memory.
-- `/flux/exec` MUST NOT use any `git` commands. MUST NOT modify the task file content (frontmatter status updates are the only exception). MUST NOT expand scope beyond what is written in the task. MUST NOT write to paths outside what the task explicitly specifies. If you find yourself about to do any of these things, stop immediately.
+- `/exec` MUST NOT use any `git` commands. MUST NOT modify the task file content (frontmatter status updates are the only exception). MUST NOT expand scope beyond what is written in the task. MUST NOT write to paths outside what the task explicitly specifies. If you find yourself about to do any of these things, stop immediately.
 
 ## Propose next step
 
-Then propose the next step: `/flux/qa` (include arguments if needed).
+Then propose the next step: `/qa` (include arguments if needed).
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

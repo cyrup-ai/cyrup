@@ -90,13 +90,13 @@ Summarize completion. In amend mode, note "Amended previous commit" instead of "
 
 ## HARD CONSTRAINT
 
-`/flux/commit` MUST NOT push to any remote unless the user explicitly asks. MUST NOT modify any source files or task files. The only permitted operations are reading git history, staging files, and creating/amending a commit. Write the commit message inline — never via shell variables.
+`/commit` MUST NOT push to any remote unless the user explicitly asks. MUST NOT modify any source files or task files. The only permitted operations are reading git history, staging files, and creating/amending a commit. Write the commit message inline — never via shell variables.
 
 ## Propose next step
 
-Then propose the next step: `/flux/create-pr` (include arguments if needed).
+Then propose the next step: `/create-pr` (include arguments if needed).
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

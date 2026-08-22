@@ -13,18 +13,25 @@ Collapses every commit on your branch that hasn't landed on the default branch y
 ```bash
 BRANCH=$(git branch --show-current)
 TICKET=$(echo "$BRANCH" | grep -oE '[A-Z]+-[0-9]+' | head -1 || echo "")
-DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo "main")
+# Default branch WITHOUT `gh`: the clone's remote HEAD, then ask the remote, then fall back.
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | sed -n 's|.*HEAD branch: ||p')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH=main
+# A fresh container clone often has ONLY the checked-out branch, so materialise the base ref.
+git fetch origin "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
+# Compare against the REMOTE ref: a local `main` may be absent in a fresh clone, or stale.
+BASE="origin/$DEFAULT_BRANCH"
 echo "BRANCH: $BRANCH"
 echo "TICKET: $TICKET"
 echo "DEFAULT_BRANCH: $DEFAULT_BRANCH"
 
 # Commits on our branch that aren't on the default branch
-COMMIT_COUNT=$(git log "$DEFAULT_BRANCH"..HEAD --oneline | wc -l | tr -d ' ')
+COMMIT_COUNT=$(git log "$BASE"..HEAD --oneline | wc -l | tr -d ' ')
 echo "Commits to squash: $COMMIT_COUNT"
-git log "$DEFAULT_BRANCH"..HEAD --oneline
+git log "$BASE"..HEAD --oneline
 
 # Files we touch
-git diff "$DEFAULT_BRANCH" --stat
+git diff "$BASE" --stat
 ```
 
 **Guards — stop if any of the following are true:**
@@ -65,10 +72,10 @@ If `$REMOTE_AHEAD` > 0 → **stop** and inform the user:
 >
 > **What to do first:**
 >
-> 1. Run `/flux/rebase` to bring your branch up to date with the latest `$DEFAULT_BRANCH` while incorporating the remote's changes.
-> 2. Once your branch is in sync, run `/flux/squash-commits` again.
+> 1. Run `/rebase` to bring your branch up to date with the latest `$DEFAULT_BRANCH` while incorporating the remote's changes.
+> 2. Once your branch is in sync, run `/squash-commits` again.
 >
-> Alternatively, run `git pull --rebase origin $BRANCH` to sync with the remote, then re-run `/flux/squash-commits`.
+> Alternatively, run `git pull --rebase origin $BRANCH` to sync with the remote, then re-run `/squash-commits`.
 
 If `$REMOTE_AHEAD` == 0 (or the remote branch doesn't exist yet), continue to STEP 4.
 
@@ -78,7 +85,7 @@ Display the commits that will be squashed:
 
 ```bash
 echo "The following $COMMIT_COUNT commits will be squashed into one:"
-git log "$DEFAULT_BRANCH"..HEAD --oneline
+git log "$BASE"..HEAD --oneline
 ```
 
 `ask_user_question` — question: "Squash these $COMMIT_COUNT commits into one?" / header: "Confirm squash" / options:
@@ -91,7 +98,7 @@ git log "$DEFAULT_BRANCH"..HEAD --oneline
 Collect all commit subjects and bodies, in chronological order (oldest first), and format as a bulleted list:
 
 ```bash
-SQUASH_MSG=$(git log "$DEFAULT_BRANCH"..HEAD --format="- %s%n%b" --reverse | sed '/^$/d' | sed 's/^- -/  -/')
+SQUASH_MSG=$(git log "$BASE"..HEAD --format="- %s%n%b" --reverse | sed '/^$/d' | sed 's/^- -/  -/')
 echo "Proposed commit message:"
 echo "---"
 echo "$SQUASH_MSG"
@@ -108,7 +115,7 @@ echo "---"
 Perform the squash using a soft reset to the merge base, then commit:
 
 ```bash
-MERGE_BASE=$(git merge-base HEAD "$DEFAULT_BRANCH")
+MERGE_BASE=$(git merge-base HEAD "$BASE")
 echo "Merge base: $MERGE_BASE"
 git reset --soft "$MERGE_BASE"
 git commit -m "$SQUASH_MSG"
@@ -122,11 +129,11 @@ Confirm the squash produced exactly 1 commit and that all changes are intact:
 
 ```bash
 echo "Commits on branch after squash:"
-git log "$DEFAULT_BRANCH"..HEAD --oneline
+git log "$BASE"..HEAD --oneline
 
 echo ""
 echo "Changed files vs $DEFAULT_BRANCH:"
-git diff "$DEFAULT_BRANCH" --stat
+git diff "$BASE" --stat
 ```
 
 Expected: exactly 1 commit in the log. Changed files should match what was there before the squash. If the log shows more than 1 commit or the diff looks wrong — stop and investigate before pushing.
@@ -166,13 +173,13 @@ Report:
 
 ## HARD CONSTRAINT
 
-`/flux/squash-commits` MUST NOT modify commit content beyond the squash itself. MUST NOT commit to `$DEFAULT_BRANCH`. MUST NOT use `git push --force` (use `--force-with-lease` when updating an existing remote branch). MUST NOT touch any commits already present on `$DEFAULT_BRANCH`.
+`/squash-commits` MUST NOT modify commit content beyond the squash itself. MUST NOT commit to `$DEFAULT_BRANCH`. MUST NOT use `git push --force` (use `--force-with-lease` when updating an existing remote branch). MUST NOT touch any commits already present on `$DEFAULT_BRANCH`.
 
 ## Propose next step
 
-Then propose the next step: `/flux/create-pr` (include arguments if needed).
+Then propose the next step: `/create-pr` (include arguments if needed).
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`, `/flux/squash-commits`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

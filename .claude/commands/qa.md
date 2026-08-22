@@ -187,20 +187,20 @@ Prompt each subagent with the single-task mode steps above as its `task` string,
 ## HARD CONSTRAINTS
 
 - **Path**: All file operations MUST use the exact `FLUX_BASE` value printed by the STEP 1 bash output (e.g. `FLUX_BASE=/Users/...`). Copy it character-for-character — never reconstruct it from `cwd` or memory.
-- `/flux/qa` is a **review-only** command. You MUST NOT write or modify any source files. The only permitted file operations are: updating the task file's frontmatter, updating the task file body to remove completed items, and moving the task file to `$FLUX_BASE/done/`. No git commands under any circumstances.
+- `/qa` is a **review-only** command. You MUST NOT write or modify any source files. The only permitted file operations are: updating the task file's frontmatter, updating the task file body to remove completed items, and moving the task file to `$FLUX_BASE/done/`. No git commands under any circumstances.
 
 ## Propose next steps
 
 After QA completes, present the user with two options:
 
 **Option A — Continue PIPELINE A (fix regressions):**
-`/flux/tests` — run the test suite and fix regressions introduced by this branch before committing.
+`/tests` — run the test suite and fix regressions introduced by this branch before committing.
 
 **Option B — Start PIPELINE B (self-review your changes):**
-`/flux/review` → `/flux/address-feedback` → `/flux/ask all` → `/flux/exec` → `/flux/qa` → `/flux/commit`
+`/review` → `/address-feedback` → `/ask all` → `/exec` → `/qa` → `/commit`
 Start here to review your own changes before creating a PR.
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

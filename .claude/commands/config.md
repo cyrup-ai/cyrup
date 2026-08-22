@@ -55,7 +55,7 @@ echo "=== $FLUX_BASE/config.env ==="
 cat "$FLUX_BASE/config.env"
 ```
 
-Use `ask_user_question` — question: "Config file created at `$FLUX_BASE/config.env`. Please open it, fill in your value, then re-run `/flux/config` to verify. Ready to continue?" / header: "Edit config" / options:
+Use `ask_user_question` — question: "Config file created at `$FLUX_BASE/config.env`. Please open it, fill in your value, then re-run `/config` to verify. Ready to continue?" / header: "Edit config" / options:
 
 - `Done, verify now` — re-read `$FLUX_BASE/config.env`, jump to STEP 4
 - `Exit` — stop
@@ -104,4 +104,4 @@ All //flux commands will read this file automatically via:
 
 ## HARD CONSTRAINT
 
-`/flux/config` MUST NOT modify any source files, task files, or any file outside of `$FLUX_BASE/config.env`. The only permitted file operation is writing/overwriting `$FLUX_BASE/config.env`. No git commands. No task creation.
+`/config` MUST NOT modify any source files, task files, or any file outside of `$FLUX_BASE/config.env`. The only permitted file operation is writing/overwriting `$FLUX_BASE/config.env`. No git commands. No task creation.

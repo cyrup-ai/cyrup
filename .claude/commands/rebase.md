@@ -12,17 +12,24 @@ Replays your branch commits on top of the latest default branch, preserving each
 
 ```bash
 BRANCH=$(git branch --show-current)
-TICKET=$(echo "$BRANCH" | grep -oE ‘[A-Z]+-[0-9]+’ | head -1 || echo "")
-DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq ‘.defaultBranchRef.name’ 2>/dev/null || echo "main")
+TICKET=$(echo "$BRANCH" | grep -oE '[A-Z]+-[0-9]+' | head -1 || echo "")
+# Default branch WITHOUT `gh`: the clone's remote HEAD, then ask the remote, then fall back.
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | sed -n 's|.*HEAD branch: ||p')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH=main
+# A fresh container clone often has ONLY the checked-out branch, so materialise the base ref.
+git fetch origin "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
+# Compare against the REMOTE ref: a local `main` may be absent in a fresh clone, or stale.
+BASE="origin/$DEFAULT_BRANCH"
 echo "BRANCH: $BRANCH"
 echo "TICKET: $TICKET"
 echo "DEFAULT_BRANCH: $DEFAULT_BRANCH"
 
 # Commits on our branch (will be replayed)
-git log "$DEFAULT_BRANCH"..HEAD --oneline
+git log "$BASE"..HEAD --oneline
 
 # Files we touch
-git diff "$DEFAULT_BRANCH" --stat
+git diff "$BASE" --stat
 ```
 
 Record: the commit list and changed files. Used for verification after the rebase.
@@ -47,7 +54,7 @@ If the tree is already clean, continue to STEP 3.
 ## STEP 3: Sync local default branch with origin
 
 ```bash
-git fetch origin "$DEFAULT_BRANCH":"$DEFAULT_BRANCH"
+git fetch origin "$BASE":"$BASE"
 ```
 
 > If this fails because the local branch has diverged from origin, use `git fetch origin "$DEFAULT_BRANCH":"$DEFAULT_BRANCH" --force`.
@@ -61,10 +68,10 @@ Overlap of “files changed on `$DEFAULT_BRANCH` since the merge base” and “
 
 ```bash
 # Files changed on default branch since our branch diverged
-git diff --name-only HEAD...”$DEFAULT_BRANCH”
+git diff --name-only HEAD..."$BASE"
 
 # Files changed on our branch
-git diff --name-only “$DEFAULT_BRANCH”..HEAD
+git diff --name-only "$BASE"..HEAD
 ```
 
 For any file appearing in **both** lists: read both sides to understand intent before rebasing.
@@ -72,7 +79,7 @@ For any file appearing in **both** lists: read both sides to understand intent b
 ## STEP 5: Rebase onto default branch
 
 ```bash
-git rebase "$DEFAULT_BRANCH"
+git rebase "$BASE"
 ```
 
 Git will replay each of your commits one at a time onto the tip of `$DEFAULT_BRANCH`. If there are no conflicts, this completes automatically and you can skip to STEP 7.
@@ -119,10 +126,10 @@ If Git says the commit is now empty: **`git rebase --skip`** only when you are s
 
 ```bash
 # Commits on top of default branch (see note below on count)
-git log "$DEFAULT_BRANCH"..HEAD --oneline
+git log "$BASE"..HEAD --oneline
 
 # Changed files vs default branch — should reflect your work (paths may shift if trees moved)
-git diff "$DEFAULT_BRANCH" --stat
+git diff "$BASE" --stat
 ```
 
 **Commit count:** Expect the **same number of commits** as in STEP 1 only if your branch was **linear** (no merge commits you introduced). If you had merge commits from `$DEFAULT_BRANCH` into the branch, the replayed count can differ — compare **content** (`git diff "$DEFAULT_BRANCH" --stat`, behavior) rather than count alone.
@@ -157,7 +164,7 @@ If `--force-with-lease` fails because the remote moved, run `git fetch origin`, 
 Report:
 
 - `$TICKET` (if any) and `$BRANCH`
-- Original commits from STEP 1 vs final `git log "$DEFAULT_BRANCH"..HEAD --oneline` (note if merge commits made counts differ)
+- Original commits from STEP 1 vs final `git log "$BASE"..HEAD --oneline` (note if merge commits made counts differ)
 - How many commits from `$DEFAULT_BRANCH` were incorporated under you
 - Conflicts: how many stops, which files, any modify/delete/binary/submodule cases
 - Push: done vs deferred by user choice
@@ -167,13 +174,13 @@ Report:
 
 ## HARD CONSTRAINT
 
-`/flux/rebase` MUST NOT squash or modify commit content except as required for conflict resolution during `git rebase --continue`. MUST NOT commit to `$DEFAULT_BRANCH`. MUST NOT use `git push --force` (use `--force-with-lease` when updating an existing remote branch). The only permitted history edits are the rebase itself and conflict resolutions in STEP 6.
+`/rebase` MUST NOT squash or modify commit content except as required for conflict resolution during `git rebase --continue`. MUST NOT commit to `$DEFAULT_BRANCH`. MUST NOT use `git push --force` (use `--force-with-lease` when updating an existing remote branch). The only permitted history edits are the rebase itself and conflict resolutions in STEP 6.
 
 ## Propose next step
 
-Then propose the next step: `/flux/create-pr` (include arguments if needed).
+Then propose the next step: `/create-pr` (include arguments if needed).
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

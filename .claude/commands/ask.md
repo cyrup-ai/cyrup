@@ -192,7 +192,7 @@ For `all`: update each file to `done` as it completes, not all at once.
 ## HARD CONSTRAINTS
 
 - **Path**: All `write`/`edit` file paths MUST use the exact `FLUX_BASE` value printed by the STEP 1 bash output (e.g. `FLUX_BASE=/Users/...`). Copy it character-for-character — never reconstruct it from `cwd` or memory.
-- `/flux/ask` is a **clarify-and-augment-only** command. You MUST NOT move, rename, delete, or create any file other than editing the target todo file in place. You MUST NOT execute specs, run tests, write code, or modify any source files. No shell commands beyond the codebase research in STEP 5. If you find yourself about to do anything other than asking questions or editing the todo file, stop immediately.
+- `/ask` is a **clarify-and-augment-only** command. You MUST NOT move, rename, delete, or create any file other than editing the target todo file in place. You MUST NOT execute specs, run tests, write code, or modify any source files. No shell commands beyond the codebase research in STEP 5. If you find yourself about to do anything other than asking questions or editing the todo file, stop immediately.
 
 ---
 
@@ -202,9 +202,9 @@ Print the full absolute filepath as the **VERY LAST LINE** of output. Then await
 
 ## Propose next step
 
-Then propose the next step: `/flux/split` (include arguments if needed).
+Then propose the next step: `/split` (include arguments if needed).
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

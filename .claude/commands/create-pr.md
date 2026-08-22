@@ -20,10 +20,27 @@ Switch to a feature branch before opening a PR.
 
 ## STEP 2: Check for existing PR
 
+First establish which GitHub path is available — this decides STEP 2 and STEP 7:
+
+```bash
+REPO_SLUG=$(git remote get-url origin | sed -E 's|^git@github\.com:|https://github.com/|; s|^https://[^/]*/||; s|\.git$||')
+OWNER="${REPO_SLUG%%/*}"; REPO="${REPO_SLUG##*/}"
+command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && echo "GH_PATH=cli" || echo "GH_PATH=mcp"
+echo "OWNER=$OWNER REPO=$REPO BRANCH=$BRANCH"
+```
+
+**If `GH_PATH=cli`** (a local machine with `gh` authenticated):
+
 ```bash
 EXISTING=$(gh pr view --json number,url,state,title 2>/dev/null)
 echo "$EXISTING"
 ```
+
+**If `GH_PATH=mcp`** (a web/cloud container — no `gh` binary, GitHub reached through MCP tools):
+
+Call `mcp__github__list_pull_requests` with `owner: $OWNER`, `repo: $REPO`, `head: "$OWNER:$BRANCH"`,
+`state: "all"`, `fields: ["number","title","state","html_url"]`. Treat a non-empty result array as
+the existing PR; read `html_url` where the CLI path reads `url`. An empty array means no PR yet.
 
 If output is non-empty JSON, print and stop:
 
@@ -37,7 +54,12 @@ A PR already exists for this branch:
 ## STEP 3: Check for commits ahead of default branch
 
 ```bash
-DEFAULT_BRANCH=$(gh repo view --json defaultBranchRef --jq '.defaultBranchRef.name' 2>/dev/null || echo "main")
+# Default branch WITHOUT `gh`: the clone's remote HEAD, then ask the remote, then fall back.
+DEFAULT_BRANCH=$(git symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH=$(git remote show origin 2>/dev/null | sed -n 's|.*HEAD branch: ||p')
+[ -z "$DEFAULT_BRANCH" ] && DEFAULT_BRANCH=main
+# A fresh container clone often has ONLY the checked-out branch, so materialise the base ref.
+git fetch origin "$DEFAULT_BRANCH" --quiet 2>/dev/null || true
 echo "DEFAULT_BRANCH: $DEFAULT_BRANCH"
 COMMIT_COUNT=$(git rev-list HEAD ^"origin/${DEFAULT_BRANCH}" --count 2>/dev/null || echo "0")
 echo "COMMIT_COUNT: $COMMIT_COUNT"
@@ -159,7 +181,9 @@ In both cases, the body is written as literal text inline in the heredoc in STEP
 
 ## STEP 7: Create the PR
 
-Do NOT pass `--web`, `--fill`, `--draft`, `--reviewer`, `--label`, `--milestone`, or `--assignee`. Write body inline in the heredoc — do NOT use shell variables for it:
+**If `GH_PATH=cli`:** do NOT pass `--web`, `--fill`, `--draft`, `--reviewer`, `--label`,
+`--milestone`, or `--assignee`. Write the body inline in the heredoc — do NOT use shell variables
+for it:
 
 ```bash
 PR_URL=$(gh pr create \
@@ -173,6 +197,19 @@ echo "PR_URL: $PR_URL"
 
 On non-zero exit, surface the raw `gh` error verbatim. Common causes: not authenticated (`gh auth login`), no remote tracking branch (`git push -u origin <branch>`), network/API error.
 
+**If `GH_PATH=mcp`:** call `mcp__github__create_pull_request` with `owner: $OWNER`, `repo: $REPO`,
+`title: $PR_TITLE`, `head: $BRANCH`, `base: $DEFAULT_BRANCH`, and `body` set to the generated body.
+Do not pass `draft` or `reviewers`. The PR URL is `html_url` on the result.
+
+Pass the body as the `body` argument directly — the heredoc rule above exists to stop the shell from
+mangling backticks and `$` in the body, and a tool argument is not shell-interpreted, so that hazard
+does not apply here.
+
+On error, surface the tool's message verbatim. Common causes: the head branch was never pushed
+(`git push -u origin <branch>`), a PR already exists for this head, or the repository is outside the
+session's granted scope — the last one is an access grant to raise with the user, not something to
+retry or work around.
+
 ## STEP 8: Print result
 
 ```
@@ -185,10 +222,10 @@ Do NOT open a browser window.
 
 ## HARD CONSTRAINT
 
-`/flux/create-pr` MUST NOT modify any source files, task files, or config files. The only permitted operations are reading git history, running `gh` commands, and pushing the branch if needed. Write the PR body inline — never via shell variables. Do NOT open a browser window.
+`/create-pr` MUST NOT modify any source files, task files, or config files. The only permitted operations are reading git history, calling GitHub (via `gh` or the `mcp__github__*` tools), and pushing the branch if needed. Write the PR body inline — never via shell variables. Do NOT open a browser window.
 
 ## Propose next step
 
-Then propose the next step: `/flux/review`
+Then propose the next step: `/review`
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.

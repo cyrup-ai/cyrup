@@ -128,9 +128,9 @@ echo "SESSION_TS=$SESSION_TS" > "$FLUX_BASE/session.env"
 echo "Session started: $SESSION_TS"
 ```
 
-Then propose the next step: `/flux/ask` (include arguments if needed).
+Then propose the next step: `/ask` (include arguments if needed).
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 ## JIRA MARKUP → MARKDOWN
 

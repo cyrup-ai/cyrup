@@ -14,8 +14,27 @@ description: Code review with smart parent branch detection and optional PR post
 ```bash
 CURRENT_BRANCH=$(git branch --show-current)
 PR_NUMBER="${ARGUMENTS}"
+REPO_SLUG=$(git remote get-url origin | sed -E 's|^git@github\.com:|https://github.com/|; s|^https://[^/]*/||; s|\.git$||')
+OWNER="${REPO_SLUG%%/*}"; REPO="${REPO_SLUG##*/}"
+command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && echo "GH_PATH=cli" || echo "GH_PATH=mcp"
+```
+
+Resolve the PR's head and base branch by whichever path is available.
+
+**If `GH_PATH=cli`:**
+
+```bash
 PR_BRANCH=$(gh pr view $PR_NUMBER --json headRefName -q '.headRefName')
 PARENT_BRANCH=$(gh pr view $PR_NUMBER --json baseRefName -q '.baseRefName')
+```
+
+**If `GH_PATH=mcp`:** call `mcp__github__pull_request_read` with `method: "get"`, `owner: $OWNER`,
+`repo: $REPO`, `pullNumber: $PR_NUMBER`. Take `PR_BRANCH` from `head.ref` and `PARENT_BRANCH` from
+`base.ref`, then set them in the shell for the checkout below.
+
+Then, on either path:
+
+```bash
 if [ "$PR_BRANCH" != "$CURRENT_BRANCH" ]; then
   git fetch origin "$PR_BRANCH" && git checkout "$PR_BRANCH"
 fi
@@ -283,21 +302,21 @@ Report zip location. If PR provided: "share with PR author or attach manually." 
 - Sub-agent fails → log, continue with remaining agents
 - No changes found → report "No files changed vs parent branch" and exit
 - 100+ issues found → pause and ask user how to proceed before categorization
-- gh CLI fails → report but continue with local review
+- GitHub is unreachable (no `gh`, and the `mcp__github__*` tools absent or the repo out of scope) → report it and continue with the local review against the detected parent branch
 
 ## HARD CONSTRAINTS
 
 - **Path**: All `write`/`edit`/`mv`/`cp` file paths MUST use the exact `FLUX_BASE` value printed by STEP 2 or STEP 7 bash output (e.g. `FLUX_BASE=/Users/...`). Copy it character-for-character — never reconstruct it from `cwd` or memory.
-- `/flux/review` MUST NOT modify any source files. The only permitted file operations are: creating issue task files in `$FLUX_BASE/review/`, moving/deleting those files during deduplication, and creating the zip archive. No changes to `./src/`, no git commits, no pushes.
+- `/review` MUST NOT modify any source files. The only permitted file operations are: creating issue task files in `$FLUX_BASE/review/`, moving/deleting those files during deduplication, and creating the zip archive. No changes to `./src/`, no git commits, no pushes.
 
 ## NEXT STEP
 
 Then propose the next step:
 
-- if user is reviewing their own branch: `/flux/address-feedback`
+- if user is reviewing their own branch: `/address-feedback`
 - if user is reviewing someone else's PR: `share the zip with the author`
 
-Valid `//flux` commands: `/flux/config`, `/flux/new`, `/flux/ask`, `/flux/split`, `/flux/aug`, `/flux/exec`, `/flux/qa`, `/flux/tests`, `/flux/commit`, `/flux/create-pr`, `/flux/review`, `/flux/address-feedback`, `/flux/status`, `/flux/auto-pilot`, `/flux/rebase`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/config`, `/new`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS
