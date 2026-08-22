@@ -550,14 +550,31 @@ impl RpcClient {
         // pi: `childProcess.stderr?.on("data", …)` — accumulate AND passthrough (`:101-104`).
         let inner = Arc::clone(&client.inner);
         let stderr_task = tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                {
-                    let mut buf = lock_ignoring_poison(&inner.stderr);
-                    buf.push_str(&line);
-                    buf.push('\n');
+            // Read BYTES and decode lossily, the way the host-side reader does
+            // (`rpc.rs`'s `String::from_utf8_lossy`). A line-strict `lines()` pump ends
+            // permanently on the first non-UTF-8 byte, and this buffer is the only diagnostic
+            // payload `ProcessExited`/`ProcessError`/`RequestTimeout`/… carry — so the failure
+            // it would truncate is exactly the one whose explanation the embedder needs. pi's
+            // `on("data")` accumulates raw bytes and has no decode failure mode at all.
+            let mut reader = BufReader::new(stderr);
+            let mut bytes = Vec::new();
+            loop {
+                bytes.clear();
+                match reader.read_until(b'\n', &mut bytes).await {
+                    Ok(0) => break, // EOF
+                    Ok(_) => {
+                        let decoded = String::from_utf8_lossy(&bytes);
+                        let line = decoded.strip_suffix('\n').unwrap_or(&decoded);
+                        let line = line.strip_suffix('\r').unwrap_or(line);
+                        {
+                            let mut buf = lock_ignoring_poison(&inner.stderr);
+                            buf.push_str(line);
+                            buf.push('\n');
+                        }
+                        eprintln!("{line}");
+                    }
+                    Err(_) => break, // the pipe is gone; nothing left to collect
                 }
-                eprintln!("{line}");
             }
         });
         if let Ok(mut slot) = client.stderr_task.lock() {
@@ -1224,13 +1241,27 @@ fn process_exit_error(inner: &ClientInner, status: &std::process::ExitStatus) ->
 /// is reported by [`RpcClient::spawn`]'s own start check (`:134-138`) — which is the path where a
 /// non-zero code actually tells the embedder something. Everything else about the message, including
 /// the accumulated stderr that usually carries the real cause, is pi's.
+///
+/// A read or decode FAILURE is a different termination and is reported as one: `next_line` yields
+/// `Err(InvalidData)` for a non-UTF-8 byte and `Err` for any read failure, so collapsing it into the
+/// EOF arm would hand the embedder `code=null signal=null` — "the agent process exited" — for a
+/// child that is alive and healthy, and drop the real cause. The [`RpcClientError::Io`] latched here
+/// wins because [`ClientInner::set_exit_error`] is first-error-wins, so the `ProcessExited` tail
+/// below is a no-op on this path while still settling the in-flight requests.
 async fn read_lines<R>(inner: Arc<ClientInner>, reader: R)
 where
     R: AsyncBufRead + Send + Unpin + 'static,
 {
     let mut lines = reader.lines();
-    while let Ok(Some(line)) = lines.next_line().await {
-        inner.handle_line(&line);
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => inner.handle_line(&line),
+            Ok(None) => break, // clean EOF — the host is gone
+            Err(e) => {
+                inner.set_exit_error(RpcClientError::Io(e));
+                break;
+            }
+        }
     }
     inner.set_exit_error(RpcClientError::ProcessExited {
         code: "null".to_string(),
