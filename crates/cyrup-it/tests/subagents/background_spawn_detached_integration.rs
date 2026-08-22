@@ -536,6 +536,11 @@ async fn detached_runner_survives_orchestrator_death_and_writes_terminal_files()
     // `background_runner_main_integration.rs`'s own identical `single_step` helper shape.
     let runner_config = RunnerConfig {
         turn_budget: None,
+        // SUBA-021 — pi's `usageBudget` is an OPTIONAL param (`extension/schemas.ts:330`) with no
+        // upstream default: a run that does not ask for a budget runs unbudgeted. This fixture asks
+        // for none, so `None` is what keeps every assertion below measuring what it measured before
+        // the field existed (and `skip_serializing_if` keeps the on-disk config byte-identical).
+        usage_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
@@ -749,6 +754,7 @@ async fn interrupting_a_running_step_pauses_rather_than_fails_the_run() {
     // too — see `mark_remaining_paused`'s own doc).
     let runner_config = RunnerConfig {
         turn_budget: None,
+        usage_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,

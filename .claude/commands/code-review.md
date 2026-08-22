@@ -73,7 +73,15 @@ If a file called `stack.env` exists at `$FLUX_BASE/stack.env`, read it and set `
 
 ```bash
 STACK="software"
-if [ -f "package.json" ]; then
+# Manifest tests first, `bun` last: every non-JS stack is decided by a file test alone, so a Rust,
+# Go, Python or JVM repo never shells out to an interpreter that may not be installed. A repo
+# carrying both a Cargo.toml and a package.json (Tauri, napi-rs, a wasm crate with a JS wrapper)
+# resolves as Rust — the native toolchain is the one the work is done in.
+if [ -f "Cargo.toml" ]; then STACK="Rust"
+elif [ -f "go.mod" ]; then STACK="Go"
+elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then STACK="Python"
+elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then STACK="Java/Kotlin"
+elif [ -f "package.json" ]; then
   STACK=$(bun -e "
     const d=JSON.parse(require('fs').readFileSync('./package.json','utf8'));
     const deps=Object.assign({}, d.dependencies, d.devDependencies, d.peerDependencies);
@@ -82,10 +90,6 @@ if [ -f "package.json" ]; then
     const ts=deps['typescript']?'TypeScript':'JavaScript';
     console.log(fw?fw+' + '+ts:ts);
   " 2>/dev/null || echo "JavaScript/TypeScript")
-elif [ -f "Cargo.toml" ]; then STACK="Rust"
-elif [ -f "go.mod" ]; then STACK="Go"
-elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then STACK="Python"
-elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then STACK="Java/Kotlin"
 fi
 mkdir -p "$FLUX_BASE"
 echo "$STACK" > "$FLUX_BASE/stack.env"
@@ -229,9 +233,9 @@ Steps 8, 10, and 11 sub-agents must use `find` or explicit subdirectory paths �
 
 ## STEP 8: Verify newly introduced issues
 
-Enumerate all task files with `find "$FLUX_BASE/review/" -name "*.md" -type f | sort`, then launch sub-agents. Each agent diffs the flagged file:
+Enumerate all task files with `find "$FLUX_BASE/review/" -name "*.md" -type f | sort`, then launch sub-agents. Each agent diffs the flagged file — `<filepath>` is a placeholder for that issue's `file`, so this is a shape to fill in, not a line to run verbatim:
 
-```bash
+```text
 git diff "$MERGE_BASE" -- <filepath>
 ```
 
@@ -404,6 +408,18 @@ The zip from STEP 12 is still written — posting supplements the hand-off, it d
 - Posting rejected because a comment's line is not in the diff → re-anchor that comment to the file (STEP 13d/13e), never drop the finding
 - Posting rejected for the whole review → keep the pending review out of the way with `delete_pending`, report the error verbatim, and fall back to the zip hand-off
 - Repository outside the session's granted scope → report it as an access grant the user must widen; do NOT retry or route around it
+
+## VERIFICATION STATUS
+
+What has and has not been run end-to-end, so a reader knows which instructions are tested and which
+are written from documentation:
+
+| Path | Status |
+|---|---|
+| STEP 2 stack detection | **Exercised** on simulated fresh checkouts (no `$FLUX_BASE/stack.env`) for Rust, Go, Python, JVM, JS and a bare directory, plus a repo carrying both `Cargo.toml` and `package.json`. `bun` is invoked only on the `package.json`-only repo. |
+| Local review, STEP 1–12 | **Exercised** — this is the path every run in this container takes. |
+| STEP 13d, posting via `GH_PATH=mcp` | **Unexercised.** Written against the `mcp__github__*` tool schemas but never run against a live PR. The part most worth confirming is the pending-review sequence: `pull_request_review_write method:"create"` with **no** `event` → one `add_comment_to_pending_review` per issue → `pull_request_review_write method:"submit_pending"`. So is the `subjectType: "FILE"` fallback for a comment whose line is not in the diff, and `delete_pending` for an abandoned review. |
+| STEP 13e, posting via `GH_PATH=cli` | **Unexercised.** No `gh` binary in the container, so `command -v gh` never succeeds and this branch has never run. Written against `gh`'s documented behaviour, including the `422`-means-line-not-in-diff retry. |
 
 ## HARD CONSTRAINTS
 

@@ -24,13 +24,12 @@ use std::collections::HashMap;
 /// `bedrock_ambient_credentials_detected` is hermetic where this module's was not. Same shape,
 /// same precedence — overlay first, then ambient, empty treated as unset at both tiers.
 #[derive(Clone, Copy)]
-enum Ambient<'a> {
+pub(crate) enum Ambient<'a> {
     /// Production: read the real process environment.
     Process,
-    /// Test: read a fixed map, so "unset" is a property of the fixture, not of the host.
-    /// Only ever constructed under `cfg(test)` — production always resolves through
-    /// [`Self::Process`], so this carries no runtime cost and changes no shipped behavior.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Read a fixed map, so "unset" is a property of the fixture, not of the host. Reached from
+    /// this module's own tests and, across crate boundaries, from [`AmbientEnv::Fixed`] — see that
+    /// type for why the owned form exists.
     Fixed(&'a HashMap<String, String>),
 }
 
@@ -39,6 +38,53 @@ impl Ambient<'_> {
         match self {
             Self::Process => std::env::var(name).ok().filter(|v| !v.is_empty()),
             Self::Fixed(map) => map.get(name).filter(|v| !v.is_empty()).cloned(),
+        }
+    }
+}
+
+/// The OWNED form of [`Ambient`] — the tier a long-lived holder such as
+/// [`AuthStore`](crate::auth::AuthStore) can be constructed with and keep.
+///
+/// [`Ambient`] borrows its map, which is right for a call-scoped argument and wrong for a value a
+/// struct must own: a `&HashMap` there would infect [`AuthStore`](crate::auth::AuthStore) — and
+/// therefore every `Arc<AuthStore>` in the session runtime — with a lifetime parameter. `Arc` keeps
+/// the map cheap to clone and the borrow local to [`Self::tier`].
+///
+/// This is the cross-crate half of the seam this module already has internally. `AuthStore::has_auth`
+/// is reached from deep inside the session runtime (`cyrup-session-svc`'s
+/// `provider_has_configured_auth`), with no argument list a test could reach through, so the tier is
+/// injected once at construction and travels with the store. Its motivating case is
+/// `amazon-bedrock`: ambient `AWS_*` credentials make [`get_env_api_key`] answer `<authenticated>`,
+/// which is CORRECT in production and turns any test that enumerates configured providers into an
+/// assertion about the machine running it. An overlay cannot express "this var is unset" (it is
+/// consulted ahead of, not instead of, the ambient tier) and `std::env::remove_var` is unsafe in
+/// Rust 2024 under this crate's `#![forbid(unsafe_code)]`, so injection is the only way to say it.
+#[derive(Clone, Debug, Default)]
+pub enum AmbientEnv {
+    /// Read the real process environment. The default, and what every existing constructor keeps.
+    #[default]
+    Process,
+    /// Read this map instead. `Arc` because the holder owns the tier for its whole life.
+    Fixed(std::sync::Arc<HashMap<String, String>>),
+}
+
+impl AmbientEnv {
+    /// A fixed tier over `vars`.
+    pub fn fixed(vars: HashMap<String, String>) -> Self {
+        Self::Fixed(std::sync::Arc::new(vars))
+    }
+
+    /// A fixed tier with NOTHING in it: every ambient variable reads as unset, whatever the host
+    /// has exported. This is the one a host-independent test wants.
+    pub fn empty() -> Self {
+        Self::fixed(HashMap::new())
+    }
+
+    /// Borrow this tier as the call-scoped [`Ambient`] the lookup functions take.
+    pub(crate) fn tier(&self) -> Ambient<'_> {
+        match self {
+            Self::Process => Ambient::Process,
+            Self::Fixed(map) => Ambient::Fixed(map),
         }
     }
 }
@@ -131,7 +177,7 @@ pub fn find_env_keys(provider: &str, env: Option<&HashMap<String, String>>) -> O
     find_env_keys_in(provider, env, Ambient::Process)
 }
 
-fn find_env_keys_in(
+pub(crate) fn find_env_keys_in(
     provider: &str,
     env: Option<&HashMap<String, String>>,
     ambient: Ambient<'_>,
@@ -169,7 +215,7 @@ pub fn get_env_api_key(provider: &str, env: Option<&HashMap<String, String>>) ->
     get_env_api_key_in(provider, env, Ambient::Process)
 }
 
-fn get_env_api_key_in(
+pub(crate) fn get_env_api_key_in(
     provider: &str,
     env: Option<&HashMap<String, String>>,
     ambient: Ambient<'_>,

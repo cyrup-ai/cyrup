@@ -49,7 +49,7 @@ pub use config_value::{
 };
 pub use defaults::DEFAULT_THINKING_LEVEL;
 pub use env::{CacheRetention, CliConfigOverrides, ConfigDirs, EnvVars};
-pub use env_keys::{api_key_env_vars, find_env_keys, get_env_api_key};
+pub use env_keys::{AmbientEnv, api_key_env_vars, find_env_keys, get_env_api_key};
 pub use error::{AuthError, ConfigError, ScopedError};
 pub use keybindings::{
     KEYBINDING_IDS, KEYBINDING_NAME_MIGRATIONS, OrderedKeybindings, migrate_keybindings_config,

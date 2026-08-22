@@ -89,7 +89,15 @@ Act as a `$STACK` expert SOFTWARE ARTISAN. If a file called `stack.env` exists a
 
 ```bash
 STACK="software"
-if [ -f "package.json" ]; then
+# Manifest tests first, `bun` last: every non-JS stack is decided by a file test alone, so a Rust,
+# Go, Python or JVM repo never shells out to an interpreter that may not be installed. A repo
+# carrying both a Cargo.toml and a package.json (Tauri, napi-rs, a wasm crate with a JS wrapper)
+# resolves as Rust — the native toolchain is the one the work is done in.
+if [ -f "Cargo.toml" ]; then STACK="Rust"
+elif [ -f "go.mod" ]; then STACK="Go"
+elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then STACK="Python"
+elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then STACK="Java/Kotlin"
+elif [ -f "package.json" ]; then
   STACK=$(bun -e "
     const d=JSON.parse(require('fs').readFileSync('./package.json','utf8'));
     const deps=Object.assign({}, d.dependencies, d.devDependencies, d.peerDependencies);
@@ -98,10 +106,6 @@ if [ -f "package.json" ]; then
     const ts=deps['typescript']?'TypeScript':'JavaScript';
     console.log(fw?fw+' + '+ts:ts);
   " 2>/dev/null || echo "JavaScript/TypeScript")
-elif [ -f "Cargo.toml" ]; then STACK="Rust"
-elif [ -f "go.mod" ]; then STACK="Go"
-elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then STACK="Python"
-elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then STACK="Java/Kotlin"
 fi
 mkdir -p "$FLUX_BASE"
 echo "$STACK" > "$FLUX_BASE/stack.env"

@@ -220,6 +220,17 @@ PR created successfully:
 
 Do NOT open a browser window.
 
+## VERIFICATION STATUS
+
+What has and has not been run end-to-end, so a reader knows which instructions are tested and which
+are written from documentation:
+
+| Path | Status |
+|---|---|
+| STEP 5 template detection | **Exercised** against fixture repos: single file at `.github/pull_request_template.md`, a `PULL_REQUEST_TEMPLATE/` directory holding exactly one file, a directory holding two (ambiguous → `TEMPLATE_NOTE` + fallback), an empty template directory, no template at all, and single-file-beats-root precedence. All six behaved as written. This repo itself has no template, so the `TEMPLATE_FOUND: no` branch is the only one it takes in practice. |
+| `GH_PATH=mcp` | **Exercised** — the web/cloud container has no `gh`, so STEP 2 and STEP 7 always take this path here. |
+| `GH_PATH=cli` | **Unexercised.** No `gh` binary in the container, so `command -v gh` never succeeds and the `gh pr view` / `gh pr create` branches have never run. Written against `gh`'s documented behaviour; worth one pass on a machine that has `gh` authenticated. |
+
 ## HARD CONSTRAINT
 
 `/create-pr` MUST NOT modify any source files, task files, or config files. The only permitted operations are reading git history, calling GitHub (via `gh` or the `mcp__github__*` tools), and pushing the branch if needed. Write the PR body inline — never via shell variables. Do NOT open a browser window.

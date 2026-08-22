@@ -12,6 +12,7 @@ use cyrup_provider::{CredentialInfo, CredentialType};
 use serde_json::{Map, Value};
 
 use crate::env::ConfigDirs;
+use crate::env_keys::AmbientEnv;
 use crate::error::AuthError;
 
 /// A stored credential (R-07-016). `api_key` optionally carries provider-scoped `env`; `oauth`
@@ -76,6 +77,10 @@ pub struct AuthStore {
     /// coerced any `Err` to "not configured", so a transient read error or a mid-write window made
     /// every configured provider look unauthenticated.
     cached: RwLock<AuthFile>,
+    /// The ambient environment the env tier of [`Self::has_auth`] / [`Self::get_api_key`] falls
+    /// back to. [`AmbientEnv::Process`] everywhere in production — see that type for why it is
+    /// injectable at all, and [`Self::at_with_ambient`] for how.
+    ambient: AmbientEnv,
 }
 
 impl AuthStore {
@@ -86,14 +91,45 @@ impl AuthStore {
     }
 
     pub fn at(path: PathBuf) -> Self {
+        Self::at_with_ambient(path, AmbientEnv::Process)
+    }
+
+    /// [`Self::at`] with the env tier's AMBIENT half chosen by the caller.
+    ///
+    /// The overlay argument the query methods already take (`env: Option<&HashMap<..>>`) is only
+    /// half a seam: it is consulted *ahead of* the process environment, never instead of it, so it
+    /// can add a variable but cannot say one is unset (`env?.[n] || process.env[n]`, Pi
+    /// `getProviderEnvValue`). Everything that enumerates *configured providers* therefore reports
+    /// whatever the host has exported — `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` make
+    /// `amazon-bedrock` configured (correctly! see [`crate::env_keys::get_env_api_key`]'s Bedrock
+    /// arm), so a test that asserts which providers a session can reach is really asserting a
+    /// property of the developer's machine.
+    ///
+    /// Scrubbing the environment around such a test is not an option twice over: `std::env::remove_var`
+    /// is unsafe in Rust 2024 and this crate is `#![forbid(unsafe_code)]`, and a process-global
+    /// mutation is wrong anyway the moment two tests run in parallel. So the tier is injected
+    /// instead, once, here — the store carries it, and every caller that reaches
+    /// [`Self::has_auth`] through the session runtime inherits it without a new argument.
+    /// `SessionFactory::auth` (cyrup-session-svc) is the seam that gets such a store into a session.
+    ///
+    /// Production behaviour is unchanged: [`Self::at`] and [`Self::open`] both pass
+    /// [`AmbientEnv::Process`].
+    pub fn at_with_ambient(path: PathBuf, ambient: AmbientEnv) -> Self {
         let store = Self {
             path,
             locks: Mutex::new(HashMap::new()),
             runtime: RwLock::new(HashMap::new()),
             cached: RwLock::new(AuthFile::new()),
+            ambient,
         };
         store.reload();
         store
+    }
+
+    /// [`Self::open`] with the env tier's ambient half chosen by the caller — see
+    /// [`Self::at_with_ambient`].
+    pub fn open_with_ambient(dirs: &ConfigDirs, ambient: AmbientEnv) -> Self {
+        Self::at_with_ambient(dirs.auth_path(), ambient)
     }
 
     /// Re-read `auth.json` into the snapshot, PRESERVING the previous snapshot on any failure
@@ -316,6 +352,11 @@ impl AuthStore {
     /// at the ported tag (`git grep 'hasAuth\b' v0.83.0 -- packages` is empty; the file is 271
     /// lines) — CFG-044. The models.json tier of `hasConfiguredAuth` lives separately in
     /// [`crate::model::provider_is_configured`].
+    ///
+    /// `env` is the OVERLAY. Beneath it the env tier falls back to this store's
+    /// [`AmbientEnv`] — the process environment unless the store was built by
+    /// [`Self::at_with_ambient`], which is what makes "this provider has no ambient credential"
+    /// something a caller can state rather than inherit from the host.
     pub fn has_auth(&self, provider: &ProviderId, env: Option<&HashMap<String, String>>) -> bool {
         if self.runtime_api_key(provider).is_some() {
             return true;
@@ -323,7 +364,7 @@ impl AuthStore {
         if self.snapshot().contains_key(provider.as_str()) {
             return true;
         }
-        crate::env_keys::get_env_api_key(provider.as_str(), env).is_some()
+        crate::env_keys::get_env_api_key_in(provider.as_str(), env, self.ambient.tier()).is_some()
     }
 
     // CFG-044: `AuthStore::get_auth_status` was DELETED here. It cited `getAuthStatus` at
@@ -386,7 +427,7 @@ impl AuthStore {
         if !include_fallback {
             return Ok(None);
         }
-        Ok(crate::env_keys::get_env_api_key(provider.as_str(), env))
+        Ok(crate::env_keys::get_env_api_key_in(provider.as_str(), env, self.ambient.tier()))
     }
 }
 
@@ -839,6 +880,83 @@ mod tests {
             .await
             .unwrap();
         assert!(s.has_auth(&stored, Some(&empty)));
+    }
+
+    /// The injectable ambient tier ([`AuthStore::at_with_ambient`]).
+    ///
+    /// `amazon-bedrock` is the provider that forced this seam: it has no API-key variable at all,
+    /// so [`crate::env_keys::get_env_api_key`] decides it from the ambient IAM chain
+    /// (`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, a container-credentials URI…)
+    /// and answers the `<authenticated>` sentinel. That is the RIGHT answer in production, and it
+    /// is why every test that enumerates configured providers went red on a developer box — and on
+    /// this project's own CI container, which exports both AWS variables — while passing on a bare
+    /// machine. The overlay could not fix it: `env` is consulted AHEAD of the ambient tier, never
+    /// instead of it, so no overlay value can mean "unset".
+    ///
+    /// The three legs are the whole contract: an ambient credential is seen, an empty ambient tier
+    /// makes the same provider unconfigured whatever the host exports, and the store's OTHER tiers
+    /// are untouched by the choice — an injected tier must not accidentally hide a stored
+    /// credential.
+    #[tokio::test]
+    async fn has_auth_reads_the_injected_ambient_tier_not_the_host() {
+        let dir = crate::test_util::temp_dir();
+        let path = dir.join("agent").join("auth.json");
+        let bedrock = ProviderId::from("amazon-bedrock");
+        let overlay: HashMap<String, String> = HashMap::new();
+
+        let aws: HashMap<String, String> = [
+            ("AWS_ACCESS_KEY_ID".to_string(), "id".to_string()),
+            ("AWS_SECRET_ACCESS_KEY".to_string(), "sec".to_string()),
+        ]
+        .into();
+        let credentialed = AuthStore::at_with_ambient(path.clone(), AmbientEnv::fixed(aws));
+        assert!(
+            credentialed.has_auth(&bedrock, Some(&overlay)),
+            "an ambient IAM pair is configured auth for bedrock (env-api-keys.ts:160-176)"
+        );
+
+        // The leg the host cannot influence: nothing in the tier => nothing ambient, on any machine.
+        let bare = AuthStore::at_with_ambient(path.clone(), AmbientEnv::empty());
+        assert!(
+            !bare.has_auth(&bedrock, Some(&overlay)),
+            "an EMPTY ambient tier must report bedrock unconfigured even on a host with AWS \
+             credentials exported — that is the entire point of injecting it"
+        );
+
+        // …and the injection is confined to the ambient tier: runtime, stored and overlay all still
+        // answer for themselves.
+        let stored = ProviderId::from("mistral");
+        bare.modify(&stored, |_| async { Ok(Some(Credential::api_key("k"))) })
+            .await
+            .unwrap();
+        assert!(bare.has_auth(&stored, Some(&overlay)), "stored tier survives an injected ambient");
+        let runtime = ProviderId::from("acme");
+        bare.set_runtime_api_key(runtime.clone(), "sk-runtime".to_string());
+        assert!(bare.has_auth(&runtime, Some(&overlay)), "runtime tier survives an injected ambient");
+        let openai = ProviderId::from("openai");
+        let overlay_key: HashMap<String, String> =
+            [("OPENAI_API_KEY".to_string(), "sk-overlay".to_string())].into();
+        assert!(
+            bare.has_auth(&openai, Some(&overlay_key)),
+            "the overlay still wins over an empty ambient tier"
+        );
+    }
+
+    /// [`AuthStore::at`] / [`AuthStore::open`] keep [`AmbientEnv::Process`], so nothing shipped
+    /// changed shape. Pinned against a variable this test exports for itself through the OVERLAY —
+    /// which is the only tier a hermetic test may assert on for a `Process` store, because the
+    /// ambient half of one is, by construction, whatever the host has.
+    #[tokio::test]
+    async fn the_default_constructors_keep_the_process_tier() {
+        let (s, _p, _dir) = store();
+        let openai = ProviderId::from("openai");
+        let overlay: HashMap<String, String> =
+            [("OPENAI_API_KEY".to_string(), "sk-overlay".to_string())].into();
+        assert!(s.has_auth(&openai, Some(&overlay)));
+        assert_eq!(
+            s.get_api_key(&openai, true, Some(&overlay)).await.unwrap().as_deref(),
+            Some("sk-overlay")
+        );
     }
 
     /// CFG-007: a corrupt / unreadable `auth.json` must NOT make a configured provider read as

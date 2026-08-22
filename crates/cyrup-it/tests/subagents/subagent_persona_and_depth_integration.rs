@@ -178,6 +178,11 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
 
     let config = RunnerConfig {
         turn_budget: None,
+        // SUBA-021 — pi's `usageBudget` is an OPTIONAL param (`extension/schemas.ts:330`) with no
+        // upstream default: a run that does not ask for a budget runs unbudgeted. This fixture asks
+        // for none, so `None` is what keeps every assertion below measuring what it measured before
+        // the field existed (and `skip_serializing_if` keeps the on-disk config byte-identical).
+        usage_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
@@ -354,6 +359,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
     let config = RunnerConfig {
         turn_budget: None,
+        usage_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
@@ -420,6 +426,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
         turn_budget: None,
+        usage_budget: None,
         enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
@@ -448,6 +455,13 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         run_id: None,
         child_index: None,
         steer_inbox_dir: None,
+        // SUBA-049 — the RETURN half of G90's steer channel. `None` for the same reason
+        // `steer_inbox_dir` above is `None`: pi mints both paths only where an async run
+        // directory exists (`subagent-runner.ts:3820-3821`), and this fixture's run has neither.
+        // Both sides gate the env keys on presence, so `None` leaves the child's spawn env
+        // byte-identical to what this test was written against.
+        steer_ack_dir: None,
+        steer_capability_path: None,
         control_config: None,
         on_control_event: None,
         artifacts_dir: None,
@@ -638,6 +652,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
         turn_budget: None,
+        usage_budget: None,
         // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
         // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
         timeout_ms: None,
@@ -1019,6 +1034,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
             dir.path(),
             BackgroundStepsSpec {
                 turn_budget: None,
+                usage_budget: None,
                 // SUBA-N03: this fixture drives the generic step-graph entry point, which
                 // carries none of the SINGLE-mode overrides.
                 run_id: cyrup_ext_subagents::background::RunId::new(),

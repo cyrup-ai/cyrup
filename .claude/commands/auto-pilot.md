@@ -57,7 +57,7 @@ On step failure: identify root cause, apply fix, re-run the failed step. After 3
 
 ## HARD CONSTRAINT
 
-`/auto-pilot` orchestrates other `//flux` commands — it does not implement logic of its own beyond sequencing. Each step's own HARD CONSTRAINTs apply in full. Do not skip steps, do not merge steps, do not take shortcuts.
+`/auto-pilot` orchestrates other `//flux` commands — it does not implement logic of its own beyond sequencing. Each step's own HARD CONSTRAINTs apply in full. Do not skip steps, do not merge steps, do not take shortcuts. Every step it runs MUST be one of the commands listed below — never invent a pipeline step, and never substitute an ad-hoc action for a command.
 
 ## Output style
 
@@ -65,6 +65,10 @@ On step failure: identify root cause, apply fix, re-run the failed step. After 3
 - Use `▶`/`✓` step headers
 - Actionable errors — no raw stack traces
 - Do not produce summary files unless a step requires it
+
+## Valid commands
+
+Valid `//flux` commands: `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/code-review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

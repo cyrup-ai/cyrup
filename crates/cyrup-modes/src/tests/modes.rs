@@ -1680,8 +1680,18 @@ async fn rpc_cycle_model_spans_the_full_auth_filtered_registry() {
     let provider: Arc<dyn Provider> = Arc::new(FauxProvider::new());
     let cfg = base_config(&fx);
     let target = cfg.target.clone();
+    // Inject the auth store with an EMPTY ambient tier. Without this the builder falls back to
+    // `AuthStore::at(...)` (builder.rs:695), whose Process tier reads the real environment — so a
+    // machine with ambient AWS credentials resolves `amazon-bedrock` ahead of the `anthropic`
+    // credential written above, and the assertion fails for a reason unrelated to the behaviour
+    // under test. The path must stay `fx.agent_dir.join("auth.json")`: that is where the
+    // credential was just written.
     let factory = Arc::new(
         SessionFactory::new(provider, cfg)
+            .auth(Arc::new(cyrup_config::AuthStore::at_with_ambient(
+                fx.agent_dir.join("auth.json"),
+                cyrup_config::AmbientEnv::empty(),
+            )))
             .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>),
     );
     let runtime = AgentSessionRuntime::create(factory, target).await.expect("build runtime");

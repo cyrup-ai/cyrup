@@ -147,6 +147,11 @@ fn base_agent_config(model: &str) -> AgentConfig {
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
         turn_budget: None,
+        // SUBA-021 — pi's `usageBudget` is an OPTIONAL param (`extension/schemas.ts:330`) with no
+        // upstream default: a run that does not ask for a budget runs unbudgeted. This fixture asks
+        // for none, so `None` is what keeps every assertion below measuring what it measured before
+        // the field existed (and `skip_serializing_if` keeps the on-disk config byte-identical).
+        usage_budget: None,
         enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
@@ -178,6 +183,13 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         run_id: None,
         child_index: None,
         steer_inbox_dir: None,
+        // SUBA-049 — the RETURN half of G90's steer channel. `None` for the same reason
+        // `steer_inbox_dir` above is `None`: pi mints both paths only where an async run
+        // directory exists (`subagent-runner.ts:3820-3821`), and this fixture's run has neither.
+        // Both sides gate the env keys on presence, so `None` leaves the child's spawn env
+        // byte-identical to what this test was written against.
+        steer_ack_dir: None,
+        steer_capability_path: None,
         control_config: None,
         on_control_event: None,
         artifacts_dir: None,

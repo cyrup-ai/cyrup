@@ -50,6 +50,22 @@ default = []
 # saying why the run suddenly takes minutes. The same flag also unifies `cyrup-provider/faux` onto
 # a normal edge (root Cargo.toml:27-38). `--all-features` must not appear in CI or in a script;
 # docs/TEST-ARCHITECTURE.md §9.3 makes that a checked invariant (G3).
+#
+# !!! THE OTHER EDGE OF THE SAME GATE !!!  A GATED-OFF TARGET CAN ROT UNSEEN.
+# Because `it` is off by default, `cargo check --workspace --all-targets` reports this crate clean
+# while every [[test]] below has stopped compiling. That is not hypothetical: on 2026-08-22 all
+# three of `subagents`, `intercom` and `permission` had drifted into 33 E0063s against fields added
+# to `RunOptions`/`RunnerConfig`/`BackgroundStepsSpec` (`usage_budget`, `steer_ack_dir`,
+# `steer_capability_path`) with nothing in the everyday gate to notice. The ONE line that notices is
+#
+#     cargo check -p cyrup-it --features it --all-targets
+#
+# — check, not test: it costs a compile and spawns nothing, so it is safe to run everywhere the
+# merge gate runs, and it is NOT `--all-features` (see the hazard above). Standing this line up in
+# CI is the CI half of that fix, and it belongs to the feature-combination sweep rather than being
+# duplicated per crate — .flux BUILD_FEATURE_COMBINATIONS.md, "Whatever combinations matter are
+# enforced in CI, not just verified once". Until that lands, this comment is the only record of the
+# command, so run it by hand after touching anything a seam test constructs.
 it = []
 
 # Forwards the Wasmtime Component Model host feature to the crates whose seam tests instantiate a

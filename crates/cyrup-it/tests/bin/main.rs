@@ -23,6 +23,11 @@
 //! * `wasm_renderer_screen` — loads a LIVE `wasm32-wasip2` guest and asserts on terminal cells.
 //! * `faux_not_in_normal_build` — shells out to `cargo tree` and asserts on the resolved feature
 //!   graph. PROV-052's RED→GREEN guard; the instrument is a real subprocess.
+//! * `core_tokio_features_stay_narrow` — the same instrument, one crate over: `cyrup-core` declares
+//!   tokio by hand (`default-features = false, features = ["sync"]`) because inheritance cannot
+//!   express the narrowing, and this asserts nobody tidies it back to `workspace = true`. Written
+//!   in this binary rather than a `cyrup-core` target so the two Cargo-graph guards stay adjacent;
+//!   it is a 16th file that was never drained from `crates/cyrup`.
 //!
 //! Migration notes:
 //!
@@ -98,7 +103,14 @@ mod runtime;
 // ---- crates/cyrup-tui: a live wasm32-wasip2 guest, drawn to terminal cells --------------------
 mod wasm_renderer_screen;
 
-// ---- crates/cyrup-provider: the PROV-052 Cargo-feature-graph guard ----------------------------
+// ---- Cargo-feature-graph guards ---------------------------------------------------------------
+// Not seam tests drained from a source crate: both shell out to `cargo tree` and assert on the
+// RESOLVED graph, an invariant no `#[cfg]`-based unit test in the crate it protects can express
+// (the resolver runs before any Rust is parsed). They share one instrument and one convention —
+// `cargo tree --offline --locked`, the `CYRUP_SKIP_CARGO_GRAPH_TESTS` opt-in escape hatch, and a
+// LOUD failure when the instrument itself breaks rather than a silent pass. Touch one, read the
+// other.
+mod core_tokio_features_stay_narrow;
 mod faux_not_in_normal_build;
 
 // ==================================================================================================
