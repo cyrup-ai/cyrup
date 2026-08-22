@@ -1,92 +1,25 @@
 //! Behavioral conformance for the agent runtime (func-02 A-02-1..10), driven by the faux provider
 //! and tiny in-test tools.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::print_stdout
-)]
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::{
     AfterOverride, Agent, AgentEvent, AgentMessage, ApiKeyResolver, BeforeOutcome, BeforeToolCall,
-    Hooks, HookError, ProviderStreamFn, StreamFn, ToolExecution,
+    Hooks, HookError, StreamFn, ToolExecution,
 };
 use crate::{AfterToolCall, EventSubscriber};
 use cyrup_core::{
     CancelToken, Content, EventStream, ExecMode, ModelRef, ProviderId, StopReason, Tool, ToolCallId,
     ToolError, ToolResult, ToolUpdateSink,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
-use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
+use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
+use cyrup_provider::{Context, StreamEvent, StreamOptions};
 use futures::StreamExt;
 use serde_json::{json, Value};
 
-// ----------------------------------------------------------------------------
-// Helpers: model ref, stream-fn wiring, recorder subscriber.
-// ----------------------------------------------------------------------------
-
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
-
-fn faux_stream_fn(responses: Vec<cyrup_core::AssistantMessage>) -> (Arc<FauxProvider>, Arc<dyn StreamFn>) {
-    let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(responses);
-    let provider: Arc<dyn Provider> = faux.clone();
-    let sf: Arc<dyn StreamFn> = Arc::new(ProviderStreamFn::new(provider));
-    (faux, sf)
-}
-
-#[derive(Default)]
-struct Recorder {
-    events: Mutex<Vec<AgentEvent>>,
-}
-
-#[async_trait::async_trait]
-impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
-        self.events.lock().unwrap().push(event.clone());
-    }
-}
-
-impl Recorder {
-    fn snapshot(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
-fn ev_name(e: &AgentEvent) -> String {
-    match e {
-        AgentEvent::AgentStart => "agent_start".into(),
-        AgentEvent::TurnStart => "turn_start".into(),
-        AgentEvent::MessageStart { message } => format!("message_start:{}", role(message)),
-        AgentEvent::MessageUpdate { .. } => "message_update:assistant".into(),
-        AgentEvent::MessageEnd { message } => format!("message_end:{}", role(message)),
-        AgentEvent::ToolExecutionStart { .. } => "tool_execution_start".into(),
-        AgentEvent::ToolExecutionUpdate { .. } => "tool_execution_update".into(),
-        AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end".into(),
-        AgentEvent::TurnEnd { .. } => "turn_end".into(),
-        AgentEvent::AgentEnd { .. } => "agent_end".into(),
-    }
-}
-
-fn role(m: &AgentMessage) -> &'static str {
-    match m {
-        AgentMessage::User { .. } => "user",
-        AgentMessage::Assistant(_) => "assistant",
-        AgentMessage::ToolResult(_) => "tool",
-        AgentMessage::Custom { .. } => "custom",
-        // SESS-043 — a declaration-merged coding-agent role never produced by the agent loop
-        // itself; it only enters through `set_messages` when `cyrup-session-svc` seeds the raw
-        // context projection, so no event in this file can carry one.
-        AgentMessage::App { .. } => "app",
-    }
-}
+use super::support::*;
 
 fn names(events: &[AgentEvent]) -> Vec<String> {
     events.iter().map(ev_name).collect()
@@ -99,48 +32,6 @@ fn count_turn_starts(events: &[AgentEvent]) -> usize {
 // ----------------------------------------------------------------------------
 // Helpers: tools.
 // ----------------------------------------------------------------------------
-
-fn obj_schema() -> Value {
-    json!({ "type": "object" })
-}
-
-struct EchoTool {
-    name: String,
-    params: Value,
-    calls: Arc<AtomicUsize>,
-}
-
-impl EchoTool {
-    fn new(name: &str) -> (Arc<Self>, Arc<AtomicUsize>) {
-        let calls = Arc::new(AtomicUsize::new(0));
-        (Arc::new(Self { name: name.into(), params: obj_schema(), calls: calls.clone() }), calls)
-    }
-}
-
-#[async_trait::async_trait]
-impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn parameters(&self) -> &Value {
-        &self.params
-    }
-    async fn execute(
-        &self,
-        _call_id: ToolCallId,
-        params: Value,
-        _cancel: CancelToken,
-        _on_update: ToolUpdateSink,
-    ) -> Result<ToolResult, ToolError> {
-        self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(ToolResult {
-            content: vec![Content::text(format!("echo:{params}"))],
-            details: None,
-            terminate: false,
-            ..Default::default()
-        })
-    }
-}
 
 struct FailTool {
     name: String,
@@ -231,7 +122,7 @@ async fn a_02_1_no_tool_ordering() {
         StopReason::Stop,
     )]);
     let agent = Agent::builder(model_ref(), sf).build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     let handle = agent.prompt("hi").await.unwrap();
@@ -381,7 +272,7 @@ async fn a_02_2_parallel_completion_vs_source_order() {
         StopReason::ToolUse,
     )]);
     let agent = Agent::builder(model_ref(), sf).tools(vec![slow, fast]).build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(Arc::new(ReleaseOnEnd {
         after: "fast".to_string(),
         tx: Mutex::new(Some(release_tx)),
@@ -505,7 +396,7 @@ async fn a_02_4_before_tool_call_block() {
         .tools(vec![echo])
         .hooks(Arc::new(BlockHook))
         .build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     agent.prompt("go").await.unwrap();
@@ -555,7 +446,7 @@ async fn a_02_5_after_tool_call_details_only_replace() {
         .tools(vec![echo])
         .hooks(Arc::new(DetailsHook))
         .build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     agent.prompt("go").await.unwrap();
@@ -609,7 +500,7 @@ async fn a_02_5_terminate_all_stops() {
         .tools(vec![a, b])
         .hooks(Arc::new(TerminateHook { only: None }))
         .build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     agent.prompt("go").await.unwrap();
@@ -634,7 +525,7 @@ async fn a_02_5_terminate_mixed_continues() {
         .tools(vec![a, b])
         .hooks(Arc::new(TerminateHook { only: Some("a".into()) }))
         .build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     agent.prompt("go").await.unwrap();
@@ -672,7 +563,7 @@ async fn a_02_6_steering_injected_after_batch() {
         faux_assistant_message(vec![faux_text("after steer")], StopReason::Stop),
     ]);
     let agent = Arc::new(Agent::builder(model_ref(), sf).tools(vec![echo]).build());
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
     agent.subscribe(Arc::new(SteerOnToolStart {
         agent: Arc::downgrade(&agent),
@@ -701,7 +592,7 @@ async fn a_02_6_follow_up_only_when_stopping() {
         faux_assistant_message(vec![faux_text("turn two")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf).build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     // A follow-up enqueued up-front must NOT be injected into turn one; it is delivered only after
@@ -770,7 +661,7 @@ impl EventSubscriber for SlowEnd {
 async fn a_02_7_abort_closing_sequence_and_idle_settlement() {
     let sf: Arc<dyn StreamFn> = Arc::new(BlockingStreamFn);
     let agent = Agent::builder(model_ref(), sf).build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
     let done = Arc::new(AtomicBool::new(false));
     agent.subscribe(Arc::new(SlowEnd { done: done.clone() }));
@@ -835,7 +726,7 @@ async fn a_02_8_thrown_tool_is_error_and_loop_continues() {
     let sf: Arc<dyn StreamFn> =
         Arc::new(RecordingStreamFn { inner, captured: captured.clone() });
     let agent = Agent::builder(model_ref(), sf).tools(vec![fail]).build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     agent.prompt("go").await.unwrap();
@@ -875,7 +766,7 @@ async fn a_02_9_custom_message_dropped_from_llm_visible_in_events() {
     let sf: Arc<dyn StreamFn> =
         Arc::new(RecordingStreamFn { inner, captured: captured.clone() });
     let agent = Agent::builder(model_ref(), sf).build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     // Pre-enqueue a custom steering message: it is injected (visible in the stream) but the default
@@ -969,7 +860,7 @@ async fn agent033_panicking_subscriber_fails_the_run_and_never_deadlocks() {
     // The recorder is registered FIRST so it still observes the events the panicker aborts on: pi
     // stops iterating the listener set at the throw, so a listener registered AFTER the thrower
     // never sees that event — same here.
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
     agent.subscribe(Arc::new(PanicSubscriber));
 
@@ -1109,7 +1000,7 @@ async fn agent_001_length_stop_fails_tool_batch_without_executing() {
         faux_assistant_message(vec![faux_text("re-issued")], StopReason::Stop),
     ]);
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     let handle = agent.prompt("go").await.unwrap();
@@ -1491,7 +1382,7 @@ async fn agent016_batch(execution: ToolExecution) {
         .tools(vec![PanicTool::new("boom"), echo])
         .tool_execution(execution)
         .build();
-    let recorder = Arc::new(Recorder::default());
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
 
     agent.prompt("go").await.unwrap();

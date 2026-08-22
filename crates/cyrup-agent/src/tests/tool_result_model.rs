@@ -9,40 +9,26 @@
 //!
 //! Every assertion here is on OBSERVABLE output: the event stream a subscriber sees, and the
 //! `Context.messages` the provider is handed on the following turn.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::print_stdout
-)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    AfterOverride, AfterToolCall, Agent, AgentEvent, AgentMessage, EventSubscriber, HookError,
-    Hooks, ProviderStreamFn, StreamFn, ToolResultMessage,
+    AfterOverride, AfterToolCall, Agent, AgentEvent, AgentMessage, HookError,
+    Hooks, ToolResultMessage,
 };
 use cyrup_core::{
-    CancelToken, Content, Cost, EventStream, Message, ModelRef, StopReason, Tool, ToolCallId,
+    CancelToken, Content, Cost, Message, StopReason, Tool, ToolCallId,
     ToolError, ToolResult, ToolUpdateSink, Usage,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
-use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
+use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
 use serde_json::{json, Value};
+
+use super::support::*;
 
 // ---------------------------------------------------------------------------
 // Harness
 // ---------------------------------------------------------------------------
-
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
-
-fn obj_schema() -> Value {
-    json!({ "type": "object" })
-}
 
 /// A distinctive [`Usage`] so an assertion cannot pass on a `Default`.
 fn usage(input: u64, output: u64) -> Usage {
@@ -56,70 +42,6 @@ fn usage(input: u64, output: u64) -> Usage {
         total_tokens: input + output,
         cost: Cost { input: 0.5, output: 1.5, cache_read: 0.0, cache_write: 0.0, total: 2.0 },
     }
-}
-
-/// Records the `Context.messages` of every provider request, then delegates to the faux provider.
-struct PayloadRecordingStreamFn {
-    inner: Arc<dyn StreamFn>,
-    payloads: Arc<Mutex<Vec<Vec<Message>>>>,
-}
-
-impl StreamFn for PayloadRecordingStreamFn {
-    fn stream(
-        &self,
-        model: &ModelRef,
-        ctx: &Context,
-        opts: &StreamOptions,
-    ) -> EventStream<StreamEvent> {
-        self.payloads.lock().unwrap().push(ctx.messages.clone());
-        self.inner.stream(model, ctx, opts)
-    }
-}
-
-type PayloadLog = Arc<Mutex<Vec<Vec<Message>>>>;
-
-fn payload_recording(
-    responses: Vec<cyrup_core::AssistantMessage>,
-) -> (Arc<dyn StreamFn>, PayloadLog) {
-    let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(responses);
-    let provider: Arc<dyn Provider> = faux;
-    let inner: Arc<dyn StreamFn> = Arc::new(ProviderStreamFn::new(provider));
-    let payloads = Arc::new(Mutex::new(Vec::new()));
-    let sf: Arc<dyn StreamFn> =
-        Arc::new(PayloadRecordingStreamFn { inner, payloads: payloads.clone() });
-    (sf, payloads)
-}
-
-#[derive(Default)]
-struct Recorder {
-    events: Mutex<Vec<AgentEvent>>,
-}
-
-#[async_trait::async_trait]
-impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
-        self.events.lock().unwrap().push(event.clone());
-    }
-}
-
-impl Recorder {
-    fn snapshot(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
-/// The `turn_end.toolResults` of the FIRST turn that produced any.
-fn first_turn_results(events: &[AgentEvent]) -> Vec<ToolResultMessage> {
-    events
-        .iter()
-        .find_map(|e| match e {
-            AgentEvent::TurnEnd { tool_results, .. } if !tool_results.is_empty() => {
-                Some(tool_results.clone())
-            }
-            _ => None,
-        })
-        .expect("a turn_end carrying tool results")
 }
 
 /// The `message_end` payloads that carry a tool result.
@@ -224,7 +146,7 @@ async fn tool_reported_usage_surfaces_on_events_and_next_turn_payload() {
         faux_assistant_message(vec![faux_tool_call("meter", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
     agent.subscribe(rec.clone());
 
@@ -264,7 +186,7 @@ async fn absent_usage_emits_no_key() {
         faux_assistant_message(vec![faux_tool_call("plain", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).tools(vec![tool]).build();
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
@@ -314,7 +236,7 @@ async fn after_tool_call_observes_then_replaces_usage() {
         faux_assistant_message(vec![faux_tool_call("meter", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![tool])
         .hooks(Arc::new(UsagePatchHook {
@@ -365,7 +287,7 @@ async fn override_without_usage_keeps_the_tools_usage_and_anchor() {
         faux_assistant_message(vec![faux_tool_call("meter", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![tool])
         .hooks(Arc::new(ContentOnlyHook))
@@ -407,7 +329,7 @@ async fn throwing_after_tool_call_clears_usage_and_anchor() {
         faux_assistant_message(vec![faux_tool_call("meter", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent =
         Agent::builder(model_ref(), sf).tools(vec![tool]).hooks(Arc::new(ThrowingHook)).build();
     agent.subscribe(rec.clone());
@@ -428,7 +350,7 @@ async fn immediate_error_result_carries_neither_field() {
         faux_assistant_message(vec![faux_tool_call("nope", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).build();
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
@@ -464,7 +386,7 @@ async fn added_tool_names_anchor_lands_on_the_introducing_result_and_nowhere_ear
         faux_assistant_message(vec![faux_tool_call("late", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).tools(vec![loader, late]).build();
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
@@ -536,7 +458,7 @@ async fn parallel_batch_preserves_per_result_anchors_in_source_order() {
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).tools(vec![a, b]).build();
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
@@ -597,7 +519,7 @@ async fn sequential_batch_preserves_per_result_anchors() {
         ),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![Arc::new(SeqTool(a)) as Arc<dyn Tool>, b])
         .build();
@@ -639,7 +561,7 @@ async fn failing_tool_anchors_nothing() {
         faux_assistant_message(vec![faux_tool_call("boom", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).tools(vec![Arc::new(Boom(obj_schema()))]).build();
     agent.subscribe(rec.clone());
     agent.prompt("go").await.unwrap().finished().await;
@@ -685,7 +607,7 @@ async fn an_announced_tool_is_still_subject_to_the_permission_gate() {
         faux_assistant_message(vec![faux_tool_call("late", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
     ]);
-    let rec = Arc::new(Recorder::default());
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf)
         .tools(vec![loader, late])
         .hooks(Arc::new(GateLateToolHook))

@@ -8,13 +8,6 @@
 //!   `agent-loop.ts:210,218-262`.
 //! - Gap #6 — an uncontained run failure reports the real panic message + aborted-vs-error, Pi
 //!   `agent.ts:496-511`.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::print_stdout
-)]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -22,24 +15,21 @@ use std::sync::{Arc, Mutex};
 use crate::{
     agent_loop, agent_loop_continue, run_agent_loop, run_agent_loop_continue, AfterOverride,
     AfterToolCall, Agent, AgentContext, AgentEvent, AgentEventSink, AgentLoopConfig, AgentMessage,
-    Hooks, HookError, PostTurn, ProviderStreamFn, StreamFn, TurnUpdate,
+    Hooks, HookError, PostTurn, StreamFn, TurnUpdate,
 };
 use cyrup_core::{
-    CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, RunCancel, StopReason, Tool,
-    ToolCallId, ToolError, ToolResult, ToolUpdateSink,
+    CancelToken, Content, EventStream, ModelRef, ModelThinkingLevel, RunCancel, StopReason,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
-use cyrup_provider::{Context, Provider, StreamEvent, StreamOptions};
+use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
+use cyrup_provider::{Context, StreamEvent, StreamOptions};
 use futures::StreamExt;
-use serde_json::{json, Value};
+use serde_json::json;
+
+use super::support::*;
 
 // ----------------------------------------------------------------------------
 // Wiring
 // ----------------------------------------------------------------------------
-
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
 
 /// A `StreamFn` that records the reasoning level forwarded on each provider call, then delegates to
 /// a faux provider for the event stream.
@@ -55,17 +45,10 @@ impl StreamFn for ReasoningRecorder {
     }
 }
 
-fn faux_stream_fn(responses: Vec<cyrup_core::AssistantMessage>) -> Arc<dyn StreamFn> {
-    let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(responses);
-    let provider: Arc<dyn Provider> = faux;
-    Arc::new(ProviderStreamFn::new(provider))
-}
-
 fn reasoning_recording(
     responses: Vec<cyrup_core::AssistantMessage>,
 ) -> (Arc<dyn StreamFn>, Arc<Mutex<Vec<ModelThinkingLevel>>>) {
-    let inner = faux_stream_fn(responses);
+    let inner = faux_stream_fn(responses).1;
     let reasoning = Arc::new(Mutex::new(Vec::new()));
     let sf: Arc<dyn StreamFn> = Arc::new(ReasoningRecorder { inner, reasoning: reasoning.clone() });
     (sf, reasoning)
@@ -86,59 +69,10 @@ impl AgentEventSink for RecSink {
 
 impl RecSink {
     fn names(&self) -> Vec<String> {
-        self.events.lock().unwrap().iter().map(ev_name).collect()
+        self.events.lock().unwrap().iter().map(ev_kind).collect()
     }
     fn turn_starts(&self) -> usize {
         self.events.lock().unwrap().iter().filter(|e| matches!(e, AgentEvent::TurnStart)).count()
-    }
-}
-
-fn ev_name(e: &AgentEvent) -> String {
-    match e {
-        AgentEvent::AgentStart => "agent_start".into(),
-        AgentEvent::TurnStart => "turn_start".into(),
-        AgentEvent::MessageStart { .. } => "message_start".into(),
-        AgentEvent::MessageUpdate { .. } => "message_update".into(),
-        AgentEvent::MessageEnd { .. } => "message_end".into(),
-        AgentEvent::ToolExecutionStart { .. } => "tool_execution_start".into(),
-        AgentEvent::ToolExecutionUpdate { .. } => "tool_execution_update".into(),
-        AgentEvent::ToolExecutionEnd { .. } => "tool_execution_end".into(),
-        AgentEvent::TurnEnd { .. } => "turn_end".into(),
-        AgentEvent::AgentEnd { .. } => "agent_end".into(),
-    }
-}
-
-fn obj_schema() -> Value {
-    json!({ "type": "object" })
-}
-
-struct EchoTool {
-    name: String,
-    params: Value,
-}
-
-impl EchoTool {
-    fn new(name: &str) -> Arc<Self> {
-        Arc::new(Self { name: name.into(), params: obj_schema() })
-    }
-}
-
-#[async_trait::async_trait]
-impl Tool for EchoTool {
-    fn name(&self) -> &str {
-        &self.name
-    }
-    fn parameters(&self) -> &Value {
-        &self.params
-    }
-    async fn execute(
-        &self,
-        _call_id: ToolCallId,
-        _params: Value,
-        _cancel: CancelToken,
-        _on_update: ToolUpdateSink,
-    ) -> Result<ToolResult, ToolError> {
-        Ok(ToolResult { content: vec![Content::text("echoed")], details: None, terminate: false, ..Default::default() })
     }
 }
 
@@ -177,7 +111,7 @@ async fn gap4_prepare_next_turn_override_is_sticky_across_later_turns() {
     ]);
     let agent = Agent::builder(model_ref(), sf)
         .thinking_level(ModelThinkingLevel::Low)
-        .tools(vec![EchoTool::new("echo")])
+        .tools(vec![EchoTool::named("echo")])
         .hooks(Arc::new(StickyThinkingHook { overridden: AtomicUsize::new(0) }))
         .build();
 
@@ -225,9 +159,9 @@ async fn gap5_terminate_still_runs_post_turn_hooks_and_drains_follow_up() {
     let sf = faux_stream_fn(vec![
         faux_assistant_message(vec![faux_tool_call("echo", json!({}))], StopReason::ToolUse),
         faux_assistant_message(vec![faux_text("after follow-up")], StopReason::Stop),
-    ]);
+    ]).1;
     let agent = Agent::builder(model_ref(), sf)
-        .tools(vec![EchoTool::new("echo")])
+        .tools(vec![EchoTool::named("echo")])
         .hooks(hook.clone())
         .build();
 
@@ -269,7 +203,7 @@ impl Hooks for ExplodingHook {
 
 #[tokio::test]
 async fn gap6_run_failure_surfaces_real_panic_message_and_error_stop_reason() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]).1;
     let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(ExplodingHook)).build();
 
     let new = agent.prompt("go").await.unwrap().finished().await;
@@ -303,28 +237,6 @@ async fn gap6_run_failure_surfaces_real_panic_message_and_error_stop_reason() {
 // `toolResults`) → `agent_end` carrying `[failureMessage]`.
 // ============================================================================
 
-/// Records every event the AGENT (not the free-function loop) publishes, in order.
-#[derive(Default)]
-struct AgentRec {
-    events: Mutex<Vec<AgentEvent>>,
-}
-
-#[async_trait::async_trait]
-impl crate::EventSubscriber for AgentRec {
-    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
-        self.events.lock().unwrap().push(event.clone());
-    }
-}
-
-impl AgentRec {
-    fn names(&self) -> Vec<String> {
-        self.events.lock().unwrap().iter().map(ev_name).collect()
-    }
-    fn snapshot(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap().clone()
-    }
-}
-
 /// `prepare_next_turn` fails (Pi: throws) after the first turn completes.
 struct FailingPrepareHook;
 
@@ -345,21 +257,10 @@ impl Hooks for FailingStopHook {
     }
 }
 
-fn last_assistant(events: &[AgentEvent]) -> cyrup_core::AssistantMessage {
-    events
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            AgentEvent::MessageEnd { message: AgentMessage::Assistant(a) } => Some(a.clone()),
-            _ => None,
-        })
-        .expect("an assistant message_end")
-}
-
 #[tokio::test]
 async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
-    let rec = Arc::new(AgentRec::default());
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]).1;
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(FailingPrepareHook)).build();
     agent.subscribe(rec.clone());
 
@@ -420,8 +321,8 @@ async fn agent007_failing_prepare_next_turn_emits_pis_full_failure_quartet() {
 
 #[tokio::test]
 async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]);
-    let rec = Arc::new(AgentRec::default());
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("a1")], StopReason::Stop)]).1;
+    let rec = Arc::new(EventRecorder::default());
     let agent = Agent::builder(model_ref(), sf).hooks(Arc::new(FailingStopHook)).build();
     agent.subscribe(rec.clone());
 
@@ -447,7 +348,7 @@ async fn agent007_failing_should_stop_after_turn_emits_pis_full_failure_quartet(
 
 #[tokio::test]
 async fn gap3_run_agent_loop_pushes_ordered_events_and_returns_new_messages() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("hello")], StopReason::Stop)]);
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("hello")], StopReason::Stop)]).1;
     let sink = Arc::new(RecSink::default());
     let cancel = RunCancel::new();
     let ctx = AgentContext { system_prompt: "sys".into(), messages: Vec::new(), tools: Vec::new() };
@@ -481,7 +382,7 @@ async fn gap3_run_agent_loop_pushes_ordered_events_and_returns_new_messages() {
 
 #[tokio::test]
 async fn gap3_agent_loop_pull_stream_finalizes_to_new_messages() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("yo")], StopReason::Stop)]);
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("yo")], StopReason::Stop)]).1;
     let cancel = RunCancel::new();
     let ctx = AgentContext::default();
     let config = AgentLoopConfig::new(model_ref());
@@ -505,7 +406,7 @@ async fn gap3_agent_loop_pull_stream_finalizes_to_new_messages() {
 
 #[tokio::test]
 async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]).1;
     let sink = Arc::new(RecSink::default()) as Arc<dyn AgentEventSink>;
 
     // Empty transcript => NoMessages.
@@ -551,7 +452,7 @@ async fn gap3_run_agent_loop_continue_rejects_empty_and_trailing_assistant() {
 
 #[tokio::test]
 async fn gap3_run_agent_loop_continue_resumes_from_user_tail() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("resumed")], StopReason::Stop)]);
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("resumed")], StopReason::Stop)]).1;
     let sink = Arc::new(RecSink::default());
     // Transcript ends with a user message => a valid continuation point.
     let ctx = AgentContext {
@@ -578,7 +479,7 @@ async fn gap3_run_agent_loop_continue_resumes_from_user_tail() {
 
 #[tokio::test]
 async fn gap3_agent_loop_continue_pull_stream_validates_up_front() {
-    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let sf = faux_stream_fn(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]).1;
     // A trailing assistant message must be rejected synchronously, before spawning.
     let ctx = AgentContext {
         system_prompt: String::new(),

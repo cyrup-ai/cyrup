@@ -60,7 +60,8 @@ impl AgentSession {
             let mut follow_up = Self::lock(&self.follow_up_messages);
             (std::mem::take(&mut *steering), std::mem::take(&mut *follow_up))
         };
-        self.agent.drain_queues_for_restore();
+        // Discarded: the agent's queued copies duplicate the mirror text taken just above.
+        let _ = self.agent.drain_queues_for_restore();
         self.emit_queue_update().await;
         drained
     }

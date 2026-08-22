@@ -18,48 +18,13 @@
 //!
 //! Offline throughout: the faux provider only. No network, no provider API.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic
-)]
+use std::sync::Arc;
 
-use std::sync::{Arc, Mutex};
+use crate::{Agent, AgentEvent, AgentMessage};
+use cyrup_core::{AssistantMessage, StopReason};
+use cyrup_provider::faux::{faux_assistant_message, faux_text};
 
-use crate::{Agent, AgentEvent, AgentMessage, EventSubscriber, ProviderStreamFn, StreamFn};
-use cyrup_core::{AssistantMessage, CancelToken, ModelRef, StopReason};
-use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
-use cyrup_provider::Provider;
-
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
-
-fn faux_stream_fn(responses: Vec<AssistantMessage>) -> Arc<dyn StreamFn> {
-    let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(responses);
-    let provider: Arc<dyn Provider> = faux;
-    Arc::new(ProviderStreamFn::new(provider))
-}
-
-#[derive(Default)]
-struct Recorder {
-    events: Mutex<Vec<AgentEvent>>,
-}
-
-#[async_trait::async_trait]
-impl EventSubscriber for Recorder {
-    async fn on_event(&self, event: &AgentEvent, _cancel: CancelToken) {
-        self.events.lock().unwrap().push(event.clone());
-    }
-}
-
-impl Recorder {
-    fn snapshot(&self) -> Vec<AgentEvent> {
-        self.events.lock().unwrap().clone()
-    }
-}
+use super::support::*;
 
 fn assistant(m: &AgentMessage) -> Option<&AssistantMessage> {
     match m {
@@ -70,8 +35,8 @@ fn assistant(m: &AgentMessage) -> Option<&AssistantMessage> {
 
 /// Run one prompt against a scripted faux response and return the recorded event stream.
 async fn run(scripted: AssistantMessage) -> Vec<AgentEvent> {
-    let agent = Agent::builder(model_ref(), faux_stream_fn(vec![scripted])).build();
-    let recorder = Arc::new(Recorder::default());
+    let agent = Agent::builder(model_ref(), faux_stream_fn(vec![scripted]).1).build();
+    let recorder = Arc::new(EventRecorder::default());
     agent.subscribe(recorder.clone());
     let handle = agent.prompt("hi").await.unwrap();
     handle.finished().await;

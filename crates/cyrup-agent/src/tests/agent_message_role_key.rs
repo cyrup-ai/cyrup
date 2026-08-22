@@ -10,8 +10,6 @@
 //! Every pre-existing assertion looked at PARSED values, where a duplicate key is invisible. These
 //! assert on the RAW BYTES, which is the only place the bug is observable.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
-
 use crate::AgentMessage;
 use cyrup_core::AssistantMessage;
 

@@ -1,9 +1,5 @@
 //! Prompt normalization — [`PromptInput`] and its conversions (Pi `normalizePromptInput`).
 
-// `Agent` is in scope solely for the intra-doc link on `PromptInput` below, which resolved
-// implicitly while this type lived in the same file as `Agent`.
-#[allow(unused_imports)]
-use super::Agent;
 use super::util::now_millis;
 use crate::event::AgentMessage;
 use cyrup_core::Content;
@@ -12,7 +8,7 @@ use cyrup_core::Content;
 // Public entry-point helpers
 // ---------------------------------------------------------------------------
 
-/// Input to [`Agent::prompt`]. Convertible from `&str`/`String`/`AgentMessage`/`Vec<AgentMessage>`.
+/// Input to [`crate::Agent::prompt`]. Convertible from `&str`/`String`/`AgentMessage`/`Vec<AgentMessage>`.
 pub struct PromptInput {
     pub messages: Vec<AgentMessage>,
 }

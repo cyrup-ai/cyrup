@@ -1,37 +1,16 @@
 //! Preflight tool-argument validation + coercion (func-02 R-02-020 / func-01 R-01-034), driven by
 //! the faux provider and a tool whose schema requires `{ "n": integer }`.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::indexing_slicing,
-    clippy::panic,
-    clippy::print_stdout
-)]
 
 use std::sync::{Arc, Mutex};
 
-use crate::{Agent, AgentMessage, ProviderStreamFn, StreamFn};
+use crate::{Agent, AgentMessage};
 use cyrup_core::{
-    CancelToken, Content, ModelRef, StopReason, Tool, ToolCallId, ToolError, ToolResult,
-    ToolUpdateSink,
+    CancelToken, Content, StopReason, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink,
 };
-use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call, FauxProvider};
-use cyrup_provider::Provider;
+use cyrup_provider::faux::{faux_assistant_message, faux_text, faux_tool_call};
 use serde_json::{json, Value};
 
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
-
-fn faux_stream_fn(
-    responses: Vec<cyrup_core::AssistantMessage>,
-) -> (Arc<FauxProvider>, Arc<dyn StreamFn>) {
-    let faux = Arc::new(FauxProvider::new());
-    faux.set_responses(responses);
-    let provider: Arc<dyn Provider> = faux.clone();
-    let sf: Arc<dyn StreamFn> = Arc::new(ProviderStreamFn::new(provider));
-    (faux, sf)
-}
+use super::support::*;
 
 /// A tool requiring `{ "n": integer }` that records every params object it actually executes with.
 struct IntTool {

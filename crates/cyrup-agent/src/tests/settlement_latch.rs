@@ -16,18 +16,15 @@
 //! `start_run` now claims the latch with `watch::Sender::send_if_modified` (a compare-and-set under
 //! the channel's own write lock) and the guard's `send(false)` is the only release, so an observed
 //! `false` and "a new run may start" are the same fact.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::sync::Arc;
 
 use crate::{Agent, AgentError, ProviderStreamFn, StreamFn};
-use cyrup_core::{ModelRef, StopReason};
+use cyrup_core::StopReason;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
 
-fn model_ref() -> ModelRef {
-    ModelRef { provider: "faux".into(), api: Some("faux".into()), model: "faux-1".into() }
-}
+use super::support::model_ref;
 
 /// A faux stream fn that answers every turn identically, so a run costs almost nothing and the
 /// settlement edge can be hammered.
