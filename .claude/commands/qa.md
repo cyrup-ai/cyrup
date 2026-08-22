@@ -197,10 +197,10 @@ After QA completes, present the user with two options:
 `/tests` — run the test suite and fix regressions introduced by this branch before committing.
 
 **Option B — Start PIPELINE B (self-review your changes):**
-`/review` → `/address-feedback` → `/ask all` → `/exec` → `/qa` → `/commit`
+`/code-review` → `/address-feedback` → `/ask all` → `/exec` → `/qa` → `/commit`
 Start here to review your own changes before creating a PR.
 
-Valid `//flux` commands: `/config`, `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/code-review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

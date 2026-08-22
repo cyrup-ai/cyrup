@@ -28,14 +28,30 @@ source "$CONFIG_FILE" 2>/dev/null
 echo "TEST_CMD: ${TEST_CMD:-<not set>}"
 ```
 
-If `TEST_CMD` is empty or config file is missing:
+If `TEST_CMD` is empty or the config file is missing, set it here — there is no separate config
+command. Detect a sensible default from the project, then confirm it:
 
-```
-Error: TEST_CMD is not configured.
-Run /config to set your test command.
+```bash
+if [ -f "Cargo.toml" ]; then SUGGESTED="cargo nextest run --workspace"
+elif [ -f "package.json" ]; then SUGGESTED="npm test"
+elif [ -f "go.mod" ]; then SUGGESTED="go test ./..."
+elif [ -f "pyproject.toml" ] || [ -f "requirements.txt" ]; then SUGGESTED="pytest -q"
+else SUGGESTED=""
+fi
+echo "SUGGESTED: ${SUGGESTED:-<none detected>}"
 ```
 
-Stop.
+Use `ask_user_question` — question: "No `TEST_CMD` configured. Use `$SUGGESTED`?" / header: "Test
+command" / options: `Use it` → take `$SUGGESTED`; `Enter a different one` → take the user's answer.
+With nothing detected, ask for the command outright. Then persist it so later runs skip this:
+
+```bash
+mkdir -p "$FLUX_BASE"
+printf 'TEST_CMD=%s\n' "$TEST_CMD" > "$CONFIG_FILE"
+echo "Saved TEST_CMD to $CONFIG_FILE"
+```
+
+Only stop if the user declines to supply a command.
 
 ## STEP 2: Establish baseline (pre-existing failures)
 
@@ -148,7 +164,7 @@ If `U > 0`, recommend the user review those manually before committing.
 
 Then propose the next step: `/commit` (include arguments if needed).
 
-Valid `//flux` commands: `/config`, `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/code-review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS

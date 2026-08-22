@@ -406,7 +406,7 @@ The zip from STEP 12 is still written — posting supplements the hand-off, it d
 ## HARD CONSTRAINTS
 
 - **Path**: All `write`/`edit`/`mv`/`cp` file paths MUST use the exact `FLUX_BASE` value printed by STEP 2 or STEP 7 bash output (e.g. `FLUX_BASE=/Users/...`). Copy it character-for-character — never reconstruct it from `cwd` or memory.
-- `/review` MUST NOT modify any source files. The only permitted file operations are: creating issue task files in `$FLUX_BASE/review/`, moving/deleting those files during deduplication, creating the zip archive, and writing the STEP 13 review payload under `$FLUX_BASE`. No changes to `./src/`, no git commits, no pushes.
+- `/code-review` MUST NOT modify any source files. The only permitted file operations are: creating issue task files in `$FLUX_BASE/review/`, moving/deleting those files during deduplication, creating the zip archive, and writing the STEP 13 review payload under `$FLUX_BASE`. No changes to `./src/`, no git commits, no pushes.
 - **Posting is the one outward-facing action this command takes.** It requires the STEP 13b confirmation every time — never post because the review "looks done", because a previous run was approved, or because the user asked for a review. Reviewing and publishing a review are different requests.
 - Never post `APPROVE` or `REQUEST_CHANGES` on the user's own PR (`IS_MY_BRANCH=true`); GitHub rejects it and the whole submission fails.
 
@@ -418,7 +418,7 @@ Then propose the next step:
 - if the review was posted in STEP 13: nothing further — the PR now carries the findings
 - if user is reviewing someone else's PR and did not post: `share the zip with the author`
 
-Valid `//flux` commands: `/config`, `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
+Valid `//flux` commands: `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/code-review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
 
 =================
 $ARGUMENTS
