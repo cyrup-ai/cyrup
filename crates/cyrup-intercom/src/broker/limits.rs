@@ -1,9 +1,11 @@
-//! The broker's ported module-level constants (`broker.ts:25-42`).
+//! The broker's ported module-level constants (`broker.ts:25-42`), plus the two that have no named
+//! upstream counterpart.
 //!
-//! Every value here is upstream's, named after upstream's constant and carrying its citation. They
-//! are gathered in one file because they are consumed across the whole broker — the caps by
-//! `state`/`session`, the retentions by `mailbox`/`receipts`, the two delays by `conn`/`lifecycle` —
-//! and reading them together is how a reviewer checks the port against `broker.ts` in one pass.
+//! Nine of the eleven are upstream's, named after upstream's constant and carrying its citation.
+//! The exceptions are called out where they are defined: `SHUTDOWN_DELAY_MS` is upstream's 5 s
+//! delay read off `broker.ts:295` rather than a named constant, and `READ_BUF` is a cyrup reader
+//! detail with no upstream counterpart at all. They are gathered in one file because reading them
+//! together is how a reviewer checks the port against `broker.ts` in one pass.
 
 /// `MAX_SESSIONS = 128` (`broker.ts:25`).
 pub(super) const MAX_SESSIONS: usize = 128;

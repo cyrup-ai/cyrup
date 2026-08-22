@@ -4,7 +4,7 @@
 //!
 //! These are not conveniences: a peer may be matching on the exact string the broker sends back, so
 //! `String(x)` and `!!x` are ported rather than approximated. Split out of `broker/mod.rs` because
-//! they are pure functions over `serde_json::Value` with no broker state involved at all.
+//! they are pure functions with no broker state involved at all.
 
 /// `String(msg.namespace || "")` — the expression pi echoes into the two `extension_state_result`
 /// frames it emits *before* `namespace` has been type-checked

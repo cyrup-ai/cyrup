@@ -1,10 +1,11 @@
 //! The `presence` frame and its context-usage tri-state
 //! (`v0.9.2 broker/broker.ts:900-960`).
 //!
-//! [`BrokerState::handle_presence`] coalesces presence into at most one broadcast per
-//! [`super::limits::PRESENCE_HEARTBEAT_MS`]; [`apply_presence_context`] ports the absent/`null`/number
-//! tri-state that decides whether a field is left alone, cleared, or set — and whether that counts
-//! as a change worth broadcasting.
+//! [`BrokerState::handle_presence`] broadcasts on any change, and on an unchanged `presence` frame
+//! only once [`super::limits::PRESENCE_HEARTBEAT_MS`] has passed since that session's last
+//! broadcast — the coalescing is frame-driven, not timed. [`apply_presence_context`] ports the
+//! absent/`null`/number tri-state that decides whether a field is left alone, cleared, or set — and
+//! whether that counts as a change worth broadcasting.
 
 
 use crate::transport::protocol::BrokerMessage;

@@ -6,7 +6,8 @@
 //! [`BrokerState::flush_mailbox_for_session`] when that identity registers again.
 //!
 //! Split out of `broker/mod.rs`, where these eight methods sat interleaved with the connection
-//! bookkeeping they do not depend on. Their only outward calls are to `state` primitives.
+//! bookkeeping. Nothing here calls a frame handler — `state`, `session`, `send` and `receipts` all
+//! call inward, never the reverse — so `mailbox` is a leaf of the handler layer.
 
 use crate::transport::protocol::{BrokerMessage, Message, SessionInfo, now_ms};
 

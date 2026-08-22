@@ -2,7 +2,8 @@
 //! (`broker.ts:123-152,181,286-296,606-633,636`).
 //!
 //! [`run`] is the `cyrup __intercom-broker` entrypoint, re-exported as `crate::broker::run` — the
-//! only public item the broker has. It binds the listen target through
+//! only public item the module root itself contributes; the four `pub mod` siblings export their
+//! own. It binds the listen target through
 //! [`super::listener::BrokerListener`], claims the runtime files, runs the accept loop, and returns
 //! once SIGTERM/SIGINT or the 5 s idle auto-shutdown has cleaned everything up.
 //!

@@ -2,8 +2,9 @@
 //! (`broker.ts:196-232`, `framing.ts:29-51`).
 //!
 //! [`writer_task`] drains queued frames; [`reader_task`] reassembles them, spends a rate-limit
-//! token, and dispatches each to [`super::state::BrokerState::handle_frame`] while honoring the 1 s
-//! registration timeout. [`spawn_connection`] is the pair's constructor, called from the accept loop
+//! token, and dispatches each to [`super::state::BrokerState::handle_frame`] — the switch itself
+//! lives in `super::dispatch` — while honoring the 1 s registration timeout.
+//! [`spawn_connection`] is the pair's constructor, called from the accept loop
 //! in `super::lifecycle`.
 //!
 //! Split out of `broker/mod.rs` to separate "what one connection does" from "what the process does".

@@ -2,7 +2,8 @@
 //!
 //! `make_state`/`make_tx`/`register` existed in duplicate while the tests lived in two modules at
 //! the bottom of `broker/mod.rs`; the copies were identical apart from JSON literal wrapping, so
-//! they are kept once here and imported by each concern's `mod tests`.
+//! they are kept once here and imported by the six `mod tests` that need them — `state`, `session`,
+//! `send`, `receipts`, `mailbox` and `conn`.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 

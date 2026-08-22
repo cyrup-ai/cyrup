@@ -2,8 +2,11 @@
 //! (`v0.10.1 broker/broker.ts:80-84,676-696` and the `cancel_message` case).
 //!
 //! A delivered message records where it went, so a receipt from the receiver can be forwarded back
-//! to the original sender and so that sender can later `cancel` or `supersede` it. Both handlers
-//! answer a miss with a silent `break` rather than an error frame, exactly as upstream does.
+//! to the original sender and so that sender can later `cancel` or `supersede` it.
+//! [`BrokerState::handle_message_receipt`] answers every miss with a silent `break`, exactly as
+//! upstream does; [`BrokerState::handle_cancel_message`] answers a well-formed cancel instead —
+//! `delivered` when it lands, `delivery_failed` with upstream's reason when the route does not
+//! authorise it — and, like every handler, destroys the connection on a malformed frame.
 //!
 //! Split out of `broker/mod.rs`; the route table itself lives on `BrokerState` in `state`.
 
