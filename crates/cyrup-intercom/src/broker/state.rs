@@ -1,10 +1,10 @@
 //! The broker's in-memory routing state and the primitives that maintain it
 //! (`broker.ts:32-36,132-139`).
 //!
-//! [`BrokerState`] is upstream's `IntercomBroker` field block; the methods here are the bookkeeping
-//! every frame handler builds on — connection tracking, the join-ordered session map, the broadcast
-//! fan-out, and the ask-edge/receipt-route pruning. The frame handlers themselves live in the
-//! sibling modules (`dispatch`, `session`, `send`, `receipts`, `presence`, `extensions`) and the
+//! [`BrokerState`] is upstream's `IntercomBroker` field block; the methods here are the shared
+//! bookkeeping the frame handlers build on — connection tracking, the join-ordered session map, the
+//! broadcast fan-out, and the ask-edge/receipt-route pruning. The frame handlers themselves live in
+//! the sibling modules (`dispatch`, `session`, `send`, `receipts`, `presence`, `extensions`) and the
 //! offline-delivery machinery in `mailbox`; all of them are `impl BrokerState` blocks over this
 //! type, which is why its fields are `pub(super)` rather than private.
 

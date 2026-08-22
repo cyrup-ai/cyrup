@@ -6,7 +6,7 @@
 //! [`BrokerState::handle_message_receipt`] answers every miss with a silent `break`, exactly as
 //! upstream does; [`BrokerState::handle_cancel_message`] answers a well-formed cancel instead —
 //! `delivered` when it lands, `delivery_failed` with upstream's reason when the route does not
-//! authorise it — and, like every handler, destroys the connection on a malformed frame.
+//! authorise it — and destroys the connection on a malformed frame.
 //!
 //! Split out of `broker/mod.rs`; the route table itself lives on `BrokerState` in `state`.
 

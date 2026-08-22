@@ -2,9 +2,10 @@
 //! (`broker.ts:336-420` and the `v0.10.1` mailbox-flush additions).
 //!
 //! [`BrokerState::handle_register`] is the crate's registration handshake — caps, takeover, the
-//! join-order insert, the mailbox flush for a returning identity, and the `registered` +
-//! `presence_update` fan-out. Split out of `broker/mod.rs` as the one concern that owns a session's
-//! arrival and departure.
+//! join-order insert, the mailbox flush for a returning identity, and the `registered` reply plus
+//! the `session_joined` broadcast. Split out of `broker/mod.rs` as the concern that owns the
+//! `register`/`unregister`/`list` frames; a session can also leave without an `unregister` — that
+//! path is `BrokerState::on_connection_closed` in `state`.
 
 use tokio::sync::mpsc::UnboundedSender;
 

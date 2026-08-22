@@ -8,7 +8,7 @@
 //! Split out of `broker/mod.rs` as the one place that names every handler, so no handler module
 //! ever dispatches to another. They still share types and validators across module lines —
 //! `session` imports `extensions::extensions_field_is_valid`, `send` and `mailbox` name
-//! `receipts::MessageReceiptRoute` — but the routing decision is only ever made here.
+//! `receipts::MessageReceiptRoute` — but the frame-type dispatch happens only here.
 
 use tokio::sync::mpsc::UnboundedSender;
 
