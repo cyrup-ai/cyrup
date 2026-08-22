@@ -1,7 +1,7 @@
 ---
-stage: exec
-status: done
-updated: 2026-08-22 16:59
+stage: qa
+status: completed
+updated: 2026-08-22 17:04
 ---
 
 # Fix Two False Rationale Comments In The ctx Decomposition
