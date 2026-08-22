@@ -14,9 +14,10 @@ If `$ARGUMENTS` contains additional instructions, apply them — they override d
 ## STEP 1: Setup
 
 ```bash
-FLUX_ROOT="${FLUX_ROOT:-$HOME/.flux}"
-FLUX_DIR=$(printf '%s' "$(pwd -P)" | tr -cs 'a-zA-Z0-9' '-')
-FLUX_BASE="$FLUX_ROOT/$FLUX_DIR"
+# Project-local and checked in: the task queue travels with the repo, so it is visible in
+# review, survives a fresh clone, and is the same for everyone. Resolves from the repo root,
+# so it is identical no matter which subdirectory the command runs from.
+FLUX_BASE="${FLUX_BASE:-$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)/.flux}"
 CONFIG_FILE="$FLUX_BASE/config.env"
 mkdir -p "$FLUX_BASE/todo" "$FLUX_BASE/done" "$FLUX_BASE/review" "$FLUX_BASE/research"
 ```
