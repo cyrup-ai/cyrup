@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 17:24
+stage: qa
+status: completed
+updated: 2026-08-22 18:06
 ---
 
 # Record the No-Panic Lint Blind Spot Inside the str_id! Macro

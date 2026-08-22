@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 17:24
+stage: qa
+status: completed
+updated: 2026-08-22 18:06
 ---
 
 # Repair Three Stale file:line Citations in cyrup-core Docs

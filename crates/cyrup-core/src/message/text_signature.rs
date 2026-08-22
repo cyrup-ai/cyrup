@@ -17,8 +17,10 @@ pub enum TextPhase {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextSignatureV1 {
-    /// Schema version — always `1` (Pi `v: 1`).
-    pub v: u8,
+    /// Schema version — always `1` (Pi `v: 1`). Private so the invariant is enforced by
+    /// [`TextSignatureV1::new`] rather than merely documented; serde still reads/writes it, so the
+    /// wire form is unchanged. Read it via [`TextSignatureV1::version`].
+    v: u8,
     pub id: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub phase: Option<TextPhase>,
@@ -28,6 +30,12 @@ impl TextSignatureV1 {
     /// Build a V1 signature (`v` fixed to 1).
     pub fn new(id: impl Into<String>, phase: Option<TextPhase>) -> Self {
         Self { v: 1, id: id.into(), phase }
+    }
+
+    /// The schema version held by this signature — always `1` for values built by
+    /// [`TextSignatureV1::new`] or accepted by [`TextSignatureV1::parse`].
+    pub fn version(&self) -> u8 {
+        self.v
     }
 
     /// Parse a structured V1 signature from a `text_signature` string, or `None` for a legacy id

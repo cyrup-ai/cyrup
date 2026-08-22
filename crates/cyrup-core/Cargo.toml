@@ -16,10 +16,21 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 futures-core = { workspace = true }
-tokio = { workspace = true }
+# NOT `workspace = true`: the workspace entry turns on the union every member needs
+# (rt-multi-thread, macros, fs, process, io-util, signal), but this crate does "no I/O,
+# no tokio tasks of its own" (lib.rs) — its only tokio path is `tokio::sync::mpsc` in
+# event_stream.rs. Inheritance cannot express the narrowing: cargo hard-errors with
+# "`default-features = false` cannot override workspace's `default-features`", so the
+# version is spelled out here instead. Keep it in step with the workspace `tokio` version.
+# Caveat: this bounds only per-crate builds (`cargo check -p cyrup-core`). Under
+# resolver = "3" a `--workspace` build still unifies tokio's features across members.
+tokio = { version = "1", default-features = false, features = ["sync"] }
 tokio-stream = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# Same reason as above; tests additionally need `#[tokio::test]` (macros) and a
+# current-thread runtime to drive it (rt). `tokio::time::timeout` in the event_stream
+# tests rides on the `time` feature that tokio-stream's defaults already enable.
+tokio = { version = "1", default-features = false, features = ["macros", "rt", "sync"] }

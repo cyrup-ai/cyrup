@@ -64,10 +64,10 @@
 ///
 /// The cost of that strictness is that an unknown value fails `Deserialize`. On the session-load
 /// path that failure is absorbed one level up rather than propagated: `cyrup_session::Entry`'s
-/// `Deserialize` (`entry.rs:262-285`) falls back to `Entry::Unknown(Value)` when a known-tag line
+/// `Deserialize` (`entry.rs:295-317`) falls back to `Entry::Unknown(Value)` when a known-tag line
 /// does not fit the strict schema, so the line survives verbatim and `manager::load`'s `recovered`
 /// flag is never raised for it. Nothing is destroyed — but the entry stops being interpretable
-/// (`entries_have_assistant` answers `false` for it, `manager.rs:826-831`), so a genuinely new
+/// (`entries_have_assistant` answers `false` for it, `manager.rs:875-880`), so a genuinely new
 /// upstream stop reason must still be added HERE to be understood. Widening the enum with a
 /// tolerant catch-all would not fix that; it would only make the misunderstanding silent.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]

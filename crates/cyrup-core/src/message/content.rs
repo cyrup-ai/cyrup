@@ -6,11 +6,15 @@ use super::tool_call::ToolCall;
 ///
 /// Per-role typing (gap 9): Pi types content per role — assistant = `Text|Thinking|ToolCall`,
 /// user/toolResult = `Text|Image` (types.ts:379/385/402). cyrup keeps one ergonomic `Content` enum
-/// but enforces Pi's per-role unions at the wire boundary with validating deserializers
-/// ([`de_assistant_content`], [`de_user_content`], [`de_tool_result_content`]): a payload carrying
-/// an `Image` in an assistant turn — or a `ToolCall`/`Thinking` in a user/tool-result turn — is
-/// REJECTED on deserialize, exactly as Pi's typed unions reject it. Producers still build the right
-/// variants by construction.
+/// and, like Pi, does NOT enforce those unions on read: the per-role deserializers
+/// ([`de_assistant_content`], [`de_user_content`], [`de_tool_result_content`]) are READ-TOLERANT by
+/// design, so a payload carrying an `Image` in an assistant turn — or a `ToolCall`/`Thinking` in a
+/// user/tool-result turn — DESERIALIZES, it is not rejected. Pi's unions are compile-time
+/// TypeScript only; its session read path is `JSON.parse(line) as FileEntry` with a catch that
+/// skips only MALFORMED JSON (`parseSessionEntryLine`, `core/session-manager.ts:503-511`
+/// @v0.83.0), so any session JSONL Pi loads, cyrup loads. Do NOT "restore" a rejection Pi never
+/// had — that is the R-00-013 wire-interop regression the deserializer docs below warn against.
+/// Producers still build the right variants by construction.
 #[derive(Clone, Debug, PartialEq, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum Content {
@@ -247,6 +251,18 @@ mod tests {
         assert_eq!(v["thoughtSignature"], "g");
         // Round-trip (req 4): Pi input (with `type` present) deserializes back to an equal value.
         assert_eq!(serde_json::from_value::<Content>(v).expect("deserialize"), c);
+    }
+
+    #[test]
+    fn image_serializes_exact_pi_bytes_and_roundtrips() {
+        // Forward-direction pin for the last hand-written arm without one. `mimeType` (camelCase)
+        // is emitted by this serializer and nowhere else in the crate, and `type`/`data`/`mimeType`
+        // is Pi's key order for `ImageContent` — the only Image coverage before this was the
+        // deserialize-direction test below. Byte-exact on purpose (R-00-013).
+        let c = Content::Image { data: "AAAA".into(), mime_type: "image/png".into() };
+        let s = serde_json::to_string(&c).expect("serialize");
+        assert_eq!(s, r#"{"type":"image","data":"AAAA","mimeType":"image/png"}"#);
+        assert_eq!(serde_json::from_str::<Content>(&s).expect("deserialize"), c);
     }
 
     #[test]

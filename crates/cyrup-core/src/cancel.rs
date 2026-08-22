@@ -10,7 +10,7 @@ pub use tokio_util::sync::CancellationToken as CancelToken;
 
 /// One root cancellation token per agent run (arch-00 §3.2). No subsystem invents its own abort
 /// flag; this is the only mechanism.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RunCancel {
     root: CancelToken,
 }
@@ -63,5 +63,52 @@ mod tests {
         let rc = RunCancel::new();
         let out = rc.run_until(async { 42u8 }).await;
         assert_eq!(out, Some(42));
+    }
+
+    /// Root cancellation reaches every derived token — the `child()` contract that carries a run
+    /// abort into hooks and `Tool::execute` (arch-00 §3.2).
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_cancel_propagates_to_child_and_clone() {
+        let rc = RunCancel::new();
+        let child = rc.child();
+        let clone = rc.token();
+        assert!(!child.is_cancelled());
+        assert!(!clone.is_cancelled());
+
+        rc.cancel();
+
+        assert!(child.is_cancelled());
+        assert!(clone.is_cancelled());
+        let out = child.run_until_cancelled(std::future::pending::<()>()).await;
+        assert_eq!(out, None);
+    }
+
+    /// A child is cancellable independently: it must not abort the run or poison later children.
+    #[tokio::test(flavor = "current_thread")]
+    async fn child_cancel_does_not_propagate_to_root() {
+        let rc = RunCancel::new();
+        let child = rc.child();
+        child.cancel();
+
+        assert!(child.is_cancelled());
+        assert!(!rc.is_cancelled());
+        assert!(!rc.token().is_cancelled());
+        assert!(!rc.child().is_cancelled());
+        let out = rc.run_until(async { 7u8 }).await;
+        assert_eq!(out, Some(7));
+    }
+
+    /// `cancel()` is idempotent (func-02 R-02-045): the second call is a no-op, not a re-arm.
+    #[tokio::test(flavor = "current_thread")]
+    async fn cancel_is_idempotent() {
+        let rc = RunCancel::new();
+        rc.cancel();
+        assert!(rc.is_cancelled());
+        rc.cancel();
+        assert!(rc.is_cancelled());
+        assert!(rc.token().is_cancelled());
+        assert!(rc.child().is_cancelled());
+        let out = rc.run_until(async { 42u8 }).await;
+        assert_eq!(out, None);
     }
 }

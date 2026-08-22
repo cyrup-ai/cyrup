@@ -298,6 +298,72 @@ mod tests {
     }
 
     #[test]
+    fn assistant_message_every_optional_arm_emits_in_pi_field_order() {
+        // Pin for the six conditional serialize arms — `responseModel`, `responseId`,
+        // `diagnostics`, `deferred`, `errorMessage`, `rawStopReason`. The all-`None` tests above
+        // cannot observe them, so with every optional field `Some` all FOURTEEN of Pi's keys must
+        // appear, in Pi's declaration order (`v0.84.1 ai/src/types.ts:413-428`). A refactor that
+        // reorders or drops one fails here (cf. PROV-020: a mis-ordered key in a sibling
+        // serializer). Do NOT "fix" a failure by editing the serializer — the order IS the wire
+        // contract (R-00-013).
+        let m = AssistantMessage {
+            content: vec![Content::text("hi")],
+            provider: "faux".into(),
+            model: "faux-1".into(),
+            api: "faux".into(),
+            response_model: Some("faux-1-20260822".into()),
+            response_id: Some("resp_1".into()),
+            diagnostics: Some(vec![crate::diagnostics::AssistantMessageDiagnostic {
+                r#type: "retry".into(),
+                timestamp: 5,
+                error: None,
+                details: None,
+            }]),
+            usage: Usage::default(),
+            stop_reason: StopReason::Deferred,
+            deferred: Some(Box::new(DeferredHandle {
+                provider: "faux".into(),
+                model_id: "faux-1".into(),
+                api: "faux".into(),
+                id: "batch_1/row_2".into(),
+                expires_at: Some(1),
+                poll_after_ms: Some(2),
+                data: Some(serde_json::json!({ "k": "v" })),
+            })),
+            error_message: Some("boom".into()),
+            raw_stop_reason: Some("max_tokens".into()),
+            timestamp: 9,
+        };
+        let s = serde_json::to_string(&m).expect("serialize");
+        // Each pattern carries its `:` so a matching VALUE (`"stopReason":"deferred"`) can never be
+        // mistaken for the `"deferred":` key, and each search starts where the previous key ended so
+        // the nested `diagnostics`/`deferred` objects — which carry their own `timestamp`,
+        // `provider` and `api` keys — cannot satisfy an outer key early.
+        const KEYS: [&str; 14] = [
+            "\"role\":", "\"content\":", "\"api\":", "\"provider\":", "\"model\":",
+            "\"responseModel\":", "\"responseId\":", "\"diagnostics\":", "\"usage\":",
+            "\"stopReason\":", "\"deferred\":", "\"errorMessage\":", "\"rawStopReason\":",
+            "\"timestamp\":",
+        ];
+        let mut cursor = 0usize;
+        let mut offsets: Vec<usize> = Vec::with_capacity(KEYS.len());
+        for key in KEYS {
+            let at = s[cursor..]
+                .find(key)
+                .map(|rel| cursor + rel)
+                .unwrap_or_else(|| panic!("key {key} missing after byte {cursor}: {s}"));
+            offsets.push(at);
+            cursor = at + key.len();
+        }
+        assert!(offsets.windows(2).all(|w| w[0] < w[1]), "Pi field order: {s}");
+        // Not vacuous: the object carries exactly those 14 keys and nothing else.
+        let v = serde_json::to_value(&m).expect("serialize");
+        assert_eq!(v.as_object().expect("object").len(), KEYS.len(), "all 14 keys, no more: {v}");
+        let back: AssistantMessage = serde_json::from_str(&s).expect("deserialize");
+        assert_eq!(back, m);
+    }
+
+    #[test]
     fn assistant_message_api_is_required_on_the_wire() {
         // gap 7: Pi declares api: Api as required — it always serializes and must be present on read.
         let m = AssistantMessage::errored(

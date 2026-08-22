@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 17:24
+stage: qa
+status: completed
+updated: 2026-08-22 18:06
 ---
 
 # Make TextSignatureV1::v Private So the v == 1 Invariant Is Enforced

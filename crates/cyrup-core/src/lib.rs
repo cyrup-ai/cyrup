@@ -5,6 +5,7 @@
 //! model, the runtime-facing `Tool` trait, and the cross-cutting error vocabulary. No I/O, no
 //! tokio tasks of its own.
 #![forbid(unsafe_code)]
+#![warn(missing_debug_implementations)]
 
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ pub use diagnostics::{
 };
 pub use error::CoreError;
 pub use event_stream::{
-    finalizing_channel, Finalizing, FinalizingSink, FinalizingStream,
+    finalizing_channel, EventStream, Finalizing, FinalizingSink, FinalizingStream,
 };
 pub use message::{
     AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, StopReason,
@@ -37,13 +38,19 @@ pub use tool::{
     ExecMode, Tool, ToolError, ToolRenderKind, ToolResult, ToolUpdate, ToolUpdateSink,
 };
 
-/// The single streaming primitive used across provider, agent, and tools (arch-00 §3.1).
-///
-/// Transport failures are delivered AS terminal items of `T` (never in `Err`); see arch-00 §3.1
-/// and func-01 R-01-018.
-pub type EventStream<T> = std::pin::Pin<Box<dyn futures_core::Stream<Item = T> + Send + 'static>>;
-
 /// Newtype ids — never raw `String` (arch-00 §3.3). `Arc<str>`-backed for cheap clones.
+//
+// LINT BLIND SPOT — keep this body free of fallible operations.
+// The workspace no-panic policy (root Cargo.toml [workspace.lints.clippy]: `unwrap_used`,
+// `expect_used`, `panic`, `indexing_slicing` = deny) does NOT reach inside `macro_rules!`
+// expansions for three of its four lints. Verified on rustc 1.98.0 / clippy 0.1.98 by probing
+// this macro body: `unwrap()`, `expect()` and `panic!` produced NO diagnostic at any of the
+// eight `str_id!` invocations below, while the identical code in an ordinary `impl` block in
+// this same file produced all three errors. Only `indexing_slicing` fired from the expansion
+// (once per invocation). The gap is in clippy's from-expansion filtering, not in this crate's
+// configuration — do not try to "fix" it by raising or re-configuring the deny levels.
+// Consequence: code added here is effectively unlinted for panics, so anything fallible must
+// be written to be infallible by construction and reviewed by hand.
 macro_rules! str_id {
     ($name:ident) => {
         #[derive(Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

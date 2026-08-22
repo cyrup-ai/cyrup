@@ -916,11 +916,7 @@ fn parse_text_signature(signature: &str) -> Option<TextSignatureV1> {
     {
         return Some(v1);
     }
-    Some(TextSignatureV1 {
-        v: 1,
-        id: signature.to_string(),
-        phase: None,
-    })
+    Some(TextSignatureV1::new(signature, None))
 }
 
 /// The wire string for a [`TextPhase`] (Pi `commentary` / `final_answer`).
