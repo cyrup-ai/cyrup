@@ -24,10 +24,10 @@
 //! The guard is structural, the same shape as `run_loop_input_priority.rs`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-/// `app.rs` and `transcript.rs` verbatim, at compile time.
+/// `app.rs` and `transcript/cache.rs` verbatim, at compile time.
 const APP_SRC: &str = include_str!("../app/run.rs");
 const ARMS_SRC: &str = include_str!("../app/run_arms.rs");
-const TRANSCRIPT_SRC: &str = include_str!("../transcript.rs");
+const TRANSCRIPT_SRC: &str = include_str!("../transcript/cache.rs");
 
 /// The body of one run-loop arm: from the arm's first line to the start of the next arm.
 fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
