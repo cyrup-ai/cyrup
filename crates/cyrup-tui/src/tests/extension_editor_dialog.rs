@@ -17,25 +17,7 @@ use cyrup_session_svc::{UiKind, UiReply, UiRequest};
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, InputEvent, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
+use super::harness::*;
 
 fn editor_request(
     reply: tokio::sync::oneshot::Sender<UiReply>,

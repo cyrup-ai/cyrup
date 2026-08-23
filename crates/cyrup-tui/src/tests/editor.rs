@@ -12,10 +12,7 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::Terminal;
-
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
-}
+use super::harness::key_event as key;
 
 fn type_str(ed: &mut InputEditor, s: &str) {
     for c in s.chars() {

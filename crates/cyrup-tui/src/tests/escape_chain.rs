@@ -20,13 +20,10 @@
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, AppAction, AppCommand, Entry, InputEvent, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
+use super::harness::*;
 
 fn new_app() -> App<TestBackend> {
     App::new(TestBackend::new(80, 16), UiTheme::dark()).unwrap()
-}
-
-fn esc() -> InputEvent {
-    InputEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
 }
 
 fn type_str(app: &mut App<TestBackend>, s: &str) {

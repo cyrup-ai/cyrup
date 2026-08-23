@@ -373,13 +373,13 @@ pub(crate) fn path_command_argument(arg: &str) -> Option<String> {
     }
     let first = args.chars().next()?;
     if first == '"' || first == '\'' {
-        let rest = &args[first.len_utf8()..];
+        let rest = args.get(first.len_utf8()..)?;
         // `indexOf(firstChar, 1)`: the matching close. `< 0` (none) is upstream's `undefined`.
         let close = rest.find(first)?;
-        return Some(rest[..close].to_string());
+        return rest.get(..close).map(str::to_string);
     }
     match args.find(char::is_whitespace) {
-        Some(ws) => Some(args[..ws].to_string()),
+        Some(ws) => args.get(..ws).map(str::to_string),
         None => Some(args.to_string()),
     }
 }

@@ -21,7 +21,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::component::Component;
-use crate::settings_selector::{str_width, truncate_to_width};
+use crate::text_width::{str_width, truncate_to_width};
 use crate::theme::UiTheme;
 
 /// Default max visible rows (`editor.ts:333-334`), clamped to `[3, 20]`.
@@ -104,6 +104,7 @@ impl SelectList {
     }
 
     /// Set the empty-state text.
+    #[must_use]
     pub fn with_no_match(mut self, text: impl Into<String>) -> Self {
         self.no_match = text.into();
         self

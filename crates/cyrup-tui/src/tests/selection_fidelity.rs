@@ -32,6 +32,7 @@ use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::Terminal;
+use super::harness::key_event as key;
 
 // ---------------------------------------------------------------------------------------------
 // helpers
@@ -85,10 +86,6 @@ fn row_of(terminal: &Terminal<TestBackend>, needle: &str) -> u16 {
         }
     }
     panic!("row containing {needle:?} not found in:\n{s}");
-}
-
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 /// `app.tree.foldOrUp` — `["alt+left","ctrl+left"]` upstream (`keybindings.ts:119-122`, v0.83.0).

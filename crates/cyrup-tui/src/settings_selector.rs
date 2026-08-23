@@ -19,58 +19,11 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
-use unicode_segmentation::UnicodeSegmentation;
 
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{input_line_spans, stack_rows, Selector, SelectorOutcome};
+use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
-
-/// Visible (terminal column) width of `s` — unicode-width correct via ratatui's `Span::width`,
-/// which is Pi's `visibleWidth` (`packages/tui/src/utils.ts`). **Never `chars().count()`**: four
-/// separate width measurements in this crate have carried that defect.
-pub(crate) fn str_width(s: &str) -> usize {
-    Span::raw(s).width()
-}
-
-/// `truncateToWidth(text, maxWidth, ellipsis)` — `packages/tui/src/utils.ts:1053-1092`.
-///
-/// Width-aware and **grapheme-atomic**: the kept prefix is accumulated one grapheme cluster at a
-/// time, so a ZWJ sequence or a combining mark is never cut in half, and each cluster is measured
-/// with [`str_width`] rather than counted. `maxWidth <= 0` yields `""` (`:1059-1061`); when the
-/// ellipsis alone is at least as wide as the budget upstream clips the *ellipsis* and emits that
-/// (`:1067-1079`), which is what the `ew >= max` arm reproduces.
-///
-/// Lives here because `settings-list.ts` is the densest caller in the port (four calls: `:108`,
-/// `:143`, `:149`, `:239`); `config_selector.rs` — the other `truncateToWidth` consumer in this
-/// group — imports it rather than growing a second copy.
-pub(crate) fn truncate_to_width(s: &str, max: usize, ellipsis: &str) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if str_width(s) <= max {
-        return s.to_string();
-    }
-    let clip = |text: &str, budget: usize| {
-        let mut out = String::new();
-        let mut w = 0usize;
-        for g in text.graphemes(true) {
-            let gw = str_width(g);
-            if w.saturating_add(gw) > budget {
-                break;
-            }
-            out.push_str(g);
-            w = w.saturating_add(gw);
-        }
-        out
-    };
-    let ew = str_width(ellipsis);
-    if ew >= max {
-        return clip(ellipsis, max);
-    }
-    let mut out = clip(s, max.saturating_sub(ew));
-    out.push_str(ellipsis);
-    out
-}
 
 /// The field separator inside a [`SelectorOutcome::Apply`] / [`SelectorOutcome::Confirm`] payload
 /// (`"id\u{1f}value"`), an ASCII Unit Separator so it never collides with a setting id or value.
@@ -557,44 +510,6 @@ impl Selector for SettingsSelector {
     }
 }
 
-/// `truncateToWidth` applied to an already-styled row, preserving each span's own style across the
-/// cut (`settings-list.ts:143` truncates the *composed* string, ANSI and all — pi's
-/// `truncateToWidth` re-emits the pending codes with the next kept character, `utils.ts:1119-1122`).
-/// Reducing the row to one span before truncating would flatten the accent/muted split.
-pub(crate) fn truncate_line_to_width(line: Line<'static>, max: usize, ellipsis: &str) -> Line<'static> {
-    if line.width() <= max {
-        return line;
-    }
-    if max == 0 {
-        return Line::from("");
-    }
-    let budget = max.saturating_sub(str_width(ellipsis));
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut w = 0usize;
-    'spans: for span in line.spans {
-        let style = span.style;
-        let mut kept = String::new();
-        for g in span.content.graphemes(true) {
-            let gw = str_width(g);
-            if w.saturating_add(gw) > budget {
-                if !kept.is_empty() {
-                    out.push(Span::styled(kept, style));
-                }
-                break 'spans;
-            }
-            kept.push_str(g);
-            w = w.saturating_add(gw);
-        }
-        if !kept.is_empty() {
-            out.push(Span::styled(kept, style));
-        }
-    }
-    if !ellipsis.is_empty() {
-        out.push(Span::raw(ellipsis.to_string()));
-    }
-    Line::from(out)
-}
-
 /// The project-trust selector (`trust-selector.ts`): a small option list (`Trust` / `Trust parent` /
 /// `Do not trust`) under a multi-line header showing the cwd, the saved decision, and the
 /// current-session trust. `Enter` **confirms** the highlighted option (the chrome writes the trust
@@ -642,6 +557,7 @@ impl TrustSelector {
 
     /// Adopt the app's merged `tui.select.*` table so the hint row names the user's real bindings
     /// (Pi resolves `keyHint` through `getKeybindings()` on every render, `keybinding-hints.ts:34-44`).
+    #[must_use]
     pub fn with_hints(mut self, keymap: &SelectKeymap) -> Self {
         self.keymap = keymap.clone();
         self
@@ -655,6 +571,7 @@ impl TrustSelector {
     /// derive the preselected index (`app.rs` `/trust`, `cyrup/src/startup_ui.rs`
     /// `trust_selected_index`), but they collapse "no match" onto index 0, which cannot be
     /// distinguished afterwards.
+    #[must_use]
     pub fn with_saved_index(mut self, saved: Option<usize>) -> Self {
         self.saved_index = saved.filter(|i| *i < self.labels.len());
         self

@@ -245,5 +245,3 @@ pub(crate) fn render_images(frame: &mut Frame, area: ratatui::layout::Rect, stat
         y = y.saturating_add(h);
     }
 }
-
-// ----------------------------------------------------------------- crossterm wiring ----

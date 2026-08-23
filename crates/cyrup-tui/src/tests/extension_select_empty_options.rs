@@ -11,13 +11,10 @@
 
 use cyrup_ext::host::DialogOptions;
 use cyrup_session_svc::{UiKind, UiReply, UiRequest};
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{App, InputEvent, SelectorKind, UiTheme};
+use crate::crossterm::event::KeyCode;
+use crate::{App, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
+use super::harness::*;
 
 fn select_request(reply: tokio::sync::oneshot::Sender<UiReply>, options: serde_json::Value) -> UiRequest {
     UiRequest {

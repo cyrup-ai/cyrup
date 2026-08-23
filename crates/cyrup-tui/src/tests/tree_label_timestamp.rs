@@ -20,6 +20,7 @@ use crate::{
     tree_node_from_dag, App, InputEvent, SelectorKind, TreeNode, TreeSelector, UiTheme,
 };
 use ratatui::backend::TestBackend;
+use super::harness::*;
 
 /// `app.tree.toggleLabelTimestamp` is bound to **`shift+t`** upstream (`keybindings.ts:131-134`,
 /// v0.83.0), which a terminal delivers as the shifted letter. A *bare* `t` is not the toggle at
@@ -27,21 +28,6 @@ use ratatui::backend::TestBackend;
 /// appended to the tree's text search.
 fn shift_t() -> InputEvent {
     InputEvent::Key(KeyEvent::new(KeyCode::Char('T'), KeyModifiers::SHIFT))
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 /// Open `/tree` over `nodes` in an assembled app, exactly as the run loop's `/tree` arm does.

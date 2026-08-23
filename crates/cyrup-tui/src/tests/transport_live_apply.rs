@@ -35,10 +35,11 @@ use cyrup_core::StopReason;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
 use cyrup_provider::{Provider, Transport};
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, Settings};
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{App, AppAction, AppCommand, InputEvent, SelectorKind, UiTheme};
+use crate::crossterm::event::KeyCode;
+use crate::{App, AppAction, AppCommand, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
+use super::harness::*;
 
 /// Every `StreamOptions.transport` the provider was called with, in call order.
 type Seen = Arc<Mutex<Vec<Option<Transport>>>>;
@@ -60,25 +61,6 @@ fn fixture() -> Fixture {
 
 fn app() -> App<TestBackend> {
     App::new(TestBackend::new(100, 40), UiTheme::dark()).unwrap()
-}
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 /// A real faux-provider-backed session whose provider records `StreamOptions.transport` on every

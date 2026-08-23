@@ -27,6 +27,7 @@ use crate::keymap::{
 use crate::selector::{Selector, SelectorOutcome};
 use crate::session_search::{filter_and_sort, NameFilter, SearchRow, SortMode};
 use crate::settings_selector::FIELD_SEP;
+use crate::text_width::{spans_width, str_width, truncate_spans_to_width, truncate_to_width};
 use crate::theme::UiTheme;
 
 /// One persisted session offered by the `/resume` picker.
@@ -1060,82 +1061,6 @@ fn normalize_message(s: &str) -> String {
     replaced.trim().to_string()
 }
 
-/// The visible width of `s` — `Span::width()`, never `chars().count()` (a grapheme/char defect this
-/// crate has carried in four separate measurements).
-fn str_width(s: &str) -> usize {
-    Span::raw(s).width()
-}
-
-/// The visible width of a span vector.
-fn spans_width(spans: &[Span<'_>]) -> usize {
-    spans.iter().map(Span::width).sum()
-}
-
-/// `truncateToWidth` (`tui/src/utils.ts:1053`): right-truncate `s` to a visible width of `max`,
-/// appending `ellipsis` only when the cut actually happens.
-fn truncate_to_width(s: &str, max: usize, ellipsis: &str) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    if str_width(s) <= max {
-        return s.to_string();
-    }
-    let budget = max.saturating_sub(str_width(ellipsis));
-    let mut out = String::new();
-    let mut used = 0usize;
-    for ch in s.chars() {
-        let mut buf = [0u8; 4];
-        let cw = str_width(ch.encode_utf8(&mut buf));
-        if used.saturating_add(cw) > budget {
-            break;
-        }
-        out.push(ch);
-        used = used.saturating_add(cw);
-    }
-    out.push_str(ellipsis);
-    out
-}
-
-/// [`truncate_to_width`] over a styled span vector, preserving each span's own style across the cut
-/// — pi truncates the assembled ANSI string and its truncator carries the pending escapes forward
-/// (`tui/src/utils.ts:1119-1122`), so the colours survive.
-fn truncate_spans_to_width(
-    spans: Vec<Span<'static>>,
-    max: usize,
-    ellipsis: &str,
-) -> Vec<Span<'static>> {
-    if spans_width(&spans) <= max {
-        return spans;
-    }
-    if max == 0 {
-        return Vec::new();
-    }
-    let budget = max.saturating_sub(str_width(ellipsis));
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut used = 0usize;
-    for span in spans {
-        if used >= budget {
-            break;
-        }
-        let remaining = budget.saturating_sub(used);
-        if span.width() <= remaining {
-            used = used.saturating_add(span.width());
-            out.push(span);
-        } else {
-            let kept = truncate_to_width(&span.content, remaining, "");
-            if !kept.is_empty() {
-                out.push(Span::styled(kept, span.style));
-            }
-            break;
-        }
-    }
-    if !ellipsis.is_empty() {
-        let style = out.last().map(|s| s.style).unwrap_or_default();
-        out.push(Span::styled(ellipsis.to_string(), style));
-    }
-    out
-}
-
 /// S8 — `buildSessionTree` (`session-selector.ts:209-254`) followed by `flattenSessionTree`
 /// (`:259-278`), fused into one pass over `rows`.
 ///
@@ -1720,6 +1645,35 @@ mod tests {
         let buf = draw(&mut sel, 80, 20);
         let text = row_text(&buf, find_row(&buf, "Build pipeline"));
         assert!(text.ends_with("/s/a.jsonl 3 msgs"), "path is not in the right column: {text:?}");
+    }
+
+    /// **S27.** The row's message column is cut by the crate's one grapheme-atomic truncator
+    /// (`crate::text_width::truncate_to_width`, `:479-483` → `tui/src/utils.ts:1053`), so a ZWJ
+    /// sequence is either kept whole or dropped whole.
+    ///
+    /// FAILS before the fix: this module carried its own `for ch in s.chars()` copy, so a family
+    /// emoji straddling the cut was emitted as `👨` + a bare U+200D joiner — an orphaned component
+    /// and a dangling joiner in a row built from a session's own message text (`:462`, `:603`).
+    #[test]
+    fn a_zwj_family_emoji_is_never_cut_in_half_by_the_row_truncator() {
+        const FAMILY: &str = "👨\u{200d}👩\u{200d}👧";
+        let theme = UiTheme::default();
+        // 24 `A`s put the cluster exactly astride the 29-column message budget at width 40: its
+        // first two components fit, the third does not.
+        let label = format!("{}{}{}", "A".repeat(24), FAMILY, " trailing text");
+        let sel = SessionSelector::new(vec![row("/s/z.jsonl", Some(label.as_str()), "z", 1)]);
+        let filtered = sel.filtered();
+        let lines = sel.body_lines(&theme, &filtered, 40);
+        let text: String =
+            lines.iter().flat_map(|l| l.spans.iter()).map(|s| &*s.content).collect();
+
+        assert!(text.contains('…'), "the row was not truncated at all: {text:?}");
+        let whole = text.contains(FAMILY);
+        let partial = text.contains('\u{200d}')
+            || text.contains('👨')
+            || text.contains('👩')
+            || text.contains('👧');
+        assert!(whole || !partial, "the family cluster was split into components: {text:?}");
     }
 
     /// **S15.** `session-selector.ts:512-517`: when the `maxVisible` window does not cover the list,

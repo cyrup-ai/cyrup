@@ -13,16 +13,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{App, InputEditor, InputEvent, UiTheme};
+use crate::{App, InputEditor, UiTheme};
 use ratatui::backend::TestBackend;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn ctrl(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
-}
+use super::harness::*;
 
 fn press(ed: &mut InputEditor, code: KeyCode) {
     ed.handle_key(&KeyEvent::new(code, KeyModifiers::NONE));

@@ -32,7 +32,7 @@ use ratatui::Frame;
 use crate::auth_select::{format_auth_selector_provider_type, status_indicator_runs, StatusTone};
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{border_rule_line, input_line_spans, Selector, SelectorOutcome};
-use crate::settings_selector::truncate_line_to_width;
+use crate::text_width::truncate_line_to_width;
 use crate::theme::UiTheme;
 
 /// `maxVisible` (`oauth-selector.ts:117`) — **8**, not the 10 the data selectors use.

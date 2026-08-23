@@ -9,6 +9,7 @@
 use crate::{App, ImageBlock, ImageRenderer, UiTheme};
 use image::{DynamicImage, Rgba, RgbaImage};
 use ratatui::backend::TestBackend;
+use super::harness::*;
 
 /// A solid-red test image of `w×h` pixels (no file IO / decode needed).
 fn red_image(w: u32, h: u32) -> ImageBlock {
@@ -17,22 +18,6 @@ fn red_image(w: u32, h: u32) -> ImageBlock {
         *px = Rgba([220, 30, 30, 255]);
     }
     ImageBlock::new(DynamicImage::ImageRgba8(img), "red.png")
-}
-
-/// Flatten the backend buffer to text rows.
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 /// TUI-017 / TUI-N08 — **a terminal with no image protocol does not rasterize.**

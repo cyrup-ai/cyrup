@@ -24,13 +24,10 @@ use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{App, AppCommand, InputEvent, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
+use super::harness::*;
 
 fn app() -> App<TestBackend> {
     App::new(TestBackend::new(110, 34), UiTheme::dark()).unwrap()
-}
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 struct Fixture {
@@ -65,34 +62,6 @@ async fn session(fx: &Fixture) -> Arc<AgentSession> {
 async fn one_turn(session: &Arc<AgentSession>) {
     let _ = session.prompt("first").await.unwrap();
     session.wait_for_idle().await;
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
-
-/// The rendered row containing `needle`, with its row index.
-fn row_with(app: &App<TestBackend>, needle: &str) -> (u16, String) {
-    let buf = app.terminal().backend().buffer();
-    for y in 0..buf.area.height {
-        let row: String =
-            (0..buf.area.width).map(|x| buf.cell((x, y)).unwrap().symbol()).collect();
-        if row.contains(needle) {
-            return (y, row);
-        }
-    }
-    panic!("no row contains {needle:?}:\n{}", buf_text(app));
 }
 
 /// The foreground of the first cell of `needle` on the row that carries it.

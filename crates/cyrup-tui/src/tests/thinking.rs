@@ -20,6 +20,7 @@ use cyrup_session_svc::AgentSessionEvent;
 use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
+use super::harness::*;
 
 const REASONING: &str = "the user wants the parser rewritten";
 const ANSWER: &str = "Here is the plan.";
@@ -77,23 +78,6 @@ fn feed(app: &mut App<TestBackend>, ev: StreamEvent) {
             assistant_message_event: Box::new(ev),
         }),
     }
-}
-
-/// The bottom `viewport_height` rows — the live inline region the app repaints each frame.
-fn live_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let vh = app.viewport_height().min(area.height);
-    let mut out = String::new();
-    for y in (area.height - vh)..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 /// Whether some committed scrollback line containing `needle` is painted in the `thinkingText`

@@ -8,10 +8,8 @@ use crate::{
 };
 use ratatui::backend::TestBackend;
 use std::path::Path;
+use super::harness::key_event as key;
 
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
-}
 fn type_str(ed: &mut InputEditor, s: &str) {
     for c in s.chars() {
         ed.handle_key(&key(KeyCode::Char(c)));

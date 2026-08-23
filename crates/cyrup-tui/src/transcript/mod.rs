@@ -15,6 +15,24 @@
 //! ([`push_user`](TranscriptView::push_user),
 //! [`push_assistant_delta`](TranscriptView::push_assistant_delta), …) remains the integration seam
 //! an adapter feeds.
+//!
+//! ## Historical paths: `transcript.rs:NNNN` citations elsewhere in this crate
+//! This tree is what `crates/cyrup-tui/src/transcript.rs` became. Commit `205aa38`
+//! (`Decompose cyrup-tui src/transcript.rs into submodules`) replaced that single file with the
+//! modules listed below, and **`src/transcript.rs` no longer exists**. Any surviving
+//! `transcript.rs:NNNN` citation in a comment anywhere in this crate — the six-row width table in
+//! `markdown/`, the cache and output-pad notes, the event-fold comments — is therefore
+//! **historical**: it names a line of the pre-split file, not of anything at HEAD.
+//!
+//! Those citations are annotated here rather than churned one by one, the same call the `app.rs`
+//! split made (see `app/mod.rs`) and for the same reason
+//! (`docs/gap-analysis/07-cyrup-tui.md:161-162`): a mechanical line-number remap produces pointers
+//! that match TEXT but not MEANING. Re-point one only when it misdirects about a **symbol**, and
+//! then only by reading the target.
+//!
+//! This does **not** apply to the crate's upstream citations (`assistant-message.ts:104-114`,
+//! `markdown.ts:284`, …), which name a line in a pinned external tag of the TypeScript this crate
+//! ports and stay verbatim.
 
 use cyrup_core::Content;
 use ratatui::layout::Rect;

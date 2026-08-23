@@ -263,6 +263,7 @@ impl UiTheme {
     }
 
     /// Bump the generation (caches keyed by generation re-render). Used by the hot-reload hook.
+    #[must_use]
     pub fn with_generation(mut self, generation: u64) -> Self {
         self.generation = generation;
         self
@@ -274,6 +275,7 @@ impl UiTheme {
     /// `createTheme` binds every color through `fgAnsi(value, mode)` at build time, `theme.ts:342-348`).
     /// The transform is idempotent for non-RGB colors, so re-applying a mode is safe. Every downstream
     /// `*_style` accessor reads the already-projected fields, so no per-widget change is needed.
+    #[must_use]
     pub fn with_color_mode(mut self, mode: ColorMode) -> Self {
         self.color_mode = mode;
         self.foreground = mode.project_opt(self.foreground);

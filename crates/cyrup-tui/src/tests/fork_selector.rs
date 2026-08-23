@@ -6,31 +6,11 @@
 //! subtitle, and a metadata string of `message 3` instead of `Message 3 of 12`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{
-    App, AppCommand, InputEvent, SelectorKind, UiTheme, UserMessageRow, UserMessageSelector,
-};
+use crate::crossterm::event::KeyCode;
+use crate::{App, AppCommand, SelectorKind, UiTheme, UserMessageRow, UserMessageSelector};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
+use super::harness::*;
 
 fn rows() -> Vec<UserMessageRow> {
     vec![
@@ -48,23 +28,6 @@ fn fork_app() -> App<TestBackend> {
     );
     app.draw().unwrap();
     app
-}
-
-/// Locate the first buffer row containing `needle`, returning `(y, row_text)`.
-fn row_with(app: &App<TestBackend>, needle: &str) -> (u16, String) {
-    let buf = app.terminal().backend().buffer();
-    for y in 0..buf.area.height {
-        let mut row = String::new();
-        for x in 0..buf.area.width {
-            if let Some(c) = buf.cell((x, y)) {
-                row.push_str(c.symbol());
-            }
-        }
-        if row.contains(needle) {
-            return (y, row);
-        }
-    }
-    panic!("no row contains {needle:?}");
 }
 
 /// **S22, the row shape.** `UserMessageList.render` pushes THREE lines per visible entry

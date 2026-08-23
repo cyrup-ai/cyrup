@@ -17,16 +17,12 @@
 //! editor row — not merely that a function was called.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{App, AppAction, InputEvent, UiTheme};
+use crate::{App, AppAction, UiTheme};
 use ratatui::backend::TestBackend;
+use super::harness::*;
 
 fn new_app() -> App<TestBackend> {
     App::new(TestBackend::new(80, 12), UiTheme::dark()).unwrap()
-}
-
-fn esc() -> InputEvent {
-    InputEvent::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
 }
 
 /// The whole rendered buffer as text.

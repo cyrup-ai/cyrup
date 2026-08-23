@@ -10,16 +10,13 @@
 
 use cyrup_config::login::{AuthCheck, AuthType, LoginProviderOption};
 use cyrup_core::ProviderId;
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::crossterm::event::KeyCode;
 use crate::{
     format_status_indicator, login_selector_rows, provider_display_name, provider_rows, App,
-    AppAction, AppCommand, AuthState, InputEvent, OAuthMode, OAuthSelector, SelectorKind, UiTheme,
+    AppAction, AppCommand, AuthState, OAuthMode, OAuthSelector, SelectorKind, UiTheme,
 };
 use ratatui::backend::TestBackend;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
+use super::harness::*;
 
 /// Open the real `OAuthSelectorComponent` port (`oauth-selector.ts`) in the editor slot — the same
 /// thing `App::execute_command` now does for `/login` and `/logout`. These tests used to open a
@@ -30,21 +27,6 @@ fn open_oauth(app: &mut App<TestBackend>, mode: OAuthMode, options: &[LoginProvi
         OAuthMode::Logout => SelectorKind::Logout,
     };
     app.open_boxed_selector(kind, Box::new(OAuthSelector::new(mode, options, None)));
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 fn option(
@@ -237,23 +219,6 @@ fn id_only_row_builder_still_sorts_by_display_name() {
     ]);
     assert_eq!(rows[0].0, "anthropic");
     assert_eq!(rows[1].0, "openai");
-}
-
-/// Locate the first buffer row containing `needle`, returning `(y, row_text)`.
-fn row_with(app: &App<TestBackend>, needle: &str) -> (u16, String) {
-    let buf = app.terminal().backend().buffer();
-    for y in 0..buf.area.height {
-        let mut row = String::new();
-        for x in 0..buf.area.width {
-            if let Some(c) = buf.cell((x, y)) {
-                row.push_str(c.symbol());
-            }
-        }
-        if row.contains(needle) {
-            return (y, row);
-        }
-    }
-    panic!("no row contains {needle:?}");
 }
 
 /// The fg colour of the buffer cell at the first column of `needle` within row `y`.
