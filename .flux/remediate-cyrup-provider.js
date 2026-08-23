@@ -14,13 +14,14 @@ export const meta = {
 // Inputs. args = ["DECOMPOSE_X.md", ...] or omitted to take every task whose
 // body names crates/cyrup-provider.
 // ---------------------------------------------------------------------------
+const BRANCH = 'claude/cyrup-provider-decompose-ow0fh7'
 const REQUESTED = Array.isArray(args) ? args : (args ? [args] : [])
 
 const BASELINE = `
 VERIFICATION BASELINE for crates/cyrup-provider, measured on this branch:
   cargo build -p cyrup-provider --all-targets   -> 0 errors, 0 warnings
   cargo clippy -p cyrup-provider --all-targets  -> 37 warnings
-  cargo doc -p cyrup-provider --no-deps         -> 76 warnings
+  cargo doc -p cyrup-provider --no-deps         -> 75 warnings
   cargo test -p cyrup-provider --lib            -> 1118 pass, 7 ignored, 0 fail
 Any task that changes these numbers must say so and justify it. A task that is
 supposed to be behaviour-neutral and moves them has a bug.
@@ -203,9 +204,20 @@ for (const [i, wave] of waves.entries()) {
 ${HOUSE_RULES}
 ${BASELINE}
 
-ISOLATION — read this before touching anything:
-You are ONE OF ${wave.length} AGENTS RUNNING CONCURRENTLY. You have been given your own git
-worktree. Work ONLY inside it, and ONLY on these paths:
+${wave.length > 1 ? `ISOLATION — read this before touching anything:
+You are ONE OF ${wave.length} AGENTS RUNNING CONCURRENTLY, in your own git worktree.
+
+FIRST, before any other work, check what your worktree is based on:
+    git log --oneline -1
+A fresh worktree is cut from the repository's DEFAULT branch, which is usually NOT the branch this
+work belongs on. If HEAD is not ${BRANCH}, run exactly:
+    git merge ${BRANCH} --no-edit
+That is the ONLY git write operation you are permitted. Skipping this check is how a whole run gets
+thrown away: a patch authored against the wrong base targets files that no longer exist on the
+target branch, and will not apply.` : `You are running ALONE, in the main checkout at /home/user/cyrup, which is already on the correct
+branch. Do NOT create a worktree. Leave your changes in the working tree — no patch file, no commit.`}
+
+Work ONLY on these paths:
 ${f.writes.map(w => '  ' + w).join('\n')}
 
 - Do NOT modify any file outside that list. If the task seems to require it, stop and report it in
@@ -216,15 +228,18 @@ ${f.writes.map(w => '  ' + w).join('\n')}
 - Do NOT run git branch/stash/checkout/reset/commit, and do not touch /home/user/cyrup itself.
 
 When the task is complete and every one of its acceptance criteria is proven by a real command:
-1. Write your changes as a patch, from the root of your worktree:
+${wave.length > 1 ? `1. Write your changes as a patch, from the root of your worktree:
      git add -A && git diff --cached --binary > /tmp/remediate-${f.task.replace(/\W+/g, '_')}.patch
    (git add -A then diff --cached is required so that NEW and DELETED files are in the patch.)
 2. Report that absolute patch path in patch_file, your worktree root in worktree, and the real
-   gate numbers you measured in gates.
+   gate numbers you measured in gates.` : `simply leave the changes in the working tree and report worktree:"" and patch_file:"". Report the
+real gate numbers you measured in gates.`}
 
 If you cannot finish, still report what you did and why you stopped. Do NOT fabricate gate numbers
 and do NOT report done:true on a task whose gates you did not actually run.`,
-      { label: `split:${f.task}`, phase: 'Split', isolation: 'worktree', schema: RESULT })
+      wave.length > 1
+        ? { label: `split:${f.task}`, phase: 'Split', isolation: 'worktree', schema: RESULT }
+        : { label: `split:${f.task}`, phase: 'Split', schema: RESULT })
   ))
   const ok = done.filter(Boolean)
   splitResults.push(...ok)
@@ -238,16 +253,19 @@ phase('Integrate')
 const patches = splitResults.filter(r => r?.done && r.patch_file)
 const failed = [...sweepResults, ...splitResults].filter(r => r && !r.done)
 
-const integration = patches.length
-  ? await agent(`Apply the isolated remediation work back into the main tree and verify the crate as a whole.
+const anyWork = [...sweepResults, ...splitResults].some(r => r?.done)
+const integration = anyWork
+  ? await agent(`${patches.length
+      ? 'Apply the isolated remediation work back into the main tree, then verify the crate as a whole.'
+      : 'All remediation ran in place in the main tree, so there is nothing to apply. Verify the crate as a whole — this is still the check that counts, because the tasks were verified one at a time and this is the first look at the combination.'}
 
 ${HOUSE_RULES}
 ${BASELINE}
 
-Patches to apply, in this order:
-${patches.map(p => `  ${p.patch_file}   (${p.task}, touches: ${(p.files_touched || []).slice(0, 6).join(', ')}${(p.files_touched || []).length > 6 ? ', …' : ''})`).join('\n')}
+${patches.length ? `Patches to apply, in this order:
+${patches.map(p => `  ${p.patch_file}   (${p.task}, touches: ${(p.files_touched || []).slice(0, 6).join(', ')}${(p.files_touched || []).length > 6 ? ', …' : ''})`).join('\n')}` : 'No patches — the work is already in the working tree.'}
 
-Work in /home/user/cyrup. For EACH patch, in order:
+Work in /home/user/cyrup. If there are patches, for EACH one, in order:
   1. git apply --check <patch>   — if it does not apply cleanly, STOP on that patch, record it,
      and continue with the next one. Do not force it and do not hand-edit to make it fit.
   2. git apply <patch>
