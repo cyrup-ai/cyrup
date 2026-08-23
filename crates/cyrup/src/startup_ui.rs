@@ -202,7 +202,7 @@ pub fn interpret_resume(outcome: &SelectorOutcome) -> ResumeChoice {
 /// (`header.setStatusMessage(...)` with a 2 s / 3 s dwell, `session-selector.ts:847`, `:851`);
 /// `cyrup_tui::SessionSelector` has no status channel, so they are returned here and printed by the
 /// caller after the alternate screen is torn down. The channel itself is area 07's file.
-pub fn run_resume_picker(
+pub async fn run_resume_picker(
     theme: &UiTheme,
     keymaps: &(SelectKeymap, SessionKeymap),
     current_sessions: &[SessionInfo],
@@ -225,7 +225,7 @@ pub fn run_resume_picker(
             .map(|s| (s.path.display().to_string(), s.cwd.clone())),
     );
     let mut status: Vec<String> = Vec::new();
-    let outcome = run_startup_selector(theme, &keymaps.0, &mut selector, |payload| {
+    let outcome = run_startup_selector(theme, &keymaps.0, &mut selector, async |payload: &str| {
         // The session selector emits delete/rename via a tagged `Apply` payload; effect it on disk so
         // the picker's optimistic row edit is not a lie (Pi's `SessionSelectorComponent` performs
         // both through its loaders, `session-selector.ts:831-855` and `:857-880`).
@@ -249,7 +249,8 @@ pub fn run_resume_picker(
             // Confirm`), and a non-session payload parses to `None` — neither is a mutation.
             Some(SessionSelectorOutcome::Resume(_)) | None => {}
         }
-    })?;
+    })
+    .await?;
     Ok((interpret_resume(&outcome), status))
 }
 
@@ -422,7 +423,7 @@ pub async fn run_trust_prompt(
     )
     // S20: the ` ✓` on the option the trust store already holds (`trust-selector.ts:109-110`).
     .with_saved_index(trust_saved_index(options, saved));
-    let outcome = run_startup_selector(theme, keymap, &mut selector, |_| {})?;
+    let outcome = run_startup_selector(theme, keymap, &mut selector, async |_| {}).await?;
     match interpret_trust(&outcome, options) {
         TrustChoice::Chosen { index, trusted } => {
             if let Some(option) = options.get(index) {
@@ -470,7 +471,7 @@ pub fn interpret_missing_cwd(outcome: &SelectorOutcome) -> MissingCwdChoice {
 /// `promptForMissingSessionCwd` → `showStartupSelector`, main.ts:454-462): mount a two-option
 /// [`ListSelector`] titled with `prompt_body`, drive it to a confirm/cancel, and return the choice.
 /// TTY-only; not unit-tested (the pure mapper [`interpret_missing_cwd`] is).
-pub fn run_missing_cwd_prompt(
+pub async fn run_missing_cwd_prompt(
     theme: &UiTheme,
     keymap: &SelectKeymap,
     prompt_body: &str,
@@ -495,7 +496,7 @@ pub fn run_missing_cwd_prompt(
         ("cancel".to_string(), "Cancel".to_string(), None),
     ];
     let mut selector = ListSelector::prompt(title, rows, 0);
-    let outcome = run_startup_selector(theme, keymap, &mut selector, |_| {})?;
+    let outcome = run_startup_selector(theme, keymap, &mut selector, async |_| {}).await?;
     Ok(interpret_missing_cwd(&outcome))
 }
 

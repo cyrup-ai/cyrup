@@ -229,35 +229,37 @@ impl SettingsManager {
         let json = serde_json::to_value(value)?;
         let key_owned = key.to_string();
         let mut corrupt: Option<String> = None;
-        self.store.with_lock(scope, &mut |current| {
-            let mut doc = match current.map(Settings::parse) {
-                Some(Ok(s)) => s,
-                // Absent file: create it. This is the ONLY branch that may start from an empty doc.
-                None => Settings::default(),
-                // Corruption that appeared BETWEEN the load and this locked write. Returning `None`
-                // leaves the file untouched; the message is surfaced below so the caller can tell
-                // the write did not happen (CFG-001).
-                Some(Err(e)) => {
-                    corrupt = Some(format!("parse error: {e}"));
-                    return None;
+        self.store
+            .with_lock(scope, &mut |current| {
+                let mut doc = match current.map(Settings::parse) {
+                    Some(Ok(s)) => s,
+                    // Absent file: create it. This is the ONLY branch that may start from an empty doc.
+                    None => Settings::default(),
+                    // Corruption that appeared BETWEEN the load and this locked write. Returning `None`
+                    // leaves the file untouched; the message is surfaced below so the caller can tell
+                    // the write did not happen (CFG-001).
+                    Some(Err(e)) => {
+                        corrupt = Some(format!("parse error: {e}"));
+                        return None;
+                    }
+                };
+                // CFG-062 — "clear" means the key is GONE, not present-and-null. Pi's clearing setters
+                // assign `undefined` (`setShellPath` settings-manager.ts:883-887, `setShellCommandPrefix`
+                // :914-918, `setNpmCommand` :924-928 @v0.83.0) and `persistScopedSettings` serializes
+                // through `JSON.stringify(mergedSettings, null, 2)` (:605), which OMITS
+                // undefined-valued properties. `serde_json` has no `undefined`, so `None::<String>`
+                // arrives here as `Value::Null` and used to persist as `"shellPath": null` — a value
+                // upstream cannot write, and one that a lower layer's `deep_merge` treats as a real
+                // override (both sides let a project `null` blank a global value, so the divergence is
+                // the WRITE, not the merge).
+                if json.is_null() {
+                    doc.obj.remove(&key_owned);
+                } else {
+                    doc.obj.insert(key_owned.clone(), json.clone());
                 }
-            };
-            // CFG-062 — "clear" means the key is GONE, not present-and-null. Pi's clearing setters
-            // assign `undefined` (`setShellPath` settings-manager.ts:883-887, `setShellCommandPrefix`
-            // :914-918, `setNpmCommand` :924-928 @v0.83.0) and `persistScopedSettings` serializes
-            // through `JSON.stringify(mergedSettings, null, 2)` (:605), which OMITS
-            // undefined-valued properties. `serde_json` has no `undefined`, so `None::<String>`
-            // arrives here as `Value::Null` and used to persist as `"shellPath": null` — a value
-            // upstream cannot write, and one that a lower layer's `deep_merge` treats as a real
-            // override (both sides let a project `null` blank a global value, so the divergence is
-            // the WRITE, not the merge).
-            if json.is_null() {
-                doc.obj.remove(&key_owned);
-            } else {
-                doc.obj.insert(key_owned.clone(), json.clone());
-            }
-            Some(doc.to_pretty())
-        }).await?;
+                Some(doc.to_pretty())
+            })
+            .await?;
         if let Some(message) = corrupt {
             return Err(ConfigError::SettingsWriteRefused { scope, message });
         }
@@ -289,18 +291,20 @@ impl SettingsManager {
         self.ensure_scope_writable(scope)?;
         let path_owned: Vec<String> = path.iter().map(|s| s.to_string()).collect();
         let mut corrupt: Option<String> = None;
-        self.store.with_lock(scope, &mut |current| {
-            let mut doc = match current.map(Settings::parse) {
-                Some(Ok(s)) => s,
-                None => Settings::default(),
-                Some(Err(e)) => {
-                    corrupt = Some(format!("parse error: {e}"));
-                    return None;
-                }
-            };
-            set_value_at_path(&mut doc.obj, &path_owned, value.clone());
-            Some(doc.to_pretty())
-        }).await?;
+        self.store
+            .with_lock(scope, &mut |current| {
+                let mut doc = match current.map(Settings::parse) {
+                    Some(Ok(s)) => s,
+                    None => Settings::default(),
+                    Some(Err(e)) => {
+                        corrupt = Some(format!("parse error: {e}"));
+                        return None;
+                    }
+                };
+                set_value_at_path(&mut doc.obj, &path_owned, value.clone());
+                Some(doc.to_pretty())
+            })
+            .await?;
         if let Some(message) = corrupt {
             return Err(ConfigError::SettingsWriteRefused { scope, message });
         }
@@ -335,18 +339,20 @@ impl SettingsManager {
         self.ensure_scope_writable(scope)?;
         let path_owned: Vec<String> = path.iter().map(|s| s.to_string()).collect();
         let mut corrupt: Option<String> = None;
-        self.store.with_lock(scope, &mut |current| {
-            let mut doc = match current.map(Settings::parse) {
-                Some(Ok(s)) => s,
-                None => Settings::default(),
-                Some(Err(e)) => {
-                    corrupt = Some(format!("parse error: {e}"));
-                    return None;
-                }
-            };
-            set_value_at_path(&mut doc.obj, &path_owned, value.clone());
-            Some(doc.to_pretty())
-        }).await?;
+        self.store
+            .with_lock(scope, &mut |current| {
+                let mut doc = match current.map(Settings::parse) {
+                    Some(Ok(s)) => s,
+                    None => Settings::default(),
+                    Some(Err(e)) => {
+                        corrupt = Some(format!("parse error: {e}"));
+                        return None;
+                    }
+                };
+                set_value_at_path(&mut doc.obj, &path_owned, value.clone());
+                Some(doc.to_pretty())
+            })
+            .await?;
         if let Some(message) = corrupt {
             return Err(ConfigError::SettingsWriteRefused { scope, message });
         }
@@ -365,19 +371,25 @@ impl SettingsManager {
             SettingsScope::Global,
             &["markdown", "mermaid"],
             Value::String(mode.as_str().to_string()),
-        ).await
+        )
+        .await
     }
 
     /// `setEditorPaddingX`: clamp to 0..=3 (Pi settings-manager.ts:1179-1183).
     pub async fn set_editor_padding_x(&mut self, padding: f64) -> Result<(), ConfigError> {
         let clamped = (padding.floor() as i64).clamp(0, 3);
-        self.set(SettingsScope::Global, "editorPaddingX", clamped).await
+        self.set(SettingsScope::Global, "editorPaddingX", clamped)
+            .await
     }
 
     /// `setAutocompleteMaxVisible`: clamp to 3..=20 (Pi settings-manager.ts:1189-1193).
-    pub async fn set_autocomplete_max_visible(&mut self, max_visible: f64) -> Result<(), ConfigError> {
+    pub async fn set_autocomplete_max_visible(
+        &mut self,
+        max_visible: f64,
+    ) -> Result<(), ConfigError> {
         let clamped = (max_visible.floor() as i64).clamp(3, 20);
-        self.set(SettingsScope::Global, "autocompleteMaxVisible", clamped).await
+        self.set(SettingsScope::Global, "autocompleteMaxVisible", clamped)
+            .await
     }
 
     /// `setImageWidthCells`: floor and clamp to >=1 (Pi settings-manager.ts:1068-1075).
@@ -387,7 +399,8 @@ impl SettingsManager {
             SettingsScope::Global,
             &["terminal", "imageWidthCells"],
             clamped.into(),
-        ).await
+        )
+        .await
     }
 
     /// `setHttpIdleTimeoutMs`: reject non-finite/negative; floor (Pi settings-manager.ts:820-827).
@@ -402,7 +415,8 @@ impl SettingsManager {
             SettingsScope::Global,
             "httpIdleTimeoutMs",
             timeout_ms.floor() as i64,
-        ).await
+        )
+        .await
     }
 
     /// `setShowImages` (nested `terminal.showImages`; Pi settings-manager.ts:1051-1058).
@@ -411,7 +425,8 @@ impl SettingsManager {
             SettingsScope::Global,
             &["terminal", "showImages"],
             show.into(),
-        ).await
+        )
+        .await
     }
 
     /// `setEnableAnalytics`: set the opt-in flag and, on first opt-in, generate a `trackingId`
@@ -444,7 +459,8 @@ impl SettingsManager {
                         .insert("trackingId".to_string(), Value::String(random_uuid_v4()));
                 }
                 Some(doc.to_pretty())
-            }).await?;
+            })
+            .await?;
         if let Some(message) = corrupt {
             return Err(ConfigError::SettingsWriteRefused {
                 scope: SettingsScope::Global,

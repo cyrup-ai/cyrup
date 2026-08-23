@@ -369,7 +369,7 @@ async fn run() -> anyhow::Result<i32> {
     // non-interactive missing-session-cwd guard. Engaged only when a session ref is supplied — the
     // bare `New`/`Continue` target from `to_session_config` stands otherwise (no needless listing).
     if (cli.fork.is_some() || cli.session.is_some() || cli.session_id.is_some())
-        && let Some(code) = prelaunch::resolve_session(&cli, &dirs, mode, &mut config)?
+        && let Some(code) = prelaunch::resolve_session(&cli, &dirs, mode, &mut config).await?
     {
         return Ok(code);
     }
@@ -379,7 +379,7 @@ async fn run() -> anyhow::Result<i32> {
     // Interactive-only (it needs a real TTY); the one-shot/RPC live path is untouched. Returns
     // `Some(0)` when the user cancels the picker.
     if mode == AppMode::Interactive
-        && let Some(code) = prelaunch::resolve_startup_ui(&cli, &dirs, mode, &mut config)?
+        && let Some(code) = prelaunch::resolve_startup_ui(&cli, &dirs, mode, &mut config).await?
     {
         return Ok(code);
     }

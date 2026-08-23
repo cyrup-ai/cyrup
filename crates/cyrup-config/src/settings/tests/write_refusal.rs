@@ -110,7 +110,8 @@ async fn cfg001_set_nested_refuses_to_clobber_a_malformed_file() {
             SettingsScope::Global,
             &["terminal", "showImages"],
             false.into(),
-        ).await,
+        )
+        .await,
         SettingsScope::Global,
     );
 
@@ -126,7 +127,8 @@ async fn cfg001_persist_nested_refuses_to_clobber_a_malformed_file() {
     let (store, mgr) = malformed_global();
 
     assert_refused(
-        mgr.persist_nested(SettingsScope::Global, &["outputPad"], 0.into()).await,
+        mgr.persist_nested(SettingsScope::Global, &["outputPad"], 0.into())
+            .await,
         SettingsScope::Global,
     );
 
@@ -146,8 +148,14 @@ async fn cfg001_convenience_setters_refuse_too() {
     assert_refused(mgr.set_editor_padding_x(3.0).await, SettingsScope::Global);
     assert_refused(mgr.set_show_images(false).await, SettingsScope::Global);
     assert_refused(mgr.set_image_width_cells(40.0).await, SettingsScope::Global);
-    assert_refused(mgr.set_autocomplete_max_visible(9.0).await, SettingsScope::Global);
-    assert_refused(mgr.set_http_idle_timeout_ms(1000.0).await, SettingsScope::Global);
+    assert_refused(
+        mgr.set_autocomplete_max_visible(9.0).await,
+        SettingsScope::Global,
+    );
+    assert_refused(
+        mgr.set_http_idle_timeout_ms(1000.0).await,
+        SettingsScope::Global,
+    );
     assert_refused(mgr.set_enable_analytics(true).await, SettingsScope::Global);
 
     let after = store.read(SettingsScope::Global).unwrap().unwrap();
@@ -181,7 +189,8 @@ async fn cfg001_project_scope_is_latched_independently() {
 
     // The healthy GLOBAL scope still writes — the guard is per-scope, not a global kill switch.
     mgr.set(SettingsScope::Global, "quietStartup", true)
-        .await.unwrap();
+        .await
+        .unwrap();
     assert!(mgr.effective().quiet_startup());
 }
 
@@ -214,11 +223,13 @@ async fn cfg001_corruption_between_load_and_write_is_also_refused() {
             SettingsScope::Global,
             &["terminal", "showImages"],
             true.into(),
-        ).await,
+        )
+        .await,
         SettingsScope::Global,
     );
     assert_refused(
-        mgr.persist_nested(SettingsScope::Global, &["outputPad"], 1.into()).await,
+        mgr.persist_nested(SettingsScope::Global, &["outputPad"], 1.into())
+            .await,
         SettingsScope::Global,
     );
     assert_refused(mgr.set_enable_analytics(true).await, SettingsScope::Global);
@@ -231,7 +242,11 @@ async fn cfg001_corruption_between_load_and_write_is_also_refused() {
 #[tokio::test]
 async fn cfg001_repairing_the_file_and_reloading_restores_writability() {
     let (store, mut mgr) = malformed_global();
-    assert!(mgr.set(SettingsScope::Global, "theme", "light").await.is_err());
+    assert!(
+        mgr.set(SettingsScope::Global, "theme", "light")
+            .await
+            .is_err()
+    );
 
     // The user fixes the trailing comma and cyrup reloads: the latch clears and writes resume.
     store.seed(
@@ -244,7 +259,9 @@ async fn cfg001_repairing_the_file_and_reloading_restores_writability() {
         "latch cleared on a clean reload"
     );
 
-    mgr.set(SettingsScope::Global, "theme", "light").await.unwrap();
+    mgr.set(SettingsScope::Global, "theme", "light")
+        .await
+        .unwrap();
     let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
     assert_eq!(after.get("theme"), Some(&serde_json::json!("light")));
     assert_eq!(
@@ -261,13 +278,16 @@ async fn cfg001_an_absent_file_is_still_created() {
     let mut mgr = SettingsManager::load(store.clone(), false);
     assert!(mgr.load_error(SettingsScope::Global).is_none());
 
-    mgr.set(SettingsScope::Global, "theme", "light").await.unwrap();
+    mgr.set(SettingsScope::Global, "theme", "light")
+        .await
+        .unwrap();
     mgr.set_nested(
         SettingsScope::Global,
         &["terminal", "showImages"],
         true.into(),
     )
-    .await.unwrap();
+    .await
+    .unwrap();
     let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
     assert_eq!(after.get("theme"), Some(&serde_json::json!("light")));
 }

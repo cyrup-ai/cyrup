@@ -36,8 +36,8 @@
 //! so at signal time it holds exactly the bash children still running.
 //!
 //! cyrup mirrors that end to end. The registry is `TRACKED_DETACHED_CHILD_PIDS` in
-//! `crates/cyrup-tools/src/ops/local.rs`, sitting beside the `setsid` and `killpg` primitives it
-//! needs; `LocalProc::exec` enrolls its shell at spawn and — this is the
+//! `crates/cyrup-tools/src/ops/local/tracking.rs`, a sibling module of the `setsid` and `killpg`
+//! primitives it needs; `LocalProc::exec` enrolls its shell at spawn and — this is the
 //! JS→Rust half — unenrolls it from `KillTreeOnDrop::drop`, not from a statement after the
 //! `select!` loop, because an abandoned future never reaches that statement and would leak the pid
 //! for the life of the process. [`kill_tracked_detached_children`] is called below as the first act

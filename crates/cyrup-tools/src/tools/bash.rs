@@ -285,7 +285,7 @@ impl Tool for BashTool {
         // error must not preempt an already-cancelled run's "Command aborted", exactly like Pi (the
         // outer catch's `err.message === "aborted"` branch, bash.ts:410-411, wins over its verbatim
         // `throw err` fallback, bash.ts:417, only because the abort check runs first and short-
-        // circuits before `getShellConfig` is ever reached). `LocalProc::exec` (ops/local.rs) still
+        // circuits before `getShellConfig` is ever reached). `LocalProc::exec` (ops/local/proc.rs) still
         // re-checks this defensively before spawning — for OTHER `ProcOps` backends that may not
         // check cancellation themselves — but by the time control reaches it here, no output has
         // been accumulated yet, so this early return produces the identical bare "Command aborted"

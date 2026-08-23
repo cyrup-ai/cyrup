@@ -145,8 +145,11 @@ pub struct FileModelsStore {
     read_state: std::sync::RwLock<ModelsFileReadState>,
 }
 
-/// Pi `ModelsFileReadState` (models-store.ts:15-19 @v0.84.1), minus the in-flight-reload coalescer:
-/// cyrup's reader is synchronous file I/O under a `FileLock`, so there is no promise to share.
+/// Pi `ModelsFileReadState` (models-store.ts:15-19 @v0.84.1). Upstream additionally memoises the
+/// in-flight reload so concurrent `readLatest` callers await one promise. A future borrowing
+/// `&self` cannot be handed out, so [`FileModelsStore::read_latest`] reaches the same property from
+/// the other end: it re-checks this revision AFTER taking the lock, and a caller that queued behind
+/// a reload returns the snapshot that reload stamped rather than re-parsing the file itself.
 #[derive(Default)]
 struct ModelsFileReadState {
     data: OrderedObject,
@@ -247,18 +250,30 @@ impl FileModelsStore {
         serde_json::from_str(&text).unwrap_or_default()
     }
 
+    /// The snapshot, when the file has not moved since it was stamped — the same
+    /// `getFileRevision(this.path) === readState.revision` predicate the `read_state` field doc
+    /// above cites.
+    ///
+    /// `None` means "reload", and covers all three of upstream's misses: the file cannot be stat'd,
+    /// the revision differs, or no revision has been stamped yet (a fresh store, or a `write`/
+    /// `delete` that cleared it). A poisoned `read_state` also reloads rather than propagating.
+    fn current_snapshot(&self) -> Option<OrderedObject> {
+        let revision = file_revision(&self.path)?;
+        let state = self.read_state.read().ok()?;
+        (state.revision.as_deref() == Some(revision.as_str())).then(|| state.data.clone())
+    }
+
     /// `readLatest` (models-store.ts:81-108 @v0.84.1): answer from the snapshot when the file's
     /// revision is unchanged, otherwise reload under the cross-process lock and re-stamp it.
+    ///
+    /// The snapshot is checked TWICE. The second check is load-bearing, not defensive — see the
+    /// comment at the re-check below.
     async fn read_latest(
         &self,
         options: Option<&ModelsStoreOperationOptions>,
     ) -> Result<OrderedObject, crate::error::ConfigError> {
-        let revision = file_revision(&self.path);
-        if revision.is_some()
-            && let Ok(state) = self.read_state.read()
-            && revision == state.revision
-        {
-            return Ok(state.data.clone());
+        if let Some(data) = self.current_snapshot() {
+            return Ok(data);
         }
         // The lock is advisory and cross-process: a concurrent `cyrup update --models` in another
         // terminal must not be observed mid-rename. A lock we could not take is not a degraded
@@ -266,6 +281,18 @@ impl FileModelsStore {
         let _guard =
             crate::lock::FileLock::acquire(&self.path, options.and_then(|o| o.signal.as_ref()))
                 .await?;
+        // Re-check under the lock. This stands in for pi's in-flight-reload coalescer, and it is
+        // not an optimisation: `acquire` awaits, so every other reader polled between the check
+        // above and this line saw the OLD revision and queued behind us. Whoever reached here
+        // first has already re-read the file and stamped its revision BEFORE releasing the guard,
+        // so re-parsing now would be pure duplicated work — one full `read_to_string` +
+        // `from_str` of the whole catalog per waiter. Upstream shares the reload's promise; a
+        // future borrowing `&self` cannot be handed out, so the equivalent here is to observe the
+        // result the winner published. `RemoteCatalog::refresh_providers` fans out one `read` per
+        // configured provider through `join_all`, which is exactly this case.
+        if let Some(data) = self.current_snapshot() {
+            return Ok(data);
+        }
         let data = self.read_all();
         self.update_read_state(&data, file_revision(&self.path));
         Ok(data)
@@ -304,10 +331,10 @@ impl ModelsStore for FileModelsStore {
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
         let latest = self.read_latest(options).await.map_err(store_err)?;
         // … and once after it returns, before the entry is handed back (`:121`). Upstream's second
-        // check catches an abort raised while the shared reload was in flight; here `read_latest`
-        // is synchronous, so it catches an abort raised while this task was descheduled across the
-        // `async fn`'s poll. Both are the same guarantee: nothing is returned to a caller that has
-        // already given up.
+        // check catches an abort raised while the shared reload was in flight, and so does this
+        // one: `read_latest` awaits `FileLock::acquire`, so the reload is genuinely in flight
+        // across the two checks and a caller can give up inside it. Nothing is returned to a
+        // caller that has already given up.
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
         Ok(latest
             .get(provider_id)

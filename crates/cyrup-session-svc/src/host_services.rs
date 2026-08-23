@@ -48,8 +48,8 @@ use crate::tools::DynamicToolState;
 /// this only fills the gap when none was given. Fed straight into `ProcOps::exec_argv`'s existing
 /// `timeout: Option<Duration>` (rather than wrapped in an outer `tokio::time::timeout`) so a fallback
 /// firing still goes through the SAME SIGTERM-then-grace-then-SIGKILL escalation
-/// (`cyrup-tools/src/ops/local.rs`) as an explicit guest timeout — not an ungraceful `kill_on_drop`
-/// SIGKILL from abandoning the future outright.
+/// (`cyrup-tools/src/ops/local/proc.rs`) as an explicit guest timeout — not an ungraceful
+/// `kill_on_drop` SIGKILL from abandoning the future outright.
 const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// A command-tier control sink: a loaded extension's `control` import (new/switch/fork/…) is routed
@@ -1398,7 +1398,7 @@ impl HostServices for LiveHostServices {
         // (exec.ts:34-46): shell:false argv, `cwd ?? sessionCwd`, and a `timeoutMs` that SIGTERMs
         // then, after a 5s grace period, SIGKILLs (killed=true) the process GROUP on expiry — Pi's
         // exact `killProcess` escalation (exec.ts:52-63), implemented by `LocalProc::exec_argv`'s
-        // SIGTERM/grace/SIGKILL loop (`cyrup-tools/src/ops/local.rs`). Deliberately does NOT honor a
+        // SIGTERM/grace/SIGKILL loop (`cyrup-tools/src/ops/local/proc.rs`). Deliberately does NOT honor a
         // guest-supplied `env` key: Pi's real `execCommand` never passes an `env` override to
         // `spawn()` at all (`exec.ts:41-45`) — the child only ever inherits the host's own ambient
         // environment. Accepting one here would be new ambient authority (arbitrary env injection
@@ -1413,8 +1413,9 @@ impl HostServices for LiveHostServices {
         // cyrup's `self.cwd` (the session's project directory) is the analog of that ambient
         // fallback here (same reasoning `HostServices::proc_spawn`'s omitted-cwd default already
         // documents), so an empty guest string gets the SAME fallback an omitted one gets, rather
-        // than reaching `LocalProc::exec_argv`'s unconditional `cmd.current_dir(cwd)`
-        // (`cyrup-tools/src/ops/local.rs`) with an empty path and hard-failing the spawn.
+        // than relying on `build_argv_command`'s defense-in-depth empty-`cwd` skip
+        // (`cyrup-tools/src/ops/local/command.rs`), which is what stops an empty path
+        // reaching `cmd.current_dir(cwd)` and hard-failing the spawn.
         let cwd = opts
             .get("cwd")
             .and_then(Value::as_str)

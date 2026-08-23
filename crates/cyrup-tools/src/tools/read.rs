@@ -131,7 +131,7 @@ impl Tool for ReadTool {
         // "File not found or unreadable: {input.path}" collapsed ENOENT/EACCES/ENOTDIR into one
         // string and reported the raw user-supplied path — misleading precisely because the loop
         // above may have selected a macOS filename VARIANT of it. `LocalFs::access` already builds
-        // `"{resolved path}: {io error}"` (ops/local.rs:113), so propagating is enough.
+        // `"{resolved path}: {io error}"` (ops/local/fs.rs), so propagating is enough.
         self.fs.access(&abs, crate::ops::Access::Read).await?;
 
         if cancel.is_cancelled() {

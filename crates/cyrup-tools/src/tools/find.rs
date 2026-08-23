@@ -161,7 +161,7 @@ impl Tool for FindTool {
             // is empty at v0.84.1: pi relativizes only the lines it received (find.ts:321-326) and
             // never reorders them, so the sort is dropped rather than moved. Note this bounds the
             // stream, not just the vector: dropping out of the loop closes the receiver and
-            // `LocalFs::walk`'s producer task breaks on the send error (ops/local.rs).
+            // `LocalFs::walk`'s producer task breaks on the send error (ops/local/fs.rs).
             if results.len() >= limit {
                 break;
             }

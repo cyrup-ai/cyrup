@@ -871,14 +871,7 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
         selector.set_override_state(i, state);
     }
     let mut persist_err: Option<String> = None;
-    // `persist_nested` is async now, and `run_startup_selector`'s `on_apply` is a sync callback
-    // driven by a raw-mode terminal loop, so the write cannot happen inside it. The toggles are
-    // recorded here and applied immediately after the loop returns, below. `arrays` already holds
-    // the full desired array for each (scope, kind) and the callback rewrites it wholesale, so the
-    // bytes that reach disk are identical; what moves is only WHEN they are written — one flush on
-    // exit rather than one per toggle.
-    let mut pending: Vec<(SettingsScope, &'static str, serde_json::Value)> = Vec::new();
-    run_startup_selector(&theme, &keymap, &mut selector, |payload| {
+    run_startup_selector(&theme, &keymap, &mut selector, async |payload: &str| {
         let Some(toggle) = ConfigToggle::from_payload(payload) else {
             return;
         };
@@ -888,21 +881,24 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
         };
         let entry = arrays.entry((toggle.scope, toggle.kind)).or_default();
         // Drop any prior +/-/! entry for this exact pattern, then push the new decision (Pi
-        // `toggleTopLevelResource`, config-selector.ts:471-480): enabling writes `+pattern`, disabling
-        // `-pattern`.
+        // `toggleTopLevelResource`, config-selector.ts:471-480): enabling writes `+pattern`,
+        // disabling `-pattern`.
         entry.retain(|p| strip_override_marker(p) != toggle.pattern);
         entry.push(format!("{}{}", if toggle.enabled { '+' } else { '-' }, toggle.pattern));
         let value = serde_json::Value::Array(
             entry.iter().cloned().map(serde_json::Value::String).collect(),
         );
-        pending.push((settings_scope, toggle.kind.key(), value));
-    })?;
-
-    for (settings_scope, key, value) in pending {
-        if let Err(e) = settings.persist_nested(settings_scope, &[key], value).await {
+        // Awaited HERE, before the loop redraws: the row the selector is about to paint as
+        // enabled/disabled is already on disk. `run_startup_selector`'s `Err` (a dead terminal
+        // mid-session) can now only lose the in-flight toggle, never the ones already made.
+        let written = settings
+            .persist_nested(settings_scope, &[toggle.kind.key()], value)
+            .await;
+        if let Err(e) = written {
             persist_err = Some(e.to_string());
         }
-    }
+    })
+    .await?;
 
     if let Some(e) = persist_err {
         // A project toggle in an untrusted folder is the usual cause (Pi requires trust to write

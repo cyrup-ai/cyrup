@@ -22,7 +22,6 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tokio-stream = { workspace = true }
-dashmap = { workspace = true }
 globset = { workspace = true }
 grep-matcher = { workspace = true }
 grep-regex = { workspace = true }
