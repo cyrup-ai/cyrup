@@ -374,6 +374,10 @@ impl Theme {
 
     /// Resolve the typed `export` section (`pageBg`/`cardBg`/`infoBg`) through `vars` for HTML
     /// export (theme.ts:94-100; arch-12). Absent keys degrade to `Inherit`.
+    ///
+    /// The arch-12 HTML-export consumer is not yet in tree, so this method currently has exactly
+    /// one caller: `src/tests/resources/themes.rs`. Its absence elsewhere is expected — the
+    /// production consumer is pending, not missing.
     pub fn resolve_export(&self) -> ExportColors {
         let get = |k: &str| {
             self.data

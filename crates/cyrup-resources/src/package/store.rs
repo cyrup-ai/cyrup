@@ -123,7 +123,12 @@ pub fn installed_dir(
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -141,7 +146,11 @@ mod tests {
 
         let tree = store.package_dir(InstallScope::Global, &id).unwrap();
         let registry = store.registry_path(InstallScope::Global).unwrap();
-        assert_eq!(tree.parent(), registry.parent(), "tree {tree:?} vs registry {registry:?}");
+        assert_eq!(
+            tree.parent(),
+            registry.parent(),
+            "tree {tree:?} vs registry {registry:?}"
+        );
         assert_eq!(tree, package_dir.join("git-github.com-acme-pack"));
         assert_eq!(registry, package_dir.join("packages.json"));
         assert!(
@@ -176,10 +185,16 @@ mod tests {
 
         assert_eq!(migrate_legacy_doubled_packages_root(&package_dir), 2);
         let moved = package_dir.join("git-github.com-acme-pack");
-        assert_eq!(std::fs::read_to_string(moved.join("SKILL.md")).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(moved.join("SKILL.md")).unwrap(),
+            "x"
+        );
         assert!(package_dir.join(".gitignore").exists());
         assert!(!legacy.exists(), "the emptied legacy root is removed");
-        assert!(package_dir.join("packages.json").exists(), "the registry is untouched");
+        assert!(
+            package_dir.join("packages.json").exists(),
+            "the registry is untouched"
+        );
 
         // Idempotent, and a name already present at the destination is left alone rather than
         // overwriting the newer tree.
@@ -187,6 +202,9 @@ mod tests {
         std::fs::create_dir_all(legacy.join("git-github.com-acme-pack")).unwrap();
         std::fs::write(legacy.join("git-github.com-acme-pack/SKILL.md"), "stale").unwrap();
         assert_eq!(migrate_legacy_doubled_packages_root(&package_dir), 0);
-        assert_eq!(std::fs::read_to_string(moved.join("SKILL.md")).unwrap(), "x");
+        assert_eq!(
+            std::fs::read_to_string(moved.join("SKILL.md")).unwrap(),
+            "x"
+        );
     }
 }
