@@ -275,7 +275,7 @@ async fn run() -> anyhow::Result<i32> {
     // `startupSettingsManager` (`:610`) and the `sessionDir` tier chain (`:625-630`), for pi's stated
     // reason at `:613-614` — "Runs before any runtime services are created so the chosen settings
     // apply everywhere". Wired per ADR-0011.
-    if bootstrap::maybe_run_first_time_setup(mode, &cli, &dirs, &env, &mut startup_settings)? {
+    if bootstrap::maybe_run_first_time_setup(mode, &cli, &dirs, &env, &mut startup_settings).await? {
         timings::time("firstTimeSetup", timings::TimingLabel::Main);
     }
 

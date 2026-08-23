@@ -37,20 +37,20 @@ pub use config::{
     ToolsOptions, WriteOpts,
 };
 pub use isolation::{
-    protected_path_rule, OsSandbox, PermissionPolicy, PolicyDecision, ProtectedFs, ProtectedPaths,
-    Rule, SandboxKind, SandboxPolicy, TraversalFs,
+    OsSandbox, PermissionPolicy, PolicyDecision, ProtectedFs, ProtectedPaths, Rule, SandboxKind,
+    SandboxPolicy, TraversalFs, protected_path_rule,
 };
 pub use lock::FileMutationLocks;
 pub use ops::{
-    kill_pid, kill_process_tree, kill_tracked_detached_children, terminate_pid,
-    track_detached_child_pid, untrack_detached_child_pid, Access, ArgvOutput, ArgvSpec, Backend,
-    DirEntry, ExecSpec, ExitStatus, FsOps, ImageMime, Meta, ProcOps, ShellConfig, Transport,
-    WalkItem, WalkOpts,
+    Access, ArgvOutput, ArgvSpec, Backend, DirEntry, ExecSpec, ExitStatus, FsOps, ImageMime, Meta,
+    ProcOps, ShellConfig, Transport, WalkItem, WalkOpts, kill_pid, kill_process_tree,
+    kill_tracked_detached_children, terminate_pid, track_detached_child_pid,
+    untrack_detached_child_pid,
 };
 pub use registry::{
-    all_tools, coding_tools, read_only_tools, Availability, ToolRegistry, BUILTIN_NAMES,
+    Availability, BUILTIN_NAMES, ToolRegistry, all_tools, coding_tools, read_only_tools,
 };
-pub use truncate::{Truncated, Truncation, TruncatedBy};
+pub use truncate::{Truncated, TruncatedBy, Truncation};
 
 #[cfg(test)]
 mod tests;

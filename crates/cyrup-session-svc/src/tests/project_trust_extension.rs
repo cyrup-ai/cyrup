@@ -331,7 +331,7 @@ async fn an_extension_verdict_pre_empts_the_prompt_entirely() {
         .with_native_extension(voter)
         .trust_prompt(Arc::new(move |_options, _saved| {
             counter.fetch_add(1, Ordering::AcqRel);
-            Some(true)
+            Box::pin(async { Some(true) })
         }))
         .build()
         .await
@@ -367,7 +367,7 @@ async fn with_no_extension_verdict_the_prompt_runs_and_decides() {
     let session = SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, cfg)
         .trust_prompt(Arc::new(move |options, _saved| {
             *sink.lock().unwrap() = options.iter().map(|o| o.label.clone()).collect();
-            Some(true)
+            Box::pin(async { Some(true) })
         }))
         .build()
         .await

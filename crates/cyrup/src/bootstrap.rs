@@ -137,7 +137,7 @@ mgr.drain_load_errors()
 ///
 /// Pi's `showFirstTimeSetup` returns void; a cancel at either step persists nothing, and a
 /// persistence failure is propagated rather than swallowed.
-pub fn maybe_run_first_time_setup(
+pub async fn maybe_run_first_time_setup(
     mode: AppMode,
     cli: &Cli,
     dirs: &ConfigDirs,
@@ -160,7 +160,7 @@ pub fn maybe_run_first_time_setup(
     } else {
         UiTheme::dark()
     };
-    let _ = crate::startup::run_first_time_setup(&theme, settings, detected)?;
+    let _ = crate::startup::run_first_time_setup(&theme, settings, detected).await?;
     Ok(true)
 }
 

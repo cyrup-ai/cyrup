@@ -21,12 +21,17 @@
 //! `else` branch. cyrup used to build the folded split unconditionally and index it for every
 //! match, so on a file with lone-`\r` separators it printed text from a DIFFERENT position than the
 //! line number it reported (`x\rTARGET` → `cr.txt:1: x`, which does not even contain the pattern).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate};
 use crate::config::GrepOpts;
 use crate::ops::local::LocalFs;
 use crate::tools::GrepTool;
+use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate};
 use std::sync::Arc;
 
 fn first_text(r: &ToolResult) -> String {
@@ -63,18 +68,28 @@ async fn grep_bytes(name: &str, bytes: &[u8], args: serde_json::Value) -> String
 /// reported line number, and not even containing the searched term.
 #[tokio::test]
 async fn lone_cr_line_renders_ripgrep_line_text_not_a_folded_segment() {
-    let text =
-        grep_bytes("cr.txt", b"x\rTARGET\n", serde_json::json!({ "pattern": "TARGET" })).await;
+    let text = grep_bytes(
+        "cr.txt",
+        b"x\rTARGET\n",
+        serde_json::json!({ "pattern": "TARGET" }),
+    )
+    .await;
     assert_eq!(text, "cr.txt:1: xTARGET");
-    assert!(!text.contains('\r'), "Pi deletes every surviving CR: {text:?}");
+    assert!(
+        !text.contains('\r'),
+        "Pi deletes every surviving CR: {text:?}"
+    );
 }
 
 /// Several interior lone `\r`s, all deleted rather than folded.
 #[tokio::test]
 async fn interior_lone_crs_are_deleted_not_folded_at_default_context() {
-    let text =
-        grep_bytes("cr.txt", b"foo\rNEEDLE\rbar\n", serde_json::json!({ "pattern": "NEEDLE" }))
-            .await;
+    let text = grep_bytes(
+        "cr.txt",
+        b"foo\rNEEDLE\rbar\n",
+        serde_json::json!({ "pattern": "NEEDLE" }),
+    )
+    .await;
     assert_eq!(text, "cr.txt:1: fooNEEDLEbar");
 }
 
@@ -109,9 +124,12 @@ async fn nonzero_context_still_folds_lone_cr_through_get_file_lines() {
 /// `\r\n` normalisation.
 #[tokio::test]
 async fn crlf_line_endings_are_unchanged() {
-    let text =
-        grep_bytes("crlf.txt", b"hello\r\nworld\r\n", serde_json::json!({ "pattern": "hello" }))
-            .await;
+    let text = grep_bytes(
+        "crlf.txt",
+        b"hello\r\nworld\r\n",
+        serde_json::json!({ "pattern": "hello" }),
+    )
+    .await;
     assert_eq!(text, "crlf.txt:1: hello");
 }
 
@@ -119,8 +137,12 @@ async fn crlf_line_endings_are_unchanged() {
 /// at all renders whole.
 #[tokio::test]
 async fn last_line_without_a_terminator_renders_whole() {
-    let text =
-        grep_bytes("t.txt", b"a\nNEEDLE", serde_json::json!({ "pattern": "NEEDLE" })).await;
+    let text = grep_bytes(
+        "t.txt",
+        b"a\nNEEDLE",
+        serde_json::json!({ "pattern": "NEEDLE" }),
+    )
+    .await;
     assert_eq!(text, "t.txt:2: NEEDLE");
 }
 
@@ -130,7 +152,11 @@ async fn last_line_without_a_terminator_renders_whole() {
 /// replacement character appears exactly as Pi's `readFile(path,"utf8")` produces it.
 #[tokio::test]
 async fn non_utf8_matched_line_falls_back_to_the_format_block_path() {
-    let text =
-        grep_bytes("l1.txt", b"caf\xe9 NEEDLE\n", serde_json::json!({ "pattern": "NEEDLE" })).await;
+    let text = grep_bytes(
+        "l1.txt",
+        b"caf\xe9 NEEDLE\n",
+        serde_json::json!({ "pattern": "NEEDLE" }),
+    )
+    .await;
     assert_eq!(text, "l1.txt:1: caf\u{fffd} NEEDLE");
 }

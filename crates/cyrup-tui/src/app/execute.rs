@@ -198,7 +198,7 @@ impl<B: Backend> App<B> {
                 // decision header. Confirming writes the trust store (`write_project_trust`).
                 let options = session.project_trust_options();
                 let cwd = session.services().cwd.display().to_string();
-                let saved = session.saved_trust_decision();
+                let saved = session.saved_trust_decision().await;
                 let saved_label = format_saved_trust(&saved);
                 // Pi `isSavedOption` (`trust-selector.ts:92-98`): the option whose trust flag AND
                 // saved path both match the persisted decision. `selectedIndex` falls back to 0
@@ -418,7 +418,7 @@ impl<B: Backend> App<B> {
                 // persist that option's store updates (Pi `/trust` `onSelect` → trust-store write).
                 let options = session.project_trust_options();
                 match value.parse::<usize>().ok().and_then(|i| options.get(i)) {
-                    Some(opt) => match session.write_project_trust(&opt.updates) {
+                    Some(opt) => match session.write_project_trust(&opt.updates).await {
                         Ok(()) => {
                             let label = if opt.trusted { "trusted" } else { "untrusted" };
                             self.state.transcript.push_status(format!(

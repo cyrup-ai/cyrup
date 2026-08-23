@@ -31,7 +31,9 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Take [`ENV_LOCK`], ignoring poisoning — a sibling that panicked has already reported its own
 /// failure, and refusing the lock here would turn that into a second, misleading one.
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// D8(1) — `ShellConfig::detect()` ignores `CYRUP_SHELL`.
@@ -91,7 +93,9 @@ fn cyrup_shell_appears_nowhere_under_crates() {
         .parent()
         .expect("crates/cyrup-tools has a parent")
         .to_path_buf();
-    let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("shell_interpreter.rs");
+    let this_file = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("shell_interpreter.rs");
 
     // Assembled at runtime so this guard does not match itself through a constant.
     let needle: String = ["CYRUP", "SHELL"].join("_");
@@ -99,7 +103,9 @@ fn cyrup_shell_appears_nowhere_under_crates() {
     let mut offenders: Vec<String> = Vec::new();
     let mut stack = vec![crates_dir];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -108,7 +114,9 @@ fn cyrup_shell_appears_nowhere_under_crates() {
                 }
                 stack.push(path);
             } else if path.extension().is_some_and(|e| e == "rs") && path != this_file {
-                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
                 for (i, line) in text.lines().enumerate() {
                     if line.contains(&needle) {
                         offenders.push(format!("{}:{}", path.display(), i + 1));

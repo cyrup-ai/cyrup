@@ -104,7 +104,9 @@ pub(crate) fn errno_code_of(err: &ToolError) -> Option<&str> {
     let is_code = head.len() >= 2
         && head.len() <= 16
         && head.starts_with('E')
-        && head.bytes().all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
+        && head
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit());
     is_code.then_some(head)
 }
 

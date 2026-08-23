@@ -42,8 +42,8 @@ pub mod traversal;
 pub use crate::ops::{Access, DirEntry, FsOps, ImageMime, Meta, WalkItem, WalkOpts};
 
 pub use policy::{
-    bash_command_contains, dangerous_bash_rule, is_dangerous_command, is_tool, protected_path_rule,
-    PermissionPolicy, PolicyDecision, Rule, RuleBuilder,
+    PermissionPolicy, PolicyDecision, Rule, RuleBuilder, bash_command_contains,
+    dangerous_bash_rule, is_dangerous_command, is_tool, protected_path_rule,
 };
 pub use protected::{ProtectedFs, ProtectedPaths};
 pub use sandbox::{DeferredSandbox, OsSandbox, SandboxError, SandboxKind, SandboxPolicy};

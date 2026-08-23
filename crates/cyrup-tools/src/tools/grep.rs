@@ -4,8 +4,8 @@
 
 use crate::config::GrepOpts;
 use crate::ops::{FsOps, WalkOpts};
-use crate::tools::globmatch::{to_posix, RgGlob};
-use crate::truncate::{format_size, truncate_head, truncate_line, GREP_MAX_LINE_LENGTH, TruncOpts};
+use crate::tools::globmatch::{RgGlob, to_posix};
+use crate::truncate::{GREP_MAX_LINE_LENGTH, TruncOpts, format_size, truncate_head, truncate_line};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
@@ -54,7 +54,12 @@ impl GrepTool {
                 "limit": { "type": "number", "description": "Maximum number of matches to return (default: 100)" }
             }
         });
-        Self { fs, cwd, opts, params }
+        Self {
+            fs,
+            cwd,
+            opts,
+            params,
+        }
     }
 
     /// Search ONE candidate and append its formatted rows to `out`, advancing the GLOBAL match
@@ -119,8 +124,11 @@ impl GrepTool {
             let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
             let mut local = 0usize;
             {
-                let sink =
-                    MatchSink { matches: &mut matches, count: &mut local, limit: remaining };
+                let sink = MatchSink {
+                    matches: &mut matches,
+                    count: &mut local,
+                    limit: remaining,
+                };
                 let _ = searcher.search_reader(&matcher_owned, reader, sink);
             }
             matches
@@ -173,8 +181,9 @@ impl GrepTool {
                 // Pi grep.ts:325-331: format straight from the captured line text —
                 // `\r\n`→`\n`, then DROP every remaining `\r` (not fold it to `\n`, which is
                 // what `getFileLines` does), then strip ONE trailing `\n`.
-                let stripped =
-                    String::from_utf8_lossy(raw).replace("\r\n", "\n").replace('\r', "");
+                let stripped = String::from_utf8_lossy(raw)
+                    .replace("\r\n", "\n")
+                    .replace('\r', "");
                 let text = stripped.strip_suffix('\n').unwrap_or(&stripped);
                 let (capped, tr) = truncate_line(text, GREP_MAX_LINE_LENGTH);
                 if tr {
@@ -193,12 +202,17 @@ impl GrepTool {
             // Pi: `start = max(1, n - context)`, `end = min(lines.length, n + context)` when
             // context > 0, else just the single match line (grep.ts:260-261).
             let (start, end) = if context > 0 {
-                (l.saturating_sub(context).max(1), (l + context).min(src_lines.len()))
+                (
+                    l.saturating_sub(context).max(1),
+                    (l + context).min(src_lines.len()),
+                )
             } else {
                 (l, l)
             };
             for current in start..=end {
-                let raw = src_lines.get(current.saturating_sub(1)).map_or("", String::as_str);
+                let raw = src_lines
+                    .get(current.saturating_sub(1))
+                    .map_or("", String::as_str);
                 // Pi's per-line `replace(/\r/g,"")` (grep.ts:264).
                 let text = raw.replace('\r', "");
                 let (capped, tr) = truncate_line(&text, GREP_MAX_LINE_LENGTH);
@@ -238,7 +252,8 @@ impl Sink for MatchSink<'_> {
     fn matched(&mut self, _s: &Searcher, m: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
         // `SinkMatch::bytes` is the matched line INCLUDING its terminator, which is exactly what
         // ripgrep serialises into `data.lines.text` — hence Pi's `.replace(/\n$/,"")` below.
-        self.matches.push((m.line_number().unwrap_or(0), m.bytes().to_vec()));
+        self.matches
+            .push((m.line_number().unwrap_or(0), m.bytes().to_vec()));
         *self.count += 1;
         Ok(*self.count < self.limit)
     }
@@ -286,7 +301,9 @@ impl Tool for GrepTool {
             .metadata(&search_root)
             .await
             // Pi: `Path not found: ${searchPath}` (grep.ts:186).
-            .map_err(|_| error::not_found(format!("Path not found: {}", error::show(&search_root))))?;
+            .map_err(|_| {
+                error::not_found(format!("Path not found: {}", error::show(&search_root)))
+            })?;
 
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(input.ignore_case.unwrap_or(false))
@@ -303,7 +320,10 @@ impl Tool for GrepTool {
         // same `Math.max` absorbs — must still yield up to one match rather than short-circuiting
         // to "No matches found". `??` is null/undefined-only, so a JSON `null` also takes the
         // default.
-        let limit = input.limit.map_or(self.opts.limit, crate::jsnum::to_count).max(1);
+        let limit = input
+            .limit
+            .map_or(self.opts.limit, crate::jsnum::to_count)
+            .max(1);
 
         // Pi hands `glob` to ripgrep verbatim (grep.ts:218), so it parses as ONE gitignore-style
         // override line — anchored when it contains a `/`, basename-matched when it does not. That
@@ -344,8 +364,13 @@ impl Tool for GrepTool {
             // which is `ignore`'s `require_git:true` (the crate does the in-repo detection internally).
             // Unlike Pi's `find` (fd `--no-require-git` outside a repo, find.ts:226-240), Pi's grep
             // never disables require-git, so outside any repo a stray `.gitignore` is NOT applied.
-            let mut walk =
-                self.fs.walk(&search_root, WalkOpts { include_hidden: true, require_git: true });
+            let mut walk = self.fs.walk(
+                &search_root,
+                WalkOpts {
+                    include_hidden: true,
+                    require_git: true,
+                },
+            );
             loop {
                 // The walk and the search are FUSED, and both stop at the limit. Pi's line handler
                 // sets `matchLimitReached` and calls `stopChild(true)` (grep.ts:292-295, defined at
@@ -433,7 +458,10 @@ impl Tool for GrepTool {
         }
         if t.info.truncated {
             // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` (grep.ts:347).
-            notices.push(format!("{} limit reached", format_size(crate::truncate::DEFAULT_MAX_BYTES)));
+            notices.push(format!(
+                "{} limit reached",
+                format_size(crate::truncate::DEFAULT_MAX_BYTES)
+            ));
         }
         if any_line_truncated {
             notices.push(format!(
@@ -449,19 +477,17 @@ impl Tool for GrepTool {
         let match_limit_reached = if count >= limit { Some(limit) } else { None };
         let lines_truncated = if any_line_truncated { Some(true) } else { None };
         let truncation = if t.info.truncated { Some(t.info) } else { None };
-        let details = if truncation.is_some()
-            || match_limit_reached.is_some()
-            || lines_truncated.is_some()
-        {
-            serde_json::to_value(crate::details::GrepDetails {
-                truncation,
-                match_limit_reached,
-                lines_truncated,
-            })
-            .ok()
-        } else {
-            None
-        };
+        let details =
+            if truncation.is_some() || match_limit_reached.is_some() || lines_truncated.is_some() {
+                serde_json::to_value(crate::details::GrepDetails {
+                    truncation,
+                    match_limit_reached,
+                    lines_truncated,
+                })
+                .ok()
+            } else {
+                None
+            };
 
         Ok(ToolResult {
             content: vec![Content::text(text)],
@@ -481,8 +507,8 @@ mod tests {
     use crate::ops::{Access, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
     use cyrup_core::{CancelToken, Content, EventStream, Tool, ToolCallId, ToolError, ToolUpdate};
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// `LocalFs` that serves the first `read()` of any path normally and fails every later one.
     ///
@@ -531,7 +557,10 @@ mod tests {
         let cwd = dir.path().to_path_buf();
         std::fs::write(cwd.join("a.txt"), "one\nNEEDLE\nthree\n").unwrap();
 
-        let fs = Arc::new(FailSecondRead { inner: LocalFs, reads: AtomicUsize::new(0) });
+        let fs = Arc::new(FailSecondRead {
+            inner: LocalFs,
+            reads: AtomicUsize::new(0),
+        });
         let grep = GrepTool::new(fs, cwd.clone(), GrepOpts::default());
         let r = grep
             .execute(
@@ -561,7 +590,10 @@ mod tests {
         let cwd = dir.path().to_path_buf();
         std::fs::write(cwd.join("a.txt"), "one\nNEEDLE\nthree\n").unwrap();
 
-        let fs = Arc::new(FailSecondRead { inner: LocalFs, reads: AtomicUsize::new(0) });
+        let fs = Arc::new(FailSecondRead {
+            inner: LocalFs,
+            reads: AtomicUsize::new(0),
+        });
         let grep = GrepTool::new(fs, cwd.clone(), GrepOpts::default());
         let r = grep
             .execute(
@@ -611,8 +643,11 @@ mod tests {
         std::fs::write(cwd.join("src/a.ts"), "NEEDLE\n").unwrap();
         std::fs::write(cwd.join("vendor/src/b.ts"), "NEEDLE\n").unwrap();
 
-        let text =
-            grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "src/**/*.ts" })).await;
+        let text = grep_text(
+            &cwd,
+            serde_json::json!({ "pattern": "NEEDLE", "glob": "src/**/*.ts" }),
+        )
+        .await;
         assert_eq!(text, "src/a.ts:1: NEEDLE");
     }
 
@@ -628,8 +663,11 @@ mod tests {
         std::fs::write(cwd.join("src/a.ts"), "NEEDLE\n").unwrap();
         std::fs::write(cwd.join("vendor/src/b.ts"), "NEEDLE\n").unwrap();
 
-        let text =
-            grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "/src/*.ts" })).await;
+        let text = grep_text(
+            &cwd,
+            serde_json::json!({ "pattern": "NEEDLE", "glob": "/src/*.ts" }),
+        )
+        .await;
         assert_eq!(text, "src/a.ts:1: NEEDLE");
     }
 
@@ -662,7 +700,11 @@ mod tests {
         std::fs::write(cwd.join("src/deep/a.ts"), "NEEDLE\n").unwrap();
         std::fs::write(cwd.join("b.js"), "NEEDLE\n").unwrap();
 
-        let text = grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE", "glob": "*.ts" })).await;
+        let text = grep_text(
+            &cwd,
+            serde_json::json!({ "pattern": "NEEDLE", "glob": "*.ts" }),
+        )
+        .await;
         assert_eq!(text, "src/deep/a.ts:1: NEEDLE");
     }
 }

@@ -216,7 +216,7 @@ impl SettingsManager {
     /// - [`ConfigError::SettingsWriteRefused`] if that scope's file failed to load, or if it became
     ///   unparseable between the load and this write — the file is left byte-for-byte unchanged
     ///   (CFG-001).
-    pub fn set<T: serde::Serialize>(
+    pub async fn set<T: serde::Serialize>(
         &mut self,
         scope: SettingsScope,
         key: &str,
@@ -257,7 +257,7 @@ impl SettingsManager {
                 doc.obj.insert(key_owned.clone(), json.clone());
             }
             Some(doc.to_pretty())
-        })?;
+        }).await?;
         if let Some(message) = corrupt {
             return Err(ConfigError::SettingsWriteRefused { scope, message });
         }
@@ -274,7 +274,7 @@ impl SettingsManager {
     ///
     /// Same as [`Self::set`], including the [`ConfigError::SettingsWriteRefused`] refusal that keeps
     /// an unparseable file intact (CFG-001).
-    pub fn set_nested(
+    pub async fn set_nested(
         &mut self,
         scope: SettingsScope,
         path: &[&str],
@@ -300,7 +300,7 @@ impl SettingsManager {
             };
             set_value_at_path(&mut doc.obj, &path_owned, value.clone());
             Some(doc.to_pretty())
-        })?;
+        }).await?;
         if let Some(message) = corrupt {
             return Err(ConfigError::SettingsWriteRefused { scope, message });
         }
@@ -320,7 +320,7 @@ impl SettingsManager {
     /// Same as [`Self::set`], including the [`ConfigError::SettingsWriteRefused`] refusal that keeps
     /// an unparseable file intact (CFG-001). This is the seam the TUI `/config` selector and the
     /// `cyrup config` subcommand drive, and both already surface the returned error to the user.
-    pub fn persist_nested(
+    pub async fn persist_nested(
         &self,
         scope: SettingsScope,
         path: &[&str],
@@ -346,7 +346,7 @@ impl SettingsManager {
             };
             set_value_at_path(&mut doc.obj, &path_owned, value.clone());
             Some(doc.to_pretty())
-        })?;
+        }).await?;
         if let Some(message) = corrupt {
             return Err(ConfigError::SettingsWriteRefused { scope, message });
         }
@@ -357,7 +357,7 @@ impl SettingsManager {
     /// scope through `markdown.mermaid`, so a sibling `markdown.codeBlockIndent` survives — pi does
     /// `this.globalSettings.markdown ??= {}` and assigns one key, never replacing the block.
     /// CFG-040.
-    pub fn set_mermaid_rendering_mode(
+    pub async fn set_mermaid_rendering_mode(
         &mut self,
         mode: MermaidRenderingMode,
     ) -> Result<(), ConfigError> {
@@ -365,33 +365,33 @@ impl SettingsManager {
             SettingsScope::Global,
             &["markdown", "mermaid"],
             Value::String(mode.as_str().to_string()),
-        )
+        ).await
     }
 
     /// `setEditorPaddingX`: clamp to 0..=3 (Pi settings-manager.ts:1179-1183).
-    pub fn set_editor_padding_x(&mut self, padding: f64) -> Result<(), ConfigError> {
+    pub async fn set_editor_padding_x(&mut self, padding: f64) -> Result<(), ConfigError> {
         let clamped = (padding.floor() as i64).clamp(0, 3);
-        self.set(SettingsScope::Global, "editorPaddingX", clamped)
+        self.set(SettingsScope::Global, "editorPaddingX", clamped).await
     }
 
     /// `setAutocompleteMaxVisible`: clamp to 3..=20 (Pi settings-manager.ts:1189-1193).
-    pub fn set_autocomplete_max_visible(&mut self, max_visible: f64) -> Result<(), ConfigError> {
+    pub async fn set_autocomplete_max_visible(&mut self, max_visible: f64) -> Result<(), ConfigError> {
         let clamped = (max_visible.floor() as i64).clamp(3, 20);
-        self.set(SettingsScope::Global, "autocompleteMaxVisible", clamped)
+        self.set(SettingsScope::Global, "autocompleteMaxVisible", clamped).await
     }
 
     /// `setImageWidthCells`: floor and clamp to >=1 (Pi settings-manager.ts:1068-1075).
-    pub fn set_image_width_cells(&mut self, width: f64) -> Result<(), ConfigError> {
+    pub async fn set_image_width_cells(&mut self, width: f64) -> Result<(), ConfigError> {
         let clamped = (width.floor() as i64).max(1);
         self.set_nested(
             SettingsScope::Global,
             &["terminal", "imageWidthCells"],
             clamped.into(),
-        )
+        ).await
     }
 
     /// `setHttpIdleTimeoutMs`: reject non-finite/negative; floor (Pi settings-manager.ts:820-827).
-    pub fn set_http_idle_timeout_ms(&mut self, timeout_ms: f64) -> Result<(), ConfigError> {
+    pub async fn set_http_idle_timeout_ms(&mut self, timeout_ms: f64) -> Result<(), ConfigError> {
         if !timeout_ms.is_finite() || timeout_ms < 0.0 {
             return Err(ConfigError::InvalidSetting {
                 key: "httpIdleTimeoutMs".to_string(),
@@ -402,16 +402,16 @@ impl SettingsManager {
             SettingsScope::Global,
             "httpIdleTimeoutMs",
             timeout_ms.floor() as i64,
-        )
+        ).await
     }
 
     /// `setShowImages` (nested `terminal.showImages`; Pi settings-manager.ts:1051-1058).
-    pub fn set_show_images(&mut self, show: bool) -> Result<(), ConfigError> {
+    pub async fn set_show_images(&mut self, show: bool) -> Result<(), ConfigError> {
         self.set_nested(
             SettingsScope::Global,
             &["terminal", "showImages"],
             show.into(),
-        )
+        ).await
     }
 
     /// `setEnableAnalytics`: set the opt-in flag and, on first opt-in, generate a `trackingId`
@@ -419,7 +419,7 @@ impl SettingsManager {
     ///
     /// Does not route through [`Self::set`] (it writes two keys under one lock), so it carries its
     /// own copy of the CFG-001 guard.
-    pub fn set_enable_analytics(&mut self, enabled: bool) -> Result<(), ConfigError> {
+    pub async fn set_enable_analytics(&mut self, enabled: bool) -> Result<(), ConfigError> {
         self.ensure_scope_writable(SettingsScope::Global)?;
         let mut corrupt: Option<String> = None;
         self.store
@@ -444,7 +444,7 @@ impl SettingsManager {
                         .insert("trackingId".to_string(), Value::String(random_uuid_v4()));
                 }
                 Some(doc.to_pretty())
-            })?;
+            }).await?;
         if let Some(message) = corrupt {
             return Err(ConfigError::SettingsWriteRefused {
                 scope: SettingsScope::Global,

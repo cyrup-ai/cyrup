@@ -273,7 +273,10 @@ mod tests {
         let mut acc = OutputAccumulator::new("cyrup-test", 2000, 1024);
         acc.append(b"small output\n");
         // No limit exceeded yet ⇒ no temp file created.
-        assert!(acc.temp_path.is_none(), "temp file must not be created before a limit is hit");
+        assert!(
+            acc.temp_path.is_none(),
+            "temp file must not be created before a limit is hit"
+        );
         let path = acc.finalize(2000, 50 * 1024);
         assert!(path.is_none());
     }
@@ -306,10 +309,20 @@ mod tests {
         // the decoded path.
         let mut acc = OutputAccumulator::new("cyrup-test", 2000, 8);
         acc.append(&[0xFF, 0xFF, 0xFF, 0xFF]);
-        assert_eq!(acc.total_bytes(), 12, "decoded length = 4 × U+FFFD(3 bytes)");
-        assert!(acc.is_truncated(), "decoded 12B > 8B max must read as truncated like Pi");
+        assert_eq!(
+            acc.total_bytes(),
+            12,
+            "decoded length = 4 × U+FFFD(3 bytes)"
+        );
+        assert!(
+            acc.is_truncated(),
+            "decoded 12B > 8B max must read as truncated like Pi"
+        );
         let path = acc.finalize(2000, 8);
-        assert!(path.is_some(), "Pi spills the full output to a temp file when decoded > max");
+        assert!(
+            path.is_some(),
+            "Pi spills the full output to a temp file when decoded > max"
+        );
         if let Some(p) = path {
             let _ = std::fs::remove_file(&p);
         }

@@ -146,8 +146,8 @@ impl TrustStore {
     /// The read runs UNDER the cross-process file lock, as pi's does: `getEntry` wraps its read in
     /// `withTrustFileLock` (trust-manager.ts:219-222 @v0.83.0, lock defined `:168`) and `get()`
     /// (`:216`) routes through `getEntry`. CFG-013.
-    pub fn nearest(&self, cwd: &Path) -> Result<Option<TrustEntry>, ConfigError> {
-        let _guard = crate::lock::FileLock::acquire(&self.path)?;
+    pub async fn nearest(&self, cwd: &Path) -> Result<Option<TrustEntry>, ConfigError> {
+        let _guard = crate::lock::FileLock::acquire(&self.path, None).await?;
         let map = self.read_map()?;
         let cwd = canonicalize(cwd);
         let mut current: Option<&Path> = Some(cwd.as_path());
@@ -167,11 +167,11 @@ impl TrustStore {
 
     /// Atomic multi-update under a cross-process lock; sorted pretty JSON + trailing newline
     /// (Pi byte-interop). A `None` decision deletes the key (R-07-010).
-    pub fn set_many(
+    pub async fn set_many(
         &self,
         updates: &[(PathBuf, Option<TrustDecision>)],
     ) -> Result<(), ConfigError> {
-        let _guard = crate::lock::FileLock::acquire(&self.path)?;
+        let _guard = crate::lock::FileLock::acquire(&self.path, None).await?;
         let mut map = self.read_map()?;
         for (path, decision) in updates {
             let key = canonicalize(path).to_string_lossy().into_owned();
@@ -195,8 +195,8 @@ impl TrustStore {
         Ok(())
     }
 
-    pub fn set(&self, cwd: &Path, decision: Option<TrustDecision>) -> Result<(), ConfigError> {
-        self.set_many(&[(cwd.to_path_buf(), decision)])
+    pub async fn set(&self, cwd: &Path, decision: Option<TrustDecision>) -> Result<(), ConfigError> {
+        self.set_many(&[(cwd.to_path_buf(), decision)]).await
     }
 }
 
@@ -489,8 +489,8 @@ mod tests {
         crate::test_util::temp_dir()
     }
 
-    #[test]
-    fn ancestor_match() {
+    #[tokio::test]
+    async fn ancestor_match() {
         // R-07-013 / A-07-2
         let dir = tmp();
         let trust = dir.join("trust.json");
@@ -499,15 +499,15 @@ mod tests {
         let child = root.join("a").join("b");
         std::fs::create_dir_all(&child).unwrap();
 
-        store.set(&root, Some(TrustDecision::Trusted)).unwrap();
-        let found = store.nearest(&child).unwrap().unwrap();
+        store.set(&root, Some(TrustDecision::Trusted)).await.unwrap();
+        let found = store.nearest(&child).await.unwrap().unwrap();
         assert_eq!(found.decision, TrustDecision::Trusted);
 
         // None when no ancestor matches.
         let other_root = tmp();
         let other = other_root.join("unrelated");
         std::fs::create_dir_all(&other).unwrap();
-        assert!(store.nearest(&other).unwrap().is_none());
+        assert!(store.nearest(&other).await.unwrap().is_none());
     }
 
     #[test]
@@ -531,22 +531,22 @@ mod tests {
         assert_ne!(got, PathBuf::from("foo/../bar"));
     }
 
-    #[test]
-    fn parent_trust_removes_child_key() {
+    #[tokio::test]
+    async fn parent_trust_removes_child_key() {
         // R-07-010: "Trust parent" writes parent=true, cwd=null.
         let dir = tmp();
         let store = TrustStore::new(dir.join("trust.json"));
         let parent = dir.join("p");
         let cwd = parent.join("c");
         std::fs::create_dir_all(&cwd).unwrap();
-        store.set(&cwd, Some(TrustDecision::Untrusted)).unwrap();
+        store.set(&cwd, Some(TrustDecision::Untrusted)).await.unwrap();
 
         let opts = trust_options(&cwd, true);
         let parent_opt = opts.iter().find(|o| o.label.contains("parent")).unwrap();
-        store.set_many(&parent_opt.updates).unwrap();
+        store.set_many(&parent_opt.updates).await.unwrap();
 
         // child key removed, parent trusted → ancestor match yields trusted.
-        let found = store.nearest(&cwd).unwrap().unwrap();
+        let found = store.nearest(&cwd).await.unwrap().unwrap();
         assert_eq!(found.decision, TrustDecision::Trusted);
     }
 
@@ -640,15 +640,15 @@ mod tests {
         assert_eq!(post.len(), 7);
     }
 
-    #[test]
-    fn invalid_trust_value_errors() {
+    #[tokio::test]
+    async fn invalid_trust_value_errors() {
         // Gap 18 / trust-manager.ts:117-121: non-bool/null values are a hard error, not skipped.
         let dir = tmp();
         let path = dir.join("trust.json");
         std::fs::write(&path, r#"{ "/some/path": "yes" }"#).unwrap();
         let store = TrustStore::new(path);
         let cwd = dir.join("some").join("path");
-        assert!(matches!(store.nearest(&cwd), Err(ConfigError::Trust(_))));
+        assert!(matches!(store.nearest(&cwd).await, Err(ConfigError::Trust(_))));
     }
 
     #[test]

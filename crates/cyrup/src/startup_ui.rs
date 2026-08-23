@@ -383,13 +383,13 @@ pub fn interpret_trust(outcome: &SelectorOutcome, options: &[TrustOption]) -> Tr
 /// "…(this session only)" answer leave exactly the permanent trace the row exists to avoid: an
 /// otherwise-untouched agent dir gained a `trust.json` (`{}`) plus a `trust.json.lock`, and a
 /// pre-seeded store was rewritten byte-for-byte-differently. SEAM-064.
-fn persist_trust_choice(trust_store: &TrustStore, option: &TrustOption) -> anyhow::Result<()> {
+async fn persist_trust_choice(trust_store: &TrustStore, option: &TrustOption) -> anyhow::Result<()> {
     if option.updates.is_empty() {
         return Ok(());
     }
     trust_store
         .set_many(&option.updates)
-        .map_err(|e| anyhow::anyhow!("writing project trust: {e}"))
+        .await.map_err(|e| anyhow::anyhow!("writing project trust: {e}"))
 }
 
 /// Run the project-trust prompt over a real terminal (Pi `createProjectTrustContext`'s
@@ -398,7 +398,7 @@ fn persist_trust_choice(trust_store: &TrustStore, option: &TrustOption) -> anyho
 /// ([`persist_trust_choice`], project-trust.ts:40-44), and return the resolved trust decision
 /// (`Some(true/false)` ⇒ feed as the run's `trust_override`; `None` ⇒ cancelled, proceed untrusted).
 /// TTY-only; the persistence branch it runs is unit-tested through [`persist_trust_choice`].
-pub fn run_trust_prompt(
+pub async fn run_trust_prompt(
     theme: &UiTheme,
     keymap: &SelectKeymap,
     cwd: &std::path::Path,
@@ -429,7 +429,7 @@ pub fn run_trust_prompt(
                 // Persist the decision through pi's `saveProjectTrustPromptResult` guard
                 // (project-trust.ts:40-44) — a session-only option has empty `updates` and must not
                 // reach `set_many` at all. See [`persist_trust_choice`].
-                persist_trust_choice(trust_store, option)?;
+                persist_trust_choice(trust_store, option).await?;
             }
             Ok(Some(trusted))
         }
@@ -761,8 +761,8 @@ mod tests {
     /// `trust.json.lock` — and a pre-seeded store must come back byte-identical. Asserting only
     /// `option.updates.is_empty()` is what let the missing guard ship: it passed happily while
     /// `run_trust_prompt` called `set_many` unconditionally.
-    #[test]
-    fn pre_launch_trust_prompt_offers_pi_five_rows_and_session_only_writes_nothing() {
+    #[tokio::test]
+    async fn pre_launch_trust_prompt_offers_pi_five_rows_and_session_only_writes_nothing() {
         let options = cyrup_config::trust::trust_options(Path::new("/work"), true);
         let labels: Vec<&str> = options.iter().map(|o| o.label.as_str()).collect();
         assert_eq!(
@@ -824,7 +824,7 @@ mod tests {
         //    trust.json, and no `trust.json.lock` from the lock the writer would have taken.
         assert!(dir_entries(&agent_dir).is_empty());
         for &index in &session_only {
-            persist_trust_choice(&store, &real[index]).unwrap();
+            persist_trust_choice(&store, &real[index]).await.unwrap();
             assert_eq!(
                 dir_entries(&agent_dir),
                 Vec::<String>::new(),
@@ -862,7 +862,7 @@ mod tests {
         assert!(
             store
                 .nearest(&cwd)
-                .unwrap()
+                .await.unwrap()
                 .is_some_and(|e| e.decision.is_trusted()),
             "the seed must be a store the reader actually accepts"
         );
@@ -880,7 +880,7 @@ mod tests {
             "a locked read adds the sidecar lock and nothing else"
         );
         for &index in &session_only {
-            persist_trust_choice(&store, &real[index]).unwrap();
+            persist_trust_choice(&store, &real[index]).await.unwrap();
             assert_eq!(
                 std::fs::read(&store_path).expect("trust.json still readable"),
                 before,
@@ -896,7 +896,7 @@ mod tests {
             .iter()
             .position(|o| o.label == "Do not trust")
             .expect("the `Do not trust` row");
-        persist_trust_choice(&store, &real[do_not_trust]).unwrap();
+        persist_trust_choice(&store, &real[do_not_trust]).await.unwrap();
         let after = std::fs::read(&store_path).expect("trust.json after a persisting row");
         assert_ne!(
             after, before,
@@ -905,7 +905,7 @@ mod tests {
         assert!(
             store
                 .nearest(&cwd)
-                .unwrap()
+                .await.unwrap()
                 .is_some_and(|e| !e.decision.is_trusted()),
             "the persisting row's verdict must be readable back from the store"
         );

@@ -17,14 +17,23 @@
 //! - A-12-4 confirm-destructive session lifecycle: lives in the agent hooks (arch-08).
 //! - A-12-10 trust-gated extension/package loading: lives in `cyrup-config`/ext.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
-use cyrup_core::{CancelToken, Content, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink};
 use crate::isolation::{ProtectedFs, ProtectedPaths, TraversalFs};
 use crate::ops::local::LocalFs;
-use crate::ops::{Access, Backend, DirEntry, FsOps, ImageMime, Meta, ShellConfig, WalkItem, WalkOpts};
+use crate::ops::{
+    Access, Backend, DirEntry, FsOps, ImageMime, Meta, ShellConfig, WalkItem, WalkOpts,
+};
 use crate::tools::{BashTool, ReadTool, WriteTool};
 use crate::{BashOpts, FileMutationLocks, ReadOpts, WriteOpts};
+use cyrup_core::{
+    CancelToken, Content, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
+};
 use cyrup_core::{EventStream, Tool};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -59,19 +68,36 @@ async fn default_bash_rm_rf_runs_without_any_gate() {
     std::fs::write(doomed.join("f.txt"), "bye").unwrap();
     assert!(doomed.exists());
 
-    let bash = BashTool::new(Backend::default().proc, ShellConfig::detect(), cwd, BashOpts::default());
+    let bash = BashTool::new(
+        Backend::default().proc,
+        ShellConfig::detect(),
+        cwd,
+        BashOpts::default(),
+    );
     let r = bash
-        .execute(cid(), serde_json::json!({ "command": "rm -rf doomed" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "rm -rf doomed" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     // Exit 0, no error, no prompt — the directory is gone.
-    assert!(!doomed.exists(), "rm -rf should have run: {}", first_text(&r));
+    assert!(
+        !doomed.exists(),
+        "rm -rf should have run: {}",
+        first_text(&r)
+    );
 }
 
 // ---------------------------------------------------------------- A-12-3 protected paths
 
 fn protected_fs() -> Arc<dyn FsOps> {
-    Arc::new(ProtectedFs::new(Arc::new(LocalFs), ProtectedPaths::defaults()))
+    Arc::new(ProtectedFs::new(
+        Arc::new(LocalFs),
+        ProtectedPaths::defaults(),
+    ))
 }
 
 #[tokio::test]
@@ -83,7 +109,12 @@ async fn protected_paths_block_writes_pass_reads() {
 
     // Write to .env -> blocked.
     let err = write
-        .execute(cid(), serde_json::json!({ "path": ".env", "content": "SECRET=1" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": ".env", "content": "SECRET=1" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("protected"), "got: {err}");
@@ -91,14 +122,24 @@ async fn protected_paths_block_writes_pass_reads() {
 
     // Write inside .git/ -> blocked.
     let err = write
-        .execute(cid(), serde_json::json!({ "path": ".git/config", "content": "x" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": ".git/config", "content": "x" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("protected"), "got: {err}");
 
     // Write to a normal file -> allowed.
     let ok = write
-        .execute(cid(), serde_json::json!({ "path": "src/main.rs", "content": "fn main(){}" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "src/main.rs", "content": "fn main(){}" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert!(first_text(&ok).contains("Successfully wrote"));
@@ -107,10 +148,19 @@ async fn protected_paths_block_writes_pass_reads() {
     std::fs::write(cwd.join(".env"), "API=abc").unwrap();
     let read = ReadTool::new(protected_fs(), cwd, ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": ".env" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": ".env" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
-    assert!(first_text(&r).contains("API=abc"), "read should pass through: {}", first_text(&r));
+    assert!(
+        first_text(&r).contains("API=abc"),
+        "read should pass through: {}",
+        first_text(&r)
+    );
 }
 
 /// ADR-0003 D8(4), the in-crate half — **the guard's scope is the fs seam only**.
@@ -131,8 +181,12 @@ async fn protected_fs_is_fs_only_and_bash_is_never_covered() {
     // (a) Undecorated (the shipped default after ADR-0003 D5): `write` to `.env` succeeds, exactly
     // like pi's `write.ts:195-225`.
     let plain: Arc<dyn FsOps> = Arc::new(LocalFs);
-    let write_plain =
-        WriteTool::new(plain, Arc::new(FileMutationLocks::new()), cwd.clone(), WriteOpts);
+    let write_plain = WriteTool::new(
+        plain,
+        Arc::new(FileMutationLocks::new()),
+        cwd.clone(),
+        WriteOpts,
+    );
     let ok = write_plain
         .execute(
             cid(),
@@ -142,12 +196,20 @@ async fn protected_fs_is_fs_only_and_bash_is_never_covered() {
         )
         .await
         .unwrap();
-    assert!(first_text(&ok).contains("Successfully wrote"), "got: {}", first_text(&ok));
+    assert!(
+        first_text(&ok).contains("Successfully wrote"),
+        "got: {}",
+        first_text(&ok)
+    );
     assert_eq!(std::fs::read_to_string(cwd.join(".env")).unwrap(), "A=1\n");
 
     // (b) Embedder opt-in: `write` is refused …
-    let write_guarded =
-        WriteTool::new(protected_fs(), Arc::new(FileMutationLocks::new()), cwd.clone(), WriteOpts);
+    let write_guarded = WriteTool::new(
+        protected_fs(),
+        Arc::new(FileMutationLocks::new()),
+        cwd.clone(),
+        WriteOpts,
+    );
     let err = write_guarded
         .execute(
             cid(),
@@ -160,8 +222,12 @@ async fn protected_fs_is_fs_only_and_bash_is_never_covered() {
     assert!(err.to_string().contains("protected"), "got: {err}");
 
     // … and `bash` reaches the very same file anyway, because the PROCESS seam is undecorated.
-    let bash =
-        BashTool::new(Backend::default().proc, ShellConfig::detect(), cwd.clone(), BashOpts::default());
+    let bash = BashTool::new(
+        Backend::default().proc,
+        ShellConfig::detect(),
+        cwd.clone(),
+        BashOpts::default(),
+    );
     bash.execute(
         cid(),
         serde_json::json!({ "command": "printf 'C=3\\n' >> .env" }),
@@ -193,7 +259,12 @@ async fn traversal_root_confines_and_rejects_escape() {
     // Read inside the root -> ok.
     let read = ReadTool::new(confined.clone(), root.clone(), ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "in.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "in.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert!(first_text(&r).contains("inside"));
@@ -202,16 +273,29 @@ async fn traversal_root_confines_and_rejects_escape() {
     // confinement denial it surfaces as not-found; either way the escape is blocked and the secret
     // is never returned).
     let err = read
-        .execute(cid(), serde_json::json!({ "path": "../secret.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "../secret.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
-    assert!(!err.to_string().contains("top secret"), "secret must not leak: {err}");
+    assert!(
+        !err.to_string().contains("top secret"),
+        "secret must not leak: {err}"
+    );
 
     // Write escaping the root -> rejected, no file created.
     let locks = Arc::new(FileMutationLocks::new());
     let write = WriteTool::new(confined, locks, root.clone(), WriteOpts);
     let err = write
-        .execute(cid(), serde_json::json!({ "path": "../escape.txt", "content": "x" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "../escape.txt", "content": "x" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("escapes"), "got: {err}");
@@ -276,24 +360,47 @@ async fn backend_swap_retargets_tools_without_contract_change() {
     let locks = Arc::new(FileMutationLocks::new());
     let write = WriteTool::new(recording.clone(), locks, cwd.clone(), WriteOpts);
     let w = write
-        .execute(cid(), serde_json::json!({ "path": "out.txt", "content": "routed" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "out.txt", "content": "routed" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     // Identical tool contract/output regardless of backend.
     assert!(first_text(&w).contains("Successfully wrote 6 bytes to out.txt"));
-    assert_eq!(writes.load(Ordering::SeqCst), 1, "write routed through the swapped backend");
-    assert_eq!(last_write.lock().unwrap().as_ref().unwrap(), &cwd.join("out.txt"));
+    assert_eq!(
+        writes.load(Ordering::SeqCst),
+        1,
+        "write routed through the swapped backend"
+    );
+    assert_eq!(
+        last_write.lock().unwrap().as_ref().unwrap(),
+        &cwd.join("out.txt")
+    );
 
     // Read through the swapped backend sees the write-through content.
     let read = ReadTool::new(recording, cwd.clone(), ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "out.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "out.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert!(first_text(&r).contains("routed"));
-    assert!(reads.load(Ordering::SeqCst) >= 1, "read routed through the swapped backend");
+    assert!(
+        reads.load(Ordering::SeqCst) >= 1,
+        "read routed through the swapped backend"
+    );
     // The write actually landed on the host workspace (R-12-014 write-through analog).
-    assert_eq!(std::fs::read_to_string(cwd.join("out.txt")).unwrap(), "routed");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("out.txt")).unwrap(),
+        "routed"
+    );
 }
 
 // -------------------------------------------------------- decorator delegation completeness
@@ -313,10 +420,7 @@ impl FsOps for DistinctStreamFs {
     async fn read(&self, _path: &Path) -> Result<Vec<u8>, ToolError> {
         Ok(b"WHOLE-READ".to_vec())
     }
-    async fn read_stream(
-        &self,
-        _path: &Path,
-    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+    async fn read_stream(&self, _path: &Path) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
         Ok(Box::new(std::io::Cursor::new(b"REAL-STREAM".to_vec())))
     }
     async fn write_in_place(&self, _path: &Path, _bytes: &[u8]) -> Result<(), ToolError> {
@@ -353,7 +457,9 @@ async fn stream_text(fs: &dyn FsOps, path: &Path) -> String {
     use std::io::Read as _;
     let mut reader = fs.read_stream(path).await.expect("read_stream succeeds");
     let mut out = String::new();
-    reader.read_to_string(&mut out).expect("probe stream is utf-8");
+    reader
+        .read_to_string(&mut out)
+        .expect("probe stream is utf-8");
     out
 }
 
@@ -386,7 +492,8 @@ async fn fs_decorators_forward_read_stream_instead_of_inheriting_the_whole_file_
          real-File streaming and re-opens TOOL-034 whenever confineToCwd is on"
     );
 
-    let protected: Arc<dyn FsOps> = Arc::new(ProtectedFs::new(base.clone(), ProtectedPaths::defaults()));
+    let protected: Arc<dyn FsOps> =
+        Arc::new(ProtectedFs::new(base.clone(), ProtectedPaths::defaults()));
     assert_eq!(
         stream_text(&*protected, &probe).await,
         "REAL-STREAM",
@@ -395,15 +502,23 @@ async fn fs_decorators_forward_read_stream_instead_of_inheriting_the_whole_file_
 
     // Stacked exactly as `cyrup-session-svc/src/builder.rs:753-758` stacks them when both settings
     // are on — the configuration where the loss actually shipped.
-    let stacked: Arc<dyn FsOps> =
-        Arc::new(ProtectedFs::new(Arc::new(TraversalFs::new(base, root.clone())), ProtectedPaths::defaults()));
+    let stacked: Arc<dyn FsOps> = Arc::new(ProtectedFs::new(
+        Arc::new(TraversalFs::new(base, root.clone())),
+        ProtectedPaths::defaults(),
+    ));
     assert_eq!(stream_text(&*stacked, &probe).await, "REAL-STREAM");
 
     // TraversalFs must still CONFINE on this method, not merely pass it through: a path outside the
     // root is rejected before the inner seam is opened.
-    let confined = TraversalFs::new(Arc::new(DistinctStreamFs), root.join("cyrup-decorator-root"));
+    let confined = TraversalFs::new(
+        Arc::new(DistinctStreamFs),
+        root.join("cyrup-decorator-root"),
+    );
     assert!(
-        confined.read_stream(Path::new("/etc/passwd")).await.is_err(),
+        confined
+            .read_stream(Path::new("/etc/passwd"))
+            .await
+            .is_err(),
         "read_stream must apply the traversal guard, not just delegate"
     );
 }

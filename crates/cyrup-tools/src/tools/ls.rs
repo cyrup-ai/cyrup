@@ -3,7 +3,7 @@
 use crate::config::LsOpts;
 use crate::details::LsDetails;
 use crate::ops::FsOps;
-use crate::truncate::{format_size, truncate_head, TruncOpts};
+use crate::truncate::{TruncOpts, format_size, truncate_head};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use std::path::PathBuf;
@@ -38,7 +38,12 @@ impl LsTool {
                 "limit": { "type": "number", "description": "Maximum number of entries to return (default: 500)" }
             }
         });
-        Self { fs, cwd, opts, params }
+        Self {
+            fs,
+            cwd,
+            opts,
+            params,
+        }
     }
 }
 
@@ -86,7 +91,10 @@ impl Tool for LsTool {
             // Pi: `Path not found: ${dirPath}` (ls.ts:129).
             .map_err(|_| error::not_found(format!("Path not found: {}", error::show(&abs))))?;
         if !meta.is_dir {
-            return Err(error::invalid(format!("Not a directory: {}", error::show(&abs))));
+            return Err(error::invalid(format!(
+                "Not a directory: {}",
+                error::show(&abs)
+            )));
         }
 
         // Pi ls.ts:147-152:
@@ -117,8 +125,7 @@ impl Tool for LsTool {
         // collator: `Collator::new(Tailoring::default() /* CLDR Root */, false /* shifting */,
         // true /* byte-value tiebreak */)`. We lower-case both keys first to mirror Pi's
         // `.toLowerCase()` pre-step exactly.
-        let mut collator =
-            feruca::Collator::new(feruca::Tailoring::default(), false, true);
+        let mut collator = feruca::Collator::new(feruca::Tailoring::default(), false, true);
         entries.sort_by(|a, b| collator.collate(&a.name.to_lowercase(), &b.name.to_lowercase()));
 
         // Pi: `const effectiveLimit = limit ?? DEFAULT_LIMIT` (ls.ts:125) — no clamp at all. A
@@ -172,7 +179,10 @@ impl Tool for LsTool {
         }
         if t.info.truncated {
             // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` (ls.ts:192).
-            notices.push(format!("{} limit reached", format_size(crate::truncate::DEFAULT_MAX_BYTES)));
+            notices.push(format!(
+                "{} limit reached",
+                format_size(crate::truncate::DEFAULT_MAX_BYTES)
+            ));
         }
         if !notices.is_empty() {
             text.push_str(&format!("\n\n[{}]", notices.join(". ")));
@@ -183,7 +193,11 @@ impl Tool for LsTool {
         let entry_limit_reached = if limit_reached { Some(limit) } else { None };
         let truncation = if t.info.truncated { Some(t.info) } else { None };
         let details = if truncation.is_some() || entry_limit_reached.is_some() {
-            serde_json::to_value(LsDetails { truncation, entry_limit_reached }).ok()
+            serde_json::to_value(LsDetails {
+                truncation,
+                entry_limit_reached,
+            })
+            .ok()
         } else {
             None
         };

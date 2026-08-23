@@ -4,8 +4,8 @@
 use crate::config::FindOpts;
 use crate::details::FindDetails;
 use crate::ops::{FsOps, WalkOpts};
-use crate::tools::globmatch::{to_posix, PatternMatcher};
-use crate::truncate::{format_size, truncate_head, TruncOpts};
+use crate::tools::globmatch::{PatternMatcher, to_posix};
+use crate::truncate::{TruncOpts, format_size, truncate_head};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
@@ -44,7 +44,12 @@ impl FindTool {
                 "limit": { "type": "number", "description": "Maximum number of results (default: 1000)" }
             }
         });
-        Self { fs, cwd, opts, params }
+        Self {
+            fs,
+            cwd,
+            opts,
+            params,
+        }
     }
 
     /// Pi's git-repo probe (find.ts:230-239): walk from `search_path` up through its parents and
@@ -119,7 +124,9 @@ impl Tool for FindTool {
             .metadata(&search_root)
             .await
             // Pi: `Path not found: ${searchPath}` (find.ts:158).
-            .map_err(|_| error::not_found(format!("Path not found: {}", error::show(&search_root))))?;
+            .map_err(|_| {
+                error::not_found(format!("Path not found: {}", error::show(&search_root)))
+            })?;
 
         let matcher = PatternMatcher::build(&input.pattern)?;
         // Pi: `const effectiveLimit = limit ?? DEFAULT_LIMIT` (find.ts:151), handed straight to
@@ -138,9 +145,13 @@ impl Tool for FindTool {
         let mut results: Vec<String> = Vec::new();
         // Pi runs `fd --hidden` (find.ts:224): match dotfiles/dot-dirs while still honoring
         // `.gitignore` (arch-03:430). So include hidden files in the walk.
-        let mut walk = self
-            .fs
-            .walk(&search_root, WalkOpts { include_hidden: true, require_git: inside_git_repo });
+        let mut walk = self.fs.walk(
+            &search_root,
+            WalkOpts {
+                include_hidden: true,
+                require_git: inside_git_repo,
+            },
+        );
         loop {
             // `--max-results` (find.ts:252) makes **fd itself** stop traversing once it has emitted
             // N paths; pi never sees the rest of the tree. Draining the whole walk and then
@@ -235,7 +246,10 @@ impl Tool for FindTool {
         }
         if t.info.truncated {
             // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` (find.ts:335).
-            notices.push(format!("{} limit reached", format_size(crate::truncate::DEFAULT_MAX_BYTES)));
+            notices.push(format!(
+                "{} limit reached",
+                format_size(crate::truncate::DEFAULT_MAX_BYTES)
+            ));
         }
         if !notices.is_empty() {
             text.push_str(&format!("\n\n[{}]", notices.join(". ")));
@@ -246,7 +260,11 @@ impl Tool for FindTool {
         let result_limit_reached = if limit_reached { Some(limit) } else { None };
         let truncation = if t.info.truncated { Some(t.info) } else { None };
         let details = if truncation.is_some() || result_limit_reached.is_some() {
-            serde_json::to_value(FindDetails { truncation, result_limit_reached }).ok()
+            serde_json::to_value(FindDetails {
+                truncation,
+                result_limit_reached,
+            })
+            .ok()
         } else {
             None
         };

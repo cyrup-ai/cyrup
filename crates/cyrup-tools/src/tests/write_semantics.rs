@@ -16,17 +16,17 @@
 //!     would have succeeded (`rename(2)` checks the PARENT directory, not the file).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use cyrup_core::{CancelToken, Tool, ToolCallId, ToolUpdate, ToolUpdateSink};
-use crate::ops::local::LocalFs;
 use crate::ops::FsOps;
+use crate::ops::local::LocalFs;
+use cyrup_core::{CancelToken, Tool, ToolCallId, ToolUpdate, ToolUpdateSink};
 // `EditTool` is only reachable from the `#[cfg(unix)]` tests below — every `edit` assertion here
 // needs a unix-only primitive (mode bits, symlinks, hard links, `chmod 0444`), so these gates are
 // load-bearing rather than incidental. The two portable tests (`write_still_creates_new_files_…`,
 // `write_truncates_at_open_…`) are deliberately ungated and DO run on the Windows arm.
+use crate::FileMutationLocks;
 #[cfg(unix)]
 use crate::tools::EditTool;
 use crate::tools::WriteTool;
-use crate::FileMutationLocks;
 use std::sync::Arc;
 
 fn fs() -> Arc<dyn FsOps> {
@@ -129,7 +129,11 @@ async fn edit_preserves_the_existing_file_mode() {
     .unwrap();
 
     assert_eq!(std::fs::read_to_string(&script).unwrap(), "echo new\n");
-    assert_eq!(mode_of(&script), 0o700, "edit must not strip the executable bits");
+    assert_eq!(
+        mode_of(&script),
+        0o700,
+        "edit must not strip the executable bits"
+    );
 }
 
 /// Writing to a symlink FOLLOWS it: the link stays a link and the target's bytes change.
@@ -155,7 +159,10 @@ async fn write_follows_a_symlink_instead_of_replacing_it() {
         .unwrap();
 
     assert!(
-        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "write replaced the symlink with a regular file"
     );
     assert_eq!(
@@ -190,7 +197,10 @@ async fn edit_follows_a_symlink_instead_of_replacing_it() {
     .unwrap();
 
     assert!(
-        std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink(),
+        std::fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
         "edit replaced the symlink with a regular file"
     );
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "beta\n");
@@ -208,7 +218,11 @@ async fn edit_keeps_hard_link_identity() {
     std::fs::write(&a, "alpha\n").unwrap();
     std::fs::hard_link(&a, &b).unwrap();
     let ino_before = inode_of(&a);
-    assert_eq!(ino_before, inode_of(&b), "fixture: the two names must share an inode");
+    assert_eq!(
+        ino_before,
+        inode_of(&b),
+        "fixture: the two names must share an inode"
+    );
 
     let edit = EditTool::new(fs(), locks(), cwd.clone(), Default::default());
     edit.execute(
@@ -223,7 +237,11 @@ async fn edit_keeps_hard_link_identity() {
     .await
     .unwrap();
 
-    assert_eq!(inode_of(&a), ino_before, "edit replaced the inode instead of writing through it");
+    assert_eq!(
+        inode_of(&a),
+        ino_before,
+        "edit replaced the inode instead of writing through it"
+    );
     assert_eq!(inode_of(&a), inode_of(&b), "edit broke the hard-link set");
     assert_eq!(
         std::fs::read_to_string(&b).unwrap(),
@@ -255,7 +273,11 @@ async fn write_keeps_hard_link_identity() {
         .await
         .unwrap();
 
-    assert_eq!(inode_of(&a), ino_before, "write replaced the inode instead of writing through it");
+    assert_eq!(
+        inode_of(&a),
+        ino_before,
+        "write replaced the inode instead of writing through it"
+    );
     assert_eq!(std::fs::read_to_string(&b).unwrap(), "omega\n");
 }
 
@@ -311,7 +333,10 @@ async fn write_still_creates_new_files_and_parent_dirs() {
         .await
         .unwrap();
 
-    assert_eq!(std::fs::read_to_string(cwd.join("nested/deep/new.txt")).unwrap(), "hello");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("nested/deep/new.txt")).unwrap(),
+        "hello"
+    );
 }
 
 /// Overwriting a LONGER file with shorter content must not leave a tail behind: pi's `O_TRUNC`

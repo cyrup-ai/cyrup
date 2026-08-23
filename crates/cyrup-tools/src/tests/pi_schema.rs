@@ -23,14 +23,19 @@
 //! parsed `serde_json::Value`s is the
 //! correct JSON byte-diff: two JSON documents are equal iff identical content, independent of the
 //! provider's key-ordering at serialize time.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use cyrup_core::Tool;
+use crate::FileMutationLocks;
 use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts, WriteOpts};
 use crate::ops::local::LocalFs;
 use crate::ops::{Backend, FsOps, ProcOps, ShellConfig};
 use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
-use crate::FileMutationLocks;
+use cyrup_core::Tool;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -159,8 +164,16 @@ fn assert_meta(
     // indistinguishable while every label happens to equal its name, and this assertion is what
     // makes the seven declarations data. RED for all seven before the fix (`label()` was the
     // trait default `None`, `cyrup-core/src/tool.rs:102-104`).
-    assert_eq!(tool.label(), Some(name), "{name} label() diverges from Pi's ToolDefinition.label");
-    assert_eq!(tool.description(), description, "{name} description() diverges from Pi");
+    assert_eq!(
+        tool.label(),
+        Some(name),
+        "{name} label() diverges from Pi's ToolDefinition.label"
+    );
+    assert_eq!(
+        tool.description(),
+        description,
+        "{name} description() diverges from Pi"
+    );
     assert_eq!(
         tool.prompt_snippet(),
         Some(snippet),
@@ -200,7 +213,12 @@ fn all_seven_tool_metadata_match_pi_verbatim() {
         PI_EDIT_GUIDELINES,
     );
     assert_meta(
-        Arc::new(BashTool::new(proc(), ShellConfig::detect(), cwd(), BashOpts::default())),
+        Arc::new(BashTool::new(
+            proc(),
+            ShellConfig::detect(),
+            cwd(),
+            BashOpts::default(),
+        )),
         "bash",
         PI_BASH_DESCRIPTION,
         PI_BASH_SNIPPET,
@@ -241,9 +259,18 @@ fn all_seven_tool_metadata_match_pi_verbatim() {
 #[test]
 fn only_bash_got_the_v0_84_softening() {
     for (name, tool) in [
-        ("read", Arc::new(ReadTool::new(fs(), cwd(), ReadOpts::default())) as Arc<dyn Tool>),
-        ("write", Arc::new(WriteTool::new(fs(), locks(), cwd(), WriteOpts))),
-        ("edit", Arc::new(EditTool::new(fs(), locks(), cwd(), Default::default()))),
+        (
+            "read",
+            Arc::new(ReadTool::new(fs(), cwd(), ReadOpts::default())) as Arc<dyn Tool>,
+        ),
+        (
+            "write",
+            Arc::new(WriteTool::new(fs(), locks(), cwd(), WriteOpts)),
+        ),
+        (
+            "edit",
+            Arc::new(EditTool::new(fs(), locks(), cwd(), Default::default())),
+        ),
     ] {
         for g in tool.prompt_guidelines() {
             assert!(
@@ -268,9 +295,17 @@ fn registry_erased_tools_all_carry_a_description_and_snippet() {
         crate::ToolsOptions::default(),
     );
     let tools = registry.visible(&crate::Availability::All);
-    assert_eq!(tools.len(), crate::BUILTIN_NAMES.len(), "all built-ins visible");
+    assert_eq!(
+        tools.len(),
+        crate::BUILTIN_NAMES.len(),
+        "all built-ins visible"
+    );
     for t in &tools {
-        assert!(!t.description().is_empty(), "{}: empty description() reaches the model", t.name());
+        assert!(
+            !t.description().is_empty(),
+            "{}: empty description() reaches the model",
+            t.name()
+        );
         assert!(
             t.prompt_snippet().is_some_and(|s| !s.is_empty()),
             "{}: no prompt_snippet() — omitted from the system prompt's Available tools",
@@ -306,7 +341,9 @@ fn schema_scalar_types_are_number_no_minimum_no_extra_additional_properties() {
     // pi `prepareEditArguments` edit.ts:94-118) emittable by a schema-constrained model.
     let edit = EditTool::new(fs(), locks(), cwd(), Default::default());
     assert!(edit.parameters().get("additionalProperties").is_none());
-    assert!(edit.parameters()["properties"]["edits"]["items"]
-        .get("additionalProperties")
-        .is_none());
+    assert!(
+        edit.parameters()["properties"]["edits"]["items"]
+            .get("additionalProperties")
+            .is_none()
+    );
 }

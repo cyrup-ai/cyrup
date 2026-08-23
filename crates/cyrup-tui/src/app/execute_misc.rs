@@ -261,7 +261,7 @@ impl<B: Backend> App<B> {
                 if id == "transport" {
                     session.set_transport(&value).await;
                 }
-                match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json) {
+                match session.persist_setting(cyrup_session_svc::SettingsScope::Global, &id, json).await {
                     Ok(()) => self.state.transcript.push_status(format!("{id} → {value}")),
                     Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
                 }

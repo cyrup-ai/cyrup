@@ -41,7 +41,13 @@ impl WriteTool {
                 "content": { "type": "string", "description": "Content to write to the file" }
             }
         });
-        Self { fs, locks, cwd, opts, params }
+        Self {
+            fs,
+            locks,
+            cwd,
+            opts,
+            params,
+        }
     }
 }
 

@@ -15,11 +15,7 @@ use unicode_normalization::UnicodeNormalization;
 fn normalize_unicode_spaces(s: &str) -> String {
     s.chars()
         .map(|c| match c {
-            '\u{00A0}'
-            | '\u{2000}'..='\u{200A}'
-            | '\u{202F}'
-            | '\u{205F}'
-            | '\u{3000}' => ' ',
+            '\u{00A0}' | '\u{2000}'..='\u{200A}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
             other => other,
         })
         .collect()
@@ -61,11 +57,7 @@ fn try_am_pm(path: &str) -> Option<String> {
             break;
         }
     }
-    if changed {
-        Some(out)
-    } else {
-        None
-    }
+    if changed { Some(out) } else { None }
 }
 
 /// Expand a leading `~` to the user's home directory. Mirrors Pi `normalizePath`'s tilde branch
@@ -162,9 +154,13 @@ fn normalize_windows_shell_path(file_path: &str) -> String {
     let after_root = file_path.get(1..).unwrap_or("");
     let lowered = after_root.to_ascii_lowercase();
     let body = if let Some(rest) = lowered.strip_prefix("mnt/") {
-        after_root.get(after_root.len() - rest.len()..).unwrap_or("")
+        after_root
+            .get(after_root.len() - rest.len()..)
+            .unwrap_or("")
     } else if let Some(rest) = lowered.strip_prefix("cygdrive/") {
-        after_root.get(after_root.len() - rest.len()..).unwrap_or("")
+        after_root
+            .get(after_root.len() - rest.len()..)
+            .unwrap_or("")
     } else {
         after_root
     };
@@ -315,13 +311,19 @@ mod tests {
     #[test]
     fn relative_joins_cwd() {
         let cwd = Path::new("/work");
-        assert_eq!(resolve_to_cwd("a/b.txt", cwd), PathBuf::from("/work/a/b.txt"));
+        assert_eq!(
+            resolve_to_cwd("a/b.txt", cwd),
+            PathBuf::from("/work/a/b.txt")
+        );
     }
 
     #[test]
     fn absolute_passthrough() {
         let cwd = Path::new("/work");
-        assert_eq!(resolve_to_cwd("/etc/hosts", cwd), PathBuf::from("/etc/hosts"));
+        assert_eq!(
+            resolve_to_cwd("/etc/hosts", cwd),
+            PathBuf::from("/etc/hosts")
+        );
     }
 
     #[test]
@@ -329,7 +331,10 @@ mod tests {
         // Pi `stripAtPrefix` only fires when the (space-normalized) string STARTS with `@`
         // (paths.ts:62). Captured Pi: resolveToCwd("@rel.txt","/work") => "/work/rel.txt".
         let cwd = Path::new("/work");
-        assert_eq!(resolve_to_cwd("@rel.txt", cwd), PathBuf::from("/work/rel.txt"));
+        assert_eq!(
+            resolve_to_cwd("@rel.txt", cwd),
+            PathBuf::from("/work/rel.txt")
+        );
     }
 
     #[test]
@@ -349,7 +354,10 @@ mod tests {
         // UM-3: Pi uses Node `path.resolve`, which lexically collapses `.`/`..` and drops trailing
         // separators. Captured Pi ground truth (node path.resolve):
         let cwd = Path::new("/work");
-        assert_eq!(resolve_to_cwd("a/../b.txt", cwd), PathBuf::from("/work/b.txt"));
+        assert_eq!(
+            resolve_to_cwd("a/../b.txt", cwd),
+            PathBuf::from("/work/b.txt")
+        );
         assert_eq!(resolve_to_cwd("./x/./y", cwd), PathBuf::from("/work/x/y"));
         assert_eq!(resolve_to_cwd("a/b/../../c", cwd), PathBuf::from("/work/c"));
         assert_eq!(resolve_to_cwd("sub/", cwd), PathBuf::from("/work/sub"));
@@ -400,7 +408,8 @@ mod tests {
         let v = resolve_read_path("caf\u{00E9}.txt", cwd);
         assert_eq!(v[0], PathBuf::from("/work/caf\u{00E9}.txt"));
         assert!(
-            v.iter().any(|p| p.to_string_lossy().contains("cafe\u{0301}.txt")),
+            v.iter()
+                .any(|p| p.to_string_lossy().contains("cafe\u{0301}.txt")),
             "variants: {v:?}"
         );
     }
@@ -429,7 +438,11 @@ mod tests {
     fn read_path_has_no_reverse_curly_variant() {
         let cwd = Path::new("/work");
         let v = resolve_read_path("it\u{2019}s.txt", cwd);
-        assert_eq!(v, vec![PathBuf::from("/work/it\u{2019}s.txt")], "variants: {v:?}");
+        assert_eq!(
+            v,
+            vec![PathBuf::from("/work/it\u{2019}s.txt")],
+            "variants: {v:?}"
+        );
         assert!(
             !v.iter().any(|p| p.to_string_lossy().contains("it's.txt")),
             "Pi emits no reverse U+2019→' candidate: {v:?}"
@@ -455,11 +468,20 @@ mod tests {
     #[test]
     fn normalize_windows_shell_path_ports_the_drive_forms() {
         // Git Bash / MSYS.
-        assert_eq!(normalize_windows_shell_path("/c/Users/x/f.txt"), r"C:\Users\x\f.txt");
+        assert_eq!(
+            normalize_windows_shell_path("/c/Users/x/f.txt"),
+            r"C:\Users\x\f.txt"
+        );
         // Cygwin.
-        assert_eq!(normalize_windows_shell_path("/cygdrive/c/Users/x/f.txt"), r"C:\Users\x\f.txt");
+        assert_eq!(
+            normalize_windows_shell_path("/cygdrive/c/Users/x/f.txt"),
+            r"C:\Users\x\f.txt"
+        );
         // WSL.
-        assert_eq!(normalize_windows_shell_path("/mnt/c/Users/x/f.txt"), r"C:\Users\x\f.txt");
+        assert_eq!(
+            normalize_windows_shell_path("/mnt/c/Users/x/f.txt"),
+            r"C:\Users\x\f.txt"
+        );
         // The drive letter is upper-cased; the `i` flag also covers the literal prefixes.
         assert_eq!(normalize_windows_shell_path("/D/tmp"), r"D:\tmp");
         assert_eq!(normalize_windows_shell_path("/CYGDRIVE/e/tmp"), r"E:\tmp");
@@ -469,10 +491,16 @@ mod tests {
 
         // The `:68` guard: not `/`-rooted, UNC-ish `//`, or already containing a backslash.
         assert_eq!(normalize_windows_shell_path("relative/x"), "relative/x");
-        assert_eq!(normalize_windows_shell_path("//server/share"), "//server/share");
+        assert_eq!(
+            normalize_windows_shell_path("//server/share"),
+            "//server/share"
+        );
         assert_eq!(normalize_windows_shell_path(r"/c/Users\x"), r"/c/Users\x");
         // No regex match: multi-char first segment, or a non-letter.
-        assert_eq!(normalize_windows_shell_path("/usr/local/bin"), "/usr/local/bin");
+        assert_eq!(
+            normalize_windows_shell_path("/usr/local/bin"),
+            "/usr/local/bin"
+        );
         assert_eq!(normalize_windows_shell_path("/1/x"), "/1/x");
         assert_eq!(normalize_windows_shell_path("/"), "/");
     }
@@ -482,8 +510,14 @@ mod tests {
     #[test]
     fn unix_resolve_is_unaffected_by_the_win32_leg() {
         let cwd = Path::new("/work");
-        assert_eq!(resolve_to_cwd("/c/Users/x/f.txt", cwd), PathBuf::from("/c/Users/x/f.txt"));
-        assert_eq!(resolve_to_cwd("/mnt/c/f.txt", cwd), PathBuf::from("/mnt/c/f.txt"));
+        assert_eq!(
+            resolve_to_cwd("/c/Users/x/f.txt", cwd),
+            PathBuf::from("/c/Users/x/f.txt")
+        );
+        assert_eq!(
+            resolve_to_cwd("/mnt/c/f.txt", cwd),
+            PathBuf::from("/mnt/c/f.txt")
+        );
     }
 
     /// CFG-072 — the `HOMEDRIVE`/`HOMEPATH` fallback and its precedence, pinned as a pure function
@@ -510,7 +544,10 @@ mod tests {
             Some(PathBuf::from(r"C:\Users\up")),
         );
         // ... including when only it is set.
-        assert_eq!(windows_home_from(os(r"C:\Users\up"), None, None), Some(PathBuf::from(r"C:\Users\up")));
+        assert_eq!(
+            windows_home_from(os(r"C:\Users\up"), None, None),
+            Some(PathBuf::from(r"C:\Users\up"))
+        );
 
         // THE DIVERGENCE: no `USERPROFILE`, but the pair is set. pi resolves nothing here; cyrup
         // joins the pair verbatim, with no separator inserted (`HOMEPATH` carries its own leading
@@ -535,11 +572,21 @@ mod tests {
     #[test]
     fn cfg072_the_widening_carries_a_delta_naming_what_it_extends() {
         let src = include_str!("path.rs");
-        let at = src.find("fn windows_home_from").expect("the extracted Windows arm");
+        let at = src
+            .find("fn windows_home_from")
+            .expect("the extracted Windows arm");
         let doc = &src[..at];
-        let doc = &doc[doc.rfind("[CYRUP-DELTA").expect("a delta annotation on the widening")..];
+        let doc = &doc[doc
+            .rfind("[CYRUP-DELTA")
+            .expect("a delta annotation on the widening")..];
 
-        for needle in ["HOMEDRIVE", "HOMEPATH", "USERPROFILE", "homedir()", "v0.83.0"] {
+        for needle in [
+            "HOMEDRIVE",
+            "HOMEPATH",
+            "USERPROFILE",
+            "homedir()",
+            "v0.83.0",
+        ] {
             assert!(
                 doc.contains(needle),
                 "the delta must name `{needle}` — what cyrup reads, and what pi reads instead; got: {doc}"

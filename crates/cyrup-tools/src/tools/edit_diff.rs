@@ -103,7 +103,11 @@ pub fn generate_diff_string(old: &str, new: &str) -> (String, Option<usize>) {
             Some(last) if last.added == added && last.removed == removed => {
                 last.value.push_str(change.value());
             }
-            _ => parts.push(Part { added, removed, value: change.value().to_string() }),
+            _ => parts.push(Part {
+                added,
+                removed,
+                value: change.value().to_string(),
+            }),
         }
     }
 
@@ -303,10 +307,18 @@ fn fuzzy_find_text(content: &str, old_text: &str) -> FuzzyMatch {
     // not-found arm, where pi falls through to `countOccurrences` and raises the DUPLICATE error
     // instead — different remediation advice for the same input.
     match fuzzy_content.find(&fuzzy_old) {
-        Some(idx) => {
-            FuzzyMatch { found: true, index: idx, match_length: fuzzy_old.len(), used_fuzzy: true }
-        }
-        None => FuzzyMatch { found: false, index: 0, match_length: 0, used_fuzzy: false },
+        Some(idx) => FuzzyMatch {
+            found: true,
+            index: idx,
+            match_length: fuzzy_old.len(),
+            used_fuzzy: true,
+        },
+        None => FuzzyMatch {
+            found: false,
+            index: 0,
+            match_length: 0,
+            used_fuzzy: false,
+        },
     }
 }
 
@@ -387,7 +399,9 @@ fn get_replacement_line_range(
         end_line += 1;
     }
     if end_line >= lines.len() {
-        return Err(EditError("Replacement range is outside the base content.".to_string()));
+        return Err(EditError(
+            "Replacement range is outside the base content.".to_string(),
+        ));
     }
     Ok((start_line, end_line + 1))
 }
@@ -398,7 +412,10 @@ fn apply_replacements(content: &str, reps: &[Replacement], offset: usize) -> Str
     for rep in reps.iter().rev() {
         let mi = rep.match_index.saturating_sub(offset);
         let before = result.get(..mi).unwrap_or("").to_string();
-        let after = result.get(mi + rep.match_length..).unwrap_or("").to_string();
+        let after = result
+            .get(mi + rep.match_length..)
+            .unwrap_or("")
+            .to_string();
         result = format!("{before}{}{after}", rep.new_text);
     }
     result
@@ -428,25 +445,37 @@ fn apply_replacements_preserving_unchanged_lines(
     sorted.sort_by_key(|r| r.match_index);
     let mut groups: Vec<Group> = Vec::new();
     for rep in sorted {
-        let (rs, re) =
-            get_replacement_line_range(&base_lines, rep.match_index, rep.match_index + rep.match_length)?;
+        let (rs, re) = get_replacement_line_range(
+            &base_lines,
+            rep.match_index,
+            rep.match_index + rep.match_length,
+        )?;
         match groups.last_mut() {
             Some(cur) if rs < cur.end_line => {
                 cur.end_line = cur.end_line.max(re);
                 cur.reps.push(rep);
             }
-            _ => groups.push(Group { start_line: rs, end_line: re, reps: vec![rep] }),
+            _ => groups.push(Group {
+                start_line: rs,
+                end_line: re,
+                reps: vec![rep],
+            }),
         }
     }
 
     let mut original_line_index = 0usize;
     let mut result = String::new();
     for group in &groups {
-        for line in original_lines.get(original_line_index..group.start_line).unwrap_or(&[]) {
+        for line in original_lines
+            .get(original_line_index..group.start_line)
+            .unwrap_or(&[])
+        {
             result.push_str(line);
         }
         let group_start = base_lines.get(group.start_line).map_or(0, |(s, _)| *s);
-        let group_end = base_lines.get(group.end_line.saturating_sub(1)).map_or(0, |(_, e)| *e);
+        let group_end = base_lines
+            .get(group.end_line.saturating_sub(1))
+            .map_or(0, |(_, e)| *e);
         let slice = base.get(group_start..group_end).unwrap_or("");
         result.push_str(&apply_replacements(slice, &group.reps, group_start));
         original_line_index = group.end_line;
@@ -467,23 +496,33 @@ fn err_empty(path: &str, i: usize, total: usize) -> EditError {
 
 fn err_not_found(path: &str, i: usize, total: usize) -> EditError {
     EditError(if total == 1 {
-        format!("Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines.")
+        format!(
+            "Could not find the exact text in {path}. The old text must match exactly including all whitespace and newlines."
+        )
     } else {
-        format!("Could not find edits[{i}] in {path}. The oldText must match exactly including all whitespace and newlines.")
+        format!(
+            "Could not find edits[{i}] in {path}. The oldText must match exactly including all whitespace and newlines."
+        )
     })
 }
 
 fn err_duplicate(path: &str, i: usize, total: usize, occ: usize) -> EditError {
     EditError(if total == 1 {
-        format!("Found {occ} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique.")
+        format!(
+            "Found {occ} occurrences of the text in {path}. The text must be unique. Please provide more context to make it unique."
+        )
     } else {
-        format!("Found {occ} occurrences of edits[{i}] in {path}. Each oldText must be unique. Please provide more context to make it unique.")
+        format!(
+            "Found {occ} occurrences of edits[{i}] in {path}. Each oldText must be unique. Please provide more context to make it unique."
+        )
     })
 }
 
 fn err_no_change(path: &str, total: usize) -> EditError {
     EditError(if total == 1 {
-        format!("No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected.")
+        format!(
+            "No changes made to {path}. The replacement produced identical content. This might indicate an issue with special characters or the text not existing as expected."
+        )
     } else {
         format!("No changes made to {path}. The replacements produced identical content.")
     })
@@ -551,7 +590,11 @@ pub fn apply_edits_to_normalized_content(
 
     let base_content = normalized_content.to_string();
     let new_content = if used_fuzzy {
-        apply_replacements_preserving_unchanged_lines(normalized_content, &replacement_base, &matched)?
+        apply_replacements_preserving_unchanged_lines(
+            normalized_content,
+            &replacement_base,
+            &matched,
+        )?
     } else {
         apply_replacements(&replacement_base, &matched, 0)
     };
@@ -560,7 +603,10 @@ pub fn apply_edits_to_normalized_content(
         return Err(err_no_change(path, total));
     }
 
-    Ok(AppliedEdits { base_content, new_content })
+    Ok(AppliedEdits {
+        base_content,
+        new_content,
+    })
 }
 
 /// The successful shape of [`compute_edits_diff`] — Pi `EditDiffResult` (edit-diff.ts:505-508).
@@ -603,16 +649,18 @@ pub fn compute_edits_diff(
     // Pi checks `access(absolutePath, R_OK)` first and reports the failure as
     // `Could not edit file: {path}. {…}.` (edit-diff.ts:527-531). A failing read is the same
     // condition, and the wording matches what `EditTool::execute` already emits (edit.rs:194).
-    let bytes = std::fs::read(&absolute)
-        .map_err(|e| format!("Could not edit file: {path}. {e}."))?;
+    let bytes =
+        std::fs::read(&absolute).map_err(|e| format!("Could not edit file: {path}. {e}."))?;
     let raw = String::from_utf8_lossy(&bytes).into_owned();
     let (_had_bom, body) = strip_bom(&raw);
     let normalized = normalize_to_lf(body);
-    let applied =
-        apply_edits_to_normalized_content(&normalized, edits, path).map_err(|e| e.0)?;
+    let applied = apply_edits_to_normalized_content(&normalized, edits, path).map_err(|e| e.0)?;
     let (diff, first_changed_line) =
         generate_diff_string(&applied.base_content, &applied.new_content);
-    Ok(EditDiffPreview { diff, first_changed_line })
+    Ok(EditDiffPreview {
+        diff,
+        first_changed_line,
+    })
 }
 
 #[cfg(test)]
@@ -688,8 +736,16 @@ mod tests {
         let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
         // Untouched original bytes (the trailing spaces) are preserved on lines we did not edit;
         // edited lines are rewritten from the normalized base.
-        assert!(r.new_content.contains("let x = 'bye';"), "got: {:?}", r.new_content);
-        assert!(r.new_content.contains("val - z"), "got: {:?}", r.new_content);
+        assert!(
+            r.new_content.contains("let x = 'bye';"),
+            "got: {:?}",
+            r.new_content
+        );
+        assert!(
+            r.new_content.contains("val - z"),
+            "got: {:?}",
+            r.new_content
+        );
     }
 
     #[test]
@@ -697,18 +753,31 @@ mod tests {
         // Disk has the `ﬁ` ligature (U+FB01) and a full-width digit `２` (U+FF12); the model sends
         // the plain ASCII forms. NFKC (edit-diff.ts:36) folds both so the fuzzy pass matches.
         let content = "const \u{FB01}le2 = \u{FF12};\n";
-        let edits = vec![("const file2 = 2;".to_string(), "const file2 = 9;".to_string())];
+        let edits = vec![(
+            "const file2 = 2;".to_string(),
+            "const file2 = 9;".to_string(),
+        )];
         let r = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap();
-        assert!(r.new_content.contains("const file2 = 9;"), "got: {:?}", r.new_content);
+        assert!(
+            r.new_content.contains("const file2 = 9;"),
+            "got: {:?}",
+            r.new_content
+        );
     }
 
     #[test]
     fn not_found_error_is_indexed_for_multi() {
         let content = "one\ntwo\n";
-        let edits =
-            vec![("one".to_string(), "1".to_string()), ("zzz".to_string(), "9".to_string())];
+        let edits = vec![
+            ("one".to_string(), "1".to_string()),
+            ("zzz".to_string(), "9".to_string()),
+        ];
         let e = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap_err();
-        assert!(e.0.contains("Could not find edits[1] in f.txt"), "got: {}", e.0);
+        assert!(
+            e.0.contains("Could not find edits[1] in f.txt"),
+            "got: {}",
+            e.0
+        );
     }
 
     #[test]
@@ -716,7 +785,11 @@ mod tests {
         let content = "dup\ndup\n";
         let edits = vec![("dup".to_string(), "x".to_string())];
         let e = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap_err();
-        assert!(e.0.contains("Found 2 occurrences of the text in f.txt"), "got: {}", e.0);
+        assert!(
+            e.0.contains("Found 2 occurrences of the text in f.txt"),
+            "got: {}",
+            e.0
+        );
     }
 
     #[test]
@@ -724,7 +797,11 @@ mod tests {
         let content = "x\n";
         let edits = vec![(String::new(), "y".to_string())];
         let e = apply_edits_to_normalized_content(content, &edits, "f.txt").unwrap_err();
-        assert!(e.0.contains("oldText must not be empty in f.txt"), "got: {}", e.0);
+        assert!(
+            e.0.contains("oldText must not be empty in f.txt"),
+            "got: {}",
+            e.0
+        );
     }
 
     #[test]

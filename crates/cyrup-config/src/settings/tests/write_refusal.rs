@@ -25,19 +25,19 @@ fn apply_overrides_deep_merges_onto_effective() {
     assert!(!mgr.effective().quiet_startup());
 }
 
-#[test]
-fn enable_analytics_generates_tracking_id() {
+#[tokio::test]
+async fn enable_analytics_generates_tracking_id() {
     // settings-manager.ts:943-951
     let store = Arc::new(InMemorySettingsStore::new());
     let mut mgr = SettingsManager::load(store.clone(), false);
     assert!(mgr.effective().tracking_id().is_none());
-    mgr.set_enable_analytics(true).unwrap();
+    mgr.set_enable_analytics(true).await.unwrap();
     assert!(mgr.effective().enable_analytics());
     let id = mgr.effective().tracking_id().unwrap();
     assert_eq!(id.len(), 36); // canonical UUID form
     // opting out doesn't regenerate / clear the id; opting back in keeps the same id
-    mgr.set_enable_analytics(false).unwrap();
-    mgr.set_enable_analytics(true).unwrap();
+    mgr.set_enable_analytics(false).await.unwrap();
+    mgr.set_enable_analytics(true).await.unwrap();
     assert_eq!(mgr.effective().tracking_id().unwrap(), id);
 }
 
@@ -80,8 +80,8 @@ fn assert_refused(result: Result<(), ConfigError>, expected_scope: SettingsScope
     );
 }
 
-#[test]
-fn cfg001_set_refuses_to_clobber_a_malformed_file() {
+#[tokio::test]
+async fn cfg001_set_refuses_to_clobber_a_malformed_file() {
     let (store, mut mgr) = malformed_global();
     // The load recorded the failure (R-00-009) and latched the scope (Pi globalSettingsLoadError).
     assert!(
@@ -90,7 +90,7 @@ fn cfg001_set_refuses_to_clobber_a_malformed_file() {
     );
 
     assert_refused(
-        mgr.set(SettingsScope::Global, "theme", "light"),
+        mgr.set(SettingsScope::Global, "theme", "light").await,
         SettingsScope::Global,
     );
 
@@ -101,8 +101,8 @@ fn cfg001_set_refuses_to_clobber_a_malformed_file() {
     );
 }
 
-#[test]
-fn cfg001_set_nested_refuses_to_clobber_a_malformed_file() {
+#[tokio::test]
+async fn cfg001_set_nested_refuses_to_clobber_a_malformed_file() {
     let (store, mut mgr) = malformed_global();
 
     assert_refused(
@@ -110,7 +110,7 @@ fn cfg001_set_nested_refuses_to_clobber_a_malformed_file() {
             SettingsScope::Global,
             &["terminal", "showImages"],
             false.into(),
-        ),
+        ).await,
         SettingsScope::Global,
     );
 
@@ -121,12 +121,12 @@ fn cfg001_set_nested_refuses_to_clobber_a_malformed_file() {
     );
 }
 
-#[test]
-fn cfg001_persist_nested_refuses_to_clobber_a_malformed_file() {
+#[tokio::test]
+async fn cfg001_persist_nested_refuses_to_clobber_a_malformed_file() {
     let (store, mgr) = malformed_global();
 
     assert_refused(
-        mgr.persist_nested(SettingsScope::Global, &["outputPad"], 0.into()),
+        mgr.persist_nested(SettingsScope::Global, &["outputPad"], 0.into()).await,
         SettingsScope::Global,
     );
 
@@ -137,18 +137,18 @@ fn cfg001_persist_nested_refuses_to_clobber_a_malformed_file() {
     );
 }
 
-#[test]
-fn cfg001_convenience_setters_refuse_too() {
+#[tokio::test]
+async fn cfg001_convenience_setters_refuse_too() {
     // Every `/config`-reachable convenience setter routes through one of the three writers, so
     // each inherits the guard — including `set_enable_analytics`, which owns its own `with_lock`.
     let (store, mut mgr) = malformed_global();
 
-    assert_refused(mgr.set_editor_padding_x(3.0), SettingsScope::Global);
-    assert_refused(mgr.set_show_images(false), SettingsScope::Global);
-    assert_refused(mgr.set_image_width_cells(40.0), SettingsScope::Global);
-    assert_refused(mgr.set_autocomplete_max_visible(9.0), SettingsScope::Global);
-    assert_refused(mgr.set_http_idle_timeout_ms(1000.0), SettingsScope::Global);
-    assert_refused(mgr.set_enable_analytics(true), SettingsScope::Global);
+    assert_refused(mgr.set_editor_padding_x(3.0).await, SettingsScope::Global);
+    assert_refused(mgr.set_show_images(false).await, SettingsScope::Global);
+    assert_refused(mgr.set_image_width_cells(40.0).await, SettingsScope::Global);
+    assert_refused(mgr.set_autocomplete_max_visible(9.0).await, SettingsScope::Global);
+    assert_refused(mgr.set_http_idle_timeout_ms(1000.0).await, SettingsScope::Global);
+    assert_refused(mgr.set_enable_analytics(true).await, SettingsScope::Global);
 
     let after = store.read(SettingsScope::Global).unwrap().unwrap();
     assert_eq!(
@@ -157,8 +157,8 @@ fn cfg001_convenience_setters_refuse_too() {
     );
 }
 
-#[test]
-fn cfg001_project_scope_is_latched_independently() {
+#[tokio::test]
+async fn cfg001_project_scope_is_latched_independently() {
     let store = Arc::new(InMemorySettingsStore::new());
     store.seed(SettingsScope::Global, r#"{ "theme": "dark" }"#);
     store.seed(SettingsScope::Project, MALFORMED);
@@ -171,7 +171,7 @@ fn cfg001_project_scope_is_latched_independently() {
     );
 
     assert_refused(
-        mgr.set(SettingsScope::Project, "quietStartup", true),
+        mgr.set(SettingsScope::Project, "quietStartup", true).await,
         SettingsScope::Project,
     );
     assert_eq!(
@@ -181,12 +181,12 @@ fn cfg001_project_scope_is_latched_independently() {
 
     // The healthy GLOBAL scope still writes — the guard is per-scope, not a global kill switch.
     mgr.set(SettingsScope::Global, "quietStartup", true)
-        .unwrap();
+        .await.unwrap();
     assert!(mgr.effective().quiet_startup());
 }
 
-#[test]
-fn cfg001_corruption_between_load_and_write_is_also_refused() {
+#[tokio::test]
+async fn cfg001_corruption_between_load_and_write_is_also_refused() {
     // The second half of the fix: the file loaded FINE (no latch), then something corrupted it
     // before the locked read-modify-write. The in-closure `Some(Err(_))` arm must abandon the
     // write and surface the refusal rather than starting from an empty document.
@@ -201,7 +201,7 @@ fn cfg001_corruption_between_load_and_write_is_also_refused() {
     store.seed(SettingsScope::Global, MALFORMED); // corrupted behind our back
 
     assert_refused(
-        mgr.set(SettingsScope::Global, "theme", "light"),
+        mgr.set(SettingsScope::Global, "theme", "light").await,
         SettingsScope::Global,
     );
     assert_eq!(
@@ -214,24 +214,24 @@ fn cfg001_corruption_between_load_and_write_is_also_refused() {
             SettingsScope::Global,
             &["terminal", "showImages"],
             true.into(),
-        ),
+        ).await,
         SettingsScope::Global,
     );
     assert_refused(
-        mgr.persist_nested(SettingsScope::Global, &["outputPad"], 1.into()),
+        mgr.persist_nested(SettingsScope::Global, &["outputPad"], 1.into()).await,
         SettingsScope::Global,
     );
-    assert_refused(mgr.set_enable_analytics(true), SettingsScope::Global);
+    assert_refused(mgr.set_enable_analytics(true).await, SettingsScope::Global);
     assert_eq!(
         store.read(SettingsScope::Global).unwrap().unwrap(),
         MALFORMED
     );
 }
 
-#[test]
-fn cfg001_repairing_the_file_and_reloading_restores_writability() {
+#[tokio::test]
+async fn cfg001_repairing_the_file_and_reloading_restores_writability() {
     let (store, mut mgr) = malformed_global();
-    assert!(mgr.set(SettingsScope::Global, "theme", "light").is_err());
+    assert!(mgr.set(SettingsScope::Global, "theme", "light").await.is_err());
 
     // The user fixes the trailing comma and cyrup reloads: the latch clears and writes resume.
     store.seed(
@@ -244,7 +244,7 @@ fn cfg001_repairing_the_file_and_reloading_restores_writability() {
         "latch cleared on a clean reload"
     );
 
-    mgr.set(SettingsScope::Global, "theme", "light").unwrap();
+    mgr.set(SettingsScope::Global, "theme", "light").await.unwrap();
     let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
     assert_eq!(after.get("theme"), Some(&serde_json::json!("light")));
     assert_eq!(
@@ -254,20 +254,20 @@ fn cfg001_repairing_the_file_and_reloading_restores_writability() {
     );
 }
 
-#[test]
-fn cfg001_an_absent_file_is_still_created() {
+#[tokio::test]
+async fn cfg001_an_absent_file_is_still_created() {
     // The refusal must not break first-run: `None` (no file) is not a parse failure.
     let store = Arc::new(InMemorySettingsStore::new());
     let mut mgr = SettingsManager::load(store.clone(), false);
     assert!(mgr.load_error(SettingsScope::Global).is_none());
 
-    mgr.set(SettingsScope::Global, "theme", "light").unwrap();
+    mgr.set(SettingsScope::Global, "theme", "light").await.unwrap();
     mgr.set_nested(
         SettingsScope::Global,
         &["terminal", "showImages"],
         true.into(),
     )
-    .unwrap();
+    .await.unwrap();
     let after = Settings::parse(&store.read(SettingsScope::Global).unwrap().unwrap()).unwrap();
     assert_eq!(after.get("theme"), Some(&serde_json::json!("light")));
 }

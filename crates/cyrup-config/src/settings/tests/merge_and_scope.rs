@@ -406,19 +406,19 @@ fn one_malformed_package_entry_does_not_discard_the_other_nine() {
 /// `:924-928` @v0.83.0) and `persistScopedSettings` writes through
 /// `JSON.stringify(mergedSettings, null, 2)` (`:605`), which omits undefined-valued properties
 /// at every depth — so upstream cannot produce a `null` in a settings document at all.
-#[test]
-fn clearing_a_key_removes_it_rather_than_writing_json_null() {
+#[tokio::test]
+async fn clearing_a_key_removes_it_rather_than_writing_json_null() {
     let store = Arc::new(InMemorySettingsStore::new());
     let mut mgr = SettingsManager::load(store.clone(), true);
 
     mgr.set(SettingsScope::Global, "shellPath", Some("~/bin/bash"))
-        .unwrap();
+        .await.unwrap();
     mgr.set_nested(
         SettingsScope::Global,
         &["terminal", "showImages"],
         Value::Bool(true),
     )
-    .unwrap();
+    .await.unwrap();
     let written = store.read(SettingsScope::Global).unwrap().unwrap();
     assert!(written.contains("shellPath"), "precondition: {written}");
     assert!(written.contains("showImages"), "precondition: {written}");
@@ -426,13 +426,13 @@ fn clearing_a_key_removes_it_rather_than_writing_json_null() {
     // Clear both. `None::<&str>` serializes to `Value::Null`, which is the only way a Rust
     // caller can express pi's `undefined`.
     mgr.set(SettingsScope::Global, "shellPath", None::<&str>)
-        .unwrap();
+        .await.unwrap();
     mgr.set_nested(
         SettingsScope::Global,
         &["terminal", "showImages"],
         Value::Null,
     )
-    .unwrap();
+    .await.unwrap();
 
     let written = store.read(SettingsScope::Global).unwrap().unwrap();
     assert!(
@@ -485,8 +485,8 @@ fn a_project_null_blanks_a_global_value_on_both_sides() {
     );
 }
 
-#[test]
-fn set_field_preserves_unknown_keys() {
+#[tokio::test]
+async fn set_field_preserves_unknown_keys() {
     let store = Arc::new(InMemorySettingsStore::new());
     store.seed(
         SettingsScope::Global,
@@ -494,17 +494,17 @@ fn set_field_preserves_unknown_keys() {
     );
     let mut mgr = SettingsManager::load(store.clone(), false);
     mgr.set(SettingsScope::Global, "defaultModel", "new")
-        .unwrap();
+        .await.unwrap();
     let raw = store.read(SettingsScope::Global).unwrap().unwrap();
     let s = Settings::parse(&raw).unwrap();
     assert_eq!(s.get("futureKey"), Some(&serde_json::json!(42)));
     assert_eq!(s.get("defaultModel"), Some(&serde_json::json!("new")));
 }
 
-#[test]
-fn project_write_requires_trust() {
+#[tokio::test]
+async fn project_write_requires_trust() {
     let store = Arc::new(InMemorySettingsStore::new());
     let mut mgr = SettingsManager::load(store, false);
-    let err = mgr.set(SettingsScope::Project, "defaultModel", "x");
+    let err = mgr.set(SettingsScope::Project, "defaultModel", "x").await;
     assert!(matches!(err, Err(ConfigError::Untrusted)));
 }

@@ -78,8 +78,10 @@ fn read_settings_file_strict(path: &Path) -> Result<Map<String, Value>, Subagent
 /// the file is hand-repaired.
 ///
 /// The lock lives on a sidecar `<path>.lock`, so it survives the atomic rename over the target.
-fn lock_settings_file(path: &Path) -> Result<cyrup_config::lock::FileLock, SubagentError> {
-    cyrup_config::lock::FileLock::acquire(path).map_err(|e| {
+async fn lock_settings_file(path: &Path) -> Result<cyrup_config::lock::FileLock, SubagentError> {
+    // `None`: this crate holds no `CancelToken` at these sites, and every non-`models_store`
+    // caller of `FileLock::acquire` passes `None` for the same reason.
+    cyrup_config::lock::FileLock::acquire(path, None).await.map_err(|e| {
         SubagentError::MalformedSettings(format!(
             "Failed to lock settings file '{}': {e}",
             path.display()
@@ -147,14 +149,14 @@ fn store_overrides(settings: &mut Map<String, Value>, next_overrides: Map<String
 ///
 /// [`SubagentError::MalformedSettings`] if the file exists but is unreadable / not JSON / not a JSON
 /// object; [`SubagentError::Spawn`] on a genuine write failure.
-pub fn merge_builtin_agent_override(
+pub async fn merge_builtin_agent_override(
     path: &Path,
     name: &str,
     fields: &Map<String, Value>,
 ) -> Result<(), SubagentError> {
     // SUBA-029: ONE lock spans the read AND the write, so the read-modify-write is atomic against
     // a concurrent management action on the same file rather than three independent operations.
-    let _lock = lock_settings_file(path)?;
+    let _lock = lock_settings_file(path).await?;
     let mut settings = read_settings_file_strict(path)?;
     let mut next_overrides = overrides_of(&settings).cloned().unwrap_or_default();
     let mut entry = next_overrides.get(name).and_then(Value::as_object).cloned().unwrap_or_default();
@@ -178,9 +180,9 @@ pub fn merge_builtin_agent_override(
 /// # Errors
 ///
 /// As [`merge_builtin_agent_override`].
-pub fn remove_builtin_agent_override(path: &Path, name: &str) -> Result<bool, SubagentError> {
+pub async fn remove_builtin_agent_override(path: &Path, name: &str) -> Result<bool, SubagentError> {
     // SUBA-029: held across read+write; see `lock_settings_file`.
-    let _lock = lock_settings_file(path)?;
+    let _lock = lock_settings_file(path).await?;
     let mut settings = read_settings_file_strict(path)?;
     let Some(overrides) = overrides_of(&settings) else {
         return Ok(false);
@@ -208,13 +210,13 @@ pub fn remove_builtin_agent_override(path: &Path, name: &str) -> Result<bool, Su
 /// # Errors
 ///
 /// As [`merge_builtin_agent_override`].
-pub fn remove_builtin_agent_override_fields(
+pub async fn remove_builtin_agent_override_fields(
     path: &Path,
     name: &str,
     fields: &[&str],
 ) -> Result<bool, SubagentError> {
     // SUBA-029: held across read+write; see `lock_settings_file`.
-    let _lock = lock_settings_file(path)?;
+    let _lock = lock_settings_file(path).await?;
     let mut settings = read_settings_file_strict(path)?;
     let Some(overrides) = overrides_of(&settings) else {
         return Ok(false);
@@ -260,22 +262,30 @@ mod tests {
     ///
     /// Red before the fix: with the bare `fs::write` both threads read `{}` and the last write
     /// wins, so exactly ONE override survives.
-    #[test]
-    fn two_concurrent_overrides_on_one_settings_file_both_survive() {
+    /// The writers are `tokio::spawn`ed onto a two-worker runtime rather than `std::thread::scope`d,
+    /// because `merge_builtin_agent_override` is now `async` and a plain thread closure cannot
+    /// await it. Two workers keep the contention genuinely parallel, so this still exercises the
+    /// real race; what it now also covers is the in-process layer of `FileLock`, which is the layer
+    /// two writers in ONE process actually contend on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn two_concurrent_overrides_on_one_settings_file_both_survive() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("settings.json");
 
-        std::thread::scope(|scope| {
-            for name in ["scout", "worker"] {
-                let path = path.clone();
-                scope.spawn(move || {
-                    let mut fields = Map::new();
-                    fields.insert("disabled".to_string(), Value::Bool(true));
-                    merge_builtin_agent_override(&path, name, &fields)
-                        .expect("each concurrent override must succeed");
-                });
-            }
-        });
+        let mut writers = Vec::new();
+        for name in ["scout", "worker"] {
+            let path = path.clone();
+            writers.push(tokio::spawn(async move {
+                let mut fields = Map::new();
+                fields.insert("disabled".to_string(), Value::Bool(true));
+                merge_builtin_agent_override(&path, name, &fields)
+                    .await
+                    .expect("each concurrent override must succeed");
+            }));
+        }
+        for w in writers {
+            w.await.expect("writer task must not panic");
+        }
 
         let settings = read_settings_file_strict(&path).expect("settings parse");
         let overrides = overrides_of(&settings).expect("agentOverrides written");
@@ -289,13 +299,13 @@ mod tests {
     /// SUBA-029's format half: the lock/atomic change must not alter a single byte of the document
     /// pi writes (two-space indent + trailing newline, `agents.ts:706-709`), or a cyrup-written
     /// settings file stops being diff-clean against a pi-written one.
-    #[test]
-    fn the_written_settings_document_is_still_pi_byte_shaped() {
+    #[tokio::test]
+    async fn the_written_settings_document_is_still_pi_byte_shaped() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("nested").join("settings.json");
         let mut fields = Map::new();
         fields.insert("disabled".to_string(), Value::Bool(true));
-        merge_builtin_agent_override(&path, "scout", &fields).expect("write");
+        merge_builtin_agent_override(&path, "scout", &fields).await.expect("write");
 
         let raw = std::fs::read_to_string(&path).expect("written");
         assert!(raw.ends_with("}\n"), "trailing newline required: {raw:?}");
@@ -314,16 +324,16 @@ mod tests {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
-    #[test]
-    fn merge_creates_every_missing_level_in_an_absent_file() {
+    #[tokio::test]
+    async fn merge_creates_every_missing_level_in_an_absent_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("nested").join("settings.json");
-        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).unwrap();
+        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).await.unwrap();
         assert_eq!(read(&path)["subagents"]["agentOverrides"]["scout"]["disabled"], Value::Bool(true));
     }
 
-    #[test]
-    fn merge_preserves_every_unrelated_key_in_the_document() {
+    #[tokio::test]
+    async fn merge_preserves_every_unrelated_key_in_the_document() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(
@@ -331,7 +341,7 @@ mod tests {
             r#"{"theme":"dark","mcpServers":{"a":{"command":"x"}},"subagents":{"defaultModel":"anthropic/m","unknownFutureKey":42,"agentOverrides":{"worker":{"model":"anthropic/w"}}}}"#,
         )
         .unwrap();
-        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).unwrap();
+        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).await.unwrap();
         let after = read(&path);
         // The whole rest of the document survives — this is the failure mode a typed round-trip has.
         assert_eq!(after["theme"], Value::String("dark".to_string()));
@@ -345,20 +355,20 @@ mod tests {
         assert_eq!(after["subagents"]["agentOverrides"]["scout"]["disabled"], Value::Bool(true));
     }
 
-    #[test]
-    fn merge_is_shallow_and_keeps_the_entrys_other_fields() {
+    #[tokio::test]
+    async fn merge_is_shallow_and_keeps_the_entrys_other_fields() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, r#"{"subagents":{"agentOverrides":{"scout":{"model":"anthropic/x"}}}}"#)
             .unwrap();
-        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).unwrap();
+        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).await.unwrap();
         let entry = &read(&path)["subagents"]["agentOverrides"]["scout"];
         assert_eq!(entry["model"], Value::String("anthropic/x".to_string()));
         assert_eq!(entry["disabled"], Value::Bool(true));
     }
 
-    #[test]
-    fn remove_fields_keeps_siblings_and_prunes_only_what_it_emptied() {
+    #[tokio::test]
+    async fn remove_fields_keeps_siblings_and_prunes_only_what_it_emptied() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(
@@ -366,26 +376,26 @@ mod tests {
             r#"{"subagents":{"agentOverrides":{"scout":{"disabled":true,"model":"anthropic/x"}}}}"#,
         )
         .unwrap();
-        assert!(remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).unwrap());
+        assert!(remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).await.unwrap());
         let entry = &read(&path)["subagents"]["agentOverrides"]["scout"];
         assert_eq!(entry["model"], Value::String("anthropic/x".to_string()));
         assert!(entry.get("disabled").is_none());
     }
 
-    #[test]
-    fn remove_last_field_prunes_entry_overrides_and_subagents() {
+    #[tokio::test]
+    async fn remove_last_field_prunes_entry_overrides_and_subagents() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, r#"{"theme":"dark","subagents":{"agentOverrides":{"scout":{"disabled":true}}}}"#)
             .unwrap();
-        assert!(remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).unwrap());
+        assert!(remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).await.unwrap());
         let after = read(&path);
         assert_eq!(after["theme"], Value::String("dark".to_string()));
         assert!(after.get("subagents").is_none(), "empty subagents block must be pruned: {after}");
     }
 
-    #[test]
-    fn remove_entry_prunes_but_leaves_sibling_overrides() {
+    #[tokio::test]
+    async fn remove_entry_prunes_but_leaves_sibling_overrides() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(
@@ -393,41 +403,41 @@ mod tests {
             r#"{"subagents":{"agentOverrides":{"scout":{"disabled":true},"worker":{"model":"m"}}}}"#,
         )
         .unwrap();
-        assert!(remove_builtin_agent_override(&path, "scout").unwrap());
+        assert!(remove_builtin_agent_override(&path, "scout").await.unwrap());
         let overrides = &read(&path)["subagents"]["agentOverrides"];
         assert!(overrides.get("scout").is_none());
         assert_eq!(overrides["worker"]["model"], Value::String("m".to_string()));
     }
 
-    #[test]
-    fn removals_are_no_ops_when_nothing_matches_and_never_create_a_file() {
+    #[tokio::test]
+    async fn removals_are_no_ops_when_nothing_matches_and_never_create_a_file() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
-        assert!(!remove_builtin_agent_override(&path, "scout").unwrap());
-        assert!(!remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).unwrap());
+        assert!(!remove_builtin_agent_override(&path, "scout").await.unwrap());
+        assert!(!remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).await.unwrap());
         assert!(!path.exists(), "a no-op removal must not create a settings file");
 
         std::fs::write(&path, r#"{"subagents":{"agentOverrides":{"scout":{"model":"m"}}}}"#).unwrap();
-        assert!(!remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).unwrap());
+        assert!(!remove_builtin_agent_override_fields(&path, "scout", &["disabled"]).await.unwrap());
         assert_eq!(read(&path)["subagents"]["agentOverrides"]["scout"]["model"], Value::String("m".to_string()));
     }
 
-    #[test]
-    fn a_malformed_settings_file_aborts_rather_than_being_overwritten() {
+    #[tokio::test]
+    async fn a_malformed_settings_file_aborts_rather_than_being_overwritten() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
         std::fs::write(&path, "{ not json").unwrap();
         let err = merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true)))
-            .expect_err("malformed settings must abort");
+            .await.expect_err("malformed settings must abort");
         assert!(matches!(err, SubagentError::MalformedSettings(_)), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{ not json");
     }
 
-    #[test]
-    fn written_file_uses_two_space_indent_and_a_trailing_newline() {
+    #[tokio::test]
+    async fn written_file_uses_two_space_indent_and_a_trailing_newline() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("settings.json");
-        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).unwrap();
+        merge_builtin_agent_override(&path, "scout", &field("disabled", Value::Bool(true))).await.unwrap();
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.ends_with("}\n"), "{raw:?}");
         assert!(raw.contains("\n  \"subagents\""), "{raw:?}");

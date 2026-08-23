@@ -3,7 +3,7 @@
 use crate::config::ReadOpts;
 use crate::details::ReadDetails;
 use crate::ops::FsOps;
-use crate::truncate::{format_size, truncate_head, TruncOpts, DEFAULT_MAX_BYTES};
+use crate::truncate::{DEFAULT_MAX_BYTES, TruncOpts, format_size, truncate_head};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use std::path::PathBuf;
@@ -45,7 +45,12 @@ impl ReadTool {
                 "limit": { "type": "number", "description": "Maximum number of lines to read" }
             }
         });
-        Self { fs, cwd, opts, params }
+        Self {
+            fs,
+            cwd,
+            opts,
+            params,
+        }
     }
 }
 
@@ -105,7 +110,12 @@ impl Tool for ReadTool {
         let candidates = path::resolve_read_path(&input.path, &self.cwd);
         let mut abs = None;
         for cand in &candidates {
-            if self.fs.access(cand, crate::ops::Access::Exists).await.is_ok() {
+            if self
+                .fs
+                .access(cand, crate::ops::Access::Exists)
+                .await
+                .is_ok()
+            {
                 abs = Some(cand.clone());
                 break;
             }
@@ -181,8 +191,10 @@ impl Tool for ReadTool {
             Some(l) => crate::jsnum::to_count(start as f64 + l).clamp(start, total),
             None => total,
         };
-        let window: Vec<&str> =
-            lines.get(start..end).map(<[&str]>::to_vec).unwrap_or_default();
+        let window: Vec<&str> = lines
+            .get(start..end)
+            .map(<[&str]>::to_vec)
+            .unwrap_or_default();
         let window_text = window.join("\n");
 
         let t = truncate_head(
@@ -207,7 +219,10 @@ impl Tool for ReadTool {
             );
             return Ok(ToolResult {
                 content: vec![Content::text(out)],
-                details: serde_json::to_value(ReadDetails { truncation: Some(t.info) }).ok(),
+                details: serde_json::to_value(ReadDetails {
+                    truncation: Some(t.info),
+                })
+                .ok(),
                 terminate: false,
                 ..Default::default()
             });
@@ -248,7 +263,10 @@ impl Tool for ReadTool {
         // Pi only sets `details` on the firstLineExceeds and truncated branches; the user-limited
         // and plain branches leave it `undefined` (read.ts:294-315). Mirror that.
         let details = if t.info.truncated {
-            serde_json::to_value(ReadDetails { truncation: Some(t.info) }).ok()
+            serde_json::to_value(ReadDetails {
+                truncation: Some(t.info),
+            })
+            .ok()
         } else {
             None
         };
@@ -278,7 +296,9 @@ impl ReadTool {
         let non_vision_note: Option<&str> = if self.opts.supports_images_now() {
             None
         } else {
-            Some("[Current model does not support images. The image will be omitted from this request.]")
+            Some(
+                "[Current model does not support images. The image will be omitted from this request.]",
+            )
         };
 
         #[cfg(feature = "inline-images")]
@@ -289,7 +309,11 @@ impl ReadTool {
                 self.opts.max_image_dim,
                 self.opts.auto_resize_images,
             ) {
-                image_proc::Processed::Ok { data, mime: out_mime, hints } => {
+                image_proc::Processed::Ok {
+                    data,
+                    mime: out_mime,
+                    hints,
+                } => {
                     // `Read image file [${processed.mimeType}]` + hints + nonVisionNote.
                     let mut note = format!("Read image file [{out_mime}]");
                     for h in &hints {
@@ -303,7 +327,10 @@ impl ReadTool {
                     Ok(ToolResult {
                         content: vec![
                             Content::text(note),
-                            Content::Image { data, mime_type: out_mime },
+                            Content::Image {
+                                data,
+                                mime_type: out_mime,
+                            },
                         ],
                         details: None,
                         terminate: false,
@@ -367,8 +394,14 @@ mod image_proc {
     const JPEG_QUALITIES: [u8; 5] = [80, 85, 70, 55, 40];
 
     pub enum Processed {
-        Ok { data: String, mime: String, hints: Vec<String> },
-        Failed { message: String },
+        Ok {
+            data: String,
+            mime: String,
+            hints: Vec<String>,
+        },
+        Failed {
+            message: String,
+        },
     }
 
     struct Resized {
@@ -446,7 +479,11 @@ mod image_proc {
                         r.original_width, r.original_height, r.width, r.height, scale
                     ));
                 }
-                Processed::Ok { data: r.data, mime: r.mime, hints }
+                Processed::Ok {
+                    data: r.data,
+                    mime: r.mime,
+                    hints,
+                }
             }
             None => Processed::Failed {
                 message: "[Image omitted: could not be resized below the inline image size limit.]"
@@ -464,9 +501,13 @@ mod image_proc {
     /// Decode + apply EXIF orientation (Pi `applyExifOrientation`). The `image` crate exposes the
     /// decoder's EXIF orientation (0.25+) which we bake into the pixels.
     fn decode_with_orientation(bytes: &[u8]) -> Option<DynamicImage> {
-        let reader = image::ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
+        let reader = image::ImageReader::new(Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()?;
         let mut decoder = reader.into_decoder().ok()?;
-        let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+        let orientation = decoder
+            .orientation()
+            .unwrap_or(image::metadata::Orientation::NoTransforms);
         let mut img = DynamicImage::from_decoder(decoder).ok()?;
         img.apply_orientation(orientation);
         Some(img)
@@ -474,7 +515,8 @@ mod image_proc {
 
     fn encode_png(img: &DynamicImage) -> Option<Vec<u8>> {
         let mut buf = Vec::new();
-        img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png).ok()?;
+        img.write_to(&mut Cursor::new(&mut buf), image::ImageFormat::Png)
+            .ok()?;
         Some(buf)
     }
 
@@ -513,11 +555,13 @@ mod image_proc {
         // Initial target dims, preserving aspect ratio (image-resize-core.ts:96-106).
         let (mut target_w, mut target_h) = (original_width, original_height);
         if target_w > max_dim {
-            target_h = ((f64::from(target_h) * f64::from(max_dim)) / f64::from(target_w)).round() as u32;
+            target_h =
+                ((f64::from(target_h) * f64::from(max_dim)) / f64::from(target_w)).round() as u32;
             target_w = max_dim;
         }
         if target_h > max_dim {
-            target_w = ((f64::from(target_w) * f64::from(max_dim)) / f64::from(target_h)).round() as u32;
+            target_w =
+                ((f64::from(target_w) * f64::from(max_dim)) / f64::from(target_h)).round() as u32;
             target_h = max_dim;
         }
 
@@ -559,8 +603,16 @@ mod image_proc {
             if cw == 1 && ch == 1 {
                 break;
             }
-            let nw = if cw == 1 { 1 } else { 1.max((f64::from(cw) * 0.75).floor() as u32) };
-            let nh = if ch == 1 { 1 } else { 1.max((f64::from(ch) * 0.75).floor() as u32) };
+            let nw = if cw == 1 {
+                1
+            } else {
+                1.max((f64::from(cw) * 0.75).floor() as u32)
+            };
+            let nh = if ch == 1 {
+                1
+            } else {
+                1.max((f64::from(ch) * 0.75).floor() as u32)
+            };
             if nw == cw && nh == ch {
                 break;
             }

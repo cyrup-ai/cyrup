@@ -144,8 +144,8 @@ fn http_idle_timeout_invalid_errors() {
     assert_eq!(s.http_idle_timeout_ms().unwrap(), 0);
 }
 
-#[test]
-fn nested_set_preserves_siblings() {
+#[tokio::test]
+async fn nested_set_preserves_siblings() {
     // R-07-004: setting terminal.showImages must not clobber terminal.imageWidthCells.
     let store = Arc::new(InMemorySettingsStore::new());
     store.seed(
@@ -153,7 +153,7 @@ fn nested_set_preserves_siblings() {
         r#"{ "terminal": { "imageWidthCells": 40 } }"#,
     );
     let mut mgr = SettingsManager::load(store.clone(), false);
-    mgr.set_show_images(false).unwrap();
+    mgr.set_show_images(false).await.unwrap();
     let raw = store.read(SettingsScope::Global).unwrap().unwrap();
     let s = Settings::parse(&raw).unwrap();
     assert_eq!(
@@ -166,17 +166,17 @@ fn nested_set_preserves_siblings() {
     );
 }
 
-#[test]
-fn setters_clamp() {
+#[tokio::test]
+async fn setters_clamp() {
     let store = Arc::new(InMemorySettingsStore::new());
     let mut mgr = SettingsManager::load(store.clone(), false);
-    mgr.set_editor_padding_x(9.0).unwrap();
+    mgr.set_editor_padding_x(9.0).await.unwrap();
     assert_eq!(mgr.effective().editor_padding_x(), 3);
-    mgr.set_autocomplete_max_visible(1.0).unwrap();
+    mgr.set_autocomplete_max_visible(1.0).await.unwrap();
     assert_eq!(mgr.effective().autocomplete_max_visible(), 3);
-    mgr.set_image_width_cells(0.0).unwrap();
+    mgr.set_image_width_cells(0.0).await.unwrap();
     assert_eq!(mgr.effective().image_width_cells(), 1);
-    assert!(mgr.set_http_idle_timeout_ms(-5.0).is_err());
+    assert!(mgr.set_http_idle_timeout_ms(-5.0).await.is_err());
 }
 
 #[test]

@@ -5,9 +5,9 @@
 use crate::config::{BashOpts, BashSpawnContext};
 use crate::details::BashDetails;
 use crate::error;
-use crate::ops::{shell_env, ExecSpec, ExitStatus, ProcOps, ShellConfig};
+use crate::ops::{ExecSpec, ExitStatus, ProcOps, ShellConfig, shell_env};
 use crate::output::OutputAccumulator;
-use crate::truncate::{format_size, truncate_tail, TruncOpts, Truncation, TruncatedBy};
+use crate::truncate::{TruncOpts, TruncatedBy, Truncation, format_size, truncate_tail};
 use cyrup_core::{
     CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
 };
@@ -36,11 +36,15 @@ const MAX_TIMEOUT_MS: f64 = 2_147_483_647.0;
 fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<Duration>, ToolError> {
     let Some(secs) = timeout else { return Ok(None) };
     if !secs.is_finite() || secs <= 0.0 {
-        return Err(error::invalid("Invalid timeout: must be a finite number of seconds"));
+        return Err(error::invalid(
+            "Invalid timeout: must be a finite number of seconds",
+        ));
     }
     let timeout_ms = secs * 1000.0;
     if timeout_ms > MAX_TIMEOUT_MS {
-        return Err(error::invalid("Invalid timeout: maximum is 2147483.647 seconds"));
+        return Err(error::invalid(
+            "Invalid timeout: maximum is 2147483.647 seconds",
+        ));
     }
     // `timeout_ms` is finite and in `(0, 2_147_483_647]`, so `round() as u64` is exact and total.
     Ok(Some(Duration::from_millis(timeout_ms.round() as u64)))
@@ -66,7 +70,13 @@ impl BashTool {
                 "timeout": { "type": "number", "description": "Timeout in seconds (optional, no default timeout)" }
             }
         });
-        Self { proc, shell, cwd, opts, params }
+        Self {
+            proc,
+            shell,
+            cwd,
+            opts,
+            params,
+        }
     }
 }
 
@@ -148,7 +158,9 @@ impl Tool for BashTool {
     /// `cyrup-config/src/env.rs:68-91` — none of those five session-metadata names appears there.
     fn prompt_guidelines(&self) -> Vec<&str> {
         if self.opts.expose_session_environment {
-            vec!["You can inspect CYRUP_* environment variables for current model and session details."]
+            vec![
+                "You can inspect CYRUP_* environment variables for current model and session details.",
+            ]
         } else {
             Vec::new()
         }
@@ -218,7 +230,10 @@ impl Tool for BashTool {
             // Pi guards this one (`if (sessionFile)`, bash.ts:174): an ephemeral session leaves it
             // unset rather than empty.
             if let Some(file) = info.session_file {
-                env.push(("CYRUP_SESSION_FILE".to_string(), file.to_string_lossy().into_owned()));
+                env.push((
+                    "CYRUP_SESSION_FILE".to_string(),
+                    file.to_string_lossy().into_owned(),
+                ));
             }
             // Pi sets the provider/model PAIR together, only when a model is selected (bash.ts:
             // 175-178).
@@ -230,7 +245,12 @@ impl Tool for BashTool {
                 env.push(("CYRUP_REASONING_LEVEL".to_string(), level));
             }
         }
-        let ctx = BashSpawnContext { command, cwd: self.cwd.clone(), env, env_remove };
+        let ctx = BashSpawnContext {
+            command,
+            cwd: self.cwd.clone(),
+            env,
+            env_remove,
+        };
         let ctx = match &self.opts.spawn_hook {
             Some(hook) => hook(ctx),
             None => ctx,
@@ -246,7 +266,11 @@ impl Tool for BashTool {
         // `ops.exec` is ever called — everything `ops.exec` does internally (`resolveTimeoutMs`
         // at bash.ts:85, the abort check, and `getShellConfig` at bash.ts:69) happens AFTER this
         // update. Emit it first, then run those checks in the same order.
-        sink(ToolUpdate { content: vec![], details: None, terminate: None });
+        sink(ToolUpdate {
+            content: vec![],
+            details: None,
+            terminate: None,
+        });
 
         // Pi's `resolveTimeoutMs` (bash.ts:85), called at the top of `ops.exec` right after the
         // initial `onUpdate`. An invalid value reaches Pi's catch as a plain `Error` that matches
@@ -403,7 +427,9 @@ impl Tool for BashTool {
                     format_size(last_line_bytes),
                 )
             } else if truncated_by == Some(crate::truncate::TruncatedBy::Lines) {
-                format!("[Showing lines {start_line}-{end_line} of {total_lines}. Full output: {ps}]")
+                format!(
+                    "[Showing lines {start_line}-{end_line} of {total_lines}. Full output: {ps}]"
+                )
             } else {
                 // Pi hardcodes `formatSize(DEFAULT_MAX_BYTES)` in this footer (bash.ts:372) even
                 // though bash's truncation point itself is configurable. Mirror the constant.
@@ -449,7 +475,11 @@ impl Tool for BashTool {
             // Both this arm and the non-zero-exit arm go through `formatOutput`, whose `emptyText`
             // defaults to `"(no output)"` (bash.ts:357,375).
             ExitStatus::Exited(0) | ExitStatus::Signaled => {
-                let body = if text.is_empty() { "(no output)".to_string() } else { text };
+                let body = if text.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    text
+                };
                 Ok(ToolResult {
                     content: vec![Content::text(body)],
                     details,
@@ -460,8 +490,15 @@ impl Tool for BashTool {
             // Non-zero exit: `formatOutput(snapshot)` uses the `"(no output)"` default for empty
             // output, then `appendStatus` joins it (bash.ts:404-406).
             ExitStatus::Exited(code) => {
-                let body = if text.is_empty() { "(no output)".to_string() } else { text };
-                Err(error::invalid(append_status(&body, &format!("Command exited with code {code}"))))
+                let body = if text.is_empty() {
+                    "(no output)".to_string()
+                } else {
+                    text
+                };
+                Err(error::invalid(append_status(
+                    &body,
+                    &format!("Command exited with code {code}"),
+                )))
             }
             // Catch path (abort/timeout): `formatOutput(snapshot, "")` — `emptyText` is `""`, so an
             // empty output yields just the status with NO leading `\n\n` (bash.ts:375,388-396).
@@ -470,7 +507,10 @@ impl Tool for BashTool {
                 // value in `Command timed out after ${timeoutSecs} seconds` (bash.ts:414-415). Rust
                 // `f64` Display matches JS number stringification (`1.0`→"1", `2.5`→"2.5").
                 let secs = input.timeout.unwrap_or(0.0);
-                Err(error::invalid(append_status(&text, &format!("Command timed out after {secs} seconds"))))
+                Err(error::invalid(append_status(
+                    &text,
+                    &format!("Command timed out after {secs} seconds"),
+                )))
             }
             ExitStatus::Killed => Err(error::invalid(append_status(&text, "Command aborted"))),
         }
@@ -505,14 +545,21 @@ fn stream_details(
     info.total_bytes = total_bytes;
     info.truncated = truncated;
     info.truncated_by = if truncated {
-        info.truncated_by
-            .or(if total_bytes > max_bytes { Some(TruncatedBy::Bytes) } else { Some(TruncatedBy::Lines) })
+        info.truncated_by.or(if total_bytes > max_bytes {
+            Some(TruncatedBy::Bytes)
+        } else {
+            Some(TruncatedBy::Lines)
+        })
     } else {
         None
     };
     let truncation = if truncated { Some(info) } else { None };
     let full_output_path = full_path.map(|p| p.to_string_lossy().into_owned());
-    serde_json::to_value(BashDetails { truncation, full_output_path }).ok()
+    serde_json::to_value(BashDetails {
+        truncation,
+        full_output_path,
+    })
+    .ok()
 }
 
 /// Build a mid-stream `onUpdate` payload from the live accumulator (Pi `emitOutputUpdate`'s
@@ -529,9 +576,19 @@ fn build_stream_update(
     let total_lines = acc.total_lines();
     let total_bytes = acc.total_bytes();
     let full_path = acc.snapshot_path();
-    let details =
-        stream_details(preview.info, truncated, total_lines, total_bytes, max_bytes, full_path);
-    ToolUpdate { content: vec![Content::text(preview.content)], details, terminate: None }
+    let details = stream_details(
+        preview.info,
+        truncated,
+        total_lines,
+        total_bytes,
+        max_bytes,
+        full_path,
+    );
+    ToolUpdate {
+        content: vec![Content::text(preview.content)],
+        details,
+        terminate: None,
+    }
 }
 
 /// Pi's `emitOutputUpdate` (bash.ts:302-314): a no-op unless something is dirty; otherwise clear the

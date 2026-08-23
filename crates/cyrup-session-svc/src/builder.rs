@@ -431,8 +431,18 @@ pub struct SessionBuilder {
 /// `saveProjectTrustPromptResult(trustStore, result)` runs inside `selectProjectTrustOption`
 /// (`:39`) under the `updates.length > 0` guard (`:40-44`) that makes the two "(this session only)"
 /// rows write nothing.
-pub type TrustPromptFn =
-    Arc<dyn Fn(&[TrustOption], &Option<TrustEntry>) -> Option<bool> + Send + Sync>;
+/// Returns a boxed future because the prompt persists the chosen option through
+/// `TrustStore::set_many`, which is async — the host's implementation cannot answer synchronously.
+/// The one call site ([`SessionBuilder::build`]) already awaits inside `async fn`, so this costs a
+/// boxed allocation per prompt and nothing else.
+pub type TrustPromptFn = Arc<
+    dyn for<'a> Fn(
+            &'a [TrustOption],
+            &'a Option<TrustEntry>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<bool>> + Send + 'a>>
+        + Send
+        + Sync,
+>;
 
 impl SessionBuilder {
     /// Start a builder over the resolved `provider` and a `config`.
@@ -617,10 +627,10 @@ impl SessionBuilder {
         };
         // SEAM-065 — the saved-decision tier is read HERE, not by the caller, because pi reads it
         // at `project-trust.ts:72-75`, i.e. strictly AFTER `emitProjectTrustEvent` (`:54-70`).
-        let saved = self
-            .trust_store
-            .as_ref()
-            .and_then(|store| store.nearest(&cwd).ok().flatten());
+        let saved = match self.trust_store.as_ref() {
+            Some(store) => store.nearest(&cwd).await.ok().flatten(),
+            None => None,
+        };
         if let Some(d) = &ext_trust
             && d.remember
         {
@@ -633,7 +643,7 @@ impl SessionBuilder {
                     } else {
                         cyrup_config::TrustDecision::Untrusted
                     };
-                    if let Err(e) = store.set(&cwd, Some(decision)) {
+                    if let Err(e) = store.set(&cwd, Some(decision)).await {
                         tracing::warn!(error = %e, "persisting extension project_trust verdict");
                     }
                 }
@@ -671,7 +681,7 @@ impl SessionBuilder {
                     // selector is the other call site and genuinely passes the default `false`
                     // (trust-selector.ts:44) — do not "fix" that one to match.
                     let options = trust_options(&cwd, true);
-                    prompt(&options, &saved).unwrap_or(false)
+                    prompt(&options, &saved).await.unwrap_or(false)
                 }
                 None => false,
             },

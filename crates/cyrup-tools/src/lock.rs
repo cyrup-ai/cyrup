@@ -9,11 +9,11 @@
 //! `FILE_MUTATION_LOCKS` below.
 
 use crate::error;
+use cyrup_core::keyed_lock::{KeyedGuard, KeyedLockMap, KeyedLocks};
 use cyrup_core::{CancelToken, ToolError};
 use dashmap::DashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
-use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// The one lock map for the whole process.
 ///
@@ -26,7 +26,7 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 /// [`crate::ops::FsOps::write_in_place`] truncates at `open` and then writes, so two unserialized
 /// mutators interleave their chunks and leave a file matching NEITHER payload, with no error to
 /// either caller. Hence: one map, process-wide, exactly like Pi's.
-static FILE_MUTATION_LOCKS: LazyLock<Arc<DashMap<PathBuf, Arc<Mutex<()>>>>> =
+static FILE_MUTATION_LOCKS: LazyLock<KeyedLockMap<PathBuf>> =
     LazyLock::new(|| Arc::new(DashMap::new()));
 
 /// Pi `isMissingPathError` (file-mutation-queue.ts:7-14): `error.code === "ENOENT" || error.code
@@ -57,7 +57,16 @@ fn is_missing_path_error(e: &std::io::Error) -> bool {
 /// prevent. Tests stay independent by keying on distinct (temp-dir) paths, which is what Pi's
 /// single-map design forces on its own tests too.
 pub struct FileMutationLocks {
-    map: Arc<DashMap<PathBuf, Arc<Mutex<()>>>>,
+    /// The same map `inner` is built over. Kept as a field, rather than reached through `inner`,
+    /// because the tests in this file assert on map membership directly — which is what lets the
+    /// move of the registry mechanics into `cyrup-core` be proven with no test changes at all.
+    /// Hence the gate: outside `cfg(test)` nothing reads it, and that is the intended state.
+    #[cfg_attr(not(test), allow(dead_code))]
+    map: KeyedLockMap<PathBuf>,
+    /// The registry mechanics (RAII guard, entry eviction, the drop-gap handling and the `biased`
+    /// cancel race) live in [`cyrup_core::keyed_lock`]; `cyrup-config` locks its own key domain
+    /// over the same code. What stays here is this crate's keying and error vocabulary.
+    inner: KeyedLocks<PathBuf>,
 }
 
 impl Default for FileMutationLocks {
@@ -69,63 +78,18 @@ impl Default for FileMutationLocks {
     }
 }
 
-/// RAII guard for a per-file mutation lock. On drop it releases the mutex and evicts the map entry
-/// once no other holder/waiter references it (Pi deletes the queue entry when it drains,
+/// RAII guard for a per-file mutation lock — [`cyrup_core::keyed_lock::KeyedGuard`] keyed by the
+/// resolved path. On drop it releases the mutex and evicts the map entry once no other
+/// holder/waiter references it (Pi deletes the queue entry when it drains,
 /// file-mutation-queue.ts:57-59), so the lock map cannot grow without bound.
-pub struct MutationGuard {
-    inner: Option<OwnedMutexGuard<()>>,
-    lock: Option<Arc<Mutex<()>>>,
-    map: Arc<DashMap<PathBuf, Arc<Mutex<()>>>>,
-    key: PathBuf,
-}
-
-impl Drop for MutationGuard {
-    fn drop(&mut self) {
-        // Release the mutex and drop our clone of the Arc *before* the eviction check, so the only
-        // remaining strong refs are the map's plus any genuinely active holders/waiters.
-        self.inner.take();
-        self.lock.take();
-        // `remove_if` runs the predicate while holding the shard lock, so a concurrent `guard()`
-        // that has just cloned the Arc is observed (strong_count > 1) and the entry is kept.
-        self.map.remove_if(&self.key, |_, v| Arc::strong_count(v) == 1);
-    }
-}
-
-/// Runs [`MutationGuard`]'s eviction check for an acquisition that never became a guard.
-///
-/// **This is a JS→Rust mechanism gap, not a tidiness measure.** Pi's `withFileMutationQueue`
-/// registers the key and releases it in a `finally` (file-mutation-queue.ts:53-60); a JS `async`
-/// function always settles, so the `finally` always runs and the key is always released. A Rust
-/// future can be dropped at ANY `.await`, and [`FileMutationLocks::guard`] inserts the map entry
-/// BEFORE awaiting the mutex. Both non-guard exits therefore leaked the entry: the
-/// `cancel.cancelled()` arm of the `select!` (an Esc during a `write`/`edit` that is queued behind
-/// another mutator on the same file) and an outright drop of the `guard()` future itself. The map
-/// is a process-global `static`, so nothing ever collected those entries; only a LATER successful
-/// lock on the identical path could, via [`MutationGuard::drop`].
-///
-/// Declared BEFORE the `lock` local in `guard` so that drop order (reverse declaration) releases
-/// the local `Arc` clone FIRST — otherwise the `strong_count == 1` predicate would always see this
-/// function's own clone and never evict.
-struct PendingLockEntry {
-    map: Arc<DashMap<PathBuf, Arc<Mutex<()>>>>,
-    key: PathBuf,
-}
-
-impl Drop for PendingLockEntry {
-    fn drop(&mut self) {
-        // Identical predicate to `MutationGuard::drop`: evict only when the map holds the last
-        // reference, so a concurrent waiter that has already cloned the `Arc` keeps its entry. On
-        // the SUCCESS path the returned `MutationGuard` holds a clone, so this is a no-op and the
-        // guard's own drop does the eviction.
-        self.map.remove_if(&self.key, |_, v| Arc::strong_count(v) == 1);
-    }
-}
+pub type MutationGuard = KeyedGuard<PathBuf>;
 
 impl FileMutationLocks {
     /// Attach to the process-global lock map (Pi's module-scope `fileMutationQueues`). This is a
     /// cheap `Arc` clone, not a fresh map — see the type docs.
     pub fn new() -> Self {
-        Self { map: Arc::clone(&FILE_MUTATION_LOCKS) }
+        let map = Arc::clone(&FILE_MUTATION_LOCKS);
+        Self { inner: KeyedLocks::new(Arc::clone(&map)), map }
     }
 
     /// Full-symlink-resolved key — a 1:1 port of Pi's `getMutationQueueKey`
@@ -163,35 +127,23 @@ impl FileMutationLocks {
 
     /// Acquire the lock for `path` for the whole read-modify-write. Cancel-aware: returns
     /// `Err(aborted)` if cancelled before acquisition — *always*, not just when the mutex happens
-    /// to be contended (see the `biased` note on the `select!` below).
+    /// to be contended.
+    ///
+    /// The registry mechanics are [`cyrup_core::keyed_lock::KeyedLocks::guard`]: the entry is
+    /// inserted before the mutex is awaited and evicted on every exit including a dropped future,
+    /// and the cancel arm is polled `biased` so a pre-cancelled token is deterministic rather than
+    /// a coin flip. What is this crate's own is the realpath keying above and the mapping of
+    /// `Cancelled` onto pi's "Operation aborted" — the abort check is the FIRST statement inside
+    /// pi's queue body (`throwIfAborted()`, write.ts:218 / edit.ts:327, defined at
+    /// write.ts:213-215), so an already-aborted `write`/`edit` must throw before any filesystem
+    /// call.
     pub async fn guard(
         &self,
         path: &Path,
         cancel: &CancelToken,
     ) -> Result<MutationGuard, ToolError> {
         let key = Self::key(path).await?;
-        // Declared before `lock` so it drops LAST — see `PendingLockEntry`.
-        let _pending = PendingLockEntry { map: Arc::clone(&self.map), key: key.clone() };
-        let lock = self.map.entry(key.clone()).or_insert_with(|| Arc::new(Mutex::new(()))).clone();
-        tokio::select! {
-            biased;
-            // `biased` is REQUIRED, not a micro-optimisation. An unbiased `select!` polls its ready
-            // arms in a RANDOM order, so when the token is already cancelled AND the mutex is
-            // uncontended both arms are ready on the first poll and the outcome is a coin flip:
-            // roughly half of all pre-cancelled acquisitions on an idle path returned
-            // `Ok(MutationGuard)` and let the mutation proceed. Pi has no such window — the abort
-            // check is the FIRST statement inside the queue body (`throwIfAborted()`,
-            // write.ts:218 / edit.ts:327, defined at write.ts:213-215) and runs before any
-            // filesystem call, so an already-aborted `write`/`edit` deterministically throws
-            // "Operation aborted". Polling the cancel arm first reproduces exactly that ordering.
-            _ = cancel.cancelled() => Err(error::aborted()),
-            g = lock.clone().lock_owned() => Ok(MutationGuard {
-                inner: Some(g),
-                lock: Some(lock),
-                map: Arc::clone(&self.map),
-                key,
-            }),
-        }
+        self.inner.guard(key, cancel).await.map_err(|_| error::aborted())
     }
 }
 
@@ -287,7 +239,10 @@ mod tests {
         let g = locks.guard(&path, &cancel).await.unwrap();
         assert!(locks.map.contains_key(&key));
         drop(g);
-        assert!(!locks.map.contains_key(&key), "drained entry must be evicted, not leaked");
+        assert!(
+            !locks.map.contains_key(&key),
+            "drained entry must be evicted, not leaked"
+        );
     }
 
     /// A cancelled acquisition must evict its map entry too. Pi's `finally`
@@ -313,7 +268,10 @@ mod tests {
         let err = locks.guard(&path, &cancel).await;
         assert!(err.is_err(), "a pre-cancelled acquisition must abort");
         // Still held by `held`, so the entry legitimately survives this drop.
-        assert!(locks.map.contains_key(&key), "an entry with a live holder must not be evicted");
+        assert!(
+            locks.map.contains_key(&key),
+            "an entry with a live holder must not be evicted"
+        );
 
         drop(held);
         assert!(!locks.map.contains_key(&key));
@@ -368,13 +326,17 @@ mod tests {
     async fn missing_path_falls_back_to_the_resolved_path() {
         let path = unique_path("enoent");
         assert!(!path.exists());
-        let key = FileMutationLocks::key(&path).await.expect("ENOENT is Pi's fallback, not an error");
+        let key = FileMutationLocks::key(&path)
+            .await
+            .expect("ENOENT is Pi's fallback, not an error");
         assert_eq!(key, path);
         // A path whose PARENT is a regular file is ENOTDIR, Pi's other caught kind.
         let file = unique_path("enotdir-parent");
         std::fs::write(&file, b"x").unwrap();
         let under = file.join("child.txt");
-        let key = FileMutationLocks::key(&under).await.expect("ENOTDIR is Pi's other fallback");
+        let key = FileMutationLocks::key(&under)
+            .await
+            .expect("ENOTDIR is Pi's other fallback");
         assert_eq!(key, under);
         let _ = std::fs::remove_file(&file);
     }
@@ -412,8 +374,14 @@ mod tests {
         let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755));
         let _ = std::fs::remove_dir_all(&dir);
 
-        assert!(msg.starts_with("EACCES: "), "must name the realpath errno, got: {msg}");
-        assert!(msg.contains(&*target.to_string_lossy()), "must name the path, got: {msg}");
+        assert!(
+            msg.starts_with("EACCES: "),
+            "must name the realpath errno, got: {msg}"
+        );
+        assert!(
+            msg.contains(&*target.to_string_lossy()),
+            "must name the path, got: {msg}"
+        );
     }
 
     /// Different paths must NOT serialize against each other even though they now share one map
@@ -422,7 +390,10 @@ mod tests {
     async fn distinct_paths_do_not_serialize() {
         let locks = Arc::new(FileMutationLocks::new());
         let cancel = CancelToken::new();
-        let held = locks.guard(&unique_path("parallel-a"), &cancel).await.unwrap();
+        let held = locks
+            .guard(&unique_path("parallel-a"), &cancel)
+            .await
+            .unwrap();
         // Would hang forever if a shared map meant a shared lock.
         let other = tokio::time::timeout(
             std::time::Duration::from_secs(5),

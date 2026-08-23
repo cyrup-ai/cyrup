@@ -233,13 +233,16 @@ pub fn trust_prompt_callback(dirs: &ConfigDirs) -> cyrup_session_svc::TrustPromp
     let theme = crate::startup_theme(dirs);
     let (keymap, _) = crate::startup_keymaps(dirs);
     Arc::new(move |options, saved| {
-        match crate::run_trust_prompt(&theme, &keymap, &cwd, options, saved, &store) {
-            Ok(choice) => choice,
-            Err(e) => {
-                eprintln!("Error: project trust prompt failed: {e}");
-                None
+        let (theme, keymap, cwd, store) = (theme.clone(), keymap.clone(), cwd.clone(), store.clone());
+        Box::pin(async move {
+            match crate::run_trust_prompt(&theme, &keymap, &cwd, options, saved, &store).await {
+                Ok(choice) => choice,
+                Err(e) => {
+                    eprintln!("Error: project trust prompt failed: {e}");
+                    None
+                }
             }
-        }
+        })
     })
 }
 

@@ -275,8 +275,8 @@ fn confirm_values_map_back_to_the_upstream_options() {
 
 /// Opting in writes the theme, `enableAnalytics: true` and a freshly minted `trackingId`
 /// (`expect(manager.getTrackingId()).toMatch(/^[0-9a-f-]{36}$/)`, first-time-setup.test.ts:63-68).
-#[test]
-fn submitting_the_wizard_persists_theme_and_analytics_opt_in() {
+#[tokio::test]
+async fn submitting_the_wizard_persists_theme_and_analytics_opt_in() {
     let root = tempfile::tempdir().unwrap();
     let dirs = dirs_under(root.path());
     std::fs::create_dir_all(&dirs.agent_dir).unwrap();
@@ -289,7 +289,7 @@ fn submitting_the_wizard_persists_theme_and_analytics_opt_in() {
             share_analytics: true,
         },
     )
-    .unwrap();
+    .await.unwrap();
 
     let written = read_settings(&dirs);
     assert_eq!(written["theme"], serde_json::json!("light"));
@@ -313,8 +313,8 @@ fn submitting_the_wizard_persists_theme_and_analytics_opt_in() {
 
 /// Opting out writes the flag but mints NO tracking identifier
 /// (`it("does not generate a tracking identifier on opt-out")`, first-time-setup.test.ts:73-79).
-#[test]
-fn opting_out_persists_the_flag_without_a_tracking_id() {
+#[tokio::test]
+async fn opting_out_persists_the_flag_without_a_tracking_id() {
     let root = tempfile::tempdir().unwrap();
     let dirs = dirs_under(root.path());
     std::fs::create_dir_all(&dirs.agent_dir).unwrap();
@@ -327,7 +327,7 @@ fn opting_out_persists_the_flag_without_a_tracking_id() {
             share_analytics: false,
         },
     )
-    .unwrap();
+    .await.unwrap();
 
     let written = read_settings(&dirs);
     assert_eq!(written["theme"], serde_json::json!("dark"));

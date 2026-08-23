@@ -2,13 +2,18 @@
 //!
 //! Every test here pins a property read out of `pi/packages/coding-agent/src/core/tools/**` at
 //! **v0.84.1** and names the file:line it came from. Each was RED before the change it guards.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use crate::FileMutationLocks;
 use crate::config::{EditOpts, FindOpts, GrepOpts, LsOpts, WriteOpts};
 use crate::ops::local::LocalFs;
 use crate::ops::{Access, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
 use crate::tools::{EditTool, FindTool, GrepTool, LsTool, WriteTool};
-use crate::FileMutationLocks;
 use cyrup_core::{
     CancelToken, Content, EventStream, ExecMode, Tool, ToolCallId, ToolError, ToolRenderKind,
     ToolResult, ToolUpdate, ToolUpdateSink,
@@ -32,11 +37,21 @@ fn first_text(r: &ToolResult) -> String {
 }
 
 fn edit_tool(cwd: PathBuf) -> EditTool {
-    EditTool::new(Arc::new(LocalFs), Arc::new(FileMutationLocks::new()), cwd, EditOpts::default())
+    EditTool::new(
+        Arc::new(LocalFs),
+        Arc::new(FileMutationLocks::new()),
+        cwd,
+        EditOpts::default(),
+    )
 }
 
 fn write_tool(cwd: PathBuf) -> WriteTool {
-    WriteTool::new(Arc::new(LocalFs), Arc::new(FileMutationLocks::new()), cwd, WriteOpts::default())
+    WriteTool::new(
+        Arc::new(LocalFs),
+        Arc::new(FileMutationLocks::new()),
+        cwd,
+        WriteOpts::default(),
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -63,8 +78,14 @@ fn mutators_do_not_declare_sequential_execution() {
 #[test]
 fn edit_declares_self_rendering_and_the_others_do_not() {
     let cwd = std::env::temp_dir();
-    assert_eq!(edit_tool(cwd.clone()).render_kind(), ToolRenderKind::SelfRendered);
-    assert_eq!(write_tool(cwd.clone()).render_kind(), ToolRenderKind::Default);
+    assert_eq!(
+        edit_tool(cwd.clone()).render_kind(),
+        ToolRenderKind::SelfRendered
+    );
+    assert_eq!(
+        write_tool(cwd.clone()).render_kind(),
+        ToolRenderKind::Default
+    );
     assert_eq!(
         GrepTool::new(Arc::new(LocalFs), cwd.clone(), GrepOpts::default()).render_kind(),
         ToolRenderKind::Default
@@ -109,7 +130,10 @@ async fn edit_access_failure_body_is_pis_bare_errno_token() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "Could not edit file: missing.txt. Error code: ENOENT.");
+    assert_eq!(
+        err.to_string(),
+        "Could not edit file: missing.txt. Error code: ENOENT."
+    );
 }
 
 /// The EACCES arm of the same ternary — a class the model acts on differently from ENOENT.
@@ -139,7 +163,10 @@ async fn edit_access_failure_reports_eacces_distinctly() {
         .await
         .unwrap_err();
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
-    assert_eq!(err.to_string(), "Could not edit file: ro.txt. Error code: EACCES.");
+    assert_eq!(
+        err.to_string(),
+        "Could not edit file: ro.txt. Error code: EACCES."
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -164,16 +191,28 @@ async fn ls_readdir_failure_carries_pis_cannot_read_directory_prefix() {
         return; // running as root
     }
 
-    let ls = LsTool::new(Arc::new(LocalFs), dir.path().to_path_buf(), LsOpts::default());
+    let ls = LsTool::new(
+        Arc::new(LocalFs),
+        dir.path().to_path_buf(),
+        LsOpts::default(),
+    );
     let err = ls
-        .execute(cid(), serde_json::json!({ "path": "locked" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "locked" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     let _ = std::fs::set_permissions(&d, std::fs::Permissions::from_mode(0o755));
     let msg = err.to_string();
     assert!(msg.starts_with("Cannot read directory: "), "got: {msg}");
     // The body is `e.message`, which on the Node side leads with the errno code.
-    assert!(msg.contains("EACCES"), "body must be Node-shaped, got: {msg}");
+    assert!(
+        msg.contains("EACCES"),
+        "body must be Node-shaped, got: {msg}"
+    );
     assert!(!msg.starts_with("Path not found:"), "got: {msg}");
     assert!(!msg.starts_with("Not a directory:"), "got: {msg}");
 }
@@ -227,9 +266,16 @@ async fn write_rechecks_cancellation_after_the_write_lands() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
     let cancel = CancelToken::new();
-    let fs = Arc::new(CancelOnWrite { inner: LocalFs, cancel: cancel.clone() });
-    let write =
-        WriteTool::new(fs, Arc::new(FileMutationLocks::new()), cwd.clone(), WriteOpts::default());
+    let fs = Arc::new(CancelOnWrite {
+        inner: LocalFs,
+        cancel: cancel.clone(),
+    });
+    let write = WriteTool::new(
+        fs,
+        Arc::new(FileMutationLocks::new()),
+        cwd.clone(),
+        WriteOpts::default(),
+    );
 
     let err = write
         .execute(
@@ -242,7 +288,10 @@ async fn write_rechecks_cancellation_after_the_write_lands() {
         .expect_err("a cancel observed after the write must not report success");
     assert_eq!(err.to_string(), "Operation aborted");
     // Pi leaves the file exactly as the write left it.
-    assert_eq!(std::fs::read_to_string(cwd.join("out.txt")).unwrap(), "payload\n");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("out.txt")).unwrap(),
+        "payload\n"
+    );
 }
 
 /// `edit.ts:352` is the sibling check — `throwIfAborted()` immediately after
@@ -253,9 +302,16 @@ async fn edit_rechecks_cancellation_after_the_write_lands() {
     let cwd = dir.path().to_path_buf();
     std::fs::write(cwd.join("f.txt"), "hello\n").unwrap();
     let cancel = CancelToken::new();
-    let fs = Arc::new(CancelOnWrite { inner: LocalFs, cancel: cancel.clone() });
-    let edit =
-        EditTool::new(fs, Arc::new(FileMutationLocks::new()), cwd.clone(), EditOpts::default());
+    let fs = Arc::new(CancelOnWrite {
+        inner: LocalFs,
+        cancel: cancel.clone(),
+    });
+    let edit = EditTool::new(
+        fs,
+        Arc::new(FileMutationLocks::new()),
+        cwd.clone(),
+        EditOpts::default(),
+    );
 
     let err = edit
         .execute(
@@ -357,10 +413,7 @@ impl FsOps for CountingWalk {
     async fn read(&self, path: &Path) -> Result<Vec<u8>, ToolError> {
         self.inner.read(path).await
     }
-    async fn read_stream(
-        &self,
-        path: &Path,
-    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+    async fn read_stream(&self, path: &Path) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
         self.inner.read_stream(path).await
     }
     async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
@@ -401,7 +454,10 @@ fn tree_of(n: usize) -> tempfile::TempDir {
 async fn find_stops_walking_once_the_limit_is_reached() {
     let dir = tree_of(300);
     let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let fs = Arc::new(CountingWalk { inner: LocalFs, pulled: Arc::clone(&pulled) });
+    let fs = Arc::new(CountingWalk {
+        inner: LocalFs,
+        pulled: Arc::clone(&pulled),
+    });
     let find = FindTool::new(fs, dir.path().to_path_buf(), FindOpts::default());
 
     let r = find
@@ -418,7 +474,10 @@ async fn find_stops_walking_once_the_limit_is_reached() {
     let rows = rows.split_once("\n\n[").map_or(rows.as_str(), |(a, _)| a);
     assert_eq!(rows.lines().count(), 5, "got: {rows}");
     let n = pulled.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(n < 300, "the walk must be bounded by the limit, not by the tree ({n} pulled)");
+    assert!(
+        n < 300,
+        "the walk must be bounded by the limit, not by the tree ({n} pulled)"
+    );
 }
 
 /// TOOL-033 — the same for `grep`. Pi's handler sets `matchLimitReached` and calls
@@ -431,7 +490,10 @@ async fn find_stops_walking_once_the_limit_is_reached() {
 async fn grep_stops_walking_once_the_match_limit_is_reached() {
     let dir = tree_of(300);
     let pulled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let fs = Arc::new(CountingWalk { inner: LocalFs, pulled: Arc::clone(&pulled) });
+    let fs = Arc::new(CountingWalk {
+        inner: LocalFs,
+        pulled: Arc::clone(&pulled),
+    });
     let grep = GrepTool::new(fs, dir.path().to_path_buf(), GrepOpts::default());
 
     let r = grep
@@ -449,9 +511,15 @@ async fn grep_stops_walking_once_the_match_limit_is_reached() {
     assert_eq!(rows.lines().count(), 5, "got: {text}");
     // The `N matches limit reached` notice (grep.ts:345-350) must still fire under the new
     // strategy — that is the half of the behaviour the restructure must not lose.
-    assert!(text.contains("5 matches limit reached. Use limit=10 for more"), "got: {text}");
+    assert!(
+        text.contains("5 matches limit reached. Use limit=10 for more"),
+        "got: {text}"
+    );
     let n = pulled.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(n < 300, "the walk must be bounded by the limit, not by the tree ({n} pulled)");
+    assert!(
+        n < 300,
+        "the walk must be bounded by the limit, not by the tree ({n} pulled)"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -520,13 +588,11 @@ struct StreamOnlySearch {
 #[async_trait::async_trait]
 impl FsOps for StreamOnlySearch {
     async fn read(&self, path: &Path) -> Result<Vec<u8>, ToolError> {
-        self.whole_file_reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.whole_file_reads
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.inner.read(path).await
     }
-    async fn read_stream(
-        &self,
-        path: &Path,
-    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+    async fn read_stream(&self, path: &Path) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
         self.inner.read_stream(path).await
     }
     async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
@@ -562,11 +628,19 @@ async fn grep_search_path_never_materializes_a_candidate() {
     std::fs::write(cwd.join("c.txt"), "also nothing\n").unwrap();
 
     let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let fs = Arc::new(StreamOnlySearch { inner: LocalFs, whole_file_reads: Arc::clone(&reads) });
+    let fs = Arc::new(StreamOnlySearch {
+        inner: LocalFs,
+        whole_file_reads: Arc::clone(&reads),
+    });
     let grep = GrepTool::new(fs, cwd, GrepOpts::default());
 
     let r = grep
-        .execute(cid(), serde_json::json!({ "pattern": "NEEDLE" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "NEEDLE" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert_eq!(first_text(&r), "a.txt:2: NEEDLE");
@@ -589,7 +663,10 @@ async fn grep_context_path_reads_only_files_that_matched() {
     std::fs::write(cwd.join("c.txt"), "also nothing\n").unwrap();
 
     let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let fs = Arc::new(StreamOnlySearch { inner: LocalFs, whole_file_reads: Arc::clone(&reads) });
+    let fs = Arc::new(StreamOnlySearch {
+        inner: LocalFs,
+        whole_file_reads: Arc::clone(&reads),
+    });
     let grep = GrepTool::new(fs, cwd, GrepOpts::default());
 
     let r = grep
@@ -601,7 +678,10 @@ async fn grep_context_path_reads_only_files_that_matched() {
         )
         .await
         .unwrap();
-    assert_eq!(first_text(&r), "a.txt-1- one\na.txt:2: NEEDLE\na.txt-3- three");
+    assert_eq!(
+        first_text(&r),
+        "a.txt-1- one\na.txt:2: NEEDLE\na.txt-3- three"
+    );
     assert_eq!(
         reads.load(std::sync::atomic::Ordering::SeqCst),
         1,
@@ -631,7 +711,10 @@ fn truncation_details_serialize_in_pis_shape() {
 
     // (1) An untruncated result must still carry an explicit `truncatedBy: null`.
     let short = truncate_head("one\ntwo\n", TruncOpts::new(2000, 50 * 1024));
-    assert!(!short.info.truncated, "fixture must be untruncated for the null case to be reachable");
+    assert!(
+        !short.info.truncated,
+        "fixture must be untruncated for the null case to be reachable"
+    );
     let v = serde_json::to_value(&short.info).unwrap();
     let obj = v.as_object().unwrap();
     assert!(
@@ -656,7 +739,8 @@ fn truncation_details_serialize_in_pis_shape() {
     );
     let v = serde_json::to_value(&bytes_only.info).unwrap();
     assert_eq!(
-        v["maxLines"], serde_json::json!(9_007_199_254_740_991u64),
+        v["maxLines"],
+        serde_json::json!(9_007_199_254_740_991u64),
         "the serialized record is what reaches the session file. Got: {v}"
     );
 
@@ -699,10 +783,12 @@ fn bash_prompt_guideline_deltas_are_tagged_cyrup_delta() {
 
     // Presence before absence: anchor on the real declaration, so a renamed/moved method fails
     // loudly here instead of making every assertion below vacuous.
-    let guidelines_at =
-        src.find("fn prompt_guidelines(").expect("`BashTool::prompt_guidelines` still exists");
-    let snippet_at =
-        src.find("fn prompt_snippet(").expect("`BashTool::prompt_snippet` still exists");
+    let guidelines_at = src
+        .find("fn prompt_guidelines(")
+        .expect("`BashTool::prompt_guidelines` still exists");
+    let snippet_at = src
+        .find("fn prompt_snippet(")
+        .expect("`BashTool::prompt_snippet` still exists");
     assert!(
         snippet_at < guidelines_at,
         "the doc block scanned below is the one BETWEEN prompt_snippet and prompt_guidelines"
@@ -717,7 +803,10 @@ fn bash_prompt_guideline_deltas_are_tagged_cyrup_delta() {
         "the guideline under audit must still be the CYRUP_* one"
     );
 
-    let tags: Vec<&str> = doc.match_indices("[CYRUP-DELTA").map(|(i, _)| &doc[i..]).collect();
+    let tags: Vec<&str> = doc
+        .match_indices("[CYRUP-DELTA")
+        .map(|(i, _)| &doc[i..])
+        .collect();
     assert_eq!(
         tags.len(),
         2,
@@ -732,13 +821,21 @@ fn bash_prompt_guideline_deltas_are_tagged_cyrup_delta() {
          it as already-ported-early rather than as already-done-at-tag"
     );
     assert!(
-        doc.contains("[CYRUP-DELTA — deliberate, value only; the variable-family name inside the \
-                      string]"),
+        doc.contains(
+            "[CYRUP-DELTA — deliberate, value only; the variable-family name inside the \
+                      string]"
+        ),
         "the PI_* -> CYRUP_* rename must be tagged as a deliberate value-only delta"
     );
     // Each tag must name the upstream symbol it diverges from (the `[CYRUP-DELTA]` contract).
-    assert!(doc.contains("bash.ts:47"), "the wording delta must cite v0.84.1 bash.ts:47");
-    assert!(doc.contains("bash.ts:330"), "the wording delta must cite v0.83.0 bash.ts:330");
+    assert!(
+        doc.contains("bash.ts:47"),
+        "the wording delta must cite v0.84.1 bash.ts:47"
+    );
+    assert!(
+        doc.contains("bash.ts:330"),
+        "the wording delta must cite v0.83.0 bash.ts:330"
+    );
 }
 
 /// TOOL-044 limb 3 — `details.truncation.content`.
@@ -759,11 +856,14 @@ fn bash_prompt_guideline_deltas_are_tagged_cyrup_delta() {
 /// branch (`truncate.ts:87-101`) returns the input content verbatim inside the same object.
 #[test]
 fn truncation_details_carry_pis_content_field() {
-    use crate::truncate::{truncate_head, truncate_tail, TruncOpts};
+    use crate::truncate::{TruncOpts, truncate_head, truncate_tail};
 
     // (1) Untruncated: pi returns the INPUT verbatim, trailing newline included.
     let short = truncate_head("one\ntwo\n", TruncOpts::new(2000, 50 * 1024));
-    assert!(!short.info.truncated, "fixture must be untruncated for this branch to be reachable");
+    assert!(
+        !short.info.truncated,
+        "fixture must be untruncated for this branch to be reachable"
+    );
     let v = serde_json::to_value(&short.info).unwrap();
     assert_eq!(
         v["content"],
@@ -797,5 +897,8 @@ fn truncation_details_carry_pis_content_field() {
     let mut legacy = serde_json::to_value(&short.info).unwrap();
     legacy.as_object_mut().unwrap().remove("content");
     let back: crate::truncate::Truncation = serde_json::from_value(legacy).unwrap();
-    assert_eq!(back.content, "", "the read side defaults; the write side never omits it");
+    assert_eq!(
+        back.content, "",
+        "the read side defaults; the write side never omits it"
+    );
 }

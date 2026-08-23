@@ -115,7 +115,7 @@ struct Outcome {
 }
 
 /// Run one management action against the CURRENT on-disk state.
-fn act(base: &Path, action: &str, agent: Option<&str>, scope: Option<&str>) -> Outcome {
+async fn act(base: &Path, action: &str, agent: Option<&str>, scope: Option<&str>) -> Outcome {
     let cfg = cfg_from_disk(base);
     let req = ManagementRequest {
         agent,
@@ -125,7 +125,7 @@ fn act(base: &Path, action: &str, agent: Option<&str>, scope: Option<&str>) -> O
         current_session_model: None,
         proactive_skills: None,
     };
-    let outcome = handle_management_action(&cfg, action, &req).expect("management action runs");
+    let outcome = handle_management_action(&cfg, action, &req).await.expect("management action runs");
     Outcome { text: outcome.text, is_error: outcome.is_error }
 }
 
@@ -159,8 +159,8 @@ fn settings_json(path: &Path) -> serde_json::Value {
 // eject
 // -------------------------------------------------------------------------------------------
 
-#[test]
-fn eject_copies_the_bundled_file_verbatim_and_the_copy_shadows_the_builtin() {
+#[tokio::test]
+async fn eject_copies_the_bundled_file_verbatim_and_the_copy_shadows_the_builtin() {
     let tmp = fixture();
     let base = tmp.path();
     assert_eq!(
@@ -169,7 +169,7 @@ fn eject_copies_the_bundled_file_verbatim_and_the_copy_shadows_the_builtin() {
         "precondition: scout resolves to the bundled tier before the eject"
     );
 
-    let outcome = act(base, "eject", Some("scout"), None);
+    let outcome = act(base, "eject", Some("scout"), None).await;
     assert!(!outcome.is_error, "{}", outcome.text);
 
     // 1. The bytes are on disk, unaltered — including the frontmatter key and the comment a
@@ -188,14 +188,14 @@ fn eject_copies_the_bundled_file_verbatim_and_the_copy_shadows_the_builtin() {
     assert!(outcome.text.contains("Ejected agent 'scout' from builtin to user scope"), "{}", outcome.text);
 }
 
-#[test]
-fn eject_into_project_scope_writes_the_project_dir_and_wins_over_a_user_copy() {
+#[tokio::test]
+async fn eject_into_project_scope_writes_the_project_dir_and_wins_over_a_user_copy() {
     let tmp = fixture();
     let base = tmp.path();
     // A user-scope copy already exists; a project eject must still land, and must win the merge.
     write_agent(&user_agents_dir(base), "scout", "user scout");
 
-    let outcome = act(base, "eject", Some("scout"), Some("project"));
+    let outcome = act(base, "eject", Some("scout"), Some("project")).await;
     assert!(!outcome.is_error, "{}", outcome.text);
     let ejected = project_agents_dir(base).join("scout.md");
     assert_eq!(std::fs::read_to_string(&ejected).unwrap(), SCOUT_BUILTIN_FILE);
@@ -205,14 +205,14 @@ fn eject_into_project_scope_writes_the_project_dir_and_wins_over_a_user_copy() {
     assert_eq!(after.file_path, ejected);
 }
 
-#[test]
-fn eject_refuses_to_clobber_an_existing_custom_agent_in_the_target_scope() {
+#[tokio::test]
+async fn eject_refuses_to_clobber_an_existing_custom_agent_in_the_target_scope() {
     let tmp = fixture();
     let base = tmp.path();
     write_agent(&user_agents_dir(base), "scout", "hand-written user scout");
     let before = std::fs::read_to_string(user_agents_dir(base).join("scout.md")).unwrap();
 
-    let outcome = act(base, "eject", Some("scout"), Some("user"));
+    let outcome = act(base, "eject", Some("scout"), Some("user")).await;
     assert!(outcome.is_error, "{}", outcome.text);
     assert!(
         outcome.text.contains("is already a custom user agent at"),
@@ -226,13 +226,13 @@ fn eject_refuses_to_clobber_an_existing_custom_agent_in_the_target_scope() {
     );
 }
 
-#[test]
-fn eject_refuses_an_agent_that_has_no_bundled_source() {
+#[tokio::test]
+async fn eject_refuses_an_agent_that_has_no_bundled_source() {
     let tmp = fixture();
     let base = tmp.path();
     write_agent(&user_agents_dir(base), "custom-only", "no bundled default");
 
-    let outcome = act(base, "eject", Some("custom-only"), None);
+    let outcome = act(base, "eject", Some("custom-only"), None).await;
     assert!(outcome.is_error, "{}", outcome.text);
     assert!(
         outcome.text.contains("not found or is not a bundled/package agent"),
@@ -249,13 +249,13 @@ fn eject_refuses_an_agent_that_has_no_bundled_source() {
 // disable / enable
 // -------------------------------------------------------------------------------------------
 
-#[test]
-fn disable_actually_removes_the_agent_from_the_delegation_view() {
+#[tokio::test]
+async fn disable_actually_removes_the_agent_from_the_delegation_view() {
     let tmp = fixture();
     let base = tmp.path();
     assert!(delegatable_names(base).contains(&"scout".to_string()), "precondition");
 
-    let outcome = act(base, "disable", Some("scout"), None);
+    let outcome = act(base, "disable", Some("scout"), None).await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert!(outcome.text.contains("Disabled agent 'scout' via user settings override"), "{}", outcome.text);
 
@@ -269,8 +269,8 @@ fn disable_actually_removes_the_agent_from_the_delegation_view() {
     assert_eq!(settings["subagents"]["agentOverrides"]["scout"]["disabled"], serde_json::json!(true));
 }
 
-#[test]
-fn enable_restores_the_agent_and_preserves_its_unrelated_overrides() {
+#[tokio::test]
+async fn enable_restores_the_agent_and_preserves_its_unrelated_overrides() {
     let tmp = fixture();
     let base = tmp.path();
     // A pre-existing user override that both disables scout AND pins its model.
@@ -281,7 +281,7 @@ fn enable_restores_the_agent_and_preserves_its_unrelated_overrides() {
     .unwrap();
     assert!(!delegatable_names(base).contains(&"scout".to_string()), "precondition: scout starts disabled");
 
-    let outcome = act(base, "enable", Some("scout"), None);
+    let outcome = act(base, "enable", Some("scout"), None).await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert!(outcome.text.contains("Enabled agent 'scout' (removed disabled override at"), "{}", outcome.text);
 
@@ -297,18 +297,18 @@ fn enable_restores_the_agent_and_preserves_its_unrelated_overrides() {
     assert!(settings["subagents"]["agentOverrides"]["scout"].get("disabled").is_none());
 }
 
-#[test]
-fn enable_on_an_already_enabled_agent_is_a_success_and_writes_nothing() {
+#[tokio::test]
+async fn enable_on_an_already_enabled_agent_is_a_success_and_writes_nothing() {
     let tmp = fixture();
     let base = tmp.path();
-    let outcome = act(base, "enable", Some("scout"), None);
+    let outcome = act(base, "enable", Some("scout"), None).await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert_eq!(outcome.text, "Agent 'scout' is already enabled.");
     assert!(!user_settings_path(base).exists(), "a no-op enable must not create a settings file");
 }
 
-#[test]
-fn disable_reports_the_winning_scope_when_a_project_override_overrules_the_write() {
+#[tokio::test]
+async fn disable_reports_the_winning_scope_when_a_project_override_overrules_the_write() {
     let tmp = fixture();
     let base = tmp.path();
     // A project-scope override explicitly keeps scout enabled; project beats user (R-SA-012), so a
@@ -319,7 +319,7 @@ fn disable_reports_the_winning_scope_when_a_project_override_overrules_the_write
     )
     .unwrap();
 
-    let outcome = act(base, "disable", Some("scout"), Some("user"));
+    let outcome = act(base, "disable", Some("scout"), Some("user")).await;
     assert!(outcome.is_error, "a disable that did not take effect must be reported as an error");
     assert!(
         outcome.text.contains("but the agent is still enabled")
@@ -331,8 +331,8 @@ fn disable_reports_the_winning_scope_when_a_project_override_overrules_the_write
     assert!(delegatable_names(base).contains(&"scout".to_string()));
 }
 
-#[test]
-fn enable_names_the_cross_scope_override_that_still_disables_the_agent() {
+#[tokio::test]
+async fn enable_names_the_cross_scope_override_that_still_disables_the_agent() {
     let tmp = fixture();
     let base = tmp.path();
     std::fs::write(
@@ -346,7 +346,7 @@ fn enable_names_the_cross_scope_override_that_still_disables_the_agent() {
     )
     .unwrap();
 
-    let outcome = act(base, "enable", Some("scout"), Some("user"));
+    let outcome = act(base, "enable", Some("scout"), Some("user")).await;
     assert!(outcome.is_error, "{}", outcome.text);
     assert!(
         outcome.text.contains("is still disabled via a project scope override at")
@@ -357,21 +357,21 @@ fn enable_names_the_cross_scope_override_that_still_disables_the_agent() {
     assert!(!delegatable_names(base).contains(&"scout".to_string()), "the claim is true");
 
     // Following the instruction actually works — the whole point of naming the scope.
-    let followed = act(base, "enable", Some("scout"), Some("project"));
+    let followed = act(base, "enable", Some("scout"), Some("project")).await;
     assert!(!followed.is_error, "{}", followed.text);
     assert!(delegatable_names(base).contains(&"scout".to_string()));
 }
 
-#[test]
-fn disable_rejects_an_unknown_agent_and_an_invalid_scope_without_writing() {
+#[tokio::test]
+async fn disable_rejects_an_unknown_agent_and_an_invalid_scope_without_writing() {
     let tmp = fixture();
     let base = tmp.path();
 
-    let unknown = act(base, "disable", Some("nope"), None);
+    let unknown = act(base, "disable", Some("nope"), None).await;
     assert!(unknown.is_error);
     assert!(unknown.text.starts_with("Agent 'nope' not found. Available: scout, worker."), "{}", unknown.text);
 
-    let bad_scope = act(base, "disable", Some("scout"), Some("both"));
+    let bad_scope = act(base, "disable", Some("scout"), Some("both")).await;
     assert!(bad_scope.is_error);
     assert_eq!(bad_scope.text, "agentScope must be 'user' or 'project' for disable.");
 
@@ -383,8 +383,8 @@ fn disable_rejects_an_unknown_agent_and_an_invalid_scope_without_writing() {
 // reset
 // -------------------------------------------------------------------------------------------
 
-#[test]
-fn reset_removes_both_the_custom_file_and_the_settings_override() {
+#[tokio::test]
+async fn reset_removes_both_the_custom_file_and_the_settings_override() {
     let tmp = fixture();
     let base = tmp.path();
     // Customize scout both ways: a shadowing user file AND a settings override pinning its model.
@@ -398,7 +398,7 @@ fn reset_removes_both_the_custom_file_and_the_settings_override() {
     assert_eq!(before.source, AgentSource::User, "precondition: the custom file wins");
     assert_eq!(before.model.as_ref().map(cyrup_core::ModelId::as_str), Some("anthropic/pinned"));
 
-    let outcome = act(base, "reset", Some("scout"), None);
+    let outcome = act(base, "reset", Some("scout"), None).await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert!(outcome.text.contains("Deleted custom user agent file at"), "{}", outcome.text);
     assert!(outcome.text.contains("Removed user settings override at"), "{}", outcome.text);
@@ -417,8 +417,8 @@ fn reset_removes_both_the_custom_file_and_the_settings_override() {
     assert_eq!(after.description, "bundled scout persona");
 }
 
-#[test]
-fn reset_re_enables_an_agent_that_a_settings_override_had_disabled() {
+#[tokio::test]
+async fn reset_re_enables_an_agent_that_a_settings_override_had_disabled() {
     let tmp = fixture();
     let base = tmp.path();
     std::fs::write(
@@ -428,17 +428,17 @@ fn reset_re_enables_an_agent_that_a_settings_override_had_disabled() {
     .unwrap();
     assert!(!delegatable_names(base).contains(&"scout".to_string()), "precondition");
 
-    let outcome = act(base, "reset", Some("scout"), None);
+    let outcome = act(base, "reset", Some("scout"), None).await;
     assert!(!outcome.is_error, "{}", outcome.text);
     assert!(delegatable_names(base).contains(&"scout".to_string()), "reset must restore delegatability");
 }
 
-#[test]
-fn reset_with_nothing_to_reset_is_a_success_and_hints_at_the_other_scope() {
+#[tokio::test]
+async fn reset_with_nothing_to_reset_is_a_success_and_hints_at_the_other_scope() {
     let tmp = fixture();
     let base = tmp.path();
     // Nothing at all customized: plain success, no hint.
-    let plain = act(base, "reset", Some("worker"), None);
+    let plain = act(base, "reset", Some("worker"), None).await;
     assert!(!plain.is_error, "{}", plain.text);
     assert_eq!(
         plain.text,
@@ -447,7 +447,7 @@ fn reset_with_nothing_to_reset_is_a_success_and_hints_at_the_other_scope() {
 
     // Customization exists in the OTHER scope: still a success, but it says where to look.
     write_agent(&project_agents_dir(base), "worker", "project worker");
-    let hinted = act(base, "reset", Some("worker"), Some("user"));
+    let hinted = act(base, "reset", Some("worker"), Some("user")).await;
     assert!(!hinted.is_error, "{}", hinted.text);
     assert!(
         hinted.text.contains("Customization exists in project scope; specify agentScope: 'project' to reset it."),
@@ -460,19 +460,19 @@ fn reset_with_nothing_to_reset_is_a_success_and_hints_at_the_other_scope() {
     );
 
     // And following the hint really removes it.
-    let followed = act(base, "reset", Some("worker"), Some("project"));
+    let followed = act(base, "reset", Some("worker"), Some("project")).await;
     assert!(!followed.is_error, "{}", followed.text);
     assert!(!project_agents_dir(base).join("worker.md").exists());
     assert_eq!(managed_agent(base, "worker").expect("worker discovered").source, AgentSource::Builtin);
 }
 
-#[test]
-fn reset_refuses_an_agent_with_no_bundled_default_and_points_at_delete() {
+#[tokio::test]
+async fn reset_refuses_an_agent_with_no_bundled_default_and_points_at_delete() {
     let tmp = fixture();
     let base = tmp.path();
     write_agent(&user_agents_dir(base), "custom-only", "no bundled default");
 
-    let outcome = act(base, "reset", Some("custom-only"), None);
+    let outcome = act(base, "reset", Some("custom-only"), None).await;
     assert!(outcome.is_error, "{}", outcome.text);
     assert_eq!(
         outcome.text,
@@ -488,13 +488,13 @@ fn reset_refuses_an_agent_with_no_bundled_default_and_points_at_delete() {
 // Cross-action: the four compose the way a real customize/undo session uses them
 // -------------------------------------------------------------------------------------------
 
-#[test]
-fn eject_customize_reset_round_trips_back_to_the_bundled_default() {
+#[tokio::test]
+async fn eject_customize_reset_round_trips_back_to_the_bundled_default() {
     let tmp = fixture();
     let base = tmp.path();
 
     // eject -> edit the copy -> the edit is live
-    assert!(!act(base, "eject", Some("scout"), None).is_error);
+    assert!(!act(base, "eject", Some("scout"), None).await.is_error);
     write_agent(&user_agents_dir(base), "scout", "edited after eject");
     assert_eq!(
         managed_agent(base, "scout").expect("scout").description,
@@ -502,13 +502,13 @@ fn eject_customize_reset_round_trips_back_to_the_bundled_default() {
     );
 
     // disable -> gone from delegation; enable -> back
-    assert!(!act(base, "disable", Some("scout"), None).is_error);
+    assert!(!act(base, "disable", Some("scout"), None).await.is_error);
     assert!(!delegatable_names(base).contains(&"scout".to_string()));
-    assert!(!act(base, "enable", Some("scout"), None).is_error);
+    assert!(!act(base, "enable", Some("scout"), None).await.is_error);
     assert!(delegatable_names(base).contains(&"scout".to_string()));
 
     // reset -> the bundled persona is back, verbatim
-    assert!(!act(base, "reset", Some("scout"), None).is_error);
+    assert!(!act(base, "reset", Some("scout"), None).await.is_error);
     let final_state = managed_agent(base, "scout").expect("scout");
     assert_eq!(final_state.source, AgentSource::Builtin);
     assert_eq!(final_state.description, "bundled scout persona");

@@ -47,12 +47,20 @@ impl TraversalFs {
     pub fn new(inner: Arc<dyn FsOps>, root: impl Into<PathBuf>) -> Self {
         let root = normalize_lexical(&root.into());
         let canonical_root = std::fs::canonicalize(&root).ok();
-        Self { inner, root, canonical_root }
+        Self {
+            inner,
+            root,
+            canonical_root,
+        }
     }
 
     /// Confine `path` to the root, returning the normalized in-root path or a denial error.
     fn confine(&self, path: &Path) -> Result<PathBuf, ToolError> {
-        let abs = if path.is_absolute() { path.to_path_buf() } else { self.root.join(path) };
+        let abs = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.root.join(path)
+        };
         let norm = normalize_lexical(&abs);
         if !norm.starts_with(&self.root) {
             return Err(error::denied(format!(
@@ -65,12 +73,13 @@ impl TraversalFs {
         // the lexical check above.
         if let Some(canon_root) = &self.canonical_root
             && let Ok(canon) = std::fs::canonicalize(&norm)
-                && !canon.starts_with(canon_root) {
-                    return Err(error::denied(format!(
-                        "path escapes traversal root via symlink: {}",
-                        error::show(path)
-                    )));
-                }
+            && !canon.starts_with(canon_root)
+        {
+            return Err(error::denied(format!(
+                "path escapes traversal root via symlink: {}",
+                error::show(path)
+            )));
+        }
         Ok(norm)
     }
 }
@@ -92,10 +101,7 @@ impl FsOps for TraversalFs {
     ///
     /// The confinement is applied here and NOT delegated to `read`, so the guarded path is what the
     /// inner seam opens, exactly as in every other method on this decorator.
-    async fn read_stream(
-        &self,
-        path: &Path,
-    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+    async fn read_stream(&self, path: &Path) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
         let p = self.confine(path)?;
         self.inner.read_stream(&p).await
     }
@@ -143,8 +149,14 @@ mod tests {
 
     #[test]
     fn normalize_resolves_dot_and_parent() {
-        assert_eq!(normalize_lexical(Path::new("/a/b/../c/./d")), PathBuf::from("/a/c/d"));
-        assert_eq!(normalize_lexical(Path::new("/a/../../etc")), PathBuf::from("/etc"));
+        assert_eq!(
+            normalize_lexical(Path::new("/a/b/../c/./d")),
+            PathBuf::from("/a/c/d")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("/a/../../etc")),
+            PathBuf::from("/etc")
+        );
     }
 
     #[test]

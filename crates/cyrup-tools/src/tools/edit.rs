@@ -75,7 +75,13 @@ impl EditTool {
                 }
             }
         });
-        Self { fs, locks, cwd, opts, params }
+        Self {
+            fs,
+            locks,
+            cwd,
+            opts,
+            params,
+        }
     }
 }
 
@@ -260,7 +266,11 @@ impl Tool for EditTool {
 
         // Restore line endings + BOM (R-03-018).
         let restored = edit_diff::restore_line_endings(&new_body, ending);
-        let final_text = if had_bom { format!("\u{feff}{restored}") } else { restored };
+        let final_text = if had_bom {
+            format!("\u{feff}{restored}")
+        } else {
+            restored
+        };
         self.fs.write_in_place(&abs, final_text.as_bytes()).await?;
         // Pi's `throwIfAborted()` immediately AFTER `ops.writeFile` (edit.ts:352, the sibling of
         // write.ts:224), before the diff is generated and the success value is built. The write is
@@ -281,7 +291,12 @@ impl Tool for EditTool {
                 "Successfully replaced {count} block(s) in {}.",
                 input.path
             ))],
-            details: serde_json::to_value(EditDetails { diff, patch, first_changed_line }).ok(),
+            details: serde_json::to_value(EditDetails {
+                diff,
+                patch,
+                first_changed_line,
+            })
+            .ok(),
             terminate: false,
             ..Default::default()
         })
@@ -353,7 +368,10 @@ mod tests {
     #[test]
     fn non_string_pair_is_left_untouched() {
         let out = normalize_args(json!({ "path": "f.txt", "oldText": 1, "newText": "b" }));
-        assert_eq!(out, json!({ "path": "f.txt", "oldText": 1, "newText": "b" }));
+        assert_eq!(
+            out,
+            json!({ "path": "f.txt", "oldText": 1, "newText": "b" })
+        );
     }
 
     /// `edits` as a JSON string is parsed to an array (Pi edit.ts:102-107), and a legacy pair then

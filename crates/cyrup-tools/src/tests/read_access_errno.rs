@@ -14,12 +14,17 @@
 //! which collapsed ENOENT/EACCES/ENOTDIR into one string and hid which absolute path was actually
 //! probed — the latter mattering because `read.rs` may have selected a macOS filename VARIANT of
 //! the requested name.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
-use cyrup_core::{CancelToken, Tool, ToolCallId, ToolUpdate};
 use crate::config::ReadOpts;
 use crate::ops::local::LocalFs;
 use crate::tools::ReadTool;
+use cyrup_core::{CancelToken, Tool, ToolCallId, ToolUpdate};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -53,9 +58,15 @@ async fn missing_file_reports_enoent_and_the_resolved_absolute_path() {
         msg.contains(&*abs.to_string_lossy()),
         "must name the resolved absolute path {abs:?}, got: {msg}"
     );
-    assert!(msg.starts_with("ENOENT: "), "must lead with the ENOENT code token, got: {msg}");
+    assert!(
+        msg.starts_with("ENOENT: "),
+        "must lead with the ENOENT code token, got: {msg}"
+    );
     #[cfg(unix)]
-    assert!(msg.contains("No such file or directory"), "must carry the ENOENT errno, got: {msg}");
+    assert!(
+        msg.contains("No such file or directory"),
+        "must carry the ENOENT errno, got: {msg}"
+    );
     assert!(
         !msg.contains("File not found or unreadable"),
         "the cyrup-invented literal must be gone, got: {msg}"
@@ -86,7 +97,10 @@ async fn unreadable_file_reports_eacces_distinctly_from_enoent() {
         msg.contains(&*p.to_string_lossy()),
         "must name the resolved absolute path {p:?}, got: {msg}"
     );
-    assert!(msg.contains("Permission denied"), "must carry the EACCES errno, got: {msg}");
+    assert!(
+        msg.contains("Permission denied"),
+        "must carry the EACCES errno, got: {msg}"
+    );
 
     let enoent = read_err(&cwd, "missing.txt").await;
     assert_ne!(
@@ -118,8 +132,8 @@ async fn nested_relative_path_is_reported_resolved_not_raw() {
 // ---------------------------------------------------------------------------------------------
 
 use crate::error::errno_code_of;
-use crate::ops::local::windows_access_result;
 use crate::ops::Access;
+use crate::ops::local::windows_access_result;
 
 /// RED before the fix: the arm returned `error::invalid("{path} is not writable")`, a message with
 /// no leading errno token, so `errno_code_of` — `edit.rs`'s port of pi's `"code" in error` test
@@ -136,7 +150,10 @@ fn windows_readwrite_denial_carries_a_recoverable_errno_code() {
         Some("EPERM"),
         "edit's `Error code:` line needs a recoverable code on this arm too, got: {err}"
     );
-    assert!(err.message.starts_with("EPERM: "), "code must lead the message, got: {err}");
+    assert!(
+        err.message.starts_with("EPERM: "),
+        "code must lead the message, got: {err}"
+    );
     assert!(
         err.message.contains(r"C:\work\ro.txt"),
         "the probed path must still be named, got: {err}"

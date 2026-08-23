@@ -44,7 +44,10 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { by_name: HashMap::new(), order: Vec::new() }
+        Self {
+            by_name: HashMap::new(),
+            order: Vec::new(),
+        }
     }
 
     /// Build the default registry with the seven built-ins over `backend` (arch-03 §3.4).
@@ -59,8 +62,17 @@ impl ToolRegistry {
         // free: filtering this order to {read,bash,edit,write} reproduces `createCodingTools`
         // (index.ts:169-176) and to {read,grep,find,ls} reproduces `createReadOnlyToolDefinitions`
         // (index.ts:147-154).
-        reg.insert(Arc::new(ReadTool::new(backend.fs.clone(), cwd.clone(), opts.read)));
-        reg.insert(Arc::new(BashTool::new(backend.proc.clone(), shell, cwd.clone(), opts.bash)));
+        reg.insert(Arc::new(ReadTool::new(
+            backend.fs.clone(),
+            cwd.clone(),
+            opts.read,
+        )));
+        reg.insert(Arc::new(BashTool::new(
+            backend.proc.clone(),
+            shell,
+            cwd.clone(),
+            opts.bash,
+        )));
         reg.insert(Arc::new(EditTool::new(
             backend.fs.clone(),
             locks.clone(),
@@ -73,8 +85,16 @@ impl ToolRegistry {
             cwd.clone(),
             opts.write,
         )));
-        reg.insert(Arc::new(GrepTool::new(backend.fs.clone(), cwd.clone(), opts.grep)));
-        reg.insert(Arc::new(FindTool::new(backend.fs.clone(), cwd.clone(), opts.find)));
+        reg.insert(Arc::new(GrepTool::new(
+            backend.fs.clone(),
+            cwd.clone(),
+            opts.grep,
+        )));
+        reg.insert(Arc::new(FindTool::new(
+            backend.fs.clone(),
+            cwd.clone(),
+            opts.find,
+        )));
         reg.insert(Arc::new(LsTool::new(backend.fs.clone(), cwd, opts.ls)));
         reg
     }
@@ -96,7 +116,10 @@ impl ToolRegistry {
 
     /// All registered tools in presentation order.
     pub fn all(&self) -> Vec<Arc<dyn Tool>> {
-        self.order.iter().filter_map(|n| self.by_name.get(n).cloned()).collect()
+        self.order
+            .iter()
+            .filter_map(|n| self.by_name.get(n).cloned())
+            .collect()
     }
 
     /// The model-visible tool set under `ctrl` (R-03-010).
@@ -120,16 +143,20 @@ impl ToolRegistry {
 /// Default coding tool set (read/bash/edit/write).
 pub fn coding_tools(cwd: PathBuf, backend: Backend, opts: ToolsOptions) -> Vec<Arc<dyn Tool>> {
     let reg = ToolRegistry::with_builtins(cwd, backend, opts);
-    let allow: HashSet<String> =
-        ["read", "bash", "edit", "write"].into_iter().map(String::from).collect();
+    let allow: HashSet<String> = ["read", "bash", "edit", "write"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     reg.visible(&Availability::Allow(allow))
 }
 
 /// Read-only tool set (read/grep/find/ls).
 pub fn read_only_tools(cwd: PathBuf, backend: Backend, opts: ToolsOptions) -> Vec<Arc<dyn Tool>> {
     let reg = ToolRegistry::with_builtins(cwd, backend, opts);
-    let allow: HashSet<String> =
-        ["read", "grep", "find", "ls"].into_iter().map(String::from).collect();
+    let allow: HashSet<String> = ["read", "grep", "find", "ls"]
+        .into_iter()
+        .map(String::from)
+        .collect();
     reg.visible(&Availability::Allow(allow))
 }
 
