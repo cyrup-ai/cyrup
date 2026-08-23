@@ -105,10 +105,10 @@ url = { workspace = true }
 # a LINEAR-TIME matching guarantee, which is why upstream's `recheck` ReDoS gate has no port — see
 # 13 "The `recheck` residual, stated precisely" for the three things that residual costs.
 regex = "1.12.4"
-# The Codex host-config import family reads `~/.codex/config.toml` (upstream `smol-toml`). Already
-# in the tree via `cyrup-resources`; pinned here rather than promoted because this is its second and
-# last consumer.
-toml = "1.1.2"
+# The Codex host-config import family reads `~/.codex/config.toml` (upstream `smol-toml`). Shared
+# with `cyrup-resources`, so the version lives in `[workspace.dependencies]` rather than being
+# pinned twice.
+toml = { workspace = true }
 # Parent-side JSON-Schema validation of a server's `outputSchema` against `structuredContent`.
 # **rmcp does NOT do this** — there is no validator hook on `Peer<RoleClient>`, unlike the TS SDK's
 # `jsonSchemaValidator` client option that `json-schema-validator.ts` supplies — so it is

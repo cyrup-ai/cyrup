@@ -95,27 +95,18 @@ pub(super) fn make_package_tree(dir: &Path, with_manifest: bool, pi_key: bool) {
 /// Create a real local git repo with one commit. Returns the tempdir (kept alive) + repo path, or
 /// None if the `git` CLI is unavailable.
 pub(super) fn make_local_git_repo() -> Option<(tempfile::TempDir, PathBuf)> {
-    use std::process::Command;
     let tmp = tempfile::tempdir().ok()?;
     let dir = tmp.path().to_path_buf();
     make_package_tree(&dir, true, false);
-    let git = |args: &[&str]| -> bool {
-        Command::new("git")
-            .current_dir(&dir)
-            .args(args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    if !git(&["init", "-q"]) {
+    if !git_in(&dir, &["init", "-q"]) {
         return None;
     }
-    git(&["config", "user.email", "t@t"]);
-    git(&["config", "user.name", "t"]);
-    if !git(&["add", "-A"]) {
+    git_in(&dir, &["config", "user.email", "t@t"]);
+    git_in(&dir, &["config", "user.name", "t"]);
+    if !git_in(&dir, &["add", "-A"]) {
         return None;
     }
-    if !git(&["commit", "-q", "-m", "init"]) {
+    if !git_in(&dir, &["commit", "-q", "-m", "init"]) {
         return None;
     }
     Some((tmp, dir))
@@ -124,32 +115,23 @@ pub(super) fn make_local_git_repo() -> Option<(tempfile::TempDir, PathBuf)> {
 /// Local git repo with two commits: commit 1 (`marker.txt`=="v1") tagged `v1`, commit 2 sets it to
 /// "v2" and is HEAD. Returns None when the `git` CLI is unavailable.
 pub(super) fn make_local_git_repo_two_commits() -> Option<(tempfile::TempDir, PathBuf)> {
-    use std::process::Command;
     let tmp = tempfile::tempdir().ok()?;
     let dir = tmp.path().to_path_buf();
     make_package_tree(&dir, true, false);
-    let git = |args: &[&str]| -> bool {
-        Command::new("git")
-            .current_dir(&dir)
-            .args(args)
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    };
-    if !git(&["init", "-q"]) {
+    if !git_in(&dir, &["init", "-q"]) {
         return None;
     }
-    git(&["config", "user.email", "t@t"]);
-    git(&["config", "user.name", "t"]);
+    git_in(&dir, &["config", "user.email", "t@t"]);
+    git_in(&dir, &["config", "user.name", "t"]);
     fs::write(dir.join("marker.txt"), "v1\n").ok()?;
-    if !git(&["add", "-A"]) || !git(&["commit", "-q", "-m", "c1"]) {
+    if !git_in(&dir, &["add", "-A"]) || !git_in(&dir, &["commit", "-q", "-m", "c1"]) {
         return None;
     }
-    if !git(&["tag", "v1"]) {
+    if !git_in(&dir, &["tag", "v1"]) {
         return None;
     }
     fs::write(dir.join("marker.txt"), "v2\n").ok()?;
-    if !git(&["add", "-A"]) || !git(&["commit", "-q", "-m", "c2"]) {
+    if !git_in(&dir, &["add", "-A"]) || !git_in(&dir, &["commit", "-q", "-m", "c2"]) {
         return None;
     }
     Some((tmp, dir))

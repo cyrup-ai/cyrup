@@ -9,23 +9,20 @@
 //! - **Themes** ([`Theme`]) — JSON TUI color schemes, hot-reloadable ([`ThemeWatcher`]).
 //! - **Packages** ([`PackageManager`]) — manifest-declared bundles, git/local-path installs.
 //!
-//! [`discover`] runs one pass over all roots and returns a [`ResourceRegistry`] snapshot held
-//! behind [`ResourceHandle`] (lock-free reads, atomic `/reload` swap). Same-name precedence is a
-//! 1:1 port of Pi's `resourcePrecedenceRank` (package-manager.ts:172-188): the lower-ranked
-//! candidate wins under first-wins dedup — project-settings < project-auto < user-settings <
-//! user-auto < any package < CLI (the explicit `--skill`/`--prompt-template`/`--theme` paths Pi
-//! appends after the sorted accumulator, resource-loader.ts:421) — see
-//! [`scope::ResourceScope::precedence_rank`].
+//! [`discover`] runs one pass over all roots and returns a [`ResourceRegistry`] snapshot;
+//! [`ResourceHandle`] is the swap primitive offered to embedders that want lock-free reads with an
+//! atomic `/reload` swap, though in-tree consumers currently hold an `Arc<ResourceRegistry>`
+//! directly.
+//!
+//! Same-name precedence is a 1:1 port of Pi's `resourcePrecedenceRank`
+//! (package-manager.ts:172-188): the lower-ranked candidate wins under first-wins dedup —
+//! project-settings < project-auto < user-settings < user-auto < any package < CLI (the explicit
+//! `--skill`/`--prompt-template`/`--theme` paths Pi appends after the sorted accumulator,
+//! resource-loader.ts:421) — see [`scope::ResourceScope::precedence_rank`].
+//!
+//! Lints: `[lints] workspace = true` in `Cargo.toml` is the single source of this crate's denies
+//! (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`), test code included.
 #![forbid(unsafe_code)]
-#![cfg_attr(
-    not(test),
-    deny(
-        clippy::unwrap_used,
-        clippy::expect_used,
-        clippy::panic,
-        clippy::indexing_slicing
-    )
-)]
 
 pub mod discovery;
 pub mod error;
@@ -52,10 +49,11 @@ pub use key::ResourceKey;
 pub use package::install::{PackageManager, security_notice_for};
 pub use package::source::{PackageSource, PinRef};
 pub use package::{
-    ConfiguredPackage, DisabledSet, InstalledPackage, InstalledPackages, ManifestResources,
-    PackageFilter, PackageStore, ParsedGitUrl, ResolvedManifest, ResourceSelector, SECURITY_CAVEAT,
-    SecurityNotice, UpdateReport, UpdateTarget, has_unsafe_git_install_part,
-    migrate_legacy_doubled_packages_root, package_identity, parse_git_url, resolve_manifest,
+    ConfiguredPackage, DisabledSet, InstalledPackage, InstalledPackages, ManifestKind,
+    ManifestResources, PackageFilter, PackageStore, ParsedGitUrl, ResolvedManifest,
+    ResourceSelector, SECURITY_CAVEAT, SecurityNotice, UpdateReport, UpdateTarget,
+    has_unsafe_git_install_part, migrate_legacy_doubled_packages_root, package_identity,
+    parse_git_url, resolve_manifest,
 };
 pub use prompt::{PromptTemplate, expand_prompt_template, parse_command_args, substitute_args};
 pub use scope::{InstallScope, ResourceOrigin, ResourceScope};
@@ -68,10 +66,12 @@ pub use theme::{
     ResolvedTheme, Theme, ThemeData, ThemeWatcher, builtin_themes,
 };
 
-/// The lock-free, atomically-swappable holder of the active [`ResourceRegistry`].
+/// A lock-free, atomically-swappable holder of a [`ResourceRegistry`], offered to embedders.
 ///
-/// Readers call [`ResourceHandle::load`] on the hot path; `/reload` builds a fresh registry off
-/// the loop and calls [`ResourceHandle::store`] (R-09-023) — a single pointer swap, no torn reads.
+/// This is the R-09-023 swap primitive: a reader calls [`ResourceHandle::load`] on the hot path
+/// while a `/reload` builds a fresh registry off the loop and calls [`ResourceHandle::store`] — a
+/// single pointer swap, no torn reads. In-tree consumers currently hold an `Arc<ResourceRegistry>`
+/// directly rather than going through this type.
 pub struct ResourceHandle(arc_swap::ArcSwap<ResourceRegistry>);
 
 impl ResourceHandle {

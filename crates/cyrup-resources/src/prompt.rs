@@ -364,10 +364,8 @@ fn match_simple_form(
     all_args: &str,
 ) -> Option<(String, usize)> {
     let rest = content.get(start + 1..)?;
-    if let Some(after) = rest.strip_prefix("ARGUMENTS") {
-        let consumed = 1 + "ARGUMENTS".len();
-        let _ = after;
-        return Some((all_args.to_string(), consumed));
+    if rest.starts_with("ARGUMENTS") {
+        return Some((all_args.to_string(), 1 + "ARGUMENTS".len()));
     }
     if rest.starts_with('@') {
         return Some((all_args.to_string(), 2));

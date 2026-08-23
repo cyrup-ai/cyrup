@@ -234,7 +234,10 @@ mod identity_tests {
         let base = Path::new(PROJECT_BASE);
         let https = package_identity("https://github.com/acme/pack.git", base);
         assert_eq!(https, "git:github.com/acme/pack");
-        assert_eq!(package_identity("git:git@github.com:acme/pack", base), https);
+        assert_eq!(
+            package_identity("git:git@github.com:acme/pack", base),
+            https
+        );
         assert_eq!(
             package_identity("ssh://git@github.com/acme/pack.git", base),
             https
@@ -269,11 +272,23 @@ mod identity_tests {
     fn an_absolute_local_source_has_one_identity_across_scopes() {
         let project = package_identity("/abs/pack", Path::new(PROJECT_BASE));
         assert_eq!(project, "local:/abs/pack");
-        assert_eq!(project, package_identity("/abs/pack", Path::new(GLOBAL_BASE)));
+        assert_eq!(
+            project,
+            package_identity("/abs/pack", Path::new(GLOBAL_BASE))
+        );
         // `resolvePath` normalizes first, so these three spellings are one identity.
-        assert_eq!(project, package_identity("  /abs/pack  ", Path::new(GLOBAL_BASE)));
-        assert_eq!(project, package_identity("file:///abs/pack", Path::new(GLOBAL_BASE)));
-        assert_eq!(project, package_identity("/abs/./sub/../pack", Path::new(GLOBAL_BASE)));
+        assert_eq!(
+            project,
+            package_identity("  /abs/pack  ", Path::new(GLOBAL_BASE))
+        );
+        assert_eq!(
+            project,
+            package_identity("file:///abs/pack", Path::new(GLOBAL_BASE))
+        );
+        assert_eq!(
+            project,
+            package_identity("/abs/./sub/../pack", Path::new(GLOBAL_BASE))
+        );
     }
 
     /// `parseSource`'s final fallback (`:1458`): a non-local string `parseGitUrl` cannot read is a

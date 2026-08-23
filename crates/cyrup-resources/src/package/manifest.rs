@@ -10,9 +10,14 @@ use std::path::{Path, PathBuf};
 use crate::error::ResourceError;
 
 /// Package metadata block.
+///
+/// Deserialize-only: the fields exist so serde REQUIRES a well-formed `[package]` block in
+/// `cyrup.toml`. Nothing reads them back, hence the `dead_code` allow — dropping the fields would
+/// make `[package]` optional, which is a behavior change, not hygiene.
+#[allow(dead_code)]
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct PackageMeta {
+struct PackageMeta {
     pub name: String,
     #[serde(default)]
     pub version: Option<String>,
@@ -34,7 +39,7 @@ pub struct PackageMeta {
 /// rather than left to be inferred from the code:
 ///   1. `agents` is a FIFTH key with no upstream counterpart (arch-SA §4.1 / R-SA-020); pi has no
 ///      subagent resource kind at any version.
-///   2. [`PiPackageJson`] accepts a `cyrup` key alongside pi's `pi` key. `pi` WINS on collision —
+///   2. `PiPackageJson` accepts a `cyrup` key alongside pi's `pi` key. `pi` WINS on collision —
 ///      `parsed.pi.or(parsed.cyrup)` — and that ordering is an INVARIANT, not an artefact: a
 ///      package authored for pi must resolve identically under cyrup, so the cross-harness key is
 ///      the fallback and never the override. Do not reorder the `.or()`.
@@ -58,7 +63,9 @@ pub struct ManifestResources {
 /// Native `cyrup.toml` manifest.
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct CyrupManifest {
+struct CyrupManifest {
+    /// Deserialize-only; see [`PackageMeta`]. Presence is the validation, the value is unused.
+    #[allow(dead_code)]
     pub package: PackageMeta,
     #[serde(default)]
     pub resources: ManifestResources,
@@ -684,7 +691,12 @@ fn walk_tree(root: &Path, dir: &Path, matcher: &globset::GlobMatcher, out: &mut 
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod ext063_tests {
     use super::*;
 
@@ -720,8 +732,11 @@ mod ext063_tests {
     #[test]
     fn the_cyrup_key_is_read_when_no_pi_key_is_present() {
         let dir = tempfile::tempdir().expect("tempdir");
-        std::fs::write(dir.path().join("package.json"), r#"{"cyrup": {"agents": ["a/b.md"]}}"#)
-            .expect("write package.json");
+        std::fs::write(
+            dir.path().join("package.json"),
+            r#"{"cyrup": {"agents": ["a/b.md"]}}"#,
+        )
+        .expect("write package.json");
 
         let resolved = resolve_manifest(dir.path()).expect("resolve");
         assert_eq!(resolved.agents, vec![dir.path().join("a/b.md")]);
