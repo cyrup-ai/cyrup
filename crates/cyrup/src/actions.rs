@@ -233,7 +233,7 @@ mod tests {
     /// only and had no swap retry.
     ///
     /// Both assertions were RED before the change, and both are the first thing a user types:
-    /// * `anthropic/sonnet` — the `provider/model` form `--model` itself documents (`cli.rs`'s help
+    /// * `anthropic/sonnet` — the `provider/model` form `--model` itself documents (`cli/help.rs`'s help
     ///   row). pi splits the query on `/[\s/]+/` (`packages/tui/src/fuzzy.ts:104-107`), so it is two
     ///   tokens; the old filter treated it as ONE and the haystack `"anthropic claude-sonnet-4-5"`
     ///   contains no `/`, so `cyrup --list-models anthropic/sonnet` printed

@@ -93,7 +93,7 @@ const MODEL_FLAG: &str = "--model";
 /// (args.ts:114), `result.tools = …` (`:121-124`) and `result.excludeTools = …` (`:125-129`) — with
 /// every spelling cyrup accepts for each. SEAM-105.
 ///
-/// clap declares all three as `Vec<String>` with `value_delimiter = ','` (cli.rs), so a REPEATED
+/// clap declares all three as `Vec<String>` with `value_delimiter = ','` (cli/args.rs), so a REPEATED
 /// flag appends: `--tools read --tools bash` resolved to `{read,bash}` where pi resolves `{bash}`.
 /// Only the repeated form ever diverged — the comma form (`--tools read,bash`) is identical under
 /// both — which is why every existing test passed. [`apply_arg_leniency`] therefore drops every
@@ -107,7 +107,7 @@ const ASSIGNING_FLAGS: [&[&str]; 3] = [&["--models"], &["--tools", "-t"], &["--e
 
 /// The [`ASSIGNING_FLAGS`] family `arg` belongs to, if any. The `--tools=read` form is matched on the
 /// name part: pi has no `=` form at all (it would land in `unknownFlags`, args.ts:190-192), but cyrup
-/// accepts one through `KNOWN_LONG_FLAGS` (cli.rs), so last-occurrence-wins has to cover it too or
+/// accepts one through `KNOWN_LONG_FLAGS` (cli/argv.rs), so last-occurrence-wins has to cover it too or
 /// `--tools read --tools=bash` would keep both.
 fn assigning_family(arg: &str) -> Option<usize> {
     let name = arg.split('=').next().unwrap_or(arg);
@@ -166,7 +166,7 @@ pub fn apply_arg_leniency(argv: &[String]) -> (Vec<String>, Vec<Diagnostic>) {
         // CYRUP-DELTA: the `--tui-mode=<v>` form is handled here too. pi's parser matches only
         // `arg === "--tui-mode"`, so `--tui-mode=regular` falls into its `unknownFlags` map
         // (args.ts:204-207) — as does `--model=x` and every other `=` form, which cyrup has always
-        // accepted through `KNOWN_LONG_FLAGS`'s `split('=')` (cli.rs:706). Given cyrup accepts the
+        // accepted through `KNOWN_LONG_FLAGS`'s `split('=')` (cli/argv.rs). Given cyrup accepts the
         // `=` form, the same two messages must cover it or `--tui-mode=bogus` would reach clap and
         // die with a clap usage error (exit 2) instead of pi's text.
         if arg == "--tui-mode" || arg.starts_with("--tui-mode=") {
