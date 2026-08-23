@@ -1,7 +1,11 @@
 //! Compaction & branch-summary **generation** (arch-05). The cut-point/serialization/file-tracking
 //! logic is a set of pure functions ([`cutpoint`], [`serialize`], [`files`], [`tokens`],
-//! [`prepare`]); the model call and hook dispatch are injected seams ([`Summarizer`],
-//! [`CompactionHooks`]). [`Compactor`] orchestrates them against a [`SessionManager`].
+//! [`prepare`]); the model call is an injected seam ([`Summarizer`]). [`Compactor`] orchestrates
+//! them against a [`SessionManager`].
+//!
+//! Extension dispatch (`session_before_compact` / `session_tree`) is NOT run from here: the
+//! session-service producer fires it against a real [`CompactionPreparation`] via `cyrup-ext` and
+//! feeds the guest's decision back in as a [`CompactionOverride`].
 //!
 //! The on-disk record is never reduced (DI-9): compaction/branch-summary only *append* a
 //! `CompactionEntry`/`BranchSummaryEntry`; context reduction is the read-time job of
@@ -10,8 +14,8 @@
 pub mod branch;
 pub mod cutpoint;
 pub mod error;
+pub mod events;
 pub mod files;
-pub mod hooks;
 pub mod prepare;
 pub mod serialize;
 pub mod settings;
@@ -32,12 +36,8 @@ pub use branch::{
 };
 pub use cutpoint::{find_cut_point, find_turn_start, find_valid_cut_points, CutPoint};
 pub use error::CompactionError;
+pub use events::{BranchSummaryEntry, CompactionEntry, CompactionOverride, CompactionReason};
 pub use files::{format_file_operations, CompactionDetails, FileOps};
-pub use hooks::{
-    BeforeCompactDecision, BeforeCompactEvent, BeforeTreeDecision, BeforeTreeEvent,
-    BeforeTreeOverrides, BranchSummaryEntry, CompactionEntry, CompactionHooks, CompactionOverride,
-    CompactionReason, NoHooks, PostCompactEvent, PostTreeEvent,
-};
 pub use prepare::{prepare_compaction, CompactionPreparation};
 pub use serialize::serialize_conversation;
 pub use settings::{BranchSummarySettings, CompactionSettings};
@@ -53,26 +53,20 @@ pub use tokens::{
 };
 
 /// Orchestrates compaction + branch summarization against a [`SessionManager`], wiring the pure
-/// algorithm to the injected [`Summarizer`] (model call) and [`CompactionHooks`] (extensions).
-pub struct Compactor<S: Summarizer, H: CompactionHooks> {
+/// algorithm to the injected [`Summarizer`] (model call).
+pub struct Compactor<S: Summarizer> {
     summarizer: S,
-    hooks: H,
     cache: TokenCache,
     thinking: ModelThinkingLevel,
 }
 
-impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
-    /// Build a compactor over an injected summarizer + hook dispatcher.
+impl<S: Summarizer> Compactor<S> {
+    /// Build a compactor over an injected summarizer.
     ///
     /// The thinking level defaults to `Off`; production callers bind the live session level with
     /// [`Self::with_thinking`].
-    pub fn new(summarizer: S, hooks: H) -> Self {
-        Self {
-            summarizer,
-            hooks,
-            cache: TokenCache::default(),
-            thinking: ModelThinkingLevel::Off,
-        }
+    pub fn new(summarizer: S) -> Self {
+        Self { summarizer, cache: TokenCache::default(), thinking: ModelThinkingLevel::Off }
     }
 
     /// Bind the session's thinking level for the summarization calls this compactor makes.
@@ -84,6 +78,7 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
     /// [`summarize::summarization_reasoning`], which reproduces Pi's
     /// `model.reasoning && level !== "off"` gate. Branch summaries deliberately ignore it — see
     /// [`branch::generate_branch_summary`].
+    #[must_use]
     pub fn with_thinking(mut self, thinking: ModelThinkingLevel) -> Self {
         self.thinking = thinking;
         self
@@ -97,11 +92,6 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
     /// The per-session token-estimate cache (R-05-024).
     pub fn cache(&self) -> &TokenCache {
         &self.cache
-    }
-
-    /// The injected hook dispatcher (inspection / notification observation).
-    pub fn hooks(&self) -> &H {
-        &self.hooks
     }
 
     /// The injected summarizer seam.
@@ -142,29 +132,21 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
         Some((prep, path))
     }
 
-    /// Run a full compaction: prepare → `before_compact` hook → (default | custom) summarize →
-    /// append `CompactionEntry` → `post_compact`. Returns the appended entry, or `None` when there
-    /// is nothing to compact or the hook cancelled (R-05-002/008/009/019/020/021).
-    #[allow(clippy::too_many_arguments)]
+    /// Run a full compaction: prepare → summarize → append `CompactionEntry`. Returns the appended
+    /// entry, or `None` when there is nothing to compact (R-05-002/008/009).
     pub async fn run_compaction(
         &self,
         session: &mut SessionManager,
         model: &Model,
         settings: &CompactionSettings,
-        reason: CompactionReason,
         custom_instructions: Option<String>,
-        will_retry: bool,
         cancel: CancelToken,
     ) -> Result<Option<CompactionEntry>, CompactionError> {
-        let (prep, path) = match self.prepare(session, settings) {
+        let (prep, _path) = match self.prepare(session, settings) {
             Some(x) => x,
             None => return Ok(None),
         };
-        self.finish_compaction(
-            session, model, settings, reason, custom_instructions, will_retry, &prep, path, None,
-            cancel,
-        )
-        .await
+        self.finish_compaction(session, model, custom_instructions, &prep, None, cancel).await
     }
 
     /// Run a compaction from an ALREADY-computed preparation (L4 gap #5). The session-service producer
@@ -173,55 +155,34 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
     /// `SessionBeforeCompactResult.compaction`). The preparation is NOT recomputed (no double-prep);
     /// `external_override` (when `Some`) replaces the default model summarization and the appended
     /// entry is marked `fromExtension`.
-    #[allow(clippy::too_many_arguments)]
     pub async fn run_compaction_prepared(
         &self,
         session: &mut SessionManager,
         model: &Model,
-        settings: &CompactionSettings,
-        reason: CompactionReason,
         custom_instructions: Option<String>,
-        will_retry: bool,
         prep: &CompactionPreparation,
-        branch_entries: Vec<Entry>,
         external_override: Option<CompactionOverride>,
         cancel: CancelToken,
     ) -> Result<Option<CompactionEntry>, CompactionError> {
-        self.finish_compaction(
-            session,
-            model,
-            settings,
-            reason,
-            custom_instructions,
-            will_retry,
-            prep,
-            branch_entries,
-            external_override,
-            cancel,
-        )
-        .await
+        self.finish_compaction(session, model, custom_instructions, prep, external_override, cancel)
+            .await
     }
 
-    /// Shared compaction tail: resolve the summary (external override > internal `before_compact` hook
-    /// > default model summarization), append the `CompactionEntry`, fire `post_compact`.
-    #[allow(clippy::too_many_arguments)]
+    /// Shared compaction tail: resolve the summary (external override > default model
+    /// summarization), then append the `CompactionEntry`.
     async fn finish_compaction(
         &self,
         session: &mut SessionManager,
         model: &Model,
-        settings: &CompactionSettings,
-        reason: CompactionReason,
         custom_instructions: Option<String>,
-        will_retry: bool,
         prep: &CompactionPreparation,
-        branch_entries: Vec<Entry>,
         external_override: Option<CompactionOverride>,
         cancel: CancelToken,
     ) -> Result<Option<CompactionEntry>, CompactionError> {
         let (summary, first_kept, tokens_before, details, usage, from_hook) = match external_override
         {
-            // An external extension override (Pi `SessionBeforeCompactResult.compaction`) wins over
-            // the internal `CompactionHooks` seam: its summary/details land in the entry (fromExtension).
+            // An external extension override (Pi `SessionBeforeCompactResult.compaction`): its
+            // summary/details land in the entry, which is marked `fromExtension`.
             Some(ov) => (
                 ov.summary,
                 ov.first_kept_entry_id.unwrap_or_else(|| prep.first_kept_entry_id.clone()),
@@ -231,65 +192,31 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                 true,
             ),
             None => {
-                let event = BeforeCompactEvent {
-                    messages_to_summarize: prep.messages_to_summarize.clone(),
-                    turn_prefix_messages: prep.turn_prefix_messages.clone(),
-                    previous_summary: prep.previous_summary.clone(),
-                    file_ops: prep.file_ops.to_details(),
-                    tokens_before: u64::from(prep.tokens_before),
-                    first_kept_entry_id: prep.first_kept_entry_id.clone(),
-                    settings: settings.clone(),
-                    branch_entries,
-                    custom_instructions: custom_instructions.clone(),
-                    reason,
-                    will_retry,
-                };
-                // before-compact hook: cancel / supply custom summary / proceed (R-05-019/020).
-                match self.hooks.before_compact(&event, cancel.child_token()).await? {
-                    BeforeCompactDecision::Cancel => return Ok(None),
-                    BeforeCompactDecision::Custom {
-                        summary,
-                        first_kept_entry_id,
-                        tokens_before,
-                        details,
-                        usage,
-                    } => (
-                        summary,
-                        first_kept_entry_id,
-                        tokens_before,
-                        details.unwrap_or_else(|| serde_json::json!({})),
-                        usage,
-                        true,
-                    ),
-                    BeforeCompactDecision::Proceed => {
-                        let produced = compact_default(
-                            &self.summarizer,
-                            prep,
-                            model,
-                            custom_instructions.as_deref(),
-                            self.thinking,
-                            cancel.clone(),
-                        )
-                        .await?;
-                        let details = serde_json::to_value(prep.file_ops.to_details())
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        (
-                            produced.summary,
-                            prep.first_kept_entry_id.clone(),
-                            u64::from(prep.tokens_before),
-                            details,
-                            produced.usage,
-                            false,
-                        )
-                    }
-                }
+                let produced = compact_default(
+                    &self.summarizer,
+                    prep,
+                    model,
+                    custom_instructions.as_deref(),
+                    self.thinking,
+                    cancel.clone(),
+                )
+                .await?;
+                let details = serde_json::to_value(prep.file_ops.to_details())
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                (
+                    produced.summary,
+                    prep.first_kept_entry_id.clone(),
+                    u64::from(prep.tokens_before),
+                    details,
+                    produced.usage,
+                    false,
+                )
             }
         };
 
-        // Pi re-tests the abort signal IMMEDIATELY before the append, unconditionally, covering all
-        // three summary sources (extension override, hook `Custom`, default summarizer) — the
-        // manual path throws `new Error("Compaction cancelled")`
-        // (`agent-session.ts:1868-1870`), the auto path emits
+        // Pi re-tests the abort signal IMMEDIATELY before the append, unconditionally, covering both
+        // summary sources (extension override, default summarizer) — the manual path throws
+        // `new Error("Compaction cancelled")` (`agent-session.ts:1868-1870`), the auto path emits
         // `compaction_end { result: undefined, aborted: true }` and returns `false` (`:2142-2151`).
         // Without it, a cancel landing while a `session_before_compact` guest is producing a
         // summary — or in the window after the summarization stream settles but before the write —
@@ -307,23 +234,18 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
             from_hook,
         )?;
         let entry = compaction_entry_of(session, &id).ok_or(CompactionError::MissingEntryId)?;
-
-        self.hooks
-            .post_compact(&PostCompactEvent {
-                entry: entry.clone(),
-                from_extension: from_hook,
-                reason,
-                will_retry,
-            })
-            .await;
         Ok(Some(entry))
     }
 
-    /// Branch summarization on `/tree` navigation (R-05-016/017/018/022). Fires `before_tree`,
-    /// optionally generates + appends a `BranchSummaryEntry` at the navigation point, then navigates
-    /// the leaf to `target_id` (the abandoned branch is never deleted) and fires `post_tree`.
-    /// Returns the appended branch-summary entry, if any. `Ok(None)` means navigation was cancelled
-    /// or no summary was produced.
+    /// Branch summarization on `/tree` navigation (R-05-016/017/018). Optionally generates +
+    /// appends a `BranchSummaryEntry` at the navigation point, then navigates the leaf to
+    /// `target_id` (the abandoned branch is never deleted). Returns the appended branch-summary
+    /// entry, if any. `Ok(None)` means no summary was produced.
+    ///
+    /// The `/tree` extension seam (`session_before_tree`/`session_tree`, with its
+    /// instruction/label overrides) lives in the session service, which drives
+    /// [`collect_entries_for_branch_summary`] + [`generate_branch_summary_with_instructions`]
+    /// directly rather than through this convenience wrapper.
     #[allow(clippy::too_many_arguments)]
     pub async fn run_branch_summary(
         &self,
@@ -342,73 +264,33 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
             session.branch_path(Some(&target_id)).into_iter().cloned().collect();
         let collection = collect_entries_for_branch_summary(&old_path, &target_path);
 
-        let event = BeforeTreeEvent {
-            target_id: target_id.clone(),
-            old_leaf_id: old_leaf.clone(),
-            common_ancestor_id: collection.common_ancestor_id.clone(),
-            entries_to_summarize: collection.entries.clone(),
-            user_wants_summary,
-        };
-
-        // before-tree hook: cancel navigation / supply custom summary / proceed (R-05-022).
-        let decision = self.hooks.before_tree(&event, cancel.child_token()).await?;
-        type SummaryPayload = Option<(String, serde_json::Value, Option<Usage>)>;
-        // Pi reads `customInstructions` / `replaceInstructions` / `label` off the SAME hook result
-        // that may also carry `cancel`/`summary` (`agent-session.ts:2968-2976`), so they are
-        // extracted before the decision is matched.
-        let overrides = match &decision {
-            BeforeTreeDecision::Cancel => BeforeTreeOverrides::default(),
-            BeforeTreeDecision::Proceed { overrides }
-            | BeforeTreeDecision::CustomSummary { overrides, .. } => overrides.clone(),
-        };
-        let (summary_and_details, from_hook): (SummaryPayload, bool) =
-            match decision {
-                BeforeTreeDecision::Cancel => return Ok(None),
-                BeforeTreeDecision::CustomSummary { summary, details, .. }
-                    if user_wants_summary =>
-                {
-                    (Some((summary, details.unwrap_or_else(|| serde_json::json!({})), None)), true)
-                }
-                // Proceed, or a custom summary the user did not ask for → default path.
-                BeforeTreeDecision::Proceed { .. } | BeforeTreeDecision::CustomSummary { .. } => {
-                    // Pi's gate is the USER's choice alone: `if (options.summarize &&
-                    // entriesToSummarize.length > 0 && !extensionSummary)`
-                    // (`agent-session.ts:2983`). `skipPrompt` is a front-end-only setting upstream
-                    // — it never appears in `agent-session.ts`; its sole consumer repo-wide is
-                    // `interactive-mode.ts:4672`, which uses it to decide whether to ASK, not
-                    // whether to summarize. Consulting it here made an embedder's
-                    // `summarize: false` still pay for a summarization call.
-                    if !user_wants_summary {
-                        (None, false)
-                    } else if collection.entries.is_empty() {
-                        // Pi gates the default summarizer on `entriesToSummarize.length > 0`
-                        // (`agent-session.ts:2983`): with NO abandoned entries, produce nothing.
-                        (None, false)
-                    } else {
-                        // Budget = (context window || 128000) − reserve (Pi
-                        // `branch-summarization.ts:312-313`), NOT a flat reserve_tokens — this
-                        // keeps far more branch history than a bare reserve would.
-                        let budget = branch_token_budget(model, settings.reserve_tokens);
-                        let prep = prepare_branch_entries(&collection.entries, budget);
-                        // `generate_branch_summary` returns the "No content to summarize" placeholder
-                        // when the abandoned branch filtered to no messages (all `toolResult` / over
-                        // budget). Pi's caller still appends it — `if (summaryText)` is truthy on the
-                        // non-empty placeholder (`agent-session.ts:3038`) — so we append it too rather
-                        // than silently dropping an explored branch.
-                        let produced = generate_branch_summary_with_instructions(
-                            &self.summarizer,
-                            &prep,
-                            model,
-                            overrides.custom_instructions.as_deref(),
-                            overrides.replace_instructions.unwrap_or(false),
-                            cancel.clone(),
-                        )
-                        .await?;
-                        let details = serde_json::to_value(prep.file_ops.to_details())
-                            .unwrap_or_else(|_| serde_json::json!({}));
-                        (Some((produced.text, details, produced.usage)), false)
-                    }
-                }
+        // Pi's gate is the USER's choice alone: `if (options.summarize &&
+        // entriesToSummarize.length > 0 && !extensionSummary)` (`agent-session.ts:2983`).
+        // `skipPrompt` is a front-end-only setting upstream — it never appears in
+        // `agent-session.ts`; its sole consumer repo-wide is `interactive-mode.ts:4672`, which uses
+        // it to decide whether to ASK, not whether to summarize. Consulting it here made an
+        // embedder's `summarize: false` still pay for a summarization call.
+        let summary_and_details: Option<(String, serde_json::Value, Option<Usage>)> =
+            if !user_wants_summary || collection.entries.is_empty() {
+                // Pi also gates the default summarizer on `entriesToSummarize.length > 0`
+                // (`agent-session.ts:2983`): with NO abandoned entries, produce nothing.
+                None
+            } else {
+                // Budget = (context window || 128000) − reserve (Pi
+                // `branch-summarization.ts:312-313`), NOT a flat reserve_tokens — this keeps far
+                // more branch history than a bare reserve would.
+                let budget = branch_token_budget(model, settings.reserve_tokens);
+                let prep = prepare_branch_entries(&collection.entries, budget);
+                // `generate_branch_summary` returns the "No content to summarize" placeholder when
+                // the abandoned branch filtered to no messages (all `toolResult` / over budget).
+                // Pi's caller still appends it — `if (summaryText)` is truthy on the non-empty
+                // placeholder (`agent-session.ts:3038`) — so we append it too rather than silently
+                // dropping an explored branch.
+                let produced =
+                    generate_branch_summary(&self.summarizer, &prep, model, cancel).await?;
+                let details = serde_json::to_value(prep.file_ops.to_details())
+                    .unwrap_or_else(|_| serde_json::json!({}));
+                Some((produced.text, details, produced.usage))
             };
 
         let entry = match summary_and_details {
@@ -424,7 +306,7 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                     summary,
                     Some(details),
                     usage,
-                    from_hook,
+                    false,
                 )?;
                 branch_summary_entry_of(session, &id)
             }
@@ -434,26 +316,11 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
                 None
             }
         };
-
-        // Pi attaches the hook-supplied label to the SUMMARY entry when one was produced, and to the
-        // navigation TARGET otherwise (`agent-session.ts:3050-3052` / `:3062-3064`).
-        if let Some(label) = overrides.label.filter(|l| !l.is_empty()) {
-            let target = entry.as_ref().map_or_else(|| target_id.clone(), |e| e.id.clone());
-            session.append_label(&target, Some(label.as_str()))?;
-        }
-
-        self.hooks
-            .post_tree(&PostTreeEvent {
-                entry: entry.clone(),
-                target_id: target_id.clone(),
-                from_extension: from_hook,
-            })
-            .await;
         Ok(entry)
     }
 }
 
-/// Build the hook-event `CompactionEntry` payload from a freshly appended session entry.
+/// Build the [`CompactionEntry`] payload from a freshly appended session entry.
 fn compaction_entry_of(session: &SessionManager, id: &EntryId) -> Option<CompactionEntry> {
     match session.entry(id) {
         Some(Entry::Known(KnownEntry::Compaction {
@@ -469,7 +336,7 @@ fn compaction_entry_of(session: &SessionManager, id: &EntryId) -> Option<Compact
             parent_id: base.parent_id.clone(),
             summary: summary.clone(),
             // `None` here means the on-disk entry carried an unresolvable v1 `firstKeptEntryIndex`
-            // (see `entry.rs`). Hook payloads are only ever built from an entry cyrup JUST
+            // (see `entry.rs`). These payloads are only ever built from an entry cyrup JUST
             // appended, which always carries the id, so this fails closed rather than inventing one
             // — the caller maps `None` to `CompactionError::MissingEntryId`.
             first_kept_entry_id: first_kept_entry_id.clone()?,
@@ -482,7 +349,7 @@ fn compaction_entry_of(session: &SessionManager, id: &EntryId) -> Option<Compact
     }
 }
 
-/// Build the hook-event `BranchSummaryEntry` payload from a freshly appended session entry.
+/// Build the [`BranchSummaryEntry`] payload from a freshly appended session entry.
 fn branch_summary_entry_of(session: &SessionManager, id: &EntryId) -> Option<BranchSummaryEntry> {
     match session.entry(id) {
         Some(Entry::Known(KnownEntry::BranchSummary {

@@ -9,7 +9,7 @@ use cyrup_core::{AssistantMessage, Message};
 use cyrup_ext::HostEvent;
 use cyrup_provider::is_context_overflow;
 use cyrup_session::compaction::{
-    CompactionReason, CompactionSettings, Compactor, NoHooks, context_tokens_from_usage,
+    CompactionReason, CompactionSettings, Compactor, context_tokens_from_usage,
 };
 
 use crate::compact::DynSummarizer;
@@ -207,7 +207,7 @@ impl AgentSession {
         // Pi threads the session thinking level into every compaction summarization call
         // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
         // gate before it reaches the request.
-        let compactor = Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
+        let compactor = Compactor::new(summarizer).with_thinking(self.thinking_level().await);
         let settings = self.effective_compaction_settings();
 
         // Compute the REAL preparation BEFORE the extension hook (L4 gap #5) — the ONLY preparation.
@@ -255,18 +255,7 @@ impl AgentSession {
 
         let mut guard = self.manager.lock().await;
         let result = compactor
-            .run_compaction_prepared(
-                &mut guard,
-                &model,
-                &settings,
-                reason,
-                None,
-                will_retry,
-                &prep,
-                branch_entries,
-                external_override,
-                cancel,
-            )
+            .run_compaction_prepared(&mut guard, &model, None, &prep, external_override, cancel)
             .await;
         // Pi agent-session.ts:2045: estimate the rebuilt context for the result payload. Hoisted
         // out of the `Ok(Some(_))` arm (as `compact` already does) so the manager guard is released

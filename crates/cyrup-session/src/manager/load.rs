@@ -29,7 +29,8 @@ use crate::header::SessionHeader;
 /// (`session-manager.ts:900-906`). Only a MISSING or ZERO-LENGTH file is a soft new session, which
 /// [`SessionManager::open_with_cwd`] handles before reaching here.
 pub(super) fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), SessionError> {
-    let file = std::fs::File::open(path)?;
+    let file =
+        std::fs::File::open(path).map_err(|e| SessionError::io("open session file", path, e))?;
     let reader = BufReader::new(file);
     let mut header: Option<SessionHeader> = None;
     let mut entries: Vec<Entry> = Vec::new();

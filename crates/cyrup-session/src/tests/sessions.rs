@@ -728,3 +728,48 @@ fn first_text_blocks(content: &[Content]) -> String {
         .collect::<Vec<_>>()
         .join("")
 }
+
+// ------------------------------------------------- io errors name the file --------------------
+
+/// Every filesystem failure must name the file it happened on. The old blanket
+/// `Io(#[from] std::io::Error)` rendered as a bare `io: No such file or directory (os error 2)`,
+/// which tells a user nothing about WHICH session could not be opened or appended to.
+#[test]
+fn io_errors_name_the_failing_path() {
+    use crate::store::{DiskStore, SessionStore};
+    use crate::SessionError;
+
+    let root = tempfile::tempdir().unwrap();
+    let cwd = PathBuf::from("/proj/io-paths");
+    let lay = layout(root.path(), &cwd);
+
+    // Opening a nonexistent session file. `fork_from` reads its source through the same tolerant
+    // loader `open` uses, without `open`'s missing-file → fresh-session shortcut, so this is the
+    // reachable `File::open` → `NotFound` path.
+    let missing = root.path().join("2026-01-01T00-00-00-absent.jsonl");
+    let Err(err) = SessionManager::fork_from(&missing, &cwd, &lay, NewSessionOpts::default())
+    else {
+        panic!("a nonexistent source session cannot be forked");
+    };
+    assert!(
+        matches!(err, SessionError::Io { .. }),
+        "a missing source file is a path-carrying Io error, got {err:?}"
+    );
+    assert!(
+        err.to_string().contains(&missing.display().to_string()),
+        "the message must name the file that could not be opened, got: {err}"
+    );
+
+    // …and so does a write failure. Appending under a parent that is a regular file (ENOTDIR)
+    // exercises `DiskStore::append_line`'s open, the hottest fs site in the crate.
+    let blocker = root.path().join("not-a-directory");
+    std::fs::write(&blocker, b"x").unwrap();
+    let blocked = blocker.join("session.jsonl");
+    let err = DiskStore::new(&blocked)
+        .append_line(r#"{"type":"session"}"#)
+        .expect_err("appending below a non-directory must fail");
+    assert!(
+        err.to_string().contains(&blocked.display().to_string()),
+        "the message must name the file that could not be appended to, got: {err}"
+    );
+}

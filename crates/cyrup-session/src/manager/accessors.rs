@@ -1,7 +1,7 @@
 //! JSONL export (R-04-029) and the plain getters over the manager's own state (R-04-028).
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cyrup_core::SessionId;
 
@@ -20,13 +20,27 @@ impl SessionManager {
     pub fn export_jsonl(&self, w: &mut dyn Write) -> Result<(), SessionError> {
         let mut header = self.header.clone();
         header.cwd = self.cwd.to_string_lossy().into_owned();
-        w.write_all(serde_json::to_string(&header)?.as_bytes())?;
-        w.write_all(b"\n")?;
+        // The sink is caller-supplied and has no path of its own, so the error names the SESSION
+        // being exported (its file, or its id when the session is ephemeral) — that is what tells
+        // the user which export failed.
+        let subject = self.export_subject();
+        let io = |e| SessionError::io("export session", subject.clone(), e);
+        w.write_all(serde_json::to_string(&header)?.as_bytes()).map_err(io)?;
+        w.write_all(b"\n").map_err(io)?;
         for e in &self.entries {
-            w.write_all(e.to_line()?.as_bytes())?;
-            w.write_all(b"\n")?;
+            w.write_all(e.to_line()?.as_bytes()).map_err(io)?;
+            w.write_all(b"\n").map_err(io)?;
         }
         Ok(())
+    }
+
+    /// What an export error names: the session file when persisted, else the session id (an
+    /// ephemeral session has no file, and its id is the only thing that identifies it).
+    fn export_subject(&self) -> PathBuf {
+        self.store
+            .path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from(self.header.id.to_string()))
     }
 
     pub fn header(&self) -> &SessionHeader {

@@ -51,17 +51,23 @@ impl SessionStore for DiskStore {
     fn append_line(&mut self, line: &str) -> Result<(), SessionError> {
         // One `write` of `<json>\n` to an append-mode fd: a crash mid-write leaves a partial
         // final line that the tolerant reader drops ("last good line wins" — R-04-032).
-        let mut f = OpenOptions::new().create(true).append(true).open(&self.path)?;
-        f.write_all(line.as_bytes())?;
-        f.write_all(b"\n")?;
-        f.flush()?;
-        f.sync_data()?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(|e| SessionError::io("open for append", &self.path, e))?;
+        let io = |e| SessionError::io("append to", &self.path, e);
+        f.write_all(line.as_bytes()).map_err(io)?;
+        f.write_all(b"\n").map_err(io)?;
+        f.flush().map_err(io)?;
+        f.sync_data().map_err(io)?;
         Ok(())
     }
 
     fn rewrite(&mut self, header: &SessionHeader, entries: &[Entry]) -> Result<(), SessionError> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| SessionError::io("create session directory", parent, e))?;
         }
         // [CYRUP-DELTA] Pi's `_rewriteFile` truncates the live file in place —
         // `const fd = openSync(this.sessionFile, "w"); … writeFileSync(fd, …)`
@@ -83,12 +89,17 @@ impl SessionStore for DiskStore {
             buf.push('\n');
         }
         {
-            let mut f = File::create(&tmp)?;
-            f.write_all(buf.as_bytes())?;
-            f.flush()?;
-            f.sync_data()?;
+            let mut f =
+                File::create(&tmp).map_err(|e| SessionError::io("create temp file", &tmp, e))?;
+            let io = |e| SessionError::io("write temp file", &tmp, e);
+            f.write_all(buf.as_bytes()).map_err(io)?;
+            f.flush().map_err(io)?;
+            f.sync_data().map_err(io)?;
         }
-        std::fs::rename(&tmp, &self.path)?;
+        // Names the DESTINATION: the temp sibling is an implementation detail, and a failing
+        // rename is a failure to install the new bytes at the session file.
+        std::fs::rename(&tmp, &self.path)
+            .map_err(|e| SessionError::io("rename temp file onto", &self.path, e))?;
         Ok(())
     }
 
@@ -98,7 +109,8 @@ impl SessionStore for DiskStore {
         entries: &[Entry],
     ) -> Result<(), SessionError> {
         if let Some(parent) = self.path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| SessionError::io("create session directory", parent, e))?;
         }
         // `create_new` is the atomic exclusive-create equivalent of Pi's `"wx"` flag: if the file
         // already exists it errors (`AlreadyExists`/EEXIST) instead of overwriting, guarding the
@@ -109,7 +121,7 @@ impl SessionStore for DiskStore {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 return Err(SessionError::AlreadyExists(self.path.clone()));
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(SessionError::io("create", &self.path, e)),
         };
         let mut buf = String::new();
         buf.push_str(&serde_json::to_string(header)?);
@@ -118,9 +130,10 @@ impl SessionStore for DiskStore {
             buf.push_str(&e.to_line()?);
             buf.push('\n');
         }
-        f.write_all(buf.as_bytes())?;
-        f.flush()?;
-        f.sync_data()?;
+        let io = |e| SessionError::io("write", &self.path, e);
+        f.write_all(buf.as_bytes()).map_err(io)?;
+        f.flush().map_err(io)?;
+        f.sync_data().map_err(io)?;
         Ok(())
     }
 }

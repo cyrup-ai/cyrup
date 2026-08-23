@@ -14,11 +14,7 @@ use cyrup_provider::faux::{
 };
 use cyrup_provider::{CacheRetention, Model, RetryPolicy, StreamOptions};
 use crate::compaction::cutpoint::{find_cut_point, CutPoint};
-use crate::compaction::hooks::{
-    BeforeCompactDecision, BeforeCompactEvent, BeforeTreeDecision, BeforeTreeEvent,
-    BeforeTreeOverrides, BranchSummaryEntry, CompactionHooks, CompactionOverride, CompactionReason,
-    PostCompactEvent, PostTreeEvent,
-};
+use crate::compaction::events::CompactionOverride;
 use crate::compaction::summarize::{
     ProviderSummarizer, SummarizationRequest, Summarizer,
 };
@@ -33,7 +29,7 @@ use crate::context::{build_context_agent_messages, build_context_messages};
 use crate::agent_message::{AgentMessage, BashExecutionMessage};
 use crate::{
     BranchSummarySettings, Compactor, CompactionSettings, Entry, EntryBase, KnownEntry,
-    NewSessionOpts, NoHooks, SessionLayout, SessionManager,
+    NewSessionOpts, SessionLayout, SessionManager,
 };
 use serde_json::json;
 
@@ -151,43 +147,6 @@ impl Summarizer for RecordingSummarizer {
     }
 }
 
-// A scripted hook dispatcher: returns canned decisions and records notifications.
-#[derive(Default)]
-struct ScriptHooks {
-    before_compact: Mutex<Option<BeforeCompactDecision>>,
-    before_tree: Mutex<Option<BeforeTreeDecision>>,
-    post_compact: Mutex<Vec<PostCompactEvent>>,
-    post_tree: Mutex<Vec<PostTreeEvent>>,
-}
-
-impl CompactionHooks for ScriptHooks {
-    async fn before_compact(
-        &self,
-        _ev: &BeforeCompactEvent,
-        _cancel: CancelToken,
-    ) -> Result<BeforeCompactDecision, CompactionError> {
-        Ok(self
-            .before_compact
-            .lock()
-            .unwrap()
-            .clone()
-            .unwrap_or(BeforeCompactDecision::Proceed))
-    }
-    async fn post_compact(&self, ev: &PostCompactEvent) {
-        self.post_compact.lock().unwrap().push(ev.clone());
-    }
-    async fn before_tree(
-        &self,
-        _ev: &BeforeTreeEvent,
-        _cancel: CancelToken,
-    ) -> Result<BeforeTreeDecision, CompactionError> {
-        Ok(self.before_tree.lock().unwrap().clone().unwrap_or(BeforeTreeDecision::proceed()))
-    }
-    async fn post_tree(&self, ev: &PostTreeEvent) {
-        self.post_tree.lock().unwrap().push(ev.clone());
-    }
-}
-
 fn has_compaction(m: &SessionManager) -> bool {
     m.entries().iter().any(|e| matches!(e, Entry::Known(KnownEntry::Compaction { .. })))
 }
@@ -222,7 +181,7 @@ async fn a05_1_auto_compaction_appends_entry_keeps_jsonl() {
     ]);
     let model = faux.model().clone();
     let summ = ProviderSummarizer::new(faux.clone(), model.clone());
-    let compactor = Compactor::new(summ, NoHooks);
+    let compactor = Compactor::new(summ);
 
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 40 };
 
@@ -242,15 +201,7 @@ async fn a05_1_auto_compaction_appends_entry_keeps_jsonl() {
     assert!(compactor.should_compact(&path, 60, &settings), "should trigger over threshold");
 
     let entry = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &settings,
-            CompactionReason::Threshold,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("compaction should produce an entry");
@@ -311,7 +262,7 @@ async fn a05_3_split_turn_two_summaries_merged() {
         faux_assistant_message(vec![faux_text("PREFIX-SUMMARY")], StopReason::Stop),
     ]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()));
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
     let cwd = PathBuf::from("/proj/a05_3");
@@ -324,15 +275,7 @@ async fn a05_3_split_turn_two_summaries_merged() {
     m.append_message(assistant(&big)).unwrap();
 
     let entry = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &settings,
-            CompactionReason::Manual,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("split-turn compaction should produce an entry");
@@ -348,7 +291,7 @@ async fn a05_3_split_turn_two_summaries_merged() {
 #[tokio::test]
 async fn a05_4_compact_custom_instructions_in_request() {
     let summarizer = Arc::new(RecordingSummarizer::new(vec![FULL_SUMMARY]));
-    let compactor = Compactor::new(RecordingArc(summarizer.clone()), NoHooks);
+    let compactor = Compactor::new(RecordingArc(summarizer.clone()));
     let model = faux_model();
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
@@ -364,9 +307,7 @@ async fn a05_4_compact_custom_instructions_in_request() {
             &mut m,
             &model,
             &settings,
-            CompactionReason::Manual,
             Some("focus on the auth refactor".to_string()),
-            false,
             CancelToken::new(),
         )
         .await
@@ -401,7 +342,7 @@ async fn a05_5_overflow_recovery_then_retry() {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop)]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()));
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
     let cwd = PathBuf::from("/proj/a05_5");
@@ -413,15 +354,7 @@ async fn a05_5_overflow_recovery_then_retry() {
 
     // Overflow recovery: compaction runs with reason=Overflow and will_retry=true (R-05-003).
     let entry = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &settings,
-            CompactionReason::Overflow,
-            None,
-            true,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("overflow compaction should produce an entry");
@@ -438,7 +371,7 @@ async fn a05_5_overflow_recovery_then_retry() {
 #[tokio::test]
 async fn a05_6_cumulative_file_lists_across_two_compactions() {
     let summarizer = Arc::new(RecordingSummarizer::new(vec![FULL_SUMMARY, FULL_SUMMARY]));
-    let compactor = Compactor::new(RecordingArc(summarizer.clone()), NoHooks);
+    let compactor = Compactor::new(RecordingArc(summarizer.clone()));
     let model = faux_model();
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
@@ -455,7 +388,7 @@ async fn a05_6_cumulative_file_lists_across_two_compactions() {
     m.append_message(assistant("first batch reply with enough words to matter here ok")).unwrap();
 
     compactor
-        .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("first compaction");
@@ -468,7 +401,7 @@ async fn a05_6_cumulative_file_lists_across_two_compactions() {
     m.append_message(assistant("second batch reply with enough words to matter here ok")).unwrap();
 
     let second = compactor
-        .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("second compaction");
@@ -489,7 +422,7 @@ async fn a05_7_branch_summary_appended_at_nav_abandoned_intact() {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop)]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()));
     let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false };
 
     let cwd = PathBuf::from("/proj/a05_7");
@@ -559,137 +492,6 @@ fn prepare_branch_entries_fills_the_token_budget_newest_first() {
     assert!(!texts.iter().any(|t| t.contains("old old")), "oldest dropped under tiny budget");
 }
 
-// ----------------------------------------------------------------- A-05-8 ---------------------
-
-#[tokio::test]
-async fn a05_8_before_compact_cancel_and_custom() {
-    let model = faux_model();
-
-    // (a) Cancel prevents compaction entirely (R-05-020a).
-    {
-        let hooks = ScriptHooks::default();
-        *hooks.before_compact.lock().unwrap() = Some(BeforeCompactDecision::Cancel);
-        let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
-        let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
-
-        let cwd = PathBuf::from("/proj/a05_8a");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-        m.append_message(user("q one with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a one with enough words to matter here now")).unwrap();
-        m.append_message(user("q two with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a two with enough words to matter here now")).unwrap();
-
-        let out = compactor
-            .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
-            .await
-            .unwrap();
-        assert!(out.is_none(), "cancel returns no entry");
-        assert!(!has_compaction(&m), "cancel appends nothing");
-        assert!(
-            compactor.hooks().post_compact.lock().unwrap().is_empty(),
-            "post_compact not fired on cancel"
-        );
-    }
-
-    // (b) Custom summary is used verbatim and marked extension-sourced (R-05-020b/021).
-    {
-        let first_kept = EntryId::from("custom-keep");
-        let hooks = ScriptHooks::default();
-        *hooks.before_compact.lock().unwrap() = Some(BeforeCompactDecision::Custom {
-            summary: "CUSTOM-EXTENSION-SUMMARY".to_string(),
-            first_kept_entry_id: first_kept.clone(),
-            tokens_before: 42,
-            details: Some(json!({ "readFiles": ["x.rs"], "modifiedFiles": [] })),
-            usage: None,
-        });
-        let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
-        let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
-
-        let cwd = PathBuf::from("/proj/a05_8b");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-        m.append_message(user("q one with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a one with enough words to matter here now")).unwrap();
-        m.append_message(user("q two with enough words to matter here now")).unwrap();
-        m.append_message(assistant("a two with enough words to matter here now")).unwrap();
-
-        let entry = compactor
-            .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
-            .await
-            .unwrap()
-            .expect("custom compaction produces an entry");
-
-        assert_eq!(entry.summary, "CUSTOM-EXTENSION-SUMMARY", "custom summary used verbatim");
-        assert!(entry.from_hook, "entry marked extension-sourced");
-        assert_eq!(entry.tokens_before, 42);
-        assert_eq!(entry.first_kept_entry_id, first_kept);
-        let posted = compactor.hooks().post_compact.lock().unwrap().clone();
-        assert_eq!(posted.len(), 1);
-        assert!(posted[0].from_extension, "post-compact reports extension source (R-05-021)");
-    }
-}
-
-// ----------------------------------------------------------------- A-05-9 ---------------------
-
-#[tokio::test]
-async fn a05_9_before_tree_cancel_and_replace() {
-    let model = faux_model();
-    let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false };
-
-    // (a) Cancel aborts navigation: leaf unchanged, nothing appended.
-    {
-        let hooks = ScriptHooks::default();
-        *hooks.before_tree.lock().unwrap() = Some(BeforeTreeDecision::Cancel);
-        let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
-
-        let cwd = PathBuf::from("/proj/a05_9a");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-        m.append_message(user("shared")).unwrap();
-        let shared = m.append_message(assistant("shared-a")).unwrap();
-        let l1 = m.append_message(assistant("branch-one")).unwrap();
-        m.branch(&shared).unwrap();
-        let l2 = m.append_message(assistant("branch-two")).unwrap();
-        m.branch(&l1).unwrap();
-
-        let before = m.entries().len();
-        let out = compactor
-            .run_branch_summary(&mut m, &model, l2, Some(l1.clone()), true, &settings, CancelToken::new())
-            .await
-            .unwrap();
-        assert!(out.is_none(), "cancel returns no entry");
-        assert_eq!(m.leaf_id(), Some(&l1), "navigation cancelled — leaf unchanged");
-        assert_eq!(m.entries().len(), before, "nothing appended on cancel");
-    }
-
-    // (b) Replace supplies a custom branch summary used verbatim.
-    {
-        let hooks = ScriptHooks::default();
-        *hooks.before_tree.lock().unwrap() = Some(BeforeTreeDecision::CustomSummary {
-            summary: "REPLACED-BRANCH-SUMMARY".to_string(),
-            details: None,
-            overrides: BeforeTreeOverrides::default(),
-        });
-        let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
-
-        let cwd = PathBuf::from("/proj/a05_9b");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-        m.append_message(user("shared")).unwrap();
-        let shared = m.append_message(assistant("shared-a")).unwrap();
-        let l1 = m.append_message(assistant("branch-one")).unwrap();
-        m.branch(&shared).unwrap();
-        let l2 = m.append_message(assistant("branch-two")).unwrap();
-        m.branch(&l1).unwrap();
-
-        let entry = compactor
-            .run_branch_summary(&mut m, &model, l2.clone(), Some(l1), true, &settings, CancelToken::new())
-            .await
-            .unwrap()
-            .expect("replace produces a branch summary");
-        assert_eq!(entry.summary, "REPLACED-BRANCH-SUMMARY");
-        assert!(entry.from_hook, "replacement marked extension-sourced");
-        assert_eq!(m.leaf_id(), Some(&entry.id), "navigated, summary at the nav point");
-    }
-}
-
 // ----------------------------------------------------------------- A-05-10 --------------------
 
 #[tokio::test]
@@ -697,7 +499,7 @@ async fn a05_10_summary_has_all_sections_and_file_blocks() {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(vec![faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop)]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()));
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
     let cwd = PathBuf::from("/proj/a05_10");
@@ -711,7 +513,7 @@ async fn a05_10_summary_has_all_sections_and_file_blocks() {
     m.append_message(assistant("reply with enough words to matter here now okay done")).unwrap();
 
     let entry = compactor
-        .run_compaction(&mut m, &model, &settings, CompactionReason::Manual, None, false, CancelToken::new())
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("compaction should run");
@@ -891,7 +693,7 @@ async fn g3_empty_branch_appends_no_content_placeholder() {
     // the branch: it appends the placeholder entry too.
     let faux = Arc::new(FauxProvider::new()); // no scripted response needed: short-circuits the model
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()));
     let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt: false };
 
     let cwd = PathBuf::from("/proj/g3");
@@ -1109,32 +911,6 @@ fn bash_msg(command: &str, output: &str, excluded: bool) -> AgentMessage {
     })
 }
 
-/// A hook dispatcher that captures the `BeforeCompactEvent` it was handed.
-#[derive(Default)]
-struct CapturingHooks {
-    events: Mutex<Vec<BeforeCompactEvent>>,
-}
-
-impl CompactionHooks for CapturingHooks {
-    async fn before_compact(
-        &self,
-        ev: &BeforeCompactEvent,
-        _cancel: CancelToken,
-    ) -> Result<BeforeCompactDecision, CompactionError> {
-        self.events.lock().unwrap().push(ev.clone());
-        Ok(BeforeCompactDecision::Proceed)
-    }
-    async fn post_compact(&self, _ev: &PostCompactEvent) {}
-    async fn before_tree(
-        &self,
-        _ev: &BeforeTreeEvent,
-        _cancel: CancelToken,
-    ) -> Result<BeforeTreeDecision, CompactionError> {
-        Ok(BeforeTreeDecision::proceed())
-    }
-    async fn post_tree(&self, _ev: &PostTreeEvent) {}
-}
-
 // ------------------------------------------------------------------ F-1 -----------------------
 
 #[test]
@@ -1172,7 +948,7 @@ fn f1_empty_branch_summary_is_neither_a_cut_point_nor_a_turn_start() {
 async fn f1_empty_branch_summary_compaction_summarizes_the_split_turn() {
     // Observable end-to-end consequence of the predicate above.
     let summ = RecordingSummarizer::new(vec!["PREFIX-SUMMARY"]);
-    let compactor = Compactor::new(summ, NoHooks);
+    let compactor = Compactor::new(summ);
     let model = faux_model();
     let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 8 };
 
@@ -1191,15 +967,7 @@ async fn f1_empty_branch_summary_compaction_summarizes_the_split_turn() {
     m.append_message(user("recent")).unwrap();
 
     let entry = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &settings,
-            CompactionReason::Manual,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("compaction runs");
@@ -1290,35 +1058,21 @@ fn f3_session() -> SessionManager {
 }
 
 #[tokio::test]
-async fn f3_before_compact_event_carries_raw_agent_messages() {
+async fn f3_compaction_preparation_carries_raw_agent_messages() {
     // Pi's `getMessageFromEntryForCompaction` returns `sessionEntryToContextMessages(entry)[0]` — a
     // RAW `AgentMessage` with its role intact (`compaction.ts:80-85`), and `convertToLlm` is applied
     // later, inside `generateSummary`. cyrup rendered to core `Message`s in `prepareCompaction`, so a
     // guest saw `{role:"user", text:"Ran `npm test`…"}`, could not read `customType`, and never saw
-    // `!!`-excluded commands at all.
+    // `!!`-excluded commands at all. The preparation is what the session service hands to the
+    // `session_before_compact` extension hook, so this is the shape a guest actually sees.
     let summ = RecordingSummarizer::new(vec!["HISTORY-SUMMARY"]);
-    let compactor = Compactor::new(summ, CapturingHooks::default());
+    let compactor = Compactor::new(summ);
     let model = faux_model();
     let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 7 };
     let mut m = f3_session();
 
-    compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &settings,
-            CompactionReason::Manual,
-            None,
-            false,
-            CancelToken::new(),
-        )
-        .await
-        .unwrap()
-        .expect("compaction runs");
-
-    let events = compactor.hooks().events.lock().unwrap().clone();
-    assert_eq!(events.len(), 1);
-    let msgs = serde_json::to_value(&events[0].messages_to_summarize).unwrap();
+    let (prep, _branch) = compactor.prepare(&m, &settings).expect("something to compact");
+    let msgs = serde_json::to_value(&prep.messages_to_summarize).unwrap();
     let arr = msgs.as_array().expect("array");
     assert_eq!(arr.len(), 3, "every projected entry is present, `!!` included: {msgs}");
     assert_eq!(arr[0]["role"], "bashExecution", "roles are preserved: {msgs}");
@@ -1331,6 +1085,12 @@ async fn f3_before_compact_event_carries_raw_agent_messages() {
     assert_eq!(arr[2]["role"], "custom", "a custom_message keeps its role: {msgs}");
     assert_eq!(arr[2]["customType"], "ext.note");
     assert_eq!(arr[2]["content"], "injected note");
+
+    compactor
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
+        .await
+        .unwrap()
+        .expect("compaction runs");
 
     // ...and the summarization prompt text is UNCHANGED: `convertToLlm` still runs, just later.
     let prompts = compactor.summarizer().prompts();
@@ -1380,18 +1140,10 @@ async fn f3_compaction_is_append_only_on_disk() {
     let file = m.session_file().unwrap().to_path_buf();
     let before = std::fs::read_to_string(&file).unwrap();
 
-    let compactor = Compactor::new(RecordingSummarizer::new(vec!["HISTORY-SUMMARY"]), NoHooks);
+    let compactor = Compactor::new(RecordingSummarizer::new(vec!["HISTORY-SUMMARY"]));
     let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 7 };
     compactor
-        .run_compaction(
-            &mut m,
-            &faux_model(),
-            &settings,
-            CompactionReason::Manual,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &faux_model(), &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("compaction runs");
@@ -1567,7 +1319,7 @@ async fn f4_compaction_entry_records_the_summed_usage_of_a_split_turn() {
     let mut prefix = usage_of(7, 3, 0.25);
     prefix.cache_read = 11;
     prefix.reasoning = Some(4); // present on ONE side only — Pi still emits the merged key
-    let compactor = Compactor::new(UsageSummarizer::new(vec![history, prefix]), NoHooks);
+    let compactor = Compactor::new(UsageSummarizer::new(vec![history, prefix]));
     let model = faux_model();
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
@@ -1580,15 +1332,7 @@ async fn f4_compaction_entry_records_the_summed_usage_of_a_split_turn() {
     m.append_message(assistant(&"x ".repeat(120))).unwrap();
 
     let entry = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &settings,
-            CompactionReason::Manual,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("split-turn compaction produces an entry");
@@ -1638,7 +1382,7 @@ async fn f4_a_single_summarization_call_records_exactly_its_own_usage() {
     let lay = layout(root.path(), &cwd);
 
     let only = usage_of(64, 8, 0.125);
-    let compactor = Compactor::new(UsageSummarizer::new(vec![only.clone()]), NoHooks);
+    let compactor = Compactor::new(UsageSummarizer::new(vec![only.clone()]));
     let model = faux_model();
     let settings = CompactionSettings { enabled: true, reserve_tokens: 100, keep_recent_tokens: 8 };
 
@@ -1657,15 +1401,7 @@ async fn f4_a_single_summarization_call_records_exactly_its_own_usage() {
     m.append_message(user("recent")).unwrap();
 
     let entry = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &settings,
-            CompactionReason::Manual,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &settings, None, CancelToken::new())
         .await
         .unwrap()
         .expect("compaction runs");
@@ -1890,22 +1626,13 @@ async fn f6_a_transient_stream_drop_is_retried_and_the_compaction_still_lands() 
     let compactor = Compactor::new(
         ProviderSummarizer::new(faux.clone(), model.clone())
             .with_retry(RetryPolicy::new(true, 3, 0)),
-        NoHooks,
     );
 
     let mut m = f6_session(root.path(), &cwd);
     let entries_before = m.entries().len();
 
     let entry = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &f6_settings(),
-            CompactionReason::Threshold,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &f6_settings(), None, CancelToken::new())
         .await
         .unwrap()
         .expect("the retried attempt produces a compaction entry");
@@ -1944,22 +1671,14 @@ async fn f6_a_with_retries_disabled_the_same_drop_kills_the_compaction() {
         faux_assistant_message(vec![faux_text(FULL_SUMMARY)], StopReason::Stop).into(),
     ]);
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()));
 
     let mut m = f6_session(root.path(), &cwd);
     let entries_before = m.entries().len();
     let before: Vec<String> = m.build_context().messages.iter().map(first_text).collect();
 
     let err = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &f6_settings(),
-            CompactionReason::Threshold,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &f6_settings(), None, CancelToken::new())
         .await
         .expect_err("the first drop fails the whole compaction");
     assert!(matches!(err, CompactionError::Summarization(_)), "{err:?}");
@@ -1987,22 +1706,13 @@ async fn f6_a_a_quota_error_fails_fast_even_with_retries_enabled() {
     let compactor = Compactor::new(
         ProviderSummarizer::new(faux.clone(), model.clone())
             .with_retry(RetryPolicy::new(true, 5, 60_000)),
-        NoHooks,
     );
 
     let mut m = f6_session(root.path(), &cwd);
     let entries_before = m.entries().len();
 
     let err = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &f6_settings(),
-            CompactionReason::Threshold,
-            None,
-            false,
-            CancelToken::new(),
-        )
+        .run_compaction(&mut m, &model, &f6_settings(), None, CancelToken::new())
         .await
         .expect_err("a deterministic provider error is terminal");
     assert!(matches!(err, CompactionError::Summarization(_)), "{err:?}");
@@ -2025,20 +1735,12 @@ async fn f6_b_summarization_is_isolated_from_the_session_cache_and_routing() {
     // Enough scripted steps for both rounds whether or not either cut splits a turn.
     faux.set_response_steps((0..6).map(|_| spy.step(FULL_SUMMARY)).collect());
     let model = faux.model().clone();
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks);
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()));
 
     let mut m = f6_session(root.path(), &cwd);
     for round in 0..2 {
         let entry = compactor
-            .run_compaction(
-                &mut m,
-                &model,
-                &f6_settings(),
-                CompactionReason::Threshold,
-                None,
-                false,
-                CancelToken::new(),
-            )
+            .run_compaction(&mut m, &model, &f6_settings(), None, CancelToken::new())
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("round {round} compacts"));
@@ -2096,7 +1798,7 @@ async fn f6_c_the_session_thinking_level_reaches_both_summarization_halves() {
     faux.set_response_steps(vec![spy.step("HISTORY-SUMMARY"), spy.step("PREFIX-SUMMARY")]);
     let mut model = faux.model().clone();
     model.reasoning = true;
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks)
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()))
         .with_thinking(ModelThinkingLevel::High);
 
     let cwd = PathBuf::from("/proj/f6_thinking");
@@ -2111,9 +1813,7 @@ async fn f6_c_the_session_thinking_level_reaches_both_summarization_halves() {
             &mut m,
             &model,
             &CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 },
-            CompactionReason::Manual,
             None,
-            false,
             CancelToken::new(),
         )
         .await
@@ -2153,16 +1853,14 @@ async fn f6_c_thinking_is_withheld_from_non_reasoning_models_and_branch_summarie
     let l2 = m.append_message(assistant("branch two answer with some words")).unwrap();
 
     // (a) A non-reasoning model never receives a level, however the session is configured.
-    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()), NoHooks)
+    let compactor = Compactor::new(ProviderSummarizer::new(faux.clone(), model.clone()))
         .with_thinking(ModelThinkingLevel::High);
     compactor
         .run_compaction(
             &mut m,
             &model,
             &CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 },
-            CompactionReason::Manual,
             None,
-            false,
             CancelToken::new(),
         )
         .await
@@ -2173,7 +1871,7 @@ async fn f6_c_thinking_is_withheld_from_non_reasoning_models_and_branch_summarie
     let mut reasoning_model = faux.model().clone();
     reasoning_model.reasoning = true;
     let branch_compactor =
-        Compactor::new(ProviderSummarizer::new(faux.clone(), reasoning_model.clone()), NoHooks)
+        Compactor::new(ProviderSummarizer::new(faux.clone(), reasoning_model.clone()))
             .with_thinking(ModelThinkingLevel::High);
     let summary = branch_compactor
         .run_branch_summary(
@@ -2208,7 +1906,7 @@ async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
     let big = |marker: &str| format!("{marker} {}", "x".repeat(40_000 - marker.len() - 1));
 
     let summarizer = RecordingSummarizer::new(vec![FULL_SUMMARY, FULL_SUMMARY]);
-    let compactor = Compactor::new(summarizer, NoHooks);
+    let compactor = Compactor::new(summarizer);
 
     let cwd = PathBuf::from("/proj/f6_budget");
     let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
@@ -2252,7 +1950,7 @@ async fn f6_d_a_zero_context_window_still_caps_the_branch_summary_prompt() {
     // proving the truncation above comes from the 128000 fallback and not from some other limit.
     let mut wide = faux_model();
     wide.context_window = 400_000;
-    let wide_compactor = Compactor::new(RecordingSummarizer::new(vec![FULL_SUMMARY]), NoHooks);
+    let wide_compactor = Compactor::new(RecordingSummarizer::new(vec![FULL_SUMMARY]));
     let mut m2 = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
     m2.append_message(user("shared question")).unwrap();
     let shared2 = m2.append_message(assistant("shared answer")).unwrap();
@@ -2527,7 +2225,7 @@ async fn sess022_declined_summary_never_calls_the_summarizer_or_appends() {
     let model = faux_model();
     for skip_prompt in [false, true] {
         let rec = Arc::new(RecordingSummarizer::new(vec!["SHOULD-NEVER-RUN"]));
-        let compactor = Compactor::new(RecordingArc(rec.clone()), ScriptHooks::default());
+        let compactor = Compactor::new(RecordingArc(rec.clone()));
         let settings = BranchSummarySettings { reserve_tokens: 16384, skip_prompt };
 
         let cwd = PathBuf::from("/proj/sess022");
@@ -2562,102 +2260,8 @@ async fn sess022_declined_summary_never_calls_the_summarizer_or_appends() {
     }
 }
 
-/// SESS-034 — the before-tree hook's `customInstructions` / `replaceInstructions` / `label` reach
-/// the generator and the appended entry.
-///
-/// Pi reads all three off the single `SessionBeforeTreeResult` (`agent-session.ts:2968-2976`) and
-/// `generateBranchSummary` selects the instructions at `branch-summarization.ts:326-334`; the label
-/// is attached to the summary entry at `agent-session.ts:3050-3052`.
-#[tokio::test]
-async fn sess034_before_tree_instructions_and_label_reach_the_generator() {
-    let model = faux_model();
-
-    async fn run(
-        decision: BeforeTreeDecision,
-    ) -> (Vec<String>, SessionManager, Option<BranchSummaryEntry>) {
-        let rec = Arc::new(RecordingSummarizer::new(vec!["S"]));
-        let hooks = ScriptHooks::default();
-        *hooks.before_tree.lock().unwrap() = Some(decision);
-        let compactor = Compactor::new(RecordingArc(rec.clone()), hooks);
-        let settings = BranchSummarySettings::default();
-
-        let cwd = PathBuf::from("/proj/sess034");
-        let mut m = SessionManager::in_memory(&cwd, NewSessionOpts::default()).unwrap();
-        m.append_message(user("shared")).unwrap();
-        let shared = m.append_message(assistant("shared-a")).unwrap();
-        m.append_message(user("abandoned question")).unwrap();
-        let abandoned = m.append_message(assistant("abandoned answer")).unwrap();
-        let entry = compactor
-            .run_branch_summary(
-                &mut m,
-                &faux_model(),
-                shared,
-                Some(abandoned),
-                true,
-                &settings,
-                CancelToken::new(),
-            )
-            .await
-            .unwrap();
-        (rec.prompts(), m, entry)
-    }
-    let _ = &model;
-
-    // (a) customInstructions alone → appended after the standard prompt.
-    let (prompts, _m, _e) = run(BeforeTreeDecision::Proceed {
-        overrides: BeforeTreeOverrides {
-            custom_instructions: Some("focus on the API surface".into()),
-            ..BeforeTreeOverrides::default()
-        },
-    })
-    .await;
-    assert_eq!(prompts.len(), 1);
-    assert!(
-        prompts[0].contains("Additional focus: focus on the API surface"),
-        "branch-summarization.ts:331; got:\n{}",
-        prompts[0]
-    );
-    assert!(prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT), "prompt still present");
-
-    // (b) replaceInstructions + customInstructions → the custom text ALONE.
-    let (prompts, _m, _e) = run(BeforeTreeDecision::Proceed {
-        overrides: BeforeTreeOverrides {
-            custom_instructions: Some("ONLY THIS".into()),
-            replace_instructions: Some(true),
-            ..BeforeTreeOverrides::default()
-        },
-    })
-    .await;
-    assert!(prompts[0].ends_with("ONLY THIS"), "branch-summarization.ts:329; got:\n{}", prompts[0]);
-    assert!(
-        !prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT),
-        "replaceInstructions drops the standard prompt"
-    );
-
-    // (c) replaceInstructions WITHOUT customInstructions → pi's `&&` makes it a no-op.
-    let (prompts, _m, _e) = run(BeforeTreeDecision::Proceed {
-        overrides: BeforeTreeOverrides {
-            replace_instructions: Some(true),
-            ..BeforeTreeOverrides::default()
-        },
-    })
-    .await;
-    assert!(prompts[0].contains(crate::compaction::BRANCH_SUMMARY_PROMPT));
-
-    // (d) label → attached to the SUMMARY entry (agent-session.ts:3050-3052).
-    let (_prompts, m, entry) = run(BeforeTreeDecision::Proceed {
-        overrides: BeforeTreeOverrides {
-            label: Some("explored".into()),
-            ..BeforeTreeOverrides::default()
-        },
-    })
-    .await;
-    let entry = entry.expect("a summary was produced");
-    assert_eq!(m.label(&entry.id), Some("explored"), "label lands on the summary entry");
-}
-
-/// SESS-042 — a cancel landing before the append must not mutate the session file, on ANY of the
-/// three summary sources.
+/// SESS-042 — a cancel landing before the append must not mutate the session file, on EITHER
+/// summary source (the default summarizer, or an extension-supplied override).
 ///
 /// Pi re-tests the signal immediately before `appendCompaction`, unconditionally: the manual path
 /// throws `new Error("Compaction cancelled")` (`agent-session.ts:1868-1870`) and the auto path
@@ -2666,31 +2270,19 @@ async fn sess034_before_tree_instructions_and_label_reach_the_generator() {
 async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
     let model = faux_model();
 
-    // A hook that cancels the token WHILE producing a custom summary — the exact window pi guards.
-    struct CancellingHook {
-        cancel: CancelToken,
-        summary: Mutex<Option<BeforeCompactDecision>>,
-    }
-    impl CompactionHooks for CancellingHook {
-        async fn before_compact(
+    // A summarizer that cancels the token WHILE producing its summary — the exact window pi guards:
+    // the stream settles, so the summarizer itself returns `Ok`, and only the re-check before the
+    // append can stop the write.
+    struct CancellingSummarizer(CancelToken);
+    impl Summarizer for CancellingSummarizer {
+        async fn complete(
             &self,
-            _ev: &BeforeCompactEvent,
+            _req: SummarizationRequest<'_>,
             _cancel: CancelToken,
-        ) -> Result<BeforeCompactDecision, CompactionError> {
-            self.cancel.cancel();
-            Ok(self.summary.lock().unwrap().take().unwrap_or(BeforeCompactDecision::Proceed))
+        ) -> Result<AssistantMessage, CompactionError> {
+            self.0.cancel();
+            Ok(faux_assistant_message(vec![faux_text("LATE-SUMMARY")], StopReason::Stop))
         }
-        async fn post_compact(&self, _ev: &PostCompactEvent) {
-            panic!("post_compact must not fire for a cancelled compaction");
-        }
-        async fn before_tree(
-            &self,
-            _ev: &BeforeTreeEvent,
-            _cancel: CancelToken,
-        ) -> Result<BeforeTreeDecision, CompactionError> {
-            Ok(BeforeTreeDecision::proceed())
-        }
-        async fn post_tree(&self, _ev: &PostTreeEvent) {}
     }
 
     fn seeded(dir: &str) -> SessionManager {
@@ -2704,31 +2296,13 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
     }
     let settings = CompactionSettings { enabled: true, reserve_tokens: 10, keep_recent_tokens: 20 };
 
-    // (a) hook-supplied `Custom` summary — the only path with no cancellation awareness at all.
+    // (a) the default summarizer settles AFTER the cancel lands.
     let cancel = CancelToken::new();
-    let hooks = CancellingHook {
-        cancel: cancel.clone(),
-        summary: Mutex::new(Some(BeforeCompactDecision::Custom {
-            summary: "HOOK-SUMMARY".into(),
-            first_kept_entry_id: EntryId::from("deadbeef"),
-            tokens_before: 1,
-            details: None,
-            usage: None,
-        })),
-    };
-    let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))), hooks);
+    let compactor = Compactor::new(CancellingSummarizer(cancel.clone()));
     let mut m = seeded("/proj/sess042a");
     let before = m.entries().len();
     let err = compactor
-        .run_compaction(
-            &mut m,
-            &model,
-            &settings,
-            CompactionReason::Manual,
-            None,
-            false,
-            cancel,
-        )
+        .run_compaction(&mut m, &model, &settings, None, cancel)
         .await
         .expect_err("a cancelled compaction is an error, not a success");
     assert!(matches!(err, CompactionError::Aborted), "got {err:?}");
@@ -2737,24 +2311,17 @@ async fn sess042_cancel_before_append_writes_nothing_on_every_summary_source() {
 
     // (b) extension override — `run_compaction_prepared`'s `external_override` branch.
     let cancel = CancelToken::new();
-    let compactor = Compactor::new(
-        RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))),
-        ScriptHooks::default(),
-    );
+    let compactor = Compactor::new(RecordingArc(Arc::new(RecordingSummarizer::new(vec![]))));
     let mut m = seeded("/proj/sess042b");
-    let (prep, branch_entries) = compactor.prepare(&m, &settings).expect("something to compact");
+    let (prep, _branch_entries) = compactor.prepare(&m, &settings).expect("something to compact");
     let before = m.entries().len();
     cancel.cancel();
     let err = compactor
         .run_compaction_prepared(
             &mut m,
             &model,
-            &settings,
-            CompactionReason::Threshold,
             None,
-            false,
             &prep,
-            branch_entries,
             Some(CompactionOverride {
                 summary: "EXT-SUMMARY".into(),
                 ..CompactionOverride::default()
