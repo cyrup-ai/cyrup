@@ -157,7 +157,7 @@ pub async fn run_interactive(
     session: Arc<AgentSession>,
     inputs: Inputs,
     // `--verbose` — Pi's `options.verbose`, which overrides `quietStartup` for the startup listing
-    // (`cli.rs:818` has always advertised exactly that; TUI-006 makes it true).
+    // (`cli/help.rs` has always advertised exactly that; TUI-006 makes it true).
     verbose: bool,
     cancel: CancelToken,
     // The detached startup package-update check's answer channel (Pi `interactive-mode.ts:850-856`);
