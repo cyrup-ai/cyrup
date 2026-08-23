@@ -46,8 +46,8 @@ pub struct AcceptanceFileOutput<'a> {
 /// ```
 ///
 /// Ported as a choice of SOURCE TEXT rather than of parse result, because every rung of
-/// [`evaluate_acceptance`] re-reads the report from text ([`self_report_floor`]'s companion-key
-/// probe and [`declared_structural_failures`]'s full parse want the same source). The selection
+/// [`crate::exec::acceptance::model::evaluate::evaluate_acceptance`] re-reads the report from text ([`self_report_floor`]'s companion-key
+/// probe and `declared_structural_failures`'s full parse want the same source). The selection
 /// rule is identical: the primary source wins whenever it yields a report OR any parse error other
 /// than "not found"; only a genuinely absent report falls through to the secondary.
 pub(crate) fn select_acceptance_report_source<'a>(

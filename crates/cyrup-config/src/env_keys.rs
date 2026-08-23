@@ -24,13 +24,13 @@ use std::collections::HashMap;
 /// `bedrock_ambient_credentials_detected` is hermetic where this module's was not. Same shape,
 /// same precedence — overlay first, then ambient, empty treated as unset at both tiers.
 #[derive(Clone, Copy)]
-enum Ambient<'a> {
+pub(crate) enum Ambient<'a> {
     /// Production: read the real process environment.
     Process,
-    /// Test: read a fixed map, so "unset" is a property of the fixture, not of the host.
-    /// Only ever constructed under `cfg(test)` — production always resolves through
-    /// [`Self::Process`], so this carries no runtime cost and changes no shipped behavior.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// An injected fixture, so "unset" is a property of the fixture and not of the host. Reached in
+    /// production builds via [`crate::auth::AuthStore::with_ambient_env`], which is how a consumer
+    /// in ANOTHER crate — `cyrup-modes`' `rpc_cycle_model_spans_the_full_auth_filtered_registry` —
+    /// gets the same hermeticity this module's own unit tests get.
     Fixed(&'a HashMap<String, String>),
 }
 
@@ -131,7 +131,7 @@ pub fn find_env_keys(provider: &str, env: Option<&HashMap<String, String>>) -> O
     find_env_keys_in(provider, env, Ambient::Process)
 }
 
-fn find_env_keys_in(
+pub(crate) fn find_env_keys_in(
     provider: &str,
     env: Option<&HashMap<String, String>>,
     ambient: Ambient<'_>,
@@ -169,7 +169,7 @@ pub fn get_env_api_key(provider: &str, env: Option<&HashMap<String, String>>) ->
     get_env_api_key_in(provider, env, Ambient::Process)
 }
 
-fn get_env_api_key_in(
+pub(crate) fn get_env_api_key_in(
     provider: &str,
     env: Option<&HashMap<String, String>>,
     ambient: Ambient<'_>,

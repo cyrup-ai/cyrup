@@ -601,10 +601,10 @@ pub(crate) fn render_parallel_tool_summary(group: &GroupStepResult, agents: &[St
 ///
 /// # The SUBA-041 invariant, stated accurately
 ///
-/// This schema must never advertise a parameter [`SubagentTool::route_single`] refuses
+/// This schema must never advertise a parameter [`crate::extension::SubagentTool::route_single`] refuses
 /// UNCONDITIONALLY — and it no longer refuses any. All nine SINGLE-mode overrides (`output`,
 /// `outputMode`, `skill`, `acceptance`, `share`, `sessionDir`, `artifacts`, `control`,
-/// `includeProgress`) reach [`RunOptions`] on the FOREGROUND path and are advertised for that
+/// `includeProgress`) reach [`crate::exec::RunOptions`] on the FOREGROUND path and are advertised for that
 /// reason.
 ///
 /// SUBA-N06 restored `includeProgress`, the last withhold. It was absent for exactly one reason —
@@ -626,7 +626,7 @@ pub(crate) fn render_parallel_tool_summary(group: &GroupStepResult, agents: &[St
 /// pipeline — and that reason is gone: [`crate::exec::control`] ports
 /// `runs/shared/subagent-control.ts` in full, [`crate::exec::control::ControlMonitor`] raises real
 /// `ControlEvent`s off the child's NDJSON stream, and
-/// [`SubagentExecutor::foreground_control_notifier`] delivers them through
+/// [`crate::extension::SubagentExecutor::foreground_control_notifier`] delivers them through
 /// [`crate::tui::notices::ControlNoticeState`]. It is honoured on the ASYNC path too — the resolved
 /// config rides to the detached hop-2 runner on [`crate::background::runner_main::RunnerConfig`],
 /// matching upstream's `executeAsyncSingle(id, { …, controlConfig, … })`
@@ -760,7 +760,7 @@ fn chain_step_requested_spawns(step: &serde_json::Value, cfg: &SubagentExtension
 
 /// The SAME charge as [`count_requested_subagent_spawns`], counted over an ALREADY-LOWERED
 /// [`RunnerStep`] graph — the shape this crate's slash surface (`/chain`, `/parallel`,
-/// `/run-chain`) hands to [`SubagentExecutor::run_or_background_graph`] (SUBA-002).
+/// `/run-chain`) hands to [`crate::extension::SubagentExecutor::run_or_background_graph`] (SUBA-002).
 ///
 /// pi needs no lowered-form counter because every slash handler funnels back into the very same
 /// `executor.execute` the tool uses (`slash/slash-commands.ts` `runSlashSubagent` ->

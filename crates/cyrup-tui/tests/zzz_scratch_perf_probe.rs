@@ -72,9 +72,18 @@ impl Backend for CaptureBackend {
     // added both methods to `Backend`. Delegated to the inner crossterm backend exactly as the
     // production `InlineBackend` does (`src/app/backend.rs:193`, `:198`) — this probe captures the
     // real byte stream, so it must emit the same escapes the real backend would.
+    //
+    // Gated exactly as that production impl (and the two in-src capture backends,
+    // `src/tests/inline_stacking.rs:127` and `src/tests/resize_viewport_failure.rs:113`) are:
+    // `Backend` declares these two ONLY under `ratatui/scrolling-regions`, and this file self-gates
+    // on `scrollback-accumulator`, NOT on `scrolling-regions`. So an ungated impl is `E0407` x2 in a
+    // `--no-default-features --features scrollback-accumulator` build — the one combination where
+    // the file compiles while the trait methods do not exist.
+    #[cfg(feature = "scrolling-regions")]
     fn scroll_region_up(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
         self.inner.scroll_region_up(region, amount)
     }
+    #[cfg(feature = "scrolling-regions")]
     fn scroll_region_down(&mut self, region: std::ops::Range<u16>, amount: u16) -> io::Result<()> {
         self.inner.scroll_region_down(region, amount)
     }

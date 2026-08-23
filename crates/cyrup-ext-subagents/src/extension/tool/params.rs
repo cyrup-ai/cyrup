@@ -75,7 +75,7 @@ pub(crate) fn normalize_public_subagent_execution(action: Option<&str>) -> Resul
 /// "doctor"`). Parsing is deliberately permissive (DI-SA-11): every field is optional, unknown keys
 /// are ignored, and the union's genuinely-open sub-shapes (`config`/`control`/`output`/`skill`/
 /// `acceptance`, and the per-item `tasks[]`/`chain[]` element shapes) are captured as raw
-/// [`serde_json::Value`] here — the LLM-facing JSON Schema in [`subagent_tool_parameters`] carries
+/// [`serde_json::Value`] here — the LLM-facing JSON Schema in [`crate::extension::tool::schema::subagent_tool_parameters`] carries
 /// the full per-field structural detail, while typed per-item parsing/routing of `tasks[]`/`chain[]`
 /// lands in P1 (this tier owns the schema + dispatch skeleton, not the sub-executor routing).
 #[derive(Clone, Debug, serde::Deserialize)]
@@ -296,7 +296,7 @@ pub(crate) fn resolve_execution_agent_scope(raw: Option<&str>) -> AgentReadScope
 /// pi `formatFailedSingleRunOutput` (`subagent-executor.ts:1569-1580`): the delivered content for a
 /// FAILED single run — the error text (`result.error` or `"Failed"`), followed, ONLY when the run
 /// produced distinct output, by an `Output:` block carrying that output. This is what
-/// [`SubagentTool::route_single`] hands to `ToolError` (cyrup's error channel; pi's `isError: true`),
+/// [`crate::extension::SubagentTool::route_single`] hands to `ToolError` (cyrup's error channel; pi's `isError: true`),
 /// so an LLM caller sees the failure reason in the model-facing CONTENT rather than only buried in
 /// `details` JSON. (pi additionally appends an `Output artifact:` line from
 /// `result.artifactPaths?.outputPath`; this crate's [`SingleResult`] carries no such field — the

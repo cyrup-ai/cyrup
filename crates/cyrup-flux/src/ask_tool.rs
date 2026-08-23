@@ -1,5 +1,5 @@
 //! `ask_user_question` — the native tool bridging code-puppy flux's structured mid-task
-//! question tool onto `HostServices::select` under the [`HumanInteractionLock`] (port doc
+//! question tool onto `HostServices::select` under the [`cyrup_ext::HumanInteractionLock`] (port doc
 //! §3.4.4 / §5.1). Closes the only real capability gap between code-puppy flux and cyrup flux:
 //! everything else ports as a prompt template, but a mid-turn structured question needs a real
 //! tool call.

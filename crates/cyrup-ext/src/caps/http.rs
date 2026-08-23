@@ -59,7 +59,7 @@ type ChunkStream = Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Se
 /// large (or unbounded chunked) body. Mirrors the exact bound `cyrup_ext::caps::proc`'s
 /// `MAX_PIPE_BUFFER_BYTES` (`proc.rs`) already established for this identical class of
 /// shared-host-resource exhaustion, ported here to close the one capability that skipped it.
-/// [`Self::request_stream`]/[`Self::poll_stream_chunk`] don't need this: the host never
+/// [`HttpCaps::request_stream`]/[`HttpCaps::poll_stream_chunk`] don't need this: the host never
 /// accumulates their body — the guest drains it one already-bounded network chunk at a time.
 const MAX_RESPONSE_BODY_BYTES: usize = 16 * 1024 * 1024;
 
@@ -153,16 +153,16 @@ pub struct HttpCaps {
     streams: Mutex<HashMap<u32, StreamSlot>>,
     next_handle: AtomicU32,
     /// [`MAX_OPEN_STREAMS`] in production; overridable ONLY for tests
-    /// ([`Self::with_max_open_streams`]) so the cap-rejection path is exercisable without actually
+    /// (`HttpCaps::with_max_open_streams`, `#[cfg(test)]`) so the cap-rejection path is exercisable without actually
     /// opening 256 real concurrent sockets (flaky under full-suite parallel test execution, which
     /// contends for the same loopback networking resources across many unrelated tests at once).
     max_open_streams: usize,
     /// [`DEFAULT_REQUEST_TIMEOUT`] in production; overridable ONLY for tests
-    /// ([`Self::with_request_timeout`]) so the fallback-timeout path is exercisable without a real
+    /// (`HttpCaps::with_request_timeout`, `#[cfg(test)]`) so the fallback-timeout path is exercisable without a real
     /// test waiting the full production duration.
     request_timeout: Duration,
     /// [`HTTP_POLL_IDLE_TIMEOUT`] in production; overridable ONLY for tests
-    /// ([`Self::with_poll_idle_timeout`]) so the idle-timeout path is exercisable without a real
+    /// (`HttpCaps::with_poll_idle_timeout`, `#[cfg(test)]`) so the idle-timeout path is exercisable without a real
     /// test waiting the full production duration.
     poll_idle_timeout: Duration,
 }
@@ -188,7 +188,7 @@ impl HttpCaps {
     /// `no_zstd` — available regardless of cargo features, so this compiles either way): that
     /// machinery unconditionally strips `Content-Encoding`/`Content-Length` the instant it
     /// decompresses a body, diverging from the real consumer's `fetch()` (which preserves both —
-    /// verified live against Node's real `fetch()`). [`request`]/[`request_stream`] instead
+    /// verified live against Node's real `fetch()`). [`Self::request`]/[`Self::request_stream`] instead
     /// advertise `fetch()`'s own real `Accept-Encoding` default (`build_request`) and decompress
     /// manually via [`decode_buffered`]/[`decode_stream`], so the caller sees the decompressed body
     /// AND the untouched original headers.

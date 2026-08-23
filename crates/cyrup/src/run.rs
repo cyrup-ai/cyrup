@@ -138,7 +138,7 @@ where
 /// * `Aborted => 130` — pi folds `aborted` into the same `exitCode = 1` as `error` (`:145-147`);
 /// * `Pending => 1` — pi has no such arm; an unsettled last message falls to the `else` and keeps 0.
 ///
-/// This is the shared decision function; [`run_print`](cyrup_modes::run_print) applies it inline in
+/// This is the shared decision function; [`cyrup_modes::run_print`] applies it inline in
 /// pi's own block, and this remains for embedders holding a bare [`AgentSession`].
 pub async fn exit_code(session: &AgentSession) -> i32 {
     use cyrup_sdk::core::{Message, StopReason};

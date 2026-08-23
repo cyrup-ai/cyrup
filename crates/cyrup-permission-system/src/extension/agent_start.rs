@@ -18,8 +18,8 @@ impl PermissionSystemExtension {
     /// MUTATE seam, `contract.rs` `EventPatch::SystemPromptAndInject` → `session.rs`
     /// `assemble_run_messages`):
     /// 1. **Active-tools exposure** (pi `setActiveTools`, `:2155`): for every registered tool
-    ///    ([`HostServices::all_tool_names`], pi `getAllTools`), keep it iff [`Self::should_expose_tool`];
-    ///    restrict the live agent's tool set via [`HostServices::set_active_tools`] (staged as
+    ///    ([`cyrup_ext::HostServices::all_tool_names`], pi `getAllTools`), keep it iff [`Self::should_expose_tool`];
+    ///    restrict the live agent's tool set via [`cyrup_ext::HostServices::set_active_tools`] (staged as
     ///    `pending_active_tools`, drained + applied IN-TURN by `AgentSession::assemble_run_messages`, so
     ///    it shapes turn 1 ordered BEFORE the sanitized prompt). Skipped when no live backend can
     ///    enumerate the registry (pi always has `getAllTools`; the default host does not).
@@ -172,10 +172,10 @@ impl PermissionSystemExtension {
     /// pi `shouldExposeTool` (`index.ts:1791-1816` @v0.8.0; `:2049-2075` @v0.7.1 — the two are the
     /// same function, only `permanentApprovals` was dropped from the `applyPatternApprovalState`
     /// call): keep a tool exposed iff its TOOL-LEVEL permission
-    /// ([`PermissionManager::get_tool_permission`]) — with the session approval overlay (pi
+    /// ([`crate::PermissionManager::get_tool_permission`]) — with the session approval overlay (pi
     /// `applyPatternApprovalState(..., {}, ...)`, `:1795-1803`) — is not `deny`. There is **exactly
     /// one** bypass below that: a `deny` `read` is still exposed when the agent has allowed skills
-    /// ([`PermissionManager::has_allowed_skills`], pi `:1811-1813`) so it can reach skill files.
+    /// ([`crate::PermissionManager::has_allowed_skills`], pi `:1811-1813`) so it can reach skill files.
     /// Everything else denied at the tool level falls through to `false` (pi `:1815`).
     ///
     /// **No bash arm — deliberately (`PERM-009`).** Cyrup previously carried
@@ -184,7 +184,7 @@ impl PermissionSystemExtension {
     /// shipped binary**, reproduced end-to-end (`docs/gap-analysis/REPRO-LOG.md` §`PERM-009`):
     /// `tools.bash: deny` alone correctly withheld the tool, but adding the strictly NARROWER
     /// `bash: {"git status": "allow"}` to the same file re-exposed `bash`, and
-    /// [`PermissionManager::check_permission`]'s bash arm then resolved that command rule ABOVE the
+    /// [`crate::PermissionManager::check_permission`]'s bash arm then resolved that command rule ABOVE the
     /// tool-level deny (`manager.rs`, pi `permission-manager.ts:944-959`), so real `git status`
     /// output came back. A rule that can only ever NARROW an allow must never widen a deny. The
     /// command-rule-over-`toolMatch` precedence in `manager.rs` is pi's and stays as-is; **this

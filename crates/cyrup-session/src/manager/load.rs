@@ -27,7 +27,7 @@ use crate::header::SessionHeader;
 /// deliberately kept: Pi's `loadEntriesFromFile` returns `[]`, and `_setSessionFile` then throws
 /// `Session file is not a valid pi session: <path>` because `statSync(path).size > 0`
 /// (`session-manager.ts:900-906`). Only a MISSING or ZERO-LENGTH file is a soft new session, which
-/// [`SessionManager::open_with_cwd`] handles before reaching here.
+/// [`crate::SessionManager::open_with_cwd`] handles before reaching here.
 pub(super) fn load(path: &Path) -> Result<(SessionHeader, Vec<Entry>, bool), SessionError> {
     let file = std::fs::File::open(path)?;
     let reader = BufReader::new(file);

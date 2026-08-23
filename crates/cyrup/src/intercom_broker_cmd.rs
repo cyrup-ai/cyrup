@@ -8,7 +8,7 @@
 //! `<intercomDir>/broker.sock`, runs the accept/route loop, answers the health probe, and auto-shuts
 //! down 5 s after its last client leaves.
 //!
-//! Never advertised to users: not listed in `--help`, not one of [`crate::subcommands::SUBCOMMANDS`],
+//! Never advertised to users: not listed in `--help`, not one of `crate::subcommands::SUBCOMMANDS`,
 //! and dispatched from `main()` BEFORE any user-facing arg leniency/clap parsing runs — mirroring the
 //! `__subagent-runner` pre-dispatch's placement.
 //!
@@ -28,14 +28,14 @@
 //! the agent-dir env handover and the socket protocol are ported literally.
 //!
 //! **Deliberately undocumented:** `__`-prefixed, absent from `--help` and
-//! [`crate::subcommands::SUBCOMMANDS`], matched only as an exact `argv[1]` ([`is_selected`]).
+//! `crate::subcommands::SUBCOMMANDS`, matched only as an exact `argv[1]` ([`is_selected`]).
 //! Undiscoverable rather than absent — recorded so the invented surface is KNOWN, not assumed parity.
 
-/// The literal argv[0] token identifying this internal subcommand (mirrors
+/// The literal `argv[0]` token identifying this internal subcommand (mirrors
 /// `cyrup_intercom::transport::spawn::INTERCOM_BROKER_SUBCOMMAND`).
 pub const SUBCOMMAND: &str = "__intercom-broker";
 
-/// Returns `true` if `argv` (the process's own args, *including* argv[0]/the binary name at index 0,
+/// Returns `true` if `argv` (the process's own args, *including* `argv[0]`/the binary name at index 0,
 /// matching [`std::env::args`]'s shape) selects this internal subcommand.
 #[must_use]
 pub fn is_selected(argv: &[String]) -> bool {

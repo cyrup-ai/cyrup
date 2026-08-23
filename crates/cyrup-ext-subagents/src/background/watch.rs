@@ -686,7 +686,7 @@ impl CompletionSink for HostServicesCompletionSink {
     }
 }
 
-/// Derive the human-facing summary text for a completed run from its per-child [`SingleResult`]s
+/// Derive the human-facing summary text for a completed run from its per-child [`crate::exec::SingleResult`]s
 /// (pi's `SubagentResult.summary`, which this crate's [`ResultFile`] does not carry as a distinct
 /// field): each child contributes its `final_output` (or, absent that, its `error`), non-empty
 /// entries joined by a blank line. Empty overall yields `""`, which [`format_completion_message`]

@@ -1,0 +1,7 @@
+# rustdoc renders this workspace's internals, not a published library façade: the 442
+# `private_intra_doc_links` warnings were all correct cross-references from a public item into the
+# private machinery it is built on (e.g. `HttpCaps` -> `StreamSlot`, `run_rpc` -> `write_pump`).
+# Documenting private items makes those links navigable instead of forcing either a `pub`-ification
+# of internal state machines or the deletion of deliberate cross-references.
+[build]
+rustdocflags = ["--document-private-items"]

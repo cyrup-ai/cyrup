@@ -29,7 +29,7 @@ pub(super) const PROJECT_AGENT_SUBDIR: [&str; 2] = [".cyrup", "agent"];
 ///
 /// **The probe and the engine must both go through this**, or they inspect different trees and
 /// disagree — the PERM-018 hazard, one rung up: [`PermissionSystemExtension::manager_paths_for`]
-/// builds the enforced paths from it and [`is_installed`] probes it.
+/// builds the enforced paths from it and [`crate::is_installed`] probes it.
 #[must_use]
 pub(super) fn policy_agent_dir(agent_dir: &Path) -> PathBuf {
     let Some(raw) = std::env::var(POLICY_AGENT_DIR_ENV_KEY)
@@ -88,7 +88,7 @@ impl PermissionSystemExtension {
     /// pi has exactly one such accessor and every consumer of the extension config funnels through
     /// it — `loadPermissionSystemConfig`'s default argument (`extension-config.ts:117`),
     /// `savePermissionSystemConfig`'s (`:240`), and the config modal's displayed `Config file:` path
-    /// (`index.ts:1509`). cyrup's [`is_installed`] probe was reading the RAW default path instead,
+    /// (`index.ts:1509`). cyrup's [`crate::is_installed`] probe was reading the RAW default path instead,
     /// so with the override set the install decision and the `enabled` decision could inspect two
     /// different files and disagree. This helper is the one accessor; use it, not
     /// [`Self::config_path_for`].

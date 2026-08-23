@@ -66,56 +66,13 @@
 //! exclusion to duplicate at the package/builtin tiers, because they route through the same walk
 //! function as User/Project.
 
-/// Shared `AgentDefinition`/`ChainDefinition` types (func-SA §4.1/§5.1, R-SA-001..022, arch-SA
-/// §3.3). Pure type definitions only — see module doc there for why `AgentDefinition` does not
-/// implement `cyrup_resources::discovery::Named`.
 pub mod types;
-
-/// Hand-rolled YAML-subset frontmatter parser (func-SA §5.1 R-SA-005/006/018; arch-SA §6.2.3).
-/// Parses one agent `.md` file's frontmatter + body into an `AgentDefinition`, applying the
-/// required-field silent-skip (R-SA-005), invalid-package-identifier whole-file skip (R-SA-006),
-/// and name-sensitive `systemPromptMode`/`inheritProjectContext` defaults (R-SA-018). Also reused
-/// by `discovery/chains.rs` for `.chain.md` files via its low-level `parse_frontmatter_block`.
 pub mod frontmatter;
-
-/// Per-agent persistent memory scopes (`memory:` frontmatter) — a port of pi-subagents'
-/// `agents/agent-memory.ts`: scope parsing, containment-checked directory resolution, capped
-/// `MEMORY.md` reading, and the read-write/read-only system-prompt block folded into the child's
-/// persona at spawn by `exec/mod.rs`.
 pub mod agent_memory;
-
-/// Chain-file discovery: `.chain.json` > `.chain.md` same-name precedence within one directory
-/// scan, cross-scope retention (never merged) across scan scopes (func-SA §5.1 R-SA-015; arch-SA
-/// §6.2.2).
 pub mod chains;
-
-/// Agent/chain management CRUD: create/update/delete/rename, restricted to User/Project sources
-/// (R-SA-014), plus the three call-site-dependent `disabled`-visibility views (R-SA-013). Depends
-/// only on `types.rs` (scoping/mutability) and `frontmatter.rs` (read-only reuse for round-trip
-/// re-parsing after a write) — does not depend on `merge.rs` (func-SA §5.1 R-SA-013/014/019;
-/// arch-SA §2.2).
 pub mod management;
-
-/// Skills association (T5, C4): skill-name resolution against a cwd (reusing `cyrup-resources`
-/// discovery), the lazy `<available_skills>` system-prompt injection, the `pi-subagents`
-/// orchestration-skill exclusion, and proactive skill-subagent suggestions — a port of pi-subagents'
-/// `agents/skills.ts:629-714` + `agents/proactive-skills.ts`. Consumed by `exec/mod.rs`'s prompt
-/// assembly (the injection is composed into the child's task text at spawn).
 pub mod skills;
-
-/// Four-tier Builtin/Package/User/Project precedence merge and settings-override application
-/// (func-SA §5.1 R-SA-001/002/004/009/010/011/012/020/021; arch-SA §6.2/§6.2.1). A bespoke, plain
-/// `HashMap`/`Vec` algorithm — deliberately NOT built on `cyrup_resources::discovery::ResourceSet
-/// <T>` (see this module's own doc for why). Consumes already-parsed `Vec<AgentDefinition>` per
-/// tier/scan-scope (as produced by `frontmatter.rs` over a directory walk this module owns); does
-/// no filesystem I/O of its own.
 pub mod merge;
-
-/// The settings-file **writer** side of `subagents.agentOverrides` (pi
-/// `mergeBuiltinAgentOverride`/`removeBuiltinAgentOverride`/`removeBuiltinAgentOverrideFields`,
-/// `agents/agents.ts:1276-1371`) — the read-modify-write half this module's reader-only
-/// [`load_layered_override_settings`] deliberately does not do. Backs the `disable`/`enable`/`reset`
-/// management actions (SUBA-005).
 pub mod settings_write;
 
 use std::path::{Path, PathBuf};
@@ -1028,7 +985,7 @@ fn walk_agent_dir_into(
 
 /// Walk multiple User/Project agent directories in fixed scan order, concatenating their
 /// per-directory [`walk_agent_dir`] results into one flat, scan-ordered `Vec` — the shape
-/// [`merge::reduce_last_seen_wins`] expects for its own last-directory-scanned-wins reduction
+/// `merge::reduce_last_seen_wins` expects for its own last-directory-scanned-wins reduction
 /// (R-SA-002).
 fn walk_agent_dirs(roots: &[PathBuf], source: AgentSource) -> Vec<AgentDefinition> {
     let mut out = Vec::new();

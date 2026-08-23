@@ -95,8 +95,9 @@ pub(crate) fn terminal_released() -> bool {
 /// The budget an arm body of [`App::run`] is expected to finish inside.
 ///
 /// Sized off the healthy ceiling, not off intuition: the `events` arm can legitimately spend
-/// 2 × [`EXTENSION_RENDER_TIMEOUT`] = 4 s on a single event (two `run_renderer` calls per
-/// `EntryAppended`). 8 s is twice that, so a working-but-slow guest renderer never files a report.
+/// 2 × [`super::extension_render_impl::EXTENSION_RENDER_TIMEOUT`] = 4 s on a single event (two
+/// `run_renderer` calls per `EntryAppended`). 8 s is twice that, so a working-but-slow guest
+/// renderer never files a report.
 ///
 /// This is a REPORTING threshold only. It bounds nothing and cannot promote anything — the escape
 /// hatch is driven entirely by unserviced chords, never by elapsed time — so an arm that
@@ -210,9 +211,10 @@ pub(crate) fn hard_exit_from_reader() -> ! {
 /// There is no timer in here, deliberately. "Promote once a chord has gone unserviced for N
 /// seconds" needs an N above the longest LEGITIMATE inline stall, and no such constant exists: a
 /// session-lifecycle hook fan-out is N extensions × `DEFAULT_INVOKE_BUDGET` and a swap replay is M
-/// messages × [`EXTENSION_RENDER_TIMEOUT`], both scaling with the user's configuration. Every
-/// transition here is instead caused by a chord the run loop was then shown not to have serviced,
-/// so the ladder cannot be climbed by a slow-but-working operation no matter how long it takes.
+/// messages × [`super::extension_render_impl::EXTENSION_RENDER_TIMEOUT`], both scaling with the
+/// user's configuration. Every transition here is instead caused by a chord the run loop was then
+/// shown not to have serviced, so the ladder cannot be climbed by a slow-but-working operation no
+/// matter how long it takes.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Escalation {
     /// Nothing outstanding.
@@ -382,7 +384,7 @@ pub fn crossterm_input_stream(cancel: CancelToken) -> EventStream<InputEvent> {
 
 /// Map a crossterm event to our [`InputEvent`] (filtering non-press key kinds).
 ///
-/// Key presses first go through [`rescue_native_shift_enter_live`] — upstream's
+/// Key presses first go through [`crate::native_modifiers::rescue_native_shift_enter`] — upstream's
 /// `ProcessTerminal.forwardInputSequence` normalization (v0.83.0 `tui/src/terminal.ts:305-312`).
 /// On Apple Terminal (and, since v0.84.1, the Windows console) a bare `\r` is all the terminal
 /// sends for BOTH `Enter` and `Shift+Enter`, so the modifier is recovered from the live keyboard

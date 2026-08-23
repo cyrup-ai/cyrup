@@ -115,11 +115,11 @@ impl SubagentExecutor {
         self.run_foreground_impl(req, Some(on_update)).await
     }
 
-    /// Shared body for [`crate::extension::SubagentExecutor::run_foreground`] / [`run_foreground_streaming`]: resolves the persona +
+    /// Shared body for [`crate::extension::SubagentExecutor::run_foreground`] / [`crate::extension::SubagentExecutor::run_foreground_streaming`]: resolves the persona +
     /// fork-context, builds the [`AgentConfig`]/[`RunOptions`], and drives [`crate::exec::run_sync`]
     /// — optionally installing a live-progress sink (`on_update = Some`, C19) that folds the child's
     /// NDJSON stream into [`crate::tui::events::SubagentUpdatePayload`] updates. Returns the run's own
-    /// [`RunId`] alongside the [`SingleResult`] (see [`run_foreground_streaming`]'s doc).
+    /// [`RunId`] alongside the [`SingleResult`] (see [`crate::extension::SubagentExecutor::run_foreground_streaming`]'s doc).
     pub(crate) async fn run_foreground_impl(
         &self,
         req: ForegroundRunRequest<'_>,

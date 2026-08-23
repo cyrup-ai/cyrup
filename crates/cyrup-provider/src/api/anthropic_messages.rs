@@ -69,9 +69,9 @@ impl AnthropicThinkingDisplay {
 
 /// Per-API typed options for the `anthropic-messages` wire protocol (Pi `AnthropicOptions`,
 /// anthropic-messages.ts:183-230). Only the fields cyrup does not already carry on the unified
-/// [`StreamOptions`](crate::StreamOptions) live here; the rest (`thinkingEnabled`,
+/// [`StreamOptions`] live here; the rest (`thinkingEnabled`,
 /// `thinkingBudgetTokens`, `effort`) map onto `StreamOptions.reasoning`/`thinking_budgets`. Carried
-/// via [`StreamOptions::api_options`](crate::StreamOptions::api_options). All fields default to
+/// via [`StreamOptions::api_options`]. All fields default to
 /// `None`, reproducing Pi's defaults exactly.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AnthropicOptions {

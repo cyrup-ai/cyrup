@@ -1,7 +1,7 @@
 //! PRINT mode — one-shot human-oriented text output (func-11 R-11-005/009; arch-11 §2.2).
 //!
 //! Drives a whole turn — the initial prompt plus every follow-up message — to completion over the
-//! [`AgentSession`] seam, then writes ONLY the final assistant message to the caller-supplied
+//! [`cyrup_session_svc::AgentSession`] seam, then writes ONLY the final assistant message to the caller-supplied
 //! [`std::io::Write`] sinks. This mirrors Pi's `runPrintMode` (`modes/print-mode.ts:121-146`), whose
 //! send loop produces no output and whose single terminal output block reads
 //! `state.messages[state.messages.length - 1]` — the final message — exactly once, *outside* the

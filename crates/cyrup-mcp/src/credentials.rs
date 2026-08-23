@@ -753,7 +753,7 @@ fn hex_sha256(bytes: &[u8]) -> String {
 /// * **The empty string is a valid server name** with a valid account (`sha256` of zero bytes). Do
 ///   not special-case it.
 ///
-/// The same token is the legacy directory name ([`auth_entry_file_path`]), which is what makes an
+/// The same token is the legacy directory name ([`McpAuthStore::auth_entry_file_path`]), which is what makes an
 /// arbitrary configured name — `../escape`, `@scope/name`, `сервер` — path-safe. Upstream's
 /// `typeof serverName !== 'string'` guards do not port (MCP-276): the parameter is `&str`, the
 /// value's only origin is a `serde_json` object **key** from `mcp.json`, and the hazard the guard

@@ -15,7 +15,7 @@ pub const DEFAULT_UNNAMED_SESSION_ALIAS_PREFIX: &str = "subagent-chat";
 /// back as its SUPERVISOR's id — see [`read_child_orchestrator_metadata_from`]'s fallback below. A
 /// session never re-reads it as its OWN registration id; that is
 /// `ctx.sessionManager.getSessionId()` (cyrup: `HostServices::session_id()`, see
-/// [`crate::connect::connect_once`]). Reading it for self-registration would make a child
+/// `crate::connect::connect_once`). Reading it for self-registration would make a child
 /// re-register under its parent's id and take the parent's broker slot over.
 pub const ENV_INTERCOM_SESSION_ID: &str = "CYRUP_INTERCOM_SESSION_ID";
 /// `CYRUP_INTERCOM_ASK_TIMEOUT_MS` (`config.ts:8`, pi `PI_INTERCOM_ASK_TIMEOUT_MS`).

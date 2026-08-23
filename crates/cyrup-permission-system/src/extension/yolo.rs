@@ -16,7 +16,7 @@ use super::{PermissionSystemExtension, guard};
 ///
 /// It is a distinct type rather than an `impl` on the extension because the registry must hold a
 /// handle that does NOT keep a finished session's extension alive; see the CYRUP-DELTA on
-/// [`crate::runtime_api`]. The three methods delegate straight to the ported inherent methods, so
+/// [`mod@crate::runtime_api`]. The three methods delegate straight to the ported inherent methods, so
 /// there is exactly ONE implementation of each behaviour — in particular of `set_yolo_mode`'s
 /// persist-failure invariant.
 struct PublishedRuntimeApi {
@@ -166,7 +166,7 @@ impl PermissionSystemExtension {
     ///
     /// Called from `init` — cyrup's analog of upstream's activation body, which is where the
     /// registration sits: AFTER the `enabled` early return (`:1475-1477`, cyrup's
-    /// [`permission_extension_for_env`] returning `None`) and before any handler registration.
+    /// [`crate::permission_extension_for_env`] returning `None`) and before any handler registration.
     ///
     /// A no-op when [`Self::self_ref`] was never installed, i.e. the extension was built by value
     /// rather than through [`Self::into_shared`]. That is the honest state and not a silent

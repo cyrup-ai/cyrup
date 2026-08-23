@@ -17,7 +17,7 @@
 //!    spec anticipates. The timeout-race, allowlist-projection, and "never block/error the caller's
 //!    turn" contracts hold across both.
 //! 2. **The foreground clarify/ask pause primitive** ([`ClarifyRequest`]/[`AskLock`]/
-//!    [`request_clarify`]): R-SA-119's "visibly pause the affected foreground flow while a child's
+//!    [`AskLock::request_clarify`]): R-SA-119's "visibly pause the affected foreground flow while a child's
 //!    clarify request is outstanding" and R-SA-120's "at most one outstanding blocking ask per
 //!    orchestrator session" single-slot lock. This is now WIRED end to end (R-SA-119/120/037
 //!    CLOSED): the intercom companion's broker-backed [`ClarifyChannel`] (`IntercomClarifyChannel`,
@@ -653,7 +653,7 @@ pub const DEFAULT_DELIVERY_TIMEOUT: Duration = Duration::from_millis(750);
 
 /// pi's `deliverSubagentIntercomMessageEvent` default `timeoutMs` (`result-intercom.ts:325-330`) —
 /// the SAME 500ms bound applies to EVERY caller of that function, including the live-child follow-up
-/// steer at `subagent-executor.ts:860` ([`SubagentExecutor::control_resume`]'s `SteerRunning` arm).
+/// steer at `subagent-executor.ts:860` ([`crate::extension::SubagentExecutor::control_resume`]'s `SteerRunning` arm).
 /// Distinct from [`DEFAULT_DELIVERY_TIMEOUT`] (750ms), which only bounds the grouped-result
 /// [`DeliveryChannel`] path — pi's own two call sites use two different literals, so this module
 /// keeps them as two separate constants rather than collapsing them into one.
@@ -778,7 +778,7 @@ pub struct ClarifyRequest {
     pub prompt: String,
 }
 
-/// The outcome a caller sees for one [`request_clarify`] attempt.
+/// The outcome a caller sees for one [`AskLock::request_clarify`] attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ClarifyOutcome {
     /// A response was obtained (whatever the pluggable [`ClarifyChannel`] returned).
@@ -798,7 +798,7 @@ pub enum ClarifyOutcome {
 /// `cyrup-session-svc` in this file).
 pub trait ClarifyChannel: Send + Sync {
     /// Present `request` to a live human/UI and await a response. Implementations should apply
-    /// their own reasonable timeout; [`request_clarify`] does not impose an additional one on top
+    /// their own reasonable timeout; [`AskLock::request_clarify`] does not impose an additional one on top
     /// (an ask is, by design, allowed to wait indefinitely for a human — R-SA-119 is about
     /// visibly pausing the flow while this is outstanding, not about bounding how long a human
     /// may take).
@@ -806,7 +806,7 @@ pub trait ClarifyChannel: Send + Sync {
 }
 
 /// The documented graceful no-op fallback (see the module-level `NOTE(clarify-wired)` doc):
-/// always reports [`ClarifyOutcome::NoLiveChannel`] via an `Err`, so [`request_clarify`]'s
+/// always reports [`ClarifyOutcome::NoLiveChannel`] via an `Err`, so [`AskLock::request_clarify`]'s
 /// single-slot-lock bookkeeping and "visibly pause" contract are exercised even with no real UI
 /// wired, exactly mirroring `LiveHostServices::ui_roundtrip`'s own "no sink -> deny default,
 /// never block" behavior for the identical situation on the WASM-guest path.
@@ -828,7 +828,7 @@ impl ClarifyChannel for NoOpClarifyChannel {
 pub struct AskLock {
     channel: Arc<dyn ClarifyChannel>,
     /// `Some` while a session has an outstanding ask; the guard is dropped (clearing the slot)
-    /// when [`request_clarify`]'s future completes, on every exit path (including cancellation),
+    /// when [`AskLock::request_clarify`]'s future completes, on every exit path (including cancellation),
     /// via `slots`' own `AsyncMutex` scoping — never left dangling by an early return.
     slots: AsyncMutex<HashMap<String, ()>>,
 }

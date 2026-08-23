@@ -20,7 +20,7 @@ impl SubagentExecutor {
     /// resolve the inherited nested route from the process env — a resolution error is swallowed
     /// (no listener), as is the "no inherited route" case (`Ok(None)`) — and, only when a real route
     /// was found, spawn the 200ms poll loop as a detached background task. Called once from
-    /// [`RegistrationMode::ChildSafe`] `init()`.
+    /// [`crate::extension::RegistrationMode::ChildSafe`] `init()`.
     pub(crate) fn start_nested_control_inbox_listener(self: &Arc<Self>) {
         let route = match crate::spawn::nested_events::resolve_nested_route_from_env(|key| {
             std::env::var(key).ok()

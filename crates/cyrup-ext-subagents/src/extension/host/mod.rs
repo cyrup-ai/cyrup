@@ -22,8 +22,8 @@ use crate::extension::host::registration::RegistrationMode;
 use crate::extension::tool::SubagentTool;
 
 /// The SubAgents extension's `NativeExtension` facade (arch-SA §3.1). In [`RegistrationMode::Full`]
-/// registers the `subagent` tool + all 12 slash commands at [`NativeExtension::init`], resumes
-/// background-run tracking on [`HostEvent::SessionStart`], and routes every slash command through the
+/// registers the `subagent` tool + all 12 slash commands at [`cyrup_ext::NativeExtension::init`], resumes
+/// background-run tracking on [`cyrup_ext::HostEvent::SessionStart`], and routes every slash command through the
 /// SAME [`SubagentExecutor`] the tool itself uses (R-SA-130). In [`RegistrationMode::ChildSafe`]
 /// registers only the restricted, mutation-blocked tool (the fanout-child surface).
 /// The intercom companion's three broker-backed seam channels (delivery + clarify + steer), handed

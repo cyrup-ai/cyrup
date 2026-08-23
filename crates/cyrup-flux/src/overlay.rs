@@ -53,7 +53,7 @@ fn severity_color(sev: &str) -> OverlayColor {
     }
 }
 
-/// A snapshot of everything the overlay draws, re-collected on open and on every [`tick`] that
+/// A snapshot of everything the overlay draws, re-collected on open and on every `tick` that
 /// finds a change. Plain `PartialEq`-able data (no styling) so `tick` can compare frames cheaply.
 #[derive(Clone, PartialEq, Eq)]
 struct Snapshot {

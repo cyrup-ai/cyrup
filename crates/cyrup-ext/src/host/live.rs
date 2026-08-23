@@ -968,11 +968,11 @@ impl bindings::cyrup::ext::provider_stream::Host for HostState {
     /// an extension-supplied provider's requests stop being invisible to every other extension.
     /// Returns the replacement payload when a handler mutated it, `None` when nothing changed.
     ///
-    /// The reduction cannot run here — re-entering the dispatcher would re-enter THIS guest's
-    /// single-instance store while it is borrowed for the `stream-simple` call. So the payload is
-    /// queued on the guest state and reduced by the host at the stream seam
-    /// ([`crate::host::GuestState::take_stream_payloads`]), the same request/poll bridge every
-    /// other long-running capability uses (arch-08 §5.2).
+    /// The reduction re-enters the dispatcher (other guests' stores), so the owner id and the
+    /// [`crate::host::GuestState::provider_reduction()`] handle are cloned OUT of the calling guest
+    /// before the `await`: holding a borrow of this guest's single-instance store across the
+    /// round trip would re-enter the very store the `stream-simple` call is already borrowing —
+    /// the same borrow discipline every other long-running capability uses (arch-08 §5.2).
     async fn on_payload(&mut self, _stream_id: String, payload_json: String) -> Option<String> {
         // Clone the two things out of the guest BEFORE awaiting: the reduction re-enters the
         // dispatcher (other stores), and holding a borrow of `self` across it would pin the
@@ -1178,7 +1178,7 @@ impl bindings::cyrup::ext::control::Host for HostState {
 
     /// Pi `ctx.shutdown()` (extensions/types.ts:344): "Gracefully shutdown pi and exit. **Available
     /// in all contexts.**" (runner entry point runner.ts:656-662). Also untiered, for the same
-    /// reason as [`Self::abort`].
+    /// reason as `abort` above.
     async fn shutdown(&mut self) -> Result<(), String> {
         let guest = guest_of(self)?;
         guest.services.control(ControlOp::Shutdown)

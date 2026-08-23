@@ -44,7 +44,7 @@
 //! failure on any one line MUST be tolerated (the line is skipped, never propagated as an error
 //! and never aborts the run) and an unrecognized `type` tag MUST degrade to
 //! [`SubagentEvent::Unknown`] rather than a parse error at all — these are two distinct tolerance
-//! mechanisms ([`serde(other)`] handles the second; [`parse_line`] returning `None` handles the
+//! mechanisms (`serde(other)` handles the second; [`parse_line`] returning `None` handles the
 //! first) and both are required. On stream end (the child closes stdout, normally because it
 //! exited), any unterminated trailing buffered content — a final line with no trailing `\n` —
 //! MUST be flushed through this exact same per-line parse path exactly once, never dropped and

@@ -122,8 +122,8 @@ impl<B: Backend> App<B> {
     /// [`App::run`] and its session-swap arm attach the TUI, mirroring `cyrup-modes`' `run_rpc` /
     /// `rebind_session`, which install the same pair for RPC mode.
     ///
-    /// The pair is not optional: [`UiSink`] carries the request/reply dialogs
-    /// (`ui.{confirm,input,select,editor}`) and [`UiEffectSink`] carries the fire-and-forget mutators
+    /// The pair is not optional: [`cyrup_session_svc::UiSink`] carries the request/reply dialogs
+    /// (`ui.{confirm,input,select,editor}`) and [`cyrup_session_svc::UiEffectSink`] carries the fire-and-forget mutators
     /// (`ui.{notify,set-status,set-widget,set-header,set-footer,set-title,set-editor-text,
     /// paste-editor-text,set-tools-expanded}`). `LiveHostServices` drops an effect outright when the
     /// effect sink is `None` — its headless (print/json) policy, Pi's `noOpUIContext`
@@ -290,11 +290,11 @@ impl<B: Backend> App<B> {
     }
 
     /// Apply one fire-and-forget extension UI effect — the interactive-TUI half of the
-    /// [`UiEffectSink`] seam `cyrup-modes`' `run_rpc` already drives for RPC mode.
+    /// [`cyrup_session_svc::UiEffectSink`] seam `cyrup-modes`' `run_rpc` already drives for RPC mode.
     ///
     /// Pi builds a real `uiContext` for interactive mode (`interactive-mode.ts:2223-2268`) whose
     /// mutators land on concrete TUI state; only headless modes get `noOpUIContext`
-    /// (`extensions/runner.ts:230-265`). Cyrup installed the request/reply [`UiSink`] here but never
+    /// (`extensions/runner.ts:230-265`). Cyrup installed the request/reply [`cyrup_session_svc::UiSink`] here but never
     /// the effect sink, so every `notify`/`setStatus`/`setTitle`/`setEditorText`/`pasteToEditor`/
     /// `setToolsExpanded`/`setWidget`/`setHeader`/`setFooter` call was dropped by
     /// `LiveHostServices::emit_ui_effect` in the DEFAULT mode while working over RPC.

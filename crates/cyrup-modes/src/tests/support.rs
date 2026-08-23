@@ -80,6 +80,36 @@ pub(super) async fn build_runtime(fx: &Fixture, faux: Arc<FauxProvider>) -> Arc<
     create_runtime(factory, target).await
 }
 
+/// [`build_runtime`] with the auth store's ambient env tier pinned EMPTY.
+///
+/// The doc above notes these fixtures are not hermetic against the ambient environment. For a test
+/// that asserts on the *shape of the available model catalog* that is not a nuisance, it decides the
+/// result: a host exporting `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` completes Bedrock's IAM
+/// pair (`cyrup-config/src/env_keys.rs`), `has_auth` reports it configured, and its whole catalog
+/// enters the available set AHEAD of anthropic — `Models::providers` is a `BTreeMap` keyed by
+/// provider id, and `"amazon-bedrock" < "anthropic"`. `cycle_model` then steps onto a Bedrock model
+/// and the assertion fails on a machine that has nothing to do with what is under test.
+///
+/// Pinning the tier makes "this provider has no credential" a property of the fixture rather than of
+/// whoever is running it. Scrubbing the process environment would not do: these tests run in
+/// parallel and would race each other.
+pub(super) async fn build_runtime_hermetic_auth(
+    fx: &Fixture,
+    faux: Arc<FauxProvider>,
+) -> Arc<AgentSessionRuntime> {
+    let provider: Arc<dyn Provider> = faux;
+    let cfg = base_config(fx);
+    let target = cfg.target.clone();
+    let auth = Arc::new(
+        cyrup_config::AuthStore::at(fx.agent_dir.join("auth.json"))
+            .with_ambient_env(std::collections::HashMap::new()),
+    );
+    let factory = SessionFactory::new(provider, cfg)
+        .provider_resolver(Arc::new(AnyFauxResolver) as Arc<dyn cyrup_session_svc::ProviderResolver>)
+        .auth(auth);
+    create_runtime(factory, target).await
+}
+
 /// Build the RPC runtime with a native extension registered into every session it builds.
 pub(super) async fn build_runtime_with_ext(
     fx: &Fixture,

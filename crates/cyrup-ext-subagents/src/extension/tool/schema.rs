@@ -291,7 +291,7 @@ fn sj_chain_item() -> serde_json::Value {
 /// CONFIG shape ([`crate::registration::ControlConfig`]) but neither `resolveControlConfig` nor the
 /// notice pipeline behind it. SUBA-N05 landed both — [`crate::exec::control`] is a full port of
 /// `runs/shared/subagent-control.ts`, [`crate::exec::control::ControlMonitor`] raises real events off
-/// the child's NDJSON stream, and [`SubagentExecutor::foreground_control_notifier`] feeds them to
+/// the child's NDJSON stream, and [`crate::extension::SubagentExecutor::foreground_control_notifier`] feeds them to
 /// [`crate::tui::notices::ControlNoticeState`] — so the fragment is live again and the dispatcher
 /// honours the param on both the foreground and the async path.
 ///

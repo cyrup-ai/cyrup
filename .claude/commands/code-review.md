@@ -78,13 +78,14 @@ echo "FLUX_BASE=$FLUX_BASE"
 If a file called `stack.env` exists at `$FLUX_BASE/stack.env`, read it and set `$STACK` from its contents. Otherwise, run the following detection script to determine `$STACK` and save it (this only ever runs the first time for this directory):
 
 ```bash
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
 STACK="software"
 # Cargo.toml is checked first: a Rust project never needs `bun`, and the package.json
 # branch below is the only part of detection that shells out to a runtime that may not
 # be installed.
-if [ -f "Cargo.toml" ]; then STACK="Rust"
-elif [ -f "package.json" ]; then
-  STACK=$(bun -e "
+if [ -f "$ROOT/Cargo.toml" ]; then STACK="Rust"
+elif [ -f "$ROOT/package.json" ]; then
+  STACK=$(cd "$ROOT" && bun -e "
     const d=JSON.parse(require('fs').readFileSync('./package.json','utf8'));
     const deps=Object.assign({}, d.dependencies, d.devDependencies, d.peerDependencies);
     const frameworks=['ink','react','vue','angular','next','express'];
@@ -92,9 +93,9 @@ elif [ -f "package.json" ]; then
     const ts=deps['typescript']?'TypeScript':'JavaScript';
     console.log(fw?fw+' + '+ts:ts);
   " 2>/dev/null || echo "JavaScript/TypeScript")
-elif [ -f "go.mod" ]; then STACK="Go"
-elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then STACK="Python"
-elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then STACK="Java/Kotlin"
+elif [ -f "$ROOT/go.mod" ]; then STACK="Go"
+elif [ -f "$ROOT/requirements.txt" ] || [ -f "$ROOT/pyproject.toml" ]; then STACK="Python"
+elif [ -f "$ROOT/pom.xml" ] || [ -f "$ROOT/build.gradle" ]; then STACK="Java/Kotlin"
 fi
 mkdir -p "$FLUX_BASE"
 echo "$STACK" > "$FLUX_BASE/stack.env"
@@ -424,7 +425,7 @@ The zip from STEP 12 is still written — posting supplements the hand-off, it d
 
 - **Path**: All `write`/`edit`/`mv`/`cp` file paths MUST use the exact `FLUX_BASE` value printed by STEP 2 or STEP 7 bash output (e.g. `FLUX_BASE=/Users/...`). Copy it character-for-character — never reconstruct it from `cwd` or memory.
 - `/code-review` MUST NOT modify any source files. The only permitted file operations are: creating issue task files in `$FLUX_BASE/review/`, moving/deleting those files during deduplication, creating the zip archive, and writing the STEP 13 review payload under `$FLUX_BASE`. No changes to `./src/`, no git commits, no pushes.
-- **Posting is the one outward-facing action this command takes.** It requires the STEP 13b confirmation every time — never post because the review "looks done", because a previous run was approved, or because the user asked for a review. Reviewing and publishing a review are different requests.
+- **Posting is the one outward-facing action this command takes.** It requires the STEP 13c confirmation every time — never post because the review "looks done", because a previous run was approved, or because the user asked for a review. Reviewing and publishing a review are different requests.
 - Never post `APPROVE` or `REQUEST_CHANGES` on the user's own PR (`IS_MY_BRANCH=true`); GitHub rejects it and the whole submission fails.
 
 ## NEXT STEP

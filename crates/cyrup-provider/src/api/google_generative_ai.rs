@@ -274,10 +274,10 @@ pub struct GoogleThinking {
 
 /// Per-API typed options for the `google-generative-ai` wire protocol (Pi `GoogleOptions`,
 /// google-generative-ai.ts:38-45). Only the fields cyrup does not already carry on the unified
-/// [`StreamOptions`](crate::StreamOptions) live here: `toolChoice` folds onto
+/// [`StreamOptions`] live here: `toolChoice` folds onto
 /// `StreamOptions.tool_choice` and the simple reasoning level onto `StreamOptions.reasoning`, but a
 /// direct `thinking.{budgetTokens,level}` per-request override has no other home. Carried via
-/// [`StreamOptions::api_options`](crate::StreamOptions::api_options); defaults to `None` (no
+/// [`StreamOptions::api_options`]; defaults to `None` (no
 /// override), reproducing the streamSimple-driven behavior exactly.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct GoogleOptions {

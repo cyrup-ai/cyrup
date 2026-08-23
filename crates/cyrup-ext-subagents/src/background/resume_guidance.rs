@@ -30,9 +30,9 @@
 //!
 //! # Mapping upstream's `AsyncRunSummary` onto cyrup's [`RunStatus`]
 //!
-//! Upstream's summary carries an explicit `step.index`; cyrup's [`StepStatus`] does not, because a
+//! Upstream's summary carries an explicit `step.index`; cyrup's [`super::StepStatus`] does not, because a
 //! [`RunStatus::steps`] vector IS in step order — the same equivalence
-//! [`super::run_status::format_resume_guidance`]'s `enumerate()` already relies on. `run.state` is
+//! `run_status::format_resume_guidance`'s `enumerate()` already relies on. `run.state` is
 //! [`RunState`] and `step.status` is [`StepState`]; `sessionFile`/`fs.existsSync` is
 //! [`session_file_exists`], the same predicate `run_status.rs` uses for its own `Revive:` line.
 

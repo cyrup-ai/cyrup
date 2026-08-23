@@ -117,7 +117,7 @@ pub struct PermissionManager {
     mcp_names_cache: Option<(String, Vec<String>)>,
     /// pi `onWarning` ctor option (`permission-manager.ts:620,631,643`): notified with a human-
     /// readable message whenever a policy file exists but fails to load/parse (NOT when it is
-    /// simply absent — see [`notify_config_load_warning`]).
+    /// simply absent — see `notify_config_load_warning`).
     on_warning: Option<WarningCallback>,
 }
 

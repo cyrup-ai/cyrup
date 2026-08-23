@@ -145,6 +145,8 @@ cargo check --workspace --all-targets   # type-check everything, including tests
 cargo clippy --workspace --all-targets  # REQUIRED — the no-panic policy only fires here
 cargo clippy -p cyrup-agent --all-targets --no-deps -- -D warnings  # cyrup-agent is warning-clean; keep it that way
 cargo nextest run --workspace           # the everyday gate: 6,855 tests (7 skipped), ~18s
+cargo run -p xtask -- feature-matrix    # the non-default feature combinations (--fast skips cyrup-it)
+cargo doc --workspace --no-deps --bins  # rustdoc links are denied, not warned — `--bins` or the binary is skipped
 ```
 
 `cargo clippy` is not optional. The no-panic policy is expressed as `[workspace.lints.clippy]`
@@ -156,6 +158,17 @@ warning-level lints are only enforceable behind the deny flag. It is scoped to `
 is warning-clean today; other crates are not (`cyrup-provider` carries 23), so a workspace-wide deny
 would fail on arrival. `--no-deps` is what keeps the scope honest: without it the deny flag also
 applies to the workspace path dependencies clippy compiles on the way in.
+
+The first three lines build **one point** in the feature space. Nine crates declare `[features]`,
+and `feature-matrix` builds the rest of them — the `#[cfg(not(feature = "wasm-host"))]` arms of
+`cyrup-ext` and `cyrup-session-svc`, every `impl Backend` with `ratatui/scrolling-regions` off,
+`cyrup-tools` without `inline-images`, the `faux` and `test-fixtures` arms, and the guest SDK for
+`wasm32-wasip2`. Each row states the obligation it discharges, and prints it when the row fails.
+Two of them are easy to over-read on a green run and say so in their own text: the
+`cyrup-session-svc --no-default-features` row compiles that crate's native arms but does **not**
+produce a wasmtime-free build (that is EXT-026), and the workspace-wide `--no-default-features` row
+is a tripwire that today resolves to the same graph as the everyday gate, because every
+in-workspace dependency edge asks for its dependency's default features.
 
 Edition 2024, `resolver = "3"`, stable toolchain. A cold first build compiles the full dependency
 graph (wasmtime, cranelift, gix, reqwest/rustls) — budget a few minutes and don't mistake it for a

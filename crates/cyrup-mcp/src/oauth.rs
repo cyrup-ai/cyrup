@@ -827,8 +827,8 @@ impl CallbackMaps {
 /// **There is no HTTP method check** — a `POST` to the callback path is handled identically to a
 /// `GET`. Upstream has none; do not add one.
 ///
-/// This handler never calls [`CallbackControl::claim`] and always returns
-/// [`CallbackOutcome::Continue`], so the reused listener's own one-shot is never settled, its 409
+/// This handler never calls [`cyrup_provider::auth::oauth::callback::CallbackControl::claim`] and always returns
+/// [`cyrup_provider::auth::oauth::callback::CallbackOutcome::Continue`], so the reused listener's own one-shot is never settled, its 409
 /// "already used" branch is unreachable, and one listener serves N concurrent logins.
 #[derive(Clone)]
 struct CallbackMultiplexer {
@@ -2333,7 +2333,7 @@ pub fn issuers_match(first: &str, second: &str) -> bool {
 /// `initialize_from_store` restores only `client_id`, through `configure_client_id`, which also
 /// resets `redirect_uri` to the manager's base URL. A confidential or explicitly-redirected client
 /// is therefore mis-configured after a restart unless the port re-applies it, which is what this
-/// does from the [`OAuthClientRecord`] second record.
+/// does from the `OAuthClientRecord` second record.
 ///
 /// Upstream's expired-secret rule is kept: a stored `client_secret_expires_at` in the past means
 /// re-register rather than reuse, so the record is skipped entirely.

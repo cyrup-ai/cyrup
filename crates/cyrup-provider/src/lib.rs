@@ -30,8 +30,6 @@ pub mod providers;
 pub mod remote_catalog;
 pub mod session_resources;
 pub mod stream;
-/// The zero-model stand-in installed when nothing is authenticated (pi `main.ts:852-855`
-/// @v0.83.0). **Always compiled** — unlike [`faux`], this is production code.
 pub mod unconfigured;
 pub mod usage;
 pub mod utils;

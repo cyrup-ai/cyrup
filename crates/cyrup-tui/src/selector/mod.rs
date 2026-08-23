@@ -5,7 +5,7 @@
 //! in the bottom inline region, full-width, delimited top and bottom by a `DynamicBorder`
 //! (`dynamic-border.ts` — a full-width `─` rule, no box corners), and they push the message history up
 //! (spec/tui/05 §1.1, §11). This module realizes that as the [`Selector`] trait (the input-slot
-//! occupant) plus a shared [`ListSelector`] engine over [`SelectList`](crate::select_list::SelectList),
+//! occupant) plus a shared [`ListSelector`] engine over [`SelectList`],
 //! and the three dependency-free selectors Pi opens this way: thinking (`thinking-selector.ts`),
 //! show-images (`show-images-selector.ts`), and theme with live preview (`theme-selector.ts`).
 //!

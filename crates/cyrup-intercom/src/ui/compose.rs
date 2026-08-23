@@ -2,7 +2,7 @@
 //! message-compose box), plus [`compose_send`] — the send leg the `/intercom` slash command drives.
 //!
 //! WIRING: [`compose_send`] runs the actual broker send for `/intercom <target> <message>`
-//! ([`crate::extension::IntercomExtension::execute_command`]). The interactive input-buffer state
+//! ([`crate::extension::IntercomExtension`]'s `execute_command`). The interactive input-buffer state
 //! machine ([`ComposeOverlay::handle_input`], [`ComposeOverlay::send_message`],
 //! [`ComposeOverlay::render`]) is the faithful port of the live overlay, including its own
 //! `client.send` leg and [`ComposeResult`] outcome (pi's `sendMessage`/`ComposeResult`,

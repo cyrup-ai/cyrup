@@ -59,6 +59,10 @@ On step failure: identify root cause, apply fix, re-run the failed step. After 3
 
 `/auto-pilot` orchestrates other `//flux` commands — it does not implement logic of its own beyond sequencing. Each step's own HARD CONSTRAINTs apply in full. Do not skip steps, do not merge steps, do not take shortcuts.
 
+`/auto-pilot` may only invoke commands from the list below. It MUST NOT invent, rename, or improvise a pipeline step.
+
+Valid `//flux` commands: `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/code-review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
+
 ## Output style
 
 - Concise and scannable

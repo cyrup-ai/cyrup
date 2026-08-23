@@ -166,7 +166,7 @@ pub enum AgentSessionEvent {
         reason: CompactionReason,
     },
     /// A compaction settled (Pi `compaction_end`, agent-session.ts:142-148). Carries the produced
-    /// [`CompactionResult`] (absent on cancel/abort/error), the `aborted` flag, whether the run will
+    /// [`crate::state::CompactionResult`] (absent on cancel/abort/error), the `aborted` flag, whether the run will
     /// be retried after the compaction (`will_retry`, only meaningful for the overflow recovery
     /// path), and an `error_message` on the failure paths. `result`/`error_message` are omitted from
     /// the JSON when absent, matching Pi's `JSON.stringify` of `undefined`/optional fields.
@@ -249,7 +249,7 @@ pub enum AgentSessionEvent {
     },
     /// A loaded extension appended a custom (non-LLM) entry to the running session tree (Pi
     /// `entry_appended`, agent-session.ts:140/2265-2271). Emitted by
-    /// [`crate::host_services::LiveHostServices::append_entry`] once the entry is persisted; `entry`
+    /// [`crate::host_services::LiveHostServices`]'s `append_entry` once the entry is persisted; `entry`
     /// is the serialized [`cyrup_session::entry::Entry`] that now lives in the tree.
     EntryAppended {
         entry: Value,

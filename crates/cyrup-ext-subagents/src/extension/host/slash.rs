@@ -25,7 +25,7 @@ use crate::extension::models::classify::render_profile_check_report;
 use crate::extension::tool::task_items::count_graph_requested_spawns;
 
 impl SubagentsExtension {
-    /// The single shared dispatch body [`NativeExtension::execute_command`] calls into
+    /// The single shared dispatch body [`cyrup_ext::NativeExtension::execute_command`] calls into
     /// (R-SA-130). Parses `args` via the real, already-built parsers in
     /// [`crate::registration::slash_commands`], then routes to [`SubagentExecutor`] exactly as
     /// the tool itself does for `/run`; the remaining commands route to their own

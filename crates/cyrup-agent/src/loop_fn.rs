@@ -6,7 +6,7 @@
 //!
 //! - pushes events to its own [`AgentEventSink`] via [`run_agent_loop`]/[`run_agent_loop_continue`]
 //!   (Pi `runAgentLoop`/`runAgentLoopContinue`, agent-loop.ts:95-143), or
-//! - pulls events from a returned finalizing [`EventStream`] whose result resolves to the run's new
+//! - pulls events from a returned finalizing [`cyrup_core::EventStream`] whose result resolves to the run's new
 //!   messages via [`agent_loop`]/[`agent_loop_continue`] (Pi `agentLoop`/`agentLoopContinue`,
 //!   agent-loop.ts:31-93).
 //!

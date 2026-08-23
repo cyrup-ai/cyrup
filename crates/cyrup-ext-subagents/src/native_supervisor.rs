@@ -1763,7 +1763,7 @@ pub fn native_child_client_should_register(agent_dir: &Path) -> bool {
 /// `$CYRUP_CODING_AGENT_DIR` (absolute verbatim, else resolved against `cwd`) if set and non-blank,
 /// else `<home>/.cyrup` — byte-identical to `cyrup_intercom::paths::agent_dir_path_from`, which the
 /// dependency edge (`cyrup-intercom` → this crate) forbids importing. Pinned by
-/// [`tests::the_agent_dir_resolution_matches_the_intercom_crates_table`].
+/// `tests::the_agent_dir_resolution_matches_the_intercom_crates_table`.
 #[must_use]
 pub fn agent_dir_from(
     env: &dyn Fn(&str) -> Option<String>,

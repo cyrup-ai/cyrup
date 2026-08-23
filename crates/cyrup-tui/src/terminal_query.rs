@@ -456,7 +456,7 @@ fn stdin_is_queryable() -> bool {
 
 /// Write `request` (plus the DA1 sentinel) and collect whatever comes back within `timeout`.
 ///
-/// `pub(crate)` so [`crate::keyboard_protocol`]'s Kitty-flags negotiation reuses the SAME bounded,
+/// `pub(crate)` so [`mod@crate::keyboard_protocol`]'s Kitty-flags negotiation reuses the SAME bounded,
 /// sentinel-terminated exchange rather than opening a second hand-rolled read of stdin — the
 /// safety contract in this module's docs is per-read, and one implementation is one contract.
 pub(crate) fn exchange(request: &str, timeout: Duration) -> Option<String> {

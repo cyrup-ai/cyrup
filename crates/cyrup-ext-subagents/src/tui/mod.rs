@@ -39,10 +39,6 @@
 //! site — callers populating this field MUST source it from that resolution, never from the
 //! caller's raw, possibly-omitted request.
 
-/// Optional out-of-band result delivery ("intercom") and the foreground clarify/ask single-slot
-/// pause primitive (R-SA-119/120/123/124/125) — see [`intercom`] for the full subsystem doc,
-/// including why live clarify-dialog wiring against `LiveHostServices` is deliberately deferred
-/// to a later phase rather than implemented in this crate today.
 pub mod intercom;
 
 use std::time::Instant;
@@ -50,51 +46,14 @@ use std::time::Instant;
 use crate::background::{self, RunMode, RunStatus};
 use crate::fork_context::ContextMode;
 
-/// Pure fold-to-aggregate rendering functions (R-SA-106..113): nested/indented subagent output,
-/// the fork-badge presentational helper, and activity-glyph gating. See that module's own doc for
-/// why every function there is deliberately terminal-free and `cyrup-tui`-free.
 pub mod render;
-
-/// The typed, serializable render-payload shapes `cyrup-tui` consumes for the live subagent
-/// surfaces (C19/C20/C21): the foreground live-progress payload streamed through the host
-/// `ToolUpdateSink`, the inline subagent-result surface payload, and the persistent async-jobs
-/// widget feed — plus the NDJSON-folding accumulator behind the foreground live sink. See that
-/// module's own doc for the clearly-labeled remaining `cyrup-tui`-side rendering step.
 pub mod events;
-
-/// `ControlNoticeState`: the debounce/actionability/dedup state machine for control notices
-/// (R-SA-114-118/121/122; arch-SA §6.7). See that module's own docs for the full design.
 pub mod notices;
-
-/// Width/style primitives shared by the three FleetView modules — cyrup's ratatui-shaped stand-in
-/// for the `@earendil-works/pi-tui` helpers (`theme.fg`, `visibleWidth`, `truncateToWidth`,
-/// `wrapTextWithAnsi`) `src/tui/fleet*.ts` import. See that module's own doc for the transport
-/// difference and why the ANSI-parsing half of those helpers has no counterpart here.
 pub mod fleet_theme;
-
-/// The FleetView transcript pane — Rust port of pi-subagents `src/tui/fleet-transcript.ts`
-/// (`@v0.43.0`): the containment-checked, sanitizing, bounded transcript reader and the
-/// event-list renderer behind the inspector's detail pane.
 pub mod fleet_transcript;
-
-/// The FleetView-relevant projection of pi-subagents' `SubagentState` (`src/shared/types.ts`
-/// `@v0.43.0`) — the shapes `fleet.ts`/`fleet-status.ts` read.
 pub mod fleet_state;
-
-/// The always-on fleet status widget — Rust port of pi-subagents `src/tui/fleet-status.ts`
-/// (`@v0.43.0`): the collapsed one-line summary, the expandable roster, and the state machine
-/// whose `Enter` opens the inspector.
 pub mod fleet_status;
-
-/// The live subagent fleet inspector — Rust port of pi-subagents `src/tui/fleet.ts`
-/// (`@v0.43.0`): the roster/detail two-pane overlay `/subagents-fleet` opens, its steer/stop/
-/// inspect controls, and `showFleet`'s own open/already-open/no-UI control flow.
 pub mod fleet;
-
-/// The host adapter that makes [`fleet`]'s component LIVE: pi's
-/// `ctx.ui.custom(factory, { overlay: true, … })` (`fleet.ts:869-875`) expressed over cyrup's
-/// [`cyrup_ext::InteractiveOverlay`] seam — keystrokes in, painted lines out, the 750 ms refresh
-/// tick, and async control-op dispatch.
 pub mod fleet_overlay;
 
 // =================================================================================================

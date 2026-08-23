@@ -4,7 +4,7 @@
 //! A "nested path" is the ancestry chain of a nested subagent run, encoded into a child's
 //! environment (`CYRUP_SUBAGENT_PARENT_PATH`) so a grandparent can reconstruct which of its
 //! descendants a relayed event belongs to. Every id along the path must survive
-//! [`is_safe_nested_path_id`] (no path separators, no `..`, bounded length) before it is trusted,
+//! [`is_safe_nested_path_id_str`] (no path separators, no `..`, bounded length) before it is trusted,
 //! and the chain is capped at [`MAX_NESTED_PATH_ENTRIES`] entries.
 
 use std::path::Path;

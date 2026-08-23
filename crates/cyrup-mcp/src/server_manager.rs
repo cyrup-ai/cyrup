@@ -51,7 +51,7 @@
 //!   synchronous step, and `throwIfAborted(attemptSignal)` runs before the generation message is
 //!   built. (13c's MCP-100 *verify* bullet asserts the second string for this scenario; that is
 //!   wrong. The second string is reachable only when the generation advanced without the attempt
-//!   being aborted, which was also measured — see [`CONNECTION_CLOSED_WHILE_CONNECTING`].)
+//!   being aborted, which was also measured — see `CONNECTION_CLOSED_WHILE_CONNECTING`.)
 //! * `connect` **does not dispose** an existing `closed`/`needs-auth` connection before replacing it
 //!   in the map. Measured: `disposedOld=0`. Ported as-is; see [`McpServerManager::connect`].
 //!
@@ -542,7 +542,7 @@ pub trait ConnectionResource: Send + Sync + std::fmt::Debug {
 ///    listener that drains it continuously into a bounded tail. A port that merely *holds* the
 ///    handle without reading it deadlocks the child as soon as it writes 64 KiB of diagnostics — the
 ///    child blocks in `write`, ignores its stdin closing, and only the 3-second hard kill ends it.
-///    [`Self::spawn`] therefore starts a drain task, and [`Self::close`] aborts it.
+///    [`StdioChildConnection::adopt`] therefore starts a drain task, and [`Self::close`] aborts it.
 /// 2. **Closing exactly once, and actually reaping.** `close` is `graceful_shutdown()`: close the
 ///    transport (which drops the child's stdin), then `select!` the child's `wait()` against
 ///    `MAX_WAIT_ON_DROP_SECS = 3`, killing on timeout. The slot guard is held **across** that await

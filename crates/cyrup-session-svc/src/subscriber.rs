@@ -101,7 +101,7 @@ pub(crate) struct SvcSubscriber {
     fanout: Arc<Fanout>,
     manager: Arc<AsyncMutex<SessionManager>>,
     handle: Arc<SessionHandle>,
-    /// The extension host (gap-08 #1): the `message_end` [mutate] re-dispatch seam. Sourced here —
+    /// The extension host (gap-08 #1): the `message_end` `mutate` re-dispatch seam. Sourced here —
     /// NOT via `handle.get()` — because `message_end` fires on unbound sessions too.
     ext_host: Arc<ExtensionHost>,
     /// The session cancel token; `message_end` re-dispatch runs under a child of it so a session

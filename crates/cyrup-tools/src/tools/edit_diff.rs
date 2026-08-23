@@ -579,7 +579,7 @@ pub struct EditDiffPreview {
 /// pending — through the permission prompt, and before a single byte is written. It reads the file
 /// but never writes one.
 ///
-/// The steps are exactly [`super::edit::EditTool::execute`]'s minus the write: resolve against
+/// The steps are exactly [`super::edit::EditTool`]'s `execute` minus the write: resolve against
 /// `cwd`, check readability, [`strip_bom`] → [`normalize_to_lf`] →
 /// [`apply_edits_to_normalized_content`] → [`generate_diff_string`]. That shared core is why the
 /// preview and the post-write `details.diff` agree byte-for-byte on the ordinary path, which is

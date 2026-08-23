@@ -180,7 +180,7 @@ pub(super) fn display_width(s: &str) -> usize {
 /// two code points in either direction: `\s` includes U+FEFF (which `White_Space` does not) and
 /// `White_Space` includes U+0085 NEL (which `\s` does not). Both are stripped before they can reach
 /// the buffer — U+FEFF and U+0085 are `char::is_control()`/format characters that
-/// [`sanitize_paste`] drops and that no key event produces — so the sets coincide on every input
+/// `sanitize_paste` drops and that no key event produces — so the sets coincide on every input
 /// this function can actually see.
 fn is_whitespace_seg(g: &str) -> bool {
     g.chars().any(char::is_whitespace)
@@ -245,7 +245,7 @@ fn is_cjk_break(g: &str) -> bool {
 /// 1. **Width.** Upstream accumulates `visibleWidth(grapheme)` (`:139-143`), so 24 CJK ideographs
 ///    are 48 columns, not 24. At a layout width of 39 the char count said "fits", the map reported
 ///    one visual line, four ideographs rendered past the right edge and — because
-///    [`Self::cursor_in`] resolves the caret through that same map — the caret left the frame.
+///    [`crate::editor::InputEditor::cursor_in`] resolves the caret through that same map — the caret left the frame.
 /// 2. **Granularity.** Upstream iterates GRAPHEMES and breaks at a cluster's own start index
 ///    (`:157-160`), so a break never lands inside a cluster. Breaking at `start + width` char-wise
 ///    put `👨` on one row and a bare `\u{200d}👩‍👧‍👦` on the next.

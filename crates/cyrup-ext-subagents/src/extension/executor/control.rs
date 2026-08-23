@@ -200,7 +200,7 @@ impl SubagentExecutor {
     /// `runs/foreground/subagent-executor.ts:5872-5885`).
     ///
     /// Clears a **reload-orphaned** run from the display. It terminates nothing: its entire effect
-    /// is to stamp [`RunStatus::display_dismissed_at`], which the three readers landed alongside
+    /// is to stamp [`crate::background::RunStatus::display_dismissed_at`], which the three readers landed alongside
     /// the field already honour ([`crate::background::reconcile::reconcile`],
     /// [`run_status::list_active_runs`], and the single-run status view). Before this method the
     /// field had no producer, so a run whose runner is gone but whose `status.json` still claims

@@ -15,7 +15,7 @@
 //! - [`example`] — a bundled reference extension (the live-E2E fixture).
 //! - `guest` (wasm32) — the `wit-bindgen` glue implementing the world's exports.
 //!
-//! `unsafe` is confined to the `wit-bindgen`-generated component export ABI in [`guest`] (the
+//! `unsafe` is confined to the `wit-bindgen`-generated component export ABI in `guest` (the
 //! `#[export_name]` shims); all author-facing code is safe Rust.
 
 pub mod api;

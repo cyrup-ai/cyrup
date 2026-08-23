@@ -995,7 +995,7 @@ pub enum StartupOutcome {
 pub trait AttemptRunner {
     /// The richer per-attempt payload this runner produces beyond what [`AttemptSignal`] exposes
     /// to the ladder driver (e.g. final output text, structured output, the raw NDJSON artifact
-    /// path). Returned verbatim inside [`FallbackOutcome::attempts`]/[`FallbackOutcome::last`].
+    /// path). Returned verbatim inside [`FallbackOutcome::last_attempt`].
     type Attempt: Send;
 
     /// Run one attempt against `model`, with `attempt_note` (R-SA-039's "note about the prior

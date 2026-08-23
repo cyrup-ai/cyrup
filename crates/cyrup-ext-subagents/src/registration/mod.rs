@@ -51,61 +51,14 @@ use std::path::PathBuf;
 
 use crate::discovery::types::AgentOverrideConfig;
 
-/// `/subagents-doctor`'s concurrent check runner (R-SA-131): [`doctor::DoctorRunner`] executes
-/// the six mandated checks — binary resolution, temp-dir writability, `config.json` validity,
-/// agent-discovery count, chain-discovery count, and provider-catalog freshness — concurrently via
-/// `tokio::join!`, each catching its own failure independently rather than aborting the whole
-/// report. See [`doctor`] for the full subsystem doc.
-/// SUBA-064 — the `subagents.authorityPolicy` gate (`pi-subagents/src/policy/authority.ts`,
-/// present at both v0.43.0 and v0.47.1): six privileged actions, three decisions, and the
-/// `stop`/`steer` consult that makes it live-reachable today.
 pub mod authority;
-
 pub mod doctor;
-
-/// SUBA-055 — `action: "guide"` and the packaged, version-matched documentation set it serves
-/// (pi `extension/subagent-guide.ts` @v0.47.1). Embedded with `include_str!` rather than read from
-/// a package root; see the module doc's `[CYRUP-DELTA]`.
 pub mod guide;
-
 pub mod profiles;
-
-/// The 12 slash-command descriptors and their pure argument parsers (R-SA-129):
-/// [`slash_commands::SLASH_COMMANDS`] is the static registration table `extension.rs` iterates at
-/// `init()` time, and `slash_commands::parse_*` functions turn each command's raw trailing
-/// argument string into a strongly-typed parsed-command value, including `/chain`'s inline
-/// parallel-group `(a | b)[opts]` chain-expression grammar. See [`slash_commands`] for the full
-/// subsystem doc, including what is explicitly deferred to `extension.rs`'s later-phase wiring
-/// (agent-name existence validation, actual `InitApi` registration, and the single shared
-/// dispatch path itself, R-SA-130).
 pub mod slash_commands;
-
-/// SUBA-025 — the `subagent` tool description RESOLVER (`pi-subagents/src/extension/
-/// tool-description.ts`, in-baseline at v0.34.0): `toolDescriptionMode`, the 50 KiB-capped
-/// `subagent-tool-description.md` file override, and the mandatory safety-guidance appender that
-/// a custom description cannot drop. See [`tool_description`] for the full subsystem doc.
 pub mod tool_description;
-
-/// `/subagent-cost`'s recursive dual-shape token/cost usage accounting (R-SA-140):
-/// [`cost::compute_recursive_cost`] sums usage recursively through nested subagent-of-subagent
-/// trees across BOTH a run's `_meta.json` `children` array shape and any per-step nested children
-/// (`StepStatus::nested_run_ids`) within async chain jobs — additively combining both, never just
-/// one (a flat single-level or single-shape sum is explicitly non-conformant per func-SA §5.6's own
-/// warning text). See [`cost`] for the full subsystem doc, including the dual-recursion rationale.
 pub mod cost;
-
-/// Bundled packaged resources (R-SA-132/134): the 7 `prompts/*.md` recipe templates and the
-/// `skills/pi-subagents/SKILL.md` operational skill this extension ships, discovered through the
-/// SAME `cyrup-resources` manifest plumbing the builtin agent personas use. See [`resources`] for
-/// the full subsystem doc, including why the manifest's directory entries are expanded to concrete
-/// files here.
 pub mod resources;
-
-/// Prompt-template workflows (R-SA-132/134): discovery of the `prompts/*.md` recipes across the
-/// package/user/project tiers plus the argument grammar and recipe→run lowering behind the
-/// `/prompt-workflow` and `/chain-prompts` slash commands. A 1:1 port of
-/// `pi-subagents/src/slash/prompt-workflows.ts` @v0.34.0. See [`prompt_workflows`] for the full
-/// subsystem doc, including which fields of a recipe cyrup's dispatch surface can carry today.
 pub mod prompt_workflows;
 
 // -------------------------------------------------------------------------------------------

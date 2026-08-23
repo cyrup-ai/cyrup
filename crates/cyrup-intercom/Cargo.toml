@@ -25,7 +25,20 @@ test-fixtures = []
 
 [dependencies]
 cyrup-core = { workspace = true }
-cyrup-ext = { workspace = true }
+# `src/session_state.rs:13`, `src/extension.rs:35` and `src/seams.rs:37` name
+# `cyrup_ext::HostServices`, which is re-exported only under `wasm-host`
+# (`cyrup-ext/src/lib.rs:205`).
+# `wasm-host` is NOT optional for this crate, and until now no manifest said so: the feature rode in
+# on `cyrup-ext`'s `default = ["wasm-host"]` through the workspace table, which sets no
+# `default-features = false` (root `Cargo.toml:111`). Stating it on the edge changes the resolved
+# graph in exactly zero builds — measured, not assumed: the feature is already on in every
+# configuration this workspace can currently produce, `--workspace --no-default-features` included,
+# because there each member's defaults come straight back through its siblings' edges. What the edge
+# buys is that the requirement SURVIVES the day `cyrup-ext` stops defaulting `wasm-host` on, or any
+# edge here gains `default-features = false` — either of which would otherwise turn this crate into a
+# wall of `E0432`/`E0407` with nothing in any manifest saying why. This is NOT the PROV-052 shape:
+# `wasm-host` is the production capability host, not a test double.
+cyrup-ext = { workspace = true, features = ["wasm-host"] }
 # Only for the two seam traits (`ClarifyChannel`/`DeliveryChannel`) + `IntercomPayload`/`RunId`
 # (`tui::intercom`). One-directional (no cycle): subagents never depends on intercom.
 cyrup-ext-subagents = { workspace = true }

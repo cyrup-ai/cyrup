@@ -148,7 +148,7 @@ impl AgentSession {
     /// auth strategy from scratch. Reaching `cyrup_provider::Models::check_auth` from here would
     /// mean composing a whole registry per refusal (the session holds one installed `Provider`, not
     /// a `Models`), and the only reason upstream's re-check can differ from its cached answer is
-    /// that the SNAPSHOT is stale — so this refreshes the snapshot ([`AuthStore::reload`], pi's own
+    /// that the SNAPSHOT is stale — so this refreshes the snapshot ([`cyrup_config::AuthStore::reload`], pi's own
     /// `AuthStorage.reload`, `auth-storage.ts:204-215`) and re-asks the same predicate. That covers
     /// every credential source `has_configured_auth` knows and reproduces the observable
     /// difference; what it does not cover is a provider whose auth is ambient in a way

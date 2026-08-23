@@ -556,7 +556,7 @@ pub struct SubagentSettings {
 ///
 /// `project_settings_path` is `None` only when there is no project scope at all (no project root);
 /// an existing-but-empty project `settings.json` is `Some(path)` with an empty
-/// [`SubagentSettings::project`], mirroring pi's non-null `projectSettingsPath` + empty
+/// [`LayeredOverrideSettings::project`], mirroring pi's non-null `projectSettingsPath` + empty
 /// `projectSettings` — the two are distinguished by the `is_some()` gate on every project-scope
 /// application branch (a project override / bulk-disable / `disableThinking` only fires when the
 /// project scope actually exists).

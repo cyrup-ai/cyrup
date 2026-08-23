@@ -206,7 +206,7 @@ impl ControlNoticeSink for HostServicesControlNoticeSink {
 
 /// The control-notice debounce/actionability/dedup state machine (arch-SA §6.7).
 ///
-/// Plain, non-`Arc`-wrapped struct — per arch-SA §3.1, the owning [`SubagentsExtension`]-analogous
+/// Plain, non-`Arc`-wrapped struct — per arch-SA §3.1, the owning [`crate::extension::SubagentsExtension`]-analogous
 /// caller wraps this in its own `Arc<tokio::sync::Mutex<ControlNoticeState>>`, since the extension
 /// host's `on_event`/command handlers may need to reach it from a different task than the one
 /// folding NDJSON progress events. Methods that must schedule a delayed re-check (foreground

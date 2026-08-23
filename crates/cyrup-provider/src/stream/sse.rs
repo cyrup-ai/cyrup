@@ -1,6 +1,8 @@
 //! Direct-wire HTTP + SSE transport (arch-01 §7.1: `reqwest` + `rustls`, no native-tls, +
 //! `eventsource-stream`).
 //!
+//! A submodule of [`crate::stream`] so the request side and the event side share one module root.
+//!
 //! [`open_sse`] opens a request, exposes `on_request`/`on_response` observability hooks, retries the
 //! response-head phase under the caller's [`ProviderRetry`] budget, maps a non-2xx response or a
 //! transport failure to a typed [`ProviderError`] (the caller turns it into a terminal

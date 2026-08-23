@@ -14,9 +14,22 @@ workspace = true
 [dependencies]
 # --- the host seam ---------------------------------------------------------------------------
 # `NativeExtension`/`InitApi`/`HostCtx`/`HostServices` — the whole attachment surface (13a "How it
-# lands"). `cyrup-ext`'s `wasm-host` feature is DEFAULT-ON and `HostServices` lives behind it, so
-# this crate names the trait unqualified exactly as `cyrup-ext-subagents` does.
-cyrup-ext = { workspace = true }
+# lands"). `HostServices` lives behind `cyrup-ext`'s `wasm-host`, and this crate names the trait
+# unqualified (`src/runtime.rs:47`, `src/owner.rs`, `src/extension.rs`, `src/ui.rs`, `src/proxy.rs`)
+# exactly as `cyrup-ext-subagents` does. `src/extension.rs:776` also implements
+# `NativeExtension::set_host_services`, which is itself `#[cfg(feature = "wasm-host")]` on the
+# trait (`cyrup-ext/src/native.rs:682`), so with the feature off that impl alone is `E0407`.
+# `wasm-host` is NOT optional for this crate, and until now no manifest said so: the feature rode in
+# on `cyrup-ext`'s `default = ["wasm-host"]` through the workspace table, which sets no
+# `default-features = false` (root `Cargo.toml:111`). Stating it on the edge changes the resolved
+# graph in exactly zero builds — measured, not assumed: the feature is already on in every
+# configuration this workspace can currently produce, `--workspace --no-default-features` included,
+# because there each member's defaults come straight back through its siblings' edges. What the edge
+# buys is that the requirement SURVIVES the day `cyrup-ext` stops defaulting `wasm-host` on, or any
+# edge here gains `default-features = false` — either of which would otherwise turn this crate into a
+# wall of `E0432`/`E0407` with nothing in any manifest saying why. This is NOT the PROV-052 shape:
+# `wasm-host` is the production capability host, not a test double.
+cyrup-ext = { workspace = true, features = ["wasm-host"] }
 # `CancelToken` (= `tokio_util::sync::CancellationToken`) is the runtime owner's abort signal
 # (MCP-004) and `Tool`/`ToolError`/`ToolResult` are the direct-tool/proxy-tool boundary.
 cyrup-core = { workspace = true }

@@ -86,7 +86,7 @@ const WRITE_STDIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// exhaust host process-table/task resources over time. No Pi-derived exact count to port — the real
 /// consumer, `pi-mcp-adapter/server-manager.ts:41,60-83`'s `connections` map, bounds real-world
 /// concurrent live children implicitly by the size of the user's OWN mcp server config (typically a
-/// handful) — so, like [`crate::caps::http::MAX_OPEN_STREAMS`], this is a deliberately generous cap
+/// handful) — so, like `crate::caps::http::MAX_OPEN_STREAMS`, this is a deliberately generous cap
 /// comfortably above any realistic legitimate count, while still guaranteeing bounded worst-case
 /// growth.
 const MAX_SPAWNED_PROCESSES: usize = 256;

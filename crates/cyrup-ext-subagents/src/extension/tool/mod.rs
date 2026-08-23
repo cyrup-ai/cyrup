@@ -97,8 +97,8 @@ impl SubagentTool {
     /// `:540` @v0.43.0).
     ///
     /// A builder rather than a `new` parameter because resolution needs the extension's loaded
-    /// config, which only [`SubagentsExtension::init`] has — every other construction site (this
-    /// crate's own tests, [`SubagentsExtension::subagent_tool`]) keeps pi's `full` default, which
+    /// config, which only [`cyrup_ext::NativeExtension::init`] has — every other construction site (this
+    /// crate's own tests, [`crate::extension::SubagentsExtension::subagent_tool`]) keeps pi's `full` default, which
     /// is exactly what `buildSubagentToolDescription({})` returns.
     #[must_use]
     pub(crate) fn with_description(mut self, description: String) -> Self {

@@ -1,5 +1,7 @@
 //! The **unconfigured** provider — the zero-model stand-in for "nothing is authenticated yet".
 //!
+//! **Always compiled** — unlike [`crate::faux`], this is production code.
+//!
 //! ## What pi does
 //!
 //! pi has no provider object at all in this state. `ModelRuntime.getAvailable()` returns the models

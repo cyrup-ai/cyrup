@@ -22,7 +22,7 @@
 //!
 //! # The two auth arms
 //!
-//! [`crate::providers::google_vertex::GoogleVertexApiKeyAuth::resolve`] (pi `google-vertex.ts:62-84`)
+//! [`crate::providers::google_vertex::GoogleVertexApiKeyAuth`]'s `resolve` (pi `google-vertex.ts:62-84`)
 //! produces one of two shapes, and this module's whole job on the auth axis is to tell them apart
 //! the way pi's `stream` does at `google-vertex.ts:98-102`:
 //!

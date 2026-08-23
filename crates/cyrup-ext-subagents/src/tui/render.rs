@@ -15,7 +15,7 @@
 //! session-event sink, and whichever crate owns the live terminal (`cyrup-tui`, out of scope
 //! here) is responsible for actually painting them. Keeping these functions pure and terminal-
 //! free is exactly what makes them unit-testable via
-//! [`cyrup_test_support::tui::TestTerminal`] without a live terminal, per this phase's own
+//! `cyrup_test_support::tui::TestTerminal` without a live terminal, per this phase's own
 //! testing instructions.
 //!
 //! # Requirement coverage
@@ -403,7 +403,7 @@ pub fn run_mode_label(mode: RunMode) -> &'static str {
 /// information — a small convenience for callers/tests that want a plain-text assertion surface
 /// without going through a full [`ratatui::backend::TestBackend`] paint. Every function in this
 /// module is designed to be equally testable either way (plain-text via this helper, or grid-
-/// painted via [`cyrup_test_support::tui::TestTerminal`]), per this phase's own testing
+/// painted via `cyrup_test_support::tui::TestTerminal`), per this phase's own testing
 /// instructions.
 #[must_use]
 pub fn lines_to_plain_text(lines: &[Line<'static>]) -> Vec<String> {

@@ -1,7 +1,7 @@
 use super::*;
 
 /// Truncate a one-line summary to a sane length (avoid overrunning the marker line).
-/// Detect a `Custom`-role [`cyrup_agent::AgentMessage`] from its serde projection and return its
+/// Detect a `Custom`-role `cyrup_agent::AgentMessage` from its serde projection and return its
 /// `(kind, body)` for [`TranscriptView::push_custom_message`](crate::transcript::TranscriptView::push_custom_message).
 /// `AgentMessage` is only a dev-dependency here, so the message is inspected through `serde_json`
 /// (`{"role":"custom","kind":…,"payload":…}`) instead of a direct pattern match — no dep ripple.
@@ -93,9 +93,9 @@ pub async fn extension_render(
 /// NOT collapse the three-state [`cyrup_ext::RenderOutcome`] the way [`extension_render`] does:
 ///
 /// * no renderer, or a renderer that drew nothing (`:3433-3435` / `:3438-3440`) →
-///   [`Rendered::None`], and the caller draws NOTHING;
-/// * a rendered component (`custom-entry.ts:58-60`) → [`Rendered::Text`];
-/// * a renderer that THREW (`custom-entry.ts:47-52`) → [`Rendered::Failed`], the failure box.
+///   [`crate::transcript::Rendered::None`], and the caller draws NOTHING;
+/// * a rendered component (`custom-entry.ts:58-60`) → [`crate::transcript::Rendered::Text`];
+/// * a renderer that THREW (`custom-entry.ts:47-52`) → [`crate::transcript::Rendered::Failed`], the failure box.
 ///
 /// Same cheap sync pre-check (`if (!renderer) return;`) and the same spawn + bounded wait as
 /// [`extension_render`].

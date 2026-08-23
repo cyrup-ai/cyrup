@@ -313,7 +313,7 @@ pub async fn evaluate_acceptance_with_cancel(
 /// `:819-829`), run against the child's own `acceptance-report` block.
 ///
 /// Returns one message per FAILED [`crate::exec::acceptance::model::AcceptanceRuntimeCheck`], verbatim, so the ledger detail
-/// (and therefore [`apply_post_hoc_correction`]'s error text) carries pi's own wording —
+/// (and therefore [`crate::exec::acceptance::lattice::post_hoc::apply_post_hoc_correction`]'s error text) carries pi's own wording —
 /// e.g. `tests-added evidence missing from child report.` or
 /// `Required criterion 'c1' was not reported.`. An empty vector means every declared check passed,
 /// which is also the trivial answer when the contract declares no criteria and no evidence.

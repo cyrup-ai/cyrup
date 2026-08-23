@@ -332,7 +332,7 @@ impl<B: Backend> App<B> {
     }
 
     /// `/share` (`handleShareCommand`, interactive-mode.ts:5191): export the session to HTML, write a
-    /// temp file, then shell `gh gist create --public=false <file>` behind a [`BorderedLoader`] and
+    /// temp file, then shell `gh gist create --public=false <file>` behind a [`crate::chrome::BorderedLoader`] and
     /// surface the resulting gist URL. `gh` missing / logged-out / failing degrades to a status line
     /// (Pi's `showError` paths). Fully in-crate (the HTML body is rendered by [`crate::export`]).
     async fn share_session(&mut self, session: &Arc<AgentSession>) {

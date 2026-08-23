@@ -85,7 +85,7 @@ pub const SUBAGENT_SAFETY_GUIDANCE: &str = r#"SAFETY-CRITICAL SUBAGENT GUIDANCE:
 /// unknown-action arm. This is a DELETION of an upstream line naming an unported subsystem, not
 /// authored text — the same convention `extension.rs`'s `SUBAGENT_ACTIONS` already documents
 /// ("This is cyrup's CURRENT surface, not upstream's full 53"), and
-/// [`the_compact_description_advertises_no_verb_cyrup_cannot_dispatch`] enforces it mechanically
+/// `the_compact_description_advertises_no_verb_cyrup_cannot_dispatch` enforces it mechanically
 /// rather than by assertion.
 ///
 /// Every other verb this text names — `list`, `get`, `models`, `create`, `update`, `delete`,

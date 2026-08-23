@@ -9,7 +9,7 @@
 //! broker has published `broker.port.json`, so a once-resolved, cached target could never become
 //! connectable.
 //!
-//! `ensure_broker` ([`spawnBrokerIfNeeded`]) is idempotent: if the broker is already health-
+//! `ensure_broker` (`spawnBrokerIfNeeded`) is idempotent: if the broker is already health-
 //! connectable it returns; otherwise it takes an exclusive spawn lock (`O_EXCL`), re-checks, and
 //! **re-execs the broker as a detached OS process** — the configured `broker_command`/`broker_args`
 //! (`IntercomConfig`, `config.ts:24,26`) if they differ from pi's own `"npx" ["--no-install","tsx"]`

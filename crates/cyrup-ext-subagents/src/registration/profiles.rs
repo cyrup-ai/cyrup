@@ -44,7 +44,7 @@
 //!   (argument parsing, `ctx.ui.notify` progress reporting) live in
 //!   `registration/slash_commands.rs`, a sibling file not owned by this task — this module
 //!   exposes the plain, synchronous functions ([`validate_profile_name`], [`list_profiles`],
-//!   [`load_profile`], [`apply_profile`]) that command dispatch calls into, per R-SA-130's
+//!   [`load_profile`], [`apply_profile_to_settings_file`]) that command dispatch calls into, per R-SA-130's
 //!   single-execution-code-path rule, rather than embedding any command-parsing logic here.
 //! - **Named-profile persistence format for *writing* new profiles** (i.e. a `save_profile`-style
 //!   authoring path) is not required by R-SA-140/141/142's text, which is scoped to *loading* and
@@ -75,7 +75,7 @@ use crate::error::SubagentError;
 /// MUST be called, and MUST return `Ok`, before `name` participates in constructing any
 /// filesystem path (R-SA-142's "before being used to construct a filesystem path" ordering
 /// requirement) or any settings-store lookup keyed by the name. [`profile_path`], [`load_profile`],
-/// and [`apply_profile`] all call this first, unconditionally, before touching the filesystem or
+/// and [`apply_profile_to_settings_file`] all call this first, unconditionally, before touching the filesystem or
 /// the settings store.
 ///
 /// # Errors

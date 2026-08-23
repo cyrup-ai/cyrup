@@ -68,7 +68,7 @@ impl SubagentTool {
     /// [CYRUP-DELTA — deliberate, narrow] pi's `canonicalizeAgentName` ALSO turns an unresolvable
     /// name into `Unknown agent: <name>` right here. cyrup leaves an unresolvable name UNTOUCHED and
     /// lets the existing per-mode resolution fail as it already does
-    /// ([`SubagentError::AgentNotFound`] -> `agent not found: <name>`): the not-found WORDING is a
+    /// ([`crate::error::SubagentError::AgentNotFound`] -> `agent not found: <name>`): the not-found WORDING is a
     /// pre-existing, separate difference from pi that this crate's own tests pin, and changing it
     /// here would be an unrelated behavioural edit smuggled into the alias port. The alias-resolution
     /// and ambiguity-refusal halves — the parts this port owns — are complete.
@@ -221,13 +221,13 @@ impl SubagentTool {
     }
 
     /// SINGLE mode (`{agent, task?}`) — the fully-wired shape (func-SA §5.2). Resolves the persona
-    /// through real discovery and drives [`SubagentExecutor::run_foreground`]/[`spawn_background`]
+    /// through real discovery and drives [`SubagentExecutor::run_foreground`]/[`crate::extension::SubagentExecutor::spawn_background`]
     /// (`async: true`), each a genuine child OS process. `context` selects fork/fresh (an omitted
     /// value is `Fresh` in this tier); `model` is the per-call override.
     ///
     /// SUBA-041 — the per-call override surface pi's `runSinglePath` honors
     /// (`subagent-executor.ts:3561-3564` output/outputMode/skill, `:2962` acceptance, `:2874` share,
-    /// `:3387-3401` artifacts/sessionDir, `:1179` control) now reaches [`RunOptions`] through
+    /// `:3387-3401` artifacts/sessionDir, `:1179` control) now reaches [`crate::exec::RunOptions`] through
     /// [`SingleRunOverrides`] instead of being rejected wholesale. `includeProgress` — the one
     /// remaining param with no subsystem behind it — is absent from the tool schema and still
     /// refused here, so the schema never promises what this dispatcher declines.

@@ -37,7 +37,7 @@ pub const ACCEPTANCE_REJECTED_EXIT_CODE: i32 = 1;
 /// output validation (R-SA-030) and the completion-mutation guard (R-SA-034), and strictly before
 /// the result is handed to the caller or serialized. This function itself does not enforce that
 /// ordering procedurally (it cannot — it has no visibility into when its caller invokes it
-/// relative to those other two checks); it is the caller's ([`crate::exec::mod`]'s not-yet-built
+/// relative to those other two checks); it is the caller's ([`crate::exec`]'s not-yet-built
 /// `run_sync` completion path, a later phase) responsibility to invoke this LAST, after
 /// [`crate::exec::acceptance::lattice::gate::evaluate_acceptance`] itself, which is exactly why this function takes an already-computed
 /// [`AcceptanceLedger`] as input rather than re-deriving one.

@@ -111,7 +111,7 @@ impl RetryObserver for RetryEventEmitter {
 
 /// Build the emitter + its drain queue for one summarization operation — Pi
 /// `_summarizationRetryCallbacks(source)` (`agent-session.ts:2641`). The receiver is drained by
-/// [`crate::AgentSession::with_emitted_events`].
+/// `AgentSession::spawn_event_pump`.
 pub(crate) fn summarization_retry_channel(
     source: SummarizationRetrySource,
 ) -> (Arc<dyn RetryObserver>, mpsc::UnboundedReceiver<AgentSessionEvent>) {

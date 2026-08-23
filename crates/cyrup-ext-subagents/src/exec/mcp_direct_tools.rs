@@ -369,7 +369,7 @@ struct MetadataCache {
 /// The directory context the resolver reads config/cache from. Factored out of the bare
 /// `process.env` reads pi performs inline (`getAgentDir()` / `os.homedir()`) so tests can inject a
 /// hermetic layout without mutating real (edition-2024 `unsafe`) process env — mirroring
-/// [`crate::spawn::depth::resolve_effective_depth_from`]'s injectable-lookup pattern.
+/// `crate::spawn::depth::resolve_effective_depth_from`'s injectable-lookup pattern.
 #[derive(Clone, Debug)]
 pub struct McpDirs {
     /// pi `getAgentDir()` — holds `mcp.json` (global pi config) and `mcp-cache.json`.

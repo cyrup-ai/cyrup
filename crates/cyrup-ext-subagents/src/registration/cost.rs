@@ -23,10 +23,10 @@
 //!    before exiting) surfaces its descendants' cost. [`accumulate_meta_tree`] walks this shape.
 //! 2. **The per-step nested-children shape inside async chain jobs**
 //!    ([`crate::background::StepStatus::nested_run_ids`]): a background/async chain run's `status.json`
-//!    records, per step, the [`background::RunId`]s of any further background runs that step
+//!    records, per step, the [`crate::background::RunId`]s of any further background runs that step
 //!    itself kicked off (func-SA §4.5's `StepStatus` "nested-child descriptors" —
 //!    `background/mod.rs`'s own doc comment on `nested_run_ids` names this exact field as R-SA-104's
-//!    nested-descendant list). Each such id resolves to its own [`background::RunPaths::nested`]
+//!    nested-descendant list). Each such id resolves to its own [`crate::background::RunPaths::nested`]
 //!    sibling tree (its own `status.json`, and potentially its own `_meta.json` artifacts, and
 //!    potentially further `nested_run_ids` of its own). [`accumulate_nested_run_ids`] walks this
 //!    shape, recursing arbitrarily deep.

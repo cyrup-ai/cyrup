@@ -16,7 +16,7 @@
 //! `cargo build --target wasm32-wasip2` then yields a loadable `cyrup:ext` COMPONENT. The macro emits
 //! the wasm guest glue — the world's `init` + `events` (all 33 hooks + `execute-tool` +
 //! `execute-command`/`get-argument-completions` + `render-call`/`render-result`) exports + the
-//! `export!` invocation — each delegating to the routing helpers in [`crate::guest`]. The
+//! `export!` invocation — each delegating to the routing helpers in `crate::guest`. The
 //! `wit_bindgen::generate!` (with `pub_export_macro`) runs once in this crate; the downstream author's
 //! cdylib reaches `bindings::export!` by path, so a one-line invocation produces a working component.
 //!

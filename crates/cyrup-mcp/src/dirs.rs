@@ -598,7 +598,7 @@ pub struct ServerCacheEntry {
     /// non-destructive: a plain `i64` makes `"cachedAt": "1760000000000"` a **parse error**, which
     /// [`load_metadata_cache`] turns into `None` for the whole file, where upstream rejects only
     /// that one entry. Anything that is not a JSON number lands on `0`, which the falsy test
-    /// already rejects. See [`crate::registration::lenient_epoch_ms`], its twin on the lenient
+    /// already rejects. See `crate::registration::lenient_epoch_ms`, its twin on the lenient
     /// reader over the same bytes.
     #[serde(default, deserialize_with = "lenient_epoch_ms")]
     pub cached_at: i64,

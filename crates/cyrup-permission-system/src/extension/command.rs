@@ -25,7 +25,7 @@ fn on_off(value: bool) -> &'static str {
 impl PermissionSystemExtension {
     /// The `/permission-system` handler body (pi `index.ts:1504-1511` via
     /// `createPermissionSystemCommandHandler`, `common.ts:188-198`), reached from
-    /// [`NativeExtension::execute_command`].
+    /// [`cyrup_ext::NativeExtension::execute_command`].
     ///
     /// \[CYRUP-DELTA] Upstream's body is `openPermissionSystemSettingsModal(ctx, controller)`
     /// (`config-modal.ts:63-123`): a `ctx.ui.custom` overlay rendering pi's own `ZellijSettingsModal`
@@ -64,7 +64,7 @@ impl PermissionSystemExtension {
     /// behaviour to satisfy a reachability rule. [`Self::set_yolo_mode`],
     /// [`Self::toggle_yolo_mode`] and [`Self::yolo_mode`] belong to the OTHER surface, and
     /// PERM-011 half A has now given them upstream's own publish seam: they are registered on the
-    /// process-global [`crate::runtime_api`] registry (pi's `globalThis.__piPermissionSystem`,
+    /// process-global [`mod@crate::runtime_api`] registry (pi's `globalThis.__piPermissionSystem`,
     /// `yolo-mode-api.ts:20-43`) by [`Self::publish_runtime_api`], so a second extension reaches
     /// them through `crate::runtime_api::runtime_api()` — never through this command.
     ///
@@ -175,7 +175,7 @@ impl PermissionSystemExtension {
     /// (`index.ts:1407`) — the raw cause alone — because its modal is still on screen to supply the
     /// context; cyrup's command has no modal, so the context has to travel in the toast.
     ///
-    /// Silent when no [`HostServices`] backend is attached, which is the same no-op pi's
+    /// Silent when no [`cyrup_ext::HostServices`] backend is attached, which is the same no-op pi's
     /// `noOpUIContext` gives a headless run.
     fn notify_save_failure(&self, summary: &str, cause: &str) {
         if let Some(services) = self.host_services.get() {

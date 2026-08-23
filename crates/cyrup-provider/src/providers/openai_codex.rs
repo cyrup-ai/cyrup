@@ -148,7 +148,7 @@ pub fn openai_codex_auth() -> ProviderAuth {
 /// [`crate::api::builtin_registry`] streams. PROV-041: this doc previously claimed "none is
 /// registered today … cannot yet stream", which was false at the tree it was written against and
 /// is the kind of citation `CLAUDE.md` makes the provenance record — see
-/// [`prov041_openai_codex_responses_is_registered`].
+/// `prov041_openai_codex_responses_is_registered`.
 pub fn openai_codex_provider_with(
     store: Arc<dyn CredentialStore>,
     registry: Arc<ApiRegistry>,

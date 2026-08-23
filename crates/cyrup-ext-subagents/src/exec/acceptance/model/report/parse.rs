@@ -83,7 +83,7 @@ fn parse_unterminated_acceptance_report_fence(
 /// model was cut off mid-opener (`"…\n```acceptance-report"` with nothing after it): the run
 /// then reports [`ACCEPTANCE_REPORT_NOT_FOUND`] instead of the fence defect, and because that
 /// constant is the one value [`parse_acceptance_report_sources`] and
-/// [`crate::exec::acceptance::select_acceptance_report_source`] branch on to decide "genuinely absent, fall
+/// [`crate::exec::acceptance::lattice::report_source::select_acceptance_report_source`] branch on to decide "genuinely absent, fall
 /// through to the other source", a truncated report in a `file-only` artifact papers itself
 /// over with the assistant text — the precise failure this source-selection rule exists to
 /// prevent.

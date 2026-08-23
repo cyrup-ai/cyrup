@@ -76,6 +76,24 @@ pub struct AuthStore {
     /// coerced any `Err` to "not configured", so a transient read error or a mid-write window made
     /// every configured provider look unauthenticated.
     cached: RwLock<AuthFile>,
+    /// The AMBIENT environment tier this store's env fallback reads (Pi
+    /// `getProviderEnvValue`'s `process.env` half). `None` — the default, and the only value
+    /// production ever uses — is the real process environment.
+    ///
+    /// This exists because without it the `env` argument threaded through [`Self::has_auth`] /
+    /// [`Self::get_api_key`] is only half a seam: `provider_env_value` is
+    /// `env?.[name] || process.env[name]`, so an overlay can ADD a value but cannot express
+    /// "this variable is unset". Every caller passing `None` — including
+    /// `AgentSession::provider_has_configured_auth` (`cyrup-session-svc/src/session.rs:3085-3092`),
+    /// which is the whole `/model` and `cycle_model` candidate filter — therefore answered from
+    /// the machine running the process. That is not hypothetical: a host with ambient
+    /// `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` makes `amazon-bedrock` configured and puts
+    /// its whole catalog into every available-model set.
+    ///
+    /// It cannot be worked around by scrubbing the environment: this crate is
+    /// `#![forbid(unsafe_code)]` and `std::env::remove_var` is unsafe in Rust 2024, and a scrub
+    /// would be process-global — wrong under any parallel test runner.
+    ambient: Option<HashMap<String, String>>,
 }
 
 impl AuthStore {
@@ -91,9 +109,30 @@ impl AuthStore {
             locks: Mutex::new(HashMap::new()),
             runtime: RwLock::new(HashMap::new()),
             cached: RwLock::new(AuthFile::new()),
+            ambient: None,
         };
         store.reload();
         store
+    }
+
+    /// Pin the AMBIENT environment tier to a fixed map instead of the process environment.
+    ///
+    /// The seam `cyrup_config::provider_is_configured` needs to be answerable from a fixture rather
+    /// than from the host. Pass `HashMap::new()` for "no ambient credentials at all", which is what
+    /// a hermetic fixture wants; the scoped `env` argument on [`Self::has_auth`] /
+    /// [`Self::get_api_key`] keeps its usual precedence over this tier.
+    #[must_use]
+    pub fn with_ambient_env(mut self, env: HashMap<String, String>) -> Self {
+        self.ambient = Some(env);
+        self
+    }
+
+    /// This store's ambient tier, as [`crate::env_keys`] wants it.
+    pub(crate) fn ambient_tier(&self) -> crate::env_keys::Ambient<'_> {
+        match self.ambient.as_ref() {
+            Some(map) => crate::env_keys::Ambient::Fixed(map),
+            None => crate::env_keys::Ambient::Process,
+        }
     }
 
     /// Re-read `auth.json` into the snapshot, PRESERVING the previous snapshot on any failure
@@ -325,7 +364,7 @@ impl AuthStore {
         if self.snapshot().contains_key(provider.as_str()) {
             return true;
         }
-        crate::env_keys::get_env_api_key(provider.as_str(), env).is_some()
+        crate::env_keys::get_env_api_key_in(provider.as_str(), env, self.ambient_tier()).is_some()
     }
 
     // CFG-044: `AuthStore::get_auth_status` was DELETED here. It cited `getAuthStatus` at
@@ -388,7 +427,11 @@ impl AuthStore {
         if !include_fallback {
             return Ok(None);
         }
-        Ok(crate::env_keys::get_env_api_key(provider.as_str(), env))
+        Ok(crate::env_keys::get_env_api_key_in(
+            provider.as_str(),
+            env,
+            self.ambient_tier(),
+        ))
     }
 }
 
@@ -805,6 +848,10 @@ mod tests {
     #[tokio::test]
     async fn has_auth_sees_stored_runtime_and_environment_tiers() {
         let (s, _p, _dir) = store();
+        // Pin the AMBIENT tier: the scoped `Some(&empty)` overlay can only ADD a value, so without
+        // this the negative assertion below is an assertion about the developer's shell (an
+        // exported `OPENAI_API_KEY` flips it), not about the three tiers under test.
+        let s = s.with_ambient_env(HashMap::new());
         let openai = ProviderId::from("openai");
         let empty: HashMap<String, String> = HashMap::new();
         assert!(!s.has_auth(&openai, Some(&empty)));
@@ -833,6 +880,9 @@ mod tests {
     #[tokio::test]
     async fn a_corrupt_auth_json_preserves_the_last_valid_snapshot() {
         let (s, path, _dir) = store();
+        // Same reason as above: the final `!has_auth` — the repaired-file assertion — would
+        // otherwise be answered by an ambient `OPENAI_API_KEY` rather than by the snapshot.
+        let s = s.with_ambient_env(HashMap::new());
         let prov = ProviderId::from("openai");
         let empty: HashMap<String, String> = HashMap::new();
 

@@ -133,7 +133,7 @@ pub struct LoginProviderOption {
     pub name: String,
     pub auth_type: AuthType,
     /// `method.name` — `"Anthropic (Claude Pro/Max)"` for OAuth, `"Anthropic API key"` for an
-    /// api-key strategy (see [`api_key_login_label`]).
+    /// api-key strategy (see [`cyrup_provider::auth::ApiKeyAuth::name`]).
     pub method_name: Option<String>,
     /// `OAuthAuth.loginLabel` (`ai/src/auth/types.ts:194`), OAuth options only.
     pub login_label: Option<String>,
@@ -164,8 +164,8 @@ pub enum LoginError {
     #[error("{0}")]
     Flow(#[from] OAuthError),
 
-    /// `throw new ModelsError("auth", \`Credential store modify failed for ${providerId}\`,
-    /// { cause })` (`models.ts:441`); `withCauseDetail` appends `": <cause>"`
+    /// ``throw new ModelsError("auth", `Credential store modify failed for ${providerId}`,
+    /// { cause })`` (`models.ts:441`); `withCauseDetail` appends `": <cause>"`
     /// (`auth/resolve.ts:33-39`).
     #[error("Credential store modify failed for {provider}: {message}")]
     StoreModify { provider: String, message: String },
@@ -327,8 +327,9 @@ pub fn provider_auth_status(
         };
     }
     // `return check ? { configured: true, source: "environment", label: check.source } : { configured: false }`.
-    if let Some(name) = crate::env_keys::find_env_keys(provider.as_str(), env)
-        .and_then(|keys| keys.into_iter().next())
+    if let Some(name) =
+        crate::env_keys::find_env_keys_in(provider.as_str(), env, store.ambient_tier())
+            .and_then(|keys| keys.into_iter().next())
     {
         return AuthStatus {
             configured: true,

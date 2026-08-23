@@ -7,7 +7,7 @@
 //! - [`interrupt`] — dual-channel (file + best-effort signal) soft-pause request (R-SA-081),
 //!   idempotent consumption semantics on the runner side (R-SA-083), Paused-not-Failed outcome
 //!   and descendant propagation (R-SA-084, the propagation-to-descendants *step* of which is
-//!   [`runner_main.rs`]'s job once written — this module only *delivers* the request; see the
+//!   `runner_main.rs`'s job once written — this module only *delivers* the request; see the
 //!   deferred-work note below).
 //! - [`resume`] — the R-SA-085/086 fork: steer an already-`Running` run's live child (no
 //!   respawn) vs. genuinely re-spawn a fresh detached-runner-spawned child seeded from a
@@ -37,7 +37,7 @@
 //!   the exact on-disk shapes ([`InterruptRequest`], [`ChainAppendRequest`]) and the
 //!   orchestrator-side write/enqueue halves those consumers read; the consumer implementations
 //!   themselves are `runner_main.rs`'s job, per this crate's module-layout doc (arch-SA §2.2).
-//!   [`watch_control_inbox_once`] below is provided as the reusable *primitive* (real
+//!   [`watch_control_inbox`] below is provided as the reusable *primitive* (real
 //!   `notify::PollWatcher` + immediate synchronous startup check) both this module's own tests
 //!   and, later, `runner_main.rs` can build on — it does not itself decide interrupt semantics.
 //! - **Marking running steps `Paused`, appending the `run.paused` event, and forwarding to live
@@ -60,7 +60,7 @@
 //!   probe. Documented here rather than left silently inconsistent.
 //! - **Combined cross-namespace run-id ambiguity detection** (R-SA-080, `SHOULD`) spans the
 //!   foreground-control/async/nested-async id namespaces this crate's later phases still need to
-//!   define; this module exposes [`super::error::AmbiguousRunId`]-shaped failures for the single
+//!   define; this module exposes [`crate::error::SubagentError::AmbiguousRunId`]-shaped failures for the single
 //!   namespace it *does* own (background run ids under one `AsyncRoot`) but does not attempt the
 //!   cross-namespace merge, which has no owner module yet.
 //! - **The orchestrator-side shared poller** that periodically invokes reconciliation for every
@@ -494,7 +494,7 @@ async fn deliver_wakeup_signal_to(control_inbox: &Path, pid: Option<u32>) {
 ///
 /// # Known gap on Windows
 ///
-/// [`check_pid_liveness`]'s own `not(unix)` body currently answers [`Liveness::Unknown`] for every
+/// [`super::reconcile::check_pid_liveness`]'s own `not(unix)` body currently answers [`Liveness::Unknown`] for every
 /// pid (`background/reconcile.rs:118-122`), so on Windows this reports `Unknown` and the cleanup
 /// correctly declines to fire on an inconclusive answer. That is a limitation of the PROBE, not of
 /// this seam — the moment `check_pid_liveness` can distinguish a dead pid on Windows (tracked

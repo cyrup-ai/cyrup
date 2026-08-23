@@ -3,7 +3,7 @@
 //!
 //! The READBACK half of the context-usage feature `pi-intercom` v0.8.0 added
 //! (`v0.9.2 CHANGELOG.md:33`, "Added live context-window usage to session presence **and list
-//! output**"). The producer half is [`crate::extension::IntercomExtension::current_context_usage`],
+//! output**"). The producer half is [`crate::session_state::SharedIntercomState::current_context_usage`],
 //! which rides the presence heartbeat; this is what turns the numbers a peer publishes into the
 //! ` · 72% ctx (144k/200k)` a user reads in `intercom({ action: "list" })` output
 //! (`v0.9.2 index.ts:428`, the sole call site — note upstream's own `ui/session-list.ts` overlay

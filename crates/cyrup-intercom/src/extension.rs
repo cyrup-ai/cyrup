@@ -15,8 +15,8 @@
 //!   sites, child-mode gated (a subagent child with metadata always attaches so `contact_supervisor`
 //!   registers; a plain session attaches only when opt-in-installed).
 //!
-//! CHANNEL HANDOFF (WIRED): the three seam channels ([`Self::clarify_channel`]/
-//! [`Self::delivery_channel`]/[`Self::steer_channel`]) are handed into
+//! CHANNEL HANDOFF (WIRED): the three seam channels ([`IntercomExtension::clarify_channel`]/
+//! [`IntercomExtension::delivery_channel`]/[`IntercomExtension::steer_channel`]) are handed into
 //! `SubagentsExtension::with_channels` at the three `crates/cyrup/src/main.rs` session-build sites,
 //! replacing subagents' `NoTransportChannel`/no-live-`AskLock`/`NoTransportSteerChannel` degrade
 //! defaults with these broker-backed impls — see [`crate::seams`].

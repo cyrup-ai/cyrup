@@ -2,7 +2,7 @@
 //! width-88, max-8-visible session picker the `/intercom` overlay opens).
 //!
 //! WIRING: [`SessionListOverlay::render`] draws the session picker the `/intercom` slash command
-//! returns as its text output ([`crate::extension::IntercomExtension::execute_command`]). The
+//! returns as its text output ([`crate::extension::IntercomExtension`]'s `execute_command`). The
 //! interactive selection state machine ([`SessionListOverlay::handle_input`]) is the faithful port of
 //! the live overlay; a live keystroke source is the Phase-6 `register_shortcut`/overlay-host gap (the
 //! port doc §4.3/§5 Phase 6), so it is unit-tested here and wired to real input only once that host

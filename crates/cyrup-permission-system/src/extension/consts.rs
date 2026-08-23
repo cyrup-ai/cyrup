@@ -42,7 +42,7 @@ pub(super) const NO_EVENT_BACKEND_ERROR: &str =
 pub const COMMAND_YOLO_CONTROL_SOURCE: &str = "permission-system-command";
 
 /// pi `saved.error ?? "Failed to persist pi-permission-system config."` (v0.8.0 `index.ts:1439`),
-/// rebranded. Reached only if [`ExtensionConfig::save`] ever reports failure without an error
+/// rebranded. Reached only if [`crate::ExtensionConfig::save`] ever reports failure without an error
 /// string, which it does not today — carried because upstream carries it.
 pub(super) const YOLO_PERSIST_FALLBACK_ERROR: &str =
     "Failed to persist cyrup-permission-system config.";
@@ -51,7 +51,7 @@ pub(super) const YOLO_PERSIST_FALLBACK_ERROR: &str =
 /// `schemas/permissions.schema.json` @v0.8.0 (`$id` and title rebranded; every keyword, `$def`,
 /// `patternProperties` entry and description otherwise upstream's). Embedded rather than merely
 /// shipped so `/permission-system schema` can emit it from a running binary with no install-layout
-/// assumptions, and so [`schema_is_wellformed`] can validate it at test time — cyrup's analog of
+/// assumptions, and so `schema_is_wellformed` can validate it at test time — cyrup's analog of
 /// upstream's `scripts/validate-artifacts.mjs:50` wired into the package `check` script.
 pub const PERMISSIONS_JSON_SCHEMA: &str =
     include_str!("../../schemas/cyrup-permissions.schema.json");

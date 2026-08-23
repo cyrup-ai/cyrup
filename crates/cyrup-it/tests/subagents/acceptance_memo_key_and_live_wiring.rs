@@ -833,6 +833,9 @@ fn runner_config(
 ) -> RunnerConfig {
     RunnerConfig {
         turn_budget: None,
+        // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
+        // call that does not ask for one runs unbudgeted. This fixture asks for none.
+        usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
         share: None,

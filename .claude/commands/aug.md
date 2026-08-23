@@ -88,9 +88,10 @@ echo "FLUX_BASE=$FLUX_BASE"
 Act as a `$STACK` expert SOFTWARE ARTISAN. If a file called `stack.env` exists at `$FLUX_BASE/stack.env`, read it and set `$STACK` from its contents. Otherwise, run the following detection script to determine `$STACK` and save it (this only ever runs the first time for this directory):
 
 ```bash
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null || pwd -P)
 STACK="software"
-if [ -f "package.json" ]; then
-  STACK=$(bun -e "
+if [ -f "$ROOT/package.json" ]; then
+  STACK=$(cd "$ROOT" && bun -e "
     const d=JSON.parse(require('fs').readFileSync('./package.json','utf8'));
     const deps=Object.assign({}, d.dependencies, d.devDependencies, d.peerDependencies);
     const frameworks=['ink','react','vue','angular','next','express'];
@@ -98,10 +99,10 @@ if [ -f "package.json" ]; then
     const ts=deps['typescript']?'TypeScript':'JavaScript';
     console.log(fw?fw+' + '+ts:ts);
   " 2>/dev/null || echo "JavaScript/TypeScript")
-elif [ -f "Cargo.toml" ]; then STACK="Rust"
-elif [ -f "go.mod" ]; then STACK="Go"
-elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then STACK="Python"
-elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then STACK="Java/Kotlin"
+elif [ -f "$ROOT/Cargo.toml" ]; then STACK="Rust"
+elif [ -f "$ROOT/go.mod" ]; then STACK="Go"
+elif [ -f "$ROOT/requirements.txt" ] || [ -f "$ROOT/pyproject.toml" ]; then STACK="Python"
+elif [ -f "$ROOT/pom.xml" ] || [ -f "$ROOT/build.gradle" ]; then STACK="Java/Kotlin"
 fi
 mkdir -p "$FLUX_BASE"
 echo "$STACK" > "$FLUX_BASE/stack.env"

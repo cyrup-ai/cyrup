@@ -290,7 +290,7 @@ fn parse_npm_exec_args(args: &[String]) -> Option<ParsedInvocation> {
 /// ([`get_npm_cache_dir`]) — split out so tests can inject a hermetic fake cache dir instead
 /// (`cyrup-ext` is `#![forbid(unsafe_code)]` crate-wide and edition 2024 makes
 /// `std::env::set_var` `unsafe fn`, so tests cannot point `NPM_CONFIG_CACHE` at a fixture dir the
-/// way a real npm invocation would — same reasoning [`interpolate_env_vars_with`]'s doc, `proc.rs`,
+/// way a real npm invocation would — same reasoning [`super::interpolate_env_vars_with`]'s doc, `proc.rs`,
 /// already documents for the sibling `${VAR}` interpolation tests).
 fn resolve_from_npm_cache(package_spec: &str, bin_name: Option<&str>) -> Option<NpxCacheEntry> {
     resolve_from_npm_cache_at(&get_npm_cache_dir()?, package_spec, bin_name)
