@@ -234,8 +234,8 @@ impl Tool for EditTool {
         // period. The ternary is ported literally: [`error::errno_code_of`] is the `"code" in
         // error` test, and a `ToolError` with no recoverable code takes Pi's `String(error)`
         // branch. `LocalFs::access` builds the code into the message via `error::io_errno`
-        // (ops/local.rs) precisely so this arm can recover it; the access mode matches on both
-        // sides (edit.ts:96 `R_OK | W_OK`, ops/local.rs `libc::R_OK | libc::W_OK`).
+        // (ops/local/fs.rs) precisely so this arm can recover it; the access mode matches on both
+        // sides (edit.ts:96 `R_OK | W_OK`, ops/local/fs.rs `libc::R_OK | libc::W_OK`).
         self.fs.access(&abs, Access::ReadWrite).await.map_err(|e| {
             let body = match error::errno_code_of(&e) {
                 Some(code) => format!("Error code: {code}"),

@@ -412,13 +412,15 @@ async fn clearing_a_key_removes_it_rather_than_writing_json_null() {
     let mut mgr = SettingsManager::load(store.clone(), true);
 
     mgr.set(SettingsScope::Global, "shellPath", Some("~/bin/bash"))
-        .await.unwrap();
+        .await
+        .unwrap();
     mgr.set_nested(
         SettingsScope::Global,
         &["terminal", "showImages"],
         Value::Bool(true),
     )
-    .await.unwrap();
+    .await
+    .unwrap();
     let written = store.read(SettingsScope::Global).unwrap().unwrap();
     assert!(written.contains("shellPath"), "precondition: {written}");
     assert!(written.contains("showImages"), "precondition: {written}");
@@ -426,13 +428,15 @@ async fn clearing_a_key_removes_it_rather_than_writing_json_null() {
     // Clear both. `None::<&str>` serializes to `Value::Null`, which is the only way a Rust
     // caller can express pi's `undefined`.
     mgr.set(SettingsScope::Global, "shellPath", None::<&str>)
-        .await.unwrap();
+        .await
+        .unwrap();
     mgr.set_nested(
         SettingsScope::Global,
         &["terminal", "showImages"],
         Value::Null,
     )
-    .await.unwrap();
+    .await
+    .unwrap();
 
     let written = store.read(SettingsScope::Global).unwrap().unwrap();
     assert!(
@@ -494,7 +498,8 @@ async fn set_field_preserves_unknown_keys() {
     );
     let mut mgr = SettingsManager::load(store.clone(), false);
     mgr.set(SettingsScope::Global, "defaultModel", "new")
-        .await.unwrap();
+        .await
+        .unwrap();
     let raw = store.read(SettingsScope::Global).unwrap().unwrap();
     let s = Settings::parse(&raw).unwrap();
     assert_eq!(s.get("futureKey"), Some(&serde_json::json!(42)));

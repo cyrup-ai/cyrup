@@ -1,4 +1,5 @@
-//! The raw unix kill primitives, and the crate's `unsafe` leaf.
+//! The raw unix kill primitives — the bulk of the crate's `unsafe`, but not all of it:
+//! [`super`]'s module doc owns the full inventory.
 //!
 //! Two shapes, deliberately kept apart: a process-GROUP `killpg` for the `setsid`'d shell
 //! [`LocalProc::exec`] spawns ([`kill_process_tree`], [`send_sigkill_tree`]), and a SINGLE-pid

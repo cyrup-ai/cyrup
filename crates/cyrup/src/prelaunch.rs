@@ -31,7 +31,7 @@ use crate::startup::file_settings_store;
 /// main.ts:254-350) and write it onto `config`. Returns `Some(exit_code)` when the resolution itself
 /// terminates the run (a not-found ref / id-collision → 1, a declined fork → 0); `None` when it set a
 /// target to build. The session listings are scanned only here, behind the caller's ref-present guard.
-pub fn resolve_session(
+pub async fn resolve_session(
     cli: &Cli,
     dirs: &ConfigDirs,
     mode: AppMode,
@@ -78,7 +78,10 @@ pub fn resolve_session(
         let (select_keymap, _) = crate::startup_keymaps(dirs);
         let body =
             crate::format_missing_session_cwd_prompt(&issue.session_cwd, &issue.fallback_cwd);
-        return match crate::run_missing_cwd_prompt(&theme, &select_keymap, &body, &issue.fallback_cwd)? {
+        let choice =
+            crate::run_missing_cwd_prompt(&theme, &select_keymap, &body, &issue.fallback_cwd)
+                .await?;
+        return match choice {
             crate::MissingCwdChoice::Continue => {
                 // Reopen the session against the chosen (fallback) cwd (Pi `SessionManager.open(
                 // sessionFile, sessionDir, selectedCwd)`, main.ts:578).
@@ -131,7 +134,7 @@ fn prompt_fork_confirm() -> bool {
 /// `None` (proceed). Interactive-only — the caller gates on the mode so the one-shot/RPC live path is
 /// never touched. TTY-bound (it drives real terminals), so it is not unit-tested; the row/label/
 /// decision builders it composes are unit-tested in [`crate::startup_ui`].
-pub fn resolve_startup_ui(
+pub async fn resolve_startup_ui(
     cli: &Cli,
     dirs: &ConfigDirs,
     mode: AppMode,
@@ -152,7 +155,8 @@ pub fn resolve_startup_ui(
         // them (`session-picker.ts:15-19` hands `selectSession` both).
         let (current_sessions, all_sessions) = gather_session_scopes(dirs);
         let (choice, status) =
-            crate::run_resume_picker(&theme, &keymaps, &current_sessions, &all_sessions, None)?;
+            crate::run_resume_picker(&theme, &keymaps, &current_sessions, &all_sessions, None)
+                .await?;
         // Pi renders these inside the picker header with a 2 s / 3 s dwell
         // (session-selector.ts:847,851); cyrup's selector has no status channel yet (area 07), so
         // they are printed after the alternate screen is torn down rather than dropped. SEAM-063.
@@ -179,7 +183,9 @@ pub fn resolve_startup_ui(
                 if crate::session_cwd_is_missing(&stored_cwd) {
                     let body =
                         crate::format_missing_session_cwd_prompt(&stored_cwd, &dirs.cwd);
-                    match crate::run_missing_cwd_prompt(&theme, &keymaps.0, &body, &dirs.cwd)? {
+                    let choice =
+                        crate::run_missing_cwd_prompt(&theme, &keymaps.0, &body, &dirs.cwd).await?;
+                    match choice {
                         // Reopen the session against the current cwd (Pi `SessionManager.open(
                         // sessionFile, sessionDir, selectedCwd)`, main.ts:580).
                         crate::MissingCwdChoice::Continue => {

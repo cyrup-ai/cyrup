@@ -11,9 +11,8 @@
 use crate::error;
 use cyrup_core::keyed_lock::{KeyedGuard, KeyedLockMap, KeyedLocks};
 use cyrup_core::{CancelToken, ToolError};
-use dashmap::DashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 
 /// The one lock map for the whole process.
 ///
@@ -26,8 +25,7 @@ use std::sync::{Arc, LazyLock};
 /// [`crate::ops::FsOps::write_in_place`] truncates at `open` and then writes, so two unserialized
 /// mutators interleave their chunks and leave a file matching NEITHER payload, with no error to
 /// either caller. Hence: one map, process-wide, exactly like Pi's.
-static FILE_MUTATION_LOCKS: LazyLock<KeyedLockMap<PathBuf>> =
-    LazyLock::new(|| Arc::new(DashMap::new()));
+static FILE_MUTATION_LOCKS: LazyLock<KeyedLockMap<PathBuf>> = LazyLock::new(KeyedLockMap::new);
 
 /// Pi `isMissingPathError` (file-mutation-queue.ts:7-14): `error.code === "ENOENT" || error.code
 /// === "ENOTDIR"`, and NOTHING else. Every other realpath failure is re-thrown at `:24`.
@@ -57,10 +55,34 @@ fn is_missing_path_error(e: &std::io::Error) -> bool {
 /// prevent. Tests stay independent by keying on distinct (temp-dir) paths, which is what Pi's
 /// single-map design forces on its own tests too.
 pub struct FileMutationLocks {
-    /// The same map `inner` is built over. Kept as a field, rather than reached through `inner`,
-    /// because the tests in this file assert on map membership directly — which is what lets the
-    /// move of the registry mechanics into `cyrup-core` be proven with no test changes at all.
-    /// Hence the gate: outside `cfg(test)` nothing reads it, and that is the intended state.
+    /// A second handle on the map `inner` is built over, held **per instance** so the tests below
+    /// can assert on map membership and on map *identity*. Four tests read it —
+    /// `independent_handles_share_one_lock_per_path`, `guard_evicts_its_entry_on_drop`,
+    /// `a_cancelled_acquisition_evicts_its_entry_instead_of_leaking_it` and
+    /// `dropping_the_acquisition_future_evicts_its_entry` — and they are the only coverage of
+    /// entry eviction, the dropped-future gap and the `biased` cancel race in the workspace,
+    /// because [`cyrup_core::keyed_lock`] carries no tests of its own.
+    ///
+    /// Two cleanups look available here and are not:
+    ///
+    /// - *Reach through `inner`.* There is no route. [`KeyedLocks`] keeps its map private and
+    ///   exposes only `new` and `guard` — no accessor, no `Deref`. Adding one would also be the
+    ///   wrong direction: the consumer already owns the map. `FILE_MUTATION_LOCKS` is declared
+    ///   here and a clone of it is handed to `KeyedLocks::new`, so an accessor would be
+    ///   `cyrup-core` re-exporting state its caller supplied. Nor would the observers it hands
+    ///   back be free of consequence — `KeyedLockMap::mutex_for` returns an `Arc` clone that
+    ///   defers eviction of the entry for as long as it is held.
+    /// - *Use the `FILE_MUTATION_LOCKS` static.* It is in scope for the tests and would serve the
+    ///   three eviction tests, but it is one object by construction, so it cannot express
+    ///   `a.map.ptr_eq(&b.map)`: the check that a separately constructed
+    ///   `FileMutationLocks` joins this lock domain instead of silently getting an isolated one —
+    ///   precisely the bug this type exists to prevent, and the reason `Default` below is
+    ///   hand-written.
+    ///
+    /// Holding the map per instance is also why no test needed a behavioural change when the
+    /// registry mechanics moved into [`cyrup_core::keyed_lock`].
+    ///
+    /// Outside `cfg(test)` nothing reads it, and that is the intended state; hence the gate.
     #[cfg_attr(not(test), allow(dead_code))]
     map: KeyedLockMap<PathBuf>,
     /// The registry mechanics (RAII guard, entry eviction, the drop-gap handling and the `biased`
@@ -70,26 +92,39 @@ pub struct FileMutationLocks {
 }
 
 impl Default for FileMutationLocks {
-    /// Hand-written, NOT derived: a derived `Default` builds `Arc::<DashMap<_, _>>::default()`,
-    /// i.e. a fresh empty map, silently re-creating the per-owner lock domain this type exists to
-    /// eliminate. It must be an alias for [`FileMutationLocks::new`].
+    /// Hand-written, NOT derived: `Default` here must mean "attach to the process-global map",
+    /// never "a fresh empty one" — a per-owner lock domain is precisely the bug this type exists
+    /// to eliminate. It must be an alias for [`FileMutationLocks::new`].
     fn default() -> Self {
         Self::new()
     }
 }
 
-/// RAII guard for a per-file mutation lock — [`cyrup_core::keyed_lock::KeyedGuard`] keyed by the
-/// resolved path. On drop it releases the mutex and evicts the map entry once no other
-/// holder/waiter references it (Pi deletes the queue entry when it drains,
-/// file-mutation-queue.ts:57-59), so the lock map cannot grow without bound.
-pub type MutationGuard = KeyedGuard<PathBuf>;
+/// RAII guard for a per-file mutation lock — a newtype over
+/// [`cyrup_core::keyed_lock::KeyedGuard`] keyed by the resolved path. On drop it releases the
+/// mutex and evicts the map entry once no other holder/waiter references it (Pi deletes the queue
+/// entry when it drains, file-mutation-queue.ts:57-59), so the lock map cannot grow without bound.
+///
+/// A newtype and NOT a `pub type` alias, deliberately. `cyrup-config` instantiates the same
+/// generic over the same key type for its own, deliberately separate map — its `CONFIG_LOCKS`
+/// static and the `FileLock::_in_process` field — so an alias would make a guard proving
+/// exclusion over config paths and one proving it over tool-mutated paths literally the same Rust
+/// type, and `fn commit(_: MutationGuard)` would accept either. Nothing passes a guard as a value
+/// today; the wrapper is what keeps the day one does from type-checking against the wrong domain.
+/// It costs nothing: `KeyedGuard` has no public operations to forward, and drop order, drop
+/// behaviour and auto-trait membership are exactly the field's. It also re-opens
+/// `impl MutationGuard` in this crate, which E0116 forbids on the aliased foreign type.
+pub struct MutationGuard(#[expect(dead_code, reason = "held for its Drop")] KeyedGuard<PathBuf>);
 
 impl FileMutationLocks {
     /// Attach to the process-global lock map (Pi's module-scope `fileMutationQueues`). This is a
     /// cheap `Arc` clone, not a fresh map — see the type docs.
     pub fn new() -> Self {
-        let map = Arc::clone(&FILE_MUTATION_LOCKS);
-        Self { inner: KeyedLocks::new(Arc::clone(&map)), map }
+        let map = FILE_MUTATION_LOCKS.clone();
+        Self {
+            inner: KeyedLocks::new(map.clone()),
+            map,
+        }
     }
 
     /// Full-symlink-resolved key — a 1:1 port of Pi's `getMutationQueueKey`
@@ -143,7 +178,11 @@ impl FileMutationLocks {
         cancel: &CancelToken,
     ) -> Result<MutationGuard, ToolError> {
         let key = Self::key(path).await?;
-        self.inner.guard(key, cancel).await.map_err(|_| error::aborted())
+        self.inner
+            .guard(key, cancel)
+            .await
+            .map(MutationGuard)
+            .map_err(|_| error::aborted())
     }
 }
 
@@ -151,6 +190,7 @@ impl FileMutationLocks {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// A path unique to the calling test. The map is process-global, so a literal like
@@ -212,11 +252,11 @@ mod tests {
         let ga = a.guard(&path, &cancel).await.unwrap();
 
         // Same map object behind every handle...
-        assert!(Arc::ptr_eq(&a.map, &b.map));
-        assert!(Arc::ptr_eq(&a.map, &c.map));
+        assert!(a.map.ptr_eq(&b.map));
+        assert!(a.map.ptr_eq(&c.map));
         // ...and therefore the same mutex for the same path.
-        let via_b = b.map.get(&key).map(|e| Arc::clone(e.value())).unwrap();
-        let via_c = c.map.get(&key).map(|e| Arc::clone(e.value())).unwrap();
+        let via_b = b.map.mutex_for(&key).unwrap();
+        let via_c = c.map.mutex_for(&key).unwrap();
         assert!(Arc::ptr_eq(&via_b, &via_c));
         // Held by `a`, so a second owner genuinely cannot enter.
         assert!(via_b.try_lock().is_err());

@@ -195,7 +195,11 @@ impl TrustStore {
         Ok(())
     }
 
-    pub async fn set(&self, cwd: &Path, decision: Option<TrustDecision>) -> Result<(), ConfigError> {
+    pub async fn set(
+        &self,
+        cwd: &Path,
+        decision: Option<TrustDecision>,
+    ) -> Result<(), ConfigError> {
         self.set_many(&[(cwd.to_path_buf(), decision)]).await
     }
 }
@@ -499,7 +503,10 @@ mod tests {
         let child = root.join("a").join("b");
         std::fs::create_dir_all(&child).unwrap();
 
-        store.set(&root, Some(TrustDecision::Trusted)).await.unwrap();
+        store
+            .set(&root, Some(TrustDecision::Trusted))
+            .await
+            .unwrap();
         let found = store.nearest(&child).await.unwrap().unwrap();
         assert_eq!(found.decision, TrustDecision::Trusted);
 
@@ -539,7 +546,10 @@ mod tests {
         let parent = dir.join("p");
         let cwd = parent.join("c");
         std::fs::create_dir_all(&cwd).unwrap();
-        store.set(&cwd, Some(TrustDecision::Untrusted)).await.unwrap();
+        store
+            .set(&cwd, Some(TrustDecision::Untrusted))
+            .await
+            .unwrap();
 
         let opts = trust_options(&cwd, true);
         let parent_opt = opts.iter().find(|o| o.label.contains("parent")).unwrap();
@@ -648,7 +658,10 @@ mod tests {
         std::fs::write(&path, r#"{ "/some/path": "yes" }"#).unwrap();
         let store = TrustStore::new(path);
         let cwd = dir.join("some").join("path");
-        assert!(matches!(store.nearest(&cwd).await, Err(ConfigError::Trust(_))));
+        assert!(matches!(
+            store.nearest(&cwd).await,
+            Err(ConfigError::Trust(_))
+        ));
     }
 
     #[test]

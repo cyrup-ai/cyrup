@@ -343,7 +343,8 @@ async fn race_wait(
 /// arrive, and the wait is pure latency in front of the rung that CAN end the child. This is the
 /// same rule (and the same `Ok(false)` "nothing was sent" convention it keys off) that
 /// `cyrup_tools::ops::local::terminate_pid` states for its own callers, which gate their grace wait
-/// on the returned bool exactly this way (`ops/local.rs:898,904`).
+/// on the returned bool exactly this way (`LocalProc::exec_argv`'s cancel and timeout arms in
+/// `ops/local/proc.rs`).
 ///
 /// The `wait()` itself is still raced even against a ZERO grace rather than skipped outright: a
 /// child that has ALREADY exited must be reported at the rung it actually died on, and `race_wait`
@@ -451,7 +452,7 @@ pub(crate) fn send_sigkill(child: &mut Child) {
 /// The exact argv pi's `killProcessTree` passes to `taskkill` on win32
 /// (`packages/coding-agent/src/utils/shell.ts:204` @v0.83.0:
 /// `["/F", "/T", "/PID", String(pid)]`), and the in-workspace twin of
-/// `cyrup_tools::ops::local::kill_process_tree`'s `not(unix)` arm (`ops/local.rs:458-459`).
+/// `cyrup_tools::ops::local::kill_process_tree`'s `not(unix)` arm (`ops/local/signal.rs`).
 ///
 /// `/T` is the load-bearing flag and the reason this is a named function rather than an inline
 /// array: it is what makes the kill reach the child's DESCENDANTS, which is the entire behavioural

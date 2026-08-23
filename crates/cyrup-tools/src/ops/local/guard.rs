@@ -14,8 +14,9 @@ use super::tracking::{track_detached_child_pid, untrack_detached_child_pid};
 /// `killProcessTree` (`shell.ts:200-225`, `process.kill(-pid, "SIGKILL")`) and the same handler runs
 /// on the timeout leg, so upstream cannot reach a state where the shell's process GROUP outlives the
 /// call. A Rust future has no such guarantee — it can be dropped at ANY `.await`: a cancelled
-/// `tokio::spawn`, a `tokio::time::timeout`, an unwinding panic, or runtime teardown all abandon the
-/// `select!` loop below without running a single one of its `send_sigkill_tree` arms.
+/// `tokio::spawn`, a `tokio::time::timeout`, an unwinding panic, or runtime teardown all abandon
+/// [`LocalProc::exec`]'s `select!` loop (in [`super::proc`]) without running a single one of its
+/// `send_sigkill_tree` arms.
 ///
 /// `tokio::process`'s own `kill_on_drop(true)` is NOT a substitute and must not be mistaken for one:
 /// it SIGKILLs the SINGLE direct child, so every grandchild the `setsid` group contains survives as
@@ -32,7 +33,7 @@ use super::tracking::{track_detached_child_pid, untrack_detached_child_pid};
 /// It also owns the registry membership from [`TRACKED_DETACHED_CHILD_PIDS`], and that half is
 /// deliberately NOT affected by [`Self::disarm`]. Pi untracks in a `finally` (`bash.ts:142`), which
 /// runs on the normal return, the abort throw and the timeout throw alike; the Rust equivalent of
-/// "runs no matter how we leave" is `Drop`, not a statement placed after the `select!` loop. Putting
+/// "runs no matter how we leave" is `Drop`, not a statement placed after that `select!` loop. Putting
 /// the untrack on the success path instead would leak the pid PERMANENTLY whenever the future is
 /// dropped mid-flight — the same class of gap this guard's `killpg` half already closes — and a
 /// leaked pid is worse than a merely-forgotten one: the next

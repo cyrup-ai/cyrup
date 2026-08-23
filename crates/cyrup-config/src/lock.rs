@@ -4,12 +4,11 @@
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use cyrup_core::CancelToken;
 use cyrup_core::keyed_lock::{KeyedGuard, KeyedLockMap, KeyedLocks};
-use dashmap::DashMap;
 use fs4::{FileExt, TryLockError};
 
 use crate::error::ConfigError;
@@ -17,11 +16,11 @@ use crate::error::ConfigError;
 /// This crate's own lock domain, separate from `cyrup-tools`' file-mutation map: config paths and
 /// tool-mutated paths are different key spaces, so two instances over the shared
 /// [`cyrup_core::keyed_lock`] mechanism are correct.
-static CONFIG_LOCKS: LazyLock<KeyedLockMap<PathBuf>> = LazyLock::new(|| Arc::new(DashMap::new()));
+static CONFIG_LOCKS: LazyLock<KeyedLockMap<PathBuf>> = LazyLock::new(KeyedLockMap::new);
 
 /// The handle over [`CONFIG_LOCKS`]. Built once; `KeyedLocks::new` is an `Arc` clone.
 static CONFIG_LOCK_HANDLE: LazyLock<KeyedLocks<PathBuf>> =
-    LazyLock::new(|| KeyedLocks::new(Arc::clone(&CONFIG_LOCKS)));
+    LazyLock::new(|| KeyedLocks::new(CONFIG_LOCKS.clone()));
 
 /// Stand-in for callers that carry no cancellation of their own — settings, trust and auth, none of
 /// which take a signal here or upstream (pi's `settings-manager`/`trust-manager` use `lockSync`,
@@ -40,20 +39,31 @@ const FIRST_RETRY: Duration = Duration::from_millis(1);
 
 /// Ceiling on the retry delay, and therefore on how long after a peer's release an acquire takes to
 /// notice. It does NOT bound cancellation — the cancel arm shares the `select!` with the sleep, so
-/// a `cancel()` preempts whatever is left of the tick; only a cancel arriving while an attempt is
-/// already in flight waits at all, for the microseconds that attempt runs. Peer hold times span a
-/// sub-millisecond JSON read-modify-write (settings, trust, models_store) to a whole OAuth refresh
-/// (`auth.rs:316-324` holds the guard across `f(current).await`), so 50 ms is small against the
-/// wait it samples and costs at most 20 non-blocking syscalls per second per waiting acquire.
+/// a `cancel()` preempts whatever is left of the tick. The only await points in `acquire` that are
+/// not themselves cancel-aware are the two `spawn_blocking` joins, so a cancel arriving while an
+/// attempt is already in flight is observed when that attempt returns: one bounded blocking job,
+/// with no cross-process wait inside it. No duration is claimed for that window — `spawn_blocking`
+/// can queue behind a saturated pool. Peer hold times span a sub-millisecond JSON
+/// read-modify-write (settings, trust, models_store) to a whole OAuth refresh (`AuthStore::modify`
+/// holds the guard across `f(current).await`), so 50 ms is small against the wait it samples and
+/// costs at most 20 non-blocking syscalls per second per waiting acquire.
 const MAX_RETRY: Duration = Duration::from_millis(50);
 
 /// An RAII cross-process exclusive lock, taken on a sidecar `<path>.lock` file so the lock survives
 /// atomic `rename` over the target (the lock inode is never replaced).
 ///
 /// Two layers. In-process contention — several tasks in one cyrup process reaching the same config
-/// file — queues on a per-path async mutex: fair, cancel-aware, no syscall and no polling. That
-/// admits at most one task per path per process, so this process presents at most one waiter to the
-/// cross-process lock.
+/// file — queues on a per-key async mutex, the key being the sidecar path made lexically absolute
+/// by [`lock_key`]: fair, cancel-aware, no syscall and no polling. Every spelling of one file that
+/// does not differ through a symlink hashes to one entry, so that admits at most one task per file
+/// per process, and this process presents at most one waiter to the cross-process lock.
+///
+/// The one alias layer 1 does not merge is a **symlink**: two such spellings are two keys, hence two
+/// layer-2 waiters from this process on one inode. It costs an extra round trip, never correctness —
+/// layer 2 locks the **inode**, so it excludes both aliases whichever name reached it. Upstream's
+/// `mkdir` lock is path-keyed and does not, which is why this residue is affordable here and would
+/// not have been in pi. Resolving it away would mean a `realpath`, and [`lock_key`] documents why
+/// this domain must not take one.
 ///
 /// **That bound holds only because the layer-2 wait lives inside [`FileLock::acquire`]'s own
 /// future.** Layer 2 is a NON-blocking `flock(LOCK_EX|LOCK_NB)` retried from async land, never the
@@ -72,20 +82,36 @@ const MAX_RETRY: Duration = Duration::from_millis(50);
 /// for settings, exponential backoff for auth), for the unrelated reason that a `mkdir` lock offers
 /// no readiness signal at all.
 pub struct FileLock {
-    /// Layer 1. Declared FIRST so reverse-declaration drop order releases the `flock` BEFORE this —
-    /// otherwise a same-process successor wakes out of layer 1 into a still-held `flock` and pays a
-    /// pointless trip to the kernel.
+    /// Layer 1. Declared first only to mirror the acquisition order in [`FileLock::acquire`] and
+    /// the `Ok(Self { .. })` that ends it; nothing depends on the position. The ordering that
+    /// matters — the `flock` gone BEFORE a same-process successor is admitted through layer 1, so
+    /// it never wakes into a lock this process still holds and pays a pointless trip to the
+    /// kernel — comes from the explicit `FileExt::unlock` that is the first statement of the
+    /// [`Drop`] impl below, and from nothing else: the `drop` body runs FIRST, then fields drop in
+    /// DECLARATION order. Reverse-declaration order is a rule about LOCALS, not fields —
+    /// `PendingEntry` in [`cyrup_core::keyed_lock`] is the correct use of it. So do not delete
+    /// that `unlock` on the theory that closing `file` is equivalent: `file` closes AFTER this
+    /// field, which is exactly backwards.
     _in_process: KeyedGuard<PathBuf>,
-    /// Layer 2, released by [`Drop`] below.
+    /// Layer 2. Released by the explicit `unlock` in the [`Drop`] impl below; closing this fd is
+    /// only the backstop for a process that dies holding it. The window between the two field
+    /// drops, where the fd is open but unlocked, is harmless: `fs4` is `flock(2)` here, whose lock
+    /// lives on the open file description, so a successor's own fd on the sidecar is unaffected.
     file: File,
 }
 
 impl FileLock {
     /// Acquire both layers for `target`, holding them until the returned guard drops.
     ///
-    /// `cancel` governs BOTH layers: layer 1 through the `biased` cancel arm inside
-    /// [`KeyedLocks::guard`], layer 2 between retry ticks — so a cancelled acquire returns
-    /// [`ConfigError::Cancelled`] within [`MAX_RETRY`] instead of waiting out a peer process.
+    /// `cancel` governs BOTH layers, by two different mechanisms — the difference is load-bearing:
+    ///
+    /// * Layer 1 is cancelled *in place*: [`KeyedLocks::guard`] races the token against the mutex
+    ///   in a `biased` `select!` and returns having taken nothing.
+    /// * Layer 2 is cancelled *between attempts*: the retry sleep shares a `biased` `select!` with
+    ///   the same token, so a cancel preempts whatever is left of the tick and the acquire returns
+    ///   [`ConfigError::Cancelled`] rather than waiting out a peer process. This is NOT bounded by
+    ///   [`MAX_RETRY`] — see that constant's doc for what that window actually is.
+    ///
     /// Dropping this future is bounded the same way: the whole layer-2 wait is in this frame, so
     /// the drop ends the wait and releases layer 1 together. At most one bounded blocking job is
     /// then in flight, and tokio discards its output — closing the fd, which releases the lock if
@@ -94,8 +120,9 @@ impl FileLock {
     ///
     /// A token cancelled while an attempt is already in flight still yields a granted lock: there
     /// is no re-check after winning, because whether that matters is the caller's contract
-    /// (`models_store.rs:311` re-checks after the read; `write`/`delete` deliberately check only
-    /// before, matching pi's placement). Dropping the returned guard releases both layers at once.
+    /// (`FileModelsStore`'s `read` re-checks after `read_latest` returns; its `write` and `delete`
+    /// deliberately check only before the acquire, matching pi's placement). Dropping the returned
+    /// guard releases both layers at once.
     ///
     /// `cancel` is `Some` only where the caller already has a token — today that is `models_store`,
     /// whose `ModelsStoreOperationOptions::signal` mirrors pi's `options` on the models-store path
@@ -103,8 +130,11 @@ impl FileLock {
     pub async fn acquire(target: &Path, cancel: Option<&CancelToken>) -> Result<Self, ConfigError> {
         let lock_path = lock_path_for(target);
         let token = cancel.unwrap_or(&NEVER_CANCELLED);
+        // Layer 1 keys on the RESOLVED sidecar path; layer 2 opens the caller's own spelling. They
+        // must stay separate: `flock` is inode-based, so the raw spelling reaches the same lock,
+        // while `ConfigError::Io` / `ConfigError::Lock` keep naming the path the operator typed.
         let in_process = CONFIG_LOCK_HANDLE
-            .guard(lock_path.clone(), token)
+            .guard(lock_key(&lock_path), token)
             .await
             .map_err(|_| ConfigError::Cancelled)?;
 
@@ -112,12 +142,21 @@ impl FileLock {
         // attempt — the same syscalls the blocking version issued, on the same pool. The loop below
         // is entered only when a peer process actually holds the lock.
         let owned_target = target.to_path_buf();
-        let (mut file, mut held) =
-            tokio::task::spawn_blocking(move || open_and_try_lock(&owned_target, &lock_path))
-                .await
-                .map_err(|_| ConfigError::Lock {
-                    path: target.to_path_buf(),
-                })??;
+        // The one outcome here that is NOT about the lock: a `JoinError` means the closure
+        // panicked, or the runtime dropped the task while shutting down. Reported as
+        // `ConfigError::Lock` it sends an operator hunting for a peer process that never existed.
+        // Not re-panicked either: the release profile is `panic = "abort"` (root `Cargo.toml`), so
+        // the panic arm is unreachable in a shipped binary, and in the unwinding builds where it is
+        // reachable the panic hook has already printed message and location before tokio caught it.
+        // Defensive, not expected — `clippy::panic`/`unwrap_used`/`expect_used`/`indexing_slicing`
+        // are all denied workspace-wide, so nothing these closures call in-tree panics by
+        // construction. The retry attempt below maps its join the same way.
+        let joined =
+            tokio::task::spawn_blocking(move || open_and_try_lock(&owned_target, &lock_path)).await;
+        let (mut file, mut held) = match joined {
+            Ok(result) => result?,
+            Err(join) => return Err(join_failed(target, &join)),
+        };
 
         // Enrolled ONCE, outside the loop: `CancellationToken::cancelled()` registers a waiter on
         // first poll, and rebuilding the future every tick would churn that registration.
@@ -135,11 +174,11 @@ impl FileLock {
             }
             backoff = backoff.saturating_mul(2).min(MAX_RETRY);
             let owned_target = target.to_path_buf();
-            let (f, h) = tokio::task::spawn_blocking(move || try_lock(file, &owned_target))
-                .await
-                .map_err(|_| ConfigError::Lock {
-                    path: target.to_path_buf(),
-                })??;
+            let joined = tokio::task::spawn_blocking(move || try_lock(file, &owned_target)).await;
+            let (f, h) = match joined {
+                Ok(result) => result?,
+                Err(join) => return Err(join_failed(target, &join)),
+            };
             file = f;
             held = h;
         }
@@ -220,6 +259,52 @@ fn lock_path_for(target: &Path) -> PathBuf {
     }
 }
 
+/// Layer 1's key: [`lock_path_for`]'s sidecar path made **lexically absolute**, so every spelling of
+/// one config file that a caller can hand [`FileLock::acquire`] hashes to one entry in
+/// [`CONFIG_LOCKS`].
+///
+/// Node `path.resolve` semantics, NOT `realpath`, and that is upstream's own choice rather than a
+/// shortcut. Every sync lock pi takes on these files opts out of realpath by hand —
+/// `settings-manager.ts:206`, `trust-manager.ts:145`, `auth-storage.ts:56` all pass
+/// `{ realpath: false }` against `proper-lockfile`'s `realpath: true` default — and pi makes the key
+/// unambiguous at CONSTRUCTION instead, with `resolvePath(cwd)` / `resolvePath(agentDir)`
+/// (settings-manager.ts:192-196), which is node's lexical `path.resolve` (utils/paths.ts:81-85) and
+/// touches no filesystem. `cyrup-tools`' `FileMutationLocks::key` realpaths because ITS upstream
+/// does (`getMutationQueueKey`, file-mutation-queue.ts:16-26). The two domains over
+/// [`cyrup_core::keyed_lock`] resolve differently because the two upstreams do.
+///
+/// A realpath would also be actively worse here: [`open_and_try_lock`] is what runs [`ensure_dir`]
+/// and `create(true)`, so this lock is routinely taken on a file — and inside a directory — that
+/// does not exist yet. `realpath` returns `ENOENT` on exactly those first-run acquires and would
+/// fall back to the unresolved spelling, leaving the gap open for the case where two tasks racing
+/// to create one config file is most likely. It would additionally put a Windows `\\?\`-verbatim
+/// form into the key, which is the divergence `ConfigDirs::resolve` removed a `canonicalize` to
+/// avoid (env.rs, the SESS-036 note).
+///
+/// Residue, stated rather than papered over: two spellings that differ only through a **symlink**
+/// still produce two keys, hence two layer-2 waiters from this process. That costs an extra retry
+/// round trip and nothing else, because layer 2 is `flock` on an **inode** — both aliases reach the
+/// same one, so mutual exclusion holds regardless of the name it was reached by. Upstream's
+/// `mkdir`-based lock is path-keyed and does NOT hold under that alias, so this is stronger than pi
+/// even with the residue.
+fn lock_key(lock_path: &Path) -> PathBuf {
+    if lock_path.is_absolute() {
+        return crate::paths::lexically_normalize(lock_path);
+    }
+    // `getcwd(3)` — a plain syscall on the rare relative branch, not a blocking-pool hop. A
+    // relative key would otherwise name whatever the cwd points at when the lock is taken, while
+    // `open(2)` in `open_and_try_lock` resolves it against the cwd at open time: the two layers
+    // would stop agreeing about which file they protect. `--agent-dir ./cfg` and
+    // `CYRUP_AGENT_DIR=./cfg` reach here, because `EnvVars`' `normalize_path_buf` expands `~` and
+    // `file://` and stops — see [`crate::paths::normalize_path`], "this is NOT `resolve`".
+    match std::env::current_dir() {
+        Ok(cwd) => crate::paths::lexically_normalize(&cwd.join(lock_path)),
+        // No reachable cwd: the `open(2)` in `open_and_try_lock` is about to fail on the same
+        // relative path, so keep the raw spelling and let layer 2 produce the error that names it.
+        Err(_) => lock_path.to_path_buf(),
+    }
+}
+
 /// Create a directory (and parents) with owner-only (0700) permissions on unix.
 pub fn ensure_dir(dir: &Path) -> Result<(), ConfigError> {
     if dir.as_os_str().is_empty() || dir.exists() {
@@ -282,5 +367,16 @@ fn io_err(path: &Path, source: std::io::Error) -> ConfigError {
     ConfigError::Io {
         path: path.to_path_buf(),
         source,
+    }
+}
+
+/// A `spawn_blocking` acquisition attempt that never produced a result: the task panicked, or the
+/// runtime dropped it while shutting down. Names the TARGET for the same reason `try_lock` does —
+/// the `<path>.lock` sidecar is not a file any operator opens — and carries the `JoinError`'s own
+/// text, which includes the panic payload when there is one.
+fn join_failed(target: &Path, join: &tokio::task::JoinError) -> ConfigError {
+    ConfigError::LockTaskFailed {
+        path: target.to_path_buf(),
+        message: join.to_string(),
     }
 }

@@ -46,9 +46,9 @@ fn exec_spec(command: &str) -> ExecSpec {
 /// `killProcess` (`exec.ts:34-63` @v0.83.0) spawns without `detached` and calls a bare,
 /// un-negated `proc.kill(...)`, so a grandchild of the spawned `sh` is upstream-correct to
 /// survive. `exec_argv_kill_signals_only_the_single_pid_never_the_process_group` exists to
-/// prove exactly that. The three fixtures below therefore leave a live `sleep 1` behind by
-/// DESIGN — and until this helper landed, none of them reaped it, so the process outlived the
-/// whole test binary by up to a second.
+/// prove exactly that. The three fixtures in `exec_argv.rs` that use this helper therefore
+/// leave a live `sleep 1` behind by DESIGN — and until this helper landed, none of them reaped
+/// it, so the process outlived the whole test binary by up to a second.
 ///
 /// That survivor is what converts nextest's per-test pipe accounting into a red on a test that
 /// spawns nothing at all. macOS has no `pipe2(2)`, so Rust's `anon_pipe` is `pipe(2)` followed

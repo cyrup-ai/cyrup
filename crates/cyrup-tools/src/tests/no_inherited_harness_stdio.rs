@@ -48,9 +48,9 @@
 use std::path::{Path, PathBuf};
 
 /// The window, in lines, in which a spawn's stdio must be pinned. Generous on purpose: cyrup's
-/// builders interleave long citation comments with the builder calls (`build_command` spans
-/// `Command::new` at `ops/local.rs:275` to `.stderr(...)` at `:290`), and the point of the rule is
-/// to catch a spawn that names NOTHING, not to police formatting.
+/// builders interleave long citation comments with the builder calls (`build_command` spans 16
+/// lines from `Command::new` to `.stderr(...)` in `ops/local/command.rs`), and the point of the
+/// rule is to catch a spawn that names NOTHING, not to police formatting.
 const WINDOW_LINES: usize = 60;
 
 /// Every `.rs` file under `dir`, recursively.
@@ -175,11 +175,11 @@ fn every_command_in_this_crate_pins_all_three_stdio_handles() {
 /// binaries, so the stray write end can belong to a completely different test — and it stays
 /// observable exactly as long as some process holds it. The test process itself releases it on
 /// exit; a `sleep 1` grandchild does not, and `leak-timeout` is 500 ms
-/// (`.config/nextest.toml:42`). See `ops/local.rs`'s `SleeperMarker` for the measurement.
+/// (`.config/nextest.toml:42`). See `ops/local/tests/mod.rs`'s `SleeperMarker` for the measurement.
 ///
 /// So: any fixture script in this crate that forks a sleeper in a loop must also record its pid
 /// (`echo $!`) so the fixture can reap it. `echo $!` is the marker every already-correct fixture in
-/// `ops/local.rs` uses; requiring it is what stops a new fixture reintroducing the shape.
+/// `ops/local/tests/` uses; requiring it is what stops a new fixture reintroducing the shape.
 #[test]
 fn fixture_scripts_that_fork_a_sleeper_record_its_pid_so_the_fixture_can_reap_it() {
     let mut files = Vec::new();

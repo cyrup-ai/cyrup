@@ -157,7 +157,11 @@ pub fn resolve_path_from_base_with_home(
 ///
 /// `..` at the root is dropped rather than escaping it (`path.resolve("/a/../..") === "/"`); on a
 /// relative remainder it is kept, because there is nothing to cancel it against.
-fn lexically_normalize(path: &std::path::Path) -> PathBuf {
+///
+/// `pub(crate)` for [`crate::lock::FileLock`]'s layer-1 key, which needs this collapse WITHOUT the
+/// tilde / `file://` tier above it and without a `String` round trip: a lock key must survive a
+/// non-UTF-8 path byte-for-byte, or two distinct files can hash to one entry.
+pub(crate) fn lexically_normalize(path: &std::path::Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for component in path.components() {

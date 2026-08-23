@@ -1362,11 +1362,11 @@ pub struct ManagementRequest<'a> {
 ///
 /// **Why the availability list is pre-resolved rather than a closure.** Upstream passes a lazy
 /// `discoverAvailableSkills: () => AvailableSkill[]` so that a disabled feature performs no
-/// filesystem scan. cyrup's [`crate::discovery::skills::discover_available_skills`] is `async`
-/// while [`handle_management_action`] is sync, so the laziness moves one level up: the async caller
-/// checks [`crate::discovery::skills::resolve_proactive_skill_subagents_config`]'s `enabled` first
-/// and only then awaits the scan, filling this field. Both upstream properties survive — no scan
-/// when disabled, and no suggestions when the scan found nothing.
+/// filesystem scan. cyrup's [`crate::discovery::skills::discover_available_skills`] is `async`, so
+/// the laziness lives one level up rather than inside the handler: the caller checks
+/// [`crate::discovery::skills::resolve_proactive_skill_subagents_config`]'s `enabled` first and
+/// only then awaits the scan, filling this field. Both upstream properties survive — no scan when
+/// disabled, and no suggestions when the scan found nothing.
 pub struct ProactiveSkillsInput<'a> {
     /// pi `ctx.config?.proactiveSkillSubagents`. `None` is pi's `undefined` (defaults-on).
     pub setting: Option<&'a crate::discovery::skills::ProactiveSkillSubagentsSetting>,
@@ -4242,8 +4242,8 @@ mod tests {
     /// the failure mode that adding a key to `KNOWN_FIELDS` creates: the extra-fields loop skips
     /// known keys, so a known key the serializer never EMITS is silently deleted the first time a
     /// management update or rename rewrites the file.
-    #[tokio::test]
-    async fn serialize_agent_round_trips_memory_and_tool_budget() {
+    #[test]
+    fn serialize_agent_round_trips_memory_and_tool_budget() {
         use crate::discovery::frontmatter::parse_agent_file;
 
         let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));

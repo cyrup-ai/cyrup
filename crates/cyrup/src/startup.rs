@@ -264,7 +264,7 @@ pub async fn run_first_time_setup(
 
     let step = first_time_setup_theme_step(detected);
     let mut selector = ListSelector::prompt(step.title, step.rows, step.selected);
-    let theme = match run_startup_selector(ui, &keymap, &mut selector, |_| {})? {
+    let theme = match run_startup_selector(ui, &keymap, &mut selector, async |_| {}).await? {
         SelectorOutcome::Confirm(value) => match parse_theme_choice(&value) {
             Some(theme) => theme,
             None => return Ok(None),
@@ -274,13 +274,14 @@ pub async fn run_first_time_setup(
 
     let step = first_time_setup_analytics_step();
     let mut selector = ListSelector::prompt(step.title, step.rows, step.selected);
-    let share_analytics = match run_startup_selector(ui, &keymap, &mut selector, |_| {})? {
-        SelectorOutcome::Confirm(value) => match parse_analytics_choice(&value) {
-            Some(share) => share,
-            None => return Ok(None),
-        },
-        _ => return Ok(None),
-    };
+    let share_analytics =
+        match run_startup_selector(ui, &keymap, &mut selector, async |_| {}).await? {
+            SelectorOutcome::Confirm(value) => match parse_analytics_choice(&value) {
+                Some(share) => share,
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
 
     let result = FirstTimeSetupResult {
         theme,

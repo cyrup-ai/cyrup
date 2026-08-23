@@ -71,8 +71,8 @@ fn read_settings_file_strict(path: &Path) -> Result<Map<String, Value>, Subagent
 /// `settings.json`.
 ///
 /// This is a `cyrup-original` finding: pi's `agents.ts` is likewise unlocked, so the bar being
-/// missed is **cyrup's own** — `cyrup-config/src/settings.rs:1138` takes a `FileLock` plus
-/// `write_atomic` for exactly this file. Without it two concurrent `disable`/`enable`/`reset`
+/// missed is **cyrup's own** — `cyrup-config`'s `FileSettingsStore::with_lock` takes a `FileLock`
+/// plus `write_atomic` for exactly this file. Without it two concurrent `disable`/`enable`/`reset`
 /// actions can lose one another's write (both read the same base, the second write wins), or leave
 /// a truncated `settings.json` if the process dies mid-`fs::write` — disabling every agent until
 /// the file is hand-repaired.
@@ -258,15 +258,28 @@ mod tests {
     /// `read_settings_file_strict` was a separate unlocked call — so both readers saw the same
     /// base document and the second writer silently discarded the first's change, and a crash
     /// mid-write left a truncated `settings.json` that disables every agent until hand-repaired.
-    /// cyrup's own bar (`cyrup-config/src/settings.rs:1138`) is `FileLock` + `write_atomic`.
+    /// cyrup's own bar (`FileSettingsStore::with_lock`) is `FileLock` + `write_atomic`.
     ///
-    /// Red before the fix: with the bare `fs::write` both threads read `{}` and the last write
+    /// Red before the fix: with the bare `fs::write` both writers read `{}` and the last write
     /// wins, so exactly ONE override survives.
-    /// The writers are `tokio::spawn`ed onto a two-worker runtime rather than `std::thread::scope`d,
-    /// because `merge_builtin_agent_override` is now `async` and a plain thread closure cannot
-    /// await it. Two workers keep the contention genuinely parallel, so this still exercises the
-    /// real race; what it now also covers is the in-process layer of `FileLock`, which is the layer
-    /// two writers in ONE process actually contend on.
+    ///
+    /// The writers are `tokio::spawn`ed onto a two-worker runtime rather than `std::thread::scope`d
+    /// because `merge_builtin_agent_override` is `async` since the two-layer `FileLock` landed, and
+    /// a plain thread closure cannot await it. `worker_threads = 2` is load-bearing for the RED
+    /// case specifically: with the lock removed this function's body is entirely synchronous, so on
+    /// one worker each task would run to completion in a single poll and neither could read the
+    /// other's stale document. Two workers make the overlap POSSIBLE, not certain — like the
+    /// `thread::scope` form it replaces this is a probabilistic race detector, measured to fire at
+    /// least as often as that form did.
+    ///
+    /// What it contends on is `FileLock`'s layer 1, the per-path async mutex — NOT the `flock`.
+    /// Layer 1 admits one task per path per process, so the second writer reaches `flock(2)` only
+    /// after the first has already released it. That is DIFFERENT coverage from the pre-split
+    /// thread version, not less: layer 1 is the layer two writers in ONE process actually contend
+    /// on, and it is what serializes the read-modify-write this test is about. In-process `flock`
+    /// contention stopped being reachable when layer 1 was put in front of it, not when this test
+    /// was rewritten — nothing reachable was given up here. Exercising the `flock` needs a second
+    /// process, which no unit test in this crate is.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn two_concurrent_overrides_on_one_settings_file_both_survive() {
         let dir = tempfile::tempdir().expect("tempdir");

@@ -427,7 +427,7 @@ mod tests {
         // let this `sleep 30` outlive the test process converted into a LEAK-FAIL. This was the
         // only spawn under `crates/cyrup-tools/**` that inherited a harness handle at all — every
         // other one (`find_bash_on_path` above, `build_command`/`build_argv_command` in
-        // `ops/local.rs`, the `ops/local.rs` fixtures) already pins all three.
+        // `ops/local/command.rs`, the `ops/local/tests/` fixtures) already pins all three.
         let started = Instant::now();
         let mut child = std::process::Command::new("sleep")
             .arg("30")

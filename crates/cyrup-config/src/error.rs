@@ -52,6 +52,18 @@ pub enum ConfigError {
     Serde(#[from] serde_json::Error),
     #[error("lock contention on {path}")]
     Lock { path: PathBuf },
+    /// A `spawn_blocking` job inside [`crate::lock::FileLock::acquire`] never produced a result:
+    /// the task panicked (unwinding builds only — the release profile is `panic = "abort"`), or
+    /// the runtime dropped it while shutting down.
+    ///
+    /// Deliberately NOT [`Self::Lock`]: nothing was contended, and "lock contention on …" sends an
+    /// operator looking for a competing process that does not exist. Deliberately not
+    /// [`Self::Cancelled`] either — that one means the caller's own `CancelToken` fired, which is a
+    /// user-initiated abort rather than a failure, and `models_store::store_err` turns it into
+    /// `ProviderError::Aborted`. `message` is the `JoinError`'s own `Display`, which carries the
+    /// panic payload when there is one.
+    #[error("lock acquisition for {path} failed to run to completion: {message}")]
+    LockTaskFailed { path: PathBuf, message: String },
     #[error("cancelled")]
     Cancelled,
     #[error(transparent)]

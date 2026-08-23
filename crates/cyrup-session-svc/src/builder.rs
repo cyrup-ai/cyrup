@@ -431,10 +431,27 @@ pub struct SessionBuilder {
 /// `saveProjectTrustPromptResult(trustStore, result)` runs inside `selectProjectTrustOption`
 /// (`:39`) under the `updates.length > 0` guard (`:40-44`) that makes the two "(this session only)"
 /// rows write nothing.
-/// Returns a boxed future because the prompt persists the chosen option through
-/// `TrustStore::set_many`, which is async — the host's implementation cannot answer synchronously.
-/// The one call site ([`SessionBuilder::build`]) already awaits inside `async fn`, so this costs a
-/// boxed allocation per prompt and nothing else.
+///
+/// Returns a boxed future because that persist runs through `TrustStore::set_many`, which is async
+/// (`cyrup-config/src/trust.rs`) — the host's implementation cannot answer synchronously. The one
+/// call site ([`SessionBuilder::build`]) already awaits inside `async fn`, so the box is the only
+/// per-prompt cost the *builder* pays.
+///
+/// Implementors face three constraints, all of them read off the signature above:
+///
+/// - The returned future borrows `options` and `saved` for `'a`, so it cannot be spawned, stored,
+///   or outlive the call. That is deliberate: `build()` cannot settle the trust flag until the
+///   prompt answers, so a detached prompt would be meaningless.
+/// - `'a` is the *arguments'* lifetime. It cannot name the `Fn`'s own `&self` borrow — that
+///   lifetime is elided, separate, and absent from the return type — so nothing the closure
+///   captured may be borrowed into the future. Every implementor clones what it needs into the
+///   future on each invocation; see `trust_prompt_callback` in `crates/cyrup/src/prelaunch.rs`.
+///   Taking the arguments by value would not change this: the `&self` borrow is what is
+///   unnameable, not the argument borrows.
+/// - `Send` on the future rules out holding a `!Send` UI handle across an await inside the prompt.
+///
+/// All three are priced for a callback invoked at most once per session build, immediately before
+/// blocking on a human at a terminal.
 pub type TrustPromptFn = Arc<
     dyn for<'a> Fn(
             &'a [TrustOption],

@@ -10,6 +10,18 @@ use crate::error::ConfigError;
 ///
 /// `#[async_trait]` rather than a native `async fn` in trait: this is consumed as
 /// `Arc<dyn SettingsStore>` (`manager.rs:26`), and a native async fn is not dyn-compatible.
+///
+/// **[CYRUP-DELTA]** The trait is HALF async on purpose. `with_lock` is `async` only because
+/// [`crate::lock::FileLock::acquire`] is — that lock awaits an in-process keyed mutex and then a
+/// non-blocking `flock` retry loop. `read` takes no lock in either impl: `FileSettingsStore::read`
+/// is a bare `std::fs::read_to_string`, and [`InMemorySettingsStore`]'s is a `std::sync::Mutex`
+/// lock plus a clone. It therefore has no suspension point at all, and `async` there would box a
+/// future that never yields. It would also cascade: `read`'s only caller is
+/// `SettingsManager::load_scope`, under `reload_internal`, under the sync `SettingsManager::load`,
+/// `reload` and `set_project_trusted`. Upstream is sync on BOTH halves — `lockfile.lockSync`
+/// behind a busy-wait retry loop annotated "Sleep synchronously to avoid changing callers to
+/// async" (settings-manager.ts:206/218 @v0.83.0) and `readFileSync` (`:237`) — so the `async` is
+/// confined to the half that takes a lock. Do not "finish the job".
 #[async_trait::async_trait]
 pub trait SettingsStore: Send + Sync {
     /// Read the current raw text for a scope (`None` if absent).
@@ -17,6 +29,14 @@ pub trait SettingsStore: Send + Sync {
 
     /// Serialized read-modify-write. `f` receives the current text (None if absent) and returns
     /// `Some(new)` to write or `None` to leave untouched.
+    ///
+    /// `for<'s>` is spelled out because `#[async_trait]` renames every elided `&` in the signature
+    /// into a method-level named lifetime, and `CollectLifetimes::visit_type_reference_mut`
+    /// recurses into the `Fn(..)` sugar as well: a plain `FnMut(Option<&str>)` here loses the
+    /// implicit `for<'a>` that Fn-sugar elision would give it and becomes early-bound, chosen by
+    /// the caller. Both impls hand `f` a borrow of a local (`current`, `guard`), which an
+    /// early-bound lifetime cannot accept. `+ Send` is load-bearing too: the body is boxed as
+    /// `Pin<Box<dyn Future + Send>>`, and `&mut T: Send` only when `T: Send`.
     async fn with_lock(
         &self,
         scope: SettingsScope,
@@ -77,10 +97,7 @@ impl SettingsStore for FileSettingsStore {
                 });
             }
         };
-        // Bound before the write: inside an `async` body the `if let` scrutinee's borrow of
-        // `current` would otherwise still be live across the call below.
-        let next = f(current.as_deref());
-        if let Some(new_text) = next {
+        if let Some(new_text) = f(current.as_deref()) {
             crate::lock::write_atomic(&path, new_text.as_bytes(), false)?;
         }
         Ok(())
@@ -128,10 +145,7 @@ impl SettingsStore for InMemorySettingsStore {
             .slot(scope)
             .lock()
             .map_err(|_| ConfigError::LockPoisoned)?;
-        // Same reason as above: bind first so the immutable borrow of `guard` ends before the
-        // assignment takes it mutably.
-        let next = f(guard.as_deref());
-        if let Some(new) = next {
+        if let Some(new) = f(guard.as_deref()) {
             *guard = Some(new);
         }
         Ok(())

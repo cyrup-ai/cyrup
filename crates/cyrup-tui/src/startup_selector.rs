@@ -15,6 +15,7 @@
 use std::io::{self, Stdout};
 
 use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::cursor::Show;
 use ratatui::crossterm::event::{self, Event, KeyEventKind};
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -28,49 +29,65 @@ use crate::keymap::SelectKeymap;
 use crate::selector::{Selector, SelectorOutcome};
 use crate::theme::UiTheme;
 
+/// Restore the terminal on EVERY exit from [`run_startup_selector`] — the two setup errors, the
+/// loop's `?`, and (new with `async`) a **future-drop**: the loop now suspends at each
+/// `on_apply(..).await`, so the caller's future can be dropped mid-selector where the sync version
+/// could not be. The old straight-line restore at the foot of the function ran on none of those.
+///
+/// Total and idempotent: every step is `let _ =` so a terminal that rejects one escape does not
+/// stop the rest, and leaving an alternate screen that was never entered is harmless.
+///
+/// This does NOT cover a panic — `panic = "abort"` in the release profile means no unwind and no
+/// `Drop`. [`crate::panic_hook::restore_terminal_best_effort`] is that path's only recourse.
+struct StartupTerminalRestore;
+
+impl Drop for StartupTerminalRestore {
+    fn drop(&mut self) {
+        let mut out = io::stdout();
+        let _ = out.execute(LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+        let _ = out.execute(Show);
+    }
+}
+
 /// Run a single `inner` selector to completion over a fresh full-screen terminal (Pi
 /// `showStartupSelector`). Returns the terminal [`SelectorOutcome::Confirm`] / [`SelectorOutcome::Cancel`].
 /// `on_apply` is invoked for each in-place [`SelectorOutcome::Apply`] payload (delete/rename) and the
-/// loop continues. The terminal is always restored (raw mode off, alternate screen left, cursor shown)
-/// even on the error path.
-pub fn run_startup_selector(
+/// loop continues. The terminal is always restored (raw mode off, alternate screen left, cursor
+/// shown) by [`StartupTerminalRestore`] — on every exit, including a dropped future.
+///
+/// `async` because [`SelectorOutcome::Apply`] is now AWAITED: `on_apply` persists the mutation
+/// before the loop repaints the row that shows it, so an in-place edit is durable before the frame
+/// that reflects it is painted. The **input** read is still the blocking `event::read()`, so this
+/// parks its executor thread between keys — unchanged from the sync version every caller already
+/// blocked on, and NOT fixable in isolation: see the `.flux` task "unify the pre-launch input path
+/// with the app reader" for why a second background reader on stdin is unsafe while
+/// [`crate::app::crossterm_input_stream`] is coupled to `App::run`'s singleton statics.
+pub async fn run_startup_selector(
     theme: &UiTheme,
     keymap: &SelectKeymap,
     inner: &mut dyn Selector,
-    on_apply: impl FnMut(&str),
+    on_apply: impl AsyncFnMut(&str),
 ) -> Result<SelectorOutcome, TuiError> {
     let mut stdout = io::stdout();
     enable_raw_mode().map_err(|e| TuiError::Backend(e.to_string()))?;
-    if let Err(e) = stdout.execute(EnterAlternateScreen) {
-        let _ = disable_raw_mode();
-        return Err(TuiError::Backend(e.to_string()));
-    }
-    let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
-        Ok(t) => t,
-        Err(e) => {
-            let mut out = io::stdout();
-            let _ = out.execute(LeaveAlternateScreen);
-            let _ = disable_raw_mode();
-            return Err(TuiError::Backend(e.to_string()));
-        }
-    };
+    // Armed the instant raw mode is on, so every exit below unwinds through `Drop`.
+    let _restore = StartupTerminalRestore;
+    stdout
+        .execute(EnterAlternateScreen)
+        .map_err(|e| TuiError::Backend(e.to_string()))?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))
+        .map_err(|e| TuiError::Backend(e.to_string()))?;
 
-    let result = run_loop(&mut terminal, theme, keymap, inner, on_apply);
-
-    // Restore — total and idempotent so any error path still leaves a usable terminal.
-    let mut out = io::stdout();
-    let _ = out.execute(LeaveAlternateScreen);
-    let _ = disable_raw_mode();
-    let _ = terminal.show_cursor();
-    result
+    run_loop(&mut terminal, theme, keymap, inner, on_apply).await
 }
 
-fn run_loop(
+async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     theme: &UiTheme,
     keymap: &SelectKeymap,
     inner: &mut dyn Selector,
-    mut on_apply: impl FnMut(&str),
+    mut on_apply: impl AsyncFnMut(&str),
 ) -> Result<SelectorOutcome, TuiError> {
     loop {
         terminal
@@ -93,7 +110,7 @@ fn run_loop(
                 match inner.handle(&key, keymap) {
                     SelectorOutcome::Confirm(value) => return Ok(SelectorOutcome::Confirm(value)),
                     SelectorOutcome::Cancel => return Ok(SelectorOutcome::Cancel),
-                    SelectorOutcome::Apply(payload) => on_apply(&payload),
+                    SelectorOutcome::Apply(payload) => on_apply(&payload).await,
                     // Never produced by the startup selectors (`OpenExternalEditor` is only
                     // `ExtensionEditorSelector`'s; `OpenSubmenu` is only the `/settings` grid's) —
                     // treated as a no-op like `Redraw`'s siblings.
