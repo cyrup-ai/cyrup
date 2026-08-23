@@ -23,20 +23,20 @@ impl AgentSession {
     /// Whether any compaction (manual / auto / branch-summary) is running (Pi `isCompacting`,
     /// agent-session.ts:831).
     pub fn is_compacting(&self) -> bool {
-        Self::lock(&self.compaction_cancel).is_some()
-            || Self::lock(&self.auto_compaction_cancel).is_some()
-            || Self::lock(&self.branch_summary_cancel).is_some()
+        crate::sync::lock(&self.compaction_cancel).is_some()
+            || crate::sync::lock(&self.auto_compaction_cancel).is_some()
+            || crate::sync::lock(&self.branch_summary_cancel).is_some()
     }
 
     /// Whether auto-compaction is enabled (runtime override, else the settings default; Pi
     /// `autoCompactionEnabled`, agent-session.ts:2086).
     pub fn auto_compaction_enabled(&self) -> bool {
-        Self::lock(&self.auto_compaction_override).unwrap_or(self.auto_compaction_enabled_default)
+        crate::sync::lock(&self.auto_compaction_override).unwrap_or(self.auto_compaction_enabled_default)
     }
 
     /// Toggle auto-compaction (Pi `setAutoCompactionEnabled`, agent-session.ts:2078).
     pub fn set_auto_compaction_enabled(&self, enabled: bool) {
-        *Self::lock(&self.auto_compaction_override) = Some(enabled);
+        *crate::sync::lock(&self.auto_compaction_override) = Some(enabled);
     }
 
     /// Check whether the given assistant turn requires compaction and run it (Pi `_checkCompaction`,
@@ -56,10 +56,10 @@ impl AgentSession {
         // Pi `_checkCompaction` reads `const contextWindow = this.model?.contextWindow ?? 0;`
         // (agent-session.ts:1960) — a modelless session has window 0, which `shouldCompact` and
         // `isContextOverflow` both treat as "unknown", so nothing triggers.
-        let model = { Self::lock(&self.compaction_model).clone() };
+        let model = { crate::sync::lock(&self.compaction_model).clone() };
         let window = model.as_ref().map_or(0, |m| m.context_window);
         let same_model = {
-            let cur = Self::lock(&self.model);
+            let cur = crate::sync::lock(&self.model);
             cur.as_ref().is_some_and(|c| {
                 assistant.provider == c.provider && assistant.model.as_str() == c.model.as_str()
             })
@@ -82,7 +82,7 @@ impl AgentSession {
             if !will_retry {
                 return self.run_auto_compaction(CompactionReason::Overflow, false).await;
             }
-            if *Self::lock(&self.overflow_recovery_attempted) {
+            if *crate::sync::lock(&self.overflow_recovery_attempted) {
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason: CompactionReason::Overflow,
                     result: None,
@@ -97,7 +97,7 @@ impl AgentSession {
                 .await;
                 return Ok(false);
             }
-            *Self::lock(&self.overflow_recovery_attempted) = true;
+            *crate::sync::lock(&self.overflow_recovery_attempted) = true;
             self.drop_trailing_assistant().await;
             return self.run_auto_compaction(CompactionReason::Overflow, will_retry).await;
         }
@@ -184,7 +184,7 @@ impl AgentSession {
         // `compaction_end`; it just declines. The check therefore sits ahead of the emit here too.
         // (Unreachable in practice: `check_compaction`'s window is 0 with no model, so neither the
         // overflow nor the threshold arm fires — but pi guards it and so do we.)
-        let Some(model) = ({ Self::lock(&self.compaction_model).clone() }) else {
+        let Some(model) = ({ crate::sync::lock(&self.compaction_model).clone() }) else {
             return Ok(false);
         };
         let cancel = self.session_cancel.child_token();
@@ -240,14 +240,7 @@ impl AgentSession {
             BeforeCompactOutcome::Cancel => {
                 cancel_slot.clear();
                 // Pi agent-session.ts:1984-1990: a cancelling handler emits aborted:true, willRetry:false.
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                })
-                .await;
+                self.emit_compaction_cancelled(reason).await;
                 return Ok(false);
             }
             BeforeCompactOutcome::Proceed(ov) => ov,

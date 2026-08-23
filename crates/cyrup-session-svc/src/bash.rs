@@ -597,8 +597,8 @@ fn unique_temp_suffix() -> String {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod sanitize_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
 
     #[test]
@@ -727,8 +727,8 @@ mod sanitize_tests {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod wire_shape_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
     use super::{bash_message_payload, BashResult};
 
     /// SEAM-083 — RED before this pass on the FIRST assertion of each half.

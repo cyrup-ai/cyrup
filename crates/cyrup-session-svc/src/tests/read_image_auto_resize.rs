@@ -11,13 +11,6 @@
 //! with the faux provider issuing a real `read` tool call, asserted on the `ToolResult` message that
 //! lands in the session transcript. A unit test on `ReadOpts` would pass against the unwired build.
 
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
-
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -38,7 +31,9 @@ use tempfile::TempDir;
 const FIXTURE_W: u32 = 2600;
 const FIXTURE_H: u32 = 800;
 
-struct Fixture {
+/// Local, deliberately NOT `common::Fixture`: these tests compare the tool's base64 against the
+/// fixture PNG's own bytes, so the file has to be built and its bytes captured with the tree.
+struct ImageFixture {
     _tmp: TempDir,
     cwd: PathBuf,
     agent_dir: PathBuf,
@@ -46,7 +41,7 @@ struct Fixture {
     png_bytes: Vec<u8>,
 }
 
-fn fixture() -> Fixture {
+fn image_fixture() -> ImageFixture {
     let tmp = TempDir::new().unwrap();
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
@@ -61,12 +56,12 @@ fn fixture() -> Fixture {
     img.save_with_format(&path, image::ImageFormat::Png).unwrap();
     let png_bytes = std::fs::read(&path).unwrap();
 
-    Fixture { _tmp: tmp, cwd, agent_dir, png_bytes }
+    ImageFixture { _tmp: tmp, cwd, agent_dir, png_bytes }
 }
 
 /// Write `{"images":{"autoResize":<v>}}` into the GLOBAL settings file the session will read.
 /// Omitting the key entirely exercises pi's `?? true` default instead.
-fn write_setting(fx: &Fixture, value: Option<bool>) {
+fn write_setting(fx: &ImageFixture, value: Option<bool>) {
     let body = match value {
         Some(v) => format!("{{\"images\":{{\"autoResize\":{v}}}}}"),
         None => "{}".to_string(),
@@ -91,7 +86,7 @@ fn faux_reading_the_image() -> Arc<FauxProvider> {
     faux
 }
 
-async fn session_for(fx: &Fixture) -> AgentSession {
+async fn session_for(fx: &ImageFixture) -> AgentSession {
     let provider: Arc<dyn Provider> = faux_reading_the_image() as Arc<dyn Provider>;
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
     cfg.trust_override = Some(true);
@@ -138,7 +133,7 @@ async fn read_tool_result(session: &AgentSession) -> (String, String) {
     (text, data)
 }
 
-async fn run_read(fx: &Fixture) -> (String, String) {
+async fn run_read(fx: &ImageFixture) -> (String, String) {
     let session = session_for(fx).await;
     // The returned stream is the caller's optional event view; the run itself is driven by the
     // session (same idiom as `src/tests/compaction_tokens_after.rs`), so settle on `wait_for_idle`.
@@ -155,7 +150,7 @@ async fn run_read(fx: &Fixture) -> (String, String) {
 /// attached base64 was a freshly re-encoded 2000px PNG.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_resize_false_reaches_the_read_tool() {
-    let fx = fixture();
+    let fx = image_fixture();
     write_setting(&fx, Some(false));
     let (text, data) = run_read(&fx).await;
 
@@ -178,7 +173,7 @@ async fn auto_resize_false_reaches_the_read_tool() {
 /// path is downscaled and annotated.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_resize_default_still_downscales() {
-    let fx = fixture();
+    let fx = image_fixture();
     write_setting(&fx, None);
     let (text, data) = run_read(&fx).await;
 
@@ -197,7 +192,7 @@ async fn auto_resize_default_still_downscales() {
 /// `true` behaves exactly like the absent key.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn auto_resize_explicit_true_matches_the_default() {
-    let fx = fixture();
+    let fx = image_fixture();
     write_setting(&fx, Some(true));
     let (text, _) = run_read(&fx).await;
     assert!(text.contains("displayed at 2000x"), "got: {text}");

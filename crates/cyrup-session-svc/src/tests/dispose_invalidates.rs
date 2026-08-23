@@ -24,36 +24,12 @@
 //! * `invalidation_is_scoped_to_the_disposed_session` — RED pre-fix for the same reason (its second
 //!   host is only invalidated by the drop).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
-
-use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::{SessionBuilder, SessionConfig};
+use super::common::{base_config, fixture, Fixture};
+use crate::SessionBuilder;
 use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg
-}
 
 async fn build(fx: &Fixture) -> crate::AgentSession {
     let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());

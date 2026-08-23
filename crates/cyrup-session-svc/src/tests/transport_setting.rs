@@ -1,4 +1,9 @@
-//! The `transport` setting must reach the agent — Pi `sdk.ts:357`
+//! The stream-transport settings must reach the provider: `transport` and the
+//! `websocketConnectTimeoutMs` that qualifies it. Both are read off the same `StreamOptions` the
+//! provider is handed, and both had the same defect shape — parsed and validated in the config
+//! layer, threaded through `AgentBuilder`, and never assigned by `SessionBuilder`.
+//!
+//! `transport` — Pi `sdk.ts:357`
 //! (`transport: settingsManager.getTransport()` in the `Agent` options), fed by
 //! `settings-manager.ts:750-752` (`this.settings.transport ?? "auto"`).
 //!
@@ -17,31 +22,14 @@
 //! only consumer is `ai/src/api/openai-codex-responses.ts:300,1465`, which is one of the four
 //! unported wire APIs. So this proves the setting now reaches the provider boundary; making a
 //! provider ACT on it is provider-side work outside this crate.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::StopReason;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
 use cyrup_provider::{Provider, Transport};
-use crate::{SessionBuilder, SessionConfig, Settings};
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
+use super::common::{base_config, fixture};
+use crate::{InputSource, SessionBuilder, SessionConfig, Settings, UserInput};
 
 /// Run one prompt through a real session built with `cli` as its settings layer, and return every
 /// `StreamOptions.transport` the provider was called with.
@@ -108,5 +96,51 @@ async fn unset_transport_stays_auto() {
     assert!(
         seen.iter().all(|t| *t == Some(Transport::Auto)),
         "an unset `transport` must remain `auto`, saw {seen:?}"
+    );
+}
+
+/// CFG-006 / AGENT-031 — the `websocketConnectTimeoutMs` setting must reach the provider's
+/// `StreamOptions`.
+///
+/// pi resolves it in the session `streamFn` as
+/// `options?.websocketConnectTimeoutMs ?? settingsManager.getWebSocketConnectTimeoutMs()` and
+/// spreads it onto every `streamSimple` call (`core/sdk.ts:310-311,314` @v0.83.0).
+///
+/// RED before this pass: BOTH halves existed and neither was connected —
+/// `Settings::websocket_connect_timeout_ms` parsed and validated the key (`settings.rs:732`) and
+/// `AgentBuilder::websocket_connect_timeout_ms` threaded it onto `StreamOptions`
+/// (`cyrup-provider/src/stream.rs:201`), but nothing in `SessionBuilder` assigned it. A user who
+/// set the key got no error and no effect, which is the AGENT-021 defect shape: a field documented
+/// as live that silently sends nothing. The factory below would observe `None`.
+#[tokio::test]
+async fn websocket_connect_timeout_setting_reaches_the_providers_stream_options() {
+    let fx = fixture();
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field("websocketConnectTimeoutMs", serde_json::json!(7_500)).unwrap();
+
+    let seen: Arc<std::sync::Mutex<Vec<Option<u64>>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_response_steps(vec![FauxResponseStep::factory({
+        let seen = Arc::clone(&seen);
+        move |_ctx, options, _state, _model| {
+            crate::sync::lock(&seen).push(options.websocket_connect_timeout_ms);
+            faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)
+        }
+    })]);
+    let provider: Arc<dyn Provider> = faux;
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    let _ = session.prompt(UserInput::text("go", InputSource::Sdk)).await.expect("prompt");
+    session.wait_for_idle().await;
+
+    assert_eq!(
+        crate::sync::lock(&seen).clone(),
+        vec![Some(7_500)],
+        "the resolved `websocketConnectTimeoutMs` must arrive on `StreamOptions` for every request"
     );
 }

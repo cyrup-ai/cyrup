@@ -26,6 +26,24 @@ use super::AgentSession;
 use super::bash::BashCancelGuard;
 
 impl AgentSession {
+    /// Emit the `compaction_end` a CANCELLED compaction reports, from the one place all three
+    /// cancel sites share: the `session_before_compact` veto in [`Self::compact`], the internal
+    /// `CompactionHooks` cancel (`Ok(None)`) below, and auto-compaction's veto
+    /// ([`super::auto_compaction`]). Pi classifies its "Compaction cancelled" throw as an ABORT, so
+    /// the event carries no result, `aborted:true` and NO `errorMessage`
+    /// (agent-session.ts:1909-1916); a cancelling handler emits the same shape with
+    /// `willRetry:false` even on the retry path (`:1984-1990`).
+    pub(super) async fn emit_compaction_cancelled(&self, reason: CompactionReason) {
+        self.fanout_emit(AgentSessionEvent::CompactionEnd {
+            reason,
+            result: None,
+            aborted: true,
+            will_retry: false,
+            error_message: None,
+        })
+        .await;
+    }
+
     /// Trigger a compaction of the current branch (R-11-014 `compact`; Pi `compact`,
     /// agent-session.ts:1647-1788). Aborts any active run first, emits
     /// `compaction_start`/`compaction_end`, offers the extension `session_before_compact` veto hook,
@@ -60,7 +78,7 @@ impl AgentSession {
         // caught by the same handler that emits `compaction_end` with
         // `errorMessage: "Compaction failed: …"` (`:1908-1917`), which is why the exit below mirrors
         // the `NothingToCompact` arm rather than returning bare.
-        let current_model = Self::lock(&self.compaction_model).clone();
+        let current_model = crate::sync::lock(&self.compaction_model).clone();
         let model = match current_model {
             Some(m) => m,
             None => {
@@ -147,17 +165,9 @@ impl AgentSession {
         {
             BeforeCompactOutcome::Cancel => {
                 cancel_slot.clear();
-                // Pi throws "Compaction cancelled" (agent-session.ts:1824); its catch classifies that
-                // exact message as an ABORT, so `compaction_end` carries `aborted:true` and NO
-                // errorMessage (agent-session.ts:1909-1916).
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                })
-                .await;
+                // Pi throws "Compaction cancelled" (agent-session.ts:1824) — an ABORT, not a
+                // failure; see [`Self::emit_compaction_cancelled`] for the event shape.
+                self.emit_compaction_cancelled(reason).await;
                 return Err(SessionServiceError::CompactionCancelled);
             }
             BeforeCompactOutcome::Proceed(ov) => ov,
@@ -294,14 +304,7 @@ impl AgentSession {
             // The internal `CompactionHooks` seam cancelled (`BeforeCompactDecision::Cancel`) — the
             // same refusal Pi reports as "Compaction cancelled" (agent-session.ts:1824/1869).
             Ok(None) => {
-                self.fanout_emit(AgentSessionEvent::CompactionEnd {
-                    reason,
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                })
-                .await;
+                self.emit_compaction_cancelled(reason).await;
                 Err(SessionServiceError::CompactionCancelled)
             }
             Err(e) => {
@@ -397,17 +400,17 @@ impl AgentSession {
     /// went to completion. `is_compacting` already reads both (`:4393`), which is what made the
     /// asymmetry invisible.
     pub fn abort_compaction(&self) {
-        if let Some(c) = Self::lock(&self.compaction_cancel).as_ref() {
+        if let Some(c) = crate::sync::lock(&self.compaction_cancel).as_ref() {
             c.cancel();
         }
-        if let Some(c) = Self::lock(&self.auto_compaction_cancel).as_ref() {
+        if let Some(c) = crate::sync::lock(&self.auto_compaction_cancel).as_ref() {
             c.cancel();
         }
     }
 
     /// Cancel an in-flight branch summarization (Pi `abortBranchSummary`, agent-session.ts:1796).
     pub fn abort_branch_summary(&self) {
-        if let Some(c) = Self::lock(&self.branch_summary_cancel).as_ref() {
+        if let Some(c) = crate::sync::lock(&self.branch_summary_cancel).as_ref() {
             c.cancel();
         }
     }
@@ -446,14 +449,14 @@ pub(super) struct CompactionCancelGuard<'a> {
 impl<'a> CompactionCancelGuard<'a> {
     /// Install `cancel` into `slot` and arm the guard.
     pub(super) fn install(slot: &'a Mutex<Option<CancelToken>>, cancel: CancelToken) -> Self {
-        *AgentSession::lock(slot) = Some(cancel);
+        *crate::sync::lock(slot) = Some(cancel);
         Self { slot, armed: true }
     }
 
     /// Clear the slot now (pi's ordered clear), and disarm.
     pub(super) fn clear(&mut self) {
         if self.armed {
-            *AgentSession::lock(self.slot) = None;
+            *crate::sync::lock(self.slot) = None;
             self.armed = false;
         }
     }

@@ -68,7 +68,7 @@ impl AgentSession {
         };
         match deliver_as {
             Some(DeliverAs::NextTurn) => {
-                Self::lock(&self.pending_next_turn).push(msg);
+                crate::sync::lock(&self.pending_next_turn).push(msg);
             }
             _ if self.is_streaming().await => match deliver_as {
                 Some(DeliverAs::FollowUp) => self.agent.follow_up(msg),

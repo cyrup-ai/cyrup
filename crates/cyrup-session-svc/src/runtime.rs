@@ -382,6 +382,50 @@ impl AgentSessionRuntime {
         matches!(reduced, Reduced::Blocked { .. })
     }
 
+    /// The `session_before_switch{reason:"resume"}` veto both resume entry points offer, written
+    /// once so the payload cannot drift between them: `switch_session_with` (SEAM-012,
+    /// `agent-session-runtime.ts:133-148/199`) and `import_from_jsonl`, which lands as a resume of
+    /// the copied file (`:353-388`). Each caller keeps this call where its own ordering needs it —
+    /// the import path runs it BEFORE its `std::fs::copy`.
+    async fn vetoed_resume(&self, current: &AgentSession, target: &Path) -> bool {
+        self.vetoed(
+            current,
+            HostEvent::SessionBeforeSwitch {
+                reason: "resume".to_string(),
+                target_session_file: Some(target.display().to_string()),
+            },
+        )
+        .await
+    }
+
+    /// The resume tail both `switch_session_with` and `import_from_jsonl` reach in the same relative
+    /// position (after their veto and `previous`/`drop(current)`): resolve the effective cwd —
+    /// `cwd_override` wins, else the file's own — assert it still exists BEFORE the teardown
+    /// `install` performs (#42, Pi `assertSessionCwdExists`, runtime.ts:208), rebuild cwd-bound
+    /// services for it, and install as `"resume"`.
+    ///
+    /// Deliberately NOT widened to include the veto: the import path interleaves its
+    /// `std::fs::copy` between the two, and folding the veto in here would move it after that copy,
+    /// leaving a copied file behind on a vetoed import.
+    async fn resume_build_and_install(
+        &self,
+        path: PathBuf,
+        cwd_override: Option<PathBuf>,
+        previous: Option<String>,
+    ) -> Result<SwitchResult, SessionServiceError> {
+        let cwd = match cwd_override {
+            Some(c) => c,
+            None => SessionManager::open(&path)?.cwd().to_path_buf(),
+        };
+        if !cwd.exists() {
+            return Err(SessionServiceError::MissingSessionCwd(cwd.display().to_string()));
+        }
+        let next =
+            self.factory.build(SessionTarget::Resume(path), Some(cwd)).await?.into_shared();
+        self.install(next, "resume", previous).await;
+        Ok(SwitchResult { cancelled: false })
+    }
+
     /// Tear down `current`, invalidate its subscriptions, install `next`, bump the generation, and
     /// emit `session_start` on the new session (the shared replacement tail).
     async fn install(
@@ -518,35 +562,13 @@ impl AgentSessionRuntime {
         let path = path.into();
         let current = self.session().await;
         // SEAM-012 — `emitBeforeSwitch("resume", sessionPath)` (`agent-session-runtime.ts:133-148`,
-        // called with `"resume"` and the target path at `:199`).
-        let target_session_file = Some(path.display().to_string());
-        if self
-            .vetoed(
-                &current,
-                HostEvent::SessionBeforeSwitch {
-                    reason: "resume".to_string(),
-                    target_session_file,
-                },
-            )
-            .await
-        {
+        // called with `"resume"` and the target path at `:199`). Vetoed BEFORE any teardown.
+        if self.vetoed_resume(&current, &path).await {
             return Ok(SwitchResult { cancelled: true });
-        }
-        // Pre-flight: resolve the effective cwd (override wins, else derived from the file) and
-        // assert it still exists BEFORE teardown (Pi `assertSessionCwdExists`, runtime.ts:208).
-        let cwd = match options.cwd_override {
-            Some(c) => c,
-            None => SessionManager::open(&path)?.cwd().to_path_buf(),
-        };
-        if !cwd.exists() {
-            return Err(SessionServiceError::MissingSessionCwd(cwd.display().to_string()));
         }
         let previous = current.session_file().await.map(|p| p.display().to_string());
         drop(current);
-        let next =
-            self.factory.build(SessionTarget::Resume(path), Some(cwd)).await?.into_shared();
-        self.install(next, "resume", previous).await;
-        Ok(SwitchResult { cancelled: false })
+        self.resume_build_and_install(path, options.cwd_override, previous).await
     }
 
     /// Fork at an entry, then switch the runtime to the new branched session (Pi `fork`,
@@ -699,17 +721,11 @@ impl AgentSessionRuntime {
         // the same replace-and-announce protocol as `switchSession`,
         // `agent-session-runtime.ts:353-388`), so the reason is `"resume"` and the target is the
         // destination path.
-        let target_session_file = Some(destination.display().to_string());
-        if self
-            .vetoed(
-                &current,
-                HostEvent::SessionBeforeSwitch {
-                    reason: "resume".to_string(),
-                    target_session_file,
-                },
-            )
-            .await
-        {
+        //
+        // The veto runs HERE — before the copy below — so a vetoed import leaves NO file behind in
+        // the sessions dir. `resume_build_and_install` deliberately holds only the tail AFTER the
+        // copy for that reason.
+        if self.vetoed_resume(&current, &destination).await {
             return Ok(SwitchResult { cancelled: true });
         }
         let previous = current_file.map(|p| p.display().to_string());
@@ -721,21 +737,7 @@ impl AgentSessionRuntime {
                 .map_err(|e| SessionServiceError::Io(e.to_string()))?;
         }
 
-        // Resolve the imported session's cwd and assert it still exists BEFORE teardown (#42).
-        let cwd = match cwd_override {
-            Some(c) => c,
-            None => SessionManager::open(&destination)?.cwd().to_path_buf(),
-        };
-        if !cwd.exists() {
-            return Err(SessionServiceError::MissingSessionCwd(cwd.display().to_string()));
-        }
-        let next = self
-            .factory
-            .build(SessionTarget::Resume(destination), Some(cwd))
-            .await?
-            .into_shared();
-        self.install(next, "resume", previous).await;
-        Ok(SwitchResult { cancelled: false })
+        self.resume_build_and_install(destination, cwd_override, previous).await
     }
 
     /// Reload the active session in place (Pi `reload`, agent-session.ts:2451): re-emit

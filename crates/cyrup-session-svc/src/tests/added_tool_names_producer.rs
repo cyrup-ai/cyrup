@@ -23,9 +23,7 @@
 //!
 //! These tests drive REAL runs through the extension seam and read the anchor off the finalized
 //! transcript message, never off a tool's return value.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -38,32 +36,10 @@ use cyrup_provider::faux::{
     faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
 };
 use cyrup_provider::Provider;
-use crate::{AgentSession, SessionBuilder, SessionConfig};
-use tempfile::TempDir;
+use super::common::{base_config_no_extensions, fixture, Fixture};
+use crate::{AgentSession, SessionBuilder};
 
 // ------------------------------------------------------------------------------ fixtures ----
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
 
 fn empty_schema() -> serde_json::Value {
     serde_json::json!({ "type": "object", "properties": {} })
@@ -219,7 +195,7 @@ async fn session_with_ext(
 ) -> (Arc<AgentSession>, Arc<AtomicUsize>) {
     let slot: SessionSlot = Arc::new(OnceLock::new());
     let late_ran = Arc::new(AtomicUsize::new(0));
-    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(fx))
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config_no_extensions(fx))
         .with_native_extension(Arc::new(LoaderExt {
             slot: slot.clone(),
             what,

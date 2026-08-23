@@ -15,41 +15,17 @@
 //! The load-bearing assertion is `a_retried_compaction_appends_exactly_one_compaction_entry`: the
 //! session JSONL is append-only, so a retry that re-ran the append would be unrecoverable
 //! corruption.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::StopReason;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
 use cyrup_provider::Provider;
+use super::common::{base_config, fixture, Fixture};
 use crate::{
-    AgentSessionEvent, BashOptions, NavigateTreeOptions, SessionBuilder, SessionConfig,
-};
+    AgentSessionEvent, BashOptions, NavigateTreeOptions, SessionBuilder, };
 use futures::StreamExt;
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg
-}
 
 /// Force even a small session to compact, and make the retry policy `enabled: true, maxRetries: 3,
 /// baseDelayMs: 0` — Pi's own defaults are `3` / `2000` (`settings-manager.ts:821-822`); only the

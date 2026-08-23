@@ -122,6 +122,34 @@ impl SessionFactory {
             .unwrap_or_else(|| self.base_config.agent_dir.join("sessions"))
     }
 
+    /// Replay this factory's stored construction inputs onto a fresh [`SessionBuilder`] for `cfg`.
+    ///
+    /// The ONE place the factory's per-build fields are mirrored onto a builder (they parallel
+    /// `SessionBuilder`'s own, builder.rs:445-454), so adding a factory-carried input is a field, a
+    /// setter and one line here — not a fourth edit that only the fork path would miss. Both build
+    /// paths end in a single chained `.build()` off this seed.
+    fn seed_builder(&self, cfg: SessionConfig) -> SessionBuilder {
+        let mut builder = SessionBuilder::new(self.provider.clone(), cfg)
+            .settings_store(self.settings_store.clone())
+            .cli_settings(self.cli_settings.clone());
+        if let Some(resolver) = &self.provider_resolver {
+            builder = builder.provider_resolver(resolver.clone());
+        }
+        if let Some(auth) = &self.auth {
+            builder = builder.auth(auth.clone());
+        }
+        if let Some(store) = &self.trust_store {
+            builder = builder.trust_store(store.clone());
+        }
+        if let Some(prompt) = &self.trust_prompt {
+            builder = builder.trust_prompt(prompt.clone());
+        }
+        for ext in &self.native_extensions {
+            builder = builder.with_native_extension(ext.clone());
+        }
+        builder
+    }
+
     /// Build a fresh [`AgentSession`] for `target`, optionally rebinding to a new `cwd` (arch-11
     /// §3.4 — recreating cwd-bound services for the effective cwd).
     pub async fn build(
@@ -153,25 +181,7 @@ impl SessionFactory {
             cfg.cwd = c.clone();
             cfg.cwd_override = Some(c);
         }
-        let mut builder = SessionBuilder::new(self.provider.clone(), cfg)
-            .settings_store(self.settings_store.clone())
-            .cli_settings(self.cli_settings.clone());
-        if let Some(resolver) = &self.provider_resolver {
-            builder = builder.provider_resolver(resolver.clone());
-        }
-        if let Some(auth) = &self.auth {
-            builder = builder.auth(auth.clone());
-        }
-        if let Some(store) = &self.trust_store {
-            builder = builder.trust_store(store.clone());
-        }
-        if let Some(prompt) = &self.trust_prompt {
-            builder = builder.trust_prompt(prompt.clone());
-        }
-        for ext in &self.native_extensions {
-            builder = builder.with_native_extension(ext.clone());
-        }
-        builder.build().await
+        self.seed_builder(cfg).build().await
     }
 
     /// Build a fresh [`AgentSession`] around a caller-supplied, already-constructed
@@ -184,25 +194,6 @@ impl SessionFactory {
     ) -> Result<AgentSession, SessionServiceError> {
         let mut cfg = self.base_config.clone();
         cfg.cwd = manager.cwd().to_path_buf();
-        let mut builder = SessionBuilder::new(self.provider.clone(), cfg)
-            .settings_store(self.settings_store.clone())
-            .cli_settings(self.cli_settings.clone())
-            .with_manager(manager);
-        if let Some(resolver) = &self.provider_resolver {
-            builder = builder.provider_resolver(resolver.clone());
-        }
-        if let Some(auth) = &self.auth {
-            builder = builder.auth(auth.clone());
-        }
-        if let Some(store) = &self.trust_store {
-            builder = builder.trust_store(store.clone());
-        }
-        if let Some(prompt) = &self.trust_prompt {
-            builder = builder.trust_prompt(prompt.clone());
-        }
-        for ext in &self.native_extensions {
-            builder = builder.with_native_extension(ext.clone());
-        }
-        builder.build().await
+        self.seed_builder(cfg).with_manager(manager).build().await
     }
 }

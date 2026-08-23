@@ -22,11 +22,6 @@ use crate::session::SessionHandle;
 
 const CHANNEL_CAPACITY: usize = 1024;
 
-/// Lock a `std::sync::Mutex` ignoring poisoning (no panic on a poisoned lock; arch-00 no-panic).
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// Multi-consumer fan-out of [`AgentSessionEvent`] backed by bounded `mpsc` (no broadcast backlog,
 /// arch-11 §5.4). `persistent` survives across runs; `run_scoped` is cleared after `agent_end`.
 #[derive(Default)]
@@ -43,7 +38,7 @@ impl Fanout {
     /// A long-lived subscription (TUI / SDK observer) — lives until the receiver is dropped.
     pub(crate) fn subscribe_persistent(&self) -> EventStream<AgentSessionEvent> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        lock(&self.persistent).push(tx);
+        crate::sync::lock(&self.persistent).push(tx);
         Box::pin(ReceiverStream::new(rx))
     }
 
@@ -51,7 +46,7 @@ impl Fanout {
     /// `agent_settled`, which follows the run's last `agent_end`).
     pub(crate) fn subscribe_run(&self) -> EventStream<AgentSessionEvent> {
         let (tx, rx) = mpsc::channel(CHANNEL_CAPACITY);
-        lock(&self.run_scoped).push(tx);
+        crate::sync::lock(&self.run_scoped).push(tx);
         Box::pin(ReceiverStream::new(rx))
     }
 
@@ -63,16 +58,16 @@ impl Fanout {
     /// Send to every live subscription, awaited (backpressure → slows the agent, never drops).
     async fn emit(&self, ev: AgentSessionEvent) {
         // Snapshot the senders so we never hold the lock across an `.await`.
-        let persistent: Vec<_> = lock(&self.persistent).clone();
+        let persistent: Vec<_> = crate::sync::lock(&self.persistent).clone();
         for s in &persistent {
             let _ = s.send(ev.clone()).await;
         }
-        let run: Vec<_> = lock(&self.run_scoped).clone();
+        let run: Vec<_> = crate::sync::lock(&self.run_scoped).clone();
         for s in &run {
             let _ = s.send(ev.clone()).await;
         }
         // Prune closed persistent senders (run-scoped are cleared wholesale in `end_run`).
-        lock(&self.persistent).retain(|s| !s.is_closed());
+        crate::sync::lock(&self.persistent).retain(|s| !s.is_closed());
     }
 
     /// Drop all run-scoped senders, terminating the streams returned by the just-finished `prompt`.
@@ -80,7 +75,7 @@ impl Fanout {
     /// (bound path), in both cases immediately AFTER `agent_settled` is emitted, so a run-scoped
     /// consumer observes the settle as its last event.
     pub(crate) fn end_run(&self) {
-        lock(&self.run_scoped).clear();
+        crate::sync::lock(&self.run_scoped).clear();
     }
 
     /// Invalidate every subscription on session replacement (R-11-021, arch-11 §3.2): emit a
@@ -88,8 +83,8 @@ impl Fanout {
     /// every sender (both run-scoped and persistent) so the streams end.
     pub(crate) async fn invalidate(&self, generation: u64) {
         self.emit(AgentSessionEvent::SessionReplaced { generation }).await;
-        lock(&self.run_scoped).clear();
-        lock(&self.persistent).clear();
+        crate::sync::lock(&self.run_scoped).clear();
+        crate::sync::lock(&self.persistent).clear();
     }
 }
 

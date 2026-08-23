@@ -21,11 +21,10 @@
 //!   an ordinary user mistake, because cyrup defers the first file write until then — surfaced a
 //!   filesystem error naming an internal path, with no remedy. Over RPC that string is what a
 //!   client renders (`rpc.rs`'s `fork`/`clone` arms relay it verbatim).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::common::{fixture, Fixture};
 use crate::{
     AgentSessionRuntime, ForkPosition, SessionConfig, SessionFactory, SessionServiceError,
     SessionTarget,
@@ -33,22 +32,6 @@ use crate::{
 use cyrup_core::{EntryId, StopReason};
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
 
 fn persisted_config(fx: &Fixture) -> SessionConfig {
     let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());

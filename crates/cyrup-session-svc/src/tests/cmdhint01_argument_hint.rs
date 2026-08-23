@@ -11,7 +11,6 @@
 //! template (and every non-prompt row) omits the key entirely (`None` ⇒ absent, not `null`, mirroring
 //! pi's spread-if-truthy `...(cmd.argumentHint && { argumentHint: cmd.argumentHint })`,
 //! `interactive-mode.ts:685-689`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

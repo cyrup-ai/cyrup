@@ -1,5 +1,9 @@
+//! Forking and cloning: the anchor a branch is taken at, on both sides of the persistence split.
+//!
 //! SEAM-009 — forking or cloning a NON-PERSISTED session must branch its transcript, not throw it
-//! away, and a bogus entry id must be rejected on that path too.
+//! away, and a bogus entry id must be rejected on that path too. The persisted path's own anchor
+//! semantics (`ForkPosition`, the entry a fork lands on) are pinned by the last test here, against
+//! the same runtime.
 //!
 //! Pi ground truth, `packages/coding-agent/src/core/agent-session-runtime.ts:262-350`. Two facts:
 //!
@@ -18,36 +22,19 @@
 //!
 //! These assertions are on transcript CONTENT, never on a length: a length check would pass against
 //! any implementation that happened to carry the right NUMBER of messages.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use cyrup_core::{EntryId, Message, StopReason};
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
+use super::common::{base_config, fixture, Fixture};
 use crate::{
     AgentSessionEvent, AgentSessionRuntime, ForkPosition, SessionConfig, SessionFactory,
     SessionTarget,
 };
 use futures::StreamExt;
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
 
 /// A NON-PERSISTED session — `persist: false` is what `--no-save` / a `SessionTarget::New` embedder
 /// session with persistence off produces, and it is the whole point of this file.
@@ -344,4 +331,43 @@ async fn a_bogus_entry_id_errors_on_the_unsaved_path_instead_of_silently_succeed
         4,
         "and must leave the live transcript untouched"
     );
+}
+
+// ================================ the PERSISTED path: fork anchors on a saved session ====
+
+/// gap #4/#6/#33: entry-anchored fork via the runtime + `getUserMessagesForForking`, plus stats.
+#[tokio::test]
+async fn runtime_fork_at_entry_and_fork_anchors() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("a1")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("a2")], StopReason::Stop),
+    ]);
+
+    let provider: Arc<dyn Provider> = faux.clone();
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime =
+        AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("runtime");
+
+    let session = runtime.session().await;
+    let _stream = session.prompt("the first user message").await.expect("prompt");
+    session.wait_for_idle().await;
+
+    // Stats reflect the round-trip.
+    let stats = session.session_stats().await;
+    assert_eq!(stats.user_messages, 1);
+    assert_eq!(stats.assistant_messages, 1);
+
+    // The fork anchors enumerate the user message(s) on the branch.
+    let anchors = session.user_messages_for_forking().await;
+    assert_eq!(anchors.len(), 1, "one user message anchor");
+    assert_eq!(anchors[0].text, "the first user message");
+    let anchor_id: EntryId = anchors[0].entry_id.clone();
+    drop(session);
+
+    // Fork AT that entry through the runtime → a fresh branched session, generation bumps.
+    let fork = runtime.fork(anchor_id, ForkPosition::At).await.expect("fork");
+    assert!(!fork.cancelled);
+    assert_eq!(runtime.generation().await, 1, "fork replaces the session");
 }

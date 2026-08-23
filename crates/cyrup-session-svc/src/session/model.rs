@@ -49,7 +49,7 @@ impl AgentSession {
             )));
         }
         self.install_owning_provider(&model)?;
-        let previous = Self::lock(&self.model).clone();
+        let previous = crate::sync::lock(&self.model).clone();
         self.apply_model_change(&model, previous.as_ref(), "set", None).await?;
         Ok(ModelRef {
             provider: model.provider.clone(),
@@ -261,7 +261,7 @@ impl AgentSession {
     /// [`cyrup_agent::Agent::set_headers`] overlay in place.
     pub(super) fn headers_for_model_ref(&self, m: &ModelRef) -> Option<cyrup_provider::HeaderMap> {
         let matches = |c: &Model| c.provider == m.provider && c.id == m.model;
-        let current = Self::lock(&self.compaction_model).clone();
+        let current = crate::sync::lock(&self.compaction_model).clone();
         if let Some(cur) = current.as_ref().filter(|c| matches(c)) {
             return self.attribution_headers(cur);
         }
@@ -317,7 +317,7 @@ impl AgentSession {
     ) -> Result<(), SessionServiceError> {
         let model_ref = ModelRef { provider: provider.clone(), api: None, model: model.clone() };
         self.agent.set_model(model_ref.clone()).await;
-        *Self::lock(&self.model) = Some(model_ref.clone());
+        *crate::sync::lock(&self.model) = Some(model_ref.clone());
         self.bash_session_env.set_model(provider.to_string(), model.to_string());
         // Same per-request attribution rule as `apply_model_change` (pi `sdk.ts:318-327`). This
         // path has only the `ModelRef`, so resolve the full `Model` to recompute; if it cannot be
@@ -339,7 +339,7 @@ impl AgentSession {
 
     /// The models available for `cycle_model` (Pi `scopedModels` getter, agent-session.ts:870).
     pub fn scoped_models(&self) -> Vec<ScopedModel> {
-        Self::lock(&self.scoped_models).clone()
+        crate::sync::lock(&self.scoped_models).clone()
     }
 
     /// Replace the scoped-model cycle set (Pi `setScopedModels`, agent-session.ts:875).
@@ -371,7 +371,7 @@ impl AgentSession {
             })
             .collect();
         self.services.host_services.update_scoped_models(mirrored);
-        *Self::lock(&self.scoped_models) = models;
+        *crate::sync::lock(&self.scoped_models) = models;
     }
 
     /// Cycle to the next/previous model (Pi `cycleModel`, agent-session.ts:1601-1671). Cycles over
@@ -385,7 +385,7 @@ impl AgentSession {
         &self,
         forward: bool,
     ) -> Result<Option<ModelCycleResult>, SessionServiceError> {
-        let scoped = Self::lock(&self.scoped_models).clone();
+        let scoped = crate::sync::lock(&self.scoped_models).clone();
         if scoped.is_empty() {
             self.cycle_available_model(forward).await
         } else {
@@ -405,7 +405,7 @@ impl AgentSession {
         if candidates.len() <= 1 {
             return Ok(None);
         }
-        let current = Self::lock(&self.model).clone();
+        let current = crate::sync::lock(&self.model).clone();
         let cur_idx = candidates
             .iter()
             // pi `modelsAreEqual(sm.model, currentModel)` with `currentModel: Model | undefined`
@@ -449,7 +449,7 @@ impl AgentSession {
         if candidates.len() <= 1 {
             return Ok(None);
         }
-        let current = Self::lock(&self.model).clone();
+        let current = crate::sync::lock(&self.model).clone();
         let cur_idx = candidates
             .iter()
             // Same `findIndex → -1 → 0` fallback as the scoped path (agent-session.ts:1647-1650).
@@ -483,8 +483,8 @@ impl AgentSession {
             model: next.id.clone(),
         };
         self.agent.set_model(model_ref.clone()).await;
-        *Self::lock(&self.model) = Some(model_ref.clone());
-        *Self::lock(&self.compaction_model) = Some(next.clone());
+        *crate::sync::lock(&self.model) = Some(model_ref.clone());
+        *crate::sync::lock(&self.compaction_model) = Some(next.clone());
         self.services.host_services.update_model(model_ref, next.context_window, None);
         // Republish `CYRUP_PROVIDER`/`CYRUP_MODEL` for the NEXT `bash` child (Pi re-reads `ctx.model`
         // on every `resolveSpawnContext`, bash.ts:175-178; docs/environment-variables.md:27).

@@ -7,7 +7,6 @@
 //!
 //! **No network.** Nothing here issues a request: the store is written directly, exactly as a
 //! completed refresh would have left it, and the session only ever reads it from disk.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

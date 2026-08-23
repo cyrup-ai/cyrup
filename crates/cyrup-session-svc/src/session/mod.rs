@@ -15,9 +15,10 @@
 //! [`accessors`] (plain getters), [`files`] (session files on disk), [`stats`], [`inject`],
 //! [`bash`], [`tools`], [`adapters`] and [`types`].
 //!
-//! The struct, its fields, construction, and the primitives every concern shares (`lock`,
-//! `fanout_emit`, `spawn_event_pump`, `now_ms`, `Drop`) stay here. Those are private to this
-//! module, which Rust already makes visible to every child module above.
+//! The struct, its fields, construction, and the primitives every concern shares
+//! (`fanout_emit`, `spawn_event_pump`, `now_ms`, `Drop`) stay here. Those are private to this
+//! module, which Rust already makes visible to every child module above. The poison-safe mutex
+//! helper every concern reaches for is the crate-level [`crate::sync::lock`].
 
 mod accessors;
 mod adapters;
@@ -498,11 +499,6 @@ impl AgentSession {
     /// `spawn_run` drives `agent.prompt` directly and no driver loop exists.
     pub fn is_run_active(&self) -> bool {
         !self.is_idle()
-    }
-
-    /// Lock a `std::sync::Mutex` ignoring poisoning (no panic; arch-00 no-panic).
-    fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-        m.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A long-lived event subscription (TUI / SDK observer) — lives until the stream is dropped.

@@ -4,9 +4,7 @@
 //! Both are `pub` surfaces with no in-workspace caller, which is exactly why neither divergence had
 //! ever been observed. Each test drives the REAL public entry point and asserts on the consumer side
 //! of the seam, never on the setter's own return value.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -19,32 +17,10 @@ use cyrup_provider::faux::{
 };
 use cyrup_provider::Provider;
 
-use crate::{AgentSession, ScopedModel, SessionBuilder, SessionConfig};
-use tempfile::TempDir;
+use super::common::{base_config_no_extensions, fixture};
+use crate::{AgentSession, ScopedModel, SessionBuilder};
 
 // ------------------------------------------------------------------------------ fixtures ----
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
 
 fn empty_schema() -> serde_json::Value {
     serde_json::json!({ "type": "object", "properties": {} })
@@ -72,7 +48,7 @@ fn empty_schema() -> serde_json::Value {
 async fn set_scoped_models_reaches_the_extension_seam() {
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config_no_extensions(&fx))
         .build()
         .await
         .unwrap();
@@ -250,7 +226,7 @@ async fn register_custom_tools_wraps_and_contributes_like_the_build_time_path() 
     let slot: SessionSlot = Arc::new(OnceLock::new());
     let late_ran = Arc::new(AtomicUsize::new(0));
 
-    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config_no_extensions(&fx))
         .build()
         .await
         .unwrap()
@@ -347,7 +323,7 @@ async fn a_command_handlers_outcome_reaches_the_ui_channel_on_every_shape() {
 
     let fx = fixture();
     let faux = Arc::new(FauxProvider::new());
-    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config_no_extensions(&fx))
         .build()
         .await
         .unwrap();

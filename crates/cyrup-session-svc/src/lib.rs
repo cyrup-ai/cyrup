@@ -39,6 +39,7 @@ mod services;
 mod session;
 mod state;
 mod subscriber;
+mod sync;
 #[cfg(test)]
 mod tests;
 mod tools;

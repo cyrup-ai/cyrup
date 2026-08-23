@@ -26,9 +26,7 @@
 //!   `description?: string` (`core/extensions/types.ts:1163-1168`) omits the key.
 //!
 //! `SEAM-055` (closed) fixed only `sourceInfo.path`; these are the three divergences that survived it.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyrup_core::ExtensionId;
@@ -38,24 +36,9 @@ use cyrup_ext::{
 };
 use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use super::common::fixture;
 use crate::{SessionBuilder, SessionConfig};
 use serde_json::Value;
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
 
 const OWNER: &str = "provenance-probe";
 

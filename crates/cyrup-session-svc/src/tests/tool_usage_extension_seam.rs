@@ -15,9 +15,7 @@
 //! of `Hooks::after_tool_call` — `cyrup-ext`'s bridge — could neither see nor change it.
 //!
 //! These run the real loop against the real `PolicyHooks` → `ExtHooks` → dispatcher chain.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{
@@ -29,32 +27,10 @@ use cyrup_provider::faux::{
     faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
 };
 use cyrup_provider::Provider;
-use crate::{SessionBuilder, SessionConfig};
-use tempfile::TempDir;
+use super::common::{base_config_no_extensions, fixture, Fixture};
+use crate::SessionBuilder;
 
 // ------------------------------------------------------------------------------ fixtures ----
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
 
 fn usage(input: u64, output: u64) -> Usage {
     Usage { input, output, total_tokens: input + output, ..Usage::default() }
@@ -160,7 +136,7 @@ async fn run_full(
     act: Act,
 ) -> (Vec<Option<Usage>>, cyrup_agent::ToolResultMessage, crate::SessionStats) {
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let mut cfg = base_config(fx);
+    let mut cfg = base_config_no_extensions(fx);
     cfg.custom_tools =
         vec![Arc::new(BillingTool { reports, params: serde_json::json!({"type":"object"}) })
             as Arc<dyn Tool>];

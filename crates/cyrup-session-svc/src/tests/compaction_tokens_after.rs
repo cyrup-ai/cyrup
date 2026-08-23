@@ -1,3 +1,6 @@
+//! The `compaction_end` PAYLOAD: that it carries pi's full field set, and that its
+//! `estimatedTokensAfter` is measured over the right projection.
+//!
 //! `compaction_end`'s `estimatedTokensAfter` must be measured over pi's RAW `AgentMessage`
 //! context, not over the `convertToLlm`-flattened one.
 //!
@@ -23,39 +26,18 @@
 //! the over-count fired on every single compaction, and it put the two halves of one
 //! `compaction_end` event on different bases: `tokens_before` is computed by `prepare_compaction`
 //! over the raw projection (`cyrup-session/src/compaction/prepare.rs`).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use cyrup_core::StopReason;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
 use cyrup_session::agent_message::AgentMessage;
 use cyrup_session::compaction::tokens::estimate_agent_message;
-use crate::{SessionBuilder, SessionConfig};
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg
-}
+use super::common::{base_config, fixture};
+use crate::{AgentSessionEvent, InputSource, SessionBuilder, UserInput};
+use futures::StreamExt;
 
 /// Compaction settings that force even a small session to compact (keep nothing, reserve nothing).
 fn aggressive_compaction_settings() -> cyrup_config::Settings {
@@ -159,4 +141,117 @@ fn both_compaction_paths_measure_the_raw_projection() {
          `cyrup_provider::estimate_message_tokens` for estimatedTokensAfter — pi bills the raw \
          AgentMessage projection (agent-session.ts:284-288)"
     );
+}
+
+// ============================================================ A.7 compaction_end payload shape ====
+
+/// A.7: a real (driven) MANUAL compaction emits `compaction_end` carrying the FULL Pi payload
+/// `{reason,result,aborted,willRetry,errorMessage?}` — the `result` object
+/// (summary/firstKeptEntryId/tokensBefore/estimatedTokensAfter), `aborted:false`, `willRetry:false`,
+/// and NO `errorMessage` key (Pi agent-session.ts:142-148 / 2062-2069).
+#[tokio::test]
+async fn compaction_end_carries_full_pi_payload() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    // Two real turns to build a transcript, then the compaction summary completion.
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("first answer")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("second answer")], StopReason::Stop),
+        // The compaction may issue a split-turn (history + turn-prefix) pair of summaries; supply
+        // ample summary completions so summarization never starves.
+        faux_assistant_message(vec![faux_text("CONTEXT SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("TURN PREFIX SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("EXTRA SUMMARY")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("EXTRA SUMMARY")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(aggressive_compaction_settings())
+        .build()
+        .await
+        .expect("build");
+
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+    let _ = session.prompt("tell me two").await.expect("prompt 2");
+    session.wait_for_idle().await;
+
+    let mut sub = session.subscribe();
+    let _result = session
+        .compact(None)
+        .await
+        .expect("an aggressive-keep compaction over two turns produces a result");
+
+    // Find the compaction_end on the live stream and assert its serialized shape.
+    let mut end: Option<serde_json::Value> = None;
+    for _ in 0..12 {
+        match tokio::time::timeout(Duration::from_millis(300), sub.next()).await {
+            Ok(Some(ev)) => {
+                if ev.kind() == "compaction_end" {
+                    end = Some(serde_json::to_value(&ev).unwrap());
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+    let v = end.expect("compaction_end must be emitted");
+    assert_eq!(v["type"], "compaction_end");
+    assert_eq!(v["reason"], "manual");
+    assert_eq!(v["aborted"], serde_json::json!(false));
+    assert_eq!(v["willRetry"], serde_json::json!(false), "manual compaction never retries");
+    assert!(v.get("errorMessage").is_none(), "no errorMessage on a clean compaction: {v}");
+    let r = v.get("result").expect("result present on a successful compaction");
+    assert!(r.get("summary").and_then(|s| s.as_str()).is_some(), "result.summary present: {r}");
+    assert!(r.get("firstKeptEntryId").is_some(), "result.firstKeptEntryId present: {r}");
+    assert!(r.get("tokensBefore").is_some(), "result.tokensBefore present: {r}");
+    assert!(r.get("estimatedTokensAfter").is_some(), "result.estimatedTokensAfter present: {r}");
+}
+
+/// check_compaction Case-2 (threshold, direct-usage) + A.7: a real BOUND run whose assistant usage
+/// exceeds `window − reserve` triggers post-run auto-compaction tagged `threshold`, and its
+/// `compaction_end` carries `willRetry:false` (Pi agent-session.ts:1900-1927 / 2069).
+#[tokio::test]
+async fn real_run_threshold_compaction_emits_threshold_end() {
+    let fx = fixture();
+    // reserveTokens just below the window so any real usage trips the threshold.
+    let mut cli = cyrup_config::Settings::new();
+    cli.set_field(
+        "compaction",
+        serde_json::json!({"enabled": true, "keepRecentTokens": 0, "reserveTokens": 127999}),
+    )
+    .unwrap();
+
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("a real answer worth some tokens")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("THRESHOLD SUMMARY")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(cli)
+        .build()
+        .await
+        .expect("build")
+        .into_shared();
+
+    let stream = session.prompt(UserInput::text("go", InputSource::Sdk)).await.expect("prompt");
+    session.wait_for_idle().await;
+    let events: Vec<AgentSessionEvent> = stream.collect().await;
+
+    let starts: Vec<String> = events
+        .iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .filter(|v| v["type"] == "compaction_start")
+        .filter_map(|v| v["reason"].as_str().map(str::to_string))
+        .collect();
+    assert_eq!(starts, vec!["threshold".to_string()], "exactly one threshold compaction from the run");
+
+    let end = events
+        .iter()
+        .filter_map(|e| serde_json::to_value(e).ok())
+        .find(|v| v["type"] == "compaction_end")
+        .expect("compaction_end must fire from the real run");
+    assert_eq!(end["reason"], "threshold");
+    assert_eq!(end["willRetry"], serde_json::json!(false), "a threshold compaction does not retry");
 }

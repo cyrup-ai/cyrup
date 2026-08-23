@@ -41,7 +41,7 @@ impl AgentSession {
         // available for summarization"); }` (agent-session.ts:2910-2912) — a DIFFERENT string from
         // `formatNoModelSelectedMessage`, and gated on the caller actually asking for a summary, so
         // a modelless session can still navigate the tree without one.
-        let current_model = Self::lock(&self.compaction_model).clone();
+        let current_model = crate::sync::lock(&self.compaction_model).clone();
         let model = match current_model {
             Some(m) => m,
             // pi's gate is on the SUMMARY, not the navigation, so a modelless session still moves
@@ -68,7 +68,7 @@ impl AgentSession {
                 .with_observer(retry_observer);
         let compactor = Compactor::new(summarizer, NoHooks);
         let cancel = self.session_cancel.child_token();
-        *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
+        *crate::sync::lock(&self.branch_summary_cancel) = Some(cancel.clone());
 
         let mut guard = self.manager.lock().await;
         let old_leaf = guard.leaf_id().cloned();
@@ -88,7 +88,7 @@ impl AgentSession {
         // `spawn_event_pump`).
         drop(compactor);
         let _ = retry_pump.await;
-        *Self::lock(&self.branch_summary_cancel) = None;
+        *crate::sync::lock(&self.branch_summary_cancel) = None;
         Ok(entry_opt?.map(|e| e.summary))
     }
 
@@ -133,7 +133,7 @@ impl AgentSession {
 
             // "Model required for summarization" (agent-session.ts:2910-2912) — after the
             // already-at-target no-op and BEFORE the target lookup, exactly as pi orders it.
-            if options.summarize && Self::lock(&self.model).is_none() {
+            if options.summarize && crate::sync::lock(&self.model).is_none() {
                 return Err(SessionServiceError::NoModelForSummarization);
             }
 
@@ -250,7 +250,7 @@ impl AgentSession {
             // Non-`None` here: the `options.summarize && !this.model` gate above already returned
             // `NoModelForSummarization` (agent-session.ts:2910-2912), and this arm is inside
             // `options.summarize`.
-            let model = Self::lock(&self.compaction_model)
+            let model = crate::sync::lock(&self.compaction_model)
                 .clone()
                 .ok_or(SessionServiceError::NoModelForSummarization)?;
             // `(contextWindow || 128000) − reserve` (Pi `branch-summarization.ts:315-317`). The
@@ -260,7 +260,7 @@ impl AgentSession {
                 branch_token_budget(&model, self.branch_summary_settings.reserve_tokens);
             let prep = prepare_branch_entries(&collection.entries, budget);
             let cancel = self.session_cancel.child_token();
-            *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
+            *crate::sync::lock(&self.branch_summary_cancel) = Some(cancel.clone());
             let result = self
                 .generate_branch_summary_with_instructions(
                     &prep,
@@ -270,7 +270,7 @@ impl AgentSession {
                     cancel,
                 )
                 .await;
-            *Self::lock(&self.branch_summary_cancel) = None;
+            *crate::sync::lock(&self.branch_summary_cancel) = None;
             match result {
                 Ok(produced) => {
                     let details = serde_json::to_value(prep.file_ops.to_details())

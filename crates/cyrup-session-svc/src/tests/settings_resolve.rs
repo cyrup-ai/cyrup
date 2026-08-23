@@ -12,12 +12,6 @@
 //!
 //! cyrup shipped step 3 plus step 2 for skills/prompts/themes only; `packages`, `extensions` and
 //! `models.json` had ZERO production readers, so every one of those declarations was inert.
-#![allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

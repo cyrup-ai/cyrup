@@ -36,28 +36,23 @@ impl GuestProviderRegistry {
 
     /// The provider realized for `id`, if a guest registered one (cheap `Arc` clone). Poison-safe.
     pub fn provider(&self, id: &str) -> Option<Arc<dyn Provider>> {
-        self.lock().get(id).cloned()
+        crate::sync::lock(&self.providers).get(id).cloned()
     }
 
     /// Whether a guest provider with this id is registered.
     pub fn has_provider(&self, id: &str) -> bool {
-        self.lock().contains_key(id)
+        crate::sync::lock(&self.providers).contains_key(id)
     }
 
     /// Every guest-registered provider's model catalog, unioned (Pi folds registered models into the
     /// shared `ModelRegistry.models`, model-registry.ts:917-940). Stable order by provider id.
     pub fn models(&self) -> Vec<Model> {
-        self.lock().values().flat_map(|p| p.models().to_vec()).collect()
+        crate::sync::lock(&self.providers).values().flat_map(|p| p.models().to_vec()).collect()
     }
 
     /// The registered provider ids (diagnostics).
     pub fn ids(&self) -> Vec<String> {
-        self.lock().keys().cloned().collect()
-    }
-
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, Arc<dyn Provider>>> {
-        // Poison-safe: a panic elsewhere must not wedge model selection (R-00-009).
-        self.providers.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+        crate::sync::lock(&self.providers).keys().cloned().collect()
     }
 }
 
@@ -65,17 +60,17 @@ impl ModelRegistrySink for GuestProviderRegistry {
     fn upsert_provider(&self, reg: &ProviderRegistration) {
         // Full replacement for this provider id (Pi "replaces all models", model-registry.ts:919).
         let provider = reg.build_provider();
-        self.lock().insert(reg.id.clone(), provider);
+        crate::sync::lock(&self.providers).insert(reg.id.clone(), provider);
     }
 
     fn remove_provider(&self, id: &str) {
-        self.lock().remove(id);
+        crate::sync::lock(&self.providers).remove(id);
     }
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use cyrup_ext::registry::ExtensionRegistry;
     use cyrup_core::ExtensionId;

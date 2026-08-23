@@ -15,18 +15,18 @@ use super::AgentSession;
 impl AgentSession {
     /// Current retry attempt (0 when not retrying; Pi `retryAttempt` getter, agent-session.ts:778).
     pub fn retry_attempt(&self) -> u32 {
-        *Self::lock(&self.retry_attempt)
+        *crate::sync::lock(&self.retry_attempt)
     }
 
     /// Whether a retry backoff is in flight (Pi `isRetrying` getter, agent-session.ts:2553).
     pub fn is_retrying(&self) -> bool {
-        Self::lock(&self.retry_cancel).is_some()
+        crate::sync::lock(&self.retry_cancel).is_some()
     }
 
     /// Whether auto-retry is enabled (runtime override, else the settings default; Pi
     /// `autoRetryEnabled`, agent-session.ts:2558).
     pub fn auto_retry_enabled(&self) -> bool {
-        Self::lock(&self.auto_retry_override).unwrap_or(self.retry_enabled_default)
+        crate::sync::lock(&self.auto_retry_override).unwrap_or(self.retry_enabled_default)
     }
 
     /// The retry policy handed to every summarization call (compaction, turn-prefix, branch).
@@ -47,12 +47,12 @@ impl AgentSession {
     /// Toggle auto-retry (Pi `setAutoRetryEnabled`, agent-session.ts:2565). Facade-side override of
     /// the settings `retry.enabled` value (settings persistence lives one layer down).
     pub fn set_auto_retry_enabled(&self, enabled: bool) {
-        *Self::lock(&self.auto_retry_override) = Some(enabled);
+        *crate::sync::lock(&self.auto_retry_override) = Some(enabled);
     }
 
     /// Cancel an in-flight retry backoff (Pi `abortRetry`, agent-session.ts:2548).
     pub fn abort_retry(&self) {
-        if let Some(c) = Self::lock(&self.retry_cancel).as_ref() {
+        if let Some(c) = crate::sync::lock(&self.retry_cancel).as_ref() {
             c.cancel();
         }
     }
@@ -62,7 +62,7 @@ impl AgentSession {
     pub fn is_retryable_error(&self, message: &AssistantMessage) -> bool {
         // Pi `if (isContextOverflow(message, this.model?.contextWindow ?? 0)) return false;`
         // (agent-session.ts:2637).
-        let window = { Some(Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window)) };
+        let window = { Some(crate::sync::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window)) };
         if is_context_overflow(message, window) {
             return false;
         }
@@ -95,7 +95,7 @@ impl AgentSession {
             return false;
         }
         {
-            let mut attempt = Self::lock(&self.retry_attempt);
+            let mut attempt = crate::sync::lock(&self.retry_attempt);
             *attempt += 1;
             if *attempt > self.retry_max_retries {
                 *attempt -= 1;
@@ -117,14 +117,14 @@ impl AgentSession {
         self.drop_trailing_assistant().await;
         // Abortable exponential backoff.
         let cancel = self.session_cancel.child_token();
-        *Self::lock(&self.retry_cancel) = Some(cancel.clone());
+        *crate::sync::lock(&self.retry_cancel) = Some(cancel.clone());
         let slept = cancel
             .run_until_cancelled(tokio::time::sleep(std::time::Duration::from_millis(delay_ms)))
             .await
             .is_some();
-        *Self::lock(&self.retry_cancel) = None;
+        *crate::sync::lock(&self.retry_cancel) = None;
         if !slept {
-            let attempt = std::mem::replace(&mut *Self::lock(&self.retry_attempt), 0);
+            let attempt = std::mem::replace(&mut *crate::sync::lock(&self.retry_attempt), 0);
             self.fanout_emit(AgentSessionEvent::AutoRetryEnd {
                 success: false,
                 attempt,

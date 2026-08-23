@@ -160,7 +160,7 @@ impl AgentSession {
         // and no lock-nesting question arises at all. cyrup's return type is non-optional, so the
         // modelless case degrades to a zero window, which `from_last_assistant` already renders as
         // fraction 0.0 — the same "unknown occupancy" the TUI shows for an undefined usage.
-        let window = { Self::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window) };
+        let window = { crate::sync::lock(&self.compaction_model).as_ref().map_or(0, |m| m.context_window) };
 
         let guard = self.manager.lock().await;
         // The last assistant ON THE ACTIVE BRANCH, by parent-link walk — the same answer
@@ -206,7 +206,7 @@ impl AgentSession {
         // pre-compaction assistant existed — including every unresolvable-v1 `first_kept_entry_id`
         // session, whose kept window is empty by construction (`cyrup-session/src/context.rs:166-172`).
         let context_usage = self.context_usage().await;
-        let model = Self::lock(&self.model).clone();
+        let model = crate::sync::lock(&self.model).clone();
         crate::state::SessionStateView {
             session_id: self.session_id.to_string(),
             cwd: self.services.cwd.display().to_string(),

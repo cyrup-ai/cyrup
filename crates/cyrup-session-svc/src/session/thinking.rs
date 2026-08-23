@@ -24,7 +24,7 @@ impl AgentSession {
         // Pi `if (!this.model) return THINKING_LEVELS;` (agent-session.ts:1722), where
         // `const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"]`
         // (agent-session.ts:297) — note it stops at `high`; `xhigh`/`max` are model-declared only.
-        let Some(model) = ({ Self::lock(&self.compaction_model).clone() }) else {
+        let Some(model) = ({ crate::sync::lock(&self.compaction_model).clone() }) else {
             return vec![
                 ModelThinkingLevel::Off,
                 ModelThinkingLevel::Minimal,
@@ -40,7 +40,7 @@ impl AgentSession {
     /// agent-session.ts:1729-1731).
     pub fn supports_thinking(&self) -> bool {
         // Pi `return !!this.model?.reasoning;` (agent-session.ts:1730) — false with no model.
-        Self::lock(&self.compaction_model).as_ref().is_some_and(|m| m.reasoning)
+        crate::sync::lock(&self.compaction_model).as_ref().is_some_and(|m| m.reasoning)
     }
 
     /// Set the thinking level, clamping to the model's capabilities, persisting a
@@ -51,7 +51,7 @@ impl AgentSession {
         &self,
         level: ModelThinkingLevel,
     ) -> Result<ModelThinkingLevel, SessionServiceError> {
-        let model = { Self::lock(&self.compaction_model).clone() };
+        let model = { crate::sync::lock(&self.compaction_model).clone() };
         // Pi `_clampThinkingLevel`: `return this.model ? clampThinkingLevel(this.model, level)
         // : "off";` (agent-session.ts:1608-1610) — a modelless session clamps everything to off.
         let effective = match model.as_ref() {
@@ -72,7 +72,7 @@ impl AgentSession {
         self.manager.lock().await.append_thinking_level_change(&level_str)?;
         // Only with a model installed: a guest's `ctx.model` stays `undefined` on a modelless
         // session (pi's `ExtensionContext.model` is the optional `session.model`).
-        if let (Some(mr), Some(m)) = (Self::lock(&self.model).clone(), model.as_ref()) {
+        if let (Some(mr), Some(m)) = (crate::sync::lock(&self.model).clone(), model.as_ref()) {
             self.services.host_services.update_model(
                 mr,
                 m.context_window,

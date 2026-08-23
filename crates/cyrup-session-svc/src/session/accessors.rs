@@ -32,7 +32,7 @@ impl AgentSession {
     /// exits 1 on it in every NON-interactive mode, while interactive shows the
     /// `modelFallbackMessage` banner and waits for `/login` + `/model`.
     pub fn model(&self) -> Option<ModelRef> {
-        Self::lock(&self.model).clone()
+        crate::sync::lock(&self.model).clone()
     }
 
     /// The model-restore fallback warning, if the resumed session's saved model was unavailable
@@ -149,14 +149,14 @@ impl AgentSession {
     /// [`Self::system_prompt`] until a tool-set rebuild (`/tools` toggle, a guest `setActiveTools`,
     /// or EXT-004 late tool registration) rewrites it via [`Self::push_active_tools`].
     pub fn base_system_prompt(&self) -> String {
-        Self::lock(&self.base_system_prompt).clone()
+        crate::sync::lock(&self.base_system_prompt).clone()
     }
 
     /// The `before_agent_start` replacement in force for the CURRENT run, if any (Pi
     /// `this._systemPromptOverride`, agent-session.ts:373 @v0.83.0). `None` between runs and
     /// whenever no handler replaced the prompt.
     pub fn system_prompt_override(&self) -> Option<String> {
-        Self::lock(&self.system_prompt_override).clone()
+        crate::sync::lock(&self.system_prompt_override).clone()
     }
 
     /// `override ?? base` — the exact expression pi evaluates at every site that writes
@@ -166,7 +166,7 @@ impl AgentSession {
     pub fn effective_system_prompt(&self) -> String {
         // Two statements, not one chained expression: the override guard must be released before
         // `base_system_prompt()` takes the second lock.
-        let over = Self::lock(&self.system_prompt_override).clone();
+        let over = crate::sync::lock(&self.system_prompt_override).clone();
         over.unwrap_or_else(|| self.base_system_prompt())
     }
 

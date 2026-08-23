@@ -21,9 +21,7 @@
 //!
 //! Both tests assert an OBSERVABLE effect — a truncated provider conversation, and the values a
 //! handler actually read back — never that `HostServices::control(...)` returned `Ok`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -35,31 +33,9 @@ use cyrup_provider::faux::{
     faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
 };
 use cyrup_provider::Provider;
-use crate::{SessionBuilder, SessionConfig};
+use super::common::{base_config_no_extensions, fixture};
+use crate::SessionBuilder;
 use serde_json::json;
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
 
 // =============================================================================================
 // `ctx.abort()` from a MID-RUN event handler
@@ -136,7 +112,7 @@ async fn ctx_abort_from_an_event_handler_stops_the_in_flight_run() {
     let fired = ext.fired.clone();
 
     let session =
-        SessionBuilder::new(faux_tool_then_more(&turns) as Arc<dyn Provider>, base_config(&fx))
+        SessionBuilder::new(faux_tool_then_more(&turns) as Arc<dyn Provider>, base_config_no_extensions(&fx))
             .with_native_extension(ext as Arc<dyn NativeExtension>)
             .build()
             .await
@@ -238,7 +214,7 @@ async fn the_ctx_state_accessors_answer_from_the_live_session() {
     let observed = ext.observed.clone();
 
     let session =
-        SessionBuilder::new(faux_tool_then_more(&turns) as Arc<dyn Provider>, base_config(&fx))
+        SessionBuilder::new(faux_tool_then_more(&turns) as Arc<dyn Provider>, base_config_no_extensions(&fx))
             .with_native_extension(ext as Arc<dyn NativeExtension>)
             .build()
             .await

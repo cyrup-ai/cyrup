@@ -16,17 +16,17 @@ use super::AgentSession;
 impl AgentSession {
     /// Names of the currently-active tools (Pi `getActiveToolNames`, agent-session.ts:786).
     pub fn active_tool_names(&self) -> Vec<String> {
-        Self::lock(&self.dynamic_tools).active_names()
+        crate::sync::lock(&self.dynamic_tools).active_names()
     }
 
     /// All enable-able tools with metadata (Pi `getAllTools`, agent-session.ts:794).
     pub fn all_tools(&self) -> Vec<ToolInfo> {
-        Self::lock(&self.dynamic_tools).all()
+        crate::sync::lock(&self.dynamic_tools).all()
     }
 
     /// One tool's definition by name (Pi `getToolDefinition`, agent-session.ts:806).
     pub fn tool_definition(&self, name: &str) -> Option<ToolInfo> {
-        Self::lock(&self.dynamic_tools).get(name)
+        crate::sync::lock(&self.dynamic_tools).get(name)
     }
 
     /// Push a rebuilt `(tools, system_prompt)` onto the agent for the next turn (Pi
@@ -40,7 +40,7 @@ impl AgentSession {
         // Without this write the next run's `before_agent_start` reset in
         // [`Self::assemble_run_messages`] would restore the startup prompt and the model would be
         // described the startup tool set for the rest of the session.
-        *Self::lock(&self.base_system_prompt) = prompt.clone();
+        *crate::sync::lock(&self.base_system_prompt) = prompt.clone();
         // …and what reaches the AGENT is `override ?? base` — pi's very next line,
         // `this.agent.state.systemPrompt = this._systemPromptOverride ?? this._baseSystemPrompt;`
         // (agent-session.ts:940 @v0.83.0). A rebuild triggered mid-run by a tool registration used to
@@ -87,7 +87,7 @@ impl AgentSession {
                 return;
             }
         };
-        let push = { Self::lock(&self.dynamic_tools).merge_registered(ext_tools) };
+        let push = { crate::sync::lock(&self.dynamic_tools).merge_registered(ext_tools) };
         if let Some((tools, prompt)) = push {
             self.push_active_tools(tools, prompt).await;
         }
@@ -147,7 +147,7 @@ impl AgentSession {
     /// tool array and the prompt to the agent for the next turn (Pi `setActiveToolsByName`,
     /// agent-session.ts:812). Unknown names are ignored.
     pub async fn set_active_tools_by_name(&self, names: &[String]) {
-        let (tools, prompt) = { Self::lock(&self.dynamic_tools).set_active(names) };
+        let (tools, prompt) = { crate::sync::lock(&self.dynamic_tools).set_active(names) };
         self.push_active_tools(tools, prompt).await;
     }
 
@@ -164,6 +164,6 @@ impl AgentSession {
     /// were blind to it — and it never derived `addedToolNames`.
     pub fn register_custom_tools(&self, tools: Vec<Arc<dyn cyrup_core::Tool>>) {
         let wrapped = tools.into_iter().map(|t| self.services.ext_host.wrap_tool(t)).collect();
-        Self::lock(&self.dynamic_tools).register_custom(wrapped);
+        crate::sync::lock(&self.dynamic_tools).register_custom(wrapped);
     }
 }

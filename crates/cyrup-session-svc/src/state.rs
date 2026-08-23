@@ -348,8 +348,8 @@ pub struct SessionStateView {
 
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod prov036_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use cyrup_core::{Cost, EntryId, ProviderId, StopReason};
     use cyrup_session::entry::EntryBase;

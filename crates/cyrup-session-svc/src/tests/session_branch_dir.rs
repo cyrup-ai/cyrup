@@ -6,7 +6,9 @@
 //!     deeper — so the branch stays visible to the `/resume` listing;
 //!   * an explicit `--session-dir` is used LITERALLY (Pi `sessionDir ? normalizePath(sessionDir) :
 //!     getDefaultSessionDir(cwd)`, session-manager.ts:1430) rather than gaining a `--<cwd>--` subdir.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+//!
+//! The `clone_at` half of the same seam is here too: a clone must write a NEW file beside the
+//! original rather than mutating it in place.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +16,8 @@ use std::sync::Arc;
 use cyrup_core::StopReason;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use crate::{SessionBuilder, SessionConfig};
+use super::common::{base_config, fixture};
+use crate::{SessionBuilder, SessionConfig, SessionFactory, SessionTarget};
 use tempfile::TempDir;
 
 fn faux() -> Arc<FauxProvider> {
@@ -87,4 +90,32 @@ async fn finding3_explicit_session_dir_is_literal() {
     println!("F3 file = {}", file.display());
     // Pi: <custom>/<ts>_<id>.jsonl. Buggy: <custom>/--...--/<ts>_<id>.jsonl (one too deep).
     assert_eq!(dir, custom, "Finding 3: explicit --session-dir must be used literally");
+}
+
+// ------------------------------------------------------- clone_at + runtime fallback getter ----
+
+/// Facade parity vs Pi `agent-session.ts`, two items: `clone_at` writes a NEW session file rather than mutating the
+/// original, and the runtime's `modelFallbackMessage` getter surfaces the message a fallback
+/// resolution left behind.
+#[tokio::test]
+async fn clone_at_creates_new_file_and_runtime_surfaces_fallback() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider.clone(), base_config(&fx)).build().await.unwrap();
+
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let _ = session.prompt("hi").await.unwrap();
+    session.wait_for_idle().await;
+
+    let original = session.session_id().clone();
+    let cloned = session.clone_at(None).await.unwrap();
+    assert_ne!(cloned, original, "clone_at branches into a distinct session id");
+
+    // Runtime re-surfaces the (absent) model-fallback message of its active session.
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime = crate::AgentSessionRuntime::create(factory, SessionTarget::New)
+        .await
+        .unwrap();
+    assert!(runtime.model_fallback_message().await.is_none(), "clean model resolve = no fallback");
 }

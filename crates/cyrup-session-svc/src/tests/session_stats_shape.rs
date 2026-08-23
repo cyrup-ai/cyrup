@@ -25,37 +25,14 @@
 //! `branch_summary`/`compaction` `entry.usage` back in (`agent-session.ts:3120-3122`). cyrup used to
 //! recompute from `messages()` — the rebuilt, LLM-flattened, POST-compaction context — so every
 //! compaction silently erased the tokens it had already billed the user for.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyrup_core::StopReason;
 use cyrup_provider::Provider;
 use cyrup_provider::faux::{FauxProvider, faux_assistant_message, faux_text};
-use crate::{SessionBuilder, SessionConfig};
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg
-}
+use super::common::{base_config, fixture};
+use crate::SessionBuilder;
 
 /// Compaction settings that force even a small session to compact (keep nothing, reserve nothing).
 fn aggressive_compaction_settings() -> cyrup_config::Settings {

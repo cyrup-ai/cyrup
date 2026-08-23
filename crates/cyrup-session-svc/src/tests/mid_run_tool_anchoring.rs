@@ -20,9 +20,7 @@
 //!
 //! These tests assert the OBSERVABLE contract, from the provider request the agent actually built:
 //! not before the anchor, yes from the anchor onward, actually executed, still permission-gated.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -31,33 +29,11 @@ use cyrup_provider::faux::{
     faux_assistant_message, faux_text, faux_tool_call, FauxProvider, FauxResponseStep,
 };
 use cyrup_provider::Provider;
-use crate::{AgentSession, SessionBuilder, SessionConfig};
+use super::common::{base_config_no_extensions, fixture, Fixture};
+use crate::{AgentSession, SessionBuilder};
 use cyrup_tools::{PermissionPolicy, Rule};
-use tempfile::TempDir;
 
 // ------------------------------------------------------------------------------ fixtures ----
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
 
 /// A late-bound weak self-reference, so a tool built BEFORE the session can reach the session that
 /// ends up owning it — the same shape `SessionActivityHandle` uses inside the crate.
@@ -180,7 +156,7 @@ async fn session_with_loader(
 ) -> (Arc<AgentSession>, Arc<AtomicBool>) {
     let slot: SessionSlot = Arc::new(OnceLock::new());
     let late_ran = Arc::new(AtomicBool::new(false));
-    let mut cfg = base_config(fx);
+    let mut cfg = base_config_no_extensions(fx);
     cfg.permission_policy = policy;
     cfg.custom_tools = vec![
         Arc::new(LoaderTool { slot: slot.clone(), params: empty_schema() }) as Arc<dyn Tool>,
@@ -400,7 +376,7 @@ async fn the_anchor_survives_the_transcript_and_the_session_file() {
     assert_eq!(v["message"]["addedToolNames"], serde_json::json!(["late"]));
 
     // (3) And it comes back through the RESUME direction (`core_message_to_agent`).
-    let mut resume_cfg = base_config(&fx);
+    let mut resume_cfg = base_config_no_extensions(&fx);
     resume_cfg.target = crate::SessionTarget::Resume(session_file);
     let resumed =
         SessionBuilder::new(Arc::new(FauxProvider::new()) as Arc<dyn Provider>, resume_cfg)
@@ -515,7 +491,7 @@ async fn a_mid_run_added_tool_is_gated_by_the_extension_tool_call_seam() {
 
     let slot: SessionSlot = Arc::new(OnceLock::new());
     let late_ran = Arc::new(AtomicBool::new(false));
-    let mut cfg = base_config(&fx);
+    let mut cfg = base_config_no_extensions(&fx);
     // A native extension needs the extension host live.
     cfg.no_extensions = false;
     cfg.custom_tools = vec![

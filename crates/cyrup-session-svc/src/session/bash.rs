@@ -34,7 +34,7 @@ pub(super) struct BashCancelGuard<'a> {
 
 impl Drop for BashCancelGuard<'_> {
     fn drop(&mut self) {
-        AgentSession::lock(&self.session.bash_cancels).retain(|(id, _)| *id != self.id);
+        crate::sync::lock(&self.session.bash_cancels).retain(|(id, _)| *id != self.id);
     }
 }
 
@@ -70,7 +70,7 @@ impl AgentSession {
         // the `finally` (here: `_bash_guard`'s drop). Concurrent calls each keep their own.
         let cancel = self.session_cancel.child_token();
         let bash_cancel_id = self.next_bash_cancel_id();
-        Self::lock(&self.bash_cancels).push((bash_cancel_id, cancel.clone()));
+        crate::sync::lock(&self.bash_cancels).push((bash_cancel_id, cancel.clone()));
         let _bash_guard = BashCancelGuard { session: self, id: bash_cancel_id };
         let cwd = self.services.cwd.clone();
         // Managed bin dir (Pi `getBinDir()`, `config.ts:549`: `join(getAgentDir(), "bin")`), matching
@@ -230,7 +230,7 @@ impl AgentSession {
             timestamp: Some(now_ms()),
         };
         if self.is_streaming().await {
-            Self::lock(&self.pending_bash).push(msg);
+            crate::sync::lock(&self.pending_bash).push(msg);
             return;
         }
         self.append_bash_message(msg, &payload).await;
@@ -250,7 +250,7 @@ impl AgentSession {
     /// this session, so the lock is released before any token is fired.
     pub fn abort_bash(&self) {
         let snapshot: Vec<CancelToken> =
-            Self::lock(&self.bash_cancels).iter().map(|(_, c)| c.clone()).collect();
+            crate::sync::lock(&self.bash_cancels).iter().map(|(_, c)| c.clone()).collect();
         for c in snapshot {
             c.cancel();
         }
@@ -259,18 +259,18 @@ impl AgentSession {
     /// Whether ANY bash command is running (Pi `isBashRunning`, agent-session.ts:2839-2841
     /// @v0.83.0: `return this._bashAbortControllers.size > 0;`).
     pub fn is_bash_running(&self) -> bool {
-        !Self::lock(&self.bash_cancels).is_empty()
+        !crate::sync::lock(&self.bash_cancels).is_empty()
     }
 
     /// Whether deferred bash messages await flush (Pi `hasPendingBashMessages`, agent-session.ts:2670).
     pub fn has_pending_bash_messages(&self) -> bool {
-        !Self::lock(&self.pending_bash).is_empty()
+        !crate::sync::lock(&self.pending_bash).is_empty()
     }
 
     /// Flush deferred bash messages to the transcript + session (Pi `_flushPendingBashMessages`,
     /// agent-session.ts:2675). Called before a new prompt so ordering is intact.
     pub async fn flush_pending_bash_messages(&self) {
-        let pending: Vec<AgentMessage> = std::mem::take(&mut *Self::lock(&self.pending_bash));
+        let pending: Vec<AgentMessage> = std::mem::take(&mut *crate::sync::lock(&self.pending_bash));
         for msg in pending {
             if let AgentMessage::Custom { payload, .. } = &msg {
                 let payload = payload.clone();

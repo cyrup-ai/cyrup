@@ -30,11 +30,9 @@
 //! Deliberately native, not wasm: `crates/cyrup-it/tests/session_svc/wasm_slash_command.rs` covers
 //! the guest route and pays a nested `cargo build` for it. A native `Arc<dyn NativeExtension>` needs
 //! no build step, so these run in milliseconds and add no fixture-target directory to `/tmp`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::{ExtensionId, Message, StopReason};
@@ -43,8 +41,8 @@ use cyrup_ext::{
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use crate::{NotifyKind, SessionBuilder, SessionConfig, UiEffect};
-use tempfile::TempDir;
+use super::common::{base_config, base_config_no_extensions, fixture, Fixture};
+use crate::{NotifyKind, SessionBuilder, UiEffect};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// What a registered command's handler should answer with. One native extension registers one
@@ -122,30 +120,6 @@ impl NativeExtension for ScriptedCommands {
     }
 }
 
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    // Only the explicitly-registered native extension is present — no on-disk auto-discovery, so a
-    // stray extension in the developer's home cannot add or answer a command here.
-    cfg.no_extensions = true;
-    cfg
-}
-
 fn faux_with_ok() -> Arc<FauxProvider> {
     let faux = Arc::new(FauxProvider::new());
     // Enough scripted responses for the fall-through prompts these tests send; unused entries are
@@ -196,7 +170,7 @@ async fn session_with(
 ) -> (crate::AgentSession, UnboundedReceiver<UiEffect>, Arc<AtomicUsize>) {
     let ran = Arc::new(AtomicUsize::new(0));
     let ext = Arc::new(ScriptedCommands { commands, ran: ran.clone() });
-    let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config(fx))
+    let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config_no_extensions(fx))
         .with_native_extension(ext)
         .build()
         .await
@@ -415,7 +389,7 @@ async fn headless_session_without_a_ui_sink_still_handles_the_command() {
         ran: ran.clone(),
     });
     // NOTE: no `set_ui_effect_sink` — this is the headless shape.
-    let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config(&fx))
+    let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config_no_extensions(&fx))
         .with_native_extension(ext)
         .build()
         .await
@@ -455,5 +429,73 @@ async fn the_facade_layer_does_carry_the_payload() {
         handler_result.expect("the handler returned Ok").as_deref(),
         Some("REPORT-OUTPUT [args=weekly]"),
         "the facade hands the caller the handler's payload — dropping it is the caller's bug"
+    );
+}
+
+// ==================== the same dispatch seen from the PROMPT side: it short-circuits ====
+
+/// A native extension registering a `/greet` command whose handler records its args + returns text.
+struct GreetCommand(Arc<Mutex<Vec<String>>>);
+#[async_trait::async_trait]
+impl NativeExtension for GreetCommand {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("greet-command")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.register_command(
+            "greet",
+            CommandDescriptor { description: "greet someone".into(), completions: vec![] },
+        );
+        Ok(())
+    }
+    async fn on_event(&self, _ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        HookOutcome::Noop
+    }
+    async fn execute_command(
+        &self,
+        _name: &str,
+        args: &str,
+        ctx: &HostCtx,
+    ) -> Result<Option<String>, ExtError> {
+        // A command runs command-tier (session mutation allowed): the deadlock guard must pass.
+        ctx.require_command_tier()?;
+        self.0.lock().unwrap().push(args.to_string());
+        Ok(Some(format!("hello {args}")))
+    }
+}
+
+/// gap-09 #13 (native residue) — slash `_tryExecuteExtensionCommand` *exec* dispatch for NATIVE
+/// extensions (Pi agent-session.ts:1004-1013,1148-1172): a `/<cmd>` matching a registered native
+/// command runs its command-tier handler and short-circuits — no user message is sent/persisted
+/// (Pi's `_tryExecuteExtensionCommand` returns `true` -> the prompt is consumed).
+#[tokio::test]
+async fn native_slash_command_executes_and_short_circuits_the_prompt() {
+    let fx = fixture();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config(&fx))
+        .with_native_extension(Arc::new(GreetCommand(calls.clone())))
+        .build()
+        .await
+        .unwrap();
+
+    let _ = session.prompt("/greet world").await.unwrap();
+    session.wait_for_idle().await;
+
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        vec!["world".to_string()],
+        "the native command handler ran with the parsed args"
+    );
+    assert!(
+        user_texts(&session.messages().await).iter().all(|t| !t.contains("/greet")),
+        "the slash command was consumed — no user message was sent to the model"
+    );
+
+    // A `/unknown` command (no native owner) is NOT consumed: it falls through to a normal prompt.
+    let _ = session.prompt("/unknown stuff").await.unwrap();
+    session.wait_for_idle().await;
+    assert!(
+        user_texts(&session.messages().await).iter().any(|t| t.contains("/unknown stuff")),
+        "an unmatched slash command falls through to normal prompt handling"
     );
 }

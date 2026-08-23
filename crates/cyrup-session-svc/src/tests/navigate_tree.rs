@@ -1,45 +1,16 @@
-//! Round-5 facade parity tests for the unified `/tree` navigation op (gap #15, Pi
-//! `agent-session.ts:2704-2895` `navigateTree`): re-editing a user message, the no-op short-circuit,
-//! branch summarization with custom instructions, label attachment, the `session_before_tree` veto,
-//! and the `SessionCommand::NavigateTree` seam.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+//! The unified `/tree` navigation op (gap #15, Pi `agent-session.ts:2704-2895` `navigateTree`):
+//! every arm of the one operation, from both the facade method and the
+//! `SessionCommand::NavigateTree` seam. Each test names the arm it pins.
 
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use cyrup_core::{Content, EntryId, ExtensionId, Message, StopReason};
-use cyrup_ext::{
-    EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
-};
-use cyrup_provider::faux::{
-    faux_assistant_message, faux_text, FauxProvider, FauxResponseStep,
-};
+use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
 use cyrup_provider::Provider;
+use super::common::{base_config, fixture};
 use crate::{
-    NavigateTreeOptions, SessionBuilder, SessionCommand, SessionCommandOutput, SessionConfig,
-};
-use tempfile::TempDir;
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg
-}
+    NavigateTreeOptions, SessionBuilder, SessionCommand, SessionCommandOutput, };
 
 /// Concatenate the text of a core `user` message (the faux summary call's prompt lives here).
 fn user_text(m: &Message) -> Option<String> {

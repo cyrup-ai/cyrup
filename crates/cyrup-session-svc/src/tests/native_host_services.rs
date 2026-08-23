@@ -12,24 +12,25 @@
 //!
 //! This proves native code genuinely reaches id/file/dialogs/message-injection through the ONE shared
 //! seam every remaining cyrup-ext-subagents blocker + both companions close on — not stubs.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+//!
+//! The second test covers the SYNC `control()` half of the same backend — the path a wasm-suspended
+//! guest takes, where the op is queued and then drained + applied at the command-tier-safe point.
 
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use cyrup_agent::AgentMessage;
-use cyrup_core::{ExtensionId, StopReason};
+use cyrup_core::{Content, ExtensionId, Message, StopReason};
 use cyrup_ext::{
+    ControlOp,
     DialogOptions, ExtError, HostCtx, HostEvent, HookOutcome, HostServices, InitApi, NativeExtension,
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
-use crate::{
-    AgentSessionEvent, SessionBuilder, SessionConfig, UiKind, UiReply, UiRequest,
-};
+use super::common::{base_config, fixture};
+use crate::{AgentSessionEvent, SessionBuilder, UiKind, UiReply, UiRequest};
 use futures::StreamExt;
-use tempfile::TempDir;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Notify;
 
@@ -107,25 +108,23 @@ impl NativeExtension for ProbeExt {
     }
 }
 
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg
+/// Every user-message text in `messages`, in order.
+fn user_texts(messages: &[Message]) -> Vec<String> {
+    messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::User { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|c| match c {
+                        Content::Text { text, .. } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect()
 }
 
 fn faux_with_ok() -> Arc<FauxProvider> {
@@ -245,5 +244,71 @@ async fn native_background_task_reaches_live_host_services() {
         session.last_assistant_text().await.as_deref(),
         Some("ok"),
         "the injected turn ran end-to-end and produced the assistant response"
+    );
+}
+
+// ============ the SYNC `control()` path the same backend serves to a wasm-suspended guest ====
+
+/// gap-09 §08 ledger row — `LiveHostServices` injected as the live capability backend: a loaded
+/// extension's `control` capability (Pi `createCommandContext`, agent-session.ts:1158) reaches a
+/// REAL session effect via the command-tier control channel. Here we exercise the SYNC `control()`
+/// path a guest would hit (the guest is wasm-suspended), then drain + apply at the command-tier-safe
+/// point — proving the backend reaches the running session without needing the gated guest E2E.
+#[tokio::test]
+async fn live_host_services_control_reaches_a_real_session_effect() {
+    let fx = fixture();
+    let session = SessionBuilder::new(faux_with_ok() as Arc<dyn Provider>, base_config(&fx))
+        .build()
+        .await
+        .unwrap();
+
+    // Simulate the guest's `session.sendUserMessage("from-extension")` capability call.
+    session
+        .services()
+        .host_services
+        .control(ControlOp::SendUserMessage {
+            content: "from-extension".into(),
+            opts: serde_json::Value::Null,
+        })
+        .expect("control routes to the wired channel (LiveHostServices::wire_control_channel)");
+
+    // The runtime drains + applies queued control ops at a command-tier-safe point.
+    session.apply_pending_control().await;
+    session.wait_for_idle().await;
+
+    assert!(
+        user_texts(&session.messages().await).iter().any(|t| t.contains("from-extension")),
+        "the extension-driven control op produced a real session effect (the user message ran)"
+    );
+
+    // SEAM-003 rewrite of this assertion. It used to read:
+    //
+    //     let deferred = session.apply_pending_control().await;
+    //     assert_eq!(deferred.len(), 1, "Reload is runtime-tier — handed back to the runtime");
+    //
+    // which encoded the defect: `apply_pending_control` returned the runtime-tier ops "for the
+    // runtime to act on", and its only production caller did `let _deferred = …`. Nothing ever
+    // acted. `apply_pending_control` is now a SINK — a runtime-tier op is routed to the installed
+    // `RuntimeActions` (see `src/tests/control_ops.rs` for the positive, end-to-end proof), and on
+    // a BARE session like this one — built straight from `SessionBuilder`, never installed into an
+    // `AgentSessionRuntime` — there is no host to route to, so the op is REPORTED (a `tracing::warn`
+    // naming `SessionServiceError::NoRuntimeHost("reload")`) rather than silently dropped. What is
+    // asserted here is that the drain consumes it and leaves the session healthy.
+    session
+        .services()
+        .host_services
+        .control(ControlOp::Reload)
+        .expect("control routes to the channel");
+    session.apply_pending_control().await;
+    assert!(
+        session.services().host_services.take_pending_control().is_empty(),
+        "the drain CONSUMED the runtime-tier op (it is not left queued for a caller that never comes)"
+    );
+    // The session is unharmed by a runtime-tier op it cannot service.
+    let _ = session.prompt("still alive").await.unwrap();
+    session.wait_for_idle().await;
+    assert!(
+        user_texts(&session.messages().await).iter().any(|t| t.contains("still alive")),
+        "a runtime-tier op with no runtime host installed degrades cleanly"
     );
 }

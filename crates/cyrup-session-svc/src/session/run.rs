@@ -175,7 +175,7 @@ impl AgentSession {
         // (agent-session.ts:1069 @v0.83.0), BEFORE the bash flush and the settle emit — a
         // `before_agent_start` replacement is scoped to its own run and must not survive into the
         // next one (DRIFT-033).
-        *Self::lock(&self.system_prompt_override) = None;
+        *crate::sync::lock(&self.system_prompt_override) = None;
         // Pi `finally` (agent-session.ts:982-984): flush deferred bash messages from this turn.
         self.flush_pending_bash_messages().await;
         // SEAM-005: the run has FULLY settled — the post-run loop above is done, so no retry,
@@ -216,14 +216,14 @@ impl AgentSession {
     /// sequence, run a post-run threshold/overflow compaction, or continue for `agent_end`-queued
     /// messages. Returns `true` when the driver should `agent.continue()`.
     async fn handle_post_agent_run(&self) -> bool {
-        let Some(msg) = Self::lock(&self.last_assistant).take() else { return false };
+        let Some(msg) = crate::sync::lock(&self.last_assistant).take() else { return false };
         // Retryable transient error → backoff + continue (Pi :991-993).
         if self.is_retryable_error(&msg) && self.prepare_retry(&msg).await {
             return true;
         }
         // A terminal error with a spent / non-retryable budget closes the retry sequence (Pi :995-1003).
         if msg.stop_reason == cyrup_core::StopReason::Error && self.retry_attempt() > 0 {
-            let attempt = std::mem::replace(&mut *Self::lock(&self.retry_attempt), 0);
+            let attempt = std::mem::replace(&mut *crate::sync::lock(&self.retry_attempt), 0);
             self.fanout_emit(AgentSessionEvent::AutoRetryEnd {
                 success: false,
                 attempt,
@@ -244,18 +244,18 @@ impl AgentSession {
     /// the message text matches a queued steer/follow-up mirror entry, drop it and emit `queue_update`
     /// as the agent drains the queue.
     pub(crate) async fn on_user_message_start(&self, message: &AgentMessage) {
-        *Self::lock(&self.overflow_recovery_attempted) = false;
+        *crate::sync::lock(&self.overflow_recovery_attempted) = false;
         let Some(text) = agent_user_text(message) else { return };
         let mut drained = false;
         {
-            let mut steer = Self::lock(&self.steering_messages);
+            let mut steer = crate::sync::lock(&self.steering_messages);
             if let Some(pos) = steer.iter().position(|m| *m == text) {
                 steer.remove(pos);
                 drained = true;
             }
         }
         if !drained {
-            let mut fu = Self::lock(&self.follow_up_messages);
+            let mut fu = crate::sync::lock(&self.follow_up_messages);
             if let Some(pos) = fu.iter().position(|m| *m == text) {
                 fu.remove(pos);
                 drained = true;
@@ -271,13 +271,13 @@ impl AgentSession {
     /// a non-error response — clear the overflow latch and reset the retry counter, emitting
     /// `auto_retry_end{success:true}` if a retry sequence was in flight.
     pub(crate) async fn on_assistant_message_end(&self, assistant: &AssistantMessage) {
-        *Self::lock(&self.last_assistant) = Some(assistant.clone());
+        *crate::sync::lock(&self.last_assistant) = Some(assistant.clone());
         if assistant.stop_reason == cyrup_core::StopReason::Error {
             return;
         }
-        *Self::lock(&self.overflow_recovery_attempted) = false;
+        *crate::sync::lock(&self.overflow_recovery_attempted) = false;
         let attempt = {
-            let mut at = Self::lock(&self.retry_attempt);
+            let mut at = crate::sync::lock(&self.retry_attempt);
             let v = *at;
             if v > 0 {
                 *at = 0;
@@ -421,7 +421,7 @@ impl AgentSession {
         // first turn of a modelless first run (SEAM-075): the answer is the `/login` → `/model`
         // instruction, surfaced as an error on the turn, never a process exit.
         {
-            let model = Self::lock(&self.compaction_model)
+            let model = crate::sync::lock(&self.compaction_model)
                 .clone()
                 .ok_or(SessionServiceError::NoModelSelected)?;
             // PROV-037 — pi's refusal is a THREE-branch decision, not one
@@ -519,7 +519,7 @@ impl AgentSession {
         let user_msg = input.into_agent_message();
         // Drain any messages staged for this turn (Pi `_pendingNextTurnMessages`,
         // agent-session.ts:1099-1103); they are injected AFTER the user message in the run input.
-        let pending: Vec<AgentMessage> = std::mem::take(&mut *Self::lock(&self.pending_next_turn));
+        let pending: Vec<AgentMessage> = std::mem::take(&mut *crate::sync::lock(&self.pending_next_turn));
 
         // The LIVE base (Pi reads the mutable field: `this._baseSystemPrompt`, agent-session.ts:1228
         // into `emitBeforeAgentStart`, :1252 for the reset) — NOT the frozen builder-assembled
@@ -532,7 +532,7 @@ impl AgentSession {
             // No handler ran, so there is nothing to override with — pi's `else` branch
             // (agent-session.ts:1251 @v0.83.0) clears the slot for exactly this reason, and a stale
             // override from a PREVIOUS run must not leak into this one.
-            *Self::lock(&self.system_prompt_override) = None;
+            *crate::sync::lock(&self.system_prompt_override) = None;
             let mut messages = vec![user_msg];
             messages.extend(pending);
             return messages;
@@ -584,16 +584,16 @@ impl AgentSession {
             // therefore read as "no override", which agrees with pi on the resulting prompt for
             // every input and differs only in which slot holds the identical text.
             if system_prompt == base {
-                *Self::lock(&self.system_prompt_override) = None;
+                *crate::sync::lock(&self.system_prompt_override) = None;
                 self.agent.set_system_prompt(base.clone()).await;
             } else {
-                *Self::lock(&self.system_prompt_override) = Some(system_prompt.clone());
+                *crate::sync::lock(&self.system_prompt_override) = Some(system_prompt.clone());
                 self.agent.set_system_prompt(system_prompt).await;
             }
             messages.extend(injected.iter().map(core_message_to_agent));
         } else {
             // Blocked/Handled (no Pi analogue here): keep the base prompt, no injection.
-            *Self::lock(&self.system_prompt_override) = None;
+            *crate::sync::lock(&self.system_prompt_override) = None;
             self.agent.set_system_prompt(base.clone()).await;
         }
         messages
@@ -623,7 +623,7 @@ impl AgentSession {
             self.throw_if_extension_command(&ui.text)?;
             ui.text = self.expand_input_text(&ui.text);
         }
-        Self::lock(&self.steering_messages).push(ui.text.clone());
+        crate::sync::lock(&self.steering_messages).push(ui.text.clone());
         self.agent.steer(ui.into_agent_message());
         self.emit_queue_update().await;
         Ok(PromptAccepted::Queued(StreamingBehavior::Steer))
@@ -642,7 +642,7 @@ impl AgentSession {
             self.throw_if_extension_command(&ui.text)?;
             ui.text = self.expand_input_text(&ui.text);
         }
-        Self::lock(&self.follow_up_messages).push(ui.text.clone());
+        crate::sync::lock(&self.follow_up_messages).push(ui.text.clone());
         self.agent.follow_up(ui.into_agent_message());
         self.emit_queue_update().await;
         Ok(PromptAccepted::Queued(StreamingBehavior::FollowUp))

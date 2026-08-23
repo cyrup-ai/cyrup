@@ -1,3 +1,8 @@
+//! Project trust: who DECIDES it (EXT-003, the extension verdict and where it slots against the
+//! `--approve` override, the saved decision and the prompt), and what the decision then GATES —
+//! the project resources a session loads and the `/trust` + `/settings` write seams the selectors
+//! source from.
+//!
 //! EXT-003 — the `project_trust` event must actually decide the session's trust.
 //!
 //! Pi resolves project trust through the extensions: `resource-loader.ts:378-399` loads a THROWAWAY
@@ -12,9 +17,7 @@
 //! them, because trust was frozen in builder step 1 while the `ExtensionHost` was not built until
 //! step 4b. These tests assert on the ASSEMBLED SESSION's trust, and on whether the handler ran at
 //! all — never on a registration returning `Ok`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -22,8 +25,10 @@ use cyrup_core::ExtensionId;
 use cyrup_ext::{
     EventKind, ExtError, HandledValue, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
 };
-use cyrup_provider::faux::FauxProvider;
+use cyrup_core::StopReason;
+use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use super::common::{base_config, fixture, Fixture};
 use crate::{SessionBuilder, SessionConfig};
 use serde_json::json;
 use tempfile::TempDir;
@@ -79,12 +84,6 @@ impl NativeExtension for TrustVoter {
     }
 }
 
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
 /// A cwd that HAS trust-requiring resources — `<cwd>/.cyrup/skills` is one of
 /// `has_trust_requiring_resources`'s markers (cyrup-config trust.rs:196-221). Without it Pi's
 /// `shouldResolveProjectTrust` guard (main.ts:676-678) correctly declines to ask anyone.
@@ -93,15 +92,6 @@ fn fixture_with_trust_requiring_resources() -> Fixture {
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
     std::fs::create_dir_all(cwd.join(".cyrup/skills")).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn fixture_bare() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
     std::fs::create_dir_all(&agent_dir).unwrap();
     Fixture { _tmp: tmp, cwd, agent_dir }
 }
@@ -180,7 +170,7 @@ async fn an_explicit_trust_override_never_asks_the_extensions() {
 /// The other half of the guard: a cwd with nothing to gate is trusted without asking anyone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_project_with_nothing_to_gate_never_asks_the_extensions() {
-    let fx = fixture_bare();
+    let fx = fixture();
     let (voter, asked, inits) = TrustVoter::new("no", false);
 
     let session = build_with(&fx, None, voter).await;
@@ -399,4 +389,93 @@ async fn no_prompt_callback_is_pis_no_ui_branch() {
         .await
         .unwrap();
     assert!(!session.services().settings.project_trusted());
+}
+
+// ================== what the VERDICT decides: whether project resources are loaded ====
+
+/// Writes an `AGENTS.md` carrying `marker` into the fixture's project tree — the cheapest
+/// trust-gated project resource.
+fn write_agents_md(fx: &Fixture, marker: &str) {
+    std::fs::write(fx.cwd.join("AGENTS.md"), format!("# Project\n{marker}\n")).unwrap();
+}
+
+#[tokio::test]
+async fn trust_gated_context_files() {
+    let fx = fixture();
+    write_agents_md(&fx, "TRUST_GATED_MARKER");
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+
+    // Untrusted (--no-approve): project context files are NOT loaded (R-06-009).
+    let mut untrusted = base_config(&fx);
+    untrusted.trust_override = Some(false);
+    let s_untrusted = SessionBuilder::new(faux.clone(), untrusted).build().await.unwrap();
+    assert!(
+        !s_untrusted.system_prompt().contains("TRUST_GATED_MARKER"),
+        "untrusted session must not inject project context"
+    );
+    assert!(!s_untrusted.services().project_trusted);
+
+    // Trusted (--approve): the project AGENTS.md is injected.
+    let mut trusted = base_config(&fx);
+    trusted.trust_override = Some(true);
+    let s_trusted = SessionBuilder::new(faux, trusted).build().await.unwrap();
+    assert!(
+        s_trusted.system_prompt().contains("TRUST_GATED_MARKER"),
+        "trusted session must inject project context"
+    );
+    assert!(s_trusted.services().project_trusted);
+}
+
+// ----------------------------------------------------------------------------------------------
+// L6↔L5 additive data seams the TUI `/trust`, `/settings`, and `/resume` selectors source from
+// (round 7): trust options + write, settings persist, session list.
+// ----------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn trust_settings_and_session_list_seams() {
+    use crate::{SettingsScope, TrustDecision};
+
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx)).build().await.expect("build");
+
+    // ---- /trust: options + write + saved-decision readback ----
+    let options = session.project_trust_options();
+    assert!(options.iter().any(|o| o.label == "Trust" && o.trusted));
+    assert!(options.iter().any(|o| o.label == "Do not trust" && !o.trusted));
+    assert_eq!(session.saved_trust_decision(), None, "no decision persisted yet");
+
+    // Persist the "Trust" option's store updates → writes agent_dir/trust.json.
+    let trust_opt = options.iter().find(|o| o.label == "Trust").expect("trust option");
+    session.write_project_trust(&trust_opt.updates).expect("write trust");
+    assert!(session.trust_store_path().exists(), "trust.json written");
+    let saved = session.saved_trust_decision().expect("decision now persisted");
+    assert!(saved.decision.is_trusted(), "persisted decision is trusted");
+
+    // Round-trip an explicit untrusted decision.
+    session
+        .write_project_trust(&[(fx.cwd.clone(), Some(TrustDecision::Untrusted))])
+        .expect("write untrusted");
+    assert!(!session.saved_trust_decision().expect("decision").decision.is_trusted());
+
+    // ---- /settings: persist via the `&self` write seam (the default builder store is in-memory,
+    // so this verifies the seam round-trips without error, including the project trust gate). ----
+    session
+        .persist_setting(SettingsScope::Global, "terminal.showImages", serde_json::json!(false))
+        .expect("persist global setting");
+    session
+        .persist_setting(SettingsScope::Project, "quietStartup", serde_json::json!(true))
+        .expect("persist project setting (trusted)");
+
+    // ---- /resume: the session list includes this session (after a turn flushes it to disk) ----
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+    let _stream = session.prompt("hello world").await.expect("prompt");
+    session.wait_for_idle().await;
+    let sessions = session.list_sessions();
+    assert!(
+        sessions.iter().any(|s| s.id.to_string() == session.session_id().to_string()),
+        "current session appears in the resume list ({} found)",
+        sessions.len()
+    );
 }

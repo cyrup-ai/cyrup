@@ -20,7 +20,6 @@
 //! `mod wasm_ext` half DOES drive a real `wasm32-wasip2` component and moved to
 //! `crates/cyrup-it/tests/session_svc/install_noop.rs`; the small helpers the two halves shared
 //! (`write`, `Fx`, `fixture`) are duplicated across the split rather than exported.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

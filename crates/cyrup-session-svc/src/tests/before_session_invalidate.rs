@@ -35,9 +35,7 @@
 //! is an after-the-fact notification (cyrup's stand-in for pi's `setRebindSession`, and what
 //! `cyrup-tui`'s `rebind_session` is driven by), so a watcher only wakes once the outgoing session
 //! is already gone.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -45,8 +43,8 @@ use cyrup_core::ExtensionId;
 use cyrup_ext::{EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension};
 use cyrup_provider::faux::FauxProvider;
 use cyrup_provider::Provider;
+use super::common::{fixture, Fixture};
 use crate::{AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget};
-use tempfile::TempDir;
 
 // ------------------------------------------------------------------------------- harness ----
 
@@ -85,24 +83,10 @@ impl NativeExtension for PhaseRecorder {
     }
 }
 
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
+/// [`super::common::base_config`] with persistence off: these tests assert over what an
+/// UNSAVED session does, so nothing may be written to the session store.
 fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
+    let mut cfg = super::common::base_config(fx);
     cfg.persist = false;
     cfg
 }

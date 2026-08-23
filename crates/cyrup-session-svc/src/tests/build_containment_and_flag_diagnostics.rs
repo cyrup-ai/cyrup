@@ -1,3 +1,7 @@
+//! What `SessionBuilder::build` REPORTS instead of failing on: a native extension whose `init`
+//! errored, an unknown CLI flag, a model that no longer resolves — plus the flags that decide which
+//! extension roots are discovered in the first place.
+//!
 //! EXT-S01 + SEAM-S01 — two build-time failure modes that must be CONTAINED and REPORTED, not
 //! swallowed (EXT-S01) or fatal (SEAM-S01).
 //!
@@ -33,21 +37,22 @@
 //! `runtime.diagnostics` (agent-session-services.ts:98-125, merged at `:182`) and makes the bin
 //! exit 1 (`main.ts:843-848`). Asserted here at the `AgentSessionRuntime::diagnostics()` seam the
 //! bin's new checkpoint consumes.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use cyrup_core::ExtensionId;
+use cyrup_core::{ExtensionId, StopReason};
 use cyrup_ext::{ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
-use cyrup_provider::faux::FauxProvider;
+use cyrup_provider::faux::{
+    faux_assistant_message, faux_text, FauxConfig, FauxModelDefinition, FauxProvider,
+};
 use cyrup_provider::Provider;
+use super::common::{base_config, base_config_no_extensions, fixture, Fixture};
 use crate::{
     AgentSessionRuntime, ExtensionFlagValue, SessionBuilder, SessionConfig, SessionFactory,
     SessionTarget,
 };
-use tempfile::TempDir;
 
 /// A native built-in whose `init()` always fails — the EXT-S01 trigger.
 struct FailingExt {
@@ -88,28 +93,6 @@ impl NativeExtension for MarkerExt {
     }
 }
 
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
-
 fn faux() -> Arc<dyn Provider> {
     Arc::new(FauxProvider::new())
 }
@@ -124,7 +107,7 @@ async fn a_failing_native_init_is_contained_and_recorded_not_fatal() {
     let fx = fixture();
     let reached = Arc::new(AtomicBool::new(false));
 
-    let session = SessionBuilder::new(faux(), base_config(&fx))
+    let session = SessionBuilder::new(faux(), base_config_no_extensions(&fx))
         .with_native_extension(Arc::new(FailingExt { id: "permission-system" })
             as Arc<dyn NativeExtension>)
         .with_native_extension(Arc::new(MarkerExt { id: "intercom", inited: reached.clone() })
@@ -166,7 +149,7 @@ async fn a_failing_native_init_is_contained_and_recorded_not_fatal() {
 #[tokio::test]
 async fn every_failing_native_is_recorded_independently() {
     let fx = fixture();
-    let session = SessionBuilder::new(faux(), base_config(&fx))
+    let session = SessionBuilder::new(faux(), base_config_no_extensions(&fx))
         .with_native_extension(Arc::new(FailingExt { id: "alpha" }) as Arc<dyn NativeExtension>)
         .with_native_extension(Arc::new(FailingExt { id: "beta" }) as Arc<dyn NativeExtension>)
         .build()
@@ -188,7 +171,7 @@ async fn every_failing_native_is_recorded_independently() {
 async fn a_clean_native_load_records_no_extension_diagnostics() {
     let fx = fixture();
     let reached = Arc::new(AtomicBool::new(false));
-    let session = SessionBuilder::new(faux(), base_config(&fx))
+    let session = SessionBuilder::new(faux(), base_config_no_extensions(&fx))
         .with_native_extension(Arc::new(MarkerExt { id: "ok-ext", inited: reached.clone() })
             as Arc<dyn NativeExtension>)
         .build()
@@ -202,7 +185,7 @@ async fn a_clean_native_load_records_no_extension_diagnostics() {
 // =============================================================================== SEAM-S01 =======
 
 fn config_with_flags(fx: &Fixture, flags: &[(&str, ExtensionFlagValue)]) -> SessionConfig {
-    let mut cfg = base_config(fx);
+    let mut cfg = base_config_no_extensions(fx);
     cfg.extension_flag_values =
         flags.iter().map(|(n, v)| ((*n).to_string(), v.clone())).collect();
     cfg
@@ -233,7 +216,7 @@ async fn an_unknown_cli_flag_becomes_a_runtime_error_diagnostic() {
 #[tokio::test]
 async fn no_captured_flags_means_no_flag_diagnostics() {
     let fx = fixture();
-    let clean = SessionBuilder::new(faux(), base_config(&fx)).build().await.expect("build");
+    let clean = SessionBuilder::new(faux(), base_config_no_extensions(&fx)).build().await.expect("build");
     assert!(clean.services().startup_diagnostics.flags.is_empty());
 
     let cfg = config_with_flags(
@@ -271,7 +254,7 @@ async fn no_captured_flags_means_no_flag_diagnostics() {
 async fn a_contained_native_failure_is_a_fatal_runtime_diagnostic_in_every_mode() {
     let fx = fixture();
     let reached = Arc::new(AtomicBool::new(false));
-    let factory = SessionFactory::new(faux(), base_config(&fx))
+    let factory = SessionFactory::new(faux(), base_config_no_extensions(&fx))
         .with_native_extension(Arc::new(FailingExt { id: "permission-system" })
             as Arc<dyn NativeExtension>)
         .with_native_extension(Arc::new(MarkerExt { id: "intercom", inited: reached.clone() })
@@ -300,7 +283,7 @@ async fn a_contained_native_failure_is_a_fatal_runtime_diagnostic_in_every_mode(
 #[tokio::test]
 async fn the_failure_reaches_the_panel_and_the_exit_channel_together() {
     let fx = fixture();
-    let factory = SessionFactory::new(faux(), base_config(&fx))
+    let factory = SessionFactory::new(faux(), base_config_no_extensions(&fx))
         .with_native_extension(Arc::new(FailingExt { id: "subagents" })
             as Arc<dyn NativeExtension>);
     let runtime = AgentSessionRuntime::create(Arc::new(factory), SessionTarget::New)
@@ -324,7 +307,7 @@ async fn the_failure_reaches_the_panel_and_the_exit_channel_together() {
 async fn a_clean_build_produces_no_fatal_diagnostic() {
     let fx = fixture();
     let reached = Arc::new(AtomicBool::new(false));
-    let factory = SessionFactory::new(faux(), base_config(&fx))
+    let factory = SessionFactory::new(faux(), base_config_no_extensions(&fx))
         .with_native_extension(Arc::new(MarkerExt { id: "ok-ext", inited: reached.clone() })
             as Arc<dyn NativeExtension>);
     let runtime = AgentSessionRuntime::create(Arc::new(factory), SessionTarget::New)
@@ -344,7 +327,7 @@ async fn a_corrupt_disk_extension_is_fatal_too() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("broken.wasm"), b"this is not a wasm component").unwrap();
 
-    let mut cfg = base_config(&fx);
+    let mut cfg = base_config_no_extensions(&fx);
     cfg.no_extensions = false; // the global root is only scanned when extensions are enabled
     let runtime =
         AgentSessionRuntime::create(Arc::new(SessionFactory::new(faux(), cfg)), SessionTarget::New)
@@ -373,7 +356,7 @@ async fn an_untrusted_project_extension_is_reported_but_never_fatal() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("local.wasm"), b"this is not a wasm component").unwrap();
 
-    let mut cfg = base_config(&fx);
+    let mut cfg = base_config_no_extensions(&fx);
     cfg.no_extensions = false;
     cfg.trust_override = Some(false); // an untrusted project
     let runtime =
@@ -395,5 +378,91 @@ async fn an_untrusted_project_extension_is_reported_but_never_fatal() {
     assert!(
         !diags.iter().any(|d| d.severity == "error"),
         "an untrusted project must not exit 1; got {diags:?}"
+    );
+}
+
+// ============================================================================ #24 diagnostics ====
+
+/// gap #24: the runtime `diagnostics` getter — empty on a clean build, and STILL empty when a
+/// resumed session's saved model is gone from the catalog, because pi keeps `modelFallbackMessage`
+/// out of `diagnostics`: it is a separate constructor argument
+/// (`new AgentSessionRuntime(session, services, createRuntime, result.diagnostics,
+/// result.modelFallbackMessage)`, agent-session-runtime.ts:425-431) whose only reader is the
+/// interactive `showWarning` (interactive-mode.ts:883-884). `reportDiagnostics` (main.ts:842) must
+/// not echo it, or every non-interactive run prints the banner twice.
+#[tokio::test]
+async fn model_restore_fallback_is_carried_beside_diagnostics_not_inside_them() {
+    let fx = fixture();
+
+    // Session 1 persists a `model_change` for `faux/faux-1` (a driven turn flushes the file).
+    let faux1 = Arc::new(FauxProvider::new());
+    faux1.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let p1: Arc<dyn Provider> = faux1.clone();
+    let s1 = SessionBuilder::new(p1.clone(), base_config(&fx)).build().await.unwrap();
+    let session_file = s1.session_file().await.expect("session 1 persisted");
+    let _ = s1.prompt("hi").await.unwrap();
+    s1.wait_for_idle().await;
+    drop(s1);
+
+    // A clean runtime (fresh New session) has no diagnostics.
+    let clean_factory = Arc::new(SessionFactory::new(p1, base_config(&fx)));
+    let clean = AgentSessionRuntime::create(clean_factory, SessionTarget::New).await.unwrap();
+    assert!(clean.diagnostics().await.is_empty(), "a clean build has no diagnostics");
+
+    // Resume session 1 with a provider whose catalog LACKS `faux-1` → model restore fails →
+    // a `modelFallbackMessage` is produced and surfaced as a runtime diagnostic.
+    let other = FauxConfig { models: vec![FauxModelDefinition::new("other-1")], ..FauxConfig::default() };
+    let p2: Arc<dyn Provider> = Arc::new(FauxProvider::with_config(other));
+    let factory2 = Arc::new(SessionFactory::new(p2, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory2, SessionTarget::Resume(session_file))
+        .await
+        .unwrap();
+
+    // The fallback IS produced and IS reachable — on its own getter, exactly as pi carries it.
+    let fallback = runtime
+        .model_fallback_message()
+        .await
+        .expect("an unrestorable saved model produces a modelFallbackMessage");
+    assert!(fallback.contains("faux-1"), "message names the unrestorable model: {fallback}");
+    // …and it is NOT duplicated into the diagnostics array that `reportDiagnostics` prints.
+    let diags = runtime.diagnostics().await;
+    assert!(
+        diags.is_empty(),
+        "pi's `services.diagnostics` carries no model entry; got {diags:?}"
+    );
+}
+
+// ---- extension flag threading (Pi resourceLoaderOptions additionalExtensionPaths/noExtensions,
+// main.ts:660,664). The `--extension`/`--no-extensions` flags must reach the discovery roots. ----
+
+#[test]
+fn extension_discovery_roots_honor_no_extensions_and_explicit_paths() {
+    use crate::builder::extension_discovery_roots;
+
+    // Default: project + global roots scanned, no configured paths.
+    let mut cfg = SessionConfig::new(PathBuf::from("/work"), PathBuf::from("/agent"));
+    let roots = extension_discovery_roots(&cfg);
+    assert_eq!(roots.project_cwd, Some(PathBuf::from("/work")));
+    assert_eq!(roots.agent_dir, Some(PathBuf::from("/agent")));
+    assert!(roots.configured.is_empty());
+
+    // Explicit `--extension` paths become pre-trust configured roots (always loaded).
+    cfg.extra_extension_paths = vec![PathBuf::from("/work/ext-a"), PathBuf::from("/work/ext-b")];
+    let roots = extension_discovery_roots(&cfg);
+    assert_eq!(
+        roots.configured,
+        vec![PathBuf::from("/work/ext-a"), PathBuf::from("/work/ext-b")]
+    );
+    // Still discovering project + global.
+    assert!(roots.project_cwd.is_some() && roots.agent_dir.is_some());
+
+    // `--no-extensions` disables project + global *discovery*, but explicit `-e` paths still load.
+    cfg.no_extensions = true;
+    let roots = extension_discovery_roots(&cfg);
+    assert_eq!(roots.project_cwd, None);
+    assert_eq!(roots.agent_dir, None);
+    assert_eq!(
+        roots.configured,
+        vec![PathBuf::from("/work/ext-a"), PathBuf::from("/work/ext-b")]
     );
 }

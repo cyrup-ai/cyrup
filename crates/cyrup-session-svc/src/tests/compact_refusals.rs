@@ -14,46 +14,25 @@
 //! (rpc-mode.ts:530-532 + the surrounding handler). Pre-fix cyrup returned `Ok(None)` for all three,
 //! which the RPC adapter serialized as `{"success":true,"data":null}` — three different refusals
 //! collapsed into one indistinguishable "success".
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use cyrup_core::{AssistantMessage, ExtensionId, StopReason};
-use cyrup_ext::{EventKind, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension};
+use cyrup_ext::{
+    EventKind, EventPatch, ExtError, HookOutcome, HostCtx, HostEvent, InitApi, NativeExtension,
+};
 use cyrup_provider::faux::{
     faux_assistant_message, faux_assistant_message_with, faux_text, FauxConfig, FauxMessageOptions,
     FauxProvider,
 };
 use cyrup_provider::Provider;
-use crate::{AgentSessionEvent, SessionBuilder, SessionConfig};
+use super::common::{base_config, fixture};
+use crate::{AgentSessionEvent, SessionBuilder};
 use futures::StreamExt;
-use tempfile::TempDir;
 
 fn kinds(events: &[AgentSessionEvent]) -> Vec<&'static str> {
     events.iter().map(AgentSessionEvent::kind).collect()
-}
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg
 }
 
 /// Compaction settings that force even a small session to compact (keep nothing, reserve nothing).
@@ -388,7 +367,7 @@ async fn a_dropped_compaction_future_releases_the_cancel_token() {
 async fn abort_compaction_also_cancels_an_auto_compaction() {
     let fx = fixture();
     // `reserveTokens` just under the window, so the real run's own usage trips the THRESHOLD arm
-    // and the post-run auto-compaction fires (round9's `real_run_threshold_compaction_emits_threshold_end`
+    // and the post-run auto-compaction fires (`compaction_tokens_after::real_run_threshold_compaction_emits_threshold_end`
     // uses the same lever).
     let mut cli = cyrup_config::Settings::new();
     cli.set_field(
@@ -611,4 +590,129 @@ async fn compaction_rebuilds_the_agents_in_memory_transcript() {
         rebuilt,
         "the agent transcript must BE the compacted session context"
     );
+}
+
+/// Facade parity vs Pi `agent-session.ts` / `sdk.ts`: the `CompactionResult` flow — a session with nothing to compact reports the
+/// error through the result rather than failing the call, and still emits the start/end pair.
+#[tokio::test]
+async fn compact_on_small_session_errors_nothing_to_compact_and_emits_events() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let session = SessionBuilder::new(faux, base_config(&fx)).build().await.unwrap();
+    let mut sub = session.subscribe();
+
+    // Nothing to compact on a fresh/tiny session: an ERROR carrying Pi's reason (Pi throws
+    // "Nothing to compact (session too small)", agent-session.ts:1806), no panic, events still flow.
+    let err = session.compact(None).await.expect_err("small session has nothing to compact");
+    assert_eq!(err.to_string(), "Nothing to compact (session too small)");
+
+    let mut saw_start = false;
+    let mut saw_end = false;
+    for _ in 0..6 {
+        match tokio::time::timeout(std::time::Duration::from_millis(200), {
+            use futures::StreamExt;
+            sub.next()
+        })
+        .await
+        {
+            Ok(Some(ev)) => match ev.kind() {
+                "compaction_start" => saw_start = true,
+                "compaction_end" => saw_end = true,
+                _ => {}
+            },
+            _ => break,
+        }
+    }
+    assert!(saw_start && saw_end, "compaction_start + compaction_end must be emitted");
+}
+
+// ==================================== the OVERRIDE arm of the same `session_before_compact` ====
+
+/// A native extension subscribed to `session_before_compact` that READS the typed
+/// `CompactionPreparation` off the event and returns a custom-summary override (Pi
+/// `SessionBeforeCompactResult.compaction`, agent-session.ts:1672-1693). Records the preparation it
+/// observed so the test can assert the typed payload actually crossed the seam.
+struct CompactionOverrider {
+    seen: Arc<Mutex<Vec<serde_json::Value>>>,
+}
+#[async_trait::async_trait]
+impl NativeExtension for CompactionOverrider {
+    fn id(&self) -> ExtensionId {
+        ExtensionId::from("compaction-overrider")
+    }
+    async fn init(&self, api: &mut InitApi) -> Result<(), ExtError> {
+        api.subscribe(&[EventKind::SessionBeforeCompact]);
+        Ok(())
+    }
+    async fn on_event(&self, ev: &HostEvent, _ctx: &HostCtx) -> HookOutcome {
+        match ev {
+            HostEvent::SessionBeforeCompact { preparation, reason, .. } => {
+                self.seen.lock().unwrap().push(preparation.clone());
+                // Derive the override summary from the REAL preparation so the assertion proves the
+                // typed payload was read, not fabricated.
+                let first_kept = preparation
+                    .get("firstKeptEntryId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                HookOutcome::Mutate(EventPatch::CompactionOverride(serde_json::json!({
+                    "summary": format!("ext-summary[{reason}|firstKept={first_kept}]"),
+                })))
+            }
+            _ => HookOutcome::Noop,
+        }
+    }
+}
+
+/// L4 gap #5: an ASSEMBLED manual compaction where a native guest reads the typed
+/// `CompactionPreparation` and returns a custom-summary override — the override lands in the appended
+/// compaction entry (`fromExtension`) and flows out as the `CompactionResult.summary`, replacing the
+/// default model summarization (no summarizer call needed).
+#[tokio::test]
+async fn compaction_before_compact_override_lands_in_entry() {
+    let fx = fixture();
+    let seen: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
+    let faux = Arc::new(FauxProvider::new());
+    // Only the two turn responses — the override skips the model summarizer entirely.
+    faux.set_responses(vec![
+        faux_assistant_message(vec![faux_text("first answer")], StopReason::Stop),
+        faux_assistant_message(vec![faux_text("second answer")], StopReason::Stop),
+    ]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let session = SessionBuilder::new(provider, base_config(&fx))
+        .cli_settings(aggressive_compaction_settings())
+        .with_native_extension(Arc::new(CompactionOverrider { seen: seen.clone() }))
+        .build()
+        .await
+        .expect("build");
+
+    let _ = session.prompt("tell me one").await.expect("prompt 1");
+    session.wait_for_idle().await;
+    let _ = session.prompt("tell me two").await.expect("prompt 2");
+    session.wait_for_idle().await;
+
+    let cr = session
+        .compact(None)
+        .await
+        .expect("an aggressive-keep compaction over two turns produces a result");
+
+    // The extension read a REAL preparation: it carries the Pi `CompactionPreparation` fields.
+    let observed = seen.lock().unwrap().clone();
+    assert_eq!(observed.len(), 1, "the before_compact hook fired exactly once");
+    let prep = &observed[0];
+    assert!(prep.get("firstKeptEntryId").is_some(), "typed preparation carries firstKeptEntryId: {prep}");
+    assert!(prep.get("messagesToSummarize").is_some(), "typed preparation carries messagesToSummarize: {prep}");
+    assert!(prep.get("tokensBefore").is_some(), "typed preparation carries tokensBefore: {prep}");
+
+    // The override summary landed in the resulting compaction entry (fromExtension), replacing the
+    // default model summary.
+    assert!(
+        cr.summary.starts_with("ext-summary[manual|firstKept="),
+        "the extension override summary lands in the compaction result: {}",
+        cr.summary
+    );
+
+    // And it is durable in the exported JSONL as a compaction entry.
+    let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl");
+    assert!(jsonl.contains("ext-summary[manual"), "the override summary is persisted: {jsonl}");
+    assert!(jsonl.contains("\"type\":\"compaction\""), "a compaction entry was appended");
 }

@@ -19,26 +19,26 @@ const ABORT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 impl AgentSession {
     /// The pending steering messages, in order (Pi `getSteeringMessages`, agent-session.ts:1408).
     pub fn steering_messages(&self) -> Vec<String> {
-        Self::lock(&self.steering_messages).clone()
+        crate::sync::lock(&self.steering_messages).clone()
     }
 
     /// The pending follow-up messages, in order (Pi `getFollowUpMessages`, agent-session.ts:1412).
     pub fn follow_up_messages(&self) -> Vec<String> {
-        Self::lock(&self.follow_up_messages).clone()
+        crate::sync::lock(&self.follow_up_messages).clone()
     }
 
     /// Total queued (steering + follow-up) message count (Pi `pendingMessageCount`,
     /// agent-session.ts:1393).
     pub fn pending_message_count(&self) -> usize {
-        Self::lock(&self.steering_messages).len() + Self::lock(&self.follow_up_messages).len()
+        crate::sync::lock(&self.steering_messages).len() + crate::sync::lock(&self.follow_up_messages).len()
     }
 
     /// Clear both queues (Pi `clearQueue`, agent-session.ts:1416): drains the agent's authoritative
     /// queues and the facade mirrors, then emits `queue_update`.
     pub async fn clear_queue(&self) {
         self.agent.clear_all_queues();
-        Self::lock(&self.steering_messages).clear();
-        Self::lock(&self.follow_up_messages).clear();
+        crate::sync::lock(&self.steering_messages).clear();
+        crate::sync::lock(&self.follow_up_messages).clear();
         self.emit_queue_update().await;
     }
 
@@ -56,8 +56,8 @@ impl AgentSession {
         // drain happens after they are released, keeping the facade→agent lock nesting `steer` /
         // `follow_up` avoid (they too drop the mirror guard before calling into the agent).
         let drained = {
-            let mut steering = Self::lock(&self.steering_messages);
-            let mut follow_up = Self::lock(&self.follow_up_messages);
+            let mut steering = crate::sync::lock(&self.steering_messages);
+            let mut follow_up = crate::sync::lock(&self.follow_up_messages);
             (std::mem::take(&mut *steering), std::mem::take(&mut *follow_up))
         };
         self.agent.drain_queues_for_restore();
@@ -68,8 +68,8 @@ impl AgentSession {
     /// Emit a `queue_update` snapshot of both facade queues (Pi `_emitQueueUpdate`,
     /// agent-session.ts:1382).
     pub(super) async fn emit_queue_update(&self) {
-        let steering = Self::lock(&self.steering_messages).clone();
-        let follow_up = Self::lock(&self.follow_up_messages).clone();
+        let steering = crate::sync::lock(&self.steering_messages).clone();
+        let follow_up = crate::sync::lock(&self.follow_up_messages).clone();
         self.fanout_emit(AgentSessionEvent::QueueUpdate { steering, follow_up }).await;
     }
 
@@ -113,23 +113,23 @@ impl AgentSession {
 
     /// The agent's current steering mode (Pi `steeringMode` getter, agent-session.ts:845).
     pub fn steering_mode(&self) -> cyrup_agent::QueueMode {
-        *Self::lock(&self.steering_mode)
+        *crate::sync::lock(&self.steering_mode)
     }
 
     /// The agent's current follow-up mode (Pi `followUpMode` getter, agent-session.ts:850).
     pub fn follow_up_mode(&self) -> cyrup_agent::QueueMode {
-        *Self::lock(&self.follow_up_mode)
+        *crate::sync::lock(&self.follow_up_mode)
     }
 
     /// Set the steering-message delivery mode (Pi `setSteeringMode`, agent-session.ts:1631).
     pub fn set_steering_mode(&self, mode: cyrup_agent::QueueMode) {
         self.agent.set_steering_mode(mode);
-        *Self::lock(&self.steering_mode) = mode;
+        *crate::sync::lock(&self.steering_mode) = mode;
     }
 
     /// Set the follow-up-message delivery mode (Pi `setFollowUpMode`, agent-session.ts:1640).
     pub fn set_follow_up_mode(&self, mode: cyrup_agent::QueueMode) {
         self.agent.set_follow_up_mode(mode);
-        *Self::lock(&self.follow_up_mode) = mode;
+        *crate::sync::lock(&self.follow_up_mode) = mode;
     }
 }

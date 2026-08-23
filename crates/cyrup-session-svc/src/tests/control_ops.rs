@@ -1,3 +1,8 @@
+//! The runtime REPLACEMENT ops — `newSession`/`switchSession`/`fork`/`navigateTree`/`reload` — from
+//! both entry points: driven directly on `AgentSessionRuntime` (its option bags and their
+//! pre-flights), and driven by an extension through the control-op seam. Every assertion is on the
+//! OBSERVABLE EFFECT of the op, so the two entry points are held to the same bar.
+//!
 //! SEAM-003 — extension runtime-tier control ops must PERFORM the operation, not be queued and
 //! discarded.
 //!
@@ -13,9 +18,8 @@
 //! changed session id, a moved tree leaf, a persisted message, an aborted run — never on the fact
 //! that `HostServices::control(...)` returned `Ok`. That return already succeeded before this fix;
 //! asserting it would re-create exactly the bug being closed.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,11 +30,13 @@ use cyrup_ext::{
 };
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
+use super::common::{base_config, base_config_no_extensions, fixture, Fixture};
 use crate::{
-    AgentSession, AgentSessionRuntime, SessionConfig, SessionFactory, SessionTarget,
+    AgentSession, AgentSessionEvent, AgentSessionRuntime, NewSessionOptions, SessionFactory,
+    SessionTarget, SwitchSessionOptions,
 };
+use futures::StreamExt;
 use serde_json::json;
-use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------------------------
 // A native built-in whose slash commands queue exactly one runtime-tier control op each, through
@@ -125,31 +131,7 @@ impl NativeExtension for ControlExt {
     }
 }
 
-
-
 // ---------------------------------------------------------------------------------------------
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
-}
 
 fn faux_ok() -> Arc<dyn Provider> {
     let faux = Arc::new(FauxProvider::new());
@@ -160,7 +142,7 @@ fn faux_ok() -> Arc<dyn Provider> {
 /// Build a runtime over a factory carrying the control-op probe extension.
 async fn runtime_with(fx: &Fixture, ext: Arc<ControlExt>) -> Arc<AgentSessionRuntime> {
     let factory = Arc::new(
-        SessionFactory::new(faux_ok(), base_config(fx))
+        SessionFactory::new(faux_ok(), base_config_no_extensions(fx))
             .with_native_extension(ext as Arc<dyn NativeExtension>),
     );
     AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap()
@@ -403,4 +385,243 @@ async fn control_wait_idle_is_applied_without_stalling_the_drain() {
         !session.messages().await.is_empty(),
         "the session continues to accept prompts after a wait-idle control op"
     );
+}
+
+// ======================================= the same ops driven DIRECTLY on the runtime ====
+
+// ============================================================================ #26 option bags ====
+
+/// gap #26: `newSession({parentSession})` records the parent file on the freshly-created session.
+#[tokio::test]
+async fn new_session_with_records_parent_session() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let factory = Arc::new(SessionFactory::new(faux, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+
+    let parent_file = runtime.session().await.session_file().await.expect("persisted").display().to_string();
+
+    let result = runtime
+        .new_session_with(NewSessionOptions { parent_session: Some(parent_file.clone()) })
+        .await
+        .unwrap();
+    assert!(!result.cancelled);
+
+    // The new session's JSONL header carries `parentSession`.
+    let session = runtime.session().await;
+    let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl text");
+    let header_line = jsonl.lines().next().expect("header line");
+    let header: serde_json::Value = serde_json::from_str(header_line).unwrap();
+    assert_eq!(
+        header["parentSession"].as_str(),
+        Some(parent_file.as_str()),
+        "the new session records its parent file"
+    );
+}
+
+/// gap #26: `switchSession({cwdOverride})` rebinds the resumed session's cwd-bound services to the
+/// caller-supplied cwd instead of deriving it from the session file.
+#[tokio::test]
+async fn switch_session_with_cwd_override_rebinds_services_cwd() {
+    let fx = fixture();
+    // A second, existing cwd to rebind onto.
+    let cwd2 = fx._tmp.path().join("project2");
+    std::fs::create_dir_all(&cwd2).unwrap();
+
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let session_file = {
+        // Drive a turn so the session file flushes to disk before we re-open it.
+        let s = runtime.session().await;
+        let file = s.session_file().await.expect("persisted");
+        let _ = s.prompt("hi").await.unwrap();
+        s.wait_for_idle().await;
+        file
+    };
+
+    let result = runtime
+        .switch_session_with(
+            session_file,
+            SwitchSessionOptions { cwd_override: Some(cwd2.clone()) },
+        )
+        .await
+        .unwrap();
+    assert!(!result.cancelled);
+
+    let session = runtime.session().await;
+    assert_eq!(session.services().cwd, cwd2, "cwd_override rebinds the services cwd");
+}
+
+/// gap #26: a missing override cwd is rejected at the pre-flight before any teardown.
+#[tokio::test]
+async fn switch_session_with_missing_override_cwd_is_rejected() {
+    let fx = fixture();
+    let faux: Arc<dyn Provider> = Arc::new(FauxProvider::new());
+    let factory = Arc::new(SessionFactory::new(faux, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+    let session_file = runtime.session().await.session_file().await.expect("persisted");
+    let gen_before = runtime.generation().await;
+
+    let missing = fx._tmp.path().join("does-not-exist");
+    let err = runtime
+        .switch_session_with(session_file, SwitchSessionOptions { cwd_override: Some(missing) })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, crate::SessionServiceError::MissingSessionCwd(_)));
+    assert_eq!(runtime.generation().await, gen_before, "a rejected switch leaves the session intact");
+}
+
+// ================================================================================== #18b reload ====
+
+/// gap #18b: the runtime `reload` op rebuilds the active (persisted) session — preserving its
+/// transcript — bumps the generation, runs the `before_start` hook, and re-emits `session_start`.
+#[tokio::test]
+async fn reload_rebuilds_session_preserving_transcript_and_runs_hook() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi there")], StopReason::Stop)]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+
+    // Drive one turn so the persisted session has a transcript.
+    {
+        let s = runtime.session().await;
+        let _ = s.prompt("remember me").await.unwrap();
+        s.wait_for_idle().await;
+        assert_eq!(s.messages().await.len(), 2, "user + assistant persisted before reload");
+    }
+    assert_eq!(runtime.generation().await, 0);
+
+    // Reload: the before_start hook fires before session_start; the generation bumps.
+    let fired = Arc::new(AtomicBool::new(false));
+    let f = fired.clone();
+    runtime
+        .reload(Some(Box::new(move || f.store(true, Ordering::SeqCst))))
+        .await
+        .unwrap();
+
+    assert!(fired.load(Ordering::SeqCst), "before_start hook must run on reload");
+    assert_eq!(runtime.generation().await, 1, "reload bumps the replacement generation");
+
+    // The rebuilt session re-opened the SAME persisted file, preserving the transcript.
+    let reloaded = runtime.session().await;
+    assert_eq!(reloaded.messages().await.len(), 2, "reload preserves the persisted transcript");
+}
+
+// =========================================================== #26 cwdOverride → manager + export ====
+
+/// gap-09 #26 — `switchSession({cwdOverride})` threads the override into the resumed
+/// `SessionManager` (Pi runtime.ts:207 → `SessionManager.open(path, _, cwdOverride)`): the manager's
+/// own cwd is rebound, so the exported JSONL header reports the override (Pi exportToJsonl
+/// `cwd: sessionManager.getCwd()`, agent-session.ts:3061), while the persisted session file keeps
+/// its original header cwd (Pi leaves `fileEntries`' header untouched).
+#[tokio::test]
+async fn switch_session_with_cwd_override_rebinds_manager_cwd_and_export_header() {
+    let fx = fixture();
+    let cwd2 = fx._tmp.path().join("project2");
+    std::fs::create_dir_all(&cwd2).unwrap();
+
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("ok")], StopReason::Stop)]);
+    let provider: Arc<dyn Provider> = faux.clone();
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime = AgentSessionRuntime::create(factory, SessionTarget::New).await.unwrap();
+
+    // Drive a turn so the session file flushes (its header cwd == fx.cwd).
+    let session_file = {
+        let s = runtime.session().await;
+        let file = s.session_file().await.expect("persisted");
+        let _ = s.prompt("hi").await.unwrap();
+        s.wait_for_idle().await;
+        file
+    };
+
+    // Resume that file with a cwd override.
+    let result = runtime
+        .switch_session_with(
+            session_file.clone(),
+            SwitchSessionOptions { cwd_override: Some(cwd2.clone()) },
+        )
+        .await
+        .unwrap();
+    assert!(!result.cancelled);
+
+    // The exported JSONL header reports the override (Pi `cwd: sessionManager.getCwd()`).
+    let session = runtime.session().await;
+    let jsonl = session.export_to_jsonl(None).await.unwrap().expect("jsonl text");
+    let header: serde_json::Value =
+        serde_json::from_str(jsonl.lines().next().expect("header line")).unwrap();
+    assert_eq!(
+        header["cwd"].as_str(),
+        cwd2.to_str(),
+        "the exported header cwd reflects the cwd override"
+    );
+
+    // The persisted session file on disk keeps its ORIGINAL header cwd (override is manager-only).
+    let on_disk = std::fs::read_to_string(&session_file).unwrap();
+    let disk_header: serde_json::Value =
+        serde_json::from_str(on_disk.lines().next().expect("disk header line")).unwrap();
+    assert_eq!(
+        disk_header["cwd"].as_str(),
+        fx.cwd.to_str(),
+        "the persisted file header keeps its original cwd"
+    );
+}
+
+/// gap #1-11 / R-11-020/021: the AgentSessionRuntime multi-session tier — `new_session` tears down,
+/// rebuilds a fresh session, bumps the generation watch, and INVALIDATES prior subscriptions.
+#[tokio::test]
+async fn runtime_new_session_invalidates_subscriptions_and_bumps_generation() {
+    let fx = fixture();
+    let faux = Arc::new(FauxProvider::new());
+    faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);
+
+    let provider: Arc<dyn Provider> = faux.clone();
+    let factory = Arc::new(SessionFactory::new(provider, base_config(&fx)));
+    let runtime =
+        AgentSessionRuntime::create(factory, SessionTarget::New).await.expect("runtime");
+
+    assert_eq!(runtime.generation().await, 0);
+    let mut gen_watch = runtime.watch_generation();
+
+    // A persistent subscription on the FIRST session.
+    let first = runtime.session().await;
+    let first_id = first.session_id().clone();
+    let mut sub = first.subscribe();
+    // Drive one prompt so the first session has content.
+    let _stream = first.prompt("first").await.expect("prompt");
+    first.wait_for_idle().await;
+    drop(first);
+
+    // Replace the session.
+    let result = runtime.new_session().await.expect("new_session");
+    assert!(!result.cancelled);
+    assert_eq!(runtime.generation().await, 1, "generation must bump on replacement");
+    assert!(gen_watch.changed().await.is_ok(), "generation watch must fire");
+    assert_eq!(*gen_watch.borrow(), 1);
+
+    // The OLD subscription terminates with a SessionReplaced terminal (R-11-021).
+    let mut saw_replaced = false;
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), sub.next()).await {
+            Ok(Some(ev)) => {
+                if let AgentSessionEvent::SessionReplaced { generation } = ev {
+                    assert_eq!(generation, 1);
+                    saw_replaced = true;
+                }
+            }
+            Ok(None) => break, // stream closed after invalidation — expected
+            Err(_) => panic!("old subscription did not terminate after replacement"),
+        }
+    }
+    assert!(saw_replaced, "old subscription must receive the SessionReplaced terminal");
+
+    // The new session is fresh (different id, empty transcript).
+    let second = runtime.session().await;
+    assert_ne!(second.session_id(), &first_id, "new_session must create a distinct session");
+    assert!(second.messages().await.is_empty(), "new session must start empty");
 }

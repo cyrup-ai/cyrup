@@ -27,17 +27,15 @@
 //! empty catalog, `model()` is `None`, the fallback message is pi's exact text, and the first turn
 //! attempted without a model answers `formatNoModelSelectedMessage()`
 //! (`agent-session.ts:1178-1180`) instead of killing anything.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use cyrup_config::AuthStore;
 use cyrup_core::{ModelThinkingLevel, ProviderId};
 use cyrup_provider::unconfigured::UnconfiguredProvider;
 use cyrup_provider::{CreateModelsOptions, Provider};
-use crate::{ProviderResolver, SessionBuilder, SessionConfig, SessionServiceError};
-use tempfile::TempDir;
+use super::common::{base_config, fixture};
+use crate::{ProviderResolver, SessionBuilder, SessionServiceError};
 
 /// Resolves a provider id to the real built-in provider, as the bin's `select_provider` does —
 /// this is what a `/model` selection targeting a newly-authenticated provider swaps in.
@@ -54,27 +52,6 @@ impl ProviderResolver for RegistryResolver {
         .get_provider(provider_id)
         .ok_or_else(|| format!("no built-in provider '{provider_id}'"))
     }
-}
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg
 }
 
 /// The state a bare `cyrup` with no credentials lands in: the zero-model provider.

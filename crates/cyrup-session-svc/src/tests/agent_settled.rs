@@ -13,23 +13,19 @@
 //!
 //! The load-bearing assertion in every test here is the COUNT and the POSITION: it is trivial to
 //! emit an event, and worthless to emit it at the wrong moment.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use cyrup_core::{ExtensionId, StopReason};
-use cyrup_ext::{
-    EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension,
-};
+use cyrup_ext::{EventKind, ExtError, HostCtx, HostEvent, HookOutcome, InitApi, NativeExtension};
 use cyrup_provider::faux::{
     faux_assistant_message, faux_assistant_message_with, faux_text, FauxMessageOptions, FauxProvider,
 };
 use cyrup_provider::Provider;
-use crate::{AgentSessionEvent, InputSource, SessionBuilder, SessionConfig, UserInput};
+use super::common::{base_config_no_extensions, fixture};
+use crate::{AgentSessionEvent, InputSource, SessionBuilder, UserInput};
 use futures::StreamExt;
-use tempfile::TempDir;
 
 /// A native built-in that counts the LIFECYCLE events it is dispatched, so a test can prove the
 /// host actually invoked its `agent_settled` handler — not merely that the kind exists.
@@ -62,28 +58,6 @@ impl NativeExtension for SettleCounter {
         }
         HookOutcome::Noop
     }
-}
-
-struct Fixture {
-    _tmp: TempDir,
-    cwd: PathBuf,
-    agent_dir: PathBuf,
-}
-
-fn fixture() -> Fixture {
-    let tmp = TempDir::new().unwrap();
-    let cwd = tmp.path().join("project");
-    let agent_dir = tmp.path().join("agent");
-    std::fs::create_dir_all(&cwd).unwrap();
-    std::fs::create_dir_all(&agent_dir).unwrap();
-    Fixture { _tmp: tmp, cwd, agent_dir }
-}
-
-fn base_config(fx: &Fixture) -> SessionConfig {
-    let mut cfg = SessionConfig::new(fx.cwd.clone(), fx.agent_dir.clone());
-    cfg.trust_override = Some(true);
-    cfg.no_extensions = true;
-    cfg
 }
 
 fn fast_retry_settings() -> cyrup_config::Settings {
@@ -122,7 +96,7 @@ async fn agent_settled_fires_once_per_run_and_last_even_across_an_auto_retry() {
     let settled = counter.settled.clone();
     let ended = counter.ended.clone();
 
-    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, base_config(&fx))
+    let session = SessionBuilder::new(faux.clone() as Arc<dyn Provider>, base_config_no_extensions(&fx))
         .cli_settings(fast_retry_settings())
         .with_native_extension(counter as Arc<dyn NativeExtension>)
         .build()
@@ -177,7 +151,7 @@ async fn a_simple_run_settles_exactly_once_after_agent_end() {
     let counter = Arc::new(SettleCounter::default());
     let settled = counter.settled.clone();
 
-    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config_no_extensions(&fx))
         .with_native_extension(counter as Arc<dyn NativeExtension>)
         .build()
         .await
@@ -215,7 +189,7 @@ async fn an_unbound_session_settles_too() {
     let settled = counter.settled.clone();
 
     // NOT `into_shared()` — a by-value session, exactly the legacy path.
-    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config(&fx))
+    let session = SessionBuilder::new(faux as Arc<dyn Provider>, base_config_no_extensions(&fx))
         .with_native_extension(counter as Arc<dyn NativeExtension>)
         .build()
         .await

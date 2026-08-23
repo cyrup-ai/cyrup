@@ -47,18 +47,12 @@ impl ProviderSwap {
 
     /// The currently-installed provider (cheap `Arc` clone). Poison-safe (no panic).
     pub(crate) fn current(&self) -> Arc<dyn Provider> {
-        match self.inner.lock() {
-            Ok(guard) => guard.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        }
+        crate::sync::lock(&self.inner).clone()
     }
 
     /// Install `provider` as the current one. Poison-safe (no panic).
     pub(crate) fn store(&self, provider: Arc<dyn Provider>) {
-        match self.inner.lock() {
-            Ok(mut guard) => *guard = provider,
-            Err(poisoned) => *poisoned.into_inner() = provider,
-        }
+        *crate::sync::lock(&self.inner) = provider;
     }
 
     /// Resolve the provider owning `provider_id` (installing its credentials) and install it as the
@@ -91,8 +85,8 @@ impl StreamFn for ProviderSwap {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use cyrup_provider::faux::FauxProvider;
 

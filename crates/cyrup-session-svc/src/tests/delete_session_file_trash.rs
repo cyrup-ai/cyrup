@@ -27,7 +27,6 @@
 //! is the argv construction (pi's `--` guard), the two status strings the callers render, and the
 //! absent-file verdict. The item's own Verify step — a live run with `trash` installed, confirming
 //! the status line says "moved to trash" and the file is in the OS trash — remains required.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::Path;
 
