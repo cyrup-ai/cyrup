@@ -11,7 +11,7 @@ use cyrup_agent::AgentMessage;
 use cyrup_core::{CancelToken, EntryId};
 use cyrup_ext::{CompactionReduction, HostEvent};
 use cyrup_session::compaction::{
-    CompactionOverride, CompactionPreparation, CompactionReason, Compactor,
+    CompactionOverride, CompactionPreparation, CompactionReason, Compactor, NoHooks,
 };
 
 use crate::compact::DynSummarizer;
@@ -89,7 +89,7 @@ impl AgentSession {
         // Pi threads the session thinking level into every compaction summarization call
         // (`agent-session.ts:1855,2129`); `summarization_reasoning` applies the `model.reasoning`
         // gate before it reaches the request.
-        let compactor = Compactor::new(summarizer).with_thinking(self.thinking_level().await);
+        let compactor = Compactor::new(summarizer, NoHooks).with_thinking(self.thinking_level().await);
         let settings = self.compaction_settings.clone();
 
         // Compute the REAL preparation BEFORE the extension hook (Pi computes `prepareCompaction`
@@ -168,8 +168,12 @@ impl AgentSession {
             .run_compaction_prepared(
                 &mut guard,
                 &model,
+                &settings,
+                reason,
                 custom_instructions,
+                false,
                 &prep,
+                branch_entries,
                 external_override,
                 cancel,
             )
@@ -287,9 +291,8 @@ impl AgentSession {
                 .await;
                 Ok(cr)
             }
-            // The compactor produced no entry — the same refusal Pi reports as "Compaction
-            // cancelled" (agent-session.ts:1824/1869). Unreachable on this path (the preparation is
-            // already known non-empty), kept so a future `None` is reported, not silently dropped.
+            // The internal `CompactionHooks` seam cancelled (`BeforeCompactDecision::Cancel`) — the
+            // same refusal Pi reports as "Compaction cancelled" (agent-session.ts:1824/1869).
             Ok(None) => {
                 self.fanout_emit(AgentSessionEvent::CompactionEnd {
                     reason,

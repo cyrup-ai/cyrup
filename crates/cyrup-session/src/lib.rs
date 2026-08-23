@@ -30,8 +30,8 @@ pub mod prompt;
 pub mod store;
 
 pub use compaction::{
-    serialize_conversation, BranchSummarySettings, Compactor, CompactionError, CompactionReason,
-    CompactionSettings, Summarizer,
+    serialize_conversation, BranchSummarySettings, Compactor, CompactionError, CompactionHooks,
+    CompactionReason, CompactionSettings, NoHooks, Summarizer,
 };
 pub use agent_message::{
     convert_to_llm, AgentMessage, BashExecutionMessage, BranchSummaryMessage,
@@ -49,6 +49,7 @@ pub use listing::{
 };
 pub use manager::{NewSessionOpts, SessionManager, TreeNode};
 pub use prompt::{
+    apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
     ContextDiagnostic, ContextError, ContextFile, ContextFileLoader, ContextScope, ContextSnapshot,
     ContextStore, DocsPointers, PromptInputs, ResolvedOverride, SkillPointer, SystemPromptBuilder,
     ToolPromptContribution, TrustQuery, DEFAULT_SELECTED_TOOLS,

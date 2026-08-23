@@ -9,19 +9,19 @@
 //! ```text
 //! caller gathers ToolPromptContribution + SkillPointer + ContextSnapshot
 //!   -> SystemPromptBuilder::build(&PromptInputs) -> String
+//!   -> apply_before_agent_start(prompt, &inputs, hooks) -> final prompt   (R-06-014)
 //! ```
-//!
-//! The `before_agent_start` extension seam (R-06-014/015) is owned by `cyrup-ext`
-//! (`ExtensionHost::emit_before_agent_start`), which runs it over the string this module returns.
 //!
 //! - Pure assembly: [`SystemPromptBuilder`] / [`PromptInputs`] / [`DocsPointers`] (no I/O).
 //! - Blocking discovery: [`ContextFileLoader`] (run via `spawn_blocking`).
 //! - Session cache: [`ContextStore`] / [`ContextSnapshot`] (`arc-swap`, read-once-per-session).
 //! - Override result: [`ResolvedOverride`] (CLI > project > global, resolved upstream).
+//! - Hook seam: [`BeforeAgentStartInput`] / [`BeforeAgentStartOutput`] / [`apply_before_agent_start`].
 
 pub mod builder;
 pub mod cache;
 pub mod context_files;
+pub mod hook;
 pub mod overrides;
 pub mod skills_inject;
 pub mod tool_prompts;
@@ -30,6 +30,9 @@ pub use builder::{DocsPointers, PromptInputs, SystemPromptBuilder, DEFAULT_SELEC
 pub use cache::{ContextError, ContextSnapshot, ContextStore};
 pub use context_files::{
     ContextDiagnostic, ContextFile, ContextFileLoader, ContextScope, TrustQuery,
+};
+pub use hook::{
+    apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
 };
 pub use overrides::ResolvedOverride;
 pub use tool_prompts::ToolPromptContribution;

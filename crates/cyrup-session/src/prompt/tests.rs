@@ -10,6 +10,9 @@ use cyrup_resources::SkillPointer;
 use super::builder::{DocsPointers, PromptInputs, SystemPromptBuilder};
 use super::cache::{ContextError, ContextStore};
 use super::context_files::{ContextFile, ContextFileLoader, ContextScope, TrustQuery};
+use super::hook::{
+    apply_before_agent_start, BeforeAgentStartHook, BeforeAgentStartInput, BeforeAgentStartOutput,
+};
 use super::overrides::ResolvedOverride;
 use super::tool_prompts::ToolPromptContribution;
 
@@ -542,6 +545,46 @@ fn a06_7_dynamic_tool_snippet() {
         builder.inputs_fingerprint(&without_tool),
         "fingerprint detects active-set change -> triggers rebuild"
     );
+}
+
+// ── A-06-8: before_agent_start hook replaces the prompt; trapping hook degrades to pre-hook ──────
+struct ReplaceHook;
+impl BeforeAgentStartHook for ReplaceHook {
+    fn before_agent_start(&self, input: &BeforeAgentStartInput) -> BeforeAgentStartOutput {
+        // sanity: hook receives build options (R-06-014)
+        assert_eq!(input.cwd, PathBuf::from("/work/proj"));
+        BeforeAgentStartOutput::replace("HOOK REPLACED PROMPT")
+    }
+}
+struct AppendHook;
+impl BeforeAgentStartHook for AppendHook {
+    fn before_agent_start(&self, input: &BeforeAgentStartInput) -> BeforeAgentStartOutput {
+        BeforeAgentStartOutput::replace(format!("{}\n[rules]", input.system_prompt))
+    }
+}
+struct KeepHook;
+impl BeforeAgentStartHook for KeepHook {
+    fn before_agent_start(&self, _: &BeforeAgentStartInput) -> BeforeAgentStartOutput {
+        BeforeAgentStartOutput::keep()
+    }
+}
+
+#[test]
+fn a06_8_before_agent_start_replaces_prompt() {
+    let inp = PromptInputs { selected_tools: Some(vec![arc("read")]), ..base_inputs() };
+    let built = SystemPromptBuilder::new().build(&inp);
+
+    // replacement wins
+    let final_prompt = apply_before_agent_start(built.clone(), &inp, &[&ReplaceHook]);
+    assert_eq!(final_prompt, "HOOK REPLACED PROMPT");
+
+    // keep-hook leaves it untouched
+    let unchanged = apply_before_agent_start(built.clone(), &inp, &[&KeepHook]);
+    assert_eq!(unchanged, built);
+
+    // R-06-015 append-style composes on top, in subscription order
+    let composed = apply_before_agent_start(built.clone(), &inp, &[&KeepHook, &AppendHook]);
+    assert!(composed.starts_with(&built) && composed.ends_with("[rules]"));
 }
 
 // ── ContextStore: read-once-per-session cache + spawn_blocking reload (R-06-016) ─────────────────

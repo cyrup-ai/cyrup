@@ -10,7 +10,7 @@ use cyrup_agent::AgentMessage;
 use cyrup_core::{CancelToken, Content, EntryId, ModelRef, ModelThinkingLevel, SessionId, Usage};
 use cyrup_ext::{HostEvent, TreeReduction};
 use cyrup_provider::Model;
-use cyrup_session::compaction::{BranchSummaryOutput, Compactor};
+use cyrup_session::compaction::{BranchSummaryOutput, Compactor, NoHooks};
 use cyrup_session::manager::SessionManager;
 
 use crate::compact::DynSummarizer;
@@ -49,7 +49,10 @@ impl AgentSession {
             None if !user_wants_summary => {
                 // `Compactor::run_branch_summary` takes `&Model` unconditionally even though it
                 // only reads it to build the summary, so the no-summary navigation is done
-                // directly here (`session.branch(&target_id)`).
+                // directly here (`session.branch(&target_id)`, compaction/mod.rs:384). Residual:
+                // the `session_before_tree`/`session_tree` hooks that `run_branch_summary` also
+                // fires are skipped on this narrow path — `run_branch_summary` should take
+                // `Option<&Model>` so they are not.
                 self.manager.lock().await.branch(&entry)?;
                 return Ok(None);
             }
@@ -63,7 +66,7 @@ impl AgentSession {
         let summarizer =
             DynSummarizer::new(self.provider.current(), model.clone(), self.summarization_retry())
                 .with_observer(retry_observer);
-        let compactor = Compactor::new(summarizer);
+        let compactor = Compactor::new(summarizer, NoHooks);
         let cancel = self.session_cancel.child_token();
         *Self::lock(&self.branch_summary_cancel) = Some(cancel.clone());
 
