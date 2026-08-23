@@ -629,6 +629,12 @@ pub async fn build_inputs(
     ))
 }
 
+/// The `@file` references in the CLI positionals (Pi `parsed.fileArgs`). Used to reject `@file` in
+/// RPC mode (main.ts:540).
+pub fn split_file_args(cli: &Cli) -> Vec<String> {
+    split_positionals(&cli.positionals).0
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
