@@ -1426,7 +1426,6 @@ dependencies = [
  "cyrup-core",
  "cyrup-ext",
  "cyrup-ext-subagents",
- "cyrup-permission-system",
  "cyrup-resources",
  "nix 0.31.3",
  "serde",

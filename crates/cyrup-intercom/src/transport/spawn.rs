@@ -408,8 +408,20 @@ fn acquire_spawn_lock(lock_path: &Path) -> bool {
             Ok(mut file) => {
                 use std::io::Write;
                 let body = format!("{}\n{}\n", std::process::id(), now_ms());
-                let _ = file.write_all(body.as_bytes());
-                let _ = paths::restrict_intercom_runtime_file(lock_path);
+                // [CYRUP-DELTA] The body IS the staleness record `is_spawn_lock_stale` reads back, and
+                // an empty body takes its `created_at: None => true` arm — i.e. a lock every peer
+                // classifies as stale on sight and unlinks. A discarded write would therefore make this
+                // process a phantom spawn owner alongside whoever reclaims the zero-byte lock, so a
+                // failed write is a failed acquisition: drop the empty lock and let `ensure_broker`
+                // fall through to `wait_for_broker_for`.
+                if let Err(e) = file.write_all(body.as_bytes()) {
+                    tracing::warn!(error = %e, "failed to write intercom spawn lock body");
+                    let _ = std::fs::remove_file(lock_path);
+                    return false;
+                }
+                if let Err(e) = paths::restrict_intercom_runtime_file(lock_path) {
+                    tracing::warn!(error = %e, "failed to restrict spawn lock permissions");
+                }
                 return true;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -668,5 +680,16 @@ mod tests {
         // Our own live pid but a very old timestamp → stale by age (> 10s).
         std::fs::write(&lock, format!("{}\n{}\n", std::process::id(), now_ms().saturating_sub(20_000))).unwrap();
         assert!(is_spawn_lock_stale(&lock), "a lock older than 10s is stale even with a live pid");
+    }
+
+    #[test]
+    fn empty_lock_body_is_stale() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join("broker.spawn.lock");
+        // A zero-byte lock — the shape left behind by a failed body write — carries no `created_at`,
+        // so every peer classifies it as stale and unlinks it. This pins the semantics that make a
+        // discarded `write_all` in `acquire_spawn_lock` a failed acquisition rather than ownership.
+        std::fs::write(&lock, b"").unwrap();
+        assert!(is_spawn_lock_stale(&lock), "a zero-byte lock body is stale");
     }
 }

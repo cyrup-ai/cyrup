@@ -1,7 +1,7 @@
 ---
-stage: new
+stage: exec
 status: done
-updated: 2026-08-22 06:00
+updated: 2026-08-22 20:02
 ---
 
 # Flux Command Loose Ends

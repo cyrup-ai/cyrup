@@ -9,9 +9,19 @@
 //! by session identity (never over the child's stdio, never via a file drop). See
 //! `spec/extensions/cyrup-intercom-port.md`.
 //!
-//! No-panic policy (arch-00 §8) is enforced crate-wide via `[workspace.lints]`; this crate-level
-//! `#![deny(...)]` restates it. Tests `#[allow(...)]` at the test-module level.
-#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+//! No-panic policy (arch-00 §8). The first four lints below are denied workspace-wide via
+//! `[workspace.lints]` and restated here; `unreachable`/`todo`/`unimplemented` are denied at
+//! this crate root only, because promoting them to the workspace table would harden eight
+//! other crates at once. Tests `#[allow(...)]` at the test-module level.
+#![deny(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::unreachable,
+    clippy::todo,
+    clippy::unimplemented
+)]
 #![forbid(unsafe_code)]
 
 pub mod broker;

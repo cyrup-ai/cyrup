@@ -16,6 +16,17 @@
 //! selection rules testable on any host, and this module's tests mirror `broker/paths.test.ts`
 //! case-for-case.
 //!
+//! This module is also the single home for the broker's **runtime-file paths** under
+//! `<intercomDir>`: [`broker_port_file_path`] (`paths.ts:61-63`), [`unix_socket_path`]
+//! (`getBrokerSocketPath`'s POSIX branch, `paths.ts:65-74`), [`broker_pid_path`] (`broker.ts:22`)
+//! and [`broker_spawn_lock_path`] (`spawn.ts:24`). They used to be split across `crate::paths` (the
+//! POSIX socket/pid/lock trio) and this module (the port file), so one upstream question — "where
+//! does the broker live" — had two answers at two tree levels and the crate-root one was the
+//! shorter, more obvious import even though it hard-codes the POSIX arm. `crate::paths` keeps only
+//! the cyrup-home/agent-dir resolution and the runtime-dir/mode helpers, which are not
+//! transport-specific, and re-exports these three for the call sites that still spell them
+//! `paths::…`.
+//!
 //! Naming: pi's `PI_INTERCOM_TRANSPORT`/`PI_INTERCOM_TCP` become `CYRUP_INTERCOM_TRANSPORT`/
 //! `CYRUP_INTERCOM_TCP`, matching this crate's existing rename of every `PI_INTERCOM_*` var
 //! (`identity.rs:20-24`). The pipe-name prefix and the `broker.port.json` file name are kept
@@ -103,7 +114,7 @@ impl BrokerTcpEndpoint {
 ///
 /// The `string` arm is a Unix socket path on non-Windows and a named-pipe name on Windows
 /// (`paths.ts:65-74`); both are carried as a [`PathBuf`] here because that is the type this crate's
-/// existing socket-path API already speaks (`paths::broker_socket_path`), and `\\.\pipe\...` is a
+/// existing socket-path API already speaks ([`unix_socket_path`]), and `\\.\pipe\...` is a
 /// well-formed Windows path.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BrokerConnectTarget {
@@ -193,6 +204,32 @@ pub fn broker_port_file_path(intercom_dir: &Path) -> PathBuf {
     intercom_dir.join("broker.port.json")
 }
 
+/// `<intercomDir>/broker.sock` — `getBrokerSocketPath`'s **Unix branch only** (`paths.ts:65-74`).
+///
+/// Named `unix_socket_path`, not `broker_socket_path`, precisely because it is one arm of a
+/// two-arm upstream function: on Windows `getBrokerSocketPath` returns the named pipe
+/// `\\.\pipe\pi-intercom-<sanitized agent dir>` instead and this path is never bound or dialed.
+/// The general, platform-choosing spelling is [`broker_socket_path_for`]; the general
+/// *transport*-choosing spellings (which additionally cover the opt-in loopback TCP arm) are
+/// [`broker_connect_target`] for clients and [`broker_listen_target`] for the broker. Call this one
+/// only where the POSIX arm is what is genuinely meant.
+#[must_use]
+pub fn unix_socket_path(intercom_dir: &Path) -> PathBuf {
+    intercom_dir.join("broker.sock")
+}
+
+/// `<intercomDir>/broker.pid` (`broker.ts:22`).
+#[must_use]
+pub fn broker_pid_path(intercom_dir: &Path) -> PathBuf {
+    intercom_dir.join("broker.pid")
+}
+
+/// `<intercomDir>/broker.spawn.lock` (`spawn.ts:24`).
+#[must_use]
+pub fn broker_spawn_lock_path(intercom_dir: &Path) -> PathBuf {
+    intercom_dir.join("broker.spawn.lock")
+}
+
 /// `getBrokerSocketPath` (`paths.ts:65-74`): the named pipe `\\.\pipe\pi-intercom-<sanitized agent
 /// dir>` on Windows, else `<agentDir>/intercom/broker.sock`.
 #[must_use]
@@ -201,7 +238,7 @@ pub fn broker_socket_path_for(platform: Platform, agent_dir: &Path) -> PathBuf {
         let segment = sanitize_pipe_segment(&agent_dir.to_string_lossy());
         return PathBuf::from(format!("{PIPE_PREFIX}{segment}"));
     }
-    crate::paths::broker_socket_path(&crate::paths::intercom_dir_path(agent_dir))
+    unix_socket_path(&crate::paths::intercom_dir_path(agent_dir))
 }
 
 /// `getBrokerConnectTarget` (`paths.ts:76-105`), with `intercomDir` supplied explicitly (upstream

@@ -177,6 +177,14 @@ impl BrokerListener {
     /// pipe is reachable only by a peer that can already open the filesystem/namespace entry, which
     /// is the credential; a loopback port is reachable by every process on the machine, which is
     /// why the file the port is published in is `0600` and its `stateId` is the actual gate.
+    ///
+    /// [CYRUP-DELTA] The dispatch path derives the same predicate from the state it already holds
+    /// (`dispatch.rs:48`, `self.endpoint_state_id.is_some()`), so this accessor has no caller
+    /// outside this module's own tests — it is kept because `broker.ts:284` has it, and dropping it
+    /// would drop the citation. `dead_code` is allowed rather than deleting a ported item; the
+    /// module became `pub(crate)` when `broker`'s stated public surface (`mod.rs:33-35`, `run`
+    /// alone) was made true of the declarations, which is what unmasked the lint.
+    #[allow(dead_code)]
     #[must_use]
     pub const fn requires_endpoint_auth(&self) -> bool {
         matches!(self, Self::Tcp(_))

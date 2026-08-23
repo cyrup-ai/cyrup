@@ -12,14 +12,15 @@ authors.workspace = true
 workspace = true
 
 [features]
-# Builds the real-broker-participant test-double binary (`cyrup-intercom-child-fixture`) used by this
-# crate's `tests/child_bridge_activation.rs` production-activation proof: unlike the scripted-NDJSON
-# `cyrup-subagent-fixture` (which only proves the spawn overlay DELIVERS the child-bridge env), that
-# binary actually READS the env via the production `read_child_orchestrator_metadata()` gate,
-# registers on the broker under its deterministic label, and completes a `contact_supervisor` round
-# trip. Never enabled for the real `cyrup` binary or any non-test build — the `[[bin]]` target below
-# is gated on `required-features` so it is not even compiled, let alone shipped, unless a caller
-# (this crate's own `cargo test --features test-fixtures`) explicitly opts in.
+# Builds the real-broker-participant test-double binary (`cyrup-intercom-child-fixture`) used by the
+# `crates/cyrup-it/tests/intercom/child_bridge_activation.rs` production-activation proof: unlike the
+# scripted-NDJSON `cyrup-subagent-fixture` (which only proves the spawn overlay DELIVERS the
+# child-bridge env), that binary actually READS the env via the production
+# `read_child_orchestrator_metadata()` gate, registers on the broker under its deterministic label,
+# and completes a `contact_supervisor` round trip. Never enabled for the real `cyrup` binary or any
+# non-test build — the `[[bin]]` target below is gated on `required-features` so it is not even
+# compiled, let alone shipped, unless a caller (`crates/cyrup-it/build.rs:70`, which builds it with
+# `--features test-fixtures` into a private `$OUT_DIR`) explicitly opts in.
 test-fixtures = []
 
 [dependencies]
@@ -77,10 +78,3 @@ tempfile = { workspace = true }
 # 1000 ms timer plus a spawn hop is intermittent red on a loaded tree, and widening the slack hides
 # the backoff regression the test exists to catch. Dev-only.
 tokio = { workspace = true, features = ["net", "io-util", "sync", "time", "macros", "rt-multi-thread", "process", "test-util"] }
-# The C3 cross-companion proof (`tests/shared_human_lock.rs`, reconciliation §1 / §4 step 6): drives
-# the REAL permission gate (`PermissionSystemExtension::on_event` ask path) AND the REAL intercom
-# `IntercomClarifyChannel::ask` against ONE shared `HostServices` sink (== ONE `HumanInteractionLock`),
-# proving a permission approval holding the lock blocks the intercom clarify's prompt (never double-
-# prompting the same human). Dev-only + one-directional (permission never depends on intercom → no
-# cycle).
-cyrup-permission-system = { path = "../cyrup-permission-system" }

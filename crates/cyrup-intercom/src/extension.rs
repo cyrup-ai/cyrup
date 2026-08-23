@@ -397,7 +397,7 @@ impl IntercomExtension {
                         .unwrap_or_else(|| s.id.clone())
                 })
                 .unwrap_or_else(|| target_id.clone());
-            let _ = services.append_entry(
+            if let Err(e) = services.append_entry(
                 "intercom_sent",
                 &serde_json::json!({
                     "to": to,
@@ -405,7 +405,9 @@ impl IntercomExtension {
                     "messageId": sent.id,
                     "timestamp": now_ms(),
                 }),
-            );
+            ) {
+                tracing::warn!(error = %e, kind = "intercom_sent", "intercom: failed to append audit entry");
+            }
         }
         // ICOM-013's residual: `notifyIfLive(ctx, \`Message sent to ${targetLabel}\`, "info", …)`
         // (`v0.10.1 index.ts:2429`). Two divergences, and they had to be fixed together — cyrup
@@ -952,6 +954,83 @@ mod tests {
         );
         // The claim is type-scoped, not a blanket one.
         assert!(!host.has_entry_renderer("subagent_run"));
+    }
+
+    /// The child-orchestrator metadata the `v0.10.1 index.ts:1505-1507` gate is keyed on. Built in
+    /// the test rather than read from the environment for the same reason
+    /// [`IntercomExtension::with_native_supervisor_channel`] exists: a test must not mutate
+    /// process-global env state.
+    fn child_metadata() -> ChildOrchestratorMetadata {
+        ChildOrchestratorMetadata {
+            orchestrator_target: "supervisor".to_string(),
+            orchestrator_session_id: None,
+            run_id: "run-xyz".to_string(),
+            agent: "researcher".to_string(),
+            index: "0".to_string(),
+            session_name: Some("subagent-chat-1".to_string()),
+        }
+    }
+
+    /// `init` one extension through a real `ExtensionHost` and report the names of the tools it
+    /// registered, sorted. `InitApi::into_parts` is `pub(crate)` to `cyrup-ext` and `InitApi`
+    /// exposes only `subscriptions()`, so the host's active tool set is the observable side of
+    /// `api.register_tool` from here — the same route
+    /// [`init_claims_the_intercom_message_entry_type`] takes to observe `register_entry_renderer`.
+    /// A fresh host per call because the extension id is fixed ([`EXTENSION_ID`]) and the two arms
+    /// must not share a registry.
+    async fn registered_tool_names(ext: IntercomExtension) -> Vec<String> {
+        let host = cyrup_ext::ExtensionHost::new(cyrup_ext::HostConfig::default());
+        host.load_native(Arc::new(ext)).await.expect("the native loads");
+        let mut names: Vec<String> = host
+            .active_tools(&[])
+            .expect("the active tool set materializes")
+            .iter()
+            .map(|t| cyrup_core::Tool::name(t.as_ref()).to_string())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// `v0.10.1 index.ts:1505-1507` — `if (childOrchestratorMetadata && !nativeSupervisorChannel
+    /// Available) { pi.registerTool(…) }`. BOTH arms are pinned here, and both are asserted against
+    /// the same fixture, because an absence assertion on its own passes just as well when the tool
+    /// failed to register for an unrelated reason. What the `true` arm guards is silent rather than
+    /// loud: a child handed the native channel AND the legacy broker-routed `contact_supervisor`
+    /// can request the same decision through two mechanisms while the parent polls only one of
+    /// them, which is a hang, not an error.
+    ///
+    /// Driven through [`IntercomExtension::with_native_supervisor_channel`] — the seam written for
+    /// exactly this and, until now, never called — so neither arm touches
+    /// `CYRUP_SUBAGENT_SUPERVISOR_CHANNEL_DIR` or any other process-global env state.
+    #[tokio::test]
+    async fn native_supervisor_channel_gates_the_legacy_contact_supervisor_tool() {
+        let dir = tempfile::tempdir().unwrap();
+        let child_extension = || {
+            IntercomExtension::new(
+                dir.path().to_path_buf(),
+                dir.path().to_path_buf(),
+                IntercomConfig::default(),
+                Some(child_metadata()),
+            )
+            .expect("a default config builds an extension")
+        };
+
+        // No native channel: the child gets the legacy broker-routed tool (`index.ts:1162-1163`).
+        let legacy = registered_tool_names(child_extension().with_native_supervisor_channel(false)).await;
+        assert!(
+            legacy.iter().any(|n| n == "contact_supervisor"),
+            "a child WITHOUT the native channel must be handed the legacy tool: {legacy:?}"
+        );
+        assert!(legacy.iter().any(|n| n == "intercom"), "`intercom` is registered always: {legacy:?}");
+
+        // Native channel available: the SAME extension minus that one tool — `intercom` still
+        // registers, so the absence below is the gate firing and not a failed `init`.
+        let native = registered_tool_names(child_extension().with_native_supervisor_channel(true)).await;
+        assert!(
+            !native.iter().any(|n| n == "contact_supervisor"),
+            "a child ON the native channel must NOT also get the broker-routed tool: {native:?}"
+        );
+        assert!(native.iter().any(|n| n == "intercom"), "`intercom` is registered always: {native:?}");
     }
 
     /// The two tool renderers are wired to the names the tools actually register under — a renderer

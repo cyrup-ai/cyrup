@@ -34,10 +34,10 @@
 //! handler reaches `BrokerState`'s fields exactly as it did when they shared one file — while the
 //! crate's public surface stays [`run`] alone.
 
-pub mod listener;
-pub mod ratelimit;
-pub mod routing;
-pub mod runtime_claim;
+pub(crate) mod listener;
+pub(crate) mod ratelimit;
+pub(crate) mod routing;
+pub(crate) mod runtime_claim;
 
 mod conn;
 mod dispatch;

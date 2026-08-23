@@ -29,6 +29,12 @@ command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && echo "GH_PATH
 echo "OWNER=$OWNER REPO=$REPO BRANCH=$BRANCH"
 ```
 
+<!-- COVERAGE 2026-08-22: the GH_PATH dispatch line above IS exercised — no `gh` on
+     PATH -> mcp; stub `gh` whose `auth status` exits 0 -> cli; stub whose `auth status` exits 1
+     -> mcp. The `gh` command bodies in the GH_PATH=cli branches of this file are NOT exercised:
+     there is no `gh` binary in this container. They are written against gh's documented
+     behaviour and still need one pass on a machine with `gh` authenticated. -->
+
 **If `GH_PATH=cli`** (a local machine with `gh` authenticated):
 
 ```bash

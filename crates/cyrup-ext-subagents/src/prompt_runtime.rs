@@ -2621,31 +2621,60 @@ mod tests {
     /// `disposed || flushing` early return, so the queued request is never consumed and
     /// `remaining_after` stays 1 forever. Post-fix `FlushGuard::drop` clears the latch and the
     /// second flush drains the inbox.
-    #[tokio::test]
-    async fn a_dropped_flush_future_does_not_wedge_the_steering_inbox() {
+    /// **Why the runtime is built by hand.** The first poll only parks if `flush`'s first `.await`
+    /// parks, and that await is `consume_steer_requests_from_dir` (`background/control.rs:1021`),
+    /// which opens with `tokio::fs::read_dir` — i.e. `spawn_blocking`. Under load the blocking
+    /// thread can finish before the future is first polled, in which case the poll returns `Ready`,
+    /// the mid-body drop never happens, and the PRECONDITION fires (measured: 25/25 in isolation,
+    /// 11 failures in 72 runs at 12x load, every one of them at the precondition, never at the
+    /// latch assertion or the drain — the latch itself is armed at `FlushGuard` construction before
+    /// any `.await`, so no drop point can strand it). The fix is to stop assuming the scheduler:
+    /// the runtime is given a ONE-thread blocking pool and that thread is occupied before the poll,
+    /// so `read_dir`'s blocking job is queued behind it and its `oneshot` cannot be ready. `Pending`
+    /// then follows from the fixture rather than from timing. The assertions are unchanged.
+    #[test]
+    fn a_dropped_flush_future_does_not_wedge_the_steering_inbox() {
         use std::task::{Context, Poll, Waker};
 
-        let temp = tempfile::tempdir().expect("tempdir");
-        let dir = temp.path().join("steer-inbox");
-        std::fs::create_dir_all(&dir).expect("create inbox");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("current-thread runtime with a single-thread blocking pool");
+        rt.block_on(async {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let dir = temp.path().join("steer-inbox");
+            std::fs::create_dir_all(&dir).expect("create inbox");
 
-        let request = crate::background::control::SteerRequest {
-            kind: "steer".to_string(),
-            id: "req-1".to_string(),
-            ts: 1,
-            message: "look at the retry path".to_string(),
-            mode: None,
-            target_index: None,
-            source: None,
-        };
-        crate::background::control::write_steer_request_to_dir(&dir, &request)
-            .await
-            .expect("write request");
+            let request = crate::background::control::SteerRequest {
+                kind: "steer".to_string(),
+                id: "req-1".to_string(),
+                ts: 1,
+                message: "look at the retry path".to_string(),
+                mode: None,
+                target_index: None,
+                source: None,
+            };
+            crate::background::control::write_steer_request_to_dir(&dir, &request)
+                .await
+                .expect("write request");
 
-        let inbox = Arc::new(SteeringInbox::new(dir.clone(), None, None, 0));
-        // `can_steer` is what the turn-lifecycle events set; without it `flush` returns before the
-        // latch is even reached and this test would prove nothing.
-        inbox.state.lock().expect("not poisoned").can_steer = true;
+            let inbox = Arc::new(SteeringInbox::new(dir.clone(), None, None, 0));
+            // `can_steer` is what the turn-lifecycle events set; without it `flush` returns before the
+            // latch is even reached and this test would prove nothing.
+            inbox.state.lock().expect("not poisoned").can_steer = true;
+
+            // Occupy the blocking pool's ONLY thread. Every `tokio::fs` call is `spawn_blocking`, so
+            // from here until `release_tx` fires, `flush`'s `read_dir` can only ever be QUEUED — which
+            // is what makes the `Poll::Pending` below deterministic. The inbox write above is already
+            // complete, so nothing else needs the pool in between.
+            let (occupied_tx, occupied_rx) = std::sync::mpsc::channel::<()>();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let blocker = tokio::task::spawn_blocking(move || {
+                occupied_tx.send(()).expect("report the pool's only thread as busy");
+                release_rx.recv().expect("held until the drop under test has happened");
+        });
+        occupied_rx.recv().expect("the blocking pool's only thread is occupied");
 
         {
             let fut = inbox.flush();
@@ -2666,6 +2695,10 @@ mod tests {
             "a dropped flush must release the re-entrancy latch (pi's `finally`)"
         );
 
+        // Hand the blocking pool back: the flush below has real file I/O to do.
+        release_tx.send(()).expect("release the blocking thread");
+        blocker.await.expect("the blocking task joins");
+
         // The consequence: a later flush still drains the inbox. No services are bound, so each
         // request is acknowledged `failed` and consumed rather than injected — either way it must
         // LEAVE the directory, which a wedged latch would prevent.
@@ -2679,6 +2712,7 @@ mod tests {
             remaining_after, 0,
             "the request must be consumed by the flush that follows a dropped one"
         );
+        });
     }
 
     /// SUBA-045 — a [`cyrup_ext::host::HostServices`] double that answers only `all_tool_names`,
