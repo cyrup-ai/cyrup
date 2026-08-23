@@ -9,6 +9,7 @@ use super::types::{AuthContext, AuthResult, Credential, ProviderEnv};
 use super::{OAuthAuth, ProviderAuth};
 use crate::error::AuthError;
 use crate::model::Model;
+use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::ProviderId;
 use std::sync::Arc;
 
@@ -228,19 +229,6 @@ async fn resolve_stored_oauth(
         env: cred.env().cloned(),
         source: Some("OAuth".to_string()),
     }))
-}
-
-/// Wall clock in Unix **milliseconds** — the unit `Credential::Oauth.expires` is stored in.
-///
-/// Pi writes the deadline as `Date.now() + expires_in * 1000` (ai/src/auth/oauth/anthropic.ts:225
-/// and :338; likewise openai-codex.ts:145, kimi-coding.ts:137, github-copilot.ts:274) and compares
-/// it against `Date.now()` (ai/src/auth/resolve.ts:110). Comparing a millisecond deadline against a
-/// seconds clock made every stored token look valid until roughly the year 57,760.
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

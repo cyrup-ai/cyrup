@@ -20,14 +20,14 @@ use crate::auth::{AuthResult, ProviderEnv};
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
+use crate::stream::sse::{SseFrame, SseRequest};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::utils::constrained_sampling::{
     ConstrainedSamplingError, resolve_json_schema_strict_sampling,
 };
 use crate::utils::hash::short_hash;
-use crate::utils::provider_retry::ProviderRetry;
+use crate::utils::provider_plumbing::{connect_sse, now_millis, resolve_cache_retention};
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
     ToolCall, ToolCallId, Usage,
@@ -123,49 +123,9 @@ impl ApiImpl for OpenAiCompletionsApi {
             body: Some(body),
         };
 
-        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
-        // node-http-proxy.ts:92-112).
-        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
-        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
-        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
-        let client = match build_client_for_target(
-            &req.url,
-            &crate::auth::types::EnvAuthContext,
-            auth.env.as_ref(),
-            opts.timeout_ms,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
-                return;
-            }
+        let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {
+            return;
         };
-
-        // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
-        let capture = crate::stream::ResponseCapture::default();
-        let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(
-            &client,
-            req,
-            cancel,
-            None,
-            on_resp,
-            ProviderRetry::from_options(opts),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                // transport / non-2xx / abort-during-connect → terminal Error (R-01-018/045)
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
-                return;
-            }
-        };
-        capture.fire(opts, model).await;
 
         decode_stream(frames, model, &self.api, &sink).await;
     }
@@ -297,32 +257,9 @@ pub(crate) fn build_body(model: &Model, ctx: &Context, opts: &StreamOptions) -> 
         .expect("fixture declares no unsatisfiable constrained sampling")
 }
 
-/// Resolve a provider env value (Pi `getProviderEnvValue`, provider-env.ts:45-52): the scoped
-/// `env` overlay wins over the process environment.
-fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
-    if let Some(map) = env
-        && let Some(v) = map.get(name).filter(|v| !v.is_empty())
-    {
-        return Some(v.clone());
-    }
-    std::env::var(name).ok().filter(|v| !v.is_empty())
-}
-
-/// Resolve the effective cache retention (1:1 port of Pi `resolveCacheRetention`,
-/// openai-completions.ts:141-149): an explicit caller value wins; otherwise `PI_CACHE_RETENTION ==
-/// "long"` promotes to `Long`; otherwise `Short`.
-fn resolve_cache_retention(
-    cache_retention: Option<CacheRetention>,
-    env: Option<&ProviderEnv>,
-) -> CacheRetention {
-    if let Some(c) = cache_retention {
-        return c;
-    }
-    if provider_env_value("PI_CACHE_RETENTION", env).as_deref() == Some("long") {
-        return CacheRetention::Long;
-    }
-    CacheRetention::Short
-}
+// `getProviderEnvValue` (provider-env.ts:45-52) and `resolveCacheRetention`
+// (openai-completions.ts:141-149) live in `crate::utils::provider_plumbing`: this file carried
+// byte-identical ports of both, shared with anthropic-messages and openai-responses.
 
 /// Env-aware `build_body`: `env` is the provider-scoped overlay (Pi `options.env`) consulted by
 /// [`resolve_cache_retention`] for the `PI_CACHE_RETENTION` fallback.
@@ -2214,14 +2151,6 @@ fn parse_partial_json(s: &str) -> Map<String, Value> {
     crate::utils::json_parse::parse_streaming_json_object(Some(s))
 }
 
-/// Current unix time in milliseconds (0 on a clock error — never panics).
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
@@ -3447,8 +3376,10 @@ mod tests {
         };
 
         // openai detects `supportsStrictMode: true` ⇒ `strict: true` for a constrained tool…
-        let mut ctx = Context::default();
-        ctx.tools = vec![tool(StrictSampling::Prefer)];
+        let mut ctx = Context {
+            tools: vec![tool(StrictSampling::Prefer)],
+            ..Default::default()
+        };
         let body = build_body(&openai_model(), &ctx, &StreamOptions::default());
         assert_eq!(body["tools"][0]["function"]["strict"], json!(true));
 
@@ -3554,7 +3485,7 @@ mod tests {
             Some(&Some("sess-7".to_string()))
         );
         assert!(
-            headers.get("x-session-id").is_none(),
+            !headers.contains_key("x-session-id"),
             "the openai form never sends OpenRouter's header"
         );
 
@@ -3630,9 +3561,9 @@ mod tests {
         });
         let h = headers_for(&router);
         assert_eq!(h.get("x-session-id"), Some(&Some("sess-7".to_string())));
-        assert!(h.get("session_id").is_none());
-        assert!(h.get("x-client-request-id").is_none());
-        assert!(h.get("x-session-affinity").is_none());
+        assert!(!h.contains_key("session_id"));
+        assert!(!h.contains_key("x-client-request-id"));
+        assert!(!h.contains_key("x-session-affinity"));
 
         // "openai-nosession": the pair WITHOUT `session_id` — pi's documented migration target for
         // the `sendSessionIdHeader: false` flag it deleted (packages/ai/CHANGELOG.md:168).
@@ -3643,7 +3574,7 @@ mod tests {
             ..Default::default()
         });
         let h = headers_for(&nos);
-        assert!(h.get("session_id").is_none());
+        assert!(!h.contains_key("session_id"));
         assert_eq!(
             h.get("x-client-request-id"),
             Some(&Some("sess-7".to_string()))
@@ -3652,6 +3583,6 @@ mod tests {
             h.get("x-session-affinity"),
             Some(&Some("sess-7".to_string()))
         );
-        assert!(h.get("x-session-id").is_none());
+        assert!(!h.contains_key("x-session-id"));
     }
 }

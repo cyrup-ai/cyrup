@@ -789,13 +789,14 @@ fn level_key(level: ModelThinkingLevel) -> &'static str {
 /// provider-specific value". It does NOT — that meaning belongs to ABSENCE. `thinkingLevelMap` is
 /// three-way, and Pi keeps all three cases distinct at BOTH ends, filter and wire:
 ///   - absent    → supported; wire sends the generic level name, because the lookup is defaulted
-///                 (`model.thinkingLevelMap?.[level] ?? options.reasoningEffort`,
-///                 `api/openai-completions.ts:875` @v0.84.2). THIS is "no mapped value".
+///     (`model.thinkingLevelMap?.[level] ?? options.reasoningEffort`,
+///     `api/openai-completions.ts:875` @v0.84.2). THIS is "no mapped value".
 ///   - `Some(v)` → supported; wire sends `v` in place of the level name (`:882`).
 ///   - `null`    → the rung does not exist on this model; the wire emits NOTHING for it, gated
-///                 BEFORE any default: `else if (model.thinkingLevelMap?.off !== null)`
-///                 (`api/openai-completions.ts:870`, `:884`, `:905`; `openai-responses.ts:333`;
-///                 `anthropic-messages.ts:1087`) — the off-switch is suppressed, not defaulted.
+///     BEFORE any default: `else if (model.thinkingLevelMap?.off !== null)`
+///     (`api/openai-completions.ts:870`, `:884`, `:905`; `openai-responses.ts:333`;
+///     `anthropic-messages.ts:1087`) — the off-switch is suppressed, not defaulted.
+///
 /// `if (mapped === null) return false` (`models.ts:668` @v0.83.0; unchanged at `:907` @v0.84.2) is
 /// simply the filter half of that same three-way, so `Some(None) => false` below is correct as
 /// written. Upstream pins it by test: `{off,minimal,low,medium: null, xhigh: "max"}` yields exactly
@@ -1696,7 +1697,7 @@ mod tests {
         let final_headers = out.headers.expect("headers");
         assert_eq!(final_headers.get("x-test"), Some(&Some("1".to_string())));
         assert!(
-            final_headers.get("x-api-key").is_none(),
+            !final_headers.contains_key("x-api-key"),
             "removing a header inside the transform must suppress it"
         );
         // And it is not visible to the api impl as an option field (models.ts:483).

@@ -25,7 +25,6 @@ use crate::api::compat::{
 use crate::utils::constrained_sampling::ConstrainedSamplingError;
 use crate::api::openai_responses::{
     ConvertResponsesToolsOptions, convert_responses_messages, convert_responses_tools, decode_stream,
-    provider_env_value,
 };
 use crate::api::{ApiImpl, EventSink};
 use crate::auth::AuthResult;
@@ -35,8 +34,8 @@ use crate::context::Context;
 use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
-use crate::stream::sse::{SseRequest, build_client_for_target, open_sse};
-use crate::utils::provider_retry::ProviderRetry;
+use crate::stream::sse::SseRequest;
+use crate::utils::provider_plumbing::{connect_sse, provider_env_value};
 use cyrup_core::{ApiId, CancelToken, ModelThinkingLevel};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeMap;
@@ -163,48 +162,9 @@ impl ApiImpl for AzureOpenAiResponsesApi {
             body: Some(body),
         };
 
-        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
-        // node-http-proxy.ts:92-112).
-        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
-        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
-        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
-        let client = match build_client_for_target(
-            &req.url,
-            &crate::auth::types::EnvAuthContext,
-            auth.env.as_ref(),
-            opts.timeout_ms,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
-                return;
-            }
+        let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {
+            return;
         };
-
-        // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
-        let capture = crate::stream::ResponseCapture::default();
-        let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(
-            &client,
-            req,
-            cancel,
-            None,
-            on_resp,
-            ProviderRetry::from_options(opts),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
-                return;
-            }
-        };
-        capture.fire(opts, model).await;
 
         // Azure speaks the identical Responses SSE wire format → reuse the shared decoder.
         decode_stream(frames, model, &self.api, &sink).await;

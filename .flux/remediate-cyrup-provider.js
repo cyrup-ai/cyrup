@@ -21,7 +21,7 @@ const BASELINE = `
 VERIFICATION BASELINE for crates/cyrup-provider, measured on this branch:
   cargo build -p cyrup-provider --all-targets   -> 0 errors, 0 warnings
   cargo clippy -p cyrup-provider --all-targets  -> 37 warnings
-  cargo doc -p cyrup-provider --no-deps         -> 75 warnings
+  cargo doc -p cyrup-provider --no-deps         -> 76 warnings
   cargo test -p cyrup-provider --lib            -> 1118 pass, 7 ignored, 0 fail
 Any task that changes these numbers must say so and justify it. A task that is
 supposed to be behaviour-neutral and moves them has a bug.

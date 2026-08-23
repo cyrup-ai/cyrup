@@ -69,10 +69,10 @@ async fn get_proxy_env(key: &str, ctx: &dyn AuthContext, env: Option<&ProviderEn
     // an ambient variable explicitly set to the EMPTY string, and `getProxyEnv`'s `||` then skips
     // it, so `HTTPS_PROXY=""` upstream means "no proxy" even with the setting configured. Here the
     // empty value is indistinguishable from unset and the setting applies.
-    if lower == "http_proxy" || lower == "https_proxy" {
-        if let Some(configured) = crate::stream::sse::configured_http_proxy() {
-            return configured;
-        }
+    if (lower == "http_proxy" || lower == "https_proxy")
+        && let Some(configured) = crate::stream::sse::configured_http_proxy()
+    {
+        return configured;
     }
     String::new()
 }

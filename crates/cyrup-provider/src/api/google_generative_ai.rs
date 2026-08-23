@@ -23,14 +23,14 @@ use crate::collection::clamp_thinking_level;
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::{Modality, Model};
-use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
+use crate::stream::sse::{SseFrame, SseRequest};
 use crate::stream::{StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
 use crate::utils::constrained_sampling::{
     ConstrainedSamplingError, resolve_json_schema_strict_sampling,
 };
 use crate::utils::json_parse::parse_json_with_repair;
-use crate::utils::provider_retry::ProviderRetry;
+use crate::utils::provider_plumbing::{connect_sse, now_millis};
 use crate::utils::simple_options::ThinkingBudgets;
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, ModelThinkingLevel, StopReason,
@@ -131,48 +131,9 @@ impl ApiImpl for GoogleGenerativeAiApi {
             body: Some(body),
         };
 
-        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
-        // node-http-proxy.ts:92-112).
-        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
-        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
-        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
-        let client = match build_client_for_target(
-            &req.url,
-            &crate::auth::types::EnvAuthContext,
-            auth.env.as_ref(),
-            opts.timeout_ms,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
-                return;
-            }
+        let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {
+            return;
         };
-
-        // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
-        let capture = crate::stream::ResponseCapture::default();
-        let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(
-            &client,
-            req,
-            cancel,
-            None,
-            on_resp,
-            ProviderRetry::from_options(opts),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
-                return;
-            }
-        };
-        capture.fire(opts, model).await;
 
         decode_stream(frames, model, &self.api, &sink).await;
     }
@@ -1422,14 +1383,6 @@ async fn emit_error(dec: &Decoder, model: &Model, api: &ApiId, sink: &EventSink,
     msg.stop_reason = StopReason::Error;
     msg.error_message = Some(message);
     sink.send(StreamEvent::terminal(msg)).await;
-}
-
-/// Current unix time in milliseconds (0 on a clock error — never panics).
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

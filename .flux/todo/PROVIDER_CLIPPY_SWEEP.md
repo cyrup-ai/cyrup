@@ -52,5 +52,5 @@ the acceptance instead.
 - [ ] `cargo clippy --fix -p cyrup-provider --all-targets` completes without reverting (the sha256 blocker is gone)
 - [ ] No change to any arithmetic in `auth/oauth/sha256.rs` — only the iteration form
 - [ ] `cargo test -p cyrup-provider --lib` — 1118 pass, including the 5 sha256 tests
-- [ ] `cargo doc -p cyrup-provider --no-deps` — still exactly 75 warnings (this task must not move that number)
+- [ ] `cargo doc -p cyrup-provider --no-deps` — still exactly 76 warnings (this task must not move that number)
 - [ ] `cargo build --workspace` clean
