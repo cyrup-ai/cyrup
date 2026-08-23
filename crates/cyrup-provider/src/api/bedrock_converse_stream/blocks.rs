@@ -3,6 +3,7 @@
 use crate::model::Model;
 use crate::usage::compute_cost;
 use crate::utils::json_parse::parse_streaming_json_object;
+use crate::utils::provider_plumbing::now_millis;
 use cyrup_core::{ApiId, AssistantMessage, Content, StopReason, ToolCall, ToolCallId, Usage};
 
 /// One in-progress content block, keyed by Bedrock's `contentBlockIndex` (pi's `Block` type,
@@ -116,12 +117,4 @@ fn blocks_to_content(blocks: &[Block]) -> Vec<Content> {
             }),
         })
         .collect()
-}
-
-/// Current unix time in milliseconds (0 on a clock error — never panics).
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }

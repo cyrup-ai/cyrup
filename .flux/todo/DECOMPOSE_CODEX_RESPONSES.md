@@ -59,5 +59,5 @@ Follow `crates/cyrup-provider/src/api/bedrock_converse_stream/` exactly — the 
 - [ ] `api/mod.rs` is unedited — `pub mod openai_codex_responses;` resolves to the directory
 - [ ] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
 - [ ] `cargo clippy -p cyrup-provider --all-targets` — still 37 warnings, none new in this module
-- [ ] `cargo doc -p cyrup-provider --no-deps` — still 75 warnings, none new in this module
+- [ ] `cargo doc -p cyrup-provider --no-deps` — still 76 warnings, none new in this module
 - [ ] `cargo test -p cyrup-provider --lib` — 1118 pass; the 34 tests in this module all still run

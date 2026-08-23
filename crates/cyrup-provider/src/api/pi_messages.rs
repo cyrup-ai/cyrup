@@ -54,6 +54,7 @@ use crate::model::Model;
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::utils::json_parse::parse_streaming_json_object;
+use crate::utils::provider_plumbing::{now_millis, provider_env_value};
 use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{
     ApiId, AssistantMessage, AssistantMessageDiagnostic, CancelToken, Content, Cost,
@@ -306,17 +307,6 @@ pub(crate) fn build_headers(opts: &StreamOptions, api_key: &str) -> HeaderMap {
         }
     }
     headers
-}
-
-/// Resolve a provider env value (Pi `getProviderEnvValue`, provider-env.ts:45-53): the scoped
-/// overlay wins over the process environment.
-fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
-    if let Some(map) = env
-        && let Some(v) = map.get(name).filter(|v| !v.is_empty())
-    {
-        return Some(v.clone());
-    }
-    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 /// 1:1 port of Pi's `resolveCacheRetention` (pi-messages.ts:337-343).
@@ -978,14 +968,6 @@ fn merge_tool_call(tc: &mut ToolCall, raw: Option<&Value>) {
     if let Some(sig) = raw.get("thoughtSignature").and_then(Value::as_str) {
         tc.thought_signature = Some(sig.to_string());
     }
-}
-
-/// Current unix time in milliseconds (0 on a clock error — never panics).
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

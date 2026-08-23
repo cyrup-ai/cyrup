@@ -34,5 +34,5 @@ visibility minimized by strip-and-restore under the compiler; banner titles beco
 - [ ] `api/mod.rs` unedited; `azure_openai_responses.rs` (which shares this wire shape) still compiles untouched
 - [ ] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
 - [ ] `cargo clippy -p cyrup-provider --all-targets` — still 37 warnings, none new here
-- [ ] `cargo doc -p cyrup-provider --no-deps` — still 75 warnings, none new here
+- [ ] `cargo doc -p cyrup-provider --no-deps` — still 76 warnings, none new here
 - [ ] `cargo test -p cyrup-provider --lib` — 1118 pass, 32 tests still run in this module

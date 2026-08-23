@@ -58,6 +58,7 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::StreamOptions;
 use crate::stream::sse::{SseRequest, build_client_for_target, open_sse};
+use crate::utils::provider_plumbing::provider_env_value;
 use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{ApiId, CancelToken};
 use std::sync::Arc;
@@ -255,17 +256,6 @@ fn is_placeholder_api_key(api_key: &str) -> bool {
         return false;
     };
     !inner.is_empty() && !inner.contains('>')
-}
-
-/// pi `getProviderEnvValue(name, env)` (`provider-env.ts:44-52`): the provider-scoped overlay wins
-/// over the process environment, and an empty string counts as absent (JS `||`).
-fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
-    if let Some(map) = env
-        && let Some(v) = map.get(name).filter(|v| !v.is_empty())
-    {
-        return Some(v.clone());
-    }
-    std::env::var(name).ok().filter(|v| !v.is_empty())
 }
 
 /// 1:1 port of pi `resolveProject` (`google-vertex.ts:396-406`), including the `GCLOUD_PROJECT`
@@ -649,7 +639,7 @@ mod tests {
             headers.get("authorization").cloned().flatten().as_deref(),
             Some("Bearer ya29.tok")
         );
-        assert!(headers.get("x-goog-api-key").is_none());
+        assert!(!headers.contains_key("x-goog-api-key"));
     }
 
     #[test]
@@ -660,7 +650,7 @@ mod tests {
             headers.get("x-goog-api-key").cloned().flatten().as_deref(),
             Some("AIza")
         );
-        assert!(headers.get("authorization").is_none());
+        assert!(!headers.contains_key("authorization"));
     }
 
     #[test]

@@ -12,7 +12,7 @@ Three rustdoc invocations on `cyrup-provider`, keyed by `file:line :: warning` r
 by count alone:
 
 ```
-cargo doc -p cyrup-provider --no-deps                              -> 75 warnings
+cargo doc -p cyrup-provider --no-deps                              -> 76 warnings
 cargo doc -p cyrup-provider --no-deps --document-private-items     -> 81
 cargo doc -p cyrup-provider --no-deps --all-features --document-private-items -> 81 (different set)
 ```

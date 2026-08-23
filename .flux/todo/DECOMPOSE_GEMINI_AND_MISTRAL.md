@@ -50,5 +50,5 @@ boundaries — do not reorder items to make a tidier module.
 - [ ] `api/mod.rs` unedited; `google_vertex.rs` still compiles untouched
 - [ ] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
 - [ ] `cargo clippy -p cyrup-provider --all-targets` — still 37 warnings, none new here
-- [ ] `cargo doc -p cyrup-provider --no-deps` — still 75 warnings, none new here
+- [ ] `cargo doc -p cyrup-provider --no-deps` — still 76 warnings, none new here
 - [ ] `cargo test -p cyrup-provider --lib` — 1118 pass; 24 + 15 tests still run in these modules

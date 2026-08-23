@@ -10,6 +10,7 @@ use super::options::{BedrockOptions, BedrockThinkingDisplay};
 use crate::context::Context;
 use crate::model::Model;
 use crate::stream::{CacheRetention, StreamOptions};
+use crate::utils::provider_plumbing::resolve_cache_retention_with;
 use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
 use cyrup_core::ThinkingLevel;
 use serde_json::{Map, Value, json};
@@ -19,7 +20,7 @@ pub(super) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05
 
 /// Build the `ConverseStreamCommand` input (pi `commandInput`,
 /// `bedrock-converse-stream.ts:230-241`), including the `modelId` URI label so `onPayload` sees the
-/// same object upstream hands it. [`split_command_input`] lifts `modelId` back out afterwards.
+/// same object upstream hands it. [`split_command_input`](super::driver::split_command_input) lifts `modelId` back out afterwards.
 ///
 /// Returns `Err(message)` for the one throwing path upstream has on this route:
 /// `createImageBlock`'s `Unknown image type: <mimeType>` (`:1106`).
@@ -108,17 +109,14 @@ pub(super) fn build_params(
 
 /// pi `resolveCacheRetention` (`bedrock-converse-stream.ts:640-648`): explicit wins, else
 /// `PI_CACHE_RETENTION=long` promotes, else `"short"`.
+///
+/// The ladder itself is the shared one; only the lookup differs, because bedrock reads through
+/// [`EnvSource`] rather than a bare overlay (its ambient map is a test seam).
 pub(super) fn resolve_cache_retention(
     cache_retention: Option<CacheRetention>,
     env: &EnvSource<'_>,
 ) -> CacheRetention {
-    if let Some(c) = cache_retention {
-        return c;
-    }
-    if env.get("PI_CACHE_RETENTION").as_deref() == Some("long") {
-        return CacheRetention::Long;
-    }
-    CacheRetention::Short
+    resolve_cache_retention_with(cache_retention, |name| env.get(name))
 }
 
 /// pi `buildAdditionalModelRequestFields` (`bedrock-converse-stream.ts:1039-1087`).

@@ -18,7 +18,7 @@ use crate::auth::{AuthResult, ProviderEnv};
 use crate::context::{Context, ToolDef};
 use crate::error::ProviderError;
 use crate::model::Model;
-use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
+use crate::stream::sse::{SseFrame, SseRequest};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::utils::constrained_sampling::{
@@ -26,7 +26,7 @@ use crate::utils::constrained_sampling::{
 };
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
-use crate::utils::provider_retry::ProviderRetry;
+use crate::utils::provider_plumbing::{connect_sse, now_millis, resolve_cache_retention};
 use crate::utils::simple_options::{adjust_max_tokens_for_thinking, clamp_max_tokens_to_context};
 use cyrup_core::{
     ApiId, AssistantMessage, CancelToken, Content, Message, StopReason, ThinkingLevel, ToolCall,
@@ -181,48 +181,9 @@ impl ApiImpl for AnthropicMessagesApi {
             body: Some(body),
         };
 
-        // Honor HTTP(S)_PROXY for the live client (Pi resolveHttpProxyUrlForTarget,
-        // node-http-proxy.ts:92-112; applied per request as in bedrock-converse-stream.ts:187).
-        // PROV-006: the request idle timeout. `StreamOptions.timeout_ms` overrides the
-        // process-global `configure_http_idle_timeout` default, exactly as Pi layers the SDK
-        // client's `timeout` on top of the global undici dispatcher (sdk.ts:304-309).
-        let client = match build_client_for_target(
-            &req.url,
-            &crate::auth::types::EnvAuthContext,
-            auth.env.as_ref(),
-            opts.timeout_ms,
-        )
-        .await
-        {
-            Ok(c) => c,
-            Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
-                return;
-            }
+        let Some(frames) = connect_sse(req, model, auth, opts, cancel, &sink).await else {
+            return;
         };
-
-        // gap-08 #3: capture {status, headers} at connect, then fire `after_provider_response`.
-        let capture = crate::stream::ResponseCapture::default();
-        let on_resp = capture.sse_hook(opts);
-        let frames = match open_sse(
-            &client,
-            req,
-            cancel,
-            None,
-            on_resp,
-            ProviderRetry::from_options(opts),
-        )
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                sink.send(e.into_error_event(provider, &model_id, Some(model.api.clone())))
-                    .await;
-                return;
-            }
-        };
-        capture.fire(opts, model).await;
 
         decode_stream(frames, model, &self.api, &sink, is_oauth, &ctx.tools).await;
     }
@@ -365,31 +326,10 @@ fn off_is_not_null(model: &Model) -> bool {
 // ---------------------------------------------------------------------------
 // Cache retention (Pi resolveCacheRetention / getCacheControl)
 // ---------------------------------------------------------------------------
-
-/// Resolve a provider env value (Pi `getProviderEnvValue`): the scoped overlay wins over the process
-/// environment.
-fn provider_env_value(name: &str, env: Option<&ProviderEnv>) -> Option<String> {
-    if let Some(map) = env
-        && let Some(v) = map.get(name).filter(|v| !v.is_empty())
-    {
-        return Some(v.clone());
-    }
-    std::env::var(name).ok().filter(|v| !v.is_empty())
-}
-
-/// 1:1 port of Pi `resolveCacheRetention` (anthropic-messages.ts:46-54).
-fn resolve_cache_retention(
-    cache_retention: Option<CacheRetention>,
-    env: Option<&ProviderEnv>,
-) -> CacheRetention {
-    if let Some(c) = cache_retention {
-        return c;
-    }
-    if provider_env_value("PI_CACHE_RETENTION", env).as_deref() == Some("long") {
-        return CacheRetention::Long;
-    }
-    CacheRetention::Short
-}
+//
+// `resolveCacheRetention` (anthropic-messages.ts:46-54) lives in
+// `crate::utils::provider_plumbing`: openai-completions.ts:141-149 and openai-responses.ts:47-55
+// declare the identical three-line ladder, and this file carried one of three byte-identical ports.
 
 /// The `cache_control` ephemeral marker for the resolved retention (Pi `getCacheControl`,
 /// anthropic-messages.ts:56-70). `None` when retention is `none`.
@@ -1964,14 +1904,6 @@ fn apply_message_delta_usage(usage: &mut Usage, raw: &Value) {
     {
         usage.reasoning = Some(v);
     }
-}
-
-/// Current unix time in milliseconds (0 on a clock error — never panics).
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -62,6 +62,7 @@
 
 use crate::auth::types::{AuthContext, ProviderEnv};
 use crate::error::ProviderError;
+use crate::utils::provider_plumbing::now_millis;
 use base64::Engine as _;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -399,14 +400,6 @@ struct TokenResponse {
     access_token: String,
     #[serde(default)]
     expires_in: Option<i64>,
-}
-
-/// Wall clock in Unix milliseconds.
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 /// POST a form to a Google token endpoint and read the access token out of the response.

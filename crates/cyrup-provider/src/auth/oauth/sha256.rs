@@ -41,11 +41,10 @@ fn word(w: &[u32; 64], i: usize) -> u32 {
 pub fn sha256(data: &[u8]) -> [u8; 32] {
     let mut state = H0;
 
-    let mut blocks = data.chunks_exact(64);
-    for block in blocks.by_ref() {
+    let (blocks, rest) = data.as_chunks::<64>();
+    for block in blocks {
         compress(&mut state, block);
     }
-    let rest = blocks.remainder();
 
     // FIPS 180-4 §5.1.1 padding: 0x80, zeroes, then the 64-bit big-endian bit length.
     let bit_len = (data.len() as u64).wrapping_mul(8);
@@ -66,12 +65,12 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     {
         *dst = *src;
     }
-    for block in tail.get(..total).unwrap_or(&[]).chunks_exact(64) {
+    for block in tail.get(..total).unwrap_or(&[]).as_chunks::<64>().0 {
         compress(&mut state, block);
     }
 
     let mut out = [0u8; 32];
-    for (chunk, word) in out.chunks_exact_mut(4).zip(state.iter()) {
+    for (chunk, word) in out.as_chunks_mut::<4>().0.iter_mut().zip(state.iter()) {
         for (dst, src) in chunk.iter_mut().zip(word.to_be_bytes().iter()) {
             *dst = *src;
         }
@@ -80,12 +79,11 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 /// FIPS 180-4 §6.2.2 — one 64-byte block. `block` shorter than 64 bytes is impossible here
-/// (every caller feeds a `chunks_exact(64)` item); a short slice would simply zero-extend.
+/// (every caller feeds an `as_chunks::<64>()` item); a short slice would simply zero-extend.
 fn compress(state: &mut [u32; 8], block: &[u8]) {
     let mut w = [0u32; 64];
-    for (dst, src) in w.iter_mut().zip(block.chunks_exact(4)) {
-        let bytes: [u8; 4] = src.try_into().unwrap_or([0; 4]);
-        *dst = u32::from_be_bytes(bytes);
+    for (dst, src) in w.iter_mut().zip(block.as_chunks::<4>().0) {
+        *dst = u32::from_be_bytes(*src);
     }
     for i in 16..64 {
         let w15 = word(&w, i - 15);

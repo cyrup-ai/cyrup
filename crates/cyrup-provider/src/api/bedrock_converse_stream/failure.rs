@@ -7,7 +7,7 @@ use cyrup_core::{
 use serde_json::{Map, Value, json};
 
 /// A failure inside the ported `try` block: the partial snapshot to attach plus the composed
-/// `errorMessage` (already run through [`format_bedrock_error`]).
+/// `errorMessage` (already run through [`format_bedrock_error`](super::errors::format_bedrock_error)).
 ///
 /// `status`/`error_code` are the parts of upstream's thrown SDK exception that survive into the
 /// structured diagnostic (`error.$metadata.httpStatusCode` and `error.name`); they are `None` for

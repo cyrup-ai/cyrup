@@ -51,5 +51,5 @@ visibility minimized by strip-and-restore under the compiler; banner titles beco
 - [ ] `api/mod.rs` unedited; other api impls that import from this module still compile untouched
 - [ ] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
 - [ ] `cargo clippy -p cyrup-provider --all-targets` — still 37 warnings, none new here
-- [ ] `cargo doc -p cyrup-provider --no-deps` — still 75 warnings, none new here
+- [ ] `cargo doc -p cyrup-provider --no-deps` — still 76 warnings, none new here
 - [ ] `cargo test -p cyrup-provider --lib` — 1118 pass, 34 tests still run in this module

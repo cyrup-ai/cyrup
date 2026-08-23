@@ -66,6 +66,7 @@ use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions, ToolChoice};
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::http_date::parse_http_date_ms;
+use crate::utils::provider_plumbing::now_millis;
 use crate::utils::provider_retry::ProviderRetry;
 use base64::Engine as _;
 use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
@@ -696,6 +697,7 @@ fn codex_user_agent() -> String {
 /// * `tool_choice` and `parallel_tool_calls` are always present;
 /// * `reasoning` is emitted purely from the requested effort, with no `model.reasoning` gate and no
 ///   `off`-branch `{effort}`-only body.
+///
 /// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws: `convertResponsesTools` rejects a
 /// `strict: "require"` tool on a route without strict mode (`constrained-sampling.ts:91-95`
 /// @v0.83.0). PROV-011.
@@ -1282,13 +1284,6 @@ async fn sleep_or_abort(cancel: &CancelToken, delay_ms: u64) -> bool {
         )))
         .await
         .is_some()
-}
-
-fn now_millis() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
 }
 
 #[cfg(test)]

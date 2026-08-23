@@ -24,6 +24,11 @@
 //! upstream files they port 1:1:
 //! - [`node_http_proxy`] — `HTTP(S)_PROXY`/`NO_PROXY` resolution (`utils/node-http-proxy.ts`).
 //! - [`provider_retry`] — the server-directed request-retry policy (`utils/provider-retry.ts`).
+//!
+//! One member is crate-private and is NOT a 1:1 port of an upstream file: `provider_plumbing`
+//! holds cyrup's own cross-`api/` glue (`getProviderEnvValue`, the `resolveCacheRetention` ladder,
+//! `Date.now()` in ms, and the direct-wire SSE connect sequence pi delegates to a vendor SDK),
+//! each of which had been copy-pasted into every `api/<protocol>.rs` that needed it.
 
 pub mod constrained_sampling;
 pub mod deferred_tools;
@@ -34,6 +39,7 @@ pub mod http_date;
 pub mod json_parse;
 pub mod node_http_proxy;
 pub mod overflow;
+pub(crate) mod provider_plumbing;
 pub mod provider_retry;
 pub mod refresh;
 pub mod regexlite;
