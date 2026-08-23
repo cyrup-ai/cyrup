@@ -13,15 +13,21 @@
 //! `anyhow` boundary (arch-00 §8).
 #![forbid(unsafe_code)]
 
+pub mod actions;
+pub mod bootstrap;
 pub mod cli;
 pub mod credential_print;
 pub mod diagnostics;
 pub mod input;
+pub mod interactive;
 pub mod intercom_broker_cmd;
 pub mod migrations;
 pub mod output_guard;
+pub mod predispatch;
+pub mod prelaunch;
 pub mod provider;
 pub mod run;
+pub mod session_launch;
 pub mod session_resolve;
 pub mod signals;
 pub mod startup;

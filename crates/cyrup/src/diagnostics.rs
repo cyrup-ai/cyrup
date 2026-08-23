@@ -339,6 +339,62 @@ pub fn format_no_models_available_message() -> String {
 /// The hint shown after an extension-load failure (Pi `EXTENSION_LOAD_FAILURE_HINT`, main.ts:52).
 pub const EXTENSION_LOAD_FAILURE_HINT: &str = "Hint: Start without extensions using \"cyrup -ne\".";
 
+/// Report parse/settings diagnostics to **stderr** (Pi `reportDiagnostics`, main.ts:87-93): warnings
+/// prefixed `Warning:`, errors `Error:`. Colour is omitted (no colour dep at the bin boundary).
+pub fn report(diagnostics: &[Diagnostic]) {
+    for d in diagnostics {
+        match d.level {
+            DiagnosticLevel::Error => eprintln!("Error: {}", d.message),
+            DiagnosticLevel::Warning => eprintln!("Warning: {}", d.message),
+        }
+    }
+}
+
+/// Pi's SECOND `reportDiagnostics` checkpoint — `reportDiagnostics(runtime.diagnostics)` +
+/// `process.exit(1)` on any error (main.ts:843-848). Returns `true` when the caller must exit 1.
+///
+/// SEAM-S01: `AgentSessionRuntime::diagnostics()` had NO production consumer, which is why a
+/// mistyped `--flag` (captured as an extension flag, then owned by no loaded extension) was
+/// swallowed with no message and exit 0. Runs in every mode, exactly like Pi's single call site,
+/// which sits after runtime creation and before the mode dispatch.
+///
+/// EXT-S01: extension LOAD failures ride this channel too. Containment (one built-in's failing
+/// `init()` no longer aborts the whole build) is Pi's `loader.ts:537-540` `errors.push(...); continue`
+/// — but Pi then LIFTS those errors onto `runtime.diagnostics` (`main.ts:735-738`) and exits 1 on
+/// them, including Pi's `EXTENSION_LOAD_FAILURE_HINT` (`main.ts:61`, `:844-846`), reproduced below.
+/// Routing them to the interactive-only `[Extension issues]` panel alone would leave print/json/rpc
+/// silent at exit 0 — and cyrup's natives include the permission gate, so that would be fail-OPEN.
+pub async fn report_runtime(runtime: &cyrup_session_svc::AgentSessionRuntime) -> bool {
+    let diagnostics = runtime.diagnostics().await;
+    let mut fatal = false;
+    for d in &diagnostics {
+        if d.severity == "error" {
+            fatal = true;
+            eprintln!("Error: {}", d.message);
+        } else {
+            eprintln!("Warning: {}", d.message);
+        }
+    }
+    // Pi `main.ts:844-846`: matched on the message text, over ALL diagnostics, not just the errors.
+    if fatal && diagnostics.iter().any(|d| d.message.contains(EXTENSION_LOAD_FAILURE_MARKER)) {
+        eprintln!("{EXTENSION_LOAD_FAILURE_HINT}");
+    }
+    fatal
+}
+
+/// Pi `main.ts:844` — the substring that selects the extension-load hint.
+pub const EXTENSION_LOAD_FAILURE_MARKER: &str = "Failed to load extension";
+
+/// The non-interactive no-models-available exit — pi
+/// `console.error(chalk.red(formatNoModelsAvailableMessage())); process.exit(1);`
+/// (main.ts:853-854 @v0.83.0, inside the `appMode !== "interactive"` gate at :852-855). Prints the
+/// provider login guidance to stderr; the caller supplies pi's exit code 1. Interactive never calls
+/// this: it
+/// launches modelless and shows the same text as a banner instead (SEAM-075).
+pub fn no_models_available() {
+    eprintln!("{}", format_no_models_available_message());
+}
+
 #[cfg(test)]
 #[allow(
     clippy::unwrap_used,
