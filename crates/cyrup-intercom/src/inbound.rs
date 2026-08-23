@@ -626,7 +626,12 @@ pub fn surface_incoming_message(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::unreachable
+    )]
     use super::*;
     use crate::config::IntercomConfig;
     use crate::transport::protocol::{AttachmentKind, MessageContent};
@@ -805,23 +810,28 @@ mod tests {
     /// One captured `inject_message` call: `(content, custom_type, display, trigger_turn)`.
     type InjectedCall = (String, Option<String>, bool, bool);
 
-    /// A `HostServices` double with a SETTABLE `is_idle` — the live run-in-flight signal
+    /// A `HostServices` double pinned at a FIXED `is_idle` — the live run-in-flight signal
     /// (`cyrup_ext::HostServices::is_idle`, pi `ctx.isIdle()`) — recording every `inject_message`
-    /// so the pending-idle flush's real delivery is observable.
+    /// so the delivery a policy actually performs is observable.
+    ///
+    /// The flag is chosen once at construction and never transitions, because nothing in this
+    /// crate observes a busy-to-idle flip: `decide_inbound_policy` takes `is_idle` BY VALUE and
+    /// re-reads it per call, and the park-until-idle machine whose debounced flush a settable
+    /// flag would once have driven was deleted upstream at v0.9.3 (`25ffb96`) — see
+    /// `InboundPolicy::Steer` above, which names all eight removed symbols. The busy-to-idle
+    /// transition contract is owned solely by
+    /// `crates/cyrup-it/tests/intercom/dismiss_incoming_ask.rs:206`, where its own near-copy of
+    /// this double flips the flag over the real socket.
     struct IdleControlledHost {
-        idle: std::sync::atomic::AtomicBool,
+        idle: bool,
         injected: std::sync::Mutex<Vec<InjectedCall>>,
     }
     impl IdleControlledHost {
         fn new(idle: bool) -> Self {
             Self {
-                idle: std::sync::atomic::AtomicBool::new(idle),
+                idle,
                 injected: std::sync::Mutex::new(Vec::new()),
             }
-        }
-        #[allow(dead_code)]
-        fn set_idle(&self, idle: bool) {
-            self.idle.store(idle, std::sync::atomic::Ordering::SeqCst);
         }
         fn injected(&self) -> Vec<InjectedCall> {
             self.injected.lock().unwrap().clone()
@@ -834,7 +844,7 @@ mod tests {
     }
     impl cyrup_ext::HostServices for IdleControlledHost {
         fn is_idle(&self) -> bool {
-            self.idle.load(std::sync::atomic::Ordering::SeqCst)
+            self.idle
         }
         fn append_entry(
             &self,

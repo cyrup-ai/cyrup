@@ -66,5 +66,11 @@ On step failure: identify root cause, apply fix, re-run the failed step. After 3
 - Actionable errors — no raw stack traces
 - Do not produce summary files unless a step requires it
 
+## Propose next step
+
+Then propose the next step: `/create-pr` (include arguments if needed).
+
+Valid `//flux` commands: `/task`, `/ask`, `/split`, `/aug`, `/exec`, `/qa`, `/tests`, `/commit`, `/create-pr`, `/code-review`, `/address-feedback`, `/auto-pilot`, `/rebase`, `/squash-commits`. Do NOT suggest any command not on this list.
+
 =================
 $ARGUMENTS

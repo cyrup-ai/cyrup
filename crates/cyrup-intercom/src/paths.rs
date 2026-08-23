@@ -1,18 +1,29 @@
-//! Agent-dir / intercom-dir / socket-path resolution + runtime-file mode restriction — a faithful
+//! Agent-dir / intercom-dir resolution + runtime-dir/file mode restriction — a faithful
 //! port of `pi-intercom/broker/paths.ts`, retargeted to cyrup's `~/.cyrup` home (the port doc §7.3;
 //! `crates/cyrup-ext-subagents/src/background/mod.rs:1086-1100` resolves the same `<home>/.cyrup`
 //! root from `CYRUP_HOME`/`HOME`).
 //!
-//! This module is the POSIX arm only: [`broker_socket_path`] is `getBrokerSocketPath`'s
-//! `<intercomDir>/broker.sock` branch. The platform CHOICE — that same branch vs the Windows named
-//! pipe `\\.\pipe\cyrup-intercom-…` (`paths.ts:65-74`), and the opt-in TCP-loopback endpoint
-//! (`paths.ts:44-116`, `CYRUP_INTERCOM_TRANSPORT=tcp`) — lives in
-//! [`crate::transport::target`], which both the client
+//! What lives here is the part of `paths.ts` that is NOT transport-specific: the
+//! cyrup-home/agent-dir/intercom-dir resolution ([`agent_dir_path`], [`intercom_dir_path`]) and the
+//! runtime-dir/mode helpers ([`ensure_intercom_runtime_dir`], [`restrict_intercom_runtime_file`],
+//! `paths.ts:5-6,118-135`).
+//!
+//! Everything that answers "where does the broker LIVE" now lives in exactly one module,
+//! [`crate::transport::target`] — the per-`<intercomDir>` runtime-file paths
+//! ([`broker_port_file_path`](crate::transport::target::broker_port_file_path),
+//! [`unix_socket_path`], [`broker_pid_path`], [`broker_spawn_lock_path`]) alongside the
+//! platform/transport CHOICE that selects between them: `<intercomDir>/broker.sock` vs the Windows
+//! named pipe `\\.\pipe\cyrup-intercom-…` (`getBrokerSocketPath`, `paths.ts:65-74`) vs the opt-in
+//! TCP-loopback endpoint (`paths.ts:44-116`, `CYRUP_INTERCOM_TRANSPORT=tcp`), which both the client
 //! ([`broker_connect_target`](crate::transport::target::broker_connect_target)) and the broker
 //! ([`broker_listen_target`](crate::transport::target::broker_listen_target)) resolve through.
 //! All three are bound on the BROKER side as of ICOM-015; the TCP one additionally publishes
-//! `<intercomDir>/broker.port.json` (`broker.ts:131-141`), whose path is
-//! [`crate::transport::target::broker_port_file_path`].
+//! `<intercomDir>/broker.port.json` (`broker.ts:131-141`).
+//!
+//! They were previously split across this module (the POSIX socket path plus the pid/lock paths) and
+//! `transport::target` (the port-file path and the platform choice), so `getBrokerSocketPath` had two
+//! callable spellings at two tree levels and the crate-root, POSIX-only one was the shorter import —
+//! which is how the production session connect path came to hard-code the POSIX arm.
 
 use std::path::{Path, PathBuf};
 
@@ -85,23 +96,27 @@ pub fn intercom_dir_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("intercom")
 }
 
-/// `<intercomDir>/broker.sock` (`getBrokerSocketPath`, `paths.ts:65-74`; Unix branch only).
-#[must_use]
-pub fn broker_socket_path(intercom_dir: &Path) -> PathBuf {
-    intercom_dir.join("broker.sock")
-}
+/// The broker runtime-file paths, re-exported from their single definition site in
+/// [`crate::transport::target`] so the call sites that still spell them `paths::…` keep resolving:
+/// `paths::broker_pid_path` (`broker/lifecycle.rs`, `transport/spawn.rs`) and
+/// `paths::broker_spawn_lock_path` (`transport/spawn.rs`).
+///
+/// `unix_socket_path` is re-exported under its new, unambiguous name only — see the alias below for
+/// why the old `broker_socket_path` spelling still resolves too.
+pub use crate::transport::target::{broker_pid_path, broker_spawn_lock_path, unix_socket_path};
 
-/// `<intercomDir>/broker.pid` (`broker.ts:22`).
-#[must_use]
-pub fn broker_pid_path(intercom_dir: &Path) -> PathBuf {
-    intercom_dir.join("broker.pid")
-}
-
-/// `<intercomDir>/broker.spawn.lock` (`spawn.ts:24`).
-#[must_use]
-pub fn broker_spawn_lock_path(intercom_dir: &Path) -> PathBuf {
-    intercom_dir.join("broker.spawn.lock")
-}
+/// The former crate-root spelling of [`unix_socket_path`](crate::transport::target::unix_socket_path).
+///
+/// `#[doc(hidden)]` and deliberately not part of this module's documented surface: the name reads as
+/// the general `getBrokerSocketPath` (`paths.ts:65-74`) while resolving only its POSIX arm, which is
+/// exactly the confusion that put the wrong endpoint into the production connect path. It survives
+/// solely because `crates/cyrup-it/tests/intercom/{reconnect,intercom_id_command,
+/// registers_under_session_id,intercom_command_transcript,presence_context_usage}.rs` still import
+/// `cyrup_intercom::paths::broker_socket_path`; those are POSIX-only seam tests, so the arm they get
+/// is the one they mean. Once they move to `transport::target::unix_socket_path` (or to
+/// `broker_connect_target`), delete this alias.
+#[doc(hidden)]
+pub use crate::transport::target::unix_socket_path as broker_socket_path;
 
 /// `ensureIntercomRuntimeDir` (`paths.ts:118-126`): `mkdir -p` at mode `0o700`, then re-`chmod`
 /// on non-Windows (a pre-existing dir keeps whatever mode it had until this re-chmods it).
@@ -227,7 +242,7 @@ mod tests {
         let intercom = intercom_dir_path(&agent);
         assert_eq!(intercom, PathBuf::from("/home/me/.cyrup/intercom"));
         assert_eq!(
-            broker_socket_path(&intercom),
+            unix_socket_path(&intercom),
             PathBuf::from("/home/me/.cyrup/intercom/broker.sock")
         );
     }

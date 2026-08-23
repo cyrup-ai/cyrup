@@ -985,6 +985,216 @@ divergence inside something that already exists, which is why they read as `part
 | `MCP-498` | medium | `hand-written` | **missing** | The two child-process host harnesses | Missing both: (1) a child-process startup harness asserting a direct MCP tool is registered **before** `agent_start` from a cold cache — and the unit's own note applies, that on a cold cache cyrup exposes only the `mcp` proxy tool unless HA-1 is built, so the test must state whether it is testing … |
 | `MCP-499` | medium | `open-decision` | **not-applicable** | A trace-JSONL differential harness against the TS adapter | Unresolved, and doubly blocked: it needs the ADR-0027 ruling *and* the tracer (MCP-473..MCP-480) before the oracle can be bootstrapped on … |
 
+#### Triage — 2026-08-22 (scoping pass)
+
+The census row above is **as of the 2026-08-21 audit**. This subsection is the scoping pass the
+audit's own shape asked for: 13i carries the most `missing` units of any section (31; next is 13c
+at 20) and the highest missing:partial ratio (31:11 against 13h's 15:9) — both read off the by-section
+table above — so picking units off the list in id order would start by building things whose harnesses
+do not exist and whose call sites are not reachable. It re-checks every open row against the tree as
+it stands today, orders what is left, and proposes waves. **No production code was changed by this
+pass**; `git status --porcelain` was empty before it and the only files it writes are this document
+and its own `.flux` task frontmatter.
+
+Baseline recorded before writing (so "unchanged" means something): `cargo clippy -p cyrup-mcp
+--all-targets` exit 0, **2 diagnostics**, both pre-existing and both already named at the head of
+this file — `empty_line_after_doc_comments` at `dirs.rs:1861-1863` and `result_large_err` at
+`runtime.rs:1696`. `cargo nextest run -p cyrup-mcp` was run for the same reason. No `.rs` file is
+touched by this pass, so both figures are unchanged by construction.
+
+**The open set, enumerated.** 50 units, 4 `implemented` (`MCP-457`, `MCP-459`, `MCP-482`,
+`MCP-488`), 4 `not-applicable` (`MCP-489`, `MCP-494`, `MCP-497`, `MCP-499`), leaving **42 open**:
+31 `missing` — `MCP-450`, `451`, `452`, `453`, `454`, `455`, `456`, `458`, `461`, `462`, `463`,
+`464`, `465`, `466`, `467`, `471`, `472`, `473`, `474`, `475`, `476`, `479`, `480`, `483`, `484`,
+`485`, `486`, `487`, `493`, `496`, `498` — and 11 `partial` — `MCP-460`, `468`, `469`, `470`, `477`,
+`478`, `481`, `490`, `491`, `492`, `495`.
+
+##### The gate that sits above all 42, and why it is not a blocker
+
+Every 13i handler reaches a live server through one seam: the manager-supplied
+[`HandlerFactory`](../../crates/cyrup-mcp/src/runtime.rs) (`runtime.rs:1927`). What production
+installs today is `bare_handler_factory()` (`runtime.rs:1931-1942`), whose `sampling`,
+`elicitation`, `list_changed` and `elicitation_complete` are all literal `None`; the only other
+producer is `ConnectionBuilder::with_handler_factory` (`runtime.rs:2289`), which has no caller —
+`grep -rn 'with_handler_factory\|handler_factory\|bare_handler_factory' crates/ --include=*.rs`
+returns 6 lines, all inside `runtime.rs`. One level up, `initialize_mcp` still has no non-test
+caller (`grep -rn 'initialize_mcp(' crates/ --include=*.rs` → the definition at `runtime.rs:125`
+and one call at `runtime.rs:413`, inside this file's `#[cfg(test)]` module), which is the same
+finding the wave-5 note above records and is unchanged.
+
+The consequence, stated so nobody re-derives it: **no 13i unit can be verified end-to-end in
+production today, and none of them is blocked by that.** Every unit below is unit-testable at its
+own seam — a free function, a `Transport` newtype, a writer with injectable fs, a `ClientHandler`
+constructed directly. The activation chain (§13a) and the manager's factory (§13c) are what turn
+the finished handlers on; they are a **sequencing** constraint on the final `cyrup-it` proofs, not
+a prerequisite for writing any of the code. Schedule 13i's waves against unit seams and let the
+activation work land in parallel.
+
+##### Confirmed-missing vs actually-present
+
+The audit's skeptic pass overturned 15 rulings workspace-wide, so each `missing` was treated as a
+lead. Re-checking the 42 against the tree found **six rows whose remaining obligation is materially
+smaller than the census says**, including the section's only `critical`. Each is evidenced by a
+command; nothing below is inferred from a name.
+
+| unit | census | what is actually in the tree | what genuinely remains |
+|---|---|---|---|
+| `MCP-455` | missing | **The three-branch gate is built and unit-tested.** `owner.rs:663 pub async fn confirm_sampling` is upstream's order verbatim (auto-approve → no-UI → declined); `SamplingApproval` (`owner.rs:629`) carries the explicit `has_ui: bool` the unit singles out as un-inferrable; both message constants (`owner.rs:614`, `owner.rs:618`) and both titles (`owner.rs:604`, `owner.rs:607`) are present, with tests at `owner.rs:1092-1160` covering all three branches plus the `has_ui && dialog.is_none()` wiring case. | The three formatters only — `formatRequestApproval`, `formatResponseApproval`, `messageText` (`grep -rn 'format_request_approval\|format_response_approval' crates/ --include=*.rs` returns one hit, a doc reference at `owner.rs:58`, and no definition) — plus the production call site. **Reclassify `missing` → `partial`.** |
+| `MCP-471` | missing | **Both guards are taken, at a single chokepoint.** `McpDialog::enter` (`owner.rs:560-571`) acquires `HostServices::human_interaction_lock` and then `HostCtx::begin_human_wait`, and both `McpDialog::confirm` (`owner.rs:575`) and `McpDialog::select` (`owner.rs:582`) bind the pair to a named `_guards` local. The type's doc already records the honest limit of the P-3 guard at today's call sites. | An `input` method on `McpDialog` (none exists), and the loop-scoping the unit requires — `MCP-463`'s unbounded re-prompt loop must hold the guard across the **loop**, which cannot be written before that loop exists. Plus the `cyrup-it` verify. **Reclassify `missing` → `partial`.** |
+| `MCP-469` | partial | **The registry and the dispatch both landed since the audit.** `accepted_url_elicitations: HashMap<String, HashSet<String>>` (`server_manager.rs:1224`) with `remember_url_elicitation` (`:2582`, no-op once the runtime signal fired), `forget_url_elicitation` (`:2601`, returning `bool` with `Set.delete` semantics), per-server clear (`:2265`) and wholesale clear (`:2470`), tested at `server_manager.rs:3877-3899`. `on_custom_notification` (`runtime.rs:1609-1655`) routes `ELICITATION_COMPLETE_METHOD`, gated on `aborted \|\| !allow_url`, and hands off to the hook. | Only the hook producer and its notice text. `elicitation_complete` is `None` at the one production construction (`runtime.rs:1942`), and `grep -rn 'completed. You can retry the tool now' crates/` returns **0 hits**. |
+| `MCP-477` | partial | The chosen side is already written into the code, not just the plan: `config.rs:1031` and `config.rs:1624` document the default as `<cwd>/.cyrup/mcp-traces/mcp-<ts>-<rand>.jsonl`. | The derivation function itself. The decision half is effectively taken; do not re-open it. |
+| `MCP-481` | partial | More than "nothing consumes it": `TraceSettings` (`config.rs:1620`) has all four fields, the per-server `trace: Option<bool>` is at `config.rs:876`, and `boundedPositiveInteger` is already ported twice — `trace_max_bytes`/`trace_max_events` (`config.rs:1271-1280`) over `DEFAULT_MCP_TRACE_MAX_BYTES = 256 * 1024` and `DEFAULT_MCP_TRACE_MAX_EVENTS = 10_000` (`config.rs:1051-1054`). | Consumers, and `MCP-478`'s combining function. The settings surface is done. |
+| `MCP-491` | partial | **The premise moved.** `grep -c '^\[\[test\]\]' crates/cyrup-it/Cargo.toml` returns **8**, not 7, and one of them is `name = "mcp"`, `path = "tests/mcp/main.rs"` (`cyrup-it/Cargo.toml:198-204`), populated with `tests/mcp/{main.rs,activation.rs}` (272 lines). | The plan's recommendation — "(b) fold into `bin` and `session_svc`" — is retrospective advice about a target that already exists. The live question shrinks to two placements: where `MCP-498`'s child-process harness goes (`bin` or `mcp`) and where `MCP-492`'s port-binding OAuth suite goes. The doc reconciliation and the guardrail-threshold question survive unchanged. |
+
+Three more rows are confirmed-missing but are **cheaper than their neighbours** and should not be
+scheduled by severity order:
+
+* **`MCP-493`** (`low`, manifest policy test) has **zero** dependencies and can be written today.
+  The manifest it must assert is already in the asserted state: `crates/cyrup-mcp/Cargo.toml`
+  declares `rmcp = { version = "3.1.2", default-features = false, features = ["client",
+  "transport-child-process", "transport-streamable-http-client-reqwest", "reqwest", "auth"] }` —
+  exactly the five, `server` and `elicitation` both absent — and `toml = "1.1.2"` is already a
+  dependency, so the test needs no manifest change of its own. It is the one 13i unit that is a
+  pure net add with no seam.
+* **`MCP-465`** needs no new dependency: `jsonschema` is already declared for `cyrup-mcp`
+  (workspace pin `0.46.9`, `default-features = false`) — and note that
+  `grep -rn 'jsonschema' crates/cyrup-mcp/src/` returns **0 hits**, so today it is a declared-but-unused
+  edge shared with the still-missing `MCP-092`. Whoever lands either unit should confirm the version
+  bump the unit mentions against `should_validate_formats`.
+* **`MCP-467`** needs no new dependency either: `url` and `opener = "0.8.5"` are both already
+  declared in `crates/cyrup-mcp/Cargo.toml`.
+
+Two rows are **blocked on another 13i unit rather than missing in their own right**:
+
+* **`MCP-462`** — the unit is a *rule about an iteration site* (`zip property_order against
+  properties`, never iterate the `BTreeMap`). No such site exists, and none can exist before
+  `MCP-461` writes the form loop. It is not independently schedulable; it is an acceptance
+  criterion on `MCP-461`.
+* **`MCP-460`** — the dispatch is `rmcp`'s already (the `LegacyForm` untagged arm), so the unit's
+  behaviour is free; what is missing is the two handlers to dispatch *to*. Same relationship:
+  an acceptance criterion on `MCP-461` + `MCP-467`, not a unit of its own.
+
+That accounts for 11 of the 42. The remaining **31 stand as the census filed them**: 25
+confirmed-missing — `MCP-450`, `451`, `452`, `453`, `454`, `456`, `458`, `461`, `463`, `464`, `466`,
+`472`, `473`, `474`, `475`, `476`, `479`, `480`, `483`, `484`, `485`, `486`, `487`, `496`, `498` —
+and 6 still-`partial` — `MCP-468`, `470`, `478`, `490`, `492`, `495`. (6 re-checked + 2
+blocked-on-another-unit + 3 annotated-but-missing + 25 + 6 = 42.) Spot-checks behind that: `grep -rIn`
+over `crates/` returns 0 hits for each of `handle_sampling_request`, `SamplingOptions`,
+`sampling_candidates`, `handle_form_elicitation`, `coerce_and_validate`, `TracingTransport`,
+`McpTraceEvent`, `redact_trace`, and 0 of the workspace's 23 `Cargo.toml`
+files (`find . -name Cargo.toml -not -path './target/*'`) name `portable-pty`, `expectrl` or
+`rexpect` — `MCP-496`'s "no pty infrastructure" claim, re-confirmed.
+
+##### Dependency order
+
+Read as a partial order; anything not named as a predecessor is independent.
+
+1. **Nothing in 13i gates the tracer.** `MCP-473 → 474 → 475 → 476 → 477 → 478 → 481` are pure
+   functions and a writer with an injectable fs seam. `MCP-479` needs the event and the writer;
+   `MCP-480` needs `479` plus `478`'s enablement combiner. The tracer is the section's only chain
+   with no host, no dialog and no provider in it.
+2. **Elicitation is two layers.** The value pipeline (`MCP-464`, `465`, `466`) is pure and comes
+   first; the dialog sequence (`MCP-461`, `463`, `467`, and the `MCP-471` residue) consumes it.
+   `MCP-462` and `MCP-460` are acceptance criteria on that second layer, not separate work.
+   `MCP-472` is three error constructors inside `MCP-467`'s handler and lands with it.
+3. **Sampling is three layers.** Model resolution (`452`, `453`, `454`) and wire translation
+   (`451`, `456`) are independent of each other and of everything else; the handler (`450`) is the
+   assembly point and needs both, plus `455`'s formatters and `458`'s live closures.
+   `MCP-459` (`truncate_at_word`) is already implemented and is `455`'s only prerequisite.
+4. **Advertisement follows behaviour.** `MCP-468` (`elicitation:{form,url?}`) and the `MCP-469`
+   hook producer must not land before the handlers exist, or the client advertises a capability it
+   cannot service — the one ordering error in this section that is visible to a remote server.
+   `MCP-470` needs `467` (it drives URL elicitations) and a production implementor of
+   `ProxyEnv::handle_url_elicitation_required` (`proxy.rs:1486`; the call site is `proxy.rs:3731`
+   and the only impl is at `proxy.rs:4973`, inside `#[cfg(test)]`).
+5. **Conformance is gated on elicitation, not on sampling.** `MCP-484`'s scripted UI exists to make
+   `elicitation-sep1034-client-defaults` traverse the *real* form handler, so the driver is worth
+   little before layer 2 lands. `MCP-483 → 484 → 485 → 486` is strictly sequential (the baseline is
+   written from one observed run of the runner). `MCP-487` may **dissolve** rather than land: it
+   only exists if `MCP-485` chooses a fixed callback port, and `docs/TEST-ARCHITECTURE.md`'s R4
+   pushes the other way.
+6. **Verification trails everything.** `MCP-490`'s 13i share is zero until 13i's code exists — that
+   is the census row's own wording. `MCP-496` needs both consent gates and the whole elicitation
+   sequence, *plus* pty infrastructure that does not exist in the workspace. `MCP-498` needs a
+   `cyrup-it` target and is discussed under HA-1 below. `MCP-492` needs `MCP-491`'s placement
+   ruling.
+7. **Gated on other sections, not on 13i.** The `HandlerFactory` installation (§13c manager) and
+   `initialize_mcp`'s production caller (§13a activation) gate only the *end-to-end* proofs —
+   `MCP-457`'s and `MCP-468`'s `cyrup-it` capability tests, `MCP-479`'s tracing-on/off differential,
+   `MCP-480`'s two-server file test, `MCP-471`'s budget test. None of them gates writing the code.
+
+##### The `host-addition` neighbours — recommendation: schedule none of them for 13i
+
+**Zero of 13i's 50 units carry the `host-addition` verdict** — the verdict column of the table above
+holds only `hand-written`, `rmcp`, `host-verb`, `extension-owned`, `open-decision` and `cut`. The
+section file says so directly: *"The section's three `host-addition` neighbours (`HA-1` late tool
+registration, `HA-2` argument completions, `HA-3` overlay geometry) are owned elsewhere and none of
+them gates sampling, elicitation or tracing"* (`13i-mcp-protocol-and-verification.md:1718`). `HA-2`
+and `HA-3` have **no** contact surface in 13i at all; they appear on 13h units (`MCP-382`, and
+`MCP-395` for `HA-1`'s command leg).
+
+The single point of contact is `MCP-498`'s note
+(`13i-mcp-protocol-and-verification.md:1648-1651`): on a cold cache cyrup exposes only the `mcp`
+proxy tool unless `HA-1` is built, so the upstream test's "a direct MCP tool is registered before
+`agent_start`" assertion is about the **warm** path here.
+
+**Recommendation.** Land `MCP-498` against the warm path, and say so in the test name and its module
+doc rather than in a comment — the unit's own instruction is "state which you are testing". File the
+cold-cache assertion as a follow-up owned by whoever lands `HA-1`, so it is a known deferred
+assertion rather than a silently weaker test. Do **not** pull `HA-1` into a 13i wave: it is a
+host-surface change whose consumers are 13a and 13h units, and adding it here would make the
+section's largest wave depend on a crate this section otherwise only reads. `HA-2` and `HA-3` need
+no 13i decision at all.
+
+##### Proposed waves
+
+Grouped by **shared obligation**, per PR #30. The failure mode being avoided is the one that put
+`runtime.rs` in a different agent's set than the unit whose obligation needed it: each wave below is
+one sentence of contract, and every file that sentence touches is inside it.
+
+| wave | obligation, in one sentence | units | size | predecessors |
+|---|---|---|---:|---|
+| **0** | The manifest cannot drift from the settled rmcp feature set without failing a test. | `493` | 1×S | none |
+| **A** | A bounded, redacted, ordered JSONL file exists and can be written without a transport. | `473`, `474`, `475`, `476`, `477`, `478`, `481` | 6×S + 1×M | none |
+| **B** | Turning tracing on changes the file and nothing on the wire. | `479`, `480` | 1×M + 1×S | A |
+| **C** | A server's declared constraints are enforced on the values before anything is returned. | `464`, `465`, `466` | 2×M + 1×S | none |
+| **D** | Every question this crate asks a human is guarded, ordered, cancellable, and never partially submitted. | `461`, `463`, `467`, `472`, `471`-residue, and `460`/`462` as acceptance criteria | 2×M + 5×S | C |
+| **E1** | A nested completion runs on the right model with the session's own credentials. | `452`, `453`, `454` | 2×M + 1×S | none |
+| **E2** | What crosses the MCP↔provider boundary is byte-for-byte what upstream sends, including its refusals. | `451`, `456` | 1×M + 1×S | none |
+| **E3** | No server-directed completion happens without consent, and none outlives its turn. | `450`, `455`-residue, `458` | 2×M + 1×S | E1, E2 |
+| **F** | The client advertises exactly the capabilities it can service, and services them. | `468`, `469`-residue, `470` | 3×S | D, E3; §13c's manager factory |
+| **G** | An external referee grades the real client stack, and the baseline is observed rather than copied. | `483`, `484`, `485`, `486`, (`487`, may dissolve) | 1×M + 4×S | D |
+| **H** | Every algorithm 13i owns is pinned by a test that fails on the pre-fix tree. | `490` (13i share), `492`, `495`, `498` | 1×L + 3×M | D, E3, A; `491` ruling for placement |
+| **spike** | Decide whether a pty harness enters the workspace at all, before `496` is scheduled as work. | `496` | 1×M | D, E3 |
+
+Notes on the sizing:
+
+* **A is the wave to start with**, not wave 0 and not the `critical` unit. It is seven units with
+  one shared obligation, no host surface, no dialogs, no provider, and no dependency on any other
+  section — the same shape as the waves that worked in PR #30. Wave 0 is a single test and can ride
+  along with anything.
+* **C and D must not be split by file.** `MCP-464`'s coercion, `MCP-465`'s final assertion and
+  `MCP-463`'s re-prompt loop are one user-visible behaviour (a bad value is rejected with the
+  server's own text and the user's typing is not lost); an agent holding only one of them cannot
+  tell whether a failing case is its own bug.
+* **D carries the `MCP-471` residue deliberately.** The guard is already at one chokepoint
+  (`McpDialog::enter`); the remaining work is an `input` method and *where the guard is taken*
+  around `MCP-463`'s unbounded loop. That is a property of the loop, so it belongs to the agent
+  writing the loop.
+* **E1, E2, C and A are mutually independent** and can run concurrently — four agents, no shared
+  file among them beyond `config.rs` (A only) and new modules.
+* **F is the first wave that needs another section.** Do not schedule it until §13c's manager owns
+  the `HandlerFactory`; scheduling it early produces a wave that can write code but cannot prove it.
+* **H is trailing by construction**, and `MCP-490`'s `L` is the mocking rewrite, not the assertion
+  translation — budget it as such.
+
+##### Open decisions this pass did not settle
+
+Recorded so they are not mistaken for work: `MCP-489` (fixture strategy), `MCP-491` (seam-test
+placement — narrowed above, not closed), `MCP-494` (the CI gate's shape) and `MCP-499` (the trace
+differential harness) remain `not-applicable`/`open-decision` and need a ruling from the owner, not
+an agent. `MCP-477`'s `.cyrup` side is taken in the code and should be treated as settled.
+
 ## Rulings the skeptic overturned
 
 Recorded because they are the measure of how much to trust the rest, and because each is a place

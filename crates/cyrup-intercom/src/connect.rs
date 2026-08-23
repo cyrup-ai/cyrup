@@ -64,11 +64,11 @@ use std::time::Duration;
 use crate::error::{IntercomError, Result};
 use crate::identity::{ChildOrchestratorMetadata, ENV_INTERCOM_SESSION_ID, presence_name};
 use crate::inbound::spawn_inbound_loop;
-use crate::paths::{broker_socket_path, intercom_dir_path};
 use crate::session_state::SharedIntercomState;
 use crate::transport::client::IntercomClient;
 use crate::transport::protocol::{SessionRegistration, now_ms};
 use crate::transport::spawn::ensure_broker;
+use crate::transport::target::broker_connect_target;
 
 /// pi's reconnect backoff ladder (`getReconnectDelayMs`, `index.ts:565`), in milliseconds. The last
 /// entry is the ceiling: every attempt past the table length waits 30 s, which is what bounds the
@@ -458,7 +458,15 @@ async fn connect_once(
     generation: u64,
 ) -> Result<Arc<IntercomClient>> {
     ensure_broker(&params.agent_dir).await?;
-    let socket = broker_socket_path(&intercom_dir_path(&params.agent_dir));
+    // `const target = getBrokerConnectTarget();` — the socket path on POSIX, the
+    // `\\.\pipe\cyrup-intercom-<agent dir>` name on Windows, or the loopback-TCP endpoint read back
+    // out of `broker.port.json` under the Windows-only opt-in (`broker/paths.ts:76-105`). This
+    // replaces a direct `paths::broker_socket_path(...)` read, which hard-coded the POSIX arm — the
+    // same fix `broker/lifecycle.rs:118` already made on the listen side. It matters because the
+    // `ensure_broker` call above confirms the broker is connectable through
+    // `target::broker_connect_target` (`transport/spawn.rs:305,378`) and returns no target, so this
+    // must re-resolve the SAME way or a session dials an endpoint no broker is listening on.
+    let target = broker_connect_target(&params.agent_dir)?;
     let registration = build_registration(state, params);
     // Register under THIS SESSION'S OWN id — pi `await nextClient.connect(buildRegistration(),
     // currentSessionId)` (`index.ts:833`), where `currentSessionId = ctx.sessionManager
@@ -501,7 +509,7 @@ async fn connect_once(
                 .filter(|id| !id.is_empty())
         })
         .or_else(|| state.connect.last_session_id());
-    let client = Arc::new(IntercomClient::connect(&socket, registration, session_id).await?);
+    let client = Arc::new(IntercomClient::connect_target(&target, registration, session_id).await?);
     if state.connect.shutting_down.load(Ordering::SeqCst)
         || state.connect.generation.load(Ordering::SeqCst) != generation
     {

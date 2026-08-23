@@ -157,7 +157,7 @@ pub async fn run() -> std::io::Result<()> {
         crate::transport::target::BrokerConnectTarget::Socket(path) => {
             // `restrictIntercomRuntimeFile(LISTEN_TARGET)` for the string arm (`broker.ts:128-130`);
             // itself a no-op off POSIX (`paths.ts:128-135`).
-            let _ = paths::restrict_intercom_runtime_file(path);
+            paths::restrict_intercom_runtime_file(path)?;
             None
         }
         crate::transport::target::BrokerConnectTarget::Tcp(target) => {
@@ -184,12 +184,12 @@ pub async fn run() -> std::io::Result<()> {
             // port is reachable by every process on the machine, so the file's permissions are what
             // keep `stateId` to this user.
             std::fs::write(&port_path, endpoint.to_port_file_body())?;
-            let _ = paths::restrict_intercom_runtime_file(&port_path);
+            paths::restrict_intercom_runtime_file(&port_path)?;
             Some(state_id)
         }
     };
     std::fs::write(&pid_path, std::process::id().to_string())?;
-    let _ = paths::restrict_intercom_runtime_file(&pid_path);
+    paths::restrict_intercom_runtime_file(&pid_path)?;
     tracing::info!(pid = std::process::id(), endpoint = %endpoint, "intercom broker started");
 
     let shutdown = Arc::new(Notify::new());

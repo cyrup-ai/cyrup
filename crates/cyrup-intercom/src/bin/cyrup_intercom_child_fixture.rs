@@ -33,13 +33,24 @@
 //! Every non-zero exit path also emits a `message_end` marker line so the driving `run_sync` tees a
 //! diagnosable reason into its attempt log rather than the test seeing a bare non-zero exit.
 
+// The crate-root `#![deny(...)]` in `lib.rs` governs the LIBRARY root only; a bin target is its own
+// crate root and inherits nothing from it. `[lints] workspace = true` covers the four workspace
+// denies here, but `clippy::unreachable`/`todo`/`unimplemented` live in `lib.rs` alone, so without
+// this the no-panic wall has a hole exactly the shape of the two bin targets. Restated locally
+// rather than promoted to `[workspace.lints.clippy]`: 12 production call sites across other crates
+// (tracker.rs:560, extension.rs:5755, main.rs:1190, sessions.rs:471, http.rs:547, wasm_host.rs:130
+// and :239, and others) carry no allow, so promoting these three would break crates this change
+// has no business touching.
+#![deny(clippy::unreachable, clippy::todo, clippy::unimplemented)]
+
 use std::io::Write;
 use std::time::Duration;
 
 use cyrup_intercom::identity::{preferred_supervisor_target, read_child_orchestrator_metadata};
-use cyrup_intercom::paths::{agent_dir_path, broker_socket_path, intercom_dir_path};
+use cyrup_intercom::paths::agent_dir_path;
 use cyrup_intercom::transport::client::{InboundEvent, IntercomClient, SendOptions};
 use cyrup_intercom::transport::protocol::{SessionRegistration, now_ms};
+use cyrup_intercom::transport::target::broker_connect_target;
 
 /// The child-bridge env gate returned `None`: the production spawn overlay did not set the six
 /// `CYRUP_SUBAGENT_*` vars, so the seam is inert.
@@ -74,7 +85,17 @@ async fn run() -> i32 {
     let supervisor_target = preferred_supervisor_target(&meta);
 
     let agent_dir = agent_dir_path();
-    let socket = broker_socket_path(&intercom_dir_path(&agent_dir));
+    // `getBrokerConnectTarget()` (`broker/paths.ts:76-105`), not the POSIX-only
+    // `paths::broker_socket_path(...)` this used to read: a real spawned child must dial the same
+    // endpoint the broker bound through `broker_listen_target` (`broker/lifecycle.rs:118`) —
+    // the Unix socket, the Windows named pipe, or the opt-in loopback-TCP endpoint.
+    let target = match broker_connect_target(&agent_dir) {
+        Ok(target) => target,
+        Err(err) => {
+            emit_message_end(&format!("BRIDGE_CONNECT_FAILED: {err}"));
+            return EXIT_CONNECT_FAILED;
+        }
+    };
 
     let registration = SessionRegistration {
         name: Some(own_label),
@@ -94,7 +115,7 @@ async fn run() -> i32 {
     };
 
     // (2) Register as a genuine broker participant under the deterministic child label.
-    let client = match IntercomClient::connect(&socket, registration, None).await {
+    let client = match IntercomClient::connect_target(&target, registration, None).await {
         Ok(client) => client,
         Err(err) => {
             emit_message_end(&format!("BRIDGE_CONNECT_FAILED: {err}"));

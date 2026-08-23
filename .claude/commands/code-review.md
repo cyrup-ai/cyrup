@@ -21,6 +21,12 @@ command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1 && echo "GH_PATH
 
 Resolve the PR's head and base branch by whichever path is available.
 
+<!-- COVERAGE 2026-08-22: the GH_PATH dispatch line above IS exercised — no `gh` on
+     PATH -> mcp; stub `gh` whose `auth status` exits 0 -> cli; stub whose `auth status` exits 1
+     -> mcp. The `gh` command bodies in the GH_PATH=cli branches of this file are NOT exercised:
+     there is no `gh` binary in this container. They are written against gh's documented
+     behaviour and still need one pass on a machine with `gh` authenticated. -->
+
 **If `GH_PATH=cli`:**
 
 ```bash
@@ -73,7 +79,11 @@ If a file called `stack.env` exists at `$FLUX_BASE/stack.env`, read it and set `
 
 ```bash
 STACK="software"
-if [ -f "package.json" ]; then
+# Cargo.toml is checked first: a Rust project never needs `bun`, and the package.json
+# branch below is the only part of detection that shells out to a runtime that may not
+# be installed.
+if [ -f "Cargo.toml" ]; then STACK="Rust"
+elif [ -f "package.json" ]; then
   STACK=$(bun -e "
     const d=JSON.parse(require('fs').readFileSync('./package.json','utf8'));
     const deps=Object.assign({}, d.dependencies, d.devDependencies, d.peerDependencies);
@@ -82,7 +92,6 @@ if [ -f "package.json" ]; then
     const ts=deps['typescript']?'TypeScript':'JavaScript';
     console.log(fw?fw+' + '+ts:ts);
   " 2>/dev/null || echo "JavaScript/TypeScript")
-elif [ -f "Cargo.toml" ]; then STACK="Rust"
 elif [ -f "go.mod" ]; then STACK="Go"
 elif [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; then STACK="Python"
 elif [ -f "pom.xml" ] || [ -f "build.gradle" ]; then STACK="Java/Kotlin"
@@ -231,7 +240,7 @@ Steps 8, 10, and 11 sub-agents must use `find` or explicit subdirectory paths �
 
 Enumerate all task files with `find "$FLUX_BASE/review/" -name "*.md" -type f | sort`, then launch sub-agents. Each agent diffs the flagged file:
 
-```bash
+```text
 git diff "$MERGE_BASE" -- <filepath>
 ```
 
@@ -346,6 +355,12 @@ comments?" / header: "Post review" / options:
 - `Post it` → continue to 13d
 - `Summary only` → continue, but skip every inline comment; post only the STEP 12 summary
 - `Don't post` → skip to NEXT STEP, leaving the zip as the hand-off
+
+<!-- COVERAGE 2026-08-22: STEP 13 has never been run against a live PR. The pending-review
+     flow below (`create` with no `event` -> add_comment_to_pending_review -> `submit_pending`),
+     the FILE-level fallback for a line that is not in the diff, and `delete_pending` are written
+     against the MCP tools' schemas and are UNVERIFIED end-to-end. 13e is doubly unexercised —
+     no live PR and no `gh` binary. Nothing here has posted a byte to GitHub. -->
 
 ### 13d. Post — `GH_PATH=mcp`
 
