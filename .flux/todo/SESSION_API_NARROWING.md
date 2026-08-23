@@ -1,16 +1,22 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 23:52
+updated: 2026-08-23 00:47
 ---
 
-# Demote 4 internal-only pub modules, drop 15 unused root re-exports, complete the compaction::tokens facade, and remove the unused `futures` dependency
+# Narrow cyrup-session's Public API Surface
 
 > Found by a six-lens hygiene audit of `crates/cyrup-session`, run after the `manager/`
 > decomposition landed in PR #53. Every claim below was reproduced against the tree.
 > **Priority:** medium · **Effort:** medium
 
 cyrup-session publishes machinery no downstream crate can reach, and simultaneously omits from its curated facade the one function downstream actually needs. Both directions were measured across `crates/` and `xtask/` excluding cyrup-session itself.
+
+## Description
+
+cyrup-session publishes internal-only machinery as crate API: four modules that no other crate imports, fifteen root re-exports with zero external consumers, a facade gap that forces callers down a deep path, and an unused `futures` dependency edge. Narrowing the surface makes the crate's real contract legible.
+
+**This task is gated** — see the block above. In a conformance-tracked port an unreferenced `pub` item is usually unfinished wiring rather than dead API, so each identifier must clear `docs/gap-analysis/` individually before it is touched.
 
 ## 1. Internal-only public modules
 
@@ -53,7 +59,7 @@ This is the *only* reason `pub mod tokens` must stay public — the other 9 comp
 - [ ] `SkillPointer` appears in exactly one re-export inside cyrup-session, and root-level `list`/`resolve` are gone from `lib.rs`
 - [ ] `cargo build --workspace` and `cargo test -p cyrup-session -p cyrup-session-svc` pass; `cargo clippy --all-targets --workspace` reports 0 findings
 
-## Verifying command
+## Evidence
 
 ```bash
 cd /home/user/cyrup && for m in store ids migrate; do printf '%-10s %s\n' "$m" "$(grep -rho "cyrup_session::$m\b" --include='*.rs' crates xtask | wc -l)"; done; grep -c '^pub ' crates/cyrup-session/src/prompt/skills_inject.rs; grep -rn 'compaction::tokens::' crates --include='*.rs' | grep -v 'crates/cyrup-session/'; grep -rn futures crates/cyrup-session/src --include='*.rs' | wc -l

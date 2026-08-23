@@ -1,16 +1,20 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 23:52
+updated: 2026-08-23 00:47
 ---
 
-# cyrup-session's public API is 57.9% documented (243 undocumented pub items) and no crate in the workspace enables missing_docs
+# Document cyrup-session's Public API And Enable missing_docs
 
 > Found by a six-lens hygiene audit of `crates/cyrup-session`, run after the `manager/`
 > decomposition landed in PR #53. Every claim below was reproduced against the tree.
 > **Priority:** medium · **Effort:** large
 
 rustdoc's coverage report puts cyrup-session at **310/535 documented = 57.9%**. Compiling with `-W missing_docs` yields **243 warnings** inside `crates/cyrup-session`, and nothing prevents the next PR from adding more: `grep -rn missing_docs --include=*.rs --include=*.toml crates/ Cargo.toml` returns **nothing** — neither `lib.rs` (which sets only `#![forbid(unsafe_code)]`) nor `[workspace.lints]` enables the lint.
+
+## Description
+
+243 of cyrup-session's public items carry no doc comment (57.9% documented), and no crate in the workspace enables `missing_docs`. Document the undocumented surface, then turn the lint on so the gap cannot silently reopen.
 
 ## Where the 243 warnings are
 
@@ -57,7 +61,7 @@ Do not write filler. A field whose meaning is genuinely obvious from its name an
 - [ ] No doc comment added is a restatement of the item's name (e.g. `/// The path.` on `path: PathBuf`); each says what the value means to a caller
 - [ ] `cargo doc --no-deps -p cyrup-session` produces no new warnings and `cargo clippy --all-targets -p cyrup-session` reports 0 findings
 
-## Verifying command
+## Evidence
 
 ```bash
 cd /home/user/cyrup && RUSTFLAGS='-W missing_docs' cargo check -p cyrup-session --lib --message-format=short 2>&1 | grep 'missing documentation' | grep '^crates/cyrup-session/' | tee /tmp/cs.txt | wc -l && sed 's/:[0-9]*:[0-9]*:.*//' /tmp/cs.txt | sort | uniq -c | sort -rn | head && grep -rn missing_docs --include=*.rs --include=*.toml crates/ Cargo.toml

@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 23:52
+stage: qa
+status: completed
+updated: 2026-08-23 00:47
 ---
 
 # SessionError::Io drops the filename on all 14 filesystem `?` sites — users see bare `io: No such file or directory (os error 2)`
@@ -64,3 +64,17 @@ and `map_err` each site. Every `DiskStore` op already holds `self.path`, and `lo
 ```bash
 cd /home/user/cyrup/crates/cyrup-session && sed -n '10,33p' src/error.rs && grep -rn 'std::fs::\|File::open\|File::create\|OpenOptions\|write_all(\|create_dir_all\|fs::rename' --include='*.rs' src/store.rs src/manager/load.rs src/manager/accessors.rs | grep '?'
 ```
+
+## Outcome — completed 2026-08-23 00:47
+
+Implemented in commit `320a7ac` (wave 1) and preserved through the `e861d76` revert.
+
+- `SessionError::Io` is now `Io { op, path, source }` with `#[error("{op} {path}: {source}")]`,
+  plus a `SessionError::io(op, path, source)` constructor. The blanket `#[from] std::io::Error`
+  was removed deliberately, and a doc comment on the variant records why.
+- 12 call sites across `store.rs`, `manager/load.rs` and `manager/accessors.rs` attach a path.
+  No bare `?` on an fs call discards it.
+- `tests/sessions.rs:738 io_errors_name_the_failing_path` asserts the path reaches the message,
+  and the constructor carries a doctest.
+- Verified: `cargo test -p cyrup-session` 158 passed, `-p cyrup-session-svc` 311 passed,
+  `cargo clippy --all-targets` 0 findings, `cargo check` 0 warnings.

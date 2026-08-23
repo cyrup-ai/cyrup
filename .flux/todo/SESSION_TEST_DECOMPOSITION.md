@@ -1,10 +1,10 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 23:52
+updated: 2026-08-23 00:47
 ---
 
-# Split src/tests/compaction.rs (2336 lines / 43 tests) and parity.rs (1308 / 38) into directory modules and extract the 4 copy-pasted fixtures into src/tests/fixtures.rs
+# Split The Two Oversized cyrup-session Test Files Into Directory Modules
 
 > Found by a six-lens hygiene audit of `crates/cyrup-session`, run after the `manager/`
 > decomposition landed in PR #53. Every claim below was reproduced against the tree.
@@ -18,7 +18,11 @@ Two files are 4077 of the 6269 lines of test code in cyrup-session (65%). Both a
 > longer exist. The table below is recomputed against the current file and sums to 43. The
 > `parity.rs` half of this task was NOT affected and remains exactly as originally verified.
 
-## A. `src/tests/compaction.rs` → `src/tests/compaction/` (mod.rs + 10 files)
+## Description
+
+`src/tests/compaction.rs` (2336 lines / 43 tests) and `src/tests/parity.rs` (1308 / 38) are 4,077 of the crate's test lines. Both are already banner-partitioned by their authors, and both partitions are exact — grouping the banners yields contiguous ranges whose test counts sum to the file totals with no test straddling a seam. Split each into a directory module along those existing seams, and lift the four copy-pasted fixtures into `src/tests/fixtures.rs`. This mirrors the `manager.rs` → `manager/` decomposition merged in PR #53.
+
+## A. `src/tests/compaction.rs` → `src/tests/compaction/` (mod.rs + 9 files)
 
 21 `// ----- NAME -----` banners; verified partition:
 
@@ -79,7 +83,7 @@ Directory modules preserve the single-test-binary property that `tests/mod.rs:1-
 - [ ] `git diff --stat` shows no assertion text changed: every moved `assert*` line is identical to its pre-split form
 - [ ] `cargo clippy --all-targets -p cyrup-session` reports 0 findings
 
-## Verifying command
+## Evidence
 
 ```bash
 cd /home/user/cyrup && wc -l crates/cyrup-session/src/tests/*.rs crates/cyrup-session/src/tests/*/*.rs 2>/dev/null && cargo test -p cyrup-session 2>&1 | tail -3 && cargo test -p cyrup-session --no-run 2>&1 | grep -c 'Executable'
