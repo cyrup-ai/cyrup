@@ -4,7 +4,7 @@
 //! A 1:1 port of Pi `coding-agent/src/cli/credential-print.ts` (v0.83.0, 152 lines) plus its
 //! driver `runCredentialPrintCommand` (main.ts:130-167), dispatched — like Pi's — BEFORE ordinary
 //! argument parsing (main.ts:557-559, right after the package/config subcommand block). Before this
-//! module existed, `auth` was not in [`crate::subcommands::SUBCOMMANDS`], so
+//! module existed, `auth` was not in `crate::subcommands::SUBCOMMANDS`, so
 //! `cyrup auth print-api-key --provider openai --model gpt-5.5` fell through arg leniency as two
 //! bare positionals, became a chat PROMPT, and started an agent session: no credential on stdout,
 //! no error, exit 0, tokens burned and a session file written. Any script following the upstream

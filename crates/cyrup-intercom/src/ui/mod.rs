@@ -11,7 +11,7 @@
 //!   `NativeExtension::render_entry`. Before that the payload was written and consumed by nothing —
 //!   the transcript showed a grey `entry appended → intercom_message` line instead of the card.
 //! - [`session_list::SessionListOverlay::render`] + [`compose::compose_send`] are driven by the
-//!   `/intercom` slash command ([`crate::extension::IntercomExtension::execute_command`]).
+//!   `/intercom` slash command ([`crate::extension::IntercomExtension`]'s `execute_command`).
 //!
 //! **What DEGRADES (the port doc §4.3, precise later-phase TODO):** the live *message* renderer for
 //! the injected `intercom_message` custom message is still unreachable, blocked outside this crate

@@ -187,7 +187,7 @@ impl RunCtx {
     /// `error.message`) followed by `message_start` → `message_end` → `turn_end` (with NO tool
     /// results) → `agent_end` carrying `[failureMessage]` and nothing else (agent.ts:508-511).
     ///
-    /// The post-unwind twin of this path lives at [`super::Agent::run`]'s `catch_unwind` arm, which must
+    /// The post-unwind twin of this path lives at [`super::Agent::start_run`]'s `catch_unwind` arm, which must
     /// synthesize the same quartet through [`super::lifecycle::emit_standalone`] because its `RunCtx` is already gone;
     /// here the live `RunCtx` is intact, so emission goes through the ordinary [`RunCtx::emit`] and
     /// the reducer records `error_message`/`stop_reason` exactly as it does for a streamed message.

@@ -35,7 +35,7 @@
 //! `cyrup-agent::Agent`'s own `std::sync::Mutex<StateInner>` as the precedent this crate's poller
 //! should follow rather than reflexively reaching for an async mutex). Every critical section
 //! against `jobs` in this file is a short, synchronous read-modify-write with no `.await` point
-//! inside the lock guard's scope; any `.await` this module needs (file reads, [`reconcile_now`])
+//! inside the lock guard's scope; any `.await` this module needs (file reads, [`reconcile::reconcile_now`])
 //! happens strictly before or after the lock is held, never while it is held.
 //!
 //! # No shared Rust-level state with `runner_main.rs` (task framing, restated)
@@ -103,7 +103,7 @@ pub struct TrackedJob {
     pub paths: RunPaths,
     /// Wall-clock time hop-1 confirmed a successful spawn for this run, if known — threaded through
     /// to [`reconcile::reconcile`] as the R-SA-090 grace-window reference point. `None` for a run
-    /// this tracker only learned about after the fact (e.g. [`JobTracker::resume_tracking_from_disk`]
+    /// this tracker only learned about after the fact (e.g. [`JobTracker::track_restored`]
     /// re-discovering a run from a prior process's `AsyncRoot`), in which case a missing
     /// `status.json` is never treated as "still within grace" (see `reconcile.rs`'s own documented
     /// behavior for `spawn_confirmed_at: None`).
@@ -265,7 +265,7 @@ impl JobTracker {
 
     /// Starts tracking `run_id` the way [`JobTracker::track`] does, except the per-run
     /// `events.jsonl` byte cursor is seeded at `events_cursor` rather than `0`. Used exclusively by
-    /// [`crate::extension::SubagentsExtension::resume_tracking`] (pi `restoreActiveJobs`'s
+    /// [`crate::extension::SubagentExecutor::resume_tracking`] (pi `restoreActiveJobs`'s
     /// `restoredControlEventCursor`, `async-job-tracker.ts:48-55,99` @v0.34.0) to re-track a run discovered
     /// from a prior process's `AsyncRoot` without re-tailing control events that process already
     /// consumed. `spawn_confirmed_at` is always `None` for a restored job — this tracker has no
@@ -580,7 +580,7 @@ struct TailOutcome {
     /// appending them, since `new_cursor` only advances past bytes up to and including the last
     /// *complete* newline actually consumed.
     ///
-    /// Not read by [`tick_one_job`]'s production call site — as documented there, folding tailed
+    /// Not read by [`JobTracker::tick_one_job`]'s production call site — as documented there, folding tailed
     /// control/notification events into renderable state is the TUI/notices subsystem's job
     /// (`tui/notices.rs`), not this poller's; this module's own contract is limited to advancing
     /// the byte cursor and reconciling status. The field remains `pub(super)`-visible-shaped data

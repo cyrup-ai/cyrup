@@ -54,9 +54,6 @@ use crate::transcript::is_ws_grapheme;
 
 mod highlight;
 
-/// M12 — `renderLatex`, the port of `tui/src/latex.ts` that `markdown.ts:505-512` and `:645-652`
-/// call. A child module of `markdown` because it has exactly one consumer, matching upstream's own
-/// `import { renderLatex } from "../latex.ts"` at `markdown.ts:2`.
 mod latex;
 mod prepass;
 mod table;

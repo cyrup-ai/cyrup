@@ -202,6 +202,9 @@ async fn build_run(dir: &Path, temp_root: &Path, run_token: &str, child_id: &str
 
     let config = RunnerConfig {
         turn_budget: None,
+        // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
+        // call that does not ask for one runs unbudgeted. This fixture asks for none.
+        usage_budget: None,
         timeout_ms: None,
         deadline_at_ms: None,
         share: None,

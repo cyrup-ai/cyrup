@@ -201,7 +201,7 @@ impl CommandRegistry {
     /// prompt/extension/skill commands the app merges in (spec/tui/04 §2.2).
     ///
     /// Until this existed, `CommandSource::{Prompt, Extension, Skill}` were declared and NEVER
-    /// constructed, [`InputEditor::set_registry`] had zero callers, and
+    /// constructed, [`crate::editor::InputEditor::set_registry`] had zero callers, and
     /// `AgentSession::slash_command_catalog()` — which already merges all three sources — was
     /// consumed only by RPC mode. An RPC client saw every registered command; the interactive TUI
     /// showed builtins only, from the same session with the same registrations.

@@ -70,7 +70,7 @@
 //! Identical in shape to [`crate::stray_reply`]'s, and for the same reason — this sits on the path
 //! every keystroke takes. **The only paths that discard a held event are a successfully decoded
 //! sequence and a completed bracketed paste.** Every other exit — an unexpected event, an
-//! undecodable sequence, the [`MAX_HELD`] cap, or the input simply going idle ([`Self::flush`],
+//! undecodable sequence, the [`MAX_HELD`] cap, or the input simply going idle ([`EscapeReassembler::flush`],
 //! driven by the reader thread's shortened poll) — replays the held prefix in order, degrading to
 //! today's behaviour rather than to lost input.
 

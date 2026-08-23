@@ -76,7 +76,7 @@ impl ModelFile {
 /// its `check` closure is `composeApiKeyAuth`'s (provider-composer.ts:314-332). So a user-declared
 /// provider carrying its own `apiKey` counts as configured with nothing in `auth.json` at all.
 ///
-/// cyrup had two disagreeing predicates: [`AuthStore::has_auth`] alone on the binary's default-launch
+/// cyrup had two disagreeing predicates: [`crate::AuthStore::has_auth`] alone on the binary's default-launch
 /// path (which knows only `--api-key`, an `auth.json` entry, and the `env_keys` table of KNOWN
 /// provider ids, so a user-declared provider matched none of the three), and a second, models.json-
 /// aware one inside the session. This is the single predicate both call.

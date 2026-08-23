@@ -12,7 +12,7 @@
 //! `cyrup-intercom::identity`, and each is a port of its OWN upstream function — which is why
 //! `orchestrator_presence_target` is NOT byte-identical to `cyrup_intercom::identity::presence_name`
 //! (ICOM-040: pi-subagents v0.47.1 slices 8, pi-intercom v0.10.1 slices 18). See the
-//! `[CYRUP-DELTA]` on that function; the [`tests`] below pin both formulas AND their disagreement.
+//! `[CYRUP-DELTA]` on that function; the `tests` below pin both formulas AND their disagreement.
 //!
 //! # The child-bridge identity env vars
 //!
@@ -146,7 +146,7 @@ pub fn resolve_subagent_intercom_target_opt(
 /// ## [CYRUP-DELTA] — this is NOT byte-identical to `cyrup_intercom::identity::presence_name`
 ///
 /// ICOM-040. This function's doc used to claim byte-identity with
-/// [`cyrup_intercom::identity::presence_name`], and that claim was false: `presence_name` takes
+/// `cyrup_intercom::identity::presence_name`, and that claim was false: `presence_name` takes
 /// **18** id characters (pi-intercom `resolveIntercomPresenceName`, `pi-intercom/index.ts:419-425`
 /// @v0.10.1, widened from 8 at v0.10.0 because two UUIDv7 ids minted in the same millisecond share
 /// far more than 8 leading characters), while this one takes **8**.

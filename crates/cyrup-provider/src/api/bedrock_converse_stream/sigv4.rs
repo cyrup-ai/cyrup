@@ -87,7 +87,7 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 /// `x-amz-content-sha256` and (with temporary credentials) `x-amz-security-token` are added to the
 /// map before the canonical request is built, so they are covered by the signature — the same
 /// invariant upstream relies on when it forbids callers from overwriting `x-amz-*` / `host` /
-/// `authorization` ([`is_reserved_header`]).
+/// `authorization` (`is_reserved_header`).
 pub(super) fn sign_sigv4(
     headers: &mut BTreeMap<String, String>,
     url: &str,

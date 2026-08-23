@@ -193,7 +193,7 @@ impl CommandDescriptor {
 /// `signal_id` is the WASM-boundary adaptation of Pi's `options.signal: AbortSignal` (`exec.ts:65-
 /// 72`): Pi extensions run in-process and can hand `execCommand` a live `AbortSignal` object
 /// directly; a WASM guest cannot pass an object reference across the component boundary, so it
-/// instead references a signal it already registered by ID via [`crate::Ctx::abort_signal`] (the
+/// instead references a signal it already registered by ID via [`crate::Ui::abort_signal`] (the
 /// SAME id namespace [`DialogOptions::signal_id`] uses). Since the guest is wasm-suspended for the
 /// whole duration of a host `exec` call, only Pi's "already aborted before the call" branch
 /// (`exec.ts:66-68`) is reachable — the host checks `signal_id` once, at call time, and starts the
@@ -221,7 +221,7 @@ impl ExecOptions {
         self
     }
     /// Bind an already-registered programmatic abort signal (builder-style; Pi `options.signal`,
-    /// `exec.ts:65-72`): if `id` was aborted via [`crate::Ctx::abort_signal`] before this call, the
+    /// `exec.ts:65-72`): if `id` was aborted via [`crate::Ui::abort_signal`] before this call, the
     /// exec starts pre-cancelled instead of running at all.
     pub fn signal_id(mut self, id: impl Into<String>) -> Self {
         self.signal_id = Some(id.into());
@@ -422,7 +422,7 @@ pub struct NavigateOptions {
 /// Pi's bag also carries `onComplete(result)` / `onError(error)` callbacks. Those are function
 /// VALUES and cannot cross the component boundary, so they have no field here: a guest that needs
 /// the completion signal subscribes to the `session_compact` event
-/// ([`crate::events::SessionCompact`], Pi's own `SessionCompactEvent`), which carries the produced
+/// ([`crate::events::SessionCompactEvent`], Pi's own `SessionCompactEvent`), which carries the produced
 /// compaction entry. Pi's `compact()` is fire-and-forget on both sides — it "triggers compaction
 /// without awaiting completion" — so the call itself returns as soon as the host has queued it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

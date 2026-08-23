@@ -43,7 +43,7 @@ impl InputEditor {
         EditorOutcome::Ignored
     }
 
-    /// Route a key while the popup is open through the configurable [`AutocompleteKeymap`] (item #6 —
+    /// Route a key while the popup is open through the configurable [`crate::AutocompleteKeymap`] (item #6 —
     /// the nav/accept/cancel keys are no longer hardcoded). Returns `Some` if consumed; `None` to
     /// fall through to normal editing.
     fn handle_popup_key(&mut self, ev: &KeyEvent) -> Option<EditorOutcome> {

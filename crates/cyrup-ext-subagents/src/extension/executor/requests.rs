@@ -1,4 +1,4 @@
-//! The request/override DTOs callers hand to [`SubagentExecutor`]'s run entry points, plus
+//! The request/override DTOs callers hand to [`crate::extension::SubagentExecutor`]'s run entry points, plus
 //! the `status` view selector.
 
 use std::collections::BTreeMap;

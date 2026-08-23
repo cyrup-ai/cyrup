@@ -431,9 +431,9 @@ pub trait HostServices: Send + Sync {
     /// `send_custom_message` otherwise lacked. Denied by default (`Err`) — the default host owns no live
     /// turn loop. This is the seam that lets a native extension's background task surface a completed
     /// result INTO the parent session (a real turn), closing R-SA-101 (cyrup-ext-subagents' background
-    /// completion currently degrades to a stderr `LoggingCompletionSink`); [`HookOutcome`] has no such
+    /// completion currently degrades to a stderr `LoggingCompletionSink`); [`crate::contract::HookOutcome`] has no such
     /// variant (Noop/Block/Mutate/Handled only), so this belongs on the capability backend, not a hook
-    /// return. [`HookOutcome`]: crate::contract::HookOutcome
+    /// return.
     fn inject_message(
         &self,
         _content: &str,
@@ -1279,7 +1279,7 @@ pub trait ProviderReduction: Send + Sync {
 
 /// Host-side state backing one loaded WASM extension's imports (arch-08 §3.5/§3.6). Shared (via
 /// `Arc`) between the extension's `Store<HostState>` (so the import Host impls reach it) and the
-/// [`crate::host::WasmExtension`] handle (so the loader reads back what `init` registered).
+/// [`crate::host::LiveExtension`] handle (so the loader reads back what `init` registered).
 pub struct GuestState {
     pub owner: ExtensionId,
     pub registry: Arc<ExtensionRegistry>,

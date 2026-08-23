@@ -14,7 +14,7 @@ use crate::scope::{InstallScope, ResourceScope};
 use super::DiscoveryConfig;
 
 /// One package working tree queued for resource collection, from either the settings channel
-/// ([`ConfiguredPackage`], CFG-003) or the install registry ([`InstalledPackage`]).
+/// ([`ConfiguredPackage`], CFG-003) or the install registry ([`crate::InstalledPackage`]).
 pub(super) struct PackageTree {
     pub(super) dir: PathBuf,
     pub(super) id: cyrup_core::PackageId,
@@ -150,7 +150,7 @@ pub fn scope_base_dir(cwd: &Path, global_dir: &Path, scope: InstallScope) -> Pat
 ///
 /// The install ROOT is prepared before the clone, exactly as upstream orders it: `getGitInstallRoot`
 /// then `ensureGitIgnore` (`:1831-1834`) — at project scope that root is inside the user's own
-/// repository, so without it the clone shows up in `git status` (CFG-037). [`git_clone`] then
+/// repository, so without it the clone shows up in `git status` (CFG-037). [`crate::package::install::git_clone`] then
 /// stages and renames, so a failure leaves nothing behind at `dir`.
 ///
 /// **No registry row is written.** pi has no install registry: a settings-declared package IS the

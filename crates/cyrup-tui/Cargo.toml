@@ -12,10 +12,16 @@ authors.workspace = true
 workspace = true
 
 [features]
-# ON by default, matching cyrup-ext and cyrup-session-svc. Nothing in `src/` is gated on it: the
-# feature exists so `tests/wasm_renderer_screen.rs` — the EXT-006 end-to-end that draws a LIVE WASM
-# guest's serialized widget tree onto real terminal cells — can `#![cfg(feature = "wasm-host")]`
-# itself out of a native-only build instead of failing to compile there.
+# ON by default, matching cyrup-ext and cyrup-session-svc. The feature exists so
+# `tests/wasm_renderer_screen.rs` — the EXT-006 end-to-end that draws a LIVE WASM guest's serialized
+# widget tree onto real terminal cells — can `#![cfg(feature = "wasm-host")]` itself out instead of
+# failing to compile.
+#
+# Turning it OFF does NOT produce a wasmtime-free build of this crate and must not be described as
+# one. No `cfg` in `src/` reads it, and `src/app/mod.rs:111` names `cyrup_ext::host::HostServices`
+# unconditionally, so `src/` cannot compile without the host at all; `cyrup-ext` is therefore pulled
+# in below with `features = ["wasm-host"]`. EXT-026 (`docs/gap-analysis/06-cyrup-ext.md:263`) is the
+# ledger item for a genuinely native-only graph, not this flag.
 default = ["wasm-host", "scrolling-regions"]
 wasm-host = ["cyrup-ext/wasm-host", "cyrup-session-svc/wasm-host"]
 # Retains every committed line in `AppState::scrollback` for test/inspection assertions. OFF in
@@ -40,7 +46,20 @@ cyrup-resources = { workspace = true }
 # so the `HostServices` trait (`cyrup_ext::host`) is in scope to call `LiveHostServices::set_label` —
 # the live label-append the `/tree` `e` rename persists through (the SAME seam a guest's `setLabel`
 # uses, host_services.rs:866). `LiveHostServices` exposes the append only via that trait impl.
-cyrup-ext = { workspace = true }
+#
+# `cyrup_ext::host` exists only under `wasm-host` (`cyrup-ext/src/lib.rs:147-152`) and
+# `src/app/mod.rs:111` imports it with no `cfg`.
+# `wasm-host` is NOT optional for this crate, and until now no manifest said so: the feature rode in
+# on `cyrup-ext`'s `default = ["wasm-host"]` through the workspace table, which sets no
+# `default-features = false` (root `Cargo.toml:111`). Stating it on the edge changes the resolved
+# graph in exactly zero builds — measured, not assumed: the feature is already on in every
+# configuration this workspace can currently produce, `--workspace --no-default-features` included,
+# because there each member's defaults come straight back through its siblings' edges. What the edge
+# buys is that the requirement SURVIVES the day `cyrup-ext` stops defaulting `wasm-host` on, or any
+# edge here gains `default-features = false` — either of which would otherwise turn this crate into a
+# wall of `E0432`/`E0407` with nothing in any manifest saying why. This is NOT the PROV-052 shape:
+# `wasm-host` is the production capability host, not a test double.
+cyrup-ext = { workspace = true, features = ["wasm-host"] }
 # Already a transitive dep (via cyrup-session-svc) and a dev-dep below; promoted to a direct
 # dependency so the streaming-delta variants of `StreamEvent` (`TextDelta { delta, partial }`,
 # stream.rs:306) can be matched in `App::ingest_event` (gap 1 — live token-by-token render).

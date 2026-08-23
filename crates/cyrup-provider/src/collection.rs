@@ -406,7 +406,7 @@ impl Models {
     /// | `allowNetwork = options.allowNetwork ?? true` (`:277`) | [`ModelsRefreshOptions::default`] |
     /// | `refreshable = providers.filter(p => p.refreshModels !== undefined)` (`:279-282`) | a provider whose [`Provider::refresh_models`] answers `None` |
     /// | `if (options.signal?.aborted) return;` (`:286`) | the per-provider pre-check below |
-    /// | `provider.refreshModels({…, allowNetwork, force, signal})` (`:297-303`) | [`RefreshModelsContext`] |
+    /// | `provider.refreshModels({…, allowNetwork, force, signal})` (`:297-303`) | [`crate::provider::RefreshModelsContext`] |
     /// | `if (!signal?.aborted) errors.set(id, error)` (`:305-311`) | an abort records NO error |
     /// | the `allowNetwork:false` re-invocation, its own failure swallowed (`:313-322`) | the restore arm |
     /// | `return { aborted: signal?.aborted ?? false, errors }` (`:327`) | [`ModelsRefreshResult`] |
@@ -418,13 +418,13 @@ impl Models {
     ///   `crates/cyrup/src/provider.rs` restricts the fetch set by id. `Some(id)` refreshes exactly
     ///   that provider and is a clean no-op for an unknown id (pi's
     ///   `if (!entry?.refreshModels) return`).
-    /// * **No `credential` / `store` are threaded.** See [`RefreshModelsContext`]'s `[CYRUP-DELTA]`:
+    /// * **No `credential` / `store` are threaded.** See [`crate::provider::RefreshModelsContext`]'s `[CYRUP-DELTA]`:
     ///   the persisting fetcher owns both, so pi's `resolveRefreshCredential` bail (`:296`) is
     ///   reproduced at the trigger site rather than here.
     ///
     /// **The abort is real, not advisory.** A provider that has not started when `cancel` fires is
     /// never called; a provider that is mid-flight is cut off only if it honours the token it was
-    /// handed, which is why [`RefreshModelsContext::cancel`] documents that as a requirement rather
+    /// handed, which is why [`crate::provider::RefreshModelsContext::cancel`] documents that as a requirement rather
     /// than a courtesy. Like pi, this waits for every started provider to settle before returning —
     /// it does not drop in-flight futures at this layer.
     pub async fn refresh_with(

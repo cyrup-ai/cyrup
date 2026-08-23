@@ -1,5 +1,12 @@
-//! `cargo xtask gen-catalogs` — regenerate `crates/cyrup-provider/src/providers/catalog/*.json`
-//! and `catalog_manifest.json` from a pinned pi revision (PROV-018 / PROV-060).
+//! `xtask` — the repo's own tooling. Two commands, both run by hand (there is no CI here; see
+//! README "Build"):
+//!
+//! * `gen-catalogs` — regenerate `crates/cyrup-provider/src/providers/catalog/*.json` and
+//!   `catalog_manifest.json` from a pinned pi revision (PROV-018 / PROV-060). Documented below.
+//! * `feature-matrix` — type-check the feature combinations `cargo check --workspace
+//!   --all-targets` does not reach. See [`features`] for the matrix and why each row is in it.
+//!
+//! # `gen-catalogs`
 //!
 //! # Why a `git show` extractor and not pi's own generator
 //!
@@ -23,6 +30,7 @@
 //!
 //! ```text
 //! cargo run -p xtask -- gen-catalogs [--pi <path>] [--rev <rev>] [--out <dir>] [--check] [--diff]
+//! cargo run -p xtask -- feature-matrix [--fast]
 //! ```
 //!
 //! * `--check` — generate in memory and compare byte-for-byte with what is on disk; exit 1 on any
@@ -30,6 +38,7 @@
 //! * `--diff` — print a **structural** (model-level and field-level) diff of on-disk vs generated
 //!   instead of writing anything. Whitespace-insensitive, so it reports only real data movement.
 
+mod features;
 mod tsdata;
 
 use std::collections::BTreeMap;
@@ -352,7 +361,7 @@ fn parse_args() -> Result<Args, String> {
     let cmd = it.next().unwrap_or_default();
     if cmd != "gen-catalogs" {
         return Err(format!(
-            "unknown command {cmd:?} — the only command is `gen-catalogs` \
+            "unknown command {cmd:?} — expected `gen-catalogs` \
              (see this file's module docs for flags)"
         ));
     }
@@ -373,7 +382,24 @@ fn parse_args() -> Result<Args, String> {
     Ok(args)
 }
 
+/// Command dispatch. `xtask` takes no dependencies (see `xtask/Cargo.toml`), so this is a `match`
+/// on `argv[1]` rather than a parser.
 fn run() -> Result<(), String> {
+    let mut argv = std::env::args().skip(1);
+    let cmd = argv.next().unwrap_or_default();
+    match cmd.as_str() {
+        // `parse_args` re-reads `std::env::args()` and re-validates the command itself, so this arm
+        // hands it nothing: `run_gen_catalogs` is a pure rename of the old `run` body.
+        "gen-catalogs" => run_gen_catalogs(),
+        "feature-matrix" => features::run_matrix(&argv.collect::<Vec<_>>(), workspace_root()),
+        other => Err(format!(
+            "unknown command {other:?} — commands are `gen-catalogs` and `feature-matrix` \
+             (see each one's module docs for flags)"
+        )),
+    }
+}
+
+fn run_gen_catalogs() -> Result<(), String> {
     let args = parse_args()?;
     let generated = generate_all(&args)?;
 

@@ -190,10 +190,10 @@ pub struct ExtensionHost {
     /// an extension runs in is not something the coordination channel is allowed to know.
     bus: Arc<crate::bus::SharedBus>,
     /// The live rich-ctx source every native dispatch/command/shortcut ctx is enriched from
-    /// (EXT-060). Feature-INDEPENDENT, unlike [`Self::services`]: `HostCtxSource` is the read-only
-    /// five-getter slice of the capability backend, so a `--no-default-features` host can attach
-    /// one and its native built-ins read the same live `is_idle`/`is_project_trusted` the shipped
-    /// arm does. Set by [`Self::set_ctx_source`], which
+    /// (EXT-060). Feature-INDEPENDENT, unlike the `wasm-host`-gated capability backend:
+    /// `HostCtxSource` is the read-only five-getter slice of that backend, so a
+    /// `--no-default-features` host can attach one and its native built-ins read the same live
+    /// `is_idle`/`is_project_trusted` the shipped arm does. Set by [`Self::set_ctx_source`], which
     /// [`Self::load_native_with_services`] calls for the `wasm-host` path.
     ctx_source: RwLock<Option<Arc<dyn crate::native::HostCtxSource>>>,
     /// Subscribers notified after a command registration lands from a LIVE handler (HA-1's command

@@ -25,7 +25,7 @@ pub(crate) fn default_results_dir(cwd: &Path) -> PathBuf {
 }
 
 /// The directory a just-spawned background run owns — the SAME arithmetic
-/// [`SubagentExecutor::spawn_background`] used to create it
+/// [`crate::extension::SubagentExecutor::spawn_background`] used to create it
 /// ([`resolve_background_storage_roots`] + [`RunPaths::for_run`]), re-derived at the tool's own
 /// call site so an async launch can report it as `details.asyncDir`.
 ///
@@ -409,7 +409,7 @@ pub(crate) fn builtin_agents_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources"))
 }
 
-/// Structurally unreachable per [`SubagentExecutor::fork_resolver`]'s own documented reasoning
+/// Structurally unreachable per [`crate::extension::SubagentExecutor::fork_resolver`]'s own documented reasoning
 /// (`SessionManager::in_memory` with a `None` id never fails); retained as an explicit, named,
 /// never-called total function rather than a bare `unreachable!()`/`panic!()` — this crate forbids
 /// both outside tests — so the type system still sees a total `SessionManager` value at every call

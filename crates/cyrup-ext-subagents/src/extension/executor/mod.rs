@@ -40,7 +40,7 @@ pub struct SubagentExecutor {
     tracker: Arc<JobTracker>,
     /// An EXPLICITLY-injected completion sink (a test's capturing sink, or a caller wiring its own
     /// turn-injection channel). `None` — the production default — means "derive the effective sink
-    /// at install time": a live [`HostServicesCompletionSink`] when the P-1 `host_services` slot is
+    /// at install time": a live [`crate::background::watch::HostServicesCompletionSink`] when the P-1 `host_services` slot is
     /// bound (R-SA-101, the real turn-injecting sink), else the graceful-degradation
     /// [`crate::background::watch::LoggingCompletionSink`] (log + delete). Set via
     /// [`SubagentExecutor::with_completion_sink`].
@@ -88,18 +88,18 @@ pub struct SubagentExecutor {
     /// The live-child steer transport (R-SA-086). Defaults to
     /// [`crate::tui::intercom::NoTransportSteerChannel`] (no broker → always "not registered"); the
     /// intercom companion's broker-backed `SteerChannel` is threaded in via
-    /// [`SubagentsExtension::with_channels`] → [`SubagentExecutor::with_channels`]. Consumed by
+    /// [`crate::extension::SubagentsExtension::with_channels`] → [`SubagentExecutor::with_channels`]. Consumed by
     /// [`Self::control_resume`]'s `SteerRunning` arm to DELIVER `action='resume'`'s follow-up to a
     /// still-running async child over the broker (pi `subagent-executor.ts:860-878`).
     steer: Arc<dyn crate::tui::intercom::SteerChannel>,
     /// The out-of-band grouped-result delivery channel (R-SA-123/124/125). Defaults to
     /// [`crate::tui::intercom::NoTransportChannel`] (always "not delivered", full inline preserved);
     /// the intercom companion's broker-backed `DeliveryChannel` is threaded in via
-    /// [`SubagentsExtension::with_channels`] → [`SubagentExecutor::with_channels`].
+    /// [`crate::extension::SubagentsExtension::with_channels`] → [`SubagentExecutor::with_channels`].
     delivery: Arc<dyn crate::tui::intercom::DeliveryChannel>,
     /// The single-slot clarify/ask lock (R-SA-119/120) backed by a [`crate::tui::intercom::ClarifyChannel`].
     /// Defaults to [`crate::tui::intercom::AskLock::new_with_no_live_channel`]; the intercom companion's
-    /// broker-backed `ClarifyChannel` is threaded in via [`SubagentsExtension::with_channels`]. Consumed
+    /// broker-backed `ClarifyChannel` is threaded in via [`crate::extension::SubagentsExtension::with_channels`]. Consumed
     /// by the exec detach-trigger arm (R-SA-037) when a child's `contact_supervisor` blocking ask fires.
     clarify: Arc<crate::tui::intercom::AskLock>,
     /// Live foreground-run control registry (pi `state.foregroundControls`, `shared/types.ts`):
@@ -181,7 +181,7 @@ impl SubagentExecutor {
     /// `sink` instead of the default graceful-degradation logging sink — the seam a host uses to
     /// route completions into a live session's turn loop (R-SA-101), and a test uses to capture
     /// them. Explicitly overriding the sink here wins over the P-1 `host_services`-derived
-    /// [`HostServicesCompletionSink`] at install time (so a test's scripted sink is authoritative).
+    /// [`crate::background::watch::HostServicesCompletionSink`] at install time (so a test's scripted sink is authoritative).
     #[must_use]
     pub fn with_completion_sink(sink: Arc<dyn crate::background::watch::CompletionSink>) -> Self {
         Self { completion_sink_override: Some(sink), ..Self::new() }

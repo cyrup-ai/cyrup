@@ -388,7 +388,7 @@ impl InitApi {
 
     /// Declare a CLI flag (EXT-035; pi `registerFlag`, `extensions/loader.ts:274-410` @v0.83.0).
     /// `spec` is the flag's JSON spec; the resolved value is read back through
-    /// [`crate::ExtensionRegistry::flag`].
+    /// [`crate::ExtensionRegistry::flag_value`].
     pub fn register_flag(&mut self, name: impl Into<String>, spec: serde_json::Value) {
         self.flags.push((name.into(), spec));
     }

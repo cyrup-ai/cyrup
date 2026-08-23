@@ -2,7 +2,7 @@
 //! `ModelRuntime`).
 //!
 //! [`crate::model::ModelFile::compose`] answers "what does the catalog look like?". This module
-//! answers the question the binary actually asks: "which [`Provider`] owns this model, and can it
+//! answers the question the binary actually asks: "which [`cyrup_provider::Provider`] owns this model, and can it
 //! stream?".
 //!
 //! Pi has exactly ONE model registry and it is the **composed** one.
@@ -154,7 +154,7 @@ fn auth_err(provider: &ProviderId, message: String) -> AuthError {
 /// 1. an explicit/stored [`Credential`] wins and is handed to the inherited built-in strategy when
 ///    there is one (so e.g. anthropic's own credential handling still applies);
 /// 2. else the `models.json` `apiKey` resolved through the config-value language
-///    (`${VAR}` / `!command` — [`resolve_config_value_or_throw`]), fed to the inherited strategy
+///    (`${VAR}` / `!command` — [`crate::config_value::resolve_config_value_or_throw`]), fed to the inherited strategy
 ///    as a credential when there is one;
 /// 3. else the inherited strategy's own ambient resolution (its env vars).
 ///

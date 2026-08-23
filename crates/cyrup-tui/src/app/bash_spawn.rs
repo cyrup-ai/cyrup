@@ -19,7 +19,7 @@ pub(crate) enum BashMsg {
 /// Run a `!`/`!!` command through the session's own bash seam — Pi's `handleBashCommand`
 /// (`interactive-mode.ts:6279-6364`), whose executor line is `await this.session.executeBash(command,
 /// (chunk) => this.bashComponent.appendOutput(chunk), { excludeFromContext, operations })`
-/// (`:6336-6345`) — streaming its deltas and terminal [`BashResult`] over the returned channel.
+/// (`:6336-6345`) — streaming its deltas and terminal [`cyrup_session_svc::BashResult`] over the returned channel.
 ///
 /// **X13.** This replaced a local `sh -c` pump that reported only an exit code, so
 /// `truncated`/`fullOutputPath` were hard-coded `false, None` at the call to `setComplete` and the

@@ -564,7 +564,7 @@ pub struct LiveHostServices {
     /// `pending_events`/the control queue use). Last write wins (Pi: the last `setActiveTools` wins).
     pending_active_tools: Mutex<Option<ActiveToolsPush>>,
     /// [`DEFAULT_EXEC_TIMEOUT`] in production; overridable ONLY for tests
-    /// ([`Self::with_exec_timeout`]) so the fallback-timeout path is exercisable without a real test
+    /// (`LiveHostServices::with_exec_timeout`, `#[cfg(test)]`) so the fallback-timeout path is exercisable without a real test
     /// waiting the full production duration.
     exec_timeout: Duration,
     /// The late-bound message-injection sink (R-SA-101 / P-2). A guest or a native extension's

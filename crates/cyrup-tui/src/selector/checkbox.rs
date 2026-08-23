@@ -25,7 +25,7 @@ struct ModelRow {
 ///
 /// **This component owns its own row rendering.** Upstream's `updateList` (`:230-280`) adds bare
 /// `Text` children — `prefix + id + " [provider]" + status` — it does **not** drive a `SelectList`,
-/// so nothing here goes through [`SelectList`](crate::select_list::SelectList)'s padded two-column
+/// so nothing here goes through [`SelectList`]'s padded two-column
 /// layout. That is what put the enable marker in front of the label and the provider in a
 /// right-aligned description column (S6/S7).
 pub struct CheckboxSelector {

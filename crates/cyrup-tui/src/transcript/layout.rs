@@ -282,7 +282,7 @@ pub(super) fn body_line(
 /// `Paragraph::line_count(width)` runs the identical `WordWrapper` the renderer does, so the measured
 /// height EXACTLY matches what render produces — the fix for the PROSE-WRAP truncation: a single
 /// long paragraph (one logical [`Line`]) wraps to many display rows, and both the content-sized live
-/// viewport ([`Transcript::content_height`]) and the scrollback flush must size to the wrapped count,
+/// viewport ([`crate::transcript::TranscriptView::content_height`]) and the scrollback flush must size to the wrapped count,
 /// not the logical line count. `width == 0` degrades to the logical count (nothing renders anyway).
 pub(crate) fn wrapped_height(lines: &[Line<'static>], width: usize) -> usize {
     if width == 0 {

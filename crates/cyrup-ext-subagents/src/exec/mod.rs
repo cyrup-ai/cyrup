@@ -34,94 +34,24 @@
 //! [`crate::spawn::SpawnedChild::terminate`]'s real SIGINT->SIGTERM->SIGKILL escalation ladder —
 //! this module never invents a second, competing cancellation mechanism.
 
-/// The acceptance-provenance ledger: contract injection, gate evaluation, and REAL `verify[]`
-/// subprocess execution (R-SA-023/030/032/033; DI-SA-5).
 pub mod acceptance;
-
-/// Project-local per-agent refinement overlays (`<cwd>/.cyrup-subagents/refinements/<agent>.md`) —
-/// the READ half of pi-subagents' `agents/agent-refinements.ts`, applied to the child's system
-/// prompt between the memory block and the output-path override (`execution.ts:1442`).
 pub mod agent_refinements;
-
-/// Bounded child-protocol I/O: the 16 MiB stdout line cap and its `protocol_output_limit`
-/// diagnostic, the oversized-aggregate-record projection, the bounded stderr byte tail, and the
-/// drain start/cancel lifecycle projection — a port of pi's `runs/shared/child-protocol.ts`.
 pub mod child_protocol;
-
-/// Implementation-expecting classification and mutating-tool-call scan (R-SA-034).
 pub mod completion_guard;
-
-/// Live-control config resolution + the control-event/notice pipeline (pi
-/// `runs/shared/subagent-control.ts` + the control half of `runs/shared/long-running-guard.ts`).
 pub mod control;
-
-/// Direct-MCP tool-allowlist resolution (T4) — `mcp:<server>[/<tool>]` selectors are expanded into
-/// concrete adapter-visible builtin tool names for the child's `--tools` allowlist (pi
-/// `resolveMcpDirectToolNames`, `runs/shared/mcp-direct-tool-allowlist.ts`), rather than passed
-/// through literally.
 pub mod mcp_direct_tools;
-
-/// The model-fallback attempt loop (`build_model_candidates`, `is_retryable_model_failure`,
-/// `run_fallback_ladder`) — R-SA-035/036/037/038/039/040/041/044.
 pub mod fallback;
-
-/// Optional `subagents.modelScope` enforcement (`check_model_scope`, `parse_model_scope_config`)
-/// — a 1:1 port of pi-subagents' `runs/shared/model-scope.ts`.
 pub mod model_scope;
-
-/// The NDJSON event-stream parser (`SubagentEvent`, `consume_stdout`) — R-SA-026/057/058.
 pub mod ndjson;
-
-/// Final-output extraction (R-SA-029), file-only output-path stat-snapshot handoff
-/// (R-SA-024/025/031), and UTF-8-safe output truncation (R-SA-042).
 pub mod output;
-
-/// Parent-side structured-output extraction and JSON-Schema re-validation (R-SA-030).
 pub mod structured;
-
-/// The shared task mutation-intent classifier — a port of pi-subagents'
-/// `runs/shared/task-intent.ts` @v0.43.0. Consumed by [`completion_guard`] (does the task REQUIRE
-/// file changes?) and by [`acceptance`]'s level inference (COULD it plausibly change files?).
 pub mod task_intent;
-
-/// `{text, expandedText}` tool-call argument previews (R-SA-043's compaction target) — pi
-/// `ToolCallSummary` + `formatToolCall` (`shared/types.ts:601`, `shared/formatters.ts:99`).
 pub mod tool_call_summary;
-
-/// Per-run child tool-call budgets (`toolBudget:` frontmatter and the
-/// `CYRUP_SUBAGENT_TOOL_BUDGET` env hand-off) — a port of pi-subagents'
-/// `runs/shared/tool-budget.ts`. Enforcement lives child-side in [`crate::prompt_runtime`].
 pub mod tool_budget;
-
-/// SUBA-008 — per-run child assistant-TURN budgets (`turnBudget:` frontmatter, the `turnBudget`
-/// tool param and the `subagents.turnBudget` config key) — a port of pi-subagents'
-/// `runs/shared/turn-budget.ts`. Unlike [`tool_budget`] there is NO env hand-off and no child-side
-/// enforcement: the child is only *told* about the budget through a system-prompt block, and
-/// [`drive_attempt`] enforces it parent-side off the child's own assistant `message_end` events.
 pub mod turn_budget;
-
-/// SUBA-021 (first half) — the subagent CAPABILITY CEILING: the monotonically-tightening
-/// `allowedTools`/`allowedAgents`/`denyExtensions` upper bound a parent imposes on its subtree, its
-/// per-session registry, and the [`capability_ceiling::CAPABILITY_CEILING_ENV`] hand-off that keeps
-/// it applying across this crate's re-exec boundary. A port of pi-subagents'
-/// `runs/shared/capability-ceiling.ts`.
 pub mod capability_ceiling;
-
-/// SUBA-021 (second half) — per-run USAGE budgets (`tokens` / `costUsd`, each with an advisory
-/// `soft` and a terminal `hard` limit): a port of pi-subagents' `runs/shared/usage-budget.ts`.
-/// Distinct from [`turn_budget`] and [`tool_budget`], which bound how MANY turns/tool calls a child
-/// takes rather than what they cost.
 pub mod usage_budget;
-
-/// SUBA-046 — the per-session subagent SPAWN budget, its snapshot, and the explicit grant path
-/// behind an exhausted cap: a port of pi-subagents' `runs/shared/spawn-budget.ts`. Consumed by
-/// `extension.rs`'s `reserve_subagent_spawns` and by the `grant-spawn-budget` dispatch arm.
 pub mod spawn_budget;
-
-/// SUBA-045 — the child tool-availability diagnostic (`CYRUP_SUBAGENT_TOOL_DIAGNOSTIC_PATH`), a
-/// port of pi-subagents' `runs/shared/tool-availability.ts`. The child writes it from its live
-/// registry; this module's `run_attempt` reads it back so a tool that was never registered becomes
-/// the run's error instead of a model apology.
 pub mod tool_availability;
 
 use std::collections::VecDeque;

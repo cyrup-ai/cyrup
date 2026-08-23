@@ -1771,13 +1771,13 @@ impl SessionBuilder {
     }
 }
 
-/// Parse the settings `steeringMode`/`followUpMode` string into the agent's [`QueueMode`]
+/// Parse the settings `steeringMode`/`followUpMode` string into the agent's [`cyrup_agent::QueueMode`]
 /// (Pi `"all"|"one-at-a-time"`; settings-manager.ts:698-710). Any non-`all` value ⇒ one-at-a-time.
 pub(crate) fn parse_queue_mode(s: &str) -> cyrup_agent::QueueMode {
     if s == "all" { cyrup_agent::QueueMode::All } else { cyrup_agent::QueueMode::OneAtATime }
 }
 
-/// Parse the settings `transport` string into the provider [`Transport`] Pi hands the agent
+/// Parse the settings `transport` string into the provider [`cyrup_provider::Transport`] Pi hands the agent
 /// (`sdk.ts:357` `transport: settingsManager.getTransport()`; the `TransportSetting` union is
 /// `"auto" | "sse" | "websocket" | "websocket-cached"`, types.ts:98). The strings are byte-1:1 with
 /// Pi because `Transport` is `#[serde(rename_all = "kebab-case")]`. An unrecognized value falls back

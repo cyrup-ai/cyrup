@@ -25,9 +25,9 @@
 //! # The pure render primitives already exist — the remaining outer-layer step is `cyrup-tui`-side
 //!
 //! The fold-to-aggregate render primitives in [`crate::tui::render`]
-//! ([`render_run_header_line`](crate::tui::render::render_run_header_line),
+//! ([`render_run_header_line`],
 //! [`render_progress_header`](crate::tui::render::render_progress_header),
-//! [`render_background_region`](crate::tui::render::render_background_region)) are already written,
+//! [`render_background_region`]) are already written,
 //! pure, and unit-tested. This module bridges the wire payloads to them:
 //! [`render_inline_result`] renders a [`SubagentUpdatePayload`] (C20) and
 //! [`render_async_jobs_widget`] renders `&[AsyncJobSnapshot]` (C21), both reusing those primitives.

@@ -21,59 +21,14 @@
 //! (R-SA-049/050/051/066/069); [`chain_graph`] and [`worktree`] are siblings built on top of
 //! those same primitives.
 
-/// Env-var-based depth-propagation guard (canonical; R-SA-054/055/056). See [`depth`] for the
-/// sole algorithm every other depth reference in this crate (and this spec) defers to.
 pub mod depth;
-
-/// Bounded `Semaphore`-gated worker pool fan-out over real child OS processes
-/// (R-SA-049/050/051/066/069). See [`parallel`] for the sole bounded-concurrency-over-real-
-/// subprocesses primitive this crate introduces.
 pub mod parallel;
-
-/// SIGINT -> SIGTERM -> SIGKILL kill-escalation state machine (R-SA-059). See [`signal`] for the
-/// sole `terminate()` implementation [`SpawnedChild::terminate`] delegates to.
 pub mod signal;
-
-/// Git-worktree cwd isolation for `worktree: true` parallel fan-out groups (R-SA-060..065). See
-/// [`worktree`] for the dirty-tree precondition check, per-task worktree creation, diff harvest,
-/// best-effort cleanup, and the optional per-worktree setup-hook JSON stdin/stdout contract.
 pub mod worktree;
-
-/// Nested-run ancestry path addressing (`CYRUP_SUBAGENT_PARENT_PATH`): safe-id validation,
-/// sanitization, and env encode/decode. See [`nested_path`]; a faithful port of pi's
-/// `runs/shared/nested-path.ts`.
 pub mod nested_path;
-
-/// Nested-run event relay + capability-gated control routing (C17): the [`nested_events::NestedRoute`]
-/// event-sink/control-inbox protocol, capability tokens, fanout-child authorization env, and the
-/// grandparent [`nested_events::project_nested_events`] registry projection. A faithful port of pi's
-/// `runs/shared/nested-events.ts`.
 pub mod nested_events;
-
-/// The linear chain/workflow-graph walker (R-SA-052/053): `RunnerStep` (`SingleStep |
-/// ParallelGroup | DynamicGroup`), `ChainGraph = Vec<RunnerStep>`, and `walk_chain`'s strict
-/// fold-over-the-list dispatch, delegating group fan-out to [`parallel::run_bounded`] (and, for
-/// `worktree: true` groups, [`worktree::setup_worktree_group`]) rather than re-implementing
-/// either. See [`chain_graph`] for the sole `RunnerStep` definition every other module
-/// (`discovery::types::ChainDefinition::steps`, `discovery::chains`/`discovery::management`, the
-/// background runner-config file, a later phase's `exec/`) references rather than re-declaring.
 pub mod chain_graph;
-
-/// Deterministic subagent↔supervisor intercom addressing (a port of pi's
-/// `intercom/intercom-bridge.ts:83-97`): [`intercom_target::resolve_subagent_intercom_target`] (each
-/// child's own broker presence label + the parent's steer address) and
-/// [`intercom_target::orchestrator_presence_target`] (a supervisor's own presence target), plus the
-/// child-bridge identity env-var names the spawn overlay writes. Lives here (not in `cyrup-intercom`)
-/// because the dependency edge runs `cyrup-intercom -> cyrup-ext-subagents`, and the parent-side
-/// target computation runs at this crate's spawn site.
 pub mod intercom_target;
-
-/// Per-item dynamic fan-out semantics (R-SA-053 / C16): a faithful port of pi's
-/// `runs/shared/dynamic-fanout.ts` supplying [`chain_graph::walk_chain`]'s `DynamicGroup` arm with
-/// per-element `{item}`/`{item.path}` template substitution, `expand.key` item keys, the `maxItems`
-/// cap, `onEmpty`, duplicate-key/colliding-id detection, and the collect-record shape + aggregate
-/// schema validation. See [`dynamic_fanout`] for the pure, taxonomy-agnostic helpers the walker and
-/// the chain-parse validator both drive.
 pub mod dynamic_fanout;
 
 use std::collections::HashMap;
@@ -209,7 +164,7 @@ pub struct ChildSpawnSpec {
     /// Argv entries appended after `command.base_args`, in order — everything except the task
     /// prompt itself (mode flags, `--model`, tools-allowlist flag, `--session`, etc.). The task
     /// prompt argument (literal or `@<tempfile>`) is appended last by [`ChildSpawnSpec::build_argv`]
-    /// so every call site constructs it via [`ChildSpawnSpec::with_task`] rather than
+    /// so every call site builds the final argv through that method rather than
     /// hand-assembling the ordering itself.
     pub args: Vec<String>,
     /// The task prompt, already resolved to its final argv form: either the literal prompt text
@@ -511,7 +466,7 @@ impl SpawnedChild {
     /// `spawn::signal` upholds); calling `.envs(spec.env_overlay)` afterward merges the overlay
     /// on top of that unmodified inherited base, so `tokio::process::Command`'s own environment-
     /// merge semantics — last write wins for a given key — is exactly the inherit-then-overlay
-    /// ordering R-SA-048 requires. See [`tests::env_overlay_wins_over_inherited_value_of_the_same_name`]
+    /// ordering R-SA-048 requires. See `tests::env_overlay_wins_over_inherited_value_of_the_same_name`
     /// for a real-process proof of this ordering (not merely an assertion about `Command`'s
     /// documented behavior).
     ///

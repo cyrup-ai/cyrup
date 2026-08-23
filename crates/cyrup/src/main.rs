@@ -54,7 +54,7 @@ async fn main() -> ExitCode {
 /// Set this process's name — pi's `process.title` (`bun/cli.ts:5` and `src/cli.ts:12`
 /// `process.title = APP_NAME`; `rpc-entry.ts:6` `process.title = `${APP_NAME}-rpc``). SEAM-070.
 ///
-/// The BASE title is already satisfied for cyrup by accident — a Rust binary's argv[0] is `cyrup`,
+/// The BASE title is already satisfied for cyrup by accident — a Rust binary's argv\[0\] is `cyrup`,
 /// where Node's is `node`, which is the whole reason pi needs the assignment at all. What was
 /// genuinely lost is the **role suffix**: pi advertises an RPC-mode process as `pi-rpc`, so an
 /// operator can `pkill pi-rpc` or spot a stuck RPC child in `ps` without touching an interactive
@@ -2151,7 +2151,7 @@ async fn run_interactive(
 /// Build a [`ThemeWatcher`] for the active theme when it resolves to an on-disk file (feature #1).
 /// Returns `None` for a compiled-in built-in (no `origin_path` — nothing editable to watch) or when
 /// the file watcher cannot be spawned (hot-reload simply stays off; never fatal). The watcher's
-/// channel seeds with the theme's current [`ThemeData`], so the run loop's `theme_changed` arm fires
+/// channel seeds with the theme's current [`cyrup_resources::ThemeData`], so the run loop's `theme_changed` arm fires
 /// on every subsequent edit of that file (`/theme` edits + a settings.theme pointed at a file theme).
 fn build_theme_watcher(
     session: &AgentSession,
@@ -2230,7 +2230,7 @@ async fn seed_footer<B: cyrup_tui::RebuildBackend>(
     app.editor_mut().set_thinking_level(level);
 }
 
-/// The lowercase footer/editor string for a [`ModelThinkingLevel`] (matches the thinking-selector
+/// The lowercase footer/editor string for a [`cyrup_sdk::core::ModelThinkingLevel`] (matches the thinking-selector
 /// values + the `theme.thinking_border_style` keys).
 fn thinking_level_str(level: cyrup_sdk::core::ModelThinkingLevel) -> &'static str {
     use cyrup_sdk::core::ModelThinkingLevel as L;

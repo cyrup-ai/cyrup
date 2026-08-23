@@ -26,10 +26,10 @@
 //! `index.ts:905`); headless / no-UI contexts still fail-CLOSE to `Block`.
 //!
 //! CHILD→PARENT ASK-FORWARDING (this build, P-4, `forwarding.rs`): a subagent CHILD loads the gate
-//! with a [`ForwardingAskChannel`] ([`Self::new_forwarding_child`]) — an ask-tier decision writes a
+//! with a [`ForwardingAskChannel`] ([`PermissionSystemExtension::new_forwarding_child`]) — an ask-tier decision writes a
 //! nonce-bound request into the PARENT's spool (addressed by the `CYRUP_SUBAGENT_PARENT_SESSION`
 //! anchor `cyrup-ext-subagents` emits, `exec/mod.rs` `PARENT_SESSION_ENV_VAR`) and BLOCKS on the bound
-//! response under the P-3 `begin_human_wait` guard. The PARENT ([`Self::new_forwarding_parent`])
+//! response under the P-3 `begin_human_wait` guard. The PARENT ([`PermissionSystemExtension::new_forwarding_parent`])
 //! installs a spawned [`forwarding::spawn_forwarding_watcher`] task — on `SessionStart` AND, from
 //! PERM-005, re-entrantly on `BeforeAgentStart` / `Input` / `ToolCall`, matching pi's four
 //! `startForwardedPermissionPolling` call sites (`index.ts:2084,2137,2194,2210`) — that surfaces
@@ -47,14 +47,14 @@
 //! pi's `hasSubagentEnvHint` (`index.ts:93-103`) — ANY of [`SUBAGENT_ENV_HINT_KEYS`] non-empty —
 //! not a strict `== "1"` on one key.
 //!
-//! FOUR SUPPLEMENTARY LAYERS (all wired + enforcing, pi `index.ts:2208-2499`): [`Self::decide`] runs
+//! FOUR SUPPLEMENTARY LAYERS (all wired + enforcing, pi `index.ts:2208-2499`): [`PermissionSystemExtension::decide`] runs
 //! the agent + projectAgent policy layers (keyed by [`resolve_agent_name_from_env`], the
 //! `CYRUP_SUBAGENT_AGENT_NAME` spawn anchor), the registry / unknown-tool block (against
 //! [`cyrup_ext::HostServices::all_tool_names`]), the skill-read bypass (against the `before_agent_start`
 //! `<available_skills>` entries, [`crate::skill`]), and the external-directory guard (against
 //! [`HostCtx::cwd`]). The `before_agent_start` CONTEXT-HYGIENE layer is ALSO wired (pi
-//! `index.ts:2134-2190`, port doc §9): [`Self::on_before_agent_start`] shapes the active tool set
-//! ([`Self::should_expose_tool`] → [`cyrup_ext::HostServices::set_active_tools`]), RETURNS the
+//! `index.ts:2134-2190`, port doc §9): [`PermissionSystemExtension::on_before_agent_start`] shapes the active tool set
+//! ([`PermissionSystemExtension::should_expose_tool`] → [`cyrup_ext::HostServices::set_active_tools`]), RETURNS the
 //! sanitized system prompt as a `[mutate]` ([`crate::sanitize`]), and surfaces the yolo status pill
 //! ([`crate::status`]). Every layer — deciding gate AND context-hygiene — is live here, none stubbed.
 
@@ -127,7 +127,7 @@ pub struct PermissionSystemExtension {
     /// `debug` gates the DIAGNOSTIC JSONL stream only ([`Self::logger`], v0.8.0 `logging.ts:90-93`)
     /// AND the forwarding "child is waiting" notice (`forwarding.rs`). It does NOT gate the
     /// security `review` stream: v0.8.0 deleted that guard (the v0.7.1 guard was `logging.ts:97`),
-    /// so the audit trail is unconditional — see [`crate::logging::Logger::review`].
+    /// so the audit trail is unconditional — see [`crate::logging::PermissionSystemLogger::review`].
     /// `forwarded_prompt_timeout_seconds` is
     /// consumed by forwarding (P-4). `Mutex`-wrapped because
     /// [`Self::refresh_config_and_manager`] re-reads it from disk on `session_start` / a
@@ -138,7 +138,7 @@ pub struct PermissionSystemExtension {
     /// `extensionConfig` binding `refreshExtensionConfig` reassigns. Handing the watcher a snapshot
     /// by value froze `yoloMode` / `forwardedPromptTimeoutSeconds` at spawn time.
     config: crate::forwarding::SharedExtensionConfig,
-    /// The fail-closed FALLBACK ask channel ([`NoOpAskChannel`] in production; a scripted channel in
+    /// The fail-closed FALLBACK ask channel ([`crate::NoOpAskChannel`] in production; a scripted channel in
     /// unit tests via [`Self::from_parts`]). Used when no live UI is reachable — the live in-session
     /// dialog goes through [`LocalAskChannel`] over [`Self::host_services`] instead.
     ask_channel: Arc<dyn AskChannel>,
@@ -214,7 +214,7 @@ pub struct PermissionSystemExtension {
     has_ui: forwarding::SharedHasUi,
     /// PERM-011 half A — a `Weak` handle on this extension's own `Arc`, installed by
     /// [`Self::into_shared`]. It exists so the published runtime API
-    /// ([`crate::runtime_api`]) can call back into these methods without the process-global
+    /// ([`crate::runtime_api()`]) can call back into these methods without the process-global
     /// registry OWNING the extension: pi's registered object is a bag of closures over module
     /// scope, whose lifetime is the realm's, and a `Weak` is the Rust spelling that does not
     /// outlive the session. Unset when the extension was built by value (unit tests), in which

@@ -37,11 +37,11 @@ impl SubagentsExtension {
     /// A just-refreshed catalog's usable, RANKED, non-dominated `provider/id` full-id list — the
     /// pure, synchronous half of pi `generateProfilesForProvider`'s pipeline (profiles.ts:615-616:
     /// `catalog.models.filter(catalogModelIsUsable)` then `filterDominatedModels`, ordered by
-    /// `derived.profileRank` ascending since [`write_provider_catalog_file`] already sorted
+    /// `derived.profileRank` ascending since [`SubagentsExtension::write_provider_catalog_file`] already sorted
     /// `catalog.models` that way — profiles.ts:398-400). Cross-references each catalog entry's
     /// `probe_status`/`profile_rank` (computed once, by the real live-probe pass that wrote
     /// `catalog`) against the model registry for the `cost`/`reasoning`/`context_window`/`max_tokens`
-    /// axes [`dominates`] needs, so a caller never re-probes.
+    /// axes `dominates` needs, so a caller never re-probes.
     pub(crate) fn provider_ranked_full_ids_from_catalog(
         provider: &str,
         catalog: &crate::registration::profiles::ProviderModelCatalog,
@@ -137,7 +137,7 @@ impl SubagentsExtension {
     /// `/subagents-refresh-provider-models <provider> [--force]` (pi `refreshProviderModelCatalog`,
     /// profiles.ts:489-577). Writes a per-provider catalog file under
     /// `providers/<provider>.models.json`, REAL-probing + classifying every candidate model
-    /// ([`write_provider_catalog_file`]); honors `--force` by reusing a still-fresh cache when
+    /// ([`SubagentsExtension::write_provider_catalog_file`]); honors `--force` by reusing a still-fresh cache when
     /// `!force` and rewriting otherwise.
     pub(crate) async fn refresh_provider_catalog_cache(
         &self,
@@ -253,7 +253,7 @@ impl SubagentsExtension {
     }
 
     /// The user-scope `settings.json` the extension's discovery reads its `subagents.*` layer back
-    /// from (`~/.cyrup/agents/settings.json` — the SAME file [`Self::discovery_config`] loads the
+    /// from (`~/.cyrup/agents/settings.json` — the SAME file [`crate::extension::SubagentExecutor::discovery_config`] loads the
     /// user settings from). `/subagents-load-profile` writes the loaded profile's `subagents` block
     /// here so the next discovery pass picks it up, exactly as pi's `applySubagentProfile` writes to
     /// the same `getUserSettingsPath()` its discovery reads.

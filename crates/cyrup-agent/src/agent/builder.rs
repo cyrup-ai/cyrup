@@ -213,7 +213,7 @@ impl AgentBuilder {
     /// `configureHttpDispatcher(getHttpIdleTimeoutMs())`, main.ts:745).
     ///
     /// Honored by the shared SSE transport for every wire API — see
-    /// [`GenConfig::timeout_ms`](crate::state::GenConfig::timeout_ms) for the exact semantics
+    /// [`GenerationConfig::timeout_ms`](crate::state::GenerationConfig::timeout_ms) for the exact semantics
     /// (idle, not total; `0` disables).
     #[must_use]
     pub fn timeout_ms(mut self, ms: u64) -> Self {

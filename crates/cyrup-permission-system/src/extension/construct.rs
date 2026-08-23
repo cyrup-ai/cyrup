@@ -217,7 +217,7 @@ impl PermissionSystemExtension {
     }
 
     /// PERM-011 half A — wrap in an `Arc` and record a `Weak` back-reference, so `init` can publish
-    /// the runtime API on [`crate::runtime_api`].
+    /// the runtime API on [`mod@crate::runtime_api`].
     ///
     /// This is the ONE constructor step that cannot happen inside [`Self::from_parts_full`]: the
     /// `Weak` can only be taken once the value is inside its `Arc`. Every production path

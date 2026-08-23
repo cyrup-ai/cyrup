@@ -1152,7 +1152,7 @@ pub struct StepResult {
     /// Carried here for the same reason `structured_output` is: something one layer OUT needs it
     /// and there is no other channel. The detached hop-2 runner collapses every step into a
     /// `SingleResult` through
-    /// [`crate::background::runner_main::step_result_to_single_result`] before writing the terminal
+    /// `crate::background::runner_main::step_result_to_single_result` before writing the terminal
     /// `ResultFile`, so without this field an async run's control events were raised, counted, and
     /// then discarded at this boundary — the orchestrator saw an empty `controlEvents` no matter
     /// what `control` the run was launched with. Upstream's async runner does not lose them either:

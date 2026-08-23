@@ -60,7 +60,7 @@
 //!    (`fleet.ts:51`), so `H` takes pi's own "Herdr inspector controls are unavailable in this
 //!    context." branch (`:692`) rather than a cyrup-invented one.
 //! 3. **Per-step `label`/`phase`/`context` and nested descendants.** Same three gaps
-//!    `background/fleet_view.rs` documents as its deltas 1-2: cyrup's [`StepStatus`] carries no
+//!    `background/fleet_view.rs` documents as its deltas 1-2: cyrup's [`crate::background::StepStatus`] carries no
 //!    user-facing label, no phase tag and no per-step fork context, so `label (agent)` collapses to
 //!    the bare agent name and per-step context badges are absent.
 //! 4. **No markdown/highlighting in the transcript pane** — see

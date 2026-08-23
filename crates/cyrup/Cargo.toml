@@ -118,7 +118,21 @@ serde = { workspace = true }
 # tempdir. `cyrup-ext` is TEST-only here: SEAM-001/002 are asserted from an EXTENSION's point of
 # view (the `session_start`/`session_shutdown` consumer Pi's `bindExtensions` serves), which needs
 # the `NativeExtension` trait.
-cyrup-ext = { workspace = true }
+#
+# `src/tests/dispatch.rs:547,555` names `cyrup_ext::HostServices` and implements the
+# `#[cfg(feature = "wasm-host")]` trait method `NativeExtension::set_host_services`
+# (`cyrup-ext/src/native.rs:682`), so with the feature off that impl alone is `E0407`.
+# `wasm-host` is NOT optional for this crate, and until now no manifest said so: the feature rode in
+# on `cyrup-ext`'s `default = ["wasm-host"]` through the workspace table, which sets no
+# `default-features = false` (root `Cargo.toml:111`). Stating it on the edge changes the resolved
+# graph in exactly zero builds — measured, not assumed: the feature is already on in every
+# configuration this workspace can currently produce, `--workspace --no-default-features` included,
+# because there each member's defaults come straight back through its siblings' edges. What the edge
+# buys is that the requirement SURVIVES the day `cyrup-ext` stops defaulting `wasm-host` on, or any
+# edge here gains `default-features = false` — either of which would otherwise turn this crate into a
+# wall of `E0432`/`E0407` with nothing in any manifest saying why. This is NOT the PROV-052 shape:
+# `wasm-host` is the production capability host, not a test double.
+cyrup-ext = { workspace = true, features = ["wasm-host"] }
 # PROV-052: the scripted double, TEST-ONLY. `crates/cyrup/src/provider.rs`'s `#[cfg(test)]` module
 # and `tests/dispatch.rs` build real sessions over it in-process.
 cyrup-provider = { workspace = true, features = ["faux"] }

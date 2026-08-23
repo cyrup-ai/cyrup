@@ -649,13 +649,13 @@ fn user_message_anchor(e: &cyrup_session::Entry) -> Option<(Option<EntryId>, Str
     user_message_text(e).map(|text| (e.parent_id(), text))
 }
 
-/// The [`SessionLayout`] a fork/clone writes its new file into. Mirrors Pi
+/// The [`crate::SessionLayout`] a fork/clone writes its new file into. Mirrors Pi
 /// `createBranchedSession`'s reuse of `this.getSessionDir()` (session-manager.ts:918-920,1343): the
 /// directory fixed once at manager construction, never re-derived or re-encoded on branch. cyrup's
 /// equivalent of `this.sessionDir` is the currently-open session file's own parent directory, which
 /// is ALREADY fully resolved (`<root>/--<encoded-cwd>--` for a default session, or a literal
 /// `--session-dir`), so it must be used LITERALLY. Feeding it back through the *encoded*
-/// [`SessionLayout::new`] would append `--<encoded-cwd>--` a second time and land the branch one
+/// [`crate::SessionLayout::new`] would append `--<encoded-cwd>--` a second time and land the branch one
 /// directory too deep — orphaning it from every listing/resume path (gap-analysis 05, Finding 1). An
 /// in-memory session (no file) never persists a branch, so the default-root fallback is inert.
 pub(crate) fn branch_layout(mgr: &SessionManager) -> cyrup_session::SessionLayout {

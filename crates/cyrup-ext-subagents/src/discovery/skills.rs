@@ -604,7 +604,7 @@ pub fn format_proactive_skill_subagent_recommendations(
 /// Upstream calls it from exactly one place: `handleList` (`agent-management.ts:765-770` @v0.43.0),
 /// which splices its lines between the `Chains:` block and the chain diagnostics
 /// (`agent-management.ts:784`, inside the `handleList` that spans `:753-788`). cyrup's
-/// [`crate::discovery::management::handle_list`] now does the same, reading its two inputs off
+/// `crate::discovery::management::handle_list` now does the same, reading its two inputs off
 /// [`crate::discovery::management::ProactiveSkillsInput`] on the `ManagementRequest`.
 ///
 /// The `discover_available_skills` closure keeps upstream's LAZINESS — it is not invoked at all

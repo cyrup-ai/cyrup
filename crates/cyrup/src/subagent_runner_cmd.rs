@@ -20,7 +20,7 @@
 //! created — never the divergent `<AsyncRoot>'s parent>/results` that C7 documents. There is no
 //! separate loader/interpreter hop — `cyrup` is already one compiled binary (arch-SA §6.5).
 //!
-//! Never advertised to users: not listed in `--help`, not one of [`crate::subcommands::SUBCOMMANDS`]
+//! Never advertised to users: not listed in `--help`, not one of `crate::subcommands::SUBCOMMANDS`
 //! (that list is for the package/config subcommands, a distinct concern), and dispatched from
 //! `main()` **before** any user-facing arg leniency/clap parsing runs, exactly mirroring the
 //! existing package/config subcommand pre-dispatch's own placement rationale (Pi `main.ts:486`).
@@ -43,7 +43,7 @@
 //! files, config handed over by path — is ported literally; only the SELECTOR differs.
 //!
 //! **Deliberately undocumented, and that is the delta's point.** The token is `__`-prefixed, absent
-//! from `--help` and from [`crate::subcommands::SUBCOMMANDS`], and matched only as an exact `argv[1]`
+//! from `--help` and from `crate::subcommands::SUBCOMMANDS`, and matched only as an exact `argv[1]`
 //! ([`is_selected`]), so it is undiscoverable rather than absent — a user-reachable command surface
 //! that upstream does not have. Recorded here so it is KNOWN rather than mistaken for parity.
 
@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use cyrup_ext_subagents::background::RunPaths;
 use cyrup_ext_subagents::background::runner_main::run;
 
-/// The literal argv[0] token identifying this internal subcommand (mirrors
+/// The literal `argv[0]` token identifying this internal subcommand (mirrors
 /// `cyrup_ext_subagents::background::spawn_detached`'s private `SUBAGENT_RUNNER_SUBCOMMAND`
 /// constant — kept as a second, independent literal here rather than an added public export,
 /// since the two call sites — "what the orchestrator spawns" and "what `main` recognizes" — must
@@ -60,7 +60,7 @@ use cyrup_ext_subagents::background::runner_main::run;
 /// internals).
 pub const SUBCOMMAND: &str = "__subagent-runner";
 
-/// Returns `true` if `argv` (the process's own args, *including* argv[0]/the binary name at index
+/// Returns `true` if `argv` (the process's own args, *including* `argv[0]`/the binary name at index
 /// 0, matching [`std::env::args`]'s shape) selects this internal subcommand — i.e. its first
 /// non-binary-name element is exactly [`SUBCOMMAND`].
 ///

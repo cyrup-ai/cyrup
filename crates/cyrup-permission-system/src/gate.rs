@@ -23,7 +23,7 @@ const PATH_BEARING_TOOLS: [&str; 6] = ["read", "write", "edit", "find", "grep", 
 /// `extension/decide.rs`'s and `extension/prompt.rs`'s `!subject.is_empty()` guards then silently
 /// drop).
 ///
-/// This is reachable, not theoretical: [`crate::manager::PermissionManager::check`]'s bash branch
+/// This is reachable, not theoretical: [`crate::manager::PermissionManager::check_permission`]'s bash branch
 /// mirrors pi's `const command = typeof record.command === "string" ? record.command : ""` and
 /// always emits `command: Some(command)`, so a bash tool call whose input has a missing or
 /// non-string `command` key produces `Some("")`.

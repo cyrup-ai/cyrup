@@ -4,7 +4,8 @@
 //! # What this module implements
 //!
 //! [`DoctorRunner::run`] executes, **concurrently** (`tokio::join!` over independent, read-only
-//! probes — never sequentially), the six checks R-SA-131 mandates at minimum:
+//! probes — never sequentially), the six checks R-SA-131 mandates at minimum plus SUBA-035's
+//! model-scope diagnostic — SEVEN [`DoctorCheck`]s in the returned [`DoctorReport`], not six:
 //!
 //! (a) [`check_binary_resolution`] — resolvability of the `cyrup` binary used for subagent
 //!     re-exec, per R-SA-045's three-tier resolution (`crate::spawn::resolve_spawn_command`).
@@ -16,12 +17,14 @@
 //!     subsystem writes `status.json`/`events.jsonl`/etc. under).
 //! (c) [`check_config_json`] — presence and parse-validity of `config.json`
 //!     ([`crate::registration::SubagentExtensionConfig`]'s on-disk form).
-//! (d) [`check_agent_discovery`] — presence/count of discovered agent persona files across all
-//!     scopes, via [`crate::discovery::discover_agents_all`] (Phase 2, already written) — reusing
-//!     that entry point rather than re-implementing any discovery/walk logic here.
-//! (e) [`check_chain_discovery`] — presence/count of discovered chain files, via the SAME
-//!     [`crate::discovery::discover_agents_all`] call's `chains` field (one discovery pass covers
-//!     both (d) and (e); this module does not run discovery twice).
+//! (d), (e) and (g) are ONE function, [`run_discovery_checks`], which runs
+//!     [`crate::discovery::discover_agents_all`] (Phase 2, already written) exactly once — reusing
+//!     that entry point rather than re-implementing any discovery/walk logic here, and never
+//!     running discovery twice — and returns the `(agents, chains, model_scope)` triple:
+//!     (d) presence/count of discovered agent persona files across all scopes;
+//!     (e) presence/count of discovered chain files, from the same call's `chains` field;
+//!     (g) SUBA-035's `subagents.modelScope` diagnostic (see [`model_scope_check`]), derived from
+//!     the same call's `model_scope` field.
 //! (f) [`check_provider_catalog_freshness`] — provider/model catalog freshness per configured
 //!     agent override. Per func-SA §5.6 R-SA-131's own parenthetical and arch-SA §12 item 11, this
 //!     intentionally reports only catalog **freshness** (an mtime/staleness stat against the
@@ -32,13 +35,16 @@
 //!     31; arch-SA §12 item 11) — **not implemented in this file, and not implemented anywhere in
 //!     this crate as of this phase.**
 //!
+//! The report's fixed order is (a), (b), (c), (d), (e), (f), (g) — the model-scope check is
+//! emitted LAST, after the catalog check, even though it is produced alongside (d)/(e).
+//!
 //! Each check is independently reportable as Ok/Warn/Fail with a human-readable remedy string
 //! (R-SA-131's own text) and **catches and records its own failure rather than aborting the whole
 //! report** — this task's own framing. No check function in this module ever returns a bare
 //! `Result` up to [`DoctorRunner::run`]'s caller; every fallible step inside a check is caught at
 //! that check's own boundary and folded into a [`CheckStatus::Fail`]/[`CheckStatus::Warn`]
 //! [`DoctorCheck`] instead, so one misconfigured check (e.g. a missing `config.json`) can never
-//! prevent the other five from reporting.
+//! prevent the other six from reporting.
 //!
 //! # Deferred to later phases (do not implement here)
 //!
@@ -266,9 +272,10 @@ pub struct DoctorRunner {
 }
 
 impl DoctorRunner {
-    /// Run all six R-SA-131 checks **concurrently** (`tokio::join!` over independent, read-only
+    /// Run all six R-SA-131 checks plus SUBA-035's model-scope diagnostic — SEVEN checks —
+    /// **concurrently** (`tokio::join!` over independent, read-only
     /// probes — arch-SA §6.8's "Doctor check sequencing" note: "all checks run concurrently... then
-    /// render one `DoctorReport` synchronously"), returning one [`DoctorReport`] in fixed a..f
+    /// render one `DoctorReport` synchronously"), returning one [`DoctorReport`] in fixed a..g
     /// order. Never fails: every check catches its own errors internally (see this module's own
     /// top-level doc), so this method has no `Result` return type at all — a caller can always
     /// render *something*, even in a maximally broken environment.
@@ -306,7 +313,7 @@ impl DoctorRunner {
 /// - `Fail` if the resolved path does not exist at all (tier 2/3 resolved to nothing usable) —
 ///   every subagent spawn will fail immediately.
 /// - `Warn` if the resolved path exists but the version-probe subprocess did not exit
-///   successfully within [`VERSION_PROBE_TIMEOUT]` (spawn failure, non-zero exit, or timeout) —
+///   successfully within [`VERSION_PROBE_TIMEOUT`] (spawn failure, non-zero exit, or timeout) —
 ///   the binary MIGHT still work for a real subagent invocation (a `--version` flag is not
 ///   guaranteed universally supported by every possible `CYRUP_SUBAGENT_BINARY` override a caller
 ///   could configure), so this is advisory, not fatal.
@@ -549,18 +556,19 @@ async fn check_config_json(config_json_path: &Path) -> DoctorCheck {
 }
 
 // =================================================================================================
-// (d)/(e) Agent + chain discovery counts — ONE discovery pass covers both
+// (d)/(e)/(g) Agent + chain counts + model-scope policy — ONE discovery pass covers all three
 // =================================================================================================
 
-/// Runs [`discovery::discover_agents_all`] exactly once and derives both check (d) (agent count)
-/// and check (e) (chain count) from its single result, so this module never pays the cost of (or
-/// risks the two counts disagreeing from) running discovery twice.
+/// Runs [`discovery::discover_agents_all`] exactly once and derives THREE checks from its single
+/// result — (d) agent count, (e) chain count and (g) the `subagents.modelScope` policy
+/// ([`model_scope_check`]) — so this module never pays the cost of (or risks the counts disagreeing
+/// from) running discovery twice.
 ///
-/// Both checks are caught independently at this function's own boundary (a discovery-level error —
+/// All three are caught independently at this function's own boundary (a discovery-level error —
 /// R-SA-009's "malformed subagents settings MUST abort discovery" case — surfaces as `Fail` on
-/// BOTH (d) and (e), since a single discovery pass covers both and a failure here means neither
-/// count was obtainable), matching this module's "each check catches its own failure" contract
-/// even though the two checks share one underlying computation.
+/// (d), (e) AND (g), since a single discovery pass covers all three and a failure here means
+/// neither count nor policy was obtainable), matching this module's "each check catches its own
+/// failure" contract even though the three checks share one underlying computation.
 async fn run_discovery_checks(cfg: &AgentDiscoveryConfig) -> (DoctorCheck, DoctorCheck, DoctorCheck) {
     // Discovery (`discovery::run_discovery`'s callees) is synchronous, real filesystem I/O
     // (R-SA-019: re-scanned per call, never cached) — run it on a blocking-safe spawn so it never

@@ -38,7 +38,7 @@ use cyrup_resources::{ResourceRegistry, Theme};
 use serde_json::{json, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
-/// The channel a validated [`TuiThemeAccess::set`] hands the resolved theme to `App::run` on. The
+/// The channel a validated `TuiThemeAccess::set` hands the resolved theme to `App::run` on. The
 /// run loop applies it live and persists it, mirroring the `/settings → theme` confirm path — pi's
 /// `setThemeName` + `settingsManager.setTheme` pair (`interactive-mode.ts:2406-2417`).
 pub type ThemeSwitchSink = UnboundedSender<Theme>;
@@ -92,7 +92,7 @@ impl cyrup_session_svc::ThemeAccess for TuiThemeAccess {
     ///
     /// `name` is the [`cyrup_resources::ResourceKey`], not `data.name`, because pi's `ThemeInfo.name`
     /// is by contract the string you hand back to `getTheme`/`setTheme` — and cyrup's key IS that
-    /// string ([`Self::by_name`] and [`Self::set`] both normalize through `get_name`). `data.name`
+    /// string (`by_name` and `set` both normalize through `get_name`). `data.name`
     /// is not always usable for lookup: `Theme::parse` falls back to the file stem when the declared
     /// name is unusable (`cyrup-resources/src/theme.rs:328-337`), which would leave the listing
     /// naming a theme that cannot be loaded. It is also what cyrup's own `/settings → theme` picker

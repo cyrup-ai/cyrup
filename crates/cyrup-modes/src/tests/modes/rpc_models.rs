@@ -6,7 +6,7 @@
 use std::io::Cursor;
 use std::sync::Arc;
 
-use super::support::{build_runtime, fixture, parse_lines};
+use super::support::{build_runtime, build_runtime_hermetic_auth, fixture, parse_lines};
 use crate::run_rpc;
 use cyrup_provider::faux::FauxProvider;
 
@@ -104,7 +104,7 @@ async fn rpc_cycle_model_spans_the_full_auth_filtered_registry() {
     )
     .expect("write auth.json");
 
-    let runtime = build_runtime(&fx, Arc::new(FauxProvider::new())).await;
+    let runtime = build_runtime_hermetic_auth(&fx, Arc::new(FauxProvider::new())).await;
 
     let reader = Cursor::new(
         concat!(r#"{"type":"cycle_model","id":"c"}"#, "\n", r#"{"type":"get_state","id":"s"}"#, "\n")

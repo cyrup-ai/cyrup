@@ -38,7 +38,7 @@
 //! the destination open). A single failed `rename` must not be treated as fatal data loss when the
 //! temp file it was about to replace `path` with is still sitting there fully written — a short
 //! bounded retry-with-backoff absorbs that window without ever silently losing the write or
-//! leaving a stray temp file behind (verified by [`tests::no_leftover_temp_file_after_success`]).
+//! leaving a stray temp file behind (verified by `tests::no_leftover_temp_file_after_success`).
 
 use std::io;
 use std::path::{Path, PathBuf};

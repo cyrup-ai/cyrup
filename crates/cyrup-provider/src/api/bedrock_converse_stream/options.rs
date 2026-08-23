@@ -50,7 +50,7 @@ impl BedrockToolChoice {
     }
 
     /// The `toolConfig.toolChoice` wire JSON, or `None` for `none` (upstream returns no
-    /// `toolConfig` at all for `"none"`, handled by [`convert_tool_config`]).
+    /// `toolConfig` at all for `"none"`, handled by [`super::convert::convert_tool_config`]).
     pub(super) fn to_wire(&self) -> Option<Value> {
         match self {
             BedrockToolChoice::Auto => Some(json!({ "auto": {} })),

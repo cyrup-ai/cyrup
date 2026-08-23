@@ -17,7 +17,7 @@
 //! - a [`SlashCommandName`] enum plus a [`SLASH_COMMANDS`] table of static descriptors
 //!   (name/usage/description) suitable for driving `InitApi::register_command` registration,
 //! - pure, side-effect-free **argument parsers** that turn a command's raw trailing argument
-//!   string into a strongly-typed [`ParsedCommand`] variant,
+//!   string into a strongly-typed `Parsed*Command` value,
 //! - for `/run`, `/chain`, and `/parallel`: the shared `--bg`/`--fork`/`[key=value,...]`
 //!   inline-override grammar (R-SA-129), including `/chain`'s inline parallel-group
 //!   `(a "task" | b "task")[opts]` chain-expression syntax, faithfully ported from
@@ -46,7 +46,7 @@
 //!   `AgentDiscoveryConfig`/`HostCtx` this pure-parsing module has no access to and no need of;
 //!   parsers here validate **syntax** only (well-formed agent-token/quoting/parens/arrow/pipe
 //!   structure, required-field presence per R-SA-129's own argument-shape contract) and return a
-//!   syntactically well-formed [`ParsedCommand`] whose `agent`/`chain name` string fields the
+//!   syntactically well-formed `Parsed*Command` whose `agent`/`chain name` string fields the
 //!   caller (again `extension.rs`, which does have discovery access via the executor) is expected
 //!   to resolve and reject-if-unknown before spawning anything. This mirrors pi-subagents' own
 //!   split between "syntax I can check with no I/O" (this file's TS analogue) and "semantic
@@ -1242,8 +1242,8 @@ pub struct ParsedRunCommand {
 ///
 /// # Errors
 ///
-/// Returns [`SlashParseError`] if, after flag-stripping, no input remains at all (source: "Usage:
-/// /run \<agent\> [task] [--bg] [--fork]").
+/// Returns [`SlashParseError`] if, after flag-stripping, no input remains at all (source:
+/// `"Usage: /run <agent> [task] [--bg] [--fork]"`).
 pub fn parse_run_command(raw_args: &str) -> Result<ParsedRunCommand, SlashParseError> {
     let (cleaned, flags) = extract_execution_flags(raw_args);
     let input = cleaned.trim();

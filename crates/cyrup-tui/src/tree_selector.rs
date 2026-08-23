@@ -398,7 +398,7 @@ impl TreeSelector {
     /// message role and the extracted content. cyrup's flattened [`TreeNode`] carries one
     /// pre-rendered row text ([`TreeNode::label`]) which the DAG display already builds *from* those
     /// same parts — the role prefix and the content preview are both in it (see the `S24(b)` note on
-    /// [`TreeRole`]) — so it is the available equivalent, not a narrowing choice. The one part it
+    /// `cyrup_test_support::TreeRole`) — so it is the available equivalent, not a narrowing choice. The one part it
     /// cannot carry is a user label whose text is not on the row: `SessionDagNode` exposes only
     /// `has_label`, the same limitation [`TreeSelector::begin_label_edit`] already documents.
     fn matches_search(&self, node: &TreeNode) -> bool {

@@ -87,7 +87,7 @@ pub struct FauxModelDefinition {
 }
 
 impl FauxModelDefinition {
-    /// A definition for `id` with Pi's defaults (name=id, reasoning=false, input=[text,image],
+    /// A definition for `id` with Pi's defaults (name=id, reasoning=false, input=`[text,image]`,
     /// zero cost, contextWindow 128000, maxTokens 16384).
     pub fn new(id: impl Into<String>) -> Self {
         Self {

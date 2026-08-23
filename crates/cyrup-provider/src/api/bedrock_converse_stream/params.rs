@@ -19,7 +19,7 @@ pub(super) const INTERLEAVED_THINKING_BETA: &str = "interleaved-thinking-2025-05
 
 /// Build the `ConverseStreamCommand` input (pi `commandInput`,
 /// `bedrock-converse-stream.ts:230-241`), including the `modelId` URI label so `onPayload` sees the
-/// same object upstream hands it. [`split_command_input`] lifts `modelId` back out afterwards.
+/// same object upstream hands it. [`super::driver::split_command_input`] lifts `modelId` back out afterwards.
 ///
 /// Returns `Err(message)` for the one throwing path upstream has on this route:
 /// `createImageBlock`'s `Unknown image type: <mimeType>` (`:1106`).

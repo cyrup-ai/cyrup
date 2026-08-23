@@ -57,7 +57,7 @@ pub(super) fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// Match a path-segment-split glob against a path-segment-split text. A `**` segment is a globstar
 /// (matches zero or more whole segments); every other segment matches exactly one text segment via
-/// [`glob_match_chars`] (which never crosses `/`).
+/// [`segment_matches`] (which never crosses `/`).
 fn match_segments(pat: &[&str], text: &[&str]) -> bool {
     match pat.split_first() {
         None => text.is_empty(),

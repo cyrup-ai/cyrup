@@ -203,7 +203,7 @@ pub fn validate_acceptance_input(input: &Value, path_label: &str) -> Vec<String>
 /// v0.43.0 added the `criterionIds` set (`:206,218-224`): two gates whose ids differ only in
 /// case, whitespace or `_`-vs-`-` spelling collapse onto ONE
 /// [`normalized_token`] — which is the key
-/// [`check_criteria_satisfied`] matches the child's reported criteria against — so the second
+/// [`crate::exec::acceptance::model::checks::check_criteria_satisfied`] matches the child's reported criteria against — so the second
 /// gate would silently shadow the first and its `must` would never be enforced. The check is
 /// deliberately inside the `else` of the `id is required` test: a blank/absent id has already
 /// been reported and must not additionally claim to duplicate the empty token.

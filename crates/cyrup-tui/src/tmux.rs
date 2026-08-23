@@ -16,7 +16,7 @@
 //!   `parse_csi_special_key_code` rejects the `27` parameter outright
 //!   (`crossterm-0.29.0/src/event/sys/unix/parse.rs:619-657`), so under cyrup the modified key is
 //!   dropped rather than merely misread. This is the same decoder limit that keeps
-//!   [`crate::keyboard_protocol`] from writing xterm's `modifyOtherKeys` fallback, which is why Pi
+//!   [`mod@crate::keyboard_protocol`] from writing xterm's `modifyOtherKeys` fallback, which is why Pi
 //!   flags the two together.
 //!
 //! Neither is discoverable from inside the session: everything else works, and only one key

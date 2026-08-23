@@ -34,7 +34,7 @@
 //! * **A missing doc file is a build error, not a runtime error.** `include_str!` fails to compile.
 //!
 //! The topic list and its order are upstream's (`:5-16`), and
-//! [`the_topic_list_is_upstreams_verbatim_and_every_topic_resolves`] pins both the list and the
+//! `the_topic_list_is_upstreams_verbatim_and_every_topic_resolves` pins both the list and the
 //! fact that every entry actually resolves to embedded bytes.
 
 /// pi `SUBAGENT_GUIDE_TOPICS` (`extension/subagent-guide.ts:5-16` @v0.47.1), in upstream's order.

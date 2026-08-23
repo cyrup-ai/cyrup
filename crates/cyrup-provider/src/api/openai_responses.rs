@@ -610,7 +610,7 @@ fn build_foreign_responses_item_id(item_id: &str) -> String {
 /// 1:1 port of Pi `convertResponsesMessages` (openai-responses-shared.ts:90-267).
 ///
 /// `deferred_tools` is Pi's `options.deferredTools` map (`ConvertResponsesMessagesOptions`,
-/// openai-responses-shared.ts:118) in insertion order: the tools that [`build_params`] withheld
+/// openai-responses-shared.ts:118) in insertion order: the tools that [`try_build_params`] withheld
 /// from `body.tools` and that must instead be anchored at their `addedToolNames` marker as a
 /// synthetic client `tool_search_call`/`tool_search_output` pair. Pass an empty slice to disable
 /// the rendering entirely — that is what `azure-openai-responses` does (Pi

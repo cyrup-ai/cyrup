@@ -1,4 +1,4 @@
-//! Free helpers backing the [`SubagentsExtension::dispatch_slash`] arms: chain description,
+//! Free helpers backing the [`crate::extension::SubagentsExtension::dispatch_slash`] arms: chain description,
 //! fork-context application and result rendering.
 
 use std::collections::BTreeMap;
@@ -11,8 +11,8 @@ use crate::spawn::chain_graph::{GroupStepResult, RunnerStep, SingleStepSpec, Ste
 
 /// Every agent name a [`RunnerStep`] graph will dispatch, in walk order — a single step's own
 /// agent, each parallel-group child's agent, and a dynamic group's per-item template agent. This is
-/// the plan-time persona resolver's input set: [`SubagentsExtension::run_or_background_chain`]
-/// resolves the whole set via [`SubagentExecutor::resolve_plan_personas`] before any child
+/// the plan-time persona resolver's input set: [`crate::extension::SubagentsExtension::run_or_background_chain`]
+/// resolves the whole set via [`crate::extension::SubagentExecutor::resolve_plan_personas`] before any child
 /// is spawned (T0.1/C13 plan-time resolution + upfront agent-name validation).
 pub(crate) fn plan_step_agent_names(graph: &[RunnerStep]) -> Vec<String> {
     let mut names = Vec::new();

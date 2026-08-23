@@ -32,7 +32,7 @@
 //! * **`response.body` null check.** Pi throws ``${model.provider} response has no body``
 //!   (pi-messages.ts:400-402). `reqwest` has no nullable body, so that branch is unreachable here.
 //! * **Sparse content indices.** Pi writes `partial.content[event.contentIndex] = …` into a JS
-//!   array, which silently grows with holes. A Rust `Vec` is dense, so [`ensure_index`] grows it
+//!   array, which silently grows with holes. A Rust `Vec` is dense, so [`Decoder::ensure_index`] grows it
 //!   with empty text blocks — and caps growth at [`MAX_CONTENT_INDEX`], because an unbounded
 //!   attacker-chosen index is an allocation DoS in Rust that it is not in JS.
 //! * **Unknown event tags.** Pi's converter `switch` falls through to `{...event, partial}`, so an

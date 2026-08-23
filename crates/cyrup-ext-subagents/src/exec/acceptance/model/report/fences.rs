@@ -9,7 +9,7 @@ use serde_json::Value;
 
 pub(crate) struct FenceMatch {
     /// Byte offset of the start of the whole match (INCLUDING an optional leading `\n`, for the
-    /// trailing-fence variant — [`with_leading_newline`] records whether that newline was
+    /// trailing-fence variant — `with_leading_newline` records whether that newline was
     /// consumed).
     pub(crate) index: usize,
     /// Byte offset immediately after the whole match (including trailing `\s*` for the

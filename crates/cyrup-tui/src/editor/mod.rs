@@ -11,7 +11,7 @@
 //! (emoji, ZWJ sequences, combining marks) via [`unicode_segmentation`], matching Pi's editor, which
 //! treats a user-perceived character as one cursor unit (`pi-tui/src/components/editor.ts`). Vertical
 //! Up/Down motion is **wrap-aware**: logical lines are wrapped into a visual-line map
-//! ([`build_visual_line_map`]) and the cursor moves by *visual* line, preserving a **sticky preferred
+//! ([`InputEditor::visual_line_map`]) and the cursor moves by *visual* line, preserving a **sticky preferred
 //! column** ([`InputEditor::preferred_visual_col`]) across short/long/rewrapped lines, falling through
 //! to history at the first visual line and to line-end at the last (spec/tui/03 §4.1-§4.2). Large
 //! pastes collapse to atomic `[paste #N …]` markers ([`InputEditor::handle_paste`]) that expand back
@@ -147,7 +147,7 @@ pub struct InputEditor {
     view_width: usize,
     /// First **visual** line of the render window (`editor.ts:288` `scrollOffset`). The editor shows
     /// at most `maxVisibleLines` rows; anything above/below is scrolled out and announced by the
-    /// `─── ↑ N more ` / `─── ↓ N more ` rules ([`scroll_border`], `editor.ts:259-268`). Kept in range
+    /// `─── ↑ N more ` / `─── ↓ N more ` rules ([`crate::editor::render::scroll_border`], `editor.ts:259-268`). Kept in range
     /// and re-pointed at the caret every render (`editor.ts:507-516`) and reset to `0` whenever the
     /// buffer is replaced wholesale (`editor.ts:471`, `:449`).
     scroll_offset: usize,
@@ -179,7 +179,7 @@ pub struct InputEditor {
     /// motion, edit, or paste so the next vertical move re-seeds from the live cursor (spec/tui/03 §4.2).
     preferred_visual_col: Option<usize>,
     /// Large-paste store (`editor.ts:81` `pastes: id -> expanded content`): each entry is the full
-    /// pasted text the buffer shows collapsed to a `[paste #N …]` marker. [`expanded_text`] substitutes
+    /// pasted text the buffer shows collapsed to a `[paste #N …]` marker. [`InputEditor::expanded_text`] substitutes
     /// markers back to content on submit (`expandPasteMarkers`, spec/tui/03 §5.5).
     pastes: BTreeMap<u32, String>,
     /// Monotonic id for the next large paste (`editor.ts:82` `paste_counter`).

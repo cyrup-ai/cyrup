@@ -1927,7 +1927,7 @@ fn mark_step_running(status: &mut RunStatus, index: usize) {
     }
 }
 
-/// Fold one completed step's [`StepResult`] (and, for a group step, its [`GroupStepResult`]'s own
+/// Fold one completed step's [`StepResult`] (and, for a group step, its [`crate::spawn::chain_graph::GroupStepResult`]'s own
 /// per-child detail) back into `status.steps[index]`/`status.parallel_groups`.
 fn record_step_outcome(
     status: &mut RunStatus,
@@ -2218,7 +2218,7 @@ pub(crate) struct ExecSingleStepExecutor {
     /// `None` for a FOREGROUND executor, matching upstream exactly: `steerInboxDir` is supplied
     /// only by the background runner, because the inbox lives inside an async run directory and a
     /// foreground `/chain`//`/parallel` walk has none. That is also why `control_steer` refuses a
-    /// foreground run outright ([`crate::extension::STEER_FOREGROUND_RUN_REFUSAL`]) rather than
+    /// foreground run outright (`crate::extension::STEER_FOREGROUND_RUN_REFUSAL`) rather than
     /// queueing into a directory nothing would ever read.
     pub(crate) run_dir: Option<PathBuf>,
 }
@@ -2783,7 +2783,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
 // =================================================================================================
 
 /// Install a handler for `SIGUSR2` (R-SA-081's best-effort wake-up signal, sent by
-/// [`control::deliver_wakeup_signal`] to nudge this runner's control-inbox watcher awake sooner)
+/// `control::deliver_wakeup_signal` to nudge this runner's control-inbox watcher awake sooner)
 /// that does nothing but drain and discard every received signal, for as long as the returned
 /// task handle is kept alive.
 ///

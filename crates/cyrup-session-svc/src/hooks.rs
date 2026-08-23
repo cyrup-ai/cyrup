@@ -150,7 +150,7 @@ impl PolicyHooks {
     }
 }
 
-/// Replace every [`Content::Image`] with the placeholder text, deduping consecutive placeholders
+/// Replace every [`cyrup_core::Content::Image`] with the placeholder text, deduping consecutive placeholders
 /// (Pi sdk.ts:262-288). Applied to `user`/`toolResult` message content only.
 fn filter_images(content: &[cyrup_core::Content]) -> Vec<cyrup_core::Content> {
     use cyrup_core::Content;

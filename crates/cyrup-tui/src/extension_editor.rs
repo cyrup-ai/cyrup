@@ -37,7 +37,7 @@ use crate::theme::UiTheme;
 pub struct ExtensionEditorSelector {
     title: String,
     editor: InputEditor,
-    /// Set by `Ctrl+G`; drained by [`Self::take_external_editor_request`].
+    /// Set by `Ctrl+G`; cleared by [`Selector::apply_external_edit`].
     external_editor_requested: bool,
     /// The host terminal's row count, fed by [`Selector::set_terminal_height`] every frame. `24`
     /// until the first one lands (pi's own `terminalHeight ?? 24` fallback,

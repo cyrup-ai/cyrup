@@ -32,7 +32,7 @@
 //! policy the parent shipped in `PERMISSION_POLICY_ENV`, and calls `requestWatchdogPermission` for
 //! every tool whose rule is `ask`. cyrup's port is
 //! [`crate::prompt_runtime::PermissionGate`], reached from
-//! [`crate::prompt_runtime::SubagentPromptRuntime::on_event`]'s `ToolCall` arm.
+//! [`crate::prompt_runtime::SubagentPromptRuntime`]'s `on_event` `ToolCall` arm.
 //!
 //! **This is not `cyrup-permission-system`'s gate, and "cyrup already has permissions" was never a
 //! reason to leave this module uncalled.** The two are different policies answering different

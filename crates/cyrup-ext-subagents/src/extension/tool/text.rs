@@ -52,7 +52,7 @@ DIAGNOSTICS:
 • { action: "doctor" } - read-only report for runtime paths, discovery, sessions, and intercom"#;
 
 /// pi's steer-on-a-foreground-run refusal (`subagent-executor.ts:3217` @v0.34.0), rebranded on the
-/// product noun exactly as [`SubagentExecutor::control_steer`]'s success text already is.
+/// product noun exactly as [`crate::extension::SubagentExecutor::control_steer`]'s success text already is.
 ///
 /// It is a distinct message, not a variant of "no live run directory": the run the caller named
 /// exists and is running RIGHT NOW — steering simply has no transport to it, because the steer
@@ -113,7 +113,7 @@ pub(crate) const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently 
 /// (`extension/fanout-child.ts:177-181` @v0.43.0; the same block sat at `:159-163` @v0.34.0). It
 /// tells the model up front which management/control actions remain available and which mutation
 /// actions are blocked in this mode, rather than only discovering the block via a runtime
-/// [`ToolError`] from [`SubagentTool::route_management_action`].
+/// [`cyrup_core::ToolError`] from [`crate::extension::SubagentTool::route_management_action`].
 ///
 /// Both lines are now upstream's, verbatim, and both used to diverge:
 ///
@@ -122,14 +122,14 @@ pub(crate) const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently 
 ///   (`fanout-child.ts:180`). Naming it here is accurate on both sides, though the two sides now
 ///   refuse it at DIFFERENT gates: upstream refuses it because it is on
 ///   `MUTATING_MANAGEMENT_ACTIONS`; cyrup — since SUBA-046 gave the verb a real dispatch arm,
-///   [`SubagentTool::route_grant_spawn_budget`] — refuses it at that arm's FIRST gate, pi's own
+///   [`crate::extension::SubagentTool::route_grant_spawn_budget`] — refuses it at that arm's FIRST gate, pi's own
 ///   `if (deps.allowMutatingManagementActions === false || !ctx.hasUI)`
 ///   (`subagent-executor.ts:4458` @v0.43.0), which a fanout-child registration fails on the
 ///   `allow_mutating_management` half. A child therefore gets upstream's verbatim "available only
 ///   from the root interactive parent session." refusal rather than an unknown-action error, which
 ///   is what upstream's own child would get were its denylist not consulted first.
 ///   [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`] is still deliberately NOT
-///   extended to match: it gates [`SubagentTool::route_management_action`], which
+///   extended to match: it gates [`crate::extension::SubagentTool::route_management_action`], which
 ///   `grant-spawn-budget` does not route through, and upstream's v0.43.0 set has 26 entries
 ///   (`subagent-executor.ts:151`), almost all of them naming actions this crate has not ported
 ///   (`watchdog.configure`, `mission.*`, `inspector.*`, `project.*`, `schedule.*`, `refine*`), and
@@ -139,13 +139,13 @@ pub(crate) const STEER_FOREGROUND_RUN_REFUSAL: &str = "action='steer' currently 
 ///   change, no longer names `stop` — upstream's allowed list has NEVER carried `stop`, at
 ///   `fanout-child.ts:161` @v0.34.0 nor `:179` @v0.43.0. This is an ADVERTISING change only, and
 ///   deliberately so on both sides: `stop` is in
-///   [`SubagentTool::route_management_or_control`]'s control arm and is absent from
+///   [`crate::extension::SubagentTool::route_action`]'s control arm and is absent from
 ///   [`crate::discovery::management::MUTATING_MANAGEMENT_ACTIONS`] (as it is from upstream's own
 ///   26-entry set), so a fanout child that calls `action: "stop"` is served here exactly as it is
 ///   served upstream. Upstream simply does not put it in the eight verbs it volunteers, and the
 ///   child-safe description's contract is "advertise pi's exact text", not "enumerate every
 ///   reachable verb" — the full enumeration lives in the tool's JSON Schema `action` enum
-///   ([`subagent_tool_parameters`]), which does name `stop` and which both registrations share.
+///   ([`crate::extension::tool::schema::subagent_tool_parameters`]), which does name `stop` and which both registrations share.
 pub(crate) const CHILD_SAFE_SUBAGENT_TOOL_DESCRIPTION: &str = "Delegate to subagents from child-safe fanout mode.\nAllowed management/control actions: list, get, status, interrupt, resume, steer, append-step, doctor.\nMutating management actions (create, update, delete, eject, disable, enable, reset, grant-spawn-budget) are blocked in this mode.";
 
 /// SUBA-038/SUBA-065 — the tool's advertised management/control verbs, as ONE source of truth.
@@ -353,7 +353,7 @@ pub(crate) fn unknown_subagent_action_message(action: &str) -> String {
 }
 
 /// pi's refusal text for an `action` that is present but blank, adapted — see
-/// [`normalize_public_subagent_execution`] for the `[CYRUP-DELTA]` on its second clause.
+/// [`crate::extension::tool::params::normalize_public_subagent_execution`] for the `[CYRUP-DELTA]` on its second clause.
 pub(crate) const BLANK_ACTION_REFUSAL: &str = "action must be a non-empty management/control action, or omit \
                                     action and provide an execution shape (agent/task, tasks, or \
                                     chain).";

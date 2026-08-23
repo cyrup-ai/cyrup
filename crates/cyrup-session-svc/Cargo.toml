@@ -17,9 +17,14 @@ workspace = true
 # through the real run path (`_tryExecuteExtensionCommand`, agent-session.ts:1148-1172). The
 # wasm32-wasip2 guest toolchain drives the full end-to-end (see tests/wasm_slash_command.rs).
 default = ["wasm-host"]
-# Forwards to cyrup-ext's `wasm-host` feature (Wasmtime Component Model host). Disable for a
-# native-only build (no wasmtime); the native-command routing + control→session-effect bridge still
-# compile and are exercised.
+# Selects the NATIVE arms of `builder.rs`/`session.rs` (`#[cfg(not(feature = "wasm-host"))]` at
+# `builder.rs:936`, `:1158`, `:2056` and `session.rs:1180`) — the native-command routing +
+# control→session-effect bridge, which no other build compiles.
+#
+# It does NOT produce a wasmtime-free build and must not be described as one: `cyrup-ext` enters this
+# crate below with `features = ["wasm-host"]`, and `src/host_services.rs:17-19` + `src/builder.rs:957`
+# name `cyrup_ext::{caps, host}::*` unconditionally through the ungated `mod host_services;`
+# (`src/lib.rs:30`). Closing that is EXT-026 (`docs/gap-analysis/06-cyrup-ext.md:263`), not this flag.
 wasm-host = ["cyrup-ext/wasm-host"]
 
 [dependencies]
@@ -30,7 +35,22 @@ cyrup-tools = { workspace = true }
 cyrup-session = { workspace = true }
 cyrup-config = { workspace = true }
 cyrup-resources = { workspace = true }
-cyrup-ext = { workspace = true }
+# `src/host_services.rs:17-19` opens with `cyrup_ext::caps::http::HttpCaps`,
+# `cyrup_ext::caps::proc::ProcCaps` and `cyrup_ext::host::{...}` — all three modules exist only under
+# `wasm-host` (`cyrup-ext/src/lib.rs:147-152`) — and `src/lib.rs:30` declares `mod host_services;`
+# with no `cfg`. `src/builder.rs:957` names `cyrup_ext::host::HostServices` outside the `#[cfg]` pair
+# at `:936`.
+# `wasm-host` is NOT optional for this crate, and until now no manifest said so: the feature rode in
+# on `cyrup-ext`'s `default = ["wasm-host"]` through the workspace table, which sets no
+# `default-features = false` (root `Cargo.toml:111`). Stating it on the edge changes the resolved
+# graph in exactly zero builds — measured, not assumed: the feature is already on in every
+# configuration this workspace can currently produce, `--workspace --no-default-features` included,
+# because there each member's defaults come straight back through its siblings' edges. What the edge
+# buys is that the requirement SURVIVES the day `cyrup-ext` stops defaulting `wasm-host` on, or any
+# edge here gains `default-features = false` — either of which would otherwise turn this crate into a
+# wall of `E0432`/`E0407` with nothing in any manifest saying why. This is NOT the PROV-052 shape:
+# `wasm-host` is the production capability host, not a test double.
+cyrup-ext = { workspace = true, features = ["wasm-host"] }
 thiserror = { workspace = true }
 # Version-pinned directly here, matching cyrup-ext/Cargo.toml:29 (the workspace has no `tracing`
 # alias). Used for the non-fatal diagnostics the builder must surface rather than drop silently.

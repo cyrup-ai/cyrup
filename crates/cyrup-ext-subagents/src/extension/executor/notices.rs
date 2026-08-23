@@ -19,7 +19,7 @@ use crate::extension::tool::mission::MissionSyncCompletionObserver;
 #[derive(Clone)]
 pub(crate) struct ForegroundControlEntry {
     /// Fires this run's soft interrupt (pi `control.interrupt?.()`); shared with the live
-    /// [`RunOptions::interrupt`] token the running child's own attempt loop races against.
+    /// [`crate::exec::RunOptions::interrupt`] token the running child's own attempt loop races against.
     pub(crate) interrupt: CancelToken,
     /// The run's current step agent name (pi `control.currentAgent`); `None` means no live message
     /// route exists yet (pi's "has no active child message route" guard).
@@ -122,7 +122,7 @@ impl SubagentExecutor {
 
     /// The effective background-completion sink to install this session (R-SA-101). Precedence:
     /// an explicitly-injected [`Self::with_completion_sink`] override (a test's scripted sink) →
-    /// a live [`HostServicesCompletionSink`] when the P-1 `host_services` slot is bound (the real
+    /// a live [`crate::background::watch::HostServicesCompletionSink`] when the P-1 `host_services` slot is bound (the real
     /// turn-injecting sink) → the graceful-degradation [`crate::background::watch::LoggingCompletionSink`]
     /// (stderr log + delete) when no host handle is present (the SDK-embedder / headless default).
     fn effective_completion_sink(&self) -> Arc<dyn crate::background::watch::CompletionSink> {

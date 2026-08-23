@@ -86,7 +86,8 @@ pub struct InputEvent {
 
 /// `user_bash` (Pi `UserBashEvent`, types.ts:782-790) — block/transform/provide a `!`/`!!` bash
 /// invocation. Byte-shape: `{command, excludeFromContext, cwd}`. The `operations`/`result` override
-/// is RETURNED via [`UserBashResult`] (Pi `UserBashEventResult`), not carried on the event.
+/// is RETURNED as the handler's [`crate::Outcome`] (Pi `UserBashEventResult`), not carried on
+/// the event.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserBashEvent {

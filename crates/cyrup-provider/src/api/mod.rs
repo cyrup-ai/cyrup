@@ -28,7 +28,7 @@
 //! timing (`lazy.ts` carries no top-level side effect beyond the import itself), which is what
 //! makes the two equivalent rather than merely similar.
 //!
-//! Pinned by [`tests::prov067_registry_constructs_nothing_until_the_first_get`], so "same
+//! Pinned by `tests::prov067_registry_constructs_nothing_until_the_first_get`, so "same
 //! observable laziness" stays a property rather than a claim in a comment.
 
 use crate::auth::AuthResult;

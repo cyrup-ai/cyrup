@@ -1240,7 +1240,7 @@ fn write_chain_file(file_path: &Path, definition: &ChainDefinition) -> Result<()
 }
 
 /// Serialize a [`ChainDefinition`] to the pi `.chain.json` shape
-/// [`crate::discovery::chains::parse_chain_json`] reads (`serializeJsonChain`,
+/// `crate::discovery::chains::parse_chain_json` reads (`serializeJsonChain`,
 /// `chain-serializer.ts:228-241`): a root object with the pre-qualification `name`
 /// (`frontmatterNameForConfig` — the chain's `local_name`), `description`, and a `chain` ARRAY of
 /// the raw [`ChainStepConfig`] steps, plus `package` when set and any preserved `extra_fields`.

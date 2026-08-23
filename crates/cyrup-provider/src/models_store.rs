@@ -63,7 +63,7 @@ pub struct ModelsStoreEntry {
 #[derive(Clone, Debug, Default)]
 pub struct ModelsStoreOperationOptions {
     /// Pi `signal?: AbortSignal`. cyrup's single `AbortSignal` equivalent is
-    /// [`CancelToken`](cyrup_core::CancelToken) (arch-00 §3.2 — "no subsystem invents its own abort
+    /// [`CancelToken`] (arch-00 §3.2 — "no subsystem invents its own abort
     /// flag").
     pub signal: Option<CancelToken>,
 }

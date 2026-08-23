@@ -324,7 +324,7 @@ fn resolve_cache_retention(
     CacheRetention::Short
 }
 
-/// Env-aware [`build_body`]: `env` is the provider-scoped overlay (Pi `options.env`) consulted by
+/// Env-aware `build_body`: `env` is the provider-scoped overlay (Pi `options.env`) consulted by
 /// [`resolve_cache_retention`] for the `PI_CACHE_RETENTION` fallback.
 /// `[CYRUP-DELTA]` — fallible where pi's `buildParams` throws. `convertTools` can throw for a
 /// `strict: "require"` tool on a provider without strict mode (`constrained-sampling.ts:91-95`

@@ -28,70 +28,16 @@
 //! - The orchestrator-side shared poller (R-SA-093/105) — owned by `background/tracker.rs`.
 //! - Nested background-run storage-subpath *derivation as consumed by the runner* and root-run
 //!   "am I fully done" recursive reconciliation (R-SA-104) — this module defines the
-//!   [`NestedRoute`] addressing type and [`RunPaths::nested`]'s pure subpath-naming rule; the
+//!   [`crate::spawn::nested_events::NestedRoute`] addressing type and [`RunPaths::nested`]'s pure subpath-naming rule; the
 //!   actual recursive liveness roll-up belongs to `background/reconcile.rs`/`tracker.rs`.
 
-/// The shared atomic-write primitive (`write_atomic_json`, R-SA-076/135) used by every other
-/// module in this subsystem (status.json, config.json, meta.json, control-inbox files) so there
-/// is exactly one temp-then-rename implementation, not one per call site.
 pub mod atomic;
-
-/// File-based interrupt/resume/append-step control protocol (R-SA-079..087, R-SA-094..097): dual-
-/// channel interrupt delivery, delete-then-act idempotent consumption, the resume running-
-/// selection-vs-terminal-revival fork, the append-step enqueue-then-consume race-safe protocol,
-/// safe-token path validation, and root-attachment polling. See [`control`] for the full subsystem
-/// doc.
 pub mod control;
-
-/// Ancestor→descendant interrupt/timeout cascade (pi `interruptNestedAsyncDescendants` /
-/// `timeoutNestedAsyncDescendants`, `subagent-runner.ts:1535-1594` @v0.34.0): walks the
-/// nested-run registry and drops the same control-inbox request file into every live background
-/// descendant's own directory, because process-group signalling cannot cross the deliberate
-/// detachment boundary a background run is defined by. See [`cascade`] for the full rationale.
 pub mod cascade;
-
-/// Hop-1 detached second-process spawn (`spawn_detached_runner`, R-SA-070/071): launches the
-/// `cyrup` binary's internal `__subagent-runner --config <path>` subcommand as a genuinely
-/// detached OS process (new process group / `DETACHED_PROCESS`, stdio redirected to files, the
-/// resulting child handle dropped without ever being awaited). See that module's docs for why
-/// "never awaited" is the entire point, not an oversight.
 pub mod spawn_detached;
-
-/// The process-wide parent-session anchor register (R-SA-P1, PERM-001) — cyrup's `unsafe`-free
-/// stand-in for pi's `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
-/// (`pi-subagents/src/extension/index.ts:716` @v0.43.0, cleared at `:619`), and the source of the one env
-/// entry [`spawn_detached`] overlays onto the hop-1 `__subagent-runner` process so a BACKGROUND
-/// subagent's forwarded permission ask can still address its root's inbox. See [`parent_anchor`]
-/// for the full why.
 pub mod parent_anchor;
-
-/// Stale-run liveness reconciliation (`reconcile`, R-SA-088..092): given a run id's resolved
-/// [`RunPaths`], applies the exact five-step algorithm — `ResultFile` presence is always
-/// authoritative; a missing `status.json` is provisional within the R-SA-090 spawn grace window
-/// and failed thereafter; a non-`Running`/no-pid status passes through unchanged; a `Running`
-/// status with a pid is probed via a real zero-signal liveness check (R-SA-089's three-outcome
-/// `Alive`/`Dead`/`Unknown` classification, never collapsing `Unknown` into `Dead`) and, if dead or
-/// alive-but-long-stale (R-SA-091), synthesizes a failure written to both files (R-SA-092). Every
-/// other module that needs "is this run actually still alive" (`background/control.rs`'s
-/// `status`/`interrupt`/`resume`/`append-step` handlers, R-SA-079; `background/tracker.rs`'s
-/// shared poller, R-SA-093) calls this module's `reconcile`/`reconcile_now`, never re-derives the
-/// algorithm.
 pub mod reconcile;
-
-/// Hop-2 detached-runner main loop (`run`, R-SA-073..077): reads+deletes the one-shot
-/// `runner-config.json` handoff file, writes the initial `Running` status, drives the step loop
-/// (interrupt/append-request checks every iteration, dispatch via the Phase-3 spawn boundary),
-/// and — on every single exit path — writes the terminal `status.json` strictly before the
-/// terminal [`ResultFile`] (R-SA-077), which is what makes [`watch`]'s orchestrator-side
-/// completion notification observable at all. See [`runner_main`] for the full subsystem doc.
 pub mod runner_main;
-
-/// `ResultsDir` filesystem-watch completion notification (R-SA-098..103): a `notify`-crate watch
-/// with poll-interval fallback over the shared `ResultsDir`, parse+session-verify+dedup+notify
-/// processing per R-SA-099, OR'd dual-signal terminal-state classification (R-SA-100), and bounded
-/// retry-in-place on transient processing failure (R-SA-102). Runs entirely in the ORCHESTRATOR
-/// process — see [`watch`] for the full subsystem doc, including the explicit scope note on why
-/// R-SA-101's turn/prompt-path re-entry is a later phase's hand-off, not implemented here.
 pub mod watch;
 
 /// SUBA-051 — pi `DEFAULT_ASYNC_TIMEOUT_MS = 30 * 60 * 1000`
@@ -110,38 +56,10 @@ pub mod watch;
 /// retry loop — burns tokens and CPU until a human notices and issues `interrupt`.
 pub const DEFAULT_ASYNC_CHILD_TIMEOUT_MS: u64 = 30 * 60 * 1000;
 
-/// Orchestrator-side shared poller (`JobTracker`, R-SA-093/105): one `tokio::time::interval`-
-/// driven task per owning extension instance, self-starting on the first tracked job and
-/// self-stopping once the tracked-job map empties. Tails newly-appended `events.jsonl` bytes per
-/// tracked job via a per-run byte cursor and invokes [`reconcile::reconcile_now`] every tick. See
-/// [`tracker`] for the full subsystem doc.
 pub mod tracker;
-
-/// Human-readable status-report rendering for the `status` control action (C5): the
-/// `run-status.ts:101-273` `inspectSubagentStatus` shape (a single run's full per-step progress
-/// report) plus the `async-status.ts` `listAsyncRuns`/`formatAsyncRunList` no-id "list active runs"
-/// shape. Pure rendering + reconciliation-gated disk reads over [`control::reconcile_before_control_op`];
-/// the four `subagent` control actions dispatch into this module and [`control`] from
-/// `extension.rs`. See [`run_status`] for the full subsystem doc.
 pub mod run_status;
-
-/// The `view: "fleet"` / `view: "transcript"` status surfaces (G92): the Rust port of
-/// pi `runs/background/fleet-view.ts` @v0.34.0 — the read-only in-flight fleet listing behind
-/// `/subagents-fleet`, and the bounded, containment-checked transcript tail behind
-/// `subagent({ action: "status", id, view: "transcript", lines })`. See [`fleet_view`] for the
-/// scope line drawn against upstream's v0.35+ `src/tui/fleet*.ts` subtree, which is NOT this.
 pub mod fleet_view;
-
-/// The `wait` tool's blocking primitive (SUBA-004): block the current turn until outstanding
-/// background runs settle, with a timeout and a cancellation path. Port of pi-subagents'
-/// `runs/background/wait.ts`. See [`wait`] for the full subsystem doc.
 pub mod wait;
-
-/// SUBA-060 — "resume-first" guidance for FAILED async runs: port of pi
-/// `runs/background/resume-guidance.ts` (v0.45.2). Tells the orchestrator to revive a failed run's
-/// persisted child session before launching a replacement; consumed by [`wait`] at pi's own
-/// position in the result text. See [`resume_guidance`] for the one upstream formatter this module
-/// deliberately leaves to PARITY-GAPS VL-S8.
 pub mod resume_guidance;
 
 use std::path::{Path, PathBuf};
@@ -1121,7 +1039,7 @@ pub struct ResultFile {
 /// The filesystem directory, keyed by run id, holding one background run's `status.json`,
 /// `events.jsonl`, control-inbox files, append-request files, output/log files, and (once
 /// terminal) its human-readable run-log — everything **except** the terminal [`ResultFile`]
-/// itself, which lives in the sibling [`ResultsDir`] (func-SA §4.5 draws this distinction
+/// itself, which lives in the sibling `ResultsDir` (func-SA §4.5 draws this distinction
 /// deliberately: presence-in-`ResultsDir` being the sole "truly done" signal only works if the
 /// result file is *not* just another entry inside the run's own, still-being-written directory).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2247,9 +2165,9 @@ pub fn build_workflow_graph_snapshot(input: &WorkflowGraphBuildInput) -> Workflo
     }
 }
 
-/// Build a [`WorkflowGraphBuildInput`] from a background run's already-flattened [`RunnerStep`] list
+/// Build a [`WorkflowGraphBuildInput`] from a background run's already-flattened [`crate::spawn::chain_graph::RunnerStep`] list
 /// plus its live [`RunStatus`], so the detached runner (`background/runner_main.rs`) can embed a
-/// live workflow-graph snapshot in `status.json`. Each [`RunnerStep`] projects to a
+/// live workflow-graph snapshot in `status.json`. Each [`crate::spawn::chain_graph::RunnerStep`] projects to a
 /// [`WorkflowInputStep`]; per-step status/errors come straight off `status.steps`
 /// ([`StepState`] normalized to the graph's own vocabulary). Note the cyrup [`crate::spawn::chain_graph::SingleStepSpec`]
 /// carries no `phase`/`label`, so those degrade to `None`/agent-name here — the richer, phase/label-

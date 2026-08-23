@@ -1,8 +1,8 @@
 //! The built-in provider registry — the L1 aggregator (1:1 port of Pi
 //! `packages/ai/src/providers/all.ts`, `builtinProviders()` / `builtinModels()`).
 //!
-//! Pi's `all.ts` constructs EVERY built-in provider ([`all.ts:70-108`]) and registers each into a
-//! `Models` collection ([`all.ts:111-117`]); the model pattern then resolves to the owning provider.
+//! Pi's `all.ts` constructs EVERY built-in provider (`all.ts:70-108`) and registers each into a
+//! `Models` collection (`all.ts:111-117`); the model pattern then resolves to the owning provider.
 //! This module mirrors that for the providers actually implemented in this crate today.
 //!
 //! ## Pi `all.ts` `builtinProviders()` listing (line numbers from `all.ts:89-126` **@ `v0.83.0`**):

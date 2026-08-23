@@ -24,7 +24,7 @@
 //! cheap `stat` fingerprint of `HEAD` (plus `reftable/tables.list`, which is what moves in a
 //! reftable repo when HEAD does not) from the run loop instead of holding an inotify watch, so a
 //! `git checkout` in another terminal still repaints the footer. Pi debounces its watch by 500 ms
-//! ([`FooterDataProvider.WATCH_DEBOUNCE_MS`]); [`POLL_INTERVAL`] is the same figure, and the poll
+//! (`FooterDataProvider.WATCH_DEBOUNCE_MS`); [`POLL_INTERVAL`] is the same figure, and the poll
 //! costs one `stat` — strictly less than the 80 ms spinner tick the loop already pays while working.
 
 use std::path::Path;

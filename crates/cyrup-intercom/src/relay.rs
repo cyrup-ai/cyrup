@@ -3,7 +3,7 @@
 //!
 //! pi relays a **pre-formatted string**; cyrup's [`DeliveryChannel`](cyrup_ext_subagents::tui::intercom::DeliveryChannel)
 //! seam instead receives a structured, allowlisted
-//! [`IntercomPayload`](cyrup_ext_subagents::tui::intercom::IntercomPayload). [`format_result_relay`]
+//! [`IntercomPayload`]. [`format_result_relay`]
 //! projects ONLY that payload's named, allowlisted fields into the relay string — it never widens
 //! the allowlist (R-SA-124): there is no field on `IntercomPayload` for a `cwd`/`session_file`/
 //! capability route, so none can appear in the relayed text.

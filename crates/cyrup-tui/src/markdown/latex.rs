@@ -1,5 +1,8 @@
 //! LaTeX math → terminal Unicode, a port of `pi/packages/tui/src/latex.ts` (v0.84.1, 1373 lines).
 //!
+//! A child module of `markdown` because it has exactly one consumer, matching upstream's own
+//! `import { renderLatex } from "../latex.ts"` at `markdown.ts:2`.
+//!
 //! M12. `markdown.ts:123-144` registers `LATEX_MARKDOWN_EXTENSIONS` — a block tokenizer for
 //! `$$…$$` / `\[…\]` and an inline one for `$…$` / `\(…\)` / `$$…$$` / `\[…\]` — and the two
 //! renderer arms at `markdown.ts:505-512` (`latexBlock`, `{ display: true }`) and `:645-652`

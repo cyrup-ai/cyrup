@@ -96,7 +96,7 @@ impl SubagentExecutor {
     /// `contact_supervisor` relays to (pi `resolveIntercomSessionTarget(pi.getSessionName(),
     /// sessionManager.getSessionId())`, `subagent-executor.ts:893`). Byte-identical to the string the
     /// intercom companion registers this session's broker presence under
-    /// ([`cyrup_intercom`]'s `build_registration` derives it from the SAME `HostServices`), so the
+    /// (`cyrup-intercom`'s `build_registration` derives it from the SAME `HostServices`), so the
     /// two independently-produced strings match at the broker. `None` when no live session id was
     /// captured (headless / SDK-embedder) — the spawn site then writes no child-bridge env, so the
     /// child registers no supervisor bridge (the clean no-intercom path).

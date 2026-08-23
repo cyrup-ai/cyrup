@@ -210,7 +210,7 @@ pub(super) fn ghost_span(hint: &str, available: usize, style: Style) -> Option<S
 /// The result is nevertheless always exactly `width` display columns, and that is a property of the
 /// indicator's ALPHABET rather than of the slice: `─`, the space, `↑`/`↓` (East-Asian Ambiguous,
 /// hence narrow) and the decimal digits are every one of them a single column, so `strict` never has
-/// a wide grapheme to reject. [`tests::the_scroll_rule_is_exactly_as_wide_as_it_is_asked_for`] pins
+/// a wide grapheme to reject. `the_scroll_rule_is_exactly_as_wide_as_it_is_asked_for` pins
 /// it across the whole width range, because cyrup — unlike pi, which composes each row from scratch
 /// — paints this string OVER the `Block`'s already-drawn rule, and a short string would leak the
 /// `─`s underneath.

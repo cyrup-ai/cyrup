@@ -7,7 +7,7 @@
 //! 1. **The config is fixed, not resolved.** `resolveConfig` is replaced by a closure returning the
 //!    already-decoded [`ChildWatchdogConfig`] widened to a full `ResolvedWatchdogConfig`
 //!    (`childResolvedConfig`, `:15-37`). A child never reads `settings.json` — its policy travelled
-//!    from the parent in [`CHILD_WATCHDOG_CONFIG_ENV`], so a child cannot disagree with the parent
+//!    from the parent in [`super::child_status::CHILD_WATCHDOG_CONFIG_ENV`], so a child cannot disagree with the parent
 //!    about whether it is being watched.
 //! 2. **A displayed warning is re-attributed.** `childWarningDetails` (`:39-46`) rewrites `source`
 //!    to `child` (unless it is `lsp`, which stays `lsp`) and stamps the `agent`/`runId`, so the

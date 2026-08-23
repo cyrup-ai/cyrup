@@ -124,6 +124,9 @@ fn base_agent_config(model: &str) -> AgentConfig {
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
         turn_budget: None,
+        // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
+        // call that does not ask for one runs unbudgeted. This fixture asks for none.
+        usage_budget: None,
         enforce_hard_turn_limit: false,
         cwd: cwd.to_path_buf(),
         deadline_at: None,
@@ -155,6 +158,12 @@ fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
         run_id: None,
         child_index: None,
         steer_inbox_dir: None,
+        // SUBA-049: the RETURN half of G90's steer channel. Both paths exist only under a background
+        // run directory; a foreground fixture like this one has none. Load-bearing:
+        // `build_attempt_spawn_plan` gates both env keys on presence (exec/mod.rs:2227-2250), so
+        // `None` keeps the child's env overlay byte-identical to a real foreground child's.
+        steer_ack_dir: None,
+        steer_capability_path: None,
         control_config: None,
         on_control_event: None,
         artifacts_dir: None,

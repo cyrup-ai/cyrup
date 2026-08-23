@@ -92,7 +92,7 @@ pub(super) fn resolve_agent_name_from_env() -> Option<String> {
 /// these env keys (`lib.rs`'s non-negotiable process-per-subagent mechanism), so there is no
 /// same-process session-dir signal to test. Note also that pi's `isSubagentExecutionContext` is a
 /// per-`ctx` RUNTIME predicate while this is consulted both at wiring time
-/// ([`permission_extension_for_env`]) and per call — the env keys are process-lifetime constants in
+/// ([`crate::permission_extension_for_env`]) and per call — the env keys are process-lifetime constants in
 /// cyrup, so the two coincide.
 pub(super) fn is_subagent_child() -> bool {
     has_subagent_env_hint(|key| std::env::var(key).ok())

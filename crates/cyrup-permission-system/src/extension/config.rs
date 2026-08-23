@@ -27,7 +27,7 @@ impl PermissionSystemExtension {
     /// pi's entry point calls this exactly once at load — `loadExtensionConfigState()`
     /// (`index.ts:1350-1354`) is invoked at `index.ts:1473`, the `enabled` master switch tests the
     /// module-scope `extensionConfig` it just populated (`:1475-1477`), and everything downstream
-    /// reuses that same object. cyrup's [`permission_extension_for_env`] is the analog of that entry
+    /// reuses that same object. cyrup's [`crate::permission_extension_for_env`] is the analog of that entry
     /// point, so it performs THE load and hands the result to the `*_with_config` constructor; the
     /// public constructors keep their standalone signature by doing the load themselves.
     ///
@@ -159,7 +159,7 @@ impl PermissionSystemExtension {
     /// [`crate::status::sync_status`] over the ONE late-bound [`HostServices`] backend the session
     /// attaches, which is the same object no matter which handler is running, so both branches
     /// collapse into this single reachability test. The `hasUI` half is not re-imposed, for the
-    /// reason [`WarningSink::notify`] documents: `HostServices::set_status` already no-ops on a
+    /// reason [`crate::extension::warnings::WarningSink::notify`] documents: `HostServices::set_status` already no-ops on a
     /// backend with no status surface, and re-imposing it would blank the pill in modes that do
     /// render one. This is the same test the `SessionStart` / `BeforeAgentStart` arms already use.
     pub(super) fn sync_status_when_possible(&self, config: &ExtensionConfig) {

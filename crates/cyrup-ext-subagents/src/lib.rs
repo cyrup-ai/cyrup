@@ -24,9 +24,6 @@
 )]
 #![forbid(unsafe_code)]
 
-/// Artifact quadruple writer + housekeeping sweep (T6) — Rust port of pi `shared/artifacts.ts`. See
-/// [`artifacts`] for the four-file `<runId>_<agent>[_i]_{input.md,output.md,.jsonl,_meta.json}`
-/// layout and the 24h-throttled 7-day cleanup contract.
 pub mod artifacts;
 pub mod background;
 pub mod discovery;
@@ -34,19 +31,8 @@ pub mod error;
 pub mod exec;
 pub mod extension;
 pub mod fork_context;
-/// The shared, size-capped append-only JSONL primitive (R-SA-136/146) used by both
-/// [`spawn::SpawnedChild`]'s child-output tee and [`background::RunPaths::events`]'s async-run
-/// event log. See [`jsonl`] for the full contract.
-/// The NATIVE supervisor channel (`pi-subagents/src/intercom/native-supervisor-channel.ts`): the
-/// broker-free, file-backed child↔supervisor request/reply channel upstream introduced in `3ac0ef5`
-/// ("Make supervisor coordination native") when it deleted the companion-recommendation surface.
 pub mod native_supervisor;
-
 pub mod jsonl;
-/// The durable MISSION subsystem — a 1:1 port of `pi-subagents/src/missions/` (6 files @v0.43.0):
-/// mission records, their store, the launch binding that ties a mission to a real run, the six
-/// `mission.*` tool actions, per-mission workflow state, and the turn-end goal-continuation driver.
-/// See [`missions`] for the full file-by-file correspondence table.
 pub mod missions;
 pub mod prompt_runtime;
 pub mod registration;

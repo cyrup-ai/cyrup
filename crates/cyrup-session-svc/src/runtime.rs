@@ -142,7 +142,7 @@ fn collect_diagnostics(session: &AgentSession) -> Vec<RuntimeDiagnostic> {
 /// The RUNTIME-tier half of a loaded extension's `control` capability — the sink an
 /// [`AgentSession`] routes `new-session`/`switch`/`fork`/`reload` to (SEAM-003).
 ///
-/// This is cyrup's [`ExtensionCommandContextActions`] (Pi `extensions/types.ts:1652-1672`). Pi
+/// This is cyrup's `ExtensionCommandContextActions` (Pi `extensions/types.ts:1652-1672`). Pi
 /// binds it with REAL implementations in every host — `modes/rpc/rpc-mode.ts:321-346` and
 /// `modes/print-mode.ts:75-95` both pass a `commandContextActions` bag wired to
 /// `runtimeHost.newSession`/`fork`/`switchSession` and `session.reload` — stores it at

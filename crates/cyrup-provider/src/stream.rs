@@ -6,8 +6,6 @@ use cyrup_core::{
 };
 use futures::StreamExt;
 
-/// Direct-wire HTTP + SSE transport (arch-01 §7.1). Submodule of `stream` so the request side and
-/// the event side share one module root.
 pub mod sse;
 
 /// Prompt-cache retention preference (func-01 §11).
