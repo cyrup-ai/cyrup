@@ -14,12 +14,12 @@ updated: 2026-08-22 19:32
 
 ## Acceptance Criteria
 
-- [ ] `src/host_services.rs` is replaced by `src/host_services/` containing `mod.rs`, `ui.rs`, `attach.rs`, `json.rs` and `inject.rs`; no file in the directory exceeds 1500 lines and `rg -c 'mod tests' crates/cyrup-session-svc/src/host_services/mod.rs` returns 0.
-- [ ] The old L1877-3050 test module is relocated into `src/tests/` split along its own four banners (core, guest introspection, session read-only view, provider OAuth callbacks, custom seam), each registered in `src/tests/mod.rs`.
-- [ ] `with_exec_timeout` is `#[cfg(test)] pub(crate) fn` and the relocated timeout test compiles against it.
-- [ ] `git diff src/lib.rs` shows the `pub use host_services::{…}` group at lines 66-69 byte-identical.
-- [ ] `cargo test -p cyrup-session-svc` still reports 311 passing (the 13 relocated tests included) and `cargo clippy -p cyrup-session-svc --all-targets` gains no warnings.
-- [ ] `impl HostServices for LiveHostServices` remains a single unsplit block in `mod.rs`.
+- [x] `src/host_services.rs` is replaced by `src/host_services/` containing `mod.rs`, `ui.rs`, `attach.rs`, `json.rs` and `inject.rs`; no file in the directory exceeds 1500 lines and `rg -c 'mod tests' crates/cyrup-session-svc/src/host_services/mod.rs` returns 0. mod.rs is 1490 lines: hitting the 1500 cap needed one line of the fix's plan widened — `ControlSink` and the private `ActiveToolsPush` alias moved to `inject.rs` alongside `InjectSink`, which is now the seam's two FIRE-AND-FORGET sinks rather than the injection one alone (`InjectSink`'s own doc already described itself as "the same sync→async bridge the `ControlSink` uses"). `lib.rs` still names `ControlSink` at the same path, via a `pub use inject::{...}` in `mod.rs`.
+- [x] The old test module (L1874-3045 by the time this ran) is relocated into `src/tests/` split along its own four banners — `host_services_core.rs` (13 tests), `host_services_introspection.rs` (3), `host_services_session_view.rs` (2), `host_services_oauth.rs` (3), `host_services_custom_seam.rs` (4) — each registered in `src/tests/mod.rs`. The shared `svc_with` helper is `pub(super)` in the core file; `FakeCatalog` likewise, since the OAuth half drives `commands()` through it.
+- [x] `with_exec_timeout` is `#[cfg(test)] pub(crate) fn` and the relocated timeout test compiles against it.
+- [x] `src/lib.rs` was never opened for writing; the `pub use host_services::{…}` group is untouched, and every name in it still resolves at the same path.
+- [x] `cargo test -p cyrup-session-svc` reports 311 passing (all 25 relocated tests included) and `cargo clippy -p cyrup-session-svc --all-targets` is warning-free, as is `cargo check --workspace`.
+- [x] `impl HostServices for LiveHostServices` remains a single unsplit block in `mod.rs`.
 
 ## Findings
 

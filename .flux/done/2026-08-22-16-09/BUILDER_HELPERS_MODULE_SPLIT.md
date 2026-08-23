@@ -1,7 +1,7 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 19:32
+updated: 2026-08-23 00:00
 ---
 
 # Move builder.rs's Free-Function Tail And Test Module Out
@@ -14,11 +14,11 @@ updated: 2026-08-22 19:32
 
 ## Acceptance Criteria
 
-- [ ] `src/builder.rs` no longer exists; `src/builder/` contains `mod.rs` plus `model.rs`, `natives.rs`, `packages.rs`, `tools.rs` and `settings_parse.rs`, with `builder/mod.rs` under 1800 lines.
-- [ ] `builder/mod.rs` carries `pub(crate) use` re-exports for `parse_queue_mode`, `parse_transport`, `thinking_level_to_str`, `thinking_level_from_str` and `tool_contribution` so every existing `crate::builder::<name>` call site compiles unchanged — verified by `git diff` touching none of src/session/thinking.rs, src/session/mod.rs, src/session/control.rs, src/tools.rs or src/host_services.rs call lines.
-- [ ] `git diff src/lib.rs` shows the `pub use builder::{…}` group at lines 47-50 byte-identical.
-- [ ] Each `#[cfg(test)]` fragment of the old L2344-2767 module travels with the cluster it exercises (the tests for `natives_to_load`, `native_survives_no_extensions`, `fallback_model`, `configured_packages_from_settings` and `apply_http_proxy_settings` stay in-module because those items are private).
-- [ ] `cargo test -p cyrup-session-svc` still reports 311 passing and `cargo clippy -p cyrup-session-svc --all-targets` gains no warnings.
+- [x] `src/builder.rs` no longer exists; `src/builder/` contains `mod.rs` plus `model.rs`, `natives.rs`, `packages.rs`, `tools.rs` and `settings_parse.rs`, with `builder/mod.rs` under 1800 lines.
+- [x] `builder/mod.rs` carries `pub(crate) use` re-exports for `parse_queue_mode`, `parse_transport`, `thinking_level_to_str`, `thinking_level_from_str` and `tool_contribution` so every existing `crate::builder::<name>` call site compiles unchanged — verified by `git diff` touching none of src/session/thinking.rs, src/session/mod.rs, src/session/control.rs, src/tools.rs or src/host_services.rs call lines.
+- [x] `git diff src/lib.rs` shows the `pub use builder::{…}` group at lines 47-50 byte-identical.
+- [x] Each `#[cfg(test)]` fragment of the old L2344-2767 module travels with the cluster it exercises (the tests for `natives_to_load`, `native_survives_no_extensions`, `fallback_model`, `configured_packages_from_settings` and `apply_http_proxy_settings` stay in-module because those items are private).
+- [x] `cargo test -p cyrup-session-svc` still reports 311 passing and `cargo clippy -p cyrup-session-svc --all-targets` gains no warnings.
 
 ## Findings
 

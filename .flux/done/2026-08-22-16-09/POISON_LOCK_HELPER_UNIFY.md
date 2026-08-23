@@ -1,7 +1,7 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 19:32
+updated: 2026-08-22 20:10
 ---
 
 # Unify The Four Copies Of The Poison-Safe Lock Helper
@@ -14,11 +14,11 @@ The crate's most-repeated primitive has no canonical home. `rg -n 'fn lock' src/
 
 ## Acceptance Criteria
 
-- [ ] `src/sync.rs` defines a single `pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T>` with the poison policy documented once; `rg -n 'fn lock' crates/cyrup-session-svc/src/` returns exactly one definition.
-- [ ] `rg -c 'Self::lock\(' crates/cyrup-session-svc/src/` returns 0 — all 177 call sites migrated to `crate::sync::lock(..)`.
-- [ ] `rg -n 'into_inner' crates/cyrup-session-svc/src/` matches only `src/sync.rs`: the two `match` blocks in provider_swap.rs and the two inline sites at host_services.rs:416/:421 now call the helper.
-- [ ] `cargo clippy -p cyrup-session-svc --all-targets` gains no warnings and `cargo test -p cyrup-session-svc` still reports 311 passing.
-- [ ] `git diff --stat` shows the change is confined to lock-site call rewrites plus the new module (no behavioural edits mixed in).
+- [x] `src/sync.rs` defines a single `pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T>` with the poison policy documented once; `rg -n 'fn lock' crates/cyrup-session-svc/src/` returns exactly one definition.
+- [x] `rg -c 'Self::lock\(' crates/cyrup-session-svc/src/` returns 0 — all 177 call sites migrated to `crate::sync::lock(..)`.
+- [x] `rg -n 'into_inner' crates/cyrup-session-svc/src/` matches only `src/sync.rs`: the two `match` blocks in provider_swap.rs and the two inline sites at host_services.rs:416/:421 now call the helper.
+- [x] `cargo clippy -p cyrup-session-svc --all-targets` gains no warnings and `cargo test -p cyrup-session-svc` still reports 311 passing.
+- [x] `git diff --stat` shows the change is confined to lock-site call rewrites plus the new module (no behavioural edits mixed in).
 
 ## Findings
 

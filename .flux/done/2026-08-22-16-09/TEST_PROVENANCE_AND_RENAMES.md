@@ -1,7 +1,7 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 19:32
+updated: 2026-08-23 00:00
 ---
 
 # Rename The Single-Subject Round Modules And Push Provenance Onto Tests
@@ -14,11 +14,11 @@ Eight `roundN` modules in `src/tests/` hold 3,822 lines and 69 of the directory'
 
 ## Acceptance Criteria
 
-- [ ] `git mv` renames round5.rs → navigate_tree.rs and round8_postrun.rs → post_run_loop.rs; `ls crates/cyrup-session-svc/src/tests | grep -c '^round'` returns 6.
-- [ ] Every bullet in the six remaining round modules' doc headers is attached as a `///` comment to the specific test(s) it describes; each module doc retains at most a one-line pointer.
-- [ ] The `mod` lines in `src/tests/mod.rs` are alphabetically sorted — verified by extracting them and running `sort -c`.
-- [ ] `git diff` shows no changes inside test function bodies (renames, `mod` declarations and comments only).
-- [ ] `cargo test -p cyrup-session-svc` still reports 311 passing and `cargo clippy --all-targets` gains no warnings.
+- [x] `git mv` renames round5.rs → navigate_tree.rs and round8_postrun.rs → post_run_loop.rs; `ls crates/cyrup-session-svc/src/tests | grep -c '^round'` returns 6.
+- [x] Every bullet in the six remaining round modules' doc headers is attached as a `///` comment to the specific test(s) it describes; each module doc retains at most a one-line pointer.
+- [x] The `mod` lines in `src/tests/mod.rs` are alphabetically sorted — verified by extracting them and running `sort -c`.
+- [x] `git diff` shows no changes inside test function bodies (renames, `mod` declarations and comments only).
+- [x] `cargo test -p cyrup-session-svc` still reports 311 passing and `cargo clippy --all-targets` gains no warnings.
 
 ## Findings
 

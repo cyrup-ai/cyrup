@@ -1,7 +1,7 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 19:32
+updated: 2026-08-23 00:00
 ---
 
 # Extract Three Copy-Pasted Blocks In Factory, Runtime And Compaction
@@ -14,11 +14,20 @@ Three concrete duplications, each behind a different public entry point, each sm
 
 ## Acceptance Criteria
 
-- [ ] `src/factory.rs` has one `seed_builder(&self, cfg) -> SessionBuilder`; both build methods end in a single chained line and `rg -c 'SessionBuilder::new' crates/cyrup-session-svc/src/factory.rs` returns 1.
-- [ ] `src/runtime.rs` has `vetoed_resume` and `resume_build_and_install` helpers; the veto block and the resolve-cwd/exists-assert/build/install tail each appear once.
-- [ ] The import path still performs the veto BEFORE `std::fs::copy` (ordering unchanged) — stated explicitly in the PR with the before/after line references.
-- [ ] One `emit_compaction_cancelled(reason)` helper serves all three call sites; `rg -c 'aborted: true' crates/cyrup-session-svc/src/session/` returns 1.
-- [ ] `cargo test -p cyrup-session-svc` still reports 311 passing and `cargo clippy --all-targets` gains no warnings.
+- [x] `src/factory.rs` has one `seed_builder(&self, cfg) -> SessionBuilder`; both build methods end in a single chained line and `rg -c 'SessionBuilder::new' crates/cyrup-session-svc/src/factory.rs` returns 1.
+- [x] `src/runtime.rs` has `vetoed_resume` and `resume_build_and_install` helpers; the veto block and the resolve-cwd/exists-assert/build/install tail each appear once.
+- [x] The import path still performs the veto BEFORE `std::fs::copy` (ordering unchanged) — stated explicitly in the PR with the before/after line references.
+- [x] One `emit_compaction_cancelled(reason)` helper serves all three call sites; `rg -c 'aborted: true' crates/cyrup-session-svc/src/session/` returns 1.
+- [x] `cargo test -p cyrup-session-svc` still reports 311 passing and `cargo clippy --all-targets` gains no warnings.
+
+## Ordering note (acceptance criterion 3)
+
+The import path still vetoes BEFORE `std::fs::copy`. Before: veto at `src/runtime.rs:703-714`, copy
+at `:719-723`. After: `self.vetoed_resume(&current, &destination).await` at `src/runtime.rs:728-730`,
+copy at `:735-738`, then `resume_build_and_install(destination, ..)` at `:740`. The extracted tail
+holds only resolve-cwd / exists-assert / build / install — the veto was deliberately left at each
+call site, so no vetoed import can leave a copied file behind. `switch_session_with` reaches the same
+tail at `:571`, after its own veto (`:566`) and `previous`/`drop(current)`.
 
 ## Findings
 

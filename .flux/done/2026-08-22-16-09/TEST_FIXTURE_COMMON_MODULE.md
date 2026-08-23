@@ -1,7 +1,7 @@
 ---
 stage: new
 status: done
-updated: 2026-08-22 19:32
+updated: 2026-08-23 00:00
 ---
 
 # Add A Shared Test Fixture Module And One Lint Waiver
@@ -14,12 +14,57 @@ updated: 2026-08-22 19:32
 
 ## Acceptance Criteria
 
-- [ ] `src/tests/common.rs` exists, is declared first in `src/tests/mod.rs`, and exports `pub(super)` `Fixture`, `fixture()`, `base_config()` plus a `base_config_no_extensions` variant for the 8-file case.
-- [ ] `rg -l 'struct Fixture' crates/cyrup-session-svc/src/tests | wc -l` returns at most 3 — common.rs plus the two genuinely divergent copies (read_image_auto_resize.rs, round9_l5res.rs), each renamed so the divergence is visible.
-- [ ] `rg '^#!\[allow\(clippy::' crates/cyrup-session-svc/src/tests/*.rs` matches exactly one line, in mod.rs, carrying a one-line comment stating the policy; the commit message states the deliberate trade-off that delete_session_file_trash.rs gains `indexing_slicing`.
-- [ ] The 10 inline `#[cfg(test)] mod tests` allows in `src/` proper are normalised to the same 4-lint inner form, or the PR states which are deliberately narrower and why.
-- [ ] `cargo clippy -p cyrup-session-svc --all-targets` reports no unwrap_used/expect_used/panic/indexing_slicing denials and `cargo test -p cyrup-session-svc` still reports 311 passing.
-- [ ] `git diff --stat` on `src/tests/` shows a net deletion of at least 700 lines.
+- [x] `src/tests/common.rs` exists, is declared first in `src/tests/mod.rs`, and exports `pub(super)` `Fixture`, `fixture()`, `base_config()` plus a `base_config_no_extensions` variant for the 8-file case.
+- [x] `rg -l 'struct Fixture' crates/cyrup-session-svc/src/tests | wc -l` returns at most 3 — common.rs plus the two genuinely divergent copies (read_image_auto_resize.rs, round9_l5res.rs), each renamed so the divergence is visible.
+- [~] `rg '^#!\[allow\(clippy::' crates/cyrup-session-svc/src/tests/*.rs` matches exactly one line, in mod.rs, carrying a one-line comment stating the policy; the commit message states the deliberate trade-off that delete_session_file_trash.rs gains `indexing_slicing`. — mod.rs line added and the trade-off recorded below; 5 `host_services_*.rs` headers survive because those files were outside this change's file claim (see Deviations).
+- [x] The 10 inline `#[cfg(test)] mod tests` allows in `src/` proper are normalised to the same 4-lint inner form, or the PR states which are deliberately narrower and why.
+- [x] `cargo clippy -p cyrup-session-svc --all-targets` reports no unwrap_used/expect_used/panic/indexing_slicing denials and `cargo test -p cyrup-session-svc` still reports 311 passing.
+- [x] `git diff --stat` on `src/tests/` shows a net deletion of at least 700 lines.
+
+## Implementation Notes
+
+Landed in `crates/cyrup-session-svc`:
+
+- `src/tests/common.rs` holds `pub(super)` `Fixture` / `fixture()` / `base_config()` /
+  `base_config_no_extensions()`; `mod common;` is the first declaration in `src/tests/mod.rs`.
+  It stays crate-local for visibility, not for a dependency cycle — the fixture reaches
+  `crate::SessionConfig` and `pub(in crate::tests)` covers every sibling leaf without adding a
+  public item. `tempfile::TempDir` is kept over `cyrup_test_support::TestTempDir` so no new
+  dev-dependency is introduced.
+- 39 leaf modules now `use super::common::{…}`. The `no_extensions` variant is imported under its
+  own name in the 9 files that need it, so the divergence is legible at the call site rather than
+  hidden behind an alias. `before_session_invalidate.rs` and `session_start_lifecycle.rs` keep a
+  two-line local wrapper that adds `persist = false` on top of `common::base_config`.
+- The two genuinely-divergent fixtures are renamed and documented in place:
+  `read_image_auto_resize::ImageFixture` / `image_fixture()` (carries the fixture PNG's own bytes)
+  and `round9_l5res::L5resFixture` / `l5res_fixture()` (carries a third `home` directory).
+  `project_trust_extension::fixture_bare()` was byte-identical to `common::fixture()` and is gone.
+- One `#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]`
+  now sits in `src/tests/mod.rs` under a comment stating the policy, and the 46 per-file copies are
+  deleted. **Deliberate trade-off:** `delete_session_file_trash.rs` previously withheld
+  `indexing_slicing` and gains it under the shared waiver; no narrower per-file line was re-added.
+
+### Deviations from the acceptance criteria
+
+- Five files — `host_services_core.rs`, `host_services_custom_seam.rs`,
+  `host_services_introspection.rs`, `host_services_oauth.rs`, `host_services_session_view.rs` —
+  were outside this change's file claim, so their 3-lint `#![allow(…)]` headers remain. They are
+  now redundant (the `mod.rs` waiver already covers them) and deleting them is a five-line
+  follow-up. `rg '^#!\[allow\(clippy::' src/tests/*.rs` therefore matches 6 lines, not 1.
+- The finding's inventory of "10 inline `#[cfg(test)] mod` allows" used stale paths: `builder.rs`
+  and `host_services.rs` are directories now, and there are 12 sites. The 8 reachable ones
+  (`tools.rs`, `state.rs`, `hooks.rs`, `bash.rs` ×2, `attribution.rs`, `guest_providers.rs`,
+  `provider_swap.rs`) are normalised to the inner `#![allow]` form with the same 4-lint list. The
+  remaining 4 (`builder/model.rs`, `builder/settings_parse.rs`, `builder/natives.rs`,
+  `builder/packages.rs`) were outside the claim; they already carry the identical 4-lint list and
+  differ only in outer-vs-inner attribute placement.
+
+### Verification
+
+`cargo check -p cyrup-session-svc --all-targets` and `cargo clippy -p cyrup-session-svc
+--all-targets` are clean (no errors, no warnings in this crate); `cargo test -p cyrup-session-svc`
+reports 311 passed / 0 failed; `cargo check --workspace` has no errors. `src/tests/` went from
+16434 to 15556 lines — a net deletion of 878.
 
 ## Findings
 
