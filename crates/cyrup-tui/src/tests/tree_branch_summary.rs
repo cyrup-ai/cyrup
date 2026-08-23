@@ -27,20 +27,17 @@ use cyrup_provider::Provider;
 use cyrup_session_svc::{
     AgentSession, NavigateTreeOutcome, SessionBuilder, SessionConfig, Settings,
 };
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::crossterm::event::KeyCode;
 use crate::{
-    Action, App, AppAction, AppCommand, Entry, IndicatorKind, InputEvent, Key, SelectAction,
-    SelectorKind, TreeNavMsg, UiTheme,
+    Action, App, AppAction, AppCommand, Entry, IndicatorKind, Key, SelectAction, SelectorKind,
+    TreeNavMsg, UiTheme,
 };
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
+use super::harness::*;
 
 fn app() -> App<TestBackend> {
     App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap()
-}
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 struct Fixture {

@@ -54,15 +54,15 @@ fn the_input_arm_outranks_every_ticker() {
              found input before cancel in the select! at byte {offset} of app.rs",
         );
         for ticker in [
-            "_ = spinner.tick()",
+            "_ = ctx.spinner.tick()",
             "_ = dialog_countdown.tick()",
             "_ = progress_keepalive.tick()",
             "_ = elapsed_tick.tick()",
             "_ = git_branch_poll.tick()",
         ] {
-            let Some(ticker_pos) = block.find(ticker) else {
-                continue;
-            };
+            let ticker_pos = block.find(ticker).unwrap_or_else(|| {
+                panic!("ticker `{ticker}` not found in the run-loop select! — if the arm was renamed, rename it here rather than losing the check")
+            });
             assert!(
                 input_pos < ticker_pos,
                 "TUI-092 §5c: the input arm must outrank every ticker — under `biased;` a ticker \

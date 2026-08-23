@@ -7,31 +7,12 @@
 //! option index; the bordered loader occupies the editor slot while a long op runs).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::crossterm::event::KeyCode;
 use crate::{
-    App, AppAction, AppCommand, InputEvent, SelectorKind, SettingRow, SettingsSelector,
-    TrustSelector, UiTheme,
+    App, AppAction, AppCommand, SelectorKind, SettingRow, SettingsSelector, TrustSelector, UiTheme,
 };
 use ratatui::backend::TestBackend;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
+use super::harness::*;
 
 fn settings_app() -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(70, 20), UiTheme::dark()).unwrap();
@@ -191,23 +172,6 @@ fn bordered_loader_occupies_the_editor_slot_when_set() {
     app.draw().unwrap();
     let text = buf_text(&app);
     assert!(text.contains("Creating gist"), "loader message rendered: {text}");
-}
-
-/// Locate the first buffer row containing `needle`, returning `(y, row_text)`.
-fn row_with(app: &App<TestBackend>, needle: &str) -> (u16, String) {
-    let buf = app.terminal().backend().buffer();
-    for y in 0..buf.area.height {
-        let mut row = String::new();
-        for x in 0..buf.area.width {
-            if let Some(c) = buf.cell((x, y)) {
-                row.push_str(c.symbol());
-            }
-        }
-        if row.contains(needle) {
-            return (y, row);
-        }
-    }
-    panic!("no row contains {needle:?}");
 }
 
 fn trust_app() -> App<TestBackend> {

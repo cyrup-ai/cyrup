@@ -62,9 +62,8 @@ pub fn parse_skill_block(text: &str) -> Option<ParsedSkillBlock> {
     }
     let rest = rest.strip_prefix(">\n")?;
     // Non-greedy: the body runs to the FIRST `\n</skill>` (`[\s\S]*?`).
-    let close = rest.find("\n</skill>")?;
-    let content = rest[..close].to_string();
-    let after = &rest[close + "\n</skill>".len()..];
+    let (content, after) = rest.split_once("\n</skill>")?;
+    let content = content.to_string();
     let user_message = if after.is_empty() {
         None
     } else {

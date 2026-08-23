@@ -7,23 +7,10 @@ use cyrup_session_svc::AgentSessionEvent;
 use crate::{App, IndicatorKind, StatusIndicator, UiTheme, SPINNER_FRAMES};
 use ratatui::backend::TestBackend;
 use ratatui::text::Line;
+use super::harness::*;
 
 fn line_text(line: &Line<'_>) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let mut out = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            if let Some(c) = buf.cell((x, y)) {
-                out.push_str(c.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 #[test]

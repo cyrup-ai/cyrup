@@ -9,8 +9,17 @@
 //! # Layering
 //! - [`App`] is the shell, generic over the backend (`TestBackend` for tests, `CrosstermBackend`
 //!   for the binary). `render` is pure (`state -> frame`) so tests are deterministic.
+//! - `app/` is that shell as a module tree (see `app/mod.rs`): the `tokio::select!` skeleton
+//!   (`run.rs` → `run_arms.rs` → `run_action.rs`) and the frame path (`draw.rs`/`render.rs`/
+//!   `layout.rs`), with the session-event fold, command execution and selector plumbing alongside.
 //! - [`Component`] is the retained-component contract (state + `render`); built-ins are
 //!   [`TranscriptView`], [`InputEditor`], and [`StatusLine`].
+//! - `transcript/` is the history view as a module tree (see `transcript/mod.rs`): entries and
+//!   their rendering (`entry.rs`/`render.rs`/`message.rs`), the tool blocks (`tool_*.rs`), the
+//!   streaming buffer (`stream.rs`) and the active-region render cache (`cache.rs`).
+//! - The other multi-file concerns follow the same shape: `editor/` (the input editor), `selector/`
+//!   (Pi's in-place editor-swap selector engine) and `markdown/` (the pulldown-cmark walk); the
+//!   crate's one visible-width / truncation primitive set is `text_width.rs`.
 //! - [`UiTheme`] projects `cyrup-resources` themes (`ResolvedTheme`/`ThemeData`/`builtin_themes`)
 //!   onto `ratatui` colors, with a hot-reload hook ([`UiTheme::from_theme_data`]).
 //! - [`Keymap`]/[`Action`] resolve global keys (no hardcoded checks, R-10-018).
@@ -21,16 +30,13 @@
 //! ([`markdown`]) + syntax highlight, the **`!`/`!!` bash-execution** block ([`bash`]), the **floating
 //! overlay z-stack + hotkeys popup** ([`overlay`]), active-region **page-scroll**, and the
 //! **`$EDITOR`/`$VISUAL` external-editor escape** (`Ctrl+G`) are all built and TestBackend-covered.
+//! So are inline images (`image.rs` — `ratatui-image` TTY-protocol probe + half-block fallback +
+//! `show_images` placeholder), the **`@`-mention `fd` file search** (`autocomplete.rs`),
+//! **grapheme-cluster** editor motion (`editor/` via `unicode-segmentation`), and the bespoke
+//! **scoped-models checkbox+reorder** selector ([`CheckboxSelector`] + [`ModelsKeymap`]).
 //!
-//! # Built this round (L6 round-4)
-//! Inline images (`image.rs` — `ratatui-image` TTY-protocol probe + half-block fallback + `show_images`
-//! placeholder), the **`@`-mention `fd` file search** (`autocomplete.rs`), **grapheme-cluster** editor
-//! motion (`editor.rs` via `unicode-segmentation`), and the bespoke **scoped-models checkbox+reorder**
-//! selector ([`CheckboxSelector`] + [`ModelsKeymap`]).
-//!
-//! # Remaining gaps (see `spec/gap-analysis/12-cyrup-tui.md`)
-//! The five unsourced data-bound selectors + their bespoke layouts (tree/session/settings/trust/oauth),
-//! wrap-aware/sticky-column vertical motion + large-paste markers, the message-component/chrome tail,
+//! # Remaining gaps (see `docs/gap-analysis/07-cyrup-tui.md`)
+//! Wrap-aware/sticky-column vertical motion + large-paste markers, the message-component/chrome tail,
 //! clipboard-image paste + base64 message-image decode — plus the outer-layer ext-UI command protocol.
 #![forbid(unsafe_code)]
 
@@ -80,6 +86,7 @@ mod terminal_progress;
 mod terminal_query;
 mod terminal_title;
 mod text_input;
+mod text_width;
 mod theme;
 mod theme_access;
 mod tmux;

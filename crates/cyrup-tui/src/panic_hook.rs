@@ -55,7 +55,7 @@ use ratatui::crossterm::terminal::{EndSynchronizedUpdate, disable_raw_mode};
 pub fn restore_terminal_best_effort() {
     let mut out = io::stdout();
     // Close the synchronized update FIRST, before this function writes anything else.
-    // [`crate::App::draw_synchronized`] (`app.rs:7593-7606`) brackets every frame in
+    // [`crate::App::draw_synchronized`] (`app/crossterm.rs:87-100`) brackets every frame in
     // `BeginSynchronizedUpdate` … `EndSynchronizedUpdate`, and both a hard exit through the TUI-092
     // input-reader escape hatch and a panic can land INSIDE that window — are LIKELY to, in fact,
     // since the wedge the escape hatch exists for is a run loop stuck mid-frame. With the closing

@@ -10,6 +10,23 @@
 //!
 //! `render` is pure (`state -> frame`): [`render`] takes `&mut AppState` and a `Frame` and never
 //! touches real I/O, so tests draw into a `TestBackend` buffer and assert on cells.
+//!
+//! ## Historical paths: `app.rs:NNNN` citations elsewhere in this crate
+//! This tree is what `crates/cyrup-tui/src/app.rs` became. Commit `40821ed`
+//! (`refactor(cyrup-tui): split the 10.6k-line app.rs into the app/ module tree`) replaced that
+//! single 10,607-line file with the modules listed below, and **`src/app.rs` no longer exists**.
+//! Any surviving `app.rs:NNNN` citation in a comment anywhere in this crate is therefore
+//! **historical**: it names a line of the pre-split file, not of anything at HEAD.
+//!
+//! Those citations are annotated here rather than churned one by one — the precedent, and the
+//! reason for it, is `docs/gap-analysis/07-cyrup-tui.md:161-162`: re-pointing a line number
+//! mechanically produced pointers that matched TEXT but not MEANING, because the citations were
+//! written across dozens of revisions of `app.rs` and no single revision maps them all. Re-point
+//! one only when it misdirects about a **symbol**, and then only by reading the target.
+//!
+//! This does **not** apply to the crate's upstream citations (`interactive-mode.ts:3500`,
+//! `editor.ts:114`, `truncate.ts:177`, …). Those name a line in a pinned external tag of the
+//! TypeScript this crate ports and stay verbatim.
 
 mod action;
 mod backend;

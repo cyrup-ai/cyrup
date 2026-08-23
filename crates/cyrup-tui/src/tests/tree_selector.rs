@@ -11,6 +11,7 @@ use crate::{
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
+use super::harness::key_event as key;
 
 fn node(id: &str, depth: usize, label: &str, kind: TreeKind) -> TreeNode {
     let mut n = TreeNode::message(id, depth, label);
@@ -51,10 +52,6 @@ fn buf_string(terminal: &Terminal<TestBackend>) -> String {
         out.push('\n');
     }
     out
-}
-
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 /// TUI-027: pi's `app.tree.foldOrUp` / `unfoldOrDown` defaults are `["alt+left","ctrl+left"]` /

@@ -425,5 +425,3 @@ pub(super) fn render_generic(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<
         }
     }
 }
-
-// --- per-tool render helpers -------------------------------------------------------------------

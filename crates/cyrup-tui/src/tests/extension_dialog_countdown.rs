@@ -13,21 +13,7 @@ use cyrup_session_svc::{UiKind, UiReply, UiRequest};
 use crate::{App, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use std::time::Duration;
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
+use super::harness::*;
 
 fn confirm_request(reply: tokio::sync::oneshot::Sender<UiReply>, timeout_ms: Option<u64>) -> UiRequest {
     UiRequest {

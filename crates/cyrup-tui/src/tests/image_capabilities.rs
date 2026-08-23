@@ -8,6 +8,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use crate::{detect_capabilities_from, detect_capabilities_on_platform, ImageProtocol};
+use super::harness::caps_lock;
 
 /// Build an env lookup from a fixed table (missing keys ⇒ `None`, exactly like `std::env::var`).
 fn env_of<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
@@ -216,23 +217,4 @@ fn set_capabilities_pins_both_branches_and_reset_drops_the_pin() {
     // not keep the pin, never what the ambient answer IS (that is the TUI-N11 mistake).
     let _ = crate::cached_capabilities();
     crate::reset_capabilities_cache();
-}
-
-/// The process-wide cache makes every test that touches it order-dependent; one lock serializes
-/// them.
-static CAPS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Take [`CAPS_LOCK`], ignoring poisoning — same device as `crate::panic_hook`'s `HOOK_LOCK` and
-/// `crate::drain`'s `DRAIN_LOCK`: a sibling that panicked has already reported its own failure, and
-/// refusing the lock here would turn that into a second, misleading one.
-///
-/// `pub(crate)` rather than file-private, and that is the whole point of this accessor. The writer
-/// above is not the only test that depends on `image::CAPABILITIES`: `render_markdown` reaches
-/// `hyperlinks_supported()` through `markdown::render_with_default_style` (`markdown.rs:126`), so
-/// `tests::markdown::inline_code_bold_and_links` READS the same global — and it read it TWICE, once
-/// directly and once inside `render_markdown`, asserting the two agree. A pin landing between those
-/// two reads makes a correct renderer disagree with itself. A lock the reader cannot name does not
-/// serialize anything, which is what a file-private `static` amounted to here.
-pub(crate) fn caps_lock() -> std::sync::MutexGuard<'static, ()> {
-    CAPS_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }

@@ -48,7 +48,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::settings_selector::truncate_to_width;
+use crate::text_width::truncate_to_width;
 use crate::theme::UiTheme;
 
 /// The queued-message snapshot the region draws, updated from `queue_update`.

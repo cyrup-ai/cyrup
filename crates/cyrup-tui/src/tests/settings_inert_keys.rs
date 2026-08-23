@@ -30,17 +30,14 @@ use cyrup_core::StopReason;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider, FauxResponseStep};
 use cyrup_provider::Provider;
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig, Settings};
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::crossterm::event::KeyCode;
 use crate::{App, AppCommand, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
+use super::harness::{buf_text, key_event as key};
 
 fn app() -> App<TestBackend> {
     App::new(TestBackend::new(100, 30), UiTheme::dark()).unwrap()
-}
-
-fn key(code: KeyCode) -> KeyEvent {
-    KeyEvent::new(code, KeyModifiers::NONE)
 }
 
 struct Fixture {
@@ -93,21 +90,6 @@ async fn one_turn(session: &Arc<AgentSession>) {
 
 fn settings(json: &str) -> Settings {
     Settings::parse(json).unwrap()
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 /// Type `/skill` into the live editor and render — the ACTUAL `/` autocomplete menu a user sees,

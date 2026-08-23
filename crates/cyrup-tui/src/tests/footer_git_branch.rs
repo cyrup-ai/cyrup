@@ -17,6 +17,7 @@ use std::path::Path;
 
 use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
+use super::harness::*;
 
 /// A temp dir that deletes itself when dropped, derefing to [`Path`] so it is still used
 /// directly as one. The guard MUST stay bound for the whole test.
@@ -45,23 +46,6 @@ fn scratch(name: &str) -> Scratch {
 fn write_head(root: &Path, head: &str) {
     std::fs::create_dir_all(root.join(".git")).unwrap();
     std::fs::write(root.join(".git").join("HEAD"), head).unwrap();
-}
-
-/// Only the live region — the bottom rows the app repaints, which is where the footer lives.
-fn live_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let vh = app.viewport_height().min(area.height);
-    let mut out = String::new();
-    for y in (area.height - vh)..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 /// THE regression: seeding the footer from a cwd inside a git repo puts the branch on screen.

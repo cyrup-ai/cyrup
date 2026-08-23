@@ -28,7 +28,7 @@ use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{border_rule_line, Selector, SelectorOutcome};
-use crate::settings_selector::truncate_line_to_width;
+use crate::text_width::truncate_line_to_width;
 use crate::theme::UiTheme;
 
 /// `maxVisible` (`user-message-selector.ts:19`) — 10 messages.

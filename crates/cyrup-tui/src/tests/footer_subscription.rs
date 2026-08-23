@@ -46,12 +46,11 @@ use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::AuthError as ProviderAuthError;
 use cyrup_provider::{Context, Credential, Model, Provider, StreamEvent, StreamOptions};
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{
-    App, AppCommand, InputEvent, LoginProviderSource, LoginUiMsg, SelectorKind, UiTheme,
-};
+use crate::crossterm::event::KeyCode;
+use crate::{App, AppCommand, LoginProviderSource, LoginUiMsg, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
+use super::harness::*;
 
 // ---------------------------------------------------------------- stub provider
 
@@ -172,26 +171,6 @@ fn app_with(registry: LoginProviderSource) -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(120, 8), UiTheme::dark()).unwrap();
     app.set_login_provider_source(registry);
     app
-}
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-/// Everything currently painted into the terminal buffer.
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 async fn next_msg(rx: &mut tokio::sync::mpsc::UnboundedReceiver<LoginUiMsg>) -> LoginUiMsg {

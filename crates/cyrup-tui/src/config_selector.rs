@@ -29,7 +29,7 @@ use ratatui::Frame;
 use crate::chrome::key_hint_spans;
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{input_line_spans, Selector, SelectorOutcome};
-use crate::settings_selector::{str_width, truncate_line_to_width, truncate_to_width};
+use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
 
 /// The unit-separator that delimits the fields of a [`ConfigToggle`] `Apply` payload.

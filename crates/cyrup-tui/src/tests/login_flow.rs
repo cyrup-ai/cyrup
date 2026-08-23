@@ -28,12 +28,11 @@ use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_core::EventStream;
 use cyrup_provider::{Context, Credential, Model, Provider, StreamEvent, StreamOptions};
 use cyrup_session_svc::{AgentSession, SessionBuilder, SessionConfig};
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{
-    App, AppCommand, Entry, InputEvent, LoginProviderSource, LoginUiMsg, SelectorKind, UiTheme,
-};
+use crate::crossterm::event::KeyCode;
+use crate::{App, AppCommand, Entry, LoginProviderSource, LoginUiMsg, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use tempfile::TempDir;
+use super::harness::*;
 
 // ---------------------------------------------------------------- stub provider
 
@@ -177,10 +176,6 @@ fn app_with(registry: LoginProviderSource) -> App<TestBackend> {
     let mut app = App::new(TestBackend::new(80, 24), UiTheme::dark()).unwrap();
     app.set_login_provider_source(registry);
     app
-}
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 fn type_text(app: &mut App<TestBackend>, text: &str) {

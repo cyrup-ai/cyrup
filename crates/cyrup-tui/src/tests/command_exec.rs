@@ -5,13 +5,10 @@
 //! surfaced as [`AppCommand`] for the run loop.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{App, AppAction, AppCommand, Entry, InputEvent, SelectorKind, UiTheme};
+use crate::crossterm::event::KeyCode;
+use crate::{App, AppAction, AppCommand, Entry, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
+use super::harness::*;
 
 /// Submit `line` through the real editor → dispatch path, returning the resulting [`AppAction`].
 fn submit(app: &mut App<TestBackend>, line: &str) -> AppAction {

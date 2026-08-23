@@ -66,6 +66,7 @@ impl TextInputSelector {
     /// is precisely the moment its "how do I submit this?" row matters, and upstream has no such
     /// window: `keyHint` resolves through `keyText` → `getKeybindings().getKeys(...)` on every
     /// render (`keybinding-hints.ts:34-44`), against the one live table.
+    #[must_use]
     pub fn with_keymap(mut self, keymap: &SelectKeymap) -> Self {
         self.keymap = keymap.clone();
         self

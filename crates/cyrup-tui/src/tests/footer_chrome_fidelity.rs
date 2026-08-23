@@ -31,34 +31,12 @@ use ratatui::style::Color;
 use ratatui::Terminal;
 use tempfile::TempDir;
 use tokio_stream::StreamExt;
+use super::harness::*;
 
 // ------------------------------------------------------------------------------ helpers ----
 
 fn app(w: u16, h: u16) -> App<TestBackend> {
     App::new(TestBackend::new(w, h), UiTheme::dark()).unwrap()
-}
-
-fn row_text(app: &App<TestBackend>, y: u16) -> String {
-    let buf = app.terminal().backend().buffer();
-    (0..buf.area.width).filter_map(|x| buf.cell((x, y))).map(|c| c.symbol()).collect()
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let h = app.terminal().backend().buffer().area.height;
-    (0..h).map(|y| row_text(app, y)).collect::<Vec<_>>().join("\n")
-}
-
-/// The first row whose text contains `needle`.
-fn find_row(app: &App<TestBackend>, needle: &str) -> u16 {
-    let h = app.terminal().backend().buffer().area.height;
-    (0..h)
-        .find(|&y| row_text(app, y).contains(needle))
-        .unwrap_or_else(|| panic!("no row contains {needle:?}:\n{}", buf_text(app)))
-}
-
-/// The foreground colour of the cell at `(x, y)`.
-fn fg_at(app: &App<TestBackend>, x: u16, y: u16) -> Option<Color> {
-    app.terminal().backend().buffer().cell((x, y)).map(|c| c.fg)
 }
 
 /// The foreground of the first non-blank cell on row `y`.
@@ -68,14 +46,6 @@ fn fg_of_row(app: &App<TestBackend>, y: u16) -> Option<Color> {
         .filter_map(|x| buf.cell((x, y)))
         .find(|c| c.symbol() != " ")
         .map(|c| c.fg)
-}
-
-/// The CELL column of `needle` in `row`. `str::find` returns a BYTE offset, and these rows carry
-/// `↑`/`↓`/`·`/`…`, so the two are not the same number — indexing the buffer with the byte offset
-/// samples the wrong cell.
-fn col_of(row: &str, needle: &str) -> u16 {
-    let byte = row.find(needle).unwrap_or_else(|| panic!("{needle:?} not in [{row}]"));
-    row.get(..byte).map_or(0, |p| p.chars().count()) as u16
 }
 
 /// [`col_of`] for the LAST occurrence.

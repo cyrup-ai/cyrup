@@ -33,6 +33,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::component::Component;
+use crate::text_width::{str_width, truncate_parts, truncate_to_width};
 use crate::theme::UiTheme;
 
 /// The style role a left-cluster segment carries, resolved against the live theme at render time.
@@ -581,50 +582,6 @@ fn context_style(percent: f64, theme: &UiTheme) -> Style {
     } else {
         theme.dim_style()
     }
-}
-
-/// Visible (terminal column) width of `s`, unicode-width correct via ratatui's `Span::width`
-/// (mirrors Pi's `visibleWidth`, `footer.ts:2`). Never `str::len`.
-fn str_width(s: &str) -> usize {
-    Span::raw(s).width()
-}
-
-/// Visible width of a single `char` (no heap allocation).
-fn char_width(c: char) -> usize {
-    let mut buf = [0u8; 4];
-    str_width(c.encode_utf8(&mut buf))
-}
-
-/// Right-truncate `s` to a visible width of `max`, appending `ellipsis` when truncation occurs
-/// (mirrors Pi's `truncateToWidth`, `footer.ts:2`). Width-aware (CJK/emoji safe), never panics.
-fn truncate_to_width(s: &str, max: usize, ellipsis: &str) -> String {
-    let (mut body, truncated) = truncate_parts(s, max, ellipsis);
-    if truncated {
-        body.push_str(ellipsis);
-    }
-    body
-}
-
-/// [`truncate_to_width`] split into `(kept text, was it truncated)`, so a caller can style the
-/// ellipsis differently from the body — which is what the third footer line needs
-/// (`truncateToWidth(statusLine, width, theme.fg("dim", "..."))`, `footer.ts:240`: the ellipsis
-/// carries the colour, the statuses do not). `ellipsis` is measured but never appended here.
-fn truncate_parts(s: &str, max: usize, ellipsis: &str) -> (String, bool) {
-    if str_width(s) <= max {
-        return (s.to_string(), false);
-    }
-    let budget = max.saturating_sub(str_width(ellipsis));
-    let mut out = String::new();
-    let mut w = 0usize;
-    for ch in s.chars() {
-        let cw = char_width(ch);
-        if w.saturating_add(cw) > budget {
-            break;
-        }
-        out.push(ch);
-        w = w.saturating_add(cw);
-    }
-    (out, true)
 }
 
 /// [`truncate_to_width`] over a **styled span vector**, preserving each span's own style across the

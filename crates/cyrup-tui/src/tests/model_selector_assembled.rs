@@ -5,29 +5,10 @@
 //! `/model` degraded to a bare titled list (Pi `model-selector.ts:229-283`, spec/tui/05 §5.2).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{App, InputEvent, ModelEntry, SelectorKind, UiTheme};
+use crate::crossterm::event::KeyCode;
+use crate::{App, ModelEntry, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-
-/// The whole rendered buffer as text.
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
+use super::harness::*;
 
 fn catalog() -> Vec<ModelEntry> {
     vec![

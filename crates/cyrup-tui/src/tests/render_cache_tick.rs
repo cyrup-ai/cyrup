@@ -1,8 +1,8 @@
 //! The TUI-092 F2 render cache must be invalidated on timer-driven repaints while
 //! wall-clock-derived transcript content is live — or the live `!`/`!!` block's spinner glyph
-//! (`BashExecution::render_lines` → `started.elapsed()`, bash.rs:204) and a running bash tool's
-//! `Elapsed …` footer (`render_bash`, transcript.rs:2157) freeze at the values materialised by
-//! the last content change.
+//! (`BashExecution::render_lines` → `started.elapsed()`, bash.rs:226-233) and a running bash tool's
+//! `Elapsed …` footer (`render_bash`, transcript/tool_builtin.rs:214) freeze at the values
+//! materialised by the last content change.
 //!
 //! # What was broken
 //!
@@ -29,13 +29,17 @@ const APP_SRC: &str = include_str!("../app/run.rs");
 const ARMS_SRC: &str = include_str!("../app/run_arms.rs");
 const TRANSCRIPT_SRC: &str = include_str!("../transcript/cache.rs");
 
-/// The body of one run-loop arm: from the arm's first line to the start of the next arm.
+/// The body of one run-loop arm: from the arm's first line to the start of the next arm. Both
+/// anchors must resolve — a terminator that no longer matches (an arm renamed, a fn moved to
+/// another file by a re-split) is a lost check, not a licence to read on.
 fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
     let start = src
         .find(arm)
         .unwrap_or_else(|| panic!("run-loop arm `{arm}` not found — if the loop moved, move this guard with it"));
     let rest = &src[start..];
-    let end = rest.find(next_arm).unwrap_or(rest.len());
+    let end = rest.find(next_arm).unwrap_or_else(|| {
+        panic!("terminator `{next_arm}` not found after `{arm}` — if the loop was re-split, re-anchor this guard rather than reading to EOF")
+    });
     &rest[..end]
 }
 
@@ -44,6 +48,7 @@ fn arm_body<'a>(src: &'a str, arm: &str, next_arm: &str) -> &'a str {
 /// its zero-materialisation tick (the F2 win).
 #[test]
 fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
+    // Terminator `_ = dialog_countdown.tick()` lives in app/run.rs (APP_SRC), the next select! arm.
     let arm = arm_body(APP_SRC, "_ = ctx.spinner.tick()", "_ = dialog_countdown.tick()");
     assert!(
         arm.contains("bash_running()"),
@@ -51,12 +56,14 @@ fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
     );
     // …and the handler additionally gates the bump on the tool's `Elapsed` footer
     // (`has_running_elapsed_tool()`), inside `on_spinner_tick` (run_arms.rs).
+    // Terminator `fn on_dialog_countdown_tick(` lives in app/run_arms.rs (ARMS_SRC), the next fn.
     assert!(
         arm_body(ARMS_SRC, "fn on_spinner_tick(", "fn on_dialog_countdown_tick(")
             .contains("has_running_elapsed_tool()"),
         "the spinner bump must also be gated on the tool's live `Elapsed` footer"
     );
     // …and the arm's handler (`on_spinner_tick`, run_arms.rs) owns the bump-then-repaint body.
+    // Terminator `fn on_dialog_countdown_tick(` lives in app/run_arms.rs (ARMS_SRC), the next fn.
     let body = arm_body(ARMS_SRC, "fn on_spinner_tick(", "fn on_dialog_countdown_tick(");
     let bump = body
         .find("bump_render_tick()")
@@ -75,12 +82,14 @@ fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
 /// unconditionally — otherwise the `Elapsed …` footer it exists to advance stays frozen.
 #[test]
 fn the_elapsed_tick_bumps_before_repainting() {
+    // Terminator `_ = git_branch_poll.tick()` lives in app/run.rs (APP_SRC), the next select! arm.
     let arm = arm_body(APP_SRC, "_ = elapsed_tick.tick()", "_ = git_branch_poll.tick()");
     assert!(
         arm.contains("has_running_elapsed_tool()"),
         "the elapsed arm stays gated on a live `Elapsed` footer:\n{arm}"
     );
     // The arm's handler (`on_elapsed_tick`, run_arms.rs) owns the bump-then-repaint body.
+    // Terminator `fn on_git_branch_poll(` lives in app/run_arms.rs (ARMS_SRC), the next fn.
     let body = arm_body(ARMS_SRC, "fn on_elapsed_tick(", "fn on_git_branch_poll(");
     let bump = body
         .find("bump_render_tick()")

@@ -15,21 +15,7 @@ use cyrup_ext::host::DialogOptions;
 use cyrup_session_svc::{UiKind, UiRequest};
 use crate::{App, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
+use super::harness::*;
 
 /// A confirm dialog's message is long enough that it CANNOT fit on a single 60-column row (nor
 /// alongside the title on the same row) — Pi's exact join is `` `${title}\n${message}` ``

@@ -151,7 +151,7 @@ fn inline_code_bold_and_links() {
     // value, or this assertion fails on a renderer that is behaving perfectly. That is a real race,
     // not a hypothetical: libtest runs these two tests on parallel threads in one process. The
     // writer already takes this lock; enrolling the reader is what actually closes it.
-    let _caps = super::image_capabilities::caps_lock();
+    let _caps = super::harness::caps_lock();
     let detected = crate::hyperlinks_supported();
     assert_eq!(
         render_markdown(src, 80, &theme),

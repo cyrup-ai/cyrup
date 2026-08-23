@@ -13,47 +13,13 @@
 //! - the tool-execution surface is the spec block with a state bg tint (audit #6/#7).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::crossterm::event::KeyCode;
 use crate::{
-    App, AppAction, ConfigKind, ConfigRow, ConfigScope, ConfigSelector, InputEvent, SelectorKind,
-    UiTheme,
+    App, AppAction, ConfigKind, ConfigRow, ConfigScope, ConfigSelector, SelectorKind, UiTheme,
 };
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
-fn ctrl(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::CONTROL))
-}
-
-/// The whole rendered buffer as text (every row, including the scrollback band above the viewport).
-fn buf_text(app: &App<TestBackend>) -> String {
-    rows_text(app, 0, app.terminal().backend().buffer().area.height)
-}
-
-/// Only the **live region** — the bottom `viewport_height` rows the app repaints each frame.
-fn live_text(app: &App<TestBackend>) -> String {
-    let h = app.terminal().backend().buffer().area.height;
-    let vh = app.viewport_height().min(h);
-    rows_text(app, h - vh, h)
-}
-
-fn rows_text(app: &App<TestBackend>, y0: u16, y1: u16) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in y0..y1 {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
+use super::harness::*;
 
 /// True if any cell in the bottom `viewport_height` rows carries the reverse-video modifier (the soft
 /// cursor, audit #3) — the hardware cursor is invisible in a headless buffer, so this is how we prove

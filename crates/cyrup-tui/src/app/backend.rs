@@ -8,6 +8,7 @@ use super::*;
 /// the real terminal is never asked where the cursor is; see [`InlineBackend::get_cursor_position`]).
 pub trait RebuildBackend: Backend + Sized {
     /// A fresh backend over the same terminal, preserving the inline-viewport cursor anchor.
+    #[must_use]
     fn rebuild(&self) -> Self;
 
     /// Prepare the **current** backend for a reconstruction at `new_height` (called by

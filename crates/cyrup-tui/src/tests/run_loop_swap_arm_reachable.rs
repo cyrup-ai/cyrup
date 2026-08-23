@@ -85,7 +85,9 @@ fn the_swap_arm_outranks_the_events_arm_and_every_ticker_and_the_events_pattern_
             "_ = elapsed_tick.tick()",
             "_ = git_branch_poll.tick()",
         ] {
-            let Some(ticker_pos) = block.find(ticker) else { continue };
+            let ticker_pos = block.find(ticker).unwrap_or_else(|| {
+                panic!("ticker `{ticker}` not found in the run-loop select! — if the arm was renamed, rename it here rather than losing the check")
+            });
             assert!(
                 swap_pos < ticker_pos,
                 "the swap arm must outrank every ticker — under `biased;` a ticker above it that \

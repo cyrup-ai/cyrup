@@ -10,6 +10,29 @@
 //! producing a component the host loads) and `experimental_marker.rs` (it mutates the process
 //! environment with `std::env::set_var`, which this crate's `#![forbid(unsafe_code)]` rules out
 //! in `src/` — and whose soundness argument depends on being a one-test binary).
+//!
+//! # Where a new test goes
+//!
+//! The crate keeps tests in three places, and the choice between them is forced by what the test
+//! needs to reach — not by taste. The rule is already written down in the leaves; it is restated
+//! here because the leaves are exactly where a reader adding a file does not look first.
+//!
+//! - **Inline `#[cfg(test)] mod tests` beside the code** — when the test needs private items or
+//!   private fields, or must sit next to a process-global `static` and the lock that serializes it.
+//!   Thirty-three production files do this. `src/app/backend.rs:230-234` states the case: the
+//!   module's own tests reach members no sibling file can name.
+//! - **`src/transcript/tests/`** — the transcript module's own private-access tests, seven files
+//!   declared at `src/transcript/mod.rs:50-51`. `src/transcript/tests/mod.rs:1-3` states why they
+//!   are a directory of the module rather than files here: they are inside `transcript`, so they
+//!   see its private surface, which a test under `src/tests/` does not.
+//! - **`src/tests/` (here)** — App-level tests that drive an `App<TestBackend>` through its public
+//!   surface and assert on rendered output. Everything here can be written against `crate::`
+//!   exports plus [`harness`]; if a test cannot, it belongs in one of the two locations above.
+//!
+//! [`harness`] carries the shared buffer scrapes ([`harness::buf_text`] and friends), the key-event
+//! constructors, and the cross-file `caps_lock`. It also pins the trailing-newline convention that
+//! the hand-rolled per-file copies had already broken — read its module doc before adding another
+//! scrape helper.
 
 mod app_global_actions;
 mod assembled_render;
@@ -53,6 +76,7 @@ mod footer_chrome_fidelity;
 mod footer_git_branch;
 mod footer_subscription;
 mod fork_selector;
+pub(crate) mod harness;
 mod image;
 mod image_capabilities;
 mod inline_stacking;

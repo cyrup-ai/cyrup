@@ -21,15 +21,16 @@ use cyrup_core::StopReason;
 use cyrup_provider::faux::{faux_assistant_message, faux_text, FauxProvider};
 use cyrup_provider::Provider;
 use cyrup_session_svc::{AgentSession, AgentSessionEvent, SessionBuilder, SessionConfig};
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use crate::crossterm::event::KeyCode;
 use crate::{
-    App, AppAction, AppCommand, InputEvent, SelectorKind, TerminalProgress, UiTheme,
+    App, AppAction, AppCommand, SelectorKind, TerminalProgress, UiTheme,
     TERMINAL_PROGRESS_ACTIVE_SEQUENCE, TERMINAL_PROGRESS_CLEAR_SEQUENCE,
     TERMINAL_PROGRESS_KEEPALIVE,
 };
 use ratatui::backend::TestBackend;
 use tokio_stream::StreamExt;
 use tempfile::TempDir;
+use super::harness::*;
 
 struct Fixture {
     _tmp: TempDir,
@@ -59,10 +60,6 @@ async fn fixture() -> Fixture {
 
 fn app() -> App<TestBackend> {
     App::new(TestBackend::new(100, 24), UiTheme::dark()).unwrap()
-}
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
 }
 
 /// Open `/settings`, fuzzy-filter to the "Terminal progress" row and press Enter — the exact

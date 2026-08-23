@@ -14,22 +14,7 @@ use cyrup_session_svc::AgentSessionEvent;
 use crate::{App, UiTheme};
 use ratatui::backend::TestBackend;
 use ratatui::style::Color;
-
-/// Flatten the test backend's cell grid into rows of text for `contains` assertions.
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
-}
+use super::harness::*;
 
 /// Flatten only the **live region** — the bottom `viewport_height` rows the app repaints each frame
 /// (ADR-0001 #1). Committed history scrolls *above* this band into native scrollback, so this is what

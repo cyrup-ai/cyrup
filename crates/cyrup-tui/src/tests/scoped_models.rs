@@ -13,15 +13,10 @@ use crate::{
 };
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
+use super::harness::*;
 
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
 fn ctrl(c: char) -> InputEvent {
     InputEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
-}
-fn alt(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::ALT))
 }
 
 /// A 3-model catalog: ids `m0`,`m1`,`m2` across two providers.
@@ -31,21 +26,6 @@ fn catalog() -> Vec<(String, String, String, Option<String>)> {
         ("m1".into(), "Model One".into(), "openai".into(), Some("openai".into())),
         ("m2".into(), "Model Two".into(), "anthropic".into(), Some("anthropic".into())),
     ]
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 /// Pull the confirm value out of a `ConfirmSelection { ScopedModels, .. }` action.

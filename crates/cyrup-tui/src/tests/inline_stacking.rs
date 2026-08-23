@@ -28,11 +28,12 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
-use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use crate::{reanchor_inline_region, App, InputEvent, RebuildBackend, UiTheme};
+use crate::crossterm::event::KeyCode;
+use crate::{reanchor_inline_region, App, RebuildBackend, UiTheme};
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::Cell;
 use ratatui::layout::{Position, Size};
+use super::harness::*;
 
 const W: u16 = 80;
 const H: u16 = 24;
@@ -368,10 +369,6 @@ fn count_subseq(hay: &[u8], needle: &[u8]) -> usize {
 }
 
 // --------------------------------------------------------------------------- driving helpers ----
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
 
 fn app() -> App<CaptureBackend> {
     let mut app = App::new(CaptureBackend::new(), UiTheme::dark()).unwrap();

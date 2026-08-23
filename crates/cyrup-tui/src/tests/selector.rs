@@ -10,10 +10,7 @@ use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{search_input_spans, App, InputEvent, SelectorKind, UiTheme};
 use ratatui::backend::TestBackend;
 use ratatui::style::Modifier;
-
-fn key(code: KeyCode) -> InputEvent {
-    InputEvent::Key(KeyEvent::new(code, KeyModifiers::NONE))
-}
+use super::harness::*;
 
 #[test]
 fn selector_search_input_renders_a_block_cursor() {
@@ -48,21 +45,6 @@ fn selector_search_input_renders_a_block_cursor() {
 }
 fn ctrl(c: char) -> InputEvent {
     InputEvent::Key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL))
-}
-
-fn buf_text(app: &App<TestBackend>) -> String {
-    let buf = app.terminal().backend().buffer();
-    let area = buf.area;
-    let mut out = String::new();
-    for y in 0..area.height {
-        for x in 0..area.width {
-            if let Some(cell) = buf.cell((x, y)) {
-                out.push_str(cell.symbol());
-            }
-        }
-        out.push('\n');
-    }
-    out
 }
 
 #[test]
