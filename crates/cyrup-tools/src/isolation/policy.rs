@@ -58,7 +58,9 @@ impl Rule {
     where
         F: Fn(&str, &Value) -> bool + Send + Sync + 'static,
     {
-        RuleBuilder { matches: Arc::new(pred) }
+        RuleBuilder {
+            matches: Arc::new(pred),
+        }
     }
 }
 
@@ -70,17 +72,26 @@ pub struct RuleBuilder {
 impl RuleBuilder {
     /// Allow matching calls (`Proceed`). Useful as an early allow-list entry before broader denies.
     pub fn allow(self) -> Rule {
-        Rule { matches: self.matches, action: RuleAction::Allow }
+        Rule {
+            matches: self.matches,
+            action: RuleAction::Allow,
+        }
     }
 
     /// Block matching calls with `reason`.
     pub fn deny(self, reason: impl Into<String>) -> Rule {
-        Rule { matches: self.matches, action: RuleAction::Deny(reason.into()) }
+        Rule {
+            matches: self.matches,
+            action: RuleAction::Deny(reason.into()),
+        }
     }
 
     /// Require confirmation for matching calls.
     pub fn confirm(self, prompt: impl Into<String>) -> Rule {
-        Rule { matches: self.matches, action: RuleAction::Confirm(prompt.into()) }
+        Rule {
+            matches: self.matches,
+            action: RuleAction::Confirm(prompt.into()),
+        }
     }
 
     /// Rewrite the input of matching calls.
@@ -88,7 +99,10 @@ impl RuleBuilder {
     where
         F: Fn(&str, &Value) -> Value + Send + Sync + 'static,
     {
-        Rule { matches: self.matches, action: RuleAction::Mutate(Arc::new(rewrite)) }
+        Rule {
+            matches: self.matches,
+            action: RuleAction::Mutate(Arc::new(rewrite)),
+        }
     }
 }
 
@@ -133,11 +147,15 @@ impl PermissionPolicy {
             if (rule.matches)(tool, input) {
                 return match &rule.action {
                     RuleAction::Allow => PolicyDecision::Proceed,
-                    RuleAction::Deny(reason) => PolicyDecision::Block { reason: reason.clone() },
-                    RuleAction::Confirm(reason) => {
-                        PolicyDecision::Confirm { reason: reason.clone() }
-                    }
-                    RuleAction::Mutate(f) => PolicyDecision::Mutate { input: f(tool, input) },
+                    RuleAction::Deny(reason) => PolicyDecision::Block {
+                        reason: reason.clone(),
+                    },
+                    RuleAction::Confirm(reason) => PolicyDecision::Confirm {
+                        reason: reason.clone(),
+                    },
+                    RuleAction::Mutate(f) => PolicyDecision::Mutate {
+                        input: f(tool, input),
+                    },
                 };
             }
         }
@@ -209,7 +227,10 @@ mod tests {
     fn empty_policy_proceeds() {
         let p = PermissionPolicy::new();
         assert!(p.is_empty());
-        assert_eq!(p.evaluate("bash", &json!({"command": "rm -rf /"})), PolicyDecision::Proceed);
+        assert_eq!(
+            p.evaluate("bash", &json!({"command": "rm -rf /"})),
+            PolicyDecision::Proceed
+        );
     }
 
     #[test]
@@ -218,10 +239,15 @@ mod tests {
             .with_rule(Rule::when(bash_command_contains("rm -rf")).deny("no rm -rf"));
         assert_eq!(
             p.evaluate("bash", &json!({"command": "rm -rf build"})),
-            PolicyDecision::Block { reason: "no rm -rf".into() }
+            PolicyDecision::Block {
+                reason: "no rm -rf".into()
+            }
         );
         // A different bash command is unaffected.
-        assert_eq!(p.evaluate("bash", &json!({"command": "ls"})), PolicyDecision::Proceed);
+        assert_eq!(
+            p.evaluate("bash", &json!({"command": "ls"})),
+            PolicyDecision::Proceed
+        );
     }
 
     #[test]
@@ -229,23 +255,29 @@ mod tests {
         let p = PermissionPolicy::new().with_rule(dangerous_bash_rule());
         assert_eq!(
             p.evaluate("bash", &json!({"command": "mkfs /dev/sda"})),
-            PolicyDecision::Confirm { reason: "potentially destructive command".into() }
+            PolicyDecision::Confirm {
+                reason: "potentially destructive command".into()
+            }
         );
     }
 
     #[test]
     fn mutate_rewrites_input() {
-        let p = PermissionPolicy::new().with_rule(
-            Rule::when(is_tool("bash")).mutate(|_t, input| {
+        let p =
+            PermissionPolicy::new().with_rule(Rule::when(is_tool("bash")).mutate(|_t, input| {
                 let mut v = input.clone();
                 if let Some(obj) = v.as_object_mut() {
                     obj.insert("command".into(), json!("echo safe"));
                 }
                 v
-            }),
-        );
+            }));
         let decision = p.evaluate("bash", &json!({"command": "rm -rf /"}));
-        assert_eq!(decision, PolicyDecision::Mutate { input: json!({"command": "echo safe"}) });
+        assert_eq!(
+            decision,
+            PolicyDecision::Mutate {
+                input: json!({"command": "echo safe"})
+            }
+        );
     }
 
     #[test]
@@ -267,7 +299,10 @@ mod tests {
             PolicyDecision::Proceed
         );
         // read is never gated by this rule
-        assert_eq!(p.evaluate("read", &json!({"path": ".env"})), PolicyDecision::Proceed);
+        assert_eq!(
+            p.evaluate("read", &json!({"path": ".env"})),
+            PolicyDecision::Proceed
+        );
     }
 
     #[test]
@@ -276,10 +311,15 @@ mod tests {
             .with_rule(Rule::when(bash_command_contains("git push")).allow())
             .with_rule(Rule::when(is_tool("bash")).deny("all bash blocked"));
         // The allow rule precedes the broad deny.
-        assert_eq!(p.evaluate("bash", &json!({"command": "git push origin"})), PolicyDecision::Proceed);
+        assert_eq!(
+            p.evaluate("bash", &json!({"command": "git push origin"})),
+            PolicyDecision::Proceed
+        );
         assert_eq!(
             p.evaluate("bash", &json!({"command": "ls"})),
-            PolicyDecision::Block { reason: "all bash blocked".into() }
+            PolicyDecision::Block {
+                reason: "all bash blocked".into()
+            }
         );
     }
 }

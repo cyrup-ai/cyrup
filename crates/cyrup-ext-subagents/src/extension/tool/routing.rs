@@ -1052,8 +1052,8 @@ impl SubagentTool {
 
         // pi `handleList` reads `ctx.config?.proactiveSkillSubagents` and passes a LAZY
         // `discoverAvailableSkills: () => discoverAvailableSkills(ctx.cwd)` closure
-        // (`agent-management.ts:765-770` @v0.43.0). cyrup's skill scan is `async` and
-        // `handle_management_action` is sync, so the laziness lives here instead: the config is
+        // (`agent-management.ts:765-770` @v0.43.0). cyrup's skill scan is `async`, so the
+        // laziness lives here rather than inside the handler: the config is
         // resolved first and the scan is awaited ONLY when the feature is enabled, which is the
         // observable behaviour upstream's closure gives (a disabled feature touches no filesystem).
         // Every other action ignores the field, so the scan is also skipped for them.
@@ -1091,7 +1091,7 @@ impl SubagentTool {
                 }
             }),
         };
-        match crate::discovery::management::handle_management_action(&cfg, action, &req) {
+        match crate::discovery::management::handle_management_action(&cfg, action, &req).await {
             Ok(outcome) if !outcome.is_error => Ok(ToolResult {
                 content: vec![cyrup_core::Content::text(outcome.text)],
                 details: Some(serde_json::json!({ "mode": "management", "results": [] })),

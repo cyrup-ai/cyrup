@@ -38,7 +38,10 @@ impl PatternMatcher {
             .literal_separator(full_path)
             .build()
             .map_err(|e| error::invalid(format!("invalid glob '{pattern}': {e}")))?;
-        Ok(Self { matcher: glob.compile_matcher(), full_path })
+        Ok(Self {
+            matcher: glob.compile_matcher(),
+            full_path,
+        })
     }
 
     /// Test a candidate. In full-path mode `path_posix` must be the **ABSOLUTE** candidate path in
@@ -146,7 +149,11 @@ impl RgGlob {
             .allow_unclosed_class(false)
             .build()
             .map_err(|e| error::invalid(format!("invalid glob '{pattern}': {e}")))?;
-        Ok(Some(Self { matcher: glob.compile_matcher(), negated, only_dir }))
+        Ok(Some(Self {
+            matcher: glob.compile_matcher(),
+            negated,
+            only_dir,
+        }))
     }
 
     /// Whether a **file** survives this filter. `rel_posix` is the candidate path relative to the
@@ -176,7 +183,10 @@ mod tests {
     use super::{PatternMatcher, RgGlob};
 
     fn keeps(pattern: &str, rel: &str) -> bool {
-        RgGlob::build(pattern).unwrap().expect("glob").keeps_file(rel)
+        RgGlob::build(pattern)
+            .unwrap()
+            .expect("glob")
+            .keeps_file(rel)
     }
 
     /// The defect this type exists to fix: fd's rule prepends `**/` to a path-containing pattern,
@@ -203,7 +213,10 @@ mod tests {
     #[test]
     fn fd_leading_slash_pattern_anchors_at_the_filesystem_root() {
         let m = PatternMatcher::build("/src/*.ts").unwrap();
-        assert!(m.full_path, "a pattern containing `/` enables fd's --full-path mode");
+        assert!(
+            m.full_path,
+            "a pattern containing `/` enables fd's --full-path mode"
+        );
         assert!(m.is_match("/src/a.ts", "a.ts"));
         // Anchored: a `src/` nested anywhere else does NOT match, exactly as fd's absolute
         // full-path comparison behaves.

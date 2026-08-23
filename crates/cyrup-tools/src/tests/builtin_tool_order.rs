@@ -5,11 +5,16 @@
 //! `ext_host.active_tools` → `.tools(active_tools)` on the provider request, and into the
 //! `Available tools` block of the system prompt. Nothing downstream sorts, so this crate is where
 //! the wire order is decided.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
+use crate::ToolsOptions;
 use crate::ops::Backend;
 use crate::registry::{Availability, ToolRegistry};
-use crate::ToolsOptions;
 
 fn names(tools: &[std::sync::Arc<dyn cyrup_core::Tool>]) -> Vec<&str> {
     tools.iter().map(|t| t.name()).collect()
@@ -36,7 +41,11 @@ fn visible_all_matches_pi_create_all_tool_definitions_order() {
         "wire/prompt tool order must match Pi's createAllToolDefinitions literal"
     );
     // `all()` replays the same `order` vector; keep the two in lockstep.
-    assert_eq!(names(&reg.all()), names(&tools), "all() and visible(All) must agree");
+    assert_eq!(
+        names(&reg.all()),
+        names(&tools),
+        "all() and visible(All) must agree"
+    );
 }
 
 /// The public constant is used as the built-in membership set (`Availability::NoBuiltins`) but is

@@ -304,11 +304,17 @@ impl AuthStore {
         F: FnOnce(Option<Credential>) -> Fut,
         Fut: Future<Output = Result<Option<Credential>, AuthError>>,
     {
+        // Kept alongside the file lock, not replaced by it: this mutex keys per PROVIDER while
+        // `FileLock`'s in-process layer keys per FILE, and every provider shares one auth file. So
+        // the file lock is the coarser of the two and subsumes this one's exclusion — but only in
+        // this order. Never invert it: two locks taken in opposite orders by different callers is
+        // the textbook deadlock.
         let provider_lock = self.provider_lock(provider);
         let _held = provider_lock.lock().await;
 
         // Cross-process critical section.
-        let flock = crate::lock::FileLock::acquire(&self.path)
+        let flock = crate::lock::FileLock::acquire(&self.path, None)
+            .await
             .map_err(|e| AuthError::Lock(e.to_string()))?;
 
         let mut map = self.read_file_uncached()?;

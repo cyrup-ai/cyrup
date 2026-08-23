@@ -13,6 +13,7 @@ pub mod constrained_sampling;
 pub mod diagnostics;
 pub mod error;
 pub mod event_stream;
+pub mod keyed_lock;
 pub mod message;
 pub mod tool;
 
@@ -29,6 +30,7 @@ pub use error::CoreError;
 pub use event_stream::{
     finalizing_channel, Finalizing, FinalizingSink, FinalizingStream,
 };
+pub use keyed_lock::{Cancelled, KeyedGuard, KeyedLockMap, KeyedLocks};
 pub use message::{
     AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, StopReason,
     TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, Usage, UNRESOLVED_API,

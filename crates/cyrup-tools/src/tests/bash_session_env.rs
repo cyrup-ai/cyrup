@@ -11,10 +11,10 @@
 //! This binary never mutates the process environment (see `bash_env_scrub.rs` for that half).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use crate::config::{BashOpts, SessionEnvHandle, SessionEnvInfo};
 use crate::ops::{Backend, ProcOps, ShellConfig};
 use crate::tools::BashTool;
+use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -46,9 +46,19 @@ const PROBE: &str = r#"printf '[%s][%s][%s][%s][%s]\n' \
 
 async fn run(opts: BashOpts) -> String {
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(proc(), ShellConfig::detect(), dir.path().to_path_buf(), opts);
+    let bash = BashTool::new(
+        proc(),
+        ShellConfig::detect(),
+        dir.path().to_path_buf(),
+        opts,
+    );
     let r = bash
-        .execute(cid(), serde_json::json!({ "command": PROBE }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "command": PROBE }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     first_text(&r)
@@ -68,7 +78,11 @@ fn seeded_handle() -> SessionEnvHandle {
 #[tokio::test]
 async fn bash_child_sees_the_live_session_metadata() {
     let handle = seeded_handle();
-    let out = run(BashOpts { session_env: Some(handle), ..BashOpts::default() }).await;
+    let out = run(BashOpts {
+        session_env: Some(handle),
+        ..BashOpts::default()
+    })
+    .await;
     assert!(
         out.contains(
             "[sess-abc123][/sessions/sess-abc123.jsonl][anthropic][claude-opus-5][medium]"
@@ -82,20 +96,36 @@ async fn bash_child_sees_the_live_session_metadata() {
 #[tokio::test]
 async fn switching_model_affects_the_next_command() {
     let handle = seeded_handle();
-    let opts = BashOpts { session_env: Some(handle.clone()), ..BashOpts::default() };
+    let opts = BashOpts {
+        session_env: Some(handle.clone()),
+        ..BashOpts::default()
+    };
 
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(proc(), ShellConfig::detect(), dir.path().to_path_buf(), opts);
+    let bash = BashTool::new(
+        proc(),
+        ShellConfig::detect(),
+        dir.path().to_path_buf(),
+        opts,
+    );
     let call = async |bash: &BashTool| {
         let r = bash
-            .execute(cid(), serde_json::json!({ "command": PROBE }), CancelToken::new(), noop_sink())
+            .execute(
+                cid(),
+                serde_json::json!({ "command": PROBE }),
+                CancelToken::new(),
+                noop_sink(),
+            )
             .await
             .unwrap();
         first_text(&r)
     };
 
     let before = call(&bash).await;
-    assert!(before.contains("[anthropic][claude-opus-5][medium]"), "got: {before}");
+    assert!(
+        before.contains("[anthropic][claude-opus-5][medium]"),
+        "got: {before}"
+    );
 
     handle.set_model("openai", "gpt-9");
     handle.set_reasoning_level("high");
@@ -119,8 +149,15 @@ async fn an_ephemeral_session_publishes_no_session_file() {
         model: Some("claude-opus-5".to_string()),
         reasoning_level: Some("off".to_string()),
     });
-    let out = run(BashOpts { session_env: Some(handle), ..BashOpts::default() }).await;
-    assert!(out.contains("[sess-ephemeral][][anthropic][claude-opus-5][off]"), "got: {out}");
+    let out = run(BashOpts {
+        session_env: Some(handle),
+        ..BashOpts::default()
+    })
+    .await;
+    assert!(
+        out.contains("[sess-ephemeral][][anthropic][claude-opus-5][off]"),
+        "got: {out}"
+    );
 }
 
 /// `exposeSessionEnvironment: false` suppresses the injection entirely (bash.ts:171).
@@ -145,7 +182,12 @@ async fn the_exposure_flag_suppresses_the_injection() {
 #[test]
 fn the_prompt_guideline_tracks_the_exposure_flag() {
     let cwd = std::env::temp_dir();
-    let on = BashTool::new(proc(), ShellConfig::detect(), cwd.clone(), BashOpts::default());
+    let on = BashTool::new(
+        proc(),
+        ShellConfig::detect(),
+        cwd.clone(),
+        BashOpts::default(),
+    );
     assert_eq!(
         on.prompt_guidelines(),
         &["You can inspect CYRUP_* environment variables for current model and session details."],
@@ -155,7 +197,10 @@ fn the_prompt_guideline_tracks_the_exposure_flag() {
         proc(),
         ShellConfig::detect(),
         cwd,
-        BashOpts { expose_session_environment: false, ..BashOpts::default() },
+        BashOpts {
+            expose_session_environment: false,
+            ..BashOpts::default()
+        },
     );
     assert!(off.prompt_guidelines().is_empty());
 }
@@ -175,9 +220,16 @@ fn the_prompt_guideline_tracks_the_exposure_flag() {
 /// re-hardened only the prefix, so both directions are checked.
 #[test]
 fn the_guideline_uses_pi_v0_84_1_softened_phrasing() {
-    let on =
-        BashTool::new(proc(), ShellConfig::detect(), std::env::temp_dir(), BashOpts::default());
-    let guideline = *on.prompt_guidelines().first().expect("guideline present by default");
+    let on = BashTool::new(
+        proc(),
+        ShellConfig::detect(),
+        std::env::temp_dir(),
+        BashOpts::default(),
+    );
+    let guideline = *on
+        .prompt_guidelines()
+        .first()
+        .expect("guideline present by default");
 
     assert!(
         guideline.starts_with("You can inspect "),
@@ -225,7 +277,11 @@ async fn bash_child_sees_the_agent_identity_markers() {
         )
         .await
         .unwrap();
-    assert!(first_text(&r).contains("[true][cyrup]"), "got: {}", first_text(&r));
+    assert!(
+        first_text(&r).contains("[true][cyrup]"),
+        "got: {}",
+        first_text(&r)
+    );
 }
 
 /// The markers are NOT gated by `exposeSessionEnvironment`: that flag is pi's
@@ -255,7 +311,11 @@ async fn identity_markers_survive_expose_session_environment_off() {
         )
         .await
         .unwrap();
-    assert!(first_text(&r).contains("[true][cyrup][]"), "got: {}", first_text(&r));
+    assert!(
+        first_text(&r).contains("[true][cyrup][]"),
+        "got: {}",
+        first_text(&r)
+    );
 }
 
 /// CFG-069 — `AI_AGENT` is a FORWARD-PORT: the key does not exist at the ported tag at all
@@ -288,10 +348,14 @@ fn cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag() {
     );
 
     let push = r#"env.push(("AI_AGENT".to_string(), "cyrup".to_string()));"#;
-    let at = src.find(push).expect("`AI_AGENT` is pushed into the bash tool's child env");
+    let at = src
+        .find(push)
+        .expect("`AI_AGENT` is pushed into the bash tool's child env");
     // The annotation is the comment block immediately above the push.
     let annotation = &src[..at];
-    let annotation = &annotation[annotation.rfind("[CYRUP-DELTA").expect("a delta annotation")..];
+    let annotation = &annotation[annotation
+        .rfind("[CYRUP-DELTA")
+        .expect("a delta annotation")..];
 
     assert!(
         annotation.contains("@v0.84.1"),

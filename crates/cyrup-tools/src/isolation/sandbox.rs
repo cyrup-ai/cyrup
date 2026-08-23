@@ -112,7 +112,10 @@ mod tests {
 
     #[test]
     fn build_is_unsupported() {
-        assert!(matches!(build(&SandboxPolicy::default()), Err(SandboxError::Unsupported)));
+        assert!(matches!(
+            build(&SandboxPolicy::default()),
+            Err(SandboxError::Unsupported)
+        ));
     }
 
     #[test]

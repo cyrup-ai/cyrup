@@ -28,8 +28,13 @@ pub struct BashSpawnContext {
 /// The five session-metadata variables `bash` exposes to its child, WITHOUT the vendor prefix
 /// (Pi `PI_SESSION_ID` / `PI_SESSION_FILE` / `PI_PROVIDER` / `PI_MODEL` / `PI_REASONING_LEVEL`,
 /// bash.ts:165-181, documented at docs/environment-variables.md:19-27).
-pub const SESSION_ENV_SUFFIXES: [&str; 5] =
-    ["SESSION_ID", "SESSION_FILE", "PROVIDER", "MODEL", "REASONING_LEVEL"];
+pub const SESSION_ENV_SUFFIXES: [&str; 5] = [
+    "SESSION_ID",
+    "SESSION_FILE",
+    "PROVIDER",
+    "MODEL",
+    "REASONING_LEVEL",
+];
 
 /// Every fully-qualified key `bash` scrubs from the child environment before repopulating it.
 ///
@@ -98,7 +103,10 @@ impl SessionEnvHandle {
 
     /// Push the effective reasoning level (Pi's `ctx.thinkingLevel`).
     pub fn set_reasoning_level(&self, level: impl Into<String>) {
-        self.0.write().unwrap_or_else(|e| e.into_inner()).reasoning_level = Some(level.into());
+        self.0
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .reasoning_level = Some(level.into());
     }
 }
 
@@ -121,7 +129,9 @@ pub struct ModelVisionHandle(Arc<std::sync::atomic::AtomicBool>);
 
 impl ModelVisionHandle {
     pub fn new(supports_images: bool) -> Self {
-        Self(Arc::new(std::sync::atomic::AtomicBool::new(supports_images)))
+        Self(Arc::new(std::sync::atomic::AtomicBool::new(
+            supports_images,
+        )))
     }
 
     /// Read the capability of the currently-selected model.
@@ -133,7 +143,8 @@ impl ModelVisionHandle {
 
     /// Push the capability of a newly-selected model (Pi's `ctx.model` changing under the tool).
     pub fn set(&self, supports_images: bool) {
-        self.0.store(supports_images, std::sync::atomic::Ordering::Relaxed);
+        self.0
+            .store(supports_images, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -167,7 +178,9 @@ impl ReadOpts {
     /// Resolve image support the way Pi does — from the model active AT CALL TIME (read.ts:246),
     /// not from whatever was selected when the tool was constructed.
     pub fn supports_images_now(&self) -> bool {
-        self.model_vision.as_ref().map_or(self.supports_images, ModelVisionHandle::get)
+        self.model_vision
+            .as_ref()
+            .map_or(self.supports_images, ModelVisionHandle::get)
     }
 }
 
@@ -243,8 +256,14 @@ impl std::fmt::Debug for BashOpts {
             .field("shell_path", &self.shell_path)
             .field("bin_dir", &self.bin_dir)
             .field("spawn_hook", &self.spawn_hook.as_ref().map(|_| "<hook>"))
-            .field("expose_session_environment", &self.expose_session_environment)
-            .field("session_env", &self.session_env.as_ref().map(SessionEnvHandle::get))
+            .field(
+                "expose_session_environment",
+                &self.expose_session_environment,
+            )
+            .field(
+                "session_env",
+                &self.session_env.as_ref().map(SessionEnvHandle::get),
+            )
             .finish()
     }
 }
@@ -257,7 +276,10 @@ pub struct GrepOpts {
 
 impl Default for GrepOpts {
     fn default() -> Self {
-        Self { limit: GREP_MAX_MATCHES, max_bytes: DEFAULT_MAX_BYTES }
+        Self {
+            limit: GREP_MAX_MATCHES,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
     }
 }
 
@@ -269,7 +291,10 @@ pub struct FindOpts {
 
 impl Default for FindOpts {
     fn default() -> Self {
-        Self { limit: FIND_MAX_RESULTS, max_bytes: DEFAULT_MAX_BYTES }
+        Self {
+            limit: FIND_MAX_RESULTS,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
     }
 }
 
@@ -281,7 +306,10 @@ pub struct LsOpts {
 
 impl Default for LsOpts {
     fn default() -> Self {
-        Self { limit: LS_MAX_ENTRIES, max_bytes: DEFAULT_MAX_BYTES }
+        Self {
+            limit: LS_MAX_ENTRIES,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
     }
 }
 

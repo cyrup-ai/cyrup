@@ -22,7 +22,10 @@
 //! a different thing: nothing was persisted, and the in-memory snapshot would otherwise be re-stamped
 //! to a state the file does not hold. Those surface as [`ProviderError::ModelSource`] so the caller
 //! decides what a lost catalog write is worth. A silent `Ok(())` is no longer how this store says it
-//! failed.
+//! failed. A cancellation is neither: an operation whose `signal` fired — before the lock, or while
+//! the acquire was queued behind another task — surfaces as [`ProviderError::Aborted`], the same
+//! identity `throw_if_aborted` gives it, so a caller can tell "the user stopped this" from "the
+//! store broke".
 
 use std::path::{Path, PathBuf};
 
@@ -190,9 +193,24 @@ fn file_revision(path: &Path) -> Option<String> {
     }
 }
 
-/// A `models-store.json` persistence failure. func-01 R-01-017 code `model_source`.
+/// A `models-store.json` persistence failure (func-01 R-01-017 code `model_source`) — except for a
+/// cancellation, which keeps the abort vocabulary.
+///
+/// `FileLock::acquire` returns `ConfigError::Cancelled` for exactly one reason: the `signal` this
+/// operation was handed fired while the acquire was waiting — whether that was layer 1
+/// (in `lock.rs`, over the single `Err` arm of `KeyedLocks::guard`) or its layer-2 retry loop.
+/// That is the SAME event `throw_if_aborted` reports a few lines above
+/// each acquire, so it must not change identity based on *when* it landed. Only
+/// [`ProviderError::Aborted`] carries code `aborted` and satisfies `ProviderError::is_aborted`,
+/// which selects `StopReason::Aborted` over `StopReason::Error` in `into_error_message`
+/// (`cyrup-provider/src/error.rs:180-186`) and sets the `aborted` flag on the wire event
+/// (`api/pi_messages.rs:528`). A lock that genuinely could not be taken is a different variant —
+/// `ConfigError::Lock` or `ConfigError::Io` — and still lands on [`ProviderError::ModelSource`].
 fn store_err(e: crate::error::ConfigError) -> ProviderError {
-    ProviderError::ModelSource(Box::new(e))
+    match e {
+        crate::error::ConfigError::Cancelled => ProviderError::Aborted,
+        other => ProviderError::ModelSource(Box::new(other)),
+    }
 }
 
 impl FileModelsStore {
@@ -231,7 +249,10 @@ impl FileModelsStore {
 
     /// `readLatest` (models-store.ts:81-108 @v0.84.1): answer from the snapshot when the file's
     /// revision is unchanged, otherwise reload under the cross-process lock and re-stamp it.
-    fn read_latest(&self) -> Result<OrderedObject, crate::error::ConfigError> {
+    async fn read_latest(
+        &self,
+        options: Option<&ModelsStoreOperationOptions>,
+    ) -> Result<OrderedObject, crate::error::ConfigError> {
         let revision = file_revision(&self.path);
         if revision.is_some()
             && let Ok(state) = self.read_state.read()
@@ -242,7 +263,9 @@ impl FileModelsStore {
         // The lock is advisory and cross-process: a concurrent `cyrup update --models` in another
         // terminal must not be observed mid-rename. A lock we could not take is not a degraded
         // read — it is an unserialized one, so it reaches the caller rather than being `.ok()`-ed.
-        let _guard = crate::lock::FileLock::acquire(&self.path)?;
+        let _guard =
+            crate::lock::FileLock::acquire(&self.path, options.and_then(|o| o.signal.as_ref()))
+                .await?;
         let data = self.read_all();
         self.update_read_state(&data, file_revision(&self.path));
         Ok(data)
@@ -279,7 +302,7 @@ impl ModelsStore for FileModelsStore {
         // CFG-042 residual. Pi checks the signal TWICE on this path, and both are ported:
         // once at the head of `readLatest` (`models-store.ts:85` @v0.84.1) …
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
-        let latest = self.read_latest().map_err(store_err)?;
+        let latest = self.read_latest(options).await.map_err(store_err)?;
         // … and once after it returns, before the entry is handed back (`:121`). Upstream's second
         // check catches an abort raised while the shared reload was in flight; here `read_latest`
         // is synchronous, so it catches an abort raised while this task was descheduled across the
@@ -303,7 +326,10 @@ impl ModelsStore for FileModelsStore {
         // this crate's `FileLock` an abort after acquisition would additionally block every other
         // process for the duration of a write nobody wants.
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
-        let _guard = crate::lock::FileLock::acquire(&self.path).map_err(store_err)?;
+        let _guard =
+            crate::lock::FileLock::acquire(&self.path, options.and_then(|o| o.signal.as_ref()))
+                .await
+                .map_err(store_err)?;
         let mut all = self.read_all();
         // Serializing `entry` cannot fail today (every field bottoms out in a plain derive over
         // String-keyed maps, and serde_json maps a non-finite f64 to `Value::Null` rather than
@@ -327,7 +353,10 @@ impl ModelsStore for FileModelsStore {
     ) -> Result<(), ProviderError> {
         // `models-store.ts:143` — same placement as `write`, before the lock.
         ModelsStoreOperationOptions::throw_if_aborted(options)?;
-        let _guard = crate::lock::FileLock::acquire(&self.path).map_err(store_err)?;
+        let _guard =
+            crate::lock::FileLock::acquire(&self.path, options.and_then(|o| o.signal.as_ref()))
+                .await
+                .map_err(store_err)?;
         let mut all = self.read_all();
         if all.remove(provider_id) {
             self.write_all(&all).map_err(store_err)?;

@@ -38,9 +38,19 @@ fn first_text(r: &ToolResult) -> String {
 
 async fn run(opts: BashOpts, command: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(proc(), ShellConfig::detect(), dir.path().to_path_buf(), opts);
+    let bash = BashTool::new(
+        proc(),
+        ShellConfig::detect(),
+        dir.path().to_path_buf(),
+        opts,
+    );
     let r = bash
-        .execute(cid(), serde_json::json!({ "command": command }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "command": command }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     first_text(&r)
@@ -79,11 +89,17 @@ done"#;
     // No session metadata is available at all (the default `BashOpts`): the child must still see
     // none of the stale values.
     let out = run(BashOpts::default(), probe).await;
-    assert!(!out.contains("stale-"), "a stale value reached the child:\n{out}");
+    assert!(
+        !out.contains("stale-"),
+        "a stale value reached the child:\n{out}"
+    );
 
     // And with the exposure flag explicitly OFF — pi deletes before it even consults the flag.
     let out = run(
-        BashOpts { expose_session_environment: false, ..BashOpts::default() },
+        BashOpts {
+            expose_session_environment: false,
+            ..BashOpts::default()
+        },
         probe,
     )
     .await;
@@ -97,13 +113,26 @@ done"#;
 
     // Without a hook the child inherits it (this is the baseline the redaction must beat).
     let out = run(BashOpts::default(), probe).await;
-    assert!(out.contains("[leaked]"), "fixture: the child should inherit it, got:\n{out}");
+    assert!(
+        out.contains("[leaked]"),
+        "fixture: the child should inherit it, got:\n{out}"
+    );
 
     let hook: cyrup_tools::config::BashSpawnHook =
         Arc::new(|mut ctx: cyrup_tools::config::BashSpawnContext| {
             ctx.env_remove.push("CYRUP_TOOL008_SECRET".to_string());
             ctx
         });
-    let out = run(BashOpts { spawn_hook: Some(hook), ..BashOpts::default() }, probe).await;
-    assert!(out.contains("[ABSENT]"), "the hook's removal was ignored, got:\n{out}");
+    let out = run(
+        BashOpts {
+            spawn_hook: Some(hook),
+            ..BashOpts::default()
+        },
+        probe,
+    )
+    .await;
+    assert!(
+        out.contains("[ABSENT]"),
+        "the hook's removal was ignored, got:\n{out}"
+    );
 }

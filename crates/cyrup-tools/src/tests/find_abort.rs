@@ -22,16 +22,23 @@
 //!
 //! The sibling `grep.rs` already carried the loop-top guard (grep.rs, `if cancel.is_cancelled()`);
 //! `find.rs` had neither that nor `biased;`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use crate::config::FindOpts;
 use crate::ops::local::LocalFs;
 use crate::ops::{Access, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
 use crate::tools::FindTool;
-use cyrup_core::{CancelToken, EventStream, Tool, ToolCallId, ToolError, ToolUpdate, ToolUpdateSink};
+use cyrup_core::{
+    CancelToken, EventStream, Tool, ToolCallId, ToolError, ToolUpdate, ToolUpdateSink,
+};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn cid() -> ToolCallId {
     ToolCallId::from("tc-find-abort")
@@ -120,7 +127,12 @@ async fn a_precancelled_find_touches_the_filesystem_zero_times() {
 
     let find = FindTool::new(fs, dir.path().to_path_buf(), FindOpts::default());
     let err = find
-        .execute(cid(), serde_json::json!({ "pattern": "*.txt" }), cancel, noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.txt" }),
+            cancel,
+            noop_sink(),
+        )
         .await
         .expect_err("an already-aborted find must reject, not search");
 
@@ -132,7 +144,11 @@ async fn a_precancelled_find_touches_the_filesystem_zero_times() {
         "pi checks `signal?.aborted` before `ops.exists` and before the git-repo probe \
          (find.ts:142-145); cyrup ran both first"
     );
-    assert_eq!(pulled.load(Ordering::SeqCst), 0, "no walk entry may be pulled after an abort");
+    assert_eq!(
+        pulled.load(Ordering::SeqCst),
+        0,
+        "no walk entry may be pulled after an abort"
+    );
 }
 
 /// An abort landing MID-walk must stop the walk on the very next iteration, deterministically.
@@ -161,7 +177,12 @@ async fn an_abort_mid_walk_stops_the_walk_on_the_next_iteration() {
 
         let find = FindTool::new(fs, dir.path().to_path_buf(), FindOpts::default());
         let err = find
-            .execute(cid(), serde_json::json!({ "pattern": "*.txt" }), cancel, noop_sink())
+            .execute(
+                cid(),
+                serde_json::json!({ "pattern": "*.txt" }),
+                cancel,
+                noop_sink(),
+            )
             .await
             .expect_err("a find aborted mid-walk must reject");
 

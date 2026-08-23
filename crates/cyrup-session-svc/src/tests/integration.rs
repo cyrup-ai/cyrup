@@ -677,29 +677,29 @@ async fn trust_settings_and_session_list_seams() {
     let options = session.project_trust_options();
     assert!(options.iter().any(|o| o.label == "Trust" && o.trusted));
     assert!(options.iter().any(|o| o.label == "Do not trust" && !o.trusted));
-    assert_eq!(session.saved_trust_decision(), None, "no decision persisted yet");
+    assert_eq!(session.saved_trust_decision().await, None, "no decision persisted yet");
 
     // Persist the "Trust" option's store updates → writes agent_dir/trust.json.
     let trust_opt = options.iter().find(|o| o.label == "Trust").expect("trust option");
-    session.write_project_trust(&trust_opt.updates).expect("write trust");
+    session.write_project_trust(&trust_opt.updates).await.expect("write trust");
     assert!(session.trust_store_path().exists(), "trust.json written");
-    let saved = session.saved_trust_decision().expect("decision now persisted");
+    let saved = session.saved_trust_decision().await.expect("decision now persisted");
     assert!(saved.decision.is_trusted(), "persisted decision is trusted");
 
     // Round-trip an explicit untrusted decision.
     session
         .write_project_trust(&[(fx.cwd.clone(), Some(TrustDecision::Untrusted))])
-        .expect("write untrusted");
-    assert!(!session.saved_trust_decision().expect("decision").decision.is_trusted());
+        .await.expect("write untrusted");
+    assert!(!session.saved_trust_decision().await.expect("decision").decision.is_trusted());
 
     // ---- /settings: persist via the `&self` write seam (the default builder store is in-memory,
     // so this verifies the seam round-trips without error, including the project trust gate). ----
     session
         .persist_setting(SettingsScope::Global, "terminal.showImages", serde_json::json!(false))
-        .expect("persist global setting");
+        .await.expect("persist global setting");
     session
         .persist_setting(SettingsScope::Project, "quietStartup", serde_json::json!(true))
-        .expect("persist project setting (trusted)");
+        .await.expect("persist project setting (trusted)");
 
     // ---- /resume: the session list includes this session (after a turn flushes it to disk) ----
     faux.set_responses(vec![faux_assistant_message(vec![faux_text("hi")], StopReason::Stop)]);

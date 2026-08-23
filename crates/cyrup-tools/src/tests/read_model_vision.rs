@@ -13,11 +13,11 @@
 //! was never derived from any model and made the note dead code in every real session.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use crate::config::{ModelVisionHandle, ReadOpts};
-use crate::ops::local::LocalFs;
 use crate::ops::FsOps;
+use crate::ops::local::LocalFs;
 use crate::tools::ReadTool;
+use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use std::sync::Arc;
 
 const NON_VISION_NOTE: &str =
@@ -73,7 +73,12 @@ async fn read_non_vision_note_follows_live_model_switch() {
     );
 
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "pic.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "pic.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
@@ -86,7 +91,12 @@ async fn read_non_vision_note_follows_live_model_switch() {
     vision.set(false);
 
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "pic.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "pic.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
@@ -99,11 +109,19 @@ async fn read_non_vision_note_follows_live_model_switch() {
     vision.set(true);
 
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "pic.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "pic.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
-    assert!(!text.contains(NON_VISION_NOTE), "switching back must drop the note; got: {text}");
+    assert!(
+        !text.contains(NON_VISION_NOTE),
+        "switching back must drop the note; got: {text}"
+    );
 }
 
 /// With no session layer wired (`model_vision: None`) the static field still decides, matching how
@@ -118,13 +136,25 @@ async fn read_falls_back_to_static_flag_without_a_handle() {
     let read = ReadTool::new(
         fs(),
         cwd,
-        ReadOpts { supports_images: false, model_vision: None, ..ReadOpts::default() },
+        ReadOpts {
+            supports_images: false,
+            model_vision: None,
+            ..ReadOpts::default()
+        },
     );
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "pic.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "pic.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert!(first_text(&r).contains(NON_VISION_NOTE));
 
-    assert!(ReadOpts::default().supports_images_now(), "default stays vision-capable");
+    assert!(
+        ReadOpts::default().supports_images_now(),
+        "default stays vision-capable"
+    );
 }

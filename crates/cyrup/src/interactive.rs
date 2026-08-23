@@ -191,11 +191,13 @@ pub async fn run_interactive(
     // Pi persists a HIGH-confidence detection back to `settings.theme` so the next boot skips the
     // query entirely (`theme-controller.ts:57-61`). A low-confidence fallback is never written.
     if let Some(name) = controller.theme_to_persist() {
-        let _ = session.persist_setting(
-            cyrup_session_svc::SettingsScope::Global,
-            "theme",
-            serde_json::Value::String(name.to_string()),
-        );
+        let _ = session
+            .persist_setting(
+                cyrup_session_svc::SettingsScope::Global,
+                "theme",
+                serde_json::Value::String(name.to_string()),
+            )
+            .await;
     }
     app.detect_image_support();
     seed_footer(&mut app, &runtime, &session).await;

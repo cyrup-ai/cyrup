@@ -7,19 +7,19 @@
     clippy::panic
 )]
 
-use cyrup_core::{
-    CancelToken, Content, ExecMode, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate,
-    ToolUpdateSink,
-};
 use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts};
 use crate::ops::local::LocalFs;
 use crate::ops::{Backend, ExecSpec, ExitStatus, FsOps, ProcOps, ShellConfig};
 use crate::registry::{Availability, ToolRegistry};
 use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
 use crate::{FileMutationLocks, ToolsOptions};
+use cyrup_core::{
+    CancelToken, Content, ExecMode, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate,
+    ToolUpdateSink,
+};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn fs() -> Arc<dyn FsOps> {
     Arc::new(LocalFs)
@@ -52,7 +52,10 @@ fn first_text(r: &ToolResult) -> String {
 async fn read_window_and_truncation_and_oversized() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    let big = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    let big = (1..=10)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     std::fs::write(cwd.join("f.txt"), &big).unwrap();
 
     // Window: offset=2 limit=3 -> lines 2,3,4.
@@ -73,10 +76,18 @@ async fn read_window_and_truncation_and_oversized() {
     let read_small = ReadTool::new(
         fs(),
         cwd.clone(),
-        ReadOpts { max_lines: 3, ..ReadOpts::default() },
+        ReadOpts {
+            max_lines: 3,
+            ..ReadOpts::default()
+        },
     );
     let r = read_small
-        .execute(cid(), serde_json::json!({ "path": "f.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
@@ -86,16 +97,33 @@ async fn read_window_and_truncation_and_oversized() {
     // Oversized single line -> Pi resolves SUCCESSFULLY with a bash-fallback content note
     // (read.ts:290-294,315), not an error. Details carry the truncation.
     std::fs::write(cwd.join("long.txt"), "x".repeat(200)).unwrap();
-    let read_tiny =
-        ReadTool::new(fs(), cwd.clone(), ReadOpts { max_bytes: 50, ..ReadOpts::default() });
+    let read_tiny = ReadTool::new(
+        fs(),
+        cwd.clone(),
+        ReadOpts {
+            max_bytes: 50,
+            ..ReadOpts::default()
+        },
+    );
     let r = read_tiny
-        .execute(cid(), serde_json::json!({ "path": "long.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "long.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let msg = first_text(&r);
-    assert!(msg.contains("exceeds") && msg.contains("bash"), "got: {msg}");
+    assert!(
+        msg.contains("exceeds") && msg.contains("bash"),
+        "got: {msg}"
+    );
     assert!(msg.contains("50.0KB") || msg.contains("50B"), "got: {msg}");
-    assert!(r.details.is_some(), "first-line-exceeds must attach truncation details");
+    assert!(
+        r.details.is_some(),
+        "first-line-exceeds must attach truncation details"
+    );
 }
 
 // A non-truncated read returns the file content VERBATIM, preserving the trailing newline — Pi's
@@ -108,11 +136,19 @@ async fn read_preserves_trailing_newline_verbatim() {
     std::fs::write(cwd.join("nl.txt"), "hello\nworld\n").unwrap();
     let read = ReadTool::new(fs(), cwd, ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "nl.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "nl.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
-    assert_eq!(text, "hello\nworld\n", "trailing newline must be preserved verbatim");
+    assert_eq!(
+        text, "hello\nworld\n",
+        "trailing newline must be preserved verbatim"
+    );
     assert!(r.details.is_none(), "no truncation -> no details");
 }
 
@@ -121,7 +157,12 @@ async fn read_missing_file_errors() {
     let dir = tempfile::tempdir().unwrap();
     let read = ReadTool::new(fs(), dir.path().to_path_buf(), ReadOpts::default());
     let err = read
-        .execute(cid(), serde_json::json!({ "path": "nope.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "nope.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     // Pi re-rejects Node's raw `fs.access` error (read.ts:241/321-324), so the message carries the
@@ -151,15 +192,25 @@ async fn read_image_non_vision_keeps_block_and_warns() {
     let read = ReadTool::new(
         fs(),
         cwd,
-        ReadOpts { supports_images: false, ..ReadOpts::default() },
+        ReadOpts {
+            supports_images: false,
+            ..ReadOpts::default()
+        },
     );
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "pic.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "pic.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
     assert!(
-        text.contains("Current model does not support images. The image will be omitted from this request."),
+        text.contains(
+            "Current model does not support images. The image will be omitted from this request."
+        ),
         "got: {text}"
     );
     // Verbatim Pi note prefix for the processed (output) mime.
@@ -177,7 +228,12 @@ async fn read_fake_image_extension_is_text() {
     std::fs::write(cwd.join("pic.png"), b"\x89PNG not-really a png\n").unwrap();
     let read = ReadTool::new(fs(), cwd, ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "pic.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "pic.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert!(!r.content.iter().any(|c| matches!(c, Content::Image { .. })));
@@ -194,7 +250,12 @@ async fn read_image_vision_attaches() {
     img.save(cwd.join("p.png")).unwrap();
     let read = ReadTool::new(fs(), cwd, ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "p.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "p.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert!(r.content.iter().any(|c| matches!(c, Content::Image { .. })));
@@ -218,7 +279,12 @@ async fn read_image_without_inline_images_announces_the_delta_instead_of_going_q
     img.save(cwd.join("p.png")).unwrap();
     let read = ReadTool::new(fs(), cwd, ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "p.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "p.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
 
@@ -226,7 +292,10 @@ async fn read_image_without_inline_images_announces_the_delta_instead_of_going_q
     assert!(!r.content.iter().any(|c| matches!(c, Content::Image { .. })));
     let text = first_text(&r);
     // It was still recognised as an image, and the divergence is stated, not hidden.
-    assert!(text.starts_with("Read image file [image/png]"), "got: {text}");
+    assert!(
+        text.starts_with("Read image file [image/png]"),
+        "got: {text}"
+    );
     assert!(
         text.contains("[Image inlining is not enabled in this build (feature `inline-images`).]"),
         "the arm must self-announce or the delta is silent, got: {text}"
@@ -236,7 +305,12 @@ async fn read_image_without_inline_images_announces_the_delta_instead_of_going_q
 // ---------------------------------------------------------------- A-03-3 edit
 
 fn edit_tool(cwd: PathBuf) -> EditTool {
-    EditTool::new(fs(), Arc::new(FileMutationLocks::new()), cwd, Default::default())
+    EditTool::new(
+        fs(),
+        Arc::new(FileMutationLocks::new()),
+        cwd,
+        Default::default(),
+    )
 }
 
 #[tokio::test]
@@ -264,11 +338,18 @@ async fn edit_unique_crlf_bom_diff() {
 
     let after = std::fs::read(cwd.join("f.txt")).unwrap();
     let after = String::from_utf8(after).unwrap();
-    assert_eq!(after, "\u{feff}one\r\nTWO\r\nthree\r\n", "CRLF+BOM preserved");
+    assert_eq!(
+        after, "\u{feff}one\r\nTWO\r\nthree\r\n",
+        "CRLF+BOM preserved"
+    );
 
     let details = r.details.unwrap();
     // Pi line-numbered display diff (`+NN TWO`).
-    assert!(details["diff"].as_str().unwrap().contains("+2 TWO"), "diff: {}", details["diff"]);
+    assert!(
+        details["diff"].as_str().unwrap().contains("+2 TWO"),
+        "diff: {}",
+        details["diff"]
+    );
     assert!(details["patch"].as_str().unwrap().contains("@@"));
     assert_eq!(details["firstChangedLine"], 2);
 }
@@ -290,7 +371,8 @@ async fn edit_non_unique_errors() {
         .unwrap_err();
     // Pi duplicate-match wording (edit-diff.ts:268-277).
     assert!(
-        err.to_string().contains("Found 2 occurrences") && err.to_string().contains("must be unique"),
+        err.to_string().contains("Found 2 occurrences")
+            && err.to_string().contains("must be unique"),
         "got: {}",
         err
     );
@@ -313,7 +395,10 @@ async fn edit_legacy_single_and_stringified_shims() {
     )
     .await
     .unwrap();
-    assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "ALPHA\n");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+        "ALPHA\n"
+    );
 
     // edits sent as a JSON string
     edit.execute(
@@ -324,7 +409,10 @@ async fn edit_legacy_single_and_stringified_shims() {
     )
     .await
     .unwrap();
-    assert_eq!(std::fs::read_to_string(cwd.join("b.txt")).unwrap(), "BETA\n");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("b.txt")).unwrap(),
+        "BETA\n"
+    );
 }
 
 /// Replay of the agent preflight for one tool call, in Pi's order: `prepareArguments` then schema
@@ -332,14 +420,13 @@ async fn edit_legacy_single_and_stringified_shims() {
 /// agent-loop.ts:596-598,617-618; cyrup: `cyrup-agent/src/agent.rs` `prepare_arguments` →
 /// `validate_tool_call`). A validation failure short-circuits to an isError tool result and the
 /// tool never runs, which is what this returns as `Err`.
-async fn preflight_execute(
-    tool: &dyn Tool,
-    raw: serde_json::Value,
-) -> Result<ToolResult, String> {
+async fn preflight_execute(tool: &dyn Tool, raw: serde_json::Value) -> Result<ToolResult, String> {
     let prepared = tool.prepare_arguments(raw).await;
     let args = cyrup_provider::validate_tool_call(tool.parameters(), prepared)
         .map_err(|e| e.to_string())?;
-    tool.execute(cid(), args, CancelToken::new(), noop_sink()).await.map_err(|e| e.to_string())
+    tool.execute(cid(), args, CancelToken::new(), noop_sink())
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// TOOL-002 — the legacy-argument shim must run BEFORE schema validation, or `{path, oldText,
@@ -362,9 +449,18 @@ async fn edit_legacy_shim_survives_the_preflight_schema_gate() {
     );
 
     // Through the preflight the shim normalizes first, so the call succeeds and the file changes.
-    let r = preflight_execute(&edit, legacy).await.expect("legacy {oldText,newText} must edit");
-    assert!(first_text(&r).contains("replaced 1 block"), "got: {}", first_text(&r));
-    assert_eq!(std::fs::read_to_string(cwd.join("a.txt")).unwrap(), "ALPHA\n");
+    let r = preflight_execute(&edit, legacy)
+        .await
+        .expect("legacy {oldText,newText} must edit");
+    assert!(
+        first_text(&r).contains("replaced 1 block"),
+        "got: {}",
+        first_text(&r)
+    );
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
+        "ALPHA\n"
+    );
 
     // Same for `edits` sent as a JSON string (Pi: "Some models (Opus 4.6, GLM-5.1) send edits as a
     // JSON string instead of an array", edit.ts:100).
@@ -376,8 +472,13 @@ async fn edit_legacy_shim_survives_the_preflight_schema_gate() {
         cyrup_provider::validate_tool_call(edit.parameters(), stringified.clone()).is_err(),
         "edit's schema is expected to reject a stringified `edits` pre-normalization"
     );
-    preflight_execute(&edit, stringified).await.expect("stringified `edits` must edit");
-    assert_eq!(std::fs::read_to_string(cwd.join("b.txt")).unwrap(), "BETA\n");
+    preflight_execute(&edit, stringified)
+        .await
+        .expect("stringified `edits` must edit");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("b.txt")).unwrap(),
+        "BETA\n"
+    );
 
     // The normal shape is unaffected by the shim.
     std::fs::write(cwd.join("c.txt"), "gamma\n").unwrap();
@@ -390,7 +491,10 @@ async fn edit_legacy_shim_survives_the_preflight_schema_gate() {
     )
     .await
     .expect("canonical shape must still edit");
-    assert_eq!(std::fs::read_to_string(cwd.join("c.txt")).unwrap(), "GAMMA\n");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("c.txt")).unwrap(),
+        "GAMMA\n"
+    );
 }
 
 // ---------------------------------------------------------------- A-03-4 write
@@ -422,7 +526,8 @@ impl FsOps for MutexProbeFs {
         // Give a would-be second entrant every chance to arrive and be counted.
         for _ in 0..50 {
             if self.live.load(Ordering::SeqCst) > 1 {
-                self.max_live.fetch_max(self.live.load(Ordering::SeqCst), Ordering::SeqCst);
+                self.max_live
+                    .fetch_max(self.live.load(Ordering::SeqCst), Ordering::SeqCst);
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(2)).await;
@@ -470,7 +575,10 @@ async fn write_creates_dirs_and_holds_one_mutator_per_path() {
         .await
         .unwrap();
     assert!(first_text(&r).contains("Successfully wrote 5 bytes"));
-    assert_eq!(std::fs::read_to_string(cwd.join("nested/deep/f.txt")).unwrap(), "hello");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("nested/deep/f.txt")).unwrap(),
+        "hello"
+    );
 
     // Concurrent writes to the same path: no corruption (final == one full content).
     //
@@ -489,7 +597,12 @@ async fn write_creates_dirs_and_holds_one_mutator_per_path() {
         live: Arc::clone(&live),
         max_live: Arc::clone(&max_live),
     });
-    let w = Arc::new(WriteTool::new(probe, locks, cwd.clone(), Default::default()));
+    let w = Arc::new(WriteTool::new(
+        probe,
+        locks,
+        cwd.clone(),
+        Default::default(),
+    ));
     let a = {
         let w = w.clone();
         tokio::spawn(async move {
@@ -524,7 +637,11 @@ async fn write_creates_dirs_and_holds_one_mutator_per_path() {
         1,
         "two mutators were inside `write_in_place` for the same path at once"
     );
-    assert_eq!(live.load(Ordering::SeqCst), 0, "every entrant left the guarded region");
+    assert_eq!(
+        live.load(Ordering::SeqCst),
+        0,
+        "every entrant left the guarded region"
+    );
     // Weaker second witness, kept: the surviving bytes match exactly one payload. The two payloads
     // have DIFFERENT LENGTHS on purpose — with equal lengths any interleaving still lands on a
     // same-sized file and the check is vacuous. The backend is an in-place `O_TRUNC` write
@@ -630,7 +747,11 @@ async fn bash_truncation_spills_to_temp_file() {
     let dir = tempfile::tempdir().unwrap();
     let bash = bash_tool(
         dir.path().to_path_buf(),
-        BashOpts { max_lines: 5, max_bytes: 100, ..Default::default() },
+        BashOpts {
+            max_lines: 5,
+            max_bytes: 100,
+            ..Default::default()
+        },
     );
     let r = bash
         .execute(
@@ -643,7 +764,9 @@ async fn bash_truncation_spills_to_temp_file() {
         .unwrap();
     assert!(first_text(&r).contains("Full output:"));
     let details = r.details.unwrap();
-    let path = details["fullOutputPath"].as_str().expect("full output path");
+    let path = details["fullOutputPath"]
+        .as_str()
+        .expect("full output path");
     let full = std::fs::read_to_string(path).unwrap();
     assert!(full.contains("line1\n") && full.contains("line200"));
 }
@@ -677,13 +800,21 @@ async fn grep_gitignore_not_applied_outside_repo() {
 
     let grep = GrepTool::new(fs(), root.to_path_buf(), GrepOpts::default());
     let r = grep
-        .execute(cid(), serde_json::json!({ "pattern": "needle" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "needle" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
     // No `.git` here → gitignore inert → the gitignored `skip.log` IS searched (matches Pi grep).
     assert!(text.contains("keep.txt:1: needle here"), "got: {text}");
-    assert!(text.contains("skip.log:1: needle here"), "gitignore wrongly applied outside repo: {text}");
+    assert!(
+        text.contains("skip.log:1: needle here"),
+        "gitignore wrongly applied outside repo: {text}"
+    );
 }
 
 #[tokio::test]
@@ -693,7 +824,12 @@ async fn grep_format_and_gitignore_and_no_matches() {
     let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
 
     let r = grep
-        .execute(cid(), serde_json::json!({ "pattern": "hello" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "hello" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
@@ -704,7 +840,12 @@ async fn grep_format_and_gitignore_and_no_matches() {
     assert!(!text.contains("b.log"), "gitignore not respected: {text}");
 
     let none = grep
-        .execute(cid(), serde_json::json!({ "pattern": "zzz_nomatch" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "zzz_nomatch" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert_eq!(first_text(&none), "No matches found");
@@ -721,22 +862,46 @@ async fn grep_skips_binary_files() {
 
     let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
     let r = grep
-        .execute(cid(), serde_json::json!({ "pattern": "hello" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "hello" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
-    assert_eq!(first_text(&r), "No matches found", "binary file must contribute no matches");
+    assert_eq!(
+        first_text(&r),
+        "No matches found",
+        "binary file must contribute no matches"
+    );
 
     // A NUL after a match line still suppresses that file, and a plain text file alongside it is
     // unaffected — binary detection must not turn grep into a no-op.
-    std::fs::write(cwd.join("later.bin"), b"hello text line\nmore\n\x00\x01\x02binary\n").unwrap();
+    std::fs::write(
+        cwd.join("later.bin"),
+        b"hello text line\nmore\n\x00\x01\x02binary\n",
+    )
+    .unwrap();
     std::fs::write(cwd.join("plain.txt"), "hello plain\n").unwrap();
     let r = grep
-        .execute(cid(), serde_json::json!({ "pattern": "hello" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "hello" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
-    assert!(text.contains("plain.txt:1: hello plain"), "text file must still match: {text}");
-    assert!(!text.contains('\u{fffd}'), "no lossy-decoded bytes may reach the result: {text}");
+    assert!(
+        text.contains("plain.txt:1: hello plain"),
+        "text file must still match: {text}"
+    );
+    assert!(
+        !text.contains('\u{fffd}'),
+        "no lossy-decoded bytes may reach the result: {text}"
+    );
     assert!(!text.contains("blob.bin"), "got: {text}");
     assert!(!text.contains("later.bin"), "got: {text}");
 }
@@ -758,20 +923,40 @@ async fn grep_and_find_search_hidden_files() {
 
     let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
     let r = grep
-        .execute(cid(), serde_json::json!({ "pattern": "hello-hidden" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "hello-hidden" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
-    assert!(text.contains(".env:1:"), "hidden dotfile must be searched: {text}");
+    assert!(
+        text.contains(".env:1:"),
+        "hidden dotfile must be searched: {text}"
+    );
     // gitignored file is still excluded even though hidden search is on.
-    assert!(!text.contains("ignored.txt"), "gitignore must still apply: {text}");
+    assert!(
+        !text.contains("ignored.txt"),
+        "gitignore must still apply: {text}"
+    );
 
     let find = FindTool::new(fs(), cwd, FindOpts::default());
     let r = find
-        .execute(cid(), serde_json::json!({ "pattern": "*.toml" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.toml" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
-    assert!(first_text(&r).contains(".config/app.toml"), "got: {}", first_text(&r));
+    assert!(
+        first_text(&r).contains(".config/app.toml"),
+        "got: {}",
+        first_text(&r)
+    );
 }
 
 #[tokio::test]
@@ -794,7 +979,10 @@ async fn edit_fuzzy_matches_curly_quote_end_to_end() {
         .await
         .unwrap();
     assert!(first_text(&r).contains("replaced 1 block"));
-    assert_eq!(std::fs::read_to_string(cwd.join("s.rs")).unwrap(), "let s = 'bye';\n");
+    assert_eq!(
+        std::fs::read_to_string(cwd.join("s.rs")).unwrap(),
+        "let s = 'bye';\n"
+    );
 }
 
 #[tokio::test]
@@ -804,7 +992,12 @@ async fn find_format_and_gitignore_and_sentinel() {
     let find = FindTool::new(fs(), cwd.clone(), FindOpts::default());
 
     let r = find
-        .execute(cid(), serde_json::json!({ "pattern": "*.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
@@ -814,17 +1007,31 @@ async fn find_format_and_gitignore_and_sentinel() {
 
     // gitignored log not found
     let none = find
-        .execute(cid(), serde_json::json!({ "pattern": "*.log" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.log" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert_eq!(first_text(&none), "No files found matching pattern");
 
     // directory suffix '/'
     let dirs = find
-        .execute(cid(), serde_json::json!({ "pattern": "sub" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "sub" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
-    assert!(first_text(&dirs).contains("sub/"), "got: {}", first_text(&dirs));
+    assert!(
+        first_text(&dirs).contains("sub/"),
+        "got: {}",
+        first_text(&dirs)
+    );
 }
 
 // G2 — the find git-boundary fix (find.ts:226-240, issue #5960). Inside a git repo, fd's default
@@ -844,15 +1051,26 @@ async fn find_git_boundary_stops_at_nested_repo() {
 
     let find = FindTool::new(fs(), root.to_path_buf(), FindOpts::default());
     let r = find
-        .execute(cid(), serde_json::json!({ "pattern": "*.log" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.log" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
     let lines: Vec<&str> = text.lines().collect();
     // Parent `.gitignore` stops at the nested repo boundary — inner.log surfaces.
-    assert!(lines.contains(&"nested/inner.log"), "nested repo boundary not honored: {text}");
+    assert!(
+        lines.contains(&"nested/inner.log"),
+        "nested repo boundary not honored: {text}"
+    );
     // The outer repo's own file remains gitignored.
-    assert!(!lines.contains(&"outer.log"), "outer .gitignore should apply in its own repo: {text}");
+    assert!(
+        !lines.contains(&"outer.log"),
+        "outer .gitignore should apply in its own repo: {text}"
+    );
 }
 
 // G2 — OUTSIDE any git repo, fd passes `--no-require-git` so `.gitignore` is STILL honored. Cyrup
@@ -868,15 +1086,29 @@ async fn find_gitignore_honored_outside_repo() {
 
     let find = FindTool::new(fs(), root.to_path_buf(), FindOpts::default());
     let logs = find
-        .execute(cid(), serde_json::json!({ "pattern": "*.log" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.log" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert_eq!(first_text(&logs), "No files found matching pattern");
     let txt = find
-        .execute(cid(), serde_json::json!({ "pattern": "*.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
-    assert!(first_text(&txt).lines().any(|l| l == "keep.txt"), "got: {}", first_text(&txt));
+    assert!(
+        first_text(&txt).lines().any(|l| l == "keep.txt"),
+        "got: {}",
+        first_text(&txt)
+    );
 }
 
 // G1 — `timeout` is Pi's `Type.Number` (float SECONDS, bash.ts:42). `timeout:2.5` must deserialize
@@ -898,7 +1130,10 @@ async fn bash_timeout_fractional_seconds() {
         .unwrap_err();
     let elapsed = start.elapsed();
     let msg = err.to_string();
-    assert!(msg.contains("Command timed out after 2.5 seconds"), "got: {msg}");
+    assert!(
+        msg.contains("Command timed out after 2.5 seconds"),
+        "got: {msg}"
+    );
     // TOOL-026: the LOWER bound is the load-bearing half — it proves the 2.5s value was honoured
     // rather than some default. The upper bound only has to stay far below the 30s sleep to prove
     // the timeout fired at all; the old 4s ceiling left ~1.5s for scheduling plus the
@@ -927,7 +1162,10 @@ async fn bash_timeout_zero_is_invalid() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "Invalid timeout: must be a finite number of seconds");
+    assert_eq!(
+        err.to_string(),
+        "Invalid timeout: must be a finite number of seconds"
+    );
 }
 
 // G1 — a negative timeout is likewise rejected with the same error (bash.ts:29 `timeout <= 0`).
@@ -944,7 +1182,10 @@ async fn bash_timeout_negative_is_invalid() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "Invalid timeout: must be a finite number of seconds");
+    assert_eq!(
+        err.to_string(),
+        "Invalid timeout: must be a finite number of seconds"
+    );
 }
 
 // G1 — a timeout whose millisecond form exceeds the 32-bit ceiling is rejected with Pi's exact
@@ -963,7 +1204,10 @@ async fn bash_timeout_over_maximum_is_invalid() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "Invalid timeout: maximum is 2147483.647 seconds");
+    assert_eq!(
+        err.to_string(),
+        "Invalid timeout: maximum is 2147483.647 seconds"
+    );
 }
 
 // G1 — the largest valid timeout (exactly 2147483.647s → 2_147_483_647ms) is accepted. It must NOT
@@ -991,12 +1235,28 @@ async fn find_limit_truncation() {
     for i in 0..10 {
         std::fs::write(cwd.join(format!("f{i}.txt")), "x").unwrap();
     }
-    let find = FindTool::new(fs(), cwd, FindOpts { limit: 2, max_bytes: 50 * 1024 });
+    let find = FindTool::new(
+        fs(),
+        cwd,
+        FindOpts {
+            limit: 2,
+            max_bytes: 50 * 1024,
+        },
+    );
     let r = find
-        .execute(cid(), serde_json::json!({ "pattern": "*.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "pattern": "*.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
-    assert!(first_text(&r).contains("results limit reached"), "got: {}", first_text(&r));
+    assert!(
+        first_text(&r).contains("results limit reached"),
+        "got: {}",
+        first_text(&r)
+    );
     assert_eq!(r.details.unwrap()["resultLimitReached"], 2);
 }
 
@@ -1011,25 +1271,44 @@ async fn ls_sorted_dotfiles_dirs_and_errors() {
     let ls = LsTool::new(fs(), cwd.clone(), LsOpts::default());
 
     let r = ls
-        .execute(cid(), serde_json::json!({}), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({}),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
     let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines, vec![".dot", "a.txt", "B.txt", "zdir/"], "case-insensitive sort + '/'");
+    assert_eq!(
+        lines,
+        vec![".dot", "a.txt", "B.txt", "zdir/"],
+        "case-insensitive sort + '/'"
+    );
 
     // empty dir
     let empty = tempfile::tempdir().unwrap();
     let ls2 = LsTool::new(fs(), empty.path().to_path_buf(), LsOpts::default());
     let r = ls2
-        .execute(cid(), serde_json::json!({}), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({}),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert_eq!(first_text(&r), "(empty directory)");
 
     // not a directory
     let err = ls
-        .execute(cid(), serde_json::json!({ "path": "a.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "a.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("Not a directory"));
@@ -1037,7 +1316,12 @@ async fn ls_sorted_dotfiles_dirs_and_errors() {
     // gap #8 — missing path uses Pi's exact literal `Path not found: ${dirPath}` (ls.ts:129),
     // not the prior `Directory not found:`.
     let err = ls
-        .execute(cid(), serde_json::json!({ "path": "nope" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "nope" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().starts_with("Path not found:"), "got: {err}");
@@ -1181,13 +1465,21 @@ async fn bash_trailing_edge_flush_emits_midstream() {
         BashOpts::default(),
     );
     let r = bash
-        .execute(cid(), serde_json::json!({ "command": "x" }), CancelToken::new(), sink)
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "x" }),
+            CancelToken::new(),
+            sink,
+        )
         .await
         .unwrap();
 
     let recorded = updates.lock().unwrap().clone();
     // Leading edge delivered "a".
-    assert!(recorded.iter().any(|t| t == "a"), "missing leading-edge 'a': {recorded:?}");
+    assert!(
+        recorded.iter().any(|t| t == "a"),
+        "missing leading-edge 'a': {recorded:?}"
+    );
     // The TRAILING-edge timer flushed the coalesced "ab" mid-stream (the regression under test):
     // without it, "ab" never appears — the consumer would jump straight from "a" to "abc".
     assert!(
@@ -1195,7 +1487,11 @@ async fn bash_trailing_edge_flush_emits_midstream() {
         "missing mid-stream trailing flush 'ab': {recorded:?}"
     );
     // Final settled content includes all output.
-    assert!(first_text(&r).contains("abc"), "final result missing 'abc': {}", first_text(&r));
+    assert!(
+        first_text(&r).contains("abc"),
+        "final result missing 'abc': {}",
+        first_text(&r)
+    );
 }
 
 #[tokio::test]
@@ -1207,11 +1503,18 @@ async fn extension_override_and_throwing_tool() {
         ToolsOptions::default(),
     );
     // Override built-in `read`.
-    reg.insert(Arc::new(EchoRead { params: serde_json::json!({ "type": "object" }) }));
+    reg.insert(Arc::new(EchoRead {
+        params: serde_json::json!({ "type": "object" }),
+    }));
     assert_eq!(reg.all().len(), 7, "override does not add a new slot");
     let read = reg.get("read").unwrap();
     let r = read
-        .execute(cid(), serde_json::json!({}), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({}),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert_eq!(first_text(&r), "overridden read");
@@ -1220,7 +1523,12 @@ async fn extension_override_and_throwing_tool() {
     reg.insert(Arc::new(Boom));
     let boom = reg.get("boom").unwrap();
     let err = boom
-        .execute(cid(), serde_json::json!({}), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({}),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     assert!(err.to_string().contains("boom"));
@@ -1265,14 +1573,25 @@ async fn tool_logic_is_backend_agnostic() {
     let cwd = dir.path().to_path_buf();
     std::fs::write(cwd.join("f.txt"), "data\n").unwrap();
     let reads = Arc::new(AtomicUsize::new(0));
-    let counting: Arc<dyn FsOps> = Arc::new(CountingFs { inner: fs(), reads: reads.clone() });
+    let counting: Arc<dyn FsOps> = Arc::new(CountingFs {
+        inner: fs(),
+        reads: reads.clone(),
+    });
     let read = ReadTool::new(counting, cwd, ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "f.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert!(first_text(&r).contains("data"));
-    assert!(reads.load(Ordering::SeqCst) >= 1, "tool routed through the seam");
+    assert!(
+        reads.load(Ordering::SeqCst) >= 1,
+        "tool routed through the seam"
+    );
 }
 
 // ---------------------------------------------------------------- round-2 1:1 additions
@@ -1289,7 +1608,10 @@ async fn bash_spawn_hook_rewrites_command() {
     });
     let bash = bash_tool(
         dir.path().to_path_buf(),
-        BashOpts { spawn_hook: Some(hook), ..Default::default() },
+        BashOpts {
+            spawn_hook: Some(hook),
+            ..Default::default()
+        },
     );
     let r = bash
         .execute(
@@ -1313,7 +1635,10 @@ async fn bash_bin_dir_prepended_to_path() {
     std::fs::create_dir_all(&bin).unwrap();
     let bash = bash_tool(
         dir.path().to_path_buf(),
-        BashOpts { bin_dir: Some(bin.clone()), ..Default::default() },
+        BashOpts {
+            bin_dir: Some(bin.clone()),
+            ..Default::default()
+        },
     );
     let r = bash
         .execute(
@@ -1325,7 +1650,10 @@ async fn bash_bin_dir_prepended_to_path() {
         .await
         .unwrap();
     let text = first_text(&r);
-    assert!(text.starts_with(&bin.to_string_lossy().into_owned()), "PATH was: {text}");
+    assert!(
+        text.starts_with(&bin.to_string_lossy().into_owned()),
+        "PATH was: {text}"
+    );
 }
 
 // gap #4 — an explicit but missing shellPath yields the `Custom shell path not found` error,
@@ -1335,13 +1663,24 @@ async fn bash_missing_shell_path_errors() {
     let dir = tempfile::tempdir().unwrap();
     let bash = bash_tool(
         dir.path().to_path_buf(),
-        BashOpts { shell_path: Some("/no/such/shell".to_string()), ..Default::default() },
+        BashOpts {
+            shell_path: Some("/no/such/shell".to_string()),
+            ..Default::default()
+        },
     );
     let err = bash
-        .execute(cid(), serde_json::json!({ "command": "echo hi" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "echo hi" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("Custom shell path not found"), "got: {err}");
+    assert!(
+        err.to_string().contains("Custom shell path not found"),
+        "got: {err}"
+    );
 }
 
 // Pi always emits its initial empty `onUpdate({content:[],details:undefined})` (bash.ts:355-357)
@@ -1350,7 +1689,8 @@ async fn bash_missing_shell_path_errors() {
 #[tokio::test]
 async fn bash_missing_shell_path_still_emits_initial_empty_update_first() {
     let dir = tempfile::tempdir().unwrap();
-    let updates: Arc<std::sync::Mutex<Vec<ToolUpdate>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let updates: Arc<std::sync::Mutex<Vec<ToolUpdate>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
     let sink: ToolUpdateSink = {
         let updates = updates.clone();
         Box::new(move |u| {
@@ -1359,15 +1699,30 @@ async fn bash_missing_shell_path_still_emits_initial_empty_update_first() {
     };
     let bash = bash_tool(
         dir.path().to_path_buf(),
-        BashOpts { shell_path: Some("/no/such/shell".to_string()), ..Default::default() },
+        BashOpts {
+            shell_path: Some("/no/such/shell".to_string()),
+            ..Default::default()
+        },
     );
     let err = bash
-        .execute(cid(), serde_json::json!({ "command": "echo hi" }), CancelToken::new(), sink)
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "echo hi" }),
+            CancelToken::new(),
+            sink,
+        )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("Custom shell path not found"), "got: {err}");
+    assert!(
+        err.to_string().contains("Custom shell path not found"),
+        "got: {err}"
+    );
     let seen = updates.lock().unwrap();
-    assert_eq!(seen.len(), 1, "expected exactly one (the initial empty) update, got {seen:?}");
+    assert_eq!(
+        seen.len(),
+        1,
+        "expected exactly one (the initial empty) update, got {seen:?}"
+    );
     assert!(seen[0].content.is_empty());
     assert!(seen[0].details.is_none());
 }
@@ -1384,12 +1739,20 @@ async fn bash_pre_cancelled_reports_aborted_even_with_an_invalid_shell_path() {
     let dir = tempfile::tempdir().unwrap();
     let bash = bash_tool(
         dir.path().to_path_buf(),
-        BashOpts { shell_path: Some("/no/such/shell".to_string()), ..Default::default() },
+        BashOpts {
+            shell_path: Some("/no/such/shell".to_string()),
+            ..Default::default()
+        },
     );
     let cancel = CancelToken::new();
     cancel.cancel();
     let err = bash
-        .execute(cid(), serde_json::json!({ "command": "echo hi" }), cancel, noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "echo hi" }),
+            cancel,
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     let msg = err.to_string();
@@ -1411,16 +1774,30 @@ async fn read_offset_bound_counts_trailing_newline_line() {
     let read = ReadTool::new(fs(), cwd, ReadOpts::default());
     // offset=4 selects the empty phantom line (in-bounds), returns "".
     let ok = read
-        .execute(cid(), serde_json::json!({ "path": "f.txt", "offset": 4 }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": 4 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     assert_eq!(first_text(&ok), "");
     // offset=5 is past the 4-element basis ⇒ error worded with "lines total".
     let err = read
-        .execute(cid(), serde_json::json!({ "path": "f.txt", "offset": 5 }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "f.txt", "offset": 5 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("beyond end of file (4 lines total)"), "got: {err}");
+    assert!(
+        err.to_string()
+            .contains("beyond end of file (4 lines total)"),
+        "got: {err}"
+    );
 }
 
 // gap #8 — write reports JS string length (UTF-16 units), not UTF-8 bytes (write.ts:222).
@@ -1428,7 +1805,12 @@ async fn read_offset_bound_counts_trailing_newline_line() {
 async fn write_reports_utf16_length() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    let write = WriteTool::new(fs(), Arc::new(FileMutationLocks::new()), cwd.clone(), Default::default());
+    let write = WriteTool::new(
+        fs(),
+        Arc::new(FileMutationLocks::new()),
+        cwd.clone(),
+        Default::default(),
+    );
     // "é𝄞" = 1 (é, 1 UTF-16 unit) + 1 (𝄞, astral, 2 UTF-16 units) = 3 UTF-16 units, 6 UTF-8 bytes.
     let r = write
         .execute(
@@ -1439,10 +1821,18 @@ async fn write_reports_utf16_length() {
         )
         .await
         .unwrap();
-    assert!(first_text(&r).contains("Successfully wrote 3 bytes to u.txt"), "got: {}", first_text(&r));
+    assert!(
+        first_text(&r).contains("Successfully wrote 3 bytes to u.txt"),
+        "got: {}",
+        first_text(&r)
+    );
     // gap #6 — Pi declares `ToolDefinition<…, undefined>` and returns `details: undefined`
     // (write.ts:223); cyrup must emit `None`, never a `{bytesWritten}` payload.
-    assert!(r.details.is_none(), "write must emit no details: {:?}", r.details);
+    assert!(
+        r.details.is_none(),
+        "write must emit no details: {:?}",
+        r.details
+    );
 }
 
 // gap #11 — a small directory with no truncation and no limit-hit emits NO `details` object (ls.ts).
@@ -1453,10 +1843,19 @@ async fn ls_omits_details_when_not_notable() {
     std::fs::write(cwd.join("only.txt"), "x").unwrap();
     let ls = LsTool::new(fs(), cwd, LsOpts::default());
     let r = ls
-        .execute(cid(), serde_json::json!({}), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({}),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
-    assert!(r.details.is_none(), "details should be omitted: {:?}", r.details);
+    assert!(
+        r.details.is_none(),
+        "details should be omitted: {:?}",
+        r.details
+    );
 }
 
 // gap #1 — magic-byte detection for each supported type, animated-PNG / lossless-JPEG rejection.
@@ -1479,7 +1878,10 @@ fn image_magic_detection() {
     apng.extend_from_slice(b"acTL");
     assert_eq!(ImageMime::from_magic(&apng), None);
     // JPEG, and the lossless 0xF7 variant rejected.
-    assert_eq!(ImageMime::from_magic(&[0xff, 0xd8, 0xff, 0xe0]), Some(ImageMime::Jpeg));
+    assert_eq!(
+        ImageMime::from_magic(&[0xff, 0xd8, 0xff, 0xe0]),
+        Some(ImageMime::Jpeg)
+    );
     assert_eq!(ImageMime::from_magic(&[0xff, 0xd8, 0xff, 0xf7]), None);
     assert_eq!(ImageMime::from_magic(b"GIF89a"), Some(ImageMime::Gif));
     let mut webp = Vec::from(*b"RIFF");
@@ -1500,8 +1902,11 @@ fn image_magic_detection() {
 /// the far-`acTL` case returned `None`); GREEN after.
 #[test]
 fn image_sniff_window_matches_pis_4100_bytes() {
-    use crate::ops::{ImageMime, IMAGE_TYPE_SNIFF_BYTES};
-    assert_eq!(IMAGE_TYPE_SNIFF_BYTES, 4100, "mime.ts:3 `IMAGE_TYPE_SNIFF_BYTES = 4100`");
+    use crate::ops::{IMAGE_TYPE_SNIFF_BYTES, ImageMime};
+    assert_eq!(
+        IMAGE_TYPE_SNIFF_BYTES, 4100,
+        "mime.ts:3 `IMAGE_TYPE_SNIFF_BYTES = 4100`"
+    );
 
     let png_sig = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
     // signature(8) + IHDR(4 len + 4 type + 13 data + 4 crc = 25) = 33 bytes so far.
@@ -1543,11 +1948,19 @@ async fn read_image_oversized_is_resized_with_dimension_note() {
     img.save(cwd.join("wide.png")).unwrap();
     let read = ReadTool::new(fs(), cwd, ReadOpts::default());
     let r = read
-        .execute(cid(), serde_json::json!({ "path": "wide.png" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "wide.png" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap();
     let text = first_text(&r);
-    assert!(text.contains("Image: original 2400x10, displayed at 2000x"), "got: {text}");
+    assert!(
+        text.contains("Image: original 2400x10, displayed at 2000x"),
+        "got: {text}"
+    );
     assert!(r.content.iter().any(|c| matches!(c, Content::Image { .. })));
 }
 
@@ -1559,11 +1972,19 @@ async fn bash_nonzero_exit_empty_output_labels_no_output() {
     let dir = tempfile::tempdir().unwrap();
     let bash = bash_tool(dir.path().to_path_buf(), BashOpts::default());
     let err = bash
-        .execute(cid(), serde_json::json!({ "command": "exit 1" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "exit 1" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     let msg = err.to_string();
-    assert_eq!(msg, "(no output)\n\nCommand exited with code 1", "got: {msg}");
+    assert_eq!(
+        msg, "(no output)\n\nCommand exited with code 1",
+        "got: {msg}"
+    );
 }
 
 // gap #5 — a timeout with NO captured output goes through the catch-path `formatOutput(snapshot, "")`
@@ -1631,7 +2052,10 @@ async fn edit_access_error_has_trailing_period() {
         .await
         .unwrap_err();
     let msg = err.to_string();
-    assert!(msg.starts_with("Could not edit file: missing.txt. "), "got: {msg}");
+    assert!(
+        msg.starts_with("Could not edit file: missing.txt. "),
+        "got: {msg}"
+    );
     assert!(msg.ends_with('.'), "missing trailing period: {msg}");
 }
 
@@ -1643,7 +2067,12 @@ async fn abort_message_is_capitalized() {
     let cwd = dir.path().to_path_buf();
     let cancel = CancelToken::new();
     cancel.cancel();
-    let write = WriteTool::new(fs(), Arc::new(FileMutationLocks::new()), cwd, Default::default());
+    let write = WriteTool::new(
+        fs(),
+        Arc::new(FileMutationLocks::new()),
+        cwd,
+        Default::default(),
+    );
     let err = write
         .execute(
             cid(),
@@ -1664,7 +2093,11 @@ async fn grep_context_blocks_duplicate_overlapping_lines() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
     // Matches on lines 2 and 4; line 3 ("shared") is context for BOTH blocks.
-    std::fs::write(cwd.join("f.txt"), "alpha\nNEEDLE one\nshared\nNEEDLE two\nomega\n").unwrap();
+    std::fs::write(
+        cwd.join("f.txt"),
+        "alpha\nNEEDLE one\nshared\nNEEDLE two\nomega\n",
+    )
+    .unwrap();
     let grep = GrepTool::new(fs(), cwd, GrepOpts::default());
     let r = grep
         .execute(
@@ -1679,7 +2112,10 @@ async fn grep_context_blocks_duplicate_overlapping_lines() {
     // Block for line 2: `f.txt-1- alpha`, `f.txt:2: NEEDLE one`, `f.txt-3- shared`.
     // Block for line 4: `f.txt-3- shared`, `f.txt:4: NEEDLE two`, `f.txt-5- omega`.
     let shared = text.matches("f.txt-3- shared").count();
-    assert_eq!(shared, 2, "overlapping context line must appear once per block: {text:?}");
+    assert_eq!(
+        shared, 2,
+        "overlapping context line must appear once per block: {text:?}"
+    );
     assert!(text.contains("f.txt:2: NEEDLE one"), "got: {text:?}");
     assert!(text.contains("f.txt:4: NEEDLE two"), "got: {text:?}");
 }
@@ -1703,11 +2139,17 @@ async fn grep_limit_zero_clamps_to_one_match() {
         .await
         .unwrap();
     let text = first_text(&r);
-    assert_ne!(text, "No matches found", "limit:0 must clamp to 1, not short-circuit");
+    assert_ne!(
+        text, "No matches found",
+        "limit:0 must clamp to 1, not short-circuit"
+    );
     assert!(text.contains("f.txt:1: hit1"), "got: {text:?}");
     assert!(!text.contains("hit2"), "only one match expected: {text:?}");
     // count >= effectiveLimit(1) ⇒ the match-limit notice fires with `Use limit=2`.
-    assert!(text.contains("1 matches limit reached. Use limit=2"), "got: {text:?}");
+    assert!(
+        text.contains("1 matches limit reached. Use limit=2"),
+        "got: {text:?}"
+    );
 }
 
 // gap #4 — `read` prechecks EFFECTIVE `R_OK` (read.ts:54): an existing-but-unreadable candidate is
@@ -1730,14 +2172,25 @@ async fn read_effective_access_skips_unreadable_candidate() {
     }
     let read = ReadTool::new(fs(), cwd, ReadOpts::default());
     let err = read
-        .execute(cid(), serde_json::json!({ "path": "secret.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "secret.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .unwrap_err();
     // Pi re-rejects Node's raw `fs.access` error (read.ts:241 uncaught, :321-324 re-`reject`s), so
     // the model sees the errno class and the RESOLVED path — see `tests/read_access_errno.rs`.
     let msg = err.to_string();
-    assert!(msg.contains("secret.txt"), "must name the resolved path: {msg}");
-    assert!(msg.contains("Permission denied"), "must carry the EACCES errno: {msg}");
+    assert!(
+        msg.contains("secret.txt"),
+        "must name the resolved path: {msg}"
+    );
+    assert!(
+        msg.contains("Permission denied"),
+        "must carry the EACCES errno: {msg}"
+    );
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
 }
 
@@ -1768,7 +2221,10 @@ async fn edit_effective_access_precheck_rejects_write_only_file() {
         )
         .await
         .unwrap_err();
-    assert!(err.to_string().starts_with("Could not edit file: wo.txt. "), "got: {err}");
+    assert!(
+        err.to_string().starts_with("Could not edit file: wo.txt. "),
+        "got: {err}"
+    );
     let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644));
 }
 
@@ -1814,8 +2270,19 @@ async fn grep_folds_lone_cr_before_splitting_context() {
 async fn grep_byte_limit_notice_uses_default_constant_not_configured() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    std::fs::write(cwd.join("f.txt"), "hello world this is a long matching line\n").unwrap();
-    let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts { limit: 100, max_bytes: 10 });
+    std::fs::write(
+        cwd.join("f.txt"),
+        "hello world this is a long matching line\n",
+    )
+    .unwrap();
+    let grep = GrepTool::new(
+        fs(),
+        cwd.clone(),
+        GrepOpts {
+            limit: 100,
+            max_bytes: 10,
+        },
+    );
     let r = grep
         .execute(
             cid(),
@@ -1826,8 +2293,14 @@ async fn grep_byte_limit_notice_uses_default_constant_not_configured() {
         .await
         .unwrap();
     let text = first_text(&r);
-    assert!(text.contains("50.0KB limit reached"), "notice must use DEFAULT_MAX_BYTES: {text}");
-    assert!(!text.contains("10B limit reached"), "notice must NOT track configured limit: {text}");
+    assert!(
+        text.contains("50.0KB limit reached"),
+        "notice must use DEFAULT_MAX_BYTES: {text}"
+    );
+    assert!(
+        !text.contains("10B limit reached"),
+        "notice must NOT track configured limit: {text}"
+    );
 }
 
 // UM-6 — read SELECTS the read-path variant by existence (F_OK) then checks readability (R_OK) on
@@ -1853,17 +2326,29 @@ async fn read_variant_probe_uses_existence_not_readability() {
     }
     let read = ReadTool::new(fs(), cwd.clone(), ReadOpts::default());
     let res = read
-        .execute(cid(), serde_json::json!({ "path": "a'b.txt" }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "path": "a'b.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await;
     let _ = std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o644));
-    let err = res.expect_err("Pi errors: primary exists but is unreadable; no variant fall-through");
+    let err =
+        res.expect_err("Pi errors: primary exists but is unreadable; no variant fall-through");
     // The failure must be EACCES on the PRIMARY — proving the selection loop chose it (F_OK) and
     // the readability check then failed on that same path rather than falling through to the
     // readable curly variant. Pi propagates Node's errno text (read.ts:241/321-324).
     let msg = err.to_string();
     assert!(msg.contains("Permission denied"), "got: {msg}");
-    assert!(msg.contains("a'b.txt"), "must name the primary, not the variant: {msg}");
-    assert!(!msg.contains('\u{2019}'), "must not name the curly variant: {msg}");
+    assert!(
+        msg.contains("a'b.txt"),
+        "must name the primary, not the variant: {msg}"
+    );
+    assert!(
+        !msg.contains('\u{2019}'),
+        "must not name the curly variant: {msg}"
+    );
 }
 
 // UM-7 — a malformed `edits` (missing / non-array) yields Pi's exact `validateEditInput` literal
@@ -1907,7 +2392,10 @@ async fn edit_malformed_edits_yields_pi_literal() {
 async fn read_accepts_float_and_negative_numeric_params() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    let ten = (1..=10).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+    let ten = (1..=10)
+        .map(|i| format!("line{i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     std::fs::write(cwd.join("f.txt"), &ten).unwrap();
     let read = ReadTool::new(fs(), cwd.clone(), ReadOpts::default());
 
@@ -1956,7 +2444,10 @@ async fn read_accepts_float_and_negative_numeric_params() {
         )
         .await
         .expect("negative limit must not fail the call");
-    assert_eq!(first_text(&neg_limit), "\n\n[10 more lines in file. Use offset=1 to continue.]");
+    assert_eq!(
+        first_text(&neg_limit),
+        "\n\n[10 more lines in file. Use offset=1 to continue.]"
+    );
 
     // The out-of-bounds message interpolates the RAW argument (read.ts:275); an integral float
     // renders without a fraction in both JS and Rust.
@@ -1969,7 +2460,10 @@ async fn read_accepts_float_and_negative_numeric_params() {
         )
         .await
         .unwrap_err();
-    assert_eq!(err.to_string(), "Offset 99 is beyond end of file (10 lines total)");
+    assert_eq!(
+        err.to_string(),
+        "Offset 99 is beyond end of file (10 lines total)"
+    );
 }
 
 // grep — `contextValue = context && context > 0 ? context : 0` and
@@ -1978,7 +2472,11 @@ async fn read_accepts_float_and_negative_numeric_params() {
 async fn grep_accepts_float_and_negative_numeric_params() {
     let dir = tempfile::tempdir().unwrap();
     let cwd = dir.path().to_path_buf();
-    std::fs::write(cwd.join("a.txt"), "one\nNEEDLE\nthree\nNEEDLE\nfive\nNEEDLE\n").unwrap();
+    std::fs::write(
+        cwd.join("a.txt"),
+        "one\nNEEDLE\nthree\nNEEDLE\nfive\nNEEDLE\n",
+    )
+    .unwrap();
     let grep = GrepTool::new(fs(), cwd.clone(), GrepOpts::default());
 
     // context: 1.0 must equal context: 1 — one line either side of the match.
@@ -1991,7 +2489,11 @@ async fn grep_accepts_float_and_negative_numeric_params() {
         )
         .await
         .expect("float context must not fail the call");
-    assert!(first_text(&ctx_float).contains("a.txt-1- one"), "got: {}", first_text(&ctx_float));
+    assert!(
+        first_text(&ctx_float).contains("a.txt-1- one"),
+        "got: {}",
+        first_text(&ctx_float)
+    );
 
     // Negative context collapses to 0 — the match line alone, no surrounding rows.
     let ctx_neg = grep
@@ -2003,8 +2505,15 @@ async fn grep_accepts_float_and_negative_numeric_params() {
         )
         .await
         .expect("negative context clamps to 0, it does not fail the call");
-    assert_eq!(first_text(&ctx_neg).lines().next().unwrap(), "a.txt:2: NEEDLE");
-    assert!(!first_text(&ctx_neg).contains("a.txt-1-"), "got: {}", first_text(&ctx_neg));
+    assert_eq!(
+        first_text(&ctx_neg).lines().next().unwrap(),
+        "a.txt:2: NEEDLE"
+    );
+    assert!(
+        !first_text(&ctx_neg).contains("a.txt-1-"),
+        "got: {}",
+        first_text(&ctx_neg)
+    );
 
     // Negative limit is absorbed by `Math.max(1, …)`: exactly one match, not an error.
     let lim_neg = grep
@@ -2016,7 +2525,13 @@ async fn grep_accepts_float_and_negative_numeric_params() {
         )
         .await
         .expect("negative limit clamps to 1, it does not fail the call");
-    assert_eq!(first_text(&lim_neg).lines().filter(|l| l.contains("NEEDLE")).count(), 1);
+    assert_eq!(
+        first_text(&lim_neg)
+            .lines()
+            .filter(|l| l.contains("NEEDLE"))
+            .count(),
+        1
+    );
 
     // limit: 2.0 must equal limit: 2.
     let lim_float = grep
@@ -2028,7 +2543,13 @@ async fn grep_accepts_float_and_negative_numeric_params() {
         )
         .await
         .expect("float limit must not fail the call");
-    assert_eq!(first_text(&lim_float).lines().filter(|l| l.contains("NEEDLE")).count(), 2);
+    assert_eq!(
+        first_text(&lim_float)
+            .lines()
+            .filter(|l| l.contains("NEEDLE"))
+            .count(),
+        2
+    );
 }
 
 // ls — `effectiveLimit = limit ?? DEFAULT_LIMIT` (ls.ts:125), unclamped: a non-positive limit
@@ -2044,14 +2565,27 @@ async fn ls_accepts_float_and_negative_limit() {
     let ls = LsTool::new(fs(), cwd.clone(), LsOpts::default());
 
     let float_limit = ls
-        .execute(cid(), serde_json::json!({ "limit": 2.0 }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "limit": 2.0 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .expect("float limit must not fail the call");
     let text = first_text(&float_limit);
-    assert!(text.starts_with("a.txt\nb.txt\n\n[2 entries limit reached."), "got: {text}");
+    assert!(
+        text.starts_with("a.txt\nb.txt\n\n[2 entries limit reached."),
+        "got: {text}"
+    );
 
     let neg_limit = ls
-        .execute(cid(), serde_json::json!({ "limit": -1 }), CancelToken::new(), noop_sink())
+        .execute(
+            cid(),
+            serde_json::json!({ "limit": -1 }),
+            CancelToken::new(),
+            noop_sink(),
+        )
         .await
         .expect("negative limit must not fail the call");
     assert_eq!(first_text(&neg_limit), "(empty directory)");
@@ -2083,13 +2617,25 @@ async fn find_accepts_float_and_negative_limit() {
     // first N discovered", not "the alphabetically-first N". Asserting `a.txt\nb.txt` pinned
     // cyrup's own `results.sort()`, which was the defect (TOOL-023), so the property asserted here
     // is pi's: exactly `limit` rows, each a member of the candidate set, plus the notice.
-    let (rows, notice) = text.split_once("\n\n[").expect("notice bracket, got: {text}");
+    let (rows, notice) = text
+        .split_once("\n\n[")
+        .expect("notice bracket, got: {text}");
     let rows: Vec<&str> = rows.lines().collect();
-    assert_eq!(rows.len(), 2, "the cap must bound the row count, got: {text}");
+    assert_eq!(
+        rows.len(),
+        2,
+        "the cap must bound the row count, got: {text}"
+    );
     for row in &rows {
-        assert!(["a.txt", "b.txt", "c.txt"].contains(row), "unexpected row {row}, got: {text}");
+        assert!(
+            ["a.txt", "b.txt", "c.txt"].contains(row),
+            "unexpected row {row}, got: {text}"
+        );
     }
-    assert!(notice.starts_with("2 results limit reached."), "got: {text}");
+    assert!(
+        notice.starts_with("2 results limit reached."),
+        "got: {text}"
+    );
 
     let neg_limit = find
         .execute(

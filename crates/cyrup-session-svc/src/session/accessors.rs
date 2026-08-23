@@ -100,9 +100,10 @@ impl AgentSession {
 
     /// The nearest saved trust decision for this session's cwd (Pi `findNearestTrustEntry`); `None`
     /// when no ancestor has a persisted decision. Read-only; surfaced in the `/trust` selector header.
-    pub fn saved_trust_decision(&self) -> Option<cyrup_config::trust::TrustEntry> {
+    pub async fn saved_trust_decision(&self) -> Option<cyrup_config::trust::TrustEntry> {
         cyrup_config::trust::TrustStore::new(self.trust_store_path())
             .nearest(&self.services.cwd)
+            .await
             .ok()
             .flatten()
     }
@@ -111,14 +112,14 @@ impl AgentSession {
     /// the `trust.json` store (Pi `/trust` `onSelect` → `setProjectTrust`, trust-manager.ts). An empty
     /// `updates` (session-only option) writes nothing. The in-memory `services().project_trusted`
     /// reflects the new session only after a `/reload`, matching Pi.
-    pub fn write_project_trust(
+    pub async fn write_project_trust(
         &self,
         updates: &[(std::path::PathBuf, Option<cyrup_config::trust::TrustDecision>)],
     ) -> Result<(), SessionServiceError> {
         if updates.is_empty() {
             return Ok(());
         }
-        cyrup_config::trust::TrustStore::new(self.trust_store_path()).set_many(updates)?;
+        cyrup_config::trust::TrustStore::new(self.trust_store_path()).set_many(updates).await?;
         Ok(())
     }
 
@@ -126,14 +127,14 @@ impl AgentSession {
     /// `SettingsManager.setNested`). Writes via the manager's `&self` store seam; the in-memory
     /// `effective()` view reflects it after a `/reload`, matching Pi's apply-then-reload flow. A
     /// dotted `key` (`terminal.showImages`) addresses a nested field. Project writes require trust.
-    pub fn persist_setting(
+    pub async fn persist_setting(
         &self,
         scope: cyrup_config::SettingsScope,
         key: &str,
         value: serde_json::Value,
     ) -> Result<(), SessionServiceError> {
         let path: Vec<&str> = key.split('.').filter(|s| !s.is_empty()).collect();
-        self.services.settings.persist_nested(scope, &path, value)?;
+        self.services.settings.persist_nested(scope, &path, value).await?;
         Ok(())
     }
 

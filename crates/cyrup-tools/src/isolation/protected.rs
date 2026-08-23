@@ -28,7 +28,9 @@ pub struct ProtectedPaths {
 impl ProtectedPaths {
     /// The conventional defaults from func-12 §4 / R-12-006: `.env`, `.git/`, `node_modules/`.
     pub fn defaults() -> Self {
-        Self { names: vec![".env".into(), ".git".into(), "node_modules".into()] }
+        Self {
+            names: vec![".env".into(), ".git".into(), "node_modules".into()],
+        }
     }
 
     /// A custom protected set of component names (e.g. `[".env", ".git"]`).
@@ -37,7 +39,9 @@ impl ProtectedPaths {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        Self { names: names.into_iter().map(Into::into).collect() }
+        Self {
+            names: names.into_iter().map(Into::into).collect(),
+        }
     }
 
     /// Add another protected component name (builder style).
@@ -115,10 +119,7 @@ impl FsOps for ProtectedFs {
     ///
     /// No guard is applied, matching [`Self::read`]: `ProtectedFs` restricts MUTATION only
     /// (`write_in_place`, and `access` under `ReadWrite`).
-    async fn read_stream(
-        &self,
-        path: &Path,
-    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+    async fn read_stream(&self, path: &Path) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
         self.inner.read_stream(path).await
     }
 

@@ -38,7 +38,12 @@
 // Same allow-set the crate's other test modules carry. Without it `cargo clippy -p cyrup-tools
 // --all-targets` is RED here (the workspace `deny`s `expect`/raw slicing), which a check-only gate
 // never sees because clippy lints do not fire under `cargo check`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 
 use std::path::{Path, PathBuf};
 
@@ -50,7 +55,9 @@ const WINDOW_LINES: usize = 60;
 
 /// Every `.rs` file under `dir`, recursively.
 fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
@@ -89,10 +96,15 @@ fn every_command_in_this_crate_pins_all_three_stdio_handles() {
     for file in &files {
         // This file names `Command::new(` inside its own documentation and its own failure
         // messages; scanning it would report itself.
-        if file.file_name().is_some_and(|n| n == "no_inherited_harness_stdio.rs") {
+        if file
+            .file_name()
+            .is_some_and(|n| n == "no_inherited_harness_stdio.rs")
+        {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(file) else { continue };
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
         let lines: Vec<&str> = text.lines().collect();
         for (index, line) in lines.iter().enumerate() {
             if !line.contains("Command::new(") {
@@ -179,10 +191,15 @@ fn fixture_scripts_that_fork_a_sleeper_record_its_pid_so_the_fixture_can_reap_it
     for file in &files {
         // Self-exclusion for the same reason as the scan above: this file names the pattern in its
         // own documentation and failure message.
-        if file.file_name().is_some_and(|n| n == "no_inherited_harness_stdio.rs") {
+        if file
+            .file_name()
+            .is_some_and(|n| n == "no_inherited_harness_stdio.rs")
+        {
             continue;
         }
-        let Ok(text) = std::fs::read_to_string(file) else { continue };
+        let Ok(text) = std::fs::read_to_string(file) else {
+            continue;
+        };
         for (index, line) in text.lines().enumerate() {
             // Prose, not code: this rule is about what a fixture RUNS.
             if line.trim_start().starts_with("//") {
@@ -191,7 +208,9 @@ fn fixture_scripts_that_fork_a_sleeper_record_its_pid_so_the_fixture_can_reap_it
             // The shape: a shell script that forks `sleep` out of a loop or into the background. A
             // one-shot `sleep 30` as the DIRECT child is not this — `exec_argv`/`exec` kill that
             // pid themselves.
-            if !(line.contains("do sleep") || line.contains("sleep 1 &") || line.contains("sleep 5 &")
+            if !(line.contains("do sleep")
+                || line.contains("sleep 1 &")
+                || line.contains("sleep 5 &")
                 || line.contains("sleep 30 &"))
             {
                 continue;

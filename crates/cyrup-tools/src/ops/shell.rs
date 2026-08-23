@@ -49,9 +49,17 @@ fn is_legacy_wsl_bash_path(path: &str) -> bool {
 /// otherwise.
 fn get_bash_shell_config(program: PathBuf) -> ShellConfig {
     if is_legacy_wsl_bash_path(&program.to_string_lossy()) {
-        ShellConfig { program, args: vec!["-s".to_string()], transport: Transport::Stdin }
+        ShellConfig {
+            program,
+            args: vec!["-s".to_string()],
+            transport: Transport::Stdin,
+        }
     } else {
-        ShellConfig { program, args: vec!["-c".to_string()], transport: Transport::Argv }
+        ShellConfig {
+            program,
+            args: vec!["-c".to_string()],
+            transport: Transport::Argv,
+        }
     }
 }
 
@@ -171,8 +179,11 @@ impl ShellConfig {
             return Ok(get_bash_shell_config(found));
         }
         // shell.ts:100-106 verbatim, including the `  ${p}`-indented searched-path list.
-        let searched =
-            candidates.iter().map(|p| format!("  {}", p.display())).collect::<Vec<_>>().join("\n");
+        let searched = candidates
+            .iter()
+            .map(|p| format!("  {}", p.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
         Err(ToolError::new(format!(
             "No bash shell found. Options:\n  1. Install Git for Windows: \
              https://git-scm.com/download/win\n  2. Add your bash to PATH (Cygwin, MSYS2, \
@@ -253,7 +264,12 @@ pub fn shell_env(bin_dir: Option<&Path>) -> Vec<(String, String)> {
     let delimiter = if cfg!(windows) { ';' } else { ':' };
     let (key, current) = std::env::vars_os()
         .find(|(k, _)| k.to_string_lossy().eq_ignore_ascii_case("path"))
-        .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+        .map(|(k, v)| {
+            (
+                k.to_string_lossy().into_owned(),
+                v.to_string_lossy().into_owned(),
+            )
+        })
         .unwrap_or_else(|| ("PATH".to_string(), String::new()));
     let already = current.split(delimiter).any(|e| !e.is_empty() && e == bin);
     let updated = if already {
@@ -267,7 +283,12 @@ pub fn shell_env(bin_dir: Option<&Path>) -> Vec<(String, String)> {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#[allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing
+)]
 mod tests {
     use super::*;
 
@@ -323,12 +344,18 @@ mod tests {
         let err = ShellConfig::windows_detect_from(&candidates, || None)
             .expect_err("no bash anywhere ⇒ Pi throws");
         let msg = err.to_string();
-        assert!(msg.starts_with("No bash shell found. Options:"), "got: {msg}");
+        assert!(
+            msg.starts_with("No bash shell found. Options:"),
+            "got: {msg}"
+        );
         assert!(msg.contains("1. Install Git for Windows: https://git-scm.com/download/win"));
         assert!(msg.contains("2. Add your bash to PATH (Cygwin, MSYS2, etc.)"));
         assert!(msg.contains("3. Set shellPath in settings.json"));
         assert!(msg.contains("Searched Git Bash in:"));
-        assert!(!msg.contains("cmd.exe"), "cyrup must never name a non-bash interpreter here");
+        assert!(
+            !msg.contains("cmd.exe"),
+            "cyrup must never name a non-bash interpreter here"
+        );
         for cand in &candidates {
             assert!(
                 msg.contains(&format!("  {}", cand.display())),
@@ -385,7 +412,11 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn path_probe_is_bounded() {
-        assert_eq!(BASH_PROBE_TIMEOUT, Duration::from_secs(5), "shell.ts:47 `timeout: 5000`");
+        assert_eq!(
+            BASH_PROBE_TIMEOUT,
+            Duration::from_secs(5),
+            "shell.ts:47 `timeout: 5000`"
+        );
         // A probe whose child never exits must be reaped at the deadline, not waited on forever.
         //
         // ALL THREE handles are set explicitly, and this is load-bearing, not tidiness:
@@ -427,7 +458,10 @@ mod tests {
                 }
             }
         }
-        assert!(started.elapsed() < Duration::from_secs(5), "the poll loop must reap on expiry");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the poll loop must reap on expiry"
+        );
     }
 
     #[test]

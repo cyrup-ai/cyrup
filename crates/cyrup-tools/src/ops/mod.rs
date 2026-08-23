@@ -18,7 +18,7 @@ pub use local::{
     kill_pid, kill_process_tree, kill_tracked_detached_children, terminate_pid,
     track_detached_child_pid, untrack_detached_child_pid,
 };
-pub use shell::{shell_env, ShellConfig, Transport};
+pub use shell::{ShellConfig, Transport, shell_env};
 
 /// Access mode for [`FsOps::access`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,10 +119,18 @@ impl ImageMime {
     fn from_magic_unbounded(buf: &[u8]) -> Option<Self> {
         const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
         if starts_with(buf, &[0xff, 0xd8, 0xff]) {
-            return if buf.get(3) == Some(&0xf7) { None } else { Some(ImageMime::Jpeg) };
+            return if buf.get(3) == Some(&0xf7) {
+                None
+            } else {
+                Some(ImageMime::Jpeg)
+            };
         }
         if starts_with(buf, &PNG_SIG) {
-            return if is_png(buf) && !is_animated_png(buf) { Some(ImageMime::Png) } else { None };
+            return if is_png(buf) && !is_animated_png(buf) {
+                Some(ImageMime::Png)
+            } else {
+                None
+            };
         }
         if starts_with_ascii(buf, 0, b"GIF") {
             return Some(ImageMime::Gif);
@@ -149,7 +157,8 @@ fn starts_with_ascii(buf: &[u8], offset: usize, text: &[u8]) -> bool {
 }
 
 fn read_u16_le(buf: &[u8], off: usize) -> u32 {
-    u32::from(buf.get(off).copied().unwrap_or(0)) + (u32::from(buf.get(off + 1).copied().unwrap_or(0)) << 8)
+    u32::from(buf.get(off).copied().unwrap_or(0))
+        + (u32::from(buf.get(off + 1).copied().unwrap_or(0)) << 8)
 }
 
 fn read_u32_be(buf: &[u8], off: usize) -> u32 {
@@ -183,7 +192,10 @@ fn is_animated_png(buf: &[u8]) -> bool {
         if starts_with_ascii(buf, chunk_type_offset, b"IDAT") {
             return false;
         }
-        let next = offset.saturating_add(8).saturating_add(chunk_len).saturating_add(4);
+        let next = offset
+            .saturating_add(8)
+            .saturating_add(chunk_len)
+            .saturating_add(4);
         if next <= offset || next > buf.len() {
             return false;
         }
@@ -326,10 +338,7 @@ pub trait FsOps: Send + Sync {
     /// Default implementation: read the whole file and hand back a cursor over it. That is the
     /// correct fallback for a backend that genuinely cannot stream (a remote/RPC filesystem), and
     /// it keeps every decorator in `isolation/` forwarding unchanged.
-    async fn read_stream(
-        &self,
-        path: &Path,
-    ) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
+    async fn read_stream(&self, path: &Path) -> Result<Box<dyn std::io::Read + Send>, ToolError> {
         Ok(Box::new(std::io::Cursor::new(self.read(path).await?)))
     }
 
@@ -361,7 +370,9 @@ pub trait FsOps: Send + Sync {
 
     /// Detect an image type by extension (None for non-images). Sync; no I/O.
     fn detect_image_mime(&self, path: &Path) -> Option<ImageMime> {
-        path.extension().and_then(|e| e.to_str()).and_then(ImageMime::from_extension)
+        path.extension()
+            .and_then(|e| e.to_str())
+            .and_then(ImageMime::from_extension)
     }
 
     /// Walk a tree for grep/find. Yields candidate paths (gitignore-aware for the local backend).
@@ -390,7 +401,9 @@ pub trait ProcOps: Send + Sync {
         _cancel: CancelToken,
         _timeout: Option<Duration>,
     ) -> Result<ArgvOutput, ToolError> {
-        Err(ToolError::new("argv exec is not supported by this process backend"))
+        Err(ToolError::new(
+            "argv exec is not supported by this process backend",
+        ))
     }
 }
 
@@ -520,7 +533,13 @@ impl BashOperations for LocalBashOperations {
         // `shellPath` is an `Err` here, matching `ShellConfig::resolve`'s contract and the
         // `Custom shell path not found` error both existing bash front-ends already surface.
         let shell = ShellConfig::resolve(self.shell_path.as_deref())?;
-        let BashExecOptions { on_data, cancel, timeout, env, env_remove } = opts;
+        let BashExecOptions {
+            on_data,
+            cancel,
+            timeout,
+            env,
+            env_remove,
+        } = opts;
         self.proc
             .exec(
                 ExecSpec {
@@ -614,7 +633,10 @@ mod bash_operations_tests {
     /// backend that filtered here would double-sanitize.
     #[tokio::test]
     async fn local_bash_operations_forwards_command_cwd_and_env_onto_the_proc_seam() {
-        let proc = Arc::new(RecordingProc { seen: Mutex::new(Vec::new()), emit: Some(b"hi\x1b[0m") });
+        let proc = Arc::new(RecordingProc {
+            seen: Mutex::new(Vec::new()),
+            emit: Some(b"hi\x1b[0m"),
+        });
         let ops = LocalBashOperations::with_proc(proc.clone(), None);
 
         let mut streamed: Vec<u8> = Vec::new();
@@ -639,7 +661,11 @@ mod bash_operations_tests {
         assert_eq!(streamed, b"hi\x1b[0m");
 
         let seen = proc.seen.lock().unwrap();
-        assert_eq!(seen.len(), 1, "exactly one exec per `BashOperations::exec` call");
+        assert_eq!(
+            seen.len(),
+            1,
+            "exactly one exec per `BashOperations::exec` call"
+        );
         assert_eq!(seen[0].command, "echo hi");
         assert_eq!(seen[0].cwd, Path::new("/tmp"));
         assert_eq!(seen[0].env, vec![("A".to_string(), "1".to_string())]);
@@ -664,10 +690,8 @@ mod bash_operations_tests {
 
         // Presence: a resolvable shell path reaches the backend.
         let good = ShellConfig::detect().program;
-        let ok_ops = LocalBashOperations::with_proc(
-            proc.clone(),
-            Some(good.to_string_lossy().into_owned()),
-        );
+        let ok_ops =
+            LocalBashOperations::with_proc(proc.clone(), Some(good.to_string_lossy().into_owned()));
         let mut noop = |_: &[u8]| {};
         ok_ops
             .exec("true", Path::new("/tmp"), opts(&mut noop))

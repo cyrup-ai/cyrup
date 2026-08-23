@@ -232,12 +232,14 @@ pub fn parse_analytics_choice(value: &str) -> Option<bool> {
 ///
 /// Cancelling the wizard persists nothing (Pi's `finish(undefined)` skips the whole block), so this
 /// is only ever called with a submitted result.
-pub fn apply_first_time_setup(
+pub async fn apply_first_time_setup(
     settings: &mut SettingsManager,
     result: &FirstTimeSetupResult,
 ) -> Result<(), ConfigError> {
-    settings.set(SettingsScope::Global, "theme", result.theme.theme_name())?;
-    settings.set_enable_analytics(result.share_analytics)?;
+    settings
+        .set(SettingsScope::Global, "theme", result.theme.theme_name())
+        .await?;
+    settings.set_enable_analytics(result.share_analytics).await?;
     Ok(())
 }
 
@@ -253,7 +255,7 @@ pub fn apply_first_time_setup(
 /// `onThemePreview` live recolour (:184-187): `run_startup_selector` treats
 /// [`SelectorOutcome::Preview`] as a no-op, so the chosen theme applies on the next render rather
 /// than while navigating.
-pub fn run_first_time_setup(
+pub async fn run_first_time_setup(
     ui: &UiTheme,
     settings: &mut SettingsManager,
     detected: TerminalTheme,
@@ -285,6 +287,7 @@ pub fn run_first_time_setup(
         share_analytics,
     };
     apply_first_time_setup(settings, &result)
+        .await
         .map_err(|e| anyhow::anyhow!("saving first-time setup: {e}"))?;
     Ok(Some(result))
 }

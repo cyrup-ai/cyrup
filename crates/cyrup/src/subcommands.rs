@@ -435,11 +435,11 @@ fn source_display(source: &PackageSource) -> String {
 }
 
 /// The saved project-trust decision for `cwd` from the trust store (Pi `trustStore.get(cwd) === true`).
-fn saved_trusted(dirs: &ConfigDirs) -> bool {
+async fn saved_trusted(dirs: &ConfigDirs) -> bool {
     let store = TrustStore::new(dirs.trust_path());
     store
         .nearest(&dirs.cwd)
-        .ok()
+        .await.ok()
         .flatten()
         .map(|entry| entry.decision.is_trusted())
         .unwrap_or(false)
@@ -486,9 +486,10 @@ pub async fn dispatch(
         // Resolve trust the same way the other verbs do (Pi `createCommandSettingsManager`): the
         // `--approve`/`-a` override, else the saved decision for this folder. Project-scope toggles
         // require trust to persist (R-07-004).
-        let trusted = trust_override(argv)
-            .or(cli_trust_override)
-            .unwrap_or_else(|| saved_trusted(dirs));
+        let trusted = match trust_override(argv).or(cli_trust_override) {
+            Some(t) => t,
+            None => saved_trusted(dirs).await,
+        };
         // `-l` / `--local` opens the editor in PROJECT write scope (Pi `handleConfigCommand`,
         // package-manager-cli.ts:622-624,670) — the flag is the whole user-facing route to
         // `ConfigWriteScope::Project`, and upstream refuses it in an untrusted folder
@@ -561,7 +562,10 @@ pub async fn dispatch(
     // Saved-trust lookup + override (Pi createCommandSettingsManager); the interactive trust prompt
     // for trust-requiring project resources is the gated outer layer (residual ledger #19).
     let trust_override = opts.project_trust_override.or(cli_trust_override);
-    let effective_trusted = trust_override.unwrap_or_else(|| saved_trusted(dirs));
+    let effective_trusted = match trust_override {
+        Some(t) => t,
+        None => saved_trusted(dirs).await,
+    };
 
     // Project-package-config write requires trust (Pi package-manager-cli.ts:635-639).
     let writes_project_config = matches!(
@@ -867,6 +871,13 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
         selector.set_override_state(i, state);
     }
     let mut persist_err: Option<String> = None;
+    // `persist_nested` is async now, and `run_startup_selector`'s `on_apply` is a sync callback
+    // driven by a raw-mode terminal loop, so the write cannot happen inside it. The toggles are
+    // recorded here and applied immediately after the loop returns, below. `arrays` already holds
+    // the full desired array for each (scope, kind) and the callback rewrites it wholesale, so the
+    // bytes that reach disk are identical; what moves is only WHEN they are written — one flush on
+    // exit rather than one per toggle.
+    let mut pending: Vec<(SettingsScope, &'static str, serde_json::Value)> = Vec::new();
     run_startup_selector(&theme, &keymap, &mut selector, |payload| {
         let Some(toggle) = ConfigToggle::from_payload(payload) else {
             return;
@@ -884,10 +895,14 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
         let value = serde_json::Value::Array(
             entry.iter().cloned().map(serde_json::Value::String).collect(),
         );
-        if let Err(e) = settings.persist_nested(settings_scope, &[toggle.kind.key()], value) {
+        pending.push((settings_scope, toggle.kind.key(), value));
+    })?;
+
+    for (settings_scope, key, value) in pending {
+        if let Err(e) = settings.persist_nested(settings_scope, &[key], value).await {
             persist_err = Some(e.to_string());
         }
-    })?;
+    }
 
     if let Some(e) = persist_err {
         // A project toggle in an untrusted folder is the usual cause (Pi requires trust to write

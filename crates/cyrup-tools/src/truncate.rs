@@ -95,7 +95,10 @@ pub struct TruncOpts {
 
 impl TruncOpts {
     pub fn new(max_lines: usize, max_bytes: usize) -> Self {
-        Self { max_lines, max_bytes }
+        Self {
+            max_lines,
+            max_bytes,
+        }
     }
     /// Byte-cap only: row count already bounded by the caller (grep/find/ls).
     ///
@@ -108,7 +111,10 @@ impl TruncOpts {
     /// neither is reachable as a real line count; the difference is only ever visible in the
     /// session record, which is exactly where interop is read.
     pub fn bytes_only(max_bytes: usize) -> Self {
-        Self { max_lines: MAX_SAFE_INTEGER, max_bytes }
+        Self {
+            max_lines: MAX_SAFE_INTEGER,
+            max_bytes,
+        }
     }
 }
 
@@ -362,7 +368,10 @@ mod tests {
 
     #[test]
     fn head_keeps_first_n_lines() {
-        let content = (1..=10).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let content = (1..=10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let t = truncate_head(&content, TruncOpts::new(3, DEFAULT_MAX_BYTES));
         assert_eq!(t.content, "1\n2\n3");
         assert!(t.info.truncated);
@@ -421,7 +430,10 @@ mod tests {
 
     #[test]
     fn tail_keeps_last_n_lines() {
-        let content = (1..=10).map(|i| i.to_string()).collect::<Vec<_>>().join("\n");
+        let content = (1..=10)
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
         let t = truncate_tail(&content, TruncOpts::new(3, DEFAULT_MAX_BYTES));
         assert_eq!(t.content, "8\n9\n10");
         assert!(t.info.truncated);
@@ -442,7 +454,10 @@ mod tests {
         let (out, t) = truncate_line(&line, GREP_MAX_LINE_LENGTH);
         assert!(t);
         assert!(out.ends_with("... [truncated]"));
-        assert_eq!(out.chars().count(), GREP_MAX_LINE_LENGTH + "... [truncated]".chars().count());
+        assert_eq!(
+            out.chars().count(),
+            GREP_MAX_LINE_LENGTH + "... [truncated]".chars().count()
+        );
     }
 
     #[test]

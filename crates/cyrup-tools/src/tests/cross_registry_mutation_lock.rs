@@ -19,15 +19,20 @@
 //! shape a large real write takes; the explicit gap only makes the window deterministic instead of
 //! leaving detection to the scheduler.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic
+)]
 
+use crate::ops::local::LocalFs;
+use crate::ops::{Access, Backend, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
+use crate::{ToolRegistry, ToolsOptions};
 use cyrup_core::{
     CancelToken, Content, EventStream, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate,
     ToolUpdateSink,
 };
-use crate::ops::local::LocalFs;
-use crate::ops::{Access, Backend, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
-use crate::{ToolRegistry, ToolsOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -68,7 +73,11 @@ struct SplitWriteFs {
 
 impl SplitWriteFs {
     fn new(probe: Arc<Probe>, gap: Duration) -> Self {
-        Self { inner: Arc::new(LocalFs), probe, gap }
+        Self {
+            inner: Arc::new(LocalFs),
+            probe,
+            gap,
+        }
     }
 }
 
@@ -117,11 +126,19 @@ impl SplitWriteFs {
             .await
             .map_err(|e| ToolError::new(format!("open: {e}")))?;
         let mid = bytes.len() / 2;
-        file.write_all(&bytes[..mid]).await.map_err(|e| ToolError::new(format!("write: {e}")))?;
-        file.flush().await.map_err(|e| ToolError::new(format!("flush: {e}")))?;
+        file.write_all(&bytes[..mid])
+            .await
+            .map_err(|e| ToolError::new(format!("write: {e}")))?;
+        file.flush()
+            .await
+            .map_err(|e| ToolError::new(format!("flush: {e}")))?;
         tokio::time::sleep(self.gap).await;
-        file.write_all(&bytes[mid..]).await.map_err(|e| ToolError::new(format!("write: {e}")))?;
-        file.flush().await.map_err(|e| ToolError::new(format!("flush: {e}")))?;
+        file.write_all(&bytes[mid..])
+            .await
+            .map_err(|e| ToolError::new(format!("write: {e}")))?;
+        file.flush()
+            .await
+            .map_err(|e| ToolError::new(format!("flush: {e}")))?;
         Ok(())
     }
 }
@@ -130,8 +147,12 @@ impl SplitWriteFs {
 /// instrumented backend so the probe sees both.
 fn two_registries(cwd: &Path, probe: Arc<Probe>) -> (ToolRegistry, ToolRegistry) {
     let fs: Arc<dyn FsOps> = Arc::new(SplitWriteFs::new(probe, Duration::from_millis(80)));
-    let backend = Backend { fs, ..Backend::default() };
-    let a = ToolRegistry::with_builtins(cwd.to_path_buf(), backend.clone(), ToolsOptions::default());
+    let backend = Backend {
+        fs,
+        ..Backend::default()
+    };
+    let a =
+        ToolRegistry::with_builtins(cwd.to_path_buf(), backend.clone(), ToolsOptions::default());
     let b = ToolRegistry::with_builtins(cwd.to_path_buf(), backend, ToolsOptions::default());
     (a, b)
 }
@@ -149,7 +170,10 @@ async fn two_registries_serialize_writes_to_the_same_file() {
 
     let write_a = reg_a.get("write").expect("write is a built-in");
     let write_b = reg_b.get("write").expect("write is a built-in");
-    assert!(!Arc::ptr_eq(&write_a, &write_b), "the two registries must be genuinely independent");
+    assert!(
+        !Arc::ptr_eq(&write_a, &write_b),
+        "the two registries must be genuinely independent"
+    );
 
     let payload_a = "A".repeat(4096);
     let payload_b = "B".repeat(6144);
