@@ -182,7 +182,7 @@ impl NativeExtension for SubagentsExtension {
                 // tool at all.
                 if crate::native_supervisor::native_intercom_alias_should_register(
                     &|k| std::env::var(k).ok(),
-                    &crate::native_supervisor::agent_dir_from(
+                    &crate::native_supervisor::intercom_agent_dir_from(
                         &|k| std::env::var(k).ok(),
                         Some(self.cwd.clone()),
                     ),

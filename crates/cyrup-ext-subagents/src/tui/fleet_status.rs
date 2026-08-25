@@ -64,6 +64,7 @@ use super::fleet_state::{
 };
 use super::fleet_theme::{self as th, Role};
 use crate::background::{ActivityState, RunMode, StepState};
+use crate::formatters::{format_model_thinking, run_mode_label};
 
 // =================================================================================================
 // Constants + placement (pi `fleet-status.ts:7-49`)
@@ -349,28 +350,6 @@ pub fn fleet_tree_rows(entries: &[FleetStatusEntry]) -> Vec<FleetTreeRow> {
     rows
 }
 
-/// pi `formatModelThinking` (`shared/formatters.ts:19-29`) — the same helper
-/// `background/fleet_view.rs` ports privately; duplicated here rather than cross-imported for the
-/// identical reason that file gives (its copy is `fn`-private to the text fleet view).
-fn format_model_thinking(model: Option<&str>, thinking: Option<&str>) -> String {
-    const THINKING_LEVELS: [&str; 4] = ["off", "low", "medium", "high"];
-    let display_model = model.map(|m| match m.rfind('/') {
-        Some(i) => m.get(i.saturating_add(1)..).unwrap_or(m),
-        None => m,
-    });
-    let display_thinking = thinking
-        .map(str::trim)
-        .filter(|t| THINKING_LEVELS.contains(t));
-    [
-        display_model.map(str::to_string),
-        display_thinking.map(|t| format!("thinking {t}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ")
-}
-
 /// JS `x || undefined` over a possibly-empty string (pi `formatModelThinking(...) || undefined`).
 fn non_empty(value: String) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
@@ -540,11 +519,6 @@ fn has_active_parallel_group(job: &AsyncRunView) -> bool {
                 .any(|child| matches!(child.status, StepState::Running | StepState::Pending))
         })
     })
-}
-
-/// The rendered lowercase mode string (pi `SubagentRunMode`).
-fn run_mode_label(mode: RunMode) -> &'static str {
-    crate::background::run_status::run_mode_label(mode)
 }
 
 /// The rendered lowercase step-status string (pi `AsyncJobStep.status`).

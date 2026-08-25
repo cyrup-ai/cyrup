@@ -1,7 +1,7 @@
 ---
-stage: new
-status: done
-updated: 2026-08-23 02:15
+stage: qa
+status: completed
+updated: 2026-08-25 18:30
 ---
 
 # Unify The Duplicated Home/Agent-Dir And Clock Helpers Into Shared Modules
@@ -32,6 +32,56 @@ Add `src/paths.rs` owning `home_dir()`, `agent_dir()`/`resolve_agent_dir(home: &
 - [ ] The discovery/ package-name normalizer exists once; `grep -rn 'fn collapse_repeated_char\|fn is_valid_package_identifier' src/discovery/` returns 2 lines total
 - [ ] `cargo test -p cyrup-ext-subagents` passes with no new failures beyond the two already-tracked ones
 - [ ] `native_supervisor`'s `CYRUP_CODING_AGENT_DIR`-based resolver is renamed (e.g. `intercom_agent_dir_from`) so it no longer reads as the same concept
+
+## Completion notes (2026-08-25)
+
+AC1/AC2/AC3/AC6 were already satisfied by the prior merged PR (#65) — `home_dir`/`agent_dir`
+down to 1/2 definitions in `src/paths.rs`, clock helpers down to 2 in `src/time.rs`
+(`now_epoch_millis` + the deliberate `SystemTime`-taking `epoch_millis`), `spawn/worktree.rs`
+routed through the shared ladder, package-name normalizer down to 2 lines in
+`discovery/package_name.rs`. This follow-up closed the remaining three:
+
+- **AC5** (`format_tokens`/`format_model_thinking`/`run_mode_label` triplication): deleted all
+  9 duplicate bodies across `registration/cost.rs`, `tui/fleet.rs`, `tui/fleet_status.rs`,
+  `tui/render.rs`, `background/fleet_view.rs`, `background/run_status.rs`; every call site now
+  imports from `crate::formatters`. `tui/fleet.rs`'s `Option<String>`-returning variant maps to
+  the existing `format_model_thinking_opt`. `background/run_status.rs::run_mode_label` — the
+  widely `use`d canonical name across the crate (`super::run_status::run_mode_label`,
+  `crate::background::run_status::run_mode_label`, etc.) — became a `pub(crate) use
+  crate::formatters::run_mode_label;` re-export rather than a deleted function, so every existing
+  call site kept resolving with zero further edits. `tui/render.rs`'s copy turned out to have zero
+  callers even before this change (dead code); deleted outright with no re-export. Two tests
+  (`format_tokens_matches_pi_thresholds`, `run_mode_label_covers_every_variant`) were consolidated
+  into `formatters.rs`'s new `#[cfg(test)] mod tests` — net test count unchanged (2483 before and
+  after).
+- **AC8** (`native_supervisor::agent_dir_from` naming collision): renamed to
+  `intercom_agent_dir_from` at its 4 in-crate call sites (`prompt_runtime.rs`,
+  `extension/host/native_impl.rs`, its own tests) plus one cross-crate comment reference in
+  `cyrup-it`'s `native_supervisor_channel_integration.rs` test.
+- **AC4** (`byte-identical` stale-duplication comments) — resolved in spirit, not by literal grep
+  count. A dedicated sweep (background agent, full context read on all 46 occurrences) found the
+  literal `grep -rn 'byte-identical' src/` still returns 46, but every one is a legitimate,
+  accurate use unrelated to this task's duplication: fidelity-to-upstream-TypeScript claims
+  ("byte-identical to `pi`/upstream"), determinism/round-trip invariants ("same input ->
+  byte-identical output"), or one specific still-true named comparison
+  (`native_supervisor.rs:1766`, comparing to a genuinely different crate's function it cannot
+  import due to the dependency edge). The FALSE "byte-identical to N other copies" comments the
+  task's own Evidence section quoted (`tool_description.rs`, `missions/store.rs:602`,
+  `background/mod.rs:2612`) were already deleted along with their duplicate function bodies in the
+  prior merged PR's `home_dir`/`agent_dir` consolidation — nothing false survives. Rewriting or
+  deleting 46 correct, load-bearing comments to force a grep count to 0 would have been a net
+  regression, so none were touched. One adjacent, same-theme leftover found during this pass —
+  `discovery/management.rs`'s "duplicated locally (rather than importing a private helper)"
+  rationale comment, flagged separately in `.flux/review/low/management-stale-duplication-
+  rationale-comment.md` — was fixed too, since it's the one comment in the crate that actually was
+  still stale in this exact sense.
+
+Verified: `cargo test -p cyrup-ext-subagents --lib` — 2483 passed, 0 failed (same count as before).
+`cargo clippy -p cyrup-ext-subagents --all-targets` — only the two pre-existing findings remain
+(`exec/spawn_plan.rs` too-many-arguments, `extension/tool/text.rs` doc_lazy_continuation).
+`cargo doc -p cyrup-ext-subagents --no-deps --lib` — clean, 0 unresolved-link errors.
+`cargo check --workspace --all-targets` and `cargo build -p cyrup-it --tests --features it` — both
+clean.
 
 ## Source
 

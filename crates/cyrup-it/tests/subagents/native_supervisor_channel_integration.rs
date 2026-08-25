@@ -605,7 +605,7 @@ async fn the_supervisor_tool_is_registered_and_dispatches_on_a_real_session() {
     // documented product opt-in, exported on developer machines and CI runners alike. Left
     // unscrubbed it made the gate true, the alias unregistered, and this test fail with
     // `Tool 'intercom' not found` on any box that sets it. `CYRUP_CODING_AGENT_DIR` is scrubbed
-    // too because `agent_dir_from` (`src/native_supervisor.rs:1772-1784`) reads it BEFORE
+    // too because `intercom_agent_dir_from` (`src/native_supervisor.rs:1770-1785`) reads it BEFORE
     // `CYRUP_HOME`, so an ambient value would silently defeat the tempdir isolation below.
     // The guards must be installed BEFORE the extension is constructed: `SubagentsExtension::init`
     // is what reads the env.

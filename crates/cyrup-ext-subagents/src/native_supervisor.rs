@@ -1767,7 +1767,7 @@ pub fn native_child_client_should_register(agent_dir: &Path) -> bool {
 /// dependency edge (`cyrup-intercom` → this crate) forbids importing. Pinned by
 /// `tests::the_agent_dir_resolution_matches_the_intercom_crates_table`.
 #[must_use]
-pub fn agent_dir_from(
+pub fn intercom_agent_dir_from(
     env: &dyn Fn(&str) -> Option<String>,
     cwd: Option<PathBuf>,
 ) -> PathBuf {
@@ -2193,12 +2193,12 @@ mod tests {
     fn the_agent_dir_resolution_matches_the_intercom_crates_table() {
         // Absolute `CYRUP_CODING_AGENT_DIR` wins verbatim.
         assert_eq!(
-            agent_dir_from(&|k| (k == "CYRUP_CODING_AGENT_DIR").then(|| "/opt/agent".to_string()), None),
+            intercom_agent_dir_from(&|k| (k == "CYRUP_CODING_AGENT_DIR").then(|| "/opt/agent".to_string()), None),
             PathBuf::from("/opt/agent")
         );
         // A relative one resolves against cwd.
         assert_eq!(
-            agent_dir_from(
+            intercom_agent_dir_from(
                 &|k| (k == "CYRUP_CODING_AGENT_DIR").then(|| "rel/agent".to_string()),
                 Some(PathBuf::from("/work"))
             ),
@@ -2206,7 +2206,7 @@ mod tests {
         );
         // A blank one is ignored; CYRUP_HOME beats HOME; the suffix is `.cyrup`.
         assert_eq!(
-            agent_dir_from(
+            intercom_agent_dir_from(
                 &|k| match k {
                     "CYRUP_CODING_AGENT_DIR" => Some("   ".to_string()),
                     "CYRUP_HOME" => Some("/h1".to_string()),
@@ -2218,7 +2218,7 @@ mod tests {
             PathBuf::from("/h1/.cyrup")
         );
         assert_eq!(
-            agent_dir_from(&|k| (k == "HOME").then(|| "/h2".to_string()), None),
+            intercom_agent_dir_from(&|k| (k == "HOME").then(|| "/h2".to_string()), None),
             PathBuf::from("/h2/.cyrup")
         );
     }

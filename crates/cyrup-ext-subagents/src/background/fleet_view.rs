@@ -53,6 +53,7 @@ use std::path::{Path, PathBuf};
 
 use super::run_status::{ActiveRun, progress_label, run_mode_label, run_state_label, step_state_label};
 use super::{ActivityState, RunPaths, RunStatus, StepStatus};
+use crate::formatters::{format_model_thinking, format_tokens};
 
 /// pi `DEFAULT_TRANSCRIPT_LINES` (`fleet-view.ts:21`).
 pub const DEFAULT_TRANSCRIPT_LINES: usize = 80;
@@ -238,39 +239,6 @@ pub fn format_activity_label(
         _ if age == "now" => Some("active now".to_string()),
         _ => Some(format!("active {age} ago")),
     }
-}
-
-/// pi `formatTokens` (`shared/formatters.ts`), duplicated from `registration/cost.rs`'s private copy
-/// rather than cross-imported: that one is `fn`-private to the cost walk and this module must not
-/// reach into it.
-fn format_tokens(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 10_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        format!("{}k", (n as f64 / 1000.0).round() as u64)
-    }
-}
-
-/// pi `formatModelThinking` (`shared/formatters.ts:19-29`): drop the provider prefix from the model
-/// ref, and append `thinking <level>` when a thinking level is known. cyrup's [`super::ModelId`]
-/// never carries pi's `:thinking-high` style suffix (the level rides on `StepTelemetry::thinking`),
-/// so only the explicit-level half of pi's two sources applies.
-fn format_model_thinking(model: Option<&str>, thinking: Option<&str>) -> String {
-    const THINKING_LEVELS: [&str; 4] = ["off", "low", "medium", "high"];
-    let display_model = model.map(|m| match m.rfind('/') {
-        Some(i) => m.get(i.saturating_add(1)..).unwrap_or(m),
-        None => m,
-    });
-    let display_thinking = thinking
-        .map(str::trim)
-        .filter(|t| THINKING_LEVELS.contains(t));
-    [display_model.map(str::to_string), display_thinking.map(|t| format!("thinking {t}"))]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .join(" · ")
 }
 
 /// The inputs pi's `formatActivityFacts` (`fleet-view.ts:207-226`) reads, gathered off either a

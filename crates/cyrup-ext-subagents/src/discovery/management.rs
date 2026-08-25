@@ -208,10 +208,11 @@ pub struct AgentMutationOutcome {
 
 // -------------------------------------------------------------------------------------------
 // Package-identifier validation (mirrors `frontmatter.rs::parse_package_name`'s validation
-// grammar exactly, R-SA-006). Duplicated locally (rather than importing a private helper from
-// `frontmatter.rs`) since this module owns its own file and must not require edits to
-// `frontmatter.rs` to build; the two implementations are each unit-tested against the same
-// fixture set to guard against drift.
+// grammar exactly, R-SA-006). The two shared primitives (`collapse_repeated_char`,
+// `is_valid_package_identifier`) are imported from `super::package_name`, the crate's single
+// port; only the outer normalize/collapse-whitespace sequencing below is written out locally,
+// to preserve this function's own `Option`-shaped error handling (see `package_name.rs`'s
+// module doc for why three differently-shaped callers exist instead of one shared function).
 // -------------------------------------------------------------------------------------------
 
 /// Normalize + validate a caller-supplied package identifier exactly per R-SA-006's grammar:
@@ -4152,9 +4153,10 @@ mod tests {
 
     #[test]
     fn normalize_package_identifier_matches_frontmatter_rs_validation_fixtures() {
-        // Same fixture set `frontmatter.rs`'s own tests pin, to guard the two duplicated
-        // implementations against drift (see this module's header note on why the validator is
-        // duplicated rather than imported).
+        // Same fixture set `frontmatter.rs`'s own tests pin, to guard this module's outer
+        // normalize sequencing against drift from `frontmatter.rs::parse_package_name`'s (the
+        // two primitives both call into are shared via `super::package_name`; see this module's
+        // header note above `normalize_package_identifier`).
         assert_eq!(normalize_package_identifier(None), None);
         assert_eq!(normalize_package_identifier(Some("")), None);
         assert_eq!(normalize_package_identifier(Some("   ---   ")), None);

@@ -44,7 +44,7 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-use crate::background::{RunMode, RunState};
+use crate::background::RunState;
 use crate::fork_context::ContextMode;
 use crate::tui::{NestedRunSummary, SubagentProgressSnapshot};
 
@@ -386,19 +386,6 @@ pub fn render_background_region(snapshots: &[SubagentProgressSnapshot], tick: us
     out
 }
 
-/// Renders a compact one-line summary for a run mode label — used by callers that need a short
-/// descriptor (e.g. `"chain"`/`"parallel"`/`"single"`) alongside a header line without pulling in
-/// a full [`SubagentProgressSnapshot`]. Kept trivial and separate from [`render_run_header_line`]
-/// since not every call site wants the mode label inline.
-#[must_use]
-pub fn run_mode_label(mode: RunMode) -> &'static str {
-    match mode {
-        RunMode::Single => "single",
-        RunMode::Parallel => "parallel",
-        RunMode::Chain => "chain",
-    }
-}
-
 /// Flattens a rendered [`Vec<Line>`] to plain text, one row per line, with no trailing styling
 /// information — a small convenience for callers/tests that want a plain-text assertion surface
 /// without going through a full [`ratatui::backend::TestBackend`] paint. Every function in this
@@ -658,13 +645,6 @@ mod tests {
         assert!(plain[0].contains(FORK_BADGE_TEXT));
         assert!(plain[1].contains("child-1"));
         assert!(plain[1].starts_with("  "), "nested child must be indented under parent");
-    }
-
-    #[test]
-    fn run_mode_label_covers_every_variant() {
-        assert_eq!(run_mode_label(RunMode::Single), "single");
-        assert_eq!(run_mode_label(RunMode::Parallel), "parallel");
-        assert_eq!(run_mode_label(RunMode::Chain), "chain");
     }
 
     // ---- Determinism: same input -> byte-identical output across repeated calls ----

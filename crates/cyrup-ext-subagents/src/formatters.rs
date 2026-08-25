@@ -64,3 +64,24 @@ pub fn run_mode_label(mode: RunMode) -> &'static str {
         RunMode::Chain => "chain",
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_tokens_matches_pi_thresholds() {
+        assert_eq!(format_tokens(0), "0");
+        assert_eq!(format_tokens(999), "999");
+        assert_eq!(format_tokens(1500), "1.5k");
+        assert_eq!(format_tokens(9999), "10.0k");
+        assert_eq!(format_tokens(12_345), "12k");
+    }
+
+    #[test]
+    fn run_mode_label_covers_every_variant() {
+        assert_eq!(run_mode_label(RunMode::Single), "single");
+        assert_eq!(run_mode_label(RunMode::Parallel), "parallel");
+        assert_eq!(run_mode_label(RunMode::Chain), "chain");
+    }
+}
