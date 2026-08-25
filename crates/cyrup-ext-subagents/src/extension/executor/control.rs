@@ -320,7 +320,7 @@ impl SubagentExecutor {
         }
 
         // pi `:65-66`: `{ ...latestStatus, displayDismissedAt: Date.now() }` written atomically.
-        latest.display_dismissed_at = Some(crate::background::now_epoch_millis_pub());
+        latest.display_dismissed_at = Some(crate::time::now_epoch_millis());
         write_atomic_json(&paths.status, &latest)
             .await
             .map_err(|e| format!("Failed to dismiss async run {run_id_text}: {e}"))?;

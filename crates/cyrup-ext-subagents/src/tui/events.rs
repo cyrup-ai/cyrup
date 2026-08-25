@@ -448,7 +448,7 @@ impl LiveProgressFold {
                     self.recent_tools.push_back(RecentToolCall {
                         tool,
                         args: std::mem::take(&mut self.current_tool_args),
-                        end_ms: u64::try_from(crate::background::now_epoch_millis_pub())
+                        end_ms: u64::try_from(crate::time::now_epoch_millis())
                             .unwrap_or(0),
                     });
                 }

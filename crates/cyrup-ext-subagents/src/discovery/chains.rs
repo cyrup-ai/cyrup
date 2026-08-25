@@ -48,6 +48,7 @@ use super::types::{
 use crate::spawn::chain_graph::{
     DynamicGroupSpec, OnEmpty, ParallelGroupSpec, RunnerStep, SingleStepSpec,
 };
+use super::package_name::normalize_valid_package_name;
 
 /// File extension suffix recognized for JSON-format chain files (higher precedence, R-SA-015).
 const CHAIN_JSON_SUFFIX: &str = ".chain.json";
@@ -609,86 +610,13 @@ fn parse_chain_package_name(value: Option<&str>, label: &str) -> Result<Option<S
     if raw.is_empty() {
         return Ok(None);
     }
-    match normalize_package_name(raw) {
-        Some(pkg) if is_valid_package_identifier(&pkg) => Ok(Some(pkg)),
-        _ => Err(format!("{label} is invalid after sanitization.")),
-    }
+    normalize_valid_package_name(raw)
+        .map(Some)
+        .ok_or_else(|| format!("{label} is invalid after sanitization."))
 }
 
-/// Port of `identity.ts::normalizePackageName`: trim; lowercase; whitespace runs -> single `-`;
-/// strip any char outside `[a-z0-9.-]`; collapse repeated `-` then repeated `.`; trim leading/
-/// trailing `-`/`.`. Returns `None` when the result is empty (source's `if (!trimmed) return`).
-fn normalize_package_name(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let lowered = trimmed.to_lowercase();
 
-    let mut collapsed_ws = String::with_capacity(lowered.len());
-    let mut last_was_ws = false;
-    for ch in lowered.chars() {
-        if ch.is_whitespace() {
-            if !last_was_ws {
-                collapsed_ws.push('-');
-            }
-            last_was_ws = true;
-        } else {
-            collapsed_ws.push(ch);
-            last_was_ws = false;
-        }
-    }
 
-    let filtered: String = collapsed_ws
-        .chars()
-        .filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '.' || *c == '-')
-        .collect();
-    let collapsed_hyphen = collapse_repeated_char(&filtered, '-');
-    let collapsed_dot = collapse_repeated_char(&collapsed_hyphen, '.');
-    let final_name = collapsed_dot
-        .trim_start_matches(['-', '.'])
-        .trim_end_matches(['-', '.'])
-        .to_string();
-
-    if final_name.is_empty() {
-        None
-    } else {
-        Some(final_name)
-    }
-}
-
-fn collapse_repeated_char(s: &str, target: char) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_was_target = false;
-    for ch in s.chars() {
-        if ch == target {
-            if !prev_was_target {
-                out.push(ch);
-            }
-            prev_was_target = true;
-        } else {
-            out.push(ch);
-            prev_was_target = false;
-        }
-    }
-    out
-}
-
-/// `^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$` — lowercase alphanumeric/hyphen segments,
-/// dot-separated, each segment starting with an alphanumeric character.
-fn is_valid_package_identifier(name: &str) -> bool {
-    if name.is_empty() {
-        return false;
-    }
-    name.split('.').all(|segment| {
-        let mut chars = segment.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
-            _ => return false,
-        }
-        chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
-    })
-}
 
 // -------------------------------------------------------------------------------------------
 // Acceptance validation (acceptance.ts::validateAcceptanceInput)

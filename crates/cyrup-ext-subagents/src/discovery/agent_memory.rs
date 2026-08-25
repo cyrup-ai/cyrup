@@ -387,32 +387,13 @@ pub fn build_agent_memory_injection_with_root(
     .join("\n")
 }
 
-/// pi `getAgentDir()` (`shared/utils.ts:72-77`) — kept byte-identical to
-/// `exec::mcp_direct_tools::resolve_agent_dir` and `registration::prompt_workflows::agent_dir`,
-/// which are the same upstream function; the three must not disagree about where the agent dir is.
-fn agent_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let configured = std::env::var("CYRUP_AGENT_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var("PI_CODING_AGENT_DIR").ok().filter(|v| !v.is_empty()));
-    match configured {
-        Some(v) if v == "~" => home,
-        Some(v) if v.starts_with("~/") => home.join(v.get(2..).unwrap_or("")),
-        Some(v) => PathBuf::from(v),
-        None => home.join(".cyrup").join("agent"),
-    }
-}
-
 /// The production scope-root resolver (pi `agent-memory.ts:196-205`): `<agentDir>/agent-memory` for
 /// `user`, `<projectConfigDir>/agent-memory` for `project` — the latter only when a project root is
 /// discoverable from `cwd`.
 #[must_use]
 pub fn memory_scope_root(scope: MemoryScope, cwd: &Path) -> Option<PathBuf> {
     match scope {
-        MemoryScope::User => Some(agent_dir().join(AGENT_MEMORY_DIR_NAME)),
+        MemoryScope::User => Some(crate::paths::agent_dir().join(AGENT_MEMORY_DIR_NAME)),
         MemoryScope::Project => super::find_nearest_project_root(cwd)
             .map(|root| root.join(super::PROJECT_CONFIG_DIR_SEGMENT).join(AGENT_MEMORY_DIR_NAME)),
     }

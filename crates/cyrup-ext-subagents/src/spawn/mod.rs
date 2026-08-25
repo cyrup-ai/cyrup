@@ -313,53 +313,22 @@ fn write_private(path: &Path, contents: &str) -> Result<(), SubagentError> {
     }
 }
 
-/// One NDJSON line from a spawned child's stdout (R-SA-057), parsed against `cyrup`'s own native
-/// JSON-mode wire-event shape (`--mode json`, `cyrup-modes/src/print.rs`'s JSONL emitter).
-///
-/// This is deliberately a narrow, tolerant view: this crate has ZERO dependency on `cyrup-agent`
-/// (arch-SA §2.1), so it does not import that crate's own event enum — instead it captures only
-/// the handful of fields the spawn boundary and its immediate callers need (progress bookkeeping,
-/// usage accumulation, tool-call counting), tagged by a `type` discriminant, with every other
-/// event shape degrading to [`NdjsonEvent::Unknown`] rather than a parse error. A fuller,
-/// purpose-built typed union for the foreground executor's own use (final-output extraction,
-/// acceptance-report scanning, structured-output validation) is `exec/ndjson.rs`'s
-/// `SubagentEvent` — a later phase of this crate's build-out (arch-SA §2.2) — which this module
-/// does not depend on and does not attempt to replace; [`NdjsonEvent`] is scoped strictly to what
-/// the raw spawn boundary itself needs to observe.
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum NdjsonEvent {
-    /// A tool call started executing.
-    ToolExecutionStart {
-        /// The tool call's correlation id.
-        call_id: String,
-        /// The tool name.
-        name: String,
-    },
-    /// A tool call finished executing.
-    ToolExecutionEnd {
-        /// The tool call's correlation id.
-        call_id: String,
-        /// Whether the tool call ended in an error.
-        #[serde(default)]
-        is_error: bool,
-    },
-    /// An assistant message completed, carrying token/cost usage for this turn.
-    MessageEnd {
-        /// The raw message payload (left as an opaque JSON value here; typed message parsing is
-        /// `exec/ndjson.rs`'s concern, not the spawn boundary's).
-        message: serde_json::Value,
-        /// Per-message usage accounting, when present.
-        #[serde(default)]
-        usage: Option<serde_json::Value>,
-    },
-    /// Any event shape this narrow view does not specifically recognize. Never a parse error —
-    /// an unrecognized `type` tag (or a shape this enum simply hasn't been taught yet) degrades
-    /// here rather than aborting NDJSON consumption (R-SA-026's tolerance principle, applied at
-    /// this layer too even though R-SA-026 itself is `exec/ndjson.rs`'s direct responsibility).
-    #[serde(other)]
-    Unknown,
-}
+// Where a child's stdout lines are typed.
+//
+// This module deliberately defines NO event schema of its own. It used to: a narrow
+// `NdjsonEvent` with `#[serde(tag = "type", rename_all = "snake_case")]` and no
+// `rename_all_fields`, whose `tool_execution_*` variants required snake_case payload keys
+// (`call_id`, `name`, `is_error`) that the real producer — `cyrup --mode json`, whose
+// `cyrup_agent::AgentEvent` carries `rename_all_fields = "camelCase"` — never emits. A known
+// `type` tag with a missing required field fails the WHOLE line's deserialize, and
+// `#[serde(other)]` only rescues an unknown *tag*, so that parser silently yielded `None` for
+// exactly the two events it existed to observe. Every line was then parsed a second time, from
+// the identical bytes, by [`crate::exec::ndjson::parse_line`].
+//
+// So the spawn boundary is now a pure line source: it reads, tees (R-SA-058), and hands back the
+// raw line text. [`crate::exec::ndjson::SubagentEvent`] is the crate's single NDJSON schema and
+// [`crate::exec::ndjson::parse_line`] its single parse — one shape to keep in step with the
+// producer, so a newly added child event has exactly one place to be taught.
 
 /// One live spawned child; owns the kill-escalation state machine (R-SA-059) and the raw NDJSON
 /// stdout read loop (R-SA-057/058).
@@ -376,9 +345,10 @@ pub enum NdjsonEvent {
 /// never happen. [`Self::Exited`] is the missing third outcome.
 #[derive(Debug)]
 pub enum ChildStep {
-    /// A stdout line arrived — or reading/teeing it failed, exactly as
-    /// [`SpawnedChild::next_event`] reports it.
-    Line(Result<NdjsonLine, SubagentError>),
+    /// A stdout line arrived — its raw text, exactly as read and already teed — or reading/teeing
+    /// it failed, exactly as [`SpawnedChild::next_event`] reports it. Typing the line is
+    /// [`crate::exec::ndjson::parse_line`]'s job, not this boundary's.
+    Line(Result<String, SubagentError>),
     /// stdout reached EOF: the ordinary end of a well-behaved child.
     Eof,
     /// The process exited while its stdout is STILL OPEN (a surviving grandchild inherited the
@@ -429,18 +399,6 @@ pub struct SpawnedChild {
     /// `wait()` has been called) — tracked so [`SpawnedChild::terminate`] and any caller-side
     /// drain-then-exit path never double-`wait()` the same child.
     exited: bool,
-}
-
-/// One parsed line from a child's raw NDJSON stdout stream, alongside the line's original text
-/// (already teed to the `.jsonl` artifact by the time this is returned).
-#[derive(Debug, Clone)]
-pub struct NdjsonLine {
-    /// The raw line text, exactly as read from the child's stdout, before any parse attempt.
-    pub raw: String,
-    /// The parsed event, or `None` if the line failed to parse as JSON at all (R-SA-026's
-    /// tolerance: a malformed line is skipped, never fatal — [`SpawnedChild::next_event`] simply
-    /// surfaces `raw` with `parsed: None` rather than erroring the whole run).
-    pub parsed: Option<NdjsonEvent>,
 }
 
 impl SpawnedChild {
@@ -594,23 +552,23 @@ impl SpawnedChild {
         self.child.as_ref().and_then(tokio::process::Child::id)
     }
 
-    /// Read and return the next line of the child's stdout as NDJSON (R-SA-057/058).
+    /// Read and return the next raw line of the child's NDJSON stdout (R-SA-057/058).
     ///
     /// Per line: the raw bytes are teed, unmodified, to the `.jsonl` artifact file FIRST (R-SA-058
-    /// — "as they are read", not buffered and written at exit), then a parse attempt is made;
-    /// [`NdjsonLine::parsed`] is `None` on a parse failure rather than this method returning an
-    /// error, so a single malformed line never aborts the read loop (R-SA-026's tolerance
-    /// principle, restated at this layer since this is where lines are actually read). The caller
-    /// (a later phase's `exec::ndjson::consume_stdout`-equivalent fold, or a test) is expected to
-    /// drive its own progress/status state from each successfully parsed event before requesting
-    /// the next line — this method itself does not maintain any progress state; it is a pure
-    /// line-source.
+    /// — "as they are read", not buffered and written at exit), then the line's text is handed
+    /// back verbatim. This method does NOT parse: it is a pure line-source, and typing a line is
+    /// [`crate::exec::ndjson::parse_line`]'s job — the crate's single NDJSON schema (see the
+    /// comment above [`SpawnedChild`] for why there is no second one here). R-SA-026's tolerance
+    /// therefore lives entirely at that parse: an unparseable line still arrives here, still gets
+    /// teed, and is simply skipped by the caller's fold rather than aborting the read loop. The
+    /// caller drives its own progress/status state from the events it parses out; this method
+    /// maintains no progress state of its own.
     ///
     /// Returns `None` once the child's stdout stream reaches EOF (the child closed its stdout,
     /// normally because it exited). A tee-write failure surfaces as `Some(Err(..))` rather than
     /// silently dropping the line — losing the on-disk audit artifact is treated as a real error,
-    /// distinct from a parse failure.
-    pub async fn next_event(&mut self) -> Option<Result<NdjsonLine, SubagentError>> {
+    /// unlike a parse failure downstream, which is tolerated.
+    pub async fn next_event(&mut self) -> Option<Result<String, SubagentError>> {
         let line = match self.stdout.next().await {
             BoundedRead::Line(line) => line,
             BoundedRead::Eof => return None,
@@ -630,8 +588,7 @@ impl SpawnedChild {
             return Some(Err(SubagentError::Spawn(err)));
         }
 
-        let parsed = serde_json::from_str::<NdjsonEvent>(&line).ok(); // R-SA-026: tolerated, never fatal
-        Some(Ok(NdjsonLine { raw: line, parsed }))
+        Some(Ok(line))
     }
 
     /// [`SpawnedChild::next_event`], plus the third outcome that method cannot express: the process
@@ -687,8 +644,7 @@ impl SpawnedChild {
             return ChildStep::Line(Err(SubagentError::Spawn(err)));
         }
 
-        let parsed = serde_json::from_str::<NdjsonEvent>(&line).ok(); // R-SA-026: tolerated, never fatal
-        ChildStep::Line(Ok(NdjsonLine { raw: line, parsed }))
+        ChildStep::Line(Ok(line))
     }
 
     /// Move the handle on the child's already-running stderr pump out of this [`SpawnedChild`], so
@@ -1212,27 +1168,43 @@ mod tests {
         );
     }
 
-    // ---- NdjsonEvent parsing tolerance ----
+    // ---- The single NDJSON parse, at the shape the real child actually emits ----
 
+    /// The spawn boundary used to carry its own `NdjsonEvent` whose `tool_execution_start`
+    /// variant required snake_case payload keys (`call_id`, `name`). The real producer
+    /// (`cyrup --mode json`, serializing `cyrup_agent::AgentEvent`, which carries
+    /// `rename_all_fields = "camelCase"`) emits `toolCallId`/`toolName`, so that variant never
+    /// once matched a real line — a known `type` tag with a missing required field fails the
+    /// whole line's deserialize, and `#[serde(other)]` rescues only an unknown TAG. The fixture
+    /// pinning it was hand-written, so CI never saw the drift.
+    ///
+    /// This is that line as the emitter really writes it, through the crate's one parser.
     #[test]
-    fn ndjson_event_parses_known_shapes() {
-        let ev: NdjsonEvent =
-            serde_json::from_str(r#"{"type":"tool_execution_start","call_id":"c1","name":"bash"}"#)
-                .expect("parses");
+    fn a_real_tool_execution_start_line_parses_with_a_populated_call_id() {
+        let line = r#"{"type":"tool_execution_start","toolCallId":"toolu_01ABC","toolName":"bash","args":{"command":"ls"}}"#;
+        let ev = crate::exec::ndjson::parse_line(line)
+            .expect("a real emitter line must parse, not degrade to None");
+        let crate::exec::ndjson::SubagentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            ..
+        } = ev
+        else {
+            panic!("a real `tool_execution_start` line must parse to the tool-start variant, got {ev:?}");
+        };
         assert_eq!(
-            ev,
-            NdjsonEvent::ToolExecutionStart {
-                call_id: "c1".to_string(),
-                name: "bash".to_string(),
-            }
+            tool_call_id.as_str(),
+            "toolu_01ABC",
+            "the call id must survive the parse, not arrive empty"
         );
+        assert_eq!(tool_name, "bash");
     }
 
     #[test]
     fn ndjson_event_degrades_unknown_tags_rather_than_erroring() {
-        let ev: NdjsonEvent = serde_json::from_str(r#"{"type":"some_future_event","x":1}"#)
+        let ev = crate::exec::ndjson::parse_line(r#"{"type":"some_future_event","x":1}"#)
             .expect("an unrecognized tag must still parse, degrading to Unknown");
-        assert_eq!(ev, NdjsonEvent::Unknown);
+        assert_eq!(ev, crate::exec::ndjson::SubagentEvent::Unknown);
     }
 
     // ---- Real-subprocess tests: argv/env construction against a scripted stand-in ----
@@ -1358,7 +1330,7 @@ mod tests {
         let mut received_args = Vec::new();
         while let Some(result) = child.next_event().await {
             let line = result.expect("no I/O error reading the scripted child's stdout");
-            if let Some(arg) = line.raw.strip_prefix(r#"{"type":"unknown","arg":""#) {
+            if let Some(arg) = line.strip_prefix(r#"{"type":"unknown","arg":""#) {
                 received_args.push(arg.trim_end_matches("\"}").to_string());
             }
         }
@@ -1400,14 +1372,14 @@ mod tests {
             .await
             .expect("first event is present")
             .expect("no I/O error");
-        assert!(first.raw.contains("\"n\":1"));
+        assert!(first.contains("\"n\":1"));
 
         let mid_stream_contents = tokio::fs::read_to_string(&jsonl_path)
             .await
             .expect("artifact readable mid-stream");
         assert_eq!(
             mid_stream_contents.trim(),
-            first.raw,
+            first,
             "the FIRST line must already be flushed to disk before the child emits its second \
              (deliberately delayed) line — proving live teeing, not buffer-at-exit"
         );
@@ -1420,8 +1392,9 @@ mod tests {
     /// R-SA-026's tolerance, exercised through the real spawn boundary: a malformed (non-JSON)
     /// line from the child's stdout must still be teed to the artifact (R-SA-058 makes no
     /// exception for unparseable lines) but must NOT abort the read loop or surface as an error —
-    /// `NdjsonLine::parsed` is simply `None` for that one line, and subsequent well-formed lines
-    /// still parse normally.
+    /// the line arrives verbatim, the crate's one parser
+    /// ([`crate::exec::ndjson::parse_line`]) simply returns `None` for it, and subsequent
+    /// well-formed lines still parse normally.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_malformed_line_is_teed_and_skipped_without_aborting_the_stream() {
         let dir = tempfile::tempdir().expect("real tempdir");
@@ -1445,9 +1418,9 @@ mod tests {
             .await
             .expect("first (malformed) line is still surfaced")
             .expect("no I/O error, even though the line is not valid JSON");
-        assert_eq!(first.raw, "not valid json at all");
+        assert_eq!(first, "not valid json at all");
         assert!(
-            first.parsed.is_none(),
+            crate::exec::ndjson::parse_line(&first).is_none(),
             "a malformed line must parse to None, not error the run"
         );
 
@@ -1457,7 +1430,7 @@ mod tests {
             .expect("the stream continues past the malformed line")
             .expect("no I/O error");
         assert!(
-            second.parsed.is_some(),
+            crate::exec::ndjson::parse_line(&second).is_some(),
             "a well-formed line after a malformed one still parses"
         );
 
@@ -1518,7 +1491,7 @@ mod tests {
 
         let mut lines = Vec::new();
         while let Some(result) = child.next_event().await {
-            lines.push(result.expect("no I/O error").raw);
+            lines.push(result.expect("no I/O error"));
         }
         child.finish();
 
@@ -1573,10 +1546,10 @@ mod tests {
         child.finish();
 
         assert!(
-            first.raw.contains(&inherited_path),
+            first.contains(&inherited_path),
             "PATH must be inherited verbatim when the overlay does not mention it at all \
              (env_clear() must never be called), got: {}",
-            first.raw
+            first
         );
     }
 

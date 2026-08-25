@@ -1,0 +1,36 @@
+---
+stage: new
+status: done
+updated: 2026-08-23 02:15
+---
+
+# Repoint The Crate's Prose At The Test Layout That Actually Exists
+
+## Description
+
+Two commits (63d729a 'move 199 integration tests into their crates as unit tests' and c3982b5 'add cyrup-it integration harness') drained this crate's `tests/` directory, and nothing updated the prose that describes it. The crate now has no `tests/` directory at all — only Cargo.toml, resources/ and src/ — yet ~20 source comments and three Cargo.toml comment blocks still route readers there.
+
+This matters more here than usual because these comments are the only map of which of the crate's four test locations covers a given seam (inline `mod tests`, the `#[path]` sibling routing_tests.rs, src/tests/, and crates/cyrup-it/tests/subagents/). Following one now dead-ends, so a reader checking whether a spawn-env or permission-forwarding contract is proven anywhere cannot find the proof. Worst of all, the file whose job is to STATE the placement rule contradicts itself: src/tests/mod.rs:10-12 says env-mutating files 'can NOT move here … Those files stay in `tests/`' — naming the deleted directory as the destination, so the rule cannot be applied by anyone adding a test today.
+
+The same drift left three defects in Cargo.toml, whose ~90 lines of rationale prose are the only place the crate's layering rules are recorded. `cyrup-session-svc` is a dev-dependency justified by a test file that lives in a different crate, is referenced by zero code in this crate, and is already reached through `cyrup-test-support` anyway. The `test-fixtures` feature and both `[[bin]]` blocks claim to serve 'this crate's own integration tests' opted into 'via `cargo test`' — a package cannot enable its own feature from its dev-dependency closure, so 651 lines of spawn-boundary test doubles never build under the crate's own `--all-targets` gate and go unlinted. And the `cyrup-provider` justification names `catalog::seed_catalog`, which the workspace describes as 'the retired 2-model stub' and which is defined nowhere, while understating the coupling: the real API is `builtin_catalog()` and one of its consumers is `watchdog/model_selection.rs`, i.e. model-selection policy, not the 'ONLY … static-catalog read' for two slash commands the comment claims.
+
+## Evidence
+
+`ls crates/cyrup-ext-subagents` = Cargo.toml, resources, src — no tests/ directory; `git log --oneline` confirms 63d729a and c3982b5. ~20 stale references: src/background/control.rs:2748, src/exec/output.rs:1694, src/background/spawn_detached.rs:270-271, src/background/runner_main.rs:3746/3801/3849/3859/3928/4165, src/extension/testsupport.rs:10, src/extension/executor/paths.rs:755, src/extension/host/registration.rs:267, src/tests/dynamic_collect_record_fidelity.rs:22 and :25, src/exec/mod.rs:1312 and :7058 (both cite `cyrup-permission-system/tests/forwarding_spawn_env.rs`, now crates/cyrup-it/tests/permission/forwarding_spawn_env.rs; :7058 calls it 'the other half of that chain' for the PERM-001 test at :7060), plus src/discovery/skills.rs:90 and :758 (cite a `cyrup-resources` tests/ dir that does not exist) and src/tui/render.rs:686 (cites crates/cyrup-tui/tests/assembled_render.rs, absent). Real destinations: 2 files in src/tests/, the rest under crates/cyrup-it/tests/{subagents,permission}/. Self-contradicting rule verbatim at src/tests/mod.rs:10-12. Cargo.toml: the cyrup-session-svc block is Cargo.toml:148-156 and names `tests/extension_end_to_end_smoke.rs`, which is at crates/cyrup-it/tests/subagents/extension_end_to_end_smoke.rs in a crate carrying its own `cyrup-session-svc` (crates/cyrup-it/Cargo.toml:92); `grep -rn 'cyrup_session_svc' crates/cyrup-ext-subagents/src/` returns 1 hit, a `//!` doc line at exec/ndjson.rs:20 — zero code references; `cargo tree -p cyrup-ext-subagents -e normal,dev --invert cyrup-session-svc` shows it already reached via cyrup-test-support (Cargo.toml:147). test-fixtures blocks at Cargo.toml:15-21, 93-99, 105-109; `cargo check -p cyrup-ext-subagents --all-targets` never builds src/bin/ (cyrup_subagent_fixture.rs 460 lines + cyrup_subagent_orchestrator_sim.rs 191 = 651); the real consumer is crates/cyrup-it/build.rs:67-77, whose BINS table runs `cargo build -p cyrup-ext-subagents --features test-fixtures` (note: cyrup-it does NOT gate those tests with `#![cfg(feature = "test-fixtures")]` — crates/cyrup-it/tests/subagents/main.rs:22-31 records that the attribute was deliberately removed because it would compile every module to nothing there; availability is a build.rs postcondition). cyrup-provider block at Cargo.toml:37-44; `grep -rn seed_catalog --include=*.rs crates/` finds no definition, only crates/cyrup-it/tests/subagents/registration_commands_integration.rs:112 calling it 'the retired 2-model `seed_catalog()` stub'; `load_catalog` exists at crates/cyrup-provider/src/catalog.rs:17 but is never called from this crate; real production call sites of `builtin_catalog()` are src/extension/models/mod.rs:59 and src/watchdog/model_selection.rs:165,172.
+
+## Suggested approach
+
+Mechanical but do it with `ls` on every rewritten path rather than by pattern — the referenced files landed in three different destinations (src/tests/, crates/cyrup-it/tests/subagents/, crates/cyrup-it/tests/permission/) and three point at other crates' deleted tests/ dirs. Fix src/tests/mod.rs's rule first, since the other comments should be consistent with it. For the cyrup-session-svc block, if the crate-boundary sentence it carries ('never depends on the session-service facade in production code') is worth keeping, move it to the `//!` doc of src/extension/mod.rs where it sits next to the code it constrains. For cyrup-provider, either rewrite the rationale to match reality or, if the narrow boundary was the actual intent, route the watchdog's catalog access through extension/models so the stated rule and the code agree again.
+
+## Acceptance Criteria
+
+- [ ] `grep -rn '`tests/' src/ | grep -v 'tests/foo.rs\|tests/file.rs\|tests/regression.rs'` returns 0 — every remaining reference names a path that exists (verify each with `ls`)
+- [ ] src/tests/mod.rs's module doc states the rule now in force (in-process -> inline `mod tests`; whole file, no process seam -> src/tests/; needs `unsafe { std::env::set_var }` or a spawned binary -> crates/cyrup-it/tests/subagents/) and no longer names a `tests/` directory in this crate
+- [ ] Cargo.toml:148-156 is deleted; `grep -c cyrup-session-svc crates/cyrup-ext-subagents/Cargo.toml` = 0 and `cargo test -p cyrup-ext-subagents --no-run` still succeeds
+- [ ] The three test-fixtures comment blocks name crates/cyrup-it/build.rs's BINS table as the consumer and state the command that builds the bins (`cargo build -p cyrup-ext-subagents --features test-fixtures`); `grep -c 'this crate.s own integration tests' Cargo.toml` = 0
+- [ ] `grep -c seed_catalog crates/cyrup-ext-subagents/Cargo.toml` = 0 and the cyrup-provider rationale names `cyrup_provider::catalog::builtin_catalog()` plus its real consumers, including watchdog/model_selection.rs
+
+## Source
+
+- Identified by the `subagents-hygiene-survey` workflow (13 agents, 21 raw findings, 16 confirmed after adversarial verification).
+- Effort: small · survey priority: 6 of 6

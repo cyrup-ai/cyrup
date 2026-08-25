@@ -15,8 +15,9 @@ use crate::exec::model_scope::ModelScopeConfig;
 use crate::fork_context::{ContextMode, ForkContext, ForkContextResolver};
 use crate::extension::executor::SubagentExecutor;
 use crate::extension::executor::paths::{
-    builtin_agents_dir, dirs_home, enumerate_installed_packages, unreachable_session_manager,
+    builtin_agents_dir, enumerate_installed_packages, unreachable_session_manager,
 };
+use crate::paths::home_dir;
 
 impl SubagentExecutor {
 
@@ -53,7 +54,7 @@ impl SubagentExecutor {
     /// today, so this crate never silently trusts a project's installed packages). Global-scope
     /// packages are always enumerated (trust-independent, matching `cyrup-resources`' own gate).
     pub(crate) fn discovery_dirs_config(cwd: &Path) -> Result<AgentDiscoveryConfig, SubagentError> {
-        let home = dirs_home();
+        let home = home_dir();
         let global_dir = home.join(".cyrup");
         // Upward project-root search — pi `findConfiguredProjectRoot` (`agents.ts:657-672`), which is
         // what `resolveNearestProjectAgentDirs`/`resolveNearestProjectChainDirs`/
@@ -109,7 +110,7 @@ impl SubagentExecutor {
     /// callers rely on.
     pub(crate) fn discovery_config(cwd: &Path) -> Result<AgentDiscoveryConfig, SubagentError> {
         let mut cfg = Self::discovery_dirs_config(cwd)?;
-        let user_settings = dirs_home().join(".cyrup").join("agents").join("settings.json");
+        let user_settings = home_dir().join(".cyrup").join("agents").join("settings.json");
         // pi `getProjectAgentSettingsPath` (`agents.ts:678-681`) keys the project settings file on
         // `findConfiguredProjectRoot(cwd)` — the SAME root the project agent/chain dirs came from —
         // not on the bare cwd. Keying it on `cwd` meant a session started in a subdirectory read a
@@ -263,7 +264,7 @@ impl SubagentExecutor {
     /// as the fallback for `None` (no host handle — the SDK-embedder / headless path), and for the
     /// (rare) case where the supplied session file cannot be opened.
     pub(crate) fn fork_resolver(cwd: &Path, session_file: Option<&Path>) -> ForkContextResolver {
-        let sessions_root = dirs_home().join(".cyrup").join("sessions");
+        let sessions_root = home_dir().join(".cyrup").join("sessions");
         let layout = cyrup_session::SessionLayout::new(sessions_root.clone(), cwd.to_path_buf());
         // Blocker #4: prefer the real live-orchestrator session file (P-1) over the mtime heuristic.
         if let Some(path) = session_file

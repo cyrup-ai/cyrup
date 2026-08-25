@@ -57,6 +57,7 @@ use cyrup_core::ModelId;
 
 use super::types::{AgentDefinition, AgentSource, OutputMode, OutputSpec, SystemPromptMode, ToolRef};
 use crate::fork_context::ContextMode;
+use super::package_name::{collapse_repeated_char, is_valid_package_identifier};
 
 /// The two frontmatter keys whose absence causes the entire agent file to be silently skipped
 /// (R-SA-005). Exposed as constants so both this module and any diagnostic/test surface reference
@@ -644,41 +645,7 @@ fn parse_package_name(raw: Option<&str>) -> Result<Option<String>, ()> {
     Ok(Some(final_name))
 }
 
-fn collapse_repeated_char(s: &str, target: char) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_was_target = false;
-    for ch in s.chars() {
-        if ch == target {
-            if !prev_was_target {
-                out.push(ch);
-            }
-            prev_was_target = true;
-        } else {
-            out.push(ch);
-            prev_was_target = false;
-        }
-    }
-    out
-}
 
-/// `^[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*$` — lowercase alphanumeric/hyphen segments,
-/// dot-separated, each segment starting with an alphanumeric character (R-SA-006).
-fn is_valid_package_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    for segment in s.split('.') {
-        let mut chars = segment.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
-            _ => return false,
-        }
-        if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-            return false;
-        }
-    }
-    true
-}
 
 /// R-SA-018: discovery-time defaults for `systemPromptMode`/`inheritProjectContext`, computed from
 /// the agent's **local (pre-packaging) name** — `Append`/`true` only when `local_name ==

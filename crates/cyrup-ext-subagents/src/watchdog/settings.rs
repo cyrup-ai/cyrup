@@ -738,46 +738,9 @@ fn is_directory(dir: &Path) -> bool {
     std::fs::metadata(dir).map(|m| m.is_dir()).unwrap_or(false)
 }
 
-/// The user home dir, following this crate's existing `CYRUP_HOME` -> `HOME` -> tempdir convention
-/// (`exec/mcp_direct_tools.rs:831-836`, itself mirroring `extension.rs::dirs_home`).
-fn home_dir() -> PathBuf {
-    std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-/// `getAgentDir()` (`shared/utils.ts:95-100`) — `$CYRUP_AGENT_DIR`/`$PI_CODING_AGENT_DIR` with `~`
-/// expansion, else `<home>/.cyrup/agent`. Byte-identical to
-/// `exec/mcp_direct_tools.rs`'s `resolve_agent_dir`, which is the crate's existing port of the same
-/// upstream function.
-fn agent_dir() -> PathBuf {
-    let home = home_dir();
-    let configured = std::env::var("CYRUP_AGENT_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::env::var("PI_CODING_AGENT_DIR")
-                .ok()
-                .filter(|v| !v.is_empty())
-        });
-    match configured {
-        Some(v) if v == "~" => home,
-        Some(v) if v.starts_with("~/") => home.join(v.get(2..).unwrap_or("")),
-        Some(v) => PathBuf::from(v),
-        None => home.join(".cyrup").join("agent"),
-    }
-}
-
-/// `getProjectConfigDir(projectRoot)` (`shared/utils.ts:91-93`) — `<root>/.cyrup` (upstream
-/// `<root>/.pi`), the same directory `cyrup_config::ConfigDirs::project_config_dir` names.
-fn project_config_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".cyrup")
-}
-
 /// `getUserSettingsPath` (`settings.ts:422-424`).
 fn user_settings_path() -> PathBuf {
-    agent_dir().join("settings.json")
+    crate::paths::agent_dir().join("settings.json")
 }
 
 /// `getWatchdogUserSettingsPath()` (`settings.ts:426-428`) — the path `/subagents-watchdog on|off`
@@ -794,8 +757,8 @@ pub fn get_watchdog_user_settings_path() -> PathBuf {
 fn find_project_settings_path(cwd: &Path) -> Option<PathBuf> {
     let mut current = cwd.to_path_buf();
     loop {
-        if is_directory(&project_config_dir(&current)) || is_directory(&current.join(".agents")) {
-            return Some(project_config_dir(&current).join("settings.json"));
+        if is_directory(&crate::paths::project_config_dir(&current)) || is_directory(&current.join(".agents")) {
+            return Some(crate::paths::project_config_dir(&current).join("settings.json"));
         }
         let parent = current.parent()?.to_path_buf();
         if parent == current {
@@ -809,7 +772,7 @@ fn find_project_settings_path(cwd: &Path) -> Option<PathBuf> {
 /// always `<cwd>/.cyrup/settings.json` with no upward walk at all.
 #[must_use]
 pub fn get_watchdog_project_settings_path(cwd: &Path) -> PathBuf {
-    project_config_dir(cwd).join("settings.json")
+    crate::paths::project_config_dir(cwd).join("settings.json")
 }
 
 // =================================================================================================
@@ -1495,7 +1458,7 @@ mod tests {
 
     /// A temp project root carrying the `.cyrup` marker directory the project-layer walk looks for.
     ///
-    /// The USER layer's path comes from the process environment (`agent_dir()`), and this crate is
+    /// The USER layer's path comes from the process environment ([`crate::paths::agent_dir`]), and this crate is
     /// `#![forbid(unsafe_code)]` while Rust 2024 requires `unsafe` for `std::env::set_var`, so a
     /// test cannot relocate it. These tests therefore drive the pure path resolution
     /// ([`find_project_settings_path`]) and the parse/merge/write core against explicit paths —

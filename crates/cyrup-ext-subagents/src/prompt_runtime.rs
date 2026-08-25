@@ -319,7 +319,7 @@ impl SteeringInbox {
             index: self.child_index,
             state,
             message: message.to_string(),
-            ts: crate::background::control::now_epoch_millis(),
+            ts: crate::time::now_epoch_millis(),
             delivery_status,
         };
         let _ = crate::background::control::write_steer_ack_at(dir, &ack).await;
@@ -349,7 +349,7 @@ impl SteeringInbox {
             protocol_version: 1,
             index: self.child_index,
             pid: std::process::id(),
-            ready_at: crate::background::control::now_epoch_millis(),
+            ready_at: crate::time::now_epoch_millis(),
             supported,
         };
         let _ = crate::background::control::write_steer_capability_at(path, &capability).await;

@@ -157,14 +157,3 @@ pub(crate) fn format_iso8601_millis(ms: i64) -> String {
     crate::background::run_status::format_iso8601_millis(ms)
 }
 
-/// `Date.now()` — epoch milliseconds, saturating rather than panicking on a pre-epoch clock.
-#[must_use]
-pub fn now_ms() -> i64 {
-    i64::try_from(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0),
-    )
-    .unwrap_or(i64::MAX)
-}

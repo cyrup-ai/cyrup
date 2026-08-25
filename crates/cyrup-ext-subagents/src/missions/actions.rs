@@ -41,7 +41,7 @@ use super::store::{
 };
 use super::workflow_state::mission_state_path;
 use super::{
-    now_ms, MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionDecisionInput,
+    MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionDecisionInput,
     MissionError, MissionGoal, MissionGoalStatus, MissionGoalUpdate, MissionReceiptInput,
     MissionReceiptKind, MissionReceiptStatus, MissionRecord, MissionResult, MissionRunLink,
     MissionRunMode, MissionStatus, MissionStoreConfig, MissionStoreLocation, MissionTokenBudget,
@@ -629,7 +629,7 @@ fn refresh_linked_run_status(
         updates.push(MissionRunLink {
             status: Some(state.to_string()),
             completed_at: if terminal && run.completed_at.is_none() {
-                Some(super::format_iso8601_millis(now_ms()))
+                Some(super::format_iso8601_millis(crate::time::now_epoch_millis()))
             } else {
                 run.completed_at.clone()
             },
@@ -692,7 +692,7 @@ fn refresh_linked_run_status(
         location,
         &record.id,
         &MissionUpdateInput { status: Some(status), add_runs: updates, ..Default::default() },
-        now_ms(),
+        crate::time::now_epoch_millis(),
         None,
     )?;
     Ok((refreshed, warnings))
@@ -813,7 +813,7 @@ pub fn handle_mission_action(
                     labels: mission.labels,
                     owner_session_id: ctx.current_session_id.clone(),
                 },
-                now_ms(),
+                crate::time::now_epoch_millis(),
                 ctx.config.as_ref().and_then(|c| c.retain_terminal),
             )?;
             let path = mission_record_path(&location, &record.id)?;
@@ -926,7 +926,7 @@ pub fn handle_mission_action(
                 &location,
                 &require_mission_id(params)?,
                 &validate_mission_update(params.mission_update.as_ref())?,
-                now_ms(),
+                crate::time::now_epoch_millis(),
                 None,
             )?;
             let path = mission_record_path(&location, &record.id)?;
@@ -970,13 +970,13 @@ pub fn handle_mission_action(
                         child_index: None,
                         agent: params.agent.clone(),
                         status: params.run_status.clone(),
-                        started_at: Some(super::format_iso8601_millis(now_ms())),
+                        started_at: Some(super::format_iso8601_millis(crate::time::now_epoch_millis())),
                         completed_at: None,
                         usage: None,
                     }],
                     ..Default::default()
                 },
-                now_ms(),
+                crate::time::now_epoch_millis(),
                 None,
             )?;
             let path = mission_record_path(&location, &record.id)?;
@@ -1008,7 +1008,7 @@ pub fn handle_mission_action(
                     summary: params.summary.as_deref().map(|s| s.trim().to_string()),
                     ..Default::default()
                 },
-                now_ms(),
+                crate::time::now_epoch_millis(),
                 None,
             )?;
             let path = mission_record_path(&location, &record.id)?;

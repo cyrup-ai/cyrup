@@ -79,8 +79,9 @@ pub struct SingleStepSpec {
     pub task: String,
     /// Working directory override for this step. In a `worktree: true` [`ParallelGroupSpec`],
     /// an explicit per-task `cwd` here MUST be rejected before any child is spawned (R-SA-062) —
-    /// enforced by [`crate::spawn::worktree::reject_task_level_cwd_overrides`], called by
-    /// [`walk_chain`] itself for any `worktree: true` group before delegating to `run_bounded`.
+    /// enforced by [`crate::spawn::worktree::find_worktree_task_cwd_conflict`], called inside
+    /// [`crate::spawn::worktree::setup_worktree_group`] for any `worktree: true` group before
+    /// [`walk_chain`] delegates to `run_bounded`.
     pub cwd: Option<PathBuf>,
     /// Explicit model override for this step, taking precedence over the agent's own configured
     /// model when present (func-SA §4.3 `RunOptions::model_override`, R-SA-041's inherit
@@ -702,8 +703,7 @@ fn compact_structured_text(value: &Value) -> String {
 /// expansion at all, which is why a step declaring `reads: ["~/notes.md"]` resolved to the literal
 /// `<chain_dir>/~/notes.md`.
 ///
-/// `os.homedir()` follows this crate's `CYRUP_HOME` → `HOME` → tempdir convention (six identical
-/// resolvers, see `missions/store.rs::home_dir`).
+/// `os.homedir()` is the crate's one home resolver, [`crate::paths::home_dir`].
 fn expand_home_path(file: &Path) -> PathBuf {
     let Some(text) = file.to_str() else {
         // A non-UTF-8 path can neither BE `~` nor START with `~/`, so both upstream branches are
@@ -711,27 +711,18 @@ fn expand_home_path(file: &Path) -> PathBuf {
         return file.to_path_buf();
     };
     if text == "~" {
-        return home_dir();
+        return crate::paths::home_dir();
     }
     if let Some(rest) = text.strip_prefix("~/") {
         // Node's `path.join` drops empty segments, so upstream's `path.join(os.homedir(), "")` for
         // the bare `"~/"` is the homedir itself. `Path::join("")` in Rust appends a separator
         // instead, so the empty tail is short-circuited to keep the two identical.
         if rest.is_empty() {
-            return home_dir();
+            return crate::paths::home_dir();
         }
-        return home_dir().join(rest);
+        return crate::paths::home_dir().join(rest);
     }
     file.to_path_buf()
-}
-
-/// `os.homedir()`, following this crate's `CYRUP_HOME` → `HOME` → tempdir convention
-/// (`missions/store.rs::home_dir`, `exec/mcp_direct_tools.rs:831`, `spawn/worktree.rs:236`, …).
-fn home_dir() -> PathBuf {
-    std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
 }
 
 /// Resolve a chain-relative file path against `chain_dir` the way pi's `resolveChainPath`
@@ -1285,7 +1276,7 @@ pub struct GroupStepResult {
 pub struct ChainRunContext {
     /// The base working directory steps without their own `cwd` override run in. Also the
     /// shared repository cwd a `worktree: true` [`ParallelGroupSpec`] validates via
-    /// [`crate::spawn::worktree::check_clean_working_tree`] before any worktree is created.
+    /// [`crate::spawn::worktree::create_worktrees`] before any worktree is created.
     pub cwd: PathBuf,
     /// The chain-wide deadline (R-SA-035: monotonically shrinking, computed once, passed through
     /// unmodified to every step — never reset per step).
@@ -2697,13 +2688,13 @@ mod tests {
     ///
     /// The `~user/` case is the one it would be easy to get wrong in the generous direction:
     /// upstream deliberately leaves it alone (`expandHomePath` handles ONLY `"~"` and a `"~/"`
-    /// prefix). Asserted against this module's own `home_dir()` rather than a mutated `CYRUP_HOME`,
+    /// prefix). Asserted against the crate's own [`crate::paths::home_dir`] rather than a mutated `CYRUP_HOME`,
     /// so the test neither races 2200 siblings over process-global env nor depends on the
     /// developer's real home.
     #[test]
     fn resolve_chain_path_expands_home_exactly_where_pi_does() {
         let chain = Path::new("/chain");
-        let h = home_dir();
+        let h = crate::paths::home_dir();
         let cases: &[(&str, PathBuf)] = &[
             ("~", h.clone()),
             ("~/", h.clone()),

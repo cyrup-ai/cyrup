@@ -68,6 +68,7 @@ use super::{
     discover_agents_all, resolve_agent_name, AgentDiscoveryConfig, AgentDiscoveryResult,
     AgentNameResolution,
 };
+use super::package_name::{collapse_repeated_char, is_valid_package_identifier};
 
 // -------------------------------------------------------------------------------------------
 // R-SA-013: call-site-dependent `disabled` visibility
@@ -264,39 +265,7 @@ fn normalize_package_identifier(raw: Option<&str>) -> Option<String> {
     Some(final_name)
 }
 
-fn collapse_repeated_char(s: &str, target: char) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut prev_was_target = false;
-    for ch in s.chars() {
-        if ch == target {
-            if !prev_was_target {
-                out.push(ch);
-            }
-            prev_was_target = true;
-        } else {
-            out.push(ch);
-            prev_was_target = false;
-        }
-    }
-    out
-}
 
-fn is_valid_package_identifier(s: &str) -> bool {
-    if s.is_empty() {
-        return false;
-    }
-    for segment in s.split('.') {
-        let mut chars = segment.chars();
-        match chars.next() {
-            Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
-            _ => return false,
-        }
-        if !chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-') {
-            return false;
-        }
-    }
-    true
-}
 
 // -------------------------------------------------------------------------------------------
 // Agent create/update/delete/rename

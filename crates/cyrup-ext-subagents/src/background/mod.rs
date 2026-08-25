@@ -63,7 +63,6 @@ pub mod wait;
 pub mod resume_guidance;
 
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use cyrup_core::{ModelId, Usage};
 
@@ -880,7 +879,7 @@ impl RunStatus {
     /// runner has written anything of its own. `started_at`/`last_update` are both set to "now".
     #[must_use]
     pub fn queued(run_id: RunId, mode: RunMode, pid: Option<u32>) -> Self {
-        let now = now_epoch_millis();
+        let now = crate::time::now_epoch_millis();
         Self {
             run_id,
             // The launching session is the runner's to record (it is the only process that knows
@@ -973,7 +972,7 @@ impl RunStatus {
     pub fn advance_state(&mut self, next: RunState) -> Result<(), RunStateTransitionError> {
         let advanced = self.state.try_advance(next)?;
         self.state = advanced;
-        let now = now_epoch_millis();
+        let now = crate::time::now_epoch_millis();
         self.last_update = now;
         if advanced.is_terminal() {
             self.ended_at = Some(now);
@@ -986,7 +985,7 @@ impl RunStatus {
     /// acceptance) that R-SA-075 requires a persisted update for even though the overall `state`
     /// enum value itself is unchanged.
     pub fn touch(&mut self) {
-        self.last_update = now_epoch_millis();
+        self.last_update = crate::time::now_epoch_millis();
     }
 }
 
@@ -1173,28 +1172,6 @@ const ASYNC_SUBDIR: &str = "async";
 /// `RESULTS_DIR` leaf, `"async-subagent-results"` (`shared/types.ts:1862` @v0.43.0), shortened
 /// for the same reason as [`ASYNC_SUBDIR`].
 const RESULTS_SUBDIR: &str = "results";
-
-/// The current wall-clock time as whole milliseconds since the Unix epoch, saturating to `u64`.
-///
-/// Two callers need the SAME reading, on opposite sides of a process boundary, which is why this
-/// lives here rather than privately in either of them: `extension.rs` stamps
-/// `RunnerConfig::deadline_at_ms` with it when a background run carries a `timeoutMs`
-/// (pi `deadlineAt = Date.now() + params.timeoutMs`, `runs/background/async-execution.ts:1302-1305`
-/// @v0.34.0), and `runner_main::run` subtracts it back out in the detached hop-2 process
-/// (pi `Math.max(0, config.deadlineAt - Date.now())`, `runs/background/subagent-runner.ts:2079`).
-/// It also stamps per-provider catalog freshness
-/// (`registration::profiles::ProviderModelCatalog`) and gates the `--force`/staleness check.
-///
-/// Never panics: a pre-epoch clock reads as `0`, and a value beyond `u64::MAX` ms
-/// (year ~584 million) saturates rather than overflowing.
-#[must_use]
-pub(crate) fn now_epoch_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .and_then(|d| u64::try_from(d.as_millis()).ok())
-        .unwrap_or(0)
-}
 
 /// One segment of a temp-scope id, with every character outside `[A-Za-z0-9._-]` collapsed to a
 /// single `-` and leading/trailing `-` stripped; an empty result becomes `"unknown"`.
@@ -2405,51 +2382,6 @@ pub fn resolve_async_run_id(
     Ok(matches.pop())
 }
 
-// =================================================================================================
-// Time helper
-// =================================================================================================
-
-/// Current wall-clock time as epoch milliseconds, clamped to `i64::MAX`/`0` on the (practically
-/// unreachable on any real system clock) chance the conversion would otherwise overflow/underflow
-/// — never a panic. Kept private: every other module in this crate obtains a timestamp through
-/// [`RunStatus`]'s own constructors/mutators rather than calling this directly, so there is one
-/// place the epoch-conversion policy lives.
-/// Public re-export of [`now_epoch_millis`]'s exact policy, for callers OUTSIDE this module that
-/// still need to stamp an individual [`StepStatus`]/[`ParallelGroupStatus`] field directly (e.g.
-/// `runner_main.rs`'s per-step `started_at`/`ended_at` bookkeeping, which mutates fields nested
-/// inside `RunStatus.steps`/`RunStatus.parallel_groups` that no [`RunStatus`] method itself
-/// exposes a setter for) — kept as a thin wrapper around the private [`now_epoch_millis`] rather
-/// than making that function itself `pub`, so the module's own doc comment ("kept private: every
-/// other module... obtains a timestamp through `RunStatus`'s own constructors/mutators") stays
-/// accurate for every USE CASE that constructor/mutator surface already covers, while still
-/// giving the narrow, genuinely-uncovered case (stamping a nested per-step field the top-level
-/// `RunStatus` API has no setter for) a sanctioned entry point instead of a second, independently
-/// reimplemented clamp-never-panic conversion.
-#[must_use]
-pub fn now_epoch_millis_pub() -> i64 {
-    now_epoch_millis()
-}
-
-fn now_epoch_millis() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        // A system clock set before the Unix epoch is not something this crate can do anything
-        // sane about; 0 is a safe, non-panicking floor rather than propagating an error type
-        // through every status-mutating call site for a condition that indicates a broken host
-        // clock, not a bug in this crate's own logic.
-        Err(_) => 0,
-    }
-}
-
-// =================================================================================================
-// Run-history recording (pi `runs/shared/run-history.ts`)
-// =================================================================================================
-//
-// pi appends one line per finished run to `<agentDir>/run-history.jsonl` via `recordRun`
-// (`run-history.ts:132-153`), a best-effort telemetry log a later `/subagents`-style surface reads
-// back. This is the Rust port of that write path, driven by the background runner's terminal
-// completion (`background/runner_main.rs::finish_run` records one entry per top-level result).
-
 /// One line of `run-history.jsonl` (pi `RunEntry`, `run-history.ts:5-12`): the agent, its (200-char-
 /// capped) task, a **seconds** epoch timestamp, an `"ok"`/`"error"` status, the run duration in
 /// milliseconds, and — only when nonzero — the failing exit code. Field names match pi's exact
@@ -2482,7 +2414,7 @@ pub struct RunHistoryEntry {
 /// tree that this module now correctly treats as disposable.
 #[must_use]
 pub fn run_history_path() -> PathBuf {
-    agent_dir().join("run-history.jsonl")
+    crate::paths::agent_dir().join("run-history.jsonl")
 }
 
 /// The run-history file for a run whose per-run directories hang off `async_root`.
@@ -2510,43 +2442,6 @@ pub fn run_history_path_for(async_root: &Path) -> PathBuf {
         .join("run-history.jsonl")
 }
 
-/// The user home dir, following this crate's `CYRUP_HOME` → `HOME` → tempdir convention
-/// (`extension.rs::dirs_home`, `exec/mcp_direct_tools.rs:831-836`,
-/// `registration/prompt_workflows.rs:105-110`, `watchdog/settings.rs:743-748`,
-/// `missions/store.rs:592-597` — the same resolver, and none of them may disagree).
-///
-/// Honouring `CYRUP_HOME` FIRST is what makes [`run_history_path`] sandboxable: a test that points
-/// `CYRUP_HOME` at a `TempDir` moves the history file with it. `missions/store.rs` was the one copy
-/// that omitted this check, and that omission alone leaked mission pointers into a real `~/.cyrup`
-/// through 19 correctly-sandboxed tests.
-fn home_dir() -> PathBuf {
-    std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-/// pi `getAgentDir()` (`shared/utils.ts:95-100` @v0.43.0): `$CYRUP_AGENT_DIR`/`$PI_CODING_AGENT_DIR`
-/// with `~` expansion, else `<home>/.cyrup/agent`. Byte-identical to the crate's four other copies
-/// of this same upstream function.
-pub(crate) fn agent_dir() -> PathBuf {
-    let home = home_dir();
-    let configured = std::env::var("CYRUP_AGENT_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::env::var("PI_CODING_AGENT_DIR")
-                .ok()
-                .filter(|v| !v.is_empty())
-        });
-    match configured {
-        Some(v) if v == "~" => home,
-        Some(v) if v.starts_with("~/") => home.join(v.get(2..).unwrap_or("")),
-        Some(v) => PathBuf::from(v),
-        None => home.join(".cyrup").join("agent"),
-    }
-}
-
 /// Append one [`RunHistoryEntry`] per `result` to `run-history.jsonl` (pi's `recordRun`,
 /// `run-history.ts:132-153`) — best-effort: a missing directory is created, and every I/O or
 /// serialization failure is silently swallowed so history recording can never fail a run (pi wraps
@@ -2563,7 +2458,7 @@ async fn record_run_history_at(path: &Path, run_started_at: i64, results: &[Sing
     if results.is_empty() {
         return;
     }
-    let now = now_epoch_millis();
+    let now = crate::time::now_epoch_millis();
     let duration = (now - run_started_at).max(0);
     let Some(parent) = path.parent() else {
         return;
@@ -2713,7 +2608,7 @@ mod tests {
         bad.agent = "writer".to_string();
         bad.exit_code = 7;
 
-        record_run_history_at(&history_path, now_epoch_millis() - 1234, &[ok, bad]).await;
+        record_run_history_at(&history_path, crate::time::now_epoch_millis() - 1234, &[ok, bad]).await;
 
         let contents = std::fs::read_to_string(&history_path).expect("history file exists");
         let lines: Vec<&str> = contents.lines().collect();
@@ -3480,7 +3375,7 @@ mod tests {
             path.file_name().and_then(|n| n.to_str()),
             Some("run-history.jsonl")
         );
-        assert_eq!(path.parent(), Some(agent_dir().as_path()));
+        assert_eq!(path.parent(), Some(crate::paths::agent_dir().as_path()));
         assert!(
             !path.starts_with(temp_root_dir()),
             "durable run history must not live inside the disposable scratch root: {path:?}"
@@ -3584,18 +3479,5 @@ mod tests {
             }
         }
         assert_eq!(leftover_probes, 0, "the write probe must always be cleaned up");
-    }
-
-    // ---------------------------------------------------------------------------------------
-    // now_epoch_millis
-    // ---------------------------------------------------------------------------------------
-
-    #[test]
-    fn now_epoch_millis_is_positive_and_monotonic_enough_for_ordering() {
-        let a = now_epoch_millis();
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        let b = now_epoch_millis();
-        assert!(a > 0);
-        assert!(b >= a);
     }
 }

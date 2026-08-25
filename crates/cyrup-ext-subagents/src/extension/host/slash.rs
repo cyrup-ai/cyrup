@@ -189,7 +189,7 @@ impl SubagentsExtension {
             .executor
             .fleet_state(cwd, false, self.fleet_inspector_open.load(Ordering::Acquire))
             .await;
-        let now = crate::background::now_epoch_millis_pub();
+        let now = crate::time::now_epoch_millis();
         let payload = {
             let Ok(mut widget) = self.fleet_status.lock() else { return };
             widget.set_ui_available(has_ui);

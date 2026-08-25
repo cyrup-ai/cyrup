@@ -29,13 +29,12 @@
 //! real `git` CLI — rather than going through a Rust git library (`git worktree` has no mature
 //! `gix` equivalent). This mirrors pi's own `spawnSync("git", ...)` usage.
 //!
-//! # Legacy compatibility surface
+//! # Group-level wrappers over the pi-faithful primitives
 //!
 //! [`setup_worktree_group`] (plus [`WorktreeGroupConfig`]/[`WorktreeGroupPlan`]/
-//! [`WorktreeAssignment`], [`HookSpec`], [`DEFAULT_HOOK_TIMEOUT`], [`check_clean_working_tree`],
-//! [`reject_task_level_cwd_overrides`]) are retained as thin wrappers over the pi-faithful
-//! primitives so existing callers (`spawn::chain_graph::assign_worktree_cwds`) keep compiling while
-//! the crate converges on pi's `create_worktrees`/`diff_worktrees`/`cleanup_worktrees` contract.
+//! [`WorktreeAssignment`], [`HookSpec`]) is a thin group-shaped wrapper over [`create_worktrees`],
+//! and is what `spawn::chain_graph::assign_worktree_cwds` calls while the crate converges on pi's
+//! `create_worktrees`/`diff_worktrees`/`cleanup_worktrees` contract.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -48,10 +47,6 @@ use crate::error::SubagentError;
 /// Default bound on the optional setup hook's total runtime, in milliseconds (pi's
 /// `DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`, 30000ms).
 pub const DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS: u64 = 30_000;
-
-/// Legacy `Duration` alias of [`DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`], retained for existing
-/// doc-links (`acceptance.rs`, `registration/mod.rs`).
-pub const DEFAULT_HOOK_TIMEOUT: Duration = Duration::from_millis(DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS);
 
 /// Environment variable naming the base directory new worktrees are created under when neither a
 /// per-call `base_dir` nor an explicit config value is supplied (pi's `PI_SUBAGENTS_WORKTREE_DIR`,
@@ -233,13 +228,6 @@ async fn run_git_checked(cwd: &Path, args: &[&str]) -> Result<String, SubagentEr
 // Path helpers
 // =================================================================================================
 
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_default()
-}
-
 /// Lexically normalize a path (resolve `.`/`..` textually, without touching the filesystem) —
 /// the equivalent of Node's `path.resolve`/`path.normalize` for the containment checks below,
 /// which must work on worktree paths that may not exist yet.
@@ -315,7 +303,7 @@ fn resolve_worktree_base_dir(
 
     let expanded: PathBuf = trimmed
         .strip_prefix("~/")
-        .map_or_else(|| PathBuf::from(trimmed), |rest| home_dir().join(rest));
+        .map_or_else(|| PathBuf::from(trimmed), |rest| crate::paths::home_dir().join(rest));
     let resolved = if expanded.is_absolute() {
         expanded
     } else {
@@ -507,7 +495,7 @@ fn resolve_worktree_setup_hook(
 
     let expanded: PathBuf = hook_path
         .strip_prefix("~/")
-        .map_or_else(|| PathBuf::from(hook_path), |rest| home_dir().join(rest));
+        .map_or_else(|| PathBuf::from(hook_path), |rest| crate::paths::home_dir().join(rest));
 
     let resolved_path = if expanded.is_absolute() {
         expanded
@@ -1088,20 +1076,16 @@ pub fn format_worktree_diff_summary(diffs: &[WorktreeDiff]) -> String {
 }
 
 // =================================================================================================
-// Legacy compatibility surface (thin wrappers over the pi-faithful primitives)
+// Group-level wrappers over the pi-faithful primitives
 // =================================================================================================
 
-/// A configured external hook command (legacy shape retained for `registration/mod.rs` doc-links
-/// and the `spawn::chain_graph` caller). The pi-faithful hook contract is
-/// [`WorktreeSetupHookConfig`]; this shape's `command` maps onto `hook_path` and its `args` are
-/// currently ignored by the per-worktree invocation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HookSpec {
-    /// The executable to invoke.
-    pub command: PathBuf,
-    /// Legacy positional arguments (unused by the pi-faithful per-worktree hook contract).
-    pub args: Vec<String>,
-}
+/// The configured external hook command [`WorktreeGroupConfig`] accepts — an alias of the
+/// canonical [`crate::registration::HookSpec`] (arch-SA §2.2 designates `registration/mod.rs` as
+/// its owner).
+///
+/// The pi-faithful hook contract is [`WorktreeSetupHookConfig`]; this shape's `command` maps onto
+/// `hook_path` and its `args` are currently ignored by the per-worktree invocation.
+pub type HookSpec = crate::registration::HookSpec;
 
 /// Legacy per-group config accepted by [`setup_worktree_group`].
 #[derive(Debug, Clone)]
@@ -1206,54 +1190,6 @@ pub async fn setup_worktree_group(
         assignments,
         base_commit: setup.base_commit,
     })
-}
-
-/// Legacy standalone dirty-tree precondition (retained for doc-links). Equivalent to the check
-/// [`create_worktrees`] performs internally via [`resolve_repo_state`].
-///
-/// # Errors
-///
-/// Returns [`SubagentError::WorktreeSetup`] if `git status --porcelain` fails or reports a dirty
-/// tree.
-pub async fn check_clean_working_tree(repo_cwd: &Path) -> Result<(), SubagentError> {
-    let status = run_git(repo_cwd, &["status", "--porcelain"]).await?;
-    if status.status != Some(0) {
-        return Err(SubagentError::WorktreeSetup(format!(
-            "git status --porcelain failed in {}: {}",
-            repo_cwd.display(),
-            status.stderr.trim()
-        )));
-    }
-    if !status.stdout.trim().is_empty() {
-        return Err(SubagentError::WorktreeSetup(
-            "worktree isolation requires a clean git working tree. Commit or stash changes first."
-                .to_string(),
-        ));
-    }
-    Ok(())
-}
-
-/// Legacy strict override rejection (retained for doc-links). Prefer
-/// [`find_worktree_task_cwd_conflict`], which allows a task `cwd` equal to the shared cwd.
-///
-/// # Errors
-///
-/// Returns [`SubagentError::WorktreeSetup`] naming every task index whose entry is `Some`.
-pub fn reject_task_level_cwd_overrides(
-    task_cwd_overrides: &[Option<&Path>],
-) -> Result<(), SubagentError> {
-    let offenders: Vec<String> = task_cwd_overrides
-        .iter()
-        .enumerate()
-        .filter_map(|(index, cwd)| cwd.map(|path| format!("task[{index}]={}", path.display())))
-        .collect();
-    if offenders.is_empty() {
-        return Ok(());
-    }
-    Err(SubagentError::WorktreeSetup(format!(
-        "worktree: true groups cannot honor per-task cwd overrides (would defeat isolation): {}",
-        offenders.join(", ")
-    )))
 }
 
 #[cfg(test)]
@@ -1939,20 +1875,4 @@ mod tests {
         cleanup_worktrees(&setup).await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn check_clean_working_tree_detects_dirty() {
-        let repo = make_real_git_repo();
-        check_clean_working_tree(repo.path()).await.expect("clean");
-        std::fs::write(repo.path().join("x.txt"), "dirty").unwrap();
-        assert!(check_clean_working_tree(repo.path()).await.is_err());
-    }
-
-    #[test]
-    fn reject_task_level_cwd_overrides_names_offenders() {
-        let explicit = PathBuf::from("/x");
-        let overrides: Vec<Option<&Path>> = vec![None, Some(explicit.as_path())];
-        let err = reject_task_level_cwd_overrides(&overrides).expect_err("reject");
-        let SubagentError::WorktreeSetup(msg) = err else { panic!("wrong") };
-        assert!(msg.contains("task[1]"), "{msg}");
-    }
 }

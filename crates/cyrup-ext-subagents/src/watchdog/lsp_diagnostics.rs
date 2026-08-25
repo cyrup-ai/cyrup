@@ -53,7 +53,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{Mutex, oneshot};
 
-use super::runtime::{WatchdogLspDiagnostics, WatchdogLspRequest as RuntimeLspRequest};
+use super::runtime::WatchdogLspDiagnostics;
 use super::types::{
     WatchdogCategory, WatchdogConfidence, WatchdogLspConfig, WatchdogLspDiagnostic,
     WatchdogLspDiagnosticSeverity, WatchdogLspResult, WatchdogLspStatus, WatchdogSeverity,
@@ -81,7 +81,8 @@ const MAX_STDERR_LENGTH: usize = 2_000;
 /// `SHUTDOWN_TIMEOUT_MS` (`lsp-diagnostics.ts:60`).
 const SHUTDOWN_TIMEOUT_MS: u64 = 250;
 
-/// `WatchdogLspRequest` (`lsp-diagnostics.ts:14-20`).
+/// `WatchdogLspRequest` (`lsp-diagnostics.ts:14-20`) — also the argument bag the runtime's
+/// [`WatchdogLspDiagnostics::collect`] seam takes (`runtime.ts:727-733`).
 #[derive(Debug, Clone)]
 pub struct WatchdogLspRequest {
     /// The session cwd, used only as the root fallback.
@@ -92,7 +93,7 @@ pub struct WatchdogLspRequest {
     pub changed_paths: Vec<String>,
     /// The resolved LSP policy.
     pub config: WatchdogLspConfig,
-    /// Cancellation.
+    /// Cancellation — cancelled when the agent-end boundary is superseded.
     pub signal: Option<CancelToken>,
 }
 
@@ -1097,15 +1098,8 @@ impl TypeScriptLspDiagnostics {
 
 #[async_trait]
 impl WatchdogLspDiagnostics for TypeScriptLspDiagnostics {
-    async fn collect(&self, request: RuntimeLspRequest) -> Result<WatchdogLspResult, String> {
-        Ok(collect_watchdog_lsp_diagnostics(&WatchdogLspRequest {
-            cwd: request.cwd,
-            root: PathBuf::from(request.root),
-            changed_paths: request.changed_paths,
-            config: request.config,
-            signal: Some(request.cancel),
-        })
-        .await)
+    async fn collect(&self, request: WatchdogLspRequest) -> Result<WatchdogLspResult, String> {
+        Ok(collect_watchdog_lsp_diagnostics(&request).await)
     }
 
     fn reduce(&self, raw: WatchdogLspResult) -> WatchdogLspResult {

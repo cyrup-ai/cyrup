@@ -1,17 +1,15 @@
 //! The NDJSON event-stream parser for a spawned child's stdout (func-SA R-SA-026/057/058;
 //! arch-SA §6.3.1).
 //!
-//! # Scope and relationship to `spawn::NdjsonEvent`
+//! # Scope and relationship to `crate::spawn`
 //!
-//! [`crate::spawn`] already owns the literal spawn boundary and defines its own narrow
-//! `spawn::NdjsonEvent` — deliberately scoped to only the handful of fields the raw spawn
-//! machinery itself needs (progress bookkeeping, tee-to-artifact). This module is the "later
-//! phase" that file's own doc comment names: the fuller, purpose-built [`SubagentEvent`] tagged
-//! union the foreground executor (`exec/fallback.rs`, `exec/output.rs`, `exec/acceptance.rs` —
-//! none implemented yet, later phases of this crate's build-out) actually folds progress state,
-//! usage accounting, and final-output extraction from. It parses the exact same wire bytes
-//! `spawn::NdjsonEvent` does; the two are independent, tolerant views over one byte stream, not a
-//! layering of one on top of the other.
+//! [`crate::spawn`] owns the literal spawn boundary, but it defines NO event schema: it reads,
+//! tees each raw line to the `.jsonl` artifact, and hands the line's text back unparsed. This
+//! module is the crate's ONE NDJSON parser — [`SubagentEvent`] is the only child-event shape, and
+//! [`parse_line`] the only place a child stdout line is deserialized. The foreground executor
+//! (`exec/mod.rs`'s read loop, `exec/output.rs`, `exec/acceptance.rs`) folds progress state, usage
+//! accounting, and final-output extraction from it. A newly added child event is therefore taught
+//! here, once, with no second schema to guess at or drift from.
 //!
 //! # Wire schema
 //!
@@ -25,13 +23,16 @@
 //! camelCase (`toolCallId`, `toolName`, `isError`, …). [`SubagentEvent`] mirrors that shape
 //! exactly so it can deserialize a real child's stdout byte-for-byte — there is no separate "pi
 //! event schema" to reimplement (func-SA §4.4's `NdjsonEvent` data-model entry, restated
-//! verbatim).
+//! verbatim). Getting `rename_all_fields = "camelCase"` wrong here is silent, not loud: a known
+//! `type` tag whose required payload field is missing fails the WHOLE line's deserialize, and
+//! [`SubagentEvent::Unknown`]'s `#[serde(other)]` rescues only an unknown *tag*, so the event
+//! simply never arrives.
 //!
 //! This crate has ZERO dependency on `cyrup-agent` or `cyrup-session-svc` (arch-SA §2.1/§1.1) —
 //! the rich `AgentMessage`/`AssistantMessage`/`Content` payload types those crates own are
 //! therefore never imported here. Payload fields that would otherwise be one of those rich types
 //! (`message`, `args`, `result`, `partial_result`, `tool_results`, `messages`) are captured as
-//! opaque `serde_json::Value`, exactly mirroring `spawn::NdjsonEvent`'s own documented choice.
+//! opaque `serde_json::Value`.
 //! `usage`, when it appears, is read out of the embedded `message` value by
 //! [`SubagentEvent::assistant_usage`] using only `serde_json::Value` field lookups (never a typed
 //! `AssistantMessage` deserialize) — the assistant turn's `usage` field is nested inside
@@ -61,9 +62,9 @@
 //! sink BEFORE attempting to parse it, and does so as each line is read rather than buffering
 //! output for a single flush at the end (R-SA-058's "as they are read, not buffered and written
 //! at exit"). The actual `.jsonl` artifact file this feeds in production is owned by
-//! `spawn::SpawnedChild` (see that module's `jsonl_writer` field and its own, independent
-//! `tee_line` helper) — this module stays storage-agnostic and accepts any `FnMut(&str)` sink so
-//! it is trivially testable without real file I/O.
+//! `spawn::SpawnedChild` (see that module's `jsonl_writer` field) — this module stays
+//! storage-agnostic and accepts any `FnMut(&str)` sink so it is trivially testable without real
+//! file I/O.
 
 use std::collections::HashMap;
 
@@ -358,9 +359,7 @@ pub fn parse_line(line: &str) -> Option<SubagentEvent> {
 /// production and an in-memory scripted reader (partial reads, no trailing newline, interleaved
 /// malformed lines) in this module's own tests — the production call site (a later phase's
 /// `exec/fallback.rs`'s per-attempt driver, spawning through `crate::spawn::SpawnedChild`) wraps a
-/// real `tokio::process::ChildStdout` in a `tokio::io::BufReader` before calling this, exactly as
-/// `spawn::SpawnedChild::spawn` already does internally for its own narrower `NdjsonEvent` read
-/// loop.
+/// real `tokio::process::ChildStdout` in a `tokio::io::BufReader` before calling this.
 ///
 /// # Ordering and tolerance contract
 ///

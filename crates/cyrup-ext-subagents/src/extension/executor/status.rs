@@ -293,7 +293,7 @@ impl SubagentExecutor {
                 &self.foreground_fleet_entries(),
                 &runs,
                 child_safe,
-                crate::background::now_epoch_millis_pub(),
+                crate::time::now_epoch_millis(),
             );
         }
 

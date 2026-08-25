@@ -77,7 +77,15 @@ fn positive_env_number(name: &str, fallback: u64) -> u64 {
         .map_or(fallback, |parsed| parsed as u64)
 }
 
-/// `WatchdogRepoChangeSignature` (`change-signature.ts:33-37`).
+/// `WatchdogRepoChangeSignature` (`change-signature.ts:33-37`) — the identity of the working
+/// tree's current diff: the repo root, a content hash over every changed path, and the changed
+/// paths themselves.
+///
+/// The runtime uses the `key` for two decisions and the `changed_paths` for two more: an unchanged
+/// key at `agent_end` means there is nothing new to review (`runtime.ts:373`), and an empty
+/// `changedPaths` means the "changes only" trigger did not fire (`:703`); the paths drive the
+/// "Changed repo paths:" block of the review input (`:798-800`) and the set of files LSP
+/// diagnostics are collected for (`:713`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchdogRepoChangeSignature {
     /// The repository top level `git rev-parse --show-toplevel` reported.
@@ -570,14 +578,8 @@ pub fn event_indicates_repo_edit(event: &Value) -> bool {
 pub struct GitRepoChangeSource;
 
 impl super::runtime::WatchdogRepoChangeSource for GitRepoChangeSource {
-    fn compute(&self, cwd: &Path) -> Option<super::runtime::WatchdogRepoChangeSignature> {
-        compute_watchdog_repo_change_signature(cwd).map(|signature| {
-            super::runtime::WatchdogRepoChangeSignature {
-                root: signature.root,
-                key: signature.key,
-                changed_paths: signature.changed_paths,
-            }
-        })
+    fn compute(&self, cwd: &Path) -> Option<WatchdogRepoChangeSignature> {
+        compute_watchdog_repo_change_signature(cwd)
     }
 }
 

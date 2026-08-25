@@ -780,7 +780,7 @@ pub fn format_async_run_transcript(
         format!("State: {}", run_state_label(status.state)),
         format!("Mode: {}", run_mode_label(status.mode)),
     ];
-    let now = super::now_epoch_millis();
+    let now = crate::time::now_epoch_millis();
     if let Some(line) = step_state_line(status, selected, now) {
         lines.push(line);
     }

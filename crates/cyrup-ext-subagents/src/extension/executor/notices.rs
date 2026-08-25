@@ -330,7 +330,7 @@ impl SubagentExecutor {
                     // pi `control.updatedAt = Date.now()` alongside the activity write
                     // (`subagent-executor.ts:549-570` @v0.43.0) — the FleetView's newest-first sort
                     // key (`fleet.ts:142`).
-                    entry.updated_at = crate::background::now_epoch_millis_pub();
+                    entry.updated_at = crate::time::now_epoch_millis();
                 }
             }
             // (3) the `notifyChannels.includes("event")` CHANNEL gate (`:521`). `shouldNotifyControlEvent`
@@ -535,8 +535,8 @@ mod tests {
                     turn_count: None,
                     tool_count: None,
                     tokens: None,
-                    started_at: crate::background::now_epoch_millis_pub(),
-                    updated_at: crate::background::now_epoch_millis_pub(),
+                    started_at: crate::time::now_epoch_millis(),
+                    updated_at: crate::time::now_epoch_millis(),
                 },
             );
         }
@@ -610,8 +610,8 @@ mod tests {
                     turn_count: None,
                     tool_count: None,
                     tokens: None,
-                    started_at: crate::background::now_epoch_millis_pub(),
-                    updated_at: crate::background::now_epoch_millis_pub(),
+                    started_at: crate::time::now_epoch_millis(),
+                    updated_at: crate::time::now_epoch_millis(),
                 },
             );
         }
@@ -985,8 +985,8 @@ mod tests {
                     turn_count: None,
                     tool_count: None,
                     tokens: None,
-                    started_at: crate::background::now_epoch_millis_pub(),
-                    updated_at: crate::background::now_epoch_millis_pub(),
+                    started_at: crate::time::now_epoch_millis(),
+                    updated_at: crate::time::now_epoch_millis(),
                 },
             );
         }

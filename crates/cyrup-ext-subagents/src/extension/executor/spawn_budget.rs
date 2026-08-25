@@ -116,7 +116,7 @@ impl SubagentExecutor {
         budget_ops::grant_spawn_budget(
             &mut budget,
             additional,
-            crate::background::now_epoch_millis_pub(),
+            crate::time::now_epoch_millis(),
         )
     }
 

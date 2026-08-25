@@ -371,7 +371,7 @@ impl SubagentExecutor {
         // detached hop-2 process cannot be handed a `std::time::Instant` (opaque, monotonic,
         // process-local), and computing the deadline on the far side would silently refund every
         // millisecond the hop-1 spawn and hop-2 startup consumed.
-        let deadline_at_ms = timeout_ms.map(|ms| crate::background::now_epoch_ms().saturating_add(ms));
+        let deadline_at_ms = timeout_ms.map(|ms| u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0).saturating_add(ms));
 
         // pi `executeAsyncChain`/`executeAsyncSingle` (`async-execution.ts:631-634,890-893` @v0.34.0): a
         // background run started from WITHIN an already-nested run (this process inherited a nested
@@ -906,7 +906,7 @@ mod tests {
         let executor = SubagentExecutor::new();
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let before = crate::background::now_epoch_ms();
+        let before = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
         let run_id = executor
             .spawn_background(BackgroundSingleRequest {
                 // SUBA-021: unbudgeted on this path (see the field doc).
@@ -933,7 +933,7 @@ mod tests {
             })
             .await
             .expect("spawn_background should succeed for a resolvable builtin agent");
-        let after = crate::background::now_epoch_ms();
+        let after = u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0);
 
         let crate::background::RunArtifactRoots { async_root, results_dir } =
             crate::background::run_artifact_roots(dir.path());

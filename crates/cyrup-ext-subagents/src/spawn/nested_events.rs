@@ -641,7 +641,7 @@ pub fn create_nested_route(root_run_id: &str) -> Result<NestedRoute, SubagentErr
     let metadata = serde_json::json!({
         "rootRunId": root_run_id,
         "capabilityToken": capability_token,
-        "createdAt": now_ms(),
+        "createdAt": crate::time::now_epoch_millis(),
     });
     let route_file = route_root.join(ROUTE_FILE);
     std::fs::write(&route_file, format!("{metadata}\n")).map_err(SubagentError::Spawn)?;
@@ -916,13 +916,6 @@ pub fn parse_nested_event_records(content: &str, route: &NestedRoute) -> Vec<Nes
             }
         })
         .collect()
-}
-
-pub(crate) fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 fn write_route_record<T: serde::Serialize>(

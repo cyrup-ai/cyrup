@@ -177,7 +177,7 @@ impl ChildWatchdog {
             step_index: self.config.child_index,
             seq,
             phase,
-            ts: now_ms(),
+            ts: crate::time::now_epoch_millis(),
             follow_up_pending,
             reason: reason.map(str::to_string),
         };
@@ -308,13 +308,6 @@ pub fn register_child_watchdog(
 // [`register_child_watchdog`] as called from `crate::prompt_runtime` (`prompt_runtime.rs:1701`),
 // which reads the same env var at `:1687-1688`, builds the review at `:1698-1700`, and passes
 // [`stdout_status_sink`] — the port of `:77` and `:50`, in one place.
-
-/// `Date.now()`.
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-}
 
 #[cfg(test)]
 #[allow(

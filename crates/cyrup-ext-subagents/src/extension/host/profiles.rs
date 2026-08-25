@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use crate::background::atomic::write_atomic_json;
 use crate::error::SubagentError;
-use crate::extension::executor::paths::dirs_home;
+use crate::paths::home_dir;
 use crate::extension::host::SubagentsExtension;
 use crate::extension::models::registry_models;
 use crate::extension::models::classify::{
@@ -28,7 +28,7 @@ impl SubagentsExtension {
     /// `/subagents-doctor`'s freshness check observes that a refresh genuinely ran.
     fn provider_catalog_cache_path(&self, cwd: &Path) -> PathBuf {
         let _ = cwd;
-        dirs_home()
+        home_dir()
             .join(".cyrup")
             .join("subagents")
             .join("provider-catalog-cache.json")
@@ -103,7 +103,7 @@ impl SubagentsExtension {
         let model_count = models.len();
         let file = crate::registration::profiles::ProviderModelCatalog {
             provider: provider.to_string(),
-            refreshed_at_epoch_ms: crate::background::now_epoch_ms(),
+            refreshed_at_epoch_ms: u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0),
             max_age_days: crate::registration::profiles::DEFAULT_PROVIDER_MODELS_MAX_AGE_DAYS,
             // pi `sources` (profiles.ts:572): `["runtime-registry", ...(probe ? ["live-probe"] :
             // []), "heuristic-classifier"]` — this port always probes (no exposed `--no-probe`
@@ -158,7 +158,7 @@ impl SubagentsExtension {
                 |existing| {
                     !crate::registration::profiles::is_provider_catalog_stale(
                         existing,
-                        crate::background::now_epoch_ms(),
+                        u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0),
                         existing.max_age_days,
                     )
                 },
@@ -249,7 +249,7 @@ impl SubagentsExtension {
     }
 
     pub(crate) fn profiles_dir(&self) -> PathBuf {
-        dirs_home().join(".cyrup").join("subagents").join("profiles")
+        home_dir().join(".cyrup").join("subagents").join("profiles")
     }
 
     /// The user-scope `settings.json` the extension's discovery reads its `subagents.*` layer back
@@ -258,7 +258,7 @@ impl SubagentsExtension {
     /// here so the next discovery pass picks it up, exactly as pi's `applySubagentProfile` writes to
     /// the same `getUserSettingsPath()` its discovery reads.
     fn user_settings_path(&self) -> PathBuf {
-        dirs_home()
+        home_dir()
             .join(".cyrup")
             .join("agents")
             .join("settings.json")
