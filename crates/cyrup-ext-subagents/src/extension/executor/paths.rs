@@ -105,19 +105,12 @@ pub(crate) fn resolve_background_storage_roots(
     }
 }
 
-pub(crate) fn dirs_home() -> PathBuf {
-    std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
-}
-
 /// pi `expandTilde` (`extension/index.ts:233-234`): a leading `~/` expands against the user's home
-/// directory; any other value (including a bare `~` with no trailing slash) passes through
+/// directory ([`crate::paths::home_dir`]); any other value (including a bare `~` with no trailing slash) passes through
 /// unchanged.
 pub(crate) fn expand_tilde(value: &str) -> PathBuf {
     match value.strip_prefix("~/") {
-        Some(rest) => dirs_home().join(rest),
+        Some(rest) => crate::paths::home_dir().join(rest),
         None => PathBuf::from(value),
     }
 }
@@ -797,7 +790,7 @@ mod tests {
     #[test]
     fn format_configured_session_dir_expands_a_leading_tilde() {
         let rendered = format_configured_session_dir(Some("~/my-sessions"), None);
-        let expected = dirs_home().join("my-sessions");
+        let expected = crate::paths::home_dir().join("my-sessions");
         assert_eq!(rendered, expected.display().to_string());
     }
 

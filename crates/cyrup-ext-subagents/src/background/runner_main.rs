@@ -815,7 +815,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
     // telemetry status write races the terminal record `finish_run` writes.
     let _ = telemetry_task.await;
 
-    let duration_ms = (super::now_epoch_millis_pub() - overall_started_at).max(0);
+    let duration_ms = (crate::time::now_epoch_millis() - overall_started_at).max(0);
     let run_id_str = config.run_id.as_str().to_string();
     let (terminal_state, results, final_error) = match loop_outcome {
         Ok(LoopOutcome::Completed { results }) => {
@@ -944,7 +944,7 @@ async fn append_event(
     );
     object.insert(
         "ts".to_string(),
-        serde_json::Value::from(super::now_epoch_millis_pub()),
+        serde_json::Value::from(crate::time::now_epoch_millis()),
     );
     if let Some(serde_json::Value::Object(fields)) = detail {
         for (key, value) in fields {
@@ -1155,7 +1155,7 @@ fn spawn_telemetry_task(
                     };
                     {
                         let mut status = lock_status(&shared);
-                        let now = super::now_epoch_millis_pub();
+                        let now = crate::time::now_epoch_millis();
                         if let Some(step) = status.steps.get_mut(flat_index) {
                             crate::background::apply_child_event_to_step(step, &event, now);
                         }
@@ -1309,7 +1309,7 @@ async fn run_inner(
     // and `tool-description.ts:25,:73` @v0.34.0 both say it applies to "foreground and
     // async/background runs"; `async-execution.ts:1302-1305` arms the deadline).
     let deadline_at = config.deadline_at_ms.map(|deadline_ms| {
-        let remaining_ms = deadline_ms.saturating_sub(crate::background::now_epoch_ms());
+        let remaining_ms = deadline_ms.saturating_sub(u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0));
         std::time::Instant::now() + std::time::Duration::from_millis(remaining_ms)
     });
     let ctx = ChainRunContext {
@@ -1764,7 +1764,7 @@ fn mark_remaining_timed_out(
     total: usize,
     message: &str,
 ) {
-    let now = super::now_epoch_millis_pub();
+    let now = crate::time::now_epoch_millis();
     for index in from_index..total {
         if let Some(step) = status.steps.get_mut(index)
             && !step.status.is_terminal()
@@ -1843,7 +1843,7 @@ fn promote_interrupted_results_to_stopped(results: &mut [SingleResult], message:
 ///   terminal and `is_terminal()` skips it either way;
 /// * the message is the fixed [`control::STOP_MESSAGE`], not a computed one.
 fn mark_remaining_stopped(status: &mut RunStatus, from_index: usize, total: usize, message: &str) {
-    let now = super::now_epoch_millis_pub();
+    let now = crate::time::now_epoch_millis();
     for index in from_index..total {
         if let Some(step) = status.steps.get_mut(index)
             && !step.status.is_terminal()
@@ -1897,7 +1897,7 @@ async fn cascade_to_descendants(
 }
 
 fn mark_remaining_paused(status: &mut RunStatus, from_index: usize, total: usize) {
-    let now = super::now_epoch_millis_pub();
+    let now = crate::time::now_epoch_millis();
     for index in from_index..total {
         if let Some(step) = status.steps.get_mut(index)
             && !step.status.is_terminal()
@@ -1923,7 +1923,7 @@ fn mark_remaining_paused(status: &mut RunStatus, from_index: usize, total: usize
 fn mark_step_running(status: &mut RunStatus, index: usize) {
     if let Some(step) = status.steps.get_mut(index) {
         step.status = StepState::Running;
-        step.started_at.get_or_insert(super::now_epoch_millis_pub());
+        step.started_at.get_or_insert(crate::time::now_epoch_millis());
     }
 }
 
@@ -1936,7 +1936,7 @@ fn record_step_outcome(
     result: &StepResult,
     group_result: Option<&crate::spawn::chain_graph::GroupStepResult>,
 ) {
-    let now = super::now_epoch_millis_pub();
+    let now = crate::time::now_epoch_millis();
     if let Some(entry) = status.steps.get_mut(index) {
         entry.status = if result.success { StepState::Complete } else { StepState::Failed };
         entry.ended_at = Some(now);
@@ -3070,7 +3070,7 @@ async fn route_steer_requests(
             continue;
         }
 
-        let now = super::now_epoch_millis_pub();
+        let now = crate::time::now_epoch_millis();
         if !accepted.is_empty() {
             let mut status = lock_status(shared);
             for index in &accepted {
@@ -3198,7 +3198,7 @@ async fn finish_run(
     // which (possibly already-illegal-from-here) state `status` currently holds, since this is the
     // authoritative "this run is now over" write, not a normal forward-progress transition subject
     // to the ordinary transition guard.
-    let now = super::now_epoch_millis_pub();
+    let now = crate::time::now_epoch_millis();
     status.state = terminal_state;
     status.last_update = now;
     status.ended_at = Some(now);

@@ -68,6 +68,7 @@
 
 pub mod types;
 pub mod frontmatter;
+pub(crate) mod package_name;
 pub mod agent_memory;
 pub mod chains;
 pub mod management;

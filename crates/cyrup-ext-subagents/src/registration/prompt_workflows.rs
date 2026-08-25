@@ -100,38 +100,11 @@ pub struct PromptWorkflow {
 // Discovery (promptDirs / readPromptFiles / loadPromptWorkflow / discoverPromptWorkflows)
 // =================================================================================================
 
-/// The user home dir, mirroring this crate's existing `extension.rs::dirs_home` /
-/// `exec::mcp_direct_tools::home_dir` convention (`CYRUP_HOME` → `HOME` → tempdir).
-fn home_dir() -> PathBuf {
-    std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-/// pi `getAgentDir()` (`shared/utils.ts:72-77`): `CYRUP_AGENT_DIR`/`PI_CODING_AGENT_DIR` with `~`
-/// expansion, else `<home>/.cyrup/agent`. Kept identical to
-/// `exec::mcp_direct_tools::resolve_agent_dir` — the same upstream function, and the two must not
-/// disagree about where the agent dir is.
-fn agent_dir() -> PathBuf {
-    let home = home_dir();
-    let configured = std::env::var("CYRUP_AGENT_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var("PI_CODING_AGENT_DIR").ok().filter(|v| !v.is_empty()));
-    match configured {
-        Some(v) if v == "~" => home,
-        Some(v) if v.starts_with("~/") => home.join(v.get(2..).unwrap_or("")),
-        Some(v) => PathBuf::from(v),
-        None => home.join(".cyrup").join("agent"),
-    }
-}
-
 /// The two NON-package prompt directories, in upstream's order (`promptDirs`, `:41-47`, minus the
 /// package tier which [`prompt_files`] takes from the bundled manifest instead):
 /// `<agentDir>/prompts`, then `<cwd>/.cyrup/prompts`.
 fn user_and_project_prompt_dirs(cwd: &Path) -> Vec<PathBuf> {
-    vec![agent_dir().join("prompts"), cwd.join(".cyrup").join("prompts")]
+    vec![crate::paths::agent_dir().join("prompts"), cwd.join(".cyrup").join("prompts")]
 }
 
 /// Every candidate prompt file, package tier first (`readPromptFiles`, `:49-63`). Package files

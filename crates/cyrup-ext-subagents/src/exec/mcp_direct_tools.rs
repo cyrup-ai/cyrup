@@ -94,7 +94,7 @@
 //! ## What this module is still NOT byte-identical to, stated exactly
 //!
 //! **A narrow divergence remains, and it is a path one, not a digest one.** The home this
-//! module anchors `~` against ([`home_dir`]: `CYRUP_HOME` → `HOME` → tempdir) is not the home the
+//! module anchors `~` against ([`crate::paths::home_dir`]: `CYRUP_HOME` → `HOME` → tempdir) is not the home the
 //! writer's default hasher uses (`cyrup_mcp::dirs::home_dir`: `HOME` → `USERPROFILE`), so with
 //! `CYRUP_HOME` set to something other than `HOME` the two disagree — but only for a server whose
 //! `cwd` actually starts with `~`. That is the narrow tail of MCP-139's agent-dir axis 3, whose fix
@@ -386,8 +386,8 @@ impl McpDirs {
     /// `<home>/.cyrup/agent`) and `GENERIC_GLOBAL_CONFIG_PATH` (`~/.config/mcp/mcp.json`).
     #[must_use]
     pub fn from_env() -> McpDirs {
-        let home = home_dir();
-        let agent_dir = resolve_agent_dir(&home);
+        let home = crate::paths::home_dir();
+        let agent_dir = crate::paths::resolve_agent_dir(&home);
         let generic_global_config_path = home.join(".config").join("mcp").join("mcp.json");
         McpDirs {
             agent_dir,
@@ -747,7 +747,7 @@ fn is_server_cache_valid_with_age(
     let Some(cached_at) = entry.cached_at.filter(|ms| *ms != 0) else {
         return false;
     };
-    if max_age_ms > 0 && now_ms().saturating_sub(cached_at) > max_age_ms {
+    if max_age_ms > 0 && crate::time::now_epoch_millis().saturating_sub(cached_at) > max_age_ms {
         return false;
     }
     true
@@ -788,12 +788,12 @@ fn is_server_cache_valid_with_age(
 /// mismatch tells you nothing about *which* field disagreed, and the conformance tests below assert
 /// the bytes.
 pub fn server_identity_pre_image(definition: &ServerEntry) -> Result<String, IdentityError> {
-    server_identity_pre_image_with(definition, &|name| std::env::var(name).ok(), &home_dir())
+    server_identity_pre_image_with(definition, &|name| std::env::var(name).ok(), &crate::paths::home_dir())
 }
 
 /// [`server_identity_pre_image`] against an injected environment and home directory.
 ///
-/// The production arity above reads `std::env` and [`home_dir`]; this one exists because edition
+/// The production arity above reads `std::env` and [`crate::paths::home_dir`]; this one exists because edition
 /// 2024 makes `std::env::set_var` `unsafe` (so a test cannot pin `$API_HOST` and put it back) and
 /// because the cross-crate conformance tests must drive **both** implementations from one table —
 /// `cyrup_mcp::dirs::ResolvedIdentity::resolve` takes the same two seams for the same reason.
@@ -1545,37 +1545,6 @@ fn json_quote(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string())
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-/// The user home dir, mirroring this crate's existing `extension.rs::dirs_home` convention
-/// (`CYRUP_HOME` → `HOME` → tempdir) so the resolver anchors identically to the rest of the crate.
-fn home_dir() -> PathBuf {
-    std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-/// Resolve pi's `getAgentDir()`: `CYRUP_AGENT_DIR`/`PI_CODING_AGENT_DIR` (with `~` expansion), else
-/// `<home>/.cyrup/agent`.
-fn resolve_agent_dir(home: &Path) -> PathBuf {
-    let configured = std::env::var("CYRUP_AGENT_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var("PI_CODING_AGENT_DIR").ok().filter(|v| !v.is_empty()));
-    match configured {
-        Some(v) if v == "~" => home.to_path_buf(),
-        Some(v) if v.starts_with("~/") => home.join(v.get(2..).unwrap_or("")),
-        Some(v) => PathBuf::from(v),
-        None => home.join(".cyrup").join("agent"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     #![allow(
@@ -1669,7 +1638,7 @@ mod tests {
                 "servers": {
                     server_name: {
                         "configHash": compute_mcp_server_hash(&entry).expect("fixture definitions are hashable"),
-                        "cachedAt": cached_at.unwrap_or_else(now_ms),
+                        "cachedAt": cached_at.unwrap_or_else(crate::time::now_epoch_millis),
                         "tools": tools_json,
                         "resources": resources_json,
                     }
@@ -1817,7 +1786,7 @@ mod tests {
             vec!["take_screenshot", "click"],
             vec![],
             None,
-            Some(now_ms() - 8 * 24 * 60 * 60 * 1000),
+            Some(crate::time::now_epoch_millis() - 8 * 24 * 60 * 60 * 1000),
         );
         assert!(resolve(&stale, &["chrome-devtools"]).is_empty());
     }
@@ -2096,7 +2065,7 @@ mod tests {
             // sides, for an entry whose stamped hash could not have come from anywhere.
             let entry = ServerCacheEntry {
                 config_hash: Some("whatever".to_string()),
-                cached_at: Some(now_ms()),
+                cached_at: Some(crate::time::now_epoch_millis()),
                 ..ServerCacheEntry::default()
             };
             assert!(!is_server_cache_valid_with_age(&entry, &reader, 0), "{json}");
@@ -2537,7 +2506,7 @@ mod tests {
                     name: "Console Logs".to_string(),
                     ..cyrup_mcp::dirs::CachedResource::default()
                 }],
-                cached_at: now_ms(),
+                cached_at: crate::time::now_epoch_millis(),
                 ..cyrup_mcp::dirs::ServerCacheEntry::default()
             },
         );
@@ -2798,7 +2767,7 @@ mod tests {
         for definition in [&unresolvable, &two, &unparseable, &non_string] {
             let entry = ServerCacheEntry {
                 config_hash: Some("0".repeat(64)),
-                cached_at: Some(now_ms()),
+                cached_at: Some(crate::time::now_epoch_millis()),
                 ..ServerCacheEntry::default()
             };
             assert!(!is_server_cache_valid(&entry, definition));
@@ -2820,10 +2789,10 @@ mod tests {
 
         assert!(!is_server_cache_valid(&with_stamp(Some(0)), &definition), "0 is falsy");
         assert!(!is_server_cache_valid(&with_stamp(None), &definition));
-        assert!(is_server_cache_valid(&with_stamp(Some(now_ms())), &definition));
+        assert!(is_server_cache_valid(&with_stamp(Some(crate::time::now_epoch_millis())), &definition));
 
         let year = 365 * 24 * 60 * 60 * 1000;
-        let ancient = with_stamp(Some(now_ms() - year));
+        let ancient = with_stamp(Some(crate::time::now_epoch_millis() - year));
         assert!(!is_server_cache_valid(&ancient, &definition));
         assert!(
             is_server_cache_valid_with_age(&ancient, &definition, 0),
@@ -2836,7 +2805,7 @@ mod tests {
             "version": 1,
             "servers": {
                 "bad":  { "configHash": hash, "cachedAt": "1760000000000" },
-                "good": { "configHash": hash, "cachedAt": now_ms() }
+                "good": { "configHash": hash, "cachedAt": crate::time::now_epoch_millis() }
             }
         }))
         .expect("the file still parses");

@@ -180,7 +180,7 @@ impl InteractiveOverlay for FleetOverlay {
         // component learns how tall the terminal is. Before the seam existed this stayed at its
         // `32` default forever, so the roster never grew or shrank with the window.
         self.component.set_terminal_rows(height);
-        let frame = self.component.render(width, crate::background::now_epoch_millis_pub());
+        let frame = self.component.render(width, crate::time::now_epoch_millis());
         fleet_theme::to_overlay_lines(&frame)
     }
 

@@ -44,7 +44,7 @@ use super::store::{
     update_mission, validate_mission_id_str,
 };
 use super::{
-    now_ms, MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionError, MissionRecord,
+    MissionArtifact, MissionArtifactKind, MissionCreateInput, MissionError, MissionRecord,
     MissionResult, MissionRunLink, MissionRunMode, MissionStatus, MissionStoreConfig,
     MissionStoreLocation, MissionTokenUsage, MissionUpdateInput, MISSION_SCHEMA_VERSION,
 };
@@ -184,7 +184,7 @@ pub fn prepare_mission_launch(
             &location,
             &mission_id,
             &MissionUpdateInput { status: Some(MissionStatus::Active), ..Default::default() },
-            now_ms(),
+            crate::time::now_epoch_millis(),
             None,
         )?;
         return Ok(Some(MissionLaunchBinding {
@@ -222,7 +222,7 @@ pub fn prepare_mission_launch(
             labels: mission.as_ref().and_then(|m| m.labels.clone()),
             owner_session_id: owner_session_id.map(str::to_string),
         },
-        now_ms(),
+        crate::time::now_epoch_millis(),
         config.and_then(|c| c.retain_terminal),
     )?;
     Ok(Some(MissionLaunchBinding {
@@ -529,7 +529,7 @@ pub fn attach_mission_to_launch_result(
                     summary: first_text(&outcome),
                     ..Default::default()
                 },
-                now_ms(),
+                crate::time::now_epoch_millis(),
                 None,
             )?
         } else {
@@ -543,7 +543,7 @@ pub fn attach_mission_to_launch_result(
 
     let run_status = run_status_for_result(&outcome);
     let current = read_mission(&binding.location, &binding.mission_id)?;
-    let started_at = super::format_iso8601_millis(now_ms());
+    let started_at = super::format_iso8601_millis(crate::time::now_epoch_millis());
     let usage = usage_for_result(&outcome);
     let results = detail_results(&outcome);
     let single_child = (results.len() == 1).then(|| results.first()).flatten();
@@ -578,7 +578,7 @@ pub fn attach_mission_to_launch_result(
                 .cloned(),
             ..Default::default()
         },
-        now_ms(),
+        crate::time::now_epoch_millis(),
         None,
     )?;
 
@@ -837,7 +837,7 @@ pub fn sync_mission_from_async_completion(event: &Value) -> MissionResult<Option
         }
         Err(err) => return Err(err),
     };
-    let completed_at = super::format_iso8601_millis(now_ms());
+    let completed_at = super::format_iso8601_millis(crate::time::now_epoch_millis());
     let mut artifacts = vec![
         MissionArtifact {
             kind: MissionArtifactKind::Status,
@@ -933,7 +933,7 @@ pub fn sync_mission_from_async_completion(event: &Value) -> MissionResult<Option
             summary,
             ..Default::default()
         },
-        now_ms(),
+        crate::time::now_epoch_millis(),
         None,
     )?;
     Ok(Some(updated))
@@ -954,7 +954,7 @@ fn append_sync_skipped_breadcrumb(
     };
     let line = serde_json::json!({
         "type": "subagent.mission.sync.skipped",
-        "ts": now_ms(),
+        "ts": crate::time::now_epoch_millis(),
         "runId": run_id,
         "missionId": binding.mission_id,
         "reason": "mission-record-missing",

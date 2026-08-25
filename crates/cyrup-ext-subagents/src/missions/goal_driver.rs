@@ -45,7 +45,7 @@ use serde_json::Value;
 use super::store::{list_missions, read_mission, update_mission};
 use super::workflow_state::mission_state_path;
 use super::{
-    now_ms, MissionDecisionStatus, MissionGoalStatus, MissionRecord, MissionResult, MissionRunLink,
+    MissionDecisionStatus, MissionGoalStatus, MissionRecord, MissionResult, MissionRunLink,
     MissionStatus, MissionStoreLocation, MissionTokenUsage, MissionUpdateInput,
 };
 
@@ -142,7 +142,7 @@ fn read_linked_run(run: &MissionRunLink) -> MissionResult<MissionRunLink> {
     Ok(MissionRunLink {
         status: Some(state.to_string()),
         completed_at: if !ACTIVE_RUN_STATUSES.contains(&state) && run.completed_at.is_none() {
-            Some(super::format_iso8601_millis(now_ms()))
+            Some(super::format_iso8601_millis(crate::time::now_epoch_millis()))
         } else {
             run.completed_at.clone()
         },
@@ -174,7 +174,7 @@ fn refresh_goal_mission(
         location,
         &record.id,
         &MissionUpdateInput { status: Some(status), add_runs: runs, ..Default::default() },
-        now_ms(),
+        crate::time::now_epoch_millis(),
         None,
     )
 }
@@ -487,7 +487,7 @@ pub fn collect_goal_continuation_notices(
                     usage: Some(record.usage.unwrap_or(MissionTokenUsage { tokens: 0 })),
                     ..Default::default()
                 },
-                now_ms(),
+                crate::time::now_epoch_millis(),
                 None,
             )?;
             if record.goal.map(|g| g.status) == Some(MissionGoalStatus::BudgetExhausted) {
@@ -524,7 +524,7 @@ pub fn collect_goal_continuation_notices(
                 event_type: crate::registration::ControlEventType::NeedsAttention,
                 from: None,
                 to: crate::background::ActivityState::NeedsAttention,
-                ts: now.unwrap_or_else(now_ms),
+                ts: now.unwrap_or_else(crate::time::now_epoch_millis),
                 run_id: format!("goal-{}-turn-{turn_id}", record.id),
                 agent: "goal mission".to_string(),
                 index: None,

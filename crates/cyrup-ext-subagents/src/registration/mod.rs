@@ -141,7 +141,8 @@ pub struct SubagentExtensionConfig {
     pub worktree_setup_hook: Option<PathBuf>,
     /// Timeout, in milliseconds, for the worktree setup hook (R-SA-063: "target 30000ms, if
     /// unset"). `None` here means "use the hard-coded 30000ms default" — the concrete default
-    /// constant itself lives in `spawn::worktree::DEFAULT_HOOK_TIMEOUT`, not duplicated here.
+    /// constant itself lives in `spawn::worktree::DEFAULT_WORKTREE_SETUP_HOOK_TIMEOUT_MS`, not
+    /// duplicated here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree_setup_hook_timeout_ms: Option<u64>,
     /// pi `ExtensionConfig.fleetView?: boolean` (`shared/types.ts:1750-1751`, its own comment:
@@ -439,17 +440,8 @@ impl SubagentExtensionConfig {
 /// A configured external hook command: invoked with a JSON payload on stdin, expecting a JSON
 /// response on stdout (func-SA §4.7 `HookSpec`; §5.3 R-SA-034/R-SA-063).
 ///
-/// This is the **canonical** definition arch-SA §2.2 designates for `registration/mod.rs`.
-/// `spawn::worktree::HookSpec` currently carries its own textually-identical, independently
-/// defined copy of this exact shape (`command: PathBuf, args: Vec<String>`), because — per that
-/// module's own doc comment — `registration/mod.rs` was still a doc-comment-only stub at the time
-/// `spawn::worktree.rs` was written and had no `HookSpec` to import. Now that this type exists
-/// here, `spawn::worktree`'s copy is expected to become a type alias (`pub type HookSpec =
-/// crate::registration::HookSpec;`) or be removed in favor of importing this one directly — that
-/// migration is left to whichever later phase next touches `spawn/worktree.rs`, so as not to
-/// perturb that already-complete, already-tested module's file outside this task's declared
-/// ownership boundary. The two shapes are guaranteed identical field-for-field so that migration
-/// is a pure rename with no behavior change.
+/// This is the **canonical** definition arch-SA §2.2 designates for `registration/mod.rs`, and the
+/// only one: [`crate::spawn::worktree::HookSpec`] is a type alias to it.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct HookSpec {
@@ -1185,7 +1177,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------------------------
-    // HookSpec shape parity with spawn::worktree::HookSpec
+    // HookSpec (aliased as spawn::worktree::HookSpec)
     // -----------------------------------------------------------------------------------------
 
     #[test]

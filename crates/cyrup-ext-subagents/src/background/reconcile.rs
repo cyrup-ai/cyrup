@@ -57,7 +57,7 @@
 //! site simply passes `SystemTime::now`/[`check_pid_liveness`] and gets the real behavior for free.
 
 use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use crate::background::{ResultFile, RunPaths, RunState, RunStatus, StepState};
 
@@ -382,8 +382,8 @@ async fn repair_from_result(
     // the run reappears with its genuine terminal outcome. Without this line a dismissed run whose
     // result landed a moment later would stay invisible forever.
     repaired.display_dismissed_at = None;
-    repaired.ended_at = repaired.ended_at.or_else(|| Some(epoch_millis(SystemTime::now())));
-    repaired.last_update = epoch_millis(SystemTime::now());
+    repaired.ended_at = repaired.ended_at.or_else(|| Some(crate::time::epoch_millis(SystemTime::now())));
+    repaired.last_update = crate::time::epoch_millis(SystemTime::now());
 
     crate::background::atomic::write_atomic_json(&paths.status, &repaired).await?;
 
@@ -424,7 +424,7 @@ fn reconcile_missing_status(
     // claimed-Running-with-pid case, step 4 below, not this one).
     let mut status = RunStatus::queued(run_id, crate::background::RunMode::Single, None);
     status.state = RunState::Failed;
-    let now_ms = epoch_millis(now);
+    let now_ms = crate::time::epoch_millis(now);
     status.last_update = now_ms;
     status.ended_at = Some(now_ms);
     ReconcileOutcome { status, action: ReconcileAction::NoneNeeded }
@@ -433,7 +433,7 @@ fn reconcile_missing_status(
 /// `true` once `last_update` has not advanced for longer than `stale_after` relative to `now`
 /// (R-SA-091).
 fn is_stale(last_update_epoch_ms: i64, now: SystemTime, stale_after: Duration) -> bool {
-    let now_ms = epoch_millis(now);
+    let now_ms = crate::time::epoch_millis(now);
     let elapsed_ms = now_ms.saturating_sub(last_update_epoch_ms);
     let elapsed = Duration::from_millis(u64::try_from(elapsed_ms.max(0)).unwrap_or(u64::MAX));
     elapsed >= stale_after
@@ -455,7 +455,7 @@ async fn synthesize_failure(
     reason: &str,
 ) -> std::io::Result<ReconcileOutcome> {
     let now = SystemTime::now();
-    let now_ms = epoch_millis(now);
+    let now_ms = crate::time::epoch_millis(now);
 
     for step in &mut status.steps {
         if !step.status.is_terminal() {
@@ -646,18 +646,6 @@ fn run_id_from_paths(paths: &RunPaths) -> crate::background::RunId {
         .unwrap_or_else(|| crate::background::RunId::from_token(""))
 }
 
-/// Converts a [`SystemTime`] to epoch milliseconds, mirroring `background/mod.rs`'s own private
-/// `now_epoch_millis` clamp-never-panic policy (duplicated here rather than imported since that
-/// helper is deliberately private to `background/mod.rs` and takes no explicit `SystemTime`
-/// parameter — this module needs the explicit-parameter form to support the injectable-clock
-/// testing strategy described above).
-fn epoch_millis(time: SystemTime) -> i64 {
-    match time.duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
-}
-
 // =================================================================================================
 // Tests
 // =================================================================================================
@@ -763,7 +751,7 @@ mod tests {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
 
-        let status = running_status(run_id.clone(), 999_999, epoch_millis(SystemTime::now()));
+        let status = running_status(run_id.clone(), 999_999, crate::time::epoch_millis(SystemTime::now()));
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -818,7 +806,7 @@ mod tests {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
 
-        let status = running_status(run_id.clone(), 999_999, epoch_millis(SystemTime::now()));
+        let status = running_status(run_id.clone(), 999_999, crate::time::epoch_millis(SystemTime::now()));
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -872,7 +860,7 @@ mod tests {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
 
-        let mut status = running_status(run_id.clone(), 1, epoch_millis(SystemTime::now()));
+        let mut status = running_status(run_id.clone(), 1, crate::time::epoch_millis(SystemTime::now()));
         status.state = RunState::Failed;
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
@@ -916,7 +904,7 @@ mod tests {
     async fn paused_status_is_returned_unmodified() {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
-        let mut status = running_status(run_id, 42, epoch_millis(SystemTime::now()));
+        let mut status = running_status(run_id, 42, crate::time::epoch_millis(SystemTime::now()));
         status.state = RunState::Paused;
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
@@ -1020,7 +1008,7 @@ mod tests {
         let run_id = run_id_from_paths(&paths);
         let dead_pid = spawn_and_reap_dead_pid();
 
-        let status = running_status(run_id, dead_pid, epoch_millis(SystemTime::now()));
+        let status = running_status(run_id, dead_pid, crate::time::epoch_millis(SystemTime::now()));
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1066,7 +1054,7 @@ mod tests {
         let (mut child, alive_pid) = spawn_long_lived();
 
         let last_update = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
-        let status = running_status(run_id, alive_pid, epoch_millis(last_update));
+        let status = running_status(run_id, alive_pid, crate::time::epoch_millis(last_update));
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1102,7 +1090,7 @@ mod tests {
         let run_id = run_id_from_paths(&paths);
         let (mut child, alive_pid) = spawn_long_lived();
 
-        let status = running_status(run_id, alive_pid, epoch_millis(SystemTime::now()));
+        let status = running_status(run_id, alive_pid, crate::time::epoch_millis(SystemTime::now()));
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1146,7 +1134,7 @@ mod tests {
     async fn unknown_liveness_within_staleness_threshold_is_not_failed() {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
-        let status = running_status(run_id, 123_456, epoch_millis(SystemTime::now()));
+        let status = running_status(run_id, 123_456, crate::time::epoch_millis(SystemTime::now()));
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1175,7 +1163,7 @@ mod tests {
         let (_dir, paths) = temp_paths();
         let run_id = run_id_from_paths(&paths);
         let last_update = SystemTime::now() - Duration::from_secs(25 * 60 * 60);
-        let status = running_status(run_id, 123_456, epoch_millis(last_update));
+        let status = running_status(run_id, 123_456, crate::time::epoch_millis(last_update));
         crate::background::atomic::write_atomic_json(&paths.status, &status)
             .await
             .expect("write status");
@@ -1205,21 +1193,21 @@ mod tests {
     #[test]
     fn is_stale_false_just_under_threshold() {
         let now = SystemTime::now();
-        let last_update = epoch_millis(now - Duration::from_secs(23 * 60 * 60));
+        let last_update = crate::time::epoch_millis(now - Duration::from_secs(23 * 60 * 60));
         assert!(!is_stale(last_update, now, DEFAULT_STALE_AFTER));
     }
 
     #[test]
     fn is_stale_true_just_over_threshold() {
         let now = SystemTime::now();
-        let last_update = epoch_millis(now - Duration::from_secs(25 * 60 * 60));
+        let last_update = crate::time::epoch_millis(now - Duration::from_secs(25 * 60 * 60));
         assert!(is_stale(last_update, now, DEFAULT_STALE_AFTER));
     }
 
     #[test]
     fn is_stale_handles_a_last_update_in_the_future_without_underflow() {
         let now = SystemTime::now();
-        let last_update = epoch_millis(now + Duration::from_secs(60));
+        let last_update = crate::time::epoch_millis(now + Duration::from_secs(60));
         assert!(!is_stale(last_update, now, DEFAULT_STALE_AFTER));
     }
 }

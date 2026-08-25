@@ -31,12 +31,20 @@ pub mod error;
 pub mod exec;
 pub mod extension;
 pub mod fork_context;
+/// The crate's single port of pi's `shared/formatters.ts` (`formatTokens`,
+/// `formatModelThinking`, the run-mode label) — see [`formatters`].
+pub mod formatters;
 pub mod native_supervisor;
 pub mod jsonl;
 pub mod missions;
+/// The crate's single port of pi's `shared/utils.ts` path helpers: the `CYRUP_HOME` -> `HOME` ->
+/// tempdir home ladder, `getAgentDir()` and `getProjectConfigDir()`. See [`paths`].
+pub mod paths;
 pub mod prompt_runtime;
 pub mod registration;
 pub mod spawn;
+/// The crate's single epoch-millisecond clock (`Date.now()`). See [`time`].
+pub mod time;
 pub mod tui;
 pub mod watchdog;
 

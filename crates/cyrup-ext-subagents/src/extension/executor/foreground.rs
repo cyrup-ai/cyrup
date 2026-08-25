@@ -469,8 +469,8 @@ impl SubagentExecutor {
                     turn_count: None,
                     tool_count: None,
                     tokens: None,
-                    started_at: crate::background::now_epoch_millis_pub(),
-                    updated_at: crate::background::now_epoch_millis_pub(),
+                    started_at: crate::time::now_epoch_millis(),
+                    updated_at: crate::time::now_epoch_millis(),
                 },
             );
         }

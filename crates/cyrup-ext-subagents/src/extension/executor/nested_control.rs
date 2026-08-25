@@ -87,7 +87,7 @@ impl SubagentExecutor {
                 None => {
                     let (ok, message) = self.resolve_nested_control_request(&request).await;
                     crate::spawn::nested_events::NestedControlResultInput {
-                        ts: crate::spawn::nested_events::now_ms(),
+                        ts: crate::time::now_epoch_millis(),
                         request_id: request.request_id.clone(),
                         target_run_id: request.target_run_id.clone(),
                         ok,

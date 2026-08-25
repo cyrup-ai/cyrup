@@ -47,7 +47,7 @@
 //! callback because it is what makes the warning texts directly assertable in-crate, which is how
 //! all eight of upstream's are pinned below.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// pi `SUBAGENT_SAFETY_GUIDANCE` (`src/extension/tool-description.ts:9-15` @v0.34.0), BYTE-IDENTICAL.
 ///
@@ -169,39 +169,9 @@ impl ToolDescriptionOptions {
     pub fn new(cwd: impl Into<PathBuf>) -> Self {
         Self {
             cwd: cwd.into(),
-            agent_dir: agent_dir(),
+            agent_dir: crate::paths::agent_dir(),
         }
     }
-}
-
-/// `getAgentDir()` (`shared/utils.ts:72-77`) — `$CYRUP_AGENT_DIR`/`$PI_CODING_AGENT_DIR` with `~`
-/// expansion, else `<home>/.cyrup/agent`. Byte-identical to `watchdog/settings.rs`'s `agent_dir`
-/// and `exec/mcp_direct_tools.rs`'s `resolve_agent_dir`, this crate's two existing ports of the
-/// same upstream function.
-fn agent_dir() -> PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(std::env::temp_dir);
-    let configured = std::env::var("CYRUP_AGENT_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| {
-            std::env::var("PI_CODING_AGENT_DIR")
-                .ok()
-                .filter(|v| !v.is_empty())
-        });
-    match configured {
-        Some(v) if v == "~" => home,
-        Some(v) if v.starts_with("~/") => home.join(v.get(2..).unwrap_or("")),
-        Some(v) => PathBuf::from(v),
-        None => home.join(".cyrup").join("agent"),
-    }
-}
-
-/// `getProjectConfigDir(projectRoot)` (`shared/utils.ts:68-70`) — `<root>/.cyrup` (upstream
-/// `<root>/.pi`).
-fn project_config_dir(project_root: &Path) -> PathBuf {
-    project_root.join(".cyrup")
 }
 
 /// pi `resolveToolDescriptionMode` (`tool-description.ts:104-110` @v0.34.0).
@@ -233,7 +203,7 @@ pub fn resolve_tool_description_mode(
 #[must_use]
 fn custom_description_paths(options: &ToolDescriptionOptions) -> [PathBuf; 2] {
     [
-        project_config_dir(&options.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
+        crate::paths::project_config_dir(&options.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
         options.agent_dir.join(CUSTOM_TOOL_DESCRIPTION_FILE),
     ]
 }
@@ -251,7 +221,7 @@ fn render_custom_template(
     options: &ToolDescriptionOptions,
     warnings: &mut Vec<String>,
 ) -> String {
-    let project_config_dir = project_config_dir(&options.cwd);
+    let project_config_dir = crate::paths::project_config_dir(&options.cwd);
     let variable = |name: &str| -> Option<String> {
         match name {
             "fullDescription" | "full" => Some(full.to_string()),
@@ -433,7 +403,7 @@ mod tests {
     fn options(dir: &std::path::Path) -> ToolDescriptionOptions {
         let cwd = dir.join("project");
         let agent_dir = dir.join("agent");
-        std::fs::create_dir_all(project_config_dir(&cwd)).expect("project config dir");
+        std::fs::create_dir_all(crate::paths::project_config_dir(&cwd)).expect("project config dir");
         std::fs::create_dir_all(&agent_dir).expect("agent dir");
         ToolDescriptionOptions { cwd, agent_dir }
     }
@@ -527,7 +497,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = options(dir.path());
         std::fs::write(
-            project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
+            crate::paths::project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
             "Only delegate through the platform team's reviewer agent.\n",
         )
         .expect("write override");
@@ -557,7 +527,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = options(dir.path());
         std::fs::write(
-            project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
+            crate::paths::project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
             "Header.\n\n{{safety}}\n\nFooter.\n",
         )
         .expect("write override");
@@ -600,7 +570,7 @@ mod tests {
         assert!(rendered.starts_with(&format!("{FULL}|{FULL}|")));
         assert!(rendered.contains(COMPACT_SUBAGENT_TOOL_DESCRIPTION));
         assert!(rendered.contains(&opts.agent_dir.display().to_string()));
-        assert!(rendered.contains(&project_config_dir(&opts.cwd).display().to_string()));
+        assert!(rendered.contains(&crate::paths::project_config_dir(&opts.cwd).display().to_string()));
         assert!(rendered.ends_with("|{{nope}}|{{ spaced }}"), "{rendered}");
         assert_eq!(
             warnings,
@@ -617,7 +587,7 @@ mod tests {
     fn an_over_cap_override_is_refused_with_pis_text_and_the_next_path_still_wins() {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = options(dir.path());
-        let oversized = project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE);
+        let oversized = crate::paths::project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE);
         std::fs::write(
             &oversized,
             "x".repeat(usize::try_from(CUSTOM_TOOL_DESCRIPTION_MAX_BYTES).unwrap() + 1),
@@ -656,7 +626,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = options(dir.path());
         std::fs::write(
-            project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
+            crate::paths::project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE),
             "   \n\t\n",
         )
         .expect("write blank override");
@@ -686,7 +656,7 @@ mod tests {
     fn a_directory_named_like_the_override_is_refused_with_pis_text() {
         let dir = tempfile::tempdir().expect("tempdir");
         let opts = options(dir.path());
-        let as_dir = project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE);
+        let as_dir = crate::paths::project_config_dir(&opts.cwd).join(CUSTOM_TOOL_DESCRIPTION_FILE);
         std::fs::create_dir_all(&as_dir).expect("mkdir");
 
         let mut warnings = Vec::new();

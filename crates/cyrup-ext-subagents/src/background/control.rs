@@ -70,7 +70,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use cyrup_core::ModelId;
 
@@ -240,7 +240,7 @@ pub async fn reconcile_before_control_op(paths: &RunPaths) -> Result<RunStatus, 
 /// terminal state (e.g. a corrupt or foreign status record). Every step is marked terminal to
 /// match `result.state`.
 fn terminal_status_from_result(result: &ResultFile, pid: Option<u32>) -> RunStatus {
-    let now = now_epoch_millis();
+    let now = crate::time::now_epoch_millis();
     RunStatus {
         run_id: result.run_id.clone(),
         // A repaired status has no surviving record of the launching session — the `ResultFile`
@@ -334,7 +334,7 @@ impl InterruptRequest {
     pub fn new(source: impl Into<String>, reason: Option<String>) -> Self {
         Self {
             kind: "interrupt".to_string(),
-            ts: now_epoch_millis(),
+            ts: crate::time::now_epoch_millis(),
             source: source.into(),
             reason,
         }
@@ -559,7 +559,7 @@ impl TimeoutRequest {
     pub fn new(source: impl Into<String>, reason: Option<String>) -> Self {
         Self {
             kind: "timeout".to_string(),
-            ts: now_epoch_millis(),
+            ts: crate::time::now_epoch_millis(),
             source: source.into(),
             reason,
         }
@@ -642,7 +642,7 @@ impl StopRequest {
     pub fn new(source: impl Into<String>, reason: Option<String>) -> Self {
         Self {
             kind: "stop".to_string(),
-            ts: now_epoch_millis(),
+            ts: crate::time::now_epoch_millis(),
             source: source.into(),
             reason,
         }
@@ -979,7 +979,7 @@ pub async fn request_async_steer_with_mode(
     let request = SteerRequest {
         kind: "steer".to_string(),
         id: next_steer_request_id(),
-        ts: now_epoch_millis(),
+        ts: crate::time::now_epoch_millis(),
         message: message.to_string(),
         mode: mode.filter(|m| *m != SteerDeliveryMode::Steer),
         target_index,
@@ -1885,7 +1885,7 @@ impl ChainAppendRequest {
     pub fn new(steps: Vec<RunnerStep>) -> Self {
         Self {
             id: uuid::Uuid::new_v4().as_simple().to_string(),
-            created_at: now_epoch_millis(),
+            created_at: crate::time::now_epoch_millis(),
             steps,
         }
     }
@@ -2347,7 +2347,7 @@ pub async fn poll_root_attachment(
     }
 
     let status = read_status_file(&target_paths.status).await?;
-    let now = now_epoch_millis();
+    let now = crate::time::now_epoch_millis();
 
     match status {
         Some(status) if status.state.is_terminal() => {
@@ -2589,24 +2589,6 @@ fn output_from_terminal_status(
         model: None,
         attempted_models: Vec::new(),
         structured_output: None,
-    }
-}
-
-// =================================================================================================
-// Time helper (mirrors background/mod.rs's private now_epoch_millis; duplicated rather than
-// exposed cross-module since arch-SA keeps each background/*.rs file's own timestamp policy
-// self-contained rather than introducing a shared time-utility module for one three-line helper)
-// =================================================================================================
-
-/// SUBA-049 raised this from private to `pub(crate)`: the child-side steering inbox
-/// (`crate::prompt_runtime::SteeringInbox`) stamps every [`SteerAck`] and [`SteerCapability`] with
-/// it, and those records are compared against [`SteerRequest::ts`] — two independently-written
-/// clocks would make a "the ack predates the request" diagnostic meaningless.
-#[must_use]
-pub(crate) fn now_epoch_millis() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
-        Err(_) => 0,
     }
 }
 
@@ -3745,7 +3727,7 @@ mod tests {
 
         // Simulate the grace period having already elapsed by backdating
         // `terminal_first_observed_at` well beyond ROOT_ATTACHMENT_GRACE.
-        let backdated = now_epoch_millis() - 5_000;
+        let backdated = crate::time::now_epoch_millis() - 5_000;
         let (outcome, _) = poll_root_attachment(&paths, Some(backdated))
             .await
             .expect("poll succeeds");

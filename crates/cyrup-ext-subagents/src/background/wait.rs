@@ -829,7 +829,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 let mut status = RunStatus::queued(run_id, RunMode::Single, Some(1));
                 status.state = RunState::Failed;
-                status.ended_at = Some(crate::background::now_epoch_millis());
+                status.ended_at = Some(crate::time::now_epoch_millis());
                 let mut step = crate::background::StepStatus::pending("worker");
                 step.status = crate::background::StepState::Failed;
                 step.session_file = Some(transcript);

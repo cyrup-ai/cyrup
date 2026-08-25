@@ -564,7 +564,7 @@ fn normalize_lexically(path: &Path) -> PathBuf {
 /// normalized in place, otherwise resolved against `projectRoot`.
 fn expand_configured_path(value: &str, project_root: &Path) -> PathBuf {
     let expanded: PathBuf = if let Some(rest) = value.strip_prefix("~/") {
-        home_dir().join(rest)
+        crate::paths::home_dir().join(rest)
     } else {
         PathBuf::from(value)
     };
@@ -572,47 +572,6 @@ fn expand_configured_path(value: &str, project_root: &Path) -> PathBuf {
         normalize_lexically(&expanded)
     } else {
         normalize_lexically(&project_root.join(expanded))
-    }
-}
-
-/// `os.homedir()`, following this crate's `CYRUP_HOME` → `HOME` → tempdir convention
-/// (`extension.rs::dirs_home:4719`, `exec/mcp_direct_tools.rs:831`,
-/// `registration/prompt_workflows.rs:105`, `watchdog/settings.rs:743`,
-/// `background/mod.rs::home_dir` — six resolvers, all identical).
-///
-/// NOT identical, and the one remaining exception: `discovery/agent_memory.rs::agent_dir` reads
-/// bare `HOME` and so still escapes the sandbox, exactly as this function used to.
-///
-/// This function used to read bare `HOME`, which made it the ONE home resolver in the crate that
-/// ignored `CYRUP_HOME`. `CYRUP_HOME` is the crate's sandbox lever: nineteen integration tests set
-/// it to a `TempDir` precisely so no run-artifact lands in the developer's real home. Every one of
-/// those tests still wrote its mission pointer index into the live `~/.cyrup/agent/missions/index`
-/// — beside `settings.json`, `models-store.json` and `sessions/` — because
-/// [`resolve_mission_store_location`]'s `global_index_dir` default reaches this function and this
-/// function alone did not honour the sandbox. Production behaviour is unchanged: with `CYRUP_HOME`
-/// unset (its only state outside tests) the first branch is `None` and `HOME` answers exactly as
-/// before.
-fn home_dir() -> PathBuf {
-    std::env::var_os("CYRUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(std::env::temp_dir)
-}
-
-/// pi `getAgentDir()` (`shared/utils.ts:95-100`), reached from `resolveMissionStoreLocation`'s
-/// `input.agentDir ?? getAgentDir()` (`store.ts:265`). Kept byte-identical to the crate's three
-/// other copies of this same upstream function (see `discovery/agent_memory.rs`'s note).
-fn agent_dir() -> PathBuf {
-    let home = home_dir();
-    let configured = std::env::var("CYRUP_AGENT_DIR")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| std::env::var("PI_CODING_AGENT_DIR").ok().filter(|v| !v.is_empty()));
-    match configured {
-        Some(v) if v == "~" => home,
-        Some(v) if v.starts_with("~/") => home.join(v.get(2..).unwrap_or("")),
-        Some(v) => PathBuf::from(v),
-        None => home.join(".cyrup").join("agent"),
     }
 }
 
@@ -682,7 +641,7 @@ pub fn validate_mission_store_config(
 /// # The `global_index_dir` default is REAL user config — never take it in a test
 ///
 /// With no `config.globalIndexDir` and no `agent_dir_override`, the pointer index lands in
-/// [`agent_dir`]`/missions/index` — `~/.cyrup/agent/missions/index` — the same directory that
+/// [`crate::paths::agent_dir`]`/missions/index` — `~/.cyrup/agent/missions/index` — the same directory that
 /// holds `settings.json`, `models-store.json` and `sessions/`. That is faithful to upstream's
 /// `path.join(input.agentDir ?? getAgentDir(), "missions", "index")` (`store.ts:265`) and must
 /// stay; the pointer index is deliberately cross-project, so it cannot live under a project root.
@@ -712,7 +671,7 @@ pub fn resolve_mission_store_location(
     let global_index_dir = match config.and_then(|c| c.global_index_dir.as_deref()) {
         Some(dir) => expand_configured_path(dir, &project_root),
         None => agent_dir_override
-            .map_or_else(agent_dir, Path::to_path_buf)
+            .map_or_else(crate::paths::agent_dir, Path::to_path_buf)
             .join("missions")
             .join("index"),
     };

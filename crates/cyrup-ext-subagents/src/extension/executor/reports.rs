@@ -7,7 +7,8 @@ use cyrup_core::ModelId;
 use crate::discovery::types::{AgentDefinition, AgentSource};
 use crate::registration::doctor::{build_doctor_report, DoctorReportInput};
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::executor::paths::{dirs_home, format_configured_session_dir};
+use crate::extension::executor::paths::format_configured_session_dir;
+use crate::paths::home_dir;
 use crate::extension::host::slash_render::BUILTIN_AGENT_NAMES;
 use crate::extension::models::{
     format_model_source, registry_available_models, resolve_default_model_scope,
@@ -108,7 +109,7 @@ impl SubagentExecutor {
     /// `/subagent-cost` locate the session transcript identically.
     fn sessions_dir(cwd: &Path) -> PathBuf {
         cyrup_session::SessionLayout::new(
-            dirs_home().join(".cyrup").join("sessions"),
+            home_dir().join(".cyrup").join("sessions"),
             cwd.to_path_buf(),
         )
         .dir()

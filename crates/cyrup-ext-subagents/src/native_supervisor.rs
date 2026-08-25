@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use cyrup_core::{CancelToken, Content, ExecMode, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
@@ -160,10 +160,12 @@ fn reply_path(channel_dir: &Path, request_id: &str) -> PathBuf {
         .join(format!("{}.json", safe_segment(request_id)))
 }
 
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+/// `Date.now()` (the crate's one clock, [`crate::time::now_epoch_millis`]) narrowed to the `u64`
+/// milliseconds this module's wire records (`SupervisorRequest::created_at`,
+/// `SupervisorReply::created_at`) carry. A pre-epoch clock reads as `0`, the same floor the shared
+/// helper uses.
+fn now_millis_u64() -> u64 {
+    u64::try_from(crate::time::now_epoch_millis()).unwrap_or(0)
 }
 
 /// `askTimeoutMs` (`:178-181`): a finite, positive `CYRUP_INTERCOM_ASK_TIMEOUT_MS`, else 10 minutes.
@@ -491,7 +493,7 @@ pub async fn send_supervisor_request(
     interview: Option<serde_json::Value>,
     cancel: &CancelToken,
 ) -> Result<(SupervisorRequest, Option<SupervisorReply>), String> {
-    let created_at = now_ms();
+    let created_at = now_millis_u64();
     let ask_timeout = ask_timeout_ms();
     let request = build_supervisor_request(
         metadata,
@@ -532,7 +534,7 @@ async fn wait_for_reply(
     cancel: &CancelToken,
 ) -> Result<SupervisorReply, String> {
     let file = reply_path(channel_dir, request_id);
-    while now_ms() <= deadline {
+    while now_millis_u64() <= deadline {
         if cancel.is_cancelled() {
             return Err("Supervisor request cancelled.".to_string());
         }
@@ -728,7 +730,7 @@ pub async fn write_reply(pending: &PendingSupervisorRequest, message: &str) -> R
     let reply = SupervisorReply {
         kind: "subagent.supervisor.reply".to_string(),
         request_id: pending.request.id.clone(),
-        created_at: now_ms(),
+        created_at: now_millis_u64(),
         message: trimmed.to_string(),
     };
     let path = reply_path(&pending.channel_dir, &pending.request.id);
@@ -869,7 +871,7 @@ impl NativeSupervisorChannel {
     /// transcript. Returns the requests adopted this pass (their visible text), so a caller — and the
     /// tests — can drive the sequence deterministically instead of racing a timer.
     pub fn poll_once(&self) -> Vec<String> {
-        let now = now_ms();
+        let now = now_millis_u64();
         let ask_timeout = ask_timeout_ms();
         self.cleanup_stale_channels_if_due(now);
 
@@ -1963,7 +1965,7 @@ mod tests {
             Some("which branch?"),
             None,
             "req-1".to_string(),
-            now_ms(),
+            now_millis_u64(),
             60_000,
         )
         .expect("request builds");

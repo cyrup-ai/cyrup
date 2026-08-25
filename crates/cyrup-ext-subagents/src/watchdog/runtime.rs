@@ -56,15 +56,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
-use super::change_signature::{event_indicates_repo_edit, GitRepoChangeSource};
+use super::change_signature::{
+    event_indicates_repo_edit, GitRepoChangeSource, WatchdogRepoChangeSignature,
+};
 use super::emission_guard::{WatchdogEmissionGuard, WatchdogEmissionGuardOptions};
-use super::lsp_diagnostics::TypeScriptLspDiagnostics;
+use super::lsp_diagnostics::{TypeScriptLspDiagnostics, WatchdogLspRequest};
 use super::scope::{WatchdogAutoFollowPromptLedger, WatchdogScopeArtifact};
 use super::settings::resolve_watchdog_config;
 use super::turn_delta::{format_watchdog_turn_delta, WatchdogTurnDeltaInput};
 use super::types::{
-    ResolvedWatchdogConfig, ThinkingSetting, WatchdogLspConfig, WatchdogLspResult,
-    WatchdogLspRuntimeSnapshot, WatchdogLspStatus, WatchdogRuntimeStatus, WatchdogSettingsError, WatchdogSettingsResult,
+    ResolvedWatchdogConfig, ThinkingSetting, WatchdogLspResult, WatchdogLspRuntimeSnapshot,
+    WatchdogLspStatus, WatchdogRuntimeStatus, WatchdogSettingsError, WatchdogSettingsResult,
     WatchdogSettingsSource, WatchdogSeverity, WatchdogWarning, WatchdogWarningDetails,
     WatchdogWarningSource, WatchdogWarningState,
 };
@@ -215,21 +217,6 @@ impl WatchdogReview for InertWatchdogReview {
 // The LSP seam (`lsp-diagnostics.ts`, injected at runtime.ts:86)
 // =================================================================================================
 
-/// The argument bag `collectWatchdogLspDiagnostics` takes (`runtime.ts:727-733`).
-#[derive(Debug, Clone)]
-pub struct WatchdogLspRequest {
-    /// The session cwd.
-    pub cwd: PathBuf,
-    /// The repository root the change signature resolved.
-    pub root: String,
-    /// The changed paths to open, repo-relative.
-    pub changed_paths: Vec<String>,
-    /// The configured budgets.
-    pub config: WatchdogLspConfig,
-    /// Cancelled when the agent-end boundary is superseded.
-    pub cancel: CancelToken,
-}
-
 /// The `lsp-diagnostics.ts` surface the runtime consumes: the collector itself (upstream's
 /// injectable `lspDiagnostics` option, `runtime.ts:86`) plus the three helpers the runtime calls
 /// around it — `WatchdogLspDiagnosticsLedger` (freshness), `watchdogWarningFromLspDiagnostics`, and
@@ -270,25 +257,6 @@ pub trait WatchdogLspDiagnostics: Send + Sync {
 // =================================================================================================
 // The repo-change seam (`change-signature.ts`, injected at runtime.ts:87)
 // =================================================================================================
-
-/// `WatchdogRepoChangeSignature` (`change-signature.ts:33-37`) — the identity of the working
-/// tree's current diff: the repo root, a content hash over every changed path, and the changed
-/// paths themselves.
-///
-/// The runtime uses the `key` for two decisions and the `changedPaths` for two more: an unchanged
-/// key at `agent_end` means there is nothing new to review (`runtime.ts:373`), and an empty
-/// `changedPaths` means the "changes only" trigger did not fire (`:703`); the paths drive the
-/// "Changed repo paths:" block of the review input (`:798-800`) and the set of files LSP
-/// diagnostics are collected for (`:713`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WatchdogRepoChangeSignature {
-    /// The repository root (`git rev-parse --show-toplevel`).
-    pub root: String,
-    /// A content hash over the changed paths — equal keys mean an identical working tree.
-    pub key: String,
-    /// The changed paths, repo-relative and sorted.
-    pub changed_paths: Vec<String>,
-}
 
 /// `computeWatchdogRepoChangeSignature(cwd)` (`change-signature.ts:186-197`) as a seam, so a test
 /// can drive the change trigger without a real repository.
@@ -1663,10 +1631,10 @@ impl MainWatchdogRuntime {
         };
         let request = WatchdogLspRequest {
             cwd: cwd.to_path_buf(),
-            root: signature.root.clone(),
+            root: PathBuf::from(&signature.root),
             changed_paths: signature.changed_paths.clone(),
             config,
-            cancel,
+            signal: Some(cancel),
         };
         match self.lsp_diagnostics.collect(request).await {
             Ok(raw) => {

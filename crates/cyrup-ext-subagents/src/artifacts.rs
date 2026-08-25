@@ -28,8 +28,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use cyrup_core::ModelId;
 
-use crate::background::{agent_dir, cwd_key, temp_root_dir};
+use crate::background::{cwd_key, temp_root_dir};
 use crate::exec::SingleResult;
+use crate::paths::agent_dir;
 
 /// Project-local artifact root (pi `PROJECT_ARTIFACT_ROOT = ".pi-subagents"`, rebranded).
 const PROJECT_ARTIFACT_ROOT: &str = ".cyrup-subagents";
@@ -330,9 +331,11 @@ fn mtime_ms(path: &Path) -> Option<u128> {
     modified.duration_since(UNIX_EPOCH).ok().map(|d| d.as_millis())
 }
 
-/// The current wall-clock time in whole milliseconds since the Unix epoch (matches pi `Date.now()`).
-fn now_ms() -> u128 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+/// `Date.now()` (the crate's one clock, [`crate::time::now_epoch_millis`]) widened to the `u128`
+/// milliseconds [`mtime_ms`] reports, so the two are directly comparable. A pre-epoch clock reads
+/// as `0`, the same floor the shared helper uses.
+fn now_millis_u128() -> u128 {
+    u128::try_from(crate::time::now_epoch_millis()).unwrap_or(0)
 }
 
 /// 24h-throttled sweep of artifacts older than `max_age_days` in one directory (pi
@@ -355,7 +358,7 @@ pub fn cleanup_old_artifacts(dir: &Path, max_age_days: u64) {
     }
 
     let marker = dir.join(CLEANUP_MARKER_FILE);
-    let now = now_ms();
+    let now = now_millis_u128();
 
     // Throttle: skip if the marker was written within the last 24h (pi `now - stat.mtimeMs < 24h`).
     if let Some(marker_mtime) = mtime_ms(&marker)
@@ -416,7 +419,7 @@ pub fn cleanup_old_chain_dirs(cwd: &Path) {
     if !dir.exists() {
         return;
     }
-    let now = now_ms();
+    let now = now_millis_u128();
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return;
     };
@@ -825,7 +828,7 @@ mod tests {
         filetime::set_file_mtime(&old, filetime::FileTime::from_system_time(ten_days_ago)).unwrap();
 
         // A marker touched "now" must short-circuit the sweep entirely (pi 24h throttle).
-        std::fs::write(dir.path().join(CLEANUP_MARKER_FILE), now_ms().to_string()).unwrap();
+        std::fs::write(dir.path().join(CLEANUP_MARKER_FILE), now_millis_u128().to_string()).unwrap();
 
         cleanup_old_artifacts(dir.path(), DEFAULT_CLEANUP_DAYS);
         assert!(old.exists(), "a fresh throttle marker skips the sweep, so the old file survives");
