@@ -83,6 +83,7 @@ use super::fleet_transcript::{
 };
 use crate::background::{RunPaths, RunState, RunStatus};
 use crate::fork_context::ContextMode;
+use crate::formatters::{format_model_thinking_opt, format_tokens};
 
 // =================================================================================================
 // Tunables (pi `fleet.ts:20-23`)
@@ -602,39 +603,6 @@ pub fn item_context(item: &FleetItem) -> Option<ContextMode> {
     }
 }
 
-/// pi `formatTokens` (`shared/formatters.ts`) — same private duplication rationale
-/// `background/fleet_view.rs` gives for its own copy.
-fn format_tokens(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 10_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        format!("{}k", (n as f64 / 1000.0).round() as u64)
-    }
-}
-
-/// pi `formatModelThinking` (`shared/formatters.ts:19-29`).
-fn format_model_thinking(model: Option<&str>, thinking: Option<&str>) -> Option<String> {
-    const THINKING_LEVELS: [&str; 4] = ["off", "low", "medium", "high"];
-    let display_model = model.map(|m| match m.rfind('/') {
-        Some(i) => m.get(i.saturating_add(1)..).unwrap_or(m),
-        None => m,
-    });
-    let display_thinking = thinking
-        .map(str::trim)
-        .filter(|t| THINKING_LEVELS.contains(t));
-    let joined = [
-        display_model.map(str::to_string),
-        display_thinking.map(|t| format!("thinking {t}")),
-    ]
-    .into_iter()
-    .flatten()
-    .collect::<Vec<_>>()
-    .join(" · ");
-    if joined.is_empty() { None } else { Some(joined) }
-}
-
 /// pi `itemStats(item)` (`fleet.ts:394-423`) — the `model · 12.4k tok · 9 tools · 1m 20s` row.
 #[must_use]
 pub fn item_stats(item: &FleetItem, now: i64) -> Vec<String> {
@@ -661,13 +629,13 @@ pub fn item_stats(item: &FleetItem, now: i64) -> Vec<String> {
                 ),
             };
             let thinking = child.map_or(control.thinking.as_deref(), |c| c.thinking.as_deref());
-            model = format_model_thinking(m, thinking);
+            model = format_model_thinking_opt(m, thinking);
             tokens = t;
             tools = tc;
             duration_ms = Some(now.saturating_sub(started).max(0));
         }
         FleetItemKind::ForegroundRecent { child, .. } => {
-            model = format_model_thinking(child.model.as_deref(), child.thinking.as_deref());
+            model = format_model_thinking_opt(child.model.as_deref(), child.thinking.as_deref());
             tokens = child.tokens;
             tools = child.tool_count;
             // pi leaves `durationMs` undefined on this branch (`fleet.ts:405-409`) — a settled
@@ -676,7 +644,7 @@ pub fn item_stats(item: &FleetItem, now: i64) -> Vec<String> {
         }
         FleetItemKind::Async { run, step_index } => {
             let step = step_index.and_then(|i| run.status.steps.get(i));
-            model = format_model_thinking(
+            model = format_model_thinking_opt(
                 step.and_then(|s| s.model.as_ref()).map(cyrup_core::ModelId::as_str),
                 step.and_then(|s| s.telemetry.thinking.as_deref()),
             );
@@ -771,7 +739,7 @@ fn foreground_active_detail(
             None => format!("Agent: {}", item.agent),
         },
     ];
-    if let Some(model) = format_model_thinking(model, thinking) {
+    if let Some(model) = format_model_thinking_opt(model, thinking) {
         lines.push(format!("Model: {model}"));
     }
     lines.push(format!("Started: {}", format_iso8601(started_at)));
@@ -820,7 +788,7 @@ fn foreground_recent_detail(
         format!("Mode: {}", crate::background::run_status::run_mode_label(run.mode)),
         format!("Child: {} ({}){context}", child.index, child.agent),
     ];
-    if let Some(model) = format_model_thinking(child.model.as_deref(), child.thinking.as_deref()) {
+    if let Some(model) = format_model_thinking_opt(child.model.as_deref(), child.thinking.as_deref()) {
         lines.push(format!("Model: {model}"));
     }
     lines.push(format!(

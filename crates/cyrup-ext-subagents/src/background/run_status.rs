@@ -54,14 +54,11 @@ pub(crate) fn run_state_label(state: RunState) -> &'static str {
     }
 }
 
-/// The lowercase mode string pi renders (`SubagentRunMode`): `single`/`parallel`/`chain`.
-pub(crate) fn run_mode_label(mode: RunMode) -> &'static str {
-    match mode {
-        RunMode::Single => "single",
-        RunMode::Parallel => "parallel",
-        RunMode::Chain => "chain",
-    }
-}
+/// The lowercase mode string pi renders (`SubagentRunMode`): `single`/`parallel`/`chain`. The
+/// crate's single definition lives in [`crate::formatters::run_mode_label`]; re-exported here so
+/// every existing `run_status::run_mode_label`/`super::run_status::run_mode_label` call site keeps
+/// resolving unchanged.
+pub(crate) use crate::formatters::run_mode_label;
 
 /// The lowercase per-step status string pi renders (`AsyncJobStep.status`).
 pub(crate) fn step_state_label(state: StepState) -> &'static str {

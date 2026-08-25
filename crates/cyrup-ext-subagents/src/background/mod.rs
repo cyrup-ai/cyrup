@@ -1323,7 +1323,7 @@ pub(crate) fn temp_root_dir() -> PathBuf {
 
 /// The pure core of [`temp_root_dir`], with the two ambient inputs — the environment and the OS
 /// temp dir — passed in, so both branches are provable without mutating process-global state.
-/// Follows the crate's existing `native_supervisor::agent_dir_from` convention.
+/// Follows the crate's existing `native_supervisor::intercom_agent_dir_from` convention.
 fn temp_root_dir_from(env: &dyn Fn(&str) -> Option<String>, os_temp_dir: PathBuf) -> PathBuf {
     if let Some(sandbox) = env("CYRUP_HOME").filter(|v| !v.trim().is_empty()) {
         return PathBuf::from(sandbox).join(".cyrup").join("subagents");

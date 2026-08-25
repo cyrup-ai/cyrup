@@ -63,6 +63,7 @@ use cyrup_session::{AgentMessage, Entry, KnownEntry};
 
 use crate::background::{RunId, RunPaths, RunStatus};
 use crate::error::SubagentError;
+use crate::formatters::format_tokens;
 
 // =================================================================================================
 // CostUsage: an additive accumulator over cyrup_core::Usage/Cost
@@ -728,18 +729,6 @@ struct TranscriptChild {
     agent: String,
     usage: Usage,
     session_file: Option<String>,
-}
-
-/// pi `formatTokens` (shared/formatters.ts): `< 1000` renders the raw integer, `< 10000` renders one
-/// decimal place with a `k` suffix, otherwise a rounded-thousands `k`.
-fn format_tokens(n: u64) -> String {
-    if n < 1000 {
-        n.to_string()
-    } else if n < 10_000 {
-        format!("{:.1}k", n as f64 / 1000.0)
-    } else {
-        format!("{}k", (n as f64 / 1000.0).round() as u64)
-    }
 }
 
 /// pi `formatCostUsage` (slash-commands.ts:368-375): `"{label}: ↑{in} ↓{out} ${cost}(...extras)"`,
@@ -1823,13 +1812,5 @@ mod tests {
         assert!(report.contains("Children: ↑12 ↓8"), "report: {report}");
     }
 
-    #[test]
-    fn format_tokens_matches_pi_thresholds() {
-        assert_eq!(format_tokens(0), "0");
-        assert_eq!(format_tokens(999), "999");
-        assert_eq!(format_tokens(1500), "1.5k");
-        assert_eq!(format_tokens(9999), "10.0k");
-        assert_eq!(format_tokens(12_345), "12k");
-    }
 }
 

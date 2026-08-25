@@ -2138,7 +2138,7 @@ pub fn prompt_runtime_from_env(
     // `contact_supervisor` that needs no broker, no socket and no intercom opt-in. See
     // [`crate::native_supervisor::native_child_client_should_register`] for why the second term
     // stands in for upstream's `!hasTool(pi, "contact_supervisor")`.
-    let agent_dir = crate::native_supervisor::agent_dir_from(get, std::env::current_dir().ok());
+    let agent_dir = crate::native_supervisor::intercom_agent_dir_from(get, std::env::current_dir().ok());
     let child_metadata = crate::native_supervisor::read_child_metadata_from(get)
         .filter(|_| {
             crate::native_supervisor::native_child_client_should_register_from(get, &agent_dir)
