@@ -1,5 +1,50 @@
 use super::*;
 
+use crate::transcript::ImageOpts;
+
+/// The per-paint bag every entry render needs and no [`crate::Entry`] can carry on itself — Pi's
+/// `ToolRenderContext` (`tool-execution.ts:116-135`), built from the live [`AppState`].
+///
+/// One definition, two renderers. The inline commit flush and the alternate screen's document build
+/// must produce the *same rows for the same entry* — that is the whole premise of ADR-0005 §B-5's
+/// bridge (`altscreen/document.rs`: "there is deliberately no second rendering path") — and the
+/// surest way to keep two call sites agreeing on nine fields is not to have two.
+///
+/// Every field is read LIVE rather than frozen onto a message, which is upstream's own rule for the
+/// three that used to drift: `setToolsExpanded` re-broadcasts to every `chatContainer` child on each
+/// toggle (`interactive-mode.ts:4032-4046`), and so do `setHiddenThinkingLabel` (`:2118-2129`) and
+/// the image capability (`tool-execution.ts:331`). A committed block that scrolled up must not
+/// disagree with the one still on screen it was scrolled up from.
+fn image_opts<'a>(
+    state: &'a AppState,
+    // TUI-020 — the sink `tool_path_span` registers hrefs into while `entry_lines` runs, emitted as
+    // OSC-8 once the cells exist. It is a per-flush local, so it cannot be read off `state`; the
+    // fullscreen path passes `None`, which is the same value every caller passed before the
+    // alternate screen existed.
+    links: Option<&'a crate::osc::LinkSink>,
+) -> ImageOpts<'a> {
+    ImageOpts {
+        show: state.transcript.show_images(),
+        // TUI-N01 — the same capability both paths read, so a block that scrolled up cannot
+        // disagree with the one still on screen.
+        graphical: state.transcript.graphical_images(),
+        width_cells: state.transcript.image_width_cells(),
+        // X9/X7 — the live `app.tools.expand` label and the SESSION cwd (not the process's), which
+        // is what `read`'s compact classification resolves its path against (`read.ts:336`).
+        expand_key: state.transcript.expand_key(),
+        cwd: state.transcript.cwd(),
+        // TUI-020 — the same OSC-8 capability the live render reads, for the same reason
+        // `graphical` is read here: a header that scrolled up must not disagree with the one still
+        // on screen.
+        hyperlinks: state.transcript.hyperlinks(),
+        links,
+        // X14 — the LIVE `this.toolOutputExpanded` (`interactive-mode.ts:442`).
+        tools_expanded: state.transcript.tool_expanded(),
+        // TUI-030 — the LIVE `setHiddenThinkingLabel` override.
+        hidden_thinking_label: Some(state.transcript.hidden_thinking_label()),
+    }
+}
+
 impl<B: Backend> App<B> {
     /// Render one frame: first flush newly-committed entries to native scrollback (R-ARCH-TUI-003),
     /// then draw the active region into the inline viewport (pure: `state -> frame`).
@@ -12,6 +57,13 @@ impl<B: Backend> App<B> {
         // show. One call site because `draw` is the one every run-loop arm that can have changed
         // them passes through (see [`Self::publish_extension_readbacks`]).
         self.publish_extension_readbacks();
+        // ADR-0005 §B-14 — the renderer fork, and it is the WHOLE fork: `draw` is the single frame
+        // path every run-loop arm ends in, so routing here is what makes the alternate screen the
+        // live renderer rather than a second one painting over the first. Regular mode is `None`
+        // and everything below this line is untouched.
+        if self.altscreen.is_some() {
+            return self.draw_fullscreen();
+        }
         // Content-size the inline viewport to the live region (active turn + band + slot + footer),
         // recomputed every frame as content grows/shrinks (ADR-0001 #1, audit #1). The viewport is
         // rebuilt only when its height actually changes so steady-state frames keep their cell-diff.
@@ -93,6 +145,61 @@ impl<B: Backend> App<B> {
         Ok(())
     }
 
+    /// Render one frame on the ADR-0005 §B-3 alternate screen — the fullscreen half of
+    /// [`Self::draw`], reached only while [`App::switch_tui_mode`] has one installed.
+    ///
+    /// # What this deliberately does NOT do
+    /// **`flush_committed`.** `Terminal::insert_before` writes into native scrollback, which is the
+    /// one place a user inside the alternate screen cannot look at — the lines would land behind
+    /// the screen they are staring at and, worse, `insert_before` on a viewport that takes up the
+    /// whole screen goes straight to the scrollback buffer with no visible frame at all
+    /// (ratatui-core `inline.rs:66-67`). Upstream has the same split: `TuiAltScreen` never writes
+    /// to the main screen while it is up, and puts the conversation there on the way out instead
+    /// (`tui-alt-screen.ts:322-327`, ADR-0005 §B-13).
+    ///
+    /// **`resize_viewport`.** The inline `Terminal` is not the one being painted and must not emit
+    /// a single escape while the alternate screen owns the cells; it is put back by
+    /// [`App::restore_main_screen_render_state`], which forces the rebuild on the first frame after
+    /// the switch by seeding `viewport_height` to `0`.
+    ///
+    /// # What it must still do
+    /// **Drain.** ADR-0005 §B-1's retained document — the only thing the alternate screen has to
+    /// paint — grows exclusively inside [`crate::TranscriptView::drain_committed`]
+    /// (`transcript/view.rs:110-116`), so the drain has to happen on this path too. The returned
+    /// `Vec` is dropped rather than rendered: with retention on, the same entries are already in
+    /// [`crate::TranscriptView::document`], which is what [`crate::AltScreen::sync_document`] walks.
+    ///
+    /// # Known residual: no chrome
+    /// The frame is the scrolled document, the selection highlight, the scrollbar and the flash
+    /// overlay — [`crate::AltScreen::draw`]'s z-order, upstream's `:1290`. The editor, the status
+    /// band, the selector slot, the footer and the attachment strip are **not** painted: they are
+    /// upstream's layout root (`interactive-mode.ts:933-936`), reached through
+    /// [`crate::ViewportRenderer::set_layout_root`], and cyrup has no [`crate::Component`] that
+    /// paints them from [`crate::AppState`] without the renderer owning it (`altscreen/mod.rs`,
+    /// rule 2). Nothing calls `set_layout_root` today, so a fullscreen session shows the transcript
+    /// and nothing else.
+    fn draw_fullscreen(&mut self) -> Result<(), TuiError> {
+        // Dropped, not rendered: with retention on the same entries are already in
+        // `TranscriptView::document`, which is what `sync_document` walks below.
+        drop(self.state.transcript.drain_committed());
+        // Destructured for the disjoint borrows: `sync_document` reads the transcript and the theme
+        // while the renderer it hands them to is mutably borrowed out of the same `self` — the
+        // shape `app/draw.rs:89` and `altscreen/mod.rs`'s rule 1 both already use.
+        let App { altscreen, state, .. } = self;
+        let Some(alt) = altscreen.as_mut() else { return Ok(()) };
+        alt.sync_document(&state.transcript, &state.theme, image_opts(state, None));
+        // §B-12's strip, built from the same two `AppState` fields the inline path renders from, so
+        // an attachment cannot look different across a mode switch.
+        let strip = (!state.pending_images.is_empty()).then(|| crate::altscreen::Strip {
+            renderer: &state.image_renderer,
+            blocks: &state.pending_images,
+            theme: &state.theme,
+            show_images: state.transcript.show_images(),
+            width_cells: state.transcript.image_width_cells(),
+        });
+        alt.draw(strip)
+    }
+
     /// Rebuild the terminal with a new inline-viewport `height` over a fresh handle to the same
     /// backend (ratatui's inline height is immutable after construction; audit #1). The cursor anchor
     /// is preserved by [`RebuildBackend::rebuild`], so the re-placed viewport stays where it was.
@@ -144,32 +251,9 @@ impl<B: Backend> App<B> {
         // OSC-8 once the cells exist. Built per flush; empty on a hyperlink-incapable terminal, in
         // which case `osc::inject` returns on its first line.
         let links = crate::osc::LinkSink::new();
-        let images = crate::transcript::ImageOpts {
-            show: self.state.transcript.show_images(),
-            // TUI-N01 — the committed path reads the same capability the live one does, so a block
-            // that scrolled up cannot disagree with the one still on screen.
-            graphical: self.state.transcript.graphical_images(),
-            width_cells: self.state.transcript.image_width_cells(),
-            // X9/X7 — the same live `app.tools.expand` label and session cwd the in-viewport render
-            // uses, so a committed block's hints and compact `read` header do not disagree with the
-            // live one they were just scrolled up from.
-            expand_key: self.state.transcript.expand_key(),
-            cwd: self.state.transcript.cwd(),
-            // TUI-020 — the same OSC-8 capability the live render reads, for the same reason
-            // `graphical` is read here: a header that scrolled up must not disagree with the one
-            // still on screen.
-            hyperlinks: self.state.transcript.hyperlinks(),
-            links: Some(&links),
-            // X14 — the LIVE `this.toolOutputExpanded`. Upstream never freezes an expansion onto a
-            // message: `setToolsExpanded` walks `chatContainer.children` and re-broadcasts to every
-            // expandable child (`interactive-mode.ts:4032-4046`), so a branch/compaction summary
-            // pushed while collapsed still opens when `Ctrl+O` is pressed before it paints.
-            tools_expanded: self.state.transcript.tool_expanded(),
-            // TUI-030 — the LIVE `setHiddenThinkingLabel` override, for the same reason
-            // `tools_expanded` is read live here: a reasoning block flushed to scrollback must not
-            // disagree with the one still on screen it was scrolled up from.
-            hidden_thinking_label: Some(self.state.transcript.hidden_thinking_label()),
-        };
+        // Built by [`image_opts`], the one definition both renderers share; the reasons the nine
+        // fields are read live are recorded there.
+        let images = image_opts(&self.state, Some(&links));
         let lines: Vec<Line<'static>> = committed
             .iter()
             .flat_map(|e| entry_lines(e, &self.state.theme, width, output_pad, images))

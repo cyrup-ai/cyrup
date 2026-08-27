@@ -40,6 +40,59 @@ impl MermaidRenderingMode {
     }
 }
 
+/// `tuiMode` — which renderer the interactive TUI starts in (Pi `TuiMode`, settings-manager.ts:36
+/// @v0.84.1, itself a re-export of `pi-tui`'s `TuiMode` = `"regular" | "fullscreen"`; the settings
+/// key is declared at `:135` with `// default: "regular"`). ADR-0005 §Decision A-3.
+///
+/// The key exists at v0.84.1 only — it is upstream drift relative to v0.83.0, the tag cyrup
+/// otherwise ports — and pairs with the `--tui-mode` flag (`args.ts:180-192`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TuiMode {
+    /// The inline (main-screen) renderer. Pi's documented default, and the value every
+    /// unrecognized spelling degrades to — see [`super::EffectiveSettings::tui_mode`].
+    #[default]
+    Regular,
+    /// The alternate-screen renderer (`crates/cyrup-tui/src/altscreen/`).
+    Fullscreen,
+}
+
+impl TuiMode {
+    /// The settings-file spelling, i.e. the value `setTuiMode` writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Regular => "regular",
+            Self::Fullscreen => "fullscreen",
+        }
+    }
+}
+
+/// `fullscreenScrollbar` — the alternate screen's scrollbar policy (Pi `ScrollViewScrollbar`,
+/// `pi-tui` `scroll-view.ts:4`: `"hidden" | "auto" | "always"`; the settings key is declared at
+/// settings-manager.ts:136 @v0.84.1 with `// default: "auto"; no effect in regular TUI mode`).
+/// ADR-0005 §Decision A-3.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FullscreenScrollbar {
+    Hidden,
+    /// Pi's documented default, and the value every unrecognized spelling degrades to — see
+    /// [`super::EffectiveSettings::fullscreen_scrollbar`].
+    #[default]
+    Auto,
+    Always,
+}
+
+impl FullscreenScrollbar {
+    /// The settings-file spelling, i.e. the value `setFullscreenScrollbar` writes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hidden => "hidden",
+            Self::Auto => "auto",
+            Self::Always => "always",
+        }
+    }
+}
+
 /// Custom per-level thinking token budgets (Pi `ThinkingBudgetsSettings`, settings-manager.ts:46-51).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

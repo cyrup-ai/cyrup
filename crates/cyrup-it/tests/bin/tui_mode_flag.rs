@@ -128,22 +128,25 @@ fn tui_mode_without_a_value_reports_pis_requires_text() {
     }
 }
 
-/// ADR-0005 §Decision A.2: `fullscreen` parses and is DECLINED at startup with the interim message
-/// that names the ADR — not a pi diagnostic, not fatal (pi accepts the value, so exiting would
-/// refuse a launch pi performs), and grep-able so work unit B-13 can delete it with the renderer.
+/// `fullscreen` is ACCEPTED in silence, now that ADR-0005 §Decision B's renderer exists.
+///
+/// This assertion is the inverse of the one it replaces. The original pinned the §A-2 interim
+/// refusal — "not built yet in this release (ADR-0005)" — and its own doc said it was written
+/// grep-able "so work unit B-13 can delete it with the renderer". B-13 deleted that message, so the
+/// old assertion pins a string the binary no longer emits. What is worth pinning instead is the
+/// property the interim was standing in for: pi accepts the value, so cyrup must not refuse it, must
+/// not treat it as unknown, and must not editorialise about it on stderr.
 #[test]
-fn tui_mode_fullscreen_is_declined_with_the_adr_0005_interim_message() {
+fn tui_mode_fullscreen_is_accepted_without_a_refusal() {
     let (r, _tmp) = run(&["--tui-mode", "fullscreen"]);
     assert!(
-        r.stderr.contains(
-            "--tui-mode fullscreen is not built yet in this release (ADR-0005); falling back to regular."
-        ),
+        !r.stderr.contains("Unknown option"),
         "stderr was: {}",
         r.stderr
     );
     assert!(
-        !r.stderr.contains("Unknown option"),
-        "stderr was: {}",
+        !r.stderr.contains("not built yet"),
+        "the ADR-0005 §A-2 interim refusal must stay deleted; stderr was: {}",
         r.stderr
     );
 }

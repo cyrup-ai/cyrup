@@ -23,6 +23,16 @@ impl App<InlineBackend<Stdout>> {
                     let editor_cmd = resolve_external_editor(&ctx.session);
                     self.open_external_editor_for_selector(&editor_cmd)?;
                 }
+                // ADR-0005 §B-8 tail + §B-11 — the async half of a completed fullscreen
+                // selection. pi flashes in the alternate screen rather than writing a status line,
+                // because there is no status line to write to (`interactive-mode.ts:6107-6112`);
+                // `renderer_mut` resolves to whichever renderer is live, so this is correct in both
+                // modes without a branch here.
+                AppAction::CopySelection(text) => {
+                    let ok = crate::clipboard::copy_to_clipboard(&text).await;
+                    let message = if ok { "Copied!" } else { "Copy failed" };
+                    self.renderer_mut().flash(message, None);
+                }
                 AppAction::Interrupt => {
                     ctx.session.abort();
                     // Also kill a running bash child (the block was already marked cancelled

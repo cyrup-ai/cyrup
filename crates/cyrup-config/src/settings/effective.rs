@@ -6,8 +6,9 @@ use serde_json::Value;
 
 use super::layer::Settings;
 use super::types::{
-    BranchSummarySettings, CompactionSettings, DefaultProjectTrust, MermaidRenderingMode,
-    PackageSource, ProviderRetrySettings, RetrySettings, ThinkingBudgets, Warnings,
+    BranchSummarySettings, CompactionSettings, DefaultProjectTrust, FullscreenScrollbar,
+    MermaidRenderingMode, PackageSource, ProviderRetrySettings, RetrySettings, ThinkingBudgets,
+    TuiMode, Warnings,
 };
 use crate::error::ConfigError;
 
@@ -424,6 +425,42 @@ impl EffectiveSettings {
             Some("off") => MermaidRenderingMode::Off,
             Some("final") => MermaidRenderingMode::Final,
             _ => MermaidRenderingMode::Streaming,
+        }
+    }
+
+    /// `tuiMode` — which renderer the interactive TUI starts in (Pi `getTuiMode`,
+    /// settings-manager.ts:1128-1130 @v0.84.1). ADR-0005 §Decision A-3.
+    ///
+    /// Pi DEGRADES rather than validates: `this.settings.tuiMode === "fullscreen" ? "fullscreen" :
+    /// "regular"` (`:1129`), so an unknown value and an absent key both answer
+    /// [`TuiMode::Regular`] instead of erroring — the sole reason this reads the raw string rather
+    /// than `serde_json::from_value::<TuiMode>`, which would reject `"Fullscreen"`, `true`, or a
+    /// typo and force a `Result` on a getter upstream cannot fail.
+    ///
+    /// Degrading is a READ-side rule only. The unrecognized value stays in the document verbatim:
+    /// [`Settings`] is a JSON map and every writer is a read-modify-write of the re-parsed file
+    /// ([`super::SettingsManager::set`]), so a `settings.json` a newer pi wrote survives a cyrup
+    /// edit of some other key byte-for-byte (R-07-004).
+    pub fn tui_mode(&self) -> TuiMode {
+        match self.merged.get_str("tuiMode").as_deref() {
+            Some("fullscreen") => TuiMode::Fullscreen,
+            _ => TuiMode::Regular,
+        }
+    }
+
+    /// `fullscreenScrollbar` — the alternate screen's scrollbar policy, default `auto` (Pi
+    /// `getFullscreenScrollbar`, settings-manager.ts:1138-1141 @v0.84.1: `mode === "always" || mode
+    /// === "hidden" ? mode : "auto"`). ADR-0005 §Decision A-3.
+    ///
+    /// Same degrade-don't-reject contract as [`Self::tui_mode`], and the same preservation
+    /// guarantee for the value on disk. Upstream documents the key as having "no effect in regular
+    /// TUI mode" (`:136`); that conditionality belongs to the renderer, not to this accessor, which
+    /// answers the configured policy in either mode.
+    pub fn fullscreen_scrollbar(&self) -> FullscreenScrollbar {
+        match self.merged.get_str("fullscreenScrollbar").as_deref() {
+            Some("always") => FullscreenScrollbar::Always,
+            Some("hidden") => FullscreenScrollbar::Hidden,
+            _ => FullscreenScrollbar::Auto,
         }
     }
 

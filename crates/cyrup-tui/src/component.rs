@@ -37,4 +37,8 @@ pub enum InputEvent {
     /// Terminal focus gained / lost.
     FocusGained,
     FocusLost,
+    /// A mouse report, delivered only while the alternate screen has asked the terminal for them
+    /// (ADR-0005 §B-4; the gate is `altscreen::mouse::reporting_enabled`). In regular mode cyrup
+    /// enables no mouse mode at all, so this variant is never constructed there.
+    Mouse(ratatui::crossterm::event::MouseEvent),
 }

@@ -203,6 +203,42 @@ pub(crate) fn settings_rows(
         // cycled blindly with no list of the levels.
         SettingRow::submenu("thinking", "Thinking level", thinking_level.to_string(), "thinking")
             .with_description("Reasoning depth for thinking-capable models"),
+        // ADR-0005 §A-4 — the two alternate-screen rows, withheld until §A-3's settings keys and
+        // §B-14's renderer existed. Pi: `{id:"tui-mode", label:"TUI mode", …, values:["regular",
+        // "fullscreen"]}` (`components/settings-selector.ts:671-676`) and `{id:
+        // "fullscreen-scrollbar", …, values:["auto","always","hidden"]}` (`:685-691`), dispatched
+        // at `:904-905` / `:910-911`. `parse_setting_value` re-types neither — both cycle strings
+        // and both settings keys hold strings — so the row `id` IS the settings key
+        // `EffectiveSettings::tui_mode` / `::fullscreen_scrollbar` reads back.
+        //
+        // Pi's third row of that group, `fullscreen-exit-output` (`:678-684`), is deliberately
+        // absent: the `fullscreenExitOutput` key does not exist at v0.84.1, the tag ADR-0005 §A-3
+        // ports, so cyrup has no getter for it and offering the row would invent a config surface.
+        //
+        // PLACEMENT — upstream has this pair immediately BEFORE its `theme` row, i.e. last. cyrup
+        // hoisted `theme` to row 0 long ago (`crates/cyrup-tui/src/tests/selector_wiring.rs:221`
+        // pins it there), so "adjacent to theme" is not reachable without moving a row a test
+        // fixes in place. Appending keeps pi's RELATIVE order for everything that remains —
+        // `warnings`, `thinking`, then this pair — which is the closest faithful position left.
+        SettingRow::choice(
+            "tuiMode",
+            "TUI mode",
+            eff.tui_mode().as_str(),
+            choices(&["regular", "fullscreen"]),
+        )
+        .with_description("Interface layout; fullscreen mode is experimental"),
+        // The "no effect in regular mode" half of the description is upstream's own wording and is
+        // load-bearing: the key is read by the alternate screen's scrollbar only, so in the default
+        // renderer this row is a stored preference and nothing more (the same conditionality
+        // `EffectiveSettings::fullscreen_scrollbar` documents on the getter — it answers the
+        // configured policy in either mode, and the renderer decides whether that matters).
+        SettingRow::choice(
+            "fullscreenScrollbar",
+            "Fullscreen scrollbar",
+            eff.fullscreen_scrollbar().as_str(),
+            choices(&["auto", "always", "hidden"]),
+        )
+        .with_description("Scrollbar behavior in fullscreen mode; has no effect in regular mode"),
     ]);
     rows
 }

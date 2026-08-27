@@ -32,6 +32,41 @@ impl<B: Backend> App<B> {
                 if !self.state.overlays.is_empty() {
                     return self.handle_overlay_key(key);
                 }
+                // ADR-0005 §B-9 — the alternate screen's viewport bindings, and their deliberate
+                // shadowing of the unmodified editor bindings in fullscreen mode
+                // (`keybindings.ts:159`, which is a comment on a *behaviour*, not documentation).
+                //
+                // Upstream implements the rule by POSITION, not by a flag: `TuiAltScreen` registers
+                // `handleViewportInput` as an input listener (`tui-alt-screen.ts:227`), and the
+                // listener loop in `handleTerminalInput` runs to completion before the focused
+                // component is ever offered the key (`tui.ts:834-848` against `tui.ts:892-897`). A
+                // listener that answers `{consume: true}` ends the dispatch; one that answers
+                // `undefined` lets the key through unchanged. `false` from `handle_key` IS that
+                // `undefined`, and the fall-through below — selector, global `Keymap`, extension
+                // shortcuts, editor — is what keeps every one of them alive in fullscreen.
+                //
+                // Placed AFTER the overlay block and BEFORE the selector block for the same reason
+                // upstream tests `shouldDeferViewportInputToOverlay()` immediately ahead of its page
+                // arms (`:538-540`, `:599`): a focused overlay keeps its own `pageUp`, but the
+                // editor — which is what cyrup's selector slot swaps in place, and what upstream
+                // calls the focused component — does not.
+                //
+                // The rule's second half is resolution-time and needs nothing here: the table is
+                // consulted through `AltScreenKeymap::action_in_mode`, which answers `None` for
+                // every event under `TuiRenderMode::Regular` — so an inline `pageUp` reaches
+                // `tui.editor.pageUp` and `app.pageUp` exactly as it did before ADR-0005, and would
+                // still do so even if this block were reached with no alternate screen live.
+                if self.altscreen.is_some() {
+                    let App { altscreen, state, alt_keymap, .. } = self;
+                    // `document()` is passed rather than held: §B-10's prompt walk is its only
+                    // reader, and the renderer owns no copy of the transcript (`altscreen/mod.rs`,
+                    // rule 2).
+                    if let Some(alt) = altscreen.as_mut()
+                        && alt.handle_key(key, alt_keymap, state.transcript.document())
+                    {
+                        return AppAction::Redraw;
+                    }
+                }
                 // A focused selector captures input first (spec/tui/05 §2 routing step 2): its
                 // navigation/confirm/cancel keys are handled before the global keymap, so `Esc`/`Ctrl+C`
                 // dismiss the selector rather than interrupting the agent. Unbound keys fall through.
@@ -109,11 +144,51 @@ impl<B: Backend> App<B> {
                 AppAction::Redraw
             }
             InputEvent::Resize(_, _) => AppAction::Redraw,
+            // ADR-0005 §B-6/§B-7/§B-8 — the alternate screen's pointer surface. Reports only reach
+            // here while it is live (`altscreen::mouse::map_reader_event`'s gate), so the `None`
+            // arm is every regular-mode session and costs one `Option` test.
+            //
+            // Capturing the mouse takes the terminal's own selection away from the user, which is
+            // why a renderer that captures it owes them a replacement — the outcomes below ARE
+            // that replacement.
+            InputEvent::Mouse(m) => {
+                let area = match self.terminal.size() {
+                    Ok(s) => ratatui::layout::Rect { x: 0, y: 0, width: s.width, height: s.height },
+                    Err(_) => return AppAction::None,
+                };
+                let Some(alt) = self.altscreen.as_mut() else {
+                    return AppAction::None;
+                };
+                match alt.handle_mouse(m, area) {
+                    crate::altscreen::PointerOutcome::Ignored => AppAction::None,
+                    crate::altscreen::PointerOutcome::Handled => AppAction::Redraw,
+                    // The write is async, so it rides the action out to the run loop.
+                    crate::altscreen::PointerOutcome::Copy(text) => AppAction::CopySelection(text),
+                    // pi's `onRightClickPaste()` (`tui-alt-screen.ts:711`) inserts into the editor,
+                    // through the same bracketed-paste path a keyboard paste takes so a large
+                    // right-click paste collapses to the `[paste #N …]` marker identically.
+                    crate::altscreen::PointerOutcome::Paste(text) => {
+                        self.state.editor.handle_paste(&text);
+                        AppAction::Redraw
+                    }
+                }
+            }
             InputEvent::FocusGained => {
                 self.state.editor.set_focused(true);
                 AppAction::Redraw
             }
             InputEvent::FocusLost => {
+                // ADR-0005 §B-4/§B-8 — the reason the alternate screen asks the terminal for
+                // `?1004h` at all: `FOCUS_OUT` cancels a live scrollbar grab and an IN-FLIGHT
+                // selection (`tui-alt-screen.ts:543-559`). Without it a drag that leaves the window
+                // never ends, because the release is delivered to whatever took the focus. A
+                // completed selection deliberately survives — `selection::focus_lost` clears only
+                // the in-flight state, which is a different clear from `selection::cancel`.
+                //
+                // A no-op inline, where neither a thumb grab nor a selection exists.
+                if let Some(alt) = self.altscreen.as_mut() {
+                    alt.handle_focus_lost();
+                }
                 self.state.editor.set_focused(false);
                 AppAction::Redraw
             }
