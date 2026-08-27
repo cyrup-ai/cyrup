@@ -1,95 +1,110 @@
-# Active scope: the permission-gate enforcement spine
+# Active scope: cyrup-ext-subagents v0.57.0 drift remediation
 
-`todo/` holds **9 upstream-parity tasks** selected from `todo/_backlog/`, plus the 5 tasks
-left over from the previous code-review scope.
+`todo/` holds **2 upstream-parity tasks** promoted from `todo/cyrup-ext-subagents/`, plus the
+5 hygiene tasks left over from a prior scope. The 8 unstarted `cyrup-permission-system`
+parity tasks (`PORT_*`) from the *previous* active scope are paused — none had begun
+execution (all `stage: new`) — and have been returned to `backlog/`; see
+[`backlog/UPSTREAM_PARITY_INDEX.md`](./backlog/UPSTREAM_PARITY_INDEX.md) to resume
+that work later. `PORT_BASH_COMMAND_ENUMERATION`, the one task from that scope that did run,
+is already filed in `done/2026-08-27-04-34/`.
 
-The 9 are one coherent subsystem: **what policy is in effect, and what that policy is
-matched against**, in `crates/cyrup-permission-system`. They are drawn from the
-`pi-permission-system` v0.8.0 → v27.0.0 parity backlog — see
-[`_backlog/UPSTREAM_PARITY_INDEX.md`](./todo/_backlog/UPSTREAM_PARITY_INDEX.md) for the
-full 40-task set, the severity table, and how the analysis was produced.
+The 2 are the critical half of a fresh drift pass over `crates/cyrup-ext-subagents/`, ported
+from `nicobailon/pi-subagents`. They are drawn from
+[`docs/gap-analysis/09a-cyrup-ext-subagents-v0.57-drift.md`](../docs/gap-analysis/09a-cyrup-ext-subagents-v0.57-drift.md),
+which measured the port against upstream tag **v0.57.0** and added `SUBA-072`…`SUBA-091` to
+the crate's existing `SUBA-001`…`SUBA-071` corpus (`docs/gap-analysis/09-cyrup-ext-subagents.md`).
 
-The remaining 89 backlog files stay parked. A non-recursive `todo/*.md` glob — which every
-flux command uses — does not see them, so `/aug N`, `/exec N` and `/qa N` operate on the
-active queue only.
+A non-recursive `todo/*.md` glob — which every flux command uses — does not see
+`todo/cyrup-ext-subagents/` or `backlog/`, so `/aug`, `/exec` and `/qa` operate on the
+active queue below only.
 
-## The 9
+## The 2
 
-| Severity | Verification | Task |
+| Severity | Confidence | Task |
 | --- | --- | --- |
-| critical | verified | `PORT_BASH_COMMAND_ENUMERATION.md` |
-| critical | verified | `PORT_PROJECT_TRUST_GATING.md` |
-| critical | **single-source** | `PORT_FLAT_PERMISSION_POLICY_MODEL.md` |
-| critical | **single-source** | `PORT_CROSS_CUTTING_PATH_SURFACE.md` |
-| high | verified | `PORT_BASH_PATH_PROJECTION.md` |
-| high | verified | `PORT_PATH_CANONICALIZATION.md` |
-| high | **single-source** | `PORT_HOME_PREFIX_EXPANSION_IN_PATTERNS.md` |
-| medium | verified | `PORT_BASH_WRAPPER_FLOOR.md` |
-| medium | verified | `PORT_BASH_COMMENT_STRIPPING.md` |
+| critical | confirmed | `SUBA-072_CAPABILITY_CEILING_UNAPPLIED.md` |
+| critical as filed / **medium** as corrected (see file) | confirmed | `SUBA-073_CHILD_PERMISSION_POLICY_INERT.md` |
 
-## Why these nine
+`SUBA-073`'s own body walks its filed severity back from `critical` to `medium` (`high`
+defensible) during the adversarial refutation pass — read the "Severity note (correction
+applied)" section before treating it as equal-priority to `SUBA-072`. It is included here
+anyway because `SUBA-CORPUS-HEALTH.md` groups the two as the same defect class (see below),
+not because the severities match.
 
-Four of the backlog's five criticals are here. The fifth
-(`PORT_LOG_KEY_NAME_REDACTION`) is logging-side and belongs with the observability
-cluster, not this one; it stays parked.
+## Why these two
 
-`PORT_BASH_COMMAND_ENUMERATION` is the anchor and the only finding in the whole backlog
-where a rule the operator **wrote** is actively bypassable rather than merely absent:
-`wildcard.rs:60-68` compiles `echo *` to `^echo .*$` and `manager.rs:221-243` matches it
-against the entire command string, so `echo hi && rm -rf /` is allowed by an `echo *`
-rule. Every deny rule on a bash sub-command is bypassable by prefixing an allowed command.
+Both are, in `SUBA-CORPUS-HEALTH.md`'s words, **"the enforcement machinery is ported and
+permanently unreachable"**:
 
-The other eight are the rest of that decision path. Fixing enumeration alone still leaves
-each enumerated unit's path arguments ungated, and the flat `permission` model is the
-schema most of the backlog's `high` items assume exists.
+- `SUBA-072` — `exec/capability_ceiling.rs` correctly resolves and intersects
+  `allowedTools`/`denyExtensions`, and even base64-encodes the result into the child env, but
+  `exec/spawn_plan.rs` never gates the spawn on it — only the AGENTS axis is enforced. A
+  registered ceiling *presents* as armed while silently permitting the exact widening it
+  exists to prevent. That is a permission bypass, not merely an absent feature, hence
+  `critical`.
+- `SUBA-073` — `watchdog/permission_arbiter.rs` fully implements the child-side permission
+  gate, but nothing in `exec/` ever writes the policy env var it reads, and neither
+  `permission:` nor `permissions:` frontmatter is a known field — both round-trip silently
+  into `extra_fields` with no diagnostic. Not a bypass of an *enforcing* system (a cyrup
+  child is still gated by `cyrup-permission-system` regardless), which is why the severity
+  was corrected down — but still a config key that is parsed and ignored.
+
+Both fixes are scoped to `crates/cyrup-ext-subagents/`, both are effort `M`, and both touch
+`exec/spawn_plan.rs`.
 
 ## Sequencing
 
-Follows the index's suggested order; the edges below are hard.
+No hard dependency between the two, but **both edit `exec/spawn_plan.rs`** — run them
+sequentially in the same working tree (not as parallel worktrees) to avoid a mechanical merge
+conflict. Suggested order: `SUBA-072` first (unambiguous critical, revises the stale
+`SUBA-021` claim in-line), then `SUBA-073`.
 
-| Must run first | Then | Why |
-| --- | --- | --- |
-| `PORT_BASH_COMMAND_ENUMERATION` | `PORT_BASH_WRAPPER_FLOOR` | `WrapperKind` is a property of an enumerated command unit (upstream calls `wrapper-analysis.ts` from `makeCommandUnit`). Not implementable before the enumerator exists — the task says sequence it as part of the same fix. |
-| `PORT_BASH_COMMAND_ENUMERATION` | `PORT_BASH_PATH_PROJECTION` | Compound: enumeration without projection still leaves each unit's path arguments unexamined. |
-| `PORT_FLAT_PERMISSION_POLICY_MODEL` | the `high` items | They assume the flat model. Doing it late means porting features twice. |
+## Reference checkouts
 
-`PORT_FLAT_PERMISSION_POLICY_MODEL` and `PORT_CROSS_CUTTING_PATH_SURFACE` are **one
-change** — v4.0.0 replaced `defaultPolicy`/`tools`/`bash`/`mcp`/`skills`/`special` with a
-single flat `permission` object plus a cross-cutting `path` surface. Do them together.
+Both cited upstream files live in tag `v0.57.0` of `nicobailon/pi-subagents`, checked out at:
 
-Suggested run order:
+    tmp/pi              — earendil-works/pi              @ v0.84.3  (HEAD e868230)
+    tmp/pi-subagents    — nicobailon/pi-subagents         @ v0.58.0  (HEAD a9d0ee1, one release past v0.57.0)
 
-1. `PORT_BASH_COMMAND_ENUMERATION` — alone
-2. `PORT_PROJECT_TRUST_GATING` — read its `HostCtxRich::default()` note first
-3. `PORT_FLAT_PERMISSION_POLICY_MODEL` + `PORT_CROSS_CUTTING_PATH_SURFACE` — together
-4. `PORT_BASH_PATH_PROJECTION`, `PORT_PATH_CANONICALIZATION`, `PORT_HOME_PREFIX_EXPANSION_IN_PATTERNS`
-5. `PORT_BASH_WRAPPER_FLOOR`, `PORT_BASH_COMMENT_STRIPPING`
+`v0.58.0` is one release ahead of what the drift pass measured; every citation in the two
+tasks is pinned to `v0.57.0` evidence via `git show v0.57.0:<path>`; the working tree being a
+release ahead does not affect either task's evidence, only a future drift pass.
 
-## Two prerequisites before `/exec`
+## The rest of the batch — parked
 
-**1. The upstream reference checkout is missing.** Every one of the 9 cites its evidence as
-`tmp/pi-packages/packages/pi-permission-system/<file>.ts:<line>`. `tmp/` is gitignored
-(`.gitignore:7`) and absent from a fresh clone, so those citations cannot be read as-is:
+11 more items from the same drift pass (`SUBA-074`, `075`, `076`, `077`, `078`, `079`, `081`,
+`083`, `085` — 8 high, plus `SUBA-CORPUS-HEALTH` and `SUBA-VERIFY-CARRIED-LEADS`) remain in
+`todo/cyrup-ext-subagents/`, each still carrying its own "lives in a subdirectory, pass the
+absolute path" note since they have not been promoted. `SUBA-080` is refuted; `SUBA-082`,
+`084`, `086`–`091` are carried-but-not-adversarially-verified — re-verify before promoting.
+Promote further items into `todo/` the same way these two were: `git mv` the file up one
+level, drop its "Path note" callout, and fix its now-shallower relative link to the
+`docs/gap-analysis/` source.
 
-    git clone https://github.com/gotgenes/pi-packages tmp/pi-packages
-
-**2. Three of the 9 are single-source.** The parity analysis paired each of 7 compare
-agents with an adversary that tried to refute its findings. The `policy-config`,
-`prompts-ui` and `logging-redaction` adversaries died on a session limit and never ran.
-`PORT_FLAT_PERMISSION_POLICY_MODEL`, `PORT_CROSS_CUTTING_PATH_SURFACE` and
-`PORT_HOME_PREFIX_EXPANSION_IN_PATTERNS` carry that warning in their own files.
-**Re-check each against the port before starting work** — the other six were adversarially
-verified and can be trusted at face value.
-
-Each file also ends with: *run `/ask` or `/aug` before `/exec` — it is a research-stage
-finding, not a plan.* All 9 are `stage: new`.
+`SUBA-CORPUS-HEALTH.md` also names three ledger rows in `09-cyrup-ext-subagents.md` that carry
+evidence now factually wrong at HEAD (`SUBA-021`, `VL-S1`, `VL-S14`, `SUBA-051`'s Fix line) —
+worth correcting before or alongside this scope, not urgent to block it.
 
 ## The 5 carried over
 
 `COLLAPSE_NDJSON_PARSERS`, `DECOMPOSE_LONG_FUNCTIONS`, `REPOINT_STALE_TEST_LAYOUT_DOCS`,
-`RESTRICT_PUB_VISIBILITY`, `UNIFY_DUPLICATE_TYPE_SHAPES` — unrelated to the parity work and
-independently runnable.
+`RESTRICT_PUB_VISIBILITY`, `UNIFY_DUPLICATE_TYPE_SHAPES` — unrelated to either parity effort
+and independently runnable. `COLLAPSE_NDJSON_PARSERS` and `UNIFY_DUPLICATE_TYPE_SHAPES` are
+`stage: exec`; per their own history both landed complete on `main` already but the flux
+bookkeeping was never advanced to `done` — leave as-is unless you're the one closing that out.
 
-## Restoring the full queue
+## Restoring the permission-system scope
 
-    mv .flux/todo/_backlog/*.md .flux/todo/ && rmdir .flux/todo/_backlog
+    git mv .flux/backlog/PORT_BASH_COMMENT_STRIPPING.md \
+           .flux/backlog/PORT_BASH_PATH_PROJECTION.md \
+           .flux/backlog/PORT_BASH_WRAPPER_FLOOR.md \
+           .flux/backlog/PORT_CROSS_CUTTING_PATH_SURFACE.md \
+           .flux/backlog/PORT_FLAT_PERMISSION_POLICY_MODEL.md \
+           .flux/backlog/PORT_HOME_PREFIX_EXPANSION_IN_PATTERNS.md \
+           .flux/backlog/PORT_PATH_CANONICALIZATION.md \
+           .flux/backlog/PORT_PROJECT_TRUST_GATING.md \
+           .flux/todo/
+
+That scope's own prerequisites still apply when resumed — see its history in this file's
+prior revision (`git log -p -- .flux/SCOPE.md`) for the `tmp/pi-packages` checkout note and
+the three single-source warnings.

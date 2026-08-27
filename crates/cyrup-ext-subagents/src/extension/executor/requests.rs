@@ -362,6 +362,12 @@ pub struct BackgroundStepsSpec {
     /// the same reason the foreground path resolves it before building `RunOptions`: hop 2 has no
     /// discovery and no live config to re-derive the chain from.
     pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-073: pi `resolvePermissionRules(ctx.config?.permissions, agentConfig.permissions)` on
+    /// the async path, carried to hop 2 on
+    /// [`crate::background::runner_main::RunnerConfig::permission_rules`] and applied by the
+    /// runner to EVERY step, exactly as [`Self::turn_budget`] is — already resolved by the
+    /// dispatch site for the same reason.
+    pub permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
     /// SUBA-021 — the run-level USAGE budget, carried to hop 2 on
     /// [`crate::background::runner_main::RunnerConfig::usage_budget`] and applied by the runner to
     /// EVERY step, exactly as [`Self::turn_budget`] is (pi enforces one `usageBudget` across a

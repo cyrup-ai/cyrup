@@ -16,6 +16,8 @@ use super::super::types::{AgentDefinition, AgentSource, ChainDefinition, SystemP
 pub(crate) fn sample_agent(source: AgentSource, file_path: PathBuf) -> AgentDefinition {
     AgentDefinition {
         default_turn_budget: None,
+        permission_rules: None,
+        runner: None,
         name: "reviewer".to_string(),
         local_name: "reviewer".to_string(),
         package_name: None,

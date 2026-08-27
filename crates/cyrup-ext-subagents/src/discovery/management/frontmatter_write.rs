@@ -254,6 +254,32 @@ pub(crate) fn serialize_agent(def: &AgentDefinition, preserve_fields: Option<&Ha
         lines.push(format!("turnBudget: {value}"));
     }
 
+    // SUBA-073 permission/permissions (`agent-serializer.ts` @v0.57.0): emitted as compact JSON
+    // under the canonical `permissions:` key — matching `aliases`'s own precedent of always
+    // writing the newer/plural spelling regardless of which the original file used — or as an
+    // empty value under preserve. Same silent-deletion trap as `toolBudget`/`turnBudget` above,
+    // now that `permission`/`permissions` are both in `KNOWN_FIELDS`.
+    if def.permission_rules.is_some() || preserve(&["permission", "permissions"]) {
+        let value = def
+            .permission_rules
+            .as_ref()
+            .map(crate::exec::permissions::permission_rules_to_json_string)
+            .unwrap_or_default();
+        lines.push(format!("permissions: {value}"));
+    }
+
+    // SUBA-074 runner (`agent-serializer.ts` @v0.57.0): emitted as compact JSON, or as an empty
+    // value under preserve. Same silent-deletion trap as `toolBudget`/`turnBudget`/`permissions`
+    // above, now that `runner` is in `KNOWN_FIELDS`.
+    if def.runner.is_some() || preserve(&["runner"]) {
+        let value = def
+            .runner
+            .as_ref()
+            .map(crate::runner::runner_to_json_string)
+            .unwrap_or_default();
+        lines.push(format!("runner: {value}"));
+    }
+
     // memory (`agent-serializer.ts:95-99` @ v0.34.0): a two-line nested block, emitted ONLY when
     // set (upstream has no `preserve` arm for it).
     if let Some(memory) = &def.memory {
@@ -515,6 +541,103 @@ mod tests {
         );
     }
 
+    /// SUBA-073 — the same silent-deletion trap for `permission`/`permissions`: now that both
+    /// spellings are `KNOWN_FIELDS`, a management rewrite that never emits them would otherwise
+    /// silently delete an author's policy on the first `update_agent` call.
+    #[test]
+    fn serialize_agent_round_trips_the_permission_policy() {
+        use crate::discovery::frontmatter::parse_agent_file;
+        use crate::watchdog::permission_arbiter::{PermissionRuleDecision, PermissionRules};
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "warden".to_string();
+        def.name = "warden".to_string();
+        def.description = "Guards things".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        let mut rules = PermissionRules::new();
+        rules.insert("write".to_string(), PermissionRuleDecision::Deny);
+        def.permission_rules = Some(rules);
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized.contains(r#"permissions: {"write":"deny"}"#),
+            "the policy must be emitted as compact JSON under the canonical plural key:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(
+            reparsed.permission_rules, def.permission_rules,
+            "the permission policy must survive a serialize -> re-parse round trip"
+        );
+        assert!(
+            !reparsed.extra_fields.contains_key("permission")
+                && !reparsed.extra_fields.contains_key("permissions"),
+            "a KNOWN_FIELDS key must never be demoted to extra_fields"
+        );
+
+        // An update that never mentions the policy must not DROP an existing one under preserve.
+        let mut preserve = HashSet::new();
+        preserve.insert("permissions".to_string());
+        let mut unset_def = def.clone();
+        unset_def.permission_rules = None;
+        let preserved_serialized = serialize_agent(&unset_def, Some(&preserve));
+        assert!(
+            preserved_serialized.contains("permissions:"),
+            "an unrelated update must preserve the existing permissions: line:\n{preserved_serialized}"
+        );
+    }
+
+    /// SUBA-074 — the same silent-deletion trap for `runner:`: now that it is a `KNOWN_FIELD`, a
+    /// serializer that never emits it would drop an author's runner block on the first management
+    /// rewrite.
+    #[test]
+    fn serialize_agent_round_trips_the_runner_block() {
+        use crate::discovery::frontmatter::parse_agent_file;
+        use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
+
+        let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
+        def.local_name = "worker".to_string();
+        def.name = "worker".to_string();
+        def.description = "Worker".to_string();
+        def.system_prompt_body = "Do work".to_string();
+        def.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+            adapter: Some("claude-code".to_string()),
+            command: "claude".to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: None,
+        }));
+
+        let serialized = serialize_agent(&def, None);
+        assert!(
+            serialized
+                .contains(r#"runner: {"type":"external-cli","adapter":"claude-code","command":"claude"}"#),
+            "the runner must be emitted as compact JSON in upstream's key order:\n{serialized}"
+        );
+
+        let reparsed = parse_agent_file(&serialized, AgentSource::Project, Path::new("/w.md"))
+            .expect("round-trips back through the parser");
+        assert_eq!(
+            reparsed.runner, def.runner,
+            "the runner block must survive a serialize -> re-parse round trip"
+        );
+        assert!(
+            !reparsed.extra_fields.contains_key("runner"),
+            "a KNOWN_FIELDS key must never be demoted to extra_fields"
+        );
+
+        // An unrelated update must not DROP an existing runner under preserve.
+        let mut preserve = HashSet::new();
+        preserve.insert("runner".to_string());
+        let mut unset = def.clone();
+        unset.runner = None;
+        assert!(
+            serialize_agent(&unset, Some(&preserve)).contains("runner:"),
+            "an unrelated update must preserve the existing runner: line"
+        );
+    }
+
     /// The same silent-deletion trap for the two launch defaults (G98).
     #[test]
     fn serialize_agent_round_trips_the_async_and_timeout_launch_defaults() {
@@ -550,8 +673,14 @@ mod tests {
     #[test]
     fn serialize_agent_round_trip_preserves_unknown_keys_including_block_values() {
         // T7 §3: unknown keys survive a serialize -> re-parse round-trip, and a block-valued extra
-        // field (embedded newlines, e.g. a `permission:` nested-YAML block) is re-emitted as an
+        // field (embedded newlines, e.g. a `vendorPolicy:` nested-YAML block) is re-emitted as an
         // indented block rather than corrupted into a flat line.
+        //
+        // SUBA-073: this test used `permission:` as its stand-in "unknown key with a block value"
+        // example. `permission`/`permissions` are now KNOWN_FIELDS (validated, typed), so they are
+        // no longer a valid example of an unrecognized key — swapped for a fictitious
+        // `vendorPolicy:` key that stays genuinely unknown, preserving this test's real subject
+        // (the block-value round-trip mechanic itself, not permission's own semantics).
         use crate::discovery::frontmatter::parse_agent_file;
 
         let mut def = sample_agent(AgentSource::Project, PathBuf::from("/w.md"));
@@ -566,7 +695,7 @@ mod tests {
         // `disabled:` in a file is an unknown extra field (T7 §2), so it round-trips here too.
         extra.insert("disabled".to_string(), "true".to_string());
         extra.insert(
-            "permission".to_string(),
+            "vendorPolicy".to_string(),
             "\"*\": ask\nread: allow\nbash:\n  \"*\": ask\n  \"git *\": allow".to_string(),
         );
         def.extra_fields = extra;
@@ -579,7 +708,7 @@ mod tests {
 
         assert!(
             serialized.contains(
-                "permission:\n  \"*\": ask\n  read: allow\n  bash:\n    \"*\": ask\n    \"git *\": allow"
+                "vendorPolicy:\n  \"*\": ask\n  read: allow\n  bash:\n    \"*\": ask\n    \"git *\": allow"
             ),
             "block-valued extra field must round-trip as an indented block:\n{serialized}"
         );
@@ -600,7 +729,7 @@ mod tests {
             Some("some-value")
         );
         assert_eq!(
-            reparsed.extra_fields.get("permission").map(String::as_str),
+            reparsed.extra_fields.get("vendorPolicy").map(String::as_str),
             Some("\"*\": ask\nread: allow\nbash:\n  \"*\": ask\n  \"git *\": allow"),
             "the block value must round-trip byte-for-byte"
         );

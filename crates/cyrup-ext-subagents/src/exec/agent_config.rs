@@ -37,7 +37,8 @@ pub struct AgentConfig {
     pub fallback_models: Vec<ModelId>,
     /// The agent's frontmatter reasoning level (func-SA §4.1 `AgentDefinition::thinking`) as pi's
     /// OPEN string, applied to the child's `--model` argument as a `:<value>` suffix at spawn time via
-    /// [`crate::exec::apply_thinking_suffix`] (pi `applyThinkingSuffix`, `runs/shared/pi-args.ts:186-200`) — `None` leaves the
+    /// [`crate::exec::apply_thinking_suffix`] (pi `applyThinkingSuffix`,
+    /// `runs/shared/pi-args.ts:238-252` @v0.57.0) — `None` leaves the
     /// per-attempt model id untouched. Carrying the raw string (rather than a closed on-only enum)
     /// means an explicit `Some("off")` now reaches the child as `:off`, exactly like pi, instead of
     /// being conflated with `None` and dropped.
@@ -96,6 +97,10 @@ pub struct AgentConfig {
     /// [`crate::exec::tool_budget::TOOL_BUDGET_ENV`] at spawn; the child-side runtime
     /// ([`crate::prompt_runtime`]) is what actually nudges and blocks.
     pub tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
+    /// SUBA-074 — the agent's declared execution runner, carried so the pre-ladder refusal in
+    /// [`crate::exec::run_sync`] fires identically on every dispatch path. `None` and
+    /// `Some(AgentRunnerConfig::Pi)` both mean the native child this crate spawns.
+    pub runner: Option<crate::runner::AgentRunnerConfig>,
 }
 
 impl AgentConfig {
@@ -124,6 +129,7 @@ impl AgentConfig {
             depth,
             memory: agent.memory.clone(),
             tool_budget: agent.tool_budget.clone(),
+            runner: agent.runner.clone(),
         }
     }
 }
@@ -222,6 +228,11 @@ pub struct ResolvedAgentPersona {
     /// runner-config hand-off backward compatible.
     #[serde(default)]
     pub tool_budget: Option<crate::discovery::types::ResolvedToolBudget>,
+    /// SUBA-074 — the agent's declared execution runner, carried across the hop-2 process
+    /// boundary so a chain/parallel/background step refuses an unsupported runner exactly as the
+    /// single-run path does. `#[serde(default)]` keeps an older on-disk config deserializable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runner: Option<crate::runner::AgentRunnerConfig>,
 }
 
 impl ResolvedAgentPersona {
@@ -250,6 +261,7 @@ impl ResolvedAgentPersona {
             default_context: agent.default_context,
             memory: agent.memory.clone(),
             tool_budget: agent.tool_budget.clone(),
+            runner: agent.runner.clone(),
         }
     }
 
@@ -279,6 +291,7 @@ impl ResolvedAgentPersona {
             depth,
             memory: self.memory.clone(),
             tool_budget: self.tool_budget.clone(),
+            runner: self.runner.clone(),
         }
     }
 }
@@ -529,6 +542,18 @@ pub struct RunOptions {
     /// is defaulted and nothing downstream re-derives it. `None` means unbudgeted, which is every
     /// run that does not ask for one — upstream has no default budget.
     pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-073 — pi `resolvePermissionRules(ctx.config?.permissions, agentConfig.permissions)`
+    /// (`async-execution.ts`, `api/preflight.ts`): the fully-merged permission policy (global
+    /// `config.permissions` + this agent's own frontmatter, agent winning on conflict, `allow`
+    /// entries stripped) this run's child receives. Resolved once by whichever call site has both
+    /// the live extension config and the resolved agent in hand — [`crate::exec::permissions::resolve_permission_rules`]
+    /// — and threaded here exactly like [`Self::turn_budget`], for the same reason: it has a
+    /// global-config rung that a per-agent-persona projection ([`ResolvedAgentPersona`]) cannot
+    /// re-derive on its own after crossing the hop-2 detached-runner process boundary.
+    ///
+    /// `None` means no policy at all — the pre-existing, permanently-unreachable state this item
+    /// exists to make reachable.
+    pub permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
     /// SUBA-008 — pi `options.enforceHardTurnLimit` (`subagent-executor.ts:240`, `shared/types.ts:1648`):
     /// suppress the mid-tool-work deferral so the hard limit really terminates.
     ///
@@ -662,6 +687,15 @@ mod tests {
             default_context: None,
             memory: None,
             tool_budget: None,
+            runner: Some(crate::runner::AgentRunnerConfig::ExternalCli(
+                crate::runner::ExternalCliRunner {
+                    adapter: Some("claude-code".to_string()),
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    prompt_delivery_stdin: false,
+                    capabilities: None,
+                },
+            )),
         };
         let json = serde_json::to_string(&persona).expect("serialize");
         let back: ResolvedAgentPersona = serde_json::from_str(&json).expect("deserialize");
@@ -690,6 +724,15 @@ mod tests {
             default_context: None,
             memory: None,
             tool_budget: None,
+            runner: Some(crate::runner::AgentRunnerConfig::ExternalCli(
+                crate::runner::ExternalCliRunner {
+                    adapter: Some("claude-code".to_string()),
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    prompt_delivery_stdin: false,
+                    capabilities: None,
+                },
+            )),
         };
         let live_depth = DepthEnvelope {
             current_depth: 1,
@@ -711,6 +754,7 @@ mod tests {
         assert_eq!(cfg.thinking, Some("high".to_string()));
         assert_eq!(cfg.extensions, Some(vec!["./allowed-ext.ts".to_string()]));
         assert_eq!(cfg.subagent_only_extensions, vec!["./child-tool.ts".to_string()]);
+        assert_eq!(cfg.runner, persona.runner);
         assert!(cfg.inherit_project_context);
         assert!(!cfg.inherit_skills);
         // The persona's own `skills` list reaches the execution config so a chain/parallel/background

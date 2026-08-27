@@ -32,6 +32,7 @@ pub(crate) fn sample_agent_config(model: &str, fallback: &[&str]) -> AgentConfig
         max_subagent_depth: None,
         memory: None,
         tool_budget: None,
+        runner: None,
         depth: DepthEnvelope {
             current_depth: 0,
             max_depth: 5,
@@ -44,6 +45,7 @@ pub(crate) fn base_opts(cwd: &std::path::Path, available: &[&str]) -> RunOptions
         // SUBA-021: no usage budget on this path (see the field doc).
         usage_budget: None,
         turn_budget: None,
+        permission_rules: None,
         enforce_hard_turn_limit: false,
         model_scope: None,
         cwd: cwd.to_path_buf(),

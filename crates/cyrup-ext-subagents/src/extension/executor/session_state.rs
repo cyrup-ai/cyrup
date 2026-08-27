@@ -376,6 +376,7 @@ mod tests {
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
+            permission_rules: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,

@@ -103,7 +103,14 @@ impl SubagentExecutor {
         // `default_context` (pi `resolveAgentDefaultContextPolicy`), an explicit value still wins.
         let effective_context = resolve_effective_context(context, agent.default_context);
         // R-SA-137: eager fork-context resolution before ANY process is spawned for this batch.
-        let fork_context = self.resolve_context(cwd, effective_context).await?;
+        //
+        // SUBA-075: `true` is upstream's own `forceThinkingOffForIndex?.(index) ?? true` fallback.
+        // The background hand-off carries only a session-file PATH across to hop 2
+        // (`RunnerConfig`'s `SingleStepSpec::session_file`), so a resolved `thinking_override` has
+        // nowhere to ride even if this path computed one; threading it is the async half of
+        // SUBA-075, filed separately. Until then this stays on the conservative side of the gate
+        // rather than resolving a ladder whose answer it could not transmit.
+        let fork_context = self.resolve_context(cwd, effective_context, true).await?;
 
         // SUBA-N03 — the run id is minted HERE, not inside `spawn_background_steps`, because the
         // SINGLE-mode output base directory is run-scoped (`<artifactsDir>/outputs/<runId>`) and a
@@ -246,6 +253,20 @@ impl SubagentExecutor {
                     )
                     .map_err(SubagentError::Management)?,
                 },
+                // SUBA-073 — pi `resolvePermissionRules(ctx.config?.permissions,
+                // agentConfig.permissions)` (`async-execution.ts`): the two-rung merge (no
+                // per-call tier — permissions has none), resolved HERE for the same reason
+                // `turn_budget` above is: hop 2 has neither discovery nor a live config to
+                // re-derive it from.
+                permission_rules: crate::exec::permissions::resolve_permission_rules(
+                    crate::exec::permissions::validate_permission_config(
+                        cfg.permissions.as_ref(),
+                        "config.permissions",
+                    )
+                    .map_err(SubagentError::Management)?
+                    .as_ref(),
+                    agent.permission_rules.as_ref(),
+                ),
                 steps: vec![RunnerStep::SingleStep(step)],
                 mode: RunMode::Single,
                 session_file: fork_context.session_file_path,
@@ -343,6 +364,7 @@ impl SubagentExecutor {
             artifacts_dir,
             artifact_config,
             turn_budget,
+            permission_rules,
             usage_budget,
         } = spec;
         let cfg = self.config_snapshot().await;
@@ -427,6 +449,9 @@ impl SubagentExecutor {
             usage_budget,
             // SUBA-008 — the run-level turn budget the orchestrator resolved, carried verbatim.
             turn_budget,
+            // SUBA-073 — the run-level, fully-merged permission policy the orchestrator resolved,
+            // carried verbatim.
+            permission_rules,
             run_id: run_id.clone(),
             mode,
             steps,

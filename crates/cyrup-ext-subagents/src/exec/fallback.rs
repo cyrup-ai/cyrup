@@ -63,7 +63,7 @@ pub const INHERIT_MODEL_SENTINEL: &str = "inherit";
 /// pi's `const explicit = trimmed && trimmed !== INHERIT_MODEL ? trimmed : undefined`
 /// (`model-fallback.ts:203-204`): the requested model as a REAL model id, or `None` when the
 /// request is absent, blank, or the [`INHERIT_MODEL_SENTINEL`].
-fn real_requested_model(requested: Option<&ModelId>) -> Option<&ModelId> {
+pub(crate) fn real_requested_model(requested: Option<&ModelId>) -> Option<&ModelId> {
     let requested = requested?;
     let trimmed = requested.as_str().trim();
     (!trimmed.is_empty() && trimmed != INHERIT_MODEL_SENTINEL).then_some(requested)

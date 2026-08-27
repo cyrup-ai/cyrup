@@ -74,7 +74,16 @@ pub(crate) fn report_value(overrides: Value) -> Value {
     });
     if let (Value::Object(b), Value::Object(o)) = (&mut base, overrides) {
         for (k, v) in o {
-            b.insert(k, v);
+            // An explicit `null` REMOVES the key, which `insert` alone cannot express. The base
+            // above supplies every evidence kind `Checked` requires, so "this kind is genuinely
+            // absent from the child's report" — a distinct case from "reported empty" ever since
+            // SUBA-076 made `changedFiles`/`testsAddedOrUpdated` tri-state — is otherwise
+            // unreachable through this helper.
+            if v.is_null() {
+                b.remove(&k);
+            } else {
+                b.insert(k, v);
+            }
         }
     }
     base

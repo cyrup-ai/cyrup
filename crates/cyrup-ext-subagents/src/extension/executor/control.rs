@@ -826,6 +826,9 @@ impl SubagentExecutor {
                     // SUBA-021: unbudgeted on this path (see the field doc).
                     usage_budget: None,
                     turn_budget: None,
+                    // SUBA-073: no policy on this path — same pre-existing incompleteness as
+                    // `turn_budget` immediately above; not this task's fix to extend.
+                    permission_rules: None,
                     steps: vec![RunnerStep::SingleStep(step)],
                     mode: RunMode::Single,
                     session_file: Some(session_file.to_path_buf()),

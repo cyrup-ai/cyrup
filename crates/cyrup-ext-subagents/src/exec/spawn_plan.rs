@@ -114,14 +114,23 @@ pub(crate) const SYSTEM_PROMPT_FLAG: &str = "--system-prompt";
 /// `"--append-system-prompt"`; repeatable host-side, joined with `\n`).
 pub(crate) const APPEND_SYSTEM_PROMPT_FLAG: &str = "--append-system-prompt";
 
-/// pi `applyThinkingSuffix` (`runs/shared/pi-args.ts:186-200`): append `:<thinking>` to a model id, unless the
-/// model already ends with a recognized `:<level>` suffix (leave it untouched) or either input is
+/// pi `applyThinkingSuffix` (`runs/shared/pi-args.ts:238-252` @v0.57.0; the citation was the
+/// v0.43.0 `:186-200` range, which the function has since moved out of): append `:<thinking>` to a
+/// model id, unless the model already ends with a recognized `:<level>` suffix or either input is
 /// absent (return the model as-is). Operates on strings so the exact pi rule — including the `off`
 /// level a closed on-only enum cannot itself carry — is reproduced verbatim; the agent's own OPEN
 /// `thinking` string (`AgentConfig::thinking`) is passed straight through, so an explicit `off`
 /// yields `<model>:off`.
+///
+/// `replace_existing` is upstream's third parameter, defaulted `false` there and required here. It
+/// is set by exactly one caller — a sanitized fork's thinking override (SUBA-075) — and it is what
+/// lets that override REPLACE a level the id already names instead of deferring to it.
 #[must_use]
-pub fn apply_thinking_suffix(model: Option<&str>, thinking: Option<&str>) -> Option<String> {
+pub fn apply_thinking_suffix(
+    model: Option<&str>,
+    thinking: Option<&str>,
+    replace_existing: bool,
+) -> Option<String> {
     let (Some(model), Some(thinking)) = (model, thinking) else {
         return model.map(str::to_string);
     };
@@ -130,10 +139,17 @@ pub fn apply_thinking_suffix(model: Option<&str>, thinking: Option<&str>) -> Opt
     if thinking.is_empty() {
         return Some(model.to_string());
     }
-    if let Some((_, suffix)) = model.rsplit_once(':')
-        && THINKING_LEVELS.contains(&suffix)
-    {
-        return Some(model.to_string());
+    let (base, existing) = split_known_thinking_suffix(model);
+    if !existing.is_empty() {
+        // SUBA-075: an id that ALREADY names a level normally wins — the caller asked for that
+        // exact model. A fork thinking-override is the one case that outranks it: the branch was
+        // sanitized precisely because the inherited thinking blocks are unusable, so honouring a
+        // persona's `:high` there relaunches the failure the sanitization exists to prevent.
+        return Some(if replace_existing {
+            format!("{base}:{thinking}")
+        } else {
+            model.to_string()
+        });
     }
     Some(format!("{model}:{thinking}"))
 }
@@ -298,12 +314,51 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
 ) -> Result<AttemptSpawnPlan, SubagentError> {
     let capability_ceiling = preflight_capability_ceiling(agent, opts)?;
 
+    // SUBA-072 — the remaining two ceiling axes, resolved once here so both the tool-allowlist
+    // block and the extension-threading block below can apply them. `ceiling_allowed_tools` is
+    // `None` when the ceiling (if any) leaves `allowedTools` unset — no bound, not "bound to
+    // nothing" (see [`crate::exec::capability_ceiling::ResolvedCapabilityCeiling`]'s own doc on
+    // that distinction).
+    let ceiling_allowed_tools: Option<Vec<String>> = capability_ceiling
+        .as_ref()
+        .and_then(|ceiling| ceiling.allowed_tools.clone());
+    let ceiling_deny_extensions = capability_ceiling
+        .as_ref()
+        .is_some_and(|ceiling| ceiling.deny_extensions);
+
+    // pi `pi-args.ts:439-441`: fires BEFORE any tool-plan branching, independent of whether this
+    // agent declared its own `tools:` — a ceiling that excludes `read` while lazy skill loading
+    // needs it is a hard launch error, not a silent narrowing.
+    if require_read_tool
+        && let Some(allowed) = ceiling_allowed_tools.as_ref()
+        && !allowed.iter().any(|tool| tool == "read")
+    {
+        let sources = capability_ceiling
+            .as_ref()
+            .filter(|ceiling| !ceiling.sources.is_empty())
+            .map_or_else(|| "unknown source".to_string(), |ceiling| ceiling.sources.join(", "));
+        return Err(SubagentError::CapabilityCeilingViolation(format!(
+            "Capability ceiling from {sources} excludes required tool 'read' for lazy skill \
+             loading."
+        )));
+    }
+
     let command = crate::spawn::resolve_spawn_command();
 
     // T4 (pi `applyThinkingSuffix`): the per-attempt model id, suffixed with the agent's frontmatter
     // reasoning level (`:high` etc.) unless it already carries a recognized `:<level>` suffix.
-    let model_arg = apply_thinking_suffix(Some(model.as_str()), agent.thinking.as_deref())
-        .unwrap_or_else(|| model.as_str().to_string());
+    //
+    // SUBA-075 / pi `applyThinkingSuffix(model, options.thinkingOverride ?? agent.thinking,
+    // options.thinkingOverride !== undefined)` (`runs/foreground/execution.ts:1847` @v0.57.0): a
+    // sanitized fork's thinking override BOTH supplies the level and licenses replacing a level the
+    // id already carries.
+    let thinking_override = opts.fork_context.thinking_override.as_deref();
+    let model_arg = apply_thinking_suffix(
+        Some(model.as_str()),
+        thinking_override.or(agent.thinking.as_deref()),
+        thinking_override.is_some(),
+    )
+    .unwrap_or_else(|| model.as_str().to_string());
 
     let mut args: Vec<String> = vec![
         "--print".to_string(),
@@ -313,9 +368,21 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         model_arg,
     ];
 
-    let tools = resolve_child_tools(agent, opts, require_read_tool, &mut args);
+    let tools = resolve_child_tools(
+        agent,
+        opts,
+        require_read_tool,
+        ceiling_allowed_tools.as_ref(),
+        ceiling_deny_extensions,
+        &mut args,
+    );
 
-    push_extension_and_skill_args(agent, tools.tool_extension_paths, &mut args);
+    push_extension_and_skill_args(
+        agent,
+        ceiling_deny_extensions,
+        tools.tool_extension_paths,
+        &mut args,
+    );
 
     let persona_temp_file = compose_persona(agent, opts, temp_dir, &mut args)?;
 
@@ -356,14 +423,23 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
 
     let mut env_overlay =
-        env_identity_and_depth(agent, depth, tools.fanout_authorized, &tools.mcp_direct_tools);
+        env_identity_and_depth(
+        agent,
+        opts,
+        depth,
+        tools.fanout_authorized,
+        &tools.mcp_direct_tools,
+        ceiling_allowed_tools.as_ref(),
+        ceiling_deny_extensions,
+    );
     env_orchestration(
         agent,
         opts,
         structured_runtime,
         capability_ceiling.as_ref(),
+        temp_dir,
         &mut env_overlay,
-    );
+    )?;
     let tool_diagnostic_path = env_control_channels(
         opts,
         temp_dir,
@@ -455,6 +531,10 @@ fn resolve_child_tools(
     agent: &AgentConfig,
     opts: &RunOptions,
     require_read_tool: bool,
+    // SUBA-072 — the ceiling axes resolved by the caller, applied to both the `--tools` allowlist
+    // and the direct-MCP resolution below.
+    ceiling_allowed_tools: Option<&Vec<String>>,
+    ceiling_deny_extensions: bool,
     args: &mut Vec<String>,
 ) -> ResolvedChildTools {
     let mut required_child_tools: Option<Vec<String>> = None;
@@ -474,46 +554,24 @@ fn resolve_child_tools(
         }
     }
 
-    // pi `runs/shared/pi-args.ts:194`: `const fanoutAuthorized = declaredBuiltinTools.includes("subagent")` —
-    // a persona is granted NESTED delegation exactly when it declares the `subagent` tool itself.
-    // With `tools` unset, pi's `declaredBuiltinTools` is `[]` (`:189-193`, no capability ceiling in
-    // this port), so an agent that declares nothing is NOT fanout-authorized. This is the single
-    // input to the child-role env pair below, and through it to
-    // [`crate::extension::resolve_registration_mode`]: authorized → `ChildSafe` (the restricted,
-    // mutation-blocked `subagent` tool, pi `extension/fanout-child.ts:132`), unauthorized → the
-    // child registers no subagent surface at all and cannot delegate.
-    let fanout_authorized = builtin_tools
-        .iter()
-        .any(|tool| tool == crate::extension::TOOL_NAME);
-
-    // G103 / pi `runs/shared/pi-args.ts:389-393,549-555` @v0.43.0. `explicitToolAllowlist` is
-    // `input.tools !== undefined || mcpDirectTools.length > 0 || <ceiling>` — i.e. "did anything
-    // pin this child's tool surface at all". cyrup folds pi's `tools` and `mcpDirectTools` into the
-    // one `agent.tools: Option<Vec<ToolRef>>`, so `is_some()` IS that predicate: `None` is an agent
-    // that never wrote a `tools:` key (no restriction, child keeps the ambient set), `Some(_)` —
-    // INCLUDING `Some(vec![])` — is an explicit allowlist.
+    // pi `pi-args.ts:444-455`: `declaredBuiltinTools`. Computed UNCONDITIONALLY here (not gated
+    // behind `explicit_tool_allowlist` below), mirroring upstream exactly: pi's own
+    // `declaredBuiltinTools` ternary — and the `fanoutAuthorized` that reads it — both run before
+    // `explicitToolAllowlist` is even checked. On the `tools !== undefined` arm (an agent that DID
+    // write a `tools:` key) start from its declared builtins; on the `tools === undefined` arm —
+    // reachable only because a ceiling pins the surface instead — the ceiling's own `allowedTools`
+    // set becomes the declared set outright, never the ambient ("no restriction at all") set this
+    // arm otherwise implies.
     //
-    // Upstream then emits `--tools <list>` when the effective allowlist is non-empty and
-    // **`--no-tools`** when it is empty. Both halves were missing here: the old gate was
-    // `!builtin_tools.is_empty()`, which (a) dropped `--no-tools` entirely, so an agent that asked
-    // for NO tools — `tools:` empty in frontmatter, or a settings override of `"tools": false`,
-    // which `discovery::merge` resolves to `Some(vec![])` — was spawned with the FULL ambient tool
-    // set, the exact inversion of what it asked for; and (b) dropped `--tools` for a
-    // direct-MCP-only agent (upstream's `effectiveToolAllowlist` is `[...declaredBuiltinTools,
-    // ...effectiveMcpTools, ...internalTools]`, so MCP names alone still pin the allowlist).
-    //
-    // Upstream's third allowlist term, `internalTools` (`runs/shared/pi-args.ts:393` — the run's own
-    // `structured_output` grant when the step declared an `outputSchema`), has no counterpart here
-    // and needs none: **[CYRUP-DELTA]** cyrup's `--tools`/`--no-tools` selection
-    // (`cyrup-session-svc/src/builder.rs:255-292`) runs over `registry.visible(...)` alone, and the
-    // extension-contributed tools are merged in AFTERWARDS by `ext_host.active_tools(&base_tools)`
-    // (`builder.rs:1068,1084`). `structured_output` is registered by this crate's own child-side
-    // `prompt_runtime` extension, so it is never a candidate for the allowlist filter and survives
-    // `--no-tools` intact — where in pi it is a first-class tool that the flag WOULD deny, hence
-    // pi's explicit re-grant.
-    let explicit_tool_allowlist = agent.tools.is_some();
-    if explicit_tool_allowlist {
-        let mut allowlist = builtin_tools.clone();
+    // SUBA-072 fix: this used to live ONLY inside the `if explicit_tool_allowlist` block below (as
+    // `allowlist`'s initializer), which meant `fanout_authorized` — computed separately, right here,
+    // from the raw pre-ceiling `builtin_tools` — never saw the ceiling filter applied to this same
+    // list two paragraphs down. A ceiling excluding `subagent` from `allowedTools` therefore failed
+    // to revoke nested-delegation authorization even though it correctly narrowed `--tools` itself;
+    // hoisting this computation out and deriving `fanout_authorized` from ITS result (below) closes
+    // that gap.
+    let effective_builtin_tools: Vec<String> = if agent.tools.is_some() {
+        let mut declared = builtin_tools.clone();
 
         // SUBA-014 / pi `runs/shared/pi-args.ts:361-371` @v0.43.0. Upstream's `declaredBuiltinTools`
         // is
@@ -527,35 +585,105 @@ fn resolve_child_tools(
         //
         // i.e. `read` is injected at the HEAD of the declared builtins — never appended, never
         // deduplicated away — under a three-way condition, and only on the `tools !== undefined`
-        // arm, which is exactly this `explicit_tool_allowlist` branch. `requestedBuiltinTools` is
-        // pi's `tools` minus the extension-path entries (`/`, `.ts`, `.js`), which cyrup already
-        // split out as `ToolRef::ExtensionPath`, so `builtin_tools` IS that list.
+        // arm, which is exactly this branch. `requestedBuiltinTools` is pi's `tools` minus the
+        // extension-path entries (`/`, `.ts`, `.js`), which cyrup already split out as
+        // `ToolRef::ExtensionPath`, so `builtin_tools` IS that list.
         //
-        // The `!allowedToolSet` term is vacuously true here: cyrup has no capability ceiling
-        // (tracked as SUBA-021), so `allowedToolSet` is permanently `undefined` and pi's companion
-        // throw at `:355-359` ("Capability ceiling ... excludes required tool 'read' for lazy skill
-        // loading") has nothing to fire on. When the ceiling lands, that throw lands with it.
-        //
-        // Injecting into `allowlist` rather than `builtin_tools` keeps `fanout_authorized`
-        // (computed above from `builtin_tools`) untouched — correct, since upstream's
-        // `fanoutAuthorized` tests for `subagent`, which this injection can never introduce — while
-        // still reaching BOTH consumers that pi's `declaredBuiltinTools` reaches: the `--tools` CSV
-        // and `requiredChildTools` (`:401-409`).
+        // SUBA-072 gives the `!allowedToolSet` term teeth: with a ceiling in play the
+        // head-injection is skipped and the ceiling-membership filter below decides `read`'s
+        // fate instead — including upstream's own edge case, faithfully reproduced: an agent
+        // that both omits `read` from an explicit `tools:` list AND launches under a ceiling
+        // that itself permits `read` does not have it force-added here; the agent must ask for
+        // it. (The launch-time throw above still guards the case that actually matters — a
+        // ceiling that EXCLUDES `read` while it is required.)
         if require_read_tool
-            && !builtin_tools.is_empty()
-            && !builtin_tools.iter().any(|tool| tool == "read")
+            && !declared.is_empty()
+            && !declared.iter().any(|tool| tool == "read")
+            && ceiling_allowed_tools.is_none()
         {
-            allowlist.insert(0, "read".to_string());
+            declared.insert(0, "read".to_string());
         }
 
-        if !mcp_direct_tools.is_empty() {
+        // SUBA-072 / pi `pi-args.ts:455`: `.filter((tool) => !allowedToolSet ||
+        // allowedToolSet.has(tool))` — a ceiling can only narrow an explicit declaration, never
+        // widen it.
+        if let Some(allowed) = ceiling_allowed_tools.as_ref() {
+            declared.retain(|tool| allowed.contains(tool));
+        }
+        declared
+    } else {
+        // pi `pi-args.ts:445`: `allowedToolSet ? [...allowedToolSet] : []` — reached only when
+        // `ceiling_allowed_tools.is_some()`, since `agent.tools` is `None` here and this arm would
+        // otherwise imply the ambient (unrestricted) set.
+        ceiling_allowed_tools.cloned().unwrap_or_default()
+    };
+
+    // pi `runs/shared/pi-args.ts:194`: `const fanoutAuthorized = declaredBuiltinTools.includes("subagent")` —
+    // a persona is granted NESTED delegation exactly when the CEILING-FILTERED declared builtin set
+    // (`effective_builtin_tools` above, SUBA-072) includes the `subagent` tool — NOT the raw
+    // pre-ceiling `agent.tools` declaration. So a ceiling whose `allowedTools` excludes `subagent`
+    // revokes fanout authorization even when the agent's own `tools:` declares it, and conversely a
+    // ceiling that GRANTS `subagent` via `allowedTools` authorizes fanout even for an agent that
+    // declares no `tools:` of its own (pi's `input.tools === undefined` arm, `[...allowedToolSet]`).
+    // With no ceiling and no `tools:` declared, `effective_builtin_tools` is `[]` exactly as
+    // `builtin_tools` was, so an agent that declares nothing and launches unceilinged is still NOT
+    // fanout-authorized — the pre-fix behavior in the only case that never involved a ceiling. This
+    // is the single input to the child-role env pair below, and through it to
+    // [`crate::extension::resolve_registration_mode`]: authorized → `ChildSafe` (the restricted,
+    // mutation-blocked `subagent` tool, pi `extension/fanout-child.ts:132`), unauthorized → the
+    // child registers no subagent surface at all and cannot delegate.
+    let fanout_authorized = effective_builtin_tools
+        .iter()
+        .any(|tool| tool == crate::extension::TOOL_NAME);
+
+    // G103 / pi `runs/shared/pi-args.ts:389-393,549-555` @v0.43.0. `explicitToolAllowlist` is
+    // `input.tools !== undefined || mcpDirectTools.length > 0 || <ceiling>` — i.e. "did anything
+    // pin this child's tool surface at all". cyrup folds pi's `tools` and `mcpDirectTools` into the
+    // one `agent.tools: Option<Vec<ToolRef>>`, so `is_some()` covers pi's first two terms: `None` is
+    // an agent that never wrote a `tools:` key (no restriction from the agent's own side), `Some(_)`
+    // — INCLUDING `Some(vec![])` — is an explicit allowlist. SUBA-072 adds pi's third term: a
+    // registered capability ceiling with `allowedTools` set pins the child's surface even when the
+    // agent itself never wrote `tools:`.
+    //
+    // Upstream then emits `--tools <list>` when the effective allowlist is non-empty and
+    // **`--no-tools`** when it is empty. Both halves were missing here: the old gate was
+    // `!builtin_tools.is_empty()`, which (a) dropped `--no-tools` entirely, so an agent that asked
+    // for NO tools — `tools:` empty in frontmatter, or a settings override of `"tools": false`,
+    // which `discovery::merge` resolves to `Some(vec![])` — was spawned with the FULL ambient tool
+    // set, the exact inversion of what it asked for; and (b) dropped `--tools` for a
+    // direct-MCP-only agent (upstream's `effectiveToolAllowlist` is `[...declaredBuiltinTools,
+    // ...effectiveMcpTools, ...internalTools]`, so MCP names alone still pin the allowlist).
+    //
+    // Upstream's fourth allowlist term, `internalTools` (`runs/shared/pi-args.ts:393` — the run's own
+    // `structured_output` grant when the step declared an `outputSchema`), has no counterpart here
+    // and needs none: **[CYRUP-DELTA]** cyrup's `--tools`/`--no-tools` selection
+    // (`cyrup-session-svc/src/builder.rs:255-292`) runs over `registry.visible(...)` alone, and the
+    // extension-contributed tools are merged in AFTERWARDS by `ext_host.active_tools(&base_tools)`
+    // (`builder.rs:1068,1084`). `structured_output` is registered by this crate's own child-side
+    // `prompt_runtime` extension, so it is never a candidate for the allowlist filter and survives
+    // `--no-tools` intact — where in pi it is a first-class tool that the flag WOULD deny, hence
+    // pi's explicit re-grant.
+    let explicit_tool_allowlist = agent.tools.is_some() || ceiling_allowed_tools.is_some();
+    if explicit_tool_allowlist {
+        // `effective_builtin_tools` (computed above, ahead of `fanout_authorized`) is exactly pi's
+        // `declaredBuiltinTools` — reused here verbatim as `allowlist`'s starting point before the
+        // MCP names are appended below, reaching both consumers pi's own value reaches: the
+        // `--tools` CSV and `requiredChildTools` (`:401-409`).
+        let mut allowlist = effective_builtin_tools;
+
+        if !mcp_direct_tools.is_empty() && !ceiling_deny_extensions {
             // SUBA-045: kept as its own binding because it is pi's `toolPlan.effectiveMcpTools`,
             // which has a SECOND consumer besides the `--tools` CSV — `MCP_DIRECT_CHILD_TOOLS_ENV`
             // (`pi-args.ts:618-621`), which is what lets the child's diagnostic distinguish a
             // missing MCP tool ("a host/pi-mcp-adapter registration problem") from a missing
-            // extension tool.
+            // extension tool. SUBA-072 / pi `pi-args.ts:457-469`: resolution itself is skipped
+            // outright under `denyExtensions` (an MCP server is extension-provided), and whatever
+            // survives is then filtered through the same ceiling-membership test as the builtins.
             effective_mcp_tools =
                 mcp_direct_tools::resolve_mcp_direct_tool_names(&mcp_direct_tools, &opts.cwd);
+            if let Some(allowed) = ceiling_allowed_tools.as_ref() {
+                effective_mcp_tools.retain(|tool| allowed.contains(tool));
+            }
             allowlist.extend(effective_mcp_tools.iter().cloned());
         }
         if allowlist.is_empty() {
@@ -595,28 +723,43 @@ fn resolve_child_tools(
 /// order-preserving and de-duplicated. (This crate does not inject pi's own runtime `.ts`
 /// extensions — cyrup's child-side subagent runtime is env-driven, not a loaded extension file,
 /// a Tier-8 child-side concern — so only agent-declared paths flow through here.)
+///
+/// SUBA-072 / pi `pi-args.ts:457-463,514-527`: `ceiling_deny_extensions` overrides all of the
+/// above — `toolExtensionPaths` becomes `[]`, `configuredExtensions` (which folds in
+/// `agent.extensions` and `subagent_only_extensions` too) becomes `[]`, and
+/// `disableAmbientExtensions` is forced true regardless of whether the agent itself declared
+/// `extensions:`. Upstream's `extensionArgs` still always carries its own `runtimeExtensions`;
+/// this crate has no analog (see the paragraph above), so under `denyExtensions` the child gets
+/// `--no-extensions` and no `--extension` flags at all.
 fn push_extension_and_skill_args(
     agent: &AgentConfig,
+    ceiling_deny_extensions: bool,
     tool_extension_paths: Vec<String>,
     args: &mut Vec<String>,
 ) {
     let mut extension_paths: Vec<String> = Vec::new();
-    for path in tool_extension_paths {
-        push_unique(&mut extension_paths, path);
-    }
-    match &agent.extensions {
-        Some(extensions) => {
-            args.push("--no-extensions".to_string());
-            for path in extensions {
-                push_unique(&mut extension_paths, path.clone());
-            }
-            for path in &agent.subagent_only_extensions {
-                push_unique(&mut extension_paths, path.clone());
-            }
+    if !ceiling_deny_extensions {
+        for path in tool_extension_paths {
+            push_unique(&mut extension_paths, path);
         }
-        None => {
-            for path in &agent.subagent_only_extensions {
-                push_unique(&mut extension_paths, path.clone());
+    }
+    if ceiling_deny_extensions || agent.extensions.is_some() {
+        args.push("--no-extensions".to_string());
+    }
+    if !ceiling_deny_extensions {
+        match &agent.extensions {
+            Some(extensions) => {
+                for path in extensions {
+                    push_unique(&mut extension_paths, path.clone());
+                }
+                for path in &agent.subagent_only_extensions {
+                    push_unique(&mut extension_paths, path.clone());
+                }
+            }
+            None => {
+                for path in &agent.subagent_only_extensions {
+                    push_unique(&mut extension_paths, path.clone());
+                }
             }
         }
     }
@@ -764,9 +907,13 @@ fn compose_persona(
 /// none of it depends on the run's orchestration wiring below.
 fn env_identity_and_depth(
     agent: &AgentConfig,
+    opts: &RunOptions,
     depth: DepthEnvelope,
     fanout_authorized: bool,
     mcp_direct_tools: &[String],
+    // SUBA-072 — the ceiling axes, applied to the RAW `MCP_DIRECT_TOOLS` selector list.
+    ceiling_allowed_tools: Option<&Vec<String>>,
+    ceiling_deny_extensions: bool,
 ) -> std::collections::HashMap<String, String> {
     let mut env_overlay = crate::spawn::depth::to_env_overlay(&depth);
     // PERM-001 / pi `augmentChildEnv` (`runs/shared/pi-args.ts:329-330`): the child-ROLE pair, written on EVERY
@@ -834,13 +981,53 @@ fn env_identity_and_depth(
         INHERIT_SKILLS_ENV.to_string(),
         if agent.inherit_skills { "1" } else { "0" }.to_string(),
     );
-    // pi `runs/shared/pi-args.ts:216-220`: the raw `mcp:` selectors (comma-joined) or the `__none__` sentinel.
+    // SUBA-072 / pi `pi-args.ts:916-926`: `MCP_DIRECT_TOOLS` (no `_CHILD_` — the raw selector list
+    // `cyrup-mcp::registration::register_surface` reads, independently of the `--tools` CSV, to
+    // decide which MCP servers/tools the child's own MCP adapter activates as direct-tool
+    // overrides) must obey the SAME ceiling axes as `effective_mcp_tools` above, but on SELECTOR
+    // strings (`<server>` or `<server>/<tool>`), not the resolved tool NAMES
+    // `resolve_mcp_direct_tool_names` returns — a raw, unfiltered write here was a second,
+    // independent bypass of the same ceiling one level of code above already narrows correctly.
+    // Upstream's exact three-way branch (`pi-args.ts:916-926`):
+    //
+    //   if (!toolPlan.capabilityCeiling && input.mcpDirectTools?.length)
+    //       env.MCP_DIRECT_TOOLS = input.mcpDirectTools.join(",");
+    //   else if (toolPlan.capabilityCeiling && toolPlan.effectiveMcpSelections.length
+    //            && !toolPlan.capabilityCeiling.denyExtensions)
+    //       env.MCP_DIRECT_TOOLS = toolPlan.effectiveMcpSelections.map(s => s.selector).join(",");
+    //   else env.MCP_DIRECT_TOOLS = "__none__";
+    //
+    // i.e. (i) no ceiling at all → the raw selectors, unfiltered; (ii) a ceiling present, not
+    // denying extensions, with at least one selection surviving the `allowedTools` filter → the
+    // FILTERED selectors; (iii) otherwise → `__none__`. A selector survives iff at least one tool
+    // name it expands to is still ceiling-allowed — resolving each selector ALONE (rather than
+    // reusing the aggregate `effective_mcp_tools`, which has already lost the selector-to-name
+    // mapping by construction) reproduces that per-selector survival test without needing to touch
+    // `mcp_direct_tools.rs`'s public surface.
+    let ceiling_filtered_mcp_selectors: Vec<String> = if ceiling_deny_extensions {
+        Vec::new()
+    } else if let Some(allowed) = ceiling_allowed_tools.as_ref() {
+        mcp_direct_tools
+            .iter()
+            .filter(|selector| {
+                mcp_direct_tools::resolve_mcp_direct_tool_names(
+                    std::slice::from_ref(*selector),
+                    &opts.cwd,
+                )
+                .iter()
+                .any(|name| allowed.contains(name))
+            })
+            .cloned()
+            .collect()
+    } else {
+        mcp_direct_tools.to_vec()
+    };
     env_overlay.insert(
         MCP_DIRECT_TOOLS_ENV.to_string(),
-        if mcp_direct_tools.is_empty() {
+        if ceiling_filtered_mcp_selectors.is_empty() {
             MCP_DIRECT_TOOLS_NONE_SENTINEL.to_string()
         } else {
-            mcp_direct_tools.join(",")
+            ceiling_filtered_mcp_selectors.join(",")
         },
     );
 
@@ -857,8 +1044,10 @@ fn env_orchestration(
     opts: &RunOptions,
     structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
     capability_ceiling: Option<&crate::exec::capability_ceiling::ResolvedCapabilityCeiling>,
+    // SUBA-073 — this attempt's scratch dir, the default home of the permission audit log.
+    temp_dir: &std::path::Path,
     env_overlay: &mut std::collections::HashMap<String, String>,
-) {
+) -> Result<(), SubagentError> {
     // R-SA-P1 (port doc §4 P-4): the canonical parent-session anchor. Precedence: EXPLICIT (the
     // launching session's own id, resolved at the root's SessionStart via P-2 and threaded through
     // `opts.parent_session_id`) → INHERITED (this process's own `CYRUP_SUBAGENT_PARENT_SESSION`, so a
@@ -1010,6 +1199,33 @@ fn env_orchestration(
         );
     }
 
+    // SUBA-073 — pi ships the resolved permission policy to the child in `PERMISSION_POLICY_ENV`
+    // (`pi-args.ts:938`); the child-side `watchdog::permission_arbiter`/`prompt_runtime` gate
+    // already decodes and enforces it. Same hand-off shape as the tool budget immediately above.
+    // Absent policy => no var, so a child cannot silently inherit a STALE policy from the parent's
+    // own environment (the overlay only ever adds — same rule as every other member of this
+    // family).
+    //
+    // pi ALSO writes `PERMISSION_AUDIT_PATH_ENV` whenever a policy is present (`pi-args.ts:905-906`),
+    // defaulting to `<tempDir>/permission-audit.jsonl` when the caller supplied no explicit path —
+    // this crate has no per-call override for the audit path today, so it always takes that
+    // default, using the SAME `temp_dir` this function already receives for the
+    // persona-body/task spill files.
+    if let Some(encoded) = crate::exec::permissions::encode_permission_rules(
+        opts.permission_rules.as_ref(),
+    )
+    .map_err(SubagentError::Management)?
+    {
+        env_overlay.insert(
+            crate::watchdog::permission_arbiter::PERMISSION_AUDIT_PATH_ENV.to_string(),
+            temp_dir.join("permission-audit.jsonl").display().to_string(),
+        );
+        env_overlay.insert(
+            crate::watchdog::permission_arbiter::PERMISSION_POLICY_ENV.to_string(),
+            encoded,
+        );
+    }
+
     // SUBA-021 — the capability ceiling resolved at the top of this function crosses the process
     // boundary here (pi `encodeSubagentCapabilityCeiling` into `SUBAGENT_CAPABILITY_CEILING_ENV`,
     // `capability-ceiling.ts:192-195`, read back by the child's own
@@ -1028,6 +1244,7 @@ fn env_orchestration(
             encoded,
         );
     }
+    Ok(())
 }
 
 /// The CONTROL-CHANNEL half of the child env overlay, applied last: the SUBA-045
@@ -1303,6 +1520,262 @@ mod tests {
             .expect("present");
         assert_eq!(decoded.allowed_agents, Some(vec!["reviewer".to_string()]));
         assert_eq!(decoded.sources, vec!["org-policy".to_string()]);
+    }
+
+    /// SUBA-072 — a capability ceiling's `allowedTools` axis must actually gate what reaches the
+    /// child, on BOTH arms pi's `resolvePiLaunchToolPlan` distinguishes: an agent that declares its
+    /// own (wider) `tools:` list gets it intersected down to the ceiling, and an agent that
+    /// declares no `tools:` at all gets the ceiling's set directly rather than falling through to
+    /// the full ambient tool surface.
+    ///
+    /// Pre-fix: `capability_ceiling.rs` resolved and intersected `allowedTools` correctly, but
+    /// nothing in `spawn_plan.rs` ever consulted it here — an agent declaring
+    /// `tools: [read, write, bash]` spawned with exactly that CSV regardless of the ceiling, and an
+    /// agent declaring no `tools:` spawned with no `--tools`/`--no-tools` flag at all (the full
+    /// ambient set).
+    #[test]
+    fn a_capability_ceilings_allowed_tools_axis_gates_both_the_declared_and_undeclared_arms() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-ceiling-allowed-tools-session";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "allowedTools": ["read"] }),
+        )
+        .expect("registers");
+
+        // Arm 1 — the agent declared a WIDER explicit allowlist; the ceiling must narrow it.
+        let mut wide = sample_agent_config("m1", &[]);
+        wide.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Builtin("write".to_string()),
+            ToolRef::Builtin("bash".to_string()),
+        ]);
+        let plan =
+            build_attempt_spawn_plan(&wide, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
+        assert_eq!(
+            argv.get(idx + 1).map(String::as_str),
+            Some("read"),
+            "the ceiling must narrow an agent's own wider declaration; argv {argv:?}"
+        );
+
+        // Arm 2 — the agent declared NO `tools:` at all; the ceiling's set must still apply rather
+        // than falling through to the ambient (unflagged) tool surface.
+        let bare = sample_agent_config("m1", &[]);
+        let plan =
+            build_attempt_spawn_plan(&bare, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let idx = argv.iter().position(|a| a == "--tools").unwrap_or_else(|| {
+            panic!("a ceiling must pin the surface even with no agent-level `tools:`; argv {argv:?}")
+        });
+        assert_eq!(argv.get(idx + 1).map(String::as_str), Some("read"));
+    }
+
+    /// SUBA-072 — a capability ceiling's `denyExtensions` axis must strip BOTH the agent's own
+    /// extension-path tools and its `extensions:`/`subagent_only_extensions` lists, and must force
+    /// `--no-extensions` even when the agent itself never declared `extensions:` at all.
+    ///
+    /// Pre-fix: `--no-extensions` and the `--extension` allowlist were driven solely by
+    /// `agent.extensions`, so `denyExtensions: true` had no effect on either axis — an agent that
+    /// declared no `extensions:` field spawned with full ambient extension discovery on, exactly
+    /// the widening the ceiling exists to prevent.
+    #[test]
+    fn a_capability_ceilings_deny_extensions_axis_strips_all_extension_paths_and_forces_no_extensions()
+    {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-ceiling-deny-extensions-session";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "denyExtensions": true }),
+        )
+        .expect("registers");
+
+        // The agent itself declares NO `extensions:` at all — the pre-fix code never pushed
+        // `--no-extensions` on this arm.
+        let bare = sample_agent_config("m1", &[]);
+        let plan =
+            build_attempt_spawn_plan(&bare, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(argv.contains(&"--no-extensions".to_string()), "argv {argv:?}");
+        assert!(!argv.iter().any(|a| a == "--extension"), "argv {argv:?}");
+
+        // The agent DOES declare `extensions:`, a tool-extension path, and a child-only
+        // extension — all three must still be stripped entirely, not merely left alongside
+        // `--no-extensions`.
+        let mut loaded = sample_agent_config("m1", &[]);
+        loaded.extensions = Some(vec!["./agent-ext.ts".to_string()]);
+        loaded.tools = Some(vec![ToolRef::ExtensionPath("./tool-ext.ts".to_string())]);
+        loaded.subagent_only_extensions = vec!["./child-only-ext.ts".to_string()];
+        let plan = build_attempt_spawn_plan(
+            &loaded,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        assert!(argv.contains(&"--no-extensions".to_string()), "argv {argv:?}");
+        assert!(
+            !argv.iter().any(|a| a == "--extension"),
+            "denyExtensions must strip agent.extensions, subagent_only_extensions AND \
+             tool-extension paths, not just leave them alongside --no-extensions; argv {argv:?}"
+        );
+    }
+
+    /// SUBA-072(d) — pi `pi-args.ts:439-441`: a ceiling that excludes `read` while lazy skill
+    /// loading requires it must fail the launch outright, independent of whether the agent itself
+    /// declared any `tools:` — this is `SUBA-014`'s companion throw, sharing the same branch.
+    #[test]
+    fn a_capability_ceiling_excluding_read_fails_the_launch_when_read_is_required() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-ceiling-require-read-session";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "allowedTools": ["bash"] }),
+        )
+        .expect("registers");
+
+        let agent = sample_agent_config("m1", &[]);
+        let Err(err) = build_attempt_spawn_plan_with_read_requirement(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            depth,
+            dir.path(),
+            None,
+            true,
+        ) else {
+            panic!("a ceiling excluding `read` must refuse a launch that requires it");
+        };
+        assert!(matches!(err, SubagentError::CapabilityCeilingViolation(_)), "{err:?}");
+        assert_eq!(
+            err.to_string(),
+            "Capability ceiling from org-policy excludes required tool 'read' for lazy skill \
+             loading."
+        );
+    }
+
+    /// SUBA-072 Gap 1 (found during `/qa` re-review of the (a)-(d) fix above) — the RAW
+    /// `MCP_DIRECT_TOOLS` env var (`spawn_plan.rs`'s own `MCP_DIRECT_TOOLS_ENV` constant, distinct
+    /// from `MCP_DIRECT_CHILD_TOOLS_ENV`) is a SECOND, independent consumer of the agent's declared
+    /// `mcp:` selectors, read by a different crate (`cyrup-mcp::registration::register_surface`) to
+    /// decide which MCP servers/tools the child's own adapter activates — entirely separate from the
+    /// `--tools` CSV / `effective_mcp_tools` this file already gates correctly above. Pre-fix, this
+    /// write ignored the ceiling entirely: `denyExtensions: true` (an MCP server is
+    /// extension-provided, per this file's own comment near `effective_mcp_tools`) still let an
+    /// agent's raw `mcp:` selector reach the child unfiltered — the exact widening the ceiling exists
+    /// to prevent, on a site the (a)-(d) fix's own tests never exercised because they only asserted
+    /// against argv, never against this specific env key.
+    #[test]
+    fn a_capability_ceilings_deny_extensions_axis_empties_the_raw_mcp_direct_tools_env_too() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-ceiling-deny-extensions-mcp-env-session";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "denyExtensions": true }),
+        )
+        .expect("registers");
+
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Mcp("chrome-devtools".to_string()),
+        ]);
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+
+        assert_eq!(
+            plan.spec.env_overlay.get(MCP_DIRECT_TOOLS_ENV),
+            Some(&MCP_DIRECT_TOOLS_NONE_SENTINEL.to_string()),
+            "denyExtensions must empty the RAW MCP_DIRECT_TOOLS env too, not just --tools; \
+             overlay was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// SUBA-072 Gap 1, `allowedTools` half. A ceiling with a narrow `allowedTools` set must also
+    /// gate `MCP_DIRECT_TOOLS`, filtering each raw selector by whether ANY tool name it expands to
+    /// is still allowed — never a raw, unfiltered pass-through merely because a ceiling happens to
+    /// exist.
+    ///
+    /// This test's harness has no on-disk MCP metadata cache (the same structural limitation this
+    /// file's own pre-existing `build_attempt_spawn_plan_splits_mcp_refs_out_of_tools_and_sets_the_env`
+    /// test documents: "with no metadata cache on disk, it resolves to nothing"), so
+    /// `chrome-devtools` here resolves to zero tool names and is filtered OUT regardless of which
+    /// names `allowedTools` lists — this pins the REGRESSION (a ceiling must reach this env var at
+    /// all, contrasted directly against the pre-fix unconditional-raw-passthrough this same setup
+    /// would have produced) rather than the selector-survives-because-its-name-is-allowed direction,
+    /// which needs a real MCP server fixture to exercise and is out of this test's reach.
+    #[test]
+    fn a_capability_ceilings_allowed_tools_axis_also_gates_the_raw_mcp_direct_tools_env() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-ceiling-allowed-tools-mcp-env-session";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "allowedTools": ["read"] }),
+        )
+        .expect("registers");
+
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = Some(vec![
+            ToolRef::Builtin("read".to_string()),
+            ToolRef::Mcp("chrome-devtools".to_string()),
+        ]);
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+
+        assert_eq!(
+            plan.spec.env_overlay.get(MCP_DIRECT_TOOLS_ENV),
+            Some(&MCP_DIRECT_TOOLS_NONE_SENTINEL.to_string()),
+            "pre-fix this was unconditionally \"chrome-devtools\" regardless of the ceiling; a \
+             ceiling must now reach this env var exactly as it reaches --tools; overlay was {:?}",
+            plan.spec.env_overlay
+        );
     }
 
 
@@ -2462,6 +2935,64 @@ mod tests {
         );
     }
 
+    /// SUBA-073 — the resolved permission policy (`RunOptions::permission_rules`, merged upstream
+    /// of this function by `run_foreground_impl`/`spawn_background`'s own `resolve_permission_rules`
+    /// call) must reach the child as `CYRUP_SUBAGENT_PERMISSION_POLICY`, decodable by the
+    /// already-ported child-side `watchdog::permission_arbiter::decode_permission_rules`. The
+    /// audit path env var must accompany it, defaulting under this attempt's own `temp_dir`.
+    #[test]
+    fn a_resolved_permission_policy_reaches_the_child_env_and_decodes() {
+        use crate::watchdog::permission_arbiter as pa;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut rules = pa::PermissionRules::new();
+        rules.insert("write".to_string(), pa::PermissionRuleDecision::Deny);
+        let agent = sample_agent_config("m1", &[]);
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.permission_rules = Some(rules.clone());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+
+        let encoded = plan
+            .spec
+            .env_overlay
+            .get(pa::PERMISSION_POLICY_ENV)
+            .expect("the policy must reach the child env");
+        assert_eq!(
+            pa::decode_permission_rules(Some(encoded)).expect("decodes"),
+            Some(rules),
+            "the child must decode the SAME policy the parent resolved"
+        );
+        let audit_path = plan
+            .spec
+            .env_overlay
+            .get(pa::PERMISSION_AUDIT_PATH_ENV)
+            .expect("an audit path must accompany a present policy");
+        assert_eq!(
+            audit_path,
+            &dir.path().join("permission-audit.jsonl").display().to_string(),
+            "the default audit path is under this attempt's own temp_dir"
+        );
+    }
+
+    /// No policy at all must set no env var — a child must never inherit a STALE policy from the
+    /// parent process's own environment (the overlay only ever adds, same rule as every other
+    /// member of this family).
+    #[test]
+    fn no_permission_policy_sets_no_env_vars() {
+        use crate::watchdog::permission_arbiter as pa;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = sample_agent_config("m1", &[]);
+        let opts = base_opts(dir.path(), &["m1"]);
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let plan = build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+            .expect("plan builds");
+        assert!(!plan.spec.env_overlay.contains_key(pa::PERMISSION_POLICY_ENV));
+        assert!(!plan.spec.env_overlay.contains_key(pa::PERMISSION_AUDIT_PATH_ENV));
+    }
+
 
     /// G90, the SPAWN hop: a child handed a steer inbox must receive the path in its environment,
     /// and the directory must already exist when it starts.
@@ -2603,6 +3134,60 @@ mod tests {
              overlay was {:?}",
             plan.spec.env_overlay
         );
+    }
+
+
+    /// SUBA-074 across the SAME detached-runner seam the test above guards.
+    ///
+    /// `runner` is a third `#[serde(default)] Option` field on that hand-off, so it carries the
+    /// identical silent-loss property the test above documents: dropping it at any of the three
+    /// hops type-checks perfectly, raises nothing, and leaves the suite green while every
+    /// background / chain / parallel run of an external-runner profile quietly spawns a
+    /// full-capability native child — the exact defect SUBA-074 exists to close, reintroduced on
+    /// the one path the foreground refusal test cannot see.
+    ///
+    /// This drives the REAL hand-off — parse → persona → JSON → persona → `AgentConfig` — and
+    /// asserts the observable end product. For `memory`/`toolBudget` that product is argv/env,
+    /// because the child still spawns; for a non-`pi` runner there is NO spawn plan, because the
+    /// run is refused before the ladder, so the refusal IS the product.
+    ///
+    /// The fixture declares no Pi-only field, which is upstream's own rule for an external profile
+    /// (`agents.ts:1864-1871`) and is why this cannot simply be folded into the test above, whose
+    /// fixture declares `toolBudget:`.
+    #[test]
+    fn the_detached_runner_persona_handoff_preserves_the_runner_profile() {
+        let def = crate::discovery::frontmatter::parse_agent_file(
+            "---\nname: reviewer\ndescription: Reviews\nrunner: {\"type\": \"external-cli\", \"adapter\": \"claude-code\", \"command\": \"claude\"}\n---\n\n- You are the REVIEWER persona.\n",
+            crate::discovery::types::AgentSource::User,
+            std::path::Path::new("reviewer.md"),
+        )
+        .expect("an external-cli profile declaring no Pi-only field must load");
+        assert!(def.runner.is_some(), "HOP 0: the frontmatter parse must yield a runner");
+
+        // The hand-off, verbatim: resolve → serialize into the runner config → deserialize in the
+        // detached runner process → rebuild the spawn input.
+        let persona = ResolvedAgentPersona::from_agent_definition(&def);
+        assert_eq!(persona.runner, def.runner, "HOP A: from_agent_definition dropped the runner");
+
+        let encoded = serde_json::to_string(&persona).expect("persona serializes");
+        let decoded: ResolvedAgentPersona =
+            serde_json::from_str(&encoded).expect("runner config deserializes");
+        assert_eq!(decoded.runner, def.runner, "HOP B: the JSON round-trip dropped the runner");
+
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+        let agent = decoded.to_agent_config(depth);
+        assert_eq!(agent.runner, def.runner, "HOP C: to_agent_config dropped the runner");
+
+        // The observable end product: the rebuilt config refuses, so a background/chain/parallel
+        // step declines the profile exactly as the foreground path does.
+        let reason = agent
+            .runner
+            .as_ref()
+            .and_then(crate::runner::AgentRunnerConfig::refusal_reason)
+            .expect("a non-`pi` runner must refuse after surviving the hand-off");
+        assert!(reason.contains("runner.type='external-cli'"), "{reason}");
+        assert!(reason.contains("adapter 'claude-code'"), "{reason}");
+        assert!(reason.contains("full-capability native child"), "{reason}");
     }
 
 
@@ -3265,6 +3850,7 @@ mod tests {
         opts.fork_context = ForkContext {
             mode: ContextMode::Fork,
             session_file_path: Some(dir.path().join("parent-branch.jsonl")),
+            thinking_override: None,
         };
         let depth = DepthEnvelope {
             current_depth: 0,
@@ -3528,6 +4114,102 @@ mod tests {
         );
     }
 
+    /// SUBA-072 Gap 2 (found during `/qa` re-review of the (a)-(d) fix above) — `fanout_authorized`
+    /// must be derived from the CEILING-FILTERED declared-tools list, not the agent's raw `tools:`
+    /// declaration. Pre-fix, `fanout_authorized` was computed from `builtin_tools` before the
+    /// ceiling filter (further down the same function) ever ran against it, so an agent declaring
+    /// `tools: [subagent, read]` stayed fanout-authorized even under a ceiling whose `allowedTools`
+    /// excludes `subagent` — the dangerous direction: the ceiling silently permitted nested
+    /// delegation it was set up to deny. This is the same class of bug `SUBA-072` exists to close,
+    /// on a fourth site the (a)-(d) fix's own tests never touched (they assert against `--tools`/
+    /// `--no-extensions`/the launch-time throw, never against `FANOUT_CHILD_ENV`).
+    #[test]
+    fn a_capability_ceiling_excluding_subagent_revokes_fanout_authorization_even_when_the_agent_declares_it()
+    {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-ceiling-fanout-revoke-session";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "allowedTools": ["read"] }),
+        )
+        .expect("registers");
+
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.tools = Some(vec![
+            ToolRef::Builtin(crate::extension::TOOL_NAME.to_string()),
+            ToolRef::Builtin("read".to_string()),
+        ]);
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+
+        // The ceiling still correctly narrows --tools to just `read` (the (a)-(d) fix, unaffected).
+        let argv = plan.spec.build_argv();
+        let idx = argv.iter().position(|a| a == "--tools").expect("--tools present");
+        assert_eq!(argv.get(idx + 1).map(String::as_str), Some("read"));
+
+        // But fanout authorization must ALSO be revoked, even though the agent's own `tools:`
+        // declares `subagent` — the ceiling excludes it from `allowedTools`.
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            Some(&"0".to_string()),
+            "a ceiling excluding `subagent` from allowedTools must revoke fanout authorization \
+             even when the agent's own tools: declares it; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
+    /// SUBA-072 Gap 2, the completeness half: a ceiling that GRANTS `subagent` via `allowedTools`
+    /// authorizes fanout even for an agent that declares no `tools:` of its own — pi's
+    /// `input.tools === undefined` arm sets `declaredBuiltinTools = [...allowedToolSet]`, so
+    /// `fanoutAuthorized` follows the ceiling, not merely the agent's own (absent) declaration.
+    /// Pre-fix, `fanout_authorized` read `builtin_tools`, which is unconditionally empty whenever
+    /// `agent.tools` is `None` — so this arm could never authorize fanout regardless of the ceiling.
+    #[test]
+    fn a_capability_ceiling_granting_subagent_authorizes_fanout_even_with_no_agent_level_tools() {
+        use crate::exec::capability_ceiling as cc;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let session = "spawn-plan-ceiling-fanout-grant-session";
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.parent_session_id = Some(session.to_string());
+        let depth = DepthEnvelope { current_depth: 0, max_depth: 5 };
+
+        let _handle = cc::register_capability_ceiling(
+            session,
+            "org-policy",
+            &serde_json::json!({ "allowedTools": [crate::extension::TOOL_NAME] }),
+        )
+        .expect("registers");
+
+        // No `tools:` declared at all.
+        let agent = sample_agent_config("m1", &[]);
+        let plan =
+            build_attempt_spawn_plan(&agent, &ModelId::from("m1"), "task", &opts, depth, dir.path(), None)
+                .expect("plan builds");
+
+        let argv = plan.spec.build_argv();
+        let idx = argv.iter().position(|a| a == "--tools").unwrap_or_else(|| {
+            panic!("a ceiling must pin the surface even with no agent-level `tools:`; argv {argv:?}")
+        });
+        assert_eq!(argv.get(idx + 1).map(String::as_str), Some(crate::extension::TOOL_NAME));
+
+        assert_eq!(
+            plan.spec.env_overlay.get(crate::spawn::nested_events::FANOUT_CHILD_ENV),
+            Some(&"1".to_string()),
+            "a ceiling granting `subagent` via allowedTools must authorize fanout even when the \
+             agent declares no tools: of its own; overlay was {:?}",
+            plan.spec.env_overlay
+        );
+    }
+
 
     // ---- T4: thinking suffix (pi `applyThinkingSuffix`), inherit flags, extension threading,
     // and the direct-MCP tools split (`mcp:` refs no longer leak into `--tools` literally) ----
@@ -3535,7 +4217,7 @@ mod tests {
     #[test]
     fn apply_thinking_suffix_appends_level_to_a_provider_qualified_model() {
         assert_eq!(
-            apply_thinking_suffix(Some("openai-codex/gpt-5.4-mini"), Some("high")).as_deref(),
+            apply_thinking_suffix(Some("openai-codex/gpt-5.4-mini"), Some("high"), false).as_deref(),
             Some("openai-codex/gpt-5.4-mini:high")
         );
     }
@@ -3545,7 +4227,7 @@ mod tests {
     fn apply_thinking_suffix_passes_explicit_off_through() {
         // pi: "passes explicit thinking off through to the model arg".
         assert_eq!(
-            apply_thinking_suffix(Some("anthropic/claude-haiku-4-5"), Some("off")).as_deref(),
+            apply_thinking_suffix(Some("anthropic/claude-haiku-4-5"), Some("off"), false).as_deref(),
             Some("anthropic/claude-haiku-4-5:off")
         );
     }
@@ -3557,7 +4239,7 @@ mod tests {
         // `:7b`-style suffix is not a THINKING_LEVEL, so with no thinking requested the id is
         // returned verbatim (no double-suffix, no accidental `:high`).
         assert_eq!(
-            apply_thinking_suffix(Some("openai-compatible/qwen2.5-coder:7b"), None).as_deref(),
+            apply_thinking_suffix(Some("openai-compatible/qwen2.5-coder:7b"), None, false).as_deref(),
             Some("openai-compatible/qwen2.5-coder:7b")
         );
     }
@@ -3566,7 +4248,7 @@ mod tests {
     #[test]
     fn apply_thinking_suffix_does_not_double_suffix_an_existing_thinking_level() {
         assert_eq!(
-            apply_thinking_suffix(Some("model:high"), Some("low")).as_deref(),
+            apply_thinking_suffix(Some("model:high"), Some("low"), false).as_deref(),
             Some("model:high")
         );
     }
@@ -3579,21 +4261,109 @@ mod tests {
     #[test]
     fn apply_thinking_suffix_recognizes_max_as_an_existing_level() {
         assert_eq!(
-            apply_thinking_suffix(Some("anthropic/claude-opus-4-6:max"), Some("high")).as_deref(),
+            apply_thinking_suffix(Some("anthropic/claude-opus-4-6:max"), Some("high"), false).as_deref(),
             Some("anthropic/claude-opus-4-6:max"),
             "an existing `:max` must not be double-suffixed"
         );
         // …and `max` is appendable as a level in its own right.
         assert_eq!(
-            apply_thinking_suffix(Some("anthropic/claude-opus-4-6"), Some("max")).as_deref(),
+            apply_thinking_suffix(Some("anthropic/claude-opus-4-6"), Some("max"), false).as_deref(),
             Some("anthropic/claude-opus-4-6:max")
         );
     }
 
 
+    /// SUBA-075 / pi `applyThinkingSuffix(model, thinking, replaceExisting)`
+    /// (`runs/shared/pi-args.ts:238-252` @v0.57.0). The third argument exists for exactly one
+    /// caller: a sanitized fork's thinking override, which must REPLACE a level the id already
+    /// names rather than defer to it.
+    #[test]
+    fn apply_thinking_suffix_replaces_an_existing_level_only_when_licensed_to() {
+        assert_eq!(
+            apply_thinking_suffix(Some("anthropic/claude-opus-4-6:high"), Some("off"), true)
+                .as_deref(),
+            Some("anthropic/claude-opus-4-6:off"),
+            "a fork override outranks the persona's own level: the branch was sanitized precisely \
+             because its inherited thinking blocks are unusable"
+        );
+        assert_eq!(
+            apply_thinking_suffix(Some("anthropic/claude-opus-4-6:high"), Some("off"), false)
+                .as_deref(),
+            Some("anthropic/claude-opus-4-6:high"),
+            "without the override, an id that already names a level still wins — the caller asked \
+             for that exact model"
+        );
+        assert_eq!(
+            apply_thinking_suffix(Some("anthropic/claude-opus-4-6"), Some("off"), true).as_deref(),
+            Some("anthropic/claude-opus-4-6:off"),
+            "no existing level to replace: the override simply appends"
+        );
+        assert_eq!(
+            apply_thinking_suffix(
+                Some("openai-compatible/qwen2.5-coder:7b"),
+                Some("off"),
+                true
+            )
+            .as_deref(),
+            Some("openai-compatible/qwen2.5-coder:7b:off"),
+            "`:7b` is part of the id, not a level, so `replace_existing` must not eat it"
+        );
+    }
+
+    /// The override reaches argv. A persona asking for `thinking: high` whose fork came back
+    /// sanitized launches with `:off` — the whole point of resolving the override at all.
+    #[test]
+    fn build_attempt_spawn_plan_applies_a_fork_thinking_override_over_the_persona_level() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.thinking = Some("high".to_string());
+        let mut opts = base_opts(dir.path(), &["m1"]);
+
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            DepthEnvelope { current_depth: 0, max_depth: 5 },
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let model_idx = argv.iter().position(|a| a == "--model").expect("--model present");
+        assert_eq!(
+            argv.get(model_idx + 1).map(String::as_str),
+            Some("m1:high"),
+            "precondition: with no override the persona's own level is what ships"
+        );
+
+        opts.fork_context = ForkContext {
+            mode: ContextMode::Fork,
+            session_file_path: Some(dir.path().join("branch.jsonl")),
+            thinking_override: Some("off".to_string()),
+        };
+        let plan = build_attempt_spawn_plan(
+            &agent,
+            &ModelId::from("m1"),
+            "task",
+            &opts,
+            DepthEnvelope { current_depth: 0, max_depth: 5 },
+            dir.path(),
+            None,
+        )
+        .expect("plan builds");
+        let argv = plan.spec.build_argv();
+        let model_idx = argv.iter().position(|a| a == "--model").expect("--model present");
+        assert_eq!(
+            argv.get(model_idx + 1).map(String::as_str),
+            Some("m1:off"),
+            "a sanitized fork's override must beat the persona's `thinking: high`"
+        );
+    }
+
     #[test]
     fn apply_thinking_suffix_returns_none_without_a_model() {
-        assert_eq!(apply_thinking_suffix(None, Some("high")), None);
+        assert_eq!(apply_thinking_suffix(None, Some("high"), false), None);
     }
 
 

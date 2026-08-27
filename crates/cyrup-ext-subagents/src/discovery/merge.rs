@@ -761,6 +761,8 @@ mod tests {
     fn agent(name: &str, source: AgentSource, file_path: &str) -> AgentDefinition {
         AgentDefinition {
             default_turn_budget: None,
+            permission_rules: None,
+            runner: None,
             name: name.to_string(),
             local_name: name.to_string(),
             package_name: None,

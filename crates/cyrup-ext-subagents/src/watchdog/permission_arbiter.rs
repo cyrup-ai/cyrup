@@ -370,7 +370,14 @@ const INTERNAL_TOOLS: [&str; 4] = [
 ];
 
 /// `PermissionDecision` (`permissions.ts:4`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// SUBA-073 — `Serialize`/`Deserialize` added (`rename_all = "lowercase"`, matching
+/// [`Self::as_str`]'s own wire spelling exactly) so a whole [`PermissionRules`] map can cross the
+/// hop-2 detached-runner process boundary as ordinary JSON inside
+/// [`crate::background::runner_main::RunnerConfig`], the same way every other resolved-config-rung
+/// value there does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PermissionRuleDecision {
     /// Run the tool.
     Allow,

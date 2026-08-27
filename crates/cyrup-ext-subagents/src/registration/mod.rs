@@ -242,6 +242,17 @@ pub struct SubagentExtensionConfig {
     /// [`tool_description::build_subagent_tool_description`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_description_mode: Option<serde_json::Value>,
+    /// SUBA-073 — pi `ExtensionConfig.permissions?: PermissionConfig` (`shared/types.ts:2268`
+    /// @v0.57.0, *"Opt-in native tool permissions. Bash remains outside this policy."*). Carried
+    /// RAW, exactly like [`Self::turn_budget`] and for the same reason: validated at the point of
+    /// use ([`crate::exec::permissions::validate_permission_config`]) rather than at config load,
+    /// so a malformed block degrades that one resolution rather than discarding the whole config
+    /// file.
+    ///
+    /// `None` (the key omitted) means no global policy rung — the effective policy is then
+    /// whatever the agent's own frontmatter declares, or no policy at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<serde_json::Value>,
 }
 
 /// SUBA-059 — pi's `Pick<ArtifactConfig, "cleanupDays">` (`shared/types.ts:1859` @v0.47.1): the
@@ -294,6 +305,7 @@ impl Default for SubagentExtensionConfig {
             turn_budget: None,
             // SUBA-025 — pi's `mode === undefined => "full"` (`tool-description.ts:106`).
             tool_description_mode: None,
+            permissions: None,
         }
     }
 }

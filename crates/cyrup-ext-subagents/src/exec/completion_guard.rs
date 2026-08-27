@@ -822,6 +822,8 @@ mod tests {
     fn agent(local_name: &str, tools: Option<Vec<ToolRef>>, completion_guard: Option<bool>) -> AgentDefinition {
         AgentDefinition {
             default_turn_budget: None,
+            permission_rules: None,
+            runner: None,
             name: local_name.to_string(),
             local_name: local_name.to_string(),
             package_name: None,

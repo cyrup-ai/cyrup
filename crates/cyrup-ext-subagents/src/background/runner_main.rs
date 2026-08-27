@@ -250,6 +250,15 @@ pub struct RunnerConfig {
     /// "unbudgeted", which is every run that does not ask for a budget.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-073 — the run-level, fully-merged permission policy (pi
+    /// `resolvePermissionRules(ctx.config?.permissions, agentConfig.permissions)`, resolved once
+    /// by the orchestrator — same shape as [`Self::turn_budget`], for the same reason: hop 2 has
+    /// neither discovery nor a live extension config to re-derive it from.
+    ///
+    /// `#[serde(default)]` (`None`) lets an older on-disk config still deserialize, and `None` is
+    /// "no policy", which is every run that does not resolve one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
     /// SUBA-021 — the run-level USAGE budget (pi `AsyncExecutionParams.usageBudget`,
     /// `runs/background/async-execution.ts:167`/`:216`, carried onto the runner as
     /// `config.usageBudget`, `subagent-runner.ts:172`). Like [`Self::turn_budget`] it is resolved
@@ -1508,6 +1517,10 @@ fn build_chain_context(
         share: config.share,
         // SUBA-008 — the run-level turn budget reaches every step from the one-shot config.
         turn_budget: config.turn_budget,
+        // SUBA-073 — and so does the run-level, fully-merged permission policy, for the same
+        // reason and by the same route: this process performs no discovery and reads no live
+        // extension config.
+        permission_rules: config.permission_rules.clone(),
         // SUBA-021 — and so does the run-level usage budget, for the same reason and by the same
         // route (pi `ctx.usageBudget` ← `config.usageBudget`, `subagent-runner.ts:172`).
         usage_budget: config.usage_budget,
@@ -2454,6 +2467,10 @@ pub(crate) struct ExecSingleStepExecutor {
     /// `runSubagentProcess({ … turnBudget: ctx.turnBudget })`, `subagent-runner.ts:1091`/`:1409`).
     /// `None` is unbudgeted.
     pub(crate) turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-073 — the run-level, fully-merged permission policy, carried from
+    /// [`RunnerConfig::permission_rules`] and threaded onto every dispatched step's
+    /// [`crate::exec::RunOptions::permission_rules`]. `None` is no policy.
+    pub(crate) permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
     /// SUBA-021 — the run-level USAGE budget, carried from [`RunnerConfig::usage_budget`] and
     /// threaded onto every dispatched step's [`crate::exec::RunOptions::usage_budget`]. `None` is
     /// unbudgeted.
@@ -2573,6 +2590,11 @@ impl ExecSingleStepExecutor {
             // it is upstream. The SINGLE-mode tool path does not build this executor; it passes
             // its own `RunOptions::turn_budget` directly.
             turn_budget: None,
+            // SUBA-073: same as `turn_budget` — the foreground chain/parallel slash surfaces
+            // expose no permission-policy input of their own either, so a foreground walk carries
+            // no policy. The SINGLE-mode tool path does not build this executor; it resolves its
+            // own `RunOptions::permission_rules` directly (`run_foreground_impl`).
+            permission_rules: None,
             // SUBA-021: same as `turn_budget` — the foreground chain/parallel slash surfaces
             // advertise no `usageBudget` param upstream either, so a foreground walk is unbudgeted.
             usage_budget: None,
@@ -2818,6 +2840,11 @@ impl ExecSingleStepExecutor {
             Some(path) => ForkContext {
                 mode: ContextMode::Fork,
                 session_file_path: Some(path.clone()),
+                // SUBA-075: hop 1 resolved and sanitized this branch, but `SingleStepSpec` carries
+                // only its PATH across the hand-off, so any thinking override it resolved is not
+                // recoverable here. Reconstructing it would mean widening the runner config — the
+                // async half of SUBA-075, filed separately. `None` is what hop 2 can honestly say.
+                thinking_override: None,
             },
             None => ForkContext::fresh(),
         };
@@ -2846,6 +2873,9 @@ impl ExecSingleStepExecutor {
             // as upstream applies one `AsyncExecutionParams.turnBudget` to every step of an async
             // chain rather than giving each step a fresh one.
             turn_budget: self.turn_budget,
+            // SUBA-073 — the RUN-level, fully-merged permission policy, applied per step, exactly
+            // as `turn_budget` immediately above.
+            permission_rules: self.permission_rules.clone(),
             // pi's `enforceHardTurnLimit` reaches `runSubagentProcess` only from the slash
             // delegation adapter (`slash/delegation-adapters.ts:298`); the async runner never sets
             // it, so the mid-tool-work deferral stays armed here as upstream leaves it.
@@ -3747,6 +3777,7 @@ mod tests {
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
+            permission_rules: None,
             depth: DepthEnvelope {
                 current_depth: 0,
                 max_depth: 5,
@@ -4005,6 +4036,7 @@ mod tests {
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
+            permission_rules: None,
             depth: DepthEnvelope {
                 current_depth: 0,
                 max_depth: 5,
@@ -4072,6 +4104,7 @@ mod tests {
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
+            permission_rules: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
@@ -4127,6 +4160,7 @@ mod tests {
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
+            permission_rules: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
@@ -4254,6 +4288,7 @@ mod tests {
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
+            permission_rules: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
@@ -4870,6 +4905,7 @@ mod tests {
             // SUBA-021: unbudgeted on this path (see the field doc).
             usage_budget: None,
             turn_budget: None,
+            permission_rules: None,
             // SUBA-N03: this fixture exercises neither the run-level timeout nor `share`/artifacts, so it
             // carries the same values an older on-disk config deserializes to (`#[serde(default)]`).
             timeout_ms: None,
