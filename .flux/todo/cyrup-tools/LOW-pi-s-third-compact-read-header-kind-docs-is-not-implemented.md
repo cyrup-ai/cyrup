@@ -3,8 +3,8 @@ title: Pi's third compact read header kind docs is not implemented
 priority: LOW
 tool: read
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: new
-status: done
+stage: aug
+status: in-progress
 updated: 2026-08-27
 ---
 

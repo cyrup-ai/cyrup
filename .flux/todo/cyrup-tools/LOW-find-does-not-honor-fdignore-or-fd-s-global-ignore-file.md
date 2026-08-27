@@ -3,8 +3,8 @@ title: Find does not honor .fdignore or fd's global ignore file
 priority: LOW
 tool: find
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: new
-status: done
+stage: aug
+status: in-progress
 updated: 2026-08-27
 ---
 
