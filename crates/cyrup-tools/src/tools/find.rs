@@ -213,7 +213,31 @@ impl Tool for FindTool {
                                 results.push(entry);
                             }
                         }
-                        Some(Err(e)) => return Err(e),
+                        // fd NEVER fails a search over a filesystem error met while traversing.
+                        // Its worker sends every `Err` from the `ignore` walker down the results
+                        // channel and returns `WalkState::Continue` (fd 10.5.0
+                        // `src/walk.rs:500-505`); the receiver prints it only under
+                        // `--show-errors` (`:227-231`), which pi's argv does not pass
+                        // (find.ts:234-267); and the exit code is `ExitCode::Success` regardless
+                        // (`:282-292`). fd therefore exits 0 with empty stderr, pi's
+                        // `if (code !== 0)` guard (find.ts:304) is never entered, and the paths fd
+                        // did emit are returned as an ordinary success.
+                        //
+                        // There is NO `ignore::Error` variant fd treats as fatal — fd's arm is a
+                        // catch-all that never inspects the variant. `WithPath{Io}` (permission
+                        // denied, EIO, a stale mount), `WithDepth{Loop}` (symlink cycle),
+                        // `Partial`/`WithLineNumber` (a malformed pattern in an ignore file) and
+                        // bare `Io` from parent-ignore loading all take the same path. So this arm
+                        // discriminates on nothing and simply keeps collecting.
+                        //
+                        // Swallowing here cannot hide a bad search root: a root that does not
+                        // exist is already rejected by the `metadata(&search_root)` probe above
+                        // (pi's `Path not found`, find.ts:158). A root that exists but cannot be
+                        // opened yields zero rows and falls through to "No files found matching
+                        // pattern" below — which is exactly what pi answers on fd's empty stdout
+                        // (find.ts:311-320). Do NOT gate this on "the walk produced no rows": pi
+                        // has no such gate, because fd never gives it a non-zero code to gate on.
+                        Some(Err(_)) => continue,
                         None => break,
                     }
                 }

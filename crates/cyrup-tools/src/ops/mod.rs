@@ -447,6 +447,13 @@ pub trait FsOps: Send + Sync {
     }
 
     /// Walk a tree for grep/find. Yields candidate paths (gitignore-aware for the local backend).
+    ///
+    /// A yielded `Err` is a NON-FATAL per-entry event, not end-of-stream: the walk continues and
+    /// further `Ok` items follow. Implementations MUST keep walking after emitting one, and
+    /// consumers MUST keep polling. Whether such an error fails the *tool call* is the caller's
+    /// decision and the two callers differ — `find` emulates fd, which swallows every traversal
+    /// error and exits 0, while `grep` emulates ripgrep, which reports it and exits 2. The message
+    /// carries no tool prefix for that reason.
     fn walk(&self, root: &Path, opts: WalkOpts) -> EventStream<Result<WalkItem, ToolError>>;
 }
 

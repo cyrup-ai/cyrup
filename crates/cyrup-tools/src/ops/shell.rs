@@ -550,8 +550,7 @@ mod tests {
     #[test]
     fn powershell_arm_prefers_pwsh_then_powershell_then_throws() {
         let pwsh = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
-        let legacy =
-            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+        let legacy = PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
 
         // Row 1: both on PATH ⇒ PowerShell 7 (shell.ts:124,130 `??`).
         let both = |exe: &str| match exe {

@@ -271,6 +271,18 @@ impl FsOps for LocalFs {
             }
 
             let walker = builder.build();
+            // A per-entry `Err` is a NON-FATAL event on this stream and the walk CONTINUES past
+            // it: `ignore::Walk::next` leaves its iterator intact after yielding one (ignore
+            // 0.4.26 `src/walk.rs:1124-1126`), so valid entries arrive both before and after.
+            // Consumers must never read one as end-of-stream.
+            //
+            // The message is the BARE `ignore::Error` text — `WithPath` renders as
+            // `{path}: {io error}` (ignore 0.4.26 `src/lib.rs:333-335`), e.g.
+            // `/srv/locked: Permission denied (os error 13)`. No prefix is added here because the
+            // two consumers of this seam want different things from the same value: `find`
+            // emulates fd, which discards it (fd 10.5.0 `src/walk.rs:227-231`, `:500-505`), and
+            // `grep` emulates ripgrep, which reports it as `rg: {path}: {io error}` on stderr.
+            // A `walk: ` prefix matched neither.
             for result in walker {
                 let item = match result {
                     Ok(entry) => {
@@ -293,7 +305,7 @@ impl FsOps for LocalFs {
                             is_file,
                         })
                     }
-                    Err(e) => Err(ToolError::new(format!("walk: {e}"))),
+                    Err(e) => Err(ToolError::new(e.to_string())),
                 };
                 if tx.blocking_send(item).is_err() {
                     break;

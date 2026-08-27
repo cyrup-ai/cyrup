@@ -512,6 +512,18 @@ impl Tool for GrepTool {
             // which is `ignore`'s `require_git:true` (the crate does the in-repo detection internally).
             // Unlike Pi's `find` (fd `--no-require-git` outside a repo, find.ts:226-240), Pi's grep
             // never disables require-git, so outside any repo a stray `.gitignore` is NOT applied.
+            // ripgrep does not abort a search on a traversal error, but it does REPORT one: it
+            // prints `rg: {path}: {os error}` to stderr and exits 2 (verified, rg 14.1.0), and
+            // pi's grep rejects on any code that is neither 0 nor 1 (grep.ts:309-313). The
+            // rejection happens at CLOSE, though, after rg has walked the whole tree — and does
+            // not happen at all if the match limit was hit first, because `stopChild(true)` sets
+            // `killedDueToLimit` (grep.ts:240-245, :291-295) and that flag short-circuits the
+            // guard. So the error is REMEMBERED here and decided after the loop; returning at the
+            // first one would stop the walk and make the limit unreachable, failing calls pi
+            // answers successfully. First error only — pi reports rg's whole stderr, but rg's
+            // parallel walk does not order it against ours, so the first is the only stable
+            // choice.
+            let mut walk_error: Option<ToolError> = None;
             let mut walk = self.fs.walk(
                 &search_root,
                 WalkOpts {
@@ -601,11 +613,37 @@ impl Tool for GrepTool {
                                 .await?;
                             }
                             Some(Ok(_)) => {}
-                            Some(Err(e)) => return Err(e),
+                            Some(Err(e)) => {
+                                if walk_error.is_none() {
+                                    // pi surfaces rg's stderr verbatim (`stderr.trim()`,
+                                    // grep.ts:310) and rg writes `rg: {path}: {os error}`.
+                                    // `LocalFs::walk` yields the bare `{path}: {os error}` because
+                                    // `find` must carry no prefix at all, so the `rg: ` half is
+                                    // added here, at the one consumer that emulates ripgrep.
+                                    walk_error =
+                                        Some(ToolError::new(format!("rg: {}", e.message)));
+                                }
+                            }
                             None => break,
                         }
                     }
                 }
+            }
+
+            // pi: `if (!killedDueToLimit && code !== 0 && code !== 1) { reject(stderr.trim()); }`
+            // (grep.ts:309-313). `count >= limit` IS `killedDueToLimit`: it is the condition that
+            // breaks the loop above, exactly as it kills the rg child upstream. `limit` is
+            // `.max(1)` (grep.ts:189), so this cannot be vacuously true on entry.
+            //
+            // This check precedes the `out.is_empty()` reply below because pi's does — the
+            // exit-code guard is at grep.ts:309 and the `matchCount === 0` reply at `:314` — so an
+            // errored walk that found nothing reports the error rather than "No matches found".
+            // It also precedes the successful formatting path, because rg exiting 2 makes pi
+            // reject even when matches were found.
+            if count < limit
+                && let Some(e) = walk_error
+            {
+                return Err(e);
             }
         }
 

@@ -119,7 +119,7 @@ impl ProcOps for LocalProc {
         // token must guarantee zero process execution, not just a kill-after-spawn race. Report it
         // as `Ok(Killed)`, the SAME outcome the mid-run cancel branch below reports (bash.ts's outer
         // catch maps BOTH the pre-spawn and the post-spawn `Error("aborted")` to the identical
-        // `"Command aborted"` text, bash.ts:407-411) — every caller (`BashTool::execute`,
+        // `"Command aborted"` text, bash.ts:407-411) — every caller (`ShellTool::execute`,
         // `bash.rs:315`; `run_bash`, `cyrup-session-svc/src/bash.rs:58`) already renders `Killed`
         // correctly, so this needs no new wiring.
         if cancel.is_cancelled() {

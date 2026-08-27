@@ -2396,8 +2396,38 @@ fn today() -> time::Date {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
-    use super::http_proxy_overlay;
+    use super::{ALL_BUILTIN_TOOLS, DEFAULT_BUILTIN_TOOLS, http_proxy_overlay};
     use std::path::Path;
+
+    /// `select_active_tools`'s no-flags arm is
+    /// `DEFAULT_BUILTIN_TOOLS.contains(name) || !ALL_BUILTIN_TOOLS.contains(name)` — it KEEPS any
+    /// name it does not recognise as a built-in, because that is how an extension- or
+    /// embedder-supplied tool stays active. So every name `ToolRegistry::with_builtins` installs
+    /// must appear in `ALL_BUILTIN_TOOLS` or it is silently on by default. `powershell` is the
+    /// case this guards: pi's `defaultActiveToolNames` is `read`/`bash`/`edit`/`write`
+    /// (sdk.ts:256) and `powershell` is reachable only through `--tools` / `defaultTools`.
+    #[test]
+    fn every_builtin_is_gated_and_powershell_is_not_a_default() {
+        for name in cyrup_tools::BUILTIN_NAMES {
+            assert!(
+                ALL_BUILTIN_TOOLS.contains(&name),
+                "`{name}` is registered by `with_builtins` but absent from ALL_BUILTIN_TOOLS, so \
+                 the default arm of `select_active_tools` would treat it as an extension tool and \
+                 enable it in EVERY session"
+            );
+        }
+        assert_eq!(ALL_BUILTIN_TOOLS.len(), cyrup_tools::BUILTIN_NAMES.len());
+        assert!(ALL_BUILTIN_TOOLS.contains(&"powershell"));
+        assert!(
+            !DEFAULT_BUILTIN_TOOLS.contains(&"powershell"),
+            "pi's default active set is read/bash/edit/write (sdk.ts:256)"
+        );
+        assert_eq!(DEFAULT_BUILTIN_TOOLS, ["read", "bash", "edit", "write"]);
+        // The reverse direction: nothing is gated that the registry does not actually install.
+        for name in DEFAULT_BUILTIN_TOOLS {
+            assert!(cyrup_tools::BUILTIN_NAMES.contains(&name));
+        }
+    }
 
     // ---- SEAM-071: `--no-extensions` gates the native built-ins ----------------------------
     //

@@ -2693,8 +2693,7 @@ async fn the_utf8_preamble_goes_on_after_the_spawn_hook_and_only_once() {
         resolve_shell: crate::ops::ShellConfig::resolve,
     };
 
-    let seen_by_hook: Arc<std::sync::Mutex<Option<String>>> =
-        Arc::new(std::sync::Mutex::new(None));
+    let seen_by_hook: Arc<std::sync::Mutex<Option<String>>> = Arc::new(std::sync::Mutex::new(None));
     let recorder = Arc::new(RecordingProc(std::sync::Mutex::new(None)));
     let dir = tempfile::tempdir().unwrap();
     let opts = BashOpts {
@@ -2746,7 +2745,11 @@ async fn the_utf8_preamble_goes_on_after_the_spawn_hook_and_only_once() {
 async fn bash_commands_get_no_preamble() {
     let recorder = Arc::new(RecordingProc(std::sync::Mutex::new(None)));
     let dir = tempfile::tempdir().unwrap();
-    let bash = ShellTool::bash(recorder.clone(), dir.path().to_path_buf(), BashOpts::default());
+    let bash = ShellTool::bash(
+        recorder.clone(),
+        dir.path().to_path_buf(),
+        BashOpts::default(),
+    );
     bash.execute(
         cid(),
         serde_json::json!({ "command": "echo hi" }),

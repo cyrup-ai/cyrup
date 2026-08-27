@@ -273,6 +273,50 @@ mod tests {
         assert_eq!(out.prompt, prompt);
     }
 
+    /// The two PowerShell file-exploration bullets the prompt builder can now emit
+    /// (`cyrup-session/src/prompt/builder.rs`, pi `system-prompt.ts:107-111`) must be DROPPABLE:
+    /// a bullet with no rule is always kept, so without these arms a hidden `powershell` would
+    /// leave the model told to use a tool it cannot call.
+    #[test]
+    fn powershell_file_exploration_bullets_track_their_tools() {
+        let ps = "- Use PowerShell for file operations like listing, searching, and finding files";
+        let both = "- Use bash or PowerShell for file operations like listing, searching, and finding files";
+
+        // PowerShell hidden ⇒ its bullet goes.
+        let out = sanitize_available_tools_section(
+            &format!("Guidelines:\n{ps}\n- always be polite\n"),
+            &allowed(&["bash"]),
+        );
+        assert!(out.removed);
+        assert!(!out.prompt.contains("Use PowerShell for file operations"));
+        assert!(out.prompt.contains("always be polite"));
+
+        // PowerShell exposed ⇒ its bullet stays.
+        let out = sanitize_available_tools_section(
+            &format!("Guidelines:\n{ps}\n"),
+            &allowed(&["powershell"]),
+        );
+        assert!(out.prompt.contains("Use PowerShell for file operations"));
+
+        // The combined bullet needs BOTH shells; hiding either drops it.
+        for still_allowed in [&["bash"][..], &["powershell"][..]] {
+            let out = sanitize_available_tools_section(
+                &format!("Guidelines:\n{both}\n- always be polite\n"),
+                &allowed(still_allowed),
+            );
+            assert!(
+                !out.prompt.contains("Use bash or PowerShell"),
+                "{still_allowed:?} alone must not keep the two-shell bullet:\n{}",
+                out.prompt
+            );
+        }
+        let out = sanitize_available_tools_section(
+            &format!("Guidelines:\n{both}\n"),
+            &allowed(&["bash", "powershell"]),
+        );
+        assert!(out.prompt.contains("Use bash or PowerShell"));
+    }
+
     #[test]
     fn unrelated_bullets_are_kept() {
         let prompt = "Guidelines:\n- always be polite\n- use write only for new files or complete rewrites\n";

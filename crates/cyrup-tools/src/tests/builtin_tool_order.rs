@@ -37,7 +37,16 @@ fn visible_all_matches_pi_create_all_tool_definitions_order() {
     let tools = reg.visible(&Availability::All);
     assert_eq!(
         names(&tools),
-        ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"],
+        [
+            "read",
+            "bash",
+            "powershell",
+            "edit",
+            "write",
+            "grep",
+            "find",
+            "ls"
+        ],
         "wire/prompt tool order must match Pi's createAllToolDefinitions literal"
     );
     // `all()` replays the same `order` vector; keep the two in lockstep.
