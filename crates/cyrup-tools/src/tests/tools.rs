@@ -7,7 +7,7 @@
     clippy::panic
 )]
 
-use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts};
+use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, PowerShellOpts, ReadOpts};
 use crate::ops::local::LocalFs;
 use crate::ops::{Backend, ExecSpec, ExitStatus, FsOps, ProcOps};
 use crate::registry::{Availability, ToolRegistry};
@@ -2646,4 +2646,201 @@ async fn find_accepts_float_and_negative_limit() {
         .await
         .expect("negative limit must not fail the call");
     assert_eq!(first_text(&neg_limit), "No files found matching pattern");
+}
+
+// ---------------------------------------------------------------- powershell (Pi `powershell.ts`)
+
+/// A `ProcOps` that records the [`ExecSpec`] it was handed and produces no output. The shell is
+/// already resolved by the time it arrives, so this is the seam where "what the child would have
+/// been given" is observable without a Windows host.
+struct RecordingProc(std::sync::Mutex<Option<ExecSpec>>);
+
+#[async_trait::async_trait]
+impl ProcOps for RecordingProc {
+    async fn exec(
+        &self,
+        spec: ExecSpec,
+        _cancel: CancelToken,
+        _timeout: Option<std::time::Duration>,
+        _on_data: &mut (dyn for<'a> FnMut(&'a [u8]) + Send),
+    ) -> Result<ExitStatus, ToolError> {
+        *self.0.lock().unwrap() = Some(spec);
+        Ok(ExitStatus::Exited(0))
+    }
+}
+
+/// Pi's `UTF8_OUTPUT_PREFIX` (powershell.ts:16) is applied INSIDE `operations.exec`
+/// (powershell.ts:35), i.e. AFTER `commandPrefix`, after `resolveSpawnContext` and after the
+/// `spawnHook` (bash.ts:340-341,451). So the hook must observe the model's command WITHOUT the
+/// preamble, and the preamble must appear exactly once, first, in what reaches the child.
+///
+/// Driven through [`ShellTool::new`] against a config that pairs PowerShell's preamble with a
+/// resolvable shell, because `resolve_powershell` refuses off Windows before `exec` is reached.
+#[tokio::test]
+async fn the_utf8_preamble_goes_on_after_the_spawn_hook_and_only_once() {
+    static PREAMBLE_CONFIG: crate::tools::ShellToolConfig = crate::tools::ShellToolConfig {
+        name: "powershell",
+        label: "powershell",
+        shell_name: "PowerShell",
+        command_description: "Shell command to execute",
+        prompt_snippet: "Execute PowerShell commands",
+        prompt_guidelines: &[],
+        temp_file_prefix: "cyrup-powershell",
+        // Byte-identical to `powershell.rs`'s `UTF8_OUTPUT_PREFIX`, asserted below.
+        command_preamble: Some(
+            "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\n",
+        ),
+        resolve_shell: crate::ops::ShellConfig::resolve,
+    };
+
+    let seen_by_hook: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let recorder = Arc::new(RecordingProc(std::sync::Mutex::new(None)));
+    let dir = tempfile::tempdir().unwrap();
+    let opts = BashOpts {
+        spawn_hook: {
+            let seen = seen_by_hook.clone();
+            Some(Arc::new(move |ctx: crate::config::BashSpawnContext| {
+                *seen.lock().unwrap() = Some(ctx.command.clone());
+                ctx
+            }))
+        },
+        ..BashOpts::default()
+    };
+    let tool = ShellTool::new(
+        &PREAMBLE_CONFIG,
+        recorder.clone(),
+        dir.path().to_path_buf(),
+        opts,
+    );
+    tool.execute(
+        cid(),
+        serde_json::json!({ "command": "Get-ChildItem" }),
+        CancelToken::new(),
+        noop_sink(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        seen_by_hook.lock().unwrap().as_deref(),
+        Some("Get-ChildItem"),
+        "the spawn hook sees the model's command WITHOUT the preamble (powershell.ts:35 runs later)"
+    );
+    let command = recorder.0.lock().unwrap().as_ref().unwrap().command.clone();
+    assert_eq!(
+        command,
+        "try { [Console]::OutputEncoding=[System.Text.Encoding]::UTF8 } catch {}\nGet-ChildItem",
+        "the preamble is prepended exactly once, immediately before the child is built"
+    );
+    // The literal above is the one `tools/powershell.rs` ships, reached through the real config.
+    assert_eq!(
+        crate::tools::POWERSHELL_CONFIG.command_preamble,
+        PREAMBLE_CONFIG.command_preamble
+    );
+}
+
+/// A `bash` command must be byte-identical to what it was before `powershell` existed: no preamble
+/// (`bashToolConfig` sets none, bash.ts:519-527).
+#[tokio::test]
+async fn bash_commands_get_no_preamble() {
+    let recorder = Arc::new(RecordingProc(std::sync::Mutex::new(None)));
+    let dir = tempfile::tempdir().unwrap();
+    let bash = ShellTool::bash(recorder.clone(), dir.path().to_path_buf(), BashOpts::default());
+    bash.execute(
+        cid(),
+        serde_json::json!({ "command": "echo hi" }),
+        CancelToken::new(),
+        noop_sink(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        recorder.0.lock().unwrap().as_ref().unwrap().command,
+        "echo hi"
+    );
+    assert!(crate::tools::BASH_CONFIG.command_preamble.is_none());
+}
+
+/// Off Windows, every `powershell` call is Pi's `win32` throw (shell.ts:127) surfaced as the tool
+/// result — bare: no prefix, no `Command exited with code …` / `Command aborted` suffix, no output
+/// body. The refusal comes from the shell thunk, so it happens without touching the process seam.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn powershell_off_windows_returns_pis_bare_refusal() {
+    let recorder = Arc::new(RecordingProc(std::sync::Mutex::new(None)));
+    let dir = tempfile::tempdir().unwrap();
+    let ps = ShellTool::powershell(
+        recorder.clone(),
+        dir.path().to_path_buf(),
+        PowerShellOpts::default(),
+    );
+    let err = ps
+        .execute(
+            cid(),
+            serde_json::json!({ "command": "Get-ChildItem" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect_err("off Windows the shell thunk throws");
+    assert_eq!(
+        err.to_string(),
+        "The powershell tool is only available on Windows."
+    );
+    assert!(
+        recorder.0.lock().unwrap().is_none(),
+        "the refusal precedes the process seam entirely"
+    );
+}
+
+/// The `shellPath` setting names a BASH. `PowerShellOpts` cannot carry it and cannot carry a
+/// `shellCommandPrefix` either, and the widening to [`BashOpts`] pins both to `None`
+/// (powershell.ts:29-30,53-56) — so a `shellPath` pointing anywhere can only ever steer `bash`.
+#[tokio::test]
+async fn powershell_options_can_never_carry_shell_path_or_command_prefix() {
+    let widened = BashOpts::from(PowerShellOpts {
+        bin_dir: Some(PathBuf::from("/opt/cyrup/bin")),
+        ..PowerShellOpts::default()
+    });
+    assert!(widened.shell_path.is_none());
+    assert!(widened.command_prefix.is_none());
+    assert_eq!(widened.bin_dir, Some(PathBuf::from("/opt/cyrup/bin")));
+    assert!(widened.expose_session_environment);
+}
+
+/// Pi's missing-cwd message names the SHELL (`Cannot execute ${shellName} commands.`, bash.ts:95).
+/// The name rides on the resolved [`crate::ops::ShellConfig`], so the process backend can say
+/// `PowerShell` for one tool and `bash` for the other from a single code path.
+#[tokio::test]
+async fn the_missing_cwd_error_names_the_shell() {
+    let missing = std::env::temp_dir().join("cyrup-no-such-cwd-for-the-shell-name-test");
+    let _ = std::fs::remove_dir_all(&missing);
+    let mut sink = |_: &[u8]| {};
+
+    for (shell_name, expected) in [("bash", "bash"), ("PowerShell", "PowerShell")] {
+        let spec = ExecSpec {
+            command: "noop".to_string(),
+            cwd: missing.clone(),
+            env: Vec::new(),
+            env_remove: Vec::new(),
+            shell: crate::ops::ShellConfig {
+                shell_name,
+                program: PathBuf::from("/bin/sh"),
+                args: vec!["-c".to_string()],
+                transport: crate::ops::Transport::Argv,
+            },
+        };
+        let err = proc()
+            .exec(spec, CancelToken::new(), None, &mut sink)
+            .await
+            .expect_err("a missing cwd is Pi's actionable error, not a raw spawn failure");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Working directory does not exist: {}\nCannot execute {expected} commands.",
+                missing.display()
+            )
+        );
+    }
 }
