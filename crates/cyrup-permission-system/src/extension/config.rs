@@ -82,18 +82,31 @@ impl PermissionSystemExtension {
     /// the raw flag would withhold project policy from every host that never attached one, trading
     /// upstream's silent widening for a silent narrowing.
     ///
-    /// `host_services.get()` resolves it exactly for THIS crate, and is the same test
+    /// `host_services.get()` is the key, and is the same test
     /// [`super::warnings::WarningSink::notify`] and [`Self::sync_status_when_possible`] already use
-    /// for "is a host backend attached at all" (pi's `runtimeContext != null`). It is exact rather
-    /// than a heuristic because: this crate holds `Arc<dyn HostServices>` unconditionally while
-    /// `cyrup-ext`'s `host` module is `cfg(feature = "wasm-host")`, so it cannot build on the arm
-    /// where the two could diverge; and on the arm it does build,
-    /// `ExtensionHost::load_native_with_services` (`cyrup-ext/src/facade.rs:354-366`) sets the
-    /// backend and the ctx source in one body — the path `cyrup-session-svc/src/builder.rs:1010`
-    /// takes for every native built-in.
+    /// for "is a host backend attached at all" (pi's `runtimeContext != null`). What it buys is
+    /// worth stating precisely, because it is not the same in every wiring:
     ///
-    /// With no backend attached the project scope is KEPT, preserving today's behaviour: a host
-    /// that supplies no trust signal has not said the project is untrusted.
+    /// - **Exact for the facade wiring.** `ExtensionHost::load_native_with_services`
+    ///   (`cyrup-ext/src/facade.rs:354-366`) attaches the backend and the `HostCtxSource` in ONE
+    ///   body, so the two are inseparable there — and that is the path
+    ///   `cyrup-session-svc/src/builder.rs:1010` takes for every native built-in. In production,
+    ///   backend attached ⟺ the trust flag is live.
+    /// - **The `--no-default-features` hazard cannot reach this crate at all.** It holds
+    ///   `Arc<dyn HostServices>` unconditionally while `cyrup-ext`'s `host` module is
+    ///   `cfg(feature = "wasm-host")`, so it does not build on the arm where a ctx source could be
+    ///   attached with no backend to pair it with.
+    /// - **NOT exact for a hand-wired embedder.** `NativeExtension::set_host_services` is a public
+    ///   trait method: a host that calls it directly without `ExtensionHost::set_ctx_source` gets
+    ///   `HostCtxRich::default()`, so this reads `is_project_trusted = false` and withholds the
+    ///   project scope. That is the residual case, and it is ACCEPTED — it withholds policy rather
+    ///   than granting it, so the error is conservative. It is also not hypothetical: every test in
+    ///   `super::tests` wires the backend that way, which is precisely why
+    ///   `extension::tests::support::trusted_event_ctx` exists — a test whose subject is
+    ///   project-scoped policy has to state trust explicitly.
+    ///
+    /// With NO backend attached the project scope is KEPT, preserving the behaviour that predates
+    /// this gate: a host that supplies no trust signal has not said the project is untrusted.
     pub(super) fn project_trusted(&self, ctx: &HostCtx) -> bool {
         match self.host_services.get() {
             Some(_) => ctx.is_project_trusted(),

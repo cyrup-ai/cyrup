@@ -7,13 +7,14 @@
 //! granted trust. The widening direction is what is asserted — a project ALLOW over a global
 //! default of `ask` — because that is the direction that actually let something through.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use cyrup_ext::{HookOutcome, HostEvent, NativeExtension};
 
 use super::support::*;
 use crate::extension::PermissionSystemExtension;
-use crate::extension::paths::{POLICY_FILE, PROJECT_AGENT_SUBDIR};
+use crate::extension::paths::{CONFIG_DIR, POLICY_FILE, PROJECT_AGENT_SUBDIR};
 
 /// Build an extension whose GLOBAL policy is empty (so bash defaults to `ask`) and whose PROJECT
 /// policy allows the `echo hi` that [`bash_call`] issues. Returns the extension and the session cwd.
@@ -130,4 +131,73 @@ async fn an_untrusted_session_announces_the_reduced_scope() {
         "the warning must say what is still in force: {:?}",
         announced[0]
     );
+}
+
+/// The `review`-stream entries for `event`, read back off the extension's own JSONL trail.
+///
+/// The trail lands at the DEFAULT logs dir — `<agent_dir>/cyrup-permission-system/logs` per
+/// [`PermissionSystemExtension::logs_dir_for`] — which is inside the test's tempdir, so no
+/// `CYRUP_PERMISSION_SYSTEM_LOGS_DIR` override is needed. The caller still has to hold the crate
+/// env lock, because `logging::tests::logs_dir_env_var_overrides_the_default` sets that variable
+/// PROCESS-WIDE while it runs and would otherwise divert this read to its own tempdir.
+///
+/// `review` is ungated (pi `logging.ts:99` is a bare `writeLine`, only `debug` early-returns on
+/// `config.debug`), and the write is serialized under the logger's own lock rather than queued,
+/// so there is nothing to flush before reading.
+fn review_entries(agent_dir: &Path, event: &str) -> Vec<serde_json::Value> {
+    let logs_dir = agent_dir.join(CONFIG_DIR).join(crate::logging::LOGS_DIR_NAME);
+    let body = std::fs::read_to_string(crate::logging::debug_path(&logs_dir)).unwrap_or_default();
+    body.lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| {
+            entry.get("stream").and_then(serde_json::Value::as_str) == Some("review")
+                && entry.get("event").and_then(serde_json::Value::as_str) == Some(event)
+        })
+        .collect()
+}
+
+/// pi `warnProjectUntrusted`'s FIRST half (`handlers/lifecycle.ts:113`):
+/// `logger.review("project_trust.skipped", { cwd, phase })`.
+///
+/// This is the durable half — it survives a dropped notify sink, which is why pi writes it before
+/// the notification and why it is worth pinning separately from
+/// [`an_untrusted_session_announces_the_reduced_scope`]. Both `phase` values are covered: pi gates
+/// the `resources_discover` reload on trust too (`:92-96`), so a reload in a still-untrusted
+/// project records its own entry.
+#[test]
+fn an_untrusted_session_records_the_skip_in_the_review_trail() {
+    with_config_env_lock(async {
+        let dir = tempfile::tempdir().unwrap();
+        let (ext, cwd) = ext_with_project_allow(dir.path()).await;
+        ext.set_host_services(Arc::new(FakeRegistry { names: vec!["bash".to_string()] }));
+
+        let ctx = event_ctx(cwd.clone());
+        start_session(&ext, &ctx).await;
+        ext.on_event(
+            &HostEvent::ResourcesDiscover {
+                cwd: cwd.display().to_string(),
+                reason: "reload".to_string(),
+            },
+            &ctx,
+        )
+        .await;
+
+        let entries = review_entries(dir.path(), "project_trust.skipped");
+        let phases: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e.get("phase").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(
+            phases,
+            vec!["session_start", "resources_discover"],
+            "both trust-gated lifecycle arms must record their skip, in order"
+        );
+        for entry in &entries {
+            assert_eq!(
+                entry.get("cwd").and_then(serde_json::Value::as_str),
+                Some(cwd.to_string_lossy().as_ref()),
+                "the entry must name the cwd whose project scope was withheld"
+            );
+        }
+    });
 }

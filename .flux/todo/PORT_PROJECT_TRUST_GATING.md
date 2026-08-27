@@ -1,9 +1,8 @@
 ---
-stage: qa
-status: needs-rework
-updated: 2026-08-27 05:20
+stage: exec
+status: done
+updated: 2026-08-27 05:25
 ---
-
 # Project-trust gating — remaining work
 
 > **QA verdict 9/10.** The gate itself is landed, correct and upstream-faithful (commit
