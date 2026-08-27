@@ -4,7 +4,7 @@ priority: MEDIUM
 tool: edit
 source: pi-parity-audit (workflow wf_e427a266-e16)
 stage: aug
-status: in-progress
+status: done
 updated: 2026-08-27
 ---
 
