@@ -46,7 +46,7 @@ use async_trait::async_trait;
 use cyrup_core::ExtensionId;
 use cyrup_ext::native::{HostCtx, InitApi, NativeExtension};
 use cyrup_ext::{ExtError, HookOutcome, HostEvent};
-use futures::future::{BoxFuture, Shared};
+use futures::future::{BoxFuture, FutureExt, Shared};
 use indexmap::IndexMap;
 
 use crate::config::McpConfig;
@@ -68,6 +68,16 @@ pub const EXTENSION_ID: &str = "mcp";
 /// double commit within one generation (MCP-011).
 pub type InitTask = Shared<BoxFuture<'static, Result<Arc<McpState>, Arc<McpError>>>>;
 
+/// `startInitialization(..., "stale_session_start")` (`index.ts:405`) — the
+/// [`crate::lifecycle::shutdown_state`] reason a build that lost its generation is torn down under.
+///
+/// A sibling of [`crate::lifecycle::SESSION_RESTART_STATE_REASON`] and
+/// [`crate::lifecycle::SESSION_SHUTDOWN_STATE_REASON`], and it lives here rather than beside them
+/// because it names a state this file — not `lifecycle.rs` — is the only producer of: a runtime that
+/// was built and then never committed. `shutdown_state` takes `&'static str`, so the literal has to
+/// be a const somewhere.
+pub const STALE_SESSION_START_STATE_REASON: &str = "stale_session_start";
+
 /// The MCP adapter as one native extension.
 pub struct McpExtension {
     id: ExtensionId,
@@ -88,6 +98,18 @@ pub struct McpExtension {
     generation: AtomicU64,
     /// `currentOwner` — the live generation's ownership token.
     owner: Mutex<Option<Arc<McpRuntimeOwner>>>,
+    /// `currentOAuthRuntime` — the live generation's OAuth flow registry.
+    ///
+    /// Held here, and not merely inside [`McpState`], because it must outlive a build that never
+    /// commits: [`crate::oauth::create_oauth_runtime`] inserts the runtime's id into a
+    /// **process-global** live-runtime set and only [`crate::oauth::shutdown_oauth`] removes it and
+    /// drops the shared loopback listener. A generation whose `initializeMcp` rejected has no state
+    /// to reach the runtime through, so without this slot every failed or superseded session start
+    /// would leak one live-runtime id for the life of the process.
+    ///
+    /// It is also what makes [`crate::lifecycle::PreviousGeneration::oauth`] reachable from the two
+    /// session handlers — the field that snapshot type has always been shaped for.
+    oauth_runtime: Mutex<Option<Arc<crate::state::OAuthRuntime>>>,
     /// `state` — the committed runtime, or `None` between generations.
     state: Mutex<Option<Arc<McpState>>>,
     /// `initPromise` — the in-flight build, if any.
@@ -126,6 +148,11 @@ pub struct McpExtension {
     /// `crates/cyrup/src/main.rs` — has only the trait object, which does not downcast back.
     /// Binding the `Weak` at construction is what makes [`Self::install_surface_sync`] callable.
     self_weak: OnceLock<std::sync::Weak<McpExtension>>,
+    /// This generation's [`crate::proxy::ProxyCtx`], built over the one production
+    /// [`crate::proxy::ProxyEnv`] by [`Self::install_runtime_env`] and read by the dispatcher
+    /// (MCP-214). `None` until the commit tail installs it, because the env holds the committed
+    /// state and so cannot exist before the commit.
+    proxy_ctx: Mutex<Option<Arc<crate::proxy::ProxyCtx>>>,
     /// `resolveMcpToolRenderOptions(settings)`, resolved **once, at load**, from the same early
     /// config `init` registered the surface from (MCP-238).
     ///
@@ -157,6 +184,11 @@ impl McpExtension {
     /// A no-op returning `false` when no registrar was bound (HA-1 absent, or a test harness), so
     /// every caller can call it unconditionally and get the pre-HA-1 behaviour rather than an
     /// error.
+    ///
+    /// Returns whether the DIRECT-TOOL set changed — `added + updated + deactivated`, which is
+    /// upstream's own `changed` (`index.ts:257`). A pass that re-registered nothing but the proxy
+    /// tool or a prompt command returns `false`: neither is a direct-tool change, and neither
+    /// belongs in the notice. `false` is also the answer when no registrar was bound.
     ///
     /// The FINGERPRINT DIFF is the point, not an optimisation. Re-registering a tool with identical
     /// bytes still rewrites `Agent::set_tools` and the base system prompt, which invalidates the
@@ -222,6 +254,45 @@ impl McpExtension {
         let surface: RegisteredSurface =
             crate::registration::register_surface(&mut sink, &self.dirs, &config, dispatch);
 
+        // `syncDirectTools`' `(previous ? updated : added)` (`index.ts:229`), computed against the
+        // PREVIOUS map — still `sink.known_tools`, because `register_surface` never touches it.
+        //
+        // Iterating `surface.tool_names` rather than every resolved spec is the point: that list
+        // already holds ONLY what registered (`register_surface` pushes at `registration.rs:2868`,
+        // after the `should_register_tool` gate at `:2865`, and `LateSink::should_register_tool` IS
+        // `previous != fingerprint`), so a tool whose fingerprint did not change is neither added
+        // nor updated. `PROXY_TOOL_NAME` is pushed onto the same list (`registration.rs:2892`) and
+        // is never in `known_tools`, so it must be excluded — otherwise every proxy-description
+        // change would read as an added tool.
+        let (mut added, mut updated) = (0usize, 0usize);
+        for name in surface
+            .tool_names
+            .iter()
+            .filter(|name| name.as_str() != crate::registration::PROXY_TOOL_NAME)
+        {
+            if sink.known_tools.contains_key(name) {
+                updated += 1;
+            } else {
+                added += 1;
+            }
+            // `index.ts:223-228` — the re-activation arm, PER TOOL and gated on this tool actually
+            // having been in the fallback set. A tool that comes back must leave that set AND be
+            // put back into the active list, or it stays invisible for the rest of the session.
+            self.reactivate_tool(name);
+        }
+        // `index.ts:233-237` — every previously-registered name absent from the NEW resolution.
+        // `surface.direct_tool_fingerprints` records EVERY resolved spec, registered or not
+        // (`registration.rs:2862-2864`), which is exactly upstream's `nextNames` (`index.ts:212`).
+        // Upstream's `registeredDirectTools.delete(toolName)` half of that loop is the adoption
+        // below: it replaces the map wholesale, so a name absent from the new fingerprints is gone.
+        let deactivated: Vec<String> = sink
+            .known_tools
+            .keys()
+            .filter(|name| !surface.direct_tool_fingerprints.contains_key(*name))
+            .cloned()
+            .collect();
+        self.deactivate_tools(&deactivated);
+
         // ADOPT the new surface, exactly as `init` does: these slots ARE the diff's input next
         // time, so a pass that registers and forgets would re-register everything on every call.
         if let Ok(mut slot) = self.registered_direct_tools.lock() {
@@ -242,15 +313,83 @@ impl McpExtension {
         // handle would discard the installed instance, which MCP-214 calls the ONLY handle to the
         // `Arc<ToolDispatch>` that this generation's tools closed over.
 
-        let changed = !surface.tool_names.is_empty() || !surface.command_names.is_empty();
-        if changed {
-            tracing::debug!(
-                "MCP: surface re-synced — {} tool(s), {} command(s) re-registered",
-                surface.tool_names.len(),
-                surface.command_names.len()
+        // `index.ts:257-263` — the sum of all three, and a UI notification. Prompt commands and
+        // the proxy description are deliberately NOT counted: upstream's `changed` is
+        // `added + updated + deactivated` out of `syncDirectTools` alone.
+        let removed = deactivated.len();
+        let changed = added + updated + removed;
+        if changed > 0
+            && let Some(services) = self.host_services()
+        {
+            services.notify(
+                &format!("MCP: direct tools refreshed (+{added}, ~{updated}, -{removed})"),
+                cyrup_ext::NotifyKind::Info,
             );
         }
-        changed
+        changed > 0
+    }
+
+    /// `index.ts:186-203` `deactivateTools(toolNames)` — the `setActiveTools` fallback, the ONLY
+    /// branch cyrup has.
+    ///
+    /// `ExtensionRegistry` has no `unregisterTool`, which lands this on upstream's own
+    /// `unregisterTool === undefined` branch — a supported upstream configuration, so `unregistered`
+    /// is always empty and `fallbackNames` is always `toolNames`. A deactivated MCP tool stops being
+    /// callable but its name stays in the registry for the session, exactly as upstream behaves
+    /// against a host without `unregisterTool`.
+    fn deactivate_tools(&self, names: &[String]) {
+        if names.is_empty() {
+            return;
+        }
+        let Some(services) = self.host_services() else { return };
+        let remove: std::collections::HashSet<&str> = names.iter().map(String::as_str).collect();
+        // `getActiveToolsIfReady()` returning undefined (`index.ts:176-184`, the "Action methods
+        // cannot be called during extension loading" arm) is `active_tools() == None`, and
+        // upstream treats an EMPTY active list the same way (`index.ts:193`).
+        let Some(active) = services.active_tools().filter(|active| !active.is_empty()) else {
+            if let Ok(mut slot) = self.fallback_deactivated_tools.lock() {
+                slot.extend(names.iter().cloned());
+            }
+            return;
+        };
+        let next: Vec<String> =
+            active.iter().filter(|name| !remove.contains(name.as_str())).cloned().collect();
+        // `if (nextActiveTools.length !== activeTools.length)` — the fallback set is recorded ONLY
+        // on this branch too (`index.ts:198-201`).
+        if next.len() != active.len() {
+            if let Ok(mut slot) = self.fallback_deactivated_tools.lock() {
+                slot.extend(names.iter().cloned());
+            }
+            services.set_active_tools(&next);
+        }
+    }
+
+    /// `index.ts:223-228` — a tool re-registered after having been deactivated leaves the fallback
+    /// set and is appended to the active list.
+    ///
+    /// The `delete` returning true is the gate: a tool that was never deactivated must not cause a
+    /// `setActiveTools` write, because that call rewrites the agent's tool array and the base
+    /// system prompt and so invalidates the provider's prompt-cache prefix.
+    fn reactivate_tool(&self, name: &str) {
+        let removed = self
+            .fallback_deactivated_tools
+            .lock()
+            .map(|mut slot| {
+                let before = slot.len();
+                slot.retain(|entry| entry != name);
+                slot.len() != before
+            })
+            .unwrap_or(false);
+        if !removed {
+            return;
+        }
+        let Some(services) = self.host_services() else { return };
+        let Some(active) = services.active_tools() else { return };
+        if !active.iter().any(|entry| entry == name) {
+            let mut next = active;
+            next.push(name.to_string());
+            services.set_active_tools(&next);
+        }
     }
 
     /// Construct the adapter for an already-resolved `<agent_dir>` and session `cwd`.
@@ -269,6 +408,7 @@ impl McpExtension {
             host_services: Arc::new(OnceLock::new()),
             generation: AtomicU64::new(0),
             owner: Mutex::new(None),
+            oauth_runtime: Mutex::new(None),
             state: Mutex::new(None),
             init_task: Mutex::new(None),
             registered_direct_tools: Mutex::new(IndexMap::new()),
@@ -279,6 +419,7 @@ impl McpExtension {
             dispatch: Mutex::new(None),
             late_registrar: Mutex::new(None),
             self_weak: OnceLock::new(),
+            proxy_ctx: Mutex::new(None),
             render_options: Mutex::new(crate::renderers::McpToolRenderOptions::default()),
             home: None,
         }
@@ -343,6 +484,61 @@ impl McpExtension {
         self.owner.lock().ok().and_then(|slot| slot.clone())
     }
 
+    /// `initPromise` — the in-flight build, if one has not yet settled.
+    ///
+    /// The join point for anything that must wait on a runtime that is still coming up: clone the
+    /// inner [`InitTask`] out of the `Arc` and await it under a bound (see [`Self::on_input`], which
+    /// does exactly that). Joining is not the same as owning — the returned handle carries no
+    /// authority to commit, and the commit tail's identity check
+    /// ([`Self::init_task_is`]) is what keeps a joiner from being mistaken for the builder.
+    #[must_use]
+    pub fn init_task(&self) -> Option<Arc<InitTask>> {
+        self.init_task.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// `initPromise === promise` — `startInitialization`'s **third** staleness check.
+    ///
+    /// An `Arc::ptr_eq` and never a value comparison: [`InitTask`] is a `Shared` future, which has
+    /// no equality and no stable id of its own, and the whole point of the check is identity. Two
+    /// `SessionStart`s inside one generation each memoise their own build; without this the second
+    /// build's commit and the first build's commit would both pass the other two checks and both
+    /// write `state`.
+    fn init_task_is(&self, task: &Arc<InitTask>) -> bool {
+        self.init_task()
+            .is_some_and(|current| Arc::ptr_eq(&current, task))
+    }
+
+    /// MCP-015's snapshot: every context-derived value `initializeMcp` can need, read
+    /// **synchronously** from the dispatch ctx before this generation's first await.
+    ///
+    /// `cwd` deliberately comes from [`Self::dirs`] and **not** from `ctx.cwd`. The same directory
+    /// reaches the extension twice — `mcp_extension_for_env` builds [`McpDirs`] from it at
+    /// construction, and the session builder independently builds the `HostCtx` from its own copy —
+    /// and the two are consumed by different halves of one system: `snapshot.cwd` becomes the MCP
+    /// child processes' working directory, while `self.dirs` resolves the config ladder and the
+    /// metadata cache. If they ever diverge, servers spawn in one directory while the config and
+    /// cache that describe them are read from another. One source; if a future host makes the ctx
+    /// authoritative, the fix is to rebuild [`McpDirs`] from it, not to mix the two.
+    ///
+    /// `initial_signal` is `None` **by construction, permanently**: [`NativeExtension::on_event`]
+    /// receives no cancellation token — the dispatcher races the handler against the session token
+    /// rather than handing it in — so there is no producer to read one from. `crate::abort::combine`
+    /// degrades that to a clone of the owner's own token with no forwarder task, which is the
+    /// documented and correct degradation.
+    fn context_snapshot(&self, ctx: &HostCtx) -> crate::runtime::ContextSnapshot {
+        crate::runtime::ContextSnapshot {
+            // The same expression `init` and `sync_tool_surface` resolve the config from. Read
+            // unconditionally: `initialize_mcp` consults it only on the arm where no programmatic
+            // config replaced discovery, so gating it would change nothing but the reading.
+            config_path: crate::config::config_path_from_argv(std::env::args()).map(PathBuf::from),
+            cwd: self.dirs.cwd().to_path_buf(),
+            has_ui: ctx.has_ui,
+            mode: mode_str(ctx.mode).to_string(),
+            initial_signal: None,
+            services: self.host_services(),
+        }
+    }
+
     /// The frozen-at-load tool-result render options (MCP-238). A poisoned slot degrades to the
     /// compact default rather than refusing to draw a row.
     #[must_use]
@@ -397,10 +593,15 @@ impl McpExtension {
 
     /// The current generation's executor slot, or `None` before the first `init`.
     ///
-    /// The install point for MCP-214's dispatcher: `runtime::initialize_mcp` calls
-    /// `ToolDispatch::install(...)` on this once [`McpState`] exists, and every tool registered by
-    /// the same pass goes live at that instant. Cloned out rather than borrowed because a pass
-    /// replaces the slot wholesale.
+    /// The install point for MCP-214's dispatcher: the commit tail
+    /// ([`Self::commit_initialization`]) calls `ToolDispatch::install(...)` on this once the
+    /// generation's [`McpState`] has been committed, and every tool registered by the same `init`
+    /// pass goes live at that instant. Cloned out rather than borrowed because a pass replaces the
+    /// slot wholesale.
+    ///
+    /// It cannot be `crate::runtime::initialize_mcp`'s job, tempting as the position is: that
+    /// function's inputs are the owner, the dirs, the snapshot and the options — it holds no handle
+    /// to this extension and so has nothing to install into.
     #[must_use]
     pub fn dispatch(&self) -> Option<Arc<ToolDispatch>> {
         self.dispatch.lock().ok().and_then(|slot| slot.clone())
@@ -408,10 +609,17 @@ impl McpExtension {
 
     /// Wire `onToolMetadataUpdated` -> `syncToolSurface` (HA-1's production caller).
     ///
-    /// This is `startInitialization`'s **step 11**, `setMetadataListChangedListener` — installed
-    /// after the state commits, so a hook firing mid-build cannot observe a half-installed surface
-    /// (the ordering `runtime.rs:200` documents). `runtime::initialize_mcp` calls this on the
-    /// committed [`McpState`] exactly as it calls [`Self::dispatch`] for MCP-214's dispatcher.
+    /// This is `startInitialization`'s `nextState.onToolMetadataUpdated = …` — installed by the
+    /// commit tail ([`Self::commit_initialization`]) after the state commits, so a hook firing
+    /// mid-build cannot observe a half-installed surface.
+    ///
+    /// **The two guards upstream's closure has and this one does not**, named rather than left for
+    /// the next reader to find: `if (state !== nextState || !owner.isActive()) return;`. Both are
+    /// safe to omit *here* and only here, because [`Self::sync_tool_surface`] re-reads `mcp.json`
+    /// and `mcp-cache.json` from disk and diffs against the **extension's** current fingerprint
+    /// maps rather than against anything the notifying state holds. A late notification from
+    /// generation N arriving during N+1 therefore re-syncs N+1's surface — correctly — instead of
+    /// republishing N's. The `Weak` upgrade covers the process-teardown case the owner check would.
     ///
     /// Upstream's chain is `manager.setMetadataListChangedListener(...)` ->
     /// `onToolMetadataUpdated` -> `syncToolSurface` -> `pi.registerTool`. Every link now exists on
@@ -438,44 +646,382 @@ impl McpExtension {
         })));
     }
 
-    /// `session_start`'s generation protocol, abort-before-await (MCP-008).
+    /// Build this generation's [`crate::proxy::ProxyCtx`] over the one production
+    /// [`crate::proxy::ProxyEnv`] and stash it where the dispatcher (MCP-214) can find it.
     ///
-    /// **Minimal body (MCP-008 fills it).** The ordering it must reproduce, exactly:
-    /// bump the generation; snapshot the previous state / owner / OAuth runtime; null `state` and
-    /// `initPromise`; call `previous_owner.begin_stop("MCP extension session restarted")`
-    /// **synchronously, before awaiting anything** — [`McpRuntimeOwner::begin_stop`] exists for
-    /// precisely this and must not be collapsed into a single `stop().await`, because the whole
-    /// point is that the cancel is observable before the cleanup completes; re-check
-    /// `generation == my_gen && owner.is_active()` after the join; then `startInitialization`.
+    /// Called from the commit tail, exactly where [`Self::install_surface_sync`] is, and for the
+    /// same reason: the env holds the committed state, so it cannot exist before the commit.
+    /// Wave 2's MCP-011 commit tail calls the two together.
+    pub fn install_runtime_env(&self, state: &Arc<McpState>) {
+        let Some(weak) = self.self_weak.get().cloned() else {
+            // Built without `into_arc` — the in-crate unit tests hold the value directly. With no
+            // self handle the env's `sync_tool_surface` could not call back, so install nothing
+            // rather than a half-wired context.
+            tracing::debug!("MCP: no self handle bound; runtime env not installed");
+            return;
+        };
+        let env = Arc::new(crate::live::RuntimeEnv::new(
+            Arc::clone(state),
+            self.dirs.clone(),
+            weak,
+        ));
+        let ctx = Arc::new(crate::proxy::ProxyCtx::new(
+            Arc::clone(state),
+            env as Arc<dyn crate::proxy::ProxyEnv>,
+        ));
+        if let Ok(mut slot) = self.proxy_ctx.lock() {
+            *slot = Some(ctx);
+        }
+    }
+
+    /// This generation's proxy context, for the dispatcher (MCP-214).
+    #[must_use]
+    pub fn proxy_ctx(&self) -> Option<Arc<crate::proxy::ProxyCtx>> {
+        self.proxy_ctx.lock().ok().and_then(|slot| slot.clone())
+    }
+
+
+    /// `startInitialization(ctx, owner, oauthRuntime, generation, staleReason)` (`index.ts:292`) —
+    /// build this generation's runtime, memoise the build, and drive its commit (MCP-011).
+    ///
+    /// **It spawns; it must never await the build inline, and that is structural rather than a
+    /// preference.** `cyrup_ext::dispatch`'s `DEFAULT_INVOKE_BUDGET` wraps every native `on_event`
+    /// in a 5-second `tokio::time::timeout` and, on expiry, **drops the handler future** and lets
+    /// the action proceed; the native path additionally drops it the moment the session cancel
+    /// token fires. [`crate::runtime::initialize_mcp`] connects subprocesses and performs their
+    /// `initialize` / `tools/list` handshakes, which on a cold start routinely outlives that budget.
+    /// An awaiting `on_session_start` would therefore have its handshakes cancelled mid-flight,
+    /// intermittently and per machine, with the session continuing as if nothing happened and every
+    /// MCP tool answering `MCP not initialized` for the rest of it. Upstream spawns for the same
+    /// reason: `const initialization = startInitialization(...)` is not awaited on the ordinary
+    /// path (`index.ts:405`).
+    ///
+    /// The returned handle is the memo, not the result: it is what [`Self::on_input`] and the
+    /// dispatcher's init gate join so that a caller arriving mid-build waits for *this* build
+    /// instead of starting a rival one.
+    ///
+    /// Returns `None` — having spawned nothing — when this extension was built without
+    /// [`Self::into_arc`], the same degradation [`Self::install_surface_sync`] takes: with no self
+    /// handle there is nothing to commit the build *into*.
+    fn start_initialization(
+        &self,
+        owner: Arc<McpRuntimeOwner>,
+        oauth_runtime: Arc<crate::state::OAuthRuntime>,
+        snapshot: crate::runtime::ContextSnapshot,
+        dispatch_ctx: HostCtx,
+        generation: u64,
+        stale_reason: &'static str,
+    ) -> Option<Arc<InitTask>> {
+        let Some(strong) = self.self_weak.get().and_then(std::sync::Weak::upgrade) else {
+            tracing::debug!("MCP: no self handle bound; session initialization not started");
+            return None;
+        };
+
+        // `owner.addCleanup(() => cleanupMaterializedBinaryResources(owner.signal))`
+        // (`index.ts:293`). Registered FIRST so it runs LAST under `begin_stop`'s LIFO drain, which
+        // is the order `runtime.rs`'s cleanup list documents: the graceful shutdown and the OAuth
+        // teardown that `initialize_mcp` registers must both have run before the materialized
+        // resource directories are removed out from under them.
+        owner.add_cleanup(Box::new(|| {
+            Box::pin(async {
+                if let Err(error) = crate::renderers::MaterializedResources::global().cleanup() {
+                    tracing::debug!("MCP: materialized-resource cleanup failed: {error}");
+                }
+                Ok(())
+            })
+        }));
+
+        // `const promise = initializeMcp(...); initPromise = promise;` (`index.ts:294-302`).
+        //
+        // `oauth_runtime: Some(...)` is deliberate and is upstream's own shape: it makes
+        // `owns_oauth_runtime` false, so `initialize_mcp` does NOT register the `shutdown_oauth`
+        // cleanup and the three explicit teardown sites — `on_session_start`,
+        // `on_session_shutdown` and the failure tail below — own it instead. That is what lets a
+        // build which never commits still have its runtime shut down.
+        let task: InitTask = {
+            let owner = Arc::clone(&owner);
+            let dirs = self.dirs.clone();
+            let options = crate::runtime::InitializeOptions {
+                programmatic_config: self.programmatic_config.clone(),
+                oauth_runtime: Some(Arc::clone(&oauth_runtime)),
+            };
+            async move {
+                crate::runtime::initialize_mcp(owner, dirs, snapshot, options)
+                    .await
+                    // `Shared` requires a `Clone` output and `McpError` is not; the `Arc` is what
+                    // lets a second joiner see the same failure rather than a poisoned memo.
+                    .map_err(Arc::new)
+            }
+            .boxed()
+            .shared()
+        };
+        let handle = Arc::new(task);
+        if let Ok(mut slot) = self.init_task.lock() {
+            *slot = Some(Arc::clone(&handle));
+        }
+
+        // The `.then` / `.catch` chain. A `Shared` makes no progress unless something polls it, so
+        // this task is not an optimisation — it is the only driver. Removing it and relying on
+        // `on_input` to poll would mean the runtime starts building when the user first types.
+        let driver = Arc::clone(&handle);
+        tokio::spawn(async move {
+            match (*driver).clone().await {
+                Ok(next_state) => {
+                    Self::commit_initialization(
+                        strong,
+                        next_state,
+                        &owner,
+                        &dispatch_ctx,
+                        generation,
+                        &driver,
+                        stale_reason,
+                    )
+                    .await;
+                }
+                Err(error) => {
+                    strong
+                        .fail_initialization(&error, &owner, &oauth_runtime, generation, &driver)
+                        .await;
+                }
+            }
+        });
+
+        Some(handle)
+    }
+
+    /// `startInitialization`'s `.then` tail (`index.ts:304-330`) — the commit.
+    ///
+    /// Everything the deliverable needs happens here: this is where the built runtime becomes *the*
+    /// runtime, where the surface listener and the proxy context are installed, and where the model
+    /// is shown the tools the servers reported.
+    ///
+    /// An associated function rather than a method because `self: &Arc<Self>` is not a stable
+    /// receiver and the dispatcher install needs a `Weak` derived from the very `Arc` being
+    /// committed into.
+    async fn commit_initialization(
+        ext: Arc<Self>,
+        next_state: Arc<McpState>,
+        owner: &Arc<McpRuntimeOwner>,
+        dispatch_ctx: &HostCtx,
+        generation: u64,
+        task: &Arc<InitTask>,
+        stale_reason: &'static str,
+    ) {
+        // 1 — the TRIPLE staleness check (`index.ts:305`), all three `||`-joined and checked before
+        // any write. Each catches a different way this build can have been superseded while it ran:
+        // the owner was stopped; a newer generation started; a second build inside this same
+        // generation replaced the memo. On any of them the new state is **shut down instead of
+        // committed** — leaking it would leave a live server manager, its children and its
+        // lifecycle timers running with nothing able to reach them.
+        if !owner.is_active() || ext.generation() != generation || !ext.init_task_is(task) {
+            if let Err(error) = crate::lifecycle::shutdown_state(
+                Some(next_state),
+                stale_reason,
+                crate::live::metadata_flush(ext.dirs.clone()),
+            )
+            .await
+            {
+                tracing::error!("MCP: failed to clean stale initialization state: {error}");
+            }
+            return;
+        }
+
+        // 2 — `state = nextState`.
+        if let Ok(mut slot) = ext.state.lock() {
+            *slot = Some(Arc::clone(&next_state));
+        }
+
+        // 2b — MCP-471's producer, and it has to be here rather than only in `on_event`'s tail.
+        // That tail records the ctx `if let Some(state) = self.state()`, which on the FIRST
+        // `SessionStart` is `None`: the build is spawned, so the handler has long returned by the
+        // time the state exists. Without this line the generation's first consent dialog would run
+        // with `with_human_wait(None)` and forfeit its P-3 budget forgiveness.
+        next_state.set_human_wait_ctx(dispatch_ctx);
+
+        // 3 — the proxy context, BEFORE the dispatcher is installed. Reversed, a tool call landing
+        // in the window between the two would find an installed dispatcher whose `proxy_ctx()` is
+        // still `None` and answer `not_initialized` once, non-deterministically.
+        ext.install_runtime_env(&next_state);
+
+        // 4 — MCP-214's executor, into the slot every tool this generation's `init` registered
+        // closed over. Without it `DirectTool::execute` and `ProxyTool::execute` both take their
+        // `None` arm and answer `MCP not initialized` for the life of the generation.
+        //
+        // `install` is a `OnceLock::set` and a second call is a no-op, which needs no
+        // special-casing precisely because [`crate::dispatch::McpDispatch`] holds a `Weak` and
+        // re-reads `proxy_ctx()` at call time: an instance installed by one generation serves the
+        // next one correctly. An instance that had captured this `ProxyCtx` would route the next
+        // generation's calls into this generation's dead state.
+        if let Some(slot) = ext.dispatch() {
+            slot.install(Arc::new(crate::dispatch::McpDispatch::new(Arc::downgrade(&ext))));
+        }
+
+        // 5 — `nextState.onToolMetadataUpdated = …` (`index.ts:307-316`): the listener that turns a
+        // later `tools/list_changed`, reconnect or `mcp({connect})` into a re-registered surface.
+        ext.install_surface_sync(&next_state);
+
+        // 6 — `syncPromptCommands(); syncToolSurface(ctx)` (`index.ts:316-317`). One call covers
+        // both: `register_surface` registers prompt commands and tools through the same sink.
+        //
+        // THIS is the step that puts the connected servers' tools in front of the model. Landing
+        // step 2 without it commits a runtime nobody can see.
+        ext.sync_tool_surface();
+
+        // 7 — `updateStatusBar(nextState)` (`index.ts:318`).
+        crate::live::update_status_bar(&next_state);
+
+        // 8 — `initPromise = null` (`index.ts:319`), and AFTER the sync rather than before: a
+        // caller arriving during the sync window should join a settled build, not be told there is
+        // no build to join.
+        if let Ok(mut slot) = ext.init_task.lock() {
+            *slot = None;
+        }
+
+        // 9 — `freezeDirectTools` (`index.ts:320-323`). Read from the config the runtime was
+        // actually built from, which is the same document `init` registered the early surface from.
+        if next_state
+            .config
+            .settings
+            .as_ref()
+            .is_some_and(crate::config::McpSettings::freeze_direct_tools)
+        {
+            ext.freeze_direct_tools();
+            tracing::info!(
+                "MCP: direct tools frozen after initial sync — reconnects won't rebuild the \
+                 system prompt; use mcp({{ connect: \"server\" }}) to rediscover"
+            );
+        }
+    }
+
+    /// `startInitialization`'s `.catch` tail (`index.ts:331-349`) — a build that rejected.
+    ///
+    /// The guards are upstream's, in upstream's order, and the two differences from the commit
+    /// tail's triple check are both deliberate:
+    ///
+    /// * it is a **two**-clause generation check, not three — a build whose memo was replaced but
+    ///   whose generation is still live has still failed and still deserves the log line;
+    /// * the memo check admits the `initPromise === null` case, which is how a build that committed
+    ///   and then cleared the slot can still report a *later* failure.
+    async fn fail_initialization(
+        &self,
+        error: &Arc<McpError>,
+        owner: &Arc<McpRuntimeOwner>,
+        oauth_runtime: &Arc<crate::state::OAuthRuntime>,
+        generation: u64,
+        task: &Arc<InitTask>,
+    ) {
+        // `if (!owner.isActive() || generation !== lifecycleGeneration) return;`
+        if !owner.is_active() || self.generation() != generation {
+            return;
+        }
+        // `if (initPromise !== promise && initPromise !== null) return;`
+        if !self.init_task_is(task) && self.init_task().is_some() {
+            return;
+        }
+
+        tracing::error!("MCP initialization failed: {error}");
+        if let Ok(mut slot) = self.init_task.lock() {
+            *slot = None;
+        }
+
+        // `if (state) return;` — a live prior state means the session is still usable and must not
+        // be torn down because a *replacement* build failed.
+        if self.state().is_some() {
+            return;
+        }
+
+        // `await Promise.all([owner.stop(...), shutdownOAuth(oauthRuntime)])`. `begin_stop` rather
+        // than a collapsed `stop().await` so the cancel is observable at call time, and the OAuth
+        // runtime is torn down here because `start_initialization` handed `initialize_mcp` a
+        // runtime it does not own — nothing else will remove its id from the process-global live
+        // set.
+        let stop = owner.begin_stop(Some("MCP initialization failed"));
+        let oauth = crate::oauth::shutdown_oauth(oauth_runtime);
+        let (stop, ()) = futures::future::join(stop, oauth).await;
+        if let Err(error) = stop {
+            tracing::error!("MCP: failed to clean rejected initialization: {error}");
+        }
+    }
+
+    /// `session_start`'s generation protocol, abort-before-await, then the build (MCP-008/MCP-011).
+    ///
+    /// The ordering, and every step of it is load-bearing:
+    ///
+    /// 1. bump the generation, and snapshot the previous state / owner / OAuth runtime out of their
+    ///    slots in the same breath;
+    /// 2. publish the NEW owner and OAuth runtime **before** the drain await, so a call arriving
+    ///    mid-drain fences against the generation that is starting rather than the one that is
+    ///    ending;
+    /// 3. take MCP-015's context snapshot — synchronously, before the first await;
+    /// 4. cancel the previous generation synchronously and then join its drain
+    ///    ([`crate::lifecycle::shutdown_previous_generation`], which is `begin_stop` +
+    ///    `shutdown_state` + `shutdown_oauth`; the cancel happens at call time, not at first poll,
+    ///    which is why that function is a plain `fn`);
+    /// 5. re-check the generation and the owner after the join, and **return** if superseded;
+    /// 6. `startInitialization`, which spawns.
     ///
     /// **Ordering note:** under cyrup's replacement tail the previous generation's
     /// `SessionShutdown` has *already* run when this fires (MCP-014), so the snapshots are normally
     /// `None`. The snapshot-and-stop arm is the defence for the paths where they are not — a
     /// `SessionStart` with no preceding shutdown, or a build that skipped the install tail.
-    async fn on_session_start(&self, _reason: &str) {
+    async fn on_session_start(&self, reason: &str, ctx: &HostCtx) {
         let my_generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let previous_owner = self.owner.lock().ok().and_then(|mut slot| slot.take());
-        let _previous_state = self.state.lock().ok().and_then(|mut slot| slot.take());
+
+        let previous = crate::lifecycle::PreviousGeneration {
+            state: self.state.lock().ok().and_then(|mut slot| slot.take()),
+            owner: self.owner.lock().ok().and_then(|mut slot| slot.take()),
+            oauth: self.oauth_runtime.lock().ok().and_then(|mut slot| slot.take()),
+        };
         if let Ok(mut slot) = self.init_task.lock() {
             *slot = None;
         }
-
-        // Synchronous cancel, then the await — never the other way round.
-        if let Some(owner) = previous_owner {
-            let draining = owner.begin_stop(Some("MCP extension session restarted"));
-            if let Err(error) = draining.await {
-                tracing::error!("MCP: session restart cleanup failed: {error}");
-            }
+        // The env holds a STRONG `Arc<McpState>`; leaving it set would keep the dead generation's
+        // manager, lifecycle and child processes reachable from the dispatcher.
+        if let Ok(mut slot) = self.proxy_ctx.lock() {
+            *slot = None;
         }
 
-        // MCP-008's post-await re-check. A newer generation superseded this one while the previous
-        // owner drained, so this continuation must not become the live runtime — which is what
-        // `startInitialization`'s triple staleness check enforces once MCP-011 lands here.
-        if self.generation() != my_generation {
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let oauth_runtime = crate::oauth::create_oauth_runtime(Some(&owner.token()));
+        if let Ok(mut slot) = self.owner.lock() {
+            *slot = Some(Arc::clone(&owner));
+        }
+        if let Ok(mut slot) = self.oauth_runtime.lock() {
+            *slot = Some(Arc::clone(&oauth_runtime));
+        }
+
+        // MCP-015 — everything ctx-derived is captured HERE, before the first await, and the one
+        // owned clone is what crosses into the spawned build.
+        let snapshot = self.context_snapshot(ctx);
+        let dispatch_ctx = ctx.clone();
+
+        crate::lifecycle::shutdown_previous_generation(
+            previous,
+            crate::lifecycle::SESSION_RESTART_STOP_REASON,
+            crate::lifecycle::SESSION_RESTART_STATE_REASON,
+            "MCP: failed to shut down previous session state",
+            crate::live::metadata_flush(self.dirs.clone()),
+        )
+        .await;
+
+        // The post-await re-check. A newer generation superseded this one while the previous owner
+        // drained, so this continuation must not become the live runtime.
+        if self.generation() != my_generation || !owner.is_active() {
             tracing::debug!(
-                "MCP: session start for generation {my_generation} superseded before initialization"
+                "MCP: session start ({reason}) for generation {my_generation} superseded before \
+                 initialization"
             );
+            return;
         }
+
+        let _ = self.start_initialization(
+            owner,
+            oauth_runtime,
+            snapshot,
+            dispatch_ctx,
+            my_generation,
+            STALE_SESSION_START_STATE_REASON,
+        );
     }
 
     /// `pi.on("input", …)` (`index.ts:489-511`) — converge the keep-alive servers **before** the
@@ -554,27 +1100,57 @@ impl McpExtension {
 
     /// `session_shutdown` — the **only** teardown point (MCP-009, MCP-010).
     ///
-    /// **Minimal body (MCP-009/MCP-010 fill it).** The ordering it must reproduce: bump the
-    /// generation; snapshot and null `state` / `currentOwner` / `currentOAuthRuntime` /
-    /// `initPromise`; `owner.begin_stop("MCP extension session shutdown")` **before** the join;
-    /// then join the owner stop, `shutdown_state` (whose metadata-flush error must win over a
-    /// concurrent shutdown failure) and `shutdown_oauth` together.
+    /// The ordering it reproduces: bump the generation; snapshot and null `state` / `currentOwner`
+    /// / `currentOAuthRuntime` / `initPromise` (and this generation's proxy context, which holds a
+    /// strong handle to the state); `owner.begin_stop("MCP extension session shutdown")`
+    /// **synchronously, before** the join; then join the owner stop, `shutdown_state` — whose
+    /// metadata-flush error must win over a concurrent shutdown failure — and `shutdown_oauth`
+    /// together. [`crate::lifecycle::shutdown_previous_generation`] is all of that.
+    ///
+    /// **This is where the metadata flush the crate docs promise actually happens.** The flush is
+    /// `shutdown_state`'s synchronous prefix, and reaching it requires handing that function the
+    /// generation's state and a real [`crate::live::metadata_flush`] — which is why the handler
+    /// routes through the joined teardown rather than stopping the owner alone.
     ///
     /// cyrup dispatches this as an **awaited** notify *before* the session cancel token fires, so
     /// the handler genuinely gets to finish — better than upstream, and it needs no compensation.
-    async fn on_session_shutdown(&self, _reason: &str) {
+    async fn on_session_shutdown(&self, reason: &str) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        let owner = self.owner.lock().ok().and_then(|mut slot| slot.take());
-        let _state = self.state.lock().ok().and_then(|mut slot| slot.take());
+        let previous = crate::lifecycle::PreviousGeneration {
+            state: self.state.lock().ok().and_then(|mut slot| slot.take()),
+            owner: self.owner.lock().ok().and_then(|mut slot| slot.take()),
+            oauth: self.oauth_runtime.lock().ok().and_then(|mut slot| slot.take()),
+        };
         if let Ok(mut slot) = self.init_task.lock() {
             *slot = None;
         }
-        if let Some(owner) = owner {
-            let draining = owner.begin_stop(Some("MCP extension session shutdown"));
-            if let Err(error) = draining.await {
-                tracing::error!("MCP: session shutdown cleanup failed: {error}");
-            }
+        if let Ok(mut slot) = self.proxy_ctx.lock() {
+            *slot = None;
         }
+        tracing::debug!("MCP: session shutdown ({reason})");
+        crate::lifecycle::shutdown_previous_generation(
+            previous,
+            crate::lifecycle::SESSION_SHUTDOWN_STOP_REASON,
+            crate::lifecycle::SESSION_SHUTDOWN_STATE_REASON,
+            "MCP: session shutdown cleanup failed",
+            crate::live::metadata_flush(self.dirs.clone()),
+        )
+        .await;
+    }
+}
+
+/// [`cyrup_ext::native::ExtMode`] as `ctx.mode`'s string, for
+/// [`crate::runtime::ContextSnapshot::mode`].
+///
+/// Only `"tui"` is load-bearing: [`crate::runtime::ContextSnapshot::is_tui_mode`] is
+/// `has_ui && mode == "tui"`, and that is what gates URL elicitation. The other three exist so a
+/// diagnostic reading the snapshot sees the mode the session is actually in.
+const fn mode_str(mode: cyrup_ext::native::ExtMode) -> &'static str {
+    match mode {
+        cyrup_ext::native::ExtMode::Tui => "tui",
+        cyrup_ext::native::ExtMode::Rpc => "rpc",
+        cyrup_ext::native::ExtMode::Json => "json",
+        cyrup_ext::native::ExtMode::Print => "print",
     }
 }
 
@@ -713,7 +1289,7 @@ impl NativeExtension for McpExtension {
     async fn on_event(&self, ev: &HostEvent, ctx: &HostCtx) -> HookOutcome {
         let outcome = match ev {
             HostEvent::SessionStart { reason, .. } => {
-                self.on_session_start(reason).await;
+                self.on_session_start(reason, ctx).await;
                 HookOutcome::Noop
             }
             HostEvent::Input { .. } => {
@@ -724,7 +1300,33 @@ impl NativeExtension for McpExtension {
                 self.on_session_shutdown(reason).await;
                 HookOutcome::Noop
             }
-            // MCP-045 fills the `isError` override.
+            // `error-signal.ts:13-21` `toolErrorOverride` — re-flag EXACTLY two `details.error`
+            // codes (MCP-045). A failed MCP tool call is RETURNED, not thrown, so without this the
+            // agent records it as a success (`error-signal.ts:4-6`).
+            //
+            // `auth_required` is deliberately NOT one of them (`error-signal.ts:10-11`): it is a
+            // prompt to run `/mcp-auth`, not a tool failure, and flagging it would make the model
+            // retry instead of authenticate.
+            //
+            // The `is_error: false` guard is cyrup-only and observably identical to upstream:
+            // `toolErrorOverride` returns `{isError: true}` for an already-flagged result too, and
+            // `apply_patch` would then write `true` over `true`.
+            HostEvent::ToolResult { details: Some(details), is_error: false, .. }
+                if matches!(
+                    details.get("error").and_then(serde_json::Value::as_str),
+                    Some("tool_error" | "call_failed")
+                ) =>
+            {
+                // `content` / `details` / `usage` stay `None` so `apply_patch`
+                // (`contract.rs:96-113`) leaves them untouched — that is the whole reason the patch
+                // is four `Option`s rather than a replacement.
+                HookOutcome::Mutate(cyrup_ext::EventPatch::ToolResult {
+                    content: None,
+                    details: None,
+                    is_error: Some(true),
+                    usage: None,
+                })
+            }
             _ => HookOutcome::Noop,
         };
         // MCP-471 — record the dispatch context so a consent dialog opened LATER, from a path that
@@ -733,11 +1335,14 @@ impl NativeExtension for McpExtension {
         // `begin_human_wait` guard. `HumanWaitGate::begin` is private to `cyrup-ext` and reachable
         // only through a ctx, so this is the only producer there can be.
         //
-        // AFTER the match, not before: on a `SessionStart` the state does not exist until
-        // `on_session_start` has awaited the build, and the very first thing that could open a
-        // dialog cannot run before that returns. See `McpState::human_wait_ctx` for why storing a
-        // ctx past its own dispatch is sound (the gate is one shared `Arc` per native handle, and
-        // the fields that go stale are never read through this slot).
+        // AFTER the match, and it covers every dispatch EXCEPT the first `SessionStart` — which is
+        // exactly why `commit_initialization` records the ctx itself. `on_session_start` spawns the
+        // build rather than awaiting it (the 5-second dispatch budget drops a handler that outlives
+        // it), so on that first event there is no committed state here to record onto and this
+        // block is a no-op. Every later dispatch refreshes the slot through this line. See
+        // `McpState::human_wait_ctx` for why storing a ctx past its own dispatch is sound (the gate
+        // is one shared `Arc` per native handle, and the fields that go stale are never read
+        // through this slot).
         if let Some(state) = self.state() {
             state.set_human_wait_ctx(ctx);
         }
@@ -1107,6 +1712,582 @@ mod tests {
 
     fn event_ctx() -> HostCtx {
         HostCtx::event(cyrup_ext::native::ExtMode::Tui, true, PathBuf::from("/w"))
+    }
+
+    // --- MCP-036 / MCP-038: the removal half ---------------------------------------------------
+
+    /// A `HostServices` that answers `getActiveTools` from a slot and records every
+    /// `setActiveTools` write and every notice — the three seams the removal half drives. Not
+    /// `RecordingServices`: that backend leaves `active_tools` / `set_active_tools` on their trait
+    /// defaults (`None` / no-op), which is precisely the arm under test.
+    #[derive(Default)]
+    struct ToolSetServices {
+        active: Mutex<Option<Vec<String>>>,
+        writes: Mutex<Vec<Vec<String>>>,
+        notices: Mutex<Vec<String>>,
+    }
+
+    impl ToolSetServices {
+        fn with_active(names: &[&str]) -> Arc<Self> {
+            let services = Arc::new(Self::default());
+            *services.active.lock().unwrap() =
+                Some(names.iter().map(|name| (*name).to_string()).collect());
+            services
+        }
+
+        fn writes(&self) -> Vec<Vec<String>> {
+            self.writes.lock().unwrap().clone()
+        }
+
+        fn notices(&self) -> Vec<String> {
+            self.notices.lock().unwrap().clone()
+        }
+    }
+
+    impl cyrup_ext::host::HostServices for ToolSetServices {
+        fn notify(&self, message: &str, _kind: cyrup_ext::NotifyKind) {
+            self.notices.lock().unwrap().push(message.to_string());
+        }
+        fn active_tools(&self) -> Option<Vec<String>> {
+            self.active.lock().unwrap().clone()
+        }
+        fn set_active_tools(&self, names: &[String]) {
+            *self.active.lock().unwrap() = Some(names.to_vec());
+            self.writes.lock().unwrap().push(names.to_vec());
+        }
+    }
+
+    /// The HA-1 registration handle, recording what a late pass registered.
+    #[derive(Default)]
+    struct RecordingRegistrar {
+        tools: Mutex<Vec<String>>,
+    }
+
+    impl RecordingRegistrar {
+        fn tools(&self) -> Vec<String> {
+            self.tools.lock().unwrap().clone()
+        }
+    }
+
+    impl cyrup_ext::LateRegistrar for RecordingRegistrar {
+        fn register_tool(&self, tool: Arc<dyn cyrup_core::Tool>) -> Result<(), ExtError> {
+            self.tools.lock().unwrap().push(tool.name().to_string());
+            Ok(())
+        }
+        fn register_command(
+            &self,
+            _name: String,
+            _desc: cyrup_ext::CommandDescriptor,
+        ) -> Result<(), ExtError> {
+            Ok(())
+        }
+        fn register_tool_renderer(&self, _tool_name: String) -> Result<(), ExtError> {
+            Ok(())
+        }
+        fn owner(&self) -> ExtensionId {
+            ExtensionId::from(EXTENSION_ID)
+        }
+    }
+
+    fn fallback_names(ext: &McpExtension) -> Vec<String> {
+        ext.fallback_deactivated_tools().lock().unwrap().clone()
+    }
+
+    fn bind_services(ext: &McpExtension, services: &Arc<ToolSetServices>) {
+        ext.set_host_services(
+            Arc::clone(services) as Arc<dyn cyrup_ext::host::HostServices>
+        );
+    }
+
+    /// `index.ts:194-202` — the `setActiveTools` fallback, the only branch cyrup has.
+    #[test]
+    fn a_removed_tool_leaves_the_active_set_and_is_recorded_as_deactivated() {
+        let ext = extension();
+        let services = ToolSetServices::with_active(&["read", "srv_gone"]);
+        bind_services(&ext, &services);
+
+        ext.deactivate_tools(&["srv_gone".to_string()]);
+
+        assert_eq!(services.writes(), vec![vec!["read".to_string()]]);
+        assert_eq!(fallback_names(&ext), vec!["srv_gone".to_string()]);
+    }
+
+    /// `if (nextActiveTools.length !== activeTools.length)` (`index.ts:198`): a name the host never
+    /// had active must not cost a `setActiveTools` write — that call rewrites the agent's tool array
+    /// and the base system prompt — and must not enter the fallback set either.
+    #[test]
+    fn a_tool_that_is_not_in_the_active_set_writes_nothing() {
+        let ext = extension();
+        let services = ToolSetServices::with_active(&["read"]);
+        bind_services(&ext, &services);
+
+        ext.deactivate_tools(&["srv_gone".to_string()]);
+
+        assert!(services.writes().is_empty());
+        assert!(fallback_names(&ext).is_empty());
+    }
+
+    /// `getActiveToolsIfReady()` returning undefined, and the empty-list arm beside it
+    /// (`index.ts:176-184`, `:193-196`): record the fallback, write nothing.
+    #[test]
+    fn no_active_tool_list_records_the_fallback_without_a_write() {
+        let ext = extension();
+        let services = Arc::new(ToolSetServices::default());
+        bind_services(&ext, &services);
+
+        ext.deactivate_tools(&["srv_gone".to_string()]);
+
+        assert!(services.writes().is_empty());
+        assert_eq!(fallback_names(&ext), vec!["srv_gone".to_string()]);
+    }
+
+    /// `index.ts:223-228` — `fallbackDeactivatedTools.delete(name)` returning true IS the gate, and
+    /// a tool that comes back is appended to the active list rather than staying invisible.
+    #[test]
+    fn reactivation_is_gated_on_the_fallback_set() {
+        let ext = extension();
+        let services = ToolSetServices::with_active(&["read", "srv_back"]);
+        bind_services(&ext, &services);
+
+        // Never deactivated: the delete returns false, so nothing is written.
+        ext.reactivate_tool("srv_back");
+        assert!(services.writes().is_empty());
+
+        ext.deactivate_tools(&["srv_back".to_string()]);
+        ext.reactivate_tool("srv_back");
+
+        assert_eq!(
+            services.writes(),
+            vec![
+                vec!["read".to_string()],
+                vec!["read".to_string(), "srv_back".to_string()],
+            ]
+        );
+        assert!(fallback_names(&ext).is_empty());
+    }
+
+    fn late_pass_extension() -> McpExtension {
+        McpExtension::with_config(
+            McpDirs::new(PathBuf::from("/nonexistent/agent"), PathBuf::from("/w")),
+            Some(McpConfig::default()),
+        )
+    }
+
+    /// `PROXY_TOOL_NAME` rides on `surface.tool_names` (`registration.rs:2892`) and is never in
+    /// `known_tools`, so counting the list unfiltered would report an `added` tool — and a UI notice
+    /// — on every proxy-description change. A pass that registered nothing but the proxy is not a
+    /// direct-tool change.
+    #[tokio::test]
+    async fn the_proxy_tool_is_not_counted_as_an_added_direct_tool() {
+        let ext = late_pass_extension();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+
+        let registrar = Arc::new(RecordingRegistrar::default());
+        ext.set_late_registrar(Arc::clone(&registrar) as Arc<dyn cyrup_ext::LateRegistrar>);
+        let services = ToolSetServices::with_active(&["read"]);
+        bind_services(&ext, &services);
+        // `should_register_proxy` compares against this slot, so clearing it is what puts
+        // `PROXY_TOOL_NAME` back onto `surface.tool_names` for this pass.
+        *ext.proxy_tool_description().lock().unwrap() = None;
+
+        assert!(!ext.sync_tool_surface());
+        assert_eq!(registrar.tools(), vec![crate::registration::PROXY_TOOL_NAME.to_string()]);
+        assert!(services.notices().is_empty());
+    }
+
+    /// `index.ts:233-237` + `:257-263` — a previously-registered tool absent from the new
+    /// resolution is deactivated, dropped from `registeredDirectTools` by the adoption, and counted
+    /// in the one notice.
+    #[tokio::test]
+    async fn a_vanished_direct_tool_is_deactivated_dropped_and_notified() {
+        let ext = late_pass_extension();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+
+        ext.set_late_registrar(
+            Arc::new(RecordingRegistrar::default()) as Arc<dyn cyrup_ext::LateRegistrar>
+        );
+        let services = ToolSetServices::with_active(&["read", "srv_ghost"]);
+        bind_services(&ext, &services);
+        // The model is currently shown a tool the config and cache no longer resolve.
+        ext.registered_direct_tools()
+            .lock()
+            .unwrap()
+            .insert("srv_ghost".to_string(), "fingerprint".to_string());
+
+        assert!(ext.sync_tool_surface());
+
+        assert_eq!(services.writes(), vec![vec!["read".to_string()]]);
+        assert_eq!(
+            services.notices(),
+            vec!["MCP: direct tools refreshed (+0, ~0, -1)".to_string()]
+        );
+        assert_eq!(fallback_names(&ext), vec!["srv_ghost".to_string()]);
+        // Upstream's `registeredDirectTools.delete(toolName)` is cyrup's wholesale adoption.
+        assert!(ext.registered_direct_tools().lock().unwrap().is_empty());
+    }
+
+    // ── `startInitialization` and the commit tail (`index.ts:292-350`, MCP-011) ───────────────
+
+    fn session_start_event() -> HostEvent {
+        HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }
+    }
+
+    /// A memoised build that is already settled, so the commit tail can be driven directly.
+    fn settled_task(state: &Arc<McpState>) -> Arc<InitTask> {
+        let state = Arc::clone(state);
+        Arc::new(async move { Ok(state) }.boxed().shared())
+    }
+
+    /// **The wiring proof.** A `SessionStart` must reach [`crate::runtime::initialize_mcp`] and
+    /// commit what it built — which before MCP-011 it did not: `on_session_start` bumped the
+    /// generation, tore the previous one down and returned, so `init_task` was written to `None` at
+    /// two sites and to `Some` at none, and no configured server ever connected in production.
+    ///
+    /// The build is **spawned**, so the handler returns before it settles and the assertions poll.
+    /// That is the point, not a wrinkle: the native dispatch budget drops a handler future that
+    /// outlives it, and `initialize_mcp` connects subprocesses.
+    #[tokio::test]
+    async fn a_session_start_builds_the_runtime_and_runs_the_commit_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        // A programmatic config, so the build is hermetic: `initialize_mcp` skips discovery
+        // entirely and cannot reach the developer's real `~/.config/mcp/mcp.json`.
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            Some(McpConfig::default()),
+        )
+        .with_home(dir.path().to_path_buf())
+        .into_arc();
+
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+        assert!(ext.state().is_none() && ext.proxy_ctx().is_none() && ext.owner().is_none());
+
+        assert!(matches!(
+            ext.on_event(&session_start_event(), &event_ctx()).await,
+            HookOutcome::Noop
+        ));
+        assert_eq!(ext.generation(), 1, "the handler bumps the generation");
+        // Published BEFORE the drain await, so a call arriving mid-start fences against the
+        // generation that is starting.
+        let owner = ext.owner().expect("the new generation's owner is published synchronously");
+        assert!(owner.is_active());
+
+        let state = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                if let Some(state) = ext.state() {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the spawned build must settle and COMMIT — check `init_task` was memoised");
+
+        // The commit tail's two installers, both of which had zero call sites before this unit.
+        assert!(
+            ext.proxy_ctx().is_some(),
+            "`install_runtime_env` must run, or the dispatcher answers `not_initialized` forever"
+        );
+        assert!(
+            state.on_tool_metadata_updated.lock().unwrap().is_some(),
+            "`install_surface_sync` must run, or a later connect never reaches the model"
+        );
+        assert!(
+            ext.dispatch().is_some_and(|slot| slot.is_installed()),
+            "MCP-214's executor must be installed, or every registered MCP tool answers \
+             `MCP not initialized` for the life of the generation"
+        );
+        // `initPromise = null`, and only after the surface sync.
+        assert!(ext.init_task().is_none(), "the memo is cleared once the build has committed");
+        // MCP-471's producer for the first `SessionStart`: `on_event`'s tail cannot cover it,
+        // because the state did not exist when that tail ran.
+        assert!(
+            state.human_wait_ctx.lock().unwrap().is_some(),
+            "the commit tail records the dispatch ctx the first turn's consent dialog needs"
+        );
+
+        // The symmetric teardown takes all four slots, including the OAuth runtime — without which
+        // every session would leak one process-global live-runtime id.
+        ext.on_session_shutdown("quit").await;
+        assert_eq!(ext.generation(), 2);
+        assert!(ext.state().is_none() && ext.owner().is_none() && ext.proxy_ctx().is_none());
+        assert!(ext.oauth_runtime.lock().unwrap().is_none());
+        assert!(!owner.is_active(), "the generation's owner is stopped, not merely dropped");
+    }
+
+    /// A real stdio MCP server, as an `sh` script — the same fixture runtime `runtime.rs`'s
+    /// `TINY_MCP` and `server_manager.rs`'s child-process tests use, so it adds no host dependency.
+    ///
+    /// `$1` is the protocol version to echo back (passed positionally rather than through `env`,
+    /// because a stdio server's `env` REPLACES the child's environment and `sh` needs `PATH`), and
+    /// `$2` is a marker file it touches on start, so "a child process really ran" is checkable from
+    /// the outside.
+    const LIVE_MCP: &str = r#"
+: > "$2"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":{"tools":{}},"serverInfo":{"name":"fixture","version":"1"}}}\n' "$id" "$1"
+      ;;
+    *'"method":"tools/list"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}}}]}}\n' "$id"
+      ;;
+    *'"method":"notifications/'*) : ;;
+    *)
+      if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
+      ;;
+  esac
+done
+"#;
+
+    /// **A server listed in `mcp.json` connects because a session started.** A real child process
+    /// is spawned, completes the MCP `initialize` handshake, and the generation's state records the
+    /// live connection.
+    ///
+    /// Every link this unit added is on the path and none can be faked: `on_session_start` must
+    /// build a [`crate::runtime::ContextSnapshot`] and call [`McpExtension::start_initialization`];
+    /// `start_initialization` must memoise the build **and spawn its driver** (a `Shared` nobody
+    /// polls never runs); and [`McpExtension::commit_initialization`] must survive the staleness
+    /// check and publish the state. Before this unit, [`crate::runtime::initialize_mcp`] had no
+    /// production caller at all and this test could not have been written.
+    ///
+    /// # What this test deliberately does NOT assert, and where that IS asserted
+    ///
+    /// That the discovered catalog reaches the MODEL. It does — discovery (MCP-119) issues
+    /// `tools/list` from `post_handshake` and `initialize_mcp`'s metadata build records the result
+    /// — but "reaches the model" is a claim about a live session's tool array, and this test has an
+    /// `McpExtension` and a child process, not an assembled `AgentSession`. Asserting it from here
+    /// would mean asserting on `state.tool_metadata`, which is one hop short of the thing that
+    /// matters and would pass just as happily with the surface sync broken.
+    ///
+    /// `crates/cyrup-it/tests/mcp/live_tool_call.rs` is where it is asserted, against a real
+    /// session: `the_live_surface_carries_the_servers_discovered_catalog` takes the same fixture
+    /// server's `tools/list` answer through `state.tool_metadata["fixture"]` (`name ==
+    /// "fixture_echo"`, `original_name == "echo"`, the server's own description and schema) and out
+    /// into the tool array the agent hands the provider, and
+    /// `a_model_issued_direct_tool_call_returns_the_servers_own_result` calls it and reads
+    /// `echoed:pong` back off the child.
+    ///
+    /// Multi-threaded on purpose: there is a real child process, a real stdio transport and a
+    /// stderr pump behind this.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_session_start_connects_a_configured_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("fixture-started");
+        let config: McpConfig = serde_json::from_value(serde_json::json!({
+            "mcpServers": {
+                "fixture": {
+                    "command": "sh",
+                    "args": [
+                        "-c",
+                        LIVE_MCP,
+                        "sh",
+                        rmcp::model::ProtocolVersion::LATEST.as_str(),
+                        marker.to_string_lossy(),
+                    ],
+                }
+            }
+        }))
+        .unwrap();
+
+        let ext = McpExtension::with_config(
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            Some(config),
+        )
+        .with_home(dir.path().to_path_buf())
+        .into_arc();
+        let mut api = InitApi::new();
+        ext.init(&mut api).await.unwrap();
+
+        // The whole of the production trigger: one `SessionStart`.
+        let _ = ext.on_event(&session_start_event(), &event_ctx()).await;
+
+        // `mcp-cache.json` does not exist in this tempdir, so `initialize_mcp` sets
+        // `bootstrap_all` and the startup pass connects every enabled server once. The connection
+        // map is written by that pass, which runs inside the SPAWNED build — so the wait is real
+        // and not a formality.
+        let state = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if let Some(state) = ext.state()
+                    && state.manager.get_connection("fixture").is_some_and(|connection| {
+                        connection.status() == crate::lifecycle::ConnectionStatus::Connected
+                    })
+                {
+                    return state;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("a configured server must connect when a session starts");
+
+        // Three independent facts, because each catches a different break.
+        assert!(marker.exists(), "a real child process ran");
+        assert!(
+            state.server_instructions.lock().is_ok(),
+            "the generation's state is the one the connect ran against"
+        );
+        // §9's cold-cache bootstrap ran, which is what set `bootstrap_all` and made this an
+        // unconditional startup connect rather than a lazy one.
+        assert!(
+            dir.path().join("mcp-cache.json").exists(),
+            "the cold-cache bootstrap writes an empty cache before the startup pass"
+        );
+        // The commit tail ran on the state that owns this connection.
+        assert!(ext.proxy_ctx().is_some());
+        assert!(state.on_tool_metadata_updated.lock().unwrap().is_some());
+
+        // Teardown drains the child through the owner's cleanup stack.
+        ext.on_session_shutdown("quit").await;
+        assert!(ext.state().is_none());
+        assert!(
+            state.manager.get_connection("fixture").is_none(),
+            "`shutdown_previous_generation` really drains the generation's children — the \
+             graceful shutdown closes the connection and removes it from the map"
+        );
+    }
+
+    /// The triple staleness check (`index.ts:305`), one clause at a time. Every clause must SHUT
+    /// THE NEW STATE DOWN rather than commit it — a leaked state keeps a live server manager, its
+    /// children and its lifecycle timers running with nothing able to reach them.
+    #[tokio::test]
+    async fn a_stale_build_is_shut_down_instead_of_committed() {
+        let ext = extension().into_arc();
+
+        // Clause 2 — a newer generation started while the build ran.
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let state = input_state(Arc::clone(&owner));
+        let task = settled_task(&state);
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
+        McpExtension::commit_initialization(
+            Arc::clone(&ext),
+            Arc::clone(&state),
+            &owner,
+            &event_ctx(),
+            ext.generation() + 1,
+            &task,
+            STALE_SESSION_START_STATE_REASON,
+        )
+        .await;
+        assert!(ext.state().is_none() && ext.proxy_ctx().is_none());
+        assert!(!owner.is_active(), "the orphaned runtime is torn down, not leaked");
+
+        // Clause 3 — a second build inside the SAME generation superseded the memo. This is the
+        // clause an `Arc::ptr_eq` exists for: the two `Shared`s have equal *values* and different
+        // identities, and without the check both commits would land.
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let state = input_state(Arc::clone(&owner));
+        let mine = settled_task(&state);
+        let theirs = settled_task(&state);
+        assert!(!Arc::ptr_eq(&mine, &theirs));
+        *ext.init_task.lock().unwrap() = Some(theirs);
+        McpExtension::commit_initialization(
+            Arc::clone(&ext),
+            Arc::clone(&state),
+            &owner,
+            &event_ctx(),
+            ext.generation(),
+            &mine,
+            STALE_SESSION_START_STATE_REASON,
+        )
+        .await;
+        assert!(ext.state().is_none(), "the superseded build must not commit");
+
+        // Clause 1 — the owner was stopped while the build ran.
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let state = input_state(Arc::clone(&owner));
+        let task = settled_task(&state);
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
+        owner.begin_stop(Some("session replaced")).await.unwrap();
+        McpExtension::commit_initialization(
+            Arc::clone(&ext),
+            state,
+            &owner,
+            &event_ctx(),
+            ext.generation(),
+            &task,
+            STALE_SESSION_START_STATE_REASON,
+        )
+        .await;
+        assert!(ext.state().is_none() && ext.proxy_ctx().is_none());
+
+        // And the live case commits, so the three assertions above are about staleness rather than
+        // about the tail never working.
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let state = input_state(Arc::clone(&owner));
+        let task = settled_task(&state);
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
+        McpExtension::commit_initialization(
+            Arc::clone(&ext),
+            Arc::clone(&state),
+            &owner,
+            &event_ctx(),
+            ext.generation(),
+            &task,
+            STALE_SESSION_START_STATE_REASON,
+        )
+        .await;
+        assert!(ext.state().is_some() && ext.proxy_ctx().is_some());
+        assert!(state.on_tool_metadata_updated.lock().unwrap().is_some());
+    }
+
+    /// A build that rejects must report once and tear its own generation down — but must NOT tear
+    /// down a *live* prior state, because a session that already has a runtime is still usable.
+    #[tokio::test]
+    async fn a_rejected_build_tears_down_only_its_own_generation() {
+        let ext = extension().into_arc();
+        let error = Arc::new(McpError::other("no"));
+
+        // With a live state, `if (state) return;` — the owner survives.
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let state = input_state(Arc::clone(&owner));
+        let oauth = crate::oauth::create_oauth_runtime(None);
+        let task = settled_task(&state);
+        *ext.state.lock().unwrap() = Some(Arc::clone(&state));
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
+        ext.fail_initialization(&error, &owner, &oauth, ext.generation(), &task).await;
+        assert!(owner.is_active(), "a replacement build's failure must not kill the live session");
+        assert!(ext.init_task().is_none(), "`initPromise = null` still runs");
+
+        // With no state, the generation is stopped and its OAuth runtime shut down.
+        *ext.state.lock().unwrap() = None;
+        let task = settled_task(&state);
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
+        ext.fail_initialization(&error, &owner, &oauth, ext.generation(), &task).await;
+        assert!(!owner.is_active());
+
+        // A superseded generation reports nothing and touches nothing.
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let task = settled_task(&state);
+        *ext.init_task.lock().unwrap() = Some(Arc::clone(&task));
+        ext.fail_initialization(&error, &owner, &oauth, ext.generation() + 1, &task).await;
+        assert!(owner.is_active());
+        assert!(ext.init_task().is_some(), "a stale failure must not clear the live memo");
+    }
+
+    /// `ContextSnapshot`'s `cwd` is the extension's own, never the ctx's: the servers' working
+    /// directory and the directory their config and metadata cache are read from must be one value.
+    #[test]
+    fn the_context_snapshot_takes_its_cwd_from_the_dirs_not_the_ctx() {
+        let ext = extension();
+        let snapshot = ext.context_snapshot(&HostCtx::event(
+            cyrup_ext::native::ExtMode::Print,
+            false,
+            PathBuf::from("/somewhere/else"),
+        ));
+        assert_eq!(snapshot.cwd, PathBuf::from("/w"));
+        assert_eq!(snapshot.mode, "print");
+        assert!(!snapshot.has_ui && !snapshot.is_tui_mode());
+        assert!(
+            snapshot.initial_signal.is_none(),
+            "`on_event` carries no cancellation token; there is no producer to read one from"
+        );
+
+        let tui = ext.context_snapshot(&event_ctx());
+        assert!(tui.has_ui && tui.is_tui_mode(), "URL elicitation is gated on exactly this");
     }
 
     fn input_state(owner: Arc<McpRuntimeOwner>) -> Arc<McpState> {

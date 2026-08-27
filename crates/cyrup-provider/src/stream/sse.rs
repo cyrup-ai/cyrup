@@ -158,6 +158,7 @@ impl SseRequest {
         }
     }
 
+    #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name.into(), Some(value.into()));
         self

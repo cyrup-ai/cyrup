@@ -1457,9 +1457,20 @@ impl SessionBuilder {
         // Shared with `host_services` so a loaded guest's `setActiveTools`/`getActiveTools`
         // capability read+mutates the SAME authoritative active-tool view the host/CLI toggle uses
         // (Pi binds both to `agent.state.tools`, agent-session.ts:2281,2283).
+        //
+        // The active set is seeded from `active_tools` — the MERGED set, which is the very array
+        // `.tools(active_tools)` hands the agent below — and NOT from `base_tools`. The two differ
+        // by exactly the extension-contributed tools, and `DynamicToolState::set_active` rebuilds
+        // `agent.state.tools` from `self.active` alone, with no second merge anywhere. Seeded from
+        // `base_tools`, the first live re-registration by ANY extension (`merge_registered` ->
+        // `set_active(&self.active + new names)`) therefore rewrote the agent's array WITHOUT every
+        // extension tool registered at `init` — silently evicting them for the rest of the session.
+        // Pi has no such gap: its `nextActiveToolNames` starts from `getActiveToolNames()`, which
+        // reads the live `agent.state.tools` (`core/agent-session.ts:2524-2545`), so an extension
+        // tool present at build is present in the rebuild.
         let dynamic_tools = Arc::new(std::sync::Mutex::new(crate::tools::DynamicToolState::new(
             registry_tools,
-            base_tools.clone(),
+            active_tools.clone(),
             crate::tools::PromptRebuilder::new(rebuild_base, contributions),
         )));
         host_services.attach_dynamic_tools(dynamic_tools.clone());

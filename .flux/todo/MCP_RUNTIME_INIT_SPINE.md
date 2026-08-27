@@ -1,7 +1,7 @@
 ---
-stage: aug
-status: done
-updated: 2026-08-27 06:00
+stage: exec
+status: in-progress
+updated: 2026-08-27 10:30
 ---
 
 # The Initialization Spine And The One Production `ProxyEnv`
@@ -101,6 +101,105 @@ This decides §9 and §10 step 6, and getting it backwards destroys usable cache
 [§9](#the-body-in-order).
 
 ---
+
+## SECOND DECAY — this task's coordinates moved again on 2026-08-27, hours after the last pass
+
+The section above re-pinned this file at **06:00** today. Two commits landed on this branch
+after that, and both rewrote files this task cites heavily:
+
+| commit | what it did | effect here |
+|---|---|---|
+| `d4f7392` (07:30) | collapsed the duplicate tool-name grammar into `registration.rs`; closed the 401 JSON-RPC hole in `runtime.rs` | `registration.rs` **+174 lines**, `runtime.rs` **+506 lines** |
+| `924dcdc` (09:00) | applied `includeTools` in the reader (`cyrup-ext-subagents`), cleared `cyrup-provider` clippy | no cyrup-mcp effect |
+
+**Measured, not assumed.** This file carries **233 file:line citations across 28 files**. Sixty-four
+of them land in files `d4f7392` rewrote. Of the citations that name an identifier checkable against
+the tree, **29 point at the wrong line now**.
+
+### There is no mechanical fix — do not apply an offset
+
+The obvious repair is a constant shift per file. It does not work, because both files took
+insertions at several points rather than one block:
+
+```
+registration.rs   is_tool_allowed +104   valid_entry +104   MetadataCache +104
+                  CandidateIndex   +99   register_surface +15
+runtime.rs        DIRECT_TOOLS_NONE_SENTINEL  -7   HandlerFactory +15
+                  NoStoredCredentials       +393   with_handler_factory +415
+```
+
+Every citation into `registration.rs` and `runtime.rs` must be re-read individually before it is
+followed. Citations into the other 26 files were verified at 06:00 and are untouched by these two
+commits — `proxy/env.rs`, `state.rs`, `extension.rs`, `lifecycle.rs`, `dirs.rs`, `renderers.rs`,
+`config.rs`, `owner.rs`, `server_manager.rs`, `proxy/discovery.rs`, `proxy/auth.rs` and
+`proxy/testsupport.rs` all still hold.
+
+### Corrected positions, re-read today
+
+| identifier | file | this task says | actually |
+|---|---|---|---|
+| `is_tool_allowed` | `registration.rs` | 458 | **562** |
+| `resource_base_tool_name` | `registration.rs` | 511 | **615** |
+| `MetadataCache` | `registration.rs` | 612 | **716** |
+| `ServerCacheEntry` | `registration.rs` | 612, 626 | **730** |
+| `is_server_cache_valid` | `registration.rs` | 860 | **964** |
+| `valid_entry` | `registration.rs` | 884 | **988** |
+| `has_tool_filters` | `registration.rs` | 1062 | **1166** |
+| `build_candidate_index` | `registration.rs` | 1071 | **1175** |
+| `CandidateIndex` | `registration.rs` | 366 | **465** |
+| `missing_configured_direct_tool_servers` | `registration.rs` | 985 | **1089** |
+| `resolve_cached_prompts` | `registration.rs` | 1803 | **1907** |
+| `direct_tool_fingerprints` | `registration.rs` | 1920 | **2024** |
+| `should_register_tool` | `registration.rs` | 2161 | **2073** |
+| `should_register_proxy` | `registration.rs` | 2032 | **2079** |
+| `LateSink` | `registration.rs` | 2021 | **2125** |
+| `register_surface` | `registration.rs` | 2161 | **2176** |
+| `try_compute_server_hash` (call site) | `registration.rs` | 860, 884 | **912** |
+| `build_client_capabilities` | `runtime.rs` | 1220 | **1613** |
+| `McpClientHandlerParts` | `runtime.rs` | 1220, 1403 | **1796** |
+| `runtime_signal` | `runtime.rs` | 208, 253 | **1802** |
+| `NoStoredCredentials` | `runtime.rs` | 1913 | **2306** |
+| `ConnectionBuilder` | `runtime.rs` | 193, 1913 | **2670** |
+| `with_handler_factory` | `runtime.rs` | 2296 | **2711** |
+| `with_auth_provider` | `runtime.rs` | 1913 | **2718** |
+| `HandlerFactory` | `runtime.rs` | 2312 | **2327** |
+| `DIRECT_TOOLS_NONE_SENTINEL` | `runtime.rs` | 314 | **307** |
+| `from_config` | `ui.rs` | 4614, 4663 | **4629** |
+
+### One signature changed, and C0 calls it
+
+`resolve_tool_prefix` now takes `Option<&ServerEntry>`, not `&ServerEntry`
+([`registration.rs:248`](../../crates/cyrup-mcp/src/registration.rs)) — upstream's
+`definition?: Pick<ServerEntry, "toolPrefix">` made optional, so a tool name resolved for a server
+with no `mcpServers` entry falls through to the global mode instead of being unrepresentable.
+**Every call C0 prescribes must pass `Some(entry)`.**
+
+Candidate sets are also `IndexSet<String>` now, not `HashSet` — `proxy/approval.rs` reads insertion
+order to decide which server is named first. Anything C0 writes against `CandidateIndex` inherits
+that, and `remove` is `shift_remove`.
+
+### C0's argument is stronger than when it was written
+
+C0 places `build_tool_metadata` in `registration.rs` "because that file already owns every helper
+they need". When that was written the grammar existed in **four** copies. `d4f7392` deleted the
+`proxy/tool_metadata.rs` copy (420 lines to 111, now a `pub use` block) and repointed six files at
+`registration.rs`. It is now the **sole** definition, so putting the walk anywhere else would fork
+the one thing that was just de-forked. Follow C0 as written.
+
+### Confirmed unchanged
+
+`ProxyEnv` still has **exactly 32 methods** ([`proxy/env.rs`](../../crates/cyrup-mcp/src/proxy/env.rs)) —
+the 06:00 count holds, and `proxy/env.rs` was not touched by either commit. The `proxy.rs` remap
+table above is still correct: those rows are deliberate "was here, now there" entries, not live
+citations.
+
+### A note for whoever writes the next revision of this file
+
+This task has now decayed twice in one day, both times because our own merged work moved the code
+underneath it. The citations that survived are the ones anchored to things that do not move —
+`MCP-###` port units, upstream `file:line` at the pinned `v2.26.1` tag, and named functions. The
+ones that rotted are local line numbers. Prefer naming the function and letting the reader grep.
+
 
 ## Verification pass — every premise re-checked against the tree on 2026-08-27
 

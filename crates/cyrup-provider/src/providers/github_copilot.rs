@@ -454,6 +454,7 @@ impl GitHubCopilotOAuth {
 
     /// Override the ambient auth context (for tests / custom env sources), mirroring
     /// [`WireProvider::with_auth_context`].
+    #[must_use]
     pub fn with_auth_context(mut self, ctx: Arc<dyn AuthContext>) -> Self {
         self.auth_ctx = ctx;
         self

@@ -73,6 +73,7 @@ use crate::config::{
     BoolOrList, McpConfig, McpSettings, ServerEntry, ToolPrefix, ToolResultRendering,
 };
 use crate::dirs::McpDirs;
+use crate::proxy::ToolMetadata;
 use crate::proxy::constants::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 
 // ---------------------------------------------------------------------------------------------
@@ -459,20 +460,48 @@ pub fn matches_tool_pattern(candidates: &IndexSet<String>, patterns: &[String]) 
 /// subtract the current tool's own candidates when building it; the subtraction happens in
 /// `has_other_current_match`, by comparing match counts.
 ///
-/// `additionalCurrentCandidatesByToolName` is deliberately absent: it exists only for
-/// `tool-metadata.ts`'s speculative arms (MCP-207), and `direct-tools.ts` never supplies it.
+/// `additionalCurrentCandidatesByToolName` (`types.ts:813`) is the index's second table and
+/// belongs to [`build_tool_metadata`]'s speculative arm alone (MCP-207): when a configured server
+/// has no metadata yet, upstream guesses the names it *would* mint for the tools being evaluated
+/// and files them under the tool they were guessed for, so a legacy alias is suppressed by a
+/// collision that has not happened yet. `direct-tools.ts` never supplies it, so it stays empty for
+/// every index [`build_candidate_index`] mints and no existing behaviour changes.
 #[derive(Debug, Default)]
 pub struct CandidateIndex {
     all_current: IndexSet<String>,
+    /// `additionalCurrentCandidatesByToolName` — keyed by the *evaluated* tool name, which is why
+    /// [`CandidateIndex::has_other_current_match`] needs a `tool_name` it never used to.
+    additional_by_tool: HashMap<String, IndexSet<String>>,
     matcher: HashMap<String, Option<Regex>>,
     matching_count: HashMap<String, usize>,
 }
 
 impl CandidateIndex {
-    /// `types.ts` `createToolSelectorCandidateIndex`.
+    /// `types.ts` `createToolSelectorCandidateIndex(candidates)` — upstream's second argument
+    /// omitted, i.e. no `additionalCurrentCandidatesByToolName`.
     #[must_use]
     pub fn new(all_current: IndexSet<String>) -> Self {
-        Self { all_current, matcher: HashMap::new(), matching_count: HashMap::new() }
+        Self {
+            all_current,
+            additional_by_tool: HashMap::new(),
+            matcher: HashMap::new(),
+            matching_count: HashMap::new(),
+        }
+    }
+
+    /// `types.ts` `createToolSelectorCandidateIndex(candidates, additionalCandidatesByToolName)` —
+    /// the two-argument form, which only [`build_tool_metadata`] uses.
+    #[must_use]
+    pub fn with_additional(
+        all_current: IndexSet<String>,
+        additional_by_tool: HashMap<String, IndexSet<String>>,
+    ) -> Self {
+        Self {
+            all_current,
+            additional_by_tool,
+            matcher: HashMap::new(),
+            matching_count: HashMap::new(),
+        }
     }
 
     /// `types.ts` `ToolSelectorCandidateIndex.allCurrentCandidates` — the readonly view of the set
@@ -485,33 +514,59 @@ impl CandidateIndex {
 
     /// `types.ts` `indexHasOtherCurrentMatch` — does `pattern` name a *different* tool's current
     /// name?
+    ///
+    /// Membership is upstream's `hasCandidate` (`types.ts:853-854`): the whole-index set **or**
+    /// the additional set filed under `tool_name`. It reaches three places, all of them
+    /// load-bearing — the literal arm's test, the glob arm's total (the additional candidates that
+    /// are not already in `all_current` count too, `types.ts:875-879`), and the glob arm's
+    /// self-match subtraction (`types.ts:883-885`).
     fn has_other_current_match(
         &mut self,
+        tool_name: &str,
         current_candidates: &IndexSet<String>,
         pattern: &str,
     ) -> bool {
+        // Destructured so the memo tables can be borrowed mutably while `all_current` and the
+        // additional set are borrowed shared — they are disjoint fields, which a `self.` path
+        // cannot express.
+        let Self { all_current, additional_by_tool, matcher, matching_count } = self;
+        let additional = additional_by_tool.get(tool_name);
+        let has_candidate = |candidate: &str| {
+            all_current.contains(candidate)
+                || additional.is_some_and(|extra| extra.contains(candidate))
+        };
+
         if !is_glob(pattern) {
-            return self.all_current.contains(pattern) && !current_candidates.contains(pattern);
+            return has_candidate(pattern) && !current_candidates.contains(pattern);
         }
 
-        let all_current = &self.all_current;
-        let matcher = self
-            .matcher
-            .entry(pattern.to_string())
-            .or_insert_with(|| glob_to_regex(pattern))
-            .as_ref();
+        let matcher =
+            matcher.entry(pattern.to_string()).or_insert_with(|| glob_to_regex(pattern)).as_ref();
         let Some(matcher) = matcher else {
             return false;
         };
-        let total = *self.matching_count.entry(pattern.to_string()).or_insert_with(|| {
+        // Only the whole-index count is memoised, exactly as upstream memoises it: the additional
+        // set is per-tool, so folding it into `matchingCountByPattern` would poison the memo for
+        // the next tool that reuses the same pattern.
+        let mut total = *matching_count.entry(pattern.to_string()).or_insert_with(|| {
             all_current.iter().filter(|candidate| matcher.is_match(candidate)).count()
         });
+        if let Some(additional) = additional {
+            total = total.saturating_add(
+                additional
+                    .iter()
+                    .filter(|candidate| {
+                        !all_current.contains(*candidate) && matcher.is_match(candidate)
+                    })
+                    .count(),
+            );
+        }
         if total == 0 {
             return false;
         }
         let current = current_candidates
             .iter()
-            .filter(|candidate| all_current.contains(*candidate) && matcher.is_match(candidate))
+            .filter(|candidate| has_candidate(candidate) && matcher.is_match(candidate))
             .count();
         total > current
     }
@@ -552,7 +607,7 @@ fn matches_tool_selector(
     }
     patterns.iter().any(|pattern| {
         matches_tool_pattern(&legacy, std::slice::from_ref(pattern))
-            && !index.has_other_current_match(&current, pattern)
+            && !index.has_other_current_match(tool_name, &current, pattern)
     })
 }
 
@@ -985,7 +1040,13 @@ pub fn is_server_cache_valid(
 }
 
 /// The valid cache entry for `server_name`, or `None` — the exact guard every loop below opens with.
-fn valid_entry<'a>(
+///
+/// `pub(crate)` for MCP-021: `live::rehydrate_from_cache` opens with the identical
+/// `cachedEntry && isServerCacheValid(cachedEntry, definition)` test (`init.ts:256`), and
+/// re-deriving it there — in particular by reaching for `dirs::try_compute_server_hash` instead of
+/// the [`server_hasher`] seam [`is_server_cache_valid`] already goes through — is the reader/writer
+/// hash drift this module exists to prevent.
+pub(crate) fn valid_entry<'a>(
     cache: Option<&'a MetadataCache>,
     server_name: &str,
     definition: &ServerEntry,
@@ -1354,6 +1415,461 @@ pub fn resolve_direct_tools(
     }
 
     specs
+}
+
+// ---------------------------------------------------------------------------------------------
+// 4b. `buildToolMetadata` / `reconstructToolMetadata` — `state.toolMetadata`'s two writers
+//     (MCP-207)
+// ---------------------------------------------------------------------------------------------
+
+/// `ui-app-bridge-helpers.ts:5` `RESOURCE_URI_META_KEY`.
+const RESOURCE_URI_META_KEY: &str = "ui/resourceUri";
+
+/// `ui-tool-visibility.ts:3` `extractUiToolVisibility(meta)` — the **live** half of MCP-208, over a
+/// server's raw `_meta` map instead of a cache entry's already-extracted array.
+///
+/// Every malformed arm answers `Some(vec![])` rather than `None`, and that is the fail-closed
+/// direction: an empty list does not contain `"model"`, so a tool whose `ui.visibility` is present
+/// but unreadable is hidden from the model rather than shown to it. `None` means the server said
+/// nothing at all, which is the only value that reads as "visible".
+fn extract_ui_tool_visibility(
+    meta: Option<&serde_json::Map<String, Value>>,
+) -> Option<Vec<String>> {
+    // `!ui || typeof ui !== "object" || Array.isArray(ui)` — an array `ui` is rejected *here* even
+    // though `getNestedResourceUri` accepts one.
+    let Some(Value::Object(ui)) = meta?.get("ui") else {
+        return None;
+    };
+    // `visibility === undefined` — an explicit `null` is not `undefined` and falls through to `[]`.
+    let visibility = ui.get("visibility")?;
+    let Value::Array(entries) = visibility else {
+        return Some(Vec::new());
+    };
+    let mut values: Vec<String> = Vec::new();
+    for entry in entries {
+        // `if (entry !== "model" && entry !== "app") return []` — ONE bad entry voids the list.
+        let Some(text @ ("model" | "app")) = entry.as_str() else {
+            return Some(Vec::new());
+        };
+        if !values.iter().any(|value| value == text) {
+            values.push(text.to_string());
+        }
+    }
+    Some(values)
+}
+
+/// `ui-app-bridge-helpers.ts:7-23` `getToolUiResourceUri(tool)`, reduced to the one observable that
+/// survives Cut 2: whether it **throws**.
+///
+/// [`ToolMetadata`] carries no `uiResourceUri` — MCP Apps are cut — so the extracted value has
+/// nowhere to go. The throw does: `tool-metadata.ts:100-104` catches it and pushes the tool's name
+/// onto `failedTools`, and the tool is still registered without its URI. Answering `bool` rather
+/// than `Result<Option<String>, _>` keeps that the only thing this computes.
+fn ui_resource_uri_is_invalid(meta: Option<&serde_json::Map<String, Value>>) -> bool {
+    let Some(meta) = meta else {
+        return false;
+    };
+    // `getNestedResourceUri`: `ui.resourceUri` when `ui` is an object. An array `ui` reaches this
+    // upstream too (`typeof [] === "object"`), where it simply has no `resourceUri` key.
+    let nested = match meta.get("ui") {
+        Some(Value::Object(ui)) => ui.get("resourceUri"),
+        _ => None,
+    };
+    // `if (resourceUri === undefined) resourceUri = meta?.[RESOURCE_URI_META_KEY]` — a nested
+    // `null` is not `undefined`, so it suppresses the fallback and then throws.
+    let Some(resource_uri) = nested.or_else(|| meta.get(RESOURCE_URI_META_KEY)) else {
+        return false;
+    };
+    !resource_uri.as_str().is_some_and(|text| text.starts_with("ui://"))
+}
+
+/// A cached `uiVisibility` in the shape [`ToolMetadata`] stores.
+///
+/// The cache holds whatever the writer put there — [`CachedTool::ui_visibility`] is a raw [`Value`]
+/// precisely so [`is_ui_tool_visible_to_model`] can tell "absent" from "present but malformed" —
+/// while [`ToolMetadata::ui_visibility`] is `Option<Vec<String>>`. The three arms agree with that
+/// predicate exactly: absent stays absent (visible), an array keeps its string entries, and
+/// anything else becomes the empty list, which contains no `"model"` and is therefore hidden.
+fn cached_ui_visibility(value: Option<&Value>) -> Option<Vec<String>> {
+    match value {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(entries)) => {
+            Some(entries.iter().filter_map(|entry| entry.as_str().map(str::to_string)).collect())
+        }
+        Some(_) => Some(Vec::new()),
+    }
+}
+
+/// `tool-metadata.ts:18` `{ metadata, failedTools }`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct BuiltToolMetadata {
+    /// `state.toolMetadata.get(serverName)`'s new value.
+    pub metadata: Vec<ToolMetadata>,
+    /// Names whose `_meta.ui.resourceUri` extraction threw (`tool-metadata.ts:100-104`), plus the
+    /// literal `"(unnamed)"` for a nameless tool (`:81`). A non-empty list becomes
+    /// `MCP: {server} - {n} tools skipped` on the startup pass (`init.ts:356-361`).
+    ///
+    /// Only the nameless entry is actually skipped: a tool whose URI extraction threw is still
+    /// registered, minus the URI there is nowhere to put.
+    pub failed_tools: Vec<String>,
+}
+
+/// `tool-metadata.ts:9` `buildToolMetadata(...)` (MCP-207) — one connected server's live tool and
+/// resource lists, resolved into the model-visible metadata `state.toolMetadata` holds.
+///
+/// `known_metadata` is the collision universe: `state.toolMetadata` from `updateServerMetadata`
+/// (`init.ts:488`), or the startup snapshot from §12 pass two (`init.ts:340`, which also passes
+/// `include_missing_configured_candidates = true`). The two are **not** interchangeable — the
+/// startup snapshot exists precisely so pass two sees every server that connected, including ones
+/// later in the map that `state.toolMetadata` does not carry yet.
+///
+/// Three details a paraphrase loses:
+///
+/// * **Gate order.** `isToolAllowed` → `formatToolName` → the `seenNames` **test** →
+///   `uiVisibility` → the `seenNames` **reservation** (`:84-97`). The test at `:89` and the
+///   `add` at `:97` are on either side of the visibility check, which is the whole subtlety: a
+///   hidden tool does **not** consume its name, so the next tool that formats to the same name
+///   still registers. Moving the `add` up one line changes which server wins a collision.
+/// * **The resource arm applies no visibility filter and no [`BUILTIN_NAMES`] check** (`:117-136`).
+///   The builtin drop list belongs to [`resolve_direct_tools`] alone — it guards what the model
+///   can *call by name*, and `state.toolMetadata` is not that surface.
+/// * **`input_schema` is carried through unnormalised.**
+///   [`normalize_direct_tool_input_schema`] belongs to registration, not to metadata.
+///
+/// Unlike [`resolve_direct_tools`], which silently `continue`s for a nameless tool because it has
+/// no channel to report one, a nameless tool here pushes `"(unnamed)"` onto
+/// [`BuiltToolMetadata::failed_tools`] (`:80-83`).
+#[allow(
+    clippy::too_many_arguments,
+    reason = "upstream's eight-parameter signature; every call site is a port of a `buildToolMetadata(...)` line and reordering or grouping them would break the correspondence"
+)]
+#[must_use]
+pub fn build_tool_metadata(
+    tools: &[rmcp::model::Tool],
+    resources: &[rmcp::model::Resource],
+    definition: &ServerEntry,
+    server_name: &str,
+    prefix: ToolPrefix,
+    configured_servers: Option<&IndexMap<String, ServerEntry>>,
+    known_metadata: Option<&IndexMap<String, Vec<ToolMetadata>>>,
+    include_missing_configured_candidates: bool,
+) -> BuiltToolMetadata {
+    let mut metadata: Vec<ToolMetadata> = Vec::new();
+    let mut failed_tools: Vec<String> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
+    let include = definition.include_tools.as_deref();
+    let exclude = definition.exclude_tools.as_deref();
+
+    // `hasToolFilters && configuredServers ? (() => { … })() : undefined` (`:26-77`).
+    let mut index = match (has_tool_filters(definition), configured_servers) {
+        (true, Some(configured_servers)) => {
+            let mut candidates: IndexSet<String> = IndexSet::new();
+            let mut additional_by_tool: HashMap<String, IndexSet<String>> = HashMap::new();
+            let mut evaluated_tool_names: IndexSet<String> = IndexSet::new();
+
+            for tool in tools {
+                if tool.name.is_empty() {
+                    continue;
+                }
+                evaluated_tool_names.insert(tool.name.to_string());
+                candidates.extend(tool_name_candidates(
+                    &tool.name,
+                    server_name,
+                    effective_prefix,
+                    false,
+                ));
+            }
+            if definition.expose_resources != Some(false) {
+                for resource in resources {
+                    let base_name = resource_base_tool_name(&resource.name);
+                    // `evaluatedToolNames.add` runs BEFORE the name/uri guard (`:47-48`), so a
+                    // resource missing either still contributes a speculative key.
+                    evaluated_tool_names.insert(base_name.clone());
+                    if !resource.name.is_empty() && !resource.uri.is_empty() {
+                        candidates.extend(tool_name_candidates(
+                            &base_name,
+                            server_name,
+                            effective_prefix,
+                            false,
+                        ));
+                    }
+                }
+            }
+
+            for (other_name, other_definition) in configured_servers {
+                if other_name.as_str() == server_name {
+                    continue;
+                }
+                let other_prefix = resolve_tool_prefix(Some(other_definition), prefix);
+                match known_metadata.and_then(|known| known.get(other_name.as_str())) {
+                    // An EMPTY vec is truthy in JS (`if (knownTools)`), so a server known to carry
+                    // no tools takes this arm and contributes nothing — it does not fall through
+                    // to the speculative one.
+                    Some(known_tools) => {
+                        for tool in known_tools {
+                            candidates.insert(tool.name.clone());
+                            candidates.extend(tool_name_candidates(
+                                &tool.original_name,
+                                other_name,
+                                other_prefix,
+                                false,
+                            ));
+                        }
+                    }
+                    // `else if (!knownMetadata || includeMissingConfiguredCandidates)` (`:60`) —
+                    // a server with no metadata yet contributes only into the per-tool table.
+                    None if known_metadata.is_none() || include_missing_configured_candidates => {
+                        for tool_name in &evaluated_tool_names {
+                            let additional =
+                                additional_by_tool.entry(tool_name.clone()).or_default();
+                            let names =
+                                tool_name_candidates(tool_name, other_name, other_prefix, false);
+                            // The `-`→`_` spellings are added ONLY under the startup pass's flag
+                            // (`:68-72`), and AFTER the raw ones — the order the set keeps.
+                            let normalized: Option<Vec<String>> =
+                                include_missing_configured_candidates.then(|| {
+                                    names.iter().map(|name| name.replace('-', "_")).collect()
+                                });
+                            additional.extend(names);
+                            if let Some(normalized) = normalized {
+                                additional.extend(normalized);
+                            }
+                        }
+                    }
+                    None => {}
+                }
+            }
+            Some(CandidateIndex::with_additional(candidates, additional_by_tool))
+        }
+        _ => None,
+    };
+
+    for tool in tools {
+        if tool.name.is_empty() {
+            failed_tools.push("(unnamed)".to_string());
+            continue;
+        }
+        if !is_tool_allowed(
+            &tool.name,
+            server_name,
+            effective_prefix,
+            include,
+            exclude,
+            index.as_mut(),
+        ) {
+            continue;
+        }
+        let name = format_tool_name(&tool.name, server_name, effective_prefix);
+        if seen_names.contains(&name) {
+            continue;
+        }
+        let meta = tool.meta.as_ref().map(|meta| &meta.0);
+        let ui_visibility = extract_ui_tool_visibility(meta);
+        if !crate::proxy::is_ui_tool_visible_to_model(ui_visibility.as_deref()) {
+            continue;
+        }
+        seen_names.insert(name.clone());
+        if ui_resource_uri_is_invalid(meta) {
+            failed_tools.push(tool.name.to_string());
+        }
+        metadata.push(ToolMetadata {
+            name,
+            original_name: tool.name.to_string(),
+            description: tool.description.as_deref().unwrap_or_default().to_string(),
+            resource_uri: None,
+            ui_visibility,
+            // `rmcp` makes `inputSchema` required where the wire type has it optional, so the
+            // `...(tool.inputSchema !== undefined ? … : {})` spread is always taken.
+            input_schema: Some(Value::Object((*tool.input_schema).clone())),
+        });
+    }
+
+    if definition.expose_resources != Some(false) {
+        for resource in resources {
+            let base_name = resource_base_tool_name(&resource.name);
+            if !is_tool_allowed(
+                &base_name,
+                server_name,
+                effective_prefix,
+                include,
+                exclude,
+                index.as_mut(),
+            ) {
+                continue;
+            }
+            let name = format_tool_name(&base_name, server_name, effective_prefix);
+            if seen_names.contains(&name) {
+                continue;
+            }
+            seen_names.insert(name.clone());
+            metadata.push(ToolMetadata {
+                name,
+                original_name: base_name,
+                description: resource
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("Read resource: {}", resource.uri)),
+                resource_uri: Some(resource.uri.clone()),
+                ui_visibility: None,
+                input_schema: None,
+            });
+        }
+    }
+
+    BuiltToolMetadata { metadata, failed_tools }
+}
+
+/// `metadata-cache.ts:185` `reconstructToolMetadata(...)` (MCP-207) — [`build_tool_metadata`]'s
+/// walk over a cache entry instead of a live connection, for the servers §10 rehydrates before
+/// anything connects.
+///
+/// This is **not** [`resolve_direct_tools`]. That one additionally applies the `directTools`
+/// selector and the [`BUILTIN_NAMES`] collision check, neither of which belongs to
+/// `state.toolMetadata`: the cached direct-tool surface is what the model may call, and this is
+/// what the proxy may resolve.
+///
+/// Four differences from [`build_tool_metadata`], all of them upstream's:
+///
+/// * there is no `failedTools` channel — a nameless cached tool is simply skipped;
+/// * visibility is checked **before** `isToolAllowed` and `formatToolName` (`:221-232`), where the
+///   live walk checks it between the `seenNames` test and the `seenNames` reservation; neither
+///   reserves a name for a hidden tool, so the reordering is observable only in how much work is
+///   done before the drop;
+/// * a resource with no `name` **or** no `uri` is skipped (`:247`), where the live walk keeps it;
+/// * the index's other-server arm reads each server's own cache entry through
+///   [`is_server_cache_valid`] (`:203`) rather than a `known_metadata` map, and therefore also
+///   drops disabled servers.
+#[must_use]
+pub fn reconstruct_tool_metadata(
+    server_name: &str,
+    entry: &ServerCacheEntry,
+    prefix: ToolPrefix,
+    definition: &ServerEntry,
+    configured_servers: Option<&IndexMap<String, ServerEntry>>,
+    cache: Option<&MetadataCache>,
+) -> Vec<ToolMetadata> {
+    let mut metadata: Vec<ToolMetadata> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+    let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
+    let include = definition.include_tools.as_deref();
+    let exclude = definition.exclude_tools.as_deref();
+
+    // `hasToolFilters && configuredServers && cache ? (() => { … })() : undefined` (`:199-217`).
+    let mut index = match (has_tool_filters(definition), configured_servers, cache) {
+        (true, Some(configured_servers), Some(cache)) => {
+            let mut candidates: IndexSet<String> = IndexSet::new();
+            for (other_name, other_definition) in configured_servers {
+                // `!otherEntry || !isServerCacheValid(...) || isServerDisabled(...)`, in upstream's
+                // order. Note this arm does NOT skip `serverName` itself: the index deliberately
+                // spans every server, and the tool's own candidates are subtracted by match count
+                // inside `CandidateIndex::has_other_current_match`.
+                let Some(other_entry) = valid_entry(Some(cache), other_name, other_definition)
+                else {
+                    continue;
+                };
+                if other_definition.is_disabled() {
+                    continue;
+                }
+                let other_prefix = resolve_tool_prefix(Some(other_definition), prefix);
+                for other_tool in other_entry.tools() {
+                    if !is_ui_tool_visible_to_model(other_tool.ui_visibility.as_ref()) {
+                        continue;
+                    }
+                    candidates.extend(tool_name_candidates(
+                        &other_tool.name,
+                        other_name,
+                        other_prefix,
+                        false,
+                    ));
+                }
+                if other_definition.expose_resources != Some(false) {
+                    for resource in other_entry.resources() {
+                        let base_name = resource_base_tool_name(&resource.name);
+                        candidates.extend(tool_name_candidates(
+                            &base_name,
+                            other_name,
+                            other_prefix,
+                            false,
+                        ));
+                    }
+                }
+            }
+            Some(CandidateIndex::new(candidates))
+        }
+        _ => None,
+    };
+
+    for tool in entry.tools() {
+        if tool.name.is_empty() {
+            continue;
+        }
+        if !is_ui_tool_visible_to_model(tool.ui_visibility.as_ref()) {
+            continue;
+        }
+        if !is_tool_allowed(
+            &tool.name,
+            server_name,
+            effective_prefix,
+            include,
+            exclude,
+            index.as_mut(),
+        ) {
+            continue;
+        }
+        let name = format_tool_name(&tool.name, server_name, effective_prefix);
+        if seen_names.contains(&name) {
+            continue;
+        }
+        seen_names.insert(name.clone());
+        metadata.push(ToolMetadata {
+            name,
+            original_name: tool.name.clone(),
+            description: tool.description.clone().unwrap_or_default(),
+            resource_uri: None,
+            ui_visibility: cached_ui_visibility(tool.ui_visibility.as_ref()),
+            input_schema: tool.input_schema.clone(),
+        });
+    }
+
+    if definition.expose_resources != Some(false) {
+        for resource in entry.resources() {
+            // `if (!resource?.name || !resource?.uri) continue` (`:247`) — the live walk has no
+            // such guard, because a live `resources/list` cannot omit either.
+            if resource.name.is_empty() || resource.uri.is_empty() {
+                continue;
+            }
+            let base_name = resource_base_tool_name(&resource.name);
+            if !is_tool_allowed(
+                &base_name,
+                server_name,
+                effective_prefix,
+                include,
+                exclude,
+                index.as_mut(),
+            ) {
+                continue;
+            }
+            let name = format_tool_name(&base_name, server_name, effective_prefix);
+            if seen_names.contains(&name) {
+                continue;
+            }
+            seen_names.insert(name.clone());
+            metadata.push(ToolMetadata {
+                name,
+                original_name: base_name,
+                description: resource
+                    .description
+                    .clone()
+                    .unwrap_or_else(|| format!("Read resource: {}", resource.uri)),
+                resource_uri: Some(resource.uri.clone()),
+                ui_visibility: None,
+                input_schema: None,
+            });
+        }
+    }
+
+    metadata
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1884,12 +2400,16 @@ impl Tool for ProxyTool {
 // 7. Prompt slash commands (MCP-206)
 // ---------------------------------------------------------------------------------------------
 
-/// One cached MCP prompt, resolved to the slash command it registers — upstream `PromptMetadata`
-/// as `resolveCachedPrompts` produces it.
+/// One MCP prompt, resolved to the slash command it registers — upstream `PromptMetadata`
+/// (`types.ts:584-591`), field for field.
 ///
-/// Named distinctly from the *live* `crate::state::PromptMetadata` (MCP-039) on purpose: this one is
-/// reconstructed from disk before any server is contacted, and `prompts.ts` re-resolves against the
-/// live map at invocation time (`findLivePromptMetadata`) precisely because the two can disagree.
+/// **This is `crate::state::PromptMetadata`**: D0 discharged that forward declaration as a
+/// `pub use` of this type, because upstream feeds `state.promptMetadata.values()` and
+/// `resolveCachedPrompts(...)` into the same `registerPromptCommands(specs)` (`index.ts:280` and
+/// `:283`). The cache path and the live path mint it through one function,
+/// [`reconstruct_prompt_metadata`]; what still differs between them is *provenance*, which
+/// `McpState::prompt_metadata_live` records separately, and which is why `prompts.ts` re-resolves
+/// against the live map at invocation time (`findLivePromptMetadata`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PromptCommandSpec {
     pub server_name: String,
@@ -1900,9 +2420,111 @@ pub struct PromptCommandSpec {
     pub arguments: Vec<CachedPromptArgument>,
 }
 
-/// `prompts.ts` `resolveCachedPrompts` + `metadata-cache.ts` `reconstructPromptMetadata`: walk the
-/// **cache's** server order, keep servers that are configured, enabled, cache-valid and actually
-/// carry prompts, and mint one command spec per named prompt.
+/// The `McpPrompt | CachedPrompt` union `reconstructPromptMetadata` takes
+/// (`metadata-cache.ts:320`), which Rust has to spell as a trait.
+///
+/// The two arms are the live `prompts/list` result and the cache entry; they carry the same four
+/// fields under different types, and the argument lists differ only in element type. Bridging them
+/// here rather than at the call sites is the point of the unification: every prompt command name
+/// in the process is minted by one function over one shape.
+pub trait PromptSource {
+    /// `prompt.name` — the `filter(prompt => prompt?.name)` gate reads it before anything else.
+    fn prompt_name(&self) -> &str;
+    /// `prompt.title`.
+    fn prompt_title(&self) -> Option<&str>;
+    /// `prompt.description`.
+    fn prompt_description(&self) -> Option<&str>;
+    /// `Array.isArray(prompt.arguments) ? prompt.arguments.filter(a => a?.name).map(…) : []`
+    /// (`metadata-cache.ts:326-332`) — absent and non-array both flatten to the empty list, and a
+    /// nameless argument is dropped.
+    fn prompt_arguments(&self) -> Vec<CachedPromptArgument>;
+}
+
+impl PromptSource for CachedPrompt {
+    fn prompt_name(&self) -> &str {
+        &self.name
+    }
+    fn prompt_title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+    fn prompt_description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+    fn prompt_arguments(&self) -> Vec<CachedPromptArgument> {
+        self.arguments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|argument| !argument.name.is_empty())
+            .cloned()
+            .collect()
+    }
+}
+
+impl PromptSource for rmcp::model::Prompt {
+    fn prompt_name(&self) -> &str {
+        &self.name
+    }
+    fn prompt_title(&self) -> Option<&str> {
+        self.title.as_deref()
+    }
+    fn prompt_description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+    fn prompt_arguments(&self) -> Vec<CachedPromptArgument> {
+        self.arguments
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|argument| !argument.name.is_empty())
+            .map(|argument| CachedPromptArgument {
+                name: argument.name.clone(),
+                description: argument.description.clone(),
+                required: argument.required,
+            })
+            .collect()
+    }
+}
+
+/// `metadata-cache.ts:318` `reconstructPromptMetadata(serverName, prompts, prefix, definition?)`
+/// (MCP-207) — one server's prompt list, live or cached, as the slash commands it registers.
+///
+/// `definition` is optional upstream (`Pick<ServerEntry, "toolPrefix">`) and stays optional here,
+/// which is exactly what [`resolve_tool_prefix`] now takes: a prompt resolved for a server with no
+/// `mcpServers` entry falls through to the global mode instead of being unrepresentable.
+#[must_use]
+pub fn reconstruct_prompt_metadata<P: PromptSource>(
+    server_name: &str,
+    prompts: &[P],
+    prefix: ToolPrefix,
+    definition: Option<&ServerEntry>,
+) -> Vec<PromptCommandSpec> {
+    let effective_prefix = resolve_tool_prefix(definition, prefix);
+    prompts
+        .iter()
+        .filter(|prompt| !prompt.prompt_name().is_empty())
+        .map(|prompt| {
+            let original_name = prompt.prompt_name();
+            PromptCommandSpec {
+                server_name: server_name.to_string(),
+                original_name: original_name.to_string(),
+                command_name: format_prompt_command_name(
+                    original_name,
+                    server_name,
+                    effective_prefix,
+                ),
+                title: prompt.prompt_title().map(str::to_string),
+                description: prompt.prompt_description().unwrap_or_default().to_string(),
+                arguments: prompt.prompt_arguments(),
+            }
+        })
+        .collect()
+}
+
+/// `prompts.ts:19` `resolveCachedPrompts`: walk the **cache's** server order, keep servers that are
+/// configured, enabled, cache-valid and actually carry prompts, and hand each survivor's prompt
+/// list to [`reconstruct_prompt_metadata`] — the same function the live path uses, so a command
+/// name cannot depend on which path minted it.
 #[must_use]
 pub fn resolve_cached_prompts(
     config: &McpConfig,
@@ -1924,31 +2546,12 @@ pub fn resolve_cached_prompts(
         if !is_server_cache_valid(entry, definition, METADATA_CACHE_MAX_AGE_MS) {
             continue;
         }
-        let effective_prefix = resolve_tool_prefix(Some(definition), global_prefix);
-        for prompt in entry.prompts() {
-            if prompt.name.is_empty() {
-                continue;
-            }
-            let arguments = prompt
-                .arguments
-                .clone()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|argument| !argument.name.is_empty())
-                .collect();
-            specs.push(PromptCommandSpec {
-                server_name: server_name.clone(),
-                original_name: prompt.name.clone(),
-                command_name: format_prompt_command_name(
-                    &prompt.name,
-                    server_name,
-                    effective_prefix,
-                ),
-                title: prompt.title.clone(),
-                description: prompt.description.clone().unwrap_or_default(),
-                arguments,
-            });
-        }
+        specs.extend(reconstruct_prompt_metadata(
+            server_name,
+            entry.prompts(),
+            global_prefix,
+            Some(definition),
+        ));
     }
     specs
 }
@@ -3188,4 +3791,300 @@ mod tests {
         );
     }
 
+    // --- MCP-207, `state.toolMetadata`'s two writers --------------------------------------------
+
+    fn live_meta(value: Value) -> rmcp::model::MetaObject {
+        match value {
+            Value::Object(map) => rmcp::model::MetaObject(map),
+            _ => rmcp::model::MetaObject::new(),
+        }
+    }
+
+    fn live_tool(name: &str, description: Option<&str>) -> rmcp::model::Tool {
+        rmcp::model::Tool::new_with_raw(
+            name.to_string(),
+            description.map(|text| std::borrow::Cow::Owned(text.to_string())),
+            Arc::new(serde_json::Map::new()),
+        )
+    }
+
+    /// The four gates of `tool-metadata.ts:79-115`, in the order that decides which tool wins a
+    /// name — and the two things that reach `failedTools`.
+    ///
+    /// The reservation is `seenNames.add` at `:97`, **after** the visibility test at `:94`, not
+    /// before it: a hidden tool is dropped without consuming its name, so the next tool that
+    /// formats to the same name still registers. (The `seenNames.has` *test* at `:89` is what runs
+    /// before visibility, which is a different statement and has no observable effect.)
+    #[test]
+    fn the_live_walk_reserves_names_only_for_tools_the_model_can_see() {
+        let definition = entry(true);
+        let config = config_of(&[("srv", definition.clone())]);
+        let tools = vec![
+            // `!tool?.name` → `"(unnamed)"` and skip (`:80-83`).
+            live_tool("", None),
+            // Hidden: dropped, and its name stays free.
+            live_tool("a.b", Some("hidden"))
+                .with_meta(live_meta(json!({"ui": {"visibility": ["app"]}}))),
+            // Formats to the same `srv_a_b` the hidden one would have taken.
+            live_tool("a_b", Some("visible")),
+            // …and now that the name IS taken, the next one on it is dropped (`:89-91`).
+            live_tool("a.b", Some("dropped")),
+            // `getToolUiResourceUri` throws on a non-`ui://` URI: the NAME is reported and the tool
+            // is still registered (`:99-104`).
+            live_tool("bad", None).with_meta(live_meta(json!({"ui": {"resourceUri": "http://x"}}))),
+        ];
+
+        let built = build_tool_metadata(
+            &tools,
+            &[],
+            &definition,
+            "srv",
+            ToolPrefix::Server,
+            Some(&config.mcp_servers),
+            None,
+            false,
+        );
+
+        let names: Vec<&str> = built.metadata.iter().map(|meta| meta.name.as_str()).collect();
+        assert_eq!(names, vec!["srv_a_b", "srv_bad"]);
+        assert_eq!(built.metadata[0].original_name, "a_b");
+        assert_eq!(built.metadata[0].description, "visible");
+        // `tool.description ?? ""`.
+        assert_eq!(built.metadata[1].description, "");
+        assert_eq!(built.failed_tools, vec!["(unnamed)".to_string(), "bad".to_string()]);
+    }
+
+    /// `state.toolMetadata` is not the direct-tool surface: the live walk applies **no**
+    /// [`BUILTIN_NAMES`] check (`tool-metadata.ts` has none), and its resource arm falls back to
+    /// `Read resource: ${uri}` (`:133`). `exposeResources: false` skips that arm entirely.
+    #[test]
+    fn the_live_walk_keeps_builtin_names_and_falls_back_to_the_uri_description() {
+        let mut definition = entry(true);
+        definition.tool_prefix = Some(ToolPrefix::None);
+        let config = config_of(&[("srv", definition.clone())]);
+        // Unprefixed, so it formats to the literal builtin name `resolve_direct_tools` drops.
+        let tools = vec![live_tool("read", None)];
+        let resources = vec![
+            rmcp::model::Resource::new("file:///a", "notes"),
+            rmcp::model::Resource::new("file:///b", "described").with_description("mine"),
+        ];
+
+        let built = build_tool_metadata(
+            &tools,
+            &resources,
+            &definition,
+            "srv",
+            ToolPrefix::Server,
+            Some(&config.mcp_servers),
+            None,
+            false,
+        );
+        assert_eq!(
+            built.metadata.iter().map(|meta| meta.name.clone()).collect::<Vec<_>>(),
+            vec!["read".to_string(), "read_notes".to_string(), "read_described".to_string()]
+        );
+        assert_eq!(built.metadata[1].description, "Read resource: file:///a");
+        assert_eq!(built.metadata[1].resource_uri.as_deref(), Some("file:///a"));
+        assert_eq!(built.metadata[2].description, "mine");
+
+        let mut hidden_resources = definition.clone();
+        hidden_resources.expose_resources = Some(false);
+        let built = build_tool_metadata(
+            &tools,
+            &resources,
+            &hidden_resources,
+            "srv",
+            ToolPrefix::Server,
+            Some(&config.mcp_servers),
+            None,
+            false,
+        );
+        assert_eq!(
+            built.metadata.iter().map(|meta| meta.name.clone()).collect::<Vec<_>>(),
+            vec!["read".to_string()]
+        );
+    }
+
+    /// `additionalCurrentCandidatesByToolName` (`tool-metadata.ts:60-73`), the arm that only
+    /// exists here.
+    ///
+    /// `do_thing` is a legacy-only alias of `mine`'s `do-thing`, so on its own it excludes the
+    /// tool. A second configured server with no metadata yet *would* mint `do_thing` as a current
+    /// name once it connects — but only the `-`→`_` pass under
+    /// `include_missing_configured_candidates` knows that, which is why the same call answers
+    /// differently for the two flags. Getting this backwards drops a tool on the startup pass that
+    /// every later refresh keeps.
+    #[test]
+    fn a_speculative_collision_suppresses_a_legacy_exclusion_only_on_the_startup_pass() {
+        let mut mine = entry(true);
+        mine.exclude_tools = Some(vec!["do_thing".to_string()]);
+        let config = config_of(&[("mine", mine.clone()), ("other", entry(true))]);
+        let tools = vec![live_tool("do-thing", None)];
+
+        let registered = |include_missing: bool| {
+            build_tool_metadata(
+                &tools,
+                &[],
+                &mine,
+                "mine",
+                ToolPrefix::Server,
+                Some(&config.mcp_servers),
+                None,
+                include_missing,
+            )
+            .metadata
+            .len()
+        };
+
+        // Raw candidates only: `do_thing` names nobody, so the legacy alias excludes.
+        assert_eq!(registered(false), 0);
+        // …plus the normalised spellings: `other` would answer to `do_thing`, so the exclusion is
+        // ambiguous and upstream keeps the tool.
+        assert_eq!(registered(true), 1);
+    }
+
+    /// A server already in `known_metadata` contributes its **resolved** names, so it never lands
+    /// in the speculative table — even when it is known to carry nothing at all
+    /// (`if (knownTools)` is truthy for `[]`, `tool-metadata.ts:55`).
+    #[test]
+    fn a_known_server_takes_the_resolved_arm_even_when_it_knows_of_no_tools() {
+        let mut mine = entry(true);
+        mine.exclude_tools = Some(vec!["do_thing".to_string()]);
+        let config = config_of(&[("mine", mine.clone()), ("other", entry(true))]);
+        let tools = vec![live_tool("do-thing", None)];
+        let mut known: IndexMap<String, Vec<ToolMetadata>> = IndexMap::new();
+        known.insert("other".to_string(), Vec::new());
+
+        // With `other` known-empty the speculative arm never runs, so the exclusion lands again
+        // even under the startup flag.
+        let built = build_tool_metadata(
+            &tools,
+            &[],
+            &mine,
+            "mine",
+            ToolPrefix::Server,
+            Some(&config.mcp_servers),
+            Some(&known),
+            true,
+        );
+        assert!(built.metadata.is_empty());
+
+        // And a server whose resolved name IS the alias collides for real.
+        known.insert(
+            "other".to_string(),
+            vec![ToolMetadata::new("do_thing", "do_thing", "")],
+        );
+        let built = build_tool_metadata(
+            &tools,
+            &[],
+            &mine,
+            "mine",
+            ToolPrefix::Server,
+            Some(&config.mcp_servers),
+            Some(&known),
+            true,
+        );
+        assert_eq!(built.metadata.len(), 1);
+    }
+
+    /// `reconstructToolMetadata` is not `resolveDirectTools`: the [`BUILTIN_NAMES`] drop list and
+    /// the `directTools` selector are absent, a hidden cached tool is skipped, and a resource
+    /// missing either half of `(name, uri)` is skipped (`metadata-cache.ts:247`).
+    #[test]
+    fn the_cache_walk_keeps_builtins_and_drops_half_written_resources() {
+        let mut definition = entry(true);
+        definition.tool_prefix = Some(ToolPrefix::None);
+        let config = config_of(&[("srv", definition.clone())]);
+        let mut entry_for_cache = cache_entry(vec![
+            CachedTool {
+                name: "read".to_string(),
+                input_schema: Some(json!({"type": "object"})),
+                ..CachedTool::default()
+            },
+            CachedTool {
+                name: "hidden".to_string(),
+                ui_visibility: Some(json!(["app"])),
+                ..CachedTool::default()
+            },
+            cached_tool(""),
+        ]);
+        entry_for_cache.resources = Some(vec![
+            CachedResource { uri: "file:///a".to_string(), name: "notes".to_string(), description: None },
+            CachedResource { uri: String::new(), name: "nouri".to_string(), description: None },
+            CachedResource { uri: "file:///c".to_string(), name: String::new(), description: None },
+        ]);
+        let cache = cache_of(&config, &[("srv", entry_for_cache)]);
+        let stored = cache.servers.get("srv").expect("entry");
+
+        let metadata = reconstruct_tool_metadata(
+            "srv",
+            stored,
+            ToolPrefix::Server,
+            &definition,
+            Some(&config.mcp_servers),
+            Some(&cache),
+        );
+        assert_eq!(
+            metadata.iter().map(|meta| meta.name.clone()).collect::<Vec<_>>(),
+            // `read` survives: the builtin collision is `resolve_direct_tools`' rule, not this one.
+            vec!["read".to_string(), "read_notes".to_string()]
+        );
+        // Carried through UNNORMALISED — `normalize_direct_tool_input_schema` is registration's.
+        assert_eq!(metadata[0].input_schema, Some(json!({"type": "object"})));
+        assert_eq!(metadata[1].resource_uri.as_deref(), Some("file:///a"));
+
+        // The same entry through `resolve_direct_tools` drops `read`, which is the difference the
+        // two functions exist to keep: that one guards what the model may call by name.
+        let specs = resolve_direct_tools(&config, Some(&cache), ToolPrefix::Server, None);
+        assert!(specs.iter().all(|spec| spec.prefixed_name != "read"));
+        assert!(specs.iter().any(|spec| spec.prefixed_name == "read_notes"));
+    }
+
+    /// `reconstructPromptMetadata` is now the ONE minter of prompt command names: the cache path
+    /// reaches it through [`resolve_cached_prompts`] and the live path passes `rmcp` prompts
+    /// straight in. Both must answer with the same `commandName` for the same prompt.
+    #[test]
+    fn one_prompt_walk_serves_the_cache_and_the_live_list() {
+        let definition = entry(false);
+        let live = vec![
+            rmcp::model::Prompt::new(
+                "brief",
+                Some("Daily brief"),
+                Some(vec![
+                    rmcp::model::PromptArgument::new("day"),
+                    rmcp::model::PromptArgument::new(""),
+                ]),
+            ),
+            rmcp::model::Prompt::new("", None::<String>, None),
+        ];
+        let specs =
+            reconstruct_prompt_metadata("demo", &live, ToolPrefix::Server, Some(&definition));
+        assert_eq!(specs.len(), 1);
+        assert_eq!(specs[0].command_name, "mcp__demo__brief");
+        assert_eq!(specs[0].description, "Daily brief");
+        // The nameless argument is dropped, the named one survives.
+        assert_eq!(
+            specs[0].arguments,
+            vec![CachedPromptArgument { name: "day".to_string(), description: None, required: None }]
+        );
+
+        let cached = vec![CachedPrompt {
+            name: "brief".to_string(),
+            description: Some("Daily brief".to_string()),
+            arguments: Some(vec![CachedPromptArgument {
+                name: "day".to_string(),
+                description: None,
+                required: None,
+            }]),
+            ..CachedPrompt::default()
+        }];
+        let from_cache =
+            reconstruct_prompt_metadata("demo", &cached, ToolPrefix::Server, Some(&definition));
+        assert_eq!(from_cache, specs);
+
+        // `definition?` is optional upstream and stays optional here: no entry falls through to
+        // the global mode rather than being unrepresentable.
+        let global = reconstruct_prompt_metadata("demo", &cached, ToolPrefix::Mcp, None);
+        assert_eq!(global[0].command_name, "mcp__mcp__demo__brief");
+    }
 }

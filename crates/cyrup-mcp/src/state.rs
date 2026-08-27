@@ -84,9 +84,11 @@ pub struct McpState {
     pub manager: Arc<McpServerManager>,
     /// 3 · The reconnect / idle-shutdown health-check state machine.
     pub lifecycle: Arc<McpLifecycleManager>,
-    /// 4 · Per-server tool metadata — the source of every direct tool and of the proxy tool's
-    /// description. Populated from `mcp-cache.json` at load and refreshed on connect.
-    pub tool_metadata: Mutex<IndexMap<String, ServerToolMetadata>>,
+    /// 4 · Per-server tool metadata — `state.toolMetadata: Map<string, ToolMetadata[]>`,
+    /// insertion-ordered because that order decides which server wins a fuzzy name match, which
+    /// disabled server is named in an error, and the output order of the unsorted regex search.
+    /// Populated from `mcp-cache.json` at load and refreshed on connect.
+    pub tool_metadata: Mutex<IndexMap<String, Vec<ServerToolMetadata>>>,
     /// 5 · Per-server resource counts. A count, not the resources: the panel shows it and
     /// `updateMetadataCache` preserves it.
     pub resource_counts: Mutex<IndexMap<String, usize>>,
@@ -246,14 +248,35 @@ impl McpState {
     ///
     /// A hook must **never break a connect** (MCP-030), so the listener is cloned out from under
     /// the lock and invoked outside it: a listener that re-enters this state cannot deadlock, and
-    /// a poisoned lock degrades to "no listener" rather than to a failed connect.
+    /// a poisoned lock degrades to "no listener" rather than to a failed connect. The call itself
+    /// is contained the way `init.ts:547-558`'s `try`/`catch` contains upstream's.
     pub fn notify_tool_metadata_updated(&self, server: &str, reason: &str) {
         let listener = match self.on_tool_metadata_updated.lock() {
             Ok(slot) => slot.clone(),
             Err(_) => None,
         };
-        if let Some(listener) = listener {
+        let Some(listener) = listener else { return };
+        // `init.ts:547-558`'s try/catch. A hook must never break a connect, and this crate denies
+        // `clippy::panic` — a panicking listener would take the whole connect down with it.
+        // `AssertUnwindSafe` is sound here: everything the closure can reach is behind `Mutex`/`Arc`,
+        // and a poisoned lock already degrades to "no metadata" at every read site.
+        //
+        // Honest scope: this contains an UNWINDING panic, which covers dev, test and any profile
+        // that unwinds. `[profile.release] panic = "abort"` (workspace `Cargo.toml:296`) leaves no
+        // unwind to catch, so a release build still aborts. Release containment rests on the
+        // workspace's no-panic policy (`clippy::panic`/`unwrap_used`/`expect_used`/`indexing_slicing`
+        // all `deny`) holding across whatever the listener reaches — here `sync_tool_surface`, via
+        // `install_surface_sync`. This is the belt to that policy's braces, not a replacement.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             listener(server, reason);
+        }));
+        if let Err(payload) = caught {
+            let message = payload
+                .downcast_ref::<&str>()
+                .map(|text| (*text).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panicked".to_string());
+            tracing::debug!("MCP: metadata update hook failed for {server}: {message}");
         }
     }
 
@@ -359,27 +382,23 @@ pub use crate::oauth::McpOAuthRuntime as OAuthRuntime;
 /// pre-resolving it here would defeat `$MCP_OAUTH_DIR`.
 pub use crate::credentials::AuthStorageOptions;
 
-/// `tool-metadata.ts`'s per-server metadata: the tools, their schemas, their resolved names, and
-/// the prefix they were named under.
+/// `tool-metadata.ts`'s per-server metadata is `ToolMetadata[]`, and MCP-021/MCP-028 are the
+/// writers that need every field of it.
 ///
-/// **Forward declaration (13e / MCP-200…MCP-259 replace it).**
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct ServerToolMetadata {
-    /// The resolved, model-visible tool names this server contributes, in server order.
-    pub tool_names: Vec<String>,
-}
+/// **Landed by this group (D0).** `crate::state::ServerToolMetadata` stays a valid path for
+/// anything already written against it and now names the real type.
+pub use crate::proxy::ToolMetadata as ServerToolMetadata;
 
 /// `prompts.ts`'s per-prompt metadata: the prompt's name, its arguments and the slash command it
 /// becomes.
 ///
-/// **Forward declaration (MCP-039 / MCP-39x replace it).**
-#[derive(Debug, Clone, Default)]
-#[non_exhaustive]
-pub struct PromptMetadata {
-    /// The MCP prompt name, as the server reported it.
-    pub name: String,
-}
+/// **Landed by this group (D0).** `types.ts:584-591`'s six fields are exactly
+/// [`crate::registration::PromptCommandSpec`] — `serverName`/`originalName`/`commandName`/`title?`/
+/// `description`/`arguments` field for field — which `resolve_cached_prompts` and
+/// `register_prompt_commands` already produce and consume. Upstream relies on the same identity:
+/// `index.ts:280` feeds `state.promptMetadata.values()` and `:283` feeds `resolveCachedPrompts(..)`
+/// into one `registerPromptCommands(specs: Iterable<PromptMetadata>)`.
+pub use crate::registration::PromptCommandSpec as PromptMetadata;
 
 /// One server's connect-failure state — the input to the 60-second backoff (MCP-024).
 #[derive(Debug, Clone)]
@@ -397,20 +416,92 @@ impl Default for ServerFailure {
     }
 }
 
-/// The status snapshot upstream publishes as `MCP_STATUS_EVENT` v1. Kept in-crate on a
-/// [`tokio::sync::watch`]: cyrup has no consumer for a bus topic here, and inventing one nothing
-/// reads would be new functionality rather than a port.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `types.ts:18` `MCP_STATUS_SNAPSHOT_VERSION` (13c §3.16).
+///
+/// Upstream types it `1 as const`, which makes the literal part of the contract rather than a
+/// mutable counter: every payload on the channel carries it, including `publishMcpStatusShutdown`'s
+/// all-zero one (`mcp-status.ts:95-102`).
+pub const MCP_STATUS_SNAPSHOT_VERSION: u32 = 1;
+
+/// `types.ts:20-26` `McpServerRuntimeStatus` — a CLOSED six-variant union. The `kebab-case` rename
+/// is what produces `needs-auth` / `not-connected`, which are the wire spellings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpServerRuntimeStatus {
+    /// A live connection reporting `connected`.
+    Connected,
+    /// No live connection, but tool metadata for the server survives — a cache rehydrate.
+    Cached,
+    /// A connect failed and is still inside the 60-second backoff window (MCP-024).
+    Failed,
+    /// The connection reports `needs-auth`: an OAuth flow is owed before the server is usable.
+    NeedsAuth,
+    /// Configured and enabled, with neither a live connection nor cached metadata.
+    NotConnected,
+    /// `definition.disabled === true` — the literal boolean, nothing else.
+    Disabled,
+}
+
+/// `types.ts:28-35` — exactly six keys, two of them OMITTED when absent, never `null`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpServerStatusSnapshot {
+    /// The server's key in `config.mcpServers`.
+    pub name: String,
+    /// The first rung of `mcp-status.ts:42-55` that matched.
+    pub status: McpServerRuntimeStatus,
+    /// The cached metadata length when there is any, else the live connection's tool count, else 0.
+    pub tool_count: usize,
+    /// Absent rather than zero when the count is unknown — which is what a disabled server and a
+    /// server that has never connected both report.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_count: Option<usize>,
+    /// Emitted only for [`McpServerRuntimeStatus::Failed`], and only inside the 60-second window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_ago_seconds: Option<u64>,
+    /// ALWAYS emitted, even for an enabled server: it duplicates `status == Disabled` and consumers
+    /// read both (`types.ts:34` is not optional).
+    pub disabled: bool,
+}
+
+/// `types.ts:37-44` — the whole payload upstream publishes as `MCP_STATUS_EVENT` v1.
+///
+/// Kept in-crate on a [`tokio::sync::watch`]: cyrup has no consumer for a bus topic here, and
+/// inventing one nothing reads would be new functionality rather than a port.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct McpStatusSnapshot {
-    /// Servers currently connected.
-    pub connected: Vec<String>,
-    /// Servers configured but not connected.
-    pub idle: Vec<String>,
-    /// Servers whose last connect failed, with the message `/mcp` shows.
-    pub failed: Vec<String>,
-    /// Servers waiting on an OAuth flow.
-    pub pending_auth: Vec<String>,
+    /// Always [`MCP_STATUS_SNAPSHOT_VERSION`].
+    pub version: u32,
+    /// One entry per `config.mcpServers` key, in config-file order.
+    pub servers: Vec<McpServerStatusSnapshot>,
+    /// The sum of `tool_count` over the servers that are not disabled.
+    pub total_tools: usize,
+    /// The sum of the present `resource_count`s over the servers that are not disabled.
+    pub total_resources: usize,
+    /// How many servers matched the `connected` rung.
+    pub connected_count: usize,
+    /// How many servers matched the `disabled` rung.
+    pub disabled_count: usize,
+}
+
+impl Default for McpStatusSnapshot {
+    /// `publishMcpStatusShutdown`'s literal all-zero payload (`mcp-status.ts:95-102`), with
+    /// `servers: []`.
+    ///
+    /// Hand-written rather than derived: `#[derive(Default)]` would give `version: 0`, and the two
+    /// existing `publish_status(Default::default())` sites — the one in `runtime.rs` and
+    /// `lifecycle::shutdown_state`'s — become CORRECT only with `version: 1`.
+    fn default() -> Self {
+        Self {
+            version: MCP_STATUS_SNAPSHOT_VERSION,
+            servers: Vec::new(),
+            total_tools: 0,
+            total_resources: 0,
+            connected_count: 0,
+            disabled_count: 0,
+        }
+    }
 }
 
 #[cfg(test)]

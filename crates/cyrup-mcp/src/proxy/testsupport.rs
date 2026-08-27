@@ -252,7 +252,7 @@ pub(crate) fn ctx_with(
     let env = Arc::new(env);
     let ctx = Arc::new(ProxyCtx::new(state, Arc::clone(&env) as Arc<dyn ProxyEnv>));
     {
-        let mut slot = ctx.tool_metadata.lock().unwrap();
+        let mut slot = ctx.state.tool_metadata.lock().unwrap();
         for (server, tools) in metadata {
             slot.insert((*server).to_string(), tools.clone());
         }

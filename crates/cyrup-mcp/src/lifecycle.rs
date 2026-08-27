@@ -393,14 +393,20 @@ pub type IdleShutdownCallback = Arc<dyn Fn(&str) + Send + Sync>;
 /// fire-and-forget write would race process exit (MCP-031).
 pub type MetadataFlush = Arc<dyn Fn(&Arc<McpState>) -> McpResult<()> + Send + Sync>;
 
-/// A [`MetadataFlush`] that flushes nothing, for call sites that genuinely have no cache — and,
-/// until MCP-031 lands, for the session handlers. It **warns**, because reaching process exit
-/// without writing `mcp-cache.json` means the next launch registers an empty tool surface.
+/// A [`MetadataFlush`] that flushes nothing, for call sites that genuinely have no cache to write.
+///
+/// **This is no longer the session handlers' flush.** MCP-031 landed:
+/// [`crate::live::metadata_flush`] is the real one, and it is what `shutdown_state` is given on any
+/// path that owns a cache. This stays for the call sites that own none — a restart with no state,
+/// and the tests that assert `shutdown_state`'s ordering without a `McpDirs`. It still **warns**,
+/// because reaching process exit without writing `mcp-cache.json` when there *was* something to
+/// write means the next launch registers an empty tool surface.
 #[must_use]
 pub fn no_metadata_flush() -> MetadataFlush {
     Arc::new(|_state| {
         tracing::warn!(
-            "MCP: metadata cache not flushed on shutdown — `flush_metadata_cache` is pending MCP-031"
+            "MCP: metadata cache not flushed on shutdown — this path holds no `McpDirs`; \
+             `crate::live::metadata_flush` is the flush for a state that owns a cache"
         );
         Ok(())
     })
@@ -2447,7 +2453,7 @@ mod tests {
         let owner = Arc::new(McpRuntimeOwner::new());
         let state = state_with(Arc::clone(&owner));
         state.publish_status(McpStatusSnapshot {
-            connected: vec!["a".to_string()],
+            connected_count: 1,
             ..Default::default()
         });
         let mut status = state.subscribe_status();
@@ -2465,7 +2471,7 @@ mod tests {
             1,
             "the flush runs at call time, before the first await"
         );
-        assert_eq!(status.borrow_and_update().connected.len(), 0);
+        assert_eq!(status.borrow_and_update().connected_count, 0);
         assert!(!owner.is_active(), "the owner is cancelled at call time too");
         pending.await.unwrap();
     }

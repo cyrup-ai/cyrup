@@ -41,7 +41,11 @@
 //! * MCP-146 — a resource-backed tool is `read_<name>`, never `get_<name>`
 //!   (`tool-metadata.ts:46` and `:119`).
 //! * MCP-370 — `ToolPrefix` carries upstream's **four** modes and the server prefix goes through
-//!   `sanitizeServerPrefix` (`types.ts:667`/`:675`), which **preserves hyphens**.
+//!   `sanitizeServerPrefix` (`types.ts:668`/`:675`), which **preserves hyphens**; a server may
+//!   override the mode with its own `toolPrefix` (`resolveToolPrefix`, `types.ts:702`); and the
+//!   tool filter is upstream's whole `isToolAllowed` (`types.ts:932`) — `includeTools` evaluated
+//!   before `excludeTools`, both over the 18-expression [`tool_name_candidates`] set, both
+//!   accepting `*`/`?` globs, and both disambiguated across servers by [`CandidateIndex`].
 //! * MCP-143 — `interpolate_env_vars` runs upstream's **three** chained passes; the third,
 //!   `{env:NAME}`, was missing.
 //! * MCP-144 — hashed values go through the `!`/`!!` secret grammar
@@ -264,14 +268,23 @@ pub struct ServerEntry {
     pub bearer_token_env: Option<String>,
     #[serde(default, rename = "exposeResources")]
     pub expose_resources: Option<bool>,
-    /// The glob-or-exact allowlist upstream applies **before** [`Self::exclude_tools`]. Part of the
-    /// config identity (MCP-141): editing it changes which tools the adapter registers, so it must
-    /// evict the cache. It is deliberately **not** applied by this resolver's own filtering yet —
-    /// that, and upstream's 18-expression `getToolNameCandidates` with its glob matching, are the
-    /// remaining half of MCP-370 (`isToolAllowed`, `types.ts`).
-    #[serde(default, rename = "includeTools")]
+    /// `resolveToolPrefix` (`cyrup_mcp::registration::resolve_tool_prefix`, `types.ts:702`) — a
+    /// per-server override of `settings.toolPrefix`. Held as a raw string and parsed by
+    /// [`parse_tool_prefix`] so an unrecognised value degrades to "inherit the global", which is
+    /// what the writer's `lenient` `Option<ToolPrefix>` does (`config.rs`) — and is NOT what
+    /// [`get_tool_prefix`]'s catch-all does.
+    ///
+    /// Not one of the fifteen identity keys: it renames tools, it does not redefine the server.
+    #[serde(default, rename = "toolPrefix", deserialize_with = "lenient_string")]
+    pub tool_prefix: Option<String>,
+    /// The glob-or-exact allowlist upstream applies **before** [`Self::exclude_tools`], through
+    /// [`is_tool_allowed`]. Part of the config identity (MCP-141): editing it changes which tools
+    /// the adapter registers, so it must evict the cache.
+    #[serde(default, rename = "includeTools", deserialize_with = "lenient_string_list")]
     pub include_tools: Option<Vec<String>>,
-    #[serde(default, rename = "excludeTools")]
+    /// The glob-or-exact denylist [`is_tool_allowed`] applies **after** [`Self::include_tools`] —
+    /// the same selector rule, negated. Also one of the fifteen identity keys.
+    #[serde(default, rename = "excludeTools", deserialize_with = "lenient_string_list")]
     pub exclude_tools: Option<Vec<String>>,
 }
 
@@ -357,6 +370,44 @@ where
     D: serde::Deserializer<'de>,
 {
     Ok(Option::<Value>::deserialize(deserializer)?.and_then(|value| value.as_i64()))
+}
+
+/// `cyrup_mcp::config::lenient` for a string field: a wrong-typed value becomes `None` rather than
+/// failing the whole [`ServerEntry`]. [`extract_server_map`] drops an entry that fails to
+/// deserialize; the writer never drops one for this reason.
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Value::deserialize(deserializer)?;
+    Ok(raw.as_str().map(str::to_string))
+}
+
+/// [`lenient_string`] for `string[]`. A non-array, an array with a non-string member, and an
+/// explicit `null` are all `None`.
+fn lenient_string_list<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value::<Vec<String>>(raw).ok())
+}
+
+/// A `toolPrefix` value parsed **strictly**: an unrecognised value is `None`. The four spellings are
+/// `cyrup_mcp::config::ToolPrefix`'s `#[serde(rename_all = "lowercase")]`.
+///
+/// [`get_tool_prefix`] keeps its catch-all-to-[`ToolPrefix::Server`] behaviour for the *global*
+/// settings key, because that is `getServerPrefix`'s final `return` (`types.ts:686`). A
+/// **per-server** value must instead fall through to the global, which is what the writer's
+/// `lenient` `Option<ToolPrefix>` produces.
+fn parse_tool_prefix(value: &str) -> Option<ToolPrefix> {
+    match value {
+        "server" => Some(ToolPrefix::Server),
+        "none" => Some(ToolPrefix::None),
+        "short" => Some(ToolPrefix::Short),
+        "mcp" => Some(ToolPrefix::Mcp),
+        _ => None,
+    }
 }
 
 /// The whole on-disk metadata cache (pi `MetadataCache`).
@@ -611,6 +662,16 @@ fn resolve_direct_tool_names(
             continue;
         }
 
+        // `direct-tools.ts:153-174` — the effective prefix is per-server (`resolveToolPrefix`), and
+        // the cross-server disambiguation index is built lazily, only for a server that actually
+        // carries filters. `build_candidate_index` takes the **global** prefix and resolves each
+        // server's own effective prefix internally.
+        let effective_prefix = effective_tool_prefix(definition, prefix);
+        let mut index =
+            has_tool_filters(definition).then(|| build_candidate_index(config, cache, prefix));
+        let include = definition.include_tools.as_deref();
+        let exclude = definition.exclude_tools.as_deref();
+
         for tool in server_cache.tools.iter().flatten() {
             let Some(tool_name) = tool.name.as_deref().filter(|n| !n.is_empty()) else {
                 continue;
@@ -618,10 +679,17 @@ fn resolve_direct_tool_names(
             if !whole_server && !tool_filter.map(|f| f.contains(tool_name)).unwrap_or(false) {
                 continue;
             }
-            if is_tool_excluded(tool_name, server_name, prefix, definition.exclude_tools.as_deref()) {
+            if !is_tool_allowed(
+                tool_name,
+                server_name,
+                effective_prefix,
+                include,
+                exclude,
+                index.as_mut(),
+            ) {
                 continue;
             }
-            let prefixed = format_tool_name(tool_name, server_name, prefix);
+            let prefixed = format_tool_name(tool_name, server_name, effective_prefix);
             if is_builtin_name(&prefixed) || seen_names.contains(&prefixed) {
                 continue;
             }
@@ -651,11 +719,17 @@ fn resolve_direct_tool_names(
             if !whole_server && !tool_filter.map(|f| f.contains(&base_name)).unwrap_or(false) {
                 continue;
             }
-            if is_tool_excluded(&base_name, server_name, prefix, definition.exclude_tools.as_deref())
-            {
+            if !is_tool_allowed(
+                &base_name,
+                server_name,
+                effective_prefix,
+                include,
+                exclude,
+                index.as_mut(),
+            ) {
                 continue;
             }
-            let prefixed = format_tool_name(&base_name, server_name, prefix);
+            let prefixed = format_tool_name(&base_name, server_name, effective_prefix);
             if is_builtin_name(&prefixed) || seen_names.contains(&prefixed) {
                 continue;
             }
@@ -1072,10 +1146,10 @@ fn get_tool_prefix(value: Option<&str>) -> ToolPrefix {
     }
 }
 
-/// Port of `sanitizeServerPrefix` (`types.ts:667`) at its default `preserveProviderValid = true` —
-/// the twin of `cyrup_mcp::registration::sanitize_server_prefix(name, true)`. `[A-Za-z0-9_-]`
-/// survives verbatim; every other code point becomes `_<lowercase hex code point>_`. Iteration is by
-/// `char` because upstream's is by `Array.from`, i.e. by code point.
+/// Port of `sanitizeServerPrefix` (`types.ts:668`) — the twin of
+/// `cyrup_mcp::registration::sanitize_server_prefix`. `[A-Za-z0-9_-]` survives verbatim; every other
+/// code point becomes `_<lowercase hex code point>_`. Iteration is by `char` because upstream's is by
+/// `Array.from`, i.e. by code point.
 ///
 /// **MCP-370.** This module folded `-` into `_` instead, so `chrome-devtools` produced the prefix
 /// `chrome_devtools` while `cyrup_mcp::registration` registers `chrome-devtools`: every `mcp:`
@@ -1084,13 +1158,19 @@ fn get_tool_prefix(value: Option<&str>) -> ToolPrefix {
 /// **collides** two distinct servers (`a-b` and `a_b`) onto one prefix, which the escape form does
 /// not.
 ///
-/// The legacy grammar (`preserve_provider_valid = false`, `github_2d_mcp`) is not ported: upstream
-/// uses it only to build the alias candidates of `getToolNameCandidates`, which this module does not
-/// implement — see [`is_tool_excluded`].
-fn sanitize_server_prefix(server_name: &str) -> String {
+/// `preserve_provider_valid = true` (every naming call site) keeps `-`; `false` is the **legacy**
+/// grammar, which escapes it — `github-mcp` becomes `github_2d_mcp`. The legacy form exists only to
+/// build the alias candidates of [`tool_name_candidates`] (`getToolNameCandidates`,
+/// `types.ts:777`).
+fn sanitize_server_prefix(server_name: &str, preserve_provider_valid: bool) -> String {
     let mut out = String::with_capacity(server_name.len());
     for ch in server_name.chars() {
-        if ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' {
+        let valid = if preserve_provider_valid {
+            ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
+        } else {
+            ch.is_ascii_alphanumeric()
+        };
+        if valid {
             out.push(ch);
         } else {
             out.push('_');
@@ -1101,13 +1181,36 @@ fn sanitize_server_prefix(server_name: &str) -> String {
     out
 }
 
+/// `getLegacyServerPrefix` (`types.ts:764`) — the same four modes over the pre-`-`/`_` grammar, and
+/// the twin of `cyrup_mcp::registration`'s private `legacy_server_prefix`.
+fn legacy_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
+    match mode {
+        ToolPrefix::None => String::new(),
+        ToolPrefix::Short => {
+            let short = sanitize_server_prefix(strip_mcp_suffix(server_name), false);
+            if short.is_empty() { "mcp".to_string() } else { short }
+        }
+        ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix(server_name, false)),
+        ToolPrefix::Server => sanitize_server_prefix(server_name, false),
+    }
+}
+
+/// `formatLegacyToolName` (`types.ts:771`) — here the tool name loses **hyphens as well as dots**,
+/// which is the one place the two grammars differ on the tool half of the name.
+fn format_legacy_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> String {
+    let server_prefix = legacy_server_prefix(server_name, prefix);
+    let sanitized: String =
+        tool_name.chars().map(|c| if c == '.' || c == '-' { '_' } else { c }).collect();
+    if server_prefix.is_empty() { sanitized } else { format!("{server_prefix}_{sanitized}") }
+}
+
 /// Port of `getServerPrefix` (`types.ts:675`), and the twin of
 /// `cyrup_mcp::registration::server_prefix`.
 fn get_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
     match mode {
         ToolPrefix::None => String::new(),
         ToolPrefix::Short => {
-            let short = sanitize_server_prefix(strip_mcp_suffix(server_name));
+            let short = sanitize_server_prefix(strip_mcp_suffix(server_name), true);
             if short.is_empty() {
                 "mcp".to_string()
             } else {
@@ -1116,8 +1219,8 @@ fn get_server_prefix(server_name: &str, mode: ToolPrefix) -> String {
         }
         // `mcp__<server>_<tool>` — one underscore between server and tool. The double-underscore
         // form belongs to prompt slash commands (`formatPromptCommandName`), not to tool names.
-        ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix(server_name)),
-        ToolPrefix::Server => sanitize_server_prefix(server_name),
+        ToolPrefix::Mcp => format!("mcp__{}", sanitize_server_prefix(server_name, true)),
+        ToolPrefix::Server => sanitize_server_prefix(server_name, true),
     }
 }
 
@@ -1152,36 +1255,338 @@ fn format_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) -> S
     }
 }
 
-fn is_tool_excluded(
+/// `isGlob` (`types.ts:836`), the twin of `cyrup_mcp::registration`'s private `is_glob`.
+fn is_glob(pattern: &str) -> bool {
+    pattern.contains('*') || pattern.contains('?')
+}
+
+/// `globToRegExp(pattern).test(candidate)` (`types.ts:804-807`) with no regex engine — this crate
+/// has no `regex` dependency and does not acquire one for a two-metacharacter grammar. Upstream
+/// escapes `. + ^ $ { } ( ) | [ ] \`, maps `*` → `.*` and `?` → `.`, and anchors with `^…$`; every
+/// other character is literal.
+///
+/// `^…$` is not line-anchored and `.` matches no newline, so a `\n` in the candidate must be met by
+/// a literal `\n` in the pattern: matching line-for-line is exact, and lets [`glob_line_matches`]
+/// ignore newlines entirely.
+///
+/// The writer answers `None` — "matches nothing" — when `Regex::new` rejects the pattern or it
+/// exceeds the compiled-size ceiling. With this escape set the produced pattern is always
+/// syntactically valid, so the only case that reaches the writer's `None` is that ceiling; this
+/// matcher compiles nothing and so has no such failure mode.
+fn glob_matches(pattern: &str, candidate: &str) -> bool {
+    let mut candidate_lines = candidate.split('\n');
+    for pattern_line in pattern.split('\n') {
+        let Some(candidate_line) = candidate_lines.next() else {
+            return false;
+        };
+        if !glob_line_matches(pattern_line, candidate_line) {
+            return false;
+        }
+    }
+    candidate_lines.next().is_none()
+}
+
+/// Anchored `*`/`?` glob match over newline-free inputs, in the segment-split shape of
+/// [`crate::exec::model_scope`]'s own `globToRegExp` port, widened for `?`.
+///
+/// With newlines gone each `*`-separated segment has a **fixed** character length (`?` consumes
+/// exactly one), so a leftmost-first scan of each interior segment is optimal and the match cannot
+/// backtrack-fail.
+fn glob_line_matches(pattern: &str, text: &str) -> bool {
+    let mut segments = pattern.split('*');
+    // `split` on a non-empty separator always yields at least one element, so this arm is
+    // unreachable in practice; it keeps the function panic-free without an `expect`.
+    let Some(first) = segments.next() else {
+        return text.is_empty();
+    };
+    let Some(mut rest) = match_segment(text, first) else {
+        return false;
+    };
+    let tail: Vec<&str> = segments.collect();
+    let Some((last, middle)) = tail.split_last() else {
+        // No `*` at all: the single literal segment had to consume the whole text.
+        return rest.is_empty();
+    };
+    for segment in middle {
+        let Some(next) = find_segment(rest, segment) else {
+            return false;
+        };
+        rest = next;
+    }
+    match_segment_at_end(rest, last)
+}
+
+/// Match `segment` — literals plus `?`, never `*` and never `\n` — against the front of `text`,
+/// answering the unconsumed tail. `?` is regex `.`, so it consumes exactly one character.
+fn match_segment<'a>(text: &'a str, segment: &str) -> Option<&'a str> {
+    let mut rest = text;
+    for pattern_char in segment.chars() {
+        let mut chars = rest.chars();
+        let text_char = chars.next()?;
+        if pattern_char != '?' && pattern_char != text_char {
+            return None;
+        }
+        rest = chars.as_str();
+    }
+    Some(rest)
+}
+
+/// The leftmost position at which `segment` matches, answering the tail after it. An empty segment
+/// (from `**`, or a `*` at either end) is vacuously satisfied where it stands.
+fn find_segment<'a>(text: &'a str, segment: &str) -> Option<&'a str> {
+    let mut cursor = text;
+    loop {
+        if let Some(rest) = match_segment(cursor, segment) {
+            return Some(rest);
+        }
+        let mut chars = cursor.chars();
+        chars.next()?;
+        cursor = chars.as_str();
+    }
+}
+
+/// `segment` must end exactly at the end of `text` (the `$` anchor) without reaching back into what
+/// the interior segments already consumed — taking it from the remainder gives that for free.
+fn match_segment_at_end(text: &str, segment: &str) -> bool {
+    let Some(skip) = text.chars().count().checked_sub(segment.chars().count()) else {
+        return false;
+    };
+    let mut chars = text.chars();
+    for _ in 0..skip {
+        if chars.next().is_none() {
+            return false;
+        }
+    }
+    match_segment(chars.as_str(), segment).is_some_and(str::is_empty)
+}
+
+/// `getToolNameCandidates` (`types.ts:777`) — the twin of
+/// `cyrup_mcp::registration::tool_name_candidates`. Every name a user might plausibly have written
+/// in an `includeTools` / `excludeTools` entry: 5 expressions for the current grammar, **13** more
+/// for the legacy one. Heavy overlap makes the resulting set far smaller than 18.
+///
+/// A [`HashSet`], not the writer's `IndexSet`: the writer's order is read by one caller of its own
+/// (`is_tool_call_approval_required`'s legacy arm takes the *first* current candidate that is not
+/// the tool's original name), and this module has no such consumer — every read here is a
+/// membership or an "any matches" question.
+fn tool_name_candidates(
     tool_name: &str,
     server_name: &str,
     prefix: ToolPrefix,
-    exclude_tools: Option<&[String]>,
-) -> bool {
-    let Some(exclude_tools) = exclude_tools.filter(|e| !e.is_empty()) else {
-        return false;
-    };
-    // `getToolNameCandidates` (`types.ts:775`) builds the bare name plus one formatted name per
-    // mode; [`ToolPrefix::Mcp`] joins the list here because MCP-370 gave this module upstream's
-    // fourth mode. Upstream's other 13 expressions — the legacy `-`-folding grammar and its
-    // aliases — stay unported, as does `isToolAllowed`'s glob matching and `includeTools`; that is
-    // the remaining half of MCP-370 and is not widened here.
-    let candidates: HashSet<String> = [
-        normalize_tool_name(tool_name),
-        normalize_tool_name(&format_tool_name(tool_name, server_name, prefix)),
-        normalize_tool_name(&format_tool_name(tool_name, server_name, ToolPrefix::Server)),
-        normalize_tool_name(&format_tool_name(tool_name, server_name, ToolPrefix::Short)),
-        normalize_tool_name(&format_tool_name(tool_name, server_name, ToolPrefix::Mcp)),
-    ]
-    .into_iter()
-    .collect();
-    exclude_tools
-        .iter()
-        .any(|excluded| candidates.contains(&normalize_tool_name(excluded)))
+    include_legacy: bool,
+) -> HashSet<String> {
+    const MODES: [ToolPrefix; 3] = [ToolPrefix::Server, ToolPrefix::Short, ToolPrefix::Mcp];
+    let mut out = HashSet::new();
+    out.insert(tool_name.to_string());
+    out.insert(format_tool_name(tool_name, server_name, prefix));
+    for mode in MODES {
+        out.insert(format_tool_name(tool_name, server_name, mode));
+    }
+    if !include_legacy {
+        return out;
+    }
+    // `types.ts` group 1: the `-` → `_` tool name under every prefix.
+    let legacy_tool_name = tool_name.replace('-', "_");
+    out.insert(legacy_tool_name.clone());
+    out.insert(format_tool_name(&legacy_tool_name, server_name, prefix));
+    for mode in MODES {
+        out.insert(format_tool_name(&legacy_tool_name, server_name, mode));
+    }
+    // `types.ts` group 2: the pre-2.x server-prefix grammar.
+    out.insert(format_legacy_tool_name(tool_name, server_name, prefix));
+    for mode in MODES {
+        out.insert(format_legacy_tool_name(tool_name, server_name, mode));
+    }
+    // `types.ts` group 3: the current spellings, post-normalised.
+    out.insert(format_tool_name(tool_name, server_name, prefix).replace('-', "_"));
+    for mode in MODES {
+        out.insert(format_tool_name(tool_name, server_name, mode).replace('-', "_"));
+    }
+    out
 }
 
-fn normalize_tool_name(value: &str) -> String {
-    value.replace('-', "_")
+/// `matchesToolPattern` (`types.ts:828`): an exact membership test for a literal pattern, a glob
+/// test over every candidate otherwise. A literal pattern is **never** glob-matched, and a glob
+/// pattern is never compared literally — so a candidate holding a literal `*` can never be matched
+/// by a `*`-bearing pattern. Upstream's leading `patterns.length === 0` guard is folded into `any`,
+/// which answers `false` on an empty slice.
+fn matches_tool_pattern(candidates: &HashSet<String>, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        if is_glob(pattern) {
+            candidates.iter().any(|candidate| glob_matches(pattern, candidate))
+        } else {
+            candidates.contains(pattern)
+        }
+    })
+}
+
+/// `ToolSelectorCandidateIndex` (`types.ts:809`) — the *current* candidate names of every server
+/// with a valid cache entry, plus upstream's match-count memo. The writer also memoises the compiled
+/// regex (`matcherByPattern`); nothing is compiled here, so only the count table is carried.
+///
+/// The index is built over **all** servers, the one being filtered included — the subtraction is by
+/// match count in [`CandidateIndex::has_other_current_match`], not at build time.
+/// `additionalCurrentCandidatesByToolName` is deliberately absent: it exists only for
+/// `tool-metadata.ts`'s speculative arms, and `direct-tools.ts` never supplies it.
+#[derive(Debug, Default)]
+struct CandidateIndex {
+    all_current: HashSet<String>,
+    matching_count: HashMap<String, usize>,
+}
+
+impl CandidateIndex {
+    /// `indexHasOtherCurrentMatch` (`types.ts:846`) — does `pattern` name a *different* tool's
+    /// current name?
+    fn has_other_current_match(
+        &mut self,
+        current_candidates: &HashSet<String>,
+        pattern: &str,
+    ) -> bool {
+        if !is_glob(pattern) {
+            return self.all_current.contains(pattern) && !current_candidates.contains(pattern);
+        }
+        // Disjoint field borrows: the closure reads `all_current` while `matching_count` is
+        // borrowed mutably, exactly as the writer's `has_other_current_match` does.
+        let all_current = &self.all_current;
+        let total = *self.matching_count.entry(pattern.to_string()).or_insert_with(|| {
+            all_current.iter().filter(|candidate| glob_matches(pattern, candidate)).count()
+        });
+        if total == 0 {
+            return false;
+        }
+        let mine = current_candidates
+            .iter()
+            .filter(|candidate| {
+                self.all_current.contains(*candidate) && glob_matches(pattern, candidate)
+            })
+            .count();
+        total > mine
+    }
+}
+
+/// `matchesToolSelector` (`types.ts:889`), the three-step disambiguation rule:
+///
+/// 1. any **current** candidate matches a pattern → `true`;
+/// 2. no index supplied → fall back to matching the **full legacy** candidate set;
+/// 3. otherwise subtract the current set from the legacy set, and a pattern wins only if it matches
+///    a legacy-only candidate **and** does not name some other tool's current candidate.
+///
+/// Step 3 is what stops a legacy alias from silently filtering the wrong tool once two servers exist
+/// whose sanitized prefixes collide.
+fn matches_tool_selector(
+    tool_name: &str,
+    server_name: &str,
+    prefix: ToolPrefix,
+    patterns: &[String],
+    index: Option<&mut CandidateIndex>,
+) -> bool {
+    if patterns.is_empty() {
+        return false;
+    }
+    let current = tool_name_candidates(tool_name, server_name, prefix, false);
+    if matches_tool_pattern(&current, patterns) {
+        return true;
+    }
+    let Some(index) = index else {
+        return matches_tool_pattern(
+            &tool_name_candidates(tool_name, server_name, prefix, true),
+            patterns,
+        );
+    };
+    let mut legacy = tool_name_candidates(tool_name, server_name, prefix, true);
+    for candidate in &current {
+        legacy.remove(candidate);
+    }
+    patterns.iter().any(|pattern| {
+        matches_tool_pattern(&legacy, std::slice::from_ref(pattern))
+            && !index.has_other_current_match(&current, pattern)
+    })
+}
+
+/// `isToolAllowed` = `isToolIncluded && !isToolExcluded` (`types.ts:932`), the twin of
+/// `cyrup_mcp::registration::is_tool_allowed`. An absent or empty `includeTools` means "everything
+/// allowed"; `excludeTools` is the same selector rule, negated. JS `&&` short-circuits, so a tool
+/// the allowlist rejects never touches the memo table — and neither does it here.
+fn is_tool_allowed(
+    tool_name: &str,
+    server_name: &str,
+    prefix: ToolPrefix,
+    include_tools: Option<&[String]>,
+    exclude_tools: Option<&[String]>,
+    mut index: Option<&mut CandidateIndex>,
+) -> bool {
+    let included = match include_tools.filter(|p| !p.is_empty()) {
+        None => true,
+        Some(patterns) => {
+            matches_tool_selector(tool_name, server_name, prefix, patterns, index.as_deref_mut())
+        }
+    };
+    if !included {
+        return false;
+    }
+    match exclude_tools.filter(|p| !p.is_empty()) {
+        None => true,
+        Some(patterns) => !matches_tool_selector(tool_name, server_name, prefix, patterns, index),
+    }
+}
+
+/// `resolveToolPrefix` (`types.ts:702`, `cyrup_mcp::registration::resolve_tool_prefix`) — the
+/// per-server override if it parses, else the global.
+fn effective_tool_prefix(definition: &ServerEntry, global: ToolPrefix) -> ToolPrefix {
+    definition.tool_prefix.as_deref().and_then(parse_tool_prefix).unwrap_or(global)
+}
+
+/// `hasToolFilters` (`direct-tools.ts:153`) — whether this server needs the cross-server index at
+/// all. Upstream builds it lazily and so does this: the answer is identical either way, but the
+/// index is O(servers × tools) and most servers carry no filters.
+fn has_tool_filters(definition: &ServerEntry) -> bool {
+    definition.include_tools.as_ref().is_some_and(|v| !v.is_empty())
+        || definition.exclude_tools.as_ref().is_some_and(|v| !v.is_empty())
+}
+
+/// The `selectorCandidateIndex` builder (`direct-tools.ts:156-174`, the twin of
+/// `cyrup_mcp::registration`'s private `build_candidate_index`): every **current** candidate name of
+/// every server with a valid cache entry — tools, plus resources unless `exposeResources: false`.
+///
+/// The two `filter(|n| !n.is_empty())` guards, and the resource `uri` guard, are this reader's own
+/// emission guards from [`resolve_direct_tool_names`], repeated here so the index holds exactly the
+/// names this reader can emit. Upstream and the writer read `tool.name` / `resource.name` unguarded
+/// and check no `uri` at all.
+fn build_candidate_index(
+    config: &McpConfig,
+    cache: &MetadataCache,
+    global_prefix: ToolPrefix,
+) -> CandidateIndex {
+    let mut all_current = HashSet::new();
+    for (other_name, other_definition) in &config.mcp_servers {
+        let Some(entry) = cache.servers.get(other_name) else {
+            continue;
+        };
+        if !is_server_cache_valid(entry, other_definition) {
+            continue;
+        }
+        let other_prefix = effective_tool_prefix(other_definition, global_prefix);
+        for tool in entry.tools.iter().flatten() {
+            let Some(name) = tool.name.as_deref().filter(|n| !n.is_empty()) else {
+                continue;
+            };
+            all_current.extend(tool_name_candidates(name, other_name, other_prefix, false));
+        }
+        if other_definition.expose_resources == Some(false) {
+            continue;
+        }
+        for resource in entry.resources.iter().flatten() {
+            let (Some(name), Some(_uri)) = (
+                resource.name.as_deref().filter(|n| !n.is_empty()),
+                resource.uri.as_deref().filter(|u| !u.is_empty()),
+            ) else {
+                continue;
+            };
+            let base = format!("read_{}", resource_name_to_tool_name(name));
+            all_current.extend(tool_name_candidates(&base, other_name, other_prefix, false));
+        }
+    }
+    CandidateIndex { all_current, matching_count: HashMap::new() }
 }
 
 /// Port of pi `resourceNameToToolName`: non-alphanumerics → `_`, collapse runs, trim edge `_`,
@@ -1752,8 +2157,10 @@ mod tests {
         //     `` `read_${resourceNameToToolName(resource.name)}` ``, and that is the name
         //     `cyrup_mcp::registration` registers and that a user's `excludeTools` entry must match.
         //     The old expectation asserted a name nothing in the tree produces or accepts.
-        // `excludeTools: ["browser_click"]` still suppresses `click`: it matches the `short`-mode
-        // candidate `browser_click` under `normalize_tool_name`.
+        // `excludeTools: ["browser_click"]` still suppresses `click` under `isToolAllowed`: it is a
+        // literal (non-glob) pattern, and `browser_click` is a member of the tool's **current**
+        // candidate set — the `short`-mode spelling of `click` on `browser-mcp` — so step 1 of
+        // `matchesToolSelector` matches it without the index ever being consulted.
         assert_eq!(
             resolve(&fixture, &["browser-mcp"]),
             vec![
@@ -2474,8 +2881,12 @@ mod tests {
     #[test]
     fn a_cache_written_by_cyrup_mcp_resolves_through_this_reader() {
         let fixture = make_fixture();
-        // `includeTools` participates in the digest (MCP-141); this resolver does not yet FILTER on
-        // it (the remaining half of MCP-370), which is why every cached tool below still appears.
+        // `includeTools` participates in the digest (MCP-141) **and** is now applied by this
+        // resolver (`isToolAllowed`, MCP-370), which is why only the cached tool it admits appears
+        // below: `click` is a current candidate of the tool `click`, while the resource tool's
+        // current set is `{read_console_logs, browser-mcp_read_console_logs,
+        // browser_read_console_logs, mcp__browser-mcp_read_console_logs}` and its legacy set adds
+        // only `_`-folded variants — none of which is `click` or `navigate`.
         let definition = serde_json::json!({
             "command": "npx",
             "args": ["browser-mcp"],
@@ -2514,29 +2925,34 @@ mod tests {
             .expect("save cache");
 
         let resolved = resolve(&fixture, &["browser-mcp"]);
+        assert_eq!(resolved, vec!["browser-mcp_click".to_string()]);
+        // …and that is exactly the name the writer would register for the same metadata.
         assert_eq!(
             resolved,
-            vec![
-                "browser-mcp_click".to_string(),
-                "browser-mcp_read_console_logs".to_string()
-            ]
+            vec![cyrup_mcp::registration::format_tool_name(
+                "click",
+                "browser-mcp",
+                WriterToolPrefix::Server
+            )]
         );
-        // …and those are exactly the names the writer would register for the same metadata.
-        assert_eq!(
-            resolved,
-            vec![
-                cyrup_mcp::registration::format_tool_name(
-                    "click",
-                    "browser-mcp",
-                    WriterToolPrefix::Server
-                ),
-                cyrup_mcp::registration::format_tool_name(
-                    "read_console_logs",
-                    "browser-mcp",
-                    WriterToolPrefix::Server
-                ),
-            ]
-        );
+        // The same fixture read through the writer's own `isToolAllowed` agrees, tool for tool:
+        // `click` in, the resource tool out.
+        assert!(cyrup_mcp::registration::is_tool_allowed(
+            "click",
+            "browser-mcp",
+            WriterToolPrefix::Server,
+            Some(&["click".to_string(), "navigate".to_string()]),
+            None,
+            None,
+        ));
+        assert!(!cyrup_mcp::registration::is_tool_allowed(
+            "read_console_logs",
+            "browser-mcp",
+            WriterToolPrefix::Server,
+            Some(&["click".to_string(), "navigate".to_string()]),
+            None,
+            None,
+        ));
     }
 
     /// The fixture environment every resolved vector below was generated against, and the `homedir()`
