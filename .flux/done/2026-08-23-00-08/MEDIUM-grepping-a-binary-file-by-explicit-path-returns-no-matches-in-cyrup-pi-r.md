@@ -3,9 +3,9 @@ title: Grepping a binary file by explicit path returns no matches in cyrup; pi r
 priority: MEDIUM
 tool: grep
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:13
 ---
 
 # Grepping a binary file by explicit path returns no matches in cyrup; pi returns the matching lines

@@ -3,9 +3,9 @@ title: Rendered tool paths are not OSC-8 hyperlinks
 priority: LOW
 tool: all
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:06
 ---
 
 # Rendered tool paths are not OSC-8 hyperlinks

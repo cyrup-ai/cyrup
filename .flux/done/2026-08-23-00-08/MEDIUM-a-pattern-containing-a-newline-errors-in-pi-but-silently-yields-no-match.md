@@ -3,9 +3,9 @@ title: A pattern containing a newline errors in pi but silently yields "No match
 priority: MEDIUM
 tool: grep
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:11
 ---
 
 # A pattern containing a newline errors in pi but silently yields "No matches found" in cyrup

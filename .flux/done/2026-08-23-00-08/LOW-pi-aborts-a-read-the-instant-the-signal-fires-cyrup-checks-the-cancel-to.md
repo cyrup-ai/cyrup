@@ -3,9 +3,9 @@ title: Pi aborts a read the instant the signal fires; cyrup checks the cancel to
 priority: LOW
 tool: read
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:06
 ---
 
 # Pi aborts a read the instant the signal fires; cyrup checks the cancel token exactly once and never during the file read

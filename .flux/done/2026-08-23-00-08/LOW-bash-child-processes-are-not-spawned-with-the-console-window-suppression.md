@@ -3,9 +3,9 @@ title: Bash child processes are not spawned with the console-window suppression 
 priority: LOW
 tool: bash
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:05
 ---
 
 # Bash child processes are not spawned with the console-window suppression flag on Windows

@@ -3,9 +3,9 @@ title: Write/mkdir failure messages drop the errno code and Node's message shape
 priority: LOW
 tool: write
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:09
 ---
 
 # Write/mkdir failure messages drop the errno code and Node's message shape

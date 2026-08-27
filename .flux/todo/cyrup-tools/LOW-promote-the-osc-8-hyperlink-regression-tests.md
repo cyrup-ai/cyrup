@@ -4,8 +4,8 @@ priority: LOW
 tool: all
 source: exec follow-up from the OSC-8 hyperlink task
 stage: new
-status: done
-updated: 2026-08-27
+status: pending
+updated: 2026-08-27 14:04
 ---
 
 # The OSC-8 hyperlink feature shipped without permanent regression cover

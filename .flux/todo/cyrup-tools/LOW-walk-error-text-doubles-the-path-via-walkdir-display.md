@@ -4,8 +4,8 @@ priority: LOW
 tool: grep
 source: exec follow-up from the find-partial-results task
 stage: new
-status: done
-updated: 2026-08-27
+status: pending
+updated: 2026-08-27 14:04
 ---
 
 # `rg:`-prefixed walk errors double the path and interpose walkdir's wording

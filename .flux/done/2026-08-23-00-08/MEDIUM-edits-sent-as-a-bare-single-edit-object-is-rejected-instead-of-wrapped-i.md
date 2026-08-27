@@ -3,9 +3,9 @@ title: Edits sent as a bare single edit object is rejected instead of wrapped in
 priority: MEDIUM
 tool: edit
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:11
 ---
 
 # Edits sent as a bare single edit object is rejected instead of wrapped into a one-element array

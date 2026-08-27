@@ -3,9 +3,9 @@ title: Cancellation is only observed between candidate files, not during a file'
 priority: LOW
 tool: grep
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:05
 ---
 
 # Cancellation is only observed between candidate files, not during a file's search

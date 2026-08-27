@@ -3,9 +3,9 @@ title: Edits sent as a JSON string that parses to a single edit object is left u
 priority: MEDIUM
 tool: edit
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:12
 ---
 
 # Edits sent as a JSON string that parses to a single edit object is left unwrapped

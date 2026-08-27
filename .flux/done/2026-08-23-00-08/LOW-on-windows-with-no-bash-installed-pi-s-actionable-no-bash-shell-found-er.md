@@ -3,9 +3,9 @@ title: On Windows with no bash installed, pi's actionable No bash shell found er
 priority: LOW
 tool: bash
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27
+stage: qa
+status: completed
+updated: 2026-08-27 14:06
 ---
 
 # On Windows with no bash installed, pi's actionable No bash shell found error is replaced by an opaque spawn failure
