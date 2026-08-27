@@ -30,7 +30,10 @@ impl TranscriptView {
             || self.render_cache.width != width
             || self.render_cache.theme_generation != theme.generation;
         if stale {
-            let lines = self.lines(width, theme); // the current body, unchanged
+            // TUI-020 — the href table `tool_path_span` fills while `lines` runs. Built with the
+            // lines and stored with them, because the marker ids the spans carry index THIS table.
+            let links = crate::osc::LinkSink::new();
+            let lines = self.lines_with(width, theme, Some(&links)); // the current body, unchanged
             // Measure WRAPPED display rows, not logical lines: `markdown::render` emits ONE
             // un-wrapped `Line` per prose paragraph, so counting `lines.len()` under-counts a long
             // streaming paragraph. `wrapped_height` measures with the SAME word-wrap `render`
@@ -43,6 +46,7 @@ impl TranscriptView {
                 theme_generation: theme.generation,
                 lines,
                 wrapped_height,
+                links,
             };
         }
         &self.render_cache
@@ -66,7 +70,25 @@ impl TranscriptView {
     /// `examples/extensions/custom-header.ts:22` (X1). The buffer is run through
     /// [`trim_partial_closing_fence`](crate::markdown::trim_partial_closing_fence) so a streaming code
     /// fence does not flicker open/closed (`markdown.ts:25-48`).
+    ///
+    /// Test-only since TUI-020: the production caller is [`Self::cached_render`], which owns an
+    /// href sink and therefore goes straight to [`Self::lines_with`]. The tests that only read the
+    /// text back keep this two-argument shape.
+    #[cfg(test)]
     pub(super) fn lines(&self, width: usize, theme: &UiTheme) -> Vec<Line<'static>> {
+        self.lines_with(width, theme, None)
+    }
+
+    /// The styled lines of the active region, with the OSC-8 href sink the caller owns (TUI-020) —
+    /// the body [`Self::cached_render`] materialises. `None` renders the same lines with no link
+    /// marked: the shape every caller that does not own the resulting `Buffer` wants, and the shape
+    /// the test-only `lines()` wrapper above keeps for the tests that only read text back.
+    pub(super) fn lines_with(
+        &self,
+        width: usize,
+        theme: &UiTheme,
+        links: Option<&crate::osc::LinkSink>,
+    ) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
         // The live reasoning block renders ABOVE the answer text, the order Pi's content walk
         // produces for a reasoning model (thinking blocks precede the text blocks of the turn) —
@@ -144,6 +166,8 @@ impl TranscriptView {
                     width_cells: self.image_width_cells,
                     expand_key: self.expand_key(),
                     cwd: self.cwd.as_deref(),
+                    hyperlinks: self.hyperlinks,
+                    links,
                     tools_expanded: self.tool_expanded,
                     // A tool block draws no reasoning, so this is inert here — carried only so the
                     // bag has one construction shape.
@@ -185,5 +209,9 @@ impl Component for TranscriptView {
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0));
         frame.render_widget(para, area);
+        // TUI-020 — same ordering rule as the scrollback flush: inject only once the cells exist.
+        // `ForcedWidth` keeps `Buffer::diff_iter` advancing one column per escaped cell, so the
+        // frame-to-frame diff that drives the live viewport stays aligned.
+        crate::osc::inject(frame.buffer_mut(), &self.render_cache.links);
     }
 }

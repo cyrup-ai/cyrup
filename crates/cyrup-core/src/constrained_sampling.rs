@@ -17,13 +17,20 @@
 //! exist at all. `cyrup-provider` re-exports every item in this module from its `context` module,
 //! so the provider-facing paths are unchanged.
 //!
-//! # No built-in tool declares it — upstream or here
+//! # The four coding built-ins declare it — as of pi v0.84.2
 //!
-//! `git grep -n constrainedSampling v0.83.0 -- packages/coding-agent/src packages/agent/src`
-//! returns exactly three hits: the `ToolDefinition` field declaration and the two
-//! `tool-definition-wrapper.ts` copies above. pi's Edit/Write/Read/Bash tools do **not** declare
-//! it. The gap this module closes is therefore the *plumbing* — an extension-registered or guest
-//! tool can opt in and have the declaration reach the wire — not a missing built-in opt-in.
+//! At v0.83.0 no pi built-in declared the field: `git grep -n constrainedSampling v0.83.0 --
+//! packages/coding-agent/src packages/agent/src` returned exactly three hits, the `ToolDefinition`
+//! field declaration and the two `tool-definition-wrapper.ts` copies above. That changed with pi
+//! commit `7915cdac` — *"feat(ai): add strict tool schema conversion"*, first tagged **v0.84.2** —
+//! which added `constrainedSampling: getExperimentalToolSampling()` to `read`
+//! (`core/tools/read.ts:222`), the shared shell definition (`bash.ts:354`, so `powershell`
+//! inherits it), `edit.ts:329` and `write.ts:200`, plus `server/create-harness.ts:34`.
+//!
+//! [`experimental_tool_sampling`] below is `getExperimentalToolSampling`'s Rust counterpart, and
+//! `cyrup-tools` returns it from `Tool::constrained_sampling` on the same four tools. The
+//! plumbing this module also provides — an extension-registered or guest tool opting in and having
+//! the declaration reach the wire — is unchanged.
 
 /// Pi `Tool["constrainedSampling"]` — `false | ConstrainedSamplingConfig`
 /// (`packages/ai/src/types.ts:484` @v0.83.0, and `extensions/types.ts:463` on the
@@ -77,6 +84,43 @@ pub struct GrammarVariants {
     pub openai_lark: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_regex: Option<String>,
+}
+
+/// Pi `PREFER_STRICT_TOOL_SAMPLING` (`core/experimental.ts:1`) — the single value every coding
+/// built-in declares. A `static` because [`crate::Tool::constrained_sampling`] hands out a
+/// reference, so the value cannot be constructed per call.
+static PREFER_STRICT_TOOL_SAMPLING: ConstrainedSampling =
+    ConstrainedSampling::Config(ConstrainedSamplingConfig::JsonSchema {
+        strict: StrictSampling::Prefer,
+    });
+
+/// [`experimental_tool_sampling`] against an injected environment, so the `||` precedence is
+/// exercisable without touching process state. Same shape as
+/// `cyrup_tui::status::experimental_features_enabled_from`.
+pub fn experimental_tool_sampling_from(
+    get: impl Fn(&str) -> Option<String>,
+) -> Option<&'static ConstrainedSampling> {
+    let enabled = get("CYRUP_EXPERIMENTAL").as_deref() == Some("1")
+        || get("PI_EXPERIMENTAL").as_deref() == Some("1");
+    enabled.then_some(&PREFER_STRICT_TOOL_SAMPLING)
+}
+
+/// Pi `getExperimentalToolSampling` (`core/experimental.ts:7-9`): the strict-`prefer` JSON-schema
+/// declaration when the experimental flag is on, and nothing otherwise.
+///
+/// `CYRUP_EXPERIMENTAL` is the renamed primary and `PI_EXPERIMENTAL` survives as the
+/// lower-precedence fallback — the same pair, in the same order, as
+/// `cyrup::startup::are_experimental_features_enabled` (`startup.rs:76-84`) and
+/// `cyrup_tui::status::experimental_features_enabled` (`status.rs:474-483`). Upstream re-reads
+/// `process.env` on every call but only ever calls it while BUILDING a tool definition; the env is
+/// read once here and latched, because cyrup likewise builds its tool set once
+/// (`ToolRegistry::with_builtins`). A caller that mutates the process env and then rebuilds the
+/// registry would observe the latch as stale; [`experimental_tool_sampling_from`] is the escape
+/// hatch.
+pub fn experimental_tool_sampling() -> Option<&'static ConstrainedSampling> {
+    static RESOLVED: std::sync::OnceLock<Option<&'static ConstrainedSampling>> =
+        std::sync::OnceLock::new();
+    *RESOLVED.get_or_init(|| experimental_tool_sampling_from(|k| std::env::var(k).ok()))
 }
 
 #[cfg(test)]

@@ -92,6 +92,13 @@ impl Tool for ReadTool {
         vec!["Use read to examine files instead of cat or sed."]
     }
 
+    /// Pi `constrainedSampling: getExperimentalToolSampling()` (`core/tools/read.ts:222`
+    /// @v0.84.2). With `CYRUP_EXPERIMENTAL=1`/`PI_EXPERIMENTAL=1` this asks a strict-capable route
+    /// to constrain generation to the declared schema; `prefer` degrades silently elsewhere.
+    fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
+        cyrup_core::experimental_tool_sampling()
+    }
+
     async fn execute(
         &self,
         _call_id: ToolCallId,

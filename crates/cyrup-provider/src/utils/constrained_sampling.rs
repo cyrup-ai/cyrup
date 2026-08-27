@@ -1,13 +1,18 @@
 //! Provider-side constrained sampling for tools — a 1:1 port of Pi
-//! `packages/ai/src/api/constrained-sampling.ts` @**v0.83.0** (148 lines, 7 exports; the file is
-//! byte-identical at v0.84.1). PROV-011 / DRIFT-018.
+//! `packages/ai/src/api/constrained-sampling.ts` @**v0.84.2** (the file was byte-identical from
+//! v0.83.0 through v0.84.1; pi commit `7915cdac` — *"feat(ai): add strict tool schema
+//! conversion"*, first tagged v0.84.2 — added the strict-conversion half). PROV-011 / DRIFT-018.
 //!
 //! Two independent mechanisms share this module because upstream keeps them in one file:
 //!
-//! 1. **JSON-schema strict sampling** — [`resolve_json_schema_strict_sampling`]. A tool declaring
+//! 1. **JSON-schema strict sampling** — [`resolve_json_schema_strict_sampling`],
+//!    [`make_strict_json_schema`] and [`json_schema_tool_parameters`]. A tool declaring
 //!    `constrainedSampling: {type:"json_schema", strict:"prefer"|"require"}` asks the provider to
 //!    constrain generation to the declared schema. `prefer` degrades silently on a model that
-//!    cannot do it; `require` fails the request.
+//!    cannot do it; `require` fails the request. Resolving `strict` and CONVERTING the schema are
+//!    one indivisible step: a provider told `strict: true` rejects any schema outside the strict
+//!    subset, so every adapter serializes [`json_schema_tool_parameters`] rather than the tool's
+//!    raw `parameters`.
 //! 2. **Grammar-constrained tools** — [`resolve_grammar_constrained_sampling`] and
 //!    [`create_grammar_tool_input_properties`]. A tool declaring
 //!    `constrainedSampling: {type:"grammar", variants:{openai_lark|openai_regex}}` is serialized as
@@ -25,7 +30,7 @@
 //! reproduced verbatim, because it reaches `AssistantMessage.error_message` on both sides.
 
 use crate::context::{ConstrainedSamplingConfig, StrictSampling, ToolDef};
-use serde_json::{Map, Value};
+use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -52,6 +57,184 @@ type Result<T> = std::result::Result<T, ConstrainedSamplingError>;
 
 fn err<T>(message: impl Into<String>) -> Result<T> {
     Err(ConstrainedSamplingError(message.into()))
+}
+
+/// Pi `UNSUPPORTED_STRICT_SCHEMA_KEYS` (`constrained-sampling.ts:12-29` @v0.84.2). A schema
+/// carrying any of these cannot be expressed in the strict subset the providers constrain against.
+const UNSUPPORTED_STRICT_SCHEMA_KEYS: [&str; 16] = [
+    "$ref",
+    "$defs",
+    "definitions",
+    "allOf",
+    "oneOf",
+    "patternProperties",
+    "dependentSchemas",
+    "dependencies",
+    "unevaluatedProperties",
+    "propertyNames",
+    "contains",
+    "prefixItems",
+    "not",
+    "if",
+    "then",
+    "else",
+];
+
+/// Pi `isStructuredSchema` (`constrained-sampling.ts:35-44` @v0.84.2).
+fn is_structured_schema(schema: &Value) -> bool {
+    let Some(o) = schema.as_object() else {
+        return false;
+    };
+    let types: Vec<&str> = match o.get("type") {
+        Some(Value::String(s)) => vec![s.as_str()],
+        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect(),
+        _ => Vec::new(),
+    };
+    types.contains(&"object")
+        || types.contains(&"array")
+        || o.contains_key("properties")
+        || o.contains_key("items")
+}
+
+/// Pi `schemaAllowsNull` (`constrained-sampling.ts:46-51` @v0.84.2).
+fn schema_allows_null(schema: &Value) -> bool {
+    let Some(o) = schema.as_object() else {
+        return false;
+    };
+    let ty_is_null = match o.get("type") {
+        Some(Value::String(s)) => s == "null",
+        Some(Value::Array(a)) => a.iter().any(|v| v.as_str() == Some("null")),
+        _ => false,
+    };
+    if ty_is_null {
+        return true;
+    }
+    if o.get("const") == Some(&Value::Null) {
+        return true;
+    }
+    if o.get("enum")
+        .and_then(Value::as_array)
+        .is_some_and(|a| a.contains(&Value::Null))
+    {
+        return true;
+    }
+    o.get("anyOf")
+        .and_then(Value::as_array)
+        .is_some_and(|a| a.iter().any(schema_allows_null))
+}
+
+/// Pi `makeJsonSchemaNodeStrict` (`constrained-sampling.ts:53-115` @v0.84.2) — mutates `schema` in
+/// place. The error strings are pi's `UnsupportedStrictJsonSchemaError` messages verbatim; they
+/// reach the model through [`ConstrainedSamplingError`] exactly as pi's thrown text does.
+fn make_json_schema_node_strict(schema: &mut Value) -> Result<()> {
+    let Some(o) = schema.as_object_mut() else {
+        return err("boolean schemas are unsupported");
+    };
+    for key in UNSUPPORTED_STRICT_SCHEMA_KEYS {
+        if o.contains_key(key) {
+            return err(format!("{key} schemas are unsupported"));
+        }
+    }
+
+    if let Some(any_of) = o.get_mut("anyOf") {
+        let Some(variants) = any_of.as_array_mut().filter(|a| !a.is_empty()) else {
+            return err("anyOf must contain at least one schema");
+        };
+        for variant in variants.iter_mut() {
+            if is_structured_schema(variant) {
+                return err("object and array unions are unsupported");
+            }
+            make_json_schema_node_strict(variant)?;
+        }
+    }
+
+    if let Some(items) = o.get_mut("items") {
+        if items.is_array() {
+            return err("tuple schemas are unsupported");
+        }
+        make_json_schema_node_strict(items)?;
+    }
+
+    let is_object_schema = o.get("type") == Some(&Value::String("object".to_string()));
+    if o.contains_key("properties") && !is_object_schema {
+        return err("properties require type object");
+    }
+    if !is_object_schema {
+        return Ok(());
+    }
+    match o.get("additionalProperties") {
+        None | Some(Value::Bool(false)) => {}
+        Some(_) => return err("schema-valued or true additionalProperties is unsupported"),
+    }
+    if o.get("properties").is_some_and(|p| !p.is_object()) {
+        return err("object properties must be a schema map");
+    }
+    if o.get("required")
+        .is_some_and(|r| r.as_array().is_none_or(|a| a.iter().any(|k| !k.is_string())))
+    {
+        return err("object required must be a string array");
+    }
+
+    let required: Vec<String> = o
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    let property_names: Vec<String> = o
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|p| p.keys().cloned().collect())
+        .unwrap_or_default();
+    if required.iter().any(|k| !property_names.contains(k)) {
+        return err("required contains an unknown property");
+    }
+
+    if let Some(properties) = o.get_mut("properties").and_then(Value::as_object_mut) {
+        for (key, property) in properties.iter_mut() {
+            make_json_schema_node_strict(property)?;
+            // Pi wraps every non-required property in `anyOf: [property, {type:"null"}]`
+            // (`constrained-sampling.ts:110-112`) so the constrainer can require EVERY key while
+            // still letting the model decline one by emitting `null`.
+            if !required.contains(key) && !schema_allows_null(property) {
+                let inner = property.take();
+                *property = json!({ "anyOf": [inner, { "type": "null" }] });
+            }
+        }
+    }
+    o.insert("required".to_string(), json!(property_names));
+    o.insert("additionalProperties".to_string(), Value::Bool(false));
+    Ok(())
+}
+
+/// Pi `makeStrictJsonSchema` (`constrained-sampling.ts:117-127` @v0.84.2). Clones first — the
+/// caller's schema is never mutated (upstream `structuredClone`).
+pub fn make_strict_json_schema(schema: &Value) -> Result<Value> {
+    let mut cloned = schema.clone();
+    if !cloned.is_object() {
+        return err("root schema must have type object");
+    }
+    make_json_schema_node_strict(&mut cloned)?;
+    if cloned.get("type") != Some(&Value::String("object".to_string())) {
+        return err("root schema must have type object");
+    }
+    Ok(cloned)
+}
+
+/// Pi `getJsonSchemaToolParameters` (`constrained-sampling.ts:129-131` @v0.84.2) — the schema an
+/// adapter must serialize. Upstream does NOT catch the throw here: a `strict === true` that came
+/// from a caller DEFAULT rather than from [`resolve_json_schema_strict_sampling`] surfaces the raw
+/// message, so this returns `Err` carrying that same bare text.
+pub fn json_schema_tool_parameters(tool: &ToolDef, strict: bool) -> Result<Value> {
+    if strict {
+        make_strict_json_schema(&tool.parameters)
+    } else {
+        Ok(tool.parameters.clone())
+    }
 }
 
 /// The grammar encoding chosen for a tool (Pi `GrammarConstrainedSampling.format`,
@@ -202,10 +385,17 @@ fn infer_grammar_input_property(tool: &ToolDef) -> Result<String> {
     Ok(input_property.to_string())
 }
 
-/// Pi `resolveJsonSchemaStrictSampling` (`constrained-sampling.ts:83-97`).
+/// Pi `resolveJsonSchemaStrictSampling` (`constrained-sampling.ts:208-227` @v0.84.2).
 ///
 /// `Ok(None)` is upstream's `undefined` — the tool is serialized with no `strict` decision of its
 /// own. `Ok(Some(true))` is upstream's `true`; upstream never returns `false` here.
+///
+/// A route that CAN do strict mode still only gets `true` when the tool's schema actually converts
+/// to the strict subset ([`make_strict_json_schema`]); a schema that does not convert degrades to
+/// `None` under `prefer` and fails the request under `require`, carrying the conversion's own
+/// reason. Upstream distinguishes `UnsupportedStrictJsonSchemaError` from any other throw and
+/// rethrows the latter; every error [`make_strict_json_schema`] can produce here is of that one
+/// kind, so the Rust match needs no discriminant.
 pub fn resolve_json_schema_strict_sampling(
     tool: &ToolDef,
     supports_strict_mode: bool,
@@ -217,7 +407,14 @@ pub fn resolve_json_schema_strict_sampling(
     };
 
     if supports_strict_mode {
-        return Ok(Some(true));
+        return match make_strict_json_schema(&tool.parameters) {
+            Ok(_) => Ok(Some(true)),
+            Err(e) if *strict == StrictSampling::Require => err(format!(
+                "Tool \"{}\" requires JSON-schema constrained sampling, but {}.",
+                tool.name, e.0
+            )),
+            Err(_) => Ok(None),
+        };
     }
     if *strict == StrictSampling::Require {
         return err(format!(

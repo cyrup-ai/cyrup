@@ -88,6 +88,12 @@ impl Tool for WriteTool {
         vec!["Use write only for new files or complete rewrites."]
     }
 
+    /// Pi `constrainedSampling: getExperimentalToolSampling()` (`core/tools/write.ts:200`
+    /// @v0.84.2).
+    fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
+        cyrup_core::experimental_tool_sampling()
+    }
+
     async fn execute(
         &self,
         _call_id: ToolCallId,

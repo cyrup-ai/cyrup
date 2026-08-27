@@ -19,7 +19,8 @@ pub mod tool;
 
 pub use cancel::{CancelToken, RunCancel};
 pub use constrained_sampling::{
-    ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
+    experimental_tool_sampling, experimental_tool_sampling_from, ConstrainedSampling,
+    ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
 };
 pub use diagnostics::{
     append_assistant_message_diagnostic, create_assistant_message_diagnostic,

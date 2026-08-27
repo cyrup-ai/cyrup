@@ -154,6 +154,12 @@ pub struct TranscriptView {
     /// `AppState::image_renderer.is_graphical()` at boot and on session swap. Default `true` so a
     /// bare `TranscriptView::default()` in a test still exercises the inline raster path.
     graphical_images: bool,
+    /// `getCapabilities().hyperlinks` (`terminal-image.ts:130-143`). Boot default **false**, pi's
+    /// own conservative value; refined once by `App::detect_image_support`. Held here rather than
+    /// read from [`crate::image::hyperlinks_supported`] at paint time because that getter falls
+    /// back to an env sniff — the TUI-N11 hermeticity hole — which would make every header
+    /// assertion depend on the developer's `TERM_PROGRAM`.
+    hyperlinks: bool,
     /// `terminal.imageWidthCells` (Pi `maxWidthCells`, tool-execution.ts:348; default 60): the cell
     /// width an inline tool-result image is clamped to.
     image_width_cells: u16,
@@ -206,4 +212,8 @@ struct RenderCache {
     theme_generation: u64,
     lines: Vec<Line<'static>>,
     wrapped_height: usize,
+    /// The hrefs `lines` was built with (TUI-020). Cached alongside because the ids in the spans'
+    /// marker bits index THIS table; a cache hit that reused stale hrefs would link the right text
+    /// to the wrong file.
+    links: crate::osc::LinkSink,
 }

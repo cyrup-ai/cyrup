@@ -27,7 +27,7 @@ use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse
 use crate::stream::{StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use crate::utils::json_parse::parse_json_with_repair;
 use crate::utils::provider_retry::ProviderRetry;
@@ -341,13 +341,16 @@ pub(crate) fn build_params(
     // from `resolveGoogleFunctionCallingMode`, which can return `VALIDATED`; the old code mapped
     // `tool_choice` alone and so could never emit it.
     if !ctx.tools.is_empty() {
-        if let Some(tools) = convert_tools(&ctx.tools) {
+        // Hoisted so `convertTools` and `resolveGoogleFunctionCallingMode` share ONE capability
+        // read, exactly as `google-generative-ai.ts:374` binds `supportsStrictMode` once.
+        let supports_strict_mode = supports_google_strict_tool_sampling(model.id.as_str());
+        if let Some(tools) = convert_tools(&ctx.tools, supports_strict_mode)? {
             obj.insert("tools".to_string(), tools);
         }
         let mode = resolve_google_function_calling_mode(
             &ctx.tools,
             opts.tool_choice.as_ref(),
-            supports_google_strict_tool_sampling(model.id.as_str()),
+            supports_strict_mode,
         )?;
         if let Some(mode) = mode {
             obj.insert(
@@ -846,23 +849,33 @@ fn assistant_parts(am: &AssistantMessage, same: bool, include_id: bool) -> Vec<V
     parts
 }
 
-/// Convert tools to Gemini `functionDeclarations` (Pi `convertTools`, google-shared.ts:272-288).
-/// Uses `parametersJsonSchema` (full JSON Schema). `None` when there are no tools.
-pub(crate) fn convert_tools(tools: &[ToolDef]) -> Option<Value> {
+/// Convert tools to Gemini `functionDeclarations` (Pi `convertTools`, `google-shared.ts:318-339`
+/// @v0.84.2). Uses `parametersJsonSchema` (full JSON Schema). `None` when there are no tools.
+///
+/// PROV-011: `supports_strict_mode` is [`supports_google_strict_tool_sampling`] of the model id,
+/// threaded in from the caller (`google-generative-ai.ts:383` passes it as the third argument) so a
+/// tool that opted in is serialized with the STRICT-converted schema Gemini's `VALIDATED` mode
+/// constrains against. Upstream's `useParameters` legacy branch has no cyrup caller and is not
+/// ported.
+pub(crate) fn convert_tools(
+    tools: &[ToolDef],
+    supports_strict_mode: bool,
+) -> Result<Option<Value>, ConstrainedSamplingError> {
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
     let decls: Vec<Value> = tools
         .iter()
         .map(|t| {
-            json!({
+            let strict = resolve_json_schema_strict_sampling(t, supports_strict_mode)?;
+            Ok(json!({
                 "name": t.name,
                 "description": t.description,
-                "parametersJsonSchema": t.parameters,
-            })
+                "parametersJsonSchema": json_schema_tool_parameters(t, strict == Some(true))?,
+            }))
         })
-        .collect();
-    Some(json!([{ "functionDeclarations": decls }]))
+        .collect::<Result<Vec<Value>, ConstrainedSamplingError>>()?;
+    Ok(Some(json!([{ "functionDeclarations": decls }])))
 }
 
 /// Map a tool-choice to a Gemini `functionCallingConfig.mode` (Pi `mapToolChoice`,

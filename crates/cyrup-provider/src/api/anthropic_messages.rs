@@ -22,7 +22,7 @@ use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use crate::utils::deferred_tools::split_deferred_tools;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
@@ -1248,20 +1248,22 @@ pub(crate) fn convert_tools(
         .iter()
         .enumerate()
         .map(|(index, tool)| {
-            // PROV-011 — `anthropic-messages.ts:1298` @v0.83.0.
+            // PROV-011 — `anthropic-messages.ts:1337` @v0.84.2.
             let strict = resolve_json_schema_strict_sampling(tool, supports_strict_tools)?;
+            // `const parameters = getJsonSchemaToolParameters(tool, strict)` (`:1338` @v0.84.2):
+            // BOTH the legacy three-key subset and the strict spread are taken from the CONVERTED
+            // schema (`:1339-1344`), not from the tool's raw parameters.
+            let parameters = json_schema_tool_parameters(tool, strict == Some(true))?;
             let name = if is_oauth {
                 to_claude_code_name(&tool.name)
             } else {
                 tool.name.clone()
             };
-            let properties = tool
-                .parameters
+            let properties = parameters
                 .get("properties")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let required = tool
-                .parameters
+            let required = parameters
                 .get("required")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
@@ -1278,11 +1280,7 @@ pub(crate) fn convert_tools(
             legacy.insert("properties".to_string(), properties);
             legacy.insert("required".to_string(), required);
             let input_schema = if strict == Some(true) {
-                let mut merged = tool
-                    .parameters
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_else(Map::new);
+                let mut merged = parameters.as_object().cloned().unwrap_or_else(Map::new);
                 for (k, v) in &legacy {
                     merged.insert(k.clone(), v.clone());
                 }

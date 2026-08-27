@@ -27,7 +27,7 @@ use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions, ToolChoice};
 use crate::usage::compute_cost;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json_object};
@@ -474,7 +474,7 @@ pub(crate) fn to_function_tools(
                 "function": {
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.parameters,
+                    "parameters": json_schema_tool_parameters(t, strict == Some(true))?,
                     "strict": strict.unwrap_or(false),
                 },
             }))

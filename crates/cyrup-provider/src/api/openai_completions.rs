@@ -24,7 +24,7 @@ use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
 use crate::usage::apply_cost;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use crate::utils::hash::short_hash;
 use crate::utils::provider_retry::ProviderRetry;
@@ -846,7 +846,12 @@ pub(crate) fn convert_tools(
             let mut function = Map::new();
             function.insert("name".to_string(), json!(t.name));
             function.insert("description".to_string(), json!(t.description));
-            function.insert("parameters".to_string(), t.parameters.clone());
+            // `getJsonSchemaToolParameters(tool, strict)` (`openai-completions.ts:1490` @v0.84.2)
+            // — a route told `strict: true` rejects anything outside the strict subset.
+            function.insert(
+                "parameters".to_string(),
+                json_schema_tool_parameters(t, strict == Some(true))?,
+            );
             if compat.supports_strict_mode {
                 function.insert("strict".to_string(), json!(strict.unwrap_or(false)));
             }

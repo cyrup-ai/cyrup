@@ -149,10 +149,16 @@ pub trait Tool: Send + Sync {
     /// counterpart: the runtime `Tool` is where the loop reads it from.
     ///
     /// Default `None` = the field is absent, which upstream is indistinguishable from `false`
-    /// (`ConstrainedSampling::Disabled`). No pi built-in tool declares it — the three hits of
-    /// `git grep constrainedSampling v0.83.0 -- packages/coding-agent/src packages/agent/src` are
-    /// the field declaration and the two wrapper copies — so every built-in correctly keeps the
-    /// default.
+    /// (`ConstrainedSampling::Disabled`), and is what a tool with no opinion keeps.
+    ///
+    /// The four coding built-ins DO declare it as of pi `7915cdac` ("feat(ai): add strict tool
+    /// schema conversion", first tagged v0.84.2): `constrainedSampling:
+    /// getExperimentalToolSampling()` at `core/tools/read.ts:222`, `bash.ts:354` (the shared shell
+    /// definition, so upstream `powershell` inherits it from the same line), `edit.ts:329` and
+    /// `write.ts:200`, plus `server/create-harness.ts:34` for harness tools. `cyrup-tools` mirrors
+    /// that by returning [`crate::constrained_sampling::experimental_tool_sampling`]. An earlier
+    /// revision of this doc asserted the opposite; it was true at v0.83.0 and went stale at
+    /// v0.84.2.
     fn constrained_sampling(&self) -> Option<&crate::ConstrainedSampling> {
         None
     }

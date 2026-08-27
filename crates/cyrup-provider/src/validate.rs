@@ -1,5 +1,16 @@
 //! Tool-argument validation + coercion (func-01 R-01-034; arch-01 §3.9).
 //!
+//! [`validate_tool_call`] runs two stages, in pi's order (`validateToolArguments`,
+//! `pi/packages/ai/src/utils/validation.ts:317-320` @**v0.84.2**):
+//!
+//! 0. **`normalize_optional_nulls`** — `normalizeOptionalNulls` (`validation.ts:240-269`, added by
+//!    pi `7915cdac` alongside strict tool-schema conversion). A strict-converted schema requires
+//!    EVERY property and wraps each optional one in `anyOf: [T, {"type":"null"}]`, so the model
+//!    declines an argument by emitting `null`. That `null` is then measured against the tool's own
+//!    (non-strict) schema, where the falsy table below would fold it to `0`/`false`/`""`; deleting
+//!    the key first restores "absent".
+//! 1. **Coercion** — everything described below.
+//!
 //! A hand-rolled, schema-driven coercion pass using `serde_json` only (no external validator):
 //! it validates model-emitted tool arguments against a tool's JSON-Schema `parameters` and
 //! **coerces** compatible mismatches — `"123"` → `123`, `"true"` → `true`, recursing into objects
@@ -54,7 +65,75 @@ impl ToolValidationError {
 /// On success returns the coerced arguments; on an unrecoverable mismatch returns a
 /// [`ToolValidationError::Schema`] describing where it failed. `serde_json`-only; no panics.
 pub fn validate_tool_call(schema: &Value, arguments: Value) -> Result<Value, ToolValidationError> {
+    let mut arguments = arguments;
+    normalize_optional_nulls(&mut arguments, schema);
     coerce(schema, arguments, "$", false)
+}
+
+/// Pi `normalizeOptionalNulls` (`validation.ts:240-269` @v0.84.2, called as the FIRST statement of
+/// `validateToolArguments` at `:319`), run BEFORE coercion.
+///
+/// Strict constrained sampling forces every property into `required` and wraps each optional one in
+/// `anyOf: [T, {type:"null"}]` (see `make_json_schema_node_strict` in
+/// `utils::constrained_sampling`), so the model legitimately emits `"limit": null` for an argument
+/// it is declining. Validation still runs against the tool's OWN schema, where `limit` is
+/// `{"type":"number"}` — and the falsy coercion table turns that `null` into `0`
+/// ([`coerce_number`], pi `validation.ts:60-73`), which would run `read` with a zero-line limit and
+/// `bash` with a zero-second timeout. Deleting the key restores "absent".
+fn normalize_optional_nulls(value: &mut Value, schema: &Value) {
+    let Some(schema) = schema.as_object() else {
+        return;
+    };
+
+    if let Some(items) = value.as_array_mut() {
+        match schema.get("items") {
+            Some(Value::Array(tuple)) => {
+                for (index, item) in items.iter_mut().enumerate() {
+                    if let Some(item_schema) = tuple.get(index) {
+                        normalize_optional_nulls(item, item_schema);
+                    }
+                }
+            }
+            Some(item_schema) => {
+                for item in items.iter_mut() {
+                    normalize_optional_nulls(item, item_schema);
+                }
+            }
+            None => {}
+        }
+        return;
+    }
+
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return;
+    };
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+
+    for (key, property_schema) in properties {
+        let Some(current) = object.get_mut(key) else {
+            continue;
+        };
+        // Upstream skips `$ref` properties because it cannot compile a sub-validator for them;
+        // cyrup's coercer has no `$ref` support either, so the same key is skipped.
+        let is_ref = property_schema.get("$ref").is_some_and(Value::is_string);
+        // Upstream's `getSubSchemaValidator(propertySchema)?.Check(null) === false`. The STRICT
+        // pass of [`coerce`] accepts only a value that ALREADY has the exact JSON type the schema
+        // wants, so it is exactly that predicate: `{"type":"number"}` rejects null, while
+        // `{"type":["number","null"]}` and an `anyOf` containing `{"type":"null"}` accept it.
+        let rejects_null = coerce(property_schema, Value::Null, "$", true).is_err();
+        if current.is_null() && !required.contains(&key.as_str()) && !is_ref && rejects_null {
+            object.remove(key);
+        } else {
+            normalize_optional_nulls(current, property_schema);
+        }
+    }
 }
 
 /// By-name convenience matching the arch-01 §3.9 contract: locate the tool's schema in a

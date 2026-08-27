@@ -264,6 +264,13 @@ impl Tool for ShellTool {
         }
     }
 
+    /// Pi `constrainedSampling: getExperimentalToolSampling()` (`core/tools/bash.ts:354`
+    /// @v0.84.2). It sits on `createShellToolDefinition`, so upstream `powershell` carries the same
+    /// declaration from the same line — and so does cyrup's, this being the shared engine.
+    fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
+        cyrup_core::experimental_tool_sampling()
+    }
+
     async fn execute(
         &self,
         _call_id: ToolCallId,

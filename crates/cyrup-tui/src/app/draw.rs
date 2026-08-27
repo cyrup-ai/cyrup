@@ -140,6 +140,10 @@ impl<B: Backend> App<B> {
         let output_pad = self.state.transcript.output_pad();
         // Committed tool-result images keep rendering — a half-block raster is ordinary cells, so it
         // survives `insert_before` into native scrollback (see `ImageBlock::halfblock_lines`).
+        // TUI-020 — the hrefs `tool_path_span` registers while `entry_lines` runs, emitted as
+        // OSC-8 once the cells exist. Built per flush; empty on a hyperlink-incapable terminal, in
+        // which case `osc::inject` returns on its first line.
+        let links = crate::osc::LinkSink::new();
         let images = crate::transcript::ImageOpts {
             show: self.state.transcript.show_images(),
             // TUI-N01 — the committed path reads the same capability the live one does, so a block
@@ -151,6 +155,11 @@ impl<B: Backend> App<B> {
             // live one they were just scrolled up from.
             expand_key: self.state.transcript.expand_key(),
             cwd: self.state.transcript.cwd(),
+            // TUI-020 — the same OSC-8 capability the live render reads, for the same reason
+            // `graphical` is read here: a header that scrolled up must not disagree with the one
+            // still on screen.
+            hyperlinks: self.state.transcript.hyperlinks(),
+            links: Some(&links),
             // X14 — the LIVE `this.toolOutputExpanded`. Upstream never freezes an expansion onto a
             // message: `setToolsExpanded` walks `chatContainer.children` and re-broadcasts to every
             // expandable child (`interactive-mode.ts:4032-4046`), so a branch/compaction summary
@@ -177,6 +186,9 @@ impl<B: Backend> App<B> {
         self.terminal
             .insert_before(height, move |buf| {
                 Paragraph::new(lines).style(style).wrap(Wrap { trim: false }).render(buf.area, buf);
+                // AFTER the wrap: the escape must not be present while `Paragraph` measures
+                // columns, and the marked cells do not exist until it has written them.
+                crate::osc::inject(buf, &links);
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;
         Ok(())

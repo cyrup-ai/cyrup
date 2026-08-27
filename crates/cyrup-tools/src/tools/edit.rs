@@ -235,6 +235,13 @@ impl Tool for EditTool {
         ]
     }
 
+    /// Pi `constrainedSampling: getExperimentalToolSampling()` (`core/tools/edit.ts:329`
+    /// @v0.84.2), declared on the same object literal as `renderShell: "self"` and
+    /// `prepareArguments`.
+    fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
+        cyrup_core::experimental_tool_sampling()
+    }
+
     async fn execute(
         &self,
         _call_id: ToolCallId,
