@@ -105,10 +105,11 @@ cyrup-ext-subagents     = { workspace = true }
 # name. A dev edge only — this crate has no `[lib]`/`[dependencies]`, so it cannot reach the
 # shipping binary's feature unification (the PROV-052 trap the header documents).
 cyrup-mcp               = { workspace = true }
-# The GUEST sdk, on the HOST target. Two reasons it is here: `tests/ext/ergonomic.rs` drives its
-# ergonomic dispatch layer directly (the crate is `["cdylib", "rlib"]` precisely so that layer is
-# host-testable — crates/cyrup-ext-sdk/Cargo.toml:19), and `tests/ext/build_tier1.rs` uses it as the
-# authored-extension crate the Tier-1 build loop compiles. No `[workspace.dependencies]` entry
+# The GUEST sdk, on the HOST target. It is here for `tests/ext/build_tier1.rs`, which uses it as the
+# authored-extension crate the Tier-1 build loop compiles (`build_tier1.rs:48` resolves it as
+# `CARGO_MANIFEST_DIR/../cyrup-ext-sdk`). The second reason this edge once had is gone: the
+# ergonomic dispatch tests that drove the host rlib directly now live in the SDK itself, at
+# `crates/cyrup-ext-sdk/src/tests/ergonomic.rs`. No `[workspace.dependencies]` entry
 # exists for it (it is deliberately not a normal dependency of anything, being excluded from
 # default-members as a wasm32-wasip2 guest), so this is a path dep, matching `cyrup-test-support`
 # above. This edge is the HOST rlib only; the wasm32-wasip2 component comes from build.rs.

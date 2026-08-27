@@ -349,7 +349,7 @@ async fn ui_effects_are_dropped_when_the_manifest_denies_ui() {
 ///
 /// Asserted on the REGISTRY, not on the guest's own error text: the import is fire-and-forget and
 /// returns nothing, so "the guest was told no" is unobservable — what matters is that the host never
-/// recorded the provider. The fixture registers exactly one (`cyrup-ext-sdk/src/example.rs`
+/// recorded the provider. The fixture registers exactly one (`cyrup-ext-sdk/src/example/provider.rs`
 /// `api.add_autocomplete_provider(...)`), so the granted run is the control that proves the denial
 /// above is the grant and not a missing registration.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

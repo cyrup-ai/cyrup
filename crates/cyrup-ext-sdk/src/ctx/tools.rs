@@ -8,7 +8,11 @@ use super::Ctx;
 
 impl Ctx {
     /// The names of the currently-active tools (Pi `getActiveTools`).
-    pub fn get_active_tools(&self) -> Vec<String> {
+    ///
+    /// The returned `Vec` is EMPTY both when no tool is active and when the host sent JSON this SDK
+    /// could not parse: `super::parse_json` yields [`Value::Null`] on a parse failure, whose
+    /// `as_array()` is `None`, which this folds to the same empty `Vec` as an empty array.
+    pub fn active_tools(&self) -> Vec<String> {
         #[cfg(target_arch = "wasm32")]
         {
             return super::parse_json(crate::guest::bindings::cyrup::ext::ext_tools::get_active_tools())
@@ -20,7 +24,11 @@ impl Ctx {
         Vec::new()
     }
     /// All configured tools with metadata (Pi `getAllTools` → `ToolInfo[]`).
-    pub fn get_all_tools(&self) -> Value {
+    ///
+    /// [`Value::Null`] — NOT an empty array — when the host sent JSON this SDK could not parse
+    /// (`super::parse_json`'s fallback), so a caller that treats a non-array as "no tools" cannot
+    /// tell the two apart. The WIT import promises a JSON array (`wit/world.wit:969`).
+    pub fn all_tools(&self) -> Value {
         #[cfg(target_arch = "wasm32")]
         {
             return super::parse_json(crate::guest::bindings::cyrup::ext::ext_tools::get_all_tools());
@@ -37,7 +45,11 @@ impl Ctx {
         let _ = names_json;
     }
     /// Available slash commands (Pi `getCommands` → `SlashCommandInfo[]`).
-    pub fn get_commands(&self) -> Value {
+    ///
+    /// [`Value::Null`] — NOT an empty array — when the host sent JSON this SDK could not parse
+    /// (`super::parse_json`'s fallback), so a caller that treats a non-array as "no commands"
+    /// cannot tell the two apart. The WIT import promises a JSON array (`wit/world.wit:974`).
+    pub fn commands(&self) -> Value {
         #[cfg(target_arch = "wasm32")]
         {
             return super::parse_json(crate::guest::bindings::cyrup::ext::ext_tools::get_commands());
@@ -48,8 +60,13 @@ impl Ctx {
 
     /// Read a registered flag's resolved VALUE (Pi `getFlag(name)`, `types.ts:1269` @v0.83.0 (EXT-036 corrected `:1218`); sdk gap #23). The
     /// WIT `registration.get-flag` import returns the value (its default / CLI override) as JSON; this
-    /// wraps it. `None` when the flag is unregistered or has no value (Pi `undefined`).
-    pub fn get_flag(&self, name: &str) -> Option<Value> {
+    /// wraps it. `None` in THREE cases: the flag is unregistered, the flag has no value (Pi
+    /// `undefined` — the host's own two, `cyrup-ext/src/host/services.rs:1824-1825`), or the host
+    /// returned a string this SDK could not parse as JSON. The third is folded into the same `None`
+    /// because Pi's `getFlag` has no error channel; the host serializes a `serde_json::Value`
+    /// (`services.rs:1840`/`:1850`, `.to_string()`), so it is defensive against a non-cyrup host
+    /// rather than reachable today.
+    pub fn flag(&self, name: &str) -> Option<Value> {
         #[cfg(target_arch = "wasm32")]
         {
             return crate::guest::bindings::cyrup::ext::registration::get_flag(name)

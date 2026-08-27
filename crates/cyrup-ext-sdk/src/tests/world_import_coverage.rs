@@ -28,6 +28,19 @@
 
 const WORLD: &str = include_str!("../../wit/world.wit");
 
+/// The crate front page and the event-kind table it describes. Kept OUT of `SDK_SOURCES`: that
+/// constant is grepped for `module::name(` call paths, and folding prose into it would let a doc
+/// sentence satisfy an import-coverage check.
+const LIB_RS: &str = include_str!("../lib.rs");
+const API_RS: &str = include_str!("../api.rs");
+
+/// The `export_extension!` body, read as TEXT because that is the only way to see it from a host
+/// test: the macro's guest arm is `#[cfg(target_arch = "wasm32")]` (`src/macros.rs:34`), so on the
+/// target the default suite runs on, its event-kind literals are never parsed at all. Kept out of
+/// `SDK_SOURCES` for the same reason `LIB_RS` is — the macro is the world's EXPORT surface, and
+/// folding it in would let an export body satisfy an IMPORT-coverage check.
+const MACROS_RS: &str = include_str!("../macros.rs");
+
 /// Every `.rs` file in this crate that may hold a binding call, concatenated.
 const SDK_SOURCES: &str = concat!(
     include_str!("../ctx/base.rs"),
@@ -214,5 +227,202 @@ fn every_declared_world_import_has_a_caller_in_the_sdk() {
          cyrup-ext-sdk calls them, so no extension can reach them: {unwired:?}. wit-bindgen emits \
          an uncalled import without a warning — unlike the host side, where bindgen's generated \
          trait makes a missing member a compile error (EXT-M04 / EXT-M05)."
+    );
+}
+
+/// The crate-root doc opens by telling an author how many lifecycle events they may subscribe to,
+/// and `api::kind` is where that number actually comes from. Nothing connected the two: EXT-072
+/// raised the count to 33 in `api.rs`, `guest.rs` and `macros.rs` and left `lib.rs` reading 30 —
+/// next to a SEPARATE, correct "30 typed event payloads" that made the stale one read as
+/// deliberate. A wrong digit in prose is not a rustdoc warning and not a compile error, so the
+/// count is pinned to its source of truth here.
+#[test]
+fn crate_root_doc_states_the_real_event_count() {
+    let kind_mod = API_RS
+        .split_once("\nmod kind {\n")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("`mod kind {` block present in src/api.rs");
+    // Non-vacuity: prove the slice really spans the table — first discriminant to last — rather
+    // than an empty or truncated match that would make the count below meaningless.
+    assert!(
+        kind_mod.contains("TOOL_CALL: u8 = 0;") && kind_mod.contains("SESSION_INFO_CHANGED: u8 = 32;"),
+        "the `mod kind` slice lost its first or last discriminant, so this guard would be vacuous"
+    );
+
+    let kinds = kind_mod
+        .lines()
+        .filter(|line| line.starts_with("    pub const ") && line.contains(": u8 = "))
+        .count();
+
+    let (before, _) = LIB_RS
+        .split_once(" lifecycle events")
+        .expect("the crate-root doc states a `<n> lifecycle events` count");
+    let stated: usize = before
+        .rsplit(' ')
+        .next()
+        .and_then(|word| word.parse().ok())
+        .expect("the word before `lifecycle events` in the crate-root doc is that count");
+
+    assert_eq!(
+        stated, kinds,
+        "src/lib.rs advertises {stated} lifecycle events but `api::kind` declares {kinds} \
+         discriminants — update the crate-root doc (and check `api.rs`, `guest.rs`, `macros.rs`, \
+         which state the same number)."
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The event-kind discriminant, leg 2 of 3.
+//
+// The numbering exists in three hand-maintained copies: the host's `EventKind`
+// (`cyrup-ext/src/event.rs`), `mod kind` in this crate's `src/api.rs`, and the bare literals
+// `export_extension!` passes to `guest::hook`/`guest::notify`. This file checks the second pair;
+// `cyrup-ext/src/tests/event_kind_lockstep.rs` checks the first, in the crate that can see both.
+//
+// The macro literal is the leg with no compiler behind it. Its arm is `#[cfg(target_arch =
+// "wasm32")]`, so a wrong number is not even PARSED on the host target the default suite runs on;
+// and on wasm32 it still type-checks, because every discriminant is a `u8`. The guest then reports
+// one event's number for another event's export, and neither side can notice: the host's dispatch
+// (`cyrup-ext/src/host/live.rs`) maps the number through `EventKind::from_u8` and finds a perfectly
+// real kind, so the handler runs against another event's argument strings.
+// ---------------------------------------------------------------------------
+
+/// `on_*` exports of `export_extension!` that carry NO event kind, and why. `on_terminal_input` is
+/// the guest half of pi's `onTerminalInput` handler — it is routed by `guest::on_terminal_input`
+/// and returns a `TerminalInputResult`, not by the kind-numbered `hook`/`notify` pair.
+const NON_KIND_EXPORTS: &[&str] = &["on_terminal_input"];
+
+/// The `fn on_<name>` -> `api::kind::<CONST>` pairs that are NOT the SCREAMING_SNAKE of `<name>`.
+/// The exports are named after the events (`on_tool_execution_start`) and three of the consts are
+/// abbreviated (`TOOL_EXEC_START`), so the pairing cannot be a case conversion — a test that
+/// assumed one would report three false failures and tempt the next reader to rename the consts.
+const KIND_NAME_OVERRIDES: &[(&str, &str)] = &[
+    ("on_tool_execution_start", "TOOL_EXEC_START"),
+    ("on_tool_execution_update", "TOOL_EXEC_UPDATE"),
+    ("on_tool_execution_end", "TOOL_EXEC_END"),
+];
+
+/// The `pub const <NAME>: u8 = <N>;` table of `mod kind` in `src/api.rs`.
+fn kind_consts() -> Vec<(String, u32)> {
+    let body = API_RS
+        .split_once("\nmod kind {\n")
+        .and_then(|(_, rest)| rest.split_once("\n}\n"))
+        .map(|(body, _)| body)
+        .expect("`mod kind {` block present in src/api.rs");
+    body.lines()
+        .filter_map(|line| {
+            let (name, value) = line.trim().strip_prefix("pub const ")?.split_once(": u8 = ")?;
+            let value: u32 = value.trim().trim_end_matches(';').trim().parse().ok()?;
+            Some((name.trim().to_string(), value))
+        })
+        .collect()
+}
+
+/// Every `fn on_<name>` in `src/macros.rs`, paired with the first discriminant its body passes to
+/// `guest::hook` / `guest::notify` — `None` when the body delegates somewhere else.
+fn macro_event_exports() -> Vec<(String, Option<u32>)> {
+    let lines: Vec<&str> = MACROS_RS.lines().collect();
+    let mut out: Vec<(String, Option<u32>)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim_start().strip_prefix("fn on_") else { continue };
+        let Some((suffix, _)) = rest.split_once('(') else { continue };
+        let mut discriminant = None;
+        // Stop at the next `fn `: a body that dispatches no kind must come back `None` rather than
+        // silently adopt the following export's literal and pass for the wrong reason.
+        for (j, body_line) in lines.iter().enumerate().skip(i + 1) {
+            let trimmed = body_line.trim_start();
+            if trimmed.starts_with("fn ") {
+                break;
+            }
+            let Some((_, after)) = trimmed
+                .split_once("guest::hook(")
+                .or_else(|| trimmed.split_once("guest::notify("))
+            else {
+                continue;
+            };
+            // Calls with many arguments are wrapped by rustfmt, which puts the discriminant alone
+            // on the next line.
+            let digits = if after.trim().is_empty() { lines.get(j + 1).copied().unwrap_or_default() } else { after };
+            discriminant =
+                digits.trim_start().chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok();
+            break;
+        }
+        out.push((format!("on_{suffix}"), discriminant));
+    }
+    out
+}
+
+#[test]
+fn every_numbered_macro_export_matches_its_mod_kind_discriminant() {
+    let kinds = kind_consts();
+    assert!(
+        kinds.len() >= 33,
+        "`mod kind` in src/api.rs parsed as only {} const(s) — this guard would be vacuous",
+        kinds.len()
+    );
+
+    let mut mismatched: Vec<String> = Vec::new();
+    let mut unaccounted: Vec<String> = Vec::new();
+    let mut allowlisted: Vec<String> = Vec::new();
+    let mut paired = 0usize;
+
+    for (export, literal) in macro_event_exports() {
+        let Some(literal) = literal else {
+            if NON_KIND_EXPORTS.contains(&export.as_str()) {
+                allowlisted.push(export);
+            } else {
+                unaccounted.push(export);
+            }
+            continue;
+        };
+        let const_name = KIND_NAME_OVERRIDES
+            .iter()
+            .find(|(export_name, _)| *export_name == export)
+            .map(|(_, const_name)| (*const_name).to_string())
+            .unwrap_or_else(|| export.trim_start_matches("on_").to_uppercase());
+        match kinds.iter().find(|(name, _)| *name == const_name) {
+            Some((_, declared)) if *declared == literal => paired += 1,
+            Some((_, declared)) => mismatched.push(format!(
+                "`{export}` reports kind {literal} to the host, but `api::kind::{const_name}` is {declared}"
+            )),
+            None => mismatched.push(format!(
+                "`{export}` maps to `api::kind::{const_name}`, which `mod kind` does not declare — \
+                 add it, or add the export to KIND_NAME_OVERRIDES / NON_KIND_EXPORTS"
+            )),
+        }
+    }
+
+    assert!(
+        mismatched.is_empty(),
+        "{} `export_extension!` export(s) disagree with `api::kind`. The macro literal is what the \
+         guest actually sends, and `ExtensionApi` subscribes and dispatches by the const, so a \
+         disagreement routes an event to the wrong handler (or to none) with no diagnostic \
+         anywhere:\n  {}",
+        mismatched.len(),
+        mismatched.join("\n  "),
+    );
+    assert!(
+        unaccounted.is_empty(),
+        "these `export_extension!` exports pass no discriminant to `guest::hook`/`guest::notify`: \
+         {unaccounted:?}. If that is deliberate, add each to NON_KIND_EXPORTS with the reason; \
+         otherwise the export is dead — the host will emit the event and no handler will run."
+    );
+    for entry in NON_KIND_EXPORTS {
+        assert!(
+            allowlisted.iter().any(|export| export == entry),
+            "NON_KIND_EXPORTS lists `{entry}`, but src/macros.rs has no such kindless `on_*` export \
+             any more — drop the stale entry so the allowlist keeps meaning something"
+        );
+    }
+    // Non-vacuity, the shape `every_ctx_submodule_is_in_sdk_sources` uses: the loops above are all
+    // satisfied trivially by a parse that finds nothing, so the COUNT is the only evidence this
+    // guard read the macro at all. 33 is the full event catalog (`EventKind::COUNT`), so the floor
+    // also catches an export that is deleted rather than renumbered.
+    assert!(
+        paired >= 33,
+        "only {paired} numbered `on_*` export(s) were paired with an `api::kind` const — \
+         src/macros.rs declares one per event kind, so this parse lost some and the guard is \
+         checking almost nothing"
     );
 }

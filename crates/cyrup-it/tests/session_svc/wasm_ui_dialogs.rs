@@ -5,7 +5,8 @@
 //! `crates/cyrup-modes/src/rpc.rs`'s `run_rpc` already used) — not a stub, not a canned answer, and
 //! not a self-deadlock.
 //!
-//! `confirmdemo`/`inputdemo`/`selectdemo`/`editordemo` (`cyrup-ext-sdk/src/example.rs`) each open ONE
+//! `confirmdemo`/`inputdemo`/`selectdemo`/`editordemo` (`cyrup-ext-sdk/src/example/commands_ui.rs`)
+//! each open ONE
 //! dialog of the matching kind, then open a SECOND `confirm` dialog whose PROMPT embeds the value just
 //! received — proving the guest resumes with the REAL answer (not a default), across TWO SEQUENTIAL
 //! synchronous host round trips from a SINGLE guest invocation. A scripted [`UiSink`] answers each
@@ -273,7 +274,7 @@ async fn wasm_guest_dialog_delayed_past_the_epoch_budget_does_not_wedge_the_exte
     session.wait_for_idle().await;
 
     // The delayed reply still resolved to the REAL answer, not a timeout/trap-induced default —
-    // `confirmdemo` (`cyrup-ext-sdk/src/example.rs`) notifies `"confirmed: {ok}"` right after the
+    // `confirmdemo` (`cyrup-ext-sdk/src/example/commands_ui.rs`) notifies `"confirmed: {ok}"` right after the
     // FIRST (delayed) dialog returns, before ever opening its second, nested confirm.
     let notifications = ext.guest().notifications();
     assert!(

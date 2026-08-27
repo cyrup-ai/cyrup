@@ -20,18 +20,25 @@ pub struct CommandCtx {
 }
 
 impl CommandCtx {
+    /// A command-tier context. The wrapped [`Ctx`] is a unit struct reaching the host through WIT
+    /// imports, so this binds nothing and talks to no host.
     pub fn new() -> Self {
         Self { base: Ctx }
     }
+    /// The base context underneath — everything an event handler gets, without the `control` ops
+    /// this type adds.
     pub fn ctx(&self) -> &Ctx {
         &self.base
     }
+    /// UI surface, delegating to [`Ctx::ui`].
     pub fn ui(&self) -> Ui {
         self.base.ui()
     }
+    /// Read-only session view + state persistence, delegating to [`Ctx::session`].
     pub fn session(&self) -> Session {
         self.base.session()
     }
+    /// Model registry view, delegating to [`Ctx::models`].
     pub fn models(&self) -> Models {
         self.base.models()
     }
@@ -50,6 +57,10 @@ impl CommandCtx {
     /// toolSnippets?, promptGuidelines?, appendSystemPrompt?, cwd, contextFiles?, skills?}` — and
     /// with no session backend the host answers pi's own default, `{cwd}` alone
     /// (`core/extensions/runner.ts:287`), rather than an error: a one-key bag is a valid answer.
+    ///
+    /// The host target has no host to answer at all, so it takes the `Err` arm of the module rule
+    /// (see [`crate::ctx`]) rather than fabricating a bag: `Ok(Value::Null)` would let a
+    /// host-target `system_prompt_options()?.get("cwd")` return `None` and assert nothing.
     pub fn system_prompt_options(&self) -> Result<serde_json::Value, String> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -57,9 +68,11 @@ impl CommandCtx {
             return serde_json::from_str(&raw).map_err(|e| format!("system prompt options: {e}"));
         }
         #[cfg(not(target_arch = "wasm32"))]
-        Ok(serde_json::Value::Null)
+        Err("system_prompt_options unavailable on host target".into())
     }
 
+    /// Start a new session with no options — [`Self::new_session_with`] against a default
+    /// [`NewSessionOptions`].
     pub fn new_session(&self) -> Result<(), String> {
         self.new_session_with(&NewSessionOptions::default())
     }
@@ -68,6 +81,8 @@ impl CommandCtx {
         let opts = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         control(Control::NewSession(&opts))
     }
+    /// Switch to `session_id` with no options — [`Self::switch_session_with`] against a default
+    /// [`SwitchSessionOptions`].
     pub fn switch_session(&self, session_id: &str) -> Result<(), String> {
         self.switch_session_with(session_id, &SwitchSessionOptions::default())
     }
@@ -80,6 +95,7 @@ impl CommandCtx {
         let opts = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         control(Control::Switch(session_id, &opts))
     }
+    /// Fork at `entry_id` with no options — [`Self::fork_with`] against a default [`ForkOptions`].
     pub fn fork(&self, entry_id: &str) -> Result<(), String> {
         self.fork_with(entry_id, &ForkOptions::default())
     }
@@ -131,14 +147,21 @@ impl CommandCtx {
         let opts_json = opts_with_callback(opts, Box::new(with_session));
         control(Control::Switch(session_id, &opts_json))
     }
+    /// Navigate to `entry_id` with author-supplied options.
+    ///
+    /// `opts` encoding is fallible; the failure is returned as `Err` rather than navigating with an
+    /// empty option bag the author never asked for.
     pub fn navigate(&self, entry_id: &str, opts: impl Serialize) -> Result<(), String> {
-        let opts = serde_json::to_string(&opts).unwrap_or_else(|_| "{}".into());
+        let opts = serde_json::to_string(&opts).map_err(|e| format!("navigate: {e}"))?;
         control(Control::Navigate(entry_id, &opts))
     }
     /// Navigate the session tree with typed options (Pi `navigateTree(targetId, {summarize, …})`).
     pub fn navigate_with(&self, entry_id: &str, opts: &NavigateOptions) -> Result<(), String> {
         self.navigate(entry_id, opts)
     }
+    /// Send the host's `reload` control op (WIT `control.reload`, `wit/world.wit:1057`). Like every
+    /// `control.*` op it is command-tier — the host's handler opens with `require_command_tier`
+    /// (`cyrup-ext/src/host/live.rs:1130-1134`), so an event handler gets the deadlock-guard error.
     pub fn reload(&self) -> Result<(), String> {
         control(Control::Reload)
     }
@@ -156,29 +179,38 @@ impl CommandCtx {
         let opts_json = serde_json::to_string(opts).unwrap_or_else(|_| "{}".into());
         control(Control::Compact(&opts_json))
     }
+    /// Send the host's `wait-idle` control op (WIT `control.wait-idle`, `wit/world.wit:1063`).
+    /// Command-tier: the host's handler opens with `require_command_tier`
+    /// (`cyrup-ext/src/host/live.rs:1151-1155`).
     pub fn wait_idle(&self) -> Result<(), String> {
         control(Control::WaitIdle)
     }
+    /// Set the model. NOT command-only (EXT-074 / GAP-11) — this is a delegating wrapper kept for
+    /// source compatibility; the implementation and its citations live on [`Models::set_model`].
+    ///
+    /// `model` is encoded HERE, not in the delegate, so an author-type encode failure is returned
+    /// as `Err` instead of setting the model to `null`. This is the one failure the WIT
+    /// `set-model: func(model-json: string)` (void) lets the SDK see; a host-side rejection is not
+    /// observable through the return value. The [`serde_json::Value`] handed to the delegate
+    /// re-encodes infallibly.
     pub fn set_model(&self, model: impl Serialize) -> Result<(), String> {
-        let m = serde_json::to_string(&model).unwrap_or_else(|_| "null".into());
-        #[cfg(target_arch = "wasm32")]
-        {
-            crate::guest::bindings::cyrup::ext::models::set_model(&m);
-            return Ok(());
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = m;
-            Ok(())
-        }
+        let model = serde_json::to_value(model).map_err(|e| format!("set_model: {e}"))?;
+        self.models().set_model(model)
     }
+    /// Queue an author-supplied message.
+    ///
+    /// Both `message` and `opts` are author-supplied; either encoding failing is returned as `Err`
+    /// rather than sending a `null` message or dropping the options.
     pub fn send_message(&self, message: impl Serialize, opts: impl Serialize) -> Result<(), String> {
-        let m = serde_json::to_string(&message).unwrap_or_else(|_| "null".into());
-        let o = serde_json::to_string(&opts).unwrap_or_else(|_| "{}".into());
+        let m = serde_json::to_string(&message).map_err(|e| format!("send_message message: {e}"))?;
+        let o = serde_json::to_string(&opts).map_err(|e| format!("send_message opts: {e}"))?;
         control(Control::SendMessage(&m, &o))
     }
+    /// Queue a user-authored message with author-supplied options.
+    ///
+    /// An `opts` encode failure is returned as `Err` rather than sending with an empty option bag.
     pub fn send_user_message(&self, content: &str, opts: impl Serialize) -> Result<(), String> {
-        let o = serde_json::to_string(&opts).unwrap_or_else(|_| "{}".into());
+        let o = serde_json::to_string(&opts).map_err(|e| format!("send_user_message opts: {e}"))?;
         control(Control::SendUserMessage(content, &o))
     }
 }

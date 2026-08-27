@@ -18,6 +18,9 @@ pub struct Signal {
 }
 
 impl Signal {
+    /// Bind a signal to a tool `call_id` — the id [`Self::is_aborted`] asks the host about.
+    /// [`ToolCall::new`] already does this for the call it builds, so a tool `execute` body reads
+    /// [`ToolCall::signal`] rather than constructing one.
     pub fn new(call_id: impl Into<String>) -> Self {
         Self { call_id: call_id.into() }
     }
@@ -37,14 +40,20 @@ impl Signal {
 /// `emit_update` streams partial output back to the runtime (Pi `onUpdate`).
 #[derive(Clone, Debug)]
 pub struct ToolCall {
+    /// The host's id for this call (Pi `toolCallId`) — the key [`Self::emit_update`] streams
+    /// against and the one [`Self::signal`] polls.
     pub call_id: String,
+    /// The call's arguments, already parsed out of the host's JSON (Pi `params`).
     pub params: Value,
+    /// The capability context for this call — the same [`Ctx`] an event handler receives.
     pub ctx: Ctx,
     /// The cancellation signal (Pi `signal`): poll [`Signal::is_aborted`] inside a long `execute`.
     pub signal: Signal,
 }
 
 impl ToolCall {
+    /// Build a call from the host's id and its parsed `params`, binding a [`Signal`] to that same
+    /// id.
     pub fn new(call_id: impl Into<String>, params: Value) -> Self {
         let call_id = call_id.into();
         Self { signal: Signal::new(call_id.clone()), call_id, params, ctx: Ctx }
@@ -54,8 +63,25 @@ impl ToolCall {
         &self.signal
     }
     /// Stream a partial-output chunk (Pi `onUpdate`).
+    ///
+    /// **On an encode failure NO chunk is streamed.** `chunk` is author-supplied and its
+    /// `serde_json` encoding is fallible; rather than streaming a `null` chunk into the runtime's
+    /// partial-output channel, the update is skipped and the error is surfaced as an error-severity
+    /// [`Ui::notify_with`] notification. The signature stays `()` — Pi's `onUpdate` has no return
+    /// value to fold an `Err` into.
+    ///
+    /// [`Ui::notify_with`]: crate::Ui::notify_with
     pub fn emit_update(&self, chunk: impl Serialize) {
-        let chunk_json = serde_json::to_string(&chunk).unwrap_or_else(|_| "null".into());
+        let chunk_json = match serde_json::to_string(&chunk) {
+            Ok(c) => c,
+            Err(e) => {
+                self.ctx.ui().notify_with(
+                    &format!("emit_update({}): chunk dropped, failed to encode: {e}", self.call_id),
+                    crate::ctx::NotifyKind::Error,
+                );
+                return;
+            }
+        };
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::host_tool::emit_update(&self.call_id, &chunk_json);
         #[cfg(not(target_arch = "wasm32"))]

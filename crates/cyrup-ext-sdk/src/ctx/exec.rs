@@ -35,8 +35,13 @@ impl Ctx {
 /// timeout/abort — Pi's exact `killProcess` escalation (exec.ts:52-63).
 #[derive(Clone, Debug, Default)]
 pub struct ExecResult {
+    /// The child's exit code (WIT `types.exec-result.code`, `wit/world.wit:141`).
     pub code: i32,
+    /// Everything the child wrote to stdout, captured for the whole run.
     pub stdout: String,
+    /// Everything the child wrote to stderr, captured for the whole run.
     pub stderr: String,
+    /// Whether the host killed the process group instead of letting it exit — see the type doc
+    /// above for the SIGTERM-then-SIGKILL escalation this reports.
     pub killed: bool,
 }

@@ -13,7 +13,8 @@
 //! blob where Pi draws the component. Every other renderer test used a NATIVE extension returning a
 //! bare string, so the widget path had no end-to-end coverage at all.
 //!
-//! This test therefore uses the REAL demo component (`cyrup-ext-sdk/src/example.rs`, whose
+//! This test therefore uses the REAL demo component (`cyrup-ext-sdk/src/example/renderers.rs`,
+//! whose
 //! `DemoToolRenderer` returns a multi-node `container`) and asserts on TERMINAL CELLS.
 //!
 //! MIGRATION NOTES (mechanical only; no assertion changed):

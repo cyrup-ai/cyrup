@@ -20,10 +20,17 @@ use super::{Models, Session, Ui};
 /// tests), where the bindings module does not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum ExtMode {
+    /// `"tui"` — the interactive terminal UI, and the [`Default`]. Pi's guidance on [`Ctx::mode`]:
+    /// guard terminal-only UI such as custom components on this variant.
     #[default]
     Tui,
+    /// `"rpc"`. Dialog-capable like [`ExtMode::Tui`]: pi documents [`Ctx::has_ui`] as "true in TUI
+    /// and RPC modes" (types.ts:313).
     Rpc,
+    /// `"json"`. NOT dialog-capable, so [`Ui::confirm`] and its siblings answer with their inert
+    /// default instead of reaching a human — check [`Ctx::has_ui`] first.
     Json,
+    /// `"print"`. NOT dialog-capable, like [`ExtMode::Json`].
     Print,
 }
 
@@ -44,6 +51,9 @@ impl ExtMode {
 pub struct Ctx;
 
 impl Ctx {
+    /// A capability context handle. [`Ctx`] is a unit struct — every method reaches the host
+    /// through a WIT import instead of through stored state — so this costs nothing and talks to
+    /// no host.
     pub fn new() -> Self {
         Ctx
     }
@@ -81,8 +91,25 @@ impl Ctx {
     }
 
     /// Emit on the inter-extension event bus (R-08-029).
+    ///
+    /// **On an encode failure NOTHING is emitted.** `payload` is author-supplied and its
+    /// `serde_json` encoding is fallible; rather than publishing a `null` payload that every
+    /// subscriber would read as a real message, the emit is skipped and the error is surfaced as an
+    /// error-severity [`Ui::notify_with`] notification. The signature stays `()` — there is no
+    /// delivery receipt on the bus to fold an `Err` into.
+    ///
+    /// [`Ui::notify_with`]: crate::Ui::notify_with
     pub fn emit(&self, topic: &str, payload: impl Serialize) {
-        let payload = serde_json::to_string(&payload).unwrap_or_else(|_| "null".into());
+        let payload = match serde_json::to_string(&payload) {
+            Ok(p) => p,
+            Err(e) => {
+                self.ui().notify_with(
+                    &format!("ctx.emit(\"{topic}\"): payload dropped, failed to encode: {e}"),
+                    crate::ctx::NotifyKind::Error,
+                );
+                return;
+            }
+        };
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::bus::emit(topic, &payload);
         #[cfg(not(target_arch = "wasm32"))]
@@ -184,13 +211,18 @@ impl Ctx {
     /// which project it was in, scope a cache, interpret a path in a tool argument, or compose one
     /// for its `ext-fs`/`exec` grant. cyrup's own native tier had always exposed it as
     /// `HostCtx.cwd`, so this was a divergence between cyrup's two tiers as well as against pi.
+    /// The host-target arm returns `String::new()` like the other string getters
+    /// ([`Ctx::system_prompt`], [`Ui::editor_text`](crate::ctx::Ui::editor_text)) and does NOT
+    /// read the process working directory: a host arm that reached into the runner's environment
+    /// would make a host-target test's result depend on where the test binary was launched rather
+    /// than on the code under test.
     pub fn cwd(&self) -> String {
         #[cfg(target_arch = "wasm32")]
         {
             return crate::guest::bindings::cyrup::ext::ctx_state::get_cwd();
         }
         #[cfg(not(target_arch = "wasm32"))]
-        std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()
+        String::new()
     }
 
     /// Whether the RUN this handler is executing inside has been cancelled (EXT-045).

@@ -220,28 +220,55 @@ fn cited_files() -> Vec<PathBuf> {
     let mut files = vec![
         crate_dir.join("wit/world.wit"),
         crate_dir.join("../cyrup-ext-sdk/wit/world.wit"),
-        crate_dir.join("../cyrup-ext-sdk/src/api.rs"),
         crate_dir.join("src/host/services.rs"),
         crate_dir.join("src/host/live.rs"),
         crate_dir.join("src/event.rs"),
         crate_dir.join("src/native.rs"),
         crate_dir.join("src/registry.rs"),
     ];
-    // The SDK's `ctx` is a DIRECTORY of submodules, one per WIT import interface, and the pi
-    // citations that used to sit in a single `ctx.rs` moved with the items that carry them.
-    // Enumerate rather than naming files, so a later submodule cannot fall outside this lint by
-    // being added and not listed here.
-    let ctx_dir = crate_dir.join("../cyrup-ext-sdk/src/ctx");
-    let mut ctx: Vec<PathBuf> = std::fs::read_dir(&ctx_dir)
-        .unwrap_or_else(|e| panic!("read {}: {e}", ctx_dir.display()))
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|x| x == "rs"))
-        .collect();
-    assert!(!ctx.is_empty(), "no `.rs` files under {} — the citation lint would be blind to the \
-         SDK's whole context surface", ctx_dir.display());
-    ctx.sort();
-    files.append(&mut ctx);
+    // The SDK's whole `src` tree, WALKED rather than named. `ctx/` was already enumerated for this
+    // reason — one submodule per WIT import interface, "so a later submodule cannot fall outside
+    // this lint by being added and not listed here" — and the argument is the same one level up.
+    // Naming `api.rs` by hand is what left the rest of the SDK invisible to both lint bodies:
+    // `rg -c -e 'types\.ts:' -e 'loader\.ts:' -e 'runner\.ts:' -e '@v0\.83\.0' \
+    // crates/cyrup-ext-sdk/src` puts 69 cited lines in `events.rs` against 45 in `api.rs`, and
+    // EXT-073's `session_info_changed … subscribed at :1203` — corrected in `api.rs`, `event.rs`
+    // and both `world.wit` copies — survived in `events.rs` alone precisely because that one file
+    // was not on the list.
+    let sdk_src = crate_dir.join("../cyrup-ext-sdk/src");
+    let mut sdk: Vec<PathBuf> = Vec::new();
+    collect_rs(&sdk_src, &mut sdk);
+    // Non-vacuity as a COUNT floor, the shape `cyrup-ext-sdk/src/tests/world_import_coverage.rs`
+    // uses (`scanned >= 13`): a walk that comes back empty or truncated — a moved directory, a
+    // `read_dir` that yields no `.rs` — satisfies both scans below trivially, so this count is the
+    // only evidence the lint looked at anything at all. The walk found 29 `.rs` files when this was
+    // written — 13 under `ctx/`, 11 at the top level, 5 under `tests/` — and the floor sits one
+    // under that, low enough that a single test module coming or going is not a false red, high
+    // enough that losing any DIRECTORY of the SDK's citation surface lands well below it.
+    assert!(
+        sdk.len() >= 28,
+        "the `cyrup-ext-sdk/src` walk found only {} `.rs` file(s) under {} — the citation lint \
+         would be blind to most of the SDK's citation surface",
+        sdk.len(),
+        sdk_src.display()
+    );
+    sdk.sort();
+    files.append(&mut sdk);
     files
+}
+
+/// Every `*.rs` under `dir`, recursively: `cyrup-ext-sdk/src` nests (`ctx/`, `tests/`), so a
+/// single-level `read_dir` would re-create the blind spot one directory down.
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+    for entry in entries {
+        let path = entry.unwrap_or_else(|e| panic!("read {}: {e}", dir.display())).path();
+        if path.is_dir() {
+            collect_rs(&path, out);
+        } else if path.extension().is_some_and(|x| x == "rs") {
+            out.push(path);
+        }
+    }
 }
 
 /// A gap-analysis id on the SAME line marks a deliberate quotation of a struck value — the

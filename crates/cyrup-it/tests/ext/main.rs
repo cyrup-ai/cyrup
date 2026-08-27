@@ -65,14 +65,6 @@ mod wasm_renderer_routing;
 mod wasm_thinking_level;
 mod wasm_tool_result_usage;
 
-/// From `crates/cyrup-ext-sdk`. Curation note, in the spirit of the `misc` target's: this is the
-/// ONLY module in this target that touches no wasm runtime at all — it exercises the guest SDK's
-/// ergonomic dispatch layer on the HOST target. It is here because the migration assignment scoped
-/// `cyrup-ext-sdk` to this directory, not because it reaches a seam. If someone is grading files
-/// on whether they earn a place in the integration suite, this is the first one to move into
-/// `crates/cyrup-ext-sdk/src` as a `#[cfg(test)]` module.
-mod ergonomic;
-
 /// §4 R5 layer 3: the suite's own process must not carry provider credentials into a run.
 #[test]
 fn no_ambient_provider_credentials() {

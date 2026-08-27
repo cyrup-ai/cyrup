@@ -12,7 +12,7 @@
 //! proven in `cyrup-ext/tests/wasm_component.rs`.
 //!
 //! Each guest-side step (`/procspawn`, `/procwrite`, `/procreadpoll`, `/procpollexit`, `/prockill` —
-//! `cyrup-ext-sdk/src/example.rs`) is its own top-level `session.prompt(...)` round trip, so this test
+//! `cyrup-ext-sdk/src/example/commands_capability.rs`) is its own top-level `session.prompt(...)` round trip, so this test
 //! observes the pipe staying live across genuinely SEPARATE host calls over time (not an internal loop
 //! within one guest invocation), and can interleave REAL OS-level process checks (`pgrep -f <marker>`)
 //! between spawning and killing.

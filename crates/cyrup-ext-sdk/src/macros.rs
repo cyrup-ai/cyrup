@@ -1,5 +1,8 @@
-//! The `export_extension!` macro (arch-08 §2.2/§3.6; Pi's "the author's module IS the extension"
-//! pattern). An external author depends on this crate, vendors the shared `wit/` dir, and writes:
+//! The [`export_extension!`](crate::export_extension) macro (arch-08 §2.2/§3.6; Pi's "the author's
+//! module IS the extension" pattern). This module is that macro's authoring guide and nothing else:
+//! the macro is `#[macro_export]`ed, so it is documented at the CRATE ROOT and this page lists no
+//! items of its own. An external author depends on this crate, vendors the shared `wit/` dir, and
+//! writes:
 //!
 //! ```ignore
 //! use cyrup_ext_sdk::prelude::*;
