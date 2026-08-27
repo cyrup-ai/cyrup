@@ -9,14 +9,26 @@
 //! both tool calls report success, and the file simply holds the wrong payload.
 //!
 //! Asserted at runtime rather than by reading the source, because both files are edited by other
-//! work. With the runtime's ONE blocking thread occupied, `tokio::fs::canonicalize` inside
-//! `FileMutationLocks::key` provably cannot complete, so the first poll of `execute` is pinned
-//! inside the lock — or it is not, and this file says so.
+//! work. The witness is `FileMutationLocks::guard_entries` — a `cfg(test)` counter incremented as
+//! the FIRST statement of `guard`'s body, on the ONE `FileMutationLocks` instance this test
+//! constructs and hands to its own tool, so no other test in the binary can move it. `guard` is an
+//! `async fn`, so its body does not run until its future is polled: "the body was entered during
+//! `execute`'s first poll" is exactly "nothing above `guard()` suspended", not a proxy for it.
+//!
+//! Occupying the runtime's ONE blocking thread is what keeps that first poll *parked* — with the
+//! blocking pool hogged, `tokio::fs::canonicalize` inside `FileMutationLocks::key` provably cannot
+//! complete, so the poll returns `Pending` from inside `guard` and the counter is sampled
+//! mid-`guard`. The hog is the mechanism that holds the poll still; it is not what is observed.
+//!
+//! An earlier version observed the process-global `MUTATION_REGISTRATION` chain instead
+//! (`lock::registration_is_held`). Every `write`/`edit` in this lib binary takes that static, so
+//! the assertion could read "held" because of a sibling test and it degraded to 2/3 detection
+//! under the full suite rather than failing. Hence the per-instance counter.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::config::{EditOpts, WriteOpts};
-use crate::lock::{FileMutationLocks, registration_is_held};
+use crate::lock::FileMutationLocks;
 use crate::ops::local::LocalFs;
 use crate::ops::{Access, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
 use crate::tools::{EditTool, WriteTool};
@@ -90,7 +102,8 @@ fn assert_first_await_is_the_mutation_lock(
             inner: Arc::new(LocalFs),
             calls: calls.clone(),
         });
-        let (tool, args) = build(fs, Arc::new(FileMutationLocks::new()), dir.path().to_path_buf());
+        let locks = Arc::new(FileMutationLocks::new());
+        let (tool, args) = build(fs, Arc::clone(&locks), dir.path().to_path_buf());
 
         let (release, hold) = std::sync::mpsc::channel::<()>();
         let hog = tokio::task::spawn_blocking(move || {
@@ -118,11 +131,18 @@ fn assert_first_await_is_the_mutation_lock(
              batch on at the first suspension point (exec.rs:177-181), so anything awaited above \
              `guard()` moves the handoff and same-path mutations lose dispatch order"
         );
-        assert!(
-            registration_is_held(),
+        assert_eq!(
+            locks.guard_entries(),
+            1,
             "the first `.await` of `execute` is NOT `FileMutationLocks::guard` — some other await \
-             was inserted above it. Same-path mutations are no longer granted in the order the \
-             model issued them (DoD 1/2/3); nothing else in the suite observes this"
+             was inserted above it and SUSPENDED, so `guard`'s body never ran in this poll. \
+             `execute_parallel` hands the batch on at the first suspension point \
+             (cyrup-agent/src/agent/run/tools/exec.rs:177-181), so same-path mutations are no \
+             longer granted in the order the model issued them (DoD 1/2/3); nothing else in the \
+             suite observes this. This counter is per-`FileMutationLocks`-instance on purpose — \
+             it replaced a `try_lock` on the process-global `MUTATION_REGISTRATION`, which other \
+             tests in this binary hold and which made this assertion degrade to 2/3 detection \
+             instead of failing"
         );
 
         let _ = release.send(());

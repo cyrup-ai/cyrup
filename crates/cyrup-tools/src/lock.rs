@@ -117,6 +117,17 @@ pub struct FileMutationLocks {
     /// cancel race) live in [`cyrup_core::keyed_lock`]; `cyrup-config` locks its own key domain
     /// over the same code. What stays here is this crate's keying and error vocabulary.
     inner: KeyedLocks<PathBuf>,
+    /// Test-only, PER-INSTANCE witness that [`Self::guard`]'s body has begun executing.
+    ///
+    /// [`registration_is_held`] above reads `MUTATION_REGISTRATION`, which is process-global by
+    /// design (pi parity, see its docs) and is taken by EVERY `write`/`edit` in the lib test
+    /// binary — including `the_registration_chain_spans_key_resolution` below, which parks inside
+    /// `Self::key` holding it. A test that samples that static therefore observes other tests, and
+    /// `crate::tests::mutation_lock_is_first_await` degraded to 2/3 detection under the full suite
+    /// because of it. This counter is reachable only through the `FileMutationLocks` the observing
+    /// test constructed and handed to its own tool, so nothing else in the binary can move it.
+    #[cfg(test)]
+    guard_entries: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for FileMutationLocks {
@@ -152,6 +163,8 @@ impl FileMutationLocks {
         Self {
             inner: KeyedLocks::new(map.clone()),
             map,
+            #[cfg(test)]
+            guard_entries: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -188,6 +201,17 @@ impl FileMutationLocks {
         }
     }
 
+    /// How many times [`Self::guard`]'s body has begun executing on THIS instance.
+    ///
+    /// `1` after a single poll of a `write`/`edit` body means the caller reached `guard()` without
+    /// suspending first — which is exactly the property
+    /// `crate::tests::mutation_lock_is_first_await` exists to pin. `0` means an `.await` above
+    /// `guard()` suspended and took the `execute_parallel` handoff with it.
+    #[cfg(test)]
+    pub(crate) fn guard_entries(&self) -> usize {
+        self.guard_entries.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Acquire the lock for `path` for the whole read-modify-write. Cancel-aware: returns
     /// `Err(aborted)` if cancelled before acquisition — *always*, not just when the mutex happens
     /// to be contended.
@@ -213,6 +237,13 @@ impl FileMutationLocks {
         path: &Path,
         cancel: &CancelToken,
     ) -> Result<MutationGuard, ToolError> {
+        // Test-only witness, deliberately ABOVE every `.await` in this body: an async fn's body
+        // does not run until its future is polled, so reaching this line at all means the caller
+        // got here without suspending. Compiles to nothing outside `cfg(test)`.
+        #[cfg(test)]
+        self.guard_entries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         // Pi `:33`: the registration slot is claimed in call order and the body below runs
         // serialized.
         let registration = MUTATION_REGISTRATION.lock().await;
