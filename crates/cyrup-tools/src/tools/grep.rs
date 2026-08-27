@@ -524,6 +524,12 @@ impl Tool for GrepTool {
             // parallel walk does not order it against ours, so the first is the only stable
             // choice.
             let mut walk_error: Option<ToolError> = None;
+            // Directory roots the override PRUNED. `ignore::Walk` prunes internally with
+            // `skip_current_dir()` on a private iterator and exposes no skip handle to a consumer
+            // (walk.rs:1131-1145), so the prune is reproduced here: the walk is pre-order, so a
+            // directory always arrives before its contents, and every later item beneath a pruned
+            // root is dropped. Same paths searched, same paths excluded, same match cap.
+            let mut pruned: Vec<PathBuf> = Vec::new();
             let mut walk = self.fs.walk(
                 &search_root,
                 WalkOpts {
@@ -563,39 +569,73 @@ impl Tool for GrepTool {
                     _ = cancel.cancelled() => return Err(error::aborted()),
                     item = walk.next() => {
                         match item {
-                            // ripgrep's subject filter. A traversal-discovered entry is
-                            // searched only when its OWN file type is a regular file
-                            // (`SubjectBuilder::build` → `Subject::is_file`); pi passes no
-                            // `--follow`/`-L` (grep.ts:220-224), so a symlink inside the tree is
-                            // not followed and not searched. `!w.is_dir` admitted symlinks — and
-                            // FIFOs, sockets and device nodes — then handed the path to
-                            // `read_stream`'s `File::open`, which has no `O_NOFOLLOW` and DOES
-                            // follow, searching the target's bytes under the link's name.
-                            //
-                            // This filter is for WALK-discovered candidates only. A `path`
-                            // argument that is a symlink to a file never reaches this loop:
-                            // `FsOps::metadata` (fs.rs:170-182) stats through the link, so
-                            // `meta.is_file` is true at the explicit-path branch above and the
-                            // file is searched directly — which is what ripgrep does for a
-                            // depth-0 explicit subject (`Subject::is_file` short-circuits on
-                            // `dent.depth() == 0`).
-                            Some(Ok(w)) if w.is_file => {
-                                let rel_path = w.path.strip_prefix(&search_root).unwrap_or(&w.path);
-                                let rel = to_posix(rel_path);
-                                // The glob is matched against the path relative to the OVERRIDE
-                                // ROOT, which for ripgrep is its own cwd — Pi spawns `rg` with no
-                                // `cwd` option and passes `searchPath` positionally, so a `path`
-                                // argument narrows the walk but does NOT re-anchor the glob
-                                // (ignore-0.4.33 gitignore.rs:286-315 `strip`). A candidate outside
-                                // the root keeps its full path, as `strip` leaves it.
-                                let glob_rel = w
-                                    .path
-                                    .strip_prefix(&self.cwd)
-                                    .map_or_else(|_| to_posix(&w.path), to_posix);
-                                if let Some(g) = &glob
-                                    && !g.keeps_file(&glob_rel) {
+                            Some(Ok(w)) => {
+                                // ripgrep's subject filter. A traversal-discovered entry is
+                                // searched only when its OWN file type is a regular file
+                                // (`SubjectBuilder::build` → `Subject::is_file`); pi passes no
+                                // `--follow`/`-L` (grep.ts:220-224), so a symlink inside the tree
+                                // is not followed and not searched. `!w.is_dir` admitted symlinks
+                                // — and FIFOs, sockets and device nodes — then handed the path to
+                                // `read_stream`'s `File::open`, which has no `O_NOFOLLOW` and DOES
+                                // follow, searching the target's bytes under the link's name.
+                                //
+                                // Directories are deliberately NOT filtered out here any more:
+                                // the override is evaluated for them below, and that is what
+                                // prunes a subtree. Everything that is neither a regular file nor
+                                // a directory is dropped up front, since it is neither a search
+                                // subject nor a prunable root.
+                                //
+                                // This filter is for WALK-discovered candidates only. A `path`
+                                // argument that is a symlink to a file never reaches this loop:
+                                // `FsOps::metadata` (fs.rs:170-182) stats through the link, so
+                                // `meta.is_file` is true at the explicit-path branch above and the
+                                // file is searched directly — which is what ripgrep does for a
+                                // depth-0 explicit subject (`Subject::is_file` short-circuits on
+                                // `dent.depth() == 0`).
+                                if !w.is_file && !w.is_dir {
+                                    continue;
+                                }
+                                if let Some(g) = &glob {
+                                    // Anything under a directory the override already pruned is
+                                    // gone — files AND nested directories — before any further
+                                    // test. This is `skip_current_dir()`'s effect, applied on the
+                                    // consumer side (walk.rs:1131-1145).
+                                    if pruned.iter().any(|p| w.path.starts_with(p)) {
                                         continue;
                                     }
+                                    // The glob is matched against the path relative to the OVERRIDE
+                                    // ROOT, which for ripgrep is its own cwd — Pi spawns `rg` with
+                                    // no `cwd` option and passes `searchPath` positionally, so a
+                                    // `path` argument narrows the walk but does NOT re-anchor the
+                                    // glob (ignore-0.4.26 gitignore.rs:275-304 `strip`). A
+                                    // candidate outside the root keeps its full path, as `strip`
+                                    // leaves it.
+                                    let glob_rel = w
+                                        .path
+                                        .strip_prefix(&self.cwd)
+                                        .map_or_else(|_| to_posix(&w.path), to_posix);
+                                    if w.is_dir {
+                                        // ripgrep evaluates the override for directories too
+                                        // (dir.rs:416-425), and an Ignore verdict takes the whole
+                                        // subtree. A plain (non-`!`) glob that simply misses does
+                                        // NOT prune — overrides.rs:106 guards that fallback with
+                                        // `!is_dir` — so `prunes_dir` is the only test here.
+                                        //
+                                        // walk.rs:1057-1060: `skip_entry` returns false at depth 0,
+                                        // so the search root itself is never prunable.
+                                        if w.path != search_root && g.prunes_dir(&glob_rel) {
+                                            pruned.push(w.path.clone());
+                                        }
+                                        continue;
+                                    }
+                                    if !g.keeps_file(&glob_rel) {
+                                        continue;
+                                    }
+                                } else if w.is_dir {
+                                    continue;
+                                }
+                                let rel_path = w.path.strip_prefix(&search_root).unwrap_or(&w.path);
+                                let rel = to_posix(rel_path);
                                 // Traversal-discovered, so implicit: binary files are still cut
                                 // off at the first NUL, exactly as before this change.
                                 self.search_one(
@@ -612,7 +652,6 @@ impl Tool for GrepTool {
                                 )
                                 .await?;
                             }
-                            Some(Ok(_)) => {}
                             Some(Err(e)) => {
                                 if walk_error.is_none() {
                                     // pi surfaces rg's stderr verbatim (`stderr.trim()`,
@@ -962,6 +1001,161 @@ mod tests {
         )
         .await;
         assert_eq!(text, "src/deep/a.ts:1: NEEDLE");
+    }
+
+    /// Build the tree the pruning contract is stated over: three files holding NEEDLE, one of them
+    /// under a `src` nested inside `vendor` so an unanchored directory glob can be seen to reach it.
+    fn prune_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        std::fs::create_dir_all(cwd.join("vendor/src")).unwrap();
+        std::fs::write(cwd.join("node_modules/pkg/a.js"), "NEEDLE\n").unwrap();
+        std::fs::write(cwd.join("src/b.js"), "NEEDLE\n").unwrap();
+        std::fs::write(cwd.join("vendor/src/c.js"), "NEEDLE\n").unwrap();
+        dir
+    }
+
+    /// `grep_text` with the rows sorted: the walk is not ordered, and neither is ripgrep's.
+    async fn grep_rows(cwd: &Path, args: serde_json::Value) -> Vec<String> {
+        let text = grep_text(cwd, args).await;
+        if text == "No matches found" {
+            return Vec::new();
+        }
+        let mut rows: Vec<String> = text.lines().map(str::to_string).collect();
+        rows.sort();
+        rows
+    }
+
+    /// TOOL — a negated glob naming a DIRECTORY must remove the whole subtree, which is what
+    /// ripgrep does: the override is evaluated for directories too (dir.rs:401-425) and an Ignore
+    /// verdict reaches `skip_current_dir()` (walk.rs:1131-1145). The port of `Override::matched`
+    /// dropped `is_dir`, so `!node_modules` compiled to `**/node_modules` — a pattern that with
+    /// `literal_separator(true)` never matches `node_modules/pkg/a.js` — and every file in the
+    /// subtree was KEPT.
+    ///
+    /// Verified against rg 14.1.0:
+    /// `rg --json --hidden --glob '!node_modules' -- NEEDLE .` → `./src/b.js`, `./vendor/src/c.js`.
+    #[tokio::test]
+    async fn negated_directory_glob_prunes_the_whole_subtree() {
+        let dir = prune_tree();
+        let rows = grep_rows(
+            dir.path(),
+            serde_json::json!({ "pattern": "NEEDLE", "glob": "!node_modules" }),
+        )
+        .await;
+        assert_eq!(
+            rows,
+            vec!["src/b.js:1: NEEDLE", "vendor/src/c.js:1: NEEDLE"]
+        );
+    }
+
+    /// A trailing `/` is DIRECTORY-ONLY, not "matches nothing": `is_only_dir` removes the glob from
+    /// consideration unless the candidate is a directory (gitignore.rs:262), so `!src/` prunes
+    /// every `src` directory — the unanchored `**/src` reaches `vendor/src` too — and no file.
+    /// With `only_dir` used in one direction only, this pattern was a complete no-op.
+    ///
+    /// Verified against rg 14.1.0:
+    /// `rg --json --hidden --glob '!src/' -- NEEDLE .` → `./node_modules/pkg/a.js` alone.
+    #[tokio::test]
+    async fn trailing_slash_glob_prunes_directories_at_any_depth() {
+        let dir = prune_tree();
+        let rows = grep_rows(
+            dir.path(),
+            serde_json::json!({ "pattern": "NEEDLE", "glob": "!src/" }),
+        )
+        .await;
+        assert_eq!(rows, vec!["node_modules/pkg/a.js:1: NEEDLE"]);
+    }
+
+    /// The other half of the rule, and the one a "prune whatever the glob does not match" shortcut
+    /// would break: a PLAIN glob that misses a directory returns `Match::None`, never Ignore —
+    /// `Override::matched` guards its whitelist-miss fallback with `!is_dir` (overrides.rs:106) —
+    /// so rg still descends and finds the files inside. An anchored path glob keeps its anchor.
+    ///
+    /// Verified against rg 14.1.0: `--glob '*.js'` → all three files; `--glob 'src/**/*.js'` →
+    /// `./src/b.js` only. The no-glob walk is unchanged and returns all three.
+    #[tokio::test]
+    async fn plain_glob_miss_never_prunes_a_directory() {
+        let dir = prune_tree();
+        let all = vec![
+            "node_modules/pkg/a.js:1: NEEDLE",
+            "src/b.js:1: NEEDLE",
+            "vendor/src/c.js:1: NEEDLE",
+        ];
+
+        let rows = grep_rows(
+            dir.path(),
+            serde_json::json!({ "pattern": "NEEDLE", "glob": "*.js" }),
+        )
+        .await;
+        assert_eq!(
+            rows, all,
+            "a directory is not a `*.js` candidate, yet it must be descended"
+        );
+
+        let rows = grep_rows(
+            dir.path(),
+            serde_json::json!({ "pattern": "NEEDLE", "glob": "src/**/*.js" }),
+        )
+        .await;
+        assert_eq!(rows, vec!["src/b.js:1: NEEDLE"]);
+
+        let rows = grep_rows(dir.path(), serde_json::json!({ "pattern": "NEEDLE" })).await;
+        assert_eq!(rows, all, "the no-glob walk is byte-for-byte what it was");
+    }
+
+    /// `skip_entry` returns `Ok(false)` unconditionally at `ent.depth() == 0` (walk.rs:1057-1060):
+    /// the search root itself is never pruned, whatever the glob says. Nor is an explicitly named
+    /// file, which never reaches the walk at all.
+    ///
+    /// Verified against rg 14.1.0: both
+    /// `rg --glob '!node_modules' -- NEEDLE node_modules` and
+    /// `rg --glob '!node_modules' -- NEEDLE node_modules/pkg/a.js` print the match.
+    #[tokio::test]
+    async fn the_search_root_and_an_explicit_file_are_never_pruned() {
+        let dir = prune_tree();
+        let rows = grep_rows(
+            dir.path(),
+            serde_json::json!({
+                "pattern": "NEEDLE", "path": "node_modules", "glob": "!node_modules"
+            }),
+        )
+        .await;
+        assert_eq!(rows, vec!["pkg/a.js:1: NEEDLE"]);
+
+        let rows = grep_rows(
+            dir.path(),
+            serde_json::json!({
+                "pattern": "NEEDLE", "path": "node_modules/pkg/a.js", "glob": "!node_modules"
+            }),
+        )
+        .await;
+        assert_eq!(rows, vec!["a.js:1: NEEDLE"]);
+    }
+
+    /// The point of pruning rather than post-filtering: the walk and the search are FUSED and both
+    /// stop at the match cap, so an excluded subtree that holds more than `limit` matches used to
+    /// spend the entire 100-match window before the walk ever reached the file the caller wanted.
+    /// Pruning it means the cap is spent where ripgrep spends it.
+    #[tokio::test]
+    async fn a_pruned_subtree_does_not_consume_the_match_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        std::fs::create_dir_all(cwd.join("node_modules/pkg")).unwrap();
+        std::fs::create_dir_all(cwd.join("src")).unwrap();
+        for i in 0..150 {
+            std::fs::write(cwd.join(format!("node_modules/pkg/f{i}.js")), "NEEDLE\n").unwrap();
+        }
+        std::fs::write(cwd.join("src/b.js"), "NEEDLE\n").unwrap();
+
+        let rows = grep_rows(
+            cwd,
+            serde_json::json!({ "pattern": "NEEDLE", "glob": "!node_modules" }),
+        )
+        .await;
+        assert_eq!(rows, vec!["src/b.js:1: NEEDLE"]);
     }
 
     /// The four-line block `rg` writes to stderr for a pattern that can match a line terminator,

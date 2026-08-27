@@ -3,8 +3,8 @@ title: Find accepts a search path that is a regular file and reports "No files f
 priority: MEDIUM
 tool: find
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
-status: done
+stage: exec
+status: in-progress
 updated: 2026-08-27
 ---
 

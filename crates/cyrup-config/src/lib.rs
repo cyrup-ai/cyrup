@@ -65,7 +65,8 @@ pub use model::{
     resolve_cli_model, restore_model_from_session,
 };
 pub use paths::{
-    normalize_path, normalize_path_buf, normalize_path_with_home, normalize_windows_shell_path,
+    asset_dir, normalize_path, normalize_path_buf, normalize_path_with_home,
+    normalize_windows_shell_path,
 };
 pub use policy::NetworkPolicy;
 pub use provider_compose::{ConfiguredApiKeyAuth, compose_provider_registry};
