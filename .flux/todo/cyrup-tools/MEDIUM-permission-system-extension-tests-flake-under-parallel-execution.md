@@ -1,10 +1,10 @@
 ---
-stage: new
-status: pending
+stage: aug
+status: in-progress
 priority: MEDIUM
 tool: all
 source: exec follow-up — observed independently by two agents, then reproduced
-updated: 2026-08-27 15:30
+updated: 2026-08-27 20:11
 ---
 
 # `cyrup-permission-system` extension tests flake under default parallelism
