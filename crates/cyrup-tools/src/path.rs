@@ -263,6 +263,41 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// Node `pathToFileURL(p).href` (`render-utils.ts:22`) — the inverse of [`file_url_to_path`].
+///
+/// Percent-encodes every byte outside the WHATWG *path* safe set, so the C0 controls, space, `"`,
+/// `#`, `<`, `>`, `?`, `` ` ``, `{`, `}`, `%` and all non-ASCII bytes (UTF-8, byte-wise) come back
+/// escaped. `/` is a separator and is preserved. On Windows the leading component is prefixed with
+/// `/` so `C:\x` becomes `file:///C:/x`, matching Node.
+///
+/// The set is a **superset** of Node's for ASCII (Node's own pre-pass escapes only `%`, `#`, `?`,
+/// `\n`, `\r`, `\t` on top of the WHATWG path set), so an exotic path can produce an href that is
+/// more escaped than Node's. Both decode to the same bytes, so nothing observable diverges.
+pub fn path_to_file_url(path: &Path) -> String {
+    const SAFE: &[u8] = b"-._~!$&'()*+,;=:@/";
+    let raw = path.to_string_lossy();
+    let raw = if cfg!(windows) { raw.replace('\\', "/") } else { raw.into_owned() };
+    let mut out = String::from("file://");
+    if !raw.starts_with('/') {
+        out.push('/');
+    }
+    for &b in raw.as_bytes() {
+        if b.is_ascii_alphanumeric() || SAFE.contains(&b) {
+            out.push(b as char);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            // `get`, not indexing: the workspace denies `clippy::indexing_slicing`. The nibbles are
+            // 0..=15 by construction, so the fallback is unreachable.
+            let hi = HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0');
+            let lo = HEX.get(usize::from(b & 0x0f)).copied().unwrap_or(b'0');
+            out.push('%');
+            out.push(char::from(hi));
+            out.push(char::from(lo));
+        }
+    }
+    out
+}
+
 /// Lexically collapse `.`/`..` segments and drop trailing separators, mirroring Node `path.resolve`
 /// (paths.ts:84). Purely lexical — symlinks are NOT resolved. `..` at the root is dropped.
 fn lexical_resolve(p: &Path) -> PathBuf {
