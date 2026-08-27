@@ -2,7 +2,7 @@
 
 use crate::context::ToolDef;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use serde_json::{Map, Value, json};
 
@@ -24,7 +24,7 @@ pub(crate) struct ConvertResponsesToolsOptions {
     pub default_strict: Option<bool>,
 }
 
-/// 1:1 port of Pi `convertResponsesTools` (`openai-responses-shared.ts:344-378` @v0.83.0).
+/// 1:1 port of Pi `convertResponsesTools` (`openai-responses-shared.ts:359-395` @v0.84.2).
 ///
 /// PROV-034: the `strict` key is emitted **only** when `supportsStrictMode` (`:376-377`). pi's
 /// function-tool literal is built without it, so a model that does not opt in receives no `strict`
@@ -43,11 +43,18 @@ pub(crate) fn convert_responses_tools(
         .map(|t| {
             let constrained_strict =
                 resolve_json_schema_strict_sampling(t, options.supports_strict_mode)?;
+            // `const strict = constrainedStrict ?? defaultStrict` (`:381` @v0.84.2) — resolved
+            // BEFORE the schema is converted, so a caller-supplied `default_strict = Some(true)`
+            // converts too, and reused verbatim for the `strict` key below.
+            let strict = constrained_strict.or(options.default_strict);
             let mut o = Map::new();
             o.insert("type".to_string(), json!("function"));
             o.insert("name".to_string(), json!(t.name));
             o.insert("description".to_string(), json!(t.description));
-            o.insert("parameters".to_string(), t.parameters.clone());
+            o.insert(
+                "parameters".to_string(),
+                json_schema_tool_parameters(t, strict == Some(true))?,
+            );
             // Pi spreads `...(options?.deferLoading ? { defer_loading: true } : {})` — the key is
             // ABSENT, not `false`, when the tool is part of the request prefix.
             if options.defer_loading {
@@ -56,7 +63,7 @@ pub(crate) fn convert_responses_tools(
             if options.supports_strict_mode {
                 o.insert(
                     "strict".to_string(),
-                    match constrained_strict.or(options.default_strict) {
+                    match strict {
                         Some(b) => json!(b),
                         None => Value::Null,
                     },

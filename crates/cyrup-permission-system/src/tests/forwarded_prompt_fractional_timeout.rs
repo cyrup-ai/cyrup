@@ -134,7 +134,7 @@ async fn drive(
 
 fn assert_no_ambient_override() {
     assert!(
-        std::env::var(FORWARDING_AGENT_DIR_ENV).is_err(),
+        crate::envx::var(FORWARDING_AGENT_DIR_ENV).is_none(),
         "this test derives the spool from its own temp agent dir; an ambient \
          {FORWARDING_AGENT_DIR_ENV} override would invalidate it"
     );

@@ -3,7 +3,7 @@
 
 use crate::config::FindOpts;
 use crate::details::FindDetails;
-use crate::ops::{FsOps, WalkOpts};
+use crate::ops::{FsOps, WalkFlavor, WalkOpts};
 use crate::tools::globmatch::{PatternMatcher, to_posix};
 use crate::truncate::{TruncOpts, format_size, truncate_head};
 use crate::{error, path};
@@ -120,13 +120,30 @@ impl Tool for FindTool {
             serde_json::from_value(params).map_err(|e| error::invalid(format!("find: {e}")))?;
 
         let search_root = path::resolve_to_cwd(input.path.as_deref().unwrap_or("."), &self.cwd);
-        self.fs
+        // Pi's fd branch has NO pre-check: it hands the absolute search path to fd as fd's root
+        // (find.ts:267) and lets fd validate it. fd's gate is ONE predicate — `is_existing_directory`
+        // = `path.is_dir() && …` (fd/src/filesystem.rs:38-42) — so a MISSING path and a path that
+        // exists but is not a directory take the same branch and print the same line via
+        // `print_error` (fd/src/error.rs), which prefixes `[fd error]: `. With the only root
+        // filtered out, `search_paths()` returns empty and fd bails through the same prefix
+        // (main.rs:84-86, :68-71), exiting 1 with empty stdout. pi rejects with `stderr.trim()`
+        // (find.ts:304-309), i.e. both lines. So: one gate here, one two-line message, and the
+        // `Path not found:` literal — which is pi's `customOps.glob` branch (find.ts:171), NOT the
+        // fd branch this tool implements — does not belong on this path.
+        // `FsOps::metadata` follows symlinks (ops/local/fs.rs:170-183), matching `Path::is_dir`, so
+        // a symlink to a directory is still a valid search root.
+        if !self
+            .fs
             .metadata(&search_root)
             .await
-            // Pi: `Path not found: ${searchPath}` (find.ts:158).
-            .map_err(|_| {
-                error::not_found(format!("Path not found: {}", error::show(&search_root)))
-            })?;
+            .is_ok_and(|meta| meta.is_dir)
+        {
+            return Err(error::invalid(format!(
+                "[fd error]: Search path '{}' is not a directory.\n\
+                 [fd error]: No valid search paths given.",
+                error::show(&search_root)
+            )));
+        }
 
         let matcher = PatternMatcher::build(&input.pattern)?;
         // Pi: `const effectiveLimit = limit ?? DEFAULT_LIMIT` (find.ts:151), handed straight to
@@ -150,6 +167,10 @@ impl Tool for FindTool {
             WalkOpts {
                 include_hidden: true,
                 require_git: inside_git_repo,
+                // Pi's `find` IS fd (find.ts:225 `ensureTool("fd")`) invoked with no
+                // `--no-ignore`/`--no-global-ignore-file` (find.ts:235-267), so fd's full default
+                // ignore set is in force: `.fdignore` files plus `<config>/fd/ignore`.
+                flavor: WalkFlavor::Fd,
             },
         );
         loop {
@@ -209,7 +230,35 @@ impl Tool for FindTool {
                                 results.push(entry);
                             }
                         }
-                        Some(Err(e)) => return Err(e),
+                        // fd NEVER fails a search over a filesystem error met while traversing.
+                        // Its worker sends every `Err` from the `ignore` walker down the results
+                        // channel and returns `WalkState::Continue` (fd 10.5.0
+                        // `src/walk.rs:500-505`); the receiver prints it only under
+                        // `--show-errors` (`:227-231`), which pi's argv does not pass
+                        // (find.ts:234-267); and the exit code is `ExitCode::Success` regardless
+                        // (`:282-292`). fd therefore exits 0 with empty stderr, pi's
+                        // `if (code !== 0)` guard (find.ts:304) is never entered, and the paths fd
+                        // did emit are returned as an ordinary success.
+                        //
+                        // There is NO `ignore::Error` variant fd treats as fatal — fd's arm is a
+                        // catch-all that never inspects the variant. `WithPath{Io}` (permission
+                        // denied, EIO, a stale mount), `WithDepth{Loop}` (symlink cycle),
+                        // `Partial`/`WithLineNumber` (a malformed pattern in an ignore file) and
+                        // bare `Io` from parent-ignore loading all take the same path. So this arm
+                        // discriminates on nothing and simply keeps collecting.
+                        //
+                        // Swallowing here cannot hide a bad search root: the
+                        // `metadata(&search_root)` probe above already rejects BOTH a
+                        // missing root and one that exists but is not a directory, with
+                        // fd's own two-line `[fd error]: …` message — see the note on
+                        // that gate for why pi's `Path not found:` (find.ts:171, the
+                        // `customOps.glob` branch) is NOT this tool's message. A root that
+                        // exists but cannot be opened yields zero rows and falls through to
+                        // "No files found matching pattern" below — which is exactly what pi
+                        // answers on fd's empty stdout (find.ts:311-320). Do NOT gate this on
+                        // "the walk produced no rows": pi has no such gate, because fd never
+                        // gives it a non-zero code to gate on.
+                        Some(Err(_)) => continue,
                         None => break,
                     }
                 }

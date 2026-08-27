@@ -115,11 +115,20 @@ impl Tool for RegisteredTool {
     /// `wrapToolDefinition` copied — `constrainedSampling` among them
     /// (`core/tools/tool-definition-wrapper.ts:14`) — survives this wrapper by construction.
     /// Rust has no spread: each surface method must be delegated by hand, and this one was the
-    /// method the hand-written list missed. Extension-registered and WASM-guest tools are the ONLY
-    /// tools that can declare `constrainedSampling` (no pi built-in does), and every one of them
-    /// reaches the loop through this wrapper — so without this override the whole opt-in path was
-    /// dead on arrival: `WasmTool::constrained_sampling` read the guest's declaration off the
-    /// descriptor and this wrapper dropped it one frame later, silently.
+    /// method the hand-written list missed.
+    ///
+    /// Everything the agent runs reaches it through this wrapper — the built-ins in `base` as well
+    /// as the extension-registered and WASM-guest tools ([`crate::ExtensionHost::active_tools`],
+    /// and upstream `wrapRegisteredTools(allCustomTools…)` +
+    /// `wrapRegisteredTools(baseToolDefinitions…)` at agent-session.ts:2694-2702 @v0.84.2) — so the
+    /// missing delegation silently dropped EVERY declaration one frame after it was read. For a
+    /// guest tool that was the whole opt-in path, dead on arrival:
+    /// `WasmTool::constrained_sampling` (host/live.rs) lifted the declaration off the descriptor
+    /// and this wrapper discarded it. Since pi `7915cdac` @v0.84.2 it is also the path the four
+    /// coding built-ins depend on: `read`, `edit`, `write` and the shared `ShellTool` engine —
+    /// pi's `createShellToolDefinition`, so `powershell` inherits it — each return
+    /// [`cyrup_core::experimental_tool_sampling`], which is `Some` only under
+    /// `CYRUP_EXPERIMENTAL=1`/`PI_EXPERIMENTAL=1` and `None` otherwise.
     fn constrained_sampling(&self) -> Option<&cyrup_core::ConstrainedSampling> {
         self.inner.constrained_sampling()
     }

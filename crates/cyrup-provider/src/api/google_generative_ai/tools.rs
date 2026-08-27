@@ -4,28 +4,38 @@
 use crate::context::ToolDef;
 use crate::stream::ToolChoice;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use serde_json::{Value, json};
 use super::capabilities::gemini_major_version;
 
-/// Convert tools to Gemini `functionDeclarations` (Pi `convertTools`, google-shared.ts:272-288).
-/// Uses `parametersJsonSchema` (full JSON Schema). `None` when there are no tools.
-pub(super) fn convert_tools(tools: &[ToolDef]) -> Option<Value> {
+/// Convert tools to Gemini `functionDeclarations` (Pi `convertTools`, `google-shared.ts:318-339`
+/// @v0.84.2). Uses `parametersJsonSchema` (full JSON Schema). `None` when there are no tools.
+///
+/// PROV-011: `supports_strict_mode` is [`supports_google_strict_tool_sampling`] of the model id,
+/// threaded in from the caller (`google-generative-ai.ts:383` passes it as the third argument) so a
+/// tool that opted in is serialized with the STRICT-converted schema Gemini's `VALIDATED` mode
+/// constrains against. Upstream's `useParameters` legacy branch has no cyrup caller and is not
+/// ported.
+pub(super) fn convert_tools(
+    tools: &[ToolDef],
+    supports_strict_mode: bool,
+) -> Result<Option<Value>, ConstrainedSamplingError> {
     if tools.is_empty() {
-        return None;
+        return Ok(None);
     }
     let decls: Vec<Value> = tools
         .iter()
         .map(|t| {
-            json!({
+            let strict = resolve_json_schema_strict_sampling(t, supports_strict_mode)?;
+            Ok(json!({
                 "name": t.name,
                 "description": t.description,
-                "parametersJsonSchema": t.parameters,
-            })
+                "parametersJsonSchema": json_schema_tool_parameters(t, strict == Some(true))?,
+            }))
         })
-        .collect();
-    Some(json!([{ "functionDeclarations": decls }]))
+        .collect::<Result<Vec<Value>, ConstrainedSamplingError>>()?;
+    Ok(Some(json!([{ "functionDeclarations": decls }])))
 }
 
 /// Map a tool-choice to a Gemini `functionCallingConfig.mode` (Pi `mapToolChoice`,

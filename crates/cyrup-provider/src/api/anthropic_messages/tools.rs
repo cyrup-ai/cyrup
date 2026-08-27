@@ -3,7 +3,7 @@
 use super::claude_code::to_claude_code_name;
 use crate::context::ToolDef;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use serde_json::{Map, Value, json};
 
@@ -28,27 +28,29 @@ pub(crate) fn convert_tools(
         .iter()
         .enumerate()
         .map(|(index, tool)| {
-            // PROV-011 — `anthropic-messages.ts:1298` @v0.83.0.
+            // PROV-011 — `anthropic-messages.ts:1337` @v0.84.2.
             let strict = resolve_json_schema_strict_sampling(tool, supports_strict_tools)?;
+            // `const parameters = getJsonSchemaToolParameters(tool, strict)` (`:1338` @v0.84.2):
+            // BOTH the legacy three-key subset and the strict spread are taken from the CONVERTED
+            // schema (`:1339-1344`), not from the tool's raw parameters.
+            let parameters = json_schema_tool_parameters(tool, strict == Some(true))?;
             let name = if is_oauth {
                 to_claude_code_name(&tool.name)
             } else {
                 tool.name.clone()
             };
-            let properties = tool
-                .parameters
+            let properties = parameters
                 .get("properties")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let required = tool
-                .parameters
+            let required = parameters
                 .get("required")
                 .cloned()
                 .unwrap_or_else(|| json!([]));
-            // `legacyInputSchema` (`:1300-1304`) — the three-key subset Anthropic has always
-            // accepted. Under strict sampling pi sends the WHOLE schema with that subset spread
-            // over it (`:1305-1311`), so `type`/`properties`/`required` still win and any extra
-            // keyword (`$defs`, `additionalProperties`, …) survives for the constrainer.
+            // `legacyInputSchema` (`:1340-1344` @v0.84.2) — the three-key subset Anthropic has
+            // always accepted. Under strict sampling pi sends the WHOLE (converted) schema with
+            // that subset spread over it (`:1345-1351`), so `type`/`properties`/`required` still
+            // win and any extra keyword (`additionalProperties`, …) survives for the constrainer.
             //
             // Built as a `Map` rather than via `json!` so the strict arm can spread it without
             // an `as_object().expect(..)` round-trip — the workspace denies `expect_used`, and
@@ -58,11 +60,7 @@ pub(crate) fn convert_tools(
             legacy.insert("properties".to_string(), properties);
             legacy.insert("required".to_string(), required);
             let input_schema = if strict == Some(true) {
-                let mut merged = tool
-                    .parameters
-                    .as_object()
-                    .cloned()
-                    .unwrap_or_else(Map::new);
+                let mut merged = parameters.as_object().cloned().unwrap_or_else(Map::new);
                 for (k, v) in &legacy {
                     merged.insert(k.clone(), v.clone());
                 }
@@ -76,7 +74,7 @@ pub(crate) fn convert_tools(
             if supports_eager {
                 o.insert("eager_input_streaming".to_string(), json!(true));
             }
-            // `...(strict === true ? { strict: true } : {})` (`:1317`) — inserted where pi spreads
+            // `...(strict === true ? { strict: true } : {})` (`:1357`) — inserted where pi spreads
             // it, between `eager_input_streaming` and `input_schema`. As with `defer_loading`
             // above, that insertion order is for readability against pi only: `serde_json`'s `Map`
             // is a `BTreeMap` here, so the wire order is lexicographic regardless.

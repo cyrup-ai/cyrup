@@ -107,9 +107,10 @@ pub fn runtime_api() -> Option<Arc<dyn PermissionSystemRuntimeApi>> {
 }
 
 /// The slot is process-global, exactly as `globalThis.__piPermissionSystem` is, so every test that
-/// touches it — here and in [`crate::extension`] — must serialize on this ONE lock. Same reasoning
-/// as `ext_config::env_lock` (PERM-020): the crate's unit tests all run as threads in a single
-/// process, and a global is only isolated while one thread owns it.
+/// touches it — here and in [`crate::extension`] — must serialize on this ONE lock: the crate's unit
+/// tests all run as threads in a single process, and a global is only isolated while one thread owns
+/// it. This is the crate's LAST such lock — the environment is no longer a shared global here, since
+/// [`crate::envx`] gives each thread its own overlay, but this slot genuinely is one.
 #[cfg(test)]
 pub(crate) fn test_registry_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: Mutex<()> = Mutex::new(());

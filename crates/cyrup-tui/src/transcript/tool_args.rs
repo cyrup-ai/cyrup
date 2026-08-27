@@ -24,22 +24,65 @@ pub(super) fn str_arg(args: &Value, keys: &[&str]) -> StrArg {
 }
 
 /// `renderToolPath` (render-utils.ts:75-85): `[invalid arg]` for a non-string, the `emptyFallback`
-/// (else `...`) for an empty/absent path, otherwise the `~`-shortened path in accent. Hyperlinks are a
-/// terminal escape the cell grid does not carry (tracked residual).
+/// (else `...`) for an empty/absent path, otherwise the `~`-shortened path in accent — wrapped in an
+/// OSC-8 hyperlink to the resolved path's `file://` URL when the terminal forwards them
+/// (`linkPath`, `:19-23`).
+///
+/// The gate and the two unlinked arms are upstream's, exactly: `linkPath` is reached only from
+/// `:84`'s `accent` branch, so `invalidArgText` (`:71-73`) and the `toolOutput` `...` (`:83`) stay
+/// inert; and the href is built from `value` — the RAW path — while the visible text is the
+/// `~`-shortened form, because `shortenPath` is display-only.
+///
+/// The escape itself is not in this `Span`. [`crate::osc`] explains why (`Span::styled_graphemes`
+/// deletes `ESC`, and `Span::width` would miscount the rest as columns); the span carries a marker
+/// in `Modifier`'s unallocated bits and [`crate::osc::inject`] converts marked cells into the
+/// escape once the `Buffer` exists.
 pub(super) fn tool_path_span(
     args: &Value,
     keys: &[&str],
     empty_fallback: Option<&str>,
     theme: &UiTheme,
+    opts: ImageOpts<'_>,
 ) -> Span<'static> {
     match str_arg(args, keys) {
         StrArg::Invalid => Span::styled("[invalid arg]".to_string(), theme.error_style()),
         StrArg::Missing => match empty_fallback {
-            Some(f) => Span::styled(shorten_path(f), theme.accent_style()),
+            Some(f) => Span::styled(shorten_path(f), link_style(f, theme, opts)),
             None => Span::styled("...".to_string(), theme.tool_output_style()),
         },
-        StrArg::Value(p) => Span::styled(shorten_path(&p), theme.accent_style()),
+        StrArg::Value(p) => Span::styled(shorten_path(&p), link_style(&p, theme, opts)),
     }
+}
+
+/// `theme.fg("accent", …)`, plus [`crate::osc`]'s link marker when the terminal forwards OSC-8 —
+/// `linkPath(styledText, rawPath, cwd)` (`render-utils.ts:19-23`) with pi's own early return:
+///
+/// ```ts
+/// if (!getCapabilities().hyperlinks) return styledText;
+/// const absolutePath = resolvePath(rawPath, cwd);
+/// return hyperlink(styledText, pathToFileURL(absolutePath).href);
+/// ```
+///
+/// `resolvePath(rawPath, cwd)` is `cyrup_tools::path::resolve_to_cwd`, the same port `read`'s
+/// compact classification resolves through (`read.ts:336`). A `cwd` of `None` falls back to the
+/// process cwd, matching [`compact_read_classification`]; if even that is unavailable the path
+/// cannot be resolved and the span stays unlinked rather than pointing somewhere wrong.
+fn link_style(raw_path: &str, theme: &UiTheme, opts: ImageOpts<'_>) -> Style {
+    let accent = theme.accent_style();
+    if !opts.hyperlinks {
+        return accent;
+    }
+    let Some(sink) = opts.links else { return accent };
+    let base = match opts.cwd {
+        Some(c) => c.to_path_buf(),
+        None => match std::env::current_dir() {
+            Ok(c) => c,
+            Err(_) => return accent,
+        },
+    };
+    let absolute = cyrup_tools::path::resolve_to_cwd(raw_path, &base);
+    let url = cyrup_tools::path::path_to_file_url(&absolute);
+    accent.patch(sink.mark(url))
 }
 
 /// The `" in <path>"` tail shared by grep/find (`path = shortenPath(rawPath || ".")` in `toolOutput`, a
@@ -54,17 +97,58 @@ pub(super) fn push_search_path(args: &Value, theme: &UiTheme, spans: &mut Vec<Sp
     }
 }
 
-/// `formatReadLineRange` (read.ts:67-72): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
+/// JS `String(n)` for a `Number` that came out of `JSON.parse` — the fold a template literal
+/// applies when a double is interpolated (`` `:${startLine}` ``, read.ts:77).
+///
+/// Rust's `Display` for `f64` is already the shortest round-tripping form, so `2.0` prints `2` and
+/// `2.5` prints `2.5`, exactly as JS does. `Debug` is NOT — it would print `2.0` — so the `{}`
+/// spelling here is load-bearing. The single value the two disagree on is negative zero, which JS
+/// prints as `0`; JSON can carry `-0.0`, so it is handled.
+///
+/// This is deliberately NOT `cyrup_tools::jsnum::to_integer`: that is `ToIntegerOrInfinity`, the
+/// coercion the READ path applies to pick a line window (read.ts:278-288). The HEADER interpolates
+/// the number as given, and a fractional `offset` reaches the screen unrounded upstream.
+pub(super) fn js_number(n: f64) -> String {
+    // `String(-0) === "0"`; Rust's `Display` would print `-0`. Covers `+0.0` too.
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    format!("{n}")
+}
+
+/// `formatReadLineRange` (read.ts:73-78): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
+///
+/// ```ts
+/// if (args?.offset === undefined && args?.limit === undefined) return "";
+/// const startLine = args.offset ?? 1;
+/// const endLine = args.limit !== undefined ? startLine + args.limit - 1 : "";
+/// return theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+/// ```
+///
+/// Upstream has no integer type to lose: `JSON.parse` yields an IEEE-754 double for `2` and for
+/// `2.0` alike, so both spellings are literally the same value by the time this runs and both
+/// render `:2`. [`Value::as_f64`] is that same "is this a JSON number" test — it answers `Some` for
+/// `Number::PosInt`, `NegInt` and `Float` alike, where `as_i64` answers `None` for every float — so
+/// it, and not `as_i64`, is the extractor. It is also the more faithful one at the top of the range:
+/// `as_f64` narrows `9007199254740993` to `9007199254740992`, which is precisely what `JSON.parse`
+/// does with the same literal.
+///
+/// The arithmetic stays in `f64` because `startLine + args.limit - 1` is double arithmetic
+/// upstream; a fractional `offset` reaches the header unrounded there and must here.
 pub(super) fn read_line_range(args: &Value) -> Option<String> {
-    let offset = args.get("offset").and_then(Value::as_i64);
-    let limit = args.get("limit").and_then(Value::as_i64);
+    let offset = args.get("offset").and_then(Value::as_f64);
+    let limit = args.get("limit").and_then(Value::as_f64);
     if offset.is_none() && limit.is_none() {
         return None;
     }
-    let start = offset.unwrap_or(1);
-    Some(match limit {
-        Some(l) => format!(":{start}-{}", start + l - 1),
-        None => format!(":{start}"),
+    let start = offset.unwrap_or(1.0);
+    // `endLine ? …` is a JS TRUTHINESS test on a Number, not a presence test: an end line that
+    // computes to zero (`{"offset":1,"limit":0}`) is falsy upstream and the `-<end>` half is
+    // dropped. `NaN` is falsy for the same reason and is excluded here for the same reason.
+    let end = limit.map(|l| start + l - 1.0).filter(|e| *e != 0.0 && !e.is_nan());
+    Some(match end {
+        Some(e) => format!(":{}-{}", js_number(start), js_number(e)),
+        None => format!(":{}", js_number(start)),
     })
 }
 
@@ -115,20 +199,84 @@ pub(super) fn more_lines_hint(
 }
 
 /// The file names `getCompactReadClassification` treats as a "resource" read
-/// (`core/tools/read.ts:42` `COMPACT_RESOURCE_FILE_NAMES`). Verbatim, including the two `.MD`
+/// (`core/tools/read.ts:43` `COMPACT_RESOURCE_FILE_NAMES`). Verbatim, including the two `.MD`
 /// spellings — the set is matched case-SENSITIVELY upstream (`Set.has(basename(absolutePath))`), so
 /// `agents.md` is deliberately not in it.
 pub(super) const COMPACT_RESOURCE_FILE_NAMES: [&str; 5] =
     ["AGENTS.override.md", "AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"];
 
-/// One `CompactReadClassification` (`read.ts:37-40`) — `kind` is `"docs" | "resource" | "skill"`.
+/// The `kind` union of `CompactReadClassification` (`read.ts:38-41`):
+/// `kind: "docs" | "resource" | "skill"`. A closed enum rather than a `&'static str` so the
+/// renderer cannot silently grow a fourth spelling, and so every `match` on it has to name all
+/// three.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CompactReadKind {
+    Docs,
+    Resource,
+    Skill,
+}
+
+impl CompactReadKind {
+    /// The word interpolated into ``read ${classification.kind}`` (`read.ts:162`).
+    fn as_str(self) -> &'static str {
+        match self {
+            CompactReadKind::Docs => "docs",
+            CompactReadKind::Resource => "resource",
+            CompactReadKind::Skill => "skill",
+        }
+    }
+}
+
+/// One `CompactReadClassification` (`read.ts:38-41`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct CompactRead {
-    kind: &'static str,
+    kind: CompactReadKind,
     label: String,
 }
 
-/// Port of `getCompactReadClassification` (`core/tools/read.ts:122-143`). **X7 = `G30b`** in
+/// Port of `getPiDocsClassification` (`read.ts:104-121`) — a read of the agent's OWN shipped
+/// `README.md`, `docs/…` or `examples/…`.
+///
+/// `absolute` is already lexically resolved by the caller and [`cyrup_config::asset_dir`] is
+/// normalized at construction, so `Path::strip_prefix` — which compares whole components — is the
+/// entire `relative()` guard upstream spells out at `:107-112`: it fails for a sibling, for an
+/// ancestor and for a different volume, and yields an EMPTY relative path for the root itself,
+/// which `:107` rejects too.
+fn docs_classification(absolute: &std::path::Path) -> Option<CompactRead> {
+    let package_root = cyrup_config::asset_dir()?;
+    let relative = absolute.strip_prefix(package_root).ok()?;
+    if relative.as_os_str().is_empty() {
+        return None;
+    }
+    let label = to_posix_label(relative);
+    // `label === "README.md" || label.startsWith("docs/") || label.startsWith("examples/")`
+    // (`:117`). The trailing separator is REQUIRED: a read of the `docs` directory itself is not a
+    // docs read upstream, and must not become one here.
+    if label == "README.md" || label.starts_with("docs/") || label.starts_with("examples/") {
+        return Some(CompactRead { kind: CompactReadKind::Docs, label });
+    }
+    None
+}
+
+/// `toPosixPath` (`read.ts:100-102`) — `filePath.split(sep).join("/")`, which is a plain
+/// replace-every-`sep`-with-`/` over the STRING form. A no-op on unix; on Windows it is what keeps
+/// the label reading `docs/providers.md` rather than `docs\providers.md`.
+///
+/// Deliberately NOT a `components()` walk joined on `"/"`: `Component::RootDir::as_os_str()` is
+/// already `MAIN_SEP_STR`, so the join emits it a second time and every absolute label comes out
+/// `//etc/…`; on Windows the `Prefix` + `RootDir` pair comes out `C:/\/a/b`. Upstream never
+/// decomposes the path, and neither must this — a UNC path's `//server/share/a` is upstream's
+/// output too, so a `//`-collapsing patch would be wrong in the other direction.
+fn to_posix_label(path: &std::path::Path) -> String {
+    let s = path.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '/' {
+        s.into_owned()
+    } else {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
+/// Port of `getCompactReadClassification` (`core/tools/read.ts:123-144`). **X7 = `G30b`** in
 /// `docs/gap-analysis/PARITY-GAPS.md` §2.5 — the same unported function; porting it here closes both, and neither
 /// backlog should re-land it.
 ///
@@ -142,13 +290,8 @@ pub(super) struct CompactRead {
 /// return undefined;
 /// ```
 ///
-/// The `docs` arm is the one piece that cannot be ported here, and the missing seam is specific:
-/// `getPiDocsClassification` (`:103-120`) resolves the read path against `dirname(getReadmePath())`
-/// — the directory of the SHIPPED package's `README.md` (`coding-agent/src/config.ts`) — to label
-/// `README.md`/`docs/…`/`examples/…` inside pi's own install. `getReadmePath` has no counterpart
-/// anywhere in `crates/` (`grep -rn "readme_path\|getReadmePath" crates --include=*.rs` is empty),
-/// and a Rust binary ships no such tree, so there is no path to compare against. `skill` and
-/// `resource` are complete; `docs` needs a packaged-docs locator to exist first.
+/// All three arms are ported: `SKILL.md` first, then [`docs_classification`]
+/// (`getPiDocsClassification`, `:104-121`), then `COMPACT_RESOURCE_FILE_NAMES` (`read.ts:43`).
 pub(super) fn compact_read_classification(
     args: &Value,
     cwd: Option<&std::path::Path>,
@@ -159,13 +302,16 @@ pub(super) fn compact_read_classification(
         // since `str()` yields `""`/`null` and both are falsy.
         _ => return None,
     };
-    // `resolveToCwd(rawPath, cwd)` — an absolute path is kept, a relative one is joined to the
-    // session cwd. `Path::join` has exactly that semantic for an absolute right-hand side.
     let base = match cwd {
         Some(c) => c.to_path_buf(),
         None => std::env::current_dir().ok()?,
     };
-    let absolute = base.join(&raw_path);
+    // `resolveToCwd(rawPath, cwd)` (`read.ts:130`). `Path::join` is NOT that function: it keeps
+    // `.`/`..` segments and expands neither `~` nor `@` nor `file://`, so a path pi resolves INTO
+    // the asset root (`docs/../docs/x.md`, `~/pkg/README.md`) would miss `strip_prefix` below.
+    // `cyrup_tools::path::resolve_to_cwd` IS the port of `resolveToCwd` (`path.rs:248-271`), and
+    // `crate::app::event_extract` already reaches for it on the same argument.
+    let absolute = cyrup_tools::path::resolve_to_cwd(&raw_path, &base);
     let file_name = absolute.file_name()?.to_string_lossy().into_owned();
     if file_name == "SKILL.md" {
         // `basename(dirname(absolutePath)) || fileName` — the containing directory names the skill,
@@ -176,21 +322,28 @@ pub(super) fn compact_read_classification(
             .map(|s| s.to_string_lossy().into_owned())
             .filter(|s| !s.is_empty())
             .unwrap_or(file_name);
-        return Some(CompactRead { kind: "skill", label });
+        return Some(CompactRead { kind: CompactReadKind::Skill, label });
+    }
+    // `const docsClassification = getPiDocsClassification(absolutePath);` (`:136-137`) — SECOND,
+    // ahead of the resource set. A `docs/AGENTS.md` inside the shipped tree is a `docs` read
+    // upstream, not a `resource` read, and the order is what decides that.
+    if let Some(docs) = docs_classification(&absolute) {
+        return Some(docs);
     }
     if COMPACT_RESOURCE_FILE_NAMES.contains(&file_name.as_str()) {
-        // `formatPathRelativeToCwdOrAbsolute(absolutePath, cwd)`: the cwd-relative form when the file
-        // is under it, else the absolute path.
+        // `formatPathRelativeToCwdOrAbsolute(absolutePath, cwd)` (`utils/paths.ts:119-122`): the
+        // cwd-relative form when the file is under it, else the absolute path — and `.split(sep)
+        // .join("/")` on the result, which is the same posix fold the docs label takes.
         let label = absolute
             .strip_prefix(&base)
-            .map(|r| r.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| absolute.to_string_lossy().into_owned());
-        return Some(CompactRead { kind: "resource", label });
+            .map(to_posix_label)
+            .unwrap_or_else(|_| to_posix_label(&absolute));
+        return Some(CompactRead { kind: CompactReadKind::Resource, label });
     }
     None
 }
 
-/// Port of `formatCompactReadCall` (`core/tools/read.ts:145-167`).
+/// Port of `formatCompactReadCall` (`core/tools/read.ts:146-168`).
 ///
 /// ```ts
 /// const expandHint = theme.fg("dim", ` (${keyText("app.tools.expand")} to expand)`);
@@ -211,15 +364,23 @@ pub(super) fn compact_read_call(
     theme: &UiTheme,
 ) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    if c.kind == "skill" {
+    match c.kind {
         // The `\x1b[1m…\x1b[22m` pair inside the interpolation is bold-on/bold-off around the
         // bracket label only; `custom_message_label_style` already carries BOLD.
-        spans.push(Span::styled("[skill] ".to_string(), theme.custom_message_label_style()));
-        spans.push(Span::styled(c.label.clone(), theme.custom_message_text_style()));
-    } else {
-        spans.push(Span::styled(format!("read {}", c.kind), theme.tool_title_style()));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(c.label.clone(), theme.accent_style()));
+        CompactReadKind::Skill => {
+            spans.push(Span::styled("[skill] ".to_string(), theme.custom_message_label_style()));
+            spans.push(Span::styled(c.label.clone(), theme.custom_message_text_style()));
+        }
+        // `read.ts:161-167` — docs and resource share ONE branch upstream; the kind word is
+        // interpolated into the bold title and the label follows in accent.
+        CompactReadKind::Docs | CompactReadKind::Resource => {
+            spans.push(Span::styled(
+                format!("read {}", c.kind.as_str()),
+                theme.tool_title_style(),
+            ));
+            spans.push(Span::raw(" "));
+            spans.push(Span::styled(c.label.clone(), theme.accent_style()));
+        }
     }
     if let Some(range) = read_line_range(args) {
         spans.push(Span::styled(range, theme.warning_style()));

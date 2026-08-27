@@ -54,6 +54,75 @@ pub(crate) fn windows_access_result(
     Ok(())
 }
 
+/// Render an [`ignore::Error`] the way ripgrep does — `{path}: {io error}`, with the path
+/// stated **exactly once**.
+///
+/// `Display` cannot be used directly. `Error::from_walkdir` stores
+/// `Error::Io(io::Error::from(walkdir_err))` (ignore 0.4.26 `src/lib.rs:296-301`), and
+/// walkdir 2.5.0's `From<Error> for io::Error` is `io::Error::new(kind, walk_err)`
+/// (`walkdir-2.5.0/src/error.rs:253-261`) — a CUSTOM io error whose own `Display` re-states
+/// the path as `"IO error for operation on {path}: {err}"` (`:224-229`). Printed under
+/// `WithPath` (`lib.rs:333-335`) that yields the path twice. walkdir 2.3.x returned the
+/// inner `io::Error` unchanged, which is why `rg` 14.1.0 prints the clean form and a
+/// straight `to_string()` here does not.
+///
+/// `Error::io_error()` is NOT the escape hatch: it unwraps only `ignore`'s own
+/// `Partial`/`WithLineNumber`/`WithPath`/`WithDepth` nesting and then returns the
+/// `Error::Io` payload verbatim (`lib.rs:205-222`), i.e. walkdir's wrapper. And there is
+/// no `Error::path()` accessor at 0.4.26 — the path is only reachable by matching the
+/// public `WithPath` variant (`lib.rs:78-84`), which is what this does.
+///
+/// Every arm reproduces the corresponding arm of `impl Display for Error`
+/// (`lib.rs:322-359`) unchanged except for the io leaf, so `Loop` (which carries no
+/// `WithPath` — `lib.rs:286-295`) keeps ripgrep's un-prefixed
+/// `"File system loop found: … points to an ancestor …"`.
+pub(crate) fn walk_error_message(err: &ignore::Error) -> String {
+    match err {
+        // The one variant carrying a path. Recurse, so the tail is the PEELED io text
+        // rather than walkdir's restatement of this same path.
+        ignore::Error::WithPath { path, err } => {
+            format!("{}: {}", path.display(), walk_error_message(err))
+        }
+        // Transparent in `Display` (`lib.rs:336`); stay transparent.
+        ignore::Error::WithDepth { err, .. } => walk_error_message(err),
+        // `Display` is `line {n}: {err}` (`lib.rs:330-332`).
+        ignore::Error::WithLineNumber { line, err } => {
+            format!("line {line}: {}", walk_error_message(err))
+        }
+        // `Display` joins with `\n` (`lib.rs:325-329`).
+        ignore::Error::Partial(errs) => errs
+            .iter()
+            .map(walk_error_message)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ignore::Error::Io(io) => io_error_message(io),
+        // `Loop`, `Glob`, `UnrecognizedFileType`, `InvalidDefinition`: no nested io error,
+        // no doubled path — their own `Display` is already what ripgrep prints.
+        other => other.to_string(),
+    }
+}
+
+/// Peel walkdir's wrapper off an [`std::io::Error`] so it prints as the OS did.
+///
+/// `io::Error::get_ref` is `Some` only for the custom repr, where it hands back the boxed
+/// payload — here the `walkdir::Error`. walkdir's `source()` is the ORIGINAL `io::Error`
+/// (`walkdir-2.5.0/src/error.rs:212-217`), which renders as
+/// `Permission denied (os error 13)`.
+///
+/// Both hops are required. An `io::Error` straight from `std::fs` is the OS repr, so
+/// `get_ref()` is `None`; `ignore`'s handful of `io::Error::new(kind, "<literal>")` sites
+/// (`walk.rs:175-179`, `:377`, `:427`) DO have a payload but its `source()` is `None`.
+/// Both therefore fall through to their own `Display`, unchanged. walkdir's error is the
+/// only payload on this seam that carries a `source()`.
+fn io_error_message(err: &std::io::Error) -> String {
+    if let Some(payload) = err.get_ref()
+        && let Some(original) = std::error::Error::source(payload)
+    {
+        return original.to_string();
+    }
+    err.to_string()
+}
+
 /// Local filesystem operations.
 #[derive(Default, Clone)]
 pub struct LocalFs;
@@ -79,7 +148,7 @@ impl FsOps for LocalFs {
         Ok(Box::new(file))
     }
 
-    /// 1:1 with Pi's `fsWriteFile(path, content, "utf-8")` (write.ts:33 / edit.ts:85):
+    /// 1:1 with Pi's `fsWriteFile(path, content, "utf-8")` (write.ts:39 / edit.ts:107):
     /// `O_WRONLY|O_CREAT|O_TRUNC` with creation mode `0o666` (umask applies), write, close.
     ///
     /// [CYRUP-DELTA] The parent-directory creation is Pi's SEPARATE `ops.mkdir(dirname(path),
@@ -95,12 +164,22 @@ impl FsOps for LocalFs {
     /// lets a write succeed on a read-only file, because `rename(2)` checks the parent directory
     /// rather than the file. See [`FsOps::write_in_place`] for the durability trade this accepts.
     async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+        // `io_errno`, not `io`, on every edge below. Pi's write ops are raw Node calls whose
+        // rejections propagate uncaught out of `execute` (write.ts:221/225, edit.ts:371) and reach
+        // the model as `error.message` verbatim (agent-loop.ts:701-707), and a Node `SystemError`
+        // message ALWAYS leads with the libuv errno name — `EACCES: permission denied, open '/x'`,
+        // `ENOSPC: no space left on device, write`. `ToolError` is flat, so the code has to ride as
+        // the leading token of the message; that is precisely what `error::io_errno` builds, and it
+        // is the same `CODE: context: display` shape `access`/`read_dir`/`lock` already emit. The
+        // context is the SYSCALL Node names for each edge (`mkdir`, `open`, `write`), so the model
+        // can tell a parent-creation failure from an open failure from a short write, which the
+        // single shared `write {path}` context could not.
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| error::io(&format!("create dir {}", error::show(parent)), &e))?;
+                .map_err(|e| error::io_errno(&format!("mkdir {}", error::show(parent)), &e))?;
         }
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -108,15 +187,15 @@ impl FsOps for LocalFs {
             .truncate(true)
             .open(path)
             .await
-            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
+            .map_err(|e| error::io_errno(&format!("open {}", error::show(path)), &e))?;
         file.write_all(bytes)
             .await
-            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
+            .map_err(|e| error::io_errno(&format!("write {}", error::show(path)), &e))?;
         // `tokio::fs::File` buffers; flush pushes the bytes to the OS. Node's `writeFile` likewise
         // only loops `write(2)` and closes the fd — there is no `fsync` on either side.
         file.flush()
             .await
-            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
+            .map_err(|e| error::io_errno(&format!("write {}", error::show(path)), &e))?;
         Ok(())
     }
 
@@ -210,7 +289,13 @@ impl FsOps for LocalFs {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<WalkItem, ToolError>>(256);
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let walker = WalkBuilder::new(&root)
+            // fd builds its walker in two phases — the chained knobs, then the tool-specific
+            // ignore SOURCES (fd 10.5.0 `src/walk.rs:352-386`) — and so must this. `add_ignore`
+            // returns `Option<ignore::Error>`, not `&mut WalkBuilder` (ignore 0.4.26
+            // `walk.rs:718`), so the chain cannot stay a single expression terminating in
+            // `.build()`.
+            let mut builder = WalkBuilder::new(&root);
+            builder
                 .hidden(!opts.include_hidden)
                 .git_ignore(true)
                 .git_exclude(true)
@@ -222,16 +307,76 @@ impl FsOps for LocalFs {
                 // The caller sets this per search path (find.ts:226-240): `false` outside a repo,
                 // `true` inside one. See `WalkOpts::require_git`.
                 .require_git(opts.require_git)
-                .parents(true)
-                .build();
+                // Also what makes the custom ignore filename below apply in ANCESTORS of the
+                // search root: `Ignore::add_parents` runs `add_child_path` per parent, which
+                // compiles the custom-ignore matcher too (ignore 0.4.26 `dir.rs:182-248`,
+                // `:286-292`). fd computes this same `true` (`read_parent_ignore &&
+                // (read_fdignore || read_vcsignore)`).
+                .parents(true);
+
+            // `.fdignore` for fd / `.rgignore` for ripgrep. Both are inert until registered;
+            // neither tool reads the other's. Custom ignore files outrank `.ignore` and EVERY
+            // gitignore source (ignore 0.4.26 `dir.rs:580-585`:
+            // `m_custom_ignore.or(m_ignore).or(m_gi).or(m_gi_exclude).or(m_global)
+            // .or(m_explicit)`), so a `!keep.txt` negation in `.fdignore` re-includes a path a
+            // `.gitignore` excluded — same as fd.
+            if let Some(name) = opts.flavor.custom_ignore_filename() {
+                builder.add_custom_ignore_filename(name);
+            }
+
+            // fd's GLOBAL ignore file (fd 10.5.0 `src/walk.rs:371-386`). Registered via
+            // `add_ignore`, which lands in `explicit_ignores` — the LOWEST precedence source,
+            // below the global gitignore (`dir.rs:585`), exactly as it is for fd. ripgrep has no
+            // global ignore file, so this is gated on the fd flavor alone.
+            if opts.flavor.reads_fd_global_ignore()
+                && let Some(global) = crate::path::fd_global_ignore_file()
+            {
+                // fd prints a warning for a malformed pattern and KEEPS WALKING, with the rules
+                // that did parse still in force (`ignore::Error::Partial`). pi buffers fd's stderr
+                // but only surfaces it when fd exits non-zero AND produced no output
+                // (find.ts:284-310), so that warning is invisible upstream on a successful run.
+                // `walk` has no warning channel; dropping the error reproduces both halves.
+                drop(builder.add_ignore(&global));
+            }
+
+            let walker = builder.build();
+            // A per-entry `Err` is a NON-FATAL event on this stream and the walk CONTINUES past
+            // it: `ignore::Walk::next` leaves its iterator intact after yielding one (ignore
+            // 0.4.26 `src/walk.rs:1124-1126`), so valid entries arrive both before and after.
+            // Consumers must never read one as end-of-stream.
+            //
+            // The message is `walk_error_message`'s rendering of the `ignore::Error`, i.e.
+            // ripgrep's own `{path}: {io error}` with the path stated once, e.g.
+            // `/srv/locked: Permission denied (os error 13)`. It is NOT `e.to_string()`:
+            // at ignore 0.4.26 + walkdir 2.5.0 `Display` states the path TWICE — see
+            // `walk_error_message`. No prefix is added here because the two consumers of
+            // this seam want different things from the same value: `find` emulates fd,
+            // which discards it (fd 10.5.0 `src/walk.rs:227-231`, `:500-505`), and `grep`
+            // emulates ripgrep, which reports it as `rg: {path}: {io error}` on stderr.
+            // A `walk: ` prefix matched neither.
             for result in walker {
                 let item = match result {
                     Ok(entry) => {
                         let path = entry.path().to_path_buf();
-                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                        Ok(WalkItem { path, is_dir })
+                        // One `file_type()` read feeds both flags. `ignore` 0.4.26 derives a
+                        // traversed entry's type from `std::fs::DirEntry::file_type`
+                        // (`walk.rs:322-333`, `:353-367`), which is `lstat` semantics: a symlink
+                        // reports itself as a symlink, so it is neither a dir nor a file and both
+                        // flags are false — exactly the entry ripgrep declines to search. `None`
+                        // occurs only for the synthetic stdin entry (`walk.rs:67-78`), which a
+                        // path-rooted walker never yields, so `unwrap_or(false)` mirrors ripgrep's
+                        // own `file_type().map_or(false, |ft| ft.is_file())`: unknown type is not a
+                        // regular file.
+                        let ty = entry.file_type();
+                        let is_dir = ty.map(|t| t.is_dir()).unwrap_or(false);
+                        let is_file = ty.map(|t| t.is_file()).unwrap_or(false);
+                        Ok(WalkItem {
+                            path,
+                            is_dir,
+                            is_file,
+                        })
                     }
-                    Err(e) => Err(ToolError::new(format!("walk: {e}"))),
+                    Err(e) => Err(ToolError::new(walk_error_message(&e))),
                 };
                 if tx.blocking_send(item).is_err() {
                     break;

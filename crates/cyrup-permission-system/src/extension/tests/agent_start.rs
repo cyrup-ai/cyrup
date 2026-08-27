@@ -14,7 +14,7 @@ use crate::extension::{PermissionSystemExtension, guard};
 /// key hit (`:1908-1913`). Cyrup recomputed and re-applied everything on every turn.
 #[test]
 fn repeated_before_agent_start_applies_the_active_tool_set_once() {
-    with_config_env_lock(async {
+    block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());
@@ -56,7 +56,7 @@ fn repeated_before_agent_start_applies_the_active_tool_set_once() {
 /// `PermissionManager::policy_cache_stamp` is public upstream (`permission-manager.ts:781`).
 #[test]
 fn a_mid_session_policy_edit_re_applies_the_shaped_tool_set() {
-    with_config_env_lock(async {
+    block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         let ext = PermissionSystemExtension::new(agent_dir.clone(), agent_dir.clone());

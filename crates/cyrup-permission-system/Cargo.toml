@@ -103,3 +103,11 @@ tempfile = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
 async-trait = { workspace = true }
+# TEST-ONLY oracle for `manager.rs::built_in_tool_names_tracks_the_tool_registry`. `BUILT_IN_TOOL_NAMES`
+# is Pi's `permission-manager.ts` constant (which permission KEYS are built-in-tool keys), NOT a
+# mirror of the registry (which tools are INSTALLED, in wire order) — the two answer different
+# questions and must stay separately stated, so this is deliberately a dev edge and `manager.rs`
+# never names `cyrup_tools`. The test is what makes the sets provably equal. No new compile surface:
+# `cyrup-tools` is already normal-reachable via `cyrup-ext` and dev-reachable via `cyrup-session-svc`
+# + `cyrup-test-support`, with the same default `inline-images` feature.
+cyrup-tools = { workspace = true }

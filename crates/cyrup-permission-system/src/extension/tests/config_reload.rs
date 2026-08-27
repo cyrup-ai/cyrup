@@ -22,7 +22,7 @@ use crate::skill::SkillPromptEntry;
 /// the cached skill-enforcement entries ever refreshed — this test fails against that behavior.
 #[test]
 fn resources_discover_reloads_config_and_invalidates_skill_cache() {
-    with_config_env_lock(resources_discover_reloads_config_and_invalidates_skill_cache_body());
+    block_on(resources_discover_reloads_config_and_invalidates_skill_cache_body());
 }
 
 async fn resources_discover_reloads_config_and_invalidates_skill_cache_body() {
@@ -114,7 +114,7 @@ async fn session_start_rebuilds_manager_from_current_session_cwd() {
 /// `resources_discover`.
 #[test]
 fn before_agent_start_re_reads_config_json() {
-    with_config_env_lock(async {
+    block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
@@ -144,7 +144,7 @@ fn before_agent_start_re_reads_config_json() {
 /// behaviour while the pill kept the stale value.
 #[test]
 fn a_resources_discover_reload_re_syncs_the_yolo_pill() {
-    with_config_env_lock(async {
+    block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         let config_path = agent_dir.join(CONFIG_DIR).join(CONFIG_FILE);
@@ -187,7 +187,7 @@ fn a_resources_discover_reload_re_syncs_the_yolo_pill() {
 /// session, so an operator can tell a reload from a fresh start in the trail. Cyrup wrote none.
 #[test]
 fn reload_surfaces_write_lifecycle_reload_debug_entries() {
-    with_config_env_lock(async {
+    block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().to_path_buf();
         write_file(&agent_dir.join(CONFIG_DIR).join(CONFIG_FILE), r#"{"debug": true}"#);
@@ -254,7 +254,7 @@ fn lifecycle_reload_entries(agent_dir: &Path) -> Vec<Value> {
 /// the host boundary.
 #[test]
 fn malformed_policy_and_config_files_notify_the_host() {
-    with_config_env_lock(malformed_policy_and_config_files_notify_the_host_body());
+    block_on(malformed_policy_and_config_files_notify_the_host_body());
 }
 
 async fn malformed_policy_and_config_files_notify_the_host_body() {
@@ -330,24 +330,11 @@ async fn malformed_policy_and_config_files_notify_the_host_body() {
 /// `config.json` and then finds a corrupt one reports the corruption — the case the count-based
 /// assertion above could never distinguish from the policy warning firing twice.
 ///
-/// Driven through `with_config_env_lock` like every other env-locked test in this module: the
-/// guard belongs in the synchronous frame, not inside the `async` body where it would be stored
-/// in the future's state across all three `.await`s below.
+/// Driven through [`block_on`] like every other lifecycle test in this module: the body is one
+/// `async fn` so the three `.await`s below share a single current-thread runtime.
 #[test]
 fn a_config_warning_re_arms_after_a_clean_load_clears_the_memo() {
-    with_config_env_lock(a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body());
-}
-
-/// RED BEFORE THE FIX, at COMPILE time. `std::sync::MutexGuard` is `!Send`, so while the guard
-/// was taken at the top of this test's `async` body it was captured in that body's future and
-/// this assertion did not compile. It compiles now because the guard lives on
-/// `with_config_env_lock`'s stack frame instead — which is exactly the property fixed.
-/// Constructing an `async fn`'s future runs none of its body, so this touches no config file
-/// and no environment variable and needs no lock of its own.
-#[test]
-fn the_env_locked_body_does_not_carry_the_guard_across_its_awaits() {
-    fn assert_send<F: Send>(_: F) {}
-    assert_send(a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body());
+    block_on(a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body());
 }
 
 async fn a_config_warning_re_arms_after_a_clean_load_clears_the_memo_body() {

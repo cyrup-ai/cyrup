@@ -10,7 +10,7 @@ use crate::context::{Context, ToolDef};
 use crate::model::Model;
 use crate::stream::CacheRetention;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use base64::Engine as _;
 use cyrup_core::{Content, Message};
@@ -285,9 +285,11 @@ pub(super) fn convert_tool_config(
             let mut spec = Map::new();
             spec.insert("name".to_string(), json!(tool.name));
             spec.insert("description".to_string(), json!(tool.description));
+            // `getJsonSchemaToolParameters(tool, strict)` (`bedrock-converse-stream.ts:1116`
+            // @v0.84.2) — the `strict` flag below and the schema must agree.
             spec.insert(
                 "inputSchema".to_string(),
-                json!({ "json": tool.parameters }),
+                json!({ "json": json_schema_tool_parameters(tool, strict == Some(true))? }),
             );
             if strict == Some(true) {
                 spec.insert("strict".to_string(), json!(true));

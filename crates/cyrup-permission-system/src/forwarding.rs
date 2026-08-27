@@ -145,8 +145,7 @@ pub struct ForwardingLocation {
 /// non-subagent-scoped precedence levels cyrup uses (explicit override → default agent dir), then
 /// `join("sessions", "permission-forwarding")`.
 fn forwarding_root_dir(default_agent_dir: &Path) -> PathBuf {
-    let agent_dir = std::env::var(FORWARDING_AGENT_DIR_ENV)
-        .ok()
+    let agent_dir = crate::envx::var(FORWARDING_AGENT_DIR_ENV)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .map_or_else(|| default_agent_dir.to_path_buf(), PathBuf::from);
@@ -636,8 +635,7 @@ fn denied() -> PermissionPromptDecision {
 /// else the pi-faithful [`PERMISSION_FORWARDING_TIMEOUT`] (10 min).
 #[must_use]
 pub fn resolve_child_wait_timeout() -> Duration {
-    std::env::var(CHILD_WAIT_TIMEOUT_ENV)
-        .ok()
+    crate::envx::var(CHILD_WAIT_TIMEOUT_ENV)
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|ms| *ms > 0)
         .map_or(PERMISSION_FORWARDING_TIMEOUT, Duration::from_millis)

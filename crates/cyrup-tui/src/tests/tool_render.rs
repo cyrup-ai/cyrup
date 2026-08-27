@@ -81,6 +81,36 @@ fn bash_call_and_output_tail() {
     assert!(expanded.contains("ln01"), "all lines visible when expanded: {expanded:?}");
 }
 
+/// Pi renders the shell call with `config.prompt` (`formatShellCall(args, config.prompt)`,
+/// bash.ts:488): `$` for bash (bash.ts:523) and `PS>` for PowerShell (powershell.ts:43). Everything
+/// else about the row — timeout suffix, tail, expand, `Took …` — is the same renderer.
+#[test]
+fn powershell_call_renders_with_the_ps_prompt() {
+    let mut view = TranscriptView::new();
+    view.push_tool_start("powershell", json!({ "command": "Get-ChildItem", "timeout": 5 }));
+    let body: String = (1..=25).map(|i| format!("ln{i:02}")).collect::<Vec<_>>().join("\n");
+    view.push_tool_end("powershell", false, Some(text_result(&body, json!(null))));
+
+    let collapsed = render(&mut view, 70, 20);
+    assert!(
+        collapsed.contains("PS> Get-ChildItem"),
+        "PowerShell header uses `PS>`: {collapsed:?}"
+    );
+    assert!(
+        !collapsed.contains("$ Get-ChildItem"),
+        "never the bash prompt: {collapsed:?}"
+    );
+    assert!(collapsed.contains("(timeout 5s)"), "timeout suffix: {collapsed:?}");
+    assert!(collapsed.contains("ln25") && collapsed.contains("ln21"), "5-line tail: {collapsed:?}");
+    assert!(!collapsed.contains("ln20"), "earlier lines hidden: {collapsed:?}");
+    assert!(collapsed.contains("Took"), "duration footer: {collapsed:?}");
+
+    assert!(view.toggle_tool_expanded());
+    let expanded = render(&mut view, 70, 30);
+    assert!(expanded.contains("ln01"), "expand shows the head: {expanded:?}");
+    assert!(expanded.contains("PS> Get-ChildItem"), "header survives expand: {expanded:?}");
+}
+
 #[test]
 fn edit_result_renders_the_self_diff() {
     let mut view = TranscriptView::new();

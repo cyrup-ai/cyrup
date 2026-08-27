@@ -3,8 +3,8 @@
 
 use crate::config::ToolsOptions;
 use crate::lock::FileMutationLocks;
-use crate::ops::{Backend, ShellConfig};
-use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
+use crate::ops::Backend;
+use crate::tools::{EditTool, FindTool, GrepTool, LsTool, ReadTool, ShellTool, WriteTool};
 use cyrup_core::Tool;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,12 +12,22 @@ use std::sync::Arc;
 
 /// The closed set of built-in tool names (DI-1), in Pi's declaration order.
 ///
-/// Pi's `createAllToolDefinitions` returns its object literal as `read, bash, edit, write, grep,
-/// find, ls` (`coding-agent/src/core/tools/index.ts:156-166`), and object-literal insertion order is
-/// the order `Object.values()` / the tool registry replays. That order reaches the wire: it is the
-/// order of the `tools` array in every provider request and of the tool list rendered into the
-/// system prompt, both of which the model conditions on.
-pub const BUILTIN_NAMES: [&str; 7] = ["read", "bash", "edit", "write", "grep", "find", "ls"];
+/// Pi's `createAllToolDefinitions` returns its object literal as `read, bash, powershell, edit,
+/// write, grep, find, ls` (`coding-agent/src/core/tools/index.ts:182-193`, matching `allToolNames`
+/// at `:96-105`), and object-literal insertion order is the order `Object.values()` / the tool
+/// registry replays. That order reaches the wire: it is the order of the `tools` array in every
+/// provider request and of the tool list rendered into the system prompt, both of which the model
+/// conditions on. `powershell` therefore goes THIRD, immediately after `bash` — not appended.
+pub const BUILTIN_NAMES: [&str; 8] = [
+    "read",
+    "bash",
+    "powershell",
+    "edit",
+    "write",
+    "grep",
+    "find",
+    "ls",
+];
 
 /// Model-visible tool-set controls (R-03-010).
 #[derive(Clone, Debug, Default)]
@@ -29,7 +39,7 @@ pub enum Availability {
     Allow(HashSet<String>),
     /// All registered tools except these names.
     Exclude(HashSet<String>),
-    /// Drop the seven built-ins; keep extension tools.
+    /// Drop the eight built-ins; keep extension tools.
     NoBuiltins,
     /// Empty model-visible set.
     NoTools,
@@ -50,28 +60,43 @@ impl ToolRegistry {
         }
     }
 
-    /// Build the default registry with the seven built-ins over `backend` (arch-03 §3.4).
+    /// Build the default registry with the eight built-ins over `backend` (arch-03 §3.4).
+    ///
+    /// Resolves NO shell. Pi's `createAllToolDefinitions` (index.ts:182) does not either — the only
+    /// `getShellConfig` call on the bash path is inside `exec` (bash.ts:91) — so a host with no
+    /// bash still gets a working registry, and its `No bash shell found` recipe arrives as the
+    /// `bash` TOOL RESULT rather than aborting session construction. Making this fallible would
+    /// also break `read_only_tools`, which contains no bash tool at all.
     pub fn with_builtins(cwd: PathBuf, backend: Backend, opts: ToolsOptions) -> Self {
         let mut reg = Self::new();
         let locks = Arc::new(FileMutationLocks::new());
-        let shell = ShellConfig::detect();
 
         // Insertion order IS presentation order (see `insert`/`all`/`visible` below), and it must be
-        // Pi's `createAllToolDefinitions` literal order — read, bash, edit, write, grep, find, ls
-        // (`coding-agent/src/core/tools/index.ts:156-166`). It also fixes the two derived sets for
-        // free: filtering this order to {read,bash,edit,write} reproduces `createCodingTools`
-        // (index.ts:169-176) and to {read,grep,find,ls} reproduces `createReadOnlyToolDefinitions`
-        // (index.ts:147-154).
+        // Pi's `createAllToolDefinitions` literal order — read, bash, powershell, edit, write, grep,
+        // find, ls (`coding-agent/src/core/tools/index.ts:182-193`). It also fixes the two derived
+        // sets for free: filtering this order to {read,bash,edit,write} reproduces
+        // `createCodingTools` (index.ts:195-202) and to {read,grep,find,ls} reproduces
+        // `createReadOnlyToolDefinitions` (index.ts:173-180). Neither derived set contains
+        // `powershell`, exactly as upstream.
         reg.insert(Arc::new(ReadTool::new(
             backend.fs.clone(),
             cwd.clone(),
             opts.read,
         )));
-        reg.insert(Arc::new(BashTool::new(
+        reg.insert(Arc::new(ShellTool::bash(
             backend.proc.clone(),
-            shell,
             cwd.clone(),
             opts.bash,
+        )));
+        // Registered on EVERY platform. Pi builds the definition unconditionally
+        // (`createAllToolDefinitions`, index.ts:186) and only `getPowerShellConfig` is Windows-gated
+        // (shell.ts:126-128), so the tool is always NAMEABLE and reports its own refusal as a tool
+        // result. Gating registration on `cfg!(windows)` would make `--tools powershell` silently
+        // select nothing off-Windows instead of saying why.
+        reg.insert(Arc::new(ShellTool::powershell(
+            backend.proc.clone(),
+            cwd.clone(),
+            opts.powershell,
         )));
         reg.insert(Arc::new(EditTool::new(
             backend.fs.clone(),
@@ -160,7 +185,7 @@ pub fn read_only_tools(cwd: PathBuf, backend: Backend, opts: ToolsOptions) -> Ve
     reg.visible(&Availability::Allow(allow))
 }
 
-/// All seven built-in tools.
+/// All eight built-in tools.
 pub fn all_tools(cwd: PathBuf, backend: Backend, opts: ToolsOptions) -> Vec<Arc<dyn Tool>> {
     ToolRegistry::with_builtins(cwd, backend, opts).all()
 }

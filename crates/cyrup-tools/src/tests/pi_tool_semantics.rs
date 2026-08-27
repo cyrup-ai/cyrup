@@ -785,10 +785,10 @@ fn bash_prompt_guideline_deltas_are_tagged_cyrup_delta() {
     // loudly here instead of making every assertion below vacuous.
     let guidelines_at = src
         .find("fn prompt_guidelines(")
-        .expect("`BashTool::prompt_guidelines` still exists");
+        .expect("`ShellTool::prompt_guidelines` still exists");
     let snippet_at = src
         .find("fn prompt_snippet(")
-        .expect("`BashTool::prompt_snippet` still exists");
+        .expect("`ShellTool::prompt_snippet` still exists");
     assert!(
         snippet_at < guidelines_at,
         "the doc block scanned below is the one BETWEEN prompt_snippet and prompt_guidelines"

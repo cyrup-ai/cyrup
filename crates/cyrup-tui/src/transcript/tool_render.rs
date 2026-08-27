@@ -35,12 +35,13 @@ pub(crate) fn tool_lines(
     } else {
         match run.name.as_str() {
             "read" => render_read(run, expanded, theme, images, &mut block),
-            "write" => render_write(run, expanded, theme, images.expand_key, &mut block),
-            "edit" => render_edit(run, theme, &mut block),
-            "bash" => render_bash(run, expanded, theme, images.expand_key, &mut block),
+            "write" => render_write(run, expanded, theme, images, &mut block),
+            "edit" => render_edit(run, theme, images, &mut block),
+            "bash" => render_bash(run, expanded, theme, images.expand_key, "$", &mut block),
+            "powershell" => render_bash(run, expanded, theme, images.expand_key, "PS>", &mut block),
             "grep" => render_grep(run, expanded, theme, images.expand_key, &mut block),
             "find" => render_find(run, expanded, theme, images.expand_key, &mut block),
-            "ls" => render_ls(run, expanded, theme, images.expand_key, &mut block),
+            "ls" => render_ls(run, expanded, theme, images, &mut block),
             _ => render_generic(run, theme, &mut block),
         }
     }
@@ -105,6 +106,14 @@ pub(crate) struct ImageOpts<'a> {
     /// Pi `ToolRenderContext.cwd` — the SESSION's working directory, not necessarily the process's.
     /// `None` falls back to the process cwd.
     pub cwd: Option<&'a std::path::Path>,
+    /// `getCapabilities().hyperlinks` (`render-utils.ts:20`) — whether the controlling terminal
+    /// forwards OSC-8. Threaded rather than read from `crate::image::hyperlinks_supported()` for
+    /// the same reason `graphical` is (TUI-N01/TUI-N11): the global falls back to an env sniff, so
+    /// reading it here would make every header assertion depend on the developer's `TERM_PROGRAM`.
+    pub hyperlinks: bool,
+    /// Where [`tool_path_span`] registers an href for [`crate::osc::inject`] to emit. `None` on any
+    /// path that does not own the resulting `Buffer` — the link is then simply not marked.
+    pub links: Option<&'a crate::osc::LinkSink>,
     /// X14 — the LIVE `this.toolOutputExpanded` (`interactive-mode.ts:442`), the flag `Ctrl+O` /
     /// `setToolsExpanded` drive. Upstream never stores an expansion on a message: it seeds each
     /// component from this field at construction (`:3486`, `:3493`) and re-broadcasts to every
@@ -131,6 +140,10 @@ impl Default for ImageOpts<'_> {
             width_cells: DEFAULT_IMAGE_WIDTH_CELLS,
             expand_key: EXPAND_KEY,
             cwd: None,
+            // Pi's own conservative default (`terminal-image.ts:130-134`), which also keeps every
+            // existing `ImageOpts::default()` construction on the plain-text branch.
+            hyperlinks: false,
+            links: None,
             tools_expanded: false,
             hidden_thinking_label: None,
         }

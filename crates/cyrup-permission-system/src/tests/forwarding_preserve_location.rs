@@ -94,7 +94,7 @@ async fn the_parent_watcher_preserves_its_spool_across_a_drained_scan() {
     // unset here — the default agent dir argument is what we pass — but asserted so a stray
     // ambient value from another test cannot silently redirect the spool.)
     assert!(
-        std::env::var(FORWARDING_AGENT_DIR_ENV).is_err(),
+        crate::envx::var(FORWARDING_AGENT_DIR_ENV).is_none(),
         "this test derives the spool from its own temp agent dir; an ambient \
          {FORWARDING_AGENT_DIR_ENV} override would invalidate it"
     );

@@ -61,12 +61,11 @@ pub const POLICY_AGENT_DIR_ENV_KEY: &str = "CYRUP_PERMISSION_SYSTEM_POLICY_AGENT
 /// lifetime), the exact equivalent of pi's in-process `active_agent` session entry / `<active_agent>`
 /// prompt tag for a separate-process subagent. Trimmed; empty/absent → `None` (pi `normalizeAgentName`
 /// null-normalization + the normalized-`""` top-level: a top-level process has no such var, so the
-/// agent + projectAgent layers no-op and global + project still enforce). This is the SAME
-/// `std::env::var` pattern the crate already uses for the sibling `CYRUP_SUBAGENT_*` anchors
-/// (`ask.rs` `PARENT_SESSION_ENV_VAR`, `is_subagent_child`).
+/// agent + projectAgent layers no-op and global + project still enforce). Read through
+/// [`crate::envx::var`], the crate's ONE environment accessor — the same one the sibling
+/// `CYRUP_SUBAGENT_*` anchors go through (`ask.rs` `PARENT_SESSION_ENV_VAR`, `is_subagent_child`).
 pub(super) fn resolve_agent_name_from_env() -> Option<String> {
-    std::env::var(cyrup_ext_subagents::AGENT_NAME_ENV_VAR)
-        .ok()
+    crate::envx::var(cyrup_ext_subagents::AGENT_NAME_ENV_VAR)
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
 }
@@ -95,7 +94,7 @@ pub(super) fn resolve_agent_name_from_env() -> Option<String> {
 /// ([`crate::permission_extension_for_env`]) and per call — the env keys are process-lifetime constants in
 /// cyrup, so the two coincide.
 pub(super) fn is_subagent_child() -> bool {
-    has_subagent_env_hint(|key| std::env::var(key).ok())
+    has_subagent_env_hint(crate::envx::var)
 }
 
 /// The injectable core of [`is_subagent_child`] — pi `hasSubagentEnvHint`'s body
@@ -103,7 +102,8 @@ pub(super) fn is_subagent_child() -> bool {
 ///
 /// Parameterized over the env reader so the predicate is directly testable without
 /// `unsafe { std::env::set_var }` and the cross-test races a process-global mutation brings, the
-/// same injectable-core convention `cyrup-ext-subagents`' `spawn::depth`/`spawn::mod` use.
+/// same injectable-core convention `cyrup-ext-subagents`' `spawn::depth`/`spawn::mod` use. The
+/// production caller passes [`crate::envx::var`] as a function item, no closure involved.
 ///
 /// Not ported: pi caches the answer keyed on a `\0`-joined signature of the values
 /// (`index.ts:94-102`). That cache exists because pi re-evaluates this on every `ctx` predicate
@@ -117,7 +117,7 @@ pub(super) fn has_subagent_env_hint(get: impl Fn(&str) -> Option<String>) -> boo
 
 pub(super) fn env_truthy(name: &str) -> bool {
     matches!(
-        std::env::var(name).ok().as_deref().map(str::trim),
+        crate::envx::var(name).as_deref().map(str::trim),
         Some("1") | Some("true") | Some("on") | Some("yes")
     )
 }

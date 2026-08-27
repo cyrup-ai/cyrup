@@ -19,7 +19,8 @@ pub mod tool;
 
 pub use cancel::{CancelToken, RunCancel};
 pub use constrained_sampling::{
-    ConstrainedSampling, ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
+    experimental_tool_sampling, experimental_tool_sampling_from, ConstrainedSampling,
+    ConstrainedSamplingConfig, GrammarVariants, StrictSampling,
 };
 pub use diagnostics::{
     append_assistant_message_diagnostic, create_assistant_message_diagnostic,
@@ -30,7 +31,7 @@ pub use error::CoreError;
 pub use event_stream::{
     finalizing_channel, Finalizing, FinalizingSink, FinalizingStream,
 };
-pub use keyed_lock::{Cancelled, KeyedGuard, KeyedLockMap, KeyedLocks};
+pub use keyed_lock::{Cancelled, KeyedAcquire, KeyedGuard, KeyedLockMap, KeyedLocks};
 pub use message::{
     AssistantMessage, Content, Cost, DeferredHandle, Message, ModelThinkingLevel, StopReason,
     TextPhase, TextSignatureV1, ThinkingLevel, ToolCall, Usage, UNRESOLVED_API,

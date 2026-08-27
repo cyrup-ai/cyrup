@@ -102,7 +102,6 @@ fn project_scoped_agent_markdown_also_installs_the_gate() {
 #[test]
 fn the_policy_agent_dir_override_moves_both_the_probe_and_the_engine() {
     without_install_env(|| {
-        let _lock_note = (); // `without_install_env` already holds `env_lock`.
         let dir = tempfile::tempdir().unwrap();
         let agent_dir = dir.path().join("agent");
         let elsewhere = dir.path().join("elsewhere");
@@ -118,18 +117,17 @@ fn the_policy_agent_dir_override_moves_both_the_probe_and_the_engine() {
             agent_dir.join(POLICY_FILE)
         );
 
-        let previous = std::env::var(POLICY_AGENT_DIR_ENV_KEY).ok();
-        // SAFETY: serialized by `env_lock`, held by the enclosing `without_install_env`.
-        unsafe { std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, &elsewhere) };
-        let installed = is_installed(&agent_dir, &cwd);
-        let paths = PermissionSystemExtension::manager_paths_for(&agent_dir, &cwd);
-        // SAFETY: same scope/serialization.
-        unsafe {
-            match previous {
-                Some(v) => std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, v),
-                None => std::env::remove_var(POLICY_AGENT_DIR_ENV_KEY),
-            }
-        }
+        // A [`crate::envx`] pin, not a process mutation: only this thread sees the override.
+        let (installed, paths) = {
+            let _pin = crate::envx::pin(
+                POLICY_AGENT_DIR_ENV_KEY,
+                Some(&elsewhere.display().to_string()),
+            );
+            (
+                is_installed(&agent_dir, &cwd),
+                PermissionSystemExtension::manager_paths_for(&agent_dir, &cwd),
+            )
+        };
 
         assert!(installed, "the probe must follow the override, or it fails OPEN");
         assert_eq!(paths.global_config_path, elsewhere.join(POLICY_FILE));
@@ -147,21 +145,12 @@ fn the_policy_agent_dir_override_moves_both_the_probe_and_the_engine() {
 /// that trims to `""` is NOT an override.
 #[test]
 fn a_blank_policy_agent_dir_override_is_not_an_override() {
-    let _lock = crate::ext_config::env_lock()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let dir = tempfile::tempdir().unwrap();
-    let previous = std::env::var(POLICY_AGENT_DIR_ENV_KEY).ok();
-    // SAFETY: serialized by `env_lock`, restored below.
-    unsafe { std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, "   ") };
-    let resolved = policy_agent_dir(dir.path());
-    // SAFETY: same scope/serialization.
-    unsafe {
-        match previous {
-            Some(v) => std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, v),
-            None => std::env::remove_var(POLICY_AGENT_DIR_ENV_KEY),
-        }
-    }
+    // A [`crate::envx`] pin, not a process mutation: only this thread sees the override.
+    let resolved = {
+        let _pin = crate::envx::pin(POLICY_AGENT_DIR_ENV_KEY, Some("   "));
+        policy_agent_dir(dir.path())
+    };
     assert_eq!(resolved, dir.path(), "a whitespace-only value is falsy in pi and inert here");
 }
 

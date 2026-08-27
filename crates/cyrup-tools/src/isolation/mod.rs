@@ -39,7 +39,7 @@ pub mod sandbox;
 pub mod traversal;
 
 // Re-export the backend-seam types these decorators are written against (arch-03 canonical).
-pub use crate::ops::{Access, DirEntry, FsOps, ImageMime, Meta, WalkItem, WalkOpts};
+pub use crate::ops::{Access, DirEntry, FsOps, ImageMime, Meta, WalkFlavor, WalkItem, WalkOpts};
 
 pub use policy::{
     PermissionPolicy, PolicyDecision, Rule, RuleBuilder, bash_command_contains,

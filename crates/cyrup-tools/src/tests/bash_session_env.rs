@@ -12,8 +12,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::config::{BashOpts, SessionEnvHandle, SessionEnvInfo};
-use crate::ops::{Backend, ProcOps, ShellConfig};
-use crate::tools::BashTool;
+use crate::ops::{Backend, ProcOps};
+use crate::tools::ShellTool;
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -46,12 +46,7 @@ const PROBE: &str = r#"printf '[%s][%s][%s][%s][%s]\n' \
 
 async fn run(opts: BashOpts) -> String {
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(
-        proc(),
-        ShellConfig::detect(),
-        dir.path().to_path_buf(),
-        opts,
-    );
+    let bash = ShellTool::bash(proc(), dir.path().to_path_buf(), opts);
     let r = bash
         .execute(
             cid(),
@@ -102,13 +97,8 @@ async fn switching_model_affects_the_next_command() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(
-        proc(),
-        ShellConfig::detect(),
-        dir.path().to_path_buf(),
-        opts,
-    );
-    let call = async |bash: &BashTool| {
+    let bash = ShellTool::bash(proc(), dir.path().to_path_buf(), opts);
+    let call = async |bash: &ShellTool| {
         let r = bash
             .execute(
                 cid(),
@@ -182,20 +172,14 @@ async fn the_exposure_flag_suppresses_the_injection() {
 #[test]
 fn the_prompt_guideline_tracks_the_exposure_flag() {
     let cwd = std::env::temp_dir();
-    let on = BashTool::new(
-        proc(),
-        ShellConfig::detect(),
-        cwd.clone(),
-        BashOpts::default(),
-    );
+    let on = ShellTool::bash(proc(), cwd.clone(), BashOpts::default());
     assert_eq!(
         on.prompt_guidelines(),
         &["You can inspect CYRUP_* environment variables for current model and session details."],
     );
 
-    let off = BashTool::new(
+    let off = ShellTool::bash(
         proc(),
-        ShellConfig::detect(),
         cwd,
         BashOpts {
             expose_session_environment: false,
@@ -220,12 +204,7 @@ fn the_prompt_guideline_tracks_the_exposure_flag() {
 /// re-hardened only the prefix, so both directions are checked.
 #[test]
 fn the_guideline_uses_pi_v0_84_1_softened_phrasing() {
-    let on = BashTool::new(
-        proc(),
-        ShellConfig::detect(),
-        std::env::temp_dir(),
-        BashOpts::default(),
-    );
+    let on = ShellTool::bash(proc(), std::env::temp_dir(), BashOpts::default());
     let guideline = *on
         .prompt_guidelines()
         .first()
@@ -260,12 +239,7 @@ fn the_guideline_uses_pi_v0_84_1_softened_phrasing() {
 #[tokio::test]
 async fn bash_child_sees_the_agent_identity_markers() {
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(
-        proc(),
-        ShellConfig::detect(),
-        dir.path().to_path_buf(),
-        BashOpts::default(),
-    );
+    let bash = ShellTool::bash(proc(), dir.path().to_path_buf(), BashOpts::default());
     let r = bash
         .execute(
             cid(),
@@ -290,9 +264,8 @@ async fn bash_child_sees_the_agent_identity_markers() {
 #[tokio::test]
 async fn identity_markers_survive_expose_session_environment_off() {
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(
+    let bash = ShellTool::bash(
         proc(),
-        ShellConfig::detect(),
         dir.path().to_path_buf(),
         BashOpts {
             expose_session_environment: false,

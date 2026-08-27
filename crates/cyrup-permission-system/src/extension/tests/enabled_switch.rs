@@ -128,27 +128,20 @@ fn a_legacy_three_key_config_template_still_reads_as_pristine() {
     });
 }
 
-/// Point `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` at `path` for the duration of `body`, restoring
-/// the ambient value after.
+/// Point `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` at `path` for the duration of `body`, on THIS
+/// THREAD only.
 ///
-/// MUST be called from inside [`without_install_env`], which already holds
-/// [`crate::ext_config::env_lock`]; this helper deliberately does NOT take that lock itself,
-/// because `std::sync::Mutex` is not reentrant and re-taking it here would deadlock.
+/// A [`crate::envx`] pin, not a process mutation: the file writes that hang off the resolved path
+/// (`ExtensionConfig::ensure_on_disk`, `::save`) therefore stay inside this test's own tempdir
+/// instead of following an override a sibling test set process-wide. Pins nest freely — innermost
+/// wins, LIFO pop — so this composes with the enclosing [`without_install_env`], which the
+/// non-reentrant mutex it replaces could not.
 fn with_config_path_override<T>(path: &Path, body: impl FnOnce() -> T) -> T {
-    let key = crate::ext_config::CONFIG_PATH_ENV_KEY;
-    let previous = std::env::var(key).ok();
-    // SAFETY: serialized by `env_lock` (held by the enclosing `without_install_env`), and
-    // restored below.
-    unsafe { std::env::set_var(key, path) };
-    let out = body();
-    // SAFETY: same scope/serialization; restores whatever the ambient shell had.
-    unsafe {
-        match previous {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-    }
-    out
+    let _pin = crate::envx::pin(
+        crate::ext_config::CONFIG_PATH_ENV_KEY,
+        Some(&path.display().to_string()),
+    );
+    body()
 }
 
 /// G130(b). The install probe and the `enabled` master switch must read the SAME file.

@@ -153,6 +153,54 @@ pub fn resolve_path_from_base_with_home(
     lexically_normalize(&joined)
 }
 
+/// The directory holding the assets shipped **with the agent itself** — `README.md`, `docs/`,
+/// `examples/`. Pi `getPackageDir()` (`config.ts:385-397`), whose only consumers are the
+/// shipped-asset paths at `config.ts:436-448`.
+///
+/// Resolution order, mirroring upstream's three tiers:
+/// 1. `$CYRUP_ASSET_DIR`, run through [`normalize_path_buf`] — pi's `PI_PACKAGE_DIR` escape hatch
+///    for Nix/Guix store paths (`config.ts:387-390`). It is deliberately NOT spelled
+///    `CYRUP_PACKAGE_DIR`: that name is already bound to [`crate::ConfigDirs::package_dir`], the
+///    installed-package STORE (`env.rs:99`), which is a different directory.
+/// 2. The directory containing the running executable, when it directly holds a `README.md` —
+///    the single-file-binary layout, pi's `dirname(process.execPath)` arm (`config.ts:392-394`).
+/// 3. The nearest ancestor of that directory holding a `Cargo.toml` — the source-checkout arm,
+///    pi's `findNodePackageDir` (`config.ts:368-383`) with `Cargo.toml` for `package.json`. A
+///    `cargo run` binary lives at `<root>/target/<profile>/cyrup`, and `target/` carries no
+///    manifest, so the walk lands on the workspace root without needing upstream's `dist/`
+///    special case.
+///
+/// `None` means no asset root is discoverable; every caller must then behave as if the tree is
+/// absent rather than substituting the cwd.
+///
+/// Resolved ONCE per process. The result is immutable for the process lifetime (unlike a session
+/// cwd), and the render path calls it per paint, so the `existsSync`-equivalent walk must not run
+/// per frame.
+pub fn asset_dir() -> Option<&'static std::path::Path> {
+    static ASSET_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+    ASSET_DIR.get_or_init(resolve_asset_dir).as_deref()
+}
+
+fn resolve_asset_dir() -> Option<PathBuf> {
+    if let Some(raw) = std::env::var_os("CYRUP_ASSET_DIR")
+        && !raw.is_empty()
+    {
+        return Some(lexically_normalize(&normalize_path_buf(&raw.to_string_lossy())));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    if exe_dir.join("README.md").is_file() {
+        return Some(lexically_normalize(exe_dir));
+    }
+    let mut dir = exe_dir;
+    loop {
+        if dir.join("Cargo.toml").is_file() {
+            return Some(lexically_normalize(dir));
+        }
+        dir = dir.parent()?;
+    }
+}
+
 /// The `.` / `..` collapse node's `path.resolve` performs after joining — purely lexical.
 ///
 /// `..` at the root is dropped rather than escaping it (`path.resolve("/a/../..") === "/"`); on a

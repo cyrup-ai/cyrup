@@ -45,8 +45,12 @@ const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 
 /// Local process operations.
+///
+/// Holds NO cached [`ShellConfig`]. An [`ExecSpec`] always carries the shell its producer resolved
+/// (Pi resolves per `exec`, bash.ts:91); a spec that arrives with an empty program is resolved
+/// here, fallibly, so a host with no bash reports Pi's `No bash shell found` recipe rather than
+/// degrading to a bare `bash -c` and failing at spawn.
 pub struct LocalProc {
-    shell: ShellConfig,
     /// SIGTERM→SIGKILL grace period; overridable ONLY for tests ([`Self::with_kill_grace`]) so the
     /// escalation path is exercisable without a real test waiting 5+ real seconds — production
     /// always gets Pi's real 5s via [`Self::new`].
@@ -54,13 +58,19 @@ pub struct LocalProc {
 }
 
 impl LocalProc {
-    pub fn new(shell: ShellConfig) -> Self {
-        Self::with_kill_grace(shell, DEFAULT_KILL_GRACE)
+    pub fn new() -> Self {
+        Self::with_kill_grace(DEFAULT_KILL_GRACE)
     }
 
     /// Build with a caller-supplied SIGTERM→SIGKILL grace period (tests only).
-    pub fn with_kill_grace(shell: ShellConfig, kill_grace: Duration) -> Self {
-        Self { shell, kill_grace }
+    pub fn with_kill_grace(kill_grace: Duration) -> Self {
+        Self { kill_grace }
+    }
+}
+
+impl Default for LocalProc {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -96,26 +106,35 @@ impl ProcOps for LocalProc {
         timeout: Option<Duration>,
         on_data: &mut (dyn for<'a> FnMut(&'a [u8]) + Send),
     ) -> Result<ExitStatus, ToolError> {
+        // A spec with no shell means "use the platform default", which is exactly Pi's
+        // `getShellConfig(undefined)` (shell.ts:76-119). Resolve it HERE, per call and fallibly:
+        // on a host with no bash this returns Pi's `No bash shell found` recipe (shell.ts:100-106)
+        // and it becomes the caller's error, instead of a degraded `bash -c` that fails below as
+        // `spawn bash: … (os error 2)`.
         if spec.shell.program.as_os_str().is_empty() {
-            spec.shell = self.shell.clone();
+            spec.shell = ShellConfig::try_detect()?;
         }
         // Pi checks `signal?.aborted` before EVER spawning (bash.ts:86-88: `if (signal?.aborted) {
         // throw new Error("aborted"); }`, ahead of even the cwd check below) — an already-cancelled
         // token must guarantee zero process execution, not just a kill-after-spawn race. Report it
         // as `Ok(Killed)`, the SAME outcome the mid-run cancel branch below reports (bash.ts's outer
         // catch maps BOTH the pre-spawn and the post-spawn `Error("aborted")` to the identical
-        // `"Command aborted"` text, bash.ts:407-411) — every caller (`BashTool::execute`,
+        // `"Command aborted"` text, bash.ts:407-411) — every caller (`ShellTool::execute`,
         // `bash.rs:315`; `run_bash`, `cyrup-session-svc/src/bash.rs:58`) already renders `Killed`
         // correctly, so this needs no new wiring.
         if cancel.is_cancelled() {
             return Ok(ExitStatus::Killed);
         }
-        // Pi checks the cwd exists before spawning (bash.ts:70-74) so the model gets an actionable
-        // message instead of a raw spawn error.
+        // Pi checks the cwd exists before spawning (bash.ts:92-96) so the model gets an actionable
+        // message instead of a raw spawn error. The shell's name comes from the resolved
+        // `ShellConfig`, mirroring Pi's `createLocalShellOperations(shellName, …)` closure capture
+        // (bash.ts:84,95): a `powershell` call on a missing cwd must say
+        // `Cannot execute PowerShell commands.`, not `bash`.
         if tokio::fs::metadata(&spec.cwd).await.is_err() {
             return Err(error::invalid(format!(
-                "Working directory does not exist: {}\nCannot execute bash commands.",
-                error::show(&spec.cwd)
+                "Working directory does not exist: {}\nCannot execute {} commands.",
+                error::show(&spec.cwd),
+                spec.shell.shell_name
             )));
         }
         let stdin_command = if spec.shell.transport == Transport::Stdin {

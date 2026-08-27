@@ -68,13 +68,16 @@ pub(crate) fn build_params(
     // from `resolveGoogleFunctionCallingMode`, which can return `VALIDATED`; the old code mapped
     // `tool_choice` alone and so could never emit it.
     if !ctx.tools.is_empty() {
-        if let Some(tools) = convert_tools(&ctx.tools) {
+        // Hoisted so `convertTools` and `resolveGoogleFunctionCallingMode` share ONE capability
+        // read, exactly as `google-generative-ai.ts:374` binds `supportsStrictMode` once.
+        let supports_strict_mode = supports_google_strict_tool_sampling(model.id.as_str());
+        if let Some(tools) = convert_tools(&ctx.tools, supports_strict_mode)? {
             obj.insert("tools".to_string(), tools);
         }
         let mode = resolve_google_function_calling_mode(
             &ctx.tools,
             opts.tool_choice.as_ref(),
-            supports_google_strict_tool_sampling(model.id.as_str()),
+            supports_strict_mode,
         )?;
         if let Some(mode) = mode {
             obj.insert(
