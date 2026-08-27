@@ -192,7 +192,18 @@ impl NativeExtension for PermissionSystemExtension {
                 // process's original cwd) — a session can start in a different working directory than
                 // the one the extension was constructed with. Also invalidates the agent-start cache
                 // (clears `active_skill_entries`), superseding the plain clear this arm did before.
-                self.refresh_config_and_manager(&ctx.cwd);
+                // pi `handleSessionStart` (`handlers/lifecycle.ts:54-60`): read project trust
+                // ONCE and use it for the refresh and the warning both. An untrusted project has
+                // its policy scopes withheld (`configureForCwd(projectTrusted ? ctx.cwd :
+                // undefined)`, `permission-session.ts:106-110`, #644), so a repo's checked-in
+                // `.cyrup/agent` file cannot widen the allow set before the human grants trust.
+                let project_trusted = self.project_trusted(ctx);
+                self.refresh_config_and_manager(project_trusted.then_some(ctx.cwd.as_path()));
+                // pi warns AFTER the refresh (`:58-60`), so the review entry can never claim a
+                // scope the manager has not actually been rebuilt with.
+                if !project_trusted {
+                    self.warn_project_untrusted(&ctx.cwd, "session_start");
+                }
                 // PERM-001 / pi `process.env[SUBAGENT_PARENT_SESSION_ENV] = sessionId`
                 // (`pi-subagents/src/extension/index.ts:599` @v0.34.0): publish this parent session's id as
                 // the process-wide anchor a subagent child's forwarded ask addresses, BEFORE the
@@ -246,7 +257,14 @@ impl NativeExtension for PermissionSystemExtension {
                 guard(&self.dedup).clear();
                 // pi `refreshExtensionConfig` + `createPermissionManagerForCwd` +
                 // `invalidateAgentStartCache` (`:1848-1852`).
-                self.refresh_config_and_manager(&ctx.cwd);
+                // pi `handleResourcesDiscover` (`handlers/lifecycle.ts:92-96`): the reload path
+                // re-evaluates trust the same way, so a trust grant since session start
+                // re-includes the project scope and a revocation drops it again.
+                let project_trusted = self.project_trusted(ctx);
+                self.refresh_config_and_manager(project_trusted.then_some(ctx.cwd.as_path()));
+                if !project_trusted {
+                    self.warn_project_untrusted(&ctx.cwd, "resources_discover");
+                }
                 // PERM-027 / pi `writeDebugEntry("lifecycle.reload", …)` (`:1853-1857`). pi's `cwd`
                 // is `runtimeContext?.cwd ?? null`; cyrup's `ctx` is always live at dispatch, so
                 // the null arm is unreachable rather than dropped.

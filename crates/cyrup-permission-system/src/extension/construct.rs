@@ -42,7 +42,10 @@ impl PermissionSystemExtension {
     /// [`Self::new`] over an ALREADY-LOADED [`ExtensionConfig`] — see [`Self::load_config`] for why
     /// the read is hoisted out of the constructor.
     fn new_with_config(agent_dir: PathBuf, cwd: PathBuf, config: ExtensionConfig) -> Self {
-        let paths = Self::manager_paths_for(&agent_dir, &cwd);
+        // Construction precedes any attached backend or ctx, so there is no trust answer yet
+        // (pi constructs the manager, then `resetForNewSession` calls `configureForCwd` —
+        // `permission-session.ts:106-110`). The first `session_start` applies the gate.
+        let paths = Self::manager_paths_for(&agent_dir, Some(cwd.as_path()));
         Self::from_parts_full(
             paths,
             config,
@@ -70,7 +73,7 @@ impl PermissionSystemExtension {
         cwd: PathBuf,
         config: ExtensionConfig,
     ) -> Self {
-        let paths = Self::manager_paths_for(&agent_dir, &cwd);
+        let paths = Self::manager_paths_for(&agent_dir, Some(cwd.as_path()));
         Self::from_parts_full(
             paths,
             config,
@@ -100,7 +103,7 @@ impl PermissionSystemExtension {
         cwd: PathBuf,
         config: ExtensionConfig,
     ) -> Self {
-        let paths = Self::manager_paths_for(&agent_dir, &cwd);
+        let paths = Self::manager_paths_for(&agent_dir, Some(cwd.as_path()));
         let host_services: Arc<OnceLock<Arc<dyn HostServices>>> = Arc::new(OnceLock::new());
         let channel_agent_dir = agent_dir.clone();
         let channel_services = Arc::clone(&host_services);

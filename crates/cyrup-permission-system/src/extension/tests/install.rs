@@ -114,7 +114,7 @@ fn the_policy_agent_dir_override_moves_both_the_probe_and_the_engine() {
         // Control: the policy lives somewhere the un-overridden probe cannot see.
         assert!(!is_installed(&agent_dir, &cwd));
         assert_eq!(
-            PermissionSystemExtension::manager_paths_for(&agent_dir, &cwd).global_config_path,
+            PermissionSystemExtension::manager_paths_for(&agent_dir, Some(cwd.as_path())).global_config_path,
             agent_dir.join(POLICY_FILE)
         );
 
@@ -122,7 +122,7 @@ fn the_policy_agent_dir_override_moves_both_the_probe_and_the_engine() {
         // SAFETY: serialized by `env_lock`, held by the enclosing `without_install_env`.
         unsafe { std::env::set_var(POLICY_AGENT_DIR_ENV_KEY, &elsewhere) };
         let installed = is_installed(&agent_dir, &cwd);
-        let paths = PermissionSystemExtension::manager_paths_for(&agent_dir, &cwd);
+        let paths = PermissionSystemExtension::manager_paths_for(&agent_dir, Some(cwd.as_path()));
         // SAFETY: same scope/serialization.
         unsafe {
             match previous {

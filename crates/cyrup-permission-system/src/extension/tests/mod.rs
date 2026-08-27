@@ -19,5 +19,6 @@ mod env;
 mod events;
 mod gate;
 mod install;
+mod project_trust;
 mod support;
 mod watcher;

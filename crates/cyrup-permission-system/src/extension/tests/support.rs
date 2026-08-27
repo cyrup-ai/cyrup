@@ -9,7 +9,7 @@ use std::sync::Mutex;
 
 use serde_json::json;
 
-use cyrup_ext::{HostCtx, HostEvent, HostServices, InitApi, NativeExtension, NotifyKind};
+use cyrup_ext::{HostCtx, HostCtxRich, HostEvent, HostServices, InitApi, NativeExtension, NotifyKind};
 
 use crate::extension::{INSTALL_ENV_VAR, PermissionSystemExtension, guard};
 
@@ -34,6 +34,18 @@ pub(super) fn write_file(path: &Path, body: &str) {
 
 pub(super) fn event_ctx(cwd: PathBuf) -> HostCtx {
     HostCtx::event(cyrup_ext::ExtMode::Print, false, cwd)
+}
+
+/// [`event_ctx`] with project trust GRANTED — pi `ctx.isProjectTrusted() === true`.
+///
+/// A hand-built [`HostCtx`] carries [`HostCtxRich::default()`], i.e. `is_project_trusted = false`,
+/// so any test whose subject is PROJECT-scoped policy has to say so explicitly now that
+/// [`PermissionSystemExtension::project_trusted`] withholds that scope from an untrusted project
+/// (pi #644). In production the flag arrives from the `HostCtxSource` that
+/// `ExtensionHost::load_native_with_services` attaches alongside the backend; these tests wire
+/// `set_host_services` by hand and never attach one, so they supply it here.
+pub(super) fn trusted_event_ctx(cwd: PathBuf) -> HostCtx {
+    event_ctx(cwd).with_rich(HostCtxRich { is_project_trusted: true, ..HostCtxRich::default() })
 }
 
 pub(super) async fn init_ext(ext: &PermissionSystemExtension) {

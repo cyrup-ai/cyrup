@@ -1,9 +1,8 @@
 ---
-stage: aug
+stage: exec
 status: done
-updated: 2026-08-27 04:52
+updated: 2026-08-27 05:13
 ---
-
 # Gate project-scoped policy on project trust
 
 > **Upstream parity gap.** `cyrup-permission-system` is a port of `pi-permission-system` **v0.8.0**;

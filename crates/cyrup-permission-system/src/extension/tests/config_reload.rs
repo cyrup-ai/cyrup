@@ -89,7 +89,9 @@ async fn session_start_rebuilds_manager_from_current_session_cwd() {
         r#"{ "bash": { "*": "deny" } }"#,
     );
 
-    let start_ctx = event_ctx(cwd2);
+    // The subject here is the CWD REBUILD, not trust: project trust is granted so the project
+    // scope is in play at all (`project_trusted`, pi #644), leaving the cwd as the only variable.
+    let start_ctx = trusted_event_ctx(cwd2);
     let start_outcome =
         ext.on_event(&HostEvent::SessionStart { reason: "startup".to_string(), previous_session_file: None }, &start_ctx).await;
     assert!(matches!(start_outcome, HookOutcome::Noop));

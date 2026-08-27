@@ -7,6 +7,8 @@ use std::sync::Arc;
 
 use serde_json::json;
 
+use cyrup_ext::HostCtx;
+
 use crate::agent_start_cache::AgentStartCache;
 use crate::ext_config::ExtensionConfig;
 use crate::status;
@@ -19,6 +21,13 @@ use super::{PermissionSystemExtension, guard};
 // links resolving without adding an import the compiled build does not use.
 #[cfg(doc)]
 use cyrup_ext::{HostServices, NotifyKind};
+
+/// pi `UNTRUSTED_PROJECT_MESSAGE` (`handlers/lifecycle.ts:24-27`), with pi's package name swapped
+/// for cyrup's — the string is operator-facing, and naming the wrong extension in it would send
+/// them to the wrong place to grant trust.
+const UNTRUSTED_PROJECT_MESSAGE: &str = "cyrup-permission-system: project is not trusted — \
+    skipping project-scoped permission configuration. Only global policy applies. Grant project \
+    trust to load this project's permission rules.";
 
 impl PermissionSystemExtension {
     /// Read `config.json` ONCE, through the resolved path (pi `loadPermissionSystemConfig()`,
@@ -52,13 +61,62 @@ impl PermissionSystemExtension {
     /// Also surfaces the extension-config load warning (pi `refreshExtensionConfig`,
     /// `index.ts:1600-1618`) — this is the one place a malformed `config.json` becomes visible,
     /// since construction happens before any host backend is attached.
-    pub(super) fn refresh_config_and_manager(&self, cwd: &Path) {
+    pub(super) fn refresh_config_and_manager(&self, project_cwd: Option<&Path>) {
         // pi order (`refreshSessionRuntimeState`, v0.8.0 `index.ts:1819-1826`): config first,
         // manager second, agent-start cache invalidated third.
         self.refresh_extension_config();
-        *guard(&self.manager) =
-            manager_with_warnings(Self::manager_paths_for(&self.agent_dir, cwd), &self.warnings);
+        *guard(&self.manager) = manager_with_warnings(
+            Self::manager_paths_for(&self.agent_dir, project_cwd),
+            &self.warnings,
+        );
         self.invalidate_agent_start_cache();
+    }
+
+    /// pi `ctx.isProjectTrusted()` (`handlers/lifecycle.ts:54`, `:92`), guarded by whether the
+    /// answer is real.
+    ///
+    /// \[CYRUP-DELTA] pi's `ExtensionContext` always carries a populated `isProjectTrusted`.
+    /// cyrup's [`HostCtx`] carries `HostCtxRich::default()` — `is_project_trusted = false` — when
+    /// no `HostCtxSource` is attached (`cyrup-ext/src/native.rs:708-725`, `dispatch_ctx`
+    /// `:822-827`), and exposes no accessor to tell that apart from a genuine `false`. Gating on
+    /// the raw flag would withhold project policy from every host that never attached one, trading
+    /// upstream's silent widening for a silent narrowing.
+    ///
+    /// `host_services.get()` resolves it exactly for THIS crate, and is the same test
+    /// [`super::warnings::WarningSink::notify`] and [`Self::sync_status_when_possible`] already use
+    /// for "is a host backend attached at all" (pi's `runtimeContext != null`). It is exact rather
+    /// than a heuristic because: this crate holds `Arc<dyn HostServices>` unconditionally while
+    /// `cyrup-ext`'s `host` module is `cfg(feature = "wasm-host")`, so it cannot build on the arm
+    /// where the two could diverge; and on the arm it does build,
+    /// `ExtensionHost::load_native_with_services` (`cyrup-ext/src/facade.rs:354-366`) sets the
+    /// backend and the ctx source in one body — the path `cyrup-session-svc/src/builder.rs:1010`
+    /// takes for every native built-in.
+    ///
+    /// With no backend attached the project scope is KEPT, preserving today's behaviour: a host
+    /// that supplies no trust signal has not said the project is untrusted.
+    pub(super) fn project_trusted(&self, ctx: &HostCtx) -> bool {
+        match self.host_services.get() {
+            Some(_) => ctx.is_project_trusted(),
+            None => true,
+        }
+    }
+
+    /// pi `warnProjectUntrusted` (`handlers/lifecycle.ts:109-115`): record the skip in the review
+    /// stream and surface a loud warning, so the reduced (global-only) scope is never silent
+    /// (#644). Review entry FIRST, then the notification — pi's order, and the useful one: the
+    /// durable trail is written even if the notify sink drops it.
+    ///
+    /// `phase` is `"session_start"` or `"resources_discover"`, matching upstream's union.
+    /// [`super::warnings::WarningSink::notify`] dedups per session and is reset by the
+    /// `warnings.reset()` both handler arms already perform, so a reload in a still-untrusted
+    /// project re-announces — pi's behaviour too, since `resetShownWarnings()` runs first in its
+    /// reload branch.
+    pub(super) fn warn_project_untrusted(&self, cwd: &Path, phase: &str) {
+        self.write_review_entry(
+            "project_trust.skipped",
+            &json!({ "cwd": cwd.to_string_lossy(), "phase": phase }),
+        );
+        self.warnings.notify(UNTRUSTED_PROJECT_MESSAGE);
     }
 
     /// pi `refreshExtensionConfig(ctx?)` (v0.8.0 `index.ts:1383-1386`) = `loadExtensionConfigState()`

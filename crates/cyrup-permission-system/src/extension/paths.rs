@@ -44,12 +44,20 @@ pub(super) fn policy_agent_dir(agent_dir: &Path) -> PathBuf {
 }
 
 impl PermissionSystemExtension {
-    /// Derive the [`ManagerPaths`] for `agent_dir` + `cwd` (pi `createPermissionManagerForCwd`'s path
-    /// derivation, `index.ts:1536-1573`) — shared by every constructor AND by
-    /// [`Self::refresh_config_and_manager`] (a `session_start` / `resources_discover` reload rebuilds
-    /// this from the CURRENT cwd, not just the process's original one).
-    pub(super) fn manager_paths_for(agent_dir: &Path, cwd: &Path) -> ManagerPaths {
-        let project_dir = PROJECT_AGENT_SUBDIR.iter().fold(cwd.to_path_buf(), |acc, seg| acc.join(seg));
+    /// Derive the [`ManagerPaths`] for `agent_dir` + `project_cwd` (pi
+    /// `createPermissionManagerForCwd`'s path derivation, `index.ts:1536-1573`) — shared by every
+    /// constructor AND by [`Self::refresh_config_and_manager`] (a `session_start` /
+    /// `resources_discover` reload rebuilds this from the CURRENT cwd, not just the process's
+    /// original one).
+    ///
+    /// `project_cwd` is `None` when the project scope must be withheld — pi
+    /// `permissionManager.configureForCwd(projectTrusted ? ctx.cwd : undefined)`
+    /// (`permission-session.ts:106-110`, `:132-136`, #644). The parameter is an `Option` rather
+    /// than a companion `bool` because `cwd` is read for NOTHING ELSE here: withholding it IS
+    /// withholding the project scope, so the two cannot drift apart.
+    pub(super) fn manager_paths_for(agent_dir: &Path, project_cwd: Option<&Path>) -> ManagerPaths {
+        let project_dir = project_cwd
+            .map(|cwd| PROJECT_AGENT_SUBDIR.iter().fold(cwd.to_path_buf(), |acc, seg| acc.join(seg)));
         // PERM-025 / pi `defaultGlobalConfigPath` / `defaultAgentsDir` /
         // `defaultLegacyGlobalSettingsPath` / `defaultGlobalMcpConfigPath`
         // (v0.8.0 `permission-manager.ts:35-38`): all four GLOBAL artifacts hang off
@@ -60,8 +68,8 @@ impl PermissionSystemExtension {
         ManagerPaths {
             global_config_path: policy_dir.join(POLICY_FILE),
             agents_dir: policy_dir.join("agents"),
-            project_global_config_path: Some(project_dir.join(POLICY_FILE)),
-            project_agents_dir: Some(project_dir.join("agents")),
+            project_global_config_path: project_dir.as_ref().map(|d| d.join(POLICY_FILE)),
+            project_agents_dir: project_dir.map(|d| d.join("agents")),
             legacy_global_settings_path: policy_dir.join("settings.json"),
             global_mcp_config_path: policy_dir.join("mcp.json"),
             mcp_server_names_override: None,
