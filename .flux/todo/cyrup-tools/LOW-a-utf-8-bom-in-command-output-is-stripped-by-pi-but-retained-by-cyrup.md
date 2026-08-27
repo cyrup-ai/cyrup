@@ -4,8 +4,8 @@ priority: LOW
 tool: bash
 source: pi-parity-audit (workflow wf_e427a266-e16)
 stage: exec
-status: in-progress
-updated: 2026-08-27 18:00
+status: done
+updated: 2026-08-27 18:59
 ---
 
 # A UTF-8 BOM in command output is stripped by pi but retained by cyrup

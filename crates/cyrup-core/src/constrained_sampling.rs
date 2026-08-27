@@ -3,7 +3,7 @@
 //! These are the serializable shapes a tool uses to OPT IN to grammar- or strict-JSON-schema
 //! constrained sampling. The resolvers that consume them live provider-side in
 //! `cyrup-provider/src/utils/constrained_sampling.rs` (a port of pi
-//! `packages/ai/src/api/constrained-sampling.ts` @v0.83.0).
+//! `packages/ai/src/api/constrained-sampling.ts` @v0.84.2).
 //!
 //! # Why these types live in `cyrup-core` and not `cyrup-provider`
 //!
