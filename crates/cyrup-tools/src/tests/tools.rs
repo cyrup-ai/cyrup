@@ -657,7 +657,7 @@ async fn write_creates_dirs_and_holds_one_mutator_per_path() {
 // ---------------------------------------------------------------- A-03-5 bash
 
 fn bash_tool(cwd: PathBuf, opts: BashOpts) -> BashTool {
-    BashTool::new(proc(), ShellConfig::detect(), cwd, opts)
+    BashTool::new(proc(), cwd, opts)
 }
 
 #[tokio::test]
@@ -1460,7 +1460,6 @@ async fn bash_trailing_edge_flush_emits_midstream() {
     let dir = tempfile::tempdir().unwrap();
     let bash = BashTool::new(
         Arc::new(ScriptedProc),
-        ShellConfig::detect(),
         dir.path().to_path_buf(),
         BashOpts::default(),
     );

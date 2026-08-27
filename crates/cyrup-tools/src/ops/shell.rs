@@ -225,28 +225,12 @@ impl ShellConfig {
         }
     }
 
-    /// Infallible detection for the `Default` impls and for embedders that cannot propagate an
-    /// error. Prefer [`ShellConfig::try_detect`] at every real construction site so a Windows box
-    /// with no bash reports Pi's `No bash shell found` at session construction.
-    ///
-    /// [CYRUP-DELTA] Pi has no infallible entry point at all — `getShellConfig` throws
-    /// (shell.ts:100-106) and every caller lives with that. Rust's `Default` cannot, so the
-    /// unreachable-on-unix arm degrades to a bare `bash -c`: still bash, never a *different*
-    /// interpreter, and it fails loudly at spawn ("program not found") rather than silently
-    /// executing bash text under `cmd.exe` (ADR-0003 D4's implementation note).
-    pub fn detect() -> Self {
-        Self::try_detect().unwrap_or_else(|_| ShellConfig {
-            program: PathBuf::from("bash"),
-            args: vec!["-c".to_string()],
-            transport: Transport::Argv,
-        })
-    }
-}
-
-impl Default for ShellConfig {
-    fn default() -> Self {
-        Self::detect()
-    }
+    // NOTE: there is deliberately NO infallible `detect()` and no `Default for ShellConfig`.
+    // Pi has no infallible entry point either — `getShellConfig` throws (shell.ts:100-106) and
+    // every caller lives with that. An infallible wrapper can only degrade to a bare `bash -c`,
+    // which turns Pi's actionable `No bash shell found` recipe into `spawn bash: … (os error 2)`
+    // at the spawn site (ops/local/proc.rs). Resolve through `try_detect`/`resolve` at the point
+    // of USE, where the error is the tool result the model reads (Pi bash.ts:91,457-468).
 }
 
 /// Build the child-process env OVERRIDES, prepending a managed `bin_dir` to `PATH` (Pi

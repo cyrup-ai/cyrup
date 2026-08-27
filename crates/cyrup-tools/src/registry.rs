@@ -3,7 +3,7 @@
 
 use crate::config::ToolsOptions;
 use crate::lock::FileMutationLocks;
-use crate::ops::{Backend, ShellConfig};
+use crate::ops::Backend;
 use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
 use cyrup_core::Tool;
 use std::collections::{HashMap, HashSet};
@@ -51,10 +51,15 @@ impl ToolRegistry {
     }
 
     /// Build the default registry with the seven built-ins over `backend` (arch-03 §3.4).
+    ///
+    /// Resolves NO shell. Pi's `createAllToolDefinitions` (index.ts:182) does not either — the only
+    /// `getShellConfig` call on the bash path is inside `exec` (bash.ts:91) — so a host with no
+    /// bash still gets a working registry, and its `No bash shell found` recipe arrives as the
+    /// `bash` TOOL RESULT rather than aborting session construction. Making this fallible would
+    /// also break `read_only_tools`, which contains no bash tool at all.
     pub fn with_builtins(cwd: PathBuf, backend: Backend, opts: ToolsOptions) -> Self {
         let mut reg = Self::new();
         let locks = Arc::new(FileMutationLocks::new());
-        let shell = ShellConfig::detect();
 
         // Insertion order IS presentation order (see `insert`/`all`/`visible` below), and it must be
         // Pi's `createAllToolDefinitions` literal order — read, bash, edit, write, grep, find, ls
@@ -69,7 +74,6 @@ impl ToolRegistry {
         )));
         reg.insert(Arc::new(BashTool::new(
             backend.proc.clone(),
-            shell,
             cwd.clone(),
             opts.bash,
         )));

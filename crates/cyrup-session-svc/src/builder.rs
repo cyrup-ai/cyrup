@@ -30,7 +30,7 @@ use cyrup_session::prompt::{
 };
 use cyrup_session::SessionLayout;
 use cyrup_tools::{
-    Availability, Backend, BashOpts, PermissionPolicy, ProtectedFs, ShellConfig, ToolRegistry,
+    Availability, Backend, BashOpts, PermissionPolicy, ProtectedFs, ToolRegistry,
     ToolsOptions, TraversalFs,
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -840,8 +840,11 @@ impl SessionBuilder {
         // `executeBash` re-reading the same two settings, agent-session.ts:2624-2632).
         let shell_path_setting = settings.effective().shell_path();
         let shell_command_prefix_setting = settings.effective().shell_command_prefix();
-        let shell = ShellConfig::detect();
-        let base = Backend::local(shell.clone());
+        // No shell is resolved at session build. Pi resolves inside every `exec` (bash.ts:91) and
+        // its session start never fails on a bash-less host; both cyrup bash seams now do the same,
+        // so a missing bash surfaces as Pi's `No bash shell found` recipe on the command that
+        // needed it, not as a failed session.
+        let base = Backend::local();
         // The process backend the immediate-bash seam (#8) runs against (kept past `base`'s move).
         let bash_proc = base.proc.clone();
         let mut fs = base.fs.clone();
@@ -1753,7 +1756,6 @@ impl SessionBuilder {
             retry_max_retries: to_u32(eff.retry_max_retries()),
             retry_base_delay_ms: u64::try_from(eff.retry_base_delay_ms().max(0)).unwrap_or(0),
             proc: bash_proc,
-            shell,
             shell_path: shell_path_setting,
             shell_command_prefix: shell_command_prefix_setting,
             dynamic_tools,

@@ -40,7 +40,6 @@ async fn run(opts: BashOpts, command: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
     let bash = BashTool::new(
         proc(),
-        ShellConfig::detect(),
         dir.path().to_path_buf(),
         opts,
     );

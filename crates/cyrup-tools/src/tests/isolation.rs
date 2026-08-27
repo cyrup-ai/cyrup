@@ -70,7 +70,6 @@ async fn default_bash_rm_rf_runs_without_any_gate() {
 
     let bash = BashTool::new(
         Backend::default().proc,
-        ShellConfig::detect(),
         cwd,
         BashOpts::default(),
     );
@@ -224,7 +223,6 @@ async fn protected_fs_is_fs_only_and_bash_is_never_covered() {
     // … and `bash` reaches the very same file anyway, because the PROCESS seam is undecorated.
     let bash = BashTool::new(
         Backend::default().proc,
-        ShellConfig::detect(),
         cwd.clone(),
         BashOpts::default(),
     );

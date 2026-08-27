@@ -75,7 +75,7 @@ fn all_seven_tool_schemas_match_pi_typebox_bytes() {
     let read = ReadTool::new(fs(), cwd(), ReadOpts::default());
     assert_schema("read", read.parameters(), PI_READ);
 
-    let bash = BashTool::new(proc(), ShellConfig::detect(), cwd(), BashOpts::default());
+    let bash = BashTool::new(proc(), cwd(), BashOpts::default());
     assert_schema("bash", bash.parameters(), PI_BASH);
 
     let grep = GrepTool::new(fs(), cwd(), GrepOpts::default());
@@ -215,7 +215,6 @@ fn all_seven_tool_metadata_match_pi_verbatim() {
     assert_meta(
         Arc::new(BashTool::new(
             proc(),
-            ShellConfig::detect(),
             cwd(),
             BashOpts::default(),
         )),
@@ -280,7 +279,7 @@ fn only_bash_got_the_v0_84_softening() {
         }
     }
 
-    let bash = BashTool::new(proc(), ShellConfig::detect(), cwd(), BashOpts::default());
+    let bash = BashTool::new(proc(), cwd(), BashOpts::default());
     assert!(bash.prompt_guidelines()[0].starts_with("You can inspect "));
 }
 

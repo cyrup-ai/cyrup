@@ -45,8 +45,12 @@ const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 const EXIT_STDIO_GRACE: Duration = Duration::from_millis(100);
 
 /// Local process operations.
+///
+/// Holds NO cached [`ShellConfig`]. An [`ExecSpec`] always carries the shell its producer resolved
+/// (Pi resolves per `exec`, bash.ts:91); a spec that arrives with an empty program is resolved
+/// here, fallibly, so a host with no bash reports Pi's `No bash shell found` recipe rather than
+/// degrading to a bare `bash -c` and failing at spawn.
 pub struct LocalProc {
-    shell: ShellConfig,
     /// SIGTERM→SIGKILL grace period; overridable ONLY for tests ([`Self::with_kill_grace`]) so the
     /// escalation path is exercisable without a real test waiting 5+ real seconds — production
     /// always gets Pi's real 5s via [`Self::new`].
@@ -54,13 +58,19 @@ pub struct LocalProc {
 }
 
 impl LocalProc {
-    pub fn new(shell: ShellConfig) -> Self {
-        Self::with_kill_grace(shell, DEFAULT_KILL_GRACE)
+    pub fn new() -> Self {
+        Self::with_kill_grace(DEFAULT_KILL_GRACE)
     }
 
     /// Build with a caller-supplied SIGTERM→SIGKILL grace period (tests only).
-    pub fn with_kill_grace(shell: ShellConfig, kill_grace: Duration) -> Self {
-        Self { shell, kill_grace }
+    pub fn with_kill_grace(kill_grace: Duration) -> Self {
+        Self { kill_grace }
+    }
+}
+
+impl Default for LocalProc {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -96,8 +106,13 @@ impl ProcOps for LocalProc {
         timeout: Option<Duration>,
         on_data: &mut (dyn for<'a> FnMut(&'a [u8]) + Send),
     ) -> Result<ExitStatus, ToolError> {
+        // A spec with no shell means "use the platform default", which is exactly Pi's
+        // `getShellConfig(undefined)` (shell.ts:76-119). Resolve it HERE, per call and fallibly:
+        // on a host with no bash this returns Pi's `No bash shell found` recipe (shell.ts:100-106)
+        // and it becomes the caller's error, instead of a degraded `bash -c` that fails below as
+        // `spawn bash: … (os error 2)`.
         if spec.shell.program.as_os_str().is_empty() {
-            spec.shell = self.shell.clone();
+            spec.shell = ShellConfig::try_detect()?;
         }
         // Pi checks `signal?.aborted` before EVER spawning (bash.ts:86-88: `if (signal?.aborted) {
         // throw new Error("aborted"); }`, ahead of even the cwd check below) — an already-cancelled

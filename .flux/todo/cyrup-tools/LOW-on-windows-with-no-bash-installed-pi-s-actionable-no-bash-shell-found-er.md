@@ -3,8 +3,8 @@ title: On Windows with no bash installed, pi's actionable No bash shell found er
 priority: LOW
 tool: bash
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
-status: done
+stage: exec
+status: in-progress
 updated: 2026-08-27
 ---
 

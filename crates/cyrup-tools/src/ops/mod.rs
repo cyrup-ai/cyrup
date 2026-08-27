@@ -508,7 +508,7 @@ impl LocalBashOperations {
     /// Over the default local process backend (pi `createLocalBashOperations({ shellPath })`).
     pub fn new(shell_path: Option<String>) -> Self {
         Self {
-            proc: Arc::new(local::LocalProc::new(ShellConfig::detect())),
+            proc: Arc::new(local::LocalProc::new()),
             shell_path,
         }
     }
@@ -565,18 +565,20 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// The default local backend over tokio fs/process with the given shell.
-    pub fn local(shell: ShellConfig) -> Self {
+    /// The default local backend over tokio fs/process. No shell is baked in — every `bash` seam
+    /// resolves its own per call (Pi bash.ts:91), and [`local::LocalProc`] resolves the platform
+    /// default itself for a spec that carries none.
+    pub fn local() -> Self {
         Self {
             fs: Arc::new(local::LocalFs),
-            proc: Arc::new(local::LocalProc::new(shell)),
+            proc: Arc::new(local::LocalProc::new()),
         }
     }
 }
 
 impl Default for Backend {
     fn default() -> Self {
-        Self::local(ShellConfig::detect())
+        Self::local()
     }
 }
 
@@ -689,7 +691,9 @@ mod bash_operations_tests {
         let proc = Arc::new(RecordingProc::default());
 
         // Presence: a resolvable shell path reaches the backend.
-        let good = ShellConfig::detect().program;
+        let good = ShellConfig::try_detect()
+            .expect("unix detection cannot fail (shell.ts:119)")
+            .program;
         let ok_ops =
             LocalBashOperations::with_proc(proc.clone(), Some(good.to_string_lossy().into_owned()));
         let mut noop = |_: &[u8]| {};

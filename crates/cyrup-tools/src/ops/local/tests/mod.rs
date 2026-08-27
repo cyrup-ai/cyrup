@@ -33,7 +33,7 @@ fn exec_spec(command: &str) -> ExecSpec {
         cwd: std::env::temp_dir(),
         env: Vec::new(),
         env_remove: Vec::new(),
-        shell: ShellConfig::detect(),
+        shell: ShellConfig::try_detect().expect("unix detection cannot fail (shell.ts:119)"),
     }
 }
 

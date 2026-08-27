@@ -50,16 +50,18 @@ fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<Duration>, ToolErro
     Ok(Some(Duration::from_millis(timeout_ms.round() as u64)))
 }
 
+/// Carries NO resolved [`ShellConfig`]. Pi's `createLocalBashOperations` captures only
+/// `options?.shellPath` (bash.ts:158-159) and calls `getShellConfig` inside every `exec`
+/// (bash.ts:91), so the shell — and any resolution error — belongs to the CALL, not to the tool.
 pub struct BashTool {
     proc: Arc<dyn ProcOps>,
-    shell: ShellConfig,
     cwd: PathBuf,
     opts: BashOpts,
     params: serde_json::Value,
 }
 
 impl BashTool {
-    pub fn new(proc: Arc<dyn ProcOps>, shell: ShellConfig, cwd: PathBuf, opts: BashOpts) -> Self {
+    pub fn new(proc: Arc<dyn ProcOps>, cwd: PathBuf, opts: BashOpts) -> Self {
         // Byte-for-byte Pi's TypeBox emission (bash.ts:24-27): verbatim descriptions,
         // `type:"number"`, no `minimum`, no `additionalProperties`.
         let params = serde_json::json!({
@@ -72,7 +74,6 @@ impl BashTool {
         });
         Self {
             proc,
-            shell,
             cwd,
             opts,
             params,
@@ -294,15 +295,16 @@ impl Tool for BashTool {
             return Err(error::invalid(append_status("", "Command aborted")));
         }
 
-        // Resolve the shell per-exec, honoring an explicit settings `shellPath` (Pi's
-        // `createLocalBashOperations` calls `getShellConfig(shellPath)` inside `exec`, AFTER
-        // `resolveTimeoutMs` and the abort check, bash.ts:85-89); a missing custom path surfaces
-        // as the `Custom shell path not found` error only after the initial empty update, the
-        // timeout validation, AND the abort check have already happened, exactly like Pi.
-        let shell = match self.opts.shell_path.as_deref() {
-            Some(p) => ShellConfig::resolve(Some(p))?,
-            None => self.shell.clone(),
-        };
+        // Resolve the shell per-exec (Pi's `createLocalBashOperations` calls
+        // `getShellConfig(shellPath)` inside `exec`, AFTER `resolveTimeoutMs` and the abort check,
+        // bash.ts:87-91). BOTH of Pi's resolution errors reach the model here as the tool result,
+        // after the initial empty update, the timeout validation and the abort check, exactly like
+        // Pi: `Custom shell path not found: …` when `shellPath` is set and missing (shell.ts:73),
+        // and the three-option `No bash shell found. Options: …` recipe with its `Searched Git Bash
+        // in:` list when it is unset and no bash exists (shell.ts:100-106). Pi's inner catch
+        // re-throws both verbatim — neither is an `"aborted"` nor a `"timeout:"` message, so it
+        // falls to `throw err` (bash.ts:468) with NO status appended — and so does this `?`.
+        let shell = ShellConfig::resolve(self.opts.shell_path.as_deref())?;
 
         let spec = ExecSpec {
             command: ctx.command,

@@ -48,7 +48,6 @@ async fn run(opts: BashOpts) -> String {
     let dir = tempfile::tempdir().unwrap();
     let bash = BashTool::new(
         proc(),
-        ShellConfig::detect(),
         dir.path().to_path_buf(),
         opts,
     );
@@ -104,7 +103,6 @@ async fn switching_model_affects_the_next_command() {
     let dir = tempfile::tempdir().unwrap();
     let bash = BashTool::new(
         proc(),
-        ShellConfig::detect(),
         dir.path().to_path_buf(),
         opts,
     );
@@ -184,7 +182,6 @@ fn the_prompt_guideline_tracks_the_exposure_flag() {
     let cwd = std::env::temp_dir();
     let on = BashTool::new(
         proc(),
-        ShellConfig::detect(),
         cwd.clone(),
         BashOpts::default(),
     );
@@ -195,7 +192,6 @@ fn the_prompt_guideline_tracks_the_exposure_flag() {
 
     let off = BashTool::new(
         proc(),
-        ShellConfig::detect(),
         cwd,
         BashOpts {
             expose_session_environment: false,
@@ -222,7 +218,6 @@ fn the_prompt_guideline_tracks_the_exposure_flag() {
 fn the_guideline_uses_pi_v0_84_1_softened_phrasing() {
     let on = BashTool::new(
         proc(),
-        ShellConfig::detect(),
         std::env::temp_dir(),
         BashOpts::default(),
     );
@@ -262,7 +257,6 @@ async fn bash_child_sees_the_agent_identity_markers() {
     let dir = tempfile::tempdir().unwrap();
     let bash = BashTool::new(
         proc(),
-        ShellConfig::detect(),
         dir.path().to_path_buf(),
         BashOpts::default(),
     );
@@ -292,7 +286,6 @@ async fn identity_markers_survive_expose_session_environment_off() {
     let dir = tempfile::tempdir().unwrap();
     let bash = BashTool::new(
         proc(),
-        ShellConfig::detect(),
         dir.path().to_path_buf(),
         BashOpts {
             expose_session_environment: false,
