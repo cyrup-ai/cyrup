@@ -69,6 +69,12 @@ sha2 = "0.11.0"
 # calendar, and the workspace already resolves `time` (cyrup-session, cyrup-session-svc) with the
 # `formatting` feature, so this adds no new version surface.
 time = { workspace = true }
+# Bash command-unit enumeration (`bash/`, pi `access-intent/bash/command-enumeration.ts`). Upstream
+# pins `tree-sitter-bash: ^0.25.1`; 0.25.1 here is the same grammar generation, so the node-type
+# names (`command`, `command_substitution`, `heredoc_body`, …) transfer 1:1. Native grammar, so the
+# parse is synchronous — pi's async WASM warm-up (`parser.ts:62-78`) has no analogue here.
+tree-sitter = "0.25"
+tree-sitter-bash = "0.25.1"
 
 [dev-dependencies]
 # The FULLY-WIRED integration proof (`tests/gate_integration.rs`, R-PERM-010/012/050): a real

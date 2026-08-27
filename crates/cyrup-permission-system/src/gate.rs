@@ -632,6 +632,23 @@ pub fn format_ask_prompt(result: &PermissionCheckResult, agent_name: Option<&str
     if result.tool_name == "bash" {
         // pi `${result.command || ""}` — the bash ask prompt DOES render an empty command inline.
         let command = result.command.clone().unwrap_or_default();
+        // `result.command` is the offending UNIT since the bash surface began gating per command
+        // unit (`manager.rs`, pi `handlers/gates/bash-command.ts:55-105`), not the whole program.
+        // Approving runs the whole program, so naming only the unit would show the human LESS than
+        // what executes: under an all-`ask` policy `echo hi && git push --force` resolves to the
+        // first unit by pi's first-wins tie-break, and a prompt naming just `echo hi` would get
+        // `git push --force` approved unseen. Name both whenever they differ.
+        //
+        // **[CYRUP-DELTA]** pi renders the unit, its `commandContext` and the full command through
+        // its `presentation/` layer (v27 `presentation/dialog-renderer.ts`, `agent-renderer.ts`),
+        // which this port does not have; this is the same guarantee in one line. The single-command
+        // case — where the unit IS the whole command — keeps pi's wording verbatim.
+        let whole = get_non_empty_string(to_record(input).get("command")).unwrap_or_default();
+        if !whole.is_empty() && whole != command {
+            return format!(
+                "{subject} requested bash command '{whole}'; '{command}'{pattern_info} requires approval. Allow this command?"
+            );
+        }
         return format!("{subject} requested bash command '{command}'{pattern_info}. Allow this command?");
     }
     if (result.source == CheckSource::Mcp || result.tool_name == "mcp")
