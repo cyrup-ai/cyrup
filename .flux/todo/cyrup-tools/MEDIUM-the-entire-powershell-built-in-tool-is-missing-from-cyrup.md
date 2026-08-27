@@ -4,7 +4,7 @@ priority: MEDIUM
 tool: powershell
 source: pi-parity-audit (workflow wf_e427a266-e16)
 stage: aug
-status: in-progress
+status: done
 updated: 2026-08-27
 ---
 
@@ -330,6 +330,71 @@ Explicitly **out of scope**, verified as unrelated rather than overlooked:
 - The `/bash` slash command and the `executeBash` RPC
   ([session/bash.rs](../../../crates/cyrup-session-svc/src/session/bash.rs)) stay bash-only —
   pi's `executeBash` reaches `createLocalBashOperations` and has no PowerShell counterpart.
+
+---
+
+## The two severity assessments, preserved
+
+Both lanes' write-ups are kept verbatim. Neither is superseded: the medium rating is why this is
+filed as the largest unit of work in the backlog, and the low rating is why the tool ships opt-in,
+Windows-gated and loud rather than as a second default shell.
+
+> **Rated medium.** Genuinely absent from the Rust. crates/cyrup-tools/src/tools/mod.rs declares
+> only bash/edit/edit_diff/find/globmatch/grep/ls/read/write; registry.rs:20 BUILTIN_NAMES is 7
+> names and with_builtins (registry.rs:56-98) inserts exactly those 7; ToolsOptions
+> (config.rs:317-325) has no powershell field. ops/shell.rs ShellConfig::try_detect resolves ONLY
+> bash (/bin/bash -> which bash -> sh -c on unix; Git Bash candidates -> where bash.exe -> hard
+> error "No bash shell found" on Windows) with no pwsh.exe/powershell.exe probe and no -NoProfile
+> -NonInteractive -ExecutionPolicy Bypass -Command arg set. BashTool is monomorphic (fn name ->
+> "bash", hardcoded "Bash command to execute" schema at bash.rs:69,85) and cyrup has no analogue of
+> pi's generic ShellToolConfig/createShellToolDefinition factory (grep for
+> ShellToolConfig|ShellTool|shell_tool across all crates: zero hits), so no parameterized shell tool
+> exists that a PowerShell variant could be instantiated from. Repo-wide case-insensitive rg for
+> powershell|pwsh over crates/ yields exactly one hit, cyrup-tui/src/theme.rs ("ps1" syntax
+> mapping). I also checked the sanitized-identifier angle (pi's tool surfaces as "il" in the tmp/pi
+> docs corpus): no IlTool, no "il" tool name, and no UTF-8 [Console]::OutputEncoding preamble
+> anywhere in cyrup. Severity lowered to medium because the claimed impact is overstated: cyrup DOES
+> provide a shell tool on Windows (Git Bash detection, where bash.exe, plus the shellPath setting
+> honored by ShellConfig::resolve, which a user can point at pwsh.exe, and the model can run
+> powershell.exe -Command ... from bash). Pi's powershell tool is Windows-only and opt-in via
+> defaultTools, not on by default. Nothing is silently wrong - the tool is merely unnameable. The
+> real blocker is narrow: a Windows machine with no bash at all, where pi lets the user select
+> powershell and cyrup hard-errors at session construction.
+
+> **Rated low.** Confirmed absent after an exhaustive search. `rg -in "powershell|pwsh"` over all of
+> /home/user/cyrup/crates yields only two irrelevant hits (cyrup-tui/src/theme.rs:1608
+> syntax-highlight map "ps1" => "powershell", and a doc comment about $env: interpolation at
+> cyrup-ext/src/caps/proc.rs:178). crates/cyrup-tools/src/tools/mod.rs has no powershell module;
+> registry.rs:20 pins BUILTIN_NAMES to 7 and with_builtins (registry.rs:54-96) registers only those;
+> ops/shell.rs is bash-only (is_legacy_wsl_bash_path, get_bash_shell_config, find_bash_on_path with
+> `which bash`/`where bash.exe`, windows_detect_from ending in the `No bash shell found` throw) with
+> no pwsh.exe/powershell.exe probe and no POWERSHELL_ARGS; cyrup/src/cli/help.rs:213-221 lists seven
+> names. There is also no generic shell-tool factory to refute with: BashTool (tools/bash.rs) is a
+> concrete tool, not a parameterized ShellToolConfig factory like pi's createShellToolDefinition.
+> The only near-miss is the `shellPath` setting (config.rs:213-215, used at tools/bash.rs:297-302
+> and cyrup-session-svc/src/session/bash.rs:88-93 via ShellConfig::resolve), which accepts an
+> arbitrary interpreter path with `-c` argv transport and would in fact run `pwsh -c "…"` — but that
+> REPLACES bash rather than adding a second tool, still presents as the `bash` tool to the model,
+> applies no -NoProfile/-NonInteractive/-ExecutionPolicy Bypass args and no UTF-8
+> [Console]::OutputEncoding preamble, and is not Windows-gated. A workaround, not the capability.
+> Severity corrected down to low: (1) pi does NOT enable powershell by default —
+> agent-session.ts:2751-2754 builds all definitions but the default enabled selection is
+> read/bash/edit/write (core/sdk.ts:66-70), so powershell is opt-in via --tools/defaultTools; (2) it
+> is Windows-only by construction (pi utils/shell.ts:127 throws off-Windows) and on Windows the
+> model can still reach PowerShell through the bash tool (`powershell.exe -Command …` under Git
+> Bash) or via shellPath; (3) nothing is silently wrong — `--tools powershell` fails loudly as an
+> unknown tool name. An opt-in, single-platform, loudly-failing gap with a working execution path
+> around it.
+
+**How both are honoured.** The medium rating's substance — a whole missing tool, no factory to
+instantiate it from — is why §3 rebuilds `BashTool` into `ShellTool` rather than bolting a second
+tool alongside it. The low rating's substance is load-bearing in three places: §9 is the change that
+keeps `powershell` out of the default set (without it the tool would be on by default, which is
+worse than absent); `PowerShellOpts` in §6 deliberately cannot carry `shell_path`, keeping the
+`shellPath` workaround exactly where it is rather than entangling it; and §7 registers the tool on
+every platform so the refusal is a sentence the model reads rather than a name that silently
+matches nothing. The medium rating's claim that cyrup "hard-errors at session construction" on a
+bash-less Windows box is true only until the sibling task lands — see **Ordering dependency**.
 
 ---
 
@@ -803,7 +868,7 @@ CURRENT ([bash.rs:83-107](../../../crates/cyrup-tools/src/tools/bash.rs)) — `i
 with `fn name -> "bash"`, `fn label -> Some("bash")`, the hardcoded `fn description`, and
 `fn prompt_snippet -> Some("Execute bash commands (ls, grep, find, etc.)")`.
 
-REPLACEMENT — the doc comments on `label`, `description` and `prompt_snippet` are kept verbatim
+REPLACEMENT — the explanatory comments on `label`, `description` and `prompt_snippet` are kept verbatim
 (they carry the TOOL-045 rationale and the `bash.ts` citations); only the bodies change:
 
 ```rust
@@ -1289,7 +1354,7 @@ use crate::tools::{EditTool, FindTool, GrepTool, LsTool, ReadTool, ShellTool, Wr
 `coding_tools` ([registry.rs:143-151](../../../crates/cyrup-tools/src/registry.rs)) and
 `read_only_tools` ([registry.rs:153-161](../../../crates/cyrup-tools/src/registry.rs)) are
 **unchanged** — neither allowlist names `powershell`, matching `createCodingTools` and
-`createReadOnlyTools`. The `all_tools` doc comment at
+`createReadOnlyTools`. The `all_tools` comment at
 [registry.rs:163](../../../crates/cyrup-tools/src/registry.rs) reads "All seven built-in tools." →
 "All eight built-in tools."
 
@@ -1595,7 +1660,7 @@ pub(super) fn render_bash(
     }
 ```
 
-The doc comment at
+The comment at
 [tool_builtin.rs:212-213](../../../crates/cyrup-tui/src/transcript/tool_builtin.rs) updates from
 "`bash` — header `$ <command>`" to "`bash`/`powershell` — header `<prompt> <command>`".
 [cyrup-tui/src/bash.rs:270](../../../crates/cyrup-tui/src/bash.rs) is the `/bash` slash-command
