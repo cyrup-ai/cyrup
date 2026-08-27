@@ -3,6 +3,7 @@
 use crate::config::ReadOpts;
 use crate::details::ReadDetails;
 use crate::ops::FsOps;
+use crate::ops::cancel_read::{Cancelled, read_to_end_cancellable};
 use crate::truncate::{DEFAULT_MAX_BYTES, TruncOpts, format_size, truncate_head};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
@@ -98,6 +99,16 @@ impl Tool for ReadTool {
         cancel: CancelToken,
         _on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
+        // Pi's FIRST statement inside the promise body (read.ts:232-235), ahead of
+        // `resolveReadPathAsync` and ahead of any argument handling — Pi never validates tool
+        // arguments, so an already-fired signal cannot lose to a schema error there. Hence before
+        // `from_value` here too. Without this guard the tool ran the entire macOS-variant
+        // `access(Exists)` probe loop below, plus the `R_OK` check, on a run the user had already
+        // cancelled — on a remote `FsOps` that is several round-trips of pure waste.
+        if cancel.is_cancelled() {
+            return Err(error::aborted());
+        }
+
         let input: ReadInput =
             serde_json::from_value(params).map_err(|e| error::invalid(format!("read: {e}")))?;
 
@@ -132,15 +143,26 @@ impl Tool for ReadTool {
         // string and reported the raw user-supplied path — misleading precisely because the loop
         // above may have selected a macOS filename VARIANT of it. `LocalFs::access` already builds
         // `"{resolved path}: {io error}"` (ops/local/fs.rs), so propagating is enough.
-        self.fs.access(&abs, crate::ops::Access::Read).await?;
 
+        // Pi's guard between `resolveReadPathAsync` and `ops.access` (read.ts:246). The resolution
+        // loop above is `candidates.len()` round-trips through the seam — one per macOS filename
+        // variant — so on a remote backend it is real latency the token must be able to cut. No
+        // per-candidate check is added INSIDE that loop: Pi's probes live inside
+        // `resolveReadPathAsync` and are equally unguarded, and this is a parity task.
         if cancel.is_cancelled() {
             return Err(error::aborted());
         }
 
-        // Read once through the (remote-aware) seam, then decide text-vs-image by MAGIC BYTES — Pi
+        self.fs.access(&abs, crate::ops::Access::Read).await?;
+
+        // Pi's guard between `ops.access` and `ops.readFile` (read.ts:249).
+        if cancel.is_cancelled() {
+            return Err(error::aborted());
+        }
+
+        // Read through the (remote-aware) seam, then decide text-vs-image by MAGIC BYTES — Pi
         // sniffs the file header (read.ts:243 → mime.ts), not the extension.
-        let bytes = self.fs.read(&abs).await?;
+        let bytes = self.read_cancellable(&abs, &cancel).await?;
 
         // Image branch (R-03-012). The sniff sees only the first `IMAGE_TYPE_SNIFF_BYTES` (4100)
         // bytes, which is the window Pi's `detectSupportedImageMimeTypeFromFile` reads
@@ -150,7 +172,14 @@ impl Tool for ReadTool {
         // through to the TEXT branch below and the model got `from_utf8_lossy` of a PNG instead of
         // the picture Pi shows.
         if let Some(mime) = crate::ops::ImageMime::from_file_head(&bytes) {
-            return self.read_image(bytes, mime).await;
+            let result = self.read_image(bytes, mime, &cancel).await?;
+            // Pi's single common guard before `resolve` (read.ts:325) dominates BOTH image result
+            // shapes — `ok` and `failed` — so a cancel landing during the decode/resize ladder
+            // yields the abort, never an image block.
+            if cancel.is_cancelled() {
+                return Err(error::aborted());
+            }
+            return Ok(result);
         }
 
         // Text branch (R-03-011).
@@ -217,6 +246,11 @@ impl Tool for ReadTool {
                 input.path,
                 DEFAULT_MAX_BYTES,
             );
+            // Pi's common pre-`resolve` guard (read.ts:325) covers this shape too — the
+            // `firstLineExceedsLimit` branch assigns `outputText` and falls THROUGH to it.
+            if cancel.is_cancelled() {
+                return Err(error::aborted());
+            }
             return Ok(ToolResult {
                 content: vec![Content::text(out)],
                 details: serde_json::to_value(ReadDetails {
@@ -270,6 +304,13 @@ impl Tool for ReadTool {
         } else {
             None
         };
+        // Pi's `if (aborted) return;` immediately before `resolve` (read.ts:325). The `split('\n')`,
+        // the window `join`, `truncate_head` and the continuation-notice formatting above are all
+        // CPU work over a file that may be tens of megabytes, so this is a real window, not a
+        // formality.
+        if cancel.is_cancelled() {
+            return Err(error::aborted());
+        }
         Ok(ToolResult {
             content: vec![Content::text(out)],
             details,
@@ -284,10 +325,75 @@ impl ReadTool {
     /// `Read image file [<mime>]` plus any processing hints, and — for non-vision models — the
     /// image block is STILL returned together with a warning note (Pi keeps the block; the request
     /// layer strips it later). `mime` is the magic-byte-detected type.
+    /// `ops.readFile` (read.ts:256 / :273) with Pi's abort listener attached.
+    ///
+    /// Two independent windows have to be covered, and they need different mechanisms.
+    ///
+    /// **Opening the stream** is where a backend that cannot stream does its ENTIRE transfer:
+    /// [`FsOps::read_stream`]'s default body is `Cursor::new(self.read(path).await?)`, so for a
+    /// remote/RPC `FsOps` the whole file arrives inside this one `await`. Nothing inside it can be
+    /// interrupted, so it is RACED and the orphaned future is dropped — precisely Pi's shape, where
+    /// the listener rejects the promise while libuv's read is still in flight and nobody cancels
+    /// libuv either.
+    ///
+    /// **Draining the stream** is where a large local file spends its time, and there the work
+    /// itself must stop rather than merely be abandoned: `spawn_blocking` tasks cannot be aborted
+    /// and dropping the `JoinHandle` only detaches, so a bare race would leave a thread reading
+    /// gigabytes into a `Vec` nobody will read. [`read_to_end_cancellable`] carries the token
+    /// INSIDE the blocking closure and unwinds within one 64 KiB buffer fill. The outer race is
+    /// still required: it is what makes the CALLER return at once when a single fill is parked on
+    /// a slow device.
+    ///
+    /// `run_until_cancelled` rather than a `biased` `select!`: it short-circuits to `None` when the
+    /// token is ALREADY cancelled (tokio-util 0.7.18 `sync/cancellation_token.rs:280-293`), which
+    /// is the same determinism `find.rs` gets from `biased;`, and it is the idiom the `grep`
+    /// sibling uses for the identical races.
+    ///
+    /// The seam moves from [`FsOps::read`] to [`FsOps::read_stream`], and that is safe for every
+    /// backend: `LocalFs` overrides it with a real `File` (ops/local/fs.rs), both isolation
+    /// decorators forward it explicitly (protected.rs, traversal.rs — the latter re-applying
+    /// `confine` to the forwarded path), and any implementation that overrides only `read` inherits
+    /// the default, which routes straight back through that implementation's own `read` — so
+    /// recording/counting backends still see this tool's traffic.
+    async fn read_cancellable(
+        &self,
+        abs: &std::path::Path,
+        cancel: &CancelToken,
+    ) -> Result<Vec<u8>, ToolError> {
+        let Some(opened) = cancel.run_until_cancelled(self.fs.read_stream(abs)).await else {
+            return Err(error::aborted());
+        };
+        // A failure to OPEN keeps propagating uncaught, exactly as `self.fs.read(&abs)?` did and as
+        // Pi's uncaught `ops.readFile` rejection does (read.ts:321-324).
+        let reader = opened?;
+
+        let token = cancel.clone();
+        let drain = tokio::task::spawn_blocking(move || read_to_end_cancellable(reader, &token));
+
+        // Dropping `drain` here DETACHES the blocking task rather than killing it; that is
+        // acceptable only because the closure holds the same token and returns within one buffer
+        // fill. Never weaken `read_to_end_cancellable` to rely on this race alone.
+        let Some(joined) = cancel.run_until_cancelled(drain).await else {
+            return Err(error::aborted());
+        };
+
+        match joined {
+            Ok(Ok(bytes)) => Ok(bytes),
+            // The token fired between two buffer fills: report Pi's abort, not a raw I/O error.
+            Ok(Err(e)) if Cancelled::is(&e) => Err(error::aborted()),
+            // A genuine backend failure keeps the shape `LocalFs::read` produced before this
+            // change: `"{resolved path}: {io error}"`.
+            Ok(Err(e)) => Err(error::io(&error::show(abs), &e)),
+            // The blocking task panicked or was cancelled by runtime shutdown.
+            Err(e) => Err(error::invalid(format!("read: {e}"))),
+        }
+    }
+
     async fn read_image(
         &self,
         bytes: Vec<u8>,
         mime: crate::ops::ImageMime,
+        cancel: &CancelToken,
     ) -> Result<ToolResult, ToolError> {
         // `getNonVisionImageNote` (read.ts:87-92), evaluated PER CALL exactly like Pi's
         // `getNonVisionImageNote(ctx?.model)` (read.ts:246) — `supports_images_now()` prefers the
@@ -303,12 +409,23 @@ impl ReadTool {
 
         #[cfg(feature = "inline-images")]
         {
-            match image_proc::process_image(
-                &bytes,
-                mime,
-                self.opts.max_image_dim,
-                self.opts.auto_resize_images,
-            ) {
+            // Pi `await`s `processImage` with the abort listener live (read.ts:257), so an abort
+            // during it rejects at once. Here it is a SYNCHRONOUS decode + EXIF + resize +
+            // JPEG-quality ladder invoked inline on the async worker: it observed no token AND
+            // pinned a runtime thread for the whole ladder. Moving it onto the blocking pool is
+            // what makes the race expressible at all. `Processed` is owned (`String` /
+            // `Vec<String>`), so it crosses the boundary unchanged; `ImageMime` is `Copy` and the
+            // two option fields are scalars, so nothing borrows `self` across the spawn.
+            let max_dim = self.opts.max_image_dim;
+            let auto_resize = self.opts.auto_resize_images;
+            let processing = tokio::task::spawn_blocking(move || {
+                image_proc::process_image(&bytes, mime, max_dim, auto_resize)
+            });
+            let Some(joined) = cancel.run_until_cancelled(processing).await else {
+                return Err(error::aborted());
+            };
+            let processed = joined.map_err(|e| error::invalid(format!("read: {e}")))?;
+            match processed {
                 image_proc::Processed::Ok {
                     data,
                     mime: out_mime,
@@ -356,6 +473,12 @@ impl ReadTool {
 
         #[cfg(not(feature = "inline-images"))]
         {
+            // No decode happens in this build, so there is no work to race — but Pi's guard before
+            // `resolve` (read.ts:325) still applies, and this keeps `cancel` used on BOTH cfg arms
+            // without an `allow` attribute or an underscore-renamed parameter.
+            if cancel.is_cancelled() {
+                return Err(error::aborted());
+            }
             // Image decoding is only compiled out under `--no-default-features`; the default build
             // always inlines. Surface the detected type + a build note (and the non-vision note).
             let mut note = format!(

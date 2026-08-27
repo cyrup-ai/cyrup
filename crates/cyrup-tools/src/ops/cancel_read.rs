@@ -89,3 +89,50 @@ impl<R: std::io::Read> std::io::Read for CancelReader<R> {
         Ok(n)
     }
 }
+
+/// Buffer size for [`read_to_end_cancellable`]: the granularity at which the token is observed.
+///
+/// Deliberately NOT `Read::read_to_end`. Its `default_read_to_end` grows the destination
+/// geometrically and issues correspondingly huge single `read` calls, so the token would be
+/// consulted a handful of times over a multi-GB file. A fixed buffer makes abort latency a function
+/// of device throughput, not of file size. 64 KiB also matches `grep_searcher`'s
+/// `DEFAULT_BUFFER_CAPACITY` (grep-searcher-0.1.16 `src/line_buffer.rs:6`), so both consumers of
+/// this module abort on the same beat.
+const CHUNK: usize = 64 * 1024;
+
+/// Drain `reader` into a `Vec`, observing `cancel` every [`CHUNK`] bytes.
+///
+/// Returns an `Err` carrying [`Cancelled`] (test it with [`Cancelled::is`]) when the token fires
+/// mid-transfer; the partial buffer is dropped, exactly as Pi discards a partially-read file when
+/// the promise rejects.
+pub(crate) fn read_to_end_cancellable<R: std::io::Read>(
+    reader: R,
+    cancel: &CancelToken,
+) -> std::io::Result<Vec<u8>> {
+    use std::io::Read as _;
+
+    let mut src = CancelReader::new(reader, cancel.clone());
+    let mut out: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => return Ok(out),
+            // `Read` is a safe trait, so a broken implementation CAN claim more bytes than the
+            // buffer holds. `get` refuses to index blindly (crate-wide `clippy::indexing_slicing`)
+            // and turns that contract violation into an error instead of a panic.
+            Ok(n) => match buf.get(..n) {
+                Some(chunk) => out.extend_from_slice(chunk),
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "read reported more bytes than the buffer holds",
+                    ));
+                }
+            },
+            // A REAL `EINTR`, not our cancel — the marker uses `ErrorKind::Other` precisely so this
+            // retry cannot swallow it. The next iteration re-tests the token first.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+}

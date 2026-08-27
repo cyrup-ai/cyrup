@@ -27,6 +27,20 @@ use std::sync::LazyLock;
 /// either caller. Hence: one map, process-wide, exactly like Pi's.
 static FILE_MUTATION_LOCKS: LazyLock<KeyedLockMap<PathBuf>> = LazyLock::new(KeyedLockMap::new);
 
+/// Pi's module-scope `registrationQueue` (file-mutation-queue.ts:5).
+///
+/// Pi funnels EVERY registration — the `realpath` key resolution at `:34` and the queue link at
+/// `:42` — through one chain, so registrations happen one at a time and in call order. This is the
+/// Rust equivalent: `tokio::sync::Mutex` is strictly FIFO (tokio 1.52.3 src/sync/mutex.rs:20-22),
+/// so entering it in dispatch order is sufficient to leave it in dispatch order.
+///
+/// It is deliberately GLOBAL, not per-path: a slow `realpath` on one mount delays registrations for
+/// every other path too, exactly as pi's single chain does. That is the upstream behaviour, and it
+/// is bounded — the chain is released as soon as the key is resolved and the per-key place is
+/// claimed, never across the mutation itself.
+static MUTATION_REGISTRATION: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Pi `isMissingPathError` (file-mutation-queue.ts:7-14): `error.code === "ENOENT" || error.code
 /// === "ENOTDIR"`, and NOTHING else. Every other realpath failure is re-thrown at `:24`.
 fn is_missing_path_error(e: &std::io::Error) -> bool {
@@ -66,7 +80,8 @@ pub struct FileMutationLocks {
     /// Two cleanups look available here and are not:
     ///
     /// - *Reach through `inner`.* There is no route. [`KeyedLocks`] keeps its map private and
-    ///   exposes only `new` and `guard` — no accessor, no `Deref`. Adding one would also be the
+    ///   exposes only `new`, `enqueue` and `guard` — no accessor, no `Deref`. Adding one would
+    ///   also be the
     ///   wrong direction: the consumer already owns the map. `FILE_MUTATION_LOCKS` is declared
     ///   here and a clone of it is handed to `KeyedLocks::new`, so an accessor would be
     ///   `cyrup-core` re-exporting state its caller supplied. Nor would the observers it hands
@@ -164,22 +179,47 @@ impl FileMutationLocks {
     /// `Err(aborted)` if cancelled before acquisition — *always*, not just when the mutex happens
     /// to be contended.
     ///
-    /// The registry mechanics are [`cyrup_core::keyed_lock::KeyedLocks::guard`]: the entry is
-    /// inserted before the mutex is awaited and evicted on every exit including a dropped future,
-    /// and the cancel arm is polled `biased` so a pre-cancelled token is deterministic rather than
-    /// a coin flip. What is this crate's own is the realpath keying above and the mapping of
-    /// `Cancelled` onto pi's "Operation aborted" — the abort check is the FIRST statement inside
-    /// pi's queue body (`throwIfAborted()`, write.ts:218 / edit.ts:327, defined at
-    /// write.ts:213-215), so an already-aborted `write`/`edit` must throw before any filesystem
-    /// call.
+    /// The registry mechanics are [`cyrup_core::keyed_lock::KeyedLocks::enqueue`] plus
+    /// [`cyrup_core::keyed_lock::KeyedAcquire::wait`]: the entry is inserted before the mutex is
+    /// awaited and evicted on every exit including a dropped future, and cancellation is tested
+    /// before the wait so a pre-cancelled token is deterministic rather than a coin flip. What is
+    /// this crate's own is the realpath keying above, the `MUTATION_REGISTRATION` chain that puts
+    /// key resolution and the queue claim in call order, and the mapping of `Cancelled` onto pi's
+    /// "Operation aborted" — the abort check is the FIRST statement inside pi's queue body
+    /// (`throwIfAborted()`, write.ts:218 / edit.ts:327, defined at write.ts:213-215), so an
+    /// already-aborted `write`/`edit` must throw before any filesystem call.
+    ///
+    /// **Ordering.** Two mutations of the same file must be granted in the order the model issued
+    /// them, so the payload of the LAST one survives (pi: `registrationQueue`,
+    /// file-mutation-queue.ts:5/:33/:46-49). That requires the caller to REACH this function in
+    /// dispatch order — `write::execute`/`edit::execute` keep `guard()` as their first `.await`
+    /// for exactly that reason, and `cyrup-agent`'s parallel batch starts its spawned bodies in
+    /// source order. Introducing an `.await` before either `guard()` call reopens the gap.
     pub async fn guard(
         &self,
         path: &Path,
         cancel: &CancelToken,
     ) -> Result<MutationGuard, ToolError> {
+        // Pi `:33`: the registration slot is claimed in call order and the body below runs
+        // serialized.
+        let registration = MUTATION_REGISTRATION.lock().await;
+
+        // Pi `:34`: `await getMutationQueueKey(filePath)` — INSIDE the chain, so two spellings of
+        // the same file resolve in call order instead of racing on the blocking pool. On the `?`
+        // path the guard drops here and the chain advances, matching pi `:46-49`, which advances
+        // the chain on rejection as well as on fulfilment.
         let key = Self::key(path).await?;
-        self.inner
-            .guard(key, cancel)
+
+        // Pi `:35-42`: link into this key's queue. `enqueue` never yields, so the place is taken
+        // while the registration is still held.
+        let acquire = self.inner.enqueue(key).await;
+
+        // Pi `:51`: registration is complete; the chain advances. Everything after this point is
+        // pi's `await currentQueue`, which happens outside the chain.
+        drop(registration);
+
+        acquire
+            .wait(cancel)
             .await
             .map(MutationGuard)
             .map_err(|_| error::aborted())

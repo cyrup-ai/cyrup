@@ -285,15 +285,17 @@ impl<K: Eq + Hash + Clone> Drop for KeyedGuard<K> {
 /// Runs [`KeyedGuard`]'s eviction check for an acquisition that never became a guard.
 ///
 /// **This closes a mechanism gap, not a tidiness one.** A Rust future can be dropped at ANY
-/// `.await`, and [`KeyedLocks::guard`] inserts the map entry BEFORE awaiting the mutex. Both
-/// non-guard exits therefore leak the entry: the `cancel.cancelled()` arm of the `select!`, and an
-/// outright drop of the `guard()` future itself. The map is typically a process-global `static`, so
-/// nothing ever collects those entries; only a LATER successful lock on the identical key could,
-/// via [`KeyedGuard::drop`].
+/// `.await`, and [`KeyedLocks::enqueue`] inserts the map entry BEFORE the mutex is awaited. Both
+/// non-guard exits therefore leak the entry: the `cancel.cancelled()` arm of
+/// [`KeyedAcquire::wait`], and an outright drop of the `wait()` future — or of the [`KeyedAcquire`]
+/// itself, which is the same thing. The map is typically a process-global `static`, so nothing ever
+/// collects those entries; only a LATER successful lock on the identical key could, via
+/// [`KeyedGuard::drop`].
 ///
-/// Declared BEFORE the `lock` local in [`KeyedLocks::guard`] so that drop order (reverse
-/// declaration) releases the local `Arc` clone FIRST — otherwise the `strong_count == 1` predicate
-/// would always see that clone and never evict.
+/// Declared BEFORE the `lock` local in [`KeyedLocks::enqueue`], and held as [`KeyedAcquire`]'s LAST
+/// field, so that drop order (reverse declaration for locals, declaration order for fields)
+/// releases every local `Arc` clone FIRST — otherwise the `strong_count == 1` predicate would
+/// always see those clones and never evict.
 struct PendingEntry<K: Eq + Hash + Clone> {
     map: KeyedLockMap<K>,
     key: K,
