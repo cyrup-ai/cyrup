@@ -70,6 +70,7 @@
 
 pub mod agent_start_cache;
 pub mod ask;
+pub mod bash;
 pub mod common;
 pub mod config_modal;
 pub mod dedup;
@@ -83,6 +84,7 @@ pub mod jsonc;
 pub mod logging;
 pub mod manager;
 pub mod ordered;
+pub mod restrictiveness;
 pub mod runtime_api;
 pub mod sanitize;
 pub mod skill;

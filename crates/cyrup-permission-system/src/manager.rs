@@ -224,20 +224,58 @@ impl PermissionManager {
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            let result = find_compiled_match(&resolved.compiled_bash, &command);
-            let state = result
-                .as_ref()
-                .map(|r| r.state)
-                .or_else(|| tool_match.as_ref().map(|r| r.state))
-                .or_else(|| default_state(&resolved.layers, DefaultCategory::Bash))
-                .unwrap_or(PermissionState::Ask);
-            return PermissionCheckResult {
-                tool_name: tool_name.to_string(),
-                state,
-                matched_pattern: result.map(|r| r.matched_pattern),
-                command: Some(command),
-                target: None,
-                source: CheckSource::Bash,
+            // pi `resolveBashCommandCheck` (`handlers/gates/bash-command.ts:55-105`). Matching the
+            // whole string lets a denied command ride an allowed leading one (pi #301/#306), so the
+            // program is decomposed into command units — including those nested in substitutions
+            // and subshells — each resolved on the bash surface, most restrictive wins.
+            let units = crate::bash::parse_command_units(&command);
+
+            let resolve_unit = |text: &str| -> PermissionCheckResult {
+                let result = find_compiled_match(&resolved.compiled_bash, text);
+                let state = result
+                    .as_ref()
+                    .map(|r| r.state)
+                    .or_else(|| tool_match.as_ref().map(|r| r.state))
+                    .or_else(|| default_state(&resolved.layers, DefaultCategory::Bash))
+                    .unwrap_or(PermissionState::Ask);
+                PermissionCheckResult {
+                    tool_name: tool_name.to_string(),
+                    state,
+                    matched_pattern: result.map(|r| r.matched_pattern),
+                    command: Some(text.to_string()),
+                    target: None,
+                    source: CheckSource::Bash,
+                }
+            };
+
+            return match units {
+                Some(units) if !units.is_empty() => {
+                    let results = units.iter().map(|u| resolve_unit(&u.text)).collect();
+                    // Non-empty by the guard, so the fallback is unreachable; it keeps the
+                    // expression total without an unwrap (`unwrap_used = "deny"`).
+                    crate::restrictiveness::pick_most_restrictive(results)
+                        .unwrap_or_else(|| resolve_unit(&command))
+                }
+                // Parsed cleanly to zero units. A trivially-empty command (empty, whitespace-only,
+                // or comment-only) has genuinely nothing to gate, so resolve the whole string as
+                // before (pi `isTriviallyEmptyCommand`, `bash-command.ts:113-119`).
+                Some(_) if is_trivially_empty_command(&command) => resolve_unit(&command),
+                // Zero units from a non-empty command, or a parse/grammar failure: fail closed to
+                // `ask` so a permissive top-level `*` cannot silently allow an unparseable command
+                // (pi #452). The whole command is resolved FIRST so an explicit `deny` covering it
+                // denies outright rather than being masked into an approvable prompt (pi #712).
+                _ => {
+                    let whole = resolve_unit(&command);
+                    if whole.state == PermissionState::Deny {
+                        whole
+                    } else {
+                        PermissionCheckResult {
+                            matched_pattern: Some("<unparseable-bash-command>".to_string()),
+                            state: PermissionState::Ask,
+                            ..whole
+                        }
+                    }
+                }
             };
         }
 
@@ -737,6 +775,18 @@ fn find_latest_trusted_match(patterns: &CompiledPatterns, name: &str) -> Option<
 
 /// pi `findCompiledPermissionMatch` (`:407-428`): last match; but if it is not `deny` and not
 /// trusted, a trusted `deny` floor wins (the trusted-floor rule).
+/// True when a command has genuinely nothing to gate — empty, whitespace-only, or every non-blank
+/// line a comment (pi `isTriviallyEmptyCommand`, `handlers/gates/bash-command.ts:113-119`). Such a
+/// command yields zero units legitimately, so resolving the whole string is safe rather than a
+/// parse anomaly.
+fn is_trivially_empty_command(command: &str) -> bool {
+    command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .all(|line| line.starts_with('#'))
+}
+
 fn find_compiled_match(patterns: &CompiledPatterns, name: &str) -> Option<LayeredMatch> {
     if patterns.is_empty() {
         return None;
@@ -1133,6 +1183,84 @@ mod tests {
             m.check_permission("bash", &serde_json::json!({"command":"rm -rf /"}), None).state,
             PermissionState::Deny
         );
+    }
+
+    /// The regression wall for the per-unit bash gate (pi `resolveBashCommandCheck`,
+    /// `handlers/gates/bash-command.ts:55-105`).
+    ///
+    /// Before this, the whole `input.command` string was matched against one wildcard, so
+    /// `echo hi && rm -rf /` rode an `echo *` allow and every deny rule on a bash sub-command was
+    /// evadable by prefixing an allowed command. Reverting the bash arm to whole-string matching
+    /// must make this test fail.
+    ///
+    /// `command` is asserted alongside `state` on purpose: an implementation that resolved "deny
+    /// wins" but reported the whole chain would satisfy a state-only assertion while losing the
+    /// offending-unit attribution `gate::get_pattern_approval_subject` persists as a rule.
+    #[test]
+    fn bash_gates_each_command_unit_not_the_whole_string() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_global(
+            dir.path(),
+            r#"{ "bash": { "echo *": "allow", "rm *": "deny" } }"#,
+        );
+
+        // (command, expected state, expected `command` field, what it pins)
+        let cases: [(&str, PermissionState, &str, &str); 11] = [
+            ("echo hi", PermissionState::Allow, "echo hi", "single command unaffected"),
+            ("echo hi && rm -rf /", PermissionState::Deny, "rm -rf /", "THE CHAIN BYPASS"),
+            ("echo $(rm x)", PermissionState::Deny, "rm x", "command substitution"),
+            ("x=1 rm -rf /", PermissionState::Deny, "rm -rf /", "env-prefix strip"),
+            ("echo hi > $(rm x)", PermissionState::Deny, "rm x", "redirect as execution host"),
+            ("( echo a && rm b )", PermissionState::Deny, "rm b", "subshell descent"),
+            ("cat <<EOF\n$(rm e)\nEOF", PermissionState::Deny, "rm e", "heredoc interpolation"),
+            ("cat <<'EOF'\n$(rm e)\nEOF", PermissionState::Ask, "cat", "quoted heredoc does NOT interpolate"),
+            ("# comment", PermissionState::Ask, "# comment", "comment-only resolves whole"),
+            ("", PermissionState::Ask, "", "empty resolves whole"),
+            ("   ", PermissionState::Ask, "   ", "whitespace-only resolves whole"),
+        ];
+
+        for (command, want_state, want_command, pins) in cases {
+            let r = m.check_permission("bash", &serde_json::json!({ "command": command }), None);
+            assert_eq!(r.state, want_state, "state for {command:?} ({pins})");
+            assert_eq!(
+                r.command.as_deref(),
+                Some(want_command),
+                "offending unit for {command:?} ({pins})"
+            );
+        }
+    }
+
+    /// The stack-safety claim behind the iterative walker, end to end through the gate: a `rm`
+    /// buried 20 000 substitutions deep must still resolve `deny` rather than aborting the process.
+    #[test]
+    fn a_deeply_nested_command_still_resolves_without_aborting() {
+        const DEPTH: usize = 20_000;
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_global(dir.path(), r#"{ "bash": { "rm *": "deny" } }"#);
+
+        let command = format!("{}rm boom{}", "$(".repeat(DEPTH), ")".repeat(DEPTH));
+        let r = m.check_permission("bash", &serde_json::json!({ "command": command }), None);
+        assert_eq!(r.state, PermissionState::Deny);
+        assert_eq!(r.command.as_deref(), Some("rm boom"));
+    }
+
+    /// A chain whose units all land on the same tier resolves to the FIRST unit (pi's first-wins
+    /// tie-break), so the prompt must still name the whole program — otherwise approving shows the
+    /// human less than what runs.
+    #[test]
+    fn an_all_ask_chain_prompts_with_the_whole_command_not_just_the_winning_unit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_global(dir.path(), "{}");
+
+        let command = "echo hi && git push --force";
+        let input = serde_json::json!({ "command": command });
+        let r = m.check_permission("bash", &input, None);
+        assert_eq!(r.state, PermissionState::Ask);
+        assert_eq!(r.command.as_deref(), Some("echo hi"), "first-wins tie-break");
+
+        let prompt = crate::gate::format_ask_prompt(&r, None, &input);
+        assert!(prompt.contains("git push --force"), "prompt hides what runs: {prompt}");
+        assert!(prompt.contains("echo hi"), "prompt drops the unit needing approval: {prompt}");
     }
 
     #[test]

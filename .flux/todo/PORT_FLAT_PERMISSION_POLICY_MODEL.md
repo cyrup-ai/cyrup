@@ -10,7 +10,7 @@ updated: 2026-08-22 23:05
 > upstream is now **v27.0.0** (2026-08-21, 27 major releases later) and lives at
 > [`gotgenes/pi-packages`](https://github.com/gotgenes/pi-packages) — the standalone repo the port
 > cites is archived at v5.18.1. Reference checkout: `./tmp/pi-packages/packages/pi-permission-system`.
-> Full backlog and ordering: [UPSTREAM_PARITY_INDEX.md](./UPSTREAM_PARITY_INDEX.md).
+> Full backlog and ordering: [UPSTREAM_PARITY_INDEX.md](./_backlog/UPSTREAM_PARITY_INDEX.md).
 
 
 | | |
