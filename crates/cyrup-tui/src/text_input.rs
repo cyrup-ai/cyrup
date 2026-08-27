@@ -17,7 +17,8 @@ use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{
-    search_input_spans, stack_rows, title_lines, title_wrapped_height, Selector, SelectorOutcome,
+    border_rule, search_input_spans, stack_rows, title_lines, title_wrapped_height, Selector,
+    SelectorOutcome,
 };
 use crate::theme::UiTheme;
 
@@ -154,11 +155,7 @@ impl Selector for TextInputSelector {
         // rows are a prefix of the natural render, exactly as pi's layout engine does (see its doc).
         let [top, _, title_area, _, body, _, hint, _, bottom] =
             stack_rows(area, [1, 1, title_h, 1, 1, 1, 1, 1, 1]);
-        let rule = |w: u16| "─".repeat(w.max(1) as usize);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(rule(top.width), theme.border_style()))),
-            top,
-        );
+        frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(
             // E11: `new Text(theme.fg("accent", title), 1, 0)` (`extension-input.ts:50`).
             // `theme.fg` (`theme.ts:372-376`) applies a colour and nothing else — there is no
@@ -189,10 +186,7 @@ impl Selector for TextInputSelector {
             Paragraph::new(vec![self.hint_line(theme)]).style(theme.base_style()),
             hint,
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(rule(bottom.width), theme.border_style()))),
-            bottom,
-        );
+        frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {

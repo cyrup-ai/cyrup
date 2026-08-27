@@ -27,7 +27,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{border_rule_line, Selector, SelectorOutcome};
+use crate::selector::{border_rule_line, centered_window, Selector, SelectorOutcome};
 use crate::text_width::truncate_line_to_width;
 use crate::theme::UiTheme;
 
@@ -89,12 +89,7 @@ impl UserMessageSelector {
             ))];
         }
         let len = self.messages.len();
-        let start = self
-            .selected
-            .saturating_sub(MAX_VISIBLE / 2)
-            .min(len.saturating_sub(MAX_VISIBLE))
-            .min(len);
-        let end = (start + MAX_VISIBLE).min(len);
+        let (start, end) = centered_window(self.selected, len, MAX_VISIBLE);
         let mut lines = Vec::with_capacity((end - start) * 3 + 1);
         for i in start..end {
             let Some(message) = self.messages.get(i) else { continue };
@@ -159,9 +154,9 @@ impl UserMessageSelector {
 
 impl Selector for UserMessageSelector {
     fn desired_height(&self, width: u16) -> u16 {
-        let theme = UiTheme::default();
-        let header = self.header_lines(width, &theme).len();
-        let body = self.body_lines(width, &theme).len();
+        let theme = UiTheme::default_ref();
+        let header = self.header_lines(width, theme).len();
+        let body = self.body_lines(width, theme).len();
         // header · `DynamicBorder`(:132) · `Spacer`(:133) · list · `Spacer`(:143) ·
         // `DynamicBorder`(:144).
         header

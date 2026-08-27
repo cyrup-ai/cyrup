@@ -17,7 +17,7 @@ use ratatui::Frame;
 
 use crate::fuzzy;
 use crate::keymap::{EditorAction, EditorKeymap, SelectAction, SelectKeymap};
-use crate::selector::{Selector, SelectorOutcome};
+use crate::selector::{border_rule_line, centered_window, Selector, SelectorOutcome};
 use crate::theme::UiTheme;
 use crate::transcript::text_lines_of;
 
@@ -309,11 +309,7 @@ impl ModelSelector {
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let len = filtered.len();
-        let start = self
-            .selected
-            .saturating_sub(self.max_visible / 2)
-            .min(len.saturating_sub(self.max_visible));
-        let end = (start + self.max_visible).min(len);
+        let (start, end) = centered_window(self.selected, len, self.max_visible);
         for (i, m) in filtered.iter().enumerate().take(end).skip(start) {
             let is_sel = i == self.selected;
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -424,11 +420,12 @@ pub fn find_exact_model_reference_match<'a>(
 impl Selector for ModelSelector {
     fn desired_height(&self, width: u16) -> u16 {
         let filtered = self.filtered();
-        let body = self.body_lines(&filtered, usize::from(width), &UiTheme::default()).len() as u16;
+        let body =
+            self.body_lines(&filtered, usize::from(width), UiTheme::default_ref()).len() as u16;
         // top rule + blank + scope block + blank + search + blank + body + blank + bottom rule
         // (L4/SYS-3 — see `render`). The scope block is TWO rows when scoped models exist (the
         // scope line plus its own hint `Text`, `model-selector.ts:96-100`) and one otherwise.
-        let scope = self.scope_block_lines(usize::from(width), &UiTheme::default()).len() as u16;
+        let scope = self.scope_block_lines(usize::from(width), UiTheme::default_ref()).len() as u16;
         body.saturating_add(7).saturating_add(scope)
     }
 
@@ -521,11 +518,6 @@ impl Selector for ModelSelector {
             }
         }
     }
-}
-
-/// A full-width `─` rule line (Pi `DynamicBorder`; mirrors the other selectors).
-fn border_rule_line(width: u16, theme: &UiTheme) -> Line<'static> {
-    Line::from(Span::styled("─".repeat(width.max(1) as usize), theme.border_style()))
 }
 
 #[cfg(test)]

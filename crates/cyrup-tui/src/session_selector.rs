@@ -24,7 +24,7 @@ use ratatui::Frame;
 use crate::keymap::{
     EditorAction, EditorKeymap, Key, SelectAction, SelectKeymap, SessionAction, SessionKeymap,
 };
-use crate::selector::{Selector, SelectorOutcome};
+use crate::selector::{centered_window, rule_line, Selector, SelectorOutcome};
 use crate::session_search::{filter_and_sort, NameFilter, SearchRow, SortMode};
 use crate::settings_selector::FIELD_SEP;
 use crate::text_width::{spans_width, str_width, truncate_spans_to_width, truncate_to_width};
@@ -544,11 +544,7 @@ impl SessionSelector {
         }
         let width = usize::from(width);
         let len = filtered.len();
-        let start = self
-            .selected
-            .saturating_sub(self.max_visible / 2)
-            .min(len.saturating_sub(self.max_visible));
-        let end = (start + self.max_visible).min(len);
+        let (start, end) = centered_window(self.selected, len, self.max_visible);
         let mut lines = Vec::new();
         for (i, node) in filtered.iter().enumerate().take(end).skip(start) {
             let row = &node.row;
@@ -826,10 +822,10 @@ impl SessionSelector {
 impl Selector for SessionSelector {
     fn desired_height(&self, width: u16) -> u16 {
         let filtered = self.filtered();
-        let body = self.body_lines(&UiTheme::default(), &filtered, width).len() as u16;
+        let body = self.body_lines(UiTheme::default_ref(), &filtered, width).len() as u16;
         // blank + top rule + blank + header (title + BOTH hint rows) + blank + search input + blank
         // + body + blank + bottom rule (L4/SYS-3 — see `render`) = body + hints + 9.
-        let hints = self.hint_lines(&UiTheme::default(), width).len() as u16;
+        let hints = self.hint_lines(UiTheme::default_ref(), width).len() as u16;
         body.saturating_add(9).saturating_add(hints)
     }
 
@@ -857,11 +853,18 @@ impl Selector for SessionSelector {
         // PREFIX of this vector, which is what pi's layout engine does to an over-tall `Container`
         // (see `crate::selector::stack_rows`' doc). A short slot therefore leads with `:737`'s
         // blank, exactly as upstream does.
+        //
+        // S13: both of `/resume`'s rules are constructed
+        // `new DynamicBorder((s) => theme.fg("accent", s))` (`session-selector.ts:738` and
+        // `:746`) — this is the one selector upstream deliberately frames in **accent**, where
+        // the rest pass the `border` token. cyrup framed it with `theme.border_style()`. Hence
+        // `rule_line(.., accent)` below rather than the shared `border_rule_line` every other
+        // envelope uses.
         let mut lines: Vec<Line<'static>> = vec![
-            Line::from(""),                             // `Spacer`(:737)
-            border_rule_line(area.width, theme),        // `DynamicBorder`(:738)
-            Line::from(""),                             // `Spacer`(:739)
-            self.header_line(theme, area.width),        // header line 1 of 3 (:185)
+            Line::from(""),                               // `Spacer`(:737)
+            rule_line(area.width, theme.accent_style()),  // `DynamicBorder`(:738), accent (S13)
+            Line::from(""),                               // `Spacer`(:739)
+            self.header_line(theme, area.width),          // header line 1 of 3 (:185)
         ];
         // Header lines 2 and 3 (`hintLine1`/`hintLine2`, `:156-183`).
         lines.extend(self.hint_lines(theme, area.width));
@@ -892,7 +895,8 @@ impl Selector for SessionSelector {
         lines.extend(self.body_lines(theme, &filtered, area.width));
         // `Spacer`(:745).
         lines.push(Line::from(""));
-        lines.push(border_rule_line(area.width, theme));
+        // `DynamicBorder`(:746) — accent, like `:738` above (S13).
+        lines.push(rule_line(area.width, theme.accent_style()));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
     }
 
@@ -1027,16 +1031,6 @@ fn name_label(filter: NameFilter) -> &'static str {
         NameFilter::All => "All",
         NameFilter::Named => "Named",
     }
-}
-
-/// A full-width `─` rule line (`DynamicBorder`).
-///
-/// S13: both of `/resume`'s rules are constructed
-/// `new DynamicBorder((s) => theme.fg("accent", s))` (`session-selector.ts:738` and `:746`) — this
-/// is the one selector upstream deliberately frames in **accent**, where the rest pass the `border`
-/// token. cyrup framed it with `theme.border_style()`.
-fn border_rule_line(width: u16, theme: &UiTheme) -> Line<'static> {
-    Line::from(Span::styled("─".repeat(width.max(1) as usize), theme.accent_style()))
 }
 
 /// `shortenPath` (`session-selector.ts:26-33`): rewrite a `$HOME`-rooted path to `~/…`. (pi keeps

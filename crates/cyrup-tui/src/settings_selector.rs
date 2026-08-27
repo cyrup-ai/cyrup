@@ -21,7 +21,10 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{input_line_spans, stack_rows, Selector, SelectorOutcome};
+use crate::selector::{
+    border_rule, border_rule_line, centered_window, input_line_spans, stack_rows, Selector,
+    SelectorOutcome,
+};
 use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
 
@@ -285,17 +288,10 @@ impl SettingsSelector {
 
         // `:113-118` — the window, centred on the highlight. `Math.min(a, len - maxVisible)` goes
         // negative when the list is shorter than the window and the outer `Math.max(0, …)` catches
-        // it; `saturating_sub` + the `total <= visible` arm reproduce that without underflowing.
+        // it; `centered_window` performs that same clamp without underflowing (its own doc carries
+        // the `select-list.ts:86-90` citation), including the `total <= visible` short-circuit.
         let total = display.len();
-        let (start, end) = if total <= SETTINGS_MAX_VISIBLE {
-            (0usize, total)
-        } else {
-            let start = self
-                .selected
-                .saturating_sub(SETTINGS_MAX_VISIBLE / 2)
-                .min(total - SETTINGS_MAX_VISIBLE);
-            (start, (start + SETTINGS_MAX_VISIBLE).min(total))
-        };
+        let (start, end) = centered_window(self.selected, total, SETTINGS_MAX_VISIBLE);
 
         let label_w = self.label_column_width();
         // `:138-139` — `usedWidth = prefixWidth + maxLabelWidth + visibleWidth(separator)`, then
@@ -413,7 +409,8 @@ impl Selector for SettingsSelector {
     fn desired_height(&self, width: u16) -> u16 {
         // `DynamicBorder`(:765) + the `SettingsList`'s own natural lines + `DynamicBorder`(:874).
         // Measured from the real `lines()` so the height can never disagree with the render.
-        let body = self.lines(width, &UiTheme::default()).len().min(usize::from(u16::MAX)) as u16;
+        let body =
+            self.lines(width, UiTheme::default_ref()).len().min(usize::from(u16::MAX)) as u16;
         body.saturating_add(2)
     }
 
@@ -743,15 +740,4 @@ impl Selector for TrustSelector {
             None => SelectorOutcome::Ignored,
         }
     }
-}
-
-/// A full-width `─` rule [`Paragraph`] (the `DynamicBorder`, shared with [`crate::selector`]).
-fn border_rule(width: u16, theme: &UiTheme) -> Paragraph<'static> {
-    Paragraph::new(border_rule_line(width, theme))
-}
-
-/// A full-width `─` rule as a single [`Line`] (for multi-line paragraph composition).
-fn border_rule_line(width: u16, theme: &UiTheme) -> Line<'static> {
-    let rule = "─".repeat(width.max(1) as usize);
-    Line::from(Span::styled(rule, theme.border_style()))
 }

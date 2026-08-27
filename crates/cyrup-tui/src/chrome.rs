@@ -19,6 +19,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::keymap::{Action, Keymap};
+use crate::selector::border_rule;
 use crate::status_indicator::SPINNER_FRAMES;
 use crate::theme::UiTheme;
 
@@ -379,10 +380,4 @@ impl BorderedLoader {
         }
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
-}
-
-/// A full-width `─` rule styled `border` (Pi `DynamicBorder`, mirrors `selector::border_rule`).
-fn border_rule(width: u16, theme: &UiTheme) -> Paragraph<'static> {
-    let rule = "─".repeat(width.max(1) as usize);
-    Paragraph::new(Line::from(Span::styled(rule, theme.border_style())))
 }

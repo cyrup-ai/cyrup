@@ -472,7 +472,7 @@ impl CheckboxSelector {
 
 impl Selector for CheckboxSelector {
     fn desired_height(&self, width: u16) -> u16 {
-        self.all_lines(width, &UiTheme::default()).len().min(usize::from(u16::MAX)) as u16
+        self.all_lines(width, UiTheme::default_ref()).len().min(usize::from(u16::MAX)) as u16
     }
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
