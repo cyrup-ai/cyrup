@@ -139,33 +139,38 @@ impl GrepTool {
         // Cloning is an `Arc` refcount bump (`CancelToken` is `tokio_util::sync::CancellationToken`,
         // cyrup-core `cancel.rs:9`).
         let cancel_task = cancel.clone();
-        let searched: Result<Vec<(u64, Vec<u8>)>, Aborted> = tokio::task::spawn_blocking(move || {
-            let mut searcher: Searcher = SearcherBuilder::new()
-                .line_number(true)
-                .binary_detection(BinaryDetection::quit(b'\x00'))
-                .build();
-            let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
-            let mut local = 0usize;
-            let outcome = {
-                let sink = MatchSink {
-                    matches: &mut matches,
-                    count: &mut local,
-                    limit: remaining,
-                    cancel: cancel_task.clone(),
+        let searched: Result<Vec<(u64, Vec<u8>)>, Aborted> =
+            tokio::task::spawn_blocking(move || {
+                let mut searcher: Searcher = SearcherBuilder::new()
+                    .line_number(true)
+                    .binary_detection(BinaryDetection::quit(b'\x00'))
+                    .build();
+                let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
+                let mut local = 0usize;
+                let outcome = {
+                    let sink = MatchSink {
+                        matches: &mut matches,
+                        count: &mut local,
+                        limit: remaining,
+                        cancel: cancel_task.clone(),
+                    };
+                    searcher.search_reader(
+                        &matcher_owned,
+                        CancelReader::new(reader, cancel_task),
+                        sink,
+                    )
                 };
-                searcher.search_reader(&matcher_owned, CancelReader::new(reader, cancel_task), sink)
-            };
-            match outcome {
-                // The searcher's error is no longer thrown away wholesale: a cancel marker is an
-                // abort, and EVERY other `io::Error` keeps the previous `let _ = …` semantics —
-                // whatever was collected before the failure stands and the walk moves on, because
-                // rg emits no match events for a file it cannot read.
-                Err(e) if Cancelled::is(&e) => Err(Aborted),
-                _ => Ok(matches),
-            }
-        })
-        .await
-        .map_err(|e| error::invalid(format!("grep: {e}")))?;
+                match outcome {
+                    // The searcher's error is no longer thrown away wholesale: a cancel marker is an
+                    // abort, and EVERY other `io::Error` keeps the previous `let _ = …` semantics —
+                    // whatever was collected before the failure stands and the walk moves on, because
+                    // rg emits no match events for a file it cannot read.
+                    Err(e) if Cancelled::is(&e) => Err(Aborted),
+                    _ => Ok(matches),
+                }
+            })
+            .await
+            .map_err(|e| error::invalid(format!("grep: {e}")))?;
 
         let Ok(matches) = searched else {
             return Err(error::aborted());

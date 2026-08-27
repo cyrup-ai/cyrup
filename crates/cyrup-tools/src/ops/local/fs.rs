@@ -79,7 +79,7 @@ impl FsOps for LocalFs {
         Ok(Box::new(file))
     }
 
-    /// 1:1 with Pi's `fsWriteFile(path, content, "utf-8")` (write.ts:33 / edit.ts:85):
+    /// 1:1 with Pi's `fsWriteFile(path, content, "utf-8")` (write.ts:39 / edit.ts:107):
     /// `O_WRONLY|O_CREAT|O_TRUNC` with creation mode `0o666` (umask applies), write, close.
     ///
     /// [CYRUP-DELTA] The parent-directory creation is Pi's SEPARATE `ops.mkdir(dirname(path),
@@ -95,12 +95,22 @@ impl FsOps for LocalFs {
     /// lets a write succeed on a read-only file, because `rename(2)` checks the parent directory
     /// rather than the file. See [`FsOps::write_in_place`] for the durability trade this accepts.
     async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+        // `io_errno`, not `io`, on every edge below. Pi's write ops are raw Node calls whose
+        // rejections propagate uncaught out of `execute` (write.ts:221/225, edit.ts:371) and reach
+        // the model as `error.message` verbatim (agent-loop.ts:701-707), and a Node `SystemError`
+        // message ALWAYS leads with the libuv errno name — `EACCES: permission denied, open '/x'`,
+        // `ENOSPC: no space left on device, write`. `ToolError` is flat, so the code has to ride as
+        // the leading token of the message; that is precisely what `error::io_errno` builds, and it
+        // is the same `CODE: context: display` shape `access`/`read_dir`/`lock` already emit. The
+        // context is the SYSCALL Node names for each edge (`mkdir`, `open`, `write`), so the model
+        // can tell a parent-creation failure from an open failure from a short write, which the
+        // single shared `write {path}` context could not.
         if let Some(parent) = path.parent()
             && !parent.as_os_str().is_empty()
         {
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| error::io(&format!("create dir {}", error::show(parent)), &e))?;
+                .map_err(|e| error::io_errno(&format!("mkdir {}", error::show(parent)), &e))?;
         }
         let mut file = tokio::fs::OpenOptions::new()
             .write(true)
@@ -108,15 +118,15 @@ impl FsOps for LocalFs {
             .truncate(true)
             .open(path)
             .await
-            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
+            .map_err(|e| error::io_errno(&format!("open {}", error::show(path)), &e))?;
         file.write_all(bytes)
             .await
-            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
+            .map_err(|e| error::io_errno(&format!("write {}", error::show(path)), &e))?;
         // `tokio::fs::File` buffers; flush pushes the bytes to the OS. Node's `writeFile` likewise
         // only loops `write(2)` and closes the fd — there is no `fsync` on either side.
         file.flush()
             .await
-            .map_err(|e| error::io(&format!("write {}", error::show(path)), &e))?;
+            .map_err(|e| error::io_errno(&format!("write {}", error::show(path)), &e))?;
         Ok(())
     }
 
@@ -293,4 +303,3 @@ impl FsOps for LocalFs {
         Box::pin(tokio_stream::wrappers::ReceiverStream::new(rx))
     }
 }
-
