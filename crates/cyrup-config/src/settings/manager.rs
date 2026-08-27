@@ -9,7 +9,7 @@ use super::effective::EffectiveSettings;
 use super::layer::{Settings, strip_global_only};
 use super::merge::deep_merge;
 use super::store::SettingsStore;
-use super::types::{MermaidRenderingMode, SettingsScope};
+use super::types::{FullscreenScrollbar, MermaidRenderingMode, SettingsScope, TuiMode};
 use crate::error::{ConfigError, ScopedError};
 
 /// The layered settings facade (arch-07 §3.3). Holds the two layers + a memoized merge.
@@ -371,6 +371,35 @@ impl SettingsManager {
             SettingsScope::Global,
             &["markdown", "mermaid"],
             Value::String(mode.as_str().to_string()),
+        )
+        .await
+    }
+
+    /// `setTuiMode` (Pi settings-manager.ts:1132-1136 @v0.84.1): writes the GLOBAL scope —
+    /// `this.globalSettings.tuiMode = mode` — so the preference follows the user, not the folder.
+    /// ADR-0005 §Decision A-3.
+    ///
+    /// The value written is [`TuiMode::as_str`], the same spelling upstream stores, which is what
+    /// makes the key round-trip between the two implementations. Reading it back is
+    /// [`EffectiveSettings::tui_mode`], and that read is MERGED, not global-only: upstream's getter
+    /// consults `this.settings` (`:1129`), so a trusted project may still pin a mode even though
+    /// the setter never writes there.
+    pub async fn set_tui_mode(&mut self, mode: TuiMode) -> Result<(), ConfigError> {
+        self.set(SettingsScope::Global, "tuiMode", mode.as_str())
+            .await
+    }
+
+    /// `setFullscreenScrollbar` (Pi settings-manager.ts:1143-1146 @v0.84.1): GLOBAL scope, same
+    /// shape as [`Self::set_tui_mode`]; read back through
+    /// [`EffectiveSettings::fullscreen_scrollbar`]. ADR-0005 §Decision A-3.
+    pub async fn set_fullscreen_scrollbar(
+        &mut self,
+        scrollbar: FullscreenScrollbar,
+    ) -> Result<(), ConfigError> {
+        self.set(
+            SettingsScope::Global,
+            "fullscreenScrollbar",
+            scrollbar.as_str(),
         )
         .await
     }

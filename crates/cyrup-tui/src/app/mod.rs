@@ -48,6 +48,7 @@ mod input;
 mod input_reader;
 mod layout;
 mod login;
+mod mode_switch;
 mod outcome;
 #[path = "render.rs"]
 mod render_impl;
@@ -91,6 +92,14 @@ pub(crate) use input_reader::{
 pub(crate) use layout::{
     live_region_height, max_visible_editor_lines, region_constraints,
 };
+/// ADR-0005 §Decision B-14 — the live renderer switch (pi `switchTuiMode`,
+/// `interactive-mode.ts:842-891` @v0.84.3). Re-exported from `lib.rs` because the eventual caller
+/// is the composition root in the `cyrup` crate (`crates/cyrup/src/interactive.rs`), not this one.
+/// Both directions of the switch are implemented — [`App::switch_tui_mode`] enters and leaves
+/// ADR-0005 §B-3's `AltScreen` — and nothing inside this crate calls it: its two callers are the
+/// composition root (merging `--tui-mode` with the persisted `settings.tuiMode`) and the
+/// `/settings` `tui-mode` row (`app/settings_rows.rs`). See [`mode_switch`]'s module doc.
+pub use mode_switch::{MainScreenRenderState, ModeSwitch, ModeSwitchOptions};
 pub use outcome::{
     CompactOutcome, CompactionQueued, ExtensionWidget, LifecycleEffects, LifecycleOutcome,
     LoginProviderSource, QueueDrain, QueueDrainReason, TreeNavMsg,
@@ -163,9 +172,10 @@ use crate::editor::{EditorOutcome, InputEditor};
 use crate::error::TuiError;
 use crate::extension_editor::ExtensionEditorSelector;
 use crate::image::{ImageBlock, ImageRenderer, TerminalCapabilities};
+use crate::altscreen::AltScreen;
 use crate::keymap::{
-    Action, EditorAction, Key, KeybindingIssue, Keymap, ModelsKeymap, SelectAction, SelectKeymap,
-    SessionKeymap, TreeKeymap,
+    Action, AltScreenKeymap, EditorAction, Key, KeybindingIssue, Keymap, ModelsKeymap, SelectAction,
+    SelectKeymap, SessionKeymap, TreeKeymap,
 };
 use crate::login_dialog::{
     notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginUiMsg,
@@ -202,6 +212,31 @@ pub const ELAPSED_TICK_INTERVAL: Duration = Duration::from_secs(1);
 pub struct App<B: Backend> {
     terminal: Terminal<B>,
     state: AppState,
+    /// The ADR-0005 §B-3 alternate-screen renderer while fullscreen mode is live — `None` for
+    /// regular mode, which is every session that never calls [`App::switch_tui_mode`].
+    ///
+    /// An `Option` field rather than a `Box<dyn ViewportRenderer>` swap, for the reason
+    /// [`crate::ViewportRenderer`]'s own scope note gives: `ratatui::Terminal` exposes no consuming
+    /// accessor, so a backend cannot be moved out of one `Terminal` into another and the second
+    /// renderer is built over `RebuildBackend::rebuild()` instead — the same mechanism
+    /// `App::draw`'s `resize_viewport` already uses (`app/draw.rs:113-118`). `App` therefore keeps
+    /// its inline `Terminal` untouched for the whole excursion and puts it back into use by
+    /// dropping this.
+    ///
+    /// Every consumer reads it through one of four seams and never inline: [`App::render_mode`] and
+    /// [`App::renderer_mut`] (`app/mode_switch.rs`), the fullscreen branch of [`App::draw`]
+    /// (`app/draw.rs`), and the §B-9 key offer in [`App::handle_input`] (`app/input.rs`).
+    altscreen: Option<AltScreen<B>>,
+    /// The `tui.altScreen.*` table §B-9's key routing resolves against — the eight ids of pi's
+    /// `keybindings.ts:159-209`, held here rather than on [`AppState`] because it is the one keymap
+    /// whose resolution is gated on which renderer is live
+    /// ([`AltScreenKeymap::action_in_mode`]).
+    ///
+    /// **Not yet reachable from a `keybindings.json`.** The five other maps are merged by
+    /// [`App::load_keybindings_json`] (`app/shell.rs:159-172`) and reset by
+    /// [`App::reload_keybindings_from`]; adding this one is a line in each, and until then the
+    /// table is upstream's defaults for the session's life.
+    alt_keymap: AltScreenKeymap,
     /// The current inline-viewport height (the live region's content height). Recomputed each
     /// [`draw`](Self::draw); the viewport is rebuilt only when it changes (audit #1).
     viewport_height: u16,

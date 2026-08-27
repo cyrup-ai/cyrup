@@ -205,18 +205,6 @@ async fn run() -> anyhow::Result<i32> {
         return actions::export_session_html(export, messages.first().map(String::as_str)).await;
     }
 
-    // `--tui-mode fullscreen` parses (pi args.ts:180-192 @v0.84.1) and is then declined HERE, at
-    // startup, falling back to `regular` — ADR-0005 §Decision A.2, which also fixes this wording and
-    // makes a grep for it the tripwire that the interim was cleaned up when work unit B-13 lands the
-    // alternate-screen renderer. Deliberately NOT phrased as a pi diagnostic and NOT fatal: pi
-    // accepts the value, so exiting here would refuse a launch pi performs. `regular` is a no-op.
-    if cli.tui_mode == Some(cyrup::TuiMode::Fullscreen) {
-        eprintln!(
-            "--tui-mode fullscreen is not built yet in this release (ADR-0005); falling back to regular."
-        );
-        cli.tui_mode = Some(cyrup::TuiMode::Regular);
-    }
-
     // Rich `--help` body (Pi printHelp, args.ts:212). Loaded-extension flags are the outer extension
     // tier; the bin injects an empty set today (the injection point is preserved 1:1).
     if cli.help {
@@ -531,6 +519,13 @@ async fn run() -> anyhow::Result<i32> {
             cancel,
             package_updates,
             migration.migrated_auth_providers.clone(),
+            // `--tui-mode` reaches the renderer here and nowhere else (ADR-0005 §B-14); the
+            // setting fallback is applied inside `run_interactive`, which is where the session's
+            // effective settings are in scope.
+            cli.tui_mode.map(|m| match m {
+                cyrup::TuiMode::Regular => cyrup_config::settings::TuiMode::Regular,
+                cyrup::TuiMode::Fullscreen => cyrup_config::settings::TuiMode::Fullscreen,
+            }),
         )
         .await;
         // Quit is a normal exit here too: Pi disposes the runtime on every host teardown path

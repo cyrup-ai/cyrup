@@ -410,6 +410,12 @@ pub(crate) fn map_event(ev: Event) -> Option<InputEvent> {
 /// lifted into parameters, so the Apple-Terminal / Windows-console branch of the Shift+Enter rescue
 /// is reachable from a test on any host (the same pattern as
 /// [`crate::image::detect_capabilities_on_platform`]).
+///
+/// The one input NOT lifted is the mouse gate: `Event::Mouse` consults the process-global set by
+/// `altscreen::mouse::MouseSetup` (ADR-0005 §B-4). It is deliberately not a parameter, because it
+/// is not a host fact a test would want to vary — it records whether THIS process wrote a mouse
+/// enable sequence, it is `false` until the alternate-screen renderer writes one, and every other
+/// arm is unaffected by it.
 pub(crate) fn map_event_on(
     ev: Event,
     platform: &str,
@@ -430,7 +436,23 @@ pub(crate) fn map_event_on(
         Event::Resize(w, h) => Some(InputEvent::Resize(w, h)),
         Event::FocusGained => Some(InputEvent::FocusGained),
         Event::FocusLost => Some(InputEvent::FocusLost),
-        Event::Mouse(_) => None,
+        // ADR-0005 §B-4. This was an unconditional `=> None`, correct while nothing in the process
+        // ever asked a terminal for mouse reports. The alternate-screen renderer does ask
+        // (`altscreen/mouse.rs`, pi `tui-alt-screen.ts:293`), so the discard moves behind the gate
+        // that knows whether it did — and stays a discard for the whole of every regular-mode
+        // session, where the gate is never armed.
+        //
+        // §B-14 NOTE — still a discard in BOTH modes, and the remaining blocker is not here.
+        // `AltScreen::handle_mouse` (the §B-3 dispatcher over `wheel`, `scrollbar_drag` and
+        // `selection`, in upstream's `:564-575` order) exists and is complete; what does not exist
+        // is a way to carry a `MouseEvent` to it, because [`InputEvent`] has no `Mouse` variant.
+        // The follow-up is two lines and neither is in this file: `Mouse(MouseEvent)` on the enum
+        // in `component.rs`, and `Some(InputEvent::Mouse(ev))` in place of
+        // `map_reader_event`'s armed-branch `None` (`altscreen/mouse.rs:217-223`, whose own doc
+        // says the same). Until then wheel scrolling, scrollbar drags, text selection, the
+        // `PointerOutcome::Copy` clipboard write and the `PointerOutcome::Paste` editor insert are
+        // all unreachable in fullscreen.
+        Event::Mouse(m) => crate::altscreen::mouse::map_reader_event(m),
     }
 }
 

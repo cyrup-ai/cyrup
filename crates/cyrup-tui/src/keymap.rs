@@ -6,6 +6,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
+use crate::altscreen::TuiRenderMode;
 use crate::error::TuiError;
 
 /// Decode the legacy C0 control bytes `0x1C..=0x1F` into the chords pi names for them — a port of
@@ -1415,5 +1416,259 @@ impl EditorKeymap {
     /// Merge a JSON keybindings document, applying only the `editor.*` ids (spec/tui/03 §6.1).
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
         merge_entries(json, EditorAction::from_id, |action, keys| self.set_action(action, keys))
+    }
+}
+
+/// An alternate-screen viewport action resolved from a key while the fullscreen renderer is live —
+/// the eight `tui.altScreen.*` ids of pi's `packages/tui/src/keybindings.ts:44-58` (the interface)
+/// and `:159-209` (the definitions) @v0.84.3. ADR-0005 §Decision C, work unit B-9; the ADR's
+/// `:44-52` / `:153-179` citations are the @v0.84.1 line numbering for the same two spans.
+///
+/// Resolved via [`AltScreenKeymap`] so the alternate screen never compares keys inline (R-10-018).
+/// What each action *does* to the scroll offset — the page sizes and their floors — is the
+/// renderer's half and lives in `altscreen/keys.rs`, over pi's `tui-alt-screen.ts:600-644`.
+///
+/// # Why this is a map of its own
+/// The four unmodified defaults (`pageUp`, `pageDown`, `home`, `end`) are already bound elsewhere:
+/// `pageUp`/`pageDown` to [`EditorAction::PageUp`]/[`EditorAction::PageDown`] and to the global
+/// [`Action::PageUp`]/[`Action::PageDown`], `home`/`end` to
+/// [`EditorAction::CursorLineStart`]/[`EditorAction::CursorLineEnd`]. Upstream's comment at
+/// `keybindings.ts:159` — "These intentionally shadow the unmodified editor bindings in fullscreen
+/// mode" — is exactly that collision, declared deliberate. Keeping the family in a separate table
+/// is what lets the collision be resolved by *mode* ([`AltScreenKeymap::action_in_mode`]) instead
+/// of by rebinding anything the inline renderer depends on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AltScreenAction {
+    /// Scroll the viewport up one page — `tui.altScreen.pageUp` (`keybindings.ts:160-163`,
+    /// handled at `tui-alt-screen.ts:601-606`). Default `pageUp`.
+    PageUp,
+    /// Scroll the viewport down one page — `tui.altScreen.pageDown` (`:164-167`; `:607-612`).
+    /// Default `pageDown`.
+    PageDown,
+    /// Scroll the viewport up half a page — `tui.altScreen.halfPageUp` (`:168-171`; `:613-616`).
+    /// **`defaultKeys: []`** upstream: the id exists so a `keybindings.json` can bind it, and
+    /// nothing is bound out of the box.
+    HalfPageUp,
+    /// Scroll the viewport down half a page — `tui.altScreen.halfPageDown` (`:172-175`; `:617-620`),
+    /// likewise `defaultKeys: []`.
+    HalfPageDown,
+    /// Jump to the previous semantic prompt — `tui.altScreen.previousPrompt` (`:184-187`;
+    /// `:629-632`). The walk itself is ADR-0005 §B-10.
+    PreviousPrompt,
+    /// Jump to the next semantic prompt — `tui.altScreen.nextPrompt` (`:188-191`; `:633-636`).
+    NextPrompt,
+    /// Scroll the viewport to its first row — `tui.altScreen.top` (`:208`; `:637-640`). Default
+    /// `home`.
+    Top,
+    /// Scroll the viewport to its last row, re-arming the tail follow — `tui.altScreen.bottom`
+    /// (`:209`; `:641-644`). Default `end`.
+    Bottom,
+}
+
+impl AltScreenAction {
+    /// Every viewport action, in pi's declaration order (`keybindings.ts:159-209`) — which is also
+    /// the order `handleViewportInput` tests them in (`tui-alt-screen.ts:601-644`).
+    ///
+    /// A keybindings *surface* enumerates this: pi's registry is a record it can iterate
+    /// (`TUI_KEYBINDINGS`, `keybindings.ts:71`), cyrup's is a table keyed by [`Key`], so the list
+    /// of ids has to be stated once somewhere. Stating it here is what makes ADR-0005 §Decision C
+    /// rule ii checkable — [`AltScreenAction::HalfPageUp`] and [`AltScreenAction::HalfPageDown`]
+    /// ship unbound and must still be listed, and an enumeration that skipped them would be the
+    /// bug the rule names.
+    pub const ALL: [AltScreenAction; 8] = [
+        AltScreenAction::PageUp,
+        AltScreenAction::PageDown,
+        AltScreenAction::HalfPageUp,
+        AltScreenAction::HalfPageDown,
+        AltScreenAction::PreviousPrompt,
+        AltScreenAction::NextPrompt,
+        AltScreenAction::Top,
+        AltScreenAction::Bottom,
+    ];
+
+    /// The binding id this action is written as in a `keybindings.json` — the exact inverse of
+    /// [`Self::from_id`], and the string a bindings surface labels the row with.
+    pub fn id(self) -> &'static str {
+        match self {
+            AltScreenAction::PageUp => "tui.altScreen.pageUp",
+            AltScreenAction::PageDown => "tui.altScreen.pageDown",
+            AltScreenAction::HalfPageUp => "tui.altScreen.halfPageUp",
+            AltScreenAction::HalfPageDown => "tui.altScreen.halfPageDown",
+            AltScreenAction::PreviousPrompt => "tui.altScreen.previousPrompt",
+            AltScreenAction::NextPrompt => "tui.altScreen.nextPrompt",
+            AltScreenAction::Top => "tui.altScreen.top",
+            AltScreenAction::Bottom => "tui.altScreen.bottom",
+        }
+    }
+
+    /// The one-line description upstream ships beside the default keys — `KeybindingDefinition`'s
+    /// `description` field (`keybindings.ts:63-66`), verbatim from `:160-209`.
+    ///
+    /// cyrup's other maps carry no descriptions because upstream's `/hotkeys` writes its own prose
+    /// per row (`interactive-mode.ts:6284-6294`) and never reads the registry's. These eight are
+    /// different only in that no such prose exists to write yet: `/hotkeys` lists no
+    /// `tui.altScreen.*` row upstream either, so the string a surface would show is upstream's or
+    /// nothing.
+    pub fn description(self) -> &'static str {
+        match self {
+            AltScreenAction::PageUp => "Scroll viewport up one page",
+            AltScreenAction::PageDown => "Scroll viewport down one page",
+            AltScreenAction::HalfPageUp => "Scroll viewport up half a page",
+            AltScreenAction::HalfPageDown => "Scroll viewport down half a page",
+            AltScreenAction::PreviousPrompt => "Jump to previous semantic prompt",
+            AltScreenAction::NextPrompt => "Jump to next semantic prompt",
+            AltScreenAction::Top => "Scroll viewport to top",
+            AltScreenAction::Bottom => "Scroll viewport to bottom",
+        }
+    }
+
+    /// Resolve a `tui.altScreen.*` binding id to an [`AltScreenAction`] (ADR-0005 §Decision C).
+    /// `None` for ids that belong to the other maps, or are unknown.
+    ///
+    /// No aliases: cyrup shipped no predecessor spelling for any of these, so unlike
+    /// [`EditorAction::from_id`] there is no legacy name to keep working, and pi's
+    /// `KEYBINDING_NAME_MIGRATIONS` (`core/keybindings.ts:209-269`) carries no entry that renames
+    /// into this family either.
+    ///
+    /// **Six ids upstream defines are deliberately not resolved here.**
+    /// `tui.altScreen.lineUp`/`lineDown` (`keybindings.ts:176-183`) and the four
+    /// `tui.altScreen.search*` ids (`:192-207`) are outside ADR-0005 §Decision C's eight, and
+    /// transcript search is not among §Decision B's work units at all — see `altscreen/scroll.rs`,
+    /// where the unported search leaves upstream's `activeSearch` permanently unset. Returning
+    /// `None` keeps them out of the user's keybindings surface rather than offering a binding whose
+    /// handler does not exist; [`merge_entries`] then skips the entry, which is pi's own
+    /// `if (!(keybinding in this.definitions)) continue;` (`keybindings.ts:172-179`).
+    pub fn from_id(id: &str) -> Option<AltScreenAction> {
+        match id {
+            "tui.altScreen.pageUp" => Some(AltScreenAction::PageUp),
+            "tui.altScreen.pageDown" => Some(AltScreenAction::PageDown),
+            "tui.altScreen.halfPageUp" => Some(AltScreenAction::HalfPageUp),
+            "tui.altScreen.halfPageDown" => Some(AltScreenAction::HalfPageDown),
+            "tui.altScreen.previousPrompt" => Some(AltScreenAction::PreviousPrompt),
+            "tui.altScreen.nextPrompt" => Some(AltScreenAction::NextPrompt),
+            "tui.altScreen.top" => Some(AltScreenAction::Top),
+            "tui.altScreen.bottom" => Some(AltScreenAction::Bottom),
+            _ => None,
+        }
+    }
+}
+
+/// The configurable alternate-screen viewport binding table (ADR-0005 §Decision C, work unit B-9).
+/// Defaults are pi's verbatim (`packages/tui/src/keybindings.ts:159-209` @v0.84.3); multiple keys
+/// may bind one action, first match wins.
+///
+/// **Every method that resolves an event takes the render mode**, or is documented as the
+/// unconditional form the mode-aware one is built from — see [`Self::action_in_mode`]. That is the
+/// shadowing rule of `keybindings.ts:159`, and it is the reason this table can bind `pageUp`,
+/// `pageDown`, `home` and `end` without disturbing the inline renderer, which resolves those same
+/// four chords through [`Keymap`] and [`EditorKeymap`] exactly as it did before ADR-0005.
+#[derive(Clone, Debug)]
+pub struct AltScreenKeymap {
+    bindings: Vec<(Key, AltScreenAction)>,
+}
+
+impl Default for AltScreenKeymap {
+    /// Upstream's defaults, in upstream's declaration order — which is also the order
+    /// `handleViewportInput` tests them in (`tui-alt-screen.ts:601-644`), so
+    /// [`Self::action_for`]'s first-match-wins resolution answers what pi's `if` chain answers even
+    /// if a user binds one chord to two of these ids.
+    ///
+    /// [`AltScreenAction::HalfPageUp`] and [`AltScreenAction::HalfPageDown`] are absent on purpose:
+    /// upstream declares them `defaultKeys: []` (`keybindings.ts:168-175`), so they are bindable and
+    /// deliberately unbound — the same treatment [`Keymap::default`] gives `app.session.new` and
+    /// its three siblings. [`Self::keys_label`] returning `None` for them is pi's
+    /// `keys.length === 0`.
+    ///
+    /// `previousPrompt`/`nextPrompt` carry **two** chords each. ADR-0005 §Decision C's table records
+    /// the single `ctrl+shift+up` / `ctrl+shift+down` of @v0.84.1; the bare `ctrl+up` / `ctrl+down`
+    /// joined those key sets by @v0.84.3 (`keybindings.ts:184-191`), which is the tree this port
+    /// reads. Version lag in the table, not a divergence here — the same call
+    /// [`EditorKeymap::default`] makes for `ctrl+home`/`ctrl+end`. Neither chord is bound by any
+    /// other cyrup map, so nothing is taken away from the editor to add them.
+    fn default() -> Self {
+        use AltScreenAction as A;
+        let ctrl_shift = |code: KeyCode| Key {
+            code,
+            mods: KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        };
+        let ctrl_code = |code: KeyCode| Key { code, mods: KeyModifiers::CONTROL };
+        AltScreenKeymap {
+            bindings: vec![
+                (Key::plain(KeyCode::PageUp), A::PageUp),
+                (Key::plain(KeyCode::PageDown), A::PageDown),
+                (ctrl_shift(KeyCode::Up), A::PreviousPrompt),
+                (ctrl_code(KeyCode::Up), A::PreviousPrompt),
+                (ctrl_shift(KeyCode::Down), A::NextPrompt),
+                (ctrl_code(KeyCode::Down), A::NextPrompt),
+                (Key::plain(KeyCode::Home), A::Top),
+                (Key::plain(KeyCode::End), A::Bottom),
+            ],
+        }
+    }
+}
+
+impl AltScreenKeymap {
+    /// Resolve the viewport action for an event **unconditionally**, ignoring which renderer is
+    /// live (R-10-018).
+    ///
+    /// This is the raw table lookup. Anything routing real input wants
+    /// [`Self::action_in_mode`] instead: calling this from the inline renderer would give
+    /// `pageUp`, `pageDown`, `home` and `end` a second meaning there, which is precisely what
+    /// ADR-0005 §Decision B forbids. Kept public because a keybindings *surface* — a `/hotkeys`
+    /// row, a conflict report — asks "what does this chord mean in fullscreen?" with no live
+    /// renderer to ask about.
+    pub fn action_for(&self, ev: &KeyEvent) -> Option<AltScreenAction> {
+        self.bindings.iter().find_map(|(key, action)| key.matches(ev).then_some(*action))
+    }
+
+    /// Resolve the viewport action for an event **only while the fullscreen renderer is live** —
+    /// the mode half of the shadowing rule (`keybindings.ts:159`, ADR-0005 §Decision C rule i).
+    ///
+    /// Under [`TuiRenderMode::Regular`] this answers `None` for every event, including the four
+    /// chords the table binds, so an inline session's `pageUp` still reaches
+    /// [`EditorAction::PageUp`] and [`Action::PageUp`], and its `home`/`end` still reach
+    /// [`EditorAction::CursorLineStart`]/[`EditorAction::CursorLineEnd`]. Under
+    /// [`TuiRenderMode::Fullscreen`] it is [`Self::action_for`], and the alternate screen's
+    /// dispatcher resolves it ahead of the editor — which is where upstream's precedence comes
+    /// from, since it registers the viewport handler as an input listener that runs before the
+    /// focused component (`tui-alt-screen.ts:227`, `tui.ts:834-848` against `tui.ts:892-897`).
+    ///
+    /// The mode is a parameter rather than a field because it is not the table's property: one
+    /// keymap outlives any number of ADR-0005 §B-14 mode switches.
+    pub fn action_in_mode(&self, ev: &KeyEvent, mode: TuiRenderMode) -> Option<AltScreenAction> {
+        match mode {
+            TuiRenderMode::Regular => None,
+            TuiRenderMode::Fullscreen => self.action_for(ev),
+        }
+    }
+
+    /// **All** keys bound to `action`, joined with `/` — pi's `keyText`
+    /// (`keybinding-hints.ts:29-36`). `None` when the action is unbound, which is upstream's
+    /// `keys.length === 0` → `""`.
+    ///
+    /// This is what puts [`AltScreenAction::HalfPageUp`] and [`AltScreenAction::HalfPageDown`] in
+    /// a user-facing bindings list *as unbound*: [`AltScreenAction::ALL`] enumerates them,
+    /// [`AltScreenAction::id`] and [`AltScreenAction::description`] name them, and this answers
+    /// `None` for their keys until someone binds them (ADR-0005 §Decision C rule ii).
+    pub fn keys_label(&self, action: AltScreenAction) -> Option<String> {
+        join_key_labels(self.bindings.iter().filter(|(_, a)| *a == action).map(|(k, _)| k))
+    }
+
+    /// Rebind `action` to exactly `keys`.
+    pub fn set_action(&mut self, action: AltScreenAction, keys: Vec<Key>) {
+        self.bindings.retain(|(_, a)| *a != action);
+        for key in keys {
+            self.bindings.push((key, action));
+        }
+    }
+
+    /// Merge a JSON keybindings document, applying only the eight `tui.altScreen.*` ids (ADR-0005
+    /// §Decision C). Ids belonging to the other maps — and the six upstream ids
+    /// [`AltScreenAction::from_id`] deliberately does not resolve — are ignored here, and only an
+    /// unparseable or non-object DOCUMENT is an error (CFG-038; see [`merge_entries`]).
+    pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
+        merge_entries(json, AltScreenAction::from_id, |action, keys| {
+            self.set_action(action, keys)
+        })
     }
 }

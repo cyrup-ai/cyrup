@@ -19,6 +19,12 @@ impl<B: Backend> App<B> {
         Ok(App {
             terminal,
             state,
+            // ADR-0005 §B-14 — `None` IS regular mode. `App::new` is the inline renderer's
+            // constructor and stays exactly that: the alternate screen is only ever installed by
+            // `App::switch_tui_mode` (`app/mode_switch.rs`), so a session that never switches
+            // behaves as it did before ADR-0005 in the strongest available sense.
+            altscreen: None,
+            alt_keymap: AltScreenKeymap::default(),
             viewport_height: 0,
             live_floor: 0,
             tree_nav_tx: None,
@@ -473,4 +479,49 @@ impl<B: Backend> App<B> {
         Some(title)
     }
 
+}
+
+/// The inline renderer's half of the ADR-0005 §B-2 renderer seam
+/// ([`crate::ViewportRenderer`], pi `tui.ts:322-330`).
+///
+/// Four of the five operations are no-ops, and that is upstream's shape rather than a shortcut:
+/// `TuiMainScreen` implements `TUI` and NOT `ViewportTUI` (`tui-main-screen.ts:123`), so it has no
+/// `setLayoutRoot`; it does not scroll, because the terminal's native scrollback holds the history
+/// (R-ARCH-TUI-003 — the same reason [`App::draw`] flushes committed entries with
+/// `Terminal::insert_before` instead of retaining them); and it has a status line, so it does not
+/// flash. **Nothing about the inline renderer's behaviour changes by implementing this** — the
+/// trait is purely additive, and [`App::new`] above stays the one construction path.
+impl<B: Backend> crate::altscreen::ViewportRenderer for App<B> {
+    /// Always [`crate::TuiRenderMode::Regular`] — pi's `TuiMainScreen` fixes
+    /// `readonly mode = "regular"` on the class too (`tui-main-screen.ts:124`). `App` is the inline
+    /// renderer; entering fullscreen swaps in the alternate-screen renderer rather than mutating
+    /// this one (ADR-0005 §B-14), so there is no state for this to read.
+    fn mode(&self) -> crate::altscreen::TuiRenderMode {
+        crate::altscreen::TuiRenderMode::Regular
+    }
+
+    /// No-op: the inline layout is fixed by [`crate::render`], which composes the active region, the
+    /// status band, the editor/selector slot and the footer out of [`AppState`]. There is no
+    /// upstream counterpart to install — `TuiMainScreen` has no `setLayoutRoot`
+    /// (`tui-main-screen.ts:123`).
+    fn set_layout_root(&mut self, _root: Option<Box<dyn Component>>) {}
+
+    /// No-op: native scrollback scrolls, not the viewport (R-ARCH-TUI-003).
+    ///
+    /// This is deliberately NOT routed to the active region's `PageUp`/`PageDown`. That surface is
+    /// [`crate::TranscriptView`]'s own scroll offset over the LIVE region only, reached through the
+    /// editor keymap; moving it from here would scroll a different thing than the one pi's
+    /// `tui.altScreen.*` bindings name (`keybindings.ts:159-183`, ADR-0005 §B-9).
+    fn scroll_by(&mut self, _lines: i32) {}
+
+    /// No-op — see [`crate::ViewportRenderer::scroll_by`].
+    fn scroll_to_top(&mut self) {}
+
+    /// No-op — see [`crate::ViewportRenderer::scroll_by`].
+    fn scroll_to_bottom(&mut self) {}
+
+    /// No-op: inline, transient notices already go to the status line, which is why pi's `/copy`
+    /// keeps its `showStatus` branch for the main screen and flashes only when
+    /// `this.ui instanceof TuiAltScreen` (`interactive-mode.ts:6107-6112`, ADR-0005 §B-11).
+    fn flash(&mut self, _message: &str, _duration: Option<Duration>) {}
 }

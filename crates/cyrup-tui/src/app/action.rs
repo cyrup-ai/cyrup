@@ -15,6 +15,13 @@ pub enum AppAction {
     /// interactive-mode.ts:3587-3594,3852-3871). Needs the live session (async queue read/clear), so
     /// like [`Self::FollowUp`] it rides an `AppAction` the run loop resolves.
     Dequeue,
+    /// A fullscreen text selection was completed and must be written to the system clipboard —
+    /// pi's `copySelectionToClipboard` tail (`tui-alt-screen.ts:1113-1117`), ADR-0005 §B-8.
+    ///
+    /// It rides an `AppAction` for the same reason [`Self::FollowUp`] and [`Self::Dequeue`] do:
+    /// [`crate::clipboard::copy_to_clipboard`] is `async` and `App::handle_input` is not. The run
+    /// loop performs the write and flashes `Copied!` or `Copy failed` on the result (§B-11).
+    CopySelection(String),
     /// The user requested an abort/interrupt of the in-flight run (Esc).
     Interrupt,
     /// Esc pressed **while a turn is streaming** (Pi `defaultEditor.onEscape` first branch,

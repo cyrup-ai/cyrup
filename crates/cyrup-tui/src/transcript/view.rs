@@ -108,12 +108,109 @@ impl TranscriptView {
     }
 
 
-    /// Take every committed entry, leaving the pending buffer empty. The shell renders the returned
-    /// entries into native scrollback exactly once (R-ARCH-TUI-003), so they are not shown again in
-    /// the inline viewport.
+    /// Take every committed entry, leaving the pending buffer empty — and, when retention is on,
+    /// ALSO keep a clone of each in the retained document (ADR-0005 §Decision B-1).
+    ///
+    /// The returned `Vec` is identical in both modes. The **inline** renderer spends it by rendering
+    /// those entries into native scrollback exactly once (R-ARCH-TUI-003), which is why they are not
+    /// shown again in the inline viewport. That is how the inline renderer disposes of a drain — it
+    /// is not a property of the transcript and not a limit on the crate: with
+    /// [`Self::set_retain_document`] on, the same entries stay in [`Self::document()`], which is
+    /// what the **alternate-screen** renderer scrolls. Upstream keeps its message components alive
+    /// in `chatContainer` in both modes and simply wraps `documentContainer` in a `ScrollView`
+    /// (`interactive-mode.ts:918`, mounted as the fullscreen layout root at `:933-936` @v0.84.3),
+    /// so it needs no such flag.
+    ///
+    /// With retention OFF — the default, and every regular-mode session — this is the pre-ADR body
+    /// exactly: the same `|=` onto `chat_flushed`, the same single `std::mem::take`, the same return
+    /// value, with one `bool` test added in front of the new branch. Retention is also the only
+    /// place the document grows, so [`MAX_RETAINED_ENTRIES`] is enforced here (via
+    /// [`Self::trim_document`]) and nowhere else.
     pub fn drain_committed(&mut self) -> Vec<Entry> {
         self.chat_flushed |= !self.pending.is_empty();
-        std::mem::take(&mut self.pending)
+        let committed = std::mem::take(&mut self.pending);
+        if self.retain_document {
+            self.document.extend_from_slice(&committed);
+            self.trim_document();
+        }
+        committed
+    }
+
+    /// Enforce [`MAX_RETAINED_ENTRIES`] on the retained document, dropping the OLDEST entries first
+    /// and adding however many it dropped to [`Self::retained_dropped()`] — ADR-0005 §Decision B-1.
+    ///
+    /// Called only from [`Self::drain_committed`], the document's only growth point, so the bound
+    /// cannot be exceeded between frames. There is no pi counterpart: `chatContainer` lives for the
+    /// process, so upstream never trims — see [`MAX_RETAINED_ENTRIES`] for why cyrup must.
+    fn trim_document(&mut self) {
+        let excess = self.document.len().saturating_sub(MAX_RETAINED_ENTRIES);
+        if excess == 0 {
+            return;
+        }
+        self.document.drain(..excess);
+        self.retained_dropped = self
+            .retained_dropped
+            .saturating_add(u64::try_from(excess).unwrap_or(u64::MAX));
+    }
+
+    /// The retained document: every committed [`Entry`] drained while retention was on, in commit
+    /// order, front-trimmed to [`MAX_RETAINED_ENTRIES`] (ADR-0005 §Decision B-1).
+    ///
+    /// cyrup's stand-in for the `documentContainer` pi's alt screen wraps in a `ScrollView`
+    /// (`interactive-mode.ts:918`, `:933-936` @v0.84.3). Empty in every regular-mode session, and
+    /// the inline path must not read it — the inline renderer consumes the `Vec`
+    /// [`Self::drain_committed`] returns and flushes that to native scrollback (R-ARCH-TUI-003),
+    /// which this accessor does not change.
+    pub fn document(&self) -> &[Entry] {
+        &self.document
+    }
+
+    /// Turn retention on or off — ADR-0005 §Decision B-1. `false` is the default and the inline
+    /// mode's behaviour; `true` is what gives the alternate-screen renderer something to scroll.
+    ///
+    /// **Set once, at the composition root, for the session's life** (the `retain_document` field's
+    /// documentation states the rule and why). Because cyrup's flag is a filter over drains and
+    /// upstream's `chatContainer` is not, turning retention OFF and back ON would splice two
+    /// non-adjacent runs of history together with no gap marker and no
+    /// [`Self::retained_dropped()`] movement, silently invalidating every row index a renderer
+    /// holds. ADR-0005 §B-14's live mode switch therefore leaves this flag alone.
+    ///
+    /// Deliberately does NOT bump the render generation: the cache this crate keys on that counter
+    /// materialises the ACTIVE region (`lines()`), and retention changes nothing a live frame paints.
+    pub fn set_retain_document(&mut self, retain: bool) {
+        self.retain_document = retain;
+    }
+
+    /// Whether drains are retained in [`Self::document()`] (ADR-0005 §Decision B-1).
+    pub fn retain_document(&self) -> bool {
+        self.retain_document
+    }
+
+    /// How many entries have been removed from the FRONT of [`Self::document()`] over the session's
+    /// life, by the [`MAX_RETAINED_ENTRIES`] bound or by [`Self::clear_document`] — monotonic, never
+    /// reset (ADR-0005 §Decision B-1).
+    ///
+    /// A renderer records the value it last rebuilt its rows against and shifts its scroll position
+    /// by the delta, so a trim scrolls history off the top instead of silently re-aiming the
+    /// viewport at unrelated rows. Upstream has no counterpart because it never drops.
+    pub fn retained_dropped(&self) -> u64 {
+        self.retained_dropped
+    }
+
+    /// Drop the retained document — the counterpart of upstream clearing `chatContainer`.
+    ///
+    /// **Bumps [`Self::retained_dropped()`] by the number of entries removed**, because that counter
+    /// is the ONLY signal a renderer has that its cached row offsets moved (ADR-0005 §Decision B-1).
+    /// A clear that left it untouched would leave a renderer's recorded value equal, its row rebuild
+    /// shifting by zero, and its scroll position pointing into an emptied document — the exact
+    /// silent mis-scroll the counter exists to prevent. The counter therefore means "entries removed
+    /// from the front over the session's life", not "entries the bound evicted".
+    pub fn clear_document(&mut self) {
+        let dropped = self.document.len();
+        self.document.clear();
+        self.retained_dropped = self
+            .retained_dropped
+            .saturating_add(u64::try_from(dropped).unwrap_or(u64::MAX));
     }
 
     /// `this.chatContainer.children.length > 0` (`interactive-mode.ts:3500`).

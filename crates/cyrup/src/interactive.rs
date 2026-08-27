@@ -166,6 +166,11 @@ pub async fn run_interactive(
     // Pi `InteractiveModeOptions.migratedProviders` (interactive-mode.ts:308), threaded from
     // `runMigrations` through `main.ts:607`. CFG-051.
     migrated_providers: Vec<String>,
+    // `--tui-mode` (pi `cli/args.ts:180-193`, threaded to the composition root at `main.ts:935`
+    // and read at `interactive-mode.ts:345-352`). `None` when the flag was omitted, in which case
+    // the `tuiMode` SETTING decides — the precedence ADR-0005 §B-14 fixes and `cli/enums.rs`
+    // documents: the flag wins when given, else the setting, else `regular`.
+    tui_mode: Option<cyrup_config::settings::TuiMode>,
 ) -> anyhow::Result<()> {
     // Boot the render theme from `settings.theme` + the terminal background/color-depth (feature #4:
     // the `ThemeController`), instead of the hardwired dark boot the audit flagged (theme.rs #4). An
@@ -174,6 +179,40 @@ pub async fn run_interactive(
     let theme_setting = session.services().settings.effective().theme_setting();
     let mut controller = ThemeController::boot_from_env(theme_setting.as_deref());
     let mut app = App::into_stdout(controller.theme()).context("initialising the terminal UI")?;
+
+    // ADR-0005 §B-14 — select the renderer before anything paints. The flag wins when supplied,
+    // otherwise the `tuiMode` setting (§A-3), otherwise `regular`. `switch_tui_mode` is a no-op
+    // returning `Unchanged` for `Regular`, so the common path costs one comparison.
+    //
+    // A refusal is NOT fatal: `ModeSwitch::RendererUnavailable` means the alternate screen could
+    // not be entered (a terminal that rejected the escape, a backend rebuild that failed), and the
+    // session continues inline rather than dying — upstream's own posture, and the reason
+    // `install_renderer` returns a bool rather than propagating.
+    let effective_tui_mode = tui_mode
+        .unwrap_or_else(|| session.services().settings.effective().tui_mode());
+    if effective_tui_mode == cyrup_config::settings::TuiMode::Fullscreen {
+        let outcome = app.switch_tui_mode(
+            cyrup_tui::TuiRenderMode::Fullscreen,
+            cyrup_tui::ModeSwitchOptions::default(),
+        );
+        if let Some(status) = outcome.refusal_status() {
+            tracing::warn!(target: "cyrup::tui", "--tui-mode fullscreen declined: {status}");
+        }
+        // ADR-0005 §A-3 → §B-5. Applied only once the renderer is live, and only in fullscreen:
+        // pi documents the `/settings` row as having "no effect in regular mode", and the setter is
+        // a no-op inline for the same reason.
+        app.set_fullscreen_scrollbar(
+            match session.services().settings.effective().fullscreen_scrollbar() {
+                cyrup_config::settings::FullscreenScrollbar::Always => {
+                    cyrup_tui::ScrollbarMode::Always
+                }
+                cyrup_config::settings::FullscreenScrollbar::Hidden => {
+                    cyrup_tui::ScrollbarMode::Hidden
+                }
+                cyrup_config::settings::FullscreenScrollbar::Auto => cyrup_tui::ScrollbarMode::Auto,
+            },
+        );
+    }
     // TUI-004: now that `into_stdout` has raw mode on — and BEFORE `crossterm_input_stream` spawns
     // the reader thread that would race us for the reply bytes — complete Pi's boot detection by
     // actually ASKING the terminal (OSC 11, and DSR `?996` for an `auto` setting) instead of

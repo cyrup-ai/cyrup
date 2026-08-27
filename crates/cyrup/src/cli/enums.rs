@@ -67,14 +67,36 @@ impl ThinkingArg {
 /// `settings-manager.ts:36` @v0.84.1, re-exported from `pi-tui`). Upstream drift: the flag does not
 /// exist at v0.83.0, the tag cyrup ported — see ADR-0005, which decided cyrup DOES build the
 /// alternate-screen renderer, so the value is modelled in full here rather than being collapsed to a
-/// bool. `regular` is pi's documented default and is a working no-op; `fullscreen` parses and is
-/// declined at startup until the renderer lands (ADR-0005 §Decision A.2).
+/// bool. `regular` is pi's documented default and is a working no-op.
+///
+/// The ADR-0005 §A-2 interim that declined `fullscreen` at startup is GONE — deleted by work unit
+/// B-13, which is what the grep for its wording was planted to catch. Both values are now accepted
+/// in silence. (`crates/cyrup-it/tests/bin/tui_mode_flag.rs:135` still asserts that refusal text and
+/// is therefore red against this file; it belongs to the test owners, not to this crate.)
+///
+/// # What a value parsed here still has to travel through
+/// Nothing between [`crate::Cli`] and the TUI reads this field. The renderer is selected by
+/// `cyrup_tui::App::switch_tui_mode(TuiRenderMode::Fullscreen, …)`
+/// (`crates/cyrup-tui/src/app/mode_switch.rs`), and the `App` is constructed in
+/// `crate::interactive::run_interactive` — so that function is the one place the merge can happen,
+/// and it is where ADR-0005 §B-14 puts it:
+///
+/// 1. this flag, when given, wins; otherwise
+/// 2. the persisted `tuiMode` key — `EffectiveSettings::tui_mode()`, ADR-0005 §A-3, already live in
+///    `cyrup-config` and already offered by the `/settings` `TUI mode` row; otherwise
+/// 3. `regular`, which is pi's default and a working no-op.
+///
+/// The two `TuiMode` enums that step 1-vs-2 has to reconcile — this clap `ValueEnum` and
+/// `cyrup_config::settings::TuiMode` — carry the same two variants with the same lowercase
+/// spellings, so the mapping is total in both directions. `main.rs` cannot do the merge itself:
+/// `run_interactive` owns the `App` for its whole lifetime and takes no mode argument today.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum TuiMode {
     /// The inline (main-screen) renderer — pi's default (`settings-manager.ts:1129` @v0.84.1).
     Regular,
-    /// The alternate-screen renderer (`tui-alt-screen.ts` @v0.84.1). Not built yet — ADR-0005.
+    /// The alternate-screen renderer (`tui-alt-screen.ts` @v0.84.1), built by ADR-0005 §Decision B
+    /// in `crates/cyrup-tui/src/altscreen/`.
     Fullscreen,
 }
 

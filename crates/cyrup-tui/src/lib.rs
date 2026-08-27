@@ -23,6 +23,11 @@
 //! - [`UiTheme`] projects `cyrup-resources` themes (`ResolvedTheme`/`ThemeData`/`builtin_themes`)
 //!   onto `ratatui` colors, with a hot-reload hook ([`UiTheme::from_theme_data`]).
 //! - [`Keymap`]/[`Action`] resolve global keys (no hardcoded checks, R-10-018).
+//! - [`ViewportRenderer`] is the renderer seam (ADR-0005 §B-2, pi `tui.ts:322-330`): the inline
+//!   [`App`] satisfies it with four no-ops, and `altscreen/`'s [`AltScreen`] is the second
+//!   implementation. It does NOT make the app swappable behind a `dyn` pointer — see the
+//!   trait's own scope note. [`App::switch_tui_mode`] is what installs and removes the alternate
+//!   screen; [`App`] holds it as an `Option`, and `None` is regular mode.
 //!
 //! # Built in-crate (no longer deferred)
 //! Streaming assistant delta text is **live**: `cyrup-provider` is a direct dependency and
@@ -44,6 +49,7 @@
 // `strip_prefix`/`split_at_checked` instead. Test modules opt out alongside the other four.
 #![deny(clippy::string_slice)]
 
+mod altscreen;
 mod ansi;
 mod app;
 mod auth_select;
@@ -104,12 +110,13 @@ mod user_message_selector;
 #[cfg(test)]
 mod tests;
 
+pub use altscreen::{AltScreen, PointerOutcome, ScrollbarMode, TuiRenderMode, ViewportRenderer};
 pub use app::{
     crossterm_input_stream, extension_render, gist_id_from_url, reanchor_inline_region, render,
     share_viewer_url, share_viewer_url_from, should_honor_extension_shutdown, tree_node_from_dag,
     App, AppAction, AppCommand, AppState, CompactionQueued, ExtensionWidget, InlineBackend,
-    LifecycleEffects, LifecycleOutcome, LoginProviderSource, QueueDrain, QueueDrainReason,
-    RebuildBackend, TreeNavMsg,
+    LifecycleEffects, LifecycleOutcome, LoginProviderSource, MainScreenRenderState, ModeSwitch,
+    ModeSwitchOptions, QueueDrain, QueueDrainReason, RebuildBackend, TreeNavMsg,
 };
 pub use auth_select::{
     format_auth_selector_provider_type, format_status_indicator, login_selector_rows,
@@ -160,9 +167,9 @@ pub use keyboard_protocol::{
     KITTY_FLAGS_QUERY, MODIFY_OTHER_KEYS_DISABLE, MODIFY_OTHER_KEYS_ENABLE, NEGOTIATION_TIMEOUT,
 };
 pub use keymap::{
-    Action, AutocompleteAction, AutocompleteKeymap, EditorAction, EditorKeymap, Key,
-    KeybindingIssue, Keymap, ModelsAction, ModelsKeymap, SelectAction, SelectKeymap, SessionAction,
-    SessionKeymap, TreeAction, TreeKeymap,
+    Action, AltScreenAction, AltScreenKeymap, AutocompleteAction, AutocompleteKeymap, EditorAction,
+    EditorKeymap, Key, KeybindingIssue, Keymap, ModelsAction, ModelsKeymap, SelectAction,
+    SelectKeymap, SessionAction, SessionKeymap, TreeAction, TreeKeymap,
 };
 pub use login_dialog::{
     notify_auth_dialog, show_auth_prompt, LoginDialog, LoginFinished, LoginLineKind, LoginUiMsg,

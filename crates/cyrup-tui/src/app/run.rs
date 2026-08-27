@@ -248,6 +248,25 @@ impl App<InlineBackend<Stdout>> {
                     None => std::future::pending().await,
                 }
             };
+            // ADR-0005 §B-14 — the alternate screen's three deadlines folded into one
+            // (`altscreen/timers.rs`): a flash's expiry, an `auto` scrollbar's fade, and a
+            // selection drag held motionless against the viewport edge. cyrup has no per-component
+            // scheduler and exactly one place that may sleep, so upstream's three
+            // `setTimeout`/`setInterval` sites (`components/alt-screen-flash.ts:24-33`,
+            // `components/scroll-view.ts:98-103`, `tui-alt-screen.ts:949-951`) all arrive here.
+            //
+            // Read into a `Copy` value BEFORE the `select!` so the borrow of `self` ends: `None` —
+            // regular mode, or a fullscreen screen with nothing armed — is the `pending()` arm
+            // every optional arm above already uses, so an idle alternate screen costs no wakeups.
+            let alt_deadline = self.altscreen.as_ref().and_then(|alt| alt.next_deadline());
+            let alt_timer = async move {
+                match alt_deadline {
+                    Some(at) => {
+                        tokio::time::sleep_until(tokio::time::Instant::from_std(at)).await;
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
                 // REQUIRED, not a micro-optimisation — the same statement `cyrup-tools/src/lock.rs:
                 // 178` makes for its own cancel race, and the shape every `select!` in
@@ -329,6 +348,12 @@ impl App<InlineBackend<Stdout>> {
                 _ = git_branch_poll.tick(), if self.state.git_branch.in_repo() => {
                     self.on_git_branch_poll()?
                 }
+                // ADR-0005 §B-14. Below the input arm and the rebind arm like every other ticker,
+                // and safe there for the same reason: `alt_deadline` is `None` — a future that
+                // never resolves — whenever nothing is armed, and each of the three deadlines
+                // behind it either disarms itself on the clock or is retired by the frame this arm
+                // provokes. It can therefore never be ready on every poll and can starve nothing.
+                () = alt_timer => self.on_altscreen_tick()?,
                 Some(msg) = bash_next => self.on_bash_msg(&mut ctx, msg)?,
                 () = overlay_ticked, if !self.state.overlays.is_empty() => self.on_overlay_ticked()?,
                 Some(req) = overlay_rx.recv() => self.on_overlay_request(&mut ctx, req)?,
@@ -365,11 +390,53 @@ impl App<InlineBackend<Stdout>> {
                 break;
             }
         }
+        // ADR-0005 §B-14 — leave the alternate screen BEFORE the terminal is restored, and before
+        // the drain below. pi's `shutdown()` runs `this.ui.stop()` on whichever renderer is live
+        // (`interactive-mode.ts:3591`); here the alternate screen would otherwise stand until `App`
+        // itself is dropped, which is after `drain_and_restore` has already put the terminal back —
+        // so its `TerminalSetup::Drop` would emit `LeaveAlternateScreen` onto a terminal the app no
+        // longer owns, and the user's shell would appear inside a screen that then vanished.
+        //
+        // The frame afterwards is what re-establishes the inline viewport at the bottom of the
+        // restored main screen, exactly as the first frame of any session does; `?` is deliberately
+        // not used, because a cosmetic failure here must not swallow `drain_and_restore`.
+        if self.stop_fullscreen() {
+            let _ = self.draw_synchronized();
+        }
         // pi `interactive-mode.ts:3589-3591`: drain, THEN stop. The drain MUST happen here, before
         // this function's own restore, not at the caller — `run` disables raw mode on the way out,
         // so a drain after it returns is a guaranteed no-op on the exact path it exists for, and
         // whatever is still queued (a late Kitty key-release report, or the Ctrl+D that asked for
         // this quit) has already been handed to the parent shell.
         self.drain_and_restore()
+    }
+
+    /// The alternate screen's timer arm — ADR-0005 §B-14, over `altscreen/timers.rs`.
+    ///
+    /// Runs whatever [`crate::AltScreen::next_deadline`] woke us for and repaints only when the
+    /// tick says the frame is now stale, which is the same "a no-op edge costs no draw" rule the
+    /// git-branch poll and the overlay tick above already follow. The repaint is not optional when
+    /// it *is* stale: an expired flash is still in the queue and still painted, and it is
+    /// `flash::overlay` on the next frame that retires it — ignore the `true` and
+    /// `next_deadline` keeps handing back the same elapsed instant for ever.
+    ///
+    /// Safe to reach with no alternate screen live (a switch back to regular between the deadline
+    /// being read and this arm firing): it answers `false` and draws nothing.
+    pub(crate) fn on_altscreen_tick(&mut self) -> Result<(), TuiError> {
+        let _arm = ArmGuard::enter("altscreen_timer");
+        let stale = match self.altscreen.as_mut() {
+            Some(alt) => {
+                // The WHOLE frame, as `handle_mouse` takes it — `timers::tick` derives the
+                // document viewport from it with `scroll::content_width` itself, so the rows the
+                // auto-scroll re-resolves the pointer over are the rows the user can see.
+                let area = alt.area();
+                alt.tick(area)
+            }
+            None => false,
+        };
+        if stale {
+            self.draw_synchronized()?;
+        }
+        Ok(())
     }
 }
