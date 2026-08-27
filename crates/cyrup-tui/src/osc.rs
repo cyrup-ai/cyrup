@@ -48,7 +48,7 @@
 //! conservative of the two, because it does not depend on the terminal keeping hyperlink state
 //! across the intervening `MoveTo`.
 
-use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use ratatui::style::{Modifier, Style};
 use std::cell::RefCell;
 use std::num::NonZeroU16;
@@ -64,11 +64,24 @@ const MAX_ID: u16 = 127;
 /// This is the cheapest defence: a build break rather than a visual one.
 const _: () = assert!(Modifier::all().bits() & LINK_MASK == 0);
 
-/// One cell wide regardless of how many bytes of escape the symbol carries.
-const UNIT_WIDTH: CellDiffOption = match NonZeroU16::new(1) {
-    Some(w) => CellDiffOption::ForcedWidth(w),
-    None => CellDiffOption::None,
-};
+/// The column count a cell keeps once its symbol carries an OSC-8 escape.
+///
+/// OSC-8 is zero-column, so the answer is always the width the cell had *before* [`inject`] touched
+/// it — one for ASCII, two for a CJK ideograph or an emoji. `diff_iter` treats `ForcedWidth(w)` as
+/// "this cell owns `w` slots" (`ratatui-core-0.1.2/src/buffer/diff.rs:133-141`), which is exactly
+/// the advance the un-forced path gives a wide grapheme (`diff.rs:172-173`), so forcing the true
+/// width makes a linked run diff identically to an unlinked one.
+///
+/// Read through [`CellWidth::cell_width`] on the **cell**, never on `cell.symbol()`: `Cell` returns
+/// an already-set `ForcedWidth` verbatim (`ratatui-core-0.1.2/src/buffer/cell.rs:309-318`), so on
+/// the tail of a one-cell run — where the head branch has already prepended the escape — this
+/// yields the head's forced width instead of re-measuring ~28 columns of escape text.
+///
+/// Width `0` (a zero-width symbol) maps to `1`, which is the advance `diff_iter` already gives such
+/// a cell on the `CellDiffOption::None` path (`diff.rs:149-153`); `ForcedWidth` cannot hold `0`.
+fn forced_width(cell: &Cell) -> CellDiffOption {
+    CellDiffOption::ForcedWidth(NonZeroU16::new(cell.cell_width()).unwrap_or(NonZeroU16::MIN))
+}
 
 /// The hrefs registered during one render pass, in assignment order. Held behind a `RefCell` so it
 /// can ride on the `Copy` per-paint bag ([`crate::transcript::ImageOpts`]) instead of threading an
@@ -158,12 +171,14 @@ pub(crate) fn inject(buf: &mut Buffer, sink: &LinkSink) {
         // Head first, then tail — a one-cell run is `start == end`, and doing it in this order
         // leaves that single cell holding `open + symbol + CLOSE`.
         if let Some(cell) = buf.content.get_mut(start) {
+            let width = forced_width(cell);
             let symbol = format!("{}{}", open(&url), cell.symbol());
-            cell.set_symbol(&symbol).set_diff_option(UNIT_WIDTH);
+            cell.set_symbol(&symbol).set_diff_option(width);
         }
         if let Some(cell) = buf.content.get_mut(end) {
+            let width = forced_width(cell);
             let symbol = format!("{}{CLOSE}", cell.symbol());
-            cell.set_symbol(&symbol).set_diff_option(UNIT_WIDTH);
+            cell.set_symbol(&symbol).set_diff_option(width);
         }
     }
 }

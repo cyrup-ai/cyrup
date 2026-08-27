@@ -13,23 +13,21 @@
 //! module covers the interaction that file cannot see — a linked HEADER above a
 //! result BODY whose own OSC-8 payload was stripped.
 //!
-//! KNOWN LIMITATION, deliberately untested (see "Out of scope" in the brief):
-//! `inject` stamps `CellDiffOption::ForcedWidth(1)` (`osc.rs:68-71`) on the head
-//! and tail cells of every run. When that cell holds a WIDE grapheme — a CJK path
-//! component at a wrap boundary — the forced width understates the true column
-//! count by one, so `Buffer::diff_iter` (ratatui-core-0.1.2
-//! `buffer/diff.rs:133-140`) does not skip the grapheme's trailing continuation
-//! cell and that row's diff accounting is off by one column. The fix is to capture
-//! `cell.symbol().cell_width()` (trait `ratatui::buffer::CellWidth`,
-//! `buffer/cell_width.rs:19-24`) BEFORE prepending the escape — `Cell::cell_width`
-//! returns the forced value once it is set (`buffer/cell.rs:309-317`) — and that
-//! is a change to `osc.rs`, which this task may not make.
+//! DIFF-CURSOR PARITY: `inject` forces a width on the head and tail cell of every
+//! run so `Buffer::diff_iter` does not count the escape's bytes as columns. That
+//! forced value must be the cell's REAL column count, not a hardcoded `1`, or a
+//! wide grapheme at a run boundary loses its continuation cell.
+//! `crate::osc::forced_width` reads it off the `Cell`, and clause 10
+//! (`a_wide_grapheme_at_a_run_boundary_keeps_its_true_column_count`) is the cover:
+//! it asserts per-column `cell_width()` parity between the linked and unlinked
+//! renders, because `paint`'s symbol stream cannot observe the cursor at all.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use crate::ansi::strip_ansi;
 use crate::transcript::*;
 use ratatui::backend::TestBackend;
+use ratatui::buffer::CellWidth;
 use ratatui::Terminal;
 use serde_json::json;
 
@@ -337,4 +335,95 @@ fn there_is_no_visible_url_fallback() {
         // The strongest form of the same claim: the gate adds bytes, never columns.
         assert_eq!(visible, plain, "`{tool}` moved a column when linked");
     }
+}
+
+/// Clause 10 — the diff cursor, not the byte stream. `inject` forces a width on the
+/// head and tail cell of every run so `Buffer::diff_iter` does not count the
+/// escape's bytes as columns (`ratatui-core-0.1.2/src/buffer/diff.rs:133-141`).
+/// When that cell holds a WIDE grapheme the forced value must be the grapheme's
+/// real column count, or the iterator stops skipping the grapheme's continuation
+/// cell and every later column on the row is one slot out of step.
+///
+/// `paint` cannot see this: on a first draw the continuation cell is `Cell::EMPTY`
+/// in both the previous and the next buffer, so it is never yielded whatever the
+/// forced width says. The assertion has to be on `cell_width()` itself, which
+/// survives into the `TestBackend` buffer because `<TestBackend as Backend>::draw`
+/// clones the whole `Cell` (`backend/test.rs:252-259`).
+#[test]
+fn a_wide_grapheme_at_a_run_boundary_keeps_its_true_column_count() {
+    /// Every cell of the linked render must occupy exactly as many diff slots as
+    /// the same cell of the unlinked render. This is "the gate adds bytes, never
+    /// columns" stated for the cursor.
+    fn assert_widths_match(path: &str, theme: &UiTheme, w: u16, h: u16) {
+        let mut v_on = view("read", json!({ "file_path": path }), true);
+        let mut on = Terminal::new(TestBackend::new(w, h)).unwrap();
+        on.draw(|f| v_on.render(f, f.area(), theme)).unwrap();
+
+        let mut v_off = view("read", json!({ "file_path": path }), false);
+        let mut off = Terminal::new(TestBackend::new(w, h)).unwrap();
+        off.draw(|f| v_off.render(f, f.area(), theme)).unwrap();
+
+        let linked = on.backend().buffer();
+        let plain = off.backend().buffer();
+        assert_eq!(linked.area, plain.area, "the gate changed the painted area");
+        let mut saw_wide = false;
+        for y in 0..linked.area.height {
+            for x in 0..linked.area.width {
+                let (Some(l), Some(p)) = (linked.cell((x, y)), plain.cell((x, y))) else {
+                    continue;
+                };
+                saw_wide |= p.cell_width() > 1;
+                assert_eq!(
+                    l.cell_width(),
+                    p.cell_width(),
+                    "column ({x},{y}) changed width when linked: {:?} vs {:?}",
+                    l.symbol(),
+                    p.symbol()
+                );
+            }
+        }
+        assert!(saw_wide, "fixture painted no wide grapheme — the test proves nothing");
+    }
+
+    let theme = UiTheme::dark();
+
+    // (a) TAIL-wide, no wrap. `apply_bg`'s right pad is unmarked, so the run ends on
+    //     the path's last grapheme — here a two-column katakana.
+    let tail = "/tmp/aug-osc/プロジェクト";
+    assert_widths_match(tail, &theme, 60, 12);
+
+    // The escape really is there, and the visible columns really are unmoved.
+    //
+    // A wide grapheme does NOT arrive as one span here: `Buffer::set_stringn` writes
+    // the symbol and then `reset()`s the continuation cell (`buffer/buffer.rs:363-366`),
+    // and `reset()` clears the modifier — so the continuation cell carries no link
+    // marker and `inject`'s run walk (`osc.rs:143-150`) breaks on it. Every wide
+    // grapheme is therefore its OWN run, and each one is a `start == end` run whose
+    // head and tail branches alias the same cell. That is precisely the case
+    // `forced_width` has to read off the `Cell` rather than off `cell.symbol()`, now
+    // exercised at width TWO: the tail branch must see the head's `ForcedWidth(2)`,
+    // not re-measure the ~40 columns of escape text the head just prepended.
+    let mut on = view("read", json!({ "file_path": tail }), true);
+    let mut off = view("read", json!({ "file_path": tail }), false);
+    let linked = paint(&mut on, &theme, 60, 12);
+    // `path_to_file_url` percent-encodes every non-ASCII byte (`path.rs:276-299`).
+    let href = "file:///tmp/aug-osc/%E3%83%97%E3%83%AD%E3%82%B8%E3%82%A7%E3%82%AF%E3%83%88";
+    for run in ["/tmp/aug-osc/プ", "ト"] {
+        assert!(
+            linked.contains(&format!("{}{run}{CLOSE}", open(href))),
+            "the run {run:?} is not wrapped by its href:\n{linked:?}"
+        );
+    }
+    // Six runs — the ASCII head plus its first katakana, then one per remaining
+    // katakana — and every open is balanced by a close.
+    assert_eq!(linked.matches(&open(href)).count(), 6, "run count moved:\n{linked:?}");
+    assert_eq!(linked.matches(CLOSE).count(), 6, "unbalanced close:\n{linked:?}");
+    assert_eq!(strip_ansi(&linked), paint(&mut off, &theme, 60, 12));
+
+    // (b) HEAD-wide, via a wrap. At width 40 `box_lines` gives content width 38; this
+    //     path is 13 + 15*2 = 43 columns, so `wrap_line`'s long-word arm breaks it
+    //     after the 12th wide grapheme (13 + 24 = 37, the 13th would reach 39) and the
+    //     next row STARTS on a wide one.
+    let wrapped = format!("/tmp/aug-osc/{}", "プ".repeat(15));
+    assert_widths_match(&wrapped, &theme, 40, 12);
 }
