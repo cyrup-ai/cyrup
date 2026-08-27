@@ -120,13 +120,30 @@ impl Tool for FindTool {
             serde_json::from_value(params).map_err(|e| error::invalid(format!("find: {e}")))?;
 
         let search_root = path::resolve_to_cwd(input.path.as_deref().unwrap_or("."), &self.cwd);
-        self.fs
+        // Pi's fd branch has NO pre-check: it hands the absolute search path to fd as fd's root
+        // (find.ts:267) and lets fd validate it. fd's gate is ONE predicate — `is_existing_directory`
+        // = `path.is_dir() && …` (fd/src/filesystem.rs:38-42) — so a MISSING path and a path that
+        // exists but is not a directory take the same branch and print the same line via
+        // `print_error` (fd/src/error.rs), which prefixes `[fd error]: `. With the only root
+        // filtered out, `search_paths()` returns empty and fd bails through the same prefix
+        // (main.rs:84-86, :68-71), exiting 1 with empty stdout. pi rejects with `stderr.trim()`
+        // (find.ts:304-309), i.e. both lines. So: one gate here, one two-line message, and the
+        // `Path not found:` literal — which is pi's `customOps.glob` branch (find.ts:171), NOT the
+        // fd branch this tool implements — does not belong on this path.
+        // `FsOps::metadata` follows symlinks (ops/local/fs.rs:170-183), matching `Path::is_dir`, so
+        // a symlink to a directory is still a valid search root.
+        if !self
+            .fs
             .metadata(&search_root)
             .await
-            // Pi: `Path not found: ${searchPath}` (find.ts:158).
-            .map_err(|_| {
-                error::not_found(format!("Path not found: {}", error::show(&search_root)))
-            })?;
+            .is_ok_and(|meta| meta.is_dir)
+        {
+            return Err(error::invalid(format!(
+                "[fd error]: Search path '{}' is not a directory.\n\
+                 [fd error]: No valid search paths given.",
+                error::show(&search_root)
+            )));
+        }
 
         let matcher = PatternMatcher::build(&input.pattern)?;
         // Pi: `const effectiveLimit = limit ?? DEFAULT_LIMIT` (find.ts:151), handed straight to
