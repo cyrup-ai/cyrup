@@ -8,6 +8,7 @@ mod edit_preview_diff;
 mod find_abort;
 mod grep_context_zero_line_text;
 mod isolation;
+mod mutation_lock_is_first_await;
 mod no_inherited_harness_stdio;
 mod pi_schema;
 mod pi_tool_semantics;

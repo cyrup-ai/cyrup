@@ -1545,6 +1545,7 @@ dependencies = [
  "cyrup-provider",
  "cyrup-session-svc",
  "cyrup-test-support",
+ "cyrup-tools",
  "getrandom 0.3.4",
  "notify",
  "regex",

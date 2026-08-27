@@ -105,8 +105,13 @@ impl FileLock {
     ///
     /// `cancel` governs BOTH layers, by two different mechanisms — the difference is load-bearing:
     ///
-    /// * Layer 1 is cancelled *in place*: [`KeyedLocks::guard`] races the token against the mutex
-    ///   in a `biased` `select!` and returns having taken nothing.
+    /// * Layer 1 is cancelled *in place*: [`KeyedLocks::guard`] is
+    ///   [`cyrup_core::keyed_lock::KeyedLocks::enqueue`] followed by
+    ///   [`cyrup_core::keyed_lock::KeyedAcquire::wait`], and it is `wait` that handles the token —
+    ///   an `is_cancelled()` pre-check that settles the already-cancelled case deterministically
+    ///   BEFORE any `select!` runs, then a `biased` `select!` racing the token against the mutex.
+    ///   Either way it returns having taken nothing, and the claimed queue place is evicted on the
+    ///   way out.
     /// * Layer 2 is cancelled *between attempts*: the retry sleep shares a `biased` `select!` with
     ///   the same token, so a cancel preempts whatever is left of the tick and the acquire returns
     ///   [`ConfigError::Cancelled`] rather than waiting out a peer process. This is NOT bounded by
@@ -166,9 +171,13 @@ impl FileLock {
         while !held {
             tokio::select! {
                 biased;
-                // `biased` for the reason spelled out in `KeyedLocks::guard`: with both arms ready
-                // the unbiased poll order is random, and a caller that has given up must not be
-                // handed the lock on a coin flip.
+                // `biased` for the reason spelled out on `KeyedAcquire::wait`
+                // (`cyrup-core/src/keyed_lock.rs`, above its `is_cancelled()` pre-check): with both
+                // arms ready the unbiased poll order is random, and a caller that has given up must
+                // not be handed the lock on a coin flip. Layer 1 now takes the already-cancelled
+                // case with that pre-check; here `biased` is the whole guarantee, because this
+                // `select!` is re-entered every tick and there is no single entry point to
+                // pre-check.
                 () = &mut cancelled => return Err(ConfigError::Cancelled),
                 () = tokio::time::sleep(backoff) => {}
             }

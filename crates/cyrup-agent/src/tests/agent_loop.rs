@@ -341,6 +341,94 @@ async fn a_02_2_parallel_completion_vs_source_order() {
     assert!(s[0].2 > s[1].1, "parallel batch must OVERLAP: {s:?}");
 }
 
+/// R-02-016 — the parallel batch must START its bodies in SOURCE order, not just emit its events
+/// in source order. `a_02_2` above pins the events; nothing pinned the bodies, and the bodies are
+/// what reach `FileMutationLocks::guard` in `cyrup-tools`. Three calls, not two, so a LIFO
+/// inversion is unambiguous rather than a swap.
+struct StartOrderTool {
+    name: String,
+    params: Value,
+    starts: Arc<Mutex<Vec<String>>>,
+    all_started: Arc<tokio::sync::Barrier>,
+}
+
+#[async_trait::async_trait]
+impl Tool for StartOrderTool {
+    fn name(&self) -> &str {
+        &self.name
+    }
+    fn parameters(&self) -> &Value {
+        &self.params
+    }
+    async fn execute(
+        &self,
+        _call_id: ToolCallId,
+        _params: Value,
+        _cancel: CancelToken,
+        _on_update: ToolUpdateSink,
+    ) -> Result<ToolResult, ToolError> {
+        // BEFORE the first `.await`: this is the instant the oneshot chain orders. `execute_parallel`
+        // drives each body to its first suspension point and only then releases the next
+        // (exec.rs:177-181), so this push happens under that guarantee or not at all.
+        self.starts.lock().unwrap().push(self.name.clone());
+        // …and the ordering must not have cost concurrency: nobody leaves until all three have
+        // started. A serialized batch deadlocks here and the timeout below reports it.
+        self.all_started.wait().await;
+        Ok(ToolResult {
+            content: vec![Content::text("ok")],
+            details: None,
+            terminate: false,
+            ..Default::default()
+        })
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_02_2b_parallel_bodies_start_in_source_order() {
+    let starts = Arc::new(Mutex::new(Vec::<String>::new()));
+    let all_started = Arc::new(tokio::sync::Barrier::new(3));
+    let tools: Vec<Arc<dyn Tool>> = (0..3)
+        .map(|i| {
+            Arc::new(StartOrderTool {
+                name: format!("t{i}"),
+                params: obj_schema(),
+                starts: starts.clone(),
+                all_started: all_started.clone(),
+            }) as Arc<dyn Tool>
+        })
+        .collect();
+
+    let (_faux, sf) = faux_stream_fn(vec![
+        faux_assistant_message(
+            vec![
+                faux_tool_call("t0", json!({})),
+                faux_tool_call("t1", json!({})),
+                faux_tool_call("t2", json!({})),
+            ],
+            StopReason::ToolUse,
+        ),
+        faux_assistant_message(vec![faux_text("done")], StopReason::Stop),
+    ]);
+    let agent = Agent::builder(model_ref(), sf).tools(tools).build();
+
+    tokio::time::timeout(Duration::from_secs(10), async {
+        agent.prompt("go").await.unwrap();
+        agent.wait_for_idle().await;
+    })
+    .await
+    .expect("three concurrent bodies settle; a serialized batch deadlocks on the barrier");
+
+    assert_eq!(
+        *starts.lock().unwrap(),
+        vec!["t0", "t1", "t2"],
+        "parallel bodies must START in source order. RED without the oneshot chain: `tokio::spawn` \
+         puts each new task in the worker's LIFO slot and pushes the slot's previous occupant to \
+         the back of the run queue (tokio 1.52.3 \
+         runtime/scheduler/multi_thread/worker.rs:1353-1377, polled first at :707), so an \
+         unordered batch starts its LAST call first"
+    );
+}
+
 // ----------------------------------------------------------------------------
 // A-02-3 — one sequential tool ⇒ whole batch sequential (no overlap).
 // ----------------------------------------------------------------------------
