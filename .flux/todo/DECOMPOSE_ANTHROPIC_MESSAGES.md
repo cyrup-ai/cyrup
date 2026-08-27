@@ -76,13 +76,26 @@ becomes the module's `//!` header.
 
 ## Acceptance Criteria
 
-- [ ] `anthropic_messages.rs` is replaced by `anthropic_messages/` (~10 modules + `tests/`)
-- [ ] No module exceeds ~350 lines
-- [ ] Both `#[cfg(test)]` regions are accounted for — the inline L642 fixture and the L1977 mod
-- [ ] Item-name multiset identical before and after (sort, diff -> empty)
-- [ ] Every file differs from its pre-split content by nothing but the `pub(super)` token, module headers and `use` blocks
-- [ ] `api/mod.rs` unedited
-- [ ] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
-- [ ] `cargo clippy -p cyrup-provider --all-targets` — still 14 warnings, none new in this module
-- [ ] `cargo doc -p cyrup-provider --no-deps` — still **0** warnings (broken links are denied, so any new one is a build error)
-- [ ] `cargo test -p cyrup-provider --lib` — 1118 pass, same test count in this module
+- [x] `anthropic_messages.rs` is replaced by `anthropic_messages/` (14 production modules + `mod.rs`
+      + a 10-file `tests/` tree)
+- [x] No module exceeds ~350 lines (largest: `tests/decode.rs` 311, `tests/headers.rs` 304,
+      `params.rs` 287)
+- [x] Both `#[cfg(test)]` regions are accounted for — the inline `build_body` fixture now sits in
+      `params.rs`, the `mod tests` block became `tests/`
+- [x] Item-name multiset identical before and after (127 items each, sorted diff empty)
+- [x] Every file differs from its pre-split content by nothing but the `pub(super)` token, module
+      headers and `use` blocks (plus five intra-doc links repaired with explicit paths)
+- [x] `api/mod.rs` unedited
+- [x] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
+- [x] `cargo clippy -p cyrup-provider --all-targets` — 14 warnings, none in this module
+- [x] `cargo doc -p cyrup-provider --no-deps --features faux` — 0 warnings, 0 errors
+- [x] `cargo test -p cyrup-provider --lib` — 1118 pass, 7 ignored, 0 fail; 52 tests in this module
+      before and after
+
+### Note on the `cargo doc` gate
+
+`cargo doc -p cyrup-provider --no-deps` **without** `--features faux` fails on a pre-existing
+`unresolved link to `crate::faux`` in `src/unconfigured.rs:3` — `faux` is `#[cfg(any(test, feature =
+"faux"))]`, so the link only resolves when the feature is on. That failure is untouched by this task
+and cannot have been introduced by it — neither `unconfigured.rs` nor `lib.rs` is in this diff. The
+baseline number is the `--features faux` run.

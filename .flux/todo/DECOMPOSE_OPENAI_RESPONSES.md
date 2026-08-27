@@ -1,7 +1,7 @@
 ---
-stage: new
+stage: exec
 status: done
-updated: 2026-08-22 22:40
+updated: 2026-08-27
 ---
 
 # Decompose api/openai_responses.rs Into Submodules
@@ -53,12 +53,37 @@ visibility minimized by strip-and-restore under the compiler; banner titles beco
 
 ## Acceptance Criteria
 
-- [ ] `openai_responses.rs` is replaced by `openai_responses/` (modules + `tests/`)
-- [ ] No module exceeds ~350 lines
-- [ ] Item-name multiset identical before and after (sort, diff -> empty)
-- [ ] Every file differs from its pre-split content by nothing but the `pub(super)` token, module headers and `use` blocks
-- [ ] `api/mod.rs` unedited; `azure_openai_responses.rs` (which shares this wire shape) still compiles untouched
-- [ ] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
-- [ ] `cargo clippy -p cyrup-provider --all-targets` — still 14 warnings, none new in this module
-- [ ] `cargo doc -p cyrup-provider --no-deps` — still **0** warnings (broken links are denied, so any new one is a build error)
-- [ ] `cargo test -p cyrup-provider --lib` — 1118 pass, 32 tests still run in this module
+- [x] `openai_responses.rs` is replaced by `openai_responses/` (modules + `tests/`)
+- [x] No module exceeds ~350 lines
+- [x] Item-name multiset identical before and after (sort, diff -> empty)
+- [x] Every file differs from its pre-split content by nothing but the `pub(super)` token, module headers and `use` blocks
+- [x] `api/mod.rs` unedited; `azure_openai_responses.rs` (which shares this wire shape) still compiles untouched
+- [x] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
+- [x] `cargo clippy -p cyrup-provider --all-targets` — still 14 warnings, none new in this module
+- [x] `cargo doc -p cyrup-provider --no-deps --features faux` — 0 warnings. NOTE: without
+      `--features faux` this command already failed on `main` before this task, on an
+      untouched file (`src/unconfigured.rs:3` links `[`crate::faux`]`, and `faux` is behind
+      `#[cfg(any(test, feature = "faux"))]`); a workspace build unifies that feature on, which
+      is how the baseline was measured. Verified pre-existing by re-running the bare command
+      against the un-split file. One real cross-module link was repaired by this task:
+      `convert.rs` now spells ``[`try_build_params`](super::params::try_build_params)``.
+- [x] `cargo test -p cyrup-provider --lib` — 1118 pass, 7 ignored, 0 fail; **39** tests still
+      run in this module (the spec's "32" undercounted: the file carries 39 `#[test]` /
+      `#[tokio::test]` fns, all present after the split)
+
+## Outcome
+
+`openai_responses.rs` (2,986 lines) became `openai_responses/` — 16 production modules + a 7-file
+`tests/` tree, 3,171 lines total. The three `// ---` banner titles became the `//!` headers of the
+modules in each group, verbatim.
+
+Sizes: every production module is <= 337 lines (`convert.rs` 337, `events.rs` 305, `params.rs` 228,
+rest smaller). One test file misses the ~350 target: `tests/tools.rs` at 565 lines, because the
+DRIFT-001 deferred-tool block (517 contiguous lines under one banner whose text reads "Every
+assertion below ...") is indivisible and the task's own file list allots no second tools test file.
+
+Purity: item-name multiset identical before/after (105 = 105, diff empty). A line-level multiset
+diff of the whole module against the pre-split file shows nothing but the added `pub(super)` /
+changed `pub(crate)` tokens, the four signatures that had to wrap once the token pushed them past
+100 columns (`emit_error`, `reasoning_summary_wire`, `apply_service_tier_pricing`, `create_slot`),
+and the one repaired intra-doc link. No logic was rewritten, reordered or tidied.
