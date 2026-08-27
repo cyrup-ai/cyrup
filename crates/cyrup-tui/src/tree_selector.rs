@@ -18,7 +18,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap, TreeAction, TreeKeymap};
-use crate::selector::{Selector, SelectorOutcome};
+use crate::selector::{border_rule, Selector, SelectorOutcome};
 use crate::theme::UiTheme;
 
 /// The entry-type glyph key (`tree-selector.ts` switch ~`:638`, render `:691-727`; spec/tui/05 §5.1).
@@ -1060,10 +1060,4 @@ impl Selector for TreeSelector {
             }
         }
     }
-}
-
-/// A full-width `─` rule styled `border` (Pi `DynamicBorder`; mirrors `selector::border_rule`).
-fn border_rule(width: u16, theme: &UiTheme) -> Paragraph<'static> {
-    let rule = "─".repeat(width.max(1) as usize);
-    Paragraph::new(Line::from(Span::styled(rule, theme.border_style())))
 }

@@ -28,7 +28,7 @@ use ratatui::Frame;
 
 use crate::chrome::key_hint_spans;
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{input_line_spans, Selector, SelectorOutcome};
+use crate::selector::{border_rule, centered_window, input_line_spans, Selector, SelectorOutcome};
 use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
 
@@ -415,7 +415,7 @@ impl ConfigSelector {
     /// window does not cover the list (`:444-449`), or the single `"No resources found"` row
     /// (`:399-402`).
     fn body_rows(&self, width: u16) -> u16 {
-        self.body_lines(width, &UiTheme::default())
+        self.body_lines(width, UiTheme::default_ref())
             .len()
             .min(u16::MAX as usize) as u16
     }
@@ -424,13 +424,7 @@ impl ConfigSelector {
     /// goes negative when the list is shorter than the window and the outer `Math.max(0, …)`
     /// catches it.
     fn window(&self) -> (usize, usize) {
-        let total = self.flat.len();
-        let visible = usize::from(self.max_visible);
-        if total <= visible {
-            return (0, total);
-        }
-        let start = self.selected.saturating_sub(visible / 2).min(total - visible);
-        (start, (start + visible).min(total))
+        centered_window(self.selected, self.flat.len(), usize::from(self.max_visible))
     }
 
     /// `renderCheckbox` (`config-selector.ts:639-647`) — the glyph **and** its colour.
@@ -852,12 +846,6 @@ impl Selector for ConfigSelector {
             _ => SelectorOutcome::Ignored,
         }
     }
-}
-
-/// A full-width `─` rule styled `border`, matching Pi's `DynamicBorder` (`dynamic-border.ts:23`).
-fn border_rule(width: u16, theme: &UiTheme) -> Paragraph<'static> {
-    let rule = "─".repeat(width.max(1) as usize);
-    Paragraph::new(Line::from(Span::styled(rule, theme.border_style())))
 }
 
 #[cfg(test)]

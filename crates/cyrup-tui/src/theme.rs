@@ -148,6 +148,28 @@ impl Default for UiTheme {
 }
 
 impl UiTheme {
+    /// The shared, process-wide `UiTheme::default()` — built **once**, then handed out by
+    /// reference. For callers that need *a* theme only to reach a style-independent result and
+    /// throw it away again; anything that actually paints must use the live theme instead.
+    ///
+    /// (D) The `desired_height(width)` measurement path is the motivating caller. `app/layout.rs`
+    /// asks the focused selector for its height on **every frame** it owns the input slot, and the
+    /// selectors answer by laying their body out against a scratch theme. Each `UiTheme::default()`
+    /// goes to [`UiTheme::dark`] → [`UiTheme::builtin_or_static`] → `builtin_themes`
+    /// (`cyrup-resources/src/theme.rs`), which re-parses BOTH `BUILTIN_DARK_JSON` and
+    /// `BUILTIN_LIGHT_JSON` (~4.5 KB of JSON) with no cache and then resolves a ~51-entry
+    /// `BTreeMap` of roles — all of it discarded as soon as the line count is known. The measured
+    /// height depends on the text and the width, never on the colors, so sharing one instance
+    /// changes nothing observable.
+    ///
+    /// This is deliberately **not** wired into `impl Default`, which keeps yielding an owned
+    /// theme the caller may still project or re-stamp ([`UiTheme::with_color_mode`],
+    /// [`UiTheme::with_generation`]) — unchanged.
+    pub fn default_ref() -> &'static UiTheme {
+        static DEFAULT: std::sync::LazyLock<UiTheme> = std::sync::LazyLock::new(UiTheme::default);
+        &DEFAULT
+    }
+
     /// Project a `ResolvedTheme` (color roles already resolved through `vars`) into a `UiTheme`.
     pub fn from_resolved(name: impl Into<String>, resolved: &ResolvedTheme, generation: u64) -> Self {
         let role = |key: &str| resolved.roles.get(key).copied().and_then(color_of);

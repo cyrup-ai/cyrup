@@ -4,9 +4,9 @@
 //! Nine crates declare `[features]`, and the combinations that are NOT that point are where
 //! compilation errors hide in this workspace — the `#[cfg(not(feature = "wasm-host"))]` arms of
 //! `cyrup-ext` / `cyrup-session-svc` are never compiled by the everyday gate, and neither is any
-//! build with `ratatui/scrolling-regions` off. `crates/cyrup-tui/tests/zzz_scratch_perf_probe.rs`
-//! carried an ungated `impl Backend::scroll_region_{up,down}` for exactly as long as nothing in the
-//! repo ever compiled it with that feature off.
+//! build with `ratatui/scrolling-regions` off. A `cyrup-tui` integration test once carried an
+//! ungated `impl Backend::scroll_region_{up,down}` for exactly as long as nothing in the repo
+//! ever compiled it with that feature off — this matrix is what found it.
 //!
 //! There is no CI here (README "Build": *"There is no CI in this repository, so nothing runs these
 //! for you"*), so this is a command, not a workflow. It sits beside `cargo clippy` in the README's
@@ -112,12 +112,13 @@ const MATRIX: &[Combo] = &[
             "scrollback-accumulator",
             "--all-targets",
         ],
-        why: "THE row that was red. tests/zzz_scratch_perf_probe.rs self-gates on \
-              `scrollback-accumulator` but implemented `scroll_region_{up,down}` UNGATED, so this \
-              is the only combination in which the file compiles while the trait methods do not \
-              exist (E0407 x2). Its three sibling `impl Backend`s gate correctly; nothing else \
-              reaches this corner, because cyrup-it only ever adds the accumulator ON TOP of \
-              defaults (crates/cyrup-it/Cargo.toml:99).",
+        why: "The row that was red. A `cyrup-tui` integration test self-gated on \
+              `scrollback-accumulator` while implementing `scroll_region_{up,down}` UNGATED, so this \
+              was the only combination in which the file compiled but the trait methods did not \
+              exist (E0407 x2). That test has since been gated, then deleted as the throwaway it \
+              declared itself to be, so this row is now a regression guard rather than a live \
+              failure: nothing else reaches this corner, because cyrup-it only ever adds the \
+              accumulator ON TOP of defaults (crates/cyrup-it/Cargo.toml:99).",
         slow: false,
     },
     Combo {

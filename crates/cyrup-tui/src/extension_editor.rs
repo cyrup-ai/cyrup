@@ -27,7 +27,7 @@ use crate::component::Component;
 use crate::editor::{EditorOutcome, InputEditor};
 use crate::keymap::{Action, EditorAction, Keymap, SelectAction, SelectKeymap};
 use crate::selector::{
-    stack_rows, title_lines, title_wrapped_height, Selector, SelectorOutcome,
+    border_rule, stack_rows, title_lines, title_wrapped_height, Selector, SelectorOutcome,
 };
 use crate::theme::UiTheme;
 
@@ -224,11 +224,7 @@ impl Selector for ExtensionEditorSelector {
         // the natural render, exactly as pi's layout engine does (see its doc).
         let [top, _, title_area, _, body, _, hint, _, bottom] =
             stack_rows(area, [1, 1, title_h, 1, body_h, 1, hint_h, 1, 1]);
-        let rule = |w: u16| "─".repeat(w.max(1) as usize);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(rule(top.width), theme.border_style()))),
-            top,
-        );
+        frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(
             // E11: `new Text(theme.fg("accent", title), 1, 0)` (`extension-editor.ts:66`).
             // `theme.fg` is colour-only (`theme.ts:372-376`); nothing bolds this title.
@@ -245,10 +241,7 @@ impl Selector for ExtensionEditorSelector {
             hint,
         );
         // E5: the closing `DynamicBorder` (`extension-editor.ts:95`).
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(rule(bottom.width), theme.border_style()))),
-            bottom,
-        );
+        frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
     fn set_terminal_height(&mut self, rows: u16) {

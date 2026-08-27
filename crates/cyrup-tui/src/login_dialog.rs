@@ -65,7 +65,7 @@ use cyrup_provider::auth::oauth::{
 
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{
-    search_input_spans, title_lines, title_wrapped_height, Selector, SelectorOutcome,
+    border_rule, search_input_spans, title_lines, title_wrapped_height, Selector, SelectorOutcome,
 };
 use crate::theme::UiTheme;
 
@@ -505,11 +505,7 @@ impl Selector for LoginDialog {
             Constraint::Length(1),
         ])
         .areas(area);
-        let rule = |w: u16| "─".repeat(w.max(1) as usize);
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(rule(top.width), theme.border_style()))),
-            top,
-        );
+        frame.render_widget(border_rule(top.width, theme), top);
         frame.render_widget(
             Paragraph::new(title_lines(&self.title))
                 .style(theme.accent_style().add_modifier(Modifier::BOLD))
@@ -520,13 +516,7 @@ impl Selector for LoginDialog {
             Paragraph::new(body).wrap(Wrap { trim: false }),
             body_area,
         );
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                rule(bottom.width),
-                theme.border_style(),
-            ))),
-            bottom,
-        );
+        frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
 
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {

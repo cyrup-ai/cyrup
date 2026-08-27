@@ -21,6 +21,7 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::component::Component;
+use crate::selector::centered_window;
 use crate::text_width::{str_width, truncate_to_width};
 use crate::theme::UiTheme;
 
@@ -179,14 +180,7 @@ impl SelectList {
     /// The visible window `[start, end)` centered on the selection
     /// (`select-list.ts:86-90`): `start = clamp(selected - maxVisible/2, 0, len - maxVisible)`.
     fn window(&self) -> (usize, usize) {
-        let len = self.items.len();
-        let max = self.max_visible as usize;
-        if len <= max {
-            return (0, len);
-        }
-        let half = max / 2;
-        let start = self.selected.saturating_sub(half).min(len - max);
-        (start, start + max)
+        centered_window(self.selected, self.items.len(), usize::from(self.max_visible))
     }
 
     /// The number of rendered rows (visible rows + optional indicator), for live-region height math.

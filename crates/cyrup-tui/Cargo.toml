@@ -26,10 +26,12 @@ default = ["wasm-host", "scrolling-regions"]
 wasm-host = ["cyrup-ext/wasm-host", "cyrup-session-svc/wasm-host"]
 # Retains every committed line in `AppState::scrollback` for test/inspection assertions. OFF in
 # production: the accumulator costs memory ∝ total session output and is never read outside tests
-# (TUI-092 F1). In-crate `#[cfg(test)]` code needs no feature; this exists for the two
-# integration-style consumers whose own `cfg(test)` does not reach the `cyrup-tui` lib build:
-# `tests/zzz_scratch_perf_probe.rs` (self-gated) and `cyrup-it`'s `tests/bin/wasm_renderer_screen.rs`
-# (via the dev-dependency edge).
+# (TUI-092 F1). In-crate `#[cfg(test)]` code needs no feature; this exists for the SOLE remaining
+# integration-style consumer whose own `cfg(test)` does not reach the `cyrup-tui` lib build:
+# `cyrup-it`'s `tests/bin/wasm_renderer_screen.rs` (via the dev-dependency edge), where
+# `scrollback_text()` backs the EXT-006 assertions at `:119` and `:144`. It was one of two until the
+# TUI-092 round-2 perf probe under this crate's `tests/` — a self-gated throwaway — was measured and
+# deleted; nothing in this crate's own `tests/` reads the accumulator any more.
 scrollback-accumulator = []
 # Passthrough for ratatui's DECSTBM `insert_before` (TUI-092-F5). ON by default: no terminal in
 # cyrup's supported matrix lacks DECSTBM, and this retires ratatui's own documented tmux

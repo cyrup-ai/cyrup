@@ -31,7 +31,7 @@ use ratatui::Frame;
 
 use crate::auth_select::{format_auth_selector_provider_type, status_indicator_runs, StatusTone};
 use crate::keymap::{SelectAction, SelectKeymap};
-use crate::selector::{border_rule_line, input_line_spans, Selector, SelectorOutcome};
+use crate::selector::{border_rule_line, centered_window, input_line_spans, Selector, SelectorOutcome};
 use crate::text_width::truncate_line_to_width;
 use crate::theme::UiTheme;
 
@@ -190,13 +190,7 @@ impl OAuthSelector {
     /// The visible window `[start, end)` — `updateList`'s centred window (`:117-122`), `maxVisible`
     /// = [`MAX_VISIBLE`].
     fn window(&self) -> (usize, usize) {
-        let len = self.filtered.len();
-        let start = self
-            .selected
-            .saturating_sub(MAX_VISIBLE / 2)
-            .min(len.saturating_sub(MAX_VISIBLE))
-            .min(len);
-        (start, (start + MAX_VISIBLE).min(len))
+        centered_window(self.selected, self.filtered.len(), MAX_VISIBLE)
     }
 
     /// The `listContainer` rows (`updateList`, `:114-161`), each already reduced to one `Line`.
@@ -283,7 +277,7 @@ impl Selector for OAuthSelector {
         // `ListSelector` route drew three and left the `:87` blank floating. The title is a
         // `TruncatedText`, which is always exactly one row (`truncated-text.ts:36-56`), so this
         // constant does not depend on `width`.
-        let body = self.body_lines(width, &UiTheme::default()).len();
+        let body = self.body_lines(width, UiTheme::default_ref()).len();
         body.saturating_add(8).min(usize::from(u16::MAX)) as u16
     }
 
