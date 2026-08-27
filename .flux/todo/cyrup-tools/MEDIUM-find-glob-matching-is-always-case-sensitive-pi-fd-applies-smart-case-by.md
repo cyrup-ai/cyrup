@@ -3,8 +3,8 @@ title: Find glob matching is always case-sensitive; pi (fd) applies smart-case b
 priority: MEDIUM
 tool: find
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
-status: done
+stage: exec
+status: in-progress
 updated: 2026-08-27
 ---
 

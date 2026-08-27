@@ -260,13 +260,20 @@ pub enum WalkFlavor {
 impl WalkFlavor {
     /// The custom ignore FILENAME this flavor's upstream reads, if any. Custom ignore files
     /// outrank `.ignore` and every gitignore source (ignore 0.4.26 `dir.rs:580-585`).
+    ///
+    /// Exactly ONE name is ever returned, so `find` can never see `.rgignore` and `grep` can
+    /// never see `.fdignore`: the cross-contamination a shared walk seam otherwise invites is
+    /// structurally impossible rather than merely avoided.
     pub fn custom_ignore_filename(self) -> Option<&'static str> {
         match self {
             Self::Plain => None,
             Self::Fd => Some(".fdignore"),
-            // The `.rgignore` registration is the sibling `.rgignore` parity task; `grep`
-            // already names itself here so that task lands as this one arm and nothing else.
-            Self::Rg => None,
+            // ripgrep registers `.rgignore` gated on `!no_ignore_dot` — the SAME knob that
+            // gates `.ignore` (ripgrep 14.1.0 `crates/core/flags/hiargs.rs:891, :897-899`).
+            // Pi's argv passes neither `--no-ignore` nor `--no-ignore-dot` (grep.ts:220-224)
+            // and cyrup never disables `WalkBuilder::ignore`, so this is unconditional,
+            // exactly as it is upstream.
+            Self::Rg => Some(".rgignore"),
         }
     }
 

@@ -369,10 +369,12 @@ impl Tool for GrepTool {
                 WalkOpts {
                     include_hidden: true,
                     require_git: true,
-                    // Pi's `grep` IS ripgrep (grep.ts:177, :226). Behaviour-neutral today —
-                    // `WalkFlavor::Rg` registers nothing yet — and deliberately so: it is the
-                    // seam the sibling `.rgignore` task fills, and it guarantees `find`'s
-                    // `.fdignore` can never leak into grep.
+                    // Pi's `grep` IS ripgrep (grep.ts:177 `ensureTool("rg")`, spawned at
+                    // `:226`), invoked with no `--no-ignore`/`--no-ignore-dot`/`--ignore-file`
+                    // (grep.ts:220-224), so ripgrep's full default ignore set is in force:
+                    // `.rgignore` on top of `.ignore` and the gitignore family. ripgrep has no
+                    // global ignore file, so unlike `find` nothing else attaches. This also
+                    // keeps `find`'s `.fdignore` out of grep.
                     flavor: WalkFlavor::Rg,
                 },
             );

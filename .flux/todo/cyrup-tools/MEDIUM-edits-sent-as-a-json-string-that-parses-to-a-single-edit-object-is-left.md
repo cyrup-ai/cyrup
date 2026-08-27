@@ -3,7 +3,7 @@ title: Edits sent as a JSON string that parses to a single edit object is left u
 priority: MEDIUM
 tool: edit
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
+stage: exec
 status: done
 updated: 2026-08-27
 ---

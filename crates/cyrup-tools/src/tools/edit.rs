@@ -55,7 +55,7 @@ impl EditTool {
         // (`api/openai_completions.rs:816`, `api/google_generative_ai.rs:859`, the latter as
         // `parametersJsonSchema`, which Gemini enforces), so the extra keyword forbade exactly the
         // legacy flat `{path, oldText, newText}` shape that [`Self::prepare_arguments`] below —
-        // pi's `prepareEditArguments` (edit.ts:94-118) — exists to accept.
+        // pi's `prepareEditArguments` (edit.ts:116-147) — exists to accept.
         let params = serde_json::json!({
             "type": "object",
             "required": ["path", "edits"],
@@ -85,12 +85,32 @@ impl EditTool {
     }
 }
 
+/// Pi `isSingleEditInput` (edit.ts:74-81): a non-null, non-array JSON OBJECT whose `oldText` and
+/// `newText` are both strings. Matching `Value::Object` performs pi's whole three-part guard
+/// (`!value`, `typeof value !== "object"`, `Array.isArray(value)`) in one pattern. Extra keys are
+/// deliberately tolerated — pi checks exactly these two properties and then wraps the value
+/// VERBATIM, so anything else the model attached rides along into `edits[0]`.
+fn is_single_edit(value: &serde_json::Value) -> bool {
+    let serde_json::Value::Object(map) = value else {
+        return false;
+    };
+    map.get("oldText").is_some_and(serde_json::Value::is_string)
+        && map.get("newText").is_some_and(serde_json::Value::is_string)
+}
+
 /// Normalize legacy shapes into `{ path, edits: [...] }` (R-03-020), a 1:1 port of Pi
-/// `prepareEditArguments` (edit.ts:94-118):
-/// - `edits` sent as a JSON string -> parse, replacing only when it yields an array (edit.ts:102-107);
+/// `prepareEditArguments` (edit.ts:116-147 @0.84.3):
+/// - `edits` sent as a JSON string -> parse, adopting an array verbatim (edit.ts:128-129) and
+///   wrapping a single edit object into a one-element array (edit.ts:130-131); a parse failure or
+///   any other parsed shape leaves the string untouched (pi's empty `catch {}`, edit.ts:133);
+/// - `edits` sent as a BARE single edit object -> wrapped into a one-element array
+///   (edit.ts:134-135). Pi added both single-object arms after the shapes were observed from
+///   shipping models (edit.ts:123-124: "Opus 4.6, GLM-5.1");
 /// - whenever BOTH top-level `oldText`/`newText` are strings, APPEND `{oldText,newText}` to the
 ///   existing `edits` array (or a fresh one), regardless of whether `edits` is already present
-///   (edit.ts:109-117: `const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : []; edits.push(...)`).
+///   (edit.ts:143-145: `const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : [];
+///   edits.push(...)`). This runs AFTER the wrap, so `{edits:{…}, oldText, newText}` yields two
+///   edits, wrapped-first.
 ///
 /// The previous gate (`!obj.contains_key("edits")`) diverged from Pi: input
 /// `{path, edits:[], oldText, newText}` made Pi succeed with one edit but made cyrup keep `edits:[]`
@@ -98,16 +118,39 @@ impl EditTool {
 /// edit while cyrup ignored the pair.
 fn normalize_args(mut raw: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = raw.as_object_mut() {
-        // edits-as-string -> parse, but only adopt the parsed value when it is an array
-        // (Pi `if (Array.isArray(parsed)) args.edits = parsed`, edit.ts:104-106).
-        if let Some(serde_json::Value::String(s)) = obj.get("edits")
-            && let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s)
-            && parsed.is_array()
-        {
-            obj.insert("edits".to_string(), parsed);
+        // Pi edit.ts:125-136, both arms. The replacement value is computed out of line so the
+        // shared borrow of `obj` ends before the insert.
+        //
+        // - `edits` as a JSON string: parse (edit.ts:127), then adopt the parsed value when it is
+        //   an array (`args.edits = parsed`, edit.ts:128-129) OR wrap it when it is a single edit
+        //   object (`args.edits = [parsed]`, edit.ts:130-131). Everything else — a parse failure
+        //   (pi's empty `catch {}`, edit.ts:133), a scalar, an object without both string
+        //   properties — leaves `edits` as the ORIGINAL STRING, untouched, exactly as pi does.
+        // - otherwise a BARE single edit object is wrapped in place
+        //   (`args.edits = [args.edits]`, edit.ts:134-135).
+        //
+        // Pi's `else if` is structural only: a string is never a single edit object, and the string
+        // arm always leaves `edits` an array or a string, so the two arms cannot both apply.
+        let coerced_edits: Option<serde_json::Value> = match obj.get("edits") {
+            Some(serde_json::Value::String(s)) => {
+                match serde_json::from_str::<serde_json::Value>(s) {
+                    Ok(parsed) if parsed.is_array() => Some(parsed),
+                    Ok(parsed) if is_single_edit(&parsed) => {
+                        Some(serde_json::Value::Array(vec![parsed]))
+                    }
+                    _ => None,
+                }
+            }
+            Some(other) if is_single_edit(other) => {
+                Some(serde_json::Value::Array(vec![other.clone()]))
+            }
+            _ => None,
+        };
+        if let Some(edits) = coerced_edits {
+            obj.insert("edits".to_string(), edits);
         }
         // legacy single-edit: append the pair whenever BOTH oldText and newText are strings
-        // (Pi edit.ts:109-117). A non-string (or absent) oldText/newText leaves the args untouched.
+        // (Pi edit.ts:138-146). A non-string (or absent) oldText/newText leaves the args untouched.
         let both_strings = obj.get("oldText").is_some_and(serde_json::Value::is_string)
             && obj.get("newText").is_some_and(serde_json::Value::is_string);
         if both_strings {
@@ -304,10 +347,29 @@ impl Tool for EditTool {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::indexing_slicing)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use super::normalize_args;
+    use super::{EditTool, normalize_args};
+    use crate::config::EditOpts;
+    use crate::lock::FileMutationLocks;
+    use crate::ops::local::LocalFs;
+    use cyrup_core::{CancelToken, Tool, ToolCallId, ToolUpdate, ToolUpdateSink};
     use serde_json::json;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn tool(cwd: PathBuf) -> EditTool {
+        EditTool::new(
+            Arc::new(LocalFs),
+            Arc::new(FileMutationLocks::new()),
+            cwd,
+            EditOpts,
+        )
+    }
+
+    fn noop_sink() -> ToolUpdateSink {
+        Box::new(|_u: ToolUpdate| {})
+    }
 
     /// Byte-diff vs Pi `prepareEditArguments` (edit.ts:109-117): a legacy `{oldText,newText}` pair
     /// is APPENDED to an existing `edits` array, regardless of whether `edits` is present. Pi:
@@ -374,7 +436,7 @@ mod tests {
         );
     }
 
-    /// `edits` as a JSON string is parsed to an array (Pi edit.ts:102-107), and a legacy pair then
+    /// `edits` as a JSON string is parsed to an array (Pi edit.ts:128-129), and a legacy pair then
     /// appends onto the parsed array.
     #[test]
     fn edits_string_parses_then_pair_appends() {
@@ -393,6 +455,239 @@ mod tests {
                     { "oldText": "a", "newText": "b" }
                 ]
             })
+        );
+    }
+
+    // ---- Pi edit.ts:125-136 @0.84.3 — the two single-edit-object arms ----
+
+    /// A BARE single edit object is wrapped into a one-element array
+    /// (Pi `args.edits = [args.edits]`, edit.ts:134-135).
+    #[test]
+    fn bare_single_edit_object_is_wrapped() {
+        let out = normalize_args(json!({
+            "path": "f.txt",
+            "edits": { "oldText": "a", "newText": "b" }
+        }));
+        assert_eq!(
+            out,
+            json!({ "path": "f.txt", "edits": [{ "oldText": "a", "newText": "b" }] })
+        );
+    }
+
+    /// The wrap is VERBATIM: pi checks exactly `oldText`/`newText` and then re-uses the value it
+    /// was given, so any extra keys the model attached ride along into `edits[0]`.
+    #[test]
+    fn bare_single_edit_object_is_wrapped_verbatim_with_extra_keys() {
+        let out = normalize_args(json!({
+            "path": "f.txt",
+            "edits": { "oldText": "a", "newText": "b", "note": "x" }
+        }));
+        assert_eq!(
+            out,
+            json!({
+                "path": "f.txt",
+                "edits": [{ "oldText": "a", "newText": "b", "note": "x" }]
+            })
+        );
+    }
+
+    /// A JSON STRING that parses to a single edit object is wrapped
+    /// (Pi `args.edits = [parsed]`, edit.ts:130-131).
+    #[test]
+    fn stringified_single_edit_object_is_wrapped() {
+        let out = normalize_args(json!({
+            "path": "f.txt",
+            "edits": "{\"oldText\":\"a\",\"newText\":\"b\"}"
+        }));
+        assert_eq!(
+            out,
+            json!({ "path": "f.txt", "edits": [{ "oldText": "a", "newText": "b" }] })
+        );
+    }
+
+    /// The string arm's trap: when the parse SUCCEEDS but yields neither an array nor a single edit
+    /// object, pi assigns nothing — so `edits` keeps the ORIGINAL STRING, byte-identical to the
+    /// parse-failure case (pi's empty `catch {}`, edit.ts:133). Pi never re-parses, so a
+    /// double-encoded string (which parses to a `string`) is left alone too.
+    #[test]
+    fn string_arm_leaves_the_original_string_for_every_other_shape() {
+        for s in [
+            "{\"oldText\":\"a\"}",                       // object, missing newText
+            "{\"oldText\":1,\"newText\":\"b\"}",         // object, non-string oldText
+            "not json",                                  // parse failure
+            "17",                                        // scalar
+            "null",                                      // parses to null
+            "\"[{\\\"oldText\\\":\\\"a\\\",\\\"newText\\\":\\\"b\\\"}]\"", // double-encoded
+        ] {
+            let out = normalize_args(json!({ "path": "f.txt", "edits": s }));
+            assert_eq!(out, json!({ "path": "f.txt", "edits": s }), "input {s:?}");
+        }
+    }
+
+    /// Every non-string shape `isSingleEditInput` rejects is left byte-identical: a non-string
+    /// property, a missing property, an array (already the target shape), and `null`.
+    #[test]
+    fn shapes_pi_rejects_are_left_untouched() {
+        for edits in [
+            json!({ "oldText": 1, "newText": "b" }),
+            json!({ "oldText": "a" }),
+            json!({ "newText": "b" }),
+            json!([]),
+            json!(null),
+        ] {
+            let out = normalize_args(json!({ "path": "f.txt", "edits": edits }));
+            assert_eq!(out, json!({ "path": "f.txt", "edits": edits }), "{edits}");
+        }
+    }
+
+    /// The wrap runs BEFORE the legacy `oldText`/`newText` append (edit.ts:125-136 then :138-146),
+    /// so `{edits:{…}, oldText, newText}` yields TWO edits, the wrapped object first.
+    #[test]
+    fn wrapped_object_precedes_the_appended_legacy_pair() {
+        let out = normalize_args(json!({
+            "path": "f.txt",
+            "edits": { "oldText": "al", "newText": "AL" },
+            "oldText": "pha",
+            "newText": "PHA"
+        }));
+        assert_eq!(
+            out,
+            json!({
+                "path": "f.txt",
+                "edits": [
+                    { "oldText": "al", "newText": "AL" },
+                    { "oldText": "pha", "newText": "PHA" }
+                ]
+            })
+        );
+    }
+
+    /// `normalize_args` stays idempotent — required by the double application at
+    /// [`Tool::prepare_arguments`] and inside [`EditTool::execute`]. Re-running sees `edits` as an
+    /// array, so both wrap arms fall through.
+    #[test]
+    fn wrap_is_idempotent() {
+        for raw in [
+            json!({ "path": "f.txt", "edits": { "oldText": "a", "newText": "b" } }),
+            json!({ "path": "f.txt", "edits": "{\"oldText\":\"a\",\"newText\":\"b\"}" }),
+        ] {
+            let once = normalize_args(raw);
+            let twice = normalize_args(once.clone());
+            assert_eq!(once, twice);
+        }
+    }
+
+    /// The real preflight order (`prepare_arguments` -> `validate_tool_call`, preflight.rs:38-47):
+    /// both single-edit shapes now clear the `edits:{type:"array"}` schema gate that used to answer
+    /// ``schema validation failed at `$.edits`: expected array, got object``/`…got string`, while
+    /// every shape pi rejects still dies there with its existing message.
+    #[tokio::test]
+    async fn preflight_accepts_the_wrapped_shapes_and_still_rejects_the_rest() {
+        let edit = tool(PathBuf::from("/tmp"));
+        for accepted in [
+            json!({ "path": "a.txt", "edits": { "oldText": "alpha", "newText": "ALPHA" } }),
+            json!({ "path": "a.txt", "edits": "{\"oldText\":\"alpha\",\"newText\":\"ALPHA\"}" }),
+            json!({ "path": "a.txt", "edits": { "oldText": "a", "newText": "b", "note": "x" } }),
+        ] {
+            let prepared = edit.prepare_arguments(accepted.clone()).await;
+            assert!(
+                cyrup_provider::validate_tool_call(edit.parameters(), prepared).is_ok(),
+                "should be accepted: {accepted}"
+            );
+        }
+        for (rejected, detail) in [
+            (
+                json!({ "path": "a.txt", "edits": { "oldText": 1, "newText": "b" } }),
+                "expected array, got object",
+            ),
+            (
+                json!({ "path": "a.txt", "edits": { "oldText": "a" } }),
+                "expected array, got object",
+            ),
+            (
+                json!({ "path": "a.txt", "edits": "not json" }),
+                "expected array, got string",
+            ),
+            (
+                json!({ "path": "a.txt", "edits": "{\"oldText\":\"a\"}" }),
+                "expected array, got string",
+            ),
+            (
+                json!({ "path": "a.txt", "edits": null }),
+                "expected array, got null",
+            ),
+        ] {
+            let prepared = edit.prepare_arguments(rejected.clone()).await;
+            let err = cyrup_provider::validate_tool_call(edit.parameters(), prepared)
+                .expect_err(&format!("should be rejected: {rejected}"))
+                .to_string();
+            assert_eq!(
+                err,
+                format!("schema validation failed at `$.edits`: {detail}"),
+                "{rejected}"
+            );
+        }
+        // `edits: []` still clears the schema and still dies one layer down, in `execute`.
+        let prepared = edit
+            .prepare_arguments(json!({ "path": "a.txt", "edits": [] }))
+            .await;
+        assert!(cyrup_provider::validate_tool_call(edit.parameters(), prepared).is_ok());
+    }
+
+    /// Direct `execute`, bypassing the preflight seam: the defensive `normalize_args` at the top of
+    /// `execute` wraps the bare object (extra key and all) before the `edits_ok` guard, so the edit
+    /// is applied instead of answering `Edit tool input is invalid. …`. The legacy pair still
+    /// appends after the wrapped edit.
+    #[tokio::test]
+    async fn execute_applies_both_the_wrapped_object_and_the_appended_legacy_pair() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        let edit = tool(dir.path().to_path_buf());
+
+        edit.execute(
+            ToolCallId::from("tc-wrap"),
+            json!({ "path": "a.txt", "edits": { "oldText": "alpha", "newText": "ALPHA", "note": "x" } }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("bare single edit object must be wrapped and applied");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ALPHA\n"
+        );
+
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        edit.execute(
+            ToolCallId::from("tc-str"),
+            json!({ "path": "a.txt", "edits": "{\"oldText\":\"alpha\",\"newText\":\"ALPHA\"}" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("stringified single edit object must be wrapped and applied");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ALPHA\n"
+        );
+
+        std::fs::write(dir.path().join("a.txt"), "alpha\n").unwrap();
+        edit.execute(
+            ToolCallId::from("tc-both"),
+            json!({
+                "path": "a.txt",
+                "edits": { "oldText": "al", "newText": "AL" },
+                "oldText": "pha",
+                "newText": "PHA"
+            }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .expect("wrapped object plus legacy pair must apply two replacements");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("a.txt")).unwrap(),
+            "ALPHA\n"
         );
     }
 }
