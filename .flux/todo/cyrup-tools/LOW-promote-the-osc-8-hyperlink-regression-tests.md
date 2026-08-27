@@ -3,9 +3,9 @@ title: Promote the OSC-8 hyperlink regression tests into the tree
 priority: LOW
 tool: all
 source: exec follow-up from the OSC-8 hyperlink task
-stage: new
-status: pending
-updated: 2026-08-27 14:04
+stage: aug
+status: in-progress
+updated: 2026-08-27 14:35
 ---
 
 # The OSC-8 hyperlink feature shipped without permanent regression cover

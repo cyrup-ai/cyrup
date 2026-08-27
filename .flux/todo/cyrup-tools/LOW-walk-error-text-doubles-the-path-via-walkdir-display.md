@@ -3,9 +3,9 @@ title: Walk error text doubles the path via walkdir's Display
 priority: LOW
 tool: grep
 source: exec follow-up from the find-partial-results task
-stage: new
-status: pending
-updated: 2026-08-27 14:04
+stage: aug
+status: in-progress
+updated: 2026-08-27 14:35
 ---
 
 # `rg:`-prefixed walk errors double the path and interpose walkdir's wording

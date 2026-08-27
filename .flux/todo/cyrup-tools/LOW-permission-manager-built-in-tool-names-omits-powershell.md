@@ -1,10 +1,10 @@
 ---
-stage: new
-status: pending
+stage: aug
+status: in-progress
 priority: LOW
 tool: powershell
 source: QA follow-up from the powershell task
-updated: 2026-08-27 14:20
+updated: 2026-08-27 14:35
 ---
 
 # `BUILT_IN_TOOL_NAMES` in the permission manager still lists seven tools
