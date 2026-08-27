@@ -14,14 +14,14 @@ export const meta = {
 // Inputs. args = ["DECOMPOSE_X.md", ...] or omitted to take every task whose
 // body names crates/cyrup-provider.
 // ---------------------------------------------------------------------------
-const BRANCH = 'claude/cyrup-provider-decompose-ow0fh7'
+const BRANCH = 'claude/cyrup-provider-api-decompositions'
 const REQUESTED = Array.isArray(args) ? args : (args ? [args] : [])
 
 const BASELINE = `
 VERIFICATION BASELINE for crates/cyrup-provider, measured on this branch:
   cargo build -p cyrup-provider --all-targets   -> 0 errors, 0 warnings
-  cargo clippy -p cyrup-provider --all-targets  -> 37 warnings
-  cargo doc -p cyrup-provider --no-deps         -> 76 warnings
+  cargo clippy -p cyrup-provider --all-targets  -> 14 warnings
+  cargo doc -p cyrup-provider --no-deps         -> 0 warnings (broken intra-doc links are DENIED)
   cargo test -p cyrup-provider --lib            -> 1118 pass, 7 ignored, 0 fail
 Any task that changes these numbers must say so and justify it. A task that is
 supposed to be behaviour-neutral and moves them has a bug.

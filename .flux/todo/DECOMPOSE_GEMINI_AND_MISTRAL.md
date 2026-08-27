@@ -6,6 +6,32 @@ updated: 2026-08-22 22:40
 
 # Decompose google_generative_ai.rs And mistral_conversations.rs
 
+
+## Base has changed — read before starting
+
+This branch is based on main, which now sets `rustdocflags = ["--document-private-items"]` in
+`.cargo/config.toml` and `rustdoc::broken_intra_doc_links = "deny"` workspace-wide. **A broken
+intra-doc link is now a build error, not a warning.**
+
+That directly affects this task. When a file is split, doc comments that referenced a sibling item
+by bare name (`[`some_helper`]`) stop resolving, because the item is no longer in the same module —
+this is exactly what happened to four links in the bedrock split. Repair them as part of the split
+by giving the link an explicit path, e.g. ``[`format_bedrock_error`](super::errors::format_bedrock_error)``.
+Never delete the reference to silence the error; these are port-fidelity cross-references.
+
+Measured baseline on this branch (use these, not any older numbers):
+
+```
+cargo build -p cyrup-provider --all-targets   -> 0 errors, 0 warnings
+cargo clippy -p cyrup-provider --all-targets  -> 14 warnings
+cargo doc -p cyrup-provider --no-deps         -> 0 warnings
+cargo test -p cyrup-provider --lib            -> 1118 pass, 7 ignored, 0 fail
+```
+
+Of the 14 clippy warnings, 13 are `return_self_not_must_use` from main's lint policy in files this
+task does not touch, and 1 is the deliberately-accepted `result_large_err` on `run_inner`. Do not
+"fix" either; just do not add to them.
+
 ## Description
 
 Two mid-sized api impls, grouped into one task because verification found each too small to
@@ -49,6 +75,6 @@ boundaries — do not reorder items to make a tidier module.
 - [ ] Every file differs from its pre-split content by nothing but the `pub(super)` token, module headers and `use` blocks
 - [ ] `api/mod.rs` unedited; `google_vertex.rs` still compiles untouched
 - [ ] `cargo build -p cyrup-provider --all-targets` — 0 errors, 0 warnings
-- [ ] `cargo clippy -p cyrup-provider --all-targets` — still 37 warnings, none new here
-- [ ] `cargo doc -p cyrup-provider --no-deps` — still 76 warnings, none new here
+- [ ] `cargo clippy -p cyrup-provider --all-targets` — still 14 warnings, none new in this module
+- [ ] `cargo doc -p cyrup-provider --no-deps` — still **0** warnings (broken links are denied, so any new one is a build error)
 - [ ] `cargo test -p cyrup-provider --lib` — 1118 pass; 24 + 15 tests still run in these modules
