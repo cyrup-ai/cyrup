@@ -74,10 +74,17 @@ impl Ctx {
 /// `http-request` record 1:1, arch-08 §3.2 draft, pi-mcp-adapter-port.md §3.2).
 #[derive(Clone, Debug, Default)]
 pub struct HttpRequest {
+    /// The HTTP method — `"GET" | "POST" | ...` (WIT `http-request.method`, `wit/world.wit:850`).
+    /// Set by [`Self::get`] or [`Self::new`].
     pub method: String,
+    /// The absolute request URL.
     pub url: String,
+    /// The request headers, in the order [`Self::header`] appended them.
     pub headers: Vec<(String, String)>,
+    /// The raw request body, or `None` for a bodyless request. Set by [`Self::body`].
     pub body: Option<Vec<u8>>,
+    /// A per-request timeout in milliseconds, or `None` to leave the bound to the host. Set by
+    /// [`Self::timeout_ms`].
     pub timeout_ms: Option<u32>,
 }
 
@@ -91,16 +98,19 @@ impl HttpRequest {
         Self { method: method.into(), url: url.into(), ..Default::default() }
     }
     /// Append a request header (builder-style).
+    #[must_use]
     pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
         self
     }
     /// Set the request body (builder-style).
+    #[must_use]
     pub fn body(mut self, body: impl Into<Vec<u8>>) -> Self {
         self.body = Some(body.into());
         self
     }
     /// Set a request timeout in milliseconds (builder-style).
+    #[must_use]
     pub fn timeout_ms(mut self, ms: u32) -> Self {
         self.timeout_ms = Some(ms);
         self
@@ -121,8 +131,13 @@ impl HttpRequest {
 /// The response to an [`HttpRequest`] (mirrors the WIT `http-response` record 1:1).
 #[derive(Clone, Debug, Default)]
 pub struct HttpResponse {
+    /// The HTTP status code. A non-2xx is delivered here rather than as an `Err` — see
+    /// [`Ctx::http_request`].
     pub status: u16,
+    /// The response headers.
     pub headers: Vec<(String, String)>,
+    /// The fully-read response body (WIT `http-response.body`, `wit/world.wit:859`) — the bounded
+    /// counterpart to [`HttpStreamResponse`], which carries no body at all.
     pub body: Vec<u8>,
 }
 
@@ -140,8 +155,12 @@ impl HttpResponse {
 /// draining the body via [`Ctx::http_poll_stream_chunk`].
 #[derive(Clone, Debug, Default)]
 pub struct HttpStreamResponse {
+    /// The opaque stream handle to pass to [`Ctx::http_poll_stream_chunk`] and
+    /// [`Ctx::http_close_stream`] (WIT `http-stream-response.handle`, `wit/world.wit:869`).
     pub handle: u32,
+    /// The initiating response's status code — readable before a single body byte is drained.
     pub status: u16,
+    /// The initiating response's headers — likewise readable before draining the body.
     pub headers: Vec<(String, String)>,
 }
 

@@ -4,13 +4,13 @@
 //! are inert stubs on the host target).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use cyrup_ext_sdk::prelude::*;
-use cyrup_ext_sdk::RawOutcome;
+use crate::prelude::*;
+use crate::RawOutcome;
 use serde_json::json;
 
 #[test]
 fn example_subscribes_to_tool_call_and_agent_start() {
-    let api = cyrup_ext_sdk::example::build();
+    let api = crate::example::build();
     let kinds = api.subscription_kinds();
     assert!(kinds.contains(&0), "tool_call (kind 0) subscribed");
     assert!(kinds.contains(&7), "agent_start (kind 7) subscribed");
@@ -87,7 +87,7 @@ fn unsubscribed_event_is_noop() {
 
 #[test]
 fn guest_tool_executes_and_streams() {
-    let api = cyrup_ext_sdk::example::build();
+    let api = crate::example::build();
     let call = ToolCall::new("tc", json!({ "text": "hi" }));
     let out = api.execute_tool("demo_echo", call).expect("tool runs");
     assert!(!out.is_error);
@@ -157,13 +157,13 @@ fn content_block_serializes_like_core_content() {
 
 #[test]
 fn provider_oauth_closures_dispatch() {
-    use cyrup_ext_sdk::{OAuthProvider, ProviderHandlers};
+    use crate::{OAuthProvider, ProviderHandlers};
     let mut api = ExtensionApi::new();
     let oauth = OAuthProvider::new(
         "Demo",
         // host target: OAuthCallbacks.on_prompt returns Err (inert), so the login derives the
         // access from a constant rather than the prompt — still proves the closure dispatches.
-        |_cb: &cyrup_ext_sdk::OAuthCallbacks| Ok(json!({ "refresh": "r", "access": "a0", "expires": 0 })),
+        |_cb: &crate::OAuthCallbacks| Ok(json!({ "refresh": "r", "access": "a0", "expires": 0 })),
         |creds: serde_json::Value| {
             let r = creds.get("refresh").and_then(|v| v.as_str()).unwrap_or("r");
             Ok(json!({ "refresh": r, "access": "a1", "expires": 0 }))
@@ -206,7 +206,7 @@ fn provider_oauth_closures_dispatch() {
 
 #[test]
 fn provider_stream_simple_pushes_events() {
-    use cyrup_ext_sdk::{ProviderConfig, ProviderHandlers, ProviderStream};
+    use crate::{ProviderConfig, ProviderHandlers, ProviderStream};
     let mut api = ExtensionApi::new();
     let stream = |model: serde_json::Value, _c: serde_json::Value, _o: serde_json::Value, out: &ProviderStream| {
         out.emit(json!({ "type": "text", "text": model["id"].clone() }));
@@ -236,7 +236,7 @@ fn provider_stream_simple_pushes_events() {
 
 #[test]
 fn autocomplete_provider_stacking_folds_over_base() {
-    use cyrup_ext_sdk::{AutocompleteItem, AutocompleteQuery, AutocompleteSuggestions};
+    use crate::{AutocompleteItem, AutocompleteQuery, AutocompleteSuggestions};
     let mut api = ExtensionApi::new();
     api.add_autocomplete_provider(
         |q: &AutocompleteQuery, current: Option<&AutocompleteSuggestions>| {
@@ -271,7 +271,7 @@ fn autocomplete_provider_stacking_folds_over_base() {
 
 #[test]
 fn define_tool_factory_bundles_descriptor_and_exec() {
-    use cyrup_ext_sdk::tool_factory::{bash_descriptor, define_tool};
+    use crate::tool_factory::{bash_descriptor, define_tool};
     let mut api = ExtensionApi::new();
     let tool = define_tool(bash_descriptor("/work"), |call: ToolCall| {
         let cmd = call.params.get("command").and_then(|v| v.as_str()).unwrap_or("");
@@ -287,7 +287,7 @@ fn define_tool_factory_bundles_descriptor_and_exec() {
 
 #[test]
 fn dialog_options_and_typed_command_options_serialize() {
-    use cyrup_ext_sdk::{DialogOptions, ForkOptions, ForkPosition, NavigateOptions, NewSessionOptions};
+    use crate::{DialogOptions, ForkOptions, ForkPosition, NavigateOptions, NewSessionOptions};
     // Dialog option bag (Pi `ExtensionUIDialogOptions { signal?, timeout? }`).
     //
     // EXT-048: the wire key is `timeout`, NOT `timeoutMs` — `timeout?: number` upstream, with no
@@ -345,7 +345,7 @@ fn dialog_options_and_typed_command_options_serialize() {
 
 #[test]
 fn example_registers_oauth_provider_and_autocomplete() {
-    let api = cyrup_ext_sdk::example::build();
+    let api = crate::example::build();
     // The bundled demo now registers the demo-oauth provider with OAuth + streamSimple.
     let creds = api.provider_login("demo-oauth").err();
     // On host target on_prompt errors (inert), so login surfaces that error — proving the closure ran.
@@ -369,8 +369,9 @@ fn turn_start_decodes_index_and_timestamp() {
 }
 
 #[test]
-fn all_thirty_events_are_registerable() {
-    // Register one handler per event kind and assert the bitset reports all 30 discriminants.
+fn all_33_event_kinds_are_registerable() {
+    // Register one handler per event kind and assert the bitset reports all 33 discriminants
+    // (`mod kind`, api.rs:21-64, defines 33).
     let mut api = ExtensionApi::new();
     api.on_tool_call(|_, _| Outcome::noop());
     api.on_tool_result(|_, _| Outcome::noop());
@@ -455,21 +456,21 @@ fn with_session_closure_registers_runs_once_and_is_consumed() {
     // stored under an id (embedded in the `control.*` opts) and the host runs it via `with-session`.
     let ran = Rc::new(Cell::new(0u32));
     let r2 = ran.clone();
-    let id = cyrup_ext_sdk::ctx::register_with_session(Box::new(move |_rsc: &ReplacedSessionContext| {
+    let id = crate::ctx::register_with_session(Box::new(move |_rsc: &ReplacedSessionContext| {
         r2.set(r2.get() + 1);
         Ok(())
     }));
 
     // An unknown id is a no-op (never an error).
-    assert!(cyrup_ext_sdk::ctx::run_with_session("no-such-id").is_ok());
+    assert!(crate::ctx::run_with_session("no-such-id").is_ok());
     assert_eq!(ran.get(), 0);
 
     // The registered id runs the closure exactly once...
-    cyrup_ext_sdk::ctx::run_with_session(&id).expect("withSession closure runs");
+    crate::ctx::run_with_session(&id).expect("withSession closure runs");
     assert_eq!(ran.get(), 1);
 
     // ...and is consumed: a second invocation is a no-op (the closure does not re-run).
-    cyrup_ext_sdk::ctx::run_with_session(&id).expect("consumed id is a no-op");
+    crate::ctx::run_with_session(&id).expect("consumed id is a no-op");
     assert_eq!(ran.get(), 1);
 }
 
@@ -538,14 +539,14 @@ fn tool_result_decodes_an_absent_usage_argument_as_none() {
 /// explicit clear on the host side.
 #[test]
 fn tool_result_patch_carries_usage_and_omits_it_when_absent() {
-    let patch = cyrup_ext_sdk::events::ToolResultPatch {
+    let patch = crate::events::ToolResultPatch {
         usage: Some(serde_json::json!({ "input": 5 })),
         ..Default::default()
     };
     let v = serde_json::to_value(&patch).unwrap();
     assert_eq!(v, serde_json::json!({ "usage": { "input": 5 } }));
 
-    let empty = cyrup_ext_sdk::events::ToolResultPatch::default();
+    let empty = crate::events::ToolResultPatch::default();
     let v = serde_json::to_value(&empty).unwrap();
     assert!(!v.as_object().unwrap().contains_key("usage"));
 }

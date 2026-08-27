@@ -48,8 +48,15 @@ pub fn run_with_session(id: &str) -> Result<(), String> {
 }
 
 /// Serialize `opts` and inject the registered `withSession` callback id (sdk gap #3).
+///
+/// **On an `opts` encode failure the options are replaced with `{}`** and only the callback id
+/// survives, so the re-binding still happens but with host defaults. Every in-crate caller
+/// (`new_session_with_callback`, `fork_with_callback`, `switch_session_with_callback`) passes a
+/// concrete SDK options struct whose `Serialize` is derived and cannot fail, so the substitution is
+/// unreachable through the public API; it exists only because the parameter is `impl Serialize`.
 pub(super) fn opts_with_callback(opts: impl Serialize, with_session: WithSessionFn) -> String {
     let id = register_with_session(with_session);
+    // Encode failure -> `{}` (unreachable through the public API, see the doc comment above).
     let mut v = serde_json::to_value(&opts).unwrap_or_else(|_| json!({}));
     if let Some(obj) = v.as_object_mut() {
         obj.insert("withSessionCallbackId".into(), json!(id));
@@ -68,6 +75,9 @@ pub struct ReplacedSessionContext {
 }
 
 impl ReplacedSessionContext {
+    /// A context over the replacement session. [`CommandCtx`] is a unit struct reaching the host
+    /// through WIT imports, so this binds nothing and is what [`run_with_session`] hands the stored
+    /// closure.
     pub fn new() -> Self {
         Self { cmd: CommandCtx::new() }
     }

@@ -68,8 +68,11 @@ pub fn hstack(children: impl IntoIterator<Item = Value>) -> Value {
 /// every extension widget landed in the one slot cyrup had.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum WidgetPlacement {
+    /// `"aboveEditor"` — upstream's documented default for
+    /// `ExtensionWidgetOptions.placement`, and the [`Default`] here.
     #[default]
     AboveEditor,
+    /// `"belowEditor"`.
     BelowEditor,
 }
 

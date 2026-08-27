@@ -11,10 +11,13 @@ use serde_json::Value;
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolCallEvent {
+    /// The host's id for the call about to run (`toolCallId` on the wire).
     #[serde(rename = "toolCallId")]
     pub call_id: String,
+    /// The tool's name (`toolName` on the wire).
     #[serde(rename = "toolName")]
     pub name: String,
+    /// The arguments the call is about to run with (Pi `input`).
     pub input: Value,
 }
 
@@ -24,13 +27,17 @@ pub struct ToolCallEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultEvent {
+    /// The host's id for the completed call (`toolCallId` on the wire).
     #[serde(rename = "toolCallId")]
     pub call_id: String,
+    /// The tool's name (`toolName` on the wire).
     #[serde(rename = "toolName")]
     pub name: String,
     /// The executed tool's arguments (Pi `ToolResultEventBase.input`, types.ts:886).
     pub input: Value,
+    /// The result content the model would see; replace it through [`ToolResultPatch::content`].
     pub content: Value,
+    /// Whether the tool reported a failure.
     pub is_error: bool,
     /// The per-tool structured details (Pi `BashToolDetails | … | undefined`, types.ts:891-928).
     /// `None` (= Pi `undefined`) for tools that carry none (e.g. `write`).
@@ -44,24 +51,31 @@ pub struct ToolResultEvent {
     pub usage: Option<Value>,
 }
 
-/// `context` (Pi types.ts:1144) — filter/replace the LLM message list.
+/// `context` (Pi types.ts:1207) — filter/replace the LLM message list.
 #[derive(Clone, Debug)]
 pub struct ContextEvent {
+    /// The LLM message list about to be sent; a handler filters or replaces it wholesale.
     pub messages: Value,
 }
 
-/// `message_end` (Pi types.ts:1143) — replace the just-finished message (same role).
+/// `message_end` (Pi types.ts:1222) — replace the just-finished message (same role).
 #[derive(Clone, Debug)]
 pub struct MessageEndEvent {
+    /// The just-finished message. A replacement must keep the same role (see the type doc).
     pub message: Value,
 }
 
-/// `before_agent_start` (Pi types.ts:1135) — inject a message and/or replace the system prompt.
+/// `before_agent_start` (Pi types.ts:1214) — inject a message and/or replace the system prompt.
 #[derive(Clone, Debug)]
 pub struct BeforeAgentStartEvent {
+    /// The prompt the run is about to start with.
     pub prompt: String,
+    /// The images attached to that prompt.
     pub images: Value,
+    /// The system prompt the run is about to use; replace it through
+    /// [`BeforeAgentStartResult::system_prompt`].
     pub system_prompt: String,
+    /// The run's options bag, as raw JSON.
     pub options: Value,
 }
 
@@ -72,6 +86,7 @@ pub struct BeforeAgentStartEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InputEvent {
+    /// The submission text (Pi `InputEvent.text`).
     pub text: String,
     /// Attached images (Pi `InputEvent.images?`, types.ts:805); `None` = Pi `undefined`.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,11 +101,12 @@ pub struct InputEvent {
 
 /// `user_bash` (Pi `UserBashEvent`, types.ts:782-790) — block/transform/provide a `!`/`!!` bash
 /// invocation. Byte-shape: `{command, excludeFromContext, cwd}`. The `operations`/`result` override
-/// is RETURNED as the handler's [`crate::Outcome`] (Pi `UserBashEventResult`), not carried on
-/// the event.
+/// is RETURNED by the handler as [`crate::Outcome::Handled`] (Pi `UserBashEventResult`), not
+/// carried on the event.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UserBashEvent {
+    /// The bash command the `!`/`!!` prefix introduced (Pi types.ts:785).
     pub command: String,
     /// True when the `!!` prefix was used (excluded from LLM context) (Pi types.ts:787).
     pub exclude_from_context: bool,
@@ -98,22 +114,26 @@ pub struct UserBashEvent {
     pub cwd: String,
 }
 
-/// `before_provider_request` (Pi types.ts:1160) — mutate the outbound provider payload.
+/// `before_provider_request` (Pi types.ts:1209) — mutate the outbound provider payload.
 #[derive(Clone, Debug)]
 pub struct BeforeProviderRequestEvent {
+    /// The outbound provider payload; return the mutation through [`crate::Outcome::mutate`].
     pub payload: Value,
 }
 
-/// `after_provider_response` (Pi types.ts:1161) — notify with HTTP status + headers.
+/// `after_provider_response` (Pi types.ts:1213) — notify with HTTP status + headers.
 #[derive(Clone, Debug)]
 pub struct AfterProviderResponseEvent {
+    /// The response's HTTP status code.
     pub status: u32,
+    /// The response headers.
     pub headers: Value,
 }
 
 /// `model_select` (Pi types.ts:1162) — notify of a model change.
 #[derive(Clone, Debug)]
 pub struct ModelSelectEvent {
+    /// The newly selected model.
     pub model: Value,
     /// pi `ModelSelectEvent.previousModel` (`extensions/types.ts:797` @v0.83.0) — a SIBLING field.
     /// cyrup used to nest it inside `model`, so a ported handler read `event.previousModel` and got
@@ -126,6 +146,7 @@ pub struct ModelSelectEvent {
 /// `thinking_level_select` (Pi types.ts:1163).
 #[derive(Clone, Debug)]
 pub struct ThinkingLevelSelectEvent {
+    /// The newly selected thinking level.
     pub level: String,
     /// pi `ThinkingLevelSelectEvent.previousLevel` (`extensions/types.ts:805` @v0.83.0) — EXT-042.
     /// Without it a handler that wants to react only to an INCREASE had to keep a shadow copy and
@@ -136,12 +157,14 @@ pub struct ThinkingLevelSelectEvent {
 /// `agent_end` (Pi types.ts:1138) — notify with the full final message list.
 #[derive(Clone, Debug)]
 pub struct AgentEndEvent {
+    /// The full final message list for the run.
     pub messages: Value,
 }
 
 /// `turn_start` (Pi `TurnStartEvent`, types.ts:688-693).
 #[derive(Clone, Debug)]
 pub struct TurnStartEvent {
+    /// The turn's zero-based index within the run.
     pub turn_index: u32,
     /// Wall-clock milliseconds at emit (Pi `Date.now()`, agent-session.ts:624).
     pub timestamp: u64,
@@ -152,7 +175,9 @@ pub struct TurnStartEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnEndEvent {
+    /// The turn's index — the same counter [`TurnStartEvent::turn_index`] carries.
     pub turn_index: u32,
+    /// The finalized assistant message for this turn (Pi `TurnEndEvent.message`).
     pub message: Value,
     /// The tool-result messages produced this turn (Pi `TurnEndEvent.toolResults`, types.ts:708).
     pub tool_results: Value,
@@ -163,6 +188,7 @@ pub struct TurnEndEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageStartEvent {
+    /// The full message that just started — user, assistant or toolResult, not just its role.
     pub message: Value,
 }
 
@@ -171,6 +197,7 @@ pub struct MessageStartEvent {
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MessageUpdateEvent {
+    /// The full in-flight message as it stands at this delta.
     pub message: Value,
     /// The provider stream delta (Pi `MessageUpdateEvent.assistantMessageEvent`, types.ts:721).
     pub assistant_message_event: Value,
@@ -179,31 +206,40 @@ pub struct MessageUpdateEvent {
 /// `tool_execution_start` (Pi types.ts:1147).
 #[derive(Clone, Debug)]
 pub struct ToolExecStartEvent {
+    /// The host's id for the call starting execution.
     pub call_id: String,
+    /// The tool's name.
     pub name: String,
+    /// The arguments it is executing with.
     pub args: Value,
 }
 
 /// `tool_execution_update` (Pi types.ts) — HIGH-FREQ.
 #[derive(Clone, Debug)]
 pub struct ToolExecUpdateEvent {
+    /// The host's id for the call this chunk belongs to.
     pub call_id: String,
     /// pi `ToolExecutionUpdateEvent.toolName` (`extensions/types.ts:773` @v0.83.0) — EXT-014.
     pub name: String,
     /// pi `ToolExecutionUpdateEvent.args` (`extensions/types.ts:774` @v0.83.0) — EXT-014.
     pub args: Value,
+    /// One partial-output chunk from the running tool; for a guest tool, what it pushed through
+    /// [`crate::ToolCall::emit_update`].
     pub chunk: Value,
 }
 
 /// `tool_execution_end` (Pi types.ts).
 #[derive(Clone, Debug)]
 pub struct ToolExecEndEvent {
+    /// The host's id for the call that finished.
     pub call_id: String,
     /// pi `ToolExecutionEndEvent.toolName` (`extensions/types.ts:782` @v0.83.0) — EXT-014. Without
     /// it an observer had to keep its own `callId -> toolName` map from `tool_execution_start`, and
     /// could not filter by tool at all if it missed the start.
     pub name: String,
+    /// The tool's result.
     pub result: Value,
+    /// Whether that result is a failure.
     pub is_error: bool,
 }
 
@@ -217,13 +253,14 @@ pub struct ToolExecEndEvent {
 /// two sides of a replacement, so one struct carries it under one name.
 #[derive(Clone, Debug)]
 pub struct SessionLifecycleEvent {
+    /// Why the session started or shut down; the values include `"reload"`.
     pub reason: String,
     /// `previousSessionFile` on `session_start`, `targetSessionFile` on `session_shutdown`.
     pub session_file: Option<String>,
 }
 
 /// `session_info_changed` (pi `SessionInfoChangedEvent`, `extensions/types.ts:571-575` @v0.83.0,
-/// subscribed at `:1203`) — EXT-011.
+/// subscribed at `:1193` — EXT-073: `:1203` is `session_compact`) — EXT-011.
 #[derive(Clone, Debug)]
 pub struct SessionInfoChangedEvent {
     /// "Current normalized session name. Undefined when the name is cleared" — so `None` is a
@@ -235,6 +272,7 @@ pub struct SessionInfoChangedEvent {
 /// EXT-016.
 #[derive(Clone, Debug)]
 pub struct ResourcesDiscoverEvent {
+    /// The directory resources are being discovered for.
     pub cwd: String,
     /// `"startup" | "reload"`.
     pub reason: String,
@@ -246,6 +284,8 @@ pub struct ResourcesDiscoverEvent {
 /// allowlist policy cannot be written without it.
 #[derive(Clone, Debug)]
 pub struct ProjectTrustEvent {
+    /// The directory the trust verdict is being asked about — the key upstream's trust store is
+    /// keyed by, per the type doc.
     pub cwd: String,
 }
 
@@ -255,6 +295,8 @@ pub struct ProjectTrustEvent {
 /// header." Return the patch through [`crate::Outcome::mutate`] — a key mapped to `null` DELETES.
 #[derive(Clone, Debug)]
 pub struct BeforeProviderHeadersEvent {
+    /// The outbound provider headers. Return the patch through [`crate::Outcome::mutate`]; a key
+    /// mapped to `null` DELETES that header (see the type doc).
     pub headers: Value,
 }
 
@@ -271,6 +313,7 @@ pub struct SessionBeforeSwitchEvent {
 /// `session_before_fork` (Pi types.ts:1149).
 #[derive(Clone, Debug)]
 pub struct SessionBeforeForkEvent {
+    /// The entry the fork is anchored on.
     pub entry_id: String,
     /// pi `SessionBeforeForkEvent.position: "before" | "at"` (`extensions/types.ts:588`
     /// @v0.83.0) — EXT-015. A fork BEFORE an entry and a fork AT it are different operations.
@@ -336,6 +379,7 @@ pub struct SessionCompactEvent {
 /// `session_tree` (Pi types.ts:1156).
 #[derive(Clone, Debug)]
 pub struct SessionTreeEvent {
+    /// The session's entry tree after the transition.
     pub tree: Value,
 }
 
@@ -345,10 +389,13 @@ pub struct SessionTreeEvent {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolResultPatch {
+    /// Replaces [`ToolResultEvent::content`] in full when present; omitted keeps the tool's value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub content: Option<Value>,
+    /// Replaces [`ToolResultEvent::details`] in full when present; omitted keeps the tool's value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub details: Option<Value>,
+    /// Replaces [`ToolResultEvent::is_error`] when present; omitted keeps the tool's value.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub is_error: Option<bool>,
     /// Replaces the tool result's usage in full when present (Pi `ToolResultEventResult.usage`,
@@ -362,8 +409,10 @@ pub struct ToolResultPatch {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BeforeAgentStartResult {
+    /// A message to inject before the run starts; omitted injects nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<Value>,
+    /// A replacement for [`BeforeAgentStartEvent::system_prompt`]; omitted keeps the host's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
 }
@@ -372,10 +421,13 @@ pub struct BeforeAgentStartResult {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResourcesResult {
+    /// Skill file paths this extension contributes.
     #[serde(default)]
     pub skill_paths: Vec<String>,
+    /// Prompt file paths this extension contributes.
     #[serde(default)]
     pub prompt_paths: Vec<String>,
+    /// Theme file paths this extension contributes.
     #[serde(default)]
     pub theme_paths: Vec<String>,
 }
@@ -386,8 +438,11 @@ pub struct ResourcesResult {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ProjectTrustDecision {
+    /// pi's `"yes"` — terminal: the project is trusted and no further handler is consulted.
     Yes,
+    /// pi's `"no"` — terminal: the project is not trusted.
     No,
+    /// pi's `"undecided"` — falls through to the next handler; the [`Default`] here.
     #[default]
     Undecided,
 }
@@ -398,7 +453,10 @@ pub enum ProjectTrustDecision {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectTrustResult {
+    /// The tri-state verdict — see [`ProjectTrustDecision`]. Built by [`Self::trust`],
+    /// [`Self::distrust`] or [`Self::undecided`].
     pub trusted: ProjectTrustDecision,
+    /// Whether to persist the decision rather than decide only for this run.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub remember: bool,
 }

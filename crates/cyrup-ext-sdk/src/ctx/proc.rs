@@ -109,28 +109,43 @@ impl Ctx {
 /// surfaced via [`Ctx::proc_read_stderr`].
 #[derive(Clone, Debug, Default)]
 pub struct ProcSpawnOptions {
+    /// Extra environment pairs, OVERLAID onto the host's own inherited environment rather than
+    /// replacing it (see the type doc above). Built with [`Self::env`].
     pub env: Vec<(String, String)>,
+    /// The child's working directory; `None` leaves the choice to the host. Built with
+    /// [`Self::cwd`].
     pub cwd: Option<String>,
+    /// Pipe and buffer the child's stderr so [`Ctx::proc_read_stderr`] can drain it; left unset
+    /// (`false`) the child's stderr is dropped. Built with [`Self::capture_stderr`].
     pub capture_stderr: bool,
 }
 
 impl ProcSpawnOptions {
     /// Append (or override) an environment variable (builder-style).
+    #[must_use]
     pub fn env(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.env.push((key.into(), value.into()));
         self
     }
     /// Set the child's working directory (builder-style).
+    #[must_use]
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
     /// Pipe + buffer stderr for [`Ctx::proc_read_stderr`] (builder-style).
+    #[must_use]
     pub fn capture_stderr(mut self, yes: bool) -> Self {
         self.capture_stderr = yes;
         self
     }
 
+    /// The `env` pairs as a JSON object.
+    ///
+    /// **On an encode failure the env map is replaced with `{}`** and the child is spawned with no
+    /// extra environment. Nothing author-supplied is serialized here — the value is a
+    /// `HashMap<&str, &str>` borrowed from the already-owned `env` `String`s, and a string-keyed
+    /// map of strings has no `serde_json` failure mode — so the substitution is unreachable.
     #[cfg(target_arch = "wasm32")]
     fn env_json(&self) -> String {
         // Scoped to the body: `env_json` is the only `HashMap` user here and it is wasm-only, so a
@@ -139,6 +154,7 @@ impl ProcSpawnOptions {
 
         let map: HashMap<&str, &str> =
             self.env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        // Encode failure -> `{}` (unreachable, see the doc comment above).
         serde_json::to_string(&map).unwrap_or_else(|_| "{}".into())
     }
 }

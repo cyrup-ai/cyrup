@@ -1,6 +1,7 @@
-//! Provider OAuth + custom-stream guest closures (Pi `ProviderConfig.oauth`/`streamSimple`,
-//! types.ts:1373-1392; arch-08 §5.6). The static [`crate::ProviderConfig`] (baseUrl/apiKey/models)
-//! crosses the seam as serializable JSON and registers models host-side; the DYNAMIC callbacks
+//! Provider OAuth + custom-stream guest closures (Pi `ProviderConfig.oauth`/`streamSimple`, on the
+//! config `registerProvider(name, config)` takes, types.ts:1401; arch-08 §5.6). The static
+//! [`crate::ProviderConfig`] (baseUrl/apiKey/models) crosses the seam as serializable JSON and
+//! registers models host-side; the DYNAMIC callbacks
 //! (`login`/`refreshToken`/`getApiKey`/`modifyModels` and `streamSimple`) cannot serialize, so they
 //! live guest-side in [`ProviderHandlers`] keyed by provider id and are invoked across the boundary
 //! via the `provider-*` WIT exports (host gap #1 / sdk gap #1).
@@ -23,6 +24,8 @@ pub type OAuthCredentials = Value;
 pub struct OAuthCallbacks;
 
 impl OAuthCallbacks {
+    /// A callbacks handle. [`OAuthCallbacks`] is a unit struct — every method reaches the `oauth`
+    /// host import directly — so this binds nothing.
     pub fn new() -> Self {
         OAuthCallbacks
     }
@@ -111,6 +114,9 @@ pub struct ProviderStream {
 }
 
 impl ProviderStream {
+    /// Bind a sink to the host-assigned `stream_id` every [`Self::emit`] is addressed to. The
+    /// guest glue builds this for a `provider-stream-simple` call; a `streamSimple` handler
+    /// receives it rather than constructing one.
     pub fn new(stream_id: impl Into<String>) -> Self {
         Self { stream_id: stream_id.into() }
     }
@@ -119,8 +125,28 @@ impl ProviderStream {
         &self.stream_id
     }
     /// Push one assistant-message stream event (Pi `stream.push(event)`).
+    ///
+    /// **On an encode failure NO event is pushed.** `event` is author-supplied and its `serde_json`
+    /// encoding is fallible; rather than pushing a `null` event into the provider pipeline, the
+    /// push is skipped and the error is surfaced as an error-severity [`Ui::notify_with`]
+    /// notification. The signature stays `()` — Pi's `stream.push` has no return value to fold an
+    /// `Err` into.
+    ///
+    /// [`Ui::notify_with`]: crate::Ui::notify_with
     pub fn emit(&self, event: impl Serialize) {
-        let event_json = serde_json::to_string(&event).unwrap_or_else(|_| "null".into());
+        let event_json = match serde_json::to_string(&event) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::ctx::Ui.notify_with(
+                    &format!(
+                        "ProviderStream::emit({}): event dropped, failed to encode: {e}",
+                        self.stream_id
+                    ),
+                    crate::ctx::NotifyKind::Error,
+                );
+                return;
+            }
+        };
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::provider_stream::emit_event(&self.stream_id, &event_json);
         #[cfg(not(target_arch = "wasm32"))]
@@ -128,7 +154,7 @@ impl ProviderStream {
     }
 
     /// **Call this BEFORE sending the provider request**, with the request payload, and send the
-    /// REPLACEMENT this returns (`None` = unchanged).
+    /// REPLACEMENT this returns (`Ok(None)` = unchanged).
     ///
     /// Half of pi's must-invoke `streamSimple` contract, quoted verbatim from
     /// `ProviderConfig.streamSimple` (`extensions/types.ts:1452-1457` @v0.84.1): "Implementations
@@ -147,20 +173,43 @@ impl ProviderStream {
     /// (Upstream these are fields of the `options` bag rather than of the stream. They hang off
     /// `ProviderStream` here because the world keys BOTH on the same `stream-id` this type already
     /// owns — a [CYRUP-DELTA] of shape, not of semantics, against `types.ts:1452-1457`.)
-    pub fn on_payload(&self, payload: impl Serialize) -> Option<Value> {
-        let payload_json = serde_json::to_string(&payload).unwrap_or_else(|_| "null".into());
+    ///
+    /// **On an encode failure the host is NOT consulted and this returns `Ok(None)`.** `payload` is
+    /// author-supplied and its `serde_json` encoding is fallible; handing the host a `null` payload
+    /// would show `before_provider_request` subscribers a request that was never made, so the call
+    /// is skipped and the error is surfaced as an error-severity [`Ui::notify_with`] notification.
+    /// `Ok(None)` already means "no replacement, send yours unchanged", so the outbound request is
+    /// unaffected.
+    ///
+    /// **`Err` = the host answered with a replacement this SDK could not decode.** The `Ok(None)`
+    /// arm above is reserved for "the host had no replacement", so a `serde_json::from_str` failure
+    /// on the returned string cannot share it: folding the two together would send the ORIGINAL,
+    /// un-redacted payload while `before_provider_request` believed it had rewritten the request,
+    /// with no error raised anywhere. The host serializes a `serde_json::Value`
+    /// (`crates/cyrup-ext/src/host/live.rs:985`, `.map(|v| v.to_string())`), so this arm is
+    /// defensive against a non-cyrup host rather than reachable today.
+    ///
+    /// [`Ui::notify_with`]: crate::Ui::notify_with
+    pub fn on_payload(&self, payload: impl Serialize) -> Result<Option<Value>, String> {
+        let id = &self.stream_id;
+        let payload_json = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(e) => {
+                let m = format!("ProviderStream::on_payload({id}): host not consulted, encode failed: {e}");
+                crate::ctx::Ui.notify_with(&m, crate::ctx::NotifyKind::Error);
+                return Ok(None);
+            }
+        };
         #[cfg(target_arch = "wasm32")]
-        {
-            return crate::guest::bindings::cyrup::ext::provider_stream::on_payload(
-                &self.stream_id,
-                &payload_json,
-            )
-            .and_then(|s| serde_json::from_str(&s).ok());
-        }
+        return crate::guest::bindings::cyrup::ext::provider_stream::on_payload(id, &payload_json)
+            .map(|s| serde_json::from_str(&s).map_err(|e| {
+                format!("ProviderStream::on_payload({id}): host replacement is not valid JSON: {e}")
+            }))
+            .transpose();
         #[cfg(not(target_arch = "wasm32"))]
         {
             let _ = payload_json;
-            None
+            Ok(None)
         }
     }
 
@@ -168,8 +217,28 @@ impl ProviderStream {
     /// notify-only half of the same must-invoke contract (EXT-M05; see [`Self::on_payload`]). This
     /// is how `after_provider_response` (`extensions/types.ts:692-696`) reaches a guest provider's
     /// responses; `headers` is serialized as the response header map.
+    ///
+    /// **On a `headers` encode failure the host is NOT notified.** `headers` is author-supplied and
+    /// its `serde_json` encoding is fallible; reporting the response with an empty `{}` header map
+    /// would show `after_provider_response` subscribers headers the provider never returned, so the
+    /// call is skipped and the error is surfaced as an error-severity [`Ui::notify_with`]
+    /// notification. The signature stays `()` — this half of the contract is notify-only.
+    ///
+    /// [`Ui::notify_with`]: crate::Ui::notify_with
     pub fn on_response(&self, status: u16, headers: impl Serialize) {
-        let headers_json = serde_json::to_string(&headers).unwrap_or_else(|_| "{}".into());
+        let headers_json = match serde_json::to_string(&headers) {
+            Ok(s) => s,
+            Err(e) => {
+                crate::ctx::Ui.notify_with(
+                    &format!(
+                        "ProviderStream::on_response({}): host not notified, headers failed to encode: {e}",
+                        self.stream_id
+                    ),
+                    crate::ctx::NotifyKind::Error,
+                );
+                return;
+            }
+        };
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::provider_stream::on_response(
             &self.stream_id,
@@ -187,10 +256,14 @@ impl ProviderStream {
 pub struct OAuthProvider {
     /// Display name in the login UI.
     pub name: String,
+    /// Runs the interactive flow through [`OAuthCallbacks`] and returns the credentials to
+    /// persist. Required; set by [`Self::new`].
     #[allow(clippy::type_complexity)]
     pub login: Box<dyn Fn(&OAuthCallbacks) -> Result<OAuthCredentials, String> + 'static>,
+    /// Renews stored credentials. Required; set by [`Self::new`].
     #[allow(clippy::type_complexity)]
     pub refresh_token: Box<dyn Fn(OAuthCredentials) -> Result<OAuthCredentials, String> + 'static>,
+    /// Derives the API key string from the credentials. Required; set by [`Self::new`].
     #[allow(clippy::type_complexity)]
     pub get_api_key: Box<dyn Fn(&OAuthCredentials) -> Result<String, String> + 'static>,
     /// Optional: rewrite the provider's models given the credentials (e.g. update baseUrl).
@@ -217,6 +290,7 @@ impl OAuthProvider {
     }
 
     /// Attach an optional `modifyModels` closure.
+    #[must_use]
     pub fn with_modify_models(
         mut self,
         f: impl Fn(Value, &OAuthCredentials) -> Result<Value, String> + 'static,
@@ -226,9 +300,13 @@ impl OAuthProvider {
     }
 }
 
-/// A guest `streamSimple` handler (Pi `ProviderConfig.streamSimple`, types.ts:1373): given the model
-/// / context / options it pushes assistant-message events into the [`ProviderStream`] then returns.
+/// A guest `streamSimple` handler (Pi `ProviderConfig.streamSimple`, on the config
+/// `registerProvider(name, config)` takes, types.ts:1401): given the model / context / options it
+/// pushes assistant-message events into the [`ProviderStream`] then returns.
 pub trait StreamSimple: 'static {
+    /// Push the response for one call into `out`, then return. An `Err` here is the
+    /// provider-level failure the host sees; a single event that fails to encode never reaches
+    /// this return value — [`ProviderStream::emit`] drops it and reports it as a notification.
     fn stream(
         &self,
         model: Value,
@@ -257,25 +335,37 @@ where
 /// (the non-serializable half of Pi's `registerProvider(config)`).
 #[derive(Default)]
 pub struct ProviderHandlers {
+    /// The dynamic OAuth half, or `None` for a provider that needs no login flow. Set by
+    /// [`Self::with_oauth`]; [`Self::has_oauth`] tests it.
     pub oauth: Option<OAuthProvider>,
+    /// The custom streaming half, or `None` to leave streaming to the host. Set by
+    /// [`Self::with_stream_simple`]; [`Self::has_stream_simple`] tests it.
     pub stream_simple: Option<Box<dyn StreamSimple>>,
 }
 
 impl ProviderHandlers {
+    /// Empty handlers — neither half set. The head of the builder chain
+    /// [`Self::with_oauth`]/[`Self::with_stream_simple`].
     pub fn new() -> Self {
         Self::default()
     }
+    /// Attach the OAuth half (builder-style).
+    #[must_use]
     pub fn with_oauth(mut self, oauth: OAuthProvider) -> Self {
         self.oauth = Some(oauth);
         self
     }
+    /// Attach the `streamSimple` half (builder-style).
+    #[must_use]
     pub fn with_stream_simple(mut self, stream: impl StreamSimple) -> Self {
         self.stream_simple = Some(Box::new(stream));
         self
     }
+    /// Whether an [`OAuthProvider`] is attached.
     pub fn has_oauth(&self) -> bool {
         self.oauth.is_some()
     }
+    /// Whether a [`StreamSimple`] handler is attached.
     pub fn has_stream_simple(&self) -> bool {
         self.stream_simple.is_some()
     }

@@ -7,8 +7,8 @@
 //! world")` and assert the GUEST handler ran across the WIT boundary (its `ctx.ui().notify(...)`
 //! recorded host-side) AND that the slash command short-circuited the prompt (no user message sent).
 //!
-//! The fixture is the bundled `cyrup-ext-sdk` demo extension (its `example.rs` registers the
-//! `/greet` command), built to a component via `cargo build -p cyrup-ext-sdk --target wasm32-wasip2`
+//! The fixture is the bundled `cyrup-ext-sdk` demo extension (its `example/commands_session.rs`
+//! registers the `/greet` command), built to a component via `cargo build -p cyrup-ext-sdk --target wasm32-wasip2`
 //! (wasm32-wasip2 emits a component directly). Set `CYRUP_EXT_FIXTURE_COMPONENT` to a prebuilt
 //! component to skip the nested build.
 // The original `#![cfg(feature = "wasm-host")]` is deliberately GONE. It named
@@ -110,7 +110,7 @@ async fn wasm_guest_slash_command_executes_through_the_run_path() {
         .await
         .expect("load + init the live wasm extension");
 
-    // The guest's `init` registered `/greet` (cyrup-ext-sdk example.rs).
+    // The guest's `init` registered `/greet` (cyrup-ext-sdk example/commands_session.rs).
     assert!(
         session.services().ext_host.registry().command_names().unwrap().iter().any(|n| n == "greet"),
         "the guest-registered `/greet` command is in the host command registry"
@@ -285,7 +285,7 @@ fn fixture_component_exists() {
 /// SEAM-005 across the WIT boundary: the `events.on-agent-settled` EXPORT this change added to
 /// BOTH world.wit copies is actually invoked on a live guest.
 ///
-/// The demo subscribes `agent_settled` (cyrup-ext-sdk `example.rs`) and notifies with a distinct
+/// The demo subscribes `agent_settled` (cyrup-ext-sdk `example/hooks.rs`) and notifies with a distinct
 /// string. Driving one real turn must produce EXACTLY ONE such notification — proving the host
 /// dispatches the synthesised `HostEvent::AgentSettled` into the guest, and that it is a per-RUN
 /// event, not a per-agent-loop one (the guest's `agent_start` notification is the control).

@@ -10,7 +10,8 @@
 //! The `/execdemo` command runs `echo hi` shell:false-argv and notifies `exec stdout: hi`, which we
 //! observe host-side after driving the command through the REAL run path.
 //!
-//! The fixture is the bundled `cyrup-ext-sdk` demo extension (its `example.rs` registers `/execdemo`),
+//! The fixture is the bundled `cyrup-ext-sdk` demo extension (its `example/commands_capability.rs`
+//! registers `/execdemo`),
 //! built to a `wasm32-wasip2` component. Set `CYRUP_EXT_FIXTURE_COMPONENT` to a prebuilt component to
 //! skip the nested build.
 // The original `#![cfg(feature = "wasm-host")]` is deliberately GONE. It named

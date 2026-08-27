@@ -9,7 +9,11 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ExecMode {
+    /// The tool may run alongside the other calls in its batch.
     Parallel,
+    /// The tool must not run alongside others — and ONE such tool serializes the WHOLE batch: the
+    /// runner takes the sequential path if `calls.iter().any(|c| … == ExecMode::Sequential)`
+    /// (`cyrup-agent/src/agent/run/tools/mod.rs:57-60`).
     Sequential,
 }
 
@@ -17,8 +21,12 @@ pub enum ExecMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RenderShell {
+    /// The runtime draws the standard tool shell. Upstream's `"default"`, and its OMITTED field —
+    /// which is why the guest lowers this variant to `none` rather than to the string
+    /// (`src/guest.rs`'s `lower_tool_descriptor`, EXT-024).
     #[default]
     Default,
+    /// pi's `"self"`: the tool renders its own framing instead of the standard shell.
     #[serde(rename = "self")]
     SelfRendered,
 }
@@ -30,12 +38,20 @@ pub enum RenderShell {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ConstrainedSamplingConfig {
     /// Ask the provider for a strict JSON-schema-constrained tool call.
-    JsonSchema { strict: StrictSampling },
+    JsonSchema {
+        /// Whether an unsupporting model is an error or a silent fallback — see
+        /// [`StrictSampling`].
+        strict: StrictSampling,
+    },
     /// Ask the provider for a Lark/regex grammar-constrained tool call. The tool's parameter
     /// schema must be an object with EXACTLY ONE required string property — upstream's
     /// `inferGrammarInputProperty` (`constrained-sampling.ts:69-88` @v0.83.0) rejects anything
     /// else and the host reports it as a provider error.
-    Grammar { variants: GrammarVariants },
+    Grammar {
+        /// The grammar to constrain with, one entry per upstream format — see
+        /// [`GrammarVariants`].
+        variants: GrammarVariants,
+    },
 }
 
 /// pi's `strict: "prefer" | "require"` (`packages/ai/src/types.ts:472` @v0.83.0). `Require` makes
@@ -44,7 +60,11 @@ pub enum ConstrainedSamplingConfig {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StrictSampling {
+    /// pi's `"prefer"`: a model that does not support strict tools silently falls back to
+    /// unconstrained sampling.
     Prefer,
+    /// pi's `"require"`: a model that does not support strict tools is an ERROR — see the type doc
+    /// for the message.
     Require,
 }
 
@@ -55,8 +75,11 @@ pub enum StrictSampling {
 /// upstream, so this struct deliberately carries no `rename_all`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct GrammarVariants {
+    /// The `openai_lark` grammar. Wins over [`Self::openai_regex`] when both are present (see the
+    /// type doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_lark: Option<String>,
+    /// The `openai_regex` grammar, used when [`Self::openai_lark`] is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_regex: Option<String>,
 }
@@ -67,6 +90,8 @@ pub struct GrammarVariants {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ConstrainedSampling {
+    /// A real request. Serialized as [`ConstrainedSamplingConfig`]'s own `{"type": …}` object,
+    /// because this enum is `untagged`.
     Config(ConstrainedSamplingConfig),
     /// pi's `false` — serialized as the bare JSON literal, not an object.
     Disabled(bool),
@@ -76,17 +101,32 @@ pub enum ConstrainedSampling {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ToolDescriptor {
+    /// The tool's name: what the model calls, and the key the host routes `execute-tool` and any
+    /// renderer back by (see [`Self::has_renderer`]).
     pub name: String,
+    /// The display label. [`Self::new`] seeds it from `name`; [`Self::label`] overrides it.
     pub label: String,
+    /// The description the model reads. Empty out of [`Self::new`]; set it with
+    /// [`Self::description`].
     pub description: String,
     /// JSON-Schema for the parameters.
     pub parameters: Value,
+    /// The tool's [`ExecMode`], or `None` to leave the runtime's default. Set with
+    /// [`Self::execution_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution_mode: Option<ExecMode>,
+    /// One-line snippet for the "Available tools" section of the default system prompt (Pi
+    /// `ToolDefinition.promptSnippet`, `extensions/types.ts:442-443`); `None` omits the tool from
+    /// that section. Set with [`Self::prompt_snippet`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_snippet: Option<String>,
+    /// Guideline bullets for the "Guidelines" section of the default system prompt (Pi
+    /// `ToolDefinition.promptGuidelines`, `extensions/types.ts:444-446`). Per func-03 R-03-039 each
+    /// string must NAME its tool, so it stays meaningful once the tool is disabled.
     #[serde(default)]
     pub prompt_guidelines: Vec<String>,
+    /// Whether this tool renders its own call/result rows. Set with [`Self::has_renderer`], whose
+    /// doc carries the routing rule.
     #[serde(default)]
     pub has_renderer: bool,
     /// `renderShell` (types.ts:449): runtime-drawn shell vs. self-rendered.
@@ -124,21 +164,30 @@ impl ToolDescriptor {
         }
     }
 
+    /// Set the model-facing description (builder-style).
+    #[must_use]
     pub fn description(mut self, d: impl Into<String>) -> Self {
         self.description = d.into();
         self
     }
 
+    /// Override the display label, which [`Self::new`] seeded from the name (builder-style).
+    #[must_use]
     pub fn label(mut self, l: impl Into<String>) -> Self {
         self.label = l.into();
         self
     }
 
+    /// Set the "Available tools" system-prompt snippet (builder-style); see
+    /// [`Self::prompt_snippet`].
+    #[must_use]
     pub fn prompt_snippet(mut self, s: impl Into<String>) -> Self {
         self.prompt_snippet = Some(s.into());
         self
     }
 
+    /// Set the tool's [`ExecMode`] (builder-style).
+    #[must_use]
     pub fn execution_mode(mut self, m: ExecMode) -> Self {
         self.execution_mode = Some(m);
         self
@@ -149,6 +198,7 @@ impl ToolDescriptor {
     /// this tool NAME and routes rendering back through the guest's `render-call`/`render-result`
     /// exports (keyed by the tool name); register the matching renderer with
     /// [`crate::ExtensionApi::register_message_renderer`] under the SAME name.
+    #[must_use]
     pub fn has_renderer(mut self, yes: bool) -> Self {
         self.has_renderer = yes;
         self
@@ -160,16 +210,18 @@ impl ToolDescriptor {
     /// (`core/tools/tool-definition-wrapper.ts:14`) — and the provider adapter resolves it per
     /// model. A model that does not support the requested mode ignores it, except for
     /// [`StrictSampling::Require`], which upstream turns into an error.
+    #[must_use]
     pub fn constrained_sampling(mut self, cs: ConstrainedSamplingConfig) -> Self {
         self.constrained_sampling = Some(ConstrainedSampling::Config(cs));
         self
     }
 }
 
-/// What a guest sends to register a command (R-08-016; Pi types.ts:1105-1111).
+/// What a guest sends to register a command (R-08-016; Pi `registerCommand`, types.ts:1247).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandDescriptor {
+    /// The command's description, as passed to [`Self::new`].
     pub description: String,
     /// Static completions; dynamic completions use the command handler's `getArgumentCompletions`.
     #[serde(default)]
@@ -177,6 +229,7 @@ pub struct CommandDescriptor {
 }
 
 impl CommandDescriptor {
+    /// A command with `description` and no static completions.
     pub fn new(description: impl Into<String>) -> Self {
         Self { description: description.into(), completions: Vec::new() }
     }
@@ -193,36 +246,45 @@ impl CommandDescriptor {
 /// `signal_id` is the WASM-boundary adaptation of Pi's `options.signal: AbortSignal` (`exec.ts:65-
 /// 72`): Pi extensions run in-process and can hand `execCommand` a live `AbortSignal` object
 /// directly; a WASM guest cannot pass an object reference across the component boundary, so it
-/// instead references a signal it already registered by ID via [`crate::Ui::abort_signal`] (the
-/// SAME id namespace [`DialogOptions::signal_id`] uses). Since the guest is wasm-suspended for the
-/// whole duration of a host `exec` call, only Pi's "already aborted before the call" branch
-/// (`exec.ts:66-68`) is reachable — the host checks `signal_id` once, at call time, and starts the
-/// process pre-cancelled if it was already aborted (`cyrup-ext/src/host/live.rs`'s `exec::Host::run`).
+/// instead references a signal by ID — the id it aborts through `ctx.ui()`'s
+/// [`crate::ctx::Ui::abort_signal`] (the SAME id namespace [`DialogOptions::signal_id`] uses).
+/// Since the guest is wasm-suspended for the whole duration of a host `exec` call, only Pi's
+/// "already aborted before the call" branch (`exec.ts:66-68`) is reachable — the host checks
+/// `signal_id` once, at call time, and starts the process pre-cancelled if it was already aborted
+/// (`cyrup-ext/src/host/live.rs`'s `exec::Host::run`).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExecOptions {
+    /// The child's working directory (Pi `ExecOptions.cwd`). Set with [`Self::cwd`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    /// Kill the child if it is still running after this many milliseconds. Set with
+    /// [`Self::timeout_ms`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// The abort-signal id the host checks ONCE, at call time — see the type doc for why only
+    /// upstream's "already aborted" branch is reachable here. Set with [`Self::signal_id`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_id: Option<String>,
 }
 
 impl ExecOptions {
     /// Set the child's working directory (builder-style).
+    #[must_use]
     pub fn cwd(mut self, cwd: impl Into<String>) -> Self {
         self.cwd = Some(cwd.into());
         self
     }
     /// Kill the child if it's still running after `ms` (builder-style).
+    #[must_use]
     pub fn timeout_ms(mut self, ms: u64) -> Self {
         self.timeout_ms = Some(ms);
         self
     }
     /// Bind an already-registered programmatic abort signal (builder-style; Pi `options.signal`,
-    /// `exec.ts:65-72`): if `id` was aborted via [`crate::Ui::abort_signal`] before this call, the
-    /// exec starts pre-cancelled instead of running at all.
+    /// `exec.ts:65-72`): if `id` was aborted via `ctx.ui()`'s [`crate::ctx::Ui::abort_signal`]
+    /// before this call, the exec starts pre-cancelled instead of running at all.
+    #[must_use]
     pub fn signal_id(mut self, id: impl Into<String>) -> Self {
         self.signal_id = Some(id.into());
         self
@@ -245,8 +307,13 @@ impl ExecOptions {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DialogOptions {
+    /// Auto-dismiss the dialog after this many milliseconds, with a live countdown. `timeout` on
+    /// the wire, with `timeoutMs` accepted as an alias — see EXT-048 in the type doc. Set with
+    /// [`Self::timeout`].
     #[serde(rename = "timeout", alias = "timeoutMs", default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
+    /// The id of a programmatic-dismiss signal the host maps to an abort token. Set with
+    /// [`Self::signal`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signal_id: Option<String>,
 }
@@ -268,8 +335,10 @@ impl DialogOptions {
 pub struct FlagSpec {
     /// `"boolean"` | `"string"`.
     pub r#type: String,
+    /// The value the flag takes when the user does not pass it; `None` for no default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default: Option<Value>,
+    /// The flag's help text.
     #[serde(default)]
     pub description: String,
 }
@@ -280,7 +349,10 @@ pub struct FlagSpec {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
+    /// The provider's name (Pi `ProviderConfig.name`).
     pub name: String,
+    /// Base URL for the provider's API; an individual model can carry its own in
+    /// [`ProviderModelConfig::base_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// The wire API family (e.g. `"anthropic"`, `"openai"`).
@@ -293,8 +365,11 @@ pub struct ProviderConfig {
     /// <resolved key>`. (sdk gap #27 — was a stringly-typed `Option<String>`.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auth_header: Option<bool>,
+    /// Extra HTTP headers for this provider's requests; an individual model can carry its own in
+    /// [`ProviderModelConfig::headers`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// The models this provider offers, each a [`ProviderModelConfig`].
     #[serde(default)]
     pub models: Vec<ProviderModelConfig>,
     /// OAuth metadata (`{name}`): a static marker that this provider authenticates via OAuth. The
@@ -312,14 +387,19 @@ pub struct ProviderConfig {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCostTier {
+    /// The request input-token count above which this tier's four rates apply.
     #[serde(default)]
     pub input_tokens_above: u64,
+    /// This tier's input rate, in the same units as [`ModelCost::input`].
     #[serde(default)]
     pub input: f64,
+    /// This tier's output rate, in the same units as [`ModelCost::output`].
     #[serde(default)]
     pub output: f64,
+    /// This tier's cache-read rate, in the same units as [`ModelCost::cache_read`].
     #[serde(default)]
     pub cache_read: f64,
+    /// This tier's cache-write rate, in the same units as [`ModelCost::cache_write`].
     #[serde(default)]
     pub cache_write: f64,
 }
@@ -329,14 +409,20 @@ pub struct ModelCostTier {
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelCost {
+    /// Per-token cost of input tokens.
     #[serde(default)]
     pub input: f64,
+    /// Per-token cost of output tokens.
     #[serde(default)]
     pub output: f64,
+    /// Per-token cost of tokens read from the prompt cache.
     #[serde(default)]
     pub cache_read: f64,
+    /// Per-token cost of tokens written to the prompt cache.
     #[serde(default)]
     pub cache_write: f64,
+    /// Optional request-wide input pricing tiers ([`ModelCostTier`]) for a model whose rates change
+    /// above a token threshold; `None` means the four rates above are the whole story.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tiers: Option<Vec<ModelCostTier>>,
 }
@@ -348,30 +434,40 @@ pub struct ModelCost {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderModelConfig {
+    /// The model's id.
     pub id: String,
+    /// An optional display name for the model.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// The wire API family for this model, when it differs from the provider's
+    /// [`ProviderConfig::api`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api: Option<String>,
+    /// A per-model base URL, when it differs from the provider's [`ProviderConfig::base_url`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     /// Whether the model supports extended thinking (Pi `reasoning`).
     #[serde(default)]
     pub reasoning: bool,
+    /// Pi `thinkingLevelMap`. Open-shaped, so it crosses as raw [`Value`] (see the type doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thinking_level_map: Option<Value>,
     /// Supported input modalities (Pi `input: ("text"|"image")[]`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input: Vec<String>,
+    /// Per-token pricing for this model ([`ModelCost`]).
     #[serde(default)]
     pub cost: ModelCost,
+    /// The model's context window in tokens; `None` when unspecified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u64>,
     /// Max output tokens (Pi `maxTokens`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u64>,
+    /// Per-model HTTP headers, alongside the provider's [`ProviderConfig::headers`].
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub headers: std::collections::BTreeMap<String, String>,
+    /// Pi `compat`. Open-shaped, so it crosses as raw [`Value`] (see the type doc).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<Value>,
 }
@@ -395,8 +491,12 @@ pub enum ForkPosition {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ForkOptions {
+    /// Where the fork lands relative to the entry ([`ForkPosition`]); `None` leaves the host's
+    /// choice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<ForkPosition>,
+    /// Request the `with-session` re-binding callback after the fork — see the type doc. Set for
+    /// you by [`crate::CommandCtx::fork_with_callback`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub with_session: bool,
 }
@@ -406,12 +506,21 @@ pub struct ForkOptions {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NavigateOptions {
+    /// Summarize the span the navigation skips.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub summarize: bool,
+    /// Extra guidance for that summary; appended to the default prompt unless
+    /// [`Self::replace_instructions`] is also set.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
+    /// Use [`Self::custom_instructions`] INSTEAD of the default prompt rather than in addition to
+    /// it. Load-bearing only together with it — upstream's selector is
+    /// `if (replaceInstructions && customInstructions)`, so this flag alone falls through to the
+    /// plain prompt (`branch-summarization.ts:326-334`, mirrored at
+    /// `cyrup-session/src/compaction/branch.rs:242-252`).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub replace_instructions: bool,
+    /// An optional label for the summary entry the navigation produces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
 }
@@ -422,12 +531,14 @@ pub struct NavigateOptions {
 /// Pi's bag also carries `onComplete(result)` / `onError(error)` callbacks. Those are function
 /// VALUES and cannot cross the component boundary, so they have no field here: a guest that needs
 /// the completion signal subscribes to the `session_compact` event
-/// ([`crate::events::SessionCompactEvent`], Pi's own `SessionCompactEvent`), which carries the produced
-/// compaction entry. Pi's `compact()` is fire-and-forget on both sides — it "triggers compaction
-/// without awaiting completion" — so the call itself returns as soon as the host has queued it.
+/// ([`crate::events::SessionCompactEvent`], Pi's own `SessionCompactEvent`), which carries the
+/// produced compaction entry. Pi's `compact()` is fire-and-forget on both sides — it "triggers
+/// compaction without awaiting completion" — so the call itself returns as soon as the host has
+/// queued it.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompactOptions {
+    /// Extra guidance handed to the compaction summarizer; `None` = no instructions.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_instructions: Option<String>,
 }
@@ -437,8 +548,11 @@ pub struct CompactOptions {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NewSessionOptions {
+    /// The parent session the new one descends from; `None` for a root session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session: Option<String>,
+    /// Request the `with-session` re-binding callback after the new session is bound. Set for you
+    /// by [`crate::CommandCtx::new_session_with_callback`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub with_session: bool,
 }
@@ -447,6 +561,8 @@ pub struct NewSessionOptions {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchSessionOptions {
+    /// Request the `with-session` re-binding callback after the switch. Set for you by
+    /// [`crate::CommandCtx::switch_session_with_callback`].
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub with_session: bool,
 }

@@ -10,7 +10,7 @@
 //!     `host.emit_session_before_compact` DIRECTLY, NOT through `AgentSession::compact()`.
 //!
 //! This test removes that hedge with ONE end-to-end proof: it loads the REAL compiled wasm guest
-//! (the bundled `cyrup-ext-sdk` demo — its `example.rs::on_session_before_compact` reads the typed
+//! (the bundled `cyrup-ext-sdk` demo — its `example/hooks.rs::on_session_before_compact` reads the typed
 //! preparation and returns `demo-summary[<reason>|firstKept=<firstKeptEntryId>]`) INTO an assembled
 //! `AgentSession`, drives two real turns to build compactable content, then calls the PRODUCTION
 //! `AgentSession::compact()` path (NOT `host.emit_*`). It asserts the guest's typed-payload-derived

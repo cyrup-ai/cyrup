@@ -11,9 +11,14 @@ use crate::widget::WidgetPlacement;
 /// [`NotifyKind::Info`] is Pi's default when the argument is omitted.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum NotifyKind {
+    /// Informational — Pi's default when `notify`'s optional type argument is omitted, and the
+    /// [`Default`] here.
     #[default]
     Info,
+    /// Warning severity.
     Warning,
+    /// Error severity — the level the SDK itself uses when it has to report that an author payload
+    /// was dropped rather than sent (`Ctx::emit`, `ToolCall::emit_update`, [`Ui::custom`]).
     Error,
 }
 
@@ -51,7 +56,8 @@ impl NotifyKind {
 ///
 /// 1. **`modes/rpc/rpc-types.ts`, uniform +8.** `confirm` cited `:232` (a BLANK line; it is `:240`)
 ///    and `input` cited `:233-240` (a banner comment; it is `:241-248`). Five sites: both
-///    `world.wit` copies, `cyrup-ext/src/host/services.rs`, this file, and `example.rs`.
+///    `world.wit` copies, `cyrup-ext/src/host/services.rs`, this file, and
+///    `example/commands_ui.rs`.
 /// 2. **`cyrup-ext/src/host/services.rs`'s fire-and-forget block, uniform ~+6.** `notify` `:136`,
 ///    `setStatus` `:141-142`, `setHeader` `:184`, `setFooter` `:174-177`, `setTitle` `:187`,
 ///    `setEditorText` `:210`, `setToolsExpanded` `:275`, and the `rpc-mode.ts:149,163,196`
@@ -257,19 +263,27 @@ impl Ui {
         let _ = key;
     }
 
-    // --- chrome (Pi setFooter/setHeader/setTitle, `types.ts:183`/`:190`/`:193` @v0.83.0) ---
+    /// Set the chrome header line (Pi `setHeader`, `types.ts:190` @v0.83.0).
+    ///
+    /// Like its two siblings [`Self::set_footer`] and [`Self::set_title`] this is
+    /// fire-and-forget — the WIT import returns nothing, so a host-side failure is not observable
+    /// here — and a no-op on the host (non-`wasm32`) target.
     pub fn set_header(&self, content: &str) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::set_header(content);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = content;
     }
+    /// Set the chrome footer line (Pi `setFooter`, `types.ts:183` @v0.83.0); fire-and-forget, see
+    /// [`Self::set_header`].
     pub fn set_footer(&self, content: &str) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::set_footer(content);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = content;
     }
+    /// Set the chrome title (Pi `setTitle`, `types.ts:193` @v0.83.0); fire-and-forget, see
+    /// [`Self::set_header`].
     pub fn set_title(&self, title: &str) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::set_title(title);
@@ -277,8 +291,23 @@ impl Ui {
         let _ = title;
     }
     /// A custom overlay component; returns an optional serialized result (Pi `custom()`).
+    ///
+    /// **On an encode failure NO overlay is opened and this returns [`None`].** `spec` is
+    /// author-supplied and its `serde_json` encoding is fallible; rather than opening an overlay
+    /// from a `null` spec, the call is skipped and the error is surfaced as an error-severity
+    /// [`Self::notify_with`] notification. `None` is already this method's "no result" answer, so
+    /// the signature is unchanged.
     pub fn custom(&self, spec: impl Serialize) -> Option<String> {
-        let spec_json = serde_json::to_string(&spec).unwrap_or_else(|_| "null".into());
+        let spec_json = match serde_json::to_string(&spec) {
+            Ok(s) => s,
+            Err(e) => {
+                self.notify_with(
+                    &format!("ui.custom: overlay not opened, spec failed to encode: {e}"),
+                    NotifyKind::Error,
+                );
+                return None;
+            }
+        };
         #[cfg(target_arch = "wasm32")]
         {
             return crate::guest::bindings::cyrup::ext::ui::custom(&spec_json);
@@ -290,16 +319,20 @@ impl Ui {
         }
     }
 
-    // --- editor buffer access (Pi `setEditorText` `types.ts:216`, `getEditorText` `:219`, and
-    // `pasteToEditor` `:213` @v0.83.0 — NOTE the upstream name is `pasteToEditor`; there is no
-    // `pasteEditorText` in pi, and the WIT import that carries this is spelled `paste-editor-text`) ---
-    //
-    // CYRUP-DELTA (EXT-021): these three ARE the editor surface a guest gets. pi additionally has
-    // `setEditorComponent(factory)` / `getEditorComponent()` (`extensions/types.ts:260`, `:263`
-    // @v0.83.0), where `EditorFactory` (`:125`) returns a live component the host then drives
-    // through a draw/handle-input/dispose protocol. That is a reference, not a value, and ADR-0002
-    // makes extension I/O values — the full reasoning, and the reason `onTerminalInput` (`:145`) is
-    // an open GAP rather than a delta, is in the register at `crates/cyrup-ext/src/lib.rs`.
+    /// The editor buffer's current text (Pi `getEditorText`, `types.ts:219` @v0.83.0);
+    /// `String::new()` on the host (non-`wasm32`) target.
+    ///
+    /// This method plus [`Self::set_editor_text`] (Pi `setEditorText`, `:216`) and
+    /// [`Self::paste_editor_text`] (Pi `pasteToEditor`, `:213` — NOTE the upstream name is
+    /// `pasteToEditor`; there is no `pasteEditorText` in pi, and the WIT import that carries this is
+    /// spelled `paste-editor-text`) are the whole editor surface a guest gets.
+    ///
+    /// CYRUP-DELTA (EXT-021): pi additionally has `setEditorComponent(factory)` /
+    /// `getEditorComponent()` (`extensions/types.ts:260`, `:263` @v0.83.0), where `EditorFactory`
+    /// (`:125`) returns a live component the host then drives through a draw/handle-input/dispose
+    /// protocol. That is a reference, not a value, and ADR-0002 makes extension I/O values — the
+    /// full reasoning, and the reason `onTerminalInput` (`:145`) is an open GAP rather than a delta,
+    /// is in the register at `crates/cyrup-ext/src/lib.rs`.
     pub fn editor_text(&self) -> String {
         #[cfg(target_arch = "wasm32")]
         {
@@ -308,12 +341,16 @@ impl Ui {
         #[cfg(not(target_arch = "wasm32"))]
         String::new()
     }
+    /// Replace the editor buffer's text (Pi `setEditorText`, `types.ts:216` @v0.83.0); see
+    /// [`Self::editor_text`] for the surface this belongs to.
     pub fn set_editor_text(&self, text: &str) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::set_editor_text(text);
         #[cfg(not(target_arch = "wasm32"))]
         let _ = text;
     }
+    /// Paste `text` into the editor buffer (Pi `pasteToEditor`, `types.ts:213` @v0.83.0 — see
+    /// [`Self::editor_text`] on the name difference).
     pub fn paste_editor_text(&self, text: &str) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::paste_editor_text(text);
@@ -321,8 +358,13 @@ impl Ui {
         let _ = text;
     }
 
-    // --- theme read/list/switch (Pi `theme`/`getAllThemes`/`getTheme`/`setTheme`,
-    // extensions/types.ts:266-275 @v0.83.0) ---
+    /// The active theme's NAME only — [`Self::theme_json`] is what returns its colours (EXT-066).
+    /// `None` when the host has no theme to report, and always `None` on the host (non-`wasm32`)
+    /// target.
+    ///
+    /// The head of the theme read/list/switch group: [`Self::theme`], [`Self::theme_json`],
+    /// [`Self::theme_list`], [`Self::theme_by_name`], [`Self::set_theme`], mirroring Pi
+    /// `theme`/`getAllThemes`/`getTheme`/`setTheme` (`extensions/types.ts:266-275` @v0.83.0).
     pub fn theme(&self) -> Option<String> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -338,6 +380,10 @@ impl Ui {
     /// EXT-066: [`Self::theme`] returns only the NAME, so the live theme used to be the one theme a
     /// guest could not read the colours of — a renderer had to call `theme()` then
     /// `theme_by_name()`, which is two round trips and races a theme switch between them.
+    ///
+    /// `Some(`[`Value::Null`]`)` when the host DID report a theme but sent JSON this SDK could not
+    /// parse (`super::parse_json`'s fallback). That is distinct from the `None` above — the
+    /// unparseable case never collapses into "no theme".
     pub fn theme_json(&self) -> Option<Value> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -351,6 +397,10 @@ impl Ui {
     /// `extensions/types.ts:269` @v0.83.0). `path` is null for a built-in theme — EXT-021: this
     /// returned bare names, so a guest could neither tell a built-in from a file-backed theme nor
     /// locate the file.
+    ///
+    /// [`Value::Null`] — NOT an empty array — when the host sent JSON this SDK could not parse
+    /// (`super::parse_json`'s fallback), so a caller that treats a non-array as "no themes" cannot
+    /// tell the two apart. The WIT import promises a JSON array (`wit/world.wit:716`).
     pub fn theme_list(&self) -> Value {
         #[cfg(target_arch = "wasm32")]
         {
@@ -362,6 +412,10 @@ impl Ui {
 
     /// Load one theme by name WITHOUT switching to it (Pi `getTheme(name): Theme | undefined`,
     /// `extensions/types.ts:272` @v0.83.0). `None` = no such theme (EXT-021).
+    ///
+    /// `Some(`[`Value::Null`]`)` when the theme EXISTS but the host sent JSON this SDK could not
+    /// parse (`super::parse_json`'s fallback). That is distinct from the `None` above — the
+    /// unparseable case never collapses into "no such theme".
     pub fn theme_by_name(&self, name: &str) -> Option<Value> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -373,6 +427,10 @@ impl Ui {
             None
         }
     }
+    /// Switch the active theme by name (Pi `setTheme`, in the `extensions/types.ts:266-275` theme
+    /// block @v0.83.0) — the one member of that group that mutates. `Ok(())` on the host
+    /// (non-`wasm32`) target: it is fire-and-forget with nothing to hand back, the first arm of the
+    /// module's host-target rule (see [`crate::ctx`]).
     pub fn set_theme(&self, name: &str) -> Result<(), String> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -443,7 +501,8 @@ impl Ui {
         crate::guest::bindings::cyrup::ext::ui::working_stop();
     }
 
-    // --- tools-expanded get/set (Pi getToolsExpanded/setToolsExpanded) ---
+    /// Whether tool rows are expanded (Pi `getToolsExpanded()`, `types.ts:278` @v0.83.0; WIT
+    /// `ui.get-tools-expanded`, `wit/world.wit:750`). `false` on the host (non-`wasm32`) target.
     pub fn tools_expanded(&self) -> bool {
         #[cfg(target_arch = "wasm32")]
         {
@@ -452,6 +511,9 @@ impl Ui {
         #[cfg(not(target_arch = "wasm32"))]
         false
     }
+    /// Expand or collapse tool rows (Pi `setToolsExpanded(expanded)`, `types.ts:281` @v0.83.0; WIT
+    /// `ui.set-tools-expanded`, `wit/world.wit:751`). Fire-and-forget; a no-op on the host
+    /// (non-`wasm32`) target.
     pub fn set_tools_expanded(&self, expanded: bool) {
         #[cfg(target_arch = "wasm32")]
         crate::guest::bindings::cyrup::ext::ui::set_tools_expanded(expanded);

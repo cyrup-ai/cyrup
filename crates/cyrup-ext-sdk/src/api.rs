@@ -17,7 +17,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
 
-// Event-kind discriminants — kept in lockstep with the host `EventKind` (cyrup-ext/src/event.rs).
+// Event-kind discriminants. Three hand-maintained copies carry this numbering — the host's
+// `EventKind` (cyrup-ext/src/event.rs), this table, and the literals `export_extension!` passes to
+// `guest::hook`/`guest::notify` (src/macros.rs) — and the discriminant crosses the WIT boundary as
+// a bare `u8`, so no compiler compares any pair of them. Two tests do, one per leg:
+// `src/tests/world_import_coverage.rs` checks this table against `src/macros.rs`, and
+// `cyrup-ext/src/tests/event_kind_lockstep.rs` checks it against `EventKind::from_u8`. Renumbering
+// any one copy on its own turns at least one of them red.
 mod kind {
     pub const TOOL_CALL: u8 = 0;
     pub const TOOL_RESULT: u8 = 1;
@@ -82,12 +88,17 @@ pub enum Outcome {
 }
 
 impl Outcome {
+    /// The no-contribution outcome ([`Outcome::Noop`]): no block, no mutate, nothing handled.
     pub fn noop() -> Self {
         Outcome::Noop
     }
+    /// Short-circuit the action with a reason (first block wins host-side), WITHOUT pi's
+    /// `terminate` hint — for that, use [`Outcome::block_and_terminate`].
     pub fn block(reason: impl Into<String>) -> Self {
         Outcome::Block(Some(reason.into()), false)
     }
+    /// Short-circuit the action with NO reason, so the host has no text to surface. Carries no
+    /// `terminate` hint.
     pub fn block_silent() -> Self {
         Outcome::Block(None, false)
     }
@@ -100,12 +111,39 @@ impl Outcome {
         Outcome::Block(Some(reason.into()), true)
     }
     /// A raw event-specific mutate patch.
+    ///
+    /// **On an encode failure this returns [`Outcome::Noop`], NOT a mutate.** `v` is author-supplied
+    /// and `serde_json` encoding is genuinely fallible for author types (a map with a non-string
+    /// key, a `#[serde(flatten)]` over a non-map, a hand-written `Serialize` that returns `Err`).
+    /// `Noop` is the only substitute that cannot corrupt the event: an encoded `null` would reach
+    /// the host as a real mutate patch and, on `tool_call`, replace the tool's arguments with
+    /// `null`. Use [`Outcome::try_mutate`] when the author wants to see the error.
     pub fn mutate(v: impl Serialize) -> Self {
-        Outcome::Mutate(serde_json::to_value(v).unwrap_or(Value::Null))
+        Outcome::try_mutate(v).unwrap_or(Outcome::Noop)
+    }
+    /// [`Outcome::mutate`], with the encode failure surfaced instead of degraded to
+    /// [`Outcome::Noop`].
+    pub fn try_mutate(v: impl Serialize) -> Result<Self, String> {
+        match serde_json::to_value(v) {
+            Ok(v) => Ok(Outcome::Mutate(v)),
+            Err(e) => Err(format!("Outcome::mutate: {e}")),
+        }
     }
     /// A fully-serviced result.
+    ///
+    /// **On an encode failure this returns [`Outcome::Noop`], NOT a handled result** — see
+    /// [`Outcome::mutate`] for why the substitute is `Noop`. Use [`Outcome::try_handled`] when the
+    /// author wants to see the error.
     pub fn handled(v: impl Serialize) -> Self {
-        Outcome::Handled(serde_json::to_value(v).unwrap_or(Value::Null))
+        Outcome::try_handled(v).unwrap_or(Outcome::Noop)
+    }
+    /// [`Outcome::handled`], with the encode failure surfaced instead of degraded to
+    /// [`Outcome::Noop`].
+    pub fn try_handled(v: impl Serialize) -> Result<Self, String> {
+        match serde_json::to_value(v) {
+            Ok(v) => Ok(Outcome::Handled(v)),
+            Err(e) => Err(format!("Outcome::handled: {e}")),
+        }
     }
 
     // --- typed mutate helpers (per-event shapes) ---
@@ -154,11 +192,14 @@ impl Outcome {
 /// The lowered outcome the guest export glue converts into the WIT `hook-outcome`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RawOutcome {
+    /// [`Outcome::Noop`] lowered: the handler changed nothing.
     Noop,
     /// `{reason, terminate}` — pi `ToolCallEventResult` (`extensions/types.ts:1072-1079`
     /// @v0.84.1). `terminate` is read only on `tool_call` (EXT-049).
     Block(Option<String>, bool),
+    /// [`Outcome::Mutate`] lowered — the patch already serialized to JSON by `Outcome::into_raw`.
     Mutate(String),
+    /// [`Outcome::Handled`] lowered — likewise already serialized.
     Handled(String),
 }
 
@@ -168,11 +209,22 @@ pub enum RawOutcome {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum ContentBlock {
-    Text { text: String },
-    Image { data: String, mime_type: String },
+    /// A text block; built by [`Self::text`].
+    Text {
+        /// The block's text.
+        text: String,
+    },
+    /// An image block.
+    Image {
+        /// The image bytes, base64-encoded (as in `cyrup_core::Content::Image`).
+        data: String,
+        /// The image's MIME type; `mimeType` on the wire.
+        mime_type: String,
+    },
 }
 
 impl ContentBlock {
+    /// A `text` content block.
     pub fn text(t: impl Into<String>) -> Self {
         ContentBlock::Text { text: t.into() }
     }
@@ -181,8 +233,13 @@ impl ContentBlock {
 /// The result of executing a guest-registered tool (Pi `AgentToolResult`, `packages/agent/src/types.ts:355-369` @v0.83.0 — a DIFFERENT package; EXT-036 corrected `extensions/types.ts:1043`, which is a member of the `ExtensionEvent` union).
 #[derive(Clone, Debug, Default)]
 pub struct ToolOutput {
+    /// The result blocks the model sees. [`Self::text`] and [`Self::error`] build a single-text
+    /// one.
     pub content: Vec<ContentBlock>,
+    /// The per-tool structured details blob — app/extension metadata, NOT sent to the model
+    /// (`cyrup_core::ToolResult`'s own rule). Set with [`Self::with_details`].
     pub details: Option<Value>,
+    /// Whether this result is a failure (Pi `isError`); set by [`Self::error`].
     pub is_error: bool,
     /// End the agent loop after this result (Pi `terminate`, R-08-015).
     pub terminate: bool,
@@ -197,10 +254,16 @@ impl ToolOutput {
     pub fn error(t: impl Into<String>) -> Self {
         Self { content: vec![ContentBlock::text(t)], is_error: true, ..Self::default() }
     }
+    /// Attach the per-tool `details` blob. A value that fails to serialize leaves `details`
+    /// unset rather than failing the tool.
+    #[must_use]
     pub fn with_details(mut self, d: impl Serialize) -> Self {
         self.details = serde_json::to_value(d).ok();
         self
     }
+    /// Set [`ToolOutput::terminate`]: end the agent loop after this result (Pi `terminate`,
+    /// R-08-015).
+    #[must_use]
     pub fn terminating(mut self) -> Self {
         self.terminate = true;
         self
@@ -211,6 +274,8 @@ impl ToolOutput {
 /// [`ToolCall`] carries the `toolCallId`, parsed `params`, and a `Ctx` with `emit_update` (onUpdate)
 /// and the capability surface. Cancellation (Pi `signal`) is enforced host-side via the epoch.
 pub trait ToolExec: 'static {
+    /// Run the tool for one [`ToolCall`]. `Err` is the tool-level failure the host reports; a
+    /// model-visible error is `Ok(`[`ToolOutput::error`]`)` instead.
     fn execute(&self, call: ToolCall) -> Result<ToolOutput, String>;
 
     /// Coerce raw tool-call arguments BEFORE schema validation — pi
@@ -238,7 +303,9 @@ where
 
 /// A registered tool: its descriptor + its executor.
 pub struct RegisteredTool {
+    /// What crosses the seam to the host at registration.
     pub descriptor: ToolDescriptor,
+    /// The executor, which stays guest-side and runs on `execute-tool`.
     pub exec: Box<dyn ToolExec>,
 }
 
@@ -248,6 +315,8 @@ pub struct RegisteredTool {
 /// A slash-command body supplied by the guest author. Runs at COMMAND tier (the [`CommandCtx`]
 /// exposes the session-control ops); `args` is the raw argument string; returns optional text.
 pub trait CommandExec: 'static {
+    /// Run the command body against the raw argument string, returning the optional text described
+    /// on the trait.
     fn execute(&self, args: &str, ctx: &CommandCtx) -> Result<Option<String>, String>;
 }
 
@@ -267,8 +336,12 @@ pub type ArgCompleter = Box<dyn Fn(&str) -> Vec<String> + 'static>;
 /// A registered slash command: its descriptor, its handler, and an optional dynamic argument
 /// completer.
 pub struct RegisteredCommand {
+    /// What crosses the seam to the host at registration.
     pub descriptor: CommandDescriptor,
+    /// The command body, which stays guest-side.
     pub handler: Box<dyn CommandExec>,
+    /// An optional dynamic completer, run through the `get-argument-completions` export; `None`
+    /// leaves only [`CommandDescriptor::completions`]'s static list.
     pub completions: Option<ArgCompleter>,
 }
 
@@ -280,6 +353,7 @@ pub struct RegisteredCommand {
 /// Invoked across the `execute-shortcut` export when the registered `KeyId` fires; receives the base
 /// [`Ctx`] (Pi hands the shortcut handler the general `ExtensionContext`).
 pub trait ShortcutExec: 'static {
+    /// Run the shortcut body against the base [`Ctx`].
     fn execute(&self, ctx: &Ctx) -> Result<(), String>;
 }
 
@@ -297,8 +371,11 @@ where
 /// `registration.register-shortcut` import; the handler stays guest-side and runs via
 /// `execute-shortcut` (so a registered shortcut is no longer structurally inert).
 pub struct RegisteredShortcut {
+    /// The key that fires it (Pi `KeyId`); crosses the seam at registration.
     pub key: String,
+    /// The description the host displays; crosses the seam alongside the key.
     pub description: String,
+    /// The body, which stays guest-side and runs via `execute-shortcut`.
     pub handler: Box<dyn ShortcutExec>,
 }
 
@@ -307,9 +384,11 @@ pub struct RegisteredShortcut {
 /// A custom message renderer the guest registers for a `custom_type`. Each method returns a
 /// serialized widget tree (`Value`), or `None` to fall back to the runtime's default renderer.
 pub trait MessageRenderer: 'static {
+    /// Render the CALL row as a widget tree, or `None` (the default) to leave it to the runtime.
     fn render_call(&self, _call: &Value, _ctx: &Ctx) -> Option<Value> {
         None
     }
+    /// Render the RESULT row as a widget tree, or `None` (the default) to leave it to the runtime.
     fn render_result(&self, _result: &Value, _ctx: &Ctx) -> Option<Value> {
         None
     }
@@ -317,7 +396,10 @@ pub trait MessageRenderer: 'static {
 
 /// A registered renderer keyed by its `custom_type`.
 pub struct RegisteredRenderer {
+    /// The key this renderer is registered under, and the one the host routes `render-call` /
+    /// `render-result` back by.
     pub custom_type: String,
+    /// The renderer itself, which stays guest-side.
     pub renderer: Box<dyn MessageRenderer>,
 }
 
@@ -329,7 +411,11 @@ pub struct RegisteredRenderer {
 pub struct MarkdownTransformContext {
     /// `"user" | "assistant" | "assistant-thinking"`.
     pub message_type: String,
+    /// Whether the message is still streaming. `false` when the host's `isStreaming` is absent or
+    /// not a bool ([`Self::from_json`]).
     pub is_streaming: bool,
+    /// The host's `availableWidth`. `0` when it is absent, not a number, or does not fit a `u32`
+    /// ([`Self::from_json`]).
     pub available_width: u32,
 }
 
@@ -361,6 +447,8 @@ impl MarkdownTransformContext {
 /// (`loader.ts:309-312`). The host folds every extension's transformer in load order, so this
 /// receives whatever the previous extension produced.
 pub trait MarkdownTransformer: 'static {
+    /// Return the markdown to render. Because the host folds transformers in load order, the
+    /// `markdown` given here is whatever the previous extension produced.
     fn transform(&self, markdown: &str, ctx: &MarkdownTransformContext) -> String;
 }
 
@@ -373,8 +461,12 @@ pub trait MarkdownTransformer: 'static {
 /// leaves it alone.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TerminalInputResult {
+    /// Swallow the keystroke when truthy. Tested for TRUTHINESS by the fold, so `None` and
+    /// `Some(false)` behave alike. Set by [`Self::consume`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub consume: Option<bool>,
+    /// Rewrite the keystroke's data. Tested for PRESENCE by the fold, so `Some("")` rewrites the
+    /// buffer to empty while `None` leaves it alone. Set by [`Self::rewrite`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<String>,
 }
@@ -400,6 +492,8 @@ impl TerminalInputResult {
 /// (`types.ts:144`): in RPC mode pi's own implementation is a no-op that returns an unsubscribe
 /// doing nothing (`modes/rpc/rpc-mode.ts:162`).
 pub trait TerminalInputHandler: 'static {
+    /// Inspect one raw terminal input chunk. `None` is upstream's `undefined` — "I looked at it and
+    /// did nothing".
     fn on_input(&self, data: &str) -> Option<TerminalInputResult>;
 }
 
@@ -507,6 +601,7 @@ fn opt_images(s: &str) -> Option<Value> {
 }
 
 impl ExtensionApi {
+    /// An empty API surface — no handlers, no registrations. Identical to `Default::default()`.
     pub fn new() -> Self {
         Self::default()
     }
@@ -655,8 +750,8 @@ impl ExtensionApi {
 
     /// Listen to raw terminal input (EXT-021; pi `ctx.ui.onTerminalInput(handler)`,
     /// `extensions/types.ts:145` @v0.83.0 — "Listen to raw terminal input (interactive mode
-    /// only)"). A second call REPLACES the first; see
-    /// [`ExtensionApi::terminal_input_handler`]'s field doc for why.
+    /// only)"). A second call REPLACES the first; see the `terminal_input_handler` field's doc
+    /// for why.
     pub fn on_terminal_input(&mut self, handler: impl TerminalInputHandler) {
         self.terminal_input_handler = Some(Box::new(handler));
     }
@@ -730,15 +825,26 @@ impl ExtensionApi {
         self.bus_subscriptions.push((topic.into(), Box::new(handler)));
     }
 
-    // --- the 33 event subscriptions (pi `pi.on`, types.ts:1190-1231 @v0.83.0; EXT-072 corrected
-    // the count AND the range, which cited the message-rendering block) ---
+    // --- the 33 event subscriptions ---
 
+    /// `tool_call` — VETOABLE (returns [`Outcome`]): block the call with [`Outcome::block`]
+    /// (first block wins host-side) or rewrite its arguments with
+    /// [`Outcome::replace_tool_input`]. Payload [`ToolCallEvent`].
+    ///
+    /// The first of this type's 33 event subscribers (pi `pi.on`, types.ts:1190-1231 @v0.83.0;
+    /// EXT-072 corrected the count AND the range, which cited the message-rendering block).
+    /// Each subscriber below names its pi event and says whether it is vetoable or
+    /// notify-only. `tool_call` is the one kind that fails CLOSED: it is cyrup's permission
+    /// seam (R-08-010), so a handler that traps, panics or exhausts its budget DENIES the call
+    /// instead of silently allowing it (EXT-001).
     pub fn on_tool_call(&mut self, f: impl Fn(ToolCallEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::TOOL_CALL, Box::new(move |a, c| {
             let ev = ToolCallEvent { call_id: arg(a, 0).into(), name: arg(a, 1).into(), input: json(arg(a, 2)) };
             f(ev, c).into_raw()
         }));
     }
+    /// `tool_result` — VETOABLE (returns [`Outcome`]): override result fields with
+    /// [`Outcome::patch_tool_result`] (replace-not-merge, R-08-011). Payload [`ToolResultEvent`].
     pub fn on_tool_result(&mut self, f: impl Fn(ToolResultEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::TOOL_RESULT, Box::new(move |a, c| {
             let ev = ToolResultEvent {
@@ -755,16 +861,22 @@ impl ExtensionApi {
             f(ev, c).into_raw()
         }));
     }
+    /// `context` — VETOABLE (returns [`Outcome`]): filter or replace the LLM message list with
+    /// [`Outcome::replace_messages`]. Payload [`ContextEvent`].
     pub fn on_context(&mut self, f: impl Fn(ContextEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::CONTEXT, Box::new(move |a, c| {
             f(ContextEvent { messages: json(arg(a, 0)) }, c).into_raw()
         }));
     }
+    /// `message_end` — VETOABLE (returns [`Outcome`]): replace the just-finished message with
+    /// [`Outcome::replace_message`] (same role enforced host-side). Payload [`MessageEndEvent`].
     pub fn on_message_end(&mut self, f: impl Fn(MessageEndEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::MESSAGE_END, Box::new(move |a, c| {
             f(MessageEndEvent { message: json(arg(a, 0)) }, c).into_raw()
         }));
     }
+    /// `before_agent_start` — VETOABLE (returns [`Outcome`]): inject a message and/or replace the
+    /// system prompt with [`Outcome::before_agent_start`]. Payload [`BeforeAgentStartEvent`].
     pub fn on_before_agent_start(&mut self, f: impl Fn(BeforeAgentStartEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::BEFORE_AGENT_START, Box::new(move |a, c| {
             let ev = BeforeAgentStartEvent {
@@ -776,6 +888,8 @@ impl ExtensionApi {
             f(ev, c).into_raw()
         }));
     }
+    /// `input` — VETOABLE (returns [`Outcome`]): transform the submission, or service it outright
+    /// with [`Outcome::handled`]. Payload [`InputEvent`].
     pub fn on_input(&mut self, f: impl Fn(InputEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::INPUT, Box::new(move |a, c| {
             let ev = InputEvent {
@@ -787,6 +901,8 @@ impl ExtensionApi {
             f(ev, c).into_raw()
         }));
     }
+    /// `user_bash` — VETOABLE (returns [`Outcome`]): block, transform or fully service a `!`/`!!`
+    /// bash invocation ([`Outcome::handled`]). Payload [`UserBashEvent`].
     pub fn on_user_bash(&mut self, f: impl Fn(UserBashEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::USER_BASH, Box::new(move |a, c| {
             let ev = UserBashEvent {
@@ -797,13 +913,18 @@ impl ExtensionApi {
             f(ev, c).into_raw()
         }));
     }
+    /// `before_provider_request` — VETOABLE (returns [`Outcome`]): mutate the outbound provider
+    /// payload. Payload [`BeforeProviderRequestEvent`].
     pub fn on_before_provider_request(&mut self, f: impl Fn(BeforeProviderRequestEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::BEFORE_PROVIDER_REQUEST, Box::new(move |a, c| {
             f(BeforeProviderRequestEvent { payload: json(arg(a, 0)) }, c).into_raw()
         }));
     }
-    /// `before_provider_headers` (EXT-009). Return the header patch via [`Outcome::mutate`]; a key
-    /// mapped to `null` DELETES that header (pi `extensions/types.ts:681-685` @v0.83.0).
+    /// `before_provider_headers` (EXT-009) — VETOABLE-shaped: it returns [`Outcome`], not `()`.
+    /// The reading the host gives that outcome is the header patch — return it via
+    /// [`Outcome::mutate`], where a key mapped to `null` DELETES that header (pi
+    /// `extensions/types.ts:681-685` @v0.83.0: handlers "mutate `headers` in place … the
+    /// return value is ignored"). Payload [`BeforeProviderHeadersEvent`].
     pub fn on_before_provider_headers(
         &mut self,
         f: impl Fn(BeforeProviderHeadersEvent, &Ctx) -> Outcome + 'static,
@@ -812,13 +933,16 @@ impl ExtensionApi {
             f(BeforeProviderHeadersEvent { headers: json(arg(a, 0)) }, c).into_raw()
         }));
     }
-    /// `session_info_changed` (EXT-011) — notify-only.
+    /// `session_info_changed` (EXT-011) — notify-only (returns `()`). Payload
+    /// [`SessionInfoChangedEvent`].
     pub fn on_session_info_changed(&mut self, f: impl Fn(SessionInfoChangedEvent, &Ctx) + 'static) {
         self.handlers.insert(
             kind::SESSION_INFO_CHANGED,
             notify(move |a, c| f(SessionInfoChangedEvent { name: opt_str(arg(a, 0)) }, c)),
         );
     }
+    /// `resources_discover` — VETOABLE (returns [`Outcome`]): contribute skill/prompt/theme paths
+    /// with [`Outcome::handled`] ([`ResourcesResult`]). Payload [`ResourcesDiscoverEvent`].
     pub fn on_resources_discover(
         &mut self,
         f: impl Fn(ResourcesDiscoverEvent, &Ctx) -> Outcome + 'static,
@@ -831,6 +955,10 @@ impl ExtensionApi {
                 .into_raw()
         }));
     }
+    /// `project_trust` — VETOABLE (returns [`Outcome`]): decide whether `cwd` is trusted. The
+    /// answer shape is [`ProjectTrustResult`], whose `trusted` is pi's TRI-STATE — `undecided`
+    /// falls through to the next handler, which a bool would collapse. Payload
+    /// [`ProjectTrustEvent`].
     pub fn on_project_trust(&mut self, f: impl Fn(ProjectTrustEvent, &Ctx) -> Outcome + 'static) {
         // EXT-043: `cwd` (pi extensions/types.ts:519-522 @v0.83.0) — the key the trust store is
         // keyed by, so `remember` has a well-defined meaning from the handler's point of view.
@@ -838,6 +966,8 @@ impl ExtensionApi {
             f(ProjectTrustEvent { cwd: arg(a, 0).into() }, c).into_raw()
         }));
     }
+    /// `session_before_switch` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
+    /// switch. Payload [`SessionBeforeSwitchEvent`].
     pub fn on_session_before_switch(&mut self, f: impl Fn(SessionBeforeSwitchEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::SESSION_BEFORE_SWITCH, Box::new(move |a, c| {
             f(
@@ -850,6 +980,8 @@ impl ExtensionApi {
             .into_raw()
         }));
     }
+    /// `session_before_fork` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the fork.
+    /// Payload [`SessionBeforeForkEvent`].
     pub fn on_session_before_fork(&mut self, f: impl Fn(SessionBeforeForkEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::SESSION_BEFORE_FORK, Box::new(move |a, c| {
             f(
@@ -862,6 +994,9 @@ impl ExtensionApi {
             .into_raw()
         }));
     }
+    /// `session_before_compact` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
+    /// compaction, or [`Outcome::compaction_override`] supplies the summary instead of the model.
+    /// Payload [`SessionBeforeCompactEvent`].
     pub fn on_session_before_compact(&mut self, f: impl Fn(SessionBeforeCompactEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::SESSION_BEFORE_COMPACT, Box::new(move |a, c| {
             let ev = SessionBeforeCompactEvent {
@@ -874,6 +1009,10 @@ impl ExtensionApi {
             f(ev, c).into_raw()
         }));
     }
+    /// `session_before_tree` — VETOABLE (returns [`Outcome`]): [`Outcome::block`] refuses the
+    /// branch summarization, or [`Outcome::tree_override`] overrides its
+    /// summary/instructions/label.
+    /// Payload [`SessionBeforeTreeEvent`].
     pub fn on_session_before_tree(&mut self, f: impl Fn(SessionBeforeTreeEvent, &Ctx) -> Outcome + 'static) {
         self.handlers.insert(kind::SESSION_BEFORE_TREE, Box::new(move |a, c| {
             f(SessionBeforeTreeEvent { preparation: json(arg(a, 0)) }, c).into_raw()
@@ -882,12 +1021,19 @@ impl ExtensionApi {
 
     // --- notify-only subscriptions (return ignored) ---
 
+    /// `agent_start` — notify-only: the handler returns `()`, which the SDK lowers to
+    /// [`RawOutcome::Noop`]. Carries no payload, so the handler receives only the [`Ctx`].
     pub fn on_agent_start(&mut self, f: impl Fn(&Ctx) + 'static) {
         self.handlers.insert(kind::AGENT_START, notify(move |_a, c| f(c)));
     }
+    /// `agent_end` — notify-only (the handler returns `()`; the SDK reports [`RawOutcome::Noop`]).
+    /// Payload [`AgentEndEvent`], the full final message list.
     pub fn on_agent_end(&mut self, f: impl Fn(AgentEndEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::AGENT_END, notify(move |a, c| f(AgentEndEvent { messages: json(arg(a, 0)) }, c)));
     }
+    /// `agent_settled` — notify-only (returns `()`), and payload-free like
+    /// [`Self::on_agent_start`]: the handler receives only the [`Ctx`].
+    ///
     /// pi `on("agent_settled", handler)` (extensions/types.ts:1217 @v0.83.0; EXT-073: `:1225` is
     /// `tool_execution_end`). Fires ONCE per run, after every
     /// automatic retry / post-run compaction / queued continuation has finished — unlike
@@ -895,11 +1041,14 @@ impl ExtensionApi {
     pub fn on_agent_settled(&mut self, f: impl Fn(&Ctx) + 'static) {
         self.handlers.insert(kind::AGENT_SETTLED, notify(move |_a, c| f(c)));
     }
+    /// `turn_start` — notify-only (returns `()`). Payload [`TurnStartEvent`].
     pub fn on_turn_start(&mut self, f: impl Fn(TurnStartEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TURN_START, notify(move |a, c| {
             f(TurnStartEvent { turn_index: arg(a, 0).parse().unwrap_or(0), timestamp: arg(a, 1).parse().unwrap_or(0) }, c)
         }));
     }
+    /// `turn_end` — notify-only (returns `()`). Payload [`TurnEndEvent`]: the finalized assistant
+    /// message AND the tool results produced this turn.
     pub fn on_turn_end(&mut self, f: impl Fn(TurnEndEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TURN_END, notify(move |a, c| {
             f(
@@ -912,19 +1061,26 @@ impl ExtensionApi {
             )
         }));
     }
+    /// `message_start` — notify-only (returns `()`). Payload [`MessageStartEvent`].
     pub fn on_message_start(&mut self, f: impl Fn(MessageStartEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::MESSAGE_START, notify(move |a, c| f(MessageStartEvent { message: json(arg(a, 0)) }, c)));
     }
+    /// `message_update` — notify-only (returns `()`) and HIGH-FREQ. Payload
+    /// [`MessageUpdateEvent`]: the full in-flight message AND the provider delta.
     pub fn on_message_update(&mut self, f: impl Fn(MessageUpdateEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::MESSAGE_UPDATE, notify(move |a, c| {
             f(MessageUpdateEvent { message: json(arg(a, 0)), assistant_message_event: json(arg(a, 1)) }, c)
         }));
     }
+    /// `tool_execution_start` — notify-only (returns `()`). Payload [`ToolExecStartEvent`]; the
+    /// vetoable seam for a tool invocation is [`Self::on_tool_call`].
     pub fn on_tool_exec_start(&mut self, f: impl Fn(ToolExecStartEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TOOL_EXEC_START, notify(move |a, c| {
             f(ToolExecStartEvent { call_id: arg(a, 0).into(), name: arg(a, 1).into(), args: json(arg(a, 2)) }, c)
         }));
     }
+    /// `tool_execution_update` — notify-only (returns `()`) and HIGH-FREQ. Payload
+    /// [`ToolExecUpdateEvent`], which carries the streamed `chunk`.
     pub fn on_tool_exec_update(&mut self, f: impl Fn(ToolExecUpdateEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TOOL_EXEC_UPDATE, notify(move |a, c| {
             f(
@@ -938,6 +1094,8 @@ impl ExtensionApi {
             )
         }));
     }
+    /// `tool_execution_end` — notify-only (returns `()`). Payload [`ToolExecEndEvent`]; the
+    /// vetoable seam for the finished result is [`Self::on_tool_result`].
     pub fn on_tool_exec_end(&mut self, f: impl Fn(ToolExecEndEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::TOOL_EXEC_END, notify(move |a, c| {
             f(
@@ -951,6 +1109,8 @@ impl ExtensionApi {
             )
         }));
     }
+    /// `session_start` — notify-only (returns `()`). Payload [`SessionLifecycleEvent`], whose
+    /// `reason` includes `"reload"` and whose `session_file` is pi's `previousSessionFile`.
     pub fn on_session_start(&mut self, f: impl Fn(SessionLifecycleEvent, &Ctx) + 'static) {
         self.handlers.insert(
             kind::SESSION_START,
@@ -965,6 +1125,8 @@ impl ExtensionApi {
             }),
         );
     }
+    /// `session_shutdown` — notify-only (returns `()`). Payload [`SessionLifecycleEvent`], whose
+    /// `session_file` is pi's `targetSessionFile` — the destination of a session replacement.
     pub fn on_session_shutdown(&mut self, f: impl Fn(SessionLifecycleEvent, &Ctx) + 'static) {
         self.handlers.insert(
             kind::SESSION_SHUTDOWN,
@@ -979,11 +1141,15 @@ impl ExtensionApi {
             }),
         );
     }
+    /// `after_provider_response` — notify-only (returns `()`). Payload
+    /// [`AfterProviderResponseEvent`]: the HTTP status + response headers.
     pub fn on_after_provider_response(&mut self, f: impl Fn(AfterProviderResponseEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::AFTER_PROVIDER_RESPONSE, notify(move |a, c| {
             f(AfterProviderResponseEvent { status: arg(a, 0).parse().unwrap_or(0), headers: json(arg(a, 1)) }, c)
         }));
     }
+    /// `model_select` — notify-only (returns `()`). Payload [`ModelSelectEvent`]: the new model,
+    /// the previous one, and the `source` of the change.
     pub fn on_model_select(&mut self, f: impl Fn(ModelSelectEvent, &Ctx) + 'static) {
         self.handlers.insert(
             kind::MODEL_SELECT,
@@ -999,6 +1165,7 @@ impl ExtensionApi {
             }),
         );
     }
+    /// `thinking_level_select` — notify-only (returns `()`). Payload [`ThinkingLevelSelectEvent`].
     pub fn on_thinking_level_select(&mut self, f: impl Fn(ThinkingLevelSelectEvent, &Ctx) + 'static) {
         self.handlers.insert(
             kind::THINKING_LEVEL_SELECT,
@@ -1013,6 +1180,9 @@ impl ExtensionApi {
             }),
         );
     }
+    /// `session_compact` — notify-only (returns `()`): the compaction entry has already been
+    /// produced. Payload [`SessionCompactEvent`]; the vetoable seam is
+    /// [`Self::on_session_before_compact`].
     pub fn on_session_compact(&mut self, f: impl Fn(SessionCompactEvent, &Ctx) + 'static) {
         // The host seam supplies the full Pi shape: the produced compaction entry, whether an
         // extension drove it, the trigger reason, and the retry flag (L4 gap #5, wired through the
@@ -1027,6 +1197,8 @@ impl ExtensionApi {
             f(ev, c)
         }));
     }
+    /// `session_tree` — notify-only (returns `()`). Payload [`SessionTreeEvent`]; the vetoable seam
+    /// is [`Self::on_session_before_tree`].
     pub fn on_session_tree(&mut self, f: impl Fn(SessionTreeEvent, &Ctx) + 'static) {
         self.handlers.insert(kind::SESSION_TREE, notify(move |a, c| f(SessionTreeEvent { tree: json(arg(a, 0)) }, c)));
     }
@@ -1226,6 +1398,7 @@ impl ExtensionApi {
         }
     }
 
+    /// The tools this extension registered, in registration order (descriptor + executor).
     pub fn tools(&self) -> &[RegisteredTool] {
         &self.tools
     }

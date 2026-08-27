@@ -16,8 +16,13 @@ use crate::ctx::ToolCall;
 use core::cell::RefCell;
 use serde_json::Value;
 
+/// The `wit-bindgen`-generated `cyrup:ext` world bindings: the import functions every
+/// [`crate::ctx`] wrapper calls, and the export traits the glue implements.
 pub mod bindings {
-    #![allow(clippy::all, dead_code, unused)]
+    // `missing_docs` is allowed HERE and nowhere else in this crate: every public item in this
+    // module is emitted by the `wit_bindgen::generate!` invocation below, so there is no source
+    // line to hang a `///` on.
+    #![allow(clippy::all, dead_code, unused, missing_docs)]
     wit_bindgen::generate!({
         world: "extension",
         path: "wit",
