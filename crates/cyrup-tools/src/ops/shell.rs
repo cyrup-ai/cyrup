@@ -99,13 +99,18 @@ fn find_executable_on_path(executable: &str) -> Option<PathBuf> {
     // stdout is piped and read only after the child exits. Both probes emit at most a handful of
     // short lines, far under a pipe buffer, so this cannot deadlock on a full pipe; `spawnSync`
     // has the same shape (it buffers the whole child output).
-    let mut child = std::process::Command::new(cmd)
+    let mut probe = std::process::Command::new(cmd);
+    probe
         .arg(arg)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    // Pi's win32 probe is `spawnSync("where", [executable], { …, windowsHide: true })`
+    // (shell.ts:28-32); its unix `which` arm (shell.ts:47) passes no such option, which is exactly
+    // what `windows_hide` compiles to off Windows. Shell detection runs during session
+    // construction, so without this a console flashes before the agent has printed anything.
+    crate::ops::win::windows_hide(&mut probe);
+    let mut child = probe.spawn().ok()?;
 
     let deadline = Instant::now() + BASH_PROBE_TIMEOUT;
     let status = loop {

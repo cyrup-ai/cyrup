@@ -7,6 +7,7 @@
 //!
 //! [`ProcOps`]: crate::ops::ProcOps
 
+use crate::ops::win::windows_hide;
 use crate::ops::{ArgvSpec, ExecSpec, Transport};
 
 /// Build the OS command for an [`ExecSpec`], installing the unix process-group setup.
@@ -47,6 +48,11 @@ pub(super) fn build_command(spec: &ExecSpec) -> std::process::Command {
             });
         }
     }
+    // The Windows counterpart of the `setsid` block above, and the exact partner of the
+    // `detached: process.platform !== "win32"` on the same spawn: Pi passes `windowsHide: true`
+    // (bash.ts:104) for BOTH shell tools, so `bash -c` / `bash -s` never flashes a console.
+    // `creation_flags` is safe and stable, so this adds no `unsafe` beyond the block above.
+    windows_hide(&mut std_cmd);
     std_cmd
 }
 
@@ -88,5 +94,10 @@ pub(super) fn build_argv_command(spec: &ArgvSpec) -> std::process::Command {
     // (`exec.ts:41-45`) never sets `detached`, so the child stays in the caller's own process
     // group and must be signaled by single pid only, never `killpg` (see the doc comment above and
     // `super::proc`'s module doc).
+    //
+    // Deliberately NO `windows_hide` either, for the same 1:1-with-its-own-consumer reason: that
+    // same `exec.ts:41-45` spawn passes no `windowsHide`, and Node's default is `false`, so this
+    // child SHOWS a console window upstream. Adding the flag here would be a behavior Pi does not
+    // have. Contrast `build_command` above, whose consumer (`bash.ts:104`) does pass it.
     std_cmd
 }

@@ -37,14 +37,18 @@ pub fn kill_process_tree(pid: u32) {
     #[cfg(not(unix))]
     {
         // Pi's win32 arm is a fire-and-forget `spawn("taskkill", ["/F","/T","/PID", …], {stdio:
-        // "ignore", detached: true, windowsHide: true})` (`shell.ts:203-212`) — NOT a blocking
+        // "ignore", detached: true, windowsHide: true})` (`shell.ts:220-228`) — NOT a blocking
         // wait, which matters because this runs inside a signal handler.
-        let _ = std::process::Command::new("taskkill")
-            .args(["/F", "/T", "/PID", &pid.to_string()])
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/F", "/T", "/PID", &pid.to_string()])
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
+            .stderr(std::process::Stdio::null());
+        // The `windowsHide: true` the comment above has always cited. This drain runs from the
+        // shutdown signal handler, so a console window per tracked child is the worst possible
+        // moment for one.
+        crate::ops::win::windows_hide(&mut cmd);
+        let _ = cmd.spawn();
     }
 }
 
@@ -72,9 +76,12 @@ pub(super) fn send_sigkill_tree(child: &mut tokio::process::Child) {
     #[cfg(not(unix))]
     {
         if let Some(pid) = child.id() {
-            let _ = std::process::Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
+            let mut cmd = std::process::Command::new("taskkill");
+            cmd.args(["/F", "/T", "/PID", &pid.to_string()]);
+            // `killProcessTree`'s `windowsHide: true` (shell.ts:226) — this fires on every cancel
+            // and every bash timeout, i.e. on the hot path the user actually watches.
+            crate::ops::win::windows_hide(&mut cmd);
+            let _ = cmd.output();
         }
     }
     let _ = child.start_kill();
@@ -141,9 +148,15 @@ pub fn kill_pid(pid: u32) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
-        std::process::Command::new("taskkill")
-            .args(["/F", "/PID", &pid.to_string()])
-            .output()?;
+        let mut cmd = std::process::Command::new("taskkill");
+        cmd.args(["/F", "/PID", &pid.to_string()]);
+        // No direct Pi counterpart — upstream's single-pid kill is `proc.kill("SIGKILL")`
+        // (exec.ts:59), and this `taskkill /F /PID` exists only because Windows has no such
+        // primitive for a pid we do not hold a `Child` for. It is a port-side spawn standing in for
+        // a Pi call that spawns NOTHING, so it must be at least as invisible as what it replaces;
+        // every `taskkill` Pi does spawn carries `windowsHide: true` (shell.ts:226).
+        crate::ops::win::windows_hide(&mut cmd);
+        cmd.output()?;
         Ok(())
     }
 }
