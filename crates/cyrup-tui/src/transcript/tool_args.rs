@@ -24,22 +24,65 @@ pub(super) fn str_arg(args: &Value, keys: &[&str]) -> StrArg {
 }
 
 /// `renderToolPath` (render-utils.ts:75-85): `[invalid arg]` for a non-string, the `emptyFallback`
-/// (else `...`) for an empty/absent path, otherwise the `~`-shortened path in accent. Hyperlinks are a
-/// terminal escape the cell grid does not carry (tracked residual).
+/// (else `...`) for an empty/absent path, otherwise the `~`-shortened path in accent — wrapped in an
+/// OSC-8 hyperlink to the resolved path's `file://` URL when the terminal forwards them
+/// (`linkPath`, `:19-23`).
+///
+/// The gate and the two unlinked arms are upstream's, exactly: `linkPath` is reached only from
+/// `:84`'s `accent` branch, so `invalidArgText` (`:71-73`) and the `toolOutput` `...` (`:83`) stay
+/// inert; and the href is built from `value` — the RAW path — while the visible text is the
+/// `~`-shortened form, because `shortenPath` is display-only.
+///
+/// The escape itself is not in this `Span`. [`crate::osc`] explains why (`Span::styled_graphemes`
+/// deletes `ESC`, and `Span::width` would miscount the rest as columns); the span carries a marker
+/// in `Modifier`'s unallocated bits and [`crate::osc::inject`] converts marked cells into the
+/// escape once the `Buffer` exists.
 pub(super) fn tool_path_span(
     args: &Value,
     keys: &[&str],
     empty_fallback: Option<&str>,
     theme: &UiTheme,
+    opts: ImageOpts<'_>,
 ) -> Span<'static> {
     match str_arg(args, keys) {
         StrArg::Invalid => Span::styled("[invalid arg]".to_string(), theme.error_style()),
         StrArg::Missing => match empty_fallback {
-            Some(f) => Span::styled(shorten_path(f), theme.accent_style()),
+            Some(f) => Span::styled(shorten_path(f), link_style(f, theme, opts)),
             None => Span::styled("...".to_string(), theme.tool_output_style()),
         },
-        StrArg::Value(p) => Span::styled(shorten_path(&p), theme.accent_style()),
+        StrArg::Value(p) => Span::styled(shorten_path(&p), link_style(&p, theme, opts)),
     }
+}
+
+/// `theme.fg("accent", …)`, plus [`crate::osc`]'s link marker when the terminal forwards OSC-8 —
+/// `linkPath(styledText, rawPath, cwd)` (`render-utils.ts:19-23`) with pi's own early return:
+///
+/// ```ts
+/// if (!getCapabilities().hyperlinks) return styledText;
+/// const absolutePath = resolvePath(rawPath, cwd);
+/// return hyperlink(styledText, pathToFileURL(absolutePath).href);
+/// ```
+///
+/// `resolvePath(rawPath, cwd)` is `cyrup_tools::path::resolve_to_cwd`, the same port `read`'s
+/// compact classification resolves through (`read.ts:336`). A `cwd` of `None` falls back to the
+/// process cwd, matching [`compact_read_classification`]; if even that is unavailable the path
+/// cannot be resolved and the span stays unlinked rather than pointing somewhere wrong.
+fn link_style(raw_path: &str, theme: &UiTheme, opts: ImageOpts<'_>) -> Style {
+    let accent = theme.accent_style();
+    if !opts.hyperlinks {
+        return accent;
+    }
+    let Some(sink) = opts.links else { return accent };
+    let base = match opts.cwd {
+        Some(c) => c.to_path_buf(),
+        None => match std::env::current_dir() {
+            Ok(c) => c,
+            Err(_) => return accent,
+        },
+    };
+    let absolute = cyrup_tools::path::resolve_to_cwd(raw_path, &base);
+    let url = cyrup_tools::path::path_to_file_url(&absolute);
+    accent.patch(sink.mark(url))
 }
 
 /// The `" in <path>"` tail shared by grep/find (`path = shortenPath(rawPath || ".")` in `toolOutput`, a
