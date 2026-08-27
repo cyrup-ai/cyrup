@@ -3659,4 +3659,72 @@ mod tests {
         );
         assert!(h.get("x-session-id").is_none());
     }
+    /// PROV-011 DoD 4/5 — the WIRE shape of an opted-in tool on a real OpenAI-completions route.
+    ///
+    /// `supports_strict_mode` is `true` by DEFAULT here (`compat.rs:660` excludes only Moonshot,
+    /// Together, the Cloudflare AI gateway and NVIDIA), so `strict: true` and the raw `read` schema
+    /// would go out together — and be REJECTED, since strict function calling demands every key of
+    /// `properties` in `required` plus `additionalProperties: false`. The schema must therefore be
+    /// the strict-converted one.
+    #[test]
+    fn an_opted_in_tool_is_serialized_with_the_strict_converted_schema() {
+        let read = ToolDef {
+            name: "read".into(),
+            description: "d".into(),
+            parameters: json!({
+                "type": "object",
+                "required": ["path"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "offset": { "type": "number" },
+                    "limit": { "type": "number" }
+                }
+            }),
+            constrained_sampling: Some(cyrup_core::ConstrainedSampling::Config(
+                cyrup_core::ConstrainedSamplingConfig::JsonSchema {
+                    strict: cyrup_core::StrictSampling::Prefer,
+                },
+            )),
+        };
+
+        // A strict-capable route: `provider` is not one of the four exclusions.
+        let mut strict_model = model();
+        strict_model.provider = "openai".into();
+        strict_model.base_url = "https://api.openai.com/v1".into();
+        let strict_compat = get_compat(&strict_model);
+        assert!(strict_compat.supports_strict_mode);
+
+        let out = convert_tools(std::slice::from_ref(&read), &strict_compat).unwrap();
+        let function = &out[0]["function"];
+        assert_eq!(function["strict"], json!(true));
+        assert_eq!(
+            function["parameters"],
+            json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["limit", "offset", "path"],
+                "properties": {
+                    "path": { "type": "string" },
+                    "offset": { "anyOf": [{ "type": "number" }, { "type": "null" }] },
+                    "limit": { "anyOf": [{ "type": "number" }, { "type": "null" }] }
+                }
+            })
+        );
+
+        // DoD 5 — Together disables strict mode: no `strict` key at all, raw schema, no failure.
+        let plain_compat = get_compat(&model());
+        assert!(!plain_compat.supports_strict_mode);
+        let out = convert_tools(std::slice::from_ref(&read), &plain_compat).unwrap();
+        let function = &out[0]["function"];
+        assert_eq!(function.get("strict"), None);
+        assert_eq!(function["parameters"], read.parameters);
+
+        // DoD 1 — a tool that did not opt in is `strict: false` with its raw schema, unchanged.
+        let mut opted_out = read.clone();
+        opted_out.constrained_sampling = None;
+        let out = convert_tools(std::slice::from_ref(&opted_out), &strict_compat).unwrap();
+        let function = &out[0]["function"];
+        assert_eq!(function["strict"], json!(false));
+        assert_eq!(function["parameters"], read.parameters);
+    }
 }

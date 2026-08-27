@@ -931,4 +931,134 @@ mod tests {
             Err(ToolValidationError::NotFound(_))
         ));
     }
+    // ---------------------------------------------------------------------
+    // `normalize_optional_nulls` — pi `validation.ts:240-269` @v0.84.2
+    // ---------------------------------------------------------------------
+
+    fn read_schema() -> Value {
+        json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string" },
+                "offset": { "type": "number" },
+                "limit": { "type": "number" }
+            }
+        })
+    }
+
+    /// DoD 6 — the `null`s a strict-converted schema invites the model to emit are DELETED, not
+    /// folded to `0` by the falsy coercion table. Without this stage `read` would run with
+    /// `limit = 0` (reading nothing) and `bash` with `timeout = 0`.
+    #[test]
+    fn an_optional_null_is_deleted_rather_than_coerced_to_zero() {
+        let out = validate_tool_call(
+            &read_schema(),
+            json!({ "path": "x", "offset": null, "limit": null }),
+        )
+        .unwrap();
+        assert_eq!(out, json!({ "path": "x" }));
+
+        let bash_schema = json!({
+            "type": "object",
+            "required": ["command"],
+            "properties": {
+                "command": { "type": "string" },
+                "timeout": { "type": "number" }
+            }
+        });
+        let out = validate_tool_call(&bash_schema, json!({ "command": "ls", "timeout": null }))
+            .unwrap();
+        assert_eq!(out, json!({ "command": "ls" }));
+    }
+
+    /// A REQUIRED property keeps pi's falsy coercion — only OPTIONAL nulls are stripped.
+    #[test]
+    fn a_required_null_still_takes_the_falsy_coercion_path() {
+        let schema = json!({
+            "type": "object",
+            "required": ["n"],
+            "properties": { "n": { "type": "number" } }
+        });
+        assert_eq!(
+            validate_tool_call(&schema, json!({ "n": null })).unwrap(),
+            json!({ "n": 0 })
+        );
+    }
+
+    /// A property whose own schema ADMITS null keeps the null — pi's
+    /// `getSubSchemaValidator(propertySchema)?.Check(null) === false` guard.
+    #[test]
+    fn an_optional_null_survives_when_the_property_schema_admits_null() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": ["number", "null"] },
+                "b": { "anyOf": [{ "type": "number" }, { "type": "null" }] }
+            }
+        });
+        assert_eq!(
+            validate_tool_call(&schema, json!({ "a": null, "b": null })).unwrap(),
+            json!({ "a": null, "b": null })
+        );
+    }
+
+    /// The pass recurses through nested objects and through both forms of `items`.
+    #[test]
+    fn optional_nulls_are_stripped_inside_nested_objects_and_arrays() {
+        let schema = json!({
+            "type": "object",
+            "required": ["edits"],
+            "properties": {
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["oldText"],
+                        "properties": {
+                            "oldText": { "type": "string" },
+                            "count": { "type": "number" }
+                        }
+                    }
+                }
+            }
+        });
+        let out = validate_tool_call(
+            &schema,
+            json!({ "edits": [{ "oldText": "a", "count": null }, { "oldText": "b", "count": 2 }] }),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            json!({ "edits": [{ "oldText": "a" }, { "oldText": "b", "count": 2 }] })
+        );
+
+        let tuple_schema = json!({
+            "type": "object",
+            "properties": {
+                "pair": {
+                    "type": "array",
+                    "items": [
+                        { "type": "object", "properties": { "a": { "type": "number" } } },
+                        { "type": "object", "properties": { "b": { "type": "number" } } }
+                    ]
+                }
+            }
+        });
+        let out = validate_tool_call(
+            &tuple_schema,
+            json!({ "pair": [{ "a": null }, { "b": null }] }),
+        )
+        .unwrap();
+        assert_eq!(out, json!({ "pair": [{}, {}] }));
+    }
+
+    /// DoD 1 — arguments with no nulls at all are byte-identical to today's output.
+    #[test]
+    fn arguments_without_nulls_are_unchanged_by_the_new_stage() {
+        assert_eq!(
+            validate_tool_call(&read_schema(), json!({ "path": "x", "limit": "10" })).unwrap(),
+            json!({ "path": "x", "limit": 10 })
+        );
+    }
 }

@@ -742,4 +742,219 @@ mod tests {
             Ok(Some("{\"p\":\"\"}".to_string()))
         );
     }
+    // ---------------------------------------------------------------------
+    // Strict JSON-schema conversion (pi `7915cdac`, `constrained-sampling.ts:10-131` @v0.84.2)
+    // ---------------------------------------------------------------------
+
+    /// A tool whose parameters are `params` and which opted into JSON-schema strict sampling.
+    fn schema_tool(name: &str, params: Value, strict: StrictSampling) -> ToolDef {
+        ToolDef {
+            name: name.into(),
+            description: "d".into(),
+            parameters: params,
+            constrained_sampling: json_schema(strict),
+        }
+    }
+
+    /// `read`'s real schema (`cyrup-tools/src/tools/read.rs`): one required key, two optional
+    /// numbers, no `additionalProperties`. Every provider that is told `strict: true` rejects that
+    /// as-is, which is exactly the breakage the conversion exists to prevent.
+    fn read_parameters() -> Value {
+        json!({
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+                "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
+                "offset": { "type": "number", "description": "Line number to start reading from (1-indexed)" },
+                "limit": { "type": "number", "description": "Maximum number of lines to read" }
+            }
+        })
+    }
+
+    /// DoD 4 — every key of `properties` lands in `required`, `additionalProperties` becomes
+    /// `false`, and each previously-optional property is wrapped in `anyOf: [<original>, null]`.
+    #[test]
+    fn strict_conversion_requires_every_key_and_makes_optionals_nullable() {
+        let converted = make_strict_json_schema(&read_parameters()).unwrap();
+        // `serde_json::Map` is a `BTreeMap` in this workspace (no `preserve_order`), so
+        // `Object::keys()` — and therefore the rewritten `required` — is alphabetical. Ordering is
+        // immaterial: `required` is a SET, and every schema cyrup emits already has alphabetical
+        // keys for the same reason.
+        assert_eq!(converted["required"], json!(["limit", "offset", "path"]));
+        assert_eq!(converted["additionalProperties"], json!(false));
+        // The required property keeps its own schema verbatim.
+        assert_eq!(
+            converted["properties"]["path"],
+            json!({ "type": "string", "description": "Path to the file to read (relative or absolute)" })
+        );
+        for optional in ["offset", "limit"] {
+            assert_eq!(
+                converted["properties"][optional],
+                json!({
+                    "anyOf": [
+                        { "type": "number", "description": if optional == "offset" {
+                            "Line number to start reading from (1-indexed)"
+                        } else {
+                            "Maximum number of lines to read"
+                        } },
+                        { "type": "null" }
+                    ]
+                }),
+                "{optional} must become present-and-nullable"
+            );
+        }
+    }
+
+    /// DoD 4 — `edit`'s array-of-objects schema is converted at BOTH levels, and gains nothing but
+    /// `additionalProperties: false` because every property is already required.
+    #[test]
+    fn strict_conversion_recurses_through_array_items() {
+        let edit_parameters = json!({
+            "type": "object",
+            "required": ["path", "edits"],
+            "properties": {
+                "path": { "type": "string" },
+                "edits": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["oldText", "newText"],
+                        "properties": {
+                            "oldText": { "type": "string" },
+                            "newText": { "type": "string" }
+                        }
+                    }
+                }
+            }
+        });
+        let converted = make_strict_json_schema(&edit_parameters).unwrap();
+        assert_eq!(converted["required"], json!(["edits", "path"]));
+        assert_eq!(converted["additionalProperties"], json!(false));
+        // No `anyOf` wrapping anywhere: nothing was optional.
+        assert_eq!(converted["properties"]["path"], json!({ "type": "string" }));
+        let items = &converted["properties"]["edits"]["items"];
+        assert_eq!(items["required"], json!(["newText", "oldText"]));
+        assert_eq!(items["additionalProperties"], json!(false));
+        assert_eq!(items["properties"]["oldText"], json!({ "type": "string" }));
+    }
+
+    /// A property that ALREADY admits `null` is left alone (pi `schemaAllowsNull`).
+    #[test]
+    fn strict_conversion_does_not_double_wrap_a_nullable_optional() {
+        let converted = make_strict_json_schema(&json!({
+            "type": "object",
+            "properties": {
+                "a": { "type": ["string", "null"] },
+                "b": { "anyOf": [{ "type": "string" }, { "type": "null" }] },
+                "c": { "enum": ["x", null] }
+            }
+        }))
+        .unwrap();
+        assert_eq!(converted["properties"]["a"], json!({ "type": ["string", "null"] }));
+        assert_eq!(
+            converted["properties"]["b"],
+            json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] })
+        );
+        assert_eq!(converted["properties"]["c"], json!({ "enum": ["x", null] }));
+        assert_eq!(converted["required"], json!(["a", "b", "c"]));
+    }
+
+    /// `structuredClone` parity — the caller's schema is never mutated.
+    #[test]
+    fn strict_conversion_leaves_the_callers_schema_untouched() {
+        let original = read_parameters();
+        let _ = make_strict_json_schema(&original).unwrap();
+        assert_eq!(original, read_parameters());
+    }
+
+    /// Pi's `UnsupportedStrictJsonSchemaError` messages, verbatim.
+    #[test]
+    fn strict_conversion_rejects_everything_outside_the_strict_subset() {
+        let cases: [(Value, &str); 8] = [
+            (json!(true), "root schema must have type object"),
+            (json!({ "type": "string" }), "root schema must have type object"),
+            (
+                json!({ "type": "object", "$ref": "#/$defs/x" }),
+                "$ref schemas are unsupported",
+            ),
+            (
+                json!({ "type": "object", "oneOf": [{ "type": "object" }] }),
+                "oneOf schemas are unsupported",
+            ),
+            (
+                json!({ "type": "object", "properties": { "a": { "anyOf": [] } } }),
+                "anyOf must contain at least one schema",
+            ),
+            (
+                json!({ "type": "object", "properties": { "a": { "anyOf": [{ "type": "object" }] } } }),
+                "object and array unions are unsupported",
+            ),
+            (
+                json!({ "type": "object", "properties": { "a": { "type": "array", "items": [{ "type": "string" }] } } }),
+                "tuple schemas are unsupported",
+            ),
+            (
+                json!({ "type": "object", "additionalProperties": true }),
+                "schema-valued or true additionalProperties is unsupported",
+            ),
+        ];
+        for (schema, message) in cases {
+            let e = make_strict_json_schema(&schema).unwrap_err();
+            assert_eq!(e.0, message, "for schema {schema}");
+        }
+    }
+
+    /// DoD 7 — a schema that cannot convert degrades to `None` under `prefer` on a strict-capable
+    /// route, and fails the request under `require` carrying the conversion's own reason.
+    #[test]
+    fn an_unconvertible_schema_degrades_under_prefer_and_fails_under_require() {
+        let params = json!({ "type": "object", "$ref": "#/$defs/x" });
+        let prefer = schema_tool("weird", params.clone(), StrictSampling::Prefer);
+        assert_eq!(resolve_json_schema_strict_sampling(&prefer, true), Ok(None));
+
+        let require = schema_tool("weird", params, StrictSampling::Require);
+        assert_eq!(
+            resolve_json_schema_strict_sampling(&require, true).unwrap_err().0,
+            "Tool \"weird\" requires JSON-schema constrained sampling, but $ref schemas are unsupported."
+        );
+    }
+
+    /// DoD 5 — a route without strict mode gets `None` and the RAW schema; `prefer` never fails.
+    #[test]
+    fn a_non_strict_route_keeps_the_raw_schema_and_does_not_fail() {
+        let tool = schema_tool("read", read_parameters(), StrictSampling::Prefer);
+        let strict = resolve_json_schema_strict_sampling(&tool, false).unwrap();
+        assert_eq!(strict, None);
+        assert_eq!(
+            json_schema_tool_parameters(&tool, strict == Some(true)).unwrap(),
+            read_parameters()
+        );
+    }
+
+    /// A convertible schema on a strict-capable route resolves to `true` and serializes converted.
+    #[test]
+    fn a_strict_capable_route_resolves_true_and_serializes_the_converted_schema() {
+        let tool = schema_tool("read", read_parameters(), StrictSampling::Prefer);
+        let strict = resolve_json_schema_strict_sampling(&tool, true).unwrap();
+        assert_eq!(strict, Some(true));
+        assert_eq!(
+            json_schema_tool_parameters(&tool, strict == Some(true)).unwrap(),
+            make_strict_json_schema(&read_parameters()).unwrap()
+        );
+    }
+
+    /// DoD 1 — a tool that never opted in is untouched on every route.
+    #[test]
+    fn a_tool_that_did_not_opt_in_is_never_converted() {
+        let mut tool = schema_tool("read", read_parameters(), StrictSampling::Prefer);
+        tool.constrained_sampling = None;
+        for supports in [false, true] {
+            let strict = resolve_json_schema_strict_sampling(&tool, supports).unwrap();
+            assert_eq!(strict, None);
+            assert_eq!(
+                json_schema_tool_parameters(&tool, strict == Some(true)).unwrap(),
+                read_parameters()
+            );
+        }
+    }
 }
