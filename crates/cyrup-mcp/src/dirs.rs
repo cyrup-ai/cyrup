@@ -1798,6 +1798,10 @@ mod tests {
     /// no trailing newline. Optional members are omitted rather than emitted as `null` — the
     /// reader's `Option` fields tolerate both, but pi omits, and a byte-comparable file is worth
     /// more than a tolerant one (MCP-077, MCP-094).
+    ///
+    /// The two readers of `mcp-cache.json` must agree about what is present. Before integration
+    /// this file's reader was strict where `crate::registration`'s is lenient, so a cache missing
+    /// one key made the panel see nothing while the registered surface saw everything.
     #[test]
     fn written_file_matches_the_readers_schema() {
         let dir = tempfile::tempdir().unwrap();
@@ -1858,10 +1862,6 @@ mod tests {
             )
         );
     }
-    /// The two readers of `mcp-cache.json` must agree about what is present. Before integration
-    /// this file's reader was strict where `crate::registration`'s is lenient, so a cache missing
-    /// one key made the panel see nothing while the registered surface saw everything.
-
     // -------------------------------------------------------------------------------------
     // MCP-141 leg (b) / MCP-143 / MCP-144 — the resolvers actually run now
     // -------------------------------------------------------------------------------------
