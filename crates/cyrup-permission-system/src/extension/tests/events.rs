@@ -42,10 +42,10 @@ impl HostServices for RecordingBus {
 /// PUBLISHED handle must move the live config the gate itself reads.
 #[test]
 fn init_publishes_the_yolo_control_surface_and_shutdown_retracts_it() {
-    // BOTH locks are taken in this SYNCHRONOUS frame, for the reason `with_config_env_lock`
-    // documents: a guard taken inside the async body would be held across every `.await`.
+    // The registry lock is taken in this SYNCHRONOUS frame, not inside the async body, so the
+    // guard is never captured in the future's state (`clippy::await_holding_lock`).
     let _registry = crate::runtime_api::test_registry_lock();
-    with_config_env_lock(init_publishes_the_yolo_control_surface_and_shutdown_retracts_it_body());
+    block_on(init_publishes_the_yolo_control_surface_and_shutdown_retracts_it_body());
 }
 
 async fn init_publishes_the_yolo_control_surface_and_shutdown_retracts_it_body() {
@@ -98,7 +98,7 @@ async fn init_publishes_the_yolo_control_surface_and_shutdown_retracts_it_body()
 /// the payload IS the interface.
 #[test]
 fn a_gated_request_is_published_on_the_permission_request_channel() {
-    with_config_env_lock(a_gated_request_is_published_on_the_permission_request_channel_body());
+    block_on(a_gated_request_is_published_on_the_permission_request_channel_body());
 }
 
 async fn a_gated_request_is_published_on_the_permission_request_channel_body() {

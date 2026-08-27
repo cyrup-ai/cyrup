@@ -32,8 +32,7 @@ pub(super) const PROJECT_AGENT_SUBDIR: [&str; 2] = [".cyrup", "agent"];
 /// builds the enforced paths from it and [`crate::is_installed`] probes it.
 #[must_use]
 pub(super) fn policy_agent_dir(agent_dir: &Path) -> PathBuf {
-    let Some(raw) = std::env::var(POLICY_AGENT_DIR_ENV_KEY)
-        .ok()
+    let Some(raw) = crate::envx::var(POLICY_AGENT_DIR_ENV_KEY)
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
     else {

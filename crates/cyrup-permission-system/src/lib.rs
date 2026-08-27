@@ -66,6 +66,14 @@
 //!
 //! No-panic policy (arch-00 §8): the workspace lints deny unwrap/expect/panic/indexing; this
 //! crate-level `#![deny(...)]` restates it. Tests `#[allow(...)]` at the module level.
+//!
+//! No-`unsafe` policy: every `unsafe` block this crate ever carried was a TEST-ONLY
+//! `std::env::set_var`/`remove_var`, and there was none in production code at all. Those mutations
+//! are gone — every environment read in this crate goes through [`envx::var`], whose `cfg(test)`
+//! build consults a THREAD-LOCAL overlay instead — so the gate below can be `forbid`, which (unlike
+//! `deny`) cannot be re-allowed by an inner attribute. That is what stops the defect from regrowing:
+//! the next author who reaches for `std::env::set_var` in a test gets a compile error, not a flake.
+#![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 pub mod agent_start_cache;
@@ -75,6 +83,9 @@ pub mod config_modal;
 pub mod dedup;
 pub mod error;
 pub mod evaluate;
+/// The crate's single process-environment accessor. PRIVATE on purpose: nothing outside this crate
+/// may reach the test overlay, and nothing inside it may read the environment any other way.
+mod envx;
 pub mod ext_config;
 pub mod extension;
 pub mod forwarding;

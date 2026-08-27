@@ -144,8 +144,7 @@ impl ExtensionConfig {
     /// override, so the precedence collapses to `env (trimmed, non-empty) || default_path`.
     #[must_use]
     pub fn resolve_config_path(default_path: &Path) -> PathBuf {
-        std::env::var(CONFIG_PATH_ENV_KEY)
-            .ok()
+        crate::envx::var(CONFIG_PATH_ENV_KEY)
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
@@ -759,44 +758,6 @@ impl<'de> serde::de::Visitor<'de> for OrderedJsonVisitor {
     }
 }
 
-/// Guards every test in this crate that mutates process-wide environment state
-/// (`CONFIG_PATH_ENV_KEY` here, `extension::INSTALL_ENV_VAR` there) from running concurrently with
-/// any other such test. Lives outside the `tests` module (and is `pub(crate)`) precisely so the
-/// *same* lock instance serializes both modules — a per-module lock would not, and `cargo test`
-/// runs the whole crate's unit tests in one process.
-#[cfg(test)]
-pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
-    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-    LOCK.get_or_init(|| std::sync::Mutex::new(()))
-}
-
-/// Drive `body` to completion with [`env_lock`] held for the WHOLE body, from a **synchronous**
-/// frame.
-///
-/// The lock genuinely has to span the awaits: `ForwardingAskChannel::confirm`,
-/// `ExtensionConfig::resolve_config_path` and `logging::resolve_logs_dir` all call `getenv` on the
-/// decision path, so a critical section that ended at the first `.await` would not close the
-/// `set_var`/`getenv` race the lock exists for. What must NOT happen is holding the guard from
-/// *inside* an `async` body, which is what `clippy::await_holding_lock` flags: there the
-/// `MutexGuard` becomes part of the generated future's state, so it makes the future `!Send`, it is
-/// owned by whichever thread last resumed the future rather than by one identifiable thread, and it
-/// is released only when the runtime gets around to dropping the future — including on cancellation
-/// paths a test never wrote. Taking it here, around `block_on`, gives the body byte-identical
-/// coverage while the guard lives on ONE stack frame that cannot be suspended or moved.
-///
-/// This is the single instance `extension/tests/support.rs`'s `with_config_env_lock`, `ask.rs` and
-/// this module's own tests all funnel through — a per-module helper over a per-module lock would
-/// not serialize anything, since `cargo test` runs the crate's unit tests as threads in one
-/// process.
-#[cfg(test)]
-// Test-only helper: a current-thread runtime that fails to build means a broken test host, and
-// there is no caller that could do anything else with the error.
-#[allow(clippy::unwrap_used)]
-pub(crate) fn with_env_lock<F: std::future::Future>(body: F) -> F::Output {
-    let _lock = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body)
-}
-
 #[cfg(test)]
 thread_local! {
     /// How many times [`ExtensionConfig::load_with_result`] has run **on the current thread**.
@@ -900,10 +861,6 @@ mod tests {
 
     #[test]
     fn absent_is_defaults() {
-        // Any test that resolves a config path reads `CONFIG_PATH_ENV_KEY`, so it must hold the
-        // same lock the env-mutating test takes — cargo runs these as parallel threads in one
-        // process, and without this the override leaks across tests intermittently.
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nope.json");
         assert_eq!(ExtensionConfig::load(&path), ExtensionConfig::default());
@@ -915,10 +872,6 @@ mod tests {
     // real, editable default-config template file at that path (mkdir -p'ing the parent first).
     #[test]
     fn absent_config_is_materialized_on_disk() {
-        // Any test that resolves a config path reads `CONFIG_PATH_ENV_KEY`, so it must hold the
-        // same lock the env-mutating test takes — cargo runs these as parallel threads in one
-        // process, and without this the override leaks across tests intermittently.
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.json");
         assert!(!path.exists());
@@ -997,7 +950,6 @@ mod tests {
     // first `/permission-system` toggle REWROTE the operator's `45.5` to `45` on disk.
     #[test]
     fn a_fractional_timeout_survives_normalize_and_a_save_round_trip() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // 1. normalize keeps it verbatim.
         assert_eq!(
@@ -1037,7 +989,6 @@ mod tests {
     // `is_pristine_default_file`'s byte-exact compare, would break the install probe's template).
     #[test]
     fn a_whole_second_timeout_is_still_written_as_an_integer_literal() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
 
@@ -1064,10 +1015,6 @@ mod tests {
     // returned structurally (not only `eprintln!`ed) so a caller can surface it.
     #[test]
     fn malformed_present_config_warns_like_pi_and_falls_back_to_defaults() {
-        // Any test that resolves a config path reads `CONFIG_PATH_ENV_KEY`, so it must hold the
-        // same lock the env-mutating test takes — cargo runs these as parallel threads in one
-        // process, and without this the override leaks across tests intermittently.
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, "{not json").unwrap();
@@ -1091,10 +1038,6 @@ mod tests {
     // instead of being silently swallowed like the pre-fix blanket `Ok(text) else return default`.
     #[test]
     fn present_but_unreadable_config_warns_instead_of_silent_default() {
-        // Any test that resolves a config path reads `CONFIG_PATH_ENV_KEY`, so it must hold the
-        // same lock the env-mutating test takes — cargo runs these as parallel threads in one
-        // process, and without this the override leaks across tests intermittently.
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         // A directory at the config path exists (so `ensure_on_disk` does not try to create it)
         // but cannot be read as a file, giving a non-ENOENT `io::Error`.
@@ -1115,21 +1058,18 @@ mod tests {
     // no environment variable was ever consulted anywhere in the crate.
     #[test]
     fn env_var_overrides_default_config_path() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let overridden = dir.path().join("overridden.json");
         std::fs::write(&overridden, r#"{"debug": true}"#).unwrap();
         let default_path = dir.path().join("default.json");
 
-        // SAFETY: serialized by `env_lock` so no other test observes a partial mutation; restored
-        // before returning.
-        unsafe {
-            std::env::set_var(CONFIG_PATH_ENV_KEY, overridden.display().to_string());
-        }
-        let result = ExtensionConfig::load(&default_path);
-        unsafe {
-            std::env::remove_var(CONFIG_PATH_ENV_KEY);
-        }
+        // A [`crate::envx`] pin, not a process mutation: the override — and therefore the file
+        // `ensure_on_disk` would materialize through it — is visible to this thread alone.
+        let result = {
+            let _pin =
+                crate::envx::pin(CONFIG_PATH_ENV_KEY, Some(&overridden.display().to_string()));
+            ExtensionConfig::load(&default_path)
+        };
 
         assert!(result.debug, "env-var override path must win over the caller-supplied default");
         assert!(!default_path.exists(), "the un-used default path must not be touched");
@@ -1173,7 +1113,6 @@ mod tests {
     // policy.
     #[test]
     fn save_preserves_non_extension_keys_and_their_order() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, CONFIG_WITH_PERMISSIONS).unwrap();
@@ -1224,7 +1163,6 @@ mod tests {
     // user mistyped a comma into.
     #[test]
     fn save_refuses_to_overwrite_a_corrupt_config() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let corrupt = "{\n  \"defaultPolicy\": \"ask\"\n  \"bash\": { \"git *\": \"allow\" }\n}\n";
@@ -1253,7 +1191,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn save_writes_through_a_symlinked_config_instead_of_replacing_it() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let real = dir.path().join("real-config.json");
         let link = dir.path().join("config.json");
@@ -1282,7 +1219,6 @@ mod tests {
     // saved document does not contain these keys, and the permission keys beside them survive.
     #[test]
     fn save_drops_prototype_pollution_keys_and_keeps_the_rest() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(
@@ -1309,7 +1245,6 @@ mod tests {
     // writes a fresh document containing exactly the three extension keys and nothing invented.
     #[test]
     fn save_creates_an_absent_config_with_only_the_extension_keys() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("nested").join("config.json");
 
@@ -1328,7 +1263,6 @@ mod tests {
     // exactly as upstream's `JSON.stringify` drops them.
     #[test]
     fn save_over_a_jsonc_config_with_comments_is_not_treated_as_corrupt() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(
@@ -1348,7 +1282,6 @@ mod tests {
     // MIRROR (must stay green): a UTF-8 BOM is not corruption either (pi `:167-168`).
     #[test]
     fn save_over_a_config_with_a_utf8_bom_is_not_treated_as_corrupt() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         std::fs::write(&path, format!("\u{feff}{CONFIG_WITH_PERMISSIONS}")).unwrap();
@@ -1362,7 +1295,6 @@ mod tests {
     // default rather than persisted verbatim.
     #[test]
     fn save_normalizes_the_config_it_writes() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
 
@@ -1391,19 +1323,17 @@ mod tests {
     // pi `getPermissionSystemConfigPath` applies to the save path too (`:242`).
     #[test]
     fn save_honours_the_config_path_env_override() {
-        let _guard = env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let overridden = dir.path().join("overridden.json");
         let default_path = dir.path().join("default.json");
 
-        // SAFETY: serialized by `env_lock`; restored before the assertions.
-        unsafe {
-            std::env::set_var(CONFIG_PATH_ENV_KEY, overridden.display().to_string());
-        }
-        let saved = ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&default_path);
-        unsafe {
-            std::env::remove_var(CONFIG_PATH_ENV_KEY);
-        }
+        // A [`crate::envx`] pin, not a process mutation: the override — and therefore the file
+        // `save` writes through it — is visible to this thread alone.
+        let saved = {
+            let _pin =
+                crate::envx::pin(CONFIG_PATH_ENV_KEY, Some(&overridden.display().to_string()));
+            ExtensionConfig { debug: true, ..ExtensionConfig::default() }.save(&default_path)
+        };
 
         assert!(saved.success, "save failed: {:?}", saved.error);
         assert!(overridden.exists(), "the override path must be the one written");
