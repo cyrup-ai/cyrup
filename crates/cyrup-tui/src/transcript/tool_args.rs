@@ -258,13 +258,22 @@ fn docs_classification(absolute: &std::path::Path) -> Option<CompactRead> {
     None
 }
 
-/// `toPosixPath` (`read.ts:100-102`) — `filePath.split(sep).join("/")`. A no-op on unix; on Windows
-/// it is what keeps the label reading `docs/providers.md` rather than `docs\providers.md`.
+/// `toPosixPath` (`read.ts:100-102`) — `filePath.split(sep).join("/")`, which is a plain
+/// replace-every-`sep`-with-`/` over the STRING form. A no-op on unix; on Windows it is what keeps
+/// the label reading `docs/providers.md` rather than `docs\providers.md`.
+///
+/// Deliberately NOT a `components()` walk joined on `"/"`: `Component::RootDir::as_os_str()` is
+/// already `MAIN_SEP_STR`, so the join emits it a second time and every absolute label comes out
+/// `//etc/…`; on Windows the `Prefix` + `RootDir` pair comes out `C:/\/a/b`. Upstream never
+/// decomposes the path, and neither must this — a UNC path's `//server/share/a` is upstream's
+/// output too, so a `//`-collapsing patch would be wrong in the other direction.
 fn to_posix_label(path: &std::path::Path) -> String {
-    path.components()
-        .map(|c| c.as_os_str().to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("/")
+    let s = path.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '/' {
+        s.into_owned()
+    } else {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
 }
 
 /// Port of `getCompactReadClassification` (`core/tools/read.ts:123-144`). **X7 = `G30b`** in

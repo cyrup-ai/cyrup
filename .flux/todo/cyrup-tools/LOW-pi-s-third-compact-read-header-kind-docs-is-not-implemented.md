@@ -4,8 +4,8 @@ priority: LOW
 tool: read
 source: pi-parity-audit (workflow wf_e427a266-e16)
 stage: exec
-status: in-progress
-updated: 2026-08-27 18:00
+status: done
+updated: 2026-08-27 18:12
 ---
 
 # Pi's third compact read header kind docs is not implemented

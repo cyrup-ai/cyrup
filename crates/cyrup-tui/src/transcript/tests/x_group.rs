@@ -214,6 +214,102 @@ fn x7_agents_md_is_a_compact_resource_read() {
     assert!(joined(&lower).contains("read docs/agents.md"), "{}", joined(&lower));
 }
 
+/// **X7b — a read under the SHIPPED asset root is a `docs` read, not a resource read.**
+///
+/// `getPiDocsClassification` (`read.ts:104-121`) + its position AHEAD of
+/// `COMPACT_RESOURCE_FILE_NAMES` in `getCompactReadClassification` (`read.ts:136-141`).
+#[test]
+fn x7b_reads_under_the_asset_root_classify_as_docs() {
+    // Tier 3: in a test binary this is the workspace root.
+    let root = cyrup_config::asset_dir().expect("asset_dir resolves in a test binary");
+    // A cwd deliberately OUTSIDE the asset root, so nothing here can pass by cwd-relative accident.
+    let opts = ImageOpts { cwd: Some(std::path::Path::new("/w/project")), ..ImageOpts::default() };
+    let read = |p: std::path::PathBuf| {
+        run_lines("read", json!({ "path": p.to_string_lossy() }), None, false, opts)
+    };
+
+    // `label === "README.md"` (`:117`).
+    let lines = read(root.join("README.md"));
+    assert_eq!(txt(row(&lines, "read docs")).trim_end(), " read docs README.md (ctrl+o to expand)");
+
+    // `label.startsWith("docs/")` — a nested path keeps its posix-joined relative label.
+    let lines = read(root.join("docs/guide/x.md"));
+    assert_eq!(
+        txt(row(&lines, "read docs")).trim_end(),
+        " read docs docs/guide/x.md (ctrl+o to expand)"
+    );
+
+    // PRECEDENCE: `docs/AGENTS.md` inside the shipped tree is a DOCS read, not a resource read.
+    // This is the ordering the `CompactReadKind` enum was introduced to protect.
+    let lines = read(root.join("docs/AGENTS.md"));
+    assert_eq!(
+        txt(row(&lines, "read docs")).trim_end(),
+        " read docs docs/AGENTS.md (ctrl+o to expand)"
+    );
+    assert!(!joined(&lines).contains("read resource"), "{}", joined(&lines));
+
+    // `resolveToCwd` normalizes lexically, so `docs/../docs/x.md` is the same read as `docs/x.md`.
+    let lines = read(root.join("docs/../docs/x.md"));
+    assert_eq!(txt(row(&lines, "read docs")).trim_end(), " read docs docs/x.md (ctrl+o to expand)");
+}
+
+/// **X7c — the `docs/` guard requires the separator, and a non-docs sibling is not a docs read.**
+///
+/// `startsWith("docs/")` (`:117`), NOT `startsWith("docs")`: a read of the `docs` DIRECTORY itself
+/// is an ordinary read upstream, and so is any other file at the asset root.
+#[test]
+fn x7c_the_docs_guard_needs_the_separator() {
+    let root = cyrup_config::asset_dir().expect("asset_dir resolves in a test binary");
+    let opts = ImageOpts { cwd: Some(std::path::Path::new("/w/project")), ..ImageOpts::default() };
+    for path in [root.join("docs"), root.join("CHANGELOG.md")] {
+        let lines = run_lines("read", json!({ "path": path.to_string_lossy() }), None, false, opts);
+        let out = joined(&lines);
+        assert!(!out.contains("read docs "), "generic header expected:\n{out}");
+        assert!(!out.contains("read resource"), "generic header expected:\n{out}");
+        // A generic (non-compact) read carries no expand hint — `x_group.rs` MIRROR 2.
+        assert!(!out.contains("to expand"), "generic header expected:\n{out}");
+    }
+}
+
+/// **X7d — a `resource` read that resolves OUTSIDE the cwd renders ONE leading slash.**
+///
+/// `formatPathRelativeToCwdOrAbsolute` (`utils/paths.ts:119-122`) falls back to the absolute path
+/// and folds it with `.split(sep).join("/")`, where the leading empty segment rejoins to exactly
+/// one `/`. The `resolveToCwd` port makes this the arm that `~`, `file://` and `@/abs` land in.
+#[test]
+fn x7d_a_resource_read_outside_the_cwd_keeps_one_leading_slash() {
+    let cwd = std::path::Path::new("/w/project");
+    let opts = ImageOpts { cwd: Some(cwd), ..ImageOpts::default() };
+    let header = |raw: &str| {
+        let lines = run_lines("read", json!({ "path": raw }), None, false, opts);
+        txt(row(&lines, "read resource")).trim_end().to_string()
+    };
+
+    // A plain absolute path outside the cwd.
+    assert_eq!(header("/etc/cyrup/AGENTS.md"), " read resource /etc/cyrup/AGENTS.md (ctrl+o to expand)");
+
+    // A `file://` URL — resolved by `resolve_to_cwd`, so it too takes the fallback.
+    assert_eq!(
+        header("file:///etc/cyrup/CLAUDE.md"),
+        " read resource /etc/cyrup/CLAUDE.md (ctrl+o to expand)"
+    );
+
+    // A `~`-expanded path. The home dir is environment-dependent, so derive the expectation from
+    // the same resolver the renderer uses and assert the LABEL SHAPE explicitly.
+    let expected = cyrup_tools::path::resolve_to_cwd("~/.cyrup/AGENTS.md", cwd);
+    let expected = expected.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
+    assert_eq!(header("~/.cyrup/AGENTS.md"), format!(" read resource {expected} (ctrl+o to expand)"));
+    assert!(!expected.contains("//"), "sanity: the fixture itself must not be doubled");
+    assert!(
+        !header("~/.cyrup/AGENTS.md").contains("//"),
+        "the doubled-separator regression: {}",
+        header("~/.cyrup/AGENTS.md")
+    );
+
+    // REGRESSION GUARD (item 1) in its most direct form.
+    assert!(!header("/etc/cyrup/AGENTS.md").contains("//"));
+}
+
 // --- X8 -------------------------------------------------------------------------------------
 
 /// **X8 — a PENDING `edit` with a computed preview is tinted `toolSuccessBg`, not `toolPendingBg`.**
