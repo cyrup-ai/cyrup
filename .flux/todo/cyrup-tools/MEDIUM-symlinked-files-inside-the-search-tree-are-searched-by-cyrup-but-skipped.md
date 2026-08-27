@@ -3,8 +3,8 @@ title: Symlinked files inside the search tree are searched by cyrup but skipped 
 priority: MEDIUM
 tool: grep
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
-status: done
+stage: exec
+status: in-progress
 updated: 2026-08-27
 ---
 

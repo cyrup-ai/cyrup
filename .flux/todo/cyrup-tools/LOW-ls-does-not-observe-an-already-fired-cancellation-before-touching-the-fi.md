@@ -3,8 +3,8 @@ title: Ls does not observe an already-fired cancellation before touching the fil
 priority: LOW
 tool: ls
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
-status: done
+stage: exec
+status: in-progress
 updated: 2026-08-27
 ---
 

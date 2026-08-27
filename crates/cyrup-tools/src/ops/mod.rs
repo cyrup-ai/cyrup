@@ -248,10 +248,24 @@ pub struct WalkOpts {
 }
 
 /// A single walked path.
+///
+/// `is_dir` and `is_file` are BOTH carried because they are not complements. A symlink, a FIFO, a
+/// socket and a device node are each neither, and separating those from a regular file is the
+/// reason this type exists rather than a bare `PathBuf`. Both flags describe the ENTRY's own type
+/// — `lstat` semantics, never followed — because that is the type the upstream binaries decide on:
+/// `ignore` 0.4.26 builds a traversed entry's type from `std::fs::DirEntry::file_type`
+/// (`walk.rs:322-333`, `:353-367`), which does not resolve the link.
+///
+/// `grep` filters on `is_file` ALONE, reproducing ripgrep's `SubjectBuilder`: a traversal-discovered
+/// entry is searched only when `file_type().is_file()` holds, so an in-tree symlink is never opened
+/// and its target is never searched under the link's name. `find` filters on `is_dir` ALONE and must
+/// keep doing so — fd DOES list symlinks, and `find` uses the flag only to decide the trailing `/`
+/// that marks a directory in its output.
 #[derive(Clone, Debug)]
 pub struct WalkItem {
     pub path: PathBuf,
     pub is_dir: bool,
+    pub is_file: bool,
 }
 
 /// What to run, where, and how (transport) for [`ProcOps::exec`].

@@ -395,7 +395,22 @@ impl Tool for GrepTool {
                     _ = cancel.cancelled() => return Err(error::aborted()),
                     item = walk.next() => {
                         match item {
-                            Some(Ok(w)) if !w.is_dir => {
+                            // ripgrep's subject filter. A traversal-discovered entry is
+                            // searched only when its OWN file type is a regular file
+                            // (`SubjectBuilder::build` → `Subject::is_file`); pi passes no
+                            // `--follow`/`-L` (grep.ts:220-224), so a symlink inside the tree is
+                            // not followed and not searched. `!w.is_dir` admitted symlinks — and
+                            // FIFOs, sockets and device nodes — then handed the path to
+                            // `read_stream`'s `File::open`, which has no `O_NOFOLLOW` and DOES
+                            // follow, searching the target's bytes under the link's name.
+                            //
+                            // This filter is for WALK-discovered candidates only. A `path`
+                            // argument that is a symlink to a file never reaches this loop:
+                            // `FsOps::metadata` (fs.rs:170-182) stats through the link, so
+                            // `meta.is_file` is true at the explicit-path branch above and the
+                            // file is searched directly — which is what ripgrep does for a
+                            // depth-0 explicit subject.
+                            Some(Ok(w)) if w.is_file => {
                                 let rel_path = w.path.strip_prefix(&search_root).unwrap_or(&w.path);
                                 let rel = to_posix(rel_path);
                                 // The glob is matched against the path relative to the OVERRIDE

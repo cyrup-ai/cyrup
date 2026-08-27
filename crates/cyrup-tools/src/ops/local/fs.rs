@@ -228,8 +228,23 @@ impl FsOps for LocalFs {
                 let item = match result {
                     Ok(entry) => {
                         let path = entry.path().to_path_buf();
-                        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                        Ok(WalkItem { path, is_dir })
+                        // One `file_type()` read feeds both flags. `ignore` 0.4.26 derives a
+                        // traversed entry's type from `std::fs::DirEntry::file_type`
+                        // (`walk.rs:322-333`, `:353-367`), which is `lstat` semantics: a symlink
+                        // reports itself as a symlink, so it is neither a dir nor a file and both
+                        // flags are false — exactly the entry ripgrep declines to search. `None`
+                        // occurs only for the synthetic stdin entry (`walk.rs:67-78`), which a
+                        // path-rooted walker never yields, so `unwrap_or(false)` mirrors ripgrep's
+                        // own `file_type().map_or(false, |ft| ft.is_file())`: unknown type is not a
+                        // regular file.
+                        let ty = entry.file_type();
+                        let is_dir = ty.map(|t| t.is_dir()).unwrap_or(false);
+                        let is_file = ty.map(|t| t.is_file()).unwrap_or(false);
+                        Ok(WalkItem {
+                            path,
+                            is_dir,
+                            is_file,
+                        })
                     }
                     Err(e) => Err(ToolError::new(format!("walk: {e}"))),
                 };
