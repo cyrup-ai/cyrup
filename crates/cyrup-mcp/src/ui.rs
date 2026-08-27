@@ -55,7 +55,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use ratatui::style::Style as RtStyle;
 use ratatui::text::Span as RtSpan;
 
@@ -1493,7 +1493,7 @@ fn matches_tool_selector_set(
     server_name: &str,
     prefix: ToolPrefix,
     patterns: &[String],
-    other_current: &HashSet<String>,
+    other_current: &IndexSet<String>,
 ) -> bool {
     if patterns.is_empty() {
         return false;
@@ -1504,7 +1504,7 @@ fn matches_tool_selector_set(
     }
     let mut legacy = tool_name_candidates(tool_name, server_name, prefix, true);
     for candidate in &current {
-        legacy.remove(candidate);
+        legacy.shift_remove(candidate);
     }
     patterns.iter().any(|pattern| {
         let one = std::slice::from_ref(pattern);
@@ -1519,7 +1519,7 @@ fn is_tool_allowed_set(
     prefix: ToolPrefix,
     include_tools: Option<&[String]>,
     exclude_tools: Option<&[String]>,
-    other_current: &HashSet<String>,
+    other_current: &IndexSet<String>,
 ) -> bool {
     let included = match include_tools.filter(|p| !p.is_empty()) {
         None => true,
@@ -1657,7 +1657,7 @@ impl McpPanelModel {
                 && !model.auth_only
                 && !definition.is_disabled()
             {
-                let definition_prefix = resolve_tool_prefix(definition, model.prefix);
+                let definition_prefix = resolve_tool_prefix(Some(definition), model.prefix);
                 for tool in &entry.tools {
                     if !ui_visible_to_model(tool) {
                         continue;
@@ -1781,8 +1781,8 @@ impl McpPanelModel {
         definition_prefix: ToolPrefix,
         current_entry: &ServerCacheEntry,
         tool_name: &str,
-    ) -> HashSet<String> {
-        let mut candidates: HashSet<String> = HashSet::new();
+    ) -> IndexSet<String> {
+        let mut candidates: IndexSet<String> = IndexSet::new();
         for (other_name, other_definition) in &self.config_servers {
             if other_definition.is_disabled() {
                 continue;
@@ -1795,7 +1795,7 @@ impl McpPanelModel {
                     None => continue,
                 }
             };
-            let other_prefix = resolve_tool_prefix(other_definition, self.prefix);
+            let other_prefix = resolve_tool_prefix(Some(other_definition), self.prefix);
             for tool in &entry.tools {
                 if !ui_visible_to_model(tool) {
                     continue;
@@ -1812,7 +1812,7 @@ impl McpPanelModel {
             }
         }
         for candidate in tool_name_candidates(tool_name, server_name, definition_prefix, false) {
-            candidates.remove(&candidate);
+            candidates.shift_remove(&candidate);
         }
         candidates
     }

@@ -11,7 +11,7 @@ use crate::config::{
     ToolPrefix,
 };
 use crate::proxy::constants::INSTRUCTIONS_SNIPPET_LENGTH;
-use crate::proxy::tool_metadata::{ToolMetadata, get_tool_name_candidates, is_tool_allowed, is_ui_tool_visible_to_model, resolve_tool_prefix, resource_name_to_tool_name, truncate_at_word};
+use crate::proxy::tool_metadata::{CandidateIndex, ToolMetadata, is_tool_allowed, is_ui_tool_visible_to_model, resolve_tool_prefix, resource_name_to_tool_name, tool_name_candidates, truncate_at_word};
 
 // ==================================================================================================
 // 13 · `buildProxyDescription` — the regenerated description (MCP-152, MCP-198)
@@ -60,31 +60,32 @@ fn server_has_tool_filters(definition: &ServerEntry) -> bool {
         || definition.exclude_tools.as_ref().is_some_and(|list| !list.is_empty())
 }
 
-/// The MCP-198 cross-server collision set: every *current-form* name candidate of every enabled
-/// server that has a cache entry — including the server being filtered, whose own candidates are
-/// subtracted by match *count* inside `index_has_other_current_match` rather than pre-deleted.
+/// The MCP-198 cross-server collision set, as the memoising index [`is_tool_allowed`] consumes:
+/// every *current-form* name candidate of every enabled server that has a cache entry — including
+/// the server being filtered, whose own candidates are subtracted by match *count* inside
+/// [`CandidateIndex`] rather than pre-deleted.
 ///
-/// **Empty unless some server declares a selector.** `direct-tools.ts:257-262`, upstream `faf55f7`
-/// ("avoid O(tools²) startup collision scan when no tool filters are configured"): [`is_tool_allowed`]
-/// short-circuits on absent/empty `includeTools` *and* `excludeTools` before it ever reads the set,
-/// so building one nothing consults is pure startup cost — the report behind that commit had 14
-/// servers / ~800 tools, where the equivalent scan cost ~2.6s of synchronous startup and dominated
-/// `pi`'s 3.66s launch. This description is regenerated on every metadata update, so the waste was
-/// per-reconnect, not once.
+/// **`None`, never an empty index, unless some server declares a selector.**
+/// `direct-tools.ts:257-262`, upstream `faf55f7` ("avoid O(tools²) startup collision scan when no
+/// tool filters are configured"): [`is_tool_allowed`] short-circuits on absent/empty `includeTools`
+/// *and* `excludeTools` before it ever reads the set, so building one nothing consults is pure
+/// startup cost — the report behind that commit had 14 servers / ~800 tools, where the equivalent
+/// scan cost ~2.6s of synchronous startup and dominated `pi`'s 3.66s launch. This description is
+/// regenerated on every metadata update, so the waste was per-reconnect, not once.
 ///
-/// Returning an empty set rather than `Option` is safe *because* this gate and the per-server gate
-/// in [`build_proxy_description`] test the identical predicate: no server can consult a set that
+/// `None` rather than an empty index is safe *because* this gate and the per-server gate in
+/// [`build_proxy_description`] test the identical predicate: no server can consult an index that
 /// was never built. One build serves the whole call, where upstream rebuilds an identical index per
 /// filtered server (it is not parameterised by the server being filtered).
-fn collision_candidates(
+fn collision_index(
     config: &McpConfig,
     cache: &IndexMap<String, CachedServerEntry>,
     prefix: ToolPrefix,
-) -> IndexSet<String> {
-    let mut all_candidates: IndexSet<String> = IndexSet::new();
+) -> Option<CandidateIndex> {
     if !config.mcp_servers.values().any(server_has_tool_filters) {
-        return all_candidates;
+        return None;
     }
+    let mut all_candidates: IndexSet<String> = IndexSet::new();
     for (other_server, other_definition) in &config.mcp_servers {
         let Some(other_entry) = cache.get(other_server) else { continue };
         if other_definition.is_disabled() {
@@ -98,16 +99,16 @@ fn collision_candidates(
                 continue;
             }
             all_candidates
-                .extend(get_tool_name_candidates(&tool.name, other_server, other_prefix, false));
+                .extend(tool_name_candidates(&tool.name, other_server, other_prefix, false));
         }
         if other_definition.expose_resources() {
             for (name, _) in &other_entry.resources {
                 let base = format!("read_{}", resource_name_to_tool_name(name));
-                all_candidates.extend(get_tool_name_candidates(&base, other_server, other_prefix, false));
+                all_candidates.extend(tool_name_candidates(&base, other_server, other_prefix, false));
             }
         }
     }
-    all_candidates
+    Some(CandidateIndex::new(all_candidates))
 }
 
 /// `direct-tools.ts:234` `buildProxyDescription(config, cache, directSpecs)`.
@@ -122,7 +123,7 @@ fn collision_candidates(
 ///    the **absence** of a trailing newline on the final `Mode:` line.
 ///
 /// **MCP-198 — the counts are an O(servers × tools) cross-server computation, not a per-server
-/// filter.** [`collision_candidates`] builds the set of name candidates produced by *every other*
+/// filter.** [`collision_index`] builds the set of name candidates produced by *every other*
 /// cache-valid, enabled server (including `read_<resource>` names when `exposeResources !== false`)
 /// and hands it to `isToolAllowed` as its collision set, so adding an unrelated server can change a
 /// third server's advertised count. Built **once per call**, and **not at all** unless some server
@@ -160,9 +161,9 @@ pub fn build_proxy_description(
         ));
     }
 
-    // MCP-198 · the cross-server candidate-collision set — built once, and only when a selector
-    // exists to read it. See [`collision_candidates`].
-    let all_candidates = collision_candidates(config, cache, prefix);
+    // MCP-198 · the cross-server candidate-collision index — built once, and only when a selector
+    // exists to read it. See [`collision_index`].
+    let mut collision = collision_index(config, cache, prefix);
 
     // 3 · Per-server proxy counts.
     let mut server_summaries: Vec<String> = Vec::new();
@@ -172,49 +173,52 @@ pub fn build_proxy_description(
         }
         let entry = cache.get(server_name);
         let effective_prefix = resolve_tool_prefix(Some(definition), prefix);
-        // `direct-tools.ts:284` — the set is consulted only when *this* server declares a selector.
-        // [`collision_candidates`] tests the same predicate across every server before it builds
-        // anything, so `Some(&all_candidates)` here can never name a set that was skipped.
-        let collision = server_has_tool_filters(definition).then_some(&all_candidates);
+        // `direct-tools.ts:284` — the index is consulted only when *this* server declares a
+        // selector. [`collision_index`] tests the same predicate across every server before it
+        // builds anything, so this can never name an index that was skipped.
+        //
+        // Explicit loops, not `.filter(…).count()`: [`CandidateIndex`] memoises as it answers, so
+        // the borrow is `&mut` and cannot cross a closure that the surrounding iterator also holds.
+        let mut index =
+            if server_has_tool_filters(definition) { collision.as_mut() } else { None };
 
-        let tool_count = entry.map_or(0, |entry| {
-            entry
-                .tools
-                .iter()
-                .filter(|tool| {
-                    is_ui_tool_visible_to_model(tool.ui_visibility.as_deref())
-                        && is_tool_allowed(
-                            &tool.name,
-                            server_name,
-                            effective_prefix,
-                            definition.include_tools.as_deref(),
-                            definition.exclude_tools.as_deref(),
-                            collision,
-                        )
-                })
-                .count()
-        });
-        let resource_count = if definition.expose_resources() {
-            entry.map_or(0, |entry| {
-                entry
-                    .resources
-                    .iter()
-                    .filter(|(name, _)| {
-                        let base = format!("read_{}", resource_name_to_tool_name(name));
-                        is_tool_allowed(
-                            &base,
-                            server_name,
-                            effective_prefix,
-                            definition.include_tools.as_deref(),
-                            definition.exclude_tools.as_deref(),
-                            collision,
-                        )
-                    })
-                    .count()
-            })
-        } else {
-            0
-        };
+        let mut tool_count = 0_usize;
+        if let Some(entry) = entry {
+            for tool in &entry.tools {
+                if !is_ui_tool_visible_to_model(tool.ui_visibility.as_deref()) {
+                    continue;
+                }
+                if is_tool_allowed(
+                    &tool.name,
+                    server_name,
+                    effective_prefix,
+                    definition.include_tools.as_deref(),
+                    definition.exclude_tools.as_deref(),
+                    index.as_deref_mut(),
+                ) {
+                    tool_count += 1;
+                }
+            }
+        }
+
+        let mut resource_count = 0_usize;
+        if definition.expose_resources()
+            && let Some(entry) = entry
+        {
+            for (name, _) in &entry.resources {
+                let base = format!("read_{}", resource_name_to_tool_name(name));
+                if is_tool_allowed(
+                    &base,
+                    server_name,
+                    effective_prefix,
+                    definition.include_tools.as_deref(),
+                    definition.exclude_tools.as_deref(),
+                    index.as_deref_mut(),
+                ) {
+                    resource_count += 1;
+                }
+            }
+        }
 
         let total_items = tool_count + resource_count;
         if total_items == 0 {
@@ -414,34 +418,35 @@ mod tests {
         assert!(!is_tool_allowed("do-it", "srv", ToolPrefix::Server, none, Some(&exclude_current), None));
 
         // `do_it` is a LEGACY-only candidate of `do-it`.
-        let current = get_tool_name_candidates("do-it", "srv", ToolPrefix::Server, false);
-        let legacy = get_tool_name_candidates("do-it", "srv", ToolPrefix::Server, true);
+        let current = tool_name_candidates("do-it", "srv", ToolPrefix::Server, false);
+        let legacy = tool_name_candidates("do-it", "srv", ToolPrefix::Server, true);
         assert!(!current.contains("do_it"));
         assert!(legacy.contains("do_it"));
 
         let exclude_legacy = ["do_it".to_string()];
         // …with no collision context it still excludes…
         assert!(!is_tool_allowed("do-it", "srv", ToolPrefix::Server, none, Some(&exclude_legacy), None));
-        // …and with a collision set that does not contain it, likewise.
-        let quiet: IndexSet<String> = current.clone();
+        // …and with a collision index that does not contain it, likewise.
+        let mut quiet = CandidateIndex::new(current.clone());
         assert!(!is_tool_allowed(
             "do-it",
             "srv",
             ToolPrefix::Server,
             none,
             Some(&exclude_legacy),
-            Some(&quiet)
+            Some(&mut quiet)
         ));
         // But when `do_it` is another server's CURRENT name, the selector is disarmed.
-        let mut collides: IndexSet<String> = current.clone();
-        collides.insert("do_it".to_string());
+        let mut collides_set: IndexSet<String> = current.clone();
+        collides_set.insert("do_it".to_string());
+        let mut collides = CandidateIndex::new(collides_set);
         assert!(is_tool_allowed(
             "do-it",
             "srv",
             ToolPrefix::Server,
             none,
             Some(&exclude_legacy),
-            Some(&collides)
+            Some(&mut collides)
         ));
     }
 
@@ -479,7 +484,7 @@ mod tests {
     ///
     /// Upstream proves this by mocking `getToolNameCandidates` and asserting zero calls
     /// (`__tests__/collision-scan-lazy.test.ts`). The Rust equivalent is to assert the scan's
-    /// product: [`collision_candidates`] is the only thing on this path that expands candidates, so
+    /// product: [`collision_index`] is the only thing on this path that expands candidates, so
     /// an empty set is proof the scan was *skipped*, not merely fast — two servers whose tool names
     /// collide would otherwise both be indexed.
     #[test]
@@ -498,19 +503,20 @@ mod tests {
 
         let unfiltered = config_with(&[("a", stdio("npx")), ("b", stdio("npx"))]);
         assert!(
-            collision_candidates(&unfiltered, &cache, unfiltered.tool_prefix()).is_empty(),
+            collision_index(&unfiltered, &cache, unfiltered.tool_prefix()).is_none(),
             "no includeTools/excludeTools anywhere — the O(tools²) scan must not run",
         );
 
         // Positive control: one selector on one server re-arms the scan for the whole call, and the
         // set spans the filtered server too — a tool's own candidates are subtracted by match count
-        // inside `index_has_other_current_match`, never by omitting them here.
+        // inside `CandidateIndex::has_other_current_match`, never by omitting them here.
         let filtered =
             ServerEntry { exclude_tools: Some(vec!["a_search".to_string()]), ..stdio("npx") };
         let armed = config_with(&[("a", filtered), ("b", stdio("npx"))]);
-        let candidates = collision_candidates(&armed, &cache, armed.tool_prefix());
-        assert!(candidates.contains("b_search"), "{candidates:?}");
-        assert!(candidates.contains("a_search"), "{candidates:?}");
+        let index = collision_index(&armed, &cache, armed.tool_prefix());
+        let candidates = index.as_ref().map(CandidateIndex::all_current);
+        assert!(candidates.is_some_and(|set| set.contains("b_search")), "{candidates:?}");
+        assert!(candidates.is_some_and(|set| set.contains("a_search")), "{candidates:?}");
 
         // …and skipping it changes nothing the model reads: the counts are identical either way,
         // which is the whole claim — a pure startup-cost fix, not a behaviour change.

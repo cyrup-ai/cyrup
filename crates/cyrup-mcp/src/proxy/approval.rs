@@ -18,7 +18,7 @@ use crate::proxy::constants::{
     APPROVAL_OPTIONS, APPROVAL_PREVIEW_LENGTH, APPROVE_FOR_SESSION_OPTION, APPROVE_ONCE_OPTION,
 };
 use crate::proxy::env::{ApprovalOrigin, ApprovalOutcome};
-use crate::proxy::tool_metadata::{ToolMetadata, get_tool_name_candidates, matches_tool_pattern, resolve_tool_prefix};
+use crate::proxy::tool_metadata::{ToolMetadata, matches_tool_pattern, resolve_tool_prefix, tool_name_candidates};
 
 // ==================================================================================================
 // 15 · `tool-approval.ts` — the approval predicate and the approval dialog (MCP-231, MCP-232)
@@ -27,7 +27,7 @@ use crate::proxy::tool_metadata::{ToolMetadata, get_tool_name_candidates, matche
 // Upstream these are `tool-approval.ts`'s two exported functions over the mutable
 // `McpExtensionState` record. They land here rather than in a module of their own for the reason
 // section 4 already gives: `ToolMetadata`, `ApprovalOrigin`, `ApprovalOutcome`,
-// `get_tool_name_candidates` and `matches_tool_pattern` are all in this file, the sole caller
+// `tool_name_candidates` and `matches_tool_pattern` are all in this file, the sole caller
 // ([`execute_call`], phase 8) is in this file, and the third piece — the session cache key — is in
 // [`crate::state`] beside the set it keys, exactly where `tool-approval.ts:151-152 @v2.26.1` puts it
 // relative to `state.approvedToolCalls`.
@@ -51,7 +51,7 @@ use crate::proxy::tool_metadata::{ToolMetadata, get_tool_name_candidates, matche
 /// # The legacy arm, and the collision test that makes it safe
 ///
 /// A pattern is first matched against the tool's **current** names
-/// (`get_tool_name_candidates(..., include_legacy = false)`). Only when that misses does the
+/// (`tool_name_candidates(..., include_legacy = false)`). Only when that misses does the
 /// pre-2.x residue get a look — the legacy-inclusive set minus everything already current, plus one
 /// explicit injection: the first non-bare current candidate with `-` mapped to `_`, which is the
 /// spelling a config written against an older adapter would carry. That residue only gates the tool
@@ -98,9 +98,9 @@ pub fn is_tool_call_approval_required(
     };
 
     let prefix = resolve_tool_prefix(definition, config.tool_prefix());
-    let current = get_tool_name_candidates(&tool.original_name, server_name, prefix, false);
+    let current = tool_name_candidates(&tool.original_name, server_name, prefix, false);
     // Both scopes run this test first and identically, so it is hoisted out of the branch.
-    if matches_tool_pattern(&current, Some(patterns)) {
+    if matches_tool_pattern(&current, patterns) {
         return true;
     }
 
@@ -109,8 +109,8 @@ pub fn is_tool_call_approval_required(
             // `matchesToolPattern(getToolNameCandidates(originalName, serverName, prefix), approval)`
             // — the DEFAULT fourth argument, i.e. legacy-inclusive and *not* minus the current set.
             matches_tool_pattern(
-                &get_tool_name_candidates(&tool.original_name, server_name, prefix, true),
-                Some(patterns),
+                &tool_name_candidates(&tool.original_name, server_name, prefix, true),
+                patterns,
             )
         } else {
             false
@@ -121,7 +121,7 @@ pub fn is_tool_call_approval_required(
         // Server scope: `toolMetadata.get(serverName) ?? []`, under THIS server's prefix.
         let mut set = IndexSet::new();
         for other in metadata.get(server_name).map(Vec::as_slice).unwrap_or_default() {
-            set.extend(get_tool_name_candidates(&other.original_name, server_name, prefix, false));
+            set.extend(tool_name_candidates(&other.original_name, server_name, prefix, false));
         }
         set
     } else {
@@ -131,7 +131,7 @@ pub fn is_tool_call_approval_required(
             let other_prefix =
                 resolve_tool_prefix(config.mcp_servers.get(other_server), config.tool_prefix());
             for other in tools {
-                set.extend(get_tool_name_candidates(
+                set.extend(tool_name_candidates(
                     &other.original_name,
                     other_server,
                     other_prefix,
@@ -161,7 +161,7 @@ fn approval_legacy_arm(
     current: &IndexSet<String>,
     mut other_current: IndexSet<String>,
 ) -> bool {
-    let mut legacy = get_tool_name_candidates(original_name, server_name, prefix, true);
+    let mut legacy = tool_name_candidates(original_name, server_name, prefix, true);
     // `[...currentCandidates].find(c => c !== toolMeta.originalName)?.replace(/-/g, "_")` — the
     // first prefixed spelling, normalised. `IndexSet` iterates in insertion order, which is what
     // makes "first" mean the same thing here as in a JS `Set`.
@@ -175,8 +175,8 @@ fn approval_legacy_arm(
         other_current.shift_remove(candidate);
     }
     patterns.iter().any(|pattern| {
-        matches_tool_pattern(&legacy, Some(std::slice::from_ref(pattern)))
-            && !matches_tool_pattern(&other_current, Some(std::slice::from_ref(pattern)))
+        matches_tool_pattern(&legacy, std::slice::from_ref(pattern))
+            && !matches_tool_pattern(&other_current, std::slice::from_ref(pattern))
     })
 }
 

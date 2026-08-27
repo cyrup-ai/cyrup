@@ -179,6 +179,10 @@ pub use secrets::{
 };
 /// The `mcp` gateway tool and its nine modes (13d) — `proxy-modes.ts` / `mcp-tool.ts`.
 pub use proxy::{McpErrorCode, McpTool, ProxyCtx, ProxyEnv, MCP_TOOL_NAME};
+/// The inverse of the tool-name grammar (MCP-073) — `types.ts` `resolveServerFromToolName`. The
+/// forward direction lives on [`registration`] with the rest of the grammar; this one is re-exported
+/// because its consumer is a downstream policy gate in another crate.
+pub use registration::resolve_server_from_tool_name;
 /// Tool-result rendering and the MCP output guard (13e/13h) — `tool-result-renderer.ts`,
 /// `mcp-output-guard.ts`, `tool-registrar.ts`.
 pub use renderers::{

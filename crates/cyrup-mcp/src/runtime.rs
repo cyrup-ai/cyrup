@@ -437,18 +437,20 @@ mod tests {
 //   run on a disposable sibling process — see [`version_negotiation`] for the delta that costs.
 // =================================================================================================
 
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::process::Stdio;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
+use futures::StreamExt as _;
 // `http` and `sse-stream` are declared dependencies for exactly this reason: implementing
 // `StreamableHttpClient` (here for [`SessionIdProbe`], in `request_headers_command.rs` for the
 // signing decorator) means naming the trait's argument and return types, and a trait impl leaves no
 // option to reach them by inference. See the crate's dependency note.
 use http::{HeaderName, HeaderValue};
-use sse_stream::{Error as SseError, Sse};
+use sse_stream::{Error as SseError, Sse, SseStream};
 // SEP-2577 deprecates `sampling/createMessage` protocol-wide and rmcp marks the types
 // accordingly; `pi-mcp-adapter` ships a sampling handler and 1:1 parity is a hard rule, so the
 // deprecation is acknowledged and suppressed rather than obeyed. rmcp's own `handler/client.rs`
@@ -464,10 +466,13 @@ use rmcp::service::{
     ClientInitializeError, ClientLifecycleMode, MaybeSendFuture, NotificationContext, Peer,
     PeerRequestOptions, RequestContext, RoleClient, RunningService,
 };
-use rmcp::model::ClientJsonRpcMessage;
+use rmcp::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage};
+use rmcp::transport::common::http_header::{
+    EVENT_STREAM_MIME_TYPE, HEADER_LAST_EVENT_ID, HEADER_SESSION_ID, JSON_MIME_TYPE,
+};
 use rmcp::transport::streamable_http_client::{
-    StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
-    StreamableHttpPostResponse,
+    AuthRequiredError, InsufficientScopeError, StreamableHttpClient,
+    StreamableHttpClientTransportConfig, StreamableHttpError, StreamableHttpPostResponse,
 };
 use rmcp::transport::{ConfigureCommandExt, IntoTransport, StreamableHttpClientTransport,
     TokioChildProcess};
@@ -1047,6 +1052,394 @@ where
             .await?;
         self.record(&response);
         Ok(response)
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        self.inner
+            .get_stream(uri, session_id, last_event_id, auth_header, custom_headers)
+            .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        self.inner
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        self.inner
+            .delete_session(uri, session_id, auth_header, custom_headers)
+            .await
+    }
+}
+
+/// `DEFAULT_MAX_SSE_EVENT_SIZE` (`rmcp-3.1.4/src/transport/common/client_side_sse.rs:18`), which
+/// rmcp keeps `pub(crate)`. Only [`UnauthorizedProbe::post_message`] needs it — the transport always
+/// calls the `_with_max_sse_event_size` form
+/// (`rmcp-3.1.4/src/transport/streamable_http_client.rs:773`, `:804`, `:867`, `:934`) — but
+/// restating it there rather than delegating is what stops a direct caller of `post_message` from
+/// bypassing the 401 classification.
+const DEFAULT_MAX_SSE_EVENT_SIZE: usize = 16 * 1024 * 1024;
+
+/// `validate_custom_header` (`rmcp-3.1.4/src/transport/common/http_header.rs:31-45`), inverted.
+///
+/// `MCP-Protocol-Version` is in rmcp's `RESERVED_HEADERS` but is explicitly allowed through (the
+/// transport worker injects it post-init), so it is simply absent from this list. The SEP-2243
+/// `Mcp-Method` / `Mcp-Name` / `Mcp-Param-*` headers are not reserved either and must keep passing:
+/// `request_version_headers` puts them on the modern startup POST.
+///
+/// This rejection is what
+/// [`request_headers_command.rs:63-67`](crate::request_headers_command) documents a derived header
+/// hitting, so it must not weaken.
+fn is_reserved_header(name: &HeaderName) -> bool {
+    const RESERVED: [&str; 3] = ["accept", HEADER_SESSION_ID, HEADER_LAST_EVENT_ID];
+    RESERVED
+        .iter()
+        .any(|reserved| name.as_str().eq_ignore_ascii_case(reserved))
+}
+
+/// `extract_scope_from_header` (`rmcp-3.1.4/src/transport/common/http_header.rs:50-73`), which rmcp
+/// keeps `pub(crate)`. Rewritten slice-free because `clippy::indexing_slicing` is `deny` here;
+/// behaviour is identical, including "an unterminated quoted value yields `None`" and "an empty
+/// unquoted value yields `None`".
+///
+/// Byte offsets from the lowercased copy index the original safely: `to_ascii_lowercase` preserves
+/// byte length, and `str::get` returns `None` rather than panicking off a char boundary.
+fn scope_from_challenge(header: &str) -> Option<String> {
+    const SCOPE_KEY: &str = "scope=";
+    let start = header.to_ascii_lowercase().find(SCOPE_KEY)? + SCOPE_KEY.len();
+    let value = header.get(start..)?;
+    match value.strip_prefix('"') {
+        Some(quoted) => {
+            let end = quoted.find('"')?;
+            quoted.get(..end).map(str::to_string)
+        }
+        None => {
+            let end = value
+                .find(|c: char| c == ',' || c == ';' || c.is_whitespace())
+                .unwrap_or(value.len());
+            let scope = value.get(..end)?;
+            (!scope.is_empty()).then(|| scope.to_string())
+        }
+    }
+}
+
+/// The two requests that can be a client's *startup* message, and therefore the only two whose 401
+/// can surface as a [`ClientInitializeError`].
+///
+/// `InitializeRequest` is [`ClientLifecycleMode::Initialize`]'s;
+/// `DiscoverRequest` is `Discover`'s and `Auto`'s (`rmcp-3.1.4/src/service/client.rs:943-954`), both
+/// of which [`version_negotiation`] reaches from `protocolVersion: "2026-07-28"` and `"auto"`.
+/// Matching only `InitializeRequest` would leave this defect live for those two configurations.
+fn is_handshake_request(message: &ClientJsonRpcMessage) -> bool {
+    matches!(
+        message,
+        JsonRpcMessage::Request(request)
+            if matches!(
+                request.request,
+                ClientRequest::InitializeRequest(_) | ClientRequest::DiscoverRequest(_)
+            )
+    )
+}
+
+/// `bounded_sse_stream` (`rmcp-3.1.4/src/transport/common/client_side_sse.rs:144-155`), which rmcp
+/// keeps `pub(crate)` along with its `SseEventSizeLimiter`.
+///
+/// NAMED DELTA: rmcp caps each SSE **event**; this caps the **total** bytes of the handshake
+/// response, i.e. strictly stricter. That is sound only because it is reached only for a handshake
+/// POST, whose stream `expect_initialized`
+/// (`rmcp-3.1.4/src/transport/streamable_http_client.rs:264-283`) drains to the first `Response`
+/// message and then DROPS. Every other POST keeps rmcp's per-event limiter because every other POST
+/// is delegated.
+///
+/// `std::io::Error` rather than a bespoke enum: `SseStream::from_bytes_stream` needs only
+/// `E: std::error::Error` (`sse-stream-0.2.5/src/stream.rs:36-56`), `reqwest::Error` cannot be
+/// constructed, and `io::Error` carries both arms without adding a type.
+fn capped_sse_stream(
+    response: reqwest::Response,
+    max_sse_event_size: usize,
+) -> BoxStream<'static, Result<Sse, SseError>> {
+    let mut seen = 0_usize;
+    let capped = response.bytes_stream().map(move |chunk| {
+        let chunk = chunk.map_err(std::io::Error::other)?;
+        seen = seen.saturating_add(chunk.len());
+        if seen > max_sse_event_size {
+            return Err(std::io::Error::other(format!(
+                "handshake SSE response exceeded the maximum size of {max_sse_event_size} bytes"
+            )));
+        }
+        Ok(chunk)
+    });
+    SseStream::from_bytes_stream(capped).boxed()
+}
+
+/// `error.status === 401` — the one bit rmcp's reqwest client throws away.
+///
+/// # Why this OWNS the POST instead of decorating it
+///
+/// [`SessionIdProbe`] and [`crate::request_headers_command::RequestHeadersCommandClient`] both sit
+/// ABOVE `impl StreamableHttpClient for reqwest::Client` and delegate the send to it
+/// (`runtime.rs:1017-1022`, `request_headers_command.rs:944-946`). What comes back to them is a
+/// [`StreamableHttpPostResponse`] — a `ServerJsonRpcMessage`, a stream, and an `Option<String>`
+/// session id, and NOTHING about the HTTP status. rmcp reads the status into a local at
+/// `rmcp-3.1.4/src/transport/common/reqwest/streamable_http_client.rs:243` and that local dies with
+/// the frame, so the status cannot be decorated out of rmcp: it can only be kept by a client that
+/// performs the POST itself.
+///
+/// # Why only the handshake
+///
+/// [`unauthorized_challenge`] has exactly one caller (`runtime.rs:2672`) and it takes a
+/// [`ClientInitializeError`], so the startup POST is the only request whose 401 can start the OAuth
+/// ladder. Every other POST is delegated to rmcp verbatim — same SSE limiter, same 202 handling,
+/// same session-expiry — which keeps the blast radius at the handshake. The SSE cap in
+/// [`capped_sse_stream`] is total-bytes rather than rmcp's per-event, and that is safe ONLY because
+/// a handshake stream is drained to its first `Response` and dropped; a `tools/call` result stream
+/// is not, which is the second reason non-handshake POSTs must stay delegated.
+///
+/// # Why `AuthRequired` and not a new shape
+///
+/// [`StreamableHttpError::AuthRequired`] is the currency the consumers already read, so nothing
+/// downstream changes: [`unauthorized_challenge`] downcasts it at `runtime.rs:2021-2025` and returns
+/// `Some(&required.www_authenticate_header)` — `Some("")` for a bare 401, which is exactly what
+/// [`crate::oauth::on_unauthorized`] (`oauth.rs:3949-3964`) already expects. `AuthRequiredError::new`
+/// is public (`rmcp-3.1.4/src/transport/streamable_http_client.rs:135-142`) and the variant carries
+/// it as `#[source]` (`:203`), so the `source()` walk at `runtime.rs:2019-2030` finds it. rmcp's own
+/// `ClientInitializeError::auth_challenge` (`…/service/client.rs:109-132`) reads the same type, and
+/// so will `AuthClient` when section 05 lands it.
+#[derive(Debug, Clone)]
+pub struct UnauthorizedProbe {
+    inner: reqwest::Client,
+}
+
+impl UnauthorizedProbe {
+    /// Wrap the tuned client [`build_http_client`] produces.
+    #[must_use]
+    pub fn new(inner: reqwest::Client) -> Self {
+        Self { inner }
+    }
+
+    /// A faithful port of `rmcp-3.1.4/src/transport/common/reqwest/streamable_http_client.rs:190-324`
+    /// with ONE behavioural difference — the 401 arm below — and two arms that cannot fire here:
+    /// one kept anyway, one omitted, each stated at the point it sits.
+    async fn post_handshake(
+        &self,
+        uri: &str,
+        message: &ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<reqwest::Error>> {
+        // Byte-for-byte the request rmcp would have sent (`:196-211`), in rmcp's order: ACCEPT, the
+        // separate bearer channel, the custom headers under the same reserved-header rejection, the
+        // session header, then `serde_json` of the message.
+        let mut request = self.inner.post(uri).header(
+            reqwest::header::ACCEPT,
+            [EVENT_STREAM_MIME_TYPE, JSON_MIME_TYPE].join(", "),
+        );
+        if let Some(auth_header) = auth_header {
+            request = request.bearer_auth(auth_header);
+        }
+        for (name, value) in custom_headers {
+            if is_reserved_header(&name) {
+                return Err(StreamableHttpError::ReservedHeaderConflict(name.to_string()));
+            }
+            request = request.header(name, value);
+        }
+        let session_was_attached = session_id.is_some();
+        if let Some(session_id) = session_id {
+            request = request.header(HEADER_SESSION_ID, session_id.as_ref());
+        }
+        let response = request.json(message).send().await?;
+
+        // ── THE FIX ──────────────────────────────────────────────────────────────────────────────
+        // The status is read BEFORE the body, and 401 wins over the JSON-RPC shortcut whether or not
+        // a challenge came with it. rmcp gates its own 401 arm on the header being present
+        // (`:212-213`), which is why a bare 401 with a JSON body falls through to `:289`. Upstream
+        // reads the status first and unconditionally
+        // (`@modelcontextprotocol/client/dist/index.mjs:5333-5334`), and confines its own JSON-RPC
+        // error passthrough to status 400 (`:5374-5381`).
+        let status = response.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            let challenge = response
+                .headers()
+                .get(http::header::WWW_AUTHENTICATE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_string();
+            return Err(StreamableHttpError::AuthRequired(AuthRequiredError::new(
+                challenge,
+            )));
+        }
+        // ── everything below mirrors rmcp `:227-324` ─────────────────────────────────────────────
+        // 403 is NOT widened: `InsufficientScope` is reproduced exactly so a scope denial keeps
+        // rmcp's vocabulary and stays a hard error, which is what `unauthorized_challenge`'s
+        // `AuthRequiredError`-only downcast already enforces.
+        if status == reqwest::StatusCode::FORBIDDEN
+            && let Some(header) = response.headers().get(http::header::WWW_AUTHENTICATE)
+        {
+            let Ok(header) = header.to_str() else {
+                return Err(StreamableHttpError::UnexpectedServerResponse(Cow::from(
+                    "invalid www-authenticate header value",
+                )));
+            };
+            return Err(StreamableHttpError::InsufficientScope(
+                InsufficientScopeError::new(header.to_string(), scope_from_challenge(header)),
+            ));
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::ACCEPTED | reqwest::StatusCode::NO_CONTENT
+        ) {
+            return Ok(StreamableHttpPostResponse::Accepted);
+        }
+        // UNREACHABLE ARM 1 of 2 — rmcp's `404 => SessionExpired` (`:250-252`) is KEPT, but it can
+        // never fire here: the worker posts both startup requests with `session_id: None`
+        // (`…/streamable_http_client.rs:870`, `:776`). Kept anyway, because it costs three lines and
+        // an rmcp change that starts attaching one must not silently change meaning.
+        if status == reqwest::StatusCode::NOT_FOUND && session_was_attached {
+            return Err(StreamableHttpError::SessionExpired);
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+        let session_id = response
+            .headers()
+            .get(HEADER_SESSION_ID)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string);
+        let is_json = content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with(JSON_MIME_TYPE));
+
+        // UNREACHABLE ARM 2 of 2 — rmcp's empty-success => Accepted (`:265-277`) requires the OUTGOING
+        // message to be a Notification/Response/Error. This method only runs for a Request, so the
+        // arm is unreachable by construction and is omitted rather than written-and-dead.
+
+        if !status.is_success() {
+            // Unchanged from rmcp `:278-299`, and deliberately so: a 400 carrying
+            // `UNSUPPORTED_PROTOCOL_VERSION` is how `Discover` renegotiates
+            // (`…/service/client.rs:980-981`). Only 401 was taken above.
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<failed to read response body>".to_owned());
+            if is_json
+                && let Ok(parsed) = serde_json::from_str::<ServerJsonRpcMessage>(&body)
+                && matches!(parsed, JsonRpcMessage::Error(_))
+            {
+                return Ok(StreamableHttpPostResponse::Json(parsed, session_id));
+            }
+            return Err(StreamableHttpError::UnexpectedServerResponse(Cow::Owned(
+                format!("HTTP {status}: {body}"),
+            )));
+        }
+        if content_type
+            .as_deref()
+            .is_some_and(|ct| ct.starts_with(EVENT_STREAM_MIME_TYPE))
+        {
+            return Ok(StreamableHttpPostResponse::Sse(
+                capped_sse_stream(response, max_sse_event_size),
+                session_id,
+            ));
+        }
+        if is_json {
+            // Same tolerance as rmcp `:308-318`: a body that is not a `ServerJsonRpcMessage` is
+            // treated as an accept rather than a failure.
+            return Ok(match response.json::<ServerJsonRpcMessage>().await {
+                Ok(message) => StreamableHttpPostResponse::Json(message, session_id),
+                Err(_) => StreamableHttpPostResponse::Accepted,
+            });
+        }
+        Err(StreamableHttpError::UnexpectedContentType(content_type))
+    }
+}
+
+impl StreamableHttpClient for UnauthorizedProbe {
+    type Error = reqwest::Error;
+
+    /// Routed through [`Self::post_message_with_max_sse_event_size`] rather than delegated to
+    /// `self.inner`, so a caller that reaches for the non-`_with_max` form cannot bypass the 401
+    /// classification. rmcp's transport never calls this one — see [`DEFAULT_MAX_SSE_EVENT_SIZE`].
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            auth_header,
+            custom_headers,
+            DEFAULT_MAX_SSE_EVENT_SIZE,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        if is_handshake_request(&message) {
+            return self
+                .post_handshake(
+                    &uri,
+                    &message,
+                    session_id,
+                    auth_header,
+                    custom_headers,
+                    max_sse_event_size,
+                )
+                .await;
+        }
+        self.inner
+            .post_message_with_max_sse_event_size(
+                uri,
+                message,
+                session_id,
+                auth_header,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
     }
 
     async fn get_stream(
@@ -1975,10 +2368,18 @@ pub fn bare_handler_factory() -> HandlerFactory {
 ///
 /// rmcp builds `AuthRequiredError` **only** inside
 /// `if response.status() == UNAUTHORIZED && let Some(header) = response.headers().get(WWW_AUTHENTICATE)`
-/// (`rmcp-3.1.4/src/transport/common/reqwest/streamable_http_client.rs:210-222` for POST, `:97-110`
+/// (`rmcp-3.1.4/src/transport/common/reqwest/streamable_http_client.rs:212-226` for POST, `:97-111`
 /// for GET). A 401 with no challenge header therefore never becomes that type, and a downcast-only
 /// predicate answers `None` for it — which sends a permanently-401 server down arm 7 as a hard
 /// connect failure and never offers the user `/mcp-auth`.
+///
+/// **On the handshake POST that gate is no longer the one this crate runs through.**
+/// [`UnauthorizedProbe`] owns that one request and types **every** 401 on it as
+/// [`StreamableHttpError::AuthRequired`], challenge header or not, so the first branch of the walk
+/// below — the `AuthRequiredError` downcast — is what actually claims a bare 401 on `initialize` or
+/// `server/discover` today. The widening is still load-bearing for every leg that stays delegated to
+/// rmcp: the `notifications/initialized` POST, whose bare 401 arrives as
+/// `UnexpectedServerResponse("HTTP 401 …")` and is claimed by [`bare_unauthorized`].
 ///
 /// Upstream has no such gate: `isUnauthorizedHttpError` is
 /// `error instanceof UnauthorizedError || (error instanceof SdkHttpError && error.status === 401)`
@@ -2042,18 +2443,32 @@ const UNEXPECTED_UNAUTHORIZED_PREFIX: &str = "HTTP 401 ";
 ///
 /// rmcp keeps the status on the error in exactly one of its two 401 shapes:
 ///
-/// * [`StreamableHttpError::Client`] wraps the `reqwest::Error` from `error_for_status()`, which
-///   still carries `.status()`. This is the GET/SSE leg. TYPED — no parsing.
+/// * [`StreamableHttpError::Client`] wraps the `reqwest::Error` from `error_for_status()`
+///   (`…/reqwest/streamable_http_client.rs:128`), which still carries `.status()`. This is the
+///   GET/SSE leg. TYPED — no parsing. It is **defence in depth, not a live path**: the GET stream is
+///   opened from a detached `JoinSet` (`…/streamable_http_client.rs:685-712`) long after the
+///   handshake has settled, so its error never becomes a [`ClientInitializeError`] and never reaches
+///   this predicate through [`unauthorized_challenge`]'s single caller.
 /// * [`StreamableHttpError::UnexpectedServerResponse`] carries a `Cow<str>` and **nothing else**.
-///   This is the POST leg, i.e. the one `initialize` uses, so it is the arm that actually matters.
 ///   The status is only in the text, so matching it is a prefix test against rmcp's own format
 ///   string. There is no typed channel to prefer: the variant is `(Cow<'static, str>)`.
 ///
+///   This is **no longer the `initialize` POST**: [`UnauthorizedProbe`] owns the handshake POST and
+///   types its 401s as [`StreamableHttpError::AuthRequired`] before rmcp's body-reading path can
+///   collapse them. What it still covers is real and reachable — the `notifications/initialized`
+///   POST, which is sent inside `serve_client_with_lifecycle_and_ct`, is **not** a handshake request
+///   and so stays delegated to rmcp verbatim. A bare 401 on that POST becomes
+///   `UnexpectedServerResponse("HTTP 401 …")` and surfaces as
+///   `ClientInitializeError::transport::<T>(error, "send initialized notification")`
+///   (`rmcp-3.1.4/src/service/client.rs:912`), which is exactly a shape
+///   [`unauthorized_challenge`] walks.
+///
 /// The fragility is real and bounded — if rmcp changes that format the predicate silently narrows
 /// back to the header-carrying 401, which is the behaviour this function was written to fix. It is
-/// pinned by `a_bare_401_with_no_challenge_still_reaches_the_oauth_ladder`, which drives a real
-/// loopback server through the real transport, so an rmcp upgrade that changes the wording fails a
-/// test rather than a user.
+/// pinned by `the_401_predicate_still_refuses_every_other_status`, which constructs rmcp's rendering
+/// directly and asserts both halves of the prefix test, so an rmcp upgrade that changes the wording
+/// fails a test rather than a user. `a_bare_401_with_no_challenge_still_reaches_the_oauth_ladder`
+/// no longer pins this arm — its 401 is on the handshake POST, which [`UnauthorizedProbe`] types.
 #[must_use]
 pub fn bare_unauthorized(error: &(dyn std::error::Error + 'static)) -> bool {
     let Some(http) = error.downcast_ref::<
@@ -2603,7 +3018,7 @@ impl ConnectionBuilder {
         // validation (`request-headers-command.ts:309`) fail the CONNECT exactly once rather than
         // once per attempt. The decorator is reused across attempts because the thing that must be
         // fresh per attempt is the MCP client, not the HTTP one.
-        let http_client = build_http_client()?;
+        let http_client = UnauthorizedProbe::new(build_http_client()?);
         let signing_client = match entry.request_headers_command.clone() {
             Some(config) => Some(crate::request_headers_command::RequestHeadersCommandClient::new(
                 http_client.clone(),
@@ -2716,9 +3131,9 @@ impl ConnectionBuilder {
         request: &CreateConnection,
         spec: &HttpTransportSpec,
         entry: &ServerEntry,
-        http_client: &reqwest::Client,
+        http_client: &UnauthorizedProbe,
         signing_client: Option<
-            &crate::request_headers_command::RequestHeadersCommandClient<reqwest::Client>,
+            &crate::request_headers_command::RequestHeadersCommandClient<UnauthorizedProbe>,
         >,
         oauth_token: Option<String>,
     ) -> McpResult<HttpAttempt> {
@@ -3895,6 +4310,14 @@ done
         /// Emit `WWW-Authenticate` on those 401s. **`false` is the bare 401** — the shape rmcp
         /// never turns into an `AuthRequiredError`, and the one no test covered before.
         challenge: bool,
+        /// Answer those 401s with `Content-Type: application/json` and a parseable JSON-RPC error
+        /// body instead of `Content-Length: 0`. With `challenge: false` this is the shape rmcp
+        /// collapses into `Ok(StreamableHttpPostResponse::Json(..))`
+        /// (`reqwest/streamable_http_client.rs:287-290`), so no transport error is constructed and
+        /// nothing `unauthorized_challenge` walks can see it. With `challenge: true` rmcp's
+        /// `:212-226` arm claims it first and the ladder is reached today — which is what makes this
+        /// field an ablation rather than a restatement.
+        json_rpc_body: bool,
         /// Emit `mcp-session-id` on the handshake response. `false` is a legal stateless
         /// streamable-HTTP server, and the case `has_session_id` used to answer `true` for.
         session_id: bool,
@@ -3909,6 +4332,7 @@ done
             Self {
                 unauthorized_initializes: 0,
                 challenge: true,
+                json_rpc_body: false,
                 session_id: true,
                 stall_initialize: false,
                 cancel_before: None,
@@ -3946,6 +4370,7 @@ done
             let FixtureOptions {
                 unauthorized_initializes,
                 challenge,
+                json_rpc_body,
                 session_id,
                 stall_initialize,
                 cancel_before,
@@ -4003,7 +4428,23 @@ done
                             // error instead of reaching the OAuth ladder.
                             ""
                         };
-                        format!("HTTP/1.1 401 Unauthorized\r\n{challenge_header}Content-Length: 0\r\nConnection: close\r\n\r\n")
+                        if json_rpc_body {
+                            // The id is ECHOED, so rmcp's `expect_response`
+                            // (`service/client.rs:191-204`) takes the `JsonRpcError` arm at `:194`
+                            // rather than `UncorrelatedErrorResponse` at `:200`. Both fail today,
+                            // but only the echoing shape is what a real server produces, and the
+                            // ablation has to fail for the right reason.
+                            let id = json_id(&recorded.body);
+                            let payload = format!(
+                                "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"error\":{{\"code\":-32001,\"message\":\"Unauthorized\"}}}}"
+                            );
+                            format!(
+                                "HTTP/1.1 401 Unauthorized\r\n{challenge_header}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                                payload.len()
+                            )
+                        } else {
+                            format!("HTTP/1.1 401 Unauthorized\r\n{challenge_header}Content-Length: 0\r\nConnection: close\r\n\r\n")
+                        }
                     } else if is_initialize {
                         let id = json_id(&recorded.body);
                         let payload = format!(
@@ -4238,6 +4679,13 @@ done
     /// Upstream's `isUnauthorizedHttpError` is status-only and reaches `needs-auth` here.
     /// `HttpFixture` always emitted the header before this test existed, which is why nothing caught
     /// it.
+    ///
+    /// WHICH ARM IT NOW PROVES: the assertions are unchanged, but the path underneath them is not.
+    /// This 401 lands on the `initialize` POST, which [`UnauthorizedProbe`] owns, so it is typed as
+    /// [`StreamableHttpError::AuthRequired`] with an empty header and claimed by
+    /// [`unauthorized_challenge`]'s `AuthRequiredError` downcast — **not** by [`bare_unauthorized`]'s
+    /// `HTTP 401 ` prefix test, which no longer sees the handshake POST at all. That prefix arm is
+    /// pinned instead by `the_401_predicate_still_refuses_every_other_status`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bare_401_with_no_challenge_still_reaches_the_oauth_ladder() {
         let fixture = HttpFixture::start_with(FixtureOptions {
@@ -4285,6 +4733,34 @@ done
             std::borrow::Cow::Borrowed("HTTP 401 Unauthorized: "),
         );
         assert!(bare_unauthorized(&unauthorized));
+    }
+
+    /// The OTHER 401 rmcp does not type: 401 + `Content-Type: application/json` + a parseable
+    /// JSON-RPC error body. rmcp applies its JSON-RPC-error shortcut to every non-success status
+    /// (`reqwest/streamable_http_client.rs:278-290`), not just 400 the way the pinned TS SDK does
+    /// (`index.mjs:5374-5381`), so this used to arrive at the ladder as
+    /// `ClientInitializeError::JsonRpcError` — a shape `unauthorized_challenge` answers `None` for
+    /// and `bare_unauthorized` is never even called on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_401_with_a_json_rpc_body_still_reaches_the_oauth_ladder() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            unauthorized_initializes: usize::MAX,
+            challenge: false,
+            json_rpc_body: true,
+            ..FixtureOptions::default()
+        })
+        .await;
+        let auth = CountingAuth::empty();
+        let connection = builder()
+            .with_auth_provider(Arc::clone(&auth) as Arc<dyn HttpAuthProvider>)
+            .connect_http_client(&request("jsonrpc401", http_entry(&fixture.url)))
+            .await
+            .expect("a 401 is `needs-auth` whatever body it carries");
+
+        assert_eq!(connection.status, ConnectionStatus::NeedsAuth);
+        assert_eq!(fixture.initializes(), 2, "implicit-deferred promotes and retries once");
+        assert_eq!(auth.invalidations(), vec!["jsonrpc401".to_string()]);
+        assert_eq!(auth.calls(), vec![Some(String::new())], "no header, so an empty challenge");
     }
 
     /// An OAuth token and a **configured** `Authorization` header must not both go on the wire.

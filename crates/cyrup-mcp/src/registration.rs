@@ -64,8 +64,8 @@ use cyrup_core::{
 };
 use cyrup_ext::native::InitApi;
 use cyrup_ext::{CommandDescriptor, EventKind};
-use indexmap::IndexMap;
-use regex::Regex;
+use indexmap::{IndexMap, IndexSet};
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -73,6 +73,7 @@ use crate::config::{
     BoolOrList, McpConfig, McpSettings, ServerEntry, ToolPrefix, ToolResultRendering,
 };
 use crate::dirs::McpDirs;
+use crate::proxy::constants::{REGEX_DFA_SIZE_LIMIT, REGEX_SIZE_LIMIT};
 
 // ---------------------------------------------------------------------------------------------
 // Constants
@@ -239,9 +240,81 @@ pub fn format_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefix) 
 }
 
 /// `types.ts` `resolveToolPrefix` — `definition.toolPrefix ?? globalPrefix ?? "server"`.
+///
+/// The definition is **optional**, as upstream's `definition?: Pick<ServerEntry, "toolPrefix">`
+/// is: a tool name may be resolved for a server that has no `mcpServers` entry, and that case
+/// falls through to the global mode rather than being unrepresentable.
 #[must_use]
-pub fn resolve_tool_prefix(definition: &ServerEntry, global: ToolPrefix) -> ToolPrefix {
-    definition.tool_prefix.unwrap_or(global)
+pub fn resolve_tool_prefix(definition: Option<&ServerEntry>, global: ToolPrefix) -> ToolPrefix {
+    definition.and_then(|entry| entry.tool_prefix).unwrap_or(global)
+}
+
+/// `types.ts` `resolveServerFromToolName(toolName, serverNames, prefix)` — the inverse of
+/// [`server_prefix`] (MCP-073).
+///
+/// Returns the configured server whose prefix the tool name starts with, longest first, and
+/// **`None` when two different server names produce that same longest prefix**. That fail-safe is
+/// the point of the function: `short` mode deliberately maps `foo` and `foo-mcp` onto the same
+/// prefix, and a downstream permission gate must fall back to its wildcard path rather than
+/// enforce a server-scoped rule against the wrong server.
+///
+/// Borrowed, not owned: the answer is always one of the inputs, so a caller that needs a `String`
+/// writes `.map(str::to_owned)` and one that does not pays nothing.
+///
+/// # The consumer is not wired, deliberately
+///
+/// `cyrup_permission_system::manager::add_derived_mcp_server_targets` derives MCP server targets
+/// today with a **suffix** test (`tool_name.ends_with(&format!("_{server}"))`), which is a
+/// different rule from this prefix one. Reconciling the two is a cross-crate decision (MCP-191)
+/// and is not this unit's; upstream ships `resolveServerFromToolName` with no production caller
+/// either.
+#[must_use]
+pub fn resolve_server_from_tool_name<'a, I>(
+    tool_name: &str,
+    server_names: I,
+    prefix: ToolPrefix,
+) -> Option<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    if matches!(prefix, ToolPrefix::None) {
+        return None;
+    }
+    // One pass instead of upstream's collect-sort-scan. `sort((a, b) => b.len - a.len)` is stable,
+    // so upstream keeps the FIRST name at the winning length; taking a strictly-longer prefix only
+    // reproduces that, and resets the ambiguity flag because the fail-safe is evaluated against
+    // the new best.
+    let mut best: Option<(&'a str, String)> = None;
+    let mut ambiguous = false;
+    for name in server_names {
+        let candidate = server_prefix(name, prefix);
+        // `if (p && toolName.startsWith(p + "_"))`.
+        if candidate.is_empty() {
+            continue;
+        }
+        let mut boundary = String::with_capacity(candidate.len() + 1);
+        boundary.push_str(&candidate);
+        boundary.push('_');
+        if !tool_name.starts_with(&boundary) {
+            continue;
+        }
+        match &best {
+            Some((best_name, best_prefix)) if best_prefix.len() >= candidate.len() => {
+                // `candidates.some(c => c.prefix === best.prefix && c.name !== best.name)`.
+                if *best_prefix == candidate && *best_name != name {
+                    ambiguous = true;
+                }
+            }
+            _ => {
+                best = Some((name, candidate));
+                ambiguous = false;
+            }
+        }
+    }
+    if ambiguous {
+        return None;
+    }
+    best.map(|(name, _)| name)
 }
 
 /// `types.ts` `getLegacyServerPrefix` — the same four modes over the pre-`-`/`_` grammar.
@@ -270,34 +343,47 @@ fn format_legacy_tool_name(tool_name: &str, server_name: &str, prefix: ToolPrefi
 ///
 /// Five expressions when `include_legacy` is false; **thirteen more** when it is true (5 + 4 + 4).
 /// The resulting set is far smaller than 18 because of heavy overlap — for
-/// `("list-sims", "xcodebuild-mcp", Short)` the current set has 4 members and the full set 12. Set
-/// iteration order does not affect any caller: every consumer asks a membership or an "any matches"
-/// question.
+/// `("list-sims", "xcodebuild-mcp", Short)` the current set has 4 members and the full set 12.
+///
+/// An [`IndexSet`], not a `HashSet`, because upstream returns a JS `Set` and one caller reads its
+/// order: [`crate::proxy::is_tool_call_approval_required`]'s legacy arm takes the *first* current
+/// candidate that is not the tool's own original name, which is upstream's
+/// `[...currentCandidates].find(c => c !== toolMeta.originalName)`. The three legacy families are
+/// therefore emitted as three complete groups, exactly as `types.ts` emits them, rather than
+/// interleaved.
 #[must_use]
 pub fn tool_name_candidates(
     tool_name: &str,
     server_name: &str,
     prefix: ToolPrefix,
     include_legacy: bool,
-) -> HashSet<String> {
+) -> IndexSet<String> {
     const MODES: [ToolPrefix; 3] = [ToolPrefix::Server, ToolPrefix::Short, ToolPrefix::Mcp];
-    let mut out = HashSet::new();
+    let mut out = IndexSet::new();
     out.insert(tool_name.to_string());
     out.insert(format_tool_name(tool_name, server_name, prefix));
     for mode in MODES {
         out.insert(format_tool_name(tool_name, server_name, mode));
     }
-    if include_legacy {
-        let legacy_tool_name = tool_name.replace('-', "_");
-        out.insert(legacy_tool_name.clone());
-        out.insert(format_tool_name(&legacy_tool_name, server_name, prefix));
-        out.insert(format_legacy_tool_name(tool_name, server_name, prefix));
-        out.insert(format_tool_name(tool_name, server_name, prefix).replace('-', "_"));
-        for mode in MODES {
-            out.insert(format_tool_name(&legacy_tool_name, server_name, mode));
-            out.insert(format_legacy_tool_name(tool_name, server_name, mode));
-            out.insert(format_tool_name(tool_name, server_name, mode).replace('-', "_"));
-        }
+    if !include_legacy {
+        return out;
+    }
+    // `types.ts` group 1: the `-`→`_` tool name under every prefix.
+    let legacy_tool_name = tool_name.replace('-', "_");
+    out.insert(legacy_tool_name.clone());
+    out.insert(format_tool_name(&legacy_tool_name, server_name, prefix));
+    for mode in MODES {
+        out.insert(format_tool_name(&legacy_tool_name, server_name, mode));
+    }
+    // `types.ts` group 2: the pre-2.x server-prefix grammar.
+    out.insert(format_legacy_tool_name(tool_name, server_name, prefix));
+    for mode in MODES {
+        out.insert(format_legacy_tool_name(tool_name, server_name, mode));
+    }
+    // `types.ts` group 3: the current spellings, post-normalised.
+    out.insert(format_tool_name(tool_name, server_name, prefix).replace('-', "_"));
+    for mode in MODES {
+        out.insert(format_tool_name(tool_name, server_name, mode).replace('-', "_"));
     }
     out
 }
@@ -307,6 +393,12 @@ pub fn tool_name_candidates(
 /// JS escapes first and then substitutes; `*` and `?` are not in the escape set, so the single pass
 /// below is equivalent. A pattern Rust's parser rejects yields `None` and is treated as "matches
 /// nothing" rather than propagating — this runs inside an infallible `init`.
+///
+/// **Ceilinged (MCP-076).** These patterns are config-supplied — `includeTools`, `excludeTools`,
+/// `approveTools`, `searchKeywords` — so the compiled program gets the same explicit
+/// [`REGEX_SIZE_LIMIT`] / [`REGEX_DFA_SIZE_LIMIT`] the model-supplied search query gets
+/// (MCP-159). A pattern that exceeds either ceiling fails to build and therefore matches nothing,
+/// which is the same outcome as a pattern the parser rejects.
 fn glob_to_regex(pattern: &str) -> Option<Regex> {
     let mut out = String::with_capacity(pattern.len() + 2);
     out.push('^');
@@ -322,7 +414,11 @@ fn glob_to_regex(pattern: &str) -> Option<Regex> {
         }
     }
     out.push('$');
-    Regex::new(&out).ok()
+    RegexBuilder::new(&out)
+        .size_limit(REGEX_SIZE_LIMIT)
+        .dfa_size_limit(REGEX_DFA_SIZE_LIMIT)
+        .build()
+        .ok()
 }
 
 fn is_glob(pattern: &str) -> bool {
@@ -333,7 +429,7 @@ fn is_glob(pattern: &str) -> bool {
 /// test over every candidate for a glob. Upstream recompiles the regex inside the loop; so does
 /// this, deliberately — the memoised path lives in [`CandidateIndex`], where upstream put it.
 #[must_use]
-pub fn matches_tool_pattern(candidates: &HashSet<String>, patterns: &[String]) -> bool {
+pub fn matches_tool_pattern(candidates: &IndexSet<String>, patterns: &[String]) -> bool {
     if patterns.is_empty() {
         return false;
     }
@@ -367,7 +463,7 @@ pub fn matches_tool_pattern(candidates: &HashSet<String>, patterns: &[String]) -
 /// `tool-metadata.ts`'s speculative arms (MCP-207), and `direct-tools.ts` never supplies it.
 #[derive(Debug, Default)]
 pub struct CandidateIndex {
-    all_current: HashSet<String>,
+    all_current: IndexSet<String>,
     matcher: HashMap<String, Option<Regex>>,
     matching_count: HashMap<String, usize>,
 }
@@ -375,15 +471,23 @@ pub struct CandidateIndex {
 impl CandidateIndex {
     /// `types.ts` `createToolSelectorCandidateIndex`.
     #[must_use]
-    pub fn new(all_current: HashSet<String>) -> Self {
+    pub fn new(all_current: IndexSet<String>) -> Self {
         Self { all_current, matcher: HashMap::new(), matching_count: HashMap::new() }
+    }
+
+    /// `types.ts` `ToolSelectorCandidateIndex.allCurrentCandidates` — the readonly view of the set
+    /// the index was built over. The two memo tables stay private; this one is upstream's public
+    /// field and is what lets a caller assert *what* was indexed without being able to mutate it.
+    #[must_use]
+    pub fn all_current(&self) -> &IndexSet<String> {
+        &self.all_current
     }
 
     /// `types.ts` `indexHasOtherCurrentMatch` — does `pattern` name a *different* tool's current
     /// name?
     fn has_other_current_match(
         &mut self,
-        current_candidates: &HashSet<String>,
+        current_candidates: &IndexSet<String>,
         pattern: &str,
     ) -> bool {
         if !is_glob(pattern) {
@@ -444,7 +548,7 @@ fn matches_tool_selector(
     };
     let mut legacy = tool_name_candidates(tool_name, server_name, prefix, true);
     for candidate in &current {
-        legacy.remove(candidate);
+        legacy.shift_remove(candidate);
     }
     patterns.iter().any(|pattern| {
         matches_tool_pattern(&legacy, std::slice::from_ref(pattern))
@@ -1073,12 +1177,12 @@ fn build_candidate_index(
     cache: Option<&MetadataCache>,
     global_prefix: ToolPrefix,
 ) -> CandidateIndex {
-    let mut candidates = HashSet::new();
+    let mut candidates = IndexSet::new();
     for (other_name, other_definition) in config.enabled_servers() {
         let Some(entry) = valid_entry(cache, other_name, other_definition) else {
             continue;
         };
-        let other_prefix = resolve_tool_prefix(other_definition, global_prefix);
+        let other_prefix = resolve_tool_prefix(Some(other_definition), global_prefix);
         for tool in entry.tools() {
             if !is_ui_tool_visible_to_model(tool.ui_visibility.as_ref()) {
                 continue;
@@ -1136,7 +1240,7 @@ pub fn resolve_direct_tools(
             continue;
         }
 
-        let effective_prefix = resolve_tool_prefix(definition, global_prefix);
+        let effective_prefix = resolve_tool_prefix(Some(definition), global_prefix);
         let mut index = has_tool_filters(definition)
             .then(|| build_candidate_index(config, Some(cache), global_prefix));
         let include = definition.include_tools.as_deref();
@@ -1309,7 +1413,7 @@ pub fn build_proxy_description(
             continue;
         }
         let entry = valid_entry(cache, server_name, definition);
-        let effective_prefix = resolve_tool_prefix(definition, global_prefix);
+        let effective_prefix = resolve_tool_prefix(Some(definition), global_prefix);
         let mut index = (has_tool_filters(definition) && cache.is_some())
             .then(|| build_candidate_index(config, cache, global_prefix));
         let include = definition.include_tools.as_deref();
@@ -1820,7 +1924,7 @@ pub fn resolve_cached_prompts(
         if !is_server_cache_valid(entry, definition, METADATA_CACHE_MAX_AGE_MS) {
             continue;
         }
-        let effective_prefix = resolve_tool_prefix(definition, global_prefix);
+        let effective_prefix = resolve_tool_prefix(Some(definition), global_prefix);
         for prompt in entry.prompts() {
             if prompt.name.is_empty() {
                 continue;
@@ -2360,7 +2464,7 @@ mod tests {
         let exclude = ["my_server_do_thing".to_string()];
 
         // Legacy-only alias, nobody else answers to it → the exclusion lands.
-        let mut lonely = CandidateIndex::new(HashSet::new());
+        let mut lonely = CandidateIndex::new(IndexSet::new());
         assert!(!is_tool_allowed(
             "do-thing",
             "my-server",
@@ -2370,7 +2474,7 @@ mod tests {
             Some(&mut lonely),
         ));
         // Same alias, but it is another tool's *current* name → the exclusion is suppressed.
-        let mut collision = CandidateIndex::new(HashSet::from(["my_server_do_thing".to_string()]));
+        let mut collision = CandidateIndex::new(IndexSet::from(["my_server_do_thing".to_string()]));
         assert!(is_tool_allowed(
             "do-thing",
             "my-server",
@@ -2382,7 +2486,7 @@ mod tests {
 
         // An absent or empty selector must never touch the memo tables: `is_tool_allowed`
         // short-circuits before `matches_tool_selector` builds a candidate set at all.
-        let mut untouched = CandidateIndex::new(HashSet::from(["my_server_do_other".to_string()]));
+        let mut untouched = CandidateIndex::new(IndexSet::from(["my_server_do_other".to_string()]));
         for patterns in [no_patterns, Some(empty_patterns)] {
             assert!(is_tool_allowed(
                 "do-thing",
@@ -2399,7 +2503,7 @@ mod tests {
         // Glob: one *other* candidate matches and none of mine do → collision. Both the compiled
         // matcher and the whole-index match count are memoised once and reused by the second call.
         let glob = ["my_server_do_*".to_string()];
-        let mut globbed = CandidateIndex::new(HashSet::from([
+        let mut globbed = CandidateIndex::new(IndexSet::from([
             "my_server_do_other".to_string(),
             "unrelated".to_string(),
         ]));
