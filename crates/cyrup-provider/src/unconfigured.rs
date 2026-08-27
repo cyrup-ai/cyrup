@@ -1,6 +1,11 @@
 //! The **unconfigured** provider — the zero-model stand-in for "nothing is authenticated yet".
 //!
-//! **Always compiled** — unlike [`crate::faux`], this is production code.
+//! **Always compiled** — unlike `crate::faux`, this is production code.
+//!
+//! `crate::faux` is deliberately NOT linked here: it is gated behind
+//! `#[cfg(any(test, feature = "faux"))]` (`lib.rs:43`), so in a default doc build the item does
+//! not exist and an intra-doc link to it fails outright under the workspace's
+//! `rustdoc::broken_intra_doc_links = "deny"`. Re-adding the brackets breaks `cargo doc`.
 //!
 //! ## What pi does
 //!

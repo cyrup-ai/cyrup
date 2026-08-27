@@ -18,3 +18,4 @@ tmp/
 # tracks relocating this under the global `~/.cyrup`/OS-temp root instead of the project cwd; ignored
 # here in the meantime so it does not show up as untracked noise or get committed by accident).
 .cyrup-subagent-scratch/
+.claude/worktrees/

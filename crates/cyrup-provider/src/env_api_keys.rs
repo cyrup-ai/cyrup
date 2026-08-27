@@ -121,7 +121,7 @@ pub async fn get_env_api_key(
     env: Option<&ProviderEnv>,
 ) -> Option<String> {
     if let Some(keys) = find_env_keys(provider, ctx, env).await
-        && keys.first().is_some()
+        && !keys.is_empty()
     {
         // `const apiKeyEnv = provider === "anthropic" ? envKeys.find(key => key !==
         // ANTHROPIC_AUTH_TOKEN_ENV) : envKeys[0]` (env-api-keys.ts:147 @v0.83.0) — PROV-021.

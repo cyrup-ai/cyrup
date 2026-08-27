@@ -38,6 +38,13 @@ const EVENT_STREAM_MEDIA_TYPE: &str = "application/vnd.amazon.eventstream";
 const BEDROCK_STANDARD_MODE_RETRIES: u32 = 2;
 
 /// pi's `stream()` try block (`bedrock-converse-stream.ts:222-303`).
+//
+// ACCEPTED WARNING: `clippy::result_large_err` fires here — the `Err` variant, [`BedrockFailure`],
+// is at least 416 bytes because it carries the decoder snapshot the caller needs to emit a
+// partial-turn error. The only "fix" is to box it, which changes what the internal driver hands
+// back and would touch a freshly-verified module for no behavioural gain, so the warning is left
+// standing deliberately rather than silenced with an `#[allow]` that would hide a future
+// regression. This is the single remaining clippy warning in `cyrup-provider`.
 pub(super) async fn run_inner(
     model: &Model,
     ctx: &Context,
