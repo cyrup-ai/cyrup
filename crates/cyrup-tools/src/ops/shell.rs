@@ -530,6 +530,92 @@ mod tests {
         );
     }
 
+    /// Pi `getPowerShellConfig`'s `win32` guard (shell.ts:126-128) — the sentence a NON-Windows
+    /// host gets back from every `powershell` call, verbatim and with nothing around it.
+    #[cfg(not(windows))]
+    #[test]
+    fn powershell_off_windows_is_pis_exact_refusal() {
+        let err = ShellConfig::resolve_powershell()
+            .expect_err("off Windows `getPowerShellConfig` throws (shell.ts:127)");
+        assert_eq!(
+            err.to_string(),
+            "The powershell tool is only available on Windows."
+        );
+    }
+
+    /// The Windows arm's body (shell.ts:130-135), driven on every host through the hoisted probe —
+    /// the same treatment (and the same reason) as `windows_arm_prefers_git_bash_then_path_then_throws`
+    /// above. Covers all three rows: `pwsh.exe` wins when both exist, `powershell.exe` is the
+    /// fallback, and neither is Pi's second verbatim throw.
+    #[test]
+    fn powershell_arm_prefers_pwsh_then_powershell_then_throws() {
+        let pwsh = PathBuf::from(r"C:\Program Files\PowerShell\7\pwsh.exe");
+        let legacy =
+            PathBuf::from(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe");
+
+        // Row 1: both on PATH ⇒ PowerShell 7 (shell.ts:124,130 `??`).
+        let both = |exe: &str| match exe {
+            "pwsh.exe" => Some(pwsh.clone()),
+            "powershell.exe" => Some(legacy.clone()),
+            other => panic!("unexpected probe for {other}"),
+        };
+        let cfg = ShellConfig::powershell_detect_from(both).unwrap();
+        assert_eq!(cfg.program, pwsh);
+        assert_eq!(cfg.shell_name, "PowerShell");
+        // shell.ts:122 `POWERSHELL_ARGS`, in order, with the command delivered as the trailing
+        // argv entry after `-Command` (no `commandTransport`, shell.ts:135).
+        assert_eq!(
+            cfg.args,
+            vec![
+                "-NoProfile".to_string(),
+                "-NonInteractive".to_string(),
+                "-ExecutionPolicy".to_string(),
+                "Bypass".to_string(),
+                "-Command".to_string(),
+            ]
+        );
+        assert_eq!(cfg.transport, Transport::Argv);
+
+        // Row 2: only Windows PowerShell 5.1 ⇒ that one runs.
+        let legacy_only = |exe: &str| match exe {
+            "pwsh.exe" => None,
+            "powershell.exe" => Some(legacy.clone()),
+            other => panic!("unexpected probe for {other}"),
+        };
+        let cfg = ShellConfig::powershell_detect_from(legacy_only).unwrap();
+        assert_eq!(cfg.program, legacy);
+        assert_eq!(cfg.transport, Transport::Argv);
+
+        // Row 3: shell.ts:132 verbatim.
+        let err = ShellConfig::powershell_detect_from(|_| None)
+            .expect_err("no PowerShell anywhere ⇒ Pi throws");
+        assert_eq!(
+            err.to_string(),
+            "No PowerShell executable found. Install PowerShell or add powershell.exe/pwsh.exe to \
+             PATH."
+        );
+    }
+
+    /// The `shell_name` that rides on the resolved config is the TOOL's name for its shell, so the
+    /// backend's missing-cwd message (`ops/local/proc.rs`) can say `Cannot execute PowerShell
+    /// commands.` — including on the unix `sh -c` degradation, which Pi still calls `bash`
+    /// (bash.ts:159 vs shell.ts:119).
+    #[test]
+    fn shell_name_is_the_tools_name_not_the_programs() {
+        assert_eq!(ShellConfig::argv("/bin/bash").shell_name, "bash");
+        assert_eq!(
+            ShellConfig::argv(r"C:\Windows\System32\bash.exe").shell_name,
+            "bash"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            ShellConfig::try_detect()
+                .expect("unix detection cannot fail")
+                .shell_name,
+            "bash"
+        );
+    }
+
     #[test]
     fn shell_env_none_inherits() {
         assert!(shell_env(None).is_empty());

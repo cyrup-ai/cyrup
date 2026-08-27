@@ -31,7 +31,7 @@
 )]
 
 use crate::FileMutationLocks;
-use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts, WriteOpts};
+use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, PowerShellOpts, ReadOpts, WriteOpts};
 use crate::ops::local::LocalFs;
 use crate::ops::{Backend, FsOps, ProcOps};
 use crate::tools::{EditTool, FindTool, GrepTool, LsTool, ReadTool, ShellTool, WriteTool};
@@ -56,6 +56,10 @@ fn locks() -> Arc<FileMutationLocks> {
 
 const PI_READ: &str = r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}}}"#;
 const PI_BASH: &str = r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Bash command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}}}"#;
+// v0.84.3 `bashSchema` (bash.ts:42-45) as `powershell` sees it: ONE shared schema whose `command`
+// description reads "Shell command to execute". `bash` still emits the v0.83.0 "Bash command to
+// execute" — see the `command_description` CYRUP-DELTA on `ShellToolConfig`.
+const PI_POWERSHELL: &str = r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}}}"#;
 const PI_GREP: &str = r#"{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Search pattern (regex or literal string)"},"path":{"type":"string","description":"Directory or file to search (default: current directory)"},"glob":{"type":"string","description":"Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"},"ignoreCase":{"type":"boolean","description":"Case-insensitive search (default: false)"},"literal":{"type":"boolean","description":"Treat pattern as literal string instead of regex (default: false)"},"context":{"type":"number","description":"Number of lines to show before and after each match (default: 0)"},"limit":{"type":"number","description":"Maximum number of matches to return (default: 100)"}}}"#;
 const PI_FIND: &str = r#"{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"},"path":{"type":"string","description":"Directory to search in (default: current directory)"},"limit":{"type":"number","description":"Maximum number of results (default: 1000)"}}}"#;
 const PI_LS: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"number","description":"Maximum number of entries to return (default: 500)"}}}"#;
@@ -71,12 +75,15 @@ fn assert_schema(tool_name: &str, got: &serde_json::Value, pi_json: &str) {
 }
 
 #[test]
-fn all_seven_tool_schemas_match_pi_typebox_bytes() {
+fn all_eight_tool_schemas_match_pi_typebox_bytes() {
     let read = ReadTool::new(fs(), cwd(), ReadOpts::default());
     assert_schema("read", read.parameters(), PI_READ);
 
     let bash = ShellTool::bash(proc(), cwd(), BashOpts::default());
     assert_schema("bash", bash.parameters(), PI_BASH);
+
+    let powershell = ShellTool::powershell(proc(), cwd(), PowerShellOpts::default());
+    assert_schema("powershell", powershell.parameters(), PI_POWERSHELL);
 
     let grep = GrepTool::new(fs(), cwd(), GrepOpts::default());
     assert_schema("grep", grep.parameters(), PI_GREP);
@@ -134,6 +141,14 @@ const PI_BASH_GUIDELINES: &[&str] =
 const PI_BASH_DESCRIPTION: &str = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.";
 const PI_BASH_SNIPPET: &str = "Execute bash commands (ls, grep, find, etc.)";
 
+// powershell.ts:18-21,50-56 — `shellName: "PowerShell"` interpolated into the SHARED description
+// (bash.ts:350). The guideline is byte-identical to bash's (`PI_*` -> `CYRUP_*` for the same
+// reason), so a session with both shells selected must still emit it exactly once.
+const PI_POWERSHELL_DESCRIPTION: &str = "Execute a PowerShell command in the current working directory. Returns stdout and stderr. Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, full output is saved to a temp file. Optionally provide a timeout in seconds.";
+const PI_POWERSHELL_SNIPPET: &str = "Execute PowerShell commands";
+const PI_POWERSHELL_GUIDELINES: &[&str] =
+    &["You can inspect CYRUP_* environment variables for current model and session details."];
+
 // grep.ts:131-132 — Pi declares no `promptGuidelines`.
 const PI_GREP_DESCRIPTION: &str = "Search file contents for a pattern. Returns matching lines with file paths and line numbers. Respects .gitignore. Output is truncated to 100 matches or 50KB (whichever is hit first). Long lines are truncated to 500 chars.";
 const PI_GREP_SNIPPET: &str = "Search file contents for patterns (respects .gitignore)";
@@ -190,7 +205,7 @@ fn assert_meta(
 /// `promptGuidelines` on the `cyrup_core::Tool` vtable. Fails for all seven before the fix
 /// (`description()` returned the trait default `""`, `prompt_snippet()` `None`).
 #[test]
-fn all_seven_tool_metadata_match_pi_verbatim() {
+fn all_eight_tool_metadata_match_pi_verbatim() {
     assert_meta(
         Arc::new(ReadTool::new(fs(), cwd(), ReadOpts::default())),
         "read",
@@ -218,6 +233,17 @@ fn all_seven_tool_metadata_match_pi_verbatim() {
         PI_BASH_DESCRIPTION,
         PI_BASH_SNIPPET,
         PI_BASH_GUIDELINES,
+    );
+    assert_meta(
+        Arc::new(ShellTool::powershell(
+            proc(),
+            cwd(),
+            PowerShellOpts::default(),
+        )),
+        "powershell",
+        PI_POWERSHELL_DESCRIPTION,
+        PI_POWERSHELL_SNIPPET,
+        PI_POWERSHELL_GUIDELINES,
     );
     assert_meta(
         Arc::new(GrepTool::new(fs(), cwd(), GrepOpts::default())),

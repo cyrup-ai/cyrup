@@ -31,6 +31,39 @@ struct GrepInput {
     limit: Option<f64>,
 }
 
+/// Render a `grep-regex` build failure as the bytes Pi's caller actually receives.
+///
+/// Pi never builds a matcher itself. It spawns `rg`, buffers the child's stderr whole
+/// (grep.ts:228, :251-253) and, for any exit code other than 0 or 1, rejects with `stderr.trim()`
+/// (grep.ts:309-312) — a rejection nothing catches, so rg's stderr text IS the model-observed tool
+/// error. That text has three layers, and dropping any one of them diverges:
+///
+/// 1. The inner message is `grep_regex::Error`'s own `Display`. cyrup links the same crate, so it
+///    is already byte-identical: `the literal "\n" is not allowed in a regex` for
+///    `ErrorKind::NotAllowed` (grep-regex-0.1.14 `src/error.rs:75-77`), and the same
+///    `regex parse error: …` block — `(?:…)` wrapper included, since grep-regex wraps every
+///    pattern that way (`src/config.rs:183-188`) — for a syntax error.
+/// 2. ripgrep appends a two-line multiline hint, gated on the message text itself and on nothing
+///    else (`suggest_multiline`, ripgrep 14.1.0 `crates/core/flags/hiargs.rs:1437-1448`). The
+///    condition below is that predicate verbatim.
+/// 3. ripgrep prefixes every top-level error with `rg: ` (`crates/core/messages.rs:50`, reached
+///    from `eprintln_locked!("{:#}", err)` at `crates/core/main.rs:62`).
+///
+/// ripgrep's sibling `suggest_text` hint (`hiargs.rs:1451-1462`) is deliberately NOT reproduced:
+/// it fires only on `ban_byte(Some(b'\x00'))`, which this matcher does not set.
+fn rg_pattern_error(err: &grep_regex::Error) -> String {
+    let msg = err.to_string();
+    if msg.contains("the literal") && msg.contains("not allowed") {
+        format!(
+            "rg: {msg}\n\n\
+             Consider enabling multiline mode with the --multiline flag (or -U for short).\n\
+             When multiline mode is enabled, new line characters can be matched."
+        )
+    } else {
+        format!("rg: {msg}")
+    }
+}
+
 pub struct GrepTool {
     fs: Arc<dyn FsOps>,
     cwd: PathBuf,
@@ -385,11 +418,35 @@ impl Tool for GrepTool {
                 error::not_found(format!("Path not found: {}", error::show(&search_root)))
             })?;
 
+        // `line_terminator(Some(b'\n'))` is ripgrep's non-multiline default, and Pi never passes
+        // `-U/--multiline` (grep.ts:220-224 carries no such flag), so rg always takes the
+        // else-branch of `matcher_rust`:
+        //     builder.line_terminator(Some(b'\n')).dot_matches_new_line(false);
+        // (ripgrep 14.1.0 `crates/core/flags/hiargs.rs:482-484`).
+        //
+        // Setting it makes grep-regex GUARANTEE the matcher can never produce a match containing
+        // the terminator. `\n` is transparently subtracted from classes like `\s`, so `a\sb` keeps
+        // building; a BARE `\n` literal cannot be removed without changing the pattern's intent, so
+        // `build` fails with `ErrorKind::NotAllowed("\n")` (grep-regex-0.1.14 `src/config.rs:222-225`
+        // → `src/strip.rs:60`). Leaving it at the builder default of `None` (`src/config.rs:61`)
+        // skips that guard entirely — the pattern compiled fine and then matched nothing, because
+        // the searcher below is line-oriented and no match can span a line break.
+        //
+        // `fixed_strings` stays wired to `input.literal` and needs no special casing: grep-regex
+        // drops out of its literal-alternation fast path when a pattern contains the terminator
+        // (`src/config.rs:113-124`), so a REAL newline still errors under `literal: true` while the
+        // two-character `\n` escape stays an ordinary literal — exactly what rg does.
+        //
+        // Consistency with the searcher is required, not optional: `Searcher::check_config` errors
+        // with `MismatchedLineTerminators` unless the two agree (grep-searcher-0.1.16
+        // `src/searcher/mod.rs:805-821`). The searcher's default is `\n`
+        // (`mod.rs:190` → grep-matcher-0.1.8 `src/lib.rs:268-273`) and is not overridden below.
         let matcher = RegexMatcherBuilder::new()
             .case_insensitive(input.ignore_case.unwrap_or(false))
             .fixed_strings(input.literal.unwrap_or(false))
+            .line_terminator(Some(b'\n'))
             .build(&input.pattern)
-            .map_err(|e| error::invalid(format!("grep: invalid pattern: {e}")))?;
+            .map_err(|e| error::invalid(rg_pattern_error(&e)))?;
 
         // Pi: `const contextValue = context && context > 0 ? context : 0` (grep.ts:188) — a
         // negative, zero or NaN `context` all collapse to 0 instead of failing. `to_count` folds
@@ -627,7 +684,7 @@ mod tests {
     use cyrup_core::{CancelToken, Content, EventStream, Tool, ToolCallId, ToolError, ToolUpdate};
     use std::path::Path;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// `LocalFs` that serves the first `read()` of any path normally and fails every later one.
     ///
@@ -867,5 +924,190 @@ mod tests {
         )
         .await;
         assert_eq!(text, "src/deep/a.ts:1: NEEDLE");
+    }
+
+    /// The four-line block `rg` writes to stderr for a pattern that can match a line terminator,
+    /// captured from ripgrep 14.1.0 driven with Pi's own argv
+    /// (`rg --json --line-number --color=never --hidden -- $'a\nimport' file.txt`, exit 2). Pi
+    /// rejects with `stderr.trim()` (grep.ts:309-312) and nothing catches it, so this string IS the
+    /// model-observed tool error.
+    const RG_NEWLINE_ERROR: &str = concat!(
+        "rg: the literal \"\\n\" is not allowed in a regex\n",
+        "\n",
+        "Consider enabling multiline mode with the --multiline flag (or -U for short).\n",
+        "When multiline mode is enabled, new line characters can be matched.",
+    );
+
+    async fn grep_err(cwd: &Path, args: serde_json::Value) -> String {
+        let grep = GrepTool::new(Arc::new(LocalFs), cwd.to_path_buf(), GrepOpts::default());
+        let r = grep
+            .execute(
+                ToolCallId::from("tc-test"),
+                args,
+                CancelToken::new(),
+                Box::new(|_u: ToolUpdate| {}),
+            )
+            .await;
+        r.expect_err("pattern should have been refused at matcher build")
+            .message
+    }
+
+    fn newline_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        // The audit's fixture: `a` alone on line 1, `import c` on line 2, so a pattern spanning the
+        // break would "obviously" match if line-oriented search allowed it.
+        std::fs::write(dir.path().join("file.txt"), "a\nimport c\n").unwrap();
+        dir
+    }
+
+    /// A REAL `\n` byte in the pattern. Without `line_terminator(Some(b'\n'))` grep-regex's
+    /// `strip_from_match` guard is off entirely (`config.rs:222-225`), the matcher builds, and the
+    /// line-oriented searcher then reports "No matches found" — a confident false negative where rg
+    /// exits 2 with an actionable error.
+    #[tokio::test]
+    async fn real_newline_in_pattern_is_refused_with_ripgreps_message() {
+        let dir = newline_fixture();
+        let msg = grep_err(dir.path(), serde_json::json!({ "pattern": "a\nimport" })).await;
+        assert_eq!(msg, RG_NEWLINE_ERROR);
+    }
+
+    /// The two-character regex escape parses to the same `\n` literal in the HIR, so it is refused
+    /// identically — rg 14.1.0 exits 2 for `-- 'a\nimport'` too.
+    #[tokio::test]
+    async fn newline_escape_in_pattern_is_refused_with_ripgreps_message() {
+        let dir = newline_fixture();
+        let msg = grep_err(dir.path(), serde_json::json!({ "pattern": "a\\nimport" })).await;
+        assert_eq!(msg, RG_NEWLINE_ERROR);
+    }
+
+    /// `--fixed-strings` does not exempt a real newline: `Config::is_fixed_strings`
+    /// (grep-regex `config.rs:113-124`) bails out of the literal-alternation fast path when the
+    /// pattern contains the terminator, routing it through the parse path where the guard runs.
+    #[tokio::test]
+    async fn real_newline_is_refused_under_fixed_strings_too() {
+        let dir = newline_fixture();
+        let msg = grep_err(
+            dir.path(),
+            serde_json::json!({ "pattern": "a\nimport", "literal": true }),
+        )
+        .await;
+        assert_eq!(msg, RG_NEWLINE_ERROR);
+    }
+
+    /// The other half of that asymmetry, and the reason `fixed_strings` needs no special casing:
+    /// under `--fixed-strings` the two-character escape is an ordinary backslash-`n` literal, holds
+    /// no `\n` byte, and rg exits 1 with no match rather than erroring.
+    #[tokio::test]
+    async fn newline_escape_under_fixed_strings_is_an_ordinary_literal() {
+        let dir = newline_fixture();
+        let text = grep_text(
+            dir.path(),
+            serde_json::json!({ "pattern": "a\\nimport", "literal": true }),
+        )
+        .await;
+        assert_eq!(text, "No matches found");
+    }
+
+    /// Only `\n` is banned — the terminator is a single byte and `crlf` is not enabled — so a
+    /// pattern carrying `\r` still builds. rg 14.1.0 exits 1 here.
+    #[tokio::test]
+    async fn carriage_return_in_pattern_is_not_banned() {
+        let dir = newline_fixture();
+        let text = grep_text(dir.path(), serde_json::json!({ "pattern": "a\\rb" })).await;
+        assert_eq!(text, "No matches found");
+    }
+
+    /// `\n` inside a CLASS is subtracted transparently rather than refused (`strip.rs`), so `a\sb`
+    /// keeps building and keeps matching within a line — it simply cannot span a line break.
+    #[tokio::test]
+    async fn newline_inside_a_class_is_stripped_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        std::fs::write(cwd.join("same.txt"), "a b\n").unwrap();
+        std::fs::write(cwd.join("split.txt"), "a\nb\n").unwrap();
+
+        let text = grep_text(&cwd, serde_json::json!({ "pattern": "a\\sb" })).await;
+        assert_eq!(text, "same.txt:1: a b");
+    }
+
+    /// A syntax error keeps ripgrep's own `regex parse error:` caret block — grep-regex wraps every
+    /// pattern in `(?:…)` (`config.rs:183-188`), which is why rg prints `(?:a()` — and gains only
+    /// the `rg: ` prefix. The old `grep: invalid pattern:` wrapper has no counterpart in Pi and
+    /// must appear nowhere.
+    #[tokio::test]
+    async fn syntax_error_keeps_ripgreps_caret_block_under_the_rg_prefix() {
+        let dir = newline_fixture();
+        let msg = grep_err(dir.path(), serde_json::json!({ "pattern": "a(" })).await;
+        // Captured from rg 14.1.0: `rg: regex parse error:\n    (?:a()\n    ^\nerror: unclosed group`.
+        assert_eq!(
+            msg,
+            "rg: regex parse error:\n    (?:a()\n    ^\nerror: unclosed group"
+        );
+        assert!(!msg.contains("grep: invalid pattern:"), "got: {msg}");
+        // And the multiline hint is gated on the message text, so it stays off here.
+        assert!(!msg.contains("--multiline"), "got: {msg}");
+    }
+
+    /// `FsOps` that records any traversal or read, proving the refusal is returned from the matcher
+    /// build — before the first `walk`/`read_stream` — so no file in the tree is ever opened.
+    struct RecordingFs {
+        inner: LocalFs,
+        touched: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl FsOps for RecordingFs {
+        // `read_stream`'s default impl funnels through `read` (ops/mod.rs:412-414), so this one
+        // override covers the search path too.
+        async fn read(&self, path: &Path) -> Result<Vec<u8>, ToolError> {
+            self.touched.store(true, Ordering::SeqCst);
+            self.inner.read(path).await
+        }
+        async fn write_in_place(&self, path: &Path, bytes: &[u8]) -> Result<(), ToolError> {
+            self.inner.write_in_place(path, bytes).await
+        }
+        async fn access(&self, path: &Path, mode: Access) -> Result<(), ToolError> {
+            self.inner.access(path, mode).await
+        }
+        async fn metadata(&self, path: &Path) -> Result<Meta, ToolError> {
+            self.inner.metadata(path).await
+        }
+        async fn read_dir(&self, path: &Path) -> Result<Vec<DirEntry>, ToolError> {
+            self.inner.read_dir(path).await
+        }
+        fn walk(&self, root: &Path, opts: WalkOpts) -> EventStream<Result<WalkItem, ToolError>> {
+            self.touched.store(true, Ordering::SeqCst);
+            self.inner.walk(root, opts)
+        }
+    }
+
+    #[tokio::test]
+    async fn refusal_precedes_any_traversal_or_read() {
+        let dir = newline_fixture();
+        let touched = Arc::new(AtomicBool::new(false));
+        let grep = GrepTool::new(
+            Arc::new(RecordingFs {
+                inner: LocalFs,
+                touched: Arc::clone(&touched),
+            }),
+            dir.path().to_path_buf(),
+            GrepOpts::default(),
+        );
+        let r = grep
+            .execute(
+                ToolCallId::from("tc-test"),
+                serde_json::json!({ "pattern": "a\nimport" }),
+                CancelToken::new(),
+                Box::new(|_u: ToolUpdate| {}),
+            )
+            .await;
+        assert_eq!(
+            r.err().map(|e| e.message).as_deref(),
+            Some(RG_NEWLINE_ERROR)
+        );
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "matcher refusal must precede the first walk/read"
+        );
     }
 }

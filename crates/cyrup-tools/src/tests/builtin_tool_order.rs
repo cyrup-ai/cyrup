@@ -1,4 +1,4 @@
-//! Built-in tool ORDER parity with Pi (`coding-agent/src/core/tools/index.ts:147-176`).
+//! Built-in tool ORDER parity with Pi (`coding-agent/src/core/tools/index.ts:173-202`).
 //!
 //! Registry insertion order is presentation order (`registry.rs` `insert`/`all`/`visible`), and that
 //! order is what `cyrup-session-svc/src/builder.rs:671` feeds into `select_active_tools` →
@@ -28,8 +28,8 @@ fn registry() -> ToolRegistry {
     )
 }
 
-/// Pi `createAllToolDefinitions` (index.ts:156-166) returns its object literal in the order
-/// `read, bash, edit, write, grep, find, ls`. `visible(&Availability::All)` is the exact call
+/// Pi `createAllToolDefinitions` (index.ts:182-193) returns its object literal in the order
+/// `read, bash, powershell, edit, write, grep, find, ls`. `visible(&Availability::All)` is the exact call
 /// `cyrup-session-svc/src/builder.rs:648-652` makes to derive `base_tools`.
 #[test]
 fn visible_all_matches_pi_create_all_tool_definitions_order() {
@@ -37,7 +37,7 @@ fn visible_all_matches_pi_create_all_tool_definitions_order() {
     let tools = reg.visible(&Availability::All);
     assert_eq!(
         names(&tools),
-        ["read", "bash", "edit", "write", "grep", "find", "ls"],
+        ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"],
         "wire/prompt tool order must match Pi's createAllToolDefinitions literal"
     );
     // `all()` replays the same `order` vector; keep the two in lockstep.
@@ -60,8 +60,9 @@ fn builtin_names_constant_agrees_with_registry_order() {
     );
 }
 
-/// Pi `createCodingTools` (index.ts:169-176) is `read, bash, edit, write` — the default active set
-/// (`sdk.ts` `defaultActiveToolNames`, `agent-session.ts:2593`). Filtering the registry must
+/// Pi `createCodingTools` (index.ts:195-202) is `read, bash, edit, write` — the default active set
+/// (`sdk.ts` `defaultActiveToolNames`, `agent-session.ts:2593`), and deliberately WITHOUT
+/// `powershell`, which upstream omits from both derived sets. Filtering the registry must
 /// reproduce that order, not `read, write, edit, bash`.
 #[test]
 fn coding_tools_matches_pi_create_coding_tools_order() {
@@ -73,7 +74,8 @@ fn coding_tools_matches_pi_create_coding_tools_order() {
     assert_eq!(names(&tools), ["read", "bash", "edit", "write"]);
 }
 
-/// Pi `createReadOnlyToolDefinitions` (index.ts:147-154) is `read, grep, find, ls`.
+/// Pi `createReadOnlyToolDefinitions` (index.ts:173-180) is `read, grep, find, ls` — again without
+/// `powershell`.
 #[test]
 fn read_only_tools_matches_pi_read_only_order() {
     let tools = crate::read_only_tools(

@@ -1337,7 +1337,7 @@ async fn availability_controls() {
         Backend::default(),
         ToolsOptions::default(),
     );
-    assert_eq!(reg.all().len(), 7);
+    assert_eq!(reg.all().len(), 8);
 
     let names = |v: &[Arc<dyn Tool>]| v.iter().map(|t| t.name().to_string()).collect::<Vec<_>>();
 
@@ -1505,7 +1505,7 @@ async fn extension_override_and_throwing_tool() {
     reg.insert(Arc::new(EchoRead {
         params: serde_json::json!({ "type": "object" }),
     }));
-    assert_eq!(reg.all().len(), 7, "override does not add a new slot");
+    assert_eq!(reg.all().len(), 8, "override does not add a new slot");
     let read = reg.get("read").unwrap();
     let r = read
         .execute(
