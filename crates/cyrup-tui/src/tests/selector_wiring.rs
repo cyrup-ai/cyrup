@@ -11,7 +11,13 @@
 //! `App::execute_command` against a real faux-provider-backed `AgentSession`, or a
 //! `keybindings.json` load followed by the command that reads it. A test that called the setter
 //! directly would pass with the wiring deleted, which is the exact failure being closed.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 use std::path::PathBuf;
 use std::sync::Arc;

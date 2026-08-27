@@ -5,7 +5,13 @@
 //! columns, the `→` cursor, the trust header) plus the routing outcomes (a settings cycle emits an
 //! `ApplySetting` command and updates the displayed value in place; a trust confirm carries the chosen
 //! option index; the bordered loader occupies the editor slot while a long op runs).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 use crate::crossterm::event::KeyCode;
 use crate::{

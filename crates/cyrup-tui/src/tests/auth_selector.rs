@@ -6,7 +6,13 @@
 //! (`oauth-selector.ts:124-181`) and what confirming one routes to. The half that actually runs a
 //! login — dialog, `AuthInteraction`, credential write — is `tests/login_flow.rs`, which drives it
 //! end to end against a live `AgentSession`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 use cyrup_config::login::{AuthCheck, AuthType, LoginProviderOption};
 use cyrup_core::ProviderId;

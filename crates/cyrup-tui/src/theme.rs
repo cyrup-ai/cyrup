@@ -1369,14 +1369,12 @@ pub fn detect_terminal_theme_for_auto(
 /// Pi `parseAutoThemeSetting` (`theme.ts:638-653`): a `"<light>/<dark>"` setting with exactly one
 /// slash parses into a `(light, dark)` pair; anything else is not an auto setting.
 pub fn parse_auto_theme_setting(setting: Option<&str>) -> Option<(String, String)> {
-    let s = setting?;
-    let first = s.find('/')?;
+    let (light, dark) = setting?.split_once('/')?;
     // Reject a second slash (Pi: `indexOf("/", slashIndex+1) !== -1`).
-    if s[first + 1..].contains('/') {
+    if dark.contains('/') {
         return None;
     }
-    let light = s[..first].trim();
-    let dark = s[first + 1..].trim();
+    let (light, dark) = (light.trim(), dark.trim());
     if light.is_empty() || dark.is_empty() {
         return None;
     }

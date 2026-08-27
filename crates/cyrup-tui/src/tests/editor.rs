@@ -3,7 +3,8 @@
     clippy::unwrap_used,
     clippy::expect_used,
     clippy::indexing_slicing,
-    clippy::panic
+    clippy::panic,
+    clippy::string_slice
 )]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};

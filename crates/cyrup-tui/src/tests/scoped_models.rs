@@ -4,7 +4,13 @@
 //! render over the full catalog, `Enter` **toggling** membership (not confirming), Alt+↑/↓ reorder of
 //! the enabled cycle order, Ctrl+A/Ctrl+X enable/clear-all, and Ctrl+S confirming with the ordered
 //! enabled set (or the `SCOPED_MODELS_ALL` sentinel).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{

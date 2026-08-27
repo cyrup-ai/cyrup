@@ -22,7 +22,13 @@
 //! The property is *inside the run loop's `select!` arms*, which own a terminal, a session and a
 //! dozen channels; driving an 80 ms tick to observe a frozen glyph is timing-flaky under CI.
 //! The guard is structural, the same shape as `run_loop_input_priority.rs`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 /// `app.rs` and `transcript/cache.rs` verbatim, at compile time.
 const APP_SRC: &str = include_str!("../app/run.rs");

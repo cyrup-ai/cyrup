@@ -232,142 +232,7 @@ impl SubagentsExtension {
         has_ui: bool,
     ) -> Result<String, SubagentError> {
         match command {
-            // Slash-live-state (T8, partial — pi `slash/slash-live-state.ts`): pi posts an IMMEDIATE
-            // in-transcript placeholder message the moment `/run` is invoked, then UPDATES IT IN
-            // PLACE as the run streams and finally renders the completed result over the same
-            // transcript entry. The crate cannot post that immediate placeholder or update it in
-            // place today: `NativeExtension::execute_command` returns a single `Option<String>` (its
-            // one final transcript entry) and its `HostCtx` exposes no transcript-message sink and no
-            // update-in-place handle. So the crate-side minimum here is to make the SINGLE returned
-            // entry read as the placeholder RESOLVED to completion — a completion summary (status +
-            // agent + tool/token stats) over the delivered output, exactly what pi's placeholder
-            // renders once the run settles (`renderSubagentResult`). The immediate placeholder + live
-            // in-place update is the remaining outer-layer step, gated on a host transcript-update
-            // channel `cyrup-tui`/`HostCtx` must expose (the tool path already streams live progress
-            // via `ToolUpdateSink`, C19 — the slash path has no equivalent sink yet).
-            SlashCommandName::Run => {
-                let parsed = slash_commands::parse_run_command(args)
-                    .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-                let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
-                let model = parsed.config.model.clone().map(ModelId::from);
-                // SUBA-002 — charge the per-SESSION spawn budget on the SLASH surface too. Upstream
-                // gets this for free: `/run`'s handler calls `runSlashSubagent` -> `requestSlashRun`
-                // -> the bridge wired at `extension/index.ts:512-517` -> `executeSubagentCollapsed`
-                // -> the SAME `executor.execute` the tool uses, whose `reserveSubagentSpawns`
-                // (`subagent-executor.ts:266-282`, called at `:3434-3441`) therefore covers both
-                // surfaces. Here `dispatch_slash` is an independent entry point into
-                // `SubagentExecutor`, so without this the budget would be enforced on the tool path
-                // ONLY and a session that had exhausted it could keep fanning out via `/run`.
-                //
-                // `/run` is pi's SINGLE shape (`params.agent` set, no `tasks`/`chain`), so
-                // `countRequestedSubagentSpawns` bills it exactly `1` — the same `1` whether the run
-                // goes foreground or background, which is why the charge sits after parsing and
-                // ahead of the mode branch below rather than inside either arm (charging once, never
-                // twice, and never a count that differs from what actually gets spawned).
-                let run_cfg = self.executor.config_snapshot().await;
-                // SUBA-002 follow-up — the DEPTH guard must precede the charge (pi checks the
-                // ceiling at `subagent-executor.ts:3297-3312`, ahead of `reserveSubagentSpawns` at
-                // `:3434-3441`). `/run`'s own R-SA-055 guard lives inside `run_foreground`/
-                // `spawn_background`, i.e. strictly after this charge, so a depth-blocked `/run`
-                // was billed and then refused. `/run-chain` already checks here for its own
-                // (discovery-ordering) reason; this is the same rung for the `/run` surface.
-                let depth = resolve_effective_depth(run_cfg.max_subagent_depth);
-                if crate::spawn::depth::is_blocked(&depth) {
-                    return Err(SubagentError::DepthExceeded {
-                        current: depth.current_depth,
-                        max: depth.max_depth,
-                    });
-                }
-                self.executor
-                    .reserve_subagent_spawns(1, run_cfg.max_subagent_spawns_per_session)
-                    .map_err(SubagentError::SpawnLimitExceeded)?;
-
-                // G98 / pi `applySingleAgentLaunchDefaults` (`subagent-executor.ts:1930-1947`,
-                // applied at `:4927` @v0.43.0). `/run` is pi's SINGLE shape, and upstream reaches it through the SAME
-                // `executor.execute` the tool does, so the agent's own `async:`/`timeoutMs:`
-                // frontmatter defaults apply here identically. cyrup's `/run` is an independent
-                // entry point, so it has to apply them itself — see
-                // [`SubagentExecutor::single_agent_launch_defaults`] for why the resolution is
-                // shared rather than duplicated.
-                //
-                // Fill-unset-only, and `/run`'s "unset" is precise: the surface parses no
-                // `timeoutMs=`/`maxRuntimeMs=` token at all (`slash-commands.ts:678-681`
-                // forwards only `output`/`outputMode`/`skill`/`model`), so a timeout
-                // default is ALWAYS eligible; `--bg` is the only async signal, and an explicit
-                // `--bg` must beat an agent declaring `async: false`, so the default only decides
-                // the case where `--bg` was NOT typed.
-                let (default_async, default_timeout_ms, _default_turn_budget) =
-                    SubagentExecutor::single_agent_launch_defaults(cwd, &parsed.agent);
-                let background = parsed.flags.background || default_async.unwrap_or(false);
-                if background {
-                    let run_id = self
-                        .executor
-                        .spawn_background(BackgroundSingleRequest {
-                            // SUBA-021: the slash surfaces advertise no `usageBudget` param upstream either.
-                            usage_budget: None,
-                            // SUBA-008: `/run` parses no `turnBudget=` token (upstream's
-                            // `slash-commands.ts:678-681` forwards only output/outputMode/skill/
-                            // model), so there is no CALLER rung here — but the agent's own
-                            // `turnBudget:` frontmatter and `subagents.turnBudget` still apply,
-                            // because `spawn_background` resolves those two itself.
-                            turn_budget: None,
-                            structured_output_schema: None,
-                            tool_budget: None,
-                            cwd,
-                            agent_name: &parsed.agent,
-                            task: &parsed.task,
-                            context,
-                            model_override: model,
-                            agent_scope: AgentReadScope::Both,
-                            // pi's own `/run` handler forwards `output`/`outputMode`/`skill`/`model`
-                            // and NOTHING else (`slash/slash-commands.ts:678-681`) — the
-                            // inline `acceptance=` token it parses is only ever consumed by the
-                            // `/chain`//`/parallel` step builders. Faithful parity: `None` here.
-                            acceptance: None,
-                            // SUBA-N06: nor an `includeProgress=` token.
-                            include_progress: None,
-                            // Same parity rule: the `/run` surface parses no `control=` token, so
-                            // there is no per-call override to forward. `spawn_background` still
-                            // folds in the extension-level `subagents.control` block.
-                            control: None,
-                            // SUBA-N03: `None` here is SYMMETRY with the foreground `/run` branch
-                            // directly below, not a background-specific drop — that branch calls
-                            // `run_foreground(…)`'s flat legacy signature, which likewise carries
-                            // no override bundle. `/run`'s own parser does not yet surface pi's
-                            // `output`/`outputMode`/`skill` tokens (`slash-commands.ts:678-681`)
-                            // on EITHER path; wiring that surface is a separate unit, and
-                            // until it lands both `/run` paths behave identically. `share`/
-                            // `sessionDir`/`artifacts`/`timeoutMs` have no `/run` token upstream at
-                            // all.
-                            output: None,
-                            output_mode: None,
-                            skills: None,
-                            share: None,
-                            session_dir: None,
-                            artifacts: None,
-                            // G98: `/run` parses no timeout token, so this is purely the agent's
-                            // own `timeoutMs:` default — never an override of a call-site value.
-                            timeout_ms: default_timeout_ms,
-                        })
-                        .await?;
-                    Ok(format!("Background subagent run started: {run_id}"))
-                } else {
-                    let result = self
-                        .executor
-                        .run_foreground(
-                            cwd,
-                            &parsed.agent,
-                            &parsed.task,
-                            context,
-                            model,
-                            // G98: same agent-level default on the foreground branch — pi applies
-                            // it before the async/foreground fork, not inside one arm of it.
-                            default_timeout_ms,
-                        )
-                        .await?;
-                    Ok(format_slash_run_completion(&result))
-                }
-            }
+            SlashCommandName::Run => self.slash_run(args, cwd).await,
             // pi's `/subagents-doctor` handler calls `runSlashSubagent(pi, ctx, { action: "doctor"
             // })` — no `sessionDir` override on the slash-command surface
             // (`slash-commands.ts:694-699` @v0.43.0), so `formatConfiguredSessionDir` falls through
@@ -380,307 +245,453 @@ impl SubagentsExtension {
             // `subagent({ action: "status", view: "fleet" })` tool call uses, so the two surfaces
             // can never render different fleets (R-SA-130).
             SlashCommandName::SubagentsFleet => self.show_fleet(cwd, has_ui).await,
-            // G77: pi's `/subagents-stop` handler with an explicit id is exactly
-            // `runSlashSubagent(pi, ctx, { action: "stop", id })` (`slash-commands.ts:754-757`
-            // @v0.43.0) — routed here to the SAME `control_stop` entry point the
-            // `subagent({ action: "stop" })` tool call lands on, so the two surfaces can never
-            // diverge (R-SA-130).
-            //
-            // With NO id upstream opens a TUI selector over the discovered stop targets and then
-            // issues the identical call for the chosen one (`:775-791`); this crate's slash layer
-            // has no overlay seam (see `SLASH_COMMANDS`' own note that `CommandDescriptor` carries
-            // a static completion list, not a closure), so the empty-argument case takes upstream's
-            // OWN documented no-UI fallback path instead — `if (!ctx.hasUI) sendSlashText(pi,
-            // stopFallbackText(targets))` (`:774`) — rather than guessing a target. A stop is
-            // unrecoverable, so guessing is the one thing this command must not do.
-            SlashCommandName::SubagentsStop => {
-                let id = args.trim();
-                if id.is_empty() {
-                    self.executor
-                        .format_stop_targets(cwd)
-                        .await
-                        .map_err(SubagentError::Management)
-                } else {
-                    self.executor
-                        .control_stop(cwd, Some(id), None)
-                        .await
-                        .map_err(SubagentError::Management)
-                }
-            }
-            // SUBA-066 — pi `slash-commands.ts:706-719` @v0.47.1. The command routes to the SAME
-            // `read_subagent_guide` the `guide` action does, which is the whole point of landing the
-            // two together: two readers over one packaged document set cannot disagree about what
-            // the current contract says.
-            //
-            // Upstream refuses a multi-word argument with `ctx.ui.notify("Usage: /subagents-guide
-            // [topic]", "error")` (`:712-715`) BEFORE dispatching, rather than letting it fall
-            // through to the unknown-topic message — because a two-word argument is a usage mistake,
-            // not a wrong topic, and the topic list would be the wrong answer to it.
-            SlashCommandName::SubagentsGuide => {
-                let topic = args.trim();
-                if topic.contains(char::is_whitespace) {
-                    return Err(SubagentError::Management(
-                        "Usage: /subagents-guide [topic]".to_string(),
-                    ));
-                }
-                Ok(crate::registration::guide::read_subagent_guide(Some(topic)))
-            }
-            SlashCommandName::SubagentsProfiles => {
-                let profiles_dir = self.profiles_dir();
-                let profiles = crate::registration::profiles::describe_profiles(&profiles_dir)?;
-                if profiles.is_empty() {
-                    Ok("No saved subagent profiles.".to_string())
-                } else {
-                    Ok(profiles
-                        .keys()
-                        .map(String::as_str)
-                        .collect::<Vec<_>>()
-                        .join("\n"))
-                }
-            }
-            SlashCommandName::SubagentsLoadProfile => {
-                let name = slash_commands::parse_subagents_load_profile_command(args)
-                    .map_err(|e| SubagentError::UnsafePathToken(e.message))?;
-                self.load_profile_into_settings(&name).await
-            }
+            SlashCommandName::SubagentsStop => self.slash_subagents_stop(args, cwd).await,
+            SlashCommandName::SubagentsGuide => self.slash_subagents_guide(args),
+            SlashCommandName::SubagentsProfiles => self.slash_subagents_profiles(),
+            SlashCommandName::SubagentsLoadProfile => self.slash_load_profile(args).await,
             SlashCommandName::SubagentCost => Ok(self.executor.run_cost_report(cwd).await),
-
-            // -----------------------------------------------------------------------------------
-            // /chain — linear sequence (with optional inline parallel groups), R-SA-129/§5.1/§5.3.
-            // Routes into the SAME chain-graph walker (`spawn::chain_graph::walk_chain`) and the
-            // SAME `ExecSingleStepExecutor` subprocess-spawning adapter the hop-2 background
-            // runner uses for a saved/async chain (R-SA-130: one execution code path, never a
-            // second divergent implementation for the foreground slash-command shape).
-            // -----------------------------------------------------------------------------------
-            SlashCommandName::Chain => {
-                let parsed = slash_commands::parse_chain_command(args)
-                    .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-                let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
-                // `/chain` carries no separate top-level task arg — the first step's task seeds the
-                // chain, so `{task}` falls back to it (`first_step_task`).
-                self.run_or_background_chain(cwd, parsed.chain, RunMode::Chain, context, parsed.flags.background, None)
-                    .await
-            }
-
-            // -----------------------------------------------------------------------------------
-            // /parallel — a single static-width fan-out group (R-SA-129/§5.3). Represented as a
-            // ONE-element `ChainGraph` whose sole element is a `RunnerStep::ParallelGroup`, so it
-            // is dispatched by the identical `walk_chain`/`run_bounded` machinery a parallel GROUP
-            // inside a longer `/chain` uses — never a second, parallel-only dispatch path.
-            // -----------------------------------------------------------------------------------
-            SlashCommandName::Parallel => {
-                let parsed = slash_commands::parse_parallel_command(args)
-                    .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-                let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
-                let cfg = self.executor.config_snapshot().await;
-                let group = RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
-                    steps: parsed.tasks,
-                    concurrency: cfg.parallel_concurrency(),
-                    fail_fast: false,
-                    worktree: false,
-                });
-                // `/parallel` carries no separate top-level task arg — `{task}` falls back to the
-                // group's first task (`first_step_task`).
-                self.run_or_background_chain(cwd, vec![group], RunMode::Parallel, context, parsed.flags.background, None)
-                    .await
-            }
-
-            // -----------------------------------------------------------------------------------
-            // /run-chain — invoke a saved chain (`.chain.md`/`.chain.json`) by name (R-SA-129).
-            // Resolves the chain through the REAL discovery pipeline (R-SA-019/020), then routes
-            // into the identical `walk_chain` machinery `/chain` itself uses.
-            // -----------------------------------------------------------------------------------
-            SlashCommandName::RunChain => {
-                let parsed = slash_commands::parse_run_chain_command(args)
-                    .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-                let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
-                // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before `resolve_chain`
-                // below, which is a real discovery filesystem scan (R-SA-019/020) — so a blocked
-                // call never touches discovery at all, not even for the saved-chain lookup this
-                // command performs ahead of `run_or_background_chain`'s own (correct, but
-                // necessarily later) independent re-check.
-                let cfg = self.executor.config_snapshot().await;
-                let depth = resolve_effective_depth(cfg.max_subagent_depth);
-                if crate::spawn::depth::is_blocked(&depth) {
-                    return Err(SubagentError::DepthExceeded {
-                        current: depth.current_depth,
-                        max: depth.max_depth,
-                    });
-                }
-                let chain = self.executor.resolve_chain(cwd, &parsed.chain_name)?;
-                // The functionality spec's own usage grammar (`/run-chain <chainName> -- <task>`)
-                // gives no further detail on how the supplied task text combines with a saved
-                // chain's own per-step task text beyond pi-subagents' `mapSavedChainSteps`
-                // reference (`registration/slash_commands.rs`'s own module doc). The most complete
-                // honest reading: the supplied task text seeds the FIRST step only (mirroring
-                // `/chain`'s own "first element's task is what starts the chain" convention,
-                // R-SA-053's own "cross-step data flows via named outputs from here forward"
-                // model) — every later step keeps its saved, fixed task text verbatim.
-                // A saved chain parses into `ChainStepConfig` authoring shapes (T0.2); lower each
-                // to the runtime `RunnerStep` union here via the structural bridge — it carries the
-                // real agent NAME (never a placeholder persona; name resolution stays the
-                // executor's job) and defers plan-time model/acceptance enrichment. A group step's
-                // omitted `concurrency` falls back to `cfg.parallel_concurrency()`, mirroring
-                // `/parallel`'s own default above.
-                let graph: Vec<RunnerStep> = chain
-                    .steps
-                    .iter()
-                    .map(|step| {
-                        crate::discovery::chains::chain_step_to_runner_step(
-                            step,
-                            cfg.parallel_concurrency(),
-                        )
-                    })
-                    .collect();
-                let steps = seed_first_step_task(graph, &parsed.task);
-                // `/run-chain <name> -- <task>`: the supplied task seeds the first step AND is the
-                // run-wide `{task}` value (pi `originalTask = params.task`).
-                let task = (!parsed.task.trim().is_empty()).then(|| parsed.task.clone());
-                self.run_or_background_chain(cwd, steps, RunMode::Chain, context, parsed.flags.background, task)
-                    .await
-            }
-
-            // -----------------------------------------------------------------------------------
-            // /subagents-models — report the RUNTIME builtin-agent -> model mapping (pi
-            // `handleModels`, slash-commands.ts:802-823), NOT a dump of the static provider
-            // catalog: each discovered builtin persona's effective model + provenance, optionally
-            // filtered to one builtin.
-            // -----------------------------------------------------------------------------------
-            SlashCommandName::SubagentsModels => {
-                let parsed = slash_commands::parse_subagents_models_command(args)
-                    .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-                Ok(self.executor.run_models_report(cwd, parsed.agent.as_deref()))
-            }
-
-            // -----------------------------------------------------------------------------------
-            // /subagents-refresh-provider-models — R-SA-129/142. The catalog-refresh ALGORITHM
-            // (probe scheduling, catalog diffing, observed/derived classification) is explicitly
-            // deferred (func-SA §9 item 31) — this crate has no provider-catalog CACHE FILE writer
-            // anywhere yet, only `registration/doctor.rs`'s freshness-checking READER
-            // (`provider_catalog_path`). The honest, most-complete implementation available today:
-            // validate the provider name (R-SA-142's path-traversal guard, since this name feeds
-            // the SAME cache-file path `doctor.rs` stats), confirm it resolves against the real
-            // built-in model registry, and write/refresh a minimal, genuinely-real freshness-cache
-            // marker file at the exact path `doctor.rs`'s own `check_provider_catalog_freshness`
-            // reads — so `/subagents-doctor`'s freshness check (R-SA-131 item f) observes a REAL
-            // effect of running this command, not a no-op. What remains explicitly OUT OF SCOPE
-            // (per the same deferred item): actually spawning a probe subprocess against the named
-            // provider's live API to discover/diff its real-time model list.
-            // -----------------------------------------------------------------------------------
+            SlashCommandName::Chain => self.slash_chain(args, cwd).await,
+            SlashCommandName::Parallel => self.slash_parallel(args, cwd).await,
+            SlashCommandName::RunChain => self.slash_run_chain(args, cwd).await,
+            SlashCommandName::SubagentsModels => self.slash_models(args, cwd),
             SlashCommandName::SubagentsRefreshProviderModels => {
-                let parsed = slash_commands::parse_subagents_refresh_provider_models_command(args)
-                    .map_err(|e| SubagentError::MalformedSettings(e.message))?;
-                self.refresh_provider_catalog_cache(cwd, &parsed.provider, parsed.force)
-                    .await
+                self.slash_refresh_provider_models(args, cwd).await
             }
-
-            // -----------------------------------------------------------------------------------
-            // /subagents-generate-profiles — R-SA-129/140/141/142. Profile *authoring* (writing a
-            // NEW named-profile JSON file) is explicitly out of `registration/profiles.rs`'s
-            // documented scope (that module is read-only over an already-authored profiles
-            // directory — see its own module doc's "Deferred to a later phase" section) — full
-            // provider-catalog-driven profile GENERATION is the same deferred item as
-            // `/subagents-refresh-provider-models` (func-SA §9 item 31). The honest, most-complete
-            // implementation available today: validate the provider name (R-SA-142), confirm it
-            // resolves against the real built-in model registry, and WRITE the two named profiles
-            // (`<provider>.quota`/`<provider>.quality`) this command's own usage string promises,
-            // selecting the catalog's cheapest/highest-capability model for that provider as the
-            // profile's `defaultModel` — a genuine, on-disk, load-through-`/subagents-load-profile`
-            // artifact, not a placeholder acknowledgement.
-            // -----------------------------------------------------------------------------------
-            SlashCommandName::SubagentsGenerateProfiles => {
-                let provider = slash_commands::parse_subagents_generate_profiles_command(args)
-                    .map_err(|e| SubagentError::UnsafePathToken(e.message))?;
-                self.generate_provider_profiles(&provider).await
-            }
-
-            // -----------------------------------------------------------------------------------
-            // /subagents-check-profile — R-SA-129/140/141/142. Loads the named profile through the
-            // real `registration::profiles::load_profile` primitive and checks every
-            // `overrides.<agent>.model`/`defaultModel` value it declares against the real
-            // built-in model registry, reporting which model references are genuinely known vs.
-            // unresolvable — the honest, catalog-backed half of "still points to usable models" this command's
-            // own usage string promises; a genuine LIVE reachability probe against the provider's
-            // API is the same explicitly deferred item as the two commands above.
-            // -----------------------------------------------------------------------------------
-            SlashCommandName::SubagentsCheckProfile => {
-                let name = slash_commands::parse_subagents_check_profile_command(args)
-                    .map_err(|e| SubagentError::UnsafePathToken(e.message))?;
-                let profiles_dir = self.profiles_dir();
-                let profile = crate::registration::profiles::load_profile(&profiles_dir, &name)?;
-                Ok(render_profile_check_report(&name, &profile).await)
-            }
-
-            // -----------------------------------------------------------------------------------
-            // /prompt-workflow — run one bundled/user/project `prompts/*.md` recipe (pi
-            // `prompt-workflows.ts:269-301` @v0.34.0). This is the reader that finally makes
-            // `registration::resources::bundled_prompt_files` reachable: the seven recipes this
-            // crate ships were discovered, unit-tested, and invocable by nothing.
-            // -----------------------------------------------------------------------------------
-            SlashCommandName::PromptWorkflow => {
-                let mut words = prompt_workflows::shell_words(args);
-                let name = if words.is_empty() { None } else { Some(words.remove(0)) };
-                let workflows = prompt_workflows::discover_prompt_workflows(cwd);
-                // pi `:275-278`: a bare `/prompt-workflow`, or the literal `list`, prints the list.
-                let Some(name) = name.filter(|n| n != "list") else {
-                    return Ok(prompt_workflows::format_workflow_list(&workflows));
-                };
-                let Some(workflow) = prompt_workflows::find_workflow(&workflows, &name) else {
-                    // pi `:281` notifies `Unknown prompt workflow: {name}` as an error.
-                    return Err(SubagentError::MalformedSettings(format!(
-                        "Unknown prompt workflow: {name}"
-                    )));
-                };
-                let runtime = prompt_workflows::parse_runtime_options(&words);
-                // pi `:286-295`: a recipe carrying `chain:` expands to a chain of OTHER recipes and
-                // never runs its own body.
-                if let Some(chain) = workflow.chain.as_deref() {
-                    let names = prompt_workflows::split_prompt_chain(chain);
-                    let steps = prompt_workflows::build_chain_steps(
-                        &workflows,
-                        &names,
-                        &runtime.args,
-                        &runtime,
-                        Some(&workflow.name),
-                    )
-                    .map_err(SubagentError::MalformedSettings)?;
-                    return self.run_prompt_workflow_chain(cwd, steps, &runtime).await;
-                }
-                let run = prompt_workflows::workflow_params(workflow, &runtime.args, &runtime);
-                self.run_prompt_workflow_single(cwd, &run).await
-            }
-
-            // -----------------------------------------------------------------------------------
-            // /chain-prompts — the same recipes, chained by an inline ` -> ` declaration (pi
-            // `prompt-workflows.ts:303-329` @v0.34.0).
-            // -----------------------------------------------------------------------------------
-            SlashCommandName::ChainPrompts => {
-                let (declaration, args_text) = prompt_workflows::split_chain_declaration(args);
-                let workflows = prompt_workflows::discover_prompt_workflows(cwd);
-                // pi `:308-311`: an empty declaration, or the literal `list`, prints the list.
-                if declaration.is_empty() || declaration == "list" {
-                    return Ok(prompt_workflows::format_workflow_list(&workflows));
-                }
-                let runtime =
-                    prompt_workflows::parse_runtime_options(&prompt_workflows::shell_words(&args_text));
-                let names = prompt_workflows::split_prompt_chain(&declaration);
-                if names.is_empty() {
-                    // pi `:315` — the usage line, verbatim.
-                    return Err(SubagentError::MalformedSettings(
-                        "Usage: /chain-prompts prompt-a -> prompt-b -- args".to_string(),
-                    ));
-                }
-                let steps = prompt_workflows::build_chain_steps(
-                    &workflows,
-                    &names,
-                    &runtime.args,
-                    &runtime,
-                    None,
-                )
-                .map_err(SubagentError::MalformedSettings)?;
-                self.run_prompt_workflow_chain(cwd, steps, &runtime).await
-            }
+            SlashCommandName::SubagentsGenerateProfiles => self.slash_generate_profiles(args).await,
+            SlashCommandName::SubagentsCheckProfile => self.slash_check_profile(args).await,
+            SlashCommandName::PromptWorkflow => self.slash_prompt_workflow(args, cwd).await,
+            SlashCommandName::ChainPrompts => self.slash_chain_prompts(args, cwd).await,
         }
+    }
+
+    /// Slash-live-state (T8, partial — pi `slash/slash-live-state.ts`): pi posts an IMMEDIATE
+    /// in-transcript placeholder message the moment `/run` is invoked, then UPDATES IT IN
+    /// PLACE as the run streams and finally renders the completed result over the same
+    /// transcript entry. The crate cannot post that immediate placeholder or update it in
+    /// place today: `NativeExtension::execute_command` returns a single `Option<String>` (its
+    /// one final transcript entry) and its `HostCtx` exposes no transcript-message sink and no
+    /// update-in-place handle. So the crate-side minimum here is to make the SINGLE returned
+    /// entry read as the placeholder RESOLVED to completion — a completion summary (status +
+    /// agent + tool/token stats) over the delivered output, exactly what pi's placeholder
+    /// renders once the run settles (`renderSubagentResult`). The immediate placeholder + live
+    /// in-place update is the remaining outer-layer step, gated on a host transcript-update
+    /// channel `cyrup-tui`/`HostCtx` must expose (the tool path already streams live progress
+    /// via `ToolUpdateSink`, C19 — the slash path has no equivalent sink yet).
+    async fn slash_run(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
+        let parsed = slash_commands::parse_run_command(args)
+            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
+        let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
+        let model = parsed.config.model.clone().map(ModelId::from);
+        // SUBA-002 — charge the per-SESSION spawn budget on the SLASH surface too. Upstream
+        // gets this for free: `/run`'s handler calls `runSlashSubagent` -> `requestSlashRun`
+        // -> the bridge wired at `extension/index.ts:512-517` -> `executeSubagentCollapsed`
+        // -> the SAME `executor.execute` the tool uses, whose `reserveSubagentSpawns`
+        // (`subagent-executor.ts:266-282`, called at `:3434-3441`) therefore covers both
+        // surfaces. Here `dispatch_slash` is an independent entry point into
+        // `SubagentExecutor`, so without this the budget would be enforced on the tool path
+        // ONLY and a session that had exhausted it could keep fanning out via `/run`.
+        //
+        // `/run` is pi's SINGLE shape (`params.agent` set, no `tasks`/`chain`), so
+        // `countRequestedSubagentSpawns` bills it exactly `1` — the same `1` whether the run
+        // goes foreground or background, which is why the charge sits after parsing and
+        // ahead of the mode branch below rather than inside either arm (charging once, never
+        // twice, and never a count that differs from what actually gets spawned).
+        let run_cfg = self.executor.config_snapshot().await;
+        // SUBA-002 follow-up — the DEPTH guard must precede the charge (pi checks the
+        // ceiling at `subagent-executor.ts:3297-3312`, ahead of `reserveSubagentSpawns` at
+        // `:3434-3441`). `/run`'s own R-SA-055 guard lives inside `run_foreground`/
+        // `spawn_background`, i.e. strictly after this charge, so a depth-blocked `/run`
+        // was billed and then refused. `/run-chain` already checks here for its own
+        // (discovery-ordering) reason; this is the same rung for the `/run` surface.
+        let depth = resolve_effective_depth(run_cfg.max_subagent_depth);
+        if crate::spawn::depth::is_blocked(&depth) {
+            return Err(SubagentError::DepthExceeded {
+                current: depth.current_depth,
+                max: depth.max_depth,
+            });
+        }
+        self.executor
+            .reserve_subagent_spawns(1, run_cfg.max_subagent_spawns_per_session)
+            .map_err(SubagentError::SpawnLimitExceeded)?;
+
+        // G98 / pi `applySingleAgentLaunchDefaults` (`subagent-executor.ts:1930-1947`,
+        // applied at `:4927` @v0.43.0). `/run` is pi's SINGLE shape, and upstream reaches it through the SAME
+        // `executor.execute` the tool does, so the agent's own `async:`/`timeoutMs:`
+        // frontmatter defaults apply here identically. cyrup's `/run` is an independent
+        // entry point, so it has to apply them itself — see
+        // [`SubagentExecutor::single_agent_launch_defaults`] for why the resolution is
+        // shared rather than duplicated.
+        //
+        // Fill-unset-only, and `/run`'s "unset" is precise: the surface parses no
+        // `timeoutMs=`/`maxRuntimeMs=` token at all (`slash-commands.ts:678-681`
+        // forwards only `output`/`outputMode`/`skill`/`model`), so a timeout
+        // default is ALWAYS eligible; `--bg` is the only async signal, and an explicit
+        // `--bg` must beat an agent declaring `async: false`, so the default only decides
+        // the case where `--bg` was NOT typed.
+        let (default_async, default_timeout_ms, _default_turn_budget) =
+            SubagentExecutor::single_agent_launch_defaults(cwd, &parsed.agent);
+        let background = parsed.flags.background || default_async.unwrap_or(false);
+        if background {
+            let run_id = self
+                .executor
+                .spawn_background(BackgroundSingleRequest {
+                    // SUBA-021: the slash surfaces advertise no `usageBudget` param upstream either.
+                    usage_budget: None,
+                    // SUBA-008: `/run` parses no `turnBudget=` token (upstream's
+                    // `slash-commands.ts:678-681` forwards only output/outputMode/skill/
+                    // model), so there is no CALLER rung here — but the agent's own
+                    // `turnBudget:` frontmatter and `subagents.turnBudget` still apply,
+                    // because `spawn_background` resolves those two itself.
+                    turn_budget: None,
+                    structured_output_schema: None,
+                    tool_budget: None,
+                    cwd,
+                    agent_name: &parsed.agent,
+                    task: &parsed.task,
+                    context,
+                    model_override: model,
+                    agent_scope: AgentReadScope::Both,
+                    // pi's own `/run` handler forwards `output`/`outputMode`/`skill`/`model`
+                    // and NOTHING else (`slash/slash-commands.ts:678-681`) — the
+                    // inline `acceptance=` token it parses is only ever consumed by the
+                    // `/chain`//`/parallel` step builders. Faithful parity: `None` here.
+                    acceptance: None,
+                    // SUBA-N06: nor an `includeProgress=` token.
+                    include_progress: None,
+                    // Same parity rule: the `/run` surface parses no `control=` token, so
+                    // there is no per-call override to forward. `spawn_background` still
+                    // folds in the extension-level `subagents.control` block.
+                    control: None,
+                    // SUBA-N03: `None` here is SYMMETRY with the foreground `/run` branch
+                    // directly below, not a background-specific drop — that branch calls
+                    // `run_foreground(…)`'s flat legacy signature, which likewise carries
+                    // no override bundle. `/run`'s own parser does not yet surface pi's
+                    // `output`/`outputMode`/`skill` tokens (`slash-commands.ts:678-681`)
+                    // on EITHER path; wiring that surface is a separate unit, and
+                    // until it lands both `/run` paths behave identically. `share`/
+                    // `sessionDir`/`artifacts`/`timeoutMs` have no `/run` token upstream at
+                    // all.
+                    output: None,
+                    output_mode: None,
+                    skills: None,
+                    share: None,
+                    session_dir: None,
+                    artifacts: None,
+                    // G98: `/run` parses no timeout token, so this is purely the agent's
+                    // own `timeoutMs:` default — never an override of a call-site value.
+                    timeout_ms: default_timeout_ms,
+                })
+                .await?;
+            Ok(format!("Background subagent run started: {run_id}"))
+        } else {
+            let result = self
+                .executor
+                .run_foreground(
+                    cwd,
+                    &parsed.agent,
+                    &parsed.task,
+                    context,
+                    model,
+                    // G98: same agent-level default on the foreground branch — pi applies
+                    // it before the async/foreground fork, not inside one arm of it.
+                    default_timeout_ms,
+                )
+                .await?;
+            Ok(format_slash_run_completion(&result))
+        }
+    }
+
+    /// G77: pi's `/subagents-stop` handler with an explicit id is exactly
+    /// `runSlashSubagent(pi, ctx, { action: "stop", id })` (`slash-commands.ts:754-757`
+    /// @v0.43.0) — routed here to the SAME `control_stop` entry point the
+    /// `subagent({ action: "stop" })` tool call lands on, so the two surfaces can never
+    /// diverge (R-SA-130).
+    ///
+    /// With NO id upstream opens a TUI selector over the discovered stop targets and then
+    /// issues the identical call for the chosen one (`:775-791`); this crate's slash layer
+    /// has no overlay seam (see `SLASH_COMMANDS`' own note that `CommandDescriptor` carries
+    /// a static completion list, not a closure), so the empty-argument case takes upstream's
+    /// OWN documented no-UI fallback path instead — `if (!ctx.hasUI) sendSlashText(pi,
+    /// stopFallbackText(targets))` (`:774`) — rather than guessing a target. A stop is
+    /// unrecoverable, so guessing is the one thing this command must not do.
+    async fn slash_subagents_stop(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
+        let id = args.trim();
+        if id.is_empty() {
+            self.executor
+                .format_stop_targets(cwd)
+                .await
+                .map_err(SubagentError::Management)
+        } else {
+            self.executor
+                .control_stop(cwd, Some(id), None)
+                .await
+                .map_err(SubagentError::Management)
+        }
+    }
+
+    /// SUBA-066 — pi `slash-commands.ts:706-719` @v0.47.1. The command routes to the SAME
+    /// `read_subagent_guide` the `guide` action does, which is the whole point of landing the
+    /// two together: two readers over one packaged document set cannot disagree about what
+    /// the current contract says.
+    ///
+    /// Upstream refuses a multi-word argument with `ctx.ui.notify("Usage: /subagents-guide
+    /// [topic]", "error")` (`:712-715`) BEFORE dispatching, rather than letting it fall
+    /// through to the unknown-topic message — because a two-word argument is a usage mistake,
+    /// not a wrong topic, and the topic list would be the wrong answer to it.
+    fn slash_subagents_guide(&self, args: &str) -> Result<String, SubagentError> {
+        let topic = args.trim();
+        if topic.contains(char::is_whitespace) {
+            return Err(SubagentError::Management(
+                "Usage: /subagents-guide [topic]".to_string(),
+            ));
+        }
+        Ok(crate::registration::guide::read_subagent_guide(Some(topic)))
+    }
+
+    /// /subagents-profiles — list the names of every saved profile in the profiles directory.
+    fn slash_subagents_profiles(&self) -> Result<String, SubagentError> {
+        let profiles_dir = self.profiles_dir();
+        let profiles = crate::registration::profiles::describe_profiles(&profiles_dir)?;
+        if profiles.is_empty() {
+            Ok("No saved subagent profiles.".to_string())
+        } else {
+            Ok(profiles
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+    }
+
+    /// /subagents-load-profile — load one named profile's overrides into the live settings.
+    async fn slash_load_profile(&self, args: &str) -> Result<String, SubagentError> {
+        let name = slash_commands::parse_subagents_load_profile_command(args)
+            .map_err(|e| SubagentError::UnsafePathToken(e.message))?;
+        self.load_profile_into_settings(&name).await
+    }
+
+    /// /chain — linear sequence (with optional inline parallel groups), R-SA-129/§5.1/§5.3.
+    /// Routes into the SAME chain-graph walker (`spawn::chain_graph::walk_chain`) and the
+    /// SAME `ExecSingleStepExecutor` subprocess-spawning adapter the hop-2 background
+    /// runner uses for a saved/async chain (R-SA-130: one execution code path, never a
+    /// second divergent implementation for the foreground slash-command shape).
+    async fn slash_chain(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
+        let parsed = slash_commands::parse_chain_command(args)
+            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
+        let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
+        // `/chain` carries no separate top-level task arg — the first step's task seeds the
+        // chain, so `{task}` falls back to it (`first_step_task`).
+        self.run_or_background_chain(cwd, parsed.chain, RunMode::Chain, context, parsed.flags.background, None)
+            .await
+    }
+
+    /// /parallel — a single static-width fan-out group (R-SA-129/§5.3). Represented as a
+    /// ONE-element `ChainGraph` whose sole element is a `RunnerStep::ParallelGroup`, so it
+    /// is dispatched by the identical `walk_chain`/`run_bounded` machinery a parallel GROUP
+    /// inside a longer `/chain` uses — never a second, parallel-only dispatch path.
+    async fn slash_parallel(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
+        let parsed = slash_commands::parse_parallel_command(args)
+            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
+        let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
+        let cfg = self.executor.config_snapshot().await;
+        let group = RunnerStep::ParallelGroup(crate::spawn::chain_graph::ParallelGroupSpec {
+            steps: parsed.tasks,
+            concurrency: cfg.parallel_concurrency(),
+            fail_fast: false,
+            worktree: false,
+        });
+        // `/parallel` carries no separate top-level task arg — `{task}` falls back to the
+        // group's first task (`first_step_task`).
+        self.run_or_background_chain(cwd, vec![group], RunMode::Parallel, context, parsed.flags.background, None)
+            .await
+    }
+
+    /// /run-chain — invoke a saved chain (`.chain.md`/`.chain.json`) by name (R-SA-129).
+    /// Resolves the chain through the REAL discovery pipeline (R-SA-019/020), then routes
+    /// into the identical `walk_chain` machinery `/chain` itself uses.
+    async fn slash_run_chain(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
+        let parsed = slash_commands::parse_run_chain_command(args)
+            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
+        let context = if parsed.flags.fork { Some(ContextMode::Fork) } else { None };
+        // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST — before `resolve_chain`
+        // below, which is a real discovery filesystem scan (R-SA-019/020) — so a blocked
+        // call never touches discovery at all, not even for the saved-chain lookup this
+        // command performs ahead of `run_or_background_chain`'s own (correct, but
+        // necessarily later) independent re-check.
+        let cfg = self.executor.config_snapshot().await;
+        let depth = resolve_effective_depth(cfg.max_subagent_depth);
+        if crate::spawn::depth::is_blocked(&depth) {
+            return Err(SubagentError::DepthExceeded {
+                current: depth.current_depth,
+                max: depth.max_depth,
+            });
+        }
+        let chain = self.executor.resolve_chain(cwd, &parsed.chain_name)?;
+        // The functionality spec's own usage grammar (`/run-chain <chainName> -- <task>`)
+        // gives no further detail on how the supplied task text combines with a saved
+        // chain's own per-step task text beyond pi-subagents' `mapSavedChainSteps`
+        // reference (`registration/slash_commands.rs`'s own module doc). The most complete
+        // honest reading: the supplied task text seeds the FIRST step only (mirroring
+        // `/chain`'s own "first element's task is what starts the chain" convention,
+        // R-SA-053's own "cross-step data flows via named outputs from here forward"
+        // model) — every later step keeps its saved, fixed task text verbatim.
+        // A saved chain parses into `ChainStepConfig` authoring shapes (T0.2); lower each
+        // to the runtime `RunnerStep` union here via the structural bridge — it carries the
+        // real agent NAME (never a placeholder persona; name resolution stays the
+        // executor's job) and defers plan-time model/acceptance enrichment. A group step's
+        // omitted `concurrency` falls back to `cfg.parallel_concurrency()`, mirroring
+        // `/parallel`'s own default above.
+        let graph: Vec<RunnerStep> = chain
+            .steps
+            .iter()
+            .map(|step| {
+                crate::discovery::chains::chain_step_to_runner_step(
+                    step,
+                    cfg.parallel_concurrency(),
+                )
+            })
+            .collect();
+        let steps = seed_first_step_task(graph, &parsed.task);
+        // `/run-chain <name> -- <task>`: the supplied task seeds the first step AND is the
+        // run-wide `{task}` value (pi `originalTask = params.task`).
+        let task = (!parsed.task.trim().is_empty()).then(|| parsed.task.clone());
+        self.run_or_background_chain(cwd, steps, RunMode::Chain, context, parsed.flags.background, task)
+            .await
+    }
+
+    /// /subagents-models — report the RUNTIME builtin-agent -> model mapping (pi
+    /// `handleModels`, slash-commands.ts:802-823), NOT a dump of the static provider
+    /// catalog: each discovered builtin persona's effective model + provenance, optionally
+    /// filtered to one builtin.
+    fn slash_models(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
+        let parsed = slash_commands::parse_subagents_models_command(args)
+            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
+        Ok(self.executor.run_models_report(cwd, parsed.agent.as_deref()))
+    }
+
+    /// /subagents-refresh-provider-models — R-SA-129/142. The catalog-refresh ALGORITHM
+    /// (probe scheduling, catalog diffing, observed/derived classification) is explicitly
+    /// deferred (func-SA §9 item 31) — this crate has no provider-catalog CACHE FILE writer
+    /// anywhere yet, only `registration/doctor.rs`'s freshness-checking READER
+    /// (`provider_catalog_path`). The honest, most-complete implementation available today:
+    /// validate the provider name (R-SA-142's path-traversal guard, since this name feeds
+    /// the SAME cache-file path `doctor.rs` stats), confirm it resolves against the real
+    /// built-in model registry, and write/refresh a minimal, genuinely-real freshness-cache
+    /// marker file at the exact path `doctor.rs`'s own `check_provider_catalog_freshness`
+    /// reads — so `/subagents-doctor`'s freshness check (R-SA-131 item f) observes a REAL
+    /// effect of running this command, not a no-op. What remains explicitly OUT OF SCOPE
+    /// (per the same deferred item): actually spawning a probe subprocess against the named
+    /// provider's live API to discover/diff its real-time model list.
+    async fn slash_refresh_provider_models(
+        &self,
+        args: &str,
+        cwd: &Path,
+    ) -> Result<String, SubagentError> {
+        let parsed = slash_commands::parse_subagents_refresh_provider_models_command(args)
+            .map_err(|e| SubagentError::MalformedSettings(e.message))?;
+        self.refresh_provider_catalog_cache(cwd, &parsed.provider, parsed.force)
+            .await
+    }
+
+    /// /subagents-generate-profiles — R-SA-129/140/141/142. Profile *authoring* (writing a
+    /// NEW named-profile JSON file) is explicitly out of `registration/profiles.rs`'s
+    /// documented scope (that module is read-only over an already-authored profiles
+    /// directory — see its own module doc's "Deferred to a later phase" section) — full
+    /// provider-catalog-driven profile GENERATION is the same deferred item as
+    /// `/subagents-refresh-provider-models` ([`Self::slash_refresh_provider_models`], func-SA §9
+    /// item 31). The honest, most-complete implementation available today: validate the provider
+    /// name (R-SA-142), confirm it
+    /// resolves against the real built-in model registry, and WRITE the two named profiles
+    /// (`<provider>.quota`/`<provider>.quality`) this command's own usage string promises,
+    /// selecting the catalog's cheapest/highest-capability model for that provider as the
+    /// profile's `defaultModel` — a genuine, on-disk, load-through-`/subagents-load-profile`
+    /// artifact, not a placeholder acknowledgement.
+    async fn slash_generate_profiles(&self, args: &str) -> Result<String, SubagentError> {
+        let provider = slash_commands::parse_subagents_generate_profiles_command(args)
+            .map_err(|e| SubagentError::UnsafePathToken(e.message))?;
+        self.generate_provider_profiles(&provider).await
+    }
+
+    /// /subagents-check-profile — R-SA-129/140/141/142. Loads the named profile through the
+    /// real `registration::profiles::load_profile` primitive and checks every
+    /// `overrides.<agent>.model`/`defaultModel` value it declares against the real
+    /// built-in model registry, reporting which model references are genuinely known vs.
+    /// unresolvable — the honest, catalog-backed half of "still points to usable models" this command's
+    /// own usage string promises; a genuine LIVE reachability probe against the provider's
+    /// API is the same explicitly deferred item as the two commands directly above
+    /// ([`Self::slash_refresh_provider_models`] and [`Self::slash_generate_profiles`]).
+    async fn slash_check_profile(&self, args: &str) -> Result<String, SubagentError> {
+        let name = slash_commands::parse_subagents_check_profile_command(args)
+            .map_err(|e| SubagentError::UnsafePathToken(e.message))?;
+        let profiles_dir = self.profiles_dir();
+        let profile = crate::registration::profiles::load_profile(&profiles_dir, &name)?;
+        Ok(render_profile_check_report(&name, &profile).await)
+    }
+
+    /// /prompt-workflow — run one bundled/user/project `prompts/*.md` recipe (pi
+    /// `prompt-workflows.ts:269-301` @v0.34.0). This is the reader that finally makes
+    /// `registration::resources::bundled_prompt_files` reachable: the seven recipes this
+    /// crate ships were discovered, unit-tested, and invocable by nothing.
+    async fn slash_prompt_workflow(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
+        let mut words = prompt_workflows::shell_words(args);
+        let name = if words.is_empty() { None } else { Some(words.remove(0)) };
+        let workflows = prompt_workflows::discover_prompt_workflows(cwd);
+        // pi `:275-278`: a bare `/prompt-workflow`, or the literal `list`, prints the list.
+        let Some(name) = name.filter(|n| n != "list") else {
+            return Ok(prompt_workflows::format_workflow_list(&workflows));
+        };
+        let Some(workflow) = prompt_workflows::find_workflow(&workflows, &name) else {
+            // pi `:281` notifies `Unknown prompt workflow: {name}` as an error.
+            return Err(SubagentError::MalformedSettings(format!(
+                "Unknown prompt workflow: {name}"
+            )));
+        };
+        let runtime = prompt_workflows::parse_runtime_options(&words);
+        // pi `:286-295`: a recipe carrying `chain:` expands to a chain of OTHER recipes and
+        // never runs its own body.
+        if let Some(chain) = workflow.chain.as_deref() {
+            let names = prompt_workflows::split_prompt_chain(chain);
+            let steps = prompt_workflows::build_chain_steps(
+                &workflows,
+                &names,
+                &runtime.args,
+                &runtime,
+                Some(&workflow.name),
+            )
+            .map_err(SubagentError::MalformedSettings)?;
+            return self.run_prompt_workflow_chain(cwd, steps, &runtime).await;
+        }
+        let run = prompt_workflows::workflow_params(workflow, &runtime.args, &runtime);
+        self.run_prompt_workflow_single(cwd, &run).await
+    }
+
+    /// /chain-prompts — the same recipes [`Self::slash_prompt_workflow`] runs, chained by an
+    /// inline ` -> ` declaration (pi `prompt-workflows.ts:303-329` @v0.34.0).
+    async fn slash_chain_prompts(&self, args: &str, cwd: &Path) -> Result<String, SubagentError> {
+        let (declaration, args_text) = prompt_workflows::split_chain_declaration(args);
+        let workflows = prompt_workflows::discover_prompt_workflows(cwd);
+        // pi `:308-311`: an empty declaration, or the literal `list`, prints the list.
+        if declaration.is_empty() || declaration == "list" {
+            return Ok(prompt_workflows::format_workflow_list(&workflows));
+        }
+        let runtime =
+            prompt_workflows::parse_runtime_options(&prompt_workflows::shell_words(&args_text));
+        let names = prompt_workflows::split_prompt_chain(&declaration);
+        if names.is_empty() {
+            // pi `:315` — the usage line, verbatim.
+            return Err(SubagentError::MalformedSettings(
+                "Usage: /chain-prompts prompt-a -> prompt-b -- args".to_string(),
+            ));
+        }
+        let steps = prompt_workflows::build_chain_steps(
+            &workflows,
+            &names,
+            &runtime.args,
+            &runtime,
+            None,
+        )
+        .map_err(SubagentError::MalformedSettings)?;
+        self.run_prompt_workflow_chain(cwd, steps, &runtime).await
     }
 
     // ---------------------------------------------------------------------------------------

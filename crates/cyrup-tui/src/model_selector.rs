@@ -191,7 +191,7 @@ impl ModelSelector {
         if self.cursor == 0 {
             return;
         }
-        if let Some(ch) = self.query[..self.cursor].chars().next_back() {
+        if let Some(ch) = self.query.get(..self.cursor).and_then(|s| s.chars().next_back()) {
             let start = self.cursor - ch.len_utf8();
             self.query.replace_range(start..self.cursor, "");
             self.cursor = start;

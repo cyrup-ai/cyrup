@@ -20,7 +20,13 @@
 //! structural, the same shape as `cyrup-session-svc/src/tests/compaction_tokens_after.rs` and
 //! `cyrup-ext-subagents/src/extension.rs`'s own `include_str!` checks. It fails on a `select!` that
 //! races `cancel.cancelled()` without `biased;`, whoever writes it and whenever.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 /// `app.rs` verbatim, at compile time.
 const APP_SRC: &str = include_str!("../app/run.rs");

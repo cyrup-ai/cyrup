@@ -5,6 +5,7 @@
 
 use std::time::Duration;
 
+use cyrup_core::CancelToken;
 
 use crate::exec::ndjson::SubagentEvent;
 use crate::exec::output::{
@@ -159,6 +160,360 @@ fn is_sole_structured_output_tool_call(event: &SubagentEvent) -> bool {
             == Some("structured_output")
 }
 
+
+/// The witnesses [`drive_attempt`]'s read loop accumulates across iterations and hands to every
+/// [`DriveOutcome`] it can settle with, gathered into one value so the loop's arms — and the
+/// helpers they delegate to — thread one `&mut` rather than six separate locals.
+struct DriveState {
+    /// Armed on the FIRST terminal assistant stop; once the grace window elapses without the child
+    /// exiting, the child is force-drained.
+    final_drain_at: Option<tokio::time::Instant>,
+    /// SUBA-S06: armed when the child is reaped with stdout still open; expiring it ends the read
+    /// loop so the post-loop `wait_final_drain()` can report the already-known exit status.
+    exit_drain_at: Option<tokio::time::Instant>,
+    /// Accumulates across every terminal stop (pi's `||=`) for `forcedDrainAfterFinalSuccess`.
+    clean_terminal_stop: bool,
+    /// pi's `agentSettledReceived` (`execution.ts:595,862,1080` @v0.43.0): the child announced the WHOLE run
+    /// settled. Like [`Self::clean_terminal_stop`] it is a "the child finished on purpose" witness,
+    /// so a forced drain after it is still coerced to success.
+    agent_settled: bool,
+    /// R-SA-037: set once the child's NDJSON shows a blocking `contact_supervisor` ask; the ask is
+    /// surfaced via `spawn_clarify` exactly once (the guard in [`handle_child_line`]), and this flag
+    /// then rides out to the attempt's `detached` outcome (bypassing acceptance; the ladder does
+    /// not advance past it).
+    detached_seen: bool,
+    /// SUBA-008 — pi's four `updateTurnBudget` locals (`turnBudgetSoftReached` plus the three
+    /// `result.turnBudget*` fields, `execution.ts:483`/`:567-569`/`:759-782`), gathered into one
+    /// value. Unarmed (and therefore inert on every path below) unless this run declared a budget.
+    turn_budget: crate::exec::turn_budget::TurnBudgetTracker,
+}
+
+/// Which of [`drive_attempt`]'s exit paths is settling the attempt — the ONLY thing that differs
+/// between its otherwise identical [`DriveOutcome`] constructions, and therefore the only argument
+/// [`DriveState::outcome`] needs beyond the exit status itself.
+#[derive(Clone, Copy)]
+enum Settled {
+    /// The child exited (or closed stdout) on its own, or the `wait()`/read itself faulted: none of
+    /// the three special conditions applies.
+    Exited,
+    /// A hard `RunOptions.cancel` fired.
+    Cancelled,
+    /// `RunOptions.interrupt` fired (pi's soft interrupt, `execution.ts:722-745`) — the paused-
+    /// success path, distinct from a timeout or a hard cancel.
+    Interrupted,
+    /// R-SA-036: the orchestrator's own wall-clock deadline expired. `timed_out` is what
+    /// `run_fallback_ladder` (R-SA-036/6.3.2) actually branches on to stop the ladder outright.
+    TimedOut,
+    /// The child had to be force-drained through the real signal ladder. Whether that is coerced
+    /// back to success (`forcedDrainAfterFinalSuccess`) is decided in `run_attempt` from
+    /// `forced_termination` + `clean_terminal_stop` + no error.
+    ForcedDrain,
+    /// SUBA-008: a turn-budget abort. NOT a forced drain — `forcedDrainAfterFinalSuccess` must
+    /// never coerce a turn-budget abort to exit 0.
+    TurnBudgetAbort,
+    /// pi `failProtocol`: NOT a forced *drain* either — upstream deliberately does not set
+    /// `forcedTerminationSignal`, so the clean-drain coercion to exit 0 cannot swallow a protocol
+    /// failure. (It could not anyway — that coercion also requires no error, and this sets one.)
+    ProtocolFailure,
+}
+
+impl DriveState {
+    fn new(opts: &RunOptions) -> Self {
+        Self {
+            final_drain_at: None,
+            exit_drain_at: None,
+            clean_terminal_stop: false,
+            agent_settled: false,
+            detached_seen: false,
+            turn_budget: crate::exec::turn_budget::TurnBudgetTracker::new(
+                opts.turn_budget,
+                opts.enforce_hard_turn_limit,
+            ),
+        }
+    }
+
+    /// Settle the attempt: every witness accumulated so far rides out onto the [`DriveOutcome`],
+    /// and `reason` supplies the three flags that tell one exit path from another.
+    fn outcome(
+        &self,
+        reason: Settled,
+        exit_status: std::io::Result<Option<std::process::ExitStatus>>,
+    ) -> DriveOutcome {
+        DriveOutcome {
+            timed_out: matches!(reason, Settled::TimedOut),
+            interrupted: matches!(reason, Settled::Interrupted),
+            forced_termination: matches!(reason, Settled::ForcedDrain),
+            clean_terminal_stop: self.clean_terminal_stop,
+            exit_status,
+            detached: self.detached_seen,
+            agent_settled: self.agent_settled,
+            protocol_error: None,
+            turn_budget: self.turn_budget.clone(),
+        }
+    }
+}
+
+/// What [`handle_child_line`] tells the drive loop to do once one NDJSON line has been folded in.
+enum LineAction {
+    /// Keep reading the child's stdout.
+    Continue,
+    /// SUBA-008 — the run's turn budget is exhausted and pi's terminal `message` has been composed:
+    /// the drive loop must abort the child through [`turn_budget_abort`].
+    TurnBudgetAbort(String),
+}
+
+/// A timer that fires at `at`, or never fires at all while the window is unarmed.
+///
+/// A fresh `sleep_until` against the fixed instant on each loop iteration is correct: it always
+/// resolves at the same absolute time regardless of how often it is reconstructed, and reduces to
+/// `pending()` (never fires) until the window is armed.
+async fn pending_until(at: Option<tokio::time::Instant>) {
+    match at {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// One NDJSON line off the child's stdout: tee it to the live sink, parse it exactly once, fold it
+/// into the terminal-stop/settled witnesses, arm or disarm the final-stop grace window, surface a
+/// blocking `contact_supervisor` ask, feed the control heuristics, and record it on `progress`.
+/// Returns what the drive loop should do next.
+fn handle_child_line(
+    line: &str,
+    state: &mut DriveState,
+    progress: &mut AgentProgress,
+    control: &mut crate::exec::control::ControlMonitor,
+    opts: &RunOptions,
+) -> LineAction {
+    // NOTE: the raw NDJSON envelope deliberately does NOT enter `progress.recent_output` — pi
+    // appends only EXTRACTED text, from an assistant `message_end`'s content and a finished tool
+    // call's result, and `AgentProgress::record_event` does exactly that a few lines below. A raw
+    // line here would put an unrenderable (and, before `RECENT_OUTPUT_LINE_CHARS`, unbounded) JSON
+    // blob on the very field `SingleResult::progress` publishes as pi's `recentOutput`.
+    // Live-telemetry tee (pi's child-event pump, `subagent-runner.ts:1430`): hand the raw NDJSON
+    // line to the background runner's sink, if one is installed, BEFORE this module parses/folds it
+    // — so the runner folds it into `status.json` live without this module depending on
+    // `background`.
+    if let Some(sink) = &opts.live_events {
+        sink.emit(line);
+    }
+    // `SpawnedChild::next_event_or_exit` tees and hands back the raw line without parsing it —
+    // `exec::ndjson::parse_line` is the crate's ONE NDJSON parse, so each child stdout line is
+    // deserialized exactly once, here, against the single `SubagentEvent` schema (final-output
+    // extraction, R-SA-029; completion-guard scanning, R-SA-034).
+    let Some(event) = crate::exec::ndjson::parse_line(line) else {
+        return LineAction::Continue;
+    };
+    // Final-stop grace-drain (pi `startFinalDrain`, execution.ts:584-605): open the grace window on
+    // the FIRST terminal assistant stop and track whether ANY terminal stop was clean (no
+    // errorMessage) for `forcedDrainAfterFinalSuccess`.
+    let terminal_stop = is_terminal_assistant_stop(&event);
+    if terminal_stop {
+        state.clean_terminal_stop =
+            state.clean_terminal_stop || !message_end_has_error_message(&event);
+    }
+    if matches!(event, crate::exec::ndjson::SubagentEvent::AgentSettled) {
+        state.agent_settled = true;
+    }
+    // pi `applyChildLifecycle(projectChildLifecycle(evt))` — run for EVERY event
+    // (`execution.ts:844`), plus the terminal-stop form at `:947`. The three arms are:
+    // `agent_end{willRetry:true}` DISARMS the window (the child is about to retry — force-killing
+    // it there kills a run that is still working); `agent_settled` and a terminal assistant stop
+    // ARM it; everything else leaves it alone.
+    let will_retry = matches!(
+        event,
+        crate::exec::ndjson::SubagentEvent::AgentEnd {
+            will_retry: true,
+            ..
+        }
+    );
+    match crate::exec::child_protocol::project_child_lifecycle(
+        event.kind(),
+        will_retry,
+        terminal_stop,
+    ) {
+        crate::exec::child_protocol::ChildLifecycleAction::CancelDrain => {
+            state.final_drain_at = None;
+        }
+        crate::exec::child_protocol::ChildLifecycleAction::StartDrain => {
+            if state.final_drain_at.is_none() {
+                state.final_drain_at =
+                    Some(tokio::time::Instant::now() + Duration::from_millis(FINAL_STOP_GRACE_MS));
+            }
+        }
+        crate::exec::child_protocol::ChildLifecycleAction::None => {}
+    }
+    // R-SA-037 detach-trigger arm: a child's blocking `contact_supervisor` ask
+    // (`need_decision`/`interview`) surfaces the ask to the parent's human via the real
+    // `ClarifyChannel` (fired exactly once) and marks this attempt detached. The intercom answer
+    // routes back to the still-alive child over the BROKER (independent of this stdout pipe), so
+    // the loop keeps driving — it neither kills nor synchronously blocks on the child.
+    if !state.detached_seen
+        && let Some(prompt) = contact_supervisor_block_prompt(&event)
+    {
+        state.detached_seen = true;
+        if let Some(dispatch) = &opts.clarify {
+            // Dropping the returned receiver does not cancel the ask (a human may still be
+            // answering); it only means this loop does not itself await the outcome — the child
+            // unblocks over the broker instead.
+            let _rx = crate::tui::intercom::spawn_clarify(
+                dispatch.lock.clone(),
+                dispatch.session_key.clone(),
+                crate::tui::intercom::ClarifyRequest {
+                    run_id: dispatch.run_id.clone(),
+                    step_index: dispatch.step_index,
+                    prompt,
+                },
+            );
+        }
+    }
+    // pi `processLine` (`execution.ts:775-890`): every parsed child event is fresh activity for the
+    // control heuristics, and the tool-start / tool-result / assistant-turn folds feed the
+    // thresholds. Driven BEFORE `record_event` because that consumes the event by value.
+    control.observe_event(&event, crate::time::now_epoch_millis());
+    // SUBA-008 — the two per-message inputs `updateTurnBudget` needs, read BEFORE `record_event`
+    // consumes the event by value (same reason the control fold above runs here).
+    let assistant_turn = is_assistant_message_end(&event);
+    let has_tool_call = message_end_has_tool_call(&event);
+    let terminal_structured_output_call =
+        opts.structured_output_schema.is_some() && is_sole_structured_output_tool_call(&event);
+    progress.record_event(event);
+
+    // pi `execution.ts:910-924`: an ASSISTANT `message_end` is one turn, and the budget is
+    // re-evaluated on it. `progress.turn_count()` is this port's `result.usage.turns` — pi keeps
+    // the two in lockstep (`:913-914`) and cyrup derives the one from the other rather than
+    // carrying a second counter that could drift.
+    if assistant_turn && state.turn_budget.is_armed() {
+        return observe_turn_budget(
+            state,
+            progress,
+            terminal_stop || terminal_structured_output_call,
+            has_tool_call,
+        );
+    }
+    LineAction::Continue
+}
+
+/// SUBA-008 — re-evaluate the run's turn budget against the assistant turn just recorded (pi's
+/// `updateTurnBudget`, `execution.ts:759-782`). `terminal_turn` is pi's second argument, the
+/// terminal-stop OR sole-`structured_output`-call disjunction its caller composes.
+fn observe_turn_budget(
+    state: &mut DriveState,
+    progress: &mut AgentProgress,
+    terminal_turn: bool,
+    has_tool_call: bool,
+) -> LineAction {
+    let turn_count = u64::from(progress.turn_count());
+    // pi's third argument: `hasToolCall || Boolean(progress.currentTool)` (`:924`) — tool work
+    // either STARTING on this very message or still in flight from an earlier one. This is what
+    // makes the deferral arm reachable.
+    let tool_work_active_or_starting = has_tool_call || progress.current_tool.is_some();
+    let effect = state.turn_budget.observe_assistant_turn(
+        turn_count,
+        terminal_turn,
+        tool_work_active_or_starting,
+        false,
+    );
+    match effect {
+        crate::exec::turn_budget::TurnBudgetEffect::None => LineAction::Continue,
+        crate::exec::turn_budget::TurnBudgetEffect::SoftNote(note) => {
+            // pi `appendRecentOutput(progress, [turnBudgetSoftNote(...)])` (`:769`) — the wrap-up
+            // request reaches the operator through the run's own output tail, once.
+            progress.append_recent_output(&note);
+            LineAction::Continue
+        }
+        crate::exec::turn_budget::TurnBudgetEffect::Abort { message, soft_note } => {
+            if let Some(note) = soft_note {
+                progress.append_recent_output(&note);
+            }
+            LineAction::TurnBudgetAbort(message)
+        }
+    }
+}
+
+/// pi `requestTurnBudgetAbort` (`:733-757`): SIGINT now, SIGTERM 1 s later, SIGKILL 4 s after the
+/// SIGINT. That is exactly this ladder with the two graces pinned — 1 s to escalate off SIGINT and
+/// 3 s more to escalate off SIGTERM lands the kill at t+4 s, upstream's own instant.
+///
+/// [CYRUP-DELTA]: pi ARMS the two timers and lets the run keep reading the child's stdout in the
+/// meantime, so a child that wraps up inside the window still delivers its final output; this
+/// ladder blocks the drive loop for the same wall-clock window instead, because
+/// [`SpawnedChild::terminate`] consumes the child and cyrup has no seam that signals without taking
+/// it. The observed outcome is the same on both timelines — the child either dies on SIGINT (the
+/// ladder returns immediately) or is escalated on upstream's schedule — but a late final message
+/// written after the SIGINT is dropped here where upstream would have read it, which is why the
+/// abort message doubles as `final_output` in `run_attempt`.
+async fn turn_budget_abort(
+    child: SpawnedChild,
+    cancel: &CancelToken,
+    message: String,
+    state: &DriveState,
+) -> DriveOutcome {
+    let outcome = child
+        .terminate_with_graces(
+            cancel,
+            crate::spawn::signal::EscalationGraces {
+                sigint: Duration::from_millis(
+                    crate::exec::turn_budget::TURN_BUDGET_TERMINATION_DELAY_MS,
+                ),
+                sigterm: Duration::from_millis(
+                    crate::exec::turn_budget::TURN_BUDGET_HARD_KILL_DELAY_MS
+                        - crate::exec::turn_budget::TURN_BUDGET_TERMINATION_DELAY_MS,
+                ),
+            },
+        )
+        .await;
+    // `message` is not carried on the outcome: it is recomputed verbatim from the tracker's own
+    // state by `TurnBudgetTracker::terminal_note`, which is the single place `run_attempt` reads it
+    // from, so there is exactly one producer of upstream's string.
+    debug_assert_eq!(
+        state.turn_budget.terminal_note(),
+        Some(crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(
+            message.clone()
+        ))
+    );
+    drop(message);
+    state.outcome(Settled::TurnBudgetAbort, outcome.map(|o| Some(o.status)))
+}
+
+/// pi `failProtocol` (`execution.ts:1026-1041`): the diagnostic becomes the run's error and the
+/// child is signalled down (upstream SIGTERM then, 3s later, SIGKILL — cyrup routes every forced
+/// termination through [`SpawnedChild::terminate`]'s own SIGINT->SIGTERM->SIGKILL ladder instead of
+/// inventing a second one). Nothing further can be read: the reader is permanently closed, so
+/// continuing to poll it would spin on `Eof`.
+async fn protocol_limit_outcome(
+    child: SpawnedChild,
+    cancel: &CancelToken,
+    limit: crate::exec::child_protocol::ProtocolOutputLimit,
+    state: &DriveState,
+) -> DriveOutcome {
+    let outcome = child.terminate(cancel).await;
+    DriveOutcome {
+        protocol_error: Some(limit),
+        ..state.outcome(Settled::ProtocolFailure, outcome.map(|o| Some(o.status)))
+    }
+}
+
+/// SUBA-S06: the process is gone but stdout is STILL OPEN, because a surviving grandchild inherited
+/// the write end. The EOF the read loop used to wait on can never arrive, and none of the other
+/// select arms is guaranteed to fire either — the deadline arm only exists when the caller passed a
+/// timeout, the final-drain arm only after a terminal assistant stop the child never emitted, and
+/// the activity tick merely re-scores heuristics. So the tool call hung forever, spinning once a
+/// second.
+///
+/// Do NOT break the read loop on this step: lines written before the exit may still be buffered in
+/// the pipe, and dropping them would trade a hang for silent output loss. This arms a bounded
+/// post-exit window instead and the loop keeps draining; the status itself is deliberately
+/// discarded because the post-loop `wait_final_drain()` re-reads it (the child is marked reaped, so
+/// that call returns immediately) and routes it through the ONE existing clean path — which is what
+/// keeps this a normal exit rather than a `forced_termination`.
+fn arm_post_exit_drain(state: &mut DriveState) {
+    if state.exit_drain_at.is_none() {
+        state.exit_drain_at =
+            Some(tokio::time::Instant::now() + Duration::from_millis(POST_EXIT_DRAIN_MS));
+    }
+}
+
 /// Drive one spawned child to completion, folding every NDJSON line into `progress` (R-SA-027/028)
 /// and racing the whole read loop against `opts.cancel`/`opts.interrupt`/an optional deadline
 /// timer, plus the final-stop grace-drain window (pi `execution.ts:333-367`, T3 group A). Returns a
@@ -193,29 +548,7 @@ pub(crate) async fn drive_attempt(
         tokio::time::interval_at(tokio::time::Instant::now() + period, period)
     });
 
-    // Armed on the FIRST terminal assistant stop; once the grace window elapses without the child
-    // exiting, the child is force-drained. `clean_terminal_stop` accumulates across every terminal
-    // stop (pi's `||=`) for `forcedDrainAfterFinalSuccess`.
-    let mut final_drain_at: Option<tokio::time::Instant> = None;
-    // SUBA-S06: armed when the child is reaped with stdout still open; expiring it ends the read
-    // loop so the post-loop `wait_final_drain()` can report the already-known exit status.
-    let mut exit_drain_at: Option<tokio::time::Instant> = None;
-    let mut clean_terminal_stop = false;
-    // pi's `agentSettledReceived` (`execution.ts:595,862,1080` @v0.43.0): the child announced the WHOLE run
-    // settled. Like `clean_terminal_stop` it is a "the child finished on purpose" witness, so a
-    // forced drain after it is still coerced to success.
-    let mut agent_settled = false;
-    // R-SA-037: set once the child's NDJSON shows a blocking `contact_supervisor` ask; the ask is
-    // surfaced via `spawn_clarify` exactly once (the guard below), and this flag then rides out to
-    // the attempt's `detached` outcome (bypassing acceptance; the ladder does not advance past it).
-    let mut detached_seen = false;
-    // SUBA-008 — pi's four `updateTurnBudget` locals (`turnBudgetSoftReached` plus the three
-    // `result.turnBudget*` fields, `execution.ts:483`/`:567-569`/`:759-782`), gathered into one
-    // value. Unarmed (and therefore inert on every path below) unless this run declared a budget.
-    let mut turn_budget = crate::exec::turn_budget::TurnBudgetTracker::new(
-        opts.turn_budget,
-        opts.enforce_hard_turn_limit,
-    );
+    let mut state = DriveState::new(opts);
 
     loop {
         let deadline_arm = async {
@@ -224,40 +557,14 @@ pub(crate) async fn drive_attempt(
                 None => std::future::pending::<()>().await,
             }
         };
-        // A fresh `sleep_until` against the fixed grace instant each iteration is correct: it
-        // always resolves at the same absolute time regardless of how often it is reconstructed,
-        // and reduces to `pending()` (never fires) until the window is armed.
-        let final_drain_arm = async {
-            match final_drain_at {
-                Some(at) => tokio::time::sleep_until(at).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
-
-        // SUBA-S06: same fixed-instant reconstruction as `final_drain_arm` above, and `pending()`
-        // (never fires) until the child is actually reaped.
-        let exit_drain_arm = async {
-            match exit_drain_at {
-                Some(at) => tokio::time::sleep_until(at).await,
-                None => std::future::pending::<()>().await,
-            }
-        };
+        let final_drain_arm = pending_until(state.final_drain_at);
+        let exit_drain_arm = pending_until(state.exit_drain_at);
 
         tokio::select! {
             biased;
             () = cancel.cancelled() => {
                 let outcome = child.terminate(&cancel).await;
-                return DriveOutcome {
-                    timed_out: false,
-                    interrupted: false,
-                    forced_termination: false,
-                    clean_terminal_stop,
-                    exit_status: outcome.map(|o| Some(o.status)),
-                    detached: detached_seen,
-                    agent_settled,
-                    protocol_error: None,
-                    turn_budget: turn_budget.clone(),
-                };
+                return state.outcome(Settled::Cancelled, outcome.map(|o| Some(o.status)));
             }
             () = interrupt.cancelled() => {
                 // pi `execution.ts:1090`: a soft interrupt CLEARS the activity state, so a
@@ -266,17 +573,7 @@ pub(crate) async fn drive_attempt(
                 // transcript for a run the caller has already deliberately paused.
                 control.clear_activity_state();
                 let outcome = child.terminate(&cancel).await;
-                return DriveOutcome {
-                    timed_out: false,
-                    interrupted: true,
-                    forced_termination: false,
-                    clean_terminal_stop,
-                    exit_status: outcome.map(|o| Some(o.status)),
-                    detached: detached_seen,
-                    agent_settled,
-                    protocol_error: None,
-                    turn_budget: turn_budget.clone(),
-                };
+                return state.outcome(Settled::Interrupted, outcome.map(|o| Some(o.status)));
             }
             () = deadline_arm => {
                 // R-SA-036: timeout is a SOFT interrupt, not an immediate hard kill — it still
@@ -285,280 +582,27 @@ pub(crate) async fn drive_attempt(
                 // cancellation is the `timed_out: true` flag, which is what `run_fallback_ladder`
                 // (R-SA-036/6.3.2) actually branches on to stop the ladder outright.
                 let outcome = child.terminate(&cancel).await;
-                return DriveOutcome {
-                    timed_out: true,
-                    interrupted: false,
-                    forced_termination: false,
-                    clean_terminal_stop,
-                    exit_status: outcome.map(|o| Some(o.status)),
-                    detached: detached_seen,
-                    agent_settled,
-                    protocol_error: None,
-                    turn_budget: turn_budget.clone(),
-                };
+                return state.outcome(Settled::TimedOut, outcome.map(|o| Some(o.status)));
             }
             step = child.next_event_or_exit() => {
                 match step {
                     crate::spawn::ChildStep::Line(Ok(line)) => {
-                        // NOTE: the raw NDJSON envelope deliberately does NOT enter
-                        // `progress.recent_output` — pi appends only EXTRACTED text, from an
-                        // assistant `message_end`'s content and a finished tool call's result, and
-                        // `AgentProgress::record_event` does exactly that a few lines below. A raw
-                        // line here would put an unrenderable (and, before
-                        // `RECENT_OUTPUT_LINE_CHARS`, unbounded) JSON blob on the very field
-                        // `SingleResult::progress` publishes as pi's `recentOutput`.
-                        // Live-telemetry tee (pi's child-event pump, `subagent-runner.ts:1430`):
-                        // hand the raw NDJSON line to the background runner's sink, if one is
-                        // installed, BEFORE this module parses/folds it — so the runner folds it
-                        // into `status.json` live without this module depending on `background`.
-                        if let Some(sink) = &opts.live_events {
-                            sink.emit(&line);
-                        }
-                        // `SpawnedChild::next_event_or_exit` tees and hands back the raw line
-                        // without parsing it — `exec::ndjson::parse_line` is the crate's ONE
-                        // NDJSON parse, so each child stdout line is deserialized exactly once,
-                        // here, against the single `SubagentEvent` schema (final-output
-                        // extraction, R-SA-029; completion-guard scanning, R-SA-034).
-                        if let Some(event) = crate::exec::ndjson::parse_line(&line) {
-                            // Final-stop grace-drain (pi `startFinalDrain`, execution.ts:584-605):
-                            // open the grace window on the FIRST terminal assistant stop and track
-                            // whether ANY terminal stop was clean (no errorMessage) for
-                            // `forcedDrainAfterFinalSuccess`.
-                            let terminal_stop = is_terminal_assistant_stop(&event);
-                            if terminal_stop {
-                                clean_terminal_stop =
-                                    clean_terminal_stop || !message_end_has_error_message(&event);
-                            }
-                            if matches!(event, crate::exec::ndjson::SubagentEvent::AgentSettled) {
-                                agent_settled = true;
-                            }
-                            // pi `applyChildLifecycle(projectChildLifecycle(evt))` — run for EVERY
-                            // event (`execution.ts:844`), plus the terminal-stop form at `:947`.
-                            // The three arms are: `agent_end{willRetry:true}` DISARMS the window
-                            // (the child is about to retry — force-killing it there kills a run
-                            // that is still working); `agent_settled` and a terminal assistant stop
-                            // ARM it; everything else leaves it alone.
-                            let will_retry = matches!(
-                                event,
-                                crate::exec::ndjson::SubagentEvent::AgentEnd {
-                                    will_retry: true,
-                                    ..
-                                }
-                            );
-                            match crate::exec::child_protocol::project_child_lifecycle(
-                                event.kind(),
-                                will_retry,
-                                terminal_stop,
-                            ) {
-                                crate::exec::child_protocol::ChildLifecycleAction::CancelDrain => {
-                                    final_drain_at = None;
-                                }
-                                crate::exec::child_protocol::ChildLifecycleAction::StartDrain => {
-                                    if final_drain_at.is_none() {
-                                        final_drain_at = Some(
-                                            tokio::time::Instant::now()
-                                                + Duration::from_millis(FINAL_STOP_GRACE_MS),
-                                        );
-                                    }
-                                }
-                                crate::exec::child_protocol::ChildLifecycleAction::None => {}
-                            }
-                            // R-SA-037 detach-trigger arm: a child's blocking `contact_supervisor`
-                            // ask (`need_decision`/`interview`) surfaces the ask to the parent's
-                            // human via the real `ClarifyChannel` (fired exactly once) and marks this
-                            // attempt detached. The intercom answer routes back to the still-alive
-                            // child over the BROKER (independent of this stdout pipe), so the loop
-                            // keeps driving — it neither kills nor synchronously blocks on the child.
-                            if !detached_seen
-                                && let Some(prompt) = contact_supervisor_block_prompt(&event)
-                            {
-                                detached_seen = true;
-                                if let Some(dispatch) = &opts.clarify {
-                                    // Dropping the returned receiver does not cancel the ask (a human
-                                    // may still be answering); it only means this loop does not itself
-                                    // await the outcome — the child unblocks over the broker instead.
-                                    let _rx = crate::tui::intercom::spawn_clarify(
-                                        dispatch.lock.clone(),
-                                        dispatch.session_key.clone(),
-                                        crate::tui::intercom::ClarifyRequest {
-                                            run_id: dispatch.run_id.clone(),
-                                            step_index: dispatch.step_index,
-                                            prompt,
-                                        },
-                                    );
-                                }
-                            }
-                            // pi `processLine` (`execution.ts:775-890`): every parsed child event
-                            // is fresh activity for the control heuristics, and the tool-start /
-                            // tool-result / assistant-turn folds feed the thresholds. Driven
-                            // BEFORE `record_event` because that consumes the event by value.
-                            control.observe_event(
-                                &event,
-                                crate::time::now_epoch_millis(),
-                            );
-                            // SUBA-008 — the two per-message inputs `updateTurnBudget` needs, read
-                            // BEFORE `record_event` consumes the event by value (same reason the
-                            // control fold above runs here).
-                            let assistant_turn = is_assistant_message_end(&event);
-                            let has_tool_call = message_end_has_tool_call(&event);
-                            let terminal_structured_output_call = opts
-                                .structured_output_schema
-                                .is_some()
-                                && is_sole_structured_output_tool_call(&event);
-                            progress.record_event(event);
-
-                            // pi `execution.ts:910-924`: an ASSISTANT `message_end` is one turn,
-                            // and the budget is re-evaluated on it. `progress.turn_count()` is
-                            // this port's `result.usage.turns` — pi keeps the two in lockstep
-                            // (`:913-914`) and cyrup derives the one from the other rather than
-                            // carrying a second counter that could drift.
-                            if assistant_turn && turn_budget.is_armed() {
-                                let turn_count = u64::from(progress.turn_count());
-                                // pi's third argument: `hasToolCall || Boolean(progress.currentTool)`
-                                // (`:924`) — tool work either STARTING on this very message or
-                                // still in flight from an earlier one. This is what makes the
-                                // deferral arm reachable.
-                                let tool_work_active_or_starting =
-                                    has_tool_call || progress.current_tool.is_some();
-                                let effect = turn_budget.observe_assistant_turn(
-                                    turn_count,
-                                    terminal_stop || terminal_structured_output_call,
-                                    tool_work_active_or_starting,
-                                    false,
-                                );
-                                match effect {
-                                    crate::exec::turn_budget::TurnBudgetEffect::None => {}
-                                    crate::exec::turn_budget::TurnBudgetEffect::SoftNote(note) => {
-                                        // pi `appendRecentOutput(progress, [turnBudgetSoftNote(...)])`
-                                        // (`:769`) — the wrap-up request reaches the operator
-                                        // through the run's own output tail, once.
-                                        progress.append_recent_output(&note);
-                                    }
-                                    crate::exec::turn_budget::TurnBudgetEffect::Abort {
-                                        message,
-                                        soft_note,
-                                    } => {
-                                        if let Some(note) = soft_note {
-                                            progress.append_recent_output(&note);
-                                        }
-                                        // pi `requestTurnBudgetAbort` (`:733-757`): SIGINT now,
-                                        // SIGTERM 1 s later, SIGKILL 4 s after the SIGINT. That is
-                                        // exactly this ladder with the two graces pinned — 1 s to
-                                        // escalate off SIGINT and 3 s more to escalate off SIGTERM
-                                        // lands the kill at t+4 s, upstream's own instant.
-                                        //
-                                        // [CYRUP-DELTA]: pi ARMS the two timers and lets the run
-                                        // keep reading the child's stdout in the meantime, so a
-                                        // child that wraps up inside the window still delivers its
-                                        // final output; this ladder blocks the drive loop for the
-                                        // same wall-clock window instead, because
-                                        // `SpawnedChild::terminate` consumes the child and cyrup
-                                        // has no seam that signals without taking it. The observed
-                                        // outcome is the same on both timelines — the child either
-                                        // dies on SIGINT (the ladder returns immediately) or is
-                                        // escalated on upstream's schedule — but a late final
-                                        // message written after the SIGINT is dropped here where
-                                        // upstream would have read it, which is why the abort
-                                        // message doubles as `final_output` below.
-                                        let outcome = child
-                                            .terminate_with_graces(
-                                                &cancel,
-                                                crate::spawn::signal::EscalationGraces {
-                                                    sigint: Duration::from_millis(
-                                                        crate::exec::turn_budget::TURN_BUDGET_TERMINATION_DELAY_MS,
-                                                    ),
-                                                    sigterm: Duration::from_millis(
-                                                        crate::exec::turn_budget::TURN_BUDGET_HARD_KILL_DELAY_MS
-                                                            - crate::exec::turn_budget::TURN_BUDGET_TERMINATION_DELAY_MS,
-                                                    ),
-                                                },
-                                            )
-                                            .await;
-                                        // `message` is not carried on the outcome: it is
-                                        // recomputed verbatim from the tracker's own state by
-                                        // `TurnBudgetTracker::terminal_note`, which is the single
-                                        // place `run_attempt` reads it from, so there is exactly
-                                        // one producer of upstream's string.
-                                        debug_assert_eq!(
-                                            turn_budget.terminal_note(),
-                                            Some(
-                                                crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(
-                                                    message.clone()
-                                                )
-                                            )
-                                        );
-                                        drop(message);
-                                        return DriveOutcome {
-                                            timed_out: false,
-                                            interrupted: false,
-                                            // NOT a forced drain: `forcedDrainAfterFinalSuccess`
-                                            // must never coerce a turn-budget abort to exit 0.
-                                            forced_termination: false,
-                                            clean_terminal_stop,
-                                            exit_status: outcome.map(|o| Some(o.status)),
-                                            detached: detached_seen,
-                                            agent_settled,
-                                            protocol_error: None,
-                                            turn_budget,
-                                        };
-                                    }
-                                }
+                        match handle_child_line(&line, &mut state, progress, control, opts) {
+                            LineAction::Continue => {}
+                            LineAction::TurnBudgetAbort(message) => {
+                                return turn_budget_abort(child, &cancel, message, &state).await;
                             }
                         }
                     }
                     crate::spawn::ChildStep::ProtocolLimit(limit) => {
-                        // pi `failProtocol` (`execution.ts:1026-1041`): the diagnostic becomes the
-                        // run's error and the child is signalled down (upstream SIGTERM then, 3s
-                        // later, SIGKILL — cyrup routes every forced termination through
-                        // `terminate`'s own SIGINT->SIGTERM->SIGKILL ladder instead of inventing a
-                        // second one). Nothing further can be read: the reader is permanently
-                        // closed, so continuing to poll it would spin on `Eof`.
-                        let outcome = child.terminate(&cancel).await;
-                        return DriveOutcome {
-                            timed_out: false,
-                            interrupted: false,
-                            // NOT a forced *drain*: upstream's `failProtocol` deliberately does not
-                            // set `forcedTerminationSignal`, so the clean-drain coercion to exit 0
-                            // cannot swallow a protocol failure. (It could not anyway — that
-                            // coercion also requires no error, and this sets one.)
-                            forced_termination: false,
-                            clean_terminal_stop,
-                            exit_status: outcome.map(|o| Some(o.status)),
-                            detached: detached_seen,
-                            agent_settled,
-                            protocol_error: Some(limit),
-                            turn_budget: turn_budget.clone(),
-                        };
+                        return protocol_limit_outcome(child, &cancel, limit, &state).await;
                     }
                     crate::spawn::ChildStep::Line(Err(_)) | crate::spawn::ChildStep::Eof => {
                         // Stdout EOF (child exited/closed stdout) or a genuine read fault — either
                         // way, stop reading and wait for the real exit status below.
                         break;
                     }
-                    crate::spawn::ChildStep::Exited(_) => {
-                        // SUBA-S06: the process is gone but stdout is STILL OPEN, because a
-                        // surviving grandchild inherited the write end. The EOF this loop used to
-                        // wait on can never arrive, and none of the other arms is guaranteed to
-                        // fire either — `deadline_arm` only exists when the caller passed a
-                        // timeout, `final_drain_arm` only after a terminal assistant stop the
-                        // child never emitted, and the activity tick merely re-scores heuristics.
-                        // So the tool call hung forever, spinning once a second.
-                        //
-                        // Do NOT break here: lines written before the exit may still be buffered
-                        // in the pipe, and dropping them would trade a hang for silent output
-                        // loss. Arm a bounded post-exit window instead and keep draining; the
-                        // status itself is deliberately discarded because the post-loop
-                        // `wait_final_drain()` re-reads it (the child is marked reaped, so that
-                        // call returns immediately) and routes it through the ONE existing clean
-                        // path — which is what keeps this a normal exit rather than a
-                        // `forced_termination`.
-                        if exit_drain_at.is_none() {
-                            exit_drain_at = Some(
-                                tokio::time::Instant::now()
-                                    + Duration::from_millis(POST_EXIT_DRAIN_MS),
-                            );
-                        }
-                    }
+                    crate::spawn::ChildStep::Exited(_) => arm_post_exit_drain(&mut state),
                 }
             }
             () = exit_drain_arm => {
@@ -573,17 +617,7 @@ pub(crate) async fn drive_attempt(
                 // this is coerced back to success (`forcedDrainAfterFinalSuccess`) is decided in
                 // `run_attempt` from `forced_termination` + `clean_terminal_stop` + no error.
                 let outcome = child.terminate(&cancel).await;
-                return DriveOutcome {
-                    timed_out: false,
-                    interrupted: false,
-                    forced_termination: true,
-                    clean_terminal_stop,
-                    exit_status: outcome.map(|o| Some(o.status)),
-                    detached: detached_seen,
-                    agent_settled,
-                    protocol_error: None,
-                    turn_budget: turn_budget.clone(),
-                };
+                return state.outcome(Settled::ForcedDrain, outcome.map(|o| Some(o.status)));
             }
             () = async {
                 match activity_tick.as_mut() {
@@ -603,17 +637,7 @@ pub(crate) async fn drive_attempt(
     match child.wait_final_drain().await {
         Ok(Some(status)) => {
             child.finish(); // R-SA-067: success-path temp-file cleanup.
-            DriveOutcome {
-                timed_out: false,
-                interrupted: false,
-                forced_termination: false,
-                clean_terminal_stop,
-                exit_status: Ok(Some(status)),
-                detached: detached_seen,
-                agent_settled,
-                protocol_error: None,
-                turn_budget: turn_budget.clone(),
-            }
+            state.outcome(Settled::Exited, Ok(Some(status)))
         }
         Ok(None) => {
             // The child closed stdout but did not exit within FINAL_DRAIN_TIMEOUT (R-SA-068) —
@@ -621,28 +645,8 @@ pub(crate) async fn drive_attempt(
             // combined with a clean terminal stop and no error, `forcedDrainAfterFinalSuccess`
             // still coerces an otherwise-successful, merely-slow-to-teardown run to exit 0.
             let outcome = child.terminate(&cancel).await;
-            DriveOutcome {
-                timed_out: false,
-                interrupted: false,
-                forced_termination: true,
-                clean_terminal_stop,
-                exit_status: outcome.map(|o| Some(o.status)),
-                detached: detached_seen,
-                agent_settled,
-                protocol_error: None,
-                turn_budget: turn_budget.clone(),
-            }
+            state.outcome(Settled::ForcedDrain, outcome.map(|o| Some(o.status)))
         }
-        Err(err) => DriveOutcome {
-            timed_out: false,
-            interrupted: false,
-            forced_termination: false,
-            clean_terminal_stop,
-            exit_status: Err(err),
-            detached: detached_seen,
-            agent_settled,
-            protocol_error: None,
-            turn_budget: turn_budget.clone(),
-        },
+        Err(err) => state.outcome(Settled::Exited, Err(err)),
     }
 }

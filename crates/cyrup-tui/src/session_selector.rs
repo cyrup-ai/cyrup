@@ -485,7 +485,7 @@ impl SessionSelector {
             return;
         }
         // Remove the char ending at `cursor`.
-        let prev = self.query[..self.cursor].chars().next_back();
+        let prev = self.query.get(..self.cursor).and_then(|s| s.chars().next_back());
         if let Some(ch) = prev {
             let start = self.cursor - ch.len_utf8();
             self.query.replace_range(start..self.cursor, "");

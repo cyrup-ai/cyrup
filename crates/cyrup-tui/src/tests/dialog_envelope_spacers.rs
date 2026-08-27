@@ -31,7 +31,13 @@
 //! (Ratatui's constraint solver does NOT do this on its own — a `[Length(1); 4]` stack resolves to
 //! `[0,1,0,0]` at height 1, and `[1,1,Min(0),1,1]` resolves to the HINT row alone, which is why
 //! these renders carve their rows explicitly through `stack_rows`.)
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 use crate::{
     CheckboxSelector, ConfigKind, ConfigRow, ConfigScope, ConfigSelector, Key, ListSelector,

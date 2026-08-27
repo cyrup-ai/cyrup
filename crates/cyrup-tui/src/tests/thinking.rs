@@ -11,7 +11,13 @@
 //! `StreamEvent::ThinkingDelta` and for the terminal message — and read what actually lands on
 //! screen: the live inline viewport for the in-flight block, the committed `insert_before`
 //! scrollback for the finished one.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 use cyrup_agent::AgentMessage;
 use cyrup_core::{ApiId, AssistantMessage, Content, ProviderId, StopReason};

@@ -1,10 +1,18 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 19:42
+stage: qa
+status: completed
+updated: 2026-08-27 04:35
 ---
 
 # Add #[must_use] To The Ten cyrup-tui Builder Methods Clippy Now Flags
+
+> **Closed by verification, not by a flux session.** The work landed via PR #58 and PR #68;
+> this file was parked in `backlog/` with the `/task`-authored `status: done` frontmatter, which
+> records only that the file was written. Every acceptance criterion above was re-checked against
+> `main` by command before filing, plus the shared gate: `cargo build -p cyrup-tui` 0 warnings,
+> `cargo test -p cyrup-tui` 1271 passed, `cargo clippy -p cyrup-tui --all-targets` reporting only
+> the pre-existing `escape_reassembly.rs:972`. The timestamp is a filing date, not authorship.
+
 
 > Found while re-verifying `EDITOR_MODULE_DECOMPOSE` after rebasing onto current `main`.
 > **Priority:** low · **Effort:** small
