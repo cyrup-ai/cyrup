@@ -236,9 +236,9 @@ pub(super) fn render_bash(
         StrArg::Value(cmd) => spans.push(Span::styled(format!("{prompt} {cmd}"), title)),
     }
     if let Some(t) = run.args.get("timeout").and_then(Value::as_f64).filter(|t| *t != 0.0) {
-        // `${timeout}s` (bash.ts:204): JS renders an integer number without a trailing `.0`.
-        let disp = if t.fract() == 0.0 { format!("{}", t as i64) } else { format!("{t}") };
-        spans.push(Span::styled(format!(" (timeout {disp}s)"), theme.muted_style()));
+        // `${timeout}s` (bash.ts:204) — the same `String(n)` fold the read range uses; the `±0`
+        // case `js_number` handles is already excluded by the filter above.
+        spans.push(Span::styled(format!(" (timeout {}s)", js_number(t)), theme.muted_style()));
     }
     out.push(Line::from(spans));
 

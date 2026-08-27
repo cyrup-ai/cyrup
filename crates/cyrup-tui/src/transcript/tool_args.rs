@@ -54,17 +54,58 @@ pub(super) fn push_search_path(args: &Value, theme: &UiTheme, spans: &mut Vec<Sp
     }
 }
 
-/// `formatReadLineRange` (read.ts:67-72): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
+/// JS `String(n)` for a `Number` that came out of `JSON.parse` — the fold a template literal
+/// applies when a double is interpolated (`` `:${startLine}` ``, read.ts:77).
+///
+/// Rust's `Display` for `f64` is already the shortest round-tripping form, so `2.0` prints `2` and
+/// `2.5` prints `2.5`, exactly as JS does. `Debug` is NOT — it would print `2.0` — so the `{}`
+/// spelling here is load-bearing. The single value the two disagree on is negative zero, which JS
+/// prints as `0`; JSON can carry `-0.0`, so it is handled.
+///
+/// This is deliberately NOT `cyrup_tools::jsnum::to_integer`: that is `ToIntegerOrInfinity`, the
+/// coercion the READ path applies to pick a line window (read.ts:278-288). The HEADER interpolates
+/// the number as given, and a fractional `offset` reaches the screen unrounded upstream.
+pub(super) fn js_number(n: f64) -> String {
+    // `String(-0) === "0"`; Rust's `Display` would print `-0`. Covers `+0.0` too.
+    if n == 0.0 {
+        return "0".to_string();
+    }
+    format!("{n}")
+}
+
+/// `formatReadLineRange` (read.ts:73-78): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
+///
+/// ```ts
+/// if (args?.offset === undefined && args?.limit === undefined) return "";
+/// const startLine = args.offset ?? 1;
+/// const endLine = args.limit !== undefined ? startLine + args.limit - 1 : "";
+/// return theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
+/// ```
+///
+/// Upstream has no integer type to lose: `JSON.parse` yields an IEEE-754 double for `2` and for
+/// `2.0` alike, so both spellings are literally the same value by the time this runs and both
+/// render `:2`. [`Value::as_f64`] is that same "is this a JSON number" test — it answers `Some` for
+/// `Number::PosInt`, `NegInt` and `Float` alike, where `as_i64` answers `None` for every float — so
+/// it, and not `as_i64`, is the extractor. It is also the more faithful one at the top of the range:
+/// `as_f64` narrows `9007199254740993` to `9007199254740992`, which is precisely what `JSON.parse`
+/// does with the same literal.
+///
+/// The arithmetic stays in `f64` because `startLine + args.limit - 1` is double arithmetic
+/// upstream; a fractional `offset` reaches the header unrounded there and must here.
 pub(super) fn read_line_range(args: &Value) -> Option<String> {
-    let offset = args.get("offset").and_then(Value::as_i64);
-    let limit = args.get("limit").and_then(Value::as_i64);
+    let offset = args.get("offset").and_then(Value::as_f64);
+    let limit = args.get("limit").and_then(Value::as_f64);
     if offset.is_none() && limit.is_none() {
         return None;
     }
-    let start = offset.unwrap_or(1);
-    Some(match limit {
-        Some(l) => format!(":{start}-{}", start + l - 1),
-        None => format!(":{start}"),
+    let start = offset.unwrap_or(1.0);
+    // `endLine ? …` is a JS TRUTHINESS test on a Number, not a presence test: an end line that
+    // computes to zero (`{"offset":1,"limit":0}`) is falsy upstream and the `-<end>` half is
+    // dropped. `NaN` is falsy for the same reason and is excluded here for the same reason.
+    let end = limit.map(|l| start + l - 1.0).filter(|e| *e != 0.0 && !e.is_nan());
+    Some(match end {
+        Some(e) => format!(":{}-{}", js_number(start), js_number(e)),
+        None => format!(":{}", js_number(start)),
     })
 }
 

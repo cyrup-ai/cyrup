@@ -55,3 +55,27 @@ text entirely, so only `grep`'s `rg: `-prefixed output changes.
 3. `find` output is unchanged — it discards walk errors unconditionally.
 4. An error carrying no path still produces its `Display` text rather than an
    empty prefix.
+
+---
+
+## Second, unrelated fragment folded in: a stale comment citation
+
+`crates/cyrup-tools/src/tools/find.rs:252`, inside the walk-loop error-swallowing
+comment, reads:
+
+> a root that does not exist is already rejected by the `metadata(&search_root)`
+> probe above (pi's `Path not found`, find.ts:158)
+
+Two problems. The `find.ts:158` coordinate is stale — pi's `Path not found:` is at
+`find.ts:171`, and it lives in the `customOps?.glob` branch, which is not the
+branch cyrup mirrors. And the description is now understated: since the
+find-path-guard task landed, that probe rejects non-directory roots too, not only
+missing ones, and it emits fd's two-line message rather than pi's `Path not found`.
+
+The comment emits nothing and misleads only a reader. The executing agent left it
+alone because it sits outside the hunk its brief prescribed — the right call.
+
+### Definition of done
+
+5. The comment at `find.rs:252` names the correct pi coordinate and describes the
+   gate as rejecting both missing and non-directory roots.
