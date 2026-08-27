@@ -4,8 +4,8 @@ priority: MEDIUM
 tool: powershell
 source: pi-parity-audit (workflow wf_e427a266-e16)
 stage: qa
-status: in-progress
-updated: 2026-08-27 14:04
+status: completed
+updated: 2026-08-27 14:16
 ---
 
 # The entire `powershell` built-in tool is missing from cyrup
