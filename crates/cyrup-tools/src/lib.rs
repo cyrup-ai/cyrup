@@ -43,7 +43,7 @@ pub use isolation::{
 pub use lock::FileMutationLocks;
 pub use ops::{
     Access, ArgvOutput, ArgvSpec, Backend, DirEntry, ExecSpec, ExitStatus, FsOps, ImageMime, Meta,
-    ProcOps, ShellConfig, Transport, WalkItem, WalkOpts, kill_pid, kill_process_tree,
+    ProcOps, ShellConfig, Transport, WalkFlavor, WalkItem, WalkOpts, kill_pid, kill_process_tree,
     kill_tracked_detached_children, terminate_pid, track_detached_child_pid,
     untrack_detached_child_pid,
 };

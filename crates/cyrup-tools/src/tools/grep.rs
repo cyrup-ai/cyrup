@@ -3,7 +3,7 @@
 //! and truncation preserve Pi's observable behavior.
 
 use crate::config::GrepOpts;
-use crate::ops::{FsOps, WalkOpts};
+use crate::ops::{FsOps, WalkFlavor, WalkOpts};
 use crate::tools::globmatch::{RgGlob, to_posix};
 use crate::truncate::{GREP_MAX_LINE_LENGTH, TruncOpts, format_size, truncate_head, truncate_line};
 use crate::{error, path};
@@ -369,6 +369,11 @@ impl Tool for GrepTool {
                 WalkOpts {
                     include_hidden: true,
                     require_git: true,
+                    // Pi's `grep` IS ripgrep (grep.ts:177, :226). Behaviour-neutral today —
+                    // `WalkFlavor::Rg` registers nothing yet — and deliberately so: it is the
+                    // seam the sibling `.rgignore` task fills, and it guarantees `find`'s
+                    // `.fdignore` can never leak into grep.
+                    flavor: WalkFlavor::Rg,
                 },
             );
             loop {

@@ -234,6 +234,49 @@ fn is_bmp(buf: &[u8]) -> bool {
     color_planes == 1 && [1, 4, 8, 16, 24, 32].contains(&bits_per_pixel)
 }
 
+/// Which upstream binary's ignore-file set a walk reproduces.
+///
+/// `.fdignore` and `.rgignore` are BOTH opt-in `WalkBuilder::add_custom_ignore_filename`
+/// registrations in the `ignore` crate, and each is read by exactly ONE of the two tools pi
+/// shells out to: fd reads `.fdignore` and a global `<config>/fd/ignore`; ripgrep reads
+/// `.rgignore` and has no global ignore file of its own. Because `find` and `grep` share the one
+/// `FsOps::walk` seam, that seam cannot register either name unconditionally without giving one
+/// tool an exclusion source its upstream does not have. Naming the caller is the whole job of
+/// this enum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WalkFlavor {
+    /// No tool-specific ignore sources: `.ignore` plus the gitignore family only. This is the
+    /// `Default` so that a defaulted `WalkOpts` can never silently confer fd or ripgrep
+    /// semantics on a walker that did not ask for them.
+    #[default]
+    Plain,
+    /// fd (`find`, find.ts:225-269). Registers `.fdignore` and fd's global ignore file.
+    Fd,
+    /// ripgrep (`grep`, grep.ts:177 `ensureTool("rg")`, argv at `:220-224`). Registers
+    /// `.rgignore`; ripgrep has no global ignore file, so nothing else attaches here.
+    Rg,
+}
+
+impl WalkFlavor {
+    /// The custom ignore FILENAME this flavor's upstream reads, if any. Custom ignore files
+    /// outrank `.ignore` and every gitignore source (ignore 0.4.26 `dir.rs:580-585`).
+    pub fn custom_ignore_filename(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Fd => Some(".fdignore"),
+            // The `.rgignore` registration is the sibling `.rgignore` parity task; `grep`
+            // already names itself here so that task lands as this one arm and nothing else.
+            Self::Rg => None,
+        }
+    }
+
+    /// Whether this flavor's upstream reads a GLOBAL ignore file. Only fd does
+    /// (fd 10.5.0 `src/walk.rs:371-386`); ripgrep has no equivalent.
+    pub fn reads_fd_global_ignore(self) -> bool {
+        matches!(self, Self::Fd)
+    }
+}
+
 /// Options for a tree walk (grep/find). Hidden files are skipped by default (ripgrep/fd parity).
 ///
 /// `require_git` mirrors fd/ripgrep's `--require-git` behavior: when `false` (fd's
@@ -241,10 +284,14 @@ fn is_bmp(buf: &[u8]) -> bool {
 /// (fd/ripgrep default), git-ignore semantics only apply inside a repo, so parent `.gitignore`
 /// rules stop at nested repo boundaries. Pi's `find` sets this per search path (find.ts:226-240,
 /// issue #5960); `grep` keeps the historical unconditional `false`.
+///
+/// `flavor` names the upstream binary being emulated so the shared walk seam can register the
+/// tool-specific ignore sources — see [`WalkFlavor`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WalkOpts {
     pub include_hidden: bool,
     pub require_git: bool,
+    pub flavor: WalkFlavor,
 }
 
 /// A single walked path.

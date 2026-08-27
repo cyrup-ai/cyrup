@@ -3,7 +3,7 @@
 
 use crate::config::FindOpts;
 use crate::details::FindDetails;
-use crate::ops::{FsOps, WalkOpts};
+use crate::ops::{FsOps, WalkFlavor, WalkOpts};
 use crate::tools::globmatch::{PatternMatcher, to_posix};
 use crate::truncate::{TruncOpts, format_size, truncate_head};
 use crate::{error, path};
@@ -150,6 +150,10 @@ impl Tool for FindTool {
             WalkOpts {
                 include_hidden: true,
                 require_git: inside_git_repo,
+                // Pi's `find` IS fd (find.ts:225 `ensureTool("fd")`) invoked with no
+                // `--no-ignore`/`--no-global-ignore-file` (find.ts:235-267), so fd's full default
+                // ignore set is in force: `.fdignore` files plus `<config>/fd/ignore`.
+                flavor: WalkFlavor::Fd,
             },
         );
         loop {

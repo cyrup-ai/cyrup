@@ -210,7 +210,13 @@ impl FsOps for LocalFs {
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<WalkItem, ToolError>>(256);
         let root = root.to_path_buf();
         tokio::task::spawn_blocking(move || {
-            let walker = WalkBuilder::new(&root)
+            // fd builds its walker in two phases — the chained knobs, then the tool-specific
+            // ignore SOURCES (fd 10.5.0 `src/walk.rs:352-386`) — and so must this. `add_ignore`
+            // returns `Option<ignore::Error>`, not `&mut WalkBuilder` (ignore 0.4.26
+            // `walk.rs:718`), so the chain cannot stay a single expression terminating in
+            // `.build()`.
+            let mut builder = WalkBuilder::new(&root);
+            builder
                 .hidden(!opts.include_hidden)
                 .git_ignore(true)
                 .git_exclude(true)
@@ -222,8 +228,39 @@ impl FsOps for LocalFs {
                 // The caller sets this per search path (find.ts:226-240): `false` outside a repo,
                 // `true` inside one. See `WalkOpts::require_git`.
                 .require_git(opts.require_git)
-                .parents(true)
-                .build();
+                // Also what makes the custom ignore filename below apply in ANCESTORS of the
+                // search root: `Ignore::add_parents` runs `add_child_path` per parent, which
+                // compiles the custom-ignore matcher too (ignore 0.4.26 `dir.rs:182-248`,
+                // `:286-292`). fd computes this same `true` (`read_parent_ignore &&
+                // (read_fdignore || read_vcsignore)`).
+                .parents(true);
+
+            // `.fdignore` for fd / `.rgignore` for ripgrep. Both are inert until registered;
+            // neither tool reads the other's. Custom ignore files outrank `.ignore` and EVERY
+            // gitignore source (ignore 0.4.26 `dir.rs:580-585`:
+            // `m_custom_ignore.or(m_ignore).or(m_gi).or(m_gi_exclude).or(m_global)
+            // .or(m_explicit)`), so a `!keep.txt` negation in `.fdignore` re-includes a path a
+            // `.gitignore` excluded — same as fd.
+            if let Some(name) = opts.flavor.custom_ignore_filename() {
+                builder.add_custom_ignore_filename(name);
+            }
+
+            // fd's GLOBAL ignore file (fd 10.5.0 `src/walk.rs:371-386`). Registered via
+            // `add_ignore`, which lands in `explicit_ignores` — the LOWEST precedence source,
+            // below the global gitignore (`dir.rs:585`), exactly as it is for fd. ripgrep has no
+            // global ignore file, so this is gated on the fd flavor alone.
+            if opts.flavor.reads_fd_global_ignore()
+                && let Some(global) = crate::path::fd_global_ignore_file()
+            {
+                // fd prints a warning for a malformed pattern and KEEPS WALKING, with the rules
+                // that did parse still in force (`ignore::Error::Partial`). pi buffers fd's stderr
+                // but only surfaces it when fd exits non-zero AND produced no output
+                // (find.ts:284-310), so that warning is invisible upstream on a successful run.
+                // `walk` has no warning channel; dropping the error reproduces both halves.
+                drop(builder.add_ignore(&global));
+            }
+
+            let walker = builder.build();
             for result in walker {
                 let item = match result {
                     Ok(entry) => {
