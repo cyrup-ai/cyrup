@@ -3,8 +3,8 @@ title: .rgignore files are honored by pi but ignored by cyrup
 priority: LOW
 tool: grep
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: new
-status: done
+stage: aug
+status: in-progress
 updated: 2026-08-27
 ---
 

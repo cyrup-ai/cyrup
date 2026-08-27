@@ -3,8 +3,8 @@ title: Shell detection is cached at tool construction instead of re-resolved on 
 priority: LOW
 tool: bash
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: new
-status: done
+stage: aug
+status: in-progress
 updated: 2026-08-27
 ---
 
