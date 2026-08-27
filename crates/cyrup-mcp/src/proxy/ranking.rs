@@ -12,7 +12,7 @@ use crate::config::{
     ToolPrefix,
 };
 use crate::proxy::constants::{MIN_STEM_LENGTH, WEIGHT_DESCRIPTION, WEIGHT_KEYWORDS, WEIGHT_NAME, WEIGHT_ORIGINAL_NAME, WEIGHT_SERVER};
-use crate::proxy::tool_metadata::{ToolMetadata, get_server_prefix, get_tool_name_candidates, matches_tool_pattern, resolve_tool_prefix};
+use crate::proxy::tool_metadata::{ToolMetadata, matches_tool_pattern, resolve_tool_prefix, server_prefix, tool_name_candidates};
 
 // ==================================================================================================
 // 3 · `search-ranking.ts` — 206 lines of allocation-free integer scoring, no I/O
@@ -289,7 +289,7 @@ pub fn resolve_search_keywords(
     let Some(map) = definition.and_then(|entry| entry.search_keywords.as_ref()) else {
         return Vec::new();
     };
-    let candidates = get_tool_name_candidates(
+    let candidates = tool_name_candidates(
         tool_original_name,
         server_name,
         resolve_tool_prefix(definition, global_prefix),
@@ -298,7 +298,7 @@ pub fn resolve_search_keywords(
     let mut keywords: Vec<String> = Vec::new();
     let mut seen: IndexSet<String> = IndexSet::new();
     for (pattern, values) in map {
-        if !matches_tool_pattern(&candidates, Some(std::slice::from_ref(pattern))) {
+        if !matches_tool_pattern(&candidates, std::slice::from_ref(pattern)) {
             continue;
         }
         for value in values {
@@ -435,7 +435,7 @@ pub fn rank_suggestions(
     let mut stripped: Vec<String> = Vec::new();
     for server in config.mcp_servers.keys() {
         for mode in [ToolPrefix::Server, ToolPrefix::Short, ToolPrefix::Mcp] {
-            let candidate = get_server_prefix(server, mode);
+            let candidate = server_prefix(server, mode);
             if candidate.is_empty() || !name.starts_with(&format!("{candidate}_")) {
                 continue;
             }
@@ -687,18 +687,18 @@ mod tests {
         );
         // No edit distance: a transposed/dropped letter falls off the coverage gate, upstream and here.
         assert!(rank_suggestions(&config, &metadata, "linear-server_isues", 5).is_empty());
-        assert_eq!(get_server_prefix("linear-server", ToolPrefix::Server), "linear-server");
-        assert_eq!(get_server_prefix("gh-mcp", ToolPrefix::Short), "gh");
-        assert_eq!(get_server_prefix("gh-mcp", ToolPrefix::Mcp), "mcp__gh-mcp");
-        assert_eq!(get_server_prefix("gh-mcp", ToolPrefix::None), "");
+        assert_eq!(server_prefix("linear-server", ToolPrefix::Server), "linear-server");
+        assert_eq!(server_prefix("gh-mcp", ToolPrefix::Short), "gh");
+        assert_eq!(server_prefix("gh-mcp", ToolPrefix::Mcp), "mcp__gh-mcp");
+        assert_eq!(server_prefix("gh-mcp", ToolPrefix::None), "");
     }
 
     #[test]
     fn longest_prefix_wins_for_lazy_discovery() {
         // Two servers whose prefixes nest: `foo-bar_x` must resolve against `foo-bar`, not `foo`.
         let mut candidates = vec![
-            ("foo".to_string(), get_server_prefix("foo", ToolPrefix::Server)),
-            ("foo-bar".to_string(), get_server_prefix("foo-bar", ToolPrefix::Server)),
+            ("foo".to_string(), server_prefix("foo", ToolPrefix::Server)),
+            ("foo-bar".to_string(), server_prefix("foo-bar", ToolPrefix::Server)),
         ];
         candidates.retain(|(_, prefix)| "foo-bar_x".starts_with(&format!("{prefix}_")));
         candidates.sort_by_key(|(_, prefix)| std::cmp::Reverse(prefix.len()));

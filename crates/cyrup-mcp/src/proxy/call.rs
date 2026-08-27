@@ -20,7 +20,7 @@ use crate::proxy::constants::MCP_TOOL_NAME;
 use crate::proxy::env::{ApprovalOrigin, ApprovalOutcome, ConnectionStatus, OutputGuardOptions, ProxyCallError, ProxyCtx, UrlElicitationAction};
 use crate::proxy::error_vocab::McpErrorCode;
 use crate::proxy::results::{SingleMatch, ambiguous_tool_result, details, details_err, get_auth_required_message, get_enabled_tool_matches, get_single_tool_match, get_tool_matches, text_result};
-use crate::proxy::tool_metadata::{ToolMetadata, find_tool_by_name, get_server_prefix};
+use crate::proxy::tool_metadata::{ToolMetadata, find_tool_by_name, server_prefix};
 
 // ==================================================================================================
 // 12 · `executeCall` — the resolution state machine (MCP-163, **critical**) and the invocation
@@ -387,7 +387,7 @@ pub async fn execute_call(
             .mcp_servers
             .keys()
             .filter(|name| !ctx.is_disabled(name))
-            .map(|name| (name.clone(), get_server_prefix(name, prefix_mode)))
+            .map(|name| (name.clone(), server_prefix(name, prefix_mode)))
             .filter(|(_, prefix)| !prefix.is_empty() && tool_name.starts_with(&format!("{prefix}_")))
             .collect();
         // Descending prefix length: with servers `foo` and `foo-bar`, `foo-bar_x` must resolve

@@ -69,9 +69,14 @@ pub(crate) const WEIGHT_DESCRIPTION: i64 = 5;
 pub(crate) const WEIGHT_KEYWORDS: i64 = 5;
 
 /// The regex engine's compiled-program ceiling, set **explicitly** rather than left to the crate
-/// default (MCP-159): a model-supplied pattern must not be able to trade a 256-character query for
-/// an unbounded DFA. A size-limit failure surfaces as [`crate::proxy::McpErrorCode::InvalidPattern`], exactly as a
-/// syntax error does.
+/// default: a supplied pattern must not be able to trade a short string for an unbounded DFA.
+///
+/// Two consumers, both untrusted-input sites. **MCP-159**, [`crate::proxy::execute_search`]'s
+/// model-supplied `regex` query, where a size-limit failure surfaces as
+/// [`crate::proxy::McpErrorCode::InvalidPattern`] exactly as a syntax error does. **MCP-076**,
+/// [`crate::registration`]'s glob compiler, which compiles the config-supplied `includeTools` /
+/// `excludeTools` / `approveTools` / `searchKeywords` patterns and where a failure means the
+/// pattern matches nothing — the same outcome a pattern the parser rejects already had.
 pub(crate) const REGEX_SIZE_LIMIT: usize = 1 << 20;
 /// Companion ceiling for the lazy DFA cache; see [`REGEX_SIZE_LIMIT`].
 pub(crate) const REGEX_DFA_SIZE_LIMIT: usize = 1 << 20;
