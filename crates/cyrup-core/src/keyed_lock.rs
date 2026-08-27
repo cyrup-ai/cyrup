@@ -17,8 +17,11 @@
 
 use crate::CancelToken;
 use dashmap::DashMap;
+use std::future::{poll_fn, Future};
 use std::hash::Hash;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 /// The map one lock domain is built over.
@@ -148,32 +151,115 @@ impl<K: Eq + Hash + Clone> KeyedLocks<K> {
         Self { map }
     }
 
-    /// Acquire the lock for `key`, holding it until the returned guard drops.
+    /// Take this task's place in `key`'s FIFO queue WITHOUT waiting for it.
     ///
-    /// Cancel-aware: returns `Err(Cancelled)` if the token is cancelled before acquisition —
-    /// *always*, not just when the mutex happens to be contended (see the `biased` note below).
-    pub async fn guard(&self, key: K, cancel: &CancelToken) -> Result<KeyedGuard<K>, Cancelled> {
+    /// The returned future resolves on its FIRST poll and can therefore never suspend, so a caller
+    /// may hold a registration lock across `enqueue(..).await` and release it on the very next
+    /// line with its queue position already claimed. This is the Rust shape of pi's
+    /// `fileMutationQueues.set(key, chainedQueue)` (file-mutation-queue.ts:42): the LINK is made
+    /// inside the serialized registration, only the WAIT happens outside it.
+    ///
+    /// Pair it with [`KeyedAcquire::wait`]; [`KeyedLocks::guard`] below is the two halves back to
+    /// back, for callers with no registration order to preserve.
+    pub async fn enqueue(&self, key: K) -> KeyedAcquire<K> {
         // Declared before `lock` so it drops LAST — see `PendingEntry`.
-        let _pending = PendingEntry {
+        let pending = PendingEntry {
             map: self.map.clone(),
             key: key.clone(),
         };
         let lock = self.map.get_or_insert(key.clone());
-        tokio::select! {
-            biased;
-            // `biased` is REQUIRED, not a micro-optimisation. An unbiased `select!` polls its ready
-            // arms in a RANDOM order, so when the token is already cancelled AND the mutex is
-            // uncontended both arms are ready on the first poll and the outcome is a coin flip:
-            // roughly half of all pre-cancelled acquisitions on an idle key would return a guard
-            // and let the caller proceed. Polling the cancel arm first makes it deterministic.
-            _ = cancel.cancelled() => Err(Cancelled),
-            g = lock.clone().lock_owned() => Ok(KeyedGuard {
-                inner: Some(g),
-                lock: Some(lock),
-                map: self.map.clone(),
-                key,
-            }),
+        let mut acquire: Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>> =
+            Box::pin(Arc::clone(&lock).lock_owned());
+        // EXACTLY ONE POLL. `tokio::sync::Mutex` is strictly FIFO (tokio 1.52.3
+        // src/sync/mutex.rs:20-22, :598-600) and a task's place in that queue is taken when its
+        // acquire future is first polled — an unpolled future has done nothing. `poll_fn` returns
+        // `Ready` on its own first poll, so this `.await` cannot yield and the caller's
+        // registration lock is still held when `enqueue` returns.
+        let early = match poll_fn(|cx| Poll::Ready(acquire.as_mut().poll(cx))).await {
+            Poll::Ready(g) => Some(g),
+            Poll::Pending => None,
+        };
+        KeyedAcquire {
+            acquire: Some(acquire),
+            early,
+            lock: Some(lock),
+            map: self.map.clone(),
+            key,
+            _pending: pending,
         }
+    }
+
+    /// Acquire the lock for `key`, holding it until the returned guard drops.
+    ///
+    /// Cancel-aware: returns `Err(Cancelled)` if the token is cancelled before acquisition —
+    /// *always*, not just when the mutex happens to be contended (see [`KeyedAcquire::wait`]).
+    ///
+    /// Unchanged behaviour, now expressed over the two halves: the claim is taken on this future's
+    /// first poll (it cannot suspend before that, since [`KeyedLocks::enqueue`] never yields) and
+    /// the wait happens after it.
+    pub async fn guard(&self, key: K, cancel: &CancelToken) -> Result<KeyedGuard<K>, Cancelled> {
+        self.enqueue(key).await.wait(cancel).await
+    }
+}
+
+/// A claimed-but-not-yet-granted place in one key's FIFO queue.
+///
+/// Minted by [`KeyedLocks::enqueue`] and consumed by [`KeyedAcquire::wait`]. Dropping it instead
+/// forfeits the place and runs the same eviction check every other exit path runs.
+pub struct KeyedAcquire<K: Eq + Hash + Clone> {
+    acquire: Option<Pin<Box<dyn Future<Output = OwnedMutexGuard<()>> + Send>>>,
+    early: Option<OwnedMutexGuard<()>>,
+    lock: Option<Arc<Mutex<()>>>,
+    map: KeyedLockMap<K>,
+    key: K,
+    /// Declared LAST so it drops AFTER `Drop::drop` below has released the guard, the acquire
+    /// future and this handle's `Arc` clone — otherwise the `strong_count == 1` predicate would
+    /// always see them and the entry would never be evicted.
+    _pending: PendingEntry<K>,
+}
+
+impl<K: Eq + Hash + Clone> KeyedAcquire<K> {
+    /// Wait for the place claimed by [`KeyedLocks::enqueue`] to come up.
+    pub async fn wait(mut self, cancel: &CancelToken) -> Result<KeyedGuard<K>, Cancelled> {
+        // Carries over what `biased` bought the old `select!`: an already-cancelled token loses
+        // even when the lock is free. An unbiased `select!` polls its ready arms in a RANDOM
+        // order, so when the token is already cancelled AND the mutex is uncontended both arms
+        // were ready on the first poll and the outcome was a coin flip. Now deterministic by
+        // construction rather than by poll order.
+        if cancel.is_cancelled() {
+            return Err(Cancelled);
+        }
+        let granted = match self.early.take() {
+            Some(g) => g,
+            None => {
+                let acquire = match self.acquire.as_mut() {
+                    Some(a) => a,
+                    None => return Err(Cancelled),
+                };
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return Err(Cancelled),
+                    g = acquire.as_mut() => g,
+                }
+            }
+        };
+        Ok(KeyedGuard {
+            inner: Some(granted),
+            lock: self.lock.take(),
+            map: self.map.clone(),
+            key: self.key.clone(),
+        })
+    }
+}
+
+impl<K: Eq + Hash + Clone> Drop for KeyedAcquire<K> {
+    /// Release in the same order `KeyedGuard::drop` does, so `_pending` — which drops after this
+    /// body returns — sees only the map's own reference. Covers both non-guard exits: a cancelled
+    /// wait and an outright drop of the `wait()` future.
+    fn drop(&mut self) {
+        self.early.take();
+        self.acquire.take();
+        self.lock.take();
     }
 }
 
