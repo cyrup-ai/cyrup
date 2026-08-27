@@ -12,7 +12,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use crate::config::{BashOpts, SessionEnvHandle, SessionEnvInfo};
-use crate::ops::{Backend, ProcOps, ShellConfig};
+use crate::ops::{Backend, ProcOps};
 use crate::tools::BashTool;
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use std::path::PathBuf;

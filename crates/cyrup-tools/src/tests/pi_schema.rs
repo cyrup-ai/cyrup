@@ -33,7 +33,7 @@
 use crate::FileMutationLocks;
 use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts, WriteOpts};
 use crate::ops::local::LocalFs;
-use crate::ops::{Backend, FsOps, ProcOps, ShellConfig};
+use crate::ops::{Backend, FsOps, ProcOps};
 use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
 use cyrup_core::Tool;
 use std::path::PathBuf;

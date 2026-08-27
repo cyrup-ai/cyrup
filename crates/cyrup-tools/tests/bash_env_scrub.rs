@@ -11,7 +11,7 @@
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use cyrup_tools::config::BashOpts;
-use cyrup_tools::ops::{Backend, ProcOps, ShellConfig};
+use cyrup_tools::ops::{Backend, ProcOps};
 use cyrup_tools::tools::BashTool;
 use std::sync::Arc;
 

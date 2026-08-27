@@ -9,7 +9,7 @@
 
 use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts};
 use crate::ops::local::LocalFs;
-use crate::ops::{Backend, ExecSpec, ExitStatus, FsOps, ProcOps, ShellConfig};
+use crate::ops::{Backend, ExecSpec, ExitStatus, FsOps, ProcOps};
 use crate::registry::{Availability, ToolRegistry};
 use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
 use crate::{FileMutationLocks, ToolsOptions};

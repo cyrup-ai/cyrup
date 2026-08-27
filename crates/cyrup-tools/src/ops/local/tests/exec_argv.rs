@@ -268,11 +268,10 @@ async fn exec_argv_forced_sigkill_does_not_drop_buffered_stdout_already_sitting_
              killed (ground truth file was empty) — with a 250ms run window this is a real \
              failure, not the scheduling race the old 15ms window made it"
         );
-        // TOOL-020 claimed this bound "assumes the host `ShellConfig::detect()` shell flushes
-        // stdout once per iteration". That half is REFUTED at HEAD: `exec_argv` runs the
-        // program it is handed, and this call hands it `argv("sh", …)` literally — the
-        // `ShellConfig::detect()` passed to `with_kill_grace` is only consulted by `exec`, not
-        // by `exec_argv`. The dependence is on `/bin/sh`'s builtin `printf`, which flushes per
+        // TOOL-020 claimed this bound "assumes the host detected shell flushes stdout once per
+        // iteration". That half is REFUTED at HEAD: `exec_argv` runs the program it is handed,
+        // and this call hands it `argv("sh", …)` literally — the shell `exec` resolves per call
+        // is never consulted by `exec_argv`. The dependence is on `/bin/sh`'s builtin `printf`, which flushes per
         // command, and is identical on every POSIX host.
         assert!(
             gt_last - stdout_last <= 1,

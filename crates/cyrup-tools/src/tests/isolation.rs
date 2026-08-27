@@ -27,7 +27,7 @@
 use crate::isolation::{ProtectedFs, ProtectedPaths, TraversalFs};
 use crate::ops::local::LocalFs;
 use crate::ops::{
-    Access, Backend, DirEntry, FsOps, ImageMime, Meta, ShellConfig, WalkItem, WalkOpts,
+    Access, Backend, DirEntry, FsOps, ImageMime, Meta, WalkItem, WalkOpts,
 };
 use crate::tools::{BashTool, ReadTool, WriteTool};
 use crate::{BashOpts, FileMutationLocks, ReadOpts, WriteOpts};

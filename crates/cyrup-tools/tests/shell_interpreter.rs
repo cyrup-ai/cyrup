@@ -36,7 +36,7 @@ fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// D8(1) — `ShellConfig::detect()` ignores `CYRUP_SHELL`.
+/// D8(1) — `ShellConfig::try_detect()` ignores `CYRUP_SHELL`.
 ///
 /// RED before ADR-0003 D1 (the deleted arm at `ops/shell.rs:101-105` returned the sentinel first,
 /// ahead of the `/bin/bash` probe at `:109-110`); GREEN after.
@@ -49,7 +49,7 @@ fn detect_ignores_cyrup_shell_env_var() {
         std::env::set_var("CYRUP_SHELL", "/no/such/interpreter/sentinel");
     }
 
-    let cfg = ShellConfig::detect();
+    let cfg = ShellConfig::try_detect().expect("unix detection cannot fail (shell.ts:119)");
     assert_ne!(
         cfg.program,
         PathBuf::from("/no/such/interpreter/sentinel"),
