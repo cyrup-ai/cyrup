@@ -1,10 +1,10 @@
 ---
-stage: aug
-status: done
+stage: exec
+status: in-progress
 priority: MEDIUM
 tool: powershell
 source: QA follow-up from the powershell task
-updated: 2026-08-27 14:40
+updated: 2026-08-27 18:00
 ---
 
 # `BUILT_IN_TOOL_NAMES` in the permission manager still lists seven tools

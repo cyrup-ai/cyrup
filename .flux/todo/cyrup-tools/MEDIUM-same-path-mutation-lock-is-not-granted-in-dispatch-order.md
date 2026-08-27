@@ -3,9 +3,9 @@ title: Same-path mutation lock is not granted in dispatch order
 priority: MEDIUM
 tool: write
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
-status: done
-updated: 2026-08-27 14:50
+stage: exec
+status: in-progress
+updated: 2026-08-27 18:00
 ---
 
 # Same-path mutation lock is not granted in dispatch order
