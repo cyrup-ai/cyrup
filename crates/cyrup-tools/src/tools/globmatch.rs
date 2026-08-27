@@ -22,6 +22,23 @@ pub struct PatternMatcher {
     pub full_path: bool,
 }
 
+/// fd's smart case, reproduced for `find` (fd v10.3.0 `src/main.rs:195-202`): the search is
+/// case-sensitive **iff** the pattern carries an uppercase character, and case-INSENSITIVE
+/// otherwise. pi passes neither `-s/--case-sensitive` nor `-i/--ignore-case` (find.ts:235-267)
+/// and its schema has no case parameter (find.ts:29-35), so fd's default is the whole rule.
+///
+/// fd runs this over the *regex* globset emits for the glob (main.rs:169-172, then
+/// `regex_helper::pattern_has_uppercase_char`, which counts uppercase only in HIR literals and
+/// class range endpoints). Scanning the glob string itself is equivalent: globset's emitter
+/// (`globset-0.4.18` glob.rs:673-790) introduces no uppercase letter — non-ASCII bytes become
+/// lowercase `\xNN` escapes — and no glob metacharacter is an uppercase letter, so the uppercase
+/// characters of the glob and of its regex are the same set.
+///
+/// `char::is_uppercase` (Unicode), NOT `is_ascii_uppercase`: fd's check is Unicode-aware.
+fn pattern_has_uppercase_char(pattern: &str) -> bool {
+    pattern.chars().any(char::is_uppercase)
+}
+
 impl PatternMatcher {
     pub fn build(pattern: &str) -> Result<Self, ToolError> {
         let full_path = pattern.contains('/');
@@ -34,8 +51,13 @@ impl PatternMatcher {
         } else {
             pattern.to_string()
         };
+        // fd's smart case. The verdict is taken on `effective` — the string fd itself receives,
+        // after pi prepends `**/` (find.ts:257-262) — not on the raw `pattern`. `**/` holds no
+        // uppercase character, so the two agree on every input; `effective` is simply the literal
+        // equivalent of fd's own input.
         let glob: Glob = GlobBuilder::new(&effective)
             .literal_separator(full_path)
+            .case_insensitive(!pattern_has_uppercase_char(&effective))
             .build()
             .map_err(|e| error::invalid(format!("invalid glob '{pattern}': {e}")))?;
         Ok(Self {
