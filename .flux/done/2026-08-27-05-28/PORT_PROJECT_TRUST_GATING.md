@@ -1,7 +1,7 @@
 ---
-stage: exec
-status: done
-updated: 2026-08-27 05:25
+stage: qa
+status: completed
+updated: 2026-08-27 05:28
 ---
 # Project-trust gating — remaining work
 
