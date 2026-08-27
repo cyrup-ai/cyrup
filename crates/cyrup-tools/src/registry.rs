@@ -39,7 +39,7 @@ pub enum Availability {
     Allow(HashSet<String>),
     /// All registered tools except these names.
     Exclude(HashSet<String>),
-    /// Drop the seven built-ins; keep extension tools.
+    /// Drop the eight built-ins; keep extension tools.
     NoBuiltins,
     /// Empty model-visible set.
     NoTools,

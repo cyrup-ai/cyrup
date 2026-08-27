@@ -172,13 +172,13 @@ fn assert_meta(
 ) {
     assert_eq!(tool.name(), name, "tool name");
     // TOOL-045 — pi sets `label` EXPLICITLY on every built-in `ToolDefinition`, immediately after
-    // `name`, and for all seven the two strings are equal: `read.ts:210-211` @v0.83.0,
-    // `bash.ts:325-326`, `edit.ts:293-294`, `write.ts:187-188`, `grep.ts:129-130`,
-    // `find.ts:115-116`, `ls.ts:101-102`. Asserted as `Some(name)`, NOT as "`None` is fine because
-    // the runtime falls back to the name": the fallback and an explicit declaration are only
-    // indistinguishable while every label happens to equal its name, and this assertion is what
-    // makes the seven declarations data. RED for all seven before the fix (`label()` was the
-    // trait default `None`, `cyrup-core/src/tool.rs:102-104`).
+    // `name`, and for all eight the two strings are equal: `read.ts:210-211` @v0.83.0,
+    // `bash.ts:325-326`, `powershell.ts:51-52`, `edit.ts:293-294`, `write.ts:187-188`,
+    // `grep.ts:129-130`, `find.ts:115-116`, `ls.ts:101-102`. Asserted as `Some(name)`, NOT as
+    // "`None` is fine because the runtime falls back to the name": the fallback and an explicit
+    // declaration are only indistinguishable while every label happens to equal its name, and this
+    // assertion is what makes those declarations data. RED for all of them before the fix
+    // (`label()` was the trait default `None`, `cyrup-core/src/tool.rs:102-104`).
     assert_eq!(
         tool.label(),
         Some(name),
@@ -202,7 +202,7 @@ fn assert_meta(
 }
 
 /// TOOL-001 + TOOL-003: every built-in ships Pi's verbatim `description`, `promptSnippet` and
-/// `promptGuidelines` on the `cyrup_core::Tool` vtable. Fails for all seven before the fix
+/// `promptGuidelines` on the `cyrup_core::Tool` vtable. Fails for all of them before the fix
 /// (`description()` returned the trait default `""`, `prompt_snippet()` `None`).
 #[test]
 fn all_eight_tool_metadata_match_pi_verbatim() {

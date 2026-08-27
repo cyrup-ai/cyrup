@@ -3,8 +3,8 @@ title: Glob: "!dir" prunes the whole directory in pi, but only filters files in 
 priority: MEDIUM
 tool: grep
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
-status: done
+stage: exec
+status: in-progress
 updated: 2026-08-27
 ---
 
