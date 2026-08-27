@@ -26,10 +26,13 @@ static CONFIG_LOCK_HANDLE: LazyLock<KeyedLocks<PathBuf>> =
 /// which take a signal here or upstream (pi's `settings-manager`/`trust-manager` use `lockSync`,
 /// and `auth-storage`'s `withLockAsync(fn)` takes no options). `CancellationToken::cancelled()` on
 /// a token nobody cancels is a future that never resolves, so both `select!`s that consume it —
-/// [`KeyedLocks::guard`]'s and the layer-2 retry loop below — always take their other arm. It is
-/// polled once per acquire, in `guard`'s biased first branch, and not again on the uncontended
-/// path because the retry loop is skipped. That poll costs no allocation (the waiter is intrusive)
-/// and no syscall (an uncontended `std::sync::Mutex` is atomics-only).
+/// [`cyrup_core::keyed_lock::KeyedAcquire::wait`]'s and the layer-2 retry loop below — always take
+/// their other arm. On the uncontended path, which is this lock's common case, `cancelled()` is
+/// polled ZERO times: `wait` returns through its `early.take()` arm before the `select!` is ever
+/// constructed, and the `is_cancelled()` guard above that is a plain synchronous read rather than a
+/// poll — it allocates nothing and registers no waiter. Only a contended layer 1 reaches the
+/// `select!`, and even then the poll costs no allocation (the waiter is intrusive) and no syscall
+/// (an uncontended `std::sync::Mutex` is atomics-only).
 static NEVER_CANCELLED: LazyLock<CancelToken> = LazyLock::new(CancelToken::new);
 
 /// First retry delay for a contended layer 2, doubled each tick up to [`MAX_RETRY`]. An

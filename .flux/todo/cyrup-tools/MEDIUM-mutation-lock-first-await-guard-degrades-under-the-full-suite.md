@@ -1,10 +1,10 @@
 ---
-stage: qa
-status: needs-rework
+stage: exec
+status: done
 priority: MEDIUM
 tool: all
 source: exec follow-up — self-reported by the mutation-lock executor
-updated: 2026-08-27 21:24
+updated: 2026-08-27 21:37
 ---
 
 # Outstanding: one stale doc rationale left behind by the fix

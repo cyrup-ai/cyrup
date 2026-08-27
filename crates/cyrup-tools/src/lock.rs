@@ -44,10 +44,21 @@ static MUTATION_REGISTRATION: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// Test-only observer on the registration chain, so the tests below can assert on its STATE
-/// instead of on a sleep. `pub(crate)` because `crate::tests::mutation_lock_is_first_await` needs
-/// it too; `cfg(test)` because nothing outside the suite may ever reach the static.
+/// instead of on a sleep. Module-private and `cfg(test)`: its only consumer is
+/// `the_registration_chain_spans_key_resolution` in this file's own `mod tests`, which reaches it
+/// through `use super::*`, and nothing outside the suite may ever touch the static.
+///
+/// That test is the one property this observer genuinely fits: the chain is held *across* key
+/// resolution, which is a fact about the process-global `MUTATION_REGISTRATION` itself. The
+/// per-instance `guard_entries` counter below cannot express it.
+///
+/// `crate::tests::mutation_lock_is_first_await` used to share this observer and no longer does.
+/// Its property is per-call, not global, so sampling this static made it read "held" because of a
+/// sibling test and degrade to 2/3 detection under the full suite instead of failing; it now reads
+/// `guard_entries`. Do not re-adopt this `try_lock` for a property that is not about the global --
+/// see the field doc below for the full hazard.
 #[cfg(test)]
-pub(crate) fn registration_is_held() -> bool {
+fn registration_is_held() -> bool {
     MUTATION_REGISTRATION.try_lock().is_err()
 }
 
