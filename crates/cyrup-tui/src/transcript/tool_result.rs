@@ -163,9 +163,10 @@ pub(super) fn strip_bash_footer(output: &str, result: &Value, done: bool) -> Str
         && let Some(path) = full
         && output.ends_with(']')
         && let Some(idx) = output.rfind("\n\n[")
-        && output[idx..].contains(path)
+        && let Some((head, tail)) = output.split_at_checked(idx)
+        && tail.contains(path)
     {
-        return output[..idx].trim_end().to_string();
+        return head.trim_end().to_string();
     }
     output.to_string()
 }

@@ -24,7 +24,13 @@
 //! the guard is structural, the same shape as `run_loop_input_priority.rs` and
 //! `render_cache_tick.rs`. The one behavioural half — the cancel-safety the drain idiom stands
 //! on — is deterministic and is exercised directly on the real `EventStream` type below.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 use futures::{FutureExt, StreamExt};
 

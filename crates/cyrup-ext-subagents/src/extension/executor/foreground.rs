@@ -1,19 +1,20 @@
 //! The foreground single-run path: a real, synchronous OS-subprocess run driven to completion.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use cyrup_core::{CancelToken, ModelId, ToolUpdateSink};
 
 use crate::background::RunId;
-use crate::discovery::types::AgentReadScope;
+use crate::discovery::types::{AgentDefinition, AgentReadScope, OutputMode};
 use crate::error::SubagentError;
 use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::exec::fallback::resolve_model_inheritance;
-use crate::fork_context::{resolve_effective_context, ContextMode};
-use crate::spawn::depth::resolve_effective_depth;
+use crate::fork_context::{resolve_effective_context, ContextMode, ForkContext};
+use crate::registration::SubagentExtensionConfig;
+use crate::spawn::depth::{resolve_effective_depth, DepthEnvelope};
 use crate::extension::EXTENSION_ID;
 use crate::extension::executor::SubagentExecutor;
-use crate::extension::executor::notices::ForegroundControlEntry;
+use crate::extension::executor::notices::{ForegroundControlEntry, ForegroundControlNotifier};
 use crate::extension::executor::paths::{
     drive_foreground_run_sync, write_foreground_output_artifacts,
 };
@@ -22,6 +23,96 @@ use crate::extension::tool::task_items::{
     normalize_single_output_override, parse_tool_output_mode, resolve_single_output_path,
     resolve_single_run_output_base_dir, resolve_single_run_session_root,
 };
+
+/// The persona-and-model half of [`SubagentExecutor::run_foreground_impl`]'s prologue, as resolved
+/// by [`SubagentExecutor::resolve_run_agent`].
+///
+/// Split out as a struct rather than a tuple because the fields divide cleanly in two: `agent`,
+/// `agent_config` and `resolved_context` survive the run's [`RunOptions`] and are still needed to
+/// drive, register and report it; the remaining five are consumed by
+/// [`SubagentExecutor::build_foreground_run_options`] and never read again.
+struct ResolvedRunAgent {
+    /// The resolved persona (pi's `agentConfig` source), alias-canonicalized by discovery.
+    agent: AgentDefinition,
+    /// The persona lowered to an executable config, already carrying SUBA-047's caller tool budget.
+    agent_config: AgentConfig,
+    /// C19 (R-SA-111): the run's *resolved* fork/fresh mode, captured before `fork_context` is
+    /// moved into [`RunOptions`].
+    resolved_context: ContextMode,
+    /// The resolved fork context itself, moved into [`RunOptions::fork_context`].
+    fork_context: ForkContext,
+    /// SUBA-008's three-rung chain: caller > agent frontmatter > extension config.
+    turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-003's `subagents.modelScope` policy, carried on so the fallback ladder's own
+    /// out-of-scope entries warn.
+    model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    /// R-SA-038's availability set, already widened by the explicit override and any inherited
+    /// parent-session model.
+    available_models: Vec<ModelId>,
+    /// The model override that survived the fail-closed `modelScope` gate.
+    effective_override: crate::exec::fallback::ModelOverride,
+}
+
+/// The run-scoped identity, sinks and directories [`SubagentExecutor::resolve_run_channels`]
+/// resolves for one foreground run — everything the run is addressed BY, as opposed to configured
+/// by.
+struct RunChannels {
+    /// R-SA-035: the wall-clock deadline `run_sync` races the child against.
+    deadline_at: Option<std::time::Instant>,
+    /// This run's own real, stable id (pi `runId`).
+    run_id: RunId,
+    /// `subagents.control` merged with this call's own `control` override, resolved ONCE so the
+    /// notifier's channel gate and [`RunOptions::control_config`] cannot disagree.
+    resolved_control: crate::exec::control::ResolvedControlConfig,
+    /// The ordered control-notice pump reading that config.
+    control_notifier: ForegroundControlNotifier,
+    /// T6 artifact-quadruple config (`enabled` already honors SUBA-041's `artifacts: false`).
+    art_cfg: crate::artifacts::ArtifactConfig,
+    /// The artifacts root, which doubles as the base a relative `output` resolves against.
+    art_dir: PathBuf,
+    /// The resolved single-run output path (pi `resolveSingleRunOutputBaseDir` + the persona's own
+    /// `output:` fallback).
+    output_path: Option<PathBuf>,
+    /// `inline` (pi's own default) or `file-only`, from the PARAM alone.
+    output_mode: OutputMode,
+    /// The child's own session directory (`<root>/run-0`), or `None` for pi's `--no-session` branch.
+    session_dir: Option<PathBuf>,
+}
+
+/// Everything [`SubagentExecutor::build_foreground_run_options`] folds into one [`RunOptions`].
+///
+/// Bundled into a borrowed request for the same reason [`ForegroundRunRequest`] is — nineteen
+/// positional arguments is not an API — and the split between owned and borrowed fields is
+/// load-bearing: an owned field is MOVED into the resulting [`RunOptions`], a borrowed one is
+/// cloned there because [`SubagentExecutor::run_foreground_impl`] still needs it to drive and tear
+/// down the run.
+struct ForegroundRunOptionsInput<'a> {
+    overrides: SingleRunOverrides,
+    cwd: &'a Path,
+    timeout_ms: Option<u64>,
+    cancel: CancelToken,
+    /// Borrowed for [`AgentDefinition::default_reads`] (SUBA-054); the caller drives the run with it.
+    agent: &'a AgentDefinition,
+    turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
+    available_models: Vec<ModelId>,
+    effective_override: crate::exec::fallback::ModelOverride,
+    fork_context: ForkContext,
+    deadline_at: Option<std::time::Instant>,
+    /// Borrowed: the same id the caller registers, tears down and returns.
+    run_id: &'a RunId,
+    /// Borrowed: the notifier built from it outlives this call.
+    resolved_control: &'a crate::exec::control::ResolvedControlConfig,
+    /// Borrowed: the caller flushes the very same pump after the run settles.
+    control_notifier: &'a ForegroundControlNotifier,
+    output_path: Option<PathBuf>,
+    output_mode: OutputMode,
+    session_dir: Option<PathBuf>,
+    /// `art_cfg.enabled` — G80 gates verify memoization on the SAME flag as the quadruple.
+    artifacts_enabled: bool,
+    /// Borrowed: the caller writes the artifact quadruple into the same root.
+    art_dir: &'a Path,
+}
 
 impl SubagentExecutor {
 
@@ -125,17 +216,6 @@ impl SubagentExecutor {
         req: ForegroundRunRequest<'_>,
         on_update: Option<ToolUpdateSink>,
     ) -> Result<(SingleResult, RunId), SubagentError> {
-        let ForegroundRunRequest {
-            overrides,
-            cwd,
-            agent_name,
-            task,
-            agent_scope,
-            context,
-            model_override,
-            timeout_ms,
-            cancel,
-        } = req;
         let cfg = self.config_snapshot().await;
         let depth = resolve_effective_depth(cfg.max_subagent_depth);
         if crate::spawn::depth::is_blocked(&depth) {
@@ -145,18 +225,123 @@ impl SubagentExecutor {
             });
         }
 
-        // SUBA-003: the persona AND this cwd's effective `subagents.modelScope` policy come back
-        // from ONE discovery pass, so the scope gating this run's model is the scope on disk right
-        // now (pi `discoverAgents` -> `{ agents, modelScope }`, `agents.ts:1727,1780` @v0.43.0).
+        let ResolvedRunAgent {
+            agent,
+            agent_config,
+            resolved_context,
+            fork_context,
+            turn_budget,
+            model_scope,
+            available_models,
+            effective_override,
+        } = self.resolve_run_agent(&req, &cfg, depth).await?;
+        let ForegroundRunRequest {
+            overrides, cwd, task, timeout_ms, cancel, ..
+        } = req;
+
+        let RunChannels {
+            deadline_at,
+            run_id,
+            resolved_control,
+            control_notifier,
+            art_cfg,
+            art_dir,
+            output_path,
+            output_mode,
+            session_dir,
+        } = self.resolve_run_channels(&cfg, &overrides, cwd, &agent, timeout_ms);
+
+        let run_options = self.build_foreground_run_options(ForegroundRunOptionsInput {
+            overrides,
+            cwd,
+            timeout_ms,
+            cancel,
+            agent: &agent,
+            turn_budget,
+            model_scope,
+            available_models,
+            effective_override,
+            fork_context,
+            deadline_at,
+            run_id: &run_id,
+            resolved_control: &resolved_control,
+            control_notifier: &control_notifier,
+            output_path,
+            output_mode,
+            session_dir,
+            artifacts_enabled: art_cfg.enabled,
+            art_dir: &art_dir,
+        });
+
+        self.register_foreground_controls(&run_id, &run_options, &agent, task).await;
+
+        let art_paths =
+            write_foreground_input_artifact(&art_cfg, &art_dir, &run_id, &agent.name, task);
+
+        let result = drive_foreground_run_sync(
+            &agent_config,
+            task,
+            run_options,
+            &agent.name,
+            resolved_context,
+            on_update,
+        )
+        .await;
+
+        self.settle_foreground_run(&run_id, &control_notifier).await;
+
+        write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
+
+        // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes to
+        // `<cwd>/.cyrup-subagent-scratch/attempt-<n>.jsonl` is this run's persisted, observable child
+        // record and MUST survive the orchestrator, exactly as it does on every other spawn path in
+        // this crate (the tool single/parallel/chain fan-outs and the background hop-2 runner all
+        // leave it in place — it is the single observation channel the crate's integration tests read
+        // back, e.g. `tool_parallel_chain_integration`'s `/run [model=…]` tee check and
+        // `companions_wiring_proof`). This mirrors pi, which likewise never deletes its persisted
+        // child NDJSON stream — pi only cleans the *transient* per-spawn prompt/task-overflow dir it
+        // creates under `os.tmpdir()` (`pi-subagents/src/runs/shared/pi-args.ts:143-158` build it,
+        // `:233-236` `cleanupTempDir` removes it, invoked from
+        // `pi-subagents/src/runs/foreground/execution.ts:1109`), a dir that lives OUTSIDE the working
+        // tree and never holds the event stream. An earlier revision erroneously `remove_dir_all`'d
+        // the whole `.cyrup-subagent-scratch` dir here, which silently discarded that tee the moment a
+        // foreground `/run` completed — defeating the tee's own stated purpose and diverging from
+        // every sibling path — so no such deletion is performed.
+
+        Ok((result, run_id))
+    }
+
+    /// Resolve the persona this foreground run will spawn, together with everything about it
+    /// the run's [`RunOptions`] is built from: its [`AgentConfig`], the effective fork context,
+    /// the three-rung turn budget, the candidate-model ladder and the model override that
+    /// survived [`crate::exec::model_scope`]'s fail-closed gate.
+    ///
+    /// SUBA-003: the persona AND this cwd's effective `subagents.modelScope` policy come back
+    /// from ONE discovery pass, so the scope gating this run's model is the scope on disk right
+    /// now (pi `discoverAgents` -> `{ agents, modelScope }`, `agents.ts:1727,1780` @v0.43.0).
+    ///
+    /// # Errors
+    ///
+    /// Surfaces [`SubagentError::AgentNotFound`]/[`SubagentError::MalformedSettings`] from
+    /// discovery, a hard fork-context failure (R-SA-137), a malformed `subagents.turnBudget`, and
+    /// [`SubagentError::ModelOutOfScope`] — all of them BEFORE the run id is minted and before
+    /// any subprocess is spawned.
+    async fn resolve_run_agent(
+        &self,
+        req: &ForegroundRunRequest<'_>,
+        cfg: &SubagentExtensionConfig,
+        depth: DepthEnvelope,
+    ) -> Result<ResolvedRunAgent, SubagentError> {
         let (agent, model_scope) =
-            self.resolve_agent_with_model_scope(cwd, agent_name, agent_scope)?;
+            self.resolve_agent_with_model_scope(req.cwd, req.agent_name, req.agent_scope)?;
         // Fork default-mode (Tier-2, pi `resolveAgentDefaultContextPolicy`): an OMITTED call-site
         // `context` (`None`) falls back to THIS agent's own `default_context` rather than being forced
         // to `Fresh`; an explicit call-site value still wins (`resolve_effective_context`).
-        let effective_context = resolve_effective_context(context, agent.default_context);
-        let fork_context = self.resolve_context(cwd, effective_context).await?;
+        let effective_context = resolve_effective_context(req.context, agent.default_context);
+        let fork_context = self.resolve_context(req.cwd, effective_context).await?;
         // C19: the run's *resolved* context (R-SA-111) — captured before `fork_context` is moved
-        // into `run_options` below — is what the live-progress payload's `[fork]` badge reflects.
+        // into the run's [`RunOptions`] — is what the live-progress payload's `[fork]` badge
+        // reflects.
         let resolved_context = fork_context.mode;
 
         let mut agent_config = AgentConfig::from_agent_definition(&agent, depth);
@@ -166,7 +351,7 @@ impl SubagentExecutor {
         // exactly that `??` chain: the encoder at `exec/mod.rs`'s spawn overlay reads
         // `agent.tool_budget` and needs no new plumbing, and the precedence stays caller >
         // frontmatter. `None` on the override leaves the persona's own budget untouched.
-        if let Some(budget) = overrides.tool_budget.clone() {
+        if let Some(budget) = req.overrides.tool_budget.clone() {
             agent_config.tool_budget = Some(budget);
         }
         // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget ?? deps.config.turnBudget)`
@@ -179,7 +364,7 @@ impl SubagentExecutor {
         // The config rung is validated (not merely parsed) at this seam, exactly as upstream
         // validates it here rather than at config load: a malformed `subagents.turnBudget` refuses
         // THIS call with upstream's own message instead of silently disarming the budget.
-        let turn_budget = match overrides.turn_budget.or(agent.default_turn_budget) {
+        let turn_budget = match req.overrides.turn_budget.or(agent.default_turn_budget) {
             Some(budget) => Some(budget),
             None => crate::exec::turn_budget::resolve_turn_budget_config(
                 cfg.turn_budget.as_ref(),
@@ -202,7 +387,7 @@ impl SubagentExecutor {
             .cloned()
             .chain(agent_config.model.clone())
             .collect::<Vec<_>>();
-        if let Some(model) = &model_override {
+        if let Some(model) = &req.model_override {
             available_models.push(model.clone());
         }
         // Session-model inheritance (pi `resolveEffectiveSubagentModel(params.model, agentConfig.model,
@@ -227,7 +412,7 @@ impl SubagentExecutor {
         // parent model, not a bare live `ctx.model` read. See
         // [`SubagentExecutor::remembered_parent_model`] for why the two differ.
         let effective_override = resolve_model_inheritance(
-            model_override.as_ref(),
+            req.model_override.as_ref(),
             agent_config.model.as_ref(),
             self.remembered_parent_model().as_ref(),
             &mut available_models,
@@ -235,6 +420,34 @@ impl SubagentExecutor {
         )
         .map_err(|violation| SubagentError::ModelOutOfScope(violation.message))?;
 
+        Ok(ResolvedRunAgent {
+            agent,
+            agent_config,
+            resolved_context,
+            fork_context,
+            turn_budget,
+            model_scope,
+            available_models,
+            effective_override,
+        })
+    }
+
+    /// Resolve everything this run is addressed BY rather than configured by: its wall-clock
+    /// deadline, its [`RunId`], the resolved control config and the ordered notice pump that
+    /// reads it, the T6 artifact quadruple's config + root, the resolved single-run output
+    /// path/mode, and the child's session directory.
+    ///
+    /// Resolved as one phase because they are mutually dependent in exactly this order: the
+    /// artifacts dir is the base a relative `output` resolves against, and the run id scopes
+    /// both it and the session root.
+    fn resolve_run_channels(
+        &self,
+        cfg: &SubagentExtensionConfig,
+        overrides: &SingleRunOverrides,
+        cwd: &Path,
+        agent: &AgentDefinition,
+        timeout_ms: Option<u64>,
+    ) -> RunChannels {
         // R-SA-035 / pi `resolveAttemptTimeout` (`execution.ts:173-181`): the orchestrator computes
         // the wall-clock `deadline_at` ONCE, here, from the nominal `timeout_ms` budget (pi
         // `deadlineAt ?? now + timeoutMs`), and threads BOTH down — `deadline_at` is what `run_sync`
@@ -242,8 +455,10 @@ impl SubagentExecutor {
         let deadline_at =
             timeout_ms.map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms));
 
-        // The run id is minted BEFORE `run_options` so it can also identify the clarify/ask dispatch
-        // context (R-SA-037/119/120) below; it doubles as the artifact-quadruple run id further down.
+        // The run id is minted BEFORE `run_options` so it can also identify the clarify/ask
+        // dispatch context (R-SA-037/119/120) that
+        // [`SubagentExecutor::build_foreground_run_options`] builds; it doubles as the
+        // artifact-quadruple run id [`write_foreground_input_artifact`] names the files after.
         let run_id = RunId::new();
 
         // pi's shared `execute` entry resolves `const controlConfig =
@@ -290,7 +505,7 @@ impl SubagentExecutor {
         // `<artifactsDir>/outputs/<runId>`. This is the base a RELATIVE `output` resolves against —
         // deliberately NOT the run cwd, so a bare `report.md` never lands in the user's repo.
         let output_base_dir =
-            resolve_single_run_output_base_dir(&cfg, &art_dir, &run_id);
+            resolve_single_run_output_base_dir(cfg, &art_dir, &run_id);
         // pi `runSinglePath` (`subagent-executor.ts:3562-3564,3666`): the persona's own `output:` is
         // the fallback for an omitted param and the referent of `output: true`; `outputMode` defaults
         // to `inline` from the PARAM alone (pi never consults the persona's own mode here).
@@ -322,14 +537,56 @@ impl SubagentExecutor {
         // (`runs/shared/pi-args.ts:105-106`). The isolation outcome is the same one pi's scoped root buys: the
         // child never writes into the orchestrator's session store.
         let session_dir =
-            resolve_single_run_session_root(&cfg, overrides.session_dir.as_deref(), &run_id)
+            resolve_single_run_session_root(cfg, overrides.session_dir.as_deref(), &run_id)
                 .map(|root| root.join("run-0"));
 
-        let run_options = RunOptions {
+        RunChannels {
+            deadline_at,
+            run_id,
+            resolved_control,
+            control_notifier,
+            art_cfg,
+            art_dir,
+            output_path,
+            output_mode,
+            session_dir,
+        }
+    }
+
+    /// Fold this run's whole resolved setup into the one [`RunOptions`]
+    /// [`crate::exec::run_sync`] is driven from.
+    ///
+    /// Every field is threaded in from [`SubagentExecutor::run_foreground_impl`]'s prologue —
+    /// nothing is re-derived here — so the value `run_sync` races the child against is
+    /// literally the value the fail-closed gates above it approved.
+    fn build_foreground_run_options(&self, input: ForegroundRunOptionsInput<'_>) -> RunOptions {
+        let ForegroundRunOptionsInput {
+            overrides,
+            cwd,
+            timeout_ms,
+            cancel,
+            agent,
+            turn_budget,
+            model_scope,
+            available_models,
+            effective_override,
+            fork_context,
+            deadline_at,
+            run_id,
+            resolved_control,
+            control_notifier,
+            output_path,
+            output_mode,
+            session_dir,
+            artifacts_enabled,
+            art_dir,
+        } = input;
+        RunOptions {
             // SUBA-021 — pi `config.usageBudget` (`subagent-runner.ts:172`), the caller's single
             // rung. The terminal check lives at `run_sync`'s settle (`exec/mod.rs`).
             usage_budget: overrides.usage_budget,
-            // SUBA-008 — the resolved three-rung chain above (caller > frontmatter > config).
+            // SUBA-008 — the three-rung chain [`SubagentExecutor::resolve_run_agent`] resolved
+            // (caller > frontmatter > config).
             turn_budget,
             // pi sets `enforceHardTurnLimit` only from the slash delegation adapter
             // (`slash/delegation-adapters.ts:298`); the tool surface never does, so the
@@ -426,26 +683,39 @@ impl SubagentExecutor {
             // effectiveParams.control)` (`subagent-executor.ts:3385` @v0.34.0), read by
             // `runSinglePath` off `ExecutionContextData.controlConfig`: the extension-level
             // `subagents.control` block is the base, the call's own `control` object overrides it
-            // field by field. Resolved once above so the notifier's channel gate reads the SAME
-            // value, exactly as pi shares one `ExecutionContextData.controlConfig`.
+            // field by field. Resolved once in [`SubagentExecutor::resolve_run_channels`] so the
+            // notifier's channel gate reads the SAME value, exactly as pi shares one
+            // `ExecutionContextData.controlConfig`.
             control_config: Some(resolved_control.clone()),
             // pi `onControlEvent: createForegroundControlNotifier(data, deps)` (`:1222-1229`).
             on_control_event: Some(control_notifier.sink()),
             // G80 — pi `artifactsDir: options.artifactsDir` reaching `evaluateAcceptance`
             // (`runs/foreground/execution.ts:1704`), which is `artifactsEnabled ?
             // getArtifactsDir(...) : undefined` (`api/preflight.ts:288`). Same `art_dir` the
-            // artifact quadruple below writes into, and gated by the SAME `art_cfg.enabled`, so
+            // artifact quadruple in [`SubagentExecutor::run_foreground_impl`] writes into, and
+            // gated by the SAME `art_cfg.enabled` the caller passed as `artifacts_enabled`, so
             // SUBA-041's `artifacts: false` turns verify memoization off with everything else.
-            artifacts_dir: art_cfg.enabled.then(|| art_dir.clone()),
-        };
+            artifacts_dir: artifacts_enabled.then(|| art_dir.to_path_buf()),
+        }
+    }
 
-        // pi `state.foregroundControls.set(runId, {interrupt, currentAgent, currentIndex})`
-        // (`shared/types.ts` + `runs/foreground/execution.ts`): register this run's live control
-        // surface BEFORE driving it, so a nested-control inbox listener polling in the SAME process
-        // (a fanout child's own `foreground_controls`, `fanout-child.ts:53-128`) can resolve an
-        // interrupt/resume request targeting this run's id while it is in flight. Shares the SAME
-        // token `run_options.interrupt` races the running child's attempt loop against, so firing it
-        // here genuinely soft-interrupts the live run rather than a disconnected flag.
+    /// Publish this run's live control surface — the `foregroundControls` entry and the notice
+    /// machine's matching [`crate::tui::notices::LiveRunView`] — BEFORE the child is driven.
+    ///
+    /// pi `state.foregroundControls.set(runId, {interrupt, currentAgent, currentIndex})`
+    /// (`shared/types.ts` + `runs/foreground/execution.ts`): register this run's live control
+    /// surface BEFORE driving it, so a nested-control inbox listener polling in the SAME process
+    /// (a fanout child's own `foreground_controls`, `fanout-child.ts:53-128`) can resolve an
+    /// interrupt/resume request targeting this run's id while it is in flight. Shares the SAME
+    /// token `run_options.interrupt` races the running child's attempt loop against, so firing it
+    /// here genuinely soft-interrupts the live run rather than a disconnected flag.
+    async fn register_foreground_controls(
+        &self,
+        run_id: &RunId,
+        run_options: &RunOptions,
+        agent: &AgentDefinition,
+        task: &str,
+    ) {
         {
             let mut controls = self
                 .foreground_controls
@@ -477,9 +747,10 @@ impl SubagentExecutor {
 
         // The notice machine's own live-state projection (R-SA-116 check 1: an unknown run is not
         // actionable). Registered alongside the `foregroundControls` entry above and dropped
-        // alongside it below, so the two views of "is this run still live" cannot disagree — pi
-        // reads BOTH off the single `state.foregroundControls` map, which is what
-        // `isForegroundNoticeStillActionable` consults (`control-notices.ts:59-65` @v0.34.0).
+        // alongside it by [`SubagentExecutor::settle_foreground_run`], so the two views of "is this
+        // run still live" cannot disagree — pi reads BOTH off the single `state.foregroundControls`
+        // map, which is what `isForegroundNoticeStillActionable` consults
+        // (`control-notices.ts:59-65` @v0.34.0).
         self.notice_state().lock().await.observe_run(
             run_id.clone(),
             crate::tui::notices::LiveRunView {
@@ -488,42 +759,23 @@ impl SubagentExecutor {
                 needs_attention: false,
             },
         );
+    }
 
-        // T6 artifact quadruple (pi `runs/foreground/execution.ts:960-1074`): record this run's input
-        // BEFORE spawning (so it survives a child crash), then its output/metadata/event-stream AFTER
-        // the run settles. Written into the scoped-temp artifacts root for `cwd` (the Rust analog of
-        // pi's `tempArtifactsDir = getArtifactsDir(null)`, `extension/index.ts:340`). Best-effort: a
-        // failed artifact write never alters the `SingleResult` the caller observes. (`run_id`,
-        // `art_cfg` and `art_dir` were all resolved above — `art_cfg.enabled` already honors
-        // SUBA-041's `artifacts: false`, and `art_dir` doubles as the relative-output base root.)
-        let art_paths =
-            crate::artifacts::artifact_paths(&art_dir, run_id.as_str(), &agent.name, None);
-        if art_cfg.enabled {
-            let _ = crate::artifacts::ensure_artifacts_dir(&art_dir);
-            if art_cfg.include_input {
-                let _ = crate::artifacts::write_artifact(
-                    &art_paths.input_path,
-                    &format!("# Task for {}\n\n{task}", agent.name),
-                );
-            }
-        }
-
-        let result = drive_foreground_run_sync(
-            &agent_config,
-            task,
-            run_options,
-            &agent.name,
-            resolved_context,
-            on_update,
-        )
-        .await;
-
-        // SUBA-N05: drain the ordered control-notice pump FIRST. Every event raised by the run that
-        // just settled is now guaranteed to have been applied to the notice machine's live
-        // projection, so the teardown below cannot be raced by a late event re-registering a
-        // finished run (see `foreground_control_notifier`'s "Ordering" section). Bounded — this can
-        // stall the tool call by at most `FOREGROUND_CONTROL_FLUSH_TIMEOUT`, and only if the pump
-        // has genuinely wedged.
+    /// Tear this run's live control surface back down once it has settled, in the ONE order
+    /// that cannot be raced: drain the notice pump, then drop the `foregroundControls` entry,
+    /// then drop the notice machine's projection of it.
+    ///
+    /// SUBA-N05: drain the ordered control-notice pump FIRST. Every event raised by the run that
+    /// just settled is now guaranteed to have been applied to the notice machine's live
+    /// projection, so the teardown below cannot be raced by a late event re-registering a
+    /// finished run (see `foreground_control_notifier`'s "Ordering" section). Bounded — this can
+    /// stall the tool call by at most `FOREGROUND_CONTROL_FLUSH_TIMEOUT`, and only if the pump
+    /// has genuinely wedged.
+    async fn settle_foreground_run(
+        &self,
+        run_id: &RunId,
+        control_notifier: &ForegroundControlNotifier,
+    ) {
         control_notifier.flush().await;
 
         // The run has settled (success, failure, or interrupted-terminal) — pi's foregroundControls
@@ -543,28 +795,40 @@ impl SubagentExecutor {
         // foreground notice still sitting in its debounce window when the run settles is therefore
         // cancelled outright, and would in any case fail check 1 of the actionability re-check —
         // pi's `if (!control) return false` (`control-notices.ts:60` @v0.34.0).
-        self.notice_state().lock().await.forget_run(&run_id);
-
-        write_foreground_output_artifacts(&art_paths, &art_cfg, run_id.as_str(), &result);
-
-        // R-SA-058: the per-attempt raw-stdout tee `run_sync` writes to
-        // `<cwd>/.cyrup-subagent-scratch/attempt-<n>.jsonl` is this run's persisted, observable child
-        // record and MUST survive the orchestrator, exactly as it does on every other spawn path in
-        // this crate (the tool single/parallel/chain fan-outs and the background hop-2 runner all
-        // leave it in place — it is the single observation channel the crate's integration tests read
-        // back, e.g. `tool_parallel_chain_integration`'s `/run [model=…]` tee check and
-        // `companions_wiring_proof`). This mirrors pi, which likewise never deletes its persisted
-        // child NDJSON stream — pi only cleans the *transient* per-spawn prompt/task-overflow dir it
-        // creates under `os.tmpdir()` (`pi-subagents/src/runs/shared/pi-args.ts:143-158` build it,
-        // `:233-236` `cleanupTempDir` removes it, invoked from
-        // `pi-subagents/src/runs/foreground/execution.ts:1109`), a dir that lives OUTSIDE the working
-        // tree and never holds the event stream. An earlier revision erroneously `remove_dir_all`'d
-        // the whole `.cyrup-subagent-scratch` dir here, which silently discarded that tee the moment a
-        // foreground `/run` completed — defeating the tee's own stated purpose and diverging from
-        // every sibling path — so no such deletion is performed.
-
-        Ok((result, run_id))
+        self.notice_state().lock().await.forget_run(run_id);
     }
+}
+
+/// Write the INPUT leg of this run's T6 artifact quadruple, and return the paths the remaining
+/// three legs are written to once the run settles (by
+/// [`crate::extension::executor::paths::write_foreground_output_artifacts`]).
+///
+/// T6 artifact quadruple (pi `runs/foreground/execution.ts:960-1074`): record this run's input
+/// BEFORE spawning (so it survives a child crash), then its output/metadata/event-stream AFTER
+/// the run settles. Written into the scoped-temp artifacts root for `cwd` (the Rust analog of
+/// pi's `tempArtifactsDir = getArtifactsDir(null)`, `extension/index.ts:340`). Best-effort: a
+/// failed artifact write never alters the `SingleResult` the caller observes. (`run_id`,
+/// `art_cfg` and `art_dir` were all resolved by [`SubagentExecutor::resolve_run_channels`] —
+/// `art_cfg.enabled` already honors SUBA-041's `artifacts: false`, and `art_dir` doubles as the
+/// relative-output base root.)
+fn write_foreground_input_artifact(
+    art_cfg: &crate::artifacts::ArtifactConfig,
+    art_dir: &Path,
+    run_id: &RunId,
+    agent_name: &str,
+    task: &str,
+) -> crate::artifacts::ArtifactPaths {
+    let art_paths = crate::artifacts::artifact_paths(art_dir, run_id.as_str(), agent_name, None);
+    if art_cfg.enabled {
+        let _ = crate::artifacts::ensure_artifacts_dir(art_dir);
+        if art_cfg.include_input {
+            let _ = crate::artifacts::write_artifact(
+                &art_paths.input_path,
+                &format!("# Task for {}\n\n{task}", agent_name),
+            );
+        }
+    }
+    art_paths
 }
 
 #[cfg(test)]

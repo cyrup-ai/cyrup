@@ -632,7 +632,8 @@ impl TreeSelector {
                     }
                     KeyCode::Backspace => {
                         if edit.cursor > 0
-                            && let Some(ch) = edit.query[..edit.cursor].chars().next_back()
+                            && let Some(ch) =
+                                edit.query.get(..edit.cursor).and_then(|s| s.chars().next_back())
                         {
                             let start = edit.cursor - ch.len_utf8();
                             edit.query.replace_range(start..edit.cursor, "");

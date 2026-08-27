@@ -296,25 +296,7 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     // an explicit `tools:` list that omits it.
     require_read_tool: bool,
 ) -> Result<AttemptSpawnPlan, SubagentError> {
-    // SUBA-021 — the CAPABILITY CEILING preflight (pi `resolveCurrentSubagentCapabilityCeiling` +
-    // `assertAgentAllowedByCapabilityCeiling`, `runs/shared/capability-ceiling.ts:168`/`:183`).
-    //
-    // Resolved FIRST, before any argv or env is built, because a ceiling is an upper bound on what
-    // this subtree may do and the only useful place to enforce it is before a child exists. The
-    // resolution intersects the INHERITED ceiling (this process's own
-    // `CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`, which a parent wrote when it spawned us) with every
-    // ceiling registered for this session, so it can only ever tighten as the tree deepens.
-    //
-    // Both arms are fail-CLOSED: a malformed inherited ceiling is an error, not "unbounded".
-    let capability_ceiling = crate::exec::capability_ceiling::resolve_current_capability_ceiling(
-        opts.parent_session_id.as_deref(),
-    )
-    .map_err(SubagentError::CapabilityCeilingViolation)?;
-    crate::exec::capability_ceiling::assert_agent_allowed(
-        agent.name.as_str(),
-        capability_ceiling.as_ref(),
-    )
-    .map_err(SubagentError::CapabilityCeilingViolation)?;
+    let capability_ceiling = preflight_capability_ceiling(agent, opts)?;
 
     let command = crate::spawn::resolve_spawn_command();
 
@@ -331,15 +313,150 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         model_arg,
     ];
 
-    // pi `splitToolList` already ran at discovery time, so a `mcp:`-prefixed entry is a
-    // `ToolRef::Mcp` holding the bare selector (pi's `mcpDirectTools`) and an extension-path entry a
-    // `ToolRef::ExtensionPath` (pi's `toolExtensionPaths`). Re-split those typed refs here to
-    // reproduce pi's three destinations for one `tools` list (`runs/shared/pi-args.ts:104-141`): builtins (plus
-    // resolved MCP names) to `--tools`, extension paths to `--extension`, and the raw MCP selectors
-    // to the `MCP_DIRECT_TOOLS` env.
-    // See the `required_child_tools = Some(allowlist)` assignment below for the full rationale;
-    // declared out here because the value has to survive into the env overlay, which is built
-    // further down.
+    let tools = resolve_child_tools(agent, opts, require_read_tool, &mut args);
+
+    push_extension_and_skill_args(agent, tools.tool_extension_paths, &mut args);
+
+    let persona_temp_file = compose_persona(agent, opts, temp_dir, &mut args)?;
+
+    // Session threading (pi `buildPiArgs`, `runs/shared/pi-args.ts:517-528`) — the FULL branch, both halves:
+    //
+    // * a resolved fork-context session FILE wins outright: its parent directory is created
+    //   (pi's `fs.mkdirSync(path.dirname(sessionFile), { recursive: true })`) and `--session <file>`
+    //   pins the child to it;
+    // * otherwise the child is spawned `--no-session` UNLESS this run enables sessions at all, and
+    //   an explicit `--session-dir <dir>` (directory likewise created up front) points the child's
+    //   session store at the caller's directory.
+    //
+    // `session_enabled` is pi's `execution.ts:1412` `Boolean(sessionFile || sessionDir) || share`:
+    // an explicit `sessionDir` OR `share: true` keeps sessions on; neither means the child must not
+    // persist a session at all. Pre-SUBA-041 only the `--session` half existed, so
+    // [`RunOptions::share`]/[`RunOptions::session_dir`] were inert fields no argv ever read and every
+    // session-less child silently persisted a session the orchestrator never asked for.
+    if let Some(session_path) = &opts.fork_context.session_file_path {
+        if let Some(parent) = session_path.parent() {
+            // Best-effort, exactly like pi's own un-guarded `mkdirSync`: a failure here surfaces as
+            // the child's own session error rather than aborting the spawn plan.
+            let _ = std::fs::create_dir_all(parent);
+        }
+        args.push("--session".to_string());
+        args.push(session_path.display().to_string());
+    } else {
+        let session_enabled = opts.session_dir.is_some() || opts.share == Some(true);
+        if !session_enabled {
+            args.push("--no-session".to_string());
+        }
+        if let Some(session_dir) = &opts.session_dir {
+            let _ = std::fs::create_dir_all(session_dir);
+            args.push("--session-dir".to_string());
+            args.push(session_dir.display().to_string());
+        }
+    }
+
+    let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
+
+    let mut env_overlay =
+        env_identity_and_depth(agent, depth, tools.fanout_authorized, &tools.mcp_direct_tools);
+    env_orchestration(
+        agent,
+        opts,
+        structured_runtime,
+        capability_ceiling.as_ref(),
+        &mut env_overlay,
+    );
+    let tool_diagnostic_path = env_control_channels(
+        opts,
+        temp_dir,
+        tools.required_child_tools,
+        &tools.effective_mcp_tools,
+        &mut env_overlay,
+    );
+
+    let cwd = opts.cwd.clone();
+
+    Ok(AttemptSpawnPlan {
+        spec: ChildSpawnSpec {
+            command: SpawnCommand {
+                binary: command.binary,
+                base_args: command.base_args,
+            },
+            args,
+            task_arg,
+            env_overlay,
+            cwd,
+            // SUBA-030: BOTH spills are registered, so `cleanup_temp_files` removes the persona
+            // file on every exit path exactly as it already removed the over-threshold task file.
+            // A leaked `0600` prompt file would still be unreadable by other users, but it would
+            // outlive the run, which pi's `mkdtemp`-per-spawn scratch directory never does.
+            temp_files: temp_file.into_iter().chain(persona_temp_file).collect(),
+        },
+        tool_diagnostic_path,
+    })
+}
+
+/// SUBA-021 — the CAPABILITY CEILING preflight (pi `resolveCurrentSubagentCapabilityCeiling` +
+/// `assertAgentAllowedByCapabilityCeiling`, `runs/shared/capability-ceiling.ts:168`/`:183`).
+///
+/// Resolved FIRST, before any argv or env is built, because a ceiling is an upper bound on what
+/// this subtree may do and the only useful place to enforce it is before a child exists. The
+/// resolution intersects the INHERITED ceiling (this process's own
+/// `CYRUP_SUBAGENT_CAPABILITY_CEILING_V1`, which a parent wrote when it spawned us) with every
+/// ceiling registered for this session, so it can only ever tighten as the tree deepens.
+///
+/// Both arms are fail-CLOSED: a malformed inherited ceiling is an error, not "unbounded".
+///
+/// # Errors
+///
+/// [`SubagentError::CapabilityCeilingViolation`] when the inherited ceiling cannot be decoded
+/// or when the resolved ceiling excludes this agent.
+fn preflight_capability_ceiling(
+    agent: &AgentConfig,
+    opts: &RunOptions,
+) -> Result<Option<crate::exec::capability_ceiling::ResolvedCapabilityCeiling>, SubagentError> {
+    let capability_ceiling = crate::exec::capability_ceiling::resolve_current_capability_ceiling(
+        opts.parent_session_id.as_deref(),
+    )
+    .map_err(SubagentError::CapabilityCeilingViolation)?;
+    crate::exec::capability_ceiling::assert_agent_allowed(
+        agent.name.as_str(),
+        capability_ceiling.as_ref(),
+    )
+    .map_err(SubagentError::CapabilityCeilingViolation)?;
+    Ok(capability_ceiling)
+}
+
+/// What [`resolve_child_tools`] hands back to the spawn plan: pi's `toolPlan` fields that
+/// outlive the `--tools`/`--extension` argv it also emits (`runs/shared/pi-args.ts:104-141,389-409`
+/// @v0.43.0), each with a consumer further down the plan — the extension threading, the
+/// child-role env pair, the `MCP_DIRECT_TOOLS` selector list and the SUBA-045 diagnostic pair.
+struct ResolvedChildTools {
+    /// pi's `toolPlan.requiredChildTools` — `None` unless the agent pinned a non-empty allowlist.
+    required_child_tools: Option<Vec<String>>,
+    /// pi's `toolPlan.effectiveMcpTools` — the RESOLVED direct-MCP tool names.
+    effective_mcp_tools: Vec<String>,
+    /// pi's `toolExtensionPaths` — the agent's `tools:` entries that name an extension file.
+    tool_extension_paths: Vec<String>,
+    /// pi's `mcpDirectTools` — the raw `mcp:` selectors, as declared.
+    mcp_direct_tools: Vec<String>,
+    /// pi's `toolPlan.fanoutAuthorized` — the agent declared the `subagent` tool itself.
+    fanout_authorized: bool,
+}
+
+/// pi `splitToolList` already ran at discovery time, so a `mcp:`-prefixed entry is a
+/// `ToolRef::Mcp` holding the bare selector (pi's `mcpDirectTools`) and an extension-path entry a
+/// `ToolRef::ExtensionPath` (pi's `toolExtensionPaths`). Re-split those typed refs here to
+/// reproduce pi's three destinations for one `tools` list (`runs/shared/pi-args.ts:104-141`): builtins (plus
+/// resolved MCP names) to `--tools`, extension paths to `--extension`, and the raw MCP selectors
+/// to the `MCP_DIRECT_TOOLS` env.
+/// See the `required_child_tools = Some(allowlist)` assignment below for the full rationale;
+/// declared out here because the value has to survive into the env overlay, which is built
+/// further down.
+fn resolve_child_tools(
+    agent: &AgentConfig,
+    opts: &RunOptions,
+    require_read_tool: bool,
+    args: &mut Vec<String>,
+) -> ResolvedChildTools {
     let mut required_child_tools: Option<Vec<String>> = None;
     // SUBA-045 — pi's `toolPlan.effectiveMcpTools`: the RESOLVED direct-MCP tool names (not the
     // `mcp:` selectors). Empty unless the agent declared `mcp:` entries.
@@ -463,12 +580,26 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         }
     }
 
-    // Extension threading (pi `runs/shared/pi-args.ts:125-137`): `Some(extensions)` turns discovery off
-    // (`--no-extensions`) and pins the exact allowlist; `None` leaves discovery on. In both cases
-    // the agent's own tool-extension paths and child-only extensions are threaded explicitly,
-    // order-preserving and de-duplicated. (This crate does not inject pi's own runtime `.ts`
-    // extensions — cyrup's child-side subagent runtime is env-driven, not a loaded extension file,
-    // a Tier-8 child-side concern — so only agent-declared paths flow through here.)
+    ResolvedChildTools {
+        required_child_tools,
+        effective_mcp_tools,
+        tool_extension_paths,
+        mcp_direct_tools,
+        fanout_authorized,
+    }
+}
+
+/// Extension threading (pi `runs/shared/pi-args.ts:125-137`): `Some(extensions)` turns discovery off
+/// (`--no-extensions`) and pins the exact allowlist; `None` leaves discovery on. In both cases
+/// the agent's own tool-extension paths and child-only extensions are threaded explicitly,
+/// order-preserving and de-duplicated. (This crate does not inject pi's own runtime `.ts`
+/// extensions — cyrup's child-side subagent runtime is env-driven, not a loaded extension file,
+/// a Tier-8 child-side concern — so only agent-declared paths flow through here.)
+fn push_extension_and_skill_args(
+    agent: &AgentConfig,
+    tool_extension_paths: Vec<String>,
+    args: &mut Vec<String>,
+) {
     let mut extension_paths: Vec<String> = Vec::new();
     for path in tool_extension_paths {
         push_unique(&mut extension_paths, path);
@@ -498,11 +629,24 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     if !agent.inherit_skills {
         args.push("--no-skills".to_string());
     }
+}
 
-    // SUBA-001 / pi `runs/shared/pi-args.ts:159-165` (v0.34.0): the persona body ships on EVERY spawn; the
-    // agent's `systemPromptMode` only chooses which flag carries it. See this function's doc
-    // comment for the literal-text-vs-temp-file `[CYRUP-DELTA]` and the empty-body rule.
-    //
+/// SUBA-001 / pi `runs/shared/pi-args.ts:159-165` (v0.34.0): the persona body ships on EVERY spawn; the
+/// agent's `systemPromptMode` only chooses which flag carries it. See [`build_attempt_spawn_plan`]'s doc
+/// comment for the literal-text-vs-temp-file `[CYRUP-DELTA]` and the empty-body rule.
+///
+/// Returns the `0600` spill file the composed body was written to, when one was written, so
+/// the caller can register it for `cleanup_temp_files` (SUBA-030).
+///
+/// # Errors
+///
+/// Propagates [`ChildSpawnSpec::resolve_system_prompt_arg`]'s error (temp-file creation failure).
+fn compose_persona(
+    agent: &AgentConfig,
+    opts: &RunOptions,
+    temp_dir: &std::path::Path,
+    args: &mut Vec<String>,
+) -> Result<Option<std::path::PathBuf>, SubagentError> {
     // pi `execution.ts:1058-1061` folds the agent's persistent-memory block onto the SAME
     // `systemPrompt` string just before it reaches `buildPiArgs`, so a `memory:`-scoped agent
     // carries its accumulated role notes into every run. Same composition here, on the persona body
@@ -610,42 +754,20 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         persona_temp_file = Some(prompt_path);
     }
 
-    // Session threading (pi `buildPiArgs`, `runs/shared/pi-args.ts:517-528`) — the FULL branch, both halves:
-    //
-    // * a resolved fork-context session FILE wins outright: its parent directory is created
-    //   (pi's `fs.mkdirSync(path.dirname(sessionFile), { recursive: true })`) and `--session <file>`
-    //   pins the child to it;
-    // * otherwise the child is spawned `--no-session` UNLESS this run enables sessions at all, and
-    //   an explicit `--session-dir <dir>` (directory likewise created up front) points the child's
-    //   session store at the caller's directory.
-    //
-    // `session_enabled` is pi's `execution.ts:1412` `Boolean(sessionFile || sessionDir) || share`:
-    // an explicit `sessionDir` OR `share: true` keeps sessions on; neither means the child must not
-    // persist a session at all. Pre-SUBA-041 only the `--session` half existed, so
-    // [`RunOptions::share`]/[`RunOptions::session_dir`] were inert fields no argv ever read and every
-    // session-less child silently persisted a session the orchestrator never asked for.
-    if let Some(session_path) = &opts.fork_context.session_file_path {
-        if let Some(parent) = session_path.parent() {
-            // Best-effort, exactly like pi's own un-guarded `mkdirSync`: a failure here surfaces as
-            // the child's own session error rather than aborting the spawn plan.
-            let _ = std::fs::create_dir_all(parent);
-        }
-        args.push("--session".to_string());
-        args.push(session_path.display().to_string());
-    } else {
-        let session_enabled = opts.session_dir.is_some() || opts.share == Some(true);
-        if !session_enabled {
-            args.push("--no-session".to_string());
-        }
-        if let Some(session_dir) = &opts.session_dir {
-            let _ = std::fs::create_dir_all(session_dir);
-            args.push("--session-dir".to_string());
-            args.push(session_dir.display().to_string());
-        }
-    }
+    Ok(persona_temp_file)
+}
 
-    let (task_arg, temp_file) = ChildSpawnSpec::resolve_task_arg(task_text, temp_dir)?;
-
+/// The IDENTITY half of the child env overlay, in upstream's own write order: the incremented
+/// depth envelope (R-SA-054), the child-ROLE pair, the run sentinel, the two agent-identity
+/// markers, the resolved persona name, the agent's inherit flags and the raw direct-MCP
+/// selector list. Every key here is a function of the AGENT and the tree position alone, so
+/// none of it depends on the run's orchestration wiring below.
+fn env_identity_and_depth(
+    agent: &AgentConfig,
+    depth: DepthEnvelope,
+    fanout_authorized: bool,
+    mcp_direct_tools: &[String],
+) -> std::collections::HashMap<String, String> {
     let mut env_overlay = crate::spawn::depth::to_env_overlay(&depth);
     // PERM-001 / pi `augmentChildEnv` (`runs/shared/pi-args.ts:329-330`): the child-ROLE pair, written on EVERY
     // spawn. This is the process about to BE a subagent child, so it must say so — see
@@ -722,6 +844,21 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         },
     );
 
+    env_overlay
+}
+
+/// The ORCHESTRATION half of the child env overlay, applied AFTER
+/// [`env_identity_and_depth`] and in upstream's own write order: the parent-session anchor,
+/// the child watchdog config, the intercom child bridge plus its native supervisor channel,
+/// the structured-output runtime, and the two encoded blobs (tool budget, capability ceiling).
+/// Every key here is a function of the RUN, not of the agent alone.
+fn env_orchestration(
+    agent: &AgentConfig,
+    opts: &RunOptions,
+    structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
+    capability_ceiling: Option<&crate::exec::capability_ceiling::ResolvedCapabilityCeiling>,
+    env_overlay: &mut std::collections::HashMap<String, String>,
+) {
     // R-SA-P1 (port doc §4 P-4): the canonical parent-session anchor. Precedence: EXPLICIT (the
     // launching session's own id, resolved at the root's SessionStart via P-2 and threaded through
     // `opts.parent_session_id`) → INHERITED (this process's own `CYRUP_SUBAGENT_PARENT_SESSION`, so a
@@ -884,14 +1021,26 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
     // no var, so an unbounded run does not inherit a stale bound from the parent's environment (the
     // overlay only ever adds).
     if let Some(encoded) =
-        crate::exec::capability_ceiling::encode_capability_ceiling(capability_ceiling.as_ref())
+        crate::exec::capability_ceiling::encode_capability_ceiling(capability_ceiling)
     {
         env_overlay.insert(
             crate::exec::capability_ceiling::CAPABILITY_CEILING_ENV.to_string(),
             encoded,
         );
     }
+}
 
+/// The CONTROL-CHANNEL half of the child env overlay, applied last: the SUBA-045
+/// tool-availability diagnostic pair and the three SUBA-049/G90 steer paths. Each is a channel
+/// the PARENT reads back or writes into while the child runs, which is why they are grouped and
+/// why the diagnostic path is returned rather than re-derived from the overlay at settle.
+fn env_control_channels(
+    opts: &RunOptions,
+    temp_dir: &std::path::Path,
+    required_child_tools: Option<Vec<String>>,
+    effective_mcp_tools: &[String],
+    env_overlay: &mut std::collections::HashMap<String, String>,
+) -> Option<PathBuf> {
     // SUBA-045 (pi `pi-args.ts:610-621`): the diagnostic path and the resolved direct-MCP names go
     // out BESIDE the required-tools list and under upstream's own gate — `if
     // (toolPlan.requiredChildTools.length > 0)`. An agent with no explicit `tools:` requires
@@ -977,26 +1126,7 @@ pub fn build_attempt_spawn_plan_with_read_requirement(
         );
     }
 
-    let cwd = opts.cwd.clone();
-
-    Ok(AttemptSpawnPlan {
-        spec: ChildSpawnSpec {
-            command: SpawnCommand {
-                binary: command.binary,
-                base_args: command.base_args,
-            },
-            args,
-            task_arg,
-            env_overlay,
-            cwd,
-            // SUBA-030: BOTH spills are registered, so `cleanup_temp_files` removes the persona
-            // file on every exit path exactly as it already removed the over-threshold task file.
-            // A leaked `0600` prompt file would still be unreadable by other users, but it would
-            // outlive the run, which pi's `mkdtemp`-per-spawn scratch directory never does.
-            temp_files: temp_file.into_iter().chain(persona_temp_file).collect(),
-        },
-        tool_diagnostic_path,
-    })
+    tool_diagnostic_path
 }
 
 /// Compose the final task text handed to the child: acceptance-contract injection (R-SA-023), then

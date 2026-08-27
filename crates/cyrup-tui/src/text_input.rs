@@ -112,26 +112,30 @@ impl TextInputSelector {
     }
 
     fn backspace(&mut self) {
-        let Some(ch) = self.buffer[..self.cursor].chars().next_back() else { return };
+        let Some(ch) = self.buffer.get(..self.cursor).and_then(|s| s.chars().next_back()) else {
+            return;
+        };
         let start = self.cursor - ch.len_utf8();
         self.buffer.replace_range(start..self.cursor, "");
         self.cursor = start;
     }
 
     fn delete_forward(&mut self) {
-        let Some(ch) = self.buffer[self.cursor..].chars().next() else { return };
+        let Some(ch) = self.buffer.get(self.cursor..).and_then(|s| s.chars().next()) else {
+            return;
+        };
         let end = self.cursor + ch.len_utf8();
         self.buffer.replace_range(self.cursor..end, "");
     }
 
     fn cursor_left(&mut self) {
-        if let Some(ch) = self.buffer[..self.cursor].chars().next_back() {
+        if let Some(ch) = self.buffer.get(..self.cursor).and_then(|s| s.chars().next_back()) {
             self.cursor -= ch.len_utf8();
         }
     }
 
     fn cursor_right(&mut self) {
-        if let Some(ch) = self.buffer[self.cursor..].chars().next() {
+        if let Some(ch) = self.buffer.get(self.cursor..).and_then(|s| s.chars().next()) {
             self.cursor += ch.len_utf8();
         }
     }

@@ -531,12 +531,13 @@ impl Key {
                 // `clear` (`keys.ts:119`) is deliberately absent: crossterm's `KeyCode` has no
                 // counterpart, so there is nothing to map it to.
                 "insert" | "ins" => code = Some(KeyCode::Insert),
-                other if other.len() >= 2
-                    && other.starts_with('f')
-                    && other[1..].bytes().all(|b| b.is_ascii_digit()) =>
+                other
+                    if other
+                        .strip_prefix('f')
+                        .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit())) =>
                 {
-                    match other[1..].parse::<u8>() {
-                        Ok(n @ 1..=12) => code = Some(KeyCode::F(n)),
+                    match other.strip_prefix('f').and_then(|d| d.parse::<u8>().ok()) {
+                        Some(n @ 1..=12) => code = Some(KeyCode::F(n)),
                         _ => return Err(TuiError::KeySpec(s.to_string())),
                     }
                 }

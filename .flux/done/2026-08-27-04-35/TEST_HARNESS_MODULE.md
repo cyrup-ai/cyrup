@@ -1,10 +1,18 @@
 ---
-stage: new
-status: done
-updated: 2026-08-22 18:31
+stage: qa
+status: completed
+updated: 2026-08-27 04:35
 ---
 
 # Add src/tests/harness.rs, Migrate The 46 Duplicated Scrape And Key Helpers, And Document Placement
+
+> **Closed by verification, not by a flux session.** The work landed via PR #58 and PR #68;
+> this file was parked in `backlog/` with the `/task`-authored `status: done` frontmatter, which
+> records only that the file was written. Every acceptance criterion above was re-checked against
+> `main` by command before filing, plus the shared gate: `cargo build -p cyrup-tui` 0 warnings,
+> `cargo test -p cyrup-tui` 1271 passed, `cargo clippy -p cyrup-tui --all-targets` reporting only
+> the pre-existing `escape_reassembly.rs:972`. The timestamp is a filing date, not authorship.
+
 
 > Identified by the `cyrup-tui` hygiene audit (6-dimension fan-out, adversarially verified).
 > **Priority:** medium · **Effort:** medium

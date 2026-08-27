@@ -5,8 +5,9 @@ use std::path::{Path, PathBuf};
 
 use cyrup_core::{CancelToken, ModelId, ToolError, ToolResult, ToolUpdateSink};
 
-use crate::background::RunMode;
+use crate::background::{RunId, RunMode};
 use crate::discovery::discover_agents;
+use crate::exec::SingleResult;
 use crate::exec::acceptance::lower_acceptance_input as parse_single_acceptance;
 use crate::fork_context::ContextMode;
 use crate::spawn::chain_graph::{ParallelGroupSpec, RunnerStep, SingleStepSpec, StepResult};
@@ -31,6 +32,30 @@ use crate::extension::tool::task_items::{
     parse_tool_chain_items, parse_tool_task_items, render_parallel_tool_summary, tool_task_to_spec,
 };
 use crate::extension::tool::text::unknown_subagent_action_message;
+
+/// The resolved SINGLE-mode call [`SubagentTool::route_single`]'s prologue hands to
+/// [`SubagentTool::route_single_background`].
+///
+/// Every field is *threaded* from that prologue rather than re-derived on the background branch —
+/// `task`/`context`/`model` in particular are read off the ORIGINAL params, before the
+/// `applySingleAgentLaunchDefaults` rebind, and `overrides` is the very bundle the foreground
+/// branch goes on to consume, so the two paths cannot disagree about what a param meant. They
+/// travel as one struct because passing them positionally would put the helper over clippy's
+/// argument ceiling.
+struct SingleBackgroundDispatch<'a> {
+    /// This call's params, already carrying [`SubagentExecutor::single_agent_launch_defaults`]'
+    /// `async:` fallback (the rebind that decided this branch was taken at all).
+    p: &'a SubagentToolParams,
+    cwd: &'a Path,
+    agent: &'a str,
+    task: &'a str,
+    context: Option<ContextMode>,
+    model: Option<ModelId>,
+    /// SUBA-041's override bundle, borrowed: hop 2 clones what it needs out of it.
+    overrides: &'a SingleRunOverrides,
+    /// Already validated + de-aliased by `resolve_foreground_timeout`.
+    timeout_ms: Option<u64>,
+}
 
 impl SubagentTool {
 
@@ -255,82 +280,7 @@ impl SubagentTool {
         let context = p.context_override();
         let model = p.model.clone().map(ModelId::from);
 
-        // SUBA-041, as amended by SUBA-N05 and then SUBA-N06: this dispatcher no longer refuses ANY
-        // advertised SINGLE-mode parameter outright.
-        //
-        // `control` came off the list in SUBA-N05. It was there for exactly one reason — this port
-        // had `registration::ControlConfig`'s SHAPE but neither `resolveControlConfig` nor the
-        // control-notice pipeline behind it — and that reason is gone: `exec::control` now ports
-        // `runs/shared/subagent-control.ts` in full, `run_sync` raises real `ControlEvent`s off the
-        // child's NDJSON stream, and `SubagentExecutor::foreground_control_notifier` feeds them to
-        // the (previously producer-less) `tui::notices::ControlNoticeState`.
-        //
-        // `includeProgress` came off in SUBA-N06, and for the same shape of reason. It was refused
-        // because `SingleResult` carried no progress object to include or omit — R-SA-043
-        // compaction with no opt-out. It now has one: `exec::AgentProgress::snapshot` projects the
-        // winning attempt's fold into pi's `AgentProgress` wire shape and `run_sync` publishes it
-        // on `SingleResult::progress` when — and only when — this flag is `Some(true)`, matching
-        // pi's `progress: params.includeProgress ? allProgress : undefined`
-        // (`subagent-executor.ts:3819` @v0.43.0). It is advertised in the tool schema again and
-        // honoured on BOTH the foreground path (`SingleRunOverrides::include_progress` →
-        // `RunOptions::include_progress`) and the async one (`BackgroundSingleRequest::
-        // include_progress` → `RunnerConfig::include_progress` → every hop-2 step's `RunOptions`).
-        //
-        // `chainDir` is CHAIN-mode-only in pi (it resolves `{chain_dir}` for chain steps) so it is
-        // not gated here for SINGLE mode.
-
-        // SUBA-041: the SINGLE-mode overrides pi's `runSinglePath` honors, resolved here and
-        // carried into `run_foreground_impl` as one bundle. `acceptance` is validated up front
-        // through pi's own `validateAcceptanceInput` (`subagent-executor.ts:1418`) so a malformed
-        // policy is refused BEFORE agent resolution and before any child spawns.
-        let overrides = SingleRunOverrides {
-            // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget …)`
-            // (`subagent-executor.ts:4928`): a malformed budget is a hard refusal at the tool
-            // boundary with upstream's own message, not a silent downgrade to "unbudgeted". The
-            // frontmatter and config rungs below it are applied by `run_foreground_impl`.
-            turn_budget: crate::exec::turn_budget::resolve_turn_budget_config(
-                p.turn_budget.as_ref(),
-                "turnBudget",
-            )
-            .map_err(ToolError::new)?,
-            // SUBA-021 / pi `validateUsageBudgetConfig(params.usageBudget)`: same seam, same
-            // fail-closed rule — a malformed budget is a hard refusal carrying upstream's own
-            // sentence, never a silent downgrade to an unbudgeted run.
-            usage_budget: crate::exec::usage_budget::validate_usage_budget_config(
-                p.usage_budget.as_ref(),
-                "usageBudget",
-            )
-            .map_err(ToolError::new)?,
-            output: p.output.clone(),
-            output_mode: p.output_mode.clone(),
-            skills: normalize_skill_input(p.skill.as_ref()),
-            acceptance: match p.acceptance.as_ref() {
-                Some(raw) => parse_single_acceptance(raw).map_err(ToolError::new)?,
-                None => None,
-            },
-            share: p.share,
-            session_dir: p.session_dir.clone(),
-            artifacts: p.artifacts,
-            // SUBA-N05 / pi `effectiveParams.control` (`subagent-executor.ts:1179`). Lowered
-            // tolerantly (a wrong-typed threshold or an unknown `notifyOn` string degrades to
-            // "that field was not supplied", exactly as `parsePositiveInt`/`parseControlList` do)
-            // rather than hard-failing the call — see `parse_control_overrides`.
-            control: p.control.as_ref().map(crate::exec::control::parse_control_overrides),
-            // SUBA-N06 / pi `params.includeProgress`. Passed through untouched: `run_sync` applies
-            // pi's own `? :` truthiness gate, so an explicit `false` behaves exactly like an
-            // omitted flag.
-            include_progress: p.include_progress,
-            // SUBA-043 / pi `params.outputSchema` (`subagent-executor.ts:3651,3671` @v0.43.0).
-            output_schema: p.output_schema.clone(),
-            // SUBA-047 / pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
-            // (`async-execution.ts:1299`): a malformed budget is a hard refusal at the tool
-            // boundary, with pi's own message text, not a silent downgrade to "unbudgeted".
-            tool_budget: crate::exec::tool_budget::validate_tool_budget_config(
-                p.tool_budget.as_ref(),
-                "toolBudget",
-            )
-            .map_err(ToolError::new)?,
-        };
+        let overrides = Self::single_run_overrides(p)?;
 
         // pi's own `validateFileOnlyOutputMode` gate (`single-output.ts:140-145`, applied at
         // `subagent-executor.ts:2883-2886`) fires AFTER the persona is resolved, because a persona's
@@ -391,123 +341,18 @@ impl SubagentTool {
             _ => p,
         };
         if p.is_background(&cfg, depth) {
-            // SUBA-N03 — there is NO foreground-only refusal on this branch any more, because
-            // every one of the nine advertised SINGLE-mode params now genuinely reaches hop 2.
-            //
-            // **The refusal that stood here cited a precedent that does not exist.** Its comment
-            // read "mirrors pi's own precedent of erroring on timeoutMs + async
-            // (subagent-executor.ts:3022)". At v0.34.0, `subagent-executor.ts:3015-3030` is
-            // FOREGROUND intercom-receipt construction (`maybeBuildForegroundIntercomReceipt`) and
-            // has nothing to do with timeouts or async; `git grep` over the whole of v0.34.0 `src/`
-            // finds no timeout-vs-async refusal anywhere in the package. Upstream does the exact
-            // OPPOSITE — `extension/schemas.ts:265-266` and `extension/tool-description.ts:25,:73`
-            // each state that `timeoutMs`/`maxRuntimeMs` apply to "foreground and async/background
-            // runs", and `runs/background/async-execution.ts:924` arms
-            // `deadlineAt = Date.now() + params.timeoutMs` for `executeAsyncSingle`, which
-            // `subagent-runner.ts:2078-2081` turns into a live run-level timer.
-            //
-            // The other eight were refused for one honest reason, now removed: the second-hop
-            // `RunnerConfig` boundary was strictly NARROWER than the foreground `RunOptions`, so a
-            // param accepted here would have been dropped on the floor by the detached runner —
-            // the advertised-and-silently-dropped defect SUBA-041 exists to prevent. Widening that
-            // boundary to upstream's own field set (`spawnRunner({ …, share, sessionDir,
-            // artifactsDir, artifactConfig, timeoutMs, deadlineAt, … })` plus the step's own
-            // `outputPath`/`outputMode`/`skills`, `async-execution.ts:930-996`) was always the work
-            // the refusal was standing in for, and it is now done:
-            //
-            // * `output`/`outputMode` -> resolved parent-side against the run-scoped output base
-            //   dir (`resolve_single_run_output_base_dir`, pi `:2203-2207`) onto the step's
-            //   `output_path`/`output_mode`;
-            // * `skill` -> the step's new `skills` field;
-            // * `sessionDir` -> resolved parent-side onto the step's new `session_dir`;
-            // * `share`/`artifacts`/`timeoutMs` -> new `RunnerConfig` fields;
-            // * `acceptance` (SUBA-N04), `control` (SUBA-N05) and `includeProgress` (SUBA-N06) were
-            //   wired by their own units and are unchanged here.
-            //
-            // This mattered beyond the explicit `async: true` call: `asyncByDefault` /
-            // `forceTopLevelAsync` route EVERY top-level `subagent` call down this branch, so the
-            // refusal made nine schema-advertised params unusable for whole configurations.
-            let run_id = self
-                .executor
-                .spawn_background(BackgroundSingleRequest {
-                    // SUBA-021 / pi `usageBudget: params.usageBudget` on the async SINGLE step builder
-                    // (`async-execution.ts:1471`): the same validated caller rung the foreground path uses.
-                    usage_budget: crate::exec::usage_budget::validate_usage_budget_config(
-                        p.usage_budget.as_ref(),
-                        "usageBudget",
-                    )
-                    .map_err(ToolError::new)?,
-                    // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget …)`
-                    // (`subagent-executor.ts:4928`): the async SINGLE branch validates the caller's
-                    // budget exactly as the foreground branch does, so `{…, turnBudget, async:true}`
-                    // is neither silently unbudgeted nor silently lenient.
-                    turn_budget: crate::exec::turn_budget::resolve_turn_budget_config(
-                        p.turn_budget.as_ref(),
-                        "turnBudget",
-                    )
-                    .map_err(ToolError::new)?,
-                    // SUBA-043 / pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0):
-                    // the async SINGLE branch forwards the top-level schema exactly as the
-                    // foreground branch does, so `{agent, task, outputSchema, async:true}` is not a
-                    // silently weaker call than the same request without `async`.
-                    structured_output_schema: p.output_schema.clone(),
-                    // SUBA-047 / pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
-                    // (`async-execution.ts:1299` @v0.43.0). Validated here for the same reason the
-                    // foreground branch validates it: a malformed budget must refuse the call, not
-                    // silently downgrade to "unbudgeted".
-                    tool_budget: crate::exec::tool_budget::validate_tool_budget_config(
-                        p.tool_budget.as_ref(),
-                        "toolBudget",
-                    )
-                    .map_err(ToolError::new)?,
+            return self
+                .route_single_background(SingleBackgroundDispatch {
+                    p,
                     cwd,
-                    agent_name: agent,
+                    agent,
                     task: &task,
                     context,
-                    model_override: model.clone(),
-                    agent_scope: resolve_execution_agent_scope(p.agent_scope.as_deref()),
-                    // SUBA-N04: the raw policy, already validated by `validate_execution_acceptance`
-                    // at the tool boundary; hop 2 lowers it per step.
-                    acceptance: p.acceptance.clone(),
-                    // SUBA-N05: the raw per-call `control` override. `spawn_background` folds it
-                    // against `subagents.control` and carries the RESOLVED value to hop 2 — pi
-                    // `executeAsyncSingle(id, { ..., controlConfig, ... })`,
-                    // `subagent-executor.ts:2845,2868-2870` @v0.34.0. Before this it was parsed,
-                    // absent from the foreground-only refusal list, and dropped on the floor.
-                    control: overrides.control.clone(),
-                    // SUBA-N03: the six params this branch used to refuse, taken from the SAME
-                    // `overrides` bundle the foreground path consumes — so the two paths cannot
-                    // disagree about what a given param meant (`skills` in particular is already
-                    // `normalize_skill_input`-normalized, so `skill: false` reaches hop 2 as the
-                    // explicit empty list rather than as "omitted").
-                    output: overrides.output.clone(),
-                    output_mode: overrides.output_mode.clone(),
-                    skills: overrides.skills.clone(),
-                    share: overrides.share,
-                    session_dir: overrides.session_dir.clone(),
-                    artifacts: overrides.artifacts,
-                    // SUBA-N03: already validated + de-aliased by `resolve_foreground_timeout`
-                    // (pi `resolveForegroundTimeout`, `:1327-1341`), whose positivity and
-                    // both-given-must-agree checks are mode-independent.
+                    model,
+                    overrides: &overrides,
                     timeout_ms,
-                    include_progress: overrides.include_progress,
                 })
-                .await
-                .map_err(|e| ToolError::new(e.to_string()))?;
-            // R-SA-074: return immediately after confirmed spawn; instruct against busy-polling.
-            // pi `executeAsyncSingle` (`async-execution.ts:1515-1518`): the headline is `Async: {agent}
-            // [{id}]`, followed by `formatAsyncStartedMessage`'s fixed guidance, and `details` is
-            // `{ mode: "single", runId, results: [], asyncId, asyncDir }` (`async-execution.ts:1563`;
-            // `asyncId` === `runId` for a SINGLE run, pi's own async-run identity convention).
-            // `asyncDir` is what binds this run to its mission — see [`async_dir_for_run`].
-            return Ok(ToolResult {
-                content: vec![cyrup_core::Content::text(format_async_started_message(&format!(
-                    "Async: {agent} [{run_id}]"
-                )))],
-                details: Some(async_launch_details("single", &run_id, cwd)),
-                terminate: false,
-                ..Default::default()
-            });
+                .await;
         }
 
         // C19: stream live foreground progress through the host `ToolUpdateSink` — the child's
@@ -533,9 +378,243 @@ impl SubagentTool {
             .await
             .map_err(|e| ToolError::new(e.to_string()))?;
 
-        // Single-run result surfacing (pi `subagent-executor.ts:2738-2761`). `final_output` is the
-        // finalized delivered output (`run_sync` already folded in the timeout preamble and any
-        // saved-output reference), i.e. pi's `finalizedOutput.displayOutput`.
+        self.render_single_result(result, run_id, agent, context, p.include_progress)
+            .await
+    }
+
+    /// Lower every advertised SINGLE-mode param into the one [`SingleRunOverrides`] bundle both of
+    /// [`Self::route_single`]'s branches consume.
+    ///
+    /// SUBA-041, as amended by SUBA-N05 and then SUBA-N06: [`Self::route_single`] no longer refuses
+    /// ANY advertised SINGLE-mode parameter outright.
+    ///
+    /// `control` came off the list in SUBA-N05. It was there for exactly one reason — this port
+    /// had `registration::ControlConfig`'s SHAPE but neither `resolveControlConfig` nor the
+    /// control-notice pipeline behind it — and that reason is gone: `exec::control` now ports
+    /// `runs/shared/subagent-control.ts` in full, `run_sync` raises real `ControlEvent`s off the
+    /// child's NDJSON stream, and `SubagentExecutor::foreground_control_notifier` feeds them to
+    /// the (previously producer-less) `tui::notices::ControlNoticeState`.
+    ///
+    /// `includeProgress` came off in SUBA-N06, and for the same shape of reason. It was refused
+    /// because `SingleResult` carried no progress object to include or omit — R-SA-043
+    /// compaction with no opt-out. It now has one: `exec::AgentProgress::snapshot` projects the
+    /// winning attempt's fold into pi's `AgentProgress` wire shape and `run_sync` publishes it
+    /// on `SingleResult::progress` when — and only when — this flag is `Some(true)`, matching
+    /// pi's `progress: params.includeProgress ? allProgress : undefined`
+    /// (`subagent-executor.ts:3819` @v0.43.0). It is advertised in the tool schema again and
+    /// honoured on BOTH the foreground path (`SingleRunOverrides::include_progress` →
+    /// `RunOptions::include_progress`) and the async one (`BackgroundSingleRequest::
+    /// include_progress` → `RunnerConfig::include_progress` → every hop-2 step's `RunOptions`).
+    ///
+    /// `chainDir` is CHAIN-mode-only in pi (it resolves `{chain_dir}` for chain steps) so it is
+    /// not gated here for SINGLE mode.
+    ///
+    /// SUBA-041: the SINGLE-mode overrides pi's `runSinglePath` honors, resolved here and
+    /// carried into `run_foreground_impl` as one bundle. `acceptance` is validated up front
+    /// through pi's own `validateAcceptanceInput` (`subagent-executor.ts:1418`) so a malformed
+    /// policy is refused BEFORE agent resolution and before any child spawns.
+    fn single_run_overrides(p: &SubagentToolParams) -> Result<SingleRunOverrides, ToolError> {
+        Ok(SingleRunOverrides {
+            // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget …)`
+            // (`subagent-executor.ts:4928`): a malformed budget is a hard refusal at the tool
+            // boundary with upstream's own message, not a silent downgrade to "unbudgeted". The
+            // frontmatter and config rungs below it are applied by `run_foreground_impl`.
+            turn_budget: crate::exec::turn_budget::resolve_turn_budget_config(
+                p.turn_budget.as_ref(),
+                "turnBudget",
+            )
+            .map_err(ToolError::new)?,
+            // SUBA-021 / pi `validateUsageBudgetConfig(params.usageBudget)`: same seam, same
+            // fail-closed rule — a malformed budget is a hard refusal carrying upstream's own
+            // sentence, never a silent downgrade to an unbudgeted run.
+            usage_budget: crate::exec::usage_budget::validate_usage_budget_config(
+                p.usage_budget.as_ref(),
+                "usageBudget",
+            )
+            .map_err(ToolError::new)?,
+            output: p.output.clone(),
+            output_mode: p.output_mode.clone(),
+            skills: normalize_skill_input(p.skill.as_ref()),
+            acceptance: match p.acceptance.as_ref() {
+                Some(raw) => parse_single_acceptance(raw).map_err(ToolError::new)?,
+                None => None,
+            },
+            share: p.share,
+            session_dir: p.session_dir.clone(),
+            artifacts: p.artifacts,
+            // SUBA-N05 / pi `effectiveParams.control` (`subagent-executor.ts:1179`). Lowered
+            // tolerantly (a wrong-typed threshold or an unknown `notifyOn` string degrades to
+            // "that field was not supplied", exactly as `parsePositiveInt`/`parseControlList` do)
+            // rather than hard-failing the call — see `parse_control_overrides`.
+            control: p.control.as_ref().map(crate::exec::control::parse_control_overrides),
+            // SUBA-N06 / pi `params.includeProgress`. Passed through untouched: `run_sync` applies
+            // pi's own `? :` truthiness gate, so an explicit `false` behaves exactly like an
+            // omitted flag.
+            include_progress: p.include_progress,
+            // SUBA-043 / pi `params.outputSchema` (`subagent-executor.ts:3651,3671` @v0.43.0).
+            output_schema: p.output_schema.clone(),
+            // SUBA-047 / pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
+            // (`async-execution.ts:1299`): a malformed budget is a hard refusal at the tool
+            // boundary, with pi's own message text, not a silent downgrade to "unbudgeted".
+            tool_budget: crate::exec::tool_budget::validate_tool_budget_config(
+                p.tool_budget.as_ref(),
+                "toolBudget",
+            )
+            .map_err(ToolError::new)?,
+        })
+    }
+
+    /// [`Self::route_single`]'s background branch: hand the call to
+    /// [`SubagentExecutor::spawn_background`] and return pi's async-started receipt.
+    ///
+    /// SUBA-N03 — there is NO foreground-only refusal on this branch any more, because
+    /// every one of the nine advertised SINGLE-mode params now genuinely reaches hop 2.
+    ///
+    /// **The refusal that stood here cited a precedent that does not exist.** Its comment
+    /// read "mirrors pi's own precedent of erroring on timeoutMs + async
+    /// (subagent-executor.ts:3022)". At v0.34.0, `subagent-executor.ts:3015-3030` is
+    /// FOREGROUND intercom-receipt construction (`maybeBuildForegroundIntercomReceipt`) and
+    /// has nothing to do with timeouts or async; `git grep` over the whole of v0.34.0 `src/`
+    /// finds no timeout-vs-async refusal anywhere in the package. Upstream does the exact
+    /// OPPOSITE — `extension/schemas.ts:265-266` and `extension/tool-description.ts:25,:73`
+    /// each state that `timeoutMs`/`maxRuntimeMs` apply to "foreground and async/background
+    /// runs", and `runs/background/async-execution.ts:924` arms
+    /// `deadlineAt = Date.now() + params.timeoutMs` for `executeAsyncSingle`, which
+    /// `subagent-runner.ts:2078-2081` turns into a live run-level timer.
+    ///
+    /// The other eight were refused for one honest reason, now removed: the second-hop
+    /// `RunnerConfig` boundary was strictly NARROWER than the foreground `RunOptions`, so a
+    /// param accepted here would have been dropped on the floor by the detached runner —
+    /// the advertised-and-silently-dropped defect SUBA-041 exists to prevent. Widening that
+    /// boundary to upstream's own field set (`spawnRunner({ …, share, sessionDir,
+    /// artifactsDir, artifactConfig, timeoutMs, deadlineAt, … })` plus the step's own
+    /// `outputPath`/`outputMode`/`skills`, `async-execution.ts:930-996`) was always the work
+    /// the refusal was standing in for, and it is now done:
+    ///
+    /// * `output`/`outputMode` -> resolved parent-side against the run-scoped output base
+    ///   dir (`resolve_single_run_output_base_dir`, pi `:2203-2207`) onto the step's
+    ///   `output_path`/`output_mode`;
+    /// * `skill` -> the step's new `skills` field;
+    /// * `sessionDir` -> resolved parent-side onto the step's new `session_dir`;
+    /// * `share`/`artifacts`/`timeoutMs` -> new `RunnerConfig` fields;
+    /// * `acceptance` (SUBA-N04), `control` (SUBA-N05) and `includeProgress` (SUBA-N06) were
+    ///   wired by their own units and are unchanged here.
+    ///
+    /// This mattered beyond the explicit `async: true` call: `asyncByDefault` /
+    /// `forceTopLevelAsync` route EVERY top-level `subagent` call down this branch, so the
+    /// refusal made nine schema-advertised params unusable for whole configurations.
+    async fn route_single_background(
+        &self,
+        dispatch: SingleBackgroundDispatch<'_>,
+    ) -> Result<ToolResult, ToolError> {
+        let SingleBackgroundDispatch {
+            p,
+            cwd,
+            agent,
+            task,
+            context,
+            model,
+            overrides,
+            timeout_ms,
+        } = dispatch;
+        let run_id = self
+            .executor
+            .spawn_background(BackgroundSingleRequest {
+                // SUBA-021 / pi `usageBudget: params.usageBudget` on the async SINGLE step builder
+                // (`async-execution.ts:1471`): the same validated caller rung the foreground path uses.
+                usage_budget: crate::exec::usage_budget::validate_usage_budget_config(
+                    p.usage_budget.as_ref(),
+                    "usageBudget",
+                )
+                .map_err(ToolError::new)?,
+                // SUBA-008 / pi `resolveTurnBudgetConfig(effectiveParams.turnBudget …)`
+                // (`subagent-executor.ts:4928`): the async SINGLE branch validates the caller's
+                // budget exactly as the foreground branch does, so `{…, turnBudget, async:true}`
+                // is neither silently unbudgeted nor silently lenient.
+                turn_budget: crate::exec::turn_budget::resolve_turn_budget_config(
+                    p.turn_budget.as_ref(),
+                    "turnBudget",
+                )
+                .map_err(ToolError::new)?,
+                // SUBA-043 / pi `params.outputSchema` (`extension/schemas.ts:351` @v0.43.0):
+                // the async SINGLE branch forwards the top-level schema exactly as the
+                // foreground branch does, so `{agent, task, outputSchema, async:true}` is not a
+                // silently weaker call than the same request without `async`.
+                structured_output_schema: p.output_schema.clone(),
+                // SUBA-047 / pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
+                // (`async-execution.ts:1299` @v0.43.0). Validated here for the same reason the
+                // foreground branch validates it: a malformed budget must refuse the call, not
+                // silently downgrade to "unbudgeted".
+                tool_budget: crate::exec::tool_budget::validate_tool_budget_config(
+                    p.tool_budget.as_ref(),
+                    "toolBudget",
+                )
+                .map_err(ToolError::new)?,
+                cwd,
+                agent_name: agent,
+                task,
+                context,
+                model_override: model,
+                agent_scope: resolve_execution_agent_scope(p.agent_scope.as_deref()),
+                // SUBA-N04: the raw policy, already validated by `validate_execution_acceptance`
+                // at the tool boundary; hop 2 lowers it per step.
+                acceptance: p.acceptance.clone(),
+                // SUBA-N05: the raw per-call `control` override. `spawn_background` folds it
+                // against `subagents.control` and carries the RESOLVED value to hop 2 — pi
+                // `executeAsyncSingle(id, { ..., controlConfig, ... })`,
+                // `subagent-executor.ts:2845,2868-2870` @v0.34.0. Before this it was parsed,
+                // absent from the foreground-only refusal list, and dropped on the floor.
+                control: overrides.control.clone(),
+                // SUBA-N03: the six params this branch used to refuse, taken from the SAME
+                // `overrides` bundle the foreground path consumes — so the two paths cannot
+                // disagree about what a given param meant (`skills` in particular is already
+                // `normalize_skill_input`-normalized, so `skill: false` reaches hop 2 as the
+                // explicit empty list rather than as "omitted").
+                output: overrides.output.clone(),
+                output_mode: overrides.output_mode.clone(),
+                skills: overrides.skills.clone(),
+                share: overrides.share,
+                session_dir: overrides.session_dir.clone(),
+                artifacts: overrides.artifacts,
+                // SUBA-N03: already validated + de-aliased by `resolve_foreground_timeout`
+                // (pi `resolveForegroundTimeout`, `:1327-1341`), whose positivity and
+                // both-given-must-agree checks are mode-independent.
+                timeout_ms,
+                include_progress: overrides.include_progress,
+            })
+            .await
+            .map_err(|e| ToolError::new(e.to_string()))?;
+        // R-SA-074: return immediately after confirmed spawn; instruct against busy-polling.
+        // pi `executeAsyncSingle` (`async-execution.ts:1515-1518`): the headline is `Async: {agent}
+        // [{id}]`, followed by `formatAsyncStartedMessage`'s fixed guidance, and `details` is
+        // `{ mode: "single", runId, results: [], asyncId, asyncDir }` (`async-execution.ts:1563`;
+        // `asyncId` === `runId` for a SINGLE run, pi's own async-run identity convention).
+        // `asyncDir` is what binds this run to its mission — see [`async_dir_for_run`].
+        Ok(ToolResult {
+            content: vec![cyrup_core::Content::text(format_async_started_message(&format!(
+                "Async: {agent} [{run_id}]"
+            )))],
+            details: Some(async_launch_details("single", &run_id, cwd)),
+            terminate: false,
+            ..Default::default()
+        })
+    }
+
+    /// Turn a settled foreground [`SingleResult`] into the tool's [`ToolResult`] — out-of-band
+    /// intercom delivery first, then the detached / interrupted / failed / clean ladder, IN THAT
+    /// ORDER (each rung returns, so a later rung only ever sees a run the earlier ones declined).
+    ///
+    /// Single-run result surfacing (pi `subagent-executor.ts:2738-2761`). `final_output` is the
+    /// finalized delivered output (`run_sync` already folded in the timeout preamble and any
+    /// saved-output reference), i.e. pi's `finalizedOutput.displayOutput`.
+    async fn render_single_result(
+        &self,
+        result: SingleResult,
+        run_id: RunId,
+        agent: &str,
+        context: Option<ContextMode>,
+        include_progress: Option<bool>,
+    ) -> Result<ToolResult, ToolError> {
         let display_output = result.final_output.clone().unwrap_or_default();
         // pi `runSinglePath`'s `details` (`subagent-executor.ts:3811-3823` @v0.43.0) is
         // `compactForegroundDetails({ mode: "single", runId, results: [r], progress, … })` — the
@@ -568,7 +647,7 @@ impl SubagentTool {
                 result.clone(),
                 crate::tui::events::LiveProgressSnapshot::from_settled_result(&result),
             );
-            if p.include_progress != Some(true) {
+            if include_progress != Some(true) {
                 payload.progress.clear();
             }
             payload.run_id = Some(run_id.clone());
@@ -578,51 +657,11 @@ impl SubagentTool {
             )
         };
 
-        // R-SA-123/124/125 (pi `runSinglePath`, `subagent-executor.ts:3515-3873`): pi attempts
-        // out-of-band result-intercom delivery for a SINGLE run too, gated on `!detached &&
-        // !interrupted` (a detached/paused run has no terminal result to hand off yet) — this mirrors
-        // `route_parallel_mode`/`route_chain_mode`'s identical wiring. On a confirmed delivery, pi
-        // returns `formatSubagentResultReceipt`'s text for BOTH a clean run and a failed one (still
-        // surfacing failure — cyrup's analog is `Err(ToolError)` carrying that same receipt text,
-        // matching the existing "error surfaced in CONTENT" convention below).
-        if !result.detached && !result.interrupted {
-            // G104 — the SINGLE path resolves its one child through
-            // `foregroundResultIntercomStatus` (`subagent-executor.ts:1594-1605`, applied per child
-            // at `:1626`), i.e. the full `resolveSubagentResultStatus` ladder over the REAL
-            // `SingleResult`. It deliberately does NOT go through the grouped
-            // `StepResult`-projection constructor: a `StepResult` carries no `process_signal`, no
-            // `detached`, no `timed_out` and no acceptance ledger, so projecting through it made the
-            // unexplained-signal → `"stopped"` branch (`result-intercom.ts:35`) unreachable and
-            // reported a rejected-but-exit-0 child as `"completed"`.
-            let payload = crate::tui::intercom::IntercomPayload::from_single_result(
-                run_id.clone(),
-                agent.to_string(),
-                result.exit_code == 0,
-                &result,
-            );
-            if let crate::tui::intercom::DeliveryOutcome::Delivered =
-                self.executor.deliver_group_out_of_band(payload.clone()).await
-            {
-                let reduced = crate::tui::intercom::ReducedInlinePayload::from(&payload);
-                let receipt = crate::tui::intercom::format_subagent_result_receipt(
-                    "single",
-                    &run_id,
-                    &payload.child_statuses,
-                );
-                let reduced_details = Some(serde_json::json!({
-                    "mode": "single", "outOfBandDelivered": true, "reduced": reduced,
-                }));
-                return if result.exit_code != 0 {
-                    Err(ToolError::new(receipt))
-                } else {
-                    Ok(ToolResult {
-                        content: vec![cyrup_core::Content::text(receipt)],
-                        details: reduced_details,
-                        terminate: false,
-                        ..Default::default()
-                    })
-                };
-            }
+        if let Some(delivered) = self
+            .deliver_single_result_out_of_band(&result, &run_id, agent)
+            .await
+        {
+            return delivered;
         }
 
         // A detached (intercom) run is a coordination hand-off, not a failure (pi 2738-2743). No
@@ -675,6 +714,68 @@ impl SubagentTool {
             terminate: false,
             ..Default::default()
         })
+    }
+
+    /// The SINGLE path's out-of-band result-intercom hand-off, offered BEFORE
+    /// [`Self::render_single_result`]'s own detached / interrupted / failed / clean ladder is
+    /// consulted. `Some` is a confirmed delivery and IS the tool's result; `None` means the run
+    /// was ineligible or the delivery was not confirmed, and that ladder runs as normal.
+    ///
+    /// R-SA-123/124/125 (pi `runSinglePath`, `subagent-executor.ts:3515-3873`): pi attempts
+    /// out-of-band result-intercom delivery for a SINGLE run too, gated on `!detached &&
+    /// !interrupted` (a detached/paused run has no terminal result to hand off yet) — this mirrors
+    /// `route_parallel_mode`/`route_chain_mode`'s identical wiring. On a confirmed delivery, pi
+    /// returns `formatSubagentResultReceipt`'s text for BOTH a clean run and a failed one (still
+    /// surfacing failure — cyrup's analog is `Err(ToolError)` carrying that same receipt text,
+    /// matching the "error surfaced in CONTENT" convention [`Self::render_single_result`]'s own
+    /// non-zero-exit rung follows).
+    async fn deliver_single_result_out_of_band(
+        &self,
+        result: &SingleResult,
+        run_id: &RunId,
+        agent: &str,
+    ) -> Option<Result<ToolResult, ToolError>> {
+        if result.detached || result.interrupted {
+            return None;
+        }
+        // G104 — the SINGLE path resolves its one child through
+        // `foregroundResultIntercomStatus` (`subagent-executor.ts:1594-1605`, applied per child
+        // at `:1626`), i.e. the full `resolveSubagentResultStatus` ladder over the REAL
+        // `SingleResult`. It deliberately does NOT go through the grouped
+        // `StepResult`-projection constructor: a `StepResult` carries no `process_signal`, no
+        // `detached`, no `timed_out` and no acceptance ledger, so projecting through it made the
+        // unexplained-signal → `"stopped"` branch (`result-intercom.ts:35`) unreachable and
+        // reported a rejected-but-exit-0 child as `"completed"`.
+        let payload = crate::tui::intercom::IntercomPayload::from_single_result(
+            run_id.clone(),
+            agent.to_string(),
+            result.exit_code == 0,
+            result,
+        );
+        if let crate::tui::intercom::DeliveryOutcome::Delivered =
+            self.executor.deliver_group_out_of_band(payload.clone()).await
+        {
+            let reduced = crate::tui::intercom::ReducedInlinePayload::from(&payload);
+            let receipt = crate::tui::intercom::format_subagent_result_receipt(
+                "single",
+                run_id,
+                &payload.child_statuses,
+            );
+            let reduced_details = Some(serde_json::json!({
+                "mode": "single", "outOfBandDelivered": true, "reduced": reduced,
+            }));
+            return Some(if result.exit_code != 0 {
+                Err(ToolError::new(receipt))
+            } else {
+                Ok(ToolResult {
+                    content: vec![cyrup_core::Content::text(receipt)],
+                    details: reduced_details,
+                    terminate: false,
+                    ..Default::default()
+                })
+            });
+        }
+        None
     }
 
     /// Management/control action dispatch (pi: a present `action` puts the tool in management mode).

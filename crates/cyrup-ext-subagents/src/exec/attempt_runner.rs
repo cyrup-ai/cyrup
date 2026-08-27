@@ -22,7 +22,7 @@ use crate::exec::output::{
 };
 use crate::spawn::SpawnedChild;
 use crate::exec::agent_config::{AgentConfig, RunOptions};
-use crate::exec::drive_attempt::drive_attempt;
+use crate::exec::drive_attempt::{DriveOutcome, drive_attempt};
 use crate::exec::progress::AgentProgress;
 use crate::exec::spawn_plan::{build_attempt_spawn_plan_with_read_requirement, build_task_text};
 
@@ -97,6 +97,195 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         model: &ModelId,
         attempt_note: Option<&str>,
     ) -> (AttemptSignal, Self::Attempt) {
+        let PreparedAttempt {
+            mut child,
+            mut progress,
+            mut control,
+            tool_diagnostic_path,
+        } = match self.prepare_attempt(model, attempt_note).await {
+            Ok(prepared) => prepared,
+            Err(failure) => return *failure,
+        };
+
+        // Move the child's stderr reader out BEFORE `drive_attempt` consumes the child, so its
+        // trailing diagnostic output can be surfaced into the run's error on a non-zero exit (pi
+        // `execution.ts:686`). `drive_attempt` reads only stdout; the orphaned reader is drained to
+        // EOF by [`SpawnedChildAttemptRunner::resolve_attempt_exit`], once the child is dead and
+        // its closed write end guarantees a prompt EOF.
+        let stderr_reader = child.take_stderr();
+
+        let deadline_sleep = self
+            .opts
+            .deadline_at
+            .map(|instant| tokio::time::sleep_until(tokio::time::Instant::from_std(instant)));
+        let outcome =
+            drive_attempt(child, &mut progress, self.opts, deadline_sleep, &mut control).await;
+
+        // pi returns from `runSingleAttempt` on an interrupt BEFORE any exit-code re-diagnosis, so
+        // this branch stays ahead of every diagnosis below.
+        if outcome.interrupted {
+            return interrupted_attempt(progress, control, &outcome);
+        }
+
+        let (raw_exit_code, spawn_error, process_signal) = match &outcome.exit_status {
+            Ok(Some(status)) => (status.code(), None, process_signal_name(status)),
+            Ok(None) => (None, None, None), // terminated via signal escalation (timeout/cancel)
+            Err(err) => (None, Some(err.to_string()), None),
+        };
+
+        let final_output = extract_final_output(&progress.message_end_events);
+
+        // Kept as a distinct early exit so the exit-0 re-diagnosis chain below never runs against a
+        // timed-out attempt.
+        if outcome.timed_out {
+            return timed_out_attempt(
+                progress,
+                control,
+                &outcome,
+                raw_exit_code,
+                spawn_error,
+                final_output,
+            );
+        }
+
+        let error = diagnose_attempt_error(
+            &outcome,
+            spawn_error,
+            tool_diagnostic_path.as_deref(),
+            &progress,
+        );
+        let AttemptDiagnosis {
+            exit_code,
+            error,
+            success,
+            error_is_placeholder,
+        } = self
+            .resolve_attempt_exit(
+                error,
+                &outcome,
+                raw_exit_code,
+                stderr_reader,
+                &progress,
+                final_output.as_deref(),
+            )
+            .await;
+
+        (
+            AttemptSignal {
+                success,
+                exit_code: Some(exit_code),
+                error,
+                usage: progress.usage.clone(),
+                timed_out: false,
+                // R-SA-037: set from the drive loop's detach observation — `true` when the child's
+                // NDJSON showed a blocking `contact_supervisor` ask (surfaced via `spawn_clarify`),
+                // which bypasses acceptance/completion-guard/truncation and stops the ladder.
+                detached: outcome.detached,
+                startup: build_startup_evidence(
+                    &progress,
+                    &outcome,
+                    final_output.as_deref(),
+                    process_signal,
+                    error_is_placeholder,
+                ),
+            },
+            AttemptRecord {
+                turn_budget: outcome.turn_budget.clone(),
+                progress,
+                final_output,
+                interrupted: false,
+                control,
+            },
+        )
+    }
+
+    /// pi `waitForSubagentStartupRetry(delayMs, [options.signal, options.interruptSignal])`
+    /// (`execution.ts:1588`): the backoff is raced against BOTH lifecycle signals, and which one
+    /// fired decides whether the run is paused or abandoned. Already-aborted is checked first
+    /// (upstream `subagent-startup-retry.ts:88`), so a cancelled run never sleeps before giving up.
+    async fn wait_startup_retry(&mut self, delay: Duration) -> StartupRetryWait {
+        if self.opts.interrupt.is_cancelled() {
+            return StartupRetryWait::Interrupted;
+        }
+        if self.opts.cancel.is_cancelled() {
+            return StartupRetryWait::Cancelled;
+        }
+        tokio::select! {
+            biased;
+            () = self.opts.interrupt.cancelled() => StartupRetryWait::Interrupted,
+            () = self.opts.cancel.cancelled() => StartupRetryWait::Cancelled,
+            () = tokio::time::sleep(delay) => StartupRetryWait::Proceed,
+        }
+    }
+
+    /// pi mutates `result.finalOutput`/`result.interrupted` in place at `execution.ts:1584-1618`;
+    /// this crate's ladder cannot reach inside an opaque `Attempt`, so it calls back here instead.
+    fn apply_startup_outcome(&mut self, attempt: &mut Self::Attempt, outcome: &StartupOutcome) {
+        match outcome {
+            StartupOutcome::Interrupted => {
+                attempt.interrupted = true;
+                attempt.final_output = Some(INTERRUPTED_FINAL_OUTPUT.to_string());
+            }
+            StartupOutcome::Cancelled(message) | StartupOutcome::Exhausted(message) => {
+                // pi also sets `result.progress.status/error` here; cyrup's `AgentProgress` carries
+                // neither field (its status/error live on `SingleResult`, which `run_sync` derives
+                // from the ladder's own `AttemptSignal::error` — already set by the ladder).
+                attempt.final_output = Some(message.clone());
+            }
+        }
+    }
+
+    fn snapshot_output_file(&mut self) {
+        // R-SA-031: the actual snapshot value is consulted later, in `finalize_result`'s
+        // file-only handoff — `run_fallback_ladder` only requires the snapshot to be TAKEN at
+        // the correct point (immediately before each fresh spawn), which this no-op satisfies
+        // trivially since `run_sync` itself takes the real snapshot once, outside the ladder, and
+        // compares it once after the ladder settles (R-SA-031 is a whole-task stat-snapshot
+        // heuristic, not a per-attempt one — a task's `output_path` does not change between
+        // fallback attempts, so re-snapshotting per attempt would not observe anything new).
+    }
+}
+
+/// Everything [`SpawnedChildAttemptRunner::prepare_attempt`] hands the drive phase once the child
+/// is actually running.
+struct PreparedAttempt {
+    child: SpawnedChild,
+    /// Seeded with this attempt's start instant and, if the ladder passed one, its attempt note.
+    progress: AgentProgress,
+    /// Built BEFORE the spawn plan, so every early-return path still hands a (trivially empty)
+    /// monitor back to `run_sync` rather than the ladder losing the field entirely.
+    control: crate::exec::control::ControlMonitor,
+    /// SUBA-045: taken off the plan before `plan.spec` was moved into the spawn, and read back by
+    /// the diagnosis cascade (pi's `toolDiagnosticPath` local, `execution.ts:1072`).
+    tool_diagnostic_path: Option<PathBuf>,
+}
+
+/// What [`SpawnedChildAttemptRunner::resolve_attempt_exit`] concluded about a settled attempt.
+struct AttemptDiagnosis {
+    /// pi's `result.exitCode`, after every correction in the cascade has had its say.
+    exit_code: i32,
+    /// The diagnosed error — or the "exited with code N" placeholder, when a failure had nothing
+    /// richer to say for itself.
+    error: Option<String>,
+    /// `exit_code == 0 && error.is_none()`, read BEFORE the placeholder above is filled in.
+    success: bool,
+    /// Whether `error` IS that placeholder — the startup-failure classifier has to be told, since
+    /// pi keys "the child failed with nothing to say" on `error` being UNSET.
+    error_is_placeholder: bool,
+}
+
+impl SpawnedChildAttemptRunner<'_> {
+    /// [`AttemptRunner::run_attempt`]'s prepare phase: seed this attempt's progress ring and
+    /// control monitor, render the task text and the CHILD's incremented depth envelope, build the
+    /// spawn plan, and spawn the real OS child. The `Err` arm carries the already-composed failure
+    /// pair for the two ways preparation can fail — an unbuildable plan or an unspawnable child;
+    /// it is boxed because that pair is far larger than the `Ok` payload and is built on neither
+    /// of the two paths a healthy attempt takes.
+    async fn prepare_attempt(
+        &mut self,
+        model: &ModelId,
+        attempt_note: Option<&str>,
+    ) -> Result<PreparedAttempt, Box<(AttemptSignal, AttemptRecord)>> {
         let mut progress = AgentProgress {
             // pi's `startTime` local, captured at the very top of `runSingleAttempt` — before the
             // spawn plan is even built — and read back as `progress.durationMs = Date.now() -
@@ -125,7 +314,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         // and its per-attempt dedup/record state. Built here — before the spawn plan — so every
         // early-return path below still hands a (trivially empty) monitor back to `run_sync`
         // rather than the ladder losing the field entirely.
-        let mut control = crate::exec::control::ControlMonitor::new(
+        let control = crate::exec::control::ControlMonitor::new(
             self.opts.control_config.clone().unwrap_or_default(),
             self.opts
                 .run_id
@@ -171,24 +360,11 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         ) {
             Ok(plan) => plan,
             Err(err) => {
-                return (
-                    AttemptSignal {
-                        success: false,
-                        exit_code: None,
-                        error: Some(err.to_string()),
-                        usage: Usage::default(),
-                        timed_out: false,
-                        detached: false,
-                        startup: StartupEvidence::default(),
-                    },
-                    AttemptRecord {
-                        turn_budget: Default::default(),
-                        progress,
-                        final_output: None,
-                        interrupted: false,
-                        control,
-                    },
-                );
+                return Err(Box::new(attempt_setup_failure(
+                    err.to_string(),
+                    progress,
+                    control,
+                )));
             }
         };
 
@@ -212,152 +388,41 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             let _ = std::fs::remove_file(path);
         }
 
-        let mut child = match SpawnedChild::spawn(plan.spec, &jsonl_path).await {
+        let child = match SpawnedChild::spawn(plan.spec, &jsonl_path).await {
             Ok(child) => child,
             Err(err) => {
-                return (
-                    AttemptSignal {
-                        success: false,
-                        exit_code: None,
-                        error: Some(err.to_string()),
-                        usage: Usage::default(),
-                        timed_out: false,
-                        detached: false,
-                        startup: StartupEvidence::default(),
-                    },
-                    AttemptRecord {
-                        turn_budget: Default::default(),
-                        progress,
-                        final_output: None,
-                        interrupted: false,
-                        control,
-                    },
-                );
+                return Err(Box::new(attempt_setup_failure(
+                    err.to_string(),
+                    progress,
+                    control,
+                )));
             }
         };
 
-        // Move the child's stderr reader out BEFORE `drive_attempt` consumes the child, so its
-        // trailing diagnostic output can be surfaced into the run's error on a non-zero exit (pi
-        // `execution.ts:686`). `drive_attempt` reads only stdout; the orphaned reader is drained to
-        // EOF below (in the non-zero-exit branch), once the child is dead and its closed write end
-        // guarantees a prompt EOF.
-        let stderr_reader = child.take_stderr();
+        Ok(PreparedAttempt {
+            child,
+            progress,
+            control,
+            tool_diagnostic_path,
+        })
+    }
 
-        let deadline_sleep = self
-            .opts
-            .deadline_at
-            .map(|instant| tokio::time::sleep_until(tokio::time::Instant::from_std(instant)));
-        let outcome =
-            drive_attempt(child, &mut progress, self.opts, deadline_sleep, &mut control).await;
-
-        // --- Interrupt: paused-success (pi `execution.ts:722-761`, T3 group A bug fix). A soft
-        // interrupt is NOT a failure: it terminates the ladder with exit 0, a CLEARED error, and
-        // the "paused" sentinel output, recorded under its own flag rather than folded into
-        // exit-1/timed-out. pi returns from `runSingleAttempt` here BEFORE any exit-code
-        // re-diagnosis, so this branch mirrors that early return exactly. ---
-        if outcome.interrupted {
-            return (
-                AttemptSignal {
-                    success: true,
-                    exit_code: Some(0),
-                    error: None,
-                    usage: progress.usage.clone(),
-                    timed_out: false,
-                    detached: outcome.detached,
-                    startup: StartupEvidence::default(),
-                },
-                AttemptRecord {
-                    // SUBA-008: an interrupted attempt still reports the budget it ran under.
-                    turn_budget: outcome.turn_budget.clone(),
-                    progress,
-                    final_output: Some(INTERRUPTED_FINAL_OUTPUT.to_string()),
-                    interrupted: true,
-                    control,
-                },
-            );
-        }
-
-        let (raw_exit_code, spawn_error, process_signal) = match &outcome.exit_status {
-            Ok(Some(status)) => (status.code(), None, process_signal_name(status)),
-            Ok(None) => (None, None, None), // terminated via signal escalation (timeout/cancel)
-            Err(err) => (None, Some(err.to_string()), None),
-        };
-
-        let final_output = extract_final_output(&progress.message_end_events);
-
-        // --- Timeout terminates the ladder outright (R-SA-036); its own flag is what
-        // `run_fallback_ladder` branches on. Kept as a distinct early exit so the exit-0
-        // re-diagnosis chain below never runs against a timed-out attempt. ---
-        if outcome.timed_out {
-            return (
-                AttemptSignal {
-                    success: false,
-                    exit_code: Some(raw_exit_code.unwrap_or(1)),
-                    error: spawn_error.or_else(|| Some("subagent attempt timed out".to_string())),
-                    usage: progress.usage.clone(),
-                    timed_out: true,
-                    detached: outcome.detached,
-                    startup: StartupEvidence::default(),
-                },
-                AttemptRecord {
-                    // SUBA-008: pi's timeout arm wins the terminal composition outright
-                    // (`execution.ts:1241`), but the state is still published.
-                    turn_budget: outcome.turn_budget.clone(),
-                    progress,
-                    final_output,
-                    interrupted: false,
-                    control,
-                },
-            );
-        }
-
-        // --- Exit-0 re-diagnosis (pi `execution.ts:684-790`), in pi's exact order. ---
-
-        // (a) The trailing, still-uncleared assistant `errorMessage` (pi close-handler
-        //     `execution.ts:684` sets `result.error = assistantError`).
-        // (a.0) The protocol-output-limit diagnostic outranks everything: pi's `failProtocol` sets
-        //     `result.error` at the moment the cap trips, and the close handler only fills in a
-        //     `closeError` when `result.error` is still unset (`execution.ts:1099`).
-        // (a.-1) SUBA-008 — a turn-budget abort sets `result.error = message` at the moment it
-        //     fires (`execution.ts:740`), i.e. strictly BEFORE the close handler runs, and the
-        //     close handler only fills in a `closeError` when `result.error` is still unset
-        //     (`:1099`). So the abort message outranks every diagnosis below it — including the
-        //     child's own trailing apology, which is exactly what a child that was signalled
-        //     mid-sentence tends to produce.
-        //
-        //     It cannot collide with the protocol-limit diagnostic below: the drive loop returns
-        //     on whichever of the two fires first, so at most one is ever set.
-        let mut error = match outcome.turn_budget.terminal_note() {
-            Some(crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(message)) => {
-                Some(message)
-            }
-            _ => None,
-        };
-        if error.is_none() {
-            error = outcome
-                .protocol_error
-                .as_ref()
-                .map(crate::exec::child_protocol::format_protocol_output_limit);
-        }
-        if error.is_none() {
-            error = spawn_error;
-        }
-        // (a.1) SUBA-045 — the child tool-availability diagnostic, in pi's exact rank: `closeError =
-        //     result.error ?? toolDiagnosticError ?? assistantError` (`execution.ts:1079`). It sits
-        //     ABOVE the trailing assistant error deliberately, and that ordering is the whole point
-        //     of the item: a child told to use a tool its host never registered produces a
-        //     perfectly ordinary model apology, and the apology would otherwise become the run's
-        //     error and hide the cause. The file exists only when something was actually missing
-        //     (the child DELETES it otherwise), so this is silent on every healthy run.
-        if error.is_none() {
-            error = crate::exec::tool_availability::read_child_tool_diagnostic_error(
-                tool_diagnostic_path.as_deref(),
-            );
-        }
-        if error.is_none() {
-            error = trailing_assistant_error(&progress.all_events);
-        }
-
+    /// The second half of the exit-0 re-diagnosis (pi `execution.ts:684-790`), picking up the
+    /// `error` [`diagnose_attempt_error`] settled on: `forcedDrainAfterFinalSuccess`, the trailing-
+    /// stderr fallback, the forced/final exit code, and the three corrections that can still flip
+    /// an otherwise-clean zero exit to a failure.
+    ///
+    /// FIRST-ERROR-WINS holds across both halves: every step here is gated on `error` still being
+    /// unset, so a diagnosis already made upstream is never overwritten.
+    async fn resolve_attempt_exit(
+        &self,
+        mut error: Option<String>,
+        outcome: &DriveOutcome,
+        raw_exit_code: Option<i32>,
+        stderr_reader: crate::spawn::CapturedStderr,
+        progress: &AgentProgress,
+        final_output: Option<&str>,
+    ) -> AttemptDiagnosis {
         // (b) `forcedDrainAfterFinalSuccess` (pi `execution.ts:1080`): a child that emitted a CLEAN
         //     terminal stop but had to be force-drained (held stdout open past the grace window)
         //     is coerced to exit 0, not treated as a forced-kill failure.
@@ -431,9 +496,7 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
         //     and only `run_sync` would later flag a NON-retryable structured-missing failure).
         if exit_code == 0
             && error.is_none()
-            && final_output
-                .as_deref()
-                .is_none_or(|text| text.trim().is_empty())
+            && final_output.is_none_or(|text| text.trim().is_empty())
             && structured_output_absent(
                 self.opts.structured_output_schema.as_ref(),
                 self.structured_runtime.as_ref(),
@@ -456,101 +519,194 @@ impl AttemptRunner for SpawnedChildAttemptRunner<'_> {
             error = Some(format!("subagent attempt exited with code {exit_code}"));
         }
 
-        (
-            AttemptSignal {
-                success,
-                exit_code: Some(exit_code),
-                error,
-                usage: progress.usage.clone(),
-                timed_out: false,
-                // R-SA-037: set from the drive loop's detach observation — `true` when the child's
-                // NDJSON showed a blocking `contact_supervisor` ask (surfaced via `spawn_clarify`),
-                // which bypasses acceptance/completion-guard/truncation and stops the ladder.
-                detached: outcome.detached,
-                // Startup-failure evidence (pi `execution.ts:1558-1573`). Every field here is a
-                // reason NOT to relaunch this model; `is_retryable_subagent_startup_failure`
-                // fails closed on any of them.
-                startup: StartupEvidence {
-                    final_output_present: final_output
-                        .as_deref()
-                        .is_some_and(|text| !text.trim().is_empty()),
-                    message_count: progress.message_end_events.len(),
-                    tool_count: progress.tool_count,
-                    duration_ms: Some(progress.duration_ms()),
-                    protocol_error: outcome.protocol_error.is_some(),
-                    process_signal: process_signal.clone(),
-                    observed_mutation_attempt: crate::exec::completion_guard::has_mutation_tool_call(
-                        &progress.all_events,
-                    ),
-                    // cyrup's foreground executor has no `stopped` analog (pi carries it on the
-                    // BACKGROUND runner's result). It cannot be true of a child with zero
-                    // messages, zero tools and zero usage anyway — it requires the child to have
-                    // run turns — so leaving it false cannot widen the predicate.
-                    stopped: false,
-                    // SUBA-008 — no longer hard-coded: a turn-budget abort is a deliberate
-                    // supervisor kill, and `is_retryable_subagent_startup_failure` must fail
-                    // closed on it rather than relaunching the model that was over budget.
-                    turn_budget_exceeded: outcome.turn_budget.exceeded(),
-                    error_is_placeholder,
-                },
-            },
-            AttemptRecord {
-                turn_budget: outcome.turn_budget.clone(),
-                progress,
-                final_output,
-                interrupted: false,
-                control,
-            },
-        )
-    }
-
-    /// pi `waitForSubagentStartupRetry(delayMs, [options.signal, options.interruptSignal])`
-    /// (`execution.ts:1588`): the backoff is raced against BOTH lifecycle signals, and which one
-    /// fired decides whether the run is paused or abandoned. Already-aborted is checked first
-    /// (upstream `subagent-startup-retry.ts:88`), so a cancelled run never sleeps before giving up.
-    async fn wait_startup_retry(&mut self, delay: Duration) -> StartupRetryWait {
-        if self.opts.interrupt.is_cancelled() {
-            return StartupRetryWait::Interrupted;
+        AttemptDiagnosis {
+            exit_code,
+            error,
+            success,
+            error_is_placeholder,
         }
-        if self.opts.cancel.is_cancelled() {
-            return StartupRetryWait::Cancelled;
-        }
-        tokio::select! {
-            biased;
-            () = self.opts.interrupt.cancelled() => StartupRetryWait::Interrupted,
-            () = self.opts.cancel.cancelled() => StartupRetryWait::Cancelled,
-            () = tokio::time::sleep(delay) => StartupRetryWait::Proceed,
-        }
-    }
-
-    /// pi mutates `result.finalOutput`/`result.interrupted` in place at `execution.ts:1584-1618`;
-    /// this crate's ladder cannot reach inside an opaque `Attempt`, so it calls back here instead.
-    fn apply_startup_outcome(&mut self, attempt: &mut Self::Attempt, outcome: &StartupOutcome) {
-        match outcome {
-            StartupOutcome::Interrupted => {
-                attempt.interrupted = true;
-                attempt.final_output = Some(INTERRUPTED_FINAL_OUTPUT.to_string());
-            }
-            StartupOutcome::Cancelled(message) | StartupOutcome::Exhausted(message) => {
-                // pi also sets `result.progress.status/error` here; cyrup's `AgentProgress` carries
-                // neither field (its status/error live on `SingleResult`, which `run_sync` derives
-                // from the ladder's own `AttemptSignal::error` — already set by the ladder).
-                attempt.final_output = Some(message.clone());
-            }
-        }
-    }
-
-    fn snapshot_output_file(&mut self) {
-        // R-SA-031: the actual snapshot value is consulted later, in `finalize_result`'s
-        // file-only handoff — `run_fallback_ladder` only requires the snapshot to be TAKEN at
-        // the correct point (immediately before each fresh spawn), which this no-op satisfies
-        // trivially since `run_sync` itself takes the real snapshot once, outside the ladder, and
-        // compares it once after the ladder settles (R-SA-031 is a whole-task stat-snapshot
-        // heuristic, not a per-attempt one — a task's `output_path` does not change between
-        // fallback attempts, so re-snapshotting per attempt would not observe anything new).
     }
 }
 
+/// The failure pair both of [`SpawnedChildAttemptRunner::prepare_attempt`]'s early exits return:
+/// nothing ever ran, so there is no exit code, no usage and no final output — only the diagnostic,
+/// alongside the progress ring and control monitor the ladder still expects back.
+fn attempt_setup_failure(
+    error: String,
+    progress: AgentProgress,
+    control: crate::exec::control::ControlMonitor,
+) -> (AttemptSignal, AttemptRecord) {
+    (
+        AttemptSignal {
+            success: false,
+            exit_code: None,
+            error: Some(error),
+            usage: Usage::default(),
+            timed_out: false,
+            detached: false,
+            startup: StartupEvidence::default(),
+        },
+        AttemptRecord {
+            turn_budget: Default::default(),
+            progress,
+            final_output: None,
+            interrupted: false,
+            control,
+        },
+    )
+}
+
+/// Interrupt: paused-success (pi `execution.ts:722-761`, T3 group A bug fix). A soft interrupt is
+/// NOT a failure: it terminates the ladder with exit 0, a CLEARED error, and the "paused" sentinel
+/// output, recorded under its own flag rather than folded into exit-1/timed-out. pi returns from
+/// `runSingleAttempt` here BEFORE any exit-code re-diagnosis, so this pair mirrors that early
+/// return exactly.
+fn interrupted_attempt(
+    progress: AgentProgress,
+    control: crate::exec::control::ControlMonitor,
+    outcome: &DriveOutcome,
+) -> (AttemptSignal, AttemptRecord) {
+    (
+        AttemptSignal {
+            success: true,
+            exit_code: Some(0),
+            error: None,
+            usage: progress.usage.clone(),
+            timed_out: false,
+            detached: outcome.detached,
+            startup: StartupEvidence::default(),
+        },
+        AttemptRecord {
+            // SUBA-008: an interrupted attempt still reports the budget it ran under.
+            turn_budget: outcome.turn_budget.clone(),
+            progress,
+            final_output: Some(INTERRUPTED_FINAL_OUTPUT.to_string()),
+            interrupted: true,
+            control,
+        },
+    )
+}
+
+/// Timeout terminates the ladder outright (R-SA-036); its own flag is what `run_fallback_ladder`
+/// branches on. Kept as a distinct early exit so the exit-0 re-diagnosis chain never runs against a
+/// timed-out attempt.
+fn timed_out_attempt(
+    progress: AgentProgress,
+    control: crate::exec::control::ControlMonitor,
+    outcome: &DriveOutcome,
+    raw_exit_code: Option<i32>,
+    spawn_error: Option<String>,
+    final_output: Option<String>,
+) -> (AttemptSignal, AttemptRecord) {
+    (
+        AttemptSignal {
+            success: false,
+            exit_code: Some(raw_exit_code.unwrap_or(1)),
+            error: spawn_error.or_else(|| Some("subagent attempt timed out".to_string())),
+            usage: progress.usage.clone(),
+            timed_out: true,
+            detached: outcome.detached,
+            startup: StartupEvidence::default(),
+        },
+        AttemptRecord {
+            // SUBA-008: pi's timeout arm wins the terminal composition outright
+            // (`execution.ts:1241`), but the state is still published.
+            turn_budget: outcome.turn_budget.clone(),
+            progress,
+            final_output,
+            interrupted: false,
+            control,
+        },
+    )
+}
+
+/// The first half of the exit-0 re-diagnosis (pi `execution.ts:684-790`), in pi's exact order.
+///
+/// FIRST-ERROR-WINS: each step runs only while `error` is still unset, so the FIRST condition that
+/// fires owns the error string and every later check is a no-op. The order below IS the contract —
+/// see each step's comment for why it outranks the one after it.
+fn diagnose_attempt_error(
+    outcome: &DriveOutcome,
+    spawn_error: Option<String>,
+    tool_diagnostic_path: Option<&std::path::Path>,
+    progress: &AgentProgress,
+) -> Option<String> {
+    // (a) The trailing, still-uncleared assistant `errorMessage` (pi close-handler
+    //     `execution.ts:684` sets `result.error = assistantError`).
+    // (a.0) The protocol-output-limit diagnostic outranks everything: pi's `failProtocol` sets
+    //     `result.error` at the moment the cap trips, and the close handler only fills in a
+    //     `closeError` when `result.error` is still unset (`execution.ts:1099`).
+    // (a.-1) SUBA-008 — a turn-budget abort sets `result.error = message` at the moment it
+    //     fires (`execution.ts:740`), i.e. strictly BEFORE the close handler runs, and the
+    //     close handler only fills in a `closeError` when `result.error` is still unset
+    //     (`:1099`). So the abort message outranks every diagnosis below it — including the
+    //     child's own trailing apology, which is exactly what a child that was signalled
+    //     mid-sentence tends to produce.
+    //
+    //     It cannot collide with the protocol-limit diagnostic below: the drive loop returns
+    //     on whichever of the two fires first, so at most one is ever set.
+    let mut error = match outcome.turn_budget.terminal_note() {
+        Some(crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(message)) => Some(message),
+        _ => None,
+    };
+    if error.is_none() {
+        error = outcome
+            .protocol_error
+            .as_ref()
+            .map(crate::exec::child_protocol::format_protocol_output_limit);
+    }
+    if error.is_none() {
+        error = spawn_error;
+    }
+    // (a.1) SUBA-045 — the child tool-availability diagnostic, in pi's exact rank: `closeError =
+    //     result.error ?? toolDiagnosticError ?? assistantError` (`execution.ts:1079`). It sits
+    //     ABOVE the trailing assistant error deliberately, and that ordering is the whole point
+    //     of the item: a child told to use a tool its host never registered produces a
+    //     perfectly ordinary model apology, and the apology would otherwise become the run's
+    //     error and hide the cause. The file exists only when something was actually missing
+    //     (the child DELETES it otherwise), so this is silent on every healthy run.
+    if error.is_none() {
+        error = crate::exec::tool_availability::read_child_tool_diagnostic_error(
+            tool_diagnostic_path,
+        );
+    }
+    if error.is_none() {
+        error = trailing_assistant_error(&progress.all_events);
+    }
+    error
+}
+
+/// Startup-failure evidence (pi `execution.ts:1558-1573`). Every field here is a reason NOT to
+/// relaunch this model; `is_retryable_subagent_startup_failure` fails closed on any of them.
+fn build_startup_evidence(
+    progress: &AgentProgress,
+    outcome: &DriveOutcome,
+    final_output: Option<&str>,
+    process_signal: Option<String>,
+    error_is_placeholder: bool,
+) -> StartupEvidence {
+    StartupEvidence {
+        final_output_present: final_output.is_some_and(|text| !text.trim().is_empty()),
+        message_count: progress.message_end_events.len(),
+        tool_count: progress.tool_count,
+        duration_ms: Some(progress.duration_ms()),
+        protocol_error: outcome.protocol_error.is_some(),
+        process_signal,
+        observed_mutation_attempt: crate::exec::completion_guard::has_mutation_tool_call(
+            &progress.all_events,
+        ),
+        // cyrup's foreground executor has no `stopped` analog (pi carries it on the
+        // BACKGROUND runner's result). It cannot be true of a child with zero
+        // messages, zero tools and zero usage anyway — it requires the child to have
+        // run turns — so leaving it false cannot widen the predicate.
+        stopped: false,
+        // SUBA-008 — no longer hard-coded: a turn-budget abort is a deliberate
+        // supervisor kill, and `is_retryable_subagent_startup_failure` must fail
+        // closed on it rather than relaunching the model that was over budget.
+        turn_budget_exceeded: outcome.turn_budget.exceeded(),
+        error_is_placeholder,
+    }
+}
 /// The OS signal that killed a child, named the way pi names it (`proc.on("close", (code,
 /// signal))` hands Node's signal NAME straight through), for
 /// [`crate::exec::fallback::StartupEvidence::process_signal`]. `None` on a normal exit, and `None`

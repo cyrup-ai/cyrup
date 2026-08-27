@@ -22,7 +22,13 @@
 //! and a dozen channels. Driving it to observe the starvation would need a frame that reliably
 //! costs more than 80 ms under CI load — the exact non-determinism under test — so the guard is
 //! structural, the same shape as `run_loop_cancel_bias.rs`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 /// `app.rs` verbatim, at compile time.
 const APP_SRC: &str = include_str!("../app/run.rs");

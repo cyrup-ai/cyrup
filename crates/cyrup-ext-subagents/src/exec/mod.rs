@@ -92,7 +92,7 @@ pub(crate) mod testsupport;
 // `exec::build_attempt_spawn_plan`, `exec::ToolCallSummary`, etc. — is unchanged for every existing
 // caller (in-crate and, per `cyrup-it`'s integration tests, cross-crate).
 pub use agent_config::*;
-use attempt_runner::SpawnedChildAttemptRunner;
+use attempt_runner::{AttemptRecord, SpawnedChildAttemptRunner};
 pub use progress::*;
 pub use run_result::*;
 pub use spawn_plan::*;
@@ -109,8 +109,8 @@ use crate::exec::acceptance::{
     AcceptanceContract, CleanCompletionGate, apply_post_hoc_correction,
     build_timed_out_acceptance_ledger,
 };
-use crate::exec::completion_guard::evaluate_completion_mutation_guard;
-use crate::exec::fallback::run_fallback_ladder;
+use crate::exec::completion_guard::{CompletionMutationGuardResult, evaluate_completion_mutation_guard};
+use crate::exec::fallback::{AttemptSignal, run_fallback_ladder};
 use crate::exec::output::{
     resolve_output_handoff, snapshot_output_file, truncate_output, validate_file_only_requires_path,
 };
@@ -265,782 +265,108 @@ fn resolve_run_acceptance(
 /// / `RunOptions::clarify = None`), the drive loop still marks the attempt detached but the `AskLock`
 /// degrades to its no-live-channel fallback rather than blocking.
 pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> SingleResult {
-    // Step 0 (R-SA-055, SAFETY-CRITICAL): the recursion-depth guard MUST run before any spawn,
-    // discovery, or worktree setup — this is `run_sync`'s very first action, ahead of even
-    // R-SA-025's output-mode validation below, because `run_sync` is the sole chokepoint every
-    // production spawn path in this crate funnels through (the foreground single-run tool
-    // dispatch, the background hop-2 runner's per-step loop, and — via `chain_graph::walk_chain`/
-    // `spawn::parallel::run_bounded`'s `SingleStepExecutor` seam — every chain step, parallel
-    // fan-out child, and dynamic fan-out child as well). A blocked check returns an error result
-    // telling the caller to complete the task directly, per R-SA-055's own text, and — because
-    // this check precedes every other line of this function — zero subprocesses are ever spawned
-    // for a blocked attempt.
-    if crate::spawn::depth::is_blocked(&agent.depth) {
-        let err = SubagentError::DepthExceeded {
-            current: agent.depth.current_depth,
-            max: agent.depth.max_depth,
-        };
-        return SingleResult {
-            // SUBA-021: no usage budget on this path (see the field doc).
-            usage_budget: None,
-            turn_budget: None,
-            turn_budget_exceeded: false,
-            wrap_up_requested: false,
-            agent: agent.name.clone(),
-            task: task.to_string(),
-            exit_code: 1,
-            usage: Usage::default(),
-            model: None,
-            attempted_models: Vec::new(),
-            model_attempts: Vec::new(),
-            final_output: None,
-            structured_output: None,
-            acceptance: None,
-            detached: false,
-            interrupted: false,
-            timed_out: false,
-            stopped: false,
-            process_signal: None,
-            error: Some(err.to_string()),
-            saved_output_path: None,
-            tool_calls: Vec::new(),
-            output_truncated: false,
-            control_events: Vec::new(),
-            progress: None,
-        };
+    if let Some(failure) = depth_guard_failure(agent, task) {
+        return failure;
     }
 
     // Step 1 (R-SA-025): fail fast before any subprocess spawns.
     if let Some(err) = validate_file_only_requires_path(opts.output_mode, opts.output_path.as_deref())
     {
-        return SingleResult {
-            // SUBA-021: no usage budget on this path (see the field doc).
-            usage_budget: None,
-            turn_budget: None,
-            turn_budget_exceeded: false,
-            wrap_up_requested: false,
-            agent: agent.name.clone(),
-            task: task.to_string(),
-            exit_code: 1,
-            usage: Usage::default(),
-            model: None,
-            attempted_models: Vec::new(),
-            model_attempts: Vec::new(),
-            final_output: None,
-            structured_output: None,
-            acceptance: None,
-            detached: false,
-            interrupted: false,
-            timed_out: false,
-            stopped: false,
-            process_signal: None,
-            error: Some(err.to_string()),
-            saved_output_path: None,
-            tool_calls: Vec::new(),
-            output_truncated: false,
-            control_events: Vec::new(),
-            progress: None,
-        };
+        return pre_spawn_failure(agent, task, err.to_string());
     }
 
     // Step 2 (R-SA-023): resolve the effective acceptance contract.
     let contract = resolve_run_acceptance(opts, agent, task);
 
-    // Step 3 (R-SA-038).
-    // SUBA-003: pi passes `{ scope: options.modelScope }` here (`execution.ts:1065-1070`), which
-    // warns (never filters) for out-of-scope FALLBACK candidates. The ladder returned is identical
-    // either way — an out-of-scope fallback is still attempted, exactly as upstream, because
-    // dropping it would silently change which model ran.
-    let (candidates, _scope_warnings) = crate::exec::fallback::build_model_candidates_scoped(
-        &opts.model_override,
-        agent.model.as_ref(),
-        &agent.fallback_models,
-        &opts.available_models,
-        opts.model_scope.as_ref(),
-    );
-
+    let candidates = resolve_model_candidates(agent, opts);
     if candidates.is_empty() {
-        return SingleResult {
-            // SUBA-021: no usage budget on this path (see the field doc).
-            usage_budget: None,
-            turn_budget: None,
-            turn_budget_exceeded: false,
-            wrap_up_requested: false,
-            agent: agent.name.clone(),
-            task: task.to_string(),
-            exit_code: 1,
-            usage: Usage::default(),
-            model: None,
-            attempted_models: Vec::new(),
-            model_attempts: Vec::new(),
-            final_output: None,
-            structured_output: None,
-            acceptance: None,
-            detached: false,
-            interrupted: false,
-            timed_out: false,
-            stopped: false,
-            process_signal: None,
-            error: Some(
-                "no candidate model available for this subagent run (empty fallback ladder)"
-                    .to_string(),
-            ),
-            saved_output_path: None,
-            tool_calls: Vec::new(),
-            output_truncated: false,
-            control_events: Vec::new(),
-            progress: None,
-        };
+        let error =
+            "no candidate model available for this subagent run (empty fallback ladder)".to_string();
+        return pre_spawn_failure(agent, task, error);
     }
 
-    // T5 (C4) — skill association: resolve the agent's (or the call-site's) configured skills to
-    // lazy `<available_skills>` pointers ONCE, before the ladder starts, and compose them into every
-    // attempt's child prompt (pi `execution.ts:935-952`). The names are `opts.skills ?? agent.skills`
-    // (pi's `options.skills ?? agent.skills ?? []`); an empty list short-circuits discovery entirely
-    // (the common case), so a run with no configured skills pays no discovery cost and injects
-    // nothing. This is ORTHOGONAL to `agent.inherit_skills` — the `--no-skills` child flag governs
-    // whether the child runs its OWN skill discovery, while THIS block always injects the explicitly
-    // configured skills. Resolution is stable across model-fallback attempts (it never depends on the
-    // model), so it is done here, not per attempt.
-    let skill_names = opts.skills.clone().unwrap_or_else(|| agent.skills.clone());
-    // pi `shared.resolvedSkillNames` (`runs/foreground/execution.ts:1481` @HEAD): the names that
-    // actually RESOLVED to a `SKILL.md`, or `undefined` when none did — the value
-    // `progress.skills` is seeded from (`:263`). Hoisted out of the `else` arm below because it
-    // outlives the injection string it is computed alongside.
-    let mut resolved_skill_names: Option<Vec<String>> = None;
-    let skill_injection = if skill_names.is_empty() {
-        String::new()
-    } else {
-        let resolution = crate::discovery::skills::resolve_skills_with_fallback(
-            &skill_names,
-            &opts.cwd,
-            opts.runtime_cwd.as_deref(),
-        )
-        .await;
-        // pi `execution.ts:938-946`: an EXPLICIT request for the orchestration skill (always
-        // missing) is a hard failure, spawning nothing.
-        let orchestration_requested = skill_names
-            .iter()
-            .any(|s| s.trim() == crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL);
-        let orchestration_missing = resolution
-            .missing
-            .iter()
-            .any(|m| m == crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL);
-        if orchestration_requested && orchestration_missing {
-            return SingleResult {
-                // SUBA-021: no usage budget on this path (see the field doc).
-                usage_budget: None,
-                turn_budget: None,
-                turn_budget_exceeded: false,
-                wrap_up_requested: false,
-                agent: agent.name.clone(),
-                task: task.to_string(),
-                exit_code: 1,
-                usage: Usage::default(),
-                model: None,
-                attempted_models: Vec::new(),
-                model_attempts: Vec::new(),
-                final_output: None,
-                structured_output: None,
-                acceptance: None,
-                detached: false,
-                interrupted: false,
-                timed_out: false,
-                stopped: false,
-                process_signal: None,
-                error: Some(format!(
-                    "Skills not found: {}",
-                    crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL
-                )),
-                saved_output_path: None,
-                tool_calls: Vec::new(),
-                output_truncated: false,
-                control_events: Vec::new(),
-                progress: None,
-            };
-        }
-        resolved_skill_names = (!resolution.resolved.is_empty())
-            .then(|| resolution.resolved.iter().map(|s| s.name.clone()).collect());
-        crate::discovery::skills::build_skill_injection(&resolution.resolved)
+    let setup = match prepare_ladder(agent, task, opts).await {
+        Ok(setup) => setup,
+        Err(failure) => return *failure,
     };
+    let mut structured_guard = setup.structured_guard;
+    let structured_runtime = structured_guard.as_ref().map(|guard| guard.runtime().clone());
 
-    // R-SA-031: snapshot the output file's state ONCE, before the ladder starts (a task's
-    // `output_path` is stable across fallback attempts — see `SpawnedChildAttemptRunner::
-    // snapshot_output_file`'s own doc note for why re-snapshotting per attempt is unnecessary).
-    let output_snapshot = snapshot_output_file(opts.output_path.as_deref());
-
-    let scratch_dir = opts.cwd.join(".cyrup-subagent-scratch");
-    if let Err(err) = std::fs::create_dir_all(&scratch_dir) {
-        return SingleResult {
-            // SUBA-021: no usage budget on this path (see the field doc).
-            usage_budget: None,
-            turn_budget: None,
-            turn_budget_exceeded: false,
-            wrap_up_requested: false,
-            agent: agent.name.clone(),
-            task: task.to_string(),
-            exit_code: 1,
-            usage: Usage::default(),
-            model: None,
-            attempted_models: Vec::new(),
-            model_attempts: Vec::new(),
-            final_output: None,
-            structured_output: None,
-            acceptance: None,
-            detached: false,
-            interrupted: false,
-            timed_out: false,
-            stopped: false,
-            process_signal: None,
-            error: Some(format!("failed to prepare subagent scratch directory: {err}")),
-            saved_output_path: None,
-            tool_calls: Vec::new(),
-            output_truncated: false,
-            control_events: Vec::new(),
-            progress: None,
-        };
-    }
-
-    // G90: create this child's steer inbox BEFORE the spawn. The child's own watcher does its own
-    // `mkdir` on start (pi `subagent-prompt-runtime.ts:226`), but the RUNNER may route an accepted
-    // steer request into the directory before the child has finished booting, and a request written
-    // into a directory that is then created underneath it would be lost. Creating it here — at the
-    // single point that also hands the path over — makes the directory exist for the whole of the
-    // child's life. A failure is deliberately NOT fatal: steering is an optional live channel, and a
-    // run must not fail to start because a control subdirectory could not be made.
-    if let Some(inbox) = opts.steer_inbox_dir.as_deref() {
-        let _ = std::fs::create_dir_all(inbox);
-    }
-
-    // SUBA-049: same reasoning for the ack directory, one hop earlier. The child creates it itself
-    // before its first write, but the PARENT polls it while waiting for the acknowledgment — and
-    // `consume_steer_acks` treats an unreadable directory as "no acks yet", which is
-    // indistinguishable from "the child has not answered". Creating it here makes the empty-and-
-    // waiting state a real, observable empty directory from the moment the child is spawned.
-    if let Some(acks) = opts.steer_ack_dir.as_deref() {
-        let _ = std::fs::create_dir_all(acks);
-    }
-    if let Some(parent) = opts.steer_capability_path.as_deref().and_then(std::path::Path::parent) {
-        let _ = std::fs::create_dir_all(parent);
-    }
-
-    // SUBA-S01 (pi `chain-execution.ts:301` / `async-execution.ts:498`): when the step declares an
-    // `outputSchema`, create the capture runtime ONCE per run — not per attempt — and write the
-    // schema to a private file the child reads. Every fallback attempt shares it, exactly as pi
-    // shares one runtime across a step's execution, so a retry cannot silently capture into a
-    // different file than the one read back below.
-    //
-    // A creation failure degrades to `None` rather than failing the run: the child then never
-    // receives the env vars, never registers `structured_output`, and the read-back reports pi's
-    // own "missing" hard failure — which is the correct outcome for "the schema never reached the
-    // child", and strictly better than aborting a run that might still produce useful prose. It is
-    // NOT a licence to go looking for the value somewhere pi never looks: see the read-back below.
-    //
-    // SUBA-S01 residual: the runtime is held by a `StructuredOutputCleanupGuard`, which is the RAII
-    // port of pi's `finally { if (!r?.detached) cleanupStructuredOutputRuntime(structuredRuntime); }`
-    // (`runs/foreground/subagent-executor.ts:3780-3787` @v0.43.0). See that type's own doc for why
-    // the end-of-function statement this replaces was wrong on BOTH halves.
-    let mut structured_guard = opts
-        .structured_output_schema
-        .as_ref()
-        .and_then(|schema| {
-            crate::exec::structured::create_structured_output_runtime(schema, &scratch_dir).ok()
-        })
-        .map(crate::exec::structured::StructuredOutputCleanupGuard::new);
-    let structured_runtime = structured_guard
-        .as_ref()
-        .map(|guard| guard.runtime().clone());
-
-    // Step 4: drive the fallback ladder.
-    let mut runner = SpawnedChildAttemptRunner {
+    let outcome = drive_fallback_ladder(
         agent,
         task,
         opts,
-        contract: &contract,
-        scratch_dir,
-        skill_injection,
-        attempt_index: 0,
-        structured_runtime: structured_runtime.clone(),
-        // SUBA-014 / pi `runs/foreground/execution.ts:322,357` @v0.43.0:
-        // `requireReadTool: Boolean(shared.resolvedSkillNames?.length)`. `resolved_skill_names` is
-        // `Some` exactly when at least one declared skill resolved to a `SKILL.md`, so `is_some()`
-        // IS `Boolean(...?.length)` — a declared-but-unresolvable skill grants nothing, matching
-        // upstream, which derives the flag from the RESOLVED list rather than the requested one.
-        require_read_tool: resolved_skill_names.is_some(),
-    };
-    let outcome = run_fallback_ladder(&candidates, &mut runner).await;
+        &contract,
+        &candidates,
+        setup.scratch_dir,
+        setup.skill_injection,
+        structured_runtime.clone(),
+        setup.resolved_skill_names.is_some(),
+    )
+    .await;
 
     let winning_model = outcome.attempted_models.last().cloned();
     let last_signal = outcome.last_signal;
     let last_attempt = outcome.last_attempt;
 
-    let (timed_out, interrupted, detached, process_signal, mut exit_code, mut error, mut final_output) =
-        match (&last_signal, &last_attempt) {
-            (Some(signal), Some(record)) => (
-                signal.timed_out,
-                // A soft interrupt is carried on the runner's own per-attempt payload
-                // ([`AttemptRecord::interrupted`], not on `AttemptSignal` which this crate does not
-                // own); an interrupted attempt reports `success: true`/`exit_code: 0`, so the
-                // ladder stops on it and this is the winning attempt whenever an interrupt fired
-                // (pi `execution.ts:748-761`, T3 group A). The gates below (structured-output,
-                // completion-guard, acceptance correction) all skip for a non-clean gate, so the
-                // paused-success `final_output` reaches the caller untouched.
-                record.interrupted,
-                signal.detached,
-                // G104 — pi `if (signal) result.processSignal = signal;` (`execution.ts:1081`).
-                // The value was already computed by `process_signal_name` and stashed on the
-                // attempt's `StartupEvidence`; publishing it on the terminal `SingleResult` is what
-                // makes `resolveSubagentResultStatus`'s unexplained-signal → `"stopped"` branch
-                // (`result-intercom.ts:35`) reachable at all.
-                signal.startup.process_signal.clone(),
-                signal.exit_code.unwrap_or(if signal.success { 0 } else { 1 }),
-                signal.error.clone(),
-                record.final_output.clone(),
-            ),
-            _ => (
-                false,
-                false,
-                false,
-                None,
-                1,
-                Some("subagent fallback ladder produced no attempt outcome".to_string()),
-                None,
-            ),
-        };
+    let SettledAttempt {
+        timed_out,
+        interrupted,
+        detached,
+        process_signal,
+        exit_code,
+        mut error,
+        final_output,
+    } = SettledAttempt::from_ladder(last_signal.as_ref(), last_attempt.as_ref());
 
-    // Timeout message + partial-output preamble (pi `execution.ts:824-829`): a timed-out run's
-    // delivered output leads with `Subagent timed out after {ms}ms.`, and — when the child produced
-    // any partial output before the deadline fired — that partial output follows under a
-    // `Partial output before timeout:` heading. Applied here, right after the ladder settles and
-    // before the output-path handoff / truncation, exactly as pi applies it right after extracting
-    // `fullOutput`. The nominal budget is `opts.timeout_ms` (pi `formatTimeoutMessage(options
-    // .timeoutMs ?? 0)`), distinct from the wall-clock `deadline_at` that actually fired the timer.
-    //
-    // SUBA-008 — pi's `else if` chain continues from the SAME `if (result.timedOut)`
-    // (`execution.ts:1241-1258`), so a timed-out run never also gets a turn-budget preamble even
-    // when both fired. That is why the three turn-budget arms are `else` on this branch and not a
-    // second independent `if`.
     let turn_budget_tracker = last_attempt
         .as_ref()
         .map(|record| record.turn_budget.clone())
         .unwrap_or_default();
-    if timed_out {
-        let timeout_message = format_timeout_message(opts.timeout_ms.unwrap_or(0));
-        let partial = final_output.clone().unwrap_or_default();
-        final_output = Some(if partial.trim().is_empty() {
-            timeout_message
-        } else {
-            format!("{timeout_message}\n\nPartial output before timeout:\n{partial}")
-        });
-    } else if let Some(note) = turn_budget_tracker.terminal_note() {
-        let body = final_output.clone().unwrap_or_default();
-        final_output = Some(match note {
-            // pi `formatTurnBudgetOutput(turnBudgetExceededMessage(...), fullOutput)` (`:1252`) —
-            // message first, whatever the child managed under a "Partial output" heading.
-            crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(message) => {
-                crate::exec::turn_budget::format_turn_budget_output(&message, &body)
-            }
-            // pi `fullOutput.trim() ? `${note}\n\n${fullOutput}` : note` (`:1255`/`:1258`) — the
-            // note leads, and the child's real answer follows it intact.
-            crate::exec::turn_budget::TurnBudgetTerminalNote::Note(note) => {
-                crate::exec::turn_budget::prepend_turn_budget_note(&body, &note)
-            }
-        });
-    }
+    let final_output =
+        apply_terminal_preamble(final_output, timed_out, opts.timeout_ms, &turn_budget_tracker);
 
-    // R-SA-031: file-only/output-path handoff, once, against the aggregate captured output. Tracks
-    // the concrete saved path (`Some` only when the file was actually written — by the child, or by
-    // the orchestrator persisting its own captured output), which the saved-output reference message
-    // below (pi `finalizeSingleOutput`, `single-output.ts:211-235`) is gated on. pi resolves the
-    // handoff only for a clean run (`finalResult?.exitCode === 0`, `subagent-runner.ts:872`), so this
-    // is gated on the same clean-completion condition rather than run unconditionally.
-    let mut saved_output_path: Option<PathBuf> = None;
-    if let Some(output_path) = opts.output_path.as_ref()
-        && exit_code == 0
-    {
-        let captured = final_output.clone().unwrap_or_default();
-        match resolve_output_handoff(output_path, &captured, output_snapshot) {
-            crate::exec::output::OutputHandoff::ChildWrote { content } => {
-                final_output = Some(content);
-                saved_output_path = Some(output_path.clone());
-            }
-            crate::exec::output::OutputHandoff::OrchestratorWrote {
-                written,
-                error: handoff_error,
-            } => {
-                if written {
-                    saved_output_path = Some(output_path.clone());
-                }
-                if let Some(handoff_error) = handoff_error {
-                    error = Some(match error {
-                        Some(existing) => format!("{existing}; {handoff_error}"),
-                        None => handoff_error,
-                    });
-                }
-            }
-        }
-    }
-    // The FULL (untruncated) persisted content the saved-output reference measures its byte/line
-    // counts over (pi `formatSavedOutputReference(savedPath, output)` uses the pre-truncation output,
-    // `subagent-runner.ts:876`) — captured here, before step 9's truncation reassigns `final_output`.
-    let full_output_for_reference = final_output.clone();
+    let (final_output, full_output_for_reference, saved_output_path) =
+        resolve_saved_output(opts, exit_code, final_output, setup.output_snapshot, &mut error);
 
-    // The WINNING attempt's progress fold AND its live-control monitor (pi keeps both as locals of
-    // the same `runSingleAttempt` scope; this crate has to carry them out of the ladder because
-    // its post-settlement guard/acceptance steps live one level up, in `run_sync`).
-    let (progress, mut control) = match last_attempt {
-        Some(record) => (record.progress, record.control),
-        None => (
-            AgentProgress::default(),
-            crate::exec::control::ControlMonitor::disabled(),
-        ),
-    };
+    let (progress, mut control) = winning_attempt_state(last_attempt);
 
-    // Step 5 (R-SA-030): structured-output extraction + parent-side JSON-Schema re-validation.
-    // Only evaluated on an otherwise-clean run (mirrors the completion-guard/acceptance gate's own
-    // "don't re-diagnose an already-failed attempt" discipline just below) — a run that already
-    // failed for another reason (non-zero exit, timeout, detach, interrupt) must not additionally
-    // be re-labeled by a structured-output check that never had a fair chance to run against a
-    // clean transcript.
-    let structured_output = if (CleanCompletionGate {
-        exit_code,
-        detached,
-        interrupted,
-        timed_out,
-    })
-    .is_clean()
-    {
-        // SUBA-S01: read the FILE the child's `structured_output` tool wrote (pi
-        // `readStructuredOutput`, `structured-output.ts:156-173`). The capture file is the ONLY
-        // channel — pi has no other, and neither does this port any more.
-        //
-        // The `None` arm used to fall back to `resolve_structured_output`, a cyrup-original scan
-        // that accepted the newest fenced ```json block in the child's prose. That is exactly what
-        // the "EVEN WHEN prose was produced" rule below says must NOT satisfy a declared schema,
-        // and it was not merely lenient: a coincidental fence could VALIDATE against the caller's
-        // schema and become the run's structured result, silently feeding a wrong answer into a
-        // chain's output bindings. A schema that was declared but whose capture runtime could not
-        // be created is therefore `Missing` — no file, no value — which is the same hard failure
-        // upstream produces when the child never called the tool.
-        let structured_outcome = match structured_runtime.as_ref() {
-            Some(runtime) => match crate::exec::structured::read_structured_output(runtime) {
-                Ok(value) => StructuredOutcome::Valid(value),
-                Err(message)
-                    if message == crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR =>
-                {
-                    StructuredOutcome::Missing
-                }
-                Err(message) => StructuredOutcome::Invalid(message),
-            },
-            None if opts.structured_output_schema.is_some() => StructuredOutcome::Missing,
-            None => StructuredOutcome::NotRequested,
-        };
-        match structured_outcome {
-            StructuredOutcome::NotRequested => None,
-            StructuredOutcome::Valid(value) => Some(value),
-            StructuredOutcome::Missing => {
-                // pi `readStructuredOutput` (structured-output.ts:156-173, execution.ts:1212-1216): a
-                // declared `outputSchema` with no captured `structured_output` value is a HARD
-                // failure — EVEN WHEN the child produced prose. pi runs its structured-output check
-                // on every clean exit and fails on the missing value unconditionally; prose is never
-                // an exemption. (An empty-prose + missing-structured attempt never reaches here: the
-                // per-attempt cold-start gate already failed it retryably via `structured_output_absent`,
-                // so a clean gate at this point implies prose WAS produced — exactly the "even with
-                // prose" case this must still reject.)
-                exit_code = 1;
-                error = Some(match error {
-                    Some(existing) if !existing.trim().is_empty() => {
-                        format!("{existing}; {}", crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR)
-                    }
-                    _ => crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR.to_string(),
-                });
-                None
-            }
-            StructuredOutcome::Invalid(message) => {
-                exit_code = 1;
-                error = Some(match error {
-                    Some(existing) if !existing.trim().is_empty() => {
-                        format!("{existing}; {message}")
-                    }
-                    _ => message,
-                });
-                None
-            }
-        }
-    } else {
-        None
-    };
-
-    // Step 6 (R-SA-034): completion-mutation guard — needs a real AgentDefinition-shaped view;
-    // `evaluate_completion_mutation_guard` only reads `local_name`/`tools`/`completion_guard`, so
-    // a minimal projection is built here rather than requiring `AgentConfig` to carry every other
-    // `AgentDefinition` field this guard never touches.
-    let guard_agent = completion_guard_projection(agent);
-    let guard_result =
-        evaluate_completion_mutation_guard(&guard_agent, task, &progress.all_events);
-
-    let clean_gate = CleanCompletionGate {
-        exit_code,
-        detached,
-        interrupted,
-        timed_out,
-    };
-
-    if clean_gate.is_clean() && guard_result.triggered {
-        exit_code = 1;
-        error = Some(match error {
-            Some(existing) if !existing.trim().is_empty() => format!(
-                "{existing}; {}",
-                crate::exec::completion_guard::COMPLETION_GUARD_ERROR_MESSAGE
-            ),
-            _ => crate::exec::completion_guard::COMPLETION_GUARD_ERROR_MESSAGE.to_string(),
-        });
-        // pi `execution.ts:1234-1247`: the guard also raises a `needs_attention` control event with
-        // `reason: "completion_guard"` — the one raise that happens AFTER the child is gone, and
-        // the one the notice renderer formats as the "Subagent failed: <agent>" body rather than
-        // the steer/resume nudge. Shares the winning attempt's dedup set (`control` is that
-        // attempt's own monitor), exactly as the source's shared `emittedControlEventKeys` does.
-        control.emit_completion_guard_notice(
-            crate::time::now_epoch_millis(),
-            format!(
-                "{} completed without making edits for an implementation task",
-                agent.name
-            ),
-        );
-    }
-
-    // Re-derive the gate AFTER the completion-guard correction above, since R-SA-033's own
-    // acceptance-gate condition must observe the POST-guard exit code (a run the completion
-    // guard already failed must not additionally run acceptance evaluation against a stale
-    // "exit_code == 0" snapshot).
-    let post_guard_gate = CleanCompletionGate {
-        exit_code,
-        detached,
-        interrupted,
-        timed_out,
-    };
-
-    // Step 7 (R-SA-032) + Step 8 (R-SA-033), unless R-SA-037 bypasses both entirely.
-    let acceptance_ledger = if detached {
-        None
-    } else if timed_out {
-        // pi `buildTimedOutAcceptanceLedger` (`execution.ts:101-113`, applied at `1089-1090`): a
-        // timed-out run's ledger is `rejected` (unless the contract required no acceptance at all,
-        // in which case it stays `not-required`), NEVER the `not-required` a non-clean gate would
-        // otherwise yield from `evaluate_acceptance`, and it carries a failed timeout runtime check.
-        // No post-hoc exit-code correction runs — pi gates that on `!result.timedOut`
-        // (`execution.ts:1098`), and the run already failed via the timeout path (exit_code != 0).
-        Some(build_timed_out_acceptance_ledger(&contract))
-    } else {
-        // G82 — pi `execution.ts:1680-1682`:
-        //   const childWrittenOutput = options.outputPath
-        //       ? extractChildWrittenOutput(result.messages, options.outputPath, options.cwd ?? runtimeCwd)
-        //       : undefined;
-        // Authorship taken from the CHILD'S OWN successful `write` calls, never from disk, so a
-        // sibling run writing the same path cannot have its content misattributed here (#420).
-        // Fed to the acceptance gate as an admissible acceptance-report source — the PRIMARY one
-        // in `outputMode: "file-only"`, where the artifact, not the receipt prose, is the answer.
-        let child_written_output = crate::exec::output::extract_child_written_output(
-            &progress.all_events,
-            opts.output_path.as_deref(),
-            &opts.cwd,
-        );
-        // `fileOutput: childWrittenOutput !== undefined && options.outputPath ? {...} : undefined`
-        // (`execution.ts:1699-1701`).
-        let file_output = match (child_written_output.as_deref(), opts.output_path.as_deref()) {
-            (Some(content), Some(path)) => Some(acceptance::AcceptanceFileOutput {
-                content,
-                path,
-                authoritative: matches!(opts.output_mode, OutputMode::FileOnly),
-            }),
-            _ => None,
-        };
-        // G80 — pi `evaluateAcceptance({ …, artifactsDir: options.artifactsDir, runId:
-        // options.runId })` (`runs/foreground/execution.ts:1704-1705` @v0.43.0). Both must be
-        // present for `runMemoizedVerifyCommand` to consult/record a memo (`acceptance.ts:1085`).
-        let memo = match (opts.artifacts_dir.as_deref(), opts.run_id.as_ref()) {
-            (Some(artifacts_dir), Some(run_id)) => Some(acceptance::model::VerifyMemoContext {
-                artifacts_dir,
-                run_id: run_id.as_str(),
-            }),
-            _ => None,
-        };
-        // SUBA-028 / pi `evaluateAcceptance({ …, signal: options.signal })`
-        // (`runs/foreground/execution.ts:1704-1706` @v0.43.0). THIS is the call the item was about:
-        // without the token, cancelling a run (Ctrl-C, orchestrator cancel, parent timeout) left
-        // acceptance verification running, so the caller waited out a full per-command `timeoutMs`
-        // — once per remaining command — after asking to stop.
-        let ledger = acceptance::evaluate_acceptance_with_cancel(
-            &contract,
-            post_guard_gate,
-            final_output.as_deref(),
-            guard_result,
-            &opts.cwd,
-            memo,
-            file_output,
-            &opts.cancel,
-        )
+    let mut gates = GateState { exit_code, error, detached, interrupted, timed_out };
+    let structured_output = gates.apply_structured_output(structured_runtime.as_ref(), opts);
+    let guard_result = gates.apply_completion_guard(agent, task, &progress, &mut control);
+    let acceptance_ledger = gates
+        .apply_acceptance(&contract, &progress, opts, final_output.as_deref(), guard_result)
         .await;
+    let GateState { exit_code, error, .. } = gates;
 
-        let correction =
-            apply_post_hoc_correction(&ledger, contract.explicit, post_guard_gate, error.as_deref());
-        exit_code = correction.exit_code;
-        error = correction.error;
-
-        Some(ledger)
-    };
-
-    // Strip trailing acceptance-report fences from the DELIVERED output (pi `stripAcceptanceReport`,
-    // execution.ts:823/857). The acceptance gate above already consumed the RAW report block for its
-    // provenance evaluation (`evaluate_acceptance` receives the unstripped `final_output`); the
-    // human/LLM caller must be shown the answer prose, never the machine report JSON that was
-    // previously delivered verbatim. Skipped for a detached result (R-SA-037 bypasses output
-    // post-processing entirely, exactly like the truncation step below).
-    if !detached {
-        final_output = final_output
-            .as_deref()
-            .map(crate::exec::acceptance::model::strip_acceptance_report);
-    }
-
-    // Step 9 (R-SA-042), skipped entirely for a detached result (R-SA-037).
-    let (final_output, output_truncated) = if detached {
-        (final_output, false)
-    } else {
-        match final_output {
-            Some(text) => {
-                let result = truncate_output(&text, agent.max_output, None);
-                (Some(result.text), result.truncated)
-            }
-            None => (None, false),
-        }
-    };
-
-    // Saved-output reference (pi `finalizeSingleOutput`, `single-output.ts:211-235`): once a clean
-    // run wrote its `output` file, the delivered output either gains a trailing
-    // `Output saved to: <path> (<size>, <n> lines). Read this file if needed.` line (inline /
-    // file-and-inline modes) or is REPLACED entirely by that reference message (file-only mode) — so
-    // an LLM caller/terminal user sees where the artifact landed rather than a wall of inlined
-    // content it can re-read on demand. The byte/line counts are measured over the FULL,
-    // pre-truncation persisted content, with acceptance-report fences stripped — matching pi, which
-    // measures `formatSavedOutputReference(savedPath, stripAcceptanceReport(resolvedOutput.fullOutput))`
-    // (execution.ts:857-861).
-    let final_output = match (&saved_output_path, detached) {
-        (Some(saved), false) if exit_code == 0 => {
-            let full = crate::exec::acceptance::model::strip_acceptance_report(
-                &full_output_for_reference.clone().unwrap_or_default(),
-            );
-            let reference = crate::exec::output::format_saved_output_reference(saved, &full);
-            match opts.output_mode {
-                OutputMode::FileOnly => Some(reference.message),
-                OutputMode::Inline | OutputMode::FileAndInline => Some(match final_output {
-                    Some(text) if !text.is_empty() => {
-                        format!("{text}\n\n{}", reference.message)
-                    }
-                    _ => reference.message,
-                }),
-            }
-        }
-        _ => final_output,
-    };
-
-    // Step 10 (R-SA-043): compaction, and its ONE documented opt-out.
-    //
-    // `SingleResult` is unconditionally the compacted shape — no raw per-turn messages, only
-    // summarized `tool_calls`. `include_progress` restores exactly one thing on top of that: this
-    // run's own `AgentProgress` projection, which pi gates identically (`progress:
-    // params.includeProgress ? allProgress : undefined`, `subagent-executor.ts:3008` for SINGLE and
-    // `:2679` for PARALLEL @v0.34.0). With the flag off or omitted the field stays `None` and
-    // `skip_serializing_if` drops it, so a returned/persisted result is byte-for-byte what it was
-    // before the field existed.
-    //
-    // Assembled HERE, from the winning attempt's fold plus this function's settled locals, because
-    // that is where pi assembles it too: `execution.ts` mutates the one `progress` object at
-    // `:907-913` @v0.34.0 and hands it out as `result.progress`. Deliberately NOT reusing the
-    // orchestrator-layer `tui::events::LiveProgressFold` — that fold only exists on the streaming
-    // foreground path (it is installed only when an `on_update` sink is present), so the detached
-    // hop-2 runner and every non-streaming caller would get nothing.
-    let progress_snapshot = if opts.include_progress == Some(true) {
-        // pi's settled `progress.status`. Order matters: a detach short-circuits at
-        // `execution.ts:344` and an interrupt returns early at `:861` with the status pi set at
-        // `:828` — neither ever reaches the `exitCode === 0 ? "completed" : "failed"` assignment at
-        // `:907`. Leaving an interrupt-paused run as `Running` is therefore upstream's own shape,
-        // and it is load-bearing: `compact_completed` refuses to compact a `running` snapshot
-        // (pi `compactCompletedProgress`'s first line), which is exactly what lets the caller who
-        // will `resume` this run still see its live detail.
-        let status = if detached {
-            crate::tui::events::LiveProgressStatus::Detached
-        } else if interrupted {
-            crate::tui::events::LiveProgressStatus::Running
-        } else if exit_code == 0 {
-            crate::tui::events::LiveProgressStatus::Complete
-        } else {
-            crate::tui::events::LiveProgressStatus::Failed
-        };
-        let snapshot = progress.snapshot(ProgressSnapshotInput {
-            index: u32::try_from(opts.child_index.unwrap_or(0)).unwrap_or(u32::MAX),
-            agent: &agent.name,
-            task,
-            skills: resolved_skill_names,
-            // pi `progress.model = modelArg` (`execution.ts:267` @v0.34.0) — the id the child was
-            // actually launched with, thinking suffix included, not the bare ladder entry.
-            model: apply_thinking_suffix(
-                winning_model.as_ref().map(ModelId::as_str),
-                agent.thinking.as_deref(),
-            ),
-            thinking: agent.thinking.clone(),
-            status,
-            // pi `progress.activityState`, owned by the control state machine; the winning
-            // attempt's monitor is the one `run_sync` carried out of the ladder, and it already
-            // cleared the state on a soft interrupt exactly as pi does at `:832,854`.
-            activity_state: control.activity_state(),
-            error: error.clone(),
-        });
-        // pi `compactForegroundDetails` → `compactCompletedProgress` (`shared/utils.ts:330-347`):
-        // a SETTLED snapshot keeps eleven fields and empties the two growth terms.
-        Some(snapshot.compact_completed())
-    } else {
-        None
-    };
-
-    // SUBA-S01 (pi `cleanupStructuredOutputRuntime`, `structured-output.ts:175-182`, invoked from
-    // `subagent-executor.ts:3780-3787`'s `finally`): the removal itself is `structured_guard`'s
-    // `Drop`, so it happens on EVERY exit from `run_sync` — including a cancellation that drops
-    // this future mid-ladder, which an end-of-function statement could never cover.
-    //
-    // This statement is upstream's `if (!r?.detached)` guard and nothing else. A detached run's
-    // child is still alive (R-SA-037) and has not written its capture file yet; that file lives
-    // inside the very directory cleanup removes. pi says so in its own words at `:3782-3784` — "A
-    // successful detached receipt transfers both to onDetachedExit while the authoritative
-    // completion remains live" — and defers the cleanup to `onDetachedExit`'s inner `finally`
-    // (`:3757-3761`). Disarming is that transfer. Before this, cyrup deleted the directory out from
-    // under the live child on every detach, so a detached run could never produce a structured
-    // value at all and the child's `structured_output` call would fail on a vanished parent dir.
-    if detached && let Some(guard) = structured_guard.as_mut() {
-        guard.disarm();
-    }
-
-    // SUBA-021 — the USAGE budget's terminal check (pi `subagent-runner.ts:4403-4411`):
-    //
-    //     setOptionalProperty(statusPayload, "usageBudget", usageBudgetState(config.usageBudget, currentUsageTotals()));
-    //     if (usageBudgetExceeded && statusPayload.usageBudget && !statusPayload.error)
-    //         statusPayload.error = usageBudgetExceededMessage(statusPayload.usageBudget);
-    //
-    // Computed from the run's AGGREGATE usage (every attempt of the fallback ladder, not just the
-    // winning one) because that is what the run actually spent. `!statusPayload.error` is
-    // load-bearing: a run that already failed keeps its own diagnosis — the budget did not cause
-    // that failure and overwriting it would hide the real cause behind a bookkeeping note.
-    let usage_budget = crate::exec::usage_budget::usage_budget_state(
-        opts.usage_budget,
-        Some(crate::exec::usage_budget::UsageTotals::from(
-            &outcome.aggregate_usage,
-        )),
+    let (final_output, output_truncated) = finalize_delivered_output(
+        final_output,
+        full_output_for_reference,
+        saved_output_path.as_ref(),
+        detached,
+        exit_code,
+        agent.max_output,
+        opts.output_mode,
     );
-    let error = match (&error, usage_budget.as_ref()) {
-        (None, Some(state)) if state.exhausted => Some(
-            crate::exec::usage_budget::usage_budget_exceeded_message(state),
-        ),
-        _ => error,
-    };
+
+    let progress_snapshot = build_progress_snapshot(
+        &progress,
+        opts,
+        agent,
+        task,
+        setup.resolved_skill_names,
+        winning_model.as_ref(),
+        &control,
+        detached,
+        interrupted,
+        exit_code,
+        error.clone(),
+    );
+
+    disarm_structured_guard_on_detach(detached, structured_guard.as_mut());
+
+    let (usage_budget, error) =
+        resolve_terminal_usage_budget(opts, &outcome.aggregate_usage, error);
 
     SingleResult {
         usage_budget,
@@ -1085,6 +411,860 @@ pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> Sin
         // pi `result.controlEvents = allControlEvents.length ? allControlEvents : undefined`
         // (`execution.ts:1260`) — an empty Vec is this crate's `undefined` (it serializes away).
         control_events: control.into_events(),
+    }
+}
+
+/// Step 0 (R-SA-055, SAFETY-CRITICAL): the recursion-depth guard MUST run before any spawn,
+/// discovery, or worktree setup — this is `run_sync`'s very first action, ahead of even
+/// R-SA-025's output-mode validation in `run_sync`'s own step 1, because `run_sync` is the sole
+/// chokepoint every production spawn path in this crate funnels through (the foreground single-run
+/// tool dispatch, the background hop-2 runner's per-step loop, and — via `chain_graph::walk_chain`/
+/// `spawn::parallel::run_bounded`'s `SingleStepExecutor` seam — every chain step, parallel
+/// fan-out child, and dynamic fan-out child as well). A blocked check returns an error result
+/// telling the caller to complete the task directly, per R-SA-055's own text, and — because
+/// this check precedes every other line of `run_sync` — zero subprocesses are ever spawned
+/// for a blocked attempt.
+fn depth_guard_failure(agent: &AgentConfig, task: &str) -> Option<SingleResult> {
+    if !crate::spawn::depth::is_blocked(&agent.depth) {
+        return None;
+    }
+    let err = SubagentError::DepthExceeded {
+        current: agent.depth.current_depth,
+        max: agent.depth.max_depth,
+    };
+    Some(pre_spawn_failure(agent, task, err.to_string()))
+}
+
+/// Step 3 (R-SA-038).
+///
+/// SUBA-003: pi passes `{ scope: options.modelScope }` here (`execution.ts:1065-1070`), which
+/// warns (never filters) for out-of-scope FALLBACK candidates. The ladder returned is identical
+/// either way — an out-of-scope fallback is still attempted, exactly as upstream, because
+/// dropping it would silently change which model ran.
+fn resolve_model_candidates(agent: &AgentConfig, opts: &RunOptions) -> Vec<ModelId> {
+    let (candidates, _scope_warnings) = crate::exec::fallback::build_model_candidates_scoped(
+        &opts.model_override,
+        agent.model.as_ref(),
+        &agent.fallback_models,
+        &opts.available_models,
+        opts.model_scope.as_ref(),
+    );
+    candidates
+}
+
+/// Step 4: drive the model-fallback ladder, spawning one REAL child OS process per attempt via
+/// [`SpawnedChildAttemptRunner`], and hand back the settled [`fallback::FallbackOutcome`].
+///
+/// Nine parameters is over clippy's threshold; they are `run_sync`'s own pre-ladder state handed
+/// through verbatim, exactly like `evaluate_acceptance_with_cancel`'s own allow in
+/// `acceptance/lattice/gate.rs`.
+#[allow(clippy::too_many_arguments)]
+async fn drive_fallback_ladder<'a>(
+    agent: &'a AgentConfig,
+    task: &'a str,
+    opts: &'a RunOptions,
+    contract: &'a AcceptanceContract,
+    candidates: &[ModelId],
+    scratch_dir: PathBuf,
+    skill_injection: String,
+    structured_runtime: Option<crate::exec::structured::StructuredOutputRuntime>,
+    require_read_tool: bool,
+) -> fallback::FallbackOutcome<AttemptRecord> {
+    let mut runner = SpawnedChildAttemptRunner {
+        agent,
+        task,
+        opts,
+        contract,
+        scratch_dir,
+        skill_injection,
+        attempt_index: 0,
+        structured_runtime,
+        // SUBA-014 / pi `runs/foreground/execution.ts:322,357` @v0.43.0:
+        // `requireReadTool: Boolean(shared.resolvedSkillNames?.length)`. `resolved_skill_names` is
+        // `Some` exactly when at least one declared skill resolved to a `SKILL.md`, so `is_some()`
+        // IS `Boolean(...?.length)` — a declared-but-unresolvable skill grants nothing, matching
+        // upstream, which derives the flag from the RESOLVED list rather than the requested one.
+        require_read_tool,
+    };
+    run_fallback_ladder(candidates, &mut runner).await
+}
+
+/// The WINNING attempt's progress fold AND its live-control monitor (pi keeps both as locals of
+/// the same `runSingleAttempt` scope; this crate has to carry them out of the ladder because
+/// its post-settlement guard/acceptance steps live one level up, in `run_sync`).
+fn winning_attempt_state(
+    last_attempt: Option<AttemptRecord>,
+) -> (AgentProgress, crate::exec::control::ControlMonitor) {
+    match last_attempt {
+        Some(record) => (record.progress, record.control),
+        None => (
+            AgentProgress::default(),
+            crate::exec::control::ControlMonitor::disabled(),
+        ),
+    }
+}
+
+/// SUBA-S01 (pi `cleanupStructuredOutputRuntime`, `structured-output.ts:175-182`, invoked from
+/// `subagent-executor.ts:3780-3787`'s `finally`): the removal itself is `structured_guard`'s
+/// `Drop`, so it happens on EVERY exit from `run_sync` — including a cancellation that drops
+/// this future mid-ladder, which an end-of-function statement could never cover.
+///
+/// This function is upstream's `if (!r?.detached)` guard and nothing else. A detached run's
+/// child is still alive (R-SA-037) and has not written its capture file yet; that file lives
+/// inside the very directory cleanup removes. pi says so in its own words at `:3782-3784` — "A
+/// successful detached receipt transfers both to onDetachedExit while the authoritative
+/// completion remains live" — and defers the cleanup to `onDetachedExit`'s inner `finally`
+/// (`:3757-3761`). Disarming is that transfer. Before this, cyrup deleted the directory out from
+/// under the live child on every detach, so a detached run could never produce a structured
+/// value at all and the child's `structured_output` call would fail on a vanished parent dir.
+fn disarm_structured_guard_on_detach(
+    detached: bool,
+    structured_guard: Option<&mut crate::exec::structured::StructuredOutputCleanupGuard>,
+) {
+    if detached && let Some(guard) = structured_guard {
+        guard.disarm();
+    }
+}
+
+/// SUBA-021 — the USAGE budget's terminal check (pi `subagent-runner.ts:4403-4411`):
+///
+/// ```text
+/// setOptionalProperty(statusPayload, "usageBudget", usageBudgetState(config.usageBudget, currentUsageTotals()));
+/// if (usageBudgetExceeded && statusPayload.usageBudget && !statusPayload.error)
+///     statusPayload.error = usageBudgetExceededMessage(statusPayload.usageBudget);
+/// ```
+///
+/// Computed from the run's AGGREGATE usage (every attempt of the fallback ladder, not just the
+/// winning one) because that is what the run actually spent. `!statusPayload.error` is
+/// load-bearing: a run that already failed keeps its own diagnosis — the budget did not cause
+/// that failure and overwriting it would hide the real cause behind a bookkeeping note.
+fn resolve_terminal_usage_budget(
+    opts: &RunOptions,
+    aggregate_usage: &Usage,
+    error: Option<String>,
+) -> (Option<crate::exec::usage_budget::UsageBudgetState>, Option<String>) {
+    let usage_budget = crate::exec::usage_budget::usage_budget_state(
+        opts.usage_budget,
+        Some(crate::exec::usage_budget::UsageTotals::from(aggregate_usage)),
+    );
+    let error = match (&error, usage_budget.as_ref()) {
+        (None, Some(state)) if state.exhausted => Some(
+            crate::exec::usage_budget::usage_budget_exceeded_message(state),
+        ),
+        _ => error,
+    };
+    (usage_budget, error)
+}
+
+/// The [`SingleResult`] shape every pre-spawn failure in [`run_sync`] returns: exit 1, no usage,
+/// no attempts, no artifacts — only the diagnosis.
+///
+/// SUBA-021: no usage budget on this path (see the field doc) — nothing was spent because
+/// nothing was spawned.
+fn pre_spawn_failure(agent: &AgentConfig, task: &str, error: String) -> SingleResult {
+    SingleResult {
+        usage_budget: None,
+        turn_budget: None,
+        turn_budget_exceeded: false,
+        wrap_up_requested: false,
+        agent: agent.name.clone(),
+        task: task.to_string(),
+        exit_code: 1,
+        usage: Usage::default(),
+        model: None,
+        attempted_models: Vec::new(),
+        model_attempts: Vec::new(),
+        final_output: None,
+        structured_output: None,
+        acceptance: None,
+        detached: false,
+        interrupted: false,
+        timed_out: false,
+        stopped: false,
+        process_signal: None,
+        error: Some(error),
+        saved_output_path: None,
+        tool_calls: Vec::new(),
+        output_truncated: false,
+        control_events: Vec::new(),
+        progress: None,
+    }
+}
+
+/// Everything [`prepare_ladder`] resolves before the fallback ladder starts, and that the
+/// ladder (or `run_sync`'s completion path) then reads back.
+struct LadderSetup {
+    /// The `<available_skills>` block composed into every attempt's child prompt.
+    skill_injection: String,
+    /// The names that actually RESOLVED to a `SKILL.md` — carried alongside
+    /// [`Self::skill_injection`] rather than being load-bearing by declaration order, because it
+    /// outlives the injection string it is computed with.
+    resolved_skill_names: Option<Vec<String>>,
+    /// The output file's pre-ladder state (R-SA-031).
+    output_snapshot: Option<crate::exec::output::OutputFileSnapshot>,
+    /// This run's private scratch directory.
+    scratch_dir: PathBuf,
+    /// The structured-output capture runtime, RAII-scoped (SUBA-S01).
+    structured_guard: Option<crate::exec::structured::StructuredOutputCleanupGuard>,
+}
+
+/// [`run_sync`]'s pre-ladder setup phase: resolve skills, snapshot the output file, make the
+/// scratch directory, make the steer inbox/ack/capability directories, create the
+/// structured-output capture runtime.
+///
+/// # Errors
+///
+/// `Err` carries the already-shaped pre-spawn failure result ([`pre_spawn_failure`]) for the two
+/// setup steps that abort the run outright: an explicitly-requested-but-missing orchestration
+/// skill, and an unusable scratch directory.
+async fn prepare_ladder(
+    agent: &AgentConfig,
+    task: &str,
+    opts: &RunOptions,
+) -> Result<LadderSetup, Box<SingleResult>> {
+    // T5 (C4) — skill association: resolve the agent's (or the call-site's) configured skills to
+    // lazy `<available_skills>` pointers ONCE, before the ladder starts, and compose them into every
+    // attempt's child prompt (pi `execution.ts:935-952`). The names are `opts.skills ?? agent.skills`
+    // (pi's `options.skills ?? agent.skills ?? []`); an empty list short-circuits discovery entirely
+    // (the common case), so a run with no configured skills pays no discovery cost and injects
+    // nothing. This is ORTHOGONAL to `agent.inherit_skills` — the `--no-skills` child flag governs
+    // whether the child runs its OWN skill discovery, while THIS block always injects the explicitly
+    // configured skills. Resolution is stable across model-fallback attempts (it never depends on the
+    // model), so it is done here, not per attempt.
+    let skill_names = opts.skills.clone().unwrap_or_else(|| agent.skills.clone());
+    // pi `shared.resolvedSkillNames` (`runs/foreground/execution.ts:1481` @HEAD): the names that
+    // actually RESOLVED to a `SKILL.md`, or `undefined` when none did — the value
+    // `progress.skills` is seeded from (`:263`). Hoisted out of the `else` arm below because it
+    // outlives the injection string it is computed alongside.
+    let mut resolved_skill_names: Option<Vec<String>> = None;
+    let skill_injection = if skill_names.is_empty() {
+        String::new()
+    } else {
+        let resolution = crate::discovery::skills::resolve_skills_with_fallback(
+            &skill_names,
+            &opts.cwd,
+            opts.runtime_cwd.as_deref(),
+        )
+        .await;
+        // pi `execution.ts:938-946`: an EXPLICIT request for the orchestration skill (always
+        // missing) is a hard failure, spawning nothing.
+        let orchestration_requested = skill_names
+            .iter()
+            .any(|s| s.trim() == crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL);
+        let orchestration_missing = resolution
+            .missing
+            .iter()
+            .any(|m| m == crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL);
+        if orchestration_requested && orchestration_missing {
+            return Err(Box::new(pre_spawn_failure(
+                agent,
+                task,
+                format!(
+                    "Skills not found: {}",
+                    crate::discovery::skills::SUBAGENT_ORCHESTRATION_SKILL
+                ),
+            )));
+        }
+        resolved_skill_names = (!resolution.resolved.is_empty())
+            .then(|| resolution.resolved.iter().map(|s| s.name.clone()).collect());
+        crate::discovery::skills::build_skill_injection(&resolution.resolved)
+    };
+
+    // R-SA-031: snapshot the output file's state ONCE, before the ladder starts (a task's
+    // `output_path` is stable across fallback attempts — see `SpawnedChildAttemptRunner::
+    // snapshot_output_file`'s own doc note for why re-snapshotting per attempt is unnecessary).
+    let output_snapshot = snapshot_output_file(opts.output_path.as_deref());
+
+    let scratch_dir = opts.cwd.join(".cyrup-subagent-scratch");
+    if let Err(err) = std::fs::create_dir_all(&scratch_dir) {
+        return Err(Box::new(pre_spawn_failure(
+            agent,
+            task,
+            format!("failed to prepare subagent scratch directory: {err}"),
+        )));
+    }
+
+    // G90: create this child's steer inbox BEFORE the spawn. The child's own watcher does its own
+    // `mkdir` on start (pi `subagent-prompt-runtime.ts:226`), but the RUNNER may route an accepted
+    // steer request into the directory before the child has finished booting, and a request written
+    // into a directory that is then created underneath it would be lost. Creating it here — at the
+    // single point that also hands the path over — makes the directory exist for the whole of the
+    // child's life. A failure is deliberately NOT fatal: steering is an optional live channel, and a
+    // run must not fail to start because a control subdirectory could not be made.
+    if let Some(inbox) = opts.steer_inbox_dir.as_deref() {
+        let _ = std::fs::create_dir_all(inbox);
+    }
+
+    // SUBA-049: same reasoning for the ack directory, one hop earlier. The child creates it itself
+    // before its first write, but the PARENT polls it while waiting for the acknowledgment — and
+    // `consume_steer_acks` treats an unreadable directory as "no acks yet", which is
+    // indistinguishable from "the child has not answered". Creating it here makes the empty-and-
+    // waiting state a real, observable empty directory from the moment the child is spawned.
+    if let Some(acks) = opts.steer_ack_dir.as_deref() {
+        let _ = std::fs::create_dir_all(acks);
+    }
+    if let Some(parent) = opts.steer_capability_path.as_deref().and_then(std::path::Path::parent) {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // SUBA-S01 (pi `chain-execution.ts:301` / `async-execution.ts:498`): when the step declares an
+    // `outputSchema`, create the capture runtime ONCE per run — not per attempt — and write the
+    // schema to a private file the child reads. Every fallback attempt shares it, exactly as pi
+    // shares one runtime across a step's execution, so a retry cannot silently capture into a
+    // different file than the one [`GateState::apply_structured_output`] reads back.
+    //
+    // A creation failure degrades to `None` rather than failing the run: the child then never
+    // receives the env vars, never registers `structured_output`, and the read-back reports pi's
+    // own "missing" hard failure — which is the correct outcome for "the schema never reached the
+    // child", and strictly better than aborting a run that might still produce useful prose. It is
+    // NOT a licence to go looking for the value somewhere pi never looks: see the read-back in
+    // [`GateState::apply_structured_output`].
+    //
+    // SUBA-S01 residual: the runtime is held by a `StructuredOutputCleanupGuard`, which is the RAII
+    // port of pi's `finally { if (!r?.detached) cleanupStructuredOutputRuntime(structuredRuntime); }`
+    // (`runs/foreground/subagent-executor.ts:3780-3787` @v0.43.0). See that type's own doc for why
+    // the end-of-function statement this replaces was wrong on BOTH halves.
+    let structured_guard = opts
+        .structured_output_schema
+        .as_ref()
+        .and_then(|schema| {
+            crate::exec::structured::create_structured_output_runtime(schema, &scratch_dir).ok()
+        })
+        .map(crate::exec::structured::StructuredOutputCleanupGuard::new);
+
+    Ok(LadderSetup {
+        skill_injection,
+        resolved_skill_names,
+        output_snapshot,
+        scratch_dir,
+        structured_guard,
+    })
+}
+
+/// The settled ladder outcome, destructured once into named fields instead of a seven-element
+/// positional tuple whose meaning was pure position.
+struct SettledAttempt {
+    timed_out: bool,
+    /// A soft interrupt is carried on the runner's own per-attempt payload
+    /// ([`AttemptRecord::interrupted`], not on `AttemptSignal` which this crate does not
+    /// own); an interrupted attempt reports `success: true`/`exit_code: 0`, so the
+    /// ladder stops on it and this is the winning attempt whenever an interrupt fired
+    /// (pi `execution.ts:748-761`, T3 group A). The [`GateState`] gates (structured-output,
+    /// completion-guard, acceptance correction) all skip for a non-clean gate, so the
+    /// paused-success `final_output` reaches the caller untouched.
+    interrupted: bool,
+    detached: bool,
+    /// G104 — pi `if (signal) result.processSignal = signal;` (`execution.ts:1081`).
+    /// The value was already computed by `process_signal_name` and stashed on the
+    /// attempt's `StartupEvidence`; publishing it on the terminal `SingleResult` is what
+    /// makes `resolveSubagentResultStatus`'s unexplained-signal → `"stopped"` branch
+    /// (`result-intercom.ts:35`) reachable at all.
+    process_signal: Option<String>,
+    exit_code: i32,
+    error: Option<String>,
+    final_output: Option<String>,
+}
+
+impl SettledAttempt {
+    /// Fold the winning attempt's [`AttemptSignal`] and [`AttemptRecord`] into the seven values
+    /// `run_sync`'s completion path reads. A ladder that produced no attempt at all settles as a
+    /// plain exit-1 failure with its own diagnosis.
+    fn from_ladder(signal: Option<&AttemptSignal>, record: Option<&AttemptRecord>) -> Self {
+        match (signal, record) {
+            (Some(signal), Some(record)) => Self {
+                timed_out: signal.timed_out,
+                interrupted: record.interrupted,
+                detached: signal.detached,
+                process_signal: signal.startup.process_signal.clone(),
+                exit_code: signal.exit_code.unwrap_or(if signal.success { 0 } else { 1 }),
+                error: signal.error.clone(),
+                final_output: record.final_output.clone(),
+            },
+            _ => Self {
+                timed_out: false,
+                interrupted: false,
+                detached: false,
+                process_signal: None,
+                exit_code: 1,
+                error: Some("subagent fallback ladder produced no attempt outcome".to_string()),
+                final_output: None,
+            },
+        }
+    }
+}
+
+/// Timeout message + partial-output preamble (pi `execution.ts:824-829`): a timed-out run's
+/// delivered output leads with `Subagent timed out after {ms}ms.`, and — when the child produced
+/// any partial output before the deadline fired — that partial output follows under a
+/// `Partial output before timeout:` heading. Applied here, right after the ladder settles and
+/// before the output-path handoff / truncation, exactly as pi applies it right after extracting
+/// `fullOutput`. The nominal budget is `opts.timeout_ms` (pi `formatTimeoutMessage(options
+/// .timeoutMs ?? 0)`), distinct from the wall-clock `deadline_at` that actually fired the timer.
+///
+/// SUBA-008 — pi's `else if` chain continues from the SAME `if (result.timedOut)`
+/// (`execution.ts:1241-1258`), so a timed-out run never also gets a turn-budget preamble even
+/// when both fired. That is why the three turn-budget arms are `else` on this branch and not a
+/// second independent `if`.
+fn apply_terminal_preamble(
+    mut final_output: Option<String>,
+    timed_out: bool,
+    timeout_ms: Option<u64>,
+    turn_budget_tracker: &crate::exec::turn_budget::TurnBudgetTracker,
+) -> Option<String> {
+    if timed_out {
+        let timeout_message = format_timeout_message(timeout_ms.unwrap_or(0));
+        let partial = final_output.clone().unwrap_or_default();
+        final_output = Some(if partial.trim().is_empty() {
+            timeout_message
+        } else {
+            format!("{timeout_message}\n\nPartial output before timeout:\n{partial}")
+        });
+    } else if let Some(note) = turn_budget_tracker.terminal_note() {
+        let body = final_output.clone().unwrap_or_default();
+        final_output = Some(match note {
+            // pi `formatTurnBudgetOutput(turnBudgetExceededMessage(...), fullOutput)` (`:1252`) —
+            // message first, whatever the child managed under a "Partial output" heading.
+            crate::exec::turn_budget::TurnBudgetTerminalNote::Exceeded(message) => {
+                crate::exec::turn_budget::format_turn_budget_output(&message, &body)
+            }
+            // pi `fullOutput.trim() ? `${note}\n\n${fullOutput}` : note` (`:1255`/`:1258`) — the
+            // note leads, and the child's real answer follows it intact.
+            crate::exec::turn_budget::TurnBudgetTerminalNote::Note(note) => {
+                crate::exec::turn_budget::prepend_turn_budget_note(&body, &note)
+            }
+        });
+    }
+    final_output
+}
+
+/// R-SA-031: file-only/output-path handoff, once, against the aggregate captured output. Tracks
+/// the concrete saved path (`Some` only when the file was actually written — by the child, or by
+/// the orchestrator persisting its own captured output), which the saved-output reference message
+/// in [`finalize_delivered_output`] (pi `finalizeSingleOutput`, `single-output.ts:211-235`) is
+/// gated on. pi resolves the
+/// handoff only for a clean run (`finalResult?.exitCode === 0`, `subagent-runner.ts:872`), so this
+/// is gated on the same clean-completion condition rather than run unconditionally.
+///
+/// Returns the possibly-replaced delivered output, the FULL (untruncated) copy of it the
+/// saved-output reference measures its byte/line counts over, and the concrete saved path; any
+/// handoff error is folded into `error`.
+fn resolve_saved_output(
+    opts: &RunOptions,
+    exit_code: i32,
+    mut final_output: Option<String>,
+    output_snapshot: Option<crate::exec::output::OutputFileSnapshot>,
+    error: &mut Option<String>,
+) -> (Option<String>, Option<String>, Option<PathBuf>) {
+    let mut saved_output_path: Option<PathBuf> = None;
+    if let Some(output_path) = opts.output_path.as_ref()
+        && exit_code == 0
+    {
+        let captured = final_output.clone().unwrap_or_default();
+        match resolve_output_handoff(output_path, &captured, output_snapshot) {
+            crate::exec::output::OutputHandoff::ChildWrote { content } => {
+                final_output = Some(content);
+                saved_output_path = Some(output_path.clone());
+            }
+            crate::exec::output::OutputHandoff::OrchestratorWrote {
+                written,
+                error: handoff_error,
+            } => {
+                if written {
+                    saved_output_path = Some(output_path.clone());
+                }
+                if let Some(handoff_error) = handoff_error {
+                    let merged = match error.take() {
+                        Some(existing) => format!("{existing}; {handoff_error}"),
+                        None => handoff_error,
+                    };
+                    *error = Some(merged);
+                }
+            }
+        }
+    }
+    // The FULL (untruncated) persisted content the saved-output reference measures its byte/line
+    // counts over (pi `formatSavedOutputReference(savedPath, output)` uses the pre-truncation output,
+    // `subagent-runner.ts:876`) — captured here, before step 9's truncation reassigns `final_output`.
+    let full_output_for_reference = final_output.clone();
+    (final_output, full_output_for_reference, saved_output_path)
+}
+
+/// The two values [`run_sync`]'s three post-settlement gates mutate — `exit_code` and `error` —
+/// carried together with the three settled observations those gates read, so that every gate
+/// derives its [`CleanCompletionGate`] from the SAME, always-current state.
+///
+/// The re-derivation this makes structural is load-bearing: R-SA-033's acceptance-gate condition
+/// must observe the POST-completion-guard exit code (a run the completion guard already failed
+/// must not additionally run acceptance evaluation against a stale `exit_code == 0` snapshot).
+struct GateState {
+    exit_code: i32,
+    error: Option<String>,
+    detached: bool,
+    interrupted: bool,
+    timed_out: bool,
+}
+
+impl GateState {
+    /// The clean-completion gate as of RIGHT NOW — re-derived per call, never cached, so a gate
+    /// that runs after an earlier gate's correction sees the corrected `exit_code`.
+    fn gate(&self) -> CleanCompletionGate {
+        CleanCompletionGate {
+            exit_code: self.exit_code,
+            detached: self.detached,
+            interrupted: self.interrupted,
+            timed_out: self.timed_out,
+        }
+    }
+
+    /// Append `message` to the run's diagnosis, `; `-joined behind whatever a previous gate (or
+    /// the attempt itself) already reported — an empty/blank existing error is replaced, not
+    /// prefixed.
+    fn push_error(&mut self, message: String) {
+        self.error = Some(match self.error.take() {
+            Some(existing) if !existing.trim().is_empty() => format!("{existing}; {message}"),
+            _ => message,
+        });
+    }
+
+    /// Step 5 (R-SA-030): structured-output extraction + parent-side JSON-Schema re-validation.
+    /// Only evaluated on an otherwise-clean run (mirrors the completion-guard/acceptance gate's own
+    /// "don't re-diagnose an already-failed attempt" discipline in the two gates that follow) — a run that already
+    /// failed for another reason (non-zero exit, timeout, detach, interrupt) must not additionally
+    /// be re-labeled by a structured-output check that never had a fair chance to run against a
+    /// clean transcript.
+    fn apply_structured_output(
+        &mut self,
+        structured_runtime: Option<&crate::exec::structured::StructuredOutputRuntime>,
+        opts: &RunOptions,
+    ) -> Option<serde_json::Value> {
+        if self.gate().is_clean() {
+            // SUBA-S01: read the FILE the child's `structured_output` tool wrote (pi
+            // `readStructuredOutput`, `structured-output.ts:156-173`). The capture file is the ONLY
+            // channel — pi has no other, and neither does this port any more.
+            //
+            // The `None` arm used to fall back to `resolve_structured_output`, a cyrup-original scan
+            // that accepted the newest fenced ```json block in the child's prose. That is exactly what
+            // the "EVEN WHEN prose was produced" rule below says must NOT satisfy a declared schema,
+            // and it was not merely lenient: a coincidental fence could VALIDATE against the caller's
+            // schema and become the run's structured result, silently feeding a wrong answer into a
+            // chain's output bindings. A schema that was declared but whose capture runtime could not
+            // be created is therefore `Missing` — no file, no value — which is the same hard failure
+            // upstream produces when the child never called the tool.
+            let structured_outcome = match structured_runtime {
+                Some(runtime) => match crate::exec::structured::read_structured_output(runtime) {
+                    Ok(value) => StructuredOutcome::Valid(value),
+                    Err(message)
+                        if message == crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR =>
+                    {
+                        StructuredOutcome::Missing
+                    }
+                    Err(message) => StructuredOutcome::Invalid(message),
+                },
+                None if opts.structured_output_schema.is_some() => StructuredOutcome::Missing,
+                None => StructuredOutcome::NotRequested,
+            };
+            match structured_outcome {
+                StructuredOutcome::NotRequested => None,
+                StructuredOutcome::Valid(value) => Some(value),
+                StructuredOutcome::Missing => {
+                    // pi `readStructuredOutput` (structured-output.ts:156-173, execution.ts:1212-1216): a
+                    // declared `outputSchema` with no captured `structured_output` value is a HARD
+                    // failure — EVEN WHEN the child produced prose. pi runs its structured-output check
+                    // on every clean exit and fails on the missing value unconditionally; prose is never
+                    // an exemption. (An empty-prose + missing-structured attempt never reaches here: the
+                    // per-attempt cold-start gate already failed it retryably via `structured_output_absent`,
+                    // so a clean gate at this point implies prose WAS produced — exactly the "even with
+                    // prose" case this must still reject.)
+                    self.exit_code = 1;
+                    self.push_error(
+                        crate::exec::structured::STRUCTURED_OUTPUT_MISSING_ERROR.to_string(),
+                    );
+                    None
+                }
+                StructuredOutcome::Invalid(message) => {
+                    self.exit_code = 1;
+                    self.push_error(message);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Step 6 (R-SA-034): completion-mutation guard — needs a real AgentDefinition-shaped view;
+    /// `evaluate_completion_mutation_guard` only reads `local_name`/`tools`/`completion_guard`, so
+    /// a minimal projection is built here rather than requiring `AgentConfig` to carry every other
+    /// `AgentDefinition` field this guard never touches.
+    ///
+    /// Returns the guard's verdict, which the acceptance gate below consumes as an acceptance
+    /// report source.
+    fn apply_completion_guard(
+        &mut self,
+        agent: &AgentConfig,
+        task: &str,
+        progress: &AgentProgress,
+        control: &mut crate::exec::control::ControlMonitor,
+    ) -> CompletionMutationGuardResult {
+        let guard_agent = completion_guard_projection(agent);
+        let guard_result =
+            evaluate_completion_mutation_guard(&guard_agent, task, &progress.all_events);
+
+        if self.gate().is_clean() && guard_result.triggered {
+            self.exit_code = 1;
+            self.push_error(
+                crate::exec::completion_guard::COMPLETION_GUARD_ERROR_MESSAGE.to_string(),
+            );
+            // pi `execution.ts:1234-1247`: the guard also raises a `needs_attention` control event with
+            // `reason: "completion_guard"` — the one raise that happens AFTER the child is gone, and
+            // the one the notice renderer formats as the "Subagent failed: <agent>" body rather than
+            // the steer/resume nudge. Shares the winning attempt's dedup set (`control` is that
+            // attempt's own monitor), exactly as the source's shared `emittedControlEventKeys` does.
+            control.emit_completion_guard_notice(
+                crate::time::now_epoch_millis(),
+                format!(
+                    "{} completed without making edits for an implementation task",
+                    agent.name
+                ),
+            );
+        }
+
+        guard_result
+    }
+
+    /// Step 7 (R-SA-032) + Step 8 (R-SA-033), unless R-SA-037 bypasses both entirely.
+    ///
+    /// The gate is re-derived HERE, after [`Self::apply_completion_guard`]'s correction, since
+    /// R-SA-033's own acceptance-gate condition must observe the POST-guard exit code (a run the
+    /// completion guard already failed must not additionally run acceptance evaluation against a
+    /// stale "exit_code == 0" snapshot).
+    async fn apply_acceptance(
+        &mut self,
+        contract: &AcceptanceContract,
+        progress: &AgentProgress,
+        opts: &RunOptions,
+        final_output: Option<&str>,
+        guard_result: CompletionMutationGuardResult,
+    ) -> Option<acceptance::AcceptanceLedger> {
+        let post_guard_gate = self.gate();
+
+        if self.detached {
+            None
+        } else if self.timed_out {
+            // pi `buildTimedOutAcceptanceLedger` (`execution.ts:101-113`, applied at `1089-1090`): a
+            // timed-out run's ledger is `rejected` (unless the contract required no acceptance at all,
+            // in which case it stays `not-required`), NEVER the `not-required` a non-clean gate would
+            // otherwise yield from `evaluate_acceptance`, and it carries a failed timeout runtime check.
+            // No post-hoc exit-code correction runs — pi gates that on `!result.timedOut`
+            // (`execution.ts:1098`), and the run already failed via the timeout path (exit_code != 0).
+            Some(build_timed_out_acceptance_ledger(contract))
+        } else {
+            // G82 — pi `execution.ts:1680-1682`:
+            //   const childWrittenOutput = options.outputPath
+            //       ? extractChildWrittenOutput(result.messages, options.outputPath, options.cwd ?? runtimeCwd)
+            //       : undefined;
+            // Authorship taken from the CHILD'S OWN successful `write` calls, never from disk, so a
+            // sibling run writing the same path cannot have its content misattributed here (#420).
+            // Fed to the acceptance gate as an admissible acceptance-report source — the PRIMARY one
+            // in `outputMode: "file-only"`, where the artifact, not the receipt prose, is the answer.
+            let child_written_output = crate::exec::output::extract_child_written_output(
+                &progress.all_events,
+                opts.output_path.as_deref(),
+                &opts.cwd,
+            );
+            // `fileOutput: childWrittenOutput !== undefined && options.outputPath ? {...} : undefined`
+            // (`execution.ts:1699-1701`).
+            let file_output = match (child_written_output.as_deref(), opts.output_path.as_deref()) {
+                (Some(content), Some(path)) => Some(acceptance::AcceptanceFileOutput {
+                    content,
+                    path,
+                    authoritative: matches!(opts.output_mode, OutputMode::FileOnly),
+                }),
+                _ => None,
+            };
+            // G80 — pi `evaluateAcceptance({ …, artifactsDir: options.artifactsDir, runId:
+            // options.runId })` (`runs/foreground/execution.ts:1704-1705` @v0.43.0). Both must be
+            // present for `runMemoizedVerifyCommand` to consult/record a memo (`acceptance.ts:1085`).
+            let memo = match (opts.artifacts_dir.as_deref(), opts.run_id.as_ref()) {
+                (Some(artifacts_dir), Some(run_id)) => Some(acceptance::model::VerifyMemoContext {
+                    artifacts_dir,
+                    run_id: run_id.as_str(),
+                }),
+                _ => None,
+            };
+            // SUBA-028 / pi `evaluateAcceptance({ …, signal: options.signal })`
+            // (`runs/foreground/execution.ts:1704-1706` @v0.43.0). THIS is the call the item was about:
+            // without the token, cancelling a run (Ctrl-C, orchestrator cancel, parent timeout) left
+            // acceptance verification running, so the caller waited out a full per-command `timeoutMs`
+            // — once per remaining command — after asking to stop.
+            let ledger = acceptance::evaluate_acceptance_with_cancel(
+                contract,
+                post_guard_gate,
+                final_output,
+                guard_result,
+                &opts.cwd,
+                memo,
+                file_output,
+                &opts.cancel,
+            )
+            .await;
+
+            let correction = apply_post_hoc_correction(
+                &ledger,
+                contract.explicit,
+                post_guard_gate,
+                self.error.as_deref(),
+            );
+            self.exit_code = correction.exit_code;
+            self.error = correction.error;
+
+            Some(ledger)
+        }
+    }
+}
+
+/// The delivered-output tail: strip acceptance-report fences, apply R-SA-042 truncation, then
+/// append (or, in `file-only` mode, substitute) the saved-output reference message. All three
+/// steps are skipped for a detached result (R-SA-037).
+fn finalize_delivered_output(
+    mut final_output: Option<String>,
+    full_output_for_reference: Option<String>,
+    saved_output_path: Option<&PathBuf>,
+    detached: bool,
+    exit_code: i32,
+    max_output: crate::exec::output::OutputCap,
+    output_mode: OutputMode,
+) -> (Option<String>, bool) {
+    // Strip trailing acceptance-report fences from the DELIVERED output (pi `stripAcceptanceReport`,
+    // execution.ts:823/857). [`GateState::apply_acceptance`] already consumed the RAW report block for its
+    // provenance evaluation (`evaluate_acceptance` receives the unstripped `final_output`); the
+    // human/LLM caller must be shown the answer prose, never the machine report JSON that was
+    // previously delivered verbatim. Skipped for a detached result (R-SA-037 bypasses output
+    // post-processing entirely, exactly like the truncation step below).
+    if !detached {
+        final_output = final_output
+            .as_deref()
+            .map(crate::exec::acceptance::model::strip_acceptance_report);
+    }
+
+    // Step 9 (R-SA-042), skipped entirely for a detached result (R-SA-037).
+    let (final_output, output_truncated) = if detached {
+        (final_output, false)
+    } else {
+        match final_output {
+            Some(text) => {
+                let result = truncate_output(&text, max_output, None);
+                (Some(result.text), result.truncated)
+            }
+            None => (None, false),
+        }
+    };
+
+    // Saved-output reference (pi `finalizeSingleOutput`, `single-output.ts:211-235`): once a clean
+    // run wrote its `output` file, the delivered output either gains a trailing
+    // `Output saved to: <path> (<size>, <n> lines). Read this file if needed.` line (inline /
+    // file-and-inline modes) or is REPLACED entirely by that reference message (file-only mode) — so
+    // an LLM caller/terminal user sees where the artifact landed rather than a wall of inlined
+    // content it can re-read on demand. The byte/line counts are measured over the FULL,
+    // pre-truncation persisted content, with acceptance-report fences stripped — matching pi, which
+    // measures `formatSavedOutputReference(savedPath, stripAcceptanceReport(resolvedOutput.fullOutput))`
+    // (execution.ts:857-861).
+    let final_output = match (saved_output_path, detached) {
+        (Some(saved), false) if exit_code == 0 => {
+            let full = crate::exec::acceptance::model::strip_acceptance_report(
+                &full_output_for_reference.clone().unwrap_or_default(),
+            );
+            let reference = crate::exec::output::format_saved_output_reference(saved, &full);
+            match output_mode {
+                OutputMode::FileOnly => Some(reference.message),
+                OutputMode::Inline | OutputMode::FileAndInline => Some(match final_output {
+                    Some(text) if !text.is_empty() => {
+                        format!("{text}\n\n{}", reference.message)
+                    }
+                    _ => reference.message,
+                }),
+            }
+        }
+        _ => final_output,
+    };
+
+    (final_output, output_truncated)
+}
+
+/// Step 10 (R-SA-043): compaction, and its ONE documented opt-out.
+///
+/// `SingleResult` is unconditionally the compacted shape — no raw per-turn messages, only
+/// summarized `tool_calls`. `include_progress` restores exactly one thing on top of that: this
+/// run's own `AgentProgress` projection, which pi gates identically (`progress:
+/// params.includeProgress ? allProgress : undefined`, `subagent-executor.ts:3008` for SINGLE and
+/// `:2679` for PARALLEL @v0.34.0). With the flag off or omitted the field stays `None` and
+/// `skip_serializing_if` drops it, so a returned/persisted result is byte-for-byte what it was
+/// before the field existed.
+///
+/// Assembled HERE, from the winning attempt's fold plus `run_sync`'s settled locals, because
+/// that is where pi assembles it too: `execution.ts` mutates the one `progress` object at
+/// `:907-913` @v0.34.0 and hands it out as `result.progress`. Deliberately NOT reusing the
+/// orchestrator-layer `tui::events::LiveProgressFold` — that fold only exists on the streaming
+/// foreground path (it is installed only when an `on_update` sink is present), so the detached
+/// hop-2 runner and every non-streaming caller would get nothing.
+// Eleven parameters is over clippy's threshold; this is `run_sync`'s own settled state handed
+// through verbatim, exactly like `evaluate_acceptance_with_cancel`'s own allow in
+// `acceptance/lattice/gate.rs`.
+#[allow(clippy::too_many_arguments)]
+fn build_progress_snapshot(
+    progress: &AgentProgress,
+    opts: &RunOptions,
+    agent: &AgentConfig,
+    task: &str,
+    resolved_skill_names: Option<Vec<String>>,
+    winning_model: Option<&ModelId>,
+    control: &crate::exec::control::ControlMonitor,
+    detached: bool,
+    interrupted: bool,
+    exit_code: i32,
+    error: Option<String>,
+) -> Option<crate::tui::events::LiveProgressSnapshot> {
+    if opts.include_progress == Some(true) {
+        // pi's settled `progress.status`. Order matters: a detach short-circuits at
+        // `execution.ts:344` and an interrupt returns early at `:861` with the status pi set at
+        // `:828` — neither ever reaches the `exitCode === 0 ? "completed" : "failed"` assignment at
+        // `:907`. Leaving an interrupt-paused run as `Running` is therefore upstream's own shape,
+        // and it is load-bearing: `compact_completed` refuses to compact a `running` snapshot
+        // (pi `compactCompletedProgress`'s first line), which is exactly what lets the caller who
+        // will `resume` this run still see its live detail.
+        let status = if detached {
+            crate::tui::events::LiveProgressStatus::Detached
+        } else if interrupted {
+            crate::tui::events::LiveProgressStatus::Running
+        } else if exit_code == 0 {
+            crate::tui::events::LiveProgressStatus::Complete
+        } else {
+            crate::tui::events::LiveProgressStatus::Failed
+        };
+        let snapshot = progress.snapshot(ProgressSnapshotInput {
+            index: u32::try_from(opts.child_index.unwrap_or(0)).unwrap_or(u32::MAX),
+            agent: &agent.name,
+            task,
+            skills: resolved_skill_names,
+            // pi `progress.model = modelArg` (`execution.ts:267` @v0.34.0) — the id the child was
+            // actually launched with, thinking suffix included, not the bare ladder entry.
+            model: apply_thinking_suffix(
+                winning_model.map(ModelId::as_str),
+                agent.thinking.as_deref(),
+            ),
+            thinking: agent.thinking.clone(),
+            status,
+            // pi `progress.activityState`, owned by the control state machine; the winning
+            // attempt's monitor is the one `run_sync` carried out of the ladder, and it already
+            // cleared the state on a soft interrupt exactly as pi does at `:832,854`.
+            activity_state: control.activity_state(),
+            error,
+        });
+        // pi `compactForegroundDetails` → `compactCompletedProgress` (`shared/utils.ts:330-347`):
+        // a SETTLED snapshot keeps eleven fields and empties the two growth terms.
+        Some(snapshot.compact_completed())
+    } else {
+        None
     }
 }
 

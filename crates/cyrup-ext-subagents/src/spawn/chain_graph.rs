@@ -1444,311 +1444,11 @@ pub async fn walk_chain(
                 result
             }
             RunnerStep::ParallelGroup(spec) => {
-                let mut resolved_steps: Vec<SingleStepSpec> =
-                    Vec::with_capacity(spec.steps.len());
-                for s in &spec.steps {
-                    let task = resolve_step_task(&s.task, registry, ctx, s)?;
-                    resolved_steps.push(SingleStepSpec {
-                        skills: None,
-                        session_dir: None,
-                        task,
-                        ..s.clone()
-                    });
-                }
-
-                if spec.worktree {
-                    assign_worktree_cwds(&mut resolved_steps, ctx).await?;
-                }
-
-                // Capture per-task named-output keys and agents before the step list is moved into
-                // dispatch_group, so a successful group can register each child's output (C11) and
-                // build the aggregated {previous} text.
-                let output_names: Vec<Option<String>> =
-                    resolved_steps.iter().map(|s| s.output.clone()).collect();
-                let agents: Vec<String> =
-                    resolved_steps.iter().map(|s| s.agent.clone()).collect();
-
-                let group_result =
-                    dispatch_group(resolved_steps, spec.concurrency, spec.fail_fast, single, ctx)
-                        .await;
-                let collapsed = group_result.aggregate.clone();
-                if collapsed.success {
-                    for (name, child) in output_names.iter().zip(group_result.children.iter()) {
-                        if let (Some(name), Some(child_result)) = (name.as_deref(), child.as_ref()) {
-                            register_single_output(registry, Some(name), child_result);
-                        }
-                    }
-                    registry.set_previous(aggregate_group_previous(
-                        &group_result.children,
-                        &agents,
-                    ));
-                }
-                group_results.push(group_result);
-                collapsed
+                run_parallel_group(spec, registry, single, ctx, &mut group_results).await?
             }
             RunnerStep::DynamicGroup(spec) => {
-                let step_display = step_index + 1;
-                let item_name = spec.item.as_deref().unwrap_or("item");
-                // pi `step.parallel.task ?? "{previous}"`: an omitted (empty) template task
-                // defaults to the previous step's output.
-                let template_task = if spec.template.task.is_empty() {
-                    "{previous}"
-                } else {
-                    spec.template.task.as_str()
-                };
-                // pi runs `validateDynamicStepShape` FIRST — it is the opening line of
-                // `resolveDynamicFanoutItems` (`dynamic-fanout.ts:217`), BEFORE the expand source is
-                // resolved and BEFORE the maxItems / duplicate-key checks. So a malformed or unknown
-                // item reference in the RAW template is the first thing rejected, failing the walk
-                // ahead of any source-resolution / maxItems / duplicate-key diagnostic — exactly the
-                // precedence pi observes. No child is dispatched.
-                crate::spawn::dynamic_fanout::assert_no_unresolved_item_references(
-                    template_task,
-                    item_name,
-                    "parallel.task",
-                )
-                .map_err(SubagentError::StructuredOutputInvalid)?;
-
-                // Resolve the expand source array (an immutable registry borrow that ends with the
-                // `.to_vec()`), so the subsequent per-item template resolution + collect
-                // registration can re-borrow the registry without overlap. An unresolvable expand
-                // pointer aborts the whole walk (hard `Err`), the pre-existing contract this arm's
-                // expand-failure tests pin.
-                let source: Vec<Value> = registry.resolve_pointer(&spec.expand)?.to_vec();
-
-                // C16: materialize one distinct item per array element — the effective `maxItems`
-                // cap (step-level `expand.maxItems`, else the run-wide config fallback), the
-                // `expand.key` dedup key, and duplicate-key / colliding-id detection. A
-                // materialization failure aborts the walk (hard `Err`,
-                // [`SubagentError::StructuredOutputInvalid`]), consistent with the expand-pointer
-                // failure above (pi `resolveDynamicFanoutItems`, `dynamic-fanout.ts:216-240`).
-                let effective_max = spec.max_items.or(ctx.dynamic_fanout_max_items);
-                let items = crate::spawn::dynamic_fanout::resolve_dynamic_fanout_items(
-                    &source,
-                    spec.key.as_deref(),
-                    effective_max,
-                    step_display,
-                )
-                .map_err(SubagentError::StructuredOutputInvalid)?;
-
-                if items.is_empty() {
-                    // pi `onEmpty`: `"fail"` errors; `"skip"` (default) registers an empty collect
-                    // array and continues, advancing `{previous}` to pi's sentinel text
-                    // (`chain-execution.ts:801-841`).
-                    if spec.on_empty == OnEmpty::Fail {
-                        return Err(SubagentError::StructuredOutputInvalid(format!(
-                            "Dynamic chain step {step_display} source array is empty."
-                        )));
-                    }
-                    let collected: Vec<crate::spawn::dynamic_fanout::DynamicCollectedResult> =
-                        Vec::new();
-                    crate::spawn::dynamic_fanout::validate_dynamic_collection(
-                        spec.collect_schema.as_ref(),
-                        &collected,
-                    )
-                    .map_err(SubagentError::StructuredOutputInvalid)?;
-                    let collected_value =
-                        crate::spawn::dynamic_fanout::collected_results_to_value(&collected);
-                    registry.register(spec.collect.clone(), collected_value.clone());
-                    registry.set_previous("Dynamic fanout produced 0 results.");
-                    // Keep the one-group-result-per-group-step invariant callers rely on
-                    // (`render_chain_results` / `runner_main` correlate `group_results` by chain
-                    // order): push an empty group result even though nothing was dispatched.
-                    group_results.push(GroupStepResult {
-                        aggregate: StepResult::success(
-                            Some("Dynamic fanout produced 0 results.".to_string()),
-                            Some(collected_value.clone()),
-                        ),
-                        children: Vec::new(),
-                        fail_fast_skipped: Vec::new(),
-                    });
-                    // SUBA-C14: the group gate runs on the EMPTY path too, over an aggregate report
-                    // built from zero children (`chain-execution.ts:869-891`: `aggregateAcceptanceReport
-                    // ({ results: [], notes: "Dynamic fanout produced 0 results." })`). A fan-out that
-                    // produced nothing satisfies no criterion, so a declared gate rejects here — which
-                    // is the whole point of declaring one on an `onEmpty: "skip"` step.
-                    match evaluate_dynamic_group_acceptance(
-                        spec,
-                        &[],
-                        "Dynamic fanout produced 0 results.",
-                        ctx,
-                    )
-                    .await
-                    {
-                        Some(message) => StepResult::failure(message),
-                        None => StepResult::success(
-                            Some("Dynamic fanout produced 0 results.".to_string()),
-                            Some(collected_value),
-                        ),
-                    }
-                } else {
-                    // Build one distinct, per-item-substituted step spec per element (C16):
-                    // item-template substitution first (pi `resolveItemTemplate`), then the flat
-                    // `{outputs.name}`/`{task}`/`{previous}`/`{chain_dir}` + chain-instruction pass
-                    // ([`resolve_step_task`]), exactly as pi materializes then dispatches — so
-                    // every fanned-out child gets its OWN task string.
-                    let mut expanded: Vec<SingleStepSpec> = Vec::with_capacity(items.len());
-                    for entry in &items {
-                        let item_task = crate::spawn::dynamic_fanout::resolve_item_template(
-                            template_task,
-                            item_name,
-                            &entry.item,
-                        )
-                        .map_err(SubagentError::StructuredOutputInvalid)?;
-                        let resolved =
-                            resolve_step_task(&item_task, registry, ctx, spec.template.as_ref())?;
-                        expanded.push(SingleStepSpec {
-                            skills: None,
-                            session_dir: None,
-                            task: resolved,
-                            ..(*spec.template).clone()
-                        });
-                    }
-                    let agents: Vec<String> = expanded.iter().map(|s| s.agent.clone()).collect();
-
-                    // A dynamic fan-out honours `failFast` exactly as a static one does: pi lowers
-                    // the dynamic step to a plain `ParallelStep` carrying `failFast: step.failFast`
-                    // (`chain-execution.ts:1061-1067`) and dispatches it through the very same
-                    // `runParallelChainTasks` (`:231` `?? false`, `:391` trip-on-nonzero-exit) that
-                    // a static parallel step uses. Passing a hardcoded `false` here would leave the
-                    // validator-accepted `failFast` key (`dynamic-fanout.ts:44`) silently inert and
-                    // spawn — and pay for — every remaining item after the first failure.
-                    let group_result =
-                        dispatch_group(expanded, spec.concurrency, spec.fail_fast, single, ctx)
-                            .await;
-
-                    // Fold the per-child results into the ordered collect-record array (pi
-                    // `collectDynamicResults`, `dynamic-fanout.ts:263-287` @v0.34.0). Every field
-                    // pi copies is copied: the child's REAL `exit_code` (`:278`
-                    // `result?.exitCode ?? null` — never derived from success, which would collapse
-                    // a `2` or a `137` to exactly `1`), plus `timed_out` / `saved_output_path` /
-                    // `artifact_paths` (`:282-284`), all carried out of `exec::SingleResult` on the
-                    // widened [`StepResult`] seam by `ExecSingleStepExecutor::run_single`. An
-                    // executor that runs no real child (the mock executors in tests) leaves
-                    // `exit_code` at `None`, so this falls back to the success/failure mapping and
-                    // pi's `?? null` shape is preserved for a never-dispatched slot.
-                    //
-                    // A child that fail-fast SKIPPED is not a hole in the array: pi returns a
-                    // synthetic `SingleResult` for it (`chain-execution.ts:321-330` — `task:
-                    // "(skipped)"`, `exitCode: -1`, `error: "Skipped due to fail-fast"`, empty
-                    // messages) and that record flows on into `collectDynamicResults` (`:976`), so
-                    // the registered `{outputs.<collect.as>}` array carries an explicit `-1`
-                    // marker per un-run item rather than a `null` exit code. A CANCELLED skip has
-                    // no upstream analog and is deliberately left as `None` (exit code `null`).
-                    let child_inputs: Vec<
-                        Option<crate::spawn::dynamic_fanout::CollectChildResult>,
-                    > = group_result
-                        .children
-                        .iter()
-                        .enumerate()
-                        .map(|(index, child)| match child.as_ref() {
-                            Some(sr) => Some(crate::spawn::dynamic_fanout::CollectChildResult {
-                                agent: Some(spec.template.agent.clone()),
-                                exit_code: Some(
-                                    sr.exit_code
-                                        .map_or_else(|| i64::from(!sr.success), i64::from),
-                                ),
-                                error: sr.error.clone(),
-                                timed_out: sr.timed_out,
-                                structured_output: sr.structured_output.clone(),
-                                artifact_paths: sr.artifact_paths.clone(),
-                                saved_output_path: sr.saved_output_path.clone(),
-                                output: None,
-                                final_output: sr.final_output.clone(),
-                            }),
-                            None if group_result
-                                .fail_fast_skipped
-                                .get(index)
-                                .copied()
-                                .unwrap_or(false) =>
-                            {
-                                Some(crate::spawn::dynamic_fanout::CollectChildResult {
-                                    agent: Some(spec.template.agent.clone()),
-                                    exit_code: Some(FAIL_FAST_SKIPPED_EXIT_CODE),
-                                    error: Some(FAIL_FAST_SKIPPED_ERROR.to_string()),
-                                    timed_out: false,
-                                    structured_output: None,
-                                    artifact_paths: None,
-                                    saved_output_path: None,
-                                    output: None,
-                                    final_output: None,
-                                })
-                            }
-                            None => None,
-                        })
-                        .collect();
-                    let collected = crate::spawn::dynamic_fanout::collect_dynamic_results(
-                        &items,
-                        &child_inputs,
-                        &spec.template.agent,
-                    );
-                    let collected_value =
-                        crate::spawn::dynamic_fanout::collected_results_to_value(&collected);
-
-                    // The dynamic step's own aggregate output IS the collect-record array (pi
-                    // `outputs[collect.as] = { structured: collected }`), NOT the raw
-                    // child-structured-output array `collapse_fan_out` produced.
-                    let mut collapsed = group_result.aggregate.clone();
-                    collapsed.structured_output = Some(collected_value.clone());
-
-                    if collapsed.success {
-                        // pi validates `collect.outputSchema` only on the all-children-succeeded
-                        // path (its failure early-return precedes `validateDynamicCollection`). A
-                        // schema failure aborts the walk (hard `Err`), matching this arm's
-                        // `StructuredOutputInvalid` contract.
-                        crate::spawn::dynamic_fanout::validate_dynamic_collection(
-                            spec.collect_schema.as_ref(),
-                            &collected,
-                        )
-                        .map_err(SubagentError::StructuredOutputInvalid)?;
-                        registry.register(spec.collect.clone(), collected_value);
-                        registry.set_previous(aggregate_group_previous(
-                            &group_result.children,
-                            &agents,
-                        ));
-                        // SUBA-C14: the GROUP-level gate, run AFTER the collect output is
-                        // registered and only on the all-children-succeeded path — exactly pi's
-                        // ordering (`chain-execution.ts:1027-1055`: `outputs[step.collect.as] = …`,
-                        // then `resolveEffectiveAcceptance`/`evaluateAcceptance`, and the
-                        // any-child-failed early return at `:998-1018` precedes both). A rejection
-                        // fails the whole chain with pi's `acceptanceFailureMessage` text, which
-                        // this walker expresses as a failed `StepResult` (C9 stop-on-failure).
-                        let aggregate_children: Vec<
-                            crate::exec::acceptance::model::AggregateChild,
-                        > = group_result
-                            .children
-                            .iter()
-                            .map(|child| crate::exec::acceptance::model::AggregateChild {
-                                agent: spec.template.agent.clone(),
-                                // The walker's narrow `StepResult` seam carries no per-child
-                                // acceptance ledger (that lives on `exec::SingleResult`, which
-                                // `SingleStepExecutor` deliberately does not surface here), so
-                                // every child reads as pi's `"unreported"` rather than a
-                                // fabricated status.
-                                acceptance: None,
-                                error: child.as_ref().and_then(|sr| sr.error.clone()),
-                                exit_code: child.as_ref().map_or(1, |sr| i32::from(!sr.success)),
-                            })
-                            .collect();
-                        let notes = format!(
-                            "Dynamic fanout collected {} result(s) into {}.",
-                            collected.len(),
-                            spec.collect
-                        );
-                        if let Some(message) = evaluate_dynamic_group_acceptance(
-                            spec,
-                            &aggregate_children,
-                            &notes,
-                            ctx,
-                        )
-                        .await
-                        {
-                            collapsed = StepResult::failure(message);
-                        }
-                    }
-                    group_results.push(group_result);
-                    collapsed
-                }
+                run_dynamic_group(spec, registry, single, ctx, step_index, &mut group_results)
+                    .await?
             }
             RunnerStep::ImportAsyncRoot(spec) => {
                 // R-SA-097 root attachment is resolved by POLLING another run's files, not by
@@ -1783,6 +1483,347 @@ pub async fn walk_chain(
     }
 
     Ok((results, group_results))
+}
+
+/// The [`RunnerStep::ParallelGroup`] arm of [`walk_chain`]: resolve every child task, assign
+/// per-child worktree `cwd`s when the group declares them, dispatch the bounded fan-out, and —
+/// only on a successful group — register each child's named output (C11) and advance the
+/// aggregated `{previous}` text.
+///
+/// The settled [`GroupStepResult`] is pushed onto `group_results` at exactly the point the walker
+/// pushed it inline, preserving the one-entry-per-group-step, chain-ordered invariant callers
+/// (`render_chain_results` / `runner_main`) correlate by position.
+async fn run_parallel_group(
+    spec: &ParallelGroupSpec,
+    registry: &mut OutputRegistry,
+    single: &Arc<dyn SingleStepExecutor>,
+    ctx: &ChainRunContext,
+    group_results: &mut Vec<GroupStepResult>,
+) -> Result<StepResult, SubagentError> {
+    let mut resolved_steps: Vec<SingleStepSpec> =
+        Vec::with_capacity(spec.steps.len());
+    for s in &spec.steps {
+        let task = resolve_step_task(&s.task, registry, ctx, s)?;
+        resolved_steps.push(SingleStepSpec {
+            skills: None,
+            session_dir: None,
+            task,
+            ..s.clone()
+        });
+    }
+
+    if spec.worktree {
+        assign_worktree_cwds(&mut resolved_steps, ctx).await?;
+    }
+
+    // Capture per-task named-output keys and agents before the step list is moved into
+    // dispatch_group, so a successful group can register each child's output (C11) and
+    // build the aggregated {previous} text.
+    let output_names: Vec<Option<String>> =
+        resolved_steps.iter().map(|s| s.output.clone()).collect();
+    let agents: Vec<String> =
+        resolved_steps.iter().map(|s| s.agent.clone()).collect();
+
+    let group_result =
+        dispatch_group(resolved_steps, spec.concurrency, spec.fail_fast, single, ctx)
+            .await;
+    let collapsed = group_result.aggregate.clone();
+    if collapsed.success {
+        for (name, child) in output_names.iter().zip(group_result.children.iter()) {
+            if let (Some(name), Some(child_result)) = (name.as_deref(), child.as_ref()) {
+                register_single_output(registry, Some(name), child_result);
+            }
+        }
+        registry.set_previous(aggregate_group_previous(
+            &group_result.children,
+            &agents,
+        ));
+    }
+    group_results.push(group_result);
+    Ok(collapsed)
+}
+
+/// The [`RunnerStep::DynamicGroup`] arm of [`walk_chain`] (C16, pi
+/// `materializeDynamicParallelStep` + `dynamic-fanout.ts:137-240`): validate the raw template,
+/// resolve the `expand` source array, materialize one distinct [`SingleStepSpec`] per element,
+/// dispatch the fan-out, and fold the per-child outcomes into the collect-record array registered
+/// under `collect.as`.
+///
+/// [`walk_chain`]'s own *Template instantiation for `DynamicGroup`* section states the full
+/// contract this implements, and its `# Errors` section the failures propagated from here.
+/// `step_index` is the walker's zero-based position, rendered one-based as `step_display` in every
+/// diagnostic; `group_results` is pushed at exactly the point the walker pushed it inline, on both
+/// the empty-source and the dispatched path.
+async fn run_dynamic_group(
+    spec: &DynamicGroupSpec,
+    registry: &mut OutputRegistry,
+    single: &Arc<dyn SingleStepExecutor>,
+    ctx: &ChainRunContext,
+    step_index: usize,
+    group_results: &mut Vec<GroupStepResult>,
+) -> Result<StepResult, SubagentError> {
+    let step_display = step_index + 1;
+    let item_name = spec.item.as_deref().unwrap_or("item");
+    // pi `step.parallel.task ?? "{previous}"`: an omitted (empty) template task
+    // defaults to the previous step's output.
+    let template_task = if spec.template.task.is_empty() {
+        "{previous}"
+    } else {
+        spec.template.task.as_str()
+    };
+    // pi runs `validateDynamicStepShape` FIRST — it is the opening line of
+    // `resolveDynamicFanoutItems` (`dynamic-fanout.ts:217`), BEFORE the expand source is
+    // resolved and BEFORE the maxItems / duplicate-key checks. So a malformed or unknown
+    // item reference in the RAW template is the first thing rejected, failing the walk
+    // ahead of any source-resolution / maxItems / duplicate-key diagnostic — exactly the
+    // precedence pi observes. No child is dispatched.
+    crate::spawn::dynamic_fanout::assert_no_unresolved_item_references(
+        template_task,
+        item_name,
+        "parallel.task",
+    )
+    .map_err(SubagentError::StructuredOutputInvalid)?;
+
+    // Resolve the expand source array (an immutable registry borrow that ends with the
+    // `.to_vec()`), so the subsequent per-item template resolution + collect
+    // registration can re-borrow the registry without overlap. An unresolvable expand
+    // pointer aborts the whole walk (hard `Err`), the pre-existing contract this arm's
+    // expand-failure tests pin.
+    let source: Vec<Value> = registry.resolve_pointer(&spec.expand)?.to_vec();
+
+    // C16: materialize one distinct item per array element — the effective `maxItems`
+    // cap (step-level `expand.maxItems`, else the run-wide config fallback), the
+    // `expand.key` dedup key, and duplicate-key / colliding-id detection. A
+    // materialization failure aborts the walk (hard `Err`,
+    // [`SubagentError::StructuredOutputInvalid`]), consistent with the expand-pointer
+    // failure above (pi `resolveDynamicFanoutItems`, `dynamic-fanout.ts:216-240`).
+    let effective_max = spec.max_items.or(ctx.dynamic_fanout_max_items);
+    let items = crate::spawn::dynamic_fanout::resolve_dynamic_fanout_items(
+        &source,
+        spec.key.as_deref(),
+        effective_max,
+        step_display,
+    )
+    .map_err(SubagentError::StructuredOutputInvalid)?;
+
+    if items.is_empty() {
+        // pi `onEmpty`: `"fail"` errors; `"skip"` (default) registers an empty collect
+        // array and continues, advancing `{previous}` to pi's sentinel text
+        // (`chain-execution.ts:801-841`).
+        if spec.on_empty == OnEmpty::Fail {
+            return Err(SubagentError::StructuredOutputInvalid(format!(
+                "Dynamic chain step {step_display} source array is empty."
+            )));
+        }
+        let collected: Vec<crate::spawn::dynamic_fanout::DynamicCollectedResult> =
+            Vec::new();
+        crate::spawn::dynamic_fanout::validate_dynamic_collection(
+            spec.collect_schema.as_ref(),
+            &collected,
+        )
+        .map_err(SubagentError::StructuredOutputInvalid)?;
+        let collected_value =
+            crate::spawn::dynamic_fanout::collected_results_to_value(&collected);
+        registry.register(spec.collect.clone(), collected_value.clone());
+        registry.set_previous("Dynamic fanout produced 0 results.");
+        // Keep the one-group-result-per-group-step invariant callers rely on
+        // (`render_chain_results` / `runner_main` correlate `group_results` by chain
+        // order): push an empty group result even though nothing was dispatched.
+        group_results.push(GroupStepResult {
+            aggregate: StepResult::success(
+                Some("Dynamic fanout produced 0 results.".to_string()),
+                Some(collected_value.clone()),
+            ),
+            children: Vec::new(),
+            fail_fast_skipped: Vec::new(),
+        });
+        // SUBA-C14: the group gate runs on the EMPTY path too, over an aggregate report
+        // built from zero children (`chain-execution.ts:869-891`: `aggregateAcceptanceReport
+        // ({ results: [], notes: "Dynamic fanout produced 0 results." })`). A fan-out that
+        // produced nothing satisfies no criterion, so a declared gate rejects here — which
+        // is the whole point of declaring one on an `onEmpty: "skip"` step.
+        match evaluate_dynamic_group_acceptance(
+            spec,
+            &[],
+            "Dynamic fanout produced 0 results.",
+            ctx,
+        )
+        .await
+        {
+            Some(message) => Ok(StepResult::failure(message)),
+            None => Ok(StepResult::success(
+                Some("Dynamic fanout produced 0 results.".to_string()),
+                Some(collected_value),
+            )),
+        }
+    } else {
+        // Build one distinct, per-item-substituted step spec per element (C16):
+        // item-template substitution first (pi `resolveItemTemplate`), then the flat
+        // `{outputs.name}`/`{task}`/`{previous}`/`{chain_dir}` + chain-instruction pass
+        // ([`resolve_step_task`]), exactly as pi materializes then dispatches — so
+        // every fanned-out child gets its OWN task string.
+        let mut expanded: Vec<SingleStepSpec> = Vec::with_capacity(items.len());
+        for entry in &items {
+            let item_task = crate::spawn::dynamic_fanout::resolve_item_template(
+                template_task,
+                item_name,
+                &entry.item,
+            )
+            .map_err(SubagentError::StructuredOutputInvalid)?;
+            let resolved =
+                resolve_step_task(&item_task, registry, ctx, spec.template.as_ref())?;
+            expanded.push(SingleStepSpec {
+                skills: None,
+                session_dir: None,
+                task: resolved,
+                ..(*spec.template).clone()
+            });
+        }
+        let agents: Vec<String> = expanded.iter().map(|s| s.agent.clone()).collect();
+
+        // A dynamic fan-out honours `failFast` exactly as a static one does: pi lowers
+        // the dynamic step to a plain `ParallelStep` carrying `failFast: step.failFast`
+        // (`chain-execution.ts:1061-1067`) and dispatches it through the very same
+        // `runParallelChainTasks` (`:231` `?? false`, `:391` trip-on-nonzero-exit) that
+        // a static parallel step uses. Passing a hardcoded `false` here would leave the
+        // validator-accepted `failFast` key (`dynamic-fanout.ts:44`) silently inert and
+        // spawn — and pay for — every remaining item after the first failure.
+        let group_result =
+            dispatch_group(expanded, spec.concurrency, spec.fail_fast, single, ctx)
+                .await;
+
+        // Fold the per-child results into the ordered collect-record array (pi
+        // `collectDynamicResults`, `dynamic-fanout.ts:263-287` @v0.34.0). Every field
+        // pi copies is copied: the child's REAL `exit_code` (`:278`
+        // `result?.exitCode ?? null` — never derived from success, which would collapse
+        // a `2` or a `137` to exactly `1`), plus `timed_out` / `saved_output_path` /
+        // `artifact_paths` (`:282-284`), all carried out of `exec::SingleResult` on the
+        // widened [`StepResult`] seam by `ExecSingleStepExecutor::run_single`. An
+        // executor that runs no real child (the mock executors in tests) leaves
+        // `exit_code` at `None`, so this falls back to the success/failure mapping and
+        // pi's `?? null` shape is preserved for a never-dispatched slot.
+        //
+        // A child that fail-fast SKIPPED is not a hole in the array: pi returns a
+        // synthetic `SingleResult` for it (`chain-execution.ts:321-330` — `task:
+        // "(skipped)"`, `exitCode: -1`, `error: "Skipped due to fail-fast"`, empty
+        // messages) and that record flows on into `collectDynamicResults` (`:976`), so
+        // the registered `{outputs.<collect.as>}` array carries an explicit `-1`
+        // marker per un-run item rather than a `null` exit code. A CANCELLED skip has
+        // no upstream analog and is deliberately left as `None` (exit code `null`).
+        let child_inputs: Vec<
+            Option<crate::spawn::dynamic_fanout::CollectChildResult>,
+        > = group_result
+            .children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| match child.as_ref() {
+                Some(sr) => Some(crate::spawn::dynamic_fanout::CollectChildResult {
+                    agent: Some(spec.template.agent.clone()),
+                    exit_code: Some(
+                        sr.exit_code
+                            .map_or_else(|| i64::from(!sr.success), i64::from),
+                    ),
+                    error: sr.error.clone(),
+                    timed_out: sr.timed_out,
+                    structured_output: sr.structured_output.clone(),
+                    artifact_paths: sr.artifact_paths.clone(),
+                    saved_output_path: sr.saved_output_path.clone(),
+                    output: None,
+                    final_output: sr.final_output.clone(),
+                }),
+                None if group_result
+                    .fail_fast_skipped
+                    .get(index)
+                    .copied()
+                    .unwrap_or(false) =>
+                {
+                    Some(crate::spawn::dynamic_fanout::CollectChildResult {
+                        agent: Some(spec.template.agent.clone()),
+                        exit_code: Some(FAIL_FAST_SKIPPED_EXIT_CODE),
+                        error: Some(FAIL_FAST_SKIPPED_ERROR.to_string()),
+                        timed_out: false,
+                        structured_output: None,
+                        artifact_paths: None,
+                        saved_output_path: None,
+                        output: None,
+                        final_output: None,
+                    })
+                }
+                None => None,
+            })
+            .collect();
+        let collected = crate::spawn::dynamic_fanout::collect_dynamic_results(
+            &items,
+            &child_inputs,
+            &spec.template.agent,
+        );
+        let collected_value =
+            crate::spawn::dynamic_fanout::collected_results_to_value(&collected);
+
+        // The dynamic step's own aggregate output IS the collect-record array (pi
+        // `outputs[collect.as] = { structured: collected }`), NOT the raw
+        // child-structured-output array `collapse_fan_out` produced.
+        let mut collapsed = group_result.aggregate.clone();
+        collapsed.structured_output = Some(collected_value.clone());
+
+        if collapsed.success {
+            // pi validates `collect.outputSchema` only on the all-children-succeeded
+            // path (its failure early-return precedes `validateDynamicCollection`). A
+            // schema failure aborts the walk (hard `Err`), matching this arm's
+            // `StructuredOutputInvalid` contract.
+            crate::spawn::dynamic_fanout::validate_dynamic_collection(
+                spec.collect_schema.as_ref(),
+                &collected,
+            )
+            .map_err(SubagentError::StructuredOutputInvalid)?;
+            registry.register(spec.collect.clone(), collected_value);
+            registry.set_previous(aggregate_group_previous(
+                &group_result.children,
+                &agents,
+            ));
+            // SUBA-C14: the GROUP-level gate, run AFTER the collect output is
+            // registered and only on the all-children-succeeded path — exactly pi's
+            // ordering (`chain-execution.ts:1027-1055`: `outputs[step.collect.as] = …`,
+            // then `resolveEffectiveAcceptance`/`evaluateAcceptance`, and the
+            // any-child-failed early return at `:998-1018` precedes both). A rejection
+            // fails the whole chain with pi's `acceptanceFailureMessage` text, which
+            // this walker expresses as a failed `StepResult` (C9 stop-on-failure).
+            let aggregate_children: Vec<
+                crate::exec::acceptance::model::AggregateChild,
+            > = group_result
+                .children
+                .iter()
+                .map(|child| crate::exec::acceptance::model::AggregateChild {
+                    agent: spec.template.agent.clone(),
+                    // The walker's narrow `StepResult` seam carries no per-child
+                    // acceptance ledger (that lives on `exec::SingleResult`, which
+                    // `SingleStepExecutor` deliberately does not surface here), so
+                    // every child reads as pi's `"unreported"` rather than a
+                    // fabricated status.
+                    acceptance: None,
+                    error: child.as_ref().and_then(|sr| sr.error.clone()),
+                    exit_code: child.as_ref().map_or(1, |sr| i32::from(!sr.success)),
+                })
+                .collect();
+            let notes = format!(
+                "Dynamic fanout collected {} result(s) into {}.",
+                collected.len(),
+                spec.collect
+            );
+            if let Some(message) = evaluate_dynamic_group_acceptance(
+                spec,
+                &aggregate_children,
+                &notes,
+                ctx,
+            )
+            .await
+            {
+                collapsed = StepResult::failure(message);
+            }
+        }
+        group_results.push(group_result);
+        Ok(collapsed)
+    }
 }
 
 /// SUBA-C14 — evaluate a dynamic fan-out's GROUP-level [`DynamicGroupSpec::acceptance`] gate once

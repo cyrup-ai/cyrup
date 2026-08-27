@@ -39,6 +39,10 @@
 //! Wrap-aware/sticky-column vertical motion + large-paste markers, the message-component/chrome tail,
 //! clipboard-image paste + base64 message-image decode — plus the outer-layer ext-UI command protocol.
 #![forbid(unsafe_code)]
+// `clippy::indexing_slicing` (workspace-denied) only fires on slice/array receivers; `str` range
+// indexing is exempt and panics on a non-char-boundary byte offset. Use `.get(..)`/`split_once`/
+// `strip_prefix`/`split_at_checked` instead. Test modules opt out alongside the other four.
+#![deny(clippy::string_slice)]
 
 mod ansi;
 mod app;

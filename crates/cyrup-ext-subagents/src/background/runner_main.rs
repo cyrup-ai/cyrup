@@ -511,10 +511,124 @@ pub async fn read_and_delete_config(
 /// diagnostic and choose its own process exit code; it carries NO information this function's own
 /// on-disk writes have not already durably recorded.
 pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), SubagentError> {
+    let Some(config) = load_runner_config(config_path, run_paths).await else {
+        return Ok(());
+    };
+
+    let effective_paths = effective_run_paths(&config);
+    let run_paths: &RunPaths = effective_paths.as_ref().unwrap_or(run_paths);
+
+    ensure_run_directories(run_paths).await;
+
+    let Some(status) = publish_initial_status(&config, run_paths).await else {
+        return Ok(());
+    };
+
+    // Install a SIGUSR2 handler BEFORE anything else that could race an interrupt delivery
+    // (R-SA-081's wake-up signal, sent by `control::deliver_wakeup_signal`): on both Linux and
+    // macOS, SIGUSR2's default disposition is process TERMINATION. Without an installed handler,
+    // the very act of a caller trying to softly interrupt this run would instead kill the runner
+    // outright — the opposite of R-SA-084's "interrupt is soft, not fatal" guarantee, and the
+    // interrupt would never even reach `run_inner`'s own cooperative `interrupted` check. The
+    // signal's payload itself is not consulted for anything: `control::watch_control_inbox`'s
+    // filesystem-notification mechanism (installed by `spawn_control_watcher` immediately below)
+    // is the actual, authoritative "an interrupt/append request landed" signal per DI-SA-9
+    // (file-based control, never live IPC) — SIGUSR2 exists purely to nudge that watcher/poll
+    // loop awake sooner than its next scheduled tick, so this handle's only job is to keep
+    // existing for this function's whole lifetime (held via `_sigusr2_guard`) so the OS routes
+    // the signal to a registered handler instead of applying its default terminate action; a
+    // received signal is otherwise fully drained/ignored.
+    #[cfg(unix)]
+    let _sigusr2_guard = install_ignored_sigusr2_handler();
+
+    let Some(status) = ensure_control_inbox_dir(&config, run_paths, status).await else {
+        return Ok(());
+    };
+
+    let (control_flags, interrupt_cancel) = init_control_flags(run_paths).await;
+
+    let mut events = open_run_events(&config, run_paths).await;
+
+    // The run's overall start (for `durationMs` on the terminal run event, pi's
+    // `runEndedAt - overallStartTime`), captured before `status` is moved into the shared handle.
+    let overall_started_at = status.started_at;
+
+    // Move the initial `Running` status into the shared handle BOTH the step loop and the live-
+    // telemetry pump mutate (pi's single `statusPayload`, folded from the per-child event handler
+    // AND the 1s `activityTimer`, `subagent-runner.ts:1962`).
+    let shared_status: SharedStatus = Arc::new(std::sync::Mutex::new(status));
+
+    // R-SA-082's watcher is installed HERE rather than immediately after the two synchronous
+    // startup checks above, because G90's steer routing needs the shared status handle (it accepts
+    // a steer only against a currently-`Running` step and records the acceptance on that step). The
+    // synchronous startup checks stay where they were — they are what closes the pre-watcher race
+    // window, and nothing between them and this line can deliver a control request.
+    let _watcher_task = spawn_control_watcher(
+        run_paths.clone(),
+        control_flags.clone(),
+        interrupt_cancel.clone(),
+        Arc::clone(&shared_status),
+    );
+
+    // The live-telemetry channel: each dispatched step's `RunOptions::live_events` sink forwards
+    // raw child NDJSON lines here (tagged with the step's flat index); the telemetry task folds
+    // each into the addressed step's `StepTelemetry` + the top-level roll-ups and writes
+    // status.json on both a per-event AND a 1s cadence.
+    let (telemetry_tx, telemetry_rx) = tokio::sync::mpsc::unbounded_channel::<TelemetryMsg>();
+    let telemetry_task =
+        spawn_telemetry_task(run_paths.clone(), Arc::clone(&shared_status), telemetry_rx);
+
+    // The step loop itself, all failure modes funneled to a single Result the tail below always
+    // routes through `finish_run`.
+    let loop_outcome = run_inner(
+        &config,
+        run_paths,
+        &shared_status,
+        &control_flags,
+        &interrupt_cancel,
+        telemetry_tx,
+        &mut events,
+    )
+    .await;
+
+    // `run_inner` has returned, so its executor (holding the last live-telemetry sender) is dropped
+    // and the telemetry task observes all-senders-dropped and finishes — await it so no late
+    // telemetry status write races the terminal record `finish_run` writes.
+    let _ = telemetry_task.await;
+
+    let duration_ms = (crate::time::now_epoch_millis() - overall_started_at).max(0);
+    let (terminal_state, results, final_error) =
+        settle_loop_outcome(loop_outcome, &config, &mut events, duration_ms).await;
+
+    // Recover the final live status (its accumulated per-step telemetry + workflow-graph snapshot)
+    // so the terminal `status.json` `finish_run` writes preserves everything the pump accumulated.
+    let final_status = lock_status(&shared_status).clone();
+
+    finish_run(
+        run_paths,
+        final_status,
+        terminal_state,
+        results,
+        config.cwd.clone(),
+        config.session_file.clone(),
+        final_error.unwrap_or_default(),
+    )
+    .await;
+
+    Ok(())
+}
+
+/// Read-and-delete the one-shot `runner-config.json` handoff file (R-SA-073), or write this run's
+/// terminal `Failed` record and report that there is nothing to run.
+///
+/// `None` means the failure has ALREADY been captured on disk by [`finish_run`] — the caller's
+/// only remaining job is to return, exactly as [`run`]'s "effectively infallible from the
+/// CALLER's point of view" contract requires (never an `Err` propagated past this point).
+async fn load_runner_config(config_path: &Path, run_paths: &RunPaths) -> Option<RunnerConfig> {
     let outcome = read_and_delete_config(config_path).await;
 
-    let config = match outcome {
-        Ok(ConfigConsumeOutcome::Consumed(config)) => *config,
+    match outcome {
+        Ok(ConfigConsumeOutcome::Consumed(config)) => Some(*config),
         Ok(ConfigConsumeOutcome::AlreadyConsumed) => {
             // R-SA-073's delete-then-act idempotency, restated at the top level: a double
             // invocation against an already-consumed config has nothing to build a run from.
@@ -536,7 +650,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
                     .to_string(),
             )
             .await;
-            return Ok(());
+            None
         }
         Err(err) => {
             // No config at all to build even a run-id-bearing status from in the ordinary case —
@@ -555,37 +669,48 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
                 format!("failed to read runner-config.json: {err}"),
             )
             .await;
-            return Ok(());
+            None
         }
-    };
+    }
+}
 
-    // C7: the orchestrator resolved this run's authoritative ABSOLUTE async-root and results-dir
-    // (via `super::run_artifact_roots`) and baked them into the config; rebuild `RunPaths` from
-    // THOSE roots — never from a re-derivation of the config file's own directory structure — so
-    // the terminal ResultFile lands in the SAME directory the orchestrator created and watches.
-    // Fall back to the caller-derived `run_paths` only for a (legacy/hand-built) config that
-    // carried neither root, preserving pre-C7 behavior for such configs.
-    let effective_paths;
-    let run_paths: &RunPaths = if config.async_root.as_os_str().is_empty()
-        || config.results_dir.as_os_str().is_empty()
-    {
-        run_paths
+/// C7: the orchestrator resolved this run's authoritative ABSOLUTE async-root and results-dir
+/// (via `super::run_artifact_roots`) and baked them into the config; rebuild `RunPaths` from
+/// THOSE roots — never from a re-derivation of the config file's own directory structure — so
+/// the terminal ResultFile lands in the SAME directory the orchestrator created and watches.
+/// Fall back to the caller-derived `run_paths` only for a (legacy/hand-built) config that
+/// carried neither root, preserving pre-C7 behavior for such configs.
+///
+/// `None` means the config carried neither root and the caller-derived `RunPaths` stands.
+fn effective_run_paths(config: &RunnerConfig) -> Option<RunPaths> {
+    if config.async_root.as_os_str().is_empty() || config.results_dir.as_os_str().is_empty() {
+        None
     } else {
-        effective_paths = RunPaths::for_run(&config.async_root, &config.results_dir, &config.run_id);
-        &effective_paths
-    };
+        Some(RunPaths::for_run(
+            &config.async_root,
+            &config.results_dir,
+            &config.run_id,
+        ))
+    }
+}
 
-    // ensureAccessibleDir-equivalent on the RUNNER side (C7's "create the dirs on both sides"):
-    // guarantee the run dir (parent of every intermediate status/events write) and the results dir
-    // (parent of the terminal ResultFile) both exist up front. `finish_run` re-ensures the results
-    // dir as a final guard on every exit path, but creating them here keeps the happy-path
-    // status/events writes from failing on a missing directory too.
+/// ensureAccessibleDir-equivalent on the RUNNER side (C7's "create the dirs on both sides"):
+/// guarantee the run dir (parent of every intermediate status/events write) and the results dir
+/// (parent of the terminal ResultFile) both exist up front. `finish_run` re-ensures the results
+/// dir as a final guard on every exit path, but creating them here keeps the happy-path
+/// status/events writes from failing on a missing directory too.
+async fn ensure_run_directories(run_paths: &RunPaths) {
     let _ = super::ensure_accessible_dir(&run_paths.run_dir).await;
     if let Some(results_dir) = run_paths.result.parent() {
         let _ = super::ensure_accessible_dir(results_dir).await;
     }
+}
 
-    // R-SA-075: initial status.json (state=Running, pid=own pid), written BEFORE any step work.
+/// R-SA-075: initial status.json (state=Running, pid=own pid), written BEFORE any step work.
+///
+/// `None` means the status could not be published and the terminal `Failed` record has already
+/// been written by [`finish_run`] — the caller returns without running a single step.
+async fn publish_initial_status(config: &RunnerConfig, run_paths: &RunPaths) -> Option<RunStatus> {
     let mut status = RunStatus::queued(config.run_id.clone(), config.mode, Some(std::process::id()));
     // pi `...(config.sessionId ? { sessionId: config.sessionId } : {})` (`subagent-runner.ts:2088`):
     // stamp the ORCHESTRATOR session onto the run's own `status.json`, so a later reader can scope
@@ -623,7 +748,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             "internal error: Queued -> Running transition was rejected".to_string(),
         )
         .await;
-        return Ok(());
+        return None;
     }
     if let Err(err) = write_atomic_json(&run_paths.status, &status).await {
         finish_run(
@@ -636,47 +761,40 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             format!("failed to write initial status.json: {err}"),
         )
         .await;
-        return Ok(());
+        return None;
     }
+    Some(status)
+}
 
-    // Install a SIGUSR2 handler BEFORE anything else that could race an interrupt delivery
-    // (R-SA-081's wake-up signal, sent by `control::deliver_wakeup_signal`): on both Linux and
-    // macOS, SIGUSR2's default disposition is process TERMINATION. Without an installed handler,
-    // the very act of a caller trying to softly interrupt this run would instead kill the runner
-    // outright — the opposite of R-SA-084's "interrupt is soft, not fatal" guarantee, and the
-    // interrupt would never even reach `run_inner`'s own cooperative `interrupted` check. The
-    // signal's payload itself is not consulted for anything: `control::watch_control_inbox`'s
-    // filesystem-notification mechanism (installed by `spawn_control_watcher` immediately below)
-    // is the actual, authoritative "an interrupt/append request landed" signal per DI-SA-9
-    // (file-based control, never live IPC) — SIGUSR2 exists purely to nudge that watcher/poll
-    // loop awake sooner than its next scheduled tick, so this handle's only job is to keep
-    // existing for this function's whole lifetime (held via `_sigusr2_guard`) so the OS routes
-    // the signal to a registered handler instead of applying its default terminate action; a
-    // received signal is otherwise fully drained/ignored.
-    #[cfg(unix)]
-    let _sigusr2_guard = install_ignored_sigusr2_handler();
-
-    // The control-inbox directory (`<run_dir>/control/`) MUST exist before
-    // `spawn_control_watcher` installs its `notify::PollWatcher` below: that watcher targets the
-    // DIRECTORY, not the (not-yet-existing, created-on-first-interrupt) file itself, since
-    // watching a not-yet-existing file path is unreliable across platforms (see
-    // `control::watch_control_inbox`'s own doc). Watching a directory that does not exist YET
-    // fails to install at all on every platform this crate ships to — and `spawn_control_watcher`
-    // degrades that failure to a silent no-op (by design, so a watcher failure never strands the
-    // run), which would silently make EVERY interrupt delivered after this point unobservable:
-    // `run_inner`'s own per-iteration re-check only re-scans pending chain-append requests
-    // (R-SA-096), it has no independent interrupt-file poll fallback of its own — the `interrupted`
-    // flag is set SOLELY by this watcher task. Creating the directory here, unconditionally,
-    // before the watcher is installed, closes that gap.
-    //
-    // This MUST route through `finish_run` on failure, matching every other pre-loop fallible step
-    // immediately above (never a bare `?`, found bypassing `finish_run` entirely in second-pass
-    // adversarial review): a bare `?` here would return `Err` straight out of `run` itself, leaving
-    // `status.json` permanently stuck at the `Running` record already written above and NO
-    // `ResultFile` ever written — directly contradicting this function's own documented "effectively
-    // infallible from the caller's point of view" contract (every internal failure captured into a
-    // terminal on-disk record, never propagated) and silently violating R-SA-077's ordering
-    // invariant by skipping BOTH writes rather than merely reordering them.
+/// The control-inbox directory (`<run_dir>/control/`) MUST exist before
+/// `spawn_control_watcher` installs its `notify::PollWatcher` below: that watcher targets the
+/// DIRECTORY, not the (not-yet-existing, created-on-first-interrupt) file itself, since
+/// watching a not-yet-existing file path is unreliable across platforms (see
+/// `control::watch_control_inbox`'s own doc). Watching a directory that does not exist YET
+/// fails to install at all on every platform this crate ships to — and `spawn_control_watcher`
+/// degrades that failure to a silent no-op (by design, so a watcher failure never strands the
+/// run), which would silently make EVERY interrupt delivered after this point unobservable:
+/// `run_inner`'s own per-iteration re-check only re-scans pending chain-append requests
+/// (R-SA-096), it has no independent interrupt-file poll fallback of its own — the `interrupted`
+/// flag is set SOLELY by this watcher task. Creating the directory here, unconditionally,
+/// before the watcher is installed, closes that gap.
+///
+/// This MUST route through `finish_run` on failure, matching every other pre-loop fallible step
+/// immediately above (never a bare `?`, found bypassing `finish_run` entirely in second-pass
+/// adversarial review): a bare `?` here would return `Err` straight out of `run` itself, leaving
+/// `status.json` permanently stuck at the `Running` record already written above and NO
+/// `ResultFile` ever written — directly contradicting this function's own documented "effectively
+/// infallible from the caller's point of view" contract (every internal failure captured into a
+/// terminal on-disk record, never propagated) and silently violating R-SA-077's ordering
+/// invariant by skipping BOTH writes rather than merely reordering them.
+///
+/// The `status` published by [`publish_initial_status`] travels through this function so the
+/// failure path can spend it on the terminal record; `None` means it already has.
+async fn ensure_control_inbox_dir(
+    config: &RunnerConfig,
+    run_paths: &RunPaths,
+    status: RunStatus,
+) -> Option<RunStatus> {
     if let Err(err) = tokio::fs::create_dir_all(
         run_paths
             .control_inbox
@@ -695,12 +813,18 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             format!("failed to create control-inbox directory: {err}"),
         )
         .await;
-        return Ok(());
+        return None;
     }
+    Some(status)
+}
 
-    // R-SA-082: control-inbox watcher, installed with the mandatory synchronous startup check
-    // performed FIRST (catches a request written in the race window before the watcher attaches),
-    // then a background task forwarding every watch notification into `interrupted`.
+/// R-SA-082: control-inbox watcher, installed with the mandatory synchronous startup check
+/// performed FIRST (catches a request written in the race window before the watcher attaches),
+/// then a background task forwarding every watch notification into `interrupted`.
+///
+/// Returns the three flags folded into a [`ControlFlags`] plus the shared soft-interrupt token
+/// they pre-cancel, both of which [`run`] hands to the watcher and to [`run_inner`].
+async fn init_control_flags(run_paths: &RunPaths) -> (ControlFlags, cyrup_core::CancelToken) {
     let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
     // R-SA-084 mid-flight interrupt (`subagent-runner.ts:1583-1609`): the run-wide SHARED soft-
     // interrupt token. The control-inbox watcher cancels it the instant an interrupt lands, which
@@ -754,12 +878,19 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         timed_out: Arc::clone(&timed_out),
         stopped: Arc::clone(&stopped),
     };
-    // R-SA-136/146: open the size-capped `events.jsonl` writer for this run, via the SAME shared
-    // `BoundedJsonlWriter` primitive `spawn::SpawnedChild`'s per-attempt child-output tee uses
-    // (`jsonl.rs`'s own module doc names this exact call site as one of its two intended writers).
-    // A failure to open it (e.g. an unwritable run directory) degrades to `None` — `append_event`
-    // then silently no-ops on every call — rather than failing this run over a best-effort
-    // diagnostic log, mirroring every other non-`status.json`/`ResultFile` write in this function.
+    (control_flags, interrupt_cancel)
+}
+
+/// R-SA-136/146: open the size-capped `events.jsonl` writer for this run, via the SAME shared
+/// `BoundedJsonlWriter` primitive `spawn::SpawnedChild`'s per-attempt child-output tee uses
+/// (`jsonl.rs`'s own module doc names this exact call site as one of its two intended writers).
+/// A failure to open it (e.g. an unwritable run directory) degrades to `None` — `append_event`
+/// then silently no-ops on every call — rather than failing this run over a best-effort
+/// diagnostic log, mirroring every other non-`status.json`/`ResultFile` write in this function.
+async fn open_run_events(
+    config: &RunnerConfig,
+    run_paths: &RunPaths,
+) -> Option<BoundedJsonlWriter> {
     let mut events = BoundedJsonlWriter::create(&run_paths.events).await.ok();
     append_event(
         &mut events,
@@ -767,61 +898,23 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         Some(serde_json::json!({ "runId": config.run_id.as_str() })),
     )
     .await;
+    events
+}
 
-    // The run's overall start (for `durationMs` on the terminal run event, pi's
-    // `runEndedAt - overallStartTime`), captured before `status` is moved into the shared handle.
-    let overall_started_at = status.started_at;
-
-    // Move the initial `Running` status into the shared handle BOTH the step loop and the live-
-    // telemetry pump mutate (pi's single `statusPayload`, folded from the per-child event handler
-    // AND the 1s `activityTimer`, `subagent-runner.ts:1962`).
-    let shared_status: SharedStatus = Arc::new(std::sync::Mutex::new(status));
-
-    // R-SA-082's watcher is installed HERE rather than immediately after the two synchronous
-    // startup checks above, because G90's steer routing needs the shared status handle (it accepts
-    // a steer only against a currently-`Running` step and records the acceptance on that step). The
-    // synchronous startup checks stay where they were — they are what closes the pre-watcher race
-    // window, and nothing between them and this line can deliver a control request.
-    let _watcher_task = spawn_control_watcher(
-        run_paths.clone(),
-        control_flags.clone(),
-        interrupt_cancel.clone(),
-        Arc::clone(&shared_status),
-    );
-
-    // The live-telemetry channel: each dispatched step's `RunOptions::live_events` sink forwards
-    // raw child NDJSON lines here (tagged with the step's flat index); the telemetry task folds
-    // each into the addressed step's `StepTelemetry` + the top-level roll-ups and writes
-    // status.json on both a per-event AND a 1s cadence.
-    let (telemetry_tx, telemetry_rx) = tokio::sync::mpsc::unbounded_channel::<TelemetryMsg>();
-    let telemetry_task =
-        spawn_telemetry_task(run_paths.clone(), Arc::clone(&shared_status), telemetry_rx);
-
-    // The step loop itself, all failure modes funneled to a single Result the tail below always
-    // routes through `finish_run`.
-    let loop_outcome = run_inner(
-        &config,
-        run_paths,
-        &shared_status,
-        &control_flags,
-        &interrupt_cancel,
-        telemetry_tx,
-        &mut events,
-    )
-    .await;
-
-    // `run_inner` has returned, so its executor (holding the last live-telemetry sender) is dropped
-    // and the telemetry task observes all-senders-dropped and finishes — await it so no late
-    // telemetry status write races the terminal record `finish_run` writes.
-    let _ = telemetry_task.await;
-
-    let duration_ms = (crate::time::now_epoch_millis() - overall_started_at).max(0);
+/// Fold [`run_inner`]'s outcome into the terminal `(state, results, error)` triple [`finish_run`]
+/// records, appending the matching terminal `subagent.run.*` event for each shape on the way.
+async fn settle_loop_outcome(
+    loop_outcome: Result<LoopOutcome, SubagentError>,
+    config: &RunnerConfig,
+    events: &mut Option<BoundedJsonlWriter>,
+    duration_ms: i64,
+) -> (RunState, Vec<SingleResult>, Option<String>) {
     let run_id_str = config.run_id.as_str().to_string();
-    let (terminal_state, results, final_error) = match loop_outcome {
+    match loop_outcome {
         Ok(LoopOutcome::Completed { results }) => {
             let all_ok = results.iter().all(|r| r.exit_code == 0);
             append_event(
-                &mut events,
+                events,
                 "subagent.run.completed",
                 Some(serde_json::json!({
                     "runId": run_id_str,
@@ -838,7 +931,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         }
         Ok(LoopOutcome::Interrupted { results }) => {
             append_event(
-                &mut events,
+                events,
                 "subagent.run.paused",
                 Some(serde_json::json!({ "runId": run_id_str })),
             )
@@ -850,7 +943,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             // the nominal budget and the absolute deadline so a reader can tell a run that used
             // its whole budget from one an ancestor cut short.
             append_event(
-                &mut events,
+                events,
                 "subagent.run.timed_out",
                 Some(serde_json::json!({
                     "runId": run_id_str,
@@ -869,7 +962,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             // to reconstruct it from the terminal record. `durationMs` follows the same shape the
             // sibling terminal events use here.
             append_event(
-                &mut events,
+                events,
                 "subagent.run.stopped",
                 Some(serde_json::json!({
                     "runId": run_id_str,
@@ -882,7 +975,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
         }
         Err(err) => {
             append_event(
-                &mut events,
+                events,
                 "subagent.run.completed",
                 Some(serde_json::json!({
                     "runId": run_id_str,
@@ -894,24 +987,7 @@ pub async fn run(config_path: &Path, run_paths: &RunPaths) -> Result<(), Subagen
             .await;
             (RunState::Failed, Vec::new(), Some(err.to_string()))
         }
-    };
-
-    // Recover the final live status (its accumulated per-step telemetry + workflow-graph snapshot)
-    // so the terminal `status.json` `finish_run` writes preserves everything the pump accumulated.
-    let final_status = lock_status(&shared_status).clone();
-
-    finish_run(
-        run_paths,
-        final_status,
-        terminal_state,
-        results,
-        config.cwd.clone(),
-        config.session_file.clone(),
-        final_error.unwrap_or_default(),
-    )
-    .await;
-
-    Ok(())
+    }
 }
 
 /// R-SA-136/146: append one JSON-shaped line to this run's `events.jsonl` via the shared
@@ -1207,41 +1283,191 @@ async fn run_inner(
     telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
     events: &mut Option<BoundedJsonlWriter>,
 ) -> Result<LoopOutcome, SubagentError> {
-    let interrupted = &flags.interrupted;
-    let timed_out = &flags.timed_out;
-    // G77 — the stop flag, read at the very top of every loop iteration ahead of the other two.
-    let stopped = &flags.stopped;
     let mut steps = config.steps.clone();
     let mut cursor = 0usize;
     let mut results: Vec<SingleResult> = Vec::new();
     let mut registry = OutputRegistry::new();
 
     let depth = crate::spawn::depth::resolve_effective_depth(config.max_subagent_depth);
+    ensure_depth_available(&depth)?;
 
-    // R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST in this loop's own setup — before
-    // any step's discovery-free-but-still-real worktree setup (`chain_graph::assign_worktree_cwds`
-    // -> `spawn::worktree::setup_worktree_group`, which shells out to real `git` subprocesses) or
-    // any child OS process is spawned for ANY step in this run's chain. This hop-2 runner process
-    // is itself already one recursion hop deep (its own `depth.current_depth` reflects however
-    // many ancestors spawned it, propagated via `CYRUP_SUBAGENT_DEPTH`/`_MAX_DEPTH`, R-SA-054) —
-    // if that inherited envelope is already at its ceiling, this run must reject EVERY one of its
-    // configured steps up front rather than dispatching the first one and only then discovering
-    // `ExecSingleStepExecutor::run_single` -> `exec::run_sync`'s own independent re-check rejects
-    // it (which would still be correct per R-SA-055's letter for that one step, since no spawn
-    // would have happened yet, but would incorrectly leave every LATER step in `steps` looking
-    // like it was simply never reached rather than explicitly blocked, and would run any
-    // `worktree: true` group's real `git worktree add` setup for nothing before the per-child
-    // dispatch inside `run_bounded` ever reached `run_sync`'s own guard). Failing the whole run
-    // here, before the loop even starts, keeps the rejection uniform across every step shape
-    // (`SingleStep`/`ParallelGroup`/`DynamicGroup`) and guarantees zero worktrees and zero child
-    // processes are ever created for a run whose own depth is already exhausted.
-    if crate::spawn::depth::is_blocked(&depth) {
+    // Published just before each dispatch so the live-telemetry sink tags every child NDJSON line
+    // with the step it belongs to (pi's `statusPayload.currentStep`, `subagent-runner.ts:1434`).
+    let current_flat_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let (executor, ctx) = build_chain_context(
+        config,
+        run_paths,
+        flags,
+        interrupt_cancel,
+        telemetry,
+        depth,
+        &current_flat_index,
+    );
+
+    let mut io = TurnLoopIo {
+        config,
+        run_paths,
+        status,
+        events,
+        flags,
+    };
+
+    loop {
+        // G77 — the three terminal-flag checks below run in pi's own inbox-drain order, and MUST
+        // stay in it: stop FIRST, then timeout, then interrupt
+        // (`runs/background/control-channel.ts:653-655` @v0.43.0). Each one returns `Some` only
+        // when it actually consumed a pending request, so the FIRST that does wins and ends the
+        // run: a stop outranks a timeout outranks an interrupt, and the terminal record is always
+        // the hardest, least-resumable verdict. Each check carries its own rationale on its `fn`.
+        if let Some(outcome) = check_stop_flag(&mut io, &steps, cursor, &mut results).await? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = check_timeout_flag(&mut io, &steps, cursor, &mut results).await? {
+            return Ok(outcome);
+        }
+        if let Some(outcome) = check_interrupt_flag(&mut io, &steps, cursor, &mut results).await? {
+            return Ok(outcome);
+        }
+
+        absorb_pending_appends(&mut io, &mut steps).await?;
+
+        if cursor >= steps.len() {
+            return Ok(LoopOutcome::Completed { results });
+        }
+
+        let step = steps
+            .get(cursor)
+            .cloned()
+            .ok_or_else(|| SubagentError::Spawn(std::io::Error::other("step cursor out of range")))?;
+
+        // Publish the current flat index BEFORE dispatch so the live-telemetry sink tags this
+        // step's child NDJSON lines with the right index (pi `statusPayload.currentStep = flatIndex`).
+        current_flat_index.store(cursor, std::sync::atomic::Ordering::SeqCst);
+
+        {
+            let mut guard = lock_status(status);
+            let s = &mut *guard;
+            mark_step_running(s, cursor);
+            s.current_step = Some(cursor);
+            refresh_workflow_graph(s, &steps);
+            s.touch();
+        }
+        write_shared_status(run_paths, status)
+            .await
+            .map_err(SubagentError::Spawn)?;
+        append_event(
+            io.events,
+            "subagent.step.started",
+            Some(serde_json::json!({
+                "runId": config.run_id.as_str(),
+                "stepIndex": cursor,
+                "agent": step_display_agent(&step),
+            })),
+        )
+        .await;
+
+        if let RunnerStep::ImportAsyncRoot(spec) = &step {
+            run_import_async_root(&mut io, &steps, cursor, &step, spec, &mut registry, &mut results)
+                .await?;
+            cursor += 1;
+            continue;
+        }
+
+        // Dispatch via the Phase-3 spawn boundary (chain_graph::walk_chain over a ONE-element
+        // graph for this single cursor position — reusing the exact same SingleStep/ParallelGroup/
+        // DynamicGroup dispatch `walk_chain` already implements, rather than re-implementing group
+        // fan-out inline here). `ChainGraph` is a plain `Vec<RunnerStep>` type alias, so the
+        // one-element "graph" is just a fresh one-element `Vec`.
+        let one_step: Vec<RunnerStep> = vec![step.clone()];
+        let (step_results, group_results) =
+            walk_chain(&one_step, &mut registry, &executor, &ctx).await?;
+
+        let step_result = step_results.into_iter().next().ok_or_else(|| {
+            SubagentError::Spawn(std::io::Error::other(
+                "walk_chain produced no result for a single dispatched step",
+            ))
+        })?;
+
+        match settle_step_result(
+            &mut io,
+            &steps,
+            cursor,
+            step,
+            step_result,
+            group_results,
+            &mut results,
+        )
+        .await?
+        {
+            StepDisposition::Advance => cursor += 1,
+            StepDisposition::Requeue => {}
+            StepDisposition::Finish(outcome) => return Ok(outcome),
+        }
+    }
+}
+
+/// The run-wide handles every turn-loop helper below writes through: the one-shot config, this
+/// run's [`RunPaths`], the shared [`RunStatus`] the telemetry pump also mutates, the `events.jsonl`
+/// writer, and the three control-inbox flags. Grouped into one struct purely so each helper takes
+/// a readable argument list instead of five threaded parameters — no helper stores it.
+struct TurnLoopIo<'a> {
+    config: &'a RunnerConfig,
+    run_paths: &'a RunPaths,
+    status: &'a SharedStatus,
+    events: &'a mut Option<BoundedJsonlWriter>,
+    flags: &'a ControlFlags,
+}
+
+/// What [`run_inner`]'s loop does next once a dispatched step's outcome has been recorded.
+enum StepDisposition {
+    /// Advance the step cursor and dispatch the next step.
+    Advance,
+    /// Re-enter the loop WITHOUT advancing the cursor, so a loop-top terminal-flag check produces
+    /// the terminal record for the verb that actually tore this step's child down.
+    Requeue,
+    /// End the run with this terminal outcome.
+    Finish(LoopOutcome),
+}
+
+/// R-SA-055 (SAFETY-CRITICAL): the depth guard runs FIRST in this loop's own setup — before
+/// any step's discovery-free-but-still-real worktree setup (`chain_graph::assign_worktree_cwds`
+/// -> `spawn::worktree::setup_worktree_group`, which shells out to real `git` subprocesses) or
+/// any child OS process is spawned for ANY step in this run's chain. This hop-2 runner process
+/// is itself already one recursion hop deep (its own `depth.current_depth` reflects however
+/// many ancestors spawned it, propagated via `CYRUP_SUBAGENT_DEPTH`/`_MAX_DEPTH`, R-SA-054) —
+/// if that inherited envelope is already at its ceiling, this run must reject EVERY one of its
+/// configured steps up front rather than dispatching the first one and only then discovering
+/// `ExecSingleStepExecutor::run_single` -> `exec::run_sync`'s own independent re-check rejects
+/// it (which would still be correct per R-SA-055's letter for that one step, since no spawn
+/// would have happened yet, but would incorrectly leave every LATER step in `steps` looking
+/// like it was simply never reached rather than explicitly blocked, and would run any
+/// `worktree: true` group's real `git worktree add` setup for nothing before the per-child
+/// dispatch inside `run_bounded` ever reached `run_sync`'s own guard). Failing the whole run
+/// here, before the loop even starts, keeps the rejection uniform across every step shape
+/// (`SingleStep`/`ParallelGroup`/`DynamicGroup`) and guarantees zero worktrees and zero child
+/// processes are ever created for a run whose own depth is already exhausted.
+fn ensure_depth_available(depth: &DepthEnvelope) -> Result<(), SubagentError> {
+    if crate::spawn::depth::is_blocked(depth) {
         return Err(SubagentError::DepthExceeded {
             current: depth.current_depth,
             max: depth.max_depth,
         });
     }
+    Ok(())
+}
 
+/// Build the two values every dispatched step is driven through: the [`SingleStepExecutor`] that
+/// carries this run's depth envelope, interrupt token, resolved personas and per-step policy into
+/// each spawned child, and the [`ChainRunContext`] `walk_chain` resolves each step against.
+fn build_chain_context(
+    config: &RunnerConfig,
+    run_paths: &RunPaths,
+    flags: &ControlFlags,
+    interrupt_cancel: &cyrup_core::CancelToken,
+    telemetry: tokio::sync::mpsc::UnboundedSender<TelemetryMsg>,
+    depth: DepthEnvelope,
+    current_flat_index: &Arc<std::sync::atomic::AtomicUsize>,
+) -> (Arc<dyn SingleStepExecutor>, ChainRunContext) {
     let global_limit = GlobalConcurrencyLimit::new(config.global_concurrency_limit.max(1));
     let cancel_root = cyrup_core::CancelToken::new();
     // T0.1 / C13: the per-agent resolved-persona map the orchestrator baked into the one-shot
@@ -1249,14 +1475,11 @@ async fn run_inner(
     // persona (never re-discovered, never a placeholder). `Arc`-shared so a parallel/dynamic
     // group's fanned-out children share one map rather than cloning it per child.
     let resolved_agents = Arc::new(config.resolved_agents.clone());
-    // Published just before each dispatch so the live-telemetry sink tags every child NDJSON line
-    // with the step it belongs to (pi's `statusPayload.currentStep`, `subagent-runner.ts:1434`).
-    let current_flat_index = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let executor: Arc<dyn SingleStepExecutor> = Arc::new(ExecSingleStepExecutor {
         depth,
-        interrupted: Arc::clone(interrupted),
+        interrupted: Arc::clone(&flags.interrupted),
         interrupt_cancel: interrupt_cancel.clone(),
-        current_flat_index: Arc::clone(&current_flat_index),
+        current_flat_index: Arc::clone(current_flat_index),
         telemetry: Some(telemetry),
         resolved_agents,
         // Intercom child-bridge (pi `subagent-runner.ts:779-783`): the orchestrator's presence target
@@ -1336,396 +1559,433 @@ async fn run_inner(
         // failing materialization.
         dynamic_fanout_max_items: config.dynamic_fanout_max_items,
     };
+    (executor, ctx)
+}
 
-    loop {
-        // G77 — STOP is checked before BOTH of the others, matching pi's own inbox-drain order
-        // (`runs/background/control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → `consumeTimeoutRequest` →
-        // `consumeInterruptRequest`) and `stopRunner`'s mutual-exclusion guard
-        // (`subagent-runner.ts:2955-2986`: `if (stopped || timedOut || interrupted || …) return`). The
-        // order is load-bearing when several land together: a stop outranks a timeout outranks an
-        // interrupt, so the terminal record is always the hardest, least-resumable verdict.
-        //
-        // Unlike the interrupt arm below there is no `cursor < steps.len()` moot-signal guard: a
-        // stop that lands after the last step finished still ends the run `Stopped` upstream
-        // (`stopRunner` only checks `statusPayload.state === "running"`, which is still true until
-        // `finish_run` writes the terminal record), and — unlike the interrupt case that guard
-        // exists for — that is not a downgrade to a permanently-wrong non-terminal record: `Stopped`
-        // IS terminal, so nothing is left waiting to be resumed.
-        if stopped.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Some(request) = control::consume_stop_request(run_paths).await? {
-                let message = request
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| control::STOP_MESSAGE.to_string());
-                {
-                    let mut guard = lock_status(status);
-                    let s = &mut *guard;
-                    mark_remaining_stopped(s, cursor, steps.len(), &message);
-                    refresh_workflow_graph(s, &steps);
-                    s.touch();
-                }
-                write_shared_status(run_paths, status)
-                    .await
-                    .map_err(SubagentError::Spawn)?;
-                // pi `stopNestedAsyncDescendants()` (`subagent-runner.ts:2984`) — stop the whole
-                // subtree, not just this run, or every background run this one spawned keeps going
-                // detached and unreachable after the user asked for it to stop.
-                cascade_to_descendants(config, events, cascade::CascadeVerb::Stop).await;
-                promote_interrupted_results_to_stopped(&mut results, &message);
-                return Ok(LoopOutcome::Stopped { results, message });
-            }
-            // Same idempotent absorption the other two arms document: a watch notification with
-            // nothing actually pending clears the flag rather than looping.
-            stopped.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        // Timeout is checked BEFORE interrupt, matching pi's own inbox-drain order
-        // (`runs/background/control-channel.ts:654-655` @v0.43.0: `if (consumeTimeoutRequest(...)) onTimeout();`
-        // then `if (consumeInterruptRequest(...)) onInterrupt();`). The order is load-bearing when
-        // both land together — an ancestor that timed out cascades a timeout to this run while a
-        // user may simultaneously be interrupting it, and the terminal record must be the harder
-        // of the two verdicts (`Failed`/timed-out, not a resumable `Paused`).
-        if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
-            if let Some(request) = control::consume_timeout_request(run_paths).await? {
-                let message = request.reason.clone().unwrap_or_else(|| {
-                    timeout_message(config.timeout_ms, &request.source)
-                });
-                {
-                    let mut guard = lock_status(status);
-                    let s = &mut *guard;
-                    mark_remaining_timed_out(s, cursor, steps.len(), &message);
-                    refresh_workflow_graph(s, &steps);
-                    s.touch();
-                }
-                write_shared_status(run_paths, status)
-                    .await
-                    .map_err(SubagentError::Spawn)?;
-                // Fail the whole subtree, not just this run — see `background::cascade`.
-                cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
-                return Ok(LoopOutcome::TimedOut { results, message });
-            }
-            // Same idempotent absorption the interrupt branch below documents: a watch
-            // notification with nothing actually pending clears the flag rather than looping.
-            timed_out.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        // R-SA-084: check interrupted FIRST, before consuming appends or dispatching further
-        // work — an interrupt that lands must stop new-step dispatch as soon as this loop next
-        // observes it, not after one more (possibly append-extended) step has already started.
-        //
-        // Race guard (found in second-pass adversarial review): a natural completion and an
-        // interrupt delivery can land in the same instant — `interrupt()` reads `status.json` and
-        // sees `state: Running` (which stays true right up until `finish_run` writes the terminal
-        // record), so it can successfully write a control-inbox request and set `interrupted` in
-        // the tiny window AFTER this loop's last step already finished (`cursor` already advanced
-        // past the final index) but BEFORE this loop's next top-of-iteration check. Without the
-        // `cursor < steps.len()` guard below, that late, moot interrupt would still be consumed
-        // and reported as `LoopOutcome::Interrupted`, downgrading a run whose every step actually
-        // completed into a non-terminal `Paused` `ResultFile` (`success: false`) with no step left
-        // to resume from — a permanently-wrong terminal record, since nothing ever reconciles a
-        // `Paused` run back to `Complete` after the fact. Only treat the interrupt as a genuine
-        // pause when there is still unstarted/unfinished step work for it to actually pause;
-        // otherwise silently absorb it (matching R-SA-083's own "duplicate/stale signal MUST be
-        // silently absorbed" idempotency principle, applied here to a signal that is stale relative
-        // to the run's own already-finished work rather than stale relative to a prior consumption)
-        // and let the loop fall through to its normal `Completed` exit on this same iteration.
-        if interrupted.load(std::sync::atomic::Ordering::SeqCst) && cursor < steps.len() {
-            if let Some(request) = control::consume_interrupt_request(run_paths).await? {
-                {
-                    let mut guard = lock_status(status);
-                    let s = &mut *guard;
-                    mark_remaining_paused(s, cursor, steps.len());
-                    refresh_workflow_graph(s, &steps);
-                    s.touch();
-                }
-                write_shared_status(run_paths, status)
-                    .await
-                    .map_err(SubagentError::Spawn)?;
-                let _ = request; // consumed; contents already reflected via status/event log.
-                // R-SA-084 stops THIS run; without the cascade every background run this one
-                // spawned would keep running, detached and unreachable — see `background::cascade`.
-                cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
-                return Ok(LoopOutcome::Interrupted { results });
-            }
-            // The watcher observed a notification but a synchronous re-check found nothing
-            // pending (already consumed by a race, or a stale wake-up) — R-SA-083's idempotent
-            // absorption, restated here: clear the flag and keep going rather than looping forever
-            // treating a one-shot notification as sticky.
-            interrupted.store(false, std::sync::atomic::Ordering::SeqCst);
-        }
-
-        // R-SA-095/096: consume pending append requests EVERY iteration, before checking whether
-        // the step cursor is exhausted — re-scans disk (never trusts the in-memory `steps` list as
-        // the source of truth for what is pending), per R-SA-096's explicit "MUST re-scan disk,
-        // not cache" requirement.
-        let pending = control::list_pending_appends(&run_paths.append_dir).await?;
-        if !pending.is_empty() {
-            for (path, parsed) in pending {
-                if let Some(request) = parsed {
-                    let mut guard = lock_status(status);
-                    append_steps(&mut steps, &mut guard, &request);
-                }
-                // Delete-then-act, at-most-once (R-SA-095: "MUST list, read, and DELETE all
-                // pending request files... and only then extend its own in-loop step list").
-                let _ = tokio::fs::remove_file(&path).await;
-            }
-            let pending_count = control::count_pending_appends(&run_paths.append_dir).await?;
+/// G77 — the stop flag, read at the very top of every loop iteration ahead of the other two.
+///
+/// G77 — STOP is checked before BOTH of the others, matching pi's own inbox-drain order
+/// (`runs/background/control-channel.ts:653-655` @v0.43.0: `consumeStopRequest` → `consumeTimeoutRequest` →
+/// `consumeInterruptRequest`) and `stopRunner`'s mutual-exclusion guard
+/// (`subagent-runner.ts:2955-2986`: `if (stopped || timedOut || interrupted || …) return`). The
+/// order is load-bearing when several land together: a stop outranks a timeout outranks an
+/// interrupt, so the terminal record is always the hardest, least-resumable verdict.
+///
+/// Unlike the interrupt arm below there is no `cursor < steps.len()` moot-signal guard: a
+/// stop that lands after the last step finished still ends the run `Stopped` upstream
+/// (`stopRunner` only checks `statusPayload.state === "running"`, which is still true until
+/// `finish_run` writes the terminal record), and — unlike the interrupt case that guard
+/// exists for — that is not a downgrade to a permanently-wrong non-terminal record: `Stopped`
+/// IS terminal, so nothing is left waiting to be resumed.
+async fn check_stop_flag(
+    io: &mut TurnLoopIo<'_>,
+    steps: &[RunnerStep],
+    cursor: usize,
+    results: &mut Vec<SingleResult>,
+) -> Result<Option<LoopOutcome>, SubagentError> {
+    let config = io.config;
+    let run_paths = io.run_paths;
+    let status = io.status;
+    let events = &mut *io.events;
+    let stopped = &io.flags.stopped;
+    if stopped.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(request) = control::consume_stop_request(run_paths).await? {
+            let message = request
+                .reason
+                .clone()
+                .unwrap_or_else(|| control::STOP_MESSAGE.to_string());
             {
                 let mut guard = lock_status(status);
                 let s = &mut *guard;
-                s.pending_appends = Some(pending_count);
-                s.chain_step_count = Some(steps.len());
-                refresh_workflow_graph(s, &steps);
+                mark_remaining_stopped(s, cursor, steps.len(), &message);
+                refresh_workflow_graph(s, steps);
                 s.touch();
             }
             write_shared_status(run_paths, status)
                 .await
                 .map_err(SubagentError::Spawn)?;
+            // pi `stopNestedAsyncDescendants()` (`subagent-runner.ts:2984`) — stop the whole
+            // subtree, not just this run, or every background run this one spawned keeps going
+            // detached and unreachable after the user asked for it to stop.
+            cascade_to_descendants(config, events, cascade::CascadeVerb::Stop).await;
+            promote_interrupted_results_to_stopped(results, &message);
+            return Ok(Some(LoopOutcome::Stopped {
+                results: std::mem::take(results),
+                message,
+            }));
         }
+        // Same idempotent absorption the other two arms document: a watch notification with
+        // nothing actually pending clears the flag rather than looping.
+        stopped.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(None)
+}
 
-        if cursor >= steps.len() {
-            return Ok(LoopOutcome::Completed { results });
+/// Timeout is checked BEFORE interrupt, matching pi's own inbox-drain order
+/// (`runs/background/control-channel.ts:654-655` @v0.43.0: `if (consumeTimeoutRequest(...)) onTimeout();`
+/// then `if (consumeInterruptRequest(...)) onInterrupt();`). The order is load-bearing when
+/// both land together — an ancestor that timed out cascades a timeout to this run while a
+/// user may simultaneously be interrupting it, and the terminal record must be the harder
+/// of the two verdicts (`Failed`/timed-out, not a resumable `Paused`).
+async fn check_timeout_flag(
+    io: &mut TurnLoopIo<'_>,
+    steps: &[RunnerStep],
+    cursor: usize,
+    results: &mut Vec<SingleResult>,
+) -> Result<Option<LoopOutcome>, SubagentError> {
+    let config = io.config;
+    let run_paths = io.run_paths;
+    let status = io.status;
+    let events = &mut *io.events;
+    let timed_out = &io.flags.timed_out;
+    if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
+        if let Some(request) = control::consume_timeout_request(run_paths).await? {
+            let message = request.reason.clone().unwrap_or_else(|| {
+                timeout_message(config.timeout_ms, &request.source)
+            });
+            {
+                let mut guard = lock_status(status);
+                let s = &mut *guard;
+                mark_remaining_timed_out(s, cursor, steps.len(), &message);
+                refresh_workflow_graph(s, steps);
+                s.touch();
+            }
+            write_shared_status(run_paths, status)
+                .await
+                .map_err(SubagentError::Spawn)?;
+            // Fail the whole subtree, not just this run — see `background::cascade`.
+            cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
+            return Ok(Some(LoopOutcome::TimedOut {
+                results: std::mem::take(results),
+                message,
+            }));
         }
+        // Same idempotent absorption the interrupt branch below documents: a watch
+        // notification with nothing actually pending clears the flag rather than looping.
+        timed_out.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(None)
+}
 
-        let step = steps
-            .get(cursor)
-            .cloned()
-            .ok_or_else(|| SubagentError::Spawn(std::io::Error::other("step cursor out of range")))?;
+/// R-SA-084: check interrupted FIRST, before consuming appends or dispatching further
+/// work — an interrupt that lands must stop new-step dispatch as soon as this loop next
+/// observes it, not after one more (possibly append-extended) step has already started.
+///
+/// Race guard (found in second-pass adversarial review): a natural completion and an
+/// interrupt delivery can land in the same instant — `interrupt()` reads `status.json` and
+/// sees `state: Running` (which stays true right up until `finish_run` writes the terminal
+/// record), so it can successfully write a control-inbox request and set `interrupted` in
+/// the tiny window AFTER this loop's last step already finished (`cursor` already advanced
+/// past the final index) but BEFORE this loop's next top-of-iteration check. Without the
+/// `cursor < steps.len()` guard below, that late, moot interrupt would still be consumed
+/// and reported as `LoopOutcome::Interrupted`, downgrading a run whose every step actually
+/// completed into a non-terminal `Paused` `ResultFile` (`success: false`) with no step left
+/// to resume from — a permanently-wrong terminal record, since nothing ever reconciles a
+/// `Paused` run back to `Complete` after the fact. Only treat the interrupt as a genuine
+/// pause when there is still unstarted/unfinished step work for it to actually pause;
+/// otherwise silently absorb it (matching R-SA-083's own "duplicate/stale signal MUST be
+/// silently absorbed" idempotency principle, applied here to a signal that is stale relative
+/// to the run's own already-finished work rather than stale relative to a prior consumption)
+/// and let the loop fall through to its normal `Completed` exit on this same iteration.
+async fn check_interrupt_flag(
+    io: &mut TurnLoopIo<'_>,
+    steps: &[RunnerStep],
+    cursor: usize,
+    results: &mut Vec<SingleResult>,
+) -> Result<Option<LoopOutcome>, SubagentError> {
+    let config = io.config;
+    let run_paths = io.run_paths;
+    let status = io.status;
+    let events = &mut *io.events;
+    let interrupted = &io.flags.interrupted;
+    if interrupted.load(std::sync::atomic::Ordering::SeqCst) && cursor < steps.len() {
+        if let Some(request) = control::consume_interrupt_request(run_paths).await? {
+            {
+                let mut guard = lock_status(status);
+                let s = &mut *guard;
+                mark_remaining_paused(s, cursor, steps.len());
+                refresh_workflow_graph(s, steps);
+                s.touch();
+            }
+            write_shared_status(run_paths, status)
+                .await
+                .map_err(SubagentError::Spawn)?;
+            let _ = request; // consumed; contents already reflected via status/event log.
+            // R-SA-084 stops THIS run; without the cascade every background run this one
+            // spawned would keep running, detached and unreachable — see `background::cascade`.
+            cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
+            return Ok(Some(LoopOutcome::Interrupted {
+                results: std::mem::take(results),
+            }));
+        }
+        // The watcher observed a notification but a synchronous re-check found nothing
+        // pending (already consumed by a race, or a stale wake-up) — R-SA-083's idempotent
+        // absorption, restated here: clear the flag and keep going rather than looping forever
+        // treating a one-shot notification as sticky.
+        interrupted.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(None)
+}
 
-        // Publish the current flat index BEFORE dispatch so the live-telemetry sink tags this
-        // step's child NDJSON lines with the right index (pi `statusPayload.currentStep = flatIndex`).
-        current_flat_index.store(cursor, std::sync::atomic::Ordering::SeqCst);
-
+/// R-SA-095/096: consume pending append requests EVERY iteration, before checking whether
+/// the step cursor is exhausted — re-scans disk (never trusts the in-memory `steps` list as
+/// the source of truth for what is pending), per R-SA-096's explicit "MUST re-scan disk,
+/// not cache" requirement.
+async fn absorb_pending_appends(
+    io: &mut TurnLoopIo<'_>,
+    steps: &mut Vec<RunnerStep>,
+) -> Result<(), SubagentError> {
+    let run_paths = io.run_paths;
+    let status = io.status;
+    let pending = control::list_pending_appends(&run_paths.append_dir).await?;
+    if !pending.is_empty() {
+        for (path, parsed) in pending {
+            if let Some(request) = parsed {
+                let mut guard = lock_status(status);
+                append_steps(steps, &mut guard, &request);
+            }
+            // Delete-then-act, at-most-once (R-SA-095: "MUST list, read, and DELETE all
+            // pending request files... and only then extend its own in-loop step list").
+            let _ = tokio::fs::remove_file(&path).await;
+        }
+        let pending_count = control::count_pending_appends(&run_paths.append_dir).await?;
         {
             let mut guard = lock_status(status);
             let s = &mut *guard;
-            mark_step_running(s, cursor);
-            s.current_step = Some(cursor);
-            refresh_workflow_graph(s, &steps);
+            s.pending_appends = Some(pending_count);
+            s.chain_step_count = Some(steps.len());
+            refresh_workflow_graph(s, steps);
             s.touch();
         }
         write_shared_status(run_paths, status)
             .await
             .map_err(SubagentError::Spawn)?;
-        append_event(
-            events,
-            "subagent.step.started",
-            Some(serde_json::json!({
-                "runId": config.run_id.as_str(),
-                "stepIndex": cursor,
-                "agent": step_display_agent(&step),
-            })),
-        )
-        .await;
+    }
+    Ok(())
+}
 
-        // R-SA-097 root attachment (chain-root-attachment.ts): an `ImportAsyncRoot` step is NOT
-        // dispatched by spawning a child — it is synthesized by POLLING another already-launched
-        // run's terminal files (mirroring pi's `runSingleStep` short-circuit `if (step.importAsyncRoot)`,
-        // `subagent-runner.ts:1153`). Intercept it here, before the `walk_chain` dispatch, so the
-        // runner "calls the poll" (`control::wait_for_imported_async_root`) rather than routing it
-        // through the `SingleStepExecutor` spawn seam that would (correctly) have no idea how to run
-        // it.
-        if let RunnerStep::ImportAsyncRoot(spec) = &step {
-            let target_run_id = RunId::from_token(spec.run_id.clone());
-            let target_paths =
-                RunPaths::for_run(&spec.async_root, &spec.results_dir, &target_run_id);
-            let imported = control::wait_for_imported_async_root(
-                &target_paths,
-                &spec.run_id,
-                spec.index,
-                &spec.agent,
-                control::ROOT_ATTACHMENT_POLL_INTERVAL,
-            )
-            .await?;
+/// R-SA-097 root attachment (chain-root-attachment.ts): an `ImportAsyncRoot` step is NOT
+/// dispatched by spawning a child — it is synthesized by POLLING another already-launched
+/// run's terminal files (mirroring pi's `runSingleStep` short-circuit `if (step.importAsyncRoot)`,
+/// `subagent-runner.ts:1153`). Intercept it here, before the `walk_chain` dispatch, so the
+/// runner "calls the poll" (`control::wait_for_imported_async_root`) rather than routing it
+/// through the `SingleStepExecutor` spawn seam that would (correctly) have no idea how to run
+/// it.
+async fn run_import_async_root(
+    io: &mut TurnLoopIo<'_>,
+    steps: &[RunnerStep],
+    cursor: usize,
+    step: &RunnerStep,
+    spec: &crate::spawn::chain_graph::ImportAsyncRootSpec,
+    registry: &mut OutputRegistry,
+    results: &mut Vec<SingleResult>,
+) -> Result<(), SubagentError> {
+    let config = io.config;
+    let run_paths = io.run_paths;
+    let status = io.status;
+    let events = &mut *io.events;
+    let target_run_id = RunId::from_token(spec.run_id.clone());
+    let target_paths =
+        RunPaths::for_run(&spec.async_root, &spec.results_dir, &target_run_id);
+    let imported = control::wait_for_imported_async_root(
+        &target_paths,
+        &spec.run_id,
+        spec.index,
+        &spec.agent,
+        control::ROOT_ATTACHMENT_POLL_INTERVAL,
+    )
+    .await?;
 
-            let step_result = StepResult {
-                success: imported.success,
-                structured_output: imported.structured_output.clone(),
-                final_output: Some(imported.output.clone()),
-                error: imported.error.clone(),
-                interrupted: false,
-                // An IMPORTED async root's control events belong to the run that was attached, and
-                // are already recorded on ITS own terminal `ResultFile` — `ImportedAsyncRootResult`
-                // deliberately carries only the identity/output fields
-                // `imported_root_to_single_result` reproduces, so there is nothing to re-attribute
-                // here (matching pi's `runSingleStep`, `subagent-runner.ts:1162-1181`).
-                control_events: Vec::new(),
-                // Same reasoning for the per-child detail fields: an imported root's real exit code
-                // is carried on `ImportedAsyncRootResult` and reproduced by
-                // `imported_root_to_single_result`; an `ImportAsyncRoot` step can never be a
-                // dynamic-fanout child, so no collect record ever reads these.
-                exit_code: None,
-                timed_out: false,
-                saved_output_path: None,
-                artifact_paths: None,
-            };
-            // Register the imported output under its named key (pi's `outputName`/`as`) so a later
-            // `{outputs.name}` reference in this chain resolves to it — a validated structured
-            // output when present, otherwise the imported text (R-SA-053).
-            if let Some(name) = &spec.output {
-                let value = imported
-                    .structured_output
-                    .clone()
-                    .unwrap_or_else(|| serde_json::Value::String(imported.output.clone()));
-                registry.register(name.clone(), value);
-            }
+    let step_result = StepResult {
+        success: imported.success,
+        structured_output: imported.structured_output.clone(),
+        final_output: Some(imported.output.clone()),
+        error: imported.error.clone(),
+        interrupted: false,
+        // An IMPORTED async root's control events belong to the run that was attached, and
+        // are already recorded on ITS own terminal `ResultFile` — `ImportedAsyncRootResult`
+        // deliberately carries only the identity/output fields
+        // `imported_root_to_single_result` reproduces, so there is nothing to re-attribute
+        // here (matching pi's `runSingleStep`, `subagent-runner.ts:1162-1181`).
+        control_events: Vec::new(),
+        // Same reasoning for the per-child detail fields: an imported root's real exit code
+        // is carried on `ImportedAsyncRootResult` and reproduced by
+        // `imported_root_to_single_result`; an `ImportAsyncRoot` step can never be a
+        // dynamic-fanout child, so no collect record ever reads these.
+        exit_code: None,
+        timed_out: false,
+        saved_output_path: None,
+        artifact_paths: None,
+    };
+    // Register the imported output under its named key (pi's `outputName`/`as`) so a later
+    // `{outputs.name}` reference in this chain resolves to it — a validated structured
+    // output when present, otherwise the imported text (R-SA-053).
+    if let Some(name) = &spec.output {
+        let value = imported
+            .structured_output
+            .clone()
+            .unwrap_or_else(|| serde_json::Value::String(imported.output.clone()));
+        registry.register(name.clone(), value);
+    }
 
-            let step_duration_ms;
-            {
-                let mut guard = lock_status(status);
-                let s = &mut *guard;
-                record_step_outcome(s, cursor, &step, &step_result, None);
-                step_duration_ms = step_elapsed_ms(s, cursor);
-                refresh_workflow_graph(s, &steps);
-                s.touch();
-            }
-            append_event(
-                events,
-                if step_result.success {
-                    "subagent.step.completed"
-                } else {
-                    "subagent.step.failed"
-                },
-                Some(serde_json::json!({
-                    "runId": config.run_id.as_str(),
-                    "stepIndex": cursor,
-                    "agent": step_display_agent(&step),
-                    "exitCode": i32::from(!step_result.success),
-                    "durationMs": step_duration_ms,
-                })),
-            )
-            .await;
-            results.push(imported_root_to_single_result(spec, &imported));
-
-            write_shared_status(run_paths, status)
-                .await
-                .map_err(SubagentError::Spawn)?;
-
-            cursor += 1;
-            continue;
-        }
-
-        // Dispatch via the Phase-3 spawn boundary (chain_graph::walk_chain over a ONE-element
-        // graph for this single cursor position — reusing the exact same SingleStep/ParallelGroup/
-        // DynamicGroup dispatch `walk_chain` already implements, rather than re-implementing group
-        // fan-out inline here). `ChainGraph` is a plain `Vec<RunnerStep>` type alias, so the
-        // one-element "graph" is just a fresh one-element `Vec`.
-        let one_step: Vec<RunnerStep> = vec![step.clone()];
-        let (step_results, group_results) =
-            walk_chain(&one_step, &mut registry, &executor, &ctx).await?;
-
-        let step_result = step_results.into_iter().next().ok_or_else(|| {
-            SubagentError::Spawn(std::io::Error::other(
-                "walk_chain produced no result for a single dispatched step",
-            ))
-        })?;
-
-        // R-SA-084 mid-flight interrupt (`subagent-runner.ts:1583-1609`): a step whose child was
-        // signalled and torn down mid-flight (the shared `interrupt_cancel` token this run threaded
-        // into `RunOptions::interrupt` fired) is the pause point — the run ends `Paused`, never
-        // `Complete`, even though an interrupted `run_sync` reports a paused-success (exit 0).
-        let interrupted_mid_flight = step_result.interrupted;
-        let step_duration_ms;
-        {
-            let mut guard = lock_status(status);
-            let s = &mut *guard;
-            record_step_outcome(s, cursor, &step, &step_result, group_results.first());
-            if interrupted_mid_flight {
-                // `record_step_outcome` marked this step `Complete` (paused-success exits 0);
-                // override it (and every not-yet-run later step) to `Paused` per R-SA-084.
-                if let Some(entry) = s.steps.get_mut(cursor) {
-                    entry.status = StepState::Paused;
-                    entry.error = None;
-                }
-                mark_remaining_paused(s, cursor + 1, steps.len());
-            }
-            step_duration_ms = step_elapsed_ms(s, cursor);
-            refresh_workflow_graph(s, &steps);
-            s.touch();
-        }
-        let event_type = if interrupted_mid_flight {
-            "subagent.step.paused"
-        } else if step_result.success {
+    let step_duration_ms;
+    {
+        let mut guard = lock_status(status);
+        let s = &mut *guard;
+        record_step_outcome(s, cursor, step, &step_result, None);
+        step_duration_ms = step_elapsed_ms(s, cursor);
+        refresh_workflow_graph(s, steps);
+        s.touch();
+    }
+    append_event(
+        events,
+        if step_result.success {
             "subagent.step.completed"
         } else {
             "subagent.step.failed"
-        };
-        append_event(
-            events,
-            event_type,
-            Some(serde_json::json!({
-                "runId": config.run_id.as_str(),
-                "stepIndex": cursor,
-                "agent": step_display_agent(&step),
-                "exitCode": if interrupted_mid_flight { 0 } else { i32::from(!step_result.success) },
-                "durationMs": step_duration_ms,
-            })),
-        )
-        .await;
-        results.push(step_result_to_single_result(&step, &step_result));
+        },
+        Some(serde_json::json!({
+            "runId": config.run_id.as_str(),
+            "stepIndex": cursor,
+            "agent": step_display_agent(step),
+            "exitCode": i32::from(!step_result.success),
+            "durationMs": step_duration_ms,
+        })),
+    )
+    .await;
+    results.push(imported_root_to_single_result(spec, &imported));
 
+    write_shared_status(run_paths, status)
+        .await
+        .map_err(SubagentError::Spawn)?;
+
+
+    Ok(())
+}
+
+/// R-SA-084 mid-flight interrupt (`subagent-runner.ts:1583-1609`): a step whose child was
+/// signalled and torn down mid-flight (the shared `interrupt_cancel` token this run threaded
+/// into `RunOptions::interrupt` fired) is the pause point — the run ends `Paused`, never
+/// `Complete`, even though an interrupted `run_sync` reports a paused-success (exit 0).
+async fn settle_step_result(
+    io: &mut TurnLoopIo<'_>,
+    steps: &[RunnerStep],
+    cursor: usize,
+    step: RunnerStep,
+    step_result: StepResult,
+    group_results: Vec<crate::spawn::chain_graph::GroupStepResult>,
+    results: &mut Vec<SingleResult>,
+) -> Result<StepDisposition, SubagentError> {
+    let config = io.config;
+    let run_paths = io.run_paths;
+    let status = io.status;
+    let events = &mut *io.events;
+    let interrupted_mid_flight = step_result.interrupted;
+    let step_duration_ms;
+    {
+        let mut guard = lock_status(status);
+        let s = &mut *guard;
+        record_step_outcome(s, cursor, &step, &step_result, group_results.first());
+        if interrupted_mid_flight {
+            // `record_step_outcome` marked this step `Complete` (paused-success exits 0);
+            // override it (and every not-yet-run later step) to `Paused` per R-SA-084.
+            if let Some(entry) = s.steps.get_mut(cursor) {
+                entry.status = StepState::Paused;
+                entry.error = None;
+            }
+            mark_remaining_paused(s, cursor + 1, steps.len());
+        }
+        step_duration_ms = step_elapsed_ms(s, cursor);
+        refresh_workflow_graph(s, steps);
+        s.touch();
+    }
+    let event_type = if interrupted_mid_flight {
+        "subagent.step.paused"
+    } else if step_result.success {
+        "subagent.step.completed"
+    } else {
+        "subagent.step.failed"
+    };
+    append_event(
+        events,
+        event_type,
+        Some(serde_json::json!({
+            "runId": config.run_id.as_str(),
+            "stepIndex": cursor,
+            "agent": step_display_agent(&step),
+            "exitCode": if interrupted_mid_flight { 0 } else { i32::from(!step_result.success) },
+            "durationMs": step_duration_ms,
+        })),
+    )
+    .await;
+    results.push(step_result_to_single_result(&step, &step_result));
+
+    write_shared_status(run_paths, status)
+        .await
+        .map_err(SubagentError::Spawn)?;
+
+    if interrupted_mid_flight {
+        // Disambiguate WHICH verb tore this child down. Both share one cancellation token, so
+        // `step_result.interrupted` is true for a timeout too — and returning `Interrupted`
+        // here would end a timed-out run as a resumable `Paused`, silently swallowing the
+        // deadline. A still-pending `control/timeout.json` means it was the timeout: fall
+        // through to the top of the loop WITHOUT advancing the cursor and let the timeout
+        // branch there produce the terminal record (it re-marks this same step `Failed`,
+        // overwriting the `Paused` marking just applied, since `Paused` is not terminal).
+        // Checked against the file rather than the flag so a stale flag can never spin this
+        // loop: only this branch's own consumption removes the file.
+        //
+        // G77: the STOP inbox is probed before the timeout inbox, for the identical reason and
+        // in pi's identical order (`runs/background/control-channel.ts:653-655`). All THREE verbs share the one
+        // cancellation token, so `step_result.interrupted` is equally true for a stop — and
+        // returning `Interrupted` here would end an explicitly-stopped run as a resumable
+        // `Paused`, which is exactly the bug this gap is about. Falling through without
+        // advancing the cursor lets the loop-top stop branch produce the terminal record; it
+        // re-marks this same step `Stopped`, overwriting the `Paused` marking just applied,
+        // because `Paused` is not terminal.
+        if control::check_stop_inbox_now(run_paths).await?.is_some() {
+            return Ok(StepDisposition::Requeue);
+        }
+        if control::check_timeout_inbox_now(run_paths).await?.is_some() {
+            return Ok(StepDisposition::Requeue);
+        }
+        // Consume the interrupt request file (idempotent) so it is not left dangling on the run
+        // dir, then end the run `Paused` — the child was already torn down mid-flight.
+        let _ = control::consume_interrupt_request(run_paths).await;
+        cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
+        return Ok(StepDisposition::Finish(LoopOutcome::Interrupted {
+            results: std::mem::take(results),
+        }));
+    }
+
+    // A step whose child was killed by the wall clock means the RUN-WIDE deadline
+    // (`config.deadline_at_ms`, converted to `ctx.deadline_at` once above) has passed — it is
+    // not a per-step budget, so every remaining step would be born already over its deadline.
+    // pi ends the whole run here (`timeoutRunner` marks the run `failed`/`timedOut` and fails
+    // every still-running-or-pending step, `subagent-runner.ts:2029-2062` @v0.34.0) rather than
+    // marching the cursor through steps that cannot succeed. This is the ORIGIN of the timeout
+    // cascade: the run whose own deadline expired is what turns a bounded background run into
+    // a bounded background SUBTREE.
+    if step_result.timed_out {
+        let message = timeout_message(config.timeout_ms, "deadline");
+        {
+            let mut guard = lock_status(status);
+            let s = &mut *guard;
+            mark_remaining_timed_out(s, cursor + 1, steps.len(), &message);
+            refresh_workflow_graph(s, steps);
+            s.touch();
+        }
         write_shared_status(run_paths, status)
             .await
             .map_err(SubagentError::Spawn)?;
-
-        if interrupted_mid_flight {
-            // Disambiguate WHICH verb tore this child down. Both share one cancellation token, so
-            // `step_result.interrupted` is true for a timeout too — and returning `Interrupted`
-            // here would end a timed-out run as a resumable `Paused`, silently swallowing the
-            // deadline. A still-pending `control/timeout.json` means it was the timeout: fall
-            // through to the top of the loop WITHOUT advancing the cursor and let the timeout
-            // branch there produce the terminal record (it re-marks this same step `Failed`,
-            // overwriting the `Paused` marking just applied, since `Paused` is not terminal).
-            // Checked against the file rather than the flag so a stale flag can never spin this
-            // loop: only this branch's own consumption removes the file.
-            //
-            // G77: the STOP inbox is probed before the timeout inbox, for the identical reason and
-            // in pi's identical order (`runs/background/control-channel.ts:653-655`). All THREE verbs share the one
-            // cancellation token, so `step_result.interrupted` is equally true for a stop — and
-            // returning `Interrupted` here would end an explicitly-stopped run as a resumable
-            // `Paused`, which is exactly the bug this gap is about. Falling through without
-            // advancing the cursor lets the loop-top stop branch produce the terminal record; it
-            // re-marks this same step `Stopped`, overwriting the `Paused` marking just applied,
-            // because `Paused` is not terminal.
-            if control::check_stop_inbox_now(run_paths).await?.is_some() {
-                continue;
-            }
-            if control::check_timeout_inbox_now(run_paths).await?.is_some() {
-                continue;
-            }
-            // Consume the interrupt request file (idempotent) so it is not left dangling on the run
-            // dir, then end the run `Paused` — the child was already torn down mid-flight.
-            let _ = control::consume_interrupt_request(run_paths).await;
-            cascade_to_descendants(config, events, cascade::CascadeVerb::Interrupt).await;
-            return Ok(LoopOutcome::Interrupted { results });
-        }
-
-        // A step whose child was killed by the wall clock means the RUN-WIDE deadline
-        // (`config.deadline_at_ms`, converted to `ctx.deadline_at` once above) has passed — it is
-        // not a per-step budget, so every remaining step would be born already over its deadline.
-        // pi ends the whole run here (`timeoutRunner` marks the run `failed`/`timedOut` and fails
-        // every still-running-or-pending step, `subagent-runner.ts:2029-2062` @v0.34.0) rather than
-        // marching the cursor through steps that cannot succeed. This is the ORIGIN of the timeout
-        // cascade: the run whose own deadline expired is what turns a bounded background run into
-        // a bounded background SUBTREE.
-        if step_result.timed_out {
-            let message = timeout_message(config.timeout_ms, "deadline");
-            {
-                let mut guard = lock_status(status);
-                let s = &mut *guard;
-                mark_remaining_timed_out(s, cursor + 1, steps.len(), &message);
-                refresh_workflow_graph(s, &steps);
-                s.touch();
-            }
-            write_shared_status(run_paths, status)
-                .await
-                .map_err(SubagentError::Spawn)?;
-            cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
-            return Ok(LoopOutcome::TimedOut { results, message });
-        }
-
-        cursor += 1;
+        cascade_to_descendants(config, events, cascade::CascadeVerb::Timeout).await;
+        return Ok(StepDisposition::Finish(LoopOutcome::TimedOut {
+            results: std::mem::take(results),
+            message,
+        }));
     }
+
+    Ok(StepDisposition::Advance)
 }
 
 /// Mark every step from `from_index` (inclusive) through `total` as `Paused` with an end
@@ -2223,6 +2483,22 @@ pub(crate) struct ExecSingleStepExecutor {
     pub(crate) run_dir: Option<PathBuf>,
 }
 
+/// The execution-ready dispatch inputs [`ExecSingleStepExecutor::build_step_agent_config`] lowers a
+/// [`SingleStepSpec`] to: the persona-derived [`AgentConfig`] `exec::run_sync` runs, plus the three
+/// [`RunOptions`] fields that same lowering decides.
+struct StepAgentSetup {
+    /// The persona's execution-ready config, stamped with this process's own depth envelope and
+    /// with the step's `tools` / `max_depth_override` overrides applied.
+    agent: AgentConfig,
+    /// The union the availability filter selects from — the persona's fallback ladder + its own
+    /// model + any per-step override + (when inheriting) the parent session model.
+    available_models: Vec<cyrup_core::ModelId>,
+    /// The resolved override the candidate ladder puts first, past the SUBA-003 scope gate.
+    model_override: crate::exec::fallback::ModelOverride,
+    /// This step's own lowered acceptance contract (SUBA-N04), `None` when it declared none.
+    acceptance: Option<crate::exec::acceptance::AcceptanceContract>,
+}
+
 impl ExecSingleStepExecutor {
     /// Construct one for a FOREGROUND (non-detached-runner) caller: no live interrupt signal
     /// source exists at this call site (a foreground `/chain`/`/parallel`/`/run-chain` slash
@@ -2368,29 +2644,32 @@ impl ExecSingleStepExecutor {
     pub(crate) fn steer_capability_path_for(&self, index: usize) -> Option<PathBuf> {
         self.run_dir.as_deref().map(|run_dir| control::steer_capability_path(run_dir, index))
     }
-}
 
-#[async_trait::async_trait]
-impl SingleStepExecutor for ExecSingleStepExecutor {
-    async fn run_single(
+    /// T0.1 / C13: dispatch the REAL named persona. Every step's agent was resolved to a full
+    /// persona at plan time by the orchestrator (`extension.rs` via
+    /// `exec::resolve_step_agent_config`) and threaded in through `self.resolved_agents` — this
+    /// executor never re-discovers (it has, by design, no discovery dependency). An agent absent
+    /// from the map is dispatched as `Unknown agent: <name>` (a step FAILURE, mirroring pi's
+    /// `agents.find((a) => a.name === seqStep.agent)` miss returning `Unknown agent`,
+    /// `chain-execution.ts:1011-1019` / `execution.ts:898-908`) — never silently downgraded to a
+    /// placeholder persona. This is what makes `## reviewer` in a chain actually run the
+    /// reviewer persona (its own system prompt, model, fallback ladder, tools, and
+    /// completion-guard flag), not an empty-system-prompt / `--model default` / guard-disabled
+    /// stand-in.
+    ///
+    /// `Err` carries the pre-spawn REJECTION this step must report: an unknown agent (above),
+    /// an out-of-scope explicit `model:` (SUBA-003) or a malformed `acceptance` policy
+    /// (SUBA-N04). Each is a step FAILURE rather than a [`SubagentError`], because that is how
+    /// this executor reports every other pre-spawn rejection — keeping the run's own status
+    /// record and the surrounding chain semantics intact. It is BOXED because a `StepResult` is 176
+    /// bytes, which `clippy::result_large_err` (rightly) refuses to widen every `Ok` return of this
+    /// pre-spawn path by for the sake of three cold rejection arms.
+    fn build_step_agent_config(
         &self,
         step: &SingleStepSpec,
-        resolved_task: &str,
-        ctx: &ChainRunContext,
-    ) -> Result<StepResult, SubagentError> {
-        // T0.1 / C13: dispatch the REAL named persona. Every step's agent was resolved to a full
-        // persona at plan time by the orchestrator (`extension.rs` via
-        // `exec::resolve_step_agent_config`) and threaded in through `self.resolved_agents` — this
-        // executor never re-discovers (it has, by design, no discovery dependency). An agent absent
-        // from the map is dispatched as `Unknown agent: <name>` (a step FAILURE, mirroring pi's
-        // `agents.find((a) => a.name === seqStep.agent)` miss returning `Unknown agent`,
-        // `chain-execution.ts:1011-1019` / `execution.ts:898-908`) — never silently downgraded to a
-        // placeholder persona. This is what makes `## reviewer` in a chain actually run the
-        // reviewer persona (its own system prompt, model, fallback ladder, tools, and
-        // completion-guard flag), not an empty-system-prompt / `--model default` / guard-disabled
-        // stand-in.
+    ) -> Result<StepAgentSetup, Box<StepResult>> {
         let Some(persona) = self.resolved_agents.get(&step.agent) else {
-            return Ok(StepResult::failure(format!("Unknown agent: {}", step.agent)));
+            return Err(Box::new(StepResult::failure(format!("Unknown agent: {}", step.agent))));
         };
 
         // Reconstitute the execution-ready config from the persona, stamping THIS process's own
@@ -2439,7 +2718,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             self.model_scope.as_ref(),
         ) {
             Ok(resolved) => resolved,
-            Err(violation) => return Ok(StepResult::failure(violation.message)),
+            Err(violation) => return Err(Box::new(StepResult::failure(violation.message))),
         };
 
         // SUBA-N04: lower THIS step's declared acceptance contract (pi `chain-execution.ts:400`
@@ -2472,15 +2751,42 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             Some(raw) => match crate::exec::acceptance::lower_acceptance_input(raw) {
                 Ok(contract) => contract,
                 Err(message) => {
-                    return Ok(StepResult::failure(format!(
+                    return Err(Box::new(StepResult::failure(format!(
                         "subagent step '{}' has an invalid acceptance policy: {message}",
                         step.agent
-                    )));
+                    ))));
                 }
             },
             None => None,
         };
 
+        Ok(StepAgentSetup { agent, available_models, model_override, acceptance })
+    }
+
+    /// Lower this step's spec and the chain-run context into the [`RunOptions`] `exec::run_sync`
+    /// consumes, together with the four per-dispatch inputs that exist only for the duration of one
+    /// dispatch and have nowhere else to live: the run-wide interrupt token, the live-telemetry
+    /// sink, the fork context, and the step's effective cwd (from which its `output` path is
+    /// resolved).
+    ///
+    /// The model ladder and the acceptance contract are passed in rather than re-derived here:
+    /// [`Self::build_step_agent_config`] decides them, and its two fail-closed gates have to have
+    /// run before any of this.
+    ///
+    /// Deliberately NOT shared with the SINGLE path's own `RunOptions` literal
+    /// (`extension::executor::foreground::run_foreground_impl`): that one is assembled on a
+    /// different type, from a different input set (the tool call's `overrides`, a live
+    /// `ClarifyDispatch`, a control-notice sink, `steer_*: None`), and the two agree on the struct
+    /// alone — a shared builder would have to reproduce both field-by-field with nothing left in
+    /// common.
+    fn build_step_run_options(
+        &self,
+        step: &SingleStepSpec,
+        ctx: &ChainRunContext,
+        available_models: Vec<cyrup_core::ModelId>,
+        model_override: crate::exec::fallback::ModelOverride,
+        acceptance: Option<crate::exec::acceptance::AcceptanceContract>,
+    ) -> RunOptions {
         // R-SA-084 mid-flight interrupt (C, `subagent-runner.ts:1333,2002-2005,2069` @v0.34.0): clone the
         // run-wide SHARED interrupt token so an interrupt landing WHILE this child is running (the
         // control-inbox watcher cancels `self.interrupt_cancel`) actually tears the child down via
@@ -2530,7 +2836,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
                 effective_cwd.join(candidate)
             }
         });
-        let opts = RunOptions {
+        RunOptions {
             // SUBA-021 — the RUN-level usage budget applied per step, exactly as `turn_budget`
             // below is (pi applies one `AsyncExecutionParams.usageBudget` across the whole run
             // rather than giving each step a fresh one).
@@ -2553,7 +2859,7 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             timeout_ms: ctx.timeout_ms,
             // SUBA-003: carried into `run_sync` so this step's fallback ladder warns on out-of-scope
             // entries, the same way the foreground single-run path does. The step's explicit
-            // `model:` was already hard-gated above.
+            // `model:` was already hard-gated by `build_step_agent_config`.
             model_scope: self.model_scope.clone(),
             output_path,
             output_mode: step
@@ -2585,10 +2891,10 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // SUBA-N03 — this step's own SKILL override (pi's runner-step `skills`,
             // `subagent-runner.ts:872` ← `async-execution.ts:990`). `run_sync` applies pi's
             // `opts.skills ?? agent.skills` fallthrough, so `None` still defers to the resolved
-            // persona's own `skills:` list (carried on the `AgentConfig` built above) and
-            // `Some(vec![])` is the explicit `skill: false` "no skills" form. The orchestrator/
-            // runtime fallback cwd is not threaded through the one-shot runner config, so a
-            // background step resolves skill NAMES against its own step cwd.
+            // persona's own `skills:` list (carried on the `AgentConfig` `build_step_agent_config`
+            // returns) and `Some(vec![])` is the explicit `skill: false` "no skills" form. The
+            // orchestrator/runtime fallback cwd is not threaded through the one-shot runner config,
+            // so a background step resolves skill NAMES against its own step cwd.
             skills: step.skills.clone(),
             runtime_cwd: None,
             // SUBA-N06: the run's `includeProgress`, carried from `RunnerConfig::include_progress`
@@ -2596,7 +2902,8 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             // same progress snapshot the foreground path returns.
             include_progress: self.include_progress,
             agent_scope: step.agent_scope,
-            // SUBA-N04: the step's own lowered contract (resolved above), NOT a hard `None`.
+            // SUBA-N04: the step's own lowered contract (resolved by `build_step_agent_config`),
+            // NOT a hard `None`.
             acceptance,
             fork_context,
             live_events,
@@ -2677,49 +2984,57 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
                 .artifacts_dir
                 .clone()
                 .filter(|_| self.artifact_config.enabled),
-        };
+        }
+    }
 
-        // SUBA-N03 / T6 on the SECOND hop — pi `runs/background/subagent-runner.ts:877-889`
-        // @v0.34.0: the artifact quadruple is written by the ASYNC runner too, not only by the
-        // foreground path, and its `_input.md` is written BEFORE the child spawns (`:882-885`,
-        // `mkdirSync` then `writeFileSync(inputPath, …)`) precisely so a child that crashes still
-        // leaves a record of what it was asked to do. The gate is pi's own two-term one:
-        // `ctx.artifactsDir && ctx.artifactConfig?.enabled !== false` (`:879`) — an absent dir is
-        // exactly as disabling as `enabled: false`, which is how the SINGLE-mode `artifacts: false`
-        // param reaches this hop.
-        //
-        // Best-effort throughout: a failed artifact write must never alter the `StepResult` the
-        // walker observes, matching pi (whose artifact writes are un-guarded side-effects) and the
-        // foreground path's identical convention.
-        //
-        // Index: pi passes the step's own index into `getArtifactPaths` so a chain's steps do not
-        // overwrite each other's files. `current_flat_index` is the value `run_inner` publishes
-        // immediately before each dispatch — the SAME index `RunOptions::child_index` above uses.
-        let artifact_paths = self.artifacts_dir.as_ref().filter(|_| self.artifact_config.enabled).map(
-            |dir| {
-                let index = self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst);
-                let run_token = self.run_id.as_ref().map_or("run", RunId::as_str).to_string();
-                let paths =
-                    crate::artifacts::artifact_paths(dir, &run_token, &step.agent, Some(index));
-                let _ = crate::artifacts::ensure_artifacts_dir(dir);
-                if self.artifact_config.include_input {
-                    let _ = crate::artifacts::write_artifact(
-                        &paths.input_path,
-                        &format!("# Task for {}\n\n{resolved_task}", step.agent),
-                    );
-                }
-                (paths, run_token)
-            },
-        );
+    /// SUBA-N03 / T6 on the SECOND hop — pi `runs/background/subagent-runner.ts:877-889`
+    /// @v0.34.0: the artifact quadruple is written by the ASYNC runner too, not only by the
+    /// foreground path, and its `_input.md` is written BEFORE the child spawns (`:882-885`,
+    /// `mkdirSync` then `writeFileSync(inputPath, …)`) precisely so a child that crashes still
+    /// leaves a record of what it was asked to do. The gate is pi's own two-term one:
+    /// `ctx.artifactsDir && ctx.artifactConfig?.enabled !== false` (`:879`) — an absent dir is
+    /// exactly as disabling as `enabled: false`, which is how the SINGLE-mode `artifacts: false`
+    /// param reaches this hop.
+    ///
+    /// Best-effort throughout: a failed artifact write must never alter the `StepResult` the
+    /// walker observes, matching pi (whose artifact writes are un-guarded side-effects) and the
+    /// foreground path's identical convention.
+    ///
+    /// Index: pi passes the step's own index into `getArtifactPaths` so a chain's steps do not
+    /// overwrite each other's files. `current_flat_index` is the value `run_inner` publishes
+    /// immediately before each dispatch — the SAME index `RunOptions::child_index` uses.
+    fn write_step_input_artifact(
+        &self,
+        step: &SingleStepSpec,
+        resolved_task: &str,
+    ) -> Option<(crate::artifacts::ArtifactPaths, String)> {
+        self.artifacts_dir.as_ref().filter(|_| self.artifact_config.enabled).map(|dir| {
+            let index = self.current_flat_index.load(std::sync::atomic::Ordering::SeqCst);
+            let run_token = self.run_id.as_ref().map_or("run", RunId::as_str).to_string();
+            let paths =
+                crate::artifacts::artifact_paths(dir, &run_token, &step.agent, Some(index));
+            let _ = crate::artifacts::ensure_artifacts_dir(dir);
+            if self.artifact_config.include_input {
+                let _ = crate::artifacts::write_artifact(
+                    &paths.input_path,
+                    &format!("# Task for {}\n\n{resolved_task}", step.agent),
+                );
+            }
+            (paths, run_token)
+        })
+    }
 
-        let result = exec::run_sync(&agent, resolved_task, &opts).await;
-
-        // SUBA-N03 / T6: the after-run half (pi `subagent-runner.ts:1117-1134` — `_output.md`,
-        // `_meta.json`, and this crate's reconstructed `.jsonl`). Shares ONE implementation with
-        // the foreground path via `artifacts::run_artifact_metadata`/`run_artifact_jsonl_lines`,
-        // so an async run's artifacts are byte-shaped identically to a foreground run's rather
-        // than being a second, drifting hand-rolled emitter.
-        if let Some((paths, run_token)) = &artifact_paths {
+    /// SUBA-N03 / T6: the after-run half (pi `subagent-runner.ts:1117-1134` — `_output.md`,
+    /// `_meta.json`, and this crate's reconstructed `.jsonl`). Shares ONE implementation with
+    /// the foreground path via `artifacts::run_artifact_metadata`/`run_artifact_jsonl_lines`,
+    /// so an async run's artifacts are byte-shaped identically to a foreground run's rather
+    /// than being a second, drifting hand-rolled emitter.
+    fn write_step_result_artifacts(
+        &self,
+        artifact_paths: Option<&(crate::artifacts::ArtifactPaths, String)>,
+        result: &SingleResult,
+    ) {
+        if let Some((paths, run_token)) = artifact_paths {
             if self.artifact_config.include_output {
                 let _ = crate::artifacts::write_artifact(
                     &paths.output_path,
@@ -2729,53 +3044,85 @@ impl SingleStepExecutor for ExecSingleStepExecutor {
             if self.artifact_config.include_metadata {
                 let _ = crate::artifacts::write_metadata(
                     &paths.metadata_path,
-                    &crate::artifacts::run_artifact_metadata(run_token, &result),
+                    &crate::artifacts::run_artifact_metadata(run_token, result),
                 );
             }
             if self.artifact_config.include_jsonl {
-                for line in crate::artifacts::run_artifact_jsonl_lines(&result) {
+                for line in crate::artifacts::run_artifact_jsonl_lines(result) {
                     let _ = crate::artifacts::append_jsonl(&paths.jsonl_path, &line);
                 }
             }
         }
-
-        // R-SA-084: carry the mid-flight interrupt flag up so `run_inner` treats an interrupted
-        // step as the pause point (`Paused`, not `Complete`). An interrupted `run_sync` reports
-        // `exit_code == 0` (pi's paused-success), so it maps to `StepResult::success` here, with
-        // `interrupted` set from the winning attempt's own flag.
-        let mut step_result = if result.exit_code == 0 {
-            StepResult::success(result.final_output, result.structured_output)
-        } else {
-            StepResult::failure(result.error.unwrap_or_else(|| {
-                format!("subagent step '{}' exited with code {}", agent.name, result.exit_code)
-            }))
-        };
-        step_result.interrupted = result.interrupted;
-        // Carry the per-child detail pi's `collectDynamicResults` copies verbatim onto a dynamic
-        // fan-out's collect records (`runs/shared/dynamic-fanout.ts:278-284` @v0.34.0). All four
-        // are known HERE and nowhere upstream of here: the walker sees only `StepResult`, so
-        // without this hop a timed-out child is indistinguishable from an ordinary failure, every
-        // failure reports exactly `1` rather than its real code, and a later chain step cannot
-        // locate the files its fanned-out siblings wrote.
-        step_result.exit_code = Some(result.exit_code);
-        step_result.timed_out = result.timed_out;
-        step_result.saved_output_path = result.saved_output_path;
-        // pi stamps `result.artifactPaths` from the quadruple it computed for this same step
-        // (`runs/foreground/execution.ts:1114`, gated on the run having an artifacts dir at all).
-        // `artifact_paths` above is precisely that quadruple, under precisely pi's gate
-        // (`artifactsDir && artifactConfig?.enabled !== false`), so reuse it rather than
-        // recomputing — a second `artifact_paths()` call would have to re-read `current_flat_index`
-        // after it has already advanced.
-        step_result.artifact_paths = artifact_paths
-            .as_ref()
-            .and_then(|(paths, _)| serde_json::to_value(paths).ok());
-        // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
-        // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
-        // hop the whole async control path is inert: the thresholds are honoured, the events are
-        // raised, and then they die here.
-        step_result.control_events = result.control_events;
-        Ok(step_result)
     }
+}
+
+#[async_trait::async_trait]
+impl SingleStepExecutor for ExecSingleStepExecutor {
+    async fn run_single(
+        &self,
+        step: &SingleStepSpec,
+        resolved_task: &str,
+        ctx: &ChainRunContext,
+    ) -> Result<StepResult, SubagentError> {
+        let StepAgentSetup { agent, available_models, model_override, acceptance } =
+            match self.build_step_agent_config(step) {
+                Ok(setup) => setup,
+                Err(rejection) => return Ok(*rejection),
+            };
+
+        let opts =
+            self.build_step_run_options(step, ctx, available_models, model_override, acceptance);
+
+        let artifact_paths = self.write_step_input_artifact(step, resolved_task);
+
+        let result = exec::run_sync(&agent, resolved_task, &opts).await;
+
+        self.write_step_result_artifacts(artifact_paths.as_ref(), &result);
+
+        Ok(build_step_result(&agent.name, result, artifact_paths.as_ref()))
+    }
+}
+
+/// R-SA-084: carry the mid-flight interrupt flag up so `run_inner` treats an interrupted
+/// step as the pause point (`Paused`, not `Complete`). An interrupted `run_sync` reports
+/// `exit_code == 0` (pi's paused-success), so it maps to `StepResult::success` here, with
+/// `interrupted` set from the winning attempt's own flag.
+fn build_step_result(
+    agent_name: &str,
+    result: SingleResult,
+    artifact_paths: Option<&(crate::artifacts::ArtifactPaths, String)>,
+) -> StepResult {
+    let mut step_result = if result.exit_code == 0 {
+        StepResult::success(result.final_output, result.structured_output)
+    } else {
+        StepResult::failure(result.error.unwrap_or_else(|| {
+            format!("subagent step '{}' exited with code {}", agent_name, result.exit_code)
+        }))
+    };
+    step_result.interrupted = result.interrupted;
+    // Carry the per-child detail pi's `collectDynamicResults` copies verbatim onto a dynamic
+    // fan-out's collect records (`runs/shared/dynamic-fanout.ts:278-284` @v0.34.0). All four
+    // are known HERE and nowhere upstream of here: the walker sees only `StepResult`, so
+    // without this hop a timed-out child is indistinguishable from an ordinary failure, every
+    // failure reports exactly `1` rather than its real code, and a later chain step cannot
+    // locate the files its fanned-out siblings wrote.
+    step_result.exit_code = Some(result.exit_code);
+    step_result.timed_out = result.timed_out;
+    step_result.saved_output_path = result.saved_output_path;
+    // pi stamps `result.artifactPaths` from the quadruple it computed for this same step
+    // (`runs/foreground/execution.ts:1114`, gated on the run having an artifacts dir at all).
+    // The `artifact_paths` parameter is precisely that quadruple, under precisely pi's gate
+    // (`artifactsDir && artifactConfig?.enabled !== false`), so reuse it rather than
+    // recomputing — a second `artifact_paths()` call would have to re-read `current_flat_index`
+    // after it has already advanced.
+    step_result.artifact_paths =
+        artifact_paths.and_then(|(paths, _)| serde_json::to_value(paths).ok());
+    // SUBA-N05: carry the events this step's control monitor raised out of `run_sync` so
+    // `step_result_to_single_result` can put them on the terminal `ResultFile`. Without this
+    // hop the whole async control path is inert: the thresholds are honoured, the events are
+    // raised, and then they die here.
+    step_result.control_events = result.control_events;
+    step_result
 }
 
 // =================================================================================================

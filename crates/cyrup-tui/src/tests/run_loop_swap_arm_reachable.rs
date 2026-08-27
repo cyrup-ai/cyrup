@@ -28,7 +28,13 @@
 //! `App::run` (which is implemented only for `App<InlineBackend<Stdout>>`), so the `select!` arm
 //! ordering itself has zero behavioural coverage. The guard is structural, the same shape as
 //! `run_loop_input_priority.rs` and `run_loop_draw_coalescing.rs`.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::panic,
+    clippy::string_slice
+)]
 
 /// `run.rs` verbatim, at compile time.
 const APP_SRC: &str = include_str!("../app/run.rs");
