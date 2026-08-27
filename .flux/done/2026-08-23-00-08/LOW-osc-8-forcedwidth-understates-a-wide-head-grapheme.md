@@ -1,10 +1,10 @@
 ---
-stage: exec
-status: in-progress
+stage: qa
+status: completed
 priority: LOW
 tool: all
 source: aug follow-up from the OSC-8 regression-test task
-updated: 2026-08-27 20:36
+updated: 2026-08-27 20:52
 ---
 
 # `osc::inject`'s `ForcedWidth(1)` understates a wide head/tail grapheme
