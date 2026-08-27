@@ -6,6 +6,9 @@
 //! the default is the local backend over tokio fs/process. This is the CANONICAL definition — no
 //! competing `Operations` trait exists.
 
+/// Cancellation pulled into a blocking `std::io::Read` consumer — `pub(crate)` because more
+/// than one tool needs the same sentinel/adapter pair; not part of the public seam.
+pub(crate) mod cancel_read;
 pub mod local;
 pub mod shell;
 

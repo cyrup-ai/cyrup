@@ -3,6 +3,7 @@
 //! and truncation preserve Pi's observable behavior.
 
 use crate::config::GrepOpts;
+use crate::ops::cancel_read::{CancelReader, Cancelled};
 use crate::ops::{FsOps, WalkFlavor, WalkOpts};
 use crate::tools::globmatch::{RgGlob, to_posix};
 use crate::truncate::{GREP_MAX_LINE_LENGTH, TruncOpts, format_size, truncate_head, truncate_line};
@@ -75,6 +76,10 @@ impl GrepTool {
         file: &std::path::Path,
         rel: &str,
         matcher: &grep_regex::RegexMatcher,
+        // Observed at BOTH `await` points below and, via `CancelReader` and `MatchSink`, inside
+        // the blocking search itself. `Err(error::aborted())` here propagates through the `?` at
+        // each call site and out of `execute`, matching Pi's `Operation aborted` rejection.
+        cancel: &CancelToken,
         context: usize,
         limit: usize,
         count: &mut usize,
@@ -90,7 +95,19 @@ impl GrepTool {
         // vendored tarball in the tree was an RSS spike or an OOM kill of the session, on a file
         // that need not match at all. A read failure is skipped, exactly as before: rg simply
         // emits no match events for a file it cannot open.
-        let Ok(reader) = self.fs.read_stream(file).await else {
+        //
+        // A cancel landing while the open is in flight must not wait for the open to finish — a
+        // remote/RPC `FsOps` can park here for a long time. `run_until_cancelled` returns `None`
+        // immediately when the token is ALREADY cancelled (tokio-util 0.7.18
+        // `sync/cancellation_token.rs:280-293`), so this doubles as the entry guard, and otherwise
+        // drops the open future the moment the token fires.
+        //
+        // `None` is an abort; a `Some(Err(_))` is still the pre-existing skip: rg simply emits no
+        // match events for a file it cannot open.
+        let Some(opened) = cancel.run_until_cancelled(self.fs.read_stream(file)).await else {
+            return Err(error::aborted());
+        };
+        let Ok(reader) = opened else {
             return Ok(());
         };
 
@@ -116,25 +133,43 @@ impl GrepTool {
         // every event once `matchCount >= effectiveLimit` (grep.ts:278) — so a file can only ever
         // fill the gap.
         let remaining = limit.saturating_sub(*count);
-        let matches: Vec<(u64, Vec<u8>)> = tokio::task::spawn_blocking(move || {
+        // The token is moved INTO the blocking task rather than polled from outside it: a
+        // `spawn_blocking` task owns an OS thread and cannot be aborted by dropping its
+        // `JoinHandle`, so the only way out of `search_reader` is for the work itself to fail.
+        // Cloning is an `Arc` refcount bump (`CancelToken` is `tokio_util::sync::CancellationToken`,
+        // cyrup-core `cancel.rs:9`).
+        let cancel_task = cancel.clone();
+        let searched: Result<Vec<(u64, Vec<u8>)>, Aborted> = tokio::task::spawn_blocking(move || {
             let mut searcher: Searcher = SearcherBuilder::new()
                 .line_number(true)
                 .binary_detection(BinaryDetection::quit(b'\x00'))
                 .build();
             let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
             let mut local = 0usize;
-            {
+            let outcome = {
                 let sink = MatchSink {
                     matches: &mut matches,
                     count: &mut local,
                     limit: remaining,
+                    cancel: cancel_task.clone(),
                 };
-                let _ = searcher.search_reader(&matcher_owned, reader, sink);
+                searcher.search_reader(&matcher_owned, CancelReader::new(reader, cancel_task), sink)
+            };
+            match outcome {
+                // The searcher's error is no longer thrown away wholesale: a cancel marker is an
+                // abort, and EVERY other `io::Error` keeps the previous `let _ = …` semantics —
+                // whatever was collected before the failure stands and the walk moves on, because
+                // rg emits no match events for a file it cannot read.
+                Err(e) if Cancelled::is(&e) => Err(Aborted),
+                _ => Ok(matches),
             }
-            matches
         })
         .await
         .map_err(|e| error::invalid(format!("grep: {e}")))?;
+
+        let Ok(matches) = searched else {
+            return Err(error::aborted());
+        };
 
         if matches.is_empty() {
             return Ok(());
@@ -160,7 +195,14 @@ impl GrepTool {
         // read on both sides, and pi pays it too — but only for a file that ACTUALLY MATCHED and
         // only on the `contextValue > 0` / non-UTF-8 path.
         let src_lines: Option<Vec<String>> = if matches.iter().any(|(_, r)| takes_block(r)) {
-            match self.fs.read(file).await {
+            // This is a WHOLE-FILE read of a file that already matched — on a multi-hundred-MB
+            // candidate it is the second place a cancel could be stranded, so it is raced too.
+            // `Err(_)` stays Pi's `catch { lines = [] }` (grep.ts:212-214); only a `None` — the
+            // token firing — aborts.
+            let Some(read) = cancel.run_until_cancelled(self.fs.read(file)).await else {
+                return Err(error::aborted());
+            };
+            match read {
                 // Pi `getFileLines` folds `\r\n`→`\n` AND lone `\r`→`\n` BEFORE splitting
                 // (grep.ts:211). The matcher numbered lines on raw `\n`, so a file using
                 // lone-`\r` separators yields context blocks that key off these folded segments
@@ -230,6 +272,9 @@ impl GrepTool {
     }
 }
 
+/// The blocking search stopped because the token fired, not because the file ended.
+struct Aborted;
+
 /// Collects the 1-based line number AND the raw bytes of every match in a file, capping the GLOBAL
 /// match count at `limit`. Pi counts each rg `match` event (one per matching line) and stops the
 /// child once `matchCount >= effectiveLimit` (grep.ts:280-292).
@@ -244,12 +289,26 @@ struct MatchSink<'a> {
     matches: &'a mut Vec<(u64, Vec<u8>)>,
     count: &'a mut usize,
     limit: usize,
+    /// The SECOND abort hook, covering the match-DENSE case [`CancelReader`] cannot: one 64 KiB
+    /// refill can fire `matched` thousands of times, and every one of those callbacks runs before
+    /// the searcher asks the reader for another byte. Owned rather than borrowed — the token is an
+    /// `Arc` handle, so the clone is a refcount bump and it keeps the `'a` lifetime tied to the
+    /// caller's buffers alone.
+    cancel: CancelToken,
 }
 
 impl Sink for MatchSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, _s: &Searcher, m: &SinkMatch<'_>) -> Result<bool, std::io::Error> {
+        // NOT `Ok(false)`. That is `search_reader`'s ordinary "stop, you have enough" signal — the
+        // very thing the limit line below uses — and it ends the search SUCCESSFULLY, so the caller
+        // could not distinguish a cancel from a satisfied match budget and would emit a normal
+        // partial result. Pi rejects with `Operation aborted` instead (grep.ts:305-307), so the
+        // cancel has to leave as an `Err` the caller can recognise.
+        if self.cancel.is_cancelled() {
+            return Err(Cancelled::err());
+        }
         // `SinkMatch::bytes` is the matched line INCLUDING its terminator, which is exactly what
         // ripgrep serialises into `data.lines.text` — hence Pi's `.replace(/\n$/,"")` below.
         self.matches
@@ -351,6 +410,7 @@ impl Tool for GrepTool {
                 &search_root,
                 &rel,
                 &matcher,
+                &cancel,
                 context,
                 limit,
                 &mut count,
@@ -392,9 +452,10 @@ impl Tool for GrepTool {
                 if count >= limit {
                     break;
                 }
-                // The `select!` below only observes a cancel while it is parked on `walk.next()`;
-                // one that lands while `search_one` is running is observed here, on the next turn
-                // — the same per-candidate granularity the staged loop had.
+                // The `select!` below observes a cancel while parked on `walk.next()`; one that
+                // lands mid-candidate is observed INSIDE `search_one`, which threads the token
+                // through `CancelReader` and `MatchSink` into the blocking searcher. This check is
+                // the cheap fast path: it skips opening the next candidate at all.
                 if cancel.is_cancelled() {
                     return Err(error::aborted());
                 }
@@ -439,6 +500,7 @@ impl Tool for GrepTool {
                                     &w.path,
                                     &rel,
                                     &matcher,
+                                    &cancel,
                                     context,
                                     limit,
                                     &mut count,
