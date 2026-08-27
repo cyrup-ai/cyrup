@@ -285,7 +285,7 @@ pub(super) fn convert_tool_config(
             let mut spec = Map::new();
             spec.insert("name".to_string(), json!(tool.name));
             spec.insert("description".to_string(), json!(tool.description));
-            // `getJsonSchemaToolParameters(tool, strict)` (`bedrock-converse-stream.ts:1011`
+            // `getJsonSchemaToolParameters(tool, strict)` (`bedrock-converse-stream.ts:1116`
             // @v0.84.2) — the `strict` flag below and the schema must agree.
             spec.insert(
                 "inputSchema".to_string(),

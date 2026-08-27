@@ -30,7 +30,7 @@
 //! reproduced verbatim, because it reaches `AssistantMessage.error_message` on both sides.
 
 use crate::context::{ConstrainedSamplingConfig, StrictSampling, ToolDef};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 use std::collections::HashMap;
 use std::fmt;
 
@@ -169,9 +169,10 @@ fn make_json_schema_node_strict(schema: &mut Value) -> Result<()> {
     if o.get("properties").is_some_and(|p| !p.is_object()) {
         return err("object properties must be a schema map");
     }
-    if o.get("required")
-        .is_some_and(|r| r.as_array().is_none_or(|a| a.iter().any(|k| !k.is_string())))
-    {
+    if o.get("required").is_some_and(|r| {
+        r.as_array()
+            .is_none_or(|a| a.iter().any(|k| !k.is_string()))
+    }) {
         return err("object required must be a string array");
     }
 
@@ -850,7 +851,10 @@ mod tests {
             }
         }))
         .unwrap();
-        assert_eq!(converted["properties"]["a"], json!({ "type": ["string", "null"] }));
+        assert_eq!(
+            converted["properties"]["a"],
+            json!({ "type": ["string", "null"] })
+        );
         assert_eq!(
             converted["properties"]["b"],
             json!({ "anyOf": [{ "type": "string" }, { "type": "null" }] })
@@ -872,7 +876,10 @@ mod tests {
     fn strict_conversion_rejects_everything_outside_the_strict_subset() {
         let cases: [(Value, &str); 8] = [
             (json!(true), "root schema must have type object"),
-            (json!({ "type": "string" }), "root schema must have type object"),
+            (
+                json!({ "type": "string" }),
+                "root schema must have type object",
+            ),
             (
                 json!({ "type": "object", "$ref": "#/$defs/x" }),
                 "$ref schemas are unsupported",
@@ -914,7 +921,9 @@ mod tests {
 
         let require = schema_tool("weird", params, StrictSampling::Require);
         assert_eq!(
-            resolve_json_schema_strict_sampling(&require, true).unwrap_err().0,
+            resolve_json_schema_strict_sampling(&require, true)
+                .unwrap_err()
+                .0,
             "Tool \"weird\" requires JSON-schema constrained sampling, but $ref schemas are unsupported."
         );
     }

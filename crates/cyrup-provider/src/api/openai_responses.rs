@@ -949,7 +949,7 @@ pub(crate) struct ConvertResponsesToolsOptions {
     pub default_strict: Option<bool>,
 }
 
-/// 1:1 port of Pi `convertResponsesTools` (`openai-responses-shared.ts:344-395` @v0.84.2).
+/// 1:1 port of Pi `convertResponsesTools` (`openai-responses-shared.ts:359-395` @v0.84.2).
 ///
 /// PROV-034: the `strict` key is emitted **only** when `supportsStrictMode` (`:376-377`). pi's
 /// function-tool literal is built without it, so a model that does not opt in receives no `strict`

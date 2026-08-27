@@ -967,8 +967,8 @@ mod tests {
                 "timeout": { "type": "number" }
             }
         });
-        let out = validate_tool_call(&bash_schema, json!({ "command": "ls", "timeout": null }))
-            .unwrap();
+        let out =
+            validate_tool_call(&bash_schema, json!({ "command": "ls", "timeout": null })).unwrap();
         assert_eq!(out, json!({ "command": "ls" }));
     }
 

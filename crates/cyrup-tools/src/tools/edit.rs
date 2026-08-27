@@ -697,4 +697,21 @@ mod tests {
             "ALPHA\n"
         );
     }
+    /// PROV-011 DoD 1/2 — the tool's opt-in tracks the experimental flag and nothing else.
+    ///
+    /// Flag-aware by construction: with the flag unset (the default `cargo test` environment) the
+    /// declaration must be ABSENT, and under `CYRUP_EXPERIMENTAL=1` / `PI_EXPERIMENTAL=1` it must
+    /// be pi's `{type:"json_schema", strict:"prefer"}`. Running the suite either way exercises the
+    /// matching branch, and the assertion also pins the tool to
+    /// `cyrup_core::experimental_tool_sampling` rather than to some private copy of the value.
+    #[test]
+    fn edit_declares_constrained_sampling_exactly_when_the_experimental_flag_is_on() {
+        let tool = tool(PathBuf::from("."));
+        let expected = cyrup_core::experimental_tool_sampling_from(|k| std::env::var(k).ok());
+        assert_eq!(tool.constrained_sampling(), expected);
+        assert_eq!(
+            tool.constrained_sampling(),
+            cyrup_core::experimental_tool_sampling()
+        );
+    }
 }
