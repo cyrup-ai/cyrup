@@ -1,10 +1,10 @@
 ---
-stage: exec
-status: done
+stage: qa
+status: in-progress
 priority: MEDIUM
 tool: all
 source: exec follow-up — self-reported by the mutation-lock executor
-updated: 2026-08-27 21:00
+updated: 2026-08-27 21:10
 ---
 
 # The `guard()`-is-first-`.await` guard degrades instead of failing
