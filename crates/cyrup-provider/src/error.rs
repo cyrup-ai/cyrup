@@ -150,6 +150,7 @@ impl ProviderError {
     /// the model-refresh fetch path).
     ///
     /// [`code`]: ProviderError::code
+    #[must_use]
     pub fn reproduce(&self) -> ProviderError {
         match self {
             ProviderError::UnknownProvider(p) => ProviderError::UnknownProvider(p.clone()),

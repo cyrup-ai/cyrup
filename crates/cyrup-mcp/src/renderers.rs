@@ -72,16 +72,17 @@
 //!
 //! # Port units
 //!
-//! Implemented: MCP-220, MCP-221, MCP-222, MCP-223, MCP-226, MCP-227, MCP-228, MCP-229, MCP-230,
-//! MCP-237, MCP-238, MCP-239, MCP-240, MCP-241, MCP-242, MCP-243, MCP-244, MCP-245.
+//! Implemented: MCP-220, MCP-221, MCP-222, MCP-223, MCP-224, MCP-226, MCP-227, MCP-228, MCP-229,
+//! MCP-230, MCP-237, MCP-238, MCP-239, MCP-240, MCP-241, MCP-242, MCP-243, MCP-244, MCP-245.
 //! MCP-225's resolution half already lives in [`crate::config::McpSettings::output_guard`] and is
-//! **reused**, not re-derived. MCP-224 (the cleanup drain's 30 s / 3-attempt retry) is stubbed —
-//! see [`MaterializedResources::cleanup`].
+//! **reused**, not re-derived. MCP-224's 30 s / 3-attempt cleanup drain is
+//! [`MaterializedResources::cleanup`] and the per-session pending-cleanup queue behind it.
 
 use std::collections::HashSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use indexmap::IndexMap;
 use serde::de::{MapAccess, SeqAccess, Visitor};
@@ -115,6 +116,11 @@ const MAX_BINARY_RESOURCE_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_SESSION_RESOURCE_BYTES: u64 = 100 * 1024 * 1024;
 /// `tool-registrar.ts:12` `MAX_SESSION_RESOURCE_FILES` — bounds metadata from tiny resources.
 const MAX_SESSION_RESOURCE_FILES: u64 = 10_000;
+/// `tool-registrar.ts:13` `CLEANUP_RETRY_DELAY_MS` — the single retry timer's delay.
+const CLEANUP_RETRY_DELAY_MS: u64 = 30_000;
+/// `tool-registrar.ts:14` `MAX_CLEANUP_RETRY_ATTEMPTS` — the per-directory ceiling that makes the
+/// retry loop quiesce rather than spin.
+const MAX_CLEANUP_RETRY_ATTEMPTS: u32 = 3;
 
 /// `mcp-output-guard.ts:360` — the `mkdtemp` prefix used for BOTH artifact kinds.
 const OUTPUT_ARTIFACT_DIR_PREFIX: &str = "pi-mcp-output-";
@@ -756,13 +762,21 @@ struct MaterializedSessionState {
 pub struct MaterializedResources {
     state: Mutex<MaterializedSessionState>,
     cancel: Option<cyrup_core::CancelToken>,
+    /// MCP-224's pending-cleanup queue. Behind an `Arc` because the 30 s retry task outlives the
+    /// borrow that scheduled it and must **not** keep the session alive: what has to survive a
+    /// stopped generation is the list of directories still on disk, not the session that made them.
+    pending: Arc<Mutex<PendingCleanup>>,
 }
 
 impl MaterializedResources {
     /// A session fenced by the runtime owner's cancellation token.
     #[must_use]
     pub fn new(cancel: Option<cyrup_core::CancelToken>) -> Self {
-        Self { state: Mutex::new(MaterializedSessionState::default()), cancel }
+        Self {
+            state: Mutex::new(MaterializedSessionState::default()),
+            cancel,
+            pending: Arc::new(Mutex::new(PendingCleanup::default())),
+        }
     }
 
     /// `tool-registrar.ts:31` `defaultMaterializedResourceSession` — the session used when a call
@@ -841,35 +855,228 @@ impl MaterializedResources {
         )
     }
 
-    /// `tool-registrar.ts:104-116` `cleanupMaterializedBinaryResources` — drop the session's
-    /// directory and zero the counters.
+    /// `tool-registrar.ts:105-117` `cleanupMaterializedBinaryResources` (MCP-224) — the session's
+    /// directory joins the pending queue, the counters zero, and the queue drains.
     ///
-    /// TODO(MCP-224): the pending-set drain is not ported. Upstream keeps a module-global
-    /// `pendingCleanupDirectories` with per-directory attempt counters capped at
-    /// `MAX_CLEANUP_RETRY_ATTEMPTS = 3`, a single `CLEANUP_RETRY_DELAY_MS = 30_000` timer guarded by
-    /// "already pending or nothing retryable", and an `AggregateError("Failed to clean materialized
-    /// MCP resources")` on any failure. gap-analysis 13e says the module-global becomes an instance
-    /// field (so two sessions do not share a retry budget) and the timer becomes `tokio::spawn` +
-    /// `tokio::time::sleep` behind an `Option<JoinHandle>`. Until that lands, a directory that
-    /// cannot be removed — a Windows lock, a stale NFS handle — is reported once and then leaked
-    /// rather than retried. MCP-224 is `medium`; the security-relevant half (0700/0600 creation) is
-    /// MCP-223 and is complete above.
+    /// The `scopedMaterializedResourceSessions.delete(scope)` at `:113` has no analog: the session
+    /// is a value the caller owns, not an entry in a scope-keyed `WeakMap`.
+    ///
+    /// Calling it twice is not an error — the second call finds no directory to queue and drains an
+    /// empty queue — which is what makes it safe on both the owner's cleanup stack and a retry.
     ///
     /// # Errors
-    /// The `std::io::Error` from the recursive removal, when one occurred.
+    /// A [`MaterializedCleanupError`] inside `std::io::Error::other` when one or more directories
+    /// could not be removed, *after* the survivors have been retained and a retry scheduled. The
+    /// return type stays `std::io::Error` so every caller keeps its existing conversions; the
+    /// aggregate rides inside it and comes back out through
+    /// `std::io::Error::get_ref` + `downcast_ref`.
     pub fn cleanup(&self) -> Result<(), std::io::Error> {
-        let Ok(mut state) = self.state.lock() else {
+        // A poisoned session lock loses the counters, not the directory: the queue below is a
+        // separate lock and the drain still runs.
+        let directory = match self.state.lock() {
+            Ok(mut state) => {
+                let directory = state.directory.take();
+                state.bytes = 0;
+                state.files = 0;
+                state.sequence = 0;
+                directory
+            }
+            Err(_) => None,
+        };
+        // `if (session?.directory) pendingCleanupDirectories.add(session.directory)` — `or_insert`
+        // rather than `insert` because re-queuing a directory must not refund its attempts, exactly
+        // as `Set.add` leaves `cleanupRetryAttempts` alone.
+        if let Some(directory) = directory
+            && let Ok(mut pending) = self.pending.lock()
+        {
+            pending.directories.entry(directory).or_insert(0);
+        }
+        drain_pending_cleanup(&self.pending, self.cancel.as_ref())
+    }
+}
+
+// --- MCP-224 · the pending-cleanup drain -----------------------------------------------------
+
+/// `tool-registrar.ts:33-35`'s three module-globals — `pendingCleanupDirectories`,
+/// `cleanupRetryAttempts` and `pendingCleanupRetry` — as **per-session** state.
+///
+/// gap-analysis 13e is explicit that the module-global becomes an instance field so two sessions do
+/// not share a retry budget. Upstream can afford one global because a directory belongs to exactly
+/// one `WeakMap`-keyed session and the process holds them all; here a session belongs to one
+/// generation of the runtime, and a generation that stopped must not spend the next one's attempts.
+#[derive(Debug, Default)]
+struct PendingCleanup {
+    /// Upstream's `Set` and its side-car attempt `Map` collapsed into one insertion-ordered map: a
+    /// pending directory **is** a key and `cleanupRetryAttempts.get(dir) ?? 0` is its value. The
+    /// insertion order is what keeps the aggregate's failures in the order the directories queued.
+    directories: IndexMap<PathBuf, u32>,
+    /// `pendingCleanupRetry` — the one in-flight timer. `Some` is the "already pending" half of
+    /// `schedulePendingCleanupRetry`'s guard, and the task clears it the moment it wakes.
+    retry: Option<tokio::task::JoinHandle<()>>,
+}
+
+/// `tool-registrar.ts:61-66` `hasRetryableCleanupDirectory`.
+///
+/// A directory that has spent its three attempts stays queued — an explicit
+/// [`MaterializedResources::cleanup`] still retries it — but no longer earns a timer, which is what
+/// makes the retry loop quiesce instead of spinning on a genuinely undeletable path.
+fn has_retryable_cleanup_directory(pending: &PendingCleanup) -> bool {
+    pending.directories.values().any(|attempts| *attempts < MAX_CLEANUP_RETRY_ATTEMPTS)
+}
+
+/// `tool-registrar.ts:68-82` `schedulePendingCleanupRetry`.
+///
+/// `setTimeout` becomes `tokio::spawn` + `tokio::time::sleep` behind the `Option<JoinHandle>`
+/// above, and the sleep races the session's owner token for the reason every other timer in this
+/// crate does: a stopped generation must not hold a 30 s sleep — or the queue behind it — open.
+///
+/// `tokio::spawn` panics off-runtime and this crate denies `clippy::panic`, so the handle is taken
+/// through `Handle::try_current()` — the guard [`crate::owner::McpRuntimeOwner::add_cleanup`] takes
+/// for the same reason — **before** the attempt counters are spent, so a drain from outside a
+/// reactor (a test, a sync teardown) costs no attempt and leaves the queue retryable.
+fn schedule_pending_cleanup_retry(
+    shared: &Arc<Mutex<PendingCleanup>>,
+    cancel: Option<&cyrup_core::CancelToken>,
+) {
+    let Ok(mut pending) = shared.lock() else {
+        return;
+    };
+    // `if (pendingCleanupRetry || !hasRetryableCleanupDirectory()) return;`
+    if pending.retry.is_some() || !has_retryable_cleanup_directory(&pending) {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        tracing::debug!(
+            "MCP: materialized-resource cleanup retry not scheduled — no tokio runtime; {} \
+             director(ies) still queued",
+            pending.directories.len()
+        );
+        return;
+    };
+    // `if (attempts < MAX) cleanupRetryAttempts.set(directory, attempts + 1)` — spent at SCHEDULE
+    // time, not at drain time, so a single timer costs every queued directory exactly one attempt.
+    for attempts in pending.directories.values_mut() {
+        if *attempts < MAX_CLEANUP_RETRY_ATTEMPTS {
+            *attempts = attempts.saturating_add(1);
+        }
+    }
+    let queue = Arc::clone(shared);
+    let cancel = cancel.cloned();
+    pending.retry = Some(runtime.spawn(async move {
+        let delay = tokio::time::sleep(Duration::from_millis(CLEANUP_RETRY_DELAY_MS));
+        let fired = match cancel.as_ref() {
+            Some(token) => token.run_until_cancelled(delay).await.is_some(),
+            None => {
+                delay.await;
+                true
+            }
+        };
+        // `pendingCleanupRetry = undefined` — the callback's first statement, so the drain below is
+        // free to schedule the next one. A cancelled owner clears the slot too, and stops here.
+        if let Ok(mut pending) = queue.lock() {
+            pending.retry = None;
+        }
+        if !fired {
+            return;
+        }
+        if let Err(err) = drain_pending_cleanup(&queue, cancel.as_ref()) {
+            // Upstream's empty `catch`: the drain has already retained the paths and rescheduled.
+            tracing::debug!("MCP: materialized-resource cleanup retry failed: {err}");
+        }
+    }));
+}
+
+/// `tool-registrar.ts:84-103` `drainPendingCleanupDirectories`.
+///
+/// # Errors
+/// A [`MaterializedCleanupError`] inside `std::io::Error::other` listing every removal that
+/// failed — thrown, as upstream throws its `AggregateError`, only **after** the next retry is
+/// scheduled.
+fn drain_pending_cleanup(
+    shared: &Arc<Mutex<PendingCleanup>>,
+    cancel: Option<&cyrup_core::CancelToken>,
+) -> Result<(), std::io::Error> {
+    let mut failures: Vec<std::io::Error> = Vec::new();
+    {
+        // A poisoned queue can no longer say what is pending; dropping the drain beats a panic on
+        // what is always a teardown path.
+        let Ok(mut pending) = shared.lock() else {
             return Ok(());
         };
-        let directory = state.directory.take();
-        state.bytes = 0;
-        state.files = 0;
-        state.sequence = 0;
-        drop(state);
-        match directory {
-            Some(dir) => std::fs::remove_dir_all(dir),
-            None => Ok(()),
+        // `Array.from(pendingCleanupDirectories)` — the snapshot is what lets the map be mutated
+        // while it is walked.
+        let directories: Vec<PathBuf> = pending.directories.keys().cloned().collect();
+        for directory in directories {
+            match remove_directory_forcefully(&directory) {
+                // `pendingCleanupDirectories.delete(d)` + `cleanupRetryAttempts.delete(d)`.
+                Ok(()) => {
+                    pending.directories.shift_remove(&directory);
+                }
+                Err(err) => failures.push(err),
+            }
         }
+        // `if (pendingCleanupDirectories.size === 0 && pendingCleanupRetry) clearTimeout(…)`.
+        if pending.directories.is_empty()
+            && let Some(retry) = pending.retry.take()
+        {
+            retry.abort();
+        }
+    }
+    if failures.is_empty() {
+        return Ok(());
+    }
+    schedule_pending_cleanup_retry(shared, cancel);
+    Err(std::io::Error::other(MaterializedCleanupError { failures }))
+}
+
+/// `rmSync(directory, { recursive: true, force: true })`.
+///
+/// `force` is the load-bearing half: [`std::fs::remove_dir_all`] reports a missing path as
+/// `NotFound` where Node treats it as done, and a temp reaper sweeping the directory between the
+/// failure and the retry is exactly the case that must not burn the remaining attempts.
+fn remove_directory_forcefully(directory: &Path) -> Result<(), std::io::Error> {
+    match std::fs::remove_dir_all(directory) {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
+}
+
+/// `tool-registrar.ts:101` `new AggregateError(failures, "Failed to clean materialized MCP
+/// resources")`.
+///
+/// Rust has no aggregate error and [`std::io::Error`] cannot carry siblings, so the failures ride
+/// in this type inside `std::io::Error::other`: one drain reports **every** directory that could
+/// not be removed, not just the first, and a caller that only wants a message still gets the whole
+/// list through [`std::fmt::Display`].
+#[derive(Debug)]
+pub struct MaterializedCleanupError {
+    failures: Vec<std::io::Error>,
+}
+
+impl MaterializedCleanupError {
+    /// Every removal error from the drain that produced this, in the order the directories queued.
+    #[must_use]
+    pub fn failures(&self) -> &[std::io::Error] {
+        &self.failures
+    }
+}
+
+impl fmt::Display for MaterializedCleanupError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Failed to clean materialized MCP resources")?;
+        for (index, failure) in self.failures.iter().enumerate() {
+            f.write_str(if index == 0 { ": " } else { "; " })?;
+            write!(f, "{failure}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for MaterializedCleanupError {
+    /// The first failure, so `source()` chains reach a real `io::Error`; the rest are in
+    /// [`MaterializedCleanupError::failures`] and in the `Display` above.
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.failures.first().map(|failure| failure as &(dyn std::error::Error + 'static))
     }
 }
 
@@ -2530,6 +2737,144 @@ mod tests {
         assert_eq!(std::fs::read(&path).ok(), Some(b"ABC".to_vec()));
         let _ = session.cleanup();
         assert!(!path.exists());
+    }
+
+    // --- MCP-224: the cleanup drain and its retry ----------------------------------------------
+
+    /// The queued attempt count for `directory`, or `None` when it is no longer queued.
+    fn queued_attempts(session: &MaterializedResources, directory: &Path) -> Option<u32> {
+        session.pending.lock().unwrap().directories.get(directory).copied()
+    }
+
+    fn retry_is_armed(session: &MaterializedResources) -> bool {
+        session.pending.lock().unwrap().retry.is_some()
+    }
+
+    /// A regular file: `remove_dir_all` fails on it with `ENOTDIR` for **every** user, root
+    /// included, which a read-only-parent fixture would not (CI runs as uid 0).
+    fn undeletable_path(holder: &Path) -> PathBuf {
+        let path = holder.join("resource-1.bin");
+        std::fs::write(&path, b"x").unwrap();
+        path
+    }
+
+    fn session_pointing_at(
+        directory: &Path,
+        cancel: Option<cyrup_core::CancelToken>,
+    ) -> MaterializedResources {
+        let session = MaterializedResources::new(cancel);
+        session.state.lock().unwrap().directory = Some(directory.to_path_buf());
+        session
+    }
+
+    #[test]
+    fn cleanup_removes_the_directory_zeroes_the_counters_and_empties_the_queue() {
+        let session = MaterializedResources::new(None);
+        let out = session.materialize(Some("file://a"), None, "QUJD");
+        let path = out
+            .lines()
+            .nth(1)
+            .and_then(|line| line.strip_prefix("Binary content saved to "))
+            .map(PathBuf::from)
+            .unwrap();
+        let directory = path.parent().unwrap().to_path_buf();
+
+        assert!(session.cleanup().is_ok());
+        assert!(!directory.exists());
+        assert!(session.pending.lock().unwrap().directories.is_empty());
+        let state = session.state.lock().unwrap();
+        assert_eq!((state.bytes, state.files, state.sequence), (0, 0, 0));
+        drop(state);
+        // `cleanupMaterializedBinaryResources` is idempotent: nothing to queue, nothing to drain.
+        assert!(session.cleanup().is_ok());
+    }
+
+    #[test]
+    fn a_directory_that_already_vanished_counts_as_cleaned() {
+        // `rmSync(..., { force: true })` — a missing path is done, not a failure, so a temp reaper
+        // between the queue and the drain does not burn an attempt.
+        let gone = std::env::temp_dir()
+            .join(format!("{RESOURCE_DIR_PREFIX}vanished-{}", random_hex(6)));
+        let session = session_pointing_at(&gone, None);
+        assert!(session.cleanup().is_ok());
+        assert_eq!(queued_attempts(&session, &gone), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_undeletable_directory_is_retried_three_times_and_then_quiesces() {
+        let holder = make_private_temp_dir(RESOURCE_DIR_PREFIX).unwrap();
+        let undeletable = undeletable_path(&holder);
+        let session = session_pointing_at(&undeletable, None);
+
+        let error = session.cleanup().unwrap_err();
+        let aggregate = error
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<MaterializedCleanupError>())
+            .unwrap();
+        assert_eq!(aggregate.failures().len(), 1);
+        assert!(
+            error.to_string().starts_with("Failed to clean materialized MCP resources: "),
+            "{error}"
+        );
+        // `schedulePendingCleanupRetry` spends the attempt when it arms the timer, not when the
+        // timer fires, so the first one is already gone.
+        assert_eq!(queued_attempts(&session, &undeletable), Some(1));
+        assert!(retry_is_armed(&session));
+
+        // Three 30 s windows. The third retry finds nothing retryable left and arms no fourth
+        // timer — `MAX_CLEANUP_RETRY_ATTEMPTS` is a ceiling on timers, not on removals.
+        tokio::time::sleep(Duration::from_secs(150)).await;
+        assert_eq!(queued_attempts(&session, &undeletable), Some(3));
+        assert!(!retry_is_armed(&session));
+
+        // Quiescence: five more minutes change nothing, and the path stays queued rather than
+        // being forgotten — an explicit `cleanup` may still succeed later.
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        assert_eq!(queued_attempts(&session, &undeletable), Some(3));
+        assert!(!retry_is_armed(&session));
+
+        std::fs::remove_dir_all(&holder).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stopped_owner_cancels_the_retry_instead_of_waiting_it_out() {
+        let holder = make_private_temp_dir(RESOURCE_DIR_PREFIX).unwrap();
+        let undeletable = undeletable_path(&holder);
+        let token = cyrup_core::CancelToken::new();
+        let session = session_pointing_at(&undeletable, Some(token.clone()));
+
+        assert!(session.cleanup().is_err());
+        assert_eq!(queued_attempts(&session, &undeletable), Some(1));
+        assert!(retry_is_armed(&session));
+
+        token.cancel();
+        tokio::time::sleep(Duration::from_secs(300)).await;
+        // The sleep lost the race: no second attempt was spent and the timer slot is clear, so a
+        // stopped generation neither retries nor holds a 30 s task open.
+        assert_eq!(queued_attempts(&session, &undeletable), Some(1));
+        assert!(!retry_is_armed(&session));
+
+        std::fs::remove_dir_all(&holder).unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_recovered_directory_is_removed_by_the_retry_and_clears_the_queue() {
+        let holder = make_private_temp_dir(RESOURCE_DIR_PREFIX).unwrap();
+        let undeletable = undeletable_path(&holder);
+        let session = session_pointing_at(&undeletable, None);
+        assert!(session.cleanup().is_err());
+
+        // Make the path removable again — the Windows lock released, the NFS handle recovered.
+        std::fs::remove_file(&undeletable).unwrap();
+        std::fs::create_dir(&undeletable).unwrap();
+
+        tokio::time::sleep(Duration::from_secs(45)).await;
+        assert_eq!(queued_attempts(&session, &undeletable), None);
+        assert!(!undeletable.exists());
+        // The queue emptied, so the drain cleared the timer rather than leaving one armed.
+        assert!(!retry_is_armed(&session));
+
+        std::fs::remove_dir_all(&holder).unwrap();
     }
 
     #[test]

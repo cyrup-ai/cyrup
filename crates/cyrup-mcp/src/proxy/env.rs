@@ -2,7 +2,7 @@
 //!
 //! See [`crate::proxy`] for the module overview.
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use indexmap::IndexMap;
 use serde_json::{Map as JsonMap, Value};
@@ -395,20 +395,21 @@ pub trait ProxyEnv: Send + Sync {
 
 /// One generation's proxy-mode context — upstream's `state: McpExtensionState` parameter.
 ///
-/// Everything the modes read that already exists on [`McpState`] is read through `state`;
-/// [`ProxyCtx::tool_metadata`] is held here because `crate::state::ServerToolMetadata` is still 13e's
-/// forward declaration and cannot yet carry a `Vec<ToolMetadata>`. **Integration:** once
-/// MCP-207 lands, delete this field and project `McpState::tool_metadata` instead — every read site
-/// below goes through [`ProxyCtx::with_metadata`], so the swap is one function.
+/// Everything the modes read is read through `state` — including the tool metadata.
+///
+/// **The duplicate map is gone (D0).** This context used to carry its own
+/// `tool_metadata`, because `crate::state::ServerToolMetadata` was a forward declaration that could
+/// not hold a `Vec<ToolMetadata>`. It can now, so the two maps are one: [`Self::with_metadata`] and
+/// [`Self::with_metadata_mut`] project `McpState::tool_metadata` directly. That collapse is what
+/// makes a production [`ProxyEnv`] observable — a writer reaching `McpState::tool_metadata` while
+/// the modes read a private copy would leave `mcp({action:"status"})` reporting every connected
+/// server as not connected.
 pub struct ProxyCtx {
-    /// The generation's runtime record: config, owner, UI handle, `serverInstructions`.
+    /// The generation's runtime record: config, owner, UI handle, `serverInstructions`, and
+    /// `state.toolMetadata: Map<string, ToolMetadata[]>` — **insertion-ordered** (MCP-170), because
+    /// that order decides which server wins a fuzzy tool-name match, which disabled server is named
+    /// in an error, and the output order of the unsorted regex search path.
     pub state: Arc<McpState>,
-    /// `state.toolMetadata: Map<string, ToolMetadata[]>`, **insertion-ordered** (MCP-170).
-    ///
-    /// Insertion order decides which server wins a fuzzy tool-name match, which disabled server is
-    /// named in an error, and the output order of the unsorted regex search path. A `BTreeMap` here
-    /// would change observable behaviour whenever server names are not already alphabetical.
-    pub tool_metadata: Mutex<IndexMap<String, Vec<ToolMetadata>>>,
     /// The late-bound collaborators.
     pub env: Arc<dyn ProxyEnv>,
 }
@@ -417,13 +418,13 @@ impl ProxyCtx {
     /// Build a context over a live state and a collaborator implementation.
     #[must_use]
     pub fn new(state: Arc<McpState>, env: Arc<dyn ProxyEnv>) -> Self {
-        Self { state, tool_metadata: Mutex::new(IndexMap::new()), env }
+        Self { state, env }
     }
 
     /// The one read path onto `state.toolMetadata`. A poisoned lock degrades to "no metadata",
     /// never to a panic (the crate denies `clippy::panic` and `init` must not fail).
     pub(crate) fn with_metadata<R>(&self, f: impl FnOnce(&IndexMap<String, Vec<ToolMetadata>>) -> R) -> R {
-        match self.tool_metadata.lock() {
+        match self.state.tool_metadata.lock() {
             Ok(guard) => f(&guard),
             Err(_) => f(&IndexMap::new()),
         }
@@ -466,7 +467,7 @@ impl ProxyCtx {
 
     /// The one write path onto `state.toolMetadata`.
     pub(crate) fn with_metadata_mut<R>(&self, f: impl FnOnce(&mut IndexMap<String, Vec<ToolMetadata>>) -> R) -> Option<R> {
-        self.tool_metadata.lock().ok().map(|mut guard| f(&mut guard))
+        self.state.tool_metadata.lock().ok().map(|mut guard| f(&mut guard))
     }
 
     /// The resolved configuration this generation is running.

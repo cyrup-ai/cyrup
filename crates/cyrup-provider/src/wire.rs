@@ -78,12 +78,14 @@ impl WireProvider {
     }
 
     /// Set the provider-level default base URL (Pi `createProvider({ baseUrl })`) — PROV-017.
+    #[must_use]
     pub fn with_base_url(mut self, base_url: impl Into<String>) -> Self {
         self.base_url = Some(base_url.into());
         self
     }
 
     /// Set the provider-level default headers (Pi `createProvider({ headers })`) — PROV-017.
+    #[must_use]
     pub fn with_headers(mut self, headers: crate::HeaderMap) -> Self {
         self.headers = Some(headers);
         self
@@ -91,12 +93,14 @@ impl WireProvider {
 
     /// Install the credential-scoped availability policy (Pi `createProvider({ filterModels })`) —
     /// PROV-032. Applied only by `Models::get_available`, never by `models()`.
+    #[must_use]
     pub fn with_filter_models(mut self, filter: FilterModelsFn) -> Self {
         self.filter_models = Some(filter);
         self
     }
 
     /// Override the ambient auth context (for tests / custom env sources).
+    #[must_use]
     pub fn with_auth_context(mut self, ctx: Arc<dyn AuthContext>) -> Self {
         self.auth_ctx = ctx;
         self

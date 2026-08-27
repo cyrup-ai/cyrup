@@ -1,10 +1,48 @@
 ---
-stage: aug
-status: done
-updated: 2026-08-27 06:00
+stage: qa
+status: completed
+updated: 2026-08-27 09:45
 ---
 
 # MCP-370: Port `includeTools` And Glob `excludeTools` Into The In-Tree Reader
+
+
+## COMPLETED — QA 10/10
+
+The reader applies `includeTools`. It previously read `excludeTools` alone, so a server
+configured to expose a named subset exposed everything.
+
+Verified against the writer rather than in isolation, since reader/writer agreement is the
+point of the unit: `is_tool_allowed` is byte-identical to `cyrup_mcp::registration`'s modulo
+one comment; `matches_tool_selector` differs only by `shift_remove` -> `remove`, the documented
+`HashSet` consequence; `matches_tool_pattern` is condensed but semantically equal, since
+`patterns.iter().any(..)` on an empty slice is the writer's explicit early `false`.
+
+One real divergence exists and is documented at the call site: the writer's glob arm compiles
+to a regex and answers `None` when the size ceiling is hit, treating that pattern as matching
+nothing, while this matcher compiles nothing and has no such failure mode. The note reasons
+correctly that with this escape set the produced pattern is always syntactically valid, so the
+ceiling is the only path that reaches `None`.
+
+The glob matcher uses `chars()`/`Chars::as_str()` with no indexing, no `unwrap`/`expect` and no
+`regex` dependency, following the existing lint-clean port in `exec/model_scope.rs` rather than
+adding a third implementation.
+
+The catch that mattered most: deleting `is_tool_excluded` would have orphaned a doc link under
+`broken_intra_doc_links = deny` — a build break, not a stale sentence.
+
+Two asserts beyond the prescribed edits drive the writer's `is_tool_allowed` over the same
+fixture. Kept: that test's purpose is reader/writer agreement and nothing else pinned the new
+filter against its twin.
+
+The task's own "which writer to transcribe from" table was stale on arrival — the previous
+commit deleted one of the three copies it named, two hours after augmentation. Transcribing
+from `registration.rs` as it now stands surfaced its grouped legacy emission, which the task
+had prescribed as interleaved.
+
+Gates: check 0 warnings, doc exit 0, 7870/7870.
+
+---
 
 ## The finding that reframes this task
 

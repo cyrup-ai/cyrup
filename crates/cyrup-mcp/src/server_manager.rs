@@ -59,7 +59,8 @@
 //!
 //! `createConnection`'s body is five other port units — MCP-101 (stdio env/args/npx), MCP-103 (npx
 //! pre-resolution), MCP-114/MCP-115 (the HTTP pre-flight and the OAuth attempt ladder) and MCP-119
-//! (tool/resource/prompt discovery). None of them is this unit's work, so the manager takes a
+//! (tool/resource/prompt discovery, which returns its findings through [`Discovery`]). None of them
+//! is this unit's work, so the manager takes a
 //! [`ConnectionFactory`] seam instead of pretending to own them, and the default factory
 //! ([`UnbuiltConnectionFactory`]) fails loudly naming the missing unit — the same discipline
 //! `lifecycle.rs`'s `ManagerSupervisor::unbound` already uses. What *is* built here is the piece
@@ -76,7 +77,7 @@ use cyrup_core::CancelToken;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use indexmap::IndexMap;
 use rmcp::model::{Prompt, Resource, Tool};
-use rmcp::service::PeerRequestOptions;
+use rmcp::service::{Peer, PeerRequestOptions, RoleClient};
 use rmcp::transport::TokioChildProcess;
 use tokio::io::AsyncReadExt;
 use tokio::process::ChildStderr;
@@ -531,6 +532,28 @@ pub trait ConnectionResource: Send + Sync + std::fmt::Debug {
     fn stderr_detail(&self) -> Option<String> {
         None
     }
+
+    /// `connection.client` — the live [`Peer`] every MCP request rides, when this resource has one.
+    ///
+    /// Upstream keeps the `Client` next to the transport in `{ client, transport }` and every
+    /// caller that wants to talk to the server reaches for it there. This port hands the manager an
+    /// `Arc<dyn ConnectionResource>` instead, so without this method the client half is reachable
+    /// only from the concrete type the factory happened to build — and the manager never sees that
+    /// type. This is the one route from [`ServerConnection::resource`] to the peer; discovery
+    /// (MCP-119, `tools/list`) and invocation (MCP-164, `tools/call`) both take it.
+    ///
+    /// `None` is the honest answer for a resource with no client behind it, and is why this returns
+    /// an `Option` rather than a `&Peer`: [`InertResource`] is the `needs-auth` early return, whose
+    /// transport was surrendered before a handshake, and [`StdioChildConnection`] owns a child rmcp
+    /// was never given. Neither can serve a request, and a caller that must issue one gets a `None`
+    /// it has to answer for rather than a handle to a connection that does not exist.
+    ///
+    /// The borrow is the resource's; [`Peer`] is a cheap clonable handle over the service's
+    /// channels, so a caller that needs it past the borrow — across an `.await` it does not hold
+    /// the `Arc` through, say — clones it.
+    fn peer(&self) -> Option<&Peer<RoleClient>> {
+        None
+    }
 }
 
 /// A stdio child process and the two things that keep it from becoming an orphan.
@@ -805,16 +828,18 @@ pub struct ServerConnection {
     instructions: Option<String>,
     /// `connection.tools` — replaced wholesale by `tools/list_changed`.
     ///
-    /// **Populated by MCP-119**, which is not this unit. The field is here because the record's
-    /// shape is part of MCP-100's contract and `refreshTools`/`list_changed` need somewhere to
-    /// write; it stays empty until that unit lands.
+    /// Filled at construction from [`Discovery::tools`] (MCP-119's `tools/list`, §3.9) and
+    /// rewritten afterwards by [`Self::set_tools`], which is what `refreshTools` and the
+    /// `list_changed` handlers (MCP-120) call. Empty is now a *finding* — a server that advertises
+    /// no tools — where before this unit it was the only value the field could ever hold.
     tools: Mutex<Vec<Tool>>,
-    /// `connection.resources`. See [`Self::tools`].
+    /// `connection.resources`. See [`Self::tools`]. Empty also when the server never advertised the
+    /// `resources` capability, in which case no `resources/list` was sent at all.
     resources: Mutex<Vec<Resource>>,
-    /// `connection.prompts`. See [`Self::tools`].
+    /// `connection.prompts`. See [`Self::tools`] and [`Self::prompt_discovery_failed`].
     prompts: Mutex<Vec<Prompt>>,
     /// `connection.promptDiscoveryFailed` — the `prompts` capability was advertised but
-    /// `prompts/list` threw. See [`Self::tools`].
+    /// `prompts/list` threw. See [`Discovery`] for why this is not the same as empty prompts.
     prompt_discovery_failed: AtomicBool,
     /// `disposeConnection` **completed** for this record — or is running and will complete; see
     /// [`Self::dispose`] and [`DisposeGuard`], which puts the flag back when it does not. Distinct
@@ -825,7 +850,11 @@ pub struct ServerConnection {
 }
 
 impl ServerConnection {
-    /// Build the record around a freshly created live half.
+    /// Build the record around a freshly created live half, with nothing discovered.
+    ///
+    /// The undiscovered form is a real one — it is what the `needs-auth` arm carries — but a
+    /// factory that *did* connect should reach for [`Self::from_created`] instead, so the tools it
+    /// just fetched are not silently dropped on the way into the record.
     #[must_use]
     pub fn new(
         definition: Arc<ServerEntry>,
@@ -833,20 +862,81 @@ impl ServerConnection {
         status: ConnectionStatus,
         credentials_invalidated: bool,
     ) -> Arc<Self> {
-        Arc::new(Self {
+        Self::with_discovery(
+            definition,
+            resource,
+            status,
+            credentials_invalidated,
+            Discovery::default(),
+        )
+    }
+
+    /// The record as `createConnection` actually returns it (`server-manager.ts:546-586`):
+    /// `{ …, instructions, tools, resources, prompts, promptDiscoveryFailed }`.
+    ///
+    /// Upstream builds the object with `...(instructions !== undefined ? { instructions } : {})`
+    /// and then *assigns* the four discovery fields once its `Promise.all` settles. The factory
+    /// here has already awaited discovery before it returns, so the record is built whole in one
+    /// step. That is why `instructions` has no setter and no lock: upstream never writes it a
+    /// second time either, and a field written once at birth should not pretend otherwise.
+    #[must_use]
+    pub fn with_discovery(
+        definition: Arc<ServerEntry>,
+        resource: Arc<dyn ConnectionResource>,
+        status: ConnectionStatus,
+        credentials_invalidated: bool,
+        discovery: Discovery,
+    ) -> Arc<Self> {
+        let Discovery {
+            tools,
+            resources,
+            prompts,
+            prompt_discovery_failed,
+            instructions,
+        } = discovery;
+        let connection = Arc::new(Self {
             definition,
             resource,
             status: AtomicU8::new(status_code(status)),
             credentials_invalidated: AtomicBool::new(credentials_invalidated),
             last_used_at: AtomicU64::new(now_ms()),
             in_flight: AtomicU32::new(0),
-            instructions: None,
+            instructions,
             tools: Mutex::new(Vec::new()),
             resources: Mutex::new(Vec::new()),
             prompts: Mutex::new(Vec::new()),
             prompt_discovery_failed: AtomicBool::new(false),
             disposed: AtomicBool::new(false),
-        })
+        });
+        // The three assignments upstream performs on the record it has just built
+        // (`connection.tools = tools` …, `server-manager.ts:580-583`), through the same setters
+        // `refreshTools` and the `list_changed` handlers use. Writing them here rather than
+        // inlining the vectors into the literal above is what keeps discovery and refresh on one
+        // code path — and it is why those setters have a caller at all.
+        //
+        // Nothing can observe the gap: this `Arc` is the only one in existence until the manager
+        // publishes it into `connections`, which happens strictly after this function returns.
+        connection.set_tools(tools);
+        connection.set_resources(resources);
+        connection.set_prompts(prompts, prompt_discovery_failed);
+        connection
+    }
+
+    /// [`Self::with_discovery`] over exactly what a [`ConnectionFactory`] handed back.
+    ///
+    /// The one production route from `createConnection`'s return value into the connection map. It
+    /// takes [`NewConnection`] **by value** on purpose: every field of it belongs to the record
+    /// being built, and a partial move would be a field quietly left behind — which is the shape
+    /// the discovery gap had before MCP-119.
+    #[must_use]
+    pub fn from_created(definition: Arc<ServerEntry>, created: NewConnection) -> Arc<Self> {
+        Self::with_discovery(
+            definition,
+            created.resource,
+            created.status,
+            created.credentials_invalidated,
+            created.discovery,
+        )
     }
 
     /// `connection.definition`.
@@ -939,7 +1029,8 @@ impl ServerConnection {
             .clone()
     }
 
-    /// `connection.tools = tools` — MCP-119/MCP-120's writer.
+    /// `connection.tools = tools` — written once by discovery through [`Self::with_discovery`]
+    /// (MCP-119) and again by every `tools/list_changed` refresh (MCP-120).
     pub fn set_tools(&self, tools: Vec<Tool>) {
         *self.tools.lock().unwrap_or_else(PoisonError::into_inner) = tools;
     }
@@ -1126,6 +1217,43 @@ pub struct CreateConnection {
     pub request_options: Option<PeerRequestOptions>,
 }
 
+/// What `Promise.all([fetchAllTools, fetchAllResources, fetchAllPrompts])` produced, plus the
+/// `instructions` read that precedes it — MCP-119, §3.9.
+///
+/// Upstream assigns these straight onto the mutable `ServerConnection` record after the
+/// `Promise.all` settles (`server-manager.ts:576-584`). Here the record is immutable-at-birth for
+/// `instructions` and lock-guarded for the three lists, so the factory hands the whole payload back
+/// as one value and [`ServerConnection::with_discovery`] installs it. That is also what makes the
+/// seam honest: before this type existed a [`ConnectionFactory`] had **nowhere to put** what it had
+/// just fetched, so `ServerConnection::new`'s empty vectors were not a default, they were a
+/// ceiling.
+///
+/// # Why `prompt_discovery_failed` is a field and not the absence of prompts
+///
+/// `prompts: []` has two causes that the prompt-command layer must tell apart: the server has no
+/// prompts, and `prompts/list` threw. Upstream carries the distinction as
+/// `promptDiscoveryFailed`, and `init.ts:340` reads it to decide whether the prompt map joins the
+/// **live** set at all. Collapsing the two would make a transient list failure look like a server
+/// that deliberately publishes nothing, and cache the emptiness.
+///
+/// [`Default`] is `{ [], [], [], false, None }` — what a `needs-auth` early return carries, and
+/// what every test factory that is not exercising discovery wants.
+#[derive(Debug, Default)]
+pub struct Discovery {
+    /// `connection.tools` — `fetchAllTools`, unconditional, errors propagate.
+    pub tools: Vec<Tool>,
+    /// `connection.resources` — `fetchAllResources`, capability-gated, failures swallowed to `[]`.
+    pub resources: Vec<Resource>,
+    /// `connection.prompts` — `fetchAllPrompts`, capability-gated.
+    pub prompts: Vec<Prompt>,
+    /// `connection.promptDiscoveryFailed` — the `prompts` capability was advertised and
+    /// `prompts/list` threw anyway.
+    pub prompt_discovery_failed: bool,
+    /// `client.getInstructions?.()`, read before the lists (§3.9). `None` is upstream's
+    /// `undefined`, which is the case its `...(instructions !== undefined ? …)` spread omits.
+    pub instructions: Option<String>,
+}
+
 /// What `createConnection` returns.
 pub struct NewConnection {
     /// `{ client, transport }`.
@@ -1134,6 +1262,9 @@ pub struct NewConnection {
     pub status: ConnectionStatus,
     /// `credentialsInvalidated`, possibly set by this attempt's own 401 handling (MCP-116).
     pub credentials_invalidated: bool,
+    /// What discovery found, or [`Discovery::default`] on the `needs-auth` arm — which skips the
+    /// whole try block upstream and so never lists anything.
+    pub discovery: Discovery,
 }
 
 /// `McpServerManager.createConnection` — the transport build, the handshake and discovery.
@@ -1141,7 +1272,8 @@ pub struct NewConnection {
 /// Everything behind this trait is a **different port unit**: MCP-101 (stdio env/args), MCP-103 (npx
 /// pre-resolution), MCP-113 (transport selection — already in [`crate::runtime::select_transport`]),
 /// MCP-109/MCP-114/MCP-115 (the HTTP transport, its pre-flight and its OAuth attempt ladder), MCP-117
-/// (revision negotiation), MCP-119 (discovery) and T-10/MCP-477 (`mcp-trace.ts`; there is no
+/// (revision negotiation), MCP-119 (discovery — landed, in [`crate::runtime::ConnectionBuilder`]'s
+/// `post_handshake`) and T-10/MCP-477 (`mcp-trace.ts`; there is no
 /// MCP-1xx unit for it — see `13-cyrup-mcp.md:688`). The manager owns the state machine around it
 /// and nothing inside it. MCP-133 is **not** the trace unit: it is `enrichHttpConnectionError`
 /// (`13c-mcp-servers.md:1608`), and its seam is named inside [`McpServerManager::connect_inner`].
@@ -1165,8 +1297,7 @@ impl ConnectionFactory for UnbuiltConnectionFactory {
             Err(McpError::Server {
                 server: name,
                 message: "MCP connection builder is not wired yet: `createConnection` is pending \
-                          MCP-101/MCP-103 (stdio) and MCP-114/MCP-115 (HTTP), with discovery \
-                          pending MCP-119"
+                          MCP-101/MCP-103 (stdio) and MCP-114/MCP-115 (HTTP)"
                     .to_string(),
             })
         })
@@ -1823,12 +1954,7 @@ impl McpServerManager {
                     let definition_for_record = Arc::clone(&definition);
                     async move {
                         let created = factory.create(request).await.map_err(ManagerError::mcp)?;
-                        Ok(ServerConnection::new(
-                            definition_for_record,
-                            created.resource,
-                            created.status,
-                            created.credentials_invalidated,
-                        ))
+                        Ok(ServerConnection::from_created(definition_for_record, created))
                     }
                     .boxed()
                     .shared()
@@ -2250,9 +2376,10 @@ impl McpServerManager {
                     // raises. The MECHANISM is therefore live, and it is proved end to end through
                     // the real manager by `a_pending_connect_that_failed_cleanup_is_rethrown_by_
                     // close`. What is still missing is a *production* producer of `SetupFailed`
-                    // against a real server: `ConnectionBuilder::post_handshake` has one narrow one
-                    // (an abort racing a successful handshake whose own teardown then fails), and
-                    // discovery — upstream's producer, MCP-119 — has not landed.
+                    // against a real server: since MCP-119 landed, `post_handshake` runs discovery
+                    // inside the try, so a `tools/list` that fails on a server whose subsequent
+                    // `close` also fails raises `SetupFailed` — upstream's own producer, on the
+                    // ordinary path rather than the narrow abort-vs-handshake race.
                     } else if let Some(pending) = tables.connect_promises.get(name).cloned() {
                         Step::AwaitPendingConnect(pending)
                     } else {
@@ -2911,11 +3038,13 @@ mod tests {
                         resource,
                         status: ConnectionStatus::Connected,
                         credentials_invalidated: false,
+                        discovery: Discovery::default(),
                     }),
                     Script::NeedsAuthInvalidated => Ok(NewConnection {
                         resource,
                         status: ConnectionStatus::NeedsAuth,
                         credentials_invalidated: true,
+                        discovery: Discovery::default(),
                     }),
                     Script::FailOrdinary => Err(McpError::other("plain connect failure")),
                 }
@@ -2943,6 +3072,7 @@ mod tests {
                     resource: Arc::new(FailingResource),
                     status: ConnectionStatus::Connected,
                     credentials_invalidated: false,
+                    discovery: Discovery::default(),
                 })
             })
         }
@@ -3186,6 +3316,7 @@ mod tests {
                         resource,
                         status: ConnectionStatus::Connected,
                         credentials_invalidated: false,
+                        discovery: Discovery::default(),
                     })
                 })
             }
@@ -3535,6 +3666,7 @@ mod tests {
                         resource,
                         status: ConnectionStatus::Connected,
                         credentials_invalidated: false,
+                        discovery: Discovery::default(),
                     })
                 })
             }
@@ -3625,6 +3757,7 @@ mod tests {
                         resource,
                         status: ConnectionStatus::Connected,
                         credentials_invalidated: false,
+                        discovery: Discovery::default(),
                     })
                 })
             }
@@ -4232,6 +4365,7 @@ mod tests {
                         resource,
                         status: ConnectionStatus::Connected,
                         credentials_invalidated: false,
+                        discovery: Discovery::default(),
                     })
                 })
             }
@@ -4620,6 +4754,7 @@ mod tests {
                         resource: spawned? as Arc<dyn ConnectionResource>,
                         status: ConnectionStatus::Connected,
                         credentials_invalidated: false,
+                        discovery: Discovery::default(),
                     })
                 })
             }

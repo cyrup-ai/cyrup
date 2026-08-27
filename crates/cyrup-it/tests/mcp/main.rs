@@ -24,3 +24,4 @@
 mod support;
 
 mod activation;
+mod live_tool_call;

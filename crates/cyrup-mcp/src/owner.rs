@@ -463,6 +463,82 @@ impl cyrup_ext::HostServices for OwnedServices {
             opts: &serde_json::Value,
             cancel: cyrup_core::CancelToken
         ) -> Result<cyrup_ext::ExecOutput, String> => Err(Self::inert_reason(&self.owner));
+
+        // --- editor / theme / layout: pure paint -------------------------------------------------
+        // The `serde_json::Value` arms below return each method's OWN trait default rather than a
+        // blanket `Value::Null`, so the invariant this type's doc states — "an unlisted method
+        // behaves exactly like a permanently-fenced one" — holds for them the way it already does
+        // for `models` (`json!([])`) and `context_usage` (`json!({})`) above. A caller that reads
+        // `entries()` with `as_array()` therefore sees an empty transcript, not "unavailable".
+        fn editor_text(&self) -> String => String::new();
+        fn set_editor_text(&self, text: &str, is_paste: bool) => ();
+        fn theme_list(&self) -> serde_json::Value => serde_json::json!([]);
+        fn theme_by_name(&self, name: &str) -> Option<serde_json::Value> => None;
+        fn set_theme(&self, name: &str) -> Result<(), String> => Err(Self::inert_reason(&self.owner));
+        fn tools_expanded(&self) -> bool => false;
+        fn set_tools_expanded(&self, expanded: bool) => ();
+        fn set_working_visible(&self, visible: bool) => ();
+        fn set_working_indicator(&self, opts: Option<&serde_json::Value>) => ();
+        fn set_hidden_thinking_label(&self, label: Option<&str>) => ();
+        fn set_header(&self, content: &str) => ();
+        fn set_footer(&self, content: &str) => ();
+        fn set_title(&self, title: &str) => ();
+        fn thinking_level(&self) -> Option<String> => None;
+
+        // --- session / transcript -----------------------------------------------------------------
+        fn entries(&self) -> serde_json::Value => serde_json::json!([]);
+        fn branch(&self) -> serde_json::Value => serde_json::json!([]);
+        fn tree(&self) -> serde_json::Value => serde_json::Value::Null;
+        fn session_name(&self) -> Option<String> => None;
+        fn set_session_name(&self, name: &str) => ();
+        fn set_label(&self, entry_id: &str, label: Option<&str>) => ();
+        fn append_entry(
+            &self,
+            custom_type: &str,
+            data: &serde_json::Value
+        ) -> Result<String, String> => Err(Self::inert_reason(&self.owner));
+        fn has_pending_messages(&self) -> bool => false;
+        fn system_prompt(&self) -> Option<String> => None;
+        fn system_prompt_options(&self) -> Option<serde_json::Value> => None;
+        fn scoped_models(&self) -> serde_json::Value => serde_json::json!([]);
+
+        // --- http: a stale generation must not issue a request -------------------------------------
+        fn http_request(
+            &self,
+            req: &cyrup_ext::host::HttpRequest
+        ) -> Result<cyrup_ext::host::HttpResponse, String> => Err(Self::inert_reason(&self.owner));
+        fn http_request_stream(
+            &self,
+            req: &cyrup_ext::host::HttpRequest
+        ) -> Result<cyrup_ext::host::HttpStreamResponse, String> => Err(Self::inert_reason(&self.owner));
+        fn http_poll_stream_chunk(
+            &self,
+            handle: u32
+        ) -> Result<Option<Vec<u8>>, String> => Err(Self::inert_reason(&self.owner));
+        fn http_close_stream(&self, handle: u32) => ();
+
+        // --- proc: a stale generation spawning a child is the exact leak the owner prevents ---------
+        fn proc_spawn(
+            &self,
+            spec: &cyrup_ext::host::ProcSpawnSpec
+        ) -> Result<u32, String> => Err(Self::inert_reason(&self.owner));
+        fn proc_write_stdin(
+            &self,
+            handle: u32,
+            data: &[u8]
+        ) -> Result<u32, String> => Err(Self::inert_reason(&self.owner));
+        fn proc_read_stdout(
+            &self,
+            handle: u32,
+            max_bytes: u32
+        ) -> Result<Vec<u8>, String> => Err(Self::inert_reason(&self.owner));
+        fn proc_read_stderr(
+            &self,
+            handle: u32,
+            max_bytes: u32
+        ) -> Result<Vec<u8>, String> => Err(Self::inert_reason(&self.owner));
+        fn proc_poll_exit(&self, handle: u32) -> Option<i32> => None;
+        fn proc_kill(&self, handle: u32) -> Result<(), String> => Err(Self::inert_reason(&self.owner));
     }
 }
 

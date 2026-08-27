@@ -96,6 +96,7 @@ impl ModelsRefreshOptions {
     }
 
     /// Attach the caller's abort token (pi's `signal`).
+    #[must_use]
     pub fn with_cancel(mut self, cancel: cyrup_core::CancelToken) -> Self {
         self.cancel = cancel;
         self

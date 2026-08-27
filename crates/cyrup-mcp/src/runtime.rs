@@ -175,15 +175,14 @@ pub async fn initialize_mcp(
     // scripts its own factory, so flipping their default would be a change to a file this unit does
     // not own for no behaviour anyone depends on.
     //
-    // **REACH, stated exactly, because the obvious reading of the line above is wrong.** Installing
-    // the builder *here* does not put it on any shipping path: `initialize_mcp` itself has no
-    // non-test caller. `grep -rn 'initialize_mcp('` over the repo returns its definition and one
-    // call, `runtime.rs:403`, inside this file's `#[cfg(test)]` module. The production entry point
-    // that would reach it — `McpExtension::on_session_start` (`extension.rs:279-300`) — is still
-    // MCP-008/MCP-011's empty body and calls nothing. So the seam is FILLED and REACHABLE (every
-    // arm below is exercised against real children and a real loopback server), but not yet reached
-    // from a session. "A configured server connects in production" becomes true when
-    // `on_session_start` calls `startInitialization`, not here.
+    // **REACH.** This is now on the shipping path. `McpExtension::start_initialization` — the port
+    // of `index.ts:292`'s `startInitialization` — builds this future and spawns its driver, and
+    // `McpExtension::on_session_start` calls that on every `SessionStart`. So a server listed in
+    // `mcp.json` connects through this line in production, not only under test.
+    //
+    // It is SPAWNED, never awaited by the handler, and that is not incidental: `cyrup_ext`'s
+    // native dispatch budget drops a handler future that outlives it, and the subprocess
+    // handshakes below routinely do. See `McpExtension::start_initialization`'s doc comment.
     //
     // Two things the builder does NOT yet get here, both named rather than smuggled:
     // `with_handler_factory` (the manager's sampling/elicitation/list-changed hooks, MCP-118/120/122)
@@ -205,7 +204,9 @@ pub async fn initialize_mcp(
     //
     // `runtimeSignal` is combined **once per generation**, which is what makes
     // `crate::abort::combine`'s one-forwarder-task-per-pair cost affordable (13a §8).
-    manager.set_runtime_signal(Some(runtime_signal));
+    // Cloned rather than moved: §11's `parallelLimit` connect pass hands the same combined token
+    // to every `manager.connect`, and this setter consumes one.
+    manager.set_runtime_signal(Some(runtime_signal.clone()));
     manager.set_default_request_timeout_ms(
         config
             .settings
@@ -263,8 +264,9 @@ pub async fn initialize_mcp(
         send_message,
     }));
 
-    // Steps 10 and 12 — registered in this order so the LIFO run order is
-    // `gracefulShutdown` -> `shutdownOAuth`.
+    // Steps 10, 11 and 12. The two cleanups are registered in this order so the LIFO run order is
+    // `gracefulShutdown` -> `shutdownOAuth`, and step 11 sits BETWEEN them — the position this
+    // function's own wiring list gives it and the position `init.ts:198-207` has.
     if owns_oauth_runtime {
         let oauth_runtime = Arc::clone(&state.oauth_runtime);
         owner.add_cleanup(Box::new(move || {
@@ -274,6 +276,33 @@ pub async fn initialize_mcp(
             })
         }));
     }
+
+    // Step 11 — the list-changed listener (MCP-017), installed AFTER the state commits so a hook
+    // fired mid-build cannot see a half-installed surface, and BEFORE the connect pass so a
+    // `tools/list_changed` arriving during startup is honoured rather than dropped
+    // (`init.ts:200-206`).
+    //
+    // `preserveEmptyResources: false` is the load-bearing detail: THIS empty `resources/list` is
+    // authoritative and must overwrite the cache, where §12's startup write must not.
+    state.manager.set_metadata_list_changed_listener(Some({
+        let state = Arc::clone(&state);
+        let dirs = dirs.clone();
+        Arc::new(move |server: &str, reason: &str| {
+            if !state.owner.is_active() {
+                return;
+            }
+            crate::live::update_server_metadata(&state, server);
+            crate::live::update_metadata_cache(
+                &state,
+                &dirs,
+                server,
+                crate::live::MetadataCacheOptions { preserve_empty_resources: false },
+            );
+            state.notify_tool_metadata_updated(server, reason);
+            crate::live::update_status_bar(&state);
+        })
+    }));
+
     owner.add_cleanup(Box::new(move || {
         Box::pin(async move {
             lifecycle.graceful_shutdown().await;
@@ -281,14 +310,594 @@ pub async fn initialize_mcp(
         })
     }));
 
-    // 13a §8's zero-enabled-servers early return (MCP-018): no cache work, no lifecycle, no health
-    // checks — just the published snapshot and the state.
+    // ── §8 tail — the zero-enabled-servers early return (MCP-018) ───────────────────────────
+    // No cache work, no lifecycle, no health checks — just the notice, the published snapshot and
+    // the state. The notice is gated on `allServerEntries.length > 0 && hasUI`
+    // (`init.ts:217-223`), so a config with NO servers at all says nothing and a headless run says
+    // nothing.
     if state.config.enabled_servers().next().is_none() {
-        state.publish_status(crate::state::McpStatusSnapshot::default());
+        let all = state.config.mcp_servers.len();
+        if all > 0
+            && let Some(ui) = state.ui.as_ref()
+        {
+            HostServices::notify(
+                ui.as_ref(),
+                &format!("MCP: All {all} server(s) are disabled"),
+                cyrup_ext::NotifyKind::Info,
+            );
+        }
+        state.publish_status(crate::live::create_mcp_status_snapshot(&state));
         return Ok(state);
     }
 
+    // ── §9 — cache bootstrap (MCP-019) ─────────────────────────────────────────────────────
+    // The two-way split IS the unit (`init.ts:228-239`). Collapsing "no usable cache" into one arm
+    // turns the corrupt-cache path from cheap into a connect storm.
+    //
+    // The PROBE is [`crate::dirs`]', the READ is [`crate::registration`]'s lenient reader, and the
+    // WRITE is [`crate::dirs`]'. That asymmetry is deliberate: the strict reader answers `None` for
+    // a file the lenient one parses fine, and rewriting on THAT would destroy the very cache
+    // `resolve_direct_tools` and `resolve_cached_prompts` registered this session's surface from.
+    let cache_path = dirs.metadata_cache();
+    let cache_file_exists = cache_path.exists();
+    let mut cache = crate::registration::load_metadata_cache(&dirs);
+    let mut bootstrap_all = false;
+    if !cache_file_exists {
+        // No file at all — a first run. Every enabled server is a startup connect this once, so
+        // the next launch has a cache to register a direct-tool surface from.
+        bootstrap_all = true;
+        save_empty_metadata_cache(&cache_path);
+    } else if cache.is_none() {
+        // A file that exists and does not parse. Truncate it, but do NOT set `bootstrap_all`: a
+        // corrupt cache must stay cheap rather than becoming a connect storm.
+        save_empty_metadata_cache(&cache_path);
+        cache = Some(crate::registration::MetadataCache {
+            version: crate::registration::METADATA_CACHE_VERSION,
+            servers: indexmap::IndexMap::new(),
+        });
+    }
+
+    // ── §10 — per-server lifecycle registration (MCP-020) + rehydration (MCP-021) ──────────
+    for (name, definition) in state.config.enabled_servers() {
+        let mode = definition.lifecycle_mode();
+        // `persistsAfterFirstSpawn` is `eager | lazy-keep-alive` (`init.ts:245`) — NOT
+        // [`ServerLifecycle::is_prewarmed`], which is `eager | keep-alive` and answers §11's
+        // question instead. The two sets differ and swapping them is silent.
+        let persists = matches!(mode, ServerLifecycle::Eager | ServerLifecycle::LazyKeepAlive);
+        // `definition.idleTimeout ?? (persistsAfterFirstSpawn ? 0 : undefined)` (`init.ts:246`) —
+        // the `?? 0` is what stops an eager or lazy-keep-alive server ever idling out by default.
+        let idle_timeout = definition.idle_timeout.or_else(|| persists.then_some(0.0));
+        state.lifecycle.register_server(
+            name,
+            definition.clone(),
+            idle_timeout
+                .map(|minutes| crate::lifecycle::LifecycleOverrides { idle_timeout: Some(minutes) }),
+        );
+        // ONLY `keep-alive` at registration (`init.ts:252`); `lazy-keep-alive` waits for its first
+        // successful connect, which is [`McpLifecycleManager::mark_keep_alive_after_connect`].
+        if marks_keep_alive_at_registration(mode) {
+            state.lifecycle.mark_keep_alive(name);
+        }
+        // Step 6 — rehydrate from a hash-valid entry (`init.ts:256-269`).
+        // [`crate::registration::valid_entry`] IS `cachedEntry && isServerCacheValid(entry, def)`;
+        // it is not re-derived here, because a second hash path is the reader/writer drift the
+        // cache seam exists to prevent.
+        if let Some(cache) = cache.as_ref()
+            && let Some(entry) = crate::registration::valid_entry(Some(cache), name, definition)
+        {
+            crate::live::rehydrate_from_cache(&state, name, definition, entry, cache);
+        }
+    }
+
+    // ── §11 — the bounded startup connect pass (MCP-022 / MCP-087 / MCP-130) ───────────────
+    let startup: Vec<(String, ServerEntry)> = state
+        .config
+        .enabled_servers()
+        .filter(|(_, definition)| bootstrap_all || definition.lifecycle_mode().is_prewarmed())
+        .map(|(name, definition)| (name.clone(), definition.clone()))
+        .collect();
+
+    if let Some(ui) = state.ui.as_ref()
+        && !startup.is_empty()
+    {
+        let text = crate::ui::format_mcp_status(
+            &state.config,
+            &format!("connecting to {} servers...", startup.len()),
+        );
+        HostServices::set_status(ui.as_ref(), "mcp", text.as_deref());
+    }
+
+    // `{name, definition, connection, error}` (`init.ts:284-299`), as a tuple. `error` is `Some`
+    // for a real failure AND for needs-auth (which carries the byte-exact `/mcp-auth` line); BOTH
+    // are `None` for an abort on a live signal, which pass two skips silently.
+    //
+    // One deliberate divergence: upstream rethrows the abort when `owner.signal.aborted`
+    // (`init.ts:294`), aborting the whole `parallelLimit`. Here the arm answers `(None, None)` and
+    // the `throw_if_inactive` immediately below turns the same condition into the same `Err` — the
+    // only difference is that the remaining in-flight connects finish first, and they are already
+    // racing a cancelled runtime signal.
+    let results = crate::live::parallel_limit(
+        startup.clone(),
+        crate::live::STARTUP_CONNECT_CONCURRENCY,
+        |(name, definition)| {
+            let manager = Arc::clone(&state.manager);
+            let signal = runtime_signal.clone();
+            async move {
+                match manager.connect(&name, &definition, Some(&signal)).await {
+                    Ok(connection) if connection.status() == ConnectionStatus::NeedsAuth => {
+                        // BYTE-EXACT (`init.ts:288`). The `/mcp-auth {name}` form is what the user
+                        // copies; a reworded line is a support burden, not a style choice.
+                        let message = format!("OAuth authentication required. Run /mcp-auth {name}.");
+                        (name, definition, None, Some(message))
+                    }
+                    Ok(connection) => (name, definition, Some(connection), None),
+                    Err(error) if crate::abort::is_abort_error(&error, Some(&signal)) => {
+                        (name, definition, None, None)
+                    }
+                    Err(error) => (name, definition, None, Some(error.to_string())),
+                }
+            }
+        },
+    )
+    .await;
+
+    // `if (initialSignal?.aborted) return state;` (`init.ts:301`) — BEFORE the owner check, and it
+    // returns `Ok`, not `Err`. This is the FIFTH exit from this function: a caller-cancelled init
+    // hands back the state it built rather than failing.
+    if snapshot.initial_signal.as_ref().is_some_and(CancelToken::is_cancelled) {
+        return Ok(state);
+    }
+    // MCP-046 checkpoint 1 (`init.ts:302`).
+    owner.throw_if_inactive()?;
+
+    // ── §12 — the two-pass metadata build (MCP-023) ────────────────────────────────────────
+    let prefix = state.config.tool_prefix();
+
+    // Pass one, over EVERY successful connection first (`init.ts:304-325`): a SIMPLE prefixed
+    // list — no `includeTools`/`excludeTools` filtering, no collision resolution, no visibility
+    // check — because it IS the collision universe pass two resolves against. Building it with
+    // [`crate::registration::build_tool_metadata`] would be circular: that function's answer for
+    // one server depends on this map's entry for every other.
+    let mut startup_known: indexmap::IndexMap<String, Vec<crate::proxy::ToolMetadata>> =
+        indexmap::IndexMap::new();
+    for (name, definition, connection, _) in &results {
+        let Some(connection) = connection.as_ref() else { continue };
+        let effective_prefix = crate::registration::resolve_tool_prefix(Some(definition), prefix);
+        let mut metadata: Vec<crate::proxy::ToolMetadata> = connection
+            .tools()
+            .iter()
+            .filter(|tool| !tool.name.is_empty())
+            .map(|tool| crate::proxy::ToolMetadata::new(
+                crate::registration::format_tool_name(&tool.name, name, effective_prefix),
+                tool.name.to_string(),
+                tool.description.as_deref().unwrap_or_default(),
+            ))
+            .collect();
+        // `definition.exposeResources !== false ? … : []` (`init.ts:313`), and the `resource?.name
+        // && resource?.uri` guard that goes with it.
+        if definition.expose_resources() {
+            for resource in &connection.resources() {
+                if resource.name.is_empty() || resource.uri.is_empty() {
+                    continue;
+                }
+                let original_name = crate::registration::resource_base_tool_name(&resource.name);
+                metadata.push(crate::proxy::ToolMetadata {
+                    name: crate::registration::format_tool_name(
+                        &original_name,
+                        name,
+                        effective_prefix,
+                    ),
+                    original_name,
+                    description: resource
+                        .description
+                        .clone()
+                        .unwrap_or_else(|| format!("Read resource: {}", resource.uri)),
+                    resource_uri: Some(resource.uri.clone()),
+                    ui_visibility: None,
+                    input_schema: None,
+                });
+            }
+        }
+        startup_known.insert(name.clone(), metadata);
+    }
+
+    // Pass two, per server (`init.ts:327-362`).
+    for (name, definition, connection, error) in &results {
+        // MCP-046 checkpoint 2 (`init.ts:328`) — at the TOP of each iteration, so a stop observed
+        // mid-pass leaves the remaining servers untouched instead of half-committed.
+        owner.throw_if_inactive()?;
+
+        // `if (error || !connection)` — a needs-auth result carries BOTH a `None` connection and a
+        // message, and a live-signal abort carries neither.
+        let connection = match connection.as_ref().filter(|_| error.is_none()) {
+            Some(connection) => connection,
+            None => {
+                // `if (initialSignal?.aborted) continue;` FIRST (`init.ts:330`), before anything is
+                // recorded: a cancelled init must not poison the next sixty seconds of every
+                // server's availability.
+                if snapshot.initial_signal.as_ref().is_some_and(CancelToken::is_cancelled) {
+                    continue;
+                }
+                // `if (error) recordFailure(...)` — the abort arm has no message and records
+                // nothing.
+                if let Some(message) = error.as_deref() {
+                    crate::live::record_failure(&state, name, message);
+                }
+                let display = crate::ui::sanitize_terminal_text(
+                    error.as_deref().unwrap_or("Unknown connection failure"),
+                );
+                let line = format!("MCP: Failed to connect to {name}: {display}");
+                if let Some(ui) = state.ui.as_ref() {
+                    HostServices::notify(ui.as_ref(), &line, cyrup_ext::NotifyKind::Error);
+                }
+                // Upstream emits the notice AND `console.error` (`init.ts:336`), because a
+                // headless run has only the second. This crate's established rendering of
+                // `console.error` is `tracing::error!` (`lifecycle.rs`'s health-check catch does
+                // the same) — writing raw to stderr from inside a TUI session would corrupt the
+                // display that `ui.notify` already served.
+                tracing::error!("{line}");
+                continue;
+            }
+        };
+
+        // `buildToolMetadata(..., startupKnownMetadata, true)` — the startup snapshot, NOT
+        // `state.toolMetadata`, and `includeMissingConfiguredCandidates: true` with it.
+        let built = crate::registration::build_tool_metadata(
+            &connection.tools(),
+            &connection.resources(),
+            definition,
+            name,
+            prefix,
+            Some(&state.config.mcp_servers),
+            Some(&startup_known),
+            true,
+        );
+        let failed_tools = built.failed_tools.len();
+        if let Ok(mut map) = state.tool_metadata.lock() {
+            map.insert(name.clone(), built.metadata);
+        }
+        if let Ok(mut counts) = state.resource_counts.lock() {
+            counts.insert(name.clone(), connection.resources().len());
+        }
+        // `if (!connection.promptDiscoveryFailed)` — only a live `prompts/list` writes the map and
+        // joins the live set (`init.ts:340-343`).
+        if !connection.prompt_discovery_failed() {
+            let prompts = crate::registration::reconstruct_prompt_metadata(
+                name,
+                &connection.prompts(),
+                prefix,
+                Some(definition),
+            );
+            if let Ok(mut map) = state.prompt_metadata.lock() {
+                map.insert(name.clone(), prompts);
+            }
+            if let Ok(mut live) = state.prompt_metadata_live.lock() {
+                live.insert(name.clone());
+            }
+        }
+        // `if (connection.instructions) … else delete` (`init.ts:344-348`) — a TRUTHY test, so an
+        // EMPTY string DELETES.
+        if let Ok(mut map) = state.server_instructions.lock() {
+            match connection.instructions().filter(|text| !text.is_empty()) {
+                Some(text) => {
+                    map.insert(name.clone(), text.to_string());
+                }
+                None => {
+                    map.shift_remove(name);
+                }
+            }
+        }
+        crate::live::update_metadata_cache(
+            &state,
+            &dirs,
+            name,
+            crate::live::MetadataCacheOptions::preserving(),
+        );
+        state.notify_tool_metadata_updated(name, "startup");
+        state.lifecycle.mark_keep_alive_after_connect(name);
+
+        if failed_tools > 0
+            && let Some(ui) = state.ui.as_ref()
+        {
+            HostServices::notify(
+                ui.as_ref(),
+                &format!("MCP: {name} - {failed_tools} tools skipped"),
+                cyrup_ext::NotifyKind::Warning,
+            );
+        }
+    }
+
+    // ── §13 — the startup summary (`init.ts:364-372`) ──────────────────────────────────────
+    let connected_count =
+        results.iter().filter(|(_, _, connection, _)| connection.is_some()).count();
+    let failed_count = results.iter().filter(|(_, _, _, error)| error.is_some()).count();
+    if let Some(ui) = state.ui.as_ref()
+        && connected_count > 0
+        && state.config.settings_or_default().notify_on_startup_connect()
+    {
+        let total_tools = total_tool_count(&state);
+        // `{total}` is `startupServers.length`, NOT the config count: a lazy server that was never
+        // in this pass is not a server that failed to connect.
+        let message = if failed_count > 0 {
+            format!(
+                "MCP: {connected_count}/{} servers connected ({total_tools} tools)",
+                startup.len()
+            )
+        } else {
+            format!("MCP: {connected_count} servers connected ({total_tools} tools)")
+        };
+        HostServices::notify(ui.as_ref(), &message, cyrup_ext::NotifyKind::Info);
+    }
+
+    // ── §14 — the `MCP_DIRECT_TOOLS` bootstrap (MCP-026) ───────────────────────────────────
+    let env_direct = std::env::var("MCP_DIRECT_TOOLS").ok();
+    // `envDirect !== "__none__"` skips the WHOLE block (`init.ts:375`), which is a different shape
+    // from [`direct_tools_override`]'s `Some(vec![])`: the RAW value is tested first, and only then
+    // normalised for the predicate.
+    if env_direct.as_deref() != Some(DIRECT_TOOLS_NONE_SENTINEL) {
+        // Re-read the cache from disk rather than reusing §9's value, exactly as upstream does
+        // (`init.ts:376`): §12 has just rewritten it, and a server whose entry landed there is no
+        // longer missing.
+        let current_cache = crate::registration::load_metadata_cache(&dirs);
+        let env_override = direct_tools_override(env_direct.as_deref());
+        let missing = crate::registration::missing_configured_direct_tool_servers(
+            &state.config,
+            current_cache.as_ref(),
+            env_override.as_deref(),
+        );
+        if !missing.is_empty() {
+            // `filter(name => !results.some(r => r.name === name && r.connection))`
+            // (`init.ts:382`) — a server §11 already connected is cached and not missing.
+            let pending: Vec<String> = missing
+                .into_iter()
+                .filter(|name| {
+                    !results.iter().any(|(other, _, connection, _)| {
+                        other == name && connection.is_some()
+                    })
+                })
+                .collect();
+            let bootstrap = crate::live::parallel_limit(
+                pending,
+                crate::live::STARTUP_CONNECT_CONCURRENCY,
+                |name| {
+                    let state = Arc::clone(&state);
+                    let dirs = dirs.clone();
+                    let signal = runtime_signal.clone();
+                    async move {
+                        // `if (!definition) throw new Error(...)` (`init.ts:387`) — thrown INSIDE
+                        // the try, so it lands in the same catch a connect failure does.
+                        let Some(definition) = state.config.mcp_servers.get(&name).cloned() else {
+                            let message = format!("MCP server \"{name}\" is not configured");
+                            crate::live::record_failure(&state, &name, &message);
+                            tracing::debug!(
+                                "MCP: direct-tools bootstrap failed for {name}: {}",
+                                crate::ui::sanitize_terminal_text(&message)
+                            );
+                            return (name, false);
+                        };
+                        match state.manager.connect(&name, &definition, Some(&signal)).await {
+                            Ok(connection)
+                                if connection.status() == ConnectionStatus::NeedsAuth =>
+                            {
+                                (name, false)
+                            }
+                            Ok(_) => {
+                                crate::live::update_server_metadata(&state, &name);
+                                crate::live::update_metadata_cache(
+                                    &state,
+                                    &dirs,
+                                    &name,
+                                    crate::live::MetadataCacheOptions::preserving(),
+                                );
+                                state.notify_tool_metadata_updated(&name, "direct-tools-bootstrap");
+                                state.lifecycle.mark_keep_alive_after_connect(&name);
+                                crate::live::clear_failure(&state, &name);
+                                (name, true)
+                            }
+                            Err(error) if crate::abort::is_abort_error(&error, Some(&signal)) => {
+                                (name, false)
+                            }
+                            Err(error) => {
+                                let message = error.to_string();
+                                crate::live::record_failure(&state, &name, &message);
+                                tracing::debug!(
+                                    "MCP: direct-tools bootstrap failed for {name}: {}",
+                                    crate::ui::sanitize_terminal_text(&message)
+                                );
+                                (name, false)
+                            }
+                        }
+                    }
+                },
+            )
+            .await;
+            let bootstrapped: Vec<String> =
+                bootstrap.into_iter().filter_map(|(name, ok)| ok.then_some(name)).collect();
+            // MCP-046 checkpoint 3 (`init.ts:411`), INSIDE the `missingCacheServers.length > 0`
+            // arm — not outside it.
+            owner.throw_if_inactive()?;
+            if !bootstrapped.is_empty()
+                && let Some(ui) = state.ui.as_ref()
+            {
+                // BYTE-EXACT upstream (`init.ts:413`), and deliberately so. 13a MCP-026 offers the
+                // alternative of registering the new surface here and saying "are now available"
+                // instead — but that requires `McpExtension::sync_tool_surface`, and this function
+                // holds no extension handle: `initialize_mcp`'s inputs are the owner, the dirs, the
+                // context snapshot and the options. The registration belongs with
+                // `install_surface_sync`'s caller (MCP-011), and the message must not change
+                // before it: promising availability that never arrives is worse than the restart.
+                HostServices::notify(
+                    ui.as_ref(),
+                    &format!(
+                        "MCP: direct tools for {} will be available after restart",
+                        bootstrapped.join(", ")
+                    ),
+                    cyrup_ext::NotifyKind::Info,
+                );
+            }
+        }
+    }
+
+    // ── §15 — lifecycle callbacks (MCP-027) ────────────────────────────────────────────────
+    // FIVE, not three (`init.ts:418-451`). Omitting `health_restored` leaves a recovered server
+    // marked `failed` for the full 60 s; omitting `auth_required` leaves a `needs-auth` server
+    // marked `failed`. Every body opens with the owner guard: that is what keeps a generation-N
+    // timer from writing into generation N+1.
+    let on_reconnect: crate::lifecycle::ReconnectCallback = {
+        let state = Arc::clone(&state);
+        let dirs = dirs.clone();
+        Arc::new(move |server: String| {
+            let state = Arc::clone(&state);
+            let dirs = dirs.clone();
+            Box::pin(async move {
+                if !state.owner.is_active() {
+                    return Ok(());
+                }
+                crate::live::update_server_metadata(&state, &server);
+                crate::live::update_metadata_cache(
+                    &state,
+                    &dirs,
+                    &server,
+                    crate::live::MetadataCacheOptions::preserving(),
+                );
+                state.notify_tool_metadata_updated(&server, "lifecycle-reconnect");
+                crate::live::clear_failure(&state, &server);
+                crate::live::update_status_bar(&state);
+                Ok(())
+            })
+        })
+    };
+    state.lifecycle.set_reconnect_callback(on_reconnect);
+
+    let on_reconnect_failure: crate::lifecycle::ReconnectFailureCallback = {
+        let state = Arc::clone(&state);
+        Arc::new(move |server: &str, error: &McpError| {
+            if !state.owner.is_active() {
+                return;
+            }
+            crate::live::record_failure(&state, server, &error.to_string());
+            crate::live::update_status_bar(&state);
+        })
+    };
+    state.lifecycle.set_reconnect_failure_callback(on_reconnect_failure);
+
+    let on_health_restored: crate::lifecycle::HealthRestoredCallback = {
+        let state = Arc::clone(&state);
+        Arc::new(move |server: String| {
+            let state = Arc::clone(&state);
+            Box::pin(async move {
+                if !state.owner.is_active() {
+                    return Ok(());
+                }
+                crate::live::clear_failure(&state, &server);
+                crate::live::update_status_bar(&state);
+                Ok(())
+            })
+        })
+    };
+    state.lifecycle.set_health_restored_callback(on_health_restored);
+
+    let on_auth_required: crate::lifecycle::AuthRequiredCallback = {
+        let state = Arc::clone(&state);
+        Arc::new(move |server: String| {
+            let state = Arc::clone(&state);
+            Box::pin(async move {
+                if !state.owner.is_active() {
+                    return Ok(());
+                }
+                crate::live::clear_failure(&state, &server);
+                crate::live::update_status_bar(&state);
+                Ok(())
+            })
+        })
+    };
+    state.lifecycle.set_auth_required_callback(on_auth_required);
+
+    let on_idle_shutdown: crate::lifecycle::IdleShutdownCallback = {
+        let state = Arc::clone(&state);
+        Arc::new(move |server: &str| {
+            if !state.owner.is_active() {
+                return;
+            }
+            let minutes = effective_idle_timeout_minutes(&state, server);
+            tracing::debug!("{server} shut down (idle {minutes}m)");
+            crate::live::update_status_bar(&state);
+        })
+    };
+    state.lifecycle.set_idle_shutdown_callback(on_idle_shutdown);
+
+    // ── The tail (`init.ts:453-458`) ───────────────────────────────────────────────────────
+    // MCP-046 checkpoint 4, the health checks, the `off` footer clear, and a PUBLISH — not an
+    // `update_status_bar`, which would additionally WRITE the footer this path deliberately leaves
+    // to whatever §11 last set.
+    owner.throw_if_inactive()?;
+    // `startHealthChecks(runtimeSignal)`. [`McpLifecycleManager::start`] takes the OWNER rather
+    // than a token — it re-reads `owner.token()` itself — so the combined runtime signal is not
+    // threaded here; the owner half of it is the half that stops the loop.
+    state.lifecycle.start(&owner);
+    if state.config.settings_or_default().mcp_footer_status() == crate::config::FooterStatus::Off
+        && let Some(ui) = state.ui.as_ref()
+    {
+        HostServices::set_status(ui.as_ref(), "mcp", None);
+    }
+    state.publish_status(crate::live::create_mcp_status_snapshot(&state));
     Ok(state)
+}
+
+/// `saveMetadataCache({version: 1, servers: {}})` (`init.ts:233`, `:236`) — §9's two write arms.
+///
+/// [`crate::dirs::save_metadata_cache`] merges rather than replaces, which is what makes upstream's
+/// one-entry writes non-destructive; an empty cache therefore truncates only because the strict
+/// reader inside it rejects the same bytes the lenient one just did.
+///
+/// The failure is swallowed with a debug line, as `metadata-cache.ts`'s own try/catch is: a cache
+/// that cannot be written is a slower next start, never a failed init.
+fn save_empty_metadata_cache(path: &std::path::Path) {
+    if let Err(error) =
+        crate::dirs::save_metadata_cache(path, &crate::dirs::MetadataCache::default())
+    {
+        tracing::debug!("MCP: failed to bootstrap the metadata cache: {error}");
+    }
+}
+
+/// `tool-metadata.ts:146` `totalToolCount(state)` — every server's tool count, summed.
+///
+/// Deliberately **not** [`crate::state::McpStatusSnapshot::total_tools`]: that one excludes
+/// disabled servers and falls back to the live connection's list, where this is the flat sum over
+/// `state.toolMetadata` that §13's summary line quotes.
+fn total_tool_count(state: &McpState) -> usize {
+    state
+        .tool_metadata
+        .lock()
+        .map(|map| map.values().map(Vec::len).sum())
+        .unwrap_or(0)
+}
+
+/// `getEffectiveIdleTimeoutMinutes(state, serverName)` (`init.ts:664-673`) — what §15's idle
+/// shutdown line reports.
+///
+/// Three rungs, in upstream's order: the definition's own `idleTimeout`; `0` for a mode that
+/// persists after its first spawn; then the global setting. An unconfigured server takes the global
+/// directly, skipping both.
+fn effective_idle_timeout_minutes(state: &McpState, server: &str) -> f64 {
+    let global = || {
+        state
+            .config
+            .settings_or_default()
+            .idle_timeout
+            .unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES)
+    };
+    let Some(definition) = state.config.mcp_servers.get(server) else { return global() };
+    if let Some(minutes) = definition.idle_timeout {
+        return minutes;
+    }
+    if matches!(
+        definition.lifecycle_mode(),
+        ServerLifecycle::Eager | ServerLifecycle::LazyKeepAlive
+    ) {
+        return 0.0;
+    }
+    global()
 }
 
 /// `startLoadTimeInitialization`'s gate (MCP-012): connect at load **only** when some enabled
@@ -464,7 +1073,7 @@ use rmcp::model::{
 };
 use rmcp::service::{
     ClientInitializeError, ClientLifecycleMode, MaybeSendFuture, NotificationContext, Peer,
-    PeerRequestOptions, RequestContext, RoleClient, RunningService,
+    PeerRequestOptions, RequestContext, RoleClient, RunningService, ServiceError,
 };
 use rmcp::model::{ClientJsonRpcMessage, ClientRequest, JsonRpcMessage, ServerJsonRpcMessage};
 use rmcp::transport::common::http_header::{
@@ -483,7 +1092,7 @@ use crate::config::{HttpTransport, ProtocolVersionSetting, ServerEntry};
 use crate::errors::McpError;
 use crate::lifecycle::ConnectionStatus;
 use crate::server_manager::{
-    ConnectionFactory, ConnectionResource, CreateConnection, NewConnection,
+    ConnectionFactory, ConnectionResource, CreateConnection, Discovery, NewConnection,
 };
 
 // -------------------------------------------------------------------------------------------------
@@ -2072,7 +2681,9 @@ impl ClientHandler for McpClientHandler {
 /// half is not expressible on this call — rmcp's connect takes no per-request timeout — so it is
 /// applied one layer out, by [`connect_client_bounded`], which every connect arm calls instead of
 /// this function. Do not call this one directly from a connect arm: an unbounded handshake is
-/// exactly the defect `connect_client_bounded` exists to prevent.
+/// exactly the defect `connect_client_bounded` exists to prevent, and `ct` is the **service's**
+/// lifetime token rather than the handshake's — passing an attempt signal straight in closes the
+/// connection the moment that attempt settles. [`detachable_from`] is what scopes it.
 ///
 /// # Errors
 ///
@@ -2148,16 +2759,87 @@ where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    let Some(budget) = timeout else {
-        return Ok(connect_client(handler, transport, lifecycle, ct).await);
+    // `signal?.addEventListener("abort", closeTransport, { once: true })` — armed for the connect,
+    // and released by `connectClientWithAbort`'s `finally` the moment it returns. See
+    // [`detachable_from`] for why holding it past that point closed every connection this crate
+    // made.
+    let (service, detach) = detachable_from(&ct);
+    let outcome = match timeout {
+        None => Ok(connect_client(handler, transport, lifecycle, service).await),
+        // Dropping the `connect_client` future is what tears the half-built connection down, and it
+        // is the same drop the abort path relies on: `serve_client_with_ct_inner` holds the
+        // transport in a local, so the transport (and, for stdio, `ChildWithCleanup::drop`'s
+        // `kill()`) goes with it.
+        Some(budget) => {
+            match tokio::time::timeout(budget, connect_client(handler, transport, lifecycle, service))
+                .await
+            {
+                Ok(outcome) => Ok(outcome),
+                Err(_elapsed) => Err(budget),
+            }
+        }
     };
-    // Dropping the `connect_client` future is what tears the half-built connection down, and it is
-    // the same drop the abort path relies on: `serve_client_with_ct_inner` holds the transport in a
-    // local, so the transport (and, for stdio, `ChildWithCleanup::drop`'s `kill()`) goes with it.
-    match tokio::time::timeout(budget, connect_client(handler, transport, lifecycle, ct)).await {
-        Ok(outcome) => Ok(outcome),
-        Err(_elapsed) => Err(budget),
+    // The `finally`. Fired on BOTH arms, success and failure: on failure the transport is already
+    // gone and this only reaps the joiner task.
+    detach.cancel();
+    outcome
+}
+
+/// A token that follows `attempt` **until the returned handle is cancelled**, and then stops —
+/// `connectClientWithAbort`'s `addEventListener` / `finally { removeEventListener }` pair.
+///
+/// # The defect this exists to close, MEASURED
+///
+/// rmcp's `ct` argument is the **service's** lifetime token, not the handshake's: it is stored on
+/// the `RunningService` and cancelling it ends the service task, which closes the transport. This
+/// crate was handing it `CreateConnection::attempt` — a token [`crate::server_manager`] deliberately
+/// cancels *on success*, in `AbortHandle::reap`, to release the parked `combine` joiners once the
+/// attempt has settled. So every connection this crate made was torn down microseconds after it was
+/// established, while the manager's bookkeeping still read `Connected`.
+///
+/// It was invisible until something actually used the peer. MEASURED against the real manager and a
+/// real `sh` child: `tools/call` on the connection `connect` had just returned answered
+/// `Err(TransportClosed)`, and the identical call through the factory with the attempt token left
+/// unreaped answered `Ok(… "echoed:pong")`. Discovery (MCP-119) does not see it because it runs
+/// inside `createConnection`, before the manager reaps.
+///
+/// Upstream cannot have this bug: its abort listener closes the transport and is removed by
+/// `connectClientWithAbort`'s `finally`, so the connect signal governs the connect and nothing
+/// after it (`server-manager.ts:646-674`). This restores that scoping — an abort *during* connect
+/// still cancels rmcp's initialise (MCP-123 is untouched), and an abort that arrives after a
+/// successful handshake is caught by [`discover`]'s `throwIfAborted`, which closes the resource
+/// through the ordinary catch rather than by killing a live service out from under it.
+///
+/// Returns `(service_token, detach_handle)`. Cancelling the detach handle releases the link and
+/// reaps the joiner; it never cancels the service token.
+fn detachable_from(attempt: &CancelToken) -> (CancelToken, CancelToken) {
+    let detach = CancelToken::new();
+    let service = CancelToken::new();
+    // Already aborted: no task, and the connect must still see a cancelled token.
+    if attempt.is_cancelled() {
+        service.cancel();
+        return (service, detach);
     }
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        // `combine`'s discipline: this crate denies `clippy::panic` and `tokio::spawn` panics
+        // off-runtime. Degrading to the attempt token itself keeps the abort half working and
+        // restores the old over-long lifetime, which is strictly better than a connect that cannot
+        // be aborted at all. Unreachable in practice — this is an `async fn`, so a runtime exists.
+        tracing::warn!("MCP: no tokio runtime to scope the connect signal on — using the attempt's");
+        return (attempt.clone(), detach);
+    };
+    let watched = attempt.clone();
+    let armed = service.clone();
+    let released = detach.clone();
+    handle.spawn(async move {
+        tokio::select! {
+            () = watched.cancelled() => armed.cancel(),
+            // The `finally`, and the joiner's own exit path.
+            () = released.cancelled() => {}
+            () = armed.cancelled() => {}
+        }
+    });
+    (service, detach)
 }
 
 /// `new SdkError(SdkErrorCode.RequestTimeout, "Request timed out", { timeout })` — the SDK's
@@ -2417,7 +3099,22 @@ pub fn unauthorized_challenge(error: &ClientInitializeError) -> Option<&str> {
         }
         _ => return None,
     };
-    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(transport.error.as_ref());
+    unauthorized_in_chain(transport.error.as_ref())
+}
+
+/// The `source()` walk itself, over any error chain — [`unauthorized_challenge`]'s second half.
+///
+/// Split out because discovery needs the identical predicate on a **different** root type. A 401 on
+/// `tools/list` never becomes a [`ClientInitializeError`]: the handshake is long over, so it arrives
+/// as [`ServiceError::TransportSend`] wrapping a `DynamicTransportError` whose `error` field is the
+/// same boxed transport error [`unauthorized_challenge`] walks. Upstream's `isUnauthorizedHttpError`
+/// is one predicate applied at both sites (`server-manager.ts:73-75`, used by `createConnection`'s
+/// catch *and* by `fetchAllResources`/`fetchAllPrompts`), and this is that one predicate.
+///
+/// Returns the `WWW-Authenticate` challenge, `Some("")` for a bare 401 — see [`bare_unauthorized`]
+/// for why an empty challenge is a real value — and `None` when no link in the chain is a 401.
+fn unauthorized_in_chain<'a>(root: &'a (dyn std::error::Error + 'static)) -> Option<&'a str> {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(root);
     while let Some(current) = source {
         if let Some(required) =
             current.downcast_ref::<rmcp::transport::streamable_http_client::AuthRequiredError>()
@@ -2597,11 +3294,14 @@ impl std::fmt::Debug for McpConnection {
 }
 
 impl McpConnection {
-    /// The `Peer` every request goes through. **Not on the [`ConnectionResource`] trait**, which
-    /// exposes only `close`/`has_session_id`/`child_pid`/`stderr_detail` — so a manager holding an
-    /// `Arc<dyn ConnectionResource>` cannot reach it. Discovery (MCP-119) and `tools/call` need it,
-    /// and giving them a way to get it is a `server_manager.rs` change (a `peer()` method on the
-    /// trait, or a typed field on `NewConnection`), named here rather than smuggled in.
+    /// The `Peer` every request goes through, for a caller that already holds the concrete type.
+    ///
+    /// A caller holding an `Arc<dyn ConnectionResource>` — which is all the manager ever has — takes
+    /// [`ConnectionResource::peer`] instead; that impl is this method wrapped in `Some`, so the two
+    /// hand back the same handle and this one is the single place the field is read. The trait
+    /// method has to be an `Option` because resources with no client behind them implement it too;
+    /// here the peer is a struct field set at the handshake, so the `Option` would always be `Some`
+    /// and is not worth making a caller unwrap.
     #[must_use]
     pub fn peer(&self) -> &Peer<RoleClient> {
         &self.peer
@@ -2648,6 +3348,10 @@ impl ConnectionResource for McpConnection {
 
     fn child_pid(&self) -> Option<u32> {
         self.pid
+    }
+
+    fn peer(&self) -> Option<&Peer<RoleClient>> {
+        Some(McpConnection::peer(self))
     }
 
     fn stderr_detail(&self) -> Option<String> {
@@ -3332,6 +4036,252 @@ fn initialize_error(
     }
 }
 
+// -------------------------------------------------------------------------------------------------
+// MCP-119 — discovery: `tools/list`, `resources/list`, `prompts/list` (§3.9)
+// -------------------------------------------------------------------------------------------------
+
+/// One list call's failure: what the request itself returned, or `requestOptions.timeout` expiring.
+///
+/// The two are kept apart because they answer the 401 predicate differently — a timeout is never a
+/// 401, and folding it into `ServiceError` would make [`unauthorized_list_failure`] guess.
+#[derive(Debug)]
+enum ListFailure {
+    /// `requestOptions.timeout` elapsed with no response.
+    ///
+    /// Carries nothing: the budget is not in the message upstream produces — `SdkError`'s
+    /// constructor is `super(message)` and the timeout rides in `data` — and it is already known to
+    /// the only code that could want it, which computed it two lines earlier.
+    Timeout,
+    /// rmcp answered, and the answer was an error.
+    Service(ServiceError),
+}
+
+impl std::fmt::Display for ListFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // The SDK's per-request timer message, byte for byte — the same one the handshake's
+            // budget produces, because upstream arms the same timer over both.
+            Self::Timeout => f.write_str(HANDSHAKE_TIMED_OUT),
+            Self::Service(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+/// `isUnauthorizedHttpError(error)` against a discovery failure.
+///
+/// A 401 that arrives *after* the handshake is not a [`ClientInitializeError`]; rmcp delivers it as
+/// [`ServiceError::TransportSend`] around a `DynamicTransportError` whose boxed `error` is the very
+/// same transport error [`unauthorized_challenge`] inspects. So the chain walk is shared and only
+/// the unwrapping differs. Every other `ServiceError` — a protocol error from the server, a closed
+/// transport, an unexpected response — is not a 401 and must not be treated as one, or a server
+/// that merely errors on `resources/list` would be sent down the OAuth path.
+fn unauthorized_list_failure(failure: &ListFailure) -> bool {
+    match failure {
+        ListFailure::Timeout => false,
+        ListFailure::Service(ServiceError::TransportSend(error)) => {
+            unauthorized_in_chain(error.error.as_ref()).is_some()
+        }
+        ListFailure::Service(_) => false,
+    }
+}
+
+/// One `list_all_*` call under `requestOptions.timeout`.
+///
+/// # NAMED DELTA — what the budget covers
+///
+/// `CreateConnection::request_options` is upstream's single `RequestOptions` object, handed to
+/// every `client.listTools(cursor, requestOptions)` call, so upstream arms the timer **per page**.
+/// rmcp's `Peer::list_all_*` own their cursor loops (13c's MCP-119 row names them as the port of
+/// `fetchAll*`) and take no per-request options, so the budget is armed around the **whole list**
+/// instead: a paginated catalog gets one budget for all its pages rather than one per page. That is
+/// strictly stricter than upstream, never looser, and it is what keeps a server that answers
+/// `initialize` and then stalls on `tools/list` from parking the connect — and with it the
+/// manager's per-name single-flight slot — for as long as the child lives.
+///
+/// A dropped list future is safe to abandon: with no subscription and no progress-reset watcher,
+/// `send_request_with_option_and_subscription` registers nothing in the peer's side tables
+/// (`rmcp-3.1.4/src/service.rs:859-931`), so the only thing left behind is one oneshot the service
+/// loop drops when the late response arrives.
+///
+/// The one thing upstream's per-request timer does that this does not is send
+/// `notifications/cancelled` for the abandoned request; rmcp only emits that from
+/// `RequestHandle::await_response`'s own timeout arm, which the typed `list_all_*` helpers do not
+/// route through. A server that keeps building a tool list nobody will read is the cost, bounded by
+/// the connection being torn down immediately afterwards.
+async fn bounded_list<T, F>(budget: Option<Duration>, list: F) -> Result<T, ListFailure>
+where
+    F: std::future::Future<Output = Result<T, ServiceError>>,
+{
+    let Some(budget) = budget else {
+        return list.await.map_err(ListFailure::Service);
+    };
+    match tokio::time::timeout(budget, list).await {
+        Ok(outcome) => outcome.map_err(ListFailure::Service),
+        Err(_elapsed) => Err(ListFailure::Timeout),
+    }
+}
+
+/// `Promise.all([fetchAllTools, fetchAllResources, fetchAllPrompts])` and the `instructions` read
+/// that precedes it (§3.9) — the body of MCP-119.
+///
+/// # The three per-list failure policies, which are not the same policy
+///
+/// * **tools** — `fetchAllTools` has no `catch` at all. Unconditional, and every error propagates
+///   into `createConnection`'s catch, which closes the half-built connection. A server whose
+///   `tools/list` fails does not become a connection with no tools; it fails to connect.
+/// * **resources** — capability-gated on `serverCapabilities.resources`, and when the capability is
+///   absent **no request is sent**. On error: rethrow if the request signal aborted, rethrow a 401,
+///   otherwise swallow to `[]` with no log.
+/// * **prompts** — capability-gated on `.prompts`. Same two rethrows, otherwise `[]` **plus**
+///   `prompt_discovery_failed = true` and one `debug`-level line. The flag is the whole point: it
+///   is what stops `init.ts`'s §12 pass from publishing an empty prompt map as authoritative.
+///
+/// # `join!`, deliberately, not `try_join!`
+///
+/// `try_join!` short-circuits on the first error and drops its siblings mid-flight. That would let
+/// a resources failure — which upstream *swallows* — cancel the tools list, turning a connection
+/// that should have succeeded with `resources: []` into a hard failure. The three policies above
+/// only exist if all three futures are allowed to finish. This is the one place in the file where
+/// the choice of combinator is a behavioural decision rather than a stylistic one.
+///
+/// # Errors
+///
+/// [`McpError::Aborted`] when the request signal fired, and [`McpError::Server`] — carrying the
+/// child's stderr tail, §3.3 step 8 — for a tools failure or a rethrown 401.
+async fn discover(
+    request: &CreateConnection,
+    resource: &dyn ConnectionResource,
+) -> McpResult<Discovery> {
+    // `throwIfAborted(signal)`. Upstream's is at the top of the try; the one that matters after a
+    // successful handshake is this — a `close` that raced the handshake must not leave a live child
+    // behind just because it arrived a microsecond late, and it must not spend a `tools/list` on a
+    // connection that is already being torn down.
+    crate::abort::throw_if_aborted(&request.attempt, None)?;
+
+    let name = request.name.as_str();
+    let Some(peer) = resource.peer() else {
+        // Not reachable from either connect arm — both hand `post_handshake` an `McpConnection`,
+        // whose `peer()` is a struct field set at the handshake. It is an error rather than an
+        // empty catalog because the two are not the same claim: `[]` would assert that the server
+        // was asked and answered nothing, and this is the case where it was never asked.
+        return Err(discovery_error(
+            name,
+            "MCP discovery cannot run: the connection carries no client",
+            resource,
+        ));
+    };
+
+    // `client.getServerCapabilities?.()` and `client.getInstructions?.()` — both off the
+    // `InitializeResult` rmcp stored at the handshake. `None` is a peer that has not completed one,
+    // which cannot happen here; reading it as "advertised nothing" keeps the gate closed, which is
+    // the safe direction: an ungated `resources/list` against a server that never offered the
+    // capability is a request upstream provably does not send.
+    let info = peer.peer_info();
+    let (has_resources, has_prompts, instructions) = match info.as_deref() {
+        Some(info) => (
+            info.capabilities.resources.is_some(),
+            info.capabilities.prompts.is_some(),
+            info.instructions.clone(),
+        ),
+        None => (false, false, None),
+    };
+
+    let budget = request.request_options.as_ref().and_then(|options| options.timeout);
+    let (tools, resources_result, prompts_result) = tokio::join!(
+        bounded_list(budget, peer.list_all_tools()),
+        async {
+            if !has_resources {
+                return None;
+            }
+            Some(bounded_list(budget, peer.list_all_resources()).await)
+        },
+        async {
+            if !has_prompts {
+                return None;
+            }
+            Some(bounded_list(budget, peer.list_all_prompts()).await)
+        },
+    );
+
+    // `if (requestOptions?.signal?.aborted) throwIfAborted(requestOptions.signal)` — upstream tests
+    // the REQUEST signal, not the attempt controller's, and `CreateConnection::request` is exactly
+    // that token. Hoisted above the three reductions because it is the same test in both catches
+    // and it must win over the swallow-to-`[]` arms: an aborted discovery is a failure, not a
+    // server with no resources.
+    let aborted = request.request.is_cancelled();
+
+    // `fetchAllTools` — no catch. Errors propagate.
+    let tools = tools.map_err(|failure| {
+        if aborted {
+            return McpError::Aborted(crate::abort::ABORTED_FALLBACK_REASON.to_string());
+        }
+        discovery_error(name, &failure.to_string(), resource)
+    })?;
+
+    // `fetchAllResources` — swallow to `[]`, except on abort and 401.
+    let resources = match resources_result {
+        Some(Ok(resources)) => resources,
+        // The capability was absent, so nothing was sent and `[]` is the answer with no request on
+        // the wire — which is the observable half of the gate.
+        None => Vec::new(),
+        Some(Err(failure)) => {
+            if aborted {
+                return Err(McpError::Aborted(
+                    crate::abort::ABORTED_FALLBACK_REASON.to_string(),
+                ));
+            }
+            if unauthorized_list_failure(&failure) {
+                return Err(discovery_error(name, &failure.to_string(), resource));
+            }
+            Vec::new()
+        }
+    };
+
+    // `fetchAllPrompts` — same two rethrows, and the `failed` flag on everything else.
+    let (prompts, prompt_discovery_failed) = match prompts_result {
+        Some(Ok(prompts)) => (prompts, false),
+        None => (Vec::new(), false),
+        Some(Err(failure)) => {
+            if aborted {
+                return Err(McpError::Aborted(
+                    crate::abort::ABORTED_FALLBACK_REASON.to_string(),
+                ));
+            }
+            if unauthorized_list_failure(&failure) {
+                return Err(discovery_error(name, &failure.to_string(), resource));
+            }
+            // BYTE-EXACT: `` logger.debug(`MCP: prompts/list failed: ${message}`) ``.
+            tracing::debug!("MCP: prompts/list failed: {failure}");
+            (Vec::new(), true)
+        }
+    };
+
+    Ok(Discovery {
+        tools,
+        resources,
+        prompts,
+        prompt_discovery_failed,
+        instructions,
+    })
+}
+
+/// [`initialize_error`]'s counterpart for a failure raised after the handshake, where the stderr
+/// tail is reachable through the resource rather than through a local [`StderrPump`].
+///
+/// Same §3.3 step-8 enrichment, same `(a — b — c)` rendering: upstream's catch appends the tail to
+/// whatever error reaches it, and a discovery failure reaches exactly that catch. For an HTTP
+/// connection [`ConnectionResource::stderr_detail`] is `None` and the message is the base text.
+fn discovery_error(server: &str, base: &str, resource: &dyn ConnectionResource) -> McpError {
+    let message = match resource.stderr_detail() {
+        Some(detail) => format!("{base} ({detail})"),
+        None => base.to_string(),
+    };
+    McpError::Server {
+        server: server.to_string(),
+        message,
+    }
+}
+
 impl ConnectionFactory for ConnectionBuilder {
     fn create(&self, request: CreateConnection) -> BoxFuture<'static, McpResult<NewConnection>> {
         // The builder is cheap to clone by `Arc` and the future must be `'static`; every field is
@@ -3351,23 +4301,21 @@ impl ConnectionFactory for ConnectionBuilder {
 impl ConnectionBuilder {
     /// `createConnection` end to end — transport selection, the two arms, and the shared catch.
     ///
-    /// # The shared catch, and the one thing it cannot do yet
+    /// # The shared catch, and what produces the arm it exists for
     ///
     /// Upstream's catch closes the half-built connection and, when *that* close fails, wraps
     /// everything in `MCP connection setup failed` ([`McpError::SetupFailed`]). Reaching that arm
-    /// needs a post-handshake step that can fail — upstream's is **discovery**
-    /// (`Promise.all([fetchAllTools, fetchAllResources, fetchAllPrompts])`, MCP-119) — and this
-    /// builder does not have that one, because `NewConnection` has nowhere to put the results.
+    /// needs a post-handshake step that can fail, and upstream's is **discovery**
+    /// (`Promise.all([fetchAllTools, fetchAllResources, fetchAllPrompts])`, MCP-119). Since that
+    /// unit landed this builder has it: [`Self::post_handshake`] runs [`discover`] inside the try,
+    /// so a server whose `tools/list` fails and whose subsequent `close` *also* fails raises
+    /// `SetupFailed` on the ordinary path.
     ///
-    /// **What it does have, stated precisely, because "no producer" is too strong and was written
-    /// here before:** [`Self::post_handshake`]'s own abort check is a genuine post-handshake step
-    /// that can fail, and when a `close` racing a successful handshake trips it *and* the
-    /// `resource.close()` after it also fails (`McpConnection::close` returns `Err` on a `JoinError`
-    /// from `service.close()`), the wrapper below fires and `SetupFailed` is raised against a real
-    /// server. That window is narrow — an abort that arrives in the microsecond after the handshake
-    /// settled, whose teardown then panics or is cancelled — but it is not empty. What is genuinely
-    /// missing is upstream's *own* producer, discovery: landing MCP-119 into the region marked in
-    /// `post_handshake` is what makes this arm ordinary rather than exotic.
+    /// The narrower producer that predates it is still there and still real: the abort check at the
+    /// top of [`discover`] is itself a post-handshake step that can fail, and when a `close` racing
+    /// a successful handshake trips it *and* the `resource.close()` after it also fails
+    /// (`McpConnection::close` returns `Err` on a `JoinError` from `service.close()`), the same
+    /// wrapper fires.
     ///
     /// `McpServerManager::close_inner`'s pending-connect rethrow arm consumes it and is live:
     /// MCP-124 landed the variant, [`McpError::is_cleanup_failure`] matches it, and
@@ -3391,6 +4339,9 @@ impl ConnectionBuilder {
                         resource: http.resource,
                         status: ConnectionStatus::NeedsAuth,
                         credentials_invalidated: http.credentials_invalidated,
+                        // Nothing was listed: the early return skips the try block, so there is no
+                        // `tools/list` on this arm and `[]` is a fact rather than a placeholder.
+                        discovery: Discovery::default(),
                     });
                 }
                 self.post_handshake(&request, http.resource, http.credentials_invalidated)
@@ -3400,31 +4351,30 @@ impl ConnectionBuilder {
     }
 
     /// The body of `createConnection`'s `try` after the handshake, and its catch.
+    ///
+    /// The try is [`discover`] — the abort check, `client.getInstructions?.()` and the `Promise.all`
+    /// over the three lists (§3.9). Everything it raises flows into the catch below.
+    ///
+    /// Still **not** here, and named so a reader does not assume otherwise:
+    /// `attachAdapterNotificationHandlers` and the identity-guarded `client.onclose`, which are
+    /// MCP-120's and MCP-131's respectively. Their absence costs a refresh on `list_changed`, not a
+    /// catalog: what a server publishes at connect time is now fetched and installed.
     async fn post_handshake(
         &self,
         request: &CreateConnection,
         resource: Arc<dyn ConnectionResource>,
         credentials_invalidated: bool,
     ) -> McpResult<NewConnection> {
-        // `throwIfAborted(signal)` — upstream's is at the TOP of the try, before the connect; the
-        // one that matters after a successful handshake is `connect`'s own step-9 check, which
-        // `McpServerManager` already performs. This one is the port's: a close that raced the
-        // handshake must not leave a live child behind just because it arrived a microsecond late.
-        //
-        // ┌─ MCP-119 lands HERE: `Promise.all([fetchAllTools, fetchAllResources, fetchAllPrompts])`
-        // │  plus `attachAdapterNotificationHandlers` and `client.getInstructions()`. Everything it
-        // │  raises flows into the catch below — which is what gives `SetupFailed` its *upstream*
-        // │  producer. It already has one here: the abort check on the next line, when the
-        // │  `resource.close()` that follows it also fails.
-        // └─
-        let outcome = crate::abort::throw_if_aborted(&request.attempt, None);
-
-        let Err(error) = outcome else {
-            return Ok(NewConnection {
-                resource,
-                status: ConnectionStatus::Connected,
-                credentials_invalidated,
-            });
+        let error = match discover(request, resource.as_ref()).await {
+            Ok(discovery) => {
+                return Ok(NewConnection {
+                    resource,
+                    status: ConnectionStatus::Connected,
+                    credentials_invalidated,
+                    discovery,
+                });
+            }
+            Err(error) => error,
         };
 
         // `const cleanupResults = await Promise.allSettled([abortCleanup ?? client.close()]);`
@@ -4202,6 +5152,248 @@ done
         connection.close().await.expect("close");
     }
 
+    // ── MCP-119 · §3.9 ─────────────────────────────────────────────────────────────
+
+    /// A real stdio MCP server whose every behaviour is an argument, so one fixture covers the
+    /// capability gate, pagination and all three per-list failure policies.
+    ///
+    /// `$1` is a log file it appends **every method it receives** to, one per line. That log is the
+    /// only way to assert the half of the capability gate that matters — that an ungated
+    /// `resources/list` is not merely discarded but never sent — and it is read from the server's
+    /// side of the pipe, so nothing on the client side can fake it.
+    ///
+    /// `$2` is the `capabilities` object echoed back from `initialize`; `$3`/`$4`/`$5` select the
+    /// tools/prompts/resources behaviour. Free of `${`, `$env:` and `{env:` for the same reason
+    /// [`TINY_MCP`] is: `args` (which includes the script) go through `interpolateEnvVars`.
+    const DISCOVERY_MCP: &str = r#"
+log="$1"
+caps="$2"
+tools="$3"
+prompts="$4"
+resources="$5"
+while IFS= read -r line; do
+  id=$(printf '%s' "$line" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  method=$(printf '%s' "$line" | sed -n 's/.*"method":"\([^"]*\)".*/\1/p')
+  if [ -n "$method" ]; then printf '%s\n' "$method" >> "$log"; fi
+  case "$line" in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":"%s","capabilities":%s,"serverInfo":{"name":"fixture","version":"1"},"instructions":"the fixture speaks"}}\n' "$id" "$PV" "$caps"
+      ;;
+    *'"method":"tools/list"'*)
+      case "$tools" in
+        fail) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"tools are unavailable"}}\n' "$id" ;;
+        paged)
+          case "$line" in
+            *'"cursor":"page2"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"second","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+            *) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"first","inputSchema":{"type":"object"}}],"nextCursor":"page2"}}\n' "$id" ;;
+          esac ;;
+        *) printf '{"jsonrpc":"2.0","id":%s,"result":{"tools":[{"name":"echo","description":"echo back","inputSchema":{"type":"object"}}]}}\n' "$id" ;;
+      esac
+      ;;
+    *'"method":"prompts/list"'*)
+      case "$prompts" in
+        fail) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"prompts exploded"}}\n' "$id" ;;
+        *) printf '{"jsonrpc":"2.0","id":%s,"result":{"prompts":[{"name":"greet"}]}}\n' "$id" ;;
+      esac
+      ;;
+    *'"method":"resources/list"'*)
+      case "$resources" in
+        fail) printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32603,"message":"resources exploded"}}\n' "$id" ;;
+        *) printf '{"jsonrpc":"2.0","id":%s,"result":{"resources":[{"name":"doc","uri":"file:///doc"}]}}\n' "$id" ;;
+      esac
+      ;;
+    *'"method":"notifications/'*) : ;;
+    *)
+      if [ -n "$id" ]; then printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"; fi
+      ;;
+  esac
+done
+"#;
+
+    /// One [`DISCOVERY_MCP`] entry, plus the log path the fixture records its wire traffic in.
+    fn discovery_entry(
+        log: &std::path::Path,
+        capabilities: &str,
+        tools: &str,
+        prompts: &str,
+        resources: &str,
+    ) -> ServerEntry {
+        let log = log.to_string_lossy().into_owned();
+        let mut entry = stdio_entry(
+            DISCOVERY_MCP,
+            &[&log, capabilities, tools, prompts, resources],
+        );
+        entry.env = Some(record(&[("PV", rmcp::model::ProtocolVersion::LATEST.as_str())]));
+        entry
+    }
+
+    /// Every method the fixture saw, in order.
+    fn wire_log(log: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(log)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// The whole of `createConnection`'s post-handshake block against a tools-only server: the
+    /// catalog is fetched, `instructions` rides back on the record, and the two capabilities the
+    /// server did **not** advertise are never asked about.
+    ///
+    /// The last clause is why the fixture keeps a wire log. `resources == []` is satisfied equally
+    /// by a gate that works and by one that asks and throws the answer away, and only one of those
+    /// is what upstream does — an unsolicited `resources/list` is a request some servers answer with
+    /// an error the user then sees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tools_only_server_is_listed_once_and_never_asked_for_the_rest() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("wire.log");
+        let entry = discovery_entry(&log, r#"{"tools":{}}"#, "ok", "ok", "ok");
+
+        let created = builder()
+            .create_connection(request("live", entry))
+            .await
+            .expect("a tools-only server connects");
+
+        assert_eq!(created.status, ConnectionStatus::Connected);
+        let names: Vec<&str> = created
+            .discovery
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect();
+        assert_eq!(names, vec!["echo"], "`tools/list` reached the record");
+        assert_eq!(
+            created.discovery.instructions.as_deref(),
+            Some("the fixture speaks"),
+            "`client.getInstructions?.()` is read off the handshake result"
+        );
+        assert!(created.discovery.resources.is_empty());
+        assert!(created.discovery.prompts.is_empty());
+        assert!(!created.discovery.prompt_discovery_failed);
+
+        let methods = wire_log(&log);
+        assert!(methods.iter().any(|method| method == "tools/list"), "{methods:?}");
+        assert!(
+            !methods.iter().any(|method| method == "resources/list"),
+            "the resources capability was absent, so NO request may be sent: {methods:?}"
+        );
+        assert!(
+            !methods.iter().any(|method| method == "prompts/list"),
+            "the prompts capability was absent, so NO request may be sent: {methods:?}"
+        );
+
+        created.resource.close().await.expect("close");
+    }
+
+    /// `do { … } while (cursor)` — a second page is fetched and both pages reach the record.
+    ///
+    /// rmcp's `Peer::list_all_tools` owns the loop, so what this pins is that discovery uses the
+    /// paginating helper rather than the single-shot `list_tools`. The fixture answers the first
+    /// call with a `nextCursor` and the second (identified by the cursor on the wire) without one,
+    /// so a port that read only `result.tools` would return `["first"]` and fail here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_paginated_tool_list_is_walked_to_the_last_cursor() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("wire.log");
+        let entry = discovery_entry(&log, r#"{"tools":{}}"#, "paged", "ok", "ok");
+
+        let created = builder()
+            .create_connection(request("live", entry))
+            .await
+            .expect("connect");
+
+        let names: Vec<&str> = created
+            .discovery
+            .tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect();
+        assert_eq!(names, vec!["first", "second"], "both pages, in order");
+        assert_eq!(
+            wire_log(&log).iter().filter(|method| *method == "tools/list").count(),
+            2,
+            "one request per page"
+        );
+
+        created.resource.close().await.expect("close");
+    }
+
+    /// `fetchAllPrompts`' catch: an advertised `prompts` capability whose list throws yields
+    /// `prompts: []` **and** `promptDiscoveryFailed: true`, and the connection still succeeds.
+    ///
+    /// The flag is the whole reason the payload carries one. `init.ts:340` publishes the prompt map
+    /// as live only when it is false, so collapsing "the server has no prompts" into "we could not
+    /// ask" would cache an empty prompt surface from one transient failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_advertised_prompt_list_that_throws_is_recorded_as_failed_not_empty() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("wire.log");
+        let entry = discovery_entry(&log, r#"{"tools":{},"prompts":{}}"#, "ok", "fail", "ok");
+
+        let created = builder()
+            .create_connection(request("live", entry))
+            .await
+            .expect("a prompts/list failure does not fail the connect");
+
+        assert_eq!(created.status, ConnectionStatus::Connected);
+        assert!(created.discovery.prompts.is_empty());
+        assert!(
+            created.discovery.prompt_discovery_failed,
+            "the capability was advertised and the list threw"
+        );
+        // The tools list is untouched by the sibling's failure — which is what `join!` buys over
+        // `try_join!`, whose short-circuit would have cancelled it.
+        assert_eq!(created.discovery.tools.len(), 1);
+        assert!(wire_log(&log).iter().any(|method| method == "prompts/list"));
+
+        created.resource.close().await.expect("close");
+    }
+
+    /// `fetchAllResources`' catch: an advertised `resources` capability whose list throws is
+    /// **silently** `[]` — no flag, no log, no failure. The asymmetry with prompts is upstream's,
+    /// and it is deliberate: nothing downstream needs to tell "no resources" from "could not ask".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_advertised_resource_list_that_throws_is_swallowed() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("wire.log");
+        let entry = discovery_entry(&log, r#"{"tools":{},"resources":{}}"#, "ok", "ok", "fail");
+
+        let created = builder()
+            .create_connection(request("live", entry))
+            .await
+            .expect("a resources/list failure does not fail the connect");
+
+        assert_eq!(created.status, ConnectionStatus::Connected);
+        assert!(created.discovery.resources.is_empty());
+        assert!(!created.discovery.prompt_discovery_failed, "prompts are a different list");
+        assert_eq!(created.discovery.tools.len(), 1);
+        assert!(wire_log(&log).iter().any(|method| method == "resources/list"));
+
+        created.resource.close().await.expect("close");
+    }
+
+    /// `fetchAllTools` has no catch: a `tools/list` that throws fails the **connect**, and the
+    /// failure carries the §3.3 step-8 treatment every other `createConnection` failure gets.
+    ///
+    /// This is also the arm that gives [`McpError::SetupFailed`] its upstream producer — a
+    /// discovery failure whose subsequent `close` also fails is what the aggregate is for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tool_list_that_throws_fails_the_connect() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let log = temp.path().join("wire.log");
+        let entry = discovery_entry(&log, r#"{"tools":{}}"#, "fail", "ok", "ok");
+
+        let outcome = builder().create_connection(request("live", entry)).await;
+        let Err(error) = outcome else {
+            panic!("a failing `tools/list` must fail the connect, not connect with no tools");
+        };
+        assert!(
+            error.to_string().contains("tools are unavailable"),
+            "the server's own message reaches the user: {error}"
+        );
+    }
+
     /// `debug: true` ⇒ stderr is **inherited**, so there is no tail and therefore no `(...)` suffix.
     /// The pair with the `debug: false` cases above is what pins the polarity — rmcp's default is
     /// `inherit`, the opposite of what a reader of `stderr: definition.debug ? "inherit" : "pipe"`
@@ -4460,6 +5652,21 @@ done
                         };
                         format!(
                             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n{session_header}Content-Length: {}\r\nConnection: close\r\n\r\n{payload}",
+                            payload.len()
+                        )
+                    } else if recorded.body.contains("\"method\":\"tools/list\"") {
+                        // MCP-119 made discovery part of every successful connect, so a fixture
+                        // that completes a handshake must answer this or the connect fails with
+                        // `UnexpectedResponse` — `{}` does not deserialize into a `ListToolsResult`.
+                        // An EMPTY catalog is the right answer here: this fixture advertises
+                        // `capabilities: {}`, so `tools/list` is the only list discovery sends, and
+                        // these tests are about the transport and the OAuth ladder, not the
+                        // inventory.
+                        let id = json_id(&recorded.body);
+                        let payload =
+                            format!("{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":{{\"tools\":[]}}}}");
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{payload}",
                             payload.len()
                         )
                     } else if recorded.body.contains("\"id\":") {

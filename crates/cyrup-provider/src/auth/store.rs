@@ -67,6 +67,7 @@ impl InMemoryCredentialStore {
     }
 
     /// Seed a credential (builder-style, for tests / programmatic config).
+    #[must_use]
     pub fn with_credential(self, provider: ProviderId, cred: Credential) -> Self {
         self.creds.insert(provider, cred);
         self
