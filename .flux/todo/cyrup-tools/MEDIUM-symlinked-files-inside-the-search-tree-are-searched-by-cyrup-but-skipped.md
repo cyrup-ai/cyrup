@@ -3,38 +3,348 @@ title: Symlinked files inside the search tree are searched by cyrup but skipped 
 priority: MEDIUM
 tool: grep
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: new
+stage: aug
 status: done
 updated: 2026-08-27
 ---
 
 # Symlinked files inside the search tree are searched by cyrup but skipped by pi
 
-## What pi does
+## Core objective
 
-pi spawns ripgrep with no `--follow`/`-L` (arg list at /home/user/cyrup/tmp/pi/packages/coding-agent/src/core/tools/grep.ts:220-224, spawn at :226). ripgrep does not follow symlinks during traversal and refuses to search a non-regular-file entry found by the walk. Verified with rg 14.1.0: a directory containing only `link.txt -> ../outside/real.txt` (which contains NEEDLE) yields zero match events from `rg --json --hidden -- NEEDLE .`.
+`grep` must apply ripgrep's **subject filter** to every candidate the walk discovers: a
+traversal-discovered entry is searched only when the entry's *own* file type is a regular file. A
+symlink found inside the tree is not followed and not searched; a symlink named **explicitly** as
+the `path` argument still is. cyrup currently searches everything the walk yields that is not a
+directory, which follows every in-tree symlink and also opens FIFOs, sockets and device nodes.
 
-## What cyrup-tools does
+The filter cannot be written today. [`WalkItem`, ops/mod.rs:250-255](../../../crates/cyrup-tools/src/ops/mod.rs)
+carries `path` and `is_dir` and nothing else, so *whether an entry is a regular file is structurally
+unavailable to every consumer of `FsOps::walk`*. The work is therefore three edits in three files,
+and the one in `grep.rs` is the last and smallest of them.
 
-/home/user/cyrup/crates/cyrup-tools/src/tools/grep.rs:398 accepts every walk item that is not a directory (`Some(Ok(w)) if !w.is_dir`) and feeds it to `search_one`, which opens it with `FsOps::read_stream` (:93) — a symlink entry is not a directory, so it is opened and its target searched. The walker (/home/user/cyrup/crates/cyrup-tools/src/ops/local/fs.rs:209-226) never sets `follow_links`, so the symlink itself is yielded, and nothing filters on file type. Verified by running the tool on that same layout: output is `link.txt:1: NEEDLE`.
+## What pi does — verified, both halves
 
-## User-visible impact
+pi shells out to ripgrep with no `--follow`/`-L`. The argv is built at
+[grep.ts:220](../../../tmp/pi/packages/coding-agent/src/core/tools/grep.ts) —
+`["--json", "--line-number", "--color=never", "--hidden"]` — the positional tail is pushed at
+`:224` (`args.push("--", pattern, searchPath)`), and the child is spawned at `:226`. Vendored pi is
+**0.84.3** (`packages/coding-agent/package.json:3`). No flag in that list, and no flag pi can add,
+enables link following.
 
-cyrup returns matches from files outside the search tree and duplicate matches for files reachable by more than one path; those extra hits also consume the 100-match limit. In a repo with symlinked vendor/build trees the result set differs from pi's for the same query.
+ripgrep's rule lives in its `SubjectBuilder`: an entry is turned into a searchable `Subject` when it
+is **explicit** (`dent.depth() == 0`, i.e. named on the command line) *or* when
+`file_type().is_file()` holds. Traversed entries are depth > 0, so they must pass the regular-file
+test. Both halves confirmed against rg 14.1.0 on a tree whose only member is
+`link.txt -> ../outside/real.txt` (target contains `NEEDLE`):
 
-## Parity action
+| invocation | result |
+| --- | --- |
+| `rg --json --line-number --color=never --hidden -- NEEDLE .` (link **discovered**) | no `"type":"match"` events, exit 1 |
+| `rg --json --line-number --color=never --hidden -- NEEDLE link.txt` (link **explicit**) | one match on `link.txt`, exit 0 |
+| `rg --hidden -- NEEDLE .` with a symlink-**to-directory** inside | not descended, exit 1 |
+| `rg --hidden -- NEEDLE dirlink` (symlink-to-directory **explicit**) | descended, `dirlink/real.txt:NEEDLE here`, exit 0 |
 
-Skip walk entries whose file type is not a regular file (ripgrep's `Subject::is_file` rule), while still searching a symlink named explicitly as the `path` argument — ripgrep searches explicitly-given paths even when they are links.
+So the divergence is confined to entries the **traversal** produced. The explicit-argument path is
+already at parity and must not be touched — see *What must not change*.
 
-## Why this gap is real
+## What cyrup-tools does today
 
-An adversary agent was tasked with **refuting** this finding by locating the capability in the Rust under another name. It could not:
+[grep.rs:398](../../../crates/cyrup-tools/src/tools/grep.rs) admits every walk item that is not a
+directory:
 
-> Genuine gap — could not refute. cyrup has no file-type filter anywhere in the grep traversal path. grep.rs:398 accepts every walk item with `!w.is_dir`, and WalkItem (ops/mod.rs:252-255) carries ONLY `is_dir`, so symlink-ness is structurally unavailable to any consumer — no filter could exist downstream even under another name. The walker (ops/local/fs.rs:209-240) sets hidden/git_ignore/git_exclude/git_global/require_git/parents but never follow_links, and computes `is_dir = entry.file_type().is_dir()`, collapsing a symlink to `is_dir=false`. search_one then opens it via read_stream = `std::fs::File::open` (fs.rs:73-80), which follows symlinks (no O_NOFOLLOW). Grepped ALL of crates/cyrup-tools/src and crates/cyrup-core/src for symlink|follow_links|is_symlink|read_link|file_type|is_file|is_regular|fifo|socket|device: cyrup-core has zero hits; cyrup-tools' only symlink-aware code is isolation/traversal.rs (opt-in TraversalFs decorator whose canonicalize escape guard applies to path ARGUMENTS, not walk items), lock.rs (mutation-queue keying) and tests/write_semantics.rs (write/edit follow tests) — none on the grep path. Verified both halves empirically: rg 14.1.0 on a dir containing only `link.txt -> ../outside/real.txt` returns matches:0 from `rg --json --hidden -- NEEDLE .` (exit 1 plain; `rg -L` finds it), matching ripgrep's SubjectBuilder which only searches entries whose file_type().is_file(); and a scratch program using the identical ignore::WalkBuilder config yields `tree/link.txt is_dir=Some(false) is_symlink=Some(true)`, which passes `!w.is_dir` and is opened. Severity lowered to medium: nothing is corrupted and the extra hits are real content, but the result set silently diverges (out-of-tree matches, duplicates via multiple paths, link-name labels) and those extras consume the global 100-match budget that breaks the fused walk at grep.rs:373-375, so genuine in-tree matches can be crowded out with no indication in the output — more than cosmetic, less than a wrong-answer/destructive bug. Fix is not local to grep.rs: WalkItem needs a file-type/is_file field populated at fs.rs:231 first. find.rs:208 uses the same flag but must be left alone, since fd does list symlinks and find is already at parity.
+```rust
+Some(Ok(w)) if !w.is_dir => {
+```
+
+and hands `w.path` to `search_one`, which opens it at
+[grep.rs:93](../../../crates/cyrup-tools/src/tools/grep.rs) via `FsOps::read_stream` —
+`std::fs::File::open` at [fs.rs:73-79](../../../crates/cyrup-tools/src/ops/local/fs.rs), with no
+`O_NOFOLLOW`. `open(2)` follows the link, so the **target's** bytes are searched under the **link's**
+name.
+
+The producing walker at [fs.rs:227-239](../../../crates/cyrup-tools/src/ops/local/fs.rs) never calls
+`follow_links`, so `ignore` yields the symlink entry itself, and line 231 collapses it:
+
+```rust
+let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+Ok(WalkItem { path, is_dir })
+```
+
+A symlink is not a directory, so `is_dir == false`, so `!w.is_dir` passes, and the type information
+that would have distinguished it is discarded one line before the struct is built. `WalkItem` is
+re-exported from [lib.rs:44-49](../../../crates/cyrup-tools/src/lib.rs) and
+[isolation/mod.rs:42](../../../crates/cyrup-tools/src/isolation/mod.rs), and both `FsOps` decorators
+([protected.rs:154-155](../../../crates/cyrup-tools/src/isolation/protected.rs),
+[traversal.rs:137-139](../../../crates/cyrup-tools/src/isolation/traversal.rs)) only delegate — no
+downstream layer can reconstruct the file type, so no filter could exist anywhere but here.
+
+Verified by running the tool on the same fixture: output is `link.txt:1: NEEDLE`.
+
+The same guard also admits FIFOs, sockets and device nodes, which `File::open` will happily open — a
+`grep` rooted anywhere above a named pipe can block in `open(2)` or `read(2)` on content ripgrep
+would never have touched.
+
+## Why the entry type survives the traversal, and why it does not survive `WalkItem`
+
+The workspace pins the `ignore` crate at **0.4.26** (`Cargo.toml:149`, `Cargo.lock:3883-3885`). In
+that version a traversal-discovered entry's type comes from `std::fs::DirEntry::file_type`
+(`walk.rs:322-333` `from_entry`, `:353-367` `from_entry_os` on unix), which is `readdir`/`lstat`
+semantics — **not followed**. `entry.file_type().is_symlink()` is therefore `true` and
+`is_file()` is `false` for exactly the entries ripgrep skips. The information is present at
+[fs.rs:231](../../../crates/cyrup-tools/src/ops/local/fs.rs) and is thrown away by the very next
+line. That is the entire bug.
+
+Two `ignore`-0.4.26 details the change relies on and must not accidentally break:
+
+* **Depth-0 roots.** `WalkBuilder::build()` produces the single-threaded `Walk` (`walk.rs:1094-1163`),
+  which is backed by `walkdir`. `walkdir` 2.5.0 `handle_entry` (`lib.rs:840-880`) applies
+  `follow_root_links`: a depth-0 symlink **to a directory** is descended into, while the root entry
+  itself is still yielded with its unfollowed type (`is_symlink`, so neither `is_dir` nor `is_file`).
+  Skipping that root entry is correct — it is a directory link, it has no bytes — and the children
+  it yields at depth 1 are unaffected.
+* **`file_type()` is `Option`.** It is `None` only for the synthetic stdin entry
+  (`DirEntry::new_stdin`, `walk.rs:67-78`), which a path-rooted `WalkBuilder` never produces.
+  `unwrap_or(false)` reproduces ripgrep's own `map_or(false, |ft| ft.is_file())`: an entry of
+  unknown type is not a regular file, so it is not searched.
+
+## Sibling coordination — read this before editing
+
+Three other briefs touch this same walker.
+
+**Finished, already prescribed, no conflict with this task:**
+
+* [LOW — find does not honor .fdignore or fd's global ignore file](LOW-find-does-not-honor-fdignore-or-fd-s-global-ignore-file.md)
+  adds a `WalkFlavor { Plain, Fd, Rg }` enum plus a `flavor` field to **`WalkOpts`**
+  (ops/mod.rs:244-248) and restructures the `WalkBuilder` **chain** at fs.rs:213-226 into
+  `let mut builder = …; …; let walker = builder.build();`. Its brief states in terms that the
+  `for result in walker { … }` loop below the chain is untouched.
+* [LOW — .rgignore files are honored by pi but ignored by cyrup](LOW-rgignore-files-are-honored-by-pi-but-ignored-by-cyrup.md)
+  is one match arm inside `WalkFlavor::custom_ignore_filename` in ops/mod.rs and touches
+  `ops/local/fs.rs` not at all.
+
+Neither of those touches `WalkItem` (a different struct from `WalkOpts`, immediately below it) and
+neither touches the loop body at fs.rs:227-239. **This task edits `WalkItem` and the loop body
+only.** If the builder chain in the *Current* snippet below already reads `let mut builder = …`, that
+is the fd task having landed: leave it exactly as found and edit the loop underneath it.
+
+**In progress, and the one that can collide:**
+
+* [MEDIUM — a single unreadable directory aborts the whole find](MEDIUM-a-single-unreadable-directory-aborts-the-whole-find-pi-returns-the-resul.md)
+  makes the walk tolerate per-entry errors instead of aborting. Its *Parity action* names
+  `find.rs:212` and `grep.rs:428` — both currently `Some(Err(e)) => return Err(e)` — and it may also
+  change how `LocalFs::walk` maps an `ignore::Error` into the channel at fs.rs:234.
+
+The interaction is exact and narrow:
+
+> **This task adds a FIELD to `WalkItem` and changes the guard on the `Ok` arm. That task changes
+> how walk ERRORS are yielded and consumed — the `Err` arm.** In `grep.rs` the two arms sit in the
+> same `match item { … }` block (lines 397-430), so they are adjacent but textually disjoint. In
+> `ops/local/fs.rs` this task edits the `Ok(entry) => { … }` branch at lines 229-233 and that task
+> edits the `Err(e) => …` branch at line 234 of the same `match result`.
+
+**Required ordering: this task lands FIRST.** The reason is asymmetric, not stylistic. This task
+changes a public struct with public fields, so it invalidates every `WalkItem` struct literal in the
+workspace; the unreadable-directory task changes only arm *bodies* and adds no literals, so it
+rebases onto a widened `WalkItem` with no edit at all. The reverse order forces a re-read of a match
+block that has already moved. There is exactly **one** `WalkItem` literal in the whole tree —
+fs.rs:232 (`rg 'WalkItem \{' crates/` returns the definition and that single construction) — so
+adding the field is a one-site change, and no re-export list changes.
+
+If the unreadable-directory task has already landed when this one is executed, the only consequence
+is that `grep.rs`'s `Err` arm no longer reads `Some(Err(e)) => return Err(e)`. **Leave it exactly as
+found.** This task must not restore, rewrite or reason about that arm; its only edit in `grep.rs` is
+the guard on line 398.
+
+## The change
+
+### 1. `crates/cyrup-tools/src/ops/mod.rs` — give `WalkItem` the file type
+
+**Current** ([ops/mod.rs:250-255](../../../crates/cyrup-tools/src/ops/mod.rs)):
+
+```rust
+/// A single walked path.
+#[derive(Clone, Debug)]
+pub struct WalkItem {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+```
+
+**Replacement**:
+
+```rust
+/// A single walked path.
+///
+/// `is_dir` and `is_file` are BOTH carried because they are not complements. A symlink, a FIFO, a
+/// socket and a device node are each neither, and separating those from a regular file is the
+/// reason this type exists rather than a bare `PathBuf`. Both flags describe the ENTRY's own type
+/// — `lstat` semantics, never followed — because that is the type the upstream binaries decide on:
+/// `ignore` 0.4.26 builds a traversed entry's type from `std::fs::DirEntry::file_type`
+/// (`walk.rs:322-333`, `:353-367`), which does not resolve the link.
+///
+/// `grep` filters on `is_file` ALONE, reproducing ripgrep's `SubjectBuilder`: a traversal-discovered
+/// entry is searched only when `file_type().is_file()` holds, so an in-tree symlink is never opened
+/// and its target is never searched under the link's name. `find` filters on `is_dir` ALONE and must
+/// keep doing so — fd DOES list symlinks, and `find` uses the flag only to decide the trailing `/`
+/// that marks a directory in its output.
+#[derive(Clone, Debug)]
+pub struct WalkItem {
+    pub path: PathBuf,
+    pub is_dir: bool,
+    pub is_file: bool,
+}
+```
+
+`is_file`, not `file_type: Option<FileType>`: `bool` keeps `WalkItem` free of a `std::fs` type in the
+backend seam's public surface, and `is_file()` is precisely — and only — the predicate ripgrep
+applies. Nothing downstream needs to distinguish a socket from a FIFO.
+
+### 2. `crates/cyrup-tools/src/ops/local/fs.rs` — populate it
+
+**Current** ([fs.rs:227-239](../../../crates/cyrup-tools/src/ops/local/fs.rs), the loop below the
+`WalkBuilder` chain):
+
+```rust
+for result in walker {
+    let item = match result {
+        Ok(entry) => {
+            let path = entry.path().to_path_buf();
+            let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            Ok(WalkItem { path, is_dir })
+        }
+        Err(e) => Err(ToolError::new(format!("walk: {e}"))),
+    };
+    if tx.blocking_send(item).is_err() {
+        break;
+    }
+}
+```
+
+**Replacement** (the `Err` arm and the `blocking_send` are reproduced only for placement — copy
+whatever they currently say, see *Sibling coordination*):
+
+```rust
+for result in walker {
+    let item = match result {
+        Ok(entry) => {
+            let path = entry.path().to_path_buf();
+            // One `file_type()` read feeds both flags. `ignore` 0.4.26 derives a traversed
+            // entry's type from `std::fs::DirEntry::file_type` (`walk.rs:322-333`,
+            // `:353-367`), which is `lstat` semantics: a symlink reports itself as a symlink,
+            // so it is neither a dir nor a file and both flags are false — exactly the entry
+            // ripgrep declines to search. `None` occurs only for the synthetic stdin entry
+            // (`walk.rs:67-78`), which a path-rooted walker never yields, so `unwrap_or(false)`
+            // mirrors ripgrep's own `file_type().map_or(false, |ft| ft.is_file())`: unknown
+            // type is not a regular file.
+            let ty = entry.file_type();
+            let is_dir = ty.map(|t| t.is_dir()).unwrap_or(false);
+            let is_file = ty.map(|t| t.is_file()).unwrap_or(false);
+            Ok(WalkItem {
+                path,
+                is_dir,
+                is_file,
+            })
+        }
+        Err(e) => Err(ToolError::new(format!("walk: {e}"))),
+    };
+    if tx.blocking_send(item).is_err() {
+        break;
+    }
+}
+```
+
+`std::fs::FileType` is `Copy`, so binding `ty` once and mapping it twice needs no clone and no second
+syscall. The import at [fs.rs:8](../../../crates/cyrup-tools/src/ops/local/fs.rs) is unchanged.
+
+### 3. `crates/cyrup-tools/src/tools/grep.rs` — the filter
+
+One line. Nothing else in the arm moves.
+
+**Current** ([grep.rs:398](../../../crates/cyrup-tools/src/tools/grep.rs)):
+
+```rust
+Some(Ok(w)) if !w.is_dir => {
+```
+
+**Replacement**:
+
+```rust
+// ripgrep's subject filter. A traversal-discovered entry is searched only when its OWN
+// file type is a regular file (`SubjectBuilder::build` → `Subject::is_file`); pi passes
+// no `--follow`/`-L` (grep.ts:220-224), so a symlink inside the tree is not followed and
+// not searched. `!w.is_dir` admitted symlinks — and FIFOs, sockets and device nodes —
+// then handed the path to `read_stream`'s `File::open`, which has no `O_NOFOLLOW` and
+// DOES follow, searching the target's bytes under the link's name.
+//
+// This filter is for WALK-discovered candidates only. A `path` argument that is a
+// symlink to a file never reaches this loop: `FsOps::metadata` (fs.rs:170-182) stats
+// through the link, so `meta.is_file` is true at grep.rs:342 and the file is searched
+// directly — which is what ripgrep does for a depth-0 explicit subject.
+Some(Ok(w)) if w.is_file => {
+```
+
+The `Some(Ok(_)) => {}` arm at [grep.rs:427](../../../crates/cyrup-tools/src/tools/grep.rs) already
+absorbs everything the guard rejects; after this change that set is directories *plus* symlinks,
+FIFOs, sockets and device nodes. It needs no edit.
+
+## What must not change
+
+* **[find.rs:208](../../../crates/cyrup-tools/src/tools/find.rs) —
+  `let entry = if w.is_dir { format!("{rel}/") } else { rel };` — must keep reading `is_dir` and must
+  keep its current behaviour.** fd DOES list symlinks, so `find` is already at parity; it uses the
+  flag purely to append the directory-marking `/`. A symlink must continue to be listed, and must
+  continue to be listed without the trailing slash. `find` must not gain an `is_file` filter, and no
+  `find` result may appear or disappear as a result of this task.
+* **The explicit-path branch at [grep.rs:342](../../../crates/cyrup-tools/src/tools/grep.rs)
+  (`if meta.is_file { … }`).** `FsOps::metadata` uses `tokio::fs::metadata`
+  ([fs.rs:170-182](../../../crates/cyrup-tools/src/ops/local/fs.rs)), which follows symlinks, so
+  `grep path=<symlink-to-file>` already takes this branch and searches the target — matching
+  ripgrep's explicit-subject rule, confirmed above against rg 14.1.0. Do not add a filter here.
+* **The `Err` arm of the `match item` block in `grep.rs`**, whatever it currently says — owned by the
+  unreadable-directory sibling.
+* **The `WalkBuilder` chain at fs.rs:213-226** — owned by the `.fdignore` sibling. `follow_links` is
+  not called today and must not start being called: following at the walker would defeat the whole
+  point.
+* The stale `ignore-0.4.33` version in the in-source comment at
+  [grep.rs:405](../../../crates/cyrup-tools/src/tools/grep.rs) (the workspace pins 0.4.26) sits
+  inside the arm body being kept verbatim. It is unrelated to this gap; leave it.
+
+## Files changed
+
+| File | Change |
+| --- | --- |
+| [crates/cyrup-tools/src/ops/mod.rs](../../../crates/cyrup-tools/src/ops/mod.rs) | `WalkItem` gains `pub is_file: bool`, plus the doc explaining why both flags are carried |
+| [crates/cyrup-tools/src/ops/local/fs.rs](../../../crates/cyrup-tools/src/ops/local/fs.rs) | The one `WalkItem` construction in the workspace populates `is_file` from the same `file_type()` read |
+| [crates/cyrup-tools/src/tools/grep.rs](../../../crates/cyrup-tools/src/tools/grep.rs) | Walk-candidate guard becomes `w.is_file` |
+
+No re-export list changes: `WalkItem` is already exported from
+[lib.rs:44-49](../../../crates/cyrup-tools/src/lib.rs) and
+[isolation/mod.rs:42](../../../crates/cyrup-tools/src/isolation/mod.rs), and adding a field to an
+exported struct does not alter either list. Both `FsOps` decorators delegate `walk` verbatim and are
+untouched.
 
 ## Definition of done
 
-1. The capability described under *Parity action* is implemented in `crates/cyrup-tools`.
-2. A test pins the new behaviour against the pi semantics quoted above.
-3. `cargo check --workspace --all-targets` and `cargo clippy` stay clean.
-4. Behaviour that pi does NOT have is not introduced — this is a parity task, not a redesign.
+Fixture: a directory `tree/` whose only entry is `link.txt -> ../outside/real.txt`, where
+`outside/real.txt` contains `NEEDLE`.
+
+1. `grep pattern="NEEDLE" path="tree"` reports **`No matches found`**. Today it reports
+   `link.txt:1: NEEDLE`.
+2. `grep pattern="NEEDLE" path="tree/link.txt"` still reports the match on `link.txt` — an explicitly
+   named symlink is searched, matching rg 14.1.0 exit 0 on the same argument.
+3. `grep pattern="NEEDLE" path="dirlink"`, where `dirlink` is a symlink to a directory containing a
+   matching regular file, still reports the match under `dirlink/…`; a symlink to a directory
+   *discovered inside* the search tree is not descended and contributes nothing.
+4. In a tree containing both a regular file and a symlink pointing at it, `grep` reports the match
+   once, under the regular file's name, and never under the link's name.
+5. A named pipe, socket or device node inside the search tree is never opened by `grep`; a `grep`
+   rooted above one completes instead of blocking.
+6. Matches from files outside the search tree no longer appear, and no longer consume the match
+   budget that stops the fused walk at
+   [grep.rs:373-375](../../../crates/cyrup-tools/src/tools/grep.rs); a tree whose in-tree matches
+   previously exceeded the limit because of symlink hits now returns those in-tree matches.
+7. For every input where the search root contains no symlinks and no non-regular files, `grep`
+   output is byte-identical to before this change — same matches, same order, same notices.
+8. `find` output is unchanged for every input, symlinked trees included: symlinks are still listed,
+   still without a trailing `/`.
