@@ -22,6 +22,23 @@ pub struct PatternMatcher {
     pub full_path: bool,
 }
 
+/// fd's smart case, reproduced for `find` (fd v10.3.0 `src/main.rs:195-202`): the search is
+/// case-sensitive **iff** the pattern carries an uppercase character, and case-INSENSITIVE
+/// otherwise. pi passes neither `-s/--case-sensitive` nor `-i/--ignore-case` (find.ts:235-267)
+/// and its schema has no case parameter (find.ts:29-35), so fd's default is the whole rule.
+///
+/// fd runs this over the *regex* globset emits for the glob (main.rs:169-172, then
+/// `regex_helper::pattern_has_uppercase_char`, which counts uppercase only in HIR literals and
+/// class range endpoints). Scanning the glob string itself is equivalent: globset's emitter
+/// (`globset-0.4.18` glob.rs:673-790) introduces no uppercase letter — non-ASCII bytes become
+/// lowercase `\xNN` escapes — and no glob metacharacter is an uppercase letter, so the uppercase
+/// characters of the glob and of its regex are the same set.
+///
+/// `char::is_uppercase` (Unicode), NOT `is_ascii_uppercase`: fd's check is Unicode-aware.
+fn pattern_has_uppercase_char(pattern: &str) -> bool {
+    pattern.chars().any(char::is_uppercase)
+}
+
 impl PatternMatcher {
     pub fn build(pattern: &str) -> Result<Self, ToolError> {
         let full_path = pattern.contains('/');
@@ -34,8 +51,13 @@ impl PatternMatcher {
         } else {
             pattern.to_string()
         };
+        // fd's smart case. The verdict is taken on `effective` — the string fd itself receives,
+        // after pi prepends `**/` (find.ts:257-262) — not on the raw `pattern`. `**/` holds no
+        // uppercase character, so the two agree on every input; `effective` is simply the literal
+        // equivalent of fd's own input.
         let glob: Glob = GlobBuilder::new(&effective)
             .literal_separator(full_path)
+            .case_insensitive(!pattern_has_uppercase_char(&effective))
             .build()
             .map_err(|e| error::invalid(format!("invalid glob '{pattern}': {e}")))?;
         Ok(Self {
@@ -66,9 +88,9 @@ impl PatternMatcher {
 
 /// ripgrep's rule for a single `--glob` argument.
 ///
-/// Pi's `grep` passes `glob` to real ripgrep untouched (grep.ts:218), so the pattern is parsed as
-/// one gitignore-style *override* line. This is a 1:1 port of that parse — `ignore-0.4.33`
-/// `src/gitignore.rs:460-539` (`GitignoreBuilder::add_line`) plus the single-glob reduction of
+/// Pi's `grep` passes `glob` to real ripgrep untouched (grep.ts:223), so the pattern is parsed as
+/// one gitignore-style *override* line. This is a 1:1 port of that parse — `ignore-0.4.26`
+/// `src/gitignore.rs:447-528` (`GitignoreBuilder::add_line`) plus the single-glob reduction of
 /// `src/overrides.rs:97-110` (`Override::matched`):
 ///
 /// * a leading `#` (or an empty/whitespace-only line) is a comment — no glob is added, so the
@@ -76,12 +98,16 @@ impl PatternMatcher {
 /// * a leading `!` inverts the match (rg's whitelist override): with one negated glob the file is
 ///   kept iff it does *not* match. `\!`/`\#` escape a literal leading `!`/`#`;
 /// * a leading `/` is stripped and anchors the glob to the root;
-/// * a trailing `/` means directories only, so no file ever matches;
+/// * a trailing `/` restricts the glob to DIRECTORIES: no file ever matches it, and a directory
+///   matches it exactly as it would without the slash (gitignore.rs:262);
 /// * `**/` is prepended **only when the pattern contains no `/` at all** and is not already
 ///   `**`-prefixed — the exact opposite of fd's rule above;
 /// * a trailing `/**` gains a `/*` so it matches the contents of a directory, not the directory;
 /// * the result always compiles with `literal_separator(true)` and always matches the *full* path
 ///   relative to the override root — never the basename. (`**/foo` covers the basename case.)
+///
+/// The override applies to **directories as well as files**, which is what makes `!node_modules`
+/// remove the whole subtree rather than nothing at all — see [`RgGlob::ignores`].
 pub struct RgGlob {
     matcher: GlobMatcher,
     /// `!`-prefixed: the sense of the match is inverted.
@@ -94,7 +120,7 @@ impl RgGlob {
     /// Compile one `--glob` argument. `Ok(None)` means "no filter at all" — ripgrep's empty
     /// override set, which matches nothing and therefore excludes nothing.
     pub fn build(pattern: &str) -> Result<Option<Self>, ToolError> {
-        // gitignore.rs:466-471: `#` comments out the line, and trailing whitespace is trimmed
+        // gitignore.rs:454-462: `#` comments out the line, and trailing whitespace is trimmed
         // unless it was escaped as `\ `.
         let mut line = pattern;
         if line.starts_with('#') {
@@ -107,7 +133,7 @@ impl RgGlob {
             return Ok(None);
         }
 
-        // gitignore.rs:483-499.
+        // gitignore.rs:470-487.
         let mut negated = false;
         let mut is_absolute = false;
         if line.starts_with("\\!") || line.starts_with("\\#") {
@@ -124,7 +150,7 @@ impl RgGlob {
             }
         }
 
-        // gitignore.rs:501-511: a trailing `/` restricts the glob to directories; an escaped
+        // gitignore.rs:488-498: a trailing `/` restricts the glob to directories; an escaped
         // trailing slash (`\/`) drops the escape too.
         let mut only_dir = false;
         if let Some(rest) = line.strip_suffix('/') {
@@ -133,16 +159,16 @@ impl RgGlob {
         }
 
         let mut actual = line.to_string();
-        // gitignore.rs:513-522. Note the condition: `**/` is added when the glob has NO `/`.
+        // gitignore.rs:500-508. Note the condition: `**/` is added when the glob has NO `/`.
         if !is_absolute && !actual.contains('/') && !(actual.starts_with("**/") || actual == "**") {
             actual = format!("**/{actual}");
         }
-        // gitignore.rs:524-527.
+        // gitignore.rs:509-514.
         if actual.ends_with("/**") {
             actual = format!("{actual}/*");
         }
 
-        // gitignore.rs:528-536, with `allow_unclosed_class(false)` from overrides.rs:126.
+        // gitignore.rs:515-524, with `allow_unclosed_class(false)` from overrides.rs:125.
         let glob: Glob = GlobBuilder::new(&actual)
             .literal_separator(true)
             .backslash_escape(true)
@@ -156,14 +182,42 @@ impl RgGlob {
         }))
     }
 
-    /// Whether a **file** survives this filter. `rel_posix` is the candidate path relative to the
-    /// override root — for ripgrep that root is its own cwd, not the search path
-    /// (gitignore.rs:286-315 `strip`), so `grep` must strip the tool's cwd, not its search root.
+    /// `Override::matched(path, is_dir)` (ignore-0.4.26 overrides.rs:97-110) reduced to this
+    /// crate's single compiled glob, returning `true` when the override says **IGNORE**.
+    ///
+    /// `is_dir` is the parameter the original port dropped, and it is the whole difference between
+    /// `!node_modules` filtering nothing and `!node_modules` removing the subtree.
+    ///
+    /// `rel_posix` is the candidate path relative to the override root — for ripgrep that root is
+    /// its own cwd, not the search path (gitignore.rs:275-304 `strip`), so `grep` must strip the
+    /// tool's cwd, not its search root.
+    fn ignores(&self, rel_posix: &str, is_dir: bool) -> bool {
+        // gitignore.rs:262 (`matched_stripped`, gitignore.rs:248-271): a glob with a trailing `/`
+        // is passed over unless the candidate IS a directory.
+        let hit = (is_dir || !self.only_dir) && self.matcher.is_match(rel_posix);
+        if hit {
+            // overrides.rs:105 `.invert()`: in an override set a `!` glob is stored as a gitignore
+            // *whitelist*, so a hit on it inverts to Ignore; a plain glob's hit inverts to
+            // Whitelist and is kept.
+            return self.negated;
+        }
+        // overrides.rs:106-108: a miss falls through to Ignore only when at least one plain
+        // (non-`!`) glob exists AND the candidate is not a directory. That `!is_dir` guard is why
+        // a whitelist miss never prunes a directory — rg still descends into it looking for files
+        // the glob does match.
+        !self.negated && !is_dir
+    }
+
+    /// Whether a **file** survives this filter.
     pub fn keeps_file(&self, rel_posix: &str) -> bool {
-        // overrides.rs:105-109: a whitelist hit inverts to Ignore (dropped); a miss with at least
-        // one non-whitelist glob present inverts to Ignore as well (dropped).
-        let hit = !self.only_dir && self.matcher.is_match(rel_posix);
-        hit != self.negated
+        !self.ignores(rel_posix, false)
+    }
+
+    /// Whether this directory must be PRUNED — dropped together with everything beneath it, the
+    /// way `ignore`'s walker drops it via `skip_current_dir()` (walk.rs:1131-1145) when
+    /// `should_skip_entry` (walk.rs:1939-1950) sees an Ignore verdict for a directory.
+    pub fn prunes_dir(&self, rel_posix: &str) -> bool {
+        self.ignores(rel_posix, true)
     }
 }
 
@@ -187,6 +241,13 @@ mod tests {
             .unwrap()
             .expect("glob")
             .keeps_file(rel)
+    }
+
+    fn prunes(pattern: &str, rel: &str) -> bool {
+        RgGlob::build(pattern)
+            .unwrap()
+            .expect("glob")
+            .prunes_dir(rel)
     }
 
     /// The defect this type exists to fix: fd's rule prepends `**/` to a path-containing pattern,
@@ -272,12 +333,55 @@ mod tests {
         assert!(RgGlob::build("   ").unwrap().is_none());
     }
 
-    /// gitignore.rs:501-505 (`is_only_dir`) and :524-527 (the `/**` → `/**/*` fixup).
+    /// gitignore.rs:488-492 (`is_only_dir`) and :509-514 (the `/**` → `/**/*` fixup).
     #[test]
     fn trailing_slash_is_directory_only_and_slash_doublestar_takes_contents() {
         assert!(!keeps("src/", "src/a.ts"));
         assert!(keeps("src/**", "src/a.ts"));
         assert!(keeps("src/**", "src/deep/a.ts"));
         assert!(!keeps("src/**", "src"));
+    }
+
+    /// The `is_dir` half of `Override::matched` (ignore-0.4.26 overrides.rs:97-110), which the
+    /// original port dropped. The full truth table for one compiled glob:
+    ///
+    /// * a NEGATED glob that hits — file or directory — is Ignore, so the directory is pruned;
+    /// * a negated glob that misses is not ignored at all;
+    /// * a PLAIN glob that hits is Whitelist, so the directory is descended;
+    /// * a plain glob that MISSES is Ignore for a file (the `num_whitelists() > 0` fallback) but
+    ///   `Match::None` for a directory — overrides.rs:106 guards that fallback with `!is_dir`, so
+    ///   a whitelist miss never prunes;
+    /// * a trailing `/` (`is_only_dir`) is skipped unless the candidate IS a directory
+    ///   (gitignore.rs:262), which is the only reason `!src/` prunes anything.
+    #[test]
+    fn a_directory_is_pruned_only_by_a_negated_hit() {
+        assert!(prunes("!node_modules", "node_modules"));
+        assert!(prunes("!node_modules", "vendor/node_modules"));
+        assert!(!prunes("!node_modules", "src"));
+
+        assert!(
+            !prunes("*.js", "src"),
+            "a whitelist MISS never prunes a directory"
+        );
+        assert!(!prunes("src/**/*.js", "vendor"));
+        assert!(!prunes("src", "src"), "a whitelist HIT is kept, not pruned");
+
+        assert!(prunes("!src/", "src"));
+        assert!(prunes("!src/", "vendor/src"));
+        // Verified against rg 14.1.0: with a regular FILE named `src` beside a `sub/x.txt`,
+        // `rg --hidden --glob '!src/' -- NEEDLE .` prints BOTH. A directory-only glob excludes no
+        // file at all — neither one named `src` nor one inside a `src` that was not pruned.
+        assert!(
+            keeps("!src/", "src"),
+            "a FILE named `src` is not a directory-only candidate"
+        );
+        assert!(
+            keeps("!src/", "src/a.ts"),
+            "no FILE matches a directory-only glob"
+        );
+        assert!(
+            !prunes("src/", "src"),
+            "plain and directory-only: a HIT is a whitelist, kept"
+        );
     }
 }

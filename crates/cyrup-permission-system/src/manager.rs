@@ -33,7 +33,23 @@ use crate::types::{
 };
 use crate::wildcard::{self, CompiledWildcard};
 
-const BUILT_IN_TOOL_NAMES: [&str; 7] = ["bash", "read", "write", "edit", "grep", "find", "ls"];
+/// The permission keys that are built-in **tool** keys (Pi `permission-manager.ts`
+/// `BUILT_IN_TOOL_NAMES`): the names whose top-level shorthand folds into the `tools` record
+/// ([`normalize_raw_permission`]) and which take `action:resource` sub-targets in
+/// [`PermissionManager::check_permission`].
+///
+/// This is deliberately a LITERAL, not an alias of `cyrup_tools::BUILTIN_NAMES`. That constant
+/// states which tools the registry INSTALLS and in what wire order; this one states which
+/// permission keys belong to the `tools` CATEGORY. They coincide today and
+/// `built_in_tool_names_tracks_the_tool_registry` fails the build if they ever stop — but an alias
+/// would auto-adopt any future registry name, and a name whose policy belongs in `mcp`/`special`
+/// (`mcp` is already a registered tool name in `cyrup-mcp`) would then be folded into `tools` and
+/// hijack the dedicated arm at `:245`. Silent wrong-category ingestion is worse than the drift.
+///
+/// `powershell` sits immediately after `bash`, mirroring `cyrup_tools::BUILTIN_NAMES`' rationale
+/// (`registry.rs:11-20`); order is irrelevant to `contains`, readability is not.
+const BUILT_IN_TOOL_NAMES: [&str; 8] =
+    ["bash", "powershell", "read", "write", "edit", "grep", "find", "ls"];
 
 /// pi `onWarning` ctor option's callback shape (`permission-manager.ts:620,631,643`): notified with a
 /// human-readable message whenever a policy file exists but fails to load/parse.
@@ -332,7 +348,12 @@ impl PermissionManager {
             };
         }
 
-        // built-in path tools (read/write/edit/grep/find/ls)
+        // built-in tools. `read`/`write`/`edit`/`grep`/`find`/`ls` are path-bearing and pick up an
+        // `action:resource` sub-target; `powershell` is not, so `create_action_resource_targets`
+        // yields nothing for it and this arm reduces to the same single-name, last-match-wins scan
+        // over `compiled_tools` (plus the same `DefaultCategory::Tools` fallback) that the
+        // extension arm at `:317` runs. It is here for the `normalize_raw_permission:1076`
+        // shorthand fold, which is where membership actually changes behaviour.
         if is_built_in_tool(normalized) {
             let mut targets = create_action_resource_targets(normalized, input);
             targets.push(normalized.to_string());
@@ -1432,5 +1453,71 @@ mod tests {
         let r = m.check_permission("skill", &serde_json::json!({"name": ""}), None);
         assert_eq!(r.state, PermissionState::Allow);
         assert_eq!(r.matched_pattern.as_deref(), Some("*"));
+    }
+
+    /// ANTI-DRIFT. `BUILT_IN_TOOL_NAMES` and `cyrup_tools::BUILTIN_NAMES` are separately stated on
+    /// purpose (see the const's doc), so nothing but this test keeps them in step. Mirrors
+    /// `cyrup-session-svc/src/builder.rs::every_builtin_is_gated_and_powershell_is_not_a_default`
+    /// (`:2409`), which does the same both-directions check for `ALL_BUILTIN_TOOLS`.
+    #[test]
+    fn built_in_tool_names_tracks_the_tool_registry() {
+        for name in cyrup_tools::BUILTIN_NAMES {
+            assert!(
+                BUILT_IN_TOOL_NAMES.contains(&name),
+                "`{name}` is installed by `ToolRegistry::with_builtins` but missing from \
+                 BUILT_IN_TOOL_NAMES, so `normalize_raw_permission` SILENTLY DROPS a top-level \
+                 `{name}: <state>` shorthand rule instead of folding it into `tools` — an explicit \
+                 deny would resolve to `defaultPolicy.tools`"
+            );
+        }
+        // Reverse direction: nothing is treated as a built-in key that the registry never installs.
+        for name in BUILT_IN_TOOL_NAMES {
+            assert!(
+                cyrup_tools::BUILTIN_NAMES.contains(&name),
+                "BUILT_IN_TOOL_NAMES claims `{name}` is a built-in, but the registry does not \
+                 install it — it belongs in the extension-tool arm, not the `tools` fold"
+            );
+        }
+        assert_eq!(BUILT_IN_TOOL_NAMES.len(), cyrup_tools::BUILTIN_NAMES.len());
+        assert!(BUILT_IN_TOOL_NAMES.contains(&"powershell"));
+    }
+
+    /// RED before the fix. The `permission:` frontmatter block has NO schema (it is parsed by
+    /// `common::parse_simple_yaml_map`), so the top-level shorthand is unguarded there. Pre-fix,
+    /// `is_built_in_tool("powershell")` was false, `normalize_raw_permission:1076` dropped the key,
+    /// and the trusted agent-layer DENY resolved to the global `defaultPolicy.tools: allow`.
+    #[test]
+    fn agent_frontmatter_powershell_shorthand_is_a_tools_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut m = manager_with_global(
+            dir.path(),
+            r#"{"defaultPolicy":{"tools":"allow","bash":"ask","mcp":"ask","skills":"ask"}}"#,
+        );
+        write(
+            &dir.path().join("agents").join("coder.md"),
+            "---\npermission:\n  powershell: deny\n---\nbody\n",
+        );
+        assert_eq!(
+            m.check_permission(
+                "powershell",
+                &serde_json::json!({"command":"Get-ChildItem"}),
+                Some("coder")
+            )
+            .state,
+            PermissionState::Deny,
+            "a top-level `powershell` shorthand must fold into the `tools` record; dropping it \
+             lets `defaultPolicy.tools: allow` override an explicit trusted deny"
+        );
+        // MIRROR: an already-listed built-in keeps working through the identical path, so the fold
+        // is set-membership only and nothing about the seven existing names changed.
+        write(
+            &dir.path().join("agents").join("reader.md"),
+            "---\npermission:\n  read: deny\n---\nbody\n",
+        );
+        assert_eq!(
+            m.check_permission("read", &serde_json::json!({"path":"/tmp/x"}), Some("reader"))
+                .state,
+            PermissionState::Deny
+        );
     }
 }

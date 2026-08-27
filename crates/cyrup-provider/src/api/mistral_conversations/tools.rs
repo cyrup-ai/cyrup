@@ -4,7 +4,7 @@
 use crate::context::ToolDef;
 use crate::stream::ToolChoice;
 use crate::utils::constrained_sampling::{
-    ConstrainedSamplingError, resolve_json_schema_strict_sampling,
+    ConstrainedSamplingError, json_schema_tool_parameters, resolve_json_schema_strict_sampling,
 };
 use serde_json::{Value, json};
 
@@ -23,12 +23,14 @@ pub(super) fn map_tool_choice(tc: &ToolChoice) -> Value {
 }
 
 /// Convert tools to Mistral `FunctionTool`s (Pi `toFunctionTools`,
-/// `mistral-conversations.ts:495-507` @**v0.83.0**).
+/// `mistral-conversations.ts:753-766` @**v0.84.2**).
 ///
-/// PROV-011 — `strict` is `resolveJsonSchemaStrictSampling(tool, true) ?? false` (`:497`). Mistral
-/// is the one route that passes `true` unconditionally: every Mistral model supports strict
-/// schemas, so a `strict: "require"` tool can never fail here and the resolver is infallible in
-/// practice — the `Result` is kept so the call reads exactly like pi's.
+/// PROV-011 — `strict` is `resolveJsonSchemaStrictSampling(tool, true) ?? false` (`:755`) and the
+/// schema is `getJsonSchemaToolParameters(tool, strict)` (`:761`). Mistral is the one route that
+/// passes `true` unconditionally: every Mistral model supports strict schemas, so the
+/// "strict tools are unsupported" arm is unreachable here. The `Result` is still load-bearing —
+/// a `strict: "require"` tool whose schema cannot be converted to the strict subset fails the
+/// request with the conversion's own reason.
 pub(super) fn to_function_tools(
     tools: &[ToolDef],
 ) -> Result<Vec<Value>, ConstrainedSamplingError> {
@@ -41,7 +43,7 @@ pub(super) fn to_function_tools(
                 "function": {
                     "name": t.name,
                     "description": t.description,
-                    "parameters": t.parameters,
+                    "parameters": json_schema_tool_parameters(t, strict == Some(true))?,
                     "strict": strict.unwrap_or(false),
                 },
             }))

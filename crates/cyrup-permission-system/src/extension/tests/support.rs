@@ -1,5 +1,5 @@
 //! Fixtures shared by two or more of the sibling test modules: the [`HostServices`] doubles, the
-//! event/context builders, and the two env-lock wrappers every config-touching test must hold.
+//! event/context builders, and the runtime + env-pin wrappers the config-touching tests use.
 //!
 //! These, and the tests across this directory that use them, are the Wave1b pi-parity regression
 //! suite (dossier: `cyrup-permission-system/src/extension/`).
@@ -41,23 +41,17 @@ pub(super) async fn init_ext(ext: &PermissionSystemExtension) {
     ext.init(&mut api).await.unwrap();
 }
 
-/// Drive `body` to completion with the crate-wide env lock held for the WHOLE test.
+/// Drive `body` on a CURRENT-THREAD runtime, from a synchronous frame.
 ///
-/// Any test that asserts on config it wrote into its own tempdir must take this lock.
-/// `ExtensionConfig::load` resolves its path through `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH`
-/// first ([`crate::ext_config::ExtensionConfig::resolve_config_path`]), and
-/// `ext_config::tests::env_var_overrides_default_config_path` sets that variable PROCESS-WIDE
-/// while it runs. A concurrent test then loads the OTHER test's fixture instead of its own and
-/// fails on an assertion that has nothing to do with the code under test. Measured on this
-/// binary: 8 failures in 300 runs before this guard, 0 in 300 after; and exporting the variable
-/// by hand reproduces the same failure 100% of the time.
-///
-/// The lock is `crate::ext_config::env_lock` — the same one the mutator holds — and it is taken
-/// in a SYNCHRONOUS frame around `block_on` rather than inside an `async` test body, so the
-/// guard is never held across an `.await` point. That frame is
-/// [`crate::ext_config::with_env_lock`]; this is the local spelling of it.
-pub(super) fn with_config_env_lock<F: std::future::Future>(body: F) -> F::Output {
-    crate::ext_config::with_env_lock(body)
+/// Formerly `with_config_env_lock`, which additionally held `ext_config::env_lock` so that
+/// `ExtensionConfig::resolve_config_path`'s read of `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` could not
+/// observe a sibling test's process-wide `set_var` of it. There is no longer a process-env mutation
+/// anywhere in the crate for that lock to serialize: an override is pinned THREAD-LOCALLY through
+/// [`crate::envx`], which no other test's thread can see. The runtime flavour is unchanged, and it
+/// is load-bearing for the pins — a thread-local pin does not reach a multi-thread worker.
+pub(super) fn block_on<F: std::future::Future>(body: F) -> F::Output {
+    #[allow(clippy::unwrap_used)]
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body)
 }
 
 pub(super) fn bash_call(call_id: &str) -> HostEvent {
@@ -68,23 +62,16 @@ pub(super) fn bash_call(call_id: &str) -> HostEvent {
     }
 }
 
-/// Run `body` with [`INSTALL_ENV_VAR`] guaranteed unset, restoring the ambient value after —
-/// serialized against every other env-mutating test in the crate by the shared
-/// [`crate::ext_config::env_lock`].
+/// Run `body` with [`INSTALL_ENV_VAR`] pinned UNSET for this thread only.
+///
+/// The pin is a thread-local overlay in [`crate::envx`], not a process mutation: nothing another
+/// test can observe changes, so no lock is taken and none is needed. The previous implementation
+/// held `ext_config::env_lock` around an `unsafe { std::env::remove_var }`, which serialized the
+/// crate's eight env WRITERS but not its sixteen unlocked READERS — and in edition 2024 a `getenv`
+/// concurrent with `unsetenv` is undefined behaviour, which no writer-side lock can repair.
 pub(super) fn without_install_env<T>(body: impl FnOnce() -> T) -> T {
-    let _lock = crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let previous = std::env::var(INSTALL_ENV_VAR).ok();
-    // SAFETY: serialized by `env_lock`, and restored below before the guard drops.
-    unsafe { std::env::remove_var(INSTALL_ENV_VAR) };
-    let out = body();
-    // SAFETY: same scope/serialization; restores whatever the ambient shell had.
-    unsafe {
-        match previous {
-            Some(v) => std::env::set_var(INSTALL_ENV_VAR, v),
-            None => std::env::remove_var(INSTALL_ENV_VAR),
-        }
-    }
-    out
+    let _pin = crate::envx::pin(INSTALL_ENV_VAR, None);
+    body()
 }
 
 /// A [`HostServices`] double that enumerates a registry (so the unknown-tool gate lets the call

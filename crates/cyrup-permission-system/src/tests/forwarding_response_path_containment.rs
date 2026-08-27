@@ -111,7 +111,7 @@ async fn drain(agent_dir: &Path, session_id: &str) {
 async fn a_traversal_request_id_cannot_write_outside_the_response_spool() {
     let agent_dir = tempfile::tempdir().expect("tempdir");
     assert!(
-        std::env::var(FORWARDING_AGENT_DIR_ENV).is_err(),
+        crate::envx::var(FORWARDING_AGENT_DIR_ENV).is_none(),
         "this test derives the spool from its own temp agent dir; an ambient \
          {FORWARDING_AGENT_DIR_ENV} override would invalidate it"
     );

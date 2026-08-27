@@ -26,10 +26,13 @@ static CONFIG_LOCK_HANDLE: LazyLock<KeyedLocks<PathBuf>> =
 /// which take a signal here or upstream (pi's `settings-manager`/`trust-manager` use `lockSync`,
 /// and `auth-storage`'s `withLockAsync(fn)` takes no options). `CancellationToken::cancelled()` on
 /// a token nobody cancels is a future that never resolves, so both `select!`s that consume it —
-/// [`KeyedLocks::guard`]'s and the layer-2 retry loop below — always take their other arm. It is
-/// polled once per acquire, in `guard`'s biased first branch, and not again on the uncontended
-/// path because the retry loop is skipped. That poll costs no allocation (the waiter is intrusive)
-/// and no syscall (an uncontended `std::sync::Mutex` is atomics-only).
+/// [`cyrup_core::keyed_lock::KeyedAcquire::wait`]'s and the layer-2 retry loop below — always take
+/// their other arm. On the uncontended path, which is this lock's common case, `cancelled()` is
+/// polled ZERO times: `wait` returns through its `early.take()` arm before the `select!` is ever
+/// constructed, and the `is_cancelled()` guard above that is a plain synchronous read rather than a
+/// poll — it allocates nothing and registers no waiter. Only a contended layer 1 reaches the
+/// `select!`, and even then the poll costs no allocation (the waiter is intrusive) and no syscall
+/// (an uncontended `std::sync::Mutex` is atomics-only).
 static NEVER_CANCELLED: LazyLock<CancelToken> = LazyLock::new(CancelToken::new);
 
 /// First retry delay for a contended layer 2, doubled each tick up to [`MAX_RETRY`]. An
@@ -105,8 +108,13 @@ impl FileLock {
     ///
     /// `cancel` governs BOTH layers, by two different mechanisms — the difference is load-bearing:
     ///
-    /// * Layer 1 is cancelled *in place*: [`KeyedLocks::guard`] races the token against the mutex
-    ///   in a `biased` `select!` and returns having taken nothing.
+    /// * Layer 1 is cancelled *in place*: [`KeyedLocks::guard`] is
+    ///   [`cyrup_core::keyed_lock::KeyedLocks::enqueue`] followed by
+    ///   [`cyrup_core::keyed_lock::KeyedAcquire::wait`], and it is `wait` that handles the token —
+    ///   an `is_cancelled()` pre-check that settles the already-cancelled case deterministically
+    ///   BEFORE any `select!` runs, then a `biased` `select!` racing the token against the mutex.
+    ///   Either way it returns having taken nothing, and the claimed queue place is evicted on the
+    ///   way out.
     /// * Layer 2 is cancelled *between attempts*: the retry sleep shares a `biased` `select!` with
     ///   the same token, so a cancel preempts whatever is left of the tick and the acquire returns
     ///   [`ConfigError::Cancelled`] rather than waiting out a peer process. This is NOT bounded by
@@ -166,9 +174,13 @@ impl FileLock {
         while !held {
             tokio::select! {
                 biased;
-                // `biased` for the reason spelled out in `KeyedLocks::guard`: with both arms ready
-                // the unbiased poll order is random, and a caller that has given up must not be
-                // handed the lock on a coin flip.
+                // `biased` for the reason spelled out on `KeyedAcquire::wait`
+                // (`cyrup-core/src/keyed_lock.rs`, above its `is_cancelled()` pre-check): with both
+                // arms ready the unbiased poll order is random, and a caller that has given up must
+                // not be handed the lock on a coin flip. Layer 1 now takes the already-cancelled
+                // case with that pre-check; here `biased` is the whole guarantee, because this
+                // `select!` is re-entered every tick and there is no single entry point to
+                // pre-check.
                 () = &mut cancelled => return Err(ConfigError::Cancelled),
                 () = tokio::time::sleep(backoff) => {}
             }

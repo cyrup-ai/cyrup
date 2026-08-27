@@ -19,21 +19,27 @@
 //!
 //! Each test drives a real `PermissionSystemExtension` through the registered `before_tool_call` gate
 //! (`NativeExtension::on_event(ToolCall)`) with a scripted [`AskChannel`] that COUNTS prompts — the
-//! same seam `tests/forwarding_persist.rs` uses. "Allow Once" is deliberate: it persists nothing, so
+//! same seam [`super::forwarding_persist`] uses. "Allow Once" is deliberate: it persists nothing, so
 //! the only thing that can collapse the second prompt is the dedup cache.
+//!
+//! Formerly `tests/prompt_dedup.rs`, an integration binary of its own. It owned a process because it
+//! MUTATED process env — `unsafe { std::env::set_var("CYRUP_SUBAGENT_CHILD", "1") }`, never restored
+//! — and [`super`]'s doc barred that from this directory. It no longer mutates anything: the anchor
+//! is a THREAD-LOCAL [`crate::envx`] pin, so the module is an ordinary unit-test module.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Once};
 
 use cyrup_core::ToolCallId;
 use cyrup_ext::{ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, InitApi, NativeExtension};
-use cyrup_permission_system::{
-    AskChannel, AskOutcome, ExtensionConfig, ManagerPaths, PermissionDecisionState,
+use serde_json::{Value, json};
+
+use crate::{
+    AskChannel, AskOutcome, CHILD_ENV_VAR, ExtensionConfig, ManagerPaths, PermissionDecisionState,
     PermissionPromptDecision, PermissionSystemExtension, PromptOpts,
 };
-use serde_json::{json, Value};
 
 /// A scripted [`HostServices`] whose ONLY override is [`HostServices::all_tool_names`] — the full
 /// registry the unknown-tool gate (pi `index.ts:2218-2228`) checks BEFORE any permission check.
@@ -65,58 +71,27 @@ impl AskChannel for CountingOnceChannel {
     }
 }
 
-/// This binary's own env lock (PERM-020).
+/// Drive `body` on a CURRENT-THREAD runtime with [`CHILD_ENV_VAR`] pinned for this thread.
 ///
-/// `crate::ext_config::env_lock()` is crate-private, so an INTEGRATION binary cannot reach it; this
-/// is the same guarantee for this compilation unit. Every test body in this file takes it, so the
-/// `set_var` in [`ensure_subagent_child`] can never be concurrent with another test's `getenv` —
-/// and every test here does `getenv` constantly, because the gate reads `CYRUP_SUBAGENT_CHILD`
-/// (`extension::is_subagent_child`), `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH`
-/// (`ExtensionConfig::resolve_config_path`) and `CYRUP_PERMISSION_SYSTEM_LOGS_DIR`
-/// (`logging::resolve_logs_dir`) on the decision path. In Rust 2024 an unsynchronized
-/// `set_var`/`getenv` pair is undefined behaviour, not merely flaky ordering.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-/// Drive `body` to completion with [`ENV_LOCK`] held for the whole test, recovering from poisoning
-/// so one failing test does not cascade into spurious failures in its siblings.
-///
-/// The lock is taken in this SYNCHRONOUS frame, around `block_on`, rather than at the top of an
-/// `async` test body. The span covered is identical — every `.await` in the body runs with the lock
-/// held, which it must, because the gate calls `getenv` on the decision path. What changes is where
-/// the `MutexGuard` lives. Inside an `async fn` it is captured in the generated future's state
-/// (`clippy::await_holding_lock`): the guard then makes the future `!Send`, it is owned by whichever
-/// thread last resumed the future rather than by one identifiable thread, and it is released only
-/// when the runtime drops the future — including down cancellation paths no test here wrote. A
-/// `std::sync::Mutex` is not reentrant and has no deadlock detection, so a guard whose release is
-/// contingent on runtime bookkeeping is the shape that hangs a whole test binary instead of failing
-/// it. On a stack frame the guard's lifetime is the frame's, and unwinding releases it.
-///
-/// `block_on` on a CURRENT-THREAD runtime is also what `#[tokio::test]` builds by default, so the
-/// scheduling the bodies see (including `tokio::spawn` + `yield_now` in the PERM-014 test) is
-/// unchanged.
-fn with_env_lock<F: std::future::Future>(body: F) -> F::Output {
-    let _guard = ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body)
-}
-
 /// `prompt_decision`'s fail-fast pre-check (pi `canRequestPermissionConfirmation`,
-/// `index.ts:2263,2351,2452`) is `hasUI || isSubagent || yoloMode`, and the channel it then selects is
-/// the injected `ask_channel` only when `has_ui` is false. Marking this process child-shaped is what
-/// routes the prompt to [`CountingOnceChannel`] instead of a live `LocalAskChannel`. Set ONCE and
-/// never unset: both tests in this binary need it and may run concurrently.
+/// `index.ts:2263,2351,2452`) is `hasUI || isSubagent || yoloMode`, and the channel it then selects
+/// is the injected `ask_channel` only when `has_ui` is false. Marking this process child-shaped is
+/// what routes the prompt to the counting channels here instead of a live `LocalAskChannel`.
 ///
-/// PERM-020: the caller MUST already be inside [`with_env_lock`]. The `Once` alone does not help — it makes
-/// the write happen once, but says nothing about whether another test is reading the environment
-/// while it happens.
-fn ensure_subagent_child() {
-    static SET: Once = Once::new();
-    SET.call_once(|| {
-        // SAFETY: serialized by `ENV_LOCK`, which the caller holds for the whole test body.
-        #[allow(unsafe_code)]
-        unsafe {
-            std::env::set_var("CYRUP_SUBAGENT_CHILD", "1");
-        }
-    });
+/// The pin replaces an `unsafe { std::env::set_var("CYRUP_SUBAGENT_CHILD", "1") }` that was never
+/// restored and was serialized only against the OTHER tests in this file — nothing about the
+/// libtest harness's own threads, and in edition 2024 a `getenv` concurrent with `setenv` is
+/// undefined behaviour rather than mere flakiness. A [`crate::envx`] pin mutates no process state
+/// at all, so `extension`'s `ask_fails_fast_without_ui_subagent_or_yolo` — which asserts that same
+/// variable is ABSENT — can run beside it in the same binary.
+///
+/// Both the pin and the runtime are taken in this SYNCHRONOUS frame. The runtime flavour is
+/// load-bearing twice over: a pin is thread-local, and a `new_current_thread` runtime keeps every
+/// `tokio::spawn`ed task on this one thread, which is also what makes [`settle`]'s determinism hold.
+#[allow(clippy::unwrap_used)]
+fn block_on<F: std::future::Future>(body: F) -> F::Output {
+    let _pin = crate::envx::pin(CHILD_ENV_VAR, Some("1"));
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(body)
 }
 
 fn write(path: &Path, body: &str) {
@@ -170,38 +145,16 @@ fn read_call(call_id: &str, path: &str) -> HostEvent {
     }
 }
 
-/// RED BEFORE THE FIX — and red at COMPILE time, which is the strongest form available here.
-///
-/// `std::sync::MutexGuard` is `!Send`. While each test took `env_guard()` at the top of its `async`
-/// body, the guard was captured in that body's future and every one of these futures was `!Send`,
-/// so this assertion did not compile ("`MutexGuard<'_, ()>` cannot be sent between threads safely
-/// ... required because it appears within the type of the future"). It compiles now precisely
-/// because the guard lives on [`with_env_lock`]'s stack frame instead of inside the futures — which
-/// is the whole content of the fix, not a proxy for it.
-///
-/// Constructing an `async fn`'s future runs none of its body, so this test opens no tempdir, writes
-/// no policy file and touches no environment variable; it needs no lock of its own.
-#[test]
-fn env_locked_bodies_do_not_carry_the_guard_across_their_awaits() {
-    fn assert_send<F: Send>(_: F) {}
-    assert_send(reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_body());
-    assert_send(
-        reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt_body(),
-    );
-    assert_send(two_concurrent_identical_asks_collapse_to_one_prompt_body());
-}
-
 // ================================================================================================
 // (1) SKILL-READ ask surface (pi `index.ts:2282-2292`, `source: "skill_read"`).
 // ================================================================================================
 
 #[test]
 fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt() {
-    with_env_lock(reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_body());
+    block_on(reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_body());
 }
 
 async fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_body() {
-    ensure_subagent_child();
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     // The `read` TOOL is denied, so a Noop can ONLY come from the skill-read bypass; the `deploy`
@@ -262,13 +215,12 @@ async fn reemitted_skill_read_reuses_the_cached_decision_with_no_second_prompt_b
 
 #[test]
 fn reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt() {
-    with_env_lock(
+    block_on(
         reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt_body(),
     );
 }
 
 async fn reemitted_external_directory_read_reuses_the_cached_decision_with_no_second_prompt_body() {
-    ensure_subagent_child();
     let cwd_dir = tempfile::tempdir().unwrap();
     let outside_dir = tempfile::tempdir().unwrap();
     let agent_dir = cwd_dir.path();
@@ -373,14 +325,13 @@ async fn settle() {
 /// surface under test (`read: ask` → the main check).
 /// The runtime is CURRENT-THREAD, as it was under `#[tokio::test(flavor = "current_thread")]`:
 /// [`settle`]'s determinism depends on there being exactly one worker, so a `spawn`ed task can only
-/// run while this body is parked in `yield_now`. [`with_env_lock`] builds precisely that runtime.
+/// run while this body is parked in `yield_now`. [`block_on`] builds precisely that runtime.
 #[test]
 fn two_concurrent_identical_asks_collapse_to_one_prompt() {
-    with_env_lock(two_concurrent_identical_asks_collapse_to_one_prompt_body());
+    block_on(two_concurrent_identical_asks_collapse_to_one_prompt_body());
 }
 
 async fn two_concurrent_identical_asks_collapse_to_one_prompt_body() {
-    ensure_subagent_child();
     let dir = tempfile::tempdir().unwrap();
     let agent_dir = dir.path();
     let policy_path = agent_dir.join("cyrup-permissions.jsonc");

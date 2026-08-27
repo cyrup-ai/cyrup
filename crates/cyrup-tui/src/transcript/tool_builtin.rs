@@ -18,7 +18,7 @@ pub(super) fn render_read(
         Some(c) => out.push(compact_read_call(&c, &run.args, opts.expand_key, theme)),
         None => {
             let mut spans = vec![Span::styled("read ", theme.tool_title_style())];
-            spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
+            spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme, opts));
             if let Some(range) = read_line_range(&run.args) {
                 spans.push(Span::styled(range, theme.warning_style()));
             }
@@ -64,11 +64,11 @@ pub(super) fn render_write(
     run: &ToolRun,
     expanded: bool,
     theme: &UiTheme,
-    expand_key: &str,
+    opts: ImageOpts<'_>,
     out: &mut Vec<Line<'static>>,
 ) {
     let mut spans = vec![Span::styled("write ", theme.tool_title_style())];
-    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
+    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme, opts));
     out.push(Line::from(spans));
     match str_arg(&run.args, &["content"]) {
         StrArg::Invalid => {
@@ -105,7 +105,7 @@ pub(super) fn render_write(
             }
             let remaining = total.saturating_sub(shown);
             if remaining > 0 {
-                out.push(more_lines_hint(remaining, Some(total), expand_key, theme));
+                out.push(more_lines_hint(remaining, Some(total), opts.expand_key, theme));
             }
         }
     }
@@ -165,9 +165,14 @@ pub(super) fn edit_header_preview(run: &ToolRun) -> crate::theme::EditHeaderPrev
     }
 }
 
-pub(super) fn render_edit(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+pub(super) fn render_edit(
+    run: &ToolRun,
+    theme: &UiTheme,
+    opts: ImageOpts<'_>,
+    out: &mut Vec<Line<'static>>,
+) {
     let mut spans = vec![Span::styled("edit ", theme.tool_title_style())];
-    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme));
+    spans.push(tool_path_span(&run.args, &["file_path", "path"], None, theme, opts));
     out.push(Line::from(spans));
 
     let preview_diff = match &run.preview {
@@ -209,33 +214,36 @@ pub(super) fn render_edit(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'st
     }
 }
 
-/// `bash` — header `$ <command> (timeout Ns)` + the output tail (collapsed = last 5 visual lines) +
-/// truncation notices + a `Took {d}s` footer (`bash.ts:201-289/430-464`).
+/// `bash`/`powershell` — header `<prompt> <command> (timeout Ns)` + the output tail (collapsed =
+/// last 5 visual lines) + truncation notices + a `Took {d}s` footer (`bash.ts:201-289/430-464`).
 pub(super) fn render_bash(
     run: &ToolRun,
     expanded: bool,
     theme: &UiTheme,
     expand_key: &str,
+    prompt: &str,
     out: &mut Vec<Line<'static>>,
 ) {
-    // Header: `$ command`, bold, + a muted ` (timeout Ns)` suffix (`formatBashCall`).
+    // Header: `<prompt> command`, bold, + a muted ` (timeout Ns)` suffix (`formatShellCall`,
+    // bash.ts:238-244, called with `config.prompt` at bash.ts:488 — `$` for bash, `PS>` for
+    // PowerShell).
     let title = theme.tool_title_style();
     let mut spans = Vec::new();
     match str_arg(&run.args, &["command"]) {
         StrArg::Invalid => {
-            spans.push(Span::styled("$ ".to_string(), title));
+            spans.push(Span::styled(format!("{prompt} "), title));
             spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style()));
         }
         StrArg::Missing => {
-            spans.push(Span::styled("$ ".to_string(), title));
+            spans.push(Span::styled(format!("{prompt} "), title));
             spans.push(Span::styled("...".to_string(), theme.tool_output_style()));
         }
-        StrArg::Value(cmd) => spans.push(Span::styled(format!("$ {cmd}"), title)),
+        StrArg::Value(cmd) => spans.push(Span::styled(format!("{prompt} {cmd}"), title)),
     }
     if let Some(t) = run.args.get("timeout").and_then(Value::as_f64).filter(|t| *t != 0.0) {
-        // `${timeout}s` (bash.ts:204): JS renders an integer number without a trailing `.0`.
-        let disp = if t.fract() == 0.0 { format!("{}", t as i64) } else { format!("{t}") };
-        spans.push(Span::styled(format!(" (timeout {disp}s)"), theme.muted_style()));
+        // `${timeout}s` (bash.ts:204) — the same `String(n)` fold the read range uses; the `±0`
+        // case `js_number` handles is already excluded by the filter above.
+        spans.push(Span::styled(format!(" (timeout {}s)", js_number(t)), theme.muted_style()));
     }
     out.push(Line::from(spans));
 
@@ -367,16 +375,16 @@ pub(super) fn render_ls(
     run: &ToolRun,
     expanded: bool,
     theme: &UiTheme,
-    expand_key: &str,
+    opts: ImageOpts<'_>,
     out: &mut Vec<Line<'static>>,
 ) {
     let mut spans = vec![Span::styled("ls ".to_string(), theme.tool_title_style())];
-    spans.push(tool_path_span(&run.args, &["path"], Some("."), theme));
+    spans.push(tool_path_span(&run.args, &["path"], Some("."), theme, opts));
     if let Some(limit) = run.args.get("limit").and_then(Value::as_i64) {
         spans.push(Span::styled(format!(" (limit {limit})"), theme.tool_output_style()));
     }
     out.push(Line::from(spans));
-    push_list_output(run, expanded, 20, theme, expand_key, out);
+    push_list_output(run, expanded, 20, theme, opts.expand_key, out);
     push_ls_warnings(run.result.as_ref(), theme, out);
 }
 

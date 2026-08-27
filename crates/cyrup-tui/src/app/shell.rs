@@ -406,6 +406,10 @@ impl<B: Backend> App<B> {
         self.state
             .transcript
             .set_graphical_images(self.state.image_renderer.is_graphical());
+        // Feature #8 / TUI-020 — the same publish for the OSC-8 gate `tool_path_span` reads, so a
+        // `read`/`write`/`edit`/`ls` header path becomes a clickable `file://` target on a terminal
+        // that forwards hyperlinks.
+        self.state.transcript.set_hyperlinks(caps.hyperlinks);
     }
 
     /// Apply a new theme, bumping its generation so caches invalidate (R-10-026). The theme is

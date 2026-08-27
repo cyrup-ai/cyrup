@@ -12,14 +12,20 @@
 //! `before_tool_call` gate: the FIRST forwards (channel invoked once) and the always-decision persists
 //! a session rule for `(bash, "echo hi")`; the SECOND auto-ALLOWS via the store overlay with NO second
 //! forward.
+//!
+//! Formerly `tests/forwarding_persist.rs`, an integration binary of its own. It owned a process
+//! because it MUTATED process env — `unsafe { std::env::set_var("CYRUP_SUBAGENT_CHILD", "1") }` —
+//! and [`super`]'s doc barred that from this directory. It no longer mutates anything: the anchor is
+//! a THREAD-LOCAL [`crate::envx`] pin, so the module is an ordinary unit-test module.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use cyrup_ext::{ExtMode, HookOutcome, HostCtx, HostEvent, HostServices, NativeExtension};
-use cyrup_permission_system::{
-    AskChannel, AskOutcome, ExtensionConfig, ManagerPaths, PermissionDecisionState,
+
+use crate::{
+    AskChannel, AskOutcome, CHILD_ENV_VAR, ExtensionConfig, ManagerPaths, PermissionDecisionState,
     PermissionPromptDecision, PermissionSystemExtension, PromptOpts,
 };
 
@@ -61,8 +67,21 @@ fn bash_call(call_id: &str, command: &str) -> HostEvent {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn forwarded_allow_always_persists_a_child_session_rule() {
+/// Driven on a CURRENT-THREAD runtime with [`CHILD_ENV_VAR`] pinned in this SYNCHRONOUS frame: the
+/// pin is a thread-local [`crate::envx`] overlay, so the body must never be resumed on a worker
+/// thread that cannot see it. Nothing here needs a second worker — the scripted channel resolves
+/// immediately and no task is spawned.
+#[test]
+fn forwarded_allow_always_persists_a_child_session_rule() {
+    let _pin = crate::envx::pin(CHILD_ENV_VAR, Some("1"));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(forwarded_allow_always_persists_a_child_session_rule_body());
+}
+
+async fn forwarded_allow_always_persists_a_child_session_rule_body() {
     let agent_dir = tempfile::tempdir().expect("tempdir");
     // Default is ASK; make bash explicitly ASK so both calls hit the forwarding channel unless a
     // session rule already promotes them to allow.
@@ -89,12 +108,8 @@ async fn forwarded_allow_always_persists_a_child_session_rule() {
     // A headless child ctx (has_ui=false) ⇒ `prompt_decision`'s live-vs-fail-closed gate
     // (`ctx.has_ui || is_subagent_child() || yolo_mode`, pi `confirmPermission`'s `hasUI` vs
     // `isSubagentExecutionContext` split, `index.ts:1506-1519`) only reaches `self.ask_channel` (the
-    // scripted forwarding stand-in) when this process is CHILD-shaped — this is the one test binary in
-    // this file, so mutating process env here is race-free.
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::set_var("CYRUP_SUBAGENT_CHILD", "1");
-    }
+    // scripted forwarding stand-in) when this process is CHILD-shaped. The caller's `envx::pin`
+    // supplies that shape for THIS THREAD only, so no sibling test can observe it.
     let ctx = HostCtx::event(ExtMode::Print, false, agent_dir.path().to_path_buf());
 
     // FIRST identical bash call: forwards (channel invoked once) and persists an always session rule.
@@ -111,9 +126,4 @@ async fn forwarded_allow_always_persists_a_child_session_rule() {
         1,
         "the always-decision persisted a child session rule ⇒ the second call did NOT forward again"
     );
-
-    #[allow(unsafe_code)]
-    unsafe {
-        std::env::remove_var("CYRUP_SUBAGENT_CHILD");
-    }
 }

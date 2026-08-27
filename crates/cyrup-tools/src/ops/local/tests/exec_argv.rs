@@ -20,7 +20,7 @@ use cyrup_core::CancelToken;
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_argv_timeout_kills_a_normal_child_well_within_grace() {
-    let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+    let proc = LocalProc::with_kill_grace(Duration::from_secs(5));
     let started = tokio::time::Instant::now();
     let out = proc
         .exec_argv(
@@ -57,7 +57,7 @@ async fn exec_argv_timeout_kills_a_normal_child_well_within_grace() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_argv_with_an_empty_cwd_inherits_the_ambient_cwd_instead_of_hard_failing() {
-    let proc = LocalProc::new(ShellConfig::detect());
+    let proc = LocalProc::new();
     let spec = ArgvSpec {
         program: "pwd".to_string(),
         args: Vec::new(),
@@ -91,7 +91,7 @@ async fn exec_argv_with_an_empty_cwd_inherits_the_ambient_cwd_instead_of_hard_fa
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_argv_timeout_preserves_the_real_code_of_a_graceful_sigterm_handler() {
-    let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+    let proc = LocalProc::with_kill_grace(Duration::from_secs(5));
     let sleeper = SleeperMarker::new("gracefulterm");
     let out = proc
         .exec_argv(
@@ -126,7 +126,7 @@ async fn exec_argv_timeout_preserves_the_real_code_of_a_graceful_sigterm_handler
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_argv_timeout_escalates_to_sigkill_when_the_child_ignores_sigterm() {
-    let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_millis(150));
+    let proc = LocalProc::with_kill_grace(Duration::from_millis(150));
     let sleeper = SleeperMarker::new("argvtimeoutkill");
     let started = tokio::time::Instant::now();
     let out = proc
@@ -160,7 +160,7 @@ async fn exec_argv_timeout_escalates_to_sigkill_when_the_child_ignores_sigterm()
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_argv_cancel_escalates_to_sigkill_when_the_child_ignores_sigterm() {
-    let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_millis(150));
+    let proc = LocalProc::with_kill_grace(Duration::from_millis(150));
     let sleeper = SleeperMarker::new("argvcancelkill");
     let cancel = CancelToken::new();
     let started = tokio::time::Instant::now();
@@ -216,7 +216,7 @@ async fn exec_argv_forced_sigkill_does_not_drop_buffered_stdout_already_sitting_
             std::process::id()
         ));
         let _ = std::fs::remove_file(&gt_path);
-        let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_millis(15));
+        let proc = LocalProc::with_kill_grace(Duration::from_millis(15));
         // fd 3 is opened ONCE (`exec 3>>`) rather than re-opened every iteration (a fresh
         // `>>` open/write/close per line is disk-syscall-bound and slow enough that the async
         // reader never falls behind) — this lets the loop spin as fast as the shell can manage
@@ -268,11 +268,10 @@ async fn exec_argv_forced_sigkill_does_not_drop_buffered_stdout_already_sitting_
              killed (ground truth file was empty) — with a 250ms run window this is a real \
              failure, not the scheduling race the old 15ms window made it"
         );
-        // TOOL-020 claimed this bound "assumes the host `ShellConfig::detect()` shell flushes
-        // stdout once per iteration". That half is REFUTED at HEAD: `exec_argv` runs the
-        // program it is handed, and this call hands it `argv("sh", …)` literally — the
-        // `ShellConfig::detect()` passed to `with_kill_grace` is only consulted by `exec`, not
-        // by `exec_argv`. The dependence is on `/bin/sh`'s builtin `printf`, which flushes per
+        // TOOL-020 claimed this bound "assumes the host detected shell flushes stdout once per
+        // iteration". That half is REFUTED at HEAD: `exec_argv` runs the program it is handed,
+        // and this call hands it `argv("sh", …)` literally — the shell `exec` resolves per call
+        // is never consulted by `exec_argv`. The dependence is on `/bin/sh`'s builtin `printf`, which flushes per
         // command, and is identical on every POSIX host.
         assert!(
             gt_last - stdout_last <= 1,
@@ -299,7 +298,7 @@ async fn exec_argv_forced_sigkill_does_not_drop_buffered_stdout_already_sitting_
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_argv_kill_signals_only_the_single_pid_never_the_process_group() {
-    let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_millis(150));
+    let proc = LocalProc::with_kill_grace(Duration::from_millis(150));
     let marker = std::env::temp_dir().join(format!(
         "cyrup-exec-argv-singlepid-{}.pid",
         std::process::id()
@@ -356,7 +355,7 @@ async fn exec_argv_kill_signals_only_the_single_pid_never_the_process_group() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_argv_does_not_hang_on_a_backgrounded_descendant_holding_the_pipe_open() {
-    let proc = LocalProc::new(ShellConfig::detect());
+    let proc = LocalProc::new();
     // The descendant records its own pid so this fixture can REAP it. The pipe-holding shape it
     // exists to prove is unchanged — `sleep` is still backgrounded out of a subshell that exits
     // immediately, still inherits the exec stdout/stderr pipes, and is still alive for the whole

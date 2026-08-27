@@ -85,19 +85,15 @@ impl AgentSession {
             Some(prefix) => format!("{prefix}\n{command}"),
             None => command.to_string(),
         };
-        // Resolve the shell fresh on THIS call, honoring a custom `shellPath` setting (Pi's
-        // `createLocalBashOperations({ shellPath })` resolves `getShellConfig(shellPath)` inside
-        // `exec` on every `executeBash` invocation — bash.ts:69/89 — never baked in once at session
-        // build time); a missing custom path surfaces the same `Custom shell path not found` error
-        // as the agent-loop `bash` tool (`cyrup-tools/src/tools/bash.rs:108-111`).
-        let shell = match self.shell_path.as_deref() {
-            Some(p) => match ShellConfig::resolve(Some(p)) {
-                Ok(shell) => shell,
-                // `_bash_guard` performs pi's `finally` removal on this path too.
-                Err(e) => return Err(e.into()),
-            },
-            None => self.shell.clone(),
-        };
+        // Resolve the shell fresh on THIS call (Pi's `createLocalBashOperations({ shellPath })`
+        // resolves `getShellConfig(shellPath)` inside `exec` on every `executeBash` invocation —
+        // bash.ts:91,159 — never baked in once at session build time). BOTH of Pi's errors surface
+        // here, identically to the agent-loop `bash` tool: `Custom shell path not found: …` when
+        // `shellPath` is set and missing (shell.ts:73), and the three-option `No bash shell found.
+        // Options: …` recipe with its `Searched Git Bash in:` list when it is unset and the host
+        // has no bash (shell.ts:100-106). `_bash_guard` performs Pi's `finally` removal on this
+        // early-return path too.
+        let shell = ShellConfig::resolve(self.shell_path.as_deref())?;
         // Pi wraps the caller's `onChunk` and emits `bash_execution_update` for EVERY delta,
         // whether or not a sink was supplied (agent-session.ts:2784-2787):
         //   onChunk: (delta) => { onChunk?.(delta); this._emit({type:"bash_execution_update", …}) }

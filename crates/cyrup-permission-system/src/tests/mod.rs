@@ -8,31 +8,29 @@
 //! The assertions are unchanged from their integration-test form — only the crate self-reference
 //! (`cyrup_permission_system::…` → `crate::…`) was rewritten.
 //!
-//! # What may NOT move here
+//! # What may move here
 //!
-//! The bar for this directory is stricter than "no subprocess". `cargo test` runs the whole
-//! crate's unit tests as parallel threads in ONE process, so a test that touches the process
-//! ENVIRONMENT is only isolated while it owns a `tests/` binary of its own. Two classes must stay
-//! under `tests/`:
+//! `cargo test` runs the whole crate's unit tests as parallel threads in ONE process, so this
+//! directory used to be barred to any test that touched the process ENVIRONMENT: such a test was
+//! isolated only while it owned a `tests/` binary of its own. That bar is gone. No test in this
+//! crate mutates the process environment any more — every env read goes through [`crate::envx`],
+//! whose `cfg(test)` build consults a THREAD-LOCAL overlay, and an override is installed with
+//! `envx::pin`, which no other thread can observe.
 //!
-//! 1. **Tests that MUTATE process env.** `tests/prompt_dedup.rs` and `tests/forwarding_persist.rs`
-//!    set `CYRUP_SUBAGENT_CHILD` process-wide (and `prompt_dedup` never restores it), while
-//!    [`crate::extension`]'s own `ask_fails_fast_without_ui_subagent_or_yolo` asserts that variable
-//!    is ABSENT. No lock fixes that without editing the pre-existing unit test.
-//! 2. **Tests that resolve a config path.**
-//!    [`crate::ext_config::ExtensionConfig::resolve_config_path`] re-reads
-//!    `CYRUP_PERMISSION_SYSTEM_CONFIG_PATH` on every load, so anything built through
-//!    `PermissionSystemExtension::new` must hold [`crate::ext_config::env_lock`] — see that
-//!    function's doc comment and `extension/tests/support.rs`'s `with_config_env_lock`. Acquiring
-//!    it means restructuring each `#[tokio::test]` into the sync-lock-then-`block_on` shape, which
-//!    is a change to the test, not a relocation of it.
+//! What a test moved here DOES have to respect is the one constraint that overlay carries: a pin is
+//! thread-local, so the pinned body must stay on the pinning thread. Drive it synchronously, or on
+//! a `new_current_thread` runtime (what `#[tokio::test]` builds by default) — never on a
+//! multi-thread runtime, whose workers cannot see the pin.
 //!
-//! The three modules below construct their `ExtensionConfig` values directly and never resolve a
-//! path from the environment, so neither hazard applies to them. (They each ASSERT
-//! `FORWARDING_AGENT_DIR_ENV` is unset as a precondition; no test in this crate sets it.)
+//! The modules below either construct their `ExtensionConfig` values directly and never resolve a
+//! path from the environment, or pin what they resolve. (Three of them ASSERT, through
+//! [`crate::envx::var`] so a pin would be seen, that `FORWARDING_AGENT_DIR_ENV` resolves to nothing
+//! as a precondition; no test in this crate sets it.)
 
 mod forwarded_prompt_fractional_timeout;
 mod forwarding_audit_trail;
 mod forwarding_has_ui_guard;
+mod forwarding_persist;
 mod forwarding_preserve_location;
 mod forwarding_response_path_containment;
+mod prompt_dedup;

@@ -72,7 +72,7 @@ use cyrup_agent::{Agent, AgentMessage};
 use cyrup_core::{AssistantMessage, CancelToken, EventStream, ModelRef, SessionId};
 use cyrup_session::compaction::{BranchSummarySettings, CompactionSettings};
 use cyrup_session::manager::SessionManager;
-use cyrup_tools::{ProcOps, ShellConfig};
+use cyrup_tools::ProcOps;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::event::AgentSessionEvent;
@@ -96,7 +96,6 @@ pub(crate) struct SessionExtras {
     pub retry_max_retries: u32,
     pub retry_base_delay_ms: u64,
     pub proc: Arc<dyn ProcOps>,
-    pub shell: ShellConfig,
     /// `shellPath` setting (Pi `getShellPath`, settings-manager.ts:864-865); resolved fresh on
     /// every immediate-bash call (see [`AgentSession::execute_bash`]), never baked in at build time.
     pub shell_path: Option<String>,
@@ -242,7 +241,6 @@ pub struct AgentSession {
     overflow_recovery_attempted: Mutex<bool>,
     // ---- immediate-bash seam (Pi agent-session.ts:2582-2684) ----
     proc: Arc<dyn ProcOps>,
-    shell: ShellConfig,
     shell_path: Option<String>,
     shell_command_prefix: Option<String>,
     /// Cancel handles for the in-flight `execute_bash` calls, one entry per call — Pi
@@ -367,7 +365,6 @@ impl AgentSession {
             auto_compaction_cancel: Mutex::new(None),
             overflow_recovery_attempted: Mutex::new(false),
             proc: extras.proc,
-            shell: extras.shell,
             shell_path: extras.shell_path,
             shell_command_prefix: extras.shell_command_prefix,
             bash_cancels: Mutex::new(Vec::new()),

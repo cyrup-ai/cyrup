@@ -31,6 +31,12 @@ fn guideline_keep_rule(normalized: &str, allowed: &HashSet<String>) -> Option<bo
     let has = |name: &str| allowed.contains(name);
     match normalized {
         "use bash for file operations like ls, rg, find" => Some(has("bash")),
+        "use powershell for file operations like listing, searching, and finding files" => {
+            Some(has("powershell"))
+        }
+        "use bash or powershell for file operations like listing, searching, and finding files" => {
+            Some(has("bash") && has("powershell"))
+        }
         "prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)" => {
             Some(has("bash") && (has("grep") || has("find") || has("ls")))
         }
@@ -265,6 +271,50 @@ mod tests {
         let out = sanitize_available_tools_section(prompt, &allowed(&["read", "bash"]));
         assert!(!out.removed);
         assert_eq!(out.prompt, prompt);
+    }
+
+    /// The two PowerShell file-exploration bullets the prompt builder can now emit
+    /// (`cyrup-session/src/prompt/builder.rs`, pi `system-prompt.ts:107-111`) must be DROPPABLE:
+    /// a bullet with no rule is always kept, so without these arms a hidden `powershell` would
+    /// leave the model told to use a tool it cannot call.
+    #[test]
+    fn powershell_file_exploration_bullets_track_their_tools() {
+        let ps = "- Use PowerShell for file operations like listing, searching, and finding files";
+        let both = "- Use bash or PowerShell for file operations like listing, searching, and finding files";
+
+        // PowerShell hidden ⇒ its bullet goes.
+        let out = sanitize_available_tools_section(
+            &format!("Guidelines:\n{ps}\n- always be polite\n"),
+            &allowed(&["bash"]),
+        );
+        assert!(out.removed);
+        assert!(!out.prompt.contains("Use PowerShell for file operations"));
+        assert!(out.prompt.contains("always be polite"));
+
+        // PowerShell exposed ⇒ its bullet stays.
+        let out = sanitize_available_tools_section(
+            &format!("Guidelines:\n{ps}\n"),
+            &allowed(&["powershell"]),
+        );
+        assert!(out.prompt.contains("Use PowerShell for file operations"));
+
+        // The combined bullet needs BOTH shells; hiding either drops it.
+        for still_allowed in [&["bash"][..], &["powershell"][..]] {
+            let out = sanitize_available_tools_section(
+                &format!("Guidelines:\n{both}\n- always be polite\n"),
+                &allowed(still_allowed),
+            );
+            assert!(
+                !out.prompt.contains("Use bash or PowerShell"),
+                "{still_allowed:?} alone must not keep the two-shell bullet:\n{}",
+                out.prompt
+            );
+        }
+        let out = sanitize_available_tools_section(
+            &format!("Guidelines:\n{both}\n"),
+            &allowed(&["bash", "powershell"]),
+        );
+        assert!(out.prompt.contains("Use bash or PowerShell"));
     }
 
     #[test]

@@ -6,8 +6,12 @@
 //! the default is the local backend over tokio fs/process. This is the CANONICAL definition — no
 //! competing `Operations` trait exists.
 
+/// Cancellation pulled into a blocking `std::io::Read` consumer — `pub(crate)` because more
+/// than one tool needs the same sentinel/adapter pair; not part of the public seam.
+pub(crate) mod cancel_read;
 pub mod local;
 pub mod shell;
+pub(crate) mod win;
 
 use cyrup_core::{CancelToken, EventStream, ToolError};
 use std::path::{Path, PathBuf};
@@ -234,6 +238,56 @@ fn is_bmp(buf: &[u8]) -> bool {
     color_planes == 1 && [1, 4, 8, 16, 24, 32].contains(&bits_per_pixel)
 }
 
+/// Which upstream binary's ignore-file set a walk reproduces.
+///
+/// `.fdignore` and `.rgignore` are BOTH opt-in `WalkBuilder::add_custom_ignore_filename`
+/// registrations in the `ignore` crate, and each is read by exactly ONE of the two tools pi
+/// shells out to: fd reads `.fdignore` and a global `<config>/fd/ignore`; ripgrep reads
+/// `.rgignore` and has no global ignore file of its own. Because `find` and `grep` share the one
+/// `FsOps::walk` seam, that seam cannot register either name unconditionally without giving one
+/// tool an exclusion source its upstream does not have. Naming the caller is the whole job of
+/// this enum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WalkFlavor {
+    /// No tool-specific ignore sources: `.ignore` plus the gitignore family only. This is the
+    /// `Default` so that a defaulted `WalkOpts` can never silently confer fd or ripgrep
+    /// semantics on a walker that did not ask for them.
+    #[default]
+    Plain,
+    /// fd (`find`, find.ts:225-269). Registers `.fdignore` and fd's global ignore file.
+    Fd,
+    /// ripgrep (`grep`, grep.ts:177 `ensureTool("rg")`, argv at `:220-224`). Registers
+    /// `.rgignore`; ripgrep has no global ignore file, so nothing else attaches here.
+    Rg,
+}
+
+impl WalkFlavor {
+    /// The custom ignore FILENAME this flavor's upstream reads, if any. Custom ignore files
+    /// outrank `.ignore` and every gitignore source (ignore 0.4.26 `dir.rs:580-585`).
+    ///
+    /// Exactly ONE name is ever returned, so `find` can never see `.rgignore` and `grep` can
+    /// never see `.fdignore`: the cross-contamination a shared walk seam otherwise invites is
+    /// structurally impossible rather than merely avoided.
+    pub fn custom_ignore_filename(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::Fd => Some(".fdignore"),
+            // ripgrep registers `.rgignore` gated on `!no_ignore_dot` — the SAME knob that
+            // gates `.ignore` (ripgrep 14.1.0 `crates/core/flags/hiargs.rs:891, :897-899`).
+            // Pi's argv passes neither `--no-ignore` nor `--no-ignore-dot` (grep.ts:220-224)
+            // and cyrup never disables `WalkBuilder::ignore`, so this is unconditional,
+            // exactly as it is upstream.
+            Self::Rg => Some(".rgignore"),
+        }
+    }
+
+    /// Whether this flavor's upstream reads a GLOBAL ignore file. Only fd does
+    /// (fd 10.5.0 `src/walk.rs:371-386`); ripgrep has no equivalent.
+    pub fn reads_fd_global_ignore(self) -> bool {
+        matches!(self, Self::Fd)
+    }
+}
+
 /// Options for a tree walk (grep/find). Hidden files are skipped by default (ripgrep/fd parity).
 ///
 /// `require_git` mirrors fd/ripgrep's `--require-git` behavior: when `false` (fd's
@@ -241,17 +295,35 @@ fn is_bmp(buf: &[u8]) -> bool {
 /// (fd/ripgrep default), git-ignore semantics only apply inside a repo, so parent `.gitignore`
 /// rules stop at nested repo boundaries. Pi's `find` sets this per search path (find.ts:226-240,
 /// issue #5960); `grep` keeps the historical unconditional `false`.
+///
+/// `flavor` names the upstream binary being emulated so the shared walk seam can register the
+/// tool-specific ignore sources — see [`WalkFlavor`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WalkOpts {
     pub include_hidden: bool,
     pub require_git: bool,
+    pub flavor: WalkFlavor,
 }
 
 /// A single walked path.
+///
+/// `is_dir` and `is_file` are BOTH carried because they are not complements. A symlink, a FIFO, a
+/// socket and a device node are each neither, and separating those from a regular file is the
+/// reason this type exists rather than a bare `PathBuf`. Both flags describe the ENTRY's own type
+/// — `lstat` semantics, never followed — because that is the type the upstream binaries decide on:
+/// `ignore` 0.4.26 builds a traversed entry's type from `std::fs::DirEntry::file_type`
+/// (`walk.rs:322-333`, `:353-367`), which does not resolve the link.
+///
+/// `grep` filters on `is_file` ALONE, reproducing ripgrep's `SubjectBuilder`: a traversal-discovered
+/// entry is searched only when `file_type().is_file()` holds, so an in-tree symlink is never opened
+/// and its target is never searched under the link's name. `find` filters on `is_dir` ALONE and must
+/// keep doing so — fd DOES list symlinks, and `find` uses the flag only to decide the trailing `/`
+/// that marks a directory in its output.
 #[derive(Clone, Debug)]
 pub struct WalkItem {
     pub path: PathBuf,
     pub is_dir: bool,
+    pub is_file: bool,
 }
 
 /// What to run, where, and how (transport) for [`ProcOps::exec`].
@@ -376,6 +448,13 @@ pub trait FsOps: Send + Sync {
     }
 
     /// Walk a tree for grep/find. Yields candidate paths (gitignore-aware for the local backend).
+    ///
+    /// A yielded `Err` is a NON-FATAL per-entry event, not end-of-stream: the walk continues and
+    /// further `Ok` items follow. Implementations MUST keep walking after emitting one, and
+    /// consumers MUST keep polling. Whether such an error fails the *tool call* is the caller's
+    /// decision and the two callers differ — `find` emulates fd, which swallows every traversal
+    /// error and exits 0, while `grep` emulates ripgrep, which reports it and exits 2. The message
+    /// carries no tool prefix for that reason.
     fn walk(&self, root: &Path, opts: WalkOpts) -> EventStream<Result<WalkItem, ToolError>>;
 }
 
@@ -508,7 +587,7 @@ impl LocalBashOperations {
     /// Over the default local process backend (pi `createLocalBashOperations({ shellPath })`).
     pub fn new(shell_path: Option<String>) -> Self {
         Self {
-            proc: Arc::new(local::LocalProc::new(ShellConfig::detect())),
+            proc: Arc::new(local::LocalProc::new()),
             shell_path,
         }
     }
@@ -565,18 +644,20 @@ pub struct Backend {
 }
 
 impl Backend {
-    /// The default local backend over tokio fs/process with the given shell.
-    pub fn local(shell: ShellConfig) -> Self {
+    /// The default local backend over tokio fs/process. No shell is baked in — every `bash` seam
+    /// resolves its own per call (Pi bash.ts:91), and [`local::LocalProc`] resolves the platform
+    /// default itself for a spec that carries none.
+    pub fn local() -> Self {
         Self {
             fs: Arc::new(local::LocalFs),
-            proc: Arc::new(local::LocalProc::new(shell)),
+            proc: Arc::new(local::LocalProc::new()),
         }
     }
 }
 
 impl Default for Backend {
     fn default() -> Self {
-        Self::local(ShellConfig::detect())
+        Self::local()
     }
 }
 
@@ -689,7 +770,9 @@ mod bash_operations_tests {
         let proc = Arc::new(RecordingProc::default());
 
         // Presence: a resolvable shell path reaches the backend.
-        let good = ShellConfig::detect().program;
+        let good = ShellConfig::try_detect()
+            .expect("unix detection cannot fail (shell.ts:119)")
+            .program;
         let ok_ops =
             LocalBashOperations::with_proc(proc.clone(), Some(good.to_string_lossy().into_owned()));
         let mut noop = |_: &[u8]| {};

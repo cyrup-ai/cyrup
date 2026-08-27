@@ -135,6 +135,53 @@ fn windows_home_from(
     None
 }
 
+/// fd's global ignore file, or `None` when there is no resolvable config dir or the file does not
+/// exist.
+///
+/// fd joins `fd/ignore` onto `etcetera::choose_base_strategy().config_dir()` and registers it only
+/// when `is_file()` holds (fd 10.5.0 `src/walk.rs:371-375`). pi passes no
+/// `--no-global-ignore-file` (find.ts:235-267), so `read_global_ignore` is true on every call.
+pub(crate) fn fd_global_ignore_file() -> Option<PathBuf> {
+    let file = fd_config_dir()?.join("fd").join("ignore");
+    file.is_file().then_some(file)
+}
+
+/// `etcetera::choose_base_strategy().config_dir()`, reproduced.
+///
+/// `choose_base_strategy` selects the `Windows` strategy on Windows and the **`Xdg`** strategy on
+/// every other target INCLUDING macOS (etcetera `src/base_strategy.rs:53-63`; the macro's second
+/// argument is the base strategy) — so a macOS user's fd ignore file is `~/.config/fd/ignore`, not
+/// `~/Library/Application Support/fd/ignore`.
+///
+/// * Xdg: `$XDG_CONFIG_HOME` when set AND ABSOLUTE, else `$HOME/.config`
+///   (`base_strategy/xdg.rs`, `env_var_or_none` + `env_var_or_default`).
+/// * Windows: `%APPDATA%` when set and non-empty, else `{home}\AppData\Roaming`
+///   (`base_strategy/windows.rs:123-127, :190-196`).
+///
+/// **[CYRUP-DELTA — the Windows arm omits etcetera's `SHGetKnownFolderPath` fallback]** etcetera's
+/// `dir_inner` falls back to a win32 known-folder lookup between the `%APPDATA%` read and the
+/// home-relative default. A Windows session with `%APPDATA%` unset but a redirected roaming folder
+/// would therefore have fd read a file cyrup does not. Stated rather than papered over, because
+/// the direction of the divergence is "cyrup excludes fewer paths", which is invisible in output.
+fn fd_config_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA").filter(|s| !s.is_empty()) {
+            return Some(PathBuf::from(appdata));
+        }
+        return home_dir().map(|h| h.join("AppData").join("Roaming"));
+    }
+    #[cfg(not(windows))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from)
+            && xdg.is_absolute()
+        {
+            return Some(xdg);
+        }
+        home_dir().map(|h| h.join(".config"))
+    }
+}
+
 /// `normalizeWindowsShellPath` (v0.84.1 `paths.ts:67-73`): convert Git Bash / MSYS / Cygwin / WSL
 /// drive paths (`/c/…`, `/cygdrive/c/…`, `/mnt/c/…`) into a form the native Windows APIs accept
 /// (`C:\…`). Bails out unchanged on anything that is not a single-slash-rooted, backslash-free
@@ -214,6 +261,41 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Node `pathToFileURL(p).href` (`render-utils.ts:22`) — the inverse of [`file_url_to_path`].
+///
+/// Percent-encodes every byte outside the WHATWG *path* safe set, so the C0 controls, space, `"`,
+/// `#`, `<`, `>`, `?`, `` ` ``, `{`, `}`, `%` and all non-ASCII bytes (UTF-8, byte-wise) come back
+/// escaped. `/` is a separator and is preserved. On Windows the leading component is prefixed with
+/// `/` so `C:\x` becomes `file:///C:/x`, matching Node.
+///
+/// The set is a **superset** of Node's for ASCII (Node's own pre-pass escapes only `%`, `#`, `?`,
+/// `\n`, `\r`, `\t` on top of the WHATWG path set), so an exotic path can produce an href that is
+/// more escaped than Node's. Both decode to the same bytes, so nothing observable diverges.
+pub fn path_to_file_url(path: &Path) -> String {
+    const SAFE: &[u8] = b"-._~!$&'()*+,;=:@/";
+    let raw = path.to_string_lossy();
+    let raw = if cfg!(windows) { raw.replace('\\', "/") } else { raw.into_owned() };
+    let mut out = String::from("file://");
+    if !raw.starts_with('/') {
+        out.push('/');
+    }
+    for &b in raw.as_bytes() {
+        if b.is_ascii_alphanumeric() || SAFE.contains(&b) {
+            out.push(b as char);
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            // `get`, not indexing: the workspace denies `clippy::indexing_slicing`. The nibbles are
+            // 0..=15 by construction, so the fallback is unreachable.
+            let hi = HEX.get(usize::from(b >> 4)).copied().unwrap_or(b'0');
+            let lo = HEX.get(usize::from(b & 0x0f)).copied().unwrap_or(b'0');
+            out.push('%');
+            out.push(char::from(hi));
+            out.push(char::from(lo));
+        }
+    }
+    out
 }
 
 /// Lexically collapse `.`/`..` segments and drop trailing separators, mirroring Node `path.resolve`

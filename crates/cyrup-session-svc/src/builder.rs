@@ -30,7 +30,7 @@ use cyrup_session::prompt::{
 };
 use cyrup_session::SessionLayout;
 use cyrup_tools::{
-    Availability, Backend, BashOpts, PermissionPolicy, ProtectedFs, ShellConfig, ToolRegistry,
+    Availability, Backend, BashOpts, PermissionPolicy, ProtectedFs, ToolRegistry,
     ToolsOptions, TraversalFs,
 };
 use tokio::sync::Mutex as AsyncMutex;
@@ -312,14 +312,27 @@ fn http_proxy_overlay(proxy: Option<&str>) -> Option<cyrup_provider::ProviderEnv
 /// Pi's default active built-in tool names (sdk.ts:244).
 const DEFAULT_BUILTIN_TOOLS: [&str; 4] = ["read", "bash", "edit", "write"];
 
-/// Every tool `ToolRegistry::with_builtins` installs (`cyrup-tools/src/registry.rs:45-67`).
+/// Every tool `ToolRegistry::with_builtins` installs (`cyrup-tools/src/registry.rs:53-100`).
 ///
-/// Needed to tell "a built-in pi does not activate by default" (`grep`/`find`/`ls`) apart from "a
-/// non-built-in tool" (an extension- or embedder-supplied one), which must stay active: pi's
-/// `defaultActiveToolNames` gates only its own built-ins and never suppresses a tool the host
-/// registered.
-const ALL_BUILTIN_TOOLS: [&str; 7] =
-    ["read", "write", "edit", "bash", "grep", "find", "ls"];
+/// Needed to tell "a built-in pi does not activate by default" (`powershell`/`grep`/`find`/`ls`)
+/// apart from "a non-built-in tool" (an extension- or embedder-supplied one), which must stay
+/// active: pi's `defaultActiveToolNames` gates only its own built-ins and never suppresses a tool
+/// the host registered.
+///
+/// `powershell` MUST be listed here. The default arm of `select_active_tools` keeps any name it
+/// does not recognise as a built-in, so omitting it would enable PowerShell in every session —
+/// while pi's default set is `read`/`bash`/`edit`/`write` (sdk.ts:256) and `powershell` is reachable
+/// only through `--tools` / `defaultTools`.
+const ALL_BUILTIN_TOOLS: [&str; 8] = [
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "powershell",
+    "grep",
+    "find",
+    "ls",
+];
 
 /// Apply the `tools`/`noTools`/`excludeTools` selection over the Availability-visible tool set
 /// (Pi sdk.ts:244-251). When none of the three is set the visible set passes through unchanged.
@@ -840,8 +853,11 @@ impl SessionBuilder {
         // `executeBash` re-reading the same two settings, agent-session.ts:2624-2632).
         let shell_path_setting = settings.effective().shell_path();
         let shell_command_prefix_setting = settings.effective().shell_command_prefix();
-        let shell = ShellConfig::detect();
-        let base = Backend::local(shell.clone());
+        // No shell is resolved at session build. Pi resolves inside every `exec` (bash.ts:91) and
+        // its session start never fails on a bash-less host; both cyrup bash seams now do the same,
+        // so a missing bash surfaces as Pi's `No bash shell found` recipe on the command that
+        // needed it, not as a failed session.
+        let base = Backend::local();
         // The process backend the immediate-bash seam (#8) runs against (kept past `base`'s move).
         let bash_proc = base.proc.clone();
         let mut fs = base.fs.clone();
@@ -913,6 +929,16 @@ impl SessionBuilder {
                     // reads as nondeterminism from the outside.
                     bin_dir: Some(cfg.agent_dir.join("bin")),
                     ..BashOpts::default()
+                },
+                // The `powershell` tool shares `resolveSpawnContext` with `bash` (bash.ts:341), so
+                // it gets the same live session handle and the same managed `<agent_dir>/bin` on
+                // PATH. It does NOT get `shellPath` or `shellCommandPrefix`: `PowerShellOpts` has
+                // no such fields, because `createLocalPowerShellOperations()` takes no options
+                // (powershell.ts:32-33) and the `shellPath` setting names a bash.
+                powershell: cyrup_tools::config::PowerShellOpts {
+                    session_env: Some(bash_session_env.clone()),
+                    bin_dir: Some(cfg.agent_dir.join("bin")),
+                    ..cyrup_tools::config::PowerShellOpts::default()
                 },
                 ..ToolsOptions::default()
             },
@@ -1753,7 +1779,6 @@ impl SessionBuilder {
             retry_max_retries: to_u32(eff.retry_max_retries()),
             retry_base_delay_ms: u64::try_from(eff.retry_base_delay_ms().max(0)).unwrap_or(0),
             proc: bash_proc,
-            shell,
             shell_path: shell_path_setting,
             shell_command_prefix: shell_command_prefix_setting,
             dynamic_tools,
@@ -2371,8 +2396,38 @@ fn today() -> time::Date {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
-    use super::http_proxy_overlay;
+    use super::{ALL_BUILTIN_TOOLS, DEFAULT_BUILTIN_TOOLS, http_proxy_overlay};
     use std::path::Path;
+
+    /// `select_active_tools`'s no-flags arm is
+    /// `DEFAULT_BUILTIN_TOOLS.contains(name) || !ALL_BUILTIN_TOOLS.contains(name)` — it KEEPS any
+    /// name it does not recognise as a built-in, because that is how an extension- or
+    /// embedder-supplied tool stays active. So every name `ToolRegistry::with_builtins` installs
+    /// must appear in `ALL_BUILTIN_TOOLS` or it is silently on by default. `powershell` is the
+    /// case this guards: pi's `defaultActiveToolNames` is `read`/`bash`/`edit`/`write`
+    /// (sdk.ts:256) and `powershell` is reachable only through `--tools` / `defaultTools`.
+    #[test]
+    fn every_builtin_is_gated_and_powershell_is_not_a_default() {
+        for name in cyrup_tools::BUILTIN_NAMES {
+            assert!(
+                ALL_BUILTIN_TOOLS.contains(&name),
+                "`{name}` is registered by `with_builtins` but absent from ALL_BUILTIN_TOOLS, so \
+                 the default arm of `select_active_tools` would treat it as an extension tool and \
+                 enable it in EVERY session"
+            );
+        }
+        assert_eq!(ALL_BUILTIN_TOOLS.len(), cyrup_tools::BUILTIN_NAMES.len());
+        assert!(ALL_BUILTIN_TOOLS.contains(&"powershell"));
+        assert!(
+            !DEFAULT_BUILTIN_TOOLS.contains(&"powershell"),
+            "pi's default active set is read/bash/edit/write (sdk.ts:256)"
+        );
+        assert_eq!(DEFAULT_BUILTIN_TOOLS, ["read", "bash", "edit", "write"]);
+        // The reverse direction: nothing is gated that the registry does not actually install.
+        for name in DEFAULT_BUILTIN_TOOLS {
+            assert!(cyrup_tools::BUILTIN_NAMES.contains(&name));
+        }
+    }
 
     // ---- SEAM-071: `--no-extensions` gates the native built-ins ----------------------------
     //

@@ -73,8 +73,7 @@ pub fn debug_path(logs_dir: &Path) -> PathBuf {
 /// on every `writeLine` (`logging.ts:47`), so an env change mid-session redirects the trail.
 #[must_use]
 pub fn resolve_logs_dir(default_dir: &Path) -> PathBuf {
-    std::env::var(LOGS_DIR_ENV_KEY)
-        .ok()
+    crate::envx::var(LOGS_DIR_ENV_KEY)
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -408,17 +407,6 @@ mod tests {
     use super::*;
     use crate::ext_config::ExtensionConfig;
 
-    /// [`resolve_logs_dir`] re-reads [`LOGS_DIR_ENV_KEY`] on EVERY write, and this crate runs its
-    /// unit tests in one process, so `logs_dir_env_var_overrides_the_default`'s process-global
-    /// `set_var` is visible to any sibling test that happens to write inside that window — it
-    /// silently redirects the sibling's trail into the override directory. Every test that touches
-    /// the trail therefore takes the SAME lock `ext_config` uses for its env-dependent tests
-    /// (`ext_config.rs:234-243`). Without this the module is flaky at HEAD independently of any
-    /// behaviour change, which makes a revert proof unreadable.
-    fn trail_lock() -> std::sync::MutexGuard<'static, ()> {
-        crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
     fn logger_with(debug: bool, dir: &Path) -> PermissionSystemLogger {
         let config = ExtensionConfig { debug, ..ExtensionConfig::default() };
         PermissionSystemLogger::new(Arc::new(StdMutex::new(config)), dir.join(LOGS_DIR_NAME))
@@ -436,7 +424,6 @@ mod tests {
     // not exist, so nothing was ever written.
     #[test]
     fn review_entry_appends_a_shaped_jsonl_line() {
-        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(true, dir.path());
 
@@ -460,7 +447,6 @@ mod tests {
     // still be written.
     #[test]
     fn review_is_written_with_debug_disabled() {
-        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(false, dir.path());
 
@@ -477,7 +463,6 @@ mod tests {
     // no filesystem at all — not even the `mkdir`.
     #[test]
     fn debug_stream_stays_gated_and_creates_no_directory() {
-        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(false, dir.path());
 
@@ -493,7 +478,6 @@ mod tests {
     // the one file.
     #[test]
     fn entries_append_and_share_one_file_across_streams() {
-        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         let logger = logger_with(true, dir.path());
 
@@ -547,20 +531,19 @@ mod tests {
     // computed default directory.
     #[test]
     fn logs_dir_env_var_overrides_the_default() {
-        let _guard = crate::ext_config::env_lock().lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         let overridden = dir.path().join("elsewhere");
         let logger = logger_with(true, dir.path());
 
-        // SAFETY: serialized by `env_lock` so no other test observes a partial mutation; restored
-        // before the assertions.
-        unsafe {
-            std::env::set_var(LOGS_DIR_ENV_KEY, overridden.display().to_string());
-        }
-        let result = logger.review("permission_request.blocked", &serde_json::json!({}));
-        unsafe {
-            std::env::remove_var(LOGS_DIR_ENV_KEY);
-        }
+        // A [`crate::envx`] pin, not a process mutation: `resolve_logs_dir` re-reads
+        // [`LOGS_DIR_ENV_KEY`] on EVERY write, so a process-global override silently redirected any
+        // concurrent sibling's trail into this directory. Pinned per-thread, no sibling can see it
+        // and no sibling can be redirected — which is why the module's trail lock is gone, not moved.
+        let result = {
+            let _pin =
+                crate::envx::pin(LOGS_DIR_ENV_KEY, Some(&overridden.display().to_string()));
+            logger.review("permission_request.blocked", &serde_json::json!({}))
+        };
 
         assert_eq!(result, None);
         assert!(debug_path(&overridden).exists(), "the override dir must receive the trail");
@@ -586,7 +569,6 @@ mod tests {
     // instead of writing (and never panics).
     #[test]
     fn unusable_logs_directory_returns_a_warning() {
-        let _env = trail_lock();
         let dir = tempfile::tempdir().unwrap();
         // A regular FILE where the logs directory should be: `mkdir -p` cannot succeed.
         std::fs::write(dir.path().join(LOGS_DIR_NAME), "not a directory").unwrap();

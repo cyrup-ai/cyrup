@@ -268,6 +268,79 @@ impl std::fmt::Debug for BashOpts {
     }
 }
 
+/// Pi's `PowerShellToolOptions` (powershell.ts:29-30):
+/// `Pick<BashToolOptions, "operations" | "exposeSessionEnvironment" | "spawnHook">`.
+///
+/// Deliberately NO `shell_path` and NO `command_prefix`. `createPowerShellToolDefinition` forwards
+/// only those three keys (powershell.ts:53-56) and `createLocalPowerShellOperations()` accepts no
+/// options at all (powershell.ts:32-33), so the settings `shellPath` — which names a bash — can
+/// never reach PowerShell. Making them unrepresentable here is what enforces that.
+///
+/// `bin_dir` IS present: `resolveSpawnContext` is SHARED by both shell tools (bash.ts:341,168) and
+/// `getShellEnv()` prepends `getBinDir()` to `PATH` for every shell child (shell.ts:138-150), so a
+/// binary cyrup manages into `<agent_dir>/bin` must be on PATH for `powershell` too.
+#[derive(Clone)]
+pub struct PowerShellOpts {
+    pub max_lines: usize,
+    pub max_bytes: usize,
+    pub bin_dir: Option<PathBuf>,
+    pub spawn_hook: Option<BashSpawnHook>,
+    pub expose_session_environment: bool,
+    pub session_env: Option<SessionEnvHandle>,
+}
+
+impl Default for PowerShellOpts {
+    fn default() -> Self {
+        Self {
+            max_lines: DEFAULT_MAX_LINES,
+            max_bytes: DEFAULT_MAX_BYTES,
+            bin_dir: None,
+            spawn_hook: None,
+            // Pi: `options?.exposeSessionEnvironment ?? true` (bash.ts:342).
+            expose_session_environment: true,
+            session_env: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for PowerShellOpts {
+    // Manual for the same reason as `BashOpts`: `spawn_hook` is a boxed closure.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PowerShellOpts")
+            .field("max_lines", &self.max_lines)
+            .field("max_bytes", &self.max_bytes)
+            .field("bin_dir", &self.bin_dir)
+            .field("spawn_hook", &self.spawn_hook.as_ref().map(|_| "<hook>"))
+            .field(
+                "expose_session_environment",
+                &self.expose_session_environment,
+            )
+            .field(
+                "session_env",
+                &self.session_env.as_ref().map(SessionEnvHandle::get),
+            )
+            .finish()
+    }
+}
+
+/// Pi's factory takes `BashToolOptions` for BOTH shells (bash.ts:338-341); `PowerShellToolOptions`
+/// is only the narrowed public surface. This widening is that fact in Rust — and it is where the
+/// two omitted keys are pinned to `None` rather than merely left unset.
+impl From<PowerShellOpts> for BashOpts {
+    fn from(o: PowerShellOpts) -> Self {
+        Self {
+            max_lines: o.max_lines,
+            max_bytes: o.max_bytes,
+            command_prefix: None,
+            shell_path: None,
+            bin_dir: o.bin_dir,
+            spawn_hook: o.spawn_hook,
+            expose_session_environment: o.expose_session_environment,
+            session_env: o.session_env,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GrepOpts {
     pub limit: usize,
@@ -319,6 +392,8 @@ pub struct ToolsOptions {
     pub write: WriteOpts,
     pub edit: EditOpts,
     pub bash: BashOpts,
+    /// Pi `ToolsOptions.powershell` (index.ts:110).
+    pub powershell: PowerShellOpts,
     pub grep: GrepOpts,
     pub find: FindOpts,
     pub ls: LsOpts,

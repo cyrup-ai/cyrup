@@ -87,7 +87,11 @@ struct PromptTemplate {
     tools_extra: &'static str,
     guidelines_header: &'static str,
     baseline_guidelines: &'static [&'static str],
+    /// Pi `system-prompt.ts:105-112` — a THREE-way branch over `hasBash`/`hasPowerShell`, not one
+    /// string. Whichever shell tools are selected, the bullet names them.
     bash_fallback_guideline: &'static str,
+    powershell_fallback_guideline: &'static str,
+    bash_or_powershell_fallback_guideline: &'static str,
     docs_header: &'static str,
     docs_guidance: &'static [&'static str],
     project_context_open: &'static str,
@@ -108,6 +112,8 @@ static DEFAULT_TEMPLATE: PromptTemplate = PromptTemplate {
         "Show file paths clearly when working with files",
     ],
     bash_fallback_guideline: "Use bash for file operations like ls, rg, find",
+    powershell_fallback_guideline: "Use PowerShell for file operations like listing, searching, and finding files",
+    bash_or_powershell_fallback_guideline: "Use bash or PowerShell for file operations like listing, searching, and finding files",
     // [CYRUP-DELTA] docs pointer references cyrup docs (Pi `system-prompt.ts:131`, "Pi
     // documentation (read only when the user asks about pi itself, its SDK, extensions, themes,
     // skills, or TUI):").
@@ -219,10 +225,21 @@ impl SystemPromptBuilder {
         out.push_str(t.guidelines_header);
         out.push('\n');
         let mut seen: Vec<String> = Vec::new();
-        // 3a. conditional file-exploration fallback
+        // 3a. conditional file-exploration fallback (Pi `system-prompt.ts:97-113`). The gate is
+        // `(hasBash || hasPowerShell)`, and the bullet names whichever shells are actually selected
+        // — a PowerShell-only session must not be told to use `ls, rg, find`.
         let has = |n: &str| is_selected(inp.selected_tools.as_ref(), n);
-        if has("bash") && !has("grep") && !has("find") && !has("ls") {
-            push_guideline(out, &mut seen, t.bash_fallback_guideline);
+        let has_bash = has("bash");
+        let has_powershell = has("powershell");
+        if (has_bash || has_powershell) && !has("grep") && !has("find") && !has("ls") {
+            let guideline = if has_bash && has_powershell {
+                t.bash_or_powershell_fallback_guideline
+            } else if has_powershell {
+                t.powershell_fallback_guideline
+            } else {
+                t.bash_fallback_guideline
+            };
+            push_guideline(out, &mut seen, guideline);
         }
         // 3b. tool-specific guidelines (named per func-03 R-03-039)
         for c in &inp.tool_contributions {

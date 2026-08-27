@@ -72,6 +72,7 @@ mod model_selector;
 mod native_modifiers;
 mod oauth_selector;
 mod open_browser;
+mod osc;
 mod overlay;
 mod panic_hook;
 mod pending_messages;

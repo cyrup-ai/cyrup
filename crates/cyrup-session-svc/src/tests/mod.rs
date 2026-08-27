@@ -40,6 +40,7 @@ mod round6;
 mod round7;
 mod round8_postrun;
 mod round9_l5res;
+mod same_path_mutation_order;
 mod session_branch_dir;
 mod session_dag;
 mod session_list_dir;

@@ -8,8 +8,30 @@
 //! into the freshly-created file. If the whole output fit, no temp file is ever created.
 
 use crate::ops::local::unique_suffix;
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::PathBuf;
+
+/// `U+FEFF` encoded as UTF-8 — the byte-order mark `TextDecoder` removes at the head of a stream
+/// when `ignoreBOM` is false (its default, output-accumulator.ts:40).
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
+/// Stream-head BOM filter, mirroring `TextDecoder`'s default `ignoreBOM: false`
+/// (output-accumulator.ts:40,70).
+///
+/// The BOM is removed **only** at the very start of the byte stream, so the state machine is
+/// one-shot: it withholds a strict prefix of `EF BB BF` until the next byte decides, then latches
+/// to [`BomFilter::Done`] and every subsequent byte passes through untouched (a second BOM, or a
+/// BOM in the middle of the output, stays as a real `U+FEFF` — exactly like `TextDecoder`).
+#[derive(Clone, Copy)]
+enum BomFilter {
+    /// The stream so far is exactly `UTF8_BOM[..n]` for `n < 3`; those `n` bytes are withheld from
+    /// the decoded counters and from the preview tail. Since the withheld bytes are by definition
+    /// a prefix of `UTF8_BOM`, `n` alone reconstructs them — nothing else needs storing.
+    Matching(usize),
+    /// The head has been decided (BOM consumed, or the first byte proved it was not a BOM).
+    Done,
+}
 
 /// Streaming accumulator for `bash` output.
 pub struct OutputAccumulator {
@@ -35,6 +57,10 @@ pub struct OutputAccumulator {
     /// Streaming UTF-8 decoder carry: trailing bytes of an INCOMPLETE multibyte sequence held for
     /// the next chunk (mirrors `TextDecoder.decode(..., { stream: true })`).
     pending: Vec<u8>,
+    /// Stream-head BOM removal state (mirrors `TextDecoder`'s default `ignoreBOM: false`). Applies
+    /// to the DECODED path and the preview tail only — `total_raw_bytes` and the spill file keep
+    /// the BOM, exactly like Pi (output-accumulator.ts:69,74-77).
+    bom: BomFilter,
     temp_path: Option<PathBuf>,
     temp_file: Option<std::fs::File>,
     prefix: &'static str,
@@ -55,6 +81,7 @@ impl OutputAccumulator {
             ends_with_newline: false,
             current_line_bytes: 0,
             pending: Vec::new(),
+            bom: BomFilter::Matching(0),
             temp_path: None,
             temp_file: None,
             prefix,
@@ -67,6 +94,46 @@ impl OutputAccumulator {
         self.total_raw_bytes > self.max_bytes
             || self.total_decoded_bytes > self.max_bytes
             || self.total_lines() > self.max_lines
+    }
+
+    /// Feed a raw chunk through the stream-head BOM filter and return the bytes the DECODED path
+    /// and the preview tail should see (Pi: the output of `decoder.decode(chunk, {stream:true})`
+    /// minus the leading BOM, output-accumulator.ts:40,70).
+    ///
+    /// Zero-copy in the only case that matters at runtime — once the head is decided the chunk is
+    /// borrowed straight through. The single allocation happens at most once per accumulator, for
+    /// the one chunk that ends a partially-matched BOM prefix with a non-BOM byte.
+    fn filter_bom<'a>(&mut self, chunk: &'a [u8]) -> Cow<'a, [u8]> {
+        let BomFilter::Matching(mut matched) = self.bom else {
+            return Cow::Borrowed(chunk);
+        };
+        let mut rest = chunk;
+        while matched < UTF8_BOM.len() {
+            let Some((&b, tail)) = rest.split_first() else {
+                // Chunk exhausted while the stream head is still a strict BOM prefix: keep
+                // withholding, exactly like `TextDecoder` holding an undecided sequence.
+                self.bom = BomFilter::Matching(matched);
+                return Cow::Borrowed(&[]);
+            };
+            if UTF8_BOM.get(matched) != Some(&b) {
+                self.bom = BomFilter::Done;
+                if matched == 0 {
+                    // Hot path: the stream simply does not start with a BOM — borrow, never copy.
+                    return Cow::Borrowed(rest);
+                }
+                // A partial match that turned out not to be a BOM: release the withheld prefix
+                // (which is, by construction, `UTF8_BOM[..matched]`) ahead of the rest.
+                let mut out = Vec::with_capacity(matched + rest.len());
+                out.extend_from_slice(UTF8_BOM.get(..matched).unwrap_or_default());
+                out.extend_from_slice(rest);
+                return Cow::Owned(out);
+            }
+            matched += 1;
+            rest = tail;
+        }
+        // Full `EF BB BF` matched: drop it and forward the remainder of this chunk.
+        self.bom = BomFilter::Done;
+        Cow::Borrowed(rest)
     }
 
     /// Streaming UTF-8 decode of a raw chunk into the decoded counters, mirroring Pi's
@@ -109,6 +176,17 @@ impl OutputAccumulator {
     /// Flush any incomplete trailing sequence as a replacement char (Pi `decoder.decode()` with no
     /// `stream` flag, output-accumulator.ts:85). Idempotent. Call before reading final totals.
     pub fn finish(&mut self) {
+        // A stream that ended while still inside a BOM prefix (`EF`, or `EF BB`, and nothing else)
+        // never carried a BOM: release the withheld bytes into the decoder and the preview tail so
+        // the final no-stream `decode()` renders them as one U+FFFD, exactly like Pi.
+        if let BomFilter::Matching(matched) = self.bom {
+            self.bom = BomFilter::Done;
+            if matched > 0 {
+                let held = UTF8_BOM.get(..matched).unwrap_or_default().to_vec();
+                self.decode_into_counters(&held);
+                self.buf.extend_from_slice(&held);
+            }
+        }
         if !self.pending.is_empty() {
             self.pending.clear();
             self.append_decoded_text("\u{FFFD}");
@@ -153,23 +231,38 @@ impl OutputAccumulator {
     }
 
     /// Append a raw chunk (called from the `ProcOps::exec` data callback).
+    ///
+    /// Pi splits this chunk into a RAW path and a DECODED path (output-accumulator.ts:64-78) and a
+    /// leading BOM survives on the raw side only: `totalRawBytes` counts it (:69) and the spill
+    /// file/`rawChunks` keep it byte-for-byte (:74-77), while `TextDecoder`'s default
+    /// `ignoreBOM: false` removes it before `appendDecodedText` ever runs (:40,70). Mirror that
+    /// split exactly.
     pub fn append(&mut self, chunk: &[u8]) {
         if chunk.is_empty() {
             return;
         }
+        // RAW path: the BOM counts here, and it still gates `should_use_temp_file` (Pi :69,205-208).
         self.total_raw_bytes += chunk.len();
-        // Decode through the streaming UTF-8 decoder so totals/line-counts/last-line bytes reflect
-        // the DECODED text (Pi parity, UM-8). For valid UTF-8 this equals the raw counts.
-        self.decode_into_counters(chunk);
 
-        // Rolling tail for the preview.
-        self.buf.extend_from_slice(chunk);
-        if self.buf.len() > self.cap {
-            let start = self.buf.len() - self.cap;
-            self.buf.drain(..start);
+        // DECODED path: everything the model can see goes through the stream-head BOM filter first.
+        let visible = self.filter_bom(chunk);
+        let visible = visible.as_ref();
+        if !visible.is_empty() {
+            // Decode through the streaming UTF-8 decoder so totals/line-counts/last-line bytes
+            // reflect the DECODED text (Pi parity, UM-8). For valid UTF-8 this equals the raw
+            // counts minus any stream-head BOM.
+            self.decode_into_counters(visible);
+
+            // Rolling tail for the preview (Pi `tailText`, built from decoded text, :155).
+            self.buf.extend_from_slice(visible);
+            if self.buf.len() > self.cap {
+                let start = self.buf.len() - self.cap;
+                self.buf.drain(..start);
+            }
         }
 
-        // Full output: buffer in memory until a limit is exceeded, then spill (and replay).
+        // Full output: buffer in memory until a limit is exceeded, then spill (and replay). The
+        // ORIGINAL chunk, BOM included — Pi writes the raw `Buffer` (:74-77).
         if self.temp_file.is_some() || self.should_use_temp_file() {
             self.ensure_temp_replay();
             if let Some(file) = self.temp_file.as_mut() {
@@ -345,5 +438,187 @@ mod tests {
         acc.append(b"small output\n");
         let path = acc.finalize(2000, 50 * 1024);
         assert!(path.is_none());
+    }
+
+    #[test]
+    fn stream_head_bom_is_invisible_to_decoded_path() {
+        // Pi's `new TextDecoder()` defaults to `ignoreBOM: false` (output-accumulator.ts:40), so the
+        // leading U+FEFF never reaches `appendDecodedText` (:70) — while `totalRawBytes` still counts
+        // all 3 of its bytes (:69). 6 raw bytes in, 3 decoded bytes out.
+        let mut acc = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        acc.append(b"\xEF\xBB\xBFhi\n");
+        acc.finish();
+        assert_eq!(acc.total_bytes(), 3, "decoded totals exclude the stream-head BOM");
+        assert_eq!(acc.total_lines(), 1);
+        assert_eq!(acc.last_line_bytes(), 0, "chunk ends on a newline");
+        // The model-visible clause: assert the STRING, not just the length.
+        assert_eq!(acc.tail_string(), "hi\n", "preview tail must not contain U+FEFF");
+        assert_eq!(acc.total_raw_bytes, 6, "raw path keeps the BOM (pi :69)");
+        assert!(acc.finalize(2000, 1024).is_none());
+
+        // A stream that is nothing but a BOM decodes to the empty string.
+        let mut only = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        only.append(&UTF8_BOM);
+        only.finish();
+        assert_eq!(only.total_bytes(), 0);
+        assert_eq!(only.total_lines(), 0);
+        assert_eq!(only.tail_string(), "");
+        assert_eq!(only.total_raw_bytes, 3);
+        assert!(only.finalize(2000, 1024).is_none());
+    }
+
+    #[test]
+    fn bom_is_stripped_across_every_chunk_boundary() {
+        // `TextDecoder` with `stream: true` (output-accumulator.ts:70) holds an undecided head across
+        // chunk boundaries; `BomFilter::Matching(n)` is that carry. Every split of `EF BB BF | "hi"`
+        // must produce the identical decoded stream.
+        const INPUT: &[u8] = b"\xEF\xBB\xBFhi";
+        for split in 0..=INPUT.len() {
+            let mut acc = OutputAccumulator::new("cyrup-test", 2000, 1024);
+            acc.append(&INPUT[..split]);
+            acc.append(&INPUT[split..]);
+            acc.finish();
+            assert_eq!(acc.tail_string(), "hi", "split at {split}");
+            assert_eq!(acc.total_bytes(), 2, "split at {split}");
+            assert_eq!(acc.total_raw_bytes, 5, "split at {split}: raw is split-invariant");
+            assert!(acc.finalize(2000, 1024).is_none(), "split at {split}");
+        }
+
+        // Degenerate delivery: one byte per callback, the worst case for the carry.
+        let mut acc = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        for b in INPUT {
+            acc.append(&[*b]);
+        }
+        acc.finish();
+        assert_eq!(acc.tail_string(), "hi", "byte-at-a-time delivery");
+        assert_eq!(acc.total_bytes(), 2, "byte-at-a-time delivery");
+        assert!(acc.finalize(2000, 1024).is_none());
+    }
+
+    #[test]
+    fn only_the_stream_head_bom_is_stripped() {
+        // Pi strips at most one BOM, at offset 0 — every later U+FEFF is ordinary text
+        // (output-accumulator.ts:40). `BomFilter::Done` is that one-shot latch.
+        let mut mid = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        mid.append("\u{feff}a\u{feff}b".as_bytes()); // 8 raw bytes
+        mid.finish();
+        assert_eq!(mid.tail_string(), "a\u{feff}b");
+        assert_eq!(mid.total_bytes(), 5, "3 stripped, the interior U+FEFF's 3 bytes kept");
+        assert_eq!(mid.total_raw_bytes, 8);
+        assert!(mid.finalize(2000, 1024).is_none());
+
+        // Back-to-back BOMs: only the first goes.
+        let mut double = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        double.append(b"\xEF\xBB\xBF\xEF\xBB\xBFx");
+        double.finish();
+        assert_eq!(double.tail_string(), "\u{feff}x", "the second BOM is real text");
+        assert_eq!(double.total_bytes(), 4);
+        assert!(double.finalize(2000, 1024).is_none());
+    }
+
+    #[test]
+    fn bom_lookalike_prefixes_lose_no_bytes() {
+        // `EF BB 41`: two BOM bytes withheld, then the third byte disproves the BOM. `filter_bom`
+        // releases `UTF8_BOM[..2]` ahead of the rest, so the decoder sees `EF BB 41` and produces
+        // U+FFFD (3 bytes, for the invalid `EF BB`) + "A" — exactly what pi's TextDecoder yields.
+        let mut a = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        a.append(b"\xEF\xBB\x41");
+        a.finish();
+        assert_eq!(a.tail_string(), "\u{FFFD}A");
+        assert_eq!(a.total_bytes(), 4, "U+FFFD(3) + 'A'(1)");
+        assert_eq!(a.total_raw_bytes, 3);
+        assert!(a.finalize(2000, 1024).is_none());
+
+        // Lone `EF` at end of stream: never a BOM, never completed. `finish` releases it into the
+        // decoder, whose final no-`stream` `decode()` (output-accumulator.ts:85) emits ONE U+FFFD.
+        let mut lone = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        lone.append(b"\xEF");
+        assert_eq!(lone.total_bytes(), 0, "withheld while still undecided");
+        lone.finish();
+        assert_eq!(lone.tail_string(), "\u{FFFD}");
+        assert_eq!(lone.total_bytes(), 3, "exactly one U+FFFD, not two");
+        assert!(lone.finalize(2000, 1024).is_none());
+
+        // `EF BB` at end of stream: the `matched == 2` release path in `finish`.
+        let mut two = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        two.append(b"\xEF\xBB");
+        two.finish();
+        assert_eq!(two.tail_string(), "\u{FFFD}");
+        assert_eq!(two.total_bytes(), 3, "one U+FFFD for the incomplete sequence");
+        assert_eq!(two.total_raw_bytes, 2);
+        assert!(two.finalize(2000, 1024).is_none());
+
+        // `EF BF BD` is a literal U+FFFD whose FIRST byte matches UTF8_BOM[0] and whose second does
+        // not. Proves `filter_bom` reassembles the byte it withheld: if the withheld `EF` were
+        // dropped, `BF BD` would decode to garbage instead of one clean character.
+        let mut fffd = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        fffd.append(b"\xEF\xBF\xBD");
+        assert!(fffd.pending.is_empty(), "decoded as one complete char, nothing carried");
+        assert_eq!(fffd.buf, vec![0xEF, 0xBF, 0xBD], "withheld byte re-emitted verbatim");
+        fffd.finish();
+        assert_eq!(fffd.tail_string(), "\u{FFFD}");
+        assert_eq!(fffd.total_bytes(), 3);
+        assert!(fffd.finalize(2000, 1024).is_none());
+    }
+
+    #[test]
+    fn spill_file_keeps_the_bom_and_raw_count_still_gates_the_spill() {
+        // Pi writes the untouched `Buffer` to the spill (output-accumulator.ts:74,76): the full-output
+        // file is a byte-exact copy of the process's stdout, BOM included.
+        let mut acc = OutputAccumulator::new("cyrup-test", 2000, 16);
+        acc.append(b"\xEF\xBB\xBF0123456789"); // 13 raw, under the 16-byte limit ⇒ buffered
+        assert!(acc.temp_path.is_none());
+        acc.append(b"abcdefghij"); // 23 raw ⇒ spill opens and replays chunk 1 WITH the BOM
+        assert!(acc.temp_path.is_some());
+        assert_eq!(acc.total_bytes(), 20, "decoded side still excludes the BOM");
+        let p = acc.finalize(2000, 16).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(&bytes[..3], &UTF8_BOM[..], "spill file must start with EF BB BF");
+        assert_eq!(bytes, b"\xEF\xBB\xBF0123456789abcdefghij".to_vec());
+        let _ = std::fs::remove_file(&p);
+
+        // Boundary flavour: 14 payload bytes + 3 BOM bytes = 17 raw > 16 = max, while decoded 14 <= 16.
+        // The spill is triggered by `totalRawBytes` ALONE (pi :69,205-207) — the BOM must still count.
+        let mut edge = OutputAccumulator::new("cyrup-test", 2000, 16);
+        edge.append(b"\xEF\xBB\xBF0123456789abcd");
+        assert_eq!(edge.total_bytes(), 14, "decoded is under the limit");
+        assert_eq!(edge.total_raw_bytes, 17, "raw is over it, only because of the BOM");
+        assert!(edge.is_truncated(), "raw count alone must trip the spill");
+        let p = edge.finalize(2000, 16).unwrap();
+        let bytes = std::fs::read(&p).unwrap();
+        assert_eq!(bytes, b"\xEF\xBB\xBF0123456789abcd".to_vec());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn finish_is_idempotent_after_a_partial_bom() {
+        // `finish` latches `bom = Done` BEFORE releasing the withheld prefix (output.rs:183). Without
+        // that latch the second call would re-release `EF` and emit a second U+FFFD. `finalize` calls
+        // `finish` again internally (:327), so this is a real path, not a hypothetical.
+        let mut acc = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        acc.append(b"\xEF");
+        acc.finish();
+        assert_eq!(acc.total_bytes(), 3);
+        assert_eq!(acc.buf.len(), 1);
+        acc.finish();
+        assert_eq!(acc.total_bytes(), 3, "second finish must not emit another U+FFFD");
+        assert_eq!(acc.buf.len(), 1, "second finish must not re-release the prefix");
+        assert_eq!(acc.tail_string(), "\u{FFFD}");
+        assert!(acc.finalize(2000, 1024).is_none(), "finalize's internal finish is also a no-op");
+        assert_eq!(acc.total_bytes(), 3);
+    }
+
+    #[test]
+    fn no_bom_output_is_untouched() {
+        // Hot path: the first byte (0x68) is not UTF8_BOM[0], so `filter_bom` borrows the whole chunk
+        // straight through. Cheap insurance that the filter never eats a leading byte.
+        let mut acc = OutputAccumulator::new("cyrup-test", 2000, 1024);
+        acc.append(b"hello\n");
+        acc.finish();
+        assert_eq!(acc.tail_string(), "hello\n");
+        assert_eq!(acc.total_bytes(), 6);
+        assert_eq!(acc.total_raw_bytes, 6, "raw and decoded agree when there is no BOM");
+        assert_eq!(acc.total_lines(), 1);
+        assert!(acc.finalize(2000, 1024).is_none());
     }
 }

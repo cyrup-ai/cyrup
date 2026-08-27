@@ -626,3 +626,56 @@ async fn context_store_reload_cancelled() {
         .expect_err("cancelled");
     assert!(matches!(err, ContextError::Cancelled));
 }
+
+/// Pi `system-prompt.ts:97-113` — the file-exploration fallback is a THREE-way branch over
+/// `hasBash`/`hasPowerShell`, gated on none of `grep`/`find`/`ls` being selected. A PowerShell-only
+/// session must not be told to reach for `ls, rg, find`.
+#[test]
+fn the_file_exploration_fallback_names_whichever_shells_are_selected() {
+    const BASH_ONLY: &str = "Use bash for file operations like ls, rg, find";
+    const PS_ONLY: &str = "Use PowerShell for file operations like listing, searching, and finding files";
+    const BOTH: &str = "Use bash or PowerShell for file operations like listing, searching, and finding files";
+
+    let build = |tools: &[&str]| {
+        SystemPromptBuilder::new().build(&PromptInputs {
+            selected_tools: Some(tools.iter().map(|t| arc(t)).collect()),
+            ..base_inputs()
+        })
+    };
+
+    for (tools, want, unwanted) in [
+        (&["bash"][..], BASH_ONLY, [PS_ONLY, BOTH]),
+        (&["powershell"][..], PS_ONLY, [BASH_ONLY, BOTH]),
+        (&["bash", "powershell"][..], BOTH, [BASH_ONLY, PS_ONLY]),
+    ] {
+        let out = build(tools);
+        assert!(out.contains(want), "{tools:?} must emit `{want}`; got:\n{out}");
+        for other in unwanted {
+            assert!(
+                !out.contains(other),
+                "{tools:?} must emit EXACTLY ONE fallback, not also `{other}`; got:\n{out}"
+            );
+        }
+    }
+
+    // Any of grep/find/ls closes the gate for every shell combination (`system-prompt.ts:105`).
+    for extra in ["grep", "find", "ls"] {
+        for shells in [&["bash"][..], &["powershell"][..], &["bash", "powershell"][..]] {
+            let mut tools = shells.to_vec();
+            tools.push(extra);
+            let out = build(&tools);
+            for g in [BASH_ONLY, PS_ONLY, BOTH] {
+                assert!(
+                    !out.contains(g),
+                    "`{extra}` selected ⇒ no shell fallback, but got `{g}`:\n{out}"
+                );
+            }
+        }
+    }
+
+    // Neither shell selected ⇒ no fallback at all.
+    let out = build(&["read"]);
+    for g in [BASH_ONLY, PS_ONLY, BOTH] {
+        assert!(!out.contains(g), "no shell selected ⇒ no fallback; got `{g}`");
+    }
+}

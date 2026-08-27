@@ -10,9 +10,12 @@ use crate::event::{AgentEvent, AgentMessage};
 use cyrup_core::{AssistantMessage, Tool, ToolCall, ToolCallId, ToolError, ToolUpdate, ToolUpdateSink};
 use futures::future::FutureExt;
 use serde_json::Value;
+use std::future::{poll_fn, Future};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::task::Poll;
 use tokio::sync::mpsc;
+use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
 impl RunCtx {
@@ -97,6 +100,10 @@ impl RunCtx {
         // deferred before an abort broke the loop are still started, exactly as Pi's
         // already-pushed closures are.
         let mut remaining = deferred.len();
+        // The batch's start order. Each call releases the next as soon as its own body has been
+        // driven to its first suspension point — which for `write`/`edit` is inside
+        // `FileMutationLocks::guard`, so the mutation registrations line up in source order.
+        let mut prev_started: Option<oneshot::Receiver<()>> = None;
         for Deferred { source_index, tool, args, call_id, tool_name } in deferred {
             let accepting = Arc::new(AtomicBool::new(true));
             let acc2 = accepting.clone();
@@ -104,42 +111,74 @@ impl RunCtx {
             let ftx = tx.clone();
             let cid = call_id;
             let child = self.cancel.child();
+            let (started_tx, started_rx) = oneshot::channel::<()>();
+            let wait_turn = prev_started.replace(started_rx);
             joinset.spawn(async move {
-                let sink_cid = cid.clone();
-                let on_update: ToolUpdateSink = Box::new(move |u: ToolUpdate| {
-                    if acc2.load(Ordering::Acquire) {
-                        // AGENT-003 — never drops: the send only fails once the receiver is gone.
-                        let _ = utx.send(ToolRuntimeMsg::Update {
-                            call_id: sink_cid.clone(),
-                            partial: u,
-                        });
-                    }
-                });
-                // AGENT-016 — pi wraps EVERY execute in try/catch/finally and converts a throw into
-                // `{ result: createErrorToolResult(...), isError: true }`
-                // (`packages/agent/src/agent-loop.ts:700-703` @v0.83.0, inside
-                // `executePreparedToolCall` at `:666-707`), identically in the parallel and the
-                // sequential batch. Without `catch_unwind` here the spawned task dies before the
-                // `ftx.send` below, `remaining` never reaches zero, the slot stays `None`, and the
-                // batch emits NO tool-result message for this call — so the next request carries an
-                // assistant `tool_use` with no matching `tool_result`. `AssertUnwindSafe` is sound
-                // for the same reason as in `emit`: the tool owns no managed-state lock across this
-                // await (keeps the crate `#![forbid(unsafe_code)]`).
-                let outcome =
-                    match std::panic::AssertUnwindSafe(tool.execute(cid.clone(), args, child, on_update))
-                        .catch_unwind()
-                        .await
+                // Pi invokes every prepared call from `finalizedCalls.map((entry) => entry())`
+                // (agent-loop.ts:540-542): `map` walks the array in source order and each async
+                // body runs synchronously to its FIRST suspension point before the next closure is
+                // invoked. `tokio::spawn` INVERTS that. `schedule_local` puts each newly spawned
+                // task in the worker's LIFO slot and pushes the slot's previous occupant to the
+                // back of the run queue (tokio 1.52.3
+                // runtime/scheduler/multi_thread/worker.rs:1353-1377), and the worker polls the
+                // LIFO slot first (:707) — so an unordered batch starts its LAST call first. An
+                // `Err` here means the previous call was aborted before it ran; proceed rather
+                // than stall.
+                if let Some(turn) = wait_turn {
+                    let _ = turn.await;
+                }
+
+                let mut body = std::pin::pin!(async move {
+                    let sink_cid = cid.clone();
+                    let on_update: ToolUpdateSink = Box::new(move |u: ToolUpdate| {
+                        if acc2.load(Ordering::Acquire) {
+                            // AGENT-003 — never drops: the send only fails once the receiver is
+                            // gone.
+                            let _ = utx.send(ToolRuntimeMsg::Update {
+                                call_id: sink_cid.clone(),
+                                partial: u,
+                            });
+                        }
+                    });
+                    // AGENT-016 — pi wraps EVERY execute in try/catch/finally and converts a throw
+                    // into `{ result: createErrorToolResult(...), isError: true }`
+                    // (`packages/agent/src/agent-loop.ts:700-703` @v0.83.0, inside
+                    // `executePreparedToolCall` at `:666-707`), identically in the parallel and the
+                    // sequential batch. Without `catch_unwind` here the spawned task dies before the
+                    // `ftx.send` below, `remaining` never reaches zero, the slot stays `None`, and
+                    // the batch emits NO tool-result message for this call — so the next request
+                    // carries an assistant `tool_use` with no matching `tool_result`.
+                    // `AssertUnwindSafe` is sound for the same reason as in `emit`: the tool owns no
+                    // managed-state lock across this await (keeps the crate
+                    // `#![forbid(unsafe_code)]`).
+                    let outcome = match std::panic::AssertUnwindSafe(tool.execute(
+                        cid.clone(),
+                        args,
+                        child,
+                        on_update,
+                    ))
+                    .catch_unwind()
+                    .await
                     {
                         Ok(r) => r,
                         Err(payload) => Err(ToolError::new(panic_message(payload.as_ref()))),
                     };
-                accepting.store(false, Ordering::Release);
-                let _ = ftx.send(ToolRuntimeMsg::Finished {
-                    call_id: cid,
-                    source_index,
-                    tool_name,
-                    outcome,
+                    accepting.store(false, Ordering::Release);
+                    let _ = ftx.send(ToolRuntimeMsg::Finished {
+                        call_id: cid,
+                        source_index,
+                        tool_name,
+                        outcome,
+                    });
                 });
+
+                // Drive this call to its first suspension point — pi's `entry()` — then hand the
+                // batch on.
+                let first = poll_fn(|cx| Poll::Ready(body.as_mut().poll(cx))).await;
+                let _ = started_tx.send(());
+                if first.is_pending() {
+                    body.await;
+                }
             });
         }
         drop(tx);

@@ -57,6 +57,26 @@ impl TranscriptView {
         self.graphical_images
     }
 
+    /// Set whether the terminal forwards OSC-8 hyperlinks (TUI-020; pi's
+    /// `getCapabilities().hyperlinks`, `terminal-image.ts:130-143`). Off ⇒ a `read`/`write`/`edit`/
+    /// `ls` header path renders exactly as it does today, with no escape and no ` (url)` suffix —
+    /// pi's own `if (!getCapabilities().hyperlinks) return styledText` early return
+    /// (`render-utils.ts:20`).
+    ///
+    /// Bumps the render generation for the same reason [`Self::set_graphical_images`] does: a cache
+    /// built before `App::detect_image_support` ran must be discarded, and the marker ids baked into
+    /// the cached spans belong to the cached href table.
+    pub fn set_hyperlinks(&mut self, hyperlinks: bool) {
+        self.bump_render_generation();
+        self.hyperlinks = hyperlinks;
+    }
+
+    /// Whether the terminal forwards OSC-8 hyperlinks (read by the shell when flushing committed
+    /// entries, so a committed header and the live one it scrolled up from agree).
+    pub fn hyperlinks(&self) -> bool {
+        self.hyperlinks
+    }
+
     /// Set `terminal.imageWidthCells` (Pi `maxWidthCells`): the cell width an inline image is
     /// clamped to. `0` is coerced to 1 so a degenerate setting cannot produce a zero-width raster.
     pub fn set_image_width_cells(&mut self, cells: u16) {

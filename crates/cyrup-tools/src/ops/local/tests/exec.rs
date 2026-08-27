@@ -24,7 +24,7 @@ use cyrup_core::CancelToken;
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_exec_future_kills_the_whole_process_group_not_just_the_direct_child() {
-    let proc = LocalProc::new(ShellConfig::detect());
+    let proc = LocalProc::new();
     let marker =
         std::env::temp_dir().join(format!("cyrup-exec-dropguard-{}.pid", std::process::id()));
     let _ = std::fs::remove_file(&marker);
@@ -83,7 +83,7 @@ async fn a_dropped_exec_future_kills_the_whole_process_group_not_just_the_direct
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_timeout_sigkills_a_sigterm_ignoring_child_immediately_no_grace() {
-    let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+    let proc = LocalProc::with_kill_grace(Duration::from_secs(5));
     let started = tokio::time::Instant::now();
     let status = proc
         .exec(
@@ -112,7 +112,7 @@ async fn exec_timeout_sigkills_a_sigterm_ignoring_child_immediately_no_grace() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_cancel_sigkills_a_sigterm_ignoring_child_immediately_no_grace() {
-    let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+    let proc = LocalProc::with_kill_grace(Duration::from_secs(5));
     let cancel = CancelToken::new();
     let started = tokio::time::Instant::now();
     let task = tokio::spawn({
@@ -148,7 +148,7 @@ async fn exec_cancel_sigkills_a_sigterm_ignoring_child_immediately_no_grace() {
 /// killed before `touch` completed also leaves it absent).
 #[tokio::test]
 async fn exec_pre_cancelled_never_spawns() {
-    let proc = LocalProc::with_kill_grace(ShellConfig::detect(), Duration::from_secs(5));
+    let proc = LocalProc::with_kill_grace(Duration::from_secs(5));
     let marker = std::env::temp_dir().join(format!("cyrup-exec-precancel-{}", unique_suffix()));
     let missing_cwd =
         std::env::temp_dir().join(format!("cyrup-exec-precancel-cwd-{}", unique_suffix()));

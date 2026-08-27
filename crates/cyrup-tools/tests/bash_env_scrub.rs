@@ -11,8 +11,8 @@
 
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolResult, ToolUpdate, ToolUpdateSink};
 use cyrup_tools::config::BashOpts;
-use cyrup_tools::ops::{Backend, ProcOps, ShellConfig};
-use cyrup_tools::tools::BashTool;
+use cyrup_tools::ops::{Backend, ProcOps};
+use cyrup_tools::tools::ShellTool;
 use std::sync::Arc;
 
 fn proc() -> Arc<dyn ProcOps> {
@@ -38,12 +38,7 @@ fn first_text(r: &ToolResult) -> String {
 
 async fn run(opts: BashOpts, command: &str) -> String {
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(
-        proc(),
-        ShellConfig::detect(),
-        dir.path().to_path_buf(),
-        opts,
-    );
+    let bash = ShellTool::bash(proc(), dir.path().to_path_buf(), opts);
     let r = bash
         .execute(
             cid(),

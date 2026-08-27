@@ -22,7 +22,7 @@ use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn exec_tracks_its_detached_shell_for_exactly_as_long_as_it_runs() {
-    let proc = LocalProc::new(ShellConfig::detect());
+    let proc = LocalProc::new();
     let cancel = CancelToken::new();
     let mut child_pid: Option<u32> = None;
     let mut tracked_while_running = false;
@@ -83,7 +83,7 @@ async fn exec_tracks_its_detached_shell_for_exactly_as_long_as_it_runs() {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dropped_exec_future_untracks_its_pid_instead_of_leaking_it() {
-    let proc = LocalProc::new(ShellConfig::detect());
+    let proc = LocalProc::new();
     let mut child_pid: Option<u32> = None;
     let mut tracked_while_running = false;
     {
