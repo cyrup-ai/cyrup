@@ -3,9 +3,9 @@ title: A UTF-8 BOM in command output is stripped by pi but retained by cyrup
 priority: LOW
 tool: bash
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27 18:59
+stage: qa
+status: completed
+updated: 2026-08-27 20:07
 ---
 
 # A UTF-8 BOM in command output is stripped by pi but retained by cyrup

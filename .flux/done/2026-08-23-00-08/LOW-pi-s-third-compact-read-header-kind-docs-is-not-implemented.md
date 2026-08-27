@@ -3,9 +3,9 @@ title: Pi's third compact read header kind docs is not implemented
 priority: LOW
 tool: read
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: exec
-status: done
-updated: 2026-08-27 18:12
+stage: qa
+status: completed
+updated: 2026-08-27 20:05
 ---
 
 # Pi's third compact read header kind docs is not implemented
