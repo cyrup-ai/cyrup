@@ -1688,17 +1688,24 @@ impl ClientHandler for McpClientHandler {
 /// chain for `AuthRequiredError`/`InsufficientScopeError` and hands back the `WWW-Authenticate`
 /// header — and flattening the error here would destroy the one thing that makes the 401 predicate
 /// typed instead of hand-written.
+///
+/// Boxed, not flattened. `ClientInitializeError` is 376 bytes, so returning it by value made
+/// every `Result` on this path that wide (`clippy::result_large_err`). `Box` keeps the concrete
+/// type — `auth_challenge()` still resolves through the deref — so the typed 401 predicate above
+/// is untouched; only the error's placement changes, and only on the failure path.
 pub async fn connect_client<T, E, A>(
     handler: McpClientHandler,
     transport: T,
     lifecycle: ClientLifecycleMode,
     ct: CancelToken,
-) -> Result<RunningService<RoleClient, McpClientHandler>, ClientInitializeError>
+) -> Result<RunningService<RoleClient, McpClientHandler>, Box<ClientInitializeError>>
 where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
 {
-    rmcp::service::serve_client_with_lifecycle_and_ct(handler, transport, lifecycle, ct).await
+    rmcp::service::serve_client_with_lifecycle_and_ct(handler, transport, lifecycle, ct)
+        .await
+        .map_err(Box::new)
 }
 
 /// [`connect_client`] under `requestOptions.timeout` — the other half of
@@ -1743,7 +1750,7 @@ pub async fn connect_client_bounded<T, E, A>(
     lifecycle: ClientLifecycleMode,
     ct: CancelToken,
     timeout: Option<Duration>,
-) -> Result<Result<RunningService<RoleClient, McpClientHandler>, ClientInitializeError>, Duration>
+) -> Result<Result<RunningService<RoleClient, McpClientHandler>, Box<ClientInitializeError>>, Duration>
 where
     T: IntoTransport<RoleClient, E, A>,
     E: std::error::Error + Send + Sync + 'static,
@@ -2837,7 +2844,7 @@ impl ConnectionBuilder {
                 pid: None,
                 stderr: None,
             })),
-            Err(error) => HttpAttempt::Failed(Box::new(error)),
+            Err(error) => HttpAttempt::Failed(error),
         })
     }
 }

@@ -368,7 +368,6 @@ mod tests {
     /// A scripted [`cyrup_ext::HostServices`] standing in for `{ ui: { select } }`.
     ///
     /// Records what it was asked, so a test can assert the dialog's exact text and — the assertion
-
     /// upstream makes most often — how many times it was asked *at all*.
     #[derive(Default)]
     struct ScriptedUi {
