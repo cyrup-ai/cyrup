@@ -8,6 +8,23 @@ status: needs-rework
 updated: 2026-08-27 20:10
 ---
 
+
+> **DELEGATION NOTE (orchestrator, post-QA).** QA was right that this task owns the
+> degraded Step-3 guard rather than a follow-up. The executable brief for that fix now
+> lives in `MEDIUM-mutation-lock-first-await-guard-degrades-under-the-full-suite.md`,
+> which was augmented in parallel and carries the research: a `#[cfg(test)]` per-instance
+> `guard_entries: AtomicUsize` on `FileMutationLocks`, incremented as the first statement
+> of `guard`'s body.
+>
+> **Run that task, not this item — they target the same twenty lines and must not both
+> execute.** This task's remaining independent work is the stale cross-references,
+> including the third one QA found at `cyrup-config/src/lock.rs:26-31`.
+>
+> That augmentation also disproved QA's own argument 4: the module-local-mutex fallback
+> cannot reach 20/20, because ~118 test fns across 7 files contend on
+> `MUTATION_REGISTRATION` — which is why detection fell from 28/30 with the sibling alone
+> to 2/3 under the full suite. The real fix does need a (cfg-gated) production edit.
+
 # Same-path mutation lock is not granted in dispatch order
 
 QA re-reviewed the rework. **The mechanism was already correct and remains so; the verification
