@@ -31,6 +31,12 @@ fn guideline_keep_rule(normalized: &str, allowed: &HashSet<String>) -> Option<bo
     let has = |name: &str| allowed.contains(name);
     match normalized {
         "use bash for file operations like ls, rg, find" => Some(has("bash")),
+        "use powershell for file operations like listing, searching, and finding files" => {
+            Some(has("powershell"))
+        }
+        "use bash or powershell for file operations like listing, searching, and finding files" => {
+            Some(has("bash") && has("powershell"))
+        }
         "prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)" => {
             Some(has("bash") && (has("grep") || has("find") || has("ls")))
         }

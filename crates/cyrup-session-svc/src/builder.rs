@@ -312,14 +312,27 @@ fn http_proxy_overlay(proxy: Option<&str>) -> Option<cyrup_provider::ProviderEnv
 /// Pi's default active built-in tool names (sdk.ts:244).
 const DEFAULT_BUILTIN_TOOLS: [&str; 4] = ["read", "bash", "edit", "write"];
 
-/// Every tool `ToolRegistry::with_builtins` installs (`cyrup-tools/src/registry.rs:45-67`).
+/// Every tool `ToolRegistry::with_builtins` installs (`cyrup-tools/src/registry.rs:53-100`).
 ///
-/// Needed to tell "a built-in pi does not activate by default" (`grep`/`find`/`ls`) apart from "a
-/// non-built-in tool" (an extension- or embedder-supplied one), which must stay active: pi's
-/// `defaultActiveToolNames` gates only its own built-ins and never suppresses a tool the host
-/// registered.
-const ALL_BUILTIN_TOOLS: [&str; 7] =
-    ["read", "write", "edit", "bash", "grep", "find", "ls"];
+/// Needed to tell "a built-in pi does not activate by default" (`powershell`/`grep`/`find`/`ls`)
+/// apart from "a non-built-in tool" (an extension- or embedder-supplied one), which must stay
+/// active: pi's `defaultActiveToolNames` gates only its own built-ins and never suppresses a tool
+/// the host registered.
+///
+/// `powershell` MUST be listed here. The default arm of `select_active_tools` keeps any name it
+/// does not recognise as a built-in, so omitting it would enable PowerShell in every session —
+/// while pi's default set is `read`/`bash`/`edit`/`write` (sdk.ts:256) and `powershell` is reachable
+/// only through `--tools` / `defaultTools`.
+const ALL_BUILTIN_TOOLS: [&str; 8] = [
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "powershell",
+    "grep",
+    "find",
+    "ls",
+];
 
 /// Apply the `tools`/`noTools`/`excludeTools` selection over the Availability-visible tool set
 /// (Pi sdk.ts:244-251). When none of the three is set the visible set passes through unchanged.
@@ -916,6 +929,16 @@ impl SessionBuilder {
                     // reads as nondeterminism from the outside.
                     bin_dir: Some(cfg.agent_dir.join("bin")),
                     ..BashOpts::default()
+                },
+                // The `powershell` tool shares `resolveSpawnContext` with `bash` (bash.ts:341), so
+                // it gets the same live session handle and the same managed `<agent_dir>/bin` on
+                // PATH. It does NOT get `shellPath` or `shellCommandPrefix`: `PowerShellOpts` has
+                // no such fields, because `createLocalPowerShellOperations()` takes no options
+                // (powershell.ts:32-33) and the `shellPath` setting names a bash.
+                powershell: cyrup_tools::config::PowerShellOpts {
+                    session_env: Some(bash_session_env.clone()),
+                    bin_dir: Some(cfg.agent_dir.join("bin")),
+                    ..cyrup_tools::config::PowerShellOpts::default()
                 },
                 ..ToolsOptions::default()
             },

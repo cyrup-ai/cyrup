@@ -26,10 +26,8 @@
 
 use crate::isolation::{ProtectedFs, ProtectedPaths, TraversalFs};
 use crate::ops::local::LocalFs;
-use crate::ops::{
-    Access, Backend, DirEntry, FsOps, ImageMime, Meta, WalkItem, WalkOpts,
-};
-use crate::tools::{BashTool, ReadTool, WriteTool};
+use crate::ops::{Access, Backend, DirEntry, FsOps, ImageMime, Meta, WalkItem, WalkOpts};
+use crate::tools::{ReadTool, ShellTool, WriteTool};
 use crate::{BashOpts, FileMutationLocks, ReadOpts, WriteOpts};
 use cyrup_core::{
     CancelToken, Content, ToolCallId, ToolError, ToolResult, ToolUpdate, ToolUpdateSink,
@@ -68,11 +66,7 @@ async fn default_bash_rm_rf_runs_without_any_gate() {
     std::fs::write(doomed.join("f.txt"), "bye").unwrap();
     assert!(doomed.exists());
 
-    let bash = BashTool::new(
-        Backend::default().proc,
-        cwd,
-        BashOpts::default(),
-    );
+    let bash = ShellTool::bash(Backend::default().proc, cwd, BashOpts::default());
     let r = bash
         .execute(
             cid(),
@@ -221,11 +215,7 @@ async fn protected_fs_is_fs_only_and_bash_is_never_covered() {
     assert!(err.to_string().contains("protected"), "got: {err}");
 
     // … and `bash` reaches the very same file anyway, because the PROCESS seam is undecorated.
-    let bash = BashTool::new(
-        Backend::default().proc,
-        cwd.clone(),
-        BashOpts::default(),
-    );
+    let bash = ShellTool::bash(Backend::default().proc, cwd.clone(), BashOpts::default());
     bash.execute(
         cid(),
         serde_json::json!({ "command": "printf 'C=3\\n' >> .env" }),

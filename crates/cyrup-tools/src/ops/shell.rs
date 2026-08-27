@@ -23,6 +23,13 @@ pub enum Transport {
 /// A resolved shell configuration.
 #[derive(Clone, Debug)]
 pub struct ShellConfig {
+    /// The shell's human name, as Pi passes it to `createLocalShellOperations` (bash.ts:84,159;
+    /// powershell.ts:33): `"bash"` or `"PowerShell"`. Its ONLY consumer is the missing-cwd error
+    /// `Cannot execute {shell_name} commands.` (bash.ts:95), which cyrup raises in the process
+    /// backend rather than in the tool — so the name has to ride along with the resolved shell.
+    /// It is the TOOL's name for its shell, not the resolved program's: bash's unix `sh -c`
+    /// fallback (shell.ts:119) still reports `bash`, exactly as upstream does.
+    pub shell_name: &'static str,
     pub program: PathBuf,
     pub args: Vec<String>,
     pub transport: Transport,
@@ -50,12 +57,14 @@ fn is_legacy_wsl_bash_path(path: &str) -> bool {
 fn get_bash_shell_config(program: PathBuf) -> ShellConfig {
     if is_legacy_wsl_bash_path(&program.to_string_lossy()) {
         ShellConfig {
+            shell_name: "bash",
             program,
             args: vec!["-s".to_string()],
             transport: Transport::Stdin,
         }
     } else {
         ShellConfig {
+            shell_name: "bash",
             program,
             args: vec!["-c".to_string()],
             transport: Transport::Argv,
@@ -69,18 +78,23 @@ fn get_bash_shell_config(program: PathBuf) -> ShellConfig {
 /// throw on Windows, shell.ts:100-106).
 const BASH_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `findBashOnPath` (shell.ts:24-58): `which bash` on unix / `where bash.exe` on Windows. Returns
-/// the first match (verified to exist on Windows, where `where` can print stale paths).
+/// `findExecutableOnPath` (shell.ts:24-58): `which <exe>` on unix / `where <exe>` on Windows.
+/// Returns the first match (verified to exist on Windows, where `where` can print stale paths).
+///
+/// Generic in the executable because Pi's is: it is called with `"bash"` / `"bash.exe"` for the
+/// bash tool (shell.ts:95,114) and with `"pwsh.exe"` / `"powershell.exe"` for the powershell tool
+/// (shell.ts:130). The unix/Windows split is the PROBE COMMAND only; the caller supplies the name.
 ///
 /// Bounded at [`BASH_PROBE_TIMEOUT`] exactly like Pi's `spawnSync` timeout: a `which` wedged on a
-/// stale automount PATH entry must not wedge session construction. Node's `spawnSync` kills the
-/// child on expiry and reports a non-zero status, which lands in Pi's `result.status === 0` guard
-/// (shell.ts:48) — i.e. "no bash on PATH" — so expiry maps to `None` here.
-fn find_bash_on_path() -> Option<PathBuf> {
+/// stale automount PATH entry must not wedge a command. Node's `spawnSync` kills the child on
+/// expiry and reports a non-zero status, which lands in Pi's `result.status === 0` guard
+/// (shell.ts:48) — i.e. "not on PATH" — so expiry maps to `None` here.
+fn find_executable_on_path(executable: &str) -> Option<PathBuf> {
     #[cfg(not(unix))]
-    let (cmd, arg) = ("where", "bash.exe");
+    let cmd = "where";
     #[cfg(unix)]
-    let (cmd, arg) = ("which", "bash");
+    let cmd = "which";
+    let arg = executable;
 
     // stdout is piped and read only after the child exits. Both probes emit at most a handful of
     // short lines, far under a pipe buffer, so this cannot deadlock on a full pipe; `spawnSync`
@@ -198,10 +212,13 @@ impl ShellConfig {
             if Path::new("/bin/bash").exists() {
                 return Ok(get_bash_shell_config(PathBuf::from("/bin/bash")));
             }
-            if let Some(found) = find_bash_on_path() {
+            if let Some(found) = find_executable_on_path("bash") {
                 return Ok(get_bash_shell_config(found));
             }
+            // Still `bash` by NAME (Pi's `createLocalShellOperations("bash", …)`, bash.ts:159, is
+            // unaware that `getShellConfig` degraded to `sh` at shell.ts:119).
             Ok(ShellConfig {
+                shell_name: "bash",
                 program: PathBuf::from("sh"),
                 args: vec!["-c".to_string()],
                 transport: Transport::Argv,
@@ -221,7 +238,72 @@ impl ShellConfig {
             if let Some(pf86) = std::env::var_os("ProgramFiles(x86)") {
                 candidates.push(PathBuf::from(pf86).join("Git").join("bin").join("bash.exe"));
             }
-            Self::windows_detect_from(&candidates, find_bash_on_path)
+            Self::windows_detect_from(&candidates, || find_executable_on_path("bash.exe"))
+        }
+    }
+
+    /// `POWERSHELL_ARGS` (shell.ts:122), verbatim and in order. The command is delivered as the
+    /// argument AFTER `-Command`, i.e. [`Transport::Argv`] — Pi sets no `commandTransport` on the
+    /// PowerShell config (shell.ts:135), so the WSL-legacy stdin path is unreachable here.
+    const POWERSHELL_ARGS: [&'static str; 5] = [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+    ];
+
+    /// Pi `getPowerShellConfig`'s body AFTER the `win32` guard (shell.ts:130-135), with the PATH
+    /// probe hoisted into an argument so the arm that SHIPS to Windows is compiled on every host —
+    /// the same treatment [`ShellConfig::windows_detect_from`] already gets, and for the same
+    /// reason: this workspace has no Windows box, so an arm that only exists under
+    /// `#[cfg(windows)]` is an arm nobody has ever built.
+    ///
+    /// `pwsh.exe` FIRST, `powershell.exe` second: Pi's `??` prefers PowerShell 7 over Windows
+    /// PowerShell 5.1 (shell.ts:124 "preferring PowerShell 7 when available").
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn powershell_detect_from(
+        find_on_path: impl Fn(&str) -> Option<PathBuf>,
+    ) -> Result<Self, ToolError> {
+        let found = find_on_path("pwsh.exe").or_else(|| find_on_path("powershell.exe"));
+        let Some(program) = found else {
+            // shell.ts:132 verbatim.
+            return Err(ToolError::new(
+                "No PowerShell executable found. Install PowerShell or add powershell.exe/pwsh.exe \
+                 to PATH.",
+            ));
+        };
+        Ok(ShellConfig {
+            shell_name: "PowerShell",
+            program,
+            args: Self::POWERSHELL_ARGS
+                .iter()
+                .map(|a| (*a).to_string())
+                .collect(),
+            transport: Transport::Argv,
+        })
+    }
+
+    /// Pi `getPowerShellConfig` (shell.ts:124-136). Called per-command from the `powershell` tool's
+    /// `execute`, never at construction — Pi's thunk is the bare `getPowerShellConfig` reference
+    /// (powershell.ts:33), invoked inside `exec` (bash.ts:91).
+    ///
+    /// Takes NO `shellPath`: `createLocalPowerShellOperations()` accepts no options at all
+    /// (powershell.ts:32-33) and `PowerShellToolOptions` does not include `shellPath`
+    /// (powershell.ts:29-30), so the settings `shellPath` — which points at a BASH — must never
+    /// steer this tool.
+    pub fn resolve_powershell() -> Result<Self, ToolError> {
+        #[cfg(not(windows))]
+        {
+            // shell.ts:127 verbatim. Pi gates on `process.platform !== "win32"`, so the Rust gate
+            // is `windows`, not `not(unix)`.
+            Err(ToolError::new(
+                "The powershell tool is only available on Windows.",
+            ))
+        }
+        #[cfg(windows)]
+        {
+            Self::powershell_detect_from(find_executable_on_path)
         }
     }
 

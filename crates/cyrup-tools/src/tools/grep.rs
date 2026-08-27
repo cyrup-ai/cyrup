@@ -80,6 +80,12 @@ impl GrepTool {
         // the blocking search itself. `Err(error::aborted())` here propagates through the `?` at
         // each call site and out of `execute`, matching Pi's `Operation aborted` rejection.
         cancel: &CancelToken,
+        // ripgrep chooses binary detection PER HAYSTACK, not per invocation: a path the user named
+        // gets one mode, a path found by traversal gets another (`hiargs.rs:1124-1157`, handed to
+        // the worker as `binary_detection_explicit` / `binary_detection_implicit` at
+        // `hiargs.rs:696-697`). The caller classifies the candidate; this function just uses what
+        // it was given.
+        binary: BinaryDetection,
         context: usize,
         limit: usize,
         count: &mut usize,
@@ -111,18 +117,28 @@ impl GrepTool {
             return Ok(());
         };
 
-        // Binary detection. Pi spawns real ripgrep with no `--text`/`-a` (grep.ts:220-224), so
-        // ripgrep's default applies: files reached by traversal are searched with
-        // `BinaryDetection::quit(b'\x00')` — a NUL ends that file as if EOF, so a binary file
-        // contributes no `--json` match lines. `grep-searcher`'s own default is
-        // `BinaryDetection::None` ("Data reported by the searcher may contain arbitrary bytes"),
-        // which would dump raw bytes of PNG/wasm/font/sqlite hits into the model-facing result.
+        // Binary detection is the caller's choice (the `binary` parameter above); this note is only
+        // about why the two values it can hold are what they are.
         //
-        // [CYRUP-DELTA] ripgrep uses `convert(b'\x00')` instead of `quit` for a path named
-        // EXPLICITLY on the command line (Pi's `path` argument pointing at a single file). cyrup
-        // keeps `quit` there too: `convert` renumbers lines at every NUL, while the output blocks
-        // below are cut from a separate raw re-read of the file that splits on `\n` only, so the
-        // two numberings would disagree and emit the wrong lines.
+        // Pi spawns real ripgrep with no `--text`/`--binary`/`--null-data` (grep.ts:220-224), so
+        // `hiargs.rs:1141-1157` resolves to explicit=`convert(b'\x00')`, implicit=`quit(b'\x00')`.
+        // Implicit is copied verbatim: a NUL ends a traversed file as if EOF, so it contributes no
+        // `--json` match events at all — not even for lines BEFORE the NUL.
+        //
+        // Explicit is copied by BEHAVIOR rather than by name, and the mode is `none()`. ripgrep
+        // memory-maps exactly this case (one path, `is_file()` — `hiargs.rs:233-244`), and
+        // `convert` is documented as having NO EFFECT under a memory map
+        // (grep-searcher-0.1.16 `searcher/mod.rs:88-94`): the bytes reach the sink untouched and
+        // line numbers stay the file's raw `\n` numbering. cyrup always uses `search_reader`
+        // (`FsOps::read_stream` above), the branch where `convert` DOES fire and rewrites every
+        // NUL to the line terminator (`line_buffer.rs:448-460`) — which shifts every line number
+        // after the first NUL. `none()` is the reader-side mode that reproduces what Pi observes,
+        // byte for byte, and it keeps the searcher's numbering in agreement with the raw
+        // `\n`-split re-read that the context / non-UTF-8 blocks below are cut from.
+        //
+        // `grep-searcher`'s own default is also `none()`, but it must not be relied on implicitly:
+        // it would apply to the walk too, dumping raw bytes of every PNG/wasm/font/sqlite hit in
+        // the tree into the model-facing result.
         //
         // The searcher is built per file rather than hoisted because `search_reader` is a
         // BLOCKING API driven from `spawn_blocking` (see [`FsOps::read_stream`]), so it and the
@@ -143,7 +159,7 @@ impl GrepTool {
             tokio::task::spawn_blocking(move || {
                 let mut searcher: Searcher = SearcherBuilder::new()
                     .line_number(true)
-                    .binary_detection(BinaryDetection::quit(b'\x00'))
+                    .binary_detection(binary)
                     .build();
                 let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
                 let mut local = 0usize;
@@ -399,6 +415,12 @@ impl Tool for GrepTool {
             None => None,
         };
 
+        // ripgrep's two detection modes, one per candidate class (`hiargs.rs:1141-1157` with Pi's
+        // flag set). The explicit one is `none()` and NOT `convert(b'\x00')` on purpose — see the
+        // note in `search_one`.
+        let binary_explicit = BinaryDetection::none();
+        let binary_implicit = BinaryDetection::quit(b'\x00');
+
         let mut out: Vec<String> = Vec::new();
         let mut count = 0usize;
         let mut any_line_truncated = false;
@@ -411,11 +433,15 @@ impl Tool for GrepTool {
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| to_posix(&search_root));
+            // `meta.is_file` IS ripgrep's explicit rule: `Haystack::is_explicit()` is "depth 0 and
+            // not a directory", i.e. a path handed to `rg` on the command line — which is what
+            // Pi's `path` argument becomes (grep.ts:224). ripgrep never filters such a file out.
             self.search_one(
                 &search_root,
                 &rel,
                 &matcher,
                 &cancel,
+                binary_explicit,
                 context,
                 limit,
                 &mut count,
@@ -501,11 +527,14 @@ impl Tool for GrepTool {
                                     && !g.keeps_file(&glob_rel) {
                                         continue;
                                     }
+                                // Traversal-discovered, so implicit: binary files are still cut
+                                // off at the first NUL, exactly as before this change.
                                 self.search_one(
                                     &w.path,
                                     &rel,
                                     &matcher,
                                     &cancel,
+                                    binary_implicit.clone(),
                                     context,
                                     limit,
                                     &mut count,
@@ -778,6 +807,48 @@ mod tests {
         )
         .await;
         assert_eq!(text, "a.ts:1: NEEDLE");
+    }
+
+    /// ripgrep picks binary detection PER HAYSTACK: a path the user NAMED is never filtered out
+    /// (`hiargs.rs:1124-1157`, selected on `Haystack::is_explicit()`), while a traversal-discovered
+    /// one still quits at the first NUL. cyrup shared ONE `quit(b'\x00')` searcher across both
+    /// branches, so `{"pattern":"NEEDLE","path":"bin.dat"}` answered "No matches found" for a file
+    /// whose text is plainly there — wrong, not merely truncated.
+    ///
+    /// The explicit mode is `none()`, not ripgrep's `convert(b'\x00')`: measured against rg 14.1.0,
+    /// `convert` is inert under the memory map rg uses for exactly this case, and on the reader
+    /// path cyrup always takes it rewrites each NUL to the line terminator and emits lines 1/3/4
+    /// instead of 1/2/3. `none()` reproduces rg's observable output — same rows, same raw `\n`
+    /// numbering, control bytes verbatim.
+    #[tokio::test]
+    async fn explicit_binary_path_is_searched_while_traversal_still_quits_at_the_nul() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().to_path_buf();
+        // rg 14.1.0, `rg --json --line-number --color=never --hidden -- NEEDLE bin.dat`:
+        //   line 1 "hello NEEDLE\n" / line 2 "\u0000\u0001\u0002binary NEEDLE\n" / line 3 "tail NEEDLE\n"
+        std::fs::write(
+            cwd.join("bin.dat"),
+            b"hello NEEDLE\n\x00\x01\x02binary NEEDLE\ntail NEEDLE\n".as_slice(),
+        )
+        .unwrap();
+        std::fs::write(cwd.join("plain.txt"), "plain NEEDLE\n").unwrap();
+
+        let text = grep_text(
+            &cwd,
+            serde_json::json!({ "pattern": "NEEDLE", "path": "bin.dat" }),
+        )
+        .await;
+        let want = concat!(
+            "bin.dat:1: hello NEEDLE\n",
+            "bin.dat:2: \u{0}\u{1}\u{2}binary NEEDLE\n",
+            "bin.dat:3: tail NEEDLE",
+        );
+        assert_eq!(text, want, "explicitly named file must be searched to EOF");
+
+        // The SAME file reached by traversal contributes nothing — not even the pre-NUL line 1 —
+        // and the text file beside it is unaffected.
+        let text = grep_text(&cwd, serde_json::json!({ "pattern": "NEEDLE" })).await;
+        assert_eq!(text, "plain.txt:1: plain NEEDLE", "got: {text}");
     }
 
     /// A bare pattern (no `/`) is basename-matched at any depth in BOTH rules — the schema's own

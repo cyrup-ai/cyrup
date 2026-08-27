@@ -34,7 +34,7 @@ use crate::FileMutationLocks;
 use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts, WriteOpts};
 use crate::ops::local::LocalFs;
 use crate::ops::{Backend, FsOps, ProcOps};
-use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
+use crate::tools::{EditTool, FindTool, GrepTool, LsTool, ReadTool, ShellTool, WriteTool};
 use cyrup_core::Tool;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,7 +75,7 @@ fn all_seven_tool_schemas_match_pi_typebox_bytes() {
     let read = ReadTool::new(fs(), cwd(), ReadOpts::default());
     assert_schema("read", read.parameters(), PI_READ);
 
-    let bash = BashTool::new(proc(), cwd(), BashOpts::default());
+    let bash = ShellTool::bash(proc(), cwd(), BashOpts::default());
     assert_schema("bash", bash.parameters(), PI_BASH);
 
     let grep = GrepTool::new(fs(), cwd(), GrepOpts::default());
@@ -213,11 +213,7 @@ fn all_seven_tool_metadata_match_pi_verbatim() {
         PI_EDIT_GUIDELINES,
     );
     assert_meta(
-        Arc::new(BashTool::new(
-            proc(),
-            cwd(),
-            BashOpts::default(),
-        )),
+        Arc::new(ShellTool::bash(proc(), cwd(), BashOpts::default())),
         "bash",
         PI_BASH_DESCRIPTION,
         PI_BASH_SNIPPET,
@@ -279,7 +275,7 @@ fn only_bash_got_the_v0_84_softening() {
         }
     }
 
-    let bash = BashTool::new(proc(), cwd(), BashOpts::default());
+    let bash = ShellTool::bash(proc(), cwd(), BashOpts::default());
     assert!(bash.prompt_guidelines()[0].starts_with("You can inspect "));
 }
 

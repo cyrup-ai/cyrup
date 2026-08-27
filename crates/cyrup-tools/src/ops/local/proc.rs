@@ -125,12 +125,16 @@ impl ProcOps for LocalProc {
         if cancel.is_cancelled() {
             return Ok(ExitStatus::Killed);
         }
-        // Pi checks the cwd exists before spawning (bash.ts:70-74) so the model gets an actionable
-        // message instead of a raw spawn error.
+        // Pi checks the cwd exists before spawning (bash.ts:92-96) so the model gets an actionable
+        // message instead of a raw spawn error. The shell's name comes from the resolved
+        // `ShellConfig`, mirroring Pi's `createLocalShellOperations(shellName, …)` closure capture
+        // (bash.ts:84,95): a `powershell` call on a missing cwd must say
+        // `Cannot execute PowerShell commands.`, not `bash`.
         if tokio::fs::metadata(&spec.cwd).await.is_err() {
             return Err(error::invalid(format!(
-                "Working directory does not exist: {}\nCannot execute bash commands.",
-                error::show(&spec.cwd)
+                "Working directory does not exist: {}\nCannot execute {} commands.",
+                error::show(&spec.cwd),
+                spec.shell.shell_name
             )));
         }
         let stdin_command = if spec.shell.transport == Transport::Stdin {

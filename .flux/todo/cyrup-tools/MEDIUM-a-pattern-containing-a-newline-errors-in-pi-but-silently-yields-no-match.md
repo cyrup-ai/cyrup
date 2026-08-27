@@ -3,8 +3,8 @@ title: A pattern containing a newline errors in pi but silently yields "No match
 priority: MEDIUM
 tool: grep
 source: pi-parity-audit (workflow wf_e427a266-e16)
-stage: aug
-status: done
+stage: exec
+status: in-progress
 updated: 2026-08-27
 ---
 

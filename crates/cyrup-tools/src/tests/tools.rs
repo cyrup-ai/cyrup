@@ -11,7 +11,7 @@ use crate::config::{BashOpts, FindOpts, GrepOpts, LsOpts, ReadOpts};
 use crate::ops::local::LocalFs;
 use crate::ops::{Backend, ExecSpec, ExitStatus, FsOps, ProcOps};
 use crate::registry::{Availability, ToolRegistry};
-use crate::tools::{BashTool, EditTool, FindTool, GrepTool, LsTool, ReadTool, WriteTool};
+use crate::tools::{EditTool, FindTool, GrepTool, LsTool, ReadTool, ShellTool, WriteTool};
 use crate::{FileMutationLocks, ToolsOptions};
 use cyrup_core::{
     CancelToken, Content, ExecMode, Tool, ToolCallId, ToolError, ToolResult, ToolUpdate,
@@ -656,8 +656,8 @@ async fn write_creates_dirs_and_holds_one_mutator_per_path() {
 
 // ---------------------------------------------------------------- A-03-5 bash
 
-fn bash_tool(cwd: PathBuf, opts: BashOpts) -> BashTool {
-    BashTool::new(proc(), cwd, opts)
+fn bash_tool(cwd: PathBuf, opts: BashOpts) -> ShellTool {
+    ShellTool::bash(proc(), cwd, opts)
 }
 
 #[tokio::test]
@@ -1458,7 +1458,7 @@ async fn bash_trailing_edge_flush_emits_midstream() {
         })
     };
     let dir = tempfile::tempdir().unwrap();
-    let bash = BashTool::new(
+    let bash = ShellTool::bash(
         Arc::new(ScriptedProc),
         dir.path().to_path_buf(),
         BashOpts::default(),

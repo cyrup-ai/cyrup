@@ -1,6 +1,11 @@
 //! `bash` — run a command in the cwd, stream combined stdout+stderr, tail-truncate the preview,
 //! spill full output to a temp file, and kill the process tree on timeout/abort
 //! (R-03-022…027, R-03-044, arch-03 §6.5).
+//!
+//! This module also houses the SHARED shell-tool engine, mirroring Pi's own file split: the
+//! factory ([`ShellTool`], Pi `createShellToolDefinition`, bash.ts:338-517) and its parameter bag
+//! ([`ShellToolConfig`], bash.ts:328-336) live here, `bash` is one instantiation ([`BASH_CONFIG`],
+//! bash.ts:519-527) and `powershell` is the other (`super::powershell`, powershell.ts:39-57).
 
 use crate::config::{BashOpts, BashSpawnContext};
 use crate::details::BashDetails;
@@ -50,60 +55,149 @@ fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<Duration>, ToolErro
     Ok(Some(Duration::from_millis(timeout_ms.round() as u64)))
 }
 
-/// Carries NO resolved [`ShellConfig`]. Pi's `createLocalBashOperations` captures only
-/// `options?.shellPath` (bash.ts:158-159) and calls `getShellConfig` inside every `exec`
-/// (bash.ts:91), so the shell — and any resolution error — belongs to the CALL, not to the tool.
-pub struct BashTool {
+/// The per-shell parameters of Pi's shared shell-tool factory (`ShellToolConfig`, bash.ts:328-336).
+/// Everything that differs between `bash` and `powershell` lives here; [`ShellTool`] below is Pi's
+/// `createShellToolDefinition` (bash.ts:338-517) and is instantiated once per config.
+pub struct ShellToolConfig {
+    /// `config.name` (bash.ts:346).
+    pub name: &'static str,
+    /// `config.label` (bash.ts:347).
+    pub label: &'static str,
+    /// `config.shellName` — interpolated into the tool description (bash.ts:350). It is ALSO the
+    /// name the missing-cwd error uses (bash.ts:95); that copy travels on [`ShellConfig`] because
+    /// cyrup raises the error in the process backend.
+    pub shell_name: &'static str,
+    /// The `command` property's schema description.
+    ///
+    /// [CYRUP-DELTA — version lag, per-tool instead of shared] Pi shares ONE `bashSchema` between
+    /// both shell tools (bash.ts:42-45), and at v0.84.3 its text is `"Shell command to execute"`.
+    /// cyrup's ported baseline is v0.83.0, where `bash` alone existed and the text was
+    /// `"Bash command to execute"` — which cyrup still emits. Keeping that per-config rather than
+    /// shared lets `powershell` be byte-exact against the tag it is ported FROM without silently
+    /// rewriting a model-facing `bash` string that no other part of this task touches. A later
+    /// v0.84.x uplift collapses both to `"Shell command to execute"`.
+    pub command_description: &'static str,
+    /// `config.promptSnippet` (bash.ts:351).
+    pub prompt_snippet: &'static str,
+    /// `config.promptGuidelines` (bash.ts:352), emitted only when
+    /// [`BashOpts::expose_session_environment`] is set.
+    pub prompt_guidelines: &'static [&'static str],
+    /// `config.tempFilePrefix` (bash.ts:364).
+    pub temp_file_prefix: &'static str,
+    /// Text prepended to the command AFTER the spawn hook has run. `None` for bash. For PowerShell
+    /// this is Pi's `UTF8_OUTPUT_PREFIX`, applied inside `createLocalPowerShellOperations`
+    /// (powershell.ts:16,35) — i.e. downstream of `commandPrefix`, `resolveSpawnContext` and the
+    /// hook, immediately before the child is built (bash.ts:451).
+    pub command_preamble: Option<&'static str>,
+    /// Pi's `resolveShellConfig` thunk (bash.ts:84; `() => getShellConfig(shellPath)` at
+    /// bash.ts:159, the bare `getPowerShellConfig` at powershell.ts:33). Called inside `execute`,
+    /// never at construction. The argument is the settings `shellPath`; the PowerShell resolver
+    /// ignores it, because Pi's PowerShell surface has no `shellPath` at all.
+    pub resolve_shell: fn(Option<&str>) -> Result<ShellConfig, ToolError>,
+}
+
+/// Pi's `bashToolConfig` (bash.ts:519-527).
+pub static BASH_CONFIG: ShellToolConfig = ShellToolConfig {
+    name: "bash",
+    label: "bash",
+    shell_name: "bash",
+    command_description: "Bash command to execute",
+    prompt_snippet: "Execute bash commands (ls, grep, find, etc.)",
+    prompt_guidelines: &[
+        "You can inspect CYRUP_* environment variables for current model and session details.",
+    ],
+    temp_file_prefix: "cyrup-bash",
+    command_preamble: None,
+    resolve_shell: ShellConfig::resolve,
+};
+
+/// Pi's `createShellToolDefinition` (bash.ts:338-517): ONE engine, parameterised by
+/// [`ShellToolConfig`]. `bash` and `powershell` are two instantiations of this type, exactly as
+/// upstream has two `ShellToolConfig` literals and one factory.
+///
+/// Carries NO resolved [`ShellConfig`]: the shell — and any resolution error — belongs to the CALL
+/// (bash.ts:91).
+pub struct ShellTool {
+    config: &'static ShellToolConfig,
     proc: Arc<dyn ProcOps>,
     cwd: PathBuf,
     opts: BashOpts,
     params: serde_json::Value,
+    /// `Execute a ${config.shellName} command …` (bash.ts:350) — interpolated, so it must be owned.
+    description: String,
 }
 
-impl BashTool {
-    pub fn new(proc: Arc<dyn ProcOps>, cwd: PathBuf, opts: BashOpts) -> Self {
-        // Byte-for-byte Pi's TypeBox emission (bash.ts:24-27): verbatim descriptions,
+impl ShellTool {
+    /// Pi's `createShellToolDefinition(cwd, config, options)` (bash.ts:338-345). [`BashOpts`] IS the
+    /// shared options bag: upstream's factory takes `BashToolOptions` for BOTH shells, and
+    /// `PowerShellToolOptions` (powershell.ts:29-30) is only the narrowed public surface on the
+    /// PowerShell constructor.
+    pub fn new(
+        config: &'static ShellToolConfig,
+        proc: Arc<dyn ProcOps>,
+        cwd: PathBuf,
+        opts: BashOpts,
+    ) -> Self {
+        // Byte-for-byte Pi's TypeBox emission (bash.ts:42-45): verbatim descriptions,
         // `type:"number"`, no `minimum`, no `additionalProperties`.
         let params = serde_json::json!({
             "type": "object",
             "required": ["command"],
             "properties": {
-                "command": { "type": "string", "description": "Bash command to execute" },
+                "command": { "type": "string", "description": config.command_description },
                 "timeout": { "type": "number", "description": "Timeout in seconds (optional, no default timeout)" }
             }
         });
+        // bash.ts:350 verbatim, with `${config.shellName}`, `${DEFAULT_MAX_LINES}` and
+        // `${DEFAULT_MAX_BYTES / 1024}` interpolated. The two limits are Pi's MODULE constants, not
+        // the per-call `opts` — upstream interpolates the constants even though its own truncation
+        // point is configurable.
+        let description = format!(
+            "Execute a {} command in the current working directory. Returns stdout and stderr. \
+             Output is truncated to last {} lines or {}KB (whichever is hit first). If truncated, \
+             full output is saved to a temp file. Optionally provide a timeout in seconds.",
+            config.shell_name,
+            crate::truncate::DEFAULT_MAX_LINES,
+            crate::truncate::DEFAULT_MAX_BYTES / 1024,
+        );
         Self {
+            config,
             proc,
             cwd,
             opts,
             params,
+            description,
         }
+    }
+
+    /// Pi's `createBashToolDefinition` (bash.ts:529-534).
+    pub fn bash(proc: Arc<dyn ProcOps>, cwd: PathBuf, opts: BashOpts) -> Self {
+        Self::new(&BASH_CONFIG, proc, cwd, opts)
     }
 }
 
 #[async_trait::async_trait]
-impl Tool for BashTool {
+impl Tool for ShellTool {
     fn name(&self) -> &str {
-        "bash"
+        self.config.name
     }
     /// TOOL-045 — pi declares `label` explicitly beside `name` on every built-in
     /// `ToolDefinition` and the two are equal for all seven (`bash.ts:325-326` @v0.83.0). See
     /// [`super::ReadTool::label`] for why the trait default was not left to stand in.
     fn label(&self) -> Option<&str> {
-        Some("bash")
+        Some(self.config.label)
     }
     fn parameters(&self) -> &serde_json::Value {
         &self.params
     }
 
-    // Verbatim from Pi (bash.ts:327). DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50.
+    // Verbatim from Pi (bash.ts:350), interpolated per config at construction.
+    // DEFAULT_MAX_LINES=2000, DEFAULT_MAX_BYTES/1024=50.
     fn description(&self) -> &str {
-        "Execute a bash command in the current working directory. Returns stdout and stderr. \
-         Output is truncated to last 2000 lines or 50KB (whichever is hit first). If truncated, \
-         full output is saved to a temp file. Optionally provide a timeout in seconds."
+        &self.description
     }
     fn prompt_snippet(&self) -> Option<&str> {
-        Some("Execute bash commands (ls, grep, find, etc.)")
+        Some(self.config.prompt_snippet)
     }
 
     /// Pi v0.84.1 `coding-agent/src/core/tools/bash.ts:45-48,334`:
@@ -149,6 +243,11 @@ impl Tool for BashTool {
     /// present is not the same as the divergence being FINDABLE, and `CYRUP-DELTA` is the grep
     /// this project's parity sweeps run.
     ///
+    /// Both shell tools carry the identical guideline — pi's
+    /// `powershellToolSystemPromptContribution.guidelines` (powershell.ts:20) is the same sentence
+    /// as bash's (bash.ts:48) — so the dedup in the prompt builder emits it once when both tools
+    /// are selected.
+    ///
     /// `PI_*` -> `CYRUP_*` is deliberate and is NOT a blind rebrand of user-environment advice: this
     /// sentence names the variables THIS TOOL injects into its own child, and cyrup's
     /// `resolveSpawnContext` port publishes exclusively `CYRUP_SESSION_ID` / `CYRUP_SESSION_FILE` /
@@ -159,9 +258,7 @@ impl Tool for BashTool {
     /// `cyrup-config/src/env.rs:68-91` — none of those five session-metadata names appears there.
     fn prompt_guidelines(&self) -> Vec<&str> {
         if self.opts.expose_session_environment {
-            vec![
-                "You can inspect CYRUP_* environment variables for current model and session details.",
-            ]
+            self.config.prompt_guidelines.to_vec()
         } else {
             Vec::new()
         }
@@ -174,8 +271,8 @@ impl Tool for BashTool {
         cancel: CancelToken,
         on_update: ToolUpdateSink,
     ) -> Result<ToolResult, ToolError> {
-        let input: BashInput =
-            serde_json::from_value(params).map_err(|e| error::invalid(format!("bash: {e}")))?;
+        let input: BashInput = serde_json::from_value(params)
+            .map_err(|e| error::invalid(format!("{}: {e}", self.config.name)))?;
 
         // Pi prepends the command prefix (bash.ts:340), then `resolveSpawnContext` (bash.ts:158-184)
         // builds the child environment in three ordered steps before handing the context to the
@@ -260,7 +357,8 @@ impl Tool for BashTool {
         let max_lines = self.opts.max_lines;
         let max_bytes = self.opts.max_bytes;
 
-        let mut acc = OutputAccumulator::new("cyrup-bash", max_lines, max_bytes);
+        // `new OutputAccumulator({ tempFilePrefix: config.tempFilePrefix })` (bash.ts:364).
+        let mut acc = OutputAccumulator::new(self.config.temp_file_prefix, max_lines, max_bytes);
         let mut sink = on_update;
 
         // Pi emits an initial empty update before streaming (bash.ts:355-357), strictly BEFORE
@@ -295,19 +393,30 @@ impl Tool for BashTool {
             return Err(error::invalid(append_status("", "Command aborted")));
         }
 
-        // Resolve the shell per-exec (Pi's `createLocalBashOperations` calls
-        // `getShellConfig(shellPath)` inside `exec`, AFTER `resolveTimeoutMs` and the abort check,
-        // bash.ts:87-91). BOTH of Pi's resolution errors reach the model here as the tool result,
-        // after the initial empty update, the timeout validation and the abort check, exactly like
-        // Pi: `Custom shell path not found: …` when `shellPath` is set and missing (shell.ts:73),
-        // and the three-option `No bash shell found. Options: …` recipe with its `Searched Git Bash
-        // in:` list when it is unset and no bash exists (shell.ts:100-106). Pi's inner catch
-        // re-throws both verbatim — neither is an `"aborted"` nor a `"timeout:"` message, so it
-        // falls to `throw err` (bash.ts:468) with NO status appended — and so does this `?`.
-        let shell = ShellConfig::resolve(self.opts.shell_path.as_deref())?;
+        // Resolve the shell per-exec through the CONFIG's thunk — Pi's `resolveShellConfig`
+        // parameter (bash.ts:84), which is `() => getShellConfig(options?.shellPath)` for bash
+        // (bash.ts:159) and the bare `getPowerShellConfig` for PowerShell (powershell.ts:33). It is
+        // called inside `exec`, AFTER `resolveTimeoutMs` and the abort check (bash.ts:85-91), so
+        // every resolution error reaches the model as the tool result: `Custom shell path not
+        // found: …` (shell.ts:73), the three-option `No bash shell found. Options: …` recipe
+        // (shell.ts:100-106), `The powershell tool is only available on Windows.` (shell.ts:127),
+        // and `No PowerShell executable found. …` (shell.ts:132). Pi's inner catch re-throws all of
+        // them verbatim — none is an `"aborted"` nor a `"timeout:"` message, so it falls to
+        // `throw err` (bash.ts:468) with NO status appended — and so does this `?`.
+        let shell = (self.config.resolve_shell)(self.opts.shell_path.as_deref())?;
+
+        // The per-shell command preamble goes on LAST, after `command_prefix`, after the session-env
+        // assembly and after the spawn hook — because Pi applies it inside `operations.exec`
+        // (powershell.ts:35), which is downstream of everything `resolveSpawnContext` and the hook
+        // do (bash.ts:340-341,451). A hook therefore rewrites the model's command, never the UTF-8
+        // preamble, and the preamble is never doubled.
+        let command = match self.config.command_preamble {
+            Some(preamble) => format!("{preamble}{}", ctx.command),
+            None => ctx.command,
+        };
 
         let spec = ExecSpec {
-            command: ctx.command,
+            command,
             cwd: ctx.cwd,
             env: ctx.env,
             env_remove: ctx.env_remove,

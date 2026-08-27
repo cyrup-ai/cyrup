@@ -1,7 +1,9 @@
 //! cyrup-tools — built-in tools and the operations seam (arch-03; conformance: func-03).
 //!
-//! Ships the deliberately minimal default tool set — `read`, `write`, `edit`, `bash`, `grep`,
-//! `find`, `ls` (DI-1) — as native Rust, plus the cross-cutting infrastructure they share: the
+//! Ships the deliberately minimal default tool set — `read`, `write`, `edit`, `bash`, `powershell`,
+//! `grep`, `find`, `ls` (DI-1) — as native Rust, of which `powershell` (Windows-only) and
+//! `grep`/`find`/`ls` are REGISTERED but off by default, plus the cross-cutting infrastructure they
+//! share: the
 //! two-limit truncation model ([`truncate`]), path handling ([`path`]), per-file mutation locking
 //! ([`lock`]), the canonical [`FsOps`]/[`ProcOps`] operations seam ([`ops`]) consumed by isolation
 //! (arch-12), the bash streaming engine with process-tree kill ([`output`]), in-process
@@ -33,8 +35,8 @@ pub mod truncate;
 pub use cyrup_core::ToolError;
 
 pub use config::{
-    BashOpts, BashSpawnContext, BashSpawnHook, EditOpts, FindOpts, GrepOpts, LsOpts, ReadOpts,
-    ToolsOptions, WriteOpts,
+    BashOpts, BashSpawnContext, BashSpawnHook, EditOpts, FindOpts, GrepOpts, LsOpts,
+    PowerShellOpts, ReadOpts, ToolsOptions, WriteOpts,
 };
 pub use isolation::{
     OsSandbox, PermissionPolicy, PolicyDecision, ProtectedFs, ProtectedPaths, Rule, SandboxKind,

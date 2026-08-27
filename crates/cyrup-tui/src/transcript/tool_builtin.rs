@@ -209,28 +209,31 @@ pub(super) fn render_edit(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'st
     }
 }
 
-/// `bash` — header `$ <command> (timeout Ns)` + the output tail (collapsed = last 5 visual lines) +
-/// truncation notices + a `Took {d}s` footer (`bash.ts:201-289/430-464`).
+/// `bash`/`powershell` — header `<prompt> <command> (timeout Ns)` + the output tail (collapsed =
+/// last 5 visual lines) + truncation notices + a `Took {d}s` footer (`bash.ts:201-289/430-464`).
 pub(super) fn render_bash(
     run: &ToolRun,
     expanded: bool,
     theme: &UiTheme,
     expand_key: &str,
+    prompt: &str,
     out: &mut Vec<Line<'static>>,
 ) {
-    // Header: `$ command`, bold, + a muted ` (timeout Ns)` suffix (`formatBashCall`).
+    // Header: `<prompt> command`, bold, + a muted ` (timeout Ns)` suffix (`formatShellCall`,
+    // bash.ts:238-244, called with `config.prompt` at bash.ts:488 — `$` for bash, `PS>` for
+    // PowerShell).
     let title = theme.tool_title_style();
     let mut spans = Vec::new();
     match str_arg(&run.args, &["command"]) {
         StrArg::Invalid => {
-            spans.push(Span::styled("$ ".to_string(), title));
+            spans.push(Span::styled(format!("{prompt} "), title));
             spans.push(Span::styled("[invalid arg]".to_string(), theme.error_style()));
         }
         StrArg::Missing => {
-            spans.push(Span::styled("$ ".to_string(), title));
+            spans.push(Span::styled(format!("{prompt} "), title));
             spans.push(Span::styled("...".to_string(), theme.tool_output_style()));
         }
-        StrArg::Value(cmd) => spans.push(Span::styled(format!("$ {cmd}"), title)),
+        StrArg::Value(cmd) => spans.push(Span::styled(format!("{prompt} {cmd}"), title)),
     }
     if let Some(t) = run.args.get("timeout").and_then(Value::as_f64).filter(|t| *t != 0.0) {
         // `${timeout}s` (bash.ts:204): JS renders an integer number without a trailing `.0`.
