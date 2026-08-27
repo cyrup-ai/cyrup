@@ -409,7 +409,8 @@ impl Tool for GrepTool {
                             // `FsOps::metadata` (fs.rs:170-182) stats through the link, so
                             // `meta.is_file` is true at the explicit-path branch above and the
                             // file is searched directly — which is what ripgrep does for a
-                            // depth-0 explicit subject.
+                            // depth-0 explicit subject (`Subject::is_file` short-circuits on
+                            // `dent.depth() == 0`).
                             Some(Ok(w)) if w.is_file => {
                                 let rel_path = w.path.strip_prefix(&search_root).unwrap_or(&w.path);
                                 let rel = to_posix(rel_path);
