@@ -247,13 +247,17 @@ impl Tool for FindTool {
                         // bare `Io` from parent-ignore loading all take the same path. So this arm
                         // discriminates on nothing and simply keeps collecting.
                         //
-                        // Swallowing here cannot hide a bad search root: a root that does not
-                        // exist is already rejected by the `metadata(&search_root)` probe above
-                        // (pi's `Path not found`, find.ts:158). A root that exists but cannot be
-                        // opened yields zero rows and falls through to "No files found matching
-                        // pattern" below — which is exactly what pi answers on fd's empty stdout
-                        // (find.ts:311-320). Do NOT gate this on "the walk produced no rows": pi
-                        // has no such gate, because fd never gives it a non-zero code to gate on.
+                        // Swallowing here cannot hide a bad search root: the
+                        // `metadata(&search_root)` probe above already rejects BOTH a
+                        // missing root and one that exists but is not a directory, with
+                        // fd's own two-line `[fd error]: …` message — see the note on
+                        // that gate for why pi's `Path not found:` (find.ts:171, the
+                        // `customOps.glob` branch) is NOT this tool's message. A root that
+                        // exists but cannot be opened yields zero rows and falls through to
+                        // "No files found matching pattern" below — which is exactly what pi
+                        // answers on fd's empty stdout (find.ts:311-320). Do NOT gate this on
+                        // "the walk produced no rows": pi has no such gate, because fd never
+                        // gives it a non-zero code to gate on.
                         Some(Err(_)) => continue,
                         None => break,
                     }

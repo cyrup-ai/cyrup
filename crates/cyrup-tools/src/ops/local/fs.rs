@@ -54,6 +54,75 @@ pub(crate) fn windows_access_result(
     Ok(())
 }
 
+/// Render an [`ignore::Error`] the way ripgrep does — `{path}: {io error}`, with the path
+/// stated **exactly once**.
+///
+/// `Display` cannot be used directly. `Error::from_walkdir` stores
+/// `Error::Io(io::Error::from(walkdir_err))` (ignore 0.4.26 `src/lib.rs:296-301`), and
+/// walkdir 2.5.0's `From<Error> for io::Error` is `io::Error::new(kind, walk_err)`
+/// (`walkdir-2.5.0/src/error.rs:253-261`) — a CUSTOM io error whose own `Display` re-states
+/// the path as `"IO error for operation on {path}: {err}"` (`:224-229`). Printed under
+/// `WithPath` (`lib.rs:333-335`) that yields the path twice. walkdir 2.3.x returned the
+/// inner `io::Error` unchanged, which is why `rg` 14.1.0 prints the clean form and a
+/// straight `to_string()` here does not.
+///
+/// `Error::io_error()` is NOT the escape hatch: it unwraps only `ignore`'s own
+/// `Partial`/`WithLineNumber`/`WithPath`/`WithDepth` nesting and then returns the
+/// `Error::Io` payload verbatim (`lib.rs:205-222`), i.e. walkdir's wrapper. And there is
+/// no `Error::path()` accessor at 0.4.26 — the path is only reachable by matching the
+/// public `WithPath` variant (`lib.rs:78-84`), which is what this does.
+///
+/// Every arm reproduces the corresponding arm of `impl Display for Error`
+/// (`lib.rs:322-359`) unchanged except for the io leaf, so `Loop` (which carries no
+/// `WithPath` — `lib.rs:286-295`) keeps ripgrep's un-prefixed
+/// `"File system loop found: … points to an ancestor …"`.
+pub(crate) fn walk_error_message(err: &ignore::Error) -> String {
+    match err {
+        // The one variant carrying a path. Recurse, so the tail is the PEELED io text
+        // rather than walkdir's restatement of this same path.
+        ignore::Error::WithPath { path, err } => {
+            format!("{}: {}", path.display(), walk_error_message(err))
+        }
+        // Transparent in `Display` (`lib.rs:336`); stay transparent.
+        ignore::Error::WithDepth { err, .. } => walk_error_message(err),
+        // `Display` is `line {n}: {err}` (`lib.rs:330-332`).
+        ignore::Error::WithLineNumber { line, err } => {
+            format!("line {line}: {}", walk_error_message(err))
+        }
+        // `Display` joins with `\n` (`lib.rs:325-329`).
+        ignore::Error::Partial(errs) => errs
+            .iter()
+            .map(walk_error_message)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        ignore::Error::Io(io) => io_error_message(io),
+        // `Loop`, `Glob`, `UnrecognizedFileType`, `InvalidDefinition`: no nested io error,
+        // no doubled path — their own `Display` is already what ripgrep prints.
+        other => other.to_string(),
+    }
+}
+
+/// Peel walkdir's wrapper off an [`std::io::Error`] so it prints as the OS did.
+///
+/// `io::Error::get_ref` is `Some` only for the custom repr, where it hands back the boxed
+/// payload — here the `walkdir::Error`. walkdir's `source()` is the ORIGINAL `io::Error`
+/// (`walkdir-2.5.0/src/error.rs:212-217`), which renders as
+/// `Permission denied (os error 13)`.
+///
+/// Both hops are required. An `io::Error` straight from `std::fs` is the OS repr, so
+/// `get_ref()` is `None`; `ignore`'s handful of `io::Error::new(kind, "<literal>")` sites
+/// (`walk.rs:175-179`, `:377`, `:427`) DO have a payload but its `source()` is `None`.
+/// Both therefore fall through to their own `Display`, unchanged. walkdir's error is the
+/// only payload on this seam that carries a `source()`.
+fn io_error_message(err: &std::io::Error) -> String {
+    if let Some(payload) = err.get_ref()
+        && let Some(original) = std::error::Error::source(payload)
+    {
+        return original.to_string();
+    }
+    err.to_string()
+}
+
 /// Local filesystem operations.
 #[derive(Default, Clone)]
 pub struct LocalFs;
@@ -276,12 +345,14 @@ impl FsOps for LocalFs {
             // 0.4.26 `src/walk.rs:1124-1126`), so valid entries arrive both before and after.
             // Consumers must never read one as end-of-stream.
             //
-            // The message is the BARE `ignore::Error` text — `WithPath` renders as
-            // `{path}: {io error}` (ignore 0.4.26 `src/lib.rs:333-335`), e.g.
-            // `/srv/locked: Permission denied (os error 13)`. No prefix is added here because the
-            // two consumers of this seam want different things from the same value: `find`
-            // emulates fd, which discards it (fd 10.5.0 `src/walk.rs:227-231`, `:500-505`), and
-            // `grep` emulates ripgrep, which reports it as `rg: {path}: {io error}` on stderr.
+            // The message is `walk_error_message`'s rendering of the `ignore::Error`, i.e.
+            // ripgrep's own `{path}: {io error}` with the path stated once, e.g.
+            // `/srv/locked: Permission denied (os error 13)`. It is NOT `e.to_string()`:
+            // at ignore 0.4.26 + walkdir 2.5.0 `Display` states the path TWICE — see
+            // `walk_error_message`. No prefix is added here because the two consumers of
+            // this seam want different things from the same value: `find` emulates fd,
+            // which discards it (fd 10.5.0 `src/walk.rs:227-231`, `:500-505`), and `grep`
+            // emulates ripgrep, which reports it as `rg: {path}: {io error}` on stderr.
             // A `walk: ` prefix matched neither.
             for result in walker {
                 let item = match result {
@@ -305,7 +376,7 @@ impl FsOps for LocalFs {
                             is_file,
                         })
                     }
-                    Err(e) => Err(ToolError::new(e.to_string())),
+                    Err(e) => Err(ToolError::new(walk_error_message(&e))),
                 };
                 if tx.blocking_send(item).is_err() {
                     break;

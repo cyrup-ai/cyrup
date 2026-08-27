@@ -14,4 +14,5 @@ mod pi_tool_semantics;
 mod read_access_errno;
 mod read_model_vision;
 mod tools;
+mod walk_error_text;
 mod write_semantics;
