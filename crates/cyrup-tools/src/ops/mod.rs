@@ -11,6 +11,7 @@
 pub(crate) mod cancel_read;
 pub mod local;
 pub mod shell;
+pub(crate) mod win;
 
 use cyrup_core::{CancelToken, EventStream, ToolError};
 use std::path::{Path, PathBuf};
