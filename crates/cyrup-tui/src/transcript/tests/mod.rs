@@ -2,6 +2,7 @@
 //! `crate::tests`) so they can reach the module's private helpers and poison
 //! [`TranscriptView`](super::TranscriptView)'s private render-cache fields.
 
+mod js_arg;
 mod js_number;
 mod osc_hyperlinks;
 mod output_pad;

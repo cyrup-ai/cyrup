@@ -86,7 +86,8 @@ use layout::{
 };
 use message::{collapsed_summary_lines, group_thousands, labeled_message_lines, thinking_lines};
 use tool_args::{
-    compact_read_call, compact_read_classification, js_number, key_hint_spans, more_lines_hint,
+    compact_read_call, compact_read_classification, js_arg, js_truthy, key_hint_spans,
+    more_lines_hint,
     push_search_path, read_line_range, str_arg, tool_path_span, StrArg,
 };
 use tool_builtin::{

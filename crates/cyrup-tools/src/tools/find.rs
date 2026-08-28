@@ -9,7 +9,7 @@ use crate::truncate::{TruncOpts, format_size, truncate_head};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(serde::Deserialize)]
@@ -181,9 +181,12 @@ impl Tool for FindTool {
             // N paths; pi never sees the rest of the tree. Draining the whole walk and then
             // `sort()`+`truncate()` cost the full-tree walk on every call regardless of `limit`,
             // AND returned a different result SET — the alphabetically-first N rather than the
-            // first N discovered. Both are fixed by bounding the walk here. `grep -n sort find.ts`
-            // is empty at v0.84.1: pi relativizes only the lines it received (find.ts:321-326) and
-            // never reorders them, so the sort is dropped rather than moved. Note this bounds the
+            // first N discovered. Both are fixed by bounding the walk here.
+            //
+            // `grep -n sort find.ts` is empty at v0.84.1, and that proves nothing: pi does not sort
+            // because **fd already did**, inside the binary find.ts spawns. Reading the wrapper and
+            // not the tool it wraps is what dropped the sort entirely. It is reinstated after the
+            // loop, on the bounded set — see the `FD_MAX_BUFFER_LENGTH` block. Note this bounds the
             // stream, not just the vector: dropping out of the loop closes the receiver and
             // `LocalFs::walk`'s producer task breaks on the send error (ops/local/fs.rs).
             if results.len() >= limit {
@@ -266,6 +269,37 @@ impl Tool for FindTool {
                     }
                 }
             }
+        }
+
+        // fd SORTS, and cyrup did not. `ReceiverBuffer::stop` runs the moment the cap fires
+        // (fd 10.5.0 `walk.rs:220-224`) and, if the receiver is still BUFFERING, sorts before
+        // emitting (`walk.rs:281-285`):
+        //
+        //     if self.mode == ReceiverMode::Buffering { self.buffer.sort(); self.stream()?; }
+        //
+        // It is still buffering while no more than `MAX_BUFFER_LENGTH` (1000, `walk.rs:125`)
+        // results have arrived and the 100 ms `DEFAULT_MAX_BUFFER_TIME` (`walk.rs:127`) has not
+        // expired. Pi passes `--max-results` with `DEFAULT_LIMIT = 1000` (find.ts:44, :165, :252),
+        // and the receiver checks `buffer.len() > MAX_BUFFER_LENGTH` BEFORE incrementing
+        // `num_results`, so on the 1000th entry the buffer holds exactly 1000 — not more — and the
+        // cap fires while still buffering. Under pi's own default, fd's output is sorted.
+        //
+        // The 100 ms deadline has no analogue here: cyrup's walk is single-threaded with no
+        // streaming mode, so the length condition is the whole test. On a tree slow enough that
+        // fd's deadline beats the cap, fd streams in arrival order where this sorts — timing
+        // dependent, unreproducible in-process, and the one genuine residual.
+        //
+        // `Path::cmp`, not `str::cmp`: fd orders by `self.path().cmp(other.path())`
+        // (`dir_entry.rs:132-136`), which compares COMPONENTS. Byte comparison inverts the two
+        // whenever a name holds a character below `/` — `.`, `-` and space all qualify, so
+        // dotfiles and hyphenated names would sort wrongly. It also normalises away the trailing
+        // `/` this function appends to directories, which byte comparison would not.
+        //
+        // This is NOT the full-tree `sort()`+`truncate()` rejected above: the walk is still
+        // bounded at `limit`, so the SET is unchanged and only its order moves.
+        const FD_MAX_BUFFER_LENGTH: usize = 1000;
+        if results.len() <= FD_MAX_BUFFER_LENGTH {
+            results.sort_by(|a, b| Path::new(a).cmp(Path::new(b)));
         }
 
         // Pi's `results.length === 0` check (find.ts:311) runs on rows that `fd` has ALREADY

@@ -103,9 +103,19 @@ pub(crate) struct RgFlags {
     pub ignore_files: Vec<String>,
 
     // --- walk ---
-    /// `--no-ignore` and the `-u` ladder: every ignore source off.
+    /// `--no-ignore` and the `-u` ladder: every ignore source off — `.ignore`, the custom ignore
+    /// file (`.rgignore`), and the whole gitignore family.
     pub no_ignore: bool,
-    /// `--no-ignore-vcs` — gitignore family off, `.ignore` still honoured.
+    /// `--no-ignore-vcs` — the gitignore family off, while `.ignore` **and the custom ignore file**
+    /// keep applying.
+    ///
+    /// Naming the custom file is the point. `.ignore` and the custom file are covered by DIFFERENT
+    /// mechanisms — `ignore(false)` reaches `.ignore` alone, and the custom file has its own
+    /// registration gate — so a description that lists `.ignore` and stops leaves a reader to group
+    /// the custom file with the gitignore family and assume it dies with them. It does not.
+    ///
+    /// Setting [`Self::no_ignore`] gives everything this flag gives and more, which is why the two
+    /// are not folded together — see `LocalFs::walk`, where the widening is applied.
     pub no_ignore_vcs: bool,
     /// `--max-depth`/`--maxdepth`.
     pub max_depth: Option<usize>,

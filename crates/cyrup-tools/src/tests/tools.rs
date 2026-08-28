@@ -2847,3 +2847,49 @@ async fn the_missing_cwd_error_names_the_shell() {
         );
     }
 }
+
+/// fd sorts its results when the cap fires while it is still buffering, and cyrup did not.
+///
+/// `ReceiverBuffer::stop` (fd 10.5.0 `walk.rs:281-285`) calls `self.buffer.sort()` before emitting
+/// whenever the mode is still `Buffering`, which is the case under pi's own default —
+/// `--max-results 1000` (find.ts:44, :165, :252) against `MAX_BUFFER_LENGTH` of 1000
+/// (`walk.rs:125`). So for any tree that answers inside fd's 100 ms deadline, pi's caller sees
+/// sorted paths. cyrup returned `ignore::Walk` readdir order.
+///
+/// The fixture pins BOTH halves of the fix at once. fd orders by
+/// `self.path().cmp(other.path())` (`dir_entry.rs:132-136`) — a COMPONENT comparison — so:
+///
+///   `Path::cmp`  ->  ["a", "b.txt"] < ["a.txt"]   because "a" < "a.txt"     =>  a/b.txt first
+///   `str::cmp`   ->  "a.txt" < "a/b.txt"          because '.' (0x2E) < '/'  =>  a.txt first
+///
+/// The two disagree, so this test fails if the sort is missing AND fails if it is done byte-wise
+/// on the joined strings. Any name holding a character below `/` — `.`, `-`, space — flips it,
+/// which covers dotfiles and hyphenated names.
+#[tokio::test]
+async fn find_returns_fd_sorted_order_not_readdir_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path().to_path_buf();
+    std::fs::create_dir(cwd.join("a")).unwrap();
+    // Created in an order that is neither the sorted nor the reverse-sorted one, so a pass cannot
+    // come from the filesystem happening to hand them back already ordered.
+    for rel in ["z.txt", "a/b.txt", "a.txt"] {
+        std::fs::write(cwd.join(rel), "x").unwrap();
+    }
+    let find = FindTool::new(fs(), cwd, FindOpts { limit: 1000, max_bytes: 50 * 1024 });
+    let r = find
+        .execute(
+            cid(),
+            // `*.txt` has no `/`, so it is basename-matched and the `a` directory is not a result.
+            serde_json::json!({ "pattern": "*.txt" }),
+            CancelToken::new(),
+            noop_sink(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        first_text(&r),
+        "a/b.txt\na.txt\nz.txt",
+        "fd sorts by Path components when the cap fires while buffering"
+    );
+}

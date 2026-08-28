@@ -3,9 +3,9 @@ title: "CYRUP-DELTA capability gap at crates/cyrup-tools/src/tools/find.rs:1"
 priority: MEDIUM
 crate: cyrup-tools
 source: CYRUP-DELTA classification audit (workflow wf_12c49023-adf)
-stage: aug
-status: done
-updated: 2026-08-28 02:23
+stage: qa
+status: completed
+updated: 2026-08-28 20:30
 ---
 
 # Capability gap: `crates/cyrup-tools/src/tools/find.rs:1`
@@ -46,6 +46,107 @@ backlog in the first place.
 1. The gap is closed, or the marker records an explicit authorized acceptance.
 2. If closed, a test fails without the change.
 3. No behaviour regression in the owning crate.
+
+---
+
+## R0. CORRECTION — R7's "undefined upstream" is false, and it hides a live divergence
+
+**David flagged R7 item 1 as factually incorrect. He is right.** This section is the verification;
+R7 has been corrected to match. Everything in R1–R6 stands.
+
+### What R7 claimed
+
+> fd's choice of *which* N under `--max-results`, and its ordering past 100 ms, are
+> nondeterministic upstream. **Nothing to converge to.**
+
+### What fd actually does
+
+`tmp/fdsrc/fd-find-10.5.0/src/walk.rs:281-285`:
+
+```rust
+fn stop(&mut self) -> Result<(), ExitCode> {
+    if self.mode == ReceiverMode::Buffering {
+        self.buffer.sort();          // <-- fd sorts
+        self.stream()?;
+    }
+    ...
+}
+```
+
+`stop()` is reached the instant the cap fires (`walk.rs:220-224`). The receiver loop, in order:
+
+```
+push to buffer  ->  if buffer.len() > MAX_BUFFER_LENGTH { stream() }
+                ->  num_results += 1
+                ->  if num_results >= max_results { stop() }
+```
+
+`MAX_BUFFER_LENGTH` is **1000** and `DEFAULT_MAX_BUFFER_TIME` is **100 ms** (`walk.rs:125,127`).
+
+### The arithmetic at pi's default
+
+pi passes `--max-results <effectiveLimit>` (`find.ts:252`) with `DEFAULT_LIMIT = 1000`
+(`find.ts:44`, `:165`). On the 1000th entry `buffer.len() == 1000`, which is **not** `> 1000`, so
+no early `stream()`. Then `num_results == 1000 >= 1000` → `stop()` → still `Buffering` → **`sort()`**.
+
+**So under pi's own default, for any tree whose first 1000 matches arrive inside 100 ms, fd's
+output is sorted and fully deterministic.** There is a great deal to converge to.
+
+### The three regimes, precisely
+
+| condition | fd |
+| --- | --- |
+| cap fires while buffering — `limit <= 1000` **and** under 100 ms | `stop()` sorts → **deterministic, sorted** |
+| 100 ms deadline fires first | `Timeout` → `stream()` (`walk.rs:240-241`), arrival order thereafter |
+| `limit > 1000` | buffer exceeds at 1001 → `stream()`, arrival order thereafter |
+
+Note `stream()` does **not** sort (`walk.rs:270-278`) — it drains the buffer as-is. Only regimes 2
+and 3 are nondeterministic. R7 generalised those two into "undefined upstream" and used it to
+justify accepting the whole item.
+
+### The live divergence this was concealing
+
+[`find.rs:180-189`](../../crates/cyrup-tools/src/tools/find.rs) drops the sort, reasoning:
+
+> `grep -n sort find.ts` is empty at v0.84.1: pi relativizes only the lines it received
+> (find.ts:321-326) and never reorders them, so the sort is dropped rather than moved.
+
+True about `find.ts`, and irrelevant. **pi does not sort because fd already did.** The sort lives
+inside the binary `find.ts` spawns. Checking the wrapper and not the tool it wraps is what produced
+both this comment and R7's claim.
+
+So in the regime that dominates real use — pi's default limit, a tree that answers in under 100 ms
+— fd returns sorted paths and cyrup returns first-N-discovered in `ignore::Walk` readdir order.
+That is caller-visible, and it is the opposite of "nothing to converge to".
+
+### Prescription
+
+Sort when fd would have. cyrup is single-threaded with no streaming mode, so the 100 ms deadline
+has no analogue and the length condition is the whole test:
+
+```rust
+// fd sorts iff it was still BUFFERING when the cap fired (fd 10.5.0 walk.rs:281-285), which
+// holds while no more than MAX_BUFFER_LENGTH results have been received. Past that fd has
+// switched to streaming and emits arrival order, unsorted — `stream()` does not sort.
+//
+// This is NOT the full-tree `sort()`+`truncate()` the earlier comment correctly rejected: the
+// walk is still bounded at `limit`, so the cost is sorting at most `limit` entries, and the
+// result SET is unchanged. Only the ORDER of the set already collected changes.
+const FD_MAX_BUFFER_LENGTH: usize = 1000;
+if results.len() <= FD_MAX_BUFFER_LENGTH {
+    results.sort();
+}
+```
+
+Keep the existing bounded walk and its comment about why the full-tree sort was wrong — that
+reasoning is sound and is a different question. Replace only the sentence claiming pi never
+reorders, since fd does.
+
+### What is genuinely residual afterwards
+
+On a tree slow enough that fd's 100 ms deadline fires before `limit` matches are found, fd streams
+in arrival order where cyrup sorts. That is timing-dependent, unreproducible in-process, and small.
+It is the honest residual — not "which N and the ordering are undefined".
 
 ---
 
@@ -622,8 +723,11 @@ with the fact that the fd-not-vendored caveat at `:1084` is now discharged for f
 
 ## R7. Residual after P1–P6 — what David is being asked to accept
 
-1. **Regime 2/3 result SETS** (T2). fd's choice of *which* N under `--max-results`, and its
-   ordering past 100 ms, are nondeterministic upstream. Nothing to converge to.
+1. **Regimes 2 and 3 only** (T2, corrected — see R0). fd's ordering is nondeterministic ONLY
+   once it has left buffering: when the 100 ms deadline fires before the cap, or when `limit`
+   exceeds `MAX_BUFFER_LENGTH` (1000). In the regime pi's own default produces — `--max-results
+   1000` on a tree that answers inside 100 ms — fd **sorts** (`walk.rs:281-285`) and is fully
+   deterministic. That part is convergeable and is now prescribed in R0, not accepted.
 2. **fd's three error strings** (F4). Structurally unreachable without a child process.
 3. **fd-version band** (R1, D5). fd ≥ 10.5.0's path-separator diagnostic exists only on newer
    fd; a cyrup that reproduces it diverges from a host running fd 9.0.0, and vice versa.
@@ -635,8 +739,9 @@ with the fact that the fd-not-vendored caveat at `:1084` is now discharged for f
 5. **Windows `**` degradation** (D4) — pending OQ3.
 6. **`FindOperations.glob` seam shape** (F3) — latent until a remote `FsOps` exists.
 
-That is the complete list. It is six items, five of which are bounded and one of which
-(item 1) is *undefined upstream*. It is not "an entire external tool's semantics".
+That is the complete list. Six items, all bounded — item 1 was previously described as
+*undefined upstream*, which was wrong: only its regime-2/3 tail is, and the dominant regime is
+sorted and deterministic. See R0. It is not "an entire external tool's semantics".
 
 ---
 
