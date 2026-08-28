@@ -184,6 +184,18 @@ pub fn format_timeout_message(ms: u64) -> String {
     format!("Subagent timed out after {ms}ms.")
 }
 
+/// pi `DEFAULT_FOREGROUND_TIMEOUT_MS` (`runs/foreground/subagent-executor.ts:2656` @v0.57.0) — the
+/// wall-clock backstop every FOREGROUND launch gets when neither the caller, the agent's own
+/// `timeoutMs:` frontmatter, nor `subagents.timeoutMs` set one. Without it a child whose bash tool
+/// blocks forever hangs the orchestrator's turn open-endedly with no signal at all.
+///
+/// Deliberately a SEPARATE constant from [`crate::background::DEFAULT_ASYNC_CHILD_TIMEOUT_MS`]
+/// rather than an alias of it. The two coincide today — upstream calls the async one "same generous
+/// default as foreground" — but upstream keeps them independent, and the two paths apply them at
+/// different seams: this one at the tool/slash dispatch, the async one inside
+/// `extension/executor/background.rs`'s own `unwrap_or`.
+pub const DEFAULT_FOREGROUND_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
 // ================================================================================================
 // run_sync: the model-fallback attempt loop, wired end to end (arch-SA §6.3.2)
 // ================================================================================================

@@ -24,8 +24,9 @@ use crate::extension::host::slash_render::{
 };
 use crate::extension::tool::SubagentTool;
 use crate::extension::tool::params::{
-    format_failed_single_run_output, resolve_execution_agent_scope, resolve_foreground_timeout,
-    validate_execution_acceptance, SubagentToolParams, WATCHDOG_MUTATING_ACTION,
+    foreground_timeout_default, format_failed_single_run_output, resolve_execution_agent_scope,
+    resolve_foreground_timeout, validate_execution_acceptance, SubagentToolParams,
+    WATCHDOG_MUTATING_ACTION,
 };
 use crate::extension::tool::task_items::{
     expand_top_level_task_counts, find_duplicate_parallel_output, normalize_skill_input,
@@ -311,16 +312,6 @@ impl SubagentTool {
         // question can actually be asked of this call's params.
         let launch_defaults = SubagentExecutor::single_agent_launch_defaults(cwd, agent);
 
-        // pi `resolveForegroundTimeout` (`subagent-executor.ts:1951-1968`): `timeoutMs`/
-        // `maxRuntimeMs` are aliases; validate up front (positive, and consistent when both given).
-        // The agent-level default is applied only when that resolution produced nothing, which is
-        // exactly pi's `params.timeoutMs === undefined && params.maxRuntimeMs === undefined` guard
-        // — and it runs AFTER validation so an invalid explicit value still errors rather than
-        // being silently replaced by the agent's default.
-        let timeout_ms = resolve_foreground_timeout(p)
-            .map_err(ToolError::new)?
-            .or(launch_defaults.1);
-
         // pi resolves `effectiveAsync` against the live config's `asyncByDefault`/
         // `forceTopLevelAsync` and this call's own depth (`applyForceTopLevelAsyncOverride`,
         // `subagent-executor.ts:3318-3322,3382` @v0.34.0) — never a hardcoded `false` default. The agent's
@@ -340,7 +331,34 @@ impl SubagentTool {
             }
             _ => p,
         };
-        if p.is_background(&cfg, depth) {
+        // SUBA-077: hoisted out of the `if` below because the timeout ladder needs it — the
+        // foreground backstop is gated on this launch NOT being async.
+        let background = p.is_background(&cfg, depth);
+
+        // pi `resolveForegroundTimeout` (`subagent-executor.ts:2689` @v0.57.0): `timeoutMs`/
+        // `maxRuntimeMs` are aliases; validate up front (positive, and consistent when both given).
+        // The default rungs are applied only when that resolution produced nothing, which is
+        // exactly pi's `params.timeoutMs === undefined && params.maxRuntimeMs === undefined` guard
+        // — and they run AFTER validation so an invalid explicit value still errors rather than
+        // being silently replaced.
+        //
+        // SUBA-077 / pi `resolveSingleAgentLaunchTimeout` (`:2719-2725`): the agent's frontmatter
+        // rung is now the FIRST rung of that default rather than a trailing `.or(launch_defaults.1)`
+        // on the result. It cannot stay a trailing `.or()`: the default would already have filled
+        // the value, leaving an agent's `timeoutMs:` permanently unreachable.
+        //
+        // The built-in backstop is gated on `!background`, which is upstream's own `!async` arm. An
+        // async single launch already picks up `DEFAULT_ASYNC_CHILD_TIMEOUT_MS` downstream at
+        // `extension/executor/background.rs`'s `timeout_ms.unwrap_or(…)`; handing that `unwrap_or`
+        // a `Some` on every run would silently retire it — harmless while the two constants agree,
+        // a trap the moment either moves.
+        let timeout_ms = resolve_foreground_timeout(
+            p,
+            foreground_timeout_default(background, launch_defaults.1, cfg.timeout_ms.as_ref()),
+        )
+        .map_err(ToolError::new)?;
+
+        if background {
             return self
                 .route_single_background(SingleBackgroundDispatch {
                     p,
@@ -1430,6 +1448,17 @@ impl SubagentTool {
 
         let context = p.context_override();
         let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
+        // SUBA-077: this site used to hard-code `None`, which dropped an EXPLICIT call-site
+        // `timeoutMs` on the floor as well as skipping the default. Resolved on the same terms as
+        // SINGLE and CHAIN — upstream's `!async` arm covers `tasks: []` launches too, since
+        // `isComposite` suppresses only the async default (`subagent-executor.ts:2724` @v0.57.0).
+        // A top-level parallel call names many agents, so there is no agent-frontmatter rung.
+        let background = p.is_background(&cfg, depth);
+        let timeout_ms = resolve_foreground_timeout(
+            p,
+            foreground_timeout_default(background, Option::None, cfg.timeout_ms.as_ref()),
+        )
+        .map_err(ToolError::new)?;
         match self
             .executor
             .run_or_background_graph(
@@ -1437,12 +1466,10 @@ impl SubagentTool {
                 vec![group],
                 RunMode::Parallel,
                 context,
-                p.is_background(&cfg, depth),
+                background,
                 p.task.clone(),
                 cancel,
-                // Timeout wiring for a bare top-level PARALLEL call is a separate unit; this call
-                // site carries no timeout param yet, matching its pre-existing behavior exactly.
-                None,
+                timeout_ms,
                 // SUBA-N05: `control` is a top-level param on pi's `SubagentParams`, so it applies
                 // to a PARALLEL invocation exactly as it does to a SINGLE one — `runParallelPath`
                 // shares `ExecutionContextData.controlConfig` with every other mode
@@ -1562,9 +1589,19 @@ impl SubagentTool {
         let graph = parse_tool_chain_items(raw, cfg.parallel_concurrency())?;
         let context = p.context_override();
         let depth = resolve_effective_depth(cfg.max_subagent_depth).current_depth;
-        // pi `resolveForegroundTimeout` (`subagent-executor.ts:1951-1968`): `timeoutMs`/
+        // pi `resolveForegroundTimeout` (`subagent-executor.ts:2689` @v0.57.0): `timeoutMs`/
         // `maxRuntimeMs` are aliases, resolved once up front here exactly as SINGLE mode does.
-        let timeout_ms = resolve_foreground_timeout(p).map_err(ToolError::new)?;
+        //
+        // SUBA-077: upstream's `!async` arm applies the foreground backstop to composite launches
+        // too — `resolveSingleAgentLaunchTimeout`'s `isComposite` test only suppresses the ASYNC
+        // default (`:2724`). A chain names many agents, so there is no single agent-frontmatter
+        // rung to pass.
+        let background = p.is_background(&cfg, depth);
+        let timeout_ms = resolve_foreground_timeout(
+            p,
+            foreground_timeout_default(background, Option::None, cfg.timeout_ms.as_ref()),
+        )
+        .map_err(ToolError::new)?;
         // SUBA-N03: no timeout-vs-async refusal here any more. The one that stood here cited
         // `subagent-executor.ts:3022-3023` as "pi's own precedent" and mirrored `route_single`'s
         // identically-cited SINGLE-mode refusal. The citation is false in both places — at v0.34.0
@@ -1589,7 +1626,7 @@ impl SubagentTool {
                 graph,
                 RunMode::Chain,
                 context,
-                p.is_background(&cfg, depth),
+                background,
                 p.task.clone(),
                 cancel,
                 timeout_ms,
