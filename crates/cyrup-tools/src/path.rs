@@ -390,6 +390,40 @@ fn resolve_lexical(path: &Path, base: &Path) -> PathBuf {
         lexical_resolve(&std::env::current_dir().unwrap_or_default().join(base).join(path))
     }
 }
+/// `strip_prefix`, with Windows's case-insensitive segment comparison.
+///
+/// Pi computes the inside-cwd test with `relative()` from `node:path`, which on Windows resolves to
+/// `path.win32.relative` — and that compares segments case-INSENSITIVELY. `Path::strip_prefix` is
+/// byte-exact, so `C:\Foo\AGENTS.md` under a `cwd` spelled `c:\foo` came back `None` here and the
+/// caller rendered the absolute path where pi renders `AGENTS.md`.
+///
+/// Unix is unaffected and deliberately keeps the byte-exact path: `path.posix.relative` is
+/// case-sensitive too, so folding there would be a divergence rather than a fix.
+#[cfg(windows)]
+fn strip_cwd_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
+    if base.as_os_str().is_empty() {
+        return Some(path);
+    }
+    let mut p = path.components();
+    for b in base.components() {
+        let n = p.next()?;
+        // `eq_ignore_ascii_case` is the right width here: Windows path comparison folds by the
+        // OEM/ANSI case table, and every character that can differ in a drive letter or an ASCII
+        // filename is covered. A non-ASCII segment still compares exactly, which is the
+        // conservative direction — it can only fail to strip, never strip the wrong thing.
+        if !n.as_os_str().to_string_lossy().eq_ignore_ascii_case(&b.as_os_str().to_string_lossy()) {
+            return None;
+        }
+    }
+    Some(p.as_path())
+}
+
+/// Unix: byte-exact, matching `path.posix.relative`.
+#[cfg(not(windows))]
+fn strip_cwd_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
+    path.strip_prefix(base).ok()
+}
+
 
 /// Port of Pi's `getCwdRelativePath` (`utils/paths.ts:108-117`): the cwd-relative form of
 /// `file_path` when it is inside `cwd`, else `None`.
@@ -404,30 +438,36 @@ fn resolve_lexical(path: &Path, base: &Path) -> PathBuf {
 /// return isInsideCwd ? relativePath || "." : undefined;
 /// ```
 ///
-/// `Path::strip_prefix` compares whole COMPONENTS, so it IS Pi's `isInsideCwd` conjunction: it fails
+/// [`strip_cwd_prefix`] compares whole COMPONENTS, so it IS Pi's `isInsideCwd` conjunction: it fails
 /// for a sibling, for an ancestor and for a different volume, it keeps a `..config`-style NAME (Pi's
 /// own `test/paths.test.ts` case), and it rejects a real `..` traversal. The two pieces it does not
 /// carry are ported explicitly below — Pi's `relativePath || "."`, and Pi's `!isAbsolute(relativePath)`
-/// guard, since `Path::new("/a/b").strip_prefix("")` returns `Ok("/a/b")`, an ABSOLUTE "relative"
-/// path Pi would reject.
+/// guard, since an empty base hands the whole absolute path back, an ABSOLUTE "relative" path Pi
+/// would reject.
 ///
 /// Both sides are lexically resolved first, mirroring `resolvePath(cwd)` /
 /// `resolvePath(filePath, resolvedCwd)`; that is what makes an un-collapsed `<cwd>/../AGENTS.md`
 /// come back `None` rather than being read as a `..`-named child.
 ///
-/// **[CYRUP-DELTA — the inside-cwd compare is case-SENSITIVE on Windows]** Node's
-/// `path.win32.relative` compares path segments CASE-INSENSITIVELY, whereas
-/// `Path::strip_prefix` is byte-exact. On Windows only, `C:\Foo\AGENTS.md` under a `cwd` spelled
-/// `c:\foo` therefore returns `None` here (and renders as the absolute path) where Pi returns
-/// `AGENTS.md`. Unix is unaffected — `path.posix.relative` is case-sensitive too. Closing it needs a
-/// `cfg(windows)` case-folded comparison in place of `strip_prefix`; awaiting a decision.
+/// Windows case-folding is why [`strip_cwd_prefix`] exists rather than a bare `Path::strip_prefix`.
+///
+/// Node's `path.win32.relative` compares path segments CASE-INSENSITIVELY; `Path::strip_prefix` is
+/// byte-exact. Without the wrapper, `C:\Foo\AGENTS.md` under a `cwd` spelled `c:\foo` returned
+/// `None` here and rendered as the absolute path where Pi returns `AGENTS.md`. Unix keeps the
+/// byte-exact comparison deliberately — `path.posix.relative` is case-sensitive too, so folding
+/// there would introduce a divergence rather than close one.
+///
+/// This carries no `CYRUP-DELTA` marker because the divergence is CLOSED. Markers are the grep the
+/// parity sweeps run for LIVE divergences; one left on fixed code gets re-filed as an open gap, and
+/// that has already cost this backlog two re-derivations.
 pub fn cwd_relative_path(file_path: &Path, cwd: &Path) -> Option<PathBuf> {
     let resolved_cwd = resolve_lexical(cwd, Path::new(""));
     let resolved_path = resolve_lexical(file_path, &resolved_cwd);
-    let relative = resolved_path.strip_prefix(&resolved_cwd).ok()?;
+    let relative = strip_cwd_prefix(&resolved_path, &resolved_cwd)?;
     // `!isAbsolute(relativePath)`. Reachable only when `resolved_cwd` is EMPTY — a relative `cwd`
-    // plus a `current_dir()` that failed — because `strip_prefix("")` succeeds and hands the whole
-    // absolute path back.
+    // plus a `current_dir()` that failed — because `strip_cwd_prefix` hands the whole absolute path
+    // back for an empty base: the Unix arm delegates to `Path::strip_prefix("")`, which succeeds,
+    // and the Windows arm returns early for the same reason.
     if relative.is_absolute() {
         return None;
     }
@@ -489,6 +529,31 @@ pub fn resolve_read_path(path: &str, cwd: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
+
+    /// `cwd_relative_path` must fold case on Windows, as `path.win32.relative` does.
+    ///
+    /// **This test does not run on this host.** It is `cfg(windows)` and this CI is Linux, so it is
+    /// compiled away entirely — a guard for a Windows builder, not coverage claimed here. Saying so
+    /// explicitly is the point: a `cfg`-gated test sitting in a green suite otherwise reads as
+    /// passing coverage when nothing has executed.
+    ///
+    /// The body was exercised before being gated, by temporarily enabling the `#[cfg(windows)]` arm
+    /// of `strip_cwd_prefix` on Linux and running these same cases: a differently-cased cwd strips,
+    /// a same-cased cwd strips, a genuine non-match returns `None`, and an empty base hands the
+    /// whole path back.
+    #[cfg(windows)]
+    #[test]
+    fn windows_cwd_compare_folds_case_like_path_win32_relative() {
+        // Node's `path.win32.relative("c:\\foo", "C:\\Foo\\AGENTS.md")` is `"AGENTS.md"`;
+        // `Path::strip_prefix` answered `None` and the caller rendered the absolute path instead.
+        assert_eq!(
+            cwd_relative_path(Path::new(r"C:\Foo\AGENTS.md"), Path::new(r"c:\foo")),
+            Some(PathBuf::from("AGENTS.md"))
+        );
+        // A path genuinely outside the cwd is still outside it.
+        assert_eq!(cwd_relative_path(Path::new(r"C:\Bar\x"), Path::new(r"c:\foo")), None);
+    }
+
     use super::*;
 
     // --- `cwd_relative_path` / `format_path_relative_to_cwd_or_absolute` ------------------------

@@ -60,6 +60,19 @@ fn rg_pattern_error(err: &grep_regex::Error) -> String {
     format!("rg: {msg}")
 }
 
+/// The refusal for a pattern carrying a RAW NUL byte, byte-identical to `ban::check`'s.
+///
+/// Routed through the same three suggestion helpers as [`rg_pattern_error`] rather than spelling
+/// the final text out, so the two paths cannot drift apart: `ban::check`'s own wording is the seed,
+/// `suggest_multiline` does not fire (no "the literal … not allowed"), `suggest_text` appends the
+/// `--text` advice, and `suggest_other_engine` does not fire.
+///
+/// See `build_matcher` for why a raw NUL is refused ahead of the builder at all.
+fn rg_nul_literal_error() -> String {
+    let seed = "pattern contains \"\\0\" but it is impossible to match".to_string();
+    format!("rg: {}", suggest_other_engine(suggest_text(suggest_multiline(seed))))
+}
+
 /// ripgrep `hiargs.rs:1437-1448`, verbatim.
 fn suggest_multiline(msg: String) -> String {
     if msg.contains("the literal") && msg.contains("not allowed") {
@@ -101,6 +114,56 @@ fn suggest_other_engine(msg: String) -> String {
     } else {
         msg
     }
+}
+
+/// Build `grep`'s matcher.
+///
+/// Extracted from `execute` so a guard can drive the PRODUCTION construction rather than a copy of
+/// the builder. `matcher.line_terminator()` is an exact discriminator for `.multi_line(true)` — it
+/// is `Some(LineTerminator(Byte(10)))` for an anchored pattern with the flag and `None` without —
+/// but a test can only use it if it can reach the matcher this function returns.
+fn build_matcher(
+    input: &GrepInput,
+    case: CaseMode,
+    rg: &RgFlags,
+) -> Result<grep_regex::RegexMatcher, ToolError> {
+    // A raw NUL in the pattern is refused HERE, before the builder, because the builder refuses it
+    // on only one of its two branches.
+    //
+    // `ban_byte(Some(b'\x00'))` runs inside `ban::check`, which the parsed branch reaches but the
+    // fixed-strings branch does not (grep-regex `config.rs:195-212`): `is_fixed_strings`
+    // (`:102-124`) bails on the LINE TERMINATOR and on nothing else, so under `literal: true` a
+    // pattern holding a real NUL byte compiles happily and the tool answers `No matches found` —
+    // a confident false negative — while the same input under `literal: false` correctly errors.
+    //
+    // This input is unreachable for pi: Node's `spawn` rejects a NUL in argv, so `rg` never sees
+    // one and there is no upstream behaviour to match. cyrup takes the pattern from JSON and can
+    // therefore reach a state pi cannot. The choice to refuse it is CYRUP'S OWN, made because one
+    // branch erroring while the other silently answers wrong is an inconsistency rather than a
+    // considered position — not because upstream does this.
+    //
+    // The message is `ban::check`'s own, so the two branches now agree byte-for-byte.
+    if input.pattern.as_bytes().contains(&b'\x00') {
+        return Err(error::invalid(rg_nul_literal_error()));
+    }
+
+    let mut builder = RegexMatcherBuilder::new();
+    builder.multi_line(true);
+    if rg.crlf {
+        builder.crlf(true);
+    } else {
+        builder.line_terminator(Some(b'\n'));
+    }
+    builder
+        .case_insensitive(case == CaseMode::Insensitive)
+        .case_smart(case == CaseMode::Smart)
+        .word(rg.word)
+        .whole_line(rg.whole_line)
+        .unicode(!rg.no_unicode)
+        .fixed_strings(input.literal.unwrap_or(rg.fixed_strings))
+        .ban_byte(Some(b'\x00'))
+        .build(&input.pattern)
+        .map_err(|e| error::invalid(rg_pattern_error(&e)))
 }
 
 pub struct GrepTool {
@@ -578,23 +641,7 @@ impl Tool for GrepTool {
         //
         // So: the CRLF flag installs its own terminator, and otherwise the plain `\n` default
         // stands exactly as it did before any of this existed.
-        let mut builder = RegexMatcherBuilder::new();
-        builder.multi_line(true);
-        if rg.crlf {
-            builder.crlf(true);
-        } else {
-            builder.line_terminator(Some(b'\n'));
-        }
-        let matcher = builder
-            .case_insensitive(case == CaseMode::Insensitive)
-            .case_smart(case == CaseMode::Smart)
-            .word(rg.word)
-            .whole_line(rg.whole_line)
-            .unicode(!rg.no_unicode)
-            .fixed_strings(input.literal.unwrap_or(rg.fixed_strings))
-            .ban_byte(Some(b'\x00'))
-            .build(&input.pattern)
-            .map_err(|e| error::invalid(rg_pattern_error(&e)))?;
+        let matcher = build_matcher(&input, case, &rg)?;
 
         // Pi: `const contextValue = context && context > 0 ? context : 0` (grep.ts:188) — a
         // negative, zero or NaN `context` all collapse to 0 instead of failing. `to_count` folds
@@ -1006,7 +1053,9 @@ impl Tool for GrepTool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
-    use super::GrepTool;
+    use super::{build_matcher, CaseMode, GrepInput, GrepTool};
+    // `line_terminator()` lives on the `Matcher` trait, not on `RegexMatcher` itself.
+    use grep_matcher::Matcher;
     use crate::config::GrepOpts;
     use crate::ops::local::LocalFs;
     use crate::tools::rgconfig::RgFlags;
@@ -1662,6 +1711,73 @@ mod tests {
         for pattern in ["\\x00", "[\\x00]", "\\x{0}"] {
             let msg = grep_err(dir.path(), serde_json::json!({ "pattern": pattern })).await;
             assert_eq!(msg, RG_NUL_ERROR, "pattern {pattern}");
+
+            // The same refusal under `ignoreCase`, which the original assertion never covered.
+            //
+            // The note that asked for this explained it as `case_insensitive` forcing grep-regex
+            // off the `is_fixed_strings` fast path. That reasoning is wrong and is recorded here so
+            // it is not re-derived: `fixed_strings` is not set on this call, so the fast path was
+            // never in play, and setting it would not help either — under `literal` the pattern is
+            // `regex_syntax::escape`d BEFORE parsing, so `\x00` becomes ordinary backslash-x-0-0
+            // holding no NUL for `ban::check` to find (pinned by
+            // `nul_escape_under_fixed_strings_is_an_ordinary_literal`).
+            //
+            // What it does pin is real: `-i` changes the HIR translation path (case folding is
+            // applied during translation), and a NUL must not survive that. rg 14.1.0 exits 2 for
+            // `-i -- '\x00'`.
+            let msg = grep_err(
+                dir.path(),
+                serde_json::json!({ "pattern": pattern, "ignoreCase": true }),
+            )
+            .await;
+            assert_eq!(msg, RG_NUL_ERROR, "pattern {pattern} under ignoreCase");
+        }
+    }
+
+    /// ITEM 7 — a RAW NUL byte, which pi cannot deliver at all.
+    ///
+    /// `literal: true` took the fixed-strings branch, which `ban::check` never sees, so the pattern
+    /// compiled and the tool answered "No matches found" — a confident false negative — while
+    /// `literal: false` correctly errored. Both branches now refuse it with the same bytes.
+    #[tokio::test]
+    async fn a_raw_nul_byte_is_refused_on_both_branches() {
+        let dir = anchor_fixture();
+        for literal in [false, true] {
+            let msg = grep_err(
+                dir.path(),
+                serde_json::json!({ "pattern": "a\u{0}b", "literal": literal }),
+            )
+            .await;
+            assert_eq!(msg, RG_NUL_ERROR, "literal {literal}");
+        }
+    }
+
+    /// ITEM 5 — the `.multi_line(true)` guard, driving the PRODUCTION construction.
+    ///
+    /// With `multi_line` on, `^`/`$` translate to the LINE anchors and `ConfiguredHIR` reports the
+    /// line terminator; with it off they become haystack anchors and `line_terminator()` answers
+    /// `None` (grep-regex `config.rs:296-302`). That is an exact discriminator, and it is only
+    /// usable because `build_matcher` is a function the test can call — asserting against a copy of
+    /// the builder would pass no matter what `execute` did.
+    #[test]
+    fn multi_line_is_set_on_the_production_matcher() {
+        let flags = RgFlags::default();
+        let input = |pattern: &str| GrepInput {
+            pattern: pattern.to_string(),
+            path: None,
+            glob: None,
+            ignore_case: None,
+            literal: None,
+            context: None,
+            limit: None,
+        };
+        for anchored in ["foo$", "^foo", "^$"] {
+            let m = build_matcher(&input(anchored), CaseMode::Sensitive, &flags).unwrap();
+            assert_eq!(
+                m.line_terminator(),
+                Some(grep_matcher::LineTerminator::byte(b'\n')),
+                "{anchored} must stay line-anchored"
+            );
         }
     }
 

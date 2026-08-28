@@ -100,10 +100,30 @@ fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::Sta
         quiet_startup: services.settings.effective().quiet_startup(),
         // Pi's `[Context]` list is the system-prompt source + appended prompts + the `AGENTS.md`
         // chain, in load order (`:1551-1555`, `{sort: false}`).
+        // `formatContextPath` (interactive-mode.ts:1334-1343) tries the CWD-RELATIVE form FIRST
+        // and only falls back to display formatting:
+        //
+        //     const relativePath = getCwdRelativePath(absolutePath, cwd);
+        //     if (relativePath !== undefined) { return relativePath; }
+        //     return this.formatDisplayPath(absolutePath);
+        //
+        // Only the fallback leg was ported, so a project `AGENTS.md` INSIDE the cwd listed as
+        // `~/…` or as a full absolute path where pi lists it `AGENTS.md`.
+        // `cyrup_tools::path::cwd_relative_path` is the `getCwdRelativePath` port; it already
+        // existed and simply was not reached from here.
         context_files: snapshot
             .context_files
             .iter()
-            .map(|f| cyrup_tui::display_path(&f.path, home))
+            .map(|f| {
+                // Returned RAW, not posix-normalised: `formatContextPath` hands back
+                // `relativePath` as-is. The `.split(sep).join("/")` fold belongs to
+                // `formatPathRelativeToCwdOrAbsolute` (`utils/paths.ts:119-122`), a different
+                // function that this call site does not use.
+                cyrup_tools::path::cwd_relative_path(&f.path, &services.cwd).map_or_else(
+                    || cyrup_tui::display_path(&f.path, home),
+                    |rel| rel.display().to_string(),
+                )
+            })
             .collect(),
         skills: services.resources.skills.all().iter().map(|s| s.name.clone()).collect(),
         // Prompt templates list as their slash command (Pi `/${template.name}`, `:1596`).

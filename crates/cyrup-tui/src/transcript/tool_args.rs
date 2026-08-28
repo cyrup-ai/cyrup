@@ -190,6 +190,84 @@ pub(super) fn js_number(n: f64) -> String {
         }
     }
 }
+/// `String(v)` for a JSON value — ECMAScript `ToString`, not a numeric cast.
+///
+/// Pi renders these header suffixes through template interpolation (`` `${limit}` ``), so a
+/// non-number reaches the screen as its JS string form: `null` becomes `"null"`, `true` becomes
+/// `"true"`, `"50"` stays `"50"`. Reading them through [`Value::as_f64`] answered `None` for all
+/// three and the suffix vanished entirely — the argument was silently unrendered rather than
+/// rendered as pi renders it.
+pub(super) fn js_arg(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.as_f64().map_or_else(|| n.to_string(), js_number),
+        Value::String(s) => s.clone(),
+        // `String([1,2])` is `"1,2"`, and a nested `null`/`undefined` element renders empty.
+        Value::Array(a) => a.iter().map(js_arg_element).collect::<Vec<_>>().join(","),
+        Value::Object(_) => "[object Object]".to_string(),
+    }
+}
+
+/// `Array.prototype.join`'s element rule: `null` and `undefined` render as the empty string rather
+/// than as `"null"`, which is why this is not [`js_arg`] applied directly.
+fn js_arg_element(v: &Value) -> String {
+    if v.is_null() { String::new() } else { js_arg(v) }
+}
+
+/// ECMAScript `ToBoolean`.
+///
+/// Pi gates the bash timeout suffix on `timeout ? …` — a truthiness test, not a presence test — so
+/// `0`, `""`, `false` and `null` all drop the suffix while any non-empty string keeps it.
+pub(super) fn js_truthy(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0 && !f.is_nan()),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
+}
+
+/// ECMAScript `ToNumber`.
+///
+/// Only the arithmetic in [`read_line_range`] needs this: pi computes
+/// `startLine + args.limit - 1`, and the trailing `- 1` forces `ToNumber` on whatever the `+`
+/// produced.
+fn js_to_number(v: &Value) -> f64 {
+    match v {
+        Value::Null => 0.0,
+        Value::Bool(b) => f64::from(u8::from(*b)),
+        Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+        // `Number("")` is `0`; `Number("  12  ")` is `12`; anything else is `NaN`.
+        Value::String(s) => {
+            let t = s.trim();
+            if t.is_empty() { 0.0 } else { t.parse::<f64>().unwrap_or(f64::NAN) }
+        }
+        Value::Array(a) => match a.as_slice() {
+            [] => 0.0,
+            [one] => js_to_number(one),
+            _ => f64::NAN,
+        },
+        Value::Object(_) => f64::NAN,
+    }
+}
+
+/// ECMAScript `+` over two JSON values.
+///
+/// `+` is the one operator where a string operand changes the OPERATION rather than just the
+/// coercion: `1 + "5"` is `"15"`, not `6`. Everything that is not a primitive string still goes
+/// through `ToPrimitive` first, and for an array or an object that yields a string — so those
+/// concatenate too.
+fn js_add(a: &Value, b: &Value) -> Value {
+    let stringy = |v: &Value| matches!(v, Value::String(_) | Value::Array(_) | Value::Object(_));
+    if stringy(a) || stringy(b) {
+        Value::String(format!("{}{}", js_arg(a), js_arg(b)))
+    } else {
+        Value::from(js_to_number(a) + js_to_number(b))
+    }
+}
+
 
 /// `formatReadLineRange` (read.ts:73-78): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
 ///
@@ -200,30 +278,56 @@ pub(super) fn js_number(n: f64) -> String {
 /// return theme.fg("warning", `:${startLine}${endLine ? `-${endLine}` : ""}`);
 /// ```
 ///
-/// Upstream has no integer type to lose: `JSON.parse` yields an IEEE-754 double for `2` and for
-/// `2.0` alike, so both spellings are literally the same value by the time this runs and both
-/// render `:2`. [`Value::as_f64`] is that same "is this a JSON number" test — it answers `Some` for
-/// `Number::PosInt`, `NegInt` and `Float` alike, where `as_i64` answers `None` for every float — so
-/// it, and not `as_i64`, is the extractor. It is also the more faithful one at the top of the range:
-/// `as_f64` narrows `9007199254740993` to `9007199254740992`, which is precisely what `JSON.parse`
-/// does with the same literal.
+/// There is NO numeric extractor here, deliberately. Each of those four lines is a different JS
+/// operator — presence, nullish, presence again, truthiness — and they disagree on `null`, so
+/// reading `offset`/`limit` through [`Value::as_f64`] collapsed all four into "is it a number" and
+/// dropped every non-number silently. The values stay raw `Value`s and each rule is applied as
+/// itself; see the comments in the body.
 ///
-/// The arithmetic stays in `f64` because `startLine + args.limit - 1` is double arithmetic
-/// upstream; a fractional `offset` reaches the header unrounded there and must here.
+/// The arithmetic is JS `+` via [`js_add`], not double arithmetic: `+` string-CONCATENATES when
+/// either operand is a string, and only the trailing `- 1` coerces back to a number. So
+/// `{"offset":1,"limit":"5"}` renders `:1-14` — `1 + "5"` is `"15"`, and `"15" - 1` is `14`.
+/// `read_line_range_ports_all_four_rules` pins that.
+///
+/// Upstream has no integer type to lose: `JSON.parse` yields an IEEE-754 double for `2` and for
+/// `2.0` alike, so both spellings are the same value by the time this runs and both render `:2`.
+/// [`js_number`], which [`js_arg`] delegates to for numbers, is also the more faithful fold at the
+/// top of the range: it narrows `9007199254740993` to `9007199254740992`, precisely what
+/// `JSON.parse` does with the same literal. A fractional `offset` reaches the header unrounded, as
+/// it does upstream.
 pub(super) fn read_line_range(args: &Value) -> Option<String> {
-    let offset = args.get("offset").and_then(Value::as_f64);
-    let limit = args.get("limit").and_then(Value::as_f64);
+    // Four separate JS rules in four lines (read.ts:74-77), and they do NOT agree with each other
+    // on `null` — which is why each is ported as itself rather than folded into one extractor:
+    //
+    //   1. `args?.offset === undefined && args?.limit === undefined` — a PRESENCE gate. An explicit
+    //      JSON `null` is present, so it passes and a range still renders.
+    //   2. `args.offset ?? 1` — NULLISH. `null` becomes `1`; a string stays the string.
+    //   3. `args.limit !== undefined ? … : ""` — PRESENCE again, so a `null` limit still computes.
+    //   4. `endLine ? … : ""` — TRUTHINESS on the computed number, so `0` and `NaN` drop the
+    //      `-<end>` half.
+    //
+    // Reading both through `Value::as_f64` collapsed rules 1-3 into "is it a number", so
+    // `{"offset": null}` rendered nothing where pi renders `:1`.
+    let offset = args.get("offset");
+    let limit = args.get("limit");
     if offset.is_none() && limit.is_none() {
         return None;
     }
-    let start = offset.unwrap_or(1.0);
-    // `endLine ? …` is a JS TRUTHINESS test on a Number, not a presence test: an end line that
-    // computes to zero (`{"offset":1,"limit":0}`) is falsy upstream and the `-<end>` half is
-    // dropped. `NaN` is falsy for the same reason and is excluded here for the same reason.
-    let end = limit.map(|l| start + l - 1.0).filter(|e| *e != 0.0 && !e.is_nan());
+    // Rule 2. `??` yields the value itself, not a number, so a non-numeric offset survives to the
+    // screen exactly as pi interpolates it.
+    let start: Value = match offset {
+        Some(v) if !v.is_null() => v.clone(),
+        _ => Value::from(1),
+    };
+    // Rules 3 and 4. `startLine + args.limit` is JS `+` — string-concatenating when either side is
+    // a string — and the trailing `- 1` then forces `ToNumber` on the result, so `endLine` is
+    // always a Number by the time the truthiness gate sees it.
+    let end = limit
+        .map(|l| js_to_number(&js_add(&start, l)) - 1.0)
+        .filter(|e| *e != 0.0 && !e.is_nan());
     Some(match end {
-        Some(e) => format!(":{}-{}", js_number(start), js_number(e)),
-        None => format!(":{}", js_number(start)),
+        Some(e) => format!(":{}-{}", js_arg(&start), js_number(e)),
+        None => format!(":{}", js_arg(&start)),
     })
 }
 

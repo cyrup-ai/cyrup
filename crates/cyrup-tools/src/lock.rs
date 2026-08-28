@@ -331,6 +331,60 @@ mod tests {
     fn poll_once<F: std::future::Future>(f: std::pin::Pin<&mut F>) -> std::task::Poll<F::Output> {
         f.poll(&mut std::task::Context::from_waker(std::task::Waker::noop()))
     }
+    /// The registration chain must span the ENQUEUE as well as key resolution.
+    ///
+    /// Pi holds one `registration` promise across BOTH halves — `getMutationQueueKey` at
+    /// `file-mutation-queue.ts:34` AND `fileMutationQueues.set(key, chainedQueue)` at `:35-42` —
+    /// and only settles it at `:51`. Moving `drop(registration)` up between the two halves is a
+    /// one-line divergence from that.
+    ///
+    /// **This guard is structural, and deliberately so.** The divergence is not behaviourally
+    /// observable, and a counter cannot catch it. `KeyedLocks::enqueue` never yields, so between
+    /// `Self::key(..).await?` and the end of `enqueue(..).await` there is no suspension point for
+    /// another task to be scheduled into — the whole window runs inside one poll. A second task
+    /// woken by an early `drop` still cannot make progress until the first task yields, by which
+    /// time the first has already enqueued, so the queue order is identical either way. Verified:
+    /// with `drop(registration)` moved above the enqueue, the entire workspace suite passes
+    /// 337/337. Any witness counter placed below `enqueue` would be incremented in that same
+    /// unyielding poll and would discriminate nothing.
+    ///
+    /// So what is pinned here is the SOURCE ORDER, which is the property pi's structure actually
+    /// asserts. A test that cannot fail is worse than an honest structural one.
+    #[test]
+    fn the_registration_chain_spans_the_enqueue() {
+        // Scoped to `guard`'s body, not the whole file. This test lives in the same file it
+        // scans, so its own string literals are part of `src`; searching the whole file would let
+        // an assertion match itself and pass for the wrong reason.
+        let whole = include_str!("lock.rs");
+        let body_at = whole
+            .find("let registration = MUTATION_REGISTRATION.lock().await;")
+            .expect("`guard` still claims the process-global registration slot");
+        let end_at = whole[body_at..]
+            .find("\n    }\n")
+            .map_or(whole.len(), |o| body_at + o);
+        let src = whole.get(body_at..end_at).expect("guard body slice is in bounds");
+
+        // Presence before absence: anchor on the real statements, so a rename or a refactor fails
+        // loudly here rather than making the ordering assertion vacuous.
+        let key_at = src
+            .find("let key = Self::key(path).await?;")
+            .expect("`guard` still resolves its key through `Self::key`");
+        let enqueue_at = src
+            .find("let acquire = self.inner.enqueue(key).await;")
+            .expect("`guard` still links into the key's queue through `enqueue`");
+        let drop_at = src
+            .find("drop(registration);")
+            .expect("`guard` still settles the registration explicitly");
+
+        assert!(key_at < enqueue_at, "key resolution must precede the enqueue");
+        assert!(
+            enqueue_at < drop_at,
+            "the registration must still be held ACROSS the enqueue (pi \
+             file-mutation-queue.ts:35-42, settled at :51) — moving `drop(registration)` above \
+             `enqueue` narrows the chain to key resolution only"
+        );
+    }
+
 
     /// Pi funnels key resolution (`file-mutation-queue.ts:34`) AND the queue link (`:42`) through
     /// ONE registration chain (`:33`). Moving `drop(registration)` above `Self::key(..).await` is a

@@ -317,23 +317,42 @@ impl FsOps for LocalFs {
                 // five `no_ignore_*` flags), so parent traversal is switched off with it.
                 //
                 // Honestly labelled: this is currently BELT AND BRACES, not load-bearing, and no
-                // test can distinguish it. By the time `no_ignore` is set, every source parent
-                // traversal could contribute has already been switched off above — `.ignore`, the
-                // gitignore family and the custom file. The one source that survives `--no-ignore`
-                // is `--ignore-file` (ripgrep `defs.rs:4251-4252`: it "does not imply
-                // \flag{no-ignore-files}"), and those are explicit paths that parent traversal
-                // never supplied. It is set because it is what the flag MEANS, so that adding a
-                // future parent-sensitive source cannot silently reintroduce the bug.
+                // test can distinguish it. Whenever `no_ignore` is set, every source parent
+                // traversal could contribute is switched off elsewhere in this same chain —
+                // `.ignore` and the gitignore family below, the custom file at the registration
+                // gate further down. Their POSITION is irrelevant: every `WalkBuilder` setter is a
+                // plain field assignment on `ig_builder` (ignore 0.4.33 `walk.rs:896-899`,
+                // `:820-826`) and nothing is read until `build()`, so these calls commute.
+                //
+                // The one source that survives `--no-ignore` is `--ignore-file` (ripgrep
+                // `defs.rs:4251-4252`: it "does not imply \flag{no-ignore-files}"), and those are
+                // explicit paths that parent traversal never supplied. It is set because it is what
+                // the flag MEANS, so that adding a future parent-sensitive source cannot silently
+                // reintroduce the bug.
                 .parents(!opts.no_ignore);
 
             // The `$RIPGREP_CONFIG_PATH` knobs. Each is a no-op at its default, so this block
             // changes nothing for a caller that did not ask for it.
             //
-            // `-u`/`--no-ignore` is the wider of the two ignore switches: `ignore(false)` drops
-            // `.ignore` and the custom ignore file, and the three git switches drop the gitignore
-            // family. `--no-ignore-vcs` is the narrower one and takes only the git switches, so a
-            // `.ignore` file still applies — that asymmetry is the whole difference between the
-            // two flags and is why they are not folded together.
+            // `-u`/`--no-ignore` is the wider of the two ignore switches, and it is wider because
+            // it reaches FOUR mechanisms — not because any one of them covers more:
+            //
+            //   `.ignore(false)`                     `.ignore` files, and ONLY those
+            //   the three `git_*` switches           the gitignore family
+            //   the registration gate further down   the custom ignore file (`.rgignore`)
+            //   `.parents(!opts.no_ignore)` above    ignore files in ANCESTOR directories
+            //
+            // `ignore(false)` covering the custom file is the misconception this comment used to
+            // state, and it is why `--no-ignore` once did nothing at all in any tree holding a
+            // `.rgignore`. In ignore 0.4.33 the two matchers are built independently: the custom
+            // one is gated ONLY on whether the filename list is empty (`dir.rs:360-364` — no
+            // `opts.ignore` in the condition), while `opts.ignore` gates the `.ignore` matcher
+            // alone (`dir.rs:391-401`). See the registration gate below for why that has to be a
+            // skip rather than an undo.
+            //
+            // `--no-ignore-vcs` is the narrower one and takes only the git switches, so `.ignore`,
+            // the custom file and parent traversal all keep applying. That asymmetry is the whole
+            // difference between the two flags and is why they are not folded together.
             if opts.no_ignore {
                 builder
                     .ignore(false)

@@ -2,7 +2,10 @@
 //! `js_number` is `String(n)` for a `Number` out of `JSON.parse` — the fold every numeric header
 //! suffix applies (read's `:<start>-<end>`, bash's `(timeout Ns)`, grep/find/ls's `limit`).
 
-use crate::transcript::*;
+// `js_number` is used only by `tool_args` itself and by this test, so it is imported from where it
+// is defined rather than forced into `transcript`'s re-export list as a dead name. That explicit
+// import is also the whole of what this file needs, so the module glob it used to rely on is gone.
+use crate::transcript::tool_args::js_number;
 
 #[test]
 fn js_number_matches_ecmascript_number_to_string() {
