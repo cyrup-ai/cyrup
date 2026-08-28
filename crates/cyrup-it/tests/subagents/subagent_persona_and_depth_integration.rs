@@ -164,6 +164,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
         default_context: None,
         memory: None,
         tool_budget: None,
+        runner: None, // SUBA-074: the native child, as before
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reviewer".to_string(), reviewer);
@@ -178,6 +179,7 @@ async fn chain_step_dispatches_the_real_named_persona_reaching_the_child_with_it
 
     let config = RunnerConfig {
         turn_budget: None,
+        permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -343,6 +345,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
         default_context: None,
         memory: None,
         tool_budget: None,
+        runner: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("worker".to_string(), worker);
@@ -357,6 +360,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 
     let config = RunnerConfig {
         turn_budget: None,
+        permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -426,6 +430,7 @@ async fn chain_step_task_placeholder_resolves_to_the_configs_original_task() {
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
         turn_budget: None,
+        permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -491,6 +496,7 @@ fn depth_echo_agent(model: &str, depth: DepthEnvelope, max_subagent_depth: Optio
         max_subagent_depth,
         memory: None,
         tool_budget: None,
+        runner: None,
         depth,
     }
 }
@@ -637,6 +643,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
             default_context: None,
             memory: None,
             tool_budget: None,
+            runner: None,
         },
     );
 
@@ -653,6 +660,7 @@ async fn deep_chain_at_the_ceiling_trips_the_guard_and_spawns_no_further_child()
     // increment has walked the inherited depth up to the ceiling across successive spawns.
     let config = RunnerConfig {
         turn_budget: None,
+        permission_rules: None,
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
@@ -778,6 +786,7 @@ async fn a_step_with_output_writes_the_file_and_returns_the_saved_output_referen
         default_context: None,
         memory: None,
         tool_budget: None,
+        runner: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reporter".to_string(), reporter);
@@ -910,6 +919,7 @@ async fn chain_wide_timeout_ms_reaches_the_real_child_and_terminates_it() {
         default_context: None,
         memory: None,
         tool_budget: None,
+        runner: None,
     };
     let mut resolved_agents = BTreeMap::new();
     resolved_agents.insert("reporter".to_string(), reporter);
@@ -1037,6 +1047,7 @@ async fn spawn_background_steps_bakes_the_configured_dynamic_fanout_max_items_in
             dir.path(),
             BackgroundStepsSpec {
                 turn_budget: None,
+                permission_rules: None,
                 // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
                 // call that does not ask for one runs unbudgeted. This fixture asks for none.
                 usage_budget: None,
@@ -1134,6 +1145,7 @@ fn acceptance_persona(name: &str) -> ResolvedAgentPersona {
         default_context: None,
         memory: None,
         tool_budget: None,
+        runner: None,
     }
 }
 

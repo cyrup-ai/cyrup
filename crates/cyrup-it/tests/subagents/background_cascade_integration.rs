@@ -83,6 +83,7 @@ fn persona(name: &str) -> ResolvedAgentPersona {
         default_context: None,
         memory: None,
         tool_budget: None,
+        runner: None, // SUBA-074: the native child, as before
     }
 }
 
@@ -202,6 +203,7 @@ async fn build_run(dir: &Path, temp_root: &Path, run_token: &str, child_id: &str
 
     let config = RunnerConfig {
         turn_budget: None,
+        permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,

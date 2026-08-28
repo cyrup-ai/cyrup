@@ -96,6 +96,7 @@ fn reporter_persona() -> ResolvedAgentPersona {
         default_context: None,
         memory: None,
         tool_budget: None,
+        runner: None, // SUBA-074: the native child, as before
     }
 }
 

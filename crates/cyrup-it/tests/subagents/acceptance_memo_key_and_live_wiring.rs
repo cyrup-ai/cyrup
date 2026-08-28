@@ -799,6 +799,7 @@ fn fixture_persona(name: &str) -> ResolvedAgentPersona {
         default_context: None,
         memory: None,
         tool_budget: None,
+        runner: None, // SUBA-074: the native child, as before
     }
 }
 
@@ -833,6 +834,7 @@ fn runner_config(
 ) -> RunnerConfig {
     RunnerConfig {
         turn_budget: None,
+        permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
