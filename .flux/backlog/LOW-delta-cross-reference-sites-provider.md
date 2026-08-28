@@ -1,5 +1,5 @@
 ---
-title: Cross-reference CYRUP-DELTA sites (bookkeeping only)
+title: Cross-reference delta sites (cyrup-provider)
 priority: LOW
 source: CYRUP-DELTA classification audit (workflow wf_12c49023-adf)
 stage: new
@@ -7,11 +7,11 @@ status: pending
 updated: 2026-08-28
 ---
 
-# Cross-reference delta sites
+# Cross-reference delta sites (cyrup-provider)
 
-6 of the 31 capability-gap markers are cross-references to another site's
-gap, listed by the audit so the count stayed honest. They need no independent fix —
-they resolve when their parent does.
+6 of the 31 capability-gap markers are cross-references to another site's gap,
+listed by the audit so the count stayed honest. They need no independent fix — they
+resolve when their parent does. Out-of-scope half — unrequested findings.
 
 - `crates/cyrup-provider/src/api/openai_responses/params.rs:143`
   - Same observable as compat.rs:781 (cross-reference, same underlying gap, listed so the count stays honest). The same gate is applied in `api/azure_openai_responses.rs` and `api/openai_codex_responses/r

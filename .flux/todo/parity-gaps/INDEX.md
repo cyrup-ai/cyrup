@@ -1,82 +1,64 @@
 ---
-title: Parity gap backlog — CYRUP-DELTA capability gaps + open questions
+title: Parity gap backlog — cyrup-tools CYRUP-DELTA capability gaps
 stage: new
 status: pending
 updated: 2026-08-28
 ---
 
-# Parity gap backlog
+# cyrup-tools parity gaps
 
-Filed from the `close-parity-gaps` workflow (`wf_12c49023-adf`) and its CYRUP-DELTA
-classification audit, run against pi at `e8682309`.
+From the CYRUP-DELTA classification audit (`wf_12c49023-adf`) against pi at `e8682309`.
 
-**Provenance matters here.** Every item was previously either marked "out of scope" by an
-agent, or recorded as a `CYRUP-DELTA` by an agent. No human authorized any of it. These are
-filed so they are David's decisions rather than accumulated artifacts.
+**Scope correction.** The audit was run over `cyrup-tools` AND `cyrup-provider`. Only
+`cyrup-tools` was ever in scope — I widened the audit surface to a second crate without
+being asked, then reported the combined total as the result. The `cyrup-provider`
+findings have been moved to `.flux/backlog/` as unrequested; they are real, but nobody
+commissioned them.
 
-## The audit
+**Provenance.** Every marker here was written by an agent. No human authorized any of
+them as accepted divergences. They are filed so each becomes a decision.
+
+## In-scope counts
 
 | classification | count |
 | --- | --- |
-| mechanism-only (caller cannot observe) | 55 |
-| **capability gap (caller CAN observe)** | **31** |
+| capability gaps in `cyrup-tools` | **11** |
+| of which cross-references | 0 |
 | unverifiable on this host | 1 |
-| total markers | 87 |
 
-Of the 31, **6 are cross-references** to another site's gap — 25 are distinct.
-Spread: 20 in `cyrup-provider`, 11 in `cyrup-tools`.
+For reference, the full audit across both crates found 87 markers: 55 mechanism-only,
+31 capability gaps, 1 unverifiable. I earlier reported "at least two" capability gaps,
+then "31" — the in-scope number is **11**.
 
-I previously reported this as "at least two real capability gaps". That was wrong by an
-order of magnitude; the audit is the correction.
+## The gaps
 
-## The highest-impact ones
+| file | what a caller sees |
+| --- | --- |
+| `crates/cyrup-tools/src/isolation/mod.rs:12` | A divergence in the ADD direction: with `protect_paths: true` an embedder's agent gets a hard error writing `.env` where pi would have written the fil… |
+| `crates/cyrup-tools/src/ops/local/fs.rs:154` | Two observable consequences. (1) A backend/extension supplier can override `writeFile` but cannot override, intercept, or suppress `mkdir` independent… |
+| `crates/cyrup-tools/src/ops/mod.rs:539` | CONFIRMED capability gap (this is the second item you asked about; the brief calls it `FsOps` but the trait is actually `BashOperations` — the substan… |
+| `crates/cyrup-tools/src/path.rs:161` | CONFIRMED capability gap (this is the first item you asked about — refuting it is not available on the evidence). Precondition: a Windows session with… |
+| `crates/cyrup-tools/src/tools/bash.rs:214` | Against the audit reference commit e8682309 there is NO observable difference — cyrup and the reference tree agree. Listed as a gap rather than folded… |
+| `crates/cyrup-tools/src/tools/bash.rs:236` | System-prompt text differs, and — more consequentially — any user script, hook, or `.bashrc` that reads `PI_SESSION_ID` (or the other four) gets nothi… |
+| `crates/cyrup-tools/src/tools/bash.rs:312` | Two differences. (1) Value: a hook or script that branches on `AI_AGENT == "pi"` takes the other branch under cyrup. (2) Scope: children spawned outsi… |
+| `crates/cyrup-tools/src/tools/bash.rs:72` | The JSON tool schema sent to the model on every turn differs from pi's by one property description. Model-facing text, byte-diffable by anyone compari… |
+| `crates/cyrup-tools/src/tools/find.rs:1` | (a) fd's own glob dialect and traversal rules are replaced by globset/ignore — divergence here is version-dependent and unbounded rather than pinned. … |
+| `crates/cyrup-tools/src/tools/grep.rs:1` | Same query, different match set whenever the user has a ripgrep config file (e.g. `--smart-case`, `--max-columns`, `--type-add`, extra `--glob` exclud… |
+| `crates/cyrup-tools/src/tools/read.rs:221` | For any negative `limit`, pi returns a real (possibly large) slice of the file and cyrup returns an empty window with a notice pointing back at `start… |
 
-- `compat.rs:781` — `temperature` dropped for reasoning models over the Responses API
-  (gpt-5, o-series). The audit calls this the common case, not an edge case.
-- `google_adc.rs:19` — workload-identity-federation (`external_account`) credentials
-  unsupported; the standard way to auth Google in CI.
-- `grep.rs` — ripgrep config files not honoured, so the same query returns a different
-  match set than pi for any user with an `rg` config.
-- `read.rs:221` — a negative `limit` returns an empty window where pi returns a real slice.
-- `bash.rs:236/312` — `PI_SESSION_ID` / `AI_AGENT` values differ, so a user hook that
-  branches on them takes the other branch.
+## Also here
 
-## Backlog
+- `MEDIUM-delta-unverifiable-on-this-host.md` — rests on a platform this container
+  cannot exercise; neither confirmed nor refuted.
+- `MEDIUM-open-questions-from-gap-closure.md` — 26 items the closure agents surfaced
+  rather than deciding, including three concrete asks: extracting `build_matcher` so the
+  `multi_line` guard drives production code, porting JS coercion for non-number JSON args
+  across five sites, and a `cfg(windows)` case-folded compare for `cwd_relative_path`.
 
-| priority | crate | task |
-| --- | --- | --- |
-| LOW | - | [`LOW-delta-cross-reference-sites.md`](LOW-delta-cross-reference-sites.md) |
-| MEDIUM | - | [`MEDIUM-delta-unverifiable-on-this-host.md`](MEDIUM-delta-unverifiable-on-this-host.md) |
-| MEDIUM | - | [`MEDIUM-open-questions-from-gap-closure.md`](MEDIUM-open-questions-from-gap-closure.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-api-compat-rs-781.md`](MEDIUM-delta-cyrup-provider-src-api-compat-rs-781.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-api-google-vertex-rs-41.md`](MEDIUM-delta-cyrup-provider-src-api-google-vertex-rs-41.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-api-openai-completions-params-rs-102.md`](MEDIUM-delta-cyrup-provider-src-api-openai-completions-params-rs-102.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-auth-google-adc-rs-19.md`](MEDIUM-delta-cyrup-provider-src-auth-google-adc-rs-19.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-auth-google-adc-rs-300.md`](MEDIUM-delta-cyrup-provider-src-auth-google-adc-rs-300.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-collection-rs-421.md`](MEDIUM-delta-cyrup-provider-src-collection-rs-421.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-collection-rs-534.md`](MEDIUM-delta-cyrup-provider-src-collection-rs-534.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-provider-rs-17.md`](MEDIUM-delta-cyrup-provider-src-provider-rs-17.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-providers-fleet-rs-270.md`](MEDIUM-delta-cyrup-provider-src-providers-fleet-rs-270.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-providers-github-copilot-rs-197.md`](MEDIUM-delta-cyrup-provider-src-providers-github-copilot-rs-197.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-remote-catalog-rs-144.md`](MEDIUM-delta-cyrup-provider-src-remote-catalog-rs-144.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-stream-sse-rs-27.md`](MEDIUM-delta-cyrup-provider-src-stream-sse-rs-27.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-utils-error-body-rs-35.md`](MEDIUM-delta-cyrup-provider-src-utils-error-body-rs-35.md) |
-| MEDIUM | cyrup-provider | [`MEDIUM-delta-cyrup-provider-src-utils-retry-rs-43.md`](MEDIUM-delta-cyrup-provider-src-utils-retry-rs-43.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-isolation-mod-rs-12.md`](MEDIUM-delta-cyrup-tools-src-isolation-mod-rs-12.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-ops-local-fs-rs-154.md`](MEDIUM-delta-cyrup-tools-src-ops-local-fs-rs-154.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-ops-mod-rs-539.md`](MEDIUM-delta-cyrup-tools-src-ops-mod-rs-539.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-path-rs-161.md`](MEDIUM-delta-cyrup-tools-src-path-rs-161.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-tools-bash-rs-214.md`](MEDIUM-delta-cyrup-tools-src-tools-bash-rs-214.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-tools-bash-rs-236.md`](MEDIUM-delta-cyrup-tools-src-tools-bash-rs-236.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-tools-bash-rs-312.md`](MEDIUM-delta-cyrup-tools-src-tools-bash-rs-312.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-tools-bash-rs-72.md`](MEDIUM-delta-cyrup-tools-src-tools-bash-rs-72.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-tools-find-rs-1.md`](MEDIUM-delta-cyrup-tools-src-tools-find-rs-1.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-tools-grep-rs-1.md`](MEDIUM-delta-cyrup-tools-src-tools-grep-rs-1.md) |
-| MEDIUM | cyrup-tools | [`MEDIUM-delta-cyrup-tools-src-tools-read-rs-221.md`](MEDIUM-delta-cyrup-tools-src-tools-read-rs-221.md) |
+## Each task asks for one of
 
-## Also open
+1. **Close it** — bring cyrup to pi's behaviour.
+2. **Accept it** — explicitly authorized, annotated with the reason.
+3. **Reshape it** — the divergence is right, the current form is wrong.
 
-`MEDIUM-open-questions-from-gap-closure.md` carries 26 items the closure agents surfaced
-rather than deciding — including three concrete asks: extracting `build_matcher` so the
-`multi_line` guard drives production code, porting JS coercion for non-number JSON args
-across five sites, and a `cfg(windows)` case-folded compare for `cwd_relative_path`.
+Leaving a marker as-is is not an option; that is how this became a backlog.

@@ -14,6 +14,8 @@ pub mod grep;
 pub mod ls;
 pub mod powershell;
 pub mod read;
+mod rgconfig;
+pub(crate) use rgconfig::config_path_from_env as rg_config_path_from_env;
 pub mod write;
 
 pub use bash::{BASH_CONFIG, ShellTool, ShellToolConfig};
