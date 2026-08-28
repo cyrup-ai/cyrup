@@ -241,7 +241,7 @@ pub(super) fn render_bash(
         StrArg::Value(cmd) => spans.push(Span::styled(format!("{prompt} {cmd}"), title)),
     }
     if let Some(t) = run.args.get("timeout").and_then(Value::as_f64).filter(|t| *t != 0.0) {
-        // `${timeout}s` (bash.ts:204) — the same `String(n)` fold the read range uses; the `±0`
+        // `${timeout}s` (bash.ts:241) — the same `String(n)` fold the read range uses; the `±0`
         // case `js_number` handles is already excluded by the filter above.
         spans.push(Span::styled(format!(" (timeout {}s)", js_number(t)), theme.muted_style()));
     }
@@ -334,8 +334,14 @@ pub(super) fn render_grep(
     if let StrArg::Value(glob) = str_arg(&run.args, &["glob"]) {
         spans.push(Span::styled(format!(" ({glob})"), outp));
     }
-    if let Some(limit) = run.args.get("limit").and_then(Value::as_i64) {
-        spans.push(Span::styled(format!(" limit {limit}"), outp));
+    // `if (limit !== undefined) text += theme.fg("toolOutput", ` limit ${limit}`)` (grep.ts:81/89,
+    // `formatGrepCall`). A PRESENCE test, not the truthiness test `formatShellCall` applies to
+    // `timeout` — so `limit: 0` renders. And `JSON.parse` yields the same double for `50` and
+    // `50.0`, so [`Value::as_f64`] — `Some` for `Number::PosInt`, `NegInt` and `Float` alike — is
+    // the extractor, not `as_i64`, which answers `None` for every float and dropped the whole
+    // suffix. `js_number` is the `String(n)` fold the template literal applies.
+    if let Some(limit) = run.args.get("limit").and_then(Value::as_f64) {
+        spans.push(Span::styled(format!(" limit {}", js_number(limit)), outp));
     }
     out.push(Line::from(spans));
     push_list_output(run, expanded, 15, theme, expand_key, out);
@@ -361,8 +367,11 @@ pub(super) fn render_find(
     }
     spans.push(Span::styled(" in ".to_string(), outp));
     push_search_path(&run.args, theme, &mut spans);
-    if let Some(limit) = run.args.get("limit").and_then(Value::as_i64) {
-        spans.push(Span::styled(format!(" (limit {limit})"), outp));
+    // `if (limit !== undefined) { text += theme.fg("toolOutput", ` (limit ${limit})`); }`
+    // (find.ts:77/84-86, `formatFindCall`) — the same presence test and the same `String(n)` fold
+    // as `render_grep`; only the parentheses differ.
+    if let Some(limit) = run.args.get("limit").and_then(Value::as_f64) {
+        spans.push(Span::styled(format!(" (limit {})", js_number(limit)), outp));
     }
     out.push(Line::from(spans));
     push_list_output(run, expanded, 20, theme, expand_key, out);
@@ -380,8 +389,10 @@ pub(super) fn render_ls(
 ) {
     let mut spans = vec![Span::styled("ls ".to_string(), theme.tool_title_style())];
     spans.push(tool_path_span(&run.args, &["path"], Some("."), theme, opts));
-    if let Some(limit) = run.args.get("limit").and_then(Value::as_i64) {
-        spans.push(Span::styled(format!(" (limit {limit})"), theme.tool_output_style()));
+    // `if (limit !== undefined) { text += theme.fg("toolOutput", ` (limit ${limit})`); }`
+    // (ls.ts:58/61-63, `formatLsCall`).
+    if let Some(limit) = run.args.get("limit").and_then(Value::as_f64) {
+        spans.push(Span::styled(format!(" (limit {})", js_number(limit)), theme.tool_output_style()));
     }
     out.push(Line::from(spans));
     push_list_output(run, expanded, 20, theme, opts.expand_key, out);

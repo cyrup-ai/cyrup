@@ -40,27 +40,65 @@ struct GrepInput {
 ///
 /// 1. The inner message is `grep_regex::Error`'s own `Display`. cyrup links the same crate, so it
 ///    is already byte-identical: `the literal "\n" is not allowed in a regex` for
-///    `ErrorKind::NotAllowed` (grep-regex-0.1.14 `src/error.rs:75-77`), and the same
+///    `ErrorKind::NotAllowed`, `pattern contains "\0" but it is impossible to match` for
+///    `ErrorKind::Banned` (grep-regex-0.1.14 `src/error.rs:69-93`), and the same
 ///    `regex parse error: …` block — `(?:…)` wrapper included, since grep-regex wraps every
 ///    pattern that way (`src/config.rs:183-188`) — for a syntax error.
-/// 2. ripgrep appends a two-line multiline hint, gated on the message text itself and on nothing
-///    else (`suggest_multiline`, ripgrep 14.1.0 `crates/core/flags/hiargs.rs:1437-1448`). The
-///    condition below is that predicate verbatim.
+/// 2. ripgrep runs the message through THREE hint filters, each gated on the message text itself
+///    and on nothing else, composed as `suggest_other_engine(suggest_text(suggest_multiline(msg)))`
+///    (ripgrep 14.1.0 `crates/core/flags/hiargs.rs:505-510` for the inner two, `:366-373` for the
+///    outer one). The three predicates below are those verbatim
+///    (`hiargs.rs:1412-1462`). `suggest_other_engine` is `cfg!(feature = "pcre2")`-gated in
+///    ripgrep, and it IS reachable from Pi: Pi downloads the official `BurntSushi/ripgrep` release
+///    asset (tools-manager.ts:50-70), which release CI builds with `--features pcre2`
+///    (`.github/workflows/release.yml`, `cargo build --release --features pcre2`).
 /// 3. ripgrep prefixes every top-level error with `rg: ` (`crates/core/messages.rs:50`, reached
 ///    from `eprintln_locked!("{:#}", err)` at `crates/core/main.rs:62`).
-///
-/// ripgrep's sibling `suggest_text` hint (`hiargs.rs:1451-1462`) is deliberately NOT reproduced:
-/// it fires only on `ban_byte(Some(b'\x00'))`, which this matcher does not set.
 fn rg_pattern_error(err: &grep_regex::Error) -> String {
-    let msg = err.to_string();
+    let msg = suggest_other_engine(suggest_text(suggest_multiline(err.to_string())));
+    format!("rg: {msg}")
+}
+
+/// ripgrep `hiargs.rs:1437-1448`, verbatim.
+fn suggest_multiline(msg: String) -> String {
     if msg.contains("the literal") && msg.contains("not allowed") {
         format!(
-            "rg: {msg}\n\n\
+            "{msg}\n\n\
              Consider enabling multiline mode with the --multiline flag (or -U for short).\n\
              When multiline mode is enabled, new line characters can be matched."
         )
     } else {
-        format!("rg: {msg}")
+        msg
+    }
+}
+
+/// ripgrep `hiargs.rs:1451-1462`, verbatim. Reachable only because the matcher below sets
+/// `ban_byte(Some(b'\x00'))`, exactly as ripgrep does for Pi's flag set.
+fn suggest_text(msg: String) -> String {
+    if msg.contains("pattern contains \"\\0\"") {
+        format!(
+            "{msg}\n\n\
+             Consider enabling text mode with the --text flag (or -a for short). Otherwise,\n\
+             binary detection is enabled and matching a NUL byte is impossible."
+        )
+    } else {
+        msg
+    }
+}
+
+/// ripgrep `suggest_other_engine` + `suggest_pcre2` (`hiargs.rs:1412-1431`), flattened: the outer
+/// function only forwards, and the `cfg!(feature = "pcre2")` guard is always true for the binaries
+/// Pi runs (see [`rg_pattern_error`]). Fires on a Rust-engine refusal of a backreference or a
+/// look-around — reachable today, with no other setting required.
+fn suggest_other_engine(msg: String) -> String {
+    if msg.contains("backreferences") || msg.contains("look-around") {
+        format!(
+            "{msg}\n\n\
+             Consider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\n\
+             and look-around."
+        )
+    } else {
+        msg
     }
 }
 
@@ -441,10 +479,48 @@ impl Tool for GrepTool {
         // with `MismatchedLineTerminators` unless the two agree (grep-searcher-0.1.16
         // `src/searcher/mod.rs:805-821`). The searcher's default is `\n`
         // (`mod.rs:190` → grep-matcher-0.1.8 `src/lib.rs:268-273`) and is not overridden below.
+        //
+        // `multi_line(true)` is grep-regex's `(?m)` flag, NOT ripgrep's `-U/--multiline`: ripgrep
+        // sets it UNCONDITIONALLY on the Rust-engine matcher (`hiargs.rs:461-465`), while `-U`
+        // drives a different pair of knobs (`line_terminator(None)` / `dot_matches_new_line`,
+        // `hiargs.rs:477-495`) and the SEARCHER's `multi_line` (`hiargs.rs:715`). Pi passes no
+        // `-U` (grep.ts:220-224), so the searcher built in `search_one` keeps grep-searcher's
+        // `multi_line: false` default and stays line-oriented — matcher and searcher are not the
+        // same setting and do not need to agree here.
+        //
+        // What it buys: with `(?m)` OFF, `^`/`$` translate to the HAYSTACK anchors
+        // `Look::Start`/`Look::End`, and `ConfiguredHIR::line_terminator` then reports `None`
+        // rather than `\n` for any such pattern — `contains_anchor_haystack()`, grep-regex
+        // `src/config.rs:296-302`. A matcher that reports no line terminator fails
+        // `Core::is_line_by_line_fast` (grep-searcher-0.1.16 `src/searcher/core.rs:673-706`), so
+        // every `^…`/`…$` search silently fell off the fast line searcher onto the slow one and
+        // ran the full regex against every line of every candidate instead of letting the literal
+        // prefilter skip whole buffers. Output was identical either way — the slow path strips the
+        // terminator before matching (`core.rs:99-107`, `:347-351`), which makes `Look::End`
+        // behave like `(?m:$)` on a line — so this is ripgrep's engine path, restored, not a
+        // change to what the caller sees.
+        //
+        // `ban_byte(Some(b'\x00'))` is ripgrep's `hiargs.rs:502-504`, gated on
+        // `!BinaryDetection::is_none()`. That predicate is `explicit == none && implicit == none`
+        // (`hiargs.rs:1159-1164`), so cyrup's deliberately-`none()` EXPLICIT mode (see
+        // `search_one`) does not switch it off: the implicit mode is `quit(b'\x00')`, so the ban
+        // is on, exactly as it is for Pi. It refuses at BUILD time any pattern whose HIR must
+        // match a NUL (`ban::check`, grep-regex `src/ban.rs:8-53`, called from
+        // `config.rs:210-212` — before the line-terminator strip, so a pattern holding both a NUL
+        // and a `\n` reports the NUL). Without it `grep pattern:"\\x00"` compiled happily and
+        // then reported "No matches found", because binary detection had already ended the file at
+        // the first NUL — a confident false negative where rg exits 2 with an actionable error.
+        //
+        // Note the asymmetry `ban::check` inherits from its call site: it runs only on the parsed
+        // branch, and only for a class of exactly one element. So `[\x00-\x01]` still builds, and
+        // under `literal: true` the pattern is `regex_syntax::escape`d into ordinary backslash-x-0-0
+        // characters that hold no NUL at all — rg exits 1 there, and so does this.
         let matcher = RegexMatcherBuilder::new()
+            .multi_line(true)
             .case_insensitive(input.ignore_case.unwrap_or(false))
             .fixed_strings(input.literal.unwrap_or(false))
             .line_terminator(Some(b'\n'))
+            .ban_byte(Some(b'\x00'))
             .build(&input.pattern)
             .map_err(|e| error::invalid(rg_pattern_error(&e)))?;
 
@@ -1340,6 +1416,144 @@ mod tests {
         assert!(
             !touched.load(Ordering::SeqCst),
             "matcher refusal must precede the first walk/read"
+        );
+    }
+
+    /// `foo$` — the plainest thing a caller writes, and the one the matcher's `(?m)` flag exists
+    /// for. Verified against ripgrep 14.1.0 driven with Pi's own argv on this exact fixture
+    /// (`rg --json --line-number --color=never --hidden -- 'foo$' .` reports a.txt:2 and a.txt:3).
+    #[tokio::test]
+    async fn dollar_anchors_at_the_end_of_every_line() {
+        let dir = anchor_fixture();
+        let rows = grep_rows(dir.path(), serde_json::json!({ "pattern": "foo$" })).await;
+        assert_eq!(rows, vec!["a.txt:2: foo", "a.txt:3: bar foo"]);
+    }
+
+    /// The `^` half. rg 14.1.0 on this fixture: a.txt:2 and a.txt:4.
+    #[tokio::test]
+    async fn caret_anchors_at_the_start_of_every_line() {
+        let dir = anchor_fixture();
+        let rows = grep_rows(dir.path(), serde_json::json!({ "pattern": "^foo" })).await;
+        assert_eq!(rows, vec!["a.txt:2: foo", "a.txt:4: foobar"]);
+    }
+
+    /// An anchor-only pattern with no extractable literal, over an empty line — the case that
+    /// separates "anchored to the haystack" from "anchored to the line" most visibly. rg 14.1.0
+    /// reports every non-empty line for `.$` and only the empty one for `^$`.
+    #[tokio::test]
+    async fn anchors_without_literals_stay_line_relative() {
+        let dir = anchor_fixture();
+        let dollar = grep_rows(dir.path(), serde_json::json!({ "pattern": ".$" })).await;
+        assert_eq!(
+            dollar,
+            vec![
+                "a.txt:1: alpha",
+                "a.txt:2: foo",
+                "a.txt:3: bar foo",
+                "a.txt:4: foobar",
+                "e.txt:1: x",
+                "e.txt:3: y",
+            ]
+        );
+        let empty = grep_rows(dir.path(), serde_json::json!({ "pattern": "^$" })).await;
+        assert_eq!(empty, vec!["e.txt:2: "]);
+    }
+
+    fn anchor_fixture() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "alpha\nfoo\nbar foo\nfoobar\n").unwrap();
+        std::fs::write(dir.path().join("e.txt"), "x\n\ny\n").unwrap();
+        dir
+    }
+
+    /// The four-line block `rg` writes to stderr for a pattern that must match a NUL, captured
+    /// from ripgrep 14.1.0 driven with Pi's own argv (`rg --json --line-number --color=never
+    /// --hidden -- '\x00' .`, exit 2). Same rejection path as [`RG_NEWLINE_ERROR`].
+    const RG_NUL_ERROR: &str = concat!(
+        "rg: pattern contains \"\\0\" but it is impossible to match\n",
+        "\n",
+        "Consider enabling text mode with the --text flag (or -a for short). Otherwise,\n",
+        "binary detection is enabled and matching a NUL byte is impossible.",
+    );
+
+    /// Every spelling of a NUL that survives into the HIR is refused at build time. Without
+    /// `ban_byte` the pattern compiled and then reported "No matches found", because binary
+    /// detection had already ended the file at the first NUL.
+    #[tokio::test]
+    async fn nul_in_pattern_is_refused_with_ripgreps_message() {
+        let dir = anchor_fixture();
+        for pattern in ["\\x00", "[\\x00]", "\\x{0}"] {
+            let msg = grep_err(dir.path(), serde_json::json!({ "pattern": pattern })).await;
+            assert_eq!(msg, RG_NUL_ERROR, "pattern {pattern}");
+        }
+    }
+
+    /// `ban::check` only refuses a class of exactly ONE element (grep-regex `src/ban.rs:19-37`),
+    /// so widening it past the NUL builds and simply does not match. rg 14.1.0 exits 1 here.
+    #[tokio::test]
+    async fn nul_inside_a_wider_class_is_not_banned() {
+        let dir = anchor_fixture();
+        let text = grep_text(
+            dir.path(),
+            serde_json::json!({ "pattern": "a[\\x00-\\x01]" }),
+        )
+        .await;
+        assert_eq!(text, "No matches found");
+    }
+
+    /// Under `literal: true` the pattern is `regex_syntax::escape`d (grep-regex
+    /// `src/config.rs:184-185`), so `\x00` is four ordinary characters holding no NUL and the ban
+    /// never sees one. rg 14.1.0 exits 1 for `-F -- '\x00'` too.
+    #[tokio::test]
+    async fn nul_escape_under_fixed_strings_is_an_ordinary_literal() {
+        let dir = anchor_fixture();
+        let text = grep_text(
+            dir.path(),
+            serde_json::json!({ "pattern": "\\x00", "literal": true }),
+        )
+        .await;
+        assert_eq!(text, "No matches found");
+    }
+
+    /// The third hint filter. Pi runs an official ripgrep build, which is compiled with
+    /// `--features pcre2`, so a Rust-engine refusal of a look-around or a backreference carries
+    /// ripgrep's PCRE2 suggestion. Both blocks captured from rg 14.1.0, exit 2.
+    #[tokio::test]
+    async fn lookaround_and_backreferences_carry_ripgreps_pcre2_hint() {
+        let dir = anchor_fixture();
+        let hint = concat!(
+            "\n\nConsider enabling PCRE2 with the --pcre2 flag, which can handle backreferences\n",
+            "and look-around.",
+        );
+
+        let msg = grep_err(dir.path(), serde_json::json!({ "pattern": "(?=foo)" })).await;
+        assert_eq!(
+            msg,
+            format!(
+                concat!(
+                    "rg: regex parse error:\n",
+                    "    (?:(?=foo))\n",
+                    "       ^^^\n",
+                    "error: look-around, including look-ahead and look-behind, is not supported",
+                    "{}"
+                ),
+                hint
+            )
+        );
+
+        let msg = grep_err(dir.path(), serde_json::json!({ "pattern": "\\0" })).await;
+        assert_eq!(
+            msg,
+            format!(
+                concat!(
+                    "rg: regex parse error:\n",
+                    "    (?:\\0)\n",
+                    "       ^^\n",
+                    "error: backreferences are not supported",
+                    "{}"
+                ),
+                hint
+            )
         );
     }
 }

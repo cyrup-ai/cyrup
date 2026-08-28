@@ -31,9 +31,6 @@ pub static POWERSHELL_CONFIG: ShellToolConfig = ShellToolConfig {
     name: "powershell",
     label: "powershell",
     shell_name: "PowerShell",
-    // v0.84.3 `bashSchema` (bash.ts:43) — the tag `powershell` exists at. See the
-    // `command_description` CYRUP-DELTA on `ShellToolConfig`.
-    command_description: "Shell command to execute",
     // powershell.ts:19.
     prompt_snippet: "Execute PowerShell commands",
     // powershell.ts:20, with the same `PI_*` → `CYRUP_*` divergence the bash guideline documents:

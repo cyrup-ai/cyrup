@@ -20,10 +20,13 @@
 //! complete, so the poll returns `Pending` from inside `guard` and the counter is sampled
 //! mid-`guard`. The hog is the mechanism that holds the poll still; it is not what is observed.
 //!
-//! An earlier version observed the process-global `MUTATION_REGISTRATION` chain instead
-//! (`lock::registration_is_held`). Every `write`/`edit` in this lib binary takes that static, so
+//! An earlier version observed the process-global `MUTATION_REGISTRATION` chain instead, through a
+//! `try_lock` helper in `lock.rs`. Every `write`/`edit` in this lib binary takes that static, so
 //! the assertion could read "held" because of a sibling test and it degraded to 2/3 detection
-//! under the full suite rather than failing. Hence the per-instance counter.
+//! under the full suite rather than failing. Hence the per-instance counter. That helper no longer
+//! exists: `lock::tests::the_registration_chain_spans_key_resolution` was its last consumer and
+//! now proves the chain's span with `FileMutationLocks::key_resolutions`, a per-instance counter of
+//! its own.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

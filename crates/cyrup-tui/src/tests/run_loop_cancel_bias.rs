@@ -9,8 +9,9 @@
 //! drawn frame, one more applied agent event after `cancel` fired. It terminates quickly in
 //! expectation, but nothing in the code bounds how much runs after cancellation, and shutdown
 //! ordering is the one thing the token exists to define. The codebase already treats this as
-//! mandatory elsewhere — `cyrup-tools/src/lock.rs:178` calls `biased;` "REQUIRED, not a
-//! micro-optimisation", and every `select!` in `cyrup-ext/src/host/live.rs` carries it.
+//! mandatory elsewhere — `KeyedAcquire::wait` (`cyrup-core/src/keyed_lock.rs`) uses `biased;`
+//! so its cancel arm wins even when the lock is free, and every `select!` in
+//! `cyrup-ext/src/host/live.rs` carries it.
 //!
 //! # Why this test reads the source
 //!

@@ -8,7 +8,7 @@
 //! Keying is the caller's job too, and it is the caller's whole job: this module hashes the key it
 //! is handed and nothing else, so two keys naming one entity are two locks. A path-keyed domain
 //! must therefore reduce every spelling it can be handed to a single form BEFORE calling
-//! [`KeyedLocks::guard`] — and it must choose WHICH form, because this module never touches the
+//! [`KeyedLocks::enqueue`] or [`KeyedLocks::guard`] — and it must choose WHICH form, because this module never touches the
 //! filesystem (see the crate docs: no I/O) and so cannot choose for it. The two in-tree domains
 //! choose differently, on purpose: `cyrup-tools`' `FileMutationLocks` realpaths, because its
 //! upstream `getMutationQueueKey` does; `cyrup-config`'s `FileLock` resolves lexically, because its
@@ -27,8 +27,9 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 /// The map one lock domain is built over.
 ///
 /// Opaque on purpose. This module's whole safety argument is "for any live key there is exactly
-/// one `Arc<Mutex<()>>`, minted only by [`KeyedLocks::guard`] and evicted only while the map holds
-/// the last reference to it". A bare `Arc<DashMap<..>>` alias hands every owner `insert`,
+/// one `Arc<Mutex<()>>`, minted only by [`KeyedLocks::enqueue`] — and therefore also by
+/// [`KeyedLocks::guard`], which is `enqueue` followed by [`KeyedAcquire::wait`] — and evicted only
+/// while the map holds the last reference to it". A bare `Arc<DashMap<..>>` alias hands every owner `insert`,
 /// `remove`, `clear`, `alter` and `entry`, each of which can put a second live mutex behind one
 /// key and void mutual exclusion with no error to either party. The wrapper keeps every mutating
 /// operation inside this module — `get_or_insert` and `evict_if_unreferenced` below are the only
@@ -86,8 +87,8 @@ impl<K: Eq + Hash + Clone> KeyedLockMap<K> {
     /// path, and the one predicate both drop paths share.
     ///
     /// `remove_if` runs the predicate while holding the shard lock, so a concurrent
-    /// [`KeyedLocks::guard`] that has just cloned the `Arc` is observed (`strong_count > 1`) and
-    /// the entry is kept.
+    /// [`KeyedLocks::enqueue`] that has just cloned the `Arc` — reached directly or through
+    /// [`KeyedLocks::guard`] — is observed (`strong_count > 1`) and the entry is kept.
     fn evict_if_unreferenced(&self, key: &K) {
         self.0.remove_if(key, |_, v| Arc::strong_count(v) == 1);
     }
@@ -362,7 +363,7 @@ mod tests {
 
     /// The never-yield property, asserted directly rather than inferred from the source.
     ///
-    /// `FileMutationLocks::guard` (`cyrup-tools/src/lock.rs:215`) holds `MUTATION_REGISTRATION`
+    /// `FileMutationLocks::guard` (`cyrup-tools/src/lock.rs`) holds `MUTATION_REGISTRATION`
     /// across `enqueue(..).await`. A suspension there releases the registration chain BEFORE the
     /// queue place is claimed, which is the whole defect this task closed — and it would be
     /// silent: nothing panics, ordering just becomes a blocking-pool coin flip again. The HELD
@@ -384,7 +385,8 @@ mod tests {
         let Poll::Ready(queued) = poll_once(contended.as_mut()) else {
             panic!(
                 "`enqueue` suspended on a HELD lock. It must claim the place and return: the \
-                 caller's registration lock is held across this call (cyrup-tools/src/lock.rs:215)"
+                 caller's registration lock is held across this call \
+                 (`FileMutationLocks::guard`, cyrup-tools/src/lock.rs)"
             );
         };
         drop(queued);

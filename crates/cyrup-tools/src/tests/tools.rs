@@ -2682,7 +2682,6 @@ async fn the_utf8_preamble_goes_on_after_the_spawn_hook_and_only_once() {
         name: "powershell",
         label: "powershell",
         shell_name: "PowerShell",
-        command_description: "Shell command to execute",
         prompt_snippet: "Execute PowerShell commands",
         prompt_guidelines: &[],
         temp_file_prefix: "cyrup-powershell",

@@ -59,24 +59,14 @@ fn resolve_timeout_ms(timeout: Option<f64>) -> Result<Option<Duration>, ToolErro
 /// Everything that differs between `bash` and `powershell` lives here; [`ShellTool`] below is Pi's
 /// `createShellToolDefinition` (bash.ts:338-517) and is instantiated once per config.
 pub struct ShellToolConfig {
-    /// `config.name` (bash.ts:346).
+    /// `config.name` (bash.ts:348).
     pub name: &'static str,
-    /// `config.label` (bash.ts:347).
+    /// `config.label` (bash.ts:349).
     pub label: &'static str,
     /// `config.shellName` — interpolated into the tool description (bash.ts:350). It is ALSO the
     /// name the missing-cwd error uses (bash.ts:95); that copy travels on [`ShellConfig`] because
     /// cyrup raises the error in the process backend.
     pub shell_name: &'static str,
-    /// The `command` property's schema description.
-    ///
-    /// [CYRUP-DELTA — version lag, per-tool instead of shared] Pi shares ONE `bashSchema` between
-    /// both shell tools (bash.ts:42-45), and at v0.84.3 its text is `"Shell command to execute"`.
-    /// cyrup's ported baseline is v0.83.0, where `bash` alone existed and the text was
-    /// `"Bash command to execute"` — which cyrup still emits. Keeping that per-config rather than
-    /// shared lets `powershell` be byte-exact against the tag it is ported FROM without silently
-    /// rewriting a model-facing `bash` string that no other part of this task touches. A later
-    /// v0.84.x uplift collapses both to `"Shell command to execute"`.
-    pub command_description: &'static str,
     /// `config.promptSnippet` (bash.ts:351).
     pub prompt_snippet: &'static str,
     /// `config.promptGuidelines` (bash.ts:352), emitted only when
@@ -101,7 +91,6 @@ pub static BASH_CONFIG: ShellToolConfig = ShellToolConfig {
     name: "bash",
     label: "bash",
     shell_name: "bash",
-    command_description: "Bash command to execute",
     prompt_snippet: "Execute bash commands (ls, grep, find, etc.)",
     prompt_guidelines: &[
         "You can inspect CYRUP_* environment variables for current model and session details.",
@@ -139,12 +128,15 @@ impl ShellTool {
         opts: BashOpts,
     ) -> Self {
         // Byte-for-byte Pi's TypeBox emission (bash.ts:42-45): verbatim descriptions,
-        // `type:"number"`, no `minimum`, no `additionalProperties`.
+        // `type:"number"`, no `minimum`, no `additionalProperties`. ONE schema for BOTH shells,
+        // exactly as upstream hands the single `bashSchema` to `parameters` from the shared
+        // factory (bash.ts:353) — which is why the `command` description is a literal here and
+        // not a `ShellToolConfig` field.
         let params = serde_json::json!({
             "type": "object",
             "required": ["command"],
             "properties": {
-                "command": { "type": "string", "description": config.command_description },
+                "command": { "type": "string", "description": "Shell command to execute" },
                 "timeout": { "type": "number", "description": "Timeout in seconds (optional, no default timeout)" }
             }
         });

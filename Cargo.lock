@@ -1538,13 +1538,9 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
- "cyrup-config",
  "cyrup-core",
  "cyrup-ext",
  "cyrup-ext-subagents",
- "cyrup-provider",
- "cyrup-session-svc",
- "cyrup-test-support",
  "cyrup-tools",
  "getrandom 0.3.4",
  "notify",

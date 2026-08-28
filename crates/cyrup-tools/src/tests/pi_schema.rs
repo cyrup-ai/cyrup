@@ -11,15 +11,16 @@
 //!
 //! The `PI_*` constants below are the EXACT output of `JSON.stringify(<schema>)` for each tool's
 //! TypeBox `Type.Object(...)`, captured by running Pi's real schema definitions
-//! (`read.ts:20-24`, `bash.ts:24-27`, `grep.ts:24-36`, `find.ts:20-26`, `ls.ts:14-17`,
-//! `write.ts:14-17`, `edit.ts:33-53`) under Node with the `typebox` package vendored in the Pi
+//! (`read.ts:21-25`, `bash.ts:42-45`, `grep.ts:24-36`, `find.ts:29-35`, `ls.ts:14-17`,
+//! `write.ts:15-18`, `edit.ts:34-43` + `edit.ts:45-54`) under Node with the `typebox` package
+//! vendored in the Pi
 //! repo. They are ground truth, not a paraphrase.
 //!
 //! The audit (gap 04, UM-1) found the prior hand-written schemas diverged on: paraphrased
 //! descriptions, `type:"integer"` (Pi: `"number"`), added `minimum`, and `additionalProperties`
 //! present on 6 tools. That last one was under-corrected: it was left standing on `edit` (both
 //! levels) on the belief that `edit` alone opts in. It does not — `Type.Object(props, {})`
-//! (edit.ts:41,52) passes an EMPTY options object, so NO built-in emits the keyword. Comparing
+//! (edit.ts:42,53) passes an EMPTY options object, so NO built-in emits the keyword. Comparing
 //! parsed `serde_json::Value`s is the
 //! correct JSON byte-diff: two JSON documents are equal iff identical content, independent of the
 //! provider's key-ordering at serialize time.
@@ -55,11 +56,11 @@ fn locks() -> Arc<FileMutationLocks> {
 // --- Ground-truth Pi TypeBox JSON (verbatim `JSON.stringify` output) ---------------------------
 
 const PI_READ: &str = r#"{"type":"object","required":["path"],"properties":{"path":{"type":"string","description":"Path to the file to read (relative or absolute)"},"offset":{"type":"number","description":"Line number to start reading from (1-indexed)"},"limit":{"type":"number","description":"Maximum number of lines to read"}}}"#;
-const PI_BASH: &str = r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Bash command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}}}"#;
-// v0.84.3 `bashSchema` (bash.ts:42-45) as `powershell` sees it: ONE shared schema whose `command`
-// description reads "Shell command to execute". `bash` still emits the v0.83.0 "Bash command to
-// execute" — see the `command_description` CYRUP-DELTA on `ShellToolConfig`.
-const PI_POWERSHELL: &str = r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}}}"#;
+// v0.84.3 `bashSchema` (bash.ts:42-45). ONE schema object serves BOTH shell tools: the shared
+// factory hands it to `parameters` (bash.ts:353) and `powershell.ts:49-57` calls that same
+// factory. `bash` and `powershell` therefore emit byte-identical `input_schema`, and asserting
+// both against ONE constant here is what keeps them that way.
+const PI_SHELL: &str = r#"{"type":"object","required":["command"],"properties":{"command":{"type":"string","description":"Shell command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (optional, no default timeout)"}}}"#;
 const PI_GREP: &str = r#"{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Search pattern (regex or literal string)"},"path":{"type":"string","description":"Directory or file to search (default: current directory)"},"glob":{"type":"string","description":"Filter files by glob pattern, e.g. '*.ts' or '**/*.spec.ts'"},"ignoreCase":{"type":"boolean","description":"Case-insensitive search (default: false)"},"literal":{"type":"boolean","description":"Treat pattern as literal string instead of regex (default: false)"},"context":{"type":"number","description":"Number of lines to show before and after each match (default: 0)"},"limit":{"type":"number","description":"Maximum number of matches to return (default: 100)"}}}"#;
 const PI_FIND: &str = r#"{"type":"object","required":["pattern"],"properties":{"pattern":{"type":"string","description":"Glob pattern to match files, e.g. '*.ts', '**/*.json', or 'src/**/*.spec.ts'"},"path":{"type":"string","description":"Directory to search in (default: current directory)"},"limit":{"type":"number","description":"Maximum number of results (default: 1000)"}}}"#;
 const PI_LS: &str = r#"{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: current directory)"},"limit":{"type":"number","description":"Maximum number of entries to return (default: 500)"}}}"#;
@@ -80,10 +81,10 @@ fn all_eight_tool_schemas_match_pi_typebox_bytes() {
     assert_schema("read", read.parameters(), PI_READ);
 
     let bash = ShellTool::bash(proc(), cwd(), BashOpts::default());
-    assert_schema("bash", bash.parameters(), PI_BASH);
+    assert_schema("bash", bash.parameters(), PI_SHELL);
 
     let powershell = ShellTool::powershell(proc(), cwd(), PowerShellOpts::default());
-    assert_schema("powershell", powershell.parameters(), PI_POWERSHELL);
+    assert_schema("powershell", powershell.parameters(), PI_SHELL);
 
     let grep = GrepTool::new(fs(), cwd(), GrepOpts::default());
     assert_schema("grep", grep.parameters(), PI_GREP);
@@ -173,8 +174,8 @@ fn assert_meta(
     assert_eq!(tool.name(), name, "tool name");
     // TOOL-045 — pi sets `label` EXPLICITLY on every built-in `ToolDefinition`, immediately after
     // `name`, and for all eight the two strings are equal: `read.ts:210-211` @v0.83.0,
-    // `bash.ts:325-326`, `powershell.ts:51-52`, `edit.ts:293-294`, `write.ts:187-188`,
-    // `grep.ts:129-130`, `find.ts:115-116`, `ls.ts:101-102`. Asserted as `Some(name)`, NOT as
+    // `bash.ts:348-349`, `powershell.ts:40-41`, `edit.ts:322-323`, `write.ts:193-194`,
+    // `grep.ts:134-135`, `find.ts:129-130`, `ls.ts:106-107`. Asserted as `Some(name)`, NOT as
     // "`None` is fine because the runtime falls back to the name": the fallback and an explicit
     // declaration are only indistinguishable while every label happens to equal its name, and this
     // assertion is what makes those declarations data. RED for all of them before the fix
