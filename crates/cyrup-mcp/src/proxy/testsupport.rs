@@ -132,7 +132,7 @@ impl ProxyEnv for FakeEnv {
     async fn handle_url_elicitation_required(
         &self,
         _server: &str,
-        _detail: &str,
+        _error: &rmcp::model::ErrorData,
     ) -> UrlElicitationAction {
         UrlElicitationAction::Accept
     }

@@ -1467,24 +1467,19 @@ impl ProxyEnv for RuntimeEnv {
     async fn handle_url_elicitation_required(
         &self,
         server: &str,
-        detail: &str,
+        error: &rmcp::model::ErrorData,
     ) -> UrlElicitationAction {
         // `if (this.runtimeSignal?.aborted || !this.elicitationConfig?.allowUrl) return "cancel";`
-        // (`server-manager.ts:801`). The manager's stored runtime signal IS the owner token, which
-        // its own setter documents, so a stopped generation cancels here.
+        // (`server-manager.ts:801`). The owner check is this crate's spelling of the first half; the
+        // manager's own method applies the runtime-signal and `allowUrl` halves and then runs the
+        // loop, so a generation that stopped between the throw and here cancels at either gate.
         if !self.state.owner.is_active() {
             return UrlElicitationAction::Cancel;
         }
-        // The loop body's `handleUrlElicitation(...)` dialog belongs to section 05 and is not
-        // ported; the one observable this verb owns in cyrup is the accepted-id registry the
-        // completion notification (MCP-122) reads. An id already recorded as accepted is a
-        // completed interaction and answers `accept`; anything else has NOT been through a human
-        // and must not claim it was.
-        if self.state.manager.has_accepted_url_elicitation(server, detail) {
-            UrlElicitationAction::Accept
-        } else {
-            UrlElicitationAction::Cancel
-        }
+        self.state
+            .manager
+            .handle_url_elicitation_required(server, error)
+            .await
     }
 
     // --- init.ts ---------------------------------------------------------------------------------

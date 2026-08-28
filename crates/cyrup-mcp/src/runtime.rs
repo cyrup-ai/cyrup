@@ -202,9 +202,11 @@ pub async fn initialize_mcp(
     // native dispatch budget drops a handler future that outlives it, and the subprocess
     // handshakes below routinely do. See `McpExtension::start_initialization`'s doc comment.
     //
-    // One thing the builder does NOT yet get here, named rather than smuggled:
-    // `with_handler_factory` (the manager's sampling/elicitation/list-changed hooks,
-    // MCP-118/120/122).
+    // `with_handler_factory` it now gets too, and that is what puts the manager's own hook bag on
+    // every connection: `manager_handler_factory` upgrades the `Weak` per call and reads the
+    // sampling and elicitation slots live. Of the three hooks it can carry, sampling is installed
+    // (step 5 below); elicitation is step 6, waiting on `elicitation.rs` (MCP-121/122), and
+    // list-changed is MCP-120.
     //
     // `with_auth_provider` it DOES get, and that is this line's whole point. The generation's
     // credential vault is built here and handed to [`StoredCredentialAuth`], which the one
@@ -243,19 +245,37 @@ pub async fn initialize_mcp(
         runtime_signal.clone(),
         skip_issuer,
     ));
-    let manager = Arc::new(McpServerManager::with_factory(
-        Some(snapshot.cwd.clone()),
-        Arc::new(
-            ConnectionBuilder::new(Some(snapshot.cwd.clone())).with_auth_provider(auth_provider),
-        ),
+    // `ctx.modelRegistry`. `default_models` spans EVERY built-in provider, which is what
+    // `getAvailable()` spans; one installed provider's catalogue would be narrower and is the bug
+    // 13i names at :930. Built once and shared by `Arc` — the sampling hook re-reads it per request.
+    let models = Arc::new(cyrup_provider::default_models(
+        cyrup_provider::CreateModelsOptions::default(),
     ));
+
+    // The late-bound back-reference the sampling hook reads the generation's dialog through.
+    // Upstream's hooks close over `ui` directly (`init.ts:126-141`) because they are created before
+    // `state`; here the dialog is `McpState::dialog()` — the ONE production constructor (MCP-471) —
+    // because it also carries `human_wait_ctx`, which only the state has. `Weak`, never `Arc`: the
+    // state owns the manager, the manager owns the hooks.
+    let session: Arc<SessionSlot> = Arc::new(SessionSlot::default());
+
+    // `Arc::new_cyclic` because the factory needs the manager and the manager needs the factory.
+    // An `Arc` in the closure would be a cycle that never drops and leaks every generation's
+    // connection table; `manager_handler_factory` takes the `Weak` and upgrades per call, which is
+    // also what makes `closeAll`'s null-out observable to a connect racing a shutdown.
+    let manager = Arc::new_cyclic(|weak: &std::sync::Weak<McpServerManager>| {
+        let builder = ConnectionBuilder::new(Some(snapshot.cwd.clone()))
+            .with_auth_provider(auth_provider)
+            .with_handler_factory(crate::server_manager::manager_handler_factory(weak.clone()));
+        McpServerManager::with_factory(Some(snapshot.cwd.clone()), Arc::new(builder))
+    });
     // Step 4's setters, now that `McpServerManager` is real (MCP-100). Four of the eight are
     // resolvable here; the other four are not this step's:
     //
     // * `setMetadataListChangedListener` is **step 11** — installed after the state commits, so a
     //   hook fired mid-build cannot see a half-installed surface (MCP-011/MCP-030);
-    // * `setSamplingConfig` / `setElicitationConfig` are steps 5-6's gates (MCP-118/MCP-121/MCP-122)
-    //   and are wired with their handlers, not here;
+    // * `setSamplingConfig` is step 5's gate and is wired with its handler immediately below;
+    //   `setElicitationConfig` is step 6's and still has no writer (MCP-121/MCP-122);
     // * `setTraceConfig` has no counterpart at all — `mcp-trace.ts` is MCP-133, unported.
     //
     // `runtimeSignal` is combined **once per generation**, which is what makes
@@ -276,6 +296,80 @@ pub async fn initialize_mcp(
     // Upstream needs no equivalent because its `authEntryCache` is module-global; this port made the
     // cache an instance field, which is what creates the obligation.
     manager.set_auth_store(auth_store);
+
+    // Step 5 — `init.ts:124-134`. `sampling !== false && (hasUI || samplingAutoApprove)`.
+    //
+    // This is `set_sampling_config`'s FIRST production caller. Until it, `bare_handler_factory`'s
+    // `sampling: None` stood at every connection, so `build_client_capabilities` advertised no
+    // sampling capability to any server, no conforming server ever sent `sampling/createMessage`,
+    // and `McpClientHandler::create_message` answered `METHOD_NOT_FOUND` unconditionally.
+    let settings = config.settings_or_default();
+    if settings.sampling(snapshot.has_ui) {
+        let options = Arc::new(crate::sampling::SamplingOptions {
+            auto_approve: settings.sampling_auto_approve(),
+            has_ui: snapshot.has_ui,
+            session: Arc::clone(&session),
+            models: Arc::clone(&models),
+            owner: Arc::clone(&owner),
+        });
+        manager.set_sampling_config(Some(Arc::new(move |server: String, params| {
+            let options = Arc::clone(&options);
+            Box::pin(async move {
+                crate::sampling::handle_sampling_request(&options, &server, params).await
+            })
+        })));
+    }
+
+    // Step 6 — `init.ts:135-141`. `elicitation !== false && hasUI`, `allowUrl = mode === "tui"`.
+    //
+    // This is `set_elicitation_config`'s FIRST production caller, and it is what makes
+    // `create_elicitation` do anything but rmcp's default `Decline`. The `allow_url` half is
+    // `is_tui_mode`, which is stricter than `has_ui`: a non-TUI surface has nowhere sensible to
+    // hand a browser handoff back to.
+    if settings.elicitation(snapshot.has_ui)
+        && let Some(ui) = ui.as_ref()
+    {
+        let validators = Arc::new(crate::schema::ValidatorCache::default());
+        let accepted = Arc::downgrade(&manager);
+        let options = Arc::new(crate::elicitation::ElicitationOptions {
+            allow_url: snapshot.is_tui_mode(),
+            session: Arc::clone(&session),
+            launcher: Arc::new(crate::oauth::OpenerLauncher) as Arc<dyn crate::oauth::BrowserLauncher>,
+            // `options.onUrlAccepted` — the registry write the completion notice's dedupe reads.
+            // `Weak`, so the hook the manager owns does not own the manager back; a dead weak is a
+            // no-op, which is the right answer for a generation that has already been torn down.
+            on_url_accepted: Arc::new(move |server: &str, id: &str| {
+                if let Some(live) = accepted.upgrade() {
+                    live.remember_url_elicitation(server, id);
+                }
+            }),
+            validators,
+        });
+        let handler = {
+            let options = Arc::clone(&options);
+            Arc::new(move |server: String, params| {
+                let options = Arc::clone(&options);
+                Box::pin(async move {
+                    crate::elicitation::handle_elicitation_request(&options, &server, params).await
+                }) as BoxFuture<'static, Result<ElicitResult, ErrorData>>
+            }) as ElicitationHook
+        };
+        let notify = {
+            // The FENCED handle: a stale generation's notice must not paint into the session that
+            // replaced it. `OwnedServices::notify` degrades to `()` once the owner stops.
+            let ui = Arc::clone(ui);
+            Arc::new(move |message: &str, kind| {
+                cyrup_ext::HostServices::notify(ui.as_ref(), message, kind);
+            }) as NotifyHook
+        };
+        manager.set_elicitation_config(Some(ElicitationConfig {
+            mode: ElicitationMode {
+                allow_url: snapshot.is_tui_mode(),
+            },
+            handler,
+            notify,
+        }));
+    }
 
     // Step 7. `hasPendingAuth` is the OAuth runtime's, so an authenticating server is never reaped.
     let lifecycle = Arc::new(McpLifecycleManager::new(Arc::clone(&manager), Arc::new(|_| false)));
@@ -318,6 +412,10 @@ pub async fn initialize_mcp(
         open_browser,
         send_message,
     }));
+
+    // The hooks minted above can now resolve the generation's dialog. Bound AFTER the state exists
+    // and BEFORE step 11's connect pass, so no hook can observe a half-built generation.
+    session.bind(&state);
 
     // Steps 10, 11 and 12. The two cleanups are registered in this order so the LIFO run order is
     // `gracefulShutdown` -> `shutdownOAuth`, and step 11 sits BETWEEN them — the position this
@@ -2529,6 +2627,32 @@ pub type ElicitationHook = Arc<
         + Sync,
 >;
 
+/// `options.ui.notify` — fire-and-forget in both implementations, which is why it returns `()` and
+/// why a re-prompt dialog can open before its toast paints (same as upstream).
+pub type NotifyHook = Arc<dyn Fn(&str, cyrup_ext::NotifyKind) + Send + Sync>;
+
+/// `ServerElicitationConfig` (`elicitation-handler.ts:28`) — everything `createClient` needs to
+/// build both elicitation hooks, minus the per-server name it splices in.
+///
+/// A named struct rather than a tuple because the completion notice needs a route out: upstream
+/// reads `this.elicitationConfig.ui.notify` off the same object (`server-manager.ts:734`), and
+/// splitting them is how the two drift.
+#[derive(Clone)]
+pub struct ElicitationConfig {
+    /// `allowUrl` — `ContextSnapshot::is_tui_mode`, stricter than `has_ui`.
+    pub mode: ElicitationMode,
+    /// `registerElicitationHandler`'s body.
+    pub handler: ElicitationHook,
+    /// The completion notice's only route out.
+    pub notify: NotifyHook,
+}
+
+impl std::fmt::Debug for ElicitationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ElicitationConfig").field("mode", &self.mode).finish_non_exhaustive()
+    }
+}
+
 /// Construction parameters for [`McpClientHandler`]. A struct rather than a nine-argument `new`
 /// because five of the fields are optional and three of those are closures.
 pub struct McpClientHandlerParts {
@@ -3286,6 +3410,45 @@ impl HttpAuthProvider for StoredCredentialAuth {
 /// completion sink) is owned by the **manager**, which holds the connection map the identity guards
 /// compare against. The builder knows the server name and the runtime signal and nothing else.
 pub type HandlerFactory = Arc<dyn Fn(&str, &CancelToken) -> McpClientHandler + Send + Sync>;
+
+/// The one-shot back-reference from a manager hook to the generation that created it.
+///
+/// `OnceLock` rather than a `Mutex`: it is written exactly once, by [`initialize_mcp`], before any
+/// connection can exist, and read from arbitrary rmcp tasks thereafter. A read before the write
+/// yields `None`, which every consumer already has to handle — it is the same answer a headless
+/// generation gives.
+#[derive(Default)]
+pub struct SessionSlot(std::sync::OnceLock<std::sync::Weak<McpState>>);
+
+impl SessionSlot {
+    /// Called once, by [`initialize_mcp`], the moment the state commits.
+    pub fn bind(&self, state: &Arc<McpState>) {
+        let _ = self.0.set(Arc::downgrade(state));
+    }
+
+    /// The generation's dialog, or `None` for a headless or already-torn-down generation. `None` is
+    /// upstream's `!state.ui`, and every consent gate must read it as "cannot ask", never
+    /// "approved".
+    #[must_use]
+    pub fn dialog(&self) -> Option<crate::owner::McpDialog> {
+        self.0.get()?.upgrade()?.dialog()
+    }
+
+    /// `getCurrentModel()`'s body, through the **fenced** handle: a stopped generation reports
+    /// `None` rather than the dead session's model.
+    #[must_use]
+    pub fn current_model(&self) -> Option<String> {
+        let state = self.0.get()?.upgrade()?;
+        let ui = state.ui.as_ref()?;
+        cyrup_ext::HostServices::current_model(ui.as_ref())
+    }
+}
+
+impl std::fmt::Debug for SessionSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionSlot").field("bound", &self.0.get().is_some()).finish()
+    }
+}
 
 /// The hookless handler — sampling and elicitation are not advertised, and `list_changed`
 /// notifications are logged and dropped. What [`ConnectionBuilder::new`] installs until a manager

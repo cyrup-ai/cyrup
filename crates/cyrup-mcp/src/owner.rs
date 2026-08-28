@@ -663,6 +663,25 @@ impl McpDialog {
         );
         self.services.select(prompt, &rendered, &cyrup_ext::DialogOptions::default())
     }
+
+    /// `ui.input(title, placeholder)` — the typed value, or `None` for a dismissal.
+    ///
+    /// `placeholder` is upstream's seed: `current === undefined ? undefined : String(current)`, so a
+    /// re-prompt after a validation failure does not lose what the user typed.
+    pub async fn input(&self, prompt: &str, placeholder: Option<&str>) -> Option<String> {
+        let _guards = self.enter().await;
+        self.services
+            .input(prompt, placeholder, &cyrup_ext::DialogOptions::default())
+    }
+
+    /// `ui.notify(message, kind)` — fire-and-forget, and deliberately NOT under [`Self::enter`].
+    ///
+    /// A toast asks the human nothing, so taking the interaction lock for it would make a validation
+    /// message queue behind the very dialog it is about to be shown beside. Upstream's `notify` is
+    /// likewise outside every `await ui.select(...)`.
+    pub fn notify(&self, message: &str, kind: cyrup_ext::NotifyKind) {
+        self.services.notify(message, kind);
+    }
 }
 
 impl std::fmt::Debug for McpDialog {
@@ -679,16 +698,16 @@ impl std::fmt::Debug for McpDialog {
 
 /// `sampling-handler.ts:64` — the title of the **request** dialog.
 ///
-/// **No production reader.** It is handed to [`confirm_sampling`] by section 05's
-/// `registerSamplingHandler` body (MCP-118) — the [`crate::runtime::SamplingHook`] that
-/// [`crate::server_manager::McpServerManager::set_sampling_config`] would carry — which is not
-/// ported, so no MCP sampling request reaches a dialog today.
+/// Handed to [`confirm_sampling`] by [`crate::sampling::handle_sampling_request`], the
+/// [`crate::runtime::SamplingHook`] that
+/// [`crate::server_manager::McpServerManager::set_sampling_config`] carries from
+/// [`crate::runtime::initialize_mcp`]'s step 5.
 pub const SAMPLING_REQUEST_APPROVAL_TITLE: &str = "Approve MCP sampling request";
 
 /// `sampling-handler.ts:89` — the title of the **response** dialog.
 ///
-/// **No production reader**, for the same reason as [`SAMPLING_REQUEST_APPROVAL_TITLE`]: the
-/// second gate is opened by section 05's handler body (MCP-118), which is unported.
+/// Read by [`crate::sampling::handle_sampling_request`]'s second gate — the one that shows the
+/// human what the server is about to receive, after the model has answered.
 pub const SAMPLING_RESPONSE_APPROVAL_TITLE: &str = "Return MCP sampling response";
 
 /// `sampling-handler.ts:188` — thrown when approval is required and there is no UI to ask through.
@@ -711,11 +730,9 @@ pub const SAMPLING_REQUEST_DECLINED: &str = "MCP sampling request was declined";
 /// may call **`confirm` only**, which is why this carries an [`McpDialog`] rather than a services
 /// handle.
 ///
-/// **Nothing constructs this in production.** The constructor is section 05's
-/// `registerSamplingHandler` body (MCP-118) — the [`crate::runtime::SamplingHook`] that
-/// [`crate::server_manager::McpServerManager::set_sampling_config`] would carry — which is not
-/// ported. This unit (MCP-455) is the *gate* the handler will call; the handler is the caller it is
-/// waiting on.
+/// Constructed by [`crate::sampling::SamplingOptions::approval`], once per dialog, so a generation
+/// that stopped between the request gate and the response gate is inert at the second one. This
+/// unit (MCP-455) is the *gate*; [`crate::sampling::handle_sampling_request`] is its caller.
 #[derive(Debug)]
 pub struct SamplingApproval {
     /// `options.autoApprove` — `settings.samplingAutoApprove === true`
@@ -861,7 +878,7 @@ pub fn format_response_approval(server_name: &str, response: &CreateMessageResul
 /// unreachable: every `SamplingMessageContentBlock` is an internally-tagged struct variant, so its
 /// serialisation always carries a string `"type"`.
 #[allow(deprecated)]
-fn sampling_block_type(block: &SamplingMessageContentBlock) -> String {
+pub(crate) fn sampling_block_type(block: &SamplingMessageContentBlock) -> String {
     serde_json::to_value(block)
         .ok()
         .as_ref()

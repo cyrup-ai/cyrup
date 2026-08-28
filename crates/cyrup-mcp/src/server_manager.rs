@@ -69,7 +69,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
@@ -1420,7 +1420,9 @@ pub struct McpServerManager {
     /// `samplingConfig` — nulled by `closeAll` so a late callback cannot re-enter a dead runtime.
     sampling: Mutex<Option<crate::runtime::SamplingHook>>,
     /// `elicitationConfig` — the mode plus its handler; nulled by `closeAll` for the same reason.
-    elicitation: Mutex<Option<(crate::runtime::ElicitationMode, crate::runtime::ElicitationHook)>>,
+    /// `elicitationConfig` — nulled by `close_all` so a late callback cannot re-enter a dead
+    /// runtime.
+    elicitation: Mutex<Option<crate::runtime::ElicitationConfig>>,
     /// `authStorageOptions`.
     auth_storage_options: Mutex<crate::credentials::AuthStorageOptions>,
     /// `oauthRuntime`.
@@ -1505,34 +1507,33 @@ impl McpServerManager {
 
     // ── the eight setters (§3.1) ────────────────────────────────────────────────────────────
 
-    /// `setSamplingConfig(config)`.
+    /// `setSamplingConfig(config)` (`server-manager.ts:200-202`).
     ///
-    /// **No production caller.** The `sampling` slot it writes is read nowhere and is only cleared
-    /// again by `close_all`, because the hook it would carry —
-    /// [`crate::runtime::SamplingHook`] — is *"section 05's body"*: the
-    /// `registerSamplingHandler` port (MCP-118), which reaches the manager through
-    /// [`crate::runtime::ConnectionBuilder::with_handler_factory`], itself uncalled.
-    /// `runtime.rs:252-253` names this setter as one of the four that are *"wired with their
-    /// handlers, not here"*. Until MCP-118 lands the only callers are this module's tests.
+    /// Installed by [`crate::runtime::initialize_mcp`]'s step 5, gated on
+    /// `settings.sampling(has_ui)`, and read per connection by [`manager_handler_factory`], which
+    /// hands the hook to [`crate::runtime::McpClientHandlerParts::sampling`]. That is what makes
+    /// [`crate::runtime::build_client_capabilities`] advertise the capability and
+    /// `McpClientHandler::create_message` dispatch instead of answering `METHOD_NOT_FOUND`.
+    ///
+    /// Nulled by `close_all` so a late `sampling/createMessage` cannot re-enter a dead runtime.
     pub fn set_sampling_config(&self, sampling: Option<crate::runtime::SamplingHook>) {
         *self.sampling.lock().unwrap_or_else(PoisonError::into_inner) = sampling;
     }
 
     /// `setElicitationConfig(config)`.
     ///
-    /// **No production caller**, for the same reason as [`Self::set_sampling_config`]: the
-    /// `elicitation` slot is written by this setter and read nowhere, and the
-    /// [`crate::runtime::ElicitationHook`] it carries is section 05's `registerElicitationHandler`
-    /// body (MCP-121 / MCP-122), installed through
-    /// [`crate::runtime::ConnectionBuilder::with_handler_factory`]. One consequence is visible in
-    /// shipping code: because no elicitation config can ever be installed, the `allowUrl` half of
-    /// upstream's URL gate (`server-manager.ts:801`) is unrepresented in
-    /// `handle_url_elicitation_required` (`live.rs:1472-1477`), which tests only the runtime
-    /// signal — correct today, and the second thing MCP-121/122 has to restore.
-    pub fn set_elicitation_config(
-        &self,
-        elicitation: Option<(crate::runtime::ElicitationMode, crate::runtime::ElicitationHook)>,
-    ) {
+    /// **Still no production caller.** The slot it writes is now *read* — [`manager_handler_factory`]
+    /// carries whatever is here onto every connection — but nothing writes it: the
+    /// [`crate::runtime::ElicitationHook`] it takes is §5's `registerElicitationHandler` body
+    /// (MCP-121 / MCP-122), and `elicitation.rs` does not exist yet. Step 6 of
+    /// [`crate::runtime::initialize_mcp`] is where it lands, beside step 5's sampling install.
+    ///
+    /// Two consequences remain visible in shipping code until then. No elicitation config can be
+    /// installed, so the `allowUrl` half of upstream's URL gate (`server-manager.ts:801`) is
+    /// unrepresented in `handle_url_elicitation_required`, which tests only the runtime signal. And
+    /// the tuple is still a tuple: §5 replaces it with `ElicitationConfig` so the completion notice
+    /// ([`url_elicitation_complete_notice`]) gets the `notify` route MCP-469 needs.
+    pub fn set_elicitation_config(&self, elicitation: Option<crate::runtime::ElicitationConfig>) {
         *self.elicitation.lock().unwrap_or_else(PoisonError::into_inner) = elicitation;
     }
 
@@ -2841,6 +2842,50 @@ impl McpServerManager {
 
     /// Whether an elicitation id is still recorded as accepted for this server.
     #[must_use]
+    /// `handleUrlElicitationRequired(serverName, error)` (`server-manager.ts:800-814`).
+    ///
+    /// Sequential and short-circuiting: the FIRST non-accept answer ends the loop and is returned,
+    /// so a decline on elicitation 2 of 3 never opens elicitation 3.
+    pub async fn handle_url_elicitation_required(
+        &self,
+        server: &str,
+        error: &rmcp::model::ErrorData,
+    ) -> crate::proxy::env::UrlElicitationAction {
+        use crate::proxy::env::UrlElicitationAction;
+
+        // `if (this.runtimeSignal?.aborted || !this.elicitationConfig?.allowUrl) return "cancel";`
+        let aborted = self
+            .runtime_signal
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .is_some_and(cyrup_core::CancelToken::is_cancelled);
+        let config = self
+            .elicitation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(config) = config.filter(|config| config.mode.allow_url) else {
+            return UrlElicitationAction::Cancel;
+        };
+        if aborted {
+            return UrlElicitationAction::Cancel;
+        }
+        for params in decode_url_elicitations(error) {
+            match (config.handler)(server.to_string(), params).await {
+                Ok(result) => match result.action {
+                    rmcp::model::ElicitationAction::Accept => {}
+                    rmcp::model::ElicitationAction::Decline => {
+                        return UrlElicitationAction::Decline
+                    }
+                    _ => return UrlElicitationAction::Cancel,
+                },
+                Err(_) => return UrlElicitationAction::Cancel,
+            }
+        }
+        UrlElicitationAction::Accept
+    }
+
     pub fn has_accepted_url_elicitation(&self, name: &str, elicitation_id: &str) -> bool {
         self.tables()
             .accepted_url_elicitations
@@ -3056,9 +3101,183 @@ pub fn should_reconnect_after_refresh(
 // the measurement, the test says so in its own name or body.
 // =================================================================================================
 
+/// `createClient(serverName, definition)`'s hook half (`server-manager.ts:691-741`).
+///
+/// # Why `Weak`
+///
+/// The manager owns the `ConnectionFactory`, the factory owns this closure, and this closure needs
+/// the manager. An `Arc` here is a cycle that never drops and leaks every generation's connection
+/// table. A dead weak yields the hookless handler, which is the correct answer rather than a
+/// fallback: a manager that no longer exists advertises no capability it could service.
+///
+/// The configs are read **per call**, not captured, because upstream tests `this.samplingConfig` at
+/// `createClient` time — `closeAll` nulls both (`server-manager.ts:1165-1166`) and a connect racing
+/// a shutdown must see the null.
+///
+/// # What this does not carry
+///
+/// `list_changed` is MCP-120, not this unit's. Everything else is wired: `elicitation_complete` is
+/// minted here from the config's `notify` route, and its dedupe reads
+/// [`McpServerManager::forget_url_elicitation`] so a duplicate completion notification is silent.
+#[must_use]
+pub fn manager_handler_factory(manager: Weak<McpServerManager>) -> crate::runtime::HandlerFactory {
+    Arc::new(move |server: &str, runtime_signal: &CancelToken| {
+        let Some(live) = manager.upgrade() else {
+            return crate::runtime::bare_handler_factory()(server, runtime_signal);
+        };
+        let sampling = live
+            .sampling
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let elicitation = live
+            .elicitation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+
+        // `if (this.elicitationConfig.allowUrl) client.setNotificationHandler(...)` — the
+        // registration gate. `McpClientHandler` applies the same `allow_url` test at dispatch, so
+        // passing the hook without `allow_url` is inert rather than wrong; gating here as well keeps
+        // the two readings of "registered" identical.
+        let complete = elicitation.as_ref().map(|config| {
+            let back = Weak::clone(&manager);
+            let notify = Arc::clone(&config.notify);
+            Arc::new(move |event: crate::runtime::ElicitationCompleteEvent| {
+                let Some(live) = back.upgrade() else { return };
+                // `if (!accepted?.delete(id)) return;` — the notice fires ONLY on a delete that
+                // removed something, so a duplicate completion is silent.
+                if !live.forget_url_elicitation(&event.server, &event.elicitation_id) {
+                    return;
+                }
+                notify(
+                    &url_elicitation_complete_notice(&event.server),
+                    cyrup_ext::NotifyKind::Info,
+                );
+            }) as crate::runtime::ElicitationCompleteHook
+        });
+
+        crate::runtime::McpClientHandler::new(crate::runtime::McpClientHandlerParts {
+            server: server.to_string(),
+            runtime_signal: runtime_signal.clone(),
+            elicitation_mode: elicitation.as_ref().map(|config| config.mode),
+            sampling,
+            elicitation: elicitation.as_ref().map(|config| Arc::clone(&config.handler)),
+            list_changed: None,
+            elicitation_complete: complete,
+        })
+    })
+}
+
+/// `UrlElicitationRequiredError`'s payload: `ProtocolErrorCode.UrlElicitationRequired` = **-32042**
+/// with `data.elicitations`.
+///
+/// rmcp models neither the code nor the error class, so the decode is by hand.
+const URL_ELICITATION_REQUIRED_CODE: i32 = -32042;
+
+/// A payload that does not parse yields an EMPTY list, which makes
+/// [`McpServerManager::handle_url_elicitation_required`] return `Accept` having opened nothing — the
+/// same answer upstream's empty `error.elicitations` gives.
+fn decode_url_elicitations(error: &rmcp::model::ErrorData) -> Vec<rmcp::model::ElicitRequestParams> {
+    if error.code.0 != URL_ELICITATION_REQUIRED_CODE {
+        return Vec::new();
+    }
+    error
+        .data
+        .as_ref()
+        .and_then(|data| data.get("elicitations"))
+        .and_then(|list| {
+            serde_json::from_value::<Vec<rmcp::model::ElicitRequestParams>>(list.clone()).ok()
+        })
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|params| {
+            matches!(
+                params,
+                rmcp::model::ElicitRequestParams::UrlElicitationParams { .. }
+            )
+        })
+        .collect()
+}
+
+/// `server-manager.ts:734-737` — the notice, verbatim.
+///
+/// Carried by the `elicitation_complete` hook [`manager_handler_factory`] mints, and emitted only
+/// when [`McpServerManager::forget_url_elicitation`] actually removed an entry.
+#[must_use]
+pub fn url_elicitation_complete_notice(server: &str) -> String {
+    format!("MCP browser interaction for {server} completed. You can retry the tool now.")
+}
+
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    // ---- Wave 0: the handler factory reads the manager's hook slots per call ----
+
+    /// The whole point of [`manager_handler_factory`]: the SAME factory answers differently before
+    /// and after `set_sampling_config`, because upstream tests `this.samplingConfig` at
+    /// `createClient` time rather than capturing it. A captured config would make a connect that
+    /// races a shutdown see a hook the manager has already nulled.
+    #[test]
+    fn the_factory_reads_the_sampling_slot_per_call_not_at_capture() {
+        let manager: std::sync::Arc<McpServerManager> =
+            std::sync::Arc::new(McpServerManager::new(std::path::PathBuf::from("/tmp")));
+        let factory = manager_handler_factory(std::sync::Arc::downgrade(&manager));
+        let token = CancelToken::new();
+
+        // Negative control: nothing installed, so nothing is advertised and `create_message`
+        // answers METHOD_NOT_FOUND.
+        assert!(
+            factory("fixture", &token).info().capabilities.sampling.is_none(),
+            "an empty slot must advertise no sampling capability"
+        );
+
+        manager.set_sampling_config(Some(std::sync::Arc::new(|_server, _params| {
+            Box::pin(async { Err(rmcp::ErrorData::internal_error("unused", None)) })
+        })));
+
+        assert!(
+            factory("fixture", &token).info().capabilities.sampling.is_some(),
+            "the same factory must pick up a slot written after it was built"
+        );
+
+        // And back again — `close_all` nulls the slot, and a connect after it must not advertise.
+        manager.set_sampling_config(None);
+        assert!(
+            factory("fixture", &token).info().capabilities.sampling.is_none(),
+            "a nulled slot must stop advertising"
+        );
+    }
+
+    /// A dead weak yields the hookless handler. This is the correct answer rather than a fallback:
+    /// a manager that no longer exists advertises no capability it could service.
+    #[test]
+    fn a_dropped_manager_yields_the_hookless_handler() {
+        let factory = {
+            let manager: std::sync::Arc<McpServerManager> =
+                std::sync::Arc::new(McpServerManager::new(std::path::PathBuf::from("/tmp")));
+            manager.set_sampling_config(Some(std::sync::Arc::new(|_server, _params| {
+                Box::pin(async { Err(rmcp::ErrorData::internal_error("unused", None)) })
+            })));
+            manager_handler_factory(std::sync::Arc::downgrade(&manager))
+        };
+        let token = CancelToken::new();
+        assert!(
+            factory("fixture", &token).info().capabilities.sampling.is_none(),
+            "an upgrade failure must not advertise the dead generation's hooks"
+        );
+    }
+
+    /// `server-manager.ts:734-737`, byte for byte.
+    #[test]
+    fn the_url_elicitation_notice_is_the_upstream_literal() {
+        assert_eq!(
+            url_elicitation_complete_notice("fixture"),
+            "MCP browser interaction for fixture completed. You can retry the tool now."
+        );
+    }
     use std::sync::atomic::AtomicI64;
 
     use super::*;
