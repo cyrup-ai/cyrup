@@ -719,6 +719,7 @@ mod tests {
                     // SUBA-021: unbudgeted on this path (see the field doc).
                     usage_budget: None,
                     turn_budget: None,
+                    permission_rules: None,
                     steps: vec![step],
                     mode: RunMode::Single,
                     session_file: None,

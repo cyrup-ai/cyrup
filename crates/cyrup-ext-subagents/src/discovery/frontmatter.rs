@@ -113,6 +113,17 @@ const KNOWN_FIELDS: &[&str] = &[
     // "known" but never emitted by `management::serialize_agent` is silently deleted on the first
     // management rewrite, so the serializer arm lands with it.
     "turnBudget",
+    // SUBA-073 — both alias spellings of the agent-level permission policy
+    // (`agent-serializer.ts` @v0.57.0). BOTH must be here for the same reason `alias`/`aliases`
+    // both are: an agent may write either, `permissions` (plural) is the canonical spelling this
+    // crate's own serializer emits on rewrite, and declaring both on one agent is a hard refusal
+    // (see the mutual-exclusion check where these are parsed) rather than "prefer one".
+    "permission",
+    "permissions",
+    // SUBA-074 — the agent's declared execution runner (`agents.ts:121` @v0.57.0). In
+    // `KNOWN_FIELDS` so a declared `runner:` is VALIDATED rather than demoted to `extra_fields` and
+    // ignored, which is the silent capability widening this item exists to close.
+    "runner",
 ];
 
 /// True iff `key` is one of the crate's first-class typed frontmatter fields (pi's `KNOWN_FIELDS`,
@@ -914,6 +925,101 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         }
     };
 
+    // SUBA-073 `permission:`/`permissions:` — pi `agents.ts:2033` @v0.57.0: mutual exclusion is a
+    // hard refusal (both spellings present is always an authoring mistake, never "prefer one"),
+    // then whichever ONE is present is parsed through `validate_permission_rules` exactly like an
+    // agent-level `toolBudget:`/`turnBudget:` block above. Same `[CYRUP-DELTA]` as those: a
+    // per-file skip + warn instead of aborting the whole directory scan.
+    let has_permission = parsed.get("permission").filter(|v| !v.trim().is_empty()).is_some();
+    let has_permissions = parsed.get("permissions").filter(|v| !v.trim().is_empty()).is_some();
+    if has_permission && has_permissions {
+        tracing::warn!(
+            agent = %local_name,
+            path = %file_path.display(),
+            "Agent '{local_name}' cannot declare both permission and permissions frontmatter. — skipping this agent file"
+        );
+        return None;
+    }
+    let permission_rules = match parsed.get("permissions").or_else(|| parsed.get("permission")) {
+        None => None,
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => {
+            let parsed_json = serde_json::from_str::<serde_json::Value>(raw).map_err(|err| {
+                format!(
+                    "Agent '{local_name}' permission frontmatter must be a JSON object mapping tool names to allow, ask, or deny. ({err})"
+                )
+            });
+            match parsed_json.and_then(|value| {
+                crate::watchdog::permission_arbiter::validate_permission_rules(
+                    Some(&value),
+                    &format!("Agent '{local_name}' permission frontmatter"),
+                )
+            }) {
+                Ok(rules) => rules,
+                Err(message) => {
+                    tracing::warn!(
+                        agent = %local_name,
+                        path = %file_path.display(),
+                        "{message} — skipping this agent file"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+
+    // SUBA-074 `runner:` — pi `agents.ts:1942-1943,1951` @v0.57.0 runs three checks in this order:
+    // parse the block, reject a contradictory external profile, then enforce the reserved
+    // selection names. Same `[CYRUP-DELTA]` as `toolBudget`/`turnBudget`/`permission` above: a
+    // per-file skip + warn instead of aborting the whole directory scan.
+    let runner = match crate::runner::parse_agent_runner_frontmatter(
+        parsed.get("runner"),
+        &local_name,
+    ) {
+        Ok(runner) => runner,
+        Err(message) => {
+            tracing::warn!(
+                agent = %local_name,
+                path = %file_path.display(),
+                "{message} — skipping this agent file"
+            );
+            return None;
+        }
+    };
+    if let Err(message) = crate::runner::validate_external_runner_profile(
+        &local_name,
+        runner.as_ref(),
+        |field| parsed.contains_key(field),
+    ) {
+        tracing::warn!(
+            agent = %local_name,
+            path = %file_path.display(),
+            "{message} — skipping this agent file"
+        );
+        return None;
+    }
+    // SUBA-074 / pi `validateCodeOwnedProfileRunner` (`agents.ts:1951`): a reserved read-only
+    // adapter's selection name may not be claimed by anything but that adapter. Runs here rather
+    // than beside the `aliases` binding above because it needs the parsed `runner` as well — all
+    // three selection names (`runtime_name`, `local_name`, `aliases`) are already bound by now.
+    {
+        let mut selection_names: Vec<&str> = vec![runtime_name.as_str(), local_name.as_str()];
+        selection_names.extend(aliases.iter().map(String::as_str));
+        if let Some(message) = crate::runner::contract::validate_code_owned_profile_runner(
+            &selection_names,
+            runner
+                .as_ref()
+                .and_then(crate::runner::AgentRunnerConfig::code_owned_adapter),
+        ) {
+            tracing::warn!(
+                agent = %local_name,
+                path = %file_path.display(),
+                "{message} — skipping this agent file"
+            );
+            return None;
+        }
+    }
+
     // `async:` — pi `agents.ts:1541-1546`: strictly `"true"`/`"false"`; anything else is an ERROR
     // upstream. Same `[CYRUP-DELTA]` as `toolBudget` above: a per-file skip + warn instead of
     // aborting the whole directory scan.
@@ -996,6 +1102,8 @@ pub fn parse_agent_file(content: &str, source: AgentSource, file_path: &Path) ->
         memory,
         tool_budget,
         default_turn_budget,
+        permission_rules,
+        runner,
         disabled,
         system_prompt_body: parsed.body,
         source,
@@ -1205,15 +1313,146 @@ mod tests {
         assert_eq!(def.name, "code-analysis.scout");
     }
 
+    /// SUBA-073 — `permission:`/`permissions:` are now KNOWN, VALIDATED fields (previously
+    /// silently demoted to `extra_fields`, which this test used to pin as the — now corrected —
+    /// pre-fix behavior). A block shaped like `cyrup-permission-system`'s own richer, nested,
+    /// wildcard-pattern policy (`"*"`, `"git *"`, a nested `bash:` sub-object) is neither valid
+    /// JSON nor a flat `{tool: decision}` map, so it is refused and the WHOLE agent file is
+    /// skipped — the same `[CYRUP-DELTA]` warn-and-skip convention `toolBudget`/`turnBudget`
+    /// already established, never a silent absorb into `extra_fields`.
     #[test]
-    fn permission_style_nested_block_round_trips_into_extra_fields() {
+    fn a_nested_wildcard_style_permission_block_is_now_refused_not_silently_absorbed() {
         let content = "---\nname: worker\ndescription: Worker\ntools: bash,read,write\npermission:\n  \"*\": ask\n  read: allow\n  bash:\n    \"*\": ask\n    \"git *\": allow\n---\n\nDo work\n";
-        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
-        assert_eq!(
-            def.extra_fields.get("permission").map(String::as_str),
-            Some("\"*\": ask\nread: allow\nbash:\n  \"*\": ask\n  \"git *\": allow")
+        assert!(
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).is_none(),
+            "a permission block that is neither valid JSON nor a flat rules map must skip the \
+             whole agent file, not silently land in extra_fields"
         );
-        assert!(def.present_fields.contains("permission"));
+    }
+
+    /// SUBA-074 — a declared `runner:` is now VALIDATED at load, not demoted to `extra_fields`.
+    /// An `external-cli` profile that also declares a Pi-only field is a contradiction upstream
+    /// refuses outright (`agents.ts:1864-1871`), so the whole agent file is skipped.
+    #[test]
+    fn an_external_runner_declaring_pi_only_fields_fails_to_load() {
+        let content = "---\nname: worker\ndescription: Worker\ntools: read\nrunner: {\"type\": \"external-cli\", \"command\": \"claude\"}\n---\n\nbody\n";
+        assert!(
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).is_none(),
+            "an external profile declaring `tools:` must skip the agent file"
+        );
+    }
+
+    /// SUBA-074 — the reserved-selection-name guard (`validateCodeOwnedProfileRunner`). An agent
+    /// reachable as `claude-code` that is NOT the read-only `claude-code` adapter would shadow the
+    /// sandboxed profile, so it is refused.
+    #[test]
+    fn an_agent_squatting_a_reserved_adapter_name_fails_to_load() {
+        let squat = "---\nname: claude-code\ndescription: Squatter\n---\n\nbody\n";
+        assert!(
+            parse_agent_file(squat, AgentSource::Project, Path::new("/w.md")).is_none(),
+            "a plain agent named `claude-code` must not shadow the reserved read-only adapter"
+        );
+        // The same reservation applies through an ALIAS, not just the name.
+        let via_alias = "---\nname: helper\ndescription: Squatter\naliases: codex-exec\n---\n\nbody\n";
+        assert!(
+            parse_agent_file(via_alias, AgentSource::Project, Path::new("/w.md")).is_none(),
+            "a reserved name claimed via an alias must be refused too"
+        );
+        // An unrelated name is unaffected.
+        let fine = "---\nname: reviewer\ndescription: Fine\n---\n\nbody\n";
+        assert!(parse_agent_file(fine, AgentSource::Project, Path::new("/w.md")).is_some());
+    }
+
+    /// SUBA-074 — a well-formed `runner:` parses onto the definition, and `{"type":"pi"}` is
+    /// indistinguishable from declaring nothing. A malformed block skips the file rather than
+    /// being silently absorbed into `extra_fields` (the pre-fix behaviour).
+    #[test]
+    fn a_declared_runner_parses_onto_the_definition_and_is_never_demoted() {
+        use crate::runner::AgentRunnerConfig;
+
+        let pi = "---\nname: worker\ndescription: W\nrunner: {\"type\": \"pi\"}\n---\n\nbody\n";
+        let def = parse_agent_file(pi, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(def.runner, Some(AgentRunnerConfig::Pi));
+        assert!(
+            !def.extra_fields.contains_key("runner"),
+            "a KNOWN_FIELDS key must never be demoted to extra_fields"
+        );
+
+        let cli = "---\nname: worker\ndescription: W\nrunner: {\"type\": \"external-cli\", \"command\": \"claude\"}\n---\n\nbody\n";
+        let def = parse_agent_file(cli, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(
+            def.runner,
+            Some(AgentRunnerConfig::ExternalCli(
+                crate::runner::ExternalCliRunner {
+                    adapter: None,
+                    command: "claude".to_string(),
+                    args: Vec::new(),
+                    prompt_delivery_stdin: false,
+                    capabilities: None,
+                }
+            ))
+        );
+
+        // An agent with no `runner:` at all carries none.
+        let bare = "---\nname: worker\ndescription: W\n---\n\nbody\n";
+        let def = parse_agent_file(bare, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        assert_eq!(def.runner, None);
+
+        // Malformed (block-style YAML, which this crate refuses per D1) skips the file.
+        let block = "---\nname: worker\ndescription: W\nrunner:\n  type: external-cli\n  command: claude\n---\n\nbody\n";
+        assert!(
+            parse_agent_file(block, AgentSource::Project, Path::new("/w.md")).is_none(),
+            "a block-style runner must be refused loudly, never absorbed into extra_fields"
+        );
+    }
+
+    /// pi `agents.ts:2033` @v0.57.0's mutual-exclusion refusal, verbatim.
+    #[test]
+    fn agent_cannot_declare_both_permission_and_permissions_frontmatter() {
+        let content = "---\nname: worker\ndescription: Worker\npermission: {\"write\": \"deny\"}\npermissions: {\"read\": \"ask\"}\n---\n\nDo work\n";
+        assert!(
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).is_none(),
+            "declaring both spellings must skip the agent file"
+        );
+    }
+
+    /// `validate_permission_rules`'s `bash` refusal (`permissions.ts:24-25`, already ported at
+    /// `watchdog::permission_arbiter`), reached through agent frontmatter for the first time now
+    /// that `permission`/`permissions` are validated at parse time.
+    #[test]
+    fn permission_frontmatter_rejects_bash_exactly_like_the_config_side_does() {
+        let content = "---\nname: worker\ndescription: Worker\npermission: {\"bash\": \"ask\"}\n---\n\nDo work\n";
+        assert!(
+            parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).is_none(),
+            "a permission block gating bash must skip the agent file"
+        );
+    }
+
+    /// A well-formed flat rules map, under EITHER spelling, parses into
+    /// [`crate::discovery::types::AgentDefinition::permission_rules`] — the actual fix this task
+    /// exists to land: the field used to not exist at all.
+    #[test]
+    fn well_formed_permission_frontmatter_parses_into_permission_rules() {
+        use crate::watchdog::permission_arbiter::PermissionRuleDecision;
+
+        let content = "---\nname: worker\ndescription: Worker\npermissions: {\"write\": \"deny\", \"edit\": \"ask\"}\n---\n\nDo work\n";
+        let def = parse_agent_file(content, AgentSource::Project, Path::new("/w.md")).expect("parses");
+        let rules = def.permission_rules.expect("permission_rules parsed");
+        assert_eq!(rules.get("write"), Some(&PermissionRuleDecision::Deny));
+        assert_eq!(rules.get("edit"), Some(&PermissionRuleDecision::Ask));
+
+        // The singular spelling works identically.
+        let content_singular = "---\nname: worker\ndescription: Worker\npermission: {\"write\": \"deny\"}\n---\n\nDo work\n";
+        let def2 = parse_agent_file(content_singular, AgentSource::Project, Path::new("/w2.md")).expect("parses");
+        assert_eq!(
+            def2.permission_rules.expect("parsed").get("write"),
+            Some(&PermissionRuleDecision::Deny)
+        );
+
+        // An agent declaring NEITHER spelling has no policy of its own.
+        let bare = "---\nname: bare\ndescription: Bare\n---\n\nDo work\n";
+        let def3 = parse_agent_file(bare, AgentSource::Project, Path::new("/b.md")).expect("parses");
+        assert_eq!(def3.permission_rules, None);
     }
 
     // -----------------------------------------------------------------------------------------

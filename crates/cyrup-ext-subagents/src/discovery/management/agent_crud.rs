@@ -275,6 +275,12 @@ fn build_definition(
         // SUBA-008: same rule as `toolBudget` — no management field exists for it, so a CREATED
         // agent declares none.
         default_turn_budget: None,
+        // SUBA-073: same rule — no management field exists for it, so a CREATED agent declares
+        // none (an author sets it by hand-editing the agent file's `permissions:` frontmatter).
+        permission_rules: None,
+        // SUBA-074: same rule — no management field exists for it either, so a CREATED agent
+        // declares no runner (an author sets it by hand-editing the file's `runner:` frontmatter).
+        runner: None,
         disabled: fields.disabled.unwrap_or(None),
         system_prompt_body: fields.system_prompt_body.clone().unwrap_or_default(),
         source,
@@ -344,6 +350,10 @@ fn merge_fields(
         tool_budget: existing.tool_budget.clone(),
         // SUBA-008: an UPDATE never edits it but must not DROP it either — see the note above.
         default_turn_budget: existing.default_turn_budget,
+        // SUBA-073: an UPDATE never edits it but must not DROP it either — see the note above.
+        permission_rules: existing.permission_rules.clone(),
+        // SUBA-074: an UPDATE never edits it but must not DROP it either — see the note above.
+        runner: existing.runner.clone(),
         disabled: fields.disabled.unwrap_or(existing.disabled),
         system_prompt_body: fields
             .system_prompt_body

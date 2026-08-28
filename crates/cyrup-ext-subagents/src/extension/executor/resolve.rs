@@ -310,6 +310,13 @@ impl SubagentExecutor {
     /// Resolve one task's requested [`ContextMode`] into a concrete [`ForkContext`] (R-SA-137,
     /// fail-hard per DI-SA-2 — never silently downgrades to `Fresh`).
     ///
+    /// SUBA-075: `force_thinking_off` is the caller's answer to "does the model this branch's
+    /// child will run require reasoning disabled?" — pi's `forceThinkingOffForIndex` callback,
+    /// which upstream likewise populates outside the resolver because the model ladder is not
+    /// resolved until after the fork is requested. Compute it with
+    /// [`crate::fork_context::forked_child_requires_thinking_off`]; pass `true` (upstream's own
+    /// `?? true` fallback) when the ladder is not in hand.
+    ///
     /// # Errors
     ///
     /// Propagates [`ForkContextResolver::resolve`]'s fail-hard errors.
@@ -317,11 +324,12 @@ impl SubagentExecutor {
         &self,
         cwd: &Path,
         requested: ContextMode,
+        force_thinking_off: bool,
     ) -> Result<ForkContext, SubagentError> {
         // Blocker #4: branch from the REAL live-orchestrator session file (P-1), not the mtime guess.
         let session_file = self.host_services().and_then(|s| s.session_file());
         let resolver = Self::fork_resolver(cwd, session_file.as_deref());
-        resolver.resolve(requested, 0).await
+        resolver.resolve(requested, 0, force_thinking_off).await
     }
 }
 

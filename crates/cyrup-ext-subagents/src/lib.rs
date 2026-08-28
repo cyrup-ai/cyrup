@@ -42,6 +42,7 @@ pub mod missions;
 pub mod paths;
 pub mod prompt_runtime;
 pub mod registration;
+pub mod runner;
 pub mod spawn;
 /// The crate's single epoch-millisecond clock (`Date.now()`). See [`time`].
 pub mod time;

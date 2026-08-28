@@ -194,7 +194,10 @@ async fn resolve_step_fork_context(
 
     if effective == ContextMode::Fork {
         if spec.session_file.is_none() {
-            let fork_context = resolver.resolve(ContextMode::Fork, index).await?;
+            // SUBA-075: upstream's `?? true` fallback — a chain/parallel step's resolved model
+            // ladder is not in hand here, and `SingleStepSpec` carries only the session file
+            // forward, so this path takes the conservative arm (see `background.rs`'s note).
+            let fork_context = resolver.resolve(ContextMode::Fork, index, true).await?;
             spec.session_file = fork_context.session_file_path.clone();
             if first_session_file.is_none() {
                 *first_session_file = fork_context.session_file_path;
@@ -430,6 +433,7 @@ mod tests {
             default_context,
             memory: None,
             tool_budget: None,
+            runner: None,
         }
     }
 

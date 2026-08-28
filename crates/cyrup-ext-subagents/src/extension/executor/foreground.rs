@@ -9,7 +9,9 @@ use crate::discovery::types::{AgentDefinition, AgentReadScope, OutputMode};
 use crate::error::SubagentError;
 use crate::exec::{AgentConfig, RunOptions, SingleResult};
 use crate::exec::fallback::resolve_model_inheritance;
-use crate::fork_context::{resolve_effective_context, ContextMode, ForkContext};
+use crate::fork_context::{
+    forked_child_requires_thinking_off, resolve_effective_context, ContextMode, ForkContext,
+};
 use crate::registration::SubagentExtensionConfig;
 use crate::spawn::depth::{resolve_effective_depth, DepthEnvelope};
 use crate::extension::EXTENSION_ID;
@@ -43,6 +45,11 @@ struct ResolvedRunAgent {
     fork_context: ForkContext,
     /// SUBA-008's three-rung chain: caller > agent frontmatter > extension config.
     turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-073's two-rung merge: `config.permissions` + the agent's own `permission:`
+    /// frontmatter, agent winning on conflict. Resolved at the same seam as `turn_budget` above,
+    /// which is the only point where both the live extension config and the resolved agent are
+    /// in hand.
+    permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
     /// SUBA-003's `subagents.modelScope` policy, carried on so the fallback ladder's own
     /// out-of-scope entries warn.
     model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
@@ -93,7 +100,12 @@ struct ForegroundRunOptionsInput<'a> {
     cancel: CancelToken,
     /// Borrowed for [`AgentDefinition::default_reads`] (SUBA-054); the caller drives the run with it.
     agent: &'a AgentDefinition,
+    /// SUBA-073's two-rung merge: `config.permissions` + the agent's own `permission:`
+    /// frontmatter, agent winning on conflict. Resolved at the same seam as `turn_budget` above,
+    /// which is the only point where both the live extension config and the resolved agent are
+    /// in hand.
     turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
     model_scope: Option<crate::exec::model_scope::ModelScopeConfig>,
     available_models: Vec<ModelId>,
     effective_override: crate::exec::fallback::ModelOverride,
@@ -231,6 +243,7 @@ impl SubagentExecutor {
             resolved_context,
             fork_context,
             turn_budget,
+            permission_rules,
             model_scope,
             available_models,
             effective_override,
@@ -258,6 +271,7 @@ impl SubagentExecutor {
             cancel,
             agent: &agent,
             turn_budget,
+            permission_rules,
             model_scope,
             available_models,
             effective_override,
@@ -338,7 +352,31 @@ impl SubagentExecutor {
         // `context` (`None`) falls back to THIS agent's own `default_context` rather than being forced
         // to `Fresh`; an explicit call-site value still wins (`resolve_effective_context`).
         let effective_context = resolve_effective_context(req.context, agent.default_context);
-        let fork_context = self.resolve_context(req.cwd, effective_context).await?;
+        // SUBA-075 / pi `prepareForkThinking` (`runs/foreground/subagent-executor.ts:5858-5885`
+        // @v0.57.0): decide, BEFORE the branch is cut, whether this child's model needs the
+        // sanitized fork to run with reasoning disabled. Upstream reaches the same decision through
+        // a `forceThinkingOffForIndex` callback rather than inline, for the same reason it is
+        // computed here rather than inside the resolver: the fork is requested at the top of the
+        // run and the model ladder is not settled until `resolve_model_inheritance` below.
+        //
+        // The predicate is upstream's verbatim, `.some` and all (`:5880-5883`) — ONE Anthropic
+        // candidate anywhere in the ladder is enough, and an empty ladder answers `true`. It is
+        // deliberately asymmetric: an unnecessary thinking-off costs one run its reasoning depth,
+        // while a missed one hands the child inherited thinking blocks whose signatures no longer
+        // validate, and Anthropic rejects that turn outright.
+        //
+        // The `!= Fork` arm is a short-circuit, not a claim: a `Fresh` request returns from
+        // `resolve` before the flag is ever read, so there is no reason to walk the registry for
+        // an answer nothing will look at.
+        let force_thinking_off = effective_context != ContextMode::Fork
+            || fork_requires_thinking_off(
+                &agent,
+                req.model_override.as_ref(),
+                self.remembered_parent_model().as_ref(),
+            );
+        let fork_context = self
+            .resolve_context(req.cwd, effective_context, force_thinking_off)
+            .await?;
         // C19: the run's *resolved* context (R-SA-111) — captured before `fork_context` is moved
         // into the run's [`RunOptions`] — is what the live-progress payload's `[fork]` badge
         // reflects.
@@ -375,6 +413,20 @@ impl SubagentExecutor {
             // (`subagent-executor.ts:4929`) produces: the validation string verbatim, unprefixed.
             .map_err(SubagentError::Management)?,
         };
+        // SUBA-073 / pi `resolvePermissionRules(ctx.config?.permissions, agentConfig.permissions)`
+        // (`async-execution.ts`, `api/preflight.ts`): the two-rung merge (no per-call tier —
+        // permissions has none) resolved here, the single point where both the live extension
+        // config (`cfg`) and the resolved agent are in hand — the exact seam `turn_budget`'s own
+        // config rung resolves at, immediately above.
+        let permission_rules = crate::exec::permissions::resolve_permission_rules(
+            crate::exec::permissions::validate_permission_config(
+                cfg.permissions.as_ref(),
+                "config.permissions",
+            )
+            .map_err(SubagentError::Management)?
+            .as_ref(),
+            agent.permission_rules.as_ref(),
+        );
         // R-SA-038: `build_model_candidates` filters the ladder to `available_models`, so an
         // explicit `model` override (pi `slash-commands.ts:681` `/run [model=…]`, and the tool's
         // SINGLE-mode `model`) must be ADDED to the availability set — otherwise the override is
@@ -426,6 +478,7 @@ impl SubagentExecutor {
             resolved_context,
             fork_context,
             turn_budget,
+            permission_rules,
             model_scope,
             available_models,
             effective_override,
@@ -567,6 +620,7 @@ impl SubagentExecutor {
             cancel,
             agent,
             turn_budget,
+            permission_rules,
             model_scope,
             available_models,
             effective_override,
@@ -588,6 +642,9 @@ impl SubagentExecutor {
             // SUBA-008 — the three-rung chain [`SubagentExecutor::resolve_run_agent`] resolved
             // (caller > frontmatter > config).
             turn_budget,
+            // SUBA-073 — the resolved two-rung merge above (agent frontmatter + config, agent
+            // winning on conflict).
+            permission_rules,
             // pi sets `enforceHardTurnLimit` only from the slash delegation adapter
             // (`slash/delegation-adapters.ts:298`); the tool surface never does, so the
             // mid-tool-work deferral stays armed here exactly as upstream leaves it.
@@ -811,6 +868,74 @@ impl SubagentExecutor {
 /// `art_cfg` and `art_dir` were all resolved by [`SubagentExecutor::resolve_run_channels`] —
 /// `art_cfg.enabled` already honors SUBA-041's `artifacts: false`, and `art_dir` doubles as the
 /// relative-output base root.)
+/// SUBA-075 / pi `prepareForkThinking` (`runs/foreground/subagent-executor.ts:5858-5885`
+/// @v0.57.0): does the child this fork is being cut for need its branch forced to `thinking: off`?
+///
+/// Two arms, both upstream's:
+///
+/// 1. An EXTERNAL runner (`:5859-5862`) short-circuits to `true`. Its child is not a pi/cyrup
+///    process and resolves no model from this registry, so the ladder below cannot speak for it.
+/// 2. Otherwise the resolved ladder decides — `candidates.length === 0 ||
+///    candidates.some(forkedChildRequiresThinkingOff)` (`:5880-5883`). Note `some`, not `every`:
+///    the fork is sanitized once, for whichever candidate ends up winning, so a single Anthropic
+///    rung anywhere in the ladder settles it.
+///
+/// The ladder is assembled from the four rungs that are actually known this early — the persona's
+/// `model` and `fallback_models`, the per-call override, and the inherited parent model. That is
+/// the whole ladder whenever the persona names a model; when it names none and there is no
+/// override and no parent to inherit from, the set is empty and upstream's own
+/// `candidates.length === 0` arm answers `true`.
+fn fork_requires_thinking_off(
+    agent: &AgentDefinition,
+    model_override: Option<&ModelId>,
+    parent_model: Option<&ModelId>,
+) -> bool {
+    if matches!(
+        agent.runner,
+        Some(
+            crate::runner::AgentRunnerConfig::ExternalCli(_)
+                | crate::runner::AgentRunnerConfig::ExternalJob(_)
+        )
+    ) {
+        return true;
+    }
+    // pi `agentConfig?.modelProvider ?? parentModel?.provider`. `AgentDefinition` declares no
+    // `modelProvider`, so only the parent rung survives: the provider half of a `provider/id`
+    // parent model, used solely to break a tie when a bare candidate id is offered by more than
+    // one provider.
+    let preferred_provider = parent_model
+        .and_then(|model| model.as_str().split_once('/'))
+        .map(|(provider, _)| provider);
+    // pi resolves the `inherit` sentinel through `resolveEffectiveSubagentModel` BEFORE building
+    // candidates (`subagent-executor.ts:5864-5879` @v0.57.0), so it never reaches the predicate
+    // upstream. Here it would: discovery hands `model: inherit` straight through as a `ModelId`
+    // (`discovery/frontmatter.rs`'s `parsed.get("model").map(ModelId::from)`), and
+    // `resolve_model_inheritance`'s own purge (`exec/fallback.rs`'s `available_models.retain`)
+    // does not run until 95 lines further down `resolve_run_agent`. Left in, an inheriting persona
+    // resolves to nothing, `forked_child_requires_thinking_off` takes its conservative
+    // unknown-model arm, and `.any` short-circuits to `true` — past the `parent_model` rung that
+    // holds the real answer.
+    //
+    // Filtering rather than resolving is faithful because the consumer is `.any`: upstream's
+    // resolved primary IS the parent model, which is already a rung here, and `.any` does not care
+    // which position it occupies. `parent_model` sits inside the filter only for uniformity — it is
+    // normalized to a two-non-empty-halves `provider/id` by `normalize_parent_model`, so it can
+    // never itself be a sentinel.
+    let mut candidates = agent
+        .model
+        .iter()
+        .chain(agent.fallback_models.iter())
+        .chain(model_override)
+        .chain(parent_model)
+        .filter_map(|model| crate::exec::fallback::real_requested_model(Some(model)))
+        .map(ModelId::as_str)
+        .peekable();
+    if candidates.peek().is_none() {
+        return true;
+    }
+    candidates.any(|model| forked_child_requires_thinking_off(Some(model), preferred_provider))
+}
+
 fn write_foreground_input_artifact(
     art_cfg: &crate::artifacts::ArtifactConfig,
     art_dir: &Path,
@@ -837,6 +962,178 @@ mod tests {
 
     use super::*;
     use crate::extension::testsupport::seed_scope_fixture;
+
+    // -----------------------------------------------------------------------------------------
+    // SUBA-075 — the fork thinking gate (pi `prepareForkThinking`,
+    // `runs/foreground/subagent-executor.ts:5858-5885` @v0.57.0)
+    // -----------------------------------------------------------------------------------------
+
+    /// A model on neither Anthropic axis, verified live against the catalog by
+    /// `fork_context`'s own fixture tests.
+    const NON_ANTHROPIC: &str = "amazon-bedrock/amazon.nova-pro-v1:0";
+    const ANTHROPIC: &str = "anthropic/claude-opus-4-6";
+
+    /// A minimal persona carrying only the fields the gate reads: `model`, `fallback_models` and
+    /// `runner`. Spelled out rather than borrowed from another subsystem's fixture so a change to
+    /// THAT fixture's field choices can never quietly make these assertions pass for the wrong
+    /// reason.
+    fn gate_agent(model: Option<&str>, fallbacks: &[&str]) -> AgentDefinition {
+        AgentDefinition {
+            name: "worker".to_string(),
+            local_name: "worker".to_string(),
+            package_name: None,
+            description: String::new(),
+            aliases: Vec::new(),
+            tools: None,
+            extensions: None,
+            extensions_from_default: false,
+            subagent_only_extensions: Vec::new(),
+            model: model.map(ModelId::from),
+            fallback_models: fallbacks.iter().map(|m| ModelId::from(*m)).collect(),
+            thinking: None,
+            system_prompt_mode: crate::discovery::types::SystemPromptMode::Replace,
+            inherit_project_context: false,
+            inherit_skills: false,
+            skills: Vec::new(),
+            default_reads: None,
+            default_progress: None,
+            output: None,
+            completion_guard: None,
+            interactive: None,
+            max_subagent_depth: None,
+            default_context: None,
+            default_async: None,
+            default_timeout_ms: None,
+            default_turn_budget: None,
+            permission_rules: None,
+            runner: None,
+            memory: None,
+            tool_budget: None,
+            disabled: None,
+            system_prompt_body: String::new(),
+            source: crate::discovery::types::AgentSource::Project,
+            file_path: PathBuf::from("/proj/.cyrup/agents/worker.md"),
+            present_fields: std::collections::HashSet::new(),
+            extra_fields: std::collections::BTreeMap::new(),
+            override_info: None,
+            model_source: None,
+        }
+    }
+
+    #[test]
+    fn the_fork_gate_clears_a_ladder_that_is_anthropic_free() {
+        assert!(
+            !fork_requires_thinking_off(&gate_agent(Some(NON_ANTHROPIC), &[]), None, None),
+            "nothing in this ladder speaks Anthropic, so the branch keeps its reasoning"
+        );
+    }
+
+    /// pi `candidates.some(...)`, NOT `every`. The fork is sanitized once, before the ladder has
+    /// picked a winner, so a single Anthropic rung anywhere settles it — a `.every` port would
+    /// leave the branch thinking-on and fail at the provider the moment a fallback was reached.
+    #[test]
+    fn one_anthropic_rung_anywhere_in_the_ladder_forces_thinking_off() {
+        assert!(
+            fork_requires_thinking_off(&gate_agent(Some(NON_ANTHROPIC), &[ANTHROPIC]), None, None),
+            "an Anthropic FALLBACK is still a model this branch may end up running"
+        );
+        assert!(
+            fork_requires_thinking_off(
+                &gate_agent(Some(NON_ANTHROPIC), &[]),
+                Some(&ModelId::from(ANTHROPIC)),
+                None
+            ),
+            "so is a per-call override"
+        );
+        assert!(
+            fork_requires_thinking_off(
+                &gate_agent(Some(NON_ANTHROPIC), &[]),
+                None,
+                Some(&ModelId::from(ANTHROPIC))
+            ),
+            "and so is the parent model this persona would inherit"
+        );
+    }
+
+    /// pi `candidates.length === 0 || ...`: a persona naming no model, with no override and no
+    /// parent to inherit from, has nothing to judge and takes the conservative arm.
+    #[test]
+    fn an_empty_ladder_forces_thinking_off() {
+        assert!(fork_requires_thinking_off(&gate_agent(None, &[]), None, None));
+    }
+
+    /// The `inherit` sentinel is a REQUEST, never a model id. pi resolves it through
+    /// `resolveEffectiveSubagentModel` before `buildModelCandidates`
+    /// (`subagent-executor.ts:5864-5879` @v0.57.0), so it never reaches the predicate upstream.
+    ///
+    /// Here it reaches the ladder verbatim — discovery passes `model:` through raw
+    /// (`discovery/frontmatter.rs`'s `parsed.get("model").map(ModelId::from)`) and
+    /// `resolve_model_inheritance`'s own purge does not run until 95 lines further down
+    /// `resolve_run_agent`. Unpurged it resolves to nothing, takes
+    /// `forked_child_requires_thinking_off`'s conservative unknown-model arm, and short-circuits
+    /// `.any` to `true` past the `parent_model` rung that holds the real answer.
+    #[test]
+    fn an_inheriting_persona_is_judged_on_the_model_it_actually_inherits() {
+        let sentinel = crate::exec::fallback::INHERIT_MODEL_SENTINEL;
+
+        assert!(
+            !fork_requires_thinking_off(
+                &gate_agent(Some(sentinel), &[]),
+                None,
+                Some(&ModelId::from(NON_ANTHROPIC))
+            ),
+            "the gate must answer on the model this persona actually inherits, not on the \
+             unresolvable sentinel standing in front of it"
+        );
+        assert!(
+            fork_requires_thinking_off(
+                &gate_agent(Some(sentinel), &[]),
+                None,
+                Some(&ModelId::from(ANTHROPIC))
+            ),
+            "the same ladder with an Anthropic parent still forces thinking off — purging the \
+             sentinel narrows the gate, it must not disarm it"
+        );
+        assert!(
+            fork_requires_thinking_off(&gate_agent(Some(sentinel), &[]), None, None),
+            "a ladder that purges down to nothing is EMPTY, which is still upstream's conservative \
+             `candidates.length === 0` arm — it must not come back cleared"
+        );
+        assert!(
+            !fork_requires_thinking_off(
+                &gate_agent(None, &[]),
+                Some(&ModelId::from(sentinel)),
+                Some(&ModelId::from(NON_ANTHROPIC))
+            ),
+            "a per-call `model=inherit` is a request on the same terms (`real_requested_model`), \
+             so the purge has to cover every rung the ladder is built from — not just `model:`"
+        );
+    }
+
+    /// pi `:5859-5862`: an external runner's child is not a cyrup process and resolves no model
+    /// from this registry, so the ladder cannot speak for it — even one that is demonstrably
+    /// Anthropic-free.
+    #[test]
+    fn an_external_runner_forces_thinking_off_whatever_its_ladder_says() {
+        let mut agent = gate_agent(Some(NON_ANTHROPIC), &[]);
+        assert!(
+            !fork_requires_thinking_off(&agent, None, None),
+            "precondition: this ladder on its own clears the gate"
+        );
+        agent.runner = Some(crate::runner::AgentRunnerConfig::ExternalCli(
+            crate::runner::ExternalCliRunner {
+                adapter: None,
+                command: "claude".to_string(),
+                args: Vec::new(),
+                prompt_delivery_stdin: false,
+                capabilities: None,
+            },
+        ));
+        assert!(
+            fork_requires_thinking_off(&agent, None, None),
+            "the runner arm must short-circuit ahead of the ladder"
+        );
+    }
 
     #[tokio::test]
     async fn run_foreground_errors_before_any_spawn_when_agent_is_unknown() {

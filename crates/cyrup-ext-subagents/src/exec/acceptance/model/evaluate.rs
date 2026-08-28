@@ -428,7 +428,11 @@ mod tests {
         });
         let ledger = evaluate_acceptance(EvaluateAcceptanceInput {
             acceptance: &acceptance,
-            output: &report_text(json!({"testsAddedOrUpdated": []}), "acceptance-report"),
+            // SUBA-076: `null` REMOVES the key, so `tests-added` is genuinely ABSENT. This test
+            // previously passed `[]` for the same purpose, which no longer means the same thing:
+            // an empty list is now `not-applicable` (pi `acceptance.ts:939` @v0.57.0) and does not
+            // reject. "Missing" is what this test is named for, so it now says missing.
+            output: &report_text(json!({"testsAddedOrUpdated": null}), "acceptance-report"),
             cwd: dir.path(),
             report: None,
             file_output: None,
@@ -439,6 +443,48 @@ mod tests {
         .await;
         assert_eq!(ledger.status, AcceptanceLedgerStatus::Rejected);
         assert!(acceptance_failure_message(&ledger).unwrap().contains("tests-added evidence missing"));
+    }
+
+    /// SUBA-076, the other side of the same coin at LEDGER level: a child that honestly reports an
+    /// EMPTY `testsAddedOrUpdated` is saying the question does not apply, not withholding evidence.
+    /// pi scores that `not-applicable` (`acceptance.ts:939` @v0.57.0) and `evaluateAcceptance`
+    /// rejects only on `failed`, so the run is ACCEPTED. This port rejected it, which is the bug.
+    #[tokio::test]
+    async fn checked_mode_accepts_an_honestly_empty_evidence_list() {
+        let dir = temp_dir();
+        let acceptance = resolve(AcceptanceResolveInput {
+            agent_name: "worker".into(),
+            task: Some("Implement a fix".into()),
+            explicit: cfg(AcceptanceConfig {
+                level: Some(AcceptanceLevel::Checked),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let ledger = evaluate_acceptance(EvaluateAcceptanceInput {
+            acceptance: &acceptance,
+            output: &report_text(json!({"testsAddedOrUpdated": []}), "acceptance-report"),
+            cwd: dir.path(),
+            report: None,
+            file_output: None,
+            review_result: None,
+            memo: None,
+            report_optional: false,
+        })
+        .await;
+        assert_eq!(
+            ledger.status,
+            AcceptanceLedgerStatus::Checked,
+            "an empty list is not withheld evidence: {ledger:?}"
+        );
+        assert!(
+            ledger.runtime_checks.iter().any(|check| {
+                check.id == "evidence:tests-added"
+                    && check.status == RuntimeCheckStatus::NotApplicable
+                    && check.message == "tests-added evidence explicitly reported as not applicable."
+            }),
+            "the check must be RECORDED as not-applicable, not quietly dropped: {ledger:?}"
+        );
     }
 
 

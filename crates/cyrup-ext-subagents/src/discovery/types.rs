@@ -815,6 +815,17 @@ pub struct AgentDefinition {
     /// (`subagent-executor.ts:1940-1942`), and the extension-config `subagents.turnBudget` sits
     /// below it in the same chain.
     pub default_turn_budget: Option<crate::exec::turn_budget::ResolvedTurnBudget>,
+    /// SUBA-073 — this agent's own `permission:`/`permissions:` frontmatter, already validated
+    /// (`discovery/frontmatter.rs`). Merged with the global `config.permissions` rung at run time
+    /// via [`crate::exec::permissions::resolve_permission_rules`] — this field alone is NOT the
+    /// effective policy, only this agent's contribution to it.
+    pub permission_rules: Option<crate::watchdog::permission_arbiter::PermissionRules>,
+    /// SUBA-074 — the agent's declared execution runner (`agents.ts:121` @v0.57.0), already
+    /// validated (`discovery/frontmatter.rs`). `None` and `Some(AgentRunnerConfig::Pi)` both mean
+    /// "the native child this crate spawns"; any other value is a profile cyrup cannot yet honour
+    /// and must REFUSE rather than downgrade — see
+    /// [`crate::runner::AgentRunnerConfig::refusal_reason`].
+    pub runner: Option<crate::runner::AgentRunnerConfig>,
     pub disabled: Option<bool>,
     /// The agent's own frontmatter-body prose, prior to any orchestrator-injected scaffolding
     /// (acceptance contract, skill pointers, project context) — combined per `system_prompt_mode`
@@ -1078,6 +1089,8 @@ mod tests {
     fn sample_agent(tools: Option<Vec<ToolRef>>) -> AgentDefinition {
         AgentDefinition {
             default_turn_budget: None,
+            permission_rules: None,
+            runner: None,
             name: "reviewer".to_string(),
             local_name: "reviewer".to_string(),
             package_name: None,

@@ -63,7 +63,9 @@ pub(crate) mod testsupport;
 
 mod executor;
 mod host;
-mod models;
+// SUBA-075: crate-visible so `fork_context`'s ported `findModelInfo` can resolve a fork's candidate
+// models against `registry_models` — the same catalog binding every model-facing command here uses.
+pub(crate) mod models;
 mod tool;
 mod wait_tool;
 

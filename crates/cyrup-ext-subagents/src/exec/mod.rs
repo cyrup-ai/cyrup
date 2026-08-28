@@ -50,6 +50,7 @@ pub mod tool_call_summary;
 pub mod tool_budget;
 pub mod turn_budget;
 pub mod capability_ceiling;
+pub mod permissions;
 pub mod usage_budget;
 pub mod spawn_budget;
 pub mod tool_availability;
@@ -267,6 +268,25 @@ fn resolve_run_acceptance(
 pub async fn run_sync(agent: &AgentConfig, task: &str, opts: &RunOptions) -> SingleResult {
     if let Some(failure) = depth_guard_failure(agent, task) {
         return failure;
+    }
+
+    // Step 0b (SUBA-074) — REFUSE a runner this crate cannot honour, before the model-fallback
+    // ladder rather than inside it. `build_attempt_spawn_plan`'s errors are per-ATTEMPT
+    // (`exec/attempt_runner.rs:351` hands an `Err` to `attempt_setup_failure`, `:534-556`, which
+    // yields `AttemptSignal { success: false, … }` and the ladder tries the next model), so a
+    // runner refusal raised there would fire once per candidate model and end in a misleading
+    // "all models failed". This is a property of the RUN, so it belongs here beside the depth
+    // guard, which has exactly the same shape.
+    //
+    // Without this, an agent declaring an external profile — which upstream FORBIDS from declaring
+    // `tools:`, so it declares none, which this crate reads as "no allowlist restriction" — spawns
+    // as a native child with the full builtin tool surface.
+    if let Some(reason) = agent
+        .runner
+        .as_ref()
+        .and_then(crate::runner::AgentRunnerConfig::refusal_reason)
+    {
+        return pre_spawn_failure(agent, task, reason);
     }
 
     // Step 1 (R-SA-025): fail fast before any subprocess spawns.
@@ -1248,9 +1268,18 @@ fn build_progress_snapshot(
             skills: resolved_skill_names,
             // pi `progress.model = modelArg` (`execution.ts:267` @v0.34.0) — the id the child was
             // actually launched with, thinking suffix included, not the bare ladder entry.
+            //
+            // SUBA-075: "actually launched with" is why the fork thinking-override has to be
+            // applied HERE too, on exactly the terms `build_attempt_spawn_plan` applied it. Reading
+            // only `agent.thinking` would report `:high` for a child whose argv said `:off`, and
+            // this snapshot is what the TUI and the run record show.
             model: apply_thinking_suffix(
                 winning_model.map(ModelId::as_str),
-                agent.thinking.as_deref(),
+                opts.fork_context
+                    .thinking_override
+                    .as_deref()
+                    .or(agent.thinking.as_deref()),
+                opts.fork_context.thinking_override.is_some(),
             ),
             thinking: agent.thinking.clone(),
             status,
@@ -1277,6 +1306,8 @@ fn build_progress_snapshot(
 pub(crate) fn completion_guard_projection(agent: &AgentConfig) -> AgentDefinition {
     AgentDefinition {
         default_turn_budget: None,
+        permission_rules: None,
+        runner: None,
         name: agent.name.clone(),
         local_name: agent.name.clone(),
         package_name: None,
@@ -1360,7 +1391,10 @@ pub async fn plan_batch(
 ) -> Result<Vec<ForkContext>, SubagentError> {
     let mut resolved = Vec::with_capacity(requests.len());
     for request in requests {
-        let ctx = resolver.resolve(request.requested, request.index).await?;
+        // SUBA-075: upstream's `forceThinkingOffForIndex?.(index) ?? true` fallback. A
+        // [`BatchForkRequest`] names a step's context mode and index only — it carries no model
+        // ladder — so the batch planner cannot answer the gate and takes the conservative arm.
+        let ctx = resolver.resolve(request.requested, request.index, true).await?;
         resolved.push(ctx);
     }
     Ok(resolved)
@@ -1380,6 +1414,54 @@ mod tests {
     use crate::exec::testsupport::{base_opts, sample_agent_config};
     use crate::spawn::depth::DepthEnvelope;
 
+
+    // ---- SUBA-075: the progress snapshot reports the model the child REALLY launched with ----
+
+    /// pi sets `progress.model = modelArg` (`runs/foreground/execution.ts:267`), and `modelArg` is
+    /// the id the override was already applied to. So this snapshot has to resolve the fork
+    /// thinking-override on exactly the terms `build_attempt_spawn_plan` resolved it on: reading
+    /// `agent.thinking` alone would report `:high` for a child whose argv said `:off`, and this
+    /// snapshot is what the TUI and the run record show.
+    ///
+    /// Taken on an INTERRUPTED run on purpose: a settled snapshot is compacted, and
+    /// `compact_completed` drops `model` outright (pi's literal has no such key), so a completed
+    /// run could not observe this at all.
+    #[test]
+    fn the_progress_snapshot_model_carries_a_fork_thinking_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.thinking = Some("high".to_string());
+        let mut opts = base_opts(dir.path(), &["m1"]);
+        opts.include_progress = Some(true);
+        let progress = crate::exec::progress::AgentProgress::default();
+        let control = crate::exec::control::ControlMonitor::disabled();
+        let winning = ModelId::from("m1");
+
+        let snapshot = build_progress_snapshot(
+            &progress, &opts, &agent, "task", None, Some(&winning), &control, false, true, 0, None,
+        )
+        .expect("progress was requested");
+        assert_eq!(
+            snapshot.model.as_deref(),
+            Some("m1:high"),
+            "precondition: with no override the persona's own level is what gets reported"
+        );
+
+        opts.fork_context = crate::fork_context::ForkContext {
+            mode: crate::fork_context::ContextMode::Fork,
+            session_file_path: Some(dir.path().join("branch.jsonl")),
+            thinking_override: Some("off".to_string()),
+        };
+        let snapshot = build_progress_snapshot(
+            &progress, &opts, &agent, "task", None, Some(&winning), &control, false, true, 0, None,
+        )
+        .expect("progress was requested");
+        assert_eq!(
+            snapshot.model.as_deref(),
+            Some("m1:off"),
+            "the reported model must agree with the argv the child was actually launched with"
+        );
+    }
 
     // ---- run_sync step 2: the effective contract is max(explicit, inferred) (R-SA-023) ----
 
@@ -1423,6 +1505,56 @@ mod tests {
         assert!(resolve_run_acceptance(&opts, &agent, "Implement the fix").is_no_op());
     }
 
+
+    // ---- SUBA-074: an unsupported runner refuses the RUN, before the model ladder ----
+
+    /// A declared `external-cli` profile must refuse the launch outright rather than spawn a
+    /// full-capability native child. The refusal is a property of the RUN, so it fires ONCE,
+    /// before any model is attempted — not once per candidate in the fallback ladder.
+    #[tokio::test]
+    async fn run_sync_refuses_an_unsupported_runner_once_before_any_model_attempt() {
+        use crate::runner::{AgentRunnerConfig, ExternalCliRunner};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &["m2", "m3"]);
+        agent.runner = Some(AgentRunnerConfig::ExternalCli(ExternalCliRunner {
+            adapter: Some("claude-code".to_string()),
+            command: "claude".to_string(),
+            args: Vec::new(),
+            prompt_delivery_stdin: false,
+            capabilities: None,
+        }));
+        let opts = base_opts(dir.path(), &["m1", "m2", "m3"]);
+
+        let result = run_sync(&agent, "do something", &opts).await;
+
+        assert_eq!(result.exit_code, 1, "an unsupported runner must fail the run: {result:?}");
+        let error = result.error.as_deref().unwrap_or_default();
+        assert!(error.contains("runner.type='external-cli'"), "{error}");
+        assert!(error.contains("full-capability native child"), "{error}");
+        assert!(
+            result.attempted_models.is_empty(),
+            "the refusal precedes the ladder, so NO model may be attempted; got {:?}",
+            result.attempted_models
+        );
+    }
+
+    /// `runner: {"type":"pi"}` is the native child, so it is indistinguishable from declaring no
+    /// runner at all — it must NOT be refused.
+    #[tokio::test]
+    async fn run_sync_does_not_refuse_a_pi_runner() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut agent = sample_agent_config("m1", &[]);
+        agent.runner = Some(crate::runner::AgentRunnerConfig::Pi);
+        let opts = base_opts(dir.path(), &["m1"]);
+
+        let result = run_sync(&agent, "do something", &opts).await;
+
+        assert!(
+            !result.error.as_deref().unwrap_or_default().contains("not yet supported by cyrup"),
+            "a `pi` runner is the native child and must never hit the SUBA-074 refusal: {result:?}"
+        );
+    }
 
     // ---- run_sync: depth guard runs first, before anything else (R-SA-055, SAFETY-CRITICAL) ----
 
