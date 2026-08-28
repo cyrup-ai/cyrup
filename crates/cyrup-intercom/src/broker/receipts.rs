@@ -238,8 +238,8 @@ mod tests {
         assert_eq!(refused[0]["reason"], "Message cannot be cancelled by this session");
     }
     /// `case "message_receipt"` (`v0.10.1 broker/broker.ts:676-696`) forwards a receipt back to the
-    /// ORIGINAL sender, which needs the `messageReceiptRoutes` entry the delivery wrote. Every pi
-    /// >= 0.9.0 client emits `receiver_received` unconditionally on its first inbound message
+    /// ORIGINAL sender, which needs the `messageReceiptRoutes` entry the delivery wrote. Every
+    /// pi client at 0.9.0 or newer emits `receiver_received` unconditionally on its first inbound message
     /// (`broker/client.ts:773-784`), so before the table existed every one of those receipts was
     /// dropped on the floor.
     #[test]

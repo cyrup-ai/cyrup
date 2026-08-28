@@ -329,9 +329,9 @@ fn has_single_adjacent_transposition(left: &str, right: &str) -> bool {
 ///
 /// The ASYMMETRIC destructive rule is the load-bearing half and is reproduced exactly: an ordinary
 /// candidate matches on `distance <= max(1, floor(len/4))` OR a single adjacent transposition, but
-/// a DESTRUCTIVE candidate matches only on `distance === 1 && requested.length >= candidate.length
-/// - 1`. That is what stops a loose typo being nudged toward `delete`. Porting a naive did-you-mean
-/// without it would be strictly worse than the wall of names it replaces.
+/// a DESTRUCTIVE candidate matches only on `distance === 1 && requested.length >=
+/// candidate.length - 1`. That is what stops a loose typo being nudged toward `delete`. Porting a
+/// naive did-you-mean without it would be strictly worse than the wall of names it replaces.
 pub(crate) fn unknown_subagent_action_message(action: &str) -> String {
     let requested = action.to_lowercase();
     let suggestion = SUBAGENT_ACTIONS.iter().find(|candidate| {

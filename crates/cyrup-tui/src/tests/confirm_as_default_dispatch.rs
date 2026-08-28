@@ -17,6 +17,7 @@
 //! The assertion is deliberately weak — *some* status must appear — because the point is
 //! reachability, not the message. A wrong message is a different bug; no message at all is this
 //! one.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use std::sync::Arc;
 

@@ -190,6 +190,7 @@ impl HostCtx {
     }
 
     /// Attach the rich native-ctx fields (Pi `ExtensionContext`, gap-08 #6).
+    #[must_use]
     pub fn with_rich(mut self, rich: HostCtxRich) -> Self {
         self.rich = rich;
         self

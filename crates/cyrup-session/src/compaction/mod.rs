@@ -84,6 +84,7 @@ impl<S: Summarizer, H: CompactionHooks> Compactor<S, H> {
     /// [`summarize::summarization_reasoning`], which reproduces Pi's
     /// `model.reasoning && level !== "off"` gate. Branch summaries deliberately ignore it — see
     /// [`branch::generate_branch_summary`].
+    #[must_use]
     pub fn with_thinking(mut self, thinking: ModelThinkingLevel) -> Self {
         self.thinking = thinking;
         self

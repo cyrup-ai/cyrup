@@ -213,6 +213,7 @@ impl Subscriptions {
         Subscriptions(0)
     }
 
+    #[must_use]
     pub fn with(mut self, kind: EventKind) -> Self {
         self.0 |= 1u64 << (kind as u8);
         self
@@ -231,6 +232,7 @@ impl Subscriptions {
     }
 
     /// Union of two bitsets (used to build the dispatcher's aggregate gate).
+    #[must_use]
     pub fn union(self, other: Subscriptions) -> Subscriptions {
         Subscriptions(self.0 | other.0)
     }

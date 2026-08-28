@@ -121,11 +121,12 @@ impl AgentSession {
     pub(crate) async fn next_turn_tools(&self) -> Vec<Arc<dyn cyrup_core::Tool>> {
         // EXT-004: a tool an extension registered from a LIVE handler during this run.
         self.refresh_extension_tools().await;
-        // A guest's `setActiveTools` queued from an event handler / mid-turn tool hook. Array only,
+        // A guest's `setActiveTools` queued from an event handler / mid-turn tool hook, re-resolved
+        // against the registry the refresh above just updated (the queue holds the requested NAMES
+        // precisely so this resolution happens after it — see `PendingActiveTools`). Array only,
         // prompt discarded — see above, and the identical rule in `assemble_run_messages`.
-        if let Some((tools, _rebuilt_prompt)) =
-            self.services.host_services.take_pending_active_tools()
-        {
+        if let Some(names) = self.services.host_services.take_pending_active_tools() {
+            let (tools, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
             self.agent.set_tools(tools).await;
         }
         self.agent.tools().await

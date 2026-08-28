@@ -552,7 +552,7 @@ impl AgentSession {
         messages.extend(pending);
         // Pi `setActiveTools` (pi-permission-system index.ts:2155): a `before_agent_start` handler may
         // have RESTRICTED the active tool set via `HostServices::set_active_tools` (the permission
-        // companion's `shouldExposeTool` shaping), which stages a `(tools, prompt)` push. Drain + apply
+        // companion's `shouldExposeTool` shaping), which stages the requested NAMES. Drain + apply
         // it IN-TURN here — before `spawn_run` — so the restriction shapes THIS turn (turn 1), not the
         // next turn boundary where `apply_pending_agent_control` would otherwise pick it up. Apply ONLY
         // the restricted tool ARRAY; the `DynamicToolState`-rebuilt prompt is DISCARDED so it cannot
@@ -560,9 +560,8 @@ impl AgentSession {
         // and its returned `systemPrompt` are independent). Draining it here also leaves
         // `pending_active_tools` empty for the later `apply_pending_agent_control` drains, so the
         // restriction is applied exactly once.
-        if let Some((tools, _rebuilt_prompt)) =
-            self.services.host_services.take_pending_active_tools()
-        {
+        if let Some(names) = self.services.host_services.take_pending_active_tools() {
+            let (tools, _rebuilt_prompt) = { Self::lock(&self.dynamic_tools).set_active(&names) };
             self.agent.set_tools(tools).await;
         }
         if let Reduced::Pass(ev) = reduced

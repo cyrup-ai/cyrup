@@ -40,16 +40,19 @@ impl DiagnosticErrorInfo {
         Self { name: None, message: message.into(), stack: None, code: None }
     }
 
+    #[must_use]
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
     }
 
+    #[must_use]
     pub fn with_stack(mut self, stack: impl Into<String>) -> Self {
         self.stack = Some(stack.into());
         self
     }
 
+    #[must_use]
     pub fn with_code(mut self, code: DiagnosticCode) -> Self {
         self.code = Some(code);
         self

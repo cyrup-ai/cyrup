@@ -135,6 +135,16 @@ impl std::fmt::Debug for BashOptions {
 /// is unchanged, because upstream delegates only the `exec` call itself
 /// (`executeBashWithOperations(command, cwd, operations, {onChunk, signal})`, `bash-executor.ts`).
 /// `None` takes the `??`'s right-hand branch, which is `proc`/`shell` exactly as before.
+///
+/// The eight parameters are pi's own `executeBashWithOperations(command, cwd, operations, {onChunk,
+/// signal})` plus the three values cyrup must thread explicitly where upstream reads them off a
+/// closure environment (`proc`, `shell`, `bin_dir`). They are unrelated to one another — a process
+/// backend, a resolved shell, a per-call backend override, a path, a string, a cancel token and a
+/// sink — so bundling them into a struct would only rename the same eight values at the single call
+/// site (`session/bash.rs`) while hiding the correspondence with the upstream signature this
+/// function is a line-for-line port of. Same disposition as the other `too_many_arguments` allows in
+/// this workspace (e.g. `cyrup-ext-subagents/src/exec/mod.rs`).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_bash(
     proc: &Arc<dyn ProcOps>,
     shell: &ShellConfig,
@@ -216,7 +226,11 @@ pub(crate) async fn run_bash(
             proc.exec(spec, cancel, None, &mut sink).await
         }
     };
-    drop(sink);
+    // `sink` is not dropped explicitly: it holds only a `&mut` borrow of `buffer` (and of
+    // `on_chunk`), and that borrow already ends at its last use above, which is what lets
+    // `buffer.finish()` take `buffer` by value on the next line. The `on_chunk` box itself — and so
+    // the caller's `chunk_tx` — is released when this function returns, which is what the caller
+    // waits on before draining its event pump (`session/bash.rs`).
     let (output, truncated, full_output_path) = buffer.finish();
 
     match status {

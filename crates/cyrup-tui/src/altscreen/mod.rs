@@ -659,7 +659,13 @@ impl<B: Backend> AltScreen<B> {
     /// Tear down in pi's order — `TuiBase.stop` (`tui.ts:752-762`): delete placements, repaint the
     /// document into the main screen unless this is a mode switch, disable mouse reporting, then
     /// leave the alternate screen.
+    ///
+    /// The flash queue is dropped first — pi's `dispose()` on the stop path
+    /// (`tui-alt-screen.ts:303`, via `components/alt-screen-flash.ts:38-41`). Nothing repaints
+    /// after this point, so it is bookkeeping rather than a visible step, but it keeps the
+    /// teardown a faithful pair for [`ViewportRenderer::flash`]'s queue.
     pub(crate) fn stop(&mut self) {
+        flash::clear(&mut self.flashes);
         self.images.delete_all(self.preserve_screen);
         let width = self.term.terminal_mut().size().map(|s| s.width).unwrap_or(0);
         let mut out = std::io::stdout();

@@ -104,8 +104,15 @@ impl AgentSession {
         // happens inside `registerTool`, i.e. strictly earlier than any later `setActiveTools`, and
         // `setActiveToolsByName` is always the last word.
         self.refresh_extension_tools().await;
-        if let Some((tools, prompt)) = self.services.host_services.take_pending_active_tools() {
-            self.push_active_tools(tools, prompt).await;
+        // …and the restriction is RE-RESOLVED here, against the just-refreshed registry, rather than
+        // replayed from the pre-refresh pair the synchronous guest call built. `merge_registered`
+        // above auto-activates every newly registered name and writes the active set doing it, so
+        // replaying a stale pair left the dynamic-tool view holding the refresh's set and the agent
+        // holding the restriction's — the guest asked for `["read"]` and the facade answered
+        // `["read", <the guest's own tools>]`. Routing through the SAME facade method the host/CLI
+        // toggle uses keeps both in step and makes `setActiveToolsByName` the last word for real.
+        if let Some(names) = self.services.host_services.take_pending_active_tools() {
+            self.set_active_tools_by_name(&names).await;
         }
         let ops = self.services.host_services.take_pending_control();
         for op in ops {
@@ -317,10 +324,12 @@ impl AgentSession {
             self.fanout_emit(ev).await;
         }
         // EXT-004, event-tier twin of the drain in `apply_pending_control` (same ordering rule:
-        // the refresh runs first so an explicit `setActiveTools` still has the last word).
+        // the refresh runs first so an explicit `setActiveTools` still has the last word — and, as
+        // there, the restriction is re-resolved AFTER it rather than replayed from the pre-refresh
+        // pair, so the dynamic-tool view and the agent cannot disagree about what is active).
         self.refresh_extension_tools().await;
-        if let Some((tools, prompt)) = self.services.host_services.take_pending_active_tools() {
-            self.push_active_tools(tools, prompt).await;
+        if let Some(names) = self.services.host_services.take_pending_active_tools() {
+            self.set_active_tools_by_name(&names).await;
         }
         for op in self.services.host_services.take_pending_control() {
             if let Some(other) = self.apply_agent_state_op(op).await {

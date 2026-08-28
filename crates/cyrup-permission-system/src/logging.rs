@@ -234,6 +234,10 @@ impl PermissionSystemLogger {
     }
 }
 
+/// pi's `loggingWarningReporter` callback shape (`index.ts:164,170-172`): handed one
+/// human-readable warning message. Mirrors `manager::WarningCallback`.
+pub type LoggingWarningReporter = Arc<dyn Fn(&str) + Send + Sync>;
+
 /// pi's module-scope logging trio — `extensionLogger` (`index.ts:160-162`),
 /// `reportedLoggingWarnings` (`:163`) and `loggingWarningReporter` (`:164`) — plus the two entry
 /// points every call site goes through: `writeLogEntry` (`:182-194`) and `reportLoggingWarning`
@@ -254,7 +258,7 @@ pub struct AuditTrail {
     /// (`:170-172`). `None` until the host backend is attached, exactly as pi's is `null` until the
     /// extension sets it — and `reportLoggingWarning` early-returns on `null` WITHOUT recording the
     /// message (`:175-177`), so a warning raised before the reporter exists is reportable later.
-    reporter: Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>,
+    reporter: Mutex<Option<LoggingWarningReporter>>,
 }
 
 impl AuditTrail {
@@ -280,7 +284,7 @@ impl AuditTrail {
     }
 
     /// pi `setLoggingWarningReporter(reporter)` (`index.ts:170-172`).
-    pub fn set_reporter(&self, reporter: Arc<dyn Fn(&str) + Send + Sync>) {
+    pub fn set_reporter(&self, reporter: LoggingWarningReporter) {
         *self.reporter.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reporter);
     }
 

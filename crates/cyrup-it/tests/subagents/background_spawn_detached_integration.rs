@@ -74,11 +74,49 @@ fn write_script(dir: &std::path::Path, name: &str, script_json: &serde_json::Val
     path
 }
 
-/// Send `kill -0 pid` and report whether the OS still considers the process alive — an
+/// Report whether the OS still considers `pid` a genuinely *running* process — an
 /// independent-of-our-own-bookkeeping liveness probe, exactly what proves genuine detachment
 /// rather than this crate merely claiming it.
+///
+/// WHY NOT A BARE `kill -0`: `kill -0` succeeds for a ZOMBIE, i.e. a process that has already run
+/// to completion and exited but whose exit status nobody has reaped yet. The pid slot still
+/// exists and is still signalable, so `kill -0` reports success for a `<defunct>` entry that is
+/// not executing anything. That is not a hypothetical here: every process this file spawns
+/// detached deliberately OUTLIVES its own parent, so the kernel re-parents it to pid 1, and
+/// reaping then depends entirely on pid 1 being a real init that calls `wait()`. Under the
+/// container/microVM this suite runs in, pid 1 is `process_api --firecracker-init`, which does
+/// not reap orphans — so a detached runner that exited cleanly stays defunct for the rest of the
+/// sandbox's life and a bare `kill -0` would claim it is still alive forever.
+///
+/// So consult `/proc/<pid>/stat` first (field 3 is the single-character process state) and treat
+/// state `Z` as NOT alive, while every other state — `R`, `S`, `D`, `T`, ... — is alive, keeping
+/// the probe honest for a genuinely running process. `kill -0` remains the fallback for a Unix
+/// without `/proc` (and for a pid that has been fully reaped, where `/proc/<pid>` is gone and
+/// `kill -0` correctly reports dead).
 #[cfg(unix)]
 fn pid_is_alive(pid: u32) -> bool {
+    match proc_state_char(pid) {
+        Some(state) => state != 'Z',
+        None => kill_zero_succeeds(pid),
+    }
+}
+
+/// Read the process state character (field 3) out of `/proc/<pid>/stat`, or `None` when there is
+/// no such entry to read (no `/proc` on this platform, or the pid is fully gone/reaped).
+///
+/// Field 2 (`comm`) is parenthesized and may itself contain spaces and `)`, so the fields after
+/// it are located from the LAST `)` in the line rather than by splitting from the start.
+#[cfg(unix)]
+fn proc_state_char(pid: u32) -> Option<char> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let after_comm = stat.rsplit_once(')')?.1;
+    after_comm.split_whitespace().next()?.chars().next()
+}
+
+/// The original probe, kept as the no-`/proc` fallback: `kill -0 <pid>` succeeds iff the pid slot
+/// exists and is signalable by us (which includes zombies — see [`pid_is_alive`]).
+#[cfg(unix)]
+fn kill_zero_succeeds(pid: u32) -> bool {
     std::process::Command::new("kill")
         .args(["-0", &pid.to_string()])
         .status()

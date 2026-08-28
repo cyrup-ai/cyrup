@@ -261,6 +261,13 @@ impl PlacementRegistry {
     /// How many uploads are currently retained. The renderer's window onto the registry; nothing
     /// outside this module may hold a [`Placement`], because the eviction order is the type's
     /// invariant and an external reordering would silently break it.
+    #[allow(
+        dead_code,
+        reason = "pi's `uploadedKittyImages.size` (tui-alt-screen.ts:180). The read-only window \
+                  onto the registry the doc above describes; no diagnostics surface in the \
+                  alternate-screen renderer consumes it yet, and the type's eviction invariant is \
+                  the reason it must stay the only way out."
+    )]
     pub(super) fn tracked(&self) -> usize {
         self.entries.len()
     }
@@ -348,11 +355,23 @@ impl ImageLifecycle {
 
     /// The protocol the terminal negotiated before suppression — pi's `imageProtocol` (`:180`).
     /// `None` on a terminal with no native graphics, where every image is already half-blocks.
+    #[allow(
+        dead_code,
+        reason = "pi's `imageProtocol` getter (tui-alt-screen.ts:180). Ported with the lifecycle \
+                  it belongs to; the only in-crate consumer would be a caller that re-negotiates \
+                  graphics mid-excursion, which is not wired yet."
+    )]
     pub(super) fn protocol(&self) -> Option<ImageProtocol> {
         self.protocol
     }
 
     /// The retained uploads — read-only, for the renderer's diagnostics.
+    #[allow(
+        dead_code,
+        reason = "read-only view of pi's `uploadedKittyImages` (tui-alt-screen.ts:182). Ported \
+                  with `tracked` above and unreachable for the same reason: no renderer \
+                  diagnostics path exists yet."
+    )]
     pub(super) fn placements(&self) -> &PlacementRegistry {
         &self.placements
     }

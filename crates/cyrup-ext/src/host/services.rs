@@ -1529,6 +1529,7 @@ impl GuestState {
         }
     }
 
+    #[must_use]
     pub fn with_fs(mut self, root: PathBuf) -> Self {
         self.fs = FsCaps::single(root);
         self
@@ -1541,6 +1542,7 @@ impl GuestState {
     ///
     /// The grant crosses as data and is enforced host-side — a guest has no import that reads or
     /// changes it (ADR-0002, batch-17 instruction).
+    #[must_use]
     pub fn with_capabilities(
         mut self,
         caps: Capabilities,
@@ -1661,6 +1663,7 @@ impl GuestState {
     /// `ctx.hasUI`, extensions/types.ts:311,313). Called by [`crate::ExtensionHost::load_wasm`]
     /// before `init`, so a guest reads the SAME pair the native built-ins get through `HostCtx`
     /// instead of the standalone default.
+    #[must_use]
     pub fn with_host_mode(mut self, mode: ExtMode, has_ui: bool, cwd: PathBuf) -> Self {
         self.mode = mode;
         self.has_ui = has_ui;
@@ -1681,6 +1684,7 @@ impl GuestState {
     /// [`crate::ExtensionHost::load_wasm_with_caps`] before `init`, so a guest provider's
     /// `on-payload`/`on-response` reach the same `before_provider_request` /
     /// `after_provider_response` reductions the built-in provider path uses.
+    #[must_use]
     pub fn with_provider_reduction(mut self, hooks: Arc<dyn ProviderReduction>) -> Self {
         self.provider_reduction = Some(hooks);
         self
@@ -1706,6 +1710,7 @@ impl GuestState {
     /// Wire this guest onto the host-owned shared bus (Pi's single `createEventBus()` threaded to
     /// every extension, loader.ts:492,499). Called by [`crate::ExtensionHost::load_wasm`] before
     /// `init` so the guest's `bus.subscribe` declarations land in the SHARED bus (gap-08 §5.3).
+    #[must_use]
     pub fn with_bus(mut self, bus: Arc<SharedBus>) -> Self {
         self.bus = bus;
         self

@@ -331,11 +331,16 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 let mut i = 0usize;
                 while i < cs.len() {
                     if let Some(len) = extract_ansi_code_len(&cs, i) {
-                        chunk.extend(&cs[i..i + len]);
+                        // `extract_ansi_code_len` only reports a length that lies wholly within
+                        // `cs`, so this slice is always present; `i` still advances either way.
+                        if let Some(code) = cs.get(i..i + len) {
+                            chunk.extend(code);
+                        }
                         i += len;
                         continue;
                     }
-                    let c = cs[i];
+                    // `i < cs.len()` holds by the loop condition, so this never breaks early.
+                    let Some(&c) = cs.get(i) else { break };
                     let cw = char_width(c);
                     if chunk_w + cw > width && !chunk.is_empty() {
                         lines.push(std::mem::take(&mut chunk));

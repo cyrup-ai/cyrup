@@ -297,6 +297,7 @@ impl ResourceRegistry {
     /// still wins (first-wins precedence). Existing candidates are preserved; `ext_crate_paths` and
     /// `loose_extensions` are carried over unchanged. Parse failures / missing paths are dropped
     /// (Pi logs a warning and skips), never panicking.
+    #[must_use]
     pub fn extend(&self, extra: &DiscoveredPaths) -> ResourceRegistry {
         let mut skills: Vec<Skill> = self.skills.all().to_vec();
         let mut prompts: Vec<PromptTemplate> = self.prompts.all().to_vec();

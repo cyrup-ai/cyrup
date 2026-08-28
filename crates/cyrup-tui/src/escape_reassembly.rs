@@ -969,7 +969,7 @@ mod tests {
     fn the_osc_dcs_and_apc_introducers_are_left_to_their_own_machines() {
         // `stray_reply` owns `ESC ]`; TUI-047 owns `ESC P` / `ESC _`. All three must pass through
         // this module byte-for-byte, or that machine would never see them.
-        for intro in [b']', b'P', b'_'] {
+        for intro in *b"]P_" {
             let burst = vec![esc(), byte(intro), byte(b'1')];
             assert_eq!(run(burst.clone()), burst, "introducer {} must pass through", intro as char);
         }

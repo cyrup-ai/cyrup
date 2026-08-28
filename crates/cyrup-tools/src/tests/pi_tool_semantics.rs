@@ -41,7 +41,7 @@ fn edit_tool(cwd: PathBuf) -> EditTool {
         Arc::new(LocalFs),
         Arc::new(FileMutationLocks::new()),
         cwd,
-        EditOpts::default(),
+        EditOpts,
     )
 }
 
@@ -50,7 +50,7 @@ fn write_tool(cwd: PathBuf) -> WriteTool {
         Arc::new(LocalFs),
         Arc::new(FileMutationLocks::new()),
         cwd,
-        WriteOpts::default(),
+        WriteOpts,
     )
 }
 
@@ -274,7 +274,7 @@ async fn write_rechecks_cancellation_after_the_write_lands() {
         fs,
         Arc::new(FileMutationLocks::new()),
         cwd.clone(),
-        WriteOpts::default(),
+        WriteOpts,
     );
 
     let err = write
@@ -310,7 +310,7 @@ async fn edit_rechecks_cancellation_after_the_write_lands() {
         fs,
         Arc::new(FileMutationLocks::new()),
         cwd.clone(),
-        EditOpts::default(),
+        EditOpts,
     );
 
     let err = edit

@@ -470,8 +470,8 @@ mod tests {
         let cfg = ShellConfig::try_detect().expect("unix detection cannot fail (shell.ts:119)");
         assert_ne!(cfg.program, PathBuf::from("cmd.exe"));
         assert!(
-            cfg.program == PathBuf::from("/bin/bash")
-                || cfg.program == PathBuf::from("sh")
+            cfg.program == *"/bin/bash"
+                || cfg.program == *"sh"
                 || cfg.program.file_name().is_some_and(|n| n == "bash"),
             "got {:?}",
             cfg.program

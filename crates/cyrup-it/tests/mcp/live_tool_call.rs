@@ -414,7 +414,7 @@ async fn drive_tool_call(
     let offered = offered.lock().unwrap().clone();
     assert!(!offered.is_empty(), "the agent drove at least one real turn against the provider");
     assert!(
-        offered[0].iter().any(|name| *name == tool),
+        offered[0].contains(&tool),
         "the AGENT offered `{tool}` to the model, or the scripted call below would be answered by \
          nothing: {:?}",
         offered[0]

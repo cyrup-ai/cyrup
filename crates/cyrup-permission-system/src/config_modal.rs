@@ -226,7 +226,7 @@ impl ConfigController {
 /// `Math.min(Math.max(settings.length + 2, 6), 18)` (`zellij-modal.ts:855`), which for this modal's
 /// two settings is `6`.
 fn max_visible(settings: usize) -> usize {
-    settings.saturating_add(2).max(6).min(18)
+    settings.saturating_add(2).clamp(6, 18)
 }
 
 /// pi's `fuzzyFilter(items, query, item => item.label)` (`settings-list.ts:234`) reduced to the
