@@ -381,7 +381,7 @@ struct MatchSink<'a> {
     matches: &'a mut Vec<(u64, Vec<u8>)>,
     count: &'a mut usize,
     limit: usize,
-    /// The SECOND abort hook, covering the match-DENSE case [`CancelReader`] cannot: one 64 KiB
+    /// The SECOND abort hook, covering the match-DENSE case `CancelReader` cannot: one 64 KiB
     /// refill can fire `matched` thousands of times, and every one of those callbacks runs before
     /// the searcher asks the reader for another byte. Owned rather than borrowed — the token is an
     /// `Arc` handle, so the clone is a refcount bump and it keeps the `'a` lifetime tied to the

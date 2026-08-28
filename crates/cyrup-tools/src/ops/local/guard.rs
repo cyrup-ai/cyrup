@@ -30,7 +30,7 @@ use super::tracking::{track_detached_child_pid, untrack_detached_child_pid};
 /// the pid — and therefore the process-group id, which `setsid` made equal to it — remains ours.
 /// Declared AFTER `child` in `exec` so Rust's reverse-declaration drop order runs this guard while
 /// that ownership still holds.
-/// It also owns the registry membership from [`TRACKED_DETACHED_CHILD_PIDS`], and that half is
+/// It also owns the registry membership from `TRACKED_DETACHED_CHILD_PIDS`, and that half is
 /// deliberately NOT affected by [`Self::disarm`]. Pi untracks in a `finally` (`bash.ts:142`), which
 /// runs on the normal return, the abort throw and the timeout throw alike; the Rust equivalent of
 /// "runs no matter how we leave" is `Drop`, not a statement placed after that `select!` loop. Putting
@@ -41,7 +41,6 @@ use super::tracking::{track_detached_child_pid, untrack_detached_child_pid};
 /// kernel may since have recycled onto an unrelated process group.
 ///
 /// [`LocalProc::exec`]: crate::ops::ProcOps::exec
-/// [`TRACKED_DETACHED_CHILD_PIDS`]: crate::ops::local::tracking::TRACKED_DETACHED_CHILD_PIDS
 /// [`kill_tracked_detached_children`]: crate::ops::local::tracking::kill_tracked_detached_children
 #[cfg(unix)]
 pub(super) struct KillTreeOnDrop {
