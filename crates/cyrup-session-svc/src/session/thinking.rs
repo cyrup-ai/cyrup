@@ -19,19 +19,17 @@ impl AgentSession {
     }
 
     /// The thinking levels the active model supports (Pi `getAvailableThinkingLevels`,
-    /// agent-session.ts:1721-1724). A non-reasoning model supports only `off`.
+    /// agent-session.ts:1816-1819). A non-reasoning model supports only `off`.
     pub fn available_thinking_levels(&self) -> Vec<ModelThinkingLevel> {
-        // Pi `if (!this.model) return THINKING_LEVELS;` (agent-session.ts:1722), where
-        // `const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high"]`
-        // (agent-session.ts:297) — note it stops at `high`; `xhigh`/`max` are model-declared only.
+        // Pi `if (!this.model) return [...THINKING_LEVEL_OPTIONS];` (agent-session.ts:1817), and
+        // `THINKING_LEVEL_OPTIONS` is the FULL ladder — `["off","minimal","low","medium","high",
+        // "xhigh","max"]` (`core/defaults.ts:4-12`). It is `EXTENDED_THINKING_LEVELS` here.
+        //
+        // This used to return a five-rung list against a citation (`agent-session.ts:297
+        // THINKING_LEVELS`) that does not exist at 0.84.3; with no model resolved yet that silently
+        // hid `xhigh`/`max` from `/thinking` and from the picker.
         let Some(model) = ({ Self::lock(&self.compaction_model).clone() }) else {
-            return vec![
-                ModelThinkingLevel::Off,
-                ModelThinkingLevel::Minimal,
-                ModelThinkingLevel::Low,
-                ModelThinkingLevel::Medium,
-                ModelThinkingLevel::High,
-            ];
+            return cyrup_provider::EXTENDED_THINKING_LEVELS.to_vec();
         };
         cyrup_provider::get_supported_thinking_levels(&model)
     }

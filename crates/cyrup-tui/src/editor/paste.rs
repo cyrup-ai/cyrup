@@ -3,12 +3,28 @@ use super::*;
 impl InputEditor {
     // ---- large-paste markers (spec/tui/03 §5.5) --------------------------------------------
 
-    /// Handle a (bracketed) paste (`editor.ts:615` `handlePaste`): sanitize, then either collapse a
-    /// **large** paste (`> 10` lines or `> 1000` chars) to an atomic `[paste #N …]` marker stored in
+    /// Handle a (bracketed) paste (`handlePaste`, `editor.ts:1168-1234` @v0.84.3): sanitize, prepend
+    /// a separating space when a path lands against a word, then either collapse a **large** paste
+    /// (`> 10` lines or `> 1000` chars) to an atomic `[paste #N …]` marker stored in
     /// [`pastes`](Self::pastes), or insert a small paste verbatim. The marker keeps the buffer compact;
     /// [`expanded_text`](Self::expanded_text) restores the full content on submit.
     pub fn handle_paste(&mut self, raw: &str) {
-        let text = sanitize_paste(raw);
+        let mut text = sanitize_paste(raw);
+        // "If pasting a file path (starts with /, ~, or .) and the character before the cursor is a
+        // word character, prepend a space for better readability" (`editor.ts:1196-1204`). Upstream
+        // does this BEFORE the size gate, so the added space is counted by the gate and is part of
+        // what the registry stores (`this.pastes.set(pasteId, filteredText)`, `:1215`).
+        if text.starts_with(['/', '~', '.'])
+            && let Some(prev) = self
+                .col
+                .checked_sub(1)
+                .and_then(|i| self.lines.get(self.row).and_then(|line| line.get(i)))
+            // `/\w/` carries no `u` flag upstream, so it is the ASCII class `[A-Za-z0-9_]` — a paste
+            // landing after a non-ASCII letter must NOT gain a space.
+            && (prev.is_ascii_alphanumeric() || *prev == '_')
+        {
+            text.insert(0, ' ');
+        }
         let line_count = text.split('\n').count();
         let char_count = text.chars().count();
         if line_count > 10 || char_count > 1000 {
@@ -20,7 +36,11 @@ impl InputEditor {
             self.push_undo_for(LastAction::None);
             self.paste_counter += 1;
             let id = self.paste_counter;
-            let marker = if line_count > 1 {
+            // The label branches on the SAME `> 10` line constant as the gate above
+            // (`editor.ts:1218-1221` against `:1211`), deliberately: a 2..=10-line paste only gets
+            // here by exceeding 1000 chars, and upstream labels that one in chars. cyrup tested
+            // `> 1` here, so such a paste was mislabelled `+3 lines`.
+            let marker = if line_count > 10 {
                 format!("[paste #{id} +{line_count} lines]")
             } else {
                 format!("[paste #{id} {char_count} chars]")
@@ -148,7 +168,10 @@ impl InputEditor {
 }
 
 /// Read a run of ASCII digits starting at `from`, returning `(value, index just past the run)` — or
-/// `None` when there is no digit there (`\d+` in `PASTE_MARKER_SINGLE`).
+/// `None` when there is no digit there. Shared by the two `\d+` groups this module matches:
+/// `PASTE_MARKER_SINGLE`'s id and the CSI-u codepoint in [`decode_csi_u`]. A run too long for `u32`
+/// saturates rather than wrapping; neither caller can act on the result (no such paste id is live,
+/// and no CSI-u letter range contains it), so an absurd run degrades to "not a match".
 fn read_digits(chars: &[char], from: usize) -> Option<(u32, usize)> {
     let mut j = from;
     let mut value: u32 = 0;
@@ -239,10 +262,69 @@ fn renumber_markers(line: &[char], target: u32) -> Vec<char> {
     out
 }
 
-/// Sanitize a bracketed-paste payload (`editor.ts:1142-1179`): normalize `\r\n`/`\r` to `\n`, expand
-/// tabs to four spaces, and drop control bytes other than `\n`.
+/// Decode CSI-u re-encoded control bytes back to the literal byte — the
+/// `pastedText.replace(/\x1b\[(\d+);5u/g, …)` pass of `handlePaste` (`editor.ts:1180-1185`
+/// @v0.84.3), whose reason comment (`:1175-1179`) reads:
+///
+/// > Some terminals (e.g. tmux popups with extended-keys-format=csi-u) re-encode control bytes
+/// > inside bracketed paste as CSI-u Ctrl+\<letter\> sequences (ESC [ \<codepoint\> ; 5 u). Decode
+/// > those back to their literal byte so the per-char filter below preserves newlines instead of
+/// > stripping ESC and leaking the printable tail (e.g. "[106;5u") into the editor.
+///
+/// `106` is `j`, so `ESC [106;5u` is Ctrl+J — a newline. This has to run **before**
+/// [`sanitize_paste`]'s per-char filter, not after: the filter drops the ESC and there is nothing
+/// left to recognise.
+///
+/// The payload really does arrive intact — `escape_reassembly.rs`'s paste-body state machine emits
+/// an ESC inside `ESC [200~ … ESC [201~` verbatim, and `app::input` hands that straight to
+/// [`InputEditor::handle_paste`].
+///
+/// Hand-written scan rather than a regex: no new dependency, and no `&str` slicing (the crate denies
+/// `clippy::string_slice`). Codepoints outside `a`–`z` / `A`–`Z`, and any incomplete or malformed
+/// sequence, pass through verbatim — upstream's `return match`.
+fn decode_csi_u(raw: &str) -> String {
+    let chars: Vec<char> = raw.chars().collect();
+    let mut out = String::with_capacity(raw.len());
+    let mut i = 0usize;
+    while let Some(&c) = chars.get(i) {
+        if c == '\u{1b}'
+            && chars.get(i + 1) == Some(&'[')
+            && let Some((cp, after)) = read_digits(&chars, i + 2)
+            && chars.get(after) == Some(&';')
+            && chars.get(after + 1) == Some(&'5')
+            && chars.get(after + 2) == Some(&'u')
+        {
+            let end = after + 3;
+            let decoded = match cp {
+                // `String.fromCharCode(cp - 96)` / `(cp - 64)` (`editor.ts:1182-1183`).
+                97..=122 => char::from_u32(cp.saturating_sub(96)),
+                65..=90 => char::from_u32(cp.saturating_sub(64)),
+                _ => None,
+            };
+            match decoded {
+                Some(d) => out.push(d),
+                None => out.extend(chars.get(i..end).unwrap_or(&[]).iter().copied()),
+            }
+            i = end;
+            continue;
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
+}
+
+/// Sanitize a bracketed-paste payload — the three cleaning steps `handlePaste` runs in order
+/// (`editor.ts:1180-1194` @v0.84.3):
+///
+/// 1. [`decode_csi_u`] — CSI-u re-encoded control bytes back to literal bytes (`:1180-1185`).
+/// 2. `normalizeText` (`:1188`, defined at `:1055-1057`) — `\r\n`/`\r` to `\n`, tabs to four spaces.
+/// 3. The per-char filter (`:1191-1194`) — keep `\n`, drop the rest of the control range.
+///
+/// The path space-prepend that follows upstream (`:1196-1204`) needs the cursor, so it lives in
+/// [`InputEditor::handle_paste`] instead.
 fn sanitize_paste(raw: &str) -> String {
-    let unified = raw.replace("\r\n", "\n").replace('\r', "\n");
+    let unified = decode_csi_u(raw).replace("\r\n", "\n").replace('\r', "\n");
     let mut out = String::with_capacity(unified.len());
     for c in unified.chars() {
         match c {

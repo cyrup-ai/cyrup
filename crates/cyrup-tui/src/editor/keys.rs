@@ -6,14 +6,32 @@ impl InputEditor {
     /// Feed a key. Resolves an [`EditorAction`] via the keymap (R-10-018); printable chars insert.
     /// While a popup is open, navigation/accept/cancel route first (spec/tui/04 §5).
     pub fn handle_key(&mut self, ev: &KeyEvent) -> EditorOutcome {
-        // 1. Char-jump mode consumes the next printable char (or cancels).
+        // 1. Char-jump mode consumes the next printable char, cancels on the hotkey, or cancels and
+        //    falls through on anything else — upstream's three arms, in order (`editor.ts:607-625`).
         if let Some(dir) = self.jump.take() {
+            // (a) "Cancel if the hotkey is pressed again" (`:609-612`), with NO fall-through: the
+            // keymap dispatch at step 3 resolves the same key back to `JumpForward`/`JumpBackward`,
+            // so falling through here would RE-ARM jump mode instead of cancelling it.
+            if matches!(
+                self.keymap.action_for(ev),
+                Some(EditorAction::JumpForward | EditorAction::JumpBackward)
+            ) {
+                return EditorOutcome::Edited;
+            }
+            // (b) Printable character — perform the jump (`:614-621`). Upstream's printable test is
+            // `decodePrintableKey(data) ?? (data.charCodeAt(0) >= 32 ? data : undefined)`, which
+            // rejects Alt+<char> because the terminal sends it as `ESC <char>` and the first byte is
+            // 27; the ALT/SUPER exclusions here are that, matched to the insert path at step 4.
             if let KeyCode::Char(c) = ev.code
-                && !ev.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.jump_to(dir, c);
-                    return EditorOutcome::Edited;
-                }
-            return EditorOutcome::Edited; // any other key cancels jump
+                && !ev.modifiers.contains(KeyModifiers::CONTROL)
+                && !ev.modifiers.contains(KeyModifiers::ALT)
+                && !ev.modifiers.contains(KeyModifiers::SUPER)
+            {
+                self.jump_to(dir, c);
+                return EditorOutcome::Edited;
+            }
+            // (c) "Control character - cancel and fall through to normal handling" (`:623-624`).
+            // The `take()` above already cleared jump mode, so the key now runs its own binding.
         }
 
         // 2. Popup-open routing (before normal editing).

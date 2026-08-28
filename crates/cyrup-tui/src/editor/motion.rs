@@ -197,26 +197,54 @@ impl InputEditor {
 
     // ---- char-jump -------------------------------------------------------------------------
 
-    /// Jump the cursor to the next/previous occurrence of `target` on the current line, skipping the
-    /// current position (case-sensitive, `editor.ts:1990-2018`).
+    /// Jump the cursor to the next/previous occurrence of `target`. **Multi-line** search,
+    /// case-sensitive, skipping the current cursor position — `jumpToChar`
+    /// (`editor.ts:2043-2074` @v0.84.3; the previous cite `editor.ts:1990-2018` was version drift).
+    ///
+    /// The scan starts on the caret's own line and walks outward to the buffer edge (`:2051-2054`):
+    /// on that first line it begins one column past/before the caret, on every later line it covers
+    /// the whole line (`:2056-2063`). A hit moves **both** `row` and `col` (`:2067-2069`); no hit
+    /// anywhere leaves the cursor exactly where it was (`:2073`). The old port only ever searched
+    /// the current line and only ever assigned `col`.
     pub(super) fn jump_to(&mut self, dir: JumpDir, target: char) {
-        let Some(line) = self.lines.get(self.row) else { return };
-        match dir {
-            JumpDir::Forward => {
-                if let Some(off) = line.iter().enumerate().skip(self.col + 1).find_map(|(i, &c)| {
-                    (c == target).then_some(i)
-                }) {
-                    self.col = off;
-                }
-            }
-            JumpDir::Backward => {
-                if let Some(off) = (0..self.col)
-                    .rev()
-                    .find(|&i| line.get(i) == Some(&target))
-                {
-                    self.col = off;
-                }
-            }
+        self.last_action = LastAction::None; // `this.lastAction = null` (`editor.ts:2047`)
+        let hit = match dir {
+            JumpDir::Forward => (self.row..self.lines.len()).find_map(|idx| {
+                let line = self.lines.get(idx)?;
+                // `searchFrom = isCurrentLine ? cursorCol + 1 : undefined` (`:2056-2063`) fed to
+                // `String.indexOf` (`:2065`), i.e. an inclusive lower bound.
+                let from = if idx == self.row { self.col.saturating_add(1) } else { 0 };
+                let rest = line.get(from..)?;
+                rest.iter().position(|&c| c == target).map(|off| (idx, from.saturating_add(off)))
+            }),
+            JumpDir::Backward => (0..=self.row).rev().find_map(|idx| {
+                let line = self.lines.get(idx)?;
+                // `searchFrom = cursorCol - 1` (`:2060`) is an INCLUSIVE upper bound for
+                // `String.lastIndexOf` (`:2065`).
+                //
+                // Upstream quirk, reproduced deliberately: at `cursorCol === 0` that expression is
+                // `-1`, and `lastIndexOf(char, -1)` clamps its start to 0, so index 0 is still
+                // examined — a caret already sitting on a matching char at column 0 "jumps" to
+                // itself instead of continuing to earlier lines. `saturating_sub(1)` yields the
+                // same `0..=0` window. It is observable behaviour of the upstream this port is
+                // measured against, so it is mirrored rather than quietly corrected.
+                let upper = if idx == self.row {
+                    self.col.saturating_sub(1)
+                } else {
+                    line.len().checked_sub(1)?
+                };
+                let scanned = line.get(..=upper)?;
+                scanned.iter().rposition(|&c| c == target).map(|off| (idx, off))
+            }),
+        };
+        if let Some((row, col)) = hit {
+            self.row = row;
+            // `setCursorCol` (`:2069` → `:1377-1381`) also drops the sticky vertical-motion state.
+            // The jump path runs in `handle_key` ahead of `apply_editor_action`, so it never reaches
+            // that crate's central `reset_preferred_col` gate (`keys.rs`) and has to do it here —
+            // otherwise the Up/Down after a jump steers by a stale goal column.
+            self.col = col;
+            self.reset_preferred_col();
         }
     }
 }

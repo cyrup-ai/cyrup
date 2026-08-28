@@ -14,16 +14,49 @@
 //! [`mermaid_text::render`]. See the workspace `Cargo.toml` for why `mermansi` was rejected after
 //! being tried first (it forces `serde_json/preserve_order` on the whole workspace).
 //!
-//! **The diagram is rendered COLOURLESS and styled with the single `md_code_block` role.** pi
-//! themes four span classes — `border` -> `borderMuted`, `edge` -> `accent`, `edgeLabel` ->
-//! `muted`, `title` -> bold `accent` (`mermaid.ts:38-56`). That fidelity is deferred, NOT
-//! unreachable: `mermaid_text` renders into a `layout::Grid` that keeps per-cell structure
-//! (`cells: Vec<Vec<char>>` beside `fg: Vec<Vec<Option<Rgb>>>`), `Grid` is public and
-//! `Grid::get(col, row) -> char` with it. The one missing piece is a `get_fg` accessor — `fg` is
-//! private and escapes only through `Grid::render_with_colors`, which bakes ANSI. A ~5-line
-//! upstream PR adding that accessor, plus a grid walk here mapping `Rgb` onto [`crate::theme`]
-//! roles, buys the full four-class theming with NO ANSI parser. Until then the diagram — which is
-//! the feature — renders in one role.
+//! ## Span classes are INFERRED FROM THE RENDERED GEOMETRY
+//! pi themes **six** span classes — `border` -> `borderMuted`, `text` -> `text`, `edge` ->
+//! `accent`, `edgeLabel` -> `muted`, `title` -> bold `accent`, `none` -> unstyled (`styleSpan`,
+//! `mermaid.ts:38-53`) — reading them off `art.styled: Span[][]`, which its engine `grok-mermaid`
+//! reports per cell.
+//!
+//! [`mermaid_text`] reports nothing of the kind, and there is no accessor to add:
+//!
+//! * `layout::Grid::fg` is not a class channel. Its own doc
+//!   (`mermaid-text-0.57.0/src/layout/grid.rs:286-289`) says the plane is "Empty (all `None`) until
+//!   the caller paints colors via `Grid::set_fg` / `paint_fg_rect`", and the painters fire only for
+//!   a diagram whose SOURCE carries `style` / `classDef` / `linkStyle`. Where it is non-`None` it
+//!   holds the diagram author's chosen RGB, which has no relation to a semantic class.
+//! * The `Grid` never escapes the engine. Both public entry points return `String`
+//!   (`render/unicode.rs:674`, `:692`) and delegate to the private `render_inner` (`:700`), which
+//!   constructs and drops the grid.
+//! * It would not generalise anyway: 16 of the 18 `DiagramKind`s early-return a `String` from their
+//!   own render module (`lib.rs:283-392`) and never touch that pipeline at all.
+//!
+//! So [`classify`] derives the six classes from the finished character grid instead — which works
+//! for all 18 kinds precisely because it operates on output. **The inference is geometric and it
+//! can be wrong.** Known limits, all cosmetic:
+//!
+//! * A node is recognised by its CLOSED outline (a corner run that meets a matching corner run
+//!   below with intact sides). A shape whose corner the engine overwrites with something else —
+//!   a class-diagram box terminated by a relationship marker (`└──△──┆`), or one a passing edge
+//!   continues straight through (`└────────◆────────│`) — is not recognised at all, so its whole
+//!   body falls to the outside rules and its label reads `EdgeLabel` rather than `Text`.
+//! * A corner scan alone cannot separate a node from an edge: `DIR_TO_CHAR[0b1010]` is `'┌'`
+//!   (`grid.rs:131`), so an edge junction produces the identical glyph. That is why the closed
+//!   rectangle match is load-bearing rather than an optimisation — and why the thick set
+//!   `┏┓┗┛┃━` is NOT treated as a corner: `THICK_DIR_TO_CHAR` (`grid.rs:79-96`) emits it for UML
+//!   fork/join bars, which are edges.
+//! * Conversely, an edge route that happens to close a rectangle reads as a node outline
+//!   (`Border` instead of `Edge`).
+//! * A box-drawing glyph used decoratively **inside** a node label reads as `Border`; a plain-text
+//!   label that happens to sit inside a node's bounding box reads as `Text` even when it is an
+//!   edge label the router placed there.
+//! * `Title` is only ever inferred for the text-report kinds (`pie`, `gantt`, `journey`,
+//!   `quadrant`, …) that emit a plain leading line and draw no node box at all —
+//!   `render/pie.rs:142-146`, `render/gantt.rs:90-92`. A flowchart never claims one.
+//! * Geometry is indexed by DISPLAY column, so a zero-width combining mark inside a label shifts
+//!   the columns after it on that row and can misclassify its tail.
 //!
 //! [`mermaid_text::render`] is used rather than `render_with_width`: the latter compacts the gap
 //! configuration to fit a budget, which pi never does. pi measures the finished art and falls back
@@ -36,9 +69,9 @@
 //! markdown-string seam whose output is lexed a second time, so spacing and box-drawing have to
 //! survive a re-parse. cyrup's walker emits [`ratatui::text::Line`]s straight into the output, with
 //! nothing left to re-parse, so the round-trip has nothing to protect — and skipping it is what
-//! lets the rows carry the `md_code_block` role the engine decision calls for rather than the
-//! inline-`md_code` role a backtick round-trip would produce. The observable result is the same set
-//! of rows, one per line.
+//! lets each row carry its own per-class [`Span`](ratatui::text::Span)s rather than the flat
+//! inline-`md_code` role a backtick round-trip would collapse them into. The observable result is
+//! the same set of rows, one per line.
 //!
 //! ## Scope of the hook
 //! [`MermaidContext`] is the mermaid-only half of the per-message markdown-transform seam: it
@@ -55,6 +88,12 @@
 
 use cyrup_config::MermaidRenderingMode;
 use mermaid_text::Error as MermaidError;
+// The arrow tips (`▸▾◂▴`) and the non-arrow endpoints (`○ ×`) are `pub` in the engine
+// (`layout/grid.rs:44` and `:51`), so they are imported rather than re-typed: an engine bump that
+// changes a glyph becomes a compile error here instead of a silent misclassification. The corner
+// and side glyphs cannot be — `mod rect` (`:26`), `mod rounded` (`:36`) and `mod dotted` (`:65`)
+// are private — so those are spelled as literals below.
+use mermaid_text::layout::grid::{arrow, endpoint};
 
 /// Which pi message a markdown body belongs to — `MarkdownTransformContext["messageType"]`
 /// (`core/extensions/types.ts:1202`).
@@ -160,10 +199,31 @@ pub(crate) fn mode_from_setting(value: &str) -> MermaidRenderingMode {
     }
 }
 
+/// pi's span classes — the six arms of `styleSpan` (`mermaid.ts:39-52`), in that order.
+///
+/// Upstream each is reported by the engine on a `Span`'s `cls`; here they are inferred by
+/// [`classify`] from the rendered geometry (see the module doc for where that inference breaks).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpanClass {
+    /// `theme.fg("borderMuted", …)` (`mermaid.ts:40-41`) — a node's outline.
+    Border,
+    /// `theme.fg("text", …)` (`:42-43`) — a node's label.
+    Text,
+    /// `theme.fg("accent", …)` (`:44-45`) — link lines, junctions, arrow tips.
+    Edge,
+    /// `theme.fg("muted", …)` (`:46-47`) — a label riding on a link rather than in a node.
+    EdgeLabel,
+    /// `theme.fg("accent", theme.bold(…))` (`:48-49`) — the diagram title.
+    Title,
+    /// `return span.text` (`:50-51`) — unstyled; here, the padding between glyphs.
+    None,
+}
+
 /// What the walker should emit for one mermaid fence.
 pub(crate) enum DiagramOutcome {
-    /// The rendered diagram, one entry per row.
-    Diagram(Vec<String>),
+    /// The rendered diagram, one entry per row, each row split into per-class runs — the shape of
+    /// pi's `art.styled: Span[][]` (`mermaid.ts:55-57` `themedLines`).
+    Diagram(Vec<Vec<(SpanClass, String)>>),
     /// `return token.raw` — the untouched fence (`mermaid.ts:74`, `:76`).
     Raw,
     /// The untouched fence followed by this warning line (`mermaid.ts:77-82`).
@@ -184,6 +244,243 @@ fn warning_line(warnings: &[String]) -> Option<String> {
         _ => String::new(),
     };
     Some(format!("Mermaid diagram not rendered: {first}{suffix}"))
+}
+
+/// Top-left corner glyphs a node outline may open with: `rect::TL`, `rounded::TL`
+/// (`grid.rs:27`, `:37`) plus the two slanted sides `╱ ╲` the diamond / hexagon / parallelogram /
+/// trapezoid shapes use for a corner. The THICK set is deliberately absent — see the module doc.
+const TOP_LEFT: [char; 4] = ['┌', '╭', '╱', '╲'];
+/// Top-right partners of [`TOP_LEFT`] (`rect::TR`, `rounded::TR`, plus the slanted pair).
+const TOP_RIGHT: [char; 4] = ['┐', '╮', '╱', '╲'];
+/// Bottom-left closers (`rect::BL`, `rounded::BL`, plus the slanted pair).
+const BOTTOM_LEFT: [char; 4] = ['└', '╰', '╱', '╲'];
+/// Bottom-right closers (`rect::BR`, `rounded::BR`, plus the slanted pair).
+const BOTTOM_RIGHT: [char; 4] = ['┘', '╯', '╱', '╲'];
+
+/// A glyph the engine draws structure with: the whole Unicode **Box Drawing** block (which is
+/// every glyph `DIR_TO_CHAR` / `THICK_DIR_TO_CHAR` / `rect` / `rounded` / `dotted` can produce —
+/// `grid.rs:26-134`) plus the arrow tips and endpoints the engine exports.
+///
+/// Block Elements (`█ ░`) are excluded on purpose: they are the pie / gantt bar fills, which are
+/// data, not structure.
+fn is_structural(ch: char) -> bool {
+    matches!(ch, '\u{2500}'..='\u{257F}')
+        || ch == arrow::RIGHT
+        || ch == arrow::DOWN
+        || ch == arrow::LEFT
+        || ch == arrow::UP
+        || ch == endpoint::CIRCLE
+        || ch == endpoint::CROSS
+}
+
+/// The class-diagram relationship markers (`△ ◆ ◇` — `render/class.rs:554`, `:558`, `:562` — plus
+/// their rotations), which the renderer writes INTO an outline run: `└────────△────────┘`. They are
+/// structure for outline-matching purposes even though they live outside the Box Drawing block.
+fn is_relationship_marker(ch: char) -> bool {
+    matches!(ch, '△' | '▲' | '▽' | '▼' | '◇' | '◆' | '◁' | '◀' | '▷' | '▶')
+}
+
+/// A glyph allowed inside the horizontal run between two matching corners.
+fn is_border_run(ch: char) -> bool {
+    is_structural(ch) || is_relationship_marker(ch)
+}
+
+/// A glyph allowed in a node's left or right wall on a row between its corners: the border set
+/// plus the ASCII/bracket walls the circle, stadium, hexagon and asymmetric shapes use
+/// (`( ) < > ⟨ ⟩`).
+fn is_side(ch: char) -> bool {
+    is_border_run(ch) || matches!(ch, '(' | ')' | '<' | '>' | '\u{27E8}' | '\u{27E9}')
+}
+
+/// A recognised node outline, in DISPLAY columns and row indices, corners inclusive.
+#[derive(Clone, Copy)]
+struct Rect {
+    top: usize,
+    bottom: usize,
+    left: usize,
+    right: usize,
+}
+
+impl Rect {
+    fn on_outline(&self, row: usize, col: usize) -> bool {
+        if row < self.top || row > self.bottom || col < self.left || col > self.right {
+            return false;
+        }
+        row == self.top || row == self.bottom || col == self.left || col == self.right
+    }
+
+    fn contains(&self, row: usize, col: usize) -> bool {
+        row > self.top && row < self.bottom && col > self.left && col < self.right
+    }
+}
+
+/// The visible column count of one `char`, routed through the crate's single width primitive.
+fn char_cols(ch: char) -> usize {
+    let mut buf = [0u8; 4];
+    crate::text_width::str_width(ch.encode_utf8(&mut buf))
+}
+
+/// The rendered rows re-indexed by DISPLAY column, so geometry lines up the way the engine laid it
+/// out (it measures with `unicode-width` too). A double-width glyph owns its first column and
+/// leaves `None` in the second; a blank column is `None` as well, which is what makes a run of
+/// border glyphs terminate at the first gap.
+fn column_grid(rows: &[String]) -> Vec<Vec<Option<char>>> {
+    rows.iter()
+        .map(|row| {
+            let mut line: Vec<Option<char>> = Vec::new();
+            for ch in row.chars() {
+                line.push(if ch == ' ' { None } else { Some(ch) });
+                for _ in 1..char_cols(ch).max(1) {
+                    line.push(None);
+                }
+            }
+            line
+        })
+        .collect()
+}
+
+fn cell(grid: &[Vec<Option<char>>], row: usize, col: usize) -> Option<char> {
+    grid.get(row)?.get(col).copied().flatten()
+}
+
+/// Every closed outline in the grid. Overlaps are kept (a double-circle nests one inside another);
+/// the classifier only ever asks "is this cell on/inside ANY of them".
+fn find_rects(grid: &[Vec<Option<char>>]) -> Vec<Rect> {
+    let mut rects = Vec::new();
+    for (row, line) in grid.iter().enumerate() {
+        for (col, slot) in line.iter().enumerate() {
+            if slot.is_some_and(|ch| TOP_LEFT.contains(&ch))
+                && let Some(rect) = rect_from(grid, row, col)
+            {
+                rects.push(rect);
+            }
+        }
+    }
+    rects
+}
+
+/// Walk right from a candidate top-left corner, and at every candidate top-right partner try to
+/// close the box below. The FIRST partner that closes wins, which is what keeps
+/// `┌────────┐──────┐` — a box whose top edge an edge route continues past — bound to its own
+/// corner rather than to the junction six columns further on.
+fn rect_from(grid: &[Vec<Option<char>>], top: usize, left: usize) -> Option<Rect> {
+    let width = grid.get(top)?.len();
+    for right in left.saturating_add(1)..width {
+        let ch = cell(grid, top, right)?;
+        if TOP_RIGHT.contains(&ch)
+            && let Some(bottom) = find_bottom(grid, top, left, right)
+        {
+            return Some(Rect { top, bottom, left, right });
+        }
+        if !is_border_run(ch) {
+            return None;
+        }
+    }
+    None
+}
+
+/// The first row below `top` that closes the two walls with a matching corner pair over an
+/// unbroken border run. Bails as soon as either wall stops being a wall.
+fn find_bottom(grid: &[Vec<Option<char>>], top: usize, left: usize, right: usize) -> Option<usize> {
+    for row in top.saturating_add(1)..grid.len() {
+        let (Some(l), Some(r)) = (cell(grid, row, left), cell(grid, row, right)) else {
+            return None;
+        };
+        if BOTTOM_LEFT.contains(&l)
+            && BOTTOM_RIGHT.contains(&r)
+            && (left.saturating_add(1)..right)
+                .all(|c| cell(grid, row, c).is_some_and(is_border_run))
+        {
+            return Some(row);
+        }
+        if !(is_side(l) && is_side(r)) {
+            return None;
+        }
+    }
+    None
+}
+
+/// The row index carrying the diagram title, if one is inferable.
+///
+/// Only the text-report kinds emit one, and they emit it as a plain leading line with no box
+/// anywhere in the drawing (`render/pie.rs:142-146` centres it and follows it with a blank;
+/// `render/gantt.rs:90-92` puts it first). Requiring BOTH "no node outline anywhere" and "row 0 has
+/// no structural glyph" is what stops a flowchart's first edge-label row from claiming the class.
+fn title_row(rows: &[String], rects: &[Rect]) -> Option<usize> {
+    if !rects.is_empty() {
+        return None;
+    }
+    let first = rows.first()?;
+    if first.trim().is_empty() || first.chars().any(is_border_run) {
+        return None;
+    }
+    Some(0)
+}
+
+/// Split the rendered rows into pi's six span classes, one `(class, text)` run per style change —
+/// the shape `themedLines` consumes (`mermaid.ts:55-57`).
+///
+/// The classes are inferred, not reported; the module doc lists where the inference breaks.
+fn classify(rows: &[String]) -> Vec<Vec<(SpanClass, String)>> {
+    let grid = column_grid(rows);
+    let rects = find_rects(&grid);
+    let title = title_row(rows, &rects);
+    // A drawing with no node outline at all is a text report (pie, gantt, journey, quadrant …):
+    // its prose is the diagram's own content, so it reads `Text`. In a drawing that HAS nodes, the
+    // prose outside them is by construction a label riding on a link — pi's `edgeLabel`.
+    let text_report = rects.is_empty();
+
+    rows.iter()
+        .enumerate()
+        .map(|(row, line)| {
+            let mut runs: Vec<(SpanClass, String)> = Vec::new();
+            let mut col = 0usize;
+            for ch in line.chars() {
+                let class = class_of(ch, row, col, &rects, title == Some(row), text_report);
+                match runs.last_mut() {
+                    Some((prev, text)) if *prev == class => text.push(ch),
+                    _ => runs.push((class, ch.to_string())),
+                }
+                col = col.saturating_add(char_cols(ch).max(1));
+            }
+            runs
+        })
+        .collect()
+}
+
+fn class_of(
+    ch: char,
+    row: usize,
+    col: usize,
+    rects: &[Rect],
+    in_title_row: bool,
+    text_report: bool,
+) -> SpanClass {
+    if rects.iter().any(|r| r.on_outline(row, col)) {
+        return SpanClass::Border;
+    }
+    if rects.iter().any(|r| r.contains(row, col)) {
+        // A structural glyph strictly inside an outline is the engine's own chrome — the cylinder's
+        // lid rule, the class-diagram compartment separator `├──┤`, the inner ring of a double
+        // circle — so it stays `Border` rather than becoming label text.
+        return if ch == ' ' {
+            SpanClass::None
+        } else if is_border_run(ch) {
+            SpanClass::Border
+        } else {
+            SpanClass::Text
+        };
+    }
+    if ch == ' ' {
+        return SpanClass::None;
+    }
+    if is_border_run(ch) {
+        return SpanClass::Edge;
+    }
+    if in_title_row {
+        return SpanClass::Title;
+    }
+    if text_report { SpanClass::Text } else { SpanClass::EdgeLabel }
 }
 
 /// Render one mermaid fence body, applying pi's width and warning rules (`mermaid.ts:75-82`).
@@ -241,5 +538,7 @@ pub(crate) fn render_diagram(
     if width > available_width {
         return DiagramOutcome::Raw;
     }
-    DiagramOutcome::Diagram(rows)
+    // `const lines = options.theme ? themedLines(art, options.theme) : art.plain` (`mermaid.ts:83`)
+    // — the theme is always present here, so the rows leave classified.
+    DiagramOutcome::Diagram(classify(&rows))
 }

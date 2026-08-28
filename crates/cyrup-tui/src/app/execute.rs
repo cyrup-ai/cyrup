@@ -211,6 +211,16 @@ impl<B: Backend> App<B> {
                     .and_then(|l| serde_json::to_value(l).ok())
                     .and_then(|v| v.as_str().map(str::to_string))
                     .unwrap_or_else(|| "medium".to_string());
+                // Same reason, same seam: the `Thinking level` submenu is built without a session,
+                // and pi reads the ladder fresh at every open (`interactive-mode.ts:4792`). Re-seed
+                // it here so a `/model` switch earlier in the session is reflected — the fold that
+                // sees `ModelChanged` is synchronous and holds no session
+                // (`AppState`'s note on the cached settings map).
+                self.state.available_thinking_levels = session
+                    .available_thinking_levels()
+                    .into_iter()
+                    .map(|l| crate::app::thinking_level_str(l).to_string())
+                    .collect();
                 let rows = settings_rows(
                     session.services().settings.effective(),
                     &self.state.theme.name,
@@ -280,7 +290,24 @@ impl<B: Backend> App<B> {
                     }
                     return;
                 }
-                self.open_data_child_selector(SelectorKind::ModelThinking, entries, 0, parent);
+                // `preselect: () => currentModelKey ?? currentDefaultModelKey`
+                // (`settings-selector.ts:610`) — `model_thinking_rows` already sorts that row
+                // first, so index 0 IS that model.
+                self.open_submenu_child_selector(
+                    SelectorKind::ModelThinking,
+                    SelectorKind::ModelThinking.title().to_string(),
+                    // `description: "Select a model to configure"` (`settings-selector.ts:581`).
+                    "Select a model to configure",
+                    1,
+                    2,
+                    // `searchable: true` (`:611`).
+                    true,
+                    // `layout: MODEL_PICKER_LAYOUT` (`:612`).
+                    crate::submenu_selector::MODEL_PICKER_LAYOUT,
+                    entries,
+                    0,
+                    parent,
+                );
             }
 
             C::OpenSelector(SelectorKind::ModelThinkingLevel) => {
@@ -298,18 +325,30 @@ impl<B: Backend> App<B> {
                 };
                 let eff = session.services().settings.effective();
                 let existing = eff.all_model_thinking_levels().get(&model_key).copied();
-                const LEVELS: [(&str, &str); 7] = [
-                    ("off", "No reasoning"),
-                    ("minimal", "Very brief reasoning (~1k tokens)"),
-                    ("low", "Light reasoning (~2k tokens)"),
-                    ("medium", "Moderate reasoning (~8k tokens)"),
-                    ("high", "Deep reasoning (~16k tokens)"),
-                    ("xhigh", "Extra-high reasoning (~32k tokens)"),
-                    ("max", "Maximum reasoning"),
-                ];
-                let mut rows: Vec<(String, String, Option<String>)> = LEVELS
+                // `const model = defaultModelByValue.get(ctx.model); if (!model) return [];` then
+                // `const levels = (model.reasoning ? getSupportedThinkingLevels(model) : ["off"])`
+                // (`settings-selector.ts:618-626`) — THIS model's ladder, not the full seven, so a
+                // non-reasoning model offers `off` alone. `get_supported_thinking_levels` already
+                // folds pi's ternary in (it returns `[off]` when `!model.reasoning`).
+                let catalog = session.available_model_catalog();
+                let levels = catalog
                     .iter()
-                    .map(|(l, d)| ((*l).to_string(), (*l).to_string(), Some((*d).to_string())))
+                    .find(|m| format!("{}/{}", m.provider, m.id) == model_key)
+                    .map(cyrup_provider::get_supported_thinking_levels)
+                    .unwrap_or_default();
+                let mut rows: Vec<(String, String, Option<String>)> = levels
+                    .into_iter()
+                    .map(|l| {
+                        let level = crate::app::thinking_level_str(l);
+                        (
+                            level.to_string(),
+                            level.to_string(),
+                            // `THINKING_DESCRIPTIONS[level]` (`settings-selector.ts:29-37,630`) —
+                            // the same table `thinking-selector.ts:24-32` uses, shared rather than
+                            // copied a third time.
+                            Some(crate::thinking_selector::level_description(level).to_string()),
+                        )
+                    })
                     .collect();
                 if existing.is_some() {
                     let global = eff
@@ -328,8 +367,39 @@ impl<B: Backend> App<B> {
                         rows.iter().position(|(v, _, _)| v == s)
                     })
                     .unwrap_or(0);
-                self.open_data_child_selector(
+                // pi's `if (!model) return []` (`settings-selector.ts:620`) leaves the step with no
+                // options at all. Rather than mount an empty picker the user can only Esc out of,
+                // say so and hand the model list back — the same recovery the empty-catalog branch
+                // of step 1 above uses.
+                if rows.is_empty() {
+                    self.state.transcript.push_status(format!("{model_key} is unavailable"));
+                    if let Some(parent) = parent {
+                        self.state.selector = Some(*parent);
+                    }
+                    return;
+                }
+                // `title: (ctx) => `Thinking Level for ${modelDisplayLabel(m) ?? ctx.model}``
+                // (`settings-selector.ts:616-619`), where `modelDisplayLabel` is
+                // `` `${id} [${provider}]` `` (`:178-180`) — which is what `model_key`'s
+                // `provider/id` resolves to, falling back to the raw key when the model is gone.
+                let title = match catalog.iter().find(|m| {
+                    format!("{}/{}", m.provider, m.id) == model_key
+                }) {
+                    Some(m) => format!("Thinking Level for {} [{}]", m.id, m.provider),
+                    None => format!("Thinking Level for {model_key}"),
+                };
+                self.open_submenu_child_selector(
                     SelectorKind::ModelThinkingLevel,
+                    title,
+                    // `description: "Select default thinking level for this model"` (`:621`).
+                    "Select default thinking level for this model",
+                    2,
+                    2,
+                    // The level step declares no `searchable`/`layout` (`settings-selector.ts:
+                    // 614-644`), so it takes `SUBMENU_SELECT_LIST_LAYOUT`'s `{12, 32}`
+                    // (`settings-submenu.ts:15-18`) with no search box.
+                    false,
+                    crate::ColumnLayout::SLASH,
                     rows,
                     selected,
                     parent,

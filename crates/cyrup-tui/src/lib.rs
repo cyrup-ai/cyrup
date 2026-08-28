@@ -93,6 +93,7 @@ mod startup_selector;
 mod status;
 mod status_indicator;
 mod stray_reply;
+mod submenu_selector;
 mod terminal_progress;
 mod terminal_query;
 mod terminal_title;
@@ -100,6 +101,7 @@ mod text_input;
 mod text_width;
 mod theme;
 mod theme_access;
+mod thinking_selector;
 mod tmux;
 mod transcript;
 mod tree_selector;
@@ -157,9 +159,9 @@ pub use error::TuiError;
 pub use fuzzy::{filter as fuzzy_filter, fuzzy_match, score as fuzzy_score, Match};
 pub use image::{
     cached_capabilities, detect_capabilities, detect_capabilities_from,
-    detect_capabilities_on_platform, hyperlinks_supported, image_fallback_text,
-    reset_capabilities_cache, seed_capabilities, seed_hyperlink_support, set_capabilities,
-    ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
+    detect_capabilities_on_platform, detect_capabilities_with_overrides, hyperlinks_supported,
+    image_fallback_text, reset_capabilities_cache, seed_capabilities, seed_hyperlink_support,
+    set_capabilities, ImageBlock, ImageProtocol, ImageRenderer, TerminalCapabilities,
 };
 pub use keyboard_protocol::{
     current as keyboard_protocol, decide as decide_keyboard_protocol, find_kitty_flags,
@@ -197,6 +199,8 @@ pub use selector::{
     input_line_spans, search_input_spans, CheckboxSelector, ListSelector, Selector, SelectorKind,
     SelectorOutcome, INPUT_PROMPT, SCOPED_MODELS_ALL,
 };
+pub use submenu_selector::SubmenuSelector;
+pub use thinking_selector::ThinkingSelector;
 pub use user_message_selector::{UserMessageRow, UserMessageSelector};
 pub use session_search::{
     filter_and_sort as filter_and_sort_sessions, match_text as match_session_text,

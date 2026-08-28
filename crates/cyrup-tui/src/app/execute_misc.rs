@@ -2,7 +2,7 @@ use super::*;
 
 /// The picker/command level vocabulary → [`ModelThinkingLevel`].
 ///
-/// The same seven strings `ListSelector::thinking` rows on and `ModelThinkingLevel`'s
+/// The same strings [`crate::thinking_selector::ThinkingSelector`] rows on and `ModelThinkingLevel`'s
 /// `serde(rename_all = "camelCase")` wire form produces (`cyrup-core/src/message/thinking.rs:25`),
 /// so a level round-trips settings → picker → settings unchanged. Shared by the session-only
 /// `SetThinking` arm and its persisting `ConfirmSelectionAsDefault` sibling, which must agree on
@@ -227,23 +227,17 @@ impl<B: Backend> App<B> {
         });
 
         // `session.getAvailableThinkingLevels()` (`core/agent-session.ts:1816-1819`): the current
-        // model's ladder, or the full `THINKING_LEVEL_OPTIONS` when no model is selected. Ranked by
-        // the `/thinking` builtin's completer (`commands.rs:130`).
-        let current = session.model();
-        let catalog = session.available_model_catalog();
-        let levels = current
-            .as_ref()
-            .and_then(|c| {
-                catalog.iter().find(|m| {
-                    m.id.as_str() == c.model.as_str() && m.provider.as_str() == c.provider.as_str()
-                })
-            })
-            .map(cyrup_provider::get_supported_thinking_levels)
-            .unwrap_or_else(|| cyrup_provider::EXTENDED_THINKING_LEVELS.to_vec());
-        let thinking_levels = levels
+        // model's ladder, or the full `THINKING_LEVEL_OPTIONS` when no model is selected. pi reads
+        // it from the session at BOTH consumers — the `/thinking` completer
+        // (`interactive-mode.ts:715`) and the picker (`:4792`) — so this one call feeds both here
+        // too, instead of the completer re-deriving it from the catalog and drifting from what the
+        // picker offers.
+        let thinking_levels: Vec<String> = session
+            .available_thinking_levels()
             .into_iter()
-            .map(|l| cyrup_provider::api::compat::thinking_level_key(l).to_string())
+            .map(|l| thinking_level_str(l).to_string())
             .collect();
+        self.state.available_thinking_levels = thinking_levels.clone();
 
         // `extension_completions` is NOT part of this snapshot — it is fetched per keystroke by
         // [`Self::refresh_extension_completions`] and carried across by `set_argument_sources`.
@@ -510,6 +504,11 @@ impl<B: Backend> App<B> {
             C::ThinkingCommand(arg) => {
                 // Pi `handleThinkingCommand(searchTerm?)` (`interactive-mode.ts:4771-4785`).
                 let levels = session.available_thinking_levels();
+                // The picker's ladder is the session's, not a hardcoded seven
+                // (`interactive-mode.ts:4792`). Re-seeded here because this is the primary route
+                // in and the snapshot that normally fills it may predate a model switch.
+                self.state.available_thinking_levels =
+                    levels.iter().copied().map(thinking_level_str).map(str::to_string).collect();
                 let Some(term) = arg else {
                     // No argument → the picker. Seed the persisted default first so the row can be
                     // badged and `Ctrl+S` offered — this is the second route in (the other is

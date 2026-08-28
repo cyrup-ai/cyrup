@@ -112,9 +112,10 @@ async fn empty_catalog_builds_a_modelless_session_with_the_no_models_banner() {
 }
 
 /// pi sdk.ts:238-240 — `if (!model) { thinkingLevel = "off"; }`; and the capability getters read the
-/// optional model: `getAvailableThinkingLevels` returns the whole `THINKING_LEVELS` constant
-/// (agent-session.ts:1722 + :297) and `supportsThinking` is `!!this.model?.reasoning`
-/// (agent-session.ts:1730).
+/// optional model: `getAvailableThinkingLevels` returns the whole `THINKING_LEVEL_OPTIONS` constant
+/// (`core/agent-session.ts:1816-1819` — `if (!this.model) return [...THINKING_LEVEL_OPTIONS];` —
+/// whose seven rungs are defined at `core/defaults.ts:4-12`) and `supportsThinking` is
+/// `!!this.model?.reasoning` (`core/agent-session.ts:1824`).
 #[tokio::test]
 async fn modelless_session_reports_off_thinking_and_the_full_level_ladder() {
     let fx = fixture();
@@ -130,8 +131,11 @@ async fn modelless_session_reports_off_thinking_and_the_full_level_ladder() {
             ModelThinkingLevel::Low,
             ModelThinkingLevel::Medium,
             ModelThinkingLevel::High,
+            ModelThinkingLevel::Xhigh,
+            ModelThinkingLevel::Max,
         ],
-        "pi returns the THINKING_LEVELS constant (agent-session.ts:297) when there is no model"
+        "pi returns the seven-rung THINKING_LEVEL_OPTIONS when there is no model \
+         (core/agent-session.ts:1817 -> core/defaults.ts:4-12)"
     );
     // Setting a level cannot escape `off` while there is nothing to clamp against
     // (pi `_clampThinkingLevel`, agent-session.ts:1608-1610).

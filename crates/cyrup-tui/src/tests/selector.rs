@@ -49,7 +49,11 @@ fn ctrl(c: char) -> InputEvent {
 
 #[test]
 fn thinking_selector_renders_borders_labels_and_cursor() {
-    let mut app = App::new(TestBackend::new(60, 16), UiTheme::dark()).unwrap();
+    // 24 rows, not 16. At pi 0.84.3 the picker's own envelope is 18 rows tall —
+    // rule/blank/title/blank/cycle-hint/blank/`Input`/blank/7 levels/blank/footer/rule
+    // (`thinking-selector.ts:77-97`) — and the chrome clamps `desired_height` to what is left after
+    // the transcript, so at 16 total rows the bottom rule (and `max`) are legitimately clipped.
+    let mut app = App::new(TestBackend::new(60, 24), UiTheme::dark()).unwrap();
     app.open_selector(SelectorKind::Thinking);
     assert_eq!(app.active_selector_kind(), Some(SelectorKind::Thinking));
     app.draw().unwrap();
@@ -58,7 +62,7 @@ fn thinking_selector_renders_borders_labels_and_cursor() {
     // Full-width DynamicBorder rules top & bottom (spec/tui/05 §11) — at least two ruled rows.
     let rule_rows = text.lines().filter(|l| l.contains("──────────")).count();
     assert!(rule_rows >= 2, "expected top+bottom `─` rules, got {rule_rows}:\n{text}");
-    // Every Pi thinking level + its description (thinking-selector.ts:11-19). `max` is the rung
+    // Every Pi thinking level + its description (thinking-selector.ts:24-32). `max` is the rung
     // Pi added in fbdd4638; without it the top of the ladder is unreachable from the TUI.
     for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
         assert!(text.contains(level), "missing level {level}:\n{text}");

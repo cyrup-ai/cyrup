@@ -20,6 +20,7 @@ impl<'t> MdRenderer<'t> {
             link_text: String::new(),
             code_lang: None,
             code_buf: String::new(),
+            html_buf: None,
             table: None,
             default_text: None,
             default_italic: false,
@@ -396,10 +397,24 @@ impl<'t> MdRenderer<'t> {
                     }
                 }
             }
-            Event::Html(h) | Event::InlineHtml(h) => {
+            // INLINE html concatenates into the surrounding run: `result +=
+            // applyTextWithNewlines(token.raw)` (`markdown.ts:721-726`). Unchanged.
+            Event::InlineHtml(h) => {
                 let style = self.inline_style();
                 self.push_text(h.trim_end_matches('\n'), style);
             }
+            // BLOCK html is one token upstream (`markdown.ts:612-617`) but one event per source
+            // line here, so accumulate and let `TagEnd::HtmlBlock` do the trim-and-split. The
+            // `None` leg is the belt-and-braces path for an `Event::Html` that arrives outside a
+            // `Tag::HtmlBlock` span: it keeps today's inline-style behaviour rather than dropping
+            // the text.
+            Event::Html(h) => match self.html_buf.as_mut() {
+                Some(buf) => buf.push_str(&h),
+                None => {
+                    let style = self.inline_style();
+                    self.push_text(h.trim_end_matches('\n'), style);
+                }
+            },
             _ => {}
         }
     }
@@ -419,6 +434,12 @@ impl<'t> MdRenderer<'t> {
                 }
             }
             Tag::Paragraph => self.flush_line(),
+            // A block-level `html` token is a block: it closes whatever row was open, exactly as
+            // `case "paragraph"` does, and then captures until `TagEnd::HtmlBlock`.
+            Tag::HtmlBlock => {
+                self.flush_line();
+                self.html_buf = Some(String::new());
+            }
             Tag::List(start) => {
                 self.flush_line();
                 self.lists.push(start);
@@ -531,6 +552,7 @@ impl<'t> MdRenderer<'t> {
                 self.flush_line();
                 self.blank();
             }
+            TagEnd::HtmlBlock => self.emit_html_block(),
             TagEnd::List(_) => {
                 self.lists.pop();
                 if self.lists.is_empty() {
@@ -644,6 +666,48 @@ impl<'t> MdRenderer<'t> {
         }
     }
 
+    /// Emit the raw HTML captured since `Tag::HtmlBlock`, one row per source line.
+    ///
+    /// `case "html"` (`markdown.ts:612-617`) pushes `this.applyDefaultStyle(token.raw.trim())` as a
+    /// SINGLE entry that still contains its newlines, and `render()` then hands every entry to
+    /// `wrapTextWithAnsi(line, contentWidth)` (`:322`), whose first act is
+    /// `text.split(/\r\n|\r|\n/)` (`utils.ts:832-839`). So an N-line `<details>…</details>` prints
+    /// as N rows in source order. cyrup's [`crate::transcript::wrap_line`] has no newline split —
+    /// it is only ever handed already-split rows — so the split happens here instead, and the rows
+    /// leave through [`Self::push_text`] + [`Self::flush_line`] so the list-item / blockquote
+    /// prefix machinery still lays `firstPrefix` on row 1 and `continuationPrefix` on rows 2..N.
+    ///
+    /// The `trim()` is upstream's and is defined on the WHOLE block, which is what guarantees no
+    /// leading or trailing blank row while an interior blank line survives as its own row (hence
+    /// `split`, not `lines()`).
+    ///
+    /// **[CYRUP-DELTA]** upstream's `case "html"` pushes no trailing `""` spacer of its own — the
+    /// blank after the block comes from the following `space` token (`markdown.ts:619-622`).
+    /// pulldown-cmark has no `space` event, so the separator is supplied here instead;
+    /// [`Self::blank`] is idempotent against an already-blank last row, so the observable output
+    /// matches pi's even though the token stream does not.
+    fn emit_html_block(&mut self) {
+        let Some(buf) = self.html_buf.take() else {
+            return;
+        };
+        // `\r\n` first so the split below cannot manufacture an empty segment from the pair.
+        let text = buf.replace("\r\n", "\n");
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        let style = self.inline_style();
+        for line in text.split(['\n', '\r']) {
+            // An interior blank line is a row of its own upstream (`utils.ts:839` yields an empty
+            // segment and `wrapTextWithAnsi` returns `[""]` for it), so the empty case is pushed
+            // too rather than skipped: the zero-width span it leaves in `cur` is what stops
+            // [`Self::flush_line`]'s empty-`cur` guard from swallowing the row.
+            self.push_text(line, style);
+            self.flush_line();
+        }
+        self.blank();
+    }
+
     /// Whether this fence takes the mermaid path (`mermaid.ts:63-74`).
     ///
     /// The `lists`/`quote` guard is not decoration: pi's transformer walks
@@ -668,15 +732,19 @@ impl<'t> MdRenderer<'t> {
     /// that is the property pi's `codeSpan` re-encoding (`:18-36`) had to fake through a markdown
     /// round-trip and which this renderer gets for free.
     ///
-    /// The whole diagram takes ONE role, `md_code_block`, rather than pi's four span colours
-    /// (`themedLines`/`styleSpan`, `:38-56`): the deliberate colorless trade-off recorded in
-    /// [`super::mermaid`]'s module doc.
+    /// Each row is themed per span class, `themedLines`/`styleSpan` (`mermaid.ts:38-57`): six
+    /// classes, one [`Span`] per run. The classes are not reported by the engine — they are
+    /// inferred from the rendered geometry by [`mermaid::classify`], whose module doc names the
+    /// cases where that inference is wrong.
     fn emit_mermaid_block(&mut self, lang: &str, code: &str) {
         match mermaid::render_diagram(code, self.width, self.mermaid.is_streaming) {
             DiagramOutcome::Diagram(rows) => {
-                let style = self.theme.md_code_block_style();
                 for row in rows {
-                    self.emit_prefixed(Line::styled(row, style));
+                    let spans: Vec<Span<'static>> = row
+                        .into_iter()
+                        .map(|(class, text)| Span::styled(text, self.span_class_style(class)))
+                        .collect();
+                    self.emit_prefixed(Line::from(spans));
                 }
                 self.blank();
             }
@@ -689,6 +757,25 @@ impl<'t> MdRenderer<'t> {
                 self.emit_prefixed(Line::styled(msg, self.theme.warning_style()));
                 self.blank();
             }
+        }
+    }
+
+    /// `styleSpan` (`mermaid.ts:38-53`), role for role.
+    ///
+    /// Every role already exists on [`UiTheme`]; `text` is [`UiTheme::custom_message_text_style`]
+    /// because that is the accessor cyrup already maps pi's `"text"` role to (see the
+    /// `RenderTheme::fg` table in [`crate::theme`]) — pi aliases `customMessageText` to the `text`
+    /// palette entry (`theme/dark.json:42`), so the two are one colour upstream as well.
+    fn span_class_style(&self, class: SpanClass) -> Style {
+        match class {
+            SpanClass::Border => self.theme.border_muted_style(),
+            SpanClass::Text => self.theme.custom_message_text_style(),
+            SpanClass::Edge => self.theme.accent_style(),
+            SpanClass::EdgeLabel => self.theme.muted_style(),
+            // `theme.fg("accent", theme.bold(span.text))` (`:48-49`).
+            SpanClass::Title => self.theme.accent_style().add_modifier(Modifier::BOLD),
+            // `return span.text` (`:50-51`) — unstyled.
+            SpanClass::None => Style::default(),
         }
     }
 

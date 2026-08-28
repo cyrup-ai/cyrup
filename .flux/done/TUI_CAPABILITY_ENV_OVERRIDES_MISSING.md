@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Add The Three Capability Env Overrides (`IMAGE_PROTOCOL` / `TRUE_COLOR` / `HYPERLINKS`) On Top Of The Terminal Sniff

@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Offer Directories In `@`-Mention Completion And Keep The Caret Inside The Token So The User Can Drill Down

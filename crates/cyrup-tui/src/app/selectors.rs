@@ -17,18 +17,28 @@ impl<B: Backend> App<B> {
     /// ([`Self::open_child_selector`]), which differ only in what they do with the slot.
     fn build_list_selector(&self, kind: SelectorKind) -> (Box<dyn Selector>, Option<UiTheme>) {
         // `with_upstream_chrome` applies the hint row / one-column inset ONLY for the kinds whose
-        // pi component builds them (`SelectorKind::draws_hint_row` / `insets_rows`). Thinking,
-        // show-images and theme are `DynamicBorder` + `SelectList` + `DynamicBorder` upstream and
-        // get neither.
+        // pi component builds them (`SelectorKind::draws_hint_row` / `insets_rows`). Show-images and
+        // theme are `DynamicBorder` + `SelectList` + `DynamicBorder` upstream and get neither.
         match kind {
+            // NOT a `ListSelector`: `ThinkingSelectorComponent` is a titled dialog with a
+            // cycle-key sentence, a search `Input` and a dim footer (`thinking-selector.ts:77-97`
+            // @0.84.3), so it has its own component. The ladder is the SESSION's
+            // (`interactive-mode.ts:4792` `getAvailableThinkingLevels()`), not a hardcoded seven.
             SelectorKind::Thinking => (
-                Box::new(
-                    ListSelector::thinking(
-                        &self.state.thinking_level,
-                        &self.state.default_thinking_level,
-                    )
-                    .with_upstream_chrome(kind, &self.state.select_keymap),
-                ),
+                Box::new(crate::thinking_selector::ThinkingSelector::new(
+                    &self.state.available_thinking_levels,
+                    &self.state.thinking_level,
+                    &self.state.default_thinking_level,
+                    // `keyDisplayText("app.thinking.cycle")` (`thinking-selector.ts:81`) =
+                    // `keyText(..., {capitalize:true})` (`keybinding-hints.ts:37-39`), read from
+                    // the app's LIVE table so a rebind changes the sentence — the same idiom the
+                    // `/settings` thinking row uses (`settings_rows.rs`).
+                    self.state
+                        .keymap
+                        .keys_label(Action::ThinkingCycle)
+                        .map(|k| crate::chrome::format_key_text(&k, true))
+                        .unwrap_or_default(),
+                )),
                 None,
             ),
             SelectorKind::ShowImages => (
@@ -121,6 +131,54 @@ impl<B: Backend> App<B> {
             kind,
             inner,
             saved_editor: String::new(),
+            restore_theme: None,
+            parent,
+        });
+    }
+
+    /// Mount one step of a `/settings` submenu (pi `SteppedSubmenu.buildStep` →
+    /// `new SelectSubmenu(title, `${stepLabel}${desc}`, items, preselect, …)`,
+    /// `settings-submenu.ts:204-243`), as a child of `parent` exactly like
+    /// [`Self::open_data_child_selector`].
+    ///
+    /// `step`/`steps` produce upstream's `Step i/N · ` description prefix, drawn only when there is
+    /// more than one step (`:206`). `searchable` is the step's own flag — `true` on the model step
+    /// of the per-model thinking flow (`settings-selector.ts:611`) and unset on its level step.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_submenu_child_selector(
+        &mut self,
+        kind: SelectorKind,
+        title: String,
+        description: &str,
+        step: usize,
+        steps: usize,
+        searchable: bool,
+        layout: crate::ColumnLayout,
+        rows: Vec<(String, String, Option<String>)>,
+        selected: usize,
+        parent: Option<Box<ActiveSelector>>,
+    ) {
+        // `const stepLabel = total > 1 ? `Step ${stepIndex + 1}/${total} · ` : ""` (`:206`) — the
+        // prefix lands on the DESCRIPTION, not on the title (`:214`).
+        let description = if steps > 1 {
+            format!("Step {step}/{steps} \u{b7} {description}")
+        } else {
+            description.to_string()
+        };
+        let inner: Box<dyn Selector> = Box::new(crate::submenu_selector::SubmenuSelector::new(
+            title,
+            description,
+            rows,
+            selected,
+            searchable,
+            layout,
+        ));
+        let saved_editor =
+            if parent.is_some() { String::new() } else { self.state.editor.text() };
+        self.state.selector = Some(ActiveSelector {
+            kind,
+            inner,
+            saved_editor,
             restore_theme: None,
             parent,
         });

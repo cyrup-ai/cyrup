@@ -60,6 +60,16 @@ pub struct AppState {
     /// path; the `"medium"` initial value is Pi's own `DEFAULT_THINKING_LEVEL` fallback for the
     /// unset case, so a fresh install still badges a row rather than none.
     pub default_thinking_level: String,
+    /// The ladder the thinking picker offers (pi's `availableLevels` constructor argument,
+    /// `thinking-selector.ts:58`, fed from `session.getAvailableThinkingLevels()` at
+    /// `interactive-mode.ts:4792`): the ACTIVE model's supported rungs, so a non-reasoning model
+    /// offers `off` alone rather than seven rows it cannot honour.
+    ///
+    /// Re-seeded from the session on every argument-source refresh and again on the `/thinking`
+    /// route into the picker. The seven-rung initial value is pi's own no-model answer
+    /// (`agent-session.ts:1817` returns `[...THINKING_LEVEL_OPTIONS]`, `core/defaults.ts:4-12`), so
+    /// a picker opened before the first snapshot is complete rather than empty.
+    pub available_thinking_levels: Vec<String>,
     /// The PERSISTED default model as `(provider, id)` (`defaultProvider` + `defaultModel`), or
     /// `None` when this app has no path to persist one.
     ///
@@ -398,6 +408,11 @@ impl AppState {
             overlays: Vec::new(),
             thinking_level: "medium".to_string(),
             default_thinking_level: "medium".to_string(),
+            available_thinking_levels: cyrup_provider::EXTENDED_THINKING_LEVELS
+                .iter()
+                .copied()
+                .map(|l| super::thinking_level_str(l).to_string())
+                .collect(),
             default_model: None,
             pending_model_thinking: None,
             pending_selector_parent: None,
