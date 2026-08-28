@@ -175,10 +175,9 @@ pub struct SettingsSelector {
     filtered: Vec<usize>,
     /// The highlight, an index into [`Self::filtered`] (`this.selectedIndex`).
     selected: usize,
-    /// The search box's text (`this.searchInput`, `settings-list.ts:65`).
-    query: String,
-    /// Caret byte offset inside `query`, for the reverse-video cursor pi's `Input` draws.
-    cursor: usize,
+    /// The search box (`this.searchInput`, `settings-list.ts:65`) — the shared single-line editing
+    /// surface, caret and all.
+    input: crate::text_input::Input,
 }
 
 impl SettingsSelector {
@@ -189,8 +188,7 @@ impl SettingsSelector {
             rows,
             filtered: Vec::new(),
             selected: 0,
-            query: String::new(),
-            cursor: 0,
+            input: crate::text_input::Input::new(),
         };
         sel.apply_filter();
         sel
@@ -207,7 +205,7 @@ impl SettingsSelector {
     /// highlight to 0. `fuzzy::filter` is the port of `fuzzyFilter`, so an empty query keeps every
     /// row in its original order.
     fn apply_filter(&mut self) {
-        self.filtered = crate::fuzzy::filter(&self.rows, &self.query, |r| r.label.as_str())
+        self.filtered = crate::fuzzy::filter(&self.rows, self.input.value(), |r| r.label.as_str())
             .into_iter()
             .map(|m| m.index)
             .collect();
@@ -236,7 +234,7 @@ impl SettingsSelector {
 
     /// The live search query (tests / inspection).
     pub fn query(&self) -> &str {
-        &self.query
+        self.input.value()
     }
 
     /// `maxLabelWidth = Math.min(30, Math.max(...this.items.map((i) => visibleWidth(i.label))))`
@@ -257,6 +255,7 @@ impl SettingsSelector {
 
     /// `renderMainList` (`settings-list.ts:90-166`), line for line.
     pub fn lines(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
+        let width_u16 = width;
         let width = usize::from(width);
         let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -264,7 +263,12 @@ impl SettingsSelector {
         // which is constructed `{ enableSearch: true }` (`settings-selector.ts:872`).
         // [`crate::selector::input_line_spans`] is the shared `Input.render` port (S31), so the
         // prompt here is upstream's bare unstyled `"> "` at column 0, same as every other dialog's.
-        lines.push(Line::from(input_line_spans(&self.query, self.cursor, theme)));
+        lines.push(Line::from(input_line_spans(
+            self.input.value(),
+            self.input.cursor(),
+            width_u16,
+            theme,
+        )));
         lines.push(Line::from(""));
 
         // `:98-104` — no rows at all. NOT truncated upstream (only the "no matching" arm is), and
@@ -466,14 +470,20 @@ impl Selector for SettingsSelector {
             None => {}
         }
 
-        // Everything else drives the search box (`:192-195`). A chord with a modifier is not text.
-        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
-            return SelectorOutcome::Ignored;
-        }
+        // Everything else drives the search box (`:192-195`).
+        //
+        // There is deliberately NO `if key.modifiers.intersects(CONTROL|ALT|SUPER) { Ignored }`
+        // guard any more: upstream hands every unclaimed key straight to the search `Input`
+        // (`settings-list.ts:192-195`), and the `Input` rejects control characters itself
+        // (`input.ts:202-210`) — which is where that rejection now lives in cyrup too. The guard
+        // made Ctrl+W / Ctrl+U / Ctrl+K / Alt+B / Alt+F / Alt+D unreachable in this dialog.
         match key.code {
             // `:187` — Space activates the row ONLY while the search box is empty; otherwise it is
             // a literal space typed into the query.
-            KeyCode::Char(' ') if self.query.is_empty() => {
+            KeyCode::Char(' ')
+                if self.input.value().is_empty()
+                    && !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 if let Some(id) = self.current().and_then(|r| r.submenu.clone()) {
                     return SelectorOutcome::OpenSubmenu(id);
                 }
@@ -482,28 +492,25 @@ impl Selector for SettingsSelector {
                     None => SelectorOutcome::Redraw,
                 }
             }
-            KeyCode::Char(c) => {
-                self.query.insert(self.cursor, c);
-                self.cursor = self.cursor.saturating_add(c.len_utf8());
-                self.apply_filter();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    let prev = self
-                        .query
-                        .get(..self.cursor)
-                        .and_then(|s| s.chars().next_back())
-                        .map_or(0, char::len_utf8);
-                    let at = self.cursor.saturating_sub(prev);
-                    self.query.replace_range(at..self.cursor, "");
-                    self.cursor = at;
+            _ => match self.input.handle_key(key) {
+                crate::text_input::InputOutcome::Edited => {
                     self.apply_filter();
+                    SelectorOutcome::Redraw
                 }
-                SelectorOutcome::Redraw
-            }
-            _ => SelectorOutcome::Ignored,
+                crate::text_input::InputOutcome::Moved => SelectorOutcome::Redraw,
+                crate::text_input::InputOutcome::Ignored => SelectorOutcome::Ignored,
+            },
         }
+    }
+
+    fn set_editor_keymap(&mut self, keymap: &crate::keymap::EditorKeymap) {
+        self.input.set_editor_keymap(keymap);
+    }
+
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        self.input.paste(text);
+        self.apply_filter();
+        SelectorOutcome::Redraw
     }
 }
 

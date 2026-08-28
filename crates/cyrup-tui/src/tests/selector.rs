@@ -19,7 +19,7 @@ fn selector_search_input_renders_a_block_cursor() {
     let theme = UiTheme::dark();
 
     // Caret in the middle: the char under it is reversed; text on either side keeps the base style.
-    let spans = search_input_spans("abc", 1, &theme);
+    let spans = search_input_spans("abc", 1, 40, &theme);
     let reversed: Vec<&str> = spans
         .iter()
         .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
@@ -30,7 +30,7 @@ fn selector_search_input_renders_a_block_cursor() {
     assert_eq!(text, "abc", "the query text is preserved around the caret");
 
     // Caret at end: drawn as a reversed trailing space so an empty/末-position caret is still visible.
-    let end = search_input_spans("hi", 2, &theme);
+    let end = search_input_spans("hi", 2, 40, &theme);
     let end_cursor: Vec<&str> = end
         .iter()
         .filter(|s| s.style.add_modifier.contains(Modifier::REVERSED))
@@ -39,7 +39,7 @@ fn selector_search_input_renders_a_block_cursor() {
     assert_eq!(end_cursor, vec![" "], "end-of-query caret is a reversed space");
 
     // Empty query: a single reversed space caret.
-    let empty = search_input_spans("", 0, &theme);
+    let empty = search_input_spans("", 0, 40, &theme);
     assert_eq!(empty.len(), 1);
     assert!(empty[0].style.add_modifier.contains(Modifier::REVERSED));
 }

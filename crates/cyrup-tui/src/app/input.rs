@@ -134,9 +134,12 @@ impl<B: Backend> App<B> {
                 }
             }
             InputEvent::Paste(s) => {
-                // A selector owns the slot: pure-list selectors ignore pastes (no embedded Input yet).
+                // A selector owns the slot: offer the paste to its embedded `Input` first — pi's
+                // `Input.handleInput` bracketed-paste branch (`input.ts:54-84`) → `handlePaste`
+                // (`:362-372`). A pure-list selector owns no input and answers `Ignored`, which
+                // `handle_selector_paste` maps back to `AppAction::None`.
                 if self.state.selector.is_some() {
-                    return AppAction::None;
+                    return self.handle_selector_paste(s);
                 }
                 // Route bracketed paste through `handle_paste` so large pastes collapse to an atomic
                 // `[paste #N …]` marker (spec/tui/03 §5.5); small pastes insert verbatim.

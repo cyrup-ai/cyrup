@@ -17,13 +17,30 @@ use unicode_segmentation::UnicodeSegmentation;
 /// Visible (terminal column) width of `s` — unicode-width correct via ratatui's `Span::width`,
 /// which is Pi's `visibleWidth` (`packages/tui/src/utils.ts`). **Never `chars().count()`**: four
 /// separate width measurements in this crate have carried that defect.
+///
+/// One deliberate correction on top of `Span::width`: **U+0009 costs 3 columns**, matching pi's
+/// `graphemeWidth` (`utils.ts:174-176`, `if (segment === "\t") return 3`) and `visibleWidth`, which
+/// pre-replaces every tab with three spaces before measuring (`utils.ts:257-259`).
+/// `Span::width` sums `unicode-width`, which reports **0** for control characters, so a tab-bearing
+/// row measured 0 columns where upstream measures 3 — the divergence this closes. Rendering never
+/// sees a bare tab (they are expanded before any [`Span`] is built, see
+/// `transcript::layout`'s `normalize_terminal_output`), but a truncation guard measured on the
+/// pre-expansion string still has to charge for it.
 pub(crate) fn str_width(s: &str) -> usize {
-    Span::raw(s).width()
+    if !s.contains('\t') {
+        return Span::raw(s).width();
+    }
+    // Allocation-free equivalent of upstream's `clean.replace(/\t/g, "   ")` then measure.
+    s.split('\t').map(|part| Span::raw(part).width()).sum::<usize>()
+        + s.matches('\t').count() * 3
 }
 
 /// The visible width of a span vector.
+///
+/// Routed through [`str_width`] rather than `Span::width` so this module keeps exactly ONE
+/// measurement, tab charge included — the whole point of the module.
 pub(crate) fn spans_width(spans: &[Span<'_>]) -> usize {
-    spans.iter().map(Span::width).sum()
+    spans.iter().map(|s| str_width(&s.content)).sum()
 }
 
 /// The kept prefix of `text` that fits in `budget` visible columns, accumulated one **grapheme
@@ -89,7 +106,7 @@ pub(crate) fn truncate_to_width(s: &str, max: usize, ellipsis: &str) -> String {
 /// [`truncate_spans_to_width`], which inherits the last kept span's style. Both behaviours are
 /// upstream-faithful for their own callers; see that function's note.
 pub(crate) fn truncate_line_to_width(line: Line<'static>, max: usize, ellipsis: &str) -> Line<'static> {
-    if line.width() <= max {
+    if spans_width(&line.spans) <= max {
         return line;
     }
     if max == 0 {
@@ -152,8 +169,9 @@ pub(crate) fn truncate_spans_to_width(
             break;
         }
         let remaining = budget.saturating_sub(used);
-        if span.width() <= remaining {
-            used = used.saturating_add(span.width());
+        let span_w = str_width(&span.content);
+        if span_w <= remaining {
+            used = used.saturating_add(span_w);
             out.push(span);
         } else {
             let kept = truncate_to_width(&span.content, remaining, "");
@@ -166,6 +184,38 @@ pub(crate) fn truncate_spans_to_width(
     if !ellipsis.is_empty() {
         let style = out.last().map(|s| s.style).unwrap_or_default();
         out.push(Span::styled(ellipsis.to_string(), style));
+    }
+    out
+}
+
+/// Extract a range of visible **columns** from `s` — pi's `sliceByColumn`/`sliceWithWidth`
+/// (`pi/packages/tui/src/utils.ts:1195-1245` @v0.83.0) minus the ANSI machinery, which has no
+/// analogue here: cyrup carries style in [`Span`]s, not escape codes, and the one caller
+/// ([`crate::selector`]'s horizontal input window) slices a raw search-box value.
+///
+/// A grapheme is kept when it starts inside `[start_col, start_col + len_cols)`; under `strict` it
+/// must also *end* inside, so a wide (CJK/emoji) cluster straddling the right edge is dropped rather
+/// than half-drawn (`utils.ts:1230`'s `fits`). Column accounting is [`str_width`], so this is the
+/// module's one measurement, tab charge included.
+pub(crate) fn slice_by_column(s: &str, start_col: usize, len_cols: usize, strict: bool) -> String {
+    // `if (length <= 0) return { text: "", width: 0 }` (`utils.ts:1213`).
+    if len_cols == 0 {
+        return String::new();
+    }
+    let end_col = start_col.saturating_add(len_cols);
+    let mut out = String::new();
+    let mut current_col = 0usize;
+    for g in s.graphemes(true) {
+        let w = str_width(g);
+        let in_range = current_col >= start_col && current_col < end_col;
+        let fits = !strict || current_col.saturating_add(w) <= end_col;
+        if in_range && fits {
+            out.push_str(g);
+        }
+        current_col = current_col.saturating_add(w);
+        if current_col >= end_col {
+            break;
+        }
     }
     out
 }

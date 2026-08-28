@@ -494,6 +494,12 @@ impl<B: Backend> App<B> {
                             .collect::<Vec<_>>()
                     )
                 };
+                // The `/model ` completer ranks the scoped set when one is active, else the whole
+                // available catalog (`interactive-mode.ts:689-691` @v0.84.3), so changing a scope
+                // changes its candidate list. Refreshed before the persist result is known: the
+                // in-session scope has already changed either way, so the completer must follow it
+                // even if the settings write fails.
+                self.refresh_argument_sources(session);
                 match session
                     .persist_setting(
                         cyrup_session_svc::SettingsScope::Global,

@@ -29,6 +29,7 @@ use ratatui::Frame;
 use crate::chrome::key_hint_spans;
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{border_rule, centered_window, input_line_spans, Selector, SelectorOutcome};
+use crate::text_input::{Input, InputOutcome};
 use crate::text_width::{str_width, truncate_line_to_width, truncate_to_width};
 use crate::theme::UiTheme;
 
@@ -235,10 +236,9 @@ pub struct ConfigSelector {
     rows: Vec<ConfigRow>,
     /// Row indices in stable group/subgroup/name order (Pi's group + subgroup + item sort).
     order: Vec<usize>,
-    /// The live type-to-filter query (Pi's `searchInput`, config-selector.ts:227,396).
-    query: String,
-    /// Caret byte offset inside `query`, for the reverse-video cursor pi's `Input` draws.
-    cursor: usize,
+    /// The live type-to-filter query (Pi's `searchInput`, config-selector.ts:227,396) — the shared
+    /// single-line editing surface, caret and all.
+    input: Input,
     /// The current (query-filtered) flattened display list.
     flat: Vec<Flat>,
     /// The selected index into `flat` — always kept on an `Item` when any item is visible.
@@ -300,8 +300,7 @@ impl ConfigSelector {
         let mut sel = ConfigSelector {
             rows,
             order,
-            query: String::new(),
-            cursor: 0,
+            input: Input::new(),
             flat: Vec::new(),
             selected: 0,
             max_visible: Self::max_visible_for(DEFAULT_TERMINAL_ROWS),
@@ -527,7 +526,12 @@ impl ConfigSelector {
         // `:396-397` — the search `Input` and the blank under it, via the shared `Input.render`
         // port (S31): a bare, unstyled `"> "` at column 0. cyrup used to hang the query off the
         // header as `filter: …`, a row upstream does not have.
-        lines.push(Line::from(input_line_spans(&self.query, self.cursor, theme)));
+        lines.push(Line::from(input_line_spans(
+            self.input.value(),
+            self.input.cursor(),
+            width,
+            theme,
+        )));
         lines.push(Line::from(""));
 
         // `:399-402` — `theme.fg("muted", …)`, not dim (S17 fix #43).
@@ -667,7 +671,7 @@ impl ConfigSelector {
         let mut cur_kind: Option<ConfigKind> = None;
         for &i in &self.order {
             let Some(row) = self.rows.get(i) else { continue };
-            if !Self::matches_query(row, &self.query) {
+            if !Self::matches_query(row, self.input.value()) {
                 continue;
             }
             let gkey = (row.scope, row.base_dir.clone());
@@ -806,13 +810,17 @@ impl Selector for ConfigSelector {
                 SelectAction::Cancel => SelectorOutcome::Cancel,
             };
         }
-        // Space toggles the highlighted resource (Pi `data === " "`, config-selector.ts:433). A bare
-        // Backspace / printable char drives the type-to-filter (config-selector.ts:445-446).
-        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER) {
-            return SelectorOutcome::Ignored;
-        }
+        // Space toggles the highlighted resource (Pi `data === " "`, config-selector.ts:497).
+        //
+        // There is deliberately NO `if key.modifiers.intersects(CONTROL|ALT|SUPER) { Ignored }`
+        // guard here any more: upstream hands EVERY unclaimed key to the search `Input`
+        // (`config-selector.ts:509-510`), and the `Input` performs the control-character rejection
+        // itself (`input.ts:202-210`) — which is exactly where it now lives in cyrup too
+        // ([`Input::handle_key`]'s `None` arm). The guard made Ctrl+W / Ctrl+U / Ctrl+K / Alt+B /
+        // Alt+F / Alt+D unreachable in this dialog.
         match key.code {
-            KeyCode::Char(' ') => self.toggle_selected(),
+            KeyCode::Char(' ') if !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                => self.toggle_selected(),
             // `tui.input.tab` flips the write scope (`config-selector.ts:495-498` →
             // `switchWriteScope`, `:933-937`) — and only when project mode is available, because
             // upstream leaves `onSwitchMode` unset otherwise (`:920-925`).
@@ -823,28 +831,26 @@ impl Selector for ConfigSelector {
                 };
                 SelectorOutcome::Redraw
             }
-            KeyCode::Char(c) => {
-                self.query.insert(self.cursor, c);
-                self.cursor = self.cursor.saturating_add(c.len_utf8());
-                self.on_query_changed();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    let prev = self
-                        .query
-                        .get(..self.cursor)
-                        .and_then(|s| s.chars().next_back())
-                        .map_or(0, char::len_utf8);
-                    let at = self.cursor.saturating_sub(prev);
-                    self.query.replace_range(at..self.cursor, "");
-                    self.cursor = at;
+            // "Pass to search input" (`:509-510`), then `filterItems(searchInput.getValue())`.
+            _ => match self.input.handle_key(key) {
+                InputOutcome::Edited => {
                     self.on_query_changed();
+                    SelectorOutcome::Redraw
                 }
-                SelectorOutcome::Redraw
-            }
-            _ => SelectorOutcome::Ignored,
+                InputOutcome::Moved => SelectorOutcome::Redraw,
+                InputOutcome::Ignored => SelectorOutcome::Ignored,
+            },
         }
+    }
+
+    fn set_editor_keymap(&mut self, keymap: &crate::keymap::EditorKeymap) {
+        self.input.set_editor_keymap(keymap);
+    }
+
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        self.input.paste(text);
+        self.on_query_changed();
+        SelectorOutcome::Redraw
     }
 }
 

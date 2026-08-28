@@ -28,6 +28,7 @@ impl InputEditor {
             autocomplete_keymap: crate::keymap::AutocompleteKeymap::default(),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             mention_files: None,
+            arg_sources: crate::autocomplete::ArgumentSources::default(),
             view_width: 80,
             scroll_offset: 0,
             term_rows: 24,
@@ -180,6 +181,14 @@ impl InputEditor {
     /// the lazy `fd`/walk source.
     pub fn set_mention_files(&mut self, files: Vec<String>) {
         self.mention_files = Some(files);
+    }
+
+    /// Install the argument-completion sources for `/model` and `/login` (and `/thinking`, once such
+    /// a command exists). Pi rebuilds the equivalent closures whenever it rebuilds the autocomplete
+    /// provider (`createBaseAutocompleteProvider`, `interactive-mode.ts:677-736` @v0.84.3); cyrup
+    /// pushes a snapshot instead, from [`crate::App::refresh_argument_sources`].
+    pub fn set_argument_sources(&mut self, sources: crate::autocomplete::ArgumentSources) {
+        self.arg_sources = sources;
     }
 
     /// Focus state (R-10-009 — focused inputs drive the hardware cursor).

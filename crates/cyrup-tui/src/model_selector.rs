@@ -18,6 +18,7 @@ use ratatui::Frame;
 use crate::fuzzy;
 use crate::keymap::{EditorAction, EditorKeymap, SelectAction, SelectKeymap};
 use crate::selector::{border_rule_line, centered_window, Selector, SelectorOutcome};
+use crate::text_input::{Input, InputOutcome};
 use crate::theme::UiTheme;
 use crate::transcript::text_lines_of;
 
@@ -74,10 +75,9 @@ pub struct ModelSelector {
     /// [`Self::with_default_model`] is the only way to set it.
     default_model: Option<(String, String)>,
     scope: Scope,
-    /// The live fuzzy search query (embedded `Input`).
-    query: String,
-    /// Cursor byte offset within `query`.
-    cursor: usize,
+    /// The live fuzzy search query — pi's embedded `Input` (`model-selector.ts:117`), which is now
+    /// literally the shared component and brings word motion / kill ring / undo / paste with it.
+    input: Input,
     /// Highlighted index into the *filtered* list.
     selected: usize,
     max_visible: usize,
@@ -158,8 +158,7 @@ impl ModelSelector {
             has_scoped,
             default_model: None,
             scope,
-            query: String::new(),
-            cursor: 0,
+            input: Input::new(),
             selected: 0,
             max_visible: 10,
             error_message: None,
@@ -185,11 +184,11 @@ impl ModelSelector {
     /// runs over each model's provider-first search text and reorders best-match-first.
     fn filtered(&self) -> Vec<&ModelEntry> {
         let active = self.active();
-        if self.query.is_empty() {
+        if self.input.value().is_empty() {
             return active;
         }
         let texts: Vec<String> = active.iter().map(|m| m.search_text()).collect();
-        let matches = fuzzy::filter(&texts, &self.query, String::as_str);
+        let matches = fuzzy::filter(&texts, self.input.value(), String::as_str);
         matches.into_iter().filter_map(|mm| active.get(mm.index).copied()).collect()
     }
 
@@ -225,38 +224,8 @@ impl ModelSelector {
     /// when no exact match set the model directly, so the picker opens already narrowed to `<text>`. The
     /// caret lands at the end of the seeded text and the highlight resets to the top of the filtered set.
     pub fn set_search(&mut self, term: String) {
-        self.cursor = term.len();
-        self.query = term;
+        self.input = Input::with_value(term);
         self.selected = 0;
-    }
-
-    /// Insert a printable char into the search query, resetting the highlight (Pi feeds everything else
-    /// to `searchInput`, `:322-325`).
-    fn insert_char(&mut self, c: char) {
-        self.query.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-        self.selected = 0;
-    }
-
-    /// Backspace the search query.
-    fn backspace(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        if let Some(ch) = self.query.get(..self.cursor).and_then(|s| s.chars().next_back()) {
-            let start = self.cursor - ch.len_utf8();
-            self.query.replace_range(start..self.cursor, "");
-            self.cursor = start;
-            self.selected = 0;
-        }
-    }
-
-    /// Adopt the live editor keymap so the scope hint names the user's `tui.input.tab` binding
-    /// rather than a hardcoded glyph (Pi `keyHint("tui.input.tab", "scope")`, `:228-230`).
-    pub fn set_editor_keymap(&mut self, keymap: &EditorKeymap) {
-        if let Some(label) = keymap.keys_label(EditorAction::Tab) {
-            self.scope_key = label;
-        }
     }
 
     /// Set the catalog-refresh status row (Pi `refreshStatusMessage`/`refreshStatusSuccess`,
@@ -508,7 +477,12 @@ impl Selector for ModelSelector {
         // because `model-selector.ts:118` adds `this.searchInput` to the container as a bare child.
         // cyrup drew accent `" ▏"…"▏"` bars around the value — one column in, coloured, and U+258F
         // occurs nowhere in pi's TUI sources.
-        lines.push(Line::from(crate::selector::input_line_spans(&self.query, self.cursor, theme)));
+        lines.push(Line::from(crate::selector::input_line_spans(
+            self.input.value(),
+            self.input.cursor(),
+            area.width,
+            theme,
+        )));
         lines.push(Line::from(""));
         lines.extend(self.body_lines(&filtered, usize::from(area.width), theme));
         // `if (this.onSelectAsDefaultCallback) { addChild(new Text(theme.fg("dim", "  Enter to
@@ -589,26 +563,45 @@ impl Selector for ModelSelector {
             },
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
             None => {
-                // Everything else feeds the search input (Pi `:322-325`).
-                if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    self.insert_char(c);
-                    return SelectorOutcome::Redraw;
+                // Everything else feeds the search input (Pi `:409-411`: `searchInput.handleInput`
+                // then `filterModels(searchInput.getValue())`) — which is now the shared `Input`,
+                // so Ctrl+W / Ctrl+U / Ctrl+K / Alt+B / Alt+F / Ctrl+Y / Ctrl+- all land here.
+                match self.input.handle_key(key) {
+                    // A changed query re-filters, so the highlight returns to the top — what
+                    // `insert_char`/`backspace` used to do inline.
+                    InputOutcome::Edited => {
+                        self.selected = 0;
+                        SelectorOutcome::Redraw
+                    }
+                    InputOutcome::Moved => SelectorOutcome::Redraw,
+                    InputOutcome::Ignored => SelectorOutcome::Ignored,
                 }
-                if key.code == KeyCode::Backspace {
-                    self.backspace();
-                    return SelectorOutcome::Redraw;
-                }
-                SelectorOutcome::Ignored
             }
         }
+    }
+
+    /// Adopt the live editor keymap: the scope hint names the user's `tui.input.tab` binding rather
+    /// than a hardcoded glyph (Pi `keyHint("tui.input.tab", "scope")`, `:228-230`), and the embedded
+    /// [`Input`] resolves its own bindings through the same table.
+    fn set_editor_keymap(&mut self, keymap: &EditorKeymap) {
+        if let Some(label) = keymap.keys_label(EditorAction::Tab) {
+            self.scope_key = label;
+        }
+        self.input.set_editor_keymap(keymap);
+    }
+
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        self.input.paste(text);
+        self.selected = 0;
+        SelectorOutcome::Redraw
     }
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::indexing_slicing)]
 mod tests {
+    use ratatui::crossterm::event::KeyModifiers;
+
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

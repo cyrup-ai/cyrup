@@ -22,7 +22,7 @@
 //! `this.filteredProviders[this.selectedIndex]` (`:199`) is.
 
 use cyrup_config::login::LoginProviderOption;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -32,6 +32,7 @@ use ratatui::Frame;
 use crate::auth_select::{format_auth_selector_provider_type, status_indicator_runs, StatusTone};
 use crate::keymap::{SelectAction, SelectKeymap};
 use crate::selector::{border_rule_line, centered_window, input_line_spans, Selector, SelectorOutcome};
+use crate::text_input::{Input, InputOutcome};
 use crate::text_width::truncate_line_to_width;
 use crate::theme::UiTheme;
 
@@ -88,9 +89,8 @@ pub struct OAuthSelector {
     filtered: Vec<usize>,
     /// Highlighted index into [`Self::filtered`] (`selectedIndex`, `:45`).
     selected: usize,
-    /// The search `Input`'s value (`:76`) and caret offset.
-    query: String,
-    cursor: usize,
+    /// The search `Input` (`:76`) — the shared single-line editing surface.
+    input: Input,
 }
 
 impl OAuthSelector {
@@ -134,10 +134,8 @@ impl OAuthSelector {
             rows,
             filtered: Vec::new(),
             selected: 0,
-            query: initial_search.unwrap_or_default(),
-            cursor: 0,
+            input: Input::with_value(initial_search.unwrap_or_default()),
         };
-        sel.cursor = sel.query.len();
         // `this.filterProviders(initialSearchInput ?? "")` (`:99`).
         sel.apply_filter();
         sel
@@ -146,11 +144,14 @@ impl OAuthSelector {
     /// `filterProviders(query)` (`:102-112`): fuzzy over the composed search text (best match
     /// first), else the identity; then clamp the highlight into range.
     fn apply_filter(&mut self) {
-        self.filtered = if self.query.is_empty() {
+        self.filtered = if self.input.value().is_empty() {
             (0..self.rows.len()).collect()
         } else {
             let texts: Vec<&str> = self.rows.iter().map(|r| r.search_text.as_str()).collect();
-            crate::fuzzy::filter(&texts, &self.query, |t| t).into_iter().map(|m| m.index).collect()
+            crate::fuzzy::filter(&texts, self.input.value(), |t| t)
+                .into_iter()
+                .map(|m| m.index)
+                .collect()
         };
         // `Math.max(0, Math.min(selectedIndex, Math.max(0, filtered.length - 1)))` (`:110`).
         self.selected = self.selected.min(self.filtered.len().saturating_sub(1));
@@ -158,7 +159,7 @@ impl OAuthSelector {
 
     /// The live query (test/inspection).
     pub fn query(&self) -> &str {
-        &self.query
+        self.input.value()
     }
 
     /// The number of rows surviving the query (test/inspection).
@@ -169,22 +170,6 @@ impl OAuthSelector {
     /// The highlighted row's index into the ORIGINAL `options` slice, if any.
     pub fn current_index(&self) -> Option<usize> {
         self.filtered.get(self.selected).copied()
-    }
-
-    fn insert_char(&mut self, c: char) {
-        self.query.insert(self.cursor, c);
-        self.cursor = self.cursor.saturating_add(c.len_utf8());
-        self.apply_filter();
-    }
-
-    fn backspace(&mut self) {
-        let Some(ch) = self.query.get(..self.cursor).and_then(|s| s.chars().next_back()) else {
-            return;
-        };
-        let start = self.cursor.saturating_sub(ch.len_utf8());
-        self.query.replace_range(start..self.cursor, "");
-        self.cursor = start;
-        self.apply_filter();
     }
 
     /// The visible window `[start, end)` — `updateList`'s centred window (`:117-122`), `maxVisible`
@@ -290,7 +275,7 @@ impl Selector for OAuthSelector {
             Line::from(""),
             self.title_line(area.width, theme),
             Line::from(""),
-            Line::from(input_line_spans(&self.query, self.cursor, theme)),
+            Line::from(input_line_spans(self.input.value(), self.input.cursor(), area.width, theme)),
             Line::from(""),
         ];
         lines.extend(self.body_lines(area.width, theme));
@@ -328,20 +313,26 @@ impl Selector for OAuthSelector {
                 None => SelectorOutcome::Redraw,
             },
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
-            // "Pass everything else to search input" (`:208-212`).
-            None => {
-                if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    self.insert_char(c);
-                    return SelectorOutcome::Redraw;
+            // "Pass everything else to search input" (`:208-212`) — the shared `Input`, so the
+            // whole Emacs surface (word motion, kill ring, undo) reaches this box too.
+            None => match self.input.handle_key(key) {
+                InputOutcome::Edited => {
+                    self.apply_filter();
+                    SelectorOutcome::Redraw
                 }
-                if key.code == KeyCode::Backspace {
-                    self.backspace();
-                    return SelectorOutcome::Redraw;
-                }
-                SelectorOutcome::Ignored
-            }
+                InputOutcome::Moved => SelectorOutcome::Redraw,
+                InputOutcome::Ignored => SelectorOutcome::Ignored,
+            },
         }
+    }
+
+    fn set_editor_keymap(&mut self, keymap: &crate::keymap::EditorKeymap) {
+        self.input.set_editor_keymap(keymap);
+    }
+
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        self.input.paste(text);
+        self.apply_filter();
+        SelectorOutcome::Redraw
     }
 }

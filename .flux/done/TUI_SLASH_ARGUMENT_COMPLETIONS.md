@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Port The `spaceIndex !== -1` Half Of `getSuggestions` So `/model <arg>` And `/login <arg>` Complete

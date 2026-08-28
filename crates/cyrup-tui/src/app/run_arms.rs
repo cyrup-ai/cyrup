@@ -30,6 +30,9 @@ impl App<InlineBackend<Stdout>> {
         // (`interactive-mode.ts:613`) and nowhere else.
         let gate = session.services().settings.effective().enable_skill_commands();
         self.rebuild_command_registry(session, gate);
+        // ...and the `/model` / `/login` argument completers, from the same seed point, so the very
+        // first `/model ` of the session already completes.
+        self.refresh_argument_sources(session);
         // `editorPaddingX` + `showHardwareCursor` — Pi seeds both while CONSTRUCTING the editor and
         // the TUI (`interactive-mode.ts:459` `new TUI(terminal, getShowHardwareCursor(), …)` and
         // `:470-474` `new CustomEditor(…, { paddingX: getEditorPaddingX(), … })`), so the very first
@@ -63,6 +66,10 @@ impl App<InlineBackend<Stdout>> {
         self.state
             .transcript
             .set_image_width_cells(eff.image_width_cells().clamp(1, u16::MAX as i64) as u16);
+        // `markdown.mermaid` — Pi seeds the transformer's `getMode()` closure when it registers the
+        // built-in transformer at construction (`interactive-mode.ts:484-486`), so the very first
+        // frame already honours the persisted value.
+        self.state.transcript.set_mermaid_mode(eff.mermaid_rendering_mode());
         // TUI-009 — `doubleEscapeAction` had no consumer at all; the Escape chain reads it out of
         // `AppState` because `apply_action` has no session in hand.
         self.state.double_escape_action = eff.double_escape_action();
@@ -216,6 +223,9 @@ impl App<InlineBackend<Stdout>> {
         let gate = ctx.session.services().settings.effective().enable_skill_commands();
         let swapped = Arc::clone(&ctx.session);
         self.rebuild_command_registry(&swapped, gate);
+        // ...and the argument completers, for the same reason: a replacement session brings its own
+        // model catalog and scoped set.
+        self.refresh_argument_sources(&swapped);
         // `rebind_session` reset the transcript to Pi's default pad; re-read the swapped-in
         // session's `outputPad` so a configured value survives the swap.
         self.state
@@ -235,6 +245,9 @@ impl App<InlineBackend<Stdout>> {
         self.state
             .transcript
             .set_image_width_cells(eff.image_width_cells().clamp(1, u16::MAX as i64) as u16);
+        // `rebind_session` reset the transcript to the derived default (`streaming`); re-read the
+        // swapped-in session's `markdown.mermaid` so a configured value survives the swap.
+        self.state.transcript.set_mermaid_mode(eff.mermaid_rendering_mode());
         // `editorPaddingX` / `showHardwareCursor` are per-settings-layer, and a swap can move the
         // project scope (`/resume` of a session recorded elsewhere), so re-apply both — Pi does
         // exactly this from `rebindSession` (`interactive-mode.ts:1721-1732`:

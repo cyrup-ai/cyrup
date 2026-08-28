@@ -1,5 +1,32 @@
 use super::*;
 
+/// Undo-stack bound — pi's `UndoStack` `maxSize` (`undo-stack.ts`), applied identically to the
+/// editor's snapshots and to a single-line [`crate::text_input::Input`]'s `(value, cursor)` pairs.
+pub(crate) const UNDO_CAP: usize = 500;
+
+/// Pi's typing-coalescing rule, shared by `Editor.insertCharacter` (`editor.ts:1085-1094`) and
+/// `Input.insertCharacter` (`components/input.ts:215`), which spell it identically:
+///
+/// ```text
+/// if (isWhitespaceChar(char) || this.lastAction !== "type-word") this.pushUndo();
+/// ```
+///
+/// Consecutive word characters coalesce into one undo unit, but a whitespace character *always*
+/// captures the state before itself, so a single `Ctrl+-` removes the last word without swallowing
+/// the whole line.
+pub(crate) fn should_snapshot_for_type(c: char, last_was_type: bool) -> bool {
+    c.is_whitespace() || !last_was_type
+}
+
+/// Push onto a bounded undo stack, dropping the oldest entry past `cap` so a long session does not
+/// grow unbounded (pi's `UndoStack.push` shift, `undo-stack.ts`).
+pub(crate) fn push_bounded<S>(stack: &mut Vec<S>, snap: S, cap: usize) {
+    stack.push(snap);
+    if stack.len() > cap {
+        stack.remove(0);
+    }
+}
+
 impl InputEditor {
     /// Snapshot the buffer + cursor **+ the paste registry** for undo — pi's `pushUndoSnapshot`
     /// payload `{ state, pastes, pasteCounter }` (`editor.ts:2012-2014` @v0.83.0), deep-copied by
@@ -19,11 +46,8 @@ impl InputEditor {
     pub(super) fn push_undo_for(&mut self, action: LastAction) {
         let coalesce = action == LastAction::Type && self.last_action == LastAction::Type;
         if !coalesce {
-            self.undo.push(self.snapshot());
-            // Bound the stack so a long session does not grow unbounded.
-            if self.undo.len() > 500 {
-                self.undo.remove(0);
-            }
+            let snap = self.snapshot();
+            push_bounded(&mut self.undo, snap, UNDO_CAP);
         }
     }
 
@@ -33,11 +57,9 @@ impl InputEditor {
     /// (`isWhitespaceChar(char) || lastAction !== "type-word"`), so a single `Ctrl+-` removes the last
     /// word without swallowing the whole line, and each space is a separate undo step.
     pub(super) fn push_undo_for_type(&mut self, c: char) {
-        if c.is_whitespace() || self.last_action != LastAction::Type {
-            self.undo.push(self.snapshot());
-            if self.undo.len() > 500 {
-                self.undo.remove(0);
-            }
+        if should_snapshot_for_type(c, self.last_action == LastAction::Type) {
+            let snap = self.snapshot();
+            push_bounded(&mut self.undo, snap, UNDO_CAP);
         }
     }
 

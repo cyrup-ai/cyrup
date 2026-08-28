@@ -22,11 +22,19 @@ pub(crate) fn entry_lines(
             // with `paddingX = 0`) — not `width - 5` (M9: that 5 was the width of the deleted
             // `"you: "` label).
             let role = theme.user_message_bg_style();
-            let md = crate::markdown::render_with_text_color(
+            // `user-message.ts:53` wraps the body in
+            // `createMarkdownTransform("user", false, this.markdownTransformers)` — messageType
+            // `"user"`, `isStreaming` hard-coded `false` (a user turn is never streamed).
+            let md = crate::markdown::render_message(
                 text,
                 width.saturating_sub(output_pad * 2).max(1),
                 theme,
                 role.fg,
+                crate::markdown::MermaidContext::new(
+                    images.mermaid,
+                    crate::markdown::MessageType::User,
+                    false,
+                ),
             );
             // `applyBackgroundToLine` paints the BACKGROUND only (`box.ts:132-134`).
             let fill = match role.bg {
@@ -60,10 +68,20 @@ pub(crate) fn entry_lines(
             // this.outputPad, 0, …)` and nothing else — no role label (X1). `contentWidth =
             // width - outputPad * 2` (`markdown.ts:284`), not `width - 11` (M9: the 11 was
             // `"assistant: "`).
-            let mut md = crate::markdown::render(
+            // `assistant-message.ts:112` passes `createMarkdownTransform("assistant",
+            // this.isStreaming, …)`. A COMMITTED entry is by definition not streaming — the turn
+            // has ended — so this is the `final`-mode leg; the live partial is the one
+            // `is_streaming: true` site (`transcript/cache.rs`).
+            let mut md = crate::markdown::render_message(
                 text,
                 width.saturating_sub(output_pad * 2).max(1),
                 theme,
+                None,
+                crate::markdown::MermaidContext::new(
+                    images.mermaid,
+                    crate::markdown::MessageType::Assistant,
+                    false,
+                ),
             );
             if md.is_empty() {
                 md.push(Line::default());

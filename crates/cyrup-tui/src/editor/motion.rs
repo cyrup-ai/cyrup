@@ -114,16 +114,15 @@ impl InputEditor {
             .is_some_and(|s| s.iter().any(|c| c.is_whitespace()))
     }
 
-    /// The word-left target `(row, col)` — a statement-for-statement port of `findWordBackward`
-    /// (`pi/packages/tui/src/word-navigation.ts:22-68` @v0.83.0) as pi calls it from
-    /// `moveWordBackwards` (`editor.ts:1869-1889`), i.e. with
+    /// The word-left target `(row, col)` — pi's `findWordBackward`
+    /// (`pi/packages/tui/src/word-navigation.ts:22-68` @v0.83.0) as `moveWordBackwards` calls it
+    /// (`editor.ts:1869-1889`), i.e. with
     /// `{ segment: (t) => this.segment(t, "word"), isAtomicSegment: isPasteMarker }`.
     ///
-    /// Three branches after the whitespace skip: **one atomic segment** whole (`:44-46` — a
-    /// `[paste #N …]` marker is never entered, which is what makes Ctrl+W delete the marker instead
-    /// of chewing its closing `]`, TUI-043), **one word-like segment** truncated at its last
-    /// `PUNCTUATION_REGEX` match (`:47-57`), or **a whole punctuation run** (`:58-66`).
-    /// At col 0 step to the previous line's end (`editor.ts:1874-1881`).
+    /// The segment walk itself lives in [`find_word_backward`](super::word_nav::find_word_backward),
+    /// shared with the single-line [`crate::text_input::Input`]; what stays here is what has no
+    /// single-line analogue — the marker-aware char-column segmentation and the row edge, where col
+    /// 0 steps to the previous line's end (`editor.ts:1874-1881`).
     pub(super) fn word_left_target(&self) -> (usize, usize) {
         let Some(line) = self.lines.get(self.row) else { return (self.row, self.col) };
         let cursor = self.col.min(line.len());
@@ -137,49 +136,23 @@ impl InputEditor {
         // `const textBeforeCursor = text.slice(0, cursor)` (`:25`) — segmenting only the PREFIX is
         // why a marker the cursor sits inside is not atomic: it is not whole in this slice.
         let Some(before) = line.get(..cursor) else { return (self.row, cursor) };
-        let mut segs = self.word_segments(before);
-        let mut new_cursor = cursor;
-
-        // "Skip trailing whitespace" (`:31-38`).
-        while let Some(last) = segs.last() {
-            if last.atomic || !Self::seg_is_whitespace(before, last) {
-                break;
-            }
-            new_cursor = new_cursor.saturating_sub(last.len);
-            segs.pop();
-        }
-        // `if (segments.length === 0) return newCursor` (`:40`).
-        let Some(&last) = segs.last() else { return (self.row, new_cursor) };
-
-        if last.atomic {
-            // "Skip one atomic segment" (`:44-46`).
-            new_cursor = new_cursor.saturating_sub(last.len);
-        } else if last.word_like {
-            // "Skip inside one word-like segment, preserving ASCII punctuation boundaries"
-            // (`:47-57`): back up to just after the LAST punctuation character in the segment.
-            let seg = before.get(last.start..last.start.saturating_add(last.len)).unwrap_or(&[]);
-            match seg.iter().rposition(|&c| is_punctuation(c)) {
-                None => new_cursor = new_cursor.saturating_sub(last.len),
-                Some(idx) => {
-                    new_cursor = new_cursor.saturating_sub(last.len.saturating_sub(idx + 1));
-                }
-            }
-        } else {
-            // "Skip non-word non-whitespace run (punctuation)" (`:58-66`).
-            while let Some(last) = segs.last() {
-                if last.atomic || last.word_like || Self::seg_is_whitespace(before, last) {
-                    break;
-                }
-                new_cursor = new_cursor.saturating_sub(last.len);
-                segs.pop();
-            }
-        }
+        let segs = self.word_segments(before);
+        let new_cursor = find_word_backward(
+            segs,
+            cursor,
+            &|seg| Self::seg_is_whitespace(before, seg),
+            &|seg| {
+                let s = before.get(seg.start..seg.start.saturating_add(seg.len)).unwrap_or(&[]);
+                s.iter().rposition(|&c| is_punctuation(c)).map(|i| i.saturating_add(1))
+            },
+        );
         (self.row, new_cursor)
     }
 
-    /// The word-right target — the mirror port of `findWordForward` (`word-navigation.ts:76-114`),
-    /// called as `moveWordForwards` does (`editor.ts:2064-2083`). Same three branches, with the
-    /// atomic skip at `:97-99` and the word-like branch taking the FIRST punctuation match (`:102`).
+    /// The word-right target — the mirror of [`Self::word_left_target`], pi's `findWordForward`
+    /// (`word-navigation.ts:76-114`) as `moveWordForwards` calls it (`editor.ts:2064-2083`). The
+    /// walk is [`find_word_forward`](super::word_nav::find_word_forward); the row edge (col ==
+    /// line length steps to the next line's start) stays here.
     pub(super) fn word_right_target(&self) -> (usize, usize) {
         let Some(line) = self.lines.get(self.row) else { return (self.row, self.col) };
         let len = line.len();
@@ -193,35 +166,15 @@ impl InputEditor {
         // `const textAfterCursor = text.slice(cursor)` (`:79`).
         let Some(after) = line.get(cursor..) else { return (self.row, cursor) };
         let segs = self.word_segments(after);
-        let mut idx = 0usize;
-        let mut new_cursor = cursor;
-
-        // "Skip leading whitespace" (`:88-93`).
-        while let Some(seg) = segs.get(idx) {
-            if seg.atomic || !Self::seg_is_whitespace(after, seg) {
-                break;
-            }
-            new_cursor = new_cursor.saturating_add(seg.len);
-            idx += 1;
-        }
-        // `if (next.done) return newCursor` (`:95`).
-        let Some(&next) = segs.get(idx) else { return (self.row, new_cursor) };
-
-        if next.atomic {
-            new_cursor = new_cursor.saturating_add(next.len);
-        } else if next.word_like {
-            let seg = after.get(next.start..next.start.saturating_add(next.len)).unwrap_or(&[]);
-            let step = seg.iter().position(|&c| is_punctuation(c)).unwrap_or(next.len);
-            new_cursor = new_cursor.saturating_add(step);
-        } else {
-            while let Some(seg) = segs.get(idx) {
-                if seg.atomic || seg.word_like || Self::seg_is_whitespace(after, seg) {
-                    break;
-                }
-                new_cursor = new_cursor.saturating_add(seg.len);
-                idx += 1;
-            }
-        }
+        let new_cursor = find_word_forward(
+            &segs,
+            cursor,
+            &|seg| Self::seg_is_whitespace(after, seg),
+            &|seg| {
+                let s = after.get(seg.start..seg.start.saturating_add(seg.len)).unwrap_or(&[]);
+                s.iter().position(|&c| is_punctuation(c))
+            },
+        );
         (self.row, new_cursor)
     }
 
@@ -261,51 +214,4 @@ impl InputEditor {
             }
         }
     }
-}
-
-/// The ASCII punctuation that sub-divides a word-like segment — a literal port of
-/// `PUNCTUATION_REGEX` (`pi/packages/tui/src/utils.ts:821` @v0.83.0):
-///
-/// ```text
-/// /[(){}[\]<>.,;:'"!?+\-=*/\\|&%^$#@~`]/
-/// ```
-///
-/// Deliberately **not** the complement of an `is_alphanumeric() || '_'` word-char test — the two are
-/// different sets (that test rejects every non-alphanumeric; this one names 31 specific ASCII
-/// characters), and word navigation must use pi's. The old class-run word motion used the former and
-/// was replaced wholesale (TUI-043 / TUI-048).
-fn is_punctuation(c: char) -> bool {
-    matches!(
-        c,
-        '(' | ')'
-            | '{'
-            | '}'
-            | '['
-            | ']'
-            | '<'
-            | '>'
-            | '.'
-            | ','
-            | ';'
-            | ':'
-            | '\''
-            | '"'
-            | '!'
-            | '?'
-            | '+'
-            | '-'
-            | '='
-            | '*'
-            | '/'
-            | '\\'
-            | '|'
-            | '&'
-            | '%'
-            | '^'
-            | '$'
-            | '#'
-            | '@'
-            | '~'
-            | '`'
-    )
 }

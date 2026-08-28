@@ -129,6 +129,18 @@ pub(crate) fn settings_rows(
         ),
         SettingRow::toggle("hideThinkingBlock", "Hide thinking", eff.hide_thinking_block())
             .with_description("Hide thinking blocks in assistant responses"),
+        // `markdown.mermaid` — Pi's own position in the list: `hide-thinking`, then
+        // `mermaid-rendering`, then `cache-miss-notices` (which cyrup has no row for), then
+        // `collapse-changelog` (`settings-selector.ts:493-506`). Label and description are its
+        // verbatim strings (`:502-503`); the three values are `MermaidRenderingMode`'s own
+        // settings-file spellings.
+        SettingRow::choice(
+            "markdown.mermaid",
+            "Mermaid diagrams",
+            eff.mermaid_rendering_mode().as_str(),
+            choices(&["off", "final", "streaming"]),
+        )
+        .with_description("Render Mermaid code blocks as Unicode diagrams"),
         SettingRow::toggle("collapseChangelog", "Collapse changelog", eff.collapse_changelog())
             .with_description("Show condensed changelog after updates"),
         SettingRow::toggle("quietStartup", "Quiet startup", eff.quiet_startup())

@@ -80,7 +80,10 @@ pub(crate) use tool_render::{tool_lines, ImageOpts};
 // The transcript-internal helpers the submodules share. Re-bound here so every submodule reaches
 // them through its own `use super::*;`, the same way `crate::app`'s split modules do.
 use images::{decode_result_images, image_raster_lines, push_image_fallbacks};
-use layout::{body_line, box_lines, finalize_block, pad_lines, replace_tabs, text_lines};
+use layout::{
+    body_line, box_lines, finalize_block, normalize_line, normalize_terminal_output, pad_lines,
+    replace_tabs, text_lines,
+};
 use message::{collapsed_summary_lines, group_thousands, labeled_message_lines, thinking_lines};
 use tool_args::{
     compact_read_call, compact_read_classification, js_number, key_hint_spans, more_lines_hint,
@@ -194,6 +197,20 @@ pub struct TranscriptView {
     /// body. Read when a thinking run is rendered live and frozen into [`Entry::Thinking::hidden`]
     /// when it commits.
     hide_thinking: bool,
+    /// `markdown.mermaid` (Pi `getMermaidRenderingMode`, settings-manager.ts:1251-1254), the mode
+    /// the mermaid markdown transformer's `getMode()` closure returns (`mermaid.ts:62`,
+    /// `interactive-mode.ts:484-486`).
+    ///
+    /// Read at PAINT time — like [`Self::hidden_thinking_label`] and for the same reason: upstream
+    /// re-reads the closure on every render, so cycling the `/settings` row re-renders everything
+    /// still in the live region and, under the alternate-screen renderer, the retained document
+    /// too. Entries the INLINE renderer has already flushed to native scrollback keep the form they
+    /// committed with, the same accepted limit `outputPad`/`hideThinkingBlock` carry.
+    ///
+    /// The derived `Default` is [`cyrup_config::MermaidRenderingMode::Streaming`], which is
+    /// already Pi's documented default (`settings-manager.ts:61`), so nothing seeds it in
+    /// [`TranscriptView::new`].
+    mermaid_mode: cyrup_config::MermaidRenderingMode,
     /// An extension's `setHiddenThinkingLabel(label?)` override (Pi `this.hiddenThinkingLabel`,
     /// `interactive-mode.ts:436` @v0.84.2 — as are `:435` and `:2118-2129` below); `None` is
     /// [`HIDDEN_THINKING_LABEL`], upstream's `defaultHiddenThinkingLabel` (`:435`).

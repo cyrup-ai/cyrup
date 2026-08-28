@@ -63,6 +63,18 @@ pub(crate) fn tool_lines(
     if !inline {
         push_image_fallbacks(run, theme, &mut block);
     }
+    // `applyLineResets` (`tui.ts:1160-1168`) — pi normalizes every finished row of the frame, and
+    // separately every child of the tool-execution component is a `Text`/`Box`/`Markdown`
+    // (`tool-execution.ts:153-155`), all three of which expand tabs for themselves (`text.ts:61`,
+    // `markdown.ts:298`). cyrup's per-tool renderers push bare `Line`s instead of components, so
+    // this is where both of those upstream layers land: without it a literal tab in grep/ls/bash or
+    // extension output is DELETED by ratatui's control-grapheme filter rather than rendered.
+    // Idempotent over the `read`/`write` rows that already went through `replace_tabs`, and applied
+    // before the raster rows are appended below so an image line is never walked (`tui.ts:1163`'s
+    // `isImageLine` guard).
+    for line in &mut block {
+        normalize_line(line);
+    }
     // The block is state-tinted (bg-only); a leading untinted blank stands in for the component Spacer.
     //
     // X8 — `edit` is the one tool whose tint is NOT the shared `done`/`is_error` one. Pi gives it
@@ -130,6 +142,13 @@ pub(crate) struct ImageOpts<'a> {
     /// `tools_expanded` joined it; it is the per-paint bag for everything an [`Entry`] cannot carry
     /// on itself.)
     pub hidden_thinking_label: Option<&'a str>,
+    /// The LIVE `markdown.mermaid` mode (Pi's transformer closure re-reads
+    /// `getMermaidRenderingMode()` on every render, `interactive-mode.ts:484-486`), for the same
+    /// reason `tools_expanded` and `hidden_thinking_label` are here: a `/settings` flip must reach
+    /// the committed entries this bag renders, not only the live region. Defaults to
+    /// [`cyrup_config::MermaidRenderingMode::Streaming`], Pi's documented default
+    /// (`settings-manager.ts:61`).
+    pub mermaid: cyrup_config::MermaidRenderingMode,
 }
 
 impl Default for ImageOpts<'_> {
@@ -146,6 +165,7 @@ impl Default for ImageOpts<'_> {
             links: None,
             tools_expanded: false,
             hidden_thinking_label: None,
+            mermaid: cyrup_config::MermaidRenderingMode::default(),
         }
     }
 }

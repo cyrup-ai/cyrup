@@ -55,6 +55,7 @@ use crate::transcript::is_ws_grapheme;
 mod highlight;
 
 mod latex;
+mod mermaid;
 mod prepass;
 mod table;
 mod walk;
@@ -62,10 +63,12 @@ mod walk;
 pub use prepass::trim_partial_closing_fence;
 
 pub(crate) use highlight::highlight_code_lines;
+pub(crate) use mermaid::{mode_from_setting, MermaidContext, MessageType};
 
 // The markdown-internal items the submodules share. Re-bound here so every submodule reaches them
 // through its own `use super::*;`, the same way `crate::transcript`'s split modules do.
 use highlight::highlight_lines;
+use mermaid::DiagramOutcome;
 use prepass::{latex_prepass, MATH_END, MATH_START};
 use table::trim_cell;
 
@@ -136,7 +139,15 @@ pub fn render_with_default_style(
     color: Option<ratatui::style::Color>,
     italic: bool,
 ) -> Vec<Line<'static>> {
-    render_inner(text, width, theme, color, italic, crate::image::hyperlinks_supported())
+    render_inner(
+        text,
+        width,
+        theme,
+        color,
+        italic,
+        crate::image::hyperlinks_supported(),
+        MermaidContext::OFF,
+    )
 }
 
 /// [`render`] with the terminal's OSC-8 hyperlink capability supplied explicitly instead of read
@@ -158,7 +169,36 @@ pub fn render_with_hyperlink_support(
     theme: &UiTheme,
     hyperlinks: bool,
 ) -> Vec<Line<'static>> {
-    render_inner(text, width, theme, None, false, hyperlinks)
+    render_inner(text, width, theme, None, false, hyperlinks, MermaidContext::OFF)
+}
+
+/// [`render_with_text_color`] plus the mermaid gate — cyrup's stand-in for pi's
+/// `createMarkdownTransform(messageType, isStreaming, transformers)`
+/// (`components/markdown-transform.ts:3-10`), which upstream attaches to the `Markdown` component of
+/// each of its three message types: `assistant-message.ts:112` (`"assistant"`, `this.isStreaming`),
+/// `:157-161` (`"assistant-thinking"`) and `user-message.ts:53` (`"user"`, `false`).
+///
+/// **This is a narrow, mermaid-only hook.** It exists because pi's mermaid gate is defined on
+/// `messageType` / `isStreaming` / `availableWidth` (`mermaid.ts:63-70`) and there is nowhere else
+/// to read them. The general, extension-supplied `MarkdownTransformer` registry
+/// (`core/extensions/types.ts:1355`) is the sibling gap MARKDOWN_TRANSFORM_HOOK_NOT_WIRED and is
+/// deliberately NOT built here; widening this signature into a transformer list is that task's job.
+pub(crate) fn render_message(
+    text: &str,
+    width: usize,
+    theme: &UiTheme,
+    color: Option<ratatui::style::Color>,
+    mermaid: MermaidContext,
+) -> Vec<Line<'static>> {
+    render_inner(
+        text,
+        width,
+        theme,
+        color,
+        false,
+        crate::image::hyperlinks_supported(),
+        mermaid,
+    )
 }
 
 fn render_inner(
@@ -168,6 +208,7 @@ fn render_inner(
     color: Option<ratatui::style::Color>,
     italic: bool,
     hyperlinks: bool,
+    mermaid: MermaidContext,
 ) -> Vec<Line<'static>> {
     // Tabs → 3 spaces before parse (`markdown.ts:171`).
     let prepared = text.replace('\t', "   ");
@@ -178,6 +219,7 @@ fn render_inner(
     r.default_text = color;
     r.default_italic = italic;
     r.hyperlinks = hyperlinks;
+    r.mermaid = mermaid;
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     // `into_offset_iter` (rather than the plain event iterator) because two upstream behaviours are
     // defined on the *source* text, not on the event: the strict `~~`-only strikethrough tokenizer
@@ -237,6 +279,11 @@ struct MdRenderer<'t> {
     /// `getCapabilities().hyperlinks` (`markdown.ts:692`): when the terminal forwards OSC-8, Pi
     /// prints the link text ONLY and never the ` (url)` suffix.
     hyperlinks: bool,
+    /// The mermaid transformer's gate (`mermaid.ts:62-70`): the live `markdown.mermaid` mode plus
+    /// the `messageType` / `isStreaming` half of pi's `MarkdownTransformContext`. Default
+    /// [`MermaidContext::OFF`] — every entry point but [`render_message`] leaves fences alone,
+    /// which is what upstream does for any markdown that is not one of its three message bodies.
+    mermaid: MermaidContext,
     /// M12 — rendered LaTeX per placeholder index, pre-split on `\n`. `latexBlock` pushes one output
     /// line per row (`markdown.ts:511-513`), so the rows are kept apart rather than re-joined.
     math: Vec<Vec<String>>,

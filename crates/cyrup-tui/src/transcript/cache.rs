@@ -112,6 +112,10 @@ impl TranscriptView {
         // non-empty. So a reasoning run of nothing but whitespace renders nothing at all, not even
         // the `Thinking...` label. `commit_thinking` already applies that test; the live leg did
         // not, so a stray whitespace `ThinkingDelta` put a label (and its blank) on screen.
+        // No mermaid context is plumbed through `thinking_lines`: pi's gate returns the markdown
+        // untouched whenever `context.messageType === "assistant-thinking"` (`mermaid.ts:65`), so
+        // the thinking path — here and in `transcript/message.rs` — is an unconditional
+        // pass-through and a context there would be dead weight.
         if let Some(thinking) = self.thinking.as_ref().filter(|_| thinking_visible) {
             let mut td = thinking_lines(
                 thinking,
@@ -141,10 +145,20 @@ impl TranscriptView {
             // paddingX * 2`, i.e. `width - outputPad * 2`, where the old `width - (11 + outputPad)`
             // was budgeting for the deleted `"assistant: "`.
             let body = crate::markdown::trim_partial_closing_fence(partial);
-            let mut md = crate::markdown::render(
+            // The ONLY `is_streaming: true` markdown site — `assistant-message.ts:112` passes
+            // `createMarkdownTransform("assistant", this.isStreaming, …)`, and `isStreaming` is
+            // true exactly while the turn streams. It is what makes `markdown.mermaid = "final"`
+            // hold the raw fence here and draw the diagram once the turn commits (`mermaid.ts:66`).
+            let mut md = crate::markdown::render_message(
                 &body,
                 width.saturating_sub(self.output_pad * 2).max(1),
                 theme,
+                None,
+                crate::markdown::MermaidContext::new(
+                    self.mermaid_mode,
+                    crate::markdown::MessageType::Assistant,
+                    true,
+                ),
             );
             if md.is_empty() {
                 md.push(Line::default());
@@ -172,6 +186,9 @@ impl TranscriptView {
                     // A tool block draws no reasoning, so this is inert here — carried only so the
                     // bag has one construction shape.
                     hidden_thinking_label: None,
+                    // Likewise inert: a tool block is not one of pi's three markdown message
+                    // bodies, so no mermaid transformer reaches it upstream.
+                    mermaid: self.mermaid_mode,
                 },
             ));
         }

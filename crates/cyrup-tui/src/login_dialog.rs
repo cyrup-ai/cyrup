@@ -51,7 +51,7 @@
 //! * **Secrets are not masked**, matching upstream — pi's dialog uses a plain `Input` for every
 //!   prompt kind including `secret` (`login-dialog.ts:54`, `:154-172`).
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -107,11 +107,11 @@ impl LoginLineKind {
     }
 }
 
-/// The active free-text prompt (pi's shared `Input`, `login-dialog.ts:54`).
+/// The active free-text prompt (pi's shared `Input`, `login-dialog.ts:54`) — literally the shared
+/// [`crate::text_input::Input`] now, so a credential field has the same word motion / kill ring /
+/// undo / paste as every search box.
 struct LoginInput {
-    buffer: String,
-    /// Byte offset into `buffer` (always a char boundary).
-    cursor: usize,
+    input: crate::text_input::Input,
     placeholder: Option<String>,
 }
 
@@ -202,7 +202,7 @@ impl LoginDialog {
 
     /// The current free-text buffer, or `None` when no text prompt is armed.
     pub fn input_text(&self) -> Option<&str> {
-        self.input.as_ref().map(|i| i.buffer.as_str())
+        self.input.as_ref().map(|i| i.input.value())
     }
 
     /// Whether a prompt (text or select) is currently awaiting an answer.
@@ -271,11 +271,8 @@ impl LoginDialog {
     pub fn show_manual_input(&mut self, prompt: &str) {
         self.spacer();
         self.push(LoginLineKind::Dim, prompt);
-        self.input = Some(LoginInput {
-            buffer: String::new(),
-            cursor: 0,
-            placeholder: None,
-        });
+        self.input =
+            Some(LoginInput { input: crate::text_input::Input::new(), placeholder: None });
         self.select = None;
     }
 
@@ -288,11 +285,7 @@ impl LoginDialog {
         if let Some(hint) = placeholder.as_deref().filter(|s| !s.is_empty()) {
             self.push(LoginLineKind::Dim, format!("e.g., {hint}"));
         }
-        self.input = Some(LoginInput {
-            buffer: String::new(),
-            cursor: 0,
-            placeholder,
-        });
+        self.input = Some(LoginInput { input: crate::text_input::Input::new(), placeholder });
         self.select = None;
     }
 
@@ -377,7 +370,7 @@ impl LoginDialog {
     /// ([`Selector::desired_height`]) — the row texts are identical either way, so measuring
     /// through the same function is what guarantees the reserved height can never disagree with
     /// what renders (the invariant `title_wrapped_height` documents for the title area).
-    fn body_lines(&self, theme: Option<&UiTheme>) -> Vec<Line<'static>> {
+    fn body_lines(&self, width: u16, theme: Option<&UiTheme>) -> Vec<Line<'static>> {
         let style = |pick: fn(&UiTheme) -> Style| theme.map(pick).unwrap_or_default();
         let mut out: Vec<Line<'static>> = self
             .lines
@@ -406,16 +399,33 @@ impl LoginDialog {
             let mut spans =
                 vec![Span::styled(crate::selector::INPUT_PROMPT, style(UiTheme::base_style))];
             match input.placeholder.as_deref().filter(|s| !s.is_empty()) {
-                Some(hint) if input.buffer.is_empty() => {
+                Some(hint) if input.input.value().is_empty() => {
                     spans.push(Span::styled(hint.to_string(), style(UiTheme::muted_style)));
                 }
                 _ => match theme {
                     Some(theme) => {
-                        spans.extend(search_input_spans(&input.buffer, input.cursor, theme));
+                        // pi's `availableWidth = width - prompt.length` (`input.ts:381`).
+                        let available =
+                            usize::from(width).saturating_sub(crate::selector::INPUT_PROMPT.len());
+                        spans.extend(search_input_spans(
+                            input.input.value(),
+                            input.input.cursor(),
+                            available,
+                            theme,
+                        ));
                     }
                     // Measurement: `search_input_spans` always draws a caret cell, so the widest
-                    // form is the buffer plus one column.
-                    None => spans.push(Span::raw(format!("{} ", input.buffer))),
+                    // form is the buffer plus one column — capped at the same `availableWidth` the
+                    // render windows to (`input.ts:381,415`), or a value wider than the field would
+                    // reserve rows the drawn (windowed) line never fills.
+                    None => {
+                        let available =
+                            usize::from(width).saturating_sub(crate::selector::INPUT_PROMPT.len());
+                        let cols = crate::text_width::str_width(input.input.value())
+                            .saturating_add(1)
+                            .min(available);
+                        spans.push(Span::raw(" ".repeat(cols)));
+                    }
                 },
             }
             out.push(Line::from(spans));
@@ -429,46 +439,6 @@ impl LoginDialog {
         out
     }
 
-    fn insert_char(&mut self, c: char) {
-        if let Some(input) = self.input.as_mut() {
-            input.buffer.insert(input.cursor, c);
-            input.cursor += c.len_utf8();
-        }
-    }
-
-    fn backspace(&mut self) {
-        let Some(input) = self.input.as_mut() else { return };
-        let Some(ch) = input.buffer.get(..input.cursor).and_then(|s| s.chars().next_back()) else {
-            return;
-        };
-        let start = input.cursor - ch.len_utf8();
-        input.buffer.replace_range(start..input.cursor, "");
-        input.cursor = start;
-    }
-
-    fn delete_forward(&mut self) {
-        let Some(input) = self.input.as_mut() else { return };
-        let Some(ch) = input.buffer.get(input.cursor..).and_then(|s| s.chars().next()) else {
-            return;
-        };
-        let end = input.cursor + ch.len_utf8();
-        input.buffer.replace_range(input.cursor..end, "");
-    }
-
-    fn cursor_left(&mut self) {
-        let Some(input) = self.input.as_mut() else { return };
-        if let Some(ch) = input.buffer.get(..input.cursor).and_then(|s| s.chars().next_back()) {
-            input.cursor -= ch.len_utf8();
-        }
-    }
-
-    fn cursor_right(&mut self) {
-        let Some(input) = self.input.as_mut() else { return };
-        if let Some(ch) = input.buffer.get(input.cursor..).and_then(|s| s.chars().next()) {
-            input.cursor += ch.len_utf8();
-        }
-    }
-
     /// The answer the currently-armed prompt would produce on `tui.select.confirm`, plus the echo
     /// text to record. `None` when nothing is armed (pi's `input.onSubmit` no-ops without an
     /// `inputResolver`, `login-dialog.ts:56-64`).
@@ -478,14 +448,15 @@ impl LoginDialog {
             return Some((id.clone(), label.clone()));
         }
         let input = self.input.as_ref()?;
-        Some((input.buffer.clone(), input.buffer.clone()))
+        let answer = input.input.value().to_string();
+        Some((answer.clone(), answer))
     }
 }
 
 impl Selector for LoginDialog {
     fn desired_height(&self, width: u16) -> u16 {
         // Top rule + wrapped title + wrapped body + bottom rule.
-        let body = self.body_lines(None);
+        let body = self.body_lines(width, None);
         let body_h = crate::transcript::wrapped_height(&body, usize::from(width))
             .min(usize::from(u16::MAX)) as u16;
         title_wrapped_height(&self.title, width)
@@ -495,7 +466,7 @@ impl Selector for LoginDialog {
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let title_h = title_wrapped_height(&self.title, area.width);
-        let body = self.body_lines(Some(theme));
+        let body = self.body_lines(area.width, Some(theme));
         let body_h = crate::transcript::wrapped_height(&body, usize::from(area.width))
             .min(usize::from(u16::MAX)) as u16;
         let [top, title_area, body_area, bottom] = Layout::vertical([
@@ -555,45 +526,31 @@ impl Selector for LoginDialog {
         if self.input.is_none() {
             return SelectorOutcome::Ignored;
         }
-        match key.code {
-            KeyCode::Backspace => {
-                self.backspace();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Delete => {
-                self.delete_forward();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Left => {
-                self.cursor_left();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Right => {
-                self.cursor_right();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Home => {
-                if let Some(input) = self.input.as_mut() {
-                    input.cursor = 0;
-                }
-                SelectorOutcome::Redraw
-            }
-            KeyCode::End => {
-                if let Some(input) = self.input.as_mut() {
-                    input.cursor = input.buffer.len();
-                }
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(c);
-                SelectorOutcome::Redraw
-            }
-            _ => SelectorOutcome::Ignored,
+        // Everything else is the shared single-line editing surface (`login-dialog.ts:231`
+        // hands the key straight to the `Input`). `Left`/`Right`/`Home`/`End`/`Delete`/`Backspace`
+        // still resolve here — they are `EditorKeymap::default()`'s `Key::plain(...)` bindings —
+        // alongside the word motion, kill ring, undo and paste they never had.
+        let Some(field) = self.input.as_mut() else { return SelectorOutcome::Ignored };
+        match field.input.handle_key(key) {
+            crate::text_input::InputOutcome::Ignored => SelectorOutcome::Ignored,
+            _ => SelectorOutcome::Redraw,
         }
     }
 
     fn set_title(&mut self, title: String) {
         self.title = title;
+    }
+
+    fn set_editor_keymap(&mut self, keymap: &crate::keymap::EditorKeymap) {
+        if let Some(field) = self.input.as_mut() {
+            field.input.set_editor_keymap(keymap);
+        }
+    }
+
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        let Some(field) = self.input.as_mut() else { return SelectorOutcome::Ignored };
+        field.input.paste(text);
+        SelectorOutcome::Redraw
     }
 
     fn as_login_dialog(&mut self) -> Option<&mut LoginDialog> {
@@ -769,6 +726,7 @@ mod tests {
     )]
 
     use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use cyrup_provider::auth::oauth::{AuthInfoLink, AuthSelectOption};
     use ratatui::crossterm::event::{KeyEventKind, KeyEventState};
 

@@ -243,6 +243,23 @@ async-compression    = { version = "0.4.33", features = ["tokio", "gzip", "brotl
 # `forbid(unsafe_code)` in cyrup-tui is unaffected (the lint is per-crate, not transitive).
 pulldown-cmark       = { version = "0.13.4", default-features = false }
 syntect              = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+# Mermaid -> Unicode terminal diagrams for cyrup-tui's markdown renderer — the Rust counterpart of
+# pi's `grok-mermaid` JS package (`components/mermaid.ts:2`), chosen 2026-08-28 after a crates.io
+# survey. MIT, and only three direct deps (`ascii-dag`, `chrono`, `unicode-width` — the last two
+# were already in this tree), so `#![forbid(unsafe_code)]` in cyrup-tui is unaffected.
+#
+# `mermansi` was tried FIRST and REJECTED — record the reason so nobody re-picks it. It is a fine
+# renderer, but it pulls 151 transitive crates including a CSS engine, and one of them,
+# `merman-core` 0.8.0-alpha.3 (an alpha), declares `serde_json` with a NON-OPTIONAL
+# `features = ["preserve_order"]`. Cargo feature unification is graph-wide and additive, so that
+# flips `serde_json::Map` from `BTreeMap` to `IndexMap` for EVERY crate in this workspace —
+# silently changing map ordering in config persistence, provider request bodies, MCP payloads and
+# session records. It broke two pre-existing `cyrup-ext-subagents` tests, and only under
+# `cargo test --workspace` (`-p cyrup-ext-subagents` alone still passed), which is the worst shape
+# of CI hazard. `mmdflux` is a 243-file surface; `flowmaid` is GPL-3.0 and cyrup is MIT.
+#
+# Not `default-features = false`: its `default` is already empty.
+mermaid-text         = { version = "0.57.0" }
 # `default-features = false` drops the `chafa-dyn` feature (a C `libchafa` pkg-config dep used only
 # for higher-quality sixel encoding); sixel still works via the pure-Rust `icy_sixel`, so the
 # workspace stays all-Rust with no system library. `crossterm` matches ratatui's backend.

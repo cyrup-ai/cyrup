@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
 use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
@@ -25,6 +25,7 @@ use crate::keymap::{
     EditorAction, EditorKeymap, Key, SelectAction, SelectKeymap, SessionAction, SessionKeymap,
 };
 use crate::selector::{centered_window, rule_line, Selector, SelectorOutcome};
+use crate::text_input::{Input, InputOutcome};
 use crate::session_search::{filter_and_sort, NameFilter, SearchRow, SortMode};
 use crate::settings_selector::FIELD_SEP;
 use crate::text_width::{spans_width, str_width, truncate_spans_to_width, truncate_to_width};
@@ -159,10 +160,9 @@ pub struct SessionSelector {
     /// at `:468-470`. Fed like [`Self::set_parent_paths`] rather than carried on [`SessionRow`], so
     /// the row struct every existing caller builds stays source-compatible.
     cwds: HashMap<String, String>,
-    /// The live search query (the embedded `Input`).
-    query: String,
-    /// Cursor byte offset within `query`.
-    cursor: usize,
+    /// The live search query — pi's embedded `Input` (`session-selector.ts:332`), the shared
+    /// single-line editing surface.
+    input: Input,
     sort: SortMode,
     name_filter: NameFilter,
     /// Show the full path under each row (`Ctrl+P`).
@@ -171,8 +171,10 @@ pub struct SessionSelector {
     selected: usize,
     /// When `Some(path)`, a delete confirmation is pending for that row.
     confirming_delete: Option<String>,
-    /// When `Some((path, buffer)）`, a rename input is open for that row.
-    renaming: Option<(String, String)>,
+    /// When `Some((path, input)）`, a rename input is open for that row — pi's SECOND `Input`
+    /// (`session-selector.ts:718`), so it carries a caret and the same editing surface as the search
+    /// box (it used to be a bare `String` edited with `push`/`pop`, with no caret at all).
+    renaming: Option<(String, Input)>,
     max_visible: usize,
     /// Which session set is on screen (drives the header radio, `session-selector.ts:144-148`).
     scope: SessionScope,
@@ -218,8 +220,7 @@ impl SessionSelector {
             all_rows: None,
             cwds: HashMap::new(),
             rows,
-            query: String::new(),
-            cursor: 0,
+            input: Input::new(),
             sort: SortMode::Threaded,
             name_filter: NameFilter::All,
             show_path: false,
@@ -354,10 +355,11 @@ impl SessionSelector {
                 item: i,
             })
             .collect();
-        let idxs = filter_and_sort(&search_rows, &self.query, self.sort, self.name_filter);
+        let idxs =
+            filter_and_sort(&search_rows, self.input.value(), self.sort, self.name_filter);
         let rows: Vec<SessionRow> =
             idxs.into_iter().filter_map(|i| self.rows.get(i).cloned()).collect();
-        if self.sort == SortMode::Threaded && self.query.trim().is_empty() {
+        if self.sort == SortMode::Threaded && self.input.value().trim().is_empty() {
             flatten_session_tree(&rows, &self.parents)
         } else {
             rows.into_iter().map(FlatSessionNode::flat).collect()
@@ -461,36 +463,6 @@ impl SessionSelector {
             self.selected = 0;
         } else if self.selected >= len {
             self.selected = len - 1;
-        }
-    }
-
-    /// Insert a printable char into the active text field (search or rename input).
-    fn insert_char(&mut self, c: char) {
-        if let Some((_, buf)) = self.renaming.as_mut() {
-            buf.push(c);
-            return;
-        }
-        self.query.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-        self.selected = 0;
-    }
-
-    /// Backspace the active text field.
-    fn backspace(&mut self) {
-        if let Some((_, buf)) = self.renaming.as_mut() {
-            buf.pop();
-            return;
-        }
-        if self.cursor == 0 {
-            return;
-        }
-        // Remove the char ending at `cursor`.
-        let prev = self.query.get(..self.cursor).and_then(|s| s.chars().next_back());
-        if let Some(ch) = prev {
-            let start = self.cursor - ch.len_utf8();
-            self.query.replace_range(start..self.cursor, "");
-            self.cursor = start;
-            self.selected = 0;
         }
     }
 
@@ -872,11 +844,17 @@ impl Selector for SessionSelector {
         // child, and the content child is the `SessionList` whose first line is the search input.
         lines.push(Line::from(""));
         // Search / rename input (`SessionList.render`, `session-selector.ts:418`).
-        if let Some((_, buf)) = &self.renaming {
-            lines.push(Line::from(vec![
-                Span::styled(" rename ", theme.accent_style()),
-                Span::styled(buf.clone(), theme.base_style()),
-            ]));
+        if let Some((_, edit)) = &self.renaming {
+            // The accent ` rename ` label, then the `Input`'s own value + caret; the label eats
+            // eight columns, so the value gets the rest.
+            let mut spans = vec![Span::styled(" rename ", theme.accent_style())];
+            spans.extend(crate::selector::search_input_spans(
+                edit.value(),
+                edit.cursor(),
+                usize::from(area.width).saturating_sub(8),
+                theme,
+            ));
+            lines.push(Line::from(spans));
         } else {
             // Search box with a visible block cursor (feature #9 "selector IME cursor").
             //
@@ -885,8 +863,9 @@ impl Selector for SessionSelector {
             // row is `Input.render`'s shared, unstyled `"> "` at column 0 (`input.ts:380`). cyrup
             // drew an accent `" > "`: one column in, and coloured.
             lines.push(Line::from(crate::selector::input_line_spans(
-                &self.query,
-                self.cursor,
+                self.input.value(),
+                self.input.cursor(),
+                area.width,
                 theme,
             )));
         }
@@ -921,12 +900,15 @@ impl Selector for SessionSelector {
             }
         }
 
-        // 2) Rename-input state.
-        if let Some((path, buf)) = self.renaming.clone() {
+        // 2) Rename-input state. Enter/Esc stay here (upstream's rename panel owns them,
+        // `session-selector.ts:879`); everything else is the embedded `Input`'s editing surface.
+        if self.renaming.is_some() {
             match key.code {
                 KeyCode::Enter => {
-                    let name = buf.trim().to_string();
-                    self.renaming = None;
+                    let Some((path, edit)) = self.renaming.take() else {
+                        return SelectorOutcome::Redraw;
+                    };
+                    let name = edit.value().trim().to_string();
                     self.apply_rename(&path, &name);
                     return SelectorOutcome::Apply(SessionSelectorOutcome::rename_payload(&path, &name));
                 }
@@ -934,15 +916,12 @@ impl Selector for SessionSelector {
                     self.renaming = None;
                     return SelectorOutcome::Redraw;
                 }
-                KeyCode::Backspace => {
-                    self.backspace();
+                _ => {
+                    if let Some((_, edit)) = self.renaming.as_mut() {
+                        edit.handle_key(key);
+                    }
                     return SelectorOutcome::Redraw;
                 }
-                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.insert_char(c);
-                    return SelectorOutcome::Redraw;
-                }
-                _ => return SelectorOutcome::Redraw,
             }
         }
 
@@ -971,7 +950,8 @@ impl Selector for SessionSelector {
                 }
                 SessionAction::Rename => {
                     if let Some(row) = self.current() {
-                        self.renaming = Some((row.path, row.name.clone().unwrap_or_default()));
+                        self.renaming =
+                            Some((row.path, Input::with_value(row.name.clone().unwrap_or_default())));
                     }
                 }
             }
@@ -1007,21 +987,36 @@ impl Selector for SessionSelector {
                 None => SelectorOutcome::Redraw,
             },
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
-            None => {
-                // 6) Printable text → search input.
-                if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    self.insert_char(c);
-                    return SelectorOutcome::Redraw;
+            // 6) Everything else → the search `Input` (`session-selector.ts:565-567`).
+            None => match self.input.handle_key(key) {
+                InputOutcome::Edited => {
+                    self.selected = 0;
+                    SelectorOutcome::Redraw
                 }
-                if key.code == KeyCode::Backspace {
-                    self.backspace();
-                    return SelectorOutcome::Redraw;
-                }
-                SelectorOutcome::Ignored
-            }
+                InputOutcome::Moved => SelectorOutcome::Redraw,
+                InputOutcome::Ignored => SelectorOutcome::Ignored,
+            },
         }
+    }
+
+    /// Feed the live editor table to BOTH embedded inputs (`session-selector.ts:332` and `:718`).
+    fn set_editor_keymap(&mut self, keymap: &EditorKeymap) {
+        self.input.set_editor_keymap(keymap);
+        if let Some((_, edit)) = self.renaming.as_mut() {
+            edit.set_editor_keymap(keymap);
+        }
+    }
+
+    /// Route a bracketed paste to whichever input is focused — the rename field when it is open,
+    /// otherwise the search box.
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        if let Some((_, edit)) = self.renaming.as_mut() {
+            edit.paste(text);
+            return SelectorOutcome::Redraw;
+        }
+        self.input.paste(text);
+        self.selected = 0;
+        SelectorOutcome::Redraw
     }
 }
 
@@ -1190,6 +1185,8 @@ fn descends_from(parent_of: &[Option<usize>], node: usize, ancestor: usize) -> b
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 mod tests {
+    use ratatui::crossterm::event::KeyModifiers;
+
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;

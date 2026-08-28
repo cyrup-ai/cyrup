@@ -11,6 +11,8 @@ impl TranscriptView {
             show_images: true,
             graphical_images: true,
             image_width_cells: DEFAULT_IMAGE_WIDTH_CELLS,
+            // `markdown.mermaid` is deliberately absent: the derived `Default` is already
+            // `MermaidRenderingMode::Streaming`, Pi's own default (settings-manager.ts:61).
             ..TranscriptView::default()
         }
     }
@@ -41,6 +43,23 @@ impl TranscriptView {
     /// Whether inline tool-result images are on (read by the shell when flushing committed entries).
     pub fn show_images(&self) -> bool {
         self.show_images
+    }
+
+    /// Set `markdown.mermaid` live (Pi's transformer reads
+    /// `getMode: () => this.settingsManager.getMermaidRenderingMode()` on every render,
+    /// `interactive-mode.ts:484-486`, so upstream the `/settings` flip is live by construction).
+    /// cyrup caches the mode here, so the row has to push into it.
+    pub fn set_mermaid_mode(&mut self, mode: cyrup_config::MermaidRenderingMode) {
+        // Required: the render cache is keyed on `(render_generation, width, theme.generation)`,
+        // so without the bump a cycled row would not repaint the live region.
+        self.bump_render_generation();
+        self.mermaid_mode = mode;
+    }
+
+    /// The live `markdown.mermaid` mode (read by the shell when flushing committed entries and by
+    /// the alternate screen's document key, so both renderers agree with the live region).
+    pub fn mermaid_mode(&self) -> cyrup_config::MermaidRenderingMode {
+        self.mermaid_mode
     }
 
     /// Set whether the terminal has a real image protocol (TUI-N01; Pi's `getCapabilities().images`

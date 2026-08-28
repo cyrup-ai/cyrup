@@ -96,6 +96,11 @@ impl<B: Backend> App<B> {
                 .collect();
         }
         self.refresh_subscription_marker();
+        // `available_model_catalog()` is auth-FILTERED (`cyrup-session-svc/src/session/model.rs:235-237`),
+        // so a login or a logout changes which models `/model ` may offer. This is the seam every
+        // credential change already funnels through, which is why the refresh hangs off it rather
+        // than off each caller.
+        self.refresh_argument_sources(session);
     }
 
     /// The provider registry the subscription predicate reads — pi's `this.models.getProvider(id)`
