@@ -467,6 +467,93 @@ async fn a_confirming_authority_policy_refuses_when_the_session_has_no_ui() {
     );
 }
 
+/// SUBA-077: the top-level PARALLEL (`tasks: []`) surface used to hard-code its timeout argument
+/// to `None`, so an explicit call-site `timeoutMs` was dropped on the floor — never validated,
+/// never propagated. An INVALID one is the decisive observable: pre-fix it was silently ignored
+/// and the call fell through to agent resolution; post-fix it must be REFUSED with the resolver's
+/// own message, before any agent is resolved or any child spawned.
+///
+/// Both agents are deliberately unresolvable, so a regression cannot pass this by erroring for
+/// some other reason — the assertion is on the message, and `AgentNotFound` does not contain it.
+#[tokio::test]
+async fn an_invalid_timeout_on_a_parallel_call_is_refused_rather_than_dropped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let tool = scoped_tool(dir.path()).await;
+
+    let message = tool
+        .execute(
+            ToolCallId::from("par-timeout"),
+            serde_json::json!({
+                "tasks": [{ "agent": "ghost-one", "task": "a" }, { "agent": "ghost-two", "task": "b" }],
+                "timeoutMs": 0
+            }),
+            CancelToken::new(),
+            Box::new(|_u: cyrup_core::ToolUpdate| {}),
+        )
+        .await
+        .expect_err("0 is not a valid timeout")
+        .to_string();
+    assert!(
+        message.contains("timeoutMs must be a positive integer."),
+        "a parallel call's timeout must be resolved, not discarded; got {message}"
+    );
+
+    // The alias is resolved on this surface too, on exactly the same terms as SINGLE.
+    let message = tool
+        .execute(
+            ToolCallId::from("par-timeout-alias"),
+            serde_json::json!({
+                "tasks": [{ "agent": "ghost-one", "task": "a" }],
+                "timeoutMs": 10,
+                "maxRuntimeMs": 20
+            }),
+            CancelToken::new(),
+            Box::new(|_u: cyrup_core::ToolUpdate| {}),
+        )
+        .await
+        .expect_err("disagreeing aliases are refused")
+        .to_string();
+    assert!(
+        message.contains("timeoutMs and maxRuntimeMs are aliases"),
+        "got {message}"
+    );
+}
+
+/// SUBA-077: `subagents.timeoutMs` reaches [`SubagentExtensionConfig`] off the wire under pi's own
+/// camelCase key, and is carried RAW so an invalid value degrades to the built-in backstop instead
+/// of failing the whole config's deserialization and taking every other setting with it.
+#[test]
+fn the_config_timeout_key_deserializes_raw_and_survives_a_garbage_value() {
+    let cfg: SubagentExtensionConfig =
+        serde_json::from_value(serde_json::json!({ "timeoutMs": 60_000 })).expect("config parses");
+    assert_eq!(
+        crate::extension::tool::params::foreground_timeout_default(
+            false,
+            Option::None,
+            cfg.timeout_ms.as_ref()
+        ),
+        Some(60_000),
+        "a valid `subagents.timeoutMs` must replace the built-in backstop"
+    );
+
+    let cfg: SubagentExtensionConfig =
+        serde_json::from_value(serde_json::json!({ "timeoutMs": -5, "asyncByDefault": true }))
+            .expect("a garbage timeoutMs must NOT fail the whole config");
+    assert!(
+        cfg.async_by_default,
+        "the sibling setting must survive alongside the bad one"
+    );
+    assert_eq!(
+        crate::extension::tool::params::foreground_timeout_default(
+            false,
+            Option::None,
+            cfg.timeout_ms.as_ref()
+        ),
+        Some(crate::exec::DEFAULT_FOREGROUND_TIMEOUT_MS),
+        "an invalid value degrades to the built-in backstop"
+    );
+}
+
 /// SUBA-047's refusal half — pi `validateToolBudgetConfig(params.toolBudget, "toolBudget")`
 /// (`runs/background/async-execution.ts:1299` @v0.43.0). A malformed budget must refuse the
 /// call with the validator's own message; silently downgrading to "unbudgeted" is the same

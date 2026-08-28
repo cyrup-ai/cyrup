@@ -228,6 +228,20 @@ pub struct SubagentExtensionConfig {
     /// does not take the whole extension down at load. `None` (the key omitted) is unbudgeted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_budget: Option<serde_json::Value>,
+    /// SUBA-077 — pi `config.timeoutMs`, read through `resolveConfigDefaultTimeoutMs`
+    /// (`runs/foreground/subagent-executor.ts:2684` @v0.57.0): the global default wall-clock
+    /// deadline, replacing the built-in backstop wherever a concrete default is applied. It is the
+    /// only way to raise a long fan-out's ceiling without passing `timeoutMs` on every call.
+    ///
+    /// Carried RAW, exactly like [`Self::turn_budget`] and for the SAME reason — with one
+    /// difference worth stating: upstream's validator returns `undefined` for ANY invalid value and
+    /// never errors, so a malformed `subagents.timeoutMs` must degrade to the built-in default
+    /// rather than fail a run. A typed `Option<u64>` here would be worse still: it would fail
+    /// deserialization of this WHOLE struct on `"timeoutMs": -5` and take every other setting down
+    /// with it. Validated at use by `extension::tool::params::resolve_config_default_timeout_ms`
+    /// — named rather than linked, because `extension::tool` is a private module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<serde_json::Value>,
     /// SUBA-025 — pi `ExtensionConfig.toolDescriptionMode?: ToolDescriptionMode`, read at
     /// `extension/index.ts:458` (@v0.34.0) / `:540` (@v0.43.0) as
     /// `description: buildSubagentToolDescription(config)`.
@@ -303,6 +317,7 @@ impl Default for SubagentExtensionConfig {
             artifact_dir: None,
             authority_policy: None,
             turn_budget: None,
+            timeout_ms: None,
             // SUBA-025 — pi's `mode === undefined => "full"` (`tool-description.ts:106`).
             tool_description_mode: None,
             permissions: None,

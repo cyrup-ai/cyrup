@@ -261,7 +261,76 @@ where
     }
 }
 
-pub(crate) fn resolve_foreground_timeout(p: &SubagentToolParams) -> Result<Option<u64>, String> {
+/// pi `MAX_TIMER_DELAY_MS` (`runs/foreground/subagent-executor.ts:2675` @v0.57.0).
+///
+/// Upstream's stated reason is a Node `setTimeout` overflow that would silently clamp the delay and
+/// expire the run almost immediately. Rust has no such clamp, but the bound is load-bearing here
+/// too: both foreground seams arm the deadline as `Instant::now() + Duration::from_millis(ms)`
+/// (`extension/executor/foreground.rs`, `extension/executor/chain.rs`), and `Instant + Duration`
+/// PANICS on overflow. Keeping upstream's ceiling therefore both stops a config value from
+/// panicking a run and keeps the same settings file behaving identically in either port.
+const MAX_TIMER_DELAY_MS: u64 = 2_147_483_647;
+
+/// pi `resolveConfigDefaultTimeoutMs` (`runs/foreground/subagent-executor.ts:2684` @v0.57.0):
+/// the global `subagents.timeoutMs` default, or `None`.
+///
+/// Silently yields `None` for ANY invalid value — absent, non-integer, non-positive, or above
+/// [`MAX_TIMER_DELAY_MS`] — so the caller falls back to the built-in default. Upstream never errors
+/// here and neither does this: a malformed global setting must not fail a run that would otherwise
+/// have had a perfectly sane deadline.
+///
+/// [`serde_json::Value::as_u64`] does upstream's `typeof raw !== "number" || !Number.isInteger(raw)
+/// || raw <= 0` in one call, rejecting strings, booleans, fractional and negative numbers. It also
+/// rejects a JSON `1.0`, where upstream's `Number.isInteger(1.0)` is `true` — not a shape worth
+/// widening the port for, and the degrade is to the built-in default rather than to an error.
+pub(crate) fn resolve_config_default_timeout_ms(raw: Option<&serde_json::Value>) -> Option<u64> {
+    let value = raw?.as_u64()?;
+    (value > 0 && value <= MAX_TIMER_DELAY_MS).then_some(value)
+}
+
+/// The foreground default rung of pi `resolveSingleAgentLaunchTimeout`
+/// (`runs/foreground/subagent-executor.ts:2719-2725` @v0.57.0):
+/// `configDefaultTimeoutMs ?? DEFAULT_FOREGROUND_TIMEOUT_MS`, with the agent's own frontmatter
+/// `timeoutMs:` ahead of both.
+///
+/// Upstream folds the agent rung into `params.timeoutMs` before its ladder runs
+/// (`applySingleAgentLaunchDefaults`), so it never appears as a separate argument there; this port
+/// resolves it separately ([`crate::extension::SubagentExecutor::single_agent_launch_defaults`]),
+/// which is why it is the first rung here.
+///
+/// Returns what [`resolve_foreground_timeout`] should be GIVEN as its default — not the final
+/// timeout. An explicit call-site `timeoutMs`/`maxRuntimeMs` still outranks all three rungs.
+///
+/// `background` is upstream's `!async` arm (`:2724`), carried as a parameter rather than left as an
+/// `if` at each of the four call sites: an ASYNC launch gets NO built-in backstop from here,
+/// because `extension/executor/background.rs` applies
+/// [`crate::background::DEFAULT_ASYNC_CHILD_TIMEOUT_MS`] itself through a `timeout_ms.unwrap_or(…)`.
+/// Handing that `unwrap_or` a `Some` on every run would silently retire it — harmless while the two
+/// constants agree, a trap the moment either moves. The agent rung still applies on both arms.
+#[must_use]
+pub(crate) fn foreground_timeout_default(
+    background: bool,
+    agent_default_ms: Option<u64>,
+    config_timeout_ms: Option<&serde_json::Value>,
+) -> Option<u64> {
+    if background {
+        return agent_default_ms;
+    }
+    agent_default_ms
+        .or_else(|| resolve_config_default_timeout_ms(config_timeout_ms))
+        .or(Some(crate::exec::DEFAULT_FOREGROUND_TIMEOUT_MS))
+}
+
+/// pi `resolveForegroundTimeout` (`runs/foreground/subagent-executor.ts:2689` @v0.57.0).
+///
+/// `default_timeout_ms` is applied LAST, so it is reached only when the call supplied neither
+/// `timeoutMs` nor `maxRuntimeMs` — exactly upstream's `rawTimeout === undefined && rawMaxRuntime
+/// === undefined` early return. The validation below still runs first, so an invalid explicit value
+/// errors instead of being silently replaced by a default.
+pub(crate) fn resolve_foreground_timeout(
+    p: &SubagentToolParams,
+    default_timeout_ms: Option<u64>,
+) -> Result<Option<u64>, String> {
     for (name, value) in [("timeoutMs", p.timeout_ms), ("maxRuntimeMs", p.max_runtime_ms)] {
         if value == Some(0) {
             return Err(format!("{name} must be a positive integer."));
@@ -276,7 +345,7 @@ pub(crate) fn resolve_foreground_timeout(p: &SubagentToolParams) -> Result<Optio
                 .to_string(),
         );
     }
-    Ok(p.timeout_ms.or(p.max_runtime_ms))
+    Ok(p.timeout_ms.or(p.max_runtime_ms).or(default_timeout_ms))
 }
 
 /// pi `resolveExecutionAgentScope` (`pi-subagents/src/agents/agent-scope.ts:3-6`): `"user"`/
@@ -475,6 +544,159 @@ mod tests {
 
     use super::*;
     use crate::extension::testsupport::scoped_tool;
+
+    // ---------------------------------------------------------------------------------------
+    // SUBA-077 — the foreground wall-clock deadline ladder
+    // (pi `resolveSingleAgentLaunchTimeout`, `subagent-executor.ts:2719-2725` @v0.57.0)
+    // ---------------------------------------------------------------------------------------
+
+    const BUILTIN: u64 = crate::exec::DEFAULT_FOREGROUND_TIMEOUT_MS;
+
+    fn params(value: serde_json::Value) -> SubagentToolParams {
+        serde_json::from_value(value).expect("params parse")
+    }
+
+    /// The whole ladder, in one place, in precedence order. The rung that matters most is the LAST:
+    /// before SUBA-077 a foreground run with nothing set resolved `None` — no wall-clock deadline at
+    /// all — so a child whose bash tool blocked forever hung the orchestrator's turn open-endedly.
+    #[test]
+    fn the_foreground_timeout_ladder_runs_explicit_then_agent_then_config_then_builtin() {
+        let cfg = serde_json::json!(60_000);
+        let agent = Some(120_000_u64);
+
+        // 1. an explicit call-site value outranks every default.
+        assert_eq!(
+            resolve_foreground_timeout(
+                &params(serde_json::json!({"timeoutMs": 5_000})),
+                foreground_timeout_default(false, agent, Some(&cfg))
+            ),
+            Ok(Some(5_000))
+        );
+        // ...and so does its alias.
+        assert_eq!(
+            resolve_foreground_timeout(
+                &params(serde_json::json!({"maxRuntimeMs": 5_000})),
+                foreground_timeout_default(false, agent, Some(&cfg))
+            ),
+            Ok(Some(5_000))
+        );
+
+        // 2. the agent's own frontmatter `timeoutMs:` outranks the config value and the built-in.
+        //    This rung is the one a naive fix kills: it used to be a trailing `.or(launch_defaults.1)`
+        //    on the RESULT, which a default applied inside the resolver would render unreachable.
+        assert_eq!(
+            resolve_foreground_timeout(
+                &params(serde_json::json!({})),
+                foreground_timeout_default(false, agent, Some(&cfg))
+            ),
+            Ok(Some(120_000)),
+            "the agent rung must still be live once the default rungs exist"
+        );
+
+        // 3. `subagents.timeoutMs` replaces the built-in backstop.
+        assert_eq!(
+            foreground_timeout_default(false, Option::None, Some(&cfg)),
+            Some(60_000)
+        );
+
+        // 4. and with nothing set at all, the built-in backstop applies.
+        assert_eq!(
+            resolve_foreground_timeout(
+                &params(serde_json::json!({})),
+                foreground_timeout_default(false, Option::None, Option::None)
+            ),
+            Ok(Some(BUILTIN)),
+            "a foreground run with nothing set must be BOUNDED, not open-ended"
+        );
+        assert_eq!(BUILTIN, 1_800_000, "pi `DEFAULT_FOREGROUND_TIMEOUT_MS` is 30 minutes");
+    }
+
+    /// pi `resolveConfigDefaultTimeoutMs` (`:2684`) returns `undefined` for ANY invalid value and
+    /// never errors, so a malformed global setting degrades to the built-in default rather than
+    /// failing a run that would otherwise have had a perfectly sane deadline.
+    #[test]
+    fn an_invalid_config_timeout_is_ignored_rather_than_erroring() {
+        for bad in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!("abc"),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            // Above pi's `MAX_TIMER_DELAY_MS`. Upstream rejects it to avoid a `setTimeout`
+            // overflow; here it also keeps a config value from panicking `Instant + Duration`.
+            serde_json::json!(2_147_483_648_u64),
+        ] {
+            assert_eq!(
+                resolve_config_default_timeout_ms(Some(&bad)),
+                Option::None,
+                "{bad} must not resolve to a config default"
+            );
+            assert_eq!(
+                foreground_timeout_default(false, Option::None, Some(&bad)),
+                Some(BUILTIN),
+                "{bad} must fall through to the built-in backstop, not disarm the deadline"
+            );
+        }
+
+        // The boundary itself is accepted — the ceiling is inclusive upstream (`raw > MAX`).
+        assert_eq!(
+            resolve_config_default_timeout_ms(Some(&serde_json::json!(2_147_483_647_u64))),
+            Some(2_147_483_647)
+        );
+        assert_eq!(
+            resolve_config_default_timeout_ms(Option::None),
+            Option::None,
+            "an omitted key is simply no config rung"
+        );
+    }
+
+    /// pi's `!async` arm (`:2724`). An ASYNC launch gets no built-in backstop from this ladder,
+    /// because `extension/executor/background.rs` applies `DEFAULT_ASYNC_CHILD_TIMEOUT_MS` itself
+    /// through a `timeout_ms.unwrap_or(…)`. Handing that `unwrap_or` a `Some` on every run would
+    /// silently retire it — harmless while the two constants agree, a trap the moment either moves.
+    #[test]
+    fn an_async_launch_gets_no_foreground_backstop_but_keeps_its_agent_rung() {
+        assert_eq!(
+            foreground_timeout_default(true, Option::None, Option::None),
+            Option::None,
+            "the async path must reach its own default with `None` in hand"
+        );
+        assert_eq!(
+            foreground_timeout_default(true, Option::None, Some(&serde_json::json!(60_000))),
+            Option::None,
+            "not even a config value may pre-empt the async default from this seam (SUBA-051's)"
+        );
+        assert_eq!(
+            foreground_timeout_default(true, Some(120_000), Option::None),
+            Some(120_000),
+            "the agent's own frontmatter rung still applies on the async arm, as it did before"
+        );
+    }
+
+    /// The defaults are applied only when the call supplied NEITHER param — upstream's early
+    /// return. Validation still runs first, so an invalid explicit value errors instead of being
+    /// silently replaced by a default that would mask it.
+    #[test]
+    fn an_invalid_explicit_timeout_still_errors_rather_than_taking_the_default() {
+        let default = foreground_timeout_default(false, Option::None, Option::None);
+        assert_eq!(
+            resolve_foreground_timeout(&params(serde_json::json!({"timeoutMs": 0})), default),
+            Err("timeoutMs must be a positive integer.".to_string())
+        );
+        assert_eq!(
+            resolve_foreground_timeout(&params(serde_json::json!({"maxRuntimeMs": 0})), default),
+            Err("maxRuntimeMs must be a positive integer.".to_string())
+        );
+        assert_eq!(
+            resolve_foreground_timeout(
+                &params(serde_json::json!({"timeoutMs": 10, "maxRuntimeMs": 20})),
+                default
+            ),
+            Err("timeoutMs and maxRuntimeMs are aliases; provide only one value or use the same \
+                 value for both."
+                .to_string())
+        );
+    }
 
     /// SUBA-N04: pi `validateExecutionAcceptance` (`runs/shared/acceptance.ts:288-310` @v0.34.0)
     /// validates EVERY declared acceptance in one dispatch, with pi's own per-site path labels —

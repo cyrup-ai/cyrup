@@ -394,7 +394,18 @@ impl SubagentsExtension {
                     model,
                     // G98: same agent-level default on the foreground branch — pi applies
                     // it before the async/foreground fork, not inside one arm of it.
-                    default_timeout_ms,
+                    //
+                    // SUBA-077: `/run` is the fourth foreground surface and had the same
+                    // unbounded hole as the tool's three. It parses no timeout token, so the
+                    // ladder here is agent frontmatter > `subagents.timeoutMs` > the built-in
+                    // backstop; without that last rung this surface has no wall-clock deadline
+                    // at all. The BACKGROUND branch above is deliberately left alone — that is
+                    // `DEFAULT_ASYNC_CHILD_TIMEOUT_MS`'s seam, not this one.
+                    crate::extension::tool::params::foreground_timeout_default(
+                        false,
+                        default_timeout_ms,
+                        run_cfg.timeout_ms.as_ref(),
+                    ),
                 )
                 .await?;
             Ok(format_slash_run_completion(&result))
