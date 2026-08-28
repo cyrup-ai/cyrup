@@ -133,4 +133,92 @@ impl TranscriptView {
         // summary above, resolved at render time from the LIVE flag.
         self.pending.push(Entry::CompactionSummary { tokens_before, summary: summary.into() });
     }
+
+    /// pi `addCacheMissNotice` (`interactive-mode.ts:3828-3842` @v0.83.0) — the in-transcript
+    /// warning that a turn silently re-billed a prompt prefix that should have been a cache read.
+    ///
+    /// ```ts
+    /// if (miss.missedTokens < 20_000 && miss.missedCost < 0.1) return;
+    /// const cost = miss.missedCost >= 0.01 ? ` (~$${miss.missedCost.toFixed(2)})` : "";
+    /// let label = "Cache miss";
+    /// if (miss.modelChanged) label = "Cache miss after model switch";
+    /// else if (miss.idleMs >= CACHE_TTL_MS) label = `Cache miss after ${Math.round(miss.idleMs / 60_000)}m idle`;
+    /// this.chatContainer.addChild(new Spacer(1));
+    /// this.chatContainer.addChild(new Text(theme.fg("warning", `${label}: ${reBilled}`), 1, 0));
+    /// ```
+    ///
+    /// The suppression floor is `&&`, so the notice shows when EITHER threshold is met.
+    ///
+    /// **Do not substitute [`cyrup_provider::cache_stats::CacheMiss::exceeded_ttl`]
+    /// (`cache_stats.rs:70-72`) for the idle test.** That helper is `idle_ms > CACHE_TTL_MS` and
+    /// belongs to a different question ("did the cache certainly expire"); upstream's label branch
+    /// is `>=` (`interactive-mode.ts:3836`), and at exactly the TTL the two disagree.
+    ///
+    /// `Entry::Warning` already renders as `Spacer(1)` + one warning-coloured row
+    /// (`transcript/render.rs`'s `Entry::Warning` arm), which is pi's two `addChild` calls — so
+    /// there is no separate blank to push, and unlike `showWarning` this path carries no
+    /// `Warning: ` prefix, exactly as upstream's raw `Text` does not.
+    pub fn push_cache_miss_notice(&mut self, miss: &cyrup_provider::cache_stats::CacheMiss) {
+        // `:3829` — below BOTH thresholds is breakpoint noise, not a story worth telling.
+        if miss.missed_tokens < 20_000 && miss.missed_cost < 0.1 {
+            return;
+        }
+        let cost = cost_suffix(miss.missed_cost);
+        let label = if miss.model_changed {
+            // `:3833-3834`
+            "Cache miss after model switch".to_string()
+        } else if miss.idle_ms >= cyrup_provider::cache_stats::CACHE_TTL_MS {
+            // `:3835-3836` — `Math.round`, which for a non-negative `idle_ms` (the detector clamps
+            // it at `cache_stats.rs:176-179`) is `f64::round`. The `as i64` is a saturating cast,
+            // so it renders an integer count of minutes without a fallible conversion.
+            format!("Cache miss after {}m idle", (miss.idle_ms as f64 / 60_000.0).round() as i64)
+        } else {
+            "Cache miss".to_string()
+        };
+        self.push_warning(format!(
+            "{label}: {} tokens re-billed{cost}",
+            crate::status::format_tokens(miss.missed_tokens)
+        ));
+    }
+
+    /// pi `addCompactionCostNotice` (`interactive-mode.ts:3802-3814` @v0.83.0) — what a compaction
+    /// or a branch summarization cost, attributed at the point it happened instead of only landing
+    /// unlabelled in the footer's cumulative `$`.
+    ///
+    /// ```ts
+    /// const tokens = usage.input + usage.output + usage.cacheRead + usage.cacheWrite;
+    /// const cost = usage.cost.total >= 0.01 ? ` (~$${usage.cost.total.toFixed(2)})` : "";
+    /// const label = notice.kind === "compaction" ? "Compaction" : "Branch summary";
+    /// `${label}: ${formatTokens(tokens)} tokens billed${cost}`
+    /// ```
+    ///
+    /// The sum is `saturating_add`ed rather than `+`ed: `Usage`'s four counters are `u64` read off
+    /// a provider response, and a debug overflow panic here would be a crash in a cost notice.
+    pub fn push_compaction_cost_notice(
+        &mut self,
+        kind: crate::transcript::CompactionCostKind,
+        usage: &cyrup_core::Usage,
+    ) {
+        let tokens = usage
+            .input
+            .saturating_add(usage.output)
+            .saturating_add(usage.cache_read)
+            .saturating_add(usage.cache_write);
+        let cost = cost_suffix(usage.cost.total);
+        self.push_warning(format!(
+            "{}: {} tokens billed{cost}",
+            kind.label(),
+            crate::status::format_tokens(tokens)
+        ));
+    }
+}
+
+/// The ` (~$x.xx)` tail both notices append, and the `>= 0.01` gate that suppresses it — pi writes
+/// the same expression twice (`interactive-mode.ts:3806` and `:3831`), once per notice.
+fn cost_suffix(dollars: f64) -> String {
+    if dollars >= 0.01 {
+        format!(" (~${dollars:.2})")
+    } else {
+        String::new()
+    }
 }

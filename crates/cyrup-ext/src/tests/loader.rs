@@ -57,6 +57,7 @@ fn discovers_three_roots_with_origins_and_dedup() {
         agent_dir: Some(agent.clone()),
         // include the SAME global dir again as a configured root: dedup must drop the repeat.
         configured: vec![cfg_ext, global_ext.join("global-ext")],
+        disabled: Vec::new(),
     };
 
     let found = discover(&roots);
@@ -91,6 +92,7 @@ fn trust_split_pre_and_post() {
         project_cwd: Some(cwd),
         agent_dir: Some(agent),
         configured: vec![],
+        disabled: Vec::new(),
     };
     let found = discover(&roots);
     let proj = found.iter().find(|d| d.manifest.id == "proj-ext").unwrap();
@@ -120,6 +122,7 @@ fn bare_wasm_without_manifest_is_discovered() {
         project_cwd: None,
         agent_dir: Some(agent),
         configured: vec![],
+        disabled: Vec::new(),
     };
     let found = discover(&roots);
     let bare = found.iter().find(|d| d.manifest.id == "mytool").expect("bare wasm discovered");

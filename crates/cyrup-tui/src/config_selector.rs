@@ -1,23 +1,26 @@
 //! The `cyrup config` interactive resource-config selector (Pi `ConfigSelectorComponent` +
 //! `selectConfig`, `modes/interactive/components/config-selector.ts` + `cli/config-selector.ts`): a
 //! full-screen, grouped, per-resource **enable/disable** editor for the top-level auto-discovered
-//! skills/prompts/themes.
+//! extensions/skills/prompts/themes — Pi's four `RESOURCE_TYPES`
+//! (`modes/interactive/components/config-selector.ts:32`), Extensions first (`typeOrder`, `:171`).
 //!
 //! Pi's `pi config` (`handleConfigCommand`, package-manager-cli.ts:543-572) resolves the settings +
 //! trust, calls `packageManager.resolve()` for the full `ResolvedPaths` (every resource tagged with
 //! its current `enabled` flag + `PathMetadata`), then mounts this component. Space (or Enter) toggles
 //! the highlighted resource; toggling writes a `+pattern`/`-pattern` override entry into the SAME
-//! `skills`/`prompts`/`themes` settings arrays the rest of the override machinery reads
-//! (`toggleTopLevelResource`, config-selector.ts:457-503) — cyrup's `global_overrides`/
+//! `extensions`/`skills`/`prompts`/`themes` settings arrays the rest of the override machinery
+//! reads (`toggleTopLevelResource`, config-selector.ts:532-578) — cyrup's `global_overrides`/
 //! `project_overrides` discovery wiring is the 1:1 equivalent (gap-07 §3 piece 1). Esc closes.
 //!
 //! This component is UI-only: it flips the checkbox in place and emits the persisted decision as a
 //! [`SelectorOutcome::Apply`] payload the chrome (bin `run_config`) writes to settings — the exact
 //! split the pre-launch selectors (`SessionSelector`/`TrustSelector`) already use with
-//! [`crate::run_startup_selector`]'s `on_apply`. Package-tier resource toggling (Pi's
-//! `togglePackageResource`, config-selector.ts:505-562) is out of this crate's scope — it needs the
-//! installed-package → live-session wiring (gap-07 §1) and `PackageManager::set_enabled`, both in
-//! `cyrup-resources`/`cyrup-session-svc`.
+//! [`crate::run_startup_selector`]'s `on_apply`. The top-level **extension** tier is covered: the
+//! rows come from `ResourceRegistry::loose_extensions`, and the `-pattern` a toggle writes is
+//! honoured at load time through `cyrup_ext::DiscoveryRoots::disabled`. Only the PACKAGE tier (Pi's
+//! `togglePackageResource`, config-selector.ts:580-626) remains out of this crate's scope — it needs
+//! the installed-package → live-session wiring (gap-07 §1) and `PackageManager::set_enabled`, both
+//! in `cyrup-resources`/`cyrup-session-svc`.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -112,45 +115,56 @@ impl ConfigScope {
     }
 }
 
-/// A manageable resource kind — the `skills`/`prompts`/`themes` settings-array key its `+`/`-` pattern
-/// lands in (Pi `ResourceType`/`arrayKey`, config-selector.ts:25,462).
+/// A manageable resource kind — the `extensions`/`skills`/`prompts`/`themes` settings-array key its
+/// `+`/`-` pattern lands in (Pi `ResourceType`/`arrayKey`,
+/// `modes/interactive/components/config-selector.ts:26,537`).
+///
+/// Declaration order IS Pi's `RESOURCE_TYPES` order (`:32`), which [`ConfigKind::order`] then makes
+/// the render order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ConfigKind {
+    Extensions,
     Skills,
     Prompts,
     Themes,
 }
 
 impl ConfigKind {
-    /// The settings-array key the pattern is written into (Pi `arrayKey`, config-selector.ts:462).
+    /// The settings-array key the pattern is written into (Pi `arrayKey`, config-selector.ts:537).
     pub fn key(self) -> &'static str {
         match self {
+            ConfigKind::Extensions => "extensions",
             ConfigKind::Skills => "skills",
             ConfigKind::Prompts => "prompts",
             ConfigKind::Themes => "themes",
         }
     }
 
-    /// The subgroup header label (Pi `RESOURCE_TYPE_LABELS`, config-selector.ts:27-32).
+    /// The subgroup header label (Pi `RESOURCE_TYPE_LABELS`, config-selector.ts:34-39).
     fn label(self) -> &'static str {
         match self {
+            ConfigKind::Extensions => "Extensions",
             ConfigKind::Skills => "Skills",
             ConfigKind::Prompts => "Prompts",
             ConfigKind::Themes => "Themes",
         }
     }
 
-    /// The subgroup sort rank (Pi `typeOrder`, config-selector.ts:164).
+    /// The subgroup sort rank (Pi `typeOrder`, config-selector.ts:171:
+    /// `{ extensions: 0, skills: 1, prompts: 2, themes: 3 }`) — Extensions renders FIRST in every
+    /// scope group.
     fn order(self) -> u8 {
         match self {
-            ConfigKind::Skills => 0,
-            ConfigKind::Prompts => 1,
-            ConfigKind::Themes => 2,
+            ConfigKind::Extensions => 0,
+            ConfigKind::Skills => 1,
+            ConfigKind::Prompts => 2,
+            ConfigKind::Themes => 3,
         }
     }
 
     fn from_key(s: &str) -> Option<ConfigKind> {
         match s {
+            "extensions" => Some(ConfigKind::Extensions),
             "skills" => Some(ConfigKind::Skills),
             "prompts" => Some(ConfigKind::Prompts),
             "themes" => Some(ConfigKind::Themes),
@@ -164,10 +178,10 @@ impl ConfigKind {
 pub struct ConfigRow {
     /// Which settings scope this resource's toggle persists to.
     pub scope: ConfigScope,
-    /// The resource kind (skills/prompts/themes).
+    /// The resource kind (extensions/skills/prompts/themes).
     pub kind: ConfigKind,
-    /// The display name (skill directory name, prompt/theme file name) — Pi `displayName`,
-    /// config-selector.ts:124-133.
+    /// The display name (extension `parentFolder/fileName`, skill directory name, prompt/theme file
+    /// name) — Pi `displayName`, config-selector.ts:131-140.
     pub display_name: String,
     /// The settings-relative pattern (`skills/foo/SKILL.md`) written as `+pattern`/`-pattern` on
     /// toggle (Pi `getResourcePattern` = `relative(baseDir, item.path)`, config-selector.ts:568-572).
@@ -222,7 +236,7 @@ impl ConfigToggle {
 enum Flat {
     /// A scope group header (`User (…)` / `Project (…)`).
     Group(String),
-    /// A resource-kind subgroup header (`Skills` / `Prompts` / `Themes`).
+    /// A resource-kind subgroup header (`Extensions` / `Skills` / `Prompts` / `Themes`).
     Subgroup(String),
     /// A toggleable resource, carrying its index into [`ConfigSelector::rows`].
     Item(usize),

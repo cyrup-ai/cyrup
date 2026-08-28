@@ -3,7 +3,7 @@
 //! standalone `build_session_context`-style message assembly (Pi `buildSessionContext`,
 //! `session-manager.ts:325-433`).
 
-use cyrup_core::{Content, Message, ModelRef};
+use cyrup_core::{Content, EntryId, Message, ModelRef};
 
 use crate::agent_message::{
     custom_to_message, AgentMessage, BranchSummaryMessage, CompactionSummaryMessage,
@@ -290,20 +290,41 @@ pub fn context_message_role(e: &Entry) -> Option<MessageRole> {
 /// `estimateContextTokens(buildSessionContext(pathEntries).messages)` (`compaction.ts:678`) rather
 /// than estimating over the LLM-rendered text.
 pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<AgentMessage> {
+    build_context_agent_messages_tagged(path).into_iter().map(|(_, m)| m).collect()
+}
+
+/// [`build_context_agent_messages`], with each projected message paired with the [`EntryId`] of the
+/// entry it came from.
+///
+/// Pi does not need this: `renderSessionEntries` walks ENTRIES and flat-maps each one's messages
+/// (`interactive-mode.ts:3781-3796`), so it still holds the entry while it renders the entry's
+/// messages, and it re-attaches a cache-miss notice by `AssistantMessage` object identity
+/// (`:3753-3755`). Rust has neither: the projection is a flat `Vec<AgentMessage>` of value types.
+/// The entry id is the stand-in for that identity, and it is what lets a consumer re-derive
+/// per-entry facts the projection drops — an assistant turn's cache miss, and the `usage` a
+/// `compaction` / `branch_summary` entry carries but its projected message does not
+/// (`agent_message.rs`'s `CompactionSummaryMessage` / `BranchSummaryMessage`).
+///
+/// [`build_context_agent_messages`] is this function with the ids dropped, so the two projections
+/// cannot drift.
+pub fn build_context_agent_messages_tagged(path: &[&Entry]) -> Vec<(EntryId, AgentMessage)> {
     let mut messages = Vec::new();
     match latest_compaction(path).and_then(|i| path.get(i).copied().map(|e| (i, e))) {
-        Some((cpos, Entry::Known(KnownEntry::Compaction {
+        Some((cpos, centry @ Entry::Known(KnownEntry::Compaction {
             summary,
             first_kept_entry_id,
             tokens_before,
             base,
             ..
         }))) => {
-            messages.push(AgentMessage::CompactionSummary(CompactionSummaryMessage {
-                summary: summary.clone(),
-                tokens_before: *tokens_before,
-                timestamp: parse_entry_ts(&base.timestamp),
-            }));
+            messages.push((
+                centry.id(),
+                AgentMessage::CompactionSummary(CompactionSummaryMessage {
+                    summary: summary.clone(),
+                    tokens_before: *tokens_before,
+                    timestamp: parse_entry_ts(&base.timestamp),
+                }),
+            ));
             // See [`build_context_messages`]: an unresolvable `first_kept_entry_id` keeps NOTHING.
             if let Some(before) = path.get(..cpos)
                 && let Some(first_kept) = first_kept_entry_id
@@ -314,23 +335,34 @@ pub fn build_context_agent_messages(path: &[&Entry]) -> Vec<AgentMessage> {
                         keeping = true;
                     }
                     if keeping {
-                        push_as_raw(&mut messages, e);
+                        push_as_raw_tagged(&mut messages, e);
                     }
                 }
             }
             if let Some(after) = path.get(cpos + 1..) {
                 for e in after {
-                    push_as_raw(&mut messages, e);
+                    push_as_raw_tagged(&mut messages, e);
                 }
             }
         }
         _ => {
             for e in path {
-                push_as_raw(&mut messages, e);
+                push_as_raw_tagged(&mut messages, e);
             }
         }
     }
     messages
+}
+
+/// [`push_as_raw`], tagging every message it produces with the source entry's [`EntryId`].
+///
+/// Delegates rather than duplicating the match, so a new projected entry kind can never be tagged
+/// in one projection and missing from the other.
+fn push_as_raw_tagged(out: &mut Vec<(EntryId, AgentMessage)>, e: &Entry) {
+    let mut projected = Vec::new();
+    push_as_raw(&mut projected, e);
+    let id = e.id();
+    out.extend(projected.into_iter().map(|m| (id.clone(), m)));
 }
 
 /// Best-effort RFC3339 → unix-ms parse for an entry timestamp (Pi passes the entry timestamp through

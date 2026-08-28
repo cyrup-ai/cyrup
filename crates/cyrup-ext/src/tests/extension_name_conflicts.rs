@@ -280,7 +280,7 @@ async fn discover_and_load_reports_conflicts_in_its_errors_array() {
     host.load_native(ToolExt::loaded("beta", &[("shared", "beta-ran")])).await.unwrap();
 
     // An empty root set: nothing on disk to discover, so every error below is a CONFLICT error.
-    let roots = DiscoveryRoots { project_cwd: None, agent_dir: None, configured: vec![] };
+    let roots = DiscoveryRoots { project_cwd: None, agent_dir: None, configured: vec![], disabled: vec![] };
     let services: Arc<dyn HostServices> = Arc::new(DenyServices);
     let result = host.discover_and_load(&roots, true, services).await;
 

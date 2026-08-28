@@ -57,6 +57,7 @@ async fn discover_trust_load_command_reload() {
         project_cwd: Some(cwd.clone()),
         agent_dir: None,
         configured: vec![],
+        disabled: Vec::new(),
     };
 
     let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };

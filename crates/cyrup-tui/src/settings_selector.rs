@@ -237,6 +237,21 @@ impl SettingsSelector {
         self.input.value()
     }
 
+    /// `updateValue(id, newValue)` (`settings-list.ts:74-80`): write a row's displayed value in
+    /// place, found by `id`, a no-op when there is no such row. Used by the submenu return path —
+    /// upstream's `done()` does `item.currentValue = selectedValue` before `closeSubmenu()`
+    /// (`:222-225`), so the row the user pops back to already shows what they just chose.
+    ///
+    /// Deliberately does NOT re-run [`Self::apply_filter`]: upstream never refilters here, and
+    /// doing so would reset `selected` to 0 and throw away the cursor row `closeSubmenu` exists to
+    /// restore. The row's position in `filtered` is unaffected by its value (the filter matches on
+    /// `label`), so the untouched indices stay valid.
+    pub fn update_value(&mut self, id: &str, value: &str) {
+        if let Some(row) = self.rows.iter_mut().find(|r| r.id == id) {
+            row.value = value.to_string();
+        }
+    }
+
     /// `maxLabelWidth = Math.min(30, Math.max(...this.items.map((i) => visibleWidth(i.label))))`
     /// — `settings-list.ts:121`. **S33.** Two things this spelling pins down:
     ///
@@ -511,6 +526,10 @@ impl Selector for SettingsSelector {
         self.input.paste(text);
         self.apply_filter();
         SelectorOutcome::Redraw
+    }
+
+    fn as_settings_mut(&mut self) -> Option<&mut SettingsSelector> {
+        Some(self)
     }
 }
 

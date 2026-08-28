@@ -127,6 +127,48 @@ pub struct NavigateTreeOutcome {
     pub summary_entry: Option<cyrup_session::compaction::BranchSummaryEntry>,
 }
 
+/// Which summarization a [`ReplayItem::CompactionCost`] is reporting — pi's
+/// `CompactionCostNotice.kind`, which carries the source `entry.type`
+/// (`modes/interactive/interactive-mode.ts:3790-3792` @v0.83.0).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionCostKind {
+    /// A context compaction (`entry.type === "compaction"`).
+    Compaction,
+    /// A branch summarization (`entry.type === "branch_summary"`).
+    BranchSummary,
+}
+
+/// One item of a replayable conversation — the raw-context message stream plus the two derived
+/// notices a front-end cannot reconstruct from the messages alone.
+///
+/// This is pi's `RenderSessionItem` (`interactive-mode.ts:217`), minus its `custom` entry variant
+/// (cyrup's raw projection already carries custom messages as
+/// [`cyrup_session::agent_message::AgentMessage::Custom`]) and with the cache-miss notice
+/// materialised as an item instead of being looked up by `AssistantMessage` object identity during
+/// the walk (`:3694-3696`, `:3753-3755`).
+///
+/// The derivation has to live here, not in the front-end, because it bridges two index spaces the
+/// front-end never sees at once: [`cyrup_provider::cache_stats::collect_cache_misses`] keys misses
+/// by index into the FLAT entry list, while the replay stream is the CURRENT BRANCH's
+/// post-compaction-admission projection. [`cyrup_session::context::build_context_agent_messages_tagged`]
+/// carries the [`cyrup_core::EntryId`] that joins them.
+#[derive(Clone, Debug)]
+pub enum ReplayItem {
+    /// A raw-context message, in stream order. Boxed: an `AgentMessage` is an order of magnitude
+    /// wider than either notice, and an unboxed variant would pad every notice in the stream out to
+    /// its size (`clippy::large_enum_variant`).
+    Message(Box<cyrup_session::agent_message::AgentMessage>),
+    /// A counted prompt-cache miss on the assistant message immediately preceding it — pi's
+    /// `cacheMisses.get(message)` re-injection (`interactive-mode.ts:3753-3755`).
+    CacheMiss(cyrup_provider::cache_stats::CacheMiss),
+    /// What the compaction / branch summary immediately preceding it cost — pi's synthesised
+    /// `{type: "compaction_cost", kind, usage}` (`interactive-mode.ts:3790-3792`).
+    CompactionCost {
+        kind: CompactionCostKind,
+        usage: cyrup_core::Usage,
+    },
+}
+
 /// A scoped model in the `cycle_model` set (Pi `{model, thinkingLevel?}`, agent-session.ts:870). An
 /// explicit `thinking_level` overrides the session level when cycled to; `None` inherits it.
 #[derive(Clone, Debug)]

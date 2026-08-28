@@ -57,9 +57,43 @@ pub enum ArgumentCompleter {
     LoginProviders,
     /// The current model's reasoning ladder (`interactive-mode.ts:713-725` @v0.84.3).
     ///
-    /// Wired to the `/thinking` builtin (`commands.rs:131`). Thinking is *also* a Shift+Tab cycle
+    /// Wired to the `/thinking` builtin (`commands.rs:130`). Thinking is *also* a Shift+Tab cycle
     /// here (`app/submit.rs:49-52`); the two are independent entry points onto the same ladder.
     ThinkingLevels,
+    /// A registered EXTENSION command's own completer — pi's
+    /// `getArgumentCompletions: cmd.getArgumentCompletions` (`interactive-mode.ts:753` @v0.84.3),
+    /// the one dynamic source upstream wires. Prompt templates (`:739-743`) and skills (`:758-766`)
+    /// get none, so their rows stay [`ArgumentCompleter::None`].
+    ///
+    /// Set from the catalog's `argumentCompletions` key
+    /// (`cyrup-session-svc/src/session/commands.rs`, emitted from
+    /// `ExtensionRegistry::command_autocomplete()`); the items themselves come from
+    /// `ExtensionHost::command_completions(invocation_name, prefix)`. The variant carries no data
+    /// because the command NAME is recoverable from the line being completed, which keeps
+    /// [`SlashCommand`] `Copy`-tagged and `const`-buildable.
+    ///
+    /// **The async bridge, and why it is shaped this way.** pi simply `await`s the guest callback
+    /// inside its autocomplete provider (`autocomplete.ts:355`). cyrup cannot: invoking a wasm
+    /// guest is async and epoch-deadlined, while [`crate::Autocomplete::compute`] is synchronous
+    /// and runs on the render thread for every keystroke — see the data-tag rationale on this enum
+    /// and on [`crate::ArgumentSources`]. So the fetch is lifted OUT of `compute` into the one
+    /// place that is already `async` and already holds the session, the run loop's input arm
+    /// (`app/run_action.rs`): after a batch of keys is serviced and BEFORE the frame is drawn,
+    /// [`crate::App::refresh_extension_completions`] notices that the line under the cursor is
+    /// `/<ext-command> <arg>`, awaits `command_completions(name, arg)` for that exact prefix, pushes
+    /// the result into the editor and re-runs the sync recompute. The popup therefore appears in
+    /// the SAME frame as the keystroke, and the guest still sees the real argument prefix pi passes
+    /// it. Repeat fetches are suppressed while `(name, arg)` is unchanged.
+    ///
+    /// REJECTED: making `compute` async. Every editor key path — including the pure-text ones that
+    /// never touch a slash command — would then have to await a guest call on the render thread,
+    /// which is exactly what the data-tag design on this enum exists to avoid.
+    ///
+    /// REJECTED: pre-fetching each opted-in command's completions once at registration with an
+    /// empty prefix. It is strictly weaker than the above (the guest never sees the argument the
+    /// user typed, so a completer that narrows server-side cannot) and adds a second, staler
+    /// source of truth for the same data.
+    Extension,
 }
 
 /// One slash command's metadata (spec/tui/04 §2.2). `name` carries no leading `/`.
@@ -82,10 +116,11 @@ pub struct SlashCommand {
     /// `getArgumentCompletions` to a builtin in `createBaseAutocompleteProvider`.
     ///
     /// pi wires **three** builtins: `/model` (`interactive-mode.ts:687` @v0.84.3), `/thinking`
-    /// (`:713`) and `/login` (`:728`). cyrup has no `/thinking` command, so only the first and
-    /// third are non-[`ArgumentCompleter::None`] in [`BUILTIN_SLASH_COMMANDS`]. Every dynamic
-    /// (prompt/extension/skill) row is `None` — see the note on `arg_completion` in
-    /// [`dynamic_commands_from_catalog_gated`].
+    /// (`:713`) and `/login` (`:728`), and cyrup has all three in [`BUILTIN_SLASH_COMMANDS`].
+    /// Beyond the builtins, upstream wires exactly one dynamic source — an extension command's own
+    /// `getArgumentCompletions` (`:753`) — which is [`ArgumentCompleter::Extension`] here. Prompt
+    /// and skill rows stay `None`, because pi gives them no completer either (`:739-743`,
+    /// `:758-766`). See the note on `arg_completion` in [`dynamic_commands_from_catalog_gated`].
     pub arg_completion: ArgumentCompleter,
 }
 
@@ -532,24 +567,32 @@ pub fn dynamic_commands_from_catalog_gated(
                     .filter(|h| !h.is_empty())
                     .map(|h| Cow::Owned(h.to_string())),
                 source: kind,
-                // EXT-013 / TUI-012: still hardcoded, and it CANNOT be resolved in this crate —
-                // for TWO reasons, only the first of which this note used to record.
+                // EXT-013 / TUI-012 — pi carries the CALLBACK onto the autocomplete row
+                // (`getArgumentCompletions: cmd.getArgumentCompletions`, `interactive-mode.ts:753`
+                // @v0.84.3) and only for EXTENSION rows; prompt templates (`:739-743`) and skills
+                // (`:758-766`) are built without one. A callback cannot cross a JSON catalog (nor,
+                // one tier down, a WIT world), so what crosses is the presence bit —
+                // `slash_command_catalog()`'s `argumentCompletions` key
+                // (`cyrup-session-svc/src/session/commands.rs`), sourced from the opt-in table
+                // `ExtensionRegistry::command_autocomplete()` (`cyrup-ext/src/registry.rs:1025`)
+                // that both tiers write (`cyrup-ext/src/facade.rs:492` native,
+                // `cyrup-ext/src/host/live.rs:249` guest) — and the items are fetched on demand
+                // through `ExtensionHost::command_completions`. The key is absent on a row that did
+                // not opt in, which reads as `false`; the `source` test keeps a prompt or skill row
+                // `None` even if some future producer starts writing the key for one.
                 //
-                // (a) No catalog key. `slash_command_catalog()`
-                // (`cyrup-session-svc/src/session/commands.rs:174` — the `session.rs:2503-2532` this
-                // used to cite predates that file being split into a module directory) emits no key
-                // saying whether a registered command declared `getArgumentCompletions`; pi carries
-                // the callback itself onto the autocomplete row (`interactive-mode.ts:753`
-                // @v0.84.3).
-                //
-                // (b) No call path even with the key. `cyrup_ext::ExtensionRegistry::command_autocomplete()`
-                // (`crates/cyrup-ext/src/registry.rs:1013`) only records WHICH commands opted in —
-                // there is no completer to invoke, and invoking a wasm guest is async, which
-                // [`crate::Autocomplete::compute`] is not (and must not become; the popup is
-                // recomputed per keystroke on the render thread). A bare boolean would therefore
-                // buy a completer that always yields zero items while suppressing the path
-                // fall-through — strictly worse than `None`.
-                arg_completion: ArgumentCompleter::None,
+                // Where the async fetch happens, and why it is not here, is on
+                // [`ArgumentCompleter::Extension`].
+                arg_completion: if kind == CommandSource::Extension
+                    && row
+                        .get("argumentCompletions")
+                        .and_then(serde_json::Value::as_bool)
+                        .unwrap_or(false)
+                {
+                    ArgumentCompleter::Extension
+                } else {
+                    ArgumentCompleter::None
+                },
             })
         })
         .collect()

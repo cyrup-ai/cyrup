@@ -73,6 +73,35 @@ impl<B: Backend> App<B> {
                 if self.state.selector.is_some() {
                     return self.handle_selector_key(key);
                 }
+                // A mounted `BorderedLoader` captures input next — ahead of the global keymap and
+                // the editor. pi CLEARS `editorContainer`, mounts the loader in its place and calls
+                // `context.ui.setFocus(loader)` (`session-share.ts:152-156`), so the editor is not
+                // on screen and the focused component is a `CancellableLoader`, whose entire
+                // `handleInput` is `if (kb.matches(data, "tui.select.cancel")) { abort(); }`
+                // (`cancellable-loader.ts:31-37`) — the SELECT-tier action whose label the loader's
+                // own hint row advertises (`bordered-loader.ts:34-36`).
+                //
+                // BELOW the selector branch rather than above it, because that is the precedence
+                // the rest of the crate already implements: `render` draws the selector and only
+                // `else if` the loader (`app/render.rs:101,118`), and `region_constraints` gives the
+                // slot to the selector first (`app/layout.rs`) — so the selector is what is on
+                // screen whenever both are somehow set, and it must be what receives the key.
+                //
+                // Everything else is swallowed rather than falling through, the same policy the
+                // overlay branch above applies to a modal: with the editor unmounted a leaked key
+                // would type into an invisible buffer, and an unmapped Escape would resolve through
+                // the global keymap to `Action::Interrupt` — aborting the agent and any live bash
+                // child instead of cancelling the share.
+                //
+                // `/share` is the only thing that mounts a loader today (`AppState::loader`'s other
+                // advertised user, an extension long op, has no writer), which is what makes
+                // [`AppAction::CancelShare`] the single correct answer here.
+                if self.state.loader.is_some() {
+                    return match self.state.select_keymap.action_for(key) {
+                        Some(SelectAction::Cancel) => AppAction::CancelShare,
+                        _ => AppAction::None,
+                    };
+                }
                 // Routing chain: overlay > completion > editor > app (spec/tui/07 §2). A global key is
                 // resolved here, but two context guards defer it to the editor so the chain holds
                 // (audit #4 — the previous unconditional global resolution made Ctrl+D quit and Esc

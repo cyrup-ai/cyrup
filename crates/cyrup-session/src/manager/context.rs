@@ -5,10 +5,12 @@
 //! borrowed path into messages; this one supplies the path and the model/thinking state carried
 //! alongside it.
 
-use cyrup_core::{Message, ModelRef};
+use cyrup_core::{EntryId, Message, ModelRef};
 
 use crate::agent_message::AgentMessage;
-use crate::context::{build_context_agent_messages, build_context_messages, SessionContext};
+use crate::context::{
+    build_context_agent_messages_tagged, build_context_messages, SessionContext,
+};
 use crate::entry::{Entry, KnownEntry};
 
 use super::SessionManager;
@@ -65,10 +67,18 @@ impl SessionManager {
     /// drops it only in `convertToLlm`), which is why the user still sees their own `!!` command
     /// after a resume.
     pub fn build_context_raw(&self) -> Vec<AgentMessage> {
+        self.build_context_raw_tagged().into_iter().map(|(_, m)| m).collect()
+    }
+
+    /// [`build_context_raw`](Self::build_context_raw), with each message paired with the
+    /// [`EntryId`] of the entry it was projected from — see
+    /// [`build_context_agent_messages_tagged`] for why the pairing exists and what it is a stand-in
+    /// for. `build_context_raw` is this with the ids dropped, so the two cannot drift.
+    pub fn build_context_raw_tagged(&self) -> Vec<(EntryId, AgentMessage)> {
         let path = self.branch_path(None);
         if path.is_empty() {
             return Vec::new();
         }
-        build_context_agent_messages(&path)
+        build_context_agent_messages_tagged(&path)
     }
 }

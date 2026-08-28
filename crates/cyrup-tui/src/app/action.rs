@@ -46,6 +46,16 @@ pub enum AppAction {
     /// down streaming state or kill a bash child: the only effect is cancelling the summarization,
     /// which resolves the spawned navigation with `aborted: true` and re-shows the tree.
     AbortBranchSummary,
+    /// `tui.select.cancel` pressed while `/share`'s [`crate::chrome::BorderedLoader`] is mounted —
+    /// pi's `CancellableLoader.handleInput` → `abortController.abort(); onAbort?.()`
+    /// (`cancellable-loader.ts:31-37`), whose `onAbort` kills the `gh` child, unmounts the loader
+    /// and shows `Share cancelled` (`session-share.ts:157-161`).
+    ///
+    /// Distinct from [`Self::Interrupt`] because the loader is MODAL over the editor and has
+    /// nothing to do with the agent: resolving the same Escape through the global keymap — which is
+    /// what happened before, there being no loader branch in the routing chain — aborted the
+    /// session's run and any live bash child while the share carried on regardless.
+    CancelShare,
     /// The user requested to quit the session.
     Quit,
     /// The user requested to suspend the process to the background (Ctrl+Z / SIGTSTP). The run loop
@@ -177,6 +187,16 @@ pub enum AppCommand {
     Share,
     /// `/copy` — copy the last assistant message to the clipboard (`handleCopyCommand`).
     Copy,
+    /// `app.message.copy` pressed while `/tree` owns the input slot: copy the HIGHLIGHTED entry's
+    /// full text to the clipboard (pi `TreeList.copySelected`, `tree-selector.ts:627-630`, wired to
+    /// the consumer at `interactive-mode.ts:5297-5308`). Carries the entry id; the run loop resolves
+    /// the text against the live session via [`AgentSession::entry_copy_text`], which is pi's
+    /// `getEntryCopyText` (`:896-922`).
+    ///
+    /// The id — not the text — rides the command because the DAG the selector holds carries only
+    /// clipped one-line row labels; materialising every entry's full body into the node list to
+    /// serve one keystroke would put the whole transcript in the selector.
+    CopyEntry(String),
     /// `/name <name>` — set the session display name (`handleNameCommand`).
     SetName(String),
     /// `/name` with NO argument — the GETTER half of `handleNameCommand`

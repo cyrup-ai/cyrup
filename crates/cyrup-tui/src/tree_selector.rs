@@ -18,8 +18,16 @@ use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
 use crate::keymap::{SelectAction, SelectKeymap, TreeAction, TreeKeymap};
-use crate::selector::{border_rule, Selector, SelectorOutcome};
+use crate::selector::{border_rule, centered_window, Selector, SelectorOutcome};
 use crate::theme::UiTheme;
+
+/// pi's floor on the `/tree` body window — the `5` in
+/// `Math.max(5, Math.floor(terminalHeight / 2))` (`tree-selector.ts:1362`).
+const MIN_MAX_VISIBLE: usize = 5;
+
+/// The window for pi's `terminalHeight ?? 24` fallback, i.e. `max(5, 24 / 2)`. Used until the first
+/// [`Selector::set_terminal_height`] of the frame loop replaces it with the real terminal's.
+const DEFAULT_MAX_VISIBLE: usize = 12;
 
 /// The entry-type glyph key (`tree-selector.ts` switch ~`:638`, render `:691-727`; spec/tui/05 §5.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,7 +86,7 @@ impl TreeKind {
 /// ## Why this is classified from the label text
 ///
 /// cyrup splits `getEntryDisplayText` across two crates: the **text** half is
-/// `cyrup_session_svc`'s `dag_display` (`session.rs:4935-4995`, whose own doc comment cites
+/// `cyrup_session_svc`'s `dag_display` (`session/transcript.rs:184-246`, whose own doc comment cites
 /// `tree-selector.ts:762-830`), which composes exactly these prefixes — `"user: "`, `"assistant: "`,
 /// `"[bash]: "`, `"branch summary: "`, `"model → "`, `"thinking → "`, `"title: "`, `"custom "`,
 /// `"label "` — and the **style** half is here. `SessionDagNode` carries `kind`
@@ -347,6 +355,15 @@ pub struct TreeSelector {
     nodes: Vec<TreeNode>,
     /// Index into the **visible** rows (filter + fold applied).
     selected: usize,
+    /// The body window: how many rows [`TreeSelector::rows`] emits and how far one page jump moves
+    /// — pi's `maxVisibleLines` (`tree-selector.ts:136`), computed by the wrapper as
+    /// `Math.max(5, Math.floor(terminalHeight / 2))` (`:1362`) and used for BOTH the render window
+    /// (`:673-681`) and the paging delta (`:1018-1023`). One number drives both upstream, which is
+    /// what makes a page jump visible instead of merely internal.
+    ///
+    /// Re-derived every frame from [`Selector::set_terminal_height`]; the initial value is pi's for
+    /// its `terminalHeight ?? 24` fallback, i.e. `max(5, 24 / 2)`.
+    max_visible: usize,
     filter: FilterMode,
     /// Whether the label-timestamp column is shown (`app.tree.toggleLabelTimestamp`). **Off** by
     /// default, as Pi's `private showLabelTimestamps = false` (`tree-selector.ts:116`) — the `t`
@@ -371,6 +388,7 @@ impl TreeSelector {
         TreeSelector {
             nodes,
             selected: 0,
+            max_visible: DEFAULT_MAX_VISIBLE,
             filter: FilterMode::Default,
             show_time: false,
             keymap: TreeKeymap::default(),
@@ -487,6 +505,37 @@ impl TreeSelector {
         }
         let next = self.selected as isize + delta;
         self.selected = next.clamp(0, len as isize - 1) as usize;
+    }
+
+    /// Move the highlight by one screenful — pi's paging arm (`tree-selector.ts:1018-1023`):
+    ///
+    /// ```text
+    /// :1020  this.selectedIndex = Math.max(0, this.selectedIndex - this.maxVisibleLines);
+    /// :1023  this.selectedIndex = Math.min(this.filteredNodes.length - 1, this.selectedIndex + this.maxVisibleLines);
+    /// ```
+    ///
+    /// [`Self::move_by`]'s `clamp(0, len - 1)` is exactly that pair of clamps, so the delta is
+    /// handed over unclamped. Both entry points — the `tui.select.pageUp`/`pageDown` half of pi's
+    /// `||` and the bare-arrow `tui.editor.cursorLeft`/`cursorRight` half — route through here so
+    /// they cannot drift apart.
+    fn page_by(&mut self, up: bool) {
+        // `max_visible` is derived from a `u16` row count, so the conversion never saturates in
+        // practice; `unwrap_or` keeps it total without an `unwrap`.
+        let step = isize::try_from(self.max_visible).unwrap_or(isize::MAX);
+        self.move_by(if up { -step } else { step });
+    }
+
+    /// The tagged [`SelectorOutcome::Apply`] payload for a `/tree` copy —
+    /// `"\u{1f}copy\u{1f}{entry_id}"`, following the same leading-separator tagging
+    /// [`crate::SessionSelectorOutcome::parse_apply`] uses, so it can never be mistaken for the
+    /// untagged `"{entry_id}\u{1f}{label}"` payload a label save rides.
+    ///
+    /// With no selected row the id is empty and the chrome resolves no text — pi's
+    /// `this.onCopy?.(node ? … : undefined)` (`tree-selector.ts:627-630`), which lands on the
+    /// consumer's "no text to copy" branch.
+    fn copy_payload(&self) -> String {
+        let sep = crate::FIELD_SEP;
+        format!("{sep}copy{sep}{}", self.selected_id().unwrap_or_default())
     }
 
     /// Fold the selected node if foldable+open, else move up (`app.tree.foldOrUp`).
@@ -738,8 +787,13 @@ impl TreeSelector {
     /// The visible rows as styled lines for `width` (used by [`Selector::render`] and tests).
     pub fn rows(&self, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
         let visible = self.visible_indices();
-        let mut lines = Vec::with_capacity(visible.len());
-        for (row, &idx) in visible.iter().enumerate() {
+        // The body is WINDOWED at `max_visible`, as upstream's is: `startIndex`/`endIndex`
+        // (`tree-selector.ts:673-681`) is the formula [`centered_window`] already holds, and
+        // `isSelected` is tested against the ABSOLUTE index `i` (`:677`) — which is why `row` stays
+        // absolute here (`.take(end).skip(start)`, not a re-based enumerate over a slice).
+        let (start, end) = centered_window(self.selected, visible.len(), self.max_visible);
+        let mut lines = Vec::with_capacity(end.saturating_sub(start));
+        for (row, &idx) in visible.iter().enumerate().take(end).skip(start) {
             let Some(node) = self.nodes.get(idx) else { continue };
             let is_sel = row == self.selected;
             let mut spans: Vec<Span<'static>> = Vec::new();
@@ -892,6 +946,11 @@ impl TreeSelector {
         if let Some(k) = pair(TreeAction::FoldOrUp, TreeAction::UnfoldOrDown) {
             items.push(format!("{k} branch"));
         }
+        // `TREE_HELP_ITEMS` puts `{ keys: ["app.message.copy"], label: "copy" }` BETWEEN the
+        // `branch` cell and the `label` cell (`tree-selector.ts:1217-1235`).
+        if let Some(k) = self.keymap.first_key_label(TreeAction::Copy) {
+            items.push(format!("{k} copy"));
+        }
         if let Some(k) = self.keymap.first_key_label(TreeAction::EditLabel) {
             items.push(format!("{k} label"));
         }
@@ -921,13 +980,23 @@ impl TreeSelector {
 }
 
 impl Selector for TreeSelector {
+    fn set_terminal_height(&mut self, rows: u16) {
+        // `const maxVisibleLines = Math.max(5, Math.floor(terminalHeight / 2));`
+        // (`tree-selector.ts:1362`). Widening `u16` -> `usize` before the halve keeps it exact, and
+        // an integer divide by 2 on a `u16` cannot panic.
+        self.max_visible = (usize::from(rows) / 2).max(MIN_MAX_VISIBLE);
+    }
+
     fn desired_height(&self, _width: u16) -> u16 {
         // top rule + header + search line + body + hint line + bottom rule (+ one slack row).
         let body = if self.label_edit.is_some() {
             // The label editor occupies the body (prompt + input + hint): at least 3 rows.
             3
         } else {
-            self.visible_indices().len().min(u16::MAX as usize) as u16
+            // WINDOWED at `max_visible`, matching what [`Self::rows`] actually emits
+            // (`tree-selector.ts:673-681`); an unbounded `visible_indices().len()` asked for one
+            // row per session entry and could never be granted.
+            self.visible_indices().len().min(self.max_visible).min(u16::MAX as usize) as u16
         };
         body.saturating_add(6)
     }
@@ -996,16 +1065,52 @@ impl Selector for TreeSelector {
                 TreeAction::FilterAll => self.toggle_filter_mode(FilterMode::All),
                 TreeAction::FilterCycleForward => self.cycle_filter(true),
                 TreeAction::FilterCycleBackward => self.cycle_filter(false),
+                // `app.message.copy` (`tree-selector.ts:1029-1030` -> `copySelected`, `:627-630`).
+                // The only tree binding that produces an OUTCOME rather than local state — and an
+                // `Apply`, not a `Confirm`, because pi does not close the tree on copy.
+                TreeAction::Copy => return SelectorOutcome::Apply(self.copy_payload()),
             }
             return SelectorOutcome::Redraw;
         }
+        // pi's paging arm binds TWO ids per direction (`tree-selector.ts:1018-1023`):
+        // `tui.editor.cursorLeft || tui.select.pageUp`, and the `cursorRight || pageDown` twin. The
+        // `tui.select.*` half arrives through the shared [`SelectKeymap`] below; the EDITOR-tier
+        // half is a bare arrow, resolved locally here precisely because `SelectKeymap` is shared by
+        // every selector while upstream binds those two ids only in the tree. The alt/ctrl arrows
+        // are `app.tree.foldOrUp`/`unfoldOrDown` and already returned above, so only BARE arrows
+        // reach this point.
+        //
+        // "Bare" is exact, as [`crate::keymap::Key::matches`] is: a chord carrying ANY modifier —
+        // including shift — parses upstream as `shift+left`, which the `left` binding does not
+        // match, so it is left to fall through rather than paging.
+        if matches!(key.code, KeyCode::Left | KeyCode::Right)
+            && !key.modifiers.intersects(
+                KeyModifiers::CONTROL
+                    | KeyModifiers::ALT
+                    | KeyModifiers::SUPER
+                    | KeyModifiers::SHIFT,
+            )
+        {
+            self.page_by(key.code == KeyCode::Left);
+            return SelectorOutcome::Redraw;
+        }
         match keymap.action_for(key) {
-            Some(SelectAction::Up) | Some(SelectAction::PageUp) => {
+            Some(SelectAction::Up) => {
                 self.move_by(-1);
                 SelectorOutcome::Redraw
             }
-            Some(SelectAction::Down) | Some(SelectAction::PageDown) => {
+            Some(SelectAction::Down) => {
                 self.move_by(1);
+                SelectorOutcome::Redraw
+            }
+            // PageUp/PageDown are the other half of pi's `||` at `:1018`/`:1021`: a screenful, not
+            // a row. Folding them into the `Up`/`Down` arms made both keys move exactly one row.
+            Some(SelectAction::PageUp) => {
+                self.page_by(true);
+                SelectorOutcome::Redraw
+            }
+            Some(SelectAction::PageDown) => {
+                self.page_by(false);
                 SelectorOutcome::Redraw
             }
             Some(SelectAction::Confirm) => match self.selected_id() {

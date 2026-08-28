@@ -8,6 +8,12 @@ impl<B: Backend> App<B> {
     pub fn new(backend: B, theme: UiTheme) -> Result<Self, TuiError> {
         let size = backend.size().map_err(|e| TuiError::Backend(e.to_string()))?;
         let mut state = AppState::new(theme);
+        // Seeded here as well as in `draw`, because a `--resume`/`--continue` boot replays its whole
+        // conversation BEFORE the first frame, and the markdown-transform pass that replay ends with
+        // reads this for `availableWidth` (see [`AppState::term_cols`]). Without the seed a resumed
+        // session would transform its history at the 80-column default and a live one at the real
+        // width.
+        state.term_cols = size.width.max(1);
         let height = live_region_height(&mut state, size.width, size.height.max(1));
         let terminal = Terminal::with_options(
             backend,
@@ -28,6 +34,7 @@ impl<B: Backend> App<B> {
             viewport_height: 0,
             live_floor: 0,
             tree_nav_tx: None,
+            share_tx: None,
             package_update_rx: None,
             login_tx: None,
             login_providers: None,

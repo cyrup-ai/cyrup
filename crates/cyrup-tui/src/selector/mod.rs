@@ -626,6 +626,18 @@ pub trait Selector: Send {
     fn as_login_dialog(&mut self) -> Option<&mut crate::login_dialog::LoginDialog> {
         None
     }
+    /// Downcast to the `/settings` list, if that is what this selector is — `None` (the default)
+    /// for every other selector, in the same targeted-accessor spirit as
+    /// [`Self::as_login_dialog`] above.
+    ///
+    /// The one caller is the submenu return path: pi's `SettingsList` owns its submenu and can
+    /// therefore write the chosen value straight into the parent row's `currentValue` before
+    /// closing it (`settings-list.ts:216-225`). cyrup's submenus are separate frames stacked in
+    /// the input slot, so the chrome ([`crate::app::App::set_settings_row_value`]) needs the
+    /// concrete list back out of the `Box<dyn Selector>` to do the same write.
+    fn as_settings_mut(&mut self) -> Option<&mut crate::settings_selector::SettingsSelector> {
+        None
+    }
     /// Adopt the live `tui.editor.*` table so an embedded [`crate::text_input::Input`] resolves word
     /// motion / kill ring / undo through the user's own bindings, exactly as pi's `Input` calls
     /// `getKeybindings()` on every key (`input.ts:86`). A no-op for pure-list selectors.

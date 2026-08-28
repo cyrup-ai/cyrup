@@ -118,9 +118,10 @@ impl App<InlineBackend<Stdout>> {
         );
         self.seed_session_ui(&session, runtime.as_ref()).await;
         self.draw_synchronized()?;
-        // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** a status
-        // indicator is active, so the Braille frame advances without a timer thread and an idle
-        // session never busy-loops (the branch is `if`-gated on `indicator.is_active()`).
+        // The spinner tick (spec/tui/01 §6.2 / §10): an 80 ms redraw used **only while** something
+        // animates — a status indicator, a live bash block, or a mounted `BorderedLoader` — so the
+        // Braille frame advances without a timer thread and an idle session never busy-loops (the
+        // branch is `if`-gated on exactly those three; see the guard for why the loader is one).
         let mut spinner = tokio::time::interval(SPINNER_INTERVAL);
         spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         // The extension-UI dialog countdown tick (Pi's `CountdownTimer`, `countdown-timer.ts:21-30`):
@@ -166,6 +167,11 @@ impl App<InlineBackend<Stdout>> {
         // what makes the spawned path (and therefore Escape→abort and the live
         // `IndicatorKind::BranchSummary` spinner) reachable at all.
         let mut tree_nav_rx = self.install_tree_nav_channel();
+        // The `/share` gist-upload channel. Installed for the same reason `tree_nav_rx` is: awaited
+        // on THIS task, `gh gist create` reaches no other arm for the whole upload — so the
+        // `BorderedLoader` `/share` mounts is never drawn, its 80 ms spinner never advances, and the
+        // `escape/ctrl+c cancel` its hint row advertises is not read until `gh` has already exited.
+        let mut share_rx = self.install_share_channel();
         // The `/login` channel (`login_dialog::LoginUiMsg`): the spawned flow's prompts, progress
         // events and final outcome. Installed for the same reason `tree_nav_rx` is — the flow must
         // not run on this task, or no keystroke could ever answer its prompts.
@@ -327,9 +333,16 @@ impl App<InlineBackend<Stdout>> {
                         self.on_session_swapped(&mut ctx, &mut events).await?;
                     }
                 }
+                // The guard is the tick's ARMING condition, so every animation driven from
+                // `on_spinner_tick` has to appear in it. `state.loader` is the third: a mounted
+                // `BorderedLoader` (`/share`) arms no indicator and runs no bash block, so without
+                // this clause the handler is never reached with only a loader up and
+                // `state.loader_tick` — the phase index `render.rs` feeds the loader — stays on
+                // frame 0 for the whole upload.
                 _ = ctx.spinner.tick(),
                     if self.state.indicator.is_active()
-                        || self.state.transcript.bash_running() =>
+                        || self.state.transcript.bash_running()
+                        || self.state.loader.is_some() =>
                 {
                     self.on_spinner_tick()?
                 }
@@ -371,6 +384,7 @@ impl App<InlineBackend<Stdout>> {
                 Some(theme) = theme_switch_rx.recv() => self.on_theme_switch(&mut ctx, theme).await?,
                 Some(msg) = login_rx.recv() => self.on_login_msg(msg)?,
                 Some(msg) = tree_nav_rx.recv() => self.on_tree_nav_msg(&mut ctx, msg).await?,
+                Some(msg) = share_rx.recv() => self.on_share_msg(msg)?,
                 // A refutable pattern: a `None` from a closed stream does NOT match `Some(ev)`, so
                 // `select!` DISABLES this branch and keeps waiting on the others instead of
                 // completing forever. `Fanout::invalidate` (`subscriber.rs:89-93`) drops every

@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Wire The Ported Cache-Miss Detector Into Transcript Notices And Add The Compaction Cost Line

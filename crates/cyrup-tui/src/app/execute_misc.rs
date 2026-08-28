@@ -227,9 +227,8 @@ impl<B: Backend> App<B> {
         });
 
         // `session.getAvailableThinkingLevels()` (`core/agent-session.ts:1816-1819`): the current
-        // model's ladder, or the full `THINKING_LEVEL_OPTIONS` when no model is selected. Fed but
-        // currently unreachable — cyrup has no `/thinking` command to hang the completer off (see
-        // [`crate::ArgumentCompleter::ThinkingLevels`]).
+        // model's ladder, or the full `THINKING_LEVEL_OPTIONS` when no model is selected. Ranked by
+        // the `/thinking` builtin's completer (`commands.rs:130`).
         let current = session.model();
         let catalog = session.available_model_catalog();
         let levels = current
@@ -246,11 +245,58 @@ impl<B: Backend> App<B> {
             .map(|l| cyrup_provider::api::compat::thinking_level_key(l).to_string())
             .collect();
 
+        // `extension_completions` is NOT part of this snapshot — it is fetched per keystroke by
+        // [`Self::refresh_extension_completions`] and carried across by `set_argument_sources`.
         self.state.editor.set_argument_sources(crate::autocomplete::ArgumentSources {
             models,
             login_providers,
             thinking_levels,
+            ..crate::autocomplete::ArgumentSources::default()
         });
+    }
+
+    /// The async half of an EXTENSION command's argument completion — pi's
+    /// `await command.getArgumentCompletions(argumentText)` (`packages/tui/src/autocomplete.ts:355`
+    /// @v0.84.3), lifted out of the synchronous popup path.
+    ///
+    /// Called once per serviced input batch, from the run loop's input arm and BEFORE the frame is
+    /// drawn, so a completion fetched for the key just pressed still reaches that key's frame. When
+    /// the line under the cursor is not `/<ext-command> <arg>` this is a single string test and a
+    /// clear; when it is, and `(command, argument)` has not changed since the last fetch, it is a
+    /// comparison. Only a genuinely new pair reaches the guest.
+    ///
+    /// The guest call is epoch-deadlined at command tier (`cyrup-ext/src/host/live.rs:1592`), which
+    /// is what bounds a misbehaving completer's effect on the input loop. An error — no live owner,
+    /// a trap, a timeout — is an EMPTY completion set, matching pi's non-array/empty branch
+    /// (`autocomplete.ts:356-357`): the popup closes and typing continues. It is not surfaced as a
+    /// notification, because it would fire on every keystroke.
+    ///
+    /// See [`crate::commands::ArgumentCompleter::Extension`] for why the fetch lives here.
+    pub(crate) async fn refresh_extension_completions(&mut self, session: &Arc<AgentSession>) {
+        let Some((name, argument)) = self.state.editor.pending_extension_argument() else {
+            // Left the argument context: forget the query, so re-entering it refetches rather than
+            // trusting a set the guest may since have changed its mind about.
+            self.state.extension_completion_query = None;
+            return;
+        };
+        if self.state.extension_completion_query.as_ref().is_some_and(|(c, a)| {
+            c == &name && a == &argument
+        }) {
+            return;
+        }
+        self.state.extension_completion_query = Some((name.clone(), argument.clone()));
+        let items = session
+            .services()
+            .ext_host
+            .command_completions(&name, &argument)
+            .await
+            .unwrap_or_default();
+        // No staleness check on the way back, and none is needed: this future holds `&mut self`
+        // across the await, so no key can be serviced while it is in flight — the pair it answers
+        // for is by construction still the pair on screen. The cost is that a slow completer
+        // delays the frame; the epoch deadline is what bounds that.
+        self.state.editor.set_extension_completions(&name, &argument, items);
+        self.state.editor.refresh_autocomplete();
     }
 
     /// The remaining [`Self::execute_command`] arms (§7.1): login, model/thinking cycling,
@@ -542,6 +588,11 @@ impl<B: Backend> App<B> {
                         .push_status(format!("thinking error: unknown level {level}"));
                     return;
                 }
+                // `modelThinkingOverridesSummary(currentModelThinkingLevels)`
+                // (`settings-selector.ts:184-188`), the value pi's `done(summary())` writes back
+                // onto the `model-thinking` row — taken off the map being persisted, so it needs no
+                // settings re-read to be current.
+                let summary = model_thinking_summary_for_count(map.len());
                 // `if (Object.keys(...).length === 0) delete this.globalSettings
                 // .modelThinkingLevels` (`settings-manager.ts:810-812`) — an emptied map removes
                 // the key rather than persisting `{}`. `Value::Null` is `SettingsManager::set`'s
@@ -566,6 +617,27 @@ impl<B: Backend> App<B> {
                             format!("{model} → {level}")
                         };
                         self.state.transcript.push_status(msg);
+                        // The `/settings` list under this submenu keeps showing the summary it was
+                        // built with unless it is written through — pi's submenu `done(summary())`
+                        // (`settings-selector.ts:665`), which runs `item.currentValue = …` before
+                        // the list comes back (`settings-list.ts:222-225`).
+                        self.set_settings_row_value("model-thinking", &summary);
+                        // pi's `{ loop: true }`: the final step re-enters step 0 rather than
+                        // closing (`settings-submenu.ts:226-231`). The step-2 confirm has already
+                        // popped back to the retained step-1 list; rebuild it in place, keeping its
+                        // parent, so the model whose override just changed shows the new value in
+                        // its description.
+                        if self.active_selector_kind() == Some(SelectorKind::ModelThinking) {
+                            let parent =
+                                self.state.selector.take().and_then(|active| active.parent);
+                            let entries = super::execute::model_thinking_rows(session);
+                            self.open_data_child_selector(
+                                SelectorKind::ModelThinking,
+                                entries,
+                                0,
+                                parent,
+                            );
+                        }
                     }
                     Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
                 }
@@ -603,6 +675,14 @@ impl<B: Backend> App<B> {
                     self.state
                         .transcript
                         .set_mermaid_mode(crate::markdown::mode_from_setting(&value));
+                }
+                // `showCacheMissNotices` is live in Pi by construction: every emission re-reads
+                // `getShowCacheMissNotices()` (`interactive-mode.ts:3803`, `:3821`, `:3694`).
+                // cyrup caches the gate on `AppState` — the fold and the replay walk hold no
+                // settings view — so the flip has to be pushed in here, or the row would not take
+                // effect until the next session bind.
+                if id == "showCacheMissNotices" {
+                    self.state.show_cache_miss_notices = value == "true";
                 }
                 // The image rows are live too (Pi re-reads them per `ToolExecutionComponent`).
                 if id == "terminal.showImages" {
@@ -737,6 +817,31 @@ impl<B: Backend> App<B> {
                 None => self.state.transcript.push_status("no assistant message to copy"),
             },
 
+            // `app.message.copy` inside `/tree` — pi's `selector.onCopy` consumer
+            // (`interactive-mode.ts:5297-5308`), whose three outcomes are reproduced verbatim:
+            // a falsy text is `showError("Selected entry has no text to copy")`, a successful write
+            // is `showStatus("Copied selected message to clipboard")`, and a throwing
+            // `copyToClipboard` is surfaced through the same error channel. The clipboard call site
+            // is `C::Copy`'s above — [`crate::clipboard::copy_to_clipboard`] — not a second one.
+            C::CopyEntry(entry_id) => {
+                match session.entry_copy_text(&entry_id.as_str().into()).await {
+                    Some(text) => {
+                        if crate::clipboard::copy_to_clipboard(&text).await {
+                            self.state
+                                .transcript
+                                .push_status("Copied selected message to clipboard");
+                        } else {
+                            // The message pi throws when every clipboard branch failed
+                            // (`clipboard.ts:171-173`), reaching `showError` via the `catch`.
+                            self.state.transcript.push_error("Failed to copy to clipboard");
+                        }
+                    }
+                    None => {
+                        self.state.transcript.push_error("Selected entry has no text to copy")
+                    }
+                }
+            }
+
             C::Share => self.share_session(session).await,
 
             // Was `_ => {}` under a comment asserting this is unreachable. Nothing enforced that
@@ -755,8 +860,12 @@ impl<B: Backend> App<B> {
 
     /// `/share` (`handleShareCommand`, interactive-mode.ts:5191): export the session to HTML, write a
     /// temp file, then shell `gh gist create --public=false <file>` behind a [`crate::chrome::BorderedLoader`] and
-    /// surface the resulting gist URL. `gh` missing / logged-out / failing degrades to a status line
-    /// (Pi's `showError` paths). Fully in-crate (the HTML body is rendered by [`crate::export`]).
+    /// surface the resulting gist URL. `gh` missing / logged-out is caught by pi's `gh auth status`
+    /// pre-check (`session-share.ts:59-68`) before anything is mounted; a failing upload degrades to
+    /// a status line. Fully in-crate (the HTML body is rendered by [`crate::export`]).
+    ///
+    /// The upload itself is SPAWNED whenever a run loop is present, never awaited on the loop task —
+    /// see [`Self::share_tx`] — and settles through [`Self::apply_share_outcome`].
     async fn share_session(&mut self, session: &Arc<AgentSession>) {
         use tokio::process::Command;
         // Render the session HTML over its own JSONL (the same body `/export` writes).
@@ -776,6 +885,40 @@ impl<B: Backend> App<B> {
             self.state.transcript.push_status(format!("share write error: {e}"));
             return;
         }
+        // pi's `gh auth status` pre-check, run BEFORE the loader is mounted
+        // (`session-share.ts:59-68`): a logged-out `gh` otherwise reaches the transcript as raw
+        // stderr, with no hint that `gh auth login` is the fix.
+        //
+        // Deliberately awaited inline, unlike the upload below: upstream runs it with `spawnSync`
+        // (`:60`) — it blocks pi's event loop too — and its ORDER is the point, since a failed
+        // check must return before anything is mounted rather than flashing a loader that is
+        // immediately torn down. There is nothing on screen to animate while it runs.
+        match Command::new("gh").args(["auth", "status"]).output().await {
+            Ok(out) if out.status.success() => {}
+            // pi's `catch` arm (`:66-68`). Node's `spawnSync` reports a missing binary as
+            // `result.error` rather than a throw, so upstream's own ENOENT actually lands in the
+            // `status !== 0` branch below and mislabels an uninstalled `gh` as logged out; the
+            // message it *intends* for that case is this one, and `ErrorKind::NotFound` is the
+            // honest test for it. Same string as the gist path used to carry, now aligned on pi's
+            // wording ("Install it from", not cyrup's "— see").
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let _ = std::fs::remove_file(&tmp);
+                self.state.transcript.push_error(
+                    "Error: GitHub CLI (gh) is not installed. Install it from https://cli.github.com/",
+                );
+                return;
+            }
+            // pi's `authResult.status !== 0` (`:61-64`). `showError` builds its own `Error: `
+            // prefix (`interactive-mode.ts:3878-3882`) while `Entry::Error` renders verbatim, so
+            // the prefix is supplied here — the same shape the gist-id arm below uses.
+            _ => {
+                let _ = std::fs::remove_file(&tmp);
+                self.state
+                    .transcript
+                    .push_error("Error: GitHub CLI is not logged in. Run 'gh auth login' first.");
+                return;
+            }
+        }
         // Show the bordered loader in the editor slot while gh runs (Pi's `BorderedLoader`).
         // `keyHint("tui.select.cancel", "cancel")` (`bordered-loader.ts:36`) — the SELECT-tier
         // action, and `keyText` joins every bound key with `/` (`keybinding-hints.ts:29-36`), so the
@@ -789,14 +932,74 @@ impl<B: Backend> App<B> {
                 .keys_label(SelectAction::Cancel)
                 .unwrap_or_else(|| "escape/ctrl+c".into()),
         ));
-        let result = Command::new("gh")
+        // A fresh run is never pre-cancelled (pi builds a new `AbortController` with every loader).
+        self.state.share_cancelled = false;
+        let Some(tx) = self.share_tx.clone() else {
+            // No run loop (an embedder or a test driving `execute_command` directly): await inline,
+            // exactly as `/tree` does (`tree_nav.rs:112-116`). Nothing would draw the loader on this
+            // path and no keystroke could be delivered, so there is nothing to keep the task free
+            // for and no cancel to retain a handle for.
+            let result = Command::new("gh")
+                .args(["gist", "create", "--public=false"])
+                .arg(&tmp)
+                .output()
+                .await;
+            self.apply_share_outcome(ShareMsg { result, tmp });
+            return;
+        };
+        // pi spawns the child and awaits it while the render loop keeps running
+        // (`session-share.ts:172-186`); here the await lives on its own task and the settled result
+        // comes back over `share_tx`, so this call returns to the `select!` immediately and the very
+        // next iteration draws the mounted loader.
+        //
+        // `kill_on_drop` is the cancel mechanism: `wait_with_output` consumes the child, so the task
+        // is its only owner and aborting the task is what kills `gh` (see [`ShareInFlight`]).
+        let spawned = Command::new("gh")
             .args(["gist", "create", "--public=false"])
             .arg(&tmp)
-            .output()
-            .await;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn();
+        let child = match spawned {
+            Ok(child) => child,
+            // pi's `catch` around the whole promise (`:198-203`) — reported through the same arms
+            // the settled result uses.
+            Err(e) => {
+                self.apply_share_outcome(ShareMsg { result: Err(e), tmp });
+                return;
+            }
+        };
+        let waiter_tmp = tmp.clone();
+        let waiter = tokio::spawn(async move {
+            let result = child.wait_with_output().await;
+            let _ = tx.send(ShareMsg { result, tmp: waiter_tmp });
+        });
+        self.state.share_in_flight = Some(ShareInFlight { task: waiter.abort_handle(), tmp });
+    }
+
+    /// Finish a settled `/share` on the run loop's task — pi's post-`await` tail
+    /// (`session-share.ts:174-197`), which unmounts the loader (`restoreEditor`, `:205-210`) and
+    /// then reports.
+    ///
+    /// Shared by the spawned and the inline path so the two cannot drift, mirroring
+    /// [`Self::apply_compact_outcome`].
+    pub fn apply_share_outcome(&mut self, msg: ShareMsg) {
+        // `restoreEditor(loader, context)` — the loader comes down before anything is printed.
         self.state.loader = None;
-        let _ = std::fs::remove_file(&tmp);
-        match result {
+        self.state.share_in_flight = None;
+        // pi's `finally { fs.unlinkSync(tmpFile) }` (`:76-84`): every path unlinks, cancellation
+        // included (the cancel path unlinks too, so this is a no-op there — `remove_file`'s error is
+        // deliberately ignored, exactly as upstream's `catch {}` ignores it).
+        let _ = std::fs::remove_file(&msg.tmp);
+        // pi re-checks `loader.signal.aborted` on EVERY completion path (`:174`, `:191-199`) and
+        // returns without touching the UI: `gh` may have settled in the window between the user's
+        // Escape and the abort landing, and a cancelled share must print neither a gist URL nor a
+        // `share error:` line over the top of `Share cancelled`.
+        if std::mem::take(&mut self.state.share_cancelled) {
+            return;
+        }
+        match msg.result {
             Ok(out) if out.status.success() => {
                 // TUI-063 — pi does NOT surface the raw gist URL on its own. It peels the gist ID
                 // off the URL `gh` printed and renders the VIEWER link built from it:
@@ -837,10 +1040,9 @@ impl<B: Backend> App<B> {
                 let detail = if msg.is_empty() { "gh gist create failed" } else { msg };
                 self.state.transcript.push_status(format!("share error: {detail}"));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self
-                .state
-                .transcript
-                .push_status("GitHub CLI (gh) is not installed — see https://cli.github.com/"),
+            // No `ErrorKind::NotFound` arm: a missing `gh` is reported by the `gh auth status`
+            // pre-check above, which runs first and returns — this path is only ever reached with a
+            // `gh` that exists.
             Err(e) => self.state.transcript.push_status(format!("share error: {e}")),
         }
     }

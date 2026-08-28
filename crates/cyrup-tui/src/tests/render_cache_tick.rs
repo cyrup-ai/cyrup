@@ -1,7 +1,7 @@
 //! The TUI-092 F2 render cache must be invalidated on timer-driven repaints while
 //! wall-clock-derived transcript content is live — or the live `!`/`!!` block's spinner glyph
 //! (`BashExecution::render_lines` → `started.elapsed()`, bash.rs:226-233) and a running bash tool's
-//! `Elapsed …` footer (`render_bash`, transcript/tool_builtin.rs:214) freeze at the values
+//! `Elapsed …` footer (`render_bash_result`, transcript/tool_builtin.rs) freeze at the values
 //! materialised by the last content change.
 //!
 //! # What was broken

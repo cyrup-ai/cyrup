@@ -67,11 +67,35 @@ impl InputEditor {
             }
             A::Accept => {
                 // Accept, keep editing (no submit), then recompute (may close if out of context).
+                //
+                // DEVIATION, pre-existing and deliberate: upstream's Tab branch applies the
+                // completion and then `cancelAutocomplete()` with NO recompute
+                // (`components/editor.ts:676-698` @v0.84.3), so Tab-accepting `/model` leaves the
+                // popup shut until the next keystroke, while cyrup immediately reopens it as the
+                // argument popup. The recompute is what path completion drills directories with —
+                // accepting `src/` and being offered its contents without a second Tab — so it is
+                // kept, and kept GENERIC: not special-casing
+                // [`crate::CompletionContext::SlashArgument`] out of it is the point, since a
+                // per-context exception here is how the accept path drifts out of one rule into
+                // four. The visible effect is new only because `SlashArgument` is now a reachable
+                // context, not because the accept path changed.
                 self.accept_completion();
                 self.update_autocomplete();
                 Some(EditorOutcome::Edited)
             }
             A::AcceptSubmit => {
+                // Which accepted items fall through to submit. Upstream tests the PREFIX —
+                // `if (this.autocompletePrefix.startsWith("/"))` (`components/editor.ts:713-720`
+                // @v0.84.3) — and cyrup tests the CONTEXT; on the slash surface the two agree by
+                // construction, because the command-name popup's prefix is the whole `/…` token
+                // (`autocomplete.rs`'s `command_name_context`, pi `:340`) while an argument
+                // popup's prefix is the bare argument text with the `/name ` already stripped
+                // (pi `:345`, `:362`). So Enter on `/mod`→`/model` submits in both, and Enter on
+                // `/model gpt` accepts the model without submitting in both.
+                //
+                // Residual, out of scope here: an ABSOLUTE-path popup carries a prefix like
+                // `/usr/lo`, which satisfies pi's string test and not cyrup's context test — pi
+                // submits the line, cyrup keeps editing.
                 let is_slash = self
                     .autocomplete
                     .as_ref()

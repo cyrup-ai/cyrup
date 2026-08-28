@@ -58,17 +58,202 @@ impl InputEditor {
     /// wrap boundary it belongs to the *start* of the following visual line, and an end-of-line cursor
     /// rides the last visual line of the row.
     pub(super) fn current_visual_line(&self, map: &[VisualLine]) -> usize {
-        let mut fallback = 0;
-        for (i, vl) in map.iter().enumerate() {
-            if vl.logical != self.row {
-                continue;
+        find_visual_line_at(map, self.row, self.col)
+    }
+
+    /// Move the caret to `target` in `map`, applying the sticky-column table, the non-last-segment
+    /// clamp and the atomic-segment snap — a port of `moveToVisualLine` (`editor.ts:1383-1466`),
+    /// documented upstream as "Shared by moveCursor() and pageScroll()". All three of cyrup's
+    /// vertical movers ([`move_up_visual`](Self::move_up_visual),
+    /// [`move_down_visual`](Self::move_down_visual), [`page_scroll`](Self::page_scroll)) go through
+    /// it, exactly as upstream's two entry points do.
+    ///
+    /// Four things happen here, in upstream's order:
+    ///
+    /// 1. **Pre-snap column re-resolution** (`:1396-1404`). When [`snapped_from_col`] holds a
+    ///    stash, the SOURCE visual column comes from that pre-snap column resolved through
+    ///    [`find_visual_line_at`] rather than from the live (snapped) `col` — "this gives the
+    ///    correct visual column even after a resize reshuffles VLs".
+    /// 2. **The non-last-segment clamp** (`:1406-1416`), see [`is_last_segment`].
+    /// 3. **The sticky-column table** (`:1418`), see
+    ///    [`compute_vertical_move_column`](Self::compute_vertical_move_column).
+    /// 4. **The atomic-segment snap** (`:1425-1466`): the TARGET logical line is re-segmented with
+    ///    [`marker_grapheme_boundaries`](Self::marker_grapheme_boundaries) — pi's
+    ///    `this.segment(logicalLine, "grapheme")` — and a landing inside a multi-grapheme segment
+    ///    either skips the segment's remaining continuation rows (moving down into a segment that
+    ///    began on an earlier visual row, `:1437-1453`) or snaps back to the segment start, stashing
+    ///    the pre-snap column (`:1455-1461`). Landing outside every atomic segment clears the stash
+    ///    (`:1465`). This is what stops Up/Down/PageUp/PageDown parking the caret INSIDE a
+    ///    `[paste #N …]` marker on a wrapped line, where the next Backspace would shred it (the
+    ///    `end == self.col` filter in [`backspace`](Self::backspace) can only fire on a whole
+    ///    marker).
+    ///
+    /// [`snapped_from_col`]: Self::snapped_from_col
+    ///
+    /// [CYRUP-DELTA] Upstream re-enters `moveToVisualLine` recursively for the continuation skip;
+    /// this is the same walk written as a loop, with `next > target` made an explicit guard rather
+    /// than the monotonicity upstream relies on implicitly, so a pathological map cannot spin.
+    pub(super) fn move_to_visual_line(
+        &mut self,
+        map: &[VisualLine],
+        current: usize,
+        target: usize,
+    ) {
+        let mut target = target;
+        loop {
+            // `if (!(currentVL && targetVL)) return` (`:1391-1394`).
+            let (Some(current_vl), Some(target_vl)) =
+                (map.get(current).copied(), map.get(target).copied())
+            else {
+                return;
+            };
+
+            // "When the cursor was snapped to a segment start, resolve the pre-snap position
+            // against the VL it belongs to." (`:1396-1404`).
+            let current_visual_col = match self.snapped_from_col {
+                Some(pre_snap) => {
+                    let i = find_visual_line_at(map, current_vl.logical, pre_snap);
+                    pre_snap.saturating_sub(map.get(i).map_or(0, |vl| vl.start))
+                }
+                None => self.col.saturating_sub(current_vl.start),
+            };
+
+            // "For non-last segments, clamp to length-1 to stay within the segment" (`:1406-1416`).
+            let source_max = segment_max_visual_col(map, current);
+            let target_max = segment_max_visual_col(map, target);
+            let move_col =
+                self.compute_vertical_move_column(current_visual_col, source_max, target_max);
+
+            // "Set cursor position" (`:1420-1423`).
+            self.row = target_vl.logical;
+            let line_len = self.cur_len();
+            self.col = target_vl.start.saturating_add(move_col).min(line_len);
+
+            // "Snap cursor to atomic segment boundary (e.g. paste markers) so the cursor never lands
+            // in the middle of a multi-grapheme unit." (`:1425-1463`). Upstream iterates the
+            // segmenter's segments; cyrup's segmenter yields BOUNDARIES, so a segment is a
+            // consecutive boundary pair.
+            let bounds = match self.lines.get(self.row) {
+                Some(line) => self.marker_grapheme_boundaries(line),
+                None => Vec::new(),
+            };
+            let mut next_target: Option<usize> = None;
+            let mut snapped = false;
+            for (&seg_start, &seg_end) in bounds.iter().zip(bounds.iter().skip(1)) {
+                // `if (seg.index > this.state.cursorCol) break` (`:1430`).
+                if seg_start > self.col {
+                    break;
+                }
+                // `if (seg.segment.length <= 1) continue` (`:1431`). [CYRUP-DELTA] upstream's
+                // `.length` is UTF-16 code units against a code-unit cursor; cyrup's columns are
+                // CHAR indices, so the analogous "single unit the caret cannot land inside" test is
+                // the segment's char count.
+                if seg_end.saturating_sub(seg_start) <= 1 {
+                    continue;
+                }
+                // `if (this.state.cursorCol < seg.index + seg.segment.length)` (`:1432`).
+                if self.col >= seg_end {
+                    continue;
+                }
+                let is_continuation = seg_start < target_vl.start;
+                let is_moving_down = target > current;
+                if is_continuation && is_moving_down {
+                    // "The segment started on a previous visual line, and we already visited it on
+                    // the way down. Skip all remaining continuation VLs and land on the first VL
+                    // past it." (`:1436-1453`).
+                    let mut next = target.saturating_add(1);
+                    while map
+                        .get(next)
+                        .is_some_and(|vl| vl.logical == target_vl.logical && vl.start < seg_end)
+                    {
+                        next = next.saturating_add(1);
+                    }
+                    if next < map.len() {
+                        next_target = Some(next);
+                        break;
+                    }
+                }
+                // "Snap to the start of the segment so it gets highlighted. Store the pre-snap
+                // position so the next vertical move can resolve it to the correct visual column."
+                // (`:1455-1461`).
+                self.snapped_from_col = Some(self.col);
+                self.col = seg_start;
+                snapped = true;
+                break;
             }
-            fallback = i;
-            if self.col >= vl.start && self.col < vl.start + vl.len {
-                return i;
+
+            match next_target {
+                // The re-entry (`:1450`), as a loop; `next` is seeded at `target + 1` so the guard
+                // always holds and the walk always advances.
+                Some(next) if next > target => target = next,
+                _ => {
+                    if !snapped {
+                        // "No snap occurred – we moved out of the atomic segment." (`:1465`).
+                        self.snapped_from_col = None;
+                    }
+                    return;
+                }
             }
         }
-        fallback
+    }
+
+    /// The target visual column for a vertical move — a statement-for-statement port of
+    /// `computeVerticalMoveColumn` (`editor.ts:1489-1518`) and the sticky-column decision table it
+    /// documents at `:1470-1488`:
+    ///
+    /// ```text
+    /// | P | S | T | U | Scenario                                             | Set Preferred | Move To     |
+    /// |---|---|---|---| ---------------------------------------------------- |---------------|-------------|
+    /// | 0 | * | 0 | - | Start nav, target fits                               | null          | current     |
+    /// | 0 | * | 1 | - | Start nav, target shorter                            | current       | target end  |
+    /// | 1 | 0 | 0 | 0 | Clamped, target fits preferred                       | null          | preferred   |
+    /// | 1 | 0 | 0 | 1 | Clamped, target longer but still can't fit preferred | keep          | target end  |
+    /// | 1 | 0 | 1 | - | Clamped, target even shorter                         | keep          | target end  |
+    /// | 1 | 1 | 0 | - | Rewrapped, target fits current                       | null          | current     |
+    /// | 1 | 1 | 1 | - | Rewrapped, target shorter than current               | current       | target end  |
+    ///
+    /// Where:
+    /// - P = preferred col is set
+    /// - S = cursor in middle of source line (not clamped to end)
+    /// - T = target line shorter than current visual col
+    /// - U = target line shorter than preferred col
+    /// ```
+    ///
+    /// Note that three of the seven cases CLEAR [`preferred_visual_col`](Self::preferred_visual_col)
+    /// (1, 3 and 6) and only two set it (2 and 7) — the previous cyrup movers set it
+    /// unconditionally on every vertical step, which is case 3's "consume the preference" arm lost.
+    fn compute_vertical_move_column(
+        &mut self,
+        current_visual_col: usize,
+        source_max_visual_col: usize,
+        target_max_visual_col: usize,
+    ) -> usize {
+        let cursor_in_middle = current_visual_col < source_max_visual_col; // S
+        let target_too_short = target_max_visual_col < current_visual_col; // T
+
+        // `if (!hasPreferred || cursorInMiddle)` (`:1499`) — P is the `is_some`, so binding the
+        // preferred value here folds the two guards into one refutable pattern and keeps the
+        // `unwrap` upstream needs at `:1512` out of the port entirely.
+        let Some(preferred) = self.preferred_visual_col.filter(|_| !cursor_in_middle) else {
+            if target_too_short {
+                // Cases 2 and 7 (`:1500-1503`).
+                self.preferred_visual_col = Some(current_visual_col);
+                return target_max_visual_col;
+            }
+            // Cases 1 and 6 (`:1505-1506`).
+            self.preferred_visual_col = None;
+            return current_visual_col;
+        };
+
+        let target_cant_fit_preferred = target_max_visual_col < preferred; // U
+        if target_too_short || target_cant_fit_preferred {
+            // Cases 4 and 5 (`:1510-1513`) — the preference is KEPT.
+            return target_max_visual_col;
+        }
+
+        // Case 3 (`:1515-1517`).
+        self.preferred_visual_col = None;
+        preferred
     }
 
     /// Vertical Up by one **visual** line, preserving the sticky preferred column (spec/tui/03 §4.2).
@@ -77,18 +262,18 @@ impl InputEditor {
     pub(super) fn move_up_visual(&mut self) {
         let map = self.visual_line_map();
         let cur = self.current_visual_line(&map);
-        let here = map.get(cur).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
-        let goal = self.preferred_visual_col.unwrap_or(self.col.saturating_sub(here.start));
-        self.preferred_visual_col = Some(goal);
         if cur == 0 {
-            // First visual line: fall through to line-start (spec/tui/03 §5.1).
+            // First visual line: fall through to line-start (spec/tui/03 §5.1). This is cyrup's
+            // deliberate divergence from `moveCursor`, which simply does not move when the target
+            // index is out of range (`editor.ts:1808-1812`) — but the placement it performs IS
+            // `moveToLineStart`, and upstream's `moveToLineStart` is `setCursorCol(0)`
+            // (`:1522-1525`), which drops BOTH sticky-column fields. Anything else would leave a
+            // stash from a snapped caret to misresolve the next vertical move.
+            self.reset_preferred_col();
             self.col = 0;
             return;
         }
-        if let Some(target) = map.get(cur - 1) {
-            self.row = target.logical;
-            self.col = target.start + goal.min(target.len);
-        }
+        self.move_to_visual_line(&map, cur, cur.saturating_sub(1));
     }
 
     /// Vertical Down by one **visual** line, preserving the sticky preferred column (spec/tui/03 §4.2).
@@ -96,18 +281,15 @@ impl InputEditor {
     pub(super) fn move_down_visual(&mut self) {
         let map = self.visual_line_map();
         let cur = self.current_visual_line(&map);
-        let here = map.get(cur).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
-        let goal = self.preferred_visual_col.unwrap_or(self.col.saturating_sub(here.start));
-        self.preferred_visual_col = Some(goal);
         if cur + 1 >= map.len() {
-            // Last visual line: fall through to line-end (spec/tui/03 §5.1).
+            // Last visual line: fall through to line-end (spec/tui/03 §5.1) — the mirror of
+            // [`move_up_visual`](Self::move_up_visual)'s fall-through, and upstream's
+            // `moveToLineEnd` is likewise `setCursorCol(line.length)` (`editor.ts:1527-1531`).
+            self.reset_preferred_col();
             self.col = self.cur_len();
             return;
         }
-        if let Some(target) = map.get(cur + 1) {
-            self.row = target.logical;
-            self.col = target.start + goal.min(target.len);
-        }
+        self.move_to_visual_line(&map, cur, cur.saturating_add(1));
     }
 
     /// Move the caret by one **page** of visual lines (`editor.ts:1857` `pageScroll(direction)`;
@@ -133,15 +315,9 @@ impl InputEditor {
         let page = usize::from(self.max_visible_lines());
         let map = self.visual_line_map();
         let cur = self.current_visual_line(&map);
-        let here = map.get(cur).copied().unwrap_or(VisualLine { logical: 0, start: 0, len: 0 });
-        let goal = self.preferred_visual_col.unwrap_or(self.col.saturating_sub(here.start));
-        self.preferred_visual_col = Some(goal);
         let last = map.len().saturating_sub(1);
         let target = if direction < 0 { cur.saturating_sub(page) } else { (cur + page).min(last) };
-        if let Some(t) = map.get(target) {
-            self.row = t.logical;
-            self.col = t.start + goal.min(t.len);
-        }
+        self.move_to_visual_line(&map, cur, target);
     }
 
     /// Whether the buffer occupies more than one **visual** line at the current layout width, i.e.
@@ -154,11 +330,61 @@ impl InputEditor {
         self.visual_line_map().len() > 1
     }
 
-    /// Drop the sticky vertical-motion column (called by every non-vertical motion/edit so the next
-    /// Up/Down re-seeds the goal column from the live cursor).
+    /// Drop **both** sticky vertical-motion fields — the preferred column and the pre-snap stash —
+    /// so the next Up/Down re-seeds the goal column from the live cursor. cyrup's `setCursorCol`
+    /// (`editor.ts:1377-1381`), which is what upstream uses "for all non-vertical cursor movements
+    /// to reset sticky column behavior"; every caller here is likewise a non-vertical
+    /// motion/edit/paste/undo, and the central gate in `apply_editor_action` (`keys.rs`) exempts
+    /// exactly `CursorUp`/`CursorDown`/`PageUp`/`PageDown`.
     pub(super) fn reset_preferred_col(&mut self) {
         self.preferred_visual_col = None;
+        self.snapped_from_col = None;
     }
+}
+
+/// The visual-line index containing logical position `(line, col)` — pi's `findVisualLineAt`
+/// (`editor.ts:1774-1792`). A `col` exactly on a wrap boundary belongs to the *start* of the
+/// following visual line; on the LAST visual line of a logical line an end-of-line `col` (`start +
+/// len`) still rides that line, which is what upstream spells as its `isLastSegmentOfLine &&
+/// offset === vl.length` arm.
+///
+/// [CYRUP-DELTA] Upstream's miss fallback is `visualLines.length - 1`, the last visual line of the
+/// whole BUFFER. This returns the last visual line of the requested logical `line` instead (`0` when
+/// the map has none), which is the only answer a caller can use: both call sites — the cursor's own
+/// position and the pre-snap stash in [`InputEditor::move_to_visual_line`] — pass a `line` that is
+/// in the map, so the buffer-end fallback is only ever reachable as a wrong answer.
+fn find_visual_line_at(map: &[VisualLine], line: usize, col: usize) -> usize {
+    let mut fallback = 0;
+    for (i, vl) in map.iter().enumerate() {
+        if vl.logical != line {
+            continue;
+        }
+        fallback = i;
+        if col >= vl.start && col < vl.start + vl.len {
+            return i;
+        }
+    }
+    fallback
+}
+
+/// Whether visual line `i` is the LAST segment of its logical line — the final map entry, or
+/// followed by an entry belonging to a different logical line (`editor.ts:1407-1409`, `:1413-1415`).
+fn is_last_segment(map: &[VisualLine], i: usize) -> bool {
+    match (map.get(i), map.get(i.saturating_add(1))) {
+        (Some(vl), Some(next)) => next.logical != vl.logical,
+        _ => true,
+    }
+}
+
+/// The highest visual column the caret may occupy on visual line `i` —
+/// `isLastSegment ? vl.length : Math.max(0, vl.length - 1)` (`editor.ts:1410`, `:1416`).
+///
+/// The `- 1` matters: on a NON-last segment, column `start + len` is the wrap boundary, which
+/// belongs to the *next* visual row (see [`find_visual_line_at`]). The movers previously clamped
+/// with a bare `goal.min(vl.len)` and so could park the caret on a column that renders one row down.
+fn segment_max_visual_col(map: &[VisualLine], i: usize) -> usize {
+    let len = map.get(i).map_or(0, |vl| vl.len);
+    if is_last_segment(map, i) { len } else { len.saturating_sub(1) }
 }
 
 /// The **display width** of `s` in terminal cells — Pi's `visibleWidth` (`utils.ts:240-...`), which

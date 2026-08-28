@@ -74,9 +74,9 @@ pub use runtime::{
 };
 pub use services::{AgentSessionServices, ExtensionLoadDiagnostic, StartupDiagnostics};
 pub use session::{
-    AgentSession, BindOptions, DeleteMethod, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult,
-    NavigateTreeOptions, NavigateTreeOutcome, ScopedModel, SessionDagKind, SessionDagNode,
-    delete_session_file_at, rename_session_file_at,
+    AgentSession, BindOptions, CompactionCostKind, DeleteMethod, ForkAnchor, ForkOutcome,
+    ForkPosition, ModelCycleResult, NavigateTreeOptions, NavigateTreeOutcome, ReplayItem,
+    ScopedModel, SessionDagKind, SessionDagNode, delete_session_file_at, rename_session_file_at,
 };
 pub use state::{
     CompactionResult, ContextUsage, SessionStateView, SessionStats, StatsContextUsage,

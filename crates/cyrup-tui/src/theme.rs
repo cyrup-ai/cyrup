@@ -1884,7 +1884,11 @@ fn indexed_rgb(i: u8) -> (u8, u8, u8) {
         }),
         16..=231 => {
             let n = i - 16;
-            (LEVELS[(n / 36) as usize], LEVELS[((n % 36) / 6) as usize], LEVELS[(n % 6) as usize])
+            // `n` is 0..=215, so every divisor below lands in `0..=5` and `LEVELS` (len 6) always
+            // has the entry. Read through `get` rather than `[]` so the bound is carried in the
+            // types instead of asserted in a comment (`clippy::indexing_slicing` is denied).
+            let level = |k: u8| LEVELS.get(usize::from(k)).copied().unwrap_or(0);
+            (level(n / 36), level((n % 36) / 6), level(n % 6))
         }
         232..=255 => {
             let v = 8 + (i - 232) * 10;

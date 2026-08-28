@@ -69,7 +69,7 @@ mod view;
 mod tests;
 
 pub use content::{content_text, parse_skill_block, thinking_text, ParsedSkillBlock};
-pub use entry::{Entry, Rendered, ToolRun};
+pub use entry::{CompactionCostKind, Entry, Rendered, ToolRun};
 pub use images::{ResultImage, DEFAULT_IMAGE_WIDTH_CELLS};
 pub use message::HIDDEN_THINKING_LABEL;
 
@@ -90,8 +90,9 @@ use tool_args::{
     push_search_path, read_line_range, str_arg, tool_path_span, StrArg,
 };
 use tool_builtin::{
-    edit_header_preview, render_bash, render_edit, render_extension, render_find, render_generic,
-    render_grep, render_ls, render_read, render_write,
+    builtin_kind, edit_header_preview, render_builtin_call, render_builtin_result,
+    render_call_fallback, render_extension_call, render_extension_result, render_generic,
+    render_result_fallback,
 };
 use tool_render::EXPAND_KEY;
 use tool_result::{
@@ -192,6 +193,25 @@ pub struct TranscriptView {
     /// separately from `streaming` because Pi renders thinking as its own block above the answer
     /// text (`assistant-message.ts:115-166`), in its own italic `thinkingText` colour.
     thinking: Option<String>,
+    /// What the extension markdown transformers made of [`Self::streaming`] at its current length —
+    /// `None` when no transformer is loaded, when none changed the text, or whenever a new delta has
+    /// landed since the last pass.
+    ///
+    /// A SECOND buffer rather than a rewrite of `streaming`, because `streaming` is an
+    /// **accumulator**: `push_assistant_delta` appends to it (`stream.rs`), so transforming it in
+    /// place would feed each transformer's own previous output back to it on the next chunk and let
+    /// it compound. Upstream has the same separation for free — `Markdown.render()` transforms
+    /// `this.text` into a local `const text` and never writes it back (`markdown.ts:285`).
+    ///
+    /// Rendered in preference to the raw buffer (`cache.rs`), with the raw buffer as the fallback,
+    /// so a partial that arrives between the delta and the pass draws untransformed rather than not
+    /// at all.
+    streaming_display: Option<String>,
+    /// [`Self::streaming_display`] for the live reasoning buffer, on the same terms. pi runs the
+    /// general transformer on the thinking body too, with `messageType: "assistant-thinking"`
+    /// (`assistant-message.ts:156-162`) — it is only the built-in MERMAID transformer that returns
+    /// a thinking body untouched (`mermaid.ts:65`).
+    thinking_display: Option<String>,
     /// `hideThinkingBlock` (settings-manager.ts; Pi `AssistantMessageComponent.hideThinkingBlock`,
     /// assistant-message.ts:126): render one static `Thinking...` label instead of the reasoning
     /// body. Read when a thinking run is rendered live and frozen into [`Entry::Thinking::hidden`]

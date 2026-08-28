@@ -179,7 +179,7 @@ pub use build::build_component;
 pub use hooks::ExtHooks;
 pub use loader::{
     discover, discover_with_diagnostics, resolve_component_bytes, DiscoveredExtension,
-    DiscoveryRoots, ExtOrigin, LoadError, LoadExtensionsResult,
+    DiscoveryRoots, ExtOrigin, LoadError, LoadExtensionsResult, EXTENSIONS_SUBDIR,
 };
 pub use manifest::{Capabilities, ExtensionManifest, FsGrant, HOST_WORLD, MANIFEST_FILE};
 pub use native::{

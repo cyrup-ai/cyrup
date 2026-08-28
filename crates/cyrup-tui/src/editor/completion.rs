@@ -105,7 +105,7 @@ impl InputEditor {
     }
 
     /// The text left of the cursor on the current line (the autocomplete context window).
-    fn before_cursor(&self) -> String {
+    pub(super) fn before_cursor(&self) -> String {
         self.lines.get(self.row).map_or(String::new(), |line| line.iter().take(self.col).collect())
     }
 

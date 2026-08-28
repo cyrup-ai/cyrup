@@ -178,11 +178,34 @@ pub fn render_with_hyperlink_support(
 /// each of its three message types: `assistant-message.ts:112` (`"assistant"`, `this.isStreaming`),
 /// `:157-161` (`"assistant-thinking"`) and `user-message.ts:53` (`"user"`, `false`).
 ///
-/// **This is a narrow, mermaid-only hook.** It exists because pi's mermaid gate is defined on
-/// `messageType` / `isStreaming` / `availableWidth` (`mermaid.ts:63-70`) and there is nowhere else
-/// to read them. The general, extension-supplied `MarkdownTransformer` registry
-/// (`core/extensions/types.ts:1355`) is the sibling gap MARKDOWN_TRANSFORM_HOOK_NOT_WIRED and is
-/// deliberately NOT built here; widening this signature into a transformer list is that task's job.
+/// **The `messageType` it carries is also what selects pi's two user-message fidelity flags** —
+/// `preserveOrderedListMarkers` / `preserveBackslashEscapes`, set together with the `"user"`
+/// transform at `user-message.ts:50-53` and nowhere else. See [`render_inner`].
+///
+/// **Otherwise this is a narrow, mermaid-only hook.** It exists because pi's mermaid gate is
+/// defined on `messageType` / `isStreaming` / `availableWidth` (`mermaid.ts:63-70`) and there is
+/// nowhere else to read them.
+///
+/// # Where the general transformer registry runs instead, and what that costs
+/// The extension-supplied `MarkdownTransformer` registry (`core/extensions/types.ts:1355`) is
+/// wired, but **not through this function**. Upstream, `createMarkdownTransform` is one more
+/// `MarkdownOptions.transform` closure applied as the first statement of `Markdown.render()`, on
+/// every frame, at the live `contentWidth` (`markdown.ts:285`). cyrup cannot put it there: this
+/// renderer is reached from `App::draw`, which is sync, while
+/// [`cyrup_ext::ExtensionHost::transform_markdown`] is `async`. So the fold runs ONCE, at
+/// push/commit time, in `App::apply_markdown_transformers` (`app/events.rs`) — the one async
+/// pre-fold hook the event path already has — and rewrites the entry text (and the live partials),
+/// at the LAST DRAWN content width.
+///
+/// The tradeoff that buys, stated plainly: **a terminal resize does not re-run transformers over
+/// already-committed text.** Upstream re-transforms it at the new width on the next frame; cyrup
+/// re-*wraps* it but keeps whatever the transformer produced at the old width. A transformer whose
+/// output does not depend on `availableWidth` — which is every transformer that is not laying out
+/// art — is unaffected.
+///
+/// The two seams cannot disagree about *which* message they are looking at: both spell
+/// `messageType` as [`MessageType`], and the guest sees it through
+/// [`MessageType::as_pi_str`](mermaid::MessageType::as_pi_str).
 pub(crate) fn render_message(
     text: &str,
     width: usize,
@@ -220,13 +243,34 @@ fn render_inner(
     r.default_italic = italic;
     r.hyperlinks = hyperlinks;
     r.mermaid = mermaid;
+    // `user-message.ts:50-53` is the ONLY place in pi that sets `preserveOrderedListMarkers` /
+    // `preserveBackslashEscapes`, and it sets them in the same options object as
+    // `createMarkdownTransform("user", …)`. The `messageType` this renderer already carries for the
+    // mermaid gate is therefore the exact same switch, so the two flags hang off it rather than off
+    // a second entry point: a user turn echoes its own source markers and escapes, and the
+    // assistant / thinking bodies (and every non-message caller, which passes
+    // [`MermaidContext::OFF`] — `messageType` `assistant`) keep the normalizing behaviour.
+    let preserve = mermaid.message_type == MessageType::User;
+    r.preserve_list_markers = preserve;
+    r.preserve_escapes = preserve;
     let opts = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     // `into_offset_iter` (rather than the plain event iterator) because two upstream behaviours are
     // defined on the *source* text, not on the event: the strict `~~`-only strikethrough tokenizer
     // (`markdown.ts:7-24`) and the too-narrow table fallback to `token.raw` (`markdown.ts:854-861`).
     for (ev, range) in Parser::new_ext(&prepared, opts).into_offset_iter() {
+        // `case "escape": result += applyTextWithNewlines(preserveBackslashEscapes ? token.raw :
+        // token.text)` (`markdown.ts:656`) reconstructed. pulldown-cmark has no escape event and —
+        // unlike the `~~` case above — the run's OWN `raw` does not carry the backslash either:
+        // `firstpass.rs:877-913` closes the preceding text run AT the `\` and opens the new one at
+        // `ix + 1`, i.e. at the escaped punctuation itself. So the marker has to come from the byte
+        // in front of the run. Bytes, not a slice, to stay inside `deny(clippy::string_slice)`.
+        let start = range.start;
+        let escaped = r.preserve_escapes
+            && matches!(ev, Event::Text(_))
+            && start > 0
+            && prepared.as_bytes().get(start - 1) == Some(&b'\\');
         let raw = prepared.get(range).unwrap_or("");
-        r.event(ev, raw);
+        r.event(ev, raw, escaped);
     }
     r.finish()
 }
@@ -291,6 +335,14 @@ struct MdRenderer<'t> {
     /// `~`, which Pi's `StrictStrikethroughTokenizer` (`markdown.ts:7-24`) never tokenizes as `del`
     /// — those levels re-emit their literal tildes instead of striking.
     strike_literal: Vec<bool>,
+    /// `preserveOrderedListMarkers` — "Preserve source list markers instead of normalizing them."
+    /// (`markdown.ts:222`). Despite the name the single flag gates BOTH branches of `renderList`'s
+    /// bullet (`:765-771`), ordered and unordered. Off everywhere but a user message.
+    preserve_list_markers: bool,
+    /// `preserveBackslashEscapes` — "Preserve source backslash escapes instead of normalizing
+    /// escaped punctuation." (`markdown.ts:224`), i.e. `markdown.ts:656`'s `token.raw` branch. Off
+    /// everywhere but a user message.
+    preserve_escapes: bool,
 }
 
 /// One open list item's prefix state.

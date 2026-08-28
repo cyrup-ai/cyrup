@@ -72,6 +72,14 @@ pub struct AppState {
     /// picks the level (Pi's `SteppedSubmenu` carries this in its `selections` map,
     /// `settings-selector.ts:653`). `None` outside that two-step flow.
     pub pending_model_thinking: Option<String>,
+    /// The settings frame displaced by a submenu whose picker the RUN LOOP has to build (it needs a
+    /// session for its rows), held between the `SelectorOutcome::OpenSubmenu` that displaced it and
+    /// the `AppCommand::OpenSelector` arm that re-parents the new picker onto it. Upstream this
+    /// hand-off does not exist — `item.submenu(...)` builds the child synchronously inside
+    /// `activateItem` (`settings-list.ts:214-236`) — so it is cyrup's stand-in for the same
+    /// parent link across the command round trip. Always consumed by the arm that the same key
+    /// press dispatched; an arm that bails before opening puts it straight back in the slot.
+    pub(crate) pending_selector_parent: Option<Box<ActiveSelector>>,
     /// Whether inline images are shown (vs. a text placeholder), toggled by the show-images selector.
     pub show_images: bool,
     /// The terminal image-protocol renderer (spec/tui/06 §6; `terminal-image.ts`). Defaults to the
@@ -117,6 +125,24 @@ pub struct AppState {
     /// (from [`render`]), and deriving the budget from its `avail` argument would make those two
     /// calls disagree and the split non-idempotent.
     pub term_rows: u16,
+    /// The host TERMINAL's column count, as of the last [`App::draw`](crate::App::draw) — the twin
+    /// of [`Self::term_rows`], refreshed from the same `backend().size()` read. `80` until the first
+    /// draw — the same value `fallback_columns` (`app/render.rs`) lands on with no `$COLUMNS` set.
+    ///
+    /// Exists for ONE consumer: the `availableWidth` of
+    /// `MarkdownTransformContext` (`core/extensions/types.ts:1204`), which
+    /// `App::apply_markdown_transformers` needs at
+    /// push/commit time. Upstream never has to store it — its transform runs inside
+    /// `Markdown.render(width)` and is handed the live width (`markdown.ts:284-285`) — but cyrup's
+    /// runs off the render path, so the last drawn width is the honest answer available there.
+    ///
+    /// One number serves both surfaces because both already use it: the scrollback flush passes the
+    /// raw terminal width to `entry_lines` (`app/draw.rs`, `flush_committed`) and the live region
+    /// passes the frame width, and each subtracts `output_pad * 2` itself.
+    ///
+    /// Stale under the alternate-screen renderer for exactly as long as [`Self::term_rows`] is:
+    /// `draw_fullscreen` forks before either is published (ADR-0005 §B-14).
+    pub term_cols: u16,
     /// Whether the compact startup keybinding-hints bar is shown (Pi `compactInstructions`,
     /// interactive-mode.ts:697-703): a one-line `interrupt · clear/exit · / commands · ! bash · more`
     /// affordance bar rendered just above the editor at startup, dismissed on the first submission.
@@ -126,9 +152,26 @@ pub struct AppState {
     /// When `Some`, it replaces the editor in the live region (the selector still wins if both are set,
     /// which never happens). Cleared when the op completes.
     pub loader: Option<crate::chrome::BorderedLoader>,
-    /// The 80 ms phase index for the active [`Self::loader`] / status spinner (advanced by the run-loop
-    /// tick). Drives the loader's animated glyph without a timer thread.
+    /// The 80 ms phase index for the active [`Self::loader`] / status spinner, advanced by the
+    /// run-loop tick ([`crate::app::App::on_spinner_tick`], whose `select!` arm is armed while a
+    /// loader is mounted for exactly this reason). Drives the loader's animated glyph without a
+    /// timer thread — pi's `Loader.restartAnimation` interval, `tui/src/components/loader.ts:74-80`.
     pub loader_tick: usize,
+    /// The in-flight `/share` gist upload behind the mounted [`Self::loader`]: the waiter task to
+    /// abort and the temp HTML file to unlink when the user cancels — pi's `proc` + `tmpFile`
+    /// captured by `loader.onAbort` (`session-share.ts:156-161`).
+    ///
+    /// `None` both when no share is running and immediately after a cancel, which is what makes it
+    /// unusable as the "was this cancelled?" marker — [`Self::share_cancelled`] is that.
+    pub(crate) share_in_flight: Option<crate::app::ShareInFlight>,
+    /// Set by the cancel path, cleared when the settled [`crate::app::ShareMsg`] is consumed: pi's
+    /// `loader.signal.aborted`, which every completion path re-checks before touching the UI
+    /// (`session-share.ts:174`, `:191-199`).
+    ///
+    /// The check cannot be skipped: `gh` may well have succeeded in the window between the user's
+    /// Escape and the abort landing, in which case the waiter has already posted a real result that
+    /// must print neither a gist URL nor a `share error:` line over the top of `Share cancelled`.
+    pub(crate) share_cancelled: bool,
     /// Set when the user requested quit; the run loop observes it.
     pub should_quit: bool,
     /// Timestamp of the last `Ctrl+C` press, for the double-tap-to-exit gate (Pi `handleCtrlC`,
@@ -148,6 +191,18 @@ pub struct AppState {
     /// submenu, which is opened from a selector outcome with no session in hand. Pi's default is
     /// `true` (`settings-selector.ts:134` `(this.state.anthropicExtraUsage ?? true)`). TUI-032.
     pub warn_anthropic_extra_usage: bool,
+    /// The persisted `showCacheMissNotices` value (pi `getShowCacheMissNotices()`), cached here for
+    /// the same reason `double_escape_action` and `warn_anthropic_extra_usage` are: the sync event
+    /// fold and the replay walk both gate on it and neither has a session — let alone an
+    /// [`cyrup_config::EffectiveSettings`] — in hand. Seeded at boot and re-seeded on session swap
+    /// and on the `/settings` flip. pi's default is `false`
+    /// (`cyrup-config/src/settings/effective.rs`'s `show_cache_miss_notices`).
+    pub show_cache_miss_notices: bool,
+    /// Raised by [`App::finalize_assistant_message`] when the just-settled turn should be tested
+    /// for a prompt-cache miss, and consumed by [`App::ingest_session_event_owned`], which has the
+    /// session the (async) scan needs — the same sync-fold/async-wrapper split
+    /// [`Self::compaction_flush_pending`] uses, and for the same reason.
+    pub cache_miss_check_pending: bool,
     /// A status/receipt to show **after** the next runtime session-swap re-binds the UI (the swap
     /// resets the transcript, so a pre-swap status would be wiped). Set by the session-lifecycle
     /// command handlers (`/new`/`/resume`/`/fork`/`/reload`/`/import`); consumed by
@@ -293,6 +348,28 @@ pub struct AppState {
     /// settled `/login` or `/logout` (each of which ends in `footer.invalidate()`,
     /// `interactive-mode.ts:5449`, `:5475`). See [`App::refresh_auth_snapshot`].
     pub(super) oauth_credential_providers: std::collections::BTreeSet<String>,
+    /// Tool names the live session knows a DEFINITION for — Pi's `getToolDefinition(name)` registry
+    /// (`agent-session.ts:806`, built over the builtins plus every registered/custom tool), which
+    /// `ToolExecutionComponent.hasRendererDefinition()` reads (`tool-execution.ts:103-105`) to
+    /// choose between the two per-side fallbacks and the unbounded `formatToolExecution`.
+    ///
+    /// Cached here for the same reason [`Self::oauth_credential_providers`] is: the answer is
+    /// needed by the **sync** fold ([`App::ingest_event_rendered_owned`]), which holds no session.
+    /// It is filled at the two points that do hold one — a `ToolExecutionStart` passing through
+    /// [`App::ingest_session_event_owned`], which resolves that one name off the live registry, and
+    /// a session bind/swap, which reloads the whole set ([`App::refresh_known_tool_definitions`])
+    /// so the `/resume` replay walk can answer for calls it never saw start.
+    pub(super) known_tool_definitions: std::collections::HashSet<String>,
+    /// The `(command, argument)` pair [`App::refresh_extension_completions`] last asked an
+    /// extension command's own completer about (`getArgumentCompletions`,
+    /// `interactive-mode.ts:753` @v0.84.3). `None` whenever the cursor is not inside such an
+    /// argument.
+    ///
+    /// This is the debounce: pi re-invokes the completer on every keystroke because its call is a
+    /// local `await`, whereas cyrup's crosses into a wasm guest, so a repeat of the SAME pair —
+    /// a cursor move, a redraw, a key that edited some other line — is answered from the cache
+    /// instead.
+    pub(super) extension_completion_query: Option<(String, String)>,
 }
 
 impl AppState {
@@ -323,6 +400,7 @@ impl AppState {
             default_thinking_level: "medium".to_string(),
             default_model: None,
             pending_model_thinking: None,
+            pending_selector_parent: None,
             show_images: true,
             image_renderer: ImageRenderer::default(),
             pending_images: Vec::new(),
@@ -333,9 +411,12 @@ impl AppState {
             compaction_queue: Vec::new(),
             reserve_status_rows: false,
             term_rows: 24,
+            term_cols: 80,
             show_startup_hints: true,
             loader: None,
             loader_tick: 0,
+            share_in_flight: None,
+            share_cancelled: false,
             should_quit: false,
             last_sigint: None,
             last_escape: None,
@@ -345,6 +426,10 @@ impl AppState {
             // Pi's `?? true` default (`settings-selector.ts:134`); re-seeded from the session's
             // effective settings before the first frame.
             warn_anthropic_extra_usage: true,
+            // pi's `showCacheMissNotices` default is `false`; re-seeded from the session's
+            // effective settings before the first frame.
+            show_cache_miss_notices: false,
+            cache_miss_check_pending: false,
             pending_swap_status: None,
             #[cfg(any(test, feature = "scrollback-accumulator"))]
             scrollback: Vec::new(),
@@ -380,6 +465,8 @@ impl AppState {
             pending_login_prompt: None,
             login_cancel: None,
             oauth_credential_providers: std::collections::BTreeSet::new(),
+            known_tool_definitions: std::collections::HashSet::new(),
+            extension_completion_query: None,
         }
     }
 
@@ -472,6 +559,19 @@ pub struct ActiveSelector {
     pub(crate) saved_editor: String,
     /// Theme to restore if a previewing selector is cancelled (theme picker only).
     pub(crate) restore_theme: Option<UiTheme>,
+    /// The selector this one was opened *from*, restored into the slot when this one closes — the
+    /// port of pi's `SettingsList.submenuComponent` / `submenuItemIndex` pair
+    /// (`settings-list.ts:50-52`, `closeSubmenu` `:242-256`). Upstream a submenu is a CHILD of the
+    /// settings list, which is never torn down: `render` draws the child instead of the list
+    /// (`:96-99`), `handleInput` forwards every key to it (`:184-187`), and closing it restores the
+    /// list *with its cursor row and search query intact* — both of which live inside the retained
+    /// component here, exactly as they live inside the retained `SettingsList` upstream.
+    ///
+    /// A single boxed link rather than a `Vec`, so nesting depth is naturally unbounded (pi nests:
+    /// `ThemeSubmenu` opens its own `SelectSubmenu`, `settings-selector.ts:283-330`) and every
+    /// frame carries its own [`Self::saved_editor`] / [`Self::restore_theme`]. Only the OUTERMOST
+    /// frame (`parent: None`) restores the editor text on close.
+    pub(crate) parent: Option<Box<ActiveSelector>>,
 }
 
 /// The REQUEST/REPLY pairing an open extension-UI dialog (`SelectorKind::Extension{Confirm,Select,

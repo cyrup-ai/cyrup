@@ -27,6 +27,8 @@ impl<'t> MdRenderer<'t> {
             mermaid: MermaidContext::OFF,
             math: Vec::new(),
             strike_literal: Vec::new(),
+            preserve_list_markers: false,
+            preserve_escapes: false,
         }
     }
 
@@ -328,15 +330,26 @@ impl<'t> MdRenderer<'t> {
         }
     }
 
-    pub(super) fn event(&mut self, ev: Event<'_>, raw: &str) {
+    /// `escaped` is set only for an `Event::Text` run that the source opened with a backslash
+    /// escape, and only while [`MdRenderer::preserve_escapes`] is on — see the call site in
+    /// `render_inner`, which is where the backslash is recovered from.
+    pub(super) fn event(&mut self, ev: Event<'_>, raw: &str, escaped: bool) {
         match ev {
             Event::Start(tag) => self.start(tag, raw),
             Event::End(tag) => self.end(tag),
             Event::Text(t) => {
                 if self.code_lang.is_some() {
+                    // Inside a fence the backslash was never an escape — pulldown-cmark hands the
+                    // fence body over verbatim — so there is nothing to put back.
                     self.code_buf.push_str(&t);
                 } else {
                     let style = self.inline_style();
+                    if escaped {
+                        // `preserveBackslashEscapes ? token.raw : token.text` (`markdown.ts:656`):
+                        // exactly one backslash per escape, and pulldown-cmark starts a fresh text
+                        // run at every escaped character, so one per run is the whole of `raw`.
+                        self.push_text("\\", style);
+                    }
                     self.emit_with_math(&t, style);
                 }
             }
@@ -411,13 +424,30 @@ impl<'t> MdRenderer<'t> {
                 self.lists.push(start);
             }
             Tag::Item => {
+                // `preserveOrderedListMarkers` (`markdown.ts:765-771`) replaces BOTH synthesized
+                // bullets with the item's own source marker, `??`-falling back to the synthesized
+                // one when the pattern does not match — which is what marked's `item.raw` is for
+                // there. `Start(Item)`'s offset range is that same slice: it opens AT the marker,
+                // with any enclosing blockquote's `> ` and any nesting indent already outside it
+                // (unlike `Start(Table)`'s raw, which is why that one needs
+                // [`strip_quote_markers`]), so pi's two patterns apply to it unchanged.
+                let preserve = self.preserve_list_markers;
                 let marker = match self.lists.last_mut() {
                     Some(Some(n)) => {
                         let s = format!("{n}. ");
+                        // The counter advances on BOTH paths: a preserved `1)` must not stop the
+                        // next item — which may fall back — from being numbered as if it had
+                        // counted (upstream numbers off `startNumber + i`, `markdown.ts:766`).
                         *n = n.saturating_add(1);
-                        s
+                        match preserve.then(|| source_ordered_marker(raw)).flatten() {
+                            Some(literal) => literal,
+                            None => s,
+                        }
                     }
-                    _ => "- ".to_string(),
+                    _ => match preserve.then(|| source_unordered_marker(raw)).flatten() {
+                        Some(literal) => literal,
+                        None => "- ".to_string(),
+                    },
                 };
                 // A fresh `renderedAnyLine = false` per item (`markdown.ts:777`).
                 self.items.push(ItemFrame::default());
@@ -725,5 +755,58 @@ impl<'t> MdRenderer<'t> {
             self.out.pop();
         }
         self.out
+    }
+}
+
+/// The `(?: {0,3})` prefix both source-marker patterns open with (`markdown.ts:744`, `:749`):
+/// CommonMark's up-to-three-space indent, no more. A fourth space is indented content, and the
+/// pattern is anchored, so it simply does not match — which is the `??` fallback's cue.
+fn strip_indent(raw: &str) -> &str {
+    let mut s = raw;
+    for _ in 0..3 {
+        match s.strip_prefix(' ') {
+            Some(rest) => s = rest,
+            None => break,
+        }
+    }
+    s
+}
+
+/// `getOrderedListMarker` (`markdown.ts:743-746`): `/^(?: {0,3})(\d{1,9}[.)])[ \t]+/`, returning
+/// `` `${match[1]} ` `` — the source digits and their `.`/`)` delimiter, plus exactly one space.
+///
+/// Hand-ported rather than pulling in `regex`, and byte-wise via `strip_prefix` so no `str` index
+/// or slice is taken (`deny(clippy::string_slice)`, `deny(clippy::indexing_slicing)`).
+fn source_ordered_marker(raw: &str) -> Option<String> {
+    let s = strip_indent(raw);
+    // `\d{1,9}` — a tenth digit leaves a digit where `[.)]` must be, so the whole pattern fails.
+    let digits: String = s.bytes().take(9).take_while(u8::is_ascii_digit).map(char::from).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = s.strip_prefix(digits.as_str())?;
+    let (delim, rest) = match rest.strip_prefix('.') {
+        Some(rest) => ('.', rest),
+        None => (')', rest.strip_prefix(')')?),
+    };
+    // `[ \t]+` — at least one.
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    Some(format!("{digits}{delim} "))
+}
+
+/// `getUnorderedListMarker` (`markdown.ts:748-751`):
+/// `/^(?: {0,3})([-+*])(?:[ \t]+|(?=\r?\n|$))/`, returning `` `${match[1]} ` `` — the source
+/// `-`/`+`/`*`, plus exactly one space. The lookahead leg is the empty item (`-` alone on its
+/// line), which carries no space to consume.
+fn source_unordered_marker(raw: &str) -> Option<String> {
+    let s = strip_indent(raw);
+    let (bullet, rest) = ['-', '+', '*'].into_iter().find_map(|b| Some((b, s.strip_prefix(b)?)))?;
+    let ends_line = rest.is_empty() || rest.starts_with('\n') || rest.starts_with("\r\n");
+    if rest.starts_with([' ', '\t']) || ends_line {
+        Some(format!("{bullet} "))
+    } else {
+        None
     }
 }

@@ -201,7 +201,21 @@ impl<B: Backend> App<B> {
                 // A summarized branch navigation records a branch-summary message
                 // (`branch-summary-message.ts`) into the transcript.
                 if let Some(entry) = o.summary_entry {
+                    // Taken before `entry.summary` moves below.
+                    let usage = entry.usage.clone();
                     self.state.transcript.push_branch_summary(entry.summary);
+                    // pi synthesises the `compaction_cost` notice for a `branch_summary` entry
+                    // that carries `usage` (`interactive-mode.ts:3788-3794`); on the live
+                    // navigation path the entry is in hand right here, so no re-derivation from
+                    // the session is needed.
+                    if self.state.show_cache_miss_notices
+                        && let Some(u) = usage.as_ref()
+                    {
+                        self.state.transcript.push_compaction_cost_notice(
+                            crate::transcript::CompactionCostKind::BranchSummary,
+                            u,
+                        );
+                    }
                 }
                 self.state.transcript.push_status("navigated session tree");
             }

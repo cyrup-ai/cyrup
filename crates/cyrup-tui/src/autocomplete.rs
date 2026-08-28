@@ -5,9 +5,11 @@
 //!
 //! 1. **Slash command** (`autocomplete.ts:313-363` @v0.84.3): the line begins with `/`, split on the
 //!    first space. No space → the fuzzy-filtered command NAME list (via [`crate::fuzzy`] + the
-//!    [`CommandRegistry`]); space → the ARGUMENT list of whichever builtin completer the named
-//!    command owns ([`crate::commands::ArgumentCompleter`]), ranked over the live
-//!    [`ArgumentSources`] the app pushes in.
+//!    [`CommandRegistry`]); space → the ARGUMENT list of whichever completer the named command owns
+//!    ([`crate::commands::ArgumentCompleter`]), ranked over the live [`ArgumentSources`] the app
+//!    pushes in — including an extension command's own completer, whose answers the app fetches
+//!    from the guest and pushes in the same way (see
+//!    [`crate::commands::ArgumentCompleter::Extension`]).
 //! 2. **Bare path** (`extractPathPrefix`, `:480-507`; `getFileSuggestions`, `:560-693`): the trailing
 //!    token looks path-like (contains `/`, or starts with `.`/`~/`) or `Tab` is forced → a single
 //!    `read_dir` scan, directories-first.
@@ -20,14 +22,15 @@
 //! Completion never executes a command — it only edits the buffer text (spec/tui/04 §1). Execution
 //! happens on submit via [`CommandRegistry::dispatch`].
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::commands::{ArgumentCompleter, CommandRegistry};
 use crate::fuzzy;
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
 
-/// The live data pi's three builtin argument completers close over
-/// (`interactive-mode.ts:685-736` @v0.84.3).
+/// The live data pi's argument completers close over — the three builtin closures
+/// (`interactive-mode.ts:685-736` @v0.84.3) plus each extension command's own callback (`:753`).
 ///
 /// Pushed in by the app ([`crate::App::refresh_argument_sources`]) rather than reached for globally:
 /// [`Autocomplete::compute`] is synchronous and holds no session. [`Default`] (all empty) until the
@@ -40,9 +43,33 @@ pub struct ArgumentSources {
     /// `/login` candidates, already merged per provider (`getLoginProviderCompletionOptions`,
     /// `interactive-mode.ts:299-318` @v0.84.3).
     pub login_providers: Vec<LoginProviderArgument>,
-    /// `/thinking` candidates (`interactive-mode.ts:713-725` @v0.84.3). Fed, but unreachable until
-    /// a `/thinking` command exists — see [`ArgumentCompleter::ThinkingLevels`].
+    /// `/thinking` candidates (`interactive-mode.ts:713-725` @v0.84.3) — the current model's
+    /// reasoning ladder, ranked for the `/thinking` builtin (`commands.rs:130`).
     pub thinking_levels: Vec<String>,
+    /// The most recent answer each EXTENSION command's own completer gave
+    /// (`getArgumentCompletions`, `interactive-mode.ts:753` @v0.84.3), keyed by the command's
+    /// INVOCATION name — the name that appears on the line and in the registry.
+    ///
+    /// Unlike the three fields above this is not a periodic snapshot: it is refreshed per keystroke
+    /// against the argument the user has actually typed, by
+    /// [`crate::App::refresh_extension_completions`]. See [`ArgumentCompleter::Extension`] for why
+    /// the guest call lives there and not in [`Autocomplete::compute`].
+    pub extension_completions: HashMap<String, ExtensionCompletions>,
+}
+
+/// One extension command's completions plus the argument prefix they were fetched for.
+///
+/// The prefix is kept because pi does NOT re-filter what the completer returns — the callback is
+/// handed `argumentText` and its answer is used verbatim (`autocomplete.ts:355-363` @v0.84.3). That
+/// is only faithful while the cached answer belongs to the prefix on screen; between the keystroke
+/// and the fetch it does not, so a stale set is narrowed locally instead of shown unfiltered. See
+/// [`extension_rows`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ExtensionCompletions {
+    /// The argument text the guest was asked about.
+    pub prefix: String,
+    /// What it answered, in its own order (pi preserves the completer's order).
+    pub items: Vec<String>,
 }
 
 /// One `/model` candidate (`interactive-mode.ts:694-709` @v0.84.3): the popup shows `id` with
@@ -218,8 +245,8 @@ fn slash_context(
         return None;
     }
     if before.contains(' ') {
-        let (completer, argument) = argument_completer(registry, before)?;
-        return argument_context(arguments, completer, argument);
+        let (completer, name, argument) = argument_completer(registry, before)?;
+        return argument_context(arguments, completer, name, argument);
     }
     command_name_context(registry, before)
 }
@@ -229,27 +256,36 @@ fn slash_context(
 /// "no `getArgumentCompletions`" refusal (`:351-353`) as one resolution step — also the terminal-arm
 /// predicate in [`Autocomplete::compute`]. `str::get`, never a slice expression
 /// (`deny(clippy::string_slice)`).
-fn argument_completer<'a>(
+///
+/// The command NAME rides back out alongside the completer because
+/// [`ArgumentCompleter::Extension`] is one tag shared by every registered extension command — the
+/// name is how its own completer is identified, standing in for the per-command closure pi binds
+/// (`interactive-mode.ts:753` @v0.84.3).
+pub(crate) fn argument_completer<'a>(
     registry: &CommandRegistry,
     before: &'a str,
-) -> Option<(ArgumentCompleter, &'a str)> {
+) -> Option<(ArgumentCompleter, &'a str, &'a str)> {
     let rest = before.strip_prefix('/')?;
     let space = rest.find(' ')?;
     let name = rest.get(..space)?;
     let argument = rest.get(space + 1..)?;
     let completer = registry.get(name)?.arg_completion;
-    (completer != ArgumentCompleter::None).then_some((completer, argument))
+    (completer != ArgumentCompleter::None).then_some((completer, name, argument))
 }
 
-/// Build one of the three builtin argument popups (`interactive-mode.ts:685-736` @v0.84.3).
+/// Build an argument popup: one of the three builtin completers (`interactive-mode.ts:685-736`
+/// @v0.84.3) or an extension command's own (`:753`).
 ///
-/// Every branch is `createFuzzyAutocompleteItems` (`:288-297`): fuzzy-filter the candidates by their
-/// per-completer search text and return `None` — upstream's `null` — for an empty result. The layout
-/// is [`ColumnLayout::DEFAULT`], **not** `SLASH`: pi picks the slash layout only when the PREFIX
-/// starts with `/` (`components/editor.ts:2148` @v0.84.3), and an argument prefix never does.
+/// Each builtin branch is `createFuzzyAutocompleteItems` (`:288-297`): fuzzy-filter the candidates
+/// by their per-completer search text and return `None` — upstream's `null` — for an empty result.
+/// The extension branch does not filter what the completer already narrowed; see
+/// [`extension_rows`]. The layout is [`ColumnLayout::DEFAULT`], **not** `SLASH`: pi picks the slash
+/// layout only when the PREFIX starts with `/` (`components/editor.ts:2148` @v0.84.3), and an
+/// argument prefix never does.
 fn argument_context(
     arguments: &ArgumentSources,
     completer: ArgumentCompleter,
+    name: &str,
     argument: &str,
 ) -> Option<Autocomplete> {
     let (items, completions) = match completer {
@@ -261,6 +297,9 @@ fn argument_context(
             login_provider_rows(&arguments.login_providers, argument)?
         }
         ArgumentCompleter::ThinkingLevels => thinking_rows(&arguments.thinking_levels, argument)?,
+        ArgumentCompleter::Extension => {
+            extension_rows(arguments.extension_completions.get(name), argument)?
+        }
     };
     let list = SelectList::new(items, ColumnLayout::DEFAULT).with_no_match("No matches");
     Some(Autocomplete {
@@ -353,9 +392,50 @@ fn login_provider_rows(
     Some((items, completions))
 }
 
+/// An extension command's own rows (`getArgumentCompletions`, `interactive-mode.ts:753` @v0.84.3):
+/// the guest answers a `list<string>` (`cyrup-ext/wit/world.wit:250`), so each string is its own
+/// label and inserted value, and there is no description column.
+///
+/// `None` — upstream's `null` — for a command with nothing cached yet and for an empty answer
+/// (`autocomplete.ts:356-357`), which closes the popup rather than falling through to a path
+/// listing (`Autocomplete::compute`'s terminal arm).
+///
+/// Ranking: when the cached answer was fetched for exactly the argument on screen it is used
+/// VERBATIM, because that is what pi does with a completer's return value — filtering a
+/// server-side-narrowed list again would drop rows the completer deliberately offered. Between a
+/// keystroke and the fetch that follows it the cache belongs to the previous prefix, and there the
+/// stale set is narrowed with [`fuzzy::filter`]: the alternative is showing rows that no longer
+/// match what is typed for one frame.
+fn extension_rows(
+    cached: Option<&ExtensionCompletions>,
+    argument: &str,
+) -> Option<(Vec<SelectItem>, Vec<Completion>)> {
+    let cached = cached?;
+    if cached.items.is_empty() {
+        return None;
+    }
+    let selected: Vec<&String> = if cached.prefix == argument {
+        cached.items.iter().collect()
+    } else {
+        fuzzy::filter(&cached.items, argument, String::as_str)
+            .iter()
+            .filter_map(|m| cached.items.get(m.index))
+            .collect()
+    };
+    if selected.is_empty() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(selected.len());
+    let mut completions = Vec::with_capacity(selected.len());
+    for value in selected {
+        items.push(SelectItem::label(value.clone()));
+        completions.push(Completion { value: value.clone(), is_dir: false });
+    }
+    Some((items, completions))
+}
+
 /// `/thinking` rows (`interactive-mode.ts:713-725` @v0.84.3): the level string is its own search
-/// text, label and value. Inert until cyrup grows a `/thinking` command — see
-/// [`ArgumentCompleter::ThinkingLevels`].
+/// text, label and value.
 fn thinking_rows(
     levels: &[String],
     argument: &str,

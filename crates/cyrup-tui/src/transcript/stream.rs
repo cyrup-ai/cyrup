@@ -49,8 +49,12 @@ impl TranscriptView {
     }
 
     /// Append a chunk of assistant text to the in-flight streaming buffer (R-10-028 streaming).
+    ///
+    /// Drops the transformed `streaming_display` twin: it was computed from a strictly shorter
+    /// buffer, so the next frame draws the raw text until the transformer pass catches up.
     pub fn push_assistant_delta(&mut self, delta: &str) {
         self.bump_render_generation();
+        self.streaming_display = None;
         match &mut self.streaming {
             Some(buf) => buf.push_str(delta),
             None => self.streaming = Some(delta.to_string()),
@@ -69,6 +73,10 @@ impl TranscriptView {
         self.bump_render_generation();
         let final_text = text.or_else(|| self.streaming.take());
         self.streaming = None;
+        // The live partial is gone; whatever the transformers made of it dies with it. The
+        // COMMITTED entry is transformed separately, as a committed entry
+        // (`is_streaming = false`, `assistant-message.ts:111`).
+        self.streaming_display = None;
         if let Some(t) = final_text
             && !t.trim().is_empty()
         {
@@ -83,14 +91,20 @@ impl TranscriptView {
         self.bump_render_generation();
         self.streaming = None;
         self.thinking = None;
+        self.streaming_display = None;
+        self.thinking_display = None;
     }
 
     /// Append a streamed chunk of assistant **reasoning** to the in-flight thinking buffer
     /// (`StreamEvent::ThinkingDelta`, provider `stream.rs:413`). Pi renders the thinking blocks of a
     /// turn as their own section (`assistant-message.ts:115-166`), so the buffer is kept apart from
     /// the answer text.
+    ///
+    /// Drops the transformed `thinking_display` twin, for the reason
+    /// [`Self::push_assistant_delta`] drops its own.
     pub fn push_thinking_delta(&mut self, delta: &str) {
         self.bump_render_generation();
+        self.thinking_display = None;
         match &mut self.thinking {
             Some(buf) => buf.push_str(delta),
             None => self.thinking = Some(delta.to_string()),
@@ -112,6 +126,9 @@ impl TranscriptView {
         self.bump_render_generation();
         let final_text = text.or_else(|| self.thinking.take());
         self.thinking = None;
+        // As in [`Self::commit_assistant`]: the live reasoning partial's transformed form dies with
+        // the partial, and the committed entry is transformed on its own terms.
+        self.thinking_display = None;
         if let Some(t) = final_text
             && !t.trim().is_empty()
         {

@@ -54,7 +54,8 @@ impl<B: Backend> App<B> {
             | C::SetThinking(_)
             | C::Share
             | C::ShowName
-            | C::ThinkingCommand(_) => self.execute_misc_command(cmd, session).await,
+            | C::ThinkingCommand(_)
+            | C::CopyEntry(_) => self.execute_misc_command(cmd, session).await,
         }
     }
 
@@ -265,55 +266,34 @@ impl<B: Backend> App<B> {
                 self.execute_open_session_selector(session).await
             }
             C::OpenSelector(SelectorKind::ModelThinking) => {
-                // GAP 3 step 1 rows: every model, each described by its CURRENT override (blank
-                // when unset), sorted current-model → persisted-default → provider, which is Pi's
-                // comparator (`settings-selector.ts:587-597`).
-                let eff = session.services().settings.effective();
-                let overrides = eff.all_model_thinking_levels();
-                let default_key = match (eff.default_provider(), eff.default_model()) {
-                    (Some(p), Some(m)) => Some(format!("{p}/{m}")),
-                    _ => None,
-                };
-                let current_key = session
-                    .model()
-                    .map(|c| format!("{}/{}", c.provider.as_str(), c.model.as_str()));
-                let mut entries: Vec<(String, String, Option<String>)> = session
-                    .available_model_catalog()
-                    .iter()
-                    .map(|m| {
-                        let key = format!("{}/{}", m.provider, m.id);
-                        // `label: modelItemLabel(model)` = `` `${id} [${provider}]` ``
-                        // (`settings-selector.ts:190-192`); `description: override ?? undefined`.
-                        let label = format!("{} [{}]", m.id, m.provider);
-                        let desc = overrides
-                            .get(&key)
-                            .map(|l| crate::app::thinking_level_str(*l).to_string());
-                        (key, label, desc)
-                    })
-                    .collect();
-                entries.sort_by(|a, b| {
-                    let rank = |k: &String| {
-                        if current_key.as_ref() == Some(k) {
-                            0
-                        } else if default_key.as_ref() == Some(k) {
-                            1
-                        } else {
-                            2
-                        }
-                    };
-                    rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0))
-                });
+                // The settings list this submenu was opened from (`OpenSubmenu("model-thinking")`,
+                // selectors.rs), which becomes the picker's parent so closing it pops back to
+                // `/settings` instead of to the prompt.
+                let parent = self.state.pending_selector_parent.take();
+                let entries = model_thinking_rows(session);
                 if entries.is_empty() {
                     self.state.transcript.push_status("no models available");
+                    // Nothing to open, so hand the settings list straight back to the slot rather
+                    // than dropping the user (and their unsaved editor text) at the prompt.
+                    if let Some(parent) = parent {
+                        self.state.selector = Some(*parent);
+                    }
                     return;
                 }
-                self.open_data_selector(SelectorKind::ModelThinking, entries, 0);
+                self.open_data_child_selector(SelectorKind::ModelThinking, entries, 0, parent);
             }
 
             C::OpenSelector(SelectorKind::ModelThinkingLevel) => {
                 // GAP 3 step 2 rows: the level ladder, plus a `(clear override)` row that exists
                 // ONLY when this model already has one (`settings-selector.ts:634-640`).
+                // The parent here is the step-1 model list (itself parented to `/settings`), so one
+                // Esc goes back a step and a second leaves the submenu — pi's `SteppedSubmenu`
+                // Escape ladder (`settings-submenu.ts:234-241`).
+                let parent = self.state.pending_selector_parent.take();
                 let Some(model_key) = self.state.pending_model_thinking.clone() else {
+                    if let Some(parent) = parent {
+                        self.state.selector = Some(*parent);
+                    }
                     return;
                 };
                 let eff = session.services().settings.effective();
@@ -348,7 +328,12 @@ impl<B: Backend> App<B> {
                         rows.iter().position(|(v, _, _)| v == s)
                     })
                     .unwrap_or(0);
-                self.open_data_selector(SelectorKind::ModelThinkingLevel, rows, selected);
+                self.open_data_child_selector(
+                    SelectorKind::ModelThinkingLevel,
+                    rows,
+                    selected,
+                    parent,
+                );
             }
 
             C::OpenSelector(other) => {
@@ -607,4 +592,51 @@ impl<B: Backend> App<B> {
             }
         }
     }
+}
+
+/// GAP 3 step 1 rows: every model, each described by its CURRENT override (blank when unset),
+/// sorted current-model → persisted-default → provider, which is Pi's comparator
+/// (`settings-selector.ts:587-597`).
+///
+/// Extracted from the `OpenSelector(ModelThinking)` arm so the level step can REBUILD the model
+/// list after applying an override: pi's `SteppedSubmenu` is constructed `{ loop: true }`, so
+/// completing the last step resets the context and rebuilds step 0 (`settings-submenu.ts:226-231`)
+/// — with the just-changed override now showing in that model's description.
+pub(crate) fn model_thinking_rows(
+    session: &Arc<AgentSession>,
+) -> Vec<(String, String, Option<String>)> {
+    let eff = session.services().settings.effective();
+    let overrides = eff.all_model_thinking_levels();
+    let default_key = match (eff.default_provider(), eff.default_model()) {
+        (Some(p), Some(m)) => Some(format!("{p}/{m}")),
+        _ => None,
+    };
+    let current_key =
+        session.model().map(|c| format!("{}/{}", c.provider.as_str(), c.model.as_str()));
+    let mut entries: Vec<(String, String, Option<String>)> = session
+        .available_model_catalog()
+        .iter()
+        .map(|m| {
+            let key = format!("{}/{}", m.provider, m.id);
+            // `label: modelItemLabel(model)` = `` `${id} [${provider}]` ``
+            // (`settings-selector.ts:190-192`); `description: override ?? undefined`.
+            let label = format!("{} [{}]", m.id, m.provider);
+            let desc =
+                overrides.get(&key).map(|l| crate::app::thinking_level_str(*l).to_string());
+            (key, label, desc)
+        })
+        .collect();
+    entries.sort_by(|a, b| {
+        let rank = |k: &String| {
+            if current_key.as_ref() == Some(k) {
+                0
+            } else if default_key.as_ref() == Some(k) {
+                1
+            } else {
+                2
+            }
+        };
+        rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0))
+    });
+    entries
 }

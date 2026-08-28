@@ -1,7 +1,7 @@
 use super::*;
 
-/// `read` — header `read <path>:<range>` + (only when expanded/error) the file body (`read.ts:74-201`).
-pub(super) fn render_read(
+/// `read`'s `renderCall` — the header `read <path>:<range>` (`read.ts:329-345`).
+pub(super) fn render_read_call(
     run: &ToolRun,
     expanded: bool,
     theme: &UiTheme,
@@ -25,6 +25,17 @@ pub(super) fn render_read(
             out.push(Line::from(spans));
         }
     }
+}
+
+/// `read`'s `renderResult` — the file body, shown only when expanded or on error
+/// (`formatReadResult`, `read.ts:173-201`).
+pub(super) fn render_read_result(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    opts: ImageOpts<'_>,
+    out: &mut Vec<Line<'static>>,
+) {
     // `formatReadResult`: nothing below the header when collapsed & not an error (read.ts:173-175).
     let Some(result) = &run.result else { return };
     if !expanded && !run.is_error {
@@ -59,8 +70,9 @@ pub(super) fn render_read(
     push_read_truncation(result, theme, out);
 }
 
-/// `write` — header `write <path>` + a content preview from the call args (`write.ts:131-179`).
-pub(super) fn render_write(
+/// `write`'s `renderCall` — the header `write <path>` + the content preview, which is built from the
+/// call ARGUMENTS and so belongs to the call side upstream too (`formatWriteCall`, `write.ts:131-163`).
+pub(super) fn render_write_call(
     run: &ToolRun,
     expanded: bool,
     theme: &UiTheme,
@@ -109,7 +121,10 @@ pub(super) fn render_write(
             }
         }
     }
-    // `formatWriteResult` shows output only on error (write.ts:164-179).
+}
+
+/// `write`'s `renderResult` — output only on error (`formatWriteResult`, `write.ts:164-179`).
+pub(super) fn render_write_result(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     if run.is_error && let Some(result) = &run.result {
         push_error_body(result, theme, out);
     }
@@ -165,7 +180,11 @@ pub(super) fn edit_header_preview(run: &ToolRun) -> crate::theme::EditHeaderPrev
     }
 }
 
-pub(super) fn render_edit(
+/// `edit`'s `renderCall` — the header AND the diff. The diff really is the call component's
+/// upstream: `buildEditCallComponent` draws `callComponent.preview` (`edit.ts:244-262`), which
+/// `renderResult` has already overwritten with `details.diff` by the time it runs (`:196-204`), so
+/// `formatEditResult` finds the two equal and emits nothing (`:220-223`). See the module note above.
+pub(super) fn render_edit_call(
     run: &ToolRun,
     theme: &UiTheme,
     opts: ImageOpts<'_>,
@@ -202,10 +221,20 @@ pub(super) fn render_edit(
             out.push(Line::styled(l.to_string(), theme.error_style()));
         }
     }
+}
 
+/// `edit`'s `renderResult` — only the error text the preview did not already say
+/// (`formatEditResult`, `edit.ts:212-218`). The preview error is recomputed here rather than
+/// threaded from [`render_edit_call`] so each side reads the same slot independently, exactly as
+/// upstream's two components do.
+pub(super) fn render_edit_result(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     if run.is_error
         && let Some(result) = &run.result
     {
+        let preview_error = match &run.preview {
+            Some(Err(e)) if !e.trim().is_empty() => Some(e.as_str()),
+            _ => None,
+        };
         // `if (!errorText || errorText === previewError) return undefined` (edit.ts:215-217).
         if preview_error.is_some_and(|e| result_text(result).trim() == e.trim()) {
             return;
@@ -214,13 +243,11 @@ pub(super) fn render_edit(
     }
 }
 
-/// `bash`/`powershell` — header `<prompt> <command> (timeout Ns)` + the output tail (collapsed =
-/// last 5 visual lines) + truncation notices + a `Took {d}s` footer (`bash.ts:201-289/430-464`).
-pub(super) fn render_bash(
+/// `bash`/`powershell`'s `renderCall` — the header `<prompt> <command> (timeout Ns)`
+/// (`formatShellCall`, `bash.ts:238-244`).
+pub(super) fn render_bash_call(
     run: &ToolRun,
-    expanded: bool,
     theme: &UiTheme,
-    expand_key: &str,
     prompt: &str,
     out: &mut Vec<Line<'static>>,
 ) {
@@ -246,7 +273,17 @@ pub(super) fn render_bash(
         spans.push(Span::styled(format!(" (timeout {}s)", js_number(t)), theme.muted_style()));
     }
     out.push(Line::from(spans));
+}
 
+/// `bash`/`powershell`'s `renderResult` — the output tail (collapsed = last 5 visual lines) +
+/// truncation notices + the `Took`/`Elapsed {d}s` footer (`bash.ts:249-317/430-479`).
+pub(super) fn render_bash_result(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
     if let Some(result) = &run.result {
         let raw = result_text(result);
         let output = strip_bash_footer(raw.trim(), result, run.done);
@@ -312,15 +349,9 @@ pub(super) fn render_bash(
     }
 }
 
-/// `grep` — header `grep /<pattern>/ in <path> (glob) limit N` + matching lines (head-15) + a
-/// `[Truncated: …]` notice (`grep.ts:68-121/370-379`).
-pub(super) fn render_grep(
-    run: &ToolRun,
-    expanded: bool,
-    theme: &UiTheme,
-    expand_key: &str,
-    out: &mut Vec<Line<'static>>,
-) {
+/// `grep`'s `renderCall` — the header `grep /<pattern>/ in <path> (glob) limit N`
+/// (`formatGrepCall`, `grep.ts:68-121`).
+pub(super) fn render_grep_call(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     let title = theme.tool_title_style();
     let outp = theme.tool_output_style();
     let mut spans = vec![Span::styled("grep ".to_string(), title)];
@@ -344,19 +375,24 @@ pub(super) fn render_grep(
         spans.push(Span::styled(format!(" limit {}", js_number(limit)), outp));
     }
     out.push(Line::from(spans));
-    push_list_output(run, expanded, 15, theme, expand_key, out);
-    push_grep_warnings(run.result.as_ref(), theme, out);
 }
 
-/// `find` — header `find <pattern> in <path> (limit N)` + matching paths (head-20) + a `[Truncated: …]`
-/// notice (`find.ts:59-107/359-368`).
-pub(super) fn render_find(
+/// `grep`'s `renderResult` — matching lines (head-15) + a `[Truncated: …]` notice
+/// (`grep.ts:370-379`).
+pub(super) fn render_grep_result(
     run: &ToolRun,
     expanded: bool,
     theme: &UiTheme,
     expand_key: &str,
     out: &mut Vec<Line<'static>>,
 ) {
+    push_list_output(run, expanded, 15, theme, expand_key, out);
+    push_grep_warnings(run.result.as_ref(), theme, out);
+}
+
+/// `find`'s `renderCall` — the header `find <pattern> in <path> (limit N)` (`formatFindCall`,
+/// `find.ts:59-107`).
+pub(super) fn render_find_call(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     let title = theme.tool_title_style();
     let outp = theme.tool_output_style();
     let mut spans = vec![Span::styled("find ".to_string(), title)];
@@ -374,15 +410,24 @@ pub(super) fn render_find(
         spans.push(Span::styled(format!(" (limit {})", js_number(limit)), outp));
     }
     out.push(Line::from(spans));
+}
+
+/// `find`'s `renderResult` — matching paths (head-20) + a `[Truncated: …]` notice
+/// (`find.ts:359-368`).
+pub(super) fn render_find_result(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
     push_list_output(run, expanded, 20, theme, expand_key, out);
     push_find_warnings(run.result.as_ref(), theme, out);
 }
 
-/// `ls` — header `ls <path> (limit N)` + entries (head-20) + a `[Truncated: …]` notice
-/// (`ls.ts:52-93/210-219`).
-pub(super) fn render_ls(
+/// `ls`'s `renderCall` — the header `ls <path> (limit N)` (`formatLsCall`, `ls.ts:52-93`).
+pub(super) fn render_ls_call(
     run: &ToolRun,
-    expanded: bool,
     theme: &UiTheme,
     opts: ImageOpts<'_>,
     out: &mut Vec<Line<'static>>,
@@ -395,31 +440,125 @@ pub(super) fn render_ls(
         spans.push(Span::styled(format!(" (limit {})", js_number(limit)), theme.tool_output_style()));
     }
     out.push(Line::from(spans));
-    push_list_output(run, expanded, 20, theme, opts.expand_key, out);
+}
+
+/// `ls`'s `renderResult` — entries (head-20) + a `[Truncated: …]` notice (`ls.ts:210-219`).
+pub(super) fn render_ls_result(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
+    push_list_output(run, expanded, 20, theme, expand_key, out);
     push_ls_warnings(run.result.as_ref(), theme, out);
 }
 
-/// Draw a tool whose renderer an extension supplied (EXT-006). The extension's `renderCall` text
-/// is the header; its `renderResult` text is the body, shown once the run finishes (collapsed runs
-/// keep the header only, matching every built-in's collapsed form). A half-supplied renderer
-/// degrades gracefully: a missing call text falls back to the tool NAME header, a missing result
-/// text simply omits the body.
-pub(super) fn render_extension(run: &ToolRun, expanded: bool, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
-    match &run.rendered_call {
-        Some(call) => {
-            for l in call.split('\n') {
-                out.push(Line::styled(
-                    normalize_terminal_output(l).into_owned(),
-                    theme.tool_title_style(),
-                ));
-            }
-        }
-        None => out.push(Line::styled(run.name.clone(), theme.tool_title_style())),
+/// Which built-in owns a tool name — cyrup's `builtInToolDefinition` lookup, i.e. Pi's
+/// `createAllToolDefinitions()[toolName]` (`tool-execution.ts`, the field the two
+/// `get*Renderer()` merges and `hasRendererDefinition()` all read).
+///
+/// Asked ONCE per block by [`tool_lines`](super::tool_render::tool_lines) so the call side and the
+/// result side consult the same answer, which is what lets an extension override one side of a
+/// BUILT-IN tool and still get the built-in's other side — upstream's
+/// `this.toolDefinition.renderCall ?? this.builtInToolDefinition.renderCall`, resolved
+/// independently per renderer (`tool-execution.ts:84-101`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Builtin {
+    Read,
+    Write,
+    Edit,
+    /// `bash` and `powershell` share one pair of renderers, differing only in the shell prompt the
+    /// header is drawn with (`config.prompt`, `bash.ts:488`).
+    Shell(&'static str),
+    Grep,
+    Find,
+    Ls,
+}
+
+/// The built-in definition table (see [`Builtin`]). `None` = the name is not a built-in, so
+/// whether anything at all is known about it is [`ToolRun::has_definition`]'s question.
+pub(super) fn builtin_kind(name: &str) -> Option<Builtin> {
+    match name {
+        "read" => Some(Builtin::Read),
+        "write" => Some(Builtin::Write),
+        "edit" => Some(Builtin::Edit),
+        "bash" => Some(Builtin::Shell("$")),
+        "powershell" => Some(Builtin::Shell("PS>")),
+        "grep" => Some(Builtin::Grep),
+        "find" => Some(Builtin::Find),
+        "ls" => Some(Builtin::Ls),
+        _ => None,
     }
-    if let Some(result) = &run.rendered_result
-        && (run.done || expanded)
-        && !result.trim().is_empty()
-    {
+}
+
+/// The built-in's `renderCall` half (Pi `getCallRenderer()`, `tool-execution.ts:84-92`).
+pub(super) fn render_builtin_call(
+    kind: Builtin,
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    opts: ImageOpts<'_>,
+    out: &mut Vec<Line<'static>>,
+) {
+    match kind {
+        Builtin::Read => render_read_call(run, expanded, theme, opts, out),
+        Builtin::Write => render_write_call(run, expanded, theme, opts, out),
+        Builtin::Edit => render_edit_call(run, theme, opts, out),
+        Builtin::Shell(prompt) => render_bash_call(run, theme, prompt, out),
+        Builtin::Grep => render_grep_call(run, theme, out),
+        Builtin::Find => render_find_call(run, theme, out),
+        Builtin::Ls => render_ls_call(run, theme, opts, out),
+    }
+}
+
+/// The built-in's `renderResult` half (Pi `getResultRenderer()`, `tool-execution.ts:94-101`).
+pub(super) fn render_builtin_result(
+    kind: Builtin,
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    opts: ImageOpts<'_>,
+    out: &mut Vec<Line<'static>>,
+) {
+    match kind {
+        Builtin::Read => render_read_result(run, expanded, theme, opts, out),
+        Builtin::Write => render_write_result(run, theme, out),
+        Builtin::Edit => render_edit_result(run, theme, out),
+        Builtin::Shell(_) => render_bash_result(run, expanded, theme, opts.expand_key, out),
+        Builtin::Grep => render_grep_result(run, expanded, theme, opts.expand_key, out),
+        Builtin::Find => render_find_result(run, expanded, theme, opts.expand_key, out),
+        Builtin::Ls => render_ls_result(run, expanded, theme, opts.expand_key, out),
+    }
+}
+
+/// The CALL text an extension's registered renderer produced, as the block's header (EXT-006; Pi
+/// `ToolDefinition.renderCall`, preferred over the built-in's at `tool-execution.ts:84-92`).
+pub(super) fn render_extension_call(call: &str, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    for l in call.split('\n') {
+        out.push(Line::styled(
+            normalize_terminal_output(l).into_owned(),
+            theme.tool_title_style(),
+        ));
+    }
+}
+
+/// The RESULT text an extension's registered renderer produced, as the block's body (Pi
+/// `ToolDefinition.renderResult`, `tool-execution.ts:94-101`).
+///
+/// The `run.done || expanded` gate is cyrup's, not Pi's — upstream runs `renderResult` whenever
+/// `this.result` is set (`:296`) and lets the renderer decide. It is kept because it is vacuous
+/// here rather than out of divergence: [`TranscriptView::push_tool_end_rendered`] is the only
+/// writer of `rendered_result` and it sets `done` in the same breath, so the gate can never be the
+/// reason a body is missing.
+pub(super) fn render_extension_result(
+    result: &str,
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    out: &mut Vec<Line<'static>>,
+) {
+    if (run.done || expanded) && !result.trim().is_empty() {
         for l in result.split('\n') {
             out.push(Line::styled(
                 normalize_terminal_output(l).into_owned(),
@@ -429,8 +568,63 @@ pub(super) fn render_extension(run: &ToolRun, expanded: bool, theme: &UiTheme, o
     }
 }
 
-/// Non-built-in tools fall back to Pi's `formatToolExecution` (tool-execution.ts:365-376): the bold
-/// tool name + pretty-printed args + any text output.
+/// How many output lines the result fallback shows collapsed — `FALLBACK_PREVIEW_LINES`
+/// (`tool-execution.ts:9`).
+const FALLBACK_PREVIEW_LINES: usize = 10;
+
+/// `createCallFallback()` (`tool-execution.ts:137-139`) — a tool that HAS a definition but no
+/// `renderCall` shows `new Text(theme.fg("toolTitle", theme.bold(this.toolName)))` and nothing
+/// else. No arguments: that is the whole difference from [`render_generic`], and it is why an
+/// MCP-proxied tool no longer commits its entire argument JSON to scrollback.
+///
+/// (`tool_title_style` already carries `BOLD`, so it is both halves of upstream's
+/// `fg("toolTitle", bold(...))`.)
+pub(super) fn render_call_fallback(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
+    out.push(Line::styled(run.name.clone(), theme.tool_title_style()));
+}
+
+/// `createResultFallback()` (`tool-execution.ts:141-155`) — a tool that HAS a definition but no
+/// `renderResult` shows its text output capped at [`FALLBACK_PREVIEW_LINES`] when collapsed, with
+/// the shared `... (N more lines, <key> to expand)` line beneath it, and everything when expanded
+/// (`:149`).
+///
+/// Empty output emits NOTHING, not even a blank row — upstream returns `undefined` and no child is
+/// added (`:143-145`).
+pub(super) fn render_result_fallback(
+    run: &ToolRun,
+    expanded: bool,
+    theme: &UiTheme,
+    expand_key: &str,
+    out: &mut Vec<Line<'static>>,
+) {
+    let Some(result) = &run.result else { return };
+    let output = result_text(result);
+    // `if (!output) return undefined` (`:143-145`) — the empty string is JS-falsy.
+    if output.is_empty() {
+        return;
+    }
+    // `output.split("\n")`, then `this.expanded ? lines : lines.slice(0, FALLBACK_PREVIEW_LINES)`.
+    // Taken with an iterator adapter rather than a slice, which `clippy::indexing_slicing` denies.
+    let total = output.split('\n').count();
+    let shown = if expanded { total } else { total.min(FALLBACK_PREVIEW_LINES) };
+    for l in output.split('\n').take(shown) {
+        out.push(Line::styled(
+            normalize_terminal_output(l).into_owned(),
+            theme.tool_output_style(),
+        ));
+    }
+    let remaining = total.saturating_sub(shown);
+    if remaining > 0 {
+        out.push(more_lines_hint(remaining, None, expand_key, theme));
+    }
+}
+
+/// A tool with NO definition at all falls back to Pi's `formatToolExecution`
+/// (`tool-execution.ts:330-333` selects it, `:376-387` builds it): the bold tool name +
+/// pretty-printed args + any text output, all unbounded.
+///
+/// This is the `else` of `hasRendererDefinition()` and NOT the shape a defined-but-unrendered tool
+/// takes — see [`render_call_fallback`] / [`render_result_fallback`] for that one.
 pub(super) fn render_generic(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     out.push(Line::styled(run.name.clone(), theme.tool_title_style()));
     if !run.args.is_null()

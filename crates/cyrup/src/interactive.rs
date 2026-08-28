@@ -345,16 +345,29 @@ pub async fn run_interactive(
 
     // TUI-003: a `--resume`/`--continue` boot starts on an existing branch, so seed the transcript
     // from it before the first frame — Pi's `renderInitialMessages()` (interactive-mode.ts:3548).
-    // A fresh session has no messages and replays nothing. `raw_context_messages` keeps the
+    // A fresh session has no messages and replays nothing. The raw projection keeps the
     // `compactionSummary`/`branchSummary`/`custom`/`bashExecution` roles that `messages()` would
     // have flattened to `user` prose at the LLM boundary (Pi feeds `renderSessionEntries` the same
     // raw projection, interactive-mode.ts:3506-3516).
-    let restored = session.raw_context_messages().await;
+    // The replay walk holds messages, not a session, so seed the has-a-definition registry it reads
+    // first (Pi's `definitionRegistry`, agent-session.ts:2659-2676, consulted per tool-execution
+    // component as `hasRendererDefinition()`, tool-execution.ts:103-105). Without it a `--resume`d
+    // MCP/extension tool call replays through `formatToolExecution`'s full argument dump.
+    app.refresh_known_tool_definitions(&session);
+    // `showCacheMissNotices` gates the derived notices below, and `App::seed_session_ui` — which
+    // caches it — does not run until `App::run` takes over, so seed it here or a `--resume` would
+    // replay with the boot default rather than the persisted value.
+    app.state_mut().show_cache_miss_notices =
+        session.services().settings.effective().show_cache_miss_notices();
+    // `replay_items` is `raw_context_messages` plus the cache-miss and compaction-cost notices pi
+    // re-derives on every rebuild (`interactive-mode.ts:3694-3696`, `:3788-3794`); neither is
+    // persisted, so this is the only way a resumed transcript carries them.
+    let restored = session.replay_items().await;
     if !restored.is_empty() {
         // X11 — WITH the loaded extensions: Pi resolves `getMessageRenderer(message.customType)` on
         // the replay walk (`interactive-mode.ts:3471`) exactly as it does on the live
         // `addMessageToChat` path, so a `--resume`d session keeps the extension rendering it had.
-        app.replay_session_with_extensions(&restored, &session.services().ext_host).await;
+        app.replay_items_with_extensions(&restored, &session.services().ext_host).await;
     }
 
     if !inputs.is_empty() {

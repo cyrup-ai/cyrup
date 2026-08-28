@@ -1743,6 +1743,7 @@ dependencies = [
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",
+ "regex",
  "rustix 1.1.4",
  "serde_json",
  "syntect",

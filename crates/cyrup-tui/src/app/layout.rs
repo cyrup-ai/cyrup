@@ -48,10 +48,17 @@ pub(crate) fn header_rows(state: &AppState) -> u16 {
 pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -> [u16; 10] {
     let avail = avail.max(1);
     let max_editor = avail.saturating_sub(2).max(3);
-    // A selector owns the slot at its desired height; otherwise the editor sizes to its line count +
-    // the two rule rows (spec/tui/05 §1.1, spec/tui/03 §3.1).
-    let want_slot = match state.selector.as_ref() {
-        Some(active) => active.inner.desired_height(width).clamp(3, max_editor),
+    // A selector — else a mounted loader — owns the slot at its desired height; otherwise the editor
+    // sizes to its line count + the two rule rows (spec/tui/05 §1.1, spec/tui/03 §3.1).
+    let want_slot = match (state.selector.as_ref(), state.loader.as_ref()) {
+        (Some(active), _) => active.inner.desired_height(width).clamp(3, max_editor),
+        // A mounted `BorderedLoader` owns the slot at ITS height, for the same reason a selector
+        // does: pi clears `editorContainer` and puts the loader there (`session-share.ts:152-156`),
+        // so the rows the editor would have asked for are irrelevant. `BorderedLoader::height()` is
+        // 7 cancellable / 5 plain (`chrome.rs:334-340`) against the editor's usual 3 — sized from
+        // the editor the loader was clipped to top-rule + blank + spinner, with neither the
+        // `escape/ctrl+c cancel` hint row nor the bottom rule ever reaching a frame.
+        (None, Some(loader)) => loader.height().clamp(3, max_editor),
         // Size from the VISUAL (wrapped) line count, windowed and measured exactly as Pi's
         // `Editor.render` does:
         //
@@ -68,7 +75,7 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
         //   text rows and scrolls, cyrup showed 38.
         //
         // The `+2` is the two rule rows; `clamp(3, max_editor)` stays as the viewport backstop.
-        None => (state
+        (None, None) => (state
             .editor
             .visual_line_count(usize::from(state.editor.layout_width(width)))
             .min(usize::from(max_visible_editor_lines(state.term_rows)))
@@ -77,15 +84,17 @@ pub(crate) fn region_constraints(state: &mut AppState, width: u16, avail: u16) -
             .clamp(3, max_editor),
     };
     // The completion popup is appended below the editor's bottom rule (spec/tui/04 §7); suppressed
-    // while a selector owns the slot.
-    let want_popup = if state.selector.is_some() {
+    // while a selector — or a loader — owns the slot, since both replace the editor the popup
+    // completes for (pi's `editorContainer.clear()`, `session-share.ts:153`).
+    let want_popup = if state.selector.is_some() || state.loader.is_some() {
         0
     } else {
         state.editor.autocomplete().map(|ac| ac.list.rendered_height()).unwrap_or(0)
     };
     let footer_max: u16 = if state.status.has_extension_statuses() { 3 } else { 2 };
     let want_status = state.indicator.is_active() || state.reserve_status_rows;
-    let want_images: u16 = if state.selector.is_some() || state.pending_images.is_empty() {
+    let want_images: u16 =
+        if state.selector.is_some() || state.loader.is_some() || state.pending_images.is_empty() {
         0
     } else {
         state

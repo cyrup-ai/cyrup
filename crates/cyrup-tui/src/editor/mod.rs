@@ -15,7 +15,11 @@
 //! column** ([`InputEditor::preferred_visual_col`]) across short/long/rewrapped lines, falling through
 //! to history at the first visual line and to line-end at the last (spec/tui/03 §4.1-§4.2). Large
 //! pastes collapse to atomic `[paste #N …]` markers ([`InputEditor::handle_paste`]) that expand back
-//! to content on submit ([`InputEditor::expanded_text`], spec/tui/03 §5.5).
+//! to content on submit ([`InputEditor::expanded_text`], spec/tui/03 §5.5). Those markers are atomic
+//! to the CARET too, on every axis: horizontal motion and deletion step them whole through
+//! [`InputEditor::marker_grapheme_boundaries`], and vertical motion snaps out of one it would
+//! otherwise land inside ([`InputEditor::move_to_visual_line`]) — a caret parked mid-marker is what
+//! turns the next Backspace into silent data loss.
 
 use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
@@ -144,10 +148,12 @@ pub struct InputEditor {
     /// `set_cwd`. `None` until first needed.
     mention_files: Option<Vec<String>>,
     /// The live `/model` / `/login` / `/thinking` candidate sets the argument completers rank
-    /// (`interactive-mode.ts:685-736` @v0.84.3). Push-fed like `registry` and `mention_files`,
-    /// because [`Autocomplete::compute`] is synchronous and the editor holds no session: the app
-    /// snapshots them on boot, session swap, credential change and scope save
-    /// ([`crate::App::refresh_argument_sources`]). Empty until the first push.
+    /// (`interactive-mode.ts:685-736` @v0.84.3), plus the answers extension commands' own
+    /// completers gave (`:753`). Push-fed like `registry` and `mention_files`, because
+    /// [`Autocomplete::compute`] is synchronous and the editor holds no session: the app snapshots
+    /// the builtin three on boot, session swap, credential change and scope save
+    /// ([`crate::App::refresh_argument_sources`]) and refreshes the extension entries per keystroke
+    /// ([`crate::App::refresh_extension_completions`]). Empty until the first push.
     arg_sources: crate::autocomplete::ArgumentSources,
     /// The layout width (in columns) used to wrap logical lines into **visual** lines for vertical
     /// motion (`editor.ts:1690` `build_visual_line_map(width)`). Updated every render; `80` until the
@@ -186,6 +192,22 @@ pub struct InputEditor {
     /// rewrapped visual lines. `Some` while a vertical run is in progress; cleared by any horizontal
     /// motion, edit, or paste so the next vertical move re-seeds from the live cursor (spec/tui/03 §4.2).
     preferred_visual_col: Option<usize>,
+    /// The **pre-snap column** stashed when a vertical move snapped the caret back to the start of
+    /// an atomic segment — pi's `snappedFromCursorCol` (`editor.ts:331-336`):
+    ///
+    /// ```text
+    /// // When the cursor is snapped to the start of an atomic segment, e.g. a
+    /// // paste marker, cursorCol no longer reflects where the cursor would have
+    /// // landed. This field stores the pre-snap cursorCol so that the next
+    /// // vertical move can resolve it to a visual column on whatever VL it belongs
+    /// // to.
+    /// ```
+    ///
+    /// Set by [`InputEditor::move_to_visual_line`] (`editor.ts:1455-1461`), consumed by the next
+    /// vertical move (`:1396-1404`) and cleared both when a vertical move lands outside every atomic
+    /// segment (`:1465`) and by [`InputEditor::reset_preferred_col`], cyrup's `setCursorCol`
+    /// (`:1377-1381`).
+    snapped_from_col: Option<usize>,
     /// Large-paste store (`editor.ts:81` `pastes: id -> expanded content`): each entry is the full
     /// pasted text the buffer shows collapsed to a `[paste #N …]` marker. [`InputEditor::expanded_text`] substitutes
     /// markers back to content on submit (`expandPasteMarkers`, spec/tui/03 §5.5).

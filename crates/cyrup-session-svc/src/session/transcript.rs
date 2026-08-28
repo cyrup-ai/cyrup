@@ -145,6 +145,24 @@ impl AgentSession {
         }
         out
     }
+
+    /// The FULL, untruncated copy text of one entry — Pi `TreeList.getEntryCopyText`
+    /// (`tree-selector.ts:896-922`), reached from `copySelected` (`:627-630`) when `app.message.copy`
+    /// fires inside `/tree` (`:1029-1030`).
+    ///
+    /// `None` for an unknown id and for every entry Pi's switch leaves `undefined` — including a
+    /// whitespace-only body, which upstream collapses with `return text?.trim() ? text : undefined`.
+    ///
+    /// This is deliberately NOT a field on [`SessionDagNode`]. The DAG node carries `label`, which is
+    /// a normalized ONE-LINE preview clipped to 80 characters by [`dag_display`]; the copy text is the
+    /// whole message body, so materialising it for every node would put the entire session transcript
+    /// into the `/tree` selector's node list to serve a single keystroke. The `/tree` chrome resolves
+    /// it on demand against the live session instead, exactly as `/copy` resolves
+    /// [`Self::last_assistant_text`].
+    pub async fn entry_copy_text(&self, entry_id: &EntryId) -> Option<String> {
+        let guard = self.manager.lock().await;
+        guard.entries().iter().find(|e| &e.id() == entry_id).and_then(dag_copy_text)
+    }
 }
 
 /// Recursively flatten a [`cyrup_session::manager::TreeNode`] into pre-order [`SessionDagNode`]s
@@ -255,6 +273,76 @@ fn join_text(content: &[Content]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+/// Pi `extractFullContent` (`tree-selector.ts:883-895`) for the JSON-valued `content` fields
+/// (`CustomRoleMessage.content` and `KnownEntry::CustomMessage.content`, both mirrored as raw JSON
+/// because Pi types them `string | (Text|Image)[]`).
+///
+/// A JSON string is returned as-is; an array concatenates the `text` of every `{"type":"text"}`
+/// block; anything else (including `null`) is the empty string. The typed `Vec<Content>` cases use
+/// [`join_text`], which is already exactly this over the parsed representation.
+fn extract_full_content(content: &serde_json::Value) -> String {
+    if let Some(s) = content.as_str() {
+        return s.to_string();
+    }
+    let Some(blocks) = content.as_array() else { return String::new() };
+    blocks
+        .iter()
+        .filter(|b| b.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|b| b.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// The full copy text of one entry — a mechanical port of Pi's `getEntryCopyText`
+/// (`tree-selector.ts:896-922`). Returns `(kind, label)`'s counterpart for the CLIPBOARD, i.e. the
+/// untruncated body: no `normalize`, no `clip`, and no role prefix, all of which belong to
+/// [`dag_display`] alone.
+///
+/// Upstream's switch is on `entry.type`, and the `message` arm then tests the message ROLE:
+///
+/// * `bashExecution` → `entry.message.command` (`:901`)
+/// * any role whose message has a `content` key → `extractFullContent(content)`; when that comes out
+///   empty **and** the role is `assistant`, fall back to `entry.message.errorMessage` (`:902-907`).
+///   In Pi's message union that key set is `user`, `assistant`, `toolResult` and `custom`
+///   (`ai/src/types.ts:379,402`, `messages.ts:46-52`) — the `branchSummary` and `compactionSummary`
+///   roles carry `summary`, not `content`, so `"content" in entry.message` is FALSE for them and the
+///   text stays `undefined` even though the ENTRY type is `message`.
+/// * entry type `custom_message` → `extractFullContent(entry.content)` (`:910`)
+/// * entry types `compaction` / `branch_summary` → `entry.summary` (`:913`, `:916`)
+/// * every other entry type falls out of the switch with `text` still `undefined`.
+///
+/// Tool CALLS are not rendered here: `formatToolCall` (`:938-994`) is on the row-label path only
+/// (reached at `:799`), never on the copy path.
+fn dag_copy_text(e: &cyrup_session::Entry) -> Option<String> {
+    use cyrup_session::agent_message::AgentMessage as SessMsg;
+    use cyrup_session::entry::{Entry, KnownEntry};
+
+    let text: Option<String> = match e {
+        Entry::Known(KnownEntry::Message { message, .. }) => match message {
+            SessMsg::BashExecution(b) => Some(b.command.clone()),
+            SessMsg::Core(Message::User { content, .. })
+            | SessMsg::Core(Message::ToolResult { content, .. }) => Some(join_text(content)),
+            SessMsg::Core(Message::Assistant(m)) => {
+                // `:904-906` — the `errorMessage` fallback fires only when the extracted text is
+                // empty AND the role is `assistant`.
+                let body = join_text(&m.content);
+                if body.is_empty() { m.error_message.clone() } else { Some(body) }
+            }
+            SessMsg::Custom(c) => Some(extract_full_content(&c.content)),
+            SessMsg::BranchSummary(_) | SessMsg::CompactionSummary(_) => None,
+        },
+        Entry::Known(KnownEntry::CustomMessage { content, .. }) => {
+            Some(extract_full_content(content))
+        }
+        Entry::Known(KnownEntry::Compaction { summary, .. })
+        | Entry::Known(KnownEntry::BranchSummary { summary, .. }) => Some(summary.clone()),
+        _ => None,
+    };
+    // `:921` — `return text?.trim() ? text : undefined`: a whitespace-only body is `undefined`, and
+    // the value returned is the UNTRIMMED original.
+    text.filter(|t| !t.trim().is_empty())
 }
 
 /// The concatenated text of a core `user` message entry, or `None` for any other entry/role.

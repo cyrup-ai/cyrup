@@ -14,6 +14,19 @@ impl<B: Backend> App<B> {
         rx
     }
 
+    /// Install the off-task `/share` gist-upload channel and hand back its receiver.
+    ///
+    /// [`App::run`] calls this once at startup, exactly like [`Self::install_tree_nav_channel`].
+    /// Without it `App::share_session` awaits `gh gist create` inline and the run loop is frozen for
+    /// the whole upload — no frame with the loader on it, no spinner tick, no key read — see
+    /// [`Self::share_tx`]. `pub` so a test can drive the spawned path (and therefore the
+    /// Escape→`Share cancelled` routing) without standing up a run loop.
+    pub fn install_share_channel(&mut self) -> tokio::sync::mpsc::UnboundedReceiver<ShareMsg> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<ShareMsg>();
+        self.share_tx = Some(tx);
+        rx
+    }
+
     // ========================================================================
     // `/login` + `/logout` (Pi `interactive-mode.ts:4941-5051`, `:5229-5403`)
     // ========================================================================
@@ -231,7 +244,23 @@ impl<B: Backend> App<B> {
             // `[compaction]` label + `**Compacted from N tokens**` markdown body produced by the
             // op (Pi appends a `CompactionSummaryMessage` after a manual `/compact`).
             Ok(result) => {
+                let usage = result.usage.clone();
                 self.state.transcript.push_compaction_summary(result.tokens_before, result.summary);
+                // The manual half of pi's `compaction_end` cost notice
+                // (`interactive-mode.ts:3431-3437`). It rides HERE and not only on the event
+                // because of the `[CYRUP-DELTA]` recorded on the `CompactionEnd` arm
+                // (`app/events_fold.rs`): that arm renders the AUTOMATIC reasons only, so a
+                // `/compact` would otherwise print its summary with no cost line while an
+                // auto-compaction printed both. `CompactionResult::usage` (SEAM-034) is the same
+                // value the entry carries, which is the same value pi reads off `event.result`.
+                if self.state.show_cache_miss_notices
+                    && let Some(u) = usage.as_ref()
+                {
+                    self.state.transcript.push_compaction_cost_notice(
+                        crate::transcript::CompactionCostKind::Compaction,
+                        u,
+                    );
+                }
             }
             // SESS-040 — the failure half of the MANUAL compaction surface, which this path owns
             // in full (see the `[CYRUP-DELTA]` on the `CompactionEnd` arm: the event renders the

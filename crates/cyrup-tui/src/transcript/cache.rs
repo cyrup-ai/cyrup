@@ -12,8 +12,8 @@ impl TranscriptView {
 
     /// Invalidate the render cache for a timer-driven repaint (TUI-092 F2): the live `!`/`!!`
     /// block's spinner glyph ([`BashExecution::render_lines`] → `started.elapsed()`,
-    /// bash.rs:204) and a running bash tool's `Elapsed …` footer (`render_bash`,
-    /// transcript.rs:2157) are computed from wall-clock time INSIDE `lines()`, so a frame that
+    /// bash.rs:204) and a running bash tool's `Elapsed …` footer (`render_bash_result`,
+    /// transcript/tool_builtin.rs) are computed from wall-clock time INSIDE `lines()`, so a frame that
     /// mutates nothing must still re-materialise while time-derived content is live. Called by
     /// the run loop's spinner tick (gated on `bash_running()`) and elapsed tick (gated on
     /// `has_running_elapsed_tool()`) — never on content-quiet frames, which stay free.
@@ -112,11 +112,20 @@ impl TranscriptView {
         // non-empty. So a reasoning run of nothing but whitespace renders nothing at all, not even
         // the `Thinking...` label. `commit_thinking` already applies that test; the live leg did
         // not, so a stray whitespace `ThinkingDelta` put a label (and its blank) on screen.
-        // No mermaid context is plumbed through `thinking_lines`: pi's gate returns the markdown
-        // untouched whenever `context.messageType === "assistant-thinking"` (`mermaid.ts:65`), so
+        // No mermaid context is plumbed through `thinking_lines`, and that is still right: pi's
+        // MERMAID gate returns the markdown untouched whenever
+        // `context.messageType === "assistant-thinking"` (`mermaid.ts:65`), so for that transformer
         // the thinking path — here and in `transcript/message.rs` — is an unconditional
         // pass-through and a context there would be dead weight.
-        if let Some(thinking) = self.thinking.as_ref().filter(|_| thinking_visible) {
+        //
+        // The GENERAL, extension-supplied transformers do run on it (`"assistant-thinking"`,
+        // `assistant-message.ts:156-162`) — but not from here: they are applied at push time by
+        // `App::apply_markdown_transformers` (`app/events.rs`) and land in `thinking_display`, which
+        // is what this renders when the pass has produced anything. Falling back to the raw buffer
+        // keeps the frame between a delta and the next pass drawing untransformed text rather than
+        // none.
+        let thinking_body = self.thinking_display.as_deref().or(self.thinking.as_deref());
+        if let Some(thinking) = thinking_body.filter(|_| thinking_visible) {
             let mut td = thinking_lines(
                 thinking,
                 self.hide_thinking,
@@ -134,7 +143,14 @@ impl TranscriptView {
                 }
             }
         }
-        if let Some(partial) = self.streaming.as_ref().filter(|_| stream_visible) {
+        // Same `*_display`-then-raw fallback as the reasoning block above: the extension
+        // transformers' `is_streaming = true` output (`assistant-message.ts:111`) when the pass has
+        // produced one, the accumulator otherwise. `stream_visible` deliberately stays keyed on the
+        // RAW buffer — upstream's `hasVisibleContent` tests `content.text.trim()`, the untransformed
+        // message content (`assistant-message.ts:96-98`), so a transformer cannot conjure or erase
+        // the leading `Spacer(1)`.
+        let stream_body = self.streaming_display.as_deref().or(self.streaming.as_deref());
+        if let Some(partial) = stream_body.filter(|_| stream_visible) {
             // X1 — no role label and no `▌` caret. `assistant-message.ts:104-114` adds exactly one
             // child per text block, `new Markdown(content.text.trim(), this.outputPad, 0, …)`; the
             // only caret in the whole TUI is the editor's reverse-video cell (`editor.ts:545-564`).

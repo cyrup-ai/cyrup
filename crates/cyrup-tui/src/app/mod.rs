@@ -109,12 +109,13 @@ pub use outcome::{
 };
 pub(crate) use settings_rows::PROJECT_UNTRUSTED_WARNING;
 pub(crate) use settings_rows::{
-    format_saved_trust, parse_setting_value, session_label, settings_rows,
-    system_time_nanos,
+    format_saved_trust, model_thinking_summary_for_count, parse_setting_value, session_label,
+    settings_rows, system_time_nanos,
 };
 #[cfg(test)]
 pub(crate) use settings_rows::{settings_rows_for_test, settings_rows_for_test_with_images};
-pub use share::{gist_id_from_url, share_viewer_url, share_viewer_url_from};
+pub use share::{ShareMsg, gist_id_from_url, share_viewer_url, share_viewer_url_from};
+pub(crate) use share::ShareInFlight;
 
 pub use render_impl::render;
 pub(crate) use render_impl::{env_rows, fallback_columns, is_extension_command};
@@ -266,6 +267,21 @@ pub struct App<B: Backend> {
     /// non-summarizing navigation (no model call, so no abort to deliver and nothing to keep the
     /// loop free for) and the only thing a caller without a loop can do.
     tree_nav_tx: Option<tokio::sync::mpsc::UnboundedSender<TreeNavMsg>>,
+    /// Where a spawned `/share` gist upload posts its outcome back to the run loop. Installed by
+    /// [`App::install_share_channel`], which [`App::run`] calls once at startup — the same shape as
+    /// [`Self::tree_nav_tx`].
+    ///
+    /// Installing it is what makes `/share`'s [`crate::chrome::BorderedLoader`] *work at all*: pi
+    /// mounts the loader and then awaits `gh` while its render loop keeps running
+    /// (`session-share.ts:152-186`), whereas an inline `.output().await` on this loop's own task
+    /// reaches no other `select!` arm for the whole upload — so no frame is ever produced with the
+    /// loader set, the 80 ms spinner never advances, and the `escape/ctrl+c cancel` hint the loader
+    /// renders is not even read until `gh` has already exited.
+    ///
+    /// `None` (an embedder or a test driving `execute_command` directly) falls back to awaiting the
+    /// upload inline, exactly as `/tree` does: with no run loop there is nothing to keep free and no
+    /// keystroke could be delivered anyway.
+    share_tx: Option<tokio::sync::mpsc::UnboundedSender<ShareMsg>>,
     /// Where the detached startup package-update check posts its answer — Pi's
     /// `this.checkForPackageUpdates().then((u) => u.length > 0 && this.showPackageUpdateNotification(u))`
     /// (`interactive-mode.ts:850-856`). Installed by [`App::set_package_update_channel`] before

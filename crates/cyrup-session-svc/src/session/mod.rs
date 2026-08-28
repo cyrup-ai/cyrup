@@ -43,8 +43,9 @@ mod types;
 // The seam surface `lib.rs` re-exports (`pub use session::{...}`) — same names, same paths.
 pub use files::{delete_session_file_at, rename_session_file_at};
 pub use types::{
-    BindOptions, DeleteMethod, ForkAnchor, ForkOutcome, ForkPosition, ModelCycleResult,
-    NavigateTreeOptions, NavigateTreeOutcome, ScopedModel, SessionDagKind, SessionDagNode,
+    BindOptions, CompactionCostKind, DeleteMethod, ForkAnchor, ForkOutcome, ForkPosition,
+    ModelCycleResult, NavigateTreeOptions, NavigateTreeOutcome, ReplayItem, ScopedModel,
+    SessionDagKind, SessionDagNode,
 };
 
 // `tests/delete_session_file_trash.rs` names this through `crate::session::trash_args`; the

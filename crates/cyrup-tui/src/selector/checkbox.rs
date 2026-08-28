@@ -200,6 +200,81 @@ impl CheckboxSelector {
         out
     }
 
+    /// The ids the bulk operations act on — `const targetIds = this.searchInput.getValue() ?
+    /// this.filteredItems.map((i) => i.fullId) : undefined` (`scoped-models-selector.ts:334`, `:344`).
+    /// `None` stands in for upstream's `undefined`, i.e. "no search active, act on the whole
+    /// catalog"; a live query narrows the bulk operation to exactly the rows on screen.
+    fn target_ids(&self) -> Option<Vec<String>> {
+        if self.input.value().is_empty() {
+            None
+        } else {
+            Some(self.items().into_iter().map(|it| it.full_id).collect())
+        }
+    }
+
+    /// `this.allIds` (`scoped-models-selector.ts:94`, `:123`): the **catalog** ids in catalog order.
+    /// Deliberately not [`Self::sorted_ids`] — that view leads with the enabled set and so carries
+    /// ids that are no longer in the catalog, which would corrupt both the `enableAll` collapse test
+    /// and `clearAll`'s "everything except the targets".
+    fn all_ids(&self) -> Vec<String> {
+        self.rows.iter().map(|r| r.id.clone()).collect()
+    }
+
+    /// `enableAll` (`scoped-models-selector.ts:32-40`). `targets` is [`Self::target_ids`]: `None`
+    /// means the whole catalog.
+    ///
+    /// Append-only over the existing order — upstream's `result.push` never sorts or rebuilds, so the
+    /// user's hand-built cycle order survives a bulk enable. Collapsing to `None` ("all enabled")
+    /// needs **both** halves of `:39`: the same length as the catalog *and* every entry in the
+    /// catalog. The length alone is not enough, because an enabled-but-unavailable id (kept by
+    /// [`Self::sorted_ids`], rendered `[unavailable]`) can pad the list to the catalog's length while
+    /// a real catalog model is still disabled.
+    fn enable_all(&mut self, targets: Option<&[String]>) {
+        // `if (enabledIds === null) return null` (`:33`) — already all-enabled, nothing to do.
+        let Some(list) = self.enabled.as_ref() else { return };
+        let all_ids = self.all_ids();
+        let mut result = list.clone();
+        for id in targets.unwrap_or(&all_ids) {
+            if !result.iter().any(|e| e == id) {
+                result.push(id.clone());
+            }
+        }
+        let covers_catalog =
+            result.len() == all_ids.len() && result.iter().all(|id| all_ids.contains(id));
+        self.enabled = if covers_catalog { None } else { Some(result) };
+    }
+
+    /// `clearAll` (`scoped-models-selector.ts:42-47`). `targets` is [`Self::target_ids`]: `None`
+    /// means "everything currently enabled".
+    ///
+    /// From all-enabled *with* targets the result is every catalog id **minus** the targets (`:44`) —
+    /// a filtered clear disables only what the query matched, it does not wipe the set. Never
+    /// collapses back to `None`: upstream's `clearAll` has no `null` return.
+    fn clear_all(&mut self, targets: Option<&[String]>) {
+        match self.enabled.take() {
+            None => {
+                self.enabled = Some(match targets {
+                    Some(t) => self
+                        .rows
+                        .iter()
+                        .map(|r| r.id.clone())
+                        .filter(|id| !t.contains(id))
+                        .collect(),
+                    None => Vec::new(),
+                });
+            }
+            Some(mut list) => {
+                // `new Set(targetIds ?? enabledIds)` (`:45`): with no targets the target set *is* the
+                // enabled set, so the filter empties it.
+                match targets {
+                    Some(t) => list.retain(|id| !t.contains(id)),
+                    None => list.clear(),
+                }
+                self.enabled = Some(list);
+            }
+        }
+    }
+
     /// Clamp the highlight to the filtered length — `refresh`'s
     /// `Math.min(selectedIndex, max(0, filteredItems.length - 1))` (`:221`).
     fn clamp_selection(&mut self) {
@@ -251,22 +326,13 @@ impl CheckboxSelector {
         let provider_ids: Vec<String> =
             self.rows.iter().filter(|r| r.provider == provider).map(|r| r.id.clone()).collect();
         let all_on = provider_ids.iter().all(|pid| self.is_enabled(pid));
-        // Materialize the current set as an explicit list, then add/remove the provider's ids.
-        let mut list: Vec<String> = match &self.enabled {
-            None => self.rows.iter().map(|r| r.id.clone()).collect(),
-            Some(l) => l.clone(),
-        };
+        // `:356-362` — upstream routes the provider toggle through the very same two bulk helpers,
+        // with the provider's ids as the target set.
         if all_on {
-            list.retain(|e| !provider_ids.contains(e));
+            self.clear_all(Some(&provider_ids));
         } else {
-            for pid in provider_ids {
-                if !list.contains(&pid) {
-                    list.push(pid);
-                }
-            }
+            self.enable_all(Some(&provider_ids));
         }
-        // Collapse back to "all" when every catalog model ended up enabled (Pi's null normalization).
-        self.enabled = if list.len() == self.rows.len() { None } else { Some(list) };
     }
 
     /// The confirm value: [`SCOPED_MODELS_ALL`] when all are enabled, else the ordered ids joined by
@@ -477,31 +543,43 @@ impl Selector for CheckboxSelector {
     fn handle(&mut self, key: &KeyEvent, keymap: &SelectKeymap) -> SelectorOutcome {
         // Bespoke scoped-models bindings take precedence over the shared select map.
         if let Some(action) = self.models_keymap.action_for(key) {
-            let Some(id) = self.current_id() else { return SelectorOutcome::Redraw };
             match action {
                 // `:300-319` — a successful move also advances the highlight so it tracks the model
                 // that moved, and only a successful move sets `isDirty`.
                 ModelsAction::ReorderUp => {
+                    let Some(id) = self.current_id() else { return SelectorOutcome::Redraw };
                     if self.reorder(&id, -1) {
                         self.selected = self.selected.saturating_sub(1);
                         self.dirty = true;
                     }
                 }
                 ModelsAction::ReorderDown => {
+                    let Some(id) = self.current_id() else { return SelectorOutcome::Redraw };
                     if self.reorder(&id, 1) {
                         self.selected = self.selected.saturating_add(1);
                         self.dirty = true;
                     }
                 }
+                // `:332-340` — "enable all (filtered if search active, otherwise all)". With no
+                // query the targets are the whole catalog, so the collapse test in
+                // [`Self::enable_all`] fires and this still lands on `enabled == None`.
                 ModelsAction::EnableAll => {
-                    self.enabled = None;
+                    let targets = self.target_ids();
+                    self.enable_all(targets.as_deref());
                     self.dirty = true;
                 }
+                // `:342-350` — with no query the target set is the enabled set itself, so this
+                // still empties it; with a query it disables only the matched rows.
                 ModelsAction::ClearAll => {
-                    self.enabled = Some(Vec::new());
+                    let targets = self.target_ids();
+                    self.clear_all(targets.as_deref());
                     self.dirty = true;
                 }
                 ModelsAction::ToggleProvider => {
+                    // `:353-355` — upstream requires `item?.model`, i.e. an *available* model; an
+                    // `[unavailable]` row has no provider to toggle. [`Self::toggle_provider`]
+                    // returns early for an id that is not in the catalog.
+                    let Some(id) = self.current_id() else { return SelectorOutcome::Redraw };
                     self.toggle_provider(&id);
                     self.dirty = true;
                 }

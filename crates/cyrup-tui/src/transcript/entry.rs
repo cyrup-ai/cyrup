@@ -1,5 +1,32 @@
 use super::*;
 
+/// Which summarization an [`Entry::Warning`]-styled compaction-cost notice is reporting — pi's
+/// `CompactionCostNotice.kind`, a synthetic render item carrying `entry.type` (`"compaction"` |
+/// `"branch_summary"`) off the session entry that paid for the summary
+/// (`interactive-mode.ts:3788-3794` @v0.83.0).
+///
+/// Presentation-only: it selects between the two label words pi prints at
+/// `interactive-mode.ts:3811`, so it lives with the view rather than with the session types that
+/// produce the usage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionCostKind {
+    /// A context compaction (`entry.type === "compaction"`) — label `Compaction`.
+    Compaction,
+    /// A branch summarization (`entry.type === "branch_summary"`) — label `Branch summary`.
+    BranchSummary,
+}
+
+impl CompactionCostKind {
+    /// pi's `notice.kind === "compaction" ? "Compaction" : "Branch summary"`
+    /// (`interactive-mode.ts:3811`).
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            CompactionCostKind::Compaction => "Compaction",
+            CompactionCostKind::BranchSummary => "Branch summary",
+        }
+    }
+}
+
 /// A committed transcript entry.
 ///
 /// `Eq` is intentionally omitted: [`ToolRun`] carries the raw `serde_json::Value` call args / result
@@ -219,6 +246,24 @@ pub struct ToolRun {
     /// The RESULT text an extension's registered renderer produced (Pi `renderResult`,
     /// extensions/types.ts:475-481). See [`ToolRun::rendered_call`].
     pub rendered_result: Option<String>,
+    /// Whether the agent knows a tool DEFINITION for [`name`](ToolRun::name) — Pi
+    /// `ToolExecutionComponent.hasRendererDefinition()`, i.e. `builtInToolDefinition !== undefined
+    /// || toolDefinition !== undefined` (tool-execution.ts:103-105), sourced from the session's own
+    /// `getToolDefinition(name)` registry (agent-session.ts:806) and so true for an
+    /// extension-registered, SDK-registered or MCP-proxied tool as well as a built-in.
+    ///
+    /// It is the branch upstream picks the whole block SHAPE by, and it is **not** "an extension
+    /// registered a renderer" — that is [`rendered_call`](ToolRun::rendered_call) /
+    /// [`rendered_result`](ToolRun::rendered_result), and a definition with no renderer is the
+    /// normal case for an MCP tool. A defined tool draws through its renderers, falling back
+    /// per-side to a bold name (`createCallFallback`, `:137-139`) and a ten-line output preview
+    /// (`createResultFallback`, `:141-155`); only a tool with NO definition reaches the unbounded
+    /// `formatToolExecution` (`:330-333`) that dumps the full argument JSON.
+    ///
+    /// `false` on the id-less/legacy constructors — the shape-preserving value, since every
+    /// built-in name is answered by the built-in table before this flag is consulted, so it decides
+    /// only how an entirely UNKNOWN name draws.
+    pub has_definition: bool,
     /// `edit`'s **pre-execution** diff preview — Pi `EditCallRenderComponent.preview`
     /// (edit.ts:145-153), set by `setEditPreview` (`:263-280`) from the `computeEditsDiff` its
     /// `renderCall` fires the moment the streamed arguments are complete (`:377-386`).

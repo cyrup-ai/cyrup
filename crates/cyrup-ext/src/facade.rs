@@ -1484,6 +1484,19 @@ impl ExtensionHost {
         self.registry.entry_renderer_owner(custom_type).ok().flatten().is_some()
     }
 
+    /// Whether ANY extension registered a markdown transformer — the sync pre-check twin of the
+    /// `has_*_renderer` trio above, for [`Self::transform_markdown`].
+    ///
+    /// [`Self::transform_markdown`] already early-returns on an empty owner list, so this answers
+    /// nothing the fold could not; what it buys is the *shape* of the call. The consumer
+    /// (`cyrup_tui::app::App::apply_markdown_transformers`) runs on the streaming path, once per
+    /// delta, and reaching the fold means an `async` hop plus a cloned owner list per chunk. Gating
+    /// on this makes the no-extension path one rwlock read and keeps the rendered lines
+    /// byte-identical to a build with no host at all.
+    pub fn has_markdown_transformers(&self) -> bool {
+        self.registry.has_markdown_transformers().unwrap_or(false)
+    }
+
     pub fn registry(&self) -> &ExtensionRegistry {
         &self.registry
     }
@@ -1874,15 +1887,54 @@ impl ExtensionHost {
         out
     }
 
-    /// Dynamic argument completions for a guest command (Pi `getArgumentCompletions`).
-    #[cfg(feature = "wasm-host")]
+    /// Dynamic argument completions for a registered command (Pi `getArgumentCompletions`,
+    /// `core/extensions/types.ts:1166` @v0.83.0), by INVOCATION name.
+    ///
+    /// Routed native-tier-first and then live-wasm, the same split
+    /// [`Self::execute_native_command`] / [`Self::run_command`] make for the handler itself:
+    /// upstream a command's completer is a field on the same object as its handler, so the two
+    /// must resolve to the same extension or a native command that opts in through
+    /// [`crate::native::InitApi::add_autocomplete`] would silently answer "no live owner".
     pub async fn command_completions(
+        &self,
+        name: &str,
+        prefix: &str,
+    ) -> Result<Vec<String>, ExtError> {
+        // SEAM-048 — the registered name goes to the handler, the invocation name is what the user
+        // typed; see [`Self::command_route`].
+        let native = self.command_route(name)?.and_then(|(owner, registered)| {
+            self.native
+                .read()
+                .ok()
+                .and_then(|g| g.get(&owner).cloned())
+                .map(|ext| (ext, registered))
+        });
+        if let Some((ext, registered)) = native {
+            return ext.argument_completions(&registered, prefix).await;
+        }
+        self.wasm_command_completions(name, prefix).await
+    }
+
+    /// The live-WASM half of [`Self::command_completions`].
+    #[cfg(feature = "wasm-host")]
+    async fn wasm_command_completions(
         &self,
         name: &str,
         prefix: &str,
     ) -> Result<Vec<String>, ExtError> {
         let (ext, registered) = self.live_for_command(name)?;
         ext.argument_completions(&registered, prefix).await
+    }
+
+    /// Native-host fallback (no `wasm-host` feature): nothing but a native can own the command, and
+    /// [`Self::command_completions`] has already tried that tier.
+    #[cfg(not(feature = "wasm-host"))]
+    async fn wasm_command_completions(
+        &self,
+        name: &str,
+        _prefix: &str,
+    ) -> Result<Vec<String>, ExtError> {
+        Err(ExtError::Component(format!("no such command: {name}")))
     }
 
     /// SEAM-048 / EXT-017 — resolve an INVOCATION name to `(owner, registered name)`.

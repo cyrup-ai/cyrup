@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Implement `/resume`'s `re:<pattern>` Search Instead Of Returning `None` For Every Session

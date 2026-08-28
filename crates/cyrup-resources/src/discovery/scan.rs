@@ -245,6 +245,13 @@ pub(super) fn add_local_entries(
     // `extensions` is the FIRST entry of Pi's `RESOURCE_TYPES` (package-manager.ts:194) and goes
     // through the very same `resolveLocalEntries` pass (:905-931). A settings-declared extension
     // root is therefore LOADED, not just pattern-filtered (CFG-004).
+    //
+    // This is the POSITIVE half only, and structurally can be nothing else: `resolve_local_entries`
+    // builds its candidate set from the array's PLAIN entries alone (manifest.rs:378-397), so a
+    // `+`/`-`/glob entry naming an AUTO-discovered extension has nothing here to match against. The
+    // negative half — `-pattern` over the loose `<agent_dir>/extensions` and `<cwd>/.cyrup/extensions`
+    // roots — is applied by `scan_loose_extension_root` (discovery/mod.rs), the analogue of the
+    // `override_enabled` retain pass skills/prompts/themes get in `blocking.rs`.
     for e in resolve_local_entries(
         base,
         &overrides.extensions,

@@ -7,7 +7,14 @@ use super::*;
 /// Pi `modelThinkingOverridesSummary` (`settings-selector.ts:184-188`): `"none"` when the map is
 /// empty, else `"{count} configured"`. Verbatim, because it is the row's user-visible value.
 fn model_thinking_summary(eff: &cyrup_session_svc::EffectiveSettings) -> String {
-    let count = eff.all_model_thinking_levels().len();
+    model_thinking_summary_for_count(eff.all_model_thinking_levels().len())
+}
+
+/// `modelThinkingOverridesSummary` proper (`settings-selector.ts:184-188`) — `"none"` at zero, else
+/// `"{n} configured"`. Split off the settings-view reader above because the submenu return path
+/// re-derives the row value from the map it is about to persist, before any re-read of the
+/// effective settings could see it.
+pub(crate) fn model_thinking_summary_for_count(count: usize) -> String {
     if count == 0 {
         "none".to_string()
     } else {
@@ -130,10 +137,9 @@ pub(crate) fn settings_rows(
         SettingRow::toggle("hideThinkingBlock", "Hide thinking", eff.hide_thinking_block())
             .with_description("Hide thinking blocks in assistant responses"),
         // `markdown.mermaid` — Pi's own position in the list: `hide-thinking`, then
-        // `mermaid-rendering`, then `cache-miss-notices` (which cyrup has no row for), then
-        // `collapse-changelog` (`settings-selector.ts:493-506`). Label and description are its
-        // verbatim strings (`:502-503`); the three values are `MermaidRenderingMode`'s own
-        // settings-file spellings.
+        // `mermaid-rendering`, then `cache-miss-notices`, then `collapse-changelog`
+        // (`settings-selector.ts:493-519`). Label and description are its verbatim strings
+        // (`:502-503`); the three values are `MermaidRenderingMode`'s own settings-file spellings.
         SettingRow::choice(
             "markdown.mermaid",
             "Mermaid diagrams",
@@ -141,6 +147,17 @@ pub(crate) fn settings_rows(
             choices(&["off", "final", "streaming"]),
         )
         .with_description("Render Mermaid code blocks as Unicode diagrams"),
+        // `showCacheMissNotices` — pi's `cache-miss-notices` row, in its own slot between
+        // `mermaid-rendering` and `collapse-changelog` (`settings-selector.ts:507-513`). Label and
+        // description are its verbatim strings (`:509` / `:511`).
+        SettingRow::toggle(
+            "showCacheMissNotices",
+            "Cache miss notices",
+            eff.show_cache_miss_notices(),
+        )
+        .with_description(
+            "Show transcript notices for significant prompt-cache misses and compaction costs",
+        ),
         SettingRow::toggle("collapseChangelog", "Collapse changelog", eff.collapse_changelog())
             .with_description("Show condensed changelog after updates"),
         SettingRow::toggle("quietStartup", "Quiet startup", eff.quiet_startup())

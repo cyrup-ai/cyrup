@@ -50,6 +50,36 @@ impl AgentSession {
         cyrup_provider::cache_stats::compute_cache_waste(&scan, &models)
     }
 
+    /// The prompt-cache miss charged to the MOST RECENT assistant turn, if it was above the
+    /// detector's noise floor — the input to pi's per-turn transcript notice
+    /// (`maybeShowCacheMissNotice`, `modes/interactive/interactive-mode.ts:3820-3826` @v0.83.0).
+    ///
+    /// **This is deliberately not [`cyrup_provider::cache_stats::detect_cache_miss`], and the
+    /// difference is an ordering one.** Upstream calls `detectCacheMiss(getEntries(), message, …)`
+    /// from its `message_end` handler and notes *"Entries don't contain `message` yet: message_end
+    /// fires before persistence"* — the just-finished turn is compared against the one before it.
+    /// cyrup inverts that ordering: [`crate::subscriber`] appends the finalized message to the
+    /// session tree BEFORE it fans the event out, so by the time any subscriber sees
+    /// `MessageEnd` the turn is already an entry. Passing those entries to `detect_cache_miss`
+    /// would compare the turn against ITSELF — `missed_tokens` collapses to `input + cache_write`
+    /// with `idle_ms == 0` (`cache_stats.rs:176-179`), i.e. a large false positive on every
+    /// big-prompt turn.
+    ///
+    /// Scanning the persisted entries and reading the LAST assistant one's miss is the faithful
+    /// equivalent: `scan` reaches that entry with `prev` set to the preceding request, which is
+    /// exactly the state `detect_cache_miss` synthesises upstream.
+    ///
+    /// `None` when there is no assistant turn yet, when the turn is the first after a reset, or
+    /// when the miss was at or below the noise floor — the same three silences upstream has.
+    pub async fn last_cache_miss(&self) -> Option<cyrup_provider::cache_stats::CacheMiss> {
+        use cyrup_provider::cache_stats::CacheScanEntry;
+        let models = self.full_model_registry();
+        let mgr = self.manager.lock().await;
+        let scan = crate::state::cache_scan_entries(mgr.entries());
+        let last = scan.iter().rposition(|e| matches!(e, CacheScanEntry::Assistant(_)))?;
+        cyrup_provider::cache_stats::collect_cache_misses(&scan, &models).get(&last).copied()
+    }
+
     /// The `contextUsage` sub-object of [`Self::session_stats`], in Pi's `ContextUsage` shape
     /// (`{tokens, contextWindow, percent}`, extensions/types.ts:288-294). `None` when no model /
     /// no known context window — Pi's `getContextUsage` returns `undefined` there

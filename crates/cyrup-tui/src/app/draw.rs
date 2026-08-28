@@ -92,6 +92,14 @@ impl<B: Backend> App<B> {
         // standalone `startup_selector` loop — so the in-app `/config` grid and the `ui.editor`
         // dialog (E12) both sized themselves against a default they were never told to update.
         self.state.term_rows = term_h;
+        // Publish the SCREEN width in the same breath, and for a related reason: the
+        // `availableWidth` of `MarkdownTransformContext` (`core/extensions/types.ts:1204`) is read
+        // off the render path but CONSUMED at push/commit time, by
+        // [`Self::apply_markdown_transformers`] — pi's transform runs inside `Markdown.render()` and
+        // is simply handed the live width (`markdown.ts:284-285`), cyrup's cannot. The last drawn
+        // width is the honest value there, so this is the frame that records it. See
+        // [`AppState::term_cols`].
+        self.state.term_cols = term_w;
         // E17: the editor caps ITSELF at `max(5, floor(terminalRows * 0.3))` from inside
         // `render` (`editor.ts:499-501`), so it needs the screen height too — `region_constraints`
         // reserving the right number of rows is not the same thing as the component knowing its own

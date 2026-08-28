@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Add Ctrl+S "Set As Default" And The `· default` Marker To `/model` And The Thinking Picker
