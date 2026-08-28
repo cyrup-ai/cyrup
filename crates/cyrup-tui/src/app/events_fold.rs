@@ -507,7 +507,10 @@ impl<B: Backend> App<B> {
             // transport) that does forward the terminal, and clears the open bit so `MessageEnd`
             // will not then commit the same text a second time. The `streaming_assistant` guard is
             // Pi's `if (this.streamingComponent && ...)` on `message_update`
-            // (`interactive-mode.ts:3146`).
+            // (`interactive-mode.ts:3146`). That guard makes this a PARTIAL arm: when
+            // `streaming_assistant` is false a matched `Done`/`Error` falls through to the `_ => {}`
+            // below, which is intended — with no open assistant message there is nothing to
+            // finalize — not an oversight.
             StreamEvent::Done { message, .. } | StreamEvent::Error { error: message, .. }
                 if self.state.streaming_assistant =>
             {

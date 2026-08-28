@@ -369,6 +369,59 @@ impl<B: Backend> App<B> {
                 }
             }
 
+            // Routed here, not to `execute_selector_command`: `execute_command`'s selector
+            // bucket lists `OpenSelector | ConfirmSelection | SetEntryLabel` only, so this
+            // variant reaches the `_` arm and lands in this file. Its `Thinking` sibling is
+            // directly below; both must stay here or the dispatcher silently drops them.
+            C::ConfirmSelectionAsDefault { kind: SelectorKind::Model, value } => {
+                // Pi `selectModel(model, true)` → `setModel(model, { persist: true })`
+                // (`interactive-mode.ts:4999` → `agent-session.ts:1630-1650`). ORDER IS THE
+                // CONTRACT: the session set runs FIRST and a failure returns without writing
+                // anything. Pi throws out of `setModel` before its persist when auth is missing
+                // (`agent-session.ts:1637-1639`); cyrup's `set_model_resolved` returns
+                // `NoConfiguredAuth` first (`model.rs:44-50`), so the same guard falls out of
+                // sequencing the persist after a successful set.
+                if let Err(e) = session.set_model(&value).await {
+                    self.state.transcript.push_status(format!("model error: {e}"));
+                    return;
+                }
+                // `setDefaultModelAndProvider(provider, id)` writes BOTH keys together
+                // (`settings-manager.ts:737-744`); never one alone, or a relaunch resolves a model
+                // id against the wrong provider. The picker confirms a fully-qualified
+                // `provider/id`, so the split is the inverse of how it was built.
+                let (provider, id) = match value.split_once('/') {
+                    Some((p, i)) => (p.to_string(), i.to_string()),
+                    // Unreachable from the picker; degrade rather than write a half pair.
+                    None => {
+                        self.state
+                            .transcript
+                            .push_status(format!("model → {value} (not persisted: no provider)"));
+                        return;
+                    }
+                };
+                let scope = cyrup_session_svc::SettingsScope::Global;
+                let wrote = match session
+                    .persist_setting(scope, "defaultProvider", serde_json::json!(provider))
+                    .await
+                {
+                    Ok(()) => {
+                        session.persist_setting(scope, "defaultModel", serde_json::json!(id)).await
+                    }
+                    Err(e) => Err(e),
+                };
+                match wrote {
+                    // `Default model: {provider}/{id}` vs the plain path's `Model: {id}`
+                    // (`interactive-mode.ts:4978`).
+                    Ok(()) => self
+                        .state
+                        .transcript
+                        .push_status(format!("Default model: {provider}/{id}")),
+                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                }
+                self.state.default_model = Some((provider.clone(), id.clone()));
+                self.add_persisted_default_to_non_empty_scope(session, &provider, &id).await;
+            }
+
             C::ConfirmSelectionAsDefault { kind: SelectorKind::Thinking, value } => {
                 // Pi `selectLevel(level, true)` → `setThinkingLevel(level, { persist: true })`
                 // (`interactive-mode.ts:4813` → `:4788`). Same ordering contract as the model
@@ -686,8 +739,17 @@ impl<B: Backend> App<B> {
 
             C::Share => self.share_session(session).await,
 
-            // unreachable by construction: the dispatcher covers every variant before here.
-            _ => {}
+            // Was `_ => {}` under a comment asserting this is unreachable. Nothing enforced that
+            // assertion, and it was false for `ConfirmSelectionAsDefault { kind: Model, .. }` until
+            // cc19b87 — the arm existed, in a function the router never sent this variant to, so the
+            // command vanished with no model change, no settings write and no status. Silence is the
+            // one failure mode that hides a misrouted arm, so refuse to be silent.
+            other => {
+                debug_assert!(false, "unrouted command in execute_misc_command: {other:?}");
+                self.state
+                    .transcript
+                    .push_error(format!("internal: unrouted command {other:?}"));
+            }
         }
     }
 

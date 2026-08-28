@@ -38,8 +38,23 @@ impl<B: Backend> App<B> {
             | C::DeleteSession(_) | C::RenameSession { .. } | C::Export(_) | C::SessionInfo => {
                 self.execute_session_command(cmd, session, runtime).await
             }
-            // everything else — app/execute_misc.rs
-            _ => self.execute_misc_command(cmd, session).await,
+            // app/execute_misc.rs — LISTED, not `_`, so a new variant is a compile error until it
+            // is deliberately bucketed. This alone does not prevent the cc19b87 defect: that was a
+            // variant routed to a dispatcher with no arm for it, which still compiles. The loud
+            // catch-alls in the sub-dispatchers are what catch that.
+            C::ApplySetting { .. }
+            | C::ConfirmSelectionAsDefault { .. }
+            | C::Copy
+            | C::CycleModel(_)
+            | C::CycleThinking
+            | C::LoginCommand(_)
+            | C::ModelCommand(_)
+            | C::SetModelThinkingLevel { .. }
+            | C::SetName(_)
+            | C::SetThinking(_)
+            | C::Share
+            | C::ShowName
+            | C::ThinkingCommand(_) => self.execute_misc_command(cmd, session).await,
         }
     }
 
@@ -388,55 +403,6 @@ impl<B: Backend> App<B> {
                 }
             }
 
-            C::ConfirmSelectionAsDefault { kind: SelectorKind::Model, value } => {
-                // Pi `selectModel(model, true)` → `setModel(model, { persist: true })`
-                // (`interactive-mode.ts:4999` → `agent-session.ts:1630-1650`). ORDER IS THE
-                // CONTRACT: the session set runs FIRST and a failure returns without writing
-                // anything. Pi throws out of `setModel` before its persist when auth is missing
-                // (`agent-session.ts:1637-1639`); cyrup's `set_model_resolved` returns
-                // `NoConfiguredAuth` first (`model.rs:44-50`), so the same guard falls out of
-                // sequencing the persist after a successful set.
-                if let Err(e) = session.set_model(&value).await {
-                    self.state.transcript.push_status(format!("model error: {e}"));
-                    return;
-                }
-                // `setDefaultModelAndProvider(provider, id)` writes BOTH keys together
-                // (`settings-manager.ts:737-744`); never one alone, or a relaunch resolves a model
-                // id against the wrong provider. The picker confirms a fully-qualified
-                // `provider/id`, so the split is the inverse of how it was built.
-                let (provider, id) = match value.split_once('/') {
-                    Some((p, i)) => (p.to_string(), i.to_string()),
-                    // Unreachable from the picker; degrade rather than write a half pair.
-                    None => {
-                        self.state
-                            .transcript
-                            .push_status(format!("model → {value} (not persisted: no provider)"));
-                        return;
-                    }
-                };
-                let scope = cyrup_session_svc::SettingsScope::Global;
-                let wrote = match session
-                    .persist_setting(scope, "defaultProvider", serde_json::json!(provider))
-                    .await
-                {
-                    Ok(()) => {
-                        session.persist_setting(scope, "defaultModel", serde_json::json!(id)).await
-                    }
-                    Err(e) => Err(e),
-                };
-                match wrote {
-                    // `Default model: {provider}/{id}` vs the plain path's `Model: {id}`
-                    // (`interactive-mode.ts:4978`).
-                    Ok(()) => self
-                        .state
-                        .transcript
-                        .push_status(format!("Default model: {provider}/{id}")),
-                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
-                }
-                self.state.default_model = Some((provider.clone(), id.clone()));
-                self.add_persisted_default_to_non_empty_scope(session, &provider, &id).await;
-            }
-
             C::SetEntryLabel { entry_id, label } => {
                 // Persist the `/tree` label edit via the SAME live `set_label` path a loaded
                 // extension's `setLabel` uses (`LiveHostServices::set_label` → `manager.append_label`,
@@ -629,8 +595,16 @@ impl<B: Backend> App<B> {
                 self.state.transcript.push_status(format!("{} → {value}", kind.title()));
             }
 
-            // unreachable by construction: the dispatcher only routes selector commands here.
-            _ => {}
+            // NOT unreachable by construction — nothing enforced that. `execute_command` decides
+            // what arrives here, and a variant it routes to this function with no arm above lands in
+            // this branch. Silence is the one failure mode that hides a misrouted arm, so report it.
+            // See the `execute_misc_command` twin for the defect that made this necessary (cc19b87).
+            other => {
+                debug_assert!(false, "unrouted command in execute_selector_command: {other:?}");
+                self.state
+                    .transcript
+                    .push_error(format!("internal: unrouted command {other:?}"));
+            }
         }
     }
 }

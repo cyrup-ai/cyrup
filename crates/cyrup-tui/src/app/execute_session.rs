@@ -307,8 +307,15 @@ impl<B: Backend> App<B> {
                     .push_status(format!("importing session {}", p.unwrap_or_default())),
             },
 
-            // unreachable by construction: the dispatcher only routes lifecycle commands here.
-            _ => {}
+            // NOT unreachable by construction — nothing enforced that. `execute_command` picks the
+            // lifecycle bucket; a variant it names there with no arm above lands here. Report it
+            // rather than swallowing it — cc19b87 was exactly this, in `execute_misc_command`.
+            other => {
+                debug_assert!(false, "unrouted command in execute_session_command: {other:?}");
+                self.state
+                    .transcript
+                    .push_error(format!("internal: unrouted command {other:?}"));
+            }
         }
     }
 
@@ -387,8 +394,17 @@ impl<B: Backend> App<B> {
                 }
             }
 
-            // unreachable by construction: only the two switch confirmations route here.
-            _ => {}
+            // NOT unreachable by construction, and this one's invariant is not even local: what
+            // reaches here is decided by the caller's pattern in `execute_selector_command`
+            // (`execute.rs:589-591`, `ConfirmSelection` of kind `Session` or `UserMessage`). Widen
+            // that arm without adding an arm here and the command vanishes silently — cc19b87's
+            // shape, one level deeper. Report it instead.
+            other => {
+                debug_assert!(false, "unrouted command in execute_session_switch: {other:?}");
+                self.state
+                    .transcript
+                    .push_error(format!("internal: unrouted command {other:?}"));
+            }
         }
     }
 
