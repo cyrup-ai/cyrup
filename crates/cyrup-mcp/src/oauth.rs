@@ -56,8 +56,9 @@
 //! Token storage itself — the OS keyring, the chunking manifest, the `keyctl` recovery — is
 //! `mcp-auth.ts` and belongs to gap-analysis section 13f ([`crate::credentials`]). This module
 //! consumes it through the [`McpOAuthStorage`] trait so the two can land independently;
-//! [`InMemoryOAuthStorage`] is the test double and the interim default. See the module's report
-//! for the one-adapter wiring that binds 13f's `McpAuthStore` to this trait.
+//! [`InMemoryOAuthStorage`] is the test double. Production constructs 13f's `McpAuthStore`
+//! (`runtime.rs:227-229`) and reaches this trait through that type's own impl
+//! (`credentials.rs:3579`).
 //!
 //! # Everything here is `extension-owned`
 //!
@@ -495,6 +496,11 @@ static APP_NAME_OVERRIDE: OnceLock<StdMutex<Option<String>>> = OnceLock::new();
 /// Override [`app_name`] for the current process. Intended for the branding tests and for a host
 /// that resolves its own name after startup — upstream builds every page per request for exactly
 /// that reason.
+///
+/// No production caller: cyrup's name is a compile-time constant ([`crate::dirs::APP_NAME`]), so
+/// the host half of that seam never has to be used. The tests that do use it are this file's
+/// callback-page branding assertions, and they must reset it to `None` afterwards — the override is
+/// process-global.
 pub fn set_app_name(name: Option<String>) {
     let slot = APP_NAME_OVERRIDE.get_or_init(|| StdMutex::new(None));
     if let Ok(mut guard) = slot.lock() {
@@ -509,6 +515,13 @@ pub fn set_app_name(name: Option<String>) {
 /// must not advertise this adapter's repository. Upstream omits the field entirely when it cannot
 /// name one; cyrup declares [`crate::dirs::APP_CLIENT_URI`], so the omit arm is unreachable here
 /// and is recorded rather than reproduced.
+///
+/// **Nothing calls it because it has no wire to reach.** rmcp's `ClientRegistrationRequest` is a
+/// fixed struct with no `client_uri` field and no extension map, so the registration this crate
+/// sends cannot carry the value however it is computed — see the `client_uri` / `logo_uri` note on
+/// [`prepare_session`] and the `TODO(MCP-312)` beside its registration step. Kept as the declared
+/// answer for when that field exists; `McpSettings::client_uri` (`config.rs:1500`) is the
+/// configured override it would defer to.
 #[must_use]
 pub fn default_client_uri() -> Option<String> {
     Some(APP_CLIENT_URI.to_string())
@@ -1182,6 +1195,11 @@ pub async fn callback_redirect_uri() -> Option<String> {
 }
 
 /// The live `(port, path)` pair — `getOAuthCallbackPort()` / `getOAuthCallbackPath()`.
+///
+/// No production reader: a flow that needs the callback address takes the whole `redirect_uri` from
+/// [`callback_redirect_uri`] instead. This is the split form, and its consumer is this file's own
+/// listener tests, which assert the port and path survive a reserve/release cycle and are
+/// re-derived after a reset.
 #[must_use]
 pub async fn callback_endpoint() -> (u16, String) {
     let runtime = callback_runtime();
@@ -1321,12 +1339,22 @@ async fn stop_callback_server_inner(runtime: &Arc<CallbackRuntime>) {
 }
 
 /// `isCallbackServerRunning()` (`mcp-callback-server.ts:501`).
+///
+/// An inspection hook with no production reader — the listener's lifecycle is driven by
+/// [`shutdown_oauth`]'s last-runtime-out rule (MCP-344), not by polling this. Its consumer is the
+/// OAuth integration suite, which asserts the listener is down once a journey finishes
+/// (`crates/cyrup-it/tests/mcp/http_oauth.rs:811`, `:1393`, `:1533`, `:1987`).
 #[must_use]
 pub async fn is_callback_server_running() -> bool {
     callback_runtime().listener.lock().await.server.is_some()
 }
 
 /// `getPendingAuthCount()` (`mcp-callback-server.ts:508`).
+///
+/// An inspection hook with no production reader; its consumer is the OAuth integration suite's
+/// teardown assertions, which pair it with [`is_callback_server_running`] to prove a finished
+/// journey left no reservation behind (`crates/cyrup-it/tests/mcp/http_oauth.rs:815`, `:1396`,
+/// `:1990`).
 #[must_use]
 pub fn pending_callback_count() -> usize {
     callback_runtime().maps.pending_count()
@@ -1441,8 +1469,12 @@ pub trait McpOAuthStorage: Send + Sync + 'static {
     }
 }
 
-/// The in-process [`McpOAuthStorage`] — the test double, and the interim default until section
-/// 13f's keyring store is wired in.
+/// The in-process [`McpOAuthStorage`] — the test double, and **only** that.
+///
+/// It is the default nowhere. Production constructs a [`crate::credentials::McpAuthStore`]
+/// (`runtime.rs:227-229`) and reaches this trait through that type's own impl
+/// (`credentials.rs:3579`), which is what section 13f landed for (MCP-321). This type stays because
+/// the flow's unit tests need a store with no keychain behind it.
 ///
 /// It reproduces the URL-binding purge rule so tests written against it are not lying about the
 /// real store's behaviour.
@@ -1619,6 +1651,11 @@ pub struct McpTokens {
 
 impl McpTokens {
     /// `token_type` is hardcoded `"Bearer"` on read (`mcp-oauth-provider.ts:396`).
+    ///
+    /// Declared for the wire contract, not consumed: the one site that writes the field spells the
+    /// literal itself (`credentials.rs:697`), because it builds the RFC 6749 §5.1 JSON by hand and
+    /// never sees this type. Point that site at this constant, or drop the constant — but do not
+    /// add a third spelling.
     pub const TOKEN_TYPE: &'static str = "Bearer";
 }
 
@@ -1839,6 +1876,24 @@ pub struct McpOAuthRuntime {
     /// `signal.reason` — a `CancelToken` carries no payload.
     stop_reason: StdMutex<Option<String>>,
     state: AsyncMutex<RuntimeState>,
+    /// A **synchronous** mirror of [`RuntimeState::pending_auths`]' keys — `key -> server_name`.
+    ///
+    /// Upstream's `pendingAuths` is a plain `Map`, so `hasPendingAuth` is an ordinary synchronous
+    /// lookup and `new McpLifecycleManager(manager, name => hasPendingAuth(name, undefined, rt))`
+    /// (`init.ts:143`) needs nothing more. Here the authoritative map lives behind an
+    /// [`AsyncMutex`], because every writer holds it across an `await`; that makes
+    /// [`has_pending_auth`] `async`, and [`crate::lifecycle::PendingAuthCheck`] is
+    /// `Fn(&str) -> bool` — a synchronous predicate consulted from inside the health-check loop.
+    ///
+    /// A `try_lock` probe was the alternative and is the wrong one: it answers "no pending auth"
+    /// whenever the async lock happens to be held, which is *precisely* while a flow is being
+    /// published or released — so the idle reaper would be most likely to fire exactly when a login
+    /// is in flight. This mirror is instead written **under the async lock**, in the same critical
+    /// section as the authoritative insert/remove, so a synchronous reader can never observe an
+    /// ordering the async map does not also have.
+    ///
+    /// It holds names, never tokens or URLs, so it is safe to `Debug`-print by count.
+    pending_auth_index: StdMutex<HashMap<String, String>>,
 }
 
 impl std::fmt::Debug for McpOAuthRuntime {
@@ -1907,6 +1962,7 @@ pub fn create_oauth_runtime(signal: Option<&CancelToken>) -> Arc<McpOAuthRuntime
         generation: AtomicU64::new(0),
         stop_reason: StdMutex::new(None),
         state: AsyncMutex::new(RuntimeState::default()),
+        pending_auth_index: StdMutex::new(HashMap::new()),
     });
     if let Ok(mut live) = live_runtimes().lock() {
         live.insert(runtime.id);
@@ -1958,25 +2014,6 @@ pub fn get_runtime(runtime: Option<&Arc<McpOAuthRuntime>>) -> McpResult<Arc<McpO
         live.insert(runtime.id);
     }
     Ok(runtime)
-}
-
-/// `initializeOAuth(runtimeOrSignal?)` (`mcp-auth-flow.ts:944`).
-///
-/// **Binding is lazy**: this never starts the listener; only [`start_auth`] does.
-pub async fn initialize_oauth(
-    runtime: Option<&Arc<McpOAuthRuntime>>,
-    signal: Option<&CancelToken>,
-) -> McpResult<Arc<McpOAuthRuntime>> {
-    if let Some(runtime) = runtime {
-        runtime.throw_if_aborted()?;
-        if let Ok(mut live) = live_runtimes().lock() {
-            live.insert(runtime.id);
-        }
-        return Ok(Arc::clone(runtime));
-    }
-    let legacy = legacy_runtime();
-    shutdown_oauth(&legacy).await;
-    Ok(create_oauth_runtime(signal))
 }
 
 /// `shutdownOAuth(runtime)` (`mcp-auth-flow.ts:963`) — in exactly this order.
@@ -2058,6 +2095,41 @@ pub async fn has_pending_auth(
     }
 }
 
+/// [`has_pending_auth`] without the `await` — the form
+/// [`crate::lifecycle::PendingAuthCheck`] can actually be built from.
+///
+/// Same two lookups as the async twin (exact key with a base directory, a scan over the recorded
+/// server names without), read from [`McpOAuthRuntime::pending_auth_index`] instead of from the
+/// async map. The two are written in one critical section, so they agree.
+///
+/// Its one consumer is [`crate::lifecycle::McpLifecycleManager`]'s two keep-alive **reconnect**
+/// gates (`lifecycle.ts:177`, `:229`) — *"Skipping reconnect for {name} while OAuth authorization is
+/// pending"*. Until this existed the manager was constructed with a hardcoded `|_| false`, so both
+/// gates were dead and the 30-second health check would connect a server whose login was still in
+/// flight. The window that matters is the one journey B spends most of its time in: after
+/// `execute_auth_complete` closes the connection so the new token is used, and before the retry
+/// connects. A health-check tick landing there races the flow's own reconnect, burns another 401,
+/// and files a connect failure that puts the server into the 60-second backoff — while the human is
+/// still looking at a browser.
+///
+/// A poisoned mirror lock degrades to `false`, which is the answer for a server with no flow in
+/// flight: the reconnect proceeds, exactly as it did before this function existed, rather than a
+/// keep-alive server being wedged permanently un-reconnectable.
+#[must_use]
+pub fn has_pending_auth_sync(
+    runtime: &Arc<McpOAuthRuntime>,
+    server_name: &str,
+    base_dir: Option<&Path>,
+) -> bool {
+    let Ok(index) = runtime.pending_auth_index.lock() else {
+        return false;
+    };
+    match base_dir {
+        Some(base_dir) => index.contains_key(&pending_auth_key(server_name, base_dir)),
+        None => index.values().any(|recorded| recorded == server_name),
+    }
+}
+
 /// `setPendingAuth(...)` (`mcp-auth-flow.ts:449`).
 ///
 /// Clears any prior pending auth for the key, re-checks the abort **and the generation captured
@@ -2085,6 +2157,12 @@ async fn set_pending_auth(
     let timer = CancelToken::new();
     {
         let mut state = runtime.state.lock().await;
+        // The synchronous mirror is written INSIDE the async critical section, before the guard is
+        // dropped, so `has_pending_auth_sync` can never see a flow the async map has not published
+        // (or miss one it has). See `McpOAuthRuntime::pending_auth_index`.
+        if let Ok(mut index) = runtime.pending_auth_index.lock() {
+            index.insert(key.clone(), pending.server_name.clone());
+        }
         state.pending_auths.insert(key.clone(), pending);
         state
             .pending_auth_states
@@ -2145,6 +2223,12 @@ async fn clear_pending_auth(
 
         if let Some(timer) = state.pending_auth_timers.remove(&key) {
             timer.cancel();
+        }
+        // Mirror the release under the same lock the publish was mirrored under. The state guard
+        // above has already returned for a stale timer, so a superseded flow's cleanup cannot evict
+        // the newer flow's entry.
+        if let Ok(mut index) = runtime.pending_auth_index.lock() {
+            index.remove(&key);
         }
         let removed = state.pending_auths.remove(&key);
         // `pendingAuth?.authStorageOptions ?? fallbackStorageOptions` (`mcp-auth-flow.ts:478`) —
@@ -2400,6 +2484,13 @@ impl BrowserLauncher for OpenerLauncher {
 }
 
 /// A launcher that does nothing successfully — for headless hosts and tests.
+///
+/// **No production constructor.** Production always keeps [`OpenerLauncher`]; this one reaches a
+/// flow only by injection through [`crate::extension::McpExtension::with_browser_launcher`], and
+/// its only user is the OAuth integration suite's journey C
+/// (`crates/cyrup-it/tests/mcp/http_oauth.rs:541`), which drives a real authorization round trip
+/// with no browser. Suppressing the handoff loses nothing: the URL is surfaced through
+/// `options.on_authorization_url` *before* the launcher runs (`extension.rs:1570-1576`).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct NoopLauncher;
 
@@ -3673,6 +3764,14 @@ async fn refresh_tokens(
 /// Resolves the runtime for its side effect of resurrecting an aborted legacy runtime, then answers
 /// `NotAuthenticated` when no tokens are stored, else `expired ? Expired : Authenticated` — so a
 /// `None` expiry reads as `Authenticated`.
+///
+/// # No caller yet, and the reason is MCP-394
+///
+/// This and [`remove_auth`] are the status and remove verbs of the `/mcp` surface. `/mcp-auth
+/// <server>` — the *login* verb — is routed (MCP-334, `extension.rs:1483`); `/mcp` itself is
+/// registered and then deliberately left on the trait's default answer, because its dispatcher is
+/// not ported (`extension.rs:2085-2088`). These two belong to that dispatcher, not to this module,
+/// and are kept ready for it rather than deleted.
 pub async fn get_auth_status(
     server_name: &str,
     server_url: &str,
@@ -3697,6 +3796,9 @@ pub async fn get_auth_status(
 
 /// `removeAuth(serverName, options)` (`mcp-auth-flow.ts:915`), in order, with abort checks
 /// interleaved at four points.
+///
+/// **`/mcp`'s remove verb, and it waits on MCP-394 with the rest of that tier.** See
+/// [`get_auth_status`] for why neither verb has a caller yet.
 pub async fn remove_auth(server_name: &str, options: &AuthenticateOptions) -> McpResult<()> {
     let runtime = get_runtime(options.runtime.as_ref())?;
     let signal = options.combined_signal(&runtime);
@@ -3729,18 +3831,16 @@ pub async fn remove_auth(server_name: &str, options: &AuthenticateOptions) -> Mc
 // the same as upstream's.
 pub use crate::credentials::{McpOAuthTokenStatus, OAuthCredentialStatus};
 
-/// `getMcpOAuthTokensForUrl(...)` (`oauth.ts`) — delegates to [`get_valid_token`], **so it may
-/// refresh**. The store being unavailable throws rather than looking like "no tokens".
-pub async fn get_mcp_oauth_tokens_for_url(
-    server_name: &str,
-    server_url: &str,
-    options: &AuthenticateOptions,
-) -> McpResult<Option<McpTokens>> {
-    get_valid_token(server_name, server_url, options).await
-}
-
 /// `inspectMcpOAuthTokensForUrl(...)` (`oauth.ts`) — **never refreshes**, and exposes **only**
 /// tokens: never the client registration, never the PKCE verifier, never the CSRF state.
+///
+/// The read-only twin of [`get_valid_token`], and the one member of `oauth.ts`'s embedder façade
+/// that survived: its two neighbours were one-line delegations with no caller and were deleted,
+/// while this one has a real consumer — the OAuth integration suite, which asserts a token landed
+/// in the store **without** perturbing it (`crates/cyrup-it/tests/mcp/http_oauth.rs:792`, whose
+/// note at `:780-787` records why the suite wants this token-level answer and not the entry-level
+/// one: [`start_auth`] writes the dynamic-registration record before any browser round trip, so an
+/// entry exists for a server that has never completed a login).
 pub async fn inspect_mcp_oauth_tokens_for_url(
     server_name: &str,
     server_url: &str,
@@ -3760,134 +3860,62 @@ pub async fn inspect_mcp_oauth_tokens_for_url(
     }
 }
 
-/// `updateMcpOAuthTokensForUrl(...)` (`oauth.ts`) — moving tokens to a new URL clears the old
-/// entry's client registration, which the URL-binding purge rule in the store performs.
-pub async fn update_mcp_oauth_tokens_for_url(
-    server_name: &str,
-    server_url: &str,
-    credentials: StoredCredentials,
-    storage: &Arc<dyn McpOAuthStorage>,
-) -> McpResult<()> {
-    storage
-        .save_credentials(server_name, server_url, Some(credentials))
-        .await
-}
-
 // ===================================================================================================
 // 12 · The user-facing strings and the connect-path classification (MCP-333, MCP-334, MCP-335)
 // ===================================================================================================
 
-// TODO(MCP-334): `/mcp-auth <server>` registers at the command tier (`InitApi::register_command`
+// MCP-334, landed: `/mcp-auth <server>` registers at the command tier (`InitApi::register_command`
 // plus `NativeExtension::execute_command`) and lives in `registration.rs`/`extension.rs`, not here.
-// This module owns the literals and the guard order — no interactive UI, unknown server, disabled,
-// not an OAuth server, no URL — and `HostServices::{set_status, notify, confirm, input}` do the
-// rest. The `mcp-auth` status key is set to [`msg_authenticating`] and cleared in a `finally`
-// **unless the signal aborted**. Terminal hyperlinks (OSC 8) have no helper: emit the escape
-// sequence in the message text, or drop the hyperlink and record the loss.
+// What is NOT yet proven is the route end to end against a server — the handler's tests cover
+// refusals, routing and message formatting, not a login.
 //
-// TODO(MCP-335): `mcp({action:"auth-start"/"auth-complete"})` and auto-auth live in `proxy.rs` and
-// the direct-tools path. This module supplies [`format_manual_auth_instructions`],
-// [`msg_auth_required_proxy`], [`msg_auth_required_direct_tools`] and [`msg_auto_auth_failed`];
-// the `details` keys (`mode`, `error`, `server`, `authorizationUrl`, `authenticated`, `status`,
-// `message`) are consumed by the tool-result renderer, so keep the names. `auth-complete`
-// additionally **closes the server connection** so the next `connect` uses the new token.
+// **The literals went with it, and the copies left behind here were deleted.** This section used to
+// carry its own guard vocabulary — no interactive UI, unknown server, disabled, not an OAuth
+// server, no URL, authenticating, success, failure, threw — none of it with a caller, and every one
+// byte-identical to what `McpExtension::authenticate_server` actually emits (`extension.rs`, the
+// guard ladder from `:1483`, with `AUTH_REQUIRES_INTERACTIVE` at `:1693` and
+// `failed_to_authenticate` at `:1763`, which additionally sanitizes the interpolated message and is
+// therefore strictly the better copy). A second grammar with no caller only drifts from the first,
+// so it is gone. The one text here that was NOT a duplicate went too: upstream *returns* a one-line
+// "does not use OAuth authentication" and *notifies* a two-line one, and this port deliberately
+// carries only the notify form (`extension.rs:1503-1509`, asserted verbatim at `extension.rs:3194`),
+// so nothing wants the one-line form. Terminal hyperlinks (OSC 8) still have no helper: emit the
+// escape sequence in the message text, or drop the hyperlink and record the loss.
+//
+// MCP-335, partly landed: `mcp({action:"auth-start"/"auth-complete"})` and auto-auth live in
+// `proxy.rs` and the direct-tools path, and the proxy-tier texts landed there —
+// [`crate::proxy::results::default_auth_required_message`] and
+// [`crate::proxy::results::get_auth_failed_message`]. What this section still supplies is
+// [`format_manual_auth_instructions`] (re-exported below) and [`msg_auth_required_direct_tools`],
+// whose literal has no counterpart anywhere else. The `details` keys (`mode`, `error`, `server`,
+// `authorizationUrl`, `authenticated`, `status`, `message`) are consumed by the tool-result
+// renderer, so keep the names. `auth-complete` additionally **closes the server connection** so the
+// next `connect` uses the new token.
 //
 // TODO(MCP-341): ship the corrected `OAUTH.md` with 13g §14's eight divergences fixed, plus this
 // port's own deltas — the `skipIssuerMetadataValidation` narrowing, the absent `prompt=consent`,
 // the `localhost`/`127.0.0.1` bind decision, and the `CYRUP_MCP_OAUTH_CALLBACK_PORT` rename.
 
-/// `"OAuth authentication requires an interactive session."`
-pub const MSG_REQUIRES_INTERACTIVE: &str = "OAuth authentication requires an interactive session.";
-
-/// `Server "<n>" not found in config`
-#[must_use]
-pub fn msg_server_not_found(server_name: &str) -> String {
-    format!("Server \"{server_name}\" not found in config")
-}
-
-/// `Server "<n>" is disabled. Run /mcp enable <n>, then /reload.`
-#[must_use]
-pub fn msg_server_disabled(server_name: &str) -> String {
-    format!("Server \"{server_name}\" is disabled. Run /mcp enable {server_name}, then /reload.")
-}
-
-/// `Server "<n>" does not use OAuth authentication. Set "auth": "oauth" or omit auth for
-/// auto-detection.` — the `notify` variant breaks after the first sentence with `\n`.
-#[must_use]
-pub fn msg_not_oauth(server_name: &str) -> String {
-    format!(
-        "Server \"{server_name}\" does not use OAuth authentication. Set \"auth\": \"oauth\" or omit auth for auto-detection."
-    )
-}
-
-/// `Server "<n>" has no URL configured (OAuth requires HTTP transport)`
-#[must_use]
-pub fn msg_no_url(server_name: &str) -> String {
-    format!("Server \"{server_name}\" has no URL configured (OAuth requires HTTP transport)")
-}
-
-/// The `mcp-auth` status-bar key's value while a login is running.
-#[must_use]
-pub fn msg_authenticating(server_name: &str) -> String {
-    format!("Authenticating {server_name}...")
-}
-
-/// `OAuth authentication successful for "<n>".`
-#[must_use]
-pub fn msg_auth_success(server_name: &str) -> String {
-    format!("OAuth authentication successful for \"{server_name}\".")
-}
-
-/// `OAuth authentication failed for "<n>".`
-#[must_use]
-pub fn msg_auth_failed(server_name: &str) -> String {
-    format!("OAuth authentication failed for \"{server_name}\".")
-}
-
-/// `Failed to authenticate "<n>": <message>` — every aggregate in this module surfaces through
-/// here, which is why collapsing an aggregate to its primary error would make the secondary
-/// permanently invisible (MCP-345).
-#[must_use]
-pub fn msg_auth_threw(server_name: &str, message: &str) -> String {
-    format!("Failed to authenticate \"{server_name}\": {message}")
-}
-
-/// The proxy-tier auth-required text. Overridable by `settings.authRequiredMessage`, which
-/// templates `${server}`.
-#[must_use]
-pub fn msg_auth_required_proxy(server_name: &str) -> String {
-    format!(
-        "Server \"{server_name}\" requires OAuth authentication. Run mcp({{ action: \"auth-start\", server: \"{server_name}\" }}) to get a browser URL, or /mcp-auth {server_name} in an interactive local session."
-    )
-}
-
-/// The direct-tools auth-required text — the same sentence with an `MCP server` prefix, and a
-/// genuinely different literal from [`msg_auth_required_proxy`].
+/// The direct-tools auth-required text — the same sentence as the proxy tier's
+/// [`crate::proxy::results::default_auth_required_message`] with an `MCP server` prefix, and so a
+/// genuinely different literal from it.
+///
+/// # Reserved, and the last member of MCP-335's vocabulary that still is
+///
+/// The other two texts this section staged for MCP-335 have landed in `proxy/results.rs` — the
+/// auth-required default at [`crate::proxy::results::default_auth_required_message`] and the
+/// auto-auth failure at [`crate::proxy::results::get_auth_failed_message`]'s no-template arm — and
+/// the copies here were byte-identical duplicates with no caller, so they were deleted. This one
+/// has no counterpart there because the path that would emit it is not ported (MCP-215):
+/// [`crate::proxy::attempt_auto_auth`] serves the gateway tool and reaches for the proxy wording;
+/// the per-tool direct-call flavour does not exist yet. Kept rather than deleted so the `MCP
+/// server "…"` prefix — the only thing that distinguishes a direct-tool refusal from a proxy one —
+/// survives until it lands.
 #[must_use]
 pub fn msg_auth_required_direct_tools(server_name: &str) -> String {
     format!(
         "MCP server \"{server_name}\" requires OAuth authentication. Run mcp({{ action: \"auth-start\", server: \"{server_name}\" }}) to get a browser URL, or /mcp-auth {server_name} in an interactive local session."
     )
-}
-
-/// `getAuthFailedMessage(...)` — the failure text plus the auth-required guidance.
-#[must_use]
-pub fn msg_auto_auth_failed(server_name: &str, message: &str) -> String {
-    format!(
-        "OAuth authentication failed for \"{server_name}\": {message}. Run mcp({{ action: \"auth-start\", server: \"{server_name}\" }}) to get a browser URL, or /mcp-auth {server_name} in an interactive local session."
-    )
-}
-
-/// `getRedirectPort(authorizationUrl)` (`proxy-modes.ts:94`) — re-parse `redirect_uri` out of the
-/// authorization URL and take its port.
-#[must_use]
-pub fn redirect_port_of(authorization_url: &str) -> Option<u16> {
-    let url = url::Url::parse(authorization_url).ok()?;
-    let redirect = url
-        .query_pairs()
-        .find(|(key, _)| key == "redirect_uri")
-        .map(|(_, value)| value.into_owned())?;
-    url::Url::parse(&redirect).ok()?.port()
 }
 
 // **De-duplicated at integration.** `formatManualAuthInstructions` is MCP-167, which
@@ -4467,10 +4495,6 @@ mod tests {
         assert_eq!(lines.len(), 8, "{with_port}");
         assert_eq!(lines[6], "");
         assert!(lines[7].contains("local port 19876"));
-        assert_eq!(
-            redirect_port_of("https://as/authorize?redirect_uri=http%3A%2F%2Flocalhost%3A19876%2Fcallback"),
-            Some(19876)
-        );
     }
 
     // --- MCP-333: the connect-path classification -----------------------------------------------
@@ -4608,6 +4632,116 @@ mod tests {
             .await
             .unwrap();
         assert!(!has_pending_auth(&runtime, "acme", None).await);
+        shutdown_oauth(&runtime).await;
+    }
+
+    /// MCP-334 — the synchronous mirror answers exactly what the async map answers, in both of
+    /// `hasPendingAuth`'s forms, across a publish, a release and a shutdown.
+    ///
+    /// This is the pin on the *whole* reason the mirror exists: `PendingAuthCheck` is a sync
+    /// `Fn(&str) -> bool`, so if the two ever disagree the idle reaper closes a server whose OAuth
+    /// flow is still in flight — and the loopback callback then arrives for a connection that no
+    /// longer exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_sync_pending_auth_mirror_tracks_the_async_map() {
+        let runtime = create_oauth_runtime(None);
+        let storage: Arc<dyn McpOAuthStorage> =
+            Arc::new(InMemoryOAuthStorage::new(PathBuf::from("/base")));
+        let base_dir = storage.base_dir();
+        let make = |server: &str| PendingAuth {
+            server_name: server.to_string(),
+            server_url: format!("https://{server}/mcp"),
+            authorization_url: "https://as/authorize".to_string(),
+            session: Arc::new(AsyncMutex::new(None)),
+            expected_issuer: None,
+            requires_issuer: false,
+            storage: Arc::clone(&storage),
+            base_dir: base_dir.clone(),
+        };
+
+        // Nothing published yet.
+        assert!(!has_pending_auth(&runtime, "acme", None).await);
+        assert!(!has_pending_auth_sync(&runtime, "acme", None));
+
+        let generation = runtime.generation();
+        set_pending_auth(&runtime, make("acme"), "state-acme", generation)
+            .await
+            .unwrap();
+        set_pending_auth(&runtime, make("other"), "state-other", generation)
+            .await
+            .unwrap();
+
+        for server in ["acme", "other"] {
+            assert!(has_pending_auth(&runtime, server, None).await);
+            assert!(has_pending_auth_sync(&runtime, server, None));
+            assert!(has_pending_auth(&runtime, server, Some(&base_dir)).await);
+            assert!(has_pending_auth_sync(&runtime, server, Some(&base_dir)));
+        }
+        // A base directory that no flow was published against matches neither.
+        let elsewhere = PathBuf::from("/somewhere-else");
+        assert!(!has_pending_auth(&runtime, "acme", Some(&elsewhere)).await);
+        assert!(!has_pending_auth_sync(&runtime, "acme", Some(&elsewhere)));
+
+        // Releasing one leaves the other.
+        clear_pending_auth(&runtime, "acme", Some("state-acme"), &base_dir, None)
+            .await
+            .unwrap();
+        assert!(!has_pending_auth(&runtime, "acme", None).await);
+        assert!(!has_pending_auth_sync(&runtime, "acme", None));
+        assert!(has_pending_auth(&runtime, "other", None).await);
+        assert!(has_pending_auth_sync(&runtime, "other", None));
+
+        // `shutdownOAuth` clears every pending flow, and the mirror empties with them — otherwise a
+        // dead generation's runtime would report a live login for the life of the process.
+        shutdown_oauth(&runtime).await;
+        assert!(!has_pending_auth(&runtime, "other", None).await);
+        assert!(!has_pending_auth_sync(&runtime, "other", None));
+    }
+
+    /// The mirror's release is written INSIDE `clear_pending_auth`'s state guard, so a stale
+    /// five-minute timer firing with an old `oauth_state` must not evict the newer flow's entry.
+    ///
+    /// Written as its own test rather than folded into the one above because the failure it catches
+    /// is silent: the async map would still say "pending" (the guard returns early) while the mirror
+    /// said "free", and the reaper reads the mirror.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stale_timer_does_not_evict_the_newer_flow_from_the_sync_mirror() {
+        let runtime = create_oauth_runtime(None);
+        let storage: Arc<dyn McpOAuthStorage> =
+            Arc::new(InMemoryOAuthStorage::new(PathBuf::from("/base")));
+        let base_dir = storage.base_dir();
+        let make = |url: &str| PendingAuth {
+            server_name: "acme".to_string(),
+            server_url: url.to_string(),
+            authorization_url: "https://as/authorize".to_string(),
+            session: Arc::new(AsyncMutex::new(None)),
+            expected_issuer: None,
+            requires_issuer: false,
+            storage: Arc::clone(&storage),
+            base_dir: base_dir.clone(),
+        };
+
+        let generation = runtime.generation();
+        set_pending_auth(&runtime, make("https://a"), "state-a", generation)
+            .await
+            .unwrap();
+        set_pending_auth(&runtime, make("https://b"), "state-b", generation)
+            .await
+            .unwrap();
+
+        clear_pending_auth(&runtime, "acme", Some("state-a"), &base_dir, None)
+            .await
+            .unwrap();
+        assert!(has_pending_auth(&runtime, "acme", Some(&base_dir)).await);
+        assert!(
+            has_pending_auth_sync(&runtime, "acme", Some(&base_dir)),
+            "the stale timer's release must not evict the newer flow from the mirror"
+        );
+
+        clear_pending_auth(&runtime, "acme", Some("state-b"), &base_dir, None)
+            .await
+            .unwrap();
+        assert!(!has_pending_auth_sync(&runtime, "acme", None));
         shutdown_oauth(&runtime).await;
     }
 

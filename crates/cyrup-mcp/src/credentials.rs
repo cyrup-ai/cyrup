@@ -62,11 +62,16 @@
 //!
 //! # Deferred, and exactly what is missing
 //!
-//! * `TODO(MCP-260)` — the hidden subcommand's *host* half. [`run_keyring_helper`] and
-//!   [`KEYRING_HELPER_SUBCOMMAND`] are complete here; `crates/cyrup/src/mcp_keyring_helper_cmd.rs`
-//!   still has to expose the `SUBCOMMAND` / `is_selected(argv)` / `dispatch()` triple beside
-//!   `intercom_broker_cmd.rs` and pre-dispatch it from `main()` before any clap parsing. Until it
-//!   exists, the recovery hop works only through `…_KEYRING_RECOVERY_HELPER`.
+//! * `MCP-260` — **landed.** The hidden subcommand's *host* half is
+//!   `crates/cyrup/src/mcp_keyring_helper_cmd.rs`: it exposes the
+//!   `SUBCOMMAND` / `is_selected(argv)` / `dispatch()` triple beside `intercom_broker_cmd.rs`,
+//!   `cyrup::predispatch::Internal::McpKeyringHelper` classifies the argv, and `cyrup`'s `main()`
+//!   dispatches it above the bootstrap HTTP-proxy install and above the package/config and
+//!   credential-print gates, so the helper answers before anything can initialise the cache, the
+//!   config or tracing. The default re-exec target — `current_exe()` +
+//!   [`KEYRING_HELPER_SUBCOMMAND`] — therefore resolves to a program that understands the token;
+//!   before it landed, the recovery hop worked only through `…_KEYRING_RECOVERY_HELPER`, and the
+//!   default arm re-exec'd the agent with an argument it did not recognize.
 //! * `TODO(MCP-278)` / `TODO(MCP-283)` — the two acceptance suites. The in-process cases are ported
 //!   below; the **two subprocess cases** (the fixture `keyctl` asserting `$1 == "session"`,
 //!   `$2 == "-"`, exiting 64 otherwise, then `shift 2; exec "$@"`; and its negative twin where a
@@ -625,6 +630,16 @@ impl AuthEntry {
 
     /// `hasStoredTokens` — `!!entry?.tokens`, with **no** expiry consideration. The live expiry
     /// predicate is rmcp's `AuthorizationManager::get_access_token` (MCP-267).
+    ///
+    /// **No in-crate caller, and that is the correct shape.** Its only one used to be
+    /// `McpAuthStore::has_stored_credentials`, a `auth_entry(name)? .is_some_and(has_credentials)`
+    /// wrapper that was itself never called and has been deleted. Every in-crate question about
+    /// usable credentials is asked at *token* granularity instead —
+    /// [`crate::oauth::inspect_mcp_oauth_tokens_for_url`] — because a `start_auth` writes the
+    /// dynamic-registration record before any browser round trip, so an entry exists for a server
+    /// that has never completed a login and this entry-level predicate would answer `true` for it.
+    /// Kept as a public accessor on a public type: an embedder holding an [`AuthEntry`] has no other
+    /// way to ask, and it is the one slot test that is not a field read.
     #[must_use]
     pub fn has_credentials(&self) -> bool {
         self.credentials.is_some()
@@ -932,6 +947,13 @@ pub trait AuthSecretStore: Send + Sync {
     /// The three inspection exports (`getTestAuthSecretStoreReadCount`,
     /// `getTestAuthSecretStoreEntries`, `removeTestAuthSecretStoreEntry`) reach inside the store
     /// through this. They are contract, not incidental — both upstream test files use them.
+    ///
+    /// **No production caller, deliberately:** this is a downcast to the fault-injection backend, so
+    /// every caller is a test or an inspection export. Production code reaching for it would be
+    /// branching on which backend it got, which is exactly what [`AuthSecretStore`] exists to
+    /// prevent. Keep it on the trait rather than on [`MemorySecretStore`]: the store arrives as
+    /// `dyn AuthSecretStore` (chosen by `…_TEST_AUTH_STORE`), so a concrete-type method would be
+    /// unreachable from where the inspection actually happens.
     fn as_memory(&self) -> Option<&MemorySecretStore> {
         None
     }
@@ -1807,6 +1829,13 @@ impl AuthStorageOptions {
     }
 
     /// An explicit root, for a caller that already resolved one.
+    ///
+    /// **No production caller, deliberately:** production always arrives through
+    /// [`Self::from_settings`], because the `settings.oauthDir` trim/blank/resolve rule
+    /// ([`crate::dirs::resolve_configured_oauth_dir`]) is the *only* sanctioned way to turn config
+    /// into a root, and a second production entry point that skips it would be a second copy of that
+    /// rule. What is left is tests and any downstream embedder that resolved a root by other means;
+    /// both want the raw constructor, neither wants the config grammar.
     #[must_use]
     pub fn with_base_dir(base_dir: impl Into<PathBuf>) -> Self {
         Self {
@@ -2159,6 +2188,13 @@ impl McpAuthStore {
     /// `resetAuthEntryCache()` — clears the cache **only**, leaving the backend read counter alone.
     /// `resetTestAuthSecretStore()` is this plus [`MemorySecretStore::reset`], and the two differing
     /// is pinned upstream.
+    ///
+    /// **No production caller, deliberately:** upstream exports `resetAuthEntryCache` from its test
+    /// surface only. The production invalidation points are per-server and targeted —
+    /// [`Self::invalidate_cache`], called from the connect loop's 401 handling and from session
+    /// recovery — because a blanket clear would evict entries for servers that never saw a 401 and
+    /// turn one server's auth failure into a keychain read storm across every other one. Keep this
+    /// for the between-cases reset that a shared process-lifetime cache otherwise leaks across.
     pub fn reset_cache(&self) {
         self.write_cache().clear();
         self.inner
@@ -2741,6 +2777,13 @@ impl McpAuthStore {
     /// converts an [`AuthStoreError::Unavailable`] — and **only** that class — into
     /// [`OAuthCredentialStatus::Unavailable`]. Everything else propagates, including a parse failure
     /// on the stored payload (MCP-284).
+    /// **No production caller.** `inspect_auth_for_url_async`, the wrapper that had one, was
+    /// deleted in the uncalled-machinery sweep; this synchronous half survives it deliberately.
+    /// Three other declarations explain themselves in terms of it — [`AuthEntry`]'s rejection pair
+    /// and the `migrateLegacy` read — so deleting it would cost those explanations their referent,
+    /// and it is the only entry point that surfaces a store read WITHOUT the refresh side effects
+    /// [`crate::oauth::get_valid_token`] carries. Wire it, do not re-derive it, if a caller needs a
+    /// plain read.
     pub fn inspect_auth_for_url(
         &self,
         server_name: &str,
@@ -2796,18 +2839,6 @@ impl McpAuthStore {
         }?;
         self.write_cache().remove(server_name);
         self.remove_legacy_auth_entry(server_name)
-    }
-
-    /// `clearAllCredentials(serverName, options)` — a bare alias for [`Self::remove_auth_entry`].
-    pub fn clear_all_credentials(&self, server_name: &str) -> Result<(), AuthStoreError> {
-        self.remove_auth_entry(server_name)
-    }
-
-    /// `hasStoredTokens(serverName, options)` — `!!entry?.tokens`, with **no** expiry consideration.
-    pub fn has_stored_credentials(&self, server_name: &str) -> Result<bool, AuthStoreError> {
-        Ok(self
-            .auth_entry(server_name)?
-            .is_some_and(|entry| entry.has_credentials()))
     }
 }
 
@@ -3003,20 +3034,6 @@ impl McpAuthStore {
             .await
     }
 
-    /// [`Self::inspect_auth_for_url`], serialized and off the reactor.
-    pub async fn inspect_auth_for_url_async(
-        &self,
-        server_name: &str,
-        server_url: &str,
-    ) -> Result<OAuthCredentialStatus, AuthStoreError> {
-        let name = server_name.to_string();
-        let url = server_url.to_string();
-        self.locked(server_name, move |store| {
-            store.inspect_auth_for_url(&name, &url)
-        })
-        .await
-    }
-
     /// [`Self::update_credentials`], serialized: the whole read-modify-write is inside the lock.
     pub async fn update_credentials_async(
         &self,
@@ -3101,6 +3118,17 @@ impl McpAuthStore {
 ///
 /// Handing it over is `AuthorizationManager::set_credential_store`; rmcp's
 /// `InMemoryCredentialStore` remains the default for tests that do not want a keychain.
+///
+/// **No installer, deliberately — and this is not a missing call site.** Nothing in the crate calls
+/// `set_credential_store`, because production HTTP auth does not run through rmcp's
+/// `AuthorizationManager` at all: [`crate::runtime`] builds a
+/// [`crate::runtime::HttpAuthProvider`] — `StoredCredentialAuth`, `runtime.rs:235-245` — and hands
+/// *that* to the connection builder, so the token is read from [`McpAuthStore`] directly and this
+/// adapter is never consulted. The `AuthorizationManager` path is section 05's `AuthClient` work
+/// (`runtime.rs:1620`, `runtime.rs:1975`); MCP-291 built the two stores ahead of it precisely so
+/// that landing `AuthClient` is a `set_credential_store` / `set_state_store` pair and not a new
+/// persistence layer. Wire this only as part of that unit — installing it beside
+/// `StoredCredentialAuth` would give one server two independent readers of the same keychain slot.
 pub struct McpCredentialStore {
     store: McpAuthStore,
     server_name: String,
@@ -3171,6 +3199,12 @@ impl rmcp::transport::auth::CredentialStore for McpCredentialStore {
 /// [`rmcp::transport::auth::StateStore`] is keyed by CSRF token; keeping **one** `state` slot in the
 /// [`AuthEntry`] and returning it only when `state.csrf_token == csrf` reproduces upstream's single
 /// `oauthState` slot exactly while satisfying the keyed trait.
+///
+/// **No installer, deliberately:** the same reason as [`McpCredentialStore`] — production HTTP auth
+/// runs through [`crate::runtime::HttpAuthProvider`] / `StoredCredentialAuth` (`runtime.rs:235-245`),
+/// not rmcp's `AuthorizationManager`, so `set_state_store` has no caller until section 05's
+/// `AuthClient` lands (`runtime.rs:1620`, `runtime.rs:1975`). The PKCE/CSRF material production
+/// *does* use today is written and read through [`McpAuthStore`]'s `state` slot directly.
 pub struct McpStateStore {
     store: McpAuthStore,
     server_name: String,

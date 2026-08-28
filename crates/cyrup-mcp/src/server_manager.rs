@@ -558,6 +558,15 @@ pub trait ConnectionResource: Send + Sync + std::fmt::Debug {
 
 /// A stdio child process and the two things that keep it from becoming an orphan.
 ///
+/// **Superseded, not staged: there is no production constructor for this type, and nothing should
+/// add one.** The shipping stdio resource is [`crate::runtime::McpConnection`], whose doc is headed
+/// *"Why this is not `StdioChildConnection`"*: rmcp's `serve_client_with_lifecycle_and_ct` takes the
+/// transport **by value**, so from the handshake onward the `RunningService` owns the child and
+/// `close()` has to go through it. This shape only fits a caller that never hands the transport to
+/// rmcp, and the connect path always does. It is kept — rather than deleted — because its tests are
+/// the grandchild-orphan residual measurement named below, which has no other home: they drive a
+/// real child directly, which is the only way to observe what `close` does to a process group.
+///
 /// **MCP-131 is this type.** Two hazards, both of which this repository has been bitten by:
 ///
 /// 1. **The unread stderr pipe.** `TokioChildProcessBuilder::spawn` hands back a `ChildStderr` when
@@ -621,6 +630,10 @@ impl StdioChildConnection {
     /// `stderr` is `Some` exactly when the definition asked for `debug: false`; when it is `Some` a
     /// drain task starts immediately, because between here and the first read the child can already
     /// have filled the pipe.
+    ///
+    /// **No production caller, by design** — this is the only constructor of a superseded type, and
+    /// the only callers are this module's tests. Production stdio reaches
+    /// [`crate::runtime::McpConnection`] instead, for the reason the type doc gives.
     #[must_use]
     pub fn adopt(process: TokioChildProcess, stderr: Option<ChildStderr>) -> Arc<Self> {
         let pid = process.id();
@@ -734,6 +747,11 @@ impl InertResource {
     }
 
     /// A resource that reports a streamable-HTTP session id — the `hadSessionId` gate of MCP-134.
+    ///
+    /// A test seam, exactly like [`Self::close_count`]: production resources report their session id
+    /// off a real transport ([`crate::runtime::McpConnection`]), so nothing outside `#[cfg(test)]`
+    /// constructs this. It is what lets a state-machine test exercise the `hadSessionId` branch
+    /// without standing up a streamable-HTTP server.
     #[must_use]
     pub fn with_session_id() -> Arc<Self> {
         Arc::new(Self {
@@ -1352,6 +1370,15 @@ struct Tables {
     /// `connectAttempts` — guard 2.
     connect_attempts: HashMap<String, Arc<AbortHandle>>,
     /// `acceptedUrlElicitations`.
+    ///
+    /// **Permanently empty in production today.** Its only writer is
+    /// [`McpServerManager::remember_url_elicitation`], whose caller is section 05's
+    /// `handleUrlElicitation` dialog (MCP-122, unported); its reader
+    /// [`McpServerManager::has_accepted_url_elicitation`] *is* live, so
+    /// `handle_url_elicitation_required` (`live.rs:1467-1488`) answers `Cancel` on every URL
+    /// elicitation. That is the fail-closed answer and is deliberate — an id that has not been
+    /// through a human must not claim it has — but it is not the *ported* behaviour, which is the
+    /// dialog.
     accepted_url_elicitations: HashMap<String, HashSet<String>>,
     /// `pendingMetadataPublications`.
     pending_metadata_publications: HashMap<String, PendingPublication>,
@@ -1398,6 +1425,18 @@ pub struct McpServerManager {
     auth_storage_options: Mutex<crate::credentials::AuthStorageOptions>,
     /// `oauthRuntime`.
     oauth_runtime: Mutex<Option<Arc<crate::oauth::McpOAuthRuntime>>>,
+    /// The generation's credential vault — **the same instance** the HTTP ladder's
+    /// [`crate::runtime::HttpAuthProvider`] holds.
+    ///
+    /// Not an upstream setter: upstream's `authEntryCache` is module-global, so every reader in the
+    /// process shares one cache for free. This port made the cache an instance field
+    /// ([`crate::credentials::McpAuthStore`]), which is better — two sessions cannot collide — but
+    /// it means the connect ladder and the auth flow must be handed the *same* instance or their
+    /// caches diverge. `readAuthEntry` caches an absence as readily as a hit, so with two instances
+    /// a token written by the auth flow stays invisible to the ladder's cached `None`, and
+    /// `invalidateAuthEntryCache` evicts a cache nobody reads. This slot is what makes that eviction
+    /// mean something.
+    auth_store: Mutex<Option<crate::credentials::McpAuthStore>>,
 }
 
 impl std::fmt::Debug for McpServerManager {
@@ -1447,6 +1486,7 @@ impl McpServerManager {
             elicitation: Mutex::new(None),
             auth_storage_options: Mutex::new(crate::credentials::AuthStorageOptions::default()),
             oauth_runtime: Mutex::new(None),
+            auth_store: Mutex::new(None),
         }
     }
 
@@ -1466,11 +1506,29 @@ impl McpServerManager {
     // ── the eight setters (§3.1) ────────────────────────────────────────────────────────────
 
     /// `setSamplingConfig(config)`.
+    ///
+    /// **No production caller.** The `sampling` slot it writes is read nowhere and is only cleared
+    /// again by `close_all`, because the hook it would carry —
+    /// [`crate::runtime::SamplingHook`] — is *"section 05's body"*: the
+    /// `registerSamplingHandler` port (MCP-118), which reaches the manager through
+    /// [`crate::runtime::ConnectionBuilder::with_handler_factory`], itself uncalled.
+    /// `runtime.rs:252-253` names this setter as one of the four that are *"wired with their
+    /// handlers, not here"*. Until MCP-118 lands the only callers are this module's tests.
     pub fn set_sampling_config(&self, sampling: Option<crate::runtime::SamplingHook>) {
         *self.sampling.lock().unwrap_or_else(PoisonError::into_inner) = sampling;
     }
 
     /// `setElicitationConfig(config)`.
+    ///
+    /// **No production caller**, for the same reason as [`Self::set_sampling_config`]: the
+    /// `elicitation` slot is written by this setter and read nowhere, and the
+    /// [`crate::runtime::ElicitationHook`] it carries is section 05's `registerElicitationHandler`
+    /// body (MCP-121 / MCP-122), installed through
+    /// [`crate::runtime::ConnectionBuilder::with_handler_factory`]. One consequence is visible in
+    /// shipping code: because no elicitation config can ever be installed, the `allowUrl` half of
+    /// upstream's URL gate (`server-manager.ts:801`) is unrepresented in
+    /// `handle_url_elicitation_required` (`live.rs:1472-1477`), which tests only the runtime
+    /// signal — correct today, and the second thing MCP-121/122 has to restore.
     pub fn set_elicitation_config(
         &self,
         elicitation: Option<(crate::runtime::ElicitationMode, crate::runtime::ElicitationHook)>,
@@ -1554,6 +1612,27 @@ impl McpServerManager {
     #[must_use]
     pub fn oauth_runtime(&self) -> Option<Arc<crate::oauth::McpOAuthRuntime>> {
         self.oauth_runtime
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Publish the generation's credential vault, so the connect ladder and the auth flow read and
+    /// write one cache. Set once by [`crate::runtime::initialize_mcp`], beside the provider it
+    /// builds from the same handle.
+    pub fn set_auth_store(&self, store: crate::credentials::McpAuthStore) {
+        *self.auth_store.lock().unwrap_or_else(PoisonError::into_inner) = Some(store);
+    }
+
+    /// The generation's credential vault, when one has been published.
+    ///
+    /// `None` for a manager built by `new`/`default` — every `server_manager.rs` test and any caller
+    /// that never ran `initialize_mcp`. [`crate::live::RuntimeEnv::auth_options`] falls back to
+    /// constructing one from `dirs` + `authStorageOptions`, which is the pair this instance was
+    /// built from, so the fallback differs only in *which cache* it holds.
+    #[must_use]
+    pub fn auth_store(&self) -> Option<crate::credentials::McpAuthStore> {
+        self.auth_store
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clone()
@@ -2654,6 +2733,15 @@ impl McpServerManager {
 
     /// The catch arm of `publishMetadataChanged`: record that this connection still owes a
     /// publication.
+    ///
+    /// **Unreachable by construction — this has no producer, and never will under the current
+    /// listener signature.** The arm it ports is `catch`: upstream queues when the metadata listener
+    /// *throws*. Here the listener is `Fn(&str, &str)`, which cannot fail, and a panic inside one
+    /// would abort under this crate's no-panic lint policy — so
+    /// [`Self::publish_metadata_changed`] has no failure path that could call this. It is kept, not
+    /// deleted, because it is half of the queue/retry pair that
+    /// [`Self::retry_pending_metadata_publication`] needs in order to be testable at all, and
+    /// because a fallible listener signature would make the arm live again with nothing to rewrite.
     pub fn queue_metadata_publication(
         &self,
         name: &str,
@@ -2672,6 +2760,12 @@ impl McpServerManager {
     /// `retryPendingMetadataPublication(name, connection)` (`server-manager.ts:410-417`) —
     /// identity-guarded on the *queued* connection, and the delete is identity-guarded again in case
     /// the listener re-queued.
+    ///
+    /// **No production caller.** Upstream's single call site is inside `refreshTools`, which is
+    /// **MCP-120** and needs a live `Peer` and therefore the discovery unit (MCP-119); the same gap
+    /// is named at [`crate::lifecycle::ManagerSupervisor`], whose `refresh_tools` arm fails closed
+    /// until MCP-120 lands. Nothing is lost meanwhile, because the only queue-filler
+    /// ([`Self::queue_metadata_publication`]) is itself unreachable.
     pub fn retry_pending_metadata_publication(&self, name: &str, connection: &Arc<ServerConnection>) {
         let (listener, reason) = {
             let tables = self.tables();
@@ -2706,6 +2800,13 @@ impl McpServerManager {
 
     /// `rememberUrlElicitation(serverName, elicitationId)` (`server-manager.ts:816-824`) — a **no-op
     /// once the runtime signal has fired**, so a stale generation cannot accumulate state.
+    ///
+    /// **No production caller.** Upstream calls it from `handleUrlElicitation`'s accept arm — the
+    /// dialog that belongs to section 05 (MCP-122) and is not ported. The registry it fills is
+    /// therefore empty for the whole generation, and its live reader
+    /// [`Self::has_accepted_url_elicitation`] always answers `false`: see
+    /// `Tables::accepted_url_elicitations` for what that costs and why the resulting `Cancel` is the
+    /// correct fail-closed answer rather than a bug.
     pub fn remember_url_elicitation(&self, name: &str, elicitation_id: &str) {
         let aborted = self
             .runtime_signal
@@ -2725,6 +2826,12 @@ impl McpServerManager {
 
     /// `accepted?.delete(notification.params.elicitationId)` — the user is told the interaction
     /// completed **only if this returns `true`** (§3.10).
+    ///
+    /// **No production caller.** Its caller is the completion sink
+    /// [`crate::runtime::ElicitationCompleteHook`] (MCP-122), installed through
+    /// [`crate::runtime::ConnectionBuilder::with_handler_factory`] — which has no caller either.
+    /// The `true`/`false` return is the whole point of the pair and is why the delete lives on the
+    /// manager: a duplicate completion notification must be silent.
     pub fn forget_url_elicitation(&self, name: &str, elicitation_id: &str) -> bool {
         self.tables()
             .accepted_url_elicitations
@@ -2752,6 +2859,12 @@ impl McpServerManager {
     /// The call itself is **not** here: it needs the connection's `Peer`, which the
     /// [`ConnectionFactory`] does not yet produce (MCP-119's plumbing). This is the half MCP-100
     /// owns; MCP-121 supplies the two one-line bodies on top of it.
+    ///
+    /// **No production caller yet — and that is not a live in-flight-accounting bug.** The one
+    /// shipping request path, the proxy's `tools/call`, performs the same four accounting calls
+    /// inline: `touch` + `increment_in_flight` at `proxy/call.rs:710-711` and
+    /// `decrement_in_flight` + `touch` at `:724-725`. So no slot leaks today; what MCP-121 buys is
+    /// [`InFlightGuard`]'s `Drop` in place of a statement pair that an early `?` could skip.
     ///
     /// # Errors
     ///
@@ -2812,6 +2925,12 @@ impl McpServerManager {
 /// pinned at the floor `raise_in_flight_to` set, so [`McpServerManager::is_idle`] returns `false`
 /// forever and the idle sweep never reaps that server — the exact failure the carry-forward was
 /// ported to avoid.
+///
+/// **No production caller yet.** The only thing that hands one out is
+/// [`McpServerManager::begin_request`], which MCP-121 has still to call; the shipping proxy path
+/// keeps its own inline `decrement_in_flight` + `touch` pair (`proxy/call.rs:724-725`) instead. So
+/// the leak this guard exists to prevent is not one the crate is currently exposed to — the guard
+/// is the *safe* shape waiting for its caller, not a fix for a live defect.
 #[derive(Debug)]
 pub struct InFlightGuard {
     manager: Option<Arc<McpServerManager>>,

@@ -49,7 +49,7 @@ use cyrup_ext::HostServices;
 use crate::config::{McpConfig, ServerLifecycle};
 use crate::dirs::McpDirs;
 use crate::errors::McpResult;
-use crate::lifecycle::{McpLifecycleManager, DEFAULT_IDLE_TIMEOUT_MINUTES};
+use crate::lifecycle::McpLifecycleManager;
 use crate::owner::{McpRuntimeOwner, OwnedServices};
 use crate::state::{
     AuthStorageOptions, McpServerManager, McpState, McpStateParts, OAuthRuntime, OpenBrowser,
@@ -82,6 +82,11 @@ pub struct ContextSnapshot {
 impl ContextSnapshot {
     /// `isTuiMode(ctx)` — exported from `init.ts` and exactly `ctx.hasUI && ctx.mode === "tui"`.
     /// Not the same test as `has_ui`: URL elicitation requires a real TUI, not merely a UI.
+    ///
+    /// **No caller, by design.** The one place upstream asks this — the URL-elicitation guard — is
+    /// answered here by the host instead, as a capability probe: `crate::ui` takes a `false` from
+    /// `HostServices::open_overlay` as "no TUI" rather than asking the snapshot. The predicate is
+    /// kept because it is `isTuiMode`'s exact test and the two must not drift.
     #[must_use]
     pub fn is_tui_mode(&self) -> bool {
         self.has_ui && self.mode == "tui"
@@ -98,6 +103,19 @@ pub struct InitializeOptions {
     /// `options.oauthRuntime`. When `None`, this generation **owns** the runtime it creates and
     /// registers `shutdownOAuth` as an owner cleanup; when `Some`, it does not.
     pub oauth_runtime: Option<Arc<OAuthRuntime>>,
+    /// The credential vault this generation authenticates through. `None` — production — builds
+    /// [`crate::credentials::McpAuthStore::new`] from `dirs` and the resolved
+    /// `authStorageOptions`.
+    ///
+    /// It exists because the backend selector is an **environment** switch
+    /// ([`crate::credentials::TEST_AUTH_STORE_ENV`]) and edition 2024 made `std::env::set_var`
+    /// `unsafe`, with std's own conclusion that a multithreaded program must not call it at all —
+    /// the same reason [`crate::McpExtension::with_home`] exists rather than a `CYRUP_HOME` write.
+    /// Without this seam nothing outside `cyrup-mcp`'s own `#[cfg(test)]` modules can reach a
+    /// session whose vault is not the host keychain, so on any machine with no OS credential store
+    /// (a container, CI, a headless Linux box) every `auth: "oauth"` HTTP server in a real session
+    /// fails its connect with `NoDefaultStore` and the failure is unprovable.
+    pub auth_store: Option<crate::credentials::McpAuthStore>,
 }
 
 /// `initializeMcp(pi, ctx, owner, options)` — build the live runtime for one generation.
@@ -184,14 +202,52 @@ pub async fn initialize_mcp(
     // native dispatch budget drops a handler future that outlives it, and the subprocess
     // handshakes below routinely do. See `McpExtension::start_initialization`'s doc comment.
     //
-    // Two things the builder does NOT yet get here, both named rather than smuggled:
-    // `with_handler_factory` (the manager's sampling/elicitation/list-changed hooks, MCP-118/120/122)
-    // and `with_auth_provider` (section 05's OAuth provider, MCP-115). Without the second, an HTTP
-    // server whose credential is already in the store still ends at `needs-auth` — the same outcome
-    // upstream reaches on a first login, and the wrong one for a returning user.
+    // One thing the builder does NOT yet get here, named rather than smuggled:
+    // `with_handler_factory` (the manager's sampling/elicitation/list-changed hooks,
+    // MCP-118/120/122).
+    //
+    // `with_auth_provider` it DOES get, and that is this line's whole point. The generation's
+    // credential vault is built here and handed to [`StoredCredentialAuth`], which the one
+    // production `ConnectionBuilder` carries into every HTTP connect. Before it,
+    // `ConnectionBuilder::new`'s default [`NoStoredCredentials`] stood, and an HTTP server whose
+    // credential was ALREADY in the store still ended at `needs-auth`: the outcome upstream reaches
+    // on a first login, and the wrong one for a returning user, who must connect on attempt one
+    // with no prompt.
+    //
+    // **One instance, published.** The handle is cloned into
+    // [`crate::server_manager::McpServerManager::set_auth_store`] below, so
+    // [`crate::live::RuntimeEnv::auth_options`] authenticates through the same vault the ladder
+    // reads rather than a fresh one per operation. That is what makes the entry cache coherent
+    // across a login (see the setter's own doc), and it is why `options.auth_store` is enough to
+    // make a whole session hermetic.
+    //
+    // Constructing the store is pure — `McpAuthStore::new` selects a backend and allocates a cache,
+    // it does not touch the keychain — so a session with no HTTP server pays nothing for this, and
+    // a stdio-only configuration never reaches a read.
+    let auth_store = options.auth_store.clone().unwrap_or_else(|| {
+        crate::credentials::McpAuthStore::new(dirs.clone(), auth_storage_options.clone())
+    });
+    // `definition.oauth?.skipIssuerMetadataValidation === true`, resolved once per generation
+    // because the provider is handed a server *name* and has no configuration of its own. Only the
+    // `true` entries are recorded; absent reads as `false`, which is also the answer for a name
+    // that is not in the config at all.
+    let skip_issuer: std::collections::HashSet<String> = config
+        .mcp_servers
+        .iter()
+        .filter(|(_, entry)| skip_issuer_metadata_validation(entry))
+        .map(|(name, _)| name.clone())
+        .collect();
+    let auth_provider: Arc<dyn HttpAuthProvider> = Arc::new(StoredCredentialAuth::new(
+        auth_store.clone(),
+        Arc::clone(&oauth_runtime),
+        runtime_signal.clone(),
+        skip_issuer,
+    ));
     let manager = Arc::new(McpServerManager::with_factory(
         Some(snapshot.cwd.clone()),
-        Arc::new(ConnectionBuilder::new(Some(snapshot.cwd.clone()))),
+        Arc::new(
+            ConnectionBuilder::new(Some(snapshot.cwd.clone())).with_auth_provider(auth_provider),
+        ),
     ));
     // Step 4's setters, now that `McpServerManager` is real (MCP-100). Four of the eight are
     // resolvable here; the other four are not this step's:
@@ -215,16 +271,15 @@ pub async fn initialize_mcp(
     );
     manager.set_auth_storage_options(auth_storage_options.clone());
     manager.set_oauth_runtime(Arc::clone(&oauth_runtime));
+    // The ninth setter, and not upstream's: it publishes the vault built two statements above so
+    // `RuntimeEnv::auth_options` authenticates through the SAME instance the connect ladder reads.
+    // Upstream needs no equivalent because its `authEntryCache` is module-global; this port made the
+    // cache an instance field, which is what creates the obligation.
+    manager.set_auth_store(auth_store);
 
     // Step 7. `hasPendingAuth` is the OAuth runtime's, so an authenticating server is never reaped.
     let lifecycle = Arc::new(McpLifecycleManager::new(Arc::clone(&manager), Arc::new(|_| false)));
-    lifecycle.set_global_idle_timeout(
-        config
-            .settings
-            .as_ref()
-            .and_then(|s| s.idle_timeout)
-            .unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES),
-    );
+    lifecycle.set_global_idle_timeout(config.settings_or_default().idle_timeout_minutes());
 
     // Steps 8-9.
     let open_browser: OpenBrowser = {
@@ -880,13 +935,7 @@ fn total_tool_count(state: &McpState) -> usize {
 /// persists after its first spawn; then the global setting. An unconfigured server takes the global
 /// directly, skipping both.
 fn effective_idle_timeout_minutes(state: &McpState, server: &str) -> f64 {
-    let global = || {
-        state
-            .config
-            .settings_or_default()
-            .idle_timeout
-            .unwrap_or(DEFAULT_IDLE_TIMEOUT_MINUTES)
-    };
+    let global = || state.config.settings_or_default().idle_timeout_minutes();
     let Some(definition) = state.config.mcp_servers.get(server) else { return global() };
     if let Some(minutes) = definition.idle_timeout {
         return minutes;
@@ -1024,6 +1073,80 @@ mod tests {
             .unwrap();
         assert!(state.config.mcp_servers.is_empty());
         assert!(state.owner.is_active());
+    }
+
+    /// The production wiring: the one `ConnectionBuilder` this function builds carries a
+    /// **store-backed** [`HttpAuthProvider`], so an `auth: "oauth"` HTTP server reads the credential
+    /// vault before it opens a socket.
+    ///
+    /// The signal is chosen to be environment-independent. The server's URL is a closed loopback
+    /// port, so the only way this connect can fail with a *credential-store* message is if the
+    /// vault was consulted first — and it is consulted first exactly because the explicit arm reads
+    /// the store before the handshake. The seeded entry is deliberately unparseable, which is the
+    /// one vault answer that is the same on a machine with a working keychain (the backend has no
+    /// entry, the read falls through to this legacy file, and the file will not parse) and on one
+    /// with none at all (the backend read itself fails). Both render
+    /// `"... OAuth credentials for gated ..."`.
+    ///
+    /// With `ConnectionBuilder::new`'s default [`NoStoredCredentials`] — which is what this
+    /// function installed before the provider was wired in — nothing reads the vault, the connect
+    /// reaches the closed port, and the recorded failure is a connection refusal instead.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_explicit_oauth_server_reaches_the_credential_store_before_the_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let oauth_dir = dir.path().join("mcp-oauth");
+        let server_dir = oauth_dir.join(crate::credentials::auth_entry_account("gated"));
+        std::fs::create_dir_all(&server_dir).unwrap();
+        std::fs::write(server_dir.join("tokens.json"), b"{ not json").unwrap();
+
+        let mut config = McpConfig::default();
+        config.mcp_servers.insert(
+            "gated".to_string(),
+            ServerEntry {
+                // Port 1 on loopback: reserved, never listening, and refused immediately.
+                url: Some("http://127.0.0.1:1/mcp".to_string()),
+                auth: Some(crate::config::AuthMode::Named(crate::config::AuthKind::Oauth)),
+                ..ServerEntry::default()
+            },
+        );
+        config.settings = Some(crate::config::McpSettings {
+            oauth_dir: Some(oauth_dir.display().to_string()),
+            ..crate::config::McpSettings::default()
+        });
+
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let dirs = McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf());
+        let snapshot = ContextSnapshot {
+            config_path: None,
+            cwd: dir.path().to_path_buf(),
+            has_ui: false,
+            mode: "print".to_string(),
+            initial_signal: None,
+            services: None,
+        };
+        let state = initialize_mcp(
+            owner,
+            dirs,
+            snapshot,
+            InitializeOptions {
+                programmatic_config: Some(config),
+                ..InitializeOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let message = state
+            .failure_messages
+            .lock()
+            .unwrap()
+            .get("gated")
+            .cloned()
+            .expect("the startup connect recorded a failure");
+        assert!(
+            message.contains("OAuth credentials for gated"),
+            "the vault was consulted before the socket; got {message}"
+        );
     }
 }
 
@@ -1183,9 +1306,11 @@ pub fn sse_cut_diagnostic(name: &str) -> String {
 
 /// The **Cut 3** diagnostic, verbatim from 13c §3.2.
 ///
-/// [`ServerEntry`] has no `socket` field, so this string can never be produced from a parsed entry —
-/// it belongs to the config loader, which sees the raw key before it is dropped. It lives here
-/// beside its Cut-1 sibling so the two sentences stay together and neither drifts.
+/// **Uncalled, and unreachable by construction.** [`ServerEntry`] has no `socket` field, so this
+/// string can never be produced from a parsed entry; the only caller it could have is the config
+/// loader, at the point where it still holds the raw document — and that loader drops an unknown
+/// `socket` key silently rather than diagnosing it. Kept as the recorded Cut-3 wording, beside its
+/// Cut-1 sibling [`sse_cut_diagnostic`], so the two sentences stay together and neither drifts.
 #[must_use]
 pub fn socket_cut_diagnostic(name: &str) -> String {
     format!(
@@ -2313,6 +2438,10 @@ impl ListKind {
 
     /// The debug line emitted when the refresh itself fails (`server-manager.ts:752`, and its two
     /// siblings). Upstream logs and returns — a failed refresh never disturbs the live list.
+    ///
+    /// **No caller yet.** Its caller is the `list_changed` refresh arm, which needs
+    /// `McpServerManager::refreshTools` — **MCP-120**, unported (see `crate::lifecycle`'s note that
+    /// the arm fails closed until MCP-120 lands).
     #[must_use]
     pub fn refresh_failed_message(self, server: &str, message: &str) -> String {
         format!(
@@ -3000,6 +3129,156 @@ impl HttpAuthProvider for NoStoredCredentials {
     fn invalidate_auth_entry_cache(&self, _server: &str) {}
 }
 
+/// The production [`HttpAuthProvider`]: MCP-115's *"a server whose credential is already in the
+/// store connects"* arm, bound to [`crate::credentials::McpAuthStore`] through
+/// [`crate::oauth::get_valid_token`].
+///
+/// [`NoStoredCredentials`] reproduces one of upstream's two outcomes — the first login, where the
+/// provider has nothing to offer and the connect ends at `needs-auth`. This is the other one, and
+/// it is what a *returning* user gets on every session after that: the credential is read out of
+/// the vault **before** the handshake POST is built, so an `auth: "oauth"` server connects on
+/// attempt one, with no 401, no browser and no prompt.
+///
+/// # What it deliberately does not do
+///
+/// * **No browser, ever.** [`crate::oauth::get_valid_token`] performs at most a token *refresh*;
+///   the authorization-code round trip belongs to the tool layer's `attempt_auto_auth`, which is
+///   the only place allowed to open a window from inside a turn. A launcher installed here would
+///   fire from inside a connect, which is precisely the fence that keeps a startup connect pass
+///   from spawning one browser tab per configured server.
+/// * **No once-per-episode policy.** [`Self::invalidate_auth_entry_cache`] evicts unconditionally.
+///   The flag that makes eviction fire at most once per connect episode is
+///   [`ConnectionBuilder::connect_http_client`]'s `invalidated` (MCP-116), and duplicating it here
+///   would invert the bug that flag exists to prevent: an eviction that never fires again after the
+///   first connect of the process, so a rotated credential is never re-read.
+/// * **No `challenge` plumbing.** `get_valid_token`'s refresh resolves authorization-server
+///   metadata with the proactive `.well-known` walk;
+///   [`crate::oauth::AuthenticateOptions::challenge`] is consumed only by `start_auth`, which this
+///   type never reaches. Setting it would be a field nothing reads.
+///
+/// # Why [`crate::oauth::get_valid_token`] and not a bare store read
+///
+/// Upstream's `McpOAuthProvider.tokens()` hands the stored token back as-is and lets the TS SDK's
+/// `auth()` loop refresh it. There is no such loop behind `auth_header` here — rmcp's
+/// streamable-HTTP transport takes a **static** bearer for the lifetime of the connection — so this
+/// is the only place a refresh can happen. Without it an expired-but-refreshable credential would
+/// 401 on every session and the returning user would silently become a first-time login forever.
+///
+/// # The four ways `authorize` can answer, and which are quiet
+///
+/// | cause | answer | connect outcome |
+/// |---|---|---|
+/// | no entry, or an entry bound to a different URL | `Ok(None)` | `needs-auth` — the first-login entry |
+/// | a live (or refreshed) token | `Ok(Some(token))` | connected |
+/// | the keychain is unreachable, or an entry will not parse | `Err(CredentialStore)` | the connect fails **loudly** |
+/// | a refresh failed on the network | `Ok(None)` after an `error` log | `needs-auth` |
+///
+/// The third row is the one that must not be swallowed: a broken keychain answered as `Ok(None)`
+/// is indistinguishable from "you have never logged in", so the user is sent to authenticate, the
+/// flow writes a credential that cannot be read back, and the loop never terminates.
+/// [`crate::oauth::get_valid_token`] already draws that line — abort errors and errors carrying the
+/// credential-store marker rethrow, everything else logs and answers `None` — so `authorize`
+/// propagates with `?` rather than classifying anything itself.
+pub struct StoredCredentialAuth {
+    /// The generation's vault. [`crate::credentials::McpAuthStore`] is `Clone`-shares-state, so
+    /// this handle and every other clone of the same store are one entry cache over one backend —
+    /// which is what makes [`Self::invalidate_auth_entry_cache`] evict something a later read will
+    /// actually miss on.
+    store: crate::credentials::McpAuthStore,
+    /// The same vault behind the trait object [`crate::oauth::AuthenticateOptions`] takes. Built
+    /// once at construction so `authorize` allocates nothing per connect attempt; it shares
+    /// `store`'s inner `Arc`, so the two are the same object and not two views of one backend.
+    storage: Arc<dyn crate::oauth::McpOAuthStorage>,
+    /// This generation's OAuth runtime, handed to every [`crate::oauth::AuthenticateOptions`] this
+    /// provider builds — see [`Self::authorize`] for why it is never left `None`.
+    runtime: Arc<OAuthRuntime>,
+    /// `runtimeSignal`: the owner/context token [`initialize_mcp`] combines once per generation, so
+    /// a session replacement aborts an in-flight refresh instead of letting it write to a vault the
+    /// next generation already owns.
+    signal: CancelToken,
+    /// The configured servers whose `oauth.skipIssuerMetadataValidation` is `true`, precomputed by
+    /// [`skip_issuer_metadata_validation`]. A name set rather than a config clone: the trait hands
+    /// `authorize` a server *name*, and this is the only per-server value
+    /// [`crate::oauth::get_valid_token`] consumes. Absent means `false`, which is also what an
+    /// unknown name gets — an unconfigured server cannot reach the ladder in the first place.
+    skip_issuer: std::collections::HashSet<String>,
+}
+
+impl StoredCredentialAuth {
+    /// Bind a provider to one generation's vault, OAuth runtime and abort.
+    #[must_use]
+    pub fn new(
+        store: crate::credentials::McpAuthStore,
+        runtime: Arc<OAuthRuntime>,
+        signal: CancelToken,
+        skip_issuer: std::collections::HashSet<String>,
+    ) -> Self {
+        let storage: Arc<dyn crate::oauth::McpOAuthStorage> = Arc::new(store.clone());
+        Self {
+            store,
+            storage,
+            runtime,
+            signal,
+            skip_issuer,
+        }
+    }
+}
+
+/// Hand-written because [`crate::credentials::McpAuthStore`] has no `Debug` and a derived one would
+/// be a credential-shaped hole in every `{:?}` on a [`ConnectionBuilder`], whose own `Debug` prints
+/// its provider. What is printed here is a directory path and two counts — never an entry, never a
+/// token.
+impl std::fmt::Debug for StoredCredentialAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoredCredentialAuth")
+            .field("base_dir", &self.store.auth_base_dir())
+            .field("servers_with_skip_issuer", &self.skip_issuer.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpAuthProvider for StoredCredentialAuth {
+    fn authorize<'a>(
+        &'a self,
+        server: &'a str,
+        url: &'a str,
+        _challenge: Option<&'a str>,
+    ) -> BoxFuture<'a, McpResult<Option<String>>> {
+        Box::pin(async move {
+            let mut options = crate::oauth::AuthenticateOptions::new(Arc::clone(&self.storage));
+            // ALWAYS `Some`. `get_valid_token` opens with `get_runtime(options.runtime.as_ref())`,
+            // and `get_runtime(None)` resurrects the module-level legacy runtime and inserts its id
+            // into the process-global live-runtime set that only `shutdown_oauth` removes — so a
+            // `None` here would leak one live-runtime id per connect attempt and wedge the shared
+            // callback listener open for the life of the process.
+            //
+            // The secondary effect is the one this path wants anyway: once this generation's
+            // runtime has been shut down, `get_runtime` answers `Err(McpError::Aborted)`, so a
+            // connect racing a session teardown fails as an **abort** rather than as `needs-auth`
+            // — which is what the ladder's abort arm and the startup pass both already expect.
+            options.runtime = Some(Arc::clone(&self.runtime));
+            options.signal = Some(self.signal.clone());
+            options.skip_issuer_metadata_validation = self.skip_issuer.contains(server);
+            // `launcher` stays the default and both hooks stay `None`: nothing on this path reaches
+            // a browser, and installing one would breach the fence in this type's doc comment.
+            // `challenge` stays `None` for the reason recorded there too.
+            let tokens = crate::oauth::get_valid_token(server, url, &options).await?;
+            // NEVER log `tokens`, and never fold it into an error: `McpTokens` derives `Debug` and
+            // `access_token` is a plain `String`, so a single `?tokens` on this line would put a
+            // live bearer token in the log. The value leaves only through the return, into
+            // `config.auth_header`, which rmcp applies with `bearer_auth`.
+            //
+            // Bare, without the `Bearer ` prefix — [`HttpAuthProvider::authorize`]'s contract.
+            Ok(tokens.map(|tokens| tokens.access_token))
+        })
+    }
+
+    fn invalidate_auth_entry_cache(&self, server: &str) {
+        // Unconditional, by design — see this type's doc comment on MCP-116.
+        self.store.invalidate_cache(server);
+    }
+}
+
 /// `createClient(serverName, definition)` — how the builder obtains its [`McpClientHandler`].
 ///
 /// A seam because every hook the handler carries (`registerSamplingHandler`,
@@ -3411,6 +3690,11 @@ impl ConnectionBuilder {
     }
 
     /// Install the manager's `createClient` — the hooks of §3.5, §3.10 and §3.16.
+    ///
+    /// **No caller yet.** This is the seam named in this module's builder note as the one thing the
+    /// builder does not yet get; the handler bodies it installs are **section 05**'s
+    /// (MCP-118 / 120 / 122 — sampling, `list_changed` refresh and elicitation-complete), so until
+    /// one of those lands every runtime is built on [`bare_handler_factory`].
     #[must_use]
     pub fn with_handler_factory(mut self, handler: HandlerFactory) -> Self {
         self.handler = handler;
@@ -3895,9 +4179,14 @@ impl ConnectionBuilder {
         //   definition.oauth?.skipIssuerMetadataValidation === true`). rmcp's streamable-HTTP
         // transport config has no such field — issuer-metadata validation belongs to
         // `rmcp::transport::auth`'s discovery, which is section 05's — so the flag is read here and
-        // handed to nothing. RECORDED: a server that needs `skipIssuerMetadataValidation` will fail
-        // discovery once section 05 wires the provider, and this is the line that has to grow an
-        // argument then.
+        // handed to nothing.
+        //
+        // RECORDED, and now live rather than predicted: the provider IS wired
+        // ([`StoredCredentialAuth`], installed at `initialize_mcp`), and this flag reaches it only
+        // through [`crate::oauth::get_valid_token`]'s refresh path — not through discovery on a
+        // first login. So a server that genuinely needs `skipIssuerMetadataValidation` still fails
+        // its first authorization-server discovery. Closing that means threading the flag into the
+        // discovery call, and this is the line that has to grow the argument.
         let _skip_issuer_metadata_validation = skip_issuer_metadata_validation(entry);
 
         // `this.createClient(serverName, definition)` — fresh per attempt.
@@ -5517,6 +5806,15 @@ done
         /// wedged-server case `requestTimeoutMs` exists for.
         stall_initialize: bool,
         cancel_before: Option<(usize, CancelToken)>,
+        /// The bearer token this server accepts. `Some(token)` makes **the credential the only
+        /// gate**: every request that does not carry exactly `Bearer <token>` is answered 401,
+        /// whichever request it is and however many have gone before.
+        ///
+        /// This is deliberately not the `unauthorized_initializes` counter. A fixture that counts
+        /// attempts answers 200 to a request carrying no credential at all, which would let a
+        /// store-backed provider that always returns `None` pass a "connects on the first attempt"
+        /// test. Gating on the token is what makes those tests honest.
+        require_bearer: Option<&'static str>,
     }
 
     impl Default for FixtureOptions {
@@ -5528,6 +5826,7 @@ done
                 session_id: true,
                 stall_initialize: false,
                 cancel_before: None,
+                require_bearer: None,
             }
         }
     }
@@ -5566,6 +5865,7 @@ done
                 session_id,
                 stall_initialize,
                 cancel_before,
+                require_bearer,
             } = options;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
@@ -5602,6 +5902,16 @@ done
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(recorded.clone());
 
+                    // The credential gate. `None` — every existing call site — is "no gate", so the
+                    // counter arm below reads exactly as it did before.
+                    let authorized = match require_bearer {
+                        None => true,
+                        Some(token) => recorded.headers.iter().any(|(key, value)| {
+                            key.eq_ignore_ascii_case("authorization")
+                                && value.trim() == format!("Bearer {token}")
+                        }),
+                    };
+
                     let response = if recorded.method == "GET" || recorded.method == "DELETE" {
                         // No server-initiated stream and no session teardown: both are optional.
                         "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
@@ -5611,7 +5921,8 @@ done
                         // nothing below the MCP layer fails, and only `requestTimeoutMs` can end it.
                         held.push(socket);
                         continue;
-                    } else if is_initialize && initializes <= unauthorized_initializes {
+                    } else if !authorized || (is_initialize && initializes <= unauthorized_initializes)
+                    {
                         let challenge_header = if challenge {
                             "WWW-Authenticate: Bearer realm=\"mcp\", resource_metadata=\"https://example.invalid/.well-known\"\r\n"
                         } else {
@@ -6317,6 +6628,387 @@ done
             "expected an abort, got {error}"
         );
         assert!(auth.invalidations().is_empty(), "an abort invalidates nothing");
+    }
+
+    // ── MCP-115 · the STORE-BACKED provider — journey A, the returning user ───────────────────
+    //
+    // Everything above this line proves the ladder against `CountingAuth`, a hand-scripted double.
+    // These prove the same ladder against [`StoredCredentialAuth`] over a real
+    // [`crate::credentials::McpAuthStore`] — the type production installs — with the fixture's
+    // **only** gate being the bearer token, so a provider that answered `None` could not pass.
+
+    /// A memory-backed vault rooted in a fresh temp dir.
+    ///
+    /// `with_backends` rather than `new`: the keychain is a host dependency and a write to it would
+    /// be a side effect on the developer's machine. The stub environment also pins the entry cache
+    /// **on**, which the eviction test below depends on.
+    fn stored_credential_store() -> (crate::credentials::McpAuthStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::credentials::McpAuthStore::with_backends(
+            Arc::new(crate::credentials::MemorySecretStore::new()),
+            Arc::new(crate::credentials::MemorySecretStore::new()),
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            AuthStorageOptions::with_base_dir(dir.path().join("mcp-oauth")),
+            Arc::new(|_| None),
+        );
+        (store, dir)
+    }
+
+    /// A memory-backed vault whose backend fails every operation — the broken keychain.
+    fn broken_credential_store() -> (crate::credentials::McpAuthStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::credentials::McpAuthStore::with_backends(
+            Arc::new(crate::credentials::MemorySecretStore::with_fault(
+                crate::credentials::SimulatedFault::Unavailable,
+            )),
+            Arc::new(crate::credentials::MemorySecretStore::new()),
+            McpDirs::new(dir.path().to_path_buf(), dir.path().to_path_buf()),
+            AuthStorageOptions::with_base_dir(dir.path().join("mcp-oauth")),
+            Arc::new(|_| None),
+        );
+        (store, dir)
+    }
+
+    fn now_secs() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_secs() as i64)
+    }
+
+    /// Put a credential in the vault through the v2.25.0 plaintext entry the store imports on its
+    /// first read.
+    ///
+    /// This route needs no `rmcp` type to build a `StoredCredentials`, and `clientInfo.clientId` is
+    /// mandatory — `translate_legacy_entry` drops tokens with no client id rather than fabricating
+    /// one. `serverUrl` must match byte-for-byte: `get_auth_for_url` is fail-closed and compares
+    /// with string equality, no normalization.
+    fn seed_credential(
+        store: &crate::credentials::McpAuthStore,
+        server: &str,
+        url: &str,
+        token: &str,
+        expires_at: i64,
+    ) {
+        let path = store.auth_entry_file_path(server);
+        std::fs::create_dir_all(path.parent().expect("a server directory")).expect("mkdir");
+        let body = serde_json::json!({
+            "tokens": {
+                "accessToken": token,
+                "refreshToken": "fixture-refresh",
+                "expiresAt": expires_at,
+                "scope": "mcp",
+            },
+            "clientInfo": { "clientId": "fixture-client" },
+            "serverUrl": url,
+        });
+        std::fs::write(&path, serde_json::to_vec(&body).expect("json")).expect("write");
+    }
+
+    /// The provider production builds, plus the runtime it must be shut down with.
+    fn stored_provider(
+        store: &crate::credentials::McpAuthStore,
+    ) -> (Arc<StoredCredentialAuth>, Arc<OAuthRuntime>) {
+        let runtime = crate::oauth::create_oauth_runtime(None);
+        let provider = Arc::new(StoredCredentialAuth::new(
+            store.clone(),
+            Arc::clone(&runtime),
+            CancelToken::new(),
+            std::collections::HashSet::new(),
+        ));
+        (provider, runtime)
+    }
+
+    fn explicit_oauth_entry(url: &str) -> ServerEntry {
+        ServerEntry {
+            auth: Some(crate::config::AuthMode::Named(crate::config::AuthKind::Oauth)),
+            ..http_entry(url)
+        }
+    }
+
+    /// **Journey A.** A credential is already in the vault; the server connects on attempt one,
+    /// with no 401, no retry and nothing opened.
+    ///
+    /// The fixture's only gate is the bearer token — it does not count attempts — so this cannot
+    /// pass with a provider that answers `None`, which is exactly what `ConnectionBuilder::new`'s
+    /// default does and what production shipped before [`StoredCredentialAuth`] was installed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stored_credential_connects_an_http_server_on_the_first_attempt() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            require_bearer: Some("stored-token"),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let (store, _dir) = stored_credential_store();
+        seed_credential(
+            &store,
+            "returning",
+            &fixture.url,
+            "stored-token",
+            now_secs() + 3600,
+        );
+        let (provider, runtime) = stored_provider(&store);
+
+        // The whole factory seam, not just the ladder: `create_connection` also runs MCP-119's
+        // discovery, so the assertions below cover the requests that follow the handshake — which
+        // is where a token that authorized only the first POST would show up.
+        let connection = builder()
+            .with_auth_provider(Arc::clone(&provider) as Arc<dyn HttpAuthProvider>)
+            .create_connection(request("returning", explicit_oauth_entry(&fixture.url)))
+            .await
+            .expect("a stored credential connects");
+
+        assert_eq!(connection.status, ConnectionStatus::Connected);
+        assert_eq!(
+            fixture.initializes(),
+            1,
+            "explicit OAuth reads the store BEFORE the handshake, so there is no 401 and no retry"
+        );
+        let requests = fixture.requests();
+        let handshake = requests.first().expect("the handshake was sent");
+        assert_eq!(
+            handshake.all("authorization"),
+            vec!["Bearer stored-token"],
+            "exactly one Authorization header, carrying the stored token"
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|recorded| recorded.body.contains("\"method\":\"tools/list\"")),
+            "discovery ran, so the token authorized more than the handshake"
+        );
+        for recorded in &requests {
+            assert_eq!(
+                recorded.all("authorization"),
+                vec!["Bearer stored-token"],
+                "every request on the connection carried the credential: {}",
+                recorded.method
+            );
+        }
+
+        // The provider is printed by `ConnectionBuilder`'s own `Debug`; a token must never be in it.
+        let rendered = format!("{provider:?}");
+        assert!(!rendered.contains("stored-token"), "{rendered}");
+        assert!(rendered.contains("StoredCredentialAuth"), "{rendered}");
+
+        connection.resource.close().await.expect("close");
+        crate::oauth::shutdown_oauth(&runtime).await;
+    }
+
+    /// The negative control for the test above: same fixture, same wiring, **no** seeded
+    /// credential. `needs-auth`, and — because `auth: "oauth"` is the explicit arm — without a
+    /// retry.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_empty_store_ends_an_explicit_oauth_server_at_needs_auth() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            require_bearer: Some("stored-token"),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let (store, _dir) = stored_credential_store();
+        let (provider, runtime) = stored_provider(&store);
+
+        let connection = builder()
+            .with_auth_provider(Arc::clone(&provider) as Arc<dyn HttpAuthProvider>)
+            .connect_http_client(&request("first-login", explicit_oauth_entry(&fixture.url)))
+            .await
+            .expect("needs-auth is not an error");
+
+        assert_eq!(connection.status, ConnectionStatus::NeedsAuth);
+        assert!(connection.credentials_invalidated);
+        assert_eq!(fixture.initializes(), 1, "explicit ⇒ no retry");
+        assert_eq!(
+            fixture
+                .requests()
+                .first()
+                .and_then(|recorded| recorded.header("authorization")),
+            None,
+            "an empty vault attaches nothing"
+        );
+        crate::oauth::shutdown_oauth(&runtime).await;
+    }
+
+    /// The implicit arm of journey A: with `auth` absent the vault is not touched until the server
+    /// proves it needs to be, and the retry after that 401 carries the stored token. Two requests,
+    /// still no prompt.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_implicit_oauth_server_retries_once_with_the_stored_token() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            require_bearer: Some("stored-token"),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let (store, _dir) = stored_credential_store();
+        seed_credential(
+            &store,
+            "implicit",
+            &fixture.url,
+            "stored-token",
+            now_secs() + 3600,
+        );
+        let (provider, runtime) = stored_provider(&store);
+
+        let connection = builder()
+            .with_auth_provider(Arc::clone(&provider) as Arc<dyn HttpAuthProvider>)
+            .connect_http_client(&request("implicit", http_entry(&fixture.url)))
+            .await
+            .expect("the retry carries the stored token");
+
+        assert_eq!(connection.status, ConnectionStatus::Connected);
+        assert_eq!(fixture.initializes(), 2, "one 401, then one authorized attempt");
+        let initializes: Vec<Recorded> = fixture
+            .requests()
+            .into_iter()
+            .filter(|recorded| recorded.body.contains("\"method\":\"initialize\""))
+            .collect();
+        assert_eq!(
+            initializes.first().and_then(|r| r.header("authorization")),
+            None,
+            "deferred: nothing was read before the 401"
+        );
+        assert_eq!(
+            initializes.get(1).and_then(|r| r.header("authorization")),
+            Some("Bearer stored-token")
+        );
+        connection.resource.close().await.expect("close");
+        crate::oauth::shutdown_oauth(&runtime).await;
+    }
+
+    /// A broken keychain is **not** `needs-auth`. Answering `Ok(None)` here would make an
+    /// unreadable vault indistinguishable from "you have never logged in": the user is sent to
+    /// authenticate, the flow writes a credential that cannot be read back, and the loop never
+    /// terminates. The connect fails, loudly, before a single byte is sent.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_broken_credential_store_fails_the_connect_rather_than_asking_for_a_login() {
+        let fixture = HttpFixture::start_with(FixtureOptions {
+            require_bearer: Some("stored-token"),
+            ..FixtureOptions::default()
+        })
+        .await;
+        let (store, _dir) = broken_credential_store();
+        let (provider, runtime) = stored_provider(&store);
+
+        let error = builder()
+            .with_auth_provider(Arc::clone(&provider) as Arc<dyn HttpAuthProvider>)
+            .connect_http_client(&request("broken", explicit_oauth_entry(&fixture.url)))
+            .await
+            .expect_err("an unreadable vault is an error, never needs-auth");
+
+        assert!(
+            error.is_credential_store_failure(),
+            "expected a credential-store failure, got {error}"
+        );
+        assert_eq!(fixture.initializes(), 0, "nothing was sent");
+        crate::oauth::shutdown_oauth(&runtime).await;
+    }
+
+    /// `authorize` hands `get_valid_token` **this generation's** runtime, never `None`.
+    ///
+    /// `get_runtime(None)` resurrects the module-level legacy runtime and re-inserts it into the
+    /// process-global live set that only `shutdown_oauth` removes, so a `None` would leak one
+    /// live-runtime id per connect and wedge the shared callback listener open for the life of the
+    /// process. The observable difference is here: against a **shut-down** runtime the provider
+    /// must abort, where a `None` would have quietly succeeded off the legacy one.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authorize_uses_the_generation_runtime_and_never_the_legacy_one() {
+        let url = "https://fixture.invalid/mcp";
+        let (store, _dir) = stored_credential_store();
+        seed_credential(&store, "scoped", url, "stored-token", now_secs() + 3600);
+        let (provider, runtime) = stored_provider(&store);
+
+        assert_eq!(
+            provider
+                .authorize("scoped", url, None)
+                .await
+                .expect("a live runtime reads the vault"),
+            Some("stored-token".to_string()),
+            "the credential is reachable while the runtime is live"
+        );
+
+        crate::oauth::shutdown_oauth(&runtime).await;
+        let error = provider
+            .authorize("scoped", url, None)
+            .await
+            .expect_err("a dead runtime aborts rather than falling back");
+        assert!(
+            matches!(error, McpError::Aborted(_)),
+            "expected an abort, got {error}"
+        );
+    }
+
+    /// `invalidate_auth_entry_cache` forgets the cached entry so the next read reloads secure
+    /// storage — including a cached **absence**, which is the shape that matters: the vault caches
+    /// `None` as readily as `Some`, so without eviction a credential written after a failed connect
+    /// would stay invisible for the life of the process.
+    ///
+    /// It is deliberately unconditional. The once-per-episode policy is
+    /// [`ConnectionBuilder::connect_http_client`]'s `invalidated` flag (MCP-116); a second latch
+    /// here would mean a rotated credential is never re-read.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn invalidate_auth_entry_cache_forgets_a_cached_absence() {
+        let url = "https://fixture.invalid/mcp";
+        let (store, _dir) = stored_credential_store();
+        let (provider, runtime) = stored_provider(&store);
+
+        assert_eq!(
+            provider.authorize("rotating", url, None).await.expect("empty"),
+            None,
+            "nothing is stored yet"
+        );
+
+        seed_credential(&store, "rotating", url, "late-token", now_secs() + 3600);
+        assert_eq!(
+            provider.authorize("rotating", url, None).await.expect("cached"),
+            None,
+            "the cached absence still stands — this is what makes the eviction load-bearing"
+        );
+
+        provider.invalidate_auth_entry_cache("rotating");
+        assert_eq!(
+            provider
+                .authorize("rotating", url, None)
+                .await
+                .expect("reloaded"),
+            Some("late-token".to_string()),
+            "the next read reached secure storage"
+        );
+
+        // Twice in a row, with no episode latch of its own.
+        provider.invalidate_auth_entry_cache("rotating");
+        provider.invalidate_auth_entry_cache("rotating");
+        assert_eq!(
+            provider
+                .authorize("rotating", url, None)
+                .await
+                .expect("still readable"),
+            Some("late-token".to_string())
+        );
+        crate::oauth::shutdown_oauth(&runtime).await;
+    }
+
+    /// A credential minted for one URL is not presented to another. The vault's binding is
+    /// fail-closed and `authorize` neither widens nor works around it, so a server whose `url`
+    /// changed lands at `needs-auth` and re-authenticates rather than leaking a token to a host it
+    /// was never issued for.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_credential_bound_to_another_url_is_not_offered() {
+        let (store, _dir) = stored_credential_store();
+        seed_credential(
+            &store,
+            "moved",
+            "https://old.invalid/mcp",
+            "stored-token",
+            now_secs() + 3600,
+        );
+        let (provider, runtime) = stored_provider(&store);
+
+        assert_eq!(
+            provider
+                .authorize("moved", "https://new.invalid/mcp", None)
+                .await
+                .expect("a mismatch is not an error"),
+            None
+        );
+        crate::oauth::shutdown_oauth(&runtime).await;
     }
 
     // ── MCP-115a · the per-request header command ─────────────────────────────────────────────

@@ -180,6 +180,9 @@ impl McpDirs {
     }
 
     /// `<agent_dir>/mcp-onboarding.json`.
+    ///
+    /// **No caller yet.** `crate::onboarding` is the only reader/writer of this file and its only
+    /// consumer is the `/mcp` setup panel, whose dispatcher is `TODO(MCP-394)` and is not ported.
     #[must_use]
     pub fn onboarding_state(&self) -> PathBuf {
         self.agent_path(ONBOARDING_FILE)
@@ -199,6 +202,9 @@ impl McpDirs {
     }
 
     /// `<cwd>/.cyrup/mcp-traces` — the trace writer's default destination.
+    ///
+    /// **No caller yet.** The trace writer is `mcp-trace.ts` — **MCP-133, unported** (see
+    /// `crate::runtime`'s step-4 note); this is the destination waiting for it.
     #[must_use]
     pub fn trace_dir(&self) -> PathBuf {
         self.cwd.join(PROJECT_CONFIG_DIR).join(TRACE_DIR)
@@ -495,12 +501,19 @@ pub struct CachedTool {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_schema: Option<Value>,
     /// **Cut 2**, retained in the schema. MCP Apps' `ui://` resource for this tool.
+    ///
+    /// **Never written and never read**: [`serialize_tools`] always writes `None` because MCP Apps is
+    /// Cut 2. The field is retained only so `mcp-cache.json` keeps the shape the in-tree reader
+    /// `cyrup_ext_subagents::exec::mcp_direct_tools` deserialises.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_resource_uri: Option<String>,
     /// **Cut 2**, retained in the schema. `UiToolVisibility[]` — an array upstream, not a scalar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_visibility: Option<Vec<String>>,
     /// **Cut 2**, retained in the schema. `"eager" | "stream-first"`.
+    ///
+    /// **Never written and never read** — Cut 2, as [`Self::ui_resource_uri`]; retained for
+    /// `mcp-cache.json` shape compatibility only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ui_stream_mode: Option<String>,
 }

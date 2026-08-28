@@ -172,6 +172,22 @@ pub struct McpExtension {
     /// seam, `MCP-001`'s cyrup-it proof would read the developer's real `~/.config/mcp/mcp.json`
     /// and its result would be a property of the machine rather than of the port.
     home: Option<PathBuf>,
+    /// The credential vault each generation authenticates through, forwarded to
+    /// [`crate::runtime::InitializeOptions::auth_store`]. `None` — production — lets
+    /// `initialize_mcp` build the real one.
+    ///
+    /// A field for exactly the reason [`Self::home`] is: the backend selector is an environment
+    /// switch and `std::env::set_var` is unusable in-process. See
+    /// [`crate::runtime::InitializeOptions::auth_store`] for what is unprovable without it.
+    auth_store: Option<crate::credentials::McpAuthStore>,
+    /// The browser launcher `/mcp-auth`'s flow hands the authorization URL to, when something other
+    /// than [`crate::oauth::OpenerLauncher`] is wanted. `None` means the production default.
+    ///
+    /// [`crate::oauth::NoopLauncher`] has existed since the flow was written, documented "for
+    /// headless hosts and tests", and nothing could reach it: `AuthenticateOptions::launcher`
+    /// defaults to `OpenerLauncher` and no caller ever set the field. This is the seam that was
+    /// missing, not the launcher.
+    browser_launcher: Option<Arc<dyn crate::oauth::BrowserLauncher>>,
 }
 
 impl McpExtension {
@@ -422,6 +438,8 @@ impl McpExtension {
             proxy_ctx: Mutex::new(None),
             render_options: Mutex::new(crate::renderers::McpToolRenderOptions::default()),
             home: None,
+            auth_store: None,
+            browser_launcher: None,
         }
     }
 
@@ -449,6 +467,28 @@ impl McpExtension {
     #[must_use]
     pub fn with_home(mut self, home: PathBuf) -> Self {
         self.home = Some(home);
+        self
+    }
+
+    /// Pin the credential vault every generation this extension starts authenticates through (see
+    /// the `auth_store` field). Production never calls this; a test that drives an OAuth HTTP
+    /// server always does, because the host keychain is neither available nor writable in CI.
+    #[must_use]
+    pub fn with_auth_store(mut self, store: crate::credentials::McpAuthStore) -> Self {
+        self.auth_store = Some(store);
+        self
+    }
+
+    /// Pin the browser launcher `/mcp-auth` hands the authorization URL to (see the
+    /// `browser_launcher` field). Production never calls this and keeps
+    /// [`crate::oauth::OpenerLauncher`]; a test that drives a login always does, because a real
+    /// `opener::open` against a fixture's `/authorize` opens a stray tab on whoever runs the suite.
+    #[must_use]
+    pub fn with_browser_launcher(
+        mut self,
+        launcher: Arc<dyn crate::oauth::BrowserLauncher>,
+    ) -> Self {
+        self.browser_launcher = Some(launcher);
         self
     }
 
@@ -564,12 +604,23 @@ impl McpExtension {
     /// `registeredDirectTools` — tool name to fingerprint. Exposed as the lock itself because the
     /// diff (MCP-036) reads and writes it as one critical section: comparing a fingerprint and then
     /// re-registering under a different lock acquisition would let two syncs interleave.
+    ///
+    /// **The field is production-live; this accessor is not.** The sync pass reads
+    /// `self.registered_direct_tools` directly (seeded into `LateSink::known_tools` by
+    /// [`Self::sync_tool_surface`] at `extension.rs:259`, written back at `:314` and `:1947`), so
+    /// nothing in the shipped path needs a getter. It stays `pub` because it is the only way an
+    /// out-of-crate observer can see the map at all — `cyrup-it`'s MCP suite asserts on it
+    /// (`crates/cyrup-it/tests/mcp/live_tool_call.rs:945`), and that crate cannot touch the field.
     #[must_use]
     pub fn registered_direct_tools(&self) -> &Mutex<IndexMap<String, String>> {
         &self.registered_direct_tools
     }
 
     /// `registeredPromptCommands` — the prompt-command dedup set (MCP-039), same locking rationale.
+    ///
+    /// **The field is production-live; this accessor is not.** The sync pass reads and writes
+    /// `self.registered_prompt_commands` directly (`extension.rs:265`, `:317`, `:1950`); this getter
+    /// exists for the crate's tests.
     #[must_use]
     pub fn registered_prompt_commands(&self) -> &Mutex<IndexMap<String, String>> {
         &self.registered_prompt_commands
@@ -578,6 +629,10 @@ impl McpExtension {
     /// `fallbackDeactivatedTools` — the tools removed through the `setActiveTools` fallback,
     /// retained so a tool that reappears after being deactivated is put back into the active set
     /// (MCP-038).
+    ///
+    /// **The field is production-live; this accessor is not.** The `setActiveTools` fallback reads
+    /// and rewrites `self.fallback_deactivated_tools` directly (`extension.rs:366`, `:376`); this
+    /// getter exists for the crate's tests.
     #[must_use]
     pub fn fallback_deactivated_tools(&self) -> &Mutex<Vec<String>> {
         &self.fallback_deactivated_tools
@@ -586,6 +641,11 @@ impl McpExtension {
     /// `proxyToolDescription` — the description the proxy tool was last registered with. An
     /// unchanged description must not re-register: identical system-prompt bytes are what keep the
     /// provider's prompt cache valid (MCP-043).
+    ///
+    /// **The field is production-live; this accessor is not.** The re-registration guard runs off
+    /// `self.proxy_tool_description` directly — read into `LateSink::known_proxy` at
+    /// `extension.rs:263`, written back at `:324` and `:1957` — never off the registered
+    /// [`crate::proxy::McpTool`]. This getter exists for the crate's tests.
     #[must_use]
     pub fn proxy_tool_description(&self) -> &Mutex<Option<String>> {
         &self.proxy_tool_description
@@ -744,6 +804,7 @@ impl McpExtension {
             let options = crate::runtime::InitializeOptions {
                 programmatic_config: self.programmatic_config.clone(),
                 oauth_runtime: Some(Arc::clone(&oauth_runtime)),
+                auth_store: self.auth_store.clone(),
             };
             async move {
                 crate::runtime::initialize_mcp(owner, dirs, snapshot, options)
@@ -837,6 +898,32 @@ impl McpExtension {
         // time the state exists. Without this line the generation's first consent dialog would run
         // with `with_human_wait(None)` and forfeit its P-3 budget forgiveness.
         next_state.set_human_wait_ctx(dispatch_ctx);
+
+        // 2c — MCP-334: bind `hasPendingAuth` to THIS generation's OAuth runtime.
+        //
+        // `initialize_mcp` step 7 builds the lifecycle manager before the state exists, so it can
+        // only pass a placeholder — and the placeholder answers `false` for every server, which
+        // leaves `lifecycle.ts:177` and `:229`'s two "skip the reconnect while OAuth is pending"
+        // gates permanently open. The 30-second keep-alive check would then connect a server whose
+        // login is still in flight: the window is the one journey B sits in longest — between
+        // `execute_auth_complete` closing the connection so the new token is used and the retry
+        // connecting — and a tick landing there races that retry, spends another 401 and files a
+        // connect failure that puts the server into the 60-second backoff.
+        //
+        // `None` for the base directory is upstream's own argument
+        // (`new McpLifecycleManager(manager, name => hasPendingAuth(name, undefined, oauthRuntime))`,
+        // `init.ts:143`): the scan is by server name, which is what the lifecycle manager knows.
+        //
+        // Installed HERE, from the committed state, rather than at construction, because
+        // `state.oauth_runtime` is the runtime this generation actually authenticates through — a
+        // predicate bound earlier could only have captured a runtime that a replacement might have
+        // superseded.
+        {
+            let runtime = Arc::clone(&next_state.oauth_runtime);
+            next_state.lifecycle.set_pending_auth_check(Arc::new(move |server: &str| {
+                crate::oauth::has_pending_auth_sync(&runtime, server, None)
+            }));
+        }
 
         // 3 — the proxy context, BEFORE the dispatcher is installed. Reversed, a tool call landing
         // in the window between the two would find an installed dispatcher whose `proxy_ctx()` is
@@ -1137,6 +1224,647 @@ impl McpExtension {
         )
         .await;
     }
+
+    // =============================================================================================
+    // MCP-334 — `/mcp-auth`, the interactive first login
+    //
+    // `index.ts:622-670` (the command handler) over `commands.ts:245-333` (`authenticateServer`),
+    // with `reconnectServer` (`commands.ts:150-215`) supplied by the already-ported
+    // [`crate::proxy::execute_connect`].
+    //
+    // # Why this is journey B's missing link rather than a convenience
+    //
+    // A first connect against an OAuth HTTP server ends at `needs-auth`, and
+    // `crate::runtime::initialize_mcp`'s startup pass records the byte-exact line
+    // `"OAuth authentication required. Run /mcp-auth {name}."`. Until this handler existed,
+    // `NativeExtension::execute_command` was left on its default arm, which answers
+    // `Err(ExtError::Component("native extension has no handler for command `mcp-auth`"))` — so the
+    // one instruction the runtime gives a user with no stored credential was an error message. The
+    // credential store therefore had no *human* route into it at all: the only working first login
+    // was the model issuing `mcp({action:"auth-start"})` and `mcp({action:"auth-complete"})` on the
+    // user's behalf.
+    // =============================================================================================
+
+    /// `pi.registerCommand("mcp-auth", { handler })` (`index.ts:623-669`).
+    ///
+    /// The ordering is upstream's and each step is a distinct refusal:
+    ///
+    /// 1. capture the owner and build the **fenced** services handle
+    ///    (`createOwnedUi(ctx.ui, commandOwner)`), so a session replacement mid-flow cannot paint
+    ///    into the session that replaced it;
+    /// 2. `if (!serverName && !commandCtx.hasUI) return;` — a bare `/mcp-auth` in a headless session
+    ///    has no server to act on and no way to ask for one;
+    /// 3. join the in-flight build (`await initPromise`) — a user who types `/mcp-auth linear`
+    ///    during startup must not be told "MCP not initialized";
+    /// 4. a bare `/mcp-auth` picks a server (see [`Self::pick_oauth_server`]);
+    /// 5. [`Self::authenticate_server`];
+    /// 6. on success only, reconnect so the stored token is actually used
+    ///    ([`Self::reconnect_after_auth`]).
+    ///
+    /// # The two output channels, and why the level decides which one is used
+    ///
+    /// [`NativeExtension::execute_command`]'s `Ok(Some(text))` return is surfaced by the session as
+    /// an **Info** notification and nothing else; it cannot carry a level. Every refusal below has
+    /// a level upstream (`error` for a missing server, `warning` for a disabled one), so when a UI
+    /// is attached this handler notifies at that level itself and answers `Ok(None)` — the
+    /// convention `NativeExtension::execute_command`'s own documentation prescribes. With no UI the
+    /// message rides the return channel instead, which is strictly more than upstream does (it
+    /// drops the text when `ctx.ui` is undefined) and cannot double-print, because the two arms are
+    /// exclusive.
+    async fn on_mcp_auth_command(
+        &self,
+        args: &str,
+        ctx: &HostCtx,
+    ) -> Result<Option<String>, ExtError> {
+        // 1 — `const commandOwner = currentOwner;` and `createOwnedUi(ctx.ui, commandOwner)`.
+        // Captured ONCE, before the first await, for the reason `on_input` documents: a handler
+        // that re-reads the slot after an await fences against the generation that replaced it.
+        let owner = self.owner();
+        let ui = self.command_services(ctx, owner.as_ref());
+
+        let server_name = args.trim();
+        // 2 — `if (!serverName && !commandCtx.hasUI) return;`
+        if server_name.is_empty() && ui.is_none() {
+            return Ok(None);
+        }
+
+        // 3 — `if (!state && initPromise) { … } if (!state) { notify("MCP not initialized") }`.
+        let state = match self.await_committed_state().await {
+            Ok(state) => state,
+            Err(message) => return surface(ui.as_ref(), message, cyrup_ext::NotifyKind::Error),
+        };
+        // `commandOwner?.throwIfInactive()` after the await — a build that finished under a
+        // superseded generation must not be acted on.
+        if owner.as_ref().is_some_and(|owner| !owner.is_active()) {
+            return Ok(None);
+        }
+
+        // 4 — the bare form.
+        let target = if server_name.is_empty() {
+            match self.pick_oauth_server(&state, ctx).await {
+                Picked::Server(name) => name,
+                Picked::Refused(outcome) => {
+                    return surface(ui.as_ref(), outcome.message, outcome.kind);
+                }
+                Picked::Dismissed => return Ok(None),
+            }
+        } else {
+            server_name.to_string()
+        };
+
+        // 5 — `authenticateServer(serverName, state.config, commandCtx, commandCtx.signal, …)`.
+        let authenticated = self.authenticate_server(&state, &target, ctx).await;
+        if !authenticated.ok {
+            return surface(ui.as_ref(), authenticated.message, authenticated.kind);
+        }
+
+        // 6 — `if (result.ok) { commandOwner?.throwIfInactive(); await reconnectServer(...) }`.
+        //
+        // The success line is surfaced BEFORE the reconnect, as upstream surfaces it (it notifies
+        // inside `authenticateServer`, `commands.ts:317-319`). The ordering is worth keeping: the
+        // reconnect re-runs the handshake and `tools/list`, so a user shown nothing until that
+        // finishes cannot tell a slow server from a wedged command.
+        if let Some(services) = ui.as_ref() {
+            notify(services, &authenticated.message, authenticated.kind);
+        }
+        if owner.as_ref().is_some_and(|owner| !owner.is_active()) {
+            // The credential IS stored; only the retry is skipped, and by the session replacement
+            // that will connect the server on its own startup pass.
+            return Ok(ui.is_none().then_some(authenticated.message));
+        }
+        let reconnected = self.reconnect_after_auth(&target).await;
+        match ui.as_ref() {
+            Some(services) => {
+                notify(services, &reconnected.message, reconnected.kind);
+                Ok(None)
+            }
+            // No UI: both lines ride the one return channel rather than being dropped.
+            None => Ok(Some(join_lines(&authenticated.message, &reconnected.message))),
+        }
+    }
+
+    /// `createOwnedUi(ctx.ui, commandOwner)` (`index.ts:629-631`) — the command's own fenced
+    /// services handle.
+    ///
+    /// `None` is upstream's `commandHasUI ? … : undefined`: with no renderer attached there is
+    /// nothing to notify through, and every caller then routes its text to the command's return
+    /// channel instead.
+    ///
+    /// This deliberately does NOT read [`McpState::ui`]: that handle is built by
+    /// `crate::runtime::initialize_mcp` and so does not exist before the build commits, while this
+    /// handler must be able to report `MCP initialization failed` — a message that exists precisely
+    /// because there is no state. With no owner (a session that has not started a generation) the
+    /// raw backend is used unfenced, which is the same degradation `McpState::dialog` takes.
+    fn command_services(
+        &self,
+        ctx: &HostCtx,
+        owner: Option<&Arc<McpRuntimeOwner>>,
+    ) -> Option<Arc<dyn cyrup_ext::host::HostServices>> {
+        if !ctx.has_ui {
+            return None;
+        }
+        let services = self.host_services()?;
+        match owner {
+            Some(owner) => Some(Arc::new(crate::owner::OwnedServices::new(
+                services,
+                Arc::clone(owner),
+            ))),
+            None => Some(services),
+        }
+    }
+
+    /// `if (!state && initPromise) { state = await initPromise } if (!state) …` (`index.ts:640-655`).
+    ///
+    /// Awaited **unbounded**, unlike [`Self::on_input`]'s bounded join, and the asymmetry is the
+    /// port: `cyrup_ext::dispatch`'s invocation budget wraps `on_event` only —
+    /// `cyrup_ext::facade::execute_native_command` races the handler against the session cancel
+    /// token and nothing else — so a command may legitimately outlive a cold start. It must: an
+    /// OAuth round trip waits on a human in a browser, which is orders of magnitude longer than any
+    /// budget this crate could pick.
+    async fn await_committed_state(&self) -> Result<Arc<McpState>, String> {
+        if let Some(state) = self.state() {
+            return Ok(state);
+        }
+        let Some(task) = self.init_task() else {
+            return Err("MCP not initialized".to_string());
+        };
+        match (*task).clone().await {
+            Ok(state) => Ok(state),
+            Err(error) => Err(format!("MCP initialization failed: {error}")),
+        }
+    }
+
+    /// `openMcpAuthPanel(state, pi, commandCtx, earlyConfigPath)` (`commands.ts:605-652`) — the
+    /// bare `/mcp-auth`'s server choice.
+    ///
+    /// The three refusals are upstream's, byte for byte and in upstream's order: the programmatic
+    /// config hint (`index.ts:659`), the empty-candidate warning (`commands.ts:627`), and the
+    /// no-terminal-overlay notice ([`crate::ui::auth_panel_unavailable_message`],
+    /// `commands.ts:613`).
+    ///
+    /// # Named delta — the picker is a `select` dialog, not the overlay panel
+    ///
+    /// Upstream's fourth arm opens `createMcpPanel(..., { authOnly: true })` over the metadata
+    /// cache and the provenance map. That overlay exists here in full ([`crate::ui`]'s
+    /// `McpPanelModel` with [`crate::ui::PanelOptions::auth_only`], MCP-391), but its **model**
+    /// wants the config-path resolution, the on-disk cache and the provenance map that
+    /// `openMcpPanel`'s orchestration assembles — the half `crate::ui`'s own
+    /// `TODO(MCP-394)` says belongs to the `/mcp` dispatcher, which is not ported. Rather than
+    /// fork that assembly here, the choice is made through [`crate::owner::McpDialog::select`]:
+    /// the same question, asked through the one dialog primitive this crate serializes behind
+    /// `HumanInteractionLock` and the P-3 budget guard (MCP-471). When MCP-394 lands, this arm
+    /// becomes a call to [`crate::ui::open_mcp_panel`] and nothing else here changes.
+    ///
+    /// A `None` from the dialog is silent. [`crate::owner::McpDialog::select`]'s own contract is
+    /// that `None` covers a dismissal, a timeout **and** a backend with no interactive surface, and
+    /// this arm cannot tell them apart — where upstream's `canRenderPanel(ctx)` probe distinguishes
+    /// the third case up front. Silence is the right answer for the two that matter (the user
+    /// closed the picker, or the picker never opened and nothing was chosen); the case it does not
+    /// serve — a host that reports `has_ui` but paints no dialogs — is caught one step earlier by
+    /// the `state.dialog()` guard above, which is `None` exactly when the generation has no fenced
+    /// handle at all.
+    async fn pick_oauth_server(&self, state: &Arc<McpState>, ctx: &HostCtx) -> Picked {
+        if self.programmatic_config.is_some() {
+            return Picked::Refused(AuthCommandOutcome::failed(
+                PROGRAMMATIC_CONFIG_AUTH_HINT.to_string(),
+                cyrup_ext::NotifyKind::Info,
+            ));
+        }
+        // `Object.entries(config.mcpServers).filter(([, d]) => !isServerDisabled(d) && supportsOAuth(d))`
+        let candidates: Vec<String> = state
+            .config
+            .mcp_servers
+            .iter()
+            .filter(|(_, definition)| {
+                !definition.is_disabled() && crate::oauth::supports_oauth(definition)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        if candidates.is_empty() {
+            return Picked::Refused(AuthCommandOutcome::failed(
+                NO_OAUTH_CAPABLE_SERVERS.to_string(),
+                cyrup_ext::NotifyKind::Warning,
+            ));
+        }
+        let Some(dialog) = state.dialog() else {
+            // `!canRenderPanel(ctx)` — the generation has no fenced UI handle to ask through, so
+            // the refusal names the form that needs none.
+            return Picked::Refused(AuthCommandOutcome::failed(
+                crate::ui::auth_panel_unavailable_message(mode_str(ctx.mode)),
+                cyrup_ext::NotifyKind::Info,
+            ));
+        };
+        let options: Vec<&str> = candidates.iter().map(String::as_str).collect();
+        match dialog.select(AUTH_PICKER_PROMPT, &options).await {
+            Some(chosen) => Picked::Server(chosen),
+            None => Picked::Dismissed,
+        }
+    }
+
+    /// `authenticateServer(serverName, config, ctx, signal, runtime)` (`commands.ts:245-333`).
+    ///
+    /// Every guard, message and level below is upstream's, in upstream's order. The one addition is
+    /// the abort arm: `commands.ts:328` rethrows an abort out of the `catch`, which here would only
+    /// become a `command:mcp-auth: …` error notice for a cancellation the user asked for, so it
+    /// answers a silent outcome instead.
+    ///
+    /// # What makes the URL reach the user
+    ///
+    /// `options.on_authorization_url` (see [`Self::authorization_url_hook`]). Without it
+    /// `crate::oauth::authenticate` falls back to `tracing::info!`, which in a TUI session is
+    /// invisible — so the command would open a browser (or fail to) and then sit there with nothing
+    /// on screen. That fallback is right for the model-facing
+    /// `mcp({action:"auth-start"})` route, which returns the URL in the tool result; it is wrong
+    /// for a human at a prompt, and installing the hook is the difference.
+    ///
+    /// # What is deliberately NOT installed: `on_authorization_input`
+    ///
+    /// Upstream also passes `onAuthorizationInput`, a confirm-then-input prompt that lets a user on
+    /// a remote machine paste the callback URL back. Two things are missing for it here, and both
+    /// are outside this unit: [`crate::owner::McpDialog`] — this crate's single serialized route to
+    /// the human (MCP-471) — exposes `confirm` and `select` but no `input` verb, and
+    /// `cyrup_ext::HostServices::input` is a blocking round trip whose only cancellation lever is
+    /// `DialogOptions::signal_id`, a guest-side registry id a native caller cannot mint. The hook's
+    /// contract is that its [`cyrup_core::CancelToken`] dismisses the prompt the moment the loopback
+    /// callback wins the race, and a prompt that cannot be dismissed would be left on screen after
+    /// the flow had already completed. Leaving the hook `None` is the documented behaviour — the
+    /// flow simply awaits the loopback callback — and the notice this handler prints names the
+    /// reachable manual route (`mcp({action:"auth-complete"})`, `crate::proxy::execute_auth_complete`)
+    /// for the remote case.
+    async fn authenticate_server(
+        &self,
+        state: &Arc<McpState>,
+        server_name: &str,
+        ctx: &HostCtx,
+    ) -> AuthCommandOutcome {
+        // `const ui = ctx.hasUI ? ctx.ui : undefined; if (!ui) return { ok: false, … }`. The state's
+        // handle is the fenced one the flow will notify through, so its absence is the same refusal.
+        let Some(ui) = ctx.has_ui.then(|| state.ui.clone()).flatten() else {
+            return AuthCommandOutcome::failed(
+                AUTH_REQUIRES_INTERACTIVE.to_string(),
+                cyrup_ext::NotifyKind::Error,
+            );
+        };
+        let Some(definition) = state.config.mcp_servers.get(server_name).cloned() else {
+            return AuthCommandOutcome::failed(
+                format!("Server \"{server_name}\" not found in config"),
+                cyrup_ext::NotifyKind::Error,
+            );
+        };
+        if definition.is_disabled() {
+            return AuthCommandOutcome::failed(
+                format!(
+                    "Server \"{server_name}\" is disabled. Run /mcp enable {server_name}, then /reload."
+                ),
+                cyrup_ext::NotifyKind::Warning,
+            );
+        }
+        if !crate::oauth::supports_oauth(&definition) {
+            // Upstream notifies the two-line form and returns the one-line form; the notify is what
+            // the user sees, so it is the one carried here.
+            return AuthCommandOutcome::failed(
+                format!(
+                    "Server \"{server_name}\" does not use OAuth authentication.\nSet \"auth\": \"oauth\" or omit auth for auto-detection."
+                ),
+                cyrup_ext::NotifyKind::Error,
+            );
+        }
+
+        // `resolveServerUrl(definition)` is INSIDE upstream's `try`, so a missing `${VAR}` lands in
+        // the catch as `Failed to authenticate …` rather than as the no-URL message.
+        let server_url = match crate::credentials::resolve_server_url(
+            definition.url.as_deref(),
+            &crate::credentials::process_env(),
+        ) {
+            Err(error) => {
+                return AuthCommandOutcome::failed(
+                    failed_to_authenticate(server_name, &error.to_string()),
+                    cyrup_ext::NotifyKind::Error,
+                );
+            }
+            Ok(url) => url.filter(|url| !url.is_empty()),
+        };
+        let Some(server_url) = server_url else {
+            return AuthCommandOutcome::failed(
+                format!(
+                    "Server \"{server_name}\" has no URL configured (OAuth requires HTTP transport)"
+                ),
+                cyrup_ext::NotifyKind::Error,
+            );
+        };
+
+        // `signal ??= ctx.signal` — the owner's token is the command's abort, and it is what
+        // `shutdown_oauth` cancels on a session replacement.
+        let cancel = self
+            .owner()
+            .map_or_else(cyrup_core::CancelToken::new, |owner| owner.token());
+
+        // `ui.setStatus("mcp-auth", `Authenticating ${serverName}...`)`.
+        cyrup_ext::host::HostServices::set_status(
+            &*ui,
+            AUTH_STATUS_KEY,
+            Some(&format!("Authenticating {server_name}...")),
+        );
+
+        let mut options = state.auth_options(&self.dirs, &cancel);
+        options.on_authorization_url =
+            Some(Self::authorization_url_hook(server_name, Arc::clone(&ui)));
+        // Production leaves this alone and keeps `OpenerLauncher`. The URL is surfaced by the hook
+        // above BEFORE the handoff either way, so a launcher that does nothing loses nothing.
+        if let Some(launcher) = &self.browser_launcher {
+            options.launcher = Arc::clone(launcher);
+        }
+        let result =
+            crate::oauth::authenticate(server_name, &server_url, Some(&definition), &options).await;
+
+        // `finally { if (!signal?.aborted) ui.setStatus("mcp-auth", undefined); }` — an aborted
+        // command leaves the status alone because the generation that owns the status bar is gone.
+        if !cancel.is_cancelled() {
+            cyrup_ext::host::HostServices::set_status(&*ui, AUTH_STATUS_KEY, None);
+        }
+
+        match result {
+            Ok(crate::oauth::AuthStatus::Authenticated) => AuthCommandOutcome::ok(format!(
+                "OAuth authentication successful for \"{server_name}\"."
+            )),
+            Ok(_) => AuthCommandOutcome::failed(
+                format!("OAuth authentication failed for \"{server_name}\"."),
+                cyrup_ext::NotifyKind::Error,
+            ),
+            Err(error) if crate::abort::is_abort_error(&error, Some(&cancel)) => {
+                AuthCommandOutcome::silent()
+            }
+            Err(error) => AuthCommandOutcome::failed(
+                failed_to_authenticate(server_name, &error.to_string()),
+                cyrup_ext::NotifyKind::Error,
+            ),
+        }
+    }
+
+    /// `options.onAuthorizationUrl` (`commands.ts:290-297`) — surface the authorization URL
+    /// **before** the browser is opened.
+    ///
+    /// The flow calls this and only then hands the URL to the launcher
+    /// (`crate::oauth::authenticate_inner`, "always surface the URL first"), so a user whose
+    /// machine has no browser — or whose browser cannot reach the loopback listener — is never
+    /// stranded looking at a blank screen.
+    ///
+    /// The handle is [`McpState::ui`], the generation's **fenced** services handle: once the owner
+    /// stops, `notify` is inert, so a URL produced by a superseded generation's flow cannot paint
+    /// into the session that replaced it.
+    ///
+    /// Nothing secret crosses here. An authorization URL is designed to be read aloud — it carries
+    /// the client id, the PKCE **challenge** (never the verifier) and the CSRF state, and the code
+    /// it eventually returns arrives on the loopback listener, not through this text.
+    fn authorization_url_hook(
+        server_name: &str,
+        ui: Arc<crate::owner::OwnedServices>,
+    ) -> crate::oauth::AuthorizationUrlHook {
+        let server_name = server_name.to_string();
+        Arc::new(move |authorization_url: String| {
+            let server_name = server_name.clone();
+            let ui = Arc::clone(&ui);
+            Box::pin(async move {
+                cyrup_ext::host::HostServices::notify(
+                    &*ui,
+                    &authorization_url_notice(&server_name, &authorization_url),
+                    cyrup_ext::NotifyKind::Info,
+                );
+                Ok(())
+            })
+        })
+    }
+
+    /// `reconnectServer(state, ctx, name)` (`commands.ts:150-215`) — close, connect, and commit the
+    /// metadata, so the credential the flow just stored is the one the connection uses.
+    ///
+    /// **Delegated, not re-derived.** [`crate::proxy::execute_connect`] is that function's ported
+    /// body: it closes a live connection, connects, and runs the eight-step metadata commit in
+    /// upstream's order — store metadata, prompts iff discovery succeeded, instructions
+    /// set-or-**delete**, cache write, `notifyToolMetadataUpdated`, keep-alive mark, clear failure,
+    /// status bar. That notification is what drives `install_surface_sync` ->
+    /// [`Self::sync_tool_surface`], so the newly authorized server's tools reach the model without
+    /// a restart — the last step of journey B. A second hand-written reconnect here would fork that
+    /// commit order.
+    ///
+    /// A `needs-auth` result after a successful authentication is not a contradiction and is
+    /// reported as upstream reports it (`commands.ts:178`): the token was stored but the server
+    /// still refused it, which is the one outcome that must not be silently rendered as success.
+    async fn reconnect_after_auth(&self, server_name: &str) -> AuthCommandOutcome {
+        let Some(ctx) = self.proxy_ctx() else {
+            return AuthCommandOutcome::failed(
+                format!(
+                    "OAuth credentials were stored for \"{server_name}\", but MCP is not initialized; the connection was not retried."
+                ),
+                cyrup_ext::NotifyKind::Warning,
+            );
+        };
+        let cancel = self
+            .owner()
+            .map_or_else(cyrup_core::CancelToken::new, |owner| owner.token());
+        let connected = crate::proxy::execute_connect(&ctx, server_name, &cancel).await;
+        let result = match connected {
+            Ok(result) => result,
+            Err(error) => {
+                return AuthCommandOutcome::failed(
+                    format!("Failed to connect to \"{server_name}\": {error}"),
+                    cyrup_ext::NotifyKind::Error,
+                );
+            }
+        };
+        match ctx.env.get_connection(server_name) {
+            Some(crate::proxy::ConnectionStatus::Connected) => {
+                let tools = ctx.state.tool_metadata.lock().map_or(0, |metadata| {
+                    metadata.get(server_name).map_or(0, Vec::len)
+                });
+                let resources = ctx.state.resource_counts.lock().map_or(0, |counts| {
+                    counts.get(server_name).copied().unwrap_or(0)
+                });
+                AuthCommandOutcome::ok(format!(
+                    "MCP: Reconnected to {server_name} ({tools} tools, {resources} resources)"
+                ))
+            }
+            Some(crate::proxy::ConnectionStatus::NeedsAuth) => AuthCommandOutcome::failed(
+                format!("MCP: {server_name} requires OAuth. Run /mcp-auth {server_name} first."),
+                cyrup_ext::NotifyKind::Warning,
+            ),
+            _ => AuthCommandOutcome::failed(
+                connect_failure_message(&result)
+                    .unwrap_or_else(|| format!("Failed to connect to \"{server_name}\".")),
+                cyrup_ext::NotifyKind::Warning,
+            ),
+        }
+    }
+}
+
+// =================================================================================================
+// MCP-334 — the `/mcp-auth` handler's vocabulary
+// =================================================================================================
+
+/// `ui.setStatus("mcp-auth", …)`'s key (`commands.ts:286`, `:332`). The key is what pairs the
+/// `Some(text)` that raises the status line with the `None` that clears it.
+const AUTH_STATUS_KEY: &str = "mcp-auth";
+
+/// `commands.ts:254` — `/mcp-auth` in a session with no renderer.
+///
+/// The authorization-code grant needs a browser and a human; `settings.autoAuth` plus a
+/// `client_credentials` grant is the headless route, and it runs from the tool layer
+/// (`crate::proxy::attempt_auto_auth`), not from a slash command.
+const AUTH_REQUIRES_INTERACTIVE: &str = "OAuth authentication requires an interactive session.";
+
+/// `index.ts:659` — a bare `/mcp-auth` against a programmatic (in-memory SDK) config.
+///
+/// The picker resolves servers from the on-disk configuration; a caller who supplied the config
+/// object has no such document, so the only workable form is the one that names its target.
+const PROGRAMMATIC_CONFIG_AUTH_HINT: &str =
+    "Use /mcp-auth <server> to authenticate a server from the in-memory SDK config.";
+
+/// `commands.ts:627` — the bare `/mcp-auth` with nothing to offer.
+const NO_OAUTH_CAPABLE_SERVERS: &str = "No OAuth-capable MCP servers are configured.";
+
+/// The picker's prompt.
+///
+/// Deliberately **not** [`crate::ui::AUTH_PANEL_NOTICE`]: that string is the overlay panel's notice
+/// row and names the panel's keybindings ("press Enter or ctrl+a"), which a `select` dialog does
+/// not have. Promising a keystroke the surface does not implement is worse than a plain question.
+const AUTH_PICKER_PROMPT: &str = "Select an MCP server to authenticate";
+
+/// One `/mcp-auth` step's result — upstream's `McpAuthResult` (`commands.ts:243`) plus the
+/// notification level, which upstream carries implicitly by calling `ui.notify` at the site.
+///
+/// The level cannot be recovered from `ok` alone: a disabled server and a missing one are both
+/// failures but upstream reports the first at `warning` and the second at `error`, and a handler
+/// that flattened them would either shout about a routine misconfiguration or whisper a real fault.
+struct AuthCommandOutcome {
+    /// `result.ok` — whether the step succeeded. The `/mcp-auth` handler reconnects on `true` only.
+    ok: bool,
+    /// The user-facing text. **Empty means say nothing** — the abort arm, where the user cancelled
+    /// and a notice would be noise.
+    message: String,
+    /// The level [`notify`] uses when a UI is attached.
+    kind: cyrup_ext::NotifyKind,
+}
+
+impl AuthCommandOutcome {
+    /// A success, reported at `info`.
+    fn ok(message: String) -> Self {
+        Self { ok: true, message, kind: cyrup_ext::NotifyKind::Info }
+    }
+
+    /// A failure at the level upstream reports it.
+    fn failed(message: String, kind: cyrup_ext::NotifyKind) -> Self {
+        Self { ok: false, message, kind }
+    }
+
+    /// A failure with nothing to say — the user's own cancellation.
+    fn silent() -> Self {
+        Self { ok: false, message: String::new(), kind: cyrup_ext::NotifyKind::Info }
+    }
+}
+
+/// What the bare `/mcp-auth` resolved to.
+enum Picked {
+    /// The server to authenticate.
+    Server(String),
+    /// One of `openMcpAuthPanel`'s three early returns, already phrased.
+    Refused(AuthCommandOutcome),
+    /// Nothing was chosen — upstream's panel `done(undefined)`. Silent; see
+    /// [`McpExtension::pick_oauth_server`] for why a dismissal and an unanswerable dialog collapse
+    /// into one arm here.
+    Dismissed,
+}
+
+/// `commands.ts:325` — the `catch` arm's wording, with the message sanitized.
+///
+/// The interpolated text can come from a remote authorization server (an error body, a metadata
+/// document) and lands in a terminal, so it goes through [`crate::ui::sanitize_terminal_text`]
+/// exactly as `logoutServer` sanitizes its own (`commands.ts:355`). An escape sequence smuggled
+/// through an OAuth error would otherwise repaint the user's screen.
+fn failed_to_authenticate(server_name: &str, message: &str) -> String {
+    format!(
+        "Failed to authenticate \"{server_name}\": {}",
+        crate::ui::sanitize_terminal_text(message)
+    )
+}
+
+/// `options.onAuthorizationUrl`'s notice (`commands.ts:291-296`).
+///
+/// # The one adapted sentence, and why
+///
+/// Upstream's second paragraph ends *"copy the full localhost URL from the browser address bar and
+/// paste it into Pi"*, which is an instruction about upstream's `onAuthorizationInput` prompt.
+/// `McpExtension::authenticate_server` documents why that prompt is not installed here, so
+/// promising it would send a remote user looking for a dialog that never opens. The sentence
+/// instead names the route that **is** wired end to end — `mcp({action:"auth-complete"})`, whose
+/// own instructions (`crate::proxy::format_manual_auth_instructions`) use this same call shape —
+/// so the two texts tell a user the same thing.
+///
+/// The URL is sanitized for the same reason [`failed_to_authenticate`]'s message is: it is built
+/// from a remote authorization server's metadata and is about to be printed to a terminal.
+fn authorization_url_notice(server_name: &str, authorization_url: &str) -> String {
+    let url = crate::ui::sanitize_terminal_text(authorization_url);
+    format!(
+        "Open this URL to authenticate {server_name}:\n\n{url}\n\nAfter approving, authentication \
+         completes automatically if the browser can reach its localhost callback. On a remote \
+         machine, copy the full redirected localhost URL from the address bar and send it back \
+         with:\nmcp({{ action: \"auth-complete\", server: \"{server_name}\", args: {{ redirectUrl: \
+         \"PASTE_REDIRECT_URL_HERE\" }} }})"
+    )
+}
+
+/// The `message` [`crate::proxy::execute_connect`] puts in `details` on every failure arm
+/// (`proxy/auth.rs`'s `auth_required`, `aborted` and `connect_failed` branches all insert it).
+///
+/// Read from `details` rather than from `content` because the details map is the structured half —
+/// the text block is a rendered sentence that already wraps the same string.
+fn connect_failure_message(result: &cyrup_core::ToolResult) -> Option<String> {
+    result
+        .details
+        .as_ref()?
+        .get("message")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Notify through a services handle at `kind`, skipping an empty message.
+///
+/// The skip is [`AuthCommandOutcome::silent`]'s contract: a blank notification is a visible empty
+/// row in the transcript, which is worse than the silence the abort arm asked for.
+fn notify(services: &Arc<dyn cyrup_ext::host::HostServices>, message: &str, kind: cyrup_ext::NotifyKind) {
+    if message.is_empty() {
+        return;
+    }
+    services.notify(message, kind);
+}
+
+/// Deliver one `/mcp-auth` message on whichever channel the session has.
+///
+/// With a services handle the message is notified **at its own level** and the command answers
+/// `Ok(None)`; with none it rides `execute_command`'s return channel, which the session surfaces as
+/// `Info`. The two are exclusive, so nothing is ever printed twice. See
+/// [`McpExtension::on_mcp_auth_command`] for why the level is what decides.
+fn surface(
+    services: Option<&Arc<dyn cyrup_ext::host::HostServices>>,
+    message: String,
+    kind: cyrup_ext::NotifyKind,
+) -> Result<Option<String>, ExtError> {
+    match services {
+        Some(services) => {
+            notify(services, &message, kind);
+            Ok(None)
+        }
+        None if message.is_empty() => Ok(None),
+        None => Ok(Some(message)),
+    }
+}
+
+/// Join two `/mcp-auth` lines for the no-UI return channel, dropping an empty half.
+fn join_lines(first: &str, second: &str) -> String {
+    match (first.is_empty(), second.is_empty()) {
+        (true, _) => second.to_string(),
+        (_, true) => first.to_string(),
+        _ => format!("{first}\n{second}"),
+    }
 }
 
 /// [`cyrup_ext::native::ExtMode`] as `ctx.mode`'s string, for
@@ -1311,11 +2039,14 @@ impl NativeExtension for McpExtension {
             // The `is_error: false` guard is cyrup-only and observably identical to upstream:
             // `toolErrorOverride` returns `{isError: true}` for an already-flagged result too, and
             // `apply_patch` would then write `true` over `true`.
+            //
+            // The two-code list itself lives in ONE place — `McpErrorCode::is_tool_error_override`
+            // (`proxy/error_vocab.rs`), reached here through `tool_error_override`, which is the
+            // direct port of `toolErrorOverride(details)`. Inlining the `matches!` here forked the
+            // vocabulary: `error_vocab`'s copy is the one the code-table test pins, so a divergence
+            // would have been invisible to it.
             HostEvent::ToolResult { details: Some(details), is_error: false, .. }
-                if matches!(
-                    details.get("error").and_then(serde_json::Value::as_str),
-                    Some("tool_error" | "call_failed")
-                ) =>
+                if crate::proxy::error_vocab::tool_error_override(Some(details)) == Some(true) =>
             {
                 // `content` / `details` / `usage` stay `None` so `apply_patch`
                 // (`contract.rs:96-113`) leaves them untouched — that is the whole reason the patch
@@ -1347,6 +2078,31 @@ impl NativeExtension for McpExtension {
             state.set_human_wait_ctx(ctx);
         }
         outcome
+    }
+
+    /// Service the slash commands this extension registers.
+    ///
+    /// Only `/mcp-auth` is routed (MCP-334). `/mcp` and the per-server prompt commands keep the
+    /// trait's default answer — `native extension has no handler for command …` — because their
+    /// dispatchers are MCP-394 and MCP-039 respectively and neither is ported; reproducing that
+    /// error verbatim here is what keeps overriding this method from changing their behaviour.
+    ///
+    /// **The name is matched on its base.** `cyrup_ext`'s facade disambiguates two extensions
+    /// registering the same command into `mcp-auth:1` / `mcp-auth:2` (SEAM-048, pi's
+    /// `resolveRegisteredCommands`) and dispatches with the REGISTERED name, so an exact comparison
+    /// against the constant would leave this extension unable to service its own command whenever
+    /// something else registered the name first.
+    async fn execute_command(
+        &self,
+        name: &str,
+        args: &str,
+        ctx: &HostCtx,
+    ) -> Result<Option<String>, ExtError> {
+        let base = name.split(':').next().unwrap_or(name);
+        if base == crate::registration::MCP_AUTH_COMMAND {
+            return self.on_mcp_auth_command(args, ctx).await;
+        }
+        Err(ExtError::Component(format!("native extension has no handler for command `{name}`")))
     }
 
     /// `renderCall` for every name [`crate::registration::register_surface`] declared a renderer
@@ -2288,6 +3044,300 @@ done
 
         let tui = ext.context_snapshot(&event_ctx());
         assert!(tui.has_ui && tui.is_tui_mode(), "URL elicitation is gated on exactly this");
+    }
+
+
+    // ---------------------------------------------------------------------------------------
+    // MCP-334 — `/mcp-auth`
+    // ---------------------------------------------------------------------------------------
+
+    fn command_ctx(has_ui: bool) -> HostCtx {
+        HostCtx::command(cyrup_ext::native::ExtMode::Tui, has_ui, PathBuf::from("/w"))
+    }
+
+    /// An `McpState` carrying `config` and, optionally, a fenced services handle — the two things
+    /// every `authenticateServer` guard reads.
+    fn auth_state(config: McpConfig, ui: bool) -> Arc<McpState> {
+        use futures::FutureExt;
+
+        let owner = Arc::new(McpRuntimeOwner::new());
+        let manager = Arc::new(crate::state::McpServerManager::default());
+        let lifecycle = Arc::new(crate::lifecycle::McpLifecycleManager::new(
+            Arc::clone(&manager),
+            Arc::new(|_| false),
+        ));
+        let services = ui.then(|| {
+            Arc::new(crate::owner::OwnedServices::new(
+                Arc::new(ToolSetServices::default()) as Arc<dyn cyrup_ext::host::HostServices>,
+                Arc::clone(&owner),
+            ))
+        });
+        Arc::new(McpState::new(crate::state::McpStateParts {
+            owner,
+            manager,
+            lifecycle,
+            config,
+            programmatic_config: None,
+            oauth_runtime: crate::oauth::create_oauth_runtime(None),
+            auth_storage_options: crate::credentials::AuthStorageOptions::default(),
+            ui: services,
+            open_browser: Arc::new(|_| async { Ok(()) }.boxed()),
+            send_message: Arc::new(|_| {}),
+        }))
+    }
+
+    fn config_with(servers: &[(&str, crate::config::ServerEntry)]) -> McpConfig {
+        let mut config = McpConfig::default();
+        for (name, entry) in servers {
+            config.mcp_servers.insert((*name).to_string(), entry.clone());
+        }
+        config
+    }
+
+    /// The refusal a [`Picked`] carries, with the other two arms folded into a *distinguishable*
+    /// failure rather than a `panic!` — this crate denies `clippy::panic` in test code too, and an
+    /// assertion that names the arm it got is more diagnostic than an unwind anyway.
+    fn refusal(picked: Picked) -> AuthCommandOutcome {
+        match picked {
+            Picked::Refused(outcome) => outcome,
+            Picked::Server(name) => AuthCommandOutcome::failed(
+                format!("expected a refusal, picked \"{name}\""),
+                cyrup_ext::NotifyKind::Error,
+            ),
+            Picked::Dismissed => AuthCommandOutcome::failed(
+                "expected a refusal, got a dismissal".to_string(),
+                cyrup_ext::NotifyKind::Error,
+            ),
+        }
+    }
+
+    fn oauth_http(url: &str) -> crate::config::ServerEntry {
+        crate::config::ServerEntry {
+            url: Some(url.to_string()),
+            auth: Some(crate::config::AuthMode::Named(crate::config::AuthKind::Oauth)),
+            ..Default::default()
+        }
+    }
+
+    /// Overriding [`NativeExtension::execute_command`] must not change what an unowned name answers:
+    /// `/mcp` and the prompt commands still belong to MCP-394 / MCP-039, and a silent `Ok(None)`
+    /// here would turn "not ported" into "ran and said nothing".
+    #[tokio::test]
+    async fn an_unowned_command_still_reports_that_there_is_no_handler() {
+        let ext = extension();
+        let error = ext
+            .execute_command("mcp", "status", &command_ctx(true))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            ExtError::Component(
+                "native extension has no handler for command `mcp`".to_string()
+            )
+            .to_string()
+        );
+    }
+
+    /// SEAM-048's disambiguated form — a second extension registering `mcp-auth` pushes this one's
+    /// registration to `mcp-auth:2`, and `execute_native_command` dispatches with the REGISTERED
+    /// name. Matching the constant exactly would leave the adapter unable to service its own
+    /// command, and the failure would only appear on a machine with a colliding extension.
+    ///
+    /// The assertion doubles as the no-UI return-channel pin: with no renderer the message rides
+    /// `Ok(Some(...))` rather than being dropped the way upstream drops it.
+    #[tokio::test]
+    async fn mcp_auth_routes_on_the_base_name_and_answers_on_the_return_channel() {
+        let ext = extension();
+        let answer = ext
+            .execute_command("mcp-auth:2", "linear", &command_ctx(false))
+            .await
+            .unwrap();
+        assert_eq!(answer, Some("MCP not initialized".to_string()));
+    }
+
+    /// `if (!serverName && !commandCtx.hasUI) return;` (`index.ts:636`) — a bare `/mcp-auth` in a
+    /// session with no renderer has no server to act on and no way to ask for one.
+    #[tokio::test]
+    async fn a_bare_mcp_auth_without_a_renderer_says_nothing() {
+        let ext = extension();
+        assert_eq!(
+            ext.execute_command("mcp-auth", "   ", &command_ctx(false)).await.unwrap(),
+            None
+        );
+    }
+
+    /// `commands.ts:254` — the authorization-code grant needs a browser and a human.
+    #[tokio::test]
+    async fn authenticate_server_refuses_without_an_interactive_session() {
+        let ext = extension();
+        let state = auth_state(config_with(&[("s", oauth_http("https://s/mcp"))]), false);
+        let outcome = ext.authenticate_server(&state, "s", &command_ctx(false)).await;
+        assert!(!outcome.ok);
+        assert_eq!(outcome.message, AUTH_REQUIRES_INTERACTIVE);
+    }
+
+    /// The three configuration refusals, byte-exact and at upstream's own levels
+    /// (`commands.ts:257-276`). The levels are the reason [`AuthCommandOutcome`] carries one: a
+    /// disabled server is a `warning` and a missing one an `error`, and flattening them would
+    /// either shout about a routine toggle or whisper a real fault.
+    #[tokio::test]
+    async fn authenticate_server_reproduces_upstreams_three_configuration_refusals() {
+        let ext = extension();
+        let disabled = crate::config::ServerEntry {
+            disabled: Some(true),
+            ..oauth_http("https://d/mcp")
+        };
+        let stdio = crate::config::ServerEntry {
+            command: Some("echo".to_string()),
+            ..Default::default()
+        };
+        let state = auth_state(
+            config_with(&[("disabled", disabled), ("stdio", stdio)]),
+            true,
+        );
+        let ctx = command_ctx(true);
+
+        let missing = ext.authenticate_server(&state, "gone", &ctx).await;
+        assert!(!missing.ok);
+        assert_eq!(missing.message, "Server \"gone\" not found in config");
+        assert_eq!(missing.kind, cyrup_ext::NotifyKind::Error);
+
+        let off = ext.authenticate_server(&state, "disabled", &ctx).await;
+        assert!(!off.ok);
+        assert_eq!(
+            off.message,
+            "Server \"disabled\" is disabled. Run /mcp enable disabled, then /reload."
+        );
+        assert_eq!(off.kind, cyrup_ext::NotifyKind::Warning);
+
+        let not_oauth = ext.authenticate_server(&state, "stdio", &ctx).await;
+        assert!(!not_oauth.ok);
+        assert_eq!(
+            not_oauth.message,
+            "Server \"stdio\" does not use OAuth authentication.\nSet \"auth\": \"oauth\" or omit auth for auto-detection."
+        );
+        assert_eq!(not_oauth.kind, cyrup_ext::NotifyKind::Error);
+    }
+
+    /// `resolveServerUrl` is INSIDE upstream's `try` (`commands.ts:279`), so a URL naming a variable
+    /// the environment does not define reports as `Failed to authenticate …` rather than as the
+    /// no-URL message — and it must never reach the network to find that out.
+    #[tokio::test]
+    async fn an_unresolvable_url_fails_before_any_network_work() {
+        let ext = extension();
+        let state = auth_state(
+            config_with(&[(
+                "s",
+                oauth_http("https://${CYRUP_MCP_A_VARIABLE_NOTHING_DEFINES}/mcp"),
+            )]),
+            true,
+        );
+        let outcome = ext.authenticate_server(&state, "s", &command_ctx(true)).await;
+        assert!(!outcome.ok);
+        assert!(
+            outcome.message.starts_with("Failed to authenticate \"s\": "),
+            "{}",
+            outcome.message
+        );
+        assert!(outcome.message.contains("CYRUP_MCP_A_VARIABLE_NOTHING_DEFINES"));
+    }
+
+    /// The bare form's three early returns (`commands.ts:611-628`, `index.ts:659`).
+    #[tokio::test]
+    async fn the_bare_form_refuses_a_programmatic_config_and_an_empty_candidate_set() {
+        let programmatic = McpExtension::with_config(
+            McpDirs::new(PathBuf::from("/nonexistent/agent"), PathBuf::from("/w")),
+            Some(McpConfig::default()),
+        );
+        let state = auth_state(config_with(&[("s", oauth_http("https://s/mcp"))]), true);
+        let ctx = command_ctx(true);
+        let outcome = refusal(programmatic.pick_oauth_server(&state, &ctx).await);
+        assert_eq!(outcome.message, PROGRAMMATIC_CONFIG_AUTH_HINT);
+        assert_eq!(outcome.kind, cyrup_ext::NotifyKind::Info);
+
+        // A disabled OAuth server and an enabled non-OAuth one are both invisible to the picker.
+        let ext = extension();
+        let hidden = config_with(&[
+            (
+                "off",
+                crate::config::ServerEntry { disabled: Some(true), ..oauth_http("https://off/mcp") },
+            ),
+            (
+                "stdio",
+                crate::config::ServerEntry {
+                    command: Some("echo".to_string()),
+                    ..Default::default()
+                },
+            ),
+        ]);
+        let outcome = refusal(ext.pick_oauth_server(&auth_state(hidden, true), &ctx).await);
+        assert_eq!(outcome.message, NO_OAUTH_CAPABLE_SERVERS);
+        assert_eq!(outcome.kind, cyrup_ext::NotifyKind::Warning);
+
+        // With candidates but no fenced handle to ask through, the refusal names the form that
+        // needs no overlay.
+        let outcome = refusal(
+            ext.pick_oauth_server(
+                &auth_state(config_with(&[("s", oauth_http("https://s/mcp"))]), false),
+                &ctx,
+            )
+            .await,
+        );
+        assert_eq!(outcome.message, crate::ui::auth_panel_unavailable_message("tui"));
+    }
+
+    /// The notice a user actually sees is the whole reason `on_authorization_url` is installed: the
+    /// flow's own fallback is `tracing::info!`, which in a TUI is invisible.
+    #[test]
+    fn the_authorization_url_notice_carries_the_url_and_the_manual_route() {
+        let notice = authorization_url_notice(
+            "linear",
+            "https://auth.example.com/authorize?state=abc&code_challenge=xyz",
+        );
+        assert!(notice.starts_with("Open this URL to authenticate linear:\n\n"));
+        assert!(notice.contains("https://auth.example.com/authorize?state=abc&code_challenge=xyz"));
+        assert!(
+            notice.contains("mcp({ action: \"auth-complete\", server: \"linear\""),
+            "the remote fallback must name the route that is actually wired: {notice}"
+        );
+    }
+
+    /// Both interpolated strings reach a terminal and both are built from a remote server's bytes,
+    /// so both are sanitized — an OSC-8 payload in an error body must not repaint the screen.
+    #[test]
+    fn remote_text_is_sanitized_before_it_reaches_the_terminal() {
+        let notice = authorization_url_notice(
+            "s",
+            "https://as/authorize\u{1b}]8;;https://evil.invalid\u{7}",
+        );
+        assert!(!notice.contains('\u{1b}'), "{notice}");
+        assert!(!notice.contains("evil.invalid"), "{notice}");
+
+        let failure = failed_to_authenticate("s", "boom\u{1b}[31m\u{7}");
+        assert_eq!(failure, "Failed to authenticate \"s\": boom");
+    }
+
+    /// `execute_connect`'s failure arms all carry `details.message`; the reconnect report reads it
+    /// from there rather than re-parsing the rendered text block.
+    #[test]
+    fn a_connect_failure_message_is_read_from_the_details_map() {
+        let mut result = cyrup_core::ToolResult::default();
+        assert_eq!(connect_failure_message(&result), None);
+        result.details = Some(serde_json::json!({"mode": "connect", "message": "no route to host"}));
+        assert_eq!(connect_failure_message(&result), Some("no route to host".to_string()));
+    }
+
+    /// [`AuthCommandOutcome::silent`]'s contract, on both output channels: an aborted `/mcp-auth`
+    /// prints nothing at all rather than an empty notification row.
+    #[test]
+    fn a_silent_outcome_prints_on_neither_channel() {
+        let silent = AuthCommandOutcome::silent();
+        assert!(!silent.ok);
+        assert_eq!(surface(None, silent.message, silent.kind).unwrap(), None);
+        assert_eq!(join_lines("", ""), "");
+        assert_eq!(join_lines("first", ""), "first");
+        assert_eq!(join_lines("", "second"), "second");
+        assert_eq!(join_lines("first", "second"), "first\nsecond");
     }
 
     fn input_state(owner: Arc<McpRuntimeOwner>) -> Arc<McpState> {

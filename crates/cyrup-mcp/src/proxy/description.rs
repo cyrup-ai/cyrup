@@ -21,6 +21,10 @@ use crate::proxy::tool_metadata::{CandidateIndex, ToolMetadata, is_tool_allowed,
 ///
 /// The full `DirectToolSpec` is 13e's; this is the projection `buildProxyDescription` actually
 /// consumes, so the two never have to agree on more than a name and a server.
+///
+/// **No production constructor, deliberately** — it is [`build_proxy_description`]'s parameter, and
+/// that function is the live-metadata twin the shipped path never calls. See
+/// [`build_proxy_description`] for why the twin exists.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectToolSummary {
     /// The `mcpServers` key that contributed the tool.
@@ -34,6 +38,10 @@ pub struct DirectToolSummary {
 /// **Only cache-valid entries reach here** — the caller applies `isServerCacheValid(entry,
 /// definition)` and passes `None` for a stale one. A stale entry is *not* skipped by the caller's
 /// loop, it just yields zero counts, and a zero total is what drops the server out of the summary.
+///
+/// **No production constructor, deliberately** — like [`DirectToolSummary`] it is only ever built to
+/// feed [`build_proxy_description`], whose shipped caller passes the on-disk `mcp-cache.json` shape
+/// to `crate::registration`'s twin instead. See [`build_proxy_description`].
 #[derive(Debug, Clone, Default)]
 pub struct CachedServerEntry {
     /// The cached tools, with their `uiVisibility` intact.
@@ -136,6 +144,22 @@ fn collision_index(
 /// and `Pi` becomes `cyrup` (MCP-163's naming decision); the
 /// `mcp({ action: "ui-messages" })` usage line is removed (Cut 2). Every other line, including the
 /// `Mode:` precedence line, is unchanged.
+///
+/// # Why this has no production caller
+///
+/// **Deliberate, and it must stay reachable.** The shipped registration pass always round-trips
+/// through `mcp-cache.json` and calls `crate::registration`'s private cache-shaped twin
+/// (`registration.rs:2882`, inside `register_surface`); nothing in production holds the live
+/// `ToolMetadata` this signature wants at the moment the description is built.
+///
+/// What this copy is for is the byte-identity guard: `both_proxy_descriptions_share_one_head_line`
+/// (`registration.rs:3773-3779`) builds a description from each of the two and asserts their head
+/// lines are equal. That assertion is load-bearing — `McpExtension::proxy_tool_description`
+/// re-registers the gateway tool only when the text *changed*, so if the two heads ever drifted the
+/// guard would never fire and every reconnect would invalidate the provider's prompt-cache prefix
+/// (see the note at `registration.rs:1900`). Deleting this function would delete the only thing that
+/// can catch that drift. The two collapse into one when MCP-207 merges this file's candidate-set
+/// form into 13e's memoised [`crate::registration::CandidateIndex`].
 #[must_use]
 pub fn build_proxy_description(
     config: &McpConfig,

@@ -303,13 +303,6 @@ impl McpTool {
             gate,
         }
     }
-
-    /// The description this instance was registered with — `syncProxyTool` compares it against a
-    /// freshly generated one and re-registers only when they differ.
-    #[must_use]
-    pub fn description_text(&self) -> &str {
-        &self.description
-    }
 }
 
 #[async_trait::async_trait]

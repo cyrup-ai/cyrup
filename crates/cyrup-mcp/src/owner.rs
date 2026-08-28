@@ -678,9 +678,17 @@ impl std::fmt::Debug for McpDialog {
 // =================================================================================================
 
 /// `sampling-handler.ts:64` — the title of the **request** dialog.
+///
+/// **No production reader.** It is handed to [`confirm_sampling`] by section 05's
+/// `registerSamplingHandler` body (MCP-118) — the [`crate::runtime::SamplingHook`] that
+/// [`crate::server_manager::McpServerManager::set_sampling_config`] would carry — which is not
+/// ported, so no MCP sampling request reaches a dialog today.
 pub const SAMPLING_REQUEST_APPROVAL_TITLE: &str = "Approve MCP sampling request";
 
 /// `sampling-handler.ts:89` — the title of the **response** dialog.
+///
+/// **No production reader**, for the same reason as [`SAMPLING_REQUEST_APPROVAL_TITLE`]: the
+/// second gate is opened by section 05's handler body (MCP-118), which is unported.
 pub const SAMPLING_RESPONSE_APPROVAL_TITLE: &str = "Return MCP sampling response";
 
 /// `sampling-handler.ts:188` — thrown when approval is required and there is no UI to ask through.
@@ -702,10 +710,20 @@ pub const SAMPLING_REQUEST_DECLINED: &str = "MCP sampling request was declined";
 /// without a model registry. `SamplingUIContext = Pick<ExtensionUIContext, "confirm">` — sampling
 /// may call **`confirm` only**, which is why this carries an [`McpDialog`] rather than a services
 /// handle.
+///
+/// **Nothing constructs this in production.** The constructor is section 05's
+/// `registerSamplingHandler` body (MCP-118) — the [`crate::runtime::SamplingHook`] that
+/// [`crate::server_manager::McpServerManager::set_sampling_config`] would carry — which is not
+/// ported. This unit (MCP-455) is the *gate* the handler will call; the handler is the caller it is
+/// waiting on.
 #[derive(Debug)]
 pub struct SamplingApproval {
     /// `options.autoApprove` — `settings.samplingAutoApprove === true`
     /// ([`crate::config::McpSettings::sampling_auto_approve`]). Short-circuits **both** dialogs.
+    ///
+    /// Read only by [`confirm_sampling`], and populated only by the unported MCP-118 handler, so
+    /// `settings.samplingAutoApprove` has no production effect yet — a user who sets it changes
+    /// nothing until section 05 lands.
     pub auto_approve: bool,
     /// `ctx.hasUI`, carried explicitly.
     ///
@@ -737,6 +755,11 @@ pub struct SamplingApproval {
 ///
 /// `has_ui && dialog.is_none()` is a wiring bug rather than a reachable state, and it resolves to
 /// branch 2: a gate with nothing to ask through has no UI, whatever a flag says.
+///
+/// **No production caller.** Its caller is section 05's `registerSamplingHandler` body (MCP-118),
+/// which is unported; until it lands the only exercise this gate gets is this module's tests. That
+/// is safe in the direction that matters — with no handler installed, no server can ask for
+/// sampling at all — so the missing caller costs the *capability*, not the *consent*.
 pub async fn confirm_sampling(
     approval: &SamplingApproval,
     title: &str,
@@ -769,6 +792,10 @@ pub async fn confirm_sampling(
 /// Both truncations are `truncateAtWord(..., 400)` — the word-boundary cut with the ASCII `...`
 /// tail ([`truncate_at_word`], MCP-459). The dialog is meant to be *inspectable*: this is the only
 /// place the user sees what a server is about to spend their credentials on.
+///
+/// **No production caller.** It renders the body [`confirm_sampling`] is given under
+/// [`SAMPLING_REQUEST_APPROVAL_TITLE`], and both are called from section 05's
+/// `registerSamplingHandler` body (MCP-118), which is unported.
 #[must_use]
 pub fn format_request_approval(
     server_name: &str,
@@ -812,6 +839,9 @@ pub fn format_request_approval(
 /// (MCP-456) emits exactly one text block, so the array arm and the empty arm are unreachable from
 /// this crate's own producer; the empty arm renders what JS would (`.type` of an array is
 /// `undefined`) rather than inventing a friendlier string for a state that cannot occur.
+///
+/// **No production caller**, for the same reason as [`format_request_approval`]: the second dialog
+/// is opened by section 05's `registerSamplingHandler` body (MCP-118), which is unported.
 #[must_use]
 #[allow(deprecated)]
 pub fn format_response_approval(server_name: &str, response: &CreateMessageResult) -> String {
@@ -888,6 +918,10 @@ fn message_text(message: &Message) -> String {
 /// `sampling-handler.ts:123` — `messageText`'s fifth spelling, the fallthrough for a block kind the
 /// switch does not name. It has **no producer** over `cyrup_core`'s closed [`Content`]; see
 /// [`message_text`] for why it is written down anyway.
+///
+/// **No reader either, and deliberately so: this is a recorded string, not a code path.** It is not
+/// staged for a unit and nothing should wire it — the day [`Content`] gains a fifth variant,
+/// [`message_text`]'s `match` becomes a compile error with the right text already sitting here.
 pub const MESSAGE_TEXT_UNKNOWN_BLOCK: &str = "[content]";
 
 #[cfg(test)]

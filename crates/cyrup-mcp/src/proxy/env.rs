@@ -57,12 +57,6 @@ pub struct ConnectOutcome {
 }
 
 impl ConnectOutcome {
-    /// `connection.status === "connected"`.
-    #[must_use]
-    pub fn is_connected(&self) -> bool {
-        self.status == Some(ConnectionStatus::Connected)
-    }
-
     /// `connection.status === "needs-auth"`.
     #[must_use]
     pub fn needs_auth(&self) -> bool {
@@ -435,6 +429,15 @@ impl ProxyCtx {
     ///
     /// The metadata is read **under the lock, without cloning**, because this runs once per row in
     /// `describe` and `search`.
+    ///
+    /// **No production caller, and that is correct.** `describe`/`search` reach approval state
+    /// through the trait ([`ProxyEnv::is_tool_call_approval_required`], called at
+    /// `discovery.rs:342` and `:563`) precisely so a mode test can script it; the shipped
+    /// implementor is [`crate::live::RuntimeEnv`]'s `is_tool_call_approval_required`
+    /// (`live.rs:1609`), which takes its own metadata lock and lands on the same
+    /// [`crate::proxy::is_tool_call_approval_required`]. This method is that body written against a
+    /// [`ProxyCtx`] instead — the form the crate's approval tests drive directly
+    /// (`approval.rs:995`, `:1015`) — and the reference an implementor is meant to mirror.
     #[must_use]
     pub fn approval_required(&self, server: &str, tool: &ToolMetadata) -> bool {
         self.with_metadata(|metadata| {

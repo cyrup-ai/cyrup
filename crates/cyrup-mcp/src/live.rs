@@ -822,10 +822,18 @@ impl RuntimeEnv {
     /// the three options every `mcp-auth-flow.ts` call site in `proxy-modes.ts` passes
     /// (`proxy-modes.ts:165-177`, `:368-372`, `:408-411`).
     fn auth_options(&self, cancel: &CancelToken) -> crate::oauth::AuthenticateOptions {
-        let store = crate::credentials::McpAuthStore::new(
-            self.dirs.clone(),
-            self.state.auth_storage_options.clone(),
-        );
+        // The GENERATION's vault, not a fresh one. `initialize_mcp` publishes the same handle it
+        // built [`crate::runtime::StoredCredentialAuth`] over, so a token this flow writes lands in
+        // the cache the connect ladder reads and `invalidateAuthEntryCache` evicts an entry someone
+        // else will see. The fallback is for a manager nothing published to — a `McpServerManager`
+        // built by `new`/`default` — and reconstructs from the same `(dirs, authStorageOptions)`
+        // pair, so it differs only in which in-process cache it holds.
+        let store = self.state.manager.auth_store().unwrap_or_else(|| {
+            crate::credentials::McpAuthStore::new(
+                self.dirs.clone(),
+                self.state.auth_storage_options.clone(),
+            )
+        });
         let storage: Arc<dyn crate::oauth::McpOAuthStorage> = Arc::new(store);
         let mut options = crate::oauth::AuthenticateOptions::new(storage);
         options.runtime = Some(Arc::clone(&self.state.oauth_runtime));
@@ -1184,12 +1192,13 @@ impl RuntimeEnv {
     ///
     /// `if (definition && supportsOAuth(definition) && (err instanceof UnauthorizedError || 401))
     /// invalidateAuthEntryCache(serverName)`. The eviction primitive exists
-    /// ([`crate::credentials::McpAuthStore::invalidate_cache`]) but its cache lives on the store
-    /// **instance**, and this crate has exactly one production construction site —
-    /// [`RuntimeEnv::auth_options`] — which builds a fresh store per auth operation. Evicting from a
-    /// store nobody else holds would be theatre; the observable it protects (a stale cached entry
-    /// surviving a 401) cannot occur while no entry outlives its store. The line lands the day a
-    /// shared store does.
+    /// ([`crate::credentials::McpAuthStore::invalidate_cache`]) and, since
+    /// [`crate::server_manager::McpServerManager::auth_store`] publishes the generation's vault,
+    /// there is now a store to evict from that someone else reads — so the line is *reachable*. It
+    /// is still not here, and the reason is scope rather than plumbing: this wrapper's contract is
+    /// "reconnect once on a proven terminated session, propagate everything else unchanged", and a
+    /// 401 arriving mid-call is the auto-auth ladder's ([`crate::proxy::call::AuthRecovery`])
+    /// business, not this one's. Land it with the unit that owns that classification.
     async fn with_session_recovery<T, F, Fut>(
         &self,
         server: &str,

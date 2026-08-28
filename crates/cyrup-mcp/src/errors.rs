@@ -414,6 +414,13 @@ impl McpError {
 
     /// The abort with upstream's default reason —
     /// `stop()`'s `reason = "MCP extension runtime stopped"`.
+    ///
+    /// **A test seam: no production caller.** Every shipping abort carries a reason it actually
+    /// obtained — [`crate::abort::abortable`] raises
+    /// [`crate::abort::ABORTED_FALLBACK_REASON`], and the owner-aware paths round-trip
+    /// `signal.reason`. This constructor exists so a test can name the default-reason value without
+    /// standing up an [`crate::owner::McpRuntimeOwner`]; its one use is `abort.rs`'s typed-arm
+    /// assertion on [`crate::abort::is_abort_error`].
     #[must_use]
     pub fn aborted_default() -> Self {
         McpError::Aborted(crate::owner::DEFAULT_STOP_REASON.to_string())
@@ -434,6 +441,16 @@ impl McpError {
     /// The refresh driver's discriminator: a store failure is rethrown, everything else becomes
     /// `None` and triggers a re-auth. Walks the chain for the same reason
     /// [`Self::is_cleanup_failure`] does, and with the same depth cap.
+    ///
+    /// **No production caller: that refresh driver is not ported.** It is rmcp's
+    /// `AuthorizationManager` / `AuthClient` path, which `runtime.rs:1620` and `:1975` both defer to
+    /// *"section 05 when it lands"*; production HTTP auth runs through
+    /// [`crate::runtime::HttpAuthProvider`] / `StoredCredentialAuth` instead, and those surface a
+    /// broken vault directly rather than deciding between rethrow and re-auth. The discriminator is
+    /// nonetheless load-bearing *as a contract* — [`crate::credentials::McpAuthStore`]'s
+    /// `McpOAuthStorage` impl is written to keep every failure crossing as
+    /// [`McpError::CredentialStore`] precisely so this stays reachable — so it is staged, not dead.
+    /// The three call sites today are `#[cfg(test)]` assertions of that contract.
     #[must_use]
     pub fn is_credential_store_failure(&self) -> bool {
         if matches!(self, McpError::CredentialStore(_)) {

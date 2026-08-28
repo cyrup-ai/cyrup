@@ -24,4 +24,5 @@
 mod support;
 
 mod activation;
+mod http_oauth;
 mod live_tool_call;

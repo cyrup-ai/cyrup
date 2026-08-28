@@ -97,6 +97,12 @@ use crate::config::{McpSettings, ToolResultRendering};
 /// `tool-result-renderer.ts:55` `DEFAULT_MAX_CALL_INPUT_CHARS`.
 pub const DEFAULT_MAX_CALL_INPUT_CHARS: usize = 1500;
 /// `tool-result-renderer.ts:57` `DEFAULT_BOXED_COLLAPSED_LINES`.
+///
+/// **No production reader.** Both references are in this file's `#[cfg(test)]` module: the renderer
+/// resolves its collapsed-line budget from `McpToolRenderOptions` and never falls back to this
+/// constant. It is upstream's default, kept so the ported default has a name to be checked against
+/// — which is what those two tests do. A reader that needs the fallback should use it rather than
+/// re-typing `3`.
 pub const DEFAULT_BOXED_COLLAPSED_LINES: u8 = 3;
 /// `tool-result-renderer.ts:58` `DEFAULT_COMPACT_COLLAPSED_LINES`.
 pub const DEFAULT_COMPACT_COLLAPSED_LINES: u8 = 1;
