@@ -173,6 +173,20 @@ impl AgentSession {
     /// ([`cyrup_resources::ResourceOrigin::source_info_json`]).
     pub fn slash_command_catalog(&self) -> Vec<serde_json::Value> {
         let mut out: Vec<serde_json::Value> = Vec::new();
+        // EXT-062 / TUI-012 — the opt-in table behind the `argumentCompletions` key emitted below.
+        // `(owner, registered name)` pairs, because that is the shape both tiers record
+        // (`cyrup-ext/src/facade.rs:492` for a native, `cyrup-ext/src/host/live.rs:249` for a guest's
+        // `registration.add-autocomplete`) and because two extensions may register the same raw
+        // name — matching on the name alone would light the key up on the wrong row.
+        let autocomplete_opt_in: std::collections::HashSet<(String, String)> = self
+            .services
+            .ext_host
+            .registry()
+            .command_autocomplete()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(owner, command)| (owner.as_str().to_string(), command))
+            .collect();
         // Registered extension commands.
         //
         // SEAM-048 — sourced from `resolved_commands()`, NOT `command_descriptions()`. pi builds
@@ -242,6 +256,24 @@ impl AgentSession {
                     entry.insert("description".into(), serde_json::Value::from(cmd.descriptor.description));
                 }
                 entry.insert("source".into(), serde_json::Value::from("extension"));
+                // EXT-062 / TUI-012 — cyrup's analog of pi carrying the CALLBACK itself onto the
+                // autocomplete row: `getArgumentCompletions: cmd.getArgumentCompletions`
+                // (`modes/interactive/interactive-mode.ts:753` @v0.84.3). A closure cannot cross
+                // this boundary (it is JSON, and one tier below it is a WIT world), so what crosses
+                // is the PRESENCE bit, and the front-end calls back through
+                // `ExtensionHost::command_completions(invocation_name, prefix)` when it needs the
+                // items. Emitted only when true, matching the `description` key above and pi's own
+                // `JSON.stringify` dropping an `undefined` field — the consumer reads it as
+                // absent ⇒ false.
+                //
+                // Extension rows ONLY. pi wires the callback in the extension-command arm alone;
+                // prompt templates (`:739-743`) and skills (`:758-766`) never get one, so those two
+                // arms below deliberately omit the key.
+                if autocomplete_opt_in
+                    .contains(&(cmd.owner.as_str().to_string(), cmd.name.clone()))
+                {
+                    entry.insert("argumentCompletions".into(), serde_json::Value::Bool(true));
+                }
                 entry.insert("sourceInfo".into(), serde_json::Value::Object(source_info));
                 out.push(serde_json::Value::Object(entry));
             }

@@ -1158,11 +1158,23 @@ pub enum TreeAction {
     FilterCycleForward,
     /// Cycle the filter backwards — `app.tree.filter.cycleBackward` (`shift+ctrl+o`).
     FilterCycleBackward,
+    /// Copy the highlighted entry's full text to the clipboard — `app.message.copy` (`ctrl+x`).
+    ///
+    /// The one binding `/tree` consumes that is NOT an `app.tree.*` id: pi's `handleInput` tests it
+    /// alongside the tree's own ids (`tree-selector.ts:1029-1030` `else if (kb.matches(keyData,
+    /// "app.message.copy")) { this.copySelected(); }`), and `TREE_HELP_ITEMS` lists it between the
+    /// `branch` and `label` cells (`:1217-1235`).
+    ///
+    /// It lives here rather than as a hole in the chrome's selector-first key route because
+    /// [`TreeKeymap::merge_json`] runs the same `merge_entries` over the same JSON the global
+    /// [`Keymap`] does, so a user rebind of `app.message.copy` moves BOTH tables at once.
+    Copy,
 }
 
 impl TreeAction {
-    /// Resolve an `app.tree.*` binding id (spec/tui/05 §6.1; pi `core/keybindings.ts:119-134`
-    /// and `:179-206` for the seven `app.tree.filter.*` ids).
+    /// Resolve a binding id the `/tree` selector consumes: the `app.tree.*` family (spec/tui/05
+    /// §6.1; pi `core/keybindings.ts:119-134` and `:179-206` for the seven `app.tree.filter.*` ids),
+    /// plus the one borrowed id `app.message.copy` (`tree-selector.ts:1029-1030`).
     pub fn from_id(id: &str) -> Option<TreeAction> {
         match id {
             "app.tree.foldOrUp" => Some(TreeAction::FoldOrUp),
@@ -1176,6 +1188,7 @@ impl TreeAction {
             "app.tree.filter.all" => Some(TreeAction::FilterAll),
             "app.tree.filter.cycleForward" => Some(TreeAction::FilterCycleForward),
             "app.tree.filter.cycleBackward" => Some(TreeAction::FilterCycleBackward),
+            "app.message.copy" => Some(TreeAction::Copy),
             _ => None,
         }
     }
@@ -1225,6 +1238,11 @@ impl Default for TreeKeymap {
                     },
                     T::FilterCycleBackward,
                 ),
+                // `app.message.copy` — the same `ctrl+x` default the global table binds to
+                // `Action::MessageCopy` (`core/keybindings.ts:99-102`), so the chord behaves
+                // identically whether or not `/tree` owns the input slot. `ctrl+x` collides with
+                // none of the chords above.
+                (ctrl('x'), T::Copy),
             ],
         }
     }
@@ -1268,7 +1286,10 @@ impl TreeKeymap {
         }
     }
 
-    /// Merge a JSON keybindings document, applying only the `app.tree.*` ids.
+    /// Merge a JSON keybindings document, applying only the ids [`TreeAction::from_id`] resolves —
+    /// the `app.tree.*` family plus `app.message.copy`. The global [`Keymap`] merges the SAME
+    /// document, so a rebind of `app.message.copy` moves this table and the global one together,
+    /// which is what keeps the chord identical inside and outside `/tree`.
     pub fn merge_json(&mut self, json: &str) -> Result<Vec<KeybindingIssue>, TuiError> {
         merge_entries(json, TreeAction::from_id, |action, keys| self.set_action(action, keys))
     }

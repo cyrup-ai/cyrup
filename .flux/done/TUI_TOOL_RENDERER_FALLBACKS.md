@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Port Pi's Tool Call/Result Fallbacks: A Defined-But-Unrendered Tool Gets A Bold Name And A 10-Line Preview, Not Full Args JSON

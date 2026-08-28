@@ -1,6 +1,6 @@
 //! The blocking body of [`discover`](super::discover), one collector per section.
 //!
-//! [`discover_blocking`] is a table of contents: it declares the six accumulators, runs the eight
+//! [`discover_blocking`] is a table of contents: it declares the seven accumulators, runs the ten
 //! `collect_*`/`apply_*` sections below in order against them, then folds the result into a
 //! [`DiscoveryReport`]. Each section is independent — none returns early, none reads a local the
 //! previous one left behind — so the order here IS the precedence story, nothing more.
@@ -29,11 +29,11 @@ use super::scan::{
     load_one_skill, name_disabled, scan_prompt_root, scan_skill_root, scan_theme_root,
 };
 use super::{
-    DiscoveryConfig, DiscoveryReport, ResourceRegistry, ResourceSet,
-    discover_append_system_prompt_file, discover_system_prompt_file,
+    DiscoveryConfig, DiscoveryReport, LooseExtension, ResourceRegistry, ResourceSet,
+    discover_append_system_prompt_file, discover_system_prompt_file, scan_loose_extension_root,
 };
 
-/// The six accumulators every section of [`discover_blocking`] appends to.
+/// The seven accumulators every section of [`discover_blocking`] appends to.
 ///
 /// Threaded through the collectors as one `&mut` so each section keeps the exact body it had when
 /// they were all inlined: every field is destructured back out to the same name at the top of the
@@ -46,6 +46,8 @@ struct Accum {
     warnings: Vec<ResourceWarning>,
     diagnostics: Vec<ResourceDiagnostic>,
     ext_paths: Vec<PathBuf>,
+    /// Auto-discovered loose extensions, ENABLED and DISABLED alike — see [`LooseExtension`].
+    loose_extensions: Vec<LooseExtension>,
 }
 
 pub(super) fn discover_blocking(
@@ -56,9 +58,11 @@ pub(super) fn discover_blocking(
 
     collect_builtin_themes(cfg, &mut acc);
     collect_global_loose(cfg, &mut acc);
+    collect_global_loose_extensions(cfg, &mut acc);
     collect_settings_listings(cfg, &mut acc);
     collect_packages(cfg, cancel, &mut acc);
     collect_project_loose(cfg, &mut acc);
+    collect_project_loose_extensions(cfg, &mut acc);
     collect_discover_contributions(cfg, &mut acc);
     collect_cli_paths(cfg, &mut acc);
     apply_disabled_filter(cfg, &mut acc);
@@ -70,6 +74,7 @@ pub(super) fn discover_blocking(
         warnings,
         mut diagnostics,
         ext_paths,
+        loose_extensions,
     } = acc;
 
     let registry = ResourceRegistry {
@@ -77,6 +82,7 @@ pub(super) fn discover_blocking(
         prompts: ResourceSet::build(prompts),
         themes: ResourceSet::build(themes),
         ext_crate_paths: ext_paths,
+        loose_extensions,
     };
 
     // Same-name collision diagnostics (skills.ts:410-427; resource-loader.ts:913-964): each
@@ -184,6 +190,46 @@ fn collect_global_loose(cfg: &DiscoveryConfig, acc: &mut Accum) {
         });
         themes.extend(buf);
     }
+}
+
+/// Auto-discovered loose extensions under the **global** root `<agent_dir>/extensions`.
+///
+/// The counterpart of [`collect_global_loose`] for Pi's fourth `RESOURCE_TYPES` member
+/// (`package-manager.ts:194`): `collectAutoExtensionEntries` (`package-manager.ts:587-630`) over the
+/// same root `cyrup_ext::loader::discover_with_diagnostics` scans pre-trust
+/// (`cyrup-session-svc/src/builder.rs:2244-2248` → `agent_dir.join("extensions")`), filtered by the
+/// GLOBAL settings layer's `extensions` array.
+///
+/// Unlike its three siblings this does not `retain` — [`scan_loose_extension_root`] keeps the
+/// disabled entries with `enabled: false`, because the extension loader needs the negative half to
+/// honour a `-pattern` at load time (`DiscoveryRoots::disabled`).
+///
+/// Not gated on `enable_skills`/`enable_prompts`/`enable_themes`: `--no-extensions` is a separate
+/// flag, applied by the session builder (which simply does not scan these roots), so gating here
+/// would double-apply an unrelated switch.
+fn collect_global_loose_extensions(cfg: &DiscoveryConfig, acc: &mut Accum) {
+    let root = cfg.global_dir.join("extensions");
+    acc.loose_extensions.extend(scan_loose_extension_root(
+        &root,
+        ResourceScope::Global,
+        &cfg.global_overrides.extensions,
+    ));
+}
+
+/// Auto-discovered loose extensions under the **project** root `<cwd>/.cyrup/extensions`,
+/// trust-gated exactly like [`collect_project_loose`] — and like the loader's own project root,
+/// which `DiscoveredExtension::is_trusted` gates post-trust
+/// (`cyrup-ext/src/loader.rs`, `ExtOrigin::Project`).
+fn collect_project_loose_extensions(cfg: &DiscoveryConfig, acc: &mut Accum) {
+    if !cfg.trusted_project {
+        return;
+    }
+    let root = cfg.cwd.join(".cyrup/extensions");
+    acc.loose_extensions.extend(scan_loose_extension_root(
+        &root,
+        ResourceScope::Project,
+        &cfg.project_overrides.extensions,
+    ));
 }
 
 /// The plain-path positive listings declared in the project/global settings arrays.

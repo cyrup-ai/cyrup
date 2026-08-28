@@ -171,13 +171,20 @@ impl<B: Backend> App<B> {
                 // tool name.
                 // EXT-006: an extension that declared a renderer for THIS tool supplies the call
                 // header; `None` keeps the built-in per-tool dispatch.
-                self.state.transcript.push_tool_start_rendered(
+                // `hasRendererDefinition()` (tool-execution.ts:103-105) — resolved off the live
+                // `getToolDefinition` registry one frame up, in
+                // [`Self::ingest_session_event_owned`], because this fold holds no session. It is
+                // what decides whether an unrendered tool draws as a bold name + ten-line preview
+                // or as `formatToolExecution`'s full argument dump.
+                let has_definition = self.state.known_tool_definitions.contains(&tool_name);
+                self.state.transcript.push_tool_start_defined(
                     tool_name,
                     Some(tool_call_id.as_str().to_string()),
                     args,
                     // A tool ROW is a string surface: it has no live-component tier, so the
                     // outcome is flattened here rather than carried.
                     rendered.clone().into_text(),
+                    has_definition,
                 );
                 if let Some(preview) = preview {
                     self.state.transcript.set_edit_preview(Some(tool_call_id.as_str()), preview);
@@ -290,9 +297,23 @@ impl<B: Backend> App<B> {
                     } else if let Some(msg) = error_message {
                         self.state.transcript.push_error(msg);
                     } else if let Some(res) = result {
+                        let usage = res.usage.clone();
                         self.state
                             .transcript
                             .push_compaction_summary(res.tokens_before, res.summary);
+                        // pi appends the cost notice right after the summary message on the same
+                        // event (`interactive-mode.ts:3431-3437`: `if (event.result.usage)
+                        // this.addCompactionCostNotice({kind: "compaction", usage})`). The gate is
+                        // pi's own `getShowCacheMissNotices()`, read off the cached copy because
+                        // this fold holds no session.
+                        if self.state.show_cache_miss_notices
+                            && let Some(u) = usage.as_ref()
+                        {
+                            self.state.transcript.push_compaction_cost_notice(
+                                crate::transcript::CompactionCostKind::Compaction,
+                                u,
+                            );
+                        }
                     }
                 }
                 // TUI-031 — `void this.flushCompactionQueue({ willRetry: event.willRetry })` is the

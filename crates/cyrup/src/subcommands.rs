@@ -802,10 +802,11 @@ async fn run_update(
 
 /// `config`: open the interactive resource-config TUI (Pi `handleConfigCommand` → `selectConfig`,
 /// package-manager-cli.ts:543-572). Resolves the settings + trust, discovers every top-level
-/// auto-discovered skill/prompt/theme with its current enabled state, mounts the [`ConfigSelector`],
-/// and persists each space/enter toggle as a `+pattern`/`-pattern` override entry into the matching
-/// `skills`/`prompts`/`themes` settings array (Pi `toggleTopLevelResource`, config-selector.ts:457-503)
-/// — the SAME arrays discovery's `global_overrides`/`project_overrides` already read back. Esc closes.
+/// auto-discovered extension/skill/prompt/theme with its current enabled state, mounts the
+/// [`ConfigSelector`], and persists each space/enter toggle as a `+pattern`/`-pattern` override entry
+/// into the matching `extensions`/`skills`/`prompts`/`themes` settings array (Pi
+/// `toggleTopLevelResource`, config-selector.ts:532-578) — the SAME arrays discovery's
+/// `global_overrides`/`project_overrides` already read back. Esc closes.
 ///
 /// Package-tier resource toggling (Pi `togglePackageResource`) is out of this bin's crate scope — it
 /// needs the installed-package → live-session wiring (`DiscoveryConfig.installed`, gap-07 §1) and
@@ -815,14 +816,16 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
     let rows = resolve_config_rows(dirs, &settings, trusted).await?;
 
     if rows.is_empty() {
-        println!("No configurable skills, prompts, or themes found.");
+        println!("No configurable extensions, skills, prompts, or themes found.");
         return Ok(0);
     }
 
     // Seed the per-(scope,kind) settings arrays from disk; each toggle read-modify-writes its own
     // scope's array (Pi's `getGlobalSettings()`/`getProjectSettings()` array reads, config-selector.ts).
     let mut arrays: HashMap<(ConfigScope, ConfigKind), Vec<String>> = HashMap::new();
-    for kind in [ConfigKind::Skills, ConfigKind::Prompts, ConfigKind::Themes] {
+    for kind in
+        [ConfigKind::Extensions, ConfigKind::Skills, ConfigKind::Prompts, ConfigKind::Themes]
+    {
         arrays.insert((ConfigScope::User, kind), settings_array(settings.global(), kind));
         arrays.insert((ConfigScope::Project, kind), settings_array(settings.project(), kind));
     }
@@ -910,9 +913,11 @@ async fn run_config(dirs: &ConfigDirs, trusted: bool, local: bool) -> Result<i32
     Ok(0)
 }
 
-/// The current `skills`/`prompts`/`themes` override array of a settings layer.
+/// The current `extensions`/`skills`/`prompts`/`themes` override array of a settings layer
+/// (Pi `arrayKey`, config-selector.ts:537).
 fn settings_array(layer: &Settings, kind: ConfigKind) -> Vec<String> {
     match kind {
+        ConfigKind::Extensions => layer.extension_paths(),
         ConfigKind::Skills => layer.skill_paths(),
         ConfigKind::Prompts => layer.prompt_template_paths(),
         ConfigKind::Themes => layer.theme_paths(),
@@ -965,12 +970,13 @@ fn strip_override_marker(p: &str) -> &str {
     }
 }
 
-/// Resolve every top-level auto-discovered skill/prompt/theme with its **current** enabled state, for
-/// the config editor. Runs discovery twice against the SAME dirs: once with the live settings override
-/// patterns (the enabled set) and once with empty overrides (the full universe of files). A resource
-/// is enabled iff it survived the override-filtered pass — reusing cyrup-resources' own enable/disable
-/// logic without depending on its `pub(crate)` matcher. Mirrors Pi's `packageManager.resolve()`
-/// returning every resource tagged with its `enabled` flag (package-manager.ts:881-897).
+/// Resolve every top-level auto-discovered extension/skill/prompt/theme with its **current** enabled
+/// state, for the config editor. Runs discovery twice against the SAME dirs: once with the live
+/// settings override patterns (the enabled set) and once with empty overrides (the full universe of
+/// files). A resource is enabled iff it survived the override-filtered pass — reusing
+/// cyrup-resources' own enable/disable logic without depending on its `pub(crate)` matcher. Mirrors
+/// Pi's `packageManager.resolve()` returning every resource tagged with its `enabled` flag
+/// (package-manager.ts:881-897).
 async fn resolve_config_rows(
     dirs: &ConfigDirs,
     settings: &SettingsManager,
@@ -1013,10 +1019,40 @@ async fn resolve_config_rows(
         enabled.registry.prompts.all().iter().map(|p| p.path.clone()).collect();
     let enabled_themes: HashSet<_> =
         enabled.registry.themes.all().iter().filter_map(|t| t.origin_path.clone()).collect();
+    // `loose_extensions` carries the settings verdict on each entry rather than dropping the
+    // disabled ones (`LooseExtension::enabled`), so the enabled set is the `enabled` pass's
+    // surviving subset — the same shape the three sets above have.
+    let enabled_extensions: HashSet<_> = enabled
+        .registry
+        .loose_extensions
+        .iter()
+        .filter(|e| e.enabled)
+        .map(|e| e.path.clone())
+        .collect();
 
     let mut rows = Vec::new();
     let mut seen: HashSet<(ConfigKind, std::path::PathBuf)> = HashSet::new();
 
+    // Extensions first, matching Pi's `addToGroup(resolved.extensions, "extensions")`
+    // (config-selector.ts:153, the first of four). The widget re-sorts by `ConfigKind::order()`
+    // anyway, so this is presentation-neutral; it keeps the collector reading like upstream.
+    for ext in &universe.registry.loose_extensions {
+        let Some((cscope, pattern, base_dir)) = loose_pattern(ext.scope, &ext.root, &ext.path, dirs)
+        else {
+            continue;
+        };
+        if !seen.insert((ConfigKind::Extensions, ext.path.clone())) {
+            continue;
+        }
+        rows.push(ConfigRow {
+            scope: cscope,
+            kind: ConfigKind::Extensions,
+            display_name: ext_display_name(&ext.path),
+            pattern,
+            base_dir,
+            enabled: enabled_extensions.contains(&ext.path),
+        });
+    }
     for skill in universe.registry.skills.all() {
         let ResourceOrigin::LooseFile { scope, root } = &skill.origin else { continue };
         let Some((cscope, pattern, base_dir)) = loose_pattern(*scope, root, &skill.skill_md, dirs) else {
@@ -1130,9 +1166,27 @@ fn skill_display_name(path: &Path) -> String {
     }
 }
 
-/// A prompt/theme display name: the file name (Pi config-selector.ts:132).
+/// A prompt/theme display name: the file name (Pi config-selector.ts:139).
 fn file_display_name(path: &Path) -> String {
     path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+/// An extension display name (Pi config-selector.ts:131-140, the `resourceType === "extensions" &&
+/// parentFolder !== "extensions"` branch at `:134`): `parentFolder/fileName` when the containing
+/// directory is not literally `extensions`, otherwise the plain file name.
+///
+/// The two shapes it disambiguates are exactly the two the discovery scan accepts: a bare
+/// `extensions/mytool.wasm` (parent IS `extensions` → `mytool.wasm`) and an extension directory
+/// `extensions/demo/` — whose own name is what the row must show, and which upstream reaches by
+/// naming its entry file, e.g. `demo/index.ts` (cyrup: `extensions/demo` → parent `extensions`, so
+/// the directory name `demo` is what falls out of the same rule).
+fn ext_display_name(path: &Path) -> String {
+    let file = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    let parent = path.parent().and_then(Path::file_name).map(|n| n.to_string_lossy().to_string());
+    match parent {
+        Some(p) if p != "extensions" => format!("{p}/{file}"),
+        _ => file,
+    }
 }
 
 #[cfg(test)]

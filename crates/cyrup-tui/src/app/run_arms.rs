@@ -76,6 +76,10 @@ impl App<InlineBackend<Stdout>> {
         // TUI-032 — the `Warnings` submenu is built from this cache.
         self.state.warn_anthropic_extra_usage =
             eff.warnings().anthropic_extra_usage.unwrap_or(true);
+        // `showCacheMissNotices` — the gate on both transcript cost notices. Cached because the
+        // sync `compaction_end` fold and the `message_end` finalizer read it with no session in
+        // hand (pi calls `getShowCacheMissNotices()` inline at `interactive-mode.ts:3803`/`:3821`).
+        self.state.show_cache_miss_notices = eff.show_cache_miss_notices();
         // `terminal.showTerminalProgress` — the gate on the OSC 9;4 taskbar indicator. Pi re-reads
         // it at each of its five call sites (`interactive-mode.ts:2865`/`:3057`/`:3076`/`:3090`/
         // `:6041`); cyrup caches it here and re-seeds it on a `/settings` flip and on a session swap,
@@ -261,6 +265,9 @@ impl App<InlineBackend<Stdout>> {
         self.state.double_escape_action = eff.double_escape_action();
         // TUI-032 — the `Warnings` submenu is built from this cache.
         self.state.warn_anthropic_extra_usage = eff.warnings().anthropic_extra_usage.unwrap_or(true);
+        // Same liveness as the rows above: a swap can move the settings scope, so re-read the
+        // cache-miss notice gate for the swapped-in session BEFORE its replay below.
+        self.state.show_cache_miss_notices = eff.show_cache_miss_notices();
         // TUI-003: seed the view from the swapped-in session's conversation (Pi re-runs
         // `renderInitialMessages()` after a tree/fork navigation, interactive-mode.ts:1737-1742).
         // Without this a `/resume`, `/fork` or `/import` leaves the user staring at an empty
@@ -268,12 +275,19 @@ impl App<InlineBackend<Stdout>> {
         // `messages()`) is Pi's `buildContextEntries()` projection: roles intact, so a
         // compaction/branch summary, a `custom` message and a `!` run each reach their own component
         // instead of replaying as user prose.
-        let restored = ctx.session.raw_context_messages().await;
+        // Pi rebuilds `definitionRegistry` with the session (`agent-session.ts:2659-2676`); the
+        // swapped-in one brings its own tools, and the replay below is the only reader that cannot
+        // ask the session itself.
+        self.refresh_known_tool_definitions(&ctx.session);
+        // `replay_items` is `raw_context_messages` plus the derived cache-miss / compaction-cost
+        // notices pi re-derives on every rebuild (`interactive-mode.ts:3694-3696`, `:3788-3794`),
+        // which is why a resumed session keeps notices that were never persisted.
+        let restored = ctx.session.replay_items().await;
         if !restored.is_empty() {
             // X11 — with extensions: the swapped-in session brings its own host, and Pi resolves
             // `getMessageRenderer` on the replay walk too (`interactive-mode.ts:3471`).
             let ext_host = ctx.session.services().ext_host.clone();
-            self.replay_session_with_extensions(&restored, &ext_host).await;
+            self.replay_items_with_extensions(&restored, &ext_host).await;
         }
         // TUI-N04 — the same statement `renderInitialMessages()` runs after its replay
         // (`interactive-mode.ts:3485`), and it must run here too: a `/resume` of a session recorded
@@ -323,6 +337,17 @@ impl App<InlineBackend<Stdout>> {
                         || self.state.transcript.has_running_elapsed_tool()
                     {
                         self.state.transcript.bump_render_tick();
+                    }
+                    // The `BorderedLoader`'s animation phase — pi's `Loader.restartAnimation`
+                    // `setInterval(…, this.intervalMs)` at 80 ms (`tui/src/components/loader.ts:74-80`),
+                    // which is the very cadence this arm already ticks at (`SPINNER_INTERVAL`,
+                    // `status_indicator.rs:48`). `render.rs` reads it modulo the frame count; nothing
+                    // wrote it before, so `/share`'s spinner sat frozen on frame 0. `wrapping_add`
+                    // rather than `+`: an overflowing add panics in debug builds, and a spinner is
+                    // the last thing that should be able to take the TUI down. `render.rs:120`
+                    // already reads it modulo the frame count, so the wrap is invisible.
+                    if self.state.loader.is_some() {
+                        self.state.loader_tick = self.state.loader_tick.wrapping_add(1);
                     }
                     self.draw_synchronized()?;
         Ok(())
@@ -604,6 +629,15 @@ impl App<InlineBackend<Stdout>> {
                     }
                     self.draw_synchronized()?;
         Ok(())
+    }
+
+    /// A spawned `/share` gist upload settled: unmount the loader, report, and repaint — pi's
+    /// post-`await` tail (`session-share.ts:174-197`). The cancelled case is dropped inside
+    /// [`App::apply_share_outcome`], which still unlinks the temp file.
+    pub(crate) fn on_share_msg(&mut self, msg: ShareMsg) -> Result<(), TuiError> {
+        let _arm = ArmGuard::enter("share");
+        self.apply_share_outcome(msg);
+        self.draw_synchronized()
     }
 
     pub(crate) fn on_theme_changed(&mut self, ok: bool, theme_rx: &Option<tokio::sync::watch::Receiver<Arc<ThemeData>>>) -> Result<(), TuiError> {

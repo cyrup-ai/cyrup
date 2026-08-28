@@ -55,3 +55,51 @@ pub fn share_viewer_url_from(env_base: Option<&str>, gist_id: &str) -> String {
     format!("{base}#{gist_id}")
 }
 
+/// The in-flight half of a `/share` gist upload: the waiter task driving `gh gist create` and the
+/// temp HTML file it is uploading.
+///
+/// pi keeps the same pair on the closure it installs as `loader.onAbort` — `proc` and `tmpFile`
+/// (`session-share.ts:156-161`, `:76-84`) — because BOTH have to be reachable from the cancel path:
+/// the child must be killed and the temp file must still be unlinked.
+///
+/// **Why an [`tokio::task::AbortHandle`] rather than the [`tokio::process::Child`] itself.**
+/// `Child::wait_with_output` consumes the child, so the task that awaits `gh` owns it for the whole
+/// upload and no second handle to it can exist. The command is therefore spawned with
+/// `kill_on_drop(true)` and cancellation aborts the waiter: dropping the aborted task drops the
+/// child, which kills `gh` — pi's `proc?.kill()` (`session-share.ts:158`) reached the only way a
+/// consuming `await` allows.
+pub(crate) struct ShareInFlight {
+    /// The waiter task spawned by `App::share_session`; aborting it kills `gh` (see above).
+    pub(crate) task: tokio::task::AbortHandle,
+    /// The temp HTML file to unlink on the cancel path — pi's `finally` block (`:76-84`), which
+    /// runs for a cancelled share exactly as it does for a successful one.
+    pub(crate) tmp: std::path::PathBuf,
+}
+
+/// A settled `gh gist create --public=false <file>`, posted back to [`crate::app::App::run`]'s
+/// `select!` so the upload never runs on the loop's own task — the channel-back shape
+/// [`crate::app::TreeNavMsg`] established.
+///
+/// pi awaits the child inside a promise while its render loop keeps running
+/// (`session-share.ts:172-186`); the equivalent here is a spawned task that owns
+/// `wait_with_output()` and sends this message when it resolves.
+#[derive(Debug)]
+pub struct ShareMsg {
+    /// `gh`'s exit status plus its captured streams, or the error `spawn`/`wait` failed with.
+    pub(crate) result: Result<std::process::Output, std::io::Error>,
+    /// The temp HTML file to unlink — pi's `finally { fs.unlinkSync(tmpFile) }` (`:76-84`).
+    pub(crate) tmp: std::path::PathBuf,
+}
+
+impl ShareMsg {
+    /// Pair a settled `gh` run with the temp file it uploaded. `pub` for the same reason
+    /// [`crate::app::TreeNavMsg::new`] is: it lets `tests/*.rs` hand
+    /// [`crate::app::App::apply_share_outcome`] a synthetic outcome — notably the cancelled and
+    /// non-zero-exit cases, which are otherwise a race to provoke — without a live `gh`.
+    pub fn new(
+        result: Result<std::process::Output, std::io::Error>,
+        tmp: std::path::PathBuf,
+    ) -> Self {
+        ShareMsg { result, tmp }
+    }
+}

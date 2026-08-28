@@ -250,6 +250,30 @@ impl DiscoveryConfig {
     }
 }
 
+/// One auto-discovered ("loose") extension sitting directly under a conventional extensions root —
+/// `<agent_dir>/extensions` or `<cwd>/.cyrup/extensions`. Pi's `collectAutoExtensionEntries`
+/// (package-manager.ts:587-630, dispatched from `collectResourceFiles` :650) produces the same tier:
+/// the entries a settings `extensions` array's `+`/`-` patterns filter, as opposed to the
+/// plain-path positive listings that land in [`ResourceRegistry::ext_crate_paths`].
+///
+/// Unlike skills/prompts/themes, a disabled entry is **kept** here with `enabled: false` rather than
+/// dropped, because the disabled set is itself load-bearing: `cyrup-session-svc` hands it to
+/// `cyrup_ext::DiscoveryRoots::disabled` so the extension loader honours the same `-pattern` the
+/// `cyrup config` editor writes.
+#[derive(Debug, Clone)]
+pub struct LooseExtension {
+    /// The extension itself — a subdirectory of `root`, or a bare `*.wasm` artifact sitting in it.
+    pub path: PathBuf,
+    /// [`ResourceScope::Global`] or [`ResourceScope::Project`] — which settings layer's
+    /// `extensions` array governs it, and which config-editor group it renders under.
+    pub scope: ResourceScope,
+    /// The conventional root it was found in (`…/extensions`). Its PARENT is the base the settings
+    /// pattern is relative to, exactly as discovery's own `override_enabled` computes it.
+    pub root: PathBuf,
+    /// Whether the governing settings `extensions` array leaves it enabled.
+    pub enabled: bool,
+}
+
 /// The immutable snapshot the rest of the app reads (swapped atomically on `/reload`).
 #[derive(Debug, Clone, Default)]
 pub struct ResourceRegistry {
@@ -258,6 +282,9 @@ pub struct ResourceRegistry {
     pub themes: ResourceSet<Theme>,
     /// Extension crate dirs found in packages — handed to cyrup-ext to build.
     pub ext_crate_paths: Vec<PathBuf>,
+    /// Auto-discovered loose extensions under the two conventional roots, each tagged with the
+    /// settings verdict — see [`LooseExtension`].
+    pub loose_extensions: Vec<LooseExtension>,
 }
 
 impl ResourceRegistry {
@@ -267,9 +294,9 @@ impl ResourceRegistry {
     /// `extendResourcesFromExtensions` (agent-session.ts:2112-2135): each contributed file is loaded
     /// at the [`ResourceScope::Discovered`] tier (Pi's `scope:"temporary"` extension resources, rank
     /// `6`) and folded back through [`ResourceSet::build`], so a same-name user/package/CLI resource
-    /// still wins (first-wins precedence). Existing candidates are preserved; `ext_crate_paths` are
-    /// carried over unchanged. Parse failures / missing paths are dropped (Pi logs a warning and
-    /// skips), never panicking.
+    /// still wins (first-wins precedence). Existing candidates are preserved; `ext_crate_paths` and
+    /// `loose_extensions` are carried over unchanged. Parse failures / missing paths are dropped
+    /// (Pi logs a warning and skips), never panicking.
     pub fn extend(&self, extra: &DiscoveredPaths) -> ResourceRegistry {
         let mut skills: Vec<Skill> = self.skills.all().to_vec();
         let mut prompts: Vec<PromptTemplate> = self.prompts.all().to_vec();
@@ -312,6 +339,7 @@ impl ResourceRegistry {
             prompts: ResourceSet::build(prompts),
             themes: ResourceSet::build(themes),
             ext_crate_paths: self.ext_crate_paths.clone(),
+            loose_extensions: self.loose_extensions.clone(),
         }
     }
 }
@@ -361,6 +389,78 @@ pub fn discover_system_prompt_file(
     project_trusted: bool,
 ) -> Option<PathBuf> {
     discover_prompt_override(cwd, agent_dir, project_trusted, "SYSTEM.md")
+}
+
+/// The manifest file name an extension directory is recognised by
+/// (`cyrup_ext::manifest::MANIFEST_FILE`, restated — see [`scan_loose_extension_root`]).
+const EXTENSION_MANIFEST_FILE: &str = "extension.json";
+
+/// True iff `dir` directly holds an extension: an `extension.json`, or a prebuilt `*.wasm`
+/// component. Restatement of `cyrup_ext::loader::is_extension_dir`
+/// (`crates/cyrup-ext/src/loader.rs:208-210`) — see [`scan_loose_extension_root`] for why it is
+/// restated rather than imported.
+fn is_extension_dir(dir: &Path) -> bool {
+    if dir.join(EXTENSION_MANIFEST_FILE).is_file() {
+        return true;
+    }
+    std::fs::read_dir(dir).is_ok_and(|rd| {
+        rd.filter_map(Result::ok).any(|e| {
+            let p = e.path();
+            p.extension().is_some_and(|x| x == "wasm") && p.is_file()
+        })
+    })
+}
+
+/// Enumerate the loose extensions directly under one conventional `…/extensions` root, tagging each
+/// with the verdict `patterns` (the governing settings-layer `extensions` array) gives it.
+///
+/// Port of Pi's `collectAutoExtensionEntries` (`package-manager.ts:587-630`, dispatched from
+/// `collectResourceFiles` :650): **one level, no recursion**, and two accepted entry shapes — a
+/// subdirectory that itself holds an extension, or a bare artifact sitting straight in the root
+/// (Pi's `*.ts`/`*.js`, cyrup's `*.wasm`).
+///
+/// The two shapes must agree exactly with what the extension loader will accept —
+/// `cyrup_ext::loader::scan_dir` (`crates/cyrup-ext/src/loader.rs:237-256`) — or a row would appear
+/// in `cyrup config` that nothing loads, or vice-versa. The predicate is nevertheless **restated**
+/// here rather than imported: `cyrup-resources` does not depend on `cyrup-ext` (and must not, since
+/// `cyrup-ext` sits above it and the edge would close a cycle).
+///
+/// A disabled entry is retained with `enabled: false` instead of being dropped — the caller needs
+/// the negative half too (see [`LooseExtension`]). That is the one deliberate difference from the
+/// `buf.retain(override_enabled(…))` pass the other three loose kinds get in `blocking.rs`.
+#[must_use]
+pub fn scan_loose_extension_root(
+    root: &Path,
+    scope: ResourceScope,
+    patterns: &[String],
+) -> Vec<LooseExtension> {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = rd
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            if p.is_dir() {
+                is_extension_dir(p)
+            } else {
+                p.extension().is_some_and(|x| x == "wasm") && p.is_file()
+            }
+        })
+        .collect();
+    // Deterministic order, matching `scan_dir`'s `entries.sort()` (loader.rs:246, R-08-004).
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let enabled = packages::override_enabled(&path, patterns, root);
+            LooseExtension {
+                path,
+                scope,
+                root: root.to_path_buf(),
+                enabled,
+            }
+        })
+        .collect()
 }
 
 /// The project-or-global `APPEND_SYSTEM.md` appended to the system prompt.

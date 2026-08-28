@@ -27,7 +27,12 @@ impl InputEditor {
     /// `handleForwardDelete` (`:1687-1690`) all step by. Without the merge the caret can be parked
     /// INSIDE a `[paste #N …]` marker, where the next keystroke silently destroys it (TUI-043's
     /// cursor-motion half).
-    fn marker_grapheme_boundaries(&self, line: &[char]) -> Vec<usize> {
+    ///
+    /// Also the segmenter VERTICAL motion snaps against —
+    /// [`move_to_visual_line`](Self::move_to_visual_line) re-segments the TARGET logical line with
+    /// it, which is why this is `pub(super)` rather than private to this module
+    /// (`moveToVisualLine`, `editor.ts:1428`).
+    pub(super) fn marker_grapheme_boundaries(&self, line: &[char]) -> Vec<usize> {
         let mut bounds = grapheme_boundaries(line);
         let markers = self.marker_spans(line);
         if !markers.is_empty() {

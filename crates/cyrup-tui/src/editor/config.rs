@@ -33,6 +33,7 @@ impl InputEditor {
             scroll_offset: 0,
             term_rows: 24,
             preferred_visual_col: None,
+            snapped_from_col: None,
             pastes: BTreeMap::new(),
             paste_counter: 0,
             thinking_level: "medium".to_string(),
@@ -183,12 +184,54 @@ impl InputEditor {
         self.mention_files = Some(files);
     }
 
-    /// Install the argument-completion sources for `/model` and `/login` (and `/thinking`, once such
-    /// a command exists). Pi rebuilds the equivalent closures whenever it rebuilds the autocomplete
-    /// provider (`createBaseAutocompleteProvider`, `interactive-mode.ts:677-736` @v0.84.3); cyrup
-    /// pushes a snapshot instead, from [`crate::App::refresh_argument_sources`].
+    /// Install the argument-completion sources for `/model`, `/login` and `/thinking`. Pi rebuilds
+    /// the equivalent closures whenever it rebuilds the autocomplete provider
+    /// (`createBaseAutocompleteProvider`, `interactive-mode.ts:677-736` @v0.84.3); cyrup pushes a
+    /// snapshot instead, from [`crate::App::refresh_argument_sources`].
+    ///
+    /// `extension_completions` is deliberately CARRIED OVER rather than replaced: it is fed on a
+    /// different clock (per keystroke, by [`crate::App::refresh_extension_completions`]) than the
+    /// three builtin sets (boot / session swap / credential change / scope save), and the snapshot
+    /// the caller builds has nothing to say about it. Overwriting it here would blank the popup
+    /// whenever an unrelated refresh landed mid-argument.
     pub fn set_argument_sources(&mut self, sources: crate::autocomplete::ArgumentSources) {
+        let extensions = std::mem::take(&mut self.arg_sources.extension_completions);
         self.arg_sources = sources;
+        self.arg_sources.extension_completions = extensions;
+    }
+
+    /// Record what an extension command's own completer answered for `prefix`
+    /// (`getArgumentCompletions`, `interactive-mode.ts:753` @v0.84.3), keyed by the command's
+    /// invocation name. Pushed in by [`crate::App::refresh_extension_completions`], which is the
+    /// async side of the seam described on [`crate::commands::ArgumentCompleter::Extension`].
+    pub fn set_extension_completions(&mut self, command: &str, prefix: &str, items: Vec<String>) {
+        self.arg_sources.extension_completions.insert(
+            command.to_string(),
+            crate::autocomplete::ExtensionCompletions {
+                prefix: prefix.to_string(),
+                items,
+            },
+        );
+    }
+
+    /// The `(command, argument)` pair under the cursor when the line being edited is
+    /// `/<command> <argument>` and `<command>` is an extension command that declared its own
+    /// completer — i.e. exactly when a guest call is worth making. `None` otherwise.
+    ///
+    /// This is [`crate::autocomplete::argument_completer`]'s resolution, reused so the async fetch
+    /// and the sync popup can never disagree about which command owns the line.
+    #[must_use]
+    pub fn pending_extension_argument(&self) -> Option<(String, String)> {
+        let before = self.before_cursor();
+        let (completer, name, argument) =
+            crate::autocomplete::argument_completer(&self.registry, &before)?;
+        (completer == crate::commands::ArgumentCompleter::Extension)
+            .then(|| (name.to_string(), argument.to_string()))
+    }
+
+    /// Recompute the popup from outside the key path, after new completion data arrived.
+    pub fn refresh_autocomplete(&mut self) {
+        self.update_autocomplete();
     }
 
     /// Focus state (R-10-009 — focused inputs drive the hardware cursor).
@@ -303,7 +346,11 @@ impl InputEditor {
         self.autocomplete = None;
         self.jump = None;
         self.last_action = LastAction::None;
-        self.preferred_visual_col = None;
+        // Both sticky-column fields, not just the preferred one: this method stands in for
+        // `submitValue`/`setText`, after which a `snapped_from_col` left over from the old buffer
+        // would misresolve the first vertical move in the new one (`setCursorCol`,
+        // `editor.ts:1377-1381`).
+        self.reset_preferred_col();
         self.scroll_offset = 0;
         self.pastes.clear();
         // `this.pastes.clear(); this.pasteCounter = 0;` — both halves, on both upstream paths this

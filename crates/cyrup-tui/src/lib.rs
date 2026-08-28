@@ -124,7 +124,8 @@ pub use auth_select::{
 };
 pub use autocomplete::{
     list_files as mention_list_files, mention_autocomplete, mention_query, Applied, Autocomplete,
-    ArgumentSources, Completion, CompletionContext, LoginProviderArgument, ModelArgument,
+    ArgumentSources, Completion, CompletionContext, ExtensionCompletions, LoginProviderArgument,
+    ModelArgument,
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use overlay::{Overlay, OverlayOutcome};

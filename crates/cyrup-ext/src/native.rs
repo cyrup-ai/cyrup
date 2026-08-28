@@ -623,6 +623,26 @@ pub trait NativeExtension: Send + Sync {
         Err(ExtError::Component(format!("native extension has no handler for command `{name}`")))
     }
 
+    /// Dynamic argument completions for a command this extension registered and opted in with
+    /// [`InitApi::add_autocomplete`] — the native tier's half of
+    /// `RegisteredCommand.getArgumentCompletions?(argumentPrefix)`
+    /// (`core/extensions/types.ts:1166` @v0.83.0), whose guest half is the
+    /// `get-argument-completions` export (`wit/world.wit:250`).
+    ///
+    /// `name` is the REGISTERED name, not the invocation name — the same resolution
+    /// [`crate::ExtensionHost::command_completions`] does for `execute_command`, so a
+    /// disambiguated `deploy:2` still reaches the handler's own `deploy` arm.
+    ///
+    /// Default: no completions, which is upstream's unset field. Overriding it without also
+    /// calling `add_autocomplete` is inert — the opt-in table is what reaches the front-end.
+    async fn argument_completions(
+        &self,
+        _name: &str,
+        _prefix: &str,
+    ) -> Result<Vec<String>, ExtError> {
+        Ok(Vec::new())
+    }
+
     /// Run the keyboard shortcut declared through [`InitApi::register_shortcut`] (EXT-035).
     ///
     /// pi's shortcut handler is `handler: (ctx: ExtensionContext) => Promise<void> | void`

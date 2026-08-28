@@ -41,26 +41,50 @@
 //! of rows, one per line.
 //!
 //! ## Scope of the hook
-//! [`MermaidContext`] is a mermaid-only stand-in for the general per-message markdown-transform
-//! seam. It is deliberately narrow: it reaches exactly the three pi `messageType`s
-//! (`user`, `assistant`, `assistant-thinking` — `assistant-message.ts:112` and `:157-161`,
-//! `user-message.ts:53`) through [`super::render_message`], and it is *not* the
-//! extension-supplied `MarkdownTransformer` registry
-//! (`core/extensions/types.ts:1355`). Widening it into that registry is the sibling gap
-//! MARKDOWN_TRANSFORM_HOOK_NOT_WIRED and is out of scope here.
+//! [`MermaidContext`] is the mermaid-only half of the per-message markdown-transform seam: it
+//! reaches exactly the three pi `messageType`s (`user`, `assistant`, `assistant-thinking` —
+//! `assistant-message.ts:112` and `:157-161`, `user-message.ts:53`) through
+//! [`super::render_message`], and it carries only what the mermaid gate reads.
+//!
+//! The general, extension-supplied `MarkdownTransformer` registry
+//! (`core/extensions/types.ts:1355`) is now wired too, but it does NOT ride this struct: it is
+//! applied at push/commit time by `App::apply_markdown_transformers` (`app/events.rs`), because
+//! `ExtensionHost::transform_markdown` is `async` while this renderer runs inside `App::draw`. The
+//! two share only [`MessageType`] — see [`MessageType::as_pi_str`] and the seam note on
+//! [`super::render_message`].
 
 use cyrup_config::MermaidRenderingMode;
 use mermaid_text::Error as MermaidError;
 
 /// Which pi message a markdown body belongs to — `MarkdownTransformContext["messageType"]`
-/// (`core/extensions/types.ts:1202`). Only the `assistant-thinking` arm changes behaviour today
-/// (`mermaid.ts:65`); the other two exist so the gate reads like its upstream and so the sibling
-/// transform-hook task has the discriminant it needs.
+/// (`core/extensions/types.ts:1202`).
+///
+/// Two consumers read it, and they disagree about which arms matter. The mermaid gate below only
+/// branches on `assistant-thinking` (`mermaid.ts:65`); the general, extension-supplied transformer
+/// pass (`App::apply_markdown_transformers`) hands all three to the guest verbatim
+/// through [`Self::as_pi_str`]. Keeping one discriminant for both is what stops the two from
+/// drifting into different spellings of the same three message components.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MessageType {
     User,
     Assistant,
     AssistantThinking,
+}
+
+impl MessageType {
+    /// The wire spelling of `MarkdownTransformContext["messageType"]`
+    /// (`core/extensions/types.ts:1202`) — the literal each of pi's three message components passes
+    /// to `createMarkdownTransform`: `"user"` (`user-message.ts:53`), `"assistant"`
+    /// (`assistant-message.ts:112`) and `"assistant-thinking"` (`assistant-message.ts:157-161`).
+    ///
+    /// Guest extensions compare this string, so the three literals live here and nowhere else.
+    pub(crate) fn as_pi_str(self) -> &'static str {
+        match self {
+            MessageType::User => "user",
+            MessageType::Assistant => "assistant",
+            MessageType::AssistantThinking => "assistant-thinking",
+        }
+    }
 }
 
 /// The three inputs pi's mermaid transformer gates on: the live `markdown.mermaid` mode

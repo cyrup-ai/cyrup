@@ -1,6 +1,6 @@
 ---
-stage: todo
-status: pending
+stage: done
+status: completed
 updated: 2026-08-28
 ---
 

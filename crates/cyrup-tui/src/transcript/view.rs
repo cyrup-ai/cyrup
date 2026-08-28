@@ -275,4 +275,89 @@ impl TranscriptView {
     pub fn cwd(&self) -> Option<&std::path::Path> {
         self.cwd.as_deref()
     }
+
+    /// How many entries are committed-but-unflushed right now.
+    ///
+    /// The extension markdown-transform pass (`App::apply_markdown_transformers`, `app/events.rs`)
+    /// snapshots this BEFORE folding an event and walks from it afterwards, so it transforms exactly
+    /// the entries that fold produced. Nothing drains between the two reads — the drain happens in
+    /// `App::draw`, one run-loop arm later.
+    pub(crate) fn pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    /// The pending entries at or after `from` that carry one of pi's three markdown message bodies,
+    /// as `(index, messageType, text)`.
+    ///
+    /// The filter IS the port: upstream attaches `createMarkdownTransform` to the `Markdown` child
+    /// of `UserMessageComponent` (`user-message.ts:53`) and to the two of `AssistantMessageComponent`
+    /// (`assistant-message.ts:112`, `:157-161`), and to nothing else — a `[skill]` block, a custom
+    /// message, a `/changelog` block and a tool row all render markdown that no transformer ever
+    /// sees. So the three variants below are the whole list, and a new [`Entry`] variant does not
+    /// join it by default.
+    pub(crate) fn pending_markdown(
+        &self,
+        from: usize,
+    ) -> impl Iterator<Item = (usize, crate::markdown::MessageType, &str)> + '_ {
+        use crate::markdown::MessageType;
+        self.pending.iter().enumerate().skip(from).filter_map(|(i, entry)| match entry {
+            Entry::User { text, .. } => Some((i, MessageType::User, text.as_str())),
+            Entry::Assistant(text) => Some((i, MessageType::Assistant, text.as_str())),
+            Entry::Thinking { text, .. } => {
+                Some((i, MessageType::AssistantThinking, text.as_str()))
+            }
+            _ => None,
+        })
+    }
+
+    /// Replace the markdown body of the pending entry at `index` with a transformer's output.
+    ///
+    /// Rewritten IN PLACE rather than kept beside the source, because these three bodies are
+    /// display-only: `transcript/render.rs` is the only reader of each, and the alternate screen's
+    /// prompt navigation keys off the entry VARIANT, not its text
+    /// (`altscreen/prompt_nav.rs`). No other subsystem re-derives anything from them, so there is
+    /// nothing a parallel `display` field would protect. (The LIVE partials are the opposite case
+    /// and do get one — see [`Self::set_streaming_display`].)
+    ///
+    /// A `None` from `get_mut`, or an index that has since been filled by another variant, is a
+    /// silent no-op: the pass reads and writes within one `&mut self` borrow of the app, so it
+    /// cannot actually happen, and the alternative is an index panic the workspace lints forbid.
+    pub(crate) fn set_pending_markdown(&mut self, index: usize, text: String) {
+        let Some(entry) = self.pending.get_mut(index) else { return };
+        match entry {
+            Entry::User { text: slot, .. } => *slot = text,
+            Entry::Assistant(slot) => *slot = text,
+            Entry::Thinking { text: slot, .. } => *slot = text,
+            _ => return,
+        }
+        // `render_generation` contract (see the field's docs in `transcript/mod.rs`): every `&mut
+        // self` mutator that changes what `lines()` emits bumps it. Without this the cache would
+        // keep serving the pre-transform lines for the rest of the turn.
+        self.bump_render_generation();
+    }
+
+    /// Publish what the extension markdown transformers made of the live assistant partial, or
+    /// `None` to fall back to the raw buffer — see the `streaming_display` field in
+    /// `transcript/mod.rs` for why this is a second buffer and not a rewrite of the accumulator.
+    ///
+    /// A no-op when the value is unchanged — including the common `None` → `None` — so an event
+    /// that streams nothing does not invalidate the render cache on a session with a transformer
+    /// loaded.
+    pub(crate) fn set_streaming_display(&mut self, text: Option<String>) {
+        if self.streaming_display == text {
+            return;
+        }
+        self.bump_render_generation();
+        self.streaming_display = text;
+    }
+
+    /// [`Self::set_streaming_display`] for the live reasoning partial (pi's `"assistant-thinking"`
+    /// transform, `assistant-message.ts:156-162`).
+    pub(crate) fn set_thinking_display(&mut self, text: Option<String>) {
+        if self.thinking_display == text {
+            return;
+        }
+        self.bump_render_generation();
+        self.thinking_display = text;
+    }
 }

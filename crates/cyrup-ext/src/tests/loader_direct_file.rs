@@ -54,6 +54,7 @@ fn bare_artifact_directly_in_each_discovery_root_is_discovered() {
         project_cwd: Some(cwd),
         agent_dir: Some(agent),
         configured: vec![cfg_artifact.clone()],
+        disabled: Vec::new(),
     };
     let found = discover(&roots);
 
@@ -99,6 +100,7 @@ fn multiple_bare_artifacts_and_dirs_coexist_in_one_root() {
         project_cwd: None,
         agent_dir: Some(agent),
         configured: vec![],
+        disabled: Vec::new(),
     };
     let found = discover(&roots);
     let ids: Vec<String> = found.iter().map(|d| d.manifest.id.clone()).collect();
@@ -133,6 +135,7 @@ async fn bare_artifact_reaches_discover_and_load() {
         project_cwd: Some(cwd.clone()),
         agent_dir: None,
         configured: vec![],
+        disabled: Vec::new(),
     };
     let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");

@@ -86,11 +86,15 @@ impl<B: Backend> App<B> {
     /// renderer on the replay walk too (`const renderer = this.session.extensionRunner
     /// .getMessageRenderer(message.customType)`, `interactive-mode.ts:3471`, inside the same
     /// `case "custom"` the `display` gate at `:3470` guards), exactly as it does on the live
-    /// `addMessageToChat` path. Call [`Self::replay_session_with_extensions`] wherever a host is in
+    /// `addMessageToChat` path. Call [`Self::replay_items_with_extensions`] wherever a host is in
     /// hand — every production `/resume`, `/fork`, `/import` and `--continue` does — or a resumed
     /// session silently loses extension rendering that the live session had.
+    ///
+    /// It is also the NO-NOTICES shorthand: a bare message list carries neither of the derived
+    /// notices pi re-injects on a rebuild, so a caller that wants them asks the session for the
+    /// full stream ([`cyrup_session_svc::AgentSession::replay_items`]) instead.
     pub fn replay_session(&mut self, messages: &[cyrup_session_svc::agent_message::AgentMessage]) {
-        self.replay_session_rendered(messages, &std::collections::HashMap::new());
+        self.replay_session_rendered(&as_replay_items(messages), &std::collections::HashMap::new());
     }
 
     /// TUI-N04 — the second statement of Pi's `renderInitialMessages()`, immediately after the
@@ -135,6 +139,20 @@ impl<B: Backend> App<B> {
         self.state.transcript.push_warning(PROJECT_UNTRUSTED_WARNING);
     }
 
+    /// Reload [`AppState::known_tool_definitions`] from the bound session's tool registry — Pi's
+    /// `definitionRegistry`, rebuilt over the builtins plus every registered and custom tool
+    /// (`agent-session.ts:2659-2676`) and read per component as `getToolDefinition(name)` (`:806`,
+    /// handed to the render context at `:3413`).
+    ///
+    /// Called wherever a session is bound or swapped in, BEFORE the replay walk: a `/resume`d
+    /// conversation's tool calls never pass through [`Self::ingest_session_event_owned`], so the
+    /// per-tool-start lookup there cannot answer for them and they would all fall back to
+    /// `formatToolExecution`'s full argument dump.
+    pub fn refresh_known_tool_definitions(&mut self, session: &Arc<AgentSession>) {
+        self.state.known_tool_definitions =
+            session.all_tools().into_iter().map(|t| t.name).collect();
+    }
+
     /// [`Self::replay_session`], first resolving each displayed `custom` message's registered
     /// extension renderer (EXT-006; Pi `getMessageRenderer(message.customType)`,
     /// `interactive-mode.ts:3471`).
@@ -147,10 +165,29 @@ impl<B: Backend> App<B> {
         messages: &[cyrup_session_svc::agent_message::AgentMessage],
         ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ) {
+        self.replay_items_with_extensions(&as_replay_items(messages), ext_host).await;
+    }
+
+    /// [`Self::replay_session_with_extensions`] over the FULL replay stream — the messages plus the
+    /// derived cache-miss and compaction-cost notices [`AgentSession::replay_items`] re-derives
+    /// (pi `renderSessionEntries`, `interactive-mode.ts:3781-3796`, whose items are exactly this
+    /// union).
+    ///
+    /// Every production replay — `--resume`/`--continue` at boot and `/resume`, `/fork`, `/import`
+    /// on a swap — calls THIS; the two `AgentMessage`-shaped entry points above are the shorthands
+    /// for a caller that has messages and nothing to re-derive from.
+    pub async fn replay_items_with_extensions(
+        &mut self,
+        items: &[cyrup_session_svc::ReplayItem],
+        ext_host: &Arc<cyrup_ext::ExtensionHost>,
+    ) {
         use cyrup_session_svc::agent_message::AgentMessage;
         let mut rendered: std::collections::HashMap<usize, crate::transcript::Rendered> =
             std::collections::HashMap::new();
-        for (i, message) in messages.iter().enumerate() {
+        // MESSAGE-relative, matching the walk below: `rendered` is keyed by the index a message has
+        // among messages, not among items, so an interleaved notice cannot shift a custom
+        // message's renderer onto its neighbour.
+        for (i, message) in replay_messages(items).enumerate() {
             // `if (message.display)` (`:3470`) gates the whole arm, lookup included.
             let AgentMessage::Custom(c) = message else { continue };
             if !c.display {
@@ -165,21 +202,70 @@ impl<B: Backend> App<B> {
                 rendered.insert(i, r);
             }
         }
-        self.replay_session_rendered(messages, &rendered);
+        // EXT-019 — the commit frontier before the walk, for the transform pass below.
+        let first_pending = self.state.transcript.pending_len();
+        self.replay_session_rendered(items, &rendered);
+        // A replayed conversation does NOT route through `ingest_event_with_extensions_owned`, so
+        // it would otherwise render untransformed while a live one renders transformed — the same
+        // trap `refresh_known_tool_definitions` documents for the per-tool-start lookup above.
+        // Upstream cannot have it: pi rebuilds real `UserMessage`/`AssistantMessage` components on
+        // replay (`renderSessionEntries`, `interactive-mode.ts:3781-3796`), each with its own
+        // `createMarkdownTransform`.
+        self.apply_markdown_transformers(ext_host, first_pending).await;
     }
 
-    /// The replay walk itself. `rendered` maps a message INDEX to the text an extension's registered
+    /// The replay walk itself — pi `renderSessionItems` (`interactive-mode.ts:3705-3775`), over the
+    /// same union of items: raw-context messages interleaved with the re-derived cache-miss and
+    /// compaction-cost notices.
+    ///
+    /// `rendered` maps a MESSAGE index (not an item index) to the text an extension's registered
     /// renderer produced for it (X11); an absent entry draws the built-in framing, which is Pi's
     /// `getMessageRenderer(...) === undefined` outcome.
     fn replay_session_rendered(
         &mut self,
-        messages: &[cyrup_session_svc::agent_message::AgentMessage],
+        items: &[cyrup_session_svc::ReplayItem],
         rendered: &std::collections::HashMap<usize, crate::transcript::Rendered>,
     ) {
         use cyrup_core::{Content, Message};
+        use cyrup_session_svc::ReplayItem;
         use cyrup_session_svc::agent_message::AgentMessage;
         use serde_json::Value;
-        for (index, message) in messages.iter().enumerate() {
+        // The MESSAGE index `rendered` is keyed by — advanced only on a message, so the notices
+        // interleaved by [`AgentSession::replay_items`] cannot desynchronise it.
+        let mut next_index = 0usize;
+        for item in items {
+            let message = match item {
+                ReplayItem::Message(m) => m.as_ref(),
+                // pi re-injects the miss notice after the assistant message that paid for it
+                // (`interactive-mode.ts:3753-3755`); the gate is its `getShowCacheMissNotices()`
+                // at the collection site (`:3694`).
+                ReplayItem::CacheMiss(miss) => {
+                    if self.state.show_cache_miss_notices {
+                        self.state.transcript.push_cache_miss_notice(miss);
+                    }
+                    continue;
+                }
+                // pi's synthesised `compaction_cost` item, dispatched by `renderSessionItems`
+                // (`:3705-3709`) into `addCompactionCostNotice`, which re-reads the same gate.
+                ReplayItem::CompactionCost { kind, usage } => {
+                    if self.state.show_cache_miss_notices {
+                        self.state.transcript.push_compaction_cost_notice(
+                            match kind {
+                                cyrup_session_svc::CompactionCostKind::Compaction => {
+                                    crate::transcript::CompactionCostKind::Compaction
+                                }
+                                cyrup_session_svc::CompactionCostKind::BranchSummary => {
+                                    crate::transcript::CompactionCostKind::BranchSummary
+                                }
+                            },
+                            usage,
+                        );
+                    }
+                    continue;
+                }
+            };
+            let index = next_index;
+            next_index += 1;
             match message {
                 AgentMessage::Core(Message::User { content, .. }) => {
                     let text = content_text(content);
@@ -209,11 +295,18 @@ impl<B: Backend> App<B> {
                         // interactive-mode.ts:3473) so the `toolResult` below resolves to the exact
                         // call that produced it — two `read`s in one turn are indistinguishable by
                         // name.
-                        self.state.transcript.push_tool_start_rendered(
+                        // `hasRendererDefinition()` (tool-execution.ts:103-105) for a replayed
+                        // call: the bind refreshed the whole registry into
+                        // [`AppState::known_tool_definitions`] just above, which is the only place
+                        // this walk can ask — it holds messages, not a session.
+                        let has_definition =
+                            self.state.known_tool_definitions.contains(&call.name);
+                        self.state.transcript.push_tool_start_defined(
                             call.name.clone(),
                             Some(call.id.as_str().to_string()),
                             Value::Object(call.arguments.clone()),
                             None,
+                            has_definition,
                         );
                     }
                     if let Some(notice) = stop_reason_notice(m) {
@@ -335,4 +428,28 @@ impl<B: Backend> App<B> {
         self.state.editor.set_text(&combined);
         queued.len()
     }
+}
+
+/// The messages of a replay stream, in order, with the derived notices skipped — the projection an
+/// extension-renderer pre-pass and the `rendered` index map are both keyed against.
+fn replay_messages(
+    items: &[cyrup_session_svc::ReplayItem],
+) -> impl Iterator<Item = &cyrup_session_svc::agent_message::AgentMessage> {
+    items.iter().filter_map(|item| match item {
+        cyrup_session_svc::ReplayItem::Message(m) => Some(m.as_ref()),
+        _ => None,
+    })
+}
+
+/// Lift a plain message list into a replay stream carrying no derived notices — what the two
+/// `AgentMessage`-shaped replay entry points feed the walk. A caller that wants the notices asks
+/// the session for them ([`cyrup_session_svc::AgentSession::replay_items`]).
+fn as_replay_items(
+    messages: &[cyrup_session_svc::agent_message::AgentMessage],
+) -> Vec<cyrup_session_svc::ReplayItem> {
+    messages
+        .iter()
+        .cloned()
+        .map(|m| cyrup_session_svc::ReplayItem::Message(Box::new(m)))
+        .collect()
 }

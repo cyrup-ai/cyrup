@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Make `cyrup config` Able To Enable/Disable Extensions: Discovery, Override Honoring, Then The Row Kind

@@ -39,6 +39,26 @@ impl App<InlineBackend<Stdout>> {
                     // in `apply_action`); the reader task's terminal `Done` clears `bash_rx`.
                     ctx.session.abort_bash();
                 }
+                AppAction::CancelShare => {
+                    // pi's `loader.onAbort` (`session-share.ts:157-161`): `proc?.kill()`,
+                    // `restoreEditor(...)`, `showStatus("Share cancelled")`.
+                    //
+                    // Aborting the waiter task IS the kill: it is the child's only owner
+                    // (`wait_with_output` consumes it) and the command was spawned with
+                    // `kill_on_drop(true)`, so dropping the aborted task kills `gh`. The temp file
+                    // is unlinked here rather than left to `apply_share_outcome`, because an
+                    // aborted waiter never posts its `ShareMsg` — pi's `finally` (`:76-84`) runs on
+                    // the cancelled path too.
+                    if let Some(share) = self.state.share_in_flight.take() {
+                        share.task.abort();
+                        let _ = std::fs::remove_file(&share.tmp);
+                    }
+                    // pi's `loader.signal.aborted`, re-checked by every completion path: `gh` may
+                    // already have settled and posted a result the loop has not drained yet.
+                    self.state.share_cancelled = true;
+                    self.state.loader = None;
+                    self.state.transcript.push_status("Share cancelled");
+                }
                 AppAction::InterruptRestoreQueued => {
                     // Pi `onEscape` while streaming (interactive-mode.ts:2636-2637):
                     // `restoreQueuedMessagesToEditor({abort: true})` — take-all BOTH queues,
@@ -237,6 +257,14 @@ impl App<InlineBackend<Stdout>> {
                         }
                         serviced += 1;
                     }
+                    // pi awaits an extension command's `getArgumentCompletions` inside the popup
+                    // path (`packages/tui/src/autocomplete.ts:355` @v0.84.3); cyrup's popup path is
+                    // synchronous, so the guest call happens HERE — after the batch of keys that
+                    // may have changed the argument, and BEFORE the one frame they produce, so the
+                    // completions land in the same frame as the keystroke that asked for them.
+                    // A no-op (one string test) unless the cursor sits in `/<ext-command> <arg>`.
+                    // See `crate::commands::ArgumentCompleter::Extension`.
+                    self.refresh_extension_completions(&ctx.session).await;
                     self.draw_synchronized()?;
                     // TUI-092 — the liveness beacon the input reader's wedge detector watches.
                     // Once per serviced event, and deliberately AFTER the single draw, so it still

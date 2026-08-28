@@ -910,6 +910,7 @@ fn a_configured_path_that_resolves_to_nothing_produces_exactly_one_diagnostic_na
         project_cwd: None,
         agent_dir: None,
         configured: vec![missing.clone()],
+        disabled: Vec::new(),
     };
     let (found, diags) = crate::loader::discover_with_diagnostics(&roots);
     assert!(found.is_empty());
@@ -925,6 +926,7 @@ fn a_configured_path_that_resolves_to_nothing_produces_exactly_one_diagnostic_na
         project_cwd: None,
         agent_dir: None,
         configured: vec![dir.clone()],
+        disabled: Vec::new(),
     };
     let (found, diags) = crate::loader::discover_with_diagnostics(&roots);
     assert!(found.is_empty());

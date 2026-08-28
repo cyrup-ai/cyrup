@@ -126,6 +126,32 @@ impl ModelSelector {
             .is_some_and(|(p, i)| *p == m.provider && *i == m.id)
     }
 
+    /// Pi `isDefaultSearch` (`model-selector.ts:256-259`): a non-empty, trimmed, lowercased query
+    /// that is a PREFIX of `"default"` — so `d`, `de`, … `default` all count, but `defaults` does
+    /// not. Note the direction: `"default".startsWith(normalized)`, i.e. the QUERY is the prefix.
+    ///
+    /// `to_lowercase` (not `to_ascii_lowercase`) mirrors JS `toLowerCase()`.
+    fn is_default_search(&self, query: &str) -> bool {
+        let normalized = query.trim().to_lowercase();
+        !normalized.is_empty() && "default".starts_with(&normalized)
+    }
+
+    /// The fuzzy haystack for one row: [`ModelEntry::search_text`] plus a `" default"` suffix on the
+    /// persisted default (Pi `model-selector.ts:275-277`, where `filterModels`' key function appends
+    /// `const defaultText = this.isDefaultModel(item.model) ? " default" : ""`).
+    ///
+    /// It lives on the SELECTOR rather than on `ModelEntry` because "is this the default" is the
+    /// selector's [`Self::default_model`], not a property of a catalog row — and because
+    /// `ModelEntry::search_text` is the standalone port of `getModelSelectorSearchText`
+    /// (`model-search.ts:16-19`), which upstream likewise knows nothing about defaults.
+    fn search_haystack(&self, m: &ModelEntry) -> String {
+        let mut text = m.search_text();
+        if self.is_default(m) {
+            text.push_str(" default");
+        }
+        text
+    }
+
     /// Pi `sortModels` (`model-selector.ts:226-238`): current model first, **persisted default
     /// second**, then by provider. The default tier is why this is a method rather than the inline
     /// sort the constructor used to do — it has to re-run when the default is threaded in.
@@ -180,16 +206,33 @@ impl ModelSelector {
         }
     }
 
-    /// The active-scope models passing the fuzzy query (Pi `filterModels`, `:219-227`). The fuzzy score
-    /// runs over each model's provider-first search text and reorders best-match-first.
+    /// The active-scope models passing the fuzzy query (Pi `filterModels`, `model-selector.ts:273-296`).
+    /// The fuzzy score runs over each model's provider-first search text — plus the `" default"`
+    /// suffix on the persisted default ([`Self::search_haystack`]) — and reorders best-match-first.
+    ///
+    /// On a *default search* (`d`, `de`, … `default`; [`Self::is_default_search`]) the default rows
+    /// are HOISTED to the front and the fuzzy result is stripped of them (`:279-286`), so typing
+    /// `d` surfaces the default without duplicating it further down the list. Upstream de-duplicates
+    /// with a `provider\0id` key set built from exactly the default rows; since `is_default` is the
+    /// same predicate that produced that set (`isDefaultModel`, `:252-254`), testing it directly is
+    /// the identical filter, not an approximation.
     fn filtered(&self) -> Vec<&ModelEntry> {
         let active = self.active();
-        if self.input.value().is_empty() {
+        let query = self.input.value();
+        if query.is_empty() {
             return active;
         }
-        let texts: Vec<String> = active.iter().map(|m| m.search_text()).collect();
-        let matches = fuzzy::filter(&texts, self.input.value(), String::as_str);
-        matches.into_iter().filter_map(|mm| active.get(mm.index).copied()).collect()
+        let texts: Vec<String> = active.iter().map(|m| self.search_haystack(m)).collect();
+        let matches = fuzzy::filter(&texts, query, String::as_str);
+        let fuzzed: Vec<&ModelEntry> =
+            matches.into_iter().filter_map(|mm| active.get(mm.index).copied()).collect();
+        if !self.is_default_search(query) {
+            return fuzzed;
+        }
+        let mut out: Vec<&ModelEntry> =
+            active.iter().copied().filter(|m| self.is_default(m)).collect();
+        out.extend(fuzzed.into_iter().filter(|m| !self.is_default(m)));
+        out
     }
 
     /// The highlighted model, if any (test/inspection).

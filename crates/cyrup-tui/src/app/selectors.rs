@@ -6,11 +6,21 @@ impl<B: Backend> App<B> {
     /// theme so a cancel can restore it. Idempotent-ish: opening replaces any already-open selector.
     pub fn open_selector(&mut self, kind: SelectorKind) {
         let saved_editor = self.state.editor.text();
+        let (inner, restore_theme) = self.build_list_selector(kind);
+        self.state.selector =
+            Some(ActiveSelector { kind, inner, saved_editor, restore_theme, parent: None });
+    }
+
+    /// Build (but do not mount) the dependency-free list selector for `kind`, plus the theme to
+    /// restore if it is cancelled. Split out of [`Self::open_selector`] so the same construction
+    /// serves both the top-level open and the `/settings` submenu open
+    /// ([`Self::open_child_selector`]), which differ only in what they do with the slot.
+    fn build_list_selector(&self, kind: SelectorKind) -> (Box<dyn Selector>, Option<UiTheme>) {
         // `with_upstream_chrome` applies the hint row / one-column inset ONLY for the kinds whose
         // pi component builds them (`SelectorKind::draws_hint_row` / `insets_rows`). Thinking,
         // show-images and theme are `DynamicBorder` + `SelectList` + `DynamicBorder` upstream and
         // get neither.
-        let (inner, restore_theme): (Box<dyn Selector>, Option<UiTheme>) = match kind {
+        match kind {
             SelectorKind::Thinking => (
                 Box::new(
                     ListSelector::thinking(
@@ -44,8 +54,35 @@ impl<B: Backend> App<B> {
                 ),
                 None,
             ),
-        };
-        self.state.selector = Some(ActiveSelector { kind, inner, saved_editor, restore_theme });
+        }
+    }
+
+    /// Open `inner` as a **child** of whatever currently occupies the slot (pi
+    /// `SettingsList.activateItem`'s `this.submenuComponent = item.submenu(…)`,
+    /// `settings-list.ts:214-236`): the displaced selector is kept as the new frame's
+    /// [`ActiveSelector::parent`] and comes back when this one closes, instead of being dropped.
+    ///
+    /// The editor is deliberately NOT re-snapshotted — the parent frame already holds the text the
+    /// editor had before the whole stack opened, and only the outermost close re-applies it
+    /// ([`Self::close_selector`]). `restore_theme` is per-frame, so the theme submenu still undoes
+    /// its own live preview on Esc while leaving `/settings` on screen.
+    ///
+    /// With no selector open this degenerates to a plain open with an empty saved editor, which is
+    /// why every call site is a submenu activation reached from an open selector.
+    pub(crate) fn open_child_selector(
+        &mut self,
+        kind: SelectorKind,
+        inner: Box<dyn Selector>,
+        restore_theme: Option<UiTheme>,
+    ) {
+        let parent = self.state.selector.take().map(Box::new);
+        self.state.selector = Some(ActiveSelector {
+            kind,
+            inner,
+            saved_editor: String::new(),
+            restore_theme,
+            parent,
+        });
     }
 
     /// Open a **data-bound** selector (`/model`, `/resume`, `/tree`, …) over rows the run loop sourced
@@ -59,12 +96,47 @@ impl<B: Backend> App<B> {
         selected: usize,
     ) {
         let saved_editor = self.state.editor.text();
-        let inner: Box<dyn Selector> = Box::new(
+        let inner = self.build_data_selector(kind, rows, selected);
+        self.state.selector =
+            Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None, parent: None });
+    }
+
+    /// The `/settings`-submenu form of [`Self::open_data_selector`]: same picker, mounted as a
+    /// child of `parent` (the frame the run loop was handed through
+    /// [`AppState::pending_selector_parent`]) so closing it pops back rather than reaching the
+    /// prompt. `parent: None` is exactly [`Self::open_data_selector`], for the routes that opened
+    /// the picker on its own (`/model`, `/resume`, …).
+    pub(crate) fn open_data_child_selector(
+        &mut self,
+        kind: SelectorKind,
+        rows: Vec<(String, String, Option<String>)>,
+        selected: usize,
+        parent: Option<Box<ActiveSelector>>,
+    ) {
+        if parent.is_none() {
+            return self.open_data_selector(kind, rows, selected);
+        }
+        let inner = self.build_data_selector(kind, rows, selected);
+        self.state.selector = Some(ActiveSelector {
+            kind,
+            inner,
+            saved_editor: String::new(),
+            restore_theme: None,
+            parent,
+        });
+    }
+
+    /// Build (but do not mount) the data-bound list picker for `kind`.
+    fn build_data_selector(
+        &self,
+        kind: SelectorKind,
+        rows: Vec<(String, String, Option<String>)>,
+        selected: usize,
+    ) -> Box<dyn Selector> {
+        Box::new(
             ListSelector::data(kind, rows, selected)
                 .with_upstream_chrome(kind, &self.state.select_keymap),
-        );
-        self.state.selector =
-            Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None });
+        )
     }
 
     /// Open the bespoke scoped-models checkbox+reorder selector (`scoped-models-selector.ts`,
@@ -90,6 +162,7 @@ impl<B: Backend> App<B> {
             inner,
             saved_editor,
             restore_theme: None,
+            parent: None,
         });
     }
 
@@ -121,6 +194,7 @@ impl<B: Backend> App<B> {
             inner,
             saved_editor,
             restore_theme: None,
+            parent: None,
         });
     }
 
@@ -166,7 +240,7 @@ impl<B: Backend> App<B> {
     pub fn open_boxed_selector(&mut self, kind: SelectorKind, inner: Box<dyn Selector>) {
         let saved_editor = self.state.editor.text();
         self.state.selector =
-            Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None });
+            Some(ActiveSelector { kind, inner, saved_editor, restore_theme: None, parent: None });
     }
 
     /// The kind of the currently-open selector, if any (test/inspection access).
@@ -229,6 +303,12 @@ impl<B: Backend> App<B> {
                 }
                 let command = self.confirm_selector(kind, &value);
                 self.close_selector(false);
+                // pi applies the chosen value to the parent row BEFORE closing the submenu
+                // (`settings-list.ts:222-225`); doing it just after the pop is the same frame on
+                // screen, and keeps the "did this close pop a settings list?" question in one place.
+                if let Some(row) = Self::submenu_row_for(kind) {
+                    self.set_settings_row_value(row, &value);
+                }
                 match command {
                     Some(c) => AppAction::Command(c),
                     None => AppAction::Redraw,
@@ -242,6 +322,9 @@ impl<B: Backend> App<B> {
                 // (`interactive-mode.ts:4803`, `:4813`) — so the close is unconditional here.
                 let command = self.confirm_selector_as_default(kind, &value);
                 self.close_selector(false);
+                if let Some(row) = Self::submenu_row_for(kind) {
+                    self.set_settings_row_value(row, &value);
+                }
                 match command {
                     Some(c) => AppAction::Command(c),
                     None => AppAction::Redraw,
@@ -253,6 +336,14 @@ impl<B: Backend> App<B> {
                 // the separator) so the split is unambiguous. Persist it via the session `set_label`
                 // path and keep the slot open (the tree already refreshed its own `has_label` star).
                 if kind == SelectorKind::Tree {
+                    // `app.message.copy` inside the tree rides a unit-separator-TAGGED payload
+                    // (`"\u{1f}copy\u{1f}{entry_id}"`, `TreeSelector::copy_payload`), decoded
+                    // first so it can never be read as the untagged label form below. The slot
+                    // stays open — pi does not close the tree on copy (`tree-selector.ts:1029`).
+                    let sep = crate::FIELD_SEP;
+                    if let Some(entry_id) = payload.strip_prefix(&format!("{sep}copy{sep}")) {
+                        return AppAction::Command(AppCommand::CopyEntry(entry_id.to_string()));
+                    }
                     return match payload.split_once(crate::FIELD_SEP) {
                         Some((entry_id, label)) => AppAction::Command(AppCommand::SetEntryLabel {
                             entry_id: entry_id.to_string(),
@@ -322,20 +413,37 @@ impl<B: Backend> App<B> {
                 AppAction::Redraw
             }
             // A `/settings` submenu row (Pi `SettingItem.submenu`, settings-selector.ts:603-610):
-            // replace the settings selector with the nested picker. Only `"theme"` exists today — the
-            // theme picker with live preview (`ThemeSubmenu`); an unknown id is a defensive no-op.
+            // open the nested picker as a CHILD of the settings selector, which stays alive
+            // underneath it (`settings-list.ts:214-236` stores it in `submenuComponent` and
+            // `closeSubmenu` `:242-256` brings it back, cursor row and search query intact).
             SelectorOutcome::OpenSubmenu(id) => {
                 match id.as_str() {
-                    "theme" => self.open_selector(SelectorKind::Theme),
+                    "theme" => {
+                        // `restore_theme` rides the CHILD frame, so Esc out of the picker undoes the
+                        // live preview and lands back on the settings list — pi's
+                        // `ThemeSubmenu.cancel()`, which restores `originalThemeSetting` and then
+                        // calls `onDone()` with no value (`settings-selector.ts:283-330`).
+                        let (inner, restore_theme) = self.build_list_selector(SelectorKind::Theme);
+                        self.open_child_selector(SelectorKind::Theme, inner, restore_theme);
+                    }
                     // TUI-032 — `thinking` opens the picker cyrup already had and could not reach:
                     // Pi's `SelectSubmenu("Thinking Level", …, config.availableThinkingLevels, …,
                     // callbacks.onThinkingLevelChange)` (`settings-selector.ts:591-611`).
-                    "thinking" => self.open_selector(SelectorKind::Thinking),
+                    "thinking" => {
+                        let (inner, restore_theme) =
+                            self.build_list_selector(SelectorKind::Thinking);
+                        self.open_child_selector(SelectorKind::Thinking, inner, restore_theme);
+                    }
                     // GAP 3 step 1. Unlike `theme`/`thinking` this picker is DATA-BOUND (its rows
                     // are the model catalog plus each model's current override), and this handler
                     // has no session — so it rides a command the run loop resolves, the same shape
                     // the `BranchSummary` cancel arm above uses.
                     "model-thinking" => {
+                        // The settings frame cannot be the child's parent yet — the child does not
+                        // exist until the run loop has built its rows — so it rides
+                        // `pending_selector_parent` across the command, and the `OpenSelector`
+                        // arm re-parents the picker onto it (execute.rs).
+                        self.state.pending_selector_parent = self.state.selector.take().map(Box::new);
                         return AppAction::Command(AppCommand::OpenSelector(
                             SelectorKind::ModelThinking,
                         ));
@@ -357,7 +465,7 @@ impl<B: Backend> App<B> {
                         )];
                         let inner: Box<dyn Selector> =
                             Box::new(SettingsSelector::new("Warnings", rows));
-                        self.open_boxed_selector(SelectorKind::Settings, inner);
+                        self.open_child_selector(SelectorKind::Settings, inner, None);
                     }
                     _ => {}
                 }
@@ -452,6 +560,14 @@ impl<B: Backend> App<B> {
             // `settings-selector.ts:653`). Data-bound, so it rides a command.
             SelectorKind::ModelThinking => {
                 self.state.pending_model_thinking = Some(value.to_string());
+                // Step 1 is not being left behind — pi's `SteppedSubmenu` keeps ONE submenu alive
+                // and swaps its active step (`settings-submenu.ts:216-232`), and its Esc at step 2
+                // rebuilds step 1 rather than closing (`:234-241`). Moving the whole step-1 frame
+                // (settings list still hanging off it) into `pending_selector_parent` makes step 2
+                // its child, so Esc pops model-list → settings list. The `close_selector(false)`
+                // that follows this call finds an empty slot and correctly does nothing: this frame
+                // is not closing, it is being re-parented.
+                self.state.pending_selector_parent = self.state.selector.take().map(Box::new);
                 Some(AppCommand::OpenSelector(SelectorKind::ModelThinkingLevel))
             }
             // GAP 3 step 2: apply. The pending model is consumed here, so an Escape at step 2
@@ -501,14 +617,56 @@ impl<B: Backend> App<B> {
         }
     }
 
-    /// Close the selector slot and restore the editor (spec/tui/05 §7 `done()`). When `cancelled` and
-    /// a theme was being previewed, the prior theme is restored first.
+    /// Close the topmost selector frame (spec/tui/05 §7 `done()`). A previewed theme is restored
+    /// first when `cancelled`, for the frame that is closing, whatever its depth.
+    ///
+    /// With a [`ActiveSelector::parent`] this is pi's `closeSubmenu` (`settings-list.ts:242-256`):
+    /// the parent goes back in the slot and the editor is left alone — the parent still owns the
+    /// input slot, and its retained component carries its own cursor row and search query, so the
+    /// user returns to the settings list exactly where they left it. Only the outermost frame
+    /// re-applies the editor text, so a stack of submenus restores it exactly once.
     pub(crate) fn close_selector(&mut self, cancelled: bool) {
         if let Some(active) = self.state.selector.take() {
             if cancelled && let Some(theme) = active.restore_theme {
                 self.set_theme(theme);
             }
-            self.state.editor.set_text(&active.saved_editor);
+            match active.parent {
+                Some(parent) => self.state.selector = Some(*parent),
+                None => self.state.editor.set_text(&active.saved_editor),
+            }
+        }
+    }
+
+    /// Write `value` into the `id` row of every `/settings` list still on the stack (pi
+    /// `SettingsList.updateValue`, `settings-list.ts:74-80`, which `activateItem`'s `done()`
+    /// callback runs — as `item.currentValue = selectedValue` — BEFORE `closeSubmenu()`,
+    /// `:216-225`). Without it the row the user pops back to still shows the value it was built
+    /// with at `/settings` time: `AppCommand::ApplySetting` persists and mirrors onto `AppState`
+    /// but never touches the open selector.
+    ///
+    /// The whole chain is walked (not just the frame in the slot) because the settings list is the
+    /// PARENT of the picker that produced the value, and for the two-step per-model flow the
+    /// grandparent. A frame that is not a [`SettingsSelector`], or has no such row, is skipped —
+    /// `update_value` is a no-op for an unknown id, exactly like upstream's `find`.
+    pub(crate) fn set_settings_row_value(&mut self, id: &str, value: &str) {
+        let mut frame = self.state.selector.as_mut();
+        while let Some(active) = frame {
+            if let Some(settings) = active.inner.as_settings_mut() {
+                settings.update_value(id, value);
+            }
+            frame = active.parent.as_deref_mut();
+        }
+    }
+
+    /// The `id` of the `/settings` row a confirmed submenu picker feeds back into, if any — the
+    /// row-to-submenu mapping of [`crate::app::settings_rows`] read backwards. `warnings` is
+    /// deliberately absent: its submenu calls `done()` with no value upstream
+    /// (`settings-selector.ts:560-569`), so the parent row keeps its literal `"configure"`.
+    fn submenu_row_for(kind: SelectorKind) -> Option<&'static str> {
+        match kind {
+            SelectorKind::Theme => Some("theme"),
+            SelectorKind::Thinking => Some("thinking"),
+            _ => None,
         }
     }
 }

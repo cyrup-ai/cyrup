@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Port `moveToVisualLine`'s Atomic-Segment Snap And Its Non-Last-Segment Column Clamp Into The Three Vertical Movers

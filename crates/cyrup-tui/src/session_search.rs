@@ -10,12 +10,13 @@
 //! `session-selector-search.ts:26`). The chrome (`app.rs`) assembles that text from
 //! [`cyrup_session_svc::SessionInfo`] and applies the [`NameFilter`]/[`SortMode`].
 //!
-//! **Regex `re:` mode** (`session-selector-search.ts:44-56`) compiles a JS `RegExp`. cyrup has no
-//! approved regex dependency, so the prefix is recognized and surfaced as a one-line *unsupported*
-//! error rather than silently matching nothing; wiring a real engine is the single dep-gated residual
-//! noted in the gap doc. Every other branch is 1:1.
+//! **Regex `re:` mode** (`session-selector-search.ts:44-56`) compiles the pattern
+//! case-insensitively — the `regex` crate standing in for pi's `new RegExp(pattern, "i")` — once at
+//! parse time, and a compile failure lands in [`ParsedSearchQuery::error`] exactly as pi's `catch`
+//! arm does (`:53-55`). Every branch is 1:1 with `session-selector-search.ts`.
 
 use crate::fuzzy::fuzzy_match;
+use regex::{Regex, RegexBuilder};
 
 /// Whether to keep all sessions or only named ones (`NameFilter`, `session-selector-search.ts:9`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,23 +63,43 @@ pub struct SearchToken {
 pub enum QueryMode {
     /// Whitespace/quote tokenized fuzzy+phrase matching.
     Tokens,
-    /// `re:<pattern>` regex matching (dep-gated; see module docs).
+    /// `re:<pattern>` regex matching (case-insensitive; see module docs).
     Regex,
 }
 
 /// A parsed search query (`ParsedSearchQuery`, `session-selector-search.ts:11-18`).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `PartialEq`/`Eq` are hand-written rather than derived because [`Regex`] implements neither; the
+/// compiled pattern is compared by its source text ([`Regex::as_str`]), which is what pi's
+/// structural comparison of `RegExp` sources would amount to.
+#[derive(Clone, Debug)]
 pub struct ParsedSearchQuery {
     /// Tokens vs. regex.
     pub mode: QueryMode,
     /// The fuzzy/phrase tokens (empty in regex mode).
     pub tokens: Vec<SearchToken>,
-    /// The raw `re:` pattern (regex mode only; matching is dep-gated).
-    pub regex_pattern: Option<String>,
+    /// The compiled, case-insensitive `re:` pattern (regex mode only; `regex: RegExp | null`,
+    /// `session-selector-search.ts:11`). Compiled ONCE here at parse time — [`match_text`] runs per
+    /// session and the `/resume` list is unbounded, so recompiling per call would cost one regex
+    /// build per session per keystroke. The raw pattern stays reachable via [`Regex::as_str`].
+    pub regex: Option<Regex>,
     /// When set, parsing failed and matching should treat every session as non-matching
     /// (`error?: string`, `:17`).
     pub error: Option<String>,
 }
+
+impl PartialEq for ParsedSearchQuery {
+    fn eq(&self, other: &Self) -> bool {
+        self.mode == other.mode
+            && self.tokens == other.tokens
+            && self.error == other.error
+            && self.regex.as_ref().map(Regex::as_str) == other.regex.as_ref().map(Regex::as_str)
+    }
+}
+
+// Comparing the two `Option<&str>` pattern sources is reflexive, symmetric and transitive, so the
+// hand-written `PartialEq` above is a full equivalence relation.
+impl Eq for ParsedSearchQuery {}
 
 /// Lowercase + collapse runs of whitespace to a single space + trim
 /// (`normalizeWhitespaceLower`, `session-selector-search.ts:20`).
@@ -118,7 +139,7 @@ pub fn parse_search_query(query: &str) -> ParsedSearchQuery {
         return ParsedSearchQuery {
             mode: QueryMode::Tokens,
             tokens: Vec::new(),
-            regex_pattern: None,
+            regex: None,
             error: None,
         };
     }
@@ -130,15 +151,25 @@ pub fn parse_search_query(query: &str) -> ParsedSearchQuery {
             return ParsedSearchQuery {
                 mode: QueryMode::Regex,
                 tokens: Vec::new(),
-                regex_pattern: None,
+                regex: None,
                 error: Some("Empty regex".to_string()),
             };
         }
-        return ParsedSearchQuery {
-            mode: QueryMode::Regex,
-            tokens: Vec::new(),
-            regex_pattern: Some(pattern.to_string()),
-            error: None,
+        // `new RegExp(pattern, "i")` inside pi's try/catch (`session-selector-search.ts:51-55`):
+        // success → a compiled case-insensitive matcher, failure → the message in `error`.
+        return match RegexBuilder::new(pattern).case_insensitive(true).build() {
+            Ok(re) => ParsedSearchQuery {
+                mode: QueryMode::Regex,
+                tokens: Vec::new(),
+                regex: Some(re),
+                error: None,
+            },
+            Err(err) => ParsedSearchQuery {
+                mode: QueryMode::Regex,
+                tokens: Vec::new(),
+                regex: None,
+                error: Some(err.to_string()),
+            },
         };
     }
 
@@ -188,27 +219,30 @@ pub fn parse_search_query(query: &str) -> ParsedSearchQuery {
         return ParsedSearchQuery {
             mode: QueryMode::Tokens,
             tokens,
-            regex_pattern: None,
+            regex: None,
             error: None,
         };
     }
 
     flush(&mut buf, if in_quote { TokenKind::Phrase } else { TokenKind::Fuzzy }, &mut tokens);
 
-    ParsedSearchQuery { mode: QueryMode::Tokens, tokens, regex_pattern: None, error: None }
+    ParsedSearchQuery { mode: QueryMode::Tokens, tokens, regex: None, error: None }
 }
 
 /// Score `text` against a parsed query (`matchSession`, `session-selector-search.ts:113-152`):
 /// `Some(score)` (lower = better) when it matches, `None` otherwise. Phrase tokens match a normalized
 /// substring (score `idx*0.1`), fuzzy tokens via [`fuzzy_match`]; an empty token list matches with
-/// score `0`. Regex mode is dep-gated → always `None`.
+/// score `0`. Regex mode scores the first match's start offset by the same `idx*0.1` rule.
 pub fn match_text(text: &str, parsed: &ParsedSearchQuery) -> Option<f64> {
     if parsed.error.is_some() {
         return None;
     }
     if parsed.mode == QueryMode::Regex {
-        // No approved regex engine — recognized but unsupported (see module docs).
-        return None;
+        // `session-selector-search.ts:116-124`: a null `regex` never matches (the `?` below), and
+        // `text.search(re) < 0` is the `None` from `find`. Delta: pi's `String.search` returns a
+        // UTF-16 code-unit index while `Match::start` is a byte offset — identical for ASCII, and
+        // the score is ordering-only, so non-ASCII text shifts no row's relative position.
+        return parsed.regex.as_ref()?.find(text).map(|m| m.start() as f64 * 0.1);
     }
     if parsed.tokens.is_empty() {
         return Some(0.0);
@@ -348,12 +382,16 @@ mod tests {
     }
 
     #[test]
-    fn regex_mode_is_recognized_but_unsupported() {
+    fn regex_mode_matches_and_scores_by_offset() {
         let parsed = parse_search_query("re:foo.*bar");
         assert_eq!(parsed.mode, QueryMode::Regex);
-        assert_eq!(parsed.regex_pattern.as_deref(), Some("foo.*bar"));
-        // Dep-gated: recognized, never matches.
-        assert_eq!(match_text("foozzzbar", &parsed), None);
+        assert_eq!(parsed.regex.as_ref().map(Regex::as_str), Some("foo.*bar"));
+        assert_eq!(match_text("foozzzbar", &parsed), Some(0.0));
+        // `new RegExp(pattern, "i")` — case-insensitive.
+        assert_eq!(match_text("FOOZZZBAR", &parsed), Some(0.0));
+        // Score is the match start * 0.1, the phrase arm's rule.
+        assert_eq!(match_text("0123456789foozzzbar", &parsed), Some(1.0));
+        assert_eq!(match_text("nothing here", &parsed), None);
     }
 
     #[test]

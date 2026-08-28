@@ -10,7 +10,7 @@ impl InputEditor {
             line.insert(col, c);
             self.col = col + 1;
         }
-        self.preferred_visual_col = None;
+        self.reset_preferred_col();
     }
 
     /// Insert a string (e.g. a paste) char by char.

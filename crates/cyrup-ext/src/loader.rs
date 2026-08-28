@@ -69,6 +69,19 @@ pub struct DiscoveryRoots {
     pub agent_dir: Option<PathBuf>,
     /// Explicitly-configured paths (pre-trust); each may be an extension dir or a dir of extensions.
     pub configured: Vec<PathBuf>,
+    /// Extension paths a settings `extensions` array turned off with a `-pattern` — the negative
+    /// half of the same arrays the `cyrup config` editor writes (Pi `toggleTopLevelResource`,
+    /// `modes/interactive/components/config-selector.ts:532-578`, `arrayKey === "extensions"`).
+    ///
+    /// Each entry is the candidate path this scanner would otherwise accept: a subdirectory of a
+    /// discovery root, or a bare `*.wasm` artifact sitting in one. **The pattern match itself is not
+    /// done here** — it lives in `cyrup-resources`
+    /// (`discovery::scan_loose_extension_root` + `package::manifest::is_enabled_by_overrides`),
+    /// which owns the settings-array semantics for all four resource kinds; this crate only honours
+    /// the resolved verdict, so the extension `cyrup config` disabled is not loaded on the next run.
+    ///
+    /// [`Default`] is empty, i.e. today's behaviour for every caller that does not resolve settings.
+    pub disabled: Vec<PathBuf>,
 }
 
 /// A per-path load failure (Pi `LoadExtensionsResult.errors[]`).
@@ -149,14 +162,17 @@ pub fn discover_with_diagnostics(
     let mut seen: HashSet<PathBuf> = HashSet::new();
     let mut out: Vec<DiscoveredExtension> = Vec::new();
     let mut diags: Vec<LoadError> = Vec::new();
+    // Canonicalized with the SAME fallible-then-verbatim rule the `seen` dedup key uses
+    // (`push_dir`/`push_file`), so the two compare apples to apples.
+    let disabled: HashSet<PathBuf> = roots.disabled.iter().map(|p| dedup_key(p)).collect();
 
     if let Some(cwd) = &roots.project_cwd {
         let dir = cwd.join(PROJECT_CONFIG_DIR).join(EXTENSIONS_SUBDIR);
-        scan_dir(&dir, ExtOrigin::Project, &mut seen, &mut out, &mut diags);
+        scan_dir(&dir, ExtOrigin::Project, &disabled, &mut seen, &mut out, &mut diags);
     }
     if let Some(agent) = &roots.agent_dir {
         let dir = agent.join(EXTENSIONS_SUBDIR);
-        scan_dir(&dir, ExtOrigin::Global, &mut seen, &mut out, &mut diags);
+        scan_dir(&dir, ExtOrigin::Global, &disabled, &mut seen, &mut out, &mut diags);
     }
     for p in &roots.configured {
         // A configured path may be a bare prebuilt `.wasm` artifact, a single extension dir, or a
@@ -187,7 +203,7 @@ pub fn discover_with_diagnostics(
             // `.cyrup/extensions` directory is the ordinary case, not a user error, and pi says
             // nothing about it either.
             let before = out.len();
-            scan_dir(p, ExtOrigin::Configured, &mut seen, &mut out, &mut diags);
+            scan_dir(p, ExtOrigin::Configured, &disabled, &mut seen, &mut out, &mut diags);
             if out.len() == before {
                 diags.push(LoadError {
                     path: p.clone(),
@@ -237,6 +253,7 @@ fn is_component_file(path: &Path) -> bool {
 fn scan_dir(
     dir: &Path,
     origin: ExtOrigin,
+    disabled: &HashSet<PathBuf>,
     seen: &mut HashSet<PathBuf>,
     out: &mut Vec<DiscoveredExtension>,
     diags: &mut Vec<LoadError>,
@@ -245,6 +262,12 @@ fn scan_dir(
     let mut entries: Vec<PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
     entries.sort(); // deterministic order (R-08-004)
     for path in entries {
+        // A settings `-pattern` disable (`DiscoveryRoots::disabled`) removes the candidate before
+        // any manifest is read, so a disabled extension contributes neither an instance nor a
+        // diagnostic — the same silence a not-present one produces.
+        if disabled.contains(&dedup_key(&path)) {
+            continue;
+        }
         if path.is_dir() {
             if is_extension_dir(&path) {
                 push_dir(&path, origin, seen, out, diags);
@@ -253,6 +276,13 @@ fn scan_dir(
             push_file(&path, origin, seen, out);
         }
     }
+}
+
+/// The identity one discovered path is compared by: its canonical form, falling back to the path
+/// verbatim when it cannot be canonicalized (a broken symlink, a missing parent). Shared by the
+/// `seen` de-dup and the `disabled` filter so both key the same way.
+fn dedup_key(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// Push a bare prebuilt `.wasm` artifact that lives directly in a discovery root (Pi's "direct
@@ -271,7 +301,7 @@ fn push_file(
     seen: &mut HashSet<PathBuf>,
     out: &mut Vec<DiscoveredExtension>,
 ) {
-    let key = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    let key = dedup_key(file);
     if !seen.insert(key) {
         return; // de-dup (Pi `seen` set)
     }
@@ -314,7 +344,7 @@ fn push_dir(
     out: &mut Vec<DiscoveredExtension>,
     diags: &mut Vec<LoadError>,
 ) {
-    let key = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let key = dedup_key(dir);
     if !seen.insert(key) {
         return; // de-dup (Pi `seen` set)
     }

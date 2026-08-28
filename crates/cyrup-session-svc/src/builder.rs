@@ -651,7 +651,13 @@ impl SessionBuilder {
         // extension pass when the answer is actually in doubt — no explicit `--approve/--no-approve`
         // and there IS something to gate. In every other case this is the exact previous code path.
         let ext_trust = if cfg.trust_override.is_none() && has_resources {
-            pre_trust_extension_verdict(&cfg, &cwd, &self.native_extensions).await
+            pre_trust_extension_verdict(
+                &cfg,
+                &cwd,
+                &self.native_extensions,
+                &settings.global().extension_paths(),
+            )
+            .await
         } else {
             None
         };
@@ -1178,6 +1184,11 @@ impl SessionBuilder {
         // toolchain — the gated arch-08b live-wasm tail, residual ledger §09 #13). Native built-ins
         // are already loaded above.
         let mut ext_roots = extension_discovery_roots(&cfg);
+        // The `-pattern` half of the settings `extensions` arrays, resolved by the discovery pass
+        // above and honoured here — the ONE production site that turns `DiscoveryRoots` into loaded
+        // extensions, and therefore the only place a `cyrup config` disable can actually bite
+        // (Pi `toggleTopLevelResource`, config-selector.ts:532-578 → `setExtensionPaths`).
+        ext_roots.disabled = disabled_loose_extensions(&report.registry);
         // SEAM-071, second half: the package tier is pi's `enabledExtensions`, the exact operand
         // `noExtensions` drops (`extensionPaths = this.noExtensions ? cliEnabledExtensions :
         // this.mergePaths(cliEnabledExtensions, enabledExtensions)`, resource-loader.ts:451-452
@@ -2119,7 +2130,17 @@ async fn pre_trust_extension_verdict(
     cfg: &SessionConfig,
     cwd: &Path,
     natives: &[Arc<dyn NativeExtension>],
+    global_extension_patterns: &[String],
 ) -> Option<cyrup_ext::ProjectTrustDecision> {
+    // A globally disabled extension must not vote on trust either: this throwaway pass loads the
+    // SAME pre-trust set the real pass loads, so it has to apply the same settings `-pattern`
+    // filter. Only the GLOBAL tier is scanned — the project root is excluded by
+    // `DiscoveredExtension::is_trusted` at `project_trusted = false` — so only the global layer's
+    // `extensions` array is consulted, which is also all that is resolvable before trust is frozen.
+    //
+    // Without the wasm host this pass loads natives only — no disk scan, nothing to filter.
+    #[cfg(not(feature = "wasm-host"))]
+    let _ = global_extension_patterns;
     let (mode, has_ui) = ext_mode(cfg.app_mode);
     let host_config = HostConfig { mode, has_ui, cwd: cwd.to_path_buf() };
     #[cfg(feature = "wasm-host")]
@@ -2143,7 +2164,16 @@ async fn pre_trust_extension_verdict(
     }
     #[cfg(feature = "wasm-host")]
     {
-        let roots = extension_discovery_roots(cfg);
+        let mut roots = extension_discovery_roots(cfg);
+        roots.disabled = cyrup_resources::scan_loose_extension_root(
+            &cfg.agent_dir.join(cyrup_ext::EXTENSIONS_SUBDIR),
+            cyrup_resources::ResourceScope::Global,
+            global_extension_patterns,
+        )
+        .into_iter()
+        .filter(|e| !e.enabled)
+        .map(|e| e.path)
+        .collect();
         let deny: Arc<dyn cyrup_ext::host::HostServices> = Arc::new(cyrup_ext::DenyServices);
         // `false` = pre-trust tier only (global + CLI-configured), exactly Pi's
         // `loadProjectTrustExtensions()`.
@@ -2239,14 +2269,37 @@ pub fn extension_discovery_roots(cfg: &SessionConfig) -> cyrup_ext::DiscoveryRoo
             project_cwd: None,
             agent_dir: None,
             configured: cfg.extra_extension_paths.clone(),
+            // The settings `-pattern` set is filled in by the caller, which is the only place the
+            // resolved settings exist — see `disabled_loose_extensions` below.
+            disabled: Vec::new(),
         }
     } else {
         cyrup_ext::DiscoveryRoots {
             project_cwd: Some(cfg.cwd.clone()),
             agent_dir: Some(cfg.agent_dir.clone()),
             configured: cfg.extra_extension_paths.clone(),
+            disabled: Vec::new(),
         }
     }
+}
+
+/// The loose extensions a settings `extensions` array turned OFF — the paths
+/// [`cyrup_ext::DiscoveryRoots::disabled`] must skip so an extension disabled through
+/// `cyrup config` is not loaded on the next run.
+///
+/// `cyrup-resources` records every auto-discovered loose extension with its settings verdict
+/// (`ResourceRegistry::loose_extensions`, `LooseExtension::enabled`) rather than filtering the
+/// disabled ones out, precisely so this negative half survives the resolve; all that is left here is
+/// to project it. Pi has no analogue because its resolve returns `enabled` per path and its loader
+/// consumes that list directly (`resource-loader.ts:451-455`); cyrup's loader scans the disk itself,
+/// so the verdict has to be handed to it.
+fn disabled_loose_extensions(registry: &cyrup_resources::ResourceRegistry) -> Vec<PathBuf> {
+    registry
+        .loose_extensions
+        .iter()
+        .filter(|e| !e.enabled)
+        .map(|e| e.path.clone())
+        .collect()
 }
 
 /// Load the on-disk installed-package registries the `install` subcommand writes — Global under

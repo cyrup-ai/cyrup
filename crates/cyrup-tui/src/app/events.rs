@@ -67,7 +67,102 @@ impl<B: Backend> App<B> {
             }
             _ => crate::transcript::Rendered::None,
         };
+        // EXT-019 — the commit frontier BEFORE the fold, so the transform pass below walks exactly
+        // the entries this event produces. Nothing drains between the two reads: `drain_committed`
+        // runs inside `App::draw`, one run-loop arm later.
+        let first_pending = self.state.transcript.pending_len();
         self.ingest_event_rendered_owned(ev, rendered, entry);
+        self.apply_markdown_transformers(ext_host, first_pending).await;
+    }
+
+    /// Run the extension-registered markdown transformers over everything the fold just put on
+    /// screen — pi's `createMarkdownTransform(messageType, isStreaming, transformers)`
+    /// (`components/markdown-transform.ts:3-10`), which upstream attaches to the `Markdown` child of
+    /// each of its three message components: `user-message.ts:53` (`"user"`, `false`),
+    /// `assistant-message.ts:112` (`"assistant"`, `this.isStreaming`) and `:157-161`
+    /// (`"assistant-thinking"`).
+    ///
+    /// # Why the seam is here
+    /// This reuses, verbatim, the reason the two renderer lookups above it run before the fold
+    /// (`ingest_event_with_extensions_owned`, and the note at the top of this file): cyrup's fold is
+    /// sync — it mutates `&mut self` from a `select!` arm — while a guest call is async. Upstream
+    /// has no such constraint and applies the transform as the first statement of
+    /// `Markdown.render()`, on every frame (`markdown.ts:285`); cyrup's markdown renderer is reached
+    /// from `App::draw`, which cannot `await`. So the fold runs ONCE per body, here, and the result
+    /// is written back into the transcript. The consequence — a resize does not re-run transformers
+    /// over already-committed text — is recorded on `crate::markdown::render_message`.
+    ///
+    /// `from` is the pending index the caller snapshotted before the entries were pushed; the live
+    /// partials are always re-offered, because a delta lengthened them.
+    ///
+    /// **No fold or containment logic lives here.** Ordering the transformers, feeding each one the
+    /// previous one's output and CONTAINING a faulting one are all
+    /// [`cyrup_ext::ExtensionHost::transform_markdown`]'s job (facade.rs), which is the single
+    /// implementation of `applyMarkdownTransformers` (`markdown-transform.ts:12-28`).
+    pub(crate) async fn apply_markdown_transformers(
+        &mut self,
+        ext_host: &Arc<cyrup_ext::ExtensionHost>,
+        from: usize,
+    ) {
+        // The sync pre-check the `has_*_renderer` gates in `extension_render` use, for the same
+        // reason: this runs once per event — including once per streamed delta — and a session with
+        // no markdown transformer must pay one rwlock read rather than an async hop, and must leave
+        // every rendered line byte-identical.
+        if !ext_host.has_markdown_transformers() {
+            return;
+        }
+        // `availableWidth` (`core/extensions/types.ts:1204`) is `markdown.ts:284`'s `contentWidth`:
+        // the width the renderer itself works in, `max(1, width - paddingX * 2)`, where `paddingX`
+        // for all three message components is `outputPad`. That is the same expression
+        // `transcript/render.rs` and `transcript/cache.rs` already feed `render_message` as `width`
+        // — the only difference is that they have the frame width and this has the last drawn one
+        // ([`AppState::term_cols`]).
+        let pad = u32::try_from(self.state.transcript.output_pad()).unwrap_or(u32::MAX);
+        let available_width =
+            u32::from(self.state.term_cols).saturating_sub(pad.saturating_mul(2)).max(1);
+        // Snapshotted rather than borrowed: the guest call is awaited, and a `&mut String` pointing
+        // into the transcript cannot straddle that await while `self` is also the receiver.
+        let committed: Vec<(usize, crate::markdown::MessageType, String)> = self
+            .state
+            .transcript
+            .pending_markdown(from)
+            .map(|(index, kind, text)| (index, kind, text.to_string()))
+            .collect();
+        for (index, kind, text) in committed {
+            // `isStreaming: false`: a committed entry is by definition no longer streaming — the
+            // turn that produced it has ended (`assistant-message.ts:111`, whose `this.isStreaming`
+            // is false for every finalized message).
+            let out =
+                ext_host.transform_markdown(&text, kind.as_pi_str(), false, available_width).await;
+            if out != text {
+                self.state.transcript.set_pending_markdown(index, out);
+            }
+        }
+        // The two LIVE partials, with `isStreaming: true` — pi's streaming
+        // `AssistantMessageComponent` is the same component with the flag set (`:111`), and it
+        // carries BOTH the answer text and the reasoning run (`:156-162`).
+        if let Some(raw) = self.state.transcript.thinking().map(str::to_string) {
+            let out = ext_host
+                .transform_markdown(
+                    &raw,
+                    crate::markdown::MessageType::AssistantThinking.as_pi_str(),
+                    true,
+                    available_width,
+                )
+                .await;
+            self.state.transcript.set_thinking_display((out != raw).then_some(out));
+        }
+        if let Some(raw) = self.state.transcript.streaming().map(str::to_string) {
+            let out = ext_host
+                .transform_markdown(
+                    &raw,
+                    crate::markdown::MessageType::Assistant.as_pi_str(),
+                    true,
+                    available_width,
+                )
+                .await;
+            self.state.transcript.set_streaming_display((out != raw).then_some(out));
+        }
     }
 
     /// The run loop's per-event fold: [`Self::ingest_event_with_extensions`], then the footer's
@@ -102,6 +197,19 @@ impl<B: Backend> App<B> {
         // nothing else, because the refresh it gates still runs where it did — after the fold and
         // after the compaction flush.
         let usage_may_have_moved = context_usage_may_have_moved(&ev);
+        // Pi resolves `getToolDefinition(toolName)` per tool-execution component — the registry is
+        // handed to the render context at `interactive-mode.ts:3413` and read as
+        // `hasRendererDefinition()` at `tool-execution.ts:103-105`. cyrup's fold is sync and holds
+        // no session, so the one lock-guarded registry lookup is hoisted here, the same place (and
+        // for the same reason) `refresh_context_usage` is. Memoized in
+        // [`AppState::known_tool_definitions`] so a repeated tool never re-locks, and read BEFORE
+        // the fold consumes `ev`.
+        if let AgentSessionEvent::ToolExecutionStart { tool_name, .. } = &ev
+            && !self.state.known_tool_definitions.contains(tool_name)
+            && session.tool_definition(tool_name).is_some()
+        {
+            self.state.known_tool_definitions.insert(tool_name.clone());
+        }
         self.ingest_event_with_extensions_owned(ev, &ext_host).await;
         // TUI-031 — `flushCompactionQueue` (`interactive-mode.ts:4036-4110` @v0.83.0), the last
         // statement of pi's `compaction_end` arm. Runs here because it needs the session; the sync
@@ -119,6 +227,16 @@ impl<B: Backend> App<B> {
                     let _ = session.steer(ui).await;
                 }
             }
+        }
+        // pi `maybeShowCacheMissNotice(this.streamingMessage)`, the last statement of its
+        // `message_end` arm before the streaming slot closes (`interactive-mode.ts:3311`). It
+        // lands here rather than in the sync fold for the same reason the compaction flush above
+        // does: the scan is an async session call and `ingest_event` holds no session. Position is
+        // still pi's — on the SAME event, so the notice precedes any tool row of the next event.
+        if std::mem::take(&mut self.state.cache_miss_check_pending)
+            && let Some(miss) = session.last_cache_miss().await
+        {
+            self.state.transcript.push_cache_miss_notice(&miss);
         }
         // `autoCompactionEnabled` is a plain `bool` read with no session walk behind it, and
         // upstream's THIRD `setAutoCompactEnabled` call site is a settings toggle rather than a turn
@@ -203,6 +321,19 @@ impl<B: Backend> App<B> {
         // truncation would end the turn with no explanation at all.
         if let Some(notice) = stop_reason_notice(message) {
             self.state.transcript.push_error(notice);
+        }
+        // pi runs `maybeShowCacheMissNotice` only on the clean branch of its `message_end` arm —
+        // the `else` of `if (stopReason === "aborted" || stopReason === "error")`
+        // (`interactive-mode.ts:3752`, and the same exclusion on its replay walk). The scan itself
+        // needs the session, which this sync finalizer does not hold, so raise the flag and let
+        // [`Self::ingest_session_event_owned`] settle it — the `compaction_flush_pending` shape.
+        if self.state.show_cache_miss_notices
+            && !matches!(
+                message.stop_reason,
+                cyrup_core::StopReason::Aborted | cyrup_core::StopReason::Error
+            )
+        {
+            self.state.cache_miss_check_pending = true;
         }
     }
 }

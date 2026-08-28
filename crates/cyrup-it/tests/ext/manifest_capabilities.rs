@@ -93,6 +93,7 @@ async fn load(cwd: &Path) -> (ExtensionHost, Arc<RecordingServices>) {
         project_cwd: Some(cwd.to_path_buf()),
         agent_dir: None,
         configured: vec![],
+        disabled: Vec::new(),
     };
     let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.to_path_buf() };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");
@@ -459,6 +460,7 @@ async fn a_malformed_fs_grant_fails_the_load() {
         project_cwd: Some(cwd.clone()),
         agent_dir: None,
         configured: vec![],
+        disabled: Vec::new(),
     };
     let cfg = HostConfig { mode: ExtMode::Tui, has_ui: true, cwd: cwd.clone() };
     let host = ExtensionHost::with_wasm(cfg).expect("host with wasm");

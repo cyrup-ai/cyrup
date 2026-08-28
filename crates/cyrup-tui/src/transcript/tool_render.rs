@@ -26,23 +26,43 @@ pub(crate) fn tool_lines(
     images: ImageOpts,
 ) -> Vec<Line<'static>> {
     let mut block: Vec<Line<'static>> = Vec::new();
-    // EXT-006: an extension that registered a renderer for THIS tool name owns the block (Pi
-    // prefers the extension's `renderCall`/`renderResult` over the built-in's,
-    // tool-execution.ts:81-112). Checked before the built-in dispatch so an extension can also
-    // override how a BUILT-IN tool draws, exactly as Pi's definition-registry override does.
-    if run.rendered_call.is_some() || run.rendered_result.is_some() {
-        render_extension(run, expanded, theme, &mut block);
+    // Pi's `builtInToolDefinition` lookup, asked ONCE so both resolutions below read the same
+    // answer (`tool-execution.ts:84-101`).
+    let builtin = builtin_kind(&run.name);
+    // `hasRendererDefinition()` — `builtInToolDefinition !== undefined || toolDefinition !==
+    // undefined` (`tool-execution.ts:103-105`). A registered RENDERER can only have come from a
+    // definition, so either rendered side implies one; the rest is what the session's own
+    // `getToolDefinition(name)` answered when the run started ([`ToolRun::has_definition`]).
+    let has_definition =
+        run.has_definition || run.rendered_call.is_some() || run.rendered_result.is_some();
+    if builtin.is_none() && !has_definition {
+        // The `else` of `hasRendererDefinition()`: the unbounded `formatToolExecution()`
+        // (`tool-execution.ts:330-333`). Nothing at all is known about this tool name.
+        render_generic(run, theme, &mut block);
     } else {
-        match run.name.as_str() {
-            "read" => render_read(run, expanded, theme, images, &mut block),
-            "write" => render_write(run, expanded, theme, images, &mut block),
-            "edit" => render_edit(run, theme, images, &mut block),
-            "bash" => render_bash(run, expanded, theme, images.expand_key, "$", &mut block),
-            "powershell" => render_bash(run, expanded, theme, images.expand_key, "PS>", &mut block),
-            "grep" => render_grep(run, expanded, theme, images.expand_key, &mut block),
-            "find" => render_find(run, expanded, theme, images.expand_key, &mut block),
-            "ls" => render_ls(run, expanded, theme, images, &mut block),
-            _ => render_generic(run, theme, &mut block),
+        // EXT-006 / `updateDisplay` (`tool-execution.ts:272-330`): the call side and the result
+        // side are resolved SEPARATELY, each preferring the extension's renderer, then the
+        // built-in's, then the matching fallback. Resolving them together is what used to leave an
+        // extension that registered only `renderCall` with no body at all, and what sent every
+        // defined-but-unrendered tool through `formatToolExecution`.
+        match &run.rendered_call {
+            Some(call) => render_extension_call(call, theme, &mut block),
+            None => match builtin {
+                Some(kind) => render_builtin_call(kind, run, expanded, theme, images, &mut block),
+                // `createCallFallback()` (`:137-139`, selected at `:281-283`).
+                None => render_call_fallback(run, theme, &mut block),
+            },
+        }
+        match &run.rendered_result {
+            Some(result) => render_extension_result(result, run, expanded, theme, &mut block),
+            None => match builtin {
+                Some(kind) => render_builtin_result(kind, run, expanded, theme, images, &mut block),
+                // `createResultFallback()` (`:141-155`, selected at `:298-304`). Upstream reaches
+                // it only inside `if (this.result)` (`:295`); the fallback makes the same check.
+                None => {
+                    render_result_fallback(run, expanded, theme, images.expand_key, &mut block)
+                }
+            },
         }
     }
     // `image` content blocks (`tool-execution.ts:330-350`). Pi adds a real `Image` component per

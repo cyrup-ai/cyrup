@@ -59,6 +59,7 @@ fn project_roots(cwd: &Path) -> DiscoveryRoots {
         project_cwd: Some(cwd.to_path_buf()),
         agent_dir: None,
         configured: vec![],
+        disabled: Vec::new(),
     }
 }
 

@@ -205,6 +205,89 @@ impl AgentSession {
         self.manager.lock().await.build_context_raw()
     }
 
+    /// [`raw_context_messages`](Self::raw_context_messages) plus the two derived notices a replay
+    /// cannot reconstruct from the messages alone — pi's `renderSessionEntries` flat-map
+    /// (`modes/interactive/interactive-mode.ts:3781-3796` @v0.83.0) together with the cache-miss
+    /// re-injection its `renderSessionItems` performs (`:3694-3696`, `:3753-3755`).
+    ///
+    /// **Why this is a session method and not a front-end walk.** The two facts are keyed in index
+    /// spaces the front-end never holds at once:
+    ///
+    /// * [`cyrup_provider::cache_stats::collect_cache_misses`] keys by index into the FLAT entry
+    ///   list (its own module doc explains why it cannot key by message), while the replay stream
+    ///   is the current branch's post-compaction-admission projection — unrelated index spaces that
+    ///   pi bridges with `AssistantMessage` object identity.
+    /// * `usage` lives on the compaction / branch-summary ENTRY
+    ///   (`cyrup-session/src/entry.rs`); the projected `CompactionSummaryMessage` /
+    ///   `BranchSummaryMessage` carry only the summary text, so the cost is gone by the time a
+    ///   `Vec<AgentMessage>` reaches the caller.
+    ///
+    /// [`cyrup_session::manager::SessionManager::build_context_raw_tagged`] carries the
+    /// [`cyrup_core::EntryId`] that joins both, under the one manager lock the misses are scanned
+    /// under.
+    ///
+    /// The aborted/errored exclusion on the cache-miss re-injection is pi's own (`:3752`).
+    /// Gating on `showCacheMissNotices` is NOT done here: pi gates at each render site, and the
+    /// front-end owns that setting's live value.
+    pub async fn replay_items(&self) -> Vec<crate::session::ReplayItem> {
+        use crate::session::{CompactionCostKind, ReplayItem};
+        use cyrup_core::{EntryId, Message, StopReason, Usage};
+        use cyrup_session::agent_message::AgentMessage;
+        use cyrup_session::entry::{Entry, KnownEntry};
+        use std::collections::HashMap;
+
+        let models = self.full_model_registry();
+        let mgr = self.manager.lock().await;
+        let entries = mgr.entries();
+        // The miss scan runs over EVERY entry — a compaction is a scan reset, so restricting it to
+        // the branch projection would change the answer (`cache_stats.rs:110-115`).
+        let scan = crate::state::cache_scan_entries(entries);
+        let misses: HashMap<EntryId, cyrup_provider::cache_stats::CacheMiss> =
+            cyrup_provider::cache_stats::collect_cache_misses(&scan, &models)
+                .into_iter()
+                .filter_map(|(i, miss)| entries.get(i).map(|e| (e.id(), miss)))
+                .collect();
+        let costs: HashMap<EntryId, (CompactionCostKind, Usage)> = entries
+            .iter()
+            .filter_map(|e| match e {
+                Entry::Known(KnownEntry::Compaction { usage: Some(u), .. }) => {
+                    Some((e.id(), (CompactionCostKind::Compaction, u.clone())))
+                }
+                Entry::Known(KnownEntry::BranchSummary { usage: Some(u), .. }) => {
+                    Some((e.id(), (CompactionCostKind::BranchSummary, u.clone())))
+                }
+                _ => None,
+            })
+            .collect();
+
+        let tagged = mgr.build_context_raw_tagged();
+        let mut out = Vec::with_capacity(tagged.len());
+        for (id, message) in tagged {
+            // Resolved BEFORE the message moves into the stream; emitted after it, which is pi's
+            // order at both sites.
+            let notice = match &message {
+                AgentMessage::Core(Message::Assistant(a))
+                    if !matches!(a.stop_reason, StopReason::Aborted | StopReason::Error) =>
+                {
+                    misses.get(&id).copied().map(ReplayItem::CacheMiss)
+                }
+                // A summary entry with no `usage`, or one whose summary was empty and therefore
+                // projected no message at all, contributes nothing — pi's
+                // `entry.usage && messages.length > 0` (`:3791`).
+                AgentMessage::CompactionSummary(_) | AgentMessage::BranchSummary(_) => costs
+                    .get(&id)
+                    .cloned()
+                    .map(|(kind, usage)| ReplayItem::CompactionCost { kind, usage }),
+                _ => None,
+            };
+            out.push(ReplayItem::Message(Box::new(message)));
+            if let Some(notice) = notice {
+                out.push(notice);
+            }
+        }
+        out
+    }
+
     /// The id of the current branch leaf (Pi `sessionManager.getLeafId()`, agent-session.ts:2705).
     /// `None` before any entry exists / after a reset-to-root. Drives the `/tree` overlay's
     /// current-position marker and its `navigate_tree` no-op guard.

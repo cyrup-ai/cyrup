@@ -38,9 +38,9 @@ use std::sync::Arc;
 pub use cyrup_core::PackageId;
 
 pub use discovery::{
-    CliResourcePaths, DiscoveredPaths, DiscoveryConfig, DiscoveryReport, Named, ResourceOverrides,
-    ResourceRegistry, ResourceSet, discover, discover_append_system_prompt_file,
-    discover_system_prompt_file, scope_base_dir,
+    CliResourcePaths, DiscoveredPaths, DiscoveryConfig, DiscoveryReport, LooseExtension, Named,
+    ResourceOverrides, ResourceRegistry, ResourceSet, discover, discover_append_system_prompt_file,
+    discover_system_prompt_file, scan_loose_extension_root, scope_base_dir,
 };
 pub use error::{
     Collision, DiagnosticType, ResourceDiagnostic, ResourceError, ResourceKind, ResourceWarning,

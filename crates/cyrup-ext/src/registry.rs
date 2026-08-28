@@ -530,6 +530,18 @@ impl ExtensionRegistry {
         Ok(self.lock_read()?.markdown_transformers.clone())
     }
 
+    /// Whether ANY extension registered a markdown transformer — the same question
+    /// [`Self::markdown_transformer_owners`] answers, without cloning the owner list.
+    ///
+    /// Exists for the per-delta streaming pre-check
+    /// ([`crate::ExtensionHost::has_markdown_transformers`]): pi captures its
+    /// `getMarkdownTransformers()` array once per message component
+    /// (`extensions/runner.ts:589-591` @v0.84.1), whereas cyrup asks per streamed chunk, so the
+    /// answer must not allocate.
+    pub fn has_markdown_transformers(&self) -> Result<bool, ExtError> {
+        Ok(!self.lock_read()?.markdown_transformers.is_empty())
+    }
+
     /// Record that `owner` subscribed to raw terminal input (EXT-021; pi
     /// `onTerminalInput(handler)`, `extensions/types.ts:145` @v0.83.0). Idempotent, matching
     /// upstream's `Set.add`.

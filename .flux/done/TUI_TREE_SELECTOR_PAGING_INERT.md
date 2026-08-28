@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Make `/tree` Page By A Screenful On PageUp/PageDown And ←/→, And Window Its Body So Paging Is Visible

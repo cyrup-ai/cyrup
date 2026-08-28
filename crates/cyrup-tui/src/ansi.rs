@@ -138,7 +138,10 @@ pub(crate) fn sgr_line(input: &str) -> Line<'static> {
             && let Some(end) = try_csi(rest)
         {
             // The sequence body is everything the scanner consumed; SGR is the `m`-terminated one.
-            let consumed = &rest[..rest.len() - end.len()];
+            // `try_csi` returns a suffix OF `rest`, so stripping it off yields exactly the consumed
+            // prefix — and does so without a byte-index slice (`clippy::string_slice` is denied).
+            // The `unwrap_or("")` arm is unreachable for that reason; an empty body is inert here.
+            let consumed = rest.strip_suffix(end).unwrap_or("");
             if consumed.ends_with('m') {
                 flush(&mut spans, &mut pending, style);
                 style = apply_sgr(style, consumed);
@@ -169,7 +172,11 @@ fn apply_sgr(mut style: Style, seq: &str) -> Style {
     let codes: Vec<&str> = body.split(&[';', ':'][..]).collect();
     let mut i = 0;
     while i < codes.len() {
-        match codes[i] {
+        // Read through `get` rather than `[]`: the `while` guard already proves `i` is in range,
+        // but `clippy::indexing_slicing` is denied crate-wide and a `let ... else` carries the
+        // proof in the types.
+        let Some(code) = codes.get(i) else { break };
+        match *code {
             "0" | "" => style = Style::default(),
             "1" => style = style.add_modifier(Modifier::BOLD),
             "2" => style = style.add_modifier(Modifier::DIM),

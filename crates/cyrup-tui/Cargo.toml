@@ -128,6 +128,14 @@ serde_json = { workspace = true }
 # rendered before the write lands — the preview MUST share the tool's own matching core, or it
 # would show a diff the tool then contradicts. Points downward: cyrup-tools sits below cyrup-tui.
 cyrup-tools = { workspace = true }
+# `/resume`'s `re:<pattern>` search mode (`session_search.rs`) — the Rust stand-in for pi's
+# `new RegExp(pattern, "i")` (`session-selector-search.ts:51`). Declared per-crate at the same pin
+# the workspace already uses (`crates/cyrup-ext/Cargo.toml:44`, `crates/cyrup-mcp/Cargo.toml:120`);
+# the root `[workspace.dependencies]` table has no `regex` entry, so a per-crate edge matches
+# existing practice. Resolves nothing new: `Cargo.lock` already pins `regex 1.12.4`. Rust's `regex`
+# is a finite automaton — no backtracking blowup on a user-typed pattern — and is `unsafe`-free at
+# this crate's `#![forbid(unsafe_code)]`.
+regex = "1.12.4"
 
 [dev-dependencies]
 cyrup-provider = { workspace = true, features = ["faux"] }
