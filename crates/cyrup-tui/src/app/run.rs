@@ -415,7 +415,7 @@ impl App<InlineBackend<Stdout>> {
         // The frame afterwards is what re-establishes the inline viewport at the bottom of the
         // restored main screen, exactly as the first frame of any session does; `?` is deliberately
         // not used, because a cosmetic failure here must not swallow `drain_and_restore`.
-        if self.stop_fullscreen() {
+        if self.stop_fullscreen(false) {
             let _ = self.draw_synchronized();
         }
         // pi `interactive-mode.ts:3589-3591`: drain, THEN stop. The drain MUST happen here, before

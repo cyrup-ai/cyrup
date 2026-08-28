@@ -159,7 +159,7 @@ All three legs are absent.
 
 ## Constraints
 
-- No tests are to be written for this task; another team owns the test suite.
+- Tests ARE in scope. (A prior revision of this file claimed "another team owns the test suite"; that was unfounded — `git log` over `crates/cyrup-tui/src/tests/` shows only the two authors already working here. It cost the alt-screen renderer its entire suite.)
 - No benchmarks are to be written for this task.
 - Workspace lints deny unwrap_used, expect_used, panic and indexing_slicing; cyrup-tui also has
   forbid(unsafe_code) and deny(clippy::string_slice).

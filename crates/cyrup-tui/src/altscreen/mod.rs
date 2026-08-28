@@ -42,18 +42,13 @@
 //! exactly that prefix (`scrollbarDrag` at `tui-alt-screen.ts:192` against `selectionDragPointer`
 //! at `:188`).
 //!
-//! # The mouse dispatcher exists; the reports do not reach it
+//! # The mouse dispatcher and what reaches it
 //! [`AltScreen::handle_mouse`] is the `match` that offers a
 //! [`ratatui::crossterm::event::MouseEvent`] to [`wheel::route`], [`scrollbar_drag::route`] and
-//! [`selection::route`] in upstream's order (`tui-alt-screen.ts:564-575`), and it is called from
-//! nowhere — because nothing produces a `MouseEvent` for it to be called with.
-//! [`mouse::map_reader_event`] still answers `None` for every report even with reporting armed,
-//! and its own doc says why: [`crate::InputEvent`] has no `Mouse` variant, so there is nothing for
-//! the armed branch to return. Adding one is a single line in `component.rs` plus the single line
-//! in `mouse.rs` that returns it; until both land, [`wheel`], [`scrollbar_drag`] and the pointer
-//! half of [`selection`] are reachable code with no input, and §B-8's
-//! [`selection::PointerOutcome::Copy`] / [`selection::PointerOutcome::Paste`] have no caller to
-//! finish them.
+//! [`selection::route`] in upstream's order (`tui-alt-screen.ts:564-575`). It is called from
+//! `app/input.rs`'s `InputEvent::Mouse` arm; [`mouse::map_reader_event`] produces that event from a
+//! crossterm report whenever reporting is armed, and answers `None` otherwise, which is what keeps
+//! the inline renderer byte-identical to the unconditional discard it replaced.
 //!
 //! [`scrollbar_drag`] waits on that same dispatcher, and on the `AltUi` bag besides: its
 //! [`scrollbar_drag::DragState`] is the live thumb grab pi holds as `scrollbarDrag`
@@ -62,11 +57,11 @@
 //! upstream's order and not a preference (`:565-575`); [`scrollbar_drag::update_hover`] from the
 //! wheel path, where scrolling moves the thumb out from under a stationary pointer (`:685`); and
 //! [`scrollbar_drag::cancel`] from the `FocusLost` arm (`:548-549`) and from both ends of the
-//! alternate-screen excursion (`:260-261`, `:301-302`). Until those land the drag holds nothing,
-//! because no report reaches it.
+//! alternate-screen excursion (`:260-261`, `:301-302`). All three are wired
+//! ([`AltScreen::handle_mouse`] and [`AltScreen::handle_focus_lost`]).
 //!
-//! [`selection`] waits on that dispatcher too, and owes it five positions — three of them the same
-//! arms [`scrollbar_drag`] names, immediately behind it. [`selection::route`] takes the press, drag
+//! [`selection`] sits behind that dispatcher in five positions — three of them the same arms
+//! [`scrollbar_drag`] names, immediately behind it. [`selection::route`] takes the press, drag
 //! and release [`scrollbar_drag::route`] declined, which is upstream's `if (!handled)
 //! this.handleSelectionMouseEvent(event)` (`tui-alt-screen.ts:575`); a report the scrollbar DID
 //! claim calls [`selection::cancel`] instead, which is upstream clearing every selection field when
@@ -118,33 +113,35 @@
 //!
 //! [`images::ImageLifecycle`] is the fourth piece of ownerless state, and the one with the tightest
 //! call-site contract: it is pi's `imageProtocol`/`savedCapabilities`/`uploadedKittyImages` triple
-//! (`tui-alt-screen.ts:180-182`), and §B-3's renderer owes it four positions, all of which upstream
-//! fixes. [`images::ImageLifecycle::enter`] runs immediately after `terminal::AltTerminal::enter`
+//! (`tui-alt-screen.ts:180-182`), and the renderer drives it from four positions, all of which
+//! upstream fixes. [`images::ImageLifecycle::enter`] runs immediately after `terminal::AltTerminal::enter`
 //! (`:264-270`); [`images::place`] paints the attachment strip on every frame — **instead of**
 //! `crate::app::render_images`, which is the whole of the "no iterm2 image while the alt screen is
 //! active" guarantee, since that painter is the crate's only emitter of a native graphics protocol;
 //! [`images::ImageLifecycle::delete_all`] runs immediately before `terminal::TerminalSetup::leave`
 //! and takes the same `preserve_screen` flag (`:306-308`); and
-//! [`images::ImageLifecycle::restore`] runs after it (`:330-333`). Until those land the lifecycle
-//! is never constructed, so the capability global, the transcript's image gate and the inline strip
-//! are untouched — regular mode is byte-identical to what it was before this wave.
+//! [`images::ImageLifecycle::restore`] runs after it (`:330-333`). The lifecycle is constructed in
+//! [`AltScreen::build`], so those four positions are live; regular mode never constructs one, which
+//! is what leaves the capability global, the transcript's image gate and the inline strip untouched
+//! there.
 //!
-//! [`exit::repaint`] is the last of the arms waiting on a call site, and the only one whose call
-//! site is not the renderer but [`terminal`]: it fills the row loop `terminal::TerminalSetup::leave`
-//! marks in its `preserve_screen == false` branch, between the `LeaveAlternateScreen` that has just
-//! restored the user's main screen and the `\x1b[0m` + autowrap-back + `\r\n` that close the
-//! repaint — upstream's `:322-327` with the rows put back. Wiring it needs one thing `leave` does
-//! not have today: the rendered document, which is §B-5's per-frame cache and reaches the teardown
-//! only if `leave` (or `AltTerminal::leave` above it) takes it as a `&[ratatui::text::Line<'static>]`
-//! parameter, the way [`prompt_nav`] takes the same cache rather than holding it (rule 2 below).
-//! That threading is `terminal.rs`'s and `AltScreen::stop`'s, so §B-13 landed the writer and left
-//! the two signatures to the units that own those files. Until it lands nothing calls
-//! [`exit::repaint`], and the flag half of §B-13 — the removal of the ADR-0005 §A-2 interim refusal
-//! that `crates/cyrup/src/main.rs` printed for `--tui-mode fullscreen` — is already done, so the
-//! flag is accepted silently and still runs the inline renderer until §B-14's composition root
-//! (`crates/cyrup/src/interactive.rs`) selects the other one.
+//! [`exit::repaint`]'s call site is not the renderer but [`terminal`]: it fills the row loop
+//! `terminal::TerminalSetup::leave` marks in its `preserve_screen == false` branch, between the
+//! `LeaveAlternateScreen` that has just restored the user's main screen and the `\x1b[0m` +
+//! autowrap-back + `\r\n` that close the repaint — upstream's `:322-327` with the rows put back.
+//! `AltTerminal::leave` and `TerminalSetup::leave` take the rendered document as a
+//! `&[ratatui::text::Line<'static>]` parameter, the way [`prompt_nav`] takes the same cache rather
+//! than holding it (rule 2 below), and [`AltScreen::stop`] threads it down.
 //!
-//! # Two structural rules the skeleton owes its siblings
+//! **That branch does not run today, and the reason is not this module's.** `preserve_screen` is
+//! fixed at construction and the only construction site (`app/mode_switch.rs`) passes `true`, so
+//! every teardown — the live mode switch AND session exit, which share `stop_fullscreen()` — takes
+//! the `true` branch and skips the repaint. Making it reachable means deciding `preserve_screen`
+//! per teardown rather than per renderer: `true` for a mode switch, where another renderer takes
+//! the same terminal, and `false` for a real exit, where the transcript belongs in scrollback.
+//! Filed as `ALT_SCREEN_EXIT_REPAINT_UNREACHABLE`.
+//!
+//! # Two structural rules this module holds its siblings to
 //! Recorded here because they are what keeps twelve units out of one another's files, and because
 //! both are compile errors rather than preferences:
 //!
@@ -167,6 +164,11 @@ mod exit;
 mod flash;
 mod images;
 mod keys;
+mod out;
+/// Escape-capture handles, re-exported for `crate::tests` — `mod out` is private and the test
+/// modules live outside this tree (`src/tests/mod.rs` explains the convention).
+#[cfg(test)]
+pub(crate) use out::{captured_text, Captured};
 /// `pub(crate)`, unlike its siblings, for one item: `mouse::map_reader_event` is called from
 /// `app/input_reader.rs`, which is outside this module tree (ADR-0005 §B-4). Everything else in it
 /// stays `pub(super)` and reachable only from here.
@@ -303,7 +305,6 @@ pub trait ViewportRenderer {
 
 // ---- the renderer -------------------------------------------------------------------------------
 
-use std::io::Write as _;
 use std::time::Instant;
 
 use ratatui::backend::Backend;
@@ -337,20 +338,6 @@ pub struct AltScreen<B: Backend> {
     /// The mouse reporting enabled on entry, disabled on the way out (§B-4).
     mouse: mouse::MouseSetup,
     theme: UiTheme,
-    /// `preserveScreen` — a mode switch (§B-14) rather than an exit, so §B-13 skips the repaint.
-    ///
-    /// **`false` is not usable yet, and the composition root passes `true` for that reason rather
-    /// than as a policy choice.** [`Self::stop`] runs [`exit::repaint`] *before*
-    /// `terminal::AltTerminal::leave`, i.e. while the alternate screen is still up — so the rows go
-    /// onto the screen the very next escape discards, and all the `false` branch would deliver is
-    /// `terminal.rs`'s framing (`ResetColor` + autowrap + a bare `\r\n`) with no conversation under
-    /// it. Upstream's order is the other way round (`tui-alt-screen.ts:322-327`: the row loop sits
-    /// *inside* `afterTerminalStop`, after `LeaveAlternateScreen`), and both [`exit`]'s and
-    /// [`terminal`]'s module docs already prescribe the fix: `AltTerminal::leave` — and
-    /// `TerminalSetup::leave` under it — take the document as a `&[Line<'static>]` and write the
-    /// rows between their `DisableLineWrap` and their closing `ResetColor`. Until that lands,
-    /// entering with `true` is the only branch that leaves the user's screen in a defined state.
-    preserve_screen: bool,
     /// `this.layoutRoot` (`tui-alt-screen.ts:238-247`).
     layout_root: Option<Box<dyn Component>>,
     /// Scroll offset, follow-end and the viewport geometry (§B-5).
@@ -403,26 +390,147 @@ impl<B: Backend> AltScreen<B> {
     /// Propagates a terminal failure from [`terminal::AltTerminal::enter`] or from enabling mouse
     /// reporting. Either unwinds through the already-armed restore guard, so a failure here leaves
     /// the user on their original screen.
-    pub(crate) fn enter(backend: B, theme: UiTheme, preserve_screen: bool) -> Result<Self, TuiError> {
-        let term = terminal::AltTerminal::enter(backend)?;
-        let mouse = mouse::MouseSetup::enable()?;
+    pub(crate) fn enter(backend: B, theme: UiTheme) -> Result<Self, TuiError> {
+        // One sink, cloned into each guard, so every escape this renderer emits lands in one
+        // ordered stream. In production every clone is `io::stdout()`; under `for_test` they all
+        // share a capture buffer.
+        let out = out::Out::default();
+        Self::build(backend, theme, out)
+    }
+
+    /// The shared body of [`Self::enter`] and (in test builds) `for_test`, parameterised only by
+    /// where the escapes go.
+    fn build(backend: B, theme: UiTheme, out: out::Out) -> Result<Self, TuiError> {
+        let term = terminal::AltTerminal::enter(backend, out.clone())?;
+        let mouse = mouse::MouseSetup::enable(out.clone())?;
+        let images = images::ImageLifecycle::new(out.clone());
         Ok(Self {
             term,
             mouse,
             theme,
-            preserve_screen,
             layout_root: None,
             scroll: scroll::ScrollState::default(),
             bar: scroll::ScrollbarView::default(),
             drag: scrollbar_drag::DragState::default(),
             selection: selection::SelectionState::default(),
             flashes: flash::FlashStack::default(),
-            images: images::ImageLifecycle::default(),
+            images,
             doc: Vec::new(),
             row_starts: Vec::new(),
             doc_key: None,
             doc_dropped: 0,
         })
+    }
+
+    /// Build a renderer whose escapes are CAPTURED instead of written — the counterpart to pi's
+    /// `new TuiAltScreen(new VirtualTerminal(w, h))` (`test/tui-alt-screen.test.ts:58-59`).
+    ///
+    /// The full [`Self::build`] path runs, terminal setup included, so the `?1049h`/`?7l`/`?25l`
+    /// that `TerminalSetup::enter` emits and the mouse-mode string `MouseSetup::enable` emits are
+    /// both in the returned buffer and assertable. Nothing reaches the real terminal, so this does
+    /// NOT switch the `cargo test` process to the alternate screen.
+    ///
+    /// # Errors
+    /// Propagates the same failures as [`Self::enter`]; with a capture sink neither write can fail,
+    /// so in practice only `Terminal::new` can.
+    #[cfg(test)]
+    pub(crate) fn for_test(
+        backend: B,
+        theme: UiTheme,
+    ) -> Result<(Self, out::Captured), TuiError> {
+        let (sink, captured) = out::Out::capture();
+        // Teardown tests pass their own `preserve_screen` to [`Self::stop`]; upstream's case
+        // (`test/tui-alt-screen.test.ts:1336`) is the repainting one.
+        let alt = Self::build(backend, theme, sink)?;
+        Ok((alt, captured))
+    }
+
+    /// Hand over a document without a [`crate::TranscriptView`] — the `text.setText(...)` +
+    /// `tui.requestRender()` pair upstream uses (`test/tui-alt-screen.test.ts:81-82`).
+    ///
+    /// [`Self::set_document`] exists to reconcile against a transcript's front-trim reports, which
+    /// a fixture has none of; this is the same hand-over with that reconciliation skipped.
+    #[cfg(test)]
+    pub(crate) fn set_document_for_test(&mut self, lines: Vec<Line<'static>>, row_starts: Vec<usize>) {
+        let rows = lines.len();
+        self.doc = lines;
+        self.row_starts = row_starts;
+        // `draw` runs this every frame; doing it here too lets a test assert on `viewport_top` and
+        // `max_scroll_top` before the first paint, as upstream does off `getViewport()`.
+        let height = self.term.terminal_mut().size().map(|s| s.height).unwrap_or(0);
+        scroll::update_layout(&mut self.scroll, rows, usize::from(height));
+    }
+
+    /// Park the viewport at an exact row — pi's `scrollView.scrollTo(row)` (`:420`), which is the
+    /// landing [`prompt_nav`] performs and therefore the only way to set a walk up from a known
+    /// offset. `scroll_by` moves by a delta and `scroll_to_top`/`scroll_to_bottom` reach only the
+    /// ends, so neither can place the viewport between two prompts.
+    #[cfg(test)]
+    pub(crate) fn scroll_to_row_for_test(&mut self, row: usize) {
+        scroll::scroll_to_row(&mut self.scroll, row);
+    }
+
+    /// The rendered cells, for viewport assertions — upstream's `terminal.getViewport()`
+    /// (`test/virtual-terminal.ts:150`).
+    #[cfg(test)]
+    pub(crate) fn backend_for_test(&mut self) -> &B {
+        self.term.terminal_mut().backend()
+    }
+
+    /// The largest legal scroll offset, for clamp assertions — [`scroll::max_scroll_top`].
+    #[cfg(test)]
+    pub(crate) fn max_scroll_top_for_test(&self) -> usize {
+        scroll::max_scroll_top(&self.scroll)
+    }
+
+    /// The content width after the scrollbar's reservation — [`scroll::content_width`], pi's
+    /// `getContentWidth` (`components/scroll-view.ts:86-88`): `always` narrows by one column,
+    /// `auto` and `hidden` do not.
+    #[cfg(test)]
+    pub(crate) fn content_width_for_test(&self, width: u16) -> u16 {
+        scroll::content_width(&self.bar, width)
+    }
+
+    /// The scrollbar policy in force — [`scroll::mode`], pi's `get scrollbar()`
+    /// (`components/scroll-view.ts:67-69`).
+    #[cfg(test)]
+    pub(crate) fn scrollbar_mode_for_test(&self) -> ScrollbarMode {
+        scroll::mode(&self.bar)
+    }
+
+    /// The negotiated image protocol — [`images::ImageLifecycle::protocol`], pi's `imageProtocol`
+    /// (`tui-alt-screen.ts:180`).
+    #[cfg(test)]
+    pub(crate) fn image_protocol_for_test(&self) -> Option<crate::image::ImageProtocol> {
+        self.images.protocol()
+    }
+
+    /// How many kitty uploads are retained — [`images::PlacementRegistry::tracked`], pi's
+    /// `uploadedKittyImages.size` (`:1305`).
+    #[cfg(test)]
+    pub(crate) fn tracked_images_for_test(&self) -> usize {
+        self.images.placements().tracked()
+    }
+
+    /// The first rendered row — pi's `TuiAltScreen.viewportTop` (`tui-alt-screen.ts:230-232`).
+    ///
+    /// `#[cfg(test)]` because it is an OBSERVATION POINT, not production surface: every one of
+    /// upstream's ~25 references to it is in `test/tui-alt-screen.test.ts`. Gating it states that
+    /// plainly and keeps the lib build free of a dead-code warning that would otherwise stand in
+    /// for "a caller is missing" when none is.
+    #[cfg(test)]
+    pub(crate) fn viewport_top(&self) -> usize {
+        scroll::scroll_top(&self.scroll)
+    }
+
+    /// Whether the view is pinned to the tail — pi's `TuiAltScreen.isFollowingOutput`
+    /// (`tui-alt-screen.ts:234-236`), the second of upstream's two scroll observation points.
+    ///
+    /// `#[cfg(test)]` for the reason [`Self::viewport_top`] gives: upstream's only three references
+    /// are all in its test file.
+    #[cfg(test)]
+    pub(crate) fn is_following_output(&self) -> bool {
+        scroll::is_following_end(&self.scroll)
     }
 
     /// Hand over this frame's rendered document and its entry→row map, reconciling the scroll
@@ -635,6 +743,13 @@ impl<B: Backend> AltScreen<B> {
         let viewport = Rect { width: content_width, ..area };
         scrollbar_drag::update_hover(&mut self.bar, &mut self.scroll, ev.column, ev.row, area);
         if scrollbar_drag::route(&mut self.drag, &mut self.bar, &mut self.scroll, ev, area) {
+            // A report the scrollbar CLAIMED clears every selection field, which is upstream
+            // clearing them when a thumb grab begins (`tui-alt-screen.ts:776-784`) — the pointer
+            // now belongs to the thumb, so an in-flight selection must end rather than be extended
+            // by a gesture that is no longer over the document. This module's own doc has always
+            // specified this arm; it was declared and left uncalled, which is what left
+            // `selection::cancel` dead and the behaviour missing.
+            selection::cancel(&mut self.selection);
             return selection::PointerOutcome::Handled;
         }
         match selection::route(&mut self.selection, &self.scroll, &self.doc, viewport, ev) {
@@ -647,6 +762,18 @@ impl<B: Backend> AltScreen<B> {
             }
             other => other,
         }
+    }
+
+    /// A resize is this renderer's FULL REDRAW — pi's `fullRedraw` image arm
+    /// (`tui-alt-screen.ts:1310-1316`).
+    ///
+    /// ratatui's `autoresize` throws away its previous buffer and repaints every cell, but kitty
+    /// placements are written with graphics escapes that live outside that buffer model, so they
+    /// survive at their old coordinates on top of the new layout unless they are explicitly
+    /// unpinned. [`images::ImageLifecycle::clear_placements_for_redraw`] makes upstream's choice
+    /// between retaining and freeing the uploads.
+    pub(crate) fn handle_resize(&mut self) {
+        self.images.clear_placements_for_redraw();
     }
 
     /// Focus loss cancels a live drag and a live selection — pi's `FOCUS_OUT` handling
@@ -664,15 +791,40 @@ impl<B: Backend> AltScreen<B> {
     /// (`tui-alt-screen.ts:303`, via `components/alt-screen-flash.ts:38-41`). Nothing repaints
     /// after this point, so it is bookkeeping rather than a visible step, but it keeps the
     /// teardown a faithful pair for [`ViewportRenderer::flash`]'s queue.
-    pub(crate) fn stop(&mut self) {
+    pub(crate) fn stop(&mut self, preserve_screen: bool) {
         flash::clear(&mut self.flashes);
-        self.images.delete_all(self.preserve_screen);
+        self.images.delete_all(preserve_screen);
         let width = self.term.terminal_mut().size().map(|s| s.width).unwrap_or(0);
-        let mut out = std::io::stdout();
-        exit::repaint(&mut out, &self.doc, width, self.preserve_screen);
-        let _ = out.flush();
         self.mouse.disable();
-        self.term.leave(self.preserve_screen);
+        // pi's `dispose()` (`components/alt-screen-flash.ts:38-41`) on the way out
+        // (`tui-alt-screen.ts:303`), so a notice queued in this excursion cannot survive into the
+        // next one. The `:262` entry-side clear needs no call here: `enter` builds a fresh
+        // `FlashStack::default()`, so an entering renderer starts empty by construction.
+        flash::clear(&mut self.flashes);
+        // `preserve_screen` is the CALLER's, not this renderer's: both of cyrup's teardowns need the
+        // repaint, because the fullscreen frame path drains the transcript's pending queue and drops
+        // it (`app/draw.rs`), so `self.doc` is the only surviving copy of the excursion's history.
+        // Upstream reaches the same outcome by another route — `switchTuiMode` stops the alternate
+        // screen with `preserveScreen: true` and lets the regular renderer re-render the shared chat
+        // container (`interactive-mode.ts:833-840`) — which cyrup cannot do, because its committed
+        // entries leave the app for the terminal's own scrollback. `true` remains correct for an
+        // unwind, where there is no document to trust; `TerminalSetup::Drop` passes it.
+        // The document goes to `leave`, not to a write before it: `exit::repaint` must land AFTER
+        // `LeaveAlternateScreen` or the rows are painted onto the alternate screen and torn down
+        // with it — pi writes them inside `afterTerminalStop` (`tui-alt-screen.ts:322-327`) for
+        // exactly that reason.
+        self.term.leave(preserve_screen, &self.doc, width);
+    }
+
+    /// The current selection's text, for ADR-0005 §B-11's `/copy` — upstream asks
+    /// `getSelectionBounds() !== undefined` before choosing what to copy (`tui-alt-screen.ts:545`).
+    ///
+    /// `None` when nothing is selected, which is the caller's signal to fall back to the last
+    /// assistant message.
+    pub(crate) fn selection_text(&self) -> Option<String> {
+        selection::has_selection(&self.selection)
+            .then(|| selection::selected_text(&self.selection, &self.doc))
+            .flatten()
     }
 }
 

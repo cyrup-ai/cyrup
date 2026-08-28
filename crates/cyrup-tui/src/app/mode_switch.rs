@@ -366,7 +366,12 @@ impl<B: RebuildBackend> App<B> {
             // main screen's arrival needs is `restoreRenderState` (`:871-873`). What there IS to do
             // is take the alternate screen down, which is [`Self::stop_fullscreen`]'s whole body.
             TuiRenderMode::Regular => {
-                self.stop_fullscreen();
+                // `false`: the excursion's history has to land in native scrollback before the inline
+                // renderer resumes below it. Upstream can pass `preserveScreen: true` here
+                // (`interactive-mode.ts:857`) because its regular renderer re-renders the shared chat
+                // container; cyrup's committed entries have already left the app for the terminal, so
+                // the repaint is the only thing that carries them across.
+                self.stop_fullscreen(false);
                 self.restore_main_screen_render_state(saved);
                 true
             }
@@ -392,12 +397,39 @@ impl<B: RebuildBackend> App<B> {
     fn enter_fullscreen(&mut self) -> bool {
         let backend = self.terminal.backend().rebuild();
         let theme = self.state.theme.clone();
-        // `preserve_screen: true` — pi's `TuiStopOptions.preserveScreen` (`tui.ts:286-289`), and
-        // the only branch that is correct today; see the field's own doc in `altscreen/mod.rs` for
-        // why the `false` branch cannot be reached until `terminal.rs` takes the document.
-        let Ok(mut alt) = AltScreen::enter(backend, theme, true) else {
+        let Ok(alt) = AltScreen::enter(backend, theme) else {
             return false;
         };
+        self.adopt_fullscreen_renderer(alt);
+        true
+    }
+
+    /// [`Self::enter_fullscreen`] over a capture sink — the `App`-level twin of
+    /// [`crate::AltScreen::for_test`], and the only way a test can reach the fullscreen frame path
+    /// without switching the `cargo test` process to the alternate screen.
+    ///
+    /// It exists because the teardown's failure mode is an INTERACTION, not a unit: `draw_fullscreen`
+    /// drains the transcript's pending queue and drops it (`app/draw.rs`), and [`Self::stop_fullscreen`]
+    /// clears the retained document one line after `stop`. Each is locally correct; together they once
+    /// destroyed the excursion's history. No test below `App` can observe that, because the drain and
+    /// the clear never meet there.
+    ///
+    /// Returns the handle the escapes land in, or `None` if the renderer could not be built. Only the
+    /// construction differs from the production path — everything after it runs
+    /// [`Self::adopt_fullscreen_renderer`], the same code, so this seam cannot drift from what it
+    /// stands in for.
+    #[cfg(test)]
+    pub(crate) fn enter_fullscreen_captured(&mut self) -> Option<crate::altscreen::Captured> {
+        let backend = self.terminal.backend().rebuild();
+        let theme = self.state.theme.clone();
+        let (alt, captured) = AltScreen::for_test(backend, theme).ok()?;
+        self.adopt_fullscreen_renderer(alt);
+        Some(captured)
+    }
+
+    /// Everything [`Self::enter_fullscreen`] does after the renderer exists, shared with
+    /// [`Self::enter_fullscreen_captured`] so the two cannot diverge.
+    fn adopt_fullscreen_renderer(&mut self, mut alt: AltScreen<B>) {
         // §B-12, pi `:264-270` — immediately after entering, before the first frame: latch the
         // terminal's protocol and suppress the one (iterm2) whose placements the alternate screen
         // cannot own. Undone by [`Self::stop_fullscreen`].
@@ -418,7 +450,6 @@ impl<B: RebuildBackend> App<B> {
         // the flag itself at boot, and this is idempotent with that.
         self.state.transcript.set_retain_document(true);
         self.altscreen = Some(alt);
-        true
     }
 
     /// Take the alternate screen down and give the inline renderer its terminal back, answering
@@ -432,11 +463,15 @@ impl<B: RebuildBackend> App<B> {
     /// [`Self::enter_fullscreen`]'s: stop the renderer (`:306-308` deletes placements, `:306`
     /// disables mouse reporting, `:315` leaves the screen), then put the image capabilities and the
     /// transcript's graphics gate back (`:330-333`), then retire the retained document.
-    pub(crate) fn stop_fullscreen(&mut self) -> bool {
+    /// `preserve_screen` is the caller's: `false` repaints the excursion's document into the main
+    /// screen's scrollback on the way out, `true` skips it. Both of cyrup's teardowns pass `false` —
+    /// see [`crate::AltScreen::stop`] for why neither can rely on the inline renderer to re-render
+    /// that history the way upstream's does.
+    pub(crate) fn stop_fullscreen(&mut self, preserve_screen: bool) -> bool {
         let Some(mut alt) = self.altscreen.take() else {
             return false;
         };
-        alt.stop();
+        alt.stop(preserve_screen);
         alt.restore_images(&mut self.state.transcript, &self.state.image_renderer);
         drop(alt);
         // The pair that keeps the §B-1 flag's "set once" rule honest across a second excursion —

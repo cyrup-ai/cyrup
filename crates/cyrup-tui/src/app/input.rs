@@ -175,7 +175,15 @@ impl<B: Backend> App<B> {
                 self.state.editor.handle_paste(s);
                 AppAction::Redraw
             }
-            InputEvent::Resize(_, _) => AppAction::Redraw,
+            InputEvent::Resize(_, _) => {
+                // A resize is the alternate screen's full redraw, and kitty placements do not live
+                // in ratatui's buffer, so they must be unpinned before the repaint lands on top of
+                // them — pi's `fullRedraw` image arm (`tui-alt-screen.ts:1310-1316`).
+                if let Some(alt) = self.altscreen.as_mut() {
+                    alt.handle_resize();
+                }
+                AppAction::Redraw
+            }
             // ADR-0005 §B-6/§B-7/§B-8 — the alternate screen's pointer surface. Reports only reach
             // here while it is live (`altscreen::mouse::map_reader_event`'s gate), so the `None`
             // arm is every regular-mode session and costs one `Option` test.

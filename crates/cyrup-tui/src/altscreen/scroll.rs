@@ -206,23 +206,19 @@ pub(super) fn content_height(scroll: &ScrollState) -> usize {
 
 /// Whether the view is stuck to the tail — pi's `get isFollowingEnd()`
 /// (`components/scroll-view.ts:59-61`).
-#[allow(
-    dead_code,
-    reason = "pi's `get isFollowingEnd()` (components/scroll-view.ts:59-61). The flag itself is \
-              maintained and read inside this module; the accessor exists for the callers ADR-0005 \
-              §B-8 gives it — none of which are wired yet."
-)]
+/// `#[cfg(test)]`: pi's `get isFollowingEnd()` (`components/scroll-view.ts:59-61`), reached through
+/// `TuiAltScreen.isFollowingOutput`, whose every upstream reference is in
+/// `test/tui-alt-screen.test.ts`. The flag itself is maintained and read inside this module.
+#[cfg(test)]
 pub(super) fn is_following_end(scroll: &ScrollState) -> bool {
     scroll.following_end
 }
 
 /// The largest legal offset — see [`max_scroll_top_of`].
-#[allow(
-    dead_code,
-    reason = "pi's `get maxScrollTop()` (components/scroll-view.ts:34-36). Every in-module caller \
-              uses `max_scroll_top_of` directly; this is the out-of-module form, and no consumer \
-              outside `scroll` is wired yet."
-)]
+/// `#[cfg(test)]`: pi's `get maxScrollTop()` (`components/scroll-view.ts:34-36`). Every in-module
+/// caller uses `max_scroll_top_of` directly; this is the out-of-module form, and its only consumer
+/// is an assertion.
+#[cfg(test)]
 pub(super) fn max_scroll_top(scroll: &ScrollState) -> usize {
     max_scroll_top_of(scroll)
 }
@@ -406,12 +402,11 @@ pub(super) fn scroll_to_bottom(scroll: &mut ScrollState) {
 }
 
 /// Which policy is in force — pi's `get scrollbar()` (`components/scroll-view.ts:67-69`).
-#[allow(
-    dead_code,
-    reason = "pi's `get scrollbar()` (components/scroll-view.ts:67-69). The policy is written \
-              through `set_scrollbar_mode` and read inside this module; the read-back accessor has \
-              no wired caller — upstream's is the settings round-trip (interactive-mode.ts:1983)."
-)]
+/// `#[cfg(test)]`: pi's `get scrollbar()` (`components/scroll-view.ts:67-69`), which upstream needs
+/// because `currentScrollbar` is private — this module's own consumers read `bar.mode` directly.
+/// Upstream's caller is the settings round-trip (`interactive-mode.ts:1983`), which cyrup routes
+/// through `set_scrollbar_mode` instead, so the read-back has no production consumer here.
+#[cfg(test)]
 pub(super) fn mode(bar: &ScrollbarView) -> ScrollbarMode {
     bar.mode
 }
