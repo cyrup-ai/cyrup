@@ -117,7 +117,9 @@ async fn fork_branches_from_the_real_session_file_handle_not_the_mtime_heuristic
     executor.set_host_services(Arc::new(SessionFileServices { session_file: file_a.clone() }));
 
     let fork = executor
-        .resolve_context(cwd, ContextMode::Fork)
+        // SUBA-075: `force_thinking_off` — this fixture resolves no model ladder, which is the
+        // case upstream's own `?? true` fallback covers.
+        .resolve_context(cwd, ContextMode::Fork, true)
         .await
         .expect("fork resolves against the real session_file handle");
 

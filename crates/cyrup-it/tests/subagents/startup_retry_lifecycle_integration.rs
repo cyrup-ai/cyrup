@@ -137,6 +137,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
         max_subagent_depth: None,
         memory: None,
         tool_budget: None,
+        runner: None, // SUBA-074: the native child, as before
         depth: DepthEnvelope {
             current_depth: 0,
             max_depth: 5,
@@ -147,6 +148,7 @@ fn base_agent_config(model: &str) -> AgentConfig {
 fn base_run_options(cwd: &Path, model: &str) -> RunOptions {
     RunOptions {
         turn_budget: None,
+        permission_rules: None, // SUBA-073: no policy — the pre-field behaviour
         // SUBA-021: pi's `usageBudget` is an OPTIONAL param — upstream has no default budget, so a
         // call that does not ask for one runs unbudgeted. This fixture asks for none.
         usage_budget: None,
