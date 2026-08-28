@@ -81,11 +81,13 @@ pub const PROTOCOL_VERSION: u32 = 1;
 /// `EXTENSION_BUS_FEATURE = "extension-bus-v1"` (`v0.9.2 types.ts:1`) — the single value pi's
 /// broker advertises in `registered.features`.
 ///
-/// cyrup never advertises it, and that is load-bearing rather than an oversight: a conforming pi
-/// client gates every extension-bus frame on `supportsFeature()`
-/// (`v0.9.2 broker/client.ts:648,817-819`), so not advertising is what stops those frames arriving
-/// at a broker that has not ported the bus. The constant exists so the negotiated name is stated
-/// once, next to the union that carries it.
+/// ICOM-016: cyrup's broker DOES advertise it, on every `registered`
+/// (`broker/session.rs`, matching `v0.9.2 broker/broker.ts:502-506`), and that is what admits the
+/// frames — a conforming pi client gates every extension-bus frame on `supportsFeature()`
+/// (`v0.9.2 broker/client.ts:648,817-819`). It could not be advertised until the bus effects
+/// existed; they do now (owner election, publish fan-out and the revision-checked state store in
+/// `broker::extension_state`). The constant exists so the negotiated name is stated once, next to
+/// the union that carries it.
 pub const EXTENSION_BUS_FEATURE: &str = "extension-bus-v1";
 
 /// `Number.MAX_SAFE_INTEGER` (2^53 - 1) — the bound `Number.isSafeInteger` enforces.
@@ -299,6 +301,35 @@ pub struct SessionInfo {
     pub extra: UnknownFields,
 }
 
+/// The single `MessageProvenance.type` value (`v0.12.0 types.ts:65`). A CLOSED one-variant
+/// vocabulary — `isMessageProvenance` compares it with `===` (`v0.12.0 broker/protocol.ts:78`), so
+/// an unknown tag fails the whole message rather than being ignored, exactly like [`AttachmentKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProvenanceKind {
+    /// Delivered on behalf of an extension through the outbox.
+    ExtensionOutbox,
+}
+
+/// `MessageProvenance` (`v0.12.0 types.ts:64-69`), guarded by `isMessageProvenance`
+/// (`v0.12.0 broker/protocol.ts:73-81`) and enforced inside `isMessage` at `:114-116`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MessageProvenance {
+    /// Always `"extension_outbox"` (`v0.12.0 broker/protocol.ts:78`).
+    #[serde(rename = "type")]
+    pub kind: ProvenanceKind,
+    /// The originating extension's id (`:79`).
+    pub extension_id: String,
+    /// The originating extension's display name (`:80`) — the string the inbound card renders.
+    pub extension_name: String,
+    /// The `IntercomOutboxRequestV1.requestId` this delivery answers (`:81`).
+    pub request_id: String,
+    /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`, as every sibling envelope struct carries.
+    #[serde(flatten)]
+    pub extra: UnknownFields,
+}
+
 /// `Message` (`v0.9.2 types.ts:24-40`), guarded by `isMessage`
 /// (`v0.9.2 broker/client.ts:106-150`, mirrored at `v0.9.2 broker/broker.ts:140-184`).
 ///
@@ -347,6 +378,15 @@ pub struct Message {
     /// (`v0.9.2 broker/client.ts:135-137`).
     #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
     pub expects_reply: Option<bool>,
+    /// Who originated this message, when it was not the agent itself
+    /// (`v0.12.0 types.ts:57`, guarded at `v0.12.0 broker/protocol.ts:114-116`).
+    ///
+    /// `[NON-NULL]`: absent is legal, an explicit `null` is FATAL — `isRecord(null)` is `false`, so
+    /// `isMessageProvenance(null)` fails and `isMessage` rejects the envelope. That is precisely
+    /// what [`present_non_null`] reproduces. Until this field existed the key round-tripped through
+    /// [`Message::extra`], which is why a v0.12.0 peer was tolerated but unattributable.
+    #[serde(default, deserialize_with = "present_non_null", skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<MessageProvenance>,
     /// The message body (`v0.9.2 broker/client.ts:139-141`).
     pub content: MessageContent,
     /// `[UNKNOWN-FIELDS]` + `[MAP-ONLY]`. This is the capture the relay claim rests on: pi
@@ -373,6 +413,7 @@ impl Default for Message {
             retry_of: None,
             reply_to: None,
             expects_reply: None,
+            provenance: None,
             content: MessageContent::default(),
             extra: UnknownFields::default(),
         }
@@ -796,6 +837,11 @@ pub enum ClientMessage {
 
 /// Broker → client messages (`v0.9.2 types.ts:103-136`), each guarded by its own arm of
 /// `handleBrokerMessage` (`v0.9.2 broker/client.ts:385-601`).
+// `Message` is THE dominant variant — every delivered message arrives through it — and it grew
+// again with ICOM-056's `provenance`. Boxing it would force `box`-patterns (unstable) at every
+// match site for a payload that dominates allocations anyway; the same tradeoff, and the same
+// decision, as `cyrup-session/src/entry.rs:50` and `:217`.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", rename_all_fields = "camelCase")]
 pub enum BrokerMessage {

@@ -198,7 +198,11 @@ mod tests {
     #[test]
     fn handle_presence_rejects_non_number_context_but_accepts_null_and_numbers() {
         fn drive(patch: serde_json::Value) -> FrameOutcome {
-            let mut state = BrokerState::new(30_000, Arc::new(Notify::new()));
+            let mut state = BrokerState::new(
+                30_000,
+                Arc::new(Notify::new()),
+                super::super::test_support::test_extension_state_dir(),
+            );
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut sid = None;
             state.handle_frame(
@@ -246,7 +250,11 @@ mod tests {
     /// race is a live path.
     #[test]
     fn a_non_owning_socket_s_malformed_presence_is_ignored_not_fatal() {
-        let mut state = BrokerState::new(30_000, Arc::new(Notify::new()));
+        let mut state = BrokerState::new(
+                30_000,
+                Arc::new(Notify::new()),
+                super::super::test_support::test_extension_state_dir(),
+            );
         let (tx_owner, _rx_owner) = tokio::sync::mpsc::unbounded_channel();
         let (tx_loser, _rx_loser) = tokio::sync::mpsc::unbounded_channel();
 
@@ -278,7 +286,11 @@ mod tests {
     /// (`v0.10.1 broker/broker.ts:779-787`) and applied to the stored `SessionInfo`.
     #[test]
     fn presence_carries_runtime_fallback_alias() {
-        let mut state = BrokerState::new(30_000, Arc::new(Notify::new()));
+        let mut state = BrokerState::new(
+                30_000,
+                Arc::new(Notify::new()),
+                super::super::test_support::test_extension_state_dir(),
+            );
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut sid = None;
         state.handle_frame(

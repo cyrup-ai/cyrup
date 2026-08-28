@@ -506,6 +506,48 @@ impl NativeExtension for IntercomExtension {
             // so the declaration is this subscription plus the answer in [`Self::on_event`].
             EventKind::ResourcesDiscover,
         ]);
+        // ICOM-056 / `v0.12.0 index.ts:1687,1716`: the two inbound bus topics. cyrup-intercom is the
+        // first native in the workspace to use `pi.events` at all; deliveries land in
+        // [`Self::on_bus_event`].
+        api.subscribe_bus(crate::outbox::INTERCOM_EXTENSION_REGISTER_EVENT);
+        api.subscribe_bus(crate::outbox::INTERCOM_OUTBOX_REQUEST_EVENT);
+        // `pi.events.emit(INTERCOM_EXTENSION_REGISTRY_READY_EVENT, { version: 1 })`
+        // (`v0.12.0 index.ts:1700`) — UNCONDITIONAL, and immediately after the listeners so no
+        // extension can ever observe "ready" before the request topic is live. This is the handshake
+        // an extension waits on before emitting its first outbox request; without it the outbox is
+        // listening to a bus nobody knows is there. `set_host_services` runs BEFORE `init`, so the
+        // backend is already bound here.
+        if let Some(services) = self.state.host_services() {
+            services.emit_event(
+                crate::outbox::INTERCOM_EXTENSION_REGISTRY_READY_EVENT,
+                &serde_json::json!({ "version": 1 }),
+            );
+        }
+        Ok(())
+    }
+
+    /// The `pi.events` listeners (`v0.12.0 index.ts:1687-1698,1716`). An `Err` here is contained by
+    /// the host and reported on the `onError` channel, matching pi's per-listener `catch`.
+    async fn on_bus_event(
+        &self,
+        topic: &str,
+        payload: &serde_json::Value,
+        _ctx: &HostCtx,
+    ) -> Result<(), ExtError> {
+        match topic {
+            // `index.ts:1716`. This NEVER blocks the fan-out: the synchronous prelude (parse,
+            // dedupe, track) settles inline so `invalid_request`/`duplicate_request` keep upstream's
+            // ordering against the emit, and the delivery leg is spawned.
+            crate::outbox::INTERCOM_OUTBOX_REQUEST_EVENT => {
+                crate::outbox::handle_outbox_request(self.state.clone(), payload.clone());
+            }
+            // `index.ts:1687-1698`: shape-check, then register. Front door only — the channel
+            // effects behind it are ICOM-016 and are deliberately not stubbed.
+            crate::outbox::INTERCOM_EXTENSION_REGISTER_EVENT => {
+                crate::outbox::handle_extension_register(&self.state, payload);
+            }
+            _ => {}
+        }
         Ok(())
     }
 

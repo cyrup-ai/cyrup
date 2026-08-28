@@ -8,7 +8,8 @@
 //! offline-delivery machinery in `mailbox`; all of them are `impl BrokerState` blocks over this
 //! type, which is why its fields are `pub(super)` rather than private.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use tokio::sync::Notify;
@@ -17,6 +18,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::transport::framing::encode_json;
 use crate::transport::protocol::{BrokerMessage, SessionInfo};
 
+use super::extension_state::ExtensionStateManager;
+use super::extensions::NamespaceOwner;
 use super::limits::{MAX_UNREGISTERED_CONNECTIONS, MESSAGE_RECEIPT_ROUTE_RETENTION_MS};
 use super::mailbox::{DisconnectedSession, MailboxMessage};
 use super::receipts::MessageReceiptRoute;
@@ -28,6 +31,18 @@ pub(super) struct ConnectedSession {
     pub(super) info: SessionInfo,
     pub(super) tx: UnboundedSender<Vec<u8>>,
     pub(super) last_presence_broadcast_at: u64,
+    /// `ownerOrder` (`v0.9.2 broker/broker.ts:56`) — the broker-owned registration order the
+    /// namespace-owner election sorts on, assigned from [`BrokerState::next_owner_order`] and
+    /// PRESERVED across an identity takeover (`:488`), so a client cannot seize a namespace by
+    /// reconnecting or by backdating its advertised `startedAt`.
+    pub(super) owner_order: u64,
+    /// `extensions` (`v0.9.2 broker/broker.ts:57`), as advertised on `register` or by a later
+    /// `extension_capabilities_update`.
+    ///
+    /// Upstream's is `ExtensionCapability[] | undefined`; an EMPTY vec is the faithful stand-in for
+    /// `undefined` because every reader is either `!session.extensions?.length` (`:1277`) or
+    /// `session.extensions ?? []` (`:1188`) — no branch upstream can tell the two apart.
+    pub(super) extensions: Vec<crate::transport::protocol::ExtensionCapability>,
 }
 
 /// A live connection's close handle, tracked so any handler can destroy it (takeover, eviction,
@@ -94,6 +109,20 @@ pub(super) struct BrokerState {
     /// "string"` (`:284`). `None` collapses upstream's two constants into "no gate", which is
     /// exactly what a socket/pipe endpoint gets.
     pub(super) endpoint_state_id: Option<String>,
+    /// `namespaceOwners` (`v0.9.2 broker/broker.ts:225`), keyed by namespace.
+    ///
+    /// [CYRUP-DELTA] A `BTreeMap` where pi has an insertion-ordered `Map`, so
+    /// `recompute_namespace_owners` walks namespaces in lexicographic rather than first-seen order.
+    /// The only thing that order can reach is the relative order of `extension_owner` frames for two
+    /// DIFFERENT namespaces on one socket; every consumer of that frame is per-namespace and
+    /// idempotent (`v0.9.2 broker/client.ts:538-552`), so no peer can observe the difference — and a
+    /// `HashMap` here WOULD be observable as nondeterminism across runs, which is the failure
+    /// `session_order` exists to prevent.
+    pub(super) namespace_owners: BTreeMap<String, NamespaceOwner>,
+    /// `nextOwnerOrder = 1` (`v0.9.2 broker/broker.ts:226`).
+    pub(super) next_owner_order: u64,
+    /// `extensionStateManager` (`v0.9.2 broker/broker.ts:227,232`).
+    pub(super) extension_state: ExtensionStateManager,
 }
 
 pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -101,10 +130,17 @@ pub(super) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl BrokerState {
-    pub(super) fn new(ask_timeout_ms: u64, shutdown: Arc<Notify>) -> Self {
+    pub(super) fn new(
+        ask_timeout_ms: u64,
+        shutdown: Arc<Notify>,
+        extension_state_dir: PathBuf,
+    ) -> Self {
         Self {
             sessions: HashMap::new(),
             session_order: Vec::new(),
+            namespace_owners: BTreeMap::new(),
+            next_owner_order: 1,
+            extension_state: ExtensionStateManager::new(extension_state_dir),
             ask_edges: HashMap::new(),
             message_receipt_routes: HashMap::new(),
             disconnected_sessions: HashMap::new(),
@@ -260,6 +296,9 @@ impl BrokerState {
             self.remove_session(sid);
             self.clear_message_receipt_routes_for_session(sid);
             self.broadcast(&BrokerMessage::SessionLeft { session_id: sid.clone() }, Some(sid));
+            // `this.recomputeNamespaceOwners()` (`v0.9.2 broker/broker.ts:337`) — this is what
+            // re-elects a namespace whose owner just died.
+            self.recompute_namespace_owners();
             return true;
         }
         false

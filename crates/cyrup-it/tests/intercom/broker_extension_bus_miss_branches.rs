@@ -3,11 +3,11 @@
 //! cannot emit these tags at all, so a unit-level mirror cannot observe what the broker puts on the
 //! wire).
 //!
-//! cyrup does not implement the extension bus and deliberately does not advertise
-//! `extension-bus-v1`, so a *conforming* pi client never sends these frames
-//! (`supportsFeature` gate, `v0.9.2 broker/client.ts:648,817-819`). A non-conforming one still
-//! can — this socket is openable by every process on the box — and upstream is neither silent nor
-//! tolerant when it does:
+//! ICOM-016 landed the bus effects, so cyrup now advertises `extension-bus-v1` and a *conforming*
+//! pi client sends these frames as a matter of course (`supportsFeature` gate,
+//! `v0.9.2 broker/client.ts:648,817-819`). The validation prefixes under test here are unchanged by
+//! that, and still matter for the same reason: a non-conforming peer can open this socket too, and
+//! upstream is neither silent nor tolerant when it does:
 //!
 //! * `extension_capabilities_update` validates and **throws** on failure, i.e. `socket.destroy`
 //!   (`v0.9.2 broker/broker.ts:551-567` → `framing.ts:44-51`).
@@ -16,10 +16,10 @@
 //! * `extension_state_commit` **always** answers `extension_state_result`
 //!   (`v0.9.2 broker/broker.ts:1367-1388`; every other exit from that handler writes one too).
 //!
-//! Because the `session.extensions` assignment at `v0.9.2 broker/broker.ts:568` is exactly the
-//! effect this crate leaves unported, `!session.extensions?.length` is unconditionally true here
-//! and pi's not-advertised branch is the only reachable one. That is the branch under test; the
-//! bus itself is later-batch work.
+//! `!session.extensions?.length` (`v0.9.2 broker/broker.ts:1277`) is now a REAL test rather than a
+//! constant — ICOM-016 landed the `session.extensions` assignment at `:568` — so the
+//! not-advertised branch is reached here by registering a session that advertises nothing, which is
+//! what each test below does.
 //!
 //! Each test carries a MIRROR so "answer everything" cannot pass: an unknown tag must still tear
 //! the connection down, and a well-formed capabilities update must still be served.
@@ -282,10 +282,46 @@ async fn a_well_formed_capabilities_update_is_accepted_and_draws_no_refusal() {
         }))
         .await;
 
-    // The very next frame must be the `list` reply: no `error`, no `extension_state_result`, and
-    // above all not a closed socket.
+    // ICOM-016: a well-formed update is no longer silent. It now draws the owner replay
+    // (`v0.9.2 broker/broker.ts:569-585`) — `recomputeNamespaceOwners` broadcasts to the capable
+    // set, then one `extension_owner` per advertised namespace goes back to the updating session.
+    // What must NOT appear is a refusal or a closed socket, so the `list` mirror still proves the
+    // connection is healthy and serving.
     alpha.send(&serde_json::json!({ "type": "list", "requestId": "r1" })).await;
-    let next = alpha.next_frame().await.expect("the connection must survive a valid capabilities update");
-    assert_eq!(next["type"], "sessions", "a valid capabilities update must draw no reply: {next}");
-    assert_eq!(next["requestId"], "r1");
+
+    let mut owned_ns = false;
+    let mut unowned_ns = false;
+    let sessions = loop {
+        let next = alpha
+            .next_frame()
+            .await
+            .expect("the connection must survive a valid capabilities update");
+        match next["type"].as_str() {
+            Some("extension_owner") => {
+                // `owner` is `#[serde(flatten)]` on the variant, so the pair sits at the TOP
+                // level of the frame — `{type, namespace, ownerId, ownerEpoch}` — and an unowned
+                // namespace omits both keys entirely rather than sending nulls.
+                if next["namespace"] == "ns" && next["ownerId"] == "alpha-session" {
+                    assert!(
+                        next["ownerEpoch"].is_string(),
+                        "an owned namespace must carry both halves of the pair: {next}"
+                    );
+                    owned_ns = true;
+                }
+                if next["namespace"] == "a.b/c-d_e" {
+                    assert!(
+                        next.get("ownerId").is_none() && next.get("ownerEpoch").is_none(),
+                        "an unowned namespace must omit both halves, not send nulls: {next}"
+                    );
+                    unowned_ns = true;
+                }
+            }
+            Some("sessions") => break next,
+            _ => panic!("a valid capabilities update must draw no refusal: {next}"),
+        }
+    };
+
+    assert!(owned_ns, "the ownerEligible namespace must elect this session as its owner");
+    assert!(unowned_ns, "a namespace advertised without ownerEligible must replay with no owner");
+    assert_eq!(sessions["requestId"], "r1");
 }

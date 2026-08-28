@@ -6,6 +6,39 @@
 //! `String(x)` and `!!x` are ported rather than approximated. Split out of `broker/mod.rs` because
 //! they are pure functions with no broker state involved at all.
 
+/// `Number.MAX_SAFE_INTEGER` (`2^53 - 1`) — the bound `Number.isSafeInteger` enforces. Defined here
+/// rather than imported from `transport::protocol`'s private one, the precedent
+/// `broker/runtime_claim.rs:50` already sets.
+const JS_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+
+/// `typeof v === "number" && Number.isSafeInteger(v) && v >= 0` — the guard pi applies to
+/// `msg.expectedRevision` before it reaches the state manager (`v0.9.2 broker/broker.ts:1417`, and
+/// again at `extension-state.ts:132`).
+///
+/// A value-level twin of `transport::protocol`'s `js_safe_integer` DESERIALIZER, which cannot be
+/// reused here: the extension handlers read a raw [`serde_json::Value`] frame and never deserialize
+/// a typed `ClientMessage`.
+///
+/// `None` is every rejected shape at once: absent, `null`, non-numeric, fractional, negative, or
+/// above `2^53 - 1`. JS treats `-0` as a safe integer that is not `< 0`, so it maps to `Some(0)`.
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the f64 arm is reached only after fract() == 0.0 and a 0..=2^53-1 range check, so the \
+              cast is exact and non-negative by construction"
+)]
+pub(super) fn js_safe_u64(v: Option<&serde_json::Value>) -> Option<u64> {
+    let n = v?.as_number()?;
+    if let Some(u) = n.as_u64() {
+        return (u <= JS_MAX_SAFE_INTEGER).then_some(u);
+    }
+    let f = n.as_f64()?;
+    if !f.is_finite() || f.fract() != 0.0 || f < 0.0 || f > JS_MAX_SAFE_INTEGER as f64 {
+        return None;
+    }
+    Some(f as u64)
+}
+
 /// `String(msg.namespace || "")` — the expression pi echoes into the two `extension_state_result`
 /// frames it emits *before* `namespace` has been type-checked
 /// (`v0.9.2 broker/broker.ts:1371` and `:1382`). Those are the only two places in the protocol
@@ -38,10 +71,14 @@ fn js_is_falsy(v: &serde_json::Value) -> bool {
     }
 }
 
-/// JS `ToString` for the JSON value subset. Arrays go through `Array.prototype.join(",")`, which
+/// JS `ToString` for the JSON value subset, WITHOUT the `|| ""` falsy short-circuit
+/// [`js_string_or_empty`] applies. `v0.9.2 broker/broker.ts:1394` writes `String(namespace)` where
+/// `:1371` and `:1382` write `String(msg.namespace || "")`, and the difference is observable:
+/// `namespace: 0` echoes `"0"` there and `""` in the two earlier branches.
+/// Arrays go through `Array.prototype.join(",")`, which
 /// renders `null` elements as the empty string and recurses into nested arrays; every plain object
 /// stringifies to `"[object Object]"`.
-fn js_to_string(v: &serde_json::Value) -> String {
+pub(super) fn js_to_string(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => "null".to_string(),
         serde_json::Value::Bool(b) => b.to_string(),

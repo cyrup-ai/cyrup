@@ -41,6 +41,7 @@ pub(crate) mod runtime_claim;
 
 mod conn;
 mod dispatch;
+mod extension_state;
 mod extensions;
 mod frame;
 mod js;

@@ -312,6 +312,17 @@ pub fn begin_runtime(state: &Arc<SharedIntercomState>, params: ConnectParams) {
     sup.started.store(true, Ordering::SeqCst);
     // `runtimeStarted = true` (`v0.10.1 index.ts:1253`) — latched, never cleared.
     sup.runtime_ever_started.store(true, Ordering::SeqCst);
+    // ICOM-056 / `v0.12.0 index.ts:1577,1582`: settle everything this runtime change orphans BEFORE
+    // the generation bump. Settling after it would leave `is_live_at` inside the settle path looking
+    // at the NEW generation, and every trace would be silently dropped instead of answered.
+    crate::outbox::fail_pending_outbox_requests(
+        state,
+        sup.generation(),
+        crate::outbox::OutboxResultCode::SessionEnded,
+        "Session replaced",
+    );
+    // The dedupe window IS the runtime, so a requestId replayed across a restart is legal.
+    state.clear_outbox_request_ids();
     sup.generation.fetch_add(1, Ordering::SeqCst);
     sup.attempt.store(0, Ordering::SeqCst);
     sup.set_timer(None);
@@ -331,6 +342,14 @@ pub fn shutdown(state: &Arc<SharedIntercomState>) {
     let sup = &state.connect;
     sup.shutting_down.store(true, Ordering::SeqCst);
     sup.started.store(false, Ordering::SeqCst);
+    // ICOM-056 / `v0.12.0 index.ts:1731`: same ordering rule as `begin_runtime` — settle first, bump
+    // second.
+    crate::outbox::fail_pending_outbox_requests(
+        state,
+        sup.generation(),
+        crate::outbox::OutboxResultCode::SessionEnded,
+        "Session shutting down",
+    );
     sup.generation.fetch_add(1, Ordering::SeqCst);
     sup.set_timer(None);
     *sup.runtime_session_id.lock().unwrap_or_else(|e| e.into_inner()) = None;

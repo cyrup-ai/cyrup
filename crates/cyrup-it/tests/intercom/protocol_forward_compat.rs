@@ -102,10 +102,16 @@ impl RawClient {
         .await;
         let ack = self.expect_frame("registered").await;
         assert_eq!(ack["sessionId"], session_id);
-        // cyrup must NOT advertise `extension-bus-v1`: not advertising is the whole reason a
-        // conforming pi client never sends the extension-bus frames this crate cannot service
-        // (`supportsFeature` gate, `v0.9.2 broker/client.ts:648,817-819`).
-        assert!(ack.get("features").is_none(), "cyrup must not advertise extension-bus features");
+        // ICOM-016 INVERTED this assertion. The broker now implements the bus effects — capability
+        // bookkeeping, owner election, publish fan-out and the revision-checked state store — so it
+        // advertises `extension-bus-v1`, which is exactly what admits the frames from a conforming
+        // pi client (`supportsFeature` gate, `v0.9.2 broker/client.ts:648,817-819`) and matches
+        // upstream's own `features` on `registered` (`v0.9.2 broker/broker.ts:502-506`).
+        assert_eq!(
+            ack["features"],
+            serde_json::json!(["extension-bus-v1"]),
+            "cyrup advertises exactly the one v0.9.2 feature whose effects it implements"
+        );
     }
 }
 

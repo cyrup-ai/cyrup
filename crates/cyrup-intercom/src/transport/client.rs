@@ -67,6 +67,10 @@ pub struct SendOptions {
     /// `retryOf` (`v0.10.1 broker/client.ts:13`) — the previous message this one retries. Carried on
     /// the envelope only; the broker does not validate it.
     pub retry_of: Option<String>,
+    /// `provenance` (`v0.12.0 broker/client.ts:29`) — who originated this message when it was not
+    /// the agent itself. Stamped ONLY by the extension outbox ([`crate::outbox`]); every other send
+    /// path leaves it `None` so the wire carries no `provenance` key at all.
+    pub provenance: Option<crate::transport::protocol::MessageProvenance>,
 }
 
 /// The result of a [`IntercomClient::send`] (`SendResult`, `client.ts:16-20`).
@@ -492,6 +496,7 @@ impl IntercomClient {
             expects_reply: options.expects_reply,
             supersedes: options.supersedes,
             retry_of: options.retry_of,
+            provenance: options.provenance,
             content: MessageContent { text: options.text, attachments: options.attachments, ..Default::default() },
             ..Default::default()
         };
@@ -899,11 +904,14 @@ async fn read_task(
                 BrokerMessage::MessageControl { from, control } => {
                     let _ = inner.events.send(InboundEvent::MessageControl { from, control });
                 }
-                // Extension-bus frames (`v0.9.2 types.ts:115-136`). Unreachable in practice: pi's
-                // broker only routes these to a session that advertised `extensions` in its
-                // `register` (`isCapable`, `v0.9.2 broker/broker.ts:1209`), and cyrup's
-                // `SessionRegistration` has no such field. Modelled anyway so a future/misbehaving
-                // broker cannot tear the connection down.
+                // Extension-bus frames (`v0.9.2 types.ts:115-136`). Still unreachable in practice,
+                // but for a narrower reason since ICOM-016: BOTH brokers now route these only to a
+                // session that advertised `extensions` in its `register` (`isCapable`,
+                // `v0.9.2 broker/broker.ts:1209`, and `notify_namespace_capable` in
+                // `broker::extensions`), and cyrup's `SessionRegistration` still has no such field —
+                // so a cyrup CLIENT is never a recipient even though a cyrup BROKER now fans these
+                // out. Modelled anyway so a future/misbehaving broker cannot tear the connection
+                // down.
                 BrokerMessage::ExtensionOwner { .. }
                 | BrokerMessage::ExtensionMessage { .. }
                 | BrokerMessage::ExtensionState { .. }

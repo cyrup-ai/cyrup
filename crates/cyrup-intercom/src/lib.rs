@@ -33,6 +33,8 @@ pub mod extension;
 pub mod format_context;
 pub mod identity;
 pub mod inbound;
+/// ICOM-056: the extension outbox and message provenance.
+pub mod outbox;
 pub mod paths;
 pub mod project_target;
 pub mod relay;

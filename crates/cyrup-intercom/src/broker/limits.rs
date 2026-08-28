@@ -29,3 +29,12 @@ pub(super) const MAX_MAILBOX_MESSAGES: usize = 256;
 pub(super) const READ_BUF: usize = 16 * 1024;
 /// `MAX_EXTENSIONS_PER_SESSION = 32` (`v0.9.2 broker/broker.ts:35`).
 pub(super) const MAX_EXTENSIONS_PER_SESSION: usize = 32;
+
+/// `MAX_EXTENSION_MESSAGE_BYTES = 16 * 1024` (`v0.9.2 broker/broker.ts:37`) — the cap
+/// `serializedPayloadSize` applies to an `extension_publish` payload.
+pub(super) const MAX_EXTENSION_MESSAGE_BYTES: usize = 16 * 1024;
+/// `MAX_EXTENSION_STATE_BYTES = 64 * 1024` (`v0.9.2 broker/broker.ts:38`), which is the same bound
+/// upstream spells a second time as `MAX_STATE_BYTES` (`broker/extension-state.ts:16`). One constant
+/// here, because the two are one rule and a divergence between them would be a silent
+/// accept-then-refuse: the broker would admit a payload the state manager then refuses to persist.
+pub(super) const MAX_EXTENSION_STATE_BYTES: usize = 64 * 1024;
