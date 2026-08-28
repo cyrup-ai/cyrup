@@ -167,9 +167,8 @@ pub use credentials::{AuthEntry, AuthStoreError, McpAuthStore, OAuthCredentialSt
 /// The OAuth flow runtime (13g) — `oauth.ts` / `mcp-auth-flow.ts`.
 pub use oauth::{
     authenticate, complete_auth, complete_auth_from_input, create_oauth_runtime, get_auth_status,
-    get_valid_token, has_pending_auth, initialize_oauth, remove_auth, shutdown_oauth, start_auth,
-    supports_oauth, AuthStatus, AuthenticateOptions, HttpAuthProviderState, McpOAuthRuntime,
-    McpOAuthStorage,
+    get_valid_token, has_pending_auth, remove_auth, shutdown_oauth, start_auth, supports_oauth,
+    AuthStatus, AuthenticateOptions, HttpAuthProviderState, McpOAuthRuntime, McpOAuthStorage,
 };
 /// Environment interpolation and the `!`/`!!` command-secret grammar (13b, MCP-082/MCP-083) —
 /// `utils.ts`. `resolve_command_secret` is the ONLY function in the crate that spawns a shell for a
@@ -182,8 +181,14 @@ pub use secrets::{
 /// The `mcp` gateway tool and its nine modes (13d) — `proxy-modes.ts` / `mcp-tool.ts`.
 pub use proxy::{McpErrorCode, McpTool, ProxyCtx, ProxyEnv, MCP_TOOL_NAME};
 /// The inverse of the tool-name grammar (MCP-073) — `types.ts` `resolveServerFromToolName`. The
-/// forward direction lives on [`registration`] with the rest of the grammar; this one is re-exported
-/// because its consumer is a downstream policy gate in another crate.
+/// forward direction lives on [`registration`] with the rest of the grammar.
+///
+/// **Its consumer is not wired, deliberately** — see the declaration (`registration.rs:265-271`).
+/// `cyrup-permission-system` is a *dependency* of this crate, not a dependent, so it cannot consume
+/// this; it derives MCP targets with its own **suffix** test — `add_derived_mcp_server_targets`,
+/// `cyrup-permission-system/src/manager.rs:985` — which is a different rule from this prefix one, and
+/// reconciling the two is MCP-191. Re-exported so the pair reads as one grammar at the
+/// crate root when that lands.
 pub use registration::resolve_server_from_tool_name;
 /// Tool-result rendering and the MCP output guard (13e/13h) — `tool-result-renderer.ts`,
 /// `mcp-output-guard.ts`, `tool-registrar.ts`.

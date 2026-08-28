@@ -239,6 +239,13 @@ impl McpState {
     }
 
     /// Observe the status snapshot — the seam `/mcp`, the footer and the panel read.
+    ///
+    /// **The publisher is wired; only this reader is missing.** [`Self::publish_status`] runs on the
+    /// `crate::runtime` startup and reload paths and on every `crate::live` connection change, so the
+    /// channel carries real snapshots at runtime. All three consumers named above, though — `/mcp`,
+    /// the footer and the panel — are the `/mcp` dispatcher's, and that is `TODO(MCP-394)`, not
+    /// ported, so nothing outside this crate's tests subscribes yet. The channel is live; it is its
+    /// readers that MCP-394 owns.
     #[must_use]
     pub fn subscribe_status(&self) -> watch::Receiver<McpStatusSnapshot> {
         self.status_events.subscribe()
@@ -286,6 +293,55 @@ impl McpState {
         if let Ok(mut slot) = self.on_tool_metadata_updated.lock() {
             *slot = listener;
         }
+    }
+
+    /// `{authStorageOptions: state.authStorageOptions, signal, runtime: state.oauthRuntime}` — the
+    /// three options every `mcp-auth-flow.ts` call site passes (`proxy-modes.ts:165-177`, `:368-372`,
+    /// `:408-411`, `commands.ts:287-311`).
+    ///
+    /// It lives on the state rather than on one of its consumers because there are now **two**
+    /// production callers with nothing else in common: `crate::live::RuntimeEnv`'s three `ProxyEnv`
+    /// auth verbs, which serve the model-facing `mcp({action:"auth-*"})` route, and
+    /// `McpExtension`'s `/mcp-auth` handler, which serves the human. Both need exactly these three
+    /// fields and both must build them from the SAME generation's record, or a `/mcp-auth` run
+    /// would authenticate against one OAuth runtime while the connect ladder reads another.
+    ///
+    /// `dirs` is a parameter because [`McpState`] does not carry one: the state is built by
+    /// `crate::runtime::initialize_mcp`, whose `dirs` argument is not stored on the record. Every
+    /// caller already holds the generation's [`crate::dirs::McpDirs`].
+    ///
+    /// **`runtime` is always `Some`.** `crate::oauth::get_runtime(None)` resurrects the module-level
+    /// legacy runtime and inserts its id into the process-global live-runtime set that only
+    /// `shutdown_oauth` removes — and nothing shuts the legacy runtime down, so the set never empties
+    /// and the shared loopback listener is never stopped for the life of the process. Passing the
+    /// generation's own runtime keeps the set balanced and makes a flow racing a session teardown
+    /// fail as an **abort** (`McpError::Aborted`) rather than as a silent `needs-auth`.
+    ///
+    /// The two hooks and the launcher are left at their defaults here — `on_authorization_url`,
+    /// `on_authorization_input` and `OpenerLauncher`. A caller that has a human to talk to installs
+    /// its own hooks on the returned bag; a caller that does not (the proxy tool's copy-paste
+    /// protocol) leaves them alone, and the flow then logs the URL and awaits the loopback callback.
+    #[must_use]
+    pub fn auth_options(
+        &self,
+        dirs: &crate::dirs::McpDirs,
+        cancel: &cyrup_core::CancelToken,
+    ) -> crate::oauth::AuthenticateOptions {
+        // The GENERATION's vault, not a fresh one — the same reasoning as
+        // [`crate::live::RuntimeEnv::auth_options`]. `initialize_mcp` publishes the handle it built
+        // `StoredCredentialAuth` over, so a token `/mcp-auth` writes lands in the cache the connect
+        // ladder reads, and `invalidate_auth_entry_cache` evicts an entry someone else will see.
+        // Building a second store here left the human login path talking to its own in-process
+        // cache. The fallback is for a manager nothing published to — one built by `new`/`default` —
+        // and reconstructs from the same `(dirs, authStorageOptions)` pair.
+        let store = self.manager.auth_store().unwrap_or_else(|| {
+            crate::credentials::McpAuthStore::new(dirs.clone(), self.auth_storage_options.clone())
+        });
+        let storage: Arc<dyn crate::oauth::McpOAuthStorage> = Arc::new(store);
+        let mut options = crate::oauth::AuthenticateOptions::new(storage);
+        options.runtime = Some(Arc::clone(&self.oauth_runtime));
+        options.signal = Some(cancel.clone());
+        options
     }
 }
 
@@ -457,6 +513,10 @@ pub struct McpServerStatusSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource_count: Option<usize>,
     /// Emitted only for [`McpServerRuntimeStatus::Failed`], and only inside the 60-second window.
+    ///
+    /// **Written, never read:** `crate::live` computes it on every snapshot, but the "failed N
+    /// seconds ago" line it feeds is drawn by the `/mcp` status renderer — `TODO(MCP-394)`, not
+    /// ported.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_ago_seconds: Option<u64>,
     /// ALWAYS emitted, even for an enabled server: it duplicates `status == Disabled` and consumers

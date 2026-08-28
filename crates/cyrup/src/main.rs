@@ -24,8 +24,8 @@
 //!
 //! [`set_process_name`] cannot move into the library: it needs `unsafe` (`prctl(PR_SET_NAME)` /
 //! `pthread_setname_np`) and `cyrup`'s lib root is `#![forbid(unsafe_code)]`. That is also why
-//! [`cyrup::predispatch`] *classifies* the two internal subcommands and this file dispatches them —
-//! each one re-labels the process first (SEAM-070).
+//! [`cyrup::predispatch`] *classifies* the three internal subcommands and this file dispatches them
+//! — each one re-labels the process first (SEAM-070).
 
 use std::io::{self, IsTerminal};
 use std::ops::ControlFlow;
@@ -118,13 +118,21 @@ async fn run() -> anyhow::Result<i32> {
     let raw: Vec<String> = normalize_short_aliases(std::env::args());
     let argv: Vec<String> = raw.iter().skip(1).cloned().collect();
 
-    // The two internal, never-advertised subcommands — `__subagent-runner --config <path>` (arch-SA
-    // §2.2/§6.5) and `__intercom-broker` (cyrup-intercom-port.md §7.3). Both MUST be recognized
-    // before ANY user-facing arg leniency/clap parsing and before the package/config pre-dispatch
-    // below, which has no knowledge of them. `cyrup::predispatch` classifies; the naming + dispatch
-    // is here because `set_process_name` is `unsafe` and cannot live in the library (SEAM-070: a
-    // distinct role name is what makes a stuck child findable in `ps`, the same reason pi gives its
-    // rpc child its own `process.title`).
+    // The three internal, never-advertised subcommands — `__subagent-runner --config <path>`
+    // (arch-SA §2.2/§6.5), `__intercom-broker` (cyrup-intercom-port.md §7.3) and
+    // `__mcp-keyring-helper` (13f-mcp-credentials MCP-260). All three MUST be recognized before ANY
+    // user-facing arg leniency/clap parsing and before the package/config pre-dispatch below, which
+    // has no knowledge of them. `cyrup::predispatch` classifies; the naming + dispatch is here
+    // because `set_process_name` is `unsafe` and cannot live in the library (SEAM-070: a distinct
+    // role name is what makes a stuck child findable in `ps`, the same reason pi gives its rpc child
+    // its own `process.title`).
+    //
+    // The keyring-helper arm is load-bearing *where it sits*, not merely early: its whole contract
+    // is one line of JSON in on stdin and one line of JSON out on stdout, and it "must not
+    // initialise the cache, the config or tracing" (`cyrup_mcp::credentials::run_keyring_helper`).
+    // Returning from here keeps it above the bootstrap HTTP-proxy install and above
+    // `run_predispatch`, so nothing can log a secret or put a stray byte on the stdout the parent
+    // process is parsing. It is also the one arm that is synchronous — there is nothing to await.
     match predispatch::classify_internal(&raw) {
         Some(Internal::SubagentRunner) => {
             set_process_name("cyrup-subagent");
@@ -133,6 +141,14 @@ async fn run() -> anyhow::Result<i32> {
         Some(Internal::IntercomBroker) => {
             set_process_name("cyrup-broker");
             return Ok(cyrup::intercom_broker_cmd::dispatch().await);
+        }
+        Some(Internal::McpKeyringHelper) => {
+            // `PR_SET_NAME` caps a name at 16 bytes including the NUL, so `ps -o comm=` shows this
+            // one as `cyrup-mcp-keyri` — still distinct from `cyrup`, `cyrup-broker` and
+            // `cyrup-subagent`, which is all SEAM-070 asks of it. Silent truncation is the
+            // documented contract of `set_process_name`, not a defect to route around.
+            set_process_name("cyrup-mcp-keyring");
+            return Ok(cyrup::mcp_keyring_helper_cmd::dispatch());
         }
         None => {}
     }

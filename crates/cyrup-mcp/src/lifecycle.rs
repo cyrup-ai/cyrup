@@ -401,6 +401,13 @@ pub type MetadataFlush = Arc<dyn Fn(&Arc<McpState>) -> McpResult<()> + Send + Sy
 /// and the tests that assert `shutdown_state`'s ordering without a `McpDirs`. It still **warns**,
 /// because reaching process exit without writing `mcp-cache.json` when there *was* something to
 /// write means the next launch registers an empty tool surface.
+///
+/// **Measured: every current caller is in this module's `#[cfg(test)]` block.** The three
+/// production shutdown paths all own an [`crate::dirs::McpDirs`] and are all given
+/// [`crate::live::metadata_flush`] instead (`extension.rs:881`, `:1090`, `:1223`), so the
+/// "restart with no state" arm above is a shape this crate does not currently reach. That makes
+/// this a test helper today; it is kept rather than deleted because the warning is the thing a
+/// future stateless path must not be allowed to skip silently.
 #[must_use]
 pub fn no_metadata_flush() -> MetadataFlush {
     Arc::new(|_state| {
@@ -500,7 +507,9 @@ enum FailureAction {
 pub struct McpLifecycleManager {
     manager: Arc<McpServerManager>,
     supervisor: Arc<dyn ConnectionSupervisor>,
-    has_pending_auth: PendingAuthCheck,
+    /// `hasPendingAuthForServer` (`lifecycle.ts:46`), **rebindable** — see
+    /// [`Self::set_pending_auth_check`] for why the constructor's value is not the last word.
+    has_pending_auth: Mutex<PendingAuthCheck>,
     registry: Arc<Mutex<Registry>>,
     callbacks: Arc<Mutex<Callbacks>>,
     /// `settings.idleTimeout` in minutes; stored as minutes and converted at read, matching
@@ -545,7 +554,7 @@ impl McpLifecycleManager {
         Self {
             manager,
             supervisor,
-            has_pending_auth,
+            has_pending_auth: Mutex::new(has_pending_auth),
             registry: Arc::new(Mutex::new(Registry::default())),
             callbacks: Arc::new(Mutex::new(Callbacks::default())),
             global_idle_minutes: Mutex::new(DEFAULT_IDLE_TIMEOUT_MINUTES),
@@ -600,6 +609,13 @@ impl McpLifecycleManager {
     /// `unregisterServer(name)` (`lifecycle.ts:76-82`) — called from `index.ts:338` when a server
     /// disappears from the live config. Drops the definition from **all five** maps; the identity
     /// fence then rejects any convergence pass still running against it.
+    ///
+    /// **No production caller.** `index.ts:338` is inside the config-change path of the `/mcp`
+    /// dispatcher, which is `TODO(MCP-394)` and not ported (see `crate::ui`'s note at
+    /// `open_mcp_panel` and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer
+    /// until MCP-394 lands). Nothing else removes a server mid-generation: registration is
+    /// one-directional today, and a deleted `mcp.json` entry is only noticed at the next
+    /// generation's build. When MCP-394 lands this is the call its config-change arm makes.
     pub fn unregister_server(&self, name: &str) {
         let Ok(mut registry) = self.registry.lock() else {
             return;
@@ -775,9 +791,40 @@ impl McpLifecycleManager {
 
     /// Whether `name` is waiting on an OAuth flow — such a server is never reconnected underneath
     /// its own authorization (`lifecycle.ts:177`, `:229`).
+    ///
+    /// A poisoned lock degrades to `false`, which is the predicate's own answer for a server with
+    /// no flow in flight: the state machine proceeds as it did before this slot existed rather than
+    /// wedging a server permanently un-reapable.
     #[must_use]
     pub fn has_pending_auth(&self, name: &str) -> bool {
-        (self.has_pending_auth)(name)
+        let check = match self.has_pending_auth.lock() {
+            Ok(check) => Arc::clone(&check),
+            Err(_) => return false,
+        };
+        // Called OUTSIDE the lock: the predicate reaches into the OAuth runtime, and holding a
+        // lifecycle lock across foreign code is how a re-entrant caller deadlocks.
+        check(name)
+    }
+
+    /// Rebind the pending-auth predicate after construction (MCP-334).
+    ///
+    /// [`Self::new`] runs inside [`crate::runtime::initialize_mcp`] step 7, and the honest
+    /// predicate — [`crate::oauth::has_pending_auth_sync`] over *this generation's*
+    /// [`crate::oauth::McpOAuthRuntime`] — is installed by the commit tail
+    /// (`McpExtension::commit_initialization`), which is the first place that holds both the
+    /// committed [`crate::state::McpState`] and the extension. Until it runs, the constructor's
+    /// value stands.
+    ///
+    /// Why this is not "just pass it to `new`": the predicate must observe the runtime the session
+    /// actually authenticates through, and the only handle that is guaranteed to be *that* runtime
+    /// for the *committed* generation is `state.oauth_runtime` — which does not exist until the
+    /// state does. Binding at construction would work for the ordinary path and silently bind a
+    /// superseded generation's runtime on a replacement, which is the class of bug the whole
+    /// generation protocol exists to prevent.
+    pub fn set_pending_auth_check(&self, check: PendingAuthCheck) {
+        if let Ok(mut slot) = self.has_pending_auth.lock() {
+            *slot = check;
+        }
     }
 
     /// Whether `name` is currently in the keep-alive set. Diagnostic; the state machine itself
@@ -2085,6 +2132,48 @@ mod tests {
 
         lc.check_connections(&CancelToken::new()).await.unwrap();
         assert!(!supervisor.log().iter().any(|e| e.starts_with("connect:")));
+    }
+
+    /// MCP-334 — the predicate the state machine reads is the one **last installed**, not the one
+    /// the constructor was handed.
+    ///
+    /// `crate::runtime::initialize_mcp` step 7 builds this manager before the generation's
+    /// `McpState` — and so before its OAuth runtime — exists, so it can only pass a placeholder;
+    /// the honest predicate is installed by the commit tail. If the setter wrote a field the passes
+    /// did not consult, that install would be silent and both `hasPendingAuth` gates would stay
+    /// permanently open, which is exactly the state this unit found them in.
+    ///
+    /// The A/B is against a second manager built the same way and left on the placeholder, so the
+    /// assertion is that the REBIND changed the outcome rather than that the fixture happens not to
+    /// connect.
+    #[tokio::test]
+    async fn rebinding_the_pending_auth_check_suppresses_a_reconnect_the_placeholder_allowed() {
+        // A — the constructor's placeholder: the reconnect proceeds.
+        let allowed = FakeSupervisor::arc();
+        let lc = lifecycle_with(Arc::clone(&allowed));
+        lc.register_server("a", keep_alive_entry(), None);
+        lc.mark_keep_alive("a");
+        assert!(!lc.has_pending_auth("a"));
+        lc.check_connections(&CancelToken::new()).await.unwrap();
+        assert!(
+            allowed.log().iter().any(|entry| entry == "connect:a"),
+            "the placeholder predicate must not suppress anything: {:?}",
+            allowed.log()
+        );
+
+        // B — the same fixture with the predicate rebound after construction.
+        let suppressed = FakeSupervisor::arc();
+        let lc = lifecycle_with(Arc::clone(&suppressed));
+        lc.register_server("a", keep_alive_entry(), None);
+        lc.mark_keep_alive("a");
+        lc.set_pending_auth_check(Arc::new(|_| true));
+        assert!(lc.has_pending_auth("a"));
+        lc.check_connections(&CancelToken::new()).await.unwrap();
+        assert!(
+            !suppressed.log().iter().any(|entry| entry.starts_with("connect:")),
+            "a rebound predicate must gate the reconnect: {:?}",
+            suppressed.log()
+        );
     }
 
     #[tokio::test]

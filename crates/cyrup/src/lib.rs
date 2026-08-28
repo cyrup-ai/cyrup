@@ -21,6 +21,7 @@ pub mod diagnostics;
 pub mod input;
 pub mod interactive;
 pub mod intercom_broker_cmd;
+pub mod mcp_keyring_helper_cmd;
 pub mod migrations;
 pub mod output_guard;
 pub mod predispatch;

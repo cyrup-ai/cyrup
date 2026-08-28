@@ -14,7 +14,7 @@
 //! **`config.ts` is fully reconciled to v2.26.1 and nothing is outstanding.** The whole delta is
 //! `+4/-4` in four one-line hunks: the `getConfigDirName` import, `PROJECT_PI_CONFIG_NAME` losing
 //! its `.pi/` prefix, `getProjectPiConfigPath` composing the dir name (all three commit `4ab5a40`,
-//! already ported as [`PROJECT_OVERRIDE_DIR`] + [`PROJECT_OVERRIDE_NAME`]), and
+//! already ported as [`PROJECT_OVERRIDE_DIR`] + [`crate::dirs::MCP_CONFIG_FILE`]), and
 //! [`URL_BOUND_AUTH_FIELDS`] gaining `requestHeadersCommand` (commit `2a2db3c`, ported with
 //! [`HttpRequestHeadersCommand`]). `types.ts` contributes `warnOnLargeDirectTools` (`76a4ea3`) and
 //! the `ServerEntry` field, both ported.
@@ -113,25 +113,12 @@ use crate::errors::{McpError, McpResult};
 // 1 · Path constants — `config.ts` head
 // ===================================================================================================
 
-/// `GENERIC_GLOBAL_CONFIG_PATH` — `join(homedir(), ".config", "mcp", "mcp.json")`. Tool-agnostic by
-/// design (it is the cross-vendor standard location), so it keeps its name in the port.
-pub const GENERIC_GLOBAL_CONFIG_SEGMENTS: [&str; 3] = [".config", "mcp", "mcp.json"];
-
-/// `AGENTS_GLOBAL_CONFIG_PATHS[0]` — `~/.agents/mcp.json`. Also tool-agnostic; verbatim.
-pub const AGENTS_GLOBAL_CONFIG_SEGMENTS: [&str; 2] = [".agents", "mcp.json"];
-
-/// `AGENTS_GLOBAL_CONFIG_PATHS[1]` — `~/.agents/mcp/mcp.json`.
-pub const AGENTS_NESTED_GLOBAL_CONFIG_SEGMENTS: [&str; 3] = [".agents", "mcp", "mcp.json"];
-
 /// `PROJECT_CONFIG_NAME` — `<cwd>/.mcp.json`, the shared project file.
 pub const PROJECT_CONFIG_NAME: &str = ".mcp.json";
 
 /// `getConfigDirName()` — upstream `.pi`. Renamed by settled in-tree precedent; see the module
 /// header.
 pub const PROJECT_OVERRIDE_DIR: &str = ".cyrup";
-
-/// `PROJECT_PI_CONFIG_NAME` — the filename inside [`PROJECT_OVERRIDE_DIR`].
-pub const PROJECT_OVERRIDE_NAME: &str = "mcp.json";
 
 /// `REPOPROMPT_BINARY_CANDIDATES[1]`. The `[0]` entry is `~/RepoPrompt/repoprompt_cli` and is built
 /// from the caller's home directory, so it cannot be a `const`.
@@ -434,16 +421,6 @@ impl<'de> Visitor<'de> for RawJsonVisitor {
     }
 }
 
-/// `serializeRawConfig(raw)` — `` `${JSON.stringify(raw, null, 2)}\n` ``.
-///
-/// Two-space indent and a **trailing newline**; both are part of the on-disk contract, because
-/// `buildConfigWritePreview` diffs against exactly this text (MCP-099) and a missing newline would
-/// show up as a one-line change on every write.
-#[must_use]
-pub fn serialize_raw_config(raw: &RawJson) -> String {
-    serde_json::to_string_pretty(raw).map_or_else(|_| "{}\n".to_string(), |text| format!("{text}\n"))
-}
-
 /// Re-read a [`RawJson`] as a typed value, or `None` if it does not fit.
 ///
 /// The round-trip goes through a compact JSON **string** rather than `serde_json::from_value`
@@ -696,17 +673,6 @@ impl McpConfig {
     pub fn tool_prefix(&self) -> ToolPrefix {
         self.settings_or_default().tool_prefix()
     }
-
-    /// `cloneMcpConfig(config)` = `structuredClone(config)` (MCP-081).
-    ///
-    /// A programmatic config is a **complete isolated snapshot**: never merged with files, imports
-    /// or `--mcp-config`, never mutated, and cloned per factory/session. In Rust that is
-    /// [`Clone`]; the alias exists so the upstream symbol is greppable and so the isolation
-    /// contract has a doc comment to live on.
-    #[must_use]
-    pub fn clone_snapshot(&self) -> McpConfig {
-        self.clone()
-    }
 }
 
 /// `HttpRequestHeadersCommand` (`types.ts:359-369`, upstream **v2.26.0** commit `2a2db3c`) — a
@@ -917,25 +883,6 @@ impl ServerEntry {
     #[must_use]
     pub fn expose_resources(&self) -> bool {
         self.expose_resources != Some(false)
-    }
-
-    /// `[command, url].filter(v => typeof v === "string" && v.length > 0).length !== 1` — the
-    /// connect-time transport check, whose failure message loses `, or socket` post-Cut-3.
-    ///
-    /// Deliberately **not** enforced at parse time: `loadMcpConfig` never rejects a two-transport
-    /// entry, and `isServerCacheValid` depends on that (it wraps the hash in a `try/catch`).
-    pub fn check_exactly_one_transport(&self, name: &str) -> McpResult<()> {
-        let count = [self.command.as_deref(), self.url.as_deref()]
-            .into_iter()
-            .flatten()
-            .filter(|value| !value.is_empty())
-            .count();
-        if count == 1 {
-            return Ok(());
-        }
-        Err(McpError::Config(format!(
-            "Server {name} must configure exactly one of command, url"
-        )))
     }
 }
 
@@ -1263,18 +1210,25 @@ impl McpSettings {
     /// `settings?.trace?.enabled === true` — the *global* half of
     /// `definition.trace ?? settings.trace?.enabled === true`; the per-server override is
     /// [`ServerEntry::trace`] and it wins by presence.
+    ///
+    /// **No production reader.** `mcp-trace.ts` is **MCP-133 and unported** (see `crate::runtime`'s
+    /// step-4 note); this accessor is the settings half, waiting for the writer.
     #[must_use]
     pub fn trace_enabled(&self) -> bool {
         self.trace.as_ref().and_then(|trace| trace.enabled) == Some(true)
     }
 
     /// `boundedPositiveInteger(settings.trace?.maxBytes, DEFAULT_MCP_TRACE_MAX_BYTES)`.
+    ///
+    /// **No production reader** — MCP-133, as [`Self::trace_enabled`].
     #[must_use]
     pub fn trace_max_bytes(&self) -> u64 {
         positive_int(self.trace.as_ref().and_then(|t| t.max_bytes), DEFAULT_MCP_TRACE_MAX_BYTES)
     }
 
     /// `boundedPositiveInteger(settings.trace?.maxEvents, DEFAULT_MCP_TRACE_MAX_EVENTS)`.
+    ///
+    /// **No production reader** — MCP-133, as [`Self::trace_enabled`].
     #[must_use]
     pub fn trace_max_events(&self) -> u64 {
         positive_int(self.trace.as_ref().and_then(|t| t.max_events), DEFAULT_MCP_TRACE_MAX_EVENTS)
@@ -1286,23 +1240,6 @@ impl McpSettings {
     #[must_use]
     pub fn auth_required_message(&self) -> Option<&str> {
         self.auth_required_message.as_deref()
-    }
-
-    /// `resolveConfiguredOAuthDir(settings.oauthDir, cwd)` — `undefined`/`null` ⇒ `None`, blank
-    /// after `.trim()` ⇒ `None`, else `resolve(cwd, trimmed)`.
-    ///
-    /// Upstream additionally **throws** `settings.oauthDir must be a string` on a non-string. That
-    /// throw is unreachable here: [`lenient`] has already normalised a non-string to `None`, which
-    /// is the same end state a caller that catches the throw would reach (`getAuthBaseDir` falls
-    /// through to `<agent_dir>/mcp-oauth`). Recorded rather than reconstructed, because
-    /// reconstructing it would mean keeping the raw settings block alive purely to re-reject it.
-    #[must_use]
-    pub fn oauth_dir(&self, cwd: &Path) -> Option<PathBuf> {
-        let trimmed = self.oauth_dir.as_deref()?.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        Some(resolve_from(cwd, trimmed))
     }
 }
 
@@ -1799,6 +1736,11 @@ pub fn parse_json_config(raw: &str, path: &str) -> Result<RawJson, String> {
 /// deserialising out of it **sorts the server keys** — losing the file order that decides connect
 /// order, `/mcp` listing order and the tool-name collision tie-break. [`RawJson`] and [`IndexMap`]
 /// keep document order end to end.
+///
+/// **No production caller.** The load ladder reads files through [`read_validated_config`], which
+/// swallows a parse failure into a diagnostic and carries on; this is the variant that *reports* it
+/// to the caller, which is what an editor of a single document wants — and that caller is the `/mcp`
+/// panel, `TODO(MCP-394)`.
 pub fn parse_config_document(raw: &str, path: &str) -> Result<McpConfig, String> {
     let document = parse_json_config(raw, path)?;
     Ok(validate_config(&document, Path::new(path), &mut Vec::new()))
@@ -1954,8 +1896,12 @@ fn push_load_warning(path: &Path, error: &str, diagnostics: &mut Vec<ConfigDiagn
 /// `URL_BOUND_AUTH_FIELDS` — the credential-bearing fields whose value is bound to a specific
 /// server `url`.
 ///
-/// Present as data purely so the exhaustiveness test in this module can assert it against the
-/// struct's field list; [`merge_entry`] clears the fields by name, not by lookup.
+/// **This constant is the checklist, not the enforcement.** [`merge_entry`] clears these fields by
+/// name on the typed struct and never reads this list; what actually stops a fifth URL-bound field
+/// from quietly bypassing the strip is `merge_entry`'s destructure of `over`, written deliberately
+/// **without** a `..` rest pattern so adding a field to [`ServerEntry`] is a compile error there.
+/// The compile error tells you to handle the new field; this list is the second place you must then
+/// add it, and the exhaustiveness test in this module is what checks you did.
 pub const URL_BOUND_AUTH_FIELDS: [&str; 4] =
     ["headers", "bearerToken", "bearerTokenEnv", "requestHeadersCommand"];
 
@@ -1984,7 +1930,7 @@ pub const URL_BOUND_AUTH_FIELDS: [&str; 4] =
 ///
 /// The `command` ⇄ `url` case is deliberately *not* handled: upstream v2.25.0 does not handle it
 /// either, so a base `{command}` overridden by `{url}` produces a two-transport entry that parses
-/// fine and fails at connect with [`ServerEntry::check_exactly_one_transport`]'s message.
+/// fine and fails at connect with [`crate::runtime::select_transport`]'s message.
 ///
 /// # Exhaustiveness
 ///
@@ -2775,6 +2721,10 @@ impl ConfigContext {
     /// `command`, an `env` value beginning with `!` (a shell command), and a `cwd`, and upstream
     /// connects `eager` servers at load — and `cyrup_config::settings`' `SettingsManager` already
     /// draws exactly this line for every other project-scoped config.
+    ///
+    /// **No production caller yet.** The caller is whoever holds `HostServices::is_project_trusted`
+    /// — the `/mcp` dispatcher (`TODO(MCP-394)`) and the setup panel; until one of them lands the
+    /// ladder runs at the upstream-identical default of `true`.
     #[must_use]
     pub fn with_project_trusted(mut self, trusted: bool) -> Self {
         self.project_trusted = trusted;
@@ -2794,41 +2744,46 @@ impl ConfigContext {
     }
 
     /// Whether the project layer is trusted — see [`Self::with_project_trusted`].
+    ///
+    /// **No production reader yet.** The trust verdict is consumed inside this module by
+    /// [`Self::source_contributes`]; the accessor exists for the `/mcp` panel, which renders a
+    /// present-but-untrusted project source and whose dispatcher is `TODO(MCP-394)`.
     #[must_use]
     pub fn project_trusted(&self) -> bool {
         self.project_trusted
     }
 
-    /// `getPiGlobalConfigPath(overridePath)` — `resolve(overridePath)` when `--mcp-config` is set,
-    /// else `getAgentPath("mcp.json")`.
+    /// `getPiGlobalConfigPath(overridePath)` — config source **4**; [`McpDirs::user_config`] is the
+    /// resolver, and it carries the `config.ts:168` citation and the source numbering.
     ///
     /// `<agent_dir>/mcp.json` is **not negotiable**: it is fixed by
     /// `cyrup_permission_system::manager::read_configured_mcp_server_names`, which reads the same
     /// file as its global MCP config path.
     #[must_use]
     pub fn user_path(&self) -> PathBuf {
-        match &self.override_path {
-            Some(path) => resolve_from(self.dirs.cwd(), &path.to_string_lossy()),
-            None => self.dirs.global_config(),
-        }
+        let raw = self.override_path.as_ref().map(|path| path.to_string_lossy());
+        self.dirs.user_config(raw.as_deref())
     }
 
-    /// `getGenericGlobalConfigPath()` — `~/.config/mcp/mcp.json`.
+    /// `getGenericGlobalConfigPath()` — config source **1**, `~/.config/mcp/mcp.json`, resolved by
+    /// [`crate::dirs::shared_global_config`] against this context's [`Self::home`].
     #[must_use]
     pub fn generic_global_path(&self) -> PathBuf {
-        GENERIC_GLOBAL_CONFIG_SEGMENTS.iter().fold(self.home.clone(), |acc, seg| acc.join(seg))
+        crate::dirs::shared_global_config(&self.home)
     }
 
-    /// `getProjectConfigPath(cwd)` — `<cwd>/.mcp.json`.
+    /// `getProjectConfigPath(cwd)` — config source **5**, `<cwd>/.mcp.json`, resolved by
+    /// [`McpDirs::project_shared_config`].
     #[must_use]
     pub fn project_path(&self) -> PathBuf {
-        resolve_from(self.dirs.cwd(), PROJECT_CONFIG_NAME)
+        self.dirs.project_shared_config()
     }
 
-    /// `getProjectPiConfigPath(cwd)` — `<cwd>/.cyrup/mcp.json` (upstream `.pi`).
+    /// `getProjectPiConfigPath(cwd)` — config source **6**, `<cwd>/.cyrup/mcp.json` (upstream
+    /// `.pi`), resolved by [`McpDirs::project_agent_config`].
     #[must_use]
     pub fn project_override_path(&self) -> PathBuf {
-        resolve_from(self.dirs.cwd(), PROJECT_OVERRIDE_DIR).join(PROJECT_OVERRIDE_NAME)
+        self.dirs.project_agent_config()
     }
 
     /// `getConfigSources(overridePath, cwd)` — 4 to 6 specs, in precedence order, **later wins**.
@@ -2857,20 +2812,16 @@ impl ConfigContext {
             });
         }
 
+        // Sources 2 and 3, in `AGENTS_GLOBAL_CONFIG_PATHS` order — the paths themselves come from
+        // `dirs::agents_global_configs`, which owns the `config.ts:14` grammar.
+        let [agents_global, agents_nested] = crate::dirs::agents_global_configs(&self.home);
         let agents_paths = [
-            (
-                SourceId::AgentsGlobal,
-                "user-global .agents MCP",
-                ".agents MCP config",
-                AGENTS_GLOBAL_CONFIG_SEGMENTS.iter().fold(self.home.clone(), |acc, s| acc.join(s)),
-            ),
+            (SourceId::AgentsGlobal, "user-global .agents MCP", ".agents MCP config", agents_global),
             (
                 SourceId::AgentsNestedGlobal,
                 "user-global .agents nested MCP",
                 ".agents/mcp MCP config",
-                AGENTS_NESTED_GLOBAL_CONFIG_SEGMENTS
-                    .iter()
-                    .fold(self.home.clone(), |acc, s| acc.join(s)),
+                agents_nested,
             ),
         ];
         for (id, label, import_kind, agents_path) in agents_paths {
@@ -3012,9 +2963,11 @@ impl ConfigContext {
 
     /// `loadAgentPluginConfigs(config.settings?.agentPluginPaths, cwd)`.
     ///
-    /// [`crate::agent_plugin::load_agent_plugins`] is MCP-047's; until it lands it returns nothing,
-    /// so this contributes an empty base — which is also the correct answer for the overwhelmingly
-    /// common case of no `agentPluginPaths` at all.
+    /// MCP-047 has landed: this really does load, through
+    /// [`crate::agent_plugin::load_agent_plugins_in`] (see the comment on the call below for why it
+    /// is the three-argument form and not [`crate::agent_plugin::load_agent_plugins`]). It
+    /// contributes an empty base only when `agentPluginPaths` is absent, which is the overwhelmingly
+    /// common case.
     fn load_plugin_config(
         &self,
         config: &McpConfig,
@@ -3088,11 +3041,12 @@ pub const SERVERS_KEY: &str = "mcpServers";
 /// **deletes**. A hyphenated file is silently normalised by any write.
 pub const LEGACY_SERVERS_KEY: &str = "mcp-servers";
 
-/// [`serialize_raw_config`] for a document that is already known to be an object.
+/// `serializeRawConfig(raw)` for a document that is already known to be an object — the only
+/// serialiser, because every writer in this module holds a [`RawObject`].
 ///
 /// `` `${JSON.stringify(raw, null, 2)}\n` `` — 2-space indent and a **trailing newline**, both part
 /// of the on-disk contract because [`build_config_write_preview`] diffs against exactly this text
-/// (MCP-099).
+/// (MCP-099) and a missing newline would show up as a one-line change on every write.
 #[must_use]
 pub fn serialize_raw_object(raw: &RawObject) -> String {
     serde_json::to_string_pretty(raw).map_or_else(|_| "{}\n".to_string(), |text| format!("{text}\n"))
@@ -3366,6 +3320,8 @@ pub struct CompatibilityImportsResult {
 }
 
 /// `buildStarterProjectConfig()` — literally `{ "mcpServers": {} }`.
+///
+/// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
 #[must_use]
 pub fn build_starter_project_config() -> McpConfig {
     McpConfig::default()
@@ -3380,6 +3336,8 @@ fn starter_raw() -> RawObject {
 
 /// `previewSharedServerEntry(filePath, serverName, entry)` — the write preview for adding one
 /// server to an arbitrary shared file (a preset, or the RepoPrompt proposal).
+///
+/// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
 #[must_use]
 pub fn preview_shared_server_entry(
     path: &Path,
@@ -3398,6 +3356,8 @@ pub fn preview_shared_server_entry(
 /// The entry is serialised from the typed [`ServerEntry`], so only the fields it actually sets are
 /// written (`skip_serializing_if = "Option::is_none"` throughout); every *other* key in the file,
 /// known or not, survives because the surrounding document is the raw one.
+///
+/// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
 pub fn write_shared_server_entry(
     path: &Path,
     server_name: &str,
@@ -3423,6 +3383,8 @@ pub fn write_shared_server_entry(
 /// (§7 rule 3). An entry that is present but is not an object is skipped: upstream's
 /// `{ ...servers[name] }` would spread a string into `{0:"x"}`, which is not a behaviour worth
 /// reproducing and which no config can reach through [`to_server_entries`] anyway.
+///
+/// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
 pub fn write_direct_tools_config(
     changes: &IndexMap<String, BoolOrList>,
     provenance: &IndexMap<String, ServerProvenance>,
@@ -3481,6 +3443,8 @@ impl ConfigContext {
     /// (§14). It is a user-initiated write on a file the user can hand-edit, so a structural problem
     /// is reported rather than silently normalised — the opposite of the load path's contract, and
     /// deliberately so.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     pub fn write_project_server_disabled_override(
         &self,
         server_name: &str,
@@ -3641,6 +3605,8 @@ impl ConfigContext {
     /// The MCP-096 trust gate applies here as it does in [`Self::load`]: an untrusted project's
     /// sources contribute no servers, so they contribute no provenance either. Anything else would
     /// hand out a write target for a server that is not loaded.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     #[must_use]
     pub fn server_provenance(
         &self,
@@ -3733,6 +3699,8 @@ impl ConfigContext {
     /// unconditionally, so a file with no server table at all gains `"mcpServers": {}` in the
     /// preview *and* in the write. That is upstream, and it is why the preview of a first-time
     /// import shows two changes rather than one.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     #[must_use]
     pub fn preview_compatibility_imports(&self, import_kinds: &[ImportKind]) -> ConfigWritePreview {
         let target = self.user_path();
@@ -3752,6 +3720,8 @@ impl ConfigContext {
     /// When nothing is added the function returns `added: []` and **does not write**, so a second
     /// call does not touch the file's mtime. That matters because the onboarding path calls it on
     /// every start.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     pub fn ensure_compatibility_imports(
         &self,
         import_kinds: &[ImportKind],
@@ -3784,6 +3754,8 @@ impl ConfigContext {
     }
 
     /// `previewStarterProjectConfig(cwd)` — the `{ "mcpServers": {} }` scaffold's preview.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     #[must_use]
     pub fn preview_starter_project_config(&self) -> ConfigWritePreview {
         build_config_write_preview(&self.project_path(), &starter_raw())
@@ -3792,6 +3764,8 @@ impl ConfigContext {
     /// `writeStarterProjectConfig(cwd)` — writes `<cwd>/.mcp.json`, **clobbering** whatever was
     /// there. Upstream does not merge here and neither does this: the caller is the setup panel,
     /// which only offers the action when the file does not exist.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     pub fn write_starter_project_config(&self) -> McpResult<PathBuf> {
         let target = self.project_path();
         write_raw_config_object(&target, &starter_raw())?;
@@ -3885,6 +3859,8 @@ pub struct ConfigDiscoverySource {
     /// MCP-096, and not an upstream field: `false` for a project-scoped rung when the project is
     /// untrusted. The rung still appears, with its real [`Self::server_count`], so the panel can say
     /// *"present, not loaded"* instead of pretending the file is empty.
+    ///
+    /// **Not read in production yet**: the renderer is the `/mcp` setup panel (`TODO(MCP-394)`).
     pub contributes: bool,
 }
 
@@ -3964,6 +3940,8 @@ pub struct RepoPromptDiscovery {
     /// A RepoPrompt server was found in a **shared** source.
     pub configured: bool,
     /// Where it was found.
+    ///
+    /// **Not read in production yet**: the renderer is the `/mcp` setup panel (`TODO(MCP-394)`).
     pub configured_path: Option<PathBuf>,
     /// The binary that was probed for, when not configured.
     pub executable_path: Option<PathBuf>,
@@ -4088,6 +4066,8 @@ impl ConfigContext {
     /// [`Self::config_source_summaries`] reads and validates every file and emits every warning.
     /// A port that implemented this in terms of the summary would change both the cost and the
     /// warning output of the setup panel.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     #[must_use]
     pub fn config_discovery_paths(&self) -> Vec<ConfigDiscoveryPath> {
         self.sources()
@@ -4105,6 +4085,8 @@ impl ConfigContext {
     ///
     /// This one **does** parse (through `resolveImportPath`) and warns with
     /// `` `Failed to discover imported MCP config from ${kind}:` ``.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     #[must_use]
     pub fn find_available_import_configs(
         &self,
@@ -4145,6 +4127,8 @@ impl ConfigContext {
 
     /// `getMcpStandardConfigSummary(overridePath, cwd)` — the narrow summary, with its own
     /// fingerprint over `sources` alone.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     #[must_use]
     pub fn mcp_standard_config_summary(
         &self,
@@ -4266,6 +4250,8 @@ impl ConfigContext {
     /// walks the ladder three times over (`getConfiguredHostConfigDiscovery` → `getMergedSettings`,
     /// then `getMergedSettings` again, then `getConfigSourceSummaries`), so a malformed file warns
     /// three times. Here the settings walk happens once.
+    ///
+    /// **No production caller yet.** This is the `/mcp` panel's data layer; the dispatcher that would call it is `TODO(MCP-394)` (`crate::ui`'s own note at `open_mcp_panel`, and `crate::extension`'s `/mcp` arm, which keeps the trait's default answer until MCP-394 lands).
     #[must_use]
     pub fn mcp_discovery_summary(
         &self,
@@ -4675,7 +4661,7 @@ mod tests {
 
         /// `<cwd>/.cyrup/mcp.json` — the project override the disabled writer owns.
         fn project_override(&self) -> PathBuf {
-            self.cwd.join(PROJECT_OVERRIDE_DIR).join(PROJECT_OVERRIDE_NAME)
+            self.cwd.join(PROJECT_OVERRIDE_DIR).join(crate::dirs::MCP_CONFIG_FILE)
         }
     }
 
@@ -5463,7 +5449,8 @@ mod tests {
 
         // And a write-back round-trips the file rather than erasing what it cannot use. The old
         // `Option<BTreeMap<String, String>>` dropped both blocks entirely on every write.
-        let written = serialize_raw_config(&raw_from(&entry));
+        let raw = raw_from(&entry);
+        let written = serialize_raw_object(raw.as_object().expect("a serialised entry is an object"));
         assert!(written.contains(r#""BAD": 5"#), "{written}");
         assert!(written.contains(r#""X-Bad": null"#), "{written}");
         assert!(written.contains(r#""auth": "basic""#), "{written}");

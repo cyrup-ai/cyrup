@@ -976,6 +976,13 @@ impl KeySpec {
 /// this crate must not depend on, so option (a) of MCP-363a is taken: `cyrup-mcp` carries its own
 /// copy (`up` / `down` / `return`, which are also upstream's own no-manager fallbacks) and a
 /// cross-crate test is what keeps the two from drifting.
+///
+/// # No production caller (MCP-394)
+///
+/// Nothing outside this module's tests ever builds one. Both panels take their keys from whoever
+/// opens them, and the only opener is the `/mcp` dispatcher — `TODO(MCP-394)`, not ported; see the
+/// note above [`open_mcp_panel`] and `crate::extension`'s `/mcp` arm, which keeps the command
+/// trait's default answer until it lands.
 #[derive(Clone, Debug)]
 pub struct PanelKeys {
     up: Vec<KeySpec>,
@@ -1074,6 +1081,10 @@ impl PanelKeys {
     /// readers cannot disagree about what `tui.select.up` means. Every failure mode (absent,
     /// unreadable, malformed, non-object) falls back to [`PanelKeys::default`], which is pi's
     /// "no manager" arm.
+    ///
+    /// **No production caller.** The agent dir is read for a panel that is about to open, and the
+    /// only thing that opens one is the `/mcp` dispatcher — `TODO(MCP-394)`, not ported — so today
+    /// only this module's tests reach it.
     #[must_use]
     pub fn from_agent_dir(agent_dir: &Path) -> Self {
         let path = agent_dir.join("keybindings.json");
@@ -1305,6 +1316,10 @@ impl McpPanelResult {
     ///
     /// A server absent from [`Self::changes`] stays absent here, which is what stops
     /// `writeDirectToolsConfig` from touching its config file at all.
+    ///
+    /// **No production caller.** This is the write-back argument named by the `TODO(MCP-394)` above
+    /// [`open_mcp_panel`]: the `writeDirectToolsConfig` -> `onDirectToolsConfigChanged` chain that
+    /// would consume it belongs to the unported `/mcp` dispatcher, not to the panel.
     #[must_use]
     pub fn to_config_changes(&self) -> IndexMap<String, crate::config::BoolOrList> {
         self.changes
@@ -1398,6 +1413,10 @@ pub enum PanelInputOutcome {
 /// run inside [`McpPanelModel::finish_job`]. `refreshCacheAfterReconnect` re-reads the whole cache
 /// file every time; keep that — it is how the panel observes what `updateMetadataCache` just
 /// flushed.
+///
+/// **No production implementor.** Building one is `buildMcpPanelCallbacks`' job (see the
+/// `TODO(MCP-392)` above), which is the `/mcp` dispatcher's — `TODO(MCP-394)`, not ported — so all
+/// three implementors in the tree are `#[cfg(test)]`.
 pub trait McpPanelCallbacks: Send + Sync + 'static {
     /// `getConnectionStatus(serverName)`. Never returns [`ConnectionStatus::Connecting`].
     fn connection_status(&self, server: &str) -> ConnectionStatus;
@@ -1949,18 +1968,28 @@ impl McpPanelModel {
     }
 
     /// The flattened list the cursor indexes into.
+    ///
+    /// **No production caller:** the overlay in this module renders from the private field, and the
+    /// out-of-module reader would be the `/mcp` dispatcher — `TODO(MCP-394)`, not ported.
     #[must_use]
     pub fn visible_items(&self) -> &[VisibleItem] {
         &self.visible_items
     }
 
     /// The cursor's position in [`Self::visible_items`].
+    ///
+    /// **No production caller**, for the same reason as [`Self::visible_items`]: the reader is the
+    /// unported `/mcp` dispatcher (`TODO(MCP-394)`).
     #[must_use]
     pub fn cursor_index(&self) -> usize {
         self.cursor_index
     }
 
     /// Whether any toggle differs from its baseline.
+    ///
+    /// **No production caller:** the "(unsaved)" hint in this module reads the private field, and
+    /// the out-of-module reader — the `/mcp` dispatcher, deciding whether a close needs a
+    /// write-back — is `TODO(MCP-394)`, not ported.
     #[must_use]
     pub fn is_dirty(&self) -> bool {
         self.dirty
@@ -1968,12 +1997,19 @@ impl McpPanelModel {
 
     /// The OAuth / reconnect / clipboard notice, un-truncated. Rendered italic in `needsAuth`
     /// beneath the body; exposed because the frame truncates it to the panel width.
+    ///
+    /// **No production caller:** the overlay in this module does that truncation off the private
+    /// field, so the accessor's only reader is out-of-module — the `/mcp` dispatcher, which is
+    /// `TODO(MCP-394)` and not ported.
     #[must_use]
     pub fn auth_notice(&self) -> Option<&str> {
         self.auth_notice.as_deref()
     }
 
     /// The "will copy to user config on save" notice, un-truncated.
+    ///
+    /// **No production caller**, for the same reason as [`Self::auth_notice`]: the out-of-module
+    /// reader is the unported `/mcp` dispatcher (`TODO(MCP-394)`).
     #[must_use]
     pub fn import_notice(&self) -> Option<&str> {
         self.import_notice.as_deref()
@@ -3347,6 +3383,9 @@ pub enum NoticeTone {
 }
 
 /// `ensureCompatibilityImports`' result, as the panel reads it.
+///
+/// **Never produced in production:** its only producer is a [`SetupPanelCallbacks`] implementor, and
+/// the `/mcp setup` dispatcher that would supply one is `TODO(MCP-394)` — not ported.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdoptImportsOutcome {
     /// What was actually added; **empty means nothing was written**.
@@ -3358,6 +3397,10 @@ pub struct AdoptImportsOutcome {
 /// `writeSharedServerEntry`'s result. Note `server_name` is the preset's **display name**, while the
 /// key written into the file is its `id` — adding "Chrome DevTools" writes `"chrome-devtools"` and
 /// notices `Added Chrome DevTools to ...` (MCP-379).
+///
+/// **Never produced in production**, for the same reason as [`AdoptImportsOutcome`]: the only
+/// producer is a [`SetupPanelCallbacks`] implementor, and `/mcp setup`'s dispatcher is the unported
+/// `TODO(MCP-394)`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AddServerOutcome {
     /// The file written.
@@ -3374,6 +3417,9 @@ pub struct AddServerOutcome {
 /// *idle* panel re-reads the config four times a second where upstream re-reads it only on a
 /// keystroke. That amplification is the poll-repaint residue, filed rather than cached away
 /// (MCP-375).
+///
+/// **No production implementor.** `/mcp setup`'s dispatcher is what builds one, and it is
+/// `TODO(MCP-394)` — not ported — so the single implementor in the tree is `#[cfg(test)]`.
 pub trait SetupPanelCallbacks: Send + Sync + 'static {
     /// `previewImports(imports)`.
     fn preview_imports(&self, imports: &[ImportKind]) -> ConfigWritePreview;
@@ -3629,12 +3675,18 @@ impl McpSetupPanelModel {
     }
 
     /// The current screen.
+    ///
+    /// **No production caller:** the overlay in this module renders from the private field; this
+    /// accessor is for the `/mcp setup` dispatcher, which is `TODO(MCP-394)` and not ported.
     #[must_use]
     pub fn screen(&self) -> SetupScreen {
         self.screen
     }
 
     /// Whether an async write is in flight.
+    ///
+    /// **No production caller**, for the same reason as [`Self::screen`]: the reader is the unported
+    /// `/mcp setup` dispatcher (`TODO(MCP-394)`).
     #[must_use]
     pub fn is_busy(&self) -> bool {
         self.busy
@@ -3647,6 +3699,9 @@ impl McpSetupPanelModel {
     }
 
     /// Whether `done()` has been called.
+    ///
+    /// **No production caller:** the overlay in this module tears down off the private flag; the
+    /// out-of-module reader — the `/mcp setup` dispatcher — is `TODO(MCP-394)`, not ported.
     #[must_use]
     pub fn is_closed(&self) -> bool {
         self.closed
@@ -4695,6 +4750,11 @@ pub fn footer_status_text(config: &McpConfig, counts: FooterCounts) -> Option<St
 ///
 /// The flag is a plain boolean and the fingerprint is stored but **never compared**, so a changed
 /// fingerprint does not re-arm the hint.
+///
+/// **No production caller.** Both halves of the one-shot belong to the `/mcp` dispatcher: it renders
+/// the lines and, once the panel has actually opened, stamps the returned fingerprint with
+/// [`crate::onboarding::mark_shared_config_hint_shown`]. That dispatcher is `TODO(MCP-394)` and not
+/// ported, so nothing consumes either half yet.
 #[must_use]
 pub fn shared_config_notice_lines(
     summary: &crate::config::McpStandardConfigSummary,
@@ -4753,6 +4813,11 @@ pub fn shared_config_notice_lines(
 // notify at `info` with [`panel_unavailable_message`] / [`auth_panel_unavailable_message`].
 
 /// `openMcpAuthPanel`'s `noticeLines` (MCP-391), rendered under the search row.
+///
+/// **No production reader.** The `/mcp-auth` picker it decorates is the overlay one, opened by the
+/// `/mcp` dispatcher — `TODO(MCP-394)`, not ported. `crate::extension`'s live `/mcp-auth` arm runs a
+/// `select` dialog instead and deliberately uses its own prompt (`AUTH_PICKER_PROMPT` there), which
+/// is why this constant is not simply shared.
 pub const AUTH_PANEL_NOTICE: &str =
     "Select an OAuth MCP server and press Enter or ctrl+a to authenticate.";
 
@@ -4761,6 +4826,11 @@ pub const AUTH_PANEL_NOTICE: &str =
 ///
 /// `commands.ts:415-418` @v2.26.1 (upstream `5787ecd`); see the section note above for why the
 /// guard that emits it is a host capability probe here rather than a mode string comparison.
+///
+/// **No production caller — and the contrast with its twin is the point.**
+/// [`auth_panel_unavailable_message`] below **is** wired: `crate::extension`'s `/mcp-auth` arm emits
+/// it whenever no terminal overlay is available. This one is `/mcp setup`'s refusal, and `/mcp
+/// setup` is dispatched by the arm that is still `TODO(MCP-394)`, so nothing emits it yet.
 #[must_use]
 pub fn panel_unavailable_message(mode: &str) -> String {
     format!(
@@ -4801,6 +4871,10 @@ pub fn auth_panel_unavailable_message(mode: &str) -> String {
 ///
 /// `None` is pi's `if (!ctx.hasUI)` branch — no renderer is attached, so the caller falls back to
 /// `showStatus`. It is **not** an error.
+///
+/// **No production caller.** The `TODO(MCP-394)` directly above owns it: `crate::extension`'s `/mcp`
+/// arm keeps the command trait's default answer until that dispatcher is ported, and when it lands
+/// the arm becomes a call to this function.
 #[must_use]
 pub fn open_mcp_panel(
     services: &dyn cyrup_ext::host::HostServices,
@@ -4822,6 +4896,9 @@ pub fn open_mcp_panel(
 /// Returns `false` for the no-renderer branch, exactly as [`open_mcp_panel`] returns `None`. The
 /// setup panel's own `done()` carries no value — whether anything was written is tracked by the
 /// caller's [`SetupPanelCallbacks`] implementation, which is where `configChanged` lives upstream.
+///
+/// **No production caller**, for the same reason as [`open_mcp_panel`]: `/mcp setup` is dispatched by
+/// the unported `TODO(MCP-394)` arm.
 #[must_use]
 pub fn open_mcp_setup_panel(
     services: &dyn cyrup_ext::host::HostServices,

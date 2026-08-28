@@ -118,6 +118,14 @@ pub async fn abortable<F: Future>(fut: F, token: &CancelToken) -> McpResult<F::O
 
 /// [`abortable`] against a runtime owner, so the surfaced [`McpError::Aborted`] carries the exact
 /// reason the owner was stopped with — `signal.reason`'s message, round-tripped.
+///
+/// **No production caller: every shipping race goes through [`abortable`] instead**, which raises
+/// [`ABORTED_FALLBACK_REASON`] because it holds a bare [`CancelToken`] and not the owner that
+/// carries the reason. That is a real difference a user can see — a custom `stop(reason)` is
+/// currently invisible at the error — so this is not a helper waiting on an unported unit but a
+/// better-informed variant waiting for its call sites to be handed an
+/// [`McpRuntimeOwner`]. Its one use today is this module's
+/// `abortable_owned_carries_the_stop_reason` test, which is the measurement of that difference.
 pub async fn abortable_owned<F: Future>(fut: F, owner: &McpRuntimeOwner) -> McpResult<F::Output> {
     let token = owner.token();
     tokio::select! {

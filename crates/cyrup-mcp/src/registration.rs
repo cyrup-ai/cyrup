@@ -507,6 +507,10 @@ impl CandidateIndex {
     /// `types.ts` `ToolSelectorCandidateIndex.allCurrentCandidates` — the readonly view of the set
     /// the index was built over. The two memo tables stay private; this one is upstream's public
     /// field and is what lets a caller assert *what* was indexed without being able to mutate it.
+    ///
+    /// **No caller yet.** The caller is the `list_changed` refresh path, which reads back the index
+    /// it has just rebuilt — **MCP-120**, unported. Init builds the index and consumes it in the
+    /// same breath, so it never needs to ask what was indexed.
     #[must_use]
     pub fn all_current(&self) -> &IndexSet<String> {
         &self.all_current
@@ -2059,8 +2063,7 @@ pub fn should_register_proxy_tool(
     direct_specs: &[DirectToolSpec],
     env_override: Option<&[String]>,
 ) -> bool {
-    let disabled = config.settings.as_ref().and_then(|s| s.disable_proxy_tool) == Some(true);
-    !disabled
+    config.settings_or_default().proxy_tool_enabled()
         || direct_specs.is_empty()
         || !missing_configured_direct_tool_servers(config, cache, env_override).is_empty()
 }

@@ -69,19 +69,26 @@ mod tests {
         assert!(!is_selected(&[]));
     }
 
-    /// SEAM-109 — the two hidden argv verbs are cyrup inventions (pi has no argv verbs at all), so
-    /// two things are owed and both are asserted here.
+    /// SEAM-109 — the three hidden argv verbs are cyrup inventions (pi has no argv verbs at all),
+    /// so two things are owed and both are asserted here.
     ///
-    /// 1. They stay INVISIBLE. `--help` and the package-subcommand table must not name either — the
-    ///    verbs are internal re-exec selectors, not a user surface, and the moment one leaks into the
-    ///    help it becomes a command a user can reasonably expect to keep working.
+    /// 1. They stay INVISIBLE. `--help` and the package-subcommand table must not name any of them —
+    ///    the verbs are internal re-exec selectors, not a user surface, and the moment one leaks into
+    ///    the help it becomes a command a user can reasonably expect to keep working.
     /// 2. Each carries a `[CYRUP-DELTA]` naming the upstream mechanism it replaces. RED before this
-    ///    pass: neither module had one, so a reader had no way to tell an invented surface from a
-    ///    ported one. Read from source at compile time, the only way to assert on a doc block.
+    ///    pass: none of the modules had one, so a reader had no way to tell an invented surface from
+    ///    a ported one. Read from source at compile time, the only way to assert on a doc block.
+    ///
+    /// The table is the enrolment gate: every module named in `predispatch::Internal` must appear in
+    /// it, so a fourth verb cannot be added without also declaring its delta.
     #[test]
     fn the_hidden_argv_verbs_are_invisible_and_declared_as_cyrup_deltas() {
         let help = crate::cli::render_help(&[]);
-        for token in [SUBCOMMAND, crate::subagent_runner_cmd::SUBCOMMAND] {
+        for token in [
+            SUBCOMMAND,
+            crate::subagent_runner_cmd::SUBCOMMAND,
+            crate::mcp_keyring_helper_cmd::SUBCOMMAND,
+        ] {
             assert!(!help.contains(token), "`{token}` must not appear in --help");
             assert!(
                 crate::subcommands::first_subcommand(&[token.to_string()]).is_none(),
@@ -99,6 +106,11 @@ mod tests {
                 "subagent_runner_cmd",
                 include_str!("subagent_runner_cmd.rs"),
                 "async-execution.ts",
+            ),
+            (
+                "mcp_keyring_helper_cmd",
+                include_str!("mcp_keyring_helper_cmd.rs"),
+                "mcp-keyring-helper.cjs",
             ),
         ] {
             let delta = src
