@@ -796,6 +796,24 @@ impl<B: Backend> App<B> {
                 None => self.state.transcript.push_warning("Usage: /name <name>"),
             },
 
+            // ADR-0005 §B-11: with an active alternate-screen selection, `/copy` copies THAT
+            // rather than the last assistant message — upstream asks
+            // `getSelectionBounds() !== undefined` first (`tui-alt-screen.ts:545`) and copies the
+            // selection when it answers yes. This arm was specified in B-11 and never wired, which
+            // is what left `selection::has_selection` dead: selecting text and running `/copy`
+            // silently copied the wrong thing.
+            C::Copy if self.altscreen.as_ref().and_then(AltScreen::selection_text).is_some() => {
+                let Some(text) = self.altscreen.as_ref().and_then(AltScreen::selection_text) else {
+                    return;
+                };
+                let n = text.chars().count();
+                if crate::clipboard::copy_to_clipboard(&text).await {
+                    self.state.transcript.push_status(format!("copied selection ({n} chars)"));
+                } else {
+                    self.state.transcript.push_error("Failed to copy to clipboard");
+                }
+            }
+
             C::Copy => match session.last_assistant_text().await {
                 Some(text) => {
                     let n = text.chars().count();

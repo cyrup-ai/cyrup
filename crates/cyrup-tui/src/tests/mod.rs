@@ -34,6 +34,7 @@
 //! the hand-rolled per-file copies had already broken — read its module doc before adding another
 //! scrape helper.
 
+mod alt_screen;
 mod app_global_actions;
 mod assembled_render;
 mod auth_selector;
@@ -77,6 +78,7 @@ mod footer_chrome_fidelity;
 mod footer_git_branch;
 mod footer_subscription;
 mod fork_selector;
+mod fullscreen_scrollback;
 pub(crate) mod harness;
 mod image;
 mod image_capabilities;

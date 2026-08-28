@@ -90,7 +90,7 @@
 //! renderer and dropped with it; until [`ImageLifecycle::enter`] runs, the capability global,
 //! the transcript gate and the strip painter are all exactly what they were before ADR-0005.
 
-use std::io::{self, Write};
+use std::io::Write;
 
 use ratatui::crossterm::queue;
 use ratatui::crossterm::style::Print;
@@ -114,6 +114,18 @@ const MAX_CACHED_OFFSCREEN_DECODED_BYTES: u64 = 64 * 1024 * 1024;
 /// pi's `deleteAllKittyImages()` (`terminal-image.ts:277-279`): `a=d,d=A` deletes every visible
 /// placement AND frees the uploaded data, `q=2` suppresses the terminal's reply.
 const DELETE_ALL_KITTY_IMAGES: &str = "\x1b_Ga=d,d=A,q=2\x1b\\";
+
+/// pi's `deleteAllKittyPlacements()` (`terminal-image.ts:282-284`): `a=d,d=a` — lowercase `d=a`
+/// deletes every visible placement but RETAINS the uploaded image data, where
+/// [`DELETE_ALL_KITTY_IMAGES`]'s uppercase `d=A` also frees it. That distinction is the whole point
+/// of pi's full-redraw branch (`tui-alt-screen.ts:1313-1316`): when uploads are retained, the
+/// screen can be repainted without re-transmitting a single image.
+const DELETE_ALL_KITTY_PLACEMENTS: &str = "\x1b_Ga=d,d=a,q=2\x1b\\";
+
+/// [`DELETE_ALL_KITTY_PLACEMENTS`] in tmux's passthrough, for the reason
+/// [`DELETE_ALL_KITTY_IMAGES_TMUX`] gives.
+const DELETE_ALL_KITTY_PLACEMENTS_TMUX: &str =
+    "\x1bPtmux;\x1b\x1b_Ga=d,d=a,q=2\x1b\x1b\\\x1b\\";
 
 /// [`DELETE_ALL_KITTY_IMAGES`] wrapped in tmux's passthrough (`\x1bPtmux;` … `\x1b\\`, with every
 /// inner `ESC` doubled) — the same wrapping `ratatui-image` applies to the transmissions this
@@ -261,13 +273,6 @@ impl PlacementRegistry {
     /// How many uploads are currently retained. The renderer's window onto the registry; nothing
     /// outside this module may hold a [`Placement`], because the eviction order is the type's
     /// invariant and an external reordering would silently break it.
-    #[allow(
-        dead_code,
-        reason = "pi's `uploadedKittyImages.size` (tui-alt-screen.ts:180). The read-only window \
-                  onto the registry the doc above describes; no diagnostics surface in the \
-                  alternate-screen renderer consumes it yet, and the type's eviction invariant is \
-                  the reason it must stay the only way out."
-    )]
     pub(super) fn tracked(&self) -> usize {
         self.entries.len()
     }
@@ -312,9 +317,22 @@ pub(super) struct ImageLifecycle {
     saved: Option<TerminalCapabilities>,
     /// pi's `uploadedKittyImages` (`:182`).
     placements: PlacementRegistry,
+    /// Where the kitty delete escapes go — [`super::out::Out`], owned because `Drop` deletes
+    /// through it.
+    out: super::out::Out,
 }
 
 impl ImageLifecycle {
+    /// Build the lifecycle over a given escape sink.
+    ///
+    /// The registry starts empty exactly as `#[derive(Default)]` left it; only the sink is
+    /// injected, so that a test can read the kitty deletes this type emits (see `out.rs`).
+    pub(super) fn new(out: super::out::Out) -> Self {
+        // Field-by-field rather than `..Self::default()`: this type implements `Drop`, so struct
+        // update syntax cannot move out of the placeholder (E0509).
+        Self { protocol: None, saved: None, placements: PlacementRegistry::default(), out }
+    }
+
     /// Latch the terminal's protocol and suppress iterm2 images — pi's `beforeTerminalStart` image
     /// block (`tui-alt-screen.ts:264-270`), in upstream's order: read the capabilities, latch the
     /// protocol from them, clear the registry, and only then suppress.
@@ -355,25 +373,55 @@ impl ImageLifecycle {
 
     /// The protocol the terminal negotiated before suppression — pi's `imageProtocol` (`:180`).
     /// `None` on a terminal with no native graphics, where every image is already half-blocks.
-    #[allow(
-        dead_code,
-        reason = "pi's `imageProtocol` getter (tui-alt-screen.ts:180). Ported with the lifecycle \
-                  it belongs to; the only in-crate consumer would be a caller that re-negotiates \
-                  graphics mid-excursion, which is not wired yet."
-    )]
+    /// `#[cfg(test)]`: pi's `imageProtocol` getter (`tui-alt-screen.ts:180`). Production reads the
+    /// `protocol` field directly inside this type, so the getter's only consumer is an assertion.
+    #[cfg(test)]
     pub(super) fn protocol(&self) -> Option<ImageProtocol> {
         self.protocol
     }
 
     /// The retained uploads — read-only, for the renderer's diagnostics.
-    #[allow(
-        dead_code,
-        reason = "read-only view of pi's `uploadedKittyImages` (tui-alt-screen.ts:182). Ported \
-                  with `tracked` above and unreachable for the same reason: no renderer \
-                  diagnostics path exists yet."
-    )]
+    /// `#[cfg(test)]`: a read-only view of pi's `uploadedKittyImages` (`tui-alt-screen.ts:182`).
+    /// The registry is private to this type in production; this exposes it for assertions only.
+    #[cfg(test)]
     pub(super) fn placements(&self) -> &PlacementRegistry {
         &self.placements
+    }
+
+    /// Clear kitty placements for a FULL REDRAW — pi's `tui-alt-screen.ts:1310-1316`.
+    ///
+    /// Upstream picks between two escapes on a full repaint, and the choice is exactly
+    /// `imageProtocol === "kitty" && hadUploadedKittyImages`:
+    ///
+    /// - kitty WITH retained uploads -> `deleteAllKittyPlacements()` (`d=a`), which unpins the
+    ///   placements the stale frame drew while KEEPING the uploaded data, so the repaint re-places
+    ///   without re-transmitting;
+    /// - anything else -> `deleteKittyImages()` (`d=A`), upstream's unconditional teardown delete.
+    ///
+    /// Both inputs to that condition — [`Self::protocol`] and [`PlacementRegistry::tracked`] —
+    /// existed and had no caller, because this branch was never ported. A resize is cyrup's full
+    /// redraw: ratatui's `autoresize` discards its previous buffer and repaints every cell, but
+    /// kitty placements live OUTSIDE that buffer model, so without this they survive at their old
+    /// coordinates over the new layout.
+    ///
+    /// The registry is deliberately NOT cleared in the retain branch — that is what makes the
+    /// uploads reusable, and clearing it is what would turn this back into the expensive path.
+    pub(super) fn clear_placements_for_redraw(&mut self) {
+        if self.protocol != Some(ImageProtocol::Kitty) {
+            return;
+        }
+        let retain = self.placements.tracked() > 0;
+        let sequence = match (retain, wraps_for_tmux()) {
+            (true, true) => DELETE_ALL_KITTY_PLACEMENTS_TMUX,
+            (true, false) => DELETE_ALL_KITTY_PLACEMENTS,
+            (false, true) => DELETE_ALL_KITTY_IMAGES_TMUX,
+            (false, false) => DELETE_ALL_KITTY_IMAGES,
+        };
+        if !retain {
+            self.placements.clear();
+        }
+        let _ = queue!(self.out, Print(sequence));
+        let _ = self.out.flush();
     }
 
     /// Delete the session's kitty uploads and forget them — pi's `beforeTerminalStop` image work
@@ -405,9 +453,8 @@ impl ImageLifecycle {
         }
         let sequence =
             if wraps_for_tmux() { DELETE_ALL_KITTY_IMAGES_TMUX } else { DELETE_ALL_KITTY_IMAGES };
-        let mut out = io::stdout();
-        let _ = queue!(out, Print(sequence));
-        let _ = out.flush();
+        let _ = queue!(self.out, Print(sequence));
+        let _ = self.out.flush();
     }
 
     /// Put the saved capability record back — pi's `afterTerminalStop` tail (`:330-333`).

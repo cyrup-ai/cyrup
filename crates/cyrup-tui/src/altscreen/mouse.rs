@@ -40,7 +40,7 @@
 //! exactly one thing: whether the terminal is sending reports at all, and the process-global answer
 //! to that question which the input reader consults.
 
-use std::io::{self, Write};
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::crossterm::event::MouseEvent;
@@ -143,6 +143,9 @@ pub(super) struct MouseSetup {
     /// pi's `altScreenActive` guard applied to this half (`:304`): `true` between a successful
     /// [`Self::enable`] and the first [`Self::disable`], so the reset runs at most once.
     active: bool,
+    /// Where the reporting escapes go — [`super::out::Out`], owned because `Drop` resets
+    /// through it.
+    out: super::out::Out,
 }
 
 impl MouseSetup {
@@ -156,12 +159,12 @@ impl MouseSetup {
     /// unwinds through `Drop`, which emits the inverse and disarms. Over-resetting a mode the
     /// terminal never entered costs nothing; under-resetting costs the user a shell that types
     /// escape sequences at them.
-    pub(super) fn enable() -> Result<Self, TuiError> {
-        let setup = MouseSetup { active: true };
+    pub(super) fn enable(out: super::out::Out) -> Result<Self, TuiError> {
+        // The sink moves into the guard because `Drop` disables through it (see `out.rs`).
+        let mut setup = MouseSetup { active: true, out };
         REPORTING.store(true, Ordering::Relaxed);
-        let mut out = io::stdout();
-        queue!(out, Print(enable_sequence()))?;
-        out.flush()?;
+        queue!(setup.out, Print(enable_sequence()))?;
+        setup.out.flush()?;
         Ok(setup)
     }
 
@@ -183,9 +186,8 @@ impl MouseSetup {
         // Disarmed before the write, not after: the reader must stop accepting reports even if the
         // reset escape never reaches the terminal.
         REPORTING.store(false, Ordering::Relaxed);
-        let mut out = io::stdout();
-        let _ = queue!(out, Print(DISABLE_MOUSE));
-        let _ = out.flush();
+        let _ = queue!(self.out, Print(DISABLE_MOUSE));
+        let _ = self.out.flush();
     }
 }
 

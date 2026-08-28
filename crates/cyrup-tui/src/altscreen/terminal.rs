@@ -43,7 +43,7 @@
 //! `deny(clippy::string_slice)` exists to discourage. The mapping to pi's constants
 //! (`tui-alt-screen.ts:51-61`) is one-to-one and noted at each use site.
 
-use std::io::{self, Write};
+use std::io::Write;
 
 use ratatui::backend::Backend;
 use ratatui::crossterm::cursor::{Hide, MoveTo, Show};
@@ -53,6 +53,7 @@ use ratatui::crossterm::terminal::{
     BeginSynchronizedUpdate, Clear, ClearType, DisableLineWrap, EnableLineWrap,
     EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use ratatui::text::Line;
 use ratatui::Terminal;
 
 use crate::error::TuiError;
@@ -89,8 +90,8 @@ impl<B: Backend> AltTerminal<B> {
     /// their original screen with the cursor back — the `startup_selector.rs:73-78` idiom, where the
     /// guard is taken the instant the first terminal mode is touched rather than at the end of a
     /// successful setup.
-    pub(super) fn enter(backend: B) -> Result<Self, TuiError> {
-        let setup = TerminalSetup::enter()?;
+    pub(super) fn enter(backend: B, out: super::out::Out) -> Result<Self, TuiError> {
+        let setup = TerminalSetup::enter(out)?;
         let terminal = Terminal::new(backend).map_err(|e| TuiError::Backend(e.to_string()))?;
         Ok(AltTerminal { terminal, setup })
     }
@@ -100,8 +101,8 @@ impl<B: Backend> AltTerminal<B> {
     /// Idempotent and total; see [`TerminalSetup::leave`] for what `preserve_screen` selects and
     /// for why calling this explicitly is an optimisation over the `Drop` path rather than a
     /// requirement.
-    pub(super) fn leave(&mut self, preserve_screen: bool) {
-        self.setup.leave(preserve_screen);
+    pub(super) fn leave(&mut self, preserve_screen: bool, document: &[Line<'static>], width: u16) {
+        self.setup.leave(preserve_screen, document, width);
     }
 
     /// The fullscreen [`Terminal`] every frame is drawn through.
@@ -135,6 +136,9 @@ pub(super) struct TerminalSetup {
     /// pi's `altScreenActive` (`tui-alt-screen.ts:179`). `true` between a successful
     /// [`Self::enter`] and the first [`Self::leave`]; the restore runs at most once.
     active: bool,
+    /// Where the enter/leave escapes go — [`super::out::Out`], owned rather than borrowed because
+    /// `Drop` restores through it.
+    out: super::out::Out,
 }
 
 impl TerminalSetup {
@@ -149,12 +153,12 @@ impl TerminalSetup {
     /// The cursor is hidden with a raw `?25l` rather than `Terminal::hide_cursor`, matching pi and
     /// keeping ratatui's own `hidden_cursor` flag `false` — otherwise `Terminal`'s `Drop` would
     /// re-emit `Show` at an ordering this module does not control.
-    fn enter() -> Result<Self, TuiError> {
-        // Armed before the first byte, not after the last.
-        let setup = TerminalSetup { active: true };
-        let mut out = io::stdout();
+    fn enter(out: super::out::Out) -> Result<Self, TuiError> {
+        // Armed before the first byte, not after the last. The sink moves into the guard because
+        // `Drop` restores through it and `Drop::drop` cannot be handed one (see `out.rs`).
+        let mut setup = TerminalSetup { active: true, out };
         queue!(
-            out,
+            setup.out,
             // `ENTER_ALT_SCREEN` (`:51`, `\x1b[?1049h`).
             EnterAlternateScreen,
             // `DISABLE_AUTOWRAP` (`:53`, `\x1b[?7l`): the renderer clips to the viewport itself, so
@@ -169,7 +173,7 @@ impl TerminalSetup {
             // `\x1b[?25l` (`:293`).
             Hide,
         )?;
-        out.flush()?;
+        setup.out.flush()?;
         Ok(setup)
     }
 
@@ -192,12 +196,12 @@ impl TerminalSetup {
     /// A second call writes nothing (pi's `if (!this.altScreenActive) return`, `:304`/`:312`), which
     /// is what lets the orderly path call this and `Drop` still be correct on the paths that do not.
     /// Returns nothing and swallows every write error for the reason given on the type.
-    pub(super) fn leave(&mut self, preserve_screen: bool) {
+    pub(super) fn leave(&mut self, preserve_screen: bool, document: &[Line<'static>], width: u16) {
         if !self.active {
             return;
         }
         self.active = false;
-        let mut out = io::stdout();
+        let out = &mut self.out;
 
         // ---- pi `beforeTerminalStop` (`:305-307`) -------------------------------------------
         // `BEGIN_SYNCHRONIZED_OUTPUT` + kitty deletes (§B-12) + `DISABLE_MOUSE` (§B-4) +
@@ -213,8 +217,12 @@ impl TerminalSetup {
             // the main screen at their rendered width, and a wrap here would double-space the
             // history the user is about to scroll through.
             let _ = queue!(out, DisableLineWrap);
-            // ADR-0005 §B-13 (`repaint.rs`) writes the retained screen here, one row per iteration
-            // of `:323-326`: `"\r\n"` between rows, then `"\r\x1b[2K"` and the row's text.
+            // ADR-0005 §B-13 (`exit::repaint`) writes the retained screen here, one row per
+            // iteration of `:323-326`: `"\r\n"` between rows, then `"\r\x1b[2K"` and the row's
+            // text. It MUST be inside this bracket and after `LeaveAlternateScreen`: rows written
+            // before the alternate screen is left are painted onto it and discarded with it, which
+            // is how a fullscreen session came to leave nothing in the user's scrollback.
+            super::exit::repaint(out, document, width, preserve_screen);
             // `\x1b[0m` + `ENABLE_AUTOWRAP` + `"\r\n"` (`:327`) close the repaint whether or not any
             // row was written — with none, this is upstream's output for an empty document.
             let _ = queue!(out, ResetColor, EnableLineWrap, Print("\r\n"));
@@ -236,6 +244,6 @@ impl Drop for TerminalSetup {
     /// document to repaint. Bringing the user's own screen back is what upstream's `preserveScreen`
     /// branch does (`tui-alt-screen.ts:315`).
     fn drop(&mut self) {
-        self.leave(true);
+        self.leave(true, &[], 0);
     }
 }

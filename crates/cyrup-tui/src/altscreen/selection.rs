@@ -338,14 +338,7 @@ pub(super) fn tick_auto_scroll(
 /// excursion, where upstream clears the same state (`:260-261`, `:301-302`).
 ///
 /// [`focus_lost`] is the *other* clear, and deliberately not this one.
-#[allow(
-    dead_code,
-    reason = "pi's unconditional selection clear on a scrollbar grab (tui-alt-screen.ts:776-784). \
-              `super::scrollbar_drag`'s module doc specifies the call site — one line in §B-3's \
-              mouse dispatcher, on a `true` from `scrollbar_drag::route` — but wiring it would \
-              change what a grab does to a live selection, so it is left to the change that \
-              lands §B-8's dispatcher rather than folded into a lint pass."
-)]
+/// Called from [`super::AltScreen::handle_mouse`] on a `true` from `scrollbar_drag::route`.
 pub(super) fn cancel(sel: &mut SelectionState) {
     stop_auto_scroll(sel);
     sel.press_active = false;
@@ -392,12 +385,9 @@ pub(super) fn focus_lost(sel: &mut SelectionState) -> bool {
 ///
 /// ADR-0005 §B-11's `/copy` reads it to choose between the selection and the transcript, which is
 /// the same question upstream asks before copying.
-#[allow(
-    dead_code,
-    reason = "pi's `this.getSelectionBounds() !== undefined` (tui-alt-screen.ts:545). ADR-0005 \
-              §B-11's `/copy` fork is the caller named in the doc above; that fork is not wired \
-              yet, and `bounds` stays private so this is the only way to ask."
-)]
+/// Called from [`super::AltScreen::selection_text`], which `/copy` consults before falling back to
+/// the last assistant message (`app/execute_misc.rs`). `bounds` stays private, so this is the only
+/// way to ask.
 pub(super) fn has_selection(sel: &SelectionState) -> bool {
     bounds(sel).is_some()
 }
