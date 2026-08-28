@@ -857,8 +857,8 @@ async fn catch_arm(
             map.insert("autoAuthAttempted".to_string(), Value::Bool(latch.attempted()));
             Ok(text_result(message, map))
         }
-        ProxyCallError::UrlElicitationRequired { detail } => {
-            let action = ctx.env.handle_url_elicitation_required(server_name, &detail).await;
+        ProxyCallError::UrlElicitationRequired { error } => {
+            let action = ctx.env.handle_url_elicitation_required(server_name, &error).await;
             let message = match action {
                 UrlElicitationAction::Accept =>
                     "The original MCP tool did not run. Complete the opened browser interaction, then retry the tool.".to_string(),

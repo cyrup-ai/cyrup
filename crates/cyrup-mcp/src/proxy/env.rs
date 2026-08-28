@@ -93,8 +93,11 @@ pub enum ProxyCallError {
     },
     /// rmcp's `UrlElicitationRequiredError` — the server wants a URL interaction first.
     UrlElicitationRequired {
-        /// Opaque detail handed straight back to `manager.handleUrlElicitationRequired`.
-        detail: String,
+        /// The `-32042` payload, handed straight back to
+        /// [`crate::server_manager::McpServerManager::handle_url_elicitation_required`]. Carried
+        /// whole rather than as a detail string because `data.elicitations` is the part that
+        /// matters, and a `to_string` of the error throws it away.
+        error: Box<rmcp::model::ErrorData>,
     },
     /// Everything else, including aborts.
     Other(McpError),
@@ -286,7 +289,11 @@ pub trait ProxyEnv: Send + Sync {
         cancel: &CancelToken,
     ) -> Result<Vec<Content>, ProxyCallError>;
     /// `state.manager.handleUrlElicitationRequired(server, error)`.
-    async fn handle_url_elicitation_required(&self, server: &str, detail: &str) -> UrlElicitationAction;
+    async fn handle_url_elicitation_required(
+        &self,
+        server: &str,
+        error: &rmcp::model::ErrorData,
+    ) -> UrlElicitationAction;
 
     // --- init.ts ---------------------------------------------------------------------------------
     /// `getFailureAgeSeconds(state, server)` — `None` outside the 60-second backoff window.
