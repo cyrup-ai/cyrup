@@ -160,6 +160,58 @@ fn grep_call_shows_pattern_and_path() {
 }
 
 #[test]
+fn list_tool_limit_survives_a_float_spelling() {
+    // `JSON.parse` gives the same double for `50` and `50.0`, and each of the three headers
+    // interpolates it with a template literal (`formatGrepCall` grep.ts:89, `formatFindCall`
+    // find.ts:85, `formatLsCall` ls.ts:62), so both spellings render. `Value::as_i64` answered
+    // `None` for the float and dropped the whole suffix.
+    let mut view = TranscriptView::new();
+    view.push_tool_start("grep", json!({ "pattern": "foo", "path": "src", "limit": 50.0 }));
+    view.push_tool_end("grep", false, Some(text_result("src/a.rs:1:foo()", json!(null))));
+    let text = render(&mut view, 70, 8);
+    assert!(text.contains("limit 50"), "grep float limit renders as `limit 50`: {text:?}");
+    assert!(!text.contains("limit 50.0"), "no Rust `Debug` float spelling: {text:?}");
+
+    let mut view = TranscriptView::new();
+    view.push_tool_start("find", json!({ "pattern": "*.rs", "path": "src", "limit": 20.0 }));
+    view.push_tool_end("find", false, Some(text_result("src/a.rs", json!(null))));
+    let text = render(&mut view, 70, 8);
+    assert!(text.contains("(limit 20)"), "find float limit: {text:?}");
+
+    let mut view = TranscriptView::new();
+    view.push_tool_start("ls", json!({ "path": "src", "limit": 10.0 }));
+    view.push_tool_end("ls", false, Some(text_result("a.rs", json!(null))));
+    let text = render(&mut view, 70, 8);
+    assert!(text.contains("(limit 10)"), "ls float limit: {text:?}");
+}
+
+#[test]
+fn list_tool_limit_zero_still_renders() {
+    // `if (limit !== undefined)` is a PRESENCE test in grep.ts/find.ts/ls.ts, unlike
+    // `formatShellCall`'s truthiness test on `timeout` — so `limit: 0` reaches the header.
+    let mut view = TranscriptView::new();
+    view.push_tool_start("grep", json!({ "pattern": "foo", "path": "src", "limit": 0 }));
+    view.push_tool_end("grep", false, Some(text_result("", json!(null))));
+    let text = render(&mut view, 70, 8);
+    assert!(text.contains("limit 0"), "presence test, not truthiness: {text:?}");
+
+    let mut view = TranscriptView::new();
+    view.push_tool_start("ls", json!({ "path": "src", "limit": 0 }));
+    view.push_tool_end("ls", false, Some(text_result("", json!(null))));
+    let text = render(&mut view, 70, 8);
+    assert!(text.contains("(limit 0)"), "ls presence test: {text:?}");
+
+    // `0.0` is the same double as `0` after `JSON.parse`, and `String(-0) === "0"` — so the float
+    // and negative-zero spellings render identically, with no `-0` and no `0.0`.
+    let mut view = TranscriptView::new();
+    view.push_tool_start("find", json!({ "pattern": "*.rs", "path": "src", "limit": -0.0 }));
+    view.push_tool_end("find", false, Some(text_result("", json!(null))));
+    let text = render(&mut view, 70, 8);
+    assert!(text.contains("(limit 0)"), "find negative-zero float limit: {text:?}");
+    assert!(!text.contains("(limit -0"), "`String(-0)` is `0`, never `-0`: {text:?}");
+}
+
+#[test]
 fn ls_call_defaults_path_to_dot() {
     let mut view = TranscriptView::new();
     view.push_tool_start("ls", json!({}));

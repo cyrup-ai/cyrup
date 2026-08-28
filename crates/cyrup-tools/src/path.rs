@@ -352,6 +352,107 @@ pub fn resolve_to_cwd(path: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+/// `filePath.split(sep).join("/")` — a plain replace-every-`sep`-with-`/` over the STRING form, the
+/// fold [`format_path_relative_to_cwd_or_absolute`] applies to its result (`utils/paths.ts:121`). A
+/// no-op on unix.
+///
+/// Deliberately NOT a `components()` walk joined on `"/"`: `Component::RootDir::as_os_str()` is
+/// already `MAIN_SEPARATOR_STR`, so such a join emits a second separator and every absolute label
+/// comes out `//etc/…`. Duplicated rather than shared with `crate::tools::globmatch::to_posix`
+/// because `globmatch` is declared `mod globmatch;` (private) inside `tools/mod.rs` and is therefore
+/// unreachable from this sibling module.
+fn to_posix(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '/' {
+        s.into_owned()
+    } else {
+        s.replace(std::path::MAIN_SEPARATOR, "/")
+    }
+}
+
+/// `resolvePath(input, baseDir)` (`paths.ts:102-106`) for the two callers below, which pass NO
+/// `PathInputOptions` — so `normalizePath` is the identity and only the `path.resolve` half remains:
+/// an absolute input resolves alone, a relative one resolves against `baseDir`, and a relative
+/// `baseDir` itself falls back to `process.cwd()` the way Node's right-to-left `path.resolve` does.
+///
+/// Deliberately NOT [`resolve_to_cwd`]: that is the port of `resolveToCwd`, which DOES pass
+/// `stripAtPrefix` + `normalizeUnicodeSpaces` (and expands `~`/`file://`). `getCwdRelativePath` and
+/// `formatPathRelativeToCwdOrAbsolute` call the bare `resolvePath`, and their callers hand in an
+/// already-resolved absolute path.
+fn resolve_lexical(path: &Path, base: &Path) -> PathBuf {
+    if path.is_absolute() {
+        lexical_resolve(path)
+    } else if base.is_absolute() {
+        lexical_resolve(&base.join(path))
+    } else {
+        // `nodeResolvePath(relativeBase, input)` prepends `process.cwd()` to the base. `unwrap_or_default`
+        // rather than `unwrap`: `clippy::unwrap_used` is denied outside `mod tests`.
+        lexical_resolve(&std::env::current_dir().unwrap_or_default().join(base).join(path))
+    }
+}
+
+/// Port of Pi's `getCwdRelativePath` (`utils/paths.ts:108-117`): the cwd-relative form of
+/// `file_path` when it is inside `cwd`, else `None`.
+///
+/// ```ts
+/// const resolvedCwd = resolvePath(cwd);
+/// const resolvedPath = resolvePath(filePath, resolvedCwd);
+/// const relativePath = relative(resolvedCwd, resolvedPath);
+/// const isInsideCwd =
+///     relativePath === "" ||
+///     (relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath));
+/// return isInsideCwd ? relativePath || "." : undefined;
+/// ```
+///
+/// `Path::strip_prefix` compares whole COMPONENTS, so it IS Pi's `isInsideCwd` conjunction: it fails
+/// for a sibling, for an ancestor and for a different volume, it keeps a `..config`-style NAME (Pi's
+/// own `test/paths.test.ts` case), and it rejects a real `..` traversal. The two pieces it does not
+/// carry are ported explicitly below — Pi's `relativePath || "."`, and Pi's `!isAbsolute(relativePath)`
+/// guard, since `Path::new("/a/b").strip_prefix("")` returns `Ok("/a/b")`, an ABSOLUTE "relative"
+/// path Pi would reject.
+///
+/// Both sides are lexically resolved first, mirroring `resolvePath(cwd)` /
+/// `resolvePath(filePath, resolvedCwd)`; that is what makes an un-collapsed `<cwd>/../AGENTS.md`
+/// come back `None` rather than being read as a `..`-named child.
+///
+/// **[CYRUP-DELTA — the inside-cwd compare is case-SENSITIVE on Windows]** Node's
+/// `path.win32.relative` compares path segments CASE-INSENSITIVELY, whereas
+/// `Path::strip_prefix` is byte-exact. On Windows only, `C:\Foo\AGENTS.md` under a `cwd` spelled
+/// `c:\foo` therefore returns `None` here (and renders as the absolute path) where Pi returns
+/// `AGENTS.md`. Unix is unaffected — `path.posix.relative` is case-sensitive too. Closing it needs a
+/// `cfg(windows)` case-folded comparison in place of `strip_prefix`; awaiting a decision.
+pub fn cwd_relative_path(file_path: &Path, cwd: &Path) -> Option<PathBuf> {
+    let resolved_cwd = resolve_lexical(cwd, Path::new(""));
+    let resolved_path = resolve_lexical(file_path, &resolved_cwd);
+    let relative = resolved_path.strip_prefix(&resolved_cwd).ok()?;
+    // `!isAbsolute(relativePath)`. Reachable only when `resolved_cwd` is EMPTY — a relative `cwd`
+    // plus a `current_dir()` that failed — because `strip_prefix("")` succeeds and hands the whole
+    // absolute path back.
+    if relative.is_absolute() {
+        return None;
+    }
+    // `relativePath || "."` — a path that IS the cwd renders as `.`, never as the empty string.
+    Some(if relative.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        relative.to_path_buf()
+    })
+}
+
+/// Port of Pi's `formatPathRelativeToCwdOrAbsolute` (`utils/paths.ts:119-122`): the cwd-relative
+/// form when `file_path` is under `cwd`, else the lexically resolved ABSOLUTE path — and
+/// `.split(sep).join("/")` over whichever came back.
+///
+/// ```ts
+/// const absolutePath = resolvePath(filePath, cwd);
+/// return (getCwdRelativePath(absolutePath, cwd) ?? absolutePath).split(sep).join("/");
+/// ```
+pub fn format_path_relative_to_cwd_or_absolute(file_path: &Path, cwd: &Path) -> String {
+    let absolute = resolve_lexical(file_path, cwd);
+    let out = cwd_relative_path(&absolute, cwd).unwrap_or(absolute);
+    to_posix(&out)
+}
+
 /// Candidate read paths in priority order (R-03-006, `resolveReadPathAsync`, path-utils.ts:86-116):
 /// EXACTLY Pi's five candidates, in Pi's order — the resolved path first, then the macOS AM/PM
 /// narrow-NBSP screenshot variant, then the NFD (decomposed) variant, then the curly-quote
@@ -389,6 +490,107 @@ pub fn resolve_read_path(path: &str, cwd: &Path) -> Vec<PathBuf> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
+
+    // --- `cwd_relative_path` / `format_path_relative_to_cwd_or_absolute` ------------------------
+    // Pi `utils/paths.ts:108-122`, plus the two cases Pi's own `test/paths.test.ts`
+    // `describe("getCwdRelativePath")` pins.
+
+    /// THE gap: Pi's `relativePath || "."` (`:116`). `Path::strip_prefix` returns `Ok("")` when the
+    /// path IS the prefix, so a bare strip renders the cwd itself as the EMPTY label.
+    #[test]
+    fn cwd_relative_path_of_the_cwd_itself_is_dot() {
+        assert_eq!(
+            cwd_relative_path(Path::new("/w/project"), Path::new("/w/project")),
+            Some(PathBuf::from("."))
+        );
+        // A trailing separator and a `.` segment are the same cwd after `resolvePath`.
+        assert_eq!(
+            cwd_relative_path(Path::new("/w/project/"), Path::new("/w/./project")),
+            Some(PathBuf::from("."))
+        );
+    }
+
+    /// Pi `test/paths.test.ts`, "keeps cwd-relative names that start with dots": a NAME beginning
+    /// `..` is not a traversal. `strip_prefix` compares whole components, so it agrees.
+    #[test]
+    fn cwd_relative_path_keeps_dotted_names() {
+        assert_eq!(
+            cwd_relative_path(Path::new("/w/project/..config/AGENTS.md"), Path::new("/w/project")),
+            Some(PathBuf::from("..config/AGENTS.md"))
+        );
+    }
+
+    /// Pi `test/paths.test.ts`, "rejects parent-directory traversals" — `relativePath !== ".."` and
+    /// `!relativePath.startsWith("../")` (`:114`). The second spelling is the un-collapsed one, and
+    /// it is what the lexical resolve of the FILE side buys.
+    #[test]
+    fn cwd_relative_path_rejects_parent_traversal() {
+        assert!(cwd_relative_path(Path::new("/w/AGENTS.md"), Path::new("/w/project")).is_none());
+        assert!(
+            cwd_relative_path(Path::new("/w/project/../AGENTS.md"), Path::new("/w/project"))
+                .is_none()
+        );
+        // A sibling whose name merely SHARES a prefix is outside too — the component-wise compare.
+        assert!(cwd_relative_path(Path::new("/w/project2/AGENTS.md"), Path::new("/w/project")).is_none());
+    }
+
+    /// `const resolvedCwd = resolvePath(cwd)` (`:109`) — the CWD side is resolved as well. A raw
+    /// `strip_prefix` against the unresolved spelling returns `Err` here.
+    #[test]
+    fn cwd_relative_path_resolves_the_cwd_side() {
+        assert_eq!(
+            cwd_relative_path(
+                Path::new("/w/project/a/AGENTS.md"),
+                Path::new("/w/./project/sub/..")
+            ),
+            Some(PathBuf::from("a/AGENTS.md"))
+        );
+        assert!(
+            Path::new("/w/project/a/AGENTS.md")
+                .strip_prefix(Path::new("/w/./project/sub/.."))
+                .is_err()
+        );
+    }
+
+    /// Pi's `!isAbsolute(relativePath)` (`:115`). With a resolvable process cwd an empty `cwd`
+    /// resolves TO that process cwd, so `/a/b` is rejected by `strip_prefix` itself; the explicit
+    /// guard is what still rejects it if `resolvePath` ever yields an empty base, where
+    /// `strip_prefix("")` hands the whole ABSOLUTE path back as the "relative" one.
+    #[test]
+    fn cwd_relative_path_rejects_an_absolute_result() {
+        assert!(cwd_relative_path(Path::new("/a/b"), Path::new("")).is_none());
+        assert_eq!(Path::new("/a/b").strip_prefix(""), Ok(Path::new("/a/b")));
+    }
+
+    /// `?? absolutePath` then `.split(sep).join("/")` (`:121`). The leading empty segment rejoins to
+    /// exactly ONE `/` — the same property the renderer-level `x7d` asserts.
+    #[test]
+    fn format_path_relative_to_cwd_or_absolute_falls_back_to_one_leading_slash() {
+        let out = format_path_relative_to_cwd_or_absolute(
+            Path::new("/etc/cyrup/AGENTS.md"),
+            Path::new("/w/project"),
+        );
+        assert_eq!(out, "/etc/cyrup/AGENTS.md");
+        assert!(!out.contains("//"));
+    }
+
+    /// The formatted half of the `relativePath || "."` gap.
+    #[test]
+    fn format_path_relative_to_cwd_or_absolute_of_the_cwd_itself_is_dot() {
+        assert_eq!(
+            format_path_relative_to_cwd_or_absolute(
+                Path::new("/w/AGENTS.md"),
+                Path::new("/w/AGENTS.md")
+            ),
+            "."
+        );
+        // `resolvePath(filePath, cwd)` (`:120`) resolves a RELATIVE input against the cwd first, so
+        // `"."` names the cwd too.
+        assert_eq!(
+            format_path_relative_to_cwd_or_absolute(Path::new("."), Path::new("/w/AGENTS.md")),
+            "."
+        );
+    }
 
     #[test]
     fn relative_joins_cwd() {

@@ -310,6 +310,34 @@ fn x7d_a_resource_read_outside_the_cwd_keeps_one_leading_slash() {
     assert!(!header("/etc/cyrup/AGENTS.md").contains("//"));
 }
 
+/// **X7e — a `resource` read of the cwd ITSELF renders `.`, not an empty label.**
+///
+/// `formatPathRelativeToCwdOrAbsolute` → `getCwdRelativePath` returns `relativePath || "."`
+/// (`utils/paths.ts:116`), so upstream can never emit an empty label. RED before the
+/// `cyrup_tools::path::format_path_relative_to_cwd_or_absolute` port: `Path::strip_prefix` returns
+/// `Ok("")` on equality, so the header came out `" read resource  (ctrl+o to expand)"` — two spaces
+/// and no path at all.
+///
+/// The live blast radius is narrow, and that is exactly why this was easy to leave unfixed: the
+/// `resource` arm only fires when the BASENAME is in `COMPACT_RESOURCE_FILE_NAMES`
+/// (`AGENTS.override.md`, `AGENTS.md`, `AGENTS.MD`, `CLAUDE.md`, `CLAUDE.MD`), so equality with the
+/// cwd is only expressible when the cwd's own basename is one of those names. `/w/AGENTS.md` is also
+/// outside `cyrup_config::asset_dir()`, so `docs_classification` cannot intercept first.
+#[test]
+fn x7e_a_resource_read_of_the_cwd_itself_renders_a_dot() {
+    let cwd = std::path::Path::new("/w/AGENTS.md");
+    let opts = ImageOpts { cwd: Some(cwd), ..ImageOpts::default() };
+    let header = |raw: &str| {
+        let lines = run_lines("read", json!({ "path": raw }), None, false, opts);
+        txt(row(&lines, "read resource")).trim_end().to_string()
+    };
+
+    // Both spellings that resolve ONTO the cwd: the relative `.` and the absolute path itself.
+    assert_eq!(header("."), " read resource . (ctrl+o to expand)");
+    assert_eq!(header("/w/AGENTS.md"), " read resource . (ctrl+o to expand)");
+}
+
+
 // --- X8 -------------------------------------------------------------------------------------
 
 /// **X8 — a PENDING `edit` with a computed preview is tinted `toolSuccessBg`, not `toolPendingBg`.**

@@ -55,8 +55,8 @@ members = [
 # unified onto a normal edge; the module is then compiled but still unselectable.
 #
 # WHAT THE EXCLUSION COSTS, stated exactly (the previous wording here was wrong): cyrup-test-support
-# is a dev-dependency of cyrup-permission-system and cyrup-ext-subagents, so a bare `cargo test`
-# BUILDS it — but *building* is not *running*. `cargo metadata` confirms it is outside
+# is a dev-dependency of cyrup-ext-subagents (`crates/cyrup-ext-subagents/Cargo.toml`), so a bare
+# `cargo test` BUILDS it — but *building* is not *running*. `cargo metadata` confirms it is outside
 # `workspace_default_members`, so a bare `cargo test` no longer EXECUTES its 35 `src/` unit tests or
 # the 5 in `tests/deferred_interop.rs`. Nothing was lost from the merge gate, which is
 # `cargo test --workspace`. If you run a bare `cargo test` locally, add

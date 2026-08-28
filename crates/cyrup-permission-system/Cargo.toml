@@ -77,28 +77,27 @@ tree-sitter = "0.25"
 tree-sitter-bash = "0.25.1"
 
 [dev-dependencies]
-# The FULLY-WIRED integration proof (`tests/gate_integration.rs`, R-PERM-010/012/050): a real
-# assembled `AgentSession` (built by `cyrup-test-support`'s `Harness`) where a scripted `bash` tool
-# call is genuinely blocked by a deny rule and genuinely allowed by an allow rule THROUGH the
-# registered `before_tool_call` hook — not a unit test of the engine in isolation.
-cyrup-test-support = { path = "../cyrup-test-support" }
-cyrup-provider = { workspace = true }
-# The LIVE-human-dialog integration proof (`tests/human_dialog.rs`, R-PERM-022): a real assembled
-# interactive `AgentSession` whose scripted UI sink (`LiveHostServices::set_ui_sink`, the SAME seam the
-# TUI/RPC renderer feeds at runtime) answers the permission `select` dialog, so an ask-tier tool call
-# blocks, the human "approves", and the tool proceeds THROUGH the registered `before_tool_call` hook +
-# the real `LocalAskChannel` dialog path. Needs the session-svc `LiveHostServices` + `Ui{Kind,Reply}`.
-cyrup-session-svc = { path = "../cyrup-session-svc" }
-# `AppMode::Interactive` (has_ui=true) on the harness options, so the gate takes the live-dialog branch.
-cyrup-config = { workspace = true }
-# The FULLY-WIRED child→parent forwarding proof (`tests/forwarding_subprocess.rs`, R-PERM-040/041/043):
-# a REAL detached `cyrup-permission-system` child subprocess drives its wired `before_tool_call` gate +
-# `ForwardingAskChannel` (writing a nonce-bound request into the PARENT spool and blocking), while the
-# PARENT process runs the REAL `spawn_forwarding_watcher` against a scripted `HostServices` human sink.
-# Needs `cyrup_ext`'s ctx/event/host-services surface (the `wasm-host` feature carries `HostServices`)
-# + `cyrup_core::ToolCallId` to construct the `ToolCall` event the child's gate decides on.
+# NOTE (2026-08): the four integration binaries this section used to name — `tests/gate_integration.rs`,
+# `tests/human_dialog.rs`, `tests/forwarding_subprocess.rs`, `tests/layers_wired.rs` — no longer live
+# in this crate. They are modules of the workspace's one seam-test crate:
+# `crates/cyrup-it/tests/permission/{gate_integration,human_dialog,forwarding_subprocess,layers_wired}.rs`,
+# wired at `crates/cyrup-it/tests/permission/main.rs:52-61`, which carries its own dev edges for them
+# (`cyrup-test-support`, `cyrup-provider` with `features = ["faux"]`, `cyrup-session-svc`,
+# `cyrup-config`, `cyrup-ext`, `cyrup-core`, `cyrup-permission-system`). The `cyrup-test-support`,
+# `cyrup-provider`, `cyrup-session-svc` and `cyrup-config` edges that used to sit here were therefore
+# dead — zero references from this crate's `src/` or `tests/` — and are removed.
+# What remains in THIS crate is `tests/shipped_artifacts.rs` plus the `#[cfg(test)]` modules under
+# `src/`, and this section must describe only those.
+#
+# `cyrup-ext`, `cyrup-core`, `serde_json`, `tokio` and `async-trait` below are RESTATEMENTS of entries
+# already in `[dependencies]`; they add no compile surface and no feature (`cyrup-ext`'s `wasm-host` is
+# default-on and is required by non-test `src/config_modal.rs` anyway, and the `tokio` feature set here
+# is a subset of the normal edge's). They are kept only so a future trim of `[dependencies]` cannot
+# silently break `cfg(test)`.
 cyrup-ext = { workspace = true, features = ["wasm-host"] }
 cyrup-core = { workspace = true }
+# `tests/shipped_artifacts.rs` + the `#[cfg(test)]` modules in `src/ext_config.rs`, `src/logging.rs`,
+# `src/sanitize/skills.rs` and the `src/tests/` + `src/extension/tests/` trees. Dev-only for real.
 tempfile = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
@@ -108,6 +107,6 @@ async-trait = { workspace = true }
 # mirror of the registry (which tools are INSTALLED, in wire order) — the two answer different
 # questions and must stay separately stated, so this is deliberately a dev edge and `manager.rs`
 # never names `cyrup_tools`. The test is what makes the sets provably equal. No new compile surface:
-# `cyrup-tools` is already normal-reachable via `cyrup-ext` and dev-reachable via `cyrup-session-svc`
-# + `cyrup-test-support`, with the same default `inline-images` feature.
+# `cyrup-tools` is already normal-reachable through `cyrup-ext`, with the same default
+# `inline-images` feature.
 cyrup-tools = { workspace = true }

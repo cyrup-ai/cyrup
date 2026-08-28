@@ -268,9 +268,10 @@ impl App<InlineBackend<Stdout>> {
                 }
             };
             tokio::select! {
-                // REQUIRED, not a micro-optimisation — the same statement `cyrup-tools/src/lock.rs:
-                // 178` makes for its own cancel race, and the shape every `select!` in
-                // `cyrup-ext/src/host/live.rs` already uses. Without it tokio picks a READY arm at
+                // REQUIRED, not a micro-optimisation — the same statement `KeyedAcquire::wait`
+                // (`cyrup-core/src/keyed_lock.rs`) makes for its own cancel race, and the shape
+                // every `select!` in `cyrup-ext/src/host/live.rs` already uses. Without it tokio
+                // picks a READY arm at
                 // random, so a loop iteration in which teardown was requested AND a keystroke,
                 // agent event or ticker is simultaneously ready could service the work arm instead:
                 // one more consumed key, one more drawn frame, one more applied event after the

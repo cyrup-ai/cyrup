@@ -4,10 +4,11 @@
 //! provider issuing both calls in ONE assistant message, `execute_parallel` spawning both bodies,
 //! the real `write`/`edit` tools, and the real process-global `FileMutationLocks`. Four separate
 //! mechanisms have to hold for this to pass — the oneshot start chain (`exec.rs:177-181`), the
-//! `MUTATION_REGISTRATION` chain (`cyrup-tools/src/lock.rs:205-219`), `enqueue`'s never-yield
-//! property (`cyrup-core/src/keyed_lock.rs:164-190`), and `guard()` being the first `.await` of
-//! both tool bodies — and each is pinned individually elsewhere. This is where they are pinned
-//! TOGETHER, because their composition is the user-visible guarantee and nothing else asserts it.
+//! `MUTATION_REGISTRATION` chain (`FileMutationLocks::guard`, `cyrup-tools/src/lock.rs`),
+//! `enqueue`'s never-yield property (`cyrup-core/src/keyed_lock.rs:164-190`), and `guard()` being
+//! the first `.await` of both tool bodies — and each is pinned individually elsewhere. This is
+//! where they are pinned TOGETHER, because their composition is the user-visible guarantee and
+//! nothing else asserts it.
 //!
 //! No sleeps and no retries: given all four, the outcome is determined, not likely.
 

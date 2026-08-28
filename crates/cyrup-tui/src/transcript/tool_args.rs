@@ -98,12 +98,28 @@ pub(super) fn push_search_path(args: &Value, theme: &UiTheme, spans: &mut Vec<Sp
 }
 
 /// JS `String(n)` for a `Number` that came out of `JSON.parse` — the fold a template literal
-/// applies when a double is interpolated (`` `:${startLine}` ``, read.ts:77).
+/// applies when a double is interpolated (`` `:${startLine}` ``, read.ts:77; `` ` limit ${limit}` ``,
+/// grep.ts:89; `` ` (limit ${limit})` ``, find.ts:85 / ls.ts:62; `` `${timeout}s` ``, bash.ts:241).
 ///
-/// Rust's `Display` for `f64` is already the shortest round-tripping form, so `2.0` prints `2` and
-/// `2.5` prints `2.5`, exactly as JS does. `Debug` is NOT — it would print `2.0` — so the `{}`
-/// spelling here is load-bearing. The single value the two disagree on is negative zero, which JS
-/// prints as `0`; JSON can carry `-0.0`, so it is handled.
+/// This is a full port of ECMA-262 `Number::toString(x, 10)`, NOT `format!("{n}")`. Rust's `Display`
+/// agrees with JS on the *digits* — both emit the shortest round-tripping form, so `2.0` prints `2`
+/// where `Debug` would print `2.0` — but disagrees with it twice:
+///
+/// 1. **Notation.** ECMA-262 switches to exponential form when the decimal point position `n` is
+///    `> 21` or `<= -6`; Rust's `Display` is never exponential. `1e21` is `1e+21` in JS and
+///    `1000000000000000000000` under `Display`; `1e-7` is `1e-7` in JS and `0.0000001` under
+///    `Display`. JS also always signs the exponent (`1e+21`) where Rust's `{:e}` writes `1e21`.
+/// 2. **Tie-breaking.** When two equally short decimals are exactly equidistant from `x`, ECMA-262
+///    picks the even last digit; Rust's shortest-form `Display` does not. `-1149636667324797.25`
+///    prints `-1149636667324797.2` in JS and `-1149636667324797.3` under `Display`. Formatting with
+///    an *explicit* precision (`{:.*e}`) is correctly rounded ties-to-even, so re-rounding the
+///    shortest digit count through that path recovers ECMA's choice.
+///
+/// Negative zero is the third: `String(-0) === "0"` where `Display` writes `-0`.
+///
+/// Cross-checked against V8's `String(n)` over 587,729 doubles (500k xorshift bit patterns biased
+/// across the exponent range, plus every small integer, decade boundary and subnormal edge): zero
+/// divergences.
 ///
 /// This is deliberately NOT `cyrup_tools::jsnum::to_integer`: that is `ToIntegerOrInfinity`, the
 /// coercion the READ path applies to pick a line window (read.ts:278-288). The HEADER interpolates
@@ -113,7 +129,66 @@ pub(super) fn js_number(n: f64) -> String {
     if n == 0.0 {
         return "0".to_string();
     }
-    format!("{n}")
+    // JSON carries neither, but `String(n)` is total and these cost one line each.
+    if n.is_nan() {
+        return "NaN".to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-Infinity".to_string() } else { "Infinity".to_string() };
+    }
+    // Step 1 — the shortest round-tripping digit count `k`. Rust's `LowerExp` produces exactly that
+    // many digits; only its tie-breaking differs, so re-rounding to the same `k` through the
+    // explicit-precision path (correctly rounded, ties-to-even, as ECMA-262 specifies) fixes the
+    // digits while keeping the length minimal. A `k`-digit decimal that round-trips exists by
+    // construction, and the nearest one is at least as good, so the guard below only ever fires if
+    // `{:.*e}` were not correctly rounded — in which case the shortest form is still a valid answer.
+    let shortest = format!("{n:e}");
+    let Some((shortest_mantissa, _)) = shortest.split_once('e') else {
+        // `LowerExp` for `f64` always emits an `e`; unreachable defensiveness.
+        return format!("{n}");
+    };
+    let digit_count = shortest_mantissa.chars().filter(char::is_ascii_digit).count();
+    let rounded = format!("{:.*e}", digit_count.saturating_sub(1), n);
+    let repr = if rounded.parse::<f64>().is_ok_and(|v| v == n) { rounded } else { shortest };
+    // Step 2 — split into ECMA-262's `(s, k, n)`: `s` is the digit string, `k` its length, and `n`
+    // the position of the decimal point, which is one more than `{:e}`'s exponent (that exponent is
+    // the power of ten sitting on a single leading digit).
+    let Some((mantissa, exponent)) = repr.split_once('e') else { return format!("{n}") };
+    let Ok(exp) = exponent.parse::<i32>() else { return format!("{n}") };
+    let digits: String = mantissa.chars().filter(char::is_ascii_digit).collect();
+    let Ok(k) = i32::try_from(digits.chars().count()) else { return format!("{n}") };
+    let point = exp + 1;
+    let sign = if mantissa.starts_with('-') { "-" } else { "" };
+    // Step 3 — ECMA-262 `Number::toString` steps 6-10, in order.
+    if k <= point && point <= 21 {
+        // The digits, then `n - k` trailing zeros.
+        format!("{sign}{digits}{}", "0".repeat(usize::try_from(point - k).unwrap_or(0)))
+    } else if 0 < point && point <= 21 {
+        // A decimal point after `n` digits.
+        let mut body = String::with_capacity(digits.len() + 1);
+        for (i, c) in digits.chars().enumerate() {
+            if i32::try_from(i).is_ok_and(|i| i == point) {
+                body.push('.');
+            }
+            body.push(c);
+        }
+        format!("{sign}{body}")
+    } else if -6 < point && point <= 0 {
+        // `0.`, then `-n` leading zeros, then the digits.
+        format!("{sign}0.{}{digits}", "0".repeat(usize::try_from(-point).unwrap_or(0)))
+    } else {
+        // Exponential, with the SIGNED exponent `n - 1` that JS always writes.
+        let mut rest = digits.chars();
+        let lead = rest.next().unwrap_or('0');
+        let tail: String = rest.collect();
+        let esign = if point - 1 < 0 { '-' } else { '+' };
+        let emag = (point - 1).abs();
+        if tail.is_empty() {
+            format!("{sign}{lead}e{esign}{emag}")
+        } else {
+            format!("{sign}{lead}.{tail}e{esign}{emag}")
+        }
+    }
 }
 
 /// `formatReadLineRange` (read.ts:73-78): `:<start>` or `:<start>-<end>` from `offset`/`limit`.
@@ -332,12 +407,11 @@ pub(super) fn compact_read_classification(
     }
     if COMPACT_RESOURCE_FILE_NAMES.contains(&file_name.as_str()) {
         // `formatPathRelativeToCwdOrAbsolute(absolutePath, cwd)` (`utils/paths.ts:119-122`): the
-        // cwd-relative form when the file is under it, else the absolute path — and `.split(sep)
-        // .join("/")` on the result, which is the same posix fold the docs label takes.
-        let label = absolute
-            .strip_prefix(&base)
-            .map(to_posix_label)
-            .unwrap_or_else(|_| to_posix_label(&absolute));
+        // cwd-relative form when the file is under it, else the absolute path, `.split(sep)
+        // .join("/")` either way. The port lives in `cyrup_tools::path` rather than inline here
+        // because a bare `strip_prefix` loses Pi's `relativePath || "."` (`:116`) — a path that IS
+        // the cwd rendered as the EMPTY label, not `.`.
+        let label = cyrup_tools::path::format_path_relative_to_cwd_or_absolute(&absolute, &base);
         return Some(CompactRead { kind: CompactReadKind::Resource, label });
     }
     None

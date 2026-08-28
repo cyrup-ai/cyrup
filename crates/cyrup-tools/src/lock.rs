@@ -40,27 +40,22 @@ static FILE_MUTATION_LOCKS: LazyLock<KeyedLockMap<PathBuf>> = LazyLock::new(Keye
 /// every other path too, exactly as pi's single chain does. That is the upstream behaviour, and it
 /// is bounded — the chain is released as soon as the key is resolved and the per-key place is
 /// claimed, never across the mutation itself.
+///
+/// **Never assert on this static's state.** Every `write`/`edit` in the lib test binary takes it,
+/// so `MUTATION_REGISTRATION.try_lock().is_err()` cannot tell "held by the call under test" from
+/// "held by a sibling test", and an assertion built on it DEGRADES under the full suite instead of
+/// failing — the exact defect that cost `crate::tests::mutation_lock_is_first_await` its detection
+/// (it went to 2/3) before it moved to `FileMutationLocks::guard_entries`. The chain's own
+/// span-across-key-resolution property is pinned by
+/// `tests::the_registration_chain_spans_key_resolution` through
+/// `FileMutationLocks::key_resolutions`, a per-instance counter the observing test owns both
+/// sides of; there is deliberately no `registration_is_held()` helper here any more.
+///
+/// (Both witnesses are `cfg(test)` fields, so they are named in prose rather than linked — an
+/// intra-doc link to either would not resolve under `cargo doc`, where `broken_intra_doc_links`
+/// is denied workspace-wide.)
 static MUTATION_REGISTRATION: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
-
-/// Test-only observer on the registration chain, so the tests below can assert on its STATE
-/// instead of on a sleep. Module-private and `cfg(test)`: its only consumer is
-/// `the_registration_chain_spans_key_resolution` in this file's own `mod tests`, which reaches it
-/// through `use super::*`, and nothing outside the suite may ever touch the static.
-///
-/// That test is the one property this observer genuinely fits: the chain is held *across* key
-/// resolution, which is a fact about the process-global `MUTATION_REGISTRATION` itself. The
-/// per-instance `guard_entries` counter below cannot express it.
-///
-/// `crate::tests::mutation_lock_is_first_await` used to share this observer and no longer does.
-/// Its property is per-call, not global, so sampling this static made it read "held" because of a
-/// sibling test and degrade to 2/3 detection under the full suite instead of failing; it now reads
-/// `guard_entries`. Do not re-adopt this `try_lock` for a property that is not about the global --
-/// see the field doc below for the full hazard.
-#[cfg(test)]
-fn registration_is_held() -> bool {
-    MUTATION_REGISTRATION.try_lock().is_err()
-}
 
 /// Pi `isMissingPathError` (file-mutation-queue.ts:7-14): `error.code === "ENOENT" || error.code
 /// === "ENOTDIR"`, and NOTHING else. Every other realpath failure is re-thrown at `:24`.
@@ -130,15 +125,28 @@ pub struct FileMutationLocks {
     inner: KeyedLocks<PathBuf>,
     /// Test-only, PER-INSTANCE witness that [`Self::guard`]'s body has begun executing.
     ///
-    /// [`registration_is_held`] above reads `MUTATION_REGISTRATION`, which is process-global by
-    /// design (pi parity, see its docs) and is taken by EVERY `write`/`edit` in the lib test
-    /// binary — including `the_registration_chain_spans_key_resolution` below, which parks inside
-    /// `Self::key` holding it. A test that samples that static therefore observes other tests, and
+    /// `MUTATION_REGISTRATION` is process-global by design (pi parity, see its docs) and is taken
+    /// by EVERY `write`/`edit` in the lib test binary — including
+    /// `the_registration_chain_spans_key_resolution` below, which parks inside `Self::key` holding
+    /// it. A test that sampled that static with `try_lock` therefore observed other tests, and
     /// `crate::tests::mutation_lock_is_first_await` degraded to 2/3 detection under the full suite
     /// because of it. This counter is reachable only through the `FileMutationLocks` the observing
     /// test constructed and handed to its own tool, so nothing else in the binary can move it.
     #[cfg(test)]
     guard_entries: std::sync::atomic::AtomicUsize,
+    /// Test-only, PER-INSTANCE count of [`Self::guard`] calls that have got PAST
+    /// `MUTATION_REGISTRATION` and into key resolution (`Self::key`).
+    ///
+    /// This is the witness for `the_registration_chain_spans_key_resolution`, whose property —
+    /// "the chain is held ACROSS key resolution" — is a fact about the global chain and so cannot
+    /// be read off `guard_entries`. It is not read off the global either: `try_lock` on
+    /// `MUTATION_REGISTRATION` cannot distinguish the call under test from a sibling
+    /// `write`/`edit`, which is what makes such an assertion degrade rather than fail. Exclusion is
+    /// proved here instead, per instance and in the test's own terms: a SECOND `guard()` on THIS
+    /// handle must fail to reach this counter while the FIRST is parked in key resolution. Both
+    /// calls belong to the observing test, so nothing else in the binary can move it either way.
+    #[cfg(test)]
+    key_resolutions: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for FileMutationLocks {
@@ -176,6 +184,8 @@ impl FileMutationLocks {
             map,
             #[cfg(test)]
             guard_entries: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            key_resolutions: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -223,6 +233,15 @@ impl FileMutationLocks {
         self.guard_entries.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// How many [`Self::guard`] calls on THIS instance have got past `MUTATION_REGISTRATION` and
+    /// begun resolving their key. See the field docs: this is the per-instance stand-in for a
+    /// `try_lock` on the process-global chain, which cannot say WHOSE hold it is observing.
+    #[cfg(test)]
+    fn key_resolutions(&self) -> usize {
+        self.key_resolutions
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     /// Acquire the lock for `path` for the whole read-modify-write. Cancel-aware: returns
     /// `Err(aborted)` if cancelled before acquisition — *always*, not just when the mutex happens
     /// to be contended.
@@ -258,6 +277,16 @@ impl FileMutationLocks {
         // Pi `:33`: the registration slot is claimed in call order and the body below runs
         // serialized.
         let registration = MUTATION_REGISTRATION.lock().await;
+
+        // Test-only, PER-INSTANCE witness that this call got past the chain and is entering key
+        // resolution. It sits immediately above `Self::key` so that moving `drop(registration)`
+        // up to here — the one-line revert `the_registration_chain_spans_key_resolution` exists to
+        // catch — lets a SECOND `guard()` on the same handle reach this line while the first is
+        // still resolving, which is exactly what that test asserts cannot happen. Compiles to
+        // nothing outside `cfg(test)`.
+        #[cfg(test)]
+        self.key_resolutions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         // Pi `:34`: `await getMutationQueueKey(filePath)` — INSIDE the chain, so two spellings of
         // the same file resolve in call order instead of racing on the blocking pool. On the `?`
@@ -308,14 +337,30 @@ mod tests {
     /// one-line revert that returns same-path ordering to a blocking-pool coin flip with no error
     /// to anyone. This is the assertion standing in its way.
     ///
+    /// **The witness is per-instance, not a sample of the global chain.** The property here is
+    /// genuinely about the process-global `MUTATION_REGISTRATION` — the chain is held ACROSS key
+    /// resolution — but `MUTATION_REGISTRATION.try_lock().is_err()` cannot say WHOSE hold it is
+    /// seeing. Every `write`/`edit` in this lib binary takes that static, so under the full suite
+    /// such an assertion can be satisfied by a sibling test and DEGRADES instead of failing; that
+    /// is the defect that cost `crate::tests::mutation_lock_is_first_await` its detection. So
+    /// exclusion is proved in this test's own terms instead: TWO `guard()` calls on ONE
+    /// `FileMutationLocks` this test constructed, and [`FileMutationLocks::key_resolutions`], a
+    /// counter on that instance. The first call is parked inside key resolution; the second must
+    /// therefore be unable to reach key resolution at all. Both calls are this test's, so no
+    /// sibling can move the counter and no sibling can satisfy the assertion.
+    ///
     /// Deterministic, no wall clock: ONE blocking thread, and it is occupied, so
-    /// `tokio::fs::canonicalize`'s job provably cannot run. The first poll of `guard()` therefore
-    /// parks inside `Self::key` as a certainty. `#[test]`, not `#[tokio::test]`, because the test
-    /// macro cannot express `max_blocking_threads`.
+    /// `tokio::fs::canonicalize`'s job provably cannot run. The first call therefore parks inside
+    /// `Self::key` as a certainty, and stays there for the whole observation. `#[test]`, not
+    /// `#[tokio::test]`, because the test macro cannot express `max_blocking_threads`.
     ///
     /// The chain is process-global, so this test holds it for the length of its own body and any
     /// sibling test calling `guard()` waits. That window is a handful of statements with no sleeps
     /// in it — keep it that way.
+    ///
+    /// RED: move `drop(registration)` above `Self::key(..).await` in [`FileMutationLocks::guard`].
+    /// The second call then walks straight past the released chain into its own key resolution and
+    /// `key_resolutions` reads 2.
     #[test]
     fn the_registration_chain_spans_key_resolution() {
         let rt = tokio::runtime::Builder::new_multi_thread()
@@ -331,37 +376,80 @@ mod tests {
             });
 
             let locks = FileMutationLocks::new();
-            let path = unique_path("registration-span");
             let cancel = CancelToken::new();
+            let first_path = unique_path("registration-span");
+            let second_path = unique_path("registration-span-other");
 
-            let mut acquiring = std::pin::pin!(locks.guard(&path, &cancel));
-            assert!(
-                poll_once(acquiring.as_mut()).is_pending(),
-                "the only blocking thread is occupied, so `guard()` must park inside `Self::key`"
-            );
-            assert!(
-                registration_is_held(),
-                "pi resolves the key INSIDE the registration chain (file-mutation-queue.ts:34). \
-                 The chain is not held across key resolution — `drop(registration)` has moved above \
-                 `Self::key(..).await`, and two spellings of one path now race on the blocking pool"
-            );
+            let mut first = std::pin::pin!(locks.guard(&first_path, &cancel));
+
+            // Drive the first call until it is demonstrably INSIDE key resolution — the state this
+            // test is about. It cannot get further: the runtime's one blocking thread is occupied,
+            // so `canonicalize` provably cannot run. It may, however, have to queue on the
+            // process-global chain first, behind a sibling `write`/`edit` in this binary; that is
+            // not a failure, so re-poll. It converges: a sibling holds the chain for its own key
+            // resolution and nothing longer. `yield_now` is what lets that sibling finish and what
+            // refreshes `block_on`'s coop budget between polls. No sleep, and none may be added.
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while locks.key_resolutions() == 0 {
+                    assert!(
+                        poll_once(first.as_mut()).is_pending(),
+                        "the only blocking thread is occupied, so `guard()` cannot get past \
+                         `Self::key`'s `canonicalize`"
+                    );
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the first `guard()` never reached key resolution");
+
+            // A SECOND `guard()` on the SAME handle, for a different path. The chain is global and
+            // the first call is holding it across its key resolution — and goes on holding it for
+            // as long as this test likes, because the hog still owns the only blocking thread — so
+            // this one must park on `MUTATION_REGISTRATION` and must NEVER reach `Self::key`.
+            //
+            // PROBED REPEATEDLY, not once. A single poll can come back pending for a reason that
+            // is not this test's property: `tokio::sync::Mutex` is fair, so the chain momentarily
+            // queued behind a sibling `write`/`edit` in this binary makes this call queue too, and
+            // one sample taken in that window would let the RED lever through. Measured: with a
+            // single probe the lever passed 1 run in 20 under the full suite. Under the fixed
+            // build the answer cannot change across probes — the first call is parked and holding
+            // — so the loop costs nothing but closes that window. `yield_now` is what gives the
+            // sibling room to drain and refreshes `block_on`'s coop budget; there is no sleep here
+            // and none may be added.
+            const CHAIN_PROBES: usize = 64;
+            let mut second = std::pin::pin!(locks.guard(&second_path, &cancel));
+            for _ in 0..CHAIN_PROBES {
+                assert!(
+                    poll_once(second.as_mut()).is_pending(),
+                    "the chain is held by the first call, so the second `guard()` cannot complete"
+                );
+                assert_eq!(
+                    locks.key_resolutions(),
+                    1,
+                    "pi resolves the key INSIDE the registration chain \
+                     (file-mutation-queue.ts:34). A second `guard()` entered key resolution while \
+                     the first was still resolving its own — `drop(registration)` has moved above \
+                     `Self::key(..).await`, and two spellings of one path now race on the blocking \
+                     pool. This counter is per-`FileMutationLocks`-instance and BOTH calls are \
+                     this test's own, so no sibling test in this binary can satisfy it: it fails \
+                     here, it does not degrade the way a `try_lock` on the process-global chain did"
+                );
+                tokio::task::yield_now().await;
+            }
 
             let _ = release.send(());
             hog.await.unwrap();
-            let guard = acquiring.await.expect("the lock must be granted");
+            let granted = first.await.expect("the lock must be granted");
 
-            // …and released BEFORE the wait (pi `:51`), never held across the mutation itself.
-            // Stated as behaviour rather than as `try_lock`, because a sibling test in this binary
-            // may legitimately hold the global chain for the length of its own `canonicalize`.
-            let other = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                locks.guard(&unique_path("registration-span-other"), &cancel),
-            )
-            .await
-            .expect("the registration chain must not be held across the mutation body")
-            .unwrap();
+            // …and the chain is released BEFORE the wait (pi `:51`), never held across the
+            // mutation itself: the second call, parked on the chain above, must now be able to
+            // finish while `granted` — a DIFFERENT key, so no per-path contention — is still held.
+            let other = tokio::time::timeout(std::time::Duration::from_secs(10), second)
+                .await
+                .expect("the registration chain must not be held across the mutation body")
+                .unwrap();
             drop(other);
-            drop(guard);
+            drop(granted);
         });
     }
 

@@ -48,7 +48,13 @@ pub(crate) fn pin(key: &str, value: Option<&str>) -> EnvPin {
 }
 
 /// The RAII guard [`pin`] returns: dropping it pops the pin off the current thread's overlay.
+///
+/// `#[must_use]` because a bare `envx::pin(K, V);` statement drops the guard at the semicolon and
+/// the pin is gone before the very next line reads it — a silent no-op that leaves the test
+/// asserting against the ambient process environment instead of the override it asked for. Every
+/// call site today binds (`let _pin = …`); this makes that a rule the compiler enforces.
 #[cfg(test)]
+#[must_use = "the pin is only in effect while this guard is alive; binding it (`let _pin = …`) is what keeps it"]
 pub(crate) struct EnvPin;
 
 #[cfg(test)]
