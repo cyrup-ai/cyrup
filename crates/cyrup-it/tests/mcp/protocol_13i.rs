@@ -87,8 +87,21 @@ fn fixture(settings: serde_json::Value) -> Fixture {
     fixture_with(settings, "")
 }
 
+/// [`fixture`], with extra keys merged onto the **server entry** — the per-server half of a gate.
+fn fixture_with_entry(settings: serde_json::Value, entry: serde_json::Value) -> Fixture {
+    build(settings, "", entry)
+}
+
 /// [`fixture`], with extra `params` JSON for the sampling request the server issues.
 fn fixture_with(settings: serde_json::Value, extra_params: &str) -> Fixture {
+    build(settings, extra_params, serde_json::json!({}))
+}
+
+fn build(
+    settings: serde_json::Value,
+    extra_params: &str,
+    entry_overrides: serde_json::Value,
+) -> Fixture {
     let tmp = TempDir::new().unwrap();
     let cwd = tmp.path().join("project");
     let agent_dir = tmp.path().join("agent");
@@ -99,7 +112,7 @@ fn fixture_with(settings: serde_json::Value, extra_params: &str) -> Fixture {
     let initialize = tmp.path().join("initialize.json");
     let sampling_response = tmp.path().join("sampling-response.json");
 
-    let config = serde_json::json!({
+    let mut config = serde_json::json!({
         "mcpServers": {
             SERVER: {
                 "command": "sh",
@@ -118,6 +131,14 @@ fn fixture_with(settings: serde_json::Value, extra_params: &str) -> Fixture {
         },
         "settings": settings,
     });
+    if let (Some(entry), Some(overrides)) = (
+        config["mcpServers"][SERVER].as_object_mut(),
+        entry_overrides.as_object(),
+    ) {
+        for (key, value) in overrides {
+            entry.insert(key.clone(), value.clone());
+        }
+    }
     std::fs::write(
         agent_dir.join("mcp.json"),
         serde_json::to_string_pretty(&config).unwrap(),
@@ -345,5 +366,127 @@ async fn elicitation_disabled_in_settings_advertises_nothing() {
         frame["params"]["capabilities"].get("elicitation").is_none(),
         "an explicit `false` outranks the UI; got {}",
         frame["params"]["capabilities"]
+    );
+}
+
+// ---- the wire tracer (§6) ------------------------------------------------------------------
+
+/// The tracer's proof, and the reason it is here rather than in `crate::trace`'s unit tests: those
+/// prove the writer and the redaction in isolation, against an injected file system. This one runs a
+/// real child process over a real pipe and reads the JSONL **off disk**, so it proves the thing the
+/// unit tests structurally cannot — that `TracingTransport` is actually installed on the transport a
+/// production connect builds, and that the frames it records are the frames rmcp exchanged.
+#[tokio::test]
+async fn a_traced_server_writes_the_real_handshake_to_a_real_file() {
+    let fx = fixture(serde_json::json!({"trace": {"enabled": true}}));
+    let ext = start(&fx).await;
+    await_connected(&ext).await;
+    await_exists(&fx.handshook, "the handshake never completed").await;
+
+    let dir = fx.cwd.join(".cyrup").join("mcp-traces");
+    let poll = async {
+        loop {
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    let text = std::fs::read_to_string(entry.path()).unwrap_or_default();
+                    // Wait for both directions, so the assertions below cannot race the writer.
+                    if text.contains("\"direction\":\"outbound\"")
+                        && text.contains("\"direction\":\"inbound\"")
+                    {
+                        return text;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    let text = tokio::time::timeout(Duration::from_secs(15), poll)
+        .await
+        .unwrap_or_else(|_| panic!("no trace file appeared under {}", dir.display()));
+
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("each line is JSON"))
+        .collect();
+    assert!(lines.len() >= 2, "expected both directions, got {}", lines.len());
+
+    // Every line carries the schema version and this server's name.
+    for line in &lines {
+        assert_eq!(line["version"].as_u64(), Some(1));
+        assert_eq!(line["server"].as_str(), Some(SERVER));
+        assert_eq!(line["transport"].as_str(), Some("stdio"));
+    }
+
+    // The outbound `initialize` really was seen by the tracer, classified as a request because it
+    // carries both `method` and `id`.
+    let initialize = lines
+        .iter()
+        .find(|line| line["method"].as_str() == Some("initialize"))
+        .expect("the handshake's initialize was traced");
+    assert_eq!(initialize["direction"].as_str(), Some("outbound"));
+    assert_eq!(initialize["kind"].as_str(), Some("request"));
+    assert_eq!(initialize["status"].as_str(), Some("sent"));
+    assert!(
+        initialize["bytes"].as_u64().is_some_and(|bytes| bytes > 0),
+        "byte counts come from the same serialisation the classifier used"
+    );
+    assert!(
+        initialize["durationMs"].as_f64().is_some(),
+        "an outbound frame is timed around the inner send"
+    );
+
+    // And the server's answer came back in, classified as a response.
+    assert!(
+        lines.iter().any(|line| line["direction"].as_str() == Some("inbound")
+            && line["kind"].as_str() == Some("response")
+            && line["status"].as_str() == Some("received")),
+        "the inbound half was traced too; got {lines:#?}"
+    );
+}
+
+/// The gate, from the other side: no `trace` block means no writer, no directory, and no wrapping.
+/// This is what keeps the tracer off by default.
+#[tokio::test]
+async fn an_untraced_server_writes_nothing_at_all() {
+    let fx = fixture(serde_json::json!({}));
+    let ext = start(&fx).await;
+    await_connected(&ext).await;
+    await_exists(&fx.handshook, "the handshake never completed").await;
+    // The handshake is complete, so any tracing that were going to happen already has.
+    let dir = fx.cwd.join(".cyrup").join("mcp-traces");
+    assert!(
+        !dir.exists(),
+        "an untraced session must not even create the directory; found {}",
+        dir.display()
+    );
+}
+
+/// `definition.trace ?? settings?.enabled === true` — a per-server `false` beats a global `true`,
+/// end to end. `||` would trace this server; `??` does not.
+#[tokio::test]
+async fn a_per_server_false_beats_a_global_true_on_the_wire() {
+    let fx = fixture_with_entry(
+        serde_json::json!({"trace": {"enabled": true}}),
+        serde_json::json!({"trace": false}),
+    );
+    let ext = start(&fx).await;
+    await_connected(&ext).await;
+    await_exists(&fx.handshook, "the handshake never completed").await;
+
+    let dir = fx.cwd.join(".cyrup").join("mcp-traces");
+    let wrote_anything = std::fs::read_dir(&dir)
+        .map(|entries| {
+            entries.flatten().any(|entry| {
+                std::fs::read_to_string(entry.path())
+                    .map(|text| !text.trim().is_empty())
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        !wrote_anything,
+        "the per-server `false` must win; something was written under {}",
+        dir.display()
     );
 }

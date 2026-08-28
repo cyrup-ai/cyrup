@@ -1848,6 +1848,7 @@ done
         let attempt = CancelToken::new();
         let made = crate::runtime::ConnectionBuilder::new(None)
             .create(crate::server_manager::CreateConnection {
+                trace: None,
                 name: "fixture".to_string(),
                 definition: Arc::new(live_entry()),
                 attempt: attempt.clone(),

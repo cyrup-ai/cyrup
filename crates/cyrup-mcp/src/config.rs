@@ -1207,20 +1207,10 @@ impl McpSettings {
         }
     }
 
-    /// `settings?.trace?.enabled === true` — the *global* half of
-    /// `definition.trace ?? settings.trace?.enabled === true`; the per-server override is
-    /// [`ServerEntry::trace`] and it wins by presence.
-    ///
-    /// **No production reader.** `mcp-trace.ts` is **MCP-133 and unported** (see `crate::runtime`'s
-    /// step-4 note); this accessor is the settings half, waiting for the writer.
-    #[must_use]
-    pub fn trace_enabled(&self) -> bool {
-        self.trace.as_ref().and_then(|trace| trace.enabled) == Some(true)
-    }
-
     /// `boundedPositiveInteger(settings.trace?.maxBytes, DEFAULT_MCP_TRACE_MAX_BYTES)`.
     ///
-    /// **No production reader** — MCP-133, as [`Self::trace_enabled`].
+    /// Read by [`crate::runtime::initialize_mcp`] when it mints the generation's
+    /// [`crate::trace::TraceWriter`].
     #[must_use]
     pub fn trace_max_bytes(&self) -> u64 {
         positive_int(self.trace.as_ref().and_then(|t| t.max_bytes), DEFAULT_MCP_TRACE_MAX_BYTES)
@@ -1228,7 +1218,8 @@ impl McpSettings {
 
     /// `boundedPositiveInteger(settings.trace?.maxEvents, DEFAULT_MCP_TRACE_MAX_EVENTS)`.
     ///
-    /// **No production reader** — MCP-133, as [`Self::trace_enabled`].
+    /// Read by [`crate::runtime::initialize_mcp`] when it mints the generation's
+    /// [`crate::trace::TraceWriter`].
     #[must_use]
     pub fn trace_max_events(&self) -> u64 {
         positive_int(self.trace.as_ref().and_then(|t| t.max_events), DEFAULT_MCP_TRACE_MAX_EVENTS)
