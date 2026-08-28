@@ -9,7 +9,7 @@
 //! (`\x1b[M`) encodings, recognising a wheel by `button & 64` and its direction by `button & 3`
 //! (`:649-671`); it also converts the 1-based coordinates a terminal sends into the 0-based ones
 //! the layout is measured in (`:657-658`, `:668-669`). cyrup receives a
-//! [`MouseEvent`](ratatui::crossterm::event::MouseEvent) that crossterm has already decoded from
+//! [`MouseEvent`] that crossterm has already decoded from
 //! either encoding, with `column`/`row` already 0-based, so all that survives the port is the
 //! direction mapping in [`notch`] — and pi's refusal to treat a *horizontal* notch as a scroll
 //! (`direction !== 0 && direction !== 1` at `:654`, `:665`, which drops the report through to the

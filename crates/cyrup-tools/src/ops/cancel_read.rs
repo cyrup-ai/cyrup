@@ -3,13 +3,13 @@
 //! A `tokio::task::spawn_blocking` task owns an OS thread and **cannot be aborted from outside** —
 //! dropping its `JoinHandle` does not stop the thread. So for an in-process blocking reader loop
 //! (`grep`'s `grep_searcher::Searcher::search_reader`, a streaming whole-file read) the only way
-//! out is for the work itself to fail. [`CancelReader`] turns the run's [`CancelToken`] into
-//! exactly that failure, and [`Cancelled`] is the payload the consumer matches on to tell "the
+//! out is for the work itself to fail. `CancelReader` turns the run's [`CancelToken`] into
+//! exactly that failure, and `Cancelled` is the payload the consumer matches on to tell "the
 //! token fired mid-file" apart from a genuine I/O error.
 
 use cyrup_core::CancelToken;
 
-/// The payload attached to the `io::Error` that a cancelled [`CancelReader`] read — or any other
+/// The payload attached to the `io::Error` that a cancelled `CancelReader` read — or any other
 /// cancelled callback that opts into the same marker — returns, so the caller can tell "the token
 /// fired mid-file" apart from a genuine read failure. That distinction is load-bearing: a read
 /// failure must stay a SILENT SKIP (rg emits no match events for a file it cannot read), while a
@@ -102,7 +102,7 @@ const CHUNK: usize = 64 * 1024;
 
 /// Drain `reader` into a `Vec`, observing `cancel` every [`CHUNK`] bytes.
 ///
-/// Returns an `Err` carrying [`Cancelled`] (test it with [`Cancelled::is`]) when the token fires
+/// Returns an `Err` carrying `Cancelled` (test it with `Cancelled::is`) when the token fires
 /// mid-transfer; the partial buffer is dropped, exactly as Pi discards a partially-read file when
 /// the promise rejects.
 pub(crate) fn read_to_end_cancellable<R: std::io::Read>(

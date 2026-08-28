@@ -27,15 +27,15 @@
 //! Upstream folds the enable into the middle of its single `beforeTerminalStart` write, between
 //! `DISABLE_AUTOWRAP` and `\x1b[2J\x1b[H\x1b[?25l` (`:293`), and the disable into the middle of its
 //! `beforeTerminalStop` bracket, between the kitty deletes and `ENABLE_AUTOWRAP` (`:306`). cyrup
-//! splits those writes across two modules, so [`MouseSetup::enable`] runs immediately AFTER
-//! `AltTerminal::enter` and [`MouseSetup::disable`] immediately BEFORE `AltTerminal::leave`. The
+//! splits those writes across two modules, so `MouseSetup::enable` runs immediately AFTER
+//! `AltTerminal::enter` and `MouseSetup::disable` immediately BEFORE `AltTerminal::leave`. The
 //! position delta is unobservable for the reason `terminal.rs` gives for the same split:
 //! mouse-mode and focus-mode escapes produce no glyphs, so nothing about the synchronized-update
 //! bracket's tearing guarantee depends on them being in the same write as the painting ones.
 //!
 //! # What this module does NOT do
 //! It never interprets a report. Decoding is crossterm's (the reader thread already parses SGR
-//! mouse reports into `Event::Mouse` — see [`map_reader_event`]), and dispatching a decoded event to
+//! mouse reports into `Event::Mouse` — see `map_reader_event`), and dispatching a decoded event to
 //! the wheel, drag and selection handlers is ADR-0005 §B-3's single `match`. This module owns
 //! exactly one thing: whether the terminal is sending reports at all, and the process-global answer
 //! to that question which the input reader consults.
@@ -75,7 +75,7 @@ const DISABLE_MOUSE: &str = "\x1b[?1006l\x1b[?1004l\x1b[?1003l\x1b[?1002l\x1b[?1
 ///
 /// A `static` rather than a field threaded to the reader, for the reason
 /// [`crate::terminal_progress`]'s `PROGRESS_ARMED` (`terminal_progress.rs:84`) is one: the consumer
-/// is [`crate::app::input_reader::map_event_on`], which runs on the reader `std::thread` and is
+/// is `app::input_reader::map_event_on`, which runs on the reader `std::thread` and is
 /// reached through an `EventStream` whose type carries no handle to thread one down
 /// (`app/input_reader.rs:28-50`). There is exactly one interactive renderer per process, so a
 /// singleton is what is being expressed.
@@ -88,7 +88,7 @@ static REPORTING: AtomicBool = AtomicBool::new(false);
 /// Whether mouse reporting is on — i.e. whether the alternate-screen renderer asked for it and has
 /// not yet given it back.
 ///
-/// `false` for the whole of every regular-mode session, which is what makes [`map_reader_event`]
+/// `false` for the whole of every regular-mode session, which is what makes `map_reader_event`
 /// byte-identical to the unconditional discard it replaced.
 pub(crate) fn reporting_enabled() -> bool {
     REPORTING.load(Ordering::Relaxed)
@@ -191,7 +191,7 @@ impl MouseSetup {
 
 impl Drop for MouseSetup {
     /// The un-taken exit: a `?` early return during setup, an ordinary scope exit, or a dropped
-    /// future. A [`MouseSetup::disable`] that already ran cleared `active`, so this is a no-op on
+    /// future. A `MouseSetup::disable` that already ran cleared `active`, so this is a no-op on
     /// the orderly path.
     fn drop(&mut self) {
         self.disable();
