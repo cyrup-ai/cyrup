@@ -4,6 +4,17 @@ use super::*;
 /// `SettingsConfig` → `SettingItem`s, :479-712). Each row's `id` is the dotted settings key persisted
 /// on cycle; toggles cycle `true`/`false`, choices cycle their fixed sets. Read straight off
 /// [`cyrup_session_svc::EffectiveSettings`] so the displayed value matches the merged config.
+/// Pi `modelThinkingOverridesSummary` (`settings-selector.ts:184-188`): `"none"` when the map is
+/// empty, else `"{count} configured"`. Verbatim, because it is the row's user-visible value.
+fn model_thinking_summary(eff: &cyrup_session_svc::EffectiveSettings) -> String {
+    let count = eff.all_model_thinking_levels().len();
+    if count == 0 {
+        "none".to_string()
+    } else {
+        format!("{count} configured")
+    }
+}
+
 pub(crate) fn settings_rows(
     eff: &cyrup_session_svc::EffectiveSettings,
     current_theme: &str,
@@ -19,6 +30,12 @@ pub(crate) fn settings_rows(
     // LIVE table — a rebind changes the sentence.
     let follow_up_key = keymap
         .keys_label(Action::FollowUp)
+        .map(|k| crate::chrome::format_key_text(&k, true))
+        .unwrap_or_default();
+    // `const cycleThinkingKey = keyDisplayText("app.thinking.cycle")` (`settings-selector.ts:448`),
+    // resolved the same live way as `follow_up_key` above and interpolated at `:576`.
+    let cycle_thinking_key = keymap
+        .keys_label(Action::ThinkingCycle)
         .map(|k| crate::chrome::format_key_text(&k, true))
         .unwrap_or_default();
     // TUI-036 — `Show images` / `Image width` are offered ONLY on a terminal that has an image
@@ -203,6 +220,18 @@ pub(crate) fn settings_rows(
         // cycled blindly with no list of the levels.
         SettingRow::submenu("thinking", "Thinking level", thinking_level.to_string(), "thinking")
             .with_description("Reasoning depth for thinking-capable models"),
+        // GAP 3 — `id: "model-thinking"` (`settings-selector.ts:574-577`). `currentValue` is
+        // `modelThinkingOverridesSummary`: `"none"` at zero, else `"{n} configured"` (`:184-188`).
+        // The description interpolates the live cycle key exactly as upstream does (`:576`).
+        SettingRow::submenu(
+            "model-thinking",
+            "Default thinking level per model",
+            model_thinking_summary(eff),
+            "model-thinking",
+        )
+        .with_description(format!(
+            "Override the default thinking level for specific models. {cycle_thinking_key} cycles in-session."
+        )),
         // ADR-0005 §A-4 — the two alternate-screen rows, withheld until §A-3's settings keys and
         // §B-14's renderer existed. Pi: `{id:"tui-mode", label:"TUI mode", …, values:["regular",
         // "fullscreen"]}` (`components/settings-selector.ts:671-676`) and `{id:
@@ -219,7 +248,7 @@ pub(crate) fn settings_rows(
         // hoisted `theme` to row 0 long ago (`crates/cyrup-tui/src/tests/selector_wiring.rs:221`
         // pins it there), so "adjacent to theme" is not reachable without moving a row a test
         // fixes in place. Appending keeps pi's RELATIVE order for everything that remains —
-        // `warnings`, `thinking`, then this pair — which is the closest faithful position left.
+        // `warnings`, `thinking`, `model-thinking`, then this pair — the closest faithful position left.
         SettingRow::choice(
             "tuiMode",
             "TUI mode",

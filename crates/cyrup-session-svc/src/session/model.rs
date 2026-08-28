@@ -502,10 +502,35 @@ impl AgentSession {
         // per-model; it simply had no caller.
         self.agent.set_headers(self.attribution_headers(next)).await;
         self.manager.lock().await.append_model_change(next.provider.clone(), next.id.clone())?;
-        // Re-clamp the thinking level for the new model (explicit override or current session level).
+        // Re-clamp the thinking level for the new model. Pi
+        // `_getThinkingLevelForModelSwitch(targetModel, explicitLevel)`
+        // (`agent-session.ts:1828-1839`), in its exact precedence:
+        //   1. an explicit level passed to this switch wins outright (`:1829-1831`);
+        //   2. else the PER-MODEL override for the model being switched TO
+        //      (`getModelThinkingLevel(provider, id)`, `:1833-1838`) — this tier is what lets a
+        //      user reason hard on a large model and cheaply on a small one across a `Ctrl+P`
+        //      cycle, instead of one global level following them everywhere;
+        //   3. else the global default, else the current session level (`:1839`).
+        // Cyrup's step 3 keeps the SESSION level ahead of the settings default, which is the order
+        // that preserves an in-session Shift+Tab across an unrelated model switch; pi reads its
+        // global default first there. \[CYRUP-DELTA] — noted rather than changed, because
+        // reversing it would silently discard a live cycle on every switch.
         let level = match explicit_thinking {
             Some(l) => l,
-            None => self.thinking_level().await,
+            None => {
+                // Bound to a `Copy` `Option` FIRST so the effective-settings borrow is released
+                // before the `.await` below, and so `thinking_level()` is not paid for on the
+                // override path.
+                let per_model = self
+                    .services
+                    .settings
+                    .effective()
+                    .model_thinking_level(next.provider.as_str(), next.id.as_str());
+                match per_model {
+                    Some(l) => l,
+                    None => self.thinking_level().await,
+                }
+            }
         };
         let new_level = self.set_thinking_level(level).await?;
         self.fanout_emit(AgentSessionEvent::ModelChanged {

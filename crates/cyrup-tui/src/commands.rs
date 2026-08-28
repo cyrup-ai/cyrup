@@ -80,6 +80,10 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     cmd("fork", "Create a new fork from a previous user message", None),
     cmd("clone", "Duplicate the current session at the current position", None),
     cmd("tree", "Navigate session tree (switch branches)", None),
+    // GAP 5 — pi registers this immediately after `tree` (`slash-commands.ts:23`), with exactly
+    // this description and hint. The list order is user-visible autocomplete order, so the slot
+    // matters as much as the entry.
+    arg_cmd("thinking", "Set thinking level", "<level>"),
     cmd("trust", "Save project trust decision for future sessions", None),
     // TUI-025 — pi carries `argumentHint: "<provider>"` here (`slash-commands.ts:35` @v0.83.0); cyrup had no
     // hint at all, which is also what left `has_arg_completion` false for `/login`.
@@ -120,7 +124,7 @@ pub const HIDDEN_COMMANDS: &[&str] = &["debug", "arminsayshi", "dementedelves"];
 /// upstream `/quit now` is **not** the quit command: it falls past the whole chain and is sent to
 /// the model as a prompt. Matching that requires this list; a uniform matcher cannot express it.
 const ARGUMENT_DISPATCH_NAMES: &[&str] =
-    &["model", "export", "import", "name", "login", "compact"];
+    &["model", "thinking", "export", "import", "name", "login", "compact"];
 
 const fn cmd(
     name: &'static str,

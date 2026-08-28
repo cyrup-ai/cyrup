@@ -62,6 +62,17 @@ pub struct ModelSelector {
     models: Vec<ModelEntry>,
     /// Whether any scoped models exist (gates the `⇥` scope toggle + the scope header).
     has_scoped: bool,
+    /// The PERSISTED default `(provider, id)` (`defaultProvider` + `defaultModel`), when one is set
+    /// AND this picker was opened on a path that can write it.
+    ///
+    /// Drives all three of Pi's default behaviours: the ` · default` badge
+    /// (`model-selector.ts:317`), sorting that row SECOND behind the current model (`:226-238`),
+    /// and — because Pi guards its `Ctrl+S` on `onSelectAsDefaultCallback` being wired
+    /// (`:401`, `:138`) — whether the `Ctrl+S` key and its footer hint exist at all.
+    ///
+    /// `Some(("", ""))` is therefore meaningful: "persisting is available, nothing is default yet".
+    /// [`Self::with_default_model`] is the only way to set it.
+    default_model: Option<(String, String)>,
     scope: Scope,
     /// The live fuzzy search query (embedded `Input`).
     query: String,
@@ -94,6 +105,46 @@ impl ModelSelector {
     /// Build from the catalog `(id, name, provider, current, scoped)` rows. The list is sorted
     /// current-first then by provider (Pi `sortModels`); the scope defaults to `scoped` when any scoped
     /// models exist, else `all` (`model-selector.ts:82`).
+    /// Enable Pi's second confirm key on this picker and tell it which row is the persisted
+    /// default (`interactive-mode.ts:5000` passes `defaultProvider && defaultModel` into the
+    /// component, and wires `onSelectAsDefault` at `:4999`).
+    ///
+    /// Pass `("", "")` when nothing is persisted yet — the binding and its footer still appear
+    /// (Pi's guard is on the CALLBACK, not on a default existing), but no row is badged.
+    /// Re-sorts so the default lands second, behind the current model.
+    #[must_use]
+    pub fn with_default_model(mut self, provider: &str, id: &str) -> Self {
+        self.default_model = Some((provider.to_string(), id.to_string()));
+        self.sort_models();
+        self
+    }
+
+    /// True when `m` is the persisted default (Pi `isDefaultModel`, `model-selector.ts:252-254`).
+    fn is_default(&self, m: &ModelEntry) -> bool {
+        self.default_model
+            .as_ref()
+            .is_some_and(|(p, i)| *p == m.provider && *i == m.id)
+    }
+
+    /// Pi `sortModels` (`model-selector.ts:226-238`): current model first, **persisted default
+    /// second**, then by provider. The default tier is why this is a method rather than the inline
+    /// sort the constructor used to do — it has to re-run when the default is threaded in.
+    fn sort_models(&mut self) {
+        let default = self.default_model.clone();
+        let is_default = |m: &ModelEntry| {
+            default.as_ref().is_some_and(|(p, i)| *p == m.provider && *i == m.id)
+        };
+        self.models.sort_by(|a, b| match (a.current, b.current) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => match (is_default(a), is_default(b)) {
+                (true, false) => std::cmp::Ordering::Less,
+                (false, true) => std::cmp::Ordering::Greater,
+                _ => a.provider.cmp(&b.provider),
+            },
+        });
+    }
+
     pub fn new(mut models: Vec<ModelEntry>) -> Self {
         models.sort_by(|a, b| match (a.current, b.current) {
             (true, false) => std::cmp::Ordering::Less,
@@ -105,6 +156,7 @@ impl ModelSelector {
         let mut sel = ModelSelector {
             models,
             has_scoped,
+            default_model: None,
             scope,
             query: String::new(),
             cursor: 0,
@@ -320,6 +372,12 @@ impl ModelSelector {
                 spans.push(Span::styled(format!("  {}", m.id), theme.base_style()));
             }
             spans.push(Span::styled(format!(" [{}]", m.provider), theme.muted_style()));
+            // `const defaultBadge = isDefault ? theme.fg("muted", " · default") : ""`, drawn
+            // AFTER the provider badge and BEFORE the `✓` (`model-selector.ts:317`, `:325`,
+            // `:330`). The identical string the thinking picker uses (`thinking-selector.ts:73`).
+            if self.is_default(m) {
+                spans.push(Span::styled(" \u{b7} default".to_string(), theme.muted_style()));
+            }
             if m.current {
                 spans.push(Span::styled(" ✓".to_string(), theme.success_style()));
             }
@@ -453,6 +511,17 @@ impl Selector for ModelSelector {
         lines.push(Line::from(crate::selector::input_line_spans(&self.query, self.cursor, theme)));
         lines.push(Line::from(""));
         lines.extend(self.body_lines(&filtered, usize::from(area.width), theme));
+        // `if (this.onSelectAsDefaultCallback) { addChild(new Text(theme.fg("dim", "  Enter to
+        // select · Ctrl+S to set as default · Esc to cancel"))) }` (`model-selector.ts:138-142`).
+        // CONDITIONAL upstream — unlike the thinking picker's, which is unconditional
+        // (`thinking-selector.ts:94`) — so a picker opened on a path that cannot persist does not
+        // advertise the key. `default_model.is_some()` is that callback's presence here.
+        if self.default_model.is_some() {
+            lines.push(Line::from(Span::styled(
+                "  Enter to select \u{b7} Ctrl+S to set as default \u{b7} Esc to cancel",
+                theme.dim_style(),
+            )));
+        }
         lines.push(Line::from(""));
         lines.push(border_rule_line(area.width, theme));
         frame.render_widget(Paragraph::new(lines).style(theme.base_style()), area);
@@ -463,6 +532,22 @@ impl Selector for ModelSelector {
         if key.code == KeyCode::Tab {
             self.toggle_scope();
             return SelectorOutcome::Redraw;
+        }
+        // Pi's second confirm key — a LITERAL `matchesKey(keyData, "ctrl+s")` (`:401`), not a
+        // binding id, and guarded on the persist callback being wired. When it is NOT wired this
+        // early-return is skipped and `Ctrl+S` falls to the `None` arm below, which refuses it as a
+        // control char and returns `Ignored`. Pi instead hands the key to its search input
+        // (`:409-412`), where `Input.handleInput` drops it as a C0 control char before inserting
+        // (`input.ts:203-209`) — same net effect, one layer down. Checked before the keymap so a
+        // rebound `tui.select.*` cannot shadow it.
+        if self.default_model.is_some()
+            && key.code == KeyCode::Char('s')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return match self.current() {
+                Some(m) => SelectorOutcome::ConfirmDefault(format!("{}/{}", m.provider, m.id)),
+                None => SelectorOutcome::Redraw,
+            };
         }
         match keymap.action_for(key) {
             Some(SelectAction::Up) => {
@@ -494,6 +579,7 @@ impl Selector for ModelSelector {
                 }
                 SelectorOutcome::Redraw
             }
+            // Handled below, ahead of this match — see the `Ctrl+S` guard at the top of `handle`.
             Some(SelectAction::Confirm) => match self.current() {
                 // Confirm the fully-qualified `provider/id` (Pi `handleSelect` →
                 // `setDefaultModelAndProvider(model.provider, model.id)`, model-selector.ts:330) so a
@@ -813,6 +899,62 @@ mod tests {
         assert_eq!(sel.visible_len(), 0, "the query matches nothing");
         assert!(rows.iter().any(|r| r == "  No matching models"), "{rows:?}");
         assert!(rows.iter().any(|r| r == "  Refreshing model catalogs…"), "{rows:?}");
+    }
+
+    /// `Ctrl+S` → `ConfirmDefault`, the confirm key → `Confirm`, both carrying the
+    /// fully-qualified `provider/id` (Pi `handleSelect` vs `onSelectAsDefaultCallback`,
+    /// `model-selector.ts:401-408`). The two must not collapse: the chrome routes on the VARIANT,
+    /// and only `ConfirmDefault` reaches the arm that writes `defaultProvider`/`defaultModel`.
+    ///
+    /// `catalog()`'s `claude-opus-4-6` is `current: true`, and `with_default_model` sorts
+    /// current-first, so it stays row 0 and the highlighted value is unambiguous.
+    #[test]
+    fn ctrl_s_confirms_as_default_while_enter_stays_session_only() {
+        let km = SelectKeymap::default();
+        // No helper builds a MODIFIED bare `KeyEvent` — the local `key()` hardcodes
+        // `KeyModifiers::NONE` — so this is constructed inline.
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+        let mut sel =
+            ModelSelector::new(catalog()).with_default_model("anthropic", "claude-opus-4-6");
+        assert_eq!(
+            sel.handle(&ctrl_s, &km),
+            SelectorOutcome::ConfirmDefault("anthropic/claude-opus-4-6".to_string()),
+            "Ctrl+S persists the highlighted model"
+        );
+
+        let mut sel =
+            ModelSelector::new(catalog()).with_default_model("anthropic", "claude-opus-4-6");
+        assert_eq!(
+            sel.handle(&key(KeyCode::Enter), &km),
+            SelectorOutcome::Confirm("anthropic/claude-opus-4-6".to_string()),
+            "Enter is session-only and must NOT be ConfirmDefault"
+        );
+    }
+
+    /// With no persist path wired the key does nothing — in Pi and here alike, by different routes.
+    /// Pi guards `Ctrl+S` on `onSelectAsDefaultCallback` (`model-selector.ts:401`), so an un-wired
+    /// picker takes the else-branch and hands the key to its search input (`:409-412`) — which then
+    /// drops it: `Input.handleInput` consults only the `tui.editor.*`, `tui.input.submit` and
+    /// `tui.select.cancel` ids, none of which is bound to `ctrl+s`, so the key falls to its C0
+    /// control-character rejection (`input.ts:203-209`). Pi does bind `ctrl+s` elsewhere —
+    /// `app.session.toggleSort` and `app.models.save` (`keybindings.ts:166,182`), both of which
+    /// cyrup mirrors — but `Input` never consults those. `ModelSelector::new` alone is
+    /// that state, and reaches the same end one step earlier: the guard is skipped, `action_for`
+    /// returns `None` (`Ctrl+S` is unbound in `SelectKeymap::default()`), and the `None` arm's
+    /// insert is gated on `!CONTROL` — so `handle` returns `Ignored` without the query ever seeing
+    /// the key. Asserted by equality, not as "not `ConfirmDefault`": that weaker form also passes
+    /// for `Confirm(_)`, and an un-wired picker that confirmed a selection would be a real bug.
+    #[test]
+    fn ctrl_s_is_ignored_when_no_default_is_wired() {
+        let km = SelectKeymap::default();
+        let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        let mut sel = ModelSelector::new(catalog());
+        assert_eq!(
+            sel.handle(&ctrl_s, &km),
+            SelectorOutcome::Ignored,
+            "an un-wired picker must neither confirm nor type — the `None` arm refuses control chars"
+        );
     }
 
     /// MIRROR for the per-component discipline. The `/scoped-models` footer

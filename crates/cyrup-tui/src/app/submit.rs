@@ -58,6 +58,12 @@ impl<B: Backend> App<B> {
             // `/model [text]` threads its argument (`handleModelCommand(searchTerm?)`,
             // interactive-mode.ts:4175): exact match → set directly; partial → pre-filtered picker.
             "model" => cmd(C::ModelCommand(arg)),
+            // `/thinking [level]` (Pi `handleThinkingCommand`, `interactive-mode.ts:4771`),
+            // dispatched with pi's `text === "/thinking" || startsWith("/thinking ")` guard
+            // (`:2996`) — hence its entry in `ARGUMENT_DISPATCH_NAMES`. No argument opens the
+            // picker; an argument applies SESSION-ONLY (`selectThinkingLevel(level, false)`,
+            // `:4786`), which is why this is not the persisting command.
+            "thinking" => cmd(C::ThinkingCommand(arg)),
             "settings" => cmd(C::OpenSelector(SelectorKind::Settings)),
             "scoped-models" => cmd(C::OpenSelector(SelectorKind::ScopedModels)),
             "tree" => cmd(C::OpenSelector(SelectorKind::Tree)),

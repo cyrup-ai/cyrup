@@ -26,7 +26,7 @@
 use crate::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use crate::{
     ColumnLayout, ListSelector, SelectItem, SelectKeymap, SelectList, Selector, SelectorKind,
-    SessionRow, SessionSelector, TreeKind, TreeNode, TreeSelector, UiTheme,
+    SelectorOutcome, SessionRow, SessionSelector, TreeKind, TreeNode, TreeSelector, UiTheme,
 };
 use ratatui::backend::TestBackend;
 use ratatui::layout::Rect;
@@ -589,15 +589,78 @@ fn tree_selection_without_a_selected_bg_role_keeps_its_foreground() {
 /// FAILS under the revert that puts the row back on every `ListSelector`.
 #[test]
 fn list_selector_draws_no_hint_row_where_pi_draws_none() {
-    for mut sel in [
-        ListSelector::thinking("medium"),
-        ListSelector::show_images(true),
-        ListSelector::theme("dark"),
-    ] {
+    // `thinking` is NO LONGER in this set: pi v0.84.3 gives it a footer of its own
+    // (`thinking-selector.ts:94`), asserted verbatim by
+    // `thinking_selector_draws_pis_set_as_default_footer` below. The point of this test is that
+    // cyrup does not INVENT the generic `↑↓ navigate / select / cancel` hint row on selectors whose
+    // pi component has none — which is still true of these two.
+    for mut sel in [ListSelector::show_images(true), ListSelector::theme("dark")] {
         let s = screen(&render_selector(&mut sel, 80, 16));
         assert!(!s.contains("navigate"), "invented navigate hint:\n{s}");
         assert!(!s.contains("cancel"), "invented cancel hint:\n{s}");
         assert!(!s.contains("select"), "invented select hint:\n{s}");
+    }
+}
+
+/// The thinking picker's footer is pi's literal string, not the generic hint row
+/// (`thinking-selector.ts:94`) — and it is what advertises the `Ctrl+S` persist key.
+#[test]
+fn thinking_selector_draws_pis_set_as_default_footer() {
+    let mut sel = ListSelector::thinking("medium", "medium");
+    let s = screen(&render_selector(&mut sel, 80, 16));
+    assert!(
+        s.contains("Enter to select \u{b7} Ctrl+S to set as default \u{b7} Esc to cancel"),
+        "pi's footer verbatim:\n{s}"
+    );
+    // The generic hint row is still not invented alongside it.
+    assert!(!s.contains("navigate"), "invented navigate hint:\n{s}");
+}
+
+/// The two confirm keys must not collapse into one outcome. `Enter` is session-only
+/// (`{persist:false}`, `interactive-mode.ts:4801`); `Ctrl+S` is the persisting sibling (`:4813` →
+/// `setThinkingLevel(level, {persist:true})`). The chrome routes on the VARIANT, so a refactor that
+/// let `Ctrl+S` fall through to `Confirm` would silently start writing settings on every plain
+/// selection — the exact regression this pins.
+///
+/// No helper builds a MODIFIED bare `KeyEvent` (`harness::ctrl` returns an `InputEvent`, and both
+/// local `key()` helpers hardcode `KeyModifiers::NONE`), so `Ctrl+S` is constructed inline.
+#[test]
+fn thinking_ctrl_s_confirms_as_default_while_enter_stays_session_only() {
+    let km = SelectKeymap::default();
+    let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+
+    let mut sel = ListSelector::thinking("medium", "medium");
+    assert_eq!(
+        sel.handle(&ctrl_s, &km),
+        SelectorOutcome::ConfirmDefault("medium".to_string()),
+        "Ctrl+S persists the highlighted level"
+    );
+
+    let mut sel = ListSelector::thinking("medium", "medium");
+    assert_eq!(
+        sel.handle(&key(KeyCode::Enter), &km),
+        SelectorOutcome::Confirm("medium".to_string()),
+        "Enter is session-only and must NOT be ConfirmDefault"
+    );
+}
+
+/// Pi binds `Ctrl+S` only when an `onSelectAsDefault` callback was supplied
+/// (`thinking-selector.ts:122`); a list without one leaves the key alone. `persist_hint` is that
+/// guard expressed structurally, so a selector that did not opt in must never persist. Unlike the
+/// model picker there is no search input to fall to, so the key simply reports itself unhandled:
+/// the guard is skipped and the `action_for` match ends at `None => Ignored`. Asserted by equality
+/// rather than as "not `ConfirmDefault`": that weaker form also passes for `Confirm(_)`, i.e. for a
+/// list that began confirming a selection on a key nobody bound to confirm.
+#[test]
+fn ctrl_s_is_inert_on_a_list_that_did_not_opt_in() {
+    let km = SelectKeymap::default();
+    let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    for mut sel in [ListSelector::show_images(true), ListSelector::theme("dark")] {
+        assert_eq!(
+            sel.handle(&ctrl_s, &km),
+            SelectorOutcome::Ignored,
+            "Ctrl+S must fall to the keymap's `None` arm on a list with no persist path"
+        );
     }
 }
 
@@ -642,14 +705,14 @@ fn only_pis_own_components_opt_into_the_dialog_chrome() {
 /// FAILS under the revert that insets every `ListSelector`.
 #[test]
 fn the_inset_does_not_move_the_two_column_gate_on_uninset_dialogs() {
-    let mut sel = ListSelector::thinking("medium");
+    let mut sel = ListSelector::thinking("medium", "medium");
     let s = screen(&render_selector(&mut sel, 42, 16));
     assert!(
         s.contains("Moderate reasoning"),
         "at width 42 pi's SelectList sees 42 > 40 and draws descriptions:\n{s}"
     );
     // The rows also start at column 0, not 1.
-    let terminal = render_selector(&mut ListSelector::thinking("medium"), 42, 16);
+    let terminal = render_selector(&mut ListSelector::thinking("medium", "medium"), 42, 16);
     let cursor_y = row_of(&terminal, "→ ");
     assert_eq!(
         terminal.backend().buffer()[(0, cursor_y)].symbol(),

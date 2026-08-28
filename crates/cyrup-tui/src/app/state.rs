@@ -51,6 +51,27 @@ pub struct AppState {
     /// The current reasoning level (`off`…`xhigh`), preselected by the thinking selector and updated
     /// on confirm. The authoritative level lives on the agent/session at the L7 layer.
     pub thinking_level: String,
+    /// The PERSISTED default reasoning level (`defaultThinkingLevel`), distinct from the live
+    /// [`Self::thinking_level`]: the thinking picker badges this row ` · default` and `Ctrl+S`
+    /// rewrites it (Pi `settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL`,
+    /// `interactive-mode.ts:4814`).
+    ///
+    /// Seeded from the effective settings whenever the picker is opened from a session-bearing
+    /// path; the `"medium"` initial value is Pi's own `DEFAULT_THINKING_LEVEL` fallback for the
+    /// unset case, so a fresh install still badges a row rather than none.
+    pub default_thinking_level: String,
+    /// The PERSISTED default model as `(provider, id)` (`defaultProvider` + `defaultModel`), or
+    /// `None` when this app has no path to persist one.
+    ///
+    /// `Some(("", ""))` means "persisting is available, nothing is default yet" — Pi guards its
+    /// `Ctrl+S` on the CALLBACK being wired, not on a default existing (`model-selector.ts:138`,
+    /// `:401`), so the key and its footer appear either way. Seeded by `handle_model_command`,
+    /// which is the session-bearing route into the picker.
+    pub default_model: Option<(String, String)>,
+    /// The `"provider/id"` chosen in step 1 of the per-model thinking submenu, held while step 2
+    /// picks the level (Pi's `SteppedSubmenu` carries this in its `selections` map,
+    /// `settings-selector.ts:653`). `None` outside that two-step flow.
+    pub pending_model_thinking: Option<String>,
     /// Whether inline images are shown (vs. a text placeholder), toggled by the show-images selector.
     pub show_images: bool,
     /// The terminal image-protocol renderer (spec/tui/06 §6; `terminal-image.ts`). Defaults to the
@@ -299,6 +320,9 @@ impl AppState {
             selector: None,
             overlays: Vec::new(),
             thinking_level: "medium".to_string(),
+            default_thinking_level: "medium".to_string(),
+            default_model: None,
+            pending_model_thinking: None,
             show_images: true,
             image_renderer: ImageRenderer::default(),
             pending_images: Vec::new(),

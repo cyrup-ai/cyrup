@@ -1,5 +1,112 @@
 use super::*;
 
+/// The picker/command level vocabulary → [`ModelThinkingLevel`].
+///
+/// The same seven strings `ListSelector::thinking` rows on and `ModelThinkingLevel`'s
+/// `serde(rename_all = "camelCase")` wire form produces (`cyrup-core/src/message/thinking.rs:25`),
+/// so a level round-trips settings → picker → settings unchanged. Shared by the session-only
+/// `SetThinking` arm and its persisting `ConfirmSelectionAsDefault` sibling, which must agree on
+/// what a valid level is or `/thinking` and `Ctrl+S` could disagree.
+impl<B: Backend> App<B> {
+    /// Pi `_addPersistedDefaultToNonEmptyScope` (`agent-session.ts:1658-1670`), run after a model
+    /// is persisted as the default.
+    ///
+    /// A scoped set that does not contain the new default would make it **uncyclable**: `Ctrl+P`
+    /// walks the scoped models when any exist (`cycle_model`), so persisting a default outside
+    /// that set leaves the user unable to reach it without clearing the scope. Pi therefore widens
+    /// the scope to include it — both the LIVE set and, when the scope came from settings rather
+    /// than a `--models` flag, the persisted `enabledModels` list.
+    ///
+    /// Every early return is Pi's, in Pi's order:
+    /// - empty scoped set → nothing is restricted, nothing to widen (`:1659`);
+    /// - model already scoped → already reachable (`:1660`);
+    /// - `enabledModels` absent/empty → the scope is session-only (a `--models` flag), so the live
+    ///   set is widened but nothing is written (`:1664-1665`);
+    /// - reference already present, compared case-INSENSITIVELY → no duplicate row (`:1668`).
+    pub(crate) async fn add_persisted_default_to_non_empty_scope(
+        &mut self,
+        session: &Arc<AgentSession>,
+        provider: &str,
+        id: &str,
+    ) {
+        let scoped = session.scoped_models();
+        if scoped.is_empty() {
+            return;
+        }
+        if scoped
+            .iter()
+            .any(|s| s.model.provider.as_str() == provider && s.model.id.as_str() == id)
+        {
+            return;
+        }
+        // Widen the LIVE set first (`:1662`), so the model is cyclable this session even when the
+        // scope is flag-driven and nothing gets written below.
+        let Some(model) =
+            session
+                .available_model_catalog()
+                .iter()
+                .find(|m| m.provider.as_str() == provider && m.id.as_str() == id)
+                .cloned()
+        else {
+            return;
+        };
+        let mut widened = scoped;
+        widened.push(cyrup_session_svc::ScopedModel { model, thinking_level: None });
+        session.set_scoped_models(widened);
+
+        let existing = session.services().settings.effective().enabled_models();
+        let Some(existing) = existing.filter(|v| !v.is_empty()) else {
+            return;
+        };
+        let reference = format!("{provider}/{id}");
+        if existing.iter().any(|p| p.eq_ignore_ascii_case(&reference)) {
+            return;
+        }
+        let mut next = existing;
+        next.push(reference);
+        if let Err(e) = session
+            .persist_setting(
+                cyrup_session_svc::SettingsScope::Global,
+                "enabledModels",
+                serde_json::json!(next),
+            )
+            .await
+        {
+            self.state.transcript.push_status(format!("settings error: {e}"));
+        }
+    }
+}
+
+/// Pi `CLEAR_OVERRIDE_VALUE` (`settings-selector.ts:174`): the sentinel row value that REMOVES a
+/// per-model override rather than setting one. Verbatim, so the two stay recognisably the same
+/// mechanism.
+pub(crate) const CLEAR_MODEL_THINKING: &str = "__clear__";
+
+pub(crate) fn thinking_level_str(level: ModelThinkingLevel) -> &'static str {
+    match level {
+        ModelThinkingLevel::Off => "off",
+        ModelThinkingLevel::Minimal => "minimal",
+        ModelThinkingLevel::Low => "low",
+        ModelThinkingLevel::Medium => "medium",
+        ModelThinkingLevel::High => "high",
+        ModelThinkingLevel::Xhigh => "xhigh",
+        ModelThinkingLevel::Max => "max",
+    }
+}
+
+pub(crate) fn parse_thinking_level(level: &str) -> Option<ModelThinkingLevel> {
+    match level {
+        "off" => Some(ModelThinkingLevel::Off),
+        "minimal" => Some(ModelThinkingLevel::Minimal),
+        "low" => Some(ModelThinkingLevel::Low),
+        "medium" => Some(ModelThinkingLevel::Medium),
+        "high" => Some(ModelThinkingLevel::High),
+        "xhigh" => Some(ModelThinkingLevel::Xhigh),
+        "max" => Some(ModelThinkingLevel::Max),
+        _ => None,
+    }
+}
+
 impl<B: Backend> App<B> {
     /// A command was registered from a live extension handler (HA-1). Re-read the catalog.
     ///
@@ -136,28 +243,11 @@ impl<B: Backend> App<B> {
             // they do for Shift+Tab.
 
             C::SetThinking(level) => {
-                let parsed = match level.as_str() {
-                    "off" => Some(ModelThinkingLevel::Off),
-                    "minimal" => Some(ModelThinkingLevel::Minimal),
-                    "low" => Some(ModelThinkingLevel::Low),
-                    "medium" => Some(ModelThinkingLevel::Medium),
-                    "high" => Some(ModelThinkingLevel::High),
-                    "xhigh" => Some(ModelThinkingLevel::Xhigh),
-                    "max" => Some(ModelThinkingLevel::Max),
-                    _ => None,
-                };
+                let parsed = parse_thinking_level(&level);
                 match parsed {
                     Some(l) => match session.set_thinking_level(l).await {
                         Ok(applied) => {
-                            let label = match applied {
-                                ModelThinkingLevel::Off => "off",
-                                ModelThinkingLevel::Minimal => "minimal",
-                                ModelThinkingLevel::Low => "low",
-                                ModelThinkingLevel::Medium => "medium",
-                                ModelThinkingLevel::High => "high",
-                                ModelThinkingLevel::Xhigh => "xhigh",
-                                ModelThinkingLevel::Max => "max",
-                            };
+                            let label = thinking_level_str(applied);
                             self.state.transcript.push_status(format!("Thinking level: {label}"));
                         }
                         Err(e) => {
@@ -168,6 +258,155 @@ impl<B: Backend> App<B> {
                         .state
                         .transcript
                         .push_status(format!("thinking error: unknown level {level}")),
+                }
+            }
+
+            C::ConfirmSelectionAsDefault { kind: SelectorKind::Thinking, value } => {
+                // Pi `selectLevel(level, true)` → `setThinkingLevel(level, { persist: true })`
+                // (`interactive-mode.ts:4813` → `:4788`). Same ordering contract as the model
+                // path: apply to the session first, and persist only if that succeeded.
+                let Some(parsed) = parse_thinking_level(&value) else {
+                    self.state
+                        .transcript
+                        .push_status(format!("thinking error: unknown level {value}"));
+                    return;
+                };
+                if let Err(e) = session.set_thinking_level(parsed).await {
+                    self.state.transcript.push_status(format!("thinking error: {e}"));
+                    return;
+                }
+                // THE REQUESTED LEVEL, NOT THE CLAMPED ONE. `setThinkingLevel` clamps to what the
+                // active model supports and returns the applied value, but Pi persists `level` —
+                // the argument — not `effectiveLevel` (`agent-session.ts:1782`). Writing the clamp
+                // would silently downgrade the user's stored default the first time they set it
+                // while on a weaker model, and it would never recover on a stronger one.
+                match session
+                    .persist_setting(
+                        cyrup_session_svc::SettingsScope::Global,
+                        "defaultThinkingLevel",
+                        serde_json::json!(value),
+                    )
+                    .await
+                {
+                    // `Default thinking level: {level}` vs the plain path's
+                    // `Thinking level: {level}` (`interactive-mode.ts:4793`).
+                    Ok(()) => {
+                        self.state.default_thinking_level = value.clone();
+                        self.state
+                            .transcript
+                            .push_status(format!("Default thinking level: {value}"));
+                    }
+                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                }
+            }
+
+            C::ThinkingCommand(arg) => {
+                // Pi `handleThinkingCommand(searchTerm?)` (`interactive-mode.ts:4771-4785`).
+                let levels = session.available_thinking_levels();
+                let Some(term) = arg else {
+                    // No argument → the picker. Seed the persisted default first so the row can be
+                    // badged and `Ctrl+S` offered — this is the second route in (the other is
+                    // `/settings` → Thinking level), and neither reaches a session later.
+                    self.state.default_thinking_level = session
+                        .services()
+                        .settings
+                        .effective()
+                        .default_thinking_level()
+                        .map(thinking_level_str)
+                        .unwrap_or("medium")
+                        .to_string();
+                    self.open_selector(SelectorKind::Thinking);
+                    return;
+                };
+                // `searchTerm.trim().toLowerCase()` matched case-insensitively against the
+                // AVAILABLE levels — not the full ladder — so a level the active model cannot do
+                // is reported unknown rather than silently clamped (`:4779-4780`).
+                let normalized = term.trim().to_lowercase();
+                let matched = levels
+                    .iter()
+                    .copied()
+                    .find(|l| thinking_level_str(*l).eq_ignore_ascii_case(&normalized));
+                let Some(level) = matched else {
+                    // Pi's exact copy, including the quotes around the RAW term (not the
+                    // normalized one) and the trailing period (`:4781`).
+                    let available: Vec<&str> =
+                        levels.iter().copied().map(thinking_level_str).collect();
+                    self.state.transcript.push_status(format!(
+                        "Unknown thinking level \"{term}\". Available levels: {}.",
+                        available.join(", ")
+                    ));
+                    return;
+                };
+                // `selectThinkingLevel(level, false)` — SESSION-ONLY, the same as `Enter` in the
+                // picker (`:4786`). The persisting sibling is `Ctrl+S`, never this.
+                match session.set_thinking_level(level).await {
+                    Ok(applied) => {
+                        let label = thinking_level_str(applied);
+                        self.state.thinking_level = label.to_string();
+                        self.state.status.set_thinking_level(label);
+                        self.state.editor.set_thinking_level(label);
+                        self.state.transcript.push_status(format!("Thinking level: {label}"));
+                    }
+                    Err(e) => self.state.transcript.push_status(format!("thinking error: {e}")),
+                }
+            }
+
+            C::SetModelThinkingLevel { model, level } => {
+                // GAP 3's write (Pi `setModelThinkingLevel` / `removeModelThinkingLevel`,
+                // `settings-manager.ts:800-812`).
+                //
+                // \[CYRUP-DELTA] The task prescribed
+                // `persist_setting(Global, "modelThinkingLevels.{provider}/{id}", …)`. That is
+                // WRONG here: `persist_setting` addresses nesting by splitting the key on `.`
+                // (`accessors.rs:135`), and **325 model ids in this workspace's catalogs contain a
+                // dot** (`claude-opus-4.5`, `gemini-2.5-pro`, …), so the key would split mid-id and
+                // write a bogus nested object for the overwhelming majority of models. Pi has no
+                // such hazard because its setter indexes the map directly with the composed string
+                // (`:804`). The whole map is therefore read, modified, and written back under the
+                // single un-dotted key `modelThinkingLevels`, which is the same end state Pi
+                // reaches and is dot-safe by construction.
+                let eff_map = session.services().settings.effective().all_model_thinking_levels();
+                let mut map: serde_json::Map<String, serde_json::Value> = eff_map
+                    .into_iter()
+                    .filter_map(|(k, v)| serde_json::to_value(v).ok().map(|v| (k, v)))
+                    .collect();
+                if level == CLEAR_MODEL_THINKING {
+                    map.remove(&model);
+                } else if let Some(parsed) = parse_thinking_level(&level) {
+                    let Ok(v) = serde_json::to_value(parsed) else { return };
+                    map.insert(model.clone(), v);
+                } else {
+                    self.state
+                        .transcript
+                        .push_status(format!("thinking error: unknown level {level}"));
+                    return;
+                }
+                // `if (Object.keys(...).length === 0) delete this.globalSettings
+                // .modelThinkingLevels` (`settings-manager.ts:810-812`) — an emptied map removes
+                // the key rather than persisting `{}`. `Value::Null` is `SettingsManager::set`'s
+                // key-removal signal (`manager.rs:255-256`).
+                let payload = if map.is_empty() {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::Value::Object(map)
+                };
+                match session
+                    .persist_setting(
+                        cyrup_session_svc::SettingsScope::Global,
+                        "modelThinkingLevels",
+                        payload,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        let msg = if level == CLEAR_MODEL_THINKING {
+                            format!("{model} → global default")
+                        } else {
+                            format!("{model} → {level}")
+                        };
+                        self.state.transcript.push_status(msg);
+                    }
+                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
                 }
             }
 

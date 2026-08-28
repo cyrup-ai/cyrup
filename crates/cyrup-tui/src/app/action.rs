@@ -127,10 +127,37 @@ pub enum AppCommand {
     /// (`interactive-mode.ts:4222-4226`), which clamps to the model's capabilities and emits
     /// `ThinkingLevelChanged`; it is a session op, not a settings write, so it does not go through
     /// [`Self::ApplySetting`].
+    ///
+    /// That is true of the **`Enter` path only**, and stating it without that qualifier is what
+    /// hid this gap: Pi's `setThinkingLevel` takes `ModelMutationOptions { persist?: boolean }`
+    /// (`agent-session.ts:256`) and its `Ctrl+S` sibling passes `{ persist: true }`
+    /// (`interactive-mode.ts:4813` → `:4788`). The persisting half is
+    /// [`Self::ConfirmSelectionAsDefault`], not this variant — this one stays session-only, which
+    /// is correct parity for `Enter`.
     SetThinking(String),
+    /// `/thinking [level]` (Pi `handleThinkingCommand`, `interactive-mode.ts:4771-4784`).
+    ///
+    /// `None` opens the picker; `Some(level)` applies it **session-only** — pi's argument path is
+    /// `selectThinkingLevel(level, false)` (`:4786`), i.e. `{ persist: false }`, the same as
+    /// `Enter` in the picker. An unrecognised level produces pi's exact error rather than silently
+    /// opening the picker.
+    ThinkingCommand(Option<String>),
+    /// `/settings` → "Default thinking level per model" step 2 (Pi's stepped-submenu `onComplete`,
+    /// `settings-selector.ts:652-666`). `model` is `"provider/id"`; `level` is a level name or the
+    /// [`crate::app::CLEAR_MODEL_THINKING`] sentinel, which REMOVES the override.
+    SetModelThinkingLevel { model: String, level: String },
     /// Apply a confirmed data-bound selection (`{kind}` chose `{value}`): set the model, switch the
     /// branch, login/logout, etc.
     ConfirmSelection { kind: SelectorKind, value: String },
+    /// `Ctrl+S` inside the model or thinking picker: apply the selection to the session **and**
+    /// persist it as the global default (Pi `selectModel(m, true)` / `selectLevel(l, true)` →
+    /// `{ persist: true }`, `interactive-mode.ts:4999`, `:4813`).
+    ///
+    /// Distinct from [`Self::ConfirmSelection`] because the persist is opt-in per keypress, not a
+    /// property of the selection: plain `Enter` must leave the settings file untouched.
+    /// The write is Global-scoped unconditionally — Pi's setters go straight to
+    /// `this.globalSettings` (`settings-manager.ts:731-744`, `:786-790`) with no scope choice.
+    ConfirmSelectionAsDefault { kind: SelectorKind, value: String },
     /// Persist a settings field changed **in place** in the `/settings` grid (Pi settings-selector
     /// `onChange` → `SettingsManager.setNested`). The slot stays open; the `/reload` re-reads it.
     ApplySetting { id: String, value: String },

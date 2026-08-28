@@ -112,12 +112,15 @@ async fn run_loop(
                     SelectorOutcome::Cancel => return Ok(SelectorOutcome::Cancel),
                     SelectorOutcome::Apply(payload) => on_apply(&payload).await,
                     // Never produced by the startup selectors (`OpenExternalEditor` is only
-                    // `ExtensionEditorSelector`'s; `OpenSubmenu` is only the `/settings` grid's) —
+                    // `ExtensionEditorSelector`'s; `OpenSubmenu` is only the `/settings` grid's;
+                    // `ConfirmDefault` is only the model/thinking pickers', neither of which runs
+                    // pre-launch — and there is no session here to persist through anyway) —
                     // treated as a no-op like `Redraw`'s siblings.
                     SelectorOutcome::Preview(_)
                     | SelectorOutcome::Redraw
                     | SelectorOutcome::Ignored
                     | SelectorOutcome::OpenExternalEditor
+                    | SelectorOutcome::ConfirmDefault(_)
                     | SelectorOutcome::OpenSubmenu(_) => {}
                 }
             }
