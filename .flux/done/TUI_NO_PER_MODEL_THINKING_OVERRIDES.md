@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Add Per-Model Default Thinking Levels And The Multi-Step Submenu Engine They Need

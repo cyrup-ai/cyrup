@@ -15,6 +15,30 @@
 //! The half-block protocol ([`ratatui_image::picker::ProtocolType::Halfblocks`]) writes ordinary
 //! `▀` cells with fg/bg colors into the frame buffer, so it renders to **any** backend — including
 //! `ratatui::backend::TestBackend` — which is what makes the inline-image path snapshot-testable.
+//!
+//! # Capability environment overrides
+//!
+//! The env sniff can be overridden per capability (Pi `detectCapabilities`,
+//! `tui/src/terminal-image.ts:139-162`). Each capability reads `CYRUP_*` first and falls back to
+//! `PI_*` only when the `CYRUP_*` key is unset, matching [`crate::experimental_features_enabled`]'s
+//! precedence (`status.rs`).
+//!
+//! | Variable | Accepted values | Effect |
+//! |---|---|---|
+//! | `CYRUP_IMAGE_PROTOCOL` / `PI_IMAGE_PROTOCOL` | `kitty`, `iterm2`, `none`, `0` (case-insensitive) | Forces the inline-image protocol; `none`/`0` force the half-block fallback |
+//! | `CYRUP_TRUE_COLOR` / `PI_TRUE_COLOR` | `1`, `0` | Forces 24-bit color on/off |
+//! | `CYRUP_HYPERLINKS` / `PI_HYPERLINKS` | `1`, `0` | Forces OSC-8 hyperlink emission on/off |
+//!
+//! Two behaviours are worth spelling out:
+//!
+//! * The booleans accept **only** `1` and `0` (`parseBooleanCapabilityOverride`,
+//!   `terminal-image.ts:139-141`). `true`, `yes`, an empty value or anything else is *not* an
+//!   override — the sniff decides.
+//! * `IMAGE_PROTOCOL=none` is **not** the same as leaving it unset: `none` (and `0`) is an explicit
+//!   "no native graphics", while an unset or unrecognised value leaves the sniff's answer alone.
+//! * A *set* hyperlinks override suppresses the tmux probe entirely — [`detect_capabilities`] never
+//!   runs `tmux display-message` when `CYRUP_HYPERLINKS`/`PI_HYPERLINKS` already answers the
+//!   question (`terminal-image.ts:145-147`, where the probe is a lazy `() => boolean`).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -500,9 +524,98 @@ impl TerminalCapabilities {
 /// Env-sniff the terminal capabilities (feature #7; Pi `detectCapabilities`, terminal-image.ts:65).
 /// Reads the real process environment and, when running under tmux, probes whether the outer terminal
 /// forwards OSC-8 hyperlinks (`tmux display-message -p '#{client_termfeatures}'`, Pi
-/// `probeTmuxHyperlinks`; any error ⇒ `false`).
+/// `probeTmuxHyperlinks`; any error ⇒ `false`), unless an env override has already answered that
+/// question — see the module docs for the override table.
+///
+/// The probe is handed over as the function **item**, not as a pre-computed `bool`: Pi's parameter
+/// is lazy (`tmuxForwardsHyperlink: () => boolean = probeTmuxHyperlinks`, terminal-image.ts:143),
+/// so a set `CYRUP_HYPERLINKS`/`PI_HYPERLINKS` short-circuits it and no `tmux` subprocess is
+/// spawned at all.
 pub fn detect_capabilities() -> TerminalCapabilities {
-    detect_capabilities_from(|k| std::env::var(k).ok(), probe_tmux_hyperlinks())
+    detect_capabilities_with_overrides(|k| std::env::var(k).ok(), probe_tmux_hyperlinks)
+}
+
+/// Pi's `parseBooleanCapabilityOverride` (terminal-image.ts:139-141): a boolean capability override
+/// is the literal `"1"` or `"0"` and nothing else. `"true"`, `"yes"`, `""` and an unset variable all
+/// yield `None`, i.e. "no override — keep what the sniff decided".
+fn parse_bool_capability_override(value: Option<&str>) -> Option<bool> {
+    match value {
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => None,
+    }
+}
+
+/// Pi's `PI_IMAGE_PROTOCOL` three-way (terminal-image.ts:148-154), which has *four* outcomes and so
+/// needs a nested `Option`:
+///
+/// * `Some(Some(protocol))` — force that protocol (`kitty`, `iterm2`).
+/// * `Some(None)` — force "no native graphics" (`none`, `0`); the half-block raster is used.
+/// * `None` — no override; whatever the sniff decided stands.
+///
+/// Pi lowercases the value before matching; the accepted literals are pure ASCII, so
+/// `eq_ignore_ascii_case` is equivalent without allocating (same argument recorded at
+/// `mermaid.rs:143-146`).
+fn parse_image_protocol_override(value: Option<&str>) -> Option<Option<ImageProtocol>> {
+    let value = value?;
+    if value.eq_ignore_ascii_case("kitty") {
+        Some(Some(ImageProtocol::Kitty))
+    } else if value.eq_ignore_ascii_case("iterm2") {
+        Some(Some(ImageProtocol::Iterm2))
+    } else if value.eq_ignore_ascii_case("none") || value == "0" {
+        Some(None)
+    } else {
+        None
+    }
+}
+
+/// Resolve one capability override's raw string: the `CYRUP_*` key wins when set, `PI_*` is the
+/// fallback (house convention, `status.rs:479-484`). The STRING is resolved before it is parsed —
+/// unlike the boolean-OR shape at `status.rs:481-483` — so a `CYRUP_*` that is set but not a legal
+/// value (`CYRUP_TRUE_COLOR=true`) does not silently fall through to `PI_TRUE_COLOR`.
+fn capability_override_value(
+    env: &impl Fn(&str) -> Option<String>,
+    cyrup_key: &str,
+    pi_key: &str,
+) -> Option<String> {
+    env(cyrup_key).or_else(|| env(pi_key))
+}
+
+/// [`detect_capabilities`] against an injected environment and an injected tmux probe — Pi
+/// `detectCapabilities` (terminal-image.ts:143-162). This is the env-override layer, sitting
+/// strictly between the sniff ([`detect_capabilities_from`]) and the cache
+/// ([`cached_capabilities`]); the sniff itself is untouched by it.
+///
+/// Order follows Pi exactly:
+///
+/// 1. Read the hyperlinks override first (`:144`) — it doubles as the tmux forwarding flag handed
+///    to the sniff (`:145-147`), which is why `probe` is `FnOnce`: a set override never calls it.
+/// 2. Apply each override onto the sniffed record, and only where the parse produced a value
+///    (`:158-161`, Pi's spread-only-if-defined). Hyperlinks is re-applied here even though it was
+///    already fed in as the forwarding flag (`:161`), because the sniff can override that flag —
+///    `TERM=screen` and the unidentified-terminal default both force `hyperlinks: false`.
+pub fn detect_capabilities_with_overrides(
+    env: impl Fn(&str) -> Option<String>,
+    probe: impl FnOnce() -> bool,
+) -> TerminalCapabilities {
+    let hyperlinks = parse_bool_capability_override(
+        capability_override_value(&env, "CYRUP_HYPERLINKS", "PI_HYPERLINKS").as_deref(),
+    );
+    let mut caps = detect_capabilities_from(&env, hyperlinks.unwrap_or_else(probe));
+    if let Some(images) = parse_image_protocol_override(
+        capability_override_value(&env, "CYRUP_IMAGE_PROTOCOL", "PI_IMAGE_PROTOCOL").as_deref(),
+    ) {
+        caps.images = images;
+    }
+    if let Some(true_color) = parse_bool_capability_override(
+        capability_override_value(&env, "CYRUP_TRUE_COLOR", "PI_TRUE_COLOR").as_deref(),
+    ) {
+        caps.true_color = true_color;
+    }
+    if let Some(hyperlinks) = hyperlinks {
+        caps.hyperlinks = hyperlinks;
+    }
+    caps
 }
 
 /// The process-wide OSC-8 answer, Pi's module-level `cachedCapabilities` + `getCapabilities()`
@@ -531,9 +644,14 @@ static CAPABILITIES: std::sync::RwLock<Option<TerminalCapabilities>> =
 ///
 /// **This is a pure environment read, unconditionally — it never spawns a subprocess**, which is
 /// what makes it safe to call from a render path. The lazy fallback therefore uses
-/// [`detect_capabilities_from`] with `tmux_forwards_hyperlinks = false` rather than
+/// [`detect_capabilities_with_overrides`] with a `|| false` probe rather than
 /// [`detect_capabilities`], whose `probe_tmux_hyperlinks` shells out to
 /// `tmux display-message -p '#{client_termfeatures}'`. Redrawing a transcript must not fork.
+///
+/// The env-override layer *is* still applied on this path, so `CYRUP_HYPERLINKS=1` (see the module
+/// docs) takes effect even for an embedder that never calls
+/// [`App::detect_image_support`](crate::App::detect_image_support). Only the tmux probe is skipped,
+/// and a set hyperlinks override would have suppressed it anyway.
 ///
 /// The probe's answer is not lost: [`App::detect_image_support`](crate::App::detect_image_support)
 /// runs the full [`detect_capabilities`] once at startup and seeds this cache via
@@ -556,7 +674,7 @@ pub fn cached_capabilities() -> TerminalCapabilities {
     {
         return caps;
     }
-    let detected = detect_capabilities_from(|k| std::env::var(k).ok(), false);
+    let detected = detect_capabilities_with_overrides(|k| std::env::var(k).ok(), || false);
     if let Ok(mut guard) = CAPABILITIES.write() {
         // First writer wins, so a `set_capabilities` that raced this detection is not clobbered.
         if guard.is_none() {

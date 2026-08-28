@@ -68,7 +68,7 @@ pub(crate) use mermaid::{mode_from_setting, MermaidContext, MessageType};
 // The markdown-internal items the submodules share. Re-bound here so every submodule reaches them
 // through its own `use super::*;`, the same way `crate::transcript`'s split modules do.
 use highlight::highlight_lines;
-use mermaid::DiagramOutcome;
+use mermaid::{DiagramOutcome, SpanClass};
 use prepass::{latex_prepass, MATH_END, MATH_START};
 use table::trim_cell;
 
@@ -312,6 +312,17 @@ struct MdRenderer<'t> {
     /// Fenced-code capture: `Some(lang)` while inside a code block.
     code_lang: Option<String>,
     code_buf: String,
+    /// Raw HTML **block** capture: `Some(buffer)` between `Tag::HtmlBlock` and `TagEnd::HtmlBlock`.
+    ///
+    /// Upstream a block-level `html` token is ONE `lines.push(applyDefaultStyle(token.raw.trim()))`
+    /// (`markdown.ts:612-617`) whose newlines survive into the wrap pass, where
+    /// `wrapTextWithAnsi` splits them into one row per source line (`utils.ts:832-839`).
+    /// pulldown-cmark instead emits one `Event::Html` per source line
+    /// (`pulldown-cmark-0.13.4/src/firstpass.rs:1473`, `parse.rs:2261`), so the whole block is
+    /// re-accumulated here before it is split: the block-edge `trim()` is defined on the whole
+    /// block, not per line, and the extra `ItemBody::Html` pulldown appends for the `\n` half of a
+    /// CRLF (`firstpass.rs:1473-1499`) is absorbed instead of becoming a phantom row.
+    html_buf: Option<String>,
     /// Simple table capture (header row + body rows of plain-text cells).
     table: Option<TableCapture>,
     /// Pi's `Markdown` `{ color }` option: the default foreground for plain prose runs, replacing

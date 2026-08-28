@@ -439,12 +439,17 @@ impl SelectorKind {
     ///   not a `ListSelector`, so this generic row never reaches it and porting that hint is left
     ///   as its own item (S40).
     ///
-    /// Every other kind's component draws no such row: `ThinkingSelectorComponent`
-    /// (`thinking-selector.ts:42-69`), `ShowImagesSelectorComponent`
+    /// Every other kind's component draws no such row: `ShowImagesSelectorComponent`
     /// (`show-images-selector.ts:25-44`) and `ThemeSelectorComponent` (`theme-selector.ts:35-61`)
     /// are `DynamicBorder` + `SelectList` + `DynamicBorder` and nothing else;
     /// `OAuthSelectorComponent` (`/login`, `/logout`) and `UserMessageSelectorComponent` (`/fork`)
     /// contain no `keyHint` call at all.
+    ///
+    /// [`Self::Thinking`] is absent from all three per-kind tables below because it no longer
+    /// routes through [`ListSelector`] at all: `ThinkingSelectorComponent` stopped being
+    /// border/list/border at 0.84.3 and is now a titled dialog with its own search `Input` and dim
+    /// footer (`thinking-selector.ts:77-97`), ported as
+    /// [`crate::thinking_selector::ThinkingSelector`].
     pub fn draws_hint_row(self) -> bool {
         matches!(
             self,
@@ -464,9 +469,11 @@ impl SelectorKind {
     /// `OAuthSelectorComponent` (`oauth-selector.ts:144` `new TruncatedText(line, 1, 0)`, and
     /// `:149`/`:160` for its scroll indicator and empty state).
     ///
-    /// The components that add a `SelectList` straight to the container — thinking, show-images,
-    /// theme — pass it the container's full width, and `/fork`'s `UserMessageList`
-    /// (`user-message-selector.ts:140`) is added unwrapped too. Those rows start at column 0.
+    /// The components that add a `SelectList` straight to the container — show-images
+    /// (`show-images-selector.ts:41`), theme (`theme-selector.ts:58`) and the relocated thinking
+    /// picker (`thinking-selector.ts:92`) — pass it the container's full width, and `/fork`'s
+    /// `UserMessageList` (`user-message-selector.ts:140`) is added unwrapped too. Those rows start
+    /// at column 0.
     ///
     /// The one-column figure is `Text`'s own: `contentWidth = max(1, width - paddingX * 2)`
     /// (`packages/tui/src/components/text.ts:64`) with a matching left and right margin at
@@ -481,11 +488,11 @@ impl SelectorKind {
     ///
     /// Same discipline as [`Self::draws_hint_row`] and [`Self::insets_rows`]: this is a property of
     /// the individual pi COMPONENT, never of the shared list engine. `SelectList`
-    /// (`packages/tui/src/components/select-list.ts`) emits no blank rows of its own, and the three
+    /// (`packages/tui/src/components/select-list.ts`) emits no blank rows of its own, and the two
     /// components that add one straight to the container draw **zero** spacers — their whole
-    /// constructor is border/list/border: `ThinkingSelectorComponent` (`thinking-selector.ts:42,66,69`),
-    /// `ShowImagesSelectorComponent` (`show-images-selector.ts:25,41,44`) and `ThemeSelectorComponent`
-    /// (`theme-selector.ts:35,58,61`). Putting the spacers in the engine would give those three a
+    /// constructor is border/list/border: `ShowImagesSelectorComponent`
+    /// (`show-images-selector.ts:25,41,44`) and `ThemeSelectorComponent`
+    /// (`theme-selector.ts:35,58,61`). Putting the spacers in the engine would give those two a
     /// four-row envelope pi does not draw.
     ///
     /// The kinds that DO get them, with the constructor lines counted:

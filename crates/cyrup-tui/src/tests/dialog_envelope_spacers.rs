@@ -9,9 +9,9 @@
 //! Two disciplines run through every test here.
 //!
 //! **The spacers are per-COMPONENT, never per-engine.** `SelectList`
-//! (`packages/tui/src/components/select-list.ts`) emits no blank rows, and three of the components
-//! that host one — `thinking-selector.ts:42,66,69`, `show-images-selector.ts:25,41,44`,
-//! `theme-selector.ts:35,58,61` — are `DynamicBorder`/list/`DynamicBorder` and nothing else, while
+//! (`packages/tui/src/components/select-list.ts`) emits no blank rows, and two of the components
+//! that host one — `show-images-selector.ts:25,41,44` and `theme-selector.ts:35,58,61` — are
+//! `DynamicBorder`/list/`DynamicBorder` and nothing else, while
 //! `settings-selector.ts:765,873-874` is the same three children for `/settings`. Every "adds
 //! spacers" test therefore has a MIRROR asserting a zero-spacer component stayed flush, so a
 //! regression that pushes the blank rows down into the shared engine fails here rather than
@@ -71,6 +71,17 @@ fn rows_at(sel: &mut dyn Selector, w: u16, h: u16) -> Vec<String> {
 fn natural(sel: &mut dyn Selector, w: u16) -> Vec<String> {
     let h = sel.desired_height(w);
     rows_at(sel, w, h)
+}
+
+/// The `/thinking` picker over pi's full `THINKING_LEVEL_OPTIONS` ladder (`core/defaults.ts:4-12`),
+/// which is what `getAvailableThinkingLevels()` returns with no model resolved
+/// (`agent-session.ts:1817`).
+fn thinking(current: &str, default_level: &str) -> crate::ThinkingSelector {
+    let levels: Vec<String> = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    crate::ThinkingSelector::new(&levels, current, default_level, "Shift+Tab".to_string())
 }
 
 fn is_rule(row: &str) -> bool {
@@ -147,34 +158,40 @@ fn extension_selector_envelope_has_the_four_upstream_spacer_rows() {
     );
 }
 
-/// MIRROR. `ThinkingSelectorComponent` is `DynamicBorder`(`thinking-selector.ts:42`) +
-/// `SelectList`(:66) + `DynamicBorder`(:69) — **zero** spacers. The blank rows above must come from
-/// the per-kind gate, never from `ListSelector` itself; if they migrate into the shared engine this
-/// test goes red while the one above stays green.
+/// MIRROR, retargeted to pi 0.84.3. `ThinkingSelectorComponent` is no longer border/list/border:
+/// its constructor (`thinking-selector.ts:77-97`) is `DynamicBorder`(:77) · `Spacer`(:78) ·
+/// `Text("Thinking Level")`(:79) · `Spacer`(:80) · the cycle-key `Text`(:81) · `Spacer`(:82) ·
+/// `Input`(:84-86) · `Spacer`(:87) · `SelectList`(:92) · `Spacer`(:93) · the dim footer(:94) ·
+/// `DynamicBorder`(:97). **Five** spacers, and they belong to that component — which is why it is
+/// [`crate::ThinkingSelector`] and not a [`ListSelector`] kind. If this envelope ever migrates into
+/// the shared engine, the show-images/theme mirrors below go red.
 #[test]
-fn thinking_selector_envelope_stays_flush_against_its_rules() {
-    let mut sel = ListSelector::thinking("medium", "medium")
-        .with_upstream_chrome(SelectorKind::Thinking, &SelectKeymap::default());
+fn thinking_selector_draws_pis_0_84_3_envelope() {
+    let mut sel = thinking("medium", "medium");
     let rows = natural(sel.as_mut_selector(), 60);
     let n = rows.len();
-    assert!(is_rule(&rows[0]), "top rule: {rows:?}");
-    assert!(rows[1].contains("off"), "the first level row is flush against the rule: {rows:?}");
-    assert!(is_rule(&rows[n - 1]), "bottom rule: {rows:?}");
-    // pi v0.84.3 CHANGED this envelope. It used to be border/list/border — flush at both ends,
-    // zero spacers — and this test pinned that. `ThinkingSelectorComponent` now ends
-    // `selectList` · `Spacer(1)`(:93) · footer `Text`(:94) · `DynamicBorder`(:96), so the last
-    // level row is no longer flush against the bottom rule and there is exactly ONE blank row.
-    // The TOP half of the envelope is unchanged, which is why the two assertions above still hold.
+    assert!(is_rule(&rows[0]), "top rule (:77): {rows:?}");
+    assert_eq!(rows[1], "", "Spacer(1) (:78): {rows:?}");
+    assert_eq!(rows[2], "Thinking Level", "the title Text (:79): {rows:?}");
+    assert_eq!(rows[3], "", "Spacer(1) (:80): {rows:?}");
     assert!(
-        rows[n - 2].contains("set as default"),
-        "pi's footer sits directly above the bottom rule: {rows:?}"
+        rows[4].ends_with("cycles thinking levels in-session"),
+        "the app.thinking.cycle sentence (:81): {rows:?}"
     );
-    assert!(rows[n - 3].is_empty(), "with pi's `Spacer(1)` above it: {rows:?}");
+    assert_eq!(rows[5], "", "Spacer(1) (:82): {rows:?}");
+    // `Input.render`'s prompt (`input.ts:380`) is `"> "`; `rows_at` trims the trailing space off
+    // the empty query, so the row is a bare `>`.
+    assert_eq!(rows[6], crate::INPUT_PROMPT.trim_end(), "the search Input (:84-86): {rows:?}");
+    assert_eq!(rows[7], "", "Spacer(1) (:87): {rows:?}");
+    assert!(rows[8].contains("off"), "the first level row (:92): {rows:?}");
+    assert!(is_rule(&rows[n - 1]), "bottom rule (:97): {rows:?}");
+    assert!(rows[n - 2].contains("set as default"), "the dim footer (:94): {rows:?}");
+    assert!(rows[n - 3].is_empty(), "Spacer(1) above it (:93): {rows:?}");
     assert!(rows[n - 4].contains("max"), "and the last level row above that: {rows:?}");
     assert_eq!(
         rows.iter().filter(|r| r.is_empty()).count(),
-        1,
-        "exactly the one `Spacer(1)` at `thinking-selector.ts:93`: {rows:?}"
+        5,
+        "exactly the five Spacer(1) children at :78, :80, :82, :87, :93: {rows:?}"
     );
 }
 
@@ -367,18 +384,23 @@ fn settings_selector_envelope_is_border_list_border_with_no_title_row() {
 /// MIRROR for S16 + S33. Everything S16/S33 add — a search `Input`, a description block, the
 /// `Type to search …` hint, the `min(30, widest)` label column — belongs to **`SettingsList`**
 /// (`packages/tui/src/components/settings-list.ts`) and to nothing else. The components that host a
-/// `SelectList` instead get none of it: `thinking-selector.ts:42,66,69`,
-/// `show-images-selector.ts:25,41,44` and `theme-selector.ts:35,58,61` are border/list/border with
-/// no `Input` and no hint, and `SelectList`'s own column policy is `getPrimaryColumnWidth`
-/// (`select-list.ts:178-197`) with the `{12, 32}` slash bounds — NOT `min(30, widest)`.
+/// `SelectList` instead get none of it: `show-images-selector.ts:25,41,44` and
+/// `theme-selector.ts:35,58,61` are border/list/border with no `Input` and no hint, and
+/// `SelectList`'s own column policy is `getPrimaryColumnWidth` (`select-list.ts:178-197`) with the
+/// `{12, 32}` slash bounds — NOT `min(30, widest)`.
+///
+/// The subject used to be the thinking picker. It cannot be any more: at 0.84.3
+/// `ThinkingSelectorComponent` grew a search `Input` of its OWN (`thinking-selector.ts:84-86`), so
+/// "no Input" is no longer true of it — and it is now [`crate::ThinkingSelector`], not a
+/// [`ListSelector`] kind, which is exactly the separation this test exists to protect.
 ///
 /// This is the batch-3 failure mode in miniature: a hint row put on the shared engine reached ~10
 /// dialogs pi draws it on 4. If any of these assertions ever flips, the `SettingsList` port has
 /// leaked into `SelectList`.
 #[test]
 fn settings_list_behaviours_do_not_leak_into_the_shared_select_list() {
-    let mut sel = ListSelector::thinking("medium", "medium")
-        .with_upstream_chrome(SelectorKind::Thinking, &SelectKeymap::default());
+    let mut sel = ListSelector::show_images(true)
+        .with_upstream_chrome(SelectorKind::ShowImages, &SelectKeymap::default());
     let rows = natural(sel.as_mut_selector(), 60);
     assert!(!rows.iter().any(|r| r.starts_with("> ") || r.trim_end() == ">"), "no Input: {rows:?}");
     assert!(!rows.iter().any(|r| r.contains("Type to search")), "no SettingsList hint: {rows:?}");

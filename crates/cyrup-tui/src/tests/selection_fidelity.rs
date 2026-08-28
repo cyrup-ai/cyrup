@@ -16,8 +16,9 @@
 //!   truncates the label to `effectivePrimaryColumnWidth - PRIMARY_COLUMN_GAP`; `:98` normalizes
 //!   the description to a single line before `renderItem` sees it.
 //! * `extension-selector.ts:63-73` composes the hint row and `:87` insets each row by one column —
-//!   **both belong to that component**, not to `SelectList`. `thinking-selector.ts:42-69` has
-//!   neither.
+//!   **both belong to that component**, not to `SelectList`. `show-images-selector.ts:25-44` has
+//!   neither. (`thinking-selector.ts` was the original example and grew its own chrome at 0.84.3,
+//!   `:77-97`; it is now [`crate::ThinkingSelector`], not a `ListSelector` kind.)
 //! * `session-selector.ts:476` uses U+203A `› `. `tree-selector.ts:722` puts the fold state in the
 //!   CONNECTOR (`isFolded ? "⊞" : foldable ? "⊟" : "─"`, dim); `:734`'s accent `⊞ ` marker is the
 //!   connector-less fallback, NOT the only site — the audit's S24 row read that guard backwards.
@@ -62,6 +63,18 @@ fn render_selector(sel: &mut dyn Selector, w: u16, h: u16) -> Terminal<TestBacke
     let mut terminal = Terminal::new(TestBackend::new(w, h)).unwrap();
     terminal.draw(|f| sel.render(f, Rect::new(0, 0, w, h), &theme)).unwrap();
     terminal
+}
+
+/// The `/thinking` picker. At pi 0.84.3 it is its own component
+/// (`thinking-selector.ts:77-97` → [`crate::ThinkingSelector`]), not a [`ListSelector`] kind, and
+/// its ladder comes from `session.getAvailableThinkingLevels()` (`interactive-mode.ts:4792`) —
+/// here the full `THINKING_LEVEL_OPTIONS` (`core/defaults.ts:4-12`).
+fn thinking(current: &str, default_level: &str) -> crate::ThinkingSelector {
+    let levels: Vec<String> = ["off", "minimal", "low", "medium", "high", "xhigh", "max"]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    crate::ThinkingSelector::new(&levels, current, default_level, "Shift+Tab".to_string())
 }
 
 fn screen(terminal: &Terminal<TestBackend>) -> String {
@@ -580,11 +593,15 @@ fn tree_selection_without_a_selected_bg_role_keeps_its_foreground() {
 // S3 / S28, the negative half — the chrome is OPT-IN
 
 /// **S3, corrected.** The hint row belongs to the *component*, not to pi's shared list engine.
-/// `ThinkingSelectorComponent` is 75 lines — `DynamicBorder` + `SelectList` + `DynamicBorder`
-/// (`thinking-selector.ts:42-69`) — with no `keyHint` call anywhere in the file, and the same holds
-/// for `show-images-selector.ts:25-44`, `theme-selector.ts:35-61`, `oauth-selector.ts` and
-/// `user-message-selector.ts`. Making the row a property of `ListSelector` gave six or seven
-/// dialogs a row pi never draws.
+/// `ShowImagesSelectorComponent` is `DynamicBorder` + `SelectList` + `DynamicBorder`
+/// (`show-images-selector.ts:25-44`) with no `keyHint` call anywhere in the file, and the same holds
+/// for `theme-selector.ts:35-61`, `oauth-selector.ts` and `user-message-selector.ts`. Making the row
+/// a property of `ListSelector` gave six or seven dialogs a row pi never draws.
+///
+/// `ThinkingSelectorComponent` used to head that list. At 0.84.3 it has an envelope of its own
+/// (`thinking-selector.ts:77-97`) — still with no generic `keyHint` row, but with a title, a
+/// cycle-key sentence, a search `Input` and a dim footer — so it is [`crate::ThinkingSelector`] and
+/// no longer rides this engine at all.
 ///
 /// FAILS under the revert that puts the row back on every `ListSelector`.
 #[test]
@@ -603,11 +620,15 @@ fn list_selector_draws_no_hint_row_where_pi_draws_none() {
 }
 
 /// The thinking picker's footer is pi's literal string, not the generic hint row
-/// (`thinking-selector.ts:94`) — and it is what advertises the `Ctrl+S` persist key.
+/// (`thinking-selector.ts:94`) — and it is what advertises the `Ctrl+S` persist key. Unconditional
+/// upstream, unlike the model picker's (`model-selector.ts:138`).
 #[test]
 fn thinking_selector_draws_pis_set_as_default_footer() {
-    let mut sel = ListSelector::thinking("medium", "medium");
-    let s = screen(&render_selector(&mut sel, 80, 16));
+    let mut sel = thinking("medium", "medium");
+    // 18 rows, not 16: the 0.84.3 envelope is rule/blank/title/blank/cycle-hint/blank/Input/blank/
+    // 7 levels/blank/footer/rule (`thinking-selector.ts:77-97`), and a `Paragraph` drops the
+    // TRAILING rows — at 16 the footer this test is about would be clipped off.
+    let s = screen(&render_selector(&mut sel, 80, 20));
     assert!(
         s.contains("Enter to select \u{b7} Ctrl+S to set as default \u{b7} Esc to cancel"),
         "pi's footer verbatim:\n{s}"
@@ -629,14 +650,14 @@ fn thinking_ctrl_s_confirms_as_default_while_enter_stays_session_only() {
     let km = SelectKeymap::default();
     let ctrl_s = KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL);
 
-    let mut sel = ListSelector::thinking("medium", "medium");
+    let mut sel = thinking("medium", "medium");
     assert_eq!(
         sel.handle(&ctrl_s, &km),
         SelectorOutcome::ConfirmDefault("medium".to_string()),
         "Ctrl+S persists the highlighted level"
     );
 
-    let mut sel = ListSelector::thinking("medium", "medium");
+    let mut sel = thinking("medium", "medium");
     assert_eq!(
         sel.handle(&key(KeyCode::Enter), &km),
         SelectorOutcome::Confirm("medium".to_string()),
@@ -644,13 +665,13 @@ fn thinking_ctrl_s_confirms_as_default_while_enter_stays_session_only() {
     );
 }
 
-/// Pi binds `Ctrl+S` only when an `onSelectAsDefault` callback was supplied
-/// (`thinking-selector.ts:122`); a list without one leaves the key alone. `persist_hint` is that
-/// guard expressed structurally, so a selector that did not opt in must never persist. Unlike the
-/// model picker there is no search input to fall to, so the key simply reports itself unhandled:
-/// the guard is skipped and the `action_for` match ends at `None => Ignored`. Asserted by equality
-/// rather than as "not `ConfirmDefault`": that weaker form also passes for `Confirm(_)`, i.e. for a
-/// list that began confirming a selection on a key nobody bound to confirm.
+/// Pi binds `Ctrl+S` only inside the two components that wire an `onSelectAsDefault`
+/// (`thinking-selector.ts:122`) / `onSelectAsDefaultCallback` (`model-selector.ts:401`); the shared
+/// list engine every other dialog rides has no such arm at all, so a `ListSelector` must never
+/// persist. There is no search input to fall to there either, so the key simply reports itself
+/// unhandled: the `action_for` match ends at `None => Ignored`. Asserted by equality rather than as
+/// "not `ConfirmDefault`": that weaker form also passes for `Confirm(_)`, i.e. for a list that began
+/// confirming a selection on a key nobody bound to confirm.
 #[test]
 fn ctrl_s_is_inert_on_a_list_that_did_not_opt_in() {
     let km = SelectKeymap::default();
@@ -698,21 +719,21 @@ fn only_pis_own_components_opt_into_the_dialog_chrome() {
 /// and moves `select-list.ts:149`'s `width > 40` two-column gate with it.
 ///
 /// `ThinkingSelectorComponent` hands its `SelectList` the container's FULL width
-/// (`thinking-selector.ts:66`), so at a 42-column dialog pi is on the two-column side of that gate
+/// (`thinking-selector.ts:92`), so at a 42-column dialog pi is on the two-column side of that gate
 /// and the level descriptions render. Insetting unconditionally pushed it to 40 and silently
 /// dropped every description at exactly the widths where they matter most.
 ///
 /// FAILS under the revert that insets every `ListSelector`.
 #[test]
 fn the_inset_does_not_move_the_two_column_gate_on_uninset_dialogs() {
-    let mut sel = ListSelector::thinking("medium", "medium");
+    let mut sel = thinking("medium", "medium");
     let s = screen(&render_selector(&mut sel, 42, 16));
     assert!(
         s.contains("Moderate reasoning"),
         "at width 42 pi's SelectList sees 42 > 40 and draws descriptions:\n{s}"
     );
     // The rows also start at column 0, not 1.
-    let terminal = render_selector(&mut ListSelector::thinking("medium", "medium"), 42, 16);
+    let terminal = render_selector(&mut thinking("medium", "medium"), 42, 16);
     let cursor_y = row_of(&terminal, "→ ");
     assert_eq!(
         terminal.backend().buffer()[(0, cursor_y)].symbol(),

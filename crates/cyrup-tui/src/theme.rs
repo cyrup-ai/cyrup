@@ -48,8 +48,14 @@ impl ColorMode {
     ///
     /// The terminal table is already ported once, in [`crate::image::detect_capabilities_from`];
     /// this delegates to it rather than growing a second copy. The tmux OSC-8 probe cannot change
-    /// `true_color`, so `false` is passed for it and the `tmux display-message` subprocess is
-    /// skipped.
+    /// `true_color`, so a `|| false` probe is passed for it and the `tmux display-message`
+    /// subprocess is skipped.
+    ///
+    /// It goes through [`crate::image::detect_capabilities_with_overrides`] rather than the bare
+    /// sniff so `CYRUP_TRUE_COLOR`/`PI_TRUE_COLOR` reaches the colour depth: upstream reads this as
+    /// `getCapabilities().trueColor`
+    /// (`coding-agent/src/modes/interactive/theme/theme.ts:630`), and `getCapabilities` is the
+    /// override-layered accessor (`tui/src/terminal-image.ts:164-172`).
     pub fn detect() -> ColorMode {
         ColorMode::detect_from(|k| std::env::var(k).ok())
     }
@@ -57,7 +63,7 @@ impl ColorMode {
     /// The pure core of [`ColorMode::detect`], parameterised over an environment lookup so both
     /// arms are deterministically testable (same shape as `detect_capabilities_from`).
     pub fn detect_from(env: impl Fn(&str) -> Option<String>) -> ColorMode {
-        if crate::image::detect_capabilities_from(env, false).true_color {
+        if crate::image::detect_capabilities_with_overrides(env, || false).true_color {
             ColorMode::TrueColor
         } else {
             // Pi `createTheme` falls back to `"256color"` when truecolor is unavailable

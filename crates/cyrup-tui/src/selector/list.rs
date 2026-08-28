@@ -6,7 +6,7 @@ use super::*;
 pub struct ListSelector {
     list: SelectList,
     /// Confirm value per row, parallel to the list items (`SelectItem.value`, e.g.
-    /// `thinking-selector.ts:35` `value: level`).
+    /// `show-images-selector.ts:20-21` `value: "yes"` / `"no"`).
     values: Vec<String>,
     /// Whether a selection move emits [`SelectorOutcome::Preview`] (theme live preview only).
     preview: bool,
@@ -24,15 +24,6 @@ pub struct ListSelector {
     /// Whether to draw the envelope's `Spacer(1)` rows — OPT-IN, see
     /// [`SelectorKind::envelope_spacers`].
     spacers: bool,
-    /// Whether this list offers Pi's SECOND confirm key — `Ctrl+S`, "set as default" — which emits
-    /// [`SelectorOutcome::ConfirmDefault`] instead of [`SelectorOutcome::Confirm`], and draws Pi's
-    /// `Enter to select · Ctrl+S to set as default · Esc to cancel` footer
-    /// (`thinking-selector.ts:94`, `:121-125`).
-    ///
-    /// OPT-IN per instance, mirroring Pi's guard: it binds the key only when an
-    /// `onSelectAsDefault` callback was supplied (`thinking-selector.ts:122`), so a list built
-    /// without one leaves `Ctrl+S` alone. Only [`ListSelector::thinking`] sets it.
-    persist_hint: bool,
 }
 
 impl ListSelector {
@@ -63,7 +54,6 @@ impl ListSelector {
             hints: false,
             inset: false,
             spacers: false,
-            persist_hint: false,
         }
     }
 
@@ -96,7 +86,6 @@ impl ListSelector {
             hints: false,
             inset: false,
             spacers: false,
-            persist_hint: false,
         }
     }
 
@@ -145,11 +134,8 @@ impl ListSelector {
     /// `:87`, belongs to the `Input` cyrup has not ported).
     fn spacer_rows(&self) -> u16 {
         if !self.spacers {
-            // `thinking-selector.ts:93` adds ONE `Spacer(1)` before its footer even though the rest
-            // of that envelope is flush (border/list/border) — so a persist-hint selector is not
-            // spacer-free any more, it has exactly that one row.
-            u16::from(self.persist_hint)
-        } else if self.hints || self.persist_hint {
+            0
+        } else if self.hints {
             4
         } else {
             3
@@ -161,8 +147,9 @@ impl ListSelector {
     ///
     /// This is the single place the per-kind decision is made. It exists because the previous batch
     /// made both a property of the shared [`ListSelector`] engine, which gave every dialog chrome
-    /// that upstream draws on four of them (hint row) and six (inset) — `ThinkingSelectorComponent`
-    /// is 75 lines of `DynamicBorder` + `SelectList` + `DynamicBorder` and has neither.
+    /// that upstream draws on four of them (hint row) and six (inset) — `ShowImagesSelectorComponent`
+    /// (`show-images-selector.ts:25,41,44`) is `DynamicBorder` + `SelectList` + `DynamicBorder` and
+    /// has neither.
     #[must_use]
     pub fn with_upstream_chrome(mut self, kind: SelectorKind, keymap: &SelectKeymap) -> Self {
         if kind.draws_hint_row() {
@@ -215,51 +202,6 @@ impl ListSelector {
 
     // ---- Pi selector constructors -----------------------------------------------------------
 
-    /// Thinking-level picker (`thinking-selector.ts:11-55`): one row per available level with its
-    /// token-estimate description, `maxVisible = levels.len()`, preselecting `current`.
-    ///
-    /// `default_level` is the PERSISTED default (`defaultThinkingLevel`). Its row gets Pi's
-    /// ` · default` suffix on the description (`thinking-selector.ts:73`), and supplying it opts
-    /// the picker into the `Ctrl+S` "set as default" key + footer — the structural equivalent of
-    /// Pi's `onSelectAsDefault` callback guard (`:122`).
-    ///
-    /// Pi passes `settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL`
-    /// (`interactive-mode.ts:4814`), so with the setting unset the badge lands on the built-in
-    /// default rather than on nothing; callers must resolve that fallback before calling.
-    pub fn thinking(current: &str, default_level: &str) -> Self {
-        // `LEVEL_DESCRIPTIONS` (`thinking-selector.ts:11-19`), in Pi's order. Pi's `max` commit
-        // (fbdd4638) renamed the `xhigh` copy from "Maximum" to "Extra-high" and gave "Maximum
-        // reasoning" to the new top rung.
-        const LEVELS: [(&str, &str); 7] = [
-            ("off", "No reasoning"),
-            ("minimal", "Very brief reasoning (~1k tokens)"),
-            ("low", "Light reasoning (~2k tokens)"),
-            ("medium", "Moderate reasoning (~8k tokens)"),
-            ("high", "Deep reasoning (~16k tokens)"),
-            ("xhigh", "Extra-high reasoning (~32k tokens)"),
-            ("max", "Maximum reasoning"),
-        ];
-        let rows: Vec<_> = LEVELS
-            .iter()
-            .map(|(level, desc)| {
-                // `level === defaultThinkingLevel ? `${LEVEL_DESCRIPTIONS[level]} · default` : …`
-                // (`thinking-selector.ts:70-74`). The identical badge string the model picker uses
-                // (`model-selector.ts:317`) — one marker, two pickers.
-                let desc = if *level == default_level {
-                    format!("{desc} \u{b7} default")
-                } else {
-                    (*desc).to_string()
-                };
-                ((*level).to_string(), (*level).to_string(), Some(desc))
-            })
-            .collect();
-        let selected = LEVELS.iter().position(|(l, _)| *l == current).unwrap_or(0);
-        let mut sel =
-            ListSelector::new(rows, LEVELS.len().min(u16::MAX as usize) as u16, selected, false);
-        sel.persist_hint = true;
-        sel
-    }
-
     /// Inline-images yes/no (`show-images-selector.ts:19-31`): `maxVisible = 5`, preselecting
     /// `Yes` when currently on, else `No`.
     pub fn show_images(current: bool) -> Self {
@@ -296,7 +238,7 @@ impl Selector for ListSelector {
         // **when this kind draws one** + bottom `DynamicBorder` (spec/tui/05 §3;
         // `extension-selector.ts:44-75`).
         let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, width));
-        let hint_h = u16::from(self.hints || self.persist_hint);
+        let hint_h = u16::from(self.hints);
         self.list
             .rendered_height()
             .saturating_add(2)
@@ -307,14 +249,14 @@ impl Selector for ListSelector {
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, area.width));
-        let hint_h = u16::from(self.hints || self.persist_hint);
+        let hint_h = u16::from(self.hints);
         // L4/SYS-3. The envelope row order is `ExtensionSelectorComponent`'s, counted from its
         // constructor (`extension-selector.ts:44-75`): `DynamicBorder`(:44) · `Spacer`(:45) ·
         // title(:47) · `Spacer`(:49) · list(:61) · `Spacer`(:62) · hint(:63-73) · `Spacer`(:74) ·
         // `DynamicBorder`(:75). `OAuthSelectorComponent` (`oauth-selector.ts:68-96`) is the same
         // order minus the hint row (it has none) — its `:87` spacer sits under a search `Input`
         // cyrup has not ported, so `sp_after_hint` collapses to 0 there and the count is three.
-        // `spacers` is per-kind (`SelectorKind::envelope_spacers`); thinking/show-images/theme are
+        // `spacers` is per-kind (`SelectorKind::envelope_spacers`); show-images and theme are
         // border/list/border upstream and keep a zero-spacer envelope.
         //
         // Every height below is the NATURAL one — `sp` does not depend on `area.height`, and the
@@ -326,10 +268,7 @@ impl Selector for ListSelector {
         // before the trailing chrome did, the exact inversion of upstream's order.
         let sp = u16::from(self.spacers);
         let sp_after_hint = sp.min(hint_h);
-        // The `Spacer(1)` pi puts between the list and the persist footer (`thinking-selector.ts:
-        // 93`). Present even when the envelope is otherwise flush, which is why it is `max`-ed in
-        // rather than folded into `spacers`.
-        let sp_before_hint = sp.max(u16::from(self.persist_hint));
+        let sp_before_hint = sp;
         let body_h = self.list.rendered_height();
         let [top, _, title_area, _, body, _, hint, _, bottom] = stack_rows(
             area,
@@ -351,10 +290,10 @@ impl Selector for ListSelector {
         // in `contentWidth = max(1, width - paddingX * 2)` (`text.ts:64,70-76`) — hence `-2` here
         // and a single leading space. That reduced width is also what the two-column gate
         // (`select-list.ts:149` `width > 40`) then sees, which is correct for these kinds and
-        // WRONG for the others: thinking / show-images / theme add the `SelectList` straight to the
-        // container (`thinking-selector.ts:66`), so it is laid out at the full container width and
-        // its rows start at column 0. Applying the inset unconditionally moved that gate by two
-        // columns on every dialog.
+        // WRONG for the others: show-images and theme add the `SelectList` straight to the
+        // container (`show-images-selector.ts:41`, `theme-selector.ts:58`), so it is laid out at the
+        // full container width and its rows start at column 0. Applying the inset unconditionally
+        // moved that gate by two columns on every dialog.
         let lines = if self.inset {
             self.list
                 .lines(body.width.saturating_sub(2), theme)
@@ -374,19 +313,6 @@ impl Selector for ListSelector {
                 Paragraph::new(vec![self.hint_line(theme)]).style(theme.base_style()),
                 hint,
             );
-        } else if self.persist_hint {
-            // Pi's literal footer, `theme.fg("dim", …)` with its two leading spaces
-            // (`thinking-selector.ts:94`). Unconditional there — unlike the model picker's, which
-            // is guarded on the callback being wired (`model-selector.ts:138`) — but reached here
-            // only because `thinking()` opted in, which is that same guard expressed structurally.
-            frame.render_widget(
-                Paragraph::new(vec![Line::from(Span::styled(
-                    "  Enter to select \u{b7} Ctrl+S to set as default \u{b7} Esc to cancel",
-                    theme.dim_style(),
-                ))])
-                .style(theme.base_style()),
-                hint,
-            );
         }
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
@@ -395,20 +321,11 @@ impl Selector for ListSelector {
         // Keep the hint row honest even for a selector constructed without `with_keymap`: adopt
         // whatever table actually routed this key.
         self.keymap = keymap.clone();
-        // Pi's second confirm key, checked BEFORE the keymap so a user-rebound `tui.select.*` can
-        // never shadow it: `matchesKey(keyData, "ctrl+s")` is a LITERAL upstream
-        // (`thinking-selector.ts:122`), not a binding id. Guarded on `persist_hint` so it only
-        // exists on the picker that opted in — every other list leaves `Ctrl+S` untouched, exactly
-        // as Pi does when no `onSelectAsDefault` was supplied.
-        if self.persist_hint
-            && key.code == KeyCode::Char('s')
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
-            return match self.values.get(self.list.selected()) {
-                Some(v) => SelectorOutcome::ConfirmDefault(v.clone()),
-                None => SelectorOutcome::Redraw,
-            };
-        }
+        // NOTE: no `Ctrl+S` arm here. Pi's second confirm key belongs to the two components that
+        // wire an `onSelectAsDefault`/`onSelectAsDefaultCallback` — `ThinkingSelectorComponent`
+        // (`thinking-selector.ts:122`, ported in [`crate::thinking_selector::ThinkingSelector`])
+        // and `ModelSelectorComponent` (`model-selector.ts:401`, [`crate::model_selector`]) — never
+        // to the shared list engine, which every other dialog rides.
         match keymap.action_for(key) {
             Some(SelectAction::Up) | Some(SelectAction::PageUp) => {
                 self.list.select_up();

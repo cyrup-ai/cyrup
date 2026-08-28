@@ -178,8 +178,10 @@ impl InputEditor {
         self.mention_files = None;
     }
 
-    /// Inject the `@`-mention candidate file list directly (test seam / an async populator). Bypasses
-    /// the lazy `fd`/walk source.
+    /// Inject the `@`-mention candidate list directly (test seam / an async populator). Bypasses
+    /// the lazy `fd`/walk source. A directory candidate is marked by a trailing `/`, the same way
+    /// `fd` prints one and pi reads it back (`autocomplete.ts:205-207` @v0.84.3) — that marker is
+    /// what earns the folder its `/` label, its ranking bonus and its withheld trailing space.
     pub fn set_mention_files(&mut self, files: Vec<String>) {
         self.mention_files = Some(files);
     }

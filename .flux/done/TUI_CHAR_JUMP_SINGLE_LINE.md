@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Make Char-Jump Search The Whole Buffer, And Let A Control Key Fall Through When It Cancels Jump Mode

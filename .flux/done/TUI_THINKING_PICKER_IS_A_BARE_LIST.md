@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Give The Thinking Picker Its Real 0.84.3 Envelope, And Bind Its Levels To The Active Model

@@ -143,9 +143,10 @@ pub struct InputEditor {
     /// navigate/accept/cancel keys are no longer hardcoded — a `keybindings.json` rebind flows through.
     autocomplete_keymap: crate::keymap::AutocompleteKeymap,
     cwd: PathBuf,
-    /// Cached whole-tree file list for `@`-mention search (`autocomplete.ts` populates once, then
-    /// fuzzy-filters in-process per keystroke). Lazily built on the first `@`-mention, invalidated on
-    /// `set_cwd`. `None` until first needed.
+    /// Cached whole-tree candidate list for `@`-mention search — files AND directories, the latter
+    /// marked by a trailing `/` (`autocomplete.ts` populates once, then fuzzy-filters in-process per
+    /// keystroke). Lazily built on the first `@`-mention, invalidated on `set_cwd`. `None` until
+    /// first needed.
     mention_files: Option<Vec<String>>,
     /// The live `/model` / `/login` / `/thinking` candidate sets the argument completers rank
     /// (`interactive-mode.ts:685-736` @v0.84.3), plus the answers extension commands' own

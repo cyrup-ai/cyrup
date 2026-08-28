@@ -195,34 +195,43 @@ impl Autocomplete {
         }
         let head: String = before.get(..before.len() - prefix_len)?.iter().collect();
 
-        let (insert, trailing) = match self.context {
+        // `(inserted text, trailing suffix, how far back from the end the caret lands)`. Only a
+        // QUOTED DIRECTORY moves the caret off the end: pi's `cursorOffset = isDirectory &&
+        // hasTrailingQuote ? item.value.length - 1 : item.value.length` (`autocomplete.ts:423`
+        // @v0.84.3) parks it INSIDE the closing quote so the next keystrokes keep narrowing within
+        // the token. Every other arm passes `0` and is unchanged.
+        let (insert, trailing, caret_back) = match self.context {
             // Slash: `/{value} ` (trailing space; `:393-404`).
-            CompletionContext::Slash => (format!("/{}", completion.value), " "),
+            CompletionContext::Slash => (format!("/{}", completion.value), " ", 0),
             // Slash argument: `beforePrefix + item.value`, cursor immediately after the value and
             // NO trailing space — upstream's argument branch is
             // `newLine = beforePrefix + item.value + adjustedAfterCursor` with
             // `cursorCol = beforePrefix.length + cursorOffset` (`autocomplete.ts:432-448`
             // @v0.84.3). The trailing space lives only in the command-NAME branch (`:399-408`,
             // `+2 for "/" and space`) and the `@`-mention branch (`:412-428`).
-            CompletionContext::SlashArgument => (completion.value.clone(), ""),
+            CompletionContext::SlashArgument => (completion.value.clone(), "", 0),
             // Path: directories keep drilling (no space), files get a trailing space (`:408-425`).
             CompletionContext::Path => {
-                (completion.value.clone(), if completion.is_dir { "" } else { " " })
+                (completion.value.clone(), if completion.is_dir { "" } else { " " }, 0)
             }
-            // Mention: `@{path} ` — quote the path when it contains whitespace (`autocomplete.ts:408`
-            // `@"…"`); always a trailing space (a mention is a complete token).
+            // Mention: `@{path}` — quote the path when it contains whitespace
+            // (`buildCompletionValue`, `autocomplete.ts:106-120`, `@"…"`). A FILE closes the token
+            // with a space; a DIRECTORY does not, so the user can keep autocompleting inside it —
+            // `const suffix = isDirectory ? "" : " "` under the comment "Don't add space after
+            // directories so user can continue autocompleting" (`:414-417`). The `/` that makes it
+            // `@src/` rather than `@src` is already on `completion.value`, from the candidate
+            // (`completionPath = isDirectory ? `${displayPath}/` : displayPath`, `:794`).
             CompletionContext::Mention => {
                 let path = &completion.value;
-                let rendered = if path.contains(char::is_whitespace) {
-                    format!("@\"{path}\"")
-                } else {
-                    format!("@{path}")
-                };
-                (rendered, " ")
+                let quoted = path.contains(char::is_whitespace);
+                let rendered = if quoted { format!("@\"{path}\"") } else { format!("@{path}") };
+                let trailing = if completion.is_dir { "" } else { " " };
+                // `hasTrailingQuote` (`:422`) — only a quoted directory has one to sit inside.
+                (rendered, trailing, usize::from(completion.is_dir && quoted))
             }
         };
         let new_before = format!("{head}{insert}{trailing}");
-        let cursor_col = new_before.chars().count();
+        let cursor_col = new_before.chars().count().saturating_sub(caret_back);
         let new_line = format!("{new_before}{after}");
         let mut new_lines = lines.to_vec();
         if let Some(slot) = new_lines.get_mut(cursor_line) {
@@ -650,30 +659,69 @@ pub fn mention_query(before: &str) -> Option<String> {
     Some(rest.strip_prefix('"').unwrap_or(rest).to_string())
 }
 
+/// Pi's directory bonus (`scoreEntry`, `autocomplete.ts:717-719`: `if (isDirectory && score > 0)
+/// score += 10`, under the comment "isDirectory adds bonus to prioritize folders") — sign-flipped.
+///
+/// `scoreEntry` runs on pi's *mention* scale, where HIGHER is better (100 / 80 / 50 / 30).
+/// [`fuzzy`] is a port of pi's *other* scorer (`fuzzy.ts`), where LOWER is better, so the identical
+/// nudge is a SUBTRACTION here. The constant is pi's, kept verbatim: on this scale it is worth one
+/// word-boundary bonus (`fuzzy.rs:60`), i.e. a tie-break plus a small lift — the same weight pi's
+/// `+10` carries against its own 30-point steps, and never enough to float a bad folder over a
+/// well-matching file.
+const DIRECTORY_SCORE_BONUS: f64 = 10.0;
+
 /// Build the `@`-mention completion popup (`autocomplete.ts:164,408`): fuzzy-rank the whole-tree
-/// `candidates` (repo-relative paths from [`list_files`]) by the `@`-query, newest-best first. `prefix`
-/// is the literal `@query` token the apply step replaces. `None` when nothing matches (closes the popup).
+/// `candidates` (repo-relative paths from [`list_files`]) by the `@`-query, best first, folders
+/// ahead of equally-good files. `prefix` is the literal `@query` token the apply step replaces.
+/// `None` when nothing matches (closes the popup).
+///
+/// A candidate ending in `/` is a directory — the marker `fd` prints and pi reads back
+/// (`:205-207`) — which drives the trailing-`/` label (`label = entryName + (isDirectory ? "/" :
+/// "")`, `:803`), the ranking bonus and, in [`Autocomplete::apply`], the withheld trailing space.
+///
+/// `resolveScopedFuzzyQuery` (`:526-554`) is deliberately NOT ported. It re-roots pi's `fd` run at
+/// the directory the user has already typed, which matters because pi re-runs `fd` on **every**
+/// keystroke; cyrup enumerates the tree once and filters it in-process, so there is no subprocess
+/// to scope. The user-visible half of it — `@src/ma` finding `src/main.rs` — is already there:
+/// [`fuzzy::filter`] splits the query on `/` as well as whitespace (`fuzzy.rs:144`), so that query
+/// tokenises to `["src", "ma"]` and every token must match.
 pub fn mention_autocomplete(before: &str, candidates: &[String]) -> Option<Autocomplete> {
     let query = mention_query(before)?;
     let token = trailing_token(before);
-    let matches = fuzzy::filter(candidates, &query, |c| c.as_str());
+    let mut matches = fuzzy::filter(candidates, &query, |c| c.as_str());
     if matches.is_empty() {
         return None;
+    }
+    // Pi's `score > 0` guard is implied — every row `fuzzy::filter` returns already matched — with
+    // one exception it also encodes: for an EMPTY query pi never calls `scoreEntry` at all
+    // (`:769` `fdQuery ? this.scoreEntry(…) : 1`), so a bare `@` gets no bonus and the whole tree
+    // stays in its listed order. `sort_by` is stable, so equal adjusted scores keep fuzzy's order.
+    if !query.is_empty() {
+        for m in &mut matches {
+            if candidates.get(m.index).is_some_and(|p| p.ends_with('/')) {
+                m.score -= DIRECTORY_SCORE_BONUS;
+            }
+        }
+        matches.sort_by(|a, b| a.score.total_cmp(&b.score));
     }
     let mut items = Vec::with_capacity(matches.len());
     let mut completions = Vec::with_capacity(matches.len());
     for m in &matches {
         let Some(path) = candidates.get(m.index) else { continue };
+        // `label = entryName + (isDirectory ? "/" : "")` (`:803`) comes for free: the candidate
+        // string already carries the separator.
         items.push(SelectItem::label(path.clone()));
-        completions.push(Completion { value: path.clone(), is_dir: false });
+        completions.push(Completion { value: path.clone(), is_dir: path.ends_with('/') });
     }
     let list = SelectList::new(items, ColumnLayout::DEFAULT).with_no_match("No matching files");
     Some(Autocomplete { context: CompletionContext::Mention, prefix: token, completions, list })
 }
 
-/// List repo files for `@`-mention search (`autocomplete.ts:719-772`), capped at `limit`. Prefers
-/// `fd` (fast + `.gitignore`-aware), falling back to a bounded in-process walk when `fd` is absent so
-/// the feature works with no external tool. Returns paths **relative** to `cwd`, `/`-separated.
+/// List repo files AND directories for `@`-mention search (`autocomplete.ts:719-772`), capped at
+/// `limit`. Prefers `fd` (fast + `.gitignore`-aware), falling back to a bounded in-process walk when
+/// `fd` is absent so the feature works with no external tool. Returns paths **relative** to `cwd`,
+/// `/`-separated, with a directory marked by a trailing `/` — pi's own marker (`:205-207`), which
+/// keeps this a flat `Vec<String>` rather than a pair type.
 pub fn list_files(cwd: &Path, limit: usize) -> Vec<String> {
     if let Some(files) = fd_list(cwd, limit) {
         return files;
@@ -681,12 +729,22 @@ pub fn list_files(cwd: &Path, limit: usize) -> Vec<String> {
     walk_list(cwd, limit)
 }
 
-/// Spawn `fd` to enumerate tracked files (`.gitignore`-aware, hidden excluded except dotfiles fd shows
-/// by default-off). `--strip-cwd-prefix` yields repo-relative paths. `None` when `fd` is unavailable or
-/// errors, so the caller falls back to the in-process walk.
+/// Spawn `fd` to enumerate the tree (`.gitignore`-aware). `--strip-cwd-prefix` yields repo-relative
+/// paths. `None` when `fd` is unavailable or errors, so the caller falls back to the in-process walk.
+///
+/// The argument list mirrors `walkDirectoryWithFd` (`autocomplete.ts:124-146` @v0.84.3): BOTH
+/// `--type f` and `--type d` (`:137-140`) so folders are offered too, plus `--follow --hidden` and
+/// pi's three `.git` exclusions (`:141-146`) — `--hidden` would otherwise surface the whole object
+/// store. A directory is marked by the trailing `/` fd prints for it, which is exactly how pi tags
+/// its own results (`:205-207` `const hasTrailingSeparator = displayLine.endsWith("/")`); the
+/// candidate list therefore stays a plain `Vec<String>`.
 fn fd_list(cwd: &Path, limit: usize) -> Option<Vec<String>> {
     let output = std::process::Command::new("fd")
-        .args(["--type", "f", "--color", "never", "--strip-cwd-prefix", "--exclude", ".git"])
+        .args([
+            "--type", "f", "--type", "d", "--follow", "--hidden", "--color", "never",
+            "--strip-cwd-prefix", "--exclude", ".git", "--exclude", ".git/*", "--exclude",
+            ".git/**",
+        ])
         .current_dir(cwd)
         .output()
         .ok()?;
@@ -706,7 +764,11 @@ fn fd_list(cwd: &Path, limit: usize) -> Option<Vec<String>> {
 
 /// A bounded breadth-first walk used when `fd` is not installed: visits at most `limit * 8` entries,
 /// skips VCS/build noise (`.git`, `node_modules`, `target`, `.cyrup`) and returns up to `limit`
-/// `/`-separated repo-relative file paths.
+/// `/`-separated repo-relative paths.
+///
+/// A directory is BOTH emitted (with the trailing `/` that marks it, matching what `fd` prints —
+/// `autocomplete.ts:205-207`) and enqueued for traversal, so the no-`fd` fallback offers the same
+/// folder candidates the `fd` path does.
 fn walk_list(cwd: &Path, limit: usize) -> Vec<String> {
     const SKIP: [&str; 5] = [".git", "node_modules", "target", ".cyrup", ".jj"];
     let visit_cap = limit.saturating_mul(8).max(limit);
@@ -730,10 +792,14 @@ fn walk_list(cwd: &Path, limit: usize) -> Vec<String> {
             }
             let path = entry.path();
             let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+            let rel = path.strip_prefix(cwd).ok().map(|r| r.to_string_lossy().replace('\\', "/"));
             if is_dir {
+                if let Some(rel) = rel {
+                    out.push(format!("{rel}/"));
+                }
                 queue.push_back(path);
-            } else if let Ok(rel) = path.strip_prefix(cwd) {
-                out.push(rel.to_string_lossy().replace('\\', "/"));
+            } else if let Some(rel) = rel {
+                out.push(rel);
             }
         }
     }
