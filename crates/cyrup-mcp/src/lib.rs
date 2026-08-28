@@ -153,6 +153,7 @@ pub mod schema;
 pub mod secrets;
 pub mod server_manager;
 pub mod state;
+pub mod trace;
 pub mod ui;
 
 pub use errors::{CleanupErrors, McpError, McpResult};

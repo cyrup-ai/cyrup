@@ -297,13 +297,33 @@ pub async fn initialize_mcp(
     // cache an instance field, which is what creates the obligation.
     manager.set_auth_store(auth_store);
 
+    let settings = config.settings_or_default();
+
+    // Step 4b — `setTraceConfig(settings.trace)` (`init.ts:122`). The writer is minted here rather
+    // than in the manager because deriving its path needs `dirs`, which the manager does not have;
+    // one writer is built per generation, so the byte and event budgets are session-global.
+    //
+    // Built unconditionally when a `trace` block exists, even if `enabled` is false: a per-server
+    // `trace: true` turns tracing on for that server against a global default of off, which is the
+    // `??` in `is_mcp_trace_enabled`. Construction touches no file system — the directory and the
+    // truncate happen on the first line actually written.
+    let trace_settings = settings.trace.clone();
+    let trace_writer = trace_settings.as_ref().map(|trace| {
+        Arc::new(crate::trace::TraceWriter::new(
+            crate::trace::trace_file_path(&dirs, trace, &crate::trace::random_suffix()),
+            settings.trace_max_bytes(),
+            settings.trace_max_events(),
+            Arc::new(crate::trace::RealTraceFs),
+        ))
+    });
+    manager.set_trace_config(trace_settings, trace_writer);
+
     // Step 5 — `init.ts:124-134`. `sampling !== false && (hasUI || samplingAutoApprove)`.
     //
     // This is `set_sampling_config`'s FIRST production caller. Until it, `bare_handler_factory`'s
     // `sampling: None` stood at every connection, so `build_client_capabilities` advertised no
     // sampling capability to any server, no conforming server ever sent `sampling/createMessage`,
     // and `McpClientHandler::create_message` answered `METHOD_NOT_FOUND` unconditionally.
-    let settings = config.settings_or_default();
     if settings.sampling(snapshot.has_ui) {
         let options = Arc::new(crate::sampling::SamplingOptions {
             auto_approve: settings.sampling_auto_approve(),
@@ -4050,6 +4070,14 @@ impl ConnectionBuilder {
         // [`connect_client_bounded`]'s budget. A wedged child — one that accepts the pipe and never
         // answers `initialize` — fails here at `requestTimeoutMs` instead of parking this future
         // and the manager's single-flight slot for that name forever.
+        // The one instrumentation point for stdio. `maybe_traced` is a passthrough when the manager
+        // handed no writer, so an untraced server pays one enum discriminant and nothing else.
+        let process = crate::trace::maybe_traced(
+            process,
+            name,
+            crate::trace::TraceTransportKind::Stdio,
+            request.trace.clone(),
+        );
         let handshake = connect_client_bounded(
             handler,
             process,
@@ -4371,7 +4399,12 @@ impl ConnectionBuilder {
                 (
                     connect_client_bounded(
                         handler,
-                        http_transport_with_client(probe, config),
+                        crate::trace::maybe_traced(
+                            http_transport_with_client(probe, config),
+                            &request.name,
+                            crate::trace::TraceTransportKind::StreamableHttp,
+                            request.trace.clone(),
+                        ),
                         lifecycle,
                         request.attempt.clone(),
                         budget,
@@ -4386,7 +4419,12 @@ impl ConnectionBuilder {
                 (
                     connect_client_bounded(
                         handler,
-                        http_transport_with_client(probe, config),
+                        crate::trace::maybe_traced(
+                            http_transport_with_client(probe, config),
+                            &request.name,
+                            crate::trace::TraceTransportKind::StreamableHttp,
+                            request.trace.clone(),
+                        ),
                         lifecycle,
                         request.attempt.clone(),
                         budget,
@@ -5437,6 +5475,7 @@ done
 
     fn request(name: &str, entry: ServerEntry) -> CreateConnection {
         CreateConnection {
+            trace: None,
             name: name.to_string(),
             definition: Arc::new(entry),
             attempt: CancelToken::new(),

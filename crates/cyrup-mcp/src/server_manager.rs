@@ -1218,6 +1218,10 @@ pub struct CreateConnection {
     pub name: String,
     /// The definition this attempt was started from.
     pub definition: Arc<ServerEntry>,
+    /// The session's trace writer, when this server is traced. Computed by the **manager** and
+    /// passed *into* the builder — upstream's shape exactly (`server-manager.ts:451-457`), so the
+    /// builder never learns about settings.
+    pub trace: Option<Arc<crate::trace::TraceWriter>>,
     /// `signal` — the **attempt** signal: `combineAbortSignals(ownedSignal, attemptController.signal)`.
     /// A `close` racing this attempt fires it, and the attempt is expected to tear down its own
     /// half-built transport.
@@ -1423,6 +1427,13 @@ pub struct McpServerManager {
     /// `elicitationConfig` — nulled by `close_all` so a late callback cannot re-enter a dead
     /// runtime.
     elicitation: Mutex<Option<crate::runtime::ElicitationConfig>>,
+
+    /// `traceConfig` — the settings `set_trace_config` stores, read per connect by
+    /// [`McpServerManager::trace_writer_for`].
+    trace_settings: Mutex<Option<crate::config::TraceSettings>>,
+
+    /// `this.traceWriter` — one per manager, so the byte and event budgets are session-global.
+    trace_writer: Mutex<Option<Arc<crate::trace::TraceWriter>>>,
     /// `authStorageOptions`.
     auth_storage_options: Mutex<crate::credentials::AuthStorageOptions>,
     /// `oauthRuntime`.
@@ -1486,6 +1497,8 @@ impl McpServerManager {
             metadata_listener: Mutex::new(None),
             sampling: Mutex::new(None),
             elicitation: Mutex::new(None),
+            trace_settings: Mutex::new(None),
+            trace_writer: Mutex::new(None),
             auth_storage_options: Mutex::new(crate::credentials::AuthStorageOptions::default()),
             oauth_runtime: Mutex::new(None),
             auth_store: Mutex::new(None),
@@ -1639,12 +1652,55 @@ impl McpServerManager {
             .clone()
     }
 
-    // `setTraceConfig(settings)` is the eighth setter and is **not here**: `mcp-trace.ts` has no
-    // Rust counterpart (T-10/MCP-477 — `mcp-trace.ts` has no MCP-1xx unit), so there is no
-    // `McpTraceSettings` to accept and no
-    // `McpTraceWriter` to memoise either. Its two behavioural consequences are named where they would
-    // land — `dispose_connection` and `close_all` both flush the writer upstream, and both note the
-    // gap. Adding a setter that stores a value nothing reads would be worse than the absence.
+    /// `setTraceConfig(settings)` (`server-manager.ts:208-210`) — the eighth setter.
+    ///
+    /// Takes the writer as well as the settings because upstream's `this.traceWriter ??=`
+    /// (`server-manager.ts:452-454`) needs a session cwd to derive a path from, and the manager has
+    /// no [`crate::dirs::McpDirs`]. Hoisting that memo to the one caller that does keeps the
+    /// **one-writer-per-manager** property — which is what makes the byte and event budgets
+    /// session-global rather than per-connection — without giving the manager a second reason to
+    /// know about directories.
+    pub fn set_trace_config(
+        &self,
+        settings: Option<crate::config::TraceSettings>,
+        writer: Option<Arc<crate::trace::TraceWriter>>,
+    ) {
+        *self
+            .trace_settings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = settings;
+        *self
+            .trace_writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = writer;
+    }
+
+    /// The session's writer, or `None` when tracing was never configured.
+    #[must_use]
+    pub fn trace_writer(&self) -> Option<Arc<crate::trace::TraceWriter>> {
+        self.trace_writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The writer this server should be traced through, gated by
+    /// [`crate::trace::is_mcp_trace_enabled`] — `definition.trace ?? settings?.enabled === true`.
+    #[must_use]
+    pub fn trace_writer_for(
+        &self,
+        definition: &ServerEntry,
+    ) -> Option<Arc<crate::trace::TraceWriter>> {
+        let settings = self
+            .trace_settings
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if !crate::trace::is_mcp_trace_enabled(definition, settings.as_ref()) {
+            return None;
+        }
+        self.trace_writer()
+    }
 
     /// `getRequestOptions(name, signal)` (`server-manager.ts:228-231`).
     ///
@@ -2025,6 +2081,7 @@ impl McpServerManager {
                     let factory = Arc::clone(&self.factory);
                     let request = CreateConnection {
                         name: name.to_string(),
+                        trace: self.trace_writer_for(&definition),
                         definition: Arc::clone(&definition),
                         attempt: attempt_signal.clone(),
                         request: owned.clone(),
@@ -2545,7 +2602,16 @@ impl McpServerManager {
     /// than silently dropped, because its absence changes shutdown ordering once it lands.
     async fn dispose_connection(&self, connection: &Arc<ServerConnection>) -> ManagerResult<()> {
         let mut failures = Vec::new();
-        if let Err(error) = connection.dispose().await {
+        // `Promise.allSettled([connection.dispose(), traceWriter.flush()])`
+        // (`server-manager.ts:1133-1140`) — both run, both failures aggregate, and the flush is
+        // joined rather than sequenced so a slow disk cannot delay the dispose.
+        let flush = async {
+            if let Some(writer) = self.trace_writer() {
+                writer.flush().await;
+            }
+        };
+        let (disposed, ()) = tokio::join!(connection.dispose(), flush);
+        if let Err(error) = disposed {
             failures.push(ManagerError::mcp(error));
         }
         if failures.is_empty() {
@@ -2683,7 +2749,14 @@ impl McpServerManager {
             .elicitation
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = None;
-        // `await this.traceWriter?.flush()` last — T-10/MCP-477, unported. See `dispose_connection`.
+        // `await this.traceWriter?.flush()` (`server-manager.ts:1165`) — LAST, after both configs are
+        // nulled, so any line a callback produced on its way out is already on disk before the
+        // manager is considered closed. The writer itself is deliberately NOT nulled: `close_all`
+        // can be followed by a re-`initialize_mcp` on the same manager in tests, and a dropped
+        // writer would silently restart the byte budget.
+        if let Some(writer) = self.trace_writer() {
+            writer.flush().await;
+        }
 
         if failures.is_empty() {
             return Ok(());
