@@ -66,11 +66,7 @@ impl OAuthCallbacks {
     ) -> Result<String, String> {
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::oauth::on_prompt(
-                message,
-                placeholder,
-                allow_empty,
-            );
+            crate::guest::bindings::cyrup::ext::oauth::on_prompt(message, placeholder, allow_empty)
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -95,7 +91,7 @@ impl OAuthCallbacks {
         .unwrap_or_else(|_| "[]".into());
         #[cfg(target_arch = "wasm32")]
         {
-            return crate::guest::bindings::cyrup::ext::oauth::on_select(message, &options_json);
+            crate::guest::bindings::cyrup::ext::oauth::on_select(message, &options_json)
         }
         #[cfg(not(target_arch = "wasm32"))]
         {

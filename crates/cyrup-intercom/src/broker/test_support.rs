@@ -52,6 +52,9 @@ pub(super) fn payloads(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) -
 
 /// Register `id` on `conn_id` with an explicit name + cwd, so the mailbox identity rules
 /// (`v0.10.1 broker/broker.ts:1039-1048`) have something to match on.
+// Mirrors the broker's own registration surface (`v0.10.1 broker/broker.ts:1039-1048`); the
+// arity is the identity tuple it matches on, so grouping it would obscure what each field is.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn register_named(
     state: &mut BrokerState,
     conn_id: u64,

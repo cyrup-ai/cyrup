@@ -64,12 +64,12 @@ fn detect_ignores_cyrup_shell_env_var() {
         } else {
             PathBuf::from("sh")
         };
-        if expected == PathBuf::from("/bin/bash") {
+        if expected == *"/bin/bash" {
             assert_eq!(cfg.program, expected);
         } else {
             // No `/bin/bash`: either `which bash` found one, or the `sh` fallback fired.
             assert!(
-                cfg.program == PathBuf::from("sh")
+                cfg.program == *"sh"
                     || cfg.program.file_name().is_some_and(|n| n == "bash"),
                 "got {:?}",
                 cfg.program

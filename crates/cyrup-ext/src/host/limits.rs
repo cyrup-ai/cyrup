@@ -22,6 +22,7 @@ impl Default for StoreLimits {
 }
 
 impl StoreLimits {
+    #[must_use]
     pub fn with_max_memory(mut self, bytes: usize) -> Self {
         self.max_memory = bytes;
         self

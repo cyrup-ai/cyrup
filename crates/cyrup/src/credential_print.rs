@@ -1035,8 +1035,7 @@ mod tests {
     /// which pi accepts. Also pins pi's per-command unknown-option message (`auth-command.ts:99-102`).
     #[test]
     fn auth_arg_validation_matches_v0_84_1() {
-        let mut cli = Cli::default();
-        cli.provider = Some("openai".to_string());
+        let cli = Cli { provider: Some("openai".to_string()), ..Cli::default() };
         assert!(validate_credential_print_args(&cli, CredentialPrintKind::ApiKey).is_ok());
         assert!(validate_credential_print_args(&cli, CredentialPrintKind::Check).is_ok());
 
@@ -1054,8 +1053,7 @@ mod tests {
             "Credential printing requires --provider <provider> or --model <model>"
         );
 
-        let mut unknown = Cli::default();
-        unknown.provider = Some("openai".to_string());
+        let mut unknown = Cli { provider: Some("openai".to_string()), ..Cli::default() };
         unknown.extension_flags = vec![crate::cli::ExtensionFlag {
             name: "bogus".to_string(),
             value: crate::cli::ExtFlagValue::Bool(true),

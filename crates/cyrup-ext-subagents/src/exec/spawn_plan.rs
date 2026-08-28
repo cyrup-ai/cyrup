@@ -298,6 +298,11 @@ pub fn build_attempt_spawn_plan(
 /// (`runs/background/subagent-runner.ts:1328,1366`), `resolvedSkills.resolved.length > 0`
 /// (`api/preflight.ts:277`). The parameter is OPTIONAL upstream and falsy when omitted, which is
 /// exactly what the seven-argument [`build_attempt_spawn_plan`] forwards.
+///
+/// Eight parameters is one over clippy's threshold: this is [`build_attempt_spawn_plan`]'s own
+/// signature plus pi's optional `requireReadTool`, forwarded verbatim, so grouping them into a
+/// struct would only rename the same values at every call site.
+#[allow(clippy::too_many_arguments)]
 pub fn build_attempt_spawn_plan_with_read_requirement(
     agent: &AgentConfig,
     model: &ModelId,
@@ -2637,7 +2642,8 @@ mod tests {
         let opts = base_opts(dir.path(), &["m1"]);
 
         // (declared tools, require_read_tool, expected `--tools` value or None for "no --tools")
-        let cases: &[(Option<&[&str]>, bool, Option<&str>)] = &[
+        type ToolsCase<'a> = (Option<&'a [&'a str]>, bool, Option<&'a str>);
+        let cases: &[ToolsCase<'_>] = &[
             // The defect: a skill resolved, `read` is absent, so it is injected at the head.
             (Some(&["bash"]), true, Some("read,bash")),
             // No skill resolved — the list is untouched.

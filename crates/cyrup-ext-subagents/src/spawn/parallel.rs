@@ -703,7 +703,7 @@ mod tests {
         /// Blocks until `size` workers have arrived, for the first `size` callers only.
         async fn join(&self) {
             if self.arrivals.fetch_add(1, Ordering::SeqCst) < self.size {
-                drop(self.barrier.wait().await);
+                self.barrier.wait().await;
             }
         }
     }

@@ -39,12 +39,10 @@ const BEDROCK_STANDARD_MODE_RETRIES: u32 = 2;
 
 /// pi's `stream()` try block (`bedrock-converse-stream.ts:222-303`).
 //
-// ACCEPTED WARNING: `clippy::result_large_err` fires here — the `Err` variant, [`BedrockFailure`],
-// is at least 416 bytes because it carries the decoder snapshot the caller needs to emit a
-// partial-turn error. The only "fix" is to box it, which changes what the internal driver hands
-// back and would touch a freshly-verified module for no behavioural gain, so the warning is left
-// standing deliberately rather than silenced with an `#[allow]` that would hide a future
-// regression. This is the single remaining clippy warning in `cyrup-provider`.
+// The `Err` variant, [`BedrockFailure`], is at least 416 bytes because it carries the decoder
+// snapshot the caller needs to emit a partial-turn error, so it is BOXED (`clippy::result_large_err`)
+// to keep the success path's `Result` small. `BedrockFailure` is `pub(super)` and this driver's only
+// caller is the catch arm in `mod.rs`, so the box is module-internal and changes no public type.
 pub(super) async fn run_inner(
     model: &Model,
     ctx: &Context,
@@ -53,7 +51,7 @@ pub(super) async fn run_inner(
     cancel: &CancelToken,
     sink: &EventSink,
     api: &ApiId,
-) -> Result<(), BedrockFailure> {
+) -> Result<(), Box<BedrockFailure>> {
     let bedrock = BedrockOptions::from_stream_options(opts);
     let env = EnvSource::new(opts.env.as_ref().or(auth.env.as_ref()));
     let mut dec = Decoder::default();
@@ -113,13 +111,15 @@ pub(super) async fn run_inner(
     };
     let max_retries = retry.max_retries;
     let mut retries_remaining = max_retries;
-    let aborted = |dec: &Decoder| BedrockFailure {
-        partial: dec.snapshot(model, api),
-        stop_reason: StopReason::Aborted,
-        message: "Request was aborted".to_string(),
-        status: None,
-        error_code: None,
-        request_id: None,
+    let aborted = |dec: &Decoder| {
+        Box::new(BedrockFailure {
+            partial: dec.snapshot(model, api),
+            stop_reason: StopReason::Aborted,
+            message: "Request was aborted".to_string(),
+            status: None,
+            error_code: None,
+            request_id: None,
+        })
     };
     let response = loop {
         // The SigV4 signature is over the (unchanged) body and headers, so it is reused across
@@ -143,10 +143,10 @@ pub(super) async fn run_inner(
             // A transport failure carries no status: `error.status === undefined` ⇒ retryable.
             Err(transport) => {
                 if retries_remaining == 0 {
-                    return Err(BedrockFailure::errored(
+                    return Err(Box::new(BedrockFailure::errored(
                         dec.snapshot(model, api),
                         format_bedrock_error(&transport.to_string()),
-                    ));
+                    )));
                 }
                 (None, transport.to_string())
             }
@@ -223,13 +223,15 @@ pub(super) async fn run_inner(
             .unwrap_or("");
         // pi's `client.send()` rejection: a `BedrockRuntimeServiceException` whose `$metadata`
         // carries the status and whose `.name` is the modeled shape (pi `:398-421` reads both).
-        return Err(BedrockFailure::service_exception(
-            dec.snapshot(model, api),
-            format_bedrock_service_error(name, status, &body),
-            status,
-            name,
-        )
-        .with_request_id(response_request_id.as_deref()));
+        return Err(Box::new(
+            BedrockFailure::service_exception(
+                dec.snapshot(model, api),
+                format_bedrock_service_error(name, status, &body),
+                status,
+                name,
+            )
+            .with_request_id(response_request_id.as_deref()),
+        ));
     }
 
     // NOTE: the `start` event is NOT pushed here — pi pushes it from the `messageStart` frame
@@ -244,14 +246,14 @@ pub(super) async fn run_inner(
             chunk = bytes.next() => Some(chunk),
         };
         let Some(chunk) = next else {
-            return Err(BedrockFailure {
+            return Err(Box::new(BedrockFailure {
                 partial: dec.snapshot(model, api),
                 stop_reason: StopReason::Aborted,
                 message: "Request was aborted".to_string(),
                 status: None,
                 error_code: None,
                 request_id: response_request_id.clone(),
-            });
+            }));
         };
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|e| {
@@ -275,8 +277,10 @@ pub(super) async fn run_inner(
                 Err(message) => {
                     // pi's `throw item.<x>Exception`: a bare object literal, so only the hoisted
                     // request id survives into the diagnostic (`:400-402`).
-                    return Err(BedrockFailure::errored(dec.snapshot(model, api), message)
-                        .with_request_id(response_request_id.as_deref()));
+                    return Err(Box::new(
+                        BedrockFailure::errored(dec.snapshot(model, api), message)
+                            .with_request_id(response_request_id.as_deref()),
+                    ));
                 }
             }
         }
@@ -284,14 +288,14 @@ pub(super) async fn run_inner(
 
     // pi `:291-293`: an aborted signal after the loop is still terminal.
     if cancel.is_cancelled() {
-        return Err(BedrockFailure {
+        return Err(Box::new(BedrockFailure {
             partial: dec.snapshot(model, api),
             stop_reason: StopReason::Aborted,
             message: "Request was aborted".to_string(),
             status: None,
             error_code: None,
             request_id: response_request_id.clone(),
-        });
+        }));
     }
 
     // pi `:295-300`: a stream that ended still "pending" is TRUNCATED, and a settled

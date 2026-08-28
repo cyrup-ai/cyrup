@@ -61,7 +61,7 @@ async fn runtime(fx: &Fixture, replies: usize) -> Arc<AgentSessionRuntime> {
     let faux = Arc::new(FauxProvider::new());
     faux.set_responses(
         (0..replies)
-            .map(|i| faux_assistant_message(vec![faux_text(&format!("ANSWER-{i}"))], StopReason::Stop))
+            .map(|i| faux_assistant_message(vec![faux_text(format!("ANSWER-{i}"))], StopReason::Stop))
             .collect(),
     );
     let provider: Arc<dyn Provider> = faux;

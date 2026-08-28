@@ -129,6 +129,9 @@ impl ApiImpl for BedrockConverseStreamApi {
         // `formatBedrockError` message in, and pushes ONE terminal `error` event (`:304-314`).
         // `run_inner` is that try block; this arm is that catch.
         if let Err(failure) = run_inner(model, ctx, auth, opts, &cancel, &sink, &api).await {
+            // `run_inner` boxes its large failure value; unbox it here so the fields below read
+            // exactly as before.
+            let failure = *failure;
             let mut message = failure.partial;
             message.stop_reason = if cancel.is_cancelled() {
                 StopReason::Aborted

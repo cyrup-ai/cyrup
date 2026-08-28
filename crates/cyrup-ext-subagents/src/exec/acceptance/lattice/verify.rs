@@ -219,7 +219,7 @@ mod tests {
         let results = run_verify_commands_memoized_with_cancel(
             &[
                 vc_timeout("sleep 300", Duration::from_secs(30)),
-                VerifyCommand::shell(&format!("touch {}", marker.display())),
+                VerifyCommand::shell(format!("touch {}", marker.display())),
             ],
             dir.path(),
             None,

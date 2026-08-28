@@ -1664,114 +1664,6 @@ pub(crate) fn language_from_path(file_path: &str) -> Option<&'static str> {
     Some(lang)
 }
 
-#[cfg(test)]
-#[allow(clippy::unwrap_used)]
-mod tests {
-    use super::*;
-
-    /// PROV-002: the `max` rung needs its own editor border color. The built-ins define
-    /// `thinkingMax` (Pi dark.json `#ff5fff` / light.json `#af005f`), so it must be distinct from
-    /// `xhigh` and `thinking_border_style("max")` must resolve it rather than fall through to the
-    /// neutral border.
-    #[test]
-    fn thinking_max_has_its_own_border_color_in_the_builtins() {
-        for theme in [UiTheme::dark(), UiTheme::light()] {
-            let t = theme.thinking();
-            assert_ne!(
-                t.max, t.xhigh,
-                "`{}` must give `max` its own color",
-                theme.name
-            );
-            assert_eq!(theme.thinking_border_style("max").fg, Some(t.max));
-            assert_ne!(
-                theme.thinking_border_style("max"),
-                theme.border_style(),
-                "`max` must not fall through to the neutral border"
-            );
-        }
-    }
-
-    /// Pi made `thinkingMax` an OPTIONAL theme token with a `?? thinkingXhigh` fallback
-    /// (theme.ts:93,329,358) so themes authored before the rung existed keep working. Ported:
-    /// a theme without the token reuses its OWN `xhigh` color. (Pi's own regression test is
-    /// `coding-agent/test/max-thinking.test.ts`, "falls back to thinkingXhigh for legacy themes".)
-    #[test]
-    fn legacy_theme_without_thinking_max_falls_back_to_xhigh() {
-        let mut legacy = UiTheme::dark();
-        legacy.roles.remove("thinkingMax");
-        let t = legacy.thinking();
-        assert_eq!(t.max, t.xhigh, "legacy themes reuse their xhigh color");
-        assert_eq!(
-            legacy.thinking_border_style("max"),
-            legacy.thinking_border_style("xhigh")
-        );
-        // A genuinely unknown level resolves to `thinkingOff`, which is Pi's `default:` arm in
-        // `Theme.getThinkingBorderColor` (v0.84.1
-        // `coding-agent/src/modes/interactive/theme/theme.ts:437-438` —
-        // `default: return (str) => this.fg("thinkingOff", str)`). It used to fall through to the
-        // `border` role, a token Pi never reaches from here.
-        assert_eq!(
-            legacy.thinking_border_style("ultra"),
-            legacy.thinking_border_style("off")
-        );
-        assert_ne!(legacy.thinking_border_style("ultra"), legacy.border_style());
-    }
-
-    #[test]
-    fn color_mode_projects_rgb_to_indexed_and_leaves_named_alone() {
-        let rgb = Color::Rgb(0x8a, 0xbe, 0xb7);
-        assert!(matches!(ColorMode::Ansi256.project(rgb), Color::Indexed(_)));
-        assert_eq!(ColorMode::TrueColor.project(rgb), rgb);
-        assert_eq!(ColorMode::None.project(rgb), Color::Reset);
-        // Named/indexed colors are already depth-safe and pass through unchanged.
-        assert_eq!(ColorMode::Ansi256.project(Color::Cyan), Color::Cyan);
-        assert_eq!(ColorMode::Ansi256.project(Color::Indexed(42)), Color::Indexed(42));
-    }
-
-    #[test]
-    fn with_color_mode_is_idempotent_and_projects_every_role() {
-        let dark = UiTheme::dark().with_color_mode(ColorMode::Ansi256);
-        // Foreground is now an indexed color, never RGB.
-        assert!(matches!(dark.foreground, Some(Color::Indexed(_))));
-        assert!(dark.roles.values().all(|c| !matches!(c, Color::Rgb(_, _, _))));
-        // Re-applying the same mode changes nothing (idempotent for a projected theme).
-        let again = dark.clone().with_color_mode(ColorMode::Ansi256);
-        assert_eq!(again.foreground, dark.foreground);
-    }
-
-    #[test]
-    fn parse_auto_theme_setting_matches_pi() {
-        assert_eq!(
-            parse_auto_theme_setting(Some("light/dark")),
-            Some(("light".to_string(), "dark".to_string()))
-        );
-        // Exactly one slash required; a bare name or a two-slash value is not an auto setting.
-        assert_eq!(parse_auto_theme_setting(Some("dark")), None);
-        assert_eq!(parse_auto_theme_setting(Some("a/b/c")), None);
-        assert_eq!(parse_auto_theme_setting(None), None);
-    }
-
-    #[test]
-    fn resolve_theme_setting_matches_pi() {
-        // Auto setting resolves against the terminal polarity.
-        assert_eq!(
-            resolve_theme_setting(Some("solarized-light/solarized-dark"), TerminalTheme::Dark),
-            Some("solarized-dark".to_string())
-        );
-        // A bare name passes through; an unresolvable slash value ⇒ None (caller falls back).
-        assert_eq!(resolve_theme_setting(Some("nord"), TerminalTheme::Light), Some("nord".to_string()));
-        assert_eq!(resolve_theme_setting(Some("a/b/c"), TerminalTheme::Dark), None);
-        assert_eq!(resolve_theme_setting(None, TerminalTheme::Light), None);
-    }
-
-    #[test]
-    fn ansi256_to_rgb_known_points() {
-        assert_eq!(ansi256_to_rgb(16), (0, 0, 0));
-        assert_eq!(ansi256_to_rgb(231), (255, 255, 255));
-        assert_eq!(ansi256_to_rgb(244), (128, 128, 128));
-    }
-}
-
 /// A [`cyrup_ext::RenderTheme`] over the live [`UiTheme`], so a native renderer's component can
 /// colour its own output in the user's palette (Pi hands its renderers the `Theme` directly).
 ///
@@ -1900,5 +1792,113 @@ fn indexed_rgb(i: u8) -> (u8, u8, u8) {
             let v = 8 + (i - 232) * 10;
             (v, v, v)
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    /// PROV-002: the `max` rung needs its own editor border color. The built-ins define
+    /// `thinkingMax` (Pi dark.json `#ff5fff` / light.json `#af005f`), so it must be distinct from
+    /// `xhigh` and `thinking_border_style("max")` must resolve it rather than fall through to the
+    /// neutral border.
+    #[test]
+    fn thinking_max_has_its_own_border_color_in_the_builtins() {
+        for theme in [UiTheme::dark(), UiTheme::light()] {
+            let t = theme.thinking();
+            assert_ne!(
+                t.max, t.xhigh,
+                "`{}` must give `max` its own color",
+                theme.name
+            );
+            assert_eq!(theme.thinking_border_style("max").fg, Some(t.max));
+            assert_ne!(
+                theme.thinking_border_style("max"),
+                theme.border_style(),
+                "`max` must not fall through to the neutral border"
+            );
+        }
+    }
+
+    /// Pi made `thinkingMax` an OPTIONAL theme token with a `?? thinkingXhigh` fallback
+    /// (theme.ts:93,329,358) so themes authored before the rung existed keep working. Ported:
+    /// a theme without the token reuses its OWN `xhigh` color. (Pi's own regression test is
+    /// `coding-agent/test/max-thinking.test.ts`, "falls back to thinkingXhigh for legacy themes".)
+    #[test]
+    fn legacy_theme_without_thinking_max_falls_back_to_xhigh() {
+        let mut legacy = UiTheme::dark();
+        legacy.roles.remove("thinkingMax");
+        let t = legacy.thinking();
+        assert_eq!(t.max, t.xhigh, "legacy themes reuse their xhigh color");
+        assert_eq!(
+            legacy.thinking_border_style("max"),
+            legacy.thinking_border_style("xhigh")
+        );
+        // A genuinely unknown level resolves to `thinkingOff`, which is Pi's `default:` arm in
+        // `Theme.getThinkingBorderColor` (v0.84.1
+        // `coding-agent/src/modes/interactive/theme/theme.ts:437-438` —
+        // `default: return (str) => this.fg("thinkingOff", str)`). It used to fall through to the
+        // `border` role, a token Pi never reaches from here.
+        assert_eq!(
+            legacy.thinking_border_style("ultra"),
+            legacy.thinking_border_style("off")
+        );
+        assert_ne!(legacy.thinking_border_style("ultra"), legacy.border_style());
+    }
+
+    #[test]
+    fn color_mode_projects_rgb_to_indexed_and_leaves_named_alone() {
+        let rgb = Color::Rgb(0x8a, 0xbe, 0xb7);
+        assert!(matches!(ColorMode::Ansi256.project(rgb), Color::Indexed(_)));
+        assert_eq!(ColorMode::TrueColor.project(rgb), rgb);
+        assert_eq!(ColorMode::None.project(rgb), Color::Reset);
+        // Named/indexed colors are already depth-safe and pass through unchanged.
+        assert_eq!(ColorMode::Ansi256.project(Color::Cyan), Color::Cyan);
+        assert_eq!(ColorMode::Ansi256.project(Color::Indexed(42)), Color::Indexed(42));
+    }
+
+    #[test]
+    fn with_color_mode_is_idempotent_and_projects_every_role() {
+        let dark = UiTheme::dark().with_color_mode(ColorMode::Ansi256);
+        // Foreground is now an indexed color, never RGB.
+        assert!(matches!(dark.foreground, Some(Color::Indexed(_))));
+        assert!(dark.roles.values().all(|c| !matches!(c, Color::Rgb(_, _, _))));
+        // Re-applying the same mode changes nothing (idempotent for a projected theme).
+        let again = dark.clone().with_color_mode(ColorMode::Ansi256);
+        assert_eq!(again.foreground, dark.foreground);
+    }
+
+    #[test]
+    fn parse_auto_theme_setting_matches_pi() {
+        assert_eq!(
+            parse_auto_theme_setting(Some("light/dark")),
+            Some(("light".to_string(), "dark".to_string()))
+        );
+        // Exactly one slash required; a bare name or a two-slash value is not an auto setting.
+        assert_eq!(parse_auto_theme_setting(Some("dark")), None);
+        assert_eq!(parse_auto_theme_setting(Some("a/b/c")), None);
+        assert_eq!(parse_auto_theme_setting(None), None);
+    }
+
+    #[test]
+    fn resolve_theme_setting_matches_pi() {
+        // Auto setting resolves against the terminal polarity.
+        assert_eq!(
+            resolve_theme_setting(Some("solarized-light/solarized-dark"), TerminalTheme::Dark),
+            Some("solarized-dark".to_string())
+        );
+        // A bare name passes through; an unresolvable slash value ⇒ None (caller falls back).
+        assert_eq!(resolve_theme_setting(Some("nord"), TerminalTheme::Light), Some("nord".to_string()));
+        assert_eq!(resolve_theme_setting(Some("a/b/c"), TerminalTheme::Dark), None);
+        assert_eq!(resolve_theme_setting(None, TerminalTheme::Light), None);
+    }
+
+    #[test]
+    fn ansi256_to_rgb_known_points() {
+        assert_eq!(ansi256_to_rgb(16), (0, 0, 0));
+        assert_eq!(ansi256_to_rgb(231), (255, 255, 255));
+        assert_eq!(ansi256_to_rgb(244), (128, 128, 128));
     }
 }

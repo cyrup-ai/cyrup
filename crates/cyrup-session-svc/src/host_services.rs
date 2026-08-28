@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use cyrup_core::{CancelToken, EntryId, ModelRef, Tool};
+use cyrup_core::{CancelToken, EntryId, ModelRef};
 use cyrup_ext::caps::http::HttpCaps;
 use cyrup_ext::caps::proc::ProcCaps;
 use cyrup_ext::host::{
@@ -57,10 +57,21 @@ const DEFAULT_EXEC_TIMEOUT: Duration = Duration::from_secs(120);
 /// runtime once it owns the session; until then control ops are reported as unavailable.
 pub type ControlSink = Arc<dyn Fn(ControlOp) -> Result<(), String> + Send + Sync>;
 
-/// A rebuilt active-tool push: the new tool array + the rebuilt system prompt a guest `setActiveTools`
-/// produced (Pi `setActiveToolsByName` output, agent-session.ts:850-854), queued for the async agent
-/// push in [`crate::AgentSession::apply_pending_control`].
-type ActiveToolsPush = (Vec<Arc<dyn Tool>>, String);
+/// A staged active-tool restriction: the tool NAMES a guest `setActiveTools` asked for (Pi
+/// `setActiveToolsByName`'s ARGUMENT, agent-session.ts:2283,840), queued for the async agent push in
+/// [`crate::AgentSession::apply_pending_control`].
+///
+/// The names, deliberately — NOT the `(tools, prompt)` pair the synchronous guest call already
+/// rebuilt. Every drain point runs the EXT-004 extension-tool refresh FIRST (`refresh_extension_tools`
+/// → `DynamicToolState::merge_registered`, which AUTO-ACTIVATES newly registered names and so writes
+/// the active set itself), and only then applies this. Staging a pre-refresh `(tools, prompt)`
+/// snapshot meant the refresh's auto-activation was the last write to the dynamic-tool view while the
+/// stale snapshot was the last write to the agent: `setActiveTools(["read"])` from a guest whose own
+/// tools had not been merged yet ended with the facade reporting `["read", <guest tools>]` and the
+/// agent running `["read"]`. Re-resolving the NAMES at the drain keeps pi's rule — the refresh happens
+/// inside `registerTool`, strictly earlier, and `setActiveToolsByName` is always the last word
+/// (agent-session.ts:2534-2553) — true for BOTH, from one write.
+type PendingActiveTools = Vec<String>;
 
 /// Which dialog family a [`UiRequest`] carries (Pi `ExtensionUIContext.{confirm,input,select,editor}`,
 /// types.ts:127-133,216).
@@ -565,11 +576,12 @@ pub struct LiveHostServices {
     /// agent-session.ts:2281,2283). Attached post-build via [`Self::attach_dynamic_tools`]; `None`
     /// until then (default host: `active_tools` returns `None` ⇒ the binding uses its own bookkeeping).
     dynamic_tools: Mutex<Option<Arc<Mutex<DynamicToolState>>>>,
-    /// The rebuilt `(tools, system_prompt)` a guest `setActiveTools` produced, queued for the ASYNC
-    /// agent push [`crate::AgentSession::apply_pending_control`] applies before the next turn (the
-    /// guest is wasm-suspended across the SYNC `set_active_tools` call — the same sync→async bridge
+    /// The tool NAMES a guest `setActiveTools` asked for, queued for the ASYNC agent push
+    /// [`crate::AgentSession::apply_pending_control`] applies before the next turn (the guest is
+    /// wasm-suspended across the SYNC `set_active_tools` call — the same sync→async bridge
     /// `pending_events`/the control queue use). Last write wins (Pi: the last `setActiveTools` wins).
-    pending_active_tools: Mutex<Option<ActiveToolsPush>>,
+    /// See [`PendingActiveTools`] for why this is the names and not the rebuilt push.
+    pending_active_tools: Mutex<Option<PendingActiveTools>>,
     /// [`DEFAULT_EXEC_TIMEOUT`] in production; overridable ONLY for tests
     /// (`LiveHostServices::with_exec_timeout`, `#[cfg(test)]`) so the fallback-timeout path is exercisable without a real test
     /// waiting the full production duration.
@@ -931,10 +943,12 @@ impl LiveHostServices {
         *Self::lock(&self.dynamic_tools) = Some(dynamic_tools);
     }
 
-    /// Drain the `(tools, system_prompt)` push a guest `setActiveTools` queued;
-    /// [`crate::AgentSession::apply_pending_control`] applies it to the live agent before the next
-    /// turn (the guest ran the restriction synchronously across the wasm-suspended call).
-    pub fn take_pending_active_tools(&self) -> Option<ActiveToolsPush> {
+    /// Drain the tool NAMES a guest `setActiveTools` queued;
+    /// [`crate::AgentSession::apply_pending_control`] re-resolves them against the dynamic-tool view
+    /// and applies the result to the live agent before the next turn (the guest ran the restriction
+    /// synchronously across the wasm-suspended call, so the readback was already right; this is what
+    /// makes it the LAST word over the tool refresh that runs at the same drain point).
+    pub fn take_pending_active_tools(&self) -> Option<PendingActiveTools> {
         Self::lock(&self.pending_active_tools).take()
     }
 
@@ -1790,14 +1804,19 @@ impl HostServices for LiveHostServices {
     fn set_active_tools(&self, names: &[String]) {
         // Restrict the live agent's tool set (Pi `setActiveTools` = `setActiveToolsByName`,
         // agent-session.ts:2283,840-855). Update the authoritative dynamic-tool view SYNCHRONOUSLY —
-        // Pi mutates `this.agent.state.tools` immediately, so the paired `getActiveTools` read
-        // reflects it at once — and queue the rebuilt `(tools, prompt)` for the ASYNC agent push
-        // `AgentSession::apply_pending_control` applies before the next turn (the guest is
-        // wasm-suspended across this SYNC call, the same sync→async bridge control ops use). No-op
-        // when no shared view is attached (default host: no live agent to restrict).
+        // Pi mutates `this.agent.state.tools` immediately, so the paired `getActiveTools` read (and
+        // the registered-tool wrapper's before/after diff) reflects it at once — and queue the
+        // REQUESTED NAMES for the ASYNC agent push `AgentSession::apply_pending_control` applies
+        // before the next turn (the guest is wasm-suspended across this SYNC call, the same
+        // sync→async bridge control ops use). No-op when no shared view is attached (default host:
+        // no live agent to restrict).
+        //
+        // The rebuilt pair this synchronous call produces is deliberately DROPPED rather than
+        // queued: the drain re-runs the restriction after its own EXT-004 tool refresh, which can
+        // have auto-activated names in between. See [`PendingActiveTools`].
         let Some(dt) = Self::lock(&self.dynamic_tools).clone() else { return };
-        let (tools, prompt) = { Self::lock(&dt).set_active(names) };
-        *Self::lock(&self.pending_active_tools) = Some((tools, prompt));
+        let _rebuilt = { Self::lock(&dt).set_active(names) };
+        *Self::lock(&self.pending_active_tools) = Some(names.to_vec());
     }
 
     fn all_tools(&self) -> Option<Vec<Value>> {
@@ -1888,6 +1907,9 @@ impl cyrup_ext::ActiveToolNames for LiveHostServices {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
     use super::*;
+    // `Tool` is a test-only need here since the pending active-tool slot became NAMES: the module
+    // itself no longer names the trait, only these fixtures' `CatalogTool` does.
+    use cyrup_core::Tool;
     use cyrup_provider::faux::FauxProvider;
     use std::sync::atomic::{AtomicUsize, Ordering};
 

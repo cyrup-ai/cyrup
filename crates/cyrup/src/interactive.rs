@@ -152,6 +152,9 @@ fn build_startup_report(session: &AgentSession, verbose: bool) -> cyrup_tui::Sta
 
 /// The interactive front-end: build the TUI over a real `CrosstermBackend<Stdout>`, seed any initial
 /// prompt, and run the event loop against the live session. Restores the terminal on exit.
+// The interactive entry point wires eight independently-owned collaborators; bundling them
+// into a struct would only move the arity to the caller, which constructs each one separately.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
     runtime: Arc<AgentSessionRuntime>,
     session: Arc<AgentSession>,

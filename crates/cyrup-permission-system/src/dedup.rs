@@ -331,11 +331,10 @@ pub fn create_duplicate_decision(decision: &PermissionPromptDecision) -> Permiss
 }
 
 #[cfg(test)]
-// The allow-set this workspace's test modules carry; the crate denies these at lib.rs:69
-// and the `_ => panic!("expected an in-flight (Pending) hit")` arm below IS the test failure.
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
+    // The allow-set this workspace's test modules carry; the crate denies these at lib.rs:69
+    // and the `_ => panic!("expected an in-flight (Pending) hit")` arm below IS the test failure.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
     use super::*;
 
     fn approved_always() -> PermissionPromptDecision {

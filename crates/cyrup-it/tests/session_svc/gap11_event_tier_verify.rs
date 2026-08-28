@@ -117,9 +117,21 @@ async fn event_tier_set_model_and_thinking_take_effect_on_next_turn() {
         .await
         .expect("load + init the live wasm extension");
 
-    // BASELINE: session starts on faux-1, thinking off (default).
+    // BASELINE: session starts on faux-1, thinking at the shipped default.
+    // CFG-056 (commit c06bb0c, 2026-08-14) changed the unset-`defaultThinkingLevel` fallback from
+    // the enum's `Off` zero to `cyrup_config::DEFAULT_THINKING_LEVEL` = `Medium`, matching pi's
+    // `getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL` (sdk.ts:230,:235; core/defaults.ts:3).
+    // This fixture writes no `settings.json`, so it lands on that fallback; `faux-1` is
+    // reasoning-capable, so the clamp leaves `Medium` intact. `Off` here was the PRE-CFG-056
+    // baseline — the file predates that commit and cyrup-it did not compile in between, so it was
+    // never re-run. What the assertion is FOR is unchanged: pin a known starting level distinct
+    // from the `high` the event handler sets below, so the switch is observable.
     assert_eq!(session.model().expect("session must have a resolved model").model.as_str(), "faux-1", "starts on faux-1");
-    assert_eq!(session.thinking_level().await, ModelThinkingLevel::Off, "starts thinking=off");
+    assert_eq!(
+        session.thinking_level().await,
+        ModelThinkingLevel::Medium,
+        "starts at the DEFAULT_THINKING_LEVEL baseline (CFG-056), not the enum zero"
+    );
 
     // ---- TURN 1: drive a real turn whose user message fires on_message_end("gap11switch"),
     //      which (event tier) calls set_model("faux/faux-2") + set_thinking_level("high"). ----

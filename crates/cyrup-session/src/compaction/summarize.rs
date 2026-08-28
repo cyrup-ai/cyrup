@@ -266,6 +266,7 @@ impl<P: Provider> ProviderSummarizer<P> {
 
     /// Bind the session's retry policy, as Pi threads `settingsManager.getRetrySettings()` into
     /// every summarization call (`agent-session.ts:1858,2132,2997`).
+    #[must_use]
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
