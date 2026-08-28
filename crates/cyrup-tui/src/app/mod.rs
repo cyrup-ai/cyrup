@@ -40,6 +40,9 @@ mod events_fold;
 mod extension_ui;
 mod execute;
 mod execute_misc;
+// The per-model-thinking helpers `execute.rs` and `selectors.rs` reach for by path
+// (`crate::app::thinking_level_str`, `crate::app::CLEAR_MODEL_THINKING`).
+pub(crate) use execute_misc::{CLEAR_MODEL_THINKING, thinking_level_str};
 mod execute_session;
 mod hotkeys;
 #[path = "extension_render.rs"]

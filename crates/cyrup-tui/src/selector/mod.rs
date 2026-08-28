@@ -228,6 +228,13 @@ pub(crate) fn centered_window(selected: usize, len: usize, max: usize) -> (usize
 pub enum SelectorKind {
     /// Reasoning-level picker (`thinking-selector.ts`).
     Thinking,
+    /// Step 1 of the `/settings` → "Default thinking level per model" submenu: pick the MODEL whose
+    /// override to edit (Pi `SteppedSubmenuStep` `key: "model"`, `settings-selector.ts:580-608`).
+    /// Confirming opens [`Self::ModelThinkingLevel`] for it.
+    ModelThinking,
+    /// Step 2 of that submenu: pick the LEVEL for the model chosen in [`Self::ModelThinking`]
+    /// (`settings-selector.ts:610-645`), plus a `(clear override)` row when one is already set.
+    ModelThinkingLevel,
     /// Inline-images yes/no (`show-images-selector.ts`).
     ShowImages,
     /// Theme picker with live preview (`theme-selector.ts`).
@@ -316,6 +323,11 @@ impl SelectorKind {
     pub fn title(self) -> &'static str {
         match self {
             SelectorKind::Thinking => "Thinking Level",
+            // `title: "Per-Model Thinking Level"` on BOTH steps (`settings-selector.ts:583`,
+            // `:612`) — the header does not change as the user walks the two pickers.
+            SelectorKind::ModelThinking | SelectorKind::ModelThinkingLevel => {
+                "Per-Model Thinking Level"
+            }
             SelectorKind::ShowImages => "Show Images",
             SelectorKind::Theme => "Theme",
             SelectorKind::Model => "Select Model",
@@ -455,6 +467,23 @@ pub enum SelectorOutcome {
     Preview(String),
     /// The highlighted row was confirmed (`tui.select.confirm`); carries its value.
     Confirm(String),
+    /// The highlighted row was confirmed **and asked to become the persisted default** (`Ctrl+S`,
+    /// Pi's second confirm key inside the model and thinking pickers — `model-selector.ts:401-408`
+    /// `onSelectAsDefaultCallback`, `thinking-selector.ts:121-125` `onSelectAsDefault`). Carries the
+    /// same value [`Self::Confirm`] would.
+    ///
+    /// Pi keeps the two keys distinct because plain `Enter` is deliberately session-only:
+    /// `selectModel(m, false)` / `selectLevel(l, false)` pass `{ persist: false }`
+    /// (`interactive-mode.ts:4993`, `:4801`), and only the `Ctrl+S` sibling passes `true`
+    /// (`:4999`, `:4813`). Emitting a separate outcome — rather than a flag on `Confirm` — keeps
+    /// every existing `Confirm` consumer untouched and non-persisting by construction.
+    ///
+    /// Pi binds `Ctrl+S` here with a LITERAL `matchesKey(keyData, "ctrl+s")`
+    /// (`model-selector.ts:401`, `thinking-selector.ts:122`), not a keybindings id — unlike the
+    /// scoped-models `app.models.save` — so the cyrup binding is likewise non-configurable, and is
+    /// only live on the selectors that opted in (Pi guards on the callback being wired at all, so
+    /// an un-wired picker leaves `Ctrl+S` to its search input, `model-selector.ts:409-412`).
+    ConfirmDefault(String),
     /// A setting was changed **in place** without closing the slot (Pi's settings/config selectors
     /// apply each cycle live via `onChange` and stay open — settings-list.ts `cycleValue`). Carries an
     /// `"id\u{1f}value"` payload the chrome persists; the selector remains open and redraws.

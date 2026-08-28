@@ -12,10 +12,13 @@ impl<B: Backend> App<B> {
         // get neither.
         let (inner, restore_theme): (Box<dyn Selector>, Option<UiTheme>) = match kind {
             SelectorKind::Thinking => (
-                Box::new(ListSelector::thinking(&self.state.thinking_level).with_upstream_chrome(
-                    kind,
-                    &self.state.select_keymap,
-                )),
+                Box::new(
+                    ListSelector::thinking(
+                        &self.state.thinking_level,
+                        &self.state.default_thinking_level,
+                    )
+                    .with_upstream_chrome(kind, &self.state.select_keymap),
+                ),
                 None,
             ),
             SelectorKind::ShowImages => (
@@ -99,6 +102,13 @@ impl<B: Backend> App<B> {
     pub fn open_model_selector(&mut self, models: Vec<ModelEntry>, search: Option<String>) {
         let saved_editor = self.state.editor.text();
         let mut selector = ModelSelector::new(models);
+        // Pi passes `defaultProvider && defaultModel` into the component and wires
+        // `onSelectAsDefault` alongside it (`interactive-mode.ts:4999-5000`). Absent here means the
+        // picker was opened on a path with no session to persist through (the test constructors),
+        // and it correctly renders no `Ctrl+S` hint and binds no key.
+        if let Some((provider, id)) = self.state.default_model.clone() {
+            selector = selector.with_default_model(&provider, &id);
+        }
         // `getScopeHintText` is `keyHint("tui.input.tab", "scope") + …` (`model-selector.ts:229`),
         // resolved through the live table; cyrup's editor tier owns that binding.
         selector.set_editor_keymap(self.state.editor.keymap_ref());
@@ -120,6 +130,15 @@ impl<B: Backend> App<B> {
     /// pre-filtered to it. The catalog is the live available multi-provider catalog the picker itself
     /// sources (`model_entries`).
     pub(crate) async fn handle_model_command(&mut self, session: &Arc<AgentSession>, search: Option<String>) {
+        // Seed the persisted default before opening: `open_model_selector` is also reachable from
+        // session-less test paths, so the picker reads it off state rather than taking it as an
+        // argument. `Some` even when both are unset — that is Pi's "callback wired, nothing
+        // default yet" state, which still offers `Ctrl+S`.
+        let eff = session.services().settings.effective();
+        self.state.default_model = Some((
+            eff.default_provider().unwrap_or_default(),
+            eff.default_model().unwrap_or_default(),
+        ));
         let models = model_entries(session);
         if models.is_empty() {
             self.state.transcript.push_status("no models available (configure providers)");
@@ -187,6 +206,19 @@ impl<B: Backend> App<B> {
                     return AppAction::Redraw;
                 }
                 let command = self.confirm_selector(kind, &value);
+                self.close_selector(false);
+                match command {
+                    Some(c) => AppAction::Command(c),
+                    None => AppAction::Redraw,
+                }
+            }
+            SelectorOutcome::ConfirmDefault(value) => {
+                // Pi's `Ctrl+S` sibling of the confirm key: apply to the session AND persist as the
+                // default. Both pickers close exactly as `Enter` does — the model picker disposes
+                // before its callback (`model-selector.ts:406-407`), the thinking picker's callback
+                // is `(level) => selectLevel(level, true)` whose `selectLevel` calls `done()`
+                // (`interactive-mode.ts:4803`, `:4813`) — so the close is unconditional here.
+                let command = self.confirm_selector_as_default(kind, &value);
                 self.close_selector(false);
                 match command {
                     Some(c) => AppAction::Command(c),
@@ -277,6 +309,15 @@ impl<B: Backend> App<B> {
                     // Pi's `SelectSubmenu("Thinking Level", …, config.availableThinkingLevels, …,
                     // callbacks.onThinkingLevelChange)` (`settings-selector.ts:591-611`).
                     "thinking" => self.open_selector(SelectorKind::Thinking),
+                    // GAP 3 step 1. Unlike `theme`/`thinking` this picker is DATA-BOUND (its rows
+                    // are the model catalog plus each model's current override), and this handler
+                    // has no session — so it rides a command the run loop resolves, the same shape
+                    // the `BranchSummary` cancel arm above uses.
+                    "model-thinking" => {
+                        return AppAction::Command(AppCommand::OpenSelector(
+                            SelectorKind::ModelThinking,
+                        ));
+                    }
                     // `warnings` is a nested toggle LIST, not a picker — Pi's
                     // `WarningSettingsSubmenu` (`settings-selector.ts:120-160`) is a `SettingsList`
                     // over one item, `anthropic-extra-usage`, whose `onChange` writes straight
@@ -313,6 +354,36 @@ impl<B: Backend> App<B> {
     /// are applied fully in-crate and return `None`; the data-bound selectors return an
     /// [`AppCommand::ConfirmSelection`] so the run loop applies the effect at the session layer (set
     /// model, switch branch, login…).
+    /// The `Ctrl+S` sibling of [`Self::confirm_selector`]: apply the choice to the session AND
+    /// persist it as the global default (Pi `selectModel(m, true)` / `selectLevel(l, true)`).
+    ///
+    /// Only the two pickers that opt into the binding can reach this — every other kind falls back
+    /// to the plain confirm, so a stray `Ctrl+S` can never write settings for a selector Pi does
+    /// not persist from.
+    fn confirm_selector_as_default(
+        &mut self,
+        kind: SelectorKind,
+        value: &str,
+    ) -> Option<AppCommand> {
+        match kind {
+            SelectorKind::Model | SelectorKind::Thinking => {
+                // The same optimistic local mirror the `Enter` path applies, so the footer and the
+                // editor rule are correct on the frame the picker closes; the session event then
+                // confirms or clamps. The persist rides the command, after the session set lands.
+                if kind == SelectorKind::Thinking {
+                    self.state.thinking_level = value.to_string();
+                    self.state.status.set_thinking_level(value);
+                    self.state.editor.set_thinking_level(value);
+                }
+                Some(AppCommand::ConfirmSelectionAsDefault {
+                    kind,
+                    value: value.to_string(),
+                })
+            }
+            other => self.confirm_selector(other, value),
+        }
+    }
+
     fn confirm_selector(&mut self, kind: SelectorKind, value: &str) -> Option<AppCommand> {
         match kind {
             // TUI-N03 — this arm used to return `None`, so a theme chosen in `/settings` repainted
@@ -334,12 +405,18 @@ impl<B: Backend> App<B> {
                     value: value.to_string(),
                 })
             }
-            // TUI-032 — the level is applied to the SESSION, not written to the settings layer:
-            // Pi's `onThinkingLevelChange` is `this.session.setThinkingLevel(level);
-            // this.footer.invalidate(); this.updateEditorBorderColor();`
+            // TUI-032 — on the `Enter` path the level is applied to the SESSION, not written to
+            // the settings layer: Pi's `onThinkingLevelChange` is `this.session.setThinkingLevel(
+            // level); this.footer.invalidate(); this.updateEditorBorderColor();`
             // (`interactive-mode.ts:4222-4226`). The optimistic local mirror below keeps the footer
             // and the editor rule in lockstep on the frame the picker closes; the session's
             // `ThinkingLevelChanged` event then confirms (or clamps) it.
+            //
+            // "Session op, not a settings write" is true HERE and only here. Pi has a second
+            // confirm key in this picker — `Ctrl+S` → `selectLevel(level, true)` → `{persist:true}`
+            // (`interactive-mode.ts:4813`) — and reading the `Enter` callback as the whole story is
+            // exactly what kept `defaultThinkingLevel` write-only-by-the-launcher. That path is
+            // [`Self::confirm_selector_as_default`].
             SelectorKind::Thinking => {
                 self.state.thinking_level = value.to_string();
                 self.state.status.set_thinking_level(value);
@@ -348,6 +425,23 @@ impl<B: Backend> App<B> {
                 self.state.editor.set_thinking_level(value);
                 Some(AppCommand::SetThinking(value.to_string()))
             }
+            // GAP 3 step 1 → step 2: stash the chosen `provider/id` and open the level picker
+            // (Pi's `SteppedSubmenu` advancing with `selections.model` set,
+            // `settings-selector.ts:653`). Data-bound, so it rides a command.
+            SelectorKind::ModelThinking => {
+                self.state.pending_model_thinking = Some(value.to_string());
+                Some(AppCommand::OpenSelector(SelectorKind::ModelThinkingLevel))
+            }
+            // GAP 3 step 2: apply. The pending model is consumed here, so an Escape at step 2
+            // leaves it set but harmless — the next step-1 confirm overwrites it.
+            SelectorKind::ModelThinkingLevel => self
+                .state
+                .pending_model_thinking
+                .take()
+                .map(|model| AppCommand::SetModelThinkingLevel {
+                    model,
+                    level: value.to_string(),
+                }),
             SelectorKind::ShowImages => {
                 self.state.show_images = value == "yes";
                 // TUI-007: the toggle governs TOOL-RESULT images too (Pi passes `showImages` into

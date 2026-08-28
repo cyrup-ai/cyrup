@@ -153,18 +153,28 @@ fn extension_selector_envelope_has_the_four_upstream_spacer_rows() {
 /// test goes red while the one above stays green.
 #[test]
 fn thinking_selector_envelope_stays_flush_against_its_rules() {
-    let mut sel = ListSelector::thinking("medium")
+    let mut sel = ListSelector::thinking("medium", "medium")
         .with_upstream_chrome(SelectorKind::Thinking, &SelectKeymap::default());
     let rows = natural(sel.as_mut_selector(), 60);
     let n = rows.len();
     assert!(is_rule(&rows[0]), "top rule: {rows:?}");
     assert!(rows[1].contains("off"), "the first level row is flush against the rule: {rows:?}");
     assert!(is_rule(&rows[n - 1]), "bottom rule: {rows:?}");
-    assert!(rows[n - 2].contains("max"), "the last level row is flush against it: {rows:?}");
+    // pi v0.84.3 CHANGED this envelope. It used to be border/list/border — flush at both ends,
+    // zero spacers — and this test pinned that. `ThinkingSelectorComponent` now ends
+    // `selectList` · `Spacer(1)`(:93) · footer `Text`(:94) · `DynamicBorder`(:96), so the last
+    // level row is no longer flush against the bottom rule and there is exactly ONE blank row.
+    // The TOP half of the envelope is unchanged, which is why the two assertions above still hold.
+    assert!(
+        rows[n - 2].contains("set as default"),
+        "pi's footer sits directly above the bottom rule: {rows:?}"
+    );
+    assert!(rows[n - 3].is_empty(), "with pi's `Spacer(1)` above it: {rows:?}");
+    assert!(rows[n - 4].contains("max"), "and the last level row above that: {rows:?}");
     assert_eq!(
         rows.iter().filter(|r| r.is_empty()).count(),
-        0,
-        "thinking draws no Spacer(1) at all: {rows:?}"
+        1,
+        "exactly the one `Spacer(1)` at `thinking-selector.ts:93`: {rows:?}"
     );
 }
 
@@ -367,7 +377,7 @@ fn settings_selector_envelope_is_border_list_border_with_no_title_row() {
 /// leaked into `SelectList`.
 #[test]
 fn settings_list_behaviours_do_not_leak_into_the_shared_select_list() {
-    let mut sel = ListSelector::thinking("medium")
+    let mut sel = ListSelector::thinking("medium", "medium")
         .with_upstream_chrome(SelectorKind::Thinking, &SelectKeymap::default());
     let rows = natural(sel.as_mut_selector(), 60);
     assert!(!rows.iter().any(|r| r.starts_with("> ") || r.trim_end() == ">"), "no Input: {rows:?}");

@@ -179,6 +179,22 @@ impl<B: Backend> App<B> {
                 // `/settings` (settings-selector.ts): the curated toggle/choice grid sourced from the
                 // live effective settings. Each row cycles in place on `Enter` and persists via
                 // `ApplySetting` (Pi's settings selector applies on `onChange`).
+                // Seed the persisted default so the `Thinking level` submenu can badge it
+                // ` · default` and offer `Ctrl+S` — `handle_selector_key` (which dispatches
+                // `OpenSubmenu`) has no session, and `/settings` is the only route to that submenu.
+                // Pi's `?? DEFAULT_THINKING_LEVEL` fallback (`interactive-mode.ts:4814`) is what
+                // keeps a badge on screen when the setting is unset.
+                // `ModelThinkingLevel` is `serde(rename_all = "camelCase")`
+                // (`cyrup-core/src/message/thinking.rs:25-26`), so its wire form is exactly the
+                // `off`/`minimal`/…/`max` vocabulary the picker rows use — no separate mapping.
+                self.state.default_thinking_level = session
+                    .services()
+                    .settings
+                    .effective()
+                    .default_thinking_level()
+                    .and_then(|l| serde_json::to_value(l).ok())
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "medium".to_string());
                 let rows = settings_rows(
                     session.services().settings.effective(),
                     &self.state.theme.name,
@@ -233,6 +249,93 @@ impl<B: Backend> App<B> {
             C::OpenSelector(SelectorKind::Session) => {
                 self.execute_open_session_selector(session).await
             }
+            C::OpenSelector(SelectorKind::ModelThinking) => {
+                // GAP 3 step 1 rows: every model, each described by its CURRENT override (blank
+                // when unset), sorted current-model → persisted-default → provider, which is Pi's
+                // comparator (`settings-selector.ts:587-597`).
+                let eff = session.services().settings.effective();
+                let overrides = eff.all_model_thinking_levels();
+                let default_key = match (eff.default_provider(), eff.default_model()) {
+                    (Some(p), Some(m)) => Some(format!("{p}/{m}")),
+                    _ => None,
+                };
+                let current_key = session
+                    .model()
+                    .map(|c| format!("{}/{}", c.provider.as_str(), c.model.as_str()));
+                let mut entries: Vec<(String, String, Option<String>)> = session
+                    .available_model_catalog()
+                    .iter()
+                    .map(|m| {
+                        let key = format!("{}/{}", m.provider, m.id);
+                        // `label: modelItemLabel(model)` = `` `${id} [${provider}]` ``
+                        // (`settings-selector.ts:190-192`); `description: override ?? undefined`.
+                        let label = format!("{} [{}]", m.id, m.provider);
+                        let desc = overrides
+                            .get(&key)
+                            .map(|l| crate::app::thinking_level_str(*l).to_string());
+                        (key, label, desc)
+                    })
+                    .collect();
+                entries.sort_by(|a, b| {
+                    let rank = |k: &String| {
+                        if current_key.as_ref() == Some(k) {
+                            0
+                        } else if default_key.as_ref() == Some(k) {
+                            1
+                        } else {
+                            2
+                        }
+                    };
+                    rank(&a.0).cmp(&rank(&b.0)).then_with(|| a.0.cmp(&b.0))
+                });
+                if entries.is_empty() {
+                    self.state.transcript.push_status("no models available");
+                    return;
+                }
+                self.open_data_selector(SelectorKind::ModelThinking, entries, 0);
+            }
+
+            C::OpenSelector(SelectorKind::ModelThinkingLevel) => {
+                // GAP 3 step 2 rows: the level ladder, plus a `(clear override)` row that exists
+                // ONLY when this model already has one (`settings-selector.ts:634-640`).
+                let Some(model_key) = self.state.pending_model_thinking.clone() else {
+                    return;
+                };
+                let eff = session.services().settings.effective();
+                let existing = eff.all_model_thinking_levels().get(&model_key).copied();
+                const LEVELS: [(&str, &str); 7] = [
+                    ("off", "No reasoning"),
+                    ("minimal", "Very brief reasoning (~1k tokens)"),
+                    ("low", "Light reasoning (~2k tokens)"),
+                    ("medium", "Moderate reasoning (~8k tokens)"),
+                    ("high", "Deep reasoning (~16k tokens)"),
+                    ("xhigh", "Extra-high reasoning (~32k tokens)"),
+                    ("max", "Maximum reasoning"),
+                ];
+                let mut rows: Vec<(String, String, Option<String>)> = LEVELS
+                    .iter()
+                    .map(|(l, d)| ((*l).to_string(), (*l).to_string(), Some((*d).to_string())))
+                    .collect();
+                if existing.is_some() {
+                    let global = eff
+                        .default_thinking_level()
+                        .map_or("medium", crate::app::thinking_level_str);
+                    rows.push((
+                        crate::app::CLEAR_MODEL_THINKING.to_string(),
+                        "(clear override)".to_string(),
+                        Some(format!("Revert to global default ({global})")),
+                    ));
+                }
+                // `preselect: (ctx) => currentModelThinkingLevels[ctx.model]` (`:643`).
+                let selected = existing
+                    .and_then(|l| {
+                        let s = crate::app::thinking_level_str(l);
+                        rows.iter().position(|(v, _, _)| v == s)
+                    })
+                    .unwrap_or(0);
+                self.open_data_selector(SelectorKind::ModelThinkingLevel, rows, selected);
+            }
+
             C::OpenSelector(other) => {
                 // Any remaining kind has no in-crate sourcing yet; surface the request (no silent drop).
                 self.state.transcript.push_status(format!("{} selector unavailable", other.title()));
@@ -285,6 +388,55 @@ impl<B: Backend> App<B> {
                 }
             }
 
+            C::ConfirmSelectionAsDefault { kind: SelectorKind::Model, value } => {
+                // Pi `selectModel(model, true)` → `setModel(model, { persist: true })`
+                // (`interactive-mode.ts:4999` → `agent-session.ts:1630-1650`). ORDER IS THE
+                // CONTRACT: the session set runs FIRST and a failure returns without writing
+                // anything. Pi throws out of `setModel` before its persist when auth is missing
+                // (`agent-session.ts:1637-1639`); cyrup's `set_model_resolved` returns
+                // `NoConfiguredAuth` first (`model.rs:44-50`), so the same guard falls out of
+                // sequencing the persist after a successful set.
+                if let Err(e) = session.set_model(&value).await {
+                    self.state.transcript.push_status(format!("model error: {e}"));
+                    return;
+                }
+                // `setDefaultModelAndProvider(provider, id)` writes BOTH keys together
+                // (`settings-manager.ts:737-744`); never one alone, or a relaunch resolves a model
+                // id against the wrong provider. The picker confirms a fully-qualified
+                // `provider/id`, so the split is the inverse of how it was built.
+                let (provider, id) = match value.split_once('/') {
+                    Some((p, i)) => (p.to_string(), i.to_string()),
+                    // Unreachable from the picker; degrade rather than write a half pair.
+                    None => {
+                        self.state
+                            .transcript
+                            .push_status(format!("model → {value} (not persisted: no provider)"));
+                        return;
+                    }
+                };
+                let scope = cyrup_session_svc::SettingsScope::Global;
+                let wrote = match session
+                    .persist_setting(scope, "defaultProvider", serde_json::json!(provider))
+                    .await
+                {
+                    Ok(()) => {
+                        session.persist_setting(scope, "defaultModel", serde_json::json!(id)).await
+                    }
+                    Err(e) => Err(e),
+                };
+                match wrote {
+                    // `Default model: {provider}/{id}` vs the plain path's `Model: {id}`
+                    // (`interactive-mode.ts:4978`).
+                    Ok(()) => self
+                        .state
+                        .transcript
+                        .push_status(format!("Default model: {provider}/{id}")),
+                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                }
+                self.state.default_model = Some((provider.clone(), id.clone()));
+                self.add_persisted_default_to_non_empty_scope(session, &provider, &id).await;
+            }
+
             C::SetEntryLabel { entry_id, label } => {
                 // Persist the `/tree` label edit via the SAME live `set_label` path a loaded
                 // extension's `setLabel` uses (`LiveHostServices::set_label` → `manager.append_label`,
@@ -324,7 +476,38 @@ impl<B: Backend> App<B> {
                     .collect();
                 let n = scoped.len();
                 session.set_scoped_models(scoped);
-                self.state.transcript.push_status(format!("scoped models → {n} enabled"));
+                // GAP 4 — Pi's `Ctrl+S` here is `setEnabledModels(patterns)`
+                // (`interactive-mode.ts:5072`), a real settings write; cyrup applied the scope to
+                // the session only, which made the selector's own footer
+                // ("Session-only. ctrl+s to save to settings.") a false promise. The patterns are
+                // the ordered fully-qualified `provider/id` references, and the "all" sentinel
+                // passes `undefined` upstream — `Value::Null` here, which `SettingsManager::set`
+                // treats as key REMOVAL (`manager.rs:255-256`) rather than writing a literal null.
+                let patterns = if value == crate::SCOPED_MODELS_ALL {
+                    serde_json::Value::Null
+                } else {
+                    serde_json::json!(
+                        ordered_ids
+                            .iter()
+                            .filter_map(|id| catalog.iter().find(|m| m.id.to_string() == *id))
+                            .map(|m| format!("{}/{}", m.provider, m.id))
+                            .collect::<Vec<_>>()
+                    )
+                };
+                match session
+                    .persist_setting(
+                        cyrup_session_svc::SettingsScope::Global,
+                        "enabledModels",
+                        patterns,
+                    )
+                    .await
+                {
+                    Ok(()) => self
+                        .state
+                        .transcript
+                        .push_status(format!("scoped models → {n} enabled")),
+                    Err(e) => self.state.transcript.push_status(format!("settings error: {e}")),
+                }
             }
 
             C::ConfirmSelection { kind: SelectorKind::Logout, value } => {

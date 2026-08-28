@@ -4,16 +4,29 @@
 use crate::{CommandRegistry, Dispatch, BUILTIN_SLASH_COMMANDS};
 
 #[test]
-fn builtin_table_is_22_commands_in_pi_order() {
-    // slash-commands.ts:18-41 — order is display order, NOT alphabetical.
-    assert_eq!(BUILTIN_SLASH_COMMANDS.len(), 22);
+fn builtin_table_is_23_commands_in_pi_order() {
+    // slash-commands.ts:19-42 — order is display order, NOT alphabetical.
+    //
+    // TWENTY-THREE at pi v0.84.3, not the 22 this asserted before: `thinking` was added at
+    // `slash-commands.ts:23`, fourth, between `tree` and `scoped-models`. The count and that slot
+    // are both user-visible (it is autocomplete order), so both are pinned.
+    assert_eq!(BUILTIN_SLASH_COMMANDS.len(), 23);
     assert_eq!(BUILTIN_SLASH_COMMANDS.first().unwrap().name, "settings");
     assert_eq!(BUILTIN_SLASH_COMMANDS[1].name, "model");
+    // `thinking` sits immediately after `tree`, which is pi's RELATIVE order
+    // (`slash-commands.ts:22-23`). Its absolute index differs because cyrup's table already places
+    // `tree` later than pi does — a pre-existing divergence this task does not touch, since the
+    // list is user-visible autocomplete order.
+    let tree_at = BUILTIN_SLASH_COMMANDS.iter().position(|c| c.name == "tree").unwrap();
+    assert_eq!(BUILTIN_SLASH_COMMANDS[tree_at + 1].name, "thinking");
+    assert_eq!(BUILTIN_SLASH_COMMANDS[tree_at + 1].argument_hint.as_deref(), Some("<level>"));
     assert_eq!(BUILTIN_SLASH_COMMANDS.last().unwrap().name, "quit");
-    // `/model` and `/login` are the two builtins that carry argument completion: at v0.83.0
-    // `interactive-mode.ts:553-590` (`createBaseAutocompleteProvider`) installs
-    // `getArgumentCompletions` on exactly those two entries, and `autocomplete.ts:342-352` returns
-    // `null` for any command without one. Their hints are `slash-commands.ts:21` and `:35`.
+    // `/model`, `/thinking` and `/login` are the builtins that carry argument completion.
+    // THREE at pi v0.84.3, not the two this used to assert: `createBaseAutocompleteProvider`
+    // installs `getArgumentCompletions` on `model` (`interactive-mode.ts:688-690`), on `thinking`
+    // (`:714-716`, completing over `getAvailableThinkingLevels()`) and on `login`;
+    // `autocomplete.ts` returns `null` for any command without one. Hints at
+    // `slash-commands.ts:21`, `:23` and `:35`.
     assert!(BUILTIN_SLASH_COMMANDS[1].has_arg_completion);
     assert_eq!(BUILTIN_SLASH_COMMANDS[1].argument_hint.as_deref(), Some("<provider/model>"));
     let with_args: Vec<&str> = BUILTIN_SLASH_COMMANDS
@@ -21,7 +34,7 @@ fn builtin_table_is_22_commands_in_pi_order() {
         .filter(|c| c.has_arg_completion)
         .map(|c| c.name.as_ref())
         .collect();
-    assert_eq!(with_args, vec!["model", "login"]);
+    assert_eq!(with_args, vec!["model", "thinking", "login"]);
     let login = BUILTIN_SLASH_COMMANDS.iter().find(|c| c.name == "login").unwrap();
     assert_eq!(login.argument_hint.as_deref(), Some("<provider>"));
 }

@@ -24,6 +24,15 @@ pub struct ListSelector {
     /// Whether to draw the envelope's `Spacer(1)` rows — OPT-IN, see
     /// [`SelectorKind::envelope_spacers`].
     spacers: bool,
+    /// Whether this list offers Pi's SECOND confirm key — `Ctrl+S`, "set as default" — which emits
+    /// [`SelectorOutcome::ConfirmDefault`] instead of [`SelectorOutcome::Confirm`], and draws Pi's
+    /// `Enter to select · Ctrl+S to set as default · Esc to cancel` footer
+    /// (`thinking-selector.ts:94`, `:121-125`).
+    ///
+    /// OPT-IN per instance, mirroring Pi's guard: it binds the key only when an
+    /// `onSelectAsDefault` callback was supplied (`thinking-selector.ts:122`), so a list built
+    /// without one leaves `Ctrl+S` alone. Only [`ListSelector::thinking`] sets it.
+    persist_hint: bool,
 }
 
 impl ListSelector {
@@ -54,6 +63,7 @@ impl ListSelector {
             hints: false,
             inset: false,
             spacers: false,
+            persist_hint: false,
         }
     }
 
@@ -86,6 +96,7 @@ impl ListSelector {
             hints: false,
             inset: false,
             spacers: false,
+            persist_hint: false,
         }
     }
 
@@ -134,8 +145,11 @@ impl ListSelector {
     /// `:87`, belongs to the `Input` cyrup has not ported).
     fn spacer_rows(&self) -> u16 {
         if !self.spacers {
-            0
-        } else if self.hints {
+            // `thinking-selector.ts:93` adds ONE `Spacer(1)` before its footer even though the rest
+            // of that envelope is flush (border/list/border) — so a persist-hint selector is not
+            // spacer-free any more, it has exactly that one row.
+            u16::from(self.persist_hint)
+        } else if self.hints || self.persist_hint {
             4
         } else {
             3
@@ -203,7 +217,16 @@ impl ListSelector {
 
     /// Thinking-level picker (`thinking-selector.ts:11-55`): one row per available level with its
     /// token-estimate description, `maxVisible = levels.len()`, preselecting `current`.
-    pub fn thinking(current: &str) -> Self {
+    ///
+    /// `default_level` is the PERSISTED default (`defaultThinkingLevel`). Its row gets Pi's
+    /// ` · default` suffix on the description (`thinking-selector.ts:73`), and supplying it opts
+    /// the picker into the `Ctrl+S` "set as default" key + footer — the structural equivalent of
+    /// Pi's `onSelectAsDefault` callback guard (`:122`).
+    ///
+    /// Pi passes `settingsManager.getDefaultThinkingLevel() ?? DEFAULT_THINKING_LEVEL`
+    /// (`interactive-mode.ts:4814`), so with the setting unset the badge lands on the built-in
+    /// default rather than on nothing; callers must resolve that fallback before calling.
+    pub fn thinking(current: &str, default_level: &str) -> Self {
         // `LEVEL_DESCRIPTIONS` (`thinking-selector.ts:11-19`), in Pi's order. Pi's `max` commit
         // (fbdd4638) renamed the `xhigh` copy from "Maximum" to "Extra-high" and gave "Maximum
         // reasoning" to the new top rung.
@@ -218,10 +241,23 @@ impl ListSelector {
         ];
         let rows: Vec<_> = LEVELS
             .iter()
-            .map(|(level, desc)| ((*level).to_string(), (*level).to_string(), Some((*desc).to_string())))
+            .map(|(level, desc)| {
+                // `level === defaultThinkingLevel ? `${LEVEL_DESCRIPTIONS[level]} · default` : …`
+                // (`thinking-selector.ts:70-74`). The identical badge string the model picker uses
+                // (`model-selector.ts:317`) — one marker, two pickers.
+                let desc = if *level == default_level {
+                    format!("{desc} \u{b7} default")
+                } else {
+                    (*desc).to_string()
+                };
+                ((*level).to_string(), (*level).to_string(), Some(desc))
+            })
             .collect();
         let selected = LEVELS.iter().position(|(l, _)| *l == current).unwrap_or(0);
-        ListSelector::new(rows, LEVELS.len().min(u16::MAX as usize) as u16, selected, false)
+        let mut sel =
+            ListSelector::new(rows, LEVELS.len().min(u16::MAX as usize) as u16, selected, false);
+        sel.persist_hint = true;
+        sel
     }
 
     /// Inline-images yes/no (`show-images-selector.ts:19-31`): `maxVisible = 5`, preselecting
@@ -260,7 +296,7 @@ impl Selector for ListSelector {
         // **when this kind draws one** + bottom `DynamicBorder` (spec/tui/05 §3;
         // `extension-selector.ts:44-75`).
         let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, width));
-        let hint_h = u16::from(self.hints);
+        let hint_h = u16::from(self.hints || self.persist_hint);
         self.list
             .rendered_height()
             .saturating_add(2)
@@ -271,7 +307,7 @@ impl Selector for ListSelector {
 
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let title_h = self.title.as_deref().map_or(0, |t| title_wrapped_height(t, area.width));
-        let hint_h = u16::from(self.hints);
+        let hint_h = u16::from(self.hints || self.persist_hint);
         // L4/SYS-3. The envelope row order is `ExtensionSelectorComponent`'s, counted from its
         // constructor (`extension-selector.ts:44-75`): `DynamicBorder`(:44) · `Spacer`(:45) ·
         // title(:47) · `Spacer`(:49) · list(:61) · `Spacer`(:62) · hint(:63-73) · `Spacer`(:74) ·
@@ -290,10 +326,14 @@ impl Selector for ListSelector {
         // before the trailing chrome did, the exact inversion of upstream's order.
         let sp = u16::from(self.spacers);
         let sp_after_hint = sp.min(hint_h);
+        // The `Spacer(1)` pi puts between the list and the persist footer (`thinking-selector.ts:
+        // 93`). Present even when the envelope is otherwise flush, which is why it is `max`-ed in
+        // rather than folded into `spacers`.
+        let sp_before_hint = sp.max(u16::from(self.persist_hint));
         let body_h = self.list.rendered_height();
         let [top, _, title_area, _, body, _, hint, _, bottom] = stack_rows(
             area,
-            [1, sp, title_h, sp, body_h, sp, hint_h, sp_after_hint, 1],
+            [1, sp, title_h, sp, body_h, sp_before_hint, hint_h, sp_after_hint, 1],
         );
         frame.render_widget(border_rule(top.width, theme), top);
         if let Some(title) = &self.title {
@@ -334,6 +374,19 @@ impl Selector for ListSelector {
                 Paragraph::new(vec![self.hint_line(theme)]).style(theme.base_style()),
                 hint,
             );
+        } else if self.persist_hint {
+            // Pi's literal footer, `theme.fg("dim", …)` with its two leading spaces
+            // (`thinking-selector.ts:94`). Unconditional there — unlike the model picker's, which
+            // is guarded on the callback being wired (`model-selector.ts:138`) — but reached here
+            // only because `thinking()` opted in, which is that same guard expressed structurally.
+            frame.render_widget(
+                Paragraph::new(vec![Line::from(Span::styled(
+                    "  Enter to select \u{b7} Ctrl+S to set as default \u{b7} Esc to cancel",
+                    theme.dim_style(),
+                ))])
+                .style(theme.base_style()),
+                hint,
+            );
         }
         frame.render_widget(border_rule(bottom.width, theme), bottom);
     }
@@ -342,6 +395,20 @@ impl Selector for ListSelector {
         // Keep the hint row honest even for a selector constructed without `with_keymap`: adopt
         // whatever table actually routed this key.
         self.keymap = keymap.clone();
+        // Pi's second confirm key, checked BEFORE the keymap so a user-rebound `tui.select.*` can
+        // never shadow it: `matchesKey(keyData, "ctrl+s")` is a LITERAL upstream
+        // (`thinking-selector.ts:122`), not a binding id. Guarded on `persist_hint` so it only
+        // exists on the picker that opted in — every other list leaves `Ctrl+S` untouched, exactly
+        // as Pi does when no `onSelectAsDefault` was supplied.
+        if self.persist_hint
+            && key.code == KeyCode::Char('s')
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            return match self.values.get(self.list.selected()) {
+                Some(v) => SelectorOutcome::ConfirmDefault(v.clone()),
+                None => SelectorOutcome::Redraw,
+            };
+        }
         match keymap.action_for(key) {
             Some(SelectAction::Up) | Some(SelectAction::PageUp) => {
                 self.list.select_up();

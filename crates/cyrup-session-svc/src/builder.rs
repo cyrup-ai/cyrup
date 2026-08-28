@@ -1999,6 +1999,14 @@ fn resolve_model(
             settings_default()
         });
     }
+    // Pi `sdk.ts:239-247`: the per-model override sits between the restored/explicit level and the
+    // global default, so a launch on a model with its own recorded level starts there rather than
+    // at the one-size default. Only consulted when nothing more specific already decided.
+    let thinking = thinking.or_else(|| {
+        model.as_ref().and_then(|m| {
+            settings.effective().model_thinking_level(m.provider.as_str(), m.id.as_str())
+        })
+    });
     let thinking = thinking.unwrap_or_else(settings_default);
     // Pi sdk.ts:238-242: `if (!model) { thinkingLevel = "off"; } else { thinkingLevel =
     // clampThinkingLevel(model, thinkingLevel); }` — a modelless session has nothing to clamp

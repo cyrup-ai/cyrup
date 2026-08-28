@@ -1,6 +1,8 @@
 //! The merged, read-only effective view (R-07-001) and its typed getters, which apply the
 //! documented defaults in one place.
 
+use std::collections::BTreeMap;
+
 use cyrup_core::ModelThinkingLevel;
 use serde_json::Value;
 
@@ -56,6 +58,34 @@ impl EffectiveSettings {
         self.merged
             .get("defaultThinkingLevel")
             .and_then(|v| serde_json::from_value::<ModelThinkingLevel>(v.clone()).ok())
+    }
+
+    /// The per-model reasoning override for `provider/id` (Pi `getModelThinkingLevel`,
+    /// `settings-manager.ts:792-794`: `this.settings.modelThinkingLevels?.[`${provider}/${modelId}`]`).
+    ///
+    /// Takes priority over [`Self::default_thinking_level`] when switching TO that model
+    /// (`agent-session.ts:1832-1838`), which is what makes "reason hard on the big model, cheaply
+    /// on the small one" hold across a `Ctrl+P` cycle instead of resetting to one global level.
+    pub fn model_thinking_level(&self, provider: &str, id: &str) -> Option<ModelThinkingLevel> {
+        self.merged
+            .get("modelThinkingLevels")?
+            .as_object()?
+            .get(&format!("{provider}/{id}"))
+            .and_then(|v| serde_json::from_value::<ModelThinkingLevel>(v.clone()).ok())
+    }
+
+    /// Every per-model override, keyed `"provider/id"` (Pi `getAllModelThinkingLevels`,
+    /// `settings-manager.ts:796-798`) — the summary source for the `/settings` row.
+    pub fn all_model_thinking_levels(&self) -> BTreeMap<String, ModelThinkingLevel> {
+        self.merged
+            .get("modelThinkingLevels")
+            .and_then(|v| v.as_object().cloned())
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(k, v)| {
+                serde_json::from_value::<ModelThinkingLevel>(v).ok().map(|l| (k, l))
+            })
+            .collect()
     }
 
     pub fn hide_thinking_block(&self) -> bool {
