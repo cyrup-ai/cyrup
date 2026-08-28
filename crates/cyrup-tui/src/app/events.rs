@@ -15,7 +15,11 @@ impl<B: Backend> App<B> {
     /// payload. This entry point exists for the in-crate test call sites that hand it a borrowed
     /// literal; no production path reaches it, so no production path pays the clone.
     pub fn ingest_event(&mut self, ev: &AgentSessionEvent) {
-        self.ingest_event_rendered_owned(ev.clone(), None, crate::transcript::Rendered::None);
+        self.ingest_event_rendered_owned(
+            ev.clone(),
+            crate::transcript::Rendered::None,
+            crate::transcript::Rendered::None,
+        );
     }
 
     /// [`Self::ingest_event`], first giving the loaded extensions a chance to RENDER the event

@@ -24,19 +24,30 @@
 use crate::transport::protocol::{Message, SessionInfo};
 use crate::ui::{Theme, truncate_to_width, visible_width, wrap_text};
 
-/// The `intercom_message` inline card (pi `InlineMessageComponent`).
-#[derive(Clone, Debug)]
+/// The `intercom_message` inline card (pi `InlineMessageComponent`) AND the `details` payload pi
+/// passes alongside it (`InboundMessageEntry` / `deliveredEntry`, `index.ts:65-70`, passed at
+/// `:1216`, read back by the renderer at `:1817`).
+///
+/// The serde shape IS upstream's `deliveredEntry` — `{from, message, replyCommand?, bodyText?}` —
+/// plus cyrup's `collapsed`, which upstream's renderer derives per-frame from `!options.expanded`.
+/// One type serves the `append_entry` surface, the `inject_message` details, and the renderer that
+/// reads them back, so the three can never drift apart.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct InlineMessage {
     /// The sender's session info.
     pub from: SessionInfo,
     /// The received message.
     pub message: Message,
     /// The reply-hint command shown in the card, when the sender expects a reply and the hint is on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_command: Option<String>,
     /// The pre-formatted body (text + attachment text). `None` falls back to `message.content.text`
     /// (pi `this.bodyText || this.message.content.text`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body_text: Option<String>,
     /// Whether the card is collapsed (preview + expand hint) vs. fully expanded.
+    #[serde(default)]
     pub collapsed: bool,
 }
 
@@ -100,6 +111,21 @@ impl InlineMessage {
     /// Every returned line is exactly `width` columns wide (for `width >= 3`).
     #[must_use]
     pub fn render(&self, theme: &dyn Theme, width: usize) -> Vec<String> {
+        self.render_with(theme, width, self.collapsed, None)
+    }
+
+    /// [`Self::render`] with the collapsed flag and the wrap cache supplied by the caller.
+    ///
+    /// The live component resolves `collapsed` from `RenderCtx::expanded` on EVERY frame rather
+    /// than from the struct, which is what lets one pushed card open and close in place.
+    #[must_use]
+    pub fn render_with(
+        &self,
+        theme: &dyn Theme,
+        width: usize,
+        collapsed: bool,
+        caches: Option<&InlineMessageComponent>,
+    ) -> Vec<String> {
         let sender_name = self.sender_display();
         if width < 3 {
             return vec![truncate_to_width(&format!("From {sender_name}"), width)];
@@ -110,19 +136,30 @@ impl InlineMessage {
         // Header: ╭ From: sender (cwd) ───╮ (`v0.10.1 ui/inline-message.ts:45`; the `📨` was removed
         // by the v0.10.0 deslop, `633e782`).
         let header = format!(" From: {sender_name} ({}) ", self.from.cwd);
-        let header_src = if self.collapsed { format!("{header} Ctrl+O expands ") } else { header };
+        let header_src = if collapsed { format!("{header} Ctrl+O expands ") } else { header };
         let header_text = truncate_to_width(&header_src, body_width);
         let header_pad = body_width.saturating_sub(visible_width(&header_text));
-        lines.push(theme.fg("accent", &format!("╭{header_text}{}╮", "─".repeat(header_pad))));
+        // Two-tone, as upstream: `muted` borders around a `toolTitle` header. Colouring the whole
+        // line `accent` is invisible under `PlainTheme` and wrong under a real one.
+        lines.push(format!(
+            "{}{}{}",
+            theme.fg("muted", "╭"),
+            theme.fg("toolTitle", &header_text),
+            theme.fg("muted", &format!("{}╮", "─".repeat(header_pad))),
+        ));
 
-        if self.collapsed {
-            self.render_collapsed(theme, body_width, &mut lines);
+        if collapsed {
+            self.render_collapsed(theme, body_width, &mut lines, caches);
             return lines;
         }
 
-        // Body content lines.
-        for line in wrap_text(self.body(), body_width) {
-            lines.push(card_row(theme, body_width, &line));
+        // Body content lines, in the custom-message text role (upstream `theme.fg("text", line)`).
+        let wrapped = match caches {
+            Some(c) => c.wrapped(body_width),
+            None => wrap_text(self.body(), body_width),
+        };
+        for line in wrapped {
+            lines.push(card_row(theme, body_width, &theme.fg("text", &line)));
         }
 
         // Reply hint block.
@@ -154,16 +191,25 @@ impl InlineMessage {
             lines.push(card_row(theme, body_width, &reply));
         }
 
-        lines.push(theme.fg("accent", &format!("╰{}╯", "─".repeat(body_width))));
+        lines.push(theme.fg("muted", &format!("╰{}╯", "─".repeat(body_width))));
         lines
     }
 
     /// The collapsed card body: preview line + meta line + bottom border (pi lines 46-65). Always
     /// yields exactly 3 lines here (header pushed by the caller → 4 total).
-    fn render_collapsed(&self, theme: &dyn Theme, body_width: usize, lines: &mut Vec<String>) {
+    fn render_collapsed(
+        &self,
+        theme: &dyn Theme,
+        body_width: usize,
+        lines: &mut Vec<String>,
+        caches: Option<&InlineMessageComponent>,
+    ) {
         // Preview: the body with runs of whitespace collapsed to single spaces, trimmed.
-        let preview: String = self.body().split_whitespace().collect::<Vec<_>>().join(" ");
-        lines.push(card_row(theme, body_width, &preview));
+        let preview: String = match caches {
+            Some(c) => c.collapsed_preview(self.body()),
+            None => self.body().split_whitespace().collect::<Vec<_>>().join(" "),
+        };
+        lines.push(card_row(theme, body_width, &theme.fg("text", &preview)));
 
         let mut meta: Vec<String> = Vec::new();
         if let Some(rc) = &self.reply_command {
@@ -185,7 +231,7 @@ impl InlineMessage {
 
         let meta_line = theme.fg("dim", &format!(" {}", meta.join(" · ")));
         lines.push(card_row(theme, body_width, &meta_line));
-        lines.push(theme.fg("accent", &format!("╰{}╯", "─".repeat(body_width))));
+        lines.push(theme.fg("muted", &format!("╰{}╯", "─".repeat(body_width))));
     }
 }
 
@@ -282,10 +328,102 @@ fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
 
 /// A `│ … │` card row: truncate `inner` to `body_width`, right-pad with spaces, frame with borders
 /// (the whole row accent-colored, matching pi's `theme.fg("accent", …)` wrapping).
+impl InlineMessage {
+    /// Rebuild the card from the `details` payload `inject_message` carried (upstream
+    /// `InboundMessageEntry`, `index.ts:65-70`) — the exact object
+    /// [`crate::inbound::surface_incoming_message`] already writes.
+    ///
+    /// `None` when `from` or `message` will not deserialize, which is upstream's
+    /// `if (!details) return undefined`: a v0.9.2 peer, or a payload written before the seam
+    /// carried `details`, falls through to the pre-rendered card rather than drawing an empty box.
+    #[must_use]
+    pub fn from_details(details: &serde_json::Value) -> Option<Self> {
+        Some(Self {
+            from: serde_json::from_value(details.get("from")?.clone()).ok()?,
+            message: serde_json::from_value(details.get("message")?.clone()).ok()?,
+            reply_command: details.get("replyCommand").and_then(|v| v.as_str()).map(str::to_string),
+            body_text: details.get("bodyText").and_then(|v| v.as_str()).map(str::to_string),
+            // Resolved per render from `RenderCtx::expanded`, never stored.
+            collapsed: false,
+        })
+    }
+}
+
+/// The live component (pi `InlineMessageComponent`). Holds the immutable card plus the two caches
+/// upstream memoizes.
+///
+/// Theme styling is deliberately OUTSIDE both caches, so a live theme change repaints without
+/// invalidating either — upstream states this in its own comment.
+#[derive(Debug)]
+pub struct InlineMessageComponent {
+    card: InlineMessage,
+    /// pi `collapsedPreview` — the whitespace-collapsed body. Independent of width and theme.
+    collapsed_preview: std::sync::OnceLock<String>,
+    /// pi `wrappedBody: {width, lines}` — invalidated only when the body width changes, so a resize
+    /// re-wraps and a mere repaint does not.
+    wrapped_body: std::sync::Mutex<Option<(usize, Vec<String>)>>,
+}
+
+impl InlineMessageComponent {
+    /// Wrap a card as a live component.
+    #[must_use]
+    pub fn new(card: InlineMessage) -> Self {
+        Self {
+            card,
+            collapsed_preview: std::sync::OnceLock::new(),
+            wrapped_body: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// pi `this.wrappedBody?.width !== bodyWidth`.
+    fn wrapped(&self, body_width: usize) -> Vec<String> {
+        // The crate is no-panic by policy; a poisoned cache is recovered, never unwrapped.
+        let mut guard = self.wrapped_body.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.as_ref().is_none_or(|(w, _)| *w != body_width) {
+            *guard = Some((body_width, wrap_text(self.card.body(), body_width)));
+        }
+        guard.as_ref().map(|(_, lines)| lines.clone()).unwrap_or_default()
+    }
+
+    /// pi `collapsedPreview` — computed once, independent of width and theme.
+    fn collapsed_preview(&self, body: &str) -> String {
+        self.collapsed_preview
+            .get_or_init(|| body.split_whitespace().collect::<Vec<_>>().join(" "))
+            .clone()
+    }
+}
+
+impl cyrup_ext::RenderedComponent for InlineMessageComponent {
+    /// pi `render(width)`. `collapsed = !options.expanded` — the flag comes from the LIVE context on
+    /// every frame, never from the struct.
+    fn render(&self, ctx: &cyrup_ext::RenderCtx<'_>) -> Vec<String> {
+        self.card.render_with(&RenderThemeAdapter(ctx.theme), ctx.width, !ctx.expanded, Some(self))
+    }
+}
+
+/// Bridges the host's [`cyrup_ext::RenderTheme`] onto this module's [`Theme`]. The two have the same
+/// shape; the split exists because `cyrup-ext` must not depend on this crate's UI module.
+struct RenderThemeAdapter<'a>(&'a dyn cyrup_ext::RenderTheme);
+
+impl Theme for RenderThemeAdapter<'_> {
+    fn fg(&self, color: &str, text: &str) -> String {
+        self.0.fg(color, text)
+    }
+    fn bold(&self, text: &str) -> String {
+        self.0.bold(text)
+    }
+}
+
 fn card_row(theme: &dyn Theme, body_width: usize, inner: &str) -> String {
     let text = truncate_to_width(inner, body_width);
     let pad = body_width.saturating_sub(visible_width(&text));
-    theme.fg("accent", &format!("│{text}{}│", " ".repeat(pad)))
+    // Only the borders are coloured; the content passes through with whatever styling the caller
+    // already applied. Wrapping the whole row would overpaint it.
+    format!(
+        "{}{text}{}",
+        theme.fg("muted", "│"),
+        theme.fg("muted", &format!("{}│", " ".repeat(pad))),
+    )
 }
 
 #[cfg(test)]
@@ -403,6 +541,43 @@ mod tests {
         assert_eq!(
             md,
             "**From sender** (/tmp/project)\n\nTo reply, use the intercom tool: intercom({ action: \"reply\" })\n\n_id message-1 · sent 1970-01-01T00:00:00.000Z_\n\nbody here"
+        );
+    }
+
+    /// ICOM-029 — the `details` the seam carries and the `content` the model reads are built from
+    /// ONE card (`inbound.rs:238-239`: `card.content_markdown()` then `to_value(&card)`), so the two
+    /// must describe the same message. This pins that correspondence rather than the card's shape
+    /// alone: a future refactor that rebuilt `details` from a second source would still render a
+    /// plausible card while the renderer and the model disagreed about what arrived.
+    #[test]
+    fn the_details_and_the_content_markdown_describe_the_same_message() {
+        let mut msg = message("the body as sent");
+        msg.injected_at = Some(1_609_459_200_003u64.into());
+        let card = InlineMessage {
+            body_text: Some("the body as sent".to_string()),
+            ..InlineMessage::new(from(), msg)
+        };
+
+        let content = card.content_markdown();
+        let details = serde_json::to_value(&card).expect("the card serializes");
+        let round_tripped =
+            InlineMessage::from_details(&details).expect("details deserialize as the inline card");
+
+        // `bodyText` is the string the markdown's body was rendered from — not a re-derived twin.
+        let body = round_tripped.body_text.as_deref().expect("the card carries bodyText");
+        assert!(
+            content.ends_with(body),
+            "the content's body IS the card's bodyText: content={content:?} bodyText={body:?}"
+        );
+
+        // The stamped `injectedAt` survives into `details` and is the one the metadata line rendered.
+        assert_eq!(
+            round_tripped.message.injected_at, card.message.injected_at,
+            "the injectedAt stamp survives serialization"
+        );
+        assert!(
+            content.contains(&round_tripped.message.id),
+            "the id in details is the id the metadata line published: {content:?}"
         );
     }
 

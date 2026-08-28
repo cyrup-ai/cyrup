@@ -136,6 +136,7 @@ async fn a_wasm_guests_message_renderer_draws_on_screen() {
         message: cyrup_agent::AgentMessage::Custom {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
+            details: None,
             timestamp: None,
         },
     };

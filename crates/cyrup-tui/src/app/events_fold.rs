@@ -20,7 +20,7 @@ impl<B: Backend> App<B> {
     pub(crate) fn ingest_event_rendered_owned(
         &mut self,
         ev: AgentSessionEvent,
-        rendered: Option<String>,
+        rendered: crate::transcript::Rendered,
         entry_rendered: crate::transcript::Rendered,
     ) {
         // The arms that need the WHOLE event again (the serde projections in `event_extract.rs`)
@@ -134,10 +134,9 @@ impl<B: Backend> App<B> {
                     // `getMessageRenderer(...) === undefined` (`interactive-mode.ts:3326`), which
                     // draws the default box. A renderer that FAULTED also lands here, matching
                     // `custom-message.ts:82-84`'s `catch { /* Fall through to default rendering */ }`.
-                    let rendered = rendered
-                        .map(crate::transcript::Rendered::Text)
-                        .unwrap_or(crate::transcript::Rendered::None);
-                    self.state.transcript.push_custom_message_rendered(kind, body, rendered);
+                    // Carried through as the host produced it: `Rendered::Live` must reach the
+                    // entry intact so `entry_lines` can re-render it per frame.
+                    self.state.transcript.push_custom_message_rendered(kind, body, rendered.clone());
                 }
             }
             AgentSessionEvent::MessageUpdate { assistant_message_event, .. } => {
@@ -176,7 +175,9 @@ impl<B: Backend> App<B> {
                     tool_name,
                     Some(tool_call_id.as_str().to_string()),
                     args,
-                    rendered,
+                    // A tool ROW is a string surface: it has no live-component tier, so the
+                    // outcome is flattened here rather than carried.
+                    rendered.clone().into_text(),
                 );
                 if let Some(preview) = preview {
                     self.state.transcript.set_edit_preview(Some(tool_call_id.as_str()), preview);
@@ -197,7 +198,7 @@ impl<B: Backend> App<B> {
                     Some(tool_call_id.as_str()),
                     is_error,
                     Some(result),
-                    rendered,
+                    rendered.clone().into_text(),
                 );
                 // Progressively flush finished tools to native scrollback mid-turn so the inline
                 // viewport holds only the running tail, not the whole turn's tool stack (the

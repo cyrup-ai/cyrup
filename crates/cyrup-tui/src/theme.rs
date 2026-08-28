@@ -1765,3 +1765,130 @@ mod tests {
         assert_eq!(ansi256_to_rgb(244), (128, 128, 128));
     }
 }
+
+/// A [`cyrup_ext::RenderTheme`] over the live [`UiTheme`], so a native renderer's component can
+/// colour its own output in the user's palette (Pi hands its renderers the `Theme` directly).
+///
+/// The bridge is SGR text rather than a ratatui `Style`, because a component returns
+/// `Vec<String>` — Pi's `Component.render(width): string[]`. [`crate::ansi::sgr_line`] converts each
+/// row back into styled spans at draw time, so the round trip is lossless for the codes emitted here.
+pub struct UiThemeRoles<'a> {
+    theme: &'a UiTheme,
+}
+
+impl<'a> UiThemeRoles<'a> {
+    /// Borrow a live theme as a renderer-facing palette.
+    #[must_use]
+    pub fn new(theme: &'a UiTheme) -> Self {
+        Self { theme }
+    }
+
+    /// Wrap `text` in the truecolor SGR pair for `style`'s foreground, plus bold/dim when set.
+    /// A style with no foreground and no modifier returns `text` untouched, so an unstyled role
+    /// costs no escapes at all.
+    fn paint(style: Style, text: &str) -> String {
+        let mut open = String::new();
+        if style.add_modifier.contains(Modifier::BOLD) {
+            open.push_str("\u{1B}[1m");
+        }
+        if style.add_modifier.contains(Modifier::DIM) {
+            open.push_str("\u{1B}[2m");
+        }
+        if let Some(Color::Rgb(r, g, b)) = style.fg {
+            open.push_str(&format!("\u{1B}[38;2;{r};{g};{b}m"));
+        } else if let Some(c) = style.fg {
+            // A named/indexed colour is resolved to its RGB so the single `38;2` form is the only
+            // one `sgr_line` has to understand.
+            let (r, g, b) = named_color_rgb(c);
+            open.push_str(&format!("\u{1B}[38;2;{r};{g};{b}m"));
+        }
+        if open.is_empty() {
+            return text.to_string();
+        }
+        // One reset closes every attribute this call opened, matching Pi's `theme.fg` wrapping.
+        format!("{open}{text}\u{1B}[0m")
+    }
+}
+
+impl cyrup_ext::RenderTheme for UiThemeRoles<'_> {
+    /// Pi `theme.fg(color, text)`. An unknown role returns `text` unchanged — upstream's `Theme.fg`
+    /// never throws and never invents a colour.
+    fn fg(&self, role: &str, text: &str) -> String {
+        let style = match role {
+            "muted" => self.theme.muted_style(),
+            "toolTitle" => self.theme.tool_title_style(),
+            "text" => self.theme.custom_message_text_style(),
+            "dim" => self.theme.dim_style(),
+            "accent" => self.theme.accent_style(),
+            "error" => self.theme.error_style(),
+            _ => return text.to_string(),
+        };
+        Self::paint(style, text)
+    }
+
+    /// Pi `theme.bold(text)`.
+    fn bold(&self, text: &str) -> String {
+        format!("\u{1B}[1m{text}\u{1B}[22m")
+    }
+}
+
+/// Resolve a ratatui named/indexed colour to RGB so [`UiThemeRoles::paint`] only ever emits the
+/// truecolor form. The 16 ANSI names use the widely-shared xterm defaults; an indexed colour walks
+/// the standard 6×6×6 cube and greyscale ramp.
+fn named_color_rgb(c: Color) -> (u8, u8, u8) {
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => (0, 0, 0),
+        Color::Red => (205, 0, 0),
+        Color::Green => (0, 205, 0),
+        Color::Yellow => (205, 205, 0),
+        Color::Blue => (0, 0, 238),
+        Color::Magenta => (205, 0, 205),
+        Color::Cyan => (0, 205, 205),
+        Color::Gray => (229, 229, 229),
+        Color::DarkGray => (127, 127, 127),
+        Color::LightRed => (255, 0, 0),
+        Color::LightGreen => (0, 255, 0),
+        Color::LightYellow => (255, 255, 0),
+        Color::LightBlue => (92, 92, 255),
+        Color::LightMagenta => (255, 0, 255),
+        Color::LightCyan => (0, 255, 255),
+        Color::White => (255, 255, 255),
+        Color::Indexed(i) => indexed_rgb(i),
+        Color::Reset => (0, 0, 0),
+    }
+}
+
+/// The xterm-256 palette: 0-15 map to the named colours, 16-231 are the 6×6×6 cube, 232-255 the
+/// greyscale ramp.
+fn indexed_rgb(i: u8) -> (u8, u8, u8) {
+    const LEVELS: [u8; 6] = [0, 95, 135, 175, 215, 255];
+    match i {
+        0..=15 => named_color_rgb(match i {
+            0 => Color::Black,
+            1 => Color::Red,
+            2 => Color::Green,
+            3 => Color::Yellow,
+            4 => Color::Blue,
+            5 => Color::Magenta,
+            6 => Color::Cyan,
+            7 => Color::Gray,
+            8 => Color::DarkGray,
+            9 => Color::LightRed,
+            10 => Color::LightGreen,
+            11 => Color::LightYellow,
+            12 => Color::LightBlue,
+            13 => Color::LightMagenta,
+            14 => Color::LightCyan,
+            _ => Color::White,
+        }),
+        16..=231 => {
+            let n = i - 16;
+            (LEVELS[(n / 36) as usize], LEVELS[((n % 36) / 6) as usize], LEVELS[(n % 6) as usize])
+        }
+        232..=255 => {
+            let v = 8 + (i - 232) * 10;
+            (v, v, v)
+        }
+    }
+}

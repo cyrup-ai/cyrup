@@ -15,6 +15,43 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+/// A live component a NATIVE renderer handed back — Pi's `Component`
+/// (`packages/tui/src/index.ts`), whose `render(width)` the host calls on EVERY frame.
+///
+/// Native-only by construction: a component cannot cross the WIT boundary to a WASM guest, and does
+/// not need to — a compiled-in built-in already gets its own hooks for exactly this reason.
+pub trait RenderedComponent: std::fmt::Debug + Send + Sync {
+    /// Pi `Component.render(width): string[]`. Returns one string per display row.
+    ///
+    /// The caller is free to invoke this on EVERY frame, so it must be cheap and MUST NOT panic;
+    /// a panic is contained by the host and drawn as the renderer-failed box.
+    fn render(&self, ctx: &RenderCtx<'_>) -> Vec<String>;
+}
+
+/// The render context Pi passes as `(width, options, theme)` (`MessageRenderer`,
+/// `extensions/types.ts:1284`). The typed counterpart of the JSON `MarkdownTransformContext` bag,
+/// which already carries `availableWidth`; typed here because a component is native-only.
+pub struct RenderCtx<'a> {
+    /// The live terminal content width, in display columns.
+    pub width: usize,
+    /// Pi `options.expanded` — the live expand-toggle flag, resolved per frame and NEVER frozen.
+    pub expanded: bool,
+    /// Pi `theme`. Read on every render, so a live theme change repaints without invalidating
+    /// anything the component has cached.
+    pub theme: &'a dyn RenderTheme,
+}
+
+/// Pi's `Theme`, narrowed to what a renderer actually calls. Implemented host-side over the live
+/// palette.
+pub trait RenderTheme: Send + Sync {
+    /// Pi `theme.fg(color, text)` — wrap `text` in the styling for the named role (`muted`,
+    /// `toolTitle`, `text`, `dim`, `accent`, `error`, …). An unknown role returns `text` unchanged;
+    /// upstream's `Theme.fg` never throws.
+    fn fg(&self, role: &str, text: &str) -> String;
+    /// Pi `theme.bold(text)`.
+    fn bold(&self, text: &str) -> String;
+}
+
 /// Which context tier a handler runs in (arch-08 §6.3, the deadlock rule). Session-mutating control
 /// ops are legal only from [`CtxTier::Command`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,6 +702,29 @@ pub trait NativeExtension: Send + Sync {
         _custom_type: &str,
         _entry: &serde_json::Value,
     ) -> Option<serde_json::Value> {
+        None
+    }
+
+    /// Resolve a LIVE component for a custom MESSAGE or ENTRY this extension registered a renderer
+    /// for (Pi `registerMessageRenderer` returning a `Component`, `pi-intercom/index.ts:1816-1820`).
+    /// `key` is the custom type; `payload` is the serialized message (or entry).
+    ///
+    /// This is the tier the string-returning [`Self::render_call`] / [`Self::render_entry`] cannot
+    /// express: those are invoked ONCE, at fold time, with no width, no theme and no expansion, so
+    /// their output is frozen at whatever the terminal happened to be when the message arrived. A
+    /// component is resolved once and re-rendered per frame, which is what makes a resize re-wrap
+    /// and an expand toggle open a card in place.
+    ///
+    /// `None` — upstream's `return undefined` for a payload carrying no `details` — falls through to
+    /// the string hooks and then to the host's own framing. Consulted BEFORE them, exactly as the
+    /// native tool-renderer fast tier is consulted before the registry dispatch.
+    ///
+    /// Sync, and a PANIC is contained by the host, for the same reasons as [`Self::render_call`].
+    fn render_live(
+        &self,
+        _key: &str,
+        _payload: &serde_json::Value,
+    ) -> Option<std::sync::Arc<dyn RenderedComponent>> {
         None
     }
 

@@ -422,6 +422,9 @@ pub(crate) fn raw_message_to_agent(m: &cyrup_session::agent_message::AgentMessag
         Raw::Custom(c) => AgentMessage::Custom {
             kind: c.custom_type.clone(),
             payload: c.content.clone(),
+            // The persisted entry's `details` survives the resume / compaction re-seed round trip,
+            // so a card drawn on the live turn is drawn identically on `--resume`.
+            details: c.details.clone(),
             timestamp: Some(c.timestamp),
         },
         // `serde_json::to_value` on the raw union emits pi's exact wire object with `role` first

@@ -21,6 +21,7 @@ mod dispose_invalidates;
 mod fork_non_persisted;
 mod get_commands_source_info;
 mod fork_parent_and_unsaved_guard;
+mod inject_message_details;
 mod install_noop;
 mod late_seams;
 mod integration;

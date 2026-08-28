@@ -157,10 +157,12 @@ impl<B: Backend> App<B> {
                 continue;
             }
             let payload = serde_json::to_value(message).unwrap_or(serde_json::Value::Null);
-            if let Some(text) =
-                extension_render_message(ext_host, &c.custom_type, &payload).await
-            {
-                rendered.insert(i, crate::transcript::Rendered::Text(text));
+            // Carried WHOLE. `has_content()` is the "did a renderer claim this" question the old
+            // `if let Some(text)` was asking, and it stays true for a LIVE component, which
+            // `Rendered::into_text()` would have dropped.
+            let r = extension_render_message(ext_host, &c.custom_type, &payload).await;
+            if r.has_content() {
+                rendered.insert(i, r);
             }
         }
         self.replay_session_rendered(messages, &rendered);

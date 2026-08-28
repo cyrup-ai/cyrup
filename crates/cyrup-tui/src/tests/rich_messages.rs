@@ -92,6 +92,7 @@ fn custom_message_event_renders_a_labeled_block() {
     let message = AgentMessage::Custom {
         kind: "review".to_string(),
         payload: serde_json::json!("Looks good to ship."),
+        details: None,
         timestamp: None,
     };
     app.ingest_event(&AgentSessionEvent::MessageEnd { message });
@@ -107,6 +108,7 @@ fn custom_message_event_handles_array_content() {
     let message = AgentMessage::Custom {
         kind: "note".to_string(),
         payload: serde_json::json!([{ "type": "text", "text": "part one " }, { "type": "text", "text": "part two" }]),
+        details: None,
         timestamp: None,
     };
     app.ingest_event(&AgentSessionEvent::MessageEnd { message });

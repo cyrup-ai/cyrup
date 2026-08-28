@@ -453,6 +453,7 @@ impl cyrup_ext::HostServices for OwnedServices {
             content: &str,
             custom_type: Option<&str>,
             display: bool,
+            details: Option<&serde_json::Value>,
             trigger_turn: bool
         ) -> Result<(), String> => Err(Self::inert_reason(&self.owner));
         fn emit_event(&self, topic: &str, payload: &serde_json::Value) => ();

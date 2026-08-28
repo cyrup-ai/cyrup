@@ -169,18 +169,19 @@ impl EventSubscriber for SvcSubscriber {
             if let Some(core) = effective {
                 // Append the finalized (possibly guest-replaced) message to the session tree.
                 let _ = self.manager.lock().await.append_message(core);
-            } else if let AgentMessage::Custom { kind, payload, .. } = message {
-                // Custom messages (queued via `send_custom_message` deliver_as steer/followUp and
-                // pulled mid-run) finalize as a `message_end` here. Pi persists them as a
-                // CustomMessageEntry (agent-session.ts:546-553 `appendCustomMessageEntry`); without
-                // this they would be silently dropped by the `Custom -> None` core mapping.
-                // `display`/`details` are not carried on `AgentMessage::Custom`, so persist with the
-                // bash-message convention (display=true, no details).
+            } else if let AgentMessage::Custom { kind, payload, details, .. } = message {
+                // Custom messages (a `trigger_turn` run input, or one queued via
+                // `send_custom_message` deliver_as steer/followUp and pulled mid-run) finalize as a
+                // `message_end` here. Pi persists them as a CustomMessageEntry
+                // (agent-session.ts:546-553 `appendCustomMessageEntry`); without this they would be
+                // silently dropped by the `Custom -> None` core mapping. `details` now rides on the
+                // message, so the persisted entry matches the live one; `display` still follows the
+                // bash-message convention (`true`), which is what every injector passes.
                 let _ = self
                     .manager
                     .lock()
                     .await
-                    .append_custom_message(kind, payload.clone(), true, None);
+                    .append_custom_message(kind, payload.clone(), true, details.clone());
             }
             // `_handleAgentEvent` tail (Pi :562-577): track the last assistant + reset retry/overflow.
             if let (Some(s), AgentMessage::Assistant(a)) = (&session, message) {

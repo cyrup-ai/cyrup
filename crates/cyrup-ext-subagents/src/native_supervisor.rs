@@ -920,6 +920,8 @@ impl NativeSupervisorChannel {
                     &content,
                     Some(SUPERVISOR_REQUEST_MESSAGE_TYPE),
                     true,
+                    // The request is carried as rendered text; there is no structured record here.
+                    None,
                     // `{ triggerTurn: true }` (`:687` @v0.43.0) — a supervisor request is exactly the
                     // case where the orchestrator must act, so it starts a turn rather than sitting
                     // in the transcript until the human happens to type.

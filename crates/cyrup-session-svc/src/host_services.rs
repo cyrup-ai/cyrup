@@ -475,7 +475,10 @@ pub(crate) fn tree_node_to_json(node: &cyrup_session::manager::TreeNode) -> Valu
 /// append/turn on the live session. Closes R-SA-101 (cyrup-ext-subagents background completion).
 ///
 /// [`HostServices::inject_message`]: cyrup_ext::host::HostServices::inject_message
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// `Eq` is deliberately absent: `details` is a [`serde_json::Value`], which is `PartialEq` but not
+/// `Eq` (floats). Nothing compares these for total equality.
+#[derive(Clone, Debug, PartialEq)]
 pub struct InjectMessage {
     /// The message body (Pi `content`).
     pub content: String,
@@ -484,6 +487,10 @@ pub struct InjectMessage {
     pub custom_type: Option<String>,
     /// Whether the message is surfaced to the user (Pi `display`).
     pub display: bool,
+    /// Pi's `details` (`pi.sendMessage({… details})`): persisted on the `CustomMessage` entry and
+    /// carried on the live message so a registered renderer can rebuild its card from structure.
+    /// `None` for a caller with no structured payload — pi's own omitted key.
+    pub details: Option<serde_json::Value>,
     /// Whether to re-enter the agent turn loop over the injected message (Pi `{ triggerTurn: true }`).
     pub trigger_turn: bool,
 }
@@ -1314,6 +1321,7 @@ impl HostServices for LiveHostServices {
         content: &str,
         custom_type: Option<&str>,
         display: bool,
+        details: Option<&serde_json::Value>,
         trigger_turn: bool,
     ) -> Result<(), String> {
         // Forward onto the late-bound inject sink (bound by `AgentSession::into_shared`), which spawns
@@ -1328,6 +1336,7 @@ impl HostServices for LiveHostServices {
             content: content.to_string(),
             custom_type: custom_type.map(str::to_string),
             display,
+            details: details.cloned(),
             trigger_turn,
         })
     }

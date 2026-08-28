@@ -321,6 +321,7 @@ fn the_llm_boundary_renders_pi_s_declaration_merged_roles() {
     let custom = cyrup_agent::AgentMessage::Custom {
         kind: "ext.note".into(),
         payload: serde_json::Value::String("remember the deploy freeze".into()),
+        details: None,
         timestamp: Some(11),
     };
     // The pre-fix boundary. Kept as an explicit witness of what changed.
@@ -402,6 +403,7 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
     let live = Agent::Custom {
         kind: "bashExecution".into(),
         payload: body(false),
+        details: None,
         timestamp: Some(7),
     };
     let live_out = coding_agent_convert_to_llm(std::slice::from_ref(&live));
@@ -421,6 +423,7 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
     let excluded = Agent::Custom {
         kind: "bashExecution".into(),
         payload: body(true),
+        details: None,
         timestamp: Some(7),
     };
     assert!(
@@ -433,6 +436,7 @@ fn a_live_bash_execution_renders_like_a_reseeded_one_and_honours_exclude_from_co
     let ext = Agent::Custom {
         kind: "ext.note".into(),
         payload: serde_json::Value::String("keep me".into()),
+        details: None,
         timestamp: Some(8),
     };
     let out = coding_agent_convert_to_llm(std::slice::from_ref(&ext));
@@ -486,7 +490,7 @@ fn raw_message_to_agent_preserves_every_pi_role() {
         timestamp: 2,
     });
     match crate::event::raw_message_to_agent(&custom) {
-        Agent::Custom { kind, payload, timestamp } => {
+        Agent::Custom { kind, payload, timestamp, .. } => {
             assert_eq!(kind, "ext.note");
             assert_eq!(payload, serde_json::Value::String("hi".into()));
             assert_eq!(timestamp, Some(2));

@@ -31,6 +31,14 @@ pub enum AgentMessage {
     Custom {
         kind: String,
         payload: Value,
+        /// Pi's `CustomMessage.details` (`messages.ts:46-53`) — the opaque structured payload a
+        /// registered message renderer reads (`getMessageRenderer(customType)(message, …)`).
+        ///
+        /// Carried HERE, and not only on the persisted `CustomMessage` entry, because the LIVE
+        /// renderer surface is this message serialized off `message_end`
+        /// (`cyrup-tui/src/app/extension_render.rs` takes `to_value(ev)?["message"]`). Without it an
+        /// injected card could be drawn on `--resume` and not on the turn that produced it.
+        details: Option<Value>,
         timestamp: Option<i64>,
     },
     /// SESS-043 — one of pi's declaration-merged coding-agent roles that this crate has no type
@@ -95,7 +103,15 @@ impl serde::Serialize for AgentMessage {
         enum TaggedNonAssistant<'a> {
             User { content: &'a Vec<Content>, timestamp: &'a Option<i64> },
             ToolResult(&'a ToolResultMessage),
-            Custom { kind: &'a str, payload: &'a Value, timestamp: &'a Option<i64> },
+            Custom {
+                kind: &'a str,
+                payload: &'a Value,
+                /// Emitted only when present, so every message written before `details` existed
+                /// serializes byte-identically.
+                #[serde(skip_serializing_if = "Option::is_none")]
+                details: &'a Option<Value>,
+                timestamp: &'a Option<i64>,
+            },
         }
 
         match self {
@@ -105,8 +121,8 @@ impl serde::Serialize for AgentMessage {
                 TaggedNonAssistant::User { content, timestamp }.serialize(serializer)
             }
             AgentMessage::ToolResult(m) => TaggedNonAssistant::ToolResult(m).serialize(serializer),
-            AgentMessage::Custom { kind, payload, timestamp } => {
-                TaggedNonAssistant::Custom { kind, payload, timestamp }.serialize(serializer)
+            AgentMessage::Custom { kind, payload, details, timestamp } => {
+                TaggedNonAssistant::Custom { kind, payload, details, timestamp }.serialize(serializer)
             }
             // SESS-043 — the payload IS the pi wire object (`role` included), so it is emitted as
             // it stands; `role` is held out separately only so this crate can classify without
@@ -144,6 +160,8 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
                 kind: String,
                 payload: Value,
                 #[serde(default)]
+                details: Option<Value>,
+                #[serde(default)]
                 timestamp: Option<i64>,
             },
         }
@@ -163,8 +181,8 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
             Typed::User { content, timestamp } => AgentMessage::User { content, timestamp },
             Typed::Assistant(a) => AgentMessage::Assistant(a),
             Typed::ToolResult(t) => AgentMessage::ToolResult(t),
-            Typed::Custom { kind, payload, timestamp } => {
-                AgentMessage::Custom { kind, payload, timestamp }
+            Typed::Custom { kind, payload, details, timestamp } => {
+                AgentMessage::Custom { kind, payload, details, timestamp }
             }
         })
     }

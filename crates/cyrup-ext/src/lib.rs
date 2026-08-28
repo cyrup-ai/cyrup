@@ -184,7 +184,7 @@ pub use loader::{
 pub use manifest::{Capabilities, ExtensionManifest, FsGrant, HOST_WORLD, MANIFEST_FILE};
 pub use native::{
     CtxTier, ExtMode, HostCtx, HostCtxRich, HostCtxSource, HumanWaitGate, HumanWaitGuard, InitApi,
-    LateRegistrar, NativeExtension, NativeHandle,
+    LateRegistrar, NativeExtension, NativeHandle, RenderCtx, RenderTheme, RenderedComponent,
 };
 /// EXT-060: the `HostServices` -> [`native::HostCtxSource`] adapter is only meaningful when the
 /// capability backend exists, but the TRAIT it feeds is unconditional.

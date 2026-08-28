@@ -460,7 +460,7 @@ impl SteeringInbox {
                 .clone()
                 .is_some_and(|services| {
                     services
-                        .inject_message(&format_steer_message(&entry.request), None, true, false)
+                        .inject_message(&format_steer_message(&entry.request), None, true, None, false)
                         .is_ok()
                 });
             if delivered {
@@ -660,7 +660,7 @@ impl SteeringInbox {
             // custom (non-LLM) message the model never sees. `display: true` so the operator
             // watching the child's transcript sees the guidance arrive; `trigger_turn: true`
             // so an IDLE child (between turns) actually acts on it instead of parking it.
-            match services.inject_message(&format_steer_message(request), None, true, true) {
+            match services.inject_message(&format_steer_message(request), None, true, None, true) {
                 Ok(()) => {
                     // SUBA-049 / pi `:413`. Upstream can only report this once its own `input`
                     // event correlates the injected text back to the request; cyrup's
@@ -3397,6 +3397,7 @@ mod tests {
         AgentMessage::Custom {
             kind: kind.to_string(),
             payload: serde_json::json!({}),
+            details: None,
             timestamp: None,
         }
     }

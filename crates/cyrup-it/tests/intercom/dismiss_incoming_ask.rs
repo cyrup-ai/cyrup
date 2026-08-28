@@ -75,6 +75,7 @@ impl HostServices for IdleControlledHost {
         content: &str,
         _custom_type: Option<&str>,
         _display: bool,
+        _details: Option<&serde_json::Value>,
         _trigger_turn: bool,
     ) -> Result<(), String> {
         self.injected.lock().unwrap_or_else(|e| e.into_inner()).push(content.to_string());

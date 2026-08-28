@@ -194,6 +194,8 @@ impl ControlNoticeSink for HostServicesControlNoticeSink {
                 &content,
                 Some(SUBAGENT_CONTROL_MESSAGE_TYPE),
                 true,
+                // A `ControlNotice` is text only — pi's own omitted key.
+                None,
                 trigger_turn,
             );
         }));

@@ -190,6 +190,24 @@ pub(crate) fn entry_lines(
                 out.extend(text.split('\n').map(|l| Line::raw(l.to_string())));
                 out
             }
+            // The component is re-rendered on EVERY frame at the LIVE width, theme and expansion —
+            // the same X14 rule `Entry::BranchSummary` and `Entry::Tool` follow. Upstream re-invokes
+            // `component.render(width)` per paint, which is what makes a resize re-wrap and the
+            // expand toggle open a card that was pushed collapsed.
+            Rendered::Live(component) => {
+                let roles = crate::theme::UiThemeRoles::new(theme);
+                let ctx = cyrup_ext::RenderCtx {
+                    width: width.saturating_sub(output_pad * 2).max(1),
+                    expanded: images.tools_expanded,
+                    theme: &roles,
+                };
+                let rows = component.render(&ctx);
+                // `custom-message.ts:33` — the constructor `Spacer(1)`, on every arm.
+                let mut out = vec![Line::default()];
+                out.extend(rows.iter().map(|r| crate::ansi::sgr_line(r)));
+                pad_lines(&mut out, output_pad);
+                out
+            }
             // A bracketed extension-type label + the markdown body (`custom-message.ts`).
             // `custom-message.ts:33`'s constructor `Spacer(1)` — unconditional.
             Rendered::None => labeled_message_lines(label, "", body, true, true, theme, width),

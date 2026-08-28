@@ -195,18 +195,23 @@ pub fn register_main_watchdog(
                 return;
             };
             let message = create_watchdog_warning_message_from_details(details, true);
+            // The structured record this message was rendered FROM, carried as pi's `details` so a
+            // renderer reads structure instead of re-parsing `content`.
+            let details_json = serde_json::to_value(&message.details).ok();
             // `:386-388` — `{deliverAs:"steer"}` re-enters the live turn loop.
             let _ = services.inject_message(
                 &message.content,
                 Some(SUBAGENT_WATCHDOG_WARNING_TYPE),
                 message.display,
+                details_json.as_ref(),
                 delivery == Some(WatchdogDelivery::Steer),
             );
         })),
         send_user_message: Some(Arc::new(move |message: &str| {
             let services = user_message_services().ok_or_else(|| "no live session".to_string())?;
             // `:389` — `pi.sendUserMessage(message)`: a plain user message, which always triggers.
-            services.inject_message(message, None, true, true)
+            // `sendUserMessage` takes a bare string in pi; there is no `details` to carry.
+            services.inject_message(message, None, true, None, true)
         })),
         review_changes_only: true,
         // The two real collectors, replacing the runtime's `UnavailableLspDiagnostics` /
