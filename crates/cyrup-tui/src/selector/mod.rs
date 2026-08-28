@@ -50,11 +50,63 @@ pub const INPUT_PROMPT: &str = "> ";
 /// The complete rendered `Input` line: [`INPUT_PROMPT`] followed by the value + block caret
 /// ([`search_input_spans`]). The single composition point for every search box, so a dialog cannot
 /// drift into a prompt of its own again (S31).
-pub fn input_line_spans(value: &str, cursor: usize, theme: &UiTheme) -> Vec<Span<'static>> {
+///
+/// `width` is the **full** slot width; the value gets `width - prompt.length`, pi's
+/// `availableWidth` (`input.ts:381`), and an `availableWidth <= 0` renders the bare prompt
+/// (`:383-385`).
+pub fn input_line_spans(value: &str, cursor: usize, width: u16, theme: &UiTheme) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(4);
     spans.push(Span::styled(INPUT_PROMPT, theme.base_style()));
-    spans.extend(search_input_spans(value, cursor, theme));
+    let available = usize::from(width).saturating_sub(INPUT_PROMPT.len());
+    if available == 0 {
+        return spans;
+    }
+    spans.extend(search_input_spans(value, cursor, available, theme));
     spans
+}
+
+/// The horizontally-scrolled window of an `Input` value — a statement-for-statement port of
+/// `Input.render`'s scroll block (`pi/packages/tui/src/components/input.ts:387-422` @v0.83.0),
+/// returning `(visible text, caret byte offset within that text)`.
+///
+/// Nothing is cached between frames: pi recomputes `startCol` from the cursor and the field width on
+/// every render, so a resize can never desynchronise a stored offset (there is none to store).
+///
+/// * `totalWidth < availableWidth` — everything fits, verbatim value, caret where it was (`:391`;
+///   the comparison is STRICT so the last column stays free for an end-of-value caret).
+/// * otherwise `scrollWidth` is the field, minus one column reserved for a caret sitting at the very
+///   end (`:397`), and `startCol` is one of three branches (`:404-413`): 0 when the caret is in the
+///   first half-window, `totalWidth - scrollWidth` when it is in the last, else `cursorCol -
+///   halfWidth` (caret centred).
+fn input_window(value: &str, cursor: usize, available: usize) -> (String, usize) {
+    let total = crate::text_width::str_width(value);
+    // `if (totalWidth < availableWidth) { visibleText = this.value; }` (`:391-393`).
+    if total < available {
+        return (value.to_string(), cursor);
+    }
+    // `const scrollWidth = this.cursor === this.value.length ? availableWidth - 1 : availableWidth`
+    // (`:397`).
+    let scroll =
+        if cursor >= value.len() { available.saturating_sub(1) } else { available };
+    // The `else` of `if (scrollWidth > 0)` (`:418-421`): nothing fits, no caret.
+    if scroll == 0 {
+        return (String::new(), 0);
+    }
+    let cursor_col = crate::text_width::str_width(value.get(..cursor).unwrap_or(""));
+    let half = scroll / 2;
+    let start_col = if cursor_col < half {
+        0
+    } else if cursor_col > total.saturating_sub(half) {
+        total.saturating_sub(scroll)
+    } else {
+        cursor_col.saturating_sub(half)
+    };
+    let visible = crate::text_width::slice_by_column(value, start_col, scroll, true);
+    // `cursorDisplay = beforeCursor.length` (`:416-417`) — the caret's offset *inside the window*.
+    let before =
+        crate::text_width::slice_by_column(value, start_col, cursor_col.saturating_sub(start_col), true);
+    let caret = before.len();
+    (visible, caret)
 }
 
 /// Render an embedded selector **search `Input`** with a visible block cursor at the byte offset
@@ -63,9 +115,23 @@ pub fn input_line_spans(value: &str, cursor: usize, theme: &UiTheme) -> Vec<Span
 /// the cursor offset but never drew it, leaving the search box caret-less. The character under the
 /// caret (or a trailing space when the cursor is at the end) is drawn reversed over the base style;
 /// text before/after keeps the base style. Shared by the model / session / scoped search boxes.
-pub fn search_input_spans(query: &str, cursor: usize, theme: &UiTheme) -> Vec<Span<'static>> {
+///
+/// `available` is the column budget for the VALUE (the slot width less [`INPUT_PROMPT`]); a value
+/// wider than that is windowed by [`input_window`] with the caret kept inside, rather than clipped
+/// by the wrapping `Paragraph`.
+pub fn search_input_spans(
+    query: &str,
+    cursor: usize,
+    available: usize,
+    theme: &UiTheme,
+) -> Vec<Span<'static>> {
     let cursor = cursor.min(query.len());
     // Snap to a char boundary so slicing never panics on a multi-byte caret position.
+    let cursor = (0..=cursor).rev().find(|i| query.is_char_boundary(*i)).unwrap_or(0);
+    // Everything below draws the WINDOW, with the caret at its window-local offset.
+    let (window, cursor) = input_window(query, cursor, available);
+    let query = window.as_str();
+    let cursor = cursor.min(query.len());
     let cursor = (0..=cursor).rev().find(|i| query.is_char_boundary(*i)).unwrap_or(0);
     let before = query.get(..cursor).unwrap_or("");
     let rest = query.get(cursor..).unwrap_or("");
@@ -559,6 +625,17 @@ pub trait Selector: Send {
     /// `dialog` local in scope across the `await` (`interactive-mode.ts:5379-5403`).
     fn as_login_dialog(&mut self) -> Option<&mut crate::login_dialog::LoginDialog> {
         None
+    }
+    /// Adopt the live `tui.editor.*` table so an embedded [`crate::text_input::Input`] resolves word
+    /// motion / kill ring / undo through the user's own bindings, exactly as pi's `Input` calls
+    /// `getKeybindings()` on every key (`input.ts:86`). A no-op for pure-list selectors.
+    fn set_editor_keymap(&mut self, _keymap: &crate::keymap::EditorKeymap) {}
+    /// Offer a bracketed paste to whatever [`crate::text_input::Input`] this selector owns (pi
+    /// `Input.handlePaste`, `input.ts:362-372`: newlines stripped, tabs expanded, inserted at the
+    /// caret). [`SelectorOutcome::Ignored`] — the default — means the selector owns no input and the
+    /// chrome drops the paste.
+    fn handle_paste(&mut self, _text: &str) -> SelectorOutcome {
+        SelectorOutcome::Ignored
     }
 }
 

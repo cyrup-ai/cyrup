@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::text_input::{Input, InputOutcome};
+
 /// The sentinel a [`CheckboxSelector`] confirm carries when **all** models are enabled (`enabledIds =
 /// null`, `scoped-models-selector.ts:18`), distinct from an explicit ordered list. The run loop maps
 /// this to "scope = full catalog".
@@ -47,10 +49,10 @@ pub struct CheckboxSelector {
     /// `config.refreshStatus` (`:149-152`): an optional `muted` `  {status}` row between the list
     /// spacer and the footer.
     refresh_status: Option<String>,
-    /// The live search query — `this.searchInput` (`scoped-models-selector.ts:139`). **S5.**
-    query: String,
-    /// Caret byte offset within [`Self::query`].
-    cursor: usize,
+    /// The live search query — `this.searchInput` (`scoped-models-selector.ts:139`). **S5.** The
+    /// shared single-line editing surface, so this box has the same word motion / kill ring / undo
+    /// / paste as every other one.
+    input: Input,
 }
 
 /// One built row — upstream's `ModelItem` (`scoped-models-selector.ts:68-72`). `model` is `None` for
@@ -87,14 +89,13 @@ impl CheckboxSelector {
             select_keymap: SelectKeymap::default(),
             dirty: false,
             refresh_status: None,
-            query: String::new(),
-            cursor: 0,
+            input: Input::new(),
         }
     }
 
     /// The live search query (test/inspection) — `getSearchInput().getValue()`.
     pub fn query(&self) -> &str {
-        &self.query
+        self.input.value()
     }
 
     /// The number of rows surviving the query (test/inspection) — `this.filteredItems.length`.
@@ -125,22 +126,6 @@ impl CheckboxSelector {
     /// `provider/id` query ranks the way it does in `/model`.
     fn search_text(row: &ModelRow) -> String {
         format!("{p} {p}/{id} {p} {id} {name}", p = row.provider, id = row.id, name = row.label)
-    }
-
-    /// Insert a character at the caret (`Input.handleInput` printable arm).
-    fn insert_char(&mut self, c: char) {
-        self.query.insert(self.cursor, c);
-        self.cursor = self.cursor.saturating_add(c.len_utf8());
-    }
-
-    /// Delete the character before the caret.
-    fn backspace(&mut self) {
-        let Some(ch) = self.query.get(..self.cursor).and_then(|s| s.chars().next_back()) else {
-            return;
-        };
-        let start = self.cursor.saturating_sub(ch.len_utf8());
-        self.query.replace_range(start..self.cursor, "");
-        self.cursor = start;
     }
 
     /// `true` when model `id` is in the scoped set (`isEnabled`, `scoped-models-selector.ts:21`).
@@ -190,7 +175,7 @@ impl CheckboxSelector {
                 full_id: id,
             })
             .collect();
-        if self.query.is_empty() {
+        if self.input.value().is_empty() {
             return all;
         }
         let texts: Vec<String> = all
@@ -201,7 +186,7 @@ impl CheckboxSelector {
                     .map_or_else(|| it.full_id.clone(), Self::search_text)
             })
             .collect();
-        let matched = crate::fuzzy::filter(&texts, &self.query, String::as_str);
+        let matched = crate::fuzzy::filter(&texts, self.input.value(), String::as_str);
         let mut out = Vec::with_capacity(matched.len());
         for m in matched {
             if let Some(it) = all.get(m.index) {
@@ -449,7 +434,12 @@ impl CheckboxSelector {
         lines.push(Line::from(""));
         // The `Input` is a bare container child (`:140`), so it renders at column 0 behind the
         // shared unstyled `"> "` prompt (S31, `input.ts:380`).
-        lines.push(Line::from(input_line_spans(&self.query, self.cursor, theme)));
+        lines.push(Line::from(input_line_spans(
+            self.input.value(),
+            self.input.cursor(),
+            width,
+            theme,
+        )));
         lines.push(Line::from(""));
         lines.extend(self.body_lines(w, theme));
         lines.push(Line::from(""));
@@ -531,10 +521,9 @@ impl Selector for CheckboxSelector {
         // is unconditional (`:390-392`) and stays with `Cancel`.
         if key.code == KeyCode::Char('c')
             && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !self.query.is_empty()
+            && !self.input.value().is_empty()
         {
-            self.query.clear();
-            self.cursor = 0;
+            self.input.clear();
             self.clamp_selection();
             return SelectorOutcome::Redraw;
         }
@@ -566,22 +555,27 @@ impl Selector for CheckboxSelector {
                 SelectorOutcome::Redraw
             }
             Some(SelectAction::Cancel) => SelectorOutcome::Cancel,
-            // Everything else feeds the search `Input` (`:396-397`).
-            None => {
-                if let KeyCode::Char(c) = key.code
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                {
-                    self.insert_char(c);
+            // Everything else feeds the search `Input` (`:396-397`). The bespoke
+            // [`ModelsKeymap`] block above deliberately stays AHEAD of this: `ctrl+w` is
+            // `ModelsAction::Save` here, not `deleteWordBackward`.
+            None => match self.input.handle_key(key) {
+                InputOutcome::Edited => {
                     self.clamp_selection();
-                    return SelectorOutcome::Redraw;
+                    SelectorOutcome::Redraw
                 }
-                if key.code == KeyCode::Backspace {
-                    self.backspace();
-                    self.clamp_selection();
-                    return SelectorOutcome::Redraw;
-                }
-                SelectorOutcome::Ignored
-            }
+                InputOutcome::Moved => SelectorOutcome::Redraw,
+                InputOutcome::Ignored => SelectorOutcome::Ignored,
+            },
         }
+    }
+
+    fn set_editor_keymap(&mut self, keymap: &crate::keymap::EditorKeymap) {
+        self.input.set_editor_keymap(keymap);
+    }
+
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        self.input.paste(text);
+        self.clamp_selection();
+        SelectorOutcome::Redraw
     }
 }

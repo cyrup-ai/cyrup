@@ -34,6 +34,34 @@ pub enum CommandSource {
     Skill,
 }
 
+/// Which builtin argument completer a command owns — cyrup's stand-in for pi's
+/// `SlashCommand.getArgumentCompletions?(argumentPrefix)` callback
+/// (`packages/tui/src/autocomplete.ts:238` @v0.84.3), installed per builtin in
+/// `createBaseAutocompleteProvider` (`interactive-mode.ts:685-736` @v0.84.3).
+///
+/// A **data tag** rather than the callback itself: [`BUILTIN_SLASH_COMMANDS`] is a `const` array
+/// built by `const fn`s and [`SlashCommand`] derives `Clone`/`Debug`/`PartialEq`/`Eq` — neither
+/// survives a boxed closure. The data each variant ranks is threaded in at
+/// [`crate::Autocomplete::compute`] time ([`crate::ArgumentSources`]), which is what keeps `compute`
+/// synchronous.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ArgumentCompleter {
+    /// No argument completion — pi's absent `getArgumentCompletions`, which makes the whole
+    /// argument branch return `null` (`autocomplete.ts:351-353` @v0.84.3).
+    None,
+    /// The scoped-else-available model catalog, inserted as `provider/id`
+    /// (`interactive-mode.ts:687-710` @v0.84.3).
+    Models,
+    /// The known login providers, inserted as the bare provider id
+    /// (`interactive-mode.ts:728-735` @v0.84.3).
+    LoginProviders,
+    /// The current model's reasoning ladder (`interactive-mode.ts:713-725` @v0.84.3).
+    ///
+    /// Wired to the `/thinking` builtin (`commands.rs:131`). Thinking is *also* a Shift+Tab cycle
+    /// here (`app/submit.rs:49-52`); the two are independent entry points onto the same ladder.
+    ThinkingLevels,
+}
+
 /// One slash command's metadata (spec/tui/04 §2.2). `name` carries no leading `/`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlashCommand {
@@ -50,14 +78,25 @@ pub struct SlashCommand {
     pub argument_hint: Option<Cow<'static, str>>,
     /// Provenance.
     pub source: CommandSource,
-    /// Whether the command provides argument completion.
+    /// Which argument completer this command owns — the port of pi assigning
+    /// `getArgumentCompletions` to a builtin in `createBaseAutocompleteProvider`.
     ///
-    /// TUI-087: this said "only `/model` in Pi, `:498-528`" and was wrong on both halves. pi assigns
-    /// `getArgumentCompletions` to **two** builtins at v0.83.0 — `/model`
-    /// (`interactive-mode.ts:555`) and `/login` (`:582`) — which is what the `arg_cmd("login", …)`
-    /// row six lines below already reflects; and `:498-528` is `getAutocompleteSourceTag` /
-    /// `prefixAutocompleteDescription`, neither of which is a completer.
-    pub has_arg_completion: bool,
+    /// pi wires **three** builtins: `/model` (`interactive-mode.ts:687` @v0.84.3), `/thinking`
+    /// (`:713`) and `/login` (`:728`). cyrup has no `/thinking` command, so only the first and
+    /// third are non-[`ArgumentCompleter::None`] in [`BUILTIN_SLASH_COMMANDS`]. Every dynamic
+    /// (prompt/extension/skill) row is `None` — see the note on `arg_completion` in
+    /// [`dynamic_commands_from_catalog_gated`].
+    pub arg_completion: ArgumentCompleter,
+}
+
+impl SlashCommand {
+    /// Whether this command offers argument completion at all — pi's
+    /// `"getArgumentCompletions" in command && command.getArgumentCompletions`
+    /// (`autocomplete.ts:351` @v0.84.3) reduced to a predicate.
+    #[must_use]
+    pub fn has_arg_completion(&self) -> bool {
+        self.arg_completion != ArgumentCompleter::None
+    }
 }
 
 /// The 22 builtin slash commands in Pi display/autocomplete order
@@ -67,7 +106,12 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     cmd("settings", "Open settings menu", None),
     // TUI-025 — pi's hint is `"<provider/model>"` (`slash-commands.ts:21` @v0.83.0); `"<model>"`
     // understated the required form and left the user guessing at the `provider/` half.
-    arg_cmd("model", "Select model (opens selector UI)", "<provider/model>"),
+    arg_cmd(
+        "model",
+        "Select model (opens selector UI)",
+        "<provider/model>",
+        ArgumentCompleter::Models,
+    ),
     cmd("scoped-models", "Enable/disable models for Ctrl+P cycling", None),
     cmd("export", "Export session (HTML default, or specify path: .html/.jsonl)", None),
     cmd("import", "Import and resume a session from a JSONL file", None),
@@ -83,11 +127,16 @@ pub const BUILTIN_SLASH_COMMANDS: &[SlashCommand] = &[
     // GAP 5 — pi registers this immediately after `tree` (`slash-commands.ts:23`), with exactly
     // this description and hint. The list order is user-visible autocomplete order, so the slot
     // matters as much as the entry.
-    arg_cmd("thinking", "Set thinking level", "<level>"),
+    arg_cmd("thinking", "Set thinking level", "<level>", ArgumentCompleter::ThinkingLevels),
     cmd("trust", "Save project trust decision for future sessions", None),
     // TUI-025 — pi carries `argumentHint: "<provider>"` here (`slash-commands.ts:35` @v0.83.0); cyrup had no
-    // hint at all, which is also what left `has_arg_completion` false for `/login`.
-    arg_cmd("login", "Configure provider authentication", "<provider>"),
+    // hint at all, which is also what left `/login` without an argument completer.
+    arg_cmd(
+        "login",
+        "Configure provider authentication",
+        "<provider>",
+        ArgumentCompleter::LoginProviders,
+    ),
     cmd("logout", "Remove provider authentication", None),
     cmd("new", "Start a new session", None),
     cmd("compact", "Manually compact the session context", None),
@@ -139,7 +188,7 @@ const fn cmd(
             None => None,
         },
         source: CommandSource::Builtin,
-        has_arg_completion: false,
+        arg_completion: ArgumentCompleter::None,
     }
 }
 
@@ -147,13 +196,14 @@ const fn arg_cmd(
     name: &'static str,
     description: &'static str,
     hint: &'static str,
+    completer: ArgumentCompleter,
 ) -> SlashCommand {
     SlashCommand {
         name: Cow::Borrowed(name),
         description: Cow::Borrowed(description),
         argument_hint: Some(Cow::Borrowed(hint)),
         source: CommandSource::Builtin,
-        has_arg_completion: true,
+        arg_completion: completer,
     }
 }
 
@@ -483,12 +533,23 @@ pub fn dynamic_commands_from_catalog_gated(
                     .map(|h| Cow::Owned(h.to_string())),
                 source: kind,
                 // EXT-013 / TUI-012: still hardcoded, and it CANNOT be resolved in this crate —
-                // `slash_command_catalog()` (`cyrup-session-svc/src/session.rs:2503-2532`) emits no
-                // key saying whether a registered command declared `getArgumentCompletions`
-                // (pi carries the callback itself onto the autocomplete row, `:607`). The producer
-                // side exists (`cyrup-ext` `registry::command_autocomplete()`, fed by
-                // `live.rs::add_autocomplete`); what is missing is one key on the catalog row.
-                has_arg_completion: false,
+                // for TWO reasons, only the first of which this note used to record.
+                //
+                // (a) No catalog key. `slash_command_catalog()`
+                // (`cyrup-session-svc/src/session/commands.rs:174` — the `session.rs:2503-2532` this
+                // used to cite predates that file being split into a module directory) emits no key
+                // saying whether a registered command declared `getArgumentCompletions`; pi carries
+                // the callback itself onto the autocomplete row (`interactive-mode.ts:753`
+                // @v0.84.3).
+                //
+                // (b) No call path even with the key. `cyrup_ext::ExtensionRegistry::command_autocomplete()`
+                // (`crates/cyrup-ext/src/registry.rs:1013`) only records WHICH commands opted in —
+                // there is no completer to invoke, and invoking a wasm guest is async, which
+                // [`crate::Autocomplete::compute`] is not (and must not become; the popup is
+                // recomputed per keystroke on the render thread). A bare boolean would therefore
+                // buy a completer that always yields zero items while suppressing the path
+                // fall-through — strictly worse than `None`.
+                arg_completion: ArgumentCompleter::None,
             })
         })
         .collect()

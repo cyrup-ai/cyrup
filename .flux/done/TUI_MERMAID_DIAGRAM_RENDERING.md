@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Render Mermaid Fences As Unicode Diagrams And Wire The Orphaned `markdown.mermaid` Setting
@@ -51,7 +51,7 @@ Unicode diagrams" with values `off|final|streaming` (`settings-selector.ts:501-5
 Nothing ports `mermaid.ts`. `grep -rni "mermaid\|diagram" crates/cyrup-tui/src` returns three hits,
 all prose: [`markdown/walk.rs:434-435`](../../crates/cyrup-tui/src/markdown/walk.rs) and
 `src/tests/markdown.rs:849`, each quoting `mermaid.ts:15` only to justify keeping the whole fence
-info string. There is no layout/diagram engine anywhere in the workspace.
+info string. There is no layout/diagram engine anywhere in the workspace *today* — subtask 1 adds `mermansi`.
 
 - The fence path is **unconditional**.
   [`markdown/walk.rs:429-444`](../../crates/cyrup-tui/src/markdown/walk.rs) (`Tag::CodeBlock`) stores
@@ -70,19 +70,46 @@ info string. There is no layout/diagram engine anywhere in the workspace.
 
 ## Remaining scope
 
-The whole feature is absent, so this is a from-scratch port. Note the mode gate depends on
+The whole feature is absent, but the layout engine is **not** written from scratch — subtask 1
+selects `mermansi`. What remains is the fence gate, the re-encoding, the gate and the wiring. Note the mode gate depends on
 `messageType` / `isStreaming` / `availableWidth`, which means it needs the per-message
 markdown-transform seam — coordinate with the sibling gap **MARKDOWN_TRANSFORM_HOOK_NOT_WIRED**, or
 land an equivalent per-message hook here.
 
 ## Subtasks
 
-1. **Decide the diagram engine and record the decision in the module doc.** `grok-mermaid` is a JS
-   package with no Rust equivalent; either port the subset of its layout that pi actually exercises
-   (flowchart/graph node+edge boxing, which is what produces `MermaidArt { plain, width, spans,
-   warnings }`) into a new module, or select a crate. Whatever is chosen must produce per-span class
-   information — `border`, `edge`, `edgeLabel`, `title` — because the theming at `mermaid.ts:38-56`
-   depends on it.
+1. **Use the `mermaid-text` crate as the diagram engine (decided 2026-08-28 — recorded in the
+   module doc and the workspace manifest).** The original claim in this task that "`grok-mermaid`
+   is a JS package with no Rust equivalent" was **wrong and is retracted**: `cargo search mermaid`
+   returns 2258+ crates, several rendering Mermaid to Unicode text in pure Rust.
+
+   | crate | licence | verdict |
+   |---|---|---|
+   | `mermaid-text` 0.57.0 | MIT | **chosen** — 3 direct deps (`ascii-dag`, `chrono`, `unicode-width`; the last two already in tree), typed `Error`, public `Grid` |
+   | `mermansi` 0.1.6 | MIT OR Apache-2.0 | **tried first, then REJECTED** — see below |
+   | `mmdflux` 2.6.1 | MIT | viable; 243 source files, far larger surface than needed |
+   | `flowmaid` 0.25.0 | GPL-3.0-or-later | **ruled out** — cyrup is MIT |
+
+   **Why `mermansi` was backed out after being implemented against.** It pulls 151 transitive
+   crates including a CSS engine, and one — `merman-core` 0.8.0-alpha.3, an alpha — declares
+   `serde_json` with a NON-OPTIONAL `features = ["preserve_order"]`. Cargo feature unification is
+   graph-wide and additive, so that flips `serde_json::Map` from `BTreeMap` to `IndexMap` for EVERY
+   crate in the workspace, silently changing map ordering in config persistence, provider request
+   bodies, MCP payloads and session records. It broke two pre-existing `cyrup-ext-subagents` tests
+   — and only under `cargo test --workspace`; `-p cyrup-ext-subagents` alone still passed. Do not
+   re-pick it without solving that at the root.
+
+   **Known limitation, accepted deliberately.** pi themes four span classes (`mermaid.ts:38-56`).
+   The diagram is rendered COLOURLESS under the single `md_code_block` role. This is deferred, not
+   unreachable: `mermaid_text` renders into a public `layout::Grid` holding
+   `fg: Vec<Vec<Option<Rgb>>>` beside its char grid, with `Grid::get` already public — only a
+   `get_fg` accessor is missing. A ~5-line upstream PR plus a grid walk buys the full four classes
+   with NO ANSI parser. Filed as `TUI_MERMAID_PER_SPAN_THEMING`.
+
+   Use `mermaid_text::render`, not `render_with_width`: the latter compacts the gap configuration
+   to fit a budget, which changes the drawing. pi measures the finished art and falls back to the
+   raw fence (`mermaid.ts:76`), so the width check stays in cyrup.
+
 2. **New module `crates/cyrup-tui/src/markdown/mermaid.rs`**: the `is_mermaid` fence gate (first word
    of the info string, lowercased), the `code_span` re-encoding with its variable-length backtick
    fence and NBSP blank rows, the hard-break join, and the `art.width > available_width` fallback to

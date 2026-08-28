@@ -3,8 +3,11 @@
 //! Port of `pi-tui/src/autocomplete.ts` (`CombinedAutocompleteProvider`) for the two **synchronous**
 //! contexts cyrup can resolve without spawning a subprocess:
 //!
-//! 1. **Slash command** (`autocomplete.ts:308-337`): the line begins with `/` and has no space yet →
-//!    fuzzy-filtered command list (via [`crate::fuzzy`] + the [`CommandRegistry`]).
+//! 1. **Slash command** (`autocomplete.ts:313-363` @v0.84.3): the line begins with `/`, split on the
+//!    first space. No space → the fuzzy-filtered command NAME list (via [`crate::fuzzy`] + the
+//!    [`CommandRegistry`]); space → the ARGUMENT list of whichever builtin completer the named
+//!    command owns ([`crate::commands::ArgumentCompleter`]), ranked over the live
+//!    [`ArgumentSources`] the app pushes in.
 //! 2. **Bare path** (`extractPathPrefix`, `:480-507`; `getFileSuggestions`, `:560-693`): the trailing
 //!    token looks path-like (contains `/`, or starts with `.`/`~/`) or `Tab` is forced → a single
 //!    `read_dir` scan, directories-first.
@@ -19,15 +22,57 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::commands::CommandRegistry;
+use crate::commands::{ArgumentCompleter, CommandRegistry};
 use crate::fuzzy;
 use crate::select_list::{ColumnLayout, SelectItem, SelectList};
+
+/// The live data pi's three builtin argument completers close over
+/// (`interactive-mode.ts:685-736` @v0.84.3).
+///
+/// Pushed in by the app ([`crate::App::refresh_argument_sources`]) rather than reached for globally:
+/// [`Autocomplete::compute`] is synchronous and holds no session. [`Default`] (all empty) until the
+/// first push, which makes an argument popup an honest no-op rather than a stale one.
+#[derive(Clone, Debug, Default)]
+pub struct ArgumentSources {
+    /// `/model` candidates — the scoped set when one is active, else the available catalog
+    /// (`interactive-mode.ts:689-691` @v0.84.3).
+    pub models: Vec<ModelArgument>,
+    /// `/login` candidates, already merged per provider (`getLoginProviderCompletionOptions`,
+    /// `interactive-mode.ts:299-318` @v0.84.3).
+    pub login_providers: Vec<LoginProviderArgument>,
+    /// `/thinking` candidates (`interactive-mode.ts:713-725` @v0.84.3). Fed, but unreachable until
+    /// a `/thinking` command exists — see [`ArgumentCompleter::ThinkingLevels`].
+    pub thinking_levels: Vec<String>,
+}
+
+/// One `/model` candidate (`interactive-mode.ts:694-709` @v0.84.3): the popup shows `id` with
+/// `provider` as the description and INSERTS `provider/id`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelArgument {
+    pub id: String,
+    pub provider: String,
+    pub name: String,
+}
+
+/// One `/login` candidate, already merged per provider the way `getLoginProviderCompletionOptions`
+/// (`interactive-mode.ts:299-318` @v0.84.3) merges its per-`(provider, authType)` rows.
+/// `auth_types` is in pi's `AUTH_TYPE_ORDER` (`:286`) — oauth before api_key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoginProviderArgument {
+    pub id: String,
+    pub name: String,
+    pub auth_types: Vec<cyrup_config::login::AuthType>,
+}
 
 /// Which completion context produced the active popup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CompletionContext {
     /// Slash-command name completion (replaces the entire `/…` token, re-adds `/` + trailing space).
     Slash,
+    /// Slash-command ARGUMENT completion (`autocomplete.ts:344-363` @v0.84.3): `prefix` is the
+    /// argument text only (`:345` `slice(spaceIndex + 1)`, echoed back at `:362`), so the replaced
+    /// span never includes `/name ` and the inserted value carries no `/`.
+    SlashArgument,
     /// Bare path completion (replaces the trailing path token).
     Path,
     /// `@`-mention whole-tree fuzzy file search (`autocomplete.ts:101,164,408`): replaces the trailing
@@ -75,6 +120,7 @@ impl Autocomplete {
     /// no context matches or the candidate set is empty (which closes the popup).
     pub fn compute(
         registry: &CommandRegistry,
+        arguments: &ArgumentSources,
         lines: &[String],
         cursor_line: usize,
         cursor_col: usize,
@@ -84,11 +130,27 @@ impl Autocomplete {
         let line = lines.get(cursor_line).map(String::as_str).unwrap_or("");
         let before: String = line.chars().take(cursor_col).collect();
 
-        // 1. Slash command — only when not a forced (Tab) path completion (`:308`).
-        if !force
-            && let Some(ac) = slash_context(registry, &before) {
-                return Some(ac);
-            }
+        // 1. Slash command (`autocomplete.ts:313-363` @v0.84.3) — the name list before the first
+        //    space, the argument list after it.
+        //
+        //    DEVIATION, deliberate: upstream gates this whole arm on `!options.force` (`:313`), so
+        //    `/mod` + Tab there falls through to `extractPathPrefix` and lists the working
+        //    directory. cyrup tries it on the forced path too — completing a command (or its
+        //    argument) is exactly what Tab is for, and answering `/model g<Tab>` with a directory
+        //    listing is a wrong answer rather than a missing one.
+        if let Some(ac) = slash_context(registry, arguments, &before) {
+            return Some(ac);
+        }
+        // A `/name <arg>` line whose command OWNS a completer is TERMINAL: upstream returns out of
+        // the slash branch whether or not it found items (`:351-353` no completer → `null`,
+        // `:356-357` empty result → `null`, `:358-363` otherwise). Without this the no-match case
+        // would fall through and answer a model query with a directory listing.
+        //
+        // A `/`-line with NO completer still falls through, which is a pre-existing cyrup
+        // deviation and the reason `/export ./sr<Tab>` completes a path.
+        if argument_completer(registry, &before).is_some() {
+            return None;
+        }
         // 2. Bare path.
         path_context(&before, force, cwd)
     }
@@ -109,6 +171,13 @@ impl Autocomplete {
         let (insert, trailing) = match self.context {
             // Slash: `/{value} ` (trailing space; `:393-404`).
             CompletionContext::Slash => (format!("/{}", completion.value), " "),
+            // Slash argument: `beforePrefix + item.value`, cursor immediately after the value and
+            // NO trailing space — upstream's argument branch is
+            // `newLine = beforePrefix + item.value + adjustedAfterCursor` with
+            // `cursorCol = beforePrefix.length + cursorOffset` (`autocomplete.ts:432-448`
+            // @v0.84.3). The trailing space lives only in the command-NAME branch (`:399-408`,
+            // `+2 for "/" and space`) and the `@`-mention branch (`:412-428`).
+            CompletionContext::SlashArgument => (completion.value.clone(), ""),
             // Path: directories keep drilling (no space), files get a trailing space (`:408-425`).
             CompletionContext::Path => {
                 (completion.value.clone(), if completion.is_dir { "" } else { " " })
@@ -136,11 +205,179 @@ impl Autocomplete {
     }
 }
 
-/// Slash-command context (`autocomplete.ts:308-337`): `before` starts with `/` and has no space.
-fn slash_context(registry: &CommandRegistry, before: &str) -> Option<Autocomplete> {
-    if !before.starts_with('/') || before.contains(char::is_whitespace) {
+/// Slash context (`autocomplete.ts:313-363` @v0.84.3): `before` starts with `/`, split on the FIRST
+/// SPACE (`:314` `textBeforeCursor.indexOf(" ")` — a literal space, not any whitespace, so a tab
+/// keeps the line in the name branch). No space → the command-name list (`:316-341`); a space → the
+/// argument list (`:344-363`), which never falls back to the name list.
+fn slash_context(
+    registry: &CommandRegistry,
+    arguments: &ArgumentSources,
+    before: &str,
+) -> Option<Autocomplete> {
+    if !before.starts_with('/') {
         return None;
     }
+    if before.contains(' ') {
+        let (completer, argument) = argument_completer(registry, before)?;
+        return argument_context(arguments, completer, argument);
+    }
+    command_name_context(registry, before)
+}
+
+/// `commandName = textBeforeCursor.slice(1, spaceIndex)` (`:344`), `argumentText =
+/// textBeforeCursor.slice(spaceIndex + 1)` (`:345`), the registry lookup (`:347-350`) and the
+/// "no `getArgumentCompletions`" refusal (`:351-353`) as one resolution step — also the terminal-arm
+/// predicate in [`Autocomplete::compute`]. `str::get`, never a slice expression
+/// (`deny(clippy::string_slice)`).
+fn argument_completer<'a>(
+    registry: &CommandRegistry,
+    before: &'a str,
+) -> Option<(ArgumentCompleter, &'a str)> {
+    let rest = before.strip_prefix('/')?;
+    let space = rest.find(' ')?;
+    let name = rest.get(..space)?;
+    let argument = rest.get(space + 1..)?;
+    let completer = registry.get(name)?.arg_completion;
+    (completer != ArgumentCompleter::None).then_some((completer, argument))
+}
+
+/// Build one of the three builtin argument popups (`interactive-mode.ts:685-736` @v0.84.3).
+///
+/// Every branch is `createFuzzyAutocompleteItems` (`:288-297`): fuzzy-filter the candidates by their
+/// per-completer search text and return `None` — upstream's `null` — for an empty result. The layout
+/// is [`ColumnLayout::DEFAULT`], **not** `SLASH`: pi picks the slash layout only when the PREFIX
+/// starts with `/` (`components/editor.ts:2148` @v0.84.3), and an argument prefix never does.
+fn argument_context(
+    arguments: &ArgumentSources,
+    completer: ArgumentCompleter,
+    argument: &str,
+) -> Option<Autocomplete> {
+    let (items, completions) = match completer {
+        // Unreachable through `argument_completer`, which filters `None` out; matched rather than
+        // `unreachable!()` because the workspace denies `clippy::panic`.
+        ArgumentCompleter::None => return None,
+        ArgumentCompleter::Models => model_rows(&arguments.models, argument)?,
+        ArgumentCompleter::LoginProviders => {
+            login_provider_rows(&arguments.login_providers, argument)?
+        }
+        ArgumentCompleter::ThinkingLevels => thinking_rows(&arguments.thinking_levels, argument)?,
+    };
+    let list = SelectList::new(items, ColumnLayout::DEFAULT).with_no_match("No matches");
+    Some(Autocomplete {
+        context: CompletionContext::SlashArgument,
+        prefix: argument.to_string(),
+        completions,
+        list,
+    })
+}
+
+/// `/model` rows (`interactive-mode.ts:687-710` @v0.84.3): label `id`, description `provider`,
+/// inserted value `provider/id`.
+fn model_rows(
+    models: &[ModelArgument],
+    argument: &str,
+) -> Option<(Vec<SelectItem>, Vec<Completion>)> {
+    // `getModelSearchText` verbatim (`modes/interactive/model-search.ts:7-11` @v0.84.3):
+    // `` `${id} ${provider} ${provider}/${id} ${provider} ${id}${name}` ``. The repetition IS the
+    // ranking — `fuzzy::filter` scores per token occurrence — so it is ported, not tidied.
+    let texts: Vec<String> = models
+        .iter()
+        .map(|m| {
+            let name = if m.name.is_empty() { String::new() } else { format!(" {}", m.name) };
+            format!("{id} {p} {p}/{id} {p} {id}{name}", id = m.id, p = m.provider)
+        })
+        .collect();
+    let matches = fuzzy::filter(&texts, argument, String::as_str);
+    if matches.is_empty() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(matches.len());
+    let mut completions = Vec::with_capacity(matches.len());
+    for m in &matches {
+        let Some(model) = models.get(m.index) else { continue };
+        items.push(SelectItem::new(model.id.clone(), Some(model.provider.clone())));
+        completions.push(Completion {
+            value: format!("{}/{}", model.provider, model.id),
+            is_dir: false,
+        });
+    }
+    Some((items, completions))
+}
+
+/// `/login` rows (`interactive-mode.ts:728-735` @v0.84.3): label and inserted value are the bare
+/// provider id, the description is `formatLoginProviderCompletionDescription` (`:328-331`).
+fn login_provider_rows(
+    providers: &[LoginProviderArgument],
+    argument: &str,
+) -> Option<(Vec<SelectItem>, Vec<Completion>)> {
+    // `getLoginProviderSearchText` (`:321-326`): `` `${id} ${name} ${authTypes}` `` where each auth
+    // type contributes `` `${authType} ${formatAuthSelectorProviderType(authType)}` `` — the wire
+    // key AND the human label, so both `oauth` and `subscription` find the row.
+    let texts: Vec<String> = providers
+        .iter()
+        .map(|p| {
+            let mut text = format!("{} {}", p.id, p.name);
+            for auth in &p.auth_types {
+                text.push_str(&format!(
+                    " {} {}",
+                    auth.as_str(),
+                    crate::auth_select::format_auth_selector_provider_type(*auth)
+                ));
+            }
+            text
+        })
+        .collect();
+    let matches = fuzzy::filter(&texts, argument, String::as_str);
+    if matches.is_empty() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(matches.len());
+    let mut completions = Vec::with_capacity(matches.len());
+    for m in &matches {
+        let Some(provider) = providers.get(m.index) else { continue };
+        let labels: Vec<&str> = provider
+            .auth_types
+            .iter()
+            .map(|a| crate::auth_select::format_auth_selector_provider_type(*a))
+            .collect();
+        let joined = labels.join("/");
+        // `provider.name === provider.id ? authTypes : `${provider.name} · ${authTypes}`` (`:330`).
+        let desc = if provider.name == provider.id {
+            joined
+        } else {
+            format!("{} · {joined}", provider.name)
+        };
+        items.push(SelectItem::new(provider.id.clone(), Some(desc)));
+        completions.push(Completion { value: provider.id.clone(), is_dir: false });
+    }
+    Some((items, completions))
+}
+
+/// `/thinking` rows (`interactive-mode.ts:713-725` @v0.84.3): the level string is its own search
+/// text, label and value. Inert until cyrup grows a `/thinking` command — see
+/// [`ArgumentCompleter::ThinkingLevels`].
+fn thinking_rows(
+    levels: &[String],
+    argument: &str,
+) -> Option<(Vec<SelectItem>, Vec<Completion>)> {
+    let matches = fuzzy::filter(levels, argument, String::as_str);
+    if matches.is_empty() {
+        return None;
+    }
+    let mut items = Vec::with_capacity(matches.len());
+    let mut completions = Vec::with_capacity(matches.len());
+    for m in &matches {
+        let Some(level) = levels.get(m.index) else { continue };
+        items.push(SelectItem::label(level.clone()));
+        completions.push(Completion { value: level.clone(), is_dir: false });
+    }
+    Some((items, completions))
+}
+
+/// The command-NAME list (`autocomplete.ts:316-341` @v0.84.3): fuzzy-filter every registered command
+/// by the text after the `/`, with `prefix = textBeforeCursor` (`:340`) — the whole `/…` token, which
+/// is what [`Autocomplete::apply`]'s slash arm replaces.
+fn command_name_context(registry: &CommandRegistry, before: &str) -> Option<Autocomplete> {
     let query = before.get(1..).unwrap_or("");
     let commands = registry.commands();
     let matches = fuzzy::filter(commands, query, |c| c.name.as_ref());

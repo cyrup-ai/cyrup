@@ -1,13 +1,21 @@
-//! A reusable single-field text-input [`Selector`] (spec/tui/05 §3.1 extension; L4 review §2.1). The
-//! input-slot occupant for a plain "type text, `Enter` confirms" flow — used by the `ui.input`
-//! extension dialog (`SelectorKind::ExtensionInput`). Generalizes the ad hoc rename buffer
-//! [`crate::session_selector::SessionSelector`] already carries inline (`renaming:
-//! Option<(String, String)>`, `session_selector.rs:108-109,371-396`), which is otherwise the only
-//! free-text input component in the crate.
+//! A reusable single-line [`Input`] editing surface — the port of pi's `Input` component
+//! (`pi/packages/tui/src/components/input.ts:19-376` @v0.83.0) minus `render` — plus the
+//! single-field [`TextInputSelector`] that wraps it for the `ui.input` extension dialog
+//! (`SelectorKind::ExtensionInput`).
 //!
-//! Unlike [`crate::selector::ListSelector`] there is no list to navigate: every printable key inserts
-//! at the cursor, `Backspace`/`Delete`/arrows edit the buffer, `Enter` confirms with the buffer's
-//! current text (even empty — Pi's `input` allows an empty submit), `Esc` cancels (Pi `undefined`).
+//! Upstream every search box in every selector IS an `Input` (`new Input()` at
+//! `model-selector.ts:117`, `session-selector.ts:332` and `:718`, `config-selector.ts:263`,
+//! `oauth-selector.ts:76`, `scoped-models-selector.ts:139`, `settings-list.ts:70`,
+//! `tree-selector.ts:1289`, `login-dialog.ts:55`, `extension-input.ts:63`), so all of them get the
+//! same Emacs-grade line editor: word motion, the kill ring, undo with typing coalescing,
+//! bracketed paste and grapheme-granular stepping. cyrup had seven private
+//! insert-plus-backspace copies instead; they now embed this one type.
+//!
+//! Keys resolve through [`EditorKeymap::action_for`], never an inline `match key.code` — pi's
+//! `handleInput` re-reads `getKeybindings()` on every keystroke (`input.ts:86`), so a
+//! `keybindings.json` rebind reaches a search field the same way it reaches the editor.
+
+use unicode_segmentation::UnicodeSegmentation;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
@@ -15,12 +23,500 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-use crate::keymap::{SelectAction, SelectKeymap};
+use crate::editor::kill_ring::{kill_ring_push, kill_ring_rotate};
+use crate::editor::undo::{push_bounded, should_snapshot_for_type, UNDO_CAP};
+use crate::editor::word_nav::{
+    byte_seg_first_punct, byte_seg_is_whitespace, byte_seg_last_punct_end, byte_word_segments,
+    find_word_backward, find_word_forward,
+};
+use crate::keymap::{EditorAction, EditorKeymap, SelectAction, SelectKeymap};
 use crate::selector::{
-    border_rule, search_input_spans, stack_rows, title_lines, title_wrapped_height, Selector,
+    border_rule, input_line_spans, stack_rows, title_lines, title_wrapped_height, Selector,
     SelectorOutcome,
 };
 use crate::theme::UiTheme;
+
+/// `lastAction` (`input.ts:34`): `"kill" | "yank" | "type-word" | null`. Gates kill-ring
+/// accumulation, yank-pop eligibility and undo coalescing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LastAction {
+    None,
+    Kill,
+    Yank,
+    TypeWord,
+}
+
+/// What one key did to an [`Input`] — the return of [`Input::handle_key`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InputOutcome {
+    /// Not an `Input` binding: the fall-through past `handleInput`'s last `if` (`input.ts:202-210`,
+    /// where a control character is rejected), or an editor action with no single-line meaning.
+    Ignored,
+    /// The cursor moved; `value` is unchanged, so a host must NOT re-run its filter hook.
+    ///
+    /// [CYRUP-DELTA] pi re-filters unconditionally after handing a key to the search input
+    /// (`model-selector.ts:410-411`, `this.searchInput.handleInput(...)` then
+    /// `this.filterModels(...)`), which resets the highlight to the top on a bare `Left`. Splitting
+    /// the outcome keeps the caret keys non-destructive; every value-changing key still reports
+    /// [`Self::Edited`] and every host still re-filters on those.
+    Moved,
+    /// `value` changed — the host runs its post-edit hook (`on_query_changed`, `apply_filter`, …).
+    Edited,
+}
+
+/// A single-line text editor: buffer, caret, kill ring and undo stack, with pi's `Input` key
+/// surface (`input.ts:86-210`).
+///
+/// The caret is a **byte** offset into [`Self::value`] and is an invariant of the type: it is only
+/// ever moved to a grapheme, word or kill-span boundary, all of which are char boundaries. Every
+/// mutation nevertheless goes through [`Self::splice`], which rebuilds the string from two
+/// `str::get` slices and no-ops on a bad index, so a violated invariant degrades to a dropped
+/// keystroke instead of the panic `String::insert`/`replace_range` would raise (no-panic policy,
+/// R-00-009).
+pub struct Input {
+    value: String,
+    /// Byte offset into [`Self::value`]; always a char boundary (see the type doc).
+    cursor: usize,
+    /// `killRing` (`input.ts:33`), oldest-first with the most recent entry LAST — the orientation
+    /// `kill-ring.ts` uses, so `peek` is `last`.
+    kill_ring: Vec<String>,
+    last_action: LastAction,
+    /// `undoStack` (`input.ts:37`), pi's `UndoStack<InputState>` over `{ value, cursor }`.
+    undo: Vec<(String, usize)>,
+    /// The live `tui.editor.*` table, refreshed from the host on every key
+    /// (`getKeybindings()`, `input.ts:86`).
+    keymap: EditorKeymap,
+}
+
+impl Default for Input {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Input {
+    /// An empty field with the caret at 0 and the stock editor bindings.
+    pub fn new() -> Self {
+        Input {
+            value: String::new(),
+            cursor: 0,
+            kill_ring: Vec::new(),
+            last_action: LastAction::None,
+            undo: Vec::new(),
+            keymap: EditorKeymap::default(),
+        }
+    }
+
+    /// A field pre-filled with `value`, caret at the end — the shape every `setValue` call site
+    /// upstream wants (`model-selector.ts:119`, `session-selector.ts:721`).
+    pub fn with_value(value: String) -> Self {
+        let mut input = Self::new();
+        input.cursor = value.len();
+        input.value = value;
+        input
+    }
+
+    /// The current text.
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+
+    /// The caret's byte offset into [`Self::value`].
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    /// `setValue` (`input.ts:43-46`): replace the text and clamp the caret —
+    /// `this.cursor = Math.min(this.cursor, value.length)`, then snapped down to a char boundary so
+    /// the invariant survives a shorter replacement that lands mid-codepoint.
+    pub fn set_value(&mut self, value: String) {
+        self.value = value;
+        self.cursor = self.snap(self.cursor.min(self.value.len()));
+    }
+
+    /// Empty the field and park the caret at 0 (the `Ctrl+C`-clears-the-query path in
+    /// `scoped-models-selector.ts`).
+    pub fn clear(&mut self) {
+        self.value.clear();
+        self.cursor = 0;
+        self.last_action = LastAction::None;
+    }
+
+    /// Adopt the app's live editor bindings, so word motion / kill ring / undo answer to whatever
+    /// the user has in `keybindings.json` (`getKeybindings()` on every key, `input.ts:86`).
+    pub fn set_editor_keymap(&mut self, keymap: &EditorKeymap) {
+        self.keymap = keymap.clone();
+    }
+
+    /// Route one key — `handleInput` (`input.ts:86-210`) resolved through
+    /// [`EditorKeymap::action_for`], **minus** the cancel/submit arms (`:89-104`): in cyrup the
+    /// wrapping selector resolves [`SelectAction::Cancel`]/[`SelectAction::Confirm`] through its
+    /// [`SelectKeymap`] *before* delegating here, so [`EditorAction::Submit`] must fall through as
+    /// [`InputOutcome::Ignored`] or a dialog loses its Enter key.
+    ///
+    /// `handleInput` tests exactly the ids below and no others, so every remaining editor binding
+    /// ([`EditorAction::CursorUp`]/`CursorDown`, `PageUp`/`PageDown`, `NewLine`, `Submit`, `Tab`,
+    /// `JumpForward`/`JumpBackward`, `HistoryPrevious`/`HistoryNext`) is inert in a single-line
+    /// field and reports `Ignored`, leaving the host free to bind it.
+    pub fn handle_key(&mut self, key: &KeyEvent) -> InputOutcome {
+        match self.keymap.action_for(key) {
+            // `tui.editor.undo` (`:95-98`).
+            Some(EditorAction::Undo) => {
+                self.undo();
+                InputOutcome::Edited
+            }
+            // Deletion (`:107-135`).
+            Some(EditorAction::DeleteCharBackward) => {
+                self.delete_char_backward();
+                InputOutcome::Edited
+            }
+            Some(EditorAction::DeleteCharForward) => {
+                self.delete_char_forward();
+                InputOutcome::Edited
+            }
+            Some(EditorAction::DeleteWordBackward) => {
+                self.delete_word_backward();
+                InputOutcome::Edited
+            }
+            Some(EditorAction::DeleteWordForward) => {
+                self.delete_word_forward();
+                InputOutcome::Edited
+            }
+            Some(EditorAction::DeleteToLineStart) => {
+                self.delete_to_line_start();
+                InputOutcome::Edited
+            }
+            Some(EditorAction::DeleteToLineEnd) => {
+                self.delete_to_line_end();
+                InputOutcome::Edited
+            }
+            // Kill-ring actions (`:138-145`).
+            Some(EditorAction::Yank) => {
+                self.yank();
+                InputOutcome::Edited
+            }
+            Some(EditorAction::YankPop) => {
+                self.yank_pop();
+                InputOutcome::Edited
+            }
+            // Cursor movement (`:148-190`). Each clears `lastAction`, which is what breaks a
+            // kill run and disqualifies the next Alt+Y.
+            Some(EditorAction::CursorLeft) => {
+                self.last_action = LastAction::None;
+                self.cursor = self.cursor.saturating_sub(self.prev_grapheme_len());
+                InputOutcome::Moved
+            }
+            Some(EditorAction::CursorRight) => {
+                self.last_action = LastAction::None;
+                self.cursor =
+                    self.cursor.saturating_add(self.next_grapheme_len()).min(self.value.len());
+                InputOutcome::Moved
+            }
+            Some(EditorAction::CursorLineStart) => {
+                self.last_action = LastAction::None;
+                self.cursor = 0;
+                InputOutcome::Moved
+            }
+            Some(EditorAction::CursorLineEnd) => {
+                self.last_action = LastAction::None;
+                self.cursor = self.value.len();
+                InputOutcome::Moved
+            }
+            Some(EditorAction::CursorWordLeft) => {
+                self.move_word_left();
+                InputOutcome::Moved
+            }
+            Some(EditorAction::CursorWordRight) => {
+                self.move_word_right();
+                InputOutcome::Moved
+            }
+            Some(_) => InputOutcome::Ignored,
+            // "Regular character input — accept printable characters including Unicode, but reject
+            // control characters" (`:202-210`). crossterm has already decoded the byte stream, so
+            // the C0/DEL/C1 scan is `char::is_control` plus the modifier test that distinguishes
+            // `Ctrl+W` from `w`.
+            None => match key.code {
+                KeyCode::Char(c)
+                    if !key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER)
+                        && !c.is_control() =>
+                {
+                    self.insert_char(c);
+                    InputOutcome::Edited
+                }
+                _ => InputOutcome::Ignored,
+            },
+        }
+    }
+
+    /// `handlePaste` (`input.ts:362-372`): one undo snapshot, then the text with `\r`/`\n` stripped
+    /// and every tab expanded to four spaces, inserted at the caret.
+    pub fn paste(&mut self, text: &str) {
+        self.last_action = LastAction::None;
+        self.push_undo();
+        let mut clean = String::with_capacity(text.len());
+        for c in text.chars() {
+            match c {
+                '\r' | '\n' => {}
+                '\t' => clean.push_str("    "),
+                _ => clean.push(c),
+            }
+        }
+        if self.splice(self.cursor, self.cursor, &clean) {
+            self.cursor = self.cursor.saturating_add(clean.len());
+        }
+    }
+
+    // ---- string plumbing -------------------------------------------------------------------
+
+    /// The largest char boundary `<= at` — the guard that keeps [`Self::cursor`]'s invariant true
+    /// even when a host hands in an arbitrary offset.
+    fn snap(&self, at: usize) -> usize {
+        (0..=at.min(self.value.len())).rev().find(|i| self.value.is_char_boundary(*i)).unwrap_or(0)
+    }
+
+    /// Replace `value[start..end]` with `text`, rebuilt from two `str::get` slices. Returns `false`
+    /// (leaving the buffer untouched) when either offset is not a char boundary — the no-panic
+    /// stand-in for `String::replace_range`, which would abort the TUI instead.
+    fn splice(&mut self, start: usize, end: usize, text: &str) -> bool {
+        let (Some(head), Some(tail)) = (self.value.get(..start), self.value.get(end..)) else {
+            return false;
+        };
+        let mut next = String::with_capacity(head.len() + text.len() + tail.len());
+        next.push_str(head);
+        next.push_str(text);
+        next.push_str(tail);
+        self.value = next;
+        true
+    }
+
+    /// The byte length of the grapheme cluster ending at the caret (`input.ts:151-155`'s
+    /// `lastGrapheme.segment.length`), `0` at the start of the field.
+    fn prev_grapheme_len(&self) -> usize {
+        self.value.get(..self.cursor).and_then(|s| s.graphemes(true).next_back()).map_or(0, str::len)
+    }
+
+    /// The byte length of the grapheme cluster starting at the caret (`input.ts:161-165`), `0` at
+    /// the end of the field.
+    fn next_grapheme_len(&self) -> usize {
+        self.value.get(self.cursor..).and_then(|s| s.graphemes(true).next()).map_or(0, str::len)
+    }
+
+    /// `pushUndo` (`input.ts:338-340`), bounded exactly as the multi-line editor's stack is.
+    fn push_undo(&mut self) {
+        push_bounded(&mut self.undo, (self.value.clone(), self.cursor), UNDO_CAP);
+    }
+
+    /// `killRing.push` with the caller's direction and pi's `lastAction === "kill"` accumulate flag.
+    fn push_kill(&mut self, text: &str, prepend: bool, accumulate: bool) {
+        kill_ring_push(&mut self.kill_ring, text, prepend, accumulate);
+    }
+
+    // ---- editing ---------------------------------------------------------------------------
+
+    /// `insertCharacter` (`input.ts:213-222`). The undo snapshot is taken only at a coalescing
+    /// boundary (whitespace, or a non-typing previous action), and `cursor += char.length` is
+    /// `len_utf8` here — this is the INSERT path, which steps by the inserted character, not by a
+    /// grapheme cluster.
+    fn insert_char(&mut self, c: char) {
+        if should_snapshot_for_type(c, self.last_action == LastAction::TypeWord) {
+            self.push_undo();
+        }
+        self.last_action = LastAction::TypeWord;
+        let mut buf = [0u8; 4];
+        let encoded = c.encode_utf8(&mut buf);
+        let len = encoded.len();
+        if self.splice(self.cursor, self.cursor, encoded) {
+            self.cursor = self.cursor.saturating_add(len);
+        }
+    }
+
+    /// `handleBackspace` (`input.ts:224-235`): one whole grapheme cluster back.
+    fn delete_char_backward(&mut self) {
+        self.last_action = LastAction::None;
+        if self.cursor == 0 {
+            return;
+        }
+        self.push_undo();
+        let start = self.cursor.saturating_sub(self.prev_grapheme_len());
+        if self.splice(start, self.cursor, "") {
+            self.cursor = start;
+        }
+    }
+
+    /// `handleForwardDelete` (`input.ts:237-247`): one whole grapheme cluster forward, caret fixed.
+    fn delete_char_forward(&mut self) {
+        self.last_action = LastAction::None;
+        if self.cursor >= self.value.len() {
+            return;
+        }
+        self.push_undo();
+        let end = self.cursor.saturating_add(self.next_grapheme_len()).min(self.value.len());
+        self.splice(self.cursor, end, "");
+    }
+
+    /// `deleteToLineStart` (`input.ts:249-257`) — Ctrl+U. Kills backward, so it PREPENDS when
+    /// accumulating onto a previous kill.
+    fn delete_to_line_start(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.push_undo();
+        let deleted = self.value.get(..self.cursor).unwrap_or("").to_string();
+        self.push_kill(&deleted, true, self.last_action == LastAction::Kill);
+        self.last_action = LastAction::Kill;
+        if self.splice(0, self.cursor, "") {
+            self.cursor = 0;
+        }
+    }
+
+    /// `deleteToLineEnd` (`input.ts:259-266`) — Ctrl+K. Kills forward, so it APPENDS.
+    fn delete_to_line_end(&mut self) {
+        if self.cursor >= self.value.len() {
+            return;
+        }
+        self.push_undo();
+        let deleted = self.value.get(self.cursor..).unwrap_or("").to_string();
+        self.push_kill(&deleted, false, self.last_action == LastAction::Kill);
+        self.last_action = LastAction::Kill;
+        let end = self.value.len();
+        self.splice(self.cursor, end, "");
+    }
+
+    /// `deleteWordBackwards` (`input.ts:268-287`) — Ctrl+W. `wasKill` is captured BEFORE the word
+    /// move, because the move clears `lastAction` and would otherwise break the accumulate run
+    /// (upstream's own comment at `:272`).
+    fn delete_word_backward(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let was_kill = self.last_action == LastAction::Kill;
+        self.push_undo();
+        let delete_from = self.word_left();
+        let deleted = self.value.get(delete_from..self.cursor).unwrap_or("").to_string();
+        self.push_kill(&deleted, true, was_kill);
+        self.last_action = LastAction::Kill;
+        if self.splice(delete_from, self.cursor, "") {
+            self.cursor = delete_from;
+        }
+    }
+
+    /// `deleteWordForward` (`input.ts:289-307`) — Alt+D. The forward twin, appending to the ring.
+    fn delete_word_forward(&mut self) {
+        if self.cursor >= self.value.len() {
+            return;
+        }
+        let was_kill = self.last_action == LastAction::Kill;
+        self.push_undo();
+        let delete_to = self.word_right();
+        let deleted = self.value.get(self.cursor..delete_to).unwrap_or("").to_string();
+        self.push_kill(&deleted, false, was_kill);
+        self.last_action = LastAction::Kill;
+        self.splice(self.cursor, delete_to, "");
+    }
+
+    /// `yank` (`input.ts:309-318`) — Ctrl+Y: insert the ring top at the caret.
+    fn yank(&mut self) {
+        let Some(text) = self.kill_ring.last().cloned() else { return };
+        if text.is_empty() {
+            return;
+        }
+        self.push_undo();
+        if self.splice(self.cursor, self.cursor, &text) {
+            self.cursor = self.cursor.saturating_add(text.len());
+        }
+        self.last_action = LastAction::Yank;
+    }
+
+    /// `yankPop` (`input.ts:320-336`) — Alt+Y: only straight after a yank and with ≥2 entries.
+    /// Deletes the just-yanked text (still the ring top before the rotation), rotates, re-inserts.
+    ///
+    /// The delete is `prevText.length` **bytes** back from the caret, pi's slice arithmetic in the
+    /// crate's index unit; the `cursor >= prev.len()` guard covers the one way that can be wrong —
+    /// a host calling [`Self::set_value`] between the yank and the yank-pop.
+    fn yank_pop(&mut self) {
+        if self.last_action != LastAction::Yank || self.kill_ring.len() <= 1 {
+            return;
+        }
+        self.push_undo();
+        let prev = self.kill_ring.last().cloned().unwrap_or_default();
+        if self.cursor >= prev.len() {
+            let start = self.cursor.saturating_sub(prev.len());
+            if self.splice(start, self.cursor, "") {
+                self.cursor = start;
+            }
+        }
+        kill_ring_rotate(&mut self.kill_ring);
+        let text = self.kill_ring.last().cloned().unwrap_or_default();
+        if self.splice(self.cursor, self.cursor, &text) {
+            self.cursor = self.cursor.saturating_add(text.len());
+        }
+        self.last_action = LastAction::Yank;
+    }
+
+    /// `undo` (`input.ts:342-348`): pop one snapshot, restore BOTH value and caret, clear
+    /// `lastAction`. No redo (pi parity).
+    fn undo(&mut self) {
+        let Some((value, cursor)) = self.undo.pop() else { return };
+        self.value = value;
+        self.cursor = self.snap(cursor.min(self.value.len()));
+        self.last_action = LastAction::None;
+    }
+
+    // ---- word motion -----------------------------------------------------------------------
+
+    /// `moveWordBackwards` (`input.ts:350-354`).
+    fn move_word_left(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        self.last_action = LastAction::None;
+        self.cursor = self.word_left();
+    }
+
+    /// `moveWordForwards` (`input.ts:356-360`).
+    fn move_word_right(&mut self) {
+        if self.cursor >= self.value.len() {
+            return;
+        }
+        self.last_action = LastAction::None;
+        self.cursor = self.word_right();
+    }
+
+    /// `findWordBackward(this.value, this.cursor)` (`word-navigation.ts:22-68`) over BYTE offsets —
+    /// the same walk the multi-line editor runs over char columns, with no atomic paste markers
+    /// because a single-line field has none.
+    fn word_left(&self) -> usize {
+        if self.cursor == 0 {
+            return 0;
+        }
+        let Some(before) = self.value.get(..self.cursor) else { return self.cursor };
+        let segs = byte_word_segments(before);
+        find_word_backward(
+            segs,
+            self.cursor,
+            &|seg| byte_seg_is_whitespace(before, seg),
+            &|seg| byte_seg_last_punct_end(before, seg),
+        )
+    }
+
+    /// `findWordForward(this.value, this.cursor)` (`word-navigation.ts:76-114`).
+    fn word_right(&self) -> usize {
+        let len = self.value.len();
+        if self.cursor >= len {
+            return len;
+        }
+        let Some(after) = self.value.get(self.cursor..) else { return self.cursor };
+        let segs = byte_word_segments(after);
+        find_word_forward(
+            &segs,
+            self.cursor,
+            &|seg| byte_seg_is_whitespace(after, seg),
+            &|seg| byte_seg_first_punct(after, seg),
+        )
+    }
+}
 
 /// A single-line text-input selector: `title` is the dialog prompt shown above the field.
 ///
@@ -31,9 +527,8 @@ use crate::theme::UiTheme;
 /// (`input.ts:378-446`). See E8 in [`Selector::render`].
 pub struct TextInputSelector {
     title: String,
-    buffer: String,
-    /// Byte offset into `buffer` (always a char boundary).
-    cursor: usize,
+    /// The field itself — pi's `new Input()` (`extension-input.ts:63`).
+    input: Input,
     /// The live selector bindings, so the hint row names the keys the user actually has bound
     /// (`keyHint` → `keyText` → `getKeybindings().getKeys(...)`, `keybinding-hints.ts:34-44`).
     /// Defaults to the stock table and is refreshed from whatever keymap routed the last key,
@@ -46,12 +541,7 @@ impl TextInputSelector {
     /// `ui.input` wire field has somewhere to land and then discarded, which is what upstream does
     /// with it (`extension-input.ts:36` binds it as `_placeholder`).
     pub fn new(title: String, _placeholder: Option<String>) -> Self {
-        TextInputSelector {
-            title,
-            buffer: String::new(),
-            cursor: 0,
-            keymap: SelectKeymap::default(),
-        }
+        TextInputSelector { title, input: Input::new(), keymap: SelectKeymap::default() }
     }
 
     /// Bind the hint row to the app's live `tui.select.*` table, so it names the keys the user has
@@ -103,41 +593,7 @@ impl TextInputSelector {
 
     /// The current buffer text (test/inspection).
     pub fn text(&self) -> &str {
-        &self.buffer
-    }
-
-    fn insert_char(&mut self, c: char) {
-        self.buffer.insert(self.cursor, c);
-        self.cursor += c.len_utf8();
-    }
-
-    fn backspace(&mut self) {
-        let Some(ch) = self.buffer.get(..self.cursor).and_then(|s| s.chars().next_back()) else {
-            return;
-        };
-        let start = self.cursor - ch.len_utf8();
-        self.buffer.replace_range(start..self.cursor, "");
-        self.cursor = start;
-    }
-
-    fn delete_forward(&mut self) {
-        let Some(ch) = self.buffer.get(self.cursor..).and_then(|s| s.chars().next()) else {
-            return;
-        };
-        let end = self.cursor + ch.len_utf8();
-        self.buffer.replace_range(self.cursor..end, "");
-    }
-
-    fn cursor_left(&mut self) {
-        if let Some(ch) = self.buffer.get(..self.cursor).and_then(|s| s.chars().next_back()) {
-            self.cursor -= ch.len_utf8();
-        }
-    }
-
-    fn cursor_right(&mut self) {
-        if let Some(ch) = self.buffer.get(self.cursor..).and_then(|s| s.chars().next()) {
-            self.cursor += ch.len_utf8();
-        }
+        self.input.value()
     }
 }
 
@@ -183,9 +639,15 @@ impl Selector for TextInputSelector {
         // and never reads it (`extension-input.ts:36`). cyrup swapped the caret out for muted
         // placeholder text whenever the buffer was empty — precisely the moment the user most needs
         // to see where typing will land, and the dialog showed no cursor at all.
-        let mut spans = vec![Span::styled("> ", theme.base_style())];
-        spans.extend(search_input_spans(&self.buffer, self.cursor, theme));
-        frame.render_widget(Paragraph::new(Line::from(spans)), body);
+        frame.render_widget(
+            Paragraph::new(Line::from(input_line_spans(
+                self.input.value(),
+                self.input.cursor(),
+                body.width,
+                theme,
+            ))),
+            body,
+        );
         frame.render_widget(
             Paragraph::new(vec![self.hint_line(theme)]).style(theme.base_style()),
             hint,
@@ -197,43 +659,30 @@ impl Selector for TextInputSelector {
         // Keep the hint row honest: adopt whatever table actually routed this key (the same
         // refresh `ListSelector::handle` does).
         self.keymap = keymap.clone();
+        // Submit/cancel first — pi's `Input` owns those arms itself (`input.ts:89-104`), but in
+        // cyrup the selector resolves them and `Input::handle_key` deliberately ignores
+        // `EditorAction::Submit`. Everything else is the shared editing surface.
         match key.code {
-            KeyCode::Enter => SelectorOutcome::Confirm(self.buffer.clone()),
+            KeyCode::Enter => SelectorOutcome::Confirm(self.input.value().to_string()),
             KeyCode::Esc => SelectorOutcome::Cancel,
-            KeyCode::Backspace => {
-                self.backspace();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Delete => {
-                self.delete_forward();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Left => {
-                self.cursor_left();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Right => {
-                self.cursor_right();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Home => {
-                self.cursor = 0;
-                SelectorOutcome::Redraw
-            }
-            KeyCode::End => {
-                self.cursor = self.buffer.len();
-                SelectorOutcome::Redraw
-            }
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.insert_char(c);
-                SelectorOutcome::Redraw
-            }
-            _ => SelectorOutcome::Ignored,
+            _ => match self.input.handle_key(key) {
+                InputOutcome::Ignored => SelectorOutcome::Ignored,
+                _ => SelectorOutcome::Redraw,
+            },
         }
     }
 
     fn set_title(&mut self, title: String) {
         self.title = title;
+    }
+
+    fn set_editor_keymap(&mut self, keymap: &EditorKeymap) {
+        self.input.set_editor_keymap(keymap);
+    }
+
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        self.input.paste(text);
+        SelectorOutcome::Redraw
     }
 }
 

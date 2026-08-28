@@ -42,6 +42,11 @@ fn image_opts<'a>(
         tools_expanded: state.transcript.tool_expanded(),
         // TUI-030 — the LIVE `setHiddenThinkingLabel` override.
         hidden_thinking_label: Some(state.transcript.hidden_thinking_label()),
+        // The LIVE `markdown.mermaid` mode, for the same reason: upstream's transformer re-reads
+        // `getMermaidRenderingMode()` on every render (`interactive-mode.ts:484-486`), so a row
+        // cycled mid-session must reach both the inline flush and the alternate screen through the
+        // one shared builder.
+        mermaid: state.transcript.mermaid_mode(),
     }
 }
 

@@ -95,9 +95,10 @@ use crate::transcript::{entry_lines, wrap_line, wrapped_height, Entry, ImageOpts
 /// [`crate::TranscriptView::drain_committed`] with retention on), when the front is trimmed
 /// (`retained_dropped` moves), or when one of the *paint-time* inputs above changes — the width, the
 /// theme, the output padding, `Ctrl+O`'s expansion flag, the image settings, the `app.tools.expand`
-/// label, the hidden-thinking label or the session cwd. [`document_key`] is exactly that set as one
-/// comparable value: hold the last key beside the last `(rows, row_starts)`, rebuild only when the
-/// key changed, and hand the cached pair to `set_document` otherwise.
+/// label, the hidden-thinking label, the `markdown.mermaid` mode or the session cwd.
+/// [`document_key`] is exactly that set as one comparable value: hold the last key beside the last
+/// `(rows, row_starts)`, rebuild only when the key changed, and hand the cached pair to
+/// `set_document` otherwise.
 ///
 /// A streaming turn is **not** in this set. The live region is the transcript's own
 /// [`crate::TranscriptView::content_height`] cache, and the spinner and elapsed-footer ticks that
@@ -163,6 +164,10 @@ pub(super) struct DocumentKey {
     /// [`crate::TranscriptView::tool_expanded`] — X14's live `toolOutputExpanded`, which every
     /// committed tool, branch summary and compaction summary renders at.
     tools_expanded: bool,
+    /// [`crate::TranscriptView::mermaid_mode`] — the live `markdown.mermaid` mode. Without it,
+    /// cycling the `/settings` row would leave the whole retained document stale: every committed
+    /// user/assistant body is re-rendered through the mermaid gate.
+    mermaid: cyrup_config::MermaidRenderingMode,
     /// The three string-shaped paint-time inputs hashed together: the `app.tools.expand` label, the
     /// hidden-thinking label and the session cwd. Hashed rather than cloned so the key stays `Copy`
     /// and free to build every frame; all three change only on a rebind, an extension call or a
@@ -194,6 +199,7 @@ pub(super) fn document_key(
         show_images: transcript.show_images(),
         graphical_images: transcript.graphical_images(),
         tools_expanded: transcript.tool_expanded(),
+        mermaid: transcript.mermaid_mode(),
         labels: hasher.finish(),
     }
 }

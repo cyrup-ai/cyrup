@@ -12,7 +12,7 @@ pub(super) fn registry_with_hinted_dynamic(name: &'static str, hint: &'static st
         description: std::borrow::Cow::Borrowed("test command"),
         argument_hint: Some(std::borrow::Cow::Borrowed(hint)),
         source: crate::commands::CommandSource::Prompt,
-        has_arg_completion: false,
+        arg_completion: crate::commands::ArgumentCompleter::None,
     }])
 }
 
@@ -23,7 +23,7 @@ fn registry_with_hintless_dynamic(name: &'static str) -> CommandRegistry {
         description: std::borrow::Cow::Borrowed("test command"),
         argument_hint: None,
         source: crate::commands::CommandSource::Prompt,
-        has_arg_completion: false,
+        arg_completion: crate::commands::ArgumentCompleter::None,
     }])
 }
 

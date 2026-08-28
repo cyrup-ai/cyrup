@@ -45,11 +45,12 @@ mod config;
 mod edit;
 mod history;
 mod keys;
-mod kill_ring;
+pub(crate) mod kill_ring;
 mod motion;
 mod paste;
 mod render;
-mod undo;
+pub(crate) mod undo;
+pub(crate) mod word_nav;
 mod wrap;
 
 #[cfg(test)]
@@ -57,6 +58,7 @@ mod tests;
 
 // The editor-internal helpers the submodules share. Re-bound here so every submodule reaches
 // them through its own `use super::*;`, the same way `crate::app` and `crate::transcript` do.
+use word_nav::{find_word_backward, find_word_forward, is_punctuation, WordSeg};
 use wrap::{display_width, grapheme_boundaries};
 
 /// Outcome of feeding a key to the editor.
@@ -141,6 +143,12 @@ pub struct InputEditor {
     /// fuzzy-filters in-process per keystroke). Lazily built on the first `@`-mention, invalidated on
     /// `set_cwd`. `None` until first needed.
     mention_files: Option<Vec<String>>,
+    /// The live `/model` / `/login` / `/thinking` candidate sets the argument completers rank
+    /// (`interactive-mode.ts:685-736` @v0.84.3). Push-fed like `registry` and `mention_files`,
+    /// because [`Autocomplete::compute`] is synchronous and the editor holds no session: the app
+    /// snapshots them on boot, session swap, credential change and scope save
+    /// ([`crate::App::refresh_argument_sources`]). Empty until the first push.
+    arg_sources: crate::autocomplete::ArgumentSources,
     /// The layout width (in columns) used to wrap logical lines into **visual** lines for vertical
     /// motion (`editor.ts:1690` `build_visual_line_map(width)`). Updated every render; `80` until the
     /// first render. Vertical Up/Down resolve against the visual map computed at this width.
@@ -247,21 +255,3 @@ pub struct CommandHighlight {
     pub ghost: Option<String>,
 }
 
-/// One segment of a line for word navigation — pi's `Intl.SegmentData` after `segmentWithMarkers`
-/// has merged the paste markers (`editor.ts:37-90`). `start`/`len` are **char columns** into the
-/// slice the segments were built from.
-#[derive(Clone, Copy, Debug)]
-struct WordSeg {
-    start: usize,
-    len: usize,
-    /// `Intl.SegmentData.isWordLike`.
-    ///
-    /// [CYRUP-DELTA] ICU marks a segment word-like when it is made of letters, digits, kana or
-    /// ideographs; `unicode-segmentation` (UAX#29, the same algorithm without ICU's flag) exposes no
-    /// such bit, so it is recomputed as "contains an alphanumeric character". The two agree on every
-    /// segment UAX#29 can produce: a word-bound segment is either a run of letters/digits (with
-    /// MidLetter/MidNumLet joiners), a run of punctuation/symbols, or whitespace.
-    word_like: bool,
-    /// `isAtomicSegment(segment)` — a whole `[paste #N …]` marker (`isPasteMarker`, `editor.ts:27`).
-    atomic: bool,
-}

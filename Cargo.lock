@@ -211,6 +211,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02882884d3e1bc524fb12c79f107f6ad0e1cfd498c536ffb494301740995dfe"
 
 [[package]]
+name = "ascii-dag"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cd898d2dcffeeb51015c511a2849a8637c894b833afc946936d48b1e5c8aa6ec"
+
+[[package]]
 name = "async-broadcast"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1733,6 +1739,7 @@ dependencies = [
  "cyrup-tools",
  "futures",
  "image",
+ "mermaid-text",
  "pulldown-cmark",
  "ratatui",
  "ratatui-image",
@@ -4473,6 +4480,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
 dependencies = [
  "autocfg",
+]
+
+[[package]]
+name = "mermaid-text"
+version = "0.57.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "830067de2eb67eff2201ad257af77099a32de25126dd06b0848f677589e13862"
+dependencies = [
+ "ascii-dag",
+ "chrono",
+ "unicode-width",
 ]
 
 [[package]]

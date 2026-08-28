@@ -27,11 +27,11 @@ fn builtin_table_is_23_commands_in_pi_order() {
     // (`:714-716`, completing over `getAvailableThinkingLevels()`) and on `login`;
     // `autocomplete.ts` returns `null` for any command without one. Hints at
     // `slash-commands.ts:21`, `:23` and `:35`.
-    assert!(BUILTIN_SLASH_COMMANDS[1].has_arg_completion);
+    assert!(BUILTIN_SLASH_COMMANDS[1].has_arg_completion());
     assert_eq!(BUILTIN_SLASH_COMMANDS[1].argument_hint.as_deref(), Some("<provider/model>"));
     let with_args: Vec<&str> = BUILTIN_SLASH_COMMANDS
         .iter()
-        .filter(|c| c.has_arg_completion)
+        .filter(|c| c.has_arg_completion())
         .map(|c| c.name.as_ref())
         .collect();
     assert_eq!(with_args, vec!["model", "thinking", "login"]);
@@ -356,8 +356,8 @@ fn the_builtin_command_metadata_matches_pi() {
         "Reload keybindings, extensions, skills, prompts, themes, and context files"
     );
     // The `argumentHint` is what `has_arg_completion` reads, so `/login` now advertises one.
-    assert!(by("login").has_arg_completion);
-    assert!(by("model").has_arg_completion);
+    assert!(by("login").has_arg_completion());
+    assert!(by("model").has_arg_completion());
 }
 
 /// TUI-075 — the `/` menu's dynamic blocks are in pi's display order: prompt templates BEFORE

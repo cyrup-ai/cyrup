@@ -124,7 +124,7 @@ pub use auth_select::{
 };
 pub use autocomplete::{
     list_files as mention_list_files, mention_autocomplete, mention_query, Applied, Autocomplete,
-    Completion, CompletionContext,
+    ArgumentSources, Completion, CompletionContext, LoginProviderArgument, ModelArgument,
 };
 pub use bash::{BashExecution, BashStatus, PREVIEW_LINES};
 pub use overlay::{Overlay, OverlayOutcome};
@@ -133,8 +133,8 @@ pub use resume_hint::{
     format_resume_command, quote_if_needed, resume_hint_line, ResumeTarget, APP_NAME,
 };
 pub use commands::{
-    dynamic_commands_from_catalog, dynamic_commands_from_catalog_gated, CommandRegistry,
-    CommandSource, Dispatch, SlashCommand, BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
+    dynamic_commands_from_catalog, dynamic_commands_from_catalog_gated, ArgumentCompleter,
+    CommandRegistry, CommandSource, Dispatch, SlashCommand, BUILTIN_SLASH_COMMANDS, HIDDEN_COMMANDS,
 };
 pub use component::{Component, InputEvent};
 pub use diff::render_diff;
@@ -208,7 +208,7 @@ pub use startup_selector::run_startup_selector;
 pub use status::{
     experimental_features_enabled, experimental_features_enabled_from, format_tokens, StatusLine,
 };
-pub use text_input::TextInputSelector;
+pub use text_input::{Input, InputOutcome, TextInputSelector};
 pub use tree_selector::{FilterMode, TreeEntryRole, TreeKind, TreeNode, TreeSelector};
 pub use status_indicator::{
     IndicatorKind, StatusIndicator, WorkingIndicator, SPINNER_FRAMES, SPINNER_INTERVAL,

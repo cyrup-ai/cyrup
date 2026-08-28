@@ -1,7 +1,7 @@
 ---
-stage: todo
-status: pending
-updated: 2026-08-27
+stage: done
+status: completed
+updated: 2026-08-28
 ---
 
 # Port `normalizeTerminalOutput`'s Per-Line Pass So Tabs Expand To Three Spaces Instead Of Vanishing

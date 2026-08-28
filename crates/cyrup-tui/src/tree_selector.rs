@@ -336,10 +336,9 @@ impl TreeNode {
 struct LabelEdit {
     /// The entry id being (re)labeled — carried into the persist payload on save.
     entry_id: String,
-    /// The label text buffer (empty ⇒ "remove label", Pi `value || undefined`, `:1277`).
-    query: String,
-    /// Caret byte offset within `query`.
-    cursor: usize,
+    /// The label text buffer (empty ⇒ "remove label", Pi `value || undefined`, `:1277`) — the
+    /// shared single-line editing surface, i.e. literally pi's embedded `Input` (`:1289`).
+    input: crate::text_input::Input,
 }
 
 /// The session-tree navigator selector (the bespoke `/tree` layout). Holds the full flattened node
@@ -591,7 +590,8 @@ impl TreeSelector {
     /// pre-fill — the user types the new label from scratch.
     fn begin_label_edit(&mut self) {
         if let Some(entry_id) = self.selected_id() {
-            self.label_edit = Some(LabelEdit { entry_id, query: String::new(), cursor: 0 });
+            self.label_edit =
+                Some(LabelEdit { entry_id, input: crate::text_input::Input::new() });
         }
     }
 
@@ -614,7 +614,7 @@ impl TreeSelector {
         match keymap.action_for(key) {
             Some(SelectAction::Confirm) => {
                 let Some(edit) = self.label_edit.take() else { return SelectorOutcome::Redraw };
-                let label = edit.query.trim().to_string();
+                let label = edit.input.value().trim().to_string();
                 self.update_node_label(&edit.entry_id, !label.is_empty());
                 SelectorOutcome::Apply(format!("{}{}{}", edit.entry_id, crate::FIELD_SEP, label))
             }
@@ -622,26 +622,13 @@ impl TreeSelector {
                 self.label_edit = None;
                 SelectorOutcome::Redraw
             }
+            // "everything printable types into the buffer" is now the whole shared editing
+            // surface — word motion, kill ring, undo and paste included.
             _ => {
                 let Some(edit) = self.label_edit.as_mut() else { return SelectorOutcome::Redraw };
-                match key.code {
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        edit.query.insert(edit.cursor, c);
-                        edit.cursor += c.len_utf8();
-                        SelectorOutcome::Redraw
-                    }
-                    KeyCode::Backspace => {
-                        if edit.cursor > 0
-                            && let Some(ch) =
-                                edit.query.get(..edit.cursor).and_then(|s| s.chars().next_back())
-                        {
-                            let start = edit.cursor - ch.len_utf8();
-                            edit.query.replace_range(start..edit.cursor, "");
-                            edit.cursor = start;
-                        }
-                        SelectorOutcome::Redraw
-                    }
-                    _ => SelectorOutcome::Ignored,
+                match edit.input.handle_key(key) {
+                    crate::text_input::InputOutcome::Ignored => SelectorOutcome::Ignored,
+                    _ => SelectorOutcome::Redraw,
                 }
             }
         }
@@ -650,13 +637,19 @@ impl TreeSelector {
     /// The label-input body lines (`LabelInput.render`, `tree-selector.ts:1256-1270`): a muted prompt,
     /// the live buffer with a visible caret, and the save/cancel hint — shown in the tree body while a
     /// rename is in progress.
-    fn label_edit_lines(&self, edit: &LabelEdit, theme: &UiTheme) -> Vec<Line<'static>> {
+    fn label_edit_lines(&self, edit: &LabelEdit, width: u16, theme: &UiTheme) -> Vec<Line<'static>> {
         // S31: `LabelInput.render` splices the `Input`'s own line in behind a literal two-space
         // `indent` — `lines.push(...this.input.render(availableWidth).map(line => `${indent}${line}`))`
         // (`tree-selector.ts:1299,1302`) — so the row reads `"  " + "> " + value`. cyrup drew the
         // indent but dropped `Input.render`'s shared `"> "` prompt (`input.ts:380`) entirely.
+        // `availableWidth = width - indent.length` with `indent = "  "` (`tree-selector.ts:1296`).
         let mut input = vec![Span::raw("  ")];
-        input.extend(crate::selector::input_line_spans(&edit.query, edit.cursor, theme));
+        input.extend(crate::selector::input_line_spans(
+            edit.input.value(),
+            edit.input.cursor(),
+            width.saturating_sub(2),
+            theme,
+        ));
         vec![
             Line::from(Span::styled("  Label (empty to remove):", theme.muted_style())),
             Line::from(input),
@@ -960,7 +953,8 @@ impl Selector for TreeSelector {
         // `labelInputContainer`, `tree-selector.ts:1363-1372`); otherwise the filtered tree rows.
         if let Some(edit) = &self.label_edit {
             frame.render_widget(
-                Paragraph::new(self.label_edit_lines(edit, theme)).style(theme.base_style()),
+                Paragraph::new(self.label_edit_lines(edit, body.width, theme))
+                    .style(theme.base_style()),
                 body,
             );
         } else {
@@ -1060,5 +1054,20 @@ impl Selector for TreeSelector {
                 SelectorOutcome::Ignored
             }
         }
+    }
+
+    /// Feed the live editor table to the inline label editor — the only `Input` this selector owns.
+    /// [`Self::search_query`] is deliberately NOT one: it is pi's `SearchLine`
+    /// (`tree-selector.ts:1155-1173`), an append-only string with no caret.
+    fn set_editor_keymap(&mut self, keymap: &crate::keymap::EditorKeymap) {
+        if let Some(edit) = self.label_edit.as_mut() {
+            edit.input.set_editor_keymap(keymap);
+        }
+    }
+
+    fn handle_paste(&mut self, text: &str) -> SelectorOutcome {
+        let Some(edit) = self.label_edit.as_mut() else { return SelectorOutcome::Ignored };
+        edit.input.paste(text);
+        SelectorOutcome::Redraw
     }
 }

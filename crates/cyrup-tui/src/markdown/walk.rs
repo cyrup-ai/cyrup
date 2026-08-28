@@ -24,6 +24,7 @@ impl<'t> MdRenderer<'t> {
             default_text: None,
             default_italic: false,
             hyperlinks: false,
+            mermaid: MermaidContext::OFF,
             math: Vec::new(),
             strike_literal: Vec::new(),
         }
@@ -546,7 +547,11 @@ impl<'t> MdRenderer<'t> {
             TagEnd::CodeBlock => {
                 let lang = self.code_lang.take().unwrap_or_default();
                 let code = std::mem::take(&mut self.code_buf);
-                self.emit_code_block(&lang, &code);
+                if self.mermaid_applies(&lang) {
+                    self.emit_mermaid_block(&lang, &code);
+                } else {
+                    self.emit_code_block(&lang, &code);
+                }
             }
             TagEnd::Emphasis => self.italic = self.italic.saturating_sub(1),
             TagEnd::Strong => self.bold = self.bold.saturating_sub(1),
@@ -609,8 +614,64 @@ impl<'t> MdRenderer<'t> {
         }
     }
 
-    /// Emit a fenced code block: top fence line, highlighted (or flat) body, bottom fence line.
+    /// Whether this fence takes the mermaid path (`mermaid.ts:63-74`).
+    ///
+    /// The `lists`/`quote` guard is not decoration: pi's transformer walks
+    /// `markdownParser.lexer(markdown)` (`mermaid.ts:71-72`), which yields the TOP-LEVEL token list
+    /// only, so a mermaid fence nested inside a list item or a blockquote is never a `code` token
+    /// it sees and stays a raw fence upstream. It is also what makes [`MdRenderer::width`] the
+    /// exact `context.availableWidth` pi compares the diagram against (`markdown.ts:284`) rather
+    /// than a container-narrowed value.
+    fn mermaid_applies(&self, lang: &str) -> bool {
+        self.mermaid.enabled()
+            && self.lists.is_empty()
+            && self.quote == 0
+            && mermaid::is_mermaid(lang)
+    }
+
+    /// Emit a top-level ```` ```mermaid ```` fence as a Unicode diagram, or fall back the way pi
+    /// does (`mermaid.ts:74-85`).
+    ///
+    /// Every row leaves through [`Self::emit_prefixed`] — the module doc's non-negotiable rule — so
+    /// the second wrap at `self.width` applies. [`crate::transcript::wrap_line`] returns a verbatim
+    /// clone for a row that already fits, so the box-drawing and the leading spaces survive intact;
+    /// that is the property pi's `codeSpan` re-encoding (`:18-36`) had to fake through a markdown
+    /// round-trip and which this renderer gets for free.
+    ///
+    /// The whole diagram takes ONE role, `md_code_block`, rather than pi's four span colours
+    /// (`themedLines`/`styleSpan`, `:38-56`): the deliberate colorless trade-off recorded in
+    /// [`super::mermaid`]'s module doc.
+    fn emit_mermaid_block(&mut self, lang: &str, code: &str) {
+        match mermaid::render_diagram(code, self.width, self.mermaid.is_streaming) {
+            DiagramOutcome::Diagram(rows) => {
+                let style = self.theme.md_code_block_style();
+                for row in rows {
+                    self.emit_prefixed(Line::styled(row, style));
+                }
+                self.blank();
+            }
+            // `return token.raw` — the fence exactly as it would have rendered untransformed.
+            DiagramOutcome::Raw => self.emit_code_block(lang, code),
+            // `` `${token.raw}\n${codeSpan(styledWarning)}  \n` `` (`:81`): the untouched fence,
+            // then the warning line with no blank between them — hence the `emit_fence_rows` split.
+            DiagramOutcome::Warned(msg) => {
+                self.emit_fence_rows(lang, code);
+                self.emit_prefixed(Line::styled(msg, self.theme.warning_style()));
+                self.blank();
+            }
+        }
+    }
+
+    /// Emit a fenced code block: top fence line, highlighted (or flat) body, bottom fence line, and
+    /// the separating blank that follows any block.
     fn emit_code_block(&mut self, lang: &str, code: &str) {
+        self.emit_fence_rows(lang, code);
+        self.blank();
+    }
+
+    /// [`Self::emit_code_block`] without the trailing blank — the fence rows alone, which is what
+    /// pi's `token.raw` is when the warning line has to follow it immediately (`mermaid.ts:81`).
+    fn emit_fence_rows(&mut self, lang: &str, code: &str) {
         // marked's `fences` tokenizer is
         // `/^ {0,3}(`{3,}(?=[^`\n]*\n)|~{3,})([^\n]*)(?:\n|$)(?:|([\s\S]*?)(?:\n|$))(?: {0,3}\1[~`]* *(?=\n|$)|$)/`
         // — the body is capture 3 and the `(?:\n|$)` that follows it consumes the newline BEFORE the
@@ -638,7 +699,6 @@ impl<'t> MdRenderer<'t> {
             self.emit_prefixed(line);
         }
         self.emit_prefixed(Line::styled("```".to_string(), border));
-        self.blank();
     }
 
     pub(super) fn finish(mut self) -> Vec<Line<'static>> {

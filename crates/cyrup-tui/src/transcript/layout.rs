@@ -1,5 +1,7 @@
 use super::*;
 
+use std::borrow::Cow;
+
 /// Visible width of one **grapheme cluster** in terminal columns, via ratatui's
 /// unicode-width-backed `Span::width` (Pi's `graphemeWidth`, `utils.ts:174-235`).
 ///
@@ -7,6 +9,12 @@ use super::*;
 /// the wrap point and the background pad disagreed, so the fix is only a fix if both halves count
 /// the same way. `Span::width` sums `unicode_width` per `char`, so summing it per grapheme over a
 /// span is identical to calling it once on the whole span — the two can never drift.
+///
+/// It therefore reports **0** for U+0009 where pi's `graphemeWidth` reports 3
+/// (`utils.ts:174-176`), and that divergence is deliberately left alone: a tab can no longer reach
+/// [`wrap_line`], because [`text_lines`] and [`normalize_line`] expand it upstream of every
+/// [`Line`] construction. Charging 3 here while [`Line::width`] still says 0 would break exactly
+/// the wrap/pad agreement this comment exists to protect.
 fn grapheme_cols(g: &str) -> usize {
     Span::raw(g).width()
 }
@@ -223,6 +231,15 @@ pub(crate) fn text_lines_of(
 /// `width` (`:83-85`) are only observable through a background, and a bare `Text` has none, so they
 /// are not materialised here — a trailing run of blanks is invisible in a ratatui cell grid and
 /// would only defeat the right-trim [`wrap_line`] performs.
+///
+/// `:61`'s `const normalizedText = this.text.replace(/\t/g, "   ")` is
+/// [`normalize_terminal_output`], applied here at the same point upstream applies it — before the
+/// wrap (`:67`), because a tab that reaches a [`Span`] is deleted rather than rendered. The sibling
+/// [`text_lines_of`] is deliberately NOT given the same pass: it takes an already-built [`Line`]
+/// whose spans every chrome call site composed from strings it owns, whereas this is the only arm
+/// that builds a span out of raw text and so the only one that is a `Text` in upstream's sense. The
+/// tool-block path is covered by [`normalize_line`] at the `tool_lines` seam instead, which is
+/// where pi's other layer (`applyLineResets`) lands.
 pub(super) fn text_lines(text: &str, width: usize, padding_x: usize, style: Style) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     // `wrapTextWithAnsi` splits on newlines first (`utils.ts:839`) and wraps each piece.
@@ -230,7 +247,8 @@ pub(super) fn text_lines(text: &str, width: usize, padding_x: usize, style: Styl
         // The style rides on the SPAN, not the `Line` — upstream's colour is baked into the string
         // the `Text` was constructed with (`theme.fg("dim", message)`), inside the margins, so it
         // survives being nested in a `Box` that later paints `Line::style` with a background.
-        out.extend(text_lines_of(&Line::from(Span::styled(logical.to_string(), style)), width, padding_x));
+        let logical = normalize_terminal_output(logical).into_owned();
+        out.extend(text_lines_of(&Line::from(Span::styled(logical, style)), width, padding_x));
     }
     out
 }
@@ -253,6 +271,85 @@ pub(super) fn finalize_block(lines: Vec<Line<'static>>, width: usize, bg: Style)
 /// positional-context-free.
 pub(super) fn replace_tabs(text: &str) -> String {
     text.replace('\t', "   ")
+}
+
+/// Port of `normalizeTerminalOutput` (`tui/src/utils.ts:368-401`) — the per-line pass pi runs over
+/// EVERY rendered row of both renderers in `TuiBase.applyLineResets` (`tui.ts:1160-1168`), and the
+/// same two jobs `Text` does for itself at `text.ts:61`.
+///
+/// Two jobs, in upstream's order:
+/// 1. **U+0E33** (THAI CHARACTER SARA AM) → `U+0E4D U+0E32` and **U+0EB3** (LAO VOWEL SIGN AM) →
+///    `U+0ECD U+0EB2` (`:376-386`). Upstream's reason, verbatim from its doc comment: "Some
+///    terminals render precomposed Thai/Lao AM vowels inconsistently during differential repaint.
+///    Their compatibility decompositions have the same cell width but avoid stale-cell artifacts."
+///    The width is unchanged either way — `unicode-width` gives the precomposed form one column,
+///    which is pi's `graphemeWidth` `+1` rule (`utils.ts:228-230`).
+/// 2. `\t` → exactly three spaces (`:398`), the fixed width layout measures a tab at
+///    (`graphemeWidth`, `utils.ts:174-176`), "so terminal tab stops cannot wrap a logical line".
+///
+/// **Why this has to run before the [`Span`] is built.** ratatui deletes tab graphemes rather than
+/// rendering them: `Span::styled_graphemes` and `Buffer::set_stringn` both
+/// `.filter(|g| !g.contains(char::is_control))` (`ratatui-core-0.1.2` `text/span.rs:314`,
+/// `buffer/buffer.rs:351`), and U+0009 is `Cc`. Expanding after the fact is impossible — the tab is
+/// already gone — so `a\tb` reached the screen as `ab`. cyrup's sanitizer keeping 0x09
+/// ([`crate::ansi::sanitize_binary_output`], pi's `sanitizeBinaryOutput`, `utils/shell.ts:144-174`)
+/// is correct precisely because this layer is what consumes it.
+///
+/// **Upstream's escape-skipping loop (`:391-397`) is deliberately NOT ported.** pi walks the string
+/// with `extractAnsiCode` so a tab *inside* an ANSI sequence survives; that guard is meaningless
+/// here. Text on this path has already been through [`crate::ansi::sanitize_display_text`] →
+/// `strip_ansi`, and ratatui carries style out-of-band on the [`Span`] rather than in the text, so
+/// no ESC byte can be present. A flat replace is the faithful equivalent, not a shortcut.
+///
+/// Returns [`Cow::Borrowed`] when neither pass fires, so the common (no tab, no AM vowel) row costs
+/// two scans and no allocation — and so the function is provably idempotent: after one pass there
+/// is no U+0E33/U+0EB3 and no `\t` left for a second one to act on. That matters because pi also
+/// applies it twice (`text.ts:61` AND `applyLineResets`) and so does cyrup ([`text_lines`] and
+/// [`normalize_line`]).
+pub(super) fn normalize_terminal_output(text: &str) -> Cow<'_, str> {
+    let decomposed: Cow<'_, str> = if text.contains(['\u{0e33}', '\u{0eb3}']) {
+        let mut out = String::with_capacity(text.len() + 3);
+        for c in text.chars() {
+            match c {
+                '\u{0e33}' => out.push_str("\u{0e4d}\u{0e32}"),
+                '\u{0eb3}' => out.push_str("\u{0ecd}\u{0eb2}"),
+                _ => out.push(c),
+            }
+        }
+        Cow::Owned(out)
+    } else {
+        Cow::Borrowed(text)
+    };
+    // `if (!normalized.includes("\t")) return normalized;` (`utils.ts:387`).
+    if !decomposed.contains('\t') {
+        return decomposed;
+    }
+    Cow::Owned(decomposed.replace('\t', "   "))
+}
+
+/// [`normalize_terminal_output`] over an already-built row — cyrup's `applyLineResets`
+/// (`tui.ts:1160-1168`), which upstream runs on the finished line array of every frame.
+///
+/// Rewrites span CONTENT only. [`Span::style`] must survive byte-for-byte and the spans must not be
+/// merged, split or reordered: [`crate::osc::LinkSink::mark`] encodes an OSC-8 link id in the span's
+/// [`ratatui::style::Modifier`] bits and [`crate::osc::inject`] reconstructs each contiguous run
+/// from it, so any style churn here would silently unlink a tool header path.
+///
+/// Upstream skips image rows (`if (!isImageLine(line))`, `tui.ts:1163`); cyrup has no analogue to
+/// skip because a raster is appended by [`crate::transcript::tool_render`] AFTER the block this
+/// walks, never as one of its lines.
+pub(super) fn normalize_line(line: &mut Line<'static>) {
+    for span in &mut line.spans {
+        // Materialise into an owned local first so the immutable borrow of `span.content` is over
+        // before the assignment.
+        let replaced = match normalize_terminal_output(&span.content) {
+            Cow::Owned(s) => Some(s),
+            Cow::Borrowed(_) => None,
+        };
+        if let Some(s) = replaced {
+            span.content = Cow::Owned(s);
+        }
+    }
 }
 
 /// X6 — one already-`replaceTabs`'d body row, syntax-highlighted when the path resolved to a

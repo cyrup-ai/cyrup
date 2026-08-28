@@ -299,10 +299,18 @@ fn slash_popup_descriptions_are_collapsed_to_one_line() {
         description: "Review the diff\r\n\nfor correctness bugs".into(),
         argument_hint: None,
         source: CommandSource::Prompt,
-        has_arg_completion: false,
+        arg_completion: crate::commands::ArgumentCompleter::None,
     }]);
-    let ac = Autocomplete::compute(&registry, &["/review".to_string()], 0, 7, false, Path::new("."))
-        .expect("slash popup should open");
+    let ac = Autocomplete::compute(
+        &registry,
+        &crate::autocomplete::ArgumentSources::default(),
+        &["/review".to_string()],
+        0,
+        7,
+        false,
+        Path::new("."),
+    )
+    .expect("slash popup should open");
     let theme = UiTheme::dark();
     let lines = ac.list.lines(90, &theme);
     let row: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
@@ -413,7 +421,7 @@ fn fuzzy_matches_where_is_command_prefix_does_not() {
         description: std::borrow::Cow::Borrowed("Augment a task"),
         argument_hint: None,
         source: CommandSource::Prompt,
-        has_arg_completion: false,
+        arg_completion: crate::commands::ArgumentCompleter::None,
     };
     let reg = CommandRegistry::with_dynamic(vec![flux_aug]);
     assert!(reg.get("flux/aug").is_some(), "the dynamic command registered");

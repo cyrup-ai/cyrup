@@ -66,9 +66,10 @@ impl InputEditor {
         self.lines.iter().map(|l| l.iter().collect()).collect()
     }
 
-    /// Recompute the popup after an edit: auto-open for slash **and** `@`-mention context, otherwise
-    /// update an already-open popup or close it (spec/tui/04 §5 — bare path does not auto-pop without
-    /// Tab; `@`-mention auto-pops on `@`, `autocomplete.ts:101`).
+    /// Recompute the popup after an edit: auto-open for **both** slash contexts (command name and
+    /// command argument) and for `@`-mention context, otherwise update an already-open popup or close
+    /// it (spec/tui/04 §5 — bare path does not auto-pop without Tab; `@`-mention auto-pops on `@`,
+    /// `autocomplete.ts:101`).
     pub(super) fn update_autocomplete(&mut self) {
         let was_open = self.autocomplete.is_some();
         // `@`-mention search auto-pops the moment an `@` token forms (whole-tree fuzzy file search).
@@ -78,6 +79,7 @@ impl InputEditor {
         }
         let computed = Autocomplete::compute(
             &self.registry,
+            &self.arg_sources,
             &self.lines_as_strings(),
             self.row,
             self.col,
@@ -85,7 +87,19 @@ impl InputEditor {
             &self.cwd,
         );
         match computed {
-            Some(ac) if ac.context == CompletionContext::Slash || was_open => self.open_popup(ac),
+            // BOTH slash contexts auto-open on every typed character: `isInSlashCommandContext`
+            // (`components/editor.ts:2110-2112` @v0.84.3) is only
+            // `trimStart().startsWith("/")` and does NOT require the absence of a space, so the
+            // per-character re-trigger (`:1152-1157`) fires for `/model g` exactly as it does for
+            // `/mod`.
+            Some(ac)
+                if matches!(
+                    ac.context,
+                    CompletionContext::Slash | CompletionContext::SlashArgument
+                ) || was_open =>
+            {
+                self.open_popup(ac)
+            }
             _ => self.autocomplete = None,
         }
     }
@@ -118,6 +132,7 @@ impl InputEditor {
         }
         let computed = Autocomplete::compute(
             &self.registry,
+            &self.arg_sources,
             &self.lines_as_strings(),
             self.row,
             self.col,
@@ -125,6 +140,9 @@ impl InputEditor {
             &self.cwd,
         );
         match computed {
+            // Only a PATH popup auto-applies its single match: a one-item argument popup
+            // (`/model gpt` narrowed to one model) must not silently insert without the user
+            // confirming, and a one-item command-name popup already behaves that way.
             Some(ac) if ac.list.len() == 1 && ac.context == CompletionContext::Path => {
                 self.open_popup(ac);
                 self.accept_completion();

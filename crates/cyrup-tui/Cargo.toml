@@ -88,6 +88,12 @@ tokio-stream.workspace = true
 # Rich rendering (spec/tui/06): markdown parse + syntax highlight. Both pure-Rust.
 pulldown-cmark = { workspace = true }
 syntect = { workspace = true }
+# Mermaid fences rendered as Unicode box-drawing diagrams (`markdown/mermaid.rs`) — the Rust
+# counterpart of the `grok-mermaid` package pi's transformer calls (`components/mermaid.ts:2`).
+# Engine decision recorded 2026-08-28 in `markdown/mermaid.rs`'s module doc; MIT OR Apache-2.0 and
+# `unsafe`-free, so `#![forbid(unsafe_code)]` here is unaffected. `cyrup-config` is already a direct
+# dependency above, so `cyrup_config::MermaidRenderingMode` needs no further edge.
+mermaid-text = { workspace = true }
 # Inline images (spec/tui/06 §6; tui/src/terminal-image.ts): Kitty/iTerm2/sixel via `ratatui-image`,
 # with a half-block fallback that renders to ANY backend (incl. `TestBackend`) and a text placeholder
 # under the `show_images` toggle. `image` decodes/resizes the source bytes (already in-workspace).

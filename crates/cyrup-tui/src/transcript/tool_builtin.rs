@@ -399,8 +399,6 @@ pub(super) fn render_ls(
     push_ls_warnings(run.result.as_ref(), theme, out);
 }
 
-/// Non-built-in tools fall back to Pi's `formatToolExecution` (tool-execution.ts:365-376): the bold
-/// tool name + pretty-printed args + any text output.
 /// Draw a tool whose renderer an extension supplied (EXT-006). The extension's `renderCall` text
 /// is the header; its `renderResult` text is the body, shown once the run finishes (collapsed runs
 /// keep the header only, matching every built-in's collapsed form). A half-supplied renderer
@@ -410,7 +408,10 @@ pub(super) fn render_extension(run: &ToolRun, expanded: bool, theme: &UiTheme, o
     match &run.rendered_call {
         Some(call) => {
             for l in call.split('\n') {
-                out.push(Line::styled(l.to_string(), theme.tool_title_style()));
+                out.push(Line::styled(
+                    normalize_terminal_output(l).into_owned(),
+                    theme.tool_title_style(),
+                ));
             }
         }
         None => out.push(Line::styled(run.name.clone(), theme.tool_title_style())),
@@ -420,11 +421,16 @@ pub(super) fn render_extension(run: &ToolRun, expanded: bool, theme: &UiTheme, o
         && !result.trim().is_empty()
     {
         for l in result.split('\n') {
-            out.push(Line::styled(l.to_string(), theme.tool_output_style()));
+            out.push(Line::styled(
+                normalize_terminal_output(l).into_owned(),
+                theme.tool_output_style(),
+            ));
         }
     }
 }
 
+/// Non-built-in tools fall back to Pi's `formatToolExecution` (tool-execution.ts:365-376): the bold
+/// tool name + pretty-printed args + any text output.
 pub(super) fn render_generic(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<'static>>) {
     out.push(Line::styled(run.name.clone(), theme.tool_title_style()));
     if !run.args.is_null()
@@ -432,14 +438,20 @@ pub(super) fn render_generic(run: &ToolRun, theme: &UiTheme, out: &mut Vec<Line<
     {
         out.push(Line::default());
         for l in pretty.split('\n') {
-            out.push(Line::styled(l.to_string(), theme.tool_output_style()));
+            out.push(Line::styled(
+                normalize_terminal_output(l).into_owned(),
+                theme.tool_output_style(),
+            ));
         }
     }
     if let Some(result) = &run.result {
         let output = result_text(result);
         if !output.trim().is_empty() {
             for l in output.split('\n') {
-                out.push(Line::styled(l.to_string(), theme.tool_output_style()));
+                out.push(Line::styled(
+                    normalize_terminal_output(l).into_owned(),
+                    theme.tool_output_style(),
+                ));
             }
         }
     }

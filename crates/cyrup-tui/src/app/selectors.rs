@@ -178,9 +178,31 @@ impl<B: Backend> App<B> {
     /// applies the selection by kind and closes the slot; `Cancel` restores the prior theme (if any)
     /// and closes; `Preview` re-themes live without closing. A no-op if no selector is open.
     pub(crate) fn handle_selector_key(&mut self, key: &event::KeyEvent) -> AppAction {
-        let Some(active) = self.state.selector.as_mut() else { return AppAction::None };
-        let outcome = active.inner.handle(key, &self.state.select_keymap);
+        // Hand the selector the LIVE `tui.editor.*` table before routing the key: pi's `Input`
+        // re-reads `getKeybindings()` on every keystroke (`input.ts:86`), so a rebound Ctrl+W or
+        // Alt+B reaches a search box without the dialog being reopened. Destructured so the editor
+        // borrow does not collide with the selector one.
+        let AppState { selector, select_keymap, editor, .. } = &mut self.state;
+        let Some(active) = selector.as_mut() else { return AppAction::None };
+        active.inner.set_editor_keymap(editor.keymap_ref());
+        let outcome = active.inner.handle(key, select_keymap);
         let kind = active.kind;
+        self.apply_selector_outcome(kind, outcome)
+    }
+
+    /// Offer a bracketed paste to the active selector's embedded `Input` (pi `Input.handlePaste`,
+    /// `input.ts:362-372`). A selector that owns no input answers [`SelectorOutcome::Ignored`],
+    /// which becomes [`AppAction::None`] — the preserved "the chrome drops the paste" fallback.
+    pub(crate) fn handle_selector_paste(&mut self, text: &str) -> AppAction {
+        let Some(active) = self.state.selector.as_mut() else { return AppAction::None };
+        let outcome = active.inner.handle_paste(text);
+        let kind = active.kind;
+        self.apply_selector_outcome(kind, outcome)
+    }
+
+    /// Act on a [`SelectorOutcome`], whatever produced it — the key path and the paste path share
+    /// this verbatim.
+    fn apply_selector_outcome(&mut self, kind: SelectorKind, outcome: SelectorOutcome) -> AppAction {
         match outcome {
             SelectorOutcome::Ignored => AppAction::None,
             SelectorOutcome::Redraw => AppAction::Redraw,
