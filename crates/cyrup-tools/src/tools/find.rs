@@ -171,6 +171,9 @@ impl Tool for FindTool {
                 // `--no-ignore`/`--no-global-ignore-file` (find.ts:235-267), so fd's full default
                 // ignore set is in force: `.fdignore` files plus `<config>/fd/ignore`.
                 flavor: WalkFlavor::Fd,
+                // `find` is fd, not ripgrep: it does not read `$RIPGREP_CONFIG_PATH`,
+                // so every walk knob that flag file controls stays at its default here.
+                ..WalkOpts::default()
             },
         );
         loop {

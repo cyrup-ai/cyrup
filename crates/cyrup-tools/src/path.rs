@@ -62,7 +62,7 @@ fn try_am_pm(path: &str) -> Option<String> {
 
 /// Expand a leading `~` to the user's home directory. Mirrors Pi `normalizePath`'s tilde branch
 /// (paths.ts:66-72): `~` → home, `~/rest` → home/rest, and on Windows `~\rest` → home/rest.
-fn expand_home(path: &str) -> String {
+pub(crate) fn expand_home(path: &str) -> String {
     if path == "~" {
         if let Some(home) = home_dir() {
             return home.to_string_lossy().into_owned();

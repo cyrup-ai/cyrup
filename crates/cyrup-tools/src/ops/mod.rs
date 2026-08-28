@@ -298,11 +298,54 @@ impl WalkFlavor {
 ///
 /// `flavor` names the upstream binary being emulated so the shared walk seam can register the
 /// tool-specific ignore sources — see [`WalkFlavor`].
-#[derive(Clone, Copy, Debug, Default)]
+/// Which direction [`WalkOpts::sort_by_path`] orders entries in.
+///
+/// ripgrep has both `--sort=path` and `--sortr=path`, and they are not interchangeable: with a
+/// match cap in play the direction decides WHICH matches the caller receives, not just the order
+/// they arrive in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathSort {
+    /// `--sort=path`.
+    Ascending,
+    /// `--sortr=path`.
+    Descending,
+}
+
+#[derive(Clone, Debug, Default)]
 pub struct WalkOpts {
     pub include_hidden: bool,
     pub require_git: bool,
     pub flavor: WalkFlavor,
+
+    // The knobs below exist so a user's `$RIPGREP_CONFIG_PATH` can reach the walk. Each maps 1:1
+    // onto a `WalkBuilder` setter, and each defaults to the value that setter already had, so a
+    // caller that leaves them alone walks exactly as it did before they existed.
+    /// `--no-ignore` / `-u`: turn every ignore source off — `.ignore`, `.rgignore`/`.fdignore`,
+    /// and the whole gitignore family.
+    pub no_ignore: bool,
+    /// `--no-ignore-vcs`: turn the gitignore family off while `.ignore` and the custom ignore file
+    /// keep applying. Implied by [`Self::no_ignore`].
+    pub no_ignore_vcs: bool,
+    /// `--max-depth`: how far below the root to descend. `None` is unlimited.
+    pub max_depth: Option<usize>,
+    /// `-L/--follow`: follow symlinks during traversal.
+    pub follow_links: bool,
+    /// `--one-file-system`: do not cross a filesystem boundary.
+    pub one_file_system: bool,
+    /// `--max-filesize`: skip any file larger than this many bytes. `None` is unlimited.
+    pub max_filesize: Option<u64>,
+    /// `--ignore-file`: extra gitignore-format files to apply, lowest precedence first.
+    ///
+    /// This field is why [`WalkOpts`] is `Clone` and no longer `Copy`: a list of paths cannot be
+    /// held by a `Copy` type. Every consumer takes the value by move and forwards it once, so the
+    /// change is invisible at the call sites.
+    pub ignore_files: Vec<PathBuf>,
+    /// `--sort=path` / `--sortr=path`: yield entries in deterministic path order.
+    ///
+    /// `None` leaves the walk in readdir order, which is what every caller wants by default —
+    /// sorting costs a full directory read before the first entry can be yielded, and `grep` is
+    /// fused to its match cap precisely so it does not pay for entries it will never search.
+    pub sort_by_path: Option<PathSort>,
 }
 
 /// A single walked path.

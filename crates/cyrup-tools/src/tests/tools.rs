@@ -2280,6 +2280,7 @@ async fn grep_byte_limit_notice_uses_default_constant_not_configured() {
         GrepOpts {
             limit: 100,
             max_bytes: 10,
+            rg_config_path: None,
         },
     );
     let r = grep

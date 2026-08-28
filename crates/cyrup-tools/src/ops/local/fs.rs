@@ -312,7 +312,57 @@ impl FsOps for LocalFs {
                 // compiles the custom-ignore matcher too (ignore 0.4.26 `dir.rs:182-248`,
                 // `:286-292`). fd computes this same `true` (`read_parent_ignore &&
                 // (read_fdignore || read_vcsignore)`).
-                .parents(true);
+                //
+                // `--no-ignore` implies `--no-ignore-parent` (ripgrep `defs.rs:4262-4266` sets all
+                // five `no_ignore_*` flags), so parent traversal is switched off with it.
+                //
+                // Honestly labelled: this is currently BELT AND BRACES, not load-bearing, and no
+                // test can distinguish it. By the time `no_ignore` is set, every source parent
+                // traversal could contribute has already been switched off above — `.ignore`, the
+                // gitignore family and the custom file. The one source that survives `--no-ignore`
+                // is `--ignore-file` (ripgrep `defs.rs:4251-4252`: it "does not imply
+                // \flag{no-ignore-files}"), and those are explicit paths that parent traversal
+                // never supplied. It is set because it is what the flag MEANS, so that adding a
+                // future parent-sensitive source cannot silently reintroduce the bug.
+                .parents(!opts.no_ignore);
+
+            // The `$RIPGREP_CONFIG_PATH` knobs. Each is a no-op at its default, so this block
+            // changes nothing for a caller that did not ask for it.
+            //
+            // `-u`/`--no-ignore` is the wider of the two ignore switches: `ignore(false)` drops
+            // `.ignore` and the custom ignore file, and the three git switches drop the gitignore
+            // family. `--no-ignore-vcs` is the narrower one and takes only the git switches, so a
+            // `.ignore` file still applies — that asymmetry is the whole difference between the
+            // two flags and is why they are not folded together.
+            if opts.no_ignore {
+                builder
+                    .ignore(false)
+                    .git_ignore(false)
+                    .git_exclude(false)
+                    .git_global(false);
+            } else if opts.no_ignore_vcs {
+                builder
+                    .git_ignore(false)
+                    .git_exclude(false)
+                    .git_global(false);
+            }
+            builder
+                .max_depth(opts.max_depth)
+                .follow_links(opts.follow_links)
+                .same_file_system(opts.one_file_system)
+                .max_filesize(opts.max_filesize);
+            // `Path::cmp` is the byte-wise component order `--sort=path` produces — the only
+            // ordering stable across runs and platforms — and `--sortr=path` is exactly its
+            // reverse, so the two share one comparator with the arguments swapped.
+            match opts.sort_by_path {
+                Some(crate::ops::PathSort::Ascending) => {
+                    builder.sort_by_file_path(std::path::Path::cmp);
+                }
+                Some(crate::ops::PathSort::Descending) => {
+                    builder.sort_by_file_path(|a, b| b.cmp(a));
+                }
+                None => {}
+            }
 
             // `.fdignore` for fd / `.rgignore` for ripgrep. Both are inert until registered;
             // neither tool reads the other's. Custom ignore files outrank `.ignore` and EVERY
@@ -320,7 +370,25 @@ impl FsOps for LocalFs {
             // `m_custom_ignore.or(m_ignore).or(m_gi).or(m_gi_exclude).or(m_global)
             // .or(m_explicit)`), so a `!keep.txt` negation in `.fdignore` re-includes a path a
             // `.gitignore` excluded — same as fd.
-            if let Some(name) = opts.flavor.custom_ignore_filename() {
+            //
+            // Gated on `!opts.no_ignore`, and it MUST be a skip rather than an undo: `WalkBuilder`
+            // exposes only `add_custom_ignore_filename`, with no setter that clears the list, so a
+            // filename registered here can never be taken back.
+            //
+            // This is the half of `--no-ignore` that `ignore(false)` does not cover. `ignore(false)`
+            // drops `.ignore`; the custom file is a SEPARATE source, and by the precedence chain
+            // quoted just above it is the STRONGEST one — so leaving it registered meant
+            // `--no-ignore` changed nothing at all in any tree containing a `.rgignore`. ripgrep
+            // gates it the same way:
+            // `if !self.no_ignore_dot { builder.add_custom_ignore_filename(".rgignore") }`
+            // (`hiargs.rs:897-899`), and `--no-ignore` implies `--no-ignore-dot`.
+            //
+            // `--no-ignore-vcs` deliberately does NOT reach here: it implies neither
+            // `no_ignore_dot` nor `no_ignore_parent`, so `.ignore`, the custom file and parent
+            // traversal all keep applying for it. The two switches are asymmetric on purpose.
+            if let Some(name) = opts.flavor.custom_ignore_filename()
+                && !opts.no_ignore
+            {
                 builder.add_custom_ignore_filename(name);
             }
 
@@ -337,6 +405,14 @@ impl FsOps for LocalFs {
                 // (find.ts:284-310), so that warning is invisible upstream on a successful run.
                 // `walk` has no warning channel; dropping the error reproduces both halves.
                 drop(builder.add_ignore(&global));
+            }
+
+            // `--ignore-file`. `add_ignore` lands in `explicit_ignores`, the LOWEST-precedence
+            // source (ignore `dir.rs:585`) — which is where ripgrep puts it too, so a `.gitignore`
+            // still outranks it. A file that does not parse is dropped rather than made fatal,
+            // matching how the fd global ignore above is handled.
+            for path in &opts.ignore_files {
+                drop(builder.add_ignore(path));
             }
 
             let walker = builder.build();

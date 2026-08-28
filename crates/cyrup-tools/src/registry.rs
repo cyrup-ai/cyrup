@@ -1,7 +1,7 @@
 //! Tool registry: built-in construction, extension override, and availability filtering
 //! (R-03-010/041, arch-03 §3.4).
 
-use crate::config::ToolsOptions;
+use crate::config::{GrepOpts, ToolsOptions};
 use crate::lock::FileMutationLocks;
 use crate::ops::Backend;
 use crate::tools::{EditTool, FindTool, GrepTool, LsTool, ReadTool, ShellTool, WriteTool};
@@ -113,7 +113,23 @@ impl ToolRegistry {
         reg.insert(Arc::new(GrepTool::new(
             backend.fs.clone(),
             cwd.clone(),
-            opts.grep,
+            // The one place `$RIPGREP_CONFIG_PATH` is resolved. Pi gets the user's ripgrep config
+            // for free — its grep spawns the real binary, which reads the variable itself
+            // (`grep.ts:226`, no `env` key, no `--no-config`) — whereas cyrup searches in-process
+            // and has to hand the path in. Reading it HERE rather than inside the tool keeps the
+            // tool a pure function of its options, so its tests need no env mutation (`set_var` is
+            // `unsafe` under edition 2024, and would race every other test in the binary).
+            //
+            // An explicit path already on `opts.grep` wins, so an embedder that configures one is
+            // not overridden by the ambient environment.
+            GrepOpts {
+                rg_config_path: opts
+                    .grep
+                    .rg_config_path
+                    .clone()
+                    .or_else(crate::tools::rg_config_path_from_env),
+                ..opts.grep
+            },
         )));
         reg.insert(Arc::new(FindTool::new(
             backend.fs.clone(),

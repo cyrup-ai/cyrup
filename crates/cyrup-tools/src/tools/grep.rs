@@ -6,12 +6,13 @@ use crate::config::GrepOpts;
 use crate::ops::cancel_read::{CancelReader, Cancelled};
 use crate::ops::{FsOps, WalkFlavor, WalkOpts};
 use crate::tools::globmatch::{RgGlob, to_posix};
+use crate::tools::rgconfig::{self, CaseMode, RgFlags};
 use crate::truncate::{GREP_MAX_LINE_LENGTH, TruncOpts, format_size, truncate_head, truncate_line};
 use crate::{error, path};
 use cyrup_core::{CancelToken, Content, Tool, ToolCallId, ToolError, ToolResult, ToolUpdateSink};
 use futures::StreamExt;
 use grep_regex::RegexMatcherBuilder;
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{BinaryDetection, Encoding, Searcher, SearcherBuilder, Sink, SinkMatch};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -157,6 +158,11 @@ impl GrepTool {
         // `hiargs.rs:696-697`). The caller classifies the candidate; this function just uses what
         // it was given.
         binary: BinaryDetection,
+        // Config-derived searcher settings (`$RIPGREP_CONFIG_PATH`). `-v/--invert-match` and
+        // `-m/--max-count` are read off `rg`; `-E/--encoding` arrives pre-parsed because
+        // `Encoding::new` is fallible and must not be re-run per candidate.
+        rg: &RgFlags,
+        encoding: Option<&Encoding>,
         context: usize,
         limit: usize,
         count: &mut usize,
@@ -226,11 +232,24 @@ impl GrepTool {
         // Cloning is an `Arc` refcount bump (`CancelToken` is `tokio_util::sync::CancellationToken`,
         // cyrup-core `cancel.rs:9`).
         let cancel_task = cancel.clone();
+        let invert = rg.invert_match;
+        let max_count = rg.max_count;
+        let encoding = encoding.cloned();
         let searched: Result<Vec<(u64, Vec<u8>)>, Aborted> =
             tokio::task::spawn_blocking(move || {
                 let mut searcher: Searcher = SearcherBuilder::new()
                     .line_number(true)
                     .binary_detection(binary)
+                    .invert_match(invert)
+                    // `-m/--max-count` is ripgrep's PER-FILE cap, a different axis from pi's
+                    // GLOBAL `limit`: rg stops reading each haystack after N matches and moves on
+                    // to the next file, whereas `limit` ends the whole search. So it belongs on
+                    // the searcher and not folded into `remaining` above — the sink keeps
+                    // enforcing the global budget, and both caps apply independently.
+                    .max_matches(max_count)
+                    // `None` is grep-searcher's "sniff the BOM, else assume UTF-8" default, so an
+                    // absent `-E` leaves the existing behaviour exactly as it was.
+                    .encoding(encoding)
                     .build();
                 let mut matches: Vec<(u64, Vec<u8>)> = Vec::new();
                 let mut local = 0usize;
@@ -447,6 +466,14 @@ impl Tool for GrepTool {
             serde_json::from_value(params).map_err(|e| error::invalid(format!("grep: {e}")))?;
 
         let search_root = path::resolve_to_cwd(input.path.as_deref().unwrap_or("."), &self.cwd);
+
+        // Pi's grep inherits `$RIPGREP_CONFIG_PATH` because it spawns the real binary
+        // (`grep.ts:226`, no `env` key, no `--no-config`), so a user who set `--smart-case` or
+        // `-g '!vendor/**'` in their config gets it applied to every agent search. cyrup searches
+        // in-process, so nothing reads that config unless this does. Read once per call, not per
+        // candidate. A missing or unreadable file yields the default (all-off) set — ripgrep only
+        // warns on stderr there and searches anyway, and pi discards rg's stderr on a zero exit.
+        let rg = RgFlags::read(self.opts.rg_config_path.as_deref());
         let meta = self
             .fs
             .metadata(&search_root)
@@ -515,11 +542,56 @@ impl Tool for GrepTool {
         // branch, and only for a class of exactly one element. So `[\x00-\x01]` still builds, and
         // under `literal: true` the pattern is `regex_syntax::escape`d into ordinary backslash-x-0-0
         // characters that hold no NUL at all — rg exits 1 there, and so does this.
-        let matcher = RegexMatcherBuilder::new()
-            .multi_line(true)
-            .case_insensitive(input.ignore_case.unwrap_or(false))
-            .fixed_strings(input.literal.unwrap_or(false))
-            .line_terminator(Some(b'\n'))
+        //
+        // The config layer sits UNDER the caller's arguments, which is ripgrep's own precedence:
+        // it splices the config in as `config_args ++ cli_args` and lets the later occurrence win
+        // (`flags/parse.rs`). So an explicit `ignoreCase` on the tool call overrides `-i`/`-s`/`-S`
+        // from the config, and `-S/--smart-case` only gets a say when the caller expressed no
+        // preference at all — otherwise a config `--smart-case` would quietly re-case a search the
+        // model asked to be case-sensitive.
+        //
+        // `-i`, `-s` and `-S` are ONE mutually-exclusive group resolved to whichever came last
+        // (`CaseMode`), and the caller's own `ignoreCase` outranks all three — ripgrep's
+        // `config_args ++ cli_args` precedence, where the later occurrence wins
+        // (`flags/parse.rs`). An absent config and an absent argument leave the pre-existing
+        // case-sensitive default.
+        let case = match input.ignore_case {
+            Some(true) => CaseMode::Insensitive,
+            Some(false) => CaseMode::Sensitive,
+            None => rg.case.unwrap_or(CaseMode::Sensitive),
+        };
+
+        // `crlf` and `line_terminator` are the SAME setting reached two ways, so exactly one of
+        // them may be called — which is why this is an `if` and not two chained calls.
+        //
+        // In grep-regex (`matcher.rs`), `crlf(true)` sets both `config.crlf` and
+        // `config.line_terminator = LineTerminator::crlf()` (`:322-328`); `line_terminator` sets
+        // only the terminator (`:281-285`). Both orders of two unconditional calls are wrong, in
+        // opposite directions:
+        //
+        //   * `crlf` then `line_terminator` puts the terminator back to plain LF, so `^`/`$` used
+        //     the CRLF anchors from `config.crlf` while `strip_from_match` (`config.rs:222-229`)
+        //     and `has_line_terminator` (`:350-357`) still treated `\r` as an ordinary byte;
+        //   * `line_terminator` then `crlf` is worse, because `crlf(FALSE)` does not leave the
+        //     terminator alone — it sets it to `None` — which silently disarmed the `\n` guard for
+        //     every caller who has no config at all.
+        //
+        // So: the CRLF flag installs its own terminator, and otherwise the plain `\n` default
+        // stands exactly as it did before any of this existed.
+        let mut builder = RegexMatcherBuilder::new();
+        builder.multi_line(true);
+        if rg.crlf {
+            builder.crlf(true);
+        } else {
+            builder.line_terminator(Some(b'\n'));
+        }
+        let matcher = builder
+            .case_insensitive(case == CaseMode::Insensitive)
+            .case_smart(case == CaseMode::Smart)
+            .word(rg.word)
+            .whole_line(rg.whole_line)
+            .unicode(!rg.no_unicode)
+            .fixed_strings(input.literal.unwrap_or(rg.fixed_strings))
             .ban_byte(Some(b'\x00'))
             .build(&input.pattern)
             .map_err(|e| error::invalid(rg_pattern_error(&e)))?;
@@ -548,11 +620,43 @@ impl Tool for GrepTool {
             None => None,
         };
 
+        // `-E/--encoding` names a transcoding source (`Encoding::new`, grep-searcher 0.1.16
+        // `searcher/mod.rs:137`). An unknown label is DROPPED rather than made fatal, for the same
+        // reason an unknown flag is: a config written against a different build must not turn every
+        // search into an error. Declaring a real encoding the files do not use and then finding
+        // nothing is correct ripgrep behaviour, and is honoured as such.
+        let encoding = rg
+            .encoding
+            .as_deref()
+            .and_then(|label| Encoding::new(label).ok());
+
+        // The config's own glob and type filters. Both are `None` unless the config actually named
+        // one, so a caller with no config takes exactly the path it took before.
+        //
+        // These are the real `ignore` matchers rather than the hand-rolled single-line
+        // [`RgGlob`]: a config can carry many `-g` lines whose verdicts interact (last match wins,
+        // `!` re-includes), which is precisely what `Override` implements and what a per-line
+        // matcher cannot express. `RgGlob` stays where it is — it models the ONE `glob` tool
+        // argument pi forwards (grep.ts:218), which has different anchoring rules.
+        //
+        // The override root is `self.cwd`, matching ripgrep's: pi spawns `rg` with no `cwd` option
+        // and passes the search path positionally, so a `path` argument narrows the walk without
+        // re-anchoring the globs.
+        let cfg_override = rgconfig::build_override(&self.cwd, &rg);
+        let cfg_types = rgconfig::build_types(&rg);
+
         // ripgrep's two detection modes, one per candidate class (`hiargs.rs:1141-1157` with Pi's
         // flag set). The explicit one is `none()` and NOT `convert(b'\x00')` on purpose — see the
         // note in `search_one`.
         let binary_explicit = BinaryDetection::none();
-        let binary_implicit = BinaryDetection::quit(b'\x00');
+        // `-a/--text` (and `--binary`) turn the implicit `quit` off, so a traversed file keeps
+        // producing match events past its first NUL instead of ending as if at EOF. The explicit
+        // mode is already `none()` for the reasons in `search_one`, so `-a` cannot change it.
+        let binary_implicit = if rg.text {
+            BinaryDetection::none()
+        } else {
+            BinaryDetection::quit(b'\x00')
+        };
 
         let mut out: Vec<String> = Vec::new();
         let mut count = 0usize;
@@ -575,6 +679,8 @@ impl Tool for GrepTool {
                 &matcher,
                 &cancel,
                 binary_explicit,
+                &rg,
+                encoding.as_ref(),
                 context,
                 limit,
                 &mut count,
@@ -618,6 +724,47 @@ impl Tool for GrepTool {
                     // global ignore file, so unlike `find` nothing else attaches. This also
                     // keeps `find`'s `.fdignore` out of grep.
                     flavor: WalkFlavor::Rg,
+
+                    // The user's `$RIPGREP_CONFIG_PATH`, reaching the walk. Pi gets all of this
+                    // for free by spawning the real `rg`; cyrup has to carry it across.
+                    no_ignore: rg.no_ignore,
+                    no_ignore_vcs: rg.no_ignore_vcs,
+                    max_depth: rg.max_depth,
+                    follow_links: rg.follow,
+                    one_file_system: rg.one_file_system,
+                    max_filesize: rg.max_filesize,
+                    // Resolved against the TOOL's cwd, not the process cwd: `add_ignore` takes the
+                    // path as given, so a relative `--ignore-file` would otherwise be looked up
+                    // wherever the host process happens to be — never the directory the caller
+                    // named.
+                    //
+                    // Deliberately NOT `path::resolve_to_cwd`. That is pi's resolver for a
+                    // user-supplied TOOL ARGUMENT (`paths.ts:80-93`) and carries semantics that are
+                    // right there and wrong here: it strips a leading `@` unconditionally, so a
+                    // config naming a real file called `@vendorignore` would silently open
+                    // `vendorignore` instead — a different existing file, with nothing reporting
+                    // the substitution. It also rewrites `file://` URLs and Windows shell paths,
+                    // neither of which appears in a ripgrep config.
+                    //
+                    // Tilde expansion is the one piece kept, and it is a deliberate improvement
+                    // rather than an oversight: real ripgrep never expands `~` here, because a
+                    // config file is not shell-expanded, so `--ignore-file ~/.rgignore` simply
+                    // fails to open for it. Expanding cannot open the WRONG file — it can only
+                    // find one ripgrep would have missed.
+                    ignore_files: rg
+                        .ignore_files
+                        .iter()
+                        .map(|raw| {
+                            let expanded = path::expand_home(raw);
+                            let candidate = std::path::Path::new(&expanded);
+                            if candidate.is_absolute() {
+                                candidate.to_path_buf()
+                            } else {
+                                self.cwd.join(candidate)
+                            }
+                        })
+                        .collect(),
+                    sort_by_path: rg.sort_path,
                 },
             );
             loop {
@@ -671,7 +818,13 @@ impl Tool for GrepTool {
                                 if !w.is_file && !w.is_dir {
                                     continue;
                                 }
-                                if let Some(g) = &glob {
+                                // A directory filter is in force when the caller passed a glob OR
+                                // the user's config carries one. Without either, a directory is
+                                // simply not a search subject and is dropped as before.
+                                if glob.is_none() && cfg_override.is_none() && w.is_dir {
+                                    continue;
+                                }
+                                {
                                     // Anything under a directory the override already pruned is
                                     // gone — files AND nested directories — before any further
                                     // test. This is `skip_current_dir()`'s effect, applied on the
@@ -695,20 +848,41 @@ impl Tool for GrepTool {
                                         // (dir.rs:416-425), and an Ignore verdict takes the whole
                                         // subtree. A plain (non-`!`) glob that simply misses does
                                         // NOT prune — overrides.rs:106 guards that fallback with
-                                        // `!is_dir` — so `prunes_dir` is the only test here.
+                                        // `!is_dir` — so `prunes_dir` is the only test here, and
+                                        // `Override::matched` applies the same rule internally.
                                         //
                                         // walk.rs:1057-1060: `skip_entry` returns false at depth 0,
                                         // so the search root itself is never prunable.
-                                        if w.path != search_root && g.prunes_dir(&glob_rel) {
+                                        //
+                                        // `--type`/`--type-not` deliberately do NOT prune: ripgrep
+                                        // matches types against files only (`Types::matched`
+                                        // returns `None` for a directory), so a `-t rust` config
+                                        // must still descend into directories that do not look
+                                        // like Rust to reach the `.rs` files inside them.
+                                        let prunes = glob.as_ref().is_some_and(|g| g.prunes_dir(&glob_rel))
+                                            || cfg_override
+                                                .as_ref()
+                                                .is_some_and(|o| o.matched(&glob_rel, true).is_ignore());
+                                        if w.path != search_root && prunes {
                                             pruned.push(w.path.clone());
                                         }
                                         continue;
                                     }
-                                    if !g.keeps_file(&glob_rel) {
+                                    if let Some(g) = &glob
+                                        && !g.keeps_file(&glob_rel)
+                                    {
                                         continue;
                                     }
-                                } else if w.is_dir {
-                                    continue;
+                                    if let Some(o) = &cfg_override
+                                        && o.matched(&glob_rel, false).is_ignore()
+                                    {
+                                        continue;
+                                    }
+                                    if let Some(t) = &cfg_types
+                                        && t.matched(&glob_rel, false).is_ignore()
+                                    {
+                                        continue;
+                                    }
                                 }
                                 let rel_path = w.path.strip_prefix(&search_root).unwrap_or(&w.path);
                                 let rel = to_posix(rel_path);
@@ -720,6 +894,8 @@ impl Tool for GrepTool {
                                     &matcher,
                                     &cancel,
                                     binary_implicit.clone(),
+                                    &rg,
+                                    encoding.as_ref(),
                                     context,
                                     limit,
                                     &mut count,
@@ -833,6 +1009,7 @@ mod tests {
     use super::GrepTool;
     use crate::config::GrepOpts;
     use crate::ops::local::LocalFs;
+    use crate::tools::rgconfig::RgFlags;
     use crate::ops::{Access, DirEntry, FsOps, Meta, WalkItem, WalkOpts};
     use cyrup_core::{CancelToken, Content, EventStream, Tool, ToolCallId, ToolError, ToolUpdate};
     use std::path::Path;
@@ -1556,4 +1733,459 @@ mod tests {
             )
         );
     }
+
+    // ---------------------------------------------------------------------------------------
+    // $RIPGREP_CONFIG_PATH
+    //
+    // Pi's grep spawns the real `rg` with no `env` key and no `--no-config` (grep.ts:226), so the
+    // child inherits the variable and applies the user's config on every search. cyrup searches
+    // in-process, so none of that happens unless it is done deliberately.
+    //
+    // Every test below drives the config through `GrepOpts::rg_config_path` rather than through
+    // `std::env::set_var`: mutating the process environment is UB under edition 2024 (the setter
+    // is `unsafe` for exactly that reason) and would race every other test in the binary.
+    // ---------------------------------------------------------------------------------------
+
+    /// Run `grep` against `cwd` with `config` (if any) as the user's ripgrep config file.
+    async fn grep_with_config(cwd: &Path, config: Option<&Path>, args: serde_json::Value) -> String {
+        let opts = GrepOpts {
+            rg_config_path: config.map(std::path::Path::to_path_buf),
+            ..GrepOpts::default()
+        };
+        let grep = GrepTool::new(Arc::new(LocalFs), cwd.to_path_buf(), opts);
+        let r = grep
+            .execute(
+                ToolCallId::from("tc-test"),
+                args,
+                CancelToken::new(),
+                Box::new(|_u: ToolUpdate| {}),
+            )
+            .await
+            .unwrap();
+        match r.content.first() {
+            Some(Content::Text { text, .. }) => text.clone(),
+            _ => String::new(),
+        }
+    }
+
+    /// A tree with one lowercase and one uppercase occurrence, plus a config file.
+    fn tree_with_config(config: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "NEEDLE\n").unwrap();
+        std::fs::write(dir.path().join("rc"), config).unwrap();
+        dir
+    }
+
+    /// THE CANARY. Before the config was read, this returned only the exact-case hit.
+    ///
+    /// `--smart-case` makes an all-lowercase pattern case-insensitive, so `needle` must now also
+    /// find `NEEDLE`. Delete the `.case_smart(…)` call from the matcher and this fails — which is
+    /// the point: it proves the config reaches `RegexMatcherBuilder` and changes the MATCH SET,
+    /// not merely that a file was parsed.
+    #[tokio::test]
+    async fn smart_case_in_config_changes_the_match_set() {
+        let dir = tree_with_config("--smart-case\n");
+        let rc = dir.path().join("rc");
+
+        let without = grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
+        assert!(without.contains("a.txt"), "baseline should match the lowercase file: {without}");
+        assert!(
+            !without.contains("b.txt"),
+            "without the config the search is case-SENSITIVE: {without}"
+        );
+
+        let with = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            with.contains("a.txt") && with.contains("b.txt"),
+            "--smart-case must fold the uppercase file in: {with}"
+        );
+    }
+
+    /// `-q` is parsed and then DROPPED. See [`RgFlags::QUIET_IS_REFUSED`].
+    ///
+    /// Honouring it would reproduce pi's own defect: `-q` short-circuits ripgrep's printer to
+    /// `Summary(Quiet)` before the JSON arm is reached (`flags/hiargs.rs:565` @14.1.0), so rg exits
+    /// 0 emitting no `type:"match"` events and pi answers `No matches found` with matches present.
+    /// Parity is the floor, not the target.
+    #[tokio::test]
+    async fn quiet_in_config_is_ignored_and_matches_are_still_returned() {
+        assert!(
+            RgFlags::QUIET_IS_REFUSED.contains("hiargs.rs:565"),
+            "the refusal must stay cited to the ripgrep line that causes it"
+        );
+        let dir = tree_with_config("-q\n");
+        let rc = dir.path().join("rc");
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            out.contains("a.txt"),
+            "-q must not silence the result set: {out}"
+        );
+        assert!(!out.contains("No matches found"), "{out}");
+    }
+
+    /// The config layer sits UNDER the caller's arguments — ripgrep's own `config_args ++ cli_args`
+    /// precedence, where the later occurrence wins (`flags/parse.rs`).
+    #[tokio::test]
+    async fn caller_argument_beats_config() {
+        let dir = tree_with_config("--ignore-case\n");
+        let rc = dir.path().join("rc");
+
+        // Config alone: case-insensitive, so both files match.
+        let cfg_only = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(cfg_only.contains("b.txt"), "config -i should fold in NEEDLE: {cfg_only}");
+
+        // The caller says otherwise, and the caller wins.
+        let overridden = grep_with_config(
+            dir.path(),
+            Some(&rc),
+            serde_json::json!({"pattern": "needle", "ignoreCase": false}),
+        )
+        .await;
+        assert!(
+            overridden.contains("a.txt") && !overridden.contains("b.txt"),
+            "an explicit ignoreCase:false must override the config's -i: {overridden}"
+        );
+    }
+
+    /// An unrecognised flag is IGNORED, and the flags around it still apply.
+    ///
+    /// ripgrep would exit 2 with `unrecognized flag`. Reproducing that would pin cyrup to one
+    /// ripgrep version — a user on a newer rg with a newer flag would get an error instead of a
+    /// search — and cyrup is not a ripgrep CLI. The neighbouring `--smart-case` still landing is
+    /// what makes this a real assertion rather than "nothing crashed".
+    #[tokio::test]
+    async fn unknown_flag_is_ignored_not_fatal() {
+        let dir = tree_with_config("--this-flag-does-not-exist\n--smart-case\n");
+        let rc = dir.path().join("rc");
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            out.contains("a.txt") && out.contains("b.txt"),
+            "the unknown flag must be skipped and --smart-case must still apply: {out}"
+        );
+    }
+
+    /// A missing or unreadable config is not an error.
+    ///
+    /// ripgrep only warns on stderr and searches anyway, and pi discards rg's stderr on a zero
+    /// exit — so upstream this is invisible. A hard failure here would break every search for a
+    /// user whose `$RIPGREP_CONFIG_PATH` points at a file they deleted.
+    #[tokio::test]
+    async fn missing_config_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        let absent = dir.path().join("no-such-file");
+
+        let out = grep_with_config(dir.path(), Some(&absent), serde_json::json!({"pattern": "needle"})).await;
+        assert!(out.contains("a.txt"), "a missing config must not fail the search: {out}");
+
+        // A directory stands in for the unreadable case: `read_to_string` fails on it on every
+        // platform, with no need to depend on running as a non-root user.
+        let out = grep_with_config(dir.path(), Some(dir.path()), serde_json::json!({"pattern": "needle"})).await;
+        assert!(out.contains("a.txt"), "an unreadable config must not fail the search: {out}");
+    }
+
+    /// Comments, blank lines and a value on its own line — ripgrep's config FORMAT, not a shell
+    /// grammar (`flags/config.rs` @14.1.0). `-g` prunes the excluded directory out of the walk.
+    #[tokio::test]
+    async fn config_globs_filter_the_walk() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("vendor")).unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("vendor/skip.txt"), "needle\n").unwrap();
+        std::fs::write(
+            dir.path().join("rc"),
+            "# a comment line is ignored\n\n--glob\n!vendor/**\n",
+        )
+        .unwrap();
+        let rc = dir.path().join("rc");
+
+        let without = grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            without.contains("keep.txt") && without.contains("skip.txt"),
+            "baseline should reach both files: {without}"
+        );
+
+        let with = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(with.contains("keep.txt"), "{with}");
+        assert!(
+            !with.contains("skip.txt"),
+            "the config's !vendor/** must prune the directory: {with}"
+        );
+    }
+
+
+    // ---------------------------------------------------------------------------------------
+    // QA rework guards. Each of the three below was a flag §6.1 lists as HONOUR that did not
+    // actually work; each test fails without its fix.
+    // ---------------------------------------------------------------------------------------
+
+    /// Same as [`grep_with_config`] but for the refusal path.
+    async fn grep_err_with_config(cwd: &Path, config: &Path, args: serde_json::Value) -> String {
+        let opts = GrepOpts {
+            rg_config_path: Some(config.to_path_buf()),
+            ..GrepOpts::default()
+        };
+        let grep = GrepTool::new(Arc::new(LocalFs), cwd.to_path_buf(), opts);
+        grep.execute(
+            ToolCallId::from("tc-test"),
+            args,
+            CancelToken::new(),
+            Box::new(|_u: ToolUpdate| {}),
+        )
+        .await
+        .unwrap_err()
+        .to_string()
+    }
+
+    /// An overflowing `--max-filesize` is dropped, not propagated.
+    ///
+    /// `18446744073709551615K` parses as `u64::MAX` and then multiplies by 1024. Unchecked that
+    /// PANICS under the workspace dev profile and WRAPS in release into a tiny cap that silently
+    /// drops files from the search — the worse of the two, because nothing in the output says so.
+    /// The module's contract is that a bad config never makes the tool fail, so the value is
+    /// discarded like any other unparseable one.
+    #[tokio::test]
+    async fn overflowing_max_filesize_is_dropped_not_a_panic() {
+        assert_eq!(
+            RgFlags::parse("--max-filesize\n18446744073709551615K\n").max_filesize,
+            None,
+            "an overflowing size must be dropped, not wrapped"
+        );
+        // A sane value still resolves, so the guard above is not passing for the wrong reason.
+        assert_eq!(
+            RgFlags::parse("--max-filesize\n2K\n").max_filesize,
+            Some(2048)
+        );
+
+        let dir = tree_with_config("--max-filesize\n18446744073709551615K\n");
+        let rc = dir.path().join("rc");
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            out.contains("a.txt"),
+            "the search must still run with the bad value dropped: {out}"
+        );
+    }
+
+    /// `--crlf` must leave the matcher internally consistent about what ends a line.
+    ///
+    /// `crlf(true)` sets BOTH `config.crlf` and a CRLF line terminator (grep-regex
+    /// `matcher.rs:322-328`); `line_terminator` sets only the latter. With `line_terminator`
+    /// called last it overwrote the CRLF terminator, so `^`/`$` used the CRLF anchors while
+    /// `strip_from_match` and `has_line_terminator` still treated `\r` as an ordinary byte.
+    ///
+    /// The observable is the existing line-terminator guard, extended: under `--crlf`, `\r` IS a
+    /// line terminator and a pattern demanding one must be refused exactly as `\n` already is.
+    /// Without the fix the pattern builds and searches instead.
+    #[tokio::test]
+    async fn crlf_in_config_makes_carriage_return_a_line_terminator() {
+        let dir = tree_with_config("--crlf\n");
+        let rc = dir.path().join("rc");
+
+        let msg = grep_err_with_config(dir.path(), &rc, serde_json::json!({"pattern": "a\\rb"})).await;
+        assert!(
+            msg.starts_with(r#"rg: the literal "\r" is not allowed in a regex"#),
+            "under --crlf, \\r is a line terminator and must be refused exactly as \\n is: {msg}"
+        );
+
+        // Without the flag the same pattern is ordinary and simply finds nothing, which is what
+        // makes the assertion above about `--crlf` rather than about the pattern.
+        let out = grep_with_config(dir.path(), None, serde_json::json!({"pattern": "a\\rb"})).await;
+        assert!(out.contains("No matches found"), "{out}");
+    }
+
+    /// `--sortr=path` descends. It shares no comparator with `--sort=path`.
+    ///
+    /// This is result-visible rather than cosmetic: `grep` is fused to its match cap, so with
+    /// `limit: 1` the traversal direction decides WHICH match the caller receives. Collapsing both
+    /// flags onto one ascending sort returned the opposite file.
+    #[tokio::test]
+    async fn sortr_reverses_which_match_the_cap_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("z.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("asc"), "--sort\npath\n").unwrap();
+        std::fs::write(dir.path().join("desc"), "--sortr\npath\n").unwrap();
+
+        let args = serde_json::json!({"pattern": "needle", "limit": 1, "glob": "*.txt"});
+        let asc = grep_with_config(dir.path(), Some(&dir.path().join("asc")), args.clone()).await;
+        let desc = grep_with_config(dir.path(), Some(&dir.path().join("desc")), args).await;
+
+        assert!(asc.contains("a.txt") && !asc.contains("z.txt"), "--sort=path: {asc}");
+        assert!(desc.contains("z.txt") && !desc.contains("a.txt"), "--sortr=path: {desc}");
+    }
+
+    /// `-i`, `-s` and `-S` are one group, and the LAST one written wins.
+    ///
+    /// As three independent fields, `-S` followed by `-s` kept smart-case on and the later `-s`
+    /// did nothing.
+    #[tokio::test]
+    async fn last_case_flag_in_config_wins() {
+        let dir = tree_with_config("-S\n-s\n");
+        let rc = dir.path().join("rc");
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            out.contains("a.txt") && !out.contains("b.txt"),
+            "-s came last, so the search is case-sensitive: {out}"
+        );
+
+        // The same two flags the other way round, to prove the assertion tracks ORDER and not
+        // merely the presence of `-s`.
+        let dir = tree_with_config("-s\n-S\n");
+        let rc = dir.path().join("rc");
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            out.contains("a.txt") && out.contains("b.txt"),
+            "-S came last, so smart-case folds NEEDLE in: {out}"
+        );
+    }
+
+    /// A relative `--ignore-file` resolves against the TOOL's cwd, not the process cwd.
+    ///
+    /// `WalkBuilder::add_ignore` takes the path verbatim, so an unresolved relative path was looked
+    /// up wherever the host process happened to be — never the directory the caller named — and
+    /// the ignore file silently did nothing.
+    #[tokio::test]
+    async fn relative_ignore_file_resolves_against_the_tools_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("myignore"), "skip.txt\n").unwrap();
+        std::fs::write(dir.path().join("rc"), "--ignore-file\nmyignore\n").unwrap();
+        let rc = dir.path().join("rc");
+
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(out.contains("keep.txt"), "{out}");
+        assert!(
+            !out.contains("skip.txt"),
+            "the relative ignore file must be found and applied: {out}"
+        );
+    }
+
+
+    /// An `--ignore-file` whose filename really does begin with `@` must be opened, not rewritten.
+    ///
+    /// `path::resolve_to_cwd` is pi's resolver for a user-supplied tool ARGUMENT and strips a
+    /// leading `@` unconditionally (`paths.ts:80-93`). Pointed at a config value it silently
+    /// substituted a different existing file. The decoy below is what makes this a real assertion:
+    /// the two candidate files exclude OPPOSITE things, so reading the wrong one is visible in the
+    /// result rather than merely absent from it.
+    #[tokio::test]
+    async fn ignore_file_named_with_a_leading_at_is_not_rewritten() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("keep.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("skip.txt"), "needle\n").unwrap();
+        // The file the config actually names.
+        std::fs::write(dir.path().join("@vendorignore"), "skip.txt\n").unwrap();
+        // The file an `@`-stripping resolver would reach for instead — it excludes the other one.
+        std::fs::write(dir.path().join("vendorignore"), "keep.txt\n").unwrap();
+        std::fs::write(dir.path().join("rc"), "--ignore-file\n@vendorignore\n").unwrap();
+        let rc = dir.path().join("rc");
+
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(
+            out.contains("keep.txt"),
+            "the @-named ignore file excludes skip.txt, so keep.txt must survive: {out}"
+        );
+        assert!(
+            !out.contains("skip.txt"),
+            "the file the config named must actually be applied: {out}"
+        );
+    }
+
+    /// One malformed `--type-add` must not disable the type filtering that IS valid.
+    ///
+    /// `TypesBuilder::build` fails with `unrecognized file type` if any selection names a type that
+    /// does not exist, and that failure took the whole matcher down — so a dropped `--type-add`
+    /// plus a `-t` for the name it tried to define also discarded the `-t rust` beside it, and the
+    /// search silently stopped filtering by type at all.
+    #[tokio::test]
+    async fn a_malformed_type_add_does_not_disable_valid_type_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("top.rs"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("top.txt"), "needle\n").unwrap();
+        std::fs::write(
+            dir.path().join("rc"),
+            // `thisIsMalformed` has no `:`, so `add_def` rejects it and the type is never defined.
+            "--type-add\nthisIsMalformed\n--type\nthisIsMalformed\n--type\nrust\n",
+        )
+        .unwrap();
+        let rc = dir.path().join("rc");
+
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(out.contains("top.rs"), "the valid -t rust must still select: {out}");
+        assert!(
+            !out.contains("top.txt"),
+            "type filtering must survive the malformed --type-add: {out}"
+        );
+    }
+
+
+    /// `--no-ignore` must clear EVERY ignore source, including the strongest one.
+    ///
+    /// `ignore(false)` drops `.ignore` and the git switches drop the gitignore family, but the
+    /// custom ignore file (`.rgignore` for the rg flavor) is a separate source — and by
+    /// `dir.rs:580-585` it outranks all of them. Leaving it registered meant `--no-ignore` changed
+    /// nothing whatsoever in any tree that had one.
+    ///
+    /// The fixture carries all three kinds deliberately: with only `.gitignore` and `.ignore` this
+    /// test passes with or without the fix and proves nothing.
+    #[tokio::test]
+    async fn no_ignore_in_config_clears_every_ignore_source() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.path().join(f), "needle\n").unwrap();
+        }
+        // A real `.git` directory, because `grep` walks with `require_git: true` — ripgrep's
+        // default. Outside a repository a stray `.gitignore` is deliberately NOT applied, so
+        // without this the `.gitignore` arm of the fixture would be inert and the test would be
+        // asserting over two sources while claiming three.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "a.txt\n").unwrap();
+        std::fs::write(dir.path().join(".ignore"), "b.txt\n").unwrap();
+        std::fs::write(dir.path().join(".rgignore"), "c.txt\n").unwrap();
+        std::fs::write(dir.path().join("rc"), "--no-ignore\n").unwrap();
+        let rc = dir.path().join("rc");
+
+        // Baseline: each of the three files is hidden by a different ignore source, so a search
+        // with no config finds none of them. This is what makes the assertion below meaningful.
+        let without = grep_with_config(dir.path(), None, serde_json::json!({"pattern": "needle"})).await;
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            assert!(!without.contains(f), "{f} should be ignored by default: {without}");
+        }
+
+        let with = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            assert!(with.contains(f), "--no-ignore must surface {f}: {with}");
+        }
+    }
+
+    /// `--no-ignore-vcs` is the NARROWER switch and must stay that way.
+    ///
+    /// It implies neither `no_ignore_dot` nor `no_ignore_parent`, so `.ignore` and `.rgignore` keep
+    /// applying while only the gitignore family is dropped. Folding the two flags together would
+    /// have made this indistinguishable from `--no-ignore`.
+    #[tokio::test]
+    async fn no_ignore_vcs_leaves_the_non_git_sources_in_force() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.path().join(f), "needle\n").unwrap();
+        }
+        // A real `.git` directory, because `grep` walks with `require_git: true` — ripgrep's
+        // default. Outside a repository a stray `.gitignore` is deliberately NOT applied, so
+        // without this the `.gitignore` arm of the fixture would be inert and the test would be
+        // asserting over two sources while claiming three.
+        std::fs::create_dir(dir.path().join(".git")).unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "a.txt\n").unwrap();
+        std::fs::write(dir.path().join(".ignore"), "b.txt\n").unwrap();
+        std::fs::write(dir.path().join(".rgignore"), "c.txt\n").unwrap();
+        std::fs::write(dir.path().join("rc"), "--no-ignore-vcs\n").unwrap();
+        let rc = dir.path().join("rc");
+
+        let out = grep_with_config(dir.path(), Some(&rc), serde_json::json!({"pattern": "needle"})).await;
+        assert!(out.contains("a.txt"), "the gitignore'd file must surface: {out}");
+        assert!(!out.contains("b.txt"), ".ignore must still apply: {out}");
+        assert!(!out.contains("c.txt"), ".rgignore must still apply: {out}");
+    }
+
 }

@@ -345,6 +345,18 @@ impl From<PowerShellOpts> for BashOpts {
 pub struct GrepOpts {
     pub limit: usize,
     pub max_bytes: usize,
+    /// Where to read ripgrep's config from — the `$RIPGREP_CONFIG_PATH` seam.
+    ///
+    /// Pi's grep spawns the real `rg` binary with no `env` key and no `--no-config`
+    /// (`grep.ts:226`), so the child inherits the variable and ripgrep applies the user's config
+    /// on every call. cyrup searches in-process, so the path is resolved once, here, and the
+    /// tool reads it rather than touching the process environment itself — which keeps the
+    /// reader testable without any env mutation (UB under edition 2024).
+    ///
+    /// [`Default`] is `None` — no ambient environment, so a test never depends on what the
+    /// developer running it happens to have exported. The registry fills it from
+    /// `$RIPGREP_CONFIG_PATH` when it builds the real tool.
+    pub rg_config_path: Option<std::path::PathBuf>,
 }
 
 impl Default for GrepOpts {
@@ -352,6 +364,7 @@ impl Default for GrepOpts {
         Self {
             limit: GREP_MAX_MATCHES,
             max_bytes: DEFAULT_MAX_BYTES,
+            rg_config_path: None,
         }
     }
 }
