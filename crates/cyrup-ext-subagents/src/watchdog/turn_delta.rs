@@ -591,6 +591,7 @@ mod tests {
         let message = cyrup_agent::AgentMessage::Custom {
             kind: "probe".to_string(),
             payload: json!({}),
+            details: None,
             timestamp: Some(0),
         };
 
@@ -633,6 +634,7 @@ mod tests {
         let message = cyrup_agent::AgentMessage::Custom {
             kind: "probe".to_string(),
             payload: json!({}),
+            details: None,
             timestamp: Some(0),
         };
         let event = watchdog_turn_end_event(&message, std::slice::from_ref(&result));

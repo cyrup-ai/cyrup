@@ -232,7 +232,11 @@ pub fn send_incoming_message_at(
         message: message.clone(),
         received_at: now_ms(),
     });
-    let content = build_inline_message_for(state, from, message, delivery).content_markdown();
+    // `details: deliveredEntry` (`index.ts:1216`) — the SAME entry the content was rendered from,
+    // carrying the `injectedAt`-stamped message and the delivery-adjusted reply command.
+    let card = build_inline_message_for(state, from, message, delivery);
+    let content = card.content_markdown();
+    let details = serde_json::to_value(&card).ok();
     // `{ triggerTurn: true }` vs `{ deliverAs: "steer" }`. cyrup's seam takes the boolean:
     // `AgentSession::inject_message` routes to `agent.steer(msg)` whenever `is_streaming()`
     // regardless of the flag (`cyrup-session-svc/src/session.rs:3926-3928`), so a busy session's
@@ -240,9 +244,13 @@ pub fn send_incoming_message_at(
     // whether an IDLE session spawns a run over the message.
     let trigger_turn = delivery == InboundDelivery::Trigger
         && should_trigger_inbound_message(state.config.inbound_trigger, message);
-    if let Err(e) =
-        services.inject_message(&content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), true, trigger_turn)
-    {
+    if let Err(e) = services.inject_message(
+        &content,
+        Some(INBOUND_MESSAGE_CUSTOM_TYPE),
+        true,
+        details.as_ref(),
+        trigger_turn,
+    ) {
         tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
     }
     true
@@ -270,10 +278,16 @@ pub fn trigger_turn_over_inbound(
         message: message.clone(),
         received_at: now_ms(),
     });
-    let content = build_inline_message(state, from, message).content_markdown();
-    if let Err(e) =
-        services.inject_message(&content, Some(INBOUND_MESSAGE_CUSTOM_TYPE), true, trigger)
-    {
+    let card = build_inline_message(state, from, message);
+    let content = card.content_markdown();
+    let details = serde_json::to_value(&card).ok();
+    if let Err(e) = services.inject_message(
+        &content,
+        Some(INBOUND_MESSAGE_CUSTOM_TYPE),
+        true,
+        details.as_ref(),
+        trigger,
+    ) {
         tracing::warn!(error = %e, "intercom: failed to deliver an inbound message");
     }
     true
@@ -426,7 +440,12 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                         MessageReceiptStatus::Acknowledged,
                         Some("accepted by receiver"),
                     );
-                    surface_incoming_message(&state, &from, &message);
+                    // (3) The durable `append_entry` surface is NOT written here any more: the
+                    //     delivering arms below inject a custom message that the registered message
+                    //     renderer draws, and `append_custom_message(…, details)` persists it, so
+                    //     writing both would paint the card TWICE for every delivery. Upstream has
+                    //     exactly one surface. It is written by the two arms that inject nothing —
+                    //     see `AutoReply`/`SurfaceOnly` below.
                     // (4) Dispatch the inbound delivery policy (pi `handleIncomingMessage`,
                     //     `index.ts:745-765`), computed AFTER the durable surface from whether a run
                     //     is in flight (`ctx.isIdle()`, read live off `HostServices`), this session's
@@ -471,6 +490,10 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                             send_incoming_message(&state, &from, &message, InboundDelivery::Steer);
                         }
                         InboundPolicy::AutoReply => {
+                            // Busy + non-interactive: nothing is injected, so the durable entry IS
+                            // the surface. Drawn by `IntercomExtension::render_entry` from the
+                            // pre-rendered card.
+                            surface_incoming_message(&state, &from, &message);
                             auto_reply_non_interactive_at(
                                 &state,
                                 &from,
@@ -479,7 +502,12 @@ pub fn spawn_inbound_loop(state: Arc<SharedIntercomState>, client: Arc<IntercomC
                             )
                             .await;
                         }
-                        InboundPolicy::SurfaceOnly => {}
+                        InboundPolicy::SurfaceOnly => {
+                            // Busy + non-interactive + the message is itself a reply: no auto-reply
+                            // and no injection, so this arm is the durable surface and nothing else.
+                            // Without it the message would be recorded and then drawn by nothing.
+                            surface_incoming_message(&state, &from, &message);
+                        }
                     }
                 }
                 Ok(InboundEvent::Disconnected(reason)) => {
@@ -606,15 +634,15 @@ pub fn surface_incoming_message(
 ) -> Option<String> {
     let services = state.host_services()?;
     let card = build_inline_message(state, from, message);
-    let payload = json!({
-        "content": card.content_markdown(),
-        "card": card.render(&PlainTheme, SURFACE_CARD_WIDTH),
-        "from": from,
-        "message": message,
-        "replyCommand": card.reply_command,
-        "bodyText": card.body(),
-        "collapsed": card.collapsed,
-    });
+    // The entry payload IS the serialized card (upstream's `deliveredEntry`) plus the two
+    // cyrup-only pre-rendered surfaces the entry renderer reads: the model-facing markdown
+    // `content` and the width-80 `card` degrade. Serializing the card rather than restating its
+    // fields is what keeps this payload and the `inject_message` details the same bytes.
+    let mut payload = serde_json::to_value(&card).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("content".into(), json!(card.content_markdown()));
+        obj.insert("card".into(), json!(card.render(&PlainTheme, SURFACE_CARD_WIDTH)));
+    }
     match services.append_entry(INBOUND_MESSAGE_CUSTOM_TYPE, &payload) {
         Ok(id) => Some(id),
         Err(e) => {
@@ -858,6 +886,7 @@ mod tests {
             content: &str,
             custom_type: Option<&str>,
             display: bool,
+            _details: Option<&serde_json::Value>,
             trigger_turn: bool,
         ) -> std::result::Result<(), String> {
             self.injected.lock().unwrap().push((

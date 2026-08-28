@@ -424,7 +424,7 @@ pub trait HostServices: Send + Sync {
     }
 
     /// Inject a user-visible message into the live session and OPTIONALLY trigger an agent turn over it
-    /// (Pi `pi.sendMessage({content, customType, display}, {triggerTurn})` → `sendCustomMessage`,
+    /// (Pi `pi.sendMessage({content, customType, display, details}, {triggerTurn})` → `sendCustomMessage`,
     /// agent-session.ts:1337-1370). `custom_type = Some(t)` tags a custom (non-LLM) message (e.g.
     /// `"subagent-notify"`); `None` is a plain user message. `display` controls surfacing; `trigger_turn`
     /// re-enters the agent turn loop OVER the injected message — the `triggerTurn` branch cyrup's own
@@ -434,11 +434,21 @@ pub trait HostServices: Send + Sync {
     /// completion currently degrades to a stderr `LoggingCompletionSink`); [`crate::contract::HookOutcome`] has no such
     /// variant (Noop/Block/Mutate/Handled only), so this belongs on the capability backend, not a hook
     /// return.
+    ///
+    /// `details` is pi's opaque structured payload (`extensions/types.ts`
+    /// `Pick<CustomMessage, "customType" | "content" | "display" | "details">`): it is persisted on the
+    /// `CustomMessage` entry AND carried on the live message, so a registered message renderer can
+    /// rebuild its card from structure instead of re-parsing the rendered `content`
+    /// (pi-intercom `index.ts:1216` `details: deliveredEntry`, read back at `:1817`). It sits between
+    /// `display` and `trigger_turn`, mirroring pi's split of the message object from the options bag;
+    /// the differing parameter type makes a mis-ordered call site a compile error rather than a silent
+    /// swap of two `bool`s.
     fn inject_message(
         &self,
         _content: &str,
         _custom_type: Option<&str>,
         _display: bool,
+        _details: Option<&Value>,
         _trigger_turn: bool,
     ) -> Result<(), String> {
         Err("message injection not available".into())

@@ -172,6 +172,7 @@ impl HostServices for RecordingHostServices {
         content: &str,
         custom_type: Option<&str>,
         display: bool,
+        _details: Option<&serde_json::Value>,
         trigger_turn: bool,
     ) -> Result<(), String> {
         self.calls.lock().expect("inject lock").push((

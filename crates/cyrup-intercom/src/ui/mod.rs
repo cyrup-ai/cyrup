@@ -45,7 +45,7 @@ pub mod inline_message;
 pub mod session_list;
 
 pub use compose::{ComposeAction, ComposeOverlay, compose_send};
-pub use inline_message::InlineMessage;
+pub use inline_message::{InlineMessage, InlineMessageComponent};
 pub use session_list::SessionListOverlay;
 
 /// A color/emphasis theme (pi `Theme`, `@earendil-works/pi-coding-agent`). Only the two methods the
@@ -323,7 +323,19 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
                 }
                 let mut chunk = String::new();
                 let mut chunk_w = 0usize;
-                for c in word.chars() {
+                // ANSI-aware: an escape sequence is consumed WHOLE and appended at zero width, so
+                // the hard break can never fall inside one and leave `[38;2;` visible as text. Pi's
+                // counterpart is `wrapTextWithAnsi`; the scanner is the module's own
+                // `extract_ansi_code_len`, which `visible_width` already uses for measurement.
+                let cs: Vec<char> = word.chars().collect();
+                let mut i = 0usize;
+                while i < cs.len() {
+                    if let Some(len) = extract_ansi_code_len(&cs, i) {
+                        chunk.extend(&cs[i..i + len]);
+                        i += len;
+                        continue;
+                    }
+                    let c = cs[i];
                     let cw = char_width(c);
                     if chunk_w + cw > width && !chunk.is_empty() {
                         lines.push(std::mem::take(&mut chunk));
@@ -331,6 +343,7 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
                     }
                     chunk.push(c);
                     chunk_w += cw;
+                    i += 1;
                 }
                 current = chunk;
                 current_w = chunk_w;

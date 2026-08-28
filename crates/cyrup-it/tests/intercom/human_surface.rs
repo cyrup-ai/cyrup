@@ -41,34 +41,65 @@ use crate::common::registration;
 /// A scripted `HostServices` sink: records every `append_entry` (and signals it on a channel) and
 /// answers `input` with a canned reply. The in-crate analog of the live TUI/RPC backend the session
 /// injects — proves the human surface reaches a real `HostServices`, not a stub.
+/// A `HostServices` double for the human surface.
+///
+/// It records BOTH halves of that surface, because the production code uses both and which one an
+/// inbound message takes is a function of the delivery arm: a session that can be delivered to (idle
+/// or steerable) gets `inject_message` carrying the card as `details`, and only a busy
+/// non-interactive session falls back to the durable `append_entry`. A double that implemented just
+/// one of the two could not observe the arm actually taken.
 struct ScriptedSink {
-    appended: Mutex<Vec<(String, Value)>>,
-    append_tx: UnboundedSender<(String, Value)>,
+    surfaced: Mutex<Vec<(String, Value)>>,
+    surface_tx: UnboundedSender<(String, Value)>,
     input_answer: Option<String>,
     input_prompts: Mutex<Vec<String>>,
 }
 
 impl ScriptedSink {
     fn new(input_answer: &str) -> (Arc<Self>, UnboundedReceiver<(String, Value)>) {
-        let (append_tx, append_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (surface_tx, surface_rx) = tokio::sync::mpsc::unbounded_channel();
         let sink = Arc::new(Self {
-            appended: Mutex::new(Vec::new()),
-            append_tx,
+            surfaced: Mutex::new(Vec::new()),
+            surface_tx,
             input_answer: Some(input_answer.to_string()),
             input_prompts: Mutex::new(Vec::new()),
         });
-        (sink, append_rx)
+        (sink, surface_rx)
+    }
+
+    /// Record one surfacing under a shape the assertions can read uniformly: `content` is the
+    /// model-facing markdown and `details` the structured card, whichever seam delivered them.
+    fn record(&self, custom_type: &str, payload: Value) {
+        self.surfaced.lock().unwrap().push((custom_type.to_string(), payload.clone()));
+        let _ = self.surface_tx.send((custom_type.to_string(), payload));
     }
 }
 
 impl HostServices for ScriptedSink {
     fn append_entry(&self, custom_type: &str, data: &Value) -> Result<String, String> {
-        let mut g = self.appended.lock().unwrap();
-        let id = format!("entry-{}", g.len() + 1);
-        g.push((custom_type.to_string(), data.clone()));
-        let _ = self.append_tx.send((custom_type.to_string(), data.clone()));
+        let id = format!("entry-{}", self.surfaced.lock().unwrap().len() + 1);
+        self.record(custom_type, data.clone());
         Ok(id)
     }
+
+    /// The seam a delivered inbound message actually takes. `details` is the serialized
+    /// `InlineMessage` the renderer rebuilds its card from.
+    fn inject_message(
+        &self,
+        content: &str,
+        custom_type: Option<&str>,
+        _display: bool,
+        details: Option<&Value>,
+        _trigger_turn: bool,
+    ) -> Result<(), String> {
+        let mut payload = details.cloned().unwrap_or_else(|| serde_json::json!({}));
+        if let Some(obj) = payload.as_object_mut() {
+            obj.insert("content".into(), Value::String(content.to_string()));
+        }
+        self.record(custom_type.unwrap_or_default(), payload);
+        Ok(())
+    }
+
     fn input(&self, prompt: &str, _placeholder: Option<&str>, _opts: &DialogOptions) -> Option<String> {
         self.input_prompts.lock().unwrap().push(prompt.to_string());
         self.input_answer.clone()
@@ -117,7 +148,7 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
 
     // P-1 Route B: late-bind the scripted HostServices exactly as the builder's
     // `load_native_with_services` → `set_host_services` does.
-    let (sink, mut append_rx) = ScriptedSink::new("Use Postgres.");
+    let (sink, mut surface_rx) = ScriptedSink::new("Use Postgres.");
     orch_state.set_host_services(sink.clone());
 
     // The REAL production inbound loop (records + surfaces every inbound message).
@@ -151,10 +182,10 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
     };
 
     // LEG A: the orchestrator's inbound loop surfaces the child's ask to the human via append_entry.
-    let (custom_type, data) = tokio::time::timeout(Duration::from_secs(5), append_rx.recv())
+    let (custom_type, data) = tokio::time::timeout(Duration::from_secs(5), surface_rx.recv())
         .await
         .expect("the inbound surface fired within the timeout")
-        .expect("the append channel delivered the surfaced entry");
+        .expect("the surface channel delivered the surfaced message");
     assert_eq!(custom_type, "intercom_message", "surfaced as the intercom_message custom entry");
     let content = data["content"].as_str().unwrap_or_default();
     // `**From <sender>** (<cwd>)`, with NO `📨`. pi dropped the emoji in v0.10.0 (the "deslop"
@@ -170,8 +201,17 @@ async fn inbound_message_surfaces_and_outbound_ask_receives_the_human_reply() {
         "the v0.10.0 deslop removed the envelope glyph from the header: {content:?}"
     );
     assert!(content.contains("Which database should I use?"), "content carries the child's ask: {content:?}");
-    // The pre-rendered card (the §4.3 degrade of the inline renderer) is present too.
-    assert!(data["card"].as_array().map(|a| !a.is_empty()).unwrap_or(false), "the rendered card is embedded");
+    // The structured card rides with it, and round-trips: this is what the registered message
+    // renderer rebuilds its component from, so asserting the shape here pins the renderer's input
+    // rather than a pre-rendered string frozen at one width.
+    let card = cyrup_intercom::ui::InlineMessage::from_details(&data)
+        .expect("the surfaced details deserialize as the inline card");
+    assert_eq!(card.message.id, "question-abc", "the card carries the asking message's id");
+    assert!(
+        card.body().contains("Which database should I use?"),
+        "the card body is the child's ask: {:?}",
+        card.body()
+    );
 
     // LEG B: the orchestrator's REAL ClarifyChannel surfaces the prompt to the human (scripted
     // sink → "Use Postgres.") and routes that answer back to the still-alive child over the broker.

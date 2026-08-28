@@ -276,10 +276,12 @@ pub fn register_child_watchdog(
             };
             let child_details = child_warning_details(details, &display_config);
             let message = create_watchdog_warning_message_from_details(&child_details, true);
+            let details_json = serde_json::to_value(&message.details).ok();
             let _ = services.inject_message(
                 &message.content,
                 Some(SUBAGENT_WATCHDOG_WARNING_TYPE),
                 message.display,
+                details_json.as_ref(),
                 false,
             );
         })),

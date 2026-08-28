@@ -64,6 +64,9 @@ impl AgentSession {
         let msg = AgentMessage::Custom {
             kind: custom_type.to_string(),
             payload: content.clone(),
+            // Carried on the live message too, not just the durable arm below: the steer, follow-up
+            // and next-turn arms surface through `message_end`, which is the renderer's surface.
+            details: details.clone(),
             timestamp: Some(ts),
         };
         match deliver_as {
@@ -104,18 +107,21 @@ impl AgentSession {
         content: String,
         custom_type: Option<String>,
         display: bool,
+        details: Option<serde_json::Value>,
         trigger_turn: bool,
     ) -> Result<(), SessionServiceError> {
         let Some(kind) = custom_type else {
             // A plain user message: Pi `sendUserMessage` always triggers a turn (and steers/follows-up
             // while streaming). Boxed like the `SendUserMessage` control edge (`apply_pending_control`)
-            // so the re-entry into the prompt path stays finitely sized (E0733).
+            // so the re-entry into the prompt path stays finitely sized (E0733). It takes a bare
+            // string in pi, so it carries no `details` to drop.
             let _ = Box::pin(self.send_user_message(content, None)).await?;
             return Ok(());
         };
         let msg = AgentMessage::Custom {
             kind: kind.clone(),
             payload: serde_json::Value::String(content.clone()),
+            details: details.clone(),
             timestamp: Some(now_ms()),
         };
         if self.is_streaming().await {
@@ -129,7 +135,7 @@ impl AgentSession {
             self.manager
                 .lock()
                 .await
-                .append_custom_message(&kind, serde_json::Value::String(content), display, None)?;
+                .append_custom_message(&kind, serde_json::Value::String(content), display, details)?;
             self.fanout_emit(AgentSessionEvent::MessageStart { message: msg.clone() }).await;
             self.fanout_emit(AgentSessionEvent::MessageEnd { message: msg }).await;
         }

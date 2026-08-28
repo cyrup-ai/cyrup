@@ -430,7 +430,13 @@ impl AgentSession {
             let runtime = runtime.clone().ok_or("inject_message: no runtime to inject on")?;
             runtime.spawn(async move {
                 let _ = session
-                    .inject_message(msg.content, msg.custom_type, msg.display, msg.trigger_turn)
+                    .inject_message(
+                        msg.content,
+                        msg.custom_type,
+                        msg.display,
+                        msg.details,
+                        msg.trigger_turn,
+                    )
                     .await;
             });
             Ok(())

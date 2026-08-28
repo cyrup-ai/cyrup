@@ -113,6 +113,7 @@ async fn a_registered_message_renderer_draws_the_custom_message() {
         message: AgentMessage::Custom {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
+            details: None,
             timestamp: None,
         },
     };
@@ -141,6 +142,7 @@ async fn an_unclaimed_custom_type_keeps_the_default_framing() {
         message: AgentMessage::Custom {
             kind: "nobody-renders-this".into(),
             payload: json!("plain fallback body"),
+            details: None,
             timestamp: None,
         },
     };
@@ -316,6 +318,7 @@ async fn a_widget_tree_draws_as_rows_not_as_json() {
         message: AgentMessage::Custom {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
+            details: None,
             timestamp: None,
         },
     };
@@ -383,6 +386,7 @@ async fn an_unknown_widget_tag_is_still_visible() {
         message: AgentMessage::Custom {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
+            details: None,
             timestamp: None,
         },
     };
@@ -700,6 +704,7 @@ async fn a_faulting_message_renderer_still_falls_through_to_the_default_box() {
         message: AgentMessage::Custom {
             kind: "demo".into(),
             payload: json!("plain fallback body"),
+            details: None,
             timestamp: None,
         },
     };

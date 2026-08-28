@@ -95,7 +95,7 @@ impl NativeExtension for ProbeExt {
                 // `confirm` blocks on the scripted ui sink's reply (block_in_place + a oneshot).
                 confirm: svc.confirm("proceed?", "from a native background task", &DialogOptions::default()),
                 // `inject_message` forwards to the live inject sink, which triggers a REAL turn.
-                inject: svc.inject_message("background result", Some("probe-notify"), true, true),
+                inject: svc.inject_message("background result", Some("probe-notify"), true, None, true),
             };
             let _ = tx.send(results);
         });

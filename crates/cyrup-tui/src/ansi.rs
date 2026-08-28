@@ -17,6 +17,9 @@
 //! are category `Cf`, not `Cc`, so `char::is_control` does not match them either and they survive
 //! all the way to the screen — which is exactly the class `sanitizeBinaryOutput` exists to remove.
 
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+
 /// `sanitizeBinaryOutput(stripAnsi(text)).replace(/\r/g, "")` — the whole `getTextOutput` transform
 /// (`render-utils.ts:48`) in the order Pi applies it.
 ///
@@ -91,6 +94,126 @@ pub(crate) fn strip_ansi(input: &str) -> String {
         rest = tail;
     }
     out
+}
+
+/// Convert one SGR-styled row into ratatui spans.
+///
+/// Reuses [`try_csi`]'s scanner to find each `ESC [ … m`, applies its parameters to a running
+/// [`Style`], and emits the text between codes as spans. Non-SGR CSI and OSC sequences are consumed
+/// and ignored — they address the terminal, and a cell grid has nothing to apply them to. An
+/// unterminated sequence is emitted as literal text, exactly as [`strip_ansi`] leaves it.
+///
+/// Supports the subset a [`cyrup_ext::RenderTheme`] emits: `0` (reset), `1` (bold), `2` (dim), `22`
+/// (normal intensity), `38;2;r;g;b` (truecolor foreground) and `39` (default foreground). Anything
+/// else is parsed and skipped rather than guessed at.
+pub(crate) fn sgr_line(input: &str) -> Line<'static> {
+    if !input.contains('\u{1B}') && !input.contains('\u{9B}') {
+        return Line::from(input.to_string());
+    }
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut style = Style::default();
+    let mut pending = String::new();
+    let mut rest = input;
+
+    // Flush whatever text has accumulated under the style that was in force while it accumulated.
+    fn flush(spans: &mut Vec<Span<'static>>, pending: &mut String, style: Style) {
+        if !pending.is_empty() {
+            spans.push(Span::styled(std::mem::take(pending), style));
+        }
+    }
+
+    loop {
+        let mut it = rest.chars();
+        let Some(c) = it.next() else { break };
+        let tail = it.as_str();
+
+        if c == '\u{1B}'
+            && let Some(after) = rest.strip_prefix("\u{1B}]")
+            && let Some(end) = find_osc_terminator(after)
+        {
+            rest = end;
+            continue;
+        }
+        if (c == '\u{1B}' || c == '\u{9B}')
+            && let Some(end) = try_csi(rest)
+        {
+            // The sequence body is everything the scanner consumed; SGR is the `m`-terminated one.
+            let consumed = &rest[..rest.len() - end.len()];
+            if consumed.ends_with('m') {
+                flush(&mut spans, &mut pending, style);
+                style = apply_sgr(style, consumed);
+            }
+            rest = end;
+            continue;
+        }
+        pending.push(c);
+        rest = tail;
+    }
+    flush(&mut spans, &mut pending, style);
+    Line::from(spans)
+}
+
+/// Apply one `ESC [ … m` sequence's parameters to `style`. `seq` is the whole consumed sequence,
+/// introducer and final `m` included; anything between them that is not a recognised code is
+/// skipped rather than guessed at.
+fn apply_sgr(mut style: Style, seq: &str) -> Style {
+    let body = seq
+        .trim_start_matches('\u{1B}')
+        .trim_start_matches('\u{9B}')
+        .trim_start_matches('[')
+        .trim_end_matches('m');
+    // An empty body (`ESC[m`) is `ESC[0m` — a reset (ECMA-48 default parameter).
+    if body.is_empty() {
+        return Style::default();
+    }
+    let codes: Vec<&str> = body.split(&[';', ':'][..]).collect();
+    let mut i = 0;
+    while i < codes.len() {
+        match codes[i] {
+            "0" | "" => style = Style::default(),
+            "1" => style = style.add_modifier(Modifier::BOLD),
+            "2" => style = style.add_modifier(Modifier::DIM),
+            "22" => style = style.remove_modifier(Modifier::BOLD | Modifier::DIM),
+            "39" => style.fg = None,
+            // An extended foreground. The tail is consumed by the FORM actually matched, never by a
+            // fixed stride: `38;2;r;g;b` is five codes and `38;5;n` is three, so advancing four for
+            // both swallows whatever follows an indexed colour (`ESC[38;5;196;1m` would lose the
+            // bold).
+            //
+            // The two paths differ, and each is deliberate:
+            //
+            // * a RECOGNISED form consumes its whole tail even when truncated — `38;2;1` still
+            //   advances four and `38;5` still advances two — so a malformed colour is skipped
+            //   entire rather than half-applied from a partial parse;
+            // * an UNRECOGNISED or absent form (`38;9`, or a trailing bare `38`) consumes only the
+            //   introducer, so whatever follows is still read as ordinary codes instead of being
+            //   swallowed by a stride guessed for a form that never matched.
+            "38" => match codes.get(i + 1) {
+                // `38;2;r;g;b` — truecolor.
+                Some(&"2") => {
+                    if let (Some(r), Some(g), Some(b)) = (
+                        codes.get(i + 2).and_then(|v| v.parse::<u8>().ok()),
+                        codes.get(i + 3).and_then(|v| v.parse::<u8>().ok()),
+                        codes.get(i + 4).and_then(|v| v.parse::<u8>().ok()),
+                    ) {
+                        style = style.fg(Color::Rgb(r, g, b));
+                    }
+                    i += 4;
+                }
+                // `38;5;n` — 256-colour index, which ratatui carries natively.
+                Some(&"5") => {
+                    if let Some(n) = codes.get(i + 2).and_then(|v| v.parse::<u8>().ok()) {
+                        style = style.fg(Color::Indexed(n));
+                    }
+                    i += 2;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        i += 1;
+    }
+    style
 }
 
 /// Scan past an OSC sequence's terminator (BEL, `ESC \`, or C1 ST 0x9C), non-greedy — `after` is

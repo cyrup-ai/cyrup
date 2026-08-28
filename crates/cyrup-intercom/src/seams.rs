@@ -504,6 +504,7 @@ mod tests {
             content: &str,
             custom_type: Option<&str>,
             display: bool,
+            _details: Option<&serde_json::Value>,
             trigger_turn: bool,
         ) -> std::result::Result<(), String> {
             self.injected.lock().unwrap().push((

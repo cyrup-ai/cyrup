@@ -230,6 +230,10 @@ impl AgentSession {
             let msg = AgentMessage::Custom {
                 kind: custom_type,
                 payload: content,
+                // The guest's `pi.sendMessage({… details})` payload, read just above and previously
+                // discarded on this branch only — the trigger-turn arm now carries it like the
+                // `send_custom_message` tail below.
+                details: details.clone(),
                 timestamp: Some(now_ms()),
             };
             return self.spawn_run(vec![msg]).await;

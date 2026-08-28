@@ -862,6 +862,7 @@ async fn a_02_9_custom_message_dropped_from_llm_visible_in_events() {
     agent.steer(AgentMessage::Custom {
         kind: "note".into(),
         payload: json!({ "hidden": true }),
+        details: None,
         timestamp: None,
     });
 

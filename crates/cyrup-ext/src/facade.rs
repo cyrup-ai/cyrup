@@ -1361,6 +1361,24 @@ impl ExtensionHost {
             // it (R-08-036) — the same containment the guest arm gets below. `catch_unwind` IS the
             // native analog of upstream's `try`/`catch`, so its `Err` is the `throw` of
             // `custom-entry.ts:47` and carries the same payload: the panic message.
+            // The LIVE-component tier is consulted first, exactly as the native tool-renderer fast
+            // tier is consulted before this dispatch. `None` falls through to the string hooks
+            // below — upstream's `return undefined` for a payload it cannot draw from.
+            let live = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                native.render_live(key, payload)
+            }));
+            match live {
+                Ok(Some(component)) => return RenderOutcome::Live(component),
+                Ok(None) => {}
+                Err(panic) => {
+                    let message = native_panic_msg(panic);
+                    tracing::warn!(
+                        extension = %owner, key = %key, error = %message,
+                        "native live renderer panicked (contained; the surface decides how to degrade)"
+                    );
+                    return RenderOutcome::Failed(message);
+                }
+            }
             let rendered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
                 RenderKind::Call => native.render_call(key, payload),
                 RenderKind::Result => native.render_result(key, payload),
@@ -2207,7 +2225,10 @@ enum RenderKind {
 /// want the cheap pre-check ask [`ExtensionHost::has_entry_renderer`] /
 /// [`ExtensionHost::has_message_renderer`] instead, exactly as upstream does before constructing a
 /// component.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+///
+/// `Eq` is deliberately absent: [`Self::Live`] holds an `Arc<dyn RenderedComponent>`, which has no
+/// meaningful total equality. `PartialEq` is hand-written below and compares `Live` by pointer.
+#[derive(Clone, Debug, Default)]
 pub enum RenderOutcome {
     /// No renderer is registered for this key, or the registered renderer chose to draw nothing
     /// (`Component | undefined` returning `undefined`). The host draws its own framing.
@@ -2220,6 +2241,23 @@ pub enum RenderOutcome {
     /// payload is the message, upstream's
     /// `error instanceof Error ? error.message : String(error)` (`custom-entry.ts:48`).
     Failed(String),
+    /// The renderer handed back a LIVE component, to be re-rendered by the host on every frame at
+    /// the current width, theme and expansion. Native-only — see [`crate::RenderedComponent`].
+    Live(std::sync::Arc<dyn crate::RenderedComponent>),
+}
+
+impl PartialEq for RenderOutcome {
+    /// Structural for the value arms; pointer identity for [`Self::Live`], which is the only
+    /// equality a trait object can honestly offer.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::None, Self::None) => true,
+            (Self::Rendered(a), Self::Rendered(b)) => a == b,
+            (Self::Failed(a), Self::Failed(b)) => a == b,
+            (Self::Live(a), Self::Live(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 impl RenderOutcome {
@@ -2236,7 +2274,9 @@ impl RenderOutcome {
     pub fn into_option(self) -> Option<Value> {
         match self {
             Self::Rendered(v) => Some(v),
-            Self::None | Self::Failed(_) => None,
+            // A live component is not a `Value` and cannot be collapsed into one; a caller that
+            // wants JSON genuinely has none.
+            Self::None | Self::Failed(_) | Self::Live(_) => None,
         }
     }
 

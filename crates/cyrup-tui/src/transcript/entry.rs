@@ -113,7 +113,10 @@ pub enum Entry {
 /// `ExtensionHost::render_via` outward, and [`crate::app::extension_render_entry`] is what turns a
 /// fault into this variant. The message/tool surfaces still collapse `Failed` into
 /// [`Rendered::None`] — that IS their upstream behaviour.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+///
+/// `Eq` is deliberately absent: [`Self::Live`] holds an `Arc<dyn RenderedComponent>`, which has no
+/// meaningful total equality. `PartialEq` is hand-written below and compares `Live` by pointer.
+#[derive(Clone, Debug, Default)]
 pub enum Rendered {
     /// No renderer is registered for this custom type, or the registered one drew nothing. A custom
     /// MESSAGE draws the default `[label]` + markdown box; a custom ENTRY is not pushed at all.
@@ -128,6 +131,25 @@ pub enum Rendered {
     /// [`cyrup_ext::RenderOutcome::Failed`] — a native renderer that panicked (contained by
     /// `catch_unwind`) or a guest renderer that trapped.
     Failed(String),
+    /// The renderer handed back a LIVE component. Re-rendered by [`crate::transcript::entry_lines`]
+    /// on EVERY frame at the live width, theme and expansion — the X14 rule `Entry::Tool` and
+    /// `Entry::BranchSummary` already follow, and what makes a resize re-wrap and an expand toggle
+    /// open a card that was pushed collapsed.
+    Live(std::sync::Arc<dyn cyrup_ext::RenderedComponent>),
+}
+
+impl PartialEq for Rendered {
+    /// Structural for the value arms; pointer identity for [`Self::Live`], which is the only
+    /// equality a trait object can honestly offer.
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::None, Self::None) => true,
+            (Self::Text(a), Self::Text(b)) => a == b,
+            (Self::Failed(a), Self::Failed(b)) => a == b,
+            (Self::Live(a), Self::Live(b)) => std::sync::Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
 }
 
 impl Rendered {
@@ -137,7 +159,9 @@ impl Rendered {
     pub fn into_text(self) -> Option<String> {
         match self {
             Self::Text(t) => Some(t),
-            Self::None | Self::Failed(_) => None,
+            // A live component has no flattened text: it is drawn per frame, not folded once. The
+            // message surface must carry the `Rendered` through instead of collapsing it here.
+            Self::None | Self::Failed(_) | Self::Live(_) => None,
         }
     }
 

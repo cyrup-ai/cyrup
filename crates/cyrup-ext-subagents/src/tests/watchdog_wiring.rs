@@ -56,6 +56,7 @@ fn turn_end(text: &str) -> HostEvent {
         message: cyrup_agent::AgentMessage::Custom {
             kind: "probe".to_string(),
             payload: serde_json::json!({ "text": text }),
+            details: None,
             timestamp: Some(0),
         },
         tool_results: Vec::new(),

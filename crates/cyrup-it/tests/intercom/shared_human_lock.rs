@@ -110,6 +110,21 @@ impl HostServices for SharedSink {
         let _ = self.append_tx.send(());
         Ok("entry-1".to_string())
     }
+
+    /// The seam a DELIVERED inbound message takes. This signal means "the orchestrator surfaced the
+    /// child's ask"; which of the two seams carried it is incidental to what the test is timing, so
+    /// both fire it. An idle/steerable session injects; only a busy non-interactive one appends.
+    fn inject_message(
+        &self,
+        _content: &str,
+        _custom_type: Option<&str>,
+        _display: bool,
+        _details: Option<&Value>,
+        _trigger_turn: bool,
+    ) -> Result<(), String> {
+        let _ = self.append_tx.send(());
+        Ok(())
+    }
 }
 
 fn child_meta() -> ChildOrchestratorMetadata {

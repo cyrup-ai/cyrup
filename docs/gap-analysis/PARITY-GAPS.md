@@ -41,7 +41,7 @@ difference costs behaviour, the entry says so and stays on the list as work.**
 | `pi` | ported baseline **v0.83.0** → latest **v0.84.1** · delta 627 files, +52 291 / −17 556 |
 | `pi-subagents` | ported baseline **≈v0.43.0** (inferred — the crate records no version string) → latest **v0.47.1** · delta 151 files, +10 254 / −1 333 |
 | `pi-permission-system` | ported baseline **v0.7.1** → latest **v0.8.0** · delta 28 files, +4 023 / −1 851 |
-| `pi-intercom` | ported baseline **v0.9.2** *(prior docs said v0.7.0 — wrong, see §1d)* → latest **v0.10.1** · true drift window `v0.9.2..v0.10.1` = 24 files, +2 495 / −700 |
+| `pi-intercom` | ported baseline **v0.9.2** *(prior docs said v0.7.0 — wrong, see §1d)* → ~~latest **v0.10.1**~~ **latest is v0.12.0** (`ef95f19`, 2026-08-22; verified 2026-08-27 against a real clone at `tmp/pi-intercom`, not from citations) · audited drift window `v0.9.2..v0.10.1` = 24 files, +2 495 / −700 · **UNAUDITED window `v0.10.1..v0.12.0` = 8 commits, 15 files, +2 006 / −261 — filed as ICOM-054…ICOM-058 in `11-cyrup-intercom.md`** |
 
 Read upstream with `git -C <repo> show <tag>:<path>`, never from a working tree — clone-HEAD line
 numbers and file existence both mislead. §7 says how much of this was first-hand.

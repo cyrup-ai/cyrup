@@ -221,6 +221,8 @@ impl AgentSession {
         let msg = AgentMessage::Custom {
             kind: "bashExecution".to_string(),
             payload: payload.clone(),
+            // A `!`-execution is rendered from its payload; pi attaches no `details` to it.
+            details: None,
             timestamp: Some(now_ms()),
         };
         if self.is_streaming().await {

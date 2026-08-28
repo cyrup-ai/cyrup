@@ -462,6 +462,10 @@ impl NativeExtension for IntercomExtension {
         // `entry appended → intercom_message` status line. This surface is cyrup's, not pi's; see
         // [`Self::render_entry`] for why upstream has no counterpart.
         api.register_entry_renderer(crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE);
+        // `pi.registerMessageRenderer("intercom_message", …)` (`index.ts:1816-1820`). The injected
+        // custom message is upstream's ONE surface for an inbound message; `render_live` answers for
+        // it with a component the TUI re-renders per frame at the live width, theme and expansion.
+        api.register_message_renderer(crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE);
         // The `/intercom` overlay command (pi `registerCommand("intercom", …)`, index.ts:1877). cyrup
         // has no `register_shortcut`, so the `alt+m` binding degrades to this command (the port doc
         // §4.3); `execute_command` renders the session picker + drives the compose send.
@@ -730,8 +734,33 @@ impl NativeExtension for IntercomExtension {
     /// `#[serde(tag = "type", rename_all_fields = "camelCase")]`), so the payload
     /// `surface_incoming_message` wrote is under `data` — not at the top level.
     ///
-    /// The card is emitted at the width it was rendered at (`SURFACE_CARD_WIDTH`); re-rendering at
-    /// the live terminal width is ICOM-024's half, which needs a width this seam does not carry.
+    /// `pi.registerMessageRenderer("intercom_message", (message, options, theme) => …)`
+    /// (`index.ts:1816-1820`). `payload` is the serialized `AgentMessage::Custom`
+    /// (`{role, kind, payload, details, timestamp}`), so the entry rides `details`.
+    ///
+    /// Also answers for the durable ENTRY surface, whose payload nests the same fields under `data`.
+    ///
+    /// `None` is upstream's `if (!details) return undefined`: a v0.9.2 peer, or a payload written
+    /// before the injection seam carried `details`, falls through to [`Self::render_entry`]'s
+    /// pre-rendered `card` / markdown `content` rather than drawing an empty box.
+    fn render_live(
+        &self,
+        key: &str,
+        payload: &serde_json::Value,
+    ) -> Option<std::sync::Arc<dyn cyrup_ext::RenderedComponent>> {
+        if key != crate::inbound::INBOUND_MESSAGE_CUSTOM_TYPE {
+            return None;
+        }
+        let details = payload.get("details").or_else(|| payload.get("data"))?;
+        let card = crate::ui::InlineMessage::from_details(details)?;
+        Some(std::sync::Arc::new(crate::ui::InlineMessageComponent::new(card)))
+    }
+
+    /// The card is emitted at the width it was rendered at (`SURFACE_CARD_WIDTH`). That degrade is
+    /// now the FALLBACK path only: a live inbound delivery is drawn by [`Self::render_live`] at the
+    /// real terminal width. This seam still serves the durable entry a busy non-interactive session
+    /// writes, and any payload carrying no `details` (a v0.9.2 peer, or one written before the
+    /// injection seam carried them).
     fn render_entry(
         &self,
         custom_type: &str,

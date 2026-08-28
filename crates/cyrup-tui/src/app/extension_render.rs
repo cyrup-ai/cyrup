@@ -47,34 +47,46 @@ pub(crate) const EXTENSION_RENDER_TIMEOUT: std::time::Duration = std::time::Dura
 /// * a tool start/end → the extension that declared a renderer for that TOOL NAME (Pi's per-tool
 ///   `renderCall`/`renderResult`, tool-execution.ts:81-112).
 ///
-/// `None` for every other event, and for any event whose key has no registered renderer — the cheap
-/// SYNC `has_*_renderer` pre-check runs first so the common path pays nothing.
+/// [`crate::transcript::Rendered::None`] for every other event, and for any event whose key has no
+/// registered renderer — the cheap SYNC `has_*_renderer` pre-check runs first so the common path
+/// pays nothing.
+///
+/// Returns the full [`crate::transcript::Rendered`] rather than flattened text: a LIVE component
+/// (`Rendered::Live`) has no flattened form, and collapsing it here would freeze the very thing that
+/// tier exists to keep live. A FAULT still collapses to `None` for this surface — see below.
 pub async fn extension_render(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
     ev: &AgentSessionEvent,
-) -> Option<String> {
+) -> crate::transcript::Rendered {
+    use crate::transcript::Rendered;
     let which = match ev {
         AgentSessionEvent::MessageEnd { .. } => {
-            let (kind, _) = custom_message_from_event(ev)?;
+            let Some((kind, _)) = custom_message_from_event(ev) else {
+                return Rendered::None;
+            };
             if !ext_host.has_message_renderer(&kind) {
-                return None;
+                return Rendered::None;
             }
-            let message = serde_json::to_value(ev).ok()?.get("message")?.clone();
+            let Some(message) =
+                serde_json::to_value(ev).ok().and_then(|v| v.get("message").cloned())
+            else {
+                return Rendered::None;
+            };
             Which::Message(kind, message)
         }
         AgentSessionEvent::ToolExecutionStart { tool_name, args, .. } => {
             if !ext_host.has_tool_renderer(tool_name) {
-                return None;
+                return Rendered::None;
             }
             Which::ToolCall(tool_name.clone(), args.clone())
         }
         AgentSessionEvent::ToolExecutionEnd { tool_name, result, .. } => {
             if !ext_host.has_tool_renderer(tool_name) {
-                return None;
+                return Rendered::None;
             }
             Which::ToolResult(tool_name.clone(), result.clone())
         }
-        _ => return None,
+        _ => return Rendered::None,
     };
     // A FAULTING renderer collapses to `None` here on purpose: both of this function's surfaces
     // swallow the throw upstream — a custom message falls through to its default `[type] body` box
@@ -82,7 +94,11 @@ pub async fn extension_render(
     // row keeps its built-in shell. The distinction is preserved by the host
     // ([`cyrup_ext::RenderOutcome`]) for the ENTRY surface, which does NOT swallow it — see
     // [`extension_render_entry`].
-    run_renderer(ext_host, which).await.into_text()
+    // A FAULT collapses to `None` here on purpose (see above); a LIVE component passes through.
+    match run_renderer(ext_host, which).await {
+        Rendered::Failed(_) => Rendered::None,
+        other => other,
+    }
 }
 
 /// Ask the loaded extensions to render an appended custom ENTRY (X15; Pi `addCustomEntryToChat`,
@@ -170,6 +186,10 @@ pub(crate) async fn run_renderer(
         // The renderer FAULTED. `cyrup-ext` already contained the fault (native panic caught,
         // guest trap mapped) and kept its message; upstream's `catch` binding is the same value.
         Ok(Ok(cyrup_ext::RenderOutcome::Failed(message))) => Rendered::Failed(message),
+        // The renderer handed back a LIVE component: carried through as-is so `entry_lines` can
+        // re-render it per frame. It is deliberately NOT flattened here — that is the freeze this
+        // tier exists to avoid.
+        Ok(Ok(cyrup_ext::RenderOutcome::Live(component))) => Rendered::Live(component),
         Ok(Ok(cyrup_ext::RenderOutcome::None)) => Rendered::None,
         // The renderer TASK itself panicked — outside the host's `catch_unwind`, so no message
         // survived the unwind. Report it as a fault anyway: something threw, and reporting `None`
@@ -277,16 +297,31 @@ pub(crate) fn flatten_children(items: &[serde_json::Value], depth: usize, sep: &
     Some(out.join(sep))
 }
 
+/// Ask the loaded extensions to render an already-persisted custom MESSAGE — the `--resume` replay
+/// of the same surface [`extension_render`] serves live (Pi `getMessageRenderer(...)`,
+/// `runner.ts:583-590`, reached from the replay walk at `interactive-mode.ts:3470-3474`).
+///
+/// Returns the full three-state [`crate::transcript::Rendered`] rather than a `String`, because a
+/// renderer may answer with a LIVE component and `Rendered::into_text()` maps `Live -> None`: taking
+/// the text here would resolve the component, throw it away, and leave the reload showing the
+/// built-in framing while the live turn showed the card.
+///
+/// A FAULT still collapses to `None`, exactly as [`extension_render`] does — this is the message
+/// surface, and `custom-message.ts:82-84` catches a renderer throw and falls through to the built-in
+/// framing. The failure box belongs to the entry surface ([`extension_render_entry`]).
 pub async fn extension_render_message(
     ext_host: &Arc<cyrup_ext::ExtensionHost>,
     custom_type: &str,
     payload: &serde_json::Value,
-) -> Option<String> {
+) -> crate::transcript::Rendered {
+    use crate::transcript::Rendered;
     if !ext_host.has_message_renderer(custom_type) {
-        return None;
+        return Rendered::None;
     }
     // Same collapse as [`extension_render`]: `custom-message.ts:82-84` swallows the throw.
-    run_renderer(ext_host, Which::Message(custom_type.to_string(), payload.clone()))
-        .await
-        .into_text()
+    // A LIVE component passes through so the replay can re-render it per frame.
+    match run_renderer(ext_host, Which::Message(custom_type.to_string(), payload.clone())).await {
+        Rendered::Failed(_) => Rendered::None,
+        other => other,
+    }
 }

@@ -2,13 +2,86 @@
 
 This area covers `crates/cyrup-intercom` — the Unix-socket supervisor↔subagent broker, its client transport, inbound-message delivery, presence/lifecycle reporting, the `intercom` / `contact_supervisor` tool surface, and the broker binary.
 
+> ### RE-BASELINE 2026-08-27 — verified against cyrup HEAD `9962e0f`, tree clean
+>
+> **This file contradicted itself in four places.** Its header said **44 open**, `:63` said **14**,
+> `:190` said **9**, and SWEEP 9 (`:165`, 2026-08-15) said **6**. The `## Status table` below still
+> carried `still-open` for **36 items the newer `## Open items` table already recorded as CLOSED**.
+> Anyone planning from the top of this file planned to re-implement work that already exists — which
+> is what this pass was called to fix.
+>
+> **The lower table was right.** Every one of its dispositions was re-verified in the Rust at HEAD by
+> reading the code, not commit messages, and excluding doc-comment matches — a comment citing an
+> upstream symbol is not an implementation, and treating it as one is how a file like this goes stale.
+> **Counted set against v0.10.1: 0 critical, 0 high, 3 medium, 1 low, plus 2 partially-closed = 6
+> open**, unchanged from SWEEP 9 twelve days earlier — but see the next block: v0.10.1 is not
+> upstream's current version, and the true counted set is **11**.
+>
+> **The suite now runs and is green — which no prior pass in this file could say.** Every earlier
+> sweep was static (`cargo check` only) and said so. This one executed:
+> `cargo nextest run -p cyrup-intercom` → **279/279 passed**, and
+> `cargo nextest run -p cyrup-it --features it -E 'binary(intercom)'` → **79/79 passed, 0 skipped**.
+> Both were re-measured at `9962e0f` itself, not carried over from an earlier commit. The integration
+> run covers the real-socket paths
+> (`broker_roundtrip::child_to_broker_to_supervisor_round_trip_over_the_real_socket`,
+> `child_bridge_activation::production_spawned_child_registers_on_the_broker_and_round_trips_with_its_supervisor`).
+> The `cyrup-it` compile-error backlog this crate carried is also discharged: `cargo check -p cyrup-it
+> --features it --all-targets` returns **0 errors** at `9962e0f`, and the `.flux` task tracking it is
+> already `status: done`.
+>
+> **The six that are open, each re-verified at HEAD:**
+>
+> | ID | Sev | Verified at HEAD `9962e0f` |
+> |---|---|---|
+> | ICOM-016 | low | `broker/extensions.rs:136,:171` — `handle_extension_publish` and `handle_extension_state_commit` only ever emit refusals (`committed: false`, `"Session has not advertised extension capability"`). Protocol modelled, effects genuinely absent. Unchanged. |
+> | ICOM-024 | medium | Blocked two-deep, as sweep 9 recorded: the seam `render_call(&self, _key, _call)` (`cyrup-ext/src/native.rs:617`) carries no `options`/`theme`, **and** ICOM-029's `details` is still absent. Note the renderers themselves exist and are wired (`cyrup-intercom/src/tools/render.rs` × 4, dispatched at `extension.rs:700-711`) — the gap is the seam, not the renderer. |
+> | ICOM-029 | medium | `cyrup-ext/src/host/services.rs:437` `inject_message` takes four parameters (`_content`, `_custom_type`, `_display`, `_trigger_turn`) — no `details`. **Citation drift corrected: the row said `:417`.** |
+> | ICOM-042 | medium · partial | The cwd half **is** ported — `cwd.rs` (`normalize_cwd`, `same_cwd`, `resolve_path`) and `project_target.rs` (`resolve_target_in_cwd`, `format_session_refs`). `openProjectPaneIfMissing` appears in comments only; that half stays unported. |
+> | ICOM-052 | low · partial | The SUN_LEN **diagnostic** is present — `broker/lifecycle.rs` names the endpoint and its byte length on bind failure. The **guard** is deliberately absent, recorded there as a CYRUP-DELTA because upstream has none either. |
+> | ICOM-053 | medium | Confirmed unchanged, and now measured: `cyrup-it` is `required-features = ["it"]`, there is **no `.github/` in this repo**, and `xtask` does not invoke the suite. The 79 tests above execute only when a human types `--features it`. This is the largest live risk in the area — 6,777 lines of integration proof that nothing runs by default. |
+>
+> ### The baseline itself is measured against the wrong upstream version
+>
+> **This was found by cloning `pi-intercom` and reading it — the first pass in this file's history to
+> do so.** Every prior pass, and the first edition of this re-baseline, took upstream's state from
+> this document's own citations. `tmp/` is gitignored, so no checkout was present; the claims were
+> second-hand, and one of them was wrong in a way no amount of re-reading the Rust could reveal.
+>
+> **This file measures parity against `pi-intercom` v0.10.1. Upstream is at v0.12.0** (`ef95f19`,
+> 2026-08-22), clone at `tmp/pi-intercom`. The window **`v0.10.1..v0.12.0` is 8 commits,
+> +2006/−261 across 15 files (`broker/broker.ts` +713, `index.ts` +370,
+> `intercom.integration.test.ts` +790) and has never been audited by any pass.** The doc's stated
+> drift window `v0.9.2..v0.10.1` is closed; this one is not open — it is unopened.
+>
+> Three new wire fields land in `broker/protocol.ts` at v0.12.0 — `provenance`
+> (`MessageProvenance`), `endpointEpoch`, `tmuxPane` — and cyrup models **none** of them (0
+> occurrences each in `transport/protocol.rs`). cyrup's own `epoch` (`connect.rs:152`) is an
+> unrelated local reconnect counter, not upstream's broker-owned endpoint epoch; do not read the
+> name as coverage. **Interop does not break:** the v0.9.2 envelope's `#[serde(flatten)] extra`
+> capture (`transport/protocol.rs:298`) round-trips the unknown keys, so a v0.12.0 peer is tolerated
+> rather than fatal. The features behind them are simply inert.
+>
+> Filed as **ICOM-054…ICOM-059** below. **Counted set is therefore 6 + 6 = 12 open.** Five are unported
+> features from the v0.10.1..v0.12.0 window. **ICOM-056 straddles the boundary, and the halves have
+> different origins** (pinned 2026-08-27 with `git log -S` against the clone): its *registry* pair
+> (`intercom:extension-register`, `:extension-registry-ready`) landed at **v0.8.0** (`db22c07`) and is
+> present at v0.9.2 and v0.10.1 — older than this port's own baseline and never filed by any pass,
+> which is the surface-sweep blind spot `## Coverage` names. Its *outbox* pair, both V1 interfaces,
+> the ten result codes and `MessageProvenance` landed at **v0.12.0** (0 hits at v0.10.1) and are
+> inside the unaudited window. Every one of the twelve now has a task file under `.flux/todo/`.
+
+> **Everything above this block, and the whole `## Status table` below, is historical.** The table's
+> per-item notes are kept because they record how each finding was originally derived, but its
+> **Status column is superseded by `## Open items`**. Where the two disagree, `## Open items` wins.
+
+
 > **Re-audited 2026-08-12, cyrup HEAD `04c1ba2`** (last code commit; docs HEAD `a9000b1`, tree clean), against **`pi-intercom` v0.10.1** with the version-lag window measured over **`v0.9.2..v0.10.1`** (24 files, +2495/−700, 14 commits, each accounted for below).
 >
 > **The headline correction of this pass is the baseline itself.** Every prior version of this file — and `PARITY-GAPS.md:19` — records the ported baseline as **v0.7.0**. That is wrong. A citation census over `crates/cyrup-intercom/src` returns **v0.9.2 × 272**, v0.7.0 × 14, v0.8.0 × 3, v0.6.0 × 1 (the `lib.rs` banner), v0.10.x × 0. Load-bearing v0.8.0/v0.9.x code is present *and tested*: `broker/runtime_claim.rs` + `tests/broker_runtime_claim.rs` (v0.8.0), `/intercom-id` + `tests/intercom_id_command.rs` (v0.8.0), `format_context.rs` + `tests/presence_context_usage.rs` + `tests/session_info_context_fields.rs` (v0.9.x), the full 16-tag `BrokerMessage` union and the v0.9.2 envelope with `#[serde(flatten)] extra` (`transport/protocol.rs`), and `transport/target.rs` + `transport/stream.rs`. **The true ported baseline is v0.9.2**, and the real drift window is v0.9.2..v0.10.1 — which is what ICOM-035…ICOM-047 cover. ICOM-012 carries the banner fix.
 >
 > **This pass: 3 closed** (ICOM-007, ICOM-019, ICOM-020 — all verified in the Rust at HEAD, not from commit messages), **0 reopened**, **24 newly filed** (ICOM-027…ICOM-050). Three prior closures (ICOM-001, ICOM-002, ICOM-022) were adversarially re-checked and survive; three items moved to `partially-closed` (ICOM-009, ICOM-015, ICOM-026) and stay open on their remaining half. Two closures produced new defects sitting *inside* the closing code (ICOM-022 → ICOM-027, ICOM-043; ICOM-002 → ICOM-035).
 >
-> Open now: **0 critical, 0 high, 22 medium, 22 low** (44 items). Treat that as a floor — see `## Coverage`.
+> ~~Open now: **0 critical, 0 high, 22 medium, 22 low** (44 items).~~ **STALE — superseded by RE-BASELINE 2026-08-27 above: the verified count at HEAD `9962e0f` is 12 (6 against v0.10.1 + 6 newly filed).** Treat that as a floor — see `## Coverage`.
 
 > ### REPAIR PASS — 2026-08-12 (second pass, same day), applying the completeness critique
 >
@@ -101,6 +174,10 @@ This area covers `crates/cyrup-intercom` — the Unix-socket supervisor↔subage
 
 
 ## Status table
+
+> **SUPERSEDED 2026-08-27 — historical.** The Status column below is stale: 36 rows
+> marked `still-open` are closed at HEAD `9962e0f`, each re-verified in the Rust. The
+> notes are kept for how the findings were derived. **`## Open items` is authoritative.**
 
 | ID | Status | Note |
 |---|---|---|
@@ -204,7 +281,7 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 | ~~ICOM-011~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | M | Restart-stable session IDs absent; `stableId` silently ignored — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-023~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | `schedule_inbound_flush(state, 0)` races its own task and aborts the retry — **CLOSED 2026-08-14**: sweep 1 — closed as SUBSUMED by ICOM-035, not as independently fixed: the machinery they described (`pending_idle`, `flush_timer`, `schedule_inbound_flush`, `flush_idle_messages`, `PendingInbound`, `InboundPolicy::Queue`) no longer exists. |
 | ICOM-024 | medium | not-ported | M | No `intercom_message` renderer; card frozen at width 80 — **2026-08-15, still open, and the blocker list is now TWO items, not one (sweep 9)**: (1) ICOM-029's `details`, as the row already said, **and (2) a blocker the item has never named — cyrup's renderer seam carries no `options`/`theme` at all.** `NativeExtension::render_call(&self, key, call) -> Option<Value>` (`cyrup-ext/src/native.rs:582`) and the host's `render_message_call_outcome(custom_type, message)` (`cyrup-ext/src/facade.rs:995`) pass ONE payload and return a STRING; upstream's renderer is `(message, options, theme) => Component` re-invoked per frame (`v0.10.1 index.ts:1485-1489`). **So the live-width, theme-aware, `options.expanded`-driven card this item asks for cannot be produced at this seam even with `details` in hand** — a registered renderer would return the same pre-rendered fixed-width string `render_entry` already returns (ICOM-028, closed). **Measured: widening the seam is `cyrup-ext` (trait + facade + the WIT guest exports + registry) plus the ONE dispatch site in `cyrup-tui/src/app/extension_render.rs:161` (inside `run_renderer`, `:153`).** Do not land the registration alone: it would add a renderer that is dead until both blockers clear. Correct the stale half-sentence at `ui/mod.rs:16-19` too — `InitApi::register_message_renderer` DOES exist (`native.rs:270`); only `register_shortcut` is missing. |
-| ICOM-029 | medium | not-ported | M | `inject_message` carries no `details`, so a renderer would have nothing to render — **2026-08-15, still open; CONFIRMED at HEAD and RE-MEASURED, and the measurement is why sweep 9 did not start it**: `cyrup-ext/src/host/services.rs:417` still takes four parameters. The item's fix site (`HostServices` + `LiveHostServices` + `AgentSession::inject_message`) is necessary but **NOT sufficient, and the missing half is a data-model change in a third crate**: the durable arm can thread `details` into `append_custom_message` (`CustomRoleMessage.details` already exists, `cyrup-session/src/agent_message.rs:62`), but the LIVE surface a renderer reads is the serialized `cyrup_agent::AgentMessage::Custom { kind, payload, timestamp }` (`cyrup-agent/src/event.rs:23-35`, taken from the `MessageEnd` event by `custom_message_from_event`, `cyrup-tui/src/app/event_extract.rs:228`), **which has no `details` field**, and neither do the steer/trigger arms that carry the COMMON inbound case (`session.rs:4254`, `:3391`). **Measured blast radius: one new field on that variant + its `TaggedNonAssistant` serialization, ~13 constructions and ~10 patterns across `cyrup-agent`, `cyrup-session-svc`, `cyrup-ext-subagents`, `cyrup-tui` and `cyrup-it`; the `HostServices::inject_message` signature itself has 9 impls and ~15 call sites in 5 crates.** **NEEDS one agent owning areas 03 (`cyrup-agent`), 06 (`cyrup-ext`) and 08 (`cyrup-session-svc`) in one commit** — and sequencing it before ICOM-024's second blocker (the renderer seam) buys nothing, so schedule the two together. |
+| ICOM-029 | medium | not-ported | M | `inject_message` carries no `details`, so a renderer would have nothing to render — **2026-08-15, still open; CONFIRMED at HEAD and RE-MEASURED, and the measurement is why sweep 9 did not start it**: `cyrup-ext/src/host/services.rs:437` still takes four parameters. The item's fix site (`HostServices` + `LiveHostServices` + `AgentSession::inject_message`) is necessary but **NOT sufficient, and the missing half is a data-model change in a third crate**: the durable arm can thread `details` into `append_custom_message` (`CustomRoleMessage.details` already exists, `cyrup-session/src/agent_message.rs:62`), but the LIVE surface a renderer reads is the serialized `cyrup_agent::AgentMessage::Custom { kind, payload, timestamp }` (`cyrup-agent/src/event.rs:23-35`, taken from the `MessageEnd` event by `custom_message_from_event`, `cyrup-tui/src/app/event_extract.rs:228`), **which has no `details` field**, and neither do the steer/trigger arms that carry the COMMON inbound case (`session.rs:4254`, `:3391`). **Measured blast radius: one new field on that variant + its `TaggedNonAssistant` serialization, ~13 constructions and ~10 patterns across `cyrup-agent`, `cyrup-session-svc`, `cyrup-ext-subagents`, `cyrup-tui` and `cyrup-it`; the `HostServices::inject_message` signature itself has 9 impls and ~15 call sites in 5 crates.** **NEEDS one agent owning areas 03 (`cyrup-agent`), 06 (`cyrup-ext`) and 08 (`cyrup-session-svc`) in one commit** — and sequencing it before ICOM-024's second blocker (the renderer seam) buys nothing, so schedule the two together. |
 | ~~ICOM-030~~ | ~~medium~~ **CLOSED 2026-08-14** | not-ported | S | `contact_supervisor` registered alongside an active native supervisor channel — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-031~~ | ~~medium~~ **CLOSED 2026-08-14** | parity-bug | S | Presence identity never re-synced on `turn_start` or at a tool call — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-033~~ | ~~medium~~ **CLOSED 2026-08-14 — REFUTED** | not-ported | M | No tool renderers for `intercom` / `contact_supervisor` — **REFUTED, CLOSED 2026-08-14**: sweep 6 — `crates/cyrup-intercom/src/tools/render.rs` is the full `renderCall`/`renderResult` port for both tools (pi-intercom v0.10.1 `index.ts:1743-1774`, `:2298-2331`). **The sequencing blocker the 2026-08-14 note added is DISCHARGED:** `tools/mod.rs::text_result` no longer sets `details: None`, it sets pi's `{}`, and `detailed_result` carries the load-bearing `details.messageId`. The three unreachable-branch carve-outs that note demanded (no theme, no `isPartial`, no `context.isError`/expanded) are documented at the head of `render.rs`. |
@@ -231,6 +308,12 @@ Closed this pass: **3** (ICOM-007, ICOM-019, ICOM-020). Newly filed: **24** (ICO
 | ~~ICOM-025~~ | ~~low~~ **CLOSED 2026-08-15 — REFUTED** | test-defect | S | Two tests assert fixed wall-clock sleeps instead of polled conditions — **REFUTED (residual does not exist), CLOSED 2026-08-15**: sweep 9 — re-derived at HEAD rather than carried: `connect.rs:750` is `#[tokio::test(start_paused = true)]` and `grep -rn 'sleep(' crates/cyrup-intercom/src` returns **eight** hits, every one of them in PRODUCTION code (`connect.rs:359` the backoff itself, `broker/mod.rs:1640` the 5 s shutdown delay, `:1735` the registration deadline, `transport/{stream,client,spawn}.rs`) and **none** in a test. The `inbound.rs` half went with the queue ICOM-035 deleted. The row survived only as a standing rule, which belongs in the crate's test conventions, not in an open-items table.
 | ~~ICOM-026~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED** | test-defect | S | Three tests pin ICOM-013's trailing period — **REFUTED, CLOSED 2026-08-14**: sweep 6 — the four assertions the item names carry NO trailing period at HEAD and match production: `cyrup-it/tests/intercom/tool_actions.rs:319` `"Message sent to target-session"`, `:372` `"Message sent to reviewer"`, `:502` `"Reply sent to reviewer"`, `intercom_command_transcript.rs:144` `"Message sent to reviewer"`. **The item's STRUCTURAL finding is NOT closed with it — it is re-filed as `ICOM-053`, because it is a statement about the GATE, not about these tests.** |
 | ICOM-053 | medium | test-gap | M | The workspace gate builds and runs NONE of the broker-socket seam tests, because `cyrup-it` is `required-features = ["it"]` — **2026-08-15, still open (sweep 9): a PROCESS decision, unchanged and not an agent's to make.** Reconfirmed unchanged at HEAD. Note that sweep 9's own new coverage for ICOM-004 and ICOM-015 was written as in-crate unit tests under `crates/cyrup-intercom/src/`, precisely so that it lands INSIDE the gate rather than behind this feature flag. **Decide whether the gated suite runs on a schedule, in CI, or as a required pre-merge step.** |
+| ICOM-054 | medium | not-ported | L | **Broker-owned endpoint epochs are absent** — upstream `636f61e` (#109, v0.11.0) adds "broker-owned endpoint epochs, exact-send retry handling, and bounded delivery records **so stale endpoints are refused**", +422/−107 over `broker/broker.ts`, `broker/client.ts`, `broker/protocol.ts`, `index.ts`, `types.ts`. cyrup does not model the `endpointEpoch` wire field (0 occurrences in `transport/protocol.rs`); `connect.rs:152` `epoch` is an unrelated local reconnect counter. **Correctness, not cosmetics:** without it a send can be accepted against an endpoint the broker has already replaced. Verify against `intercom.integration.test.ts` (+202 in that commit). |
+| ICOM-055 | medium | not-ported | M | **Scoped routing is absent** — upstream `089b631` (v0.12.0) adds opt-in broker-enforced `PI_INTERCOM_SCOPE_ID` routing scopes (issue #112). cyrup has no scope concept on the wire or in the broker. Without it every registered session is mutually addressable with no isolation boundary. |
+| ICOM-056 | medium | not-ported | L | **The extension outbox API is wholly unported, and message provenance with it.** `extension-api.ts` (84 lines) defines four events (`intercom:extension-register`, `:extension-registry-ready`, `:outbox-request`, `:outbox-result`), `IntercomOutboxRequestV1` `{version,requestId,extensionId,extensionName,to,message}`, and `IntercomOutboxResultV1` with 4 statuses and 10 codes. v0.12.0 then stamps delivered messages with `MessageProvenance` (`type:"extension_outbox"`). cyrup: **0 hits** for each of `outbox`, `OutboxRequest`, `OutboxResult`, `extension_outbox`, `provenance`. **Found 2026-08-27 by surface-sweeping the clone; no prior pass filed this surface at all.** The two halves differ in origin: the registry pair landed at **v0.8.0** (`db22c07`, present at v0.9.2 and v0.10.1) so it predates this port's baseline entirely, while the outbox pair, both V1 interfaces, the ten codes and `MessageProvenance` landed at **v0.12.0** (0 hits at v0.10.1) and sit inside the unaudited window. Neither half is a regression. Severity raised low->medium: this is how anything other than the agent sends a message. Task: `.flux/todo/ICOM-056_EXTENSION_OUTBOX_AND_PROVENANCE.md`. |
+| ICOM-057 | low | not-ported | S | **Pending blocking-ask records are not persisted** — upstream `d69854d` (v0.11.0, issue #104) persists local pending-ask observability records for delivered blocking asks. cyrup has no equivalent (0 non-comment hits for a persisted ask record). Observability only; no delivery-path effect. |
+| ICOM-058 | low | not-ported | S | **`tmuxPane` is neither modelled nor surfaced** — upstream `4af53db` (v0.11.0) surfaces tmux pane ids in the roster and adds the `tmuxPane` envelope field, validated in `broker/protocol.ts` @v0.12.0. cyrup: 0 non-comment hits for `tmux`/`pane_id`. Non-fatal (round-trips via `extra`). Roster usability. Task: `.flux/todo/ICOM-058_TMUX_PANE_ROSTER.md`. |
+| ICOM-059 | low | not-ported | S | **`toolVisibility` config key absent** — upstream `12f4b6c` (#113, v0.12.0) adds `IntercomToolVisibility = "always" | "after-first-use"` (`config.ts:27`, default `"always"` at `:67`); under `after-first-use` the `intercom` tool is hidden from the model's tool surface until first use. **This is the only one of upstream's nine config keys with no counterpart in `config.rs`** — `brokerArgs`, `brokerCommand`, `confirmSend`, `enabled`, `inboundTrigger`, `replyHint`, `stableId`, `status` are all present. Split out of ICOM-058 on 2026-08-27 (independent work). Task: `.flux/todo/ICOM-059_LAZY_TOOL_VISIBILITY.md`. |
 | ~~ICOM-027~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Non-trigger inbound messages persisted with `display=false` — **CLOSED 2026-08-14**: sweep 1. |
 | ~~ICOM-028~~ | ~~low~~ **CLOSED 2026-08-14 — REFUTED** | cyrup-original | M | `intercom_message` entry surface has no renderer — **REFUTED, CLOSED 2026-08-14**: sweep 6 — closed at HEAD as **the item's own option (a)**: `IntercomExtension::render_entry` draws the durable `intercom_message` entry (`extension.rs:690-707`, `:832`), with the in-source note recording that option (b) still depends on `ICOM-024`/`ICOM-029`. |
 | ~~ICOM-032~~ | ~~low~~ **CLOSED 2026-08-14** | parity-bug | S | Session shutdown leaves the pending-idle queue populated — **CLOSED 2026-08-14**: sweep 1 — closed as SUBSUMED by ICOM-035, not as independently fixed: the machinery they described (`pending_idle`, `flush_timer`, `schedule_inbound_flush`, `flush_idle_messages`, `PendingInbound`, `InboundPolicy::Queue`) no longer exists. |

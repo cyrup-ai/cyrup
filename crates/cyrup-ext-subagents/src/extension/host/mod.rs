@@ -252,10 +252,12 @@ impl SubagentsExtension {
                 crate::watchdog::warning_format::create_watchdog_warning_message_from_details(
                     details, true,
                 );
+            let details_json = serde_json::to_value(&message.details).ok();
             let _ = services.inject_message(
                 &message.content,
                 Some(crate::watchdog::types::SUBAGENT_WATCHDOG_WARNING_TYPE),
                 message.display,
+                details_json.as_ref(),
                 false,
             );
         }

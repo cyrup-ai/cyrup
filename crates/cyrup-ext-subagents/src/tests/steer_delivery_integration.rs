@@ -77,6 +77,7 @@ impl cyrup_ext::host::HostServices for RecordingServices {
         content: &str,
         custom_type: Option<&str>,
         display: bool,
+        _details: Option<&serde_json::Value>,
         trigger_turn: bool,
     ) -> Result<(), String> {
         if *self.fail.lock().unwrap() {

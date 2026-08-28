@@ -760,6 +760,7 @@ fn t9_render_custom_message_paints_bg_and_text_tokens() {
         message: AgentMessage::Custom {
             kind: "review".to_string(),
             payload: serde_json::json!("Looks good to ship."),
+            details: None,
             timestamp: None,
         },
     });

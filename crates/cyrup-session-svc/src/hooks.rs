@@ -71,7 +71,7 @@ pub(crate) fn coding_agent_convert_to_llm(msgs: &[AgentMessage]) -> Vec<Message>
             // wire object and rendered by the SAME `push_llm` the `App` arm below uses — the two
             // paths cannot disagree, which they did until this was added: after a compaction
             // re-seed the same execution arrives as `App { role: "bashExecution" }` and IS dropped.
-            AgentMessage::Custom { kind, payload, timestamp } => {
+            AgentMessage::Custom { kind, payload, timestamp, .. } => {
                 match app_role_payload(kind, payload, *timestamp)
                     .and_then(|v| serde_json::from_value::<Raw>(v).ok())
                 {

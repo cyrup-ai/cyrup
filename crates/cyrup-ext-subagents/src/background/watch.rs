@@ -678,7 +678,7 @@ impl CompletionSink for HostServicesCompletionSink {
         let CompletionMessage { custom_type, content, display, trigger_turn } = message;
         tokio::task::spawn_blocking(move || {
             services
-                .inject_message(&content, Some(custom_type.as_str()), display, trigger_turn)
+                .inject_message(&content, Some(custom_type.as_str()), display, None, trigger_turn)
                 .is_ok()
         })
         .await

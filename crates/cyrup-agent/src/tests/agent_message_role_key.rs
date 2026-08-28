@@ -45,6 +45,7 @@ fn the_other_arms_are_byte_unchanged_and_still_tagged() {
             AgentMessage::Custom {
                 kind: "note".into(),
                 payload: serde_json::json!({"a": 1}),
+                details: None,
                 timestamp: Some(7),
             },
             "custom",
@@ -69,6 +70,7 @@ fn every_arm_still_round_trips() {
         AgentMessage::Custom {
             kind: "note".into(),
             payload: serde_json::json!({"a": 1}),
+            details: None,
             timestamp: Some(7),
         },
     ] {
