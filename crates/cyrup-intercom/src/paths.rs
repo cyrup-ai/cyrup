@@ -96,6 +96,14 @@ pub fn intercom_dir_path(agent_dir: &Path) -> PathBuf {
     agent_dir.join("intercom")
 }
 
+/// `<intercomDir>/extension-state` — the directory `ExtensionStateManager` owns
+/// (`pi-intercom/broker/extension-state.ts:54`). One file per namespace, each named by the sha256
+/// of that namespace.
+#[must_use]
+pub fn extension_state_dir_path(intercom_dir: &Path) -> PathBuf {
+    intercom_dir.join("extension-state")
+}
+
 /// The broker runtime-file paths, re-exported from their single definition site in
 /// [`crate::transport::target`] so the call sites that still spell them `paths::…` keep resolving:
 /// `paths::broker_pid_path` (`broker/lifecycle.rs`, `transport/spawn.rs`) and

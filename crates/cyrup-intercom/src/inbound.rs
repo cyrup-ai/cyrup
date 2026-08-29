@@ -343,6 +343,7 @@ pub async fn auto_reply_non_interactive_at(
             message_id: None,
             supersedes: None,
             retry_of: None,
+            provenance: None,
         })
         .await;
     match send {

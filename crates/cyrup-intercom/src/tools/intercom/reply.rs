@@ -43,6 +43,7 @@ impl IntercomTool {
                 message_id: None,
                 supersedes: None,
                 retry_of: None,
+                provenance: None,
             })
             .await
             .map_err(to_tool_err)?;

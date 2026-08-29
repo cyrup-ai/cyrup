@@ -191,6 +191,16 @@ impl InlineMessage {
             lines.push(card_row(theme, body_width, &reply));
         }
 
+        // ICOM-056 / `v0.12.0 ui/inline-message.ts:109-112`: who actually originated this message,
+        // when it was not the peer agent itself. The LAST block, so it reads as a footnote to the
+        // body — note this is NOT the same position it takes in the collapsed meta line.
+        if let Some(provenance) = &self.message.provenance {
+            lines.push(card_row(theme, body_width, ""));
+            let via =
+                theme.fg("dim", &format!(" Via extension: {}", provenance.extension_name));
+            lines.push(card_row(theme, body_width, &via));
+        }
+
         lines.push(theme.fg("muted", &format!("╰{}╯", "─".repeat(body_width))));
         lines
     }
@@ -221,6 +231,12 @@ impl InlineMessage {
                 let plural = if count == 1 { "" } else { "s" };
                 meta.push(format!("{count} attachment{plural}"));
             }
+        }
+        // ICOM-056 / `v0.12.0 ui/inline-message.ts:70`: after the attachment count and BEFORE the
+        // reply-to breadcrumb. Upstream's collapsed `meta` order is deliberately not the expanded
+        // block order, where provenance comes last.
+        if let Some(provenance) = &self.message.provenance {
+            meta.push(format!("Via {}", provenance.extension_name));
         }
         if self.message.reply_to.is_some() && self.message.expects_reply != Some(true) {
             let short: String =

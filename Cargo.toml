@@ -213,6 +213,11 @@ base64               = { version = "0.22" }
 # dependency of `rustls` (via `reqwest`'s rustls feature) and `quinn-proto`, so this is a direct
 # edge onto something already compiled, not a new third-party surface.
 ring                 = { version = "0.17" }
+# ICOM-016 — `createHash("sha256")` in `pi-intercom/broker/extension-state.ts:46,60`: the extension
+# state file is NAMED by the sha256 of its namespace and CARRIES a sha256 of its payload, which is
+# what lets a torn write be detected and fall back to the `.bak`. ADDS NO NEW CRATE TO THE GRAPH:
+# `sha2` 0.10.9 is already resolved in Cargo.lock as a transitive dependency.
+sha2                 = { version = "0.10" }
 # `cyrup-ext-subagents`'s mission store validates a delivery receipt's URL by CONSTRUCTING one —
 # pi does `new URL(url)` and treats a throw as "not an absolute URL"
 # (`pi-subagents/src/missions/store.ts:170-174`, `actions.ts:161-165`). `url` implements the same

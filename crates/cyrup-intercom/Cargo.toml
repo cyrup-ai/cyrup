@@ -25,6 +25,9 @@ test-fixtures = []
 
 [dependencies]
 cyrup-core = { workspace = true }
+# ICOM-016 — the extension-state store names each file by the sha256 of its namespace and carries a
+# sha256 of the payload for the torn-write check (`broker/extension-state.ts:46,60`).
+sha2 = { workspace = true }
 # `src/session_state.rs:13`, `src/extension.rs:35` and `src/seams.rs:37` name
 # `cyrup_ext::HostServices`, which is re-exported only under `wasm-host`
 # (`cyrup-ext/src/lib.rs:205`).

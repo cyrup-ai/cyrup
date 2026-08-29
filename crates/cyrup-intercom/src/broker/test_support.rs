@@ -16,8 +16,18 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use super::frame::FrameOutcome;
 use super::state::BrokerState;
 
+/// A process-unique extension-state directory for a test broker. Never the real
+/// `<intercomDir>/extension-state`: a unit test must not read or write the developer's own state.
+pub(super) fn test_extension_state_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!(
+        "cyrup-intercom-extension-state-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4()
+    ))
+}
+
 pub(super) fn make_state() -> BrokerState {
-    BrokerState::new(30_000, Arc::new(Notify::new()))
+    BrokerState::new(30_000, Arc::new(Notify::new()), test_extension_state_dir())
 }
 
 pub(super) fn make_tx() -> UnboundedSender<Vec<u8>> {

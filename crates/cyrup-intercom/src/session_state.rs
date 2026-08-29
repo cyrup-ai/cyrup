@@ -5,7 +5,7 @@
 //! The [`IntercomClient`] is created on `SessionStart` (after the broker is health-connectable) and
 //! stashed here; tools/seams clone the `Arc` out under a short lock (never held across `.await`).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -149,6 +149,21 @@ pub struct SharedIntercomState {
     /// `latestOutboundReceipts` (`v0.10.1 index.ts:528`) — the newest receipt seen for each message
     /// THIS session sent, read back by [`Self::latest_delivery_state`].
     latest_outbound_receipts: Mutex<HashMap<String, OutboundReceipt>>,
+    /// `outboxRequestIds` (`v0.12.0 index.ts:645`) — every outbox `requestId` seen in THIS runtime,
+    /// the source of `duplicate_request`. Cleared by [`crate::connect::begin_runtime`]
+    /// (`index.ts:1582`) and never pruned by time: the dedupe window IS the runtime, so replaying a
+    /// requestId after a session restart is legal.
+    /// `extensionRegistry` (`v0.12.0 index.ts:856-861`) — the `(namespace, ownerEligible)` pairs
+    /// registered on this session, the source `currentExtensionCapabilities` reads. ICOM-056 lands
+    /// the FRONT DOOR only: the pairs are recorded here, but the channel effects behind them (owner
+    /// election, publish fan-out, the state store) are ICOM-016 and are not stubbed.
+    extension_registrations: Mutex<HashMap<String, bool>>,
+    outbox_request_ids: Mutex<HashSet<String>>,
+    /// `pendingOutboxRequests` (`v0.12.0 index.ts:646`) — in-flight outbox requests keyed by
+    /// `requestId`, each stamped with the generation it started under so
+    /// [`crate::outbox::fail_pending_outbox_requests`] can settle exactly the ones a runtime change
+    /// orphaned and leave a newer runtime's requests alone.
+    pending_outbox_requests: Mutex<HashMap<String, crate::outbox::PendingOutboxRequest>>,
     /// Inbound ask tracking (`ReplyTracker`).
     pub tracker: Mutex<ReplyTracker>,
     /// The outbound single-slot reply waiter (`replyWaiter`).
@@ -178,6 +193,9 @@ impl SharedIntercomState {
             connect: crate::connect::ConnectSupervisor::default(),
             seen_inbound_messages: Mutex::new(SeenInboundMessages::default()),
             latest_outbound_receipts: Mutex::new(HashMap::new()),
+            extension_registrations: Mutex::new(HashMap::new()),
+            outbox_request_ids: Mutex::new(HashSet::new()),
+            pending_outbox_requests: Mutex::new(HashMap::new()),
             tracker: Mutex::new(ReplyTracker::new(ask_timeout_ms)),
             waiter: OutboundReplyWaiter::new(),
             config,
@@ -668,6 +686,78 @@ impl SharedIntercomState {
 
     /// This session's own broker-assigned id, if connected (for the self-target guard).
     #[must_use]
+    /// Record one `intercom:extension-register` (`v0.12.0 index.ts:856-861`). Re-registering an
+    /// existing namespace is refused, matching upstream's already-registered branch.
+    pub fn record_extension_registration(&self, namespace: &str, owner_eligible: bool) -> bool {
+        let mut guard = self.extension_registrations.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.contains_key(namespace) {
+            return false;
+        }
+        guard.insert(namespace.to_string(), owner_eligible);
+        true
+    }
+
+    /// `currentExtensionCapabilities` (`v0.12.0 index.ts:856-861`) — the registered namespaces.
+    #[must_use]
+    pub fn extension_registrations(&self) -> Vec<(String, bool)> {
+        self.extension_registrations
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect()
+    }
+
+    /// Test-and-insert on `outboxRequestIds` (`v0.12.0 index.ts:1063`): `true` means this
+    /// `requestId` was ALREADY seen in this runtime, i.e. `duplicate_request`. A `false` answer also
+    /// records it, so the second emit of the same id answers `true`.
+    pub fn outbox_request_seen(&self, request_id: &str) -> bool {
+        !self
+            .outbox_request_ids
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id.to_string())
+    }
+
+    /// `outboxRequestIds.clear()` (`v0.12.0 index.ts:1582`) — the dedupe window is one runtime.
+    pub fn clear_outbox_request_ids(&self) {
+        self.outbox_request_ids.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    }
+
+    /// Track an in-flight request so a runtime change can settle it (`index.ts:1064`).
+    pub fn track_pending_outbox(&self, request_id: String, pending: crate::outbox::PendingOutboxRequest) {
+        self.pending_outbox_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(request_id, pending);
+    }
+
+    /// Pop one in-flight request. `None` means it was already settled — the caller must then emit
+    /// NOTHING, which is how `settleOutboxRequest` stays exactly-once (`index.ts:1009-1021`).
+    pub fn take_pending_outbox(&self, request_id: &str) -> Option<crate::outbox::PendingOutboxRequest> {
+        self.pending_outbox_requests
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(request_id)
+    }
+
+    /// Drain every in-flight request stamped at or before `generation`
+    /// (`failPendingOutboxRequests`, `v0.12.0 index.ts:1022-1028`).
+    ///
+    /// `<=`, deliberately: both call sites run BEFORE their generation bump and pass the CURRENT
+    /// generation, and the requests they are orphaning are stamped with exactly that value. A `<`
+    /// here would drain nothing and leak every in-flight request on a runtime change. A request
+    /// started under a LATER generation is left alone.
+    pub fn drain_pending_outbox_upto(&self, generation: u64) -> Vec<crate::outbox::PendingOutboxRequest> {
+        let mut guard = self.pending_outbox_requests.lock().unwrap_or_else(|e| e.into_inner());
+        let stale: Vec<String> = guard
+            .iter()
+            .filter(|(_, p)| p.generation <= generation)
+            .map(|(k, _)| k.clone())
+            .collect();
+        stale.iter().filter_map(|k| guard.remove(k)).collect()
+    }
+
     pub fn self_session_id(&self) -> Option<String> {
         self.client().and_then(|c| c.session_id())
     }
@@ -754,6 +844,7 @@ impl SharedIntercomState {
                 message_id: Some(question_id.clone()),
                 supersedes,
                 retry_of,
+                provenance: None,
             })
             .await;
 

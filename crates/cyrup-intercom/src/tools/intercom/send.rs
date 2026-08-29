@@ -124,6 +124,7 @@ impl IntercomTool {
                 // deliberately does NOT carry them (`:2217-2221`).
                 supersedes: params.supersedes.clone(),
                 retry_of: params.retry_of.clone(),
+                provenance: None,
             })
             .await
             .map_err(to_tool_err)?;

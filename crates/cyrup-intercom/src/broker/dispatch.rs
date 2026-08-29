@@ -95,19 +95,22 @@ impl BrokerState {
             "presence" => self.handle_presence(conn_id, value, session_id, now),
             "message_receipt" => self.handle_message_receipt(conn_id, value, session_id, now),
             "cancel_message" => self.handle_cancel_message(conn_id, self_tx, value, session_id, now),
-            // Extension-bus frames (`v0.9.2 broker/broker.ts:551-585,961-969`). cyrup does not
-            // implement the bus, so it never advertises `EXTENSION_BUS_FEATURE` on `registered` —
-            // which is exactly what stops a conforming pi client from sending these
-            // (`supportsFeature` gate, `v0.9.2 broker/client.ts:648,817-819`). A NON-conforming
-            // peer can still send them over a socket every process on the box can reach, so each
-            // handler ports pi's own validation prefix and pi's own miss branch. The bus EFFECTS
-            // stay unported; nothing below needs them.
-            "extension_publish" => self.handle_extension_publish(conn_id, self_tx, session_id),
+            // Extension-bus frames (`v0.9.2 broker/broker.ts:551-585,961-969`). ICOM-016 landed the
+            // effects, so the broker now advertises `EXTENSION_BUS_FEATURE` on `registered` and a
+            // conforming pi client sends these as a matter of course (`supportsFeature` gate,
+            // `v0.9.2 broker/client.ts:648,817-819`). `handle_extension_capabilities_update` records
+            // the advertised namespaces and re-elects, `handle_extension_publish` fans out to the
+            // capable set, and `handle_extension_state_commit` drives the revision-checked store in
+            // `super::extension_state`. All three still port pi's validation prefix verbatim,
+            // because a non-conforming peer can reach this socket regardless of what was advertised.
+            "extension_publish" => {
+                self.handle_extension_publish(conn_id, self_tx, value, session_id)
+            }
             "extension_state_commit" => {
                 self.handle_extension_state_commit(conn_id, self_tx, value, session_id)
             }
             "extension_capabilities_update" => {
-                self.handle_extension_capabilities_update(conn_id, value, session_id)
+                self.handle_extension_capabilities_update(conn_id, self_tx, value, session_id)
             }
             // Genuinely unknown tags stay fatal — that is pi's own behaviour
             // (`default: throw new Error(\`Unknown client message type\`)`,
@@ -142,7 +145,11 @@ mod tests {
     #[test]
     fn the_tcp_endpoint_credential_gates_health_and_register_and_the_socket_endpoint_does_not() {
         fn drive(state_id: Option<&str>, frame: serde_json::Value) -> FrameOutcome {
-            let mut state = BrokerState::new(30_000, Arc::new(Notify::new()))
+            let mut state = BrokerState::new(
+                30_000,
+                Arc::new(Notify::new()),
+                super::super::test_support::test_extension_state_dir(),
+            )
                 .with_listen_endpoint(state_id.is_none(), state_id.map(str::to_string));
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut sid = None;
@@ -198,7 +205,11 @@ mod tests {
     #[test]
     fn trusted_local_follows_the_bound_endpoint_not_the_platform() {
         for (trusted, label) in [(true, "socket"), (false, "tcp")] {
-            let mut state = BrokerState::new(30_000, Arc::new(Notify::new()))
+            let mut state = BrokerState::new(
+                30_000,
+                Arc::new(Notify::new()),
+                super::super::test_support::test_extension_state_dir(),
+            )
                 .with_listen_endpoint(trusted, None);
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             let mut sid = None;

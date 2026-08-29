@@ -194,7 +194,11 @@ pub async fn run() -> std::io::Result<()> {
 
     let shutdown = Arc::new(Notify::new());
     let state = Arc::new(Mutex::new(
-        BrokerState::new(ask_timeout, shutdown.clone())
+        BrokerState::new(
+            ask_timeout,
+            shutdown.clone(),
+            paths::extension_state_dir_path(&intercom_dir),
+        )
             .with_listen_endpoint(listener.is_trusted_local(), endpoint_state_id),
     ));
     let mut next_conn_id: u64 = 0;
@@ -310,7 +314,11 @@ mod tests {
     #[tokio::test]
     async fn a_register_clears_the_pending_shutdown_so_a_later_disconnect_can_re_arm() {
         let state: Arc<Mutex<BrokerState>> =
-            Arc::new(Mutex::new(BrokerState::new(30_000, Arc::new(Notify::new()))));
+            Arc::new(Mutex::new(BrokerState::new(
+                30_000,
+                Arc::new(Notify::new()),
+                super::super::test_support::test_extension_state_dir(),
+            )));
         // t=0: the last session left → a check is armed.
         schedule_shutdown_check(&state);
         assert!(lock(&state).shutdown_scheduled, "armed");

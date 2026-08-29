@@ -108,11 +108,32 @@ impl BrokerState {
             context_window: None,
             extra: Default::default(),
         };
+        // `previous?.ownerOrder ?? this.nextOwnerOrder++` (`v0.9.2 broker/broker.ts:488`) — read
+        // BEFORE the takeover path removes anything, so a session that re-registers under the same
+        // id keeps its original election order and cannot seize a namespace by reconnecting.
+        let owner_order = self.sessions.get(&id).map_or_else(
+            || {
+                let next = self.next_owner_order;
+                self.next_owner_order += 1;
+                next
+            },
+            |previous| previous.owner_order,
+        );
+        // `extensions_field_is_valid` above has already proved every element decodes, so the `None`
+        // arm is unreachable for a frame that got here.
+        let extensions: Vec<crate::transport::protocol::ExtensionCapability> = registration
+            .extra
+            .get("extensions")
+            .and_then(|v| serde_json::from_value(v.clone()).ok())
+            .unwrap_or_default();
+        let namespaces: Vec<String> = extensions.iter().map(|e| e.namespace.clone()).collect();
         self.insert_session(id.clone(), ConnectedSession {
             conn_id,
             info: info.clone(),
             tx: self_tx.clone(),
             last_presence_broadcast_at: now,
+            owner_order,
+            extensions,
         });
         // `this.disconnectedSessions.delete(id)` (`v0.10.1 broker/broker.ts:377`): this identity is
         // live again, so it must no longer be a mailbox TARGET — only a mailbox recipient.
@@ -128,13 +149,26 @@ impl BrokerState {
             task.abort();
         }
 
-        send_msg(self_tx, &BrokerMessage::Registered { session_id: id.clone(), features: None });
+        // ICOM-016 — `features: [EXTENSION_BUS_FEATURE]` (`v0.9.2 broker/broker.ts:502-506`). This
+        // is what a conforming pi client gates every bus frame on
+        // (`v0.9.2 broker/client.ts:648,817-819`), so the broker could not advertise it until the
+        // effects existed. v0.9.2 advertises this one value only: `EXACT_SEND_FEATURE` is a v0.12.0
+        // addition whose behaviour is not ported, so advertising it would be a lie.
+        send_msg(self_tx, &BrokerMessage::Registered {
+            session_id: id.clone(),
+            features: Some(vec![crate::transport::protocol::EXTENSION_BUS_FEATURE.to_string()]),
+        });
         self.broadcast(&BrokerMessage::SessionJoined { session: info }, Some(&id));
+        // pi's order: AFTER `session_joined` and BEFORE the mailbox flush (`:509-510`).
+        self.recompute_namespace_owners();
         // `this.flushMailboxForSession(connectedSession)` (`v0.10.1 broker/broker.ts:392`), in pi's
         // own position: AFTER `registered` and `session_joined`, so the client has already
         // transitioned to connected and installed its message handler before its parked mail
         // arrives on the same socket, in order.
         self.flush_mailbox_for_session(&id, now);
+        // The per-capability replay (`v0.9.2 broker/broker.ts:512-528`), shared verbatim with
+        // `extension_capabilities_update` (`:570-585`) and factored once in `extensions.rs`.
+        self.replay_extension_state(self_tx, &namespaces);
         FrameResult::cont()
     }
 
@@ -160,6 +194,9 @@ impl BrokerState {
             self.remove_session(&sid);
             self.clear_message_receipt_routes_for_session(&sid);
             self.broadcast(&BrokerMessage::SessionLeft { session_id: sid.clone() }, Some(&sid));
+            // `this.recomputeNamespaceOwners()` (`v0.9.2 broker/broker.ts:544`) — the departing
+            // session may have been a namespace owner.
+            self.recompute_namespace_owners();
             schedule = true;
         }
         *session_id = None;
