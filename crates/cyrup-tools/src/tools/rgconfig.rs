@@ -17,7 +17,19 @@
 //!
 //! Roughly half of ripgrep's flags cannot be observed through the `--json` pipeline pi consumes
 //! (`--max-columns`, `-r/--replace`, the context flags, every colour/format flag, the mode flags):
-//! they parse and change nothing. One flag is refused outright — see [`RgFlags::QUIET_IS_REFUSED`].
+//! they change nothing — but the value-taking ones among them are still named explicitly, so their
+//! VALUE is consumed. Only `take()` advances past a value, so a value-taking flag left on the
+//! catch-all hands its argument back to the top of the loop, where a leading `-` makes it parse as
+//! a flag and apply. The catch-all remains for flags this module does not KNOW — a newer ripgrep's
+//! flag is ignored, never an error — and that is the one case where a value can still leak, because
+//! its arity is genuinely unknowable here.
+//!
+//! Three groups are recognised and then refused outright, each
+//! with its reason recorded in a const so it cannot drift from the arm it explains:
+//! [`RgFlags::QUIET_IS_REFUSED`] (`-q`, where honouring pi would import pi's own defect),
+//! [`RgFlags::PCRE2_IS_DECLINED`] (`-P`/`--pcre2`/`--engine`, an engine cyrup does not link)
+//! and [`RgFlags::PREPROCESSOR_IS_DECLINED`] (`--pre`/`--pre-glob`/`-z`, which need the
+//! process execution `grep`'s `FsOps` seam does not have).
 
 use ignore::overrides::{Override, OverrideBuilder};
 use ignore::types::{Types, TypesBuilder};
@@ -162,6 +174,49 @@ impl RgFlags {
         "-q/--quiet suppresses ripgrep's JSON match events (hiargs.rs:565); honouring it would \
          reproduce pi's silent 'No matches found' with matches present";
 
+    /// Why `-P`/`--pcre2`/`--engine` are recognised and then dropped.
+    ///
+    /// cyrup links `grep-regex` and not `grep-pcre2`, so it cannot run a PCRE2 search. Pi CAN: its
+    /// `rg` is the official release asset, built `--features pcre2` for every target
+    /// (`release.yml:177`). This is therefore a real divergence, and it is the one place the hint
+    /// `rg_pattern_error` emits — correctly, matching Pi's bytes — cannot be acted on: a human who
+    /// follows it and writes `--pcre2` into a `.ripgreprc` gets a PCRE2 search under Pi and the
+    /// same error again under cyrup.
+    ///
+    /// The flags are not turned into errors, because this module's contract is that a config never
+    /// makes the tool fail: one line in a `.ripgreprc` shared with a PCRE2-enabled `rg` must not
+    /// break every cyrup search. (Real ripgrep built WITHOUT the feature does error — "PCRE2 is
+    /// not available in this build of ripgrep", `hiargs.rs:447-452` — but that is not the binary
+    /// Pi runs, so it is not the parity target either.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const PCRE2_IS_DECLINED: &'static str =
+        "-P/--pcre2/--engine=pcre2 need grep-pcre2 (a C dependency cyrup-tools does not take); \
+         Pi's rg has the feature, so this is a real divergence, recorded rather than erased — \
+         this module never fails a search over a config line";
+
+    /// Why `--pre`, `--pre-glob` and `-z` — and their negations `--no-pre` and
+    /// `--no-search-zip` — are recognised and then dropped.
+    ///
+    /// The three positive forms make ripgrep spawn a program per file — `--pre` one named by the
+    /// config author
+    /// (`defs.rs:5377-5386`), `-z` a decompressor found on `PATH` (`defs.rs:5986-5991`). `grep`'s
+    /// seam is `FsOps` (`ops/mod.rs:437`), whose whole surface is read / read_stream /
+    /// write_in_place / access / metadata / read_dir / walk — no process operation at all;
+    /// execution is `ProcOps` (`ops/mod.rs:507`), which `GrepTool` does not hold (`grep.rs:170`).
+    /// A subprocess would also open the file with its own credentials, bypassing the `TraversalFs`
+    /// and `ProtectedFs` decorators every other byte `grep` reads passes through — arbitrary
+    /// execution reached through a read-only tool.
+    ///
+    /// The negations spawn nothing — they turn the preprocessor off — and are switches, so they
+    /// consume no value (`Pre::update` asserts there is no affirmative switch for `--pre`,
+    /// `defs.rs:5431-5435`). They are recognised anyway, because the catch-all is for flags this
+    /// module does not KNOW, and these belong to a group it does.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub const PREPROCESSOR_IS_DECLINED: &'static str =
+        "--pre/--pre-glob/-z spawn a program per file (and --no-pre/--no-search-zip turn that \
+         off); grep's seam is FsOps (ops/mod.rs:437), which has no exec, and a subprocess would \
+         bypass the isolation decorators";
+
     /// Read and parse the config named by `path`.
     ///
     /// A missing, unreadable or non-UTF-8 file yields [`RgFlags::default()`] — ripgrep only warns
@@ -218,7 +273,14 @@ impl RgFlags {
                 let mut it = shorts.chars();
                 while let Some(ch) = it.next() {
                     // Value-taking shorts consume the rest of the cluster, else the next line.
-                    if matches!(ch, 'm' | 'E' | 'g' | 't' | 'T') {
+                    // The set is ripgrep 14.1.0's `is_switch() == false` shorts: a short missing
+                    // from here is treated as a switch, so its value line survives to the top of
+                    // the loop and is applied as a flag in its own right.
+                    if matches!(
+                        ch,
+                        'm' | 'E' | 'g' | 't' | 'T' | 'd' | 'A' | 'B' | 'C' | 'M' | 'e' | 'f'
+                            | 'j' | 'r'
+                    ) {
                         let tail: String = it.by_ref().collect();
                         let v = if tail.is_empty() {
                             let v = args.get(i).map(|s| (*s).to_string());
@@ -265,7 +327,12 @@ impl RgFlags {
             "smart-case" => self.case = Some(CaseMode::Smart),
             "word-regexp" => self.word = true,
             "line-regexp" => self.whole_line = true,
-            "no-unicode" => self.no_unicode = true,
+            // `--pcre2-unicode`/`--no-pcre2-unicode` are DEPRECATED aliases of
+            // `--unicode`/`--no-unicode` (defs.rs:4692-4714) — engine-independent, writing the
+            // same `no_unicode` bool the Rust engine reads via `builder.unicode(!rg.no_unicode)`.
+            // Last occurrence wins across all four names, cross pairs included (defs.rs:4851-4860).
+            "no-unicode" | "no-pcre2-unicode" => self.no_unicode = true,
+            "unicode" | "pcre2-unicode" => self.no_unicode = false,
             "crlf" => self.crlf = true,
             "fixed-strings" => self.fixed_strings = true,
             "invert-match" => self.invert_match = true,
@@ -299,6 +366,38 @@ impl RgFlags {
             // `--quiet` is recognised so it does not fall through as unknown, and then dropped.
             // See `QUIET_IS_REFUSED`.
             "quiet" => {}
+            // Recognised and declined — see `PCRE2_IS_DECLINED`. `--engine`'s VALUE is consumed
+            // here on purpose: an unconsumed value-taking flag leaves its argument to be re-read
+            // as a top-level arg by `parse`, so `--engine` followed by `-i` would silently turn
+            // the search case-insensitive. `default` and `auto` are what cyrup already does —
+            // `Auto` (hiargs.rs:375-398) returns the Rust matcher whenever it builds — so all
+            // three values land in the same place.
+            "engine" => {
+                take();
+            }
+            "pcre2" | "no-pcre2" | "auto-hybrid-regex" | "no-auto-hybrid-regex" => {}
+            // Recognised and declined — see `PREPROCESSOR_IS_DECLINED`. Same value-consuming
+            // reason as `--engine` above.
+            "pre" | "pre-glob" => {
+                take();
+            }
+            // All three are switches — `Pre::update` asserts there is no affirmative switch for
+            // `--pre` (defs.rs:5431-5435) — so none of them consumes a value.
+            "no-pre" | "search-zip" | "no-search-zip" => {}
+            // Recognised, value CONSUMED, semantics dropped. These are ripgrep 14.1.0 flags that
+            // take a value and that this module does not act on. They must not reach the catch-all:
+            // `parse` advances past the flag but only `take()` advances past the VALUE, so an
+            // unconsumed value-taking flag hands its argument back to the top of the loop, where a
+            // leading `-` makes it parse as a flag and apply — `--replace` followed by `-i`
+            // silently turned the search case-insensitive. The catch-all below stays for flags this
+            // module does not KNOW: a newer ripgrep's flag must still be ignored, never an error.
+            "after-context" | "before-context" | "color" | "colors" | "context"
+            | "context-separator" | "dfa-size-limit" | "field-context-separator"
+            | "field-match-separator" | "file" | "generate" | "hostname-bin"
+            | "hyperlink-format" | "max-columns" | "path-separator" | "regex-size-limit"
+            | "regexp" | "replace" | "threads" | "type-clear" => {
+                take();
+            }
             // Everything else — inert through the JSON pipeline, or a flag from a ripgrep newer
             // than the one this was written against. Ignored, never fatal.
             _ => {}
@@ -320,6 +419,9 @@ impl RgFlags {
             // the whole config has been read. Resolved at the end of `parse`.
             'u' => self.u_level = self.u_level.saturating_add(1),
             'q' => {}
+            // Recognised and declined. See `PCRE2_IS_DECLINED` (`-P`) and
+            // `PREPROCESSOR_IS_DECLINED` (`-z`). Both are switches, so neither takes a value.
+            'P' | 'z' => {}
             _ => {}
         }
     }
@@ -331,6 +433,14 @@ impl RgFlags {
             'g' => self.globs.extend(v.map(|g| (g, false))),
             't' => self.types.extend(v),
             'T' => self.types_not.extend(v),
+            // `-d` is `--max-depth`, which this module ALREADY honours by its long names. Leaving
+            // the short form off the arity guard made the two spellings of one flag disagree:
+            // `--max-depth 2` limited the walk and `-d 2` did nothing at all — a different result
+            // set, not merely a dropped flag.
+            'd' => self.max_depth = v.and_then(|v| v.parse().ok()),
+            // Recognised, value consumed, semantics dropped — the short spellings of the group in
+            // `apply_long` above.
+            'A' | 'B' | 'C' | 'M' | 'e' | 'f' | 'j' | 'r' => {}
             _ => {}
         }
     }

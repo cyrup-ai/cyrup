@@ -5,33 +5,50 @@ crate: cyrup-tools
 source: CYRUP-DELTA classification audit (workflow wf_12c49023-adf)
 stage: aug
 status: done
-updated: 2026-08-28 02:08
+updated: 2026-08-28 21:00
 ---
 
-# Capability gap: `read`'s negative-`limit` window
+# `read`'s negative-`limit` window — EXECUTION path
 
-Classified a **capability gap** — a caller can observe a difference — by the audit
-that reviewed all 87 `CYRUP-DELTA` markers against pi at `e8682309`.
+Scope, stated first because this workstream has already confused the two:
 
-**This was never authorized as an accepted divergence.** The marker was written by an
-agent. Nobody decided it was acceptable. It is filed here so it is a decision rather
-than an artifact.
+| path | file | what it decides | status |
+|---|---|---|---|
+| **HEADER render** | [`crates/cyrup-tui/src/transcript/tool_args.rs`](../../../crates/cyrup-tui/src/transcript/tool_args.rs) `read_line_range` (line 298) | the `:1--5` text drawn next to `read foo.txt` in the transcript | **fixed earlier today — out of scope, do not touch** |
+| **EXECUTION** | [`crates/cyrup-tools/src/tools/read.rs`](../../../crates/cyrup-tools/src/tools/read.rs) `ReadTool::execute` (lines 218-233, 296-302) | **which lines of the file are actually read**, and the continuation notice appended to them | **this task** |
 
-Marker location: `crates/cyrup-tools/src/tools/read.rs`, inside `ReadTool::execute`, the
-comment block immediately above `let end = match input.limit { … }` in the text branch.
-(Anchor by that symbol — line 221 has drifted.)
+The two are independent: the header is computed from the *arguments*, the execution path from the
+*file*. Fixing one does not move the other.
+
+Classified a **capability gap** — a caller can observe a difference — by the audit that reviewed all
+87 `CYRUP-DELTA` markers against pi at `e8682309`. **This was never authorized as an accepted
+divergence.** The marker was written by an agent; nobody decided it was acceptable.
+
+Marker location: [`crates/cyrup-tools/src/tools/read.rs:221`](../../../crates/cyrup-tools/src/tools/read.rs)
+— the `[CYRUP-DELTA]:` sentence inside the comment block at lines 218-224, immediately above
+`let end = match input.limit { … }` (line 225). **Verified 2026-08-28: line 221 is still exact, it
+has NOT drifted.** (An earlier revision of this task claimed it had; that claim was wrong.)
 
 ---
 
-## Ground truth: what pi does at `e8682309`
+## Ground truth: pi at `e8682309`
 
-Reference: `tmp/pi/packages/coding-agent/src/core/tools/read.ts` @ `e8682309`.
+Reference: [`tmp/pi/packages/coding-agent/src/core/tools/read.ts`](../../../tmp/pi/packages/coding-agent/src/core/tools/read.ts)
+(`git -C tmp/pi rev-parse HEAD` = `e86823096c5bad39e1ca282ec24bc5eb9bec745b`). **Every line number
+below was re-read from that file today.**
 
 ```ts
-// read.ts:288-290
-const endLine = Math.min(startLine + limit, allLines.length);
-selectedContent = allLines.slice(startLine, endLine).join("\n");
-userLimitedLines = endLine - startLine;
+// read.ts:284-293
+let selectedContent: string;
+let userLimitedLines: number | undefined;
+// If limit is specified by the user, honor it first. Otherwise truncateHead decides.
+if (limit !== undefined) {
+    const endLine = Math.min(startLine + limit, allLines.length);    // :288
+    selectedContent = allLines.slice(startLine, endLine).join("\n"); // :289
+    userLimitedLines = endLine - startLine;                          // :290
+} else {
+    selectedContent = allLines.slice(startLine).join("\n");
+}
 ```
 
 ```ts
@@ -43,29 +60,29 @@ userLimitedLines = endLine - startLine;
 }
 ```
 
-> **Citation correction.** The audit brief and the in-tree comment both cite
-> `read.ts:282` for the `endLine` expression. At `e8682309` that expression is at
-> **read.ts:288**, the `slice` at **289**, `userLimitedLines` at **290**, `startLine` at
-> **278**, and the out-of-bounds `throw` at **282**. See open question **OQ-4**.
+Other anchors verified in the same file: `startLine` at **:278**, the out-of-bounds `throw` at
+**:282**, the `limit` schema property at **:24** (`offset` at **:23**), `truncateHead(...)` at
+**:295**, and the three branches that precede the user-limit branch at **:297** / **:302** / **:313**.
 
-`endLine` is an **unclamped signed value**. Two separate consumers key off it, and they
-normalise it differently — that is the whole of the gap:
+`endLine` is an **unclamped signed** JS number. Two consumers key off it and normalise it
+differently — that is the entire gap:
 
-1. **The slice.** `Array.prototype.slice` resolves its `end` argument as
+1. **The slice** (`:289`). `Array.prototype.slice` resolves `end` as
    `relativeEnd < 0 ? max(len + relativeEnd, 0) : min(relativeEnd, len)`, then takes
-   `count = max(final − k, 0)`. So a negative `endLine` **counts from the end of the
-   file** and returns a real, usually large window. A negative `limit` that leaves
-   `endLine` in `[0, startLine)` instead returns nothing.
-2. **The continuation notice.** `userLimitedLines = endLine − startLine` keeps the
-   **raw, unnormalised** `endLine`; `startLine + userLimitedLines` telescopes straight
-   back to `endLine`. So the notice can quote a `remaining` **larger than the file** and
-   an `offset=` that is **zero or negative**.
+   `count = max(final − k, 0)`. So a negative `endLine` **counts from the end of the file** and
+   returns a real, usually large window. A negative `limit` that leaves `endLine` in `[0, startLine)`
+   instead returns nothing.
+2. **The continuation notice** (`:290` → `:315-316`). `userLimitedLines = endLine − startLine` keeps
+   the **raw, unnormalised** `endLine`; `startLine + userLimitedLines` telescopes straight back to
+   it. So the notice can quote a `remaining` **larger than the file** and an `offset=` that is
+   **zero or negative**.
 
-### Node-verified oracle (10-line file `line1…line10`, no trailing newline, `total = 10`)
+### Node-verified oracle
 
-Replayed against pi's exact expressions:
+Replayed today against pi's exact expressions. Fixture: 10-line file `line1…line10`, **no trailing
+newline** ⇒ `allLines.length = 10`.
 
-| args | pi output |
+| args | pi output (exact `first_text`) |
 |---|---|
 | `{limit: -1}` | `line1…line9` + `\n\n[11 more lines in file. Use offset=0 to continue.]` |
 | `{limit: -5}` | `line1…line5` + `\n\n[15 more lines in file. Use offset=-4 to continue.]` |
@@ -73,125 +90,119 @@ Replayed against pi's exact expressions:
 | `{offset: 4, limit: -2}` | `""` + `\n\n[9 more lines in file. Use offset=2 to continue.]` |
 | `{offset: 8, limit: -5}` | `""` + `\n\n[8 more lines in file. Use offset=3 to continue.]` |
 
-Note the last two rows: when `|limit| ≤ startLine` pi's window is **also empty** — but
-the *notice* still differs from cyrup's, because pi's `offset=` is `endLine + 1`
-(`start + limit + 1`) where cyrup's is `start + 1`.
+Rows 4-5 are load-bearing: when `|limit| ≤ startLine` pi's *window* is also empty, but the *notice*
+still differs from cyrup's, because pi's `offset=` is `endLine + 1` (`start + limit + 1`) where
+cyrup's is `start + 1`. They are what prove the notice is driven by the **raw** `endLine` and not by
+the clamped slice bound.
+
+`truncateHead("")` returns `{ content: "", truncated: false, firstLineExceedsLimit: false }`
+([`truncate.ts:87-101`](../../../tmp/pi/packages/coding-agent/src/core/tools/truncate.ts)), so the
+empty-window sub-case falls through to the notice branch in both implementations.
 
 ### Negative `offset` is NOT part of this gap
 
-`startLine = offset ? Math.max(0, offset − 1) : 0` (read.ts:278) clamps at zero in pi
-itself, and `Math.max(0, −0.5)` is `0`, not `−0.5`. cyrup's
-`to_count(offset.map_or(0.0, |o| (o − 1.0).max(0.0)))` reproduces that exactly for every
-integral input. **Negative `offset` is already at parity — do not touch it.** The
-existing `read_accepts_float_and_negative_numeric_params` assertion for `offset: -5`
-stays as-is.
+`const startLine = offset ? Math.max(0, offset - 1) : 0` (read.ts:**278**) clamps at zero in pi
+itself, and `Math.max(0, −0.5)` is `0`. cyrup's `to_count(offset.map_or(0.0, |o| (o − 1.0).max(0.0)))`
+([read.rs:206](../../../crates/cyrup-tools/src/tools/read.rs)) reproduces that exactly for every
+integral input. **Negative `offset` is already at parity — do not touch it.**
 
 ---
 
 ## What cyrup does today
 
+[`read.rs:225-229`](../../../crates/cyrup-tools/src/tools/read.rs):
+
 ```rust
 let end = match input.limit {
+    #[allow(clippy::cast_precision_loss)]
     Some(l) => crate::jsnum::to_count(start as f64 + l).clamp(start, total),
     None => total,
 };
 ```
 
-`jsnum::to_count` (`crates/cyrup-tools/src/jsnum.rs`) is `to_integer` (the ECMA-262
-`ToIntegerOrInfinity` truncate-toward-zero fold) followed by *floor at 0*. That floor is
-correct at its other three call sites — each has a pi-side `Math.max(0, …)` or an
-equivalent behind it — but `read`'s `endLine` has **no** such guard, so `to_count` +
-`.clamp(start, total)` collapses every negative `limit` to `end == start`: an empty
-window, and a notice pointing back at `start + 1`.
+[`crate::jsnum::to_count`](../../../crates/cyrup-tools/src/jsnum.rs) (jsnum.rs:37) is `to_integer`
+(the ECMA-262 §7.1.5 `ToIntegerOrInfinity` truncate-toward-zero fold, jsnum.rs:25) followed by a
+**floor at 0**. That floor is correct at its other five call sites — each has a pi-side clamp behind
+it — but `read`'s `endLine` has **no** such guard, so `to_count` + `.clamp(start, total)` collapses
+every negative `limit` to `end == start`: an empty window, and a notice pointing back at `start + 1`.
 
-**What a caller sees.** For any negative `limit`, pi returns a real (possibly large)
-slice of the file and cyrup returns **no content at all**. The model can reach this:
-`limit` is a bare `Type.Number` with no `minimum` (read.ts:23) and pi never validates
-tool arguments (`tool-definition-wrapper.ts:16-18`), so `limit: -5` is an input both
-implementations accept and answer differently.
-
----
-
-## Decision required
-
-One of:
-
-1. **Close it** — bring cyrup to pi's behaviour. *(Prescribed below.)*
-2. **Accept it** — David explicitly accepts the divergence; the marker stays and is
-   annotated as authorized, with the reason.
-3. **Reshape it** — the divergence is right but the current form is wrong.
-
-Do not silently keep option 2 by leaving the marker as-is; that is how this became a
-backlog in the first place.
-
-### The argument FOR David, if he wants to consider accepting
-
-Stated once, in full, so it is a decision and not an omission — the close plan below is
-the prescription either way:
-
-- pi's negative-`limit` output is arguably a **latent JS bug**: `offset=0` and
-  `offset=-4` are not values pi's own `read` will accept on a follow-up call (`offset: 0`
-  is falsy → start of file; `offset: -4` → also start of file), so the continuation
-  notice is self-inconsistent, and `remaining` exceeds the file's line count.
-- Cyrup's current behaviour is the "safe" reading of a nonsense argument.
-
-**Against accepting** (why the close path is prescribed): the *content* difference is
-what matters, not the notice. pi hands the model most of the file; cyrup hands it an
-empty string. A model that emits `limit: -1` gets a working read from pi and a dead end
-from cyrup, and the difference is not observable to the model as an error — it just sees
-an empty file. Reproducing a quirk is cheap; the divergence is not. Cyrup's stated
-posture elsewhere in this file (see the `offset`, `NaN`, macOS-variant and errno
-comments) is byte-for-byte reproduction of pi including its infelicities.
+**What a caller sees.** For any negative `limit`, pi returns a real (possibly large) slice of the
+file and cyrup returns **no content at all**. The model can reach this: `limit` is a bare
+`Type.Number` with no `minimum` (read.ts:**24**) and pi never validates tool arguments
+([`tool-definition-wrapper.ts:16-18`](../../../tmp/pi/packages/coding-agent/src/core/tools/tool-definition-wrapper.ts)),
+so `limit: -5` is an input both implementations accept and answer differently. The model cannot even
+see it as an error — it just sees an empty file.
 
 ---
 
-## Prescribed change (the CLOSE path)
+## Decision: CLOSE. Bring cyrup to pi.
 
-### 1. `crates/cyrup-tools/src/tools/read.rs` — `ReadTool::execute`, text branch
+Recorded once, so it is a decision and not an omission. The counter-argument is that pi's
+negative-`limit` notice is a latent JS bug — `offset=0` and `offset=-4` are not values pi's own
+`read` will honour on a follow-up call (both fall back to the start of the file) — and cyrup's
+emptiness is the "safe" reading of a nonsense argument.
 
-Replace the `let end = match input.limit { … };` block (and its `[CYRUP-DELTA]` comment)
-with a computation that keeps the raw `endLine` alongside the slice bound. Anchor: the
-statement immediately preceding `let window: Vec<&str> = lines.get(start..end)…`.
+It loses to the *content* difference, which is what the model consumes: pi hands it most of the
+file, cyrup hands it an empty string, silently. Reproducing a quirk is cheap; the divergence is not.
+Cyrup's posture in this very file (the `offset`, `NaN`, macOS-variant and errno comments) is
+byte-for-byte reproduction of pi including its infelicities. **Close it.**
+
+---
+
+## Required implementation
+
+One path. Do not substitute an alternative shape.
+
+### 1. [`crates/cyrup-tools/src/tools/read.rs`](../../../crates/cyrup-tools/src/tools/read.rs) — replace lines 218-229
+
+Replace the comment block (218-224) **and** the `let end = match input.limit { … };` statement
+(225-229) — the `#[allow(clippy::cast_precision_loss)]` goes with it, because the replacement has no
+`start as f64` — with:
 
 ```rust
 // Pi: `const endLine = Math.min(startLine + limit, allLines.length)` (read.ts:288), then
 // `allLines.slice(startLine, endLine)` (read.ts:289) and
 // `userLimitedLines = endLine - startLine` (read.ts:290).
 //
-// `endLine` is UNCLAMPED and signed, and its two consumers normalise it differently, which
-// is why it is kept here instead of being folded straight into one `usize`:
+// `endLine` is UNCLAMPED and signed, and its two consumers normalise it differently, which is
+// why the raw value is kept here instead of being folded straight into one `usize`:
 //
-//  * the SLICE applies `Array.prototype.slice`'s `relativeEnd` rule — a negative end is
-//    resolved as `max(len + end, 0)`, counting from the END of the array, then
-//    `count = max(final - k, 0)`. So `limit: -1` on a 10-line file returns lines 1..9, while a
-//    negative `limit` that leaves `endLine` in `[0, start)` selects nothing.
-//  * the CONTINUATION NOTICE keeps `endLine` RAW (`startLine + userLimitedLines`
-//    telescopes back to it), so it quotes a `remaining` that can exceed the file's line
-//    count and an `offset=` that can be zero or negative.
+//  * the SLICE applies `Array.prototype.slice`'s `relativeEnd` rule — a negative end resolves as
+//    `max(len + end, 0)`, counting from the END of the array — then `count = max(final - k, 0)`,
+//    which is the floor at `start`. So `limit: -1` on a 10-line file returns lines 1..9, while a
+//    negative `limit` leaving `endLine` in `[0, start)` selects nothing.
+//  * the CONTINUATION NOTICE keeps `endLine` RAW (`startLine + userLimitedLines` telescopes back
+//    to it, read.ts:315-316), so it quotes a `remaining` that can exceed the file's line count and
+//    an `offset=` that can be zero or negative.
 let total_i = i64::try_from(total).unwrap_or(i64::MAX);
 let start_i = i64::try_from(start).unwrap_or(i64::MAX);
 // `Math.min(startLine + limit, allLines.length)`, with `limit` folded through
-// `ToIntegerOrInfinity` here rather than inside `slice` — `start` is already integral, so
-// the fold is exact for every integral `limit` and the two orders agree.
+// `ToIntegerOrInfinity` here rather than inside `slice`. `start` is integral, so for every input
+// that can reach this line the two fold orders agree.
 let end_raw: Option<i64> = input
     .limit
     .map(|l| start_i.saturating_add(crate::jsnum::to_integer(l)).min(total_i));
-// `slice`'s `relativeEnd` resolution, then `count = max(final - k, 0)` as a clamp to `start`.
+// `slice`'s `relativeEnd` resolution, then `count = max(final - k, 0)` as a floor at `start`.
+// Saturating: `to_integer` folds a huge negative `limit` to `i64::MIN`, and `total_i + i64::MIN`
+// would otherwise overflow.
 let end: usize = match end_raw {
     Some(e) => {
-        let resolved = if e < 0 { (total_i + e).max(0) } else { e };
+        let resolved = if e < 0 { total_i.saturating_add(e).max(0) } else { e };
         usize::try_from(resolved).unwrap_or(0).clamp(start, total)
     }
     None => total,
 };
 ```
 
-`crate::jsnum::to_integer` is already `pub(crate)` and already documented as
-`ToIntegerOrInfinity` — **use it, do not add a new helper**, and **do not change
-`to_count`**: its three other callers (`read`'s `offset`, `ls`, `find`) each have a
-pi-side floor-at-zero behind them and must keep it.
+Use [`crate::jsnum::to_integer`](../../../crates/cyrup-tools/src/jsnum.rs) (jsnum.rs:25) — it is
+already `pub(crate)` and already documented as `ToIntegerOrInfinity`. **Do not add a new helper, and
+do not change `to_count`.** `to_count`'s five other callers each have a pi-side floor-at-zero behind
+them and must keep it: [read.rs:206](../../../crates/cyrup-tools/src/tools/read.rs) (`offset`),
+[ls.rs:107](../../../crates/cyrup-tools/src/tools/ls.rs),
+[find.rs:154](../../../crates/cyrup-tools/src/tools/find.rs), and
+[grep.rs:649 and :657](../../../crates/cyrup-tools/src/tools/grep.rs).
 
-### 2. Same file — the "more lines in file" branch
+### 2. Same file — replace the notice branch, lines 296-302
 
 Replace:
 
@@ -213,11 +224,11 @@ with:
 {
     // Pi: `remaining = allLines.length - (startLine + userLimitedLines)` and
     // `nextOffset = startLine + userLimitedLines + 1` (read.ts:315-316), where
-    // `startLine + userLimitedLines` telescopes back to the RAW `endLine`. Both go straight
-    // into the template literal upstream, so a negative `endLine` yields a `remaining` above
-    // the file's line count and a zero-or-negative `offset=`. The `end_raw.is_some()` test is
-    // Pi's `userLimitedLines !== undefined`, i.e. "the caller passed a limit".
-    let remaining = total_i - e;
+    // `startLine + userLimitedLines` telescopes back to the RAW `endLine`. Both go straight into
+    // the template literal, so a negative `endLine` yields a `remaining` above the file's line
+    // count and a zero-or-negative `offset=`. `end_raw.is_some()` is Pi's
+    // `userLimitedLines !== undefined`, i.e. "the caller passed a limit".
+    let remaining = total_i.saturating_sub(e);
     out.push_str(&format!(
         "\n\n[{remaining} more lines in file. Use offset={} to continue.]",
         e + 1
@@ -225,69 +236,57 @@ with:
 }
 ```
 
-For every non-negative `limit` this is identical to the code it replaces (`end_raw == end`
-and `end_raw.is_some()` ⟺ `end < total` is unreachable when `limit` is `None`, because
-`end == total` there). Let-chains are already used in this workspace
-(`cyrup-ext-subagents/src/tui/fleet_transcript.rs`), so the `if let … && …` form is fine.
+Let-chains are already used inside this crate —
+[`crates/cyrup-tools/src/isolation/traversal.rs:74-76`](../../../crates/cyrup-tools/src/isolation/traversal.rs) —
+and the workspace is edition 2024 / `rust-version = "1.96"` (Cargo.toml:88-89), so `if let … && …`
+compiles.
+
+**Equivalence for non-negative `limit`.** `end_raw == Some(min(start + l, total)) == Some(end)`, and
+`end_raw.is_some() && e < total_i` ⟺ `end < total` (when `limit` is `None`, `end == total`, so the
+old condition was already unreachable). Byte-identical output.
 
 ### 3. Delete the `[CYRUP-DELTA]` marker
 
-It is the only justification for the divergence and it is now false. Remove the
-`[CYRUP-DELTA]:` sentence; keep the surrounding pi citation, corrected to `read.ts:288`.
+The sentence at read.rs:221 is the only justification for the divergence and it is now false. It is
+deleted as part of replacing lines 218-224; the replacement comment above carries the corrected pi
+citations (`read.ts:288-290`, `:315-316`).
 
 ### Ordering is unchanged
 
-Pi's `truncateHead` branch runs **before** the user-limit branch (read.ts:296-313), so a
-negative-`limit` window large enough to trip the 2000-line / 50KB limits still produces
-the `[Showing lines …]` notice, not the `[N more lines …]` one. cyrup already has that
-ordering — do not reorder. `truncateHead("")` reports `truncated: false,
-firstLineExceedsLimit: false` (truncate.ts:87-101), so the empty-window sub-case falls
-through to the notice branch in both implementations.
+`truncateHead` (read.ts:295) and its `firstLineExceedsLimit` / `truncated` branches (read.ts:297,
+:302) run **before** the user-limit branch (read.ts:313). So a negative-`limit` window large enough
+to trip the 2000-line / 50KB limits produces the `[Showing lines …]` notice, not the
+`[N more lines …]` one. cyrup already has that ordering (read.rs:240, :266, :296) — **do not
+reorder.**
+
+### Note on fold ordering (why the prescription is safe)
+
+pi computes `endLine` in floats and folds via `ToIntegerOrInfinity` inside `slice`; the prescription
+folds `limit` first. For integral `start` these disagree only when `m = start + trunc(limit)` is
+positive and `limit` has a negative fractional part, in which case pi's slice end is `m − 1` and
+cyrup's is `m`. That requires `trunc(limit) ≥ 1` **and** `limit < 0` simultaneously — impossible —
+or `m > total`, which needs `start ≥ total`, already rejected by the out-of-bounds error
+(read.rs:207-217). **Selected content is therefore identical for every reachable input.** Only the
+notice's numerals can differ, and only for a fractional `limit`: see AD-1.
 
 ---
 
-## `cyrup-tui` interaction — checked, no change needed
+## Guard that fails without the change
 
-`crates/cyrup-tui/src/transcript/tool_args.rs::read_line_range` is the port of
-`formatReadLineRange` (read.ts:73-78). It was verified against pi for negative `limit`:
+Amend the existing test — **do not add a new file, do not add a new test fn.**
 
-- pi: `startLine = args.offset ?? 1`, `endLine = startLine + limit - 1`, rendered as
-  `:${startLine}${endLine ? "-" + endLine : ""}` — the `endLine ?` is a JS **truthiness**
-  test, so `endLine === 0` drops the range half.
-- cyrup: identical, including the `!= 0.0 && !is_nan()` filter and `f64` arithmetic.
-
-`{"limit": -5}` renders `:1--5` in both. **The header is already pi-faithful and this fix
-does not touch it.** The header is computed from the *arguments*, not from the tool's
-output, so the two are independent.
-
-The only other transcript sites that mention read's notices are
-`cyrup-tui/src/transcript/tool_result.rs:157` (a `bash` footer stripper, unrelated) and
-`cyrup-ext-subagents/src/tui/fleet_transcript.rs:831` (a `contains("[Showing lines")`
-truncation flag, unaffected). Neither parses `offset=` or `remaining`.
-
-Optional, cheap: add `{"path":"x","limit":-5}` → `:1--5` to the `read_line_range` cases in
-`cyrup-tui` so the header's negative branch is pinned rather than merely correct.
-
----
-
-## Test that fails without the change
-
-Amend the existing test — **do not add a new file**. It currently pins the divergent
-behaviour *and* misstates pi in its comment ("Pi's unclamped `startLine + limit` selects
-nothing" — it does not).
-
-**File:** `crates/cyrup-tools/src/tests/tools.rs`
-**Test:** `read_accepts_float_and_negative_numeric_params`
+**File:** [`crates/cyrup-tools/src/tests/tools.rs`](../../../crates/cyrup-tools/src/tests/tools.rs)
+**Test:** `read_accepts_float_and_negative_numeric_params` (line 2392)
 **Fixture already present:** `f.txt` = `line1…line10`, no trailing newline ⇒ `total = 10`.
 
-Replace the `neg_limit` block, whose current assertion is
+Replace the `neg_limit` block (tools.rs:2434-2450), whose current assertion pins the divergence
 
 ```rust
 assert_eq!(first_text(&neg_limit), "\n\n[10 more lines in file. Use offset=1 to continue.]");
 ```
 
-with the five Node-verified cases from the oracle table above, each asserted with
-`assert_eq!(first_text(&r), …)` on the full string:
+and whose comment misstates pi ("Pi's unclamped `startLine + limit` selects nothing" — it does not),
+with the five oracle rows, each asserted with `assert_eq!(first_text(&r), …)` on the full string:
 
 | args | expected `first_text` |
 |---|---|
@@ -297,82 +296,144 @@ with the five Node-verified cases from the oracle table above, each asserted wit
 | `{"path":"f.txt","offset":4,"limit":-2}` | `"\n\n[9 more lines in file. Use offset=2 to continue.]"` |
 | `{"path":"f.txt","offset":8,"limit":-5}` | `"\n\n[8 more lines in file. Use offset=3 to continue.]"` |
 
-Every one of the five fails against today's code (rows 1-3 return `""` + a wrong notice;
-rows 4-5 return the right emptiness with the wrong `offset=`/`remaining`). Rows 4 and 5
-are the ones that prove the notice is driven by the **raw** `endLine` and not by the
-clamped slice bound — keep both.
+All five fail against today's code: rows 1-3 return `""` plus a wrong notice; rows 4-5 return the
+right emptiness with the wrong `offset=` / `remaining`.
 
-Keep the test's existing non-negative assertions unchanged; they are the no-regression
-half (`offset: 2.0, limit: 3.0` ≡ `offset: 2, limit: 3`; `offset: -5` ⇒ whole file;
-`offset: 99.0` ⇒ the out-of-bounds error text). Also update the block's comment to state
-pi's actual rule.
+Keep the test's existing non-negative assertions unchanged — they are the no-regression half
+(`offset: 2.0, limit: 3.0` ≡ `offset: 2, limit: 3`; `offset: -5` ⇒ whole file; `offset: 99.0` ⇒ the
+out-of-bounds error text). Update the block's comment to state pi's actual rule.
+
+---
+
+## `cyrup-tui` interaction — checked, no change needed
+
+[`crates/cyrup-tui/src/transcript/tool_args.rs:298`](../../../crates/cyrup-tui/src/transcript/tool_args.rs)
+`read_line_range` is the port of `formatReadLineRange` (read.ts:73-78). **It was already reworked
+earlier today** and now ports all four of read.ts:74-77's rules as the separate JS operators they
+are — the presence gate, `?? 1` nullish, `limit !== undefined` presence, and truthiness on the
+computed end — via `js_arg` / `js_truthy` / `js_to_number` / `js_add` in the same file (lines 200,
+222, 237, 262). Verified today for the negative case: `{"limit": -5}` renders `:1--5`
+(`js_add(1, -5)` = `-4`, `- 1` = `-5`, non-zero ⇒ the range half is kept, `js_number(-5.0)` = `"-5"`),
+matching pi.
+
+**The header is already pi-faithful and this fix does not touch it.** Do not edit `tool_args.rs`
+under this task. (An earlier revision of this task described the pre-rework `read_line_range` as
+"identical, including the `!= 0.0 && !is_nan()` filter and `f64` arithmetic". The truthiness filter
+survives; the plain-`f64` arithmetic does not — it is `js_add` now.)
+
+Optional, cheap, and the only permitted tui-side edit: add
+`assert_eq!(read_line_range(&json!({"limit": -5})).unwrap(), ":1--5");` to
+`read_line_range_ports_all_four_rules` in
+[`crates/cyrup-tui/src/transcript/tests/js_arg.rs:64`](../../../crates/cyrup-tui/src/transcript/tests/js_arg.rs)
+so the header's negative branch is pinned rather than merely correct.
+
+No other consumer parses read's notices. Verified by grepping the workspace for
+`more lines in file` / `Showing lines`: the only other hits are
+[`cyrup-tui/src/transcript/tool_result.rs:157`](../../../crates/cyrup-tui/src/transcript/tool_result.rs)
+(a **bash** footer stripper — different string, unrelated) and
+[`cyrup-ext-subagents/src/tui/fleet_transcript.rs:831`](../../../crates/cyrup-ext-subagents/src/tui/fleet_transcript.rs)
+(`text.contains("[Showing lines")`, a boolean truncation flag). Neither parses `offset=` or
+`remaining`.
 
 ---
 
 ## Additional divergences found while researching
 
-Recorded here per the no-descoping rule. **None of these is dismissed**; each is an open
-question below.
+Recorded per the no-descoping rule. **None is dismissed**; each is an open question below.
 
-**AD-1 — fractional `limit` reaches pi's notice unrounded.**
-`userLimitedLines` is a JS double, so `{"limit": 2.5}` on the 10-line file makes pi emit
-`[7.5 more lines in file. Use offset=3.5 to continue.]` (Node-verified). Cyrup folds
-through `to_integer` before formatting and emits `[8 more lines … offset=3]`. The
-*content* is identical (`slice` folds `2.5 → 2` in both). The prescribed fix above does
-**not** close this: reproducing it needs JS `Number::toString` formatting, and the only
-such helper in the tree is `js_number` in
-`crates/cyrup-tui/src/transcript/tool_args.rs`, which is `pub(super)` inside a crate that
-`cyrup-tools` does not (and must not) depend on.
+**AD-1 — fractional `limit` reaches pi's notice unrounded.** `userLimitedLines` is a JS double, so
+`{"limit": 2.5}` on the 10-line file makes pi emit
+`[7.5 more lines in file. Use offset=3.5 to continue.]` (Node-verified today). Cyrup folds through
+`to_integer` before formatting and emits `[8 more lines … offset=3]`. The *content* is identical
+(`line1\nline2` in both). The prescribed fix does **not** close this and does not make it worse:
+reproducing it needs JS `Number::toString`, and the only such helper in the tree is `js_number` in
+[`cyrup-tui/src/transcript/tool_args.rs:127`](../../../crates/cyrup-tui/src/transcript/tool_args.rs),
+which is `pub(super)` inside a crate `cyrup-tools` does not (and must not) depend on. The same
+formatting gap swallows an extreme `limit` such as `-1e30`, where pi prints `1e+30` and the
+saturating Rust prints `i64::MAX`; the *content* (an empty window) still matches, and the saturating
+arithmetic in §1/§2 is what keeps that case from overflowing in a debug build.
 
 **AD-2 — fractional `offset` reaches pi's notices unrounded, and can make pi throw.**
-`startLine = Math.max(0, offset - 1)` keeps the fraction: `{"offset": 2.5}` gives
+`startLine = Math.max(0, offset - 1)` (read.ts:278) keeps the fraction: `{"offset": 2.5}` gives
 `startLine = 1.5`, so `startLineDisplay = 2.5` and pi's `[Showing lines 2.5-…]` /
-`Offset 2.5 is beyond…` differ from cyrup's integral rendering. Worse, the
-`firstLineExceedsLimit` branch indexes `allLines[1.5]` → `undefined` →
-`Buffer.byteLength(undefined, "utf-8")` **throws a TypeError**, which pi's catch
-re-`reject`s as a tool error. cyrup uses `window.first()` and returns the note instead.
-Same family as AD-1; same missing helper; plus a "do we reproduce a pi crash?" question.
+`Offset 2.5 is beyond…` differ from cyrup's integral rendering. Worse, the `firstLineExceedsLimit`
+branch indexes `allLines[1.5]` → `undefined` → `Buffer.byteLength(undefined, "utf-8")` **throws a
+TypeError** (read.ts:299), which pi's catch (read.ts:328-331) re-`reject`s as a tool error. cyrup
+uses `window.first()` (read.rs:246) and returns the note instead. Same family as AD-1, same missing
+helper, plus a "do we reproduce a pi crash?" question.
 
-**AD-3 — the `read.ts:NNN` citations in `read.rs` are stale.**
-Against `e8682309` they are mixed: `read.ts:271 → 278`, `:275 → 282`, `:282 → 288`,
-`:238 → 245`, `:241 → 248`, `:321-324 → 329-330`, while `:246`, `:249` and `:325` are
-exact. The file therefore carries citations from at least two pi revisions. Every comment
-this task touches should be corrected; the rest of the file is a separate sweep.
+**AD-3 — the `read.ts:NNN` citations in `read.rs` are stale, and more broadly than first thought.**
+Against `e8682309`, verified line by line today:
+
+| `read.rs` comment | cites | actual at `e8682309` |
+|---|---|---|
+| :17 | `read.ts:22-23` | `:23-24` |
+| :35 | `read.ts:20-24` | `:21-25` |
+| :81 | `read.ts:212-214` | `:216-220` |
+| :124 | `read.ts:238` | `:245` |
+| :126, :143 | `read.ts:241` | `:248` |
+| :144 | `read.ts:321-324` | `:328-331` |
+| :171 | `read.ts:243` | `:250` |
+| :195 | `read.ts:268-269` | `:275-276` |
+| :200 | `read.ts:271` | `:278` |
+| :204 | `read.ts:283` | `:289` |
+| :208 | `read.ts:275` | `:282` |
+| :218 | `read.ts:282` | `:288` |
+| :242 | `read.ts:290-294,315` | `:297-301, :322` |
+| :248 | `read.ts:293` | `:299-300` |
+| :276 | `read.ts:300-304` | `:307-311` |
+| :286 | `read.ts:303` | `:310` |
+| :305 | `read.ts:294-315` | `:301-322` |
+| :331 | `read.ts:247-263` | `:254-270` |
+| :405 | `read.ts:87-92` | `:93-98` |
+| :406 | `read.ts:246` | `:253` |
+
+Exact at `e8682309` and needing no change: `:95` → `read.ts:222`, `:109` → `:232-235`, `:154` →
+`:246`, `:165` → `:249`, `:183`/`:256`/`:314` → `:325`, `:335` → `:256` and `:273`, `:419` → `:257`.
+(`:64` cites `read.ts:210-211 @v0.83.0` explicitly and is a different revision on purpose.) The file
+therefore carries citations from at least two pi revisions. **Only the comments this task rewrites
+(lines 218-224 and 296-302) are corrected here**; the rest is a separate sweep — OQ-4. `jsnum.rs:4`
+and `tests/tools.rs:2380` carry the same `read.ts:22-23` drift.
 
 ---
 
 ## Open questions for David
 
-- **OQ-1 (AD-1/AD-2).** Does cyrup reproduce pi's *fractional* renderings in read's
-  notices? That needs a shared JS `Number::toString`. Options: (a) lift `js_number` from
-  `cyrup-tui/src/transcript/tool_args.rs` into `cyrup-core` and have both crates use it;
-  (b) duplicate it in `cyrup-tools`; (c) file AD-1/AD-2 as their own parity task. **Not
-  decided here.** The prescribed fix is integral-exact and independent of the answer.
-- **OQ-2 (AD-2).** If yes to OQ-1: does cyrup also reproduce pi's `TypeError` on a
-  fractional `offset` that reaches the `firstLineExceedsLimit` branch, or is that the one
-  place cyrup stays safe?
-- **OQ-3.** Should read's continuation `offset=` ever be sanitised? pi can emit
-  `offset=0` and `offset=-4`, neither of which pi's own `read` will honour as written.
-  Closing this gap makes cyrup emit them too. Deliberate, and stated so David can say
-  otherwise.
-- **OQ-4 (AD-3).** Authorise a citation-refresh sweep over `read.rs` (and, if the drift
-  is workspace-wide, the other tool ports) against `e8682309`?
+Carried here, in this file. Do not close them silently and do not answer them inside the
+implementation.
 
-Log these to `.flux/todo/parity-gaps/MEDIUM-open-questions-from-gap-closure.md` as well.
+- **OQ-1 (AD-1/AD-2).** Does cyrup reproduce pi's *fractional* renderings in read's notices? That
+  needs a shared JS `Number::toString`. Options: (a) lift `js_number` from
+  `cyrup-tui/src/transcript/tool_args.rs` into `cyrup-core` and have both crates use it;
+  (b) duplicate it in `cyrup-tools`; (c) file AD-1/AD-2 as their own parity task. **Not decided
+  here.** The prescribed fix is integral-exact and independent of the answer.
+- **OQ-2 (AD-2).** If yes to OQ-1: does cyrup also reproduce pi's `TypeError` on a fractional
+  `offset` that reaches the `firstLineExceedsLimit` branch, or is that the one place cyrup stays
+  safe?
+- **OQ-3.** Should read's continuation `offset=` ever be sanitised? pi can emit `offset=0` and
+  `offset=-4`, neither of which pi's own `read` will honour as written. Closing this gap makes cyrup
+  emit them too. Deliberate, and stated so David can say otherwise.
+- **OQ-4 (AD-3).** Authorise a citation-refresh sweep over `read.rs` (twenty stale anchors, table
+  above) and, if the drift is workspace-wide, the other tool ports, against `e8682309`?
 
 ---
 
 ## Definition of done
 
-1. `read`'s window and continuation notice match pi at `e8682309` for every **integral**
-   `limit`, negative included, per the five-row oracle table.
-2. `read_accepts_float_and_negative_numeric_params` carries the five new assertions and
-   fails on the pre-change code.
-3. The `[CYRUP-DELTA]` marker at the `endLine` computation is **deleted**, and the pi
-   citations in the comments it touches are corrected to `read.ts:288-290` / `:313-317`.
-4. `jsnum::to_count` and its other three call sites are untouched; `offset` handling is
-   untouched.
-5. `cyrup-tui`'s `read_line_range` is untouched (verified already at parity).
-6. No behaviour regression in `cyrup-tools`: the non-negative-`limit`, `offset`, image,
-   truncation and errno tests in `crates/cyrup-tools/src/tests/tools.rs` still pass.
-7. AD-1, AD-2 and AD-3 are carried forward as open questions, not closed silently.
+1. `read.rs` lines 218-229 are replaced by the `end_raw` / `end` computation in §1, and lines
+   296-302 by the `if let Some(e) = end_raw && e < total_i` branch in §2.
+2. The `[CYRUP-DELTA]:` sentence at read.rs:221 no longer exists anywhere in the file, and the two
+   comments that replace it cite `read.ts:288-290` and `read.ts:315-316`.
+3. `read_accepts_float_and_negative_numeric_params` (tools.rs:2392) asserts all five oracle rows on
+   the full `first_text` string, and every one of them fails when run against the pre-change code.
+4. `read`'s window and continuation notice match pi at `e8682309` for every **integral** `limit`,
+   negative included.
+5. `crates/cyrup-tools/src/jsnum.rs` is unmodified; `to_count`'s five other call sites (read.rs:206,
+   ls.rs:107, find.rs:154, grep.rs:649, grep.rs:657) are unmodified; `offset` handling at
+   read.rs:200-217 is unmodified.
+6. `crates/cyrup-tui/src/transcript/tool_args.rs` is unmodified (the header path is already at
+   parity). At most, one assertion is added to `read_line_range_ports_all_four_rules` in
+   `crates/cyrup-tui/src/transcript/tests/js_arg.rs`.
+7. No regression in `cyrup-tools`: the non-negative-`limit`, `offset`, image, truncation and errno
+   tests in `crates/cyrup-tools/src/tests/tools.rs` still pass unchanged.
+8. AD-1, AD-2 and AD-3 remain open in this file as OQ-1…OQ-4, not closed as part of the fix.

@@ -9,9 +9,16 @@
 //!
 //! - [`ProtectedFs`] / [`ProtectedPaths`] — backend-seam decorator that blocks writes/edits to
 //!   protected paths (`.env`, `.git/`, `node_modules/`) while passing reads through (R-12-006).
-//!   **[CYRUP-DELTA], and off by default** (`SessionConfig::protect_paths: false`, ADR-0003 D5):
-//!   pi has no protected-path concept — `core/tools/write.ts:195-225` @v0.83.0 writes whatever
-//!   path it is handed. It decorates the **fs** seam ONLY; an embedder that opts in still leaves
+//!   **[CYRUP-DELTA], and off by default** (`SessionConfig::protect_paths: false`, ADR-0003 D5).
+//!   pi's *core* has no protected-path predicate (`write.ts::createWriteToolDefinition` and
+//!   `edit.ts::execute` both reach `ops.writeFile` unguarded), so the `false` default matches
+//!   default pi exactly; but pi DOES ship the guard, as an auto-discovered opt-in extension over
+//!   the same three names (`examples/extensions/protected-paths.ts`, catalogued at
+//!   `docs/extensions.md:2944`, blocking `write`/`edit` at the `tool_call` gate). The
+//!   `[CYRUP-DELTA]` is therefore the **configuration surface** (`SessionConfig::protect_paths` is
+//!   a Rust builder field; pi's `src/` has no `protectedPaths` option), not the capability —
+//!   cyrup's equivalent of pi's enablement is a `.cyrup/extensions/` `tool_call` extension, which
+//!   is why there is still no CLI flag and no settings key. It decorates the **fs** seam ONLY; an embedder that opts in still leaves
 //!   `bash 'echo x >> .env'` unaffected, because the process seam is passed through undecorated
 //!   and no correct guard can be derived from arbitrary command text (ADR-0003 D6).
 //! - [`TraversalFs`] — backend-seam decorator confining all fs operations to a root, rejecting

@@ -5,380 +5,342 @@ crate: cyrup-tools
 source: CYRUP-DELTA classification audit (workflow wf_12c49023-adf)
 stage: aug
 status: done
-updated: 2026-08-28 02:10
+updated: 2026-08-28 21:00
 ---
 
-# Capability gap: the `AI_AGENT` marker — `<ShellTool as Tool>::execute`
+# The `AI_AGENT` marker in `<ShellTool as Tool>::execute` — retag, record, close
 
-**Anchor by symbol, not by line.** The title says `bash.rs:312`. At HEAD the `[CYRUP-DELTA`
-annotation opens at `crates/cyrup-tools/src/tools/bash.rs:304` and the write itself is `:315`,
-inside `<ShellTool as Tool>::execute` (declared `:266`). `:312` is mid-comment. Every anchor below
-is a symbol plus a line as of this pass.
+**Outcome of this pass: the filed premise is half wrong and half out of scope, and one real
+defect is underneath it.**
 
-Classified a **capability gap** — a caller can observe a difference — by the audit that reviewed
-all 87 `CYRUP-DELTA` markers against pi at `e8682309`.
-
-**This was never authorized as an accepted divergence.** The marker was written by an agent. Nobody
-decided it was acceptable. It is filed here so it is a decision rather than an artifact.
+- The **value** difference (`AI_AGENT="cyrup"` vs pi's `"pi"`) is not a gap. It is the correct port
+  of pi's *documented* semantics, and it is the same naming policy that produced `CYRUP_SESSION_ID`
+  nineteen lines below it. → **ACCEPT**, record the reason on the delta line.
+- The **scope** difference (per-child at three sites vs pi's process-global) is a **decision this
+  project already took and recorded** — `PARITY-GAPS` **PB-5**, with the competing proposal
+  (`DRIFT-044`) explicitly rejected as a duplicate. It is not this site's, not this crate's, and not
+  this item's. → **do not re-file**; cite it in-source so the next audit stops re-deriving it.
+- What *is* wrong here is a **factual citation error**: the annotation says `AI_AGENT` arrives
+  `@v0.84.1`. It arrives at **v0.84.0**. The wrong tag is written into three source annotations and
+  **asserted as a string literal by three source-scan tests**, so a future `v0.84.x` uplift routes by
+  it. → **fix the tag**. That is the code change.
 
 ---
 
-## 0. Reference tree, pinned
+## 0. Anchors — every one re-derived at HEAD this pass
 
-`./tmp/pi` at **`e8682309`** is `packages/coding-agent` **0.84.3** (`packages/coding-agent/package.json:3`),
-with an `[Unreleased]` section above `## [0.84.3] - 2026-08-24` (`packages/coding-agent/CHANGELOG.md:3`, `:18`).
-Every pi citation below was read in that tree at that commit. `git` was not run.
+`:312` in the title is mid-comment. Anchor by symbol.
 
-`AI_AGENT` occurs in exactly **six** places in the whole reference tree
-(`grep -rn "AI_AGENT" ./tmp/pi --exclude-dir=node_modules`): two source writes and four documentation
-lines. There is no third write site, no conditional, no settings key, and nothing reads it back.
-
-| where | what |
+| symbol | file:line |
 | --- | --- |
-| `packages/coding-agent/src/cli.ts:14` | `process.env.AI_AGENT = "pi";` |
-| `packages/coding-agent/src/rpc-entry.ts:8` | `process.env.AI_AGENT = "pi";` |
-| `packages/coding-agent/docs/environment-variables.md:15` | semantics |
-| `packages/coding-agent/docs/environment-variables.md:18` | inheritance + the SDK carve-out |
-| `packages/coding-agent/README.md:675` | table row |
-| `packages/coding-agent/CHANGELOG.md:288`, `:123` | added; documented |
+| `<ShellTool as Tool>::execute` | [`crates/cyrup-tools/src/tools/bash.rs:266`](../../../crates/cyrup-tools/src/tools/bash.rs) |
+| prose block (identity markers, non-delta) | `bash.rs:291-302` |
+| `env.push(("PI_CODING_AGENT", "true"))` | `bash.rs:303` |
+| `[CYRUP-DELTA` annotation opens | `bash.rs:304` |
+| `env.push(("AI_AGENT", "cyrup"))` | `bash.rs:315` |
+| `let env_remove = crate::config::session_env_scrub_keys();` | `bash.rs:316` |
+| `run_bash` / its `AI_AGENT` push | [`crates/cyrup-session-svc/src/bash.rs:148`](../../../crates/cyrup-session-svc/src/bash.rs) / `:183` (delta opens `:174`) |
+| `env_identity_and_depth` / its `AI_AGENT` insert | [`crates/cyrup-ext-subagents/src/exec/spawn_plan.rs:913`](../../../crates/cyrup-ext-subagents/src/exec/spawn_plan.rs) / `:972` (delta opens `:963`) |
+| `crates/cyrup/src/main.rs` — `#[tokio::main]` `:48`, `set_process_name` `:80`, `run()` `:100`, the declined-`set_var` comment `:104-110`, `predispatch::classify_internal` `:136` | [`crates/cyrup/src/main.rs`](../../../crates/cyrup/src/main.rs) |
+
+> **Citation drift corrected from the previous revision of this file.** It gave the immediate-bash
+> push as `cyrup-session-svc/src/bash.rs:173` (it is **`:183`**; `:173` is the `PI_CODING_AGENT`
+> push) and the subagent insert as `spawn_plan.rs:967` (it is **`:972`**), and
+> `env_identity_and_depth` as `:908` (it is **`:913`**). Re-verify by grep, not by memory:
+> `grep -n 'AI_AGENT' crates/cyrup-session-svc/src/bash.rs crates/cyrup-ext-subagents/src/exec/spawn_plan.rs`.
+
+## 1. Reference tree, pinned
+
+[`./tmp/pi`](../../../tmp/pi) at **`e8682309`** = `packages/coding-agent` **0.84.3**
+([`package.json:3`](../../../tmp/pi/packages/coding-agent/package.json)). Every pi citation below was
+read in that tree at that commit; `git` was not run.
+
+`AI_AGENT` occurs in six places tree-wide
+(`grep -rn AI_AGENT ./tmp/pi --exclude-dir=node_modules`): two writes
+([`src/cli.ts:14`](../../../tmp/pi/packages/coding-agent/src/cli.ts),
+[`src/rpc-entry.ts:8`](../../../tmp/pi/packages/coding-agent/src/rpc-entry.ts), both
+`process.env.AI_AGENT = "pi";` at module top level), and four doc lines
+([`docs/environment-variables.md:15`](../../../tmp/pi/packages/coding-agent/docs/environment-variables.md),
+`:18`; [`README.md:675`](../../../tmp/pi/packages/coding-agent/README.md);
+[`CHANGELOG.md:288`](../../../tmp/pi/packages/coding-agent/CHANGELOG.md), `:123`). **Nothing in pi
+reads it back.** Nothing in cyrup reads it back either (`grep -rn AI_AGENT crates/ --include=*.rs`
+returns three writes plus tests). The variable is outward-facing only.
+
+Relevant shape of the shell tool at that commit — the code this whole item is a footnote to:
+
+- [`core/tools/bash.ts:170-195`](../../../tmp/pi/packages/coding-agent/src/core/tools/bash.ts)
+  `resolveSpawnContext`: `:177` `const env = { ...getShellEnv() };` → `:178-182` unconditionally
+  `delete env.PI_SESSION_ID / PI_SESSION_FILE / PI_PROVIDER / PI_MODEL / PI_REASONING_LEVEL` →
+  `:183-193` repopulate them when `exposeSessionEnvironment && ctx` → `:194-195` `spawnHook` last.
+- `getShellEnv()` ([`utils/shell.ts:138-150`](../../../tmp/pi/packages/coding-agent/src/utils/shell.ts))
+  returns `{ ...process.env, [pathKey]: updatedPath }` — which is *why* `AI_AGENT` reaches the bash
+  child upstream at all: it is **inherited**, never pushed.
+- `resolveSpawnContext` is called from `bash.ts:363`, inside `createShellToolDefinition`, which
+  `powershell.ts:53` also calls — the shared engine, mirrored by cyrup's shared `ShellTool`
+  ([`crates/cyrup-tools/src/tools/powershell.rs:49-51`](../../../crates/cyrup-tools/src/tools/powershell.rs)).
+
+The five session keys and their `PI_*` → `CYRUP_*` rename are **not this item** — see
+[`MEDIUM-delta-cyrup-tools-src-tools-bash-rs-236.md`](./MEDIUM-delta-cyrup-tools-src-tools-bash-rs-236.md).
+That rename is settled policy and is not reopened here; it is cited below only as the precedent that
+settles the `AI_AGENT` value.
 
 ---
 
-## 1. What pi does — the VALUE half
+## 2. Disposition of the two filed differences
 
-Both write sites are **module-top-level statements**, executed at import time, before `main()` is
-called:
+### 2.1 VALUE — **ACCEPT.** `"cyrup"` is the port; `"pi"` would be the bug.
 
-```
-// packages/coding-agent/src/cli.ts:12-14
-process.title = APP_NAME;
-process.env.PI_CODING_AGENT = "true";
-process.env.AI_AGENT = "pi";
-```
+pi's own documentation defines the split, verbatim:
 
-`packages/coding-agent/src/rpc-entry.ts:6-8` is the identical trio with `process.title =
-`${APP_NAME}-rpc``. The value is the literal `"pi"`, unconditionally, with no settings override and
-no env-respecting fallback (it *overwrites* an inherited `AI_AGENT`).
+> `AI_AGENT=pi` is a generic marker that lets tooling identify Pi as **the agent that launched the
+> process**. (`docs/environment-variables.md:15`)
 
-Documented semantics, verbatim (`docs/environment-variables.md:15`):
+and `README.md:675`: "Set to `pi` by the CLI and RPC entry points **so generic tooling can attribute
+child processes to Pi**". The KEY is vendor-neutral; the VALUE is the running agent's own name, and
+the whole point of the variable is attribution. Porting the *semantics* into a binary called `cyrup`
+yields `"cyrup"`. Porting the *literal* would make every cyrup child claim to have been launched by a
+program that is not running — a falsehood in the one field whose stated purpose is truthful
+attribution. The key arrived upstream from an outside contributor (`CHANGELOG.md:288`, #7493 by
+`@renaudhartert-db`), i.e. it is a cross-vendor convention, which sharpens the point rather than
+softening it.
 
-> `AI_AGENT=pi` is a generic marker that lets tooling identify Pi as the agent that launched the process.
+This is the same policy that already governs `CYRUP_SESSION_ID` nineteen lines below the push
+(`bash.rs:334`) and the read-side `CYRUP_*`-then-`PI_*` fallback chain in
+[`crates/cyrup-config/src/env.rs:68-91`](../../../crates/cyrup-config/src/env.rs). **There is no
+decision to escalate.** The previous revision of this file asked for a human ruling between
+`"cyrup"` and `"pi"`; pi's own docs answer it, and the project's naming convention answers it twice.
+Delete the question, record the answer in-source.
 
-and (`README.md:675`) "Set to `pi` by the CLI and RPC entry points so generic tooling can attribute
-child processes to Pi". The KEY is deliberately vendor-neutral; the VALUE is the vendor's own name.
-That reading matters for §7.
+*(For a hook asking "is a pi-family agent running?", the answer is already correct today:
+`PI_CODING_AGENT="true"` is pushed verbatim one line above, `bash.rs:303`. A hook branching on
+`AI_AGENT == "pi"` is asking **which** agent, and `cyrup` is the honest answer.)*
 
-### Correction to the tag every cyrup site cites (divergence **D1**)
+### 2.2 SCOPE — **already decided, elsewhere. Do not re-file here.**
 
-All three cyrup write sites and three source-scan tests assert the key arrives at **`@v0.84.1`**.
-That is off by one minor version. At `e8682309`:
+The difference is real: pi writes to `process.env` before `main()`, so *every* descendant inherits
+the marker; cyrup writes it per child at exactly three sites, so an MCP stdio server
+([`crates/cyrup-mcp/src/runtime.rs:1386-1400`](../../../crates/cyrup-mcp/src/runtime.rs)), an
+extension process, the intercom broker, an editor, a clipboard helper or the update check sees
+nothing.
+
+**But the placement question was raised, contested and resolved, and this item is downstream of that
+resolution:**
+
+- [`docs/gap-analysis/PARITY-GAPS.md:397-401`](../../../docs/gap-analysis/PARITY-GAPS.md) — **PB-5**,
+  which owns exactly this: "The unsafe-`set_var` rationale covers *process-global* mutation only —
+  `bash.rs` already builds a per-child env vector, so both keys can be added there with **no
+  `unsafe`**."
+- [`docs/gap-analysis/12-upstream-drift-pi-core.md:1225`](../../../docs/gap-analysis/12-upstream-drift-pi-core.md)
+  — area 12 proposed `DRIFT-044` with the **opposite** fix ("explicitly do **not** do that") and
+  **rejected it as a duplicate**, ruling: "**Resolve inside PB-5**, and decide the placement question
+  there."
+- [`docs/gap-analysis/04-cyrup-tools.md:197`](../../../docs/gap-analysis/04-cyrup-tools.md) —
+  `TOOL-031` **CLOSED 2026-08-15**, all three per-child halves landed. `PARITY-GAPS.md:170-174`
+  records the same closure path.
+- The in-source rationale at `crates/cyrup/src/main.rs:104-110` is *specifically* scoped:
+  `std::env::set_var` is `unsafe` under edition 2024; the process-**name** half is a syscall and was
+  ported (`set_process_name`, `:80`, called `:110`), the env half was routed to PB-5.
+
+So the narrowing is the **accepted consequence of a recorded decision**, not an unauthorized agent
+artifact. Two consequences for this task:
+
+1. **Do not prescribe making the markers process-global from here.** The previous revision of this
+   file did exactly that — replace `#[tokio::main]` (`main.rs:48`) with a hand-built runtime and put
+   two `unsafe std::env::set_var` calls in a single-threaded prologue above
+   `predispatch::classify_internal` (`:136`). That is technically sound Rust, and it is still the
+   wrong move *from this file*: it reverses PB-5's ruling, re-files the position area 12 already
+   rejected, and lands a binary-entry refactor out of a `cyrup-tools` comment marker. If the scope is
+   ever revisited, it is revisited in PB-5, by whoever owns `crates/cyrup/src/main.rs`.
+2. **Record the decision at the site**, so the next `CYRUP-DELTA` sweep reads a citation instead of
+   re-deriving the whole analysis for the third time. That is §4.1.
+
+---
+
+## 3. The one real defect — the tag is off by one minor (`@v0.84.1` → `@v0.84.0`)
+
+All three write-site annotations and all three source-scan tests assert `AI_AGENT` arrives at
+`@v0.84.1`. It arrives at **v0.84.0**. Evidence, in the pinned tree:
 
 - `CHANGELOG.md:288` — "Added `AI_AGENT=pi` to CLI and RPC child-process environments for generic
-  agent attribution … ([#7493] by @renaudhartert-db)".
-- Section headings: `## [0.84.0] - 2026-08-06` at `:188`, and the next heading below it is
-  `## [0.83.0] - 2026-07-29` at `:384`. Line 288 is inside **0.84.0**.
-- `CHANGELOG.md:123` — "Documented the generic `AI_AGENT=pi` process marker …" ([#7747]) — sits
-  between `## [0.84.2]` (`:99`) and `## [0.84.1]` (`:157`), i.e. **0.84.2** merely documented it.
+  agent attribution … (#7493)".
+- Section headings: `## [0.84.0] - 2026-08-06` at `:188`; the next heading below it is
+  `## [0.83.0] - 2026-07-29` at `:384`. **188 < 288 < 384**, so `:288` is inside **0.84.0**.
+  (`## [0.84.1] - 2026-08-07` is at `:157`, i.e. *above* — 0.84.1's block is `:157-187` and contains
+  no `AI_AGENT` line; the tree-wide grep in §1 finds only `:123` and `:288` in the whole file.)
+- `CHANGELOG.md:123` — "Documented the generic `AI_AGENT=pi` process marker … (#7747)" — sits
+  between `## [0.84.2]` (`:99`) and `## [0.84.1]` (`:157`), so **0.84.2 merely documented** what
+  0.84.0 shipped.
 
-So the forward-port is from **v0.84.0**, not v0.84.1. The *absence* at the ported v0.83.0 baseline —
-the load-bearing half of the annotation — is unaffected and still correct.
-
----
-
-## 2. What pi does — the SCOPE half
-
-Because the write lands on `process.env`, the scope is **every descendant process, whichever code
-spawns it**. Node inherits the parent environment by default, and pi's two explicit-`env` sites
-re-spread `process.env` rather than replacing it. Verified spawn sites at `e8682309`:
-
-| spawn site | env handling | inherits `AI_AGENT` |
-| --- | --- | --- |
-| `utils/shell.ts:138-150` `getShellEnv()` | returns `{...process.env, [pathKey]: updatedPath}` | yes |
-| `core/tools/bash.ts` (`env: env ?? getShellEnv()`) — `bash` + `powershell` | via `getShellEnv()` | yes |
-| `core/exec.ts:41` `spawn(command, args, {...})` | no `env` option → inherit | yes |
-| `core/tools/find.ts:269` (`fd`) | `{ stdio: [...] }` only | yes |
-| `core/tools/grep.ts:226` (`rg`) | `{ stdio: [...] }` only | yes |
-| `modes/rpc/rpc-client.ts:94-96` | `env: { ...process.env, ...this.options.env }` | yes |
-| `modes/interactive/external-editor.ts:26` | inherit | yes |
-| `modes/interactive/session-share.ts:168` (`gh gist create`) | inherit | yes |
-| `modes/interactive/interactive-mode.ts:1213` (`tmux show -gv`) | inherit | yes |
-| `utils/clipboard.ts:135` (`wl-copy`), and its `execFileSync`/`execSync` calls | inherit | yes |
-| `utils/open-browser.ts:21` | inherit, detached | yes |
-
-**The one condition under which pi does NOT set it**, stated by pi itself
-(`docs/environment-variables.md:18`):
-
-> Child processes inherit both markers. They are not session-specific and are not set automatically
-> when Pi is embedded through the SDK.
-
-i.e. an embedder that imports the agent without going through `cli.ts` / `rpc-entry.ts` gets **no
-markers at all**, in any child, including bash-tool children. Remember this for §4.
-
-**pi at `e8682309` has no MCP subsystem.** `grep -rli mcp ./tmp/pi/packages/*/src` returns two
-unrelated files (`packages/ai/src/auth/oauth/anthropic.ts`,
-`packages/coding-agent/src/utils/tool-result-images.ts`); there is no `StdioClientTransport`, no MCP
-client, no server manager. The audit's headline example — "a detection script inside an MCP server
-sees no agent marker" — is therefore **true of cyrup but has no pi counterpart to be measured
-against** (divergence **D4**, below). The scope gap is real; that particular illustration is not a
-pi-parity observation.
+The load-bearing half of the annotation — *absence at the ported v0.83.0 baseline* — is unaffected
+and stays. Only the arrival tag moves. It matters because the tests assert the literal string, so the
+wrong tag is now **enforced**, and a `v0.84.x` uplift asking "what did 0.84.1 bring?" would find this
+site listed under a release that did not touch it.
 
 ---
 
-## 3. What cyrup does — the VALUE half
+## 4. Required implementation path — the only one
 
-`crates/cyrup/src/main.rs` declines the process-global write outright. `run()` (`:100`) says so at
-`:104-110`: `std::env::set_var` is `unsafe` under edition 2024, so only `process.title`'s analogue
-(`set_process_name`, `:80`, called `:110`) was ported and "the env half is TOOL-031 / PARITY-GAPS
-PB-5". There is **no global `AI_AGENT` anywhere in cyrup**.
+Four edits and one guard. No new files, no new test crate, no runtime behaviour change: every
+`AI_AGENT` push stays exactly as it is, with exactly the value it has.
 
-Instead there are exactly **three** per-child writes, all with the literal value `"cyrup"`:
+### 4.1 Edit A — rewrite the annotation at `crates/cyrup-tools/src/tools/bash.rs:304-314`
 
-| # | symbol | file:line | which children |
-| --- | --- | --- | --- |
-| 1 | `<ShellTool as Tool>::execute` (`:266`) | `crates/cyrup-tools/src/tools/bash.rs:315` | the `bash` **and** `powershell` tool children — one shared engine, `ShellTool::powershell` at `crates/cyrup-tools/src/tools/powershell.rs:47-51` reuses it with `POWERSHELL_CONFIG` (`:30`) |
-| 2 | `run_bash` (`:138`) | `crates/cyrup-session-svc/src/bash.rs:173` | the immediate-bash seam — TUI `!!cmd` and RPC `executeBash` |
-| 3 | `env_identity_and_depth` (`:908`) | `crates/cyrup-ext-subagents/src/exec/spawn_plan.rs:967` | the re-exec'd subagent child, via `env_overlay` |
+Replace the eleven comment lines between the `PI_CODING_AGENT` push (`:303`) and the `AI_AGENT` push
+(`:315`) with the block below. **Leave `:303` and `:315` byte-identical** — both are asserted as
+literals by `cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag`.
 
-Each is paired with `PI_CODING_AGENT = "true"` written verbatim one line above (`bash.rs:303`,
-`cyrup-session-svc/src/bash.rs:163`, `spawn_plan.rs:957`).
+```rust
+        // [CYRUP-DELTA — KEY *and* value; the key is a FORWARD-PORT from `cli.ts:14` @v0.84.0, which
+        // is AHEAD of the ported tag] `AI_AGENT` does not exist anywhere in pi @v0.83.0
+        // (`git -C pi grep -n AI_AGENT v0.83.0 -- packages/` → 0 hits; `cli.ts:13` @v0.83.0 sets
+        // only `PI_CODING_AGENT`), so cyrup writes a variable into every bash child that the ported
+        // baseline never wrote.
+        //
+        // TAG (corrected): `CHANGELOG.md:288` — "Added `AI_AGENT=pi` to CLI and RPC child-process
+        // environments" (#7493) — sits under `## [0.84.0]` (`:188`), above `## [0.83.0]` (`:384`).
+        // v0.84.2 only DOCUMENTED it (`CHANGELOG.md:123`, #7747). This line read `@v0.84.1` until it
+        // was re-derived against the pinned tree; it was off by one minor.
+        //
+        // VALUE — `"cyrup"`, not `"pi"`: AUTHORIZED, not incidental. pi defines the KEY as generic
+        // and the VALUE as the agent that launched the process ("a generic marker that lets tooling
+        // identify Pi as the agent that launched the process", `docs/environment-variables.md:15`;
+        // `README.md:675`). Porting the SEMANTICS into a binary named `cyrup` yields `"cyrup"`;
+        // porting the LITERAL would make every cyrup child claim it was launched by a program that
+        // is not running, in the one field whose stated purpose is attribution. Same policy as the
+        // `CYRUP_SESSION_*` keys below and as `cyrup-config/src/env.rs`'s read-side ordering. A hook
+        // asking "is a pi-family agent running?" is answered by `PI_CODING_AGENT` on the line above.
+        // Settled — do not re-open per-variable.
+        //
+        // SCOPE — pi sets this on `process.env` (`cli.ts:14`, `rpc-entry.ts:8`) so EVERY descendant
+        // inherits it via `getShellEnv()`'s `{...process.env}` (`utils/shell.ts:138-150`, consumed at
+        // `bash.ts:177`). cyrup writes it per child at three sites — here,
+        // `cyrup-session-svc/src/bash.rs:183`, `cyrup-ext-subagents/src/exec/spawn_plan.rs:972` — so
+        // children spawned elsewhere (MCP servers, extension processes, the intercom broker) see no
+        // marker. That is the ACCEPTED CONSEQUENCE of PARITY-GAPS PB-5's placement ruling — per-child
+        // env vector rather than `unsafe std::env::set_var` (`crates/cyrup/src/main.rs:104-110`) —
+        // taken after area 12 rejected the opposite proposal (`DRIFT-044`) as a duplicate and routed
+        // it into PB-5; `TOOL-031` closed on that basis. Revisit it in PB-5, not here.
+        //
+        // Stated on the delta line itself rather than only in the prose above (CFG-069) so a later
+        // v0.84.x uplift reads this as ALREADY-PORTED-EARLY and not as already-done-at-tag. Same
+        // class as the `working-start`/`working-stop` precedent.
+```
 
-**Nothing in cyrup reads `AI_AGENT` back.** The only readers are the tests in §9. The divergence is
-purely outward-facing: it is observable by user hooks and scripts and by nothing else.
+Also fix the prose line **`bash.rs:293`**: `(added at v0.84.1, mirrored in rpc-entry.ts:7-8)` →
+`(added at v0.84.0, mirrored in rpc-entry.ts:7-8)`.
 
----
+### 4.2 Edit B — `crates/cyrup-session-svc/src/bash.rs`
 
-## 4. What cyrup does — the SCOPE half (the part that is easy to get wrong)
+Same correction, same shape, in `run_bash` (`:148`): the prose at `:164` and the delta block
+`:174-182`. Every `v0.84.1` that refers to `AI_AGENT`'s arrival becomes `v0.84.0` (`:164`, `:174`,
+`:180`, `:181`), and the block carries the same TAG / VALUE / SCOPE paragraphs. Leave `:173` and
+`:183` byte-identical.
 
-The three sites in §3 are the **entire** reach. Every other child cyrup spawns runs with no agent
-marker at all. Verified spawn sites carrying neither key
-(`grep -rn "AI_AGENT" crates/*/src` returns only the three writes plus tests):
+### 4.3 Edit C — `crates/cyrup-ext-subagents/src/exec/spawn_plan.rs`
 
-- **MCP stdio servers** — `spawn_stdio_transport`, `crates/cyrup-mcp/src/runtime.rs:1386-1400`.
-  This is the **only** cyrup spawn path that calls `env_clear()` (`:1391`); it then sets
-  `StdioTransportSpec::env`, which `StdioTransportSpec::resolve` (`:1337`) builds from
-  `crate::secrets::resolve_stdio_env(entry, server_name, base)` over
-  `base = crate::secrets::process_env_snapshot()` (`crates/cyrup-mcp/src/secrets.rs:327-331`,
-  `std::env::vars_os()`). So it does not *inherit* — but it does copy the live process env, which
-  is precisely the hook a global fix needs (§6).
-- Extension process capability — `crates/cyrup-ext/src/caps/proc.rs:514-526` (overlay via `.env()`).
-- Detached background subagent — `crates/cyrup-ext-subagents/src/background/spawn_detached.rs:224`
-  (overlay, "never `env_clear`", `:195`).
-- `crates/cyrup-intercom/src/transport/spawn.rs`;
-  `crates/cyrup-ext-subagents/src/watchdog/lsp_diagnostics.rs`;
-  `crates/cyrup-resources/src/package/install.rs`;
-  `crates/cyrup-tui/src/{tmux.rs,clipboard.rs,open_browser.rs,image.rs}`;
-  `crates/cyrup/src/update_check.rs`;
-  `crates/cyrup-session-svc/src/{host_services.rs,session/files.rs}`.
+Same, in `env_identity_and_depth` (`:913`): the prose at `:950` and the delta block `:963-971`
+(`v0.84.1` at `:950`, `:963`, `:969`). Leave `:962` and `:972` byte-identical. Also the test-doc
+occurrences at `:3761`, `:3797`, `:3803`.
 
-**Composition note.** The uncovered set is not the same shape as pi's inheriting set: cyrup's `grep`
-and `find` are **in-process** (`crates/cyrup-tools/src/tools/grep.rs:215-230` drives the `ignore`/
-`grep` crates from `spawn_blocking`), where pi spawns `rg`/`fd`. Two of pi's marker-inheriting
-children simply have no cyrup analogue. Conversely cyrup has whole subsystems (MCP, intercom,
-LSP watchdog, package install) that pi has no counterpart for — so "which children see it differs"
-cannot be reduced to a diff of two lists; it is *global vs. three sites*.
+### 4.4 Edit D — the guard
 
-**The direction of the gap INVERTS for the embedded case (divergence D2).** pi documents that an SDK
-embedder gets the markers in **no** child (`docs/environment-variables.md:18`). cyrup's per-child
-push means an embedder of `cyrup-tools` / `cyrup-session-svc` / `cyrup-ext-subagents` **does** get
-them in bash, immediate-bash and subagent children. So cyrup is *behind* pi outside the three sites
-and *ahead* of pi inside them. None of the three annotations says this.
+**The guard is a one-token flip of an existing assertion, and it is RED until Edit A lands:**
 
----
+[`crates/cyrup-tools/src/tests/bash_session_env.rs:334`](../../../crates/cyrup-tools/src/tests/bash_session_env.rs)
 
-## 5. The two differences, stated exactly
+```rust
+        annotation.contains("@v0.84.0"),
+```
 
-| | pi @ `e8682309` | cyrup @ HEAD | observable to |
-| --- | --- | --- | --- |
-| **value** | `AI_AGENT="pi"`, unconditional literal (`cli.ts:14`, `rpc-entry.ts:8`) | `AI_AGENT="cyrup"`, unconditional literal (three sites) | any hook/script that branches on `"$AI_AGENT" = pi` |
-| **scope** | process-global → **every** descendant, from any spawn site, whenever the process started via the CLI or RPC entry; **nothing** when embedded via SDK | three spawn sites only (shell tools, immediate-bash, subagent re-exec) — regardless of how the process started; MCP servers, extension processes, the intercom broker transport, editors, browsers, clipboard, npm installs and the update check see nothing | a detection script anywhere other than a shell-tool/subagent child |
+Update that test's doc prose at `:296` and `:304` to match. With `:334` flipped and `bash.rs:304`
+untouched, `cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag` fails on *"the delta
+line must state the TAG the key comes from"* — that is the whole proof.
 
-The two are independent: closing the scope half does not decide the value, and vice versa.
+The two sibling source-scan tests move in lockstep or they go red for the same reason:
+`crates/cyrup-session-svc/src/tests/summarization_retry_events.rs:756` (doc `:697`, `:734`) and
+`crates/cyrup-ext-subagents/src/exec/spawn_plan.rs:3822` (doc `:3761`, `:3797`, `:3803`). These are
+not additional deliverables; they are the same literal in three places.
 
----
+### 4.5 Invariants the rewrite MUST NOT break
 
-## 6. Prescription — CLOSE the scope half. It is a parity bug, not a product choice.
+`cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag`
+(`bash_session_env.rs:315-345`) slices `src[..find(AI_AGENT push)]` and then takes everything from the
+**last** `rfind("[CYRUP-DELTA")` in that slice. Therefore:
 
-Nothing about the scope difference is a branding decision. pi's contract is "child processes inherit
-both markers"; cyrup silently narrows it to three call sites, and the narrowing is an artifact of
-`std::env::set_var` being `unsafe`, which is a *how*, not a *whether*. Close it.
+1. **Do not introduce a second `[CYRUP-DELTA` token between `:304` and the push.** It would move
+   `rfind` forward and silently drop the tag / key / `v0.83.0` facts out of the asserted window.
+2. The window must still contain, literally: **`@v0.84.0`**, **`AI_AGENT`**, **`v0.83.0`**. The block
+   in §4.1 contains all three (`v0.83.0` appears twice in its first paragraph).
+3. `env.push(("PI_CODING_AGENT".to_string(), "true".to_string()));` must remain byte-identical —
+   asserted at `:318-321` as *presence before absence*, so the test cannot be satisfied by deleting
+   the forward-ported marker.
+4. `env.push(("AI_AGENT".to_string(), "cyrup".to_string()));` must remain byte-identical — it is the
+   `find()` anchor at `:323-326` and the literal the two runtime tests observe as `[true][cyrup]`
+   (`:240`, `:265`).
+5. Nothing moves into or out of the `expose_session_environment` gate (`:317`), and nothing is added
+   to `session_env_scrub_keys()` (`:316`) — pi does not scrub these two.
+6. `bash_prompt_guideline_deltas_are_tagged_cyrup_delta`
+   ([`crates/cyrup-tools/src/tests/pi_tool_semantics.rs:778`](../../../crates/cyrup-tools/src/tests/pi_tool_semantics.rs))
+   scans only the doc block between `prompt_snippet` and `prompt_guidelines` and is unaffected —
+   provided Edit A stays inside `execute` and does not touch `bash.rs:195-249`.
 
-**6.1 — Set both markers process-globally at the binary entry.**
-`crates/cyrup/src/main.rs` is the only legal home: the `cyrup` lib root is `#![forbid(unsafe_code)]`
-and this file already carries `unsafe` for `set_process_name` (`:80-96`), for exactly the same
-"pi does it at `cli.ts`, we need a syscall" reason.
+### 4.6 Explicitly NOT in this change
 
-The `unsafe`-ness of `set_var` is a **thread** hazard, not an absolute bar. `#[tokio::main]`
-(`:48-49`) builds the multi-thread runtime *around* the body, so today there is no single-threaded
-window inside `run()`. Replace the attribute with a hand-built runtime so there is one:
-
-- `fn main() -> ExitCode` (no attribute), whose first statements are the two `set_var` calls in a
-  provably single-threaded prologue — before any `Runtime::new`, before `predispatch`, before
-  anything spawns a thread — with a `// SAFETY:` note saying so.
-- then `tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(run())`.
-
-It must sit **above** `predispatch::classify_internal` (`:128`) so the `__subagent-runner` and
-`__intercom-broker` re-execs are covered too — and note each of those is itself a `cyrup` binary, so
-it re-asserts the pair at its own startup exactly as pi's `rpc-entry.ts:7-8` re-asserts what
-`cli.ts:13-14` already set.
-
-This single change covers everything in §4, including MCP: `process_env_snapshot()`
-(`crates/cyrup-mcp/src/secrets.rs:327`) reads `std::env::vars_os()`, so the marker lands in the
-`env_clear()`ed child through the snapshot; every other site is an overlay over an inherited env
-(`crates/cyrup-tools/src/ops/local/command.rs:24-28` is the shell backend's `.env_remove()` /
-`.env()` pattern) and picks it up for free.
-
-**6.2 — Keep all three per-child writes.** They become belt-and-braces, not redundancy:
-- they are `.env()` overlays over an inherited env, so they are idempotent with the global;
-- they are what makes the tools correct for an SDK embedder whose process never runs
-  `crates/cyrup/src/main.rs` — and every test in §9 exercises the tools **in-process**, never
-  through the binary, so deleting them turns all four runtime assertions red for the wrong reason;
-- the subagent overlay is documented assert-not-assume for a separate reason
-  (`spawn_plan.rs:930-940`: an overlay entry that is merely omitted lets a parent's value leak).
-This leaves a *residual, narrower* divergence — the SDK-case surplus of D2 — which should be stated
-on the annotations rather than left implicit.
-
-**6.3 — Retag.** `@v0.84.1` → `@v0.84.0` at all three write sites and in the three source-scan
-tests that assert the string (§9). The v0.84.2 doc entry can be cited separately if useful.
-
-**6.4 — Rewrite the three annotations** so they carry *scope* as well as *value*: after 6.1 the
-scope delta is gone at the process level, and what remains to record is (a) whatever David decides
-in §7 and (b) the SDK-case surplus.
-
-**6.5 — Failing test first** (cannot be run here: cargo is off-limits this pass, 10 siblings /
-7.7 G disk — these are prescriptions, not verifications):
-- an integration test in `crates/cyrup-it` that runs the real `cyrup` binary and observes a
-  **non-shell-tool** child's environment — the cheapest honest RED is an MCP stdio server whose
-  command prints its own env, asserting `AI_AGENT` is present. RED today (only the three sites
-  write it), GREEN after 6.1.
-- a source scan on `crates/cyrup/src/main.rs` pinning that the prologue sets both keys *before* the
-  runtime is built, so a later refactor back to `#[tokio::main]` fails loudly rather than silently
-  re-narrowing the scope.
+- The `v0.84.1` citations at `bash.rs:195`, `:207`, `:225`, `:229` and the test
+  `the_guideline_uses_pi_v0_84_1_softened_phrasing` (`bash_session_env.rs:206`). Those are
+  **TOOL-043**, a different upstream change (the prompt-guideline wording + const hoist), whose tag
+  this pass did **not** re-derive. Do not retag them on the strength of §3.
+- `crates/cyrup/src/main.rs`. See §2.2.
+- The `PI_*` → `CYRUP_*` session-key rename and `session_env_scrub_keys`. See
+  [`MEDIUM-delta-cyrup-tools-src-tools-bash-rs-236.md`](./MEDIUM-delta-cyrup-tools-src-tools-bash-rs-236.md).
 
 ---
 
-## 7. The VALUE half is **David's call** — options, with a recommendation
+## 5. Found this pass, routed elsewhere — not to be fixed here
 
-Presented, not pre-decided. The scope half (§6) closes regardless of which of these is chosen.
-
-**V1 — keep `"cyrup"`, and record it as an explicitly authorized divergence.** *(recommended)*
-pi's own documentation defines the KEY as vendor-neutral ("generic marker … identify **Pi** as the
-agent that launched the process", `docs/environment-variables.md:15`) and the VALUE as the running
-agent's own name. Porting the *semantics* of that line to a binary called `cyrup` yields `"cyrup"`;
-porting the *literal* yields a marker that misattributes cyrup's children to a program that is not
-running. `AI_AGENT` looks like a cross-vendor attribution convention (contributed upstream by an
-outside contributor, `CHANGELOG.md:288`), which makes truthfulness the point of the variable.
-Cost: a third-party hook hard-coded to `"pi"` takes the other branch.
-
-**V2 — write `"pi"`.** Byte-exact parity; any pi-targeted hook works unmodified. Cost: cyrup claims
-to be pi in a variable whose stated purpose is attribution, and it does so to every descendant once
-§6 lands — the blast radius of the lie grows with the fix. Not recommended, but it is a coherent
-position if cyrup is meant to be a drop-in under existing pi tooling.
-
-**V3 — keep `"cyrup"` and lean on the key that already answers the family question.** *(recommended
-alongside V1)* cyrup already writes `PI_CODING_AGENT="true"` verbatim at all three sites. A hook
-asking "is a pi-family agent running?" is answered correctly today by `PI_CODING_AGENT`; a hook
-branching on `AI_AGENT == "pi"` is asking "*which* agent", and the honest answer is `cyrup`. If V1 is
-taken, this is the migration note to publish for hook authors — and it should be written into the
-annotations so the next agent does not re-derive it.
-
-**Recommended disposition:** close the scope half per §6; take **V1 + V3** for the value half as an
-*explicitly authorized* divergence with the reason recorded on the annotation line — David's
-signature, not an agent's.
+- **`bash.rs:279` cites `docs/environment-variables.md:27`** for "The values are resolved when each
+  command starts…". In the pinned tree that sentence is at **`:32`**. It sits in the session-key
+  branch, which belongs to the `bash.rs:236` item; fixing it here would collide. Route it there.
+- **The SDK-embedder inversion.** pi states its markers are "not set automatically when Pi is
+  embedded through the SDK" (`docs/environment-variables.md:18`), so an SDK embedder gets them in
+  *no* child. cyrup's per-child writes mean an embedder of `cyrup-tools` / `cyrup-session-svc` /
+  `cyrup-ext-subagents` **does** get them. cyrup is behind pi outside the three sites and ahead of it
+  inside them. This is a *surplus*, costs nothing, and keeps the tools self-contained — every test in
+  §4.4 exercises the tools in-process, never through the binary, so the pushes are load-bearing for
+  the crate regardless. Recorded, not actioned.
+- **The audit's headline illustration is unverifiable against pi.** pi at `e8682309` has no MCP
+  subsystem (`grep -rli mcp ./tmp/pi/packages/*/src` → two unrelated files; no `StdioClientTransport`,
+  no client, no server manager), so "a detection script inside an MCP server sees no agent marker"
+  describes a real cyrup consequence with **no upstream counterpart to measure against**. The §2.2
+  finding stands on the other children. When the INDEX row is closed out, re-word it.
+- **`docs/gap-analysis/04-cyrup-tools.md:197`'s citation of `exec/mod.rs:1961-1963`** is stale — the
+  subagent write now lives at `exec/spawn_plan.rs:962`/`:972`. Cosmetic; note it if that file is
+  touched for another reason.
 
 ---
 
-## 8. Additional divergences found this pass (filed, not descoped)
+## 6. Definition of done
 
-- **D1 — wrong upstream tag, three sites and three tests.** `@v0.84.1` should be `@v0.84.0`
-  (`CHANGELOG.md:288` inside `## [0.84.0]`, `:188`). Cheap to fix, and it matters because the tests
-  assert the literal string and a future v0.84.x uplift will route by it. See §6.3.
-- **D2 — the SDK-case inversion is undocumented.** pi sets nothing when embedded
-  (`docs/environment-variables.md:18`); cyrup's per-child writes mean an embedder's bash children DO
-  see the markers. cyrup is behind pi outside the three sites and ahead of it inside them, and no
-  annotation says so. See §4, §6.2.
-- **D3 — cyrup gives three different answers to one naming question.** It writes `PI_CODING_AGENT`
-  **verbatim** into children (impersonating pi on the *pi-specific* key), refuses pi's value on the
-  *generic* key (`AI_AGENT="cyrup"`), renames the five session keys `PI_*` → `CYRUP_*` and
-  additionally *scrubs* the `PI_*` spellings from the child
-  (`crate::config::session_env_scrub_keys`, applied at `bash.rs:316`), while on the READ side it
-  accepts `CYRUP_*` first and `PI_*` last as a migration fallback
-  (`crates/cyrup-config/src/env.rs:71-97`, e.g. `agent_dir: ["CYRUP_AGENT_DIR",
-  "CYRUP_CODING_AGENT_DIR", "PI_CODING_AGENT_DIR"]`). Whatever David decides in §7 should be decided
-  as a *policy* across these, not per-variable — otherwise the next agent re-litigates it at the
-  next site.
-- **D4 — the audit's own illustration is unverifiable against pi.** pi at `e8682309` has no MCP
-  subsystem at all, so "a detection script inside an MCP server sees no agent marker" describes a
-  real cyrup hole with no upstream counterpart. The scope gap stands on the other children
-  (extension processes, intercom broker, editors, npm installs, update check); the MCP example
-  should be re-worded when the marker is rewritten.
-
----
-
-## 9. Tests — exactly which assertions move
-
-Existing coverage, all verified present at HEAD:
-
-| test | file:line | asserts | scope-close only (§6) | if V2 (`"pi"`) | if D1 retag |
-| --- | --- | --- | --- | --- | --- |
-| `bash_child_sees_the_agent_identity_markers` | `crates/cyrup-tools/src/tests/bash_session_env.rs:240` | child prints `[true][cyrup]` | unchanged | → `[true][pi]` | — |
-| `identity_markers_survive_expose_session_environment_off` | `crates/cyrup-tools/src/tests/bash_session_env.rs:265` | child prints `[true][cyrup][]` | unchanged | → `[true][pi][]` | — |
-| `cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag` | `crates/cyrup-tools/src/tests/bash_session_env.rs:315` | source contains `env.push(("AI_AGENT".to_string(), "cyrup".to_string()));`; annotation contains `@v0.84.1`, `AI_AGENT`, `v0.83.0` | annotation text changes (§6.4) — the three `contains` still hold if the rewrite keeps the tag + key + absence facts | the searched literal changes | **`@v0.84.1` → `@v0.84.0`** |
-| `immediate_bash_carries_the_agent_identity_markers` | `crates/cyrup-session-svc/src/tests/summarization_retry_events.rs:707` | `execute_bash` output contains `[true][cyrup]` | unchanged | → `[true][pi]` | — |
-| `the_forward_ported_ai_agent_marker_names_its_key_and_its_tag` | `crates/cyrup-session-svc/src/tests/summarization_retry_events.rs:741` | same shape as the `cyrup-tools` one, over `../bash.rs` | annotation text | literal | **retag** |
-| `the_spawn_overlay_carries_the_agent_identity_markers` | `crates/cyrup-ext-subagents/src/exec/spawn_plan.rs:3766` | `env_overlay["AI_AGENT"] == Some("cyrup")` | unchanged | → `Some("pi")` | — |
-| `cfg069_the_spawn_overlay_delta_names_the_forward_ported_key_and_its_tag` | `crates/cyrup-ext-subagents/src/exec/spawn_plan.rs:3802` | same shape, over `spawn_plan.rs` | annotation text | literal | **retag** |
-| `execute_bash_routes_through_an_operations_override_instead_of_the_local_shell` | `crates/cyrup-session-svc/src/tests/round9_l5res.rs:610` (assertion `:666`) | env **key** `AI_AGENT` present | unchanged | unchanged (key only) | — |
-| `bash_prompt_guideline_deltas_are_tagged_cyrup_delta` | `crates/cyrup-tools/src/tests/pi_tool_semantics.rs:778` | scans only the doc block between `prompt_snippet` and `prompt_guidelines` (`:786-793`) | **unaffected** — it does not see the `execute`-site delta | unaffected | unaffected |
-
-**Summary of movement.** Under the recommended disposition (close scope, V1+V3 value, D1 retag) the
-only assertions that move are the three `@v0.84.1` strings and whatever the rewritten annotations
-must still contain; every runtime `[true][cyrup]` assertion stays exactly as it is, because §6.2
-keeps the per-child writes. Under V2 six literals change instead.
-
-**New tests required** (RED before the change, per §6.5):
-1. `crates/cyrup-it` — real-binary integration: a **non-shell-tool** child (MCP stdio server) sees
-   `AI_AGENT`. This is the test that fails without §6.1 and is the whole point of the item.
-2. source scan on `crates/cyrup/src/main.rs`: the markers are set in the pre-runtime prologue,
-   above `predispatch::classify_internal`.
-3. optional, pins D2 honestly: an in-process test asserting the tool still stamps the markers with
-   no global set — i.e. the SDK surplus is deliberate, so a later cleanup cannot delete the pushes
-   as "redundant".
-
----
-
-## 10. Definition of done
-
-1. §6.1 lands: the markers are process-global at the `cyrup` binary entry, above the internal-
-   subcommand dispatch, and the three per-child writes are kept (§6.2).
-2. New test 1 (§9) fails without the change and passes with it.
-3. D1 retag applied at all three write sites and the three source-scan tests (§6.3).
-4. The three annotations are rewritten to record scope as well as value, including the SDK-case
-   surplus (D2) and a corrected illustration (D4).
-5. The value half carries **David's** recorded decision (§7) — V1+V3 recommended — written on the
-   annotation line as an authorized acceptance, not an agent's assertion.
-6. No behaviour regression in `cyrup-tools`, `cyrup-session-svc`, `cyrup-ext-subagents`, `cyrup-mcp`.
-
----
-
-## 11. Open questions for David
-
-1. **Value: V1+V3 (recommended), or V2?** Do we want cyrup's children to say `AI_AGENT=cyrup` (true,
-   breaks hooks hard-coded to `pi`) or `AI_AGENT=pi` (drop-in, untrue)? This is the only genuinely
-   product-shaped half of the item.
-2. **D3 — is there one naming policy?** `PI_CODING_AGENT` verbatim + `AI_AGENT=cyrup` +
-   `CYRUP_SESSION_*` (with `PI_SESSION_*` scrubbed) + read-side `CYRUP_*`-then-`PI_*` are four
-   different answers. Should cyrup also write `CYRUP_CODING_AGENT="true"` alongside
-   `PI_CODING_AGENT`, the way `crates/cyrup-config/src/env.rs` reads both spellings? Deciding this
-   once settles this item and the sibling below.
-3. **Reconciliation with the `PI_SESSION_ID` sibling** (`bash.rs:236`, being augmented in parallel —
-   that file was not touched by this pass). The two items meet at the same `execute` body and at the
-   same `[CYRUP-DELTA` grep: `:228-236` is the `PI_*` → `CYRUP_*` prompt-string/session-key
-   divergence, `:304-315` is this one. Q2's answer governs both. Note for that item's author: this
-   pass establishes that `AI_AGENT` arrived at **v0.84.0**, not v0.84.1 (D1), and that the *scope*
-   of the identity markers — not just their spelling — diverges; if the `PI_SESSION_ID` item
-   prescribes anything about `session_env_scrub_keys` or the guideline string, it should assume
-   §6.1 makes the identity pair process-global while the five session keys stay tool-local (pi's
-   own split: `resolveSpawnContext`, `bash.ts:158-184`, vs. `cli.ts:13-14`).
-4. **Is the SDK surplus (D2) wanted?** Keeping the per-child writes after §6.1 makes cyrup strictly
-   more informative than pi for embedders. Recommended (it costs nothing and keeps the tools
-   self-contained), but it is a deliberate step past parity and should be authorized as such.
+1. `bash.rs:293` and the `[CYRUP-DELTA` block at `bash.rs:304-314` are rewritten per §4.1: the
+   arrival tag reads `@v0.84.0`, the VALUE paragraph records `"cyrup"` as authorized-by-semantics
+   with the `docs/environment-variables.md:15` / `README.md:675` citation, and the SCOPE paragraph
+   cites PB-5 / `DRIFT-044` / `TOOL-031` as the recorded placement decision.
+2. The same corrections land at `cyrup-session-svc/src/bash.rs:164`, `:174-182` and
+   `cyrup-ext-subagents/src/exec/spawn_plan.rs:950`, `:963-971`, `:3761`, `:3797`, `:3803`.
+   Afterwards `grep -rn 'v0\.84\.1' crates/cyrup-session-svc/src/bash.rs
+   crates/cyrup-ext-subagents/src/exec/spawn_plan.rs` returns nothing.
+3. `bash_session_env.rs:334` asserts `"@v0.84.0"`; `summarization_retry_events.rs:756` and
+   `spawn_plan.rs:3822` likewise. Reverting any one annotation turns its test red — that is the
+   guard, and it is the only new assertion state this item introduces.
+4. **Zero runtime change.** `bash.rs:303`/`:315`, `cyrup-session-svc/src/bash.rs:173`/`:183` and
+   `spawn_plan.rs:962`/`:972` are byte-identical before and after. The four runtime assertions
+   (`bash_session_env.rs:240`, `:265`; `summarization_retry_events.rs:707`; `spawn_plan.rs:3772`)
+   still observe `[true][cyrup]` / `Some("cyrup")` unchanged, and `round9_l5res.rs:613` (assertion
+   `:669`, key-presence only) is untouched.
+5. `cfg069_the_bash_tool_delta_names_the_forward_ported_key_and_its_tag` and its two siblings pass,
+   with the §4.5 invariants intact — in particular exactly **one** `[CYRUP-DELTA` token between
+   `bash.rs:303` and `bash.rs:315`.
+6. The INDEX row for `crates/cyrup-tools/src/tools/bash.rs:312` is closed as **ACCEPT** (option 2 of
+   the three in [`INDEX.md`](./INDEX.md)) — divergence authorized, reason annotated — **not** as
+   "close it". Nothing about this item needs a human ruling: pi's own documentation fixes the value,
+   and PB-5 already fixed the placement.

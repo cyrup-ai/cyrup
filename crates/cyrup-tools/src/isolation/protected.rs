@@ -13,13 +13,15 @@
 use super::FsOps;
 use crate::error;
 use cyrup_core::{EventStream, ToolError};
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 
 /// A set of protected path *component names*. A path is protected when **any** of its components
-/// equals one of these names — so `.env` matches the file `.env`, and `.git` / `node_modules` match
-/// anything inside `.git/` or `node_modules/`. Component-equality (not prefix) avoids false hits on
-/// e.g. `.environment`. Cross-platform (operates on `Path` components, no separator assumptions).
+/// equals one of these names, or begins with one followed by `.` — so `.env` matches the file
+/// `.env` and the dotenv family (`.env.local`, `.env.production`), and `.git` / `node_modules`
+/// match anything inside `.git/` or `node_modules/`. The name-plus-dot rule (not a bare substring)
+/// avoids false hits on e.g. `.environment`. Cross-platform (operates on `Path` components, no
+/// separator assumptions).
 #[derive(Clone, Debug)]
 pub struct ProtectedPaths {
     names: Vec<String>,
@@ -51,12 +53,33 @@ impl ProtectedPaths {
         self
     }
 
-    /// True when `path` is protected: any of its components equals a protected name.
+    /// True when `path` is protected: any of its components equals a protected name, or begins
+    /// with that name followed by `.` — so `.env` covers the dotenv family (`.env.local`,
+    /// `.env.production`, `.env.development.local`) exactly as pi's example extension does, without
+    /// inheriting its substring false positives (`.environment`, `config.env`, `.envrc`).
+    ///
+    /// pi's own list is inconsistent — `.env` has no trailing slash and so matches as a bare
+    /// substring, while `.git/` and `node_modules/` match only as directory prefixes
+    /// (`examples/extensions/protected-paths.ts` @e8682309). cyrup applies ONE rule to every
+    /// configured name instead: a custom `ProtectedPaths::new([".secret"])` then also covers
+    /// `.secret.local`, which is the same intent. The cost is that `.git.bak` is protected here and
+    /// not under pi — over-protection, never a hole.
+    ///
+    /// `.gitignore` stays writable: it is not `.git` and does not begin with `.git.`. `.envrc` is
+    /// out of scope on purpose — direnv, not dotenv; pi only catches it via the same bare-substring
+    /// behaviour that catches `.environment`. A component that is exactly `<name>.` with nothing
+    /// after the dot is NOT protected — the dot must introduce a suffix — which is why the length
+    /// test is `>` and not `>=`.
     pub fn is_protected(&self, path: &Path) -> bool {
         path.components().any(|c| match c {
-            Component::Normal(os) => os
-                .to_str()
-                .is_some_and(|s| self.names.iter().any(|n| n == s)),
+            Component::Normal(os) => os.to_str().is_some_and(|s| {
+                self.names.iter().any(|n| {
+                    s == n.as_str()
+                        || (s.len() > n.len() + 1
+                            && s.starts_with(n.as_str())
+                            && s.as_bytes().get(n.len()) == Some(&b'.'))
+                })
+            }),
             _ => false,
         })
     }
@@ -73,12 +96,18 @@ impl Default for ProtectedPaths {
 pub struct ProtectedFs {
     inner: Arc<dyn FsOps>,
     protected: ProtectedPaths,
+    /// When set, paths are matched RELATIVE to this root — see [`ProtectedFs::rooted`].
+    root: Option<PathBuf>,
 }
 
 impl ProtectedFs {
-    /// Wrap `inner`, blocking mutations to `protected`.
+    /// Wrap `inner`, blocking mutations to `protected`, matching against the WHOLE path.
     pub fn new(inner: Arc<dyn FsOps>, protected: ProtectedPaths) -> Self {
-        Self { inner, protected }
+        Self {
+            inner,
+            protected,
+            root: None,
+        }
     }
 
     /// Convenience: wrap `inner` with the conventional default protected set.
@@ -86,8 +115,37 @@ impl ProtectedFs {
         Self::new(inner, ProtectedPaths::defaults())
     }
 
+    /// Wrap `inner`, matching `protected` against the path RELATIVE to `root`.
+    ///
+    /// The tools hand this decorator an ABSOLUTE path — `write` resolves the caller's argument with
+    /// `path::resolve_to_cwd` before it reaches the backend (`tools/write.rs:106`) — so an
+    /// unrooted matcher tests the session cwd's own components too. A session rooted at
+    /// `…/node_modules/mypkg` then has EVERY write refused, which makes the flag unusable in a
+    /// legitimate cwd.
+    ///
+    /// pi is not immune to this: its example extension tests `event.input.path`, and pi's `write`
+    /// schema is "Path to the file to write (relative or absolute)" (`write.ts:16`), so an absolute
+    /// path under such a cwd is blocked there too. The difference is certainty, not existence —
+    /// cyrup absolutizes unconditionally. Rooting is better than both, and is what the session
+    /// builder uses.
+    ///
+    /// A path that is not under `root` fails `strip_prefix` and falls back to the whole path, so
+    /// writes escaping the session are still checked in full (`protect_paths` can be on with
+    /// `confine_to_cwd` off).
+    pub fn rooted(inner: Arc<dyn FsOps>, root: PathBuf, protected: ProtectedPaths) -> Self {
+        Self {
+            inner,
+            protected,
+            root: Some(root),
+        }
+    }
+
     fn deny_if_protected(&self, path: &Path) -> Result<(), ToolError> {
-        if self.protected.is_protected(path) {
+        let candidate = match &self.root {
+            Some(root) => path.strip_prefix(root).unwrap_or(path),
+            None => path,
+        };
+        if self.protected.is_protected(candidate) {
             return Err(error::denied(format!(
                 "write to protected path denied: {}",
                 error::show(path)
@@ -105,7 +163,7 @@ impl FsOps for ProtectedFs {
 
     /// Forwarded EXPLICITLY, not left to the trait default.
     ///
-    /// `FsOps::read_stream`'s default is `Cursor::new(self.read(path).await?)` (`ops/mod.rs:329-334`)
+    /// `FsOps::read_stream`'s default is `Cursor::new(self.read(path).await?)` (`ops/mod.rs:456`)
     /// — a whole-file materialization. That default is *semantically* indistinguishable from a real
     /// stream, so a decorator that omits this method still returns the right bytes and no test can
     /// see the difference; what it silently discards is `LocalFs`'s real-`File` override, i.e. the
@@ -161,15 +219,73 @@ impl FsOps for ProtectedFs {
 mod tests {
     use super::*;
 
+    /// The defaults, over the whole matrix pi's example extension defines.
+    ///
+    /// The dotenv rows are the reason this rule is name-plus-dot rather than component-equality:
+    /// `.env.local` and `.env.production` are where secrets actually live in JS projects, pi's
+    /// extension blocks them (`protectedPaths` contains a bare `".env"`, matched with
+    /// `String.includes`), and cyrup used to write them. The negative rows are the other half —
+    /// cyrup must not acquire pi's bare-substring false positives while closing that hole.
     #[test]
     fn defaults_match_env_git_node_modules() {
         let p = ProtectedPaths::defaults();
         assert!(p.is_protected(Path::new("/work/.env")));
+        assert!(p.is_protected(Path::new("/work/.env.local")));
+        assert!(p.is_protected(Path::new("/work/.env.production")));
+        assert!(p.is_protected(Path::new("/work/.env.development.local")));
+        assert!(p.is_protected(Path::new("/work/.git")));
         assert!(p.is_protected(Path::new("/work/.git/config")));
         assert!(p.is_protected(Path::new("/work/node_modules/foo/index.js")));
-        // Not protected: a normal file and a near-miss name.
+        // Not protected: a normal file, and the near-miss names pi's `String.includes` DOES catch
+        // — `.environment` and `config.env` contain `.env`, `.envrc` is direnv rather than dotenv,
+        // and `.gitignore` is not `.git` and does not begin with `.git.`.
         assert!(!p.is_protected(Path::new("/work/src/main.rs")));
         assert!(!p.is_protected(Path::new("/work/.environment")));
+        assert!(!p.is_protected(Path::new("/work/config.env")));
+        assert!(!p.is_protected(Path::new("/work/.gitignore")));
+        assert!(!p.is_protected(Path::new("/work/.envrc")));
+    }
+
+    /// A session rooted UNDER a protected name must not have every write refused.
+    ///
+    /// `write` hands the backend an absolutized path (`tools/write.rs:106`), so an unrooted
+    /// matcher tests the session cwd's own components. Before [`ProtectedFs::rooted`] a session at
+    /// `…/node_modules/mypkg` refused every write in its own tree — the flag was unusable in a
+    /// legitimate cwd. Rooting strips the cwd before matching, while a path OUTSIDE the root falls
+    /// back to whole-path matching so escapes are still checked.
+    #[tokio::test]
+    async fn rooted_matcher_ignores_the_cwd_and_still_guards_inside_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("proj/node_modules/mypkg");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+
+        let base: Arc<dyn FsOps> = Arc::new(crate::ops::local::LocalFs);
+        let fs = ProtectedFs::rooted(base.clone(), root.clone(), ProtectedPaths::defaults());
+
+        // An ordinary file inside that root: allowed, despite `node_modules` in the cwd.
+        fs.write_in_place(&root.join("src/lib.rs"), b"x")
+            .await
+            .unwrap();
+        // Its own dotenv file: still refused.
+        let err = fs
+            .write_in_place(&root.join(".env.local"), b"x")
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("protected"), "got: {err}");
+
+        // Outside the root, the whole path is matched — an escape is not laundered by rooting.
+        let outside = dir.path().join("other/.env");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        assert!(fs.write_in_place(&outside, b"x").await.is_err());
+
+        // Unrooted keeps today's whole-path semantics for embedders calling `with_defaults`.
+        let unrooted = ProtectedFs::with_defaults(base);
+        assert!(
+            unrooted
+                .write_in_place(&root.join("src/lib.rs"), b"x")
+                .await
+                .is_err()
+        );
     }
 
     #[test]
