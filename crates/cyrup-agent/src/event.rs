@@ -3,7 +3,8 @@
 //! tagged enums add `rename_all_fields = "camelCase"` so payload fields are camelCase for
 //! Pi-interop (R-00-013).
 
-use cyrup_core::{AssistantMessage, Content, ToolCallId, Usage};
+use cyrup_core::{AssistantMessage, Content, SharedStr, ToolCallId, Usage};
+use std::sync::Arc;
 use cyrup_provider::StreamEvent;
 use serde_json::Value;
 
@@ -25,7 +26,14 @@ pub enum AgentMessage {
         content: Vec<Content>,
         timestamp: Option<i64>,
     },
-    Assistant(AssistantMessage),
+    /// The assistant turn, as a SHARED handle (PERF-001).
+    ///
+    /// This message is carried by every `message_update`, is also embedded in that event's
+    /// `assistant_message_event`, and is then cloned once per live subscriber by the session
+    /// facade's fan-out. Owning it here meant a deep copy at each of those points, on every
+    /// stream delta. The wire is unchanged: serde's `rc` feature serializes an `Arc<T>`
+    /// transparently as `T`, and this enum's hand-written serializer delegates to it.
+    Assistant(Arc<AssistantMessage>),
     ToolResult(ToolResultMessage),
     /// App/extension role, never serialized into the LLM request verbatim (func-02 R-02-052).
     Custom {
@@ -179,7 +187,7 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
         }
         Ok(match serde_json::from_value::<Typed>(v).map_err(D::Error::custom)? {
             Typed::User { content, timestamp } => AgentMessage::User { content, timestamp },
-            Typed::Assistant(a) => AgentMessage::Assistant(a),
+            Typed::Assistant(a) => AgentMessage::Assistant(Arc::new(a)),
             Typed::ToolResult(t) => AgentMessage::ToolResult(t),
             Typed::Custom { kind, payload, details, timestamp } => {
                 AgentMessage::Custom { kind, payload, details, timestamp }
@@ -190,7 +198,7 @@ impl<'de> serde::Deserialize<'de> for AgentMessage {
 
 impl AgentMessage {
     /// Convenience: a plain user text message.
-    pub fn user_text(text: impl Into<String>) -> Self {
+    pub fn user_text(text: impl Into<SharedStr>) -> Self {
         AgentMessage::User { content: vec![Content::text(text)], timestamp: None }
     }
 

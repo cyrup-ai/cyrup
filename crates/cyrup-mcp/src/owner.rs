@@ -923,7 +923,7 @@ fn message_text(message: &Message) -> String {
     blocks
         .iter()
         .map(|block| match block {
-            Content::Text { text, .. } => text.clone(),
+            Content::Text { text, .. } => text.to_string(),
             Content::Image { mime_type, .. } => format!("[image: {mime_type}]"),
             Content::Thinking { .. } => "[thinking]".to_string(),
             Content::ToolCall(call) => format!("[tool call: {}]", call.name),
@@ -1293,7 +1293,7 @@ mod tests {
 
     fn user_text(text: &str) -> Message {
         Message::User {
-            content: vec![Content::Text { text: text.to_string(), text_signature: None }],
+            content: vec![Content::Text { text: text.into(), text_signature: None }],
             timestamp: 0,
         }
     }
@@ -1320,7 +1320,7 @@ mod tests {
             "anthropic/claude-opus-4",
             Some("be terse"),
             &[user_text("hello"), assistant_blocks(vec![Content::Text {
-                text: "hi".to_string(),
+                text: "hi".into(),
                 text_signature: None,
             }])],
         );
@@ -1370,17 +1370,17 @@ mod tests {
     #[test]
     fn message_text_renders_every_reachable_block_spelling() {
         let message = assistant_blocks(vec![
-            Content::Text { text: "plain".to_string(), text_signature: None },
+            Content::Text { text: "plain".into(), text_signature: None },
             Content::Image { data: "AAAA".to_string(), mime_type: "image/png".to_string() },
             Content::Thinking {
-                thinking: "hidden".to_string(),
+                thinking: "hidden".into(),
                 thinking_signature: None,
                 redacted: false,
             },
             Content::ToolCall(cyrup_core::ToolCall {
                 id: cyrup_core::ToolCallId::from("call-1"),
                 name: "search".to_string(),
-                arguments: serde_json::Map::new(),
+                arguments: serde_json::Map::new().into(),
                 thought_signature: None,
             }),
         ]);
@@ -1400,7 +1400,7 @@ mod tests {
         let tool_result = Message::ToolResult {
             tool_call_id: cyrup_core::ToolCallId::from("call-1"),
             tool_name: "search".to_string(),
-            content: vec![Content::Text { text: "rows".to_string(), text_signature: None }],
+            content: vec![Content::Text { text: "rows".into(), text_signature: None }],
             is_error: false,
             details: None,
             usage: None,

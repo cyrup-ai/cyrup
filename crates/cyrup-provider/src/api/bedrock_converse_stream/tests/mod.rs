@@ -189,7 +189,7 @@ async fn collect(chunks: Vec<Vec<u8>>, model: &Model) -> Vec<StreamEvent> {
             frames.push(&chunk);
             while let Some(f) = frames.next_frame().expect("frame") {
                 if let Err(message) = dispatch_frame(&f, &mut dec, &m, &a, &sink).await {
-                    let mut msg = dec.snapshot(&m, &a);
+                    let mut msg = dec.snapshot_owned(&m, &a);
                     msg.stop_reason = StopReason::Error;
                     msg.error_message = Some(message);
                     sink.send(StreamEvent::terminal(msg)).await;
@@ -197,7 +197,7 @@ async fn collect(chunks: Vec<Vec<u8>>, model: &Model) -> Vec<StreamEvent> {
                 }
             }
         }
-        let mut msg = dec.snapshot(&m, &a);
+        let mut msg = dec.snapshot_owned(&m, &a);
         if dec.stop_reason == Some(StopReason::Error) && dec.error_message.is_none() {
             msg.error_message = Some("An unknown error occurred".to_string());
         }

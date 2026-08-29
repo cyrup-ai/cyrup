@@ -262,8 +262,8 @@ mod tests {
     use tokio::net::TcpListener;
 
     /// A neutral non-terminal `partial` snapshot for scripted test events.
-    fn test_partial() -> AssistantMessage {
-        AssistantMessage {
+    fn test_partial() -> Arc<AssistantMessage> {
+        Arc::new(AssistantMessage {
             content: Vec::new(),
             provider: ProviderId::from("p"),
             model: "m1".into(),
@@ -277,7 +277,7 @@ mod tests {
             error_message: None,
             raw_stop_reason: None,
             timestamp: 0,
-        }
+        })
     }
 
     fn test_model(api: &str) -> Model {
@@ -391,7 +391,7 @@ mod tests {
                 arguments: serde_json::json!({"x": 1})
                     .as_object()
                     .cloned()
-                    .expect("object"),
+                    .expect("object").into(),
                 thought_signature: None,
             };
             sink.send(StreamEvent::ToolCallEnd {
@@ -409,7 +409,7 @@ mod tests {
                         arguments: serde_json::json!({"x": 1})
                             .as_object()
                             .cloned()
-                            .expect("object"),
+                            .expect("object").into(),
                         thought_signature: None,
                     }),
                 ],

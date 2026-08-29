@@ -87,7 +87,7 @@ where
     // "Google stream ended without a finish reason" (google-generative-ai.ts:266-268); this used to
     // fall through to the `Stop` seed and report a clean turn.
     sink.send(StreamEvent::end_of_stream(
-        dec.snapshot(model, api),
+        dec.snapshot_owned(model, api),
         dec.stop_reason,
         "Google stream ended without a finish reason",
     ))

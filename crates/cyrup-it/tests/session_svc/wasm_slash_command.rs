@@ -73,7 +73,7 @@ fn user_texts(messages: &[Message]) -> Vec<String> {
                 content
                     .iter()
                     .filter_map(|c| match c {
-                        cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+                        cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
                         _ => None,
                     })
                     .collect::<String>(),

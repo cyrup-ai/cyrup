@@ -1182,7 +1182,7 @@ mod tests {
         assert_eq!(record.artifacts[0].path, "/tmp/out.md");
 
         let text = match &attached.content[0] {
-            cyrup_core::Content::Text { text, .. } => text.clone(),
+            cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("expected text, got {other:?}"),
         };
         assert_eq!(text, format!("all done\nMission: {} (completed)", record.id));
@@ -1263,7 +1263,7 @@ mod tests {
         )
         .unwrap();
         let text = match &json_result.content[0] {
-            cyrup_core::Content::Text { text, .. } => text.clone(),
+            cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("{other:?}"),
         };
         assert_eq!(text, r#"{"ok":true}"#, "a JSON payload must not be prose-appended to");
@@ -1280,7 +1280,7 @@ mod tests {
         )
         .unwrap();
         let text = match &structured.content[0] {
-            cyrup_core::Content::Text { text, .. } => text.clone(),
+            cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("{other:?}"),
         };
         assert_eq!(text, "plain text");
@@ -1313,7 +1313,7 @@ mod tests {
         )
         .unwrap();
         let text = match &structured.content[0] {
-            cyrup_core::Content::Text { text, .. } => text.clone(),
+            cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("{other:?}"),
         };
         assert_eq!(text, "plain text");
@@ -1335,7 +1335,7 @@ mod tests {
         )
         .unwrap();
         let text = match &plain.content[0] {
-            cyrup_core::Content::Text { text, .. } => text.clone(),
+            cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("{other:?}"),
         };
         assert!(text.starts_with("plain text\nMission: "), "{text}");
@@ -1518,7 +1518,7 @@ mod tests {
         // The no-run-id branch never announces in content.
         assert_eq!(attached.content.len(), 1);
         let text = match &attached.content[0] {
-            cyrup_core::Content::Text { text, .. } => text.clone(),
+            cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("{other:?}"),
         };
         assert_eq!(text, "refused before launch");

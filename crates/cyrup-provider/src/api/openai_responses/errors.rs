@@ -9,13 +9,13 @@ use cyrup_core::{ApiId, StopReason};
 
 /// Emit a terminal `error` event carrying the live snapshot + message (Pi catch block).
 pub(super) async fn emit_error(
-    dec: &RDecoder,
+    dec: &mut RDecoder,
     model: &Model,
     api: &ApiId,
     sink: &EventSink,
     message: String,
 ) {
-    let mut msg = dec.snapshot(model, api);
+    let mut msg = dec.snapshot_owned(model, api);
     msg.stop_reason = StopReason::Error;
     msg.error_message = Some(message);
     sink.send(StreamEvent::terminal(msg)).await;

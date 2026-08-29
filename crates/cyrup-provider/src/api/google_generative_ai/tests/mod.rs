@@ -123,7 +123,7 @@ fn a_tool_call() -> Content {
     Content::ToolCall(ToolCall {
         id: ToolCallId::from("call_1"),
         name: "bash".to_string(),
-        arguments: serde_json::Map::new(),
+        arguments: serde_json::Map::new().into(),
         thought_signature: None,
     })
 }

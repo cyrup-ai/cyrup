@@ -87,7 +87,7 @@ fn blank_tool_result_content_becomes_the_empty_placeholder() {
                 content: vec![Content::ToolCall(ToolCall {
                     id: ToolCallId::from("tool-1"),
                     name: "tool".to_string(),
-                    arguments: Map::new(),
+                    arguments: Map::new().into(),
                     thought_signature: None,
                 })],
                 provider: "amazon-bedrock".into(),
@@ -146,7 +146,7 @@ fn consecutive_tool_results_collapse_into_one_user_message() {
                     Content::ToolCall(ToolCall {
                         id: ToolCallId::from(*id),
                         name: "tool".to_string(),
-                        arguments: Map::new(),
+                        arguments: Map::new().into(),
                         thought_signature: None,
                     })
                 })
@@ -203,7 +203,7 @@ fn consecutive_tool_results_collapse_into_one_user_message() {
 #[test]
 fn signatureless_thinking_replays_as_text_on_claude_and_as_reasoning_elsewhere() {
     let thinking = |sig: Option<&str>| Content::Thinking {
-        thinking: "ponder".to_string(),
+        thinking: "ponder".into(),
         thinking_signature: sig.map(str::to_string),
         redacted: false,
     };

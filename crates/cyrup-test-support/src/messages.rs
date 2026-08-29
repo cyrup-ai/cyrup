@@ -3,17 +3,19 @@
 //! uses, adapted to cyrup's [`cyrup_core::Message`] / [`cyrup_agent::AgentMessage`].
 
 use cyrup_agent::AgentMessage;
-use cyrup_core::{ApiId, AssistantMessage, Content, Cost, Message, ProviderId, StopReason, Usage};
+use cyrup_core::{
+    ApiId, AssistantMessage, Content, Cost, Message, ProviderId, SharedStr, StopReason, Usage,
+};
 
 /// A minimal persisted user message (Pi `userMsg`, utilities.ts:130-132). `timestamp` is fixed at 0
 /// for deterministic snapshots (Pi uses `Date.now()`; [CYRUP-DELTA] zeroes it).
-pub fn user_msg(text: impl Into<String>) -> Message {
+pub fn user_msg(text: impl Into<SharedStr>) -> Message {
     Message::User { content: vec![Content::text(text)], timestamp: 0 }
 }
 
 /// A minimal persisted assistant message (Pi `assistantMsg`, utilities.ts:137-155): provider
 /// `anthropic`, model `test`, api `anthropic-messages`, usage `{input:1, output:1, total:2}`.
-pub fn assistant_msg(text: impl Into<String>) -> Message {
+pub fn assistant_msg(text: impl Into<SharedStr>) -> Message {
     Message::Assistant(AssistantMessage {
         content: vec![Content::text(text)],
         provider: ProviderId::from("anthropic"),
@@ -41,14 +43,14 @@ pub fn assistant_msg(text: impl Into<String>) -> Message {
 }
 
 /// A user [`AgentMessage`] (Pi `createUserMessage`, session-test-utils.ts:7-13).
-pub fn create_user_message(text: impl Into<String>) -> AgentMessage {
+pub fn create_user_message(text: impl Into<SharedStr>) -> AgentMessage {
     AgentMessage::user_text(text)
 }
 
 /// An assistant [`AgentMessage`] (Pi `createAssistantMessage`, session-test-utils.ts:15-33):
 /// provider `anthropic`, model `claude-sonnet-4-5`, api `anthropic-messages`, zero usage.
-pub fn create_assistant_message(text: impl Into<String>) -> AgentMessage {
-    AgentMessage::Assistant(AssistantMessage {
+pub fn create_assistant_message(text: impl Into<SharedStr>) -> AgentMessage {
+    AgentMessage::Assistant(std::sync::Arc::new(AssistantMessage {
         content: vec![Content::text(text)],
         provider: ProviderId::from("anthropic"),
         model: "claude-sonnet-4-5".to_string(),
@@ -62,5 +64,5 @@ pub fn create_assistant_message(text: impl Into<String>) -> AgentMessage {
         error_message: None,
         raw_stop_reason: None,
         timestamp: 0,
-    })
+    }))
 }

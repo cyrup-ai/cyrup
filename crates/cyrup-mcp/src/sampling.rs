@@ -1,8 +1,9 @@
 //! `sampling-handler.ts` — `sampling/createMessage`.
 //!
 //! A server asks the agent to run a completion; the human approves the request and, separately, the
-//! response; the server gets back a single text block. [`crate::runtime::McpClientHandler::create_message`]
-//! is the entry point, and it answers `METHOD_NOT_FOUND` unless
+//! response; the server gets back a single text block.
+//! [`McpClientHandler`](crate::runtime::McpClientHandler)'s `create_message` — its `rmcp`
+//! `ClientHandler` impl — is the entry point, and it answers `METHOD_NOT_FOUND` unless
 //! [`crate::server_manager::McpServerManager::set_sampling_config`] has installed a hook — which
 //! [`crate::runtime::initialize_mcp`] does, gated on `settings.sampling(has_ui)`.
 //!
@@ -258,7 +259,7 @@ pub async fn handle_sampling_request(
 
 /// `convertSamplingMessage` (`sampling-handler.ts:196-216`).
 ///
-/// [`SamplingContent`]'s `Single`/`Multiple` already models upstream's
+/// `SamplingMessage::content`'s `Single`/`Multiple` already models upstream's
 /// `Array.isArray(content) ? content : [content]`, so the normalisation is `into_vec`.
 #[allow(deprecated)]
 fn convert_sampling_message(message: &SamplingMessage) -> Result<Message, ErrorData> {
@@ -309,7 +310,7 @@ fn convert_text_block(
 ) -> Result<Content, ErrorData> {
     match block {
         SamplingMessageContentBlock::Text(text) => Ok(Content::Text {
-            text: text.text.clone(),
+            text: text.text.clone().into(),
             text_signature: None,
         }),
         other => Err(internal_msg(
@@ -589,7 +590,7 @@ mod tests {
 
     fn text(text: &str) -> Content {
         Content::Text {
-            text: text.to_string(),
+            text: text.into(),
             text_signature: None,
         }
     }
@@ -620,7 +621,7 @@ mod tests {
             vec![
                 text("first"),
                 Content::Thinking {
-                    thinking: "ignored".to_string(),
+                    thinking: "ignored".into(),
                     thinking_signature: None,
                     redacted: false,
                 },
@@ -646,7 +647,7 @@ mod tests {
         let message = assistant(
             StopReason::Stop,
             vec![Content::Thinking {
-                thinking: "only".to_string(),
+                thinking: "only".into(),
                 thinking_signature: None,
                 redacted: false,
             }],

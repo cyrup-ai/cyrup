@@ -802,8 +802,8 @@ mod smoke {
         assert_eq!(types.iter().filter(|t| *t == "done").count(), 2);
     }
 
-    fn faux_partial() -> cyrup_core::AssistantMessage {
-        cyrup_core::AssistantMessage {
+    fn faux_partial() -> std::sync::Arc<cyrup_core::AssistantMessage> {
+        std::sync::Arc::new(cyrup_core::AssistantMessage {
             content: Vec::new(),
             provider: cyrup_core::ProviderId::from("faux"),
             model: "faux-1".into(),
@@ -817,7 +817,7 @@ mod smoke {
             error_message: None,
             raw_stop_reason: None,
             timestamp: 0,
-        }
+        })
     }
 }
 

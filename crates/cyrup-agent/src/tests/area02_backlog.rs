@@ -453,7 +453,7 @@ fn errored(stop: StopReason, msg: Option<&str>) -> AgentMessage {
         msg.unwrap_or_default(),
     );
     a.error_message = msg.map(str::to_string);
-    AgentMessage::Assistant(a)
+    AgentMessage::Assistant(Arc::new(a))
 }
 
 /// `case "turn_end": if (event.message.role === "assistant" && event.message.errorMessage) { ... }`

@@ -952,7 +952,7 @@ mod tests {
             out.content
                 .iter()
                 .find_map(|c| match c {
-                    cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+                    cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
                     _ => None,
                 })
                 .unwrap_or_default()

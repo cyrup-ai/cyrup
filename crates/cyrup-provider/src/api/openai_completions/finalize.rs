@@ -1,6 +1,6 @@
 //! Response decoding: the terminal message, usage and the stop-reason table.
 
-use super::blocks::{Decoder, blocks_to_content};
+use super::blocks::{Decoder, project_block};
 use crate::model::Model;
 use crate::usage::apply_cost;
 use crate::utils::provider_plumbing::now_millis;
@@ -9,7 +9,7 @@ use serde_json::{Map, Value};
 
 /// Build the terminal [`AssistantMessage`] from accumulated decoder state.
 pub(super) fn build_final_message(dec: Decoder, model: &Model, api: &ApiId) -> AssistantMessage {
-    let content = blocks_to_content(&dec.blocks);
+    let content: Vec<_> = dec.blocks.iter().map(project_block).collect();
 
     let mut usage = dec.usage.unwrap_or_default();
     apply_cost(&model.cost, &mut usage);

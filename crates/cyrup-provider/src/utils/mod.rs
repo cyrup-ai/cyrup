@@ -10,7 +10,10 @@
 //! - [`overflow`] — context-overflow error classification (`utils/overflow.ts`).
 //! - [`retry`] — transient provider/transport error classification (`utils/retry.ts`).
 //! - [`json_parse`] — best-effort/partial JSON recovery for streamed tool-call args
-//!   (`utils/json-parse.ts`).
+//!   (`utils/json-parse.ts`). RE-EXPORTED from [`cyrup_core::json`], where it had to move so that
+//!   [`LazyArgs`](cyrup_core::LazyArgs) — which lives beside `ToolCall` — can call it (PERF-001).
+//!   The alias keeps `crate::utils::json_parse::…` and the public re-exports in `lib.rs` resolving
+//!   unchanged.
 //! - [`simple_options`] — the unified "simple" option surface + thinking-budget mapping
 //!   (`api/simple-options.ts`).
 //! - [`regexlite`] — the tiny case-insensitive matcher the overflow/retry classifiers run on
@@ -36,7 +39,7 @@ pub mod error_body;
 pub mod estimate;
 pub mod hash;
 pub mod http_date;
-pub mod json_parse;
+pub use cyrup_core::json as json_parse;
 pub mod node_http_proxy;
 pub mod overflow;
 pub(crate) mod provider_plumbing;

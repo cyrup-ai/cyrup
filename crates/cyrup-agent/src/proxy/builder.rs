@@ -1,31 +1,53 @@
 //! Client-side partial reconstruction (Pi `processProxyEvent` + `partial`, proxy.ts:121-367).
 
 use super::wire::ProxyAssistantMessageEvent;
-use cyrup_core::{AssistantMessage, Content, ModelRef, ToolCall, ToolCallId, Usage};
-use cyrup_provider::{parse_streaming_json_object, StreamEvent};
+use cyrup_core::{
+    AssistantMessage, Content, LazyArgs, ModelRef, SharedStr, ToolCall, ToolCallId, Usage,
+};
+use cyrup_provider::StreamEvent;
 use serde_json::Map;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Rebuilds the streaming [`AssistantMessage`] from bandwidth-reduced proxy events (Pi keeps the
 /// `partial` object + a per-tool-call `partialJson` side-field, proxy.ts:121-137,323-324). cyrup
 /// holds the streaming tool-call arg JSON in a side map keyed by content index rather than mutating
-/// the typed [`ToolCall`] (which has no `partialJson` field) — observably identical: the rebuilt
-/// `arguments` map is refreshed on every delta exactly as Pi does.
+/// the typed [`ToolCall`] (which has no `partialJson` field) — observably identical: the block's
+/// `arguments` track that buffer on every delta exactly as Pi's do. What differs is only when the
+/// map behind them is built; see [`LazyArgs`] (PERF-001).
 pub struct ProxyMessageBuilder {
     partial: AssistantMessage,
-    tool_json: HashMap<usize, String>,
+    /// Shared with every snapshot taken from it, so attaching the arguments to a block is a
+    /// refcount bump and the `Map` is recovered only if something reads it (PERF-001). This
+    /// builder is the CLIENT half of the proxy and carried the same per-delta whole-buffer
+    /// re-parse the decoders did.
+    tool_json: HashMap<usize, SharedStr>,
 }
 
 impl ProxyMessageBuilder {
     /// Seed the empty partial from the model identity (Pi `partial: AssistantMessage = {...}`,
     /// proxy.ts:121-137). `stopReason` starts at `pending`; `usage` is zeroed; content is empty.
     pub fn new(model: &ModelRef) -> Self {
-        Self { partial: empty_partial(model), tool_json: HashMap::new() }
+        Self {
+            partial: empty_partial(model),
+            tool_json: HashMap::new(),
+        }
     }
 
     /// The message assembled so far.
     pub fn partial(&self) -> &AssistantMessage {
         &self.partial
+    }
+
+    /// The message assembled so far, as the shared handle every [`StreamEvent`] now carries.
+    ///
+    /// This builder keeps an OWNED partial and mutates it in place, so this is exactly the one copy
+    /// per event it always made: holding an `Arc` here instead would force `Arc::make_mut` to copy
+    /// on the next mutation, because the event just emitted still holds a reference (PERF-001).
+    /// That copy is now O(blocks) rather than O(bytes accumulated), because a block's text is a
+    /// [`SharedStr`] and its tool arguments a [`LazyArgs`].
+    fn shared(&self) -> Arc<AssistantMessage> {
+        Arc::new(self.partial.clone())
     }
 
     /// Process one proxy event, mutating the partial and returning the reconstructed
@@ -40,14 +62,14 @@ impl ProxyMessageBuilder {
     ) -> Result<Option<StreamEvent>, String> {
         match event {
             ProxyAssistantMessageEvent::Start => {
-                Ok(Some(StreamEvent::Start { partial: self.partial.clone() }))
+                Ok(Some(StreamEvent::Start { partial: self.shared() }))
             }
 
             ProxyAssistantMessageEvent::TextStart { content_index } => {
                 self.set_content(content_index, Content::text(""));
                 Ok(Some(StreamEvent::TextStart {
                     content_index,
-                    partial: self.partial.clone(),
+                    partial: self.shared(),
                 }))
             }
             ProxyAssistantMessageEvent::TextDelta { content_index, delta } => {
@@ -58,21 +80,21 @@ impl ProxyMessageBuilder {
                 Ok(Some(StreamEvent::TextDelta {
                     content_index,
                     delta,
-                    partial: self.partial.clone(),
+                    partial: self.shared(),
                 }))
             }
             ProxyAssistantMessageEvent::TextEnd { content_index, content_signature } => {
                 let text = match self.partial.content.get_mut(content_index) {
                     Some(Content::Text { text, text_signature }) => {
                         *text_signature = content_signature;
-                        text.clone()
+                        text.to_string()
                     }
                     _ => return Err("Received text_end for non-text content".into()),
                 };
                 Ok(Some(StreamEvent::TextEnd {
                     content_index,
                     content: text,
-                    partial: self.partial.clone(),
+                    partial: self.shared(),
                 }))
             }
 
@@ -80,7 +102,7 @@ impl ProxyMessageBuilder {
                 self.set_content(content_index, Content::thinking(""));
                 Ok(Some(StreamEvent::ThinkingStart {
                     content_index,
-                    partial: self.partial.clone(),
+                    partial: self.shared(),
                 }))
             }
             ProxyAssistantMessageEvent::ThinkingDelta { content_index, delta } => {
@@ -91,21 +113,21 @@ impl ProxyMessageBuilder {
                 Ok(Some(StreamEvent::ThinkingDelta {
                     content_index,
                     delta,
-                    partial: self.partial.clone(),
+                    partial: self.shared(),
                 }))
             }
             ProxyAssistantMessageEvent::ThinkingEnd { content_index, content_signature } => {
                 let thinking = match self.partial.content.get_mut(content_index) {
                     Some(Content::Thinking { thinking, thinking_signature, .. }) => {
                         *thinking_signature = content_signature;
-                        thinking.clone()
+                        thinking.to_string()
                     }
                     _ => return Err("Received thinking_end for non-thinking content".into()),
                 };
                 Ok(Some(StreamEvent::ThinkingEnd {
                     content_index,
                     content: thinking,
-                    partial: self.partial.clone(),
+                    partial: self.shared(),
                 }))
             }
 
@@ -115,25 +137,27 @@ impl ProxyMessageBuilder {
                     Content::ToolCall(ToolCall {
                         id: ToolCallId::from(id),
                         name: tool_name,
-                        arguments: Map::new(),
+                        arguments: Map::new().into(),
                         thought_signature: None,
                     }),
                 );
-                self.tool_json.insert(content_index, String::new());
+                self.tool_json.insert(content_index, SharedStr::new());
                 Ok(Some(StreamEvent::ToolCallStart {
                     content_index,
-                    partial: self.partial.clone(),
+                    partial: self.shared(),
                 }))
             }
             ProxyAssistantMessageEvent::ToolCallDelta { content_index, delta } => {
                 let arguments = match self.partial.content.get(content_index) {
                     Some(Content::ToolCall(_)) => {
+                        // Pi re-parses `content.partialJson` on every delta
+                        // (`parseStreamingJson(content.partialJson) || {}`, proxy.ts:324). The
+                        // recovered value is identical; only the cost differs — the block is handed
+                        // a HANDLE on the buffer, so that parse runs only if something reads the
+                        // arguments (PERF-001).
                         let buf = self.tool_json.entry(content_index).or_default();
                         buf.push_str(&delta);
-                        // Re-parse the accumulated partial JSON on every delta, recovering as much of
-                        // the (possibly-truncated) object as possible — Pi
-                        // `parseStreamingJson(content.partialJson) || {}` (proxy.ts:324).
-                        parse_streaming_json_object(Some(buf.as_str()))
+                        LazyArgs::streaming(buf.clone())
                     }
                     _ => return Err("Received toolcall_delta for non-toolCall content".into()),
                 };
@@ -143,7 +167,7 @@ impl ProxyMessageBuilder {
                 Ok(Some(StreamEvent::ToolCallDelta {
                     content_index,
                     delta,
-                    partial: self.partial.clone(),
+                    partial: self.shared(),
                 }))
             }
             ProxyAssistantMessageEvent::ToolCallEnd { content_index } => {
@@ -155,7 +179,7 @@ impl ProxyMessageBuilder {
                         Ok(Some(StreamEvent::ToolCallEnd {
                             content_index,
                             tool_call,
-                            partial: self.partial.clone(),
+                            partial: self.shared(),
                         }))
                     }
                     // Pi returns `undefined` (no throw) for a non-toolCall slot (proxy.ts:347).
@@ -166,13 +190,13 @@ impl ProxyMessageBuilder {
             ProxyAssistantMessageEvent::Done { reason, usage } => {
                 self.partial.stop_reason = reason.into();
                 self.partial.usage = usage;
-                Ok(Some(StreamEvent::Done { reason, message: self.partial.clone() }))
+                Ok(Some(StreamEvent::Done { reason, message: self.shared() }))
             }
             ProxyAssistantMessageEvent::Error { reason, error_message, usage } => {
                 self.partial.stop_reason = reason.into();
                 self.partial.error_message = error_message;
                 self.partial.usage = usage;
-                Ok(Some(StreamEvent::Error { reason, error: self.partial.clone() }))
+                Ok(Some(StreamEvent::Error { reason, error: self.shared() }))
             }
         }
     }

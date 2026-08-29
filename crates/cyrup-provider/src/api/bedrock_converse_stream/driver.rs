@@ -61,7 +61,7 @@ pub(super) async fn run_inner(
     // `cacheRetention` + payload (pi `:228-241`).
     let cache_retention = resolve_cache_retention(opts.cache_retention, &env);
     let payload = build_params(model, ctx, opts, &bedrock, cache_retention, &env)
-        .map_err(|e| BedrockFailure::errored(dec.snapshot(model, api), format_bedrock_error(&e)))?;
+        .map_err(|e| BedrockFailure::errored(dec.snapshot_owned(model, api), format_bedrock_error(&e)))?;
 
     // `onPayload` may replace the whole command input, including `modelId` (pi `:242-245`).
     let payload = crate::stream::apply_on_payload(opts, model, payload).await;
@@ -76,7 +76,7 @@ pub(super) async fn run_inner(
     // pi `:224-227`: caller headers are injected at the Smithy `build` step, i.e. before signing.
     apply_custom_headers(&mut headers, opts.headers.as_ref(), model.headers.as_ref());
     authorize(&mut headers, &config, &url, &body_bytes).map_err(|e| {
-        BedrockFailure::errored(dec.snapshot(model, api), format_bedrock_error(&e))
+        BedrockFailure::errored(dec.snapshot_owned(model, api), format_bedrock_error(&e))
     })?;
 
     // pi resolves an HTTP(S) proxy per request (`:197-205`), and — only when there is no proxy —
@@ -94,7 +94,7 @@ pub(super) async fn run_inner(
     )
     .await
     .map_err(|e| {
-        BedrockFailure::errored(dec.snapshot(model, api), format_bedrock_error(&e.to_string()))
+        BedrockFailure::errored(dec.snapshot_owned(model, api), format_bedrock_error(&e.to_string()))
     })?;
 
     // PROV-043. pi builds `new BedrockRuntimeClient(config)` (`bedrock-converse-stream.ts:223`)
@@ -111,9 +111,9 @@ pub(super) async fn run_inner(
     };
     let max_retries = retry.max_retries;
     let mut retries_remaining = max_retries;
-    let aborted = |dec: &Decoder| {
+    let aborted = |dec: &mut Decoder| {
         Box::new(BedrockFailure {
-            partial: dec.snapshot(model, api),
+            partial: dec.snapshot_owned(model, api),
             stop_reason: StopReason::Aborted,
             message: "Request was aborted".to_string(),
             status: None,
@@ -135,16 +135,16 @@ pub(super) async fn run_inner(
         };
         // An abort is terminal and is never retried (Pi `provider-retry.ts:117`).
         if cancel.is_cancelled() {
-            return Err(aborted(&dec));
+            return Err(aborted(&mut dec));
         }
 
         let (retry_headers, message) = match attempt {
-            Err(ProviderError::Aborted) => return Err(aborted(&dec)),
+            Err(ProviderError::Aborted) => return Err(aborted(&mut dec)),
             // A transport failure carries no status: `error.status === undefined` ⇒ retryable.
             Err(transport) => {
                 if retries_remaining == 0 {
                     return Err(Box::new(BedrockFailure::errored(
-                        dec.snapshot(model, api),
+                        dec.snapshot_owned(model, api),
                         format_bedrock_error(&transport.to_string()),
                     )));
                 }
@@ -170,7 +170,7 @@ pub(super) async fn run_inner(
         let delay = retry_delay_ms(retry_headers.as_ref(), &message, retry_index, retry)
             .map_err(|e| {
                 BedrockFailure::errored(
-                    dec.snapshot(model, api),
+                    dec.snapshot_owned(model, api),
                     format_bedrock_error(&e.to_string()),
                 )
             })?;
@@ -180,7 +180,7 @@ pub(super) async fn run_inner(
             .await
             .is_none()
         {
-            return Err(aborted(&dec));
+            return Err(aborted(&mut dec));
         }
     };
 
@@ -225,7 +225,7 @@ pub(super) async fn run_inner(
         // carries the status and whose `.name` is the modeled shape (pi `:398-421` reads both).
         return Err(Box::new(
             BedrockFailure::service_exception(
-                dec.snapshot(model, api),
+                dec.snapshot_owned(model, api),
                 format_bedrock_service_error(name, status, &body),
                 status,
                 name,
@@ -247,7 +247,7 @@ pub(super) async fn run_inner(
         };
         let Some(chunk) = next else {
             return Err(Box::new(BedrockFailure {
-                partial: dec.snapshot(model, api),
+                partial: dec.snapshot_owned(model, api),
                 stop_reason: StopReason::Aborted,
                 message: "Request was aborted".to_string(),
                 status: None,
@@ -258,7 +258,7 @@ pub(super) async fn run_inner(
         let Some(chunk) = chunk else { break };
         let chunk = chunk.map_err(|e| {
             BedrockFailure::errored(
-                dec.snapshot(model, api),
+                dec.snapshot_owned(model, api),
                 format_bedrock_error(&format!("transport error: {e}")),
             )
             .with_request_id(response_request_id.as_deref())
@@ -266,7 +266,7 @@ pub(super) async fn run_inner(
         frames.push(&chunk);
         loop {
             let frame = frames.next_frame().map_err(|e| {
-                BedrockFailure::errored(dec.snapshot(model, api), format_bedrock_error(&e))
+                BedrockFailure::errored(dec.snapshot_owned(model, api), format_bedrock_error(&e))
                     .with_request_id(response_request_id.as_deref())
             })?;
             let Some(frame) = frame else { break };
@@ -278,7 +278,7 @@ pub(super) async fn run_inner(
                     // pi's `throw item.<x>Exception`: a bare object literal, so only the hoisted
                     // request id survives into the diagnostic (`:400-402`).
                     return Err(Box::new(
-                        BedrockFailure::errored(dec.snapshot(model, api), message)
+                        BedrockFailure::errored(dec.snapshot_owned(model, api), message)
                             .with_request_id(response_request_id.as_deref()),
                     ));
                 }
@@ -289,7 +289,7 @@ pub(super) async fn run_inner(
     // pi `:291-293`: an aborted signal after the loop is still terminal.
     if cancel.is_cancelled() {
         return Err(Box::new(BedrockFailure {
-            partial: dec.snapshot(model, api),
+            partial: dec.snapshot_owned(model, api),
             stop_reason: StopReason::Aborted,
             message: "Request was aborted".to_string(),
             status: None,
@@ -302,7 +302,7 @@ pub(super) async fn run_inner(
     // `error`/`aborted` stop reason throws with the recorded message. `end_of_stream` encodes both
     // (a `None` stop reason becomes the `error` terminal with the truncation text; a settled
     // `Error` routes to the same terminal carrying `error_message`).
-    let mut message = dec.snapshot(model, api);
+    let mut message = dec.snapshot_owned(model, api);
     if dec.stop_reason == Some(StopReason::Error) && dec.error_message.is_none() {
         message.error_message = Some("An unknown error occurred".to_string());
     }

@@ -162,7 +162,7 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
     // emits it on the stream's `Start` frame (`cyrup-agent/src/agent.rs:802-808`) and, failing that,
     // just before `MessageEnd` (`:848-852`), so it is never absent in production.
     app.ingest_event(&AgentSessionEvent::MessageStart {
-        message: AgentMessage::Assistant(partial.clone()),
+        message: AgentMessage::Assistant(std::sync::Arc::new(partial.clone())),
     });
     for delta in ["The ", "live ", "stream"] {
         app.ingest_event(&AgentSessionEvent::MessageUpdate {
@@ -170,7 +170,7 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
             assistant_message_event: Box::new(StreamEvent::TextDelta {
                 content_index: 0,
                 delta: delta.to_string(),
-                partial: partial.clone(),
+                partial: std::sync::Arc::new(partial.clone()),
             }),
         });
     }
@@ -194,7 +194,7 @@ fn streaming_text_deltas_render_in_viewport_via_events() {
     final_msg.content = vec![Content::text("The live stream is done")];
     final_msg.usage = Usage { total_tokens: 42, ..Usage::default() };
     app.ingest_event(&AgentSessionEvent::MessageEnd {
-        message: AgentMessage::Assistant(final_msg),
+        message: AgentMessage::Assistant(std::sync::Arc::new(final_msg)),
     });
     app.ingest_event(&AgentSessionEvent::AgentEnd { messages: vec![], will_retry: false });
     app.draw().unwrap();

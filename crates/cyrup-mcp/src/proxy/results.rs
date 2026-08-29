@@ -20,7 +20,10 @@ use crate::proxy::tool_metadata::ToolMetadata;
 // ==================================================================================================
 
 /// `{content: [{type:"text", text}], details}` — the envelope every mode returns.
-pub(crate) fn text_result(text: impl Into<String>, details: JsonMap<String, Value>) -> ToolResult {
+pub(crate) fn text_result(
+    text: impl Into<cyrup_core::SharedStr>,
+    details: JsonMap<String, Value>,
+) -> ToolResult {
     ToolResult {
         content: vec![Content::Text { text: text.into(), text_signature: None }],
         details: Some(Value::Object(details)),

@@ -486,7 +486,7 @@ async fn a_peers_intercom_list_renders_this_sessions_context_usage() {
             .content
             .iter()
             .map(|c| match c {
-                Content::Text { text, .. } => text.clone(),
+                Content::Text { text, .. } => text.to_string(),
                 _ => String::new(),
             })
             .collect();

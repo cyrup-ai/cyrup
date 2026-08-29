@@ -441,7 +441,7 @@ mod tests {
         assert_eq!(result.content.len(), 3);
         assert_eq!(result.content[1], image, "a non-text part is carried through untouched");
         let warning = match &result.content[2] {
-            cyrup_core::Content::Text { text, .. } => text.clone(),
+            cyrup_core::Content::Text { text, .. } => text.to_string(),
             other => panic!("{other:?}"),
         };
         assert!(warning.starts_with("Mission tracking unavailable after launch: "), "{warning}");

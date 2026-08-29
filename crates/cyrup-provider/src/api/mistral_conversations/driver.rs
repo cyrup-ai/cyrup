@@ -48,7 +48,7 @@ where
         }
         let Some(chunk) = parse_json_with_repair(data) else {
             emit_error(
-                &dec,
+                &mut dec,
                 model,
                 api,
                 sink,
@@ -75,23 +75,20 @@ where
         dec.stop_reason,
         Some(StopReason::Aborted) | Some(StopReason::Error)
     ) {
-        emit_error(
-            &dec,
-            model,
-            api,
-            sink,
-            dec.error_message
-                .clone()
-                .unwrap_or_else(|| "An unknown error occurred".to_string()),
-        )
-        .await;
+        // Lifted out first: `emit_error` takes `&mut dec` (its snapshot memoises), which cannot
+        // overlap a read of `dec.error_message` in the same call.
+        let message = dec
+            .error_message
+            .clone()
+            .unwrap_or_else(|| "An unknown error occurred".to_string());
+        emit_error(&mut dec, model, api, sink, message).await;
         return;
     }
 
     // No chunk carried a truthy `finishReason` → TRUNCATED. Pi throws
     // "Mistral stream ended without a finish reason" (mistral-conversations.ts:88-90).
     sink.send(StreamEvent::end_of_stream(
-        dec.snapshot(model, api),
+        dec.snapshot_owned(model, api),
         dec.stop_reason,
         "Mistral stream ended without a finish reason",
     ))

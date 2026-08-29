@@ -10,6 +10,7 @@
 //! Every pre-existing assertion looked at PARSED values, where a duplicate key is invisible. These
 //! assert on the RAW BYTES, which is the only place the bug is observable.
 
+use std::sync::Arc;
 use crate::AgentMessage;
 use cyrup_core::AssistantMessage;
 
@@ -25,7 +26,7 @@ fn assistant() -> AssistantMessage {
 
 #[test]
 fn an_assistant_message_emits_role_exactly_once() {
-    let raw = serde_json::to_string(&AgentMessage::Assistant(assistant())).unwrap();
+    let raw = serde_json::to_string(&AgentMessage::Assistant(Arc::new(assistant()))).unwrap();
     assert_eq!(
         raw.matches(r#""role""#).count(),
         1,
@@ -65,7 +66,7 @@ fn every_arm_still_round_trips() {
     // hand-written one so the three declaration-merged roles can share one `App` arm; the four
     // typed arms below are the check that it stayed byte-compatible with the derive.
     for msg in [
-        AgentMessage::Assistant(assistant()),
+        AgentMessage::Assistant(Arc::new(assistant())),
         AgentMessage::user_text("hello"),
         AgentMessage::Custom {
             kind: "note".into(),

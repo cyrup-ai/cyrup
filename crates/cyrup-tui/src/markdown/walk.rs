@@ -734,8 +734,8 @@ impl<'t> MdRenderer<'t> {
     ///
     /// Each row is themed per span class, `themedLines`/`styleSpan` (`mermaid.ts:38-57`): six
     /// classes, one [`Span`] per run. The classes are not reported by the engine — they are
-    /// inferred from the rendered geometry by [`mermaid::classify`], whose module doc names the
-    /// cases where that inference is wrong.
+    /// inferred from the rendered geometry by the private `mermaid::classify`, whose module doc
+    /// names the cases where that inference is wrong.
     fn emit_mermaid_block(&mut self, lang: &str, code: &str) {
         match mermaid::render_diagram(code, self.width, self.mermaid.is_streaming) {
             DiagramOutcome::Diagram(rows) => {

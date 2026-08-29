@@ -9,7 +9,7 @@ use crate::api::EventSink;
 use crate::model::Model;
 use crate::stream::StreamEvent;
 use crate::utils::json_parse::parse_streaming_json_object;
-use cyrup_core::{ApiId, ToolCall, ToolCallId};
+use cyrup_core::{ApiId, SharedStr, ToolCall, ToolCallId};
 use serde_json::Value;
 
 /// Dispatch one decoded event-stream frame (pi's `for await (const item of response.stream!)` body,
@@ -108,7 +108,7 @@ async fn handle_content_block_start(
     let Some(tool_use) = payload.get("start").and_then(|s| s.get("toolUse")) else {
         return true;
     };
-    dec.blocks.push(Block::Tool {
+    dec.push_block(Block::Tool {
         index,
         id: tool_use
             .get("toolUseId")
@@ -120,7 +120,7 @@ async fn handle_content_block_start(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string(),
-        partial_json: String::new(),
+        partial_json: SharedStr::new(),
     });
     let content_index = dec.blocks.len().saturating_sub(1);
     sink.send(StreamEvent::ToolCallStart {
@@ -150,9 +150,9 @@ async fn handle_content_block_delta(
             Some(p) => p,
             None => {
                 // pi `:486-493`: no `contentBlockStart` is sent for text blocks.
-                dec.blocks.push(Block::Text {
+                dec.push_block(Block::Text {
                     index,
-                    text: String::new(),
+                    text: SharedStr::new(),
                 });
                 let content_index = dec.blocks.len().saturating_sub(1);
                 if !sink
@@ -167,7 +167,7 @@ async fn handle_content_block_delta(
                 content_index
             }
         };
-        if let Some(Block::Text { text: buf, .. }) = dec.blocks.get_mut(position) {
+        if let Some(Block::Text { text: buf, .. }) = dec.block_mut(position) {
             buf.push_str(text);
         } else {
             return true;
@@ -190,8 +190,12 @@ async fn handle_content_block_delta(
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        match dec.blocks.get_mut(position) {
-            Some(Block::Tool { partial_json, .. }) => partial_json.push_str(&input),
+        match dec.block_mut(position) {
+            Some(Block::Tool { partial_json, .. }) => {
+                // O(delta): the append is amortised and no parse happens here at all — see
+                // [`SharedStr`] and [`LazyArgs`](cyrup_core::LazyArgs) (PERF-001).
+                partial_json.push_str(&input);
+            }
             // pi guards on `block?.type === "toolCall"`; any other block type is ignored.
             _ => return true,
         }
@@ -208,9 +212,9 @@ async fn handle_content_block_delta(
         let position = match position {
             Some(p) => p,
             None => {
-                dec.blocks.push(Block::Thinking {
+                dec.push_block(Block::Thinking {
                     index,
-                    thinking: String::new(),
+                    thinking: SharedStr::new(),
                     signature: String::new(),
                 });
                 let content_index = dec.blocks.len().saturating_sub(1);
@@ -233,7 +237,7 @@ async fn handle_content_block_delta(
         if let Some(text) = reasoning.get("text").and_then(Value::as_str)
             && !text.is_empty()
         {
-            if let Some(Block::Thinking { thinking, .. }) = dec.blocks.get_mut(position) {
+            if let Some(Block::Thinking { thinking, .. }) = dec.block_mut(position) {
                 thinking.push_str(text);
             }
             if !sink
@@ -250,7 +254,7 @@ async fn handle_content_block_delta(
         // pi `:524-527`: the signature accumulates silently — no event is emitted for it.
         if let Some(sig) = reasoning.get("signature").and_then(Value::as_str)
             && !sig.is_empty()
-            && let Some(Block::Thinking { signature, .. }) = dec.blocks.get_mut(position)
+            && let Some(Block::Thinking { signature, .. }) = dec.block_mut(position)
         {
             signature.push_str(sig);
         }
@@ -278,12 +282,12 @@ async fn handle_content_block_stop(
     let event = match dec.blocks.get(position) {
         Some(Block::Text { text, .. }) => StreamEvent::TextEnd {
             content_index: position,
-            content: text.clone(),
+            content: text.to_string(),
             partial: dec.snapshot(model, api),
         },
         Some(Block::Thinking { thinking, .. }) => StreamEvent::ThinkingEnd {
             content_index: position,
-            content: thinking.clone(),
+            content: thinking.to_string(),
             partial: dec.snapshot(model, api),
         },
         Some(Block::Tool {
@@ -296,7 +300,7 @@ async fn handle_content_block_stop(
             tool_call: ToolCall {
                 id: ToolCallId::from(id.as_str()),
                 name: name.clone(),
-                arguments: parse_streaming_json_object(Some(partial_json)),
+                arguments: parse_streaming_json_object(Some(partial_json)).into(),
                 thought_signature: None,
             },
             partial: dec.snapshot(model, api),

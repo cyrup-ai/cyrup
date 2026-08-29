@@ -428,7 +428,7 @@ impl<B: RebuildBackend> App<B> {
     }
 
     /// Everything [`Self::enter_fullscreen`] does after the renderer exists, shared with
-    /// [`Self::enter_fullscreen_captured`] so the two cannot diverge.
+    /// `enter_fullscreen_captured`, which exists only under `cfg(test)`, so the two cannot diverge.
     fn adopt_fullscreen_renderer(&mut self, mut alt: AltScreen<B>) {
         // §B-12, pi `:264-270` — immediately after entering, before the first frame: latch the
         // terminal's protocol and suppress the one (iterm2) whose placements the alternate screen

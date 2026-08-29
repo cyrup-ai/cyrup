@@ -579,7 +579,7 @@ mod tests {
             tool_call_id: cyrup_core::ToolCallId::from("call-1"),
             tool_name: "read".to_string(),
             content: vec![cyrup_core::Content::Text {
-                text: "file body".to_string(),
+                text: "file body".into(),
                 text_signature: None,
             }],
             details: None,
@@ -622,7 +622,7 @@ mod tests {
             tool_call_id: cyrup_core::ToolCallId::from("call-2"),
             tool_name: "bash".to_string(),
             content: vec![cyrup_core::Content::Text {
-                text: "command not found".to_string(),
+                text: "command not found".into(),
                 text_signature: None,
             }],
             details: None,

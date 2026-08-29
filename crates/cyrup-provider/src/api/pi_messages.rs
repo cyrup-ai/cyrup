@@ -53,12 +53,12 @@ use crate::error::ProviderError;
 use crate::model::Model;
 use crate::stream::sse::{SseFrame, SseRequest, build_client_for_target, open_sse};
 use crate::stream::{CacheRetention, StreamEvent, StreamOptions};
-use crate::utils::json_parse::parse_streaming_json_object;
 use crate::utils::provider_plumbing::{now_millis, provider_env_value};
 use crate::utils::provider_retry::ProviderRetry;
 use cyrup_core::{
     ApiId, AssistantMessage, AssistantMessageDiagnostic, CancelToken, Content, Cost,
-    DiagnosticCode, DiagnosticErrorInfo, StopReason, ToolCall, ToolCallId, Usage,
+    DiagnosticCode, DiagnosticErrorInfo, LazyArgs, SharedStr, StopReason, ToolCall, ToolCallId,
+    Usage,
 };
 use futures::{Stream, StreamExt};
 use serde_json::{Map, Value, json};
@@ -527,7 +527,10 @@ fn transport_error_event(model: &Model, api: &ApiId, e: &ProviderError) -> Strea
 struct Decoder {
     content: Vec<Content>,
     /// Accumulated tool-call JSON per content index (Pi `toolJson: Map<number, string>`).
-    tool_json: HashMap<usize, String>,
+    ///
+    /// Shared with every snapshot taken from it, so attaching the arguments to a block is a
+    /// refcount bump and the `Map` is recovered only if something reads it (PERF-001).
+    tool_json: HashMap<usize, SharedStr>,
     usage: Usage,
     response_id: Option<String>,
     diagnostics: Option<Vec<AssistantMessageDiagnostic>>,
@@ -549,12 +552,23 @@ impl Decoder {
         }
     }
 
-    /// Build the live `partial` snapshot (Pi's `partial` object itself, mutated in place).
+    /// The live `partial`, as a SHARED handle (PERF-001).
+    ///
+    /// Every non-terminal event carries this message and it is then cloned again by the
+    /// agent loop, by `MessageUpdate`, and once per live subscriber. Handing out an `Arc`
+    /// turns those into refcount bumps; the wire bytes are unchanged because serde's `rc`
+    /// feature serializes an `Arc<T>` transparently as `T`.
+    fn snapshot(&self, model: &Model, api: &ApiId) -> Arc<AssistantMessage> {
+        Arc::new(self.snapshot_owned(model, api))
+    }
+
+    /// The same message, owned, for the terminal paths that stamp a stop reason onto it
+    /// before handing it to [`StreamEvent::terminal`]/[`StreamEvent::end_of_stream`].
     ///
     /// `usage` is NOT cost-adjusted here: a pi-messages backend reports its own `usage.cost`
     /// on the terminal frame (`PiMessagesUsage = AssistantMessage["usage"]`, pi-messages.ts:38),
     /// and Pi assigns it wholesale rather than recomputing from `model.cost`.
-    fn snapshot(&self, model: &Model, api: &ApiId) -> AssistantMessage {
+    fn snapshot_owned(&self, model: &Model, api: &ApiId) -> AssistantMessage {
         AssistantMessage {
             content: self.content.clone(),
             provider: model.provider.clone(),
@@ -736,7 +750,7 @@ async fn process_event(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             dec.append_rewrite(event.get("rewrite"));
-            sink.send(StreamEvent::terminal(dec.snapshot(model, api)))
+            sink.send(StreamEvent::terminal(dec.snapshot_owned(model, api)))
                 .await;
             return Flow::Stop;
         }
@@ -754,7 +768,7 @@ async fn process_event(
                 .and_then(Value::as_str)
                 .map(str::to_string);
             dec.append_rewrite(event.get("rewrite"));
-            sink.send(StreamEvent::terminal(dec.snapshot(model, api)))
+            sink.send(StreamEvent::terminal(dec.snapshot_owned(model, api)))
                 .await;
             return Flow::Stop;
         }
@@ -827,7 +841,7 @@ async fn process_event(
                 .map(str::to_string);
             if let Some(slot) = dec.content.get_mut(index) {
                 *slot = Content::Text {
-                    text: content.clone(),
+                    text: SharedStr::from(&content),
                     text_signature: signature,
                 };
             }
@@ -875,7 +889,7 @@ async fn process_event(
                 .unwrap_or(false);
             if let Some(slot) = dec.content.get_mut(index) {
                 *slot = Content::Thinking {
-                    thinking: content.clone(),
+                    thinking: SharedStr::from(&content),
                     thinking_signature: signature,
                     redacted,
                 };
@@ -898,11 +912,11 @@ async fn process_event(
                 *slot = Content::ToolCall(ToolCall {
                     id: ToolCallId::from(id),
                     name,
-                    arguments: Map::new(),
+                    arguments: Map::new().into(),
                     thought_signature: None,
                 });
             }
-            dec.tool_json.insert(index, String::new());
+            dec.tool_json.insert(index, SharedStr::new());
             sink.send(StreamEvent::ToolCallStart {
                 content_index: index,
                 partial: dec.snapshot(model, api),
@@ -912,13 +926,16 @@ async fn process_event(
         "toolcall_delta" => {
             // Pi: `${toolJson.get(i) ?? ""}${event.delta}` re-parsed with `parseStreamingJson`
             // on EVERY delta, so `partial` always shows the best-effort arguments so far.
-            let json_text = {
-                let acc = dec.tool_json.entry(index).or_default();
-                acc.push_str(&delta);
-                acc.clone()
-            };
+            //
+            // PERF-001: the recovered value is identical, only the cost differs. The delta is
+            // appended to a buffer every snapshot shares, and the block is handed a HANDLE on it
+            // rather than a parse of it, so the whole-buffer parse Pi runs per delta happens only
+            // if something actually reads the arguments.
+            let acc = dec.tool_json.entry(index).or_default();
+            acc.push_str(&delta);
+            let arguments = LazyArgs::streaming(acc.clone());
             if let Some(Content::ToolCall(tc)) = dec.content.get_mut(index) {
-                tc.arguments = parse_streaming_json_object(Some(&json_text));
+                tc.arguments = arguments;
             }
             sink.send(StreamEvent::ToolCallDelta {
                 content_index: index,
@@ -963,7 +980,7 @@ fn merge_tool_call(tc: &mut ToolCall, raw: Option<&Value>) {
         tc.name = name.to_string();
     }
     if let Some(Value::Object(args)) = raw.get("arguments") {
-        tc.arguments = args.clone();
+        tc.arguments = args.clone().into();
     }
     if let Some(sig) = raw.get("thoughtSignature").and_then(Value::as_str) {
         tc.thought_signature = Some(sig.to_string());

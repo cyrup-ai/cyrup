@@ -75,7 +75,7 @@ fn assistant_tool(name: &str, path: &str) -> Message {
         content: vec![Content::ToolCall(ToolCall {
             id: ToolCallId::from(format!("tc-{name}-{path}")),
             name: name.to_string(),
-            arguments: json!({ "path": path }).as_object().cloned().expect("object"),
+            arguments: json!({ "path": path }).as_object().cloned().expect("object").into(),
             thought_signature: None,
         })],
         provider: "faux".into(),
@@ -200,7 +200,7 @@ fn first_text(m: &Message) -> String {
     blocks
         .iter()
         .find_map(|b| match b {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_default()

@@ -43,6 +43,9 @@ use std::sync::Arc;
 /// OpenAI-completions compatibility matrix (shared by every OpenAI-compatible provider).
 pub mod compat;
 
+/// Per-block memo shared by the streaming decoders (PERF-001).
+mod content_cache;
+
 /// Concrete wire-protocol implementations (one `ApiImpl` per submodule).
 pub mod anthropic_messages;
 pub mod azure_openai_responses;
@@ -227,7 +230,10 @@ mod tests {
                 cyrup_core::StopReason::Stop,
                 "",
             );
-            sink.send(StreamEvent::Start { partial }).await;
+            sink.send(StreamEvent::Start {
+                partial: std::sync::Arc::new(partial),
+            })
+            .await;
         }
     }
 

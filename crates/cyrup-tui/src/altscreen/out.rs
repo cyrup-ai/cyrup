@@ -29,8 +29,9 @@ use std::sync::{Arc, Mutex};
 /// Where this module tree's escape sequences go.
 ///
 /// See the module doc. `Clone` is by-handle, not by-content: cloning [`Out::Stdout`] opens another
-/// `io::stdout()` handle (they share one lock), and cloning [`Out::Capture`] shares the same
-/// buffer, so every guard in one renderer appends to a single ordered transcript.
+/// `io::stdout()` handle (they share one lock), and cloning `Out::Capture`, which exists only under
+/// `cfg(test)`, shares the same buffer, so every guard in one renderer appends to a single ordered
+/// transcript.
 pub(super) enum Out {
     /// The real terminal.
     Stdout(io::Stdout),

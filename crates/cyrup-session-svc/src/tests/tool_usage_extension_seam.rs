@@ -249,7 +249,7 @@ async fn a_patch_that_omits_usage_keeps_the_tools_value() {
     let (_seen, result) = run(&fx, Some(usage(11, 22)), Act::PatchContentOnly).await;
     assert_eq!(result.usage, Some(usage(11, 22)), "an omitted key keeps, never clears");
     let text = result.content.iter().find_map(|c| match c {
-        Content::Text { text, .. } => Some(text.clone()),
+        Content::Text { text, .. } => Some(text.to_string()),
         _ => None,
     });
     assert_eq!(text.as_deref(), Some("rewritten"), "the patch that WAS made still applied");

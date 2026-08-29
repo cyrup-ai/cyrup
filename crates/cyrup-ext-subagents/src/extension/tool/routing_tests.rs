@@ -143,7 +143,7 @@ async fn the_child_safe_registration_refuses_the_fleet_view_through_the_dispatch
         .content
         .iter()
         .find_map(|c| match c {
-            cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_default();
@@ -193,7 +193,7 @@ async fn tool_list_renders_the_proactive_skill_subagent_suggestions_end_to_end()
         .content
         .iter()
         .find_map(|c| match c {
-            cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_default();
@@ -238,7 +238,7 @@ async fn tool_execute_routes_each_mode_to_its_dispatch_arm() {
         .content
         .iter()
         .find_map(|c| match c {
-            cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_default();
@@ -798,7 +798,7 @@ async fn subagent_tool_cwd_param_is_resolved_and_threaded_into_dispatch() {
         .content
         .iter()
         .find_map(|c| match c {
-            cyrup_core::Content::Text { text, .. } => Some(text.clone()),
+            cyrup_core::Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_default();

@@ -664,13 +664,13 @@ fn assistant_turn_end(
     message.error_message = None;
     if !text.is_empty() {
         message.content = vec![cyrup_core::Content::Text {
-            text: text.to_string(),
+            text: text.into(),
             text_signature: None,
         }];
     }
     HostEvent::TurnEnd {
         turn_index: 1,
-        message: cyrup_agent::AgentMessage::Assistant(message),
+        message: cyrup_agent::AgentMessage::Assistant(std::sync::Arc::new(message)),
         tool_results,
     }
 }
@@ -680,7 +680,7 @@ fn tool_result(name: &str, text: &str, is_error: bool) -> cyrup_agent::ToolResul
         tool_call_id: cyrup_core::ToolCallId::from("call-1"),
         tool_name: name.to_string(),
         content: vec![cyrup_core::Content::Text {
-            text: text.to_string(),
+            text: text.into(),
             text_signature: None,
         }],
         details: None,

@@ -122,7 +122,7 @@ async fn read_tool_result(session: &AgentSession) -> (String, String) {
     let text = content
         .iter()
         .find_map(|c| match c {
-            Content::Text { text, .. } => Some(text.clone()),
+            Content::Text { text, .. } => Some(text.to_string()),
             _ => None,
         })
         .unwrap_or_else(|| panic!("`read` always emits its note text; got {content:#?}"));

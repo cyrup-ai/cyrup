@@ -197,7 +197,7 @@ pub fn build_assistant_message(resp: &FauxResponse) -> AssistantMessage {
         content.push(Content::ToolCall(ToolCall {
             id: ToolCallId::from(id),
             name: tc.name.clone(),
-            arguments,
+            arguments: arguments.into(),
             thought_signature: None,
         }));
     }

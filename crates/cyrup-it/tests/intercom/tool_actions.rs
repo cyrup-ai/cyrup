@@ -76,7 +76,7 @@ fn result_text(result: &ToolResult) -> String {
         .content
         .iter()
         .map(|c| match c {
-            Content::Text { text, .. } => text.clone(),
+            Content::Text { text, .. } => text.to_string(),
             _ => String::new(),
         })
         .collect::<Vec<_>>()

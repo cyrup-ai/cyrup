@@ -113,7 +113,7 @@ mod tests {
 
     fn text(t: &str) -> Content {
         Content::Text {
-            text: t.to_string(),
+            text: t.into(),
             text_signature: None,
         }
     }

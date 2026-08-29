@@ -738,7 +738,7 @@ impl<B: Backend> App<B> {
     }
 
     /// The `id` of the `/settings` row a confirmed submenu picker feeds back into, if any — the
-    /// row-to-submenu mapping of [`crate::app::settings_rows`] read backwards. `warnings` is
+    /// row-to-submenu mapping of [`fn@crate::app::settings_rows`] read backwards. `warnings` is
     /// deliberately absent: its submenu calls `done()` with no value upstream
     /// (`settings-selector.ts:560-569`), so the parent row keeps its literal `"configure"`.
     fn submenu_row_for(kind: SelectorKind) -> Option<&'static str> {

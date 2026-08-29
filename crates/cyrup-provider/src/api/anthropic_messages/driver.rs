@@ -32,11 +32,7 @@ pub(crate) async fn decode_stream<S>(
     let provider = model.provider.clone();
     let model_id = model.id.as_str().to_string();
 
-    let mut dec = Decoder {
-        is_oauth,
-        tool_names: tools.iter().map(|t| t.name.clone()).collect(),
-        ..Default::default()
-    };
+    let mut dec = Decoder::new(is_oauth, tools.iter().map(|t| t.name.clone()).collect());
     if !sink
         .send(StreamEvent::Start {
             partial: dec.snapshot(model, api),
@@ -62,7 +58,7 @@ pub(crate) async fn decode_stream<S>(
             } else {
                 frame.data.clone()
             };
-            emit_error(&dec, model, api, sink, msg).await;
+            emit_error(&mut dec, model, api, sink, msg).await;
             return;
         }
         if !is_message_event(&frame.event) {
@@ -74,7 +70,7 @@ pub(crate) async fn decode_stream<S>(
         }
         let Some(event) = parse_json_with_repair(data) else {
             emit_error(
-                &dec,
+                &mut dec,
                 model,
                 api,
                 sink,
@@ -87,16 +83,13 @@ pub(crate) async fn decode_stream<S>(
             return; // consumer dropped
         }
         if dec.stop_reason == Some(StopReason::Error) {
-            emit_error(
-                &dec,
-                model,
-                api,
-                sink,
-                dec.error_message
-                    .clone()
-                    .unwrap_or_else(|| "An unknown error occurred".to_string()),
-            )
-            .await;
+            // The message is lifted out first: `emit_error` now takes `&mut dec` (its snapshot
+            // memoises), which cannot overlap a read of `dec.error_message` in the same call.
+            let message = dec
+                .error_message
+                .clone()
+                .unwrap_or_else(|| "An unknown error occurred".to_string());
+            emit_error(&mut dec, model, api, sink, message).await;
             return;
         }
     }
@@ -105,7 +98,7 @@ pub(crate) async fn decode_stream<S>(
     // anthropic-messages.ts:463-465).
     if dec.saw_message_start && !dec.saw_message_stop {
         emit_error(
-            &dec,
+            &mut dec,
             model,
             api,
             sink,
@@ -121,7 +114,7 @@ pub(crate) async fn decode_stream<S>(
     // `end_of_stream` turns it into the same `error` terminal Pi's throw produces
     // (anthropic-messages.ts:751-753) instead of the clean `stop` this used to default to.
     sink.send(StreamEvent::end_of_stream(
-        dec.snapshot(model, api),
+        dec.snapshot_owned(model, api),
         dec.stop_reason,
         "Anthropic stream ended without a stop reason",
     ))

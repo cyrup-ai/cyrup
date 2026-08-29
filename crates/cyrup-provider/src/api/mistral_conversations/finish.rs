@@ -86,8 +86,14 @@ pub(super) fn map_chat_stop_reason(reason: Option<&str>) -> (StopReason, Option<
 
 /// Emit a terminal error event carrying the partial snapshot (Pi catch block,
 /// mistral-conversations.ts:92-101).
-pub(super) async fn emit_error(dec: &Decoder, model: &Model, api: &ApiId, sink: &EventSink, message: String) {
-    let mut msg = dec.snapshot(model, api);
+pub(super) async fn emit_error(
+    dec: &mut Decoder,
+    model: &Model,
+    api: &ApiId,
+    sink: &EventSink,
+    message: String,
+) {
+    let mut msg = dec.snapshot_owned(model, api);
     msg.stop_reason = StopReason::Error;
     msg.error_message = Some(message);
     sink.send(StreamEvent::terminal(msg)).await;

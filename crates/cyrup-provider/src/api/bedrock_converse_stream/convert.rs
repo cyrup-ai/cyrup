@@ -184,7 +184,7 @@ pub(super) fn convert_messages(
                                 "toolUse": {
                                     "toolUseId": tc.id.as_str(),
                                     "name": tc.name,
-                                    "input": Value::Object(tc.arguments.clone()),
+                                    "input": Value::Object((*tc.arguments).clone()),
                                 }
                             }));
                         }

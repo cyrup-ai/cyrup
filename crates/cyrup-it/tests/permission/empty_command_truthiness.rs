@@ -117,7 +117,7 @@ async fn denied_reasons_for(
                 content
                     .iter()
                     .filter_map(|c| match c {
-                        Content::Text { text, .. } => Some(text.clone()),
+                        Content::Text { text, .. } => Some(text.to_string()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()

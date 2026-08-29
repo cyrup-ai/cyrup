@@ -59,7 +59,7 @@ pub(super) fn to_chat_messages(messages: &[Message], supports_images: bool) -> V
                             }
                         }
                         Content::ToolCall(tc) => {
-                            let args = serde_json::to_string(&Value::Object(tc.arguments.clone()))
+                            let args = serde_json::to_string(&tc.arguments)
                                 .unwrap_or_else(|_| "{}".to_string());
                             tool_calls.push(json!({
                                 "id": tc.id.as_str(),
