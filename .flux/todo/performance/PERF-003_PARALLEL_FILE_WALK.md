@@ -1,7 +1,7 @@
 ---
 stage: aug
-status: in-progress
-updated: 2026-08-29 04:16
+status: done
+updated: 2026-08-29 04:22
 ---
 
 # Parallelise the file walk in `grep` and `find`
@@ -31,6 +31,16 @@ the vendored source at `~/.cargo/registry/src/*/ignore-0.4.26/src/walk.rs`:
 | `walk.rs:1057-1059` | serial root exemption: `skip_entry` returns `Ok(false)` at `ent.depth() == 0` |
 | `walk.rs:1355-1400` | parallel root exemption, structurally: roots are pushed onto the stack in `visit()` before any filter runs |
 | `walk.rs:616,640,1423` | `self.filter` is cloned into `Walk` *and* into `WalkParallel` — one registration covers both |
+
+> **Read the RIGHT vendored copy — versions are pinned and this is a live trap.** `Cargo.lock`
+> resolves **`ignore 0.4.26`** and **`grep-searcher 0.1.16`** — the exact versions every citation in
+> this file names. But the registry ALSO holds `ignore-0.4.33` and `grep-searcher-0.1.17` (present,
+> unused), and `fs.rs`'s own comments inconsistently cite `0.4.33` for a few `walk.rs`/`dir.rs`
+> lines — those numbers do **not** line up with the resolved crate. Verify against
+> `~/.cargo/registry/src/*/ignore-0.4.26/`, never `0.4.33`, or you will read shifted lines and
+> "disprove" a citation that is correct. Every `ignore 0.4.26` and `grep-searcher 0.1.16` line
+> number below was re-checked against the resolved copies at HEAD `8f49433` on 2026-08-29 and is
+> exact.
 
 **Consequence:** ONE predicate, registered once on the builder, gives byte-identical prune
 semantics on the serial and the parallel walker. There is no `WalkState::Skip` in this task, no
@@ -103,8 +113,9 @@ fields, which would drift the first time a knob is added.
 
 ### Also worth knowing before you start
 
-- `grep_searcher::Searcher` holds three `RefCell`s (`grep-searcher-0.1.16 searcher/mod.rs:597-620`)
-  ⇒ `Send`, `!Sync`. One searcher per in-flight file. This is **already** what the code does —
+- `grep_searcher::Searcher` holds three `RefCell`s (`grep-searcher-0.1.16 searcher/mod.rs:597-624`
+  — `decode_buffer`, `line_buffer`, `multi_line_buffer`) ⇒ `Send`, `!Sync`. One searcher per
+  in-flight file. This is **already** what the code does —
   it is built inside the per-file `spawn_blocking`
   ([`grep.rs:301-334`](../../../crates/cyrup-tools/src/tools/grep.rs)) — so the brief's
   "build one per walker thread" is a no-op. Searcher *construction* is not the bottleneck; the
@@ -116,16 +127,21 @@ fields, which would drift the first time a knob is added.
 - `Sender::blocking_send` from the walker threads is legal: those threads are created by
   `std::thread::scope` inside the existing `spawn_blocking` and carry no tokio runtime context.
   It returns `Err` — it does not hang — once the receiver is dropped.
-- `ignore::DirEntry::is_dir` is **private**; use `e.file_type().is_some_and(|t| t.is_dir())`,
-  which is already the idiom at [`fs.rs:465-467`](../../../crates/cyrup-tools/src/ops/local/fs.rs).
+- `ignore::DirEntry::is_dir` is **private** (`pub(crate) fn is_dir`, ignore 0.4.26 `walk.rs:102`),
+  so read the type through `e.file_type()`. The existing per-entry code does exactly this at
+  [`fs.rs:465-467`](../../../crates/cyrup-tools/src/ops/local/fs.rs) as
+  `ty.map(|t| t.is_dir()).unwrap_or(false)`; the §4a `filter_entry` sample below writes the
+  equivalent `e.file_type().is_some_and(|t| t.is_dir())`. Both are clippy-clean — `is_some_and`
+  currently appears nowhere in the crate, so this introduces it; either form is fine, just match
+  the sample within one closure.
 
 ---
 
-## 2. Where it is (line numbers verified at HEAD)
+## 2. Where it is (line numbers re-verified at HEAD `8f49433`, 2026-08-29)
 
 | site | what |
 | --- | --- |
-| [`ops/local/fs.rs:288-481`](../../../crates/cyrup-tools/src/ops/local/fs.rs) | `fn walk` — the single implementation. `spawn_blocking` + `mpsc::channel(256)` at `:289`, builder knobs `:297-435`, `let walker = builder.build()` at **`:437`**, yield loop `:452-479` |
+| [`ops/local/fs.rs:288-481`](../../../crates/cyrup-tools/src/ops/local/fs.rs) | `fn walk` — the single implementation. `mpsc::channel(256)` at `:289` + `spawn_blocking` at `:291`, builder knobs `:297-435`, `let walker = builder.build()` at **`:437`**, yield loop `:452-479` |
 | [`ops/mod.rs:314-352`](../../../crates/cyrup-tools/src/ops/mod.rs) | `WalkOpts` |
 | [`ops/mod.rs:501`](../../../crates/cyrup-tools/src/ops/mod.rs) | the trait declaration |
 | [`tools/grep.rs:761`](../../../crates/cyrup-tools/src/tools/grep.rs) | `let mut pruned: Vec<PathBuf>` — the post-hoc filter to delete |
@@ -135,7 +151,7 @@ fields, which would drift the first time a knob is added.
 | [`tools/find.rs:186-273`](../../../crates/cyrup-tools/src/tools/find.rs) | `find`'s walk loop; its cap breaks at `:192`, `biased;` at `:210` |
 | [`tools/find.rs:274-303`](../../../crates/cyrup-tools/src/tools/find.rs) | fd's buffered sort — the ordering precedent this task follows |
 | [`isolation/protected.rs:150`](../../../crates/cyrup-tools/src/isolation/protected.rs), [`isolation/traversal.rs:133`](../../../crates/cyrup-tools/src/isolation/traversal.rs) | delegating wrappers — unchanged; they forward `WalkOpts` by move |
-| `grep.rs:1100`, `grep.rs:1612`, `tests/*.rs` | mock `FsOps` impls — unaffected, `WalkOpts` gains a field with a `Default` |
+| `grep.rs:1080` (`FailSecondRead`), `grep.rs:1593` (`RecordingFs`), `tests/*.rs` | mock `FsOps` impls — unaffected, `WalkOpts` gains a field with a `Default` |
 
 The walk is already off the reactor (`spawn_blocking`) and already back-pressured
 (`mpsc::channel(256)`). **The async plumbing is fine.** Only the walker's own concurrency and the
@@ -143,16 +159,19 @@ consumer's one-file-at-a-time search are missing.
 
 ## 3. The measurement
 
-`rg` on this repo (`crates/`, 1690 files, ~250k LOC), warm page cache, 8 cores — re-measured
-today, matching the brief:
+`rg` on this repo (`crates/`, 1691 files, ~250k LOC of code under ~700k total lines — cyrup's doc
+comments are large), warm page cache, 8 cores — re-measured 2026-08-29 (`rg 15.1.0`, median of 5,
+`rg "fn " crates`):
 
 | | wall |
 | --- | --- |
-| `rg --threads 1` (cyrup's shape) | **31 ms** |
-| `rg --threads 8` (pi's shape) | **14 ms** |
+| `rg --threads 1` (cyrup's shape) | **~41 ms** |
+| `rg --threads 8` (pi's shape) | **~18 ms** |
 
-**~2.2× floor** on a small warm tree; wider cold, and wider again on a real monorepo, because
-`rg -j1` still overlaps its own walk and search where cyrup's fused loop does not.
+**~2.2–2.3× floor** on a small warm tree — the RATIO is the load-bearing claim and it reproduces
+across sessions even as the absolutes drift with machine load (the brief's earlier 31/14 ms run
+gave the same ~2.2×); wider cold, and wider again on a real monorepo, because `rg -j1` still
+overlaps its own walk and search where cyrup's fused loop does not.
 
 ---
 

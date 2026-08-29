@@ -1,8 +1,8 @@
 ---
 stage: aug
-status: in-progress
-updated: 2026-08-29 05:10
-aug_against: cyrup HEAD 8f49433 · pi v0.84.1 (`packages/tui/src/tui.ts`) · numbers measured on this host, `--release`
+status: done
+updated: 2026-08-29 05:34
+aug_against: cyrup HEAD 8f49433 · pi v0.84.1 (`packages/tui/src/tui.ts`) · all numbers re-measured on this host, `--release`
 ---
 
 # Move rendering off the event-fold task
@@ -16,127 +16,247 @@ aug_against: cyrup HEAD 8f49433 · pi v0.84.1 (`packages/tui/src/tui.ts`) · num
 > > transcripts do — the input arm is never reached again and **the keyboard dies while the
 > > screen keeps animating**
 >
-> **[AUG] That sentence is now measured, not projected.** One inline frame costs
-> **11.5 ms at a 2,000-row active turn, 46.6 ms at 8,000 and 92.1 ms at 16,000** — the 80 ms
-> tick is crossed at ~14,000 rows and the 16.7 ms 60 Hz budget at ~2,900. The cost is
-> **linear in active-turn size on every frame, cache hit included**, and §0.2 shows it is
-> almost entirely *redundant work*. Fixing that (§3.0) makes a frame **flat at ~190 µs** —
-> constant in turn size, a **122× reduction** at 16k rows — and it touches no terminal
-> ownership at all.
+> **[AUG-2] That sentence is measured, and the cliff is 28× closer than the last round of
+> research thought.** It is not reached at ~14,000 rows of prose. It is reached at
+> **~500 lines of code in the active turn**, because a streaming turn re-runs
+> `syntect` over its *entire* code content on *every single frame* — 174 µs per code line,
+> 86 ms at 500 lines, 109% of the spinner tick. §3.0 does not touch that term at all.
+> The required fix set is now **§3.0b first** (resumable highlighter, 300×), then §3.0
+> (wrapped-row cache, removes two full O(n) passes worth ~180 ms at 16k rows), then §3.1.
 
 ---
 
-## 0. READ THIS FIRST — three things, and the last two change the plan
+## 0. READ THIS FIRST
+
+Six findings. §0.1 is inherited. **§0.3, §0.4 and §0.5 are new this round and they move the
+work.**
 
 ### 0.1 Do not re-do TUI-092
 
 **[`docs/gap-analysis/bugs/TUI-092-progressive-lockup.md`](../../../docs/gap-analysis/bugs/TUI-092-progressive-lockup.md)
-is required reading before touching this.** All eight of its fixes have landed. Every one of
-the obvious "make the TUI faster" moves is already made, and re-doing any of them is wasted
-work:
+is required reading before touching this.** All eight of its fixes have landed. Every
+obvious "make the TUI faster" move is already made:
 
 | | already landed | do not redo |
 | --- | --- | --- |
 | F1 | scrollback accumulator gated out of production builds | — |
-| F2 | `RenderCache` keyed `(generation, width, theme.generation)` — no triple materialisation per frame | the render cache exists |
-| F3 | drain-then-draw on the `events`/`input`/`bash_next` arms — N deltas cost N folds and **one** frame | the coalescing exists |
+| F2 | `RenderCache` keyed `(generation, width, theme.generation)` | the render cache exists |
+| F3 | drain-then-draw on the `events`/`input`/`bash_next` arms | the coalescing exists |
 | F4 | `context_usage` reverse scan, zero message clones | — |
 | F5 | ratatui `scrolling-regions` on by default | — |
 | F6 | `BashExecution::output_lines` bounded at 2000 | — |
 | F7 | image protocol memoised per frame | — |
 | F8 | by-value event ingest, payloads moved not cloned | — |
 
-**What TUI-092 did was reduce frame cost and frame count. What it did not do is remove the
-coupling.** Draw still happens inline on the task that folds events
-([`run_action.rs:339`](../../../crates/cyrup-tui/src/app/run_action.rs)), so the starvation
-mode is mitigated, not eliminated.
+**TUI-092 reduced frame cost and frame count. It did not remove the coupling.** Draw still
+happens inline on the task that folds events
+([`run_action.rs:339`](../../../crates/cyrup-tui/src/app/run_action.rs)).
 
-Also from that doc's §8: **the original defect has not been re-observed since round 2
-landed, and nobody has confirmed the fix live** — the workspace's standing rule is that a
-TUI claim is not settled by `TestBackend`.
+### 0.2 A cache HIT is O(active turn) — F2's own definition of done is false
 
-### 0.2 [AUG] F2's own definition of done is FALSE — a frame is O(active turn), even on a cache hit
-
-TUI-092 §7 property 2 claims *"a frame with unchanged state is O(changed chrome)"* and
-offers `cached_render`'s key check as *"the whole proof"*. It is not. The cache memoises the
-**markdown + syntect materialisation**; it memoises nothing downstream of it, and
-[`TranscriptView::render`](../../../crates/cyrup-tui/src/transcript/cache.rs) pays three
-costs on **every** frame, hit or miss:
+TUI-092 §7 property 2 claims *"a frame with unchanged state is O(changed chrome)"*, offering
+`cached_render`'s key check as *"the whole proof"*. The cache memoises the markdown + syntect
+materialisation; it memoises nothing downstream of it, and
+[`TranscriptView::render`](../../../crates/cyrup-tui/src/transcript/cache.rs) pays three costs
+on **every** frame, hit or miss — verified verbatim at `cache.rs:228-244`:
 
 ```rust
-// crates/cyrup-tui/src/transcript/cache.rs:228-244
 fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
     let width = area.width as usize;
     let (total, lines) = {
         let cache = self.cached_render(width, theme);
         (cache.lines.len(), cache.lines.clone())      // (1) DEEP clone of every line + span
     };
-    …
+    let inner_h = area.height as usize;
+    let max_scroll = total.saturating_sub(inner_h);
+    self.scroll_offset = self.scroll_offset.min(max_scroll);
+    let scroll = max_scroll.saturating_sub(self.scroll_offset).min(u16::MAX as usize) as u16;
     let para = Paragraph::new(lines)
         .style(theme.base_style())
         .wrap(Wrap { trim: false })                   // (2) re-wraps the WHOLE turn …
         .scroll((scroll, 0));                         // (3) … to paint ≤ area.height rows
     frame.render_widget(para, area);
+    crate::osc::inject(frame.buffer_mut(), &self.render_cache.links);
+}
 ```
 
-1. **`cache.lines.clone()` is a deep copy.** `Line<'static>` owns `Vec<Span<'static>>` and
-   every `Span` holds a `Cow::Owned(String)` — markdown and syntect both emit owned
-   strings — so this allocates once per span and memcpys every byte, per frame.
+1. **`cache.lines.clone()` is a deep copy.** `Line<'static>` owns `Vec<Span<'static>>`, each
+   `Span` a `Cow::Owned(String)`; one allocation per span, every byte memcpy'd, per frame.
 2. **`.wrap(Wrap { trim: false })` re-wraps content that is already wrapped.**
    [`MdRenderer::finish`](../../../crates/cyrup-tui/src/markdown/walk.rs) ends the token walk
-   with a full second pass — `self.out.into_iter().flat_map(|l| wrap_line(&l, width))` at
-   `walk.rs:834-838` — and the module doc states the consequence outright
-   ([`markdown/mod.rs:98-101`](../../../crates/cyrup-tui/src/markdown/mod.rs)):
-   *"Rows come back already wrapped to `width` … nothing downstream needs to reflow them, and
-   reflowing them at a wider width is exactly the L2/M10 bug."* The comment in
-   `cached_render` that justifies the second wrap — *"`markdown::render` emits ONE un-wrapped
+   with `self.out.into_iter().flat_map(|l| wrap_line(&l, width))` at `walk.rs:834-838`, and
+   [`markdown/mod.rs:98-101`](../../../crates/cyrup-tui/src/markdown/mod.rs) states the
+   consequence: *"Rows come back already wrapped to `width` … nothing downstream needs to
+   reflow them, and reflowing them at a wider width is exactly the L2/M10 bug."* The comment
+   in `cached_render` justifying the second wrap — *"`markdown::render` emits ONE un-wrapped
    `Line` per prose paragraph"* — is **stale**; it describes a renderer that no longer exists.
-3. **Nothing is windowed.** The entire `Vec<Line>` is handed to `Paragraph`, which wraps all
-   of it and then discards everything above `scroll`.
+3. **Nothing is windowed.** The entire `Vec<Line>` goes to `Paragraph`, which wraps all of it
+   and discards everything above `scroll`.
 
-Measured on this host, `--release`, painting a 100 × 30 area (§6 reproduces it):
+Measured, `--release`, 100 × 30 area — [`tmp/perf005-probe`](../../../tmp/perf005-probe),
+reproduced this round:
 
 | active-turn rows | A: today | B: drop the deep clone | C: + drop the re-wrap | D: + window the paint |
 | --- | --- | --- | --- | --- |
-| 20 | **183 µs** | 177 µs | 145 µs | **141 µs** |
-| 200 | **1 167 µs** | 1 160 µs | 197 µs | **189 µs** |
-| 1 000 | **5 704 µs** | 5 636 µs | 337 µs | **189 µs** |
-| 2 000 | **11 472 µs** | 11 293 µs | 545 µs | **194 µs** |
-| 4 000 | **22 862 µs** | 22 344 µs | 991 µs | **193 µs** |
-| 8 000 | **46 644 µs** | 44 503 µs | 1 895 µs | **190 µs** |
-| 16 000 | **92 139 µs** | 88 409 µs | 4 535 µs | **188 µs** |
+| 20 | **167 µs** | 160 µs | 137 µs | **137 µs** |
+| 200 | **1 169 µs** | 1 098 µs | 203 µs | **198 µs** |
+| 1 000 | **5 790 µs** | 5 346 µs | 341 µs | **194 µs** |
+| 2 000 | **11 424 µs** | 10 507 µs | 535 µs | **193 µs** |
+| 4 000 | **23 183 µs** | 21 227 µs | 953 µs | **193 µs** |
+| 8 000 | **45 989 µs** | 42 317 µs | 1 869 µs | **195 µs** |
+| 16 000 | **90 982 µs** | 83 565 µs | 4 436 µs | **194 µs** |
 
-Read the table in this order, because the ranking is counter-intuitive:
+* **The deep clone is not the problem** (A→B ≈ 4–8%), even though in isolation it costs
+  12.1 ms at 16k rows. It is dwarfed by what follows it.
+* **The redundant re-wrap is ~95% of the frame** (B→C is 19× at 16k). ratatui's `WordWrapper`
+  walks every line before honouring `.scroll()`.
+* **Windowing removes the last O(n)** (C→D): **flat at ~194 µs**, independent of turn size.
+  That floor is `Buffer::reset()` over 3,000 cells plus the blit.
 
-* **The deep clone is NOT the problem** (A→B is ~4%), even though in isolation it costs
-  2.5 ms at 4k rows and 12.1 ms at 16k. It is dwarfed by the thing after it.
-* **The redundant re-wrap is 95% of the frame** (B→C is 20× at 16k rows). ratatui's
-  `WordWrapper` walks every line before honouring `.scroll()`, so the app re-flows the whole
-  turn to paint thirty rows — work whose *only* output is the rows it then throws away.
-* **Windowing removes the last O(n)** (C→D): the frame becomes **flat at ~190 µs**,
-  independent of turn size. That ~190 µs is `Buffer::reset()` over 3,000 cells plus the blit;
-  it is the floor, not the content.
+### 0.3 [AUG-2] But the cache is MISSED on every streaming frame — §0.2 priced the wrong path
 
-**This is the crux of the whole task.** The in-code warning at `run.rs:293-301` is real
-*because* frame cost grows with the turn. Remove the growth and the cliff is no longer
-reachable by a transcript getting longer — which is the only mechanism anyone has proposed
-for it. §3.0 is therefore not a preliminary; it is the fix with the evidence behind it, and
-the thread in §3.3 is what is left over afterwards.
+`push_assistant_delta` bumps the render generation
+([`transcript/stream.rs:55-56`](../../../crates/cyrup-tui/src/transcript/stream.rs)):
 
-**The same three costs exist on the commit path** and should be fixed in the same change:
-[`flush_committed`](../../../crates/cyrup-tui/src/app/draw.rs) at `draw.rs:248-292` builds
-`lines`, calls `wrapped_height(&lines, width)` — which does `lines.to_vec()`, a second deep
-clone, then a full `Paragraph::line_count` wrap
-([`transcript/layout.rs:384-391`](../../../crates/cyrup-tui/src/transcript/layout.rs)) — and
-then wraps a *third* time inside `insert_before`'s `Paragraph::new(lines).wrap(…)`.
+```rust
+    pub fn push_assistant_delta(&mut self, delta: &str) {
+        self.bump_render_generation();
+```
 
-### 0.3 [AUG] §2's premise is half wrong: pi DOES decouple render from fold
+There are **39 `bump_render_generation()` call sites** and the streaming delta is one of them.
+So **during a streaming turn every frame is a cache miss.** `RenderCache` earns its keep only
+on content-quiet repaints (a spinner tick while a tool runs, a keystroke that changes no
+content). §0.2's table measures everything *downstream* of `cached_render` — the hit portion.
+A streaming frame pays that **plus the whole miss path on top.**
 
-pi has a **frame scheduler with a hard frame-rate cap**, and cyrup ported none of it. This is
-unported behaviour, not a language difference:
+The miss path has two O(n) terms the previous round never priced:
+
+**(i) `wrapped_height` is a second full wrap, not "a second deep clone".**
+[`layout.rs:384-391`](../../../crates/cyrup-tui/src/transcript/layout.rs):
+
+```rust
+pub(crate) fn wrapped_height(lines: &[Line<'static>], width: usize) -> usize {
+    if width == 0 { return lines.len(); }
+    Paragraph::new(lines.to_vec())            // deep clone of the whole turn
+        .wrap(Wrap { trim: false })
+        .line_count(width.min(u16::MAX as usize) as u16)   // …then wrap all of it, to count
+}
+```
+
+It runs inside `cached_render` on **every miss** (`cache.rs:42`). Measured — column E,
+[`tmp/perf005-miss`](../../../tmp/perf005-miss):
+
+| active-turn rows | E: `wrapped_height` per miss | F: `flat_map(wrap_line)` (§3.0 as drafted) | G: move-based (§3.0 done right) |
+| --- | --- | --- | --- |
+| 200 | **1 048 µs** | 84 µs | **51 µs** |
+| 1 000 | **5 434 µs** | 404 µs | **259 µs** |
+| 2 000 | **10 951 µs** | 803 µs | **506 µs** |
+| 4 000 | **22 106 µs** | 1 684 µs | **1 048 µs** |
+| 8 000 | **44 439 µs** | 3 473 µs | **2 039 µs** |
+| 16 000 | **88 158 µs** | 7 614 µs | **4 494 µs** |
+
+`wrapped_height` alone costs **88 ms at 16k rows** — the same order as the entire hit-path
+frame. The true frame today at 16k rows is therefore ≈ **88 ms (wrapped_height) + 91 ms
+(clone + re-wrap + blit) ≈ 180 ms**, before markdown. §3.0 deletes both, because `rows.len()`
+*is* the wrapped height.
+
+**(ii) `flat_map(wrap_line)` as §3.0 currently drafts it is a pessimization.**
+`wrap_line`'s early return is a **deep clone**
+([`layout.rs:51-55`](../../../crates/cyrup-tui/src/transcript/layout.rs)):
+
+```rust
+pub(crate) fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    if line.width() <= width {
+        return vec![line.clone()];        // ← every already-fitting row is CLONED
+    }
+```
+
+Nearly every row already fits, so the naive `flat_map` clones the whole vector for nothing:
+column F, 7.6 ms at 16k rows against 4.5 ms for the move-based form (column G). §3.0 must use
+the move-based helper.
+
+### 0.4 [AUG-2] THE CLIFF IS SYNTAX HIGHLIGHTING, AND §3.0 DOES NOT TOUCH IT
+
+The third miss-path term is `lines_with()` itself — a full re-render of the turn's markdown
+through `pulldown-cmark` **and `syntect`**. There is no memoisation of results anywhere in
+[`markdown/`](../../../crates/cyrup-tui/src/markdown/); the only cache is a
+`OnceLock<SyntaxSet>` holding the *grammars*
+([`highlight.rs:4-7`](../../../crates/cyrup-tui/src/markdown/highlight.rs)).
+[`highlight_inner`](../../../crates/cyrup-tui/src/markdown/highlight.rs) at `highlight.rs:73-102`
+builds a **fresh `ParseState` and re-parses every line of every code block, per frame**:
+
+```rust
+fn highlight_inner(code: &str, syntax: &SyntaxReference, ss: &SyntaxSet, theme: &UiTheme)
+    -> Option<Vec<Line<'static>>> {
+    let mut parse = ParseState::new(syntax);          // ← discarded and rebuilt EVERY frame
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for raw in code.split('\n') {                     // ← the WHOLE block, every frame
+        let line_nl = format!("{raw}\n");
+        let ops = parse.parse_line(&line_nl, ss).ok()?;
+        …
+```
+
+Measured with that function reproduced verbatim —
+[`tmp/perf005-hl`](../../../tmp/perf005-hl), `--release`:
+
+| code lines in the active turn | `highlight_inner` per frame | µs / code line | vs 16.7 ms (60 Hz) | vs 80 ms spinner tick |
+| --- | --- | --- | --- | --- |
+| 10 | 1.84 ms | 184 µs | 11% | 2% |
+| 50 | 8.52 ms | 170 µs | 51% | 11% |
+| 100 | **17.44 ms** | 174 µs | **104%** | 22% |
+| 250 | **43.39 ms** | 174 µs | 260% | 54% |
+| 500 | **87.10 ms** | 174 µs | 522% | **109%** |
+| 1 000 | **171.88 ms** | 172 µs | 1 029% | 215% |
+| 2 000 | **343.04 ms** | 172 µs | 2 054% | 429% |
+
+**Read those two right-hand columns.** The 60 Hz budget is blown by **100 lines of code** in
+the turn. The 80 ms spinner tick — the documented starvation threshold at `run.rs:293-301` —
+is crossed at **~500 lines of code**, not at 14,000 rows of prose. For a *coding* agent that
+is an ordinary turn, not a pathological one.
+
+The cost is ~174 µs per code line and flat in that unit, so it scales purely with how much
+code is in the turn. It compounds with the deliberate pure-Rust regex choice recorded at
+[`Cargo.toml:246-250`](../../../Cargo.toml) — `syntect` with `default-fancy` instead of
+oniguruma. **That choice is correct and stays**; the defect is not the engine, it is running
+the engine over the entire turn on every frame.
+
+**This term survives §3.0, §3.1, §3.2 and §3.3 untouched.** No amount of frame-cost or
+frame-rate work removes an O(turn) markdown re-render from the miss path. It has to be made
+incremental, which is §3.0b — and §3.0b is therefore the *first* thing to build.
+
+### 0.5 [AUG-2] A latent scroll bug that §3.0 closes for free
+
+In `TranscriptView::render` (§0.2, line 1) `total` is `cache.lines.len()` — the count of
+**logical** lines — but `Paragraph::scroll()` counts **wrapped display rows**. The correct
+number is sitting in the same struct, unused on this path: `cache.wrapped_height`, which
+`content_height` *does* return (`cache.rs:59`) and which sizes the viewport
+([`app/layout.rs:174`](../../../crates/cyrup-tui/src/app/layout.rs)).
+
+When the two diverge, `max_scroll` under-counts and the tail-anchor lands in the middle of
+the turn: **the newest streaming text is never shown.** The codebase already knows they can
+diverge — [`altscreen/document.rs:125`](../../../crates/cyrup-tui/src/altscreen/document.rs)
+branches on exactly that test:
+
+```rust
+        if wrapped_height(&lines, width) == lines.len() {
+            rows.extend(lines);
+            continue;
+        }
+        for line in &lines { rows.extend(wrap_line(line, width)); }
+```
+
+Markdown bodies are pre-wrapped so they usually agree; the rows that reach `lines_with`
+through `tool_lines` and `BashExecution::render_lines` carry no such guarantee. §3.0 makes
+`rows.len()` the single definition of height and the bug cannot be expressed.
+
+### 0.6 pi DOES decouple render from fold — cyrup ported none of it
+
+pi has a frame scheduler with a hard frame-rate cap. Verified verbatim in
+`pi/packages/tui/src/tui.ts`:
 
 ```ts
-// pi/packages/tui/src/tui.ts:343
+// :343
 private static readonly MIN_RENDER_INTERVAL_MS = 16;
 
 // :772-781 — the default path. Sets a flag; paints nothing.
@@ -147,7 +267,7 @@ requestRender(force = false): void {
     process.nextTick(() => this.scheduleRender());
 }
 
-// :806-822 — one frame per MIN_RENDER_INTERVAL_MS, no matter how many requests arrived
+// :806-822 — one frame per MIN_RENDER_INTERVAL_MS, however many requests arrived
 private scheduleRender(): void {
     if (this.stopped || this.renderTimer || !this.renderRequested) return;
     const elapsed = performance.now() - this.lastRenderAt;
@@ -155,32 +275,50 @@ private scheduleRender(): void {
     this.renderTimer = setTimeout(() => { … this.doRender(); if (this.renderRequested) this.scheduleRender(); }, delay);
 }
 
-// :896-900 — and input PREEMPTS the throttle, with the reason stated
+// :783-796 — input's preempting path: cancels a queued throttled frame outright
+private requestImmediateRender(): void {
+    this.cancelRenderTimer();
+    this.renderRequested = true;
+    if (this.immediateRenderScheduled) return;
+    this.immediateRenderScheduled = true;
+    process.nextTick(() => { … this.cancelRenderTimer(); this.renderRequested = false;
+                             this.lastRenderAt = performance.now(); this.doRender(); });
+}
+
+// :896-900 — and input takes it, with the reason stated
 this.focusedComponent.handleInput(data);
 // Keyboard input is latency-sensitive. Avoid the throttled timer path,
 // where even setTimeout(0) can take a full 16 ms tick on Windows.
 this.requestImmediateRender();
 ```
 
-`interactive-mode.ts` calls `requestRender(` **106 times** and none of them paints
-synchronously; the one synchronous escape hatch is `renderNow()`, used once
-([`interactive-mode.ts:815`](../../../../pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts)).
+**There are THREE modes, not two** — the previous round collapsed the third:
 
-cyrup has **30 production `draw_synchronized()` call sites**
-(`run_arms.rs` 22, `crossterm.rs` 3, `run.rs` 3, `run_action.rs` 2), **every one of which
-paints immediately**, and no frame cap anywhere in the crate
-(`grep -rn 'MIN_RENDER\|frame_interval\|render_interval' crates/cyrup-tui/src` → nothing).
+| pi | meaning | cyrup analog |
+| --- | --- | --- |
+| `requestRender()` | flag; coalesced to ≤1 frame / 16 ms | `frames.request()` |
+| `requestRender(true)` | `resetRenderState()` **+** immediate — a **full redraw**: `tui-main-screen.ts:91-99` clears `previousLines`/`previousWidth`/`previousHeight`/`cursorRow`/`maxLinesRendered`, `tui-alt-screen.ts:387-392` clears `previousScreen`/`currentLayout`. 3 call sites in `interactive-mode.ts` | `frames.request_full_redraw()` → `terminal.clear()` before the frame |
+| `renderNow()` | `tui.ts:764-770`, synchronous, paints before returning. **1** call site ([`interactive-mode.ts:815`](../../../../pi/packages/coding-agent/src/modes/interactive/interactive-mode.ts)) | keep `draw_synchronized()` |
+
+`interactive-mode.ts` calls `requestRender(` **106 times**; none paints synchronously.
+
+cyrup has **30 production `draw_synchronized()` call sites**, **every one of which paints
+immediately**, and no frame cap anywhere in the crate:
 
 ```bash
-# the census, reproducible:
 grep -rn 'draw_synchronized()' crates/cyrup-tui/src --include=*.rs \
-  | grep -v '^crates/cyrup-tui/src/tests' | grep -v 'fn draw_synchronized' \
+  | grep -v '/tests/' | grep -v 'fn draw_synchronized' \
   | grep -v '// ' | sed 's/:.*//' | sort | uniq -c
+#   3 crates/cyrup-tui/src/app/crossterm.rs
+#   3 crates/cyrup-tui/src/app/run.rs
+#   2 crates/cyrup-tui/src/app/run_action.rs
+#  22 crates/cyrup-tui/src/app/run_arms.rs
+grep -rn 'MIN_RENDER\|frame_interval\|render_interval' crates/cyrup-tui/src   # → nothing
 ```
 
-So: pi cannot get *parallelism* — that part of §2 stands — but it does get **coalescing
-across arms and a bounded frame rate**, which cyrup does not. That is a straight port, it is
-cheap, and it subsumes F3's within-arm drain with a structural guarantee.
+pi cannot get *parallelism* (§2), but it gets **coalescing across arms and a bounded frame
+rate**, which cyrup does not. That is a straight port and it subsumes F3's within-arm drain
+with a structural guarantee.
 
 ---
 
@@ -201,60 +339,154 @@ cheap, and it subsumes F3's within-arm drain with a structural guarantee.
                     self.draw_synchronized()?;                       // :339 — draw, SAME TASK
 ```
 
-`draw_synchronized` is [`app/crossterm.rs:87`](../../../crates/cyrup-tui/src/app/crossterm.rs).
-Every call site is on the run-loop task.
+`draw_synchronized` is [`app/crossterm.rs:87-100`](../../../crates/cyrup-tui/src/app/crossterm.rs).
+Every call site is on the run-loop task. The consequence chain:
 
-The consequence chain:
-
-1. Draw cost grows with active-turn size — **§0.2, measured: 11.5 ms at 2k rows, 92 ms at
-   16k, on every frame including a `RenderCache` hit.**
-2. The run loop is `biased;` ([`run.rs:302`](../../../crates/cyrup-tui/src/app/run.rs)), and
+1. Draw cost grows with the active turn — **§0.3/§0.4, measured: ~180 ms of layout at 16k
+   rows, and 87 ms of syntect at 500 code lines, on every streaming frame.**
+2. The run loop is `biased;` ([`run.rs:302`](../../../crates/cyrup-tui/src/app/run.rs)) and
    the spinner ticker re-arms every 80 ms
    ([`status_indicator.rs:48`](../../../crates/cyrup-tui/src/status_indicator.rs)).
-3. If one draw exceeds one tick, arms below the ticker are reached less often; the input arm
-   is deliberately hoisted above the tickers to prevent exactly this, which is a mitigation
-   of the coupling rather than a removal of it.
+3. One draw exceeding one tick starves the arms below the ticker; the input arm is hoisted
+   above the tickers precisely to mitigate — not remove — this.
 4. Meanwhile `Fanout::emit` **awaits** every send
    ([`subscriber.rs:63-72`](../../../crates/cyrup-session-svc/src/subscriber.rs), *"backpressure
-   → slows the agent, never drops"*), so a slow draw does not merely look bad — **it throttles
-   the provider stream**.
+   → slows the agent, never drops"*), so a slow draw **throttles the provider stream**.
 
-That last point is what makes this a throughput task and not a cosmetics task.
+That last point makes this a throughput task, not a cosmetics task.
 
-**[AUG] And there is one cost the CPU numbers do not capture at all.**
-`CrosstermBackend` writes straight to `io::Stdout`, and a `write(2)` to a tty **blocks
-without bound** when the terminal is not draining — flow control (`Ctrl+S`/XOFF), a slow ssh
-link, a suspended terminal emulator. That stall is not proportional to anything and no amount
-of §3.0 removes it. **It is the honest justification for §3.3's OS thread**, and it should be
-the argument that decides whether §3.3 gets built — not the CPU cliff, which §3.0 closes.
+**One cost the CPU numbers do not capture at all.** `CrosstermBackend` writes to `io::Stdout`,
+and a `write(2)` to a tty **blocks without bound** when the terminal is not draining — flow
+control (`Ctrl+S`/XOFF), a slow ssh link, a suspended emulator. That stall is proportional to
+nothing and no amount of §3.0/§3.0b removes it. **It is the honest justification for §3.3's
+OS thread**, and it is the argument that should decide whether §3.3 gets built.
 
 ---
 
-## 2. What pi can and cannot do — CORRECTED
+## 2. What pi can and cannot do
 
-pi has one event-loop thread. `Promise.all` is concurrency, not parallelism; its renderer,
-its fold and its tool execution all contend for that thread by construction.
+pi has one event-loop thread. `Promise.all` is concurrency, not parallelism; renderer, fold
+and tool execution contend for that thread by construction.
 
-**But it does not paint inline.** §0.3: `requestRender` defers, `MIN_RENDER_INTERVAL_MS`
-caps the rate, `requestImmediateRender` gives input a preempting path. Every claim of the
-form *"pi cannot do this"* applies only to §3.3 — putting the terminal writes on a real
-thread so a blocking `write(2)` cannot reach the fold. §3.1 is not a cyrup innovation; it is
-a port of behaviour cyrup skipped.
+**But it does not paint inline** (§0.6). Every *"pi cannot do this"* claim applies only to
+§3.3 — putting terminal writes on a real thread so a blocking `write(2)` cannot reach the
+fold. §3.1 is not a cyrup innovation; it is a port of behaviour cyrup skipped.
 
 ---
 
 ## 3. Required implementation
 
-Four stages, in this order. Each stands alone and each is a strict prerequisite of the next:
-§3.0 makes a frame cheap enough that a cap is meaningful, §3.1 makes frames rare and gives
-input a preempting path, §3.2 makes a frame publishable, §3.3 moves the writes off the task.
+Five stages. The order is now **§3.0b, §3.0, §3.1, §3.2, §3.3** — §3.0b moved to the front
+because §0.4 shows it owns the dominant term.
+
+### 3.0b Make the markdown miss path incremental — resumable syntect
+
+**This is the largest single win in the task and the previous round missed it entirely.**
+
+syntect is a line-at-a-time state machine and `ParseState` **derives `Clone`**
+(`syntect-5.3.0/src/parsing/parser.rs:57-58`); syntect's own doc comment on that type is about
+caching it. A streaming code fence only ever *appends* lines, so the parse state after line N
+is still valid when line N+1 arrives. Keep it instead of throwing it away.
+
+Add a cursor beside the existing `OnceLock<SyntaxSet>` in
+[`markdown/highlight.rs`](../../../crates/cyrup-tui/src/markdown/highlight.rs):
+
+```rust
+/// A resumable highlight of ONE code block. `highlight_inner` used to build a fresh
+/// `ParseState` and re-parse every line on every call, and `cached_render` misses on every
+/// streaming delta (`transcript/stream.rs:55-56`) — so a turn holding 500 lines of code paid
+/// 87 ms of syntect per frame, 109% of the 80 ms spinner tick (`status_indicator.rs:48`).
+///
+/// syntect is a line-at-a-time state machine and `ParseState: Clone`, so the state after line
+/// N stays valid for line N+1. A streaming fence only appends; parse the tail, keep the rows.
+pub(super) struct HighlightCursor {
+    /// Invalidation key. `lang` because the fence's info string can change while it streams
+    /// (```` ```ru ```` → ```` ```rust ````); `theme_generation` because the emitted spans
+    /// carry resolved colours, exactly as `RenderCache` keys on it (`transcript/mod.rs:326`).
+    lang: String,
+    theme_generation: u64,
+    /// Lines already turned into `rows`. The resume point.
+    consumed: usize,
+    /// The syntect state after `consumed` lines. THE reason this type exists.
+    parse: ParseState,
+    rows: Vec<Line<'static>>,
+}
+
+impl HighlightCursor {
+    /// Rows for `code`, parsing only what is new since the last call.
+    ///
+    /// The prefix check is what makes reuse SOUND: a delta appends, but a re-render after an
+    /// edit, a `/clear`, or a committed-then-restreamed turn does not. Anything that is not a
+    /// strict line-prefix extension rebuilds from scratch — correctness first, and the rebuild
+    /// is exactly today's cost, so the worst case is a wash.
+    fn rows_for(&mut self, code: &str, lang: &str, theme: &UiTheme, ss: &SyntaxSet,
+                syntax: &syntect::parsing::SyntaxReference) -> &[Line<'static>] {
+        let reusable = self.lang == lang
+            && self.theme_generation == theme.generation
+            && self.consumed <= code.split('\n').count()
+            && code.split('\n').take(self.consumed).eq(self.prefix_lines());
+        if !reusable {
+            self.lang = lang.to_string();
+            self.theme_generation = theme.generation;
+            self.consumed = 0;
+            self.parse = ParseState::new(syntax);
+            self.rows.clear();
+        }
+        for raw in code.split('\n').skip(self.consumed) {
+            // Body identical to today's `highlight_inner` loop (highlight.rs:81-100) — it is
+            // moved here, not rewritten, so the span/scope semantics T5 pins are untouched.
+            …
+            self.rows.push(Line::from(spans));
+            self.consumed += 1;
+        }
+        &self.rows
+    }
+}
+```
+
+**Where the cursor lives.** Not in a global map — the key would have to be the code text,
+which changes every delta, so a map only grows. Hang it off the render path that already has
+a stable identity for the block: `TranscriptView` owns the active turn, so the cursor belongs
+beside `render_cache` in [`transcript/mod.rs:323-333`](../../../crates/cyrup-tui/src/transcript/mod.rs)
+as `Vec<HighlightCursor>` indexed by the block's ordinal within the turn, reset by
+`commit_assistant`/`discard_streaming`. Ordinal is stable during a stream because fences only
+ever appear in order and only the last one grows.
+
+**Do not lose the fallbacks.** [`highlight_lines`](../../../crates/cyrup-tui/src/markdown/highlight.rs)
+at `:12-29` returns `flat()` for an empty/unknown language token or any syntect fault, and
+[`highlight_code_lines`](../../../crates/cyrup-tui/src/markdown/highlight.rs) at `:42-69`
+returns `None` for the same and strips the 2-space gutter. Both must keep behaving exactly as
+they do — the cursor sits *inside* `highlight_inner`'s position, below those gates.
+
+**Also handle the streaming-fence case explicitly.** The live path runs
+`trim_partial_closing_fence` (`cache.rs`, via `crate::markdown::trim_partial_closing_fence`)
+so an unterminated fence still parses. That means the *last* line of a streaming block can be
+a partial token that changes on the next delta. Do not consume the final line into the cursor
+while the fence is open: parse `code` up to its last `\n` and re-parse the tail each frame.
+One line of re-parse is ~174 µs, flat.
+
+Measured — the cost of the frame a delta produces, at a given amount of already-highlighted
+code ([`tmp/perf005-hl`](../../../tmp/perf005-hl)):
+
+| code lines already in the turn | today (re-highlight all) | §3.0b (parse the new line) | speedup |
+| --- | --- | --- | --- |
+| 50 | 8.68 ms | 130 µs | **67×** |
+| 100 | 17.80 ms | 205 µs | **87×** |
+| 250 | 44.00 ms | 157 µs | **280×** |
+| 500 | 85.90 ms | 282 µs | **304×** |
+| 1 000 | 175.07 ms | 54 µs | **3 265×** |
+| 2 000 | 349.34 ms | 157 µs | **2 219×** |
+
+The §3.0b column is **flat** — it is one line's parse, independent of turn size. (It includes
+a `ParseState::clone()` the probe needs and production does not, so it is an over-estimate.)
 
 ### 3.0 Make a frame O(visible), not O(active turn)
 
 **Wrap once, into the cache. Share the rows. Paint only what fits.**
 
 [`transcript/mod.rs:323-333`](../../../crates/cyrup-tui/src/transcript/mod.rs) — the cache
-holds **already-wrapped display rows**, behind an `Arc` so no consumer ever deep-copies it:
+holds **already-wrapped display rows** behind an `Arc`, and `wrapped_height` disappears as a
+separate field because it *is* `rows.len()`:
 
 ```rust
 struct RenderCache {
@@ -262,56 +494,80 @@ struct RenderCache {
     width: usize,
     theme_generation: u64,
     /// ALREADY-WRAPPED display rows, one `Line` per screen row, shared not copied.
-    /// `Arc` because every consumer wants the whole vector and none of them mutates it:
+    /// `Arc` because every consumer wants the whole vector and none mutates it:
     /// `TranscriptView::render` (per frame), `content_height` (per frame) and — after §3.2 —
-    /// the published `FrameState`. `Arc::clone` is 11 ns against 12.1 ms for the deep copy
-    /// this replaces at a 16k-row turn.
+    /// the published `FrameState`. `Arc::clone` is 11 ns against 12.1 ms for the deep copy it
+    /// replaces at a 16k-row turn.
+    ///
+    /// Replaces the separate `wrapped_height: usize`: that field was recomputed per MISS by
+    /// `wrapped_height()`, a `lines.to_vec()` plus a full `Paragraph::line_count` wrap costing
+    /// 88 ms at 16k rows (§0.3). `rows.len()` is the same quantity, exactly, for free.
     rows: Arc<Vec<Line<'static>>>,
     links: crate::osc::LinkSink,
 }
 ```
 
-`wrapped_height` disappears as a separate concept: it is `rows.len()`.
-
 [`transcript/cache.rs:28-56`](../../../crates/cyrup-tui/src/transcript/cache.rs) —
-`cached_render` does the wrap on the miss path, where the markdown pass already is:
+`cached_render` wraps on the miss path, where the markdown pass already is, **moving every row
+that already fits**:
 
 ```rust
         if stale {
             let links = crate::osc::LinkSink::new();
             let lines = self.lines_with(width, theme, Some(&links));
-            // Wrap ONCE, here, into the cache. `wrap_line` early-returns a verbatim clone for a
-            // row that already fits (`transcript/layout.rs:53-55`), so this is a no-op for the
-            // markdown bodies — `MdRenderer::finish` already wrapped them to the content width
-            // (`markdown/walk.rs:834-838`) — and only bites the rows the inner wrap could not
-            // bound. It replaces BOTH the per-frame `Paragraph::wrap` and the `wrapped_height`
-            // measurement pass, which were two full wraps of the same content.
-            let rows: Vec<Line<'static>> = lines
-                .into_iter()
-                .flat_map(|line| crate::transcript::wrap_line(&line, width.max(1)))
-                .collect();
             self.render_cache = RenderCache {
                 generation: self.render_generation,
                 width,
                 theme_generation: theme.generation,
-                rows: Arc::new(rows),
+                rows: Arc::new(wrap_all_owned(lines, width.max(1))),
                 links,
             };
         }
 ```
 
-[`transcript/cache.rs:228-249`](../../../crates/cyrup-tui/src/transcript/cache.rs) — the
-render becomes a refcount bump, a slice and a bounded blit:
+```rust
+/// Wrap a materialised turn into display rows, MOVING every row that already fits.
+///
+/// Not `lines.into_iter().flat_map(|l| wrap_line(&l, w))`: `wrap_line`'s early return is
+/// `vec![line.clone()]` (`layout.rs:53-55`), a deep clone of a `Line` whose spans each own a
+/// `String` — and almost every row takes that branch, because `MdRenderer::finish` already
+/// wrapped the markdown to `width` (`markdown/walk.rs:834-838`). Measured at a 16k-row turn:
+/// 7.6 ms for the `flat_map`, 4.5 ms for this (§0.3, columns F and G).
+///
+/// The `wrap_line` call is still needed for the rows the inner wrap cannot bound — deeply
+/// nested quoted lists at a narrow pane (`walk.rs:829-833`) — and for the rows that never went
+/// through markdown at all: `tool_lines` and `BashExecution::render_lines` carry no
+/// pre-wrapped guarantee. That is why the wrap MOVES here rather than being deleted.
+pub(crate) fn wrap_all_owned(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if line.width() <= width {
+            out.push(line);                       // MOVE — no allocation, no memcpy
+        } else {
+            out.extend(wrap_line(&line, width));
+        }
+    }
+    out
+}
+```
+
+[`transcript/cache.rs:228-249`](../../../crates/cyrup-tui/src/transcript/cache.rs) — render
+becomes a refcount bump, a slice, and a bounded blit:
 
 ```rust
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let width = area.width as usize;
         let inner_h = area.height as usize;
-        // 11 ns. The rows outlive the borrow, so nothing here holds `&mut self` across the paint.
+        // 11 ns. The rows outlive the borrow, so nothing holds `&mut self` across the paint.
         let rows = Arc::clone(&self.cached_render(width, theme).rows);
         let total = rows.len();
         let max_scroll = total.saturating_sub(inner_h);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
+        // `total` is now WRAPPED rows, which is what the scroll unit always was — closing the
+        // §0.5 mismatch where `cache.lines.len()` (logical) was compared against a wrapped
+        // scroll offset and the tail-anchor missed the newest text.
+        //
         // Every row is pre-wrapped, so this index is an exact screen row: `Paragraph` needs
         // neither `.wrap()` (the rows already fit) nor `.scroll()` (we sliced instead), and the
         // deep copy below is bounded by the VIEWPORT, not by the turn.
@@ -324,12 +580,18 @@ render becomes a refcount bump, a slice and a bounded blit:
 ```
 
 `.get(..)` rather than `[..]` — `cyrup-tui` denies `clippy::indexing_slicing` and
-`clippy::string_slice` ([`lib.rs:46-50`](../../../crates/cyrup-tui/src/lib.rs)).
+`clippy::string_slice` ([`lib.rs:46-50`](../../../crates/cyrup-tui/src/lib.rs)), and those
+lints fire **only under `cargo clippy`**, never `cargo build`/`cargo test`.
 
-**Do the same on the commit path** ([`app/draw.rs:248-292`](../../../crates/cyrup-tui/src/app/draw.rs)):
-build `rows` with the same `flat_map(wrap_line)`, use `rows.len()` as the `insert_before`
-height, and drop `.wrap(Wrap { trim: false })` from the `Paragraph`. That removes one deep
-clone (`wrapped_height`'s `lines.to_vec()`) and two of the three wraps per commit.
+`content_height` becomes `self.cached_render(width, theme).rows.len()`.
+
+**Do the same on the commit path** ([`app/draw.rs:248-292`](../../../crates/cyrup-tui/src/app/draw.rs)),
+which pays the identical triple today — `entry_lines` → `wrapped_height(&lines, width)` (a
+`to_vec()` + a full wrap, `:282`) → `Paragraph::new(lines).wrap(…)` inside `insert_before`
+(`:285-287`), a **third** wrap. Build `rows` with `wrap_all_owned`, use `rows.len()` as the
+`insert_before` height, and drop `.wrap(Wrap { trim: false })` from the `Paragraph`. Note the
+`#[cfg(any(test, feature = "scrollback-accumulator"))]` line at `:271` clones again; leave it,
+it is already gated out of production by TUI-092 F1.
 
 Three hazards, each of which will look like a rendering regression if missed:
 
@@ -337,22 +599,22 @@ Three hazards, each of which will look like a rendering regression if missed:
   `region_constraints` → the inline viewport height
   ([`app/layout.rs:174`](../../../crates/cyrup-tui/src/app/layout.rs),
   [`app/draw.rs:56-140`](../../../crates/cyrup-tui/src/app/draw.rs)). `rows.len()` is the same
-  quantity `wrapped_height` computed, now exactly rather than by re-measurement — but a
-  `lines.len()` left anywhere would silently under-size the viewport and reintroduce the
-  PROSE-WRAP truncation the `wrapped_height` comment was written for.
-* **`osc::inject` alignment.** Its doc requires that the marked cells exist before injection
-  and that `Buffer::diff_iter` stays column-aligned. Slicing changes *which* rows reach the
-  buffer, not their cell layout, so the contract holds — but the injection must still run
-  after `render_widget`, exactly as it does now.
-* **Non-markdown rows.** Tool bodies and the live bash block reach `lines_with` through
-  `tool_lines`/`render_lines`, which are *not* guaranteed pre-wrapped. That is precisely why
-  the wrap moves into the cache instead of being deleted: it stays correct for them and
-  becomes free for everything else.
+  quantity, now exact rather than re-measured — but a `lines.len()` left anywhere would
+  under-size the viewport and reintroduce the PROSE-WRAP truncation `wrapped_height` was
+  written for.
+* **`osc::inject` alignment.** Its doc requires the marked cells to exist before injection and
+  `Buffer::diff_iter` to stay column-aligned. Slicing changes *which* rows reach the buffer,
+  not their cell layout, so the contract holds — but injection must still run **after**
+  `render_widget`, exactly as it does now.
+* **`wrapped_height` has six other callers** and they are unrelated to this change — the
+  selector title (`selector/mod.rs:206`), `text_input.rs:604`, `login_dialog.rs:460`,
+  `extension_editor.rs:205`, `chrome.rs:159`, `altscreen/document.rs:125`. Keep the free
+  function; only the two transcript call sites go away.
 
 ### 3.1 Port pi's frame scheduler — request, don't paint
 
-One frame per `MIN_RENDER_INTERVAL`, input preempts, and a `renderNow` escape hatch for the
-paths that must have pixels before they return.
+One frame per `MIN_RENDER_INTERVAL`, input preempts, a full-redraw mode, and a `renderNow`
+escape hatch for paths that must have pixels before they return.
 
 ```rust
 /// pi `TuiBase.MIN_RENDER_INTERVAL_MS` (`packages/tui/src/tui.ts:343`) — a 62.5 Hz cap.
@@ -360,18 +622,26 @@ pub(crate) const MIN_RENDER_INTERVAL: Duration = Duration::from_millis(16);
 
 /// pi's `renderRequested` / `renderTimer` / `lastRenderAt` triple (`tui.ts:772-822`), owned by
 /// the run loop. A request is a FLAG, never a paint: N arms firing inside one interval produce
-/// one frame, which is F3's guarantee upheld across arms rather than inside each one.
+/// one frame — F3's guarantee upheld ACROSS arms instead of inside each one.
 pub(crate) struct FrameScheduler {
     requested: bool,
     /// pi's `requestImmediateRender` (`tui.ts:783-796`): a keystroke must not wait out the
     /// throttle. Set only by the input arm.
     force: bool,
+    /// pi's `requestRender(true)` → `resetRenderState()` (`tui.ts:773-777`,
+    /// `tui-main-screen.ts:91-99`). Upstream drops its whole line-diff state so the next frame
+    /// repaints from scratch; cyrup's equivalent is `terminal.clear()` before the draw, since
+    /// ratatui's diff lives in the `Terminal`'s back buffer.
+    full: bool,
     last: Instant,
 }
 
 impl FrameScheduler {
     pub(crate) fn request(&mut self) { self.requested = true; }
     pub(crate) fn request_immediate(&mut self) { self.requested = true; self.force = true; }
+    pub(crate) fn request_full_redraw(&mut self) {
+        self.requested = true; self.force = true; self.full = true;
+    }
     /// Is a frame owed RIGHT NOW?
     pub(crate) fn due(&self) -> bool {
         self.requested && (self.force || self.last.elapsed() >= MIN_RENDER_INTERVAL)
@@ -383,7 +653,13 @@ impl FrameScheduler {
         if self.force { return Some(Duration::ZERO); }
         Some(MIN_RENDER_INTERVAL.saturating_sub(self.last.elapsed()))
     }
-    pub(crate) fn taken(&mut self) { self.requested = false; self.force = false; self.last = Instant::now(); }
+    /// Consume the request. Returns whether this frame must repaint from scratch.
+    pub(crate) fn taken(&mut self) -> bool {
+        let full = self.full;
+        self.requested = false; self.force = false; self.full = false;
+        self.last = Instant::now();
+        full
+    }
 }
 ```
 
@@ -393,15 +669,16 @@ Wiring, in [`app/run.rs`](../../../crates/cyrup-tui/src/app/run.rs):
         'run: loop {
             self.drain_over_budget_arm();
             // The ONE production frame site. At the top of the body, so it batches every arm
-            // that fired on the previous iteration regardless of which one it was — pi's
-            // `scheduleRender` callback, in the one place cyrup has to put it.
+            // that fired on the previous iteration regardless of which — pi's `scheduleRender`
+            // callback, in the one place cyrup has to put it.
             if self.frames.due() {
+                let _frame = ArmGuard::enter("frame");
+                if self.frames.taken() { let _ = self.terminal.clear(); }
                 self.draw_synchronized()?;
-                self.frames.taken();
             }
             // Wakes the loop for a frame that is pending but not yet due. Never resolves when
-            // nothing is requested, so an idle session costs no wakeups — the same shape as
-            // `overlay_ticked` / `alt_timer` above it.
+            // nothing is requested, so an idle session costs no wakeups — the same shape as the
+            // `overlay_ticked` / `alt_timer` arms above it.
             let frame_due = async {
                 match self.frames.due_in() {
                     Some(d) => tokio::time::sleep(d).await,
@@ -419,35 +696,51 @@ Wiring, in [`app/run.rs`](../../../crates/cyrup-tui/src/app/run.rs):
 ```
 
 The `frame_due` arm carries **no body** deliberately: putting the draw in an arm would make
-frames starvable by any hotter arm above it under `biased;`, which is the exact failure this
-task exists to remove.
+frames starvable by any hotter arm above it under `biased;` — the exact failure this task
+exists to remove.
 
-Then convert the call sites:
+Then convert the 30 call sites:
 
-* **25 sites become `self.frames.request();`** — pi's `requestRender()`: all 22 in
-  `run_arms.rs`, the events arm at
-  [`run_action.rs:339`](../../../crates/cyrup-tui/src/app/run_action.rs), and
-  `on_altscreen_tick` at [`run.rs:453`](../../../crates/cyrup-tui/src/app/run.rs) (an ordinary
-  arm despite living in `run.rs`).
+* **25 become `self.frames.request();`** — pi's `requestRender()`: all 22 in `run_arms.rs`
+  (`:310,352,358,367,376,422,436,463,475,504,515,521,529,541,550,562,572,608,618,630,640,647`),
+  the events arm at [`run_action.rs:339`](../../../crates/cyrup-tui/src/app/run_action.rs),
+  and `on_altscreen_tick` at [`run.rs:453`](../../../crates/cyrup-tui/src/app/run.rs) (an
+  ordinary arm despite living in `run.rs`). Note `run_arms.rs:640` is a tail-position
+  `self.draw_synchronized()` whose value is the fn's return — it becomes
+  `self.frames.request(); Ok(())`.
 * **The input arm** ([`run_action.rs:268`](../../../crates/cyrup-tui/src/app/run_action.rs))
   becomes `self.frames.request_immediate();` — pi's `requestImmediateRender()` at
   `tui.ts:896-900`, for the reason pi states in that comment.
-* **Five sites stay synchronous `draw_synchronized()`** — pi's `renderNow()`
-  (`interactive-mode.ts:815`) — because control leaves the loop immediately afterwards and a
-  deferred frame would never land: the seed frame at
-  [`run.rs:120`](../../../crates/cyrup-tui/src/app/run.rs); the post-`stop_fullscreen` frame on
-  the exit path at [`run.rs:419`](../../../crates/cyrup-tui/src/app/run.rs); and the three
-  terminal-handed-back redraws in
-  [`crossterm.rs:136`](../../../crates/cyrup-tui/src/app/crossterm.rs) (`suspend`, after `fg`),
+* **Five stay synchronous `draw_synchronized()`** — pi's `renderNow()` — because control
+  leaves the loop immediately afterwards and a deferred frame would never land: the seed frame
+  at [`run.rs:120`](../../../crates/cyrup-tui/src/app/run.rs); the post-`stop_fullscreen`
+  frame on the exit path at [`run.rs:419`](../../../crates/cyrup-tui/src/app/run.rs); and the
+  three terminal-handed-back redraws in
+  [`crossterm.rs:136`](../../../crates/cyrup-tui/src/app/crossterm.rs) (`suspend`, after `fg`
+  — already paired with its own `terminal.clear()` at `:135`),
   [`:150`](../../../crates/cyrup-tui/src/app/crossterm.rs) (`open_external_editor`) and
-  [`:170`](../../../crates/cyrup-tui/src/app/crossterm.rs)
-  (`open_external_editor_for_selector`).
+  [`:170`](../../../crates/cyrup-tui/src/app/crossterm.rs) (`open_external_editor_for_selector`).
 * **The exit path must flush a pending frame** before `drain_and_restore`, or the last state
-  change before a quit is never drawn.
+  change before a quit is never drawn. `run.rs:404-406`'s `if self.state.should_quit { break; }`
+  leaves the loop without passing the top-of-body site again.
+* `ArmGuard::enter` ([`app/input_reader.rs:119-142`](../../../crates/cyrup-tui/src/app/input_reader.rs))
+  keeps bracketing arm bodies; the `"frame"` guard above lets the wedge detector name a slow
+  paint.
 
-`ArmGuard::enter` ([`app/input_reader.rs:111-142`](../../../crates/cyrup-tui/src/app/input_reader.rs))
-keeps bracketing the arm bodies; add a `ArmGuard::enter("frame")` around the top-of-body draw
-so the wedge detector can still name it.
+**Four structural guards read the source and will fail — re-anchor them, do not delete them.**
+They use `include_str!` on the very files being edited and count `draw_synchronized()`
+literally:
+
+| file | what it pins | becomes |
+| --- | --- | --- |
+| [`run_loop_draw_coalescing.rs`](../../../crates/cyrup-tui/src/tests/run_loop_draw_coalescing.rs) | `arm.matches("draw_synchronized()").count() == 1` per arm; ordering `ArmGuard` < `now_or_never` drain < draw | count `frames.request()` instead; ordering becomes guard < drain < request |
+| [`run_loop_input_priority.rs`](../../../crates/cyrup-tui/src/tests/run_loop_input_priority.rs) | the input arm sits above every ticker in the `biased;` block | unchanged, but the rationale comment it quotes moves (§3.5) |
+| [`render_cache_tick.rs`](../../../crates/cyrup-tui/src/tests/render_cache_tick.rs) | `bump_render_tick()` precedes the draw in `on_spinner_tick` / `on_elapsed_tick` | bump-before-**request** |
+| [`resize_viewport_failure.rs`](../../../crates/cyrup-tui/src/tests/resize_viewport_failure.rs) | draw behaviour on a failed viewport resize | check whether its site is one of the five synchronous survivors |
+
+`arm_body()` in the first of these **panics** with *"if the loop was re-split, re-anchor this
+guard rather than reading to EOF"* when an anchor stops matching — that message is the
+instruction; follow it.
 
 ### 3.2 Split the state the renderer reads from the state the loop mutates
 
@@ -467,12 +760,12 @@ pub(crate) struct FrameState {
     links: crate::osc::LinkSink,
     /// The first visible row — resolved by the fold, because `scroll_offset` is fold state.
     first_row: usize,
-    /// Materialised chrome, all of it viewport-bounded: band, editor, selector/loader slot,
+    /// Materialised chrome, all viewport-bounded: band, editor, selector/loader slot,
     /// completion popup, extension header/footer/widgets, image strip, overlays.
     chrome: Chrome,
     /// `[header, msg, pending, band, images, wabove, slot, popup, wbelow, footer]` — the exact
-    /// output of `region_constraints`, resolved once by the fold so the two sides cannot
-    /// disagree on row counts (`app/layout.rs`'s idempotence note).
+    /// output of `region_constraints` (`app/layout.rs:48`), resolved once by the fold so the two
+    /// sides cannot disagree on row counts.
     regions: [u16; 10],
     geometry: Geometry,      // term_w, term_h, viewport_height, live_floor
     cursor: Option<Position>,
@@ -482,29 +775,29 @@ pub(crate) struct FrameState {
 }
 ```
 
-**The blocker to plan around, stated plainly: cyrup's render path is `&mut`.**
+**The blocker to plan around: cyrup's render path is `&mut`.**
 [`render(frame, state: &mut AppState)`](../../../crates/cyrup-tui/src/app/render.rs) at
 `render.rs:4`, and [`Component::render`](../../../crates/cyrup-tui/src/component.rs) at
 `component.rs:19` is `fn render(&mut self, …)`. The transcript mutates `scroll_offset` and its
-cache, the editor mutates its wrap state, the selector and every overlay mutate as they paint.
-So the render thread **cannot** be handed an `&AppState`, and `FrameState` cannot be a view —
-it has to be the *materialised output* of those components.
+cache, the editor its wrap state, the selector and every overlay as they paint. So the render
+thread **cannot** be handed an `&AppState`, and `FrameState` cannot be a view — it must be the
+*materialised output* of those components.
 
-The required shape: give each chrome component a
+Give each chrome component a
 `fn lines(&mut self, width: u16, theme: &UiTheme) -> Vec<Line<'static>>` that its existing
 `render` then blits, and have the fold call `lines()` while the render thread blits. This is
 affordable **only** because every one of those components is viewport-bounded — the editor
-caps itself at `max(5, rows * 3 / 10)` ([`app/layout.rs:25`](../../../crates/cyrup-tui/src/app/layout.rs)),
+caps at `max(5, rows * 3 / 10)` ([`app/layout.rs:25`](../../../crates/cyrup-tui/src/app/layout.rs)),
 the band is 2 rows, the footer 1 — whereas the transcript is not, which is why the transcript
 rides the `Arc` from §3.0 instead.
 
 Two carries that are easy to lose:
 
-* **The selector caret.** [`app/render.rs`](../../../crates/cyrup-tui/src/app/render.rs) derives
-  it by scanning the *rendered buffer* (`crate::selector::caret_cell(frame.buffer_mut(), slot_area)`).
-  That scan must run on the render thread after its blit, or the caret must be produced
-  directly by the selector's `lines()`. Do the latter; a buffer scan on the render thread
-  re-introduces a render-side computation that the publish was supposed to have settled.
+* **The selector caret.** [`app/render.rs`](../../../crates/cyrup-tui/src/app/render.rs)
+  derives it by scanning the *rendered buffer*
+  (`crate::selector::caret_cell(frame.buffer_mut(), slot_area)`). Produce it directly from the
+  selector's `lines()` instead; a buffer scan on the render thread re-introduces a render-side
+  computation the publish was supposed to have settled.
 * **`publish_extension_readbacks`** runs at the top of `App::draw` (`draw.rs:56-66`) so a guest
   reading the editor buffer or theme name sees what the frame is about to show. It is fold
   state, not paint: it moves to the publish, not to the thread.
@@ -513,15 +806,14 @@ Two carries that are easy to lose:
 
 A `std::thread` (not a tokio task — it does blocking terminal I/O and must not occupy a
 runtime worker) that wakes on a publish notification or a ~60 Hz timer, `load()`s the current
-`Arc<FrameState>`, and draws. Terminal ownership moves entirely to this thread; nothing else
-may write to the terminal concurrently.
+`Arc<FrameState>`, and draws. Terminal ownership moves entirely to this thread.
 
-**Build this only if §5's exit criterion says so** (see §4). The justification is not the CPU
-cliff — §3.0 closes that — it is the unbounded blocking `write(2)` named at the end of §1.
+**Build this only if §5.4's exit criterion says so.** The justification is not the CPU cliff —
+§3.0b and §3.0 close that — it is the unbounded blocking `write(2)` named at the end of §1.
 
-`self.terminal` has **21 uses across 8 files**, which is the tractable half. The untracked
-half is everything that writes escapes straight to `io::stdout()` and must now be ordered
-against frames:
+`self.terminal` has **21 uses across 8 files**, the tractable half. The untracked half is
+everything writing escapes straight to `io::stdout()`, which must now be ordered against
+frames:
 
 | writer | site |
 | --- | --- |
@@ -538,251 +830,196 @@ against frames:
 
 Sequencing hazards that must be handled explicitly:
 
-- **Alternate-screen enter/leave, raw-mode toggles, and terminal restore** must be ordered
-  against frames. Today they are trivially ordered because everything is on one task. See
+- **Alternate-screen enter/leave, raw-mode toggles, terminal restore** must be ordered against
+  frames — today trivially, because everything is one task. See
   [`app/crossterm.rs:110-112,200`](../../../crates/cyrup-tui/src/app/crossterm.rs) (the
-  by-design block announced to the wedge detector) and
-  [`app/backend.rs`](../../../crates/cyrup-tui/src/app/backend.rs)'s `append_lines`
-  anchoring, which depends on knowing exactly what was drawn last. Model them as **commands on
-  the render thread's own queue**, not as calls that race it; the anchor
+  by-design block announced to the wedge detector via `TerminalReleased::enter()`) and
+  [`app/backend.rs`](../../../crates/cyrup-tui/src/app/backend.rs)'s `append_lines` anchoring,
+  which depends on knowing exactly what was drawn last. Model them as **commands on the render
+  thread's own queue**, not as calls that race it; the anchor
   ([`InlineBackend::anchor`](../../../crates/cyrup-tui/src/app/backend.rs), TUI-093) is
   render-thread-private state and a second writer invalidates it.
-- **`TERMINAL_RELEASED` is now load-bearing for the renderer too.** The flag at
-  [`app/input_reader.rs:70-93`](../../../crates/cyrup-tui/src/app/input_reader.rs) already
-  marks the two windows where the terminal belongs to a child (`suspend`,
-  `edit_in_external_editor`). The render thread **must** consult it and paint nothing while it
-  is set, or a frame lands in the middle of the user's `$EDITOR`.
+- **`TERMINAL_RELEASED` becomes load-bearing for the renderer too.** The flag at
+  [`app/input_reader.rs:70-93`](../../../crates/cyrup-tui/src/app/input_reader.rs) marks the
+  windows where the terminal belongs to a child (`suspend`, `edit_in_external_editor`). The
+  render thread **must** consult it and paint nothing while it is set, or a frame lands in the
+  middle of the user's `$EDITOR`.
 - **`drain_and_restore` at shutdown** must stop the render thread and take the terminal back
-  before restoring it — the same ordering the existing `stop_fullscreen(false)` +
-  final-draw sequence at [`run.rs:405-420`](../../../crates/cyrup-tui/src/app/run.rs) gets
-  for free today.
+  before restoring — the ordering the existing `stop_fullscreen(false)` + final-draw sequence
+  at [`run.rs:405-420`](../../../crates/cyrup-tui/src/app/run.rs) gets for free today.
 - **Panic safety.** [`panic_hook.rs`](../../../crates/cyrup-tui/src/panic_hook.rs) is
   process-global (`std::panic::set_hook`) so it already fires from any thread, and it closes
-  the synchronized-update bracket **first** (`panic_hook.rs:56-70`) — which is exactly what a
-  render thread dying mid-frame needs. It stays correct **provided the render thread holds no
-  lock the restore needs**: keep it writing straight to `stdout`, never through a mutex the
-  hook would have to take. Note release sets `panic = "abort"`, so no `Drop` can stand in.
+  the synchronized-update bracket **first** (`panic_hook.rs:56-70`) — exactly what a render
+  thread dying mid-frame needs. It stays correct **provided the render thread holds no lock the
+  restore needs**: keep it writing straight to `stdout`, never through a mutex the hook would
+  take. Release sets `panic = "abort"`, so no `Drop` can stand in.
 
 ### 3.4 Keep the escape hatch working, and extend it to the renderer
 
 [`app/input_reader.rs:27-204`](../../../crates/cyrup-tui/src/app/input_reader.rs) is a
 `std::thread` that hard-exits on three unserviced `Ctrl+C`/`Ctrl+D` chords and prints
-``cyrup: run loop wedged in arm `{arm}` for {elapsed}`` from `ACTIVE_ARM` (`:111`). It is the
-last line of defence and it must survive: `ArmGuard::enter("events")`
-([`run_action.rs:293`](../../../crates/cyrup-tui/src/app/run_action.rs)) still needs to
-bracket the fold, and the hatch must now also restore the terminal correctly when the
-*render* thread is the one that is stuck.
+``cyrup: run loop wedged in arm `{arm}` for {elapsed}`` from `ACTIVE_ARM` (`:110-111`). It must
+survive: `ArmGuard::enter("events")`
+([`run_action.rs:293`](../../../crates/cyrup-tui/src/app/run_action.rs)) still brackets the
+fold, and the hatch must now also restore the terminal correctly when the *render* thread is
+stuck.
 
-Mirror the existing machinery rather than inventing a second one — the same
-`Mutex<Option<(&'static str, Instant)>>` shape:
+Mirror the existing machinery rather than inventing a second one — same
+`Mutex<Option<…>>` shape, same `try_lock`-never-`lock` discipline:
 
 ```rust
 /// The frame currently being painted, and since when — written by the render thread, read by
-/// the input reader's watchdog. Same shape and same `try_lock`-never-`lock` discipline as
-/// `ACTIVE_ARM` (`input_reader.rs:111`), so a wedged renderer names itself instead of
-/// presenting as a silent freeze.
+/// the input reader's watchdog. Same shape and same discipline as `ACTIVE_ARM`
+/// (`input_reader.rs:110-111`), so a wedged renderer names itself instead of presenting as a
+/// silent freeze. `hard_exit_from_reader` (`:194-205`) reports both.
 pub(crate) static ACTIVE_FRAME: std::sync::Mutex<Option<std::time::Instant>> =
     std::sync::Mutex::new(None);
 ```
 
-`hard_exit_from_reader` (`:194`) reports both. `mark_input_serviced` (`:52`) keeps meaning
-"serviced" and stays after the frame request — a *requested* frame the user never sees is not
-service, exactly as TUI-092 §7 property 7 already argues about a *drawn* one.
+`mark_input_serviced` (`:52`) keeps meaning "serviced" and stays **after** the frame request —
+a *requested* frame the user never sees is not service, exactly as TUI-092 §7 property 7
+argues about a *drawn* one.
 
-### 3.5 Delete what becomes dead, and say so
+### 3.5 Correct the comments that this change makes false
 
-If the decoupling lands, the `biased;` ordering rationale at
-[`run.rs:293-315`](../../../crates/cyrup-tui/src/app/run.rs) is no longer load-bearing for
-*this* reason (it remains load-bearing for the cancel arm and the session-swap arm at
-`:321-330`). **Rewrite that comment rather than leaving it to mislead** — it currently tells
-the next reader that arm order is what protects the keyboard, and after this change it is
-not.
+Three in-code comments become actively misleading and must be rewritten **in the same change**,
+or the next reader re-derives the wrong model:
 
-Two more comments become false the moment §3.0 lands and must be corrected in the same
-change, or the next reader will re-derive the wrong model of the render path:
-
-* [`transcript/cache.rs:36-40`](../../../crates/cyrup-tui/src/transcript/cache.rs) — *"`markdown::render`
-  emits ONE un-wrapped `Line` per prose paragraph"*. Already stale at HEAD (§0.2); after §3.0
-  it is stale **and** describes deleted code.
-* [`docs/gap-analysis/bugs/TUI-092-progressive-lockup.md`](../../../docs/gap-analysis/bugs/TUI-092-progressive-lockup.md)
-  §7 property 2 — *"a frame with unchanged state is O(changed chrome)"*, with `cached_render`'s
-  key check offered as *"the whole proof"*. It was never true; §3.0 is what makes it true.
-  Update the ledger with the measurement, since that row is the reason nobody looked here.
+* [`run.rs:293-315`](../../../crates/cyrup-tui/src/app/run.rs) — the `biased;` rationale
+  currently tells the reader that arm ORDER is what protects the keyboard. After §3.1 it is
+  not; the frame cap and the preempting input request are. The ordering remains load-bearing
+  for the cancel arm and the session-swap arm (`:321-330`) and that half must stay.
+* [`transcript/cache.rs:36-40`](../../../crates/cyrup-tui/src/transcript/cache.rs) —
+  *"`markdown::render` emits ONE un-wrapped `Line` per prose paragraph"*. Already false at HEAD
+  (§0.2); after §3.0 it describes deleted code.
+* [`app/draw.rs:278-281`](../../../crates/cyrup-tui/src/app/draw.rs) — the same false claim on
+  the commit path, used there to justify the `.wrap()` §3.0 removes.
 
 ---
 
-## 4. Honest sizing — REVISED
-
-The original sizing said *"the highest-risk task in the backlog and its benefit is the least
-quantified"*, and recommended not starting until PERF-001 landed. **§0.2 changes both halves
-of that**, but only for §3.0/§3.1.
+## 4. Sizing
 
 | stage | risk | benefit | evidence |
 | --- | --- | --- | --- |
-| **§3.0** wrapped-row cache + windowed paint | **low** — one file's cache shape, no terminal, no threads | **122× at 16k rows; frame cost becomes constant in turn size** | measured, §0.2 / §6 |
-| **§3.1** frame scheduler | **low** — one struct, one loop-body statement, 26 call-site edits | frames capped at 62.5 Hz; coalescing across arms, not just within one | pi parity, `tui.ts:343,772-822,896-900` |
-| **§3.2** `FrameState` publish | **medium** — every chrome component gains a `lines()` seam | none on its own; a prerequisite | — |
-| **§3.3** render thread | **high** — terminal ownership, shutdown ordering, panic safety, the escape hatch | only against a **blocking tty write**, which §3.0 cannot touch | argued, §1; not measured |
+| **§3.0b** resumable syntect | **low** — one file, one struct, the existing loop body moved | **67–300×**; removes the term that actually crosses the spinner tick, at ~500 code lines | measured, §0.4 / §6 |
+| **§3.0** wrapped-row cache + windowed paint | **low** — one cache shape, no terminal, no threads | **~180 ms → ~194 µs** at a 16k-row turn; frame becomes constant in turn size; closes the §0.5 scroll bug | measured, §0.2 / §0.3 |
+| **§3.1** frame scheduler | **low** — one struct, one loop statement, 26 call-site edits, 4 structural guards re-anchored | frames capped at 62.5 Hz; coalescing across arms, not just within one | pi parity, `tui.ts:343,772-822,896-900` |
+| **§3.2** `FrameState` publish | **medium** — every chrome component gains a `lines()` seam | none alone; a prerequisite | — |
+| **§3.3** render thread | **high** — terminal ownership, shutdown ordering, panic safety, escape hatch | only against a **blocking tty write**, which nothing above touches | argued, §1; not measured |
 
-**Do §3.0 and §3.1 unconditionally. Then measure before committing to §3.2/§3.3.** The
-exit criterion is in §5.4: if, after §3.0 and §3.1, a frame on a real terminal with a large
-transcript is bounded and no longer scales with the turn, then the CPU justification for the
-thread is spent and the remaining case rests entirely on tty blocking — which is a real
-hazard, but a different one, and it deserves its own observation before it buys a
-terminal-ownership refactor.
+**Do §3.0b, §3.0 and §3.1 unconditionally, in that order.** §3.0b first because §0.4 shows it
+owns the dominant term and it is independent of everything else — it lands alone, in one file.
+§3.0 second because it is what makes §3.2's publish an `Arc::clone`. Then re-measure before
+committing to §3.2/§3.3.
 
-The original recommendation to land PERF-001 first still holds for §3.2/§3.3 and no longer
-holds for §3.0: PERF-001 removes provider-side CPU from the same pipeline, but nothing in it
-touches the redundant re-wrap, and §0.2's numbers were taken with the renderer in isolation.
-
-Unlike [PERF-001](PERF-001_STREAM_SNAPSHOT_QUADRATIC.md), the *lockup* here is still
-unobserved since TUI-092 round 2 (that doc's §8, Q2–Q5 open). If §3.3 is started, **get a
-live reproduction first** (Q2: how many turns until spinner lag is noticeable?). §0.2 supplies
-the prediction to test against: lag should begin around a few thousand active rows today and
-not at all after §3.0.
+The earlier recommendation to land [PERF-001](PERF-001_STREAM_SNAPSHOT_QUADRATIC.md) first
+still holds for §3.2/§3.3 and does not hold for §3.0b/§3.0: PERF-001 removes provider-side CPU
+from the same pipeline, but nothing in it touches the re-highlight or the redundant wraps.
 
 ---
 
 ## 5. Definition of Done
 
-### 5.1 After §3.0 — frame cost
+### 5.1 After §3.0b — the markdown miss path
 
-1. **A frame is constant in active-turn size.** The `Paragraph` built by
-   `TranscriptView::render` receives at most `area.height` rows, carries no `.wrap()` and no
-   `.scroll()`, and the transcript's rows reach it through `Arc::clone`, never `Vec::clone`.
+1. **A streaming frame re-parses only new code lines.** `ParseState::new(` appears in
+   `markdown/highlight.rs` only on the cursor's rebuild path, never once per call:
+   `grep -c 'ParseState::new' crates/cyrup-tui/src/markdown/highlight.rs` is 1.
+2. **The invalidation key is complete.** The cursor rebuilds on a language change, a
+   `theme.generation` change, and on any input that is not a strict line-prefix extension of
+   what it already consumed.
+3. **The fallbacks are untouched.** An empty or unknown language token still takes
+   `highlight_lines`' `flat()` branch; `highlight_code_lines` still returns `None` for the same
+   and still strips the 2-space gutter (T5 / TUI-FIDELITY §2 span semantics unchanged).
+4. **An open streaming fence stays correct.** The final, still-growing line is re-parsed each
+   frame rather than consumed into the cursor.
+
+### 5.2 After §3.0 — frame cost
+
+5. **A frame is constant in active-turn size.** The `Paragraph` in `TranscriptView::render`
+   receives at most `area.height` rows, carries no `.wrap()` and no `.scroll()`, and the rows
+   reach it through `Arc::clone`.
    `grep -n 'lines.clone()\|\.wrap(Wrap' crates/cyrup-tui/src/transcript/cache.rs` returns
    nothing.
-2. **Content is wrapped exactly once per materialisation.** `wrap_line` appears once on the
-   live path (in `cached_render`) and once on the commit path (in `flush_committed`);
-   `wrapped_height`'s `lines.to_vec()` measurement pass is gone.
-3. **The viewport still sizes to wrapped rows.** A long single-paragraph streaming answer
-   reserves its full wrapped height in the inline region and is not clipped to one row on
-   commit — the PROSE-WRAP invariant `wrapped_height` existed for (R-ARCH-TUI-003/-005).
-4. **OSC-8 links still land on the right text.** The href table is cached with the rows it was
+6. **Content is wrapped exactly once per materialisation**, through `wrap_all_owned`, which
+   **moves** every already-fitting row. The `wrapped_height` measurement pass is gone from both
+   `cached_render` and `flush_committed`; the free function survives for its six other callers.
+7. **Height has one definition.** `rows.len()` is both the scroll bound and `content_height`;
+   no `lines.len()` remains on either path. A long single-paragraph streaming answer reserves
+   its full wrapped height in the inline region, is tail-anchored on the newest text (§0.5),
+   and is not clipped on commit (R-ARCH-TUI-003/-005).
+8. **OSC-8 links still land on the right text** — the href table is cached with the rows it was
    built from, and injection still runs after the blit.
 
-### 5.2 After §3.1 — frame rate
+### 5.3 After §3.1 — frame rate
 
-5. **N state changes inside one 16 ms window produce one frame.** The only unconditional
+9. **N state changes inside one 16 ms window produce one frame.** The only unconditional
    production paint is the top-of-body site in `App::run`; every arm requests.
-6. **A keystroke is never delayed by the throttle.** The input arm forces an immediate frame
-   (pi `tui.ts:896-900`), and `mark_input_serviced` still fires after it.
-7. **Frames coalesce at least as well as F3 does today.** N queued deltas produce ≤1 frame.
-   The structural guard in
-   [`src/tests/run_loop_draw_coalescing.rs`](../../../crates/cyrup-tui/src/tests/run_loop_draw_coalescing.rs)
-   counts `draw_synchronized()` per arm body, so it must be **re-anchored to the request
-   sites, not deleted** — same for
-   [`run_loop_input_priority.rs`](../../../crates/cyrup-tui/src/tests/run_loop_input_priority.rs)
-   and [`render_cache_tick.rs`](../../../crates/cyrup-tui/src/tests/render_cache_tick.rs),
-   whose `bump_render_tick`-before-draw ordering becomes bump-before-*request*.
-8. **The five synchronous sites remain synchronous.** Seed frame (`run.rs:120`), the final
-   frame on the exit path (`run.rs:419`), and the three terminal-handed-back redraws
-   (`crossterm.rs:136`/`:150`/`:170`) — pi's `renderNow`.
+10. **A keystroke is never delayed by the throttle.** The input arm forces an immediate frame
+    (pi `tui.ts:896-900`), and `mark_input_serviced` still fires after it.
+11. **The five synchronous sites remain synchronous** — `run.rs:120`, `run.rs:419`,
+    `crossterm.rs:136`/`:150`/`:170` (pi's `renderNow`) — and the exit path flushes a pending
+    frame before `drain_and_restore`.
+12. **The four structural guards are re-anchored and passing**, not deleted (§3.1 table).
 
-### 5.3 After §3.2/§3.3 — the decoupling
+### 5.4 After §3.2/§3.3 — the decoupling
 
-9. **Input is never starved by draw cost.** With an artificially slowed frame (say 500 ms),
-   keystrokes are still serviced promptly and the editor stays responsive. This is the
-   property that must hold *structurally* — not "does not reproduce", but "cannot".
-10. **The agent is not throttled by the renderer.** With the same artificially slowed frame,
-    `Fanout::emit`'s awaited sends do not stall the provider stream: token throughput is
-    unchanged from a fast-frame baseline.
-11. **Terminal state is correct on every exit path.** Normal quit, `Ctrl+D`, the double-tap
-    `Ctrl+C`, the three-chord hard exit from the reader thread, a panic on the run-loop task,
-    and a panic on the **render thread** each leave a usable shell out of raw mode and out of
-    the alternate screen.
-12. **The wedge detector still reports.** A stuck fold still produces
-    ``cyrup: run loop wedged in arm `{arm}` for {elapsed}``, and a stuck *render thread* is
-    also detected and reported rather than appearing as a silent freeze.
-13. **No tokio worker does terminal I/O.** The render thread is an OS thread.
-14. **The renderer paints nothing while `TERMINAL_RELEASED` is set** — no frame lands inside
-    `$EDITOR` or across a `Ctrl+Z` suspend.
-15. **Alternate-screen transitions are ordered against frames.** Entering and leaving the
-    alternate screen, resizes, and `append_lines` anchoring produce no torn or misplaced
-    output under a streaming turn.
+13. **Input cannot be starved by draw cost** — structurally, not "does not reproduce".
+14. **The agent is not throttled by the renderer**: `Fanout::emit`'s awaited sends do not stall
+    the provider stream behind a slow frame.
+15. **Terminal state is correct on every exit path**: normal quit, `Ctrl+D`, double-tap
+    `Ctrl+C`, the three-chord hard exit, a panic on the run-loop task, and a panic on the
+    **render thread**.
+16. **The wedge detector still reports**, and a stuck *render thread* is named rather than
+    appearing as a silent freeze.
+17. **No tokio worker does terminal I/O**; the render thread is an OS thread; it paints nothing
+    while `TERMINAL_RELEASED` is set; alternate-screen transitions, resizes and `append_lines`
+    anchoring are ordered against frames.
 
-### 5.4 The gate, and the go/no-go for §3.3
+### 5.5 The gate, and the go/no-go for §3.3
 
-16. **The suite is green under the real gate:**
-    `cargo test --workspace --features test-fixtures --no-fail-fast`, and
-    `cargo clippy --workspace --all-targets --features test-fixtures` exits **0** (the
-    no-panic lints — `unwrap_used`, `expect_used`, `panic`, `indexing_slicing` — do **not**
-    fire under `cargo build`/`cargo test`; check the exit code, not the output).
-17. **A live terminal check, not just `TestBackend`.** Per the workspace rule this doc's
-    predecessor states explicitly: a TUI claim is not settled by `TestBackend`. Drive a real
-    session with a large transcript and confirm 1, 5, 6 and 11 by hand.
-18. **The go/no-go.** On that live session, with the largest transcript reachable, record
-    whether the spinner still visibly slips. If it does not, §3.3 is not justified by CPU and
-    the remaining case for it is tty blocking alone — record that finding here and decide
+18. **The suite is green under the real gate**, from the workspace root:
+
+    ```bash
+    cargo test --workspace --features test-fixtures --no-fail-fast
+    cargo clippy --workspace --all-targets --features test-fixtures; echo "exit=$?"   # MUST be 0
+    ```
+
+    `--features test-fixtures` is required or two `[[bin]]` targets never build. The no-panic
+    lints (`unwrap_used`, `expect_used`, `panic`, `indexing_slicing`) fire **only** under
+    clippy — check the exit code, not the output.
+19. **The go/no-go.** With §3.0b and §3.0 landed, a turn holding 2,000 lines of code should
+    cost ~194 µs of layout and ~160 µs of highlight per frame instead of ~350 ms. If the
+    spinner no longer slips at the largest reachable transcript, §3.3 is **not** justified by
+    CPU and the remaining case rests on tty blocking alone (§1) — record that and decide
     deliberately rather than by momentum.
 
 ---
 
-## 6. [AUG] The probe
+## 6. The probes
 
-Standalone, no workspace edit, `--release`. Reproduces §0.2's table.
+All three are standalone crates under `./tmp`, no workspace edit, `--release`.
 
-```rust
-// tmp/perf005-probe/src/main.rs   (Cargo.toml: ratatui = "0.30.2", plus an empty [workspace])
-use ratatui::buffer::Buffer;
-use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
-use std::borrow::Cow;
-use std::time::Instant;
+| probe | reproduces | key result |
+| --- | --- | --- |
+| [`tmp/perf005-probe`](../../../tmp/perf005-probe) | §0.2 — the hit path, A→D | 91 ms → 194 µs at 16k rows |
+| [`tmp/perf005-miss`](../../../tmp/perf005-miss) | §0.3 — `wrapped_height` (E), naive vs move-based wrap (F/G) | E = 88 ms at 16k; G is 1.7× F |
+| [`tmp/perf005-hl`](../../../tmp/perf005-hl) | §0.4/§3.0b — `highlight_inner` verbatim, and the resumable form | 174 µs / code line; 87 ms at 500 lines; flat after §3.0b |
 
-fn build(rows: usize) -> Vec<Line<'static>> {
-    (0..rows).map(|r| Line::from((0..8).map(|s| Span::styled(
-        format!("{:12}", format!("r{r}s{s}")),
-        Style::default().fg(Color::Rgb(200,180,90)).add_modifier(Modifier::BOLD))).collect::<Vec<_>>())).collect()
-}
-/// The cheap alternative to `Vec::clone()`: same tree, every span a `Cow::Borrowed`.
-fn shallow<'a>(src: &'a [Line<'static>]) -> Vec<Line<'a>> {
-    src.iter().map(|l| Line {
-        spans: l.spans.iter().map(|s| Span { content: Cow::Borrowed(s.content.as_ref()), style: s.style }).collect(),
-        style: l.style, alignment: l.alignment }).collect()
-}
-fn timed(iters: usize, mut f: impl FnMut()) -> f64 {
-    for _ in 0..(iters/10).max(1) { f(); }
-    let t = Instant::now();
-    for _ in 0..iters { f(); }
-    t.elapsed().as_secs_f64() * 1e6 / iters as f64
-}
-fn main() {
-    let area = Rect::new(0, 0, 100, 30);
-    let h = area.height as usize;
-    for (rows, it) in [(20usize,3000usize),(200,2000),(1_000,800),(2_000,400),(4_000,200),(8_000,100),(16_000,60)] {
-        let src = build(rows);
-        let scroll = rows.saturating_sub(h).min(u16::MAX as usize) as u16;
-        let mut buf = Buffer::empty(area);
-        // A — today: deep clone + full re-wrap + scroll
-        let a = timed(it, || { buf.reset();
-            Paragraph::new(src.clone()).wrap(Wrap{trim:false}).scroll((scroll,0)).render(area,&mut buf); });
-        // B — drop the deep clone only
-        let b = timed(it, || { buf.reset();
-            Paragraph::new(shallow(&src)).wrap(Wrap{trim:false}).scroll((scroll,0)).render(area,&mut buf); });
-        // C — cache holds already-wrapped rows: drop `.wrap()`
-        let c = timed(it, || { buf.reset();
-            Paragraph::new(shallow(&src)).scroll((scroll,0)).render(area,&mut buf); });
-        // D — §3.0: window the paint to the visible rows
-        let d = timed(it, || { buf.reset();
-            let first = rows.saturating_sub(h).min(rows);
-            Paragraph::new(shallow(src.get(first..).unwrap_or(&[]))).render(area,&mut buf); });
-        println!("| {rows} | {a:.0} µs | {b:.0} µs | {c:.0} µs | {d:.0} µs |");
-    }
-}
-```
+`perf005-miss` and `perf005-hl` need
+`ratatui = { version = "0.30.2", features = ["unstable-rendered-line-info"] }` — `line_count`
+is behind that feature, which `cyrup-tui/Cargo.toml:84` already enables.
 
-Reference run on this host (2026-08-29, `--release`, 100 × 30 area) — §0.2's table.
-Companion figures from the same probe:
+**Three traps.**
 
-* `Vec<Line>::clone()` alone: `7 µs` @20 rows · `567 µs` @1k · `2 452 µs` @4k · `12 081 µs` @16k.
-* `Arc<Vec<Line>>::clone()`: **`11 ns`, flat** at every size — the §3.0/§3.2 publish.
-* Deep clone against the 80 ms spinner tick: `23.2 ms` @30k rows (29%) · `47.7 ms` @60k (60%) ·
-  `95.1 ms` @120k (119%). The full frame crosses the tick far earlier, at ~14k rows.
+* **Measure in `--release`.** A debug allocator's noise swamps the C→D difference entirely.
+* **Measure the frame, not the clone.** The deep clone is ~4% of the hit path; a probe that
+  times `lines.clone()` alone reports the least important of the three costs as the finding.
+  That is how the previous round nearly stopped at the wrong fix.
+* **Measure the MISS, not the hit.** `push_assistant_delta` bumps the generation, so the hit
+  path is not the streaming path. A probe that only exercises `RenderCache` hits misses the
+  syntect term entirely — which is the whole of §0.4, and 4× everything else combined.
 
-**Two traps.** Measure in `--release`: a debug build's allocator noise swamps the C→D
-difference. And measure the *frame*, not the clone — the clone is only ~4% of it, and a probe
-that times `lines.clone()` alone reports the least important of the three costs as if it were
-the finding.
+---
+
+/home/d0m17bw/workspace/cyrup/.flux/todo/performance/PERF-005_DECOUPLE_RENDER_FROM_FOLD.md

@@ -1,9 +1,9 @@
 ---
 stage: aug
-status: in-progress
+status: done
 updated: 2026-08-29 04:16
 aug_against: cyrup HEAD f3bf9f0 · pi v0.84.2 (agent-loop.ts unchanged from ported baseline)
-aug_reverified: cyrup HEAD 8f49433 (= f3bf9f0 + 1 commit; zero diff in cyrup-agent/session-svc/ext)
+aug_reverified: cyrup HEAD 8f49433 — AUG-3 pass re-checked every cyrup file:line EXACT; serde `rc` + clone-before-gate preconditions re-confirmed; pi at v0.84.2-48 (see §7)
 ---
 
 # Deep-copying the transcript per turn where pi copies pointers
@@ -450,3 +450,77 @@ in this task fails to compile. Verified at
 guest serialization, the guest-patch deserialization in §6.8, and the `--json`/RPC output in §6.3
 are all safe. This is a load-bearing precondition — record it so a future `rc`-feature removal is
 understood to break this task, not just this seam.
+
+---
+
+## 7. [AUG-3] Re-verification pass @ HEAD `8f49433` — every cyrup citation re-checked, exact
+
+*This pass re-ran the greps behind §1–§6 against the working tree at the **current** HEAD
+`8f49433` (identical to `f3bf9f0` in `cyrup-agent`/`session-svc`/`ext`/`core` — `git diff
+f3bf9f0..HEAD` on those four crates is empty). The point of the pass is to let `exec` trust the
+line numbers as-is: they were confirmed against the exact commit it will edit, not an ancestor.*
+
+### 7.1 All cyrup-side line numbers verified EXACT (no edits needed)
+
+Every `file:line` in §1–§6 resolves to the cited construct at HEAD `8f49433`. Spot-list of the
+load-bearing ones, each re-read this pass:
+
+- **§1 per-turn clones** — `stream.rs:40` (`base_messages = self.messages.clone()`),
+  `tools/mod.rs:63`, `turn.rs:52/99/160/177/197`, field decls `run/mod.rs:62,69`, accumulator
+  `run/mod.rs:245`, `lifecycle.rs:180,270,375`, `state.rs:122`, `loop_fn.rs:120,217` — all exact.
+- **§6.3 `agent_end` trio** — the `AgentEnd { messages: vec![fm.clone()] }` failure constructor is
+  at `run/mod.rs:221` **as cited** (line 222 is the separate `self.new_messages = vec![fm]`; do
+  not “correct” 221→222). Session seam `event.rs:154/328-329`, `subscriber.rs:68/72/196-198`,
+  and `retry.rs:75` (`will_retry_after_agent_end(&self, messages: &[AgentMessage])`) + its
+  `AgentMessage::Assistant(a)` arm at `:83` — all exact.
+- **§6.2 hook seam** — `hooks.rs:24` (`AgentContextView.messages: &'a [AgentMessage]`), `:114/117`
+  (`PostTurn`), `:215` (`convert_to_llm(&[AgentMessage])`), `:220` (`transform_context`) — exact.
+- **§6.7/§6.8 ext seams** — `ext/event.rs:300` (`Context`), `:314` (`AgentEnd`), `:536` (clone);
+  `ext/contract.rs:58` (`Context`), `:114` (`*messages = m`); `ext/hooks.rs:130/135/138`;
+  `ext/host/live.rs:2077` (Context `to_string`), `:2146` (AgentEnd `to_string`) — exact.
+- **§0/§3.5/§6.7.6 doc comment** — the `.slice()` SNAPSHOT comment is at `run/mod.rs:63-68`
+  exactly, above the `messages:` field at `:69`, citing `agent.ts:424-429; agent-loop.ts:104-107`.
+
+### 7.2 The two load-bearing preconditions were RE-CONFIRMED independently, not taken on faith
+
+- **serde `rc` (§6.9).** `Cargo.toml:145` reads
+  `serde        = { version = "1",   features = ["derive", "rc"] }` — confirmed by eye this pass
+  (note the column-aligned whitespace: a naive `grep 'serde = '` with single spaces MISSES it; use
+  `grep '"rc"' Cargo.toml`). All four path crates (`cyrup-core/agent/ext/session-svc`) take
+  `serde` via `workspace = true`. Without `rc`, every Arc-carrying seam in this task fails to
+  compile — so this is the first thing to sanity-check if a build errors on a missing
+  `Serialize`/`Deserialize` for `Arc<AgentMessage>`.
+- **§6.8 clone-BEFORE-gate ordering.** Re-read `ext/hooks.rs:135-136`: `let ev =
+  HostEvent::Context { messages: msgs.clone() };` is on the line **before**
+  `dispatch_block_mutate(ev, ...)`, and the `no_subscribers` gate lives *inside*
+  `dispatch_block_mutate` at `dispatch.rs:415`. So the `transform_context` transcript copy is
+  genuinely UNCONDITIONAL (fires with zero `context` subscribers), unlike the `agent_end` copy at
+  `ext/subscriber.rs:65` (`HostEvent::from_agent`) which sits AFTER that file's own
+  `no_subscribers` gate at `:62`. The §6.8 asymmetry is real — this is exactly why DoD #6 names the
+  `HostEvent::Context` build specifically.
+- **§6.1 `no Arc::make_mut` (DoD #4).** Re-confirmed: writes to the three transcripts are all
+  `push` of a freshly built message; no in-place index-assignment on this path. Structurally safe.
+
+### 7.3 pi oracle: version + behavioural claims confirmed; two immaterial 1-line drifts
+
+- **pi is at `v0.84.2-48-g59a71b2` here** (tags `v0.84.0/1/2` all present). The frontmatter’s
+  `pi v0.84.2` is correct and is MORE current than the workspace `CLAUDE.md`’s “v0.84.1” — trust
+  the frontmatter, not `CLAUDE.md`, for this file.
+- **Behaviour confirmed** at `agent-loop.ts`: `let currentContext = initialContext` (`:163`),
+  by-reference reassign `currentContext = nextTurnSnapshot.context ?? currentContext` (`:234`),
+  accumulator `newMessages.push(…)` (`:187/:194/:220`), `{ type:"agent_end", messages:
+  newMessages }` (`:198/:255/:274`), and the run-request copy `messages: [...context.messages,
+  ...prompts]` (`:106`, a spread — the literal `.slice()` is the run-start snapshot in
+  `agent.ts:424-429`, which is what the cyrup comment cites). Parity claim intact.
+- **Do NOT “fix” the two 1-line pi drifts.** §2 cites the two `currentContext.messages.push`
+  sites as `:186` and `:219`; at this checkout they are `:187` and `:220`. This is normal upstream
+  line drift on a read-only oracle and changes NOTHING about the cyrup work — left as-is
+  deliberately so a future reader doesn’t burn a turn “correcting” a pi line that will drift again.
+
+### 7.4 Bottom line for `exec`
+
+The plan in §6.7 (steps 1–7) is ready to execute verbatim; §6.8 is mandatory (DoD #6/#2); §6.4/§6.5
+draw the scope boundary (do **not** touch `StateInner::messages` / `AgentStateSnapshot` / the public
+`RunHandle::finished` return type in Phase 1). No citation in this file needs updating before
+starting. If the compiler points at a `file:line` that disagrees with this document, HEAD moved
+after `8f49433` — re-grep that one site before editing; everything else in the plan still holds.
