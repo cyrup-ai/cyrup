@@ -7,6 +7,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing, clippy::panic)]
 
 use crate::transcript::*;
+use crate::transcript::layout::wrap_all_owned;
 use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
@@ -28,15 +29,32 @@ fn buffer_text(terminal: &Terminal<TestBackend>) -> String {
     out
 }
 
-/// The core invariant, asserted after every step of a simulated turn: the cached entry equals
-/// a fresh `lines()` + `wrapped_height()` compute at the same key.
+/// Poison the cache with rows nothing could have produced, so a later read proves the cache was
+/// consulted rather than recomputed. `POISON_HEIGHT` rows, so `content_height` reports it.
+fn poison(view: &mut TranscriptView) {
+    view.render_cache.rows =
+        std::sync::Arc::new(vec![Line::from("POISON"); POISON_HEIGHT]);
+}
+
+/// The core invariant, asserted after every step of a simulated turn: the cached entry equals a
+/// fresh `lines()` wrapped at the same key.
+///
+/// Re-anchored for PERF-005 §3.0: the cache now holds already-WRAPPED rows, so the oracle is
+/// `wrap_all_owned` — cyrup's own `wrap_line`, the rows that actually get blitted — and not
+/// `wrapped_height`'s ratatui `Paragraph::line_count`, which was a PREDICTION of what a
+/// `.wrap()`ing `Paragraph` would paint. There is no `.wrap()` any more, so `rows.len()` is not an
+/// estimate of the height, it IS the height.
 fn assert_fresh(view: &mut TranscriptView, theme: &UiTheme, step: &str) {
     let fresh = view.lines(80, theme);
-    let fresh_h = wrapped_height(&fresh, 80);
+    let fresh_rows = wrap_all_owned(fresh, 80);
     let cache = view.cached_render(80, theme);
-    assert_eq!(cache.lines, fresh, "stale cached lines after {step}");
-    assert_eq!(cache.wrapped_height, fresh_h, "stale cached height after {step}");
-    assert_eq!(view.content_height(80, theme), fresh_h, "stale content_height after {step}");
+    assert_eq!(cache.rows.as_slice(), fresh_rows.as_slice(), "stale cached rows after {step}");
+    assert_eq!(cache.rows.len(), fresh_rows.len(), "stale cached height after {step}");
+    assert_eq!(
+        view.content_height(80, theme),
+        fresh_rows.len(),
+        "stale content_height after {step}"
+    );
 }
 
 #[test]
@@ -45,8 +63,7 @@ fn a_default_view_starts_unprimed() {
     assert_eq!(view.render_generation, 0);
     assert_eq!(view.render_cache.generation, 0);
     assert_eq!(view.render_cache.width, 0);
-    assert!(view.render_cache.lines.is_empty());
-    assert_eq!(view.render_cache.wrapped_height, 0);
+    assert!(view.render_cache.rows.is_empty());
 }
 
 #[test]
@@ -56,8 +73,9 @@ fn the_first_content_height_populates_the_cache() {
     view.push_assistant_delta("hello **world**");
     let h = view.content_height(80, &theme);
     let fresh = view.lines(80, &theme);
-    assert_eq!(h, wrapped_height(&fresh, 80));
-    assert_eq!(view.render_cache.lines, fresh);
+    let fresh_rows = wrap_all_owned(fresh, 80);
+    assert_eq!(h, fresh_rows.len());
+    assert_eq!(view.render_cache.rows.as_slice(), fresh_rows.as_slice());
     assert_eq!(view.render_cache.width, 80);
     assert_eq!(view.render_cache.generation, view.render_generation);
     assert_eq!(view.render_cache.theme_generation, theme.generation);
@@ -69,7 +87,7 @@ fn a_key_hit_serves_the_cached_entry_without_recomputing() {
     let theme = UiTheme::dark();
     view.push_assistant_delta("real content");
     let _ = view.content_height(80, &theme);
-    view.render_cache.wrapped_height = POISON_HEIGHT;
+    poison(&mut view);
     assert_eq!(
         view.content_height(80, &theme),
         POISON_HEIGHT,
@@ -83,7 +101,7 @@ fn a_content_bump_misses_and_recomputes() {
     let theme = UiTheme::dark();
     view.push_assistant_delta("real content");
     let _ = view.content_height(80, &theme);
-    view.render_cache.wrapped_height = POISON_HEIGHT;
+    poison(&mut view);
     let generation = view.render_generation;
     view.push_assistant_delta(" more");
     assert!(
@@ -93,7 +111,7 @@ fn a_content_bump_misses_and_recomputes() {
     let fresh = view.lines(80, &theme);
     assert_eq!(
         view.content_height(80, &theme),
-        wrapped_height(&fresh, 80),
+        wrap_all_owned(fresh, 80).len(),
         "the frame after a bump must re-materialise, not serve the poisoned entry"
     );
 }
@@ -104,9 +122,9 @@ fn a_width_change_misses_and_recomputes() {
     let theme = UiTheme::dark();
     view.push_assistant_delta("real content");
     let _ = view.content_height(80, &theme);
-    view.render_cache.wrapped_height = POISON_HEIGHT;
+    poison(&mut view);
     let fresh = view.lines(81, &theme);
-    assert_eq!(view.content_height(81, &theme), wrapped_height(&fresh, 81));
+    assert_eq!(view.content_height(81, &theme), wrap_all_owned(fresh, 81).len());
     assert_eq!(view.render_cache.width, 81);
 }
 
@@ -116,11 +134,11 @@ fn a_theme_generation_change_misses_and_recomputes() {
     let theme = UiTheme::dark();
     view.push_assistant_delta("real content");
     let _ = view.content_height(80, &theme);
-    view.render_cache.wrapped_height = POISON_HEIGHT;
+    poison(&mut view);
     let mut theme2 = theme.clone();
     theme2.generation = theme.generation.wrapping_add(1);
     let fresh = view.lines(80, &theme);
-    assert_eq!(view.content_height(80, &theme2), wrapped_height(&fresh, 80));
+    assert_eq!(view.content_height(80, &theme2), wrap_all_owned(fresh, 80).len());
     assert_eq!(view.render_cache.theme_generation, theme2.generation);
 }
 
@@ -271,7 +289,7 @@ fn bump_render_tick_advances_once_and_invalidates() {
     let theme = UiTheme::dark();
     view.push_assistant_delta("real content");
     let _ = view.content_height(80, &theme);
-    view.render_cache.wrapped_height = POISON_HEIGHT;
+    poison(&mut view);
     let generation = view.render_generation;
     view.bump_render_tick();
     assert_eq!(
@@ -282,7 +300,7 @@ fn bump_render_tick_advances_once_and_invalidates() {
     let fresh = view.lines(80, &theme);
     assert_eq!(
         view.content_height(80, &theme),
-        wrapped_height(&fresh, 80),
+        wrap_all_owned(fresh, 80).len(),
         "the frame after a tick bump must re-materialise (the wall-clock inputs live in lines())"
     );
 }
@@ -352,7 +370,7 @@ fn render_paints_the_cached_lines_not_a_recompute() {
     // Prime the cache at the paint width, then poison it: the paint must show the SENTINEL,
     // proving `Component::render` reads the cache instead of re-running `lines()`.
     let _ = view.content_height(40, &theme);
-    view.render_cache.lines = vec![Line::from("SENTINEL-LINE")];
+    view.render_cache.rows = std::sync::Arc::new(vec![Line::from("SENTINEL-LINE")]);
     terminal
         .draw(|frame| {
             let area = frame.area();
@@ -377,5 +395,70 @@ fn render_paints_the_cached_lines_not_a_recompute() {
     assert!(
         text.contains("real-streamed-text-tail"),
         "the post-bump paint must re-materialise:\n{text}"
+    );
+}
+
+/// PERF-005 §5.5.19 — the go/no-go measurement for §3.3.
+///
+/// The spec gates the dedicated render thread on a number rather than on momentum: with §3.0a,
+/// §3.0b and §3.0 landed, if a frame at the largest reachable transcript no longer outruns the
+/// 80 ms spinner tick (`status_indicator.rs`), §3.3 is not justified by CPU and the remaining case
+/// rests on tty blocking alone.
+///
+/// `#[ignore]` because it is a measurement, not an assertion — run it deliberately:
+/// `cargo test -p cyrup-tui --lib go_no_go -- --ignored --nocapture --test-threads=1`
+/// and read it in `--release`, where the numbers mean something.
+#[test]
+#[ignore = "measurement, not an assertion — see PERF-005 §5.5.19"]
+fn go_no_go_frame_cost_at_the_largest_reachable_transcript() {
+    use std::time::Instant;
+
+    let theme = UiTheme::dark();
+    let code: String = (0..2_000)
+        .map(|i| format!("fn f{i}(x: u32) -> u32 {{ x + {i} }}\n"))
+        .collect();
+    let body: String = (0..2_000).map(|i| format!("line {i} of a read result\n")).collect();
+
+    // A turn that holds BOTH terms the cliff was made of: 2,000 lines of streaming code in a
+    // fence, and a settled 2,000-line `read` whose body is collapsed to ten rows.
+    let mut view = TranscriptView::new();
+    view.push_tool_start("read", serde_json::json!({ "file_path": "/tmp/big.rs" }));
+    view.push_tool_end(
+        "read",
+        false,
+        Some(serde_json::json!({ "content": body, "file_path": "/tmp/big.rs" })),
+    );
+    view.push_assistant_delta(&format!("Here is the code:\n\n```rust\n{code}"));
+
+    // The MISS path is the streaming path: `push_assistant_delta` bumps the generation, so every
+    // frame of a streaming turn re-materialises. Measure that, not the hit.
+    let frames = 20usize;
+    let mut each = Vec::with_capacity(frames);
+    for i in 0..frames {
+        view.push_assistant_delta(&format!("fn extra{i}() {{}}\n"));
+        let t = Instant::now();
+        let h = view.content_height(120, &theme);
+        each.push(t.elapsed());
+        std::hint::black_box(h);
+    }
+    let first = each.first().copied().unwrap_or_default();
+    let steady: Vec<_> = each.iter().skip(1).copied().collect();
+    let worst_steady = steady.iter().copied().max().unwrap_or_default();
+    let mean_steady = steady.iter().sum::<std::time::Duration>()
+        / u32::try_from(steady.len().max(1)).unwrap_or(1);
+    let tick = std::time::Duration::from_millis(80);
+    println!(
+        "PERF-005 §5.5.19 go/no-go — 2,000-line fence + collapsed 2,000-line read, width 120\n  \
+         first frame (cold caches): {first:?}\n  \
+         steady-state mean        : {mean_steady:?}\n  \
+         steady-state worst       : {worst_steady:?}\n  \
+         spinner tick (the cliff) : {tick:?}\n  \
+         all frames: {each:?}\n  \
+         verdict: {}",
+        if worst_steady < tick {
+            "steady state is UNDER the tick — the cliff is not reachable while streaming"
+        } else {
+            "steady state is OVER the tick — the cliff is still reachable"
+        }
     );
 }

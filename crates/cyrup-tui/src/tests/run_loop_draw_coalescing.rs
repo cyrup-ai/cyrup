@@ -4,6 +4,11 @@
 //! # What was broken
 //!
 //! Every run-loop arm ended in its own `draw_synchronized()` after servicing exactly ONE message,
+//! and now ends in exactly one `frames.request()` instead — the paint moved to the single
+//! top-of-body site so that N arms firing inside one interval produce ONE frame (PERF-005 §3.1).
+//! The token matched is the `frames.request` PREFIX, so it covers the input arm's
+//! `request_immediate()` — pi's `requestImmediateRender()`, which preempts the throttle so a
+//! keystroke is never delayed, but is still exactly ONE request.
 //! so frames/s was proportional to event rate: a model streaming 100+ `TextDelta`s/s demanded
 //! 100+ full frames/s (each paying F2's triple materialisation), every output chunk of a live `!`
 //! run cost a frame, and key auto-repeat (30–60/s) against a slow frame was an unbounded
@@ -108,9 +113,9 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
     // anchor in that file, so the slice deliberately runs to EOF.
     let arm = arm_body_to_end(ACTION_SRC, "fn on_session_event(");
     assert_eq!(
-        arm.matches("draw_synchronized()").count(),
+        arm.matches("frames.request").count(),
         1,
-        "the events arm must draw exactly once per wakeup:\n{arm}"
+        "the events arm must request exactly one frame per wakeup:\n{arm}"
     );
     // ONE guard brackets the WHOLE drain — the reader thread's wedge detector keeps seeing a
     // single "events" span, not N. A closed stream can no longer enter this handler at all: the
@@ -124,7 +129,7 @@ fn the_events_arm_drains_every_ready_event_then_draws_once() {
     );
     let guard = pos(arm, "ArmGuard::enter(\"events\")");
     let drain = pos(arm, "events.next().now_or_never()");
-    let draw = pos(arm, "draw_synchronized()");
+    let draw = pos(arm, "frames.request");
     assert!(
         guard < drain && drain < draw,
         "ONE guard, then the now_or_never drain, then the single draw:\n{arm}"
@@ -155,9 +160,9 @@ fn the_input_arm_drains_every_queued_key_then_draws_once() {
     // Terminator `fn on_session_event(` lives in app/run_action.rs (ACTION_SRC), the next fn.
     let arm = arm_body(ACTION_SRC, "fn on_input_event(", "fn on_session_event(");
     assert_eq!(
-        arm.matches("draw_synchronized()").count(),
+        arm.matches("frames.request").count(),
         1,
-        "the input arm must draw exactly once per wakeup:\n{arm}"
+        "the input arm must request exactly one frame per wakeup:\n{arm}"
     );
     assert_eq!(
         arm.matches("ArmGuard::enter(\"input\")").count(),
@@ -167,7 +172,7 @@ fn the_input_arm_drains_every_queued_key_then_draws_once() {
     let guard = pos(arm, "ArmGuard::enter(\"input\")");
     let drain = pos(arm, "input.next().now_or_never()");
     let counted = pos(arm, "serviced += 1;");
-    let draw = pos(arm, "draw_synchronized()");
+    let draw = pos(arm, "frames.request");
     assert!(
         guard < drain && drain < counted && counted < draw,
         "ONE guard, then the now_or_never drain, then per-event dispatch counting, then the \
@@ -183,7 +188,7 @@ fn the_input_arm_drains_every_queued_key_then_draws_once() {
 fn the_input_arm_marks_each_serviced_key_after_the_single_draw() {
     // Terminator `fn on_session_event(` lives in app/run_action.rs (ACTION_SRC), the next fn.
     let arm = arm_body(ACTION_SRC, "fn on_input_event(", "fn on_session_event(");
-    let draw = pos(arm, "draw_synchronized()");
+    let draw = pos(arm, "frames.request");
     let marks_loop = pos(arm, "for _ in 0..serviced {");
     let mark = pos(arm, "mark_input_serviced();");
     assert!(
@@ -201,12 +206,12 @@ fn the_bash_arm_drains_with_try_recv_then_draws_once() {
     // Terminator `fn on_overlay_ticked(` lives in app/run_arms.rs (ARMS_SRC), the next fn.
     let arm = arm_body(ARMS_SRC, "fn on_bash_msg(", "fn on_overlay_ticked(");
     assert_eq!(
-        arm.matches("draw_synchronized()").count(),
+        arm.matches("frames.request").count(),
         1,
-        "the bash arm must draw exactly once per wakeup:\n{arm}"
+        "the bash arm must request exactly one frame per wakeup:\n{arm}"
     );
     let drain = pos(arm, "rx.try_recv()");
-    let draw = pos(arm, "draw_synchronized()");
+    let draw = pos(arm, "frames.request");
     assert!(drain < draw, "the try_recv drain precedes the single draw:\n{arm}");
     assert!(
         arm.contains("ctx.bash_rx = None;") && arm.contains("break;"),
@@ -229,9 +234,9 @@ fn one_wakeup_one_frame_across_the_three_high_frequency_arms() {
     ] {
         let body = next.map_or_else(|| arm_body_to_end(src, arm), |t| arm_body(src, arm, t));
         assert_eq!(
-            body.matches("draw_synchronized()").count(),
+            body.matches("frames.request").count(),
             1,
-            "arm `{arm}` must draw exactly once per wakeup:\n{body}"
+            "arm `{arm}` must request exactly one frame per wakeup:\n{body}"
         );
     }
 }

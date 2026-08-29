@@ -274,17 +274,30 @@ impl<B: Backend> App<B> {
         #[cfg(any(test, feature = "scrollback-accumulator"))]
         self.state.scrollback.extend(lines.iter().cloned());
         let style = self.state.theme.base_style();
-        // Size the scrollback slot to the WRAPPED display-row count (not `lines.len()`) and render
-        // WITH `.wrap()`: `entry_lines` emits one un-wrapped `Line` per prose paragraph, so a long
-        // committed answer must wrap to width and reserve its wrapped height — otherwise
-        // `insert_before` clips it to a single row and the full text is lost from native scrollback
-        // (the PROSE-WRAP truncation; R-ARCH-TUI-003/-005, spec/tui/01 §3 overflow).
-        let height = crate::transcript::wrapped_height(&lines, width).min(u16::MAX as usize) as u16;
+        // Size the scrollback slot to the WRAPPED display-row count, not `lines.len()`: a long
+        // committed answer must reserve its wrapped height or `insert_before` clips it and the
+        // full text is lost from native scrollback (the PROSE-WRAP truncation;
+        // R-ARCH-TUI-003/-005, spec/tui/01 §3 overflow).
+        //
+        // [PERF-005 §3.5] This used to say `entry_lines` emits one un-wrapped `Line` per prose
+        // paragraph. That has not been true since `MdRenderer::finish` started wrapping to width
+        // (`markdown/walk.rs:835-838`) — most rows arrive already fitting, which is exactly why
+        // `wrap_all_owned` MOVES them instead of cloning. The rows that still need wrapping are
+        // the ones the inner wrap cannot bound (deeply nested quoted lists at a narrow pane) and
+        // the ones that never went through markdown at all (`tool_lines`,
+        // `BashExecution::render_lines`).
+        //
+        // Wrap ONCE, here, and blit the result: this used to measure with `wrapped_height`
+        // (a `to_vec` plus a full ratatui `line_count` pass) and then wrap a SECOND time inside
+        // `Paragraph::render(.wrap(..))`. `rows.len()` is the same height for free, and it is now
+        // the same oracle the live viewport uses (PERF-005 §3.0).
+        let rows = crate::transcript::wrap_all_owned(lines, width.max(1));
+        let height = rows.len().min(u16::MAX as usize) as u16;
         self.terminal
             .insert_before(height, move |buf| {
-                Paragraph::new(lines).style(style).wrap(Wrap { trim: false }).render(buf.area, buf);
-                // AFTER the wrap: the escape must not be present while `Paragraph` measures
-                // columns, and the marked cells do not exist until it has written them.
+                Paragraph::new(rows).style(style).render(buf.area, buf);
+                // AFTER the rows are written: the escape must not be present while `Paragraph`
+                // measures columns, and the marked cells do not exist until it has written them.
                 crate::osc::inject(buf, &links);
             })
             .map_err(|e| TuiError::Backend(e.to_string()))?;

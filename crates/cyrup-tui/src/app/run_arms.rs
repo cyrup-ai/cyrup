@@ -304,7 +304,7 @@ impl App<InlineBackend<Stdout>> {
         if rt.generation().await != bound_gen {
             return Ok(());
         }
-        self.draw_synchronized()?;
+        self.frames.request();
         Ok(())
     }
 
@@ -346,13 +346,13 @@ impl App<InlineBackend<Stdout>> {
                     if self.state.loader.is_some() {
                         self.state.loader_tick = self.state.loader_tick.wrapping_add(1);
                     }
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
     pub(crate) fn on_dialog_countdown_tick(&mut self) -> Result<(), TuiError> {
                     self.tick_extension_dialog_countdown();
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -361,7 +361,7 @@ impl App<InlineBackend<Stdout>> {
                     // computed from `started_at` inside `lines()`, so the render cache must be
                     // invalidated for the repaint to show a fresh value.
                     self.state.transcript.bump_render_tick();
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -370,7 +370,7 @@ impl App<InlineBackend<Stdout>> {
                     // inside `if (this.cachedBranch !== nextBranch)`); an unchanged `stat` draws
                     // nothing.
                     if self.poll_footer_git_branch() {
-                        self.draw_synchronized()?;
+                        self.frames.request();
                     }
         Ok(())
     }
@@ -416,7 +416,7 @@ impl App<InlineBackend<Stdout>> {
                             }
                         }
                     }
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -430,7 +430,7 @@ impl App<InlineBackend<Stdout>> {
                         changed |= overlay.tick();
                     }
                     if changed {
-                        self.draw_synchronized()?;
+                        self.frames.request();
                     }
         Ok(())
     }
@@ -457,7 +457,7 @@ impl App<InlineBackend<Stdout>> {
                         interval
                     });
                     self.state.overlays.push(Box::new(adapter));
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -469,7 +469,7 @@ impl App<InlineBackend<Stdout>> {
                     // the matching input-slot selector via `open_extension_dialog` and waits for a
                     // future key event to confirm/cancel it (`AppState::pending_ui_reply`).
                     self.open_extension_dialog(req);
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -498,7 +498,7 @@ impl App<InlineBackend<Stdout>> {
                         ctx.spinner = tokio::time::interval(self.state.indicator.spinner_period());
                         ctx.spinner.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                     }
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -509,13 +509,13 @@ impl App<InlineBackend<Stdout>> {
                     // `tracing`, so a broken extension silently ate its hook — or silently denied a
                     // tool — with nothing on screen (TUI-S02).
                     self.show_extension_error(&err);
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
     pub(crate) fn on_shortcut_status(&mut self, msg: String) -> Result<(), TuiError> {
                     self.state.transcript.push_status(msg);
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -523,7 +523,7 @@ impl App<InlineBackend<Stdout>> {
                     // A spawned `/compact` settled (TUI-055). The band was cleared by the
                     // `compaction_end` event that preceded this message on the `events` stream.
                     self.apply_compact_outcome(outcome);
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -535,7 +535,7 @@ impl App<InlineBackend<Stdout>> {
                     // (the `/fork` editor re-seed, the `/reload` keybinding rebuild) and clears that
                     // caption if the op turned out to have failed.
                     self.apply_lifecycle_outcome(outcome);
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -544,7 +544,7 @@ impl App<InlineBackend<Stdout>> {
                     // `drain_queue().await` inline happens here, in the same order: the
                     // `clearAllQueues` interleave, the editor restore, then the abort.
                     self.apply_queue_drain(drained, &ctx.session);
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -556,7 +556,7 @@ impl App<InlineBackend<Stdout>> {
                     ctx.package_update_rx = None;
                     if let Some(packages) = maybe_updates {
                         self.state.transcript.push_package_updates(&packages);
-                        self.draw_synchronized()?;
+                        self.frames.request();
                     }
         Ok(())
     }
@@ -566,7 +566,7 @@ impl App<InlineBackend<Stdout>> {
                     // (`interactive-mode.ts:3885-3889`), the same framing the extension `notify`
                     // path uses in `apply_ui_effect`.
                     self.state.transcript.push_warning(format!("Warning: {warning}"));
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -602,7 +602,7 @@ impl App<InlineBackend<Stdout>> {
                         ctx.runtime.as_ref(),
                     )
                     .await;
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -612,7 +612,7 @@ impl App<InlineBackend<Stdout>> {
                     // the `try`/`catch` around `loginProvider`, `interactive-mode.ts:5367-5374`,
                     // `:5285-5296`). Answers travel back over the one-shot the message carried.
                     self.apply_login_msg(msg);
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -624,7 +624,7 @@ impl App<InlineBackend<Stdout>> {
                     if let Some(cmd) = self.apply_tree_nav_outcome(msg) {
                         self.execute_command(cmd, &ctx.session, ctx.runtime.as_ref()).await;
                     }
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(())
     }
 
@@ -634,14 +634,15 @@ impl App<InlineBackend<Stdout>> {
     pub(crate) fn on_share_msg(&mut self, msg: ShareMsg) -> Result<(), TuiError> {
         let _arm = ArmGuard::enter("share");
         self.apply_share_outcome(msg);
-        self.draw_synchronized()
+        self.frames.request();
+        Ok(())
     }
 
     pub(crate) fn on_theme_changed(&mut self, ok: bool, theme_rx: &Option<tokio::sync::watch::Receiver<Arc<ThemeData>>>) -> Result<(), TuiError> {
                     if ok && let Some(rx) = theme_rx.as_ref() {
                         let data = rx.borrow().clone();
                         self.set_theme(UiTheme::from_theme_data(&data, 0));
-                        self.draw_synchronized()?;
+                        self.frames.request();
                     }
         Ok(())
     }

@@ -9,7 +9,7 @@
 //! The cache key is `(render_generation, width, theme.generation)`; `lines()` *also* reads
 //! `Instant::now()` at those two sites. The run loop's spinner tick (gated on
 //! `bash_running()`) and elapsed tick (gated on `has_running_elapsed_tool()`) exist precisely to
-//! animate those figures, but their bodies only called `draw_synchronized()` — a guaranteed
+//! animate those figures, but their bodies only asked for a frame — a guaranteed
 //! cache hit — so a silent long-running `!` command or `bash` tool painted a frozen glyph and a
 //! frozen `Elapsed` until the next content event.
 //!
@@ -75,12 +75,13 @@ fn the_spinner_tick_bumps_when_time_derived_content_is_live() {
         .find("bump_render_tick()")
         .unwrap_or_else(|| panic!("the spinner arm must invalidate the render cache:\n{body}"));
     let draw = body
-        .find("draw_synchronized()")
-        .unwrap_or_else(|| panic!("the spinner arm must repaint:\n{body}"));
+        .find("frames.request()")
+        .unwrap_or_else(|| panic!("the spinner arm must request a frame:\n{body}"));
     assert!(
         bump < draw,
-        "the bump must precede the draw, so the very next `cached_render` misses once and the \
-         frame re-materialises:\n{body}"
+        "the bump must precede the request, so the very next `cached_render` misses once and the \
+         frame re-materialises. The draw itself now happens at the top of the run-loop body \
+         (PERF-005 §3.1), so what this pins is the ORDER within the arm:\n{body}"
     );
 }
 
@@ -101,11 +102,12 @@ fn the_elapsed_tick_bumps_before_repainting() {
         .find("bump_render_tick()")
         .unwrap_or_else(|| panic!("the elapsed arm must invalidate the render cache:\n{body}"));
     let draw = body
-        .find("draw_synchronized()")
-        .unwrap_or_else(|| panic!("the elapsed arm must repaint:\n{body}"));
+        .find("frames.request()")
+        .unwrap_or_else(|| panic!("the elapsed arm must request a frame:\n{body}"));
     assert!(
         bump < draw,
-        "the bump must precede the draw, so the repaint shows a fresh `Elapsed` figure:\n{body}"
+        "the bump must precede the request, so the frame the loop then paints shows a fresh \
+         `Elapsed` figure:\n{body}"
     );
 }
 

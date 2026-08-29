@@ -374,6 +374,30 @@ pub(super) fn body_line(
     }
 }
 
+/// Wrap a materialised turn into display rows, MOVING every row that already fits.
+///
+/// Not `lines.into_iter().flat_map(|l| wrap_line(&l, w))`: [`wrap_line`]'s early return is
+/// `vec![line.clone()]`, a deep clone of a [`Line`] whose spans each own a `String` — and almost
+/// every row takes that branch, because `MdRenderer::finish` already wrapped the markdown to
+/// `width`. Moving instead costs no allocation and no memcpy (PERF-005 §3.0).
+///
+/// The [`wrap_line`] call is still needed for the rows the inner wrap cannot bound — deeply nested
+/// quoted lists at a narrow pane — and for the rows that never went through markdown at all:
+/// `tool_lines` and `BashExecution::render_lines` carry no pre-wrapped guarantee. That is why the
+/// wrap MOVES here rather than being deleted.
+pub(crate) fn wrap_all_owned(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut out = Vec::with_capacity(lines.len());
+    for line in lines {
+        if crate::text_width::spans_width(&line.spans) <= width {
+            out.push(line); // MOVE — no allocation, no memcpy
+        } else {
+            out.extend(wrap_line(&line, width));
+        }
+    }
+    out
+}
+
 /// The number of WRAPPED display rows `lines` occupy at `width`, using the **same** word-wrap
 /// `ratatui`'s `Paragraph::render` applies with `.wrap(Wrap { trim: false })`. ratatui 0.30's
 /// `Paragraph::line_count(width)` runs the identical `WordWrapper` the renderer does, so the measured

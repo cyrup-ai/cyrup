@@ -265,7 +265,7 @@ impl App<InlineBackend<Stdout>> {
                     // A no-op (one string test) unless the cursor sits in `/<ext-command> <arg>`.
                     // See `crate::commands::ArgumentCompleter::Extension`.
                     self.refresh_extension_completions(&ctx.session).await;
-                    self.draw_synchronized()?;
+                    self.frames.request_immediate();
                     // TUI-092 — the liveness beacon the input reader's wedge detector watches.
                     // Once per serviced event, and deliberately AFTER the single draw, so it still
                     // means "serviced", not "started": a frame the user never sees is not service.
@@ -336,7 +336,7 @@ impl App<InlineBackend<Stdout>> {
                             return Ok(RunFlow::ReturnOk);
                         }
                     }
-                    self.draw_synchronized()?;
+                    self.frames.request();
         Ok(RunFlow::Continue)
     }
 }

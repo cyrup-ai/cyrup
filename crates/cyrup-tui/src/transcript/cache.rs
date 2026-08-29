@@ -1,4 +1,5 @@
 use super::*;
+use super::layout::wrap_all_owned;
 
 impl TranscriptView {
     /// Invalidate the render cache. Called by every mutator on the bump list below; the next
@@ -34,18 +35,14 @@ impl TranscriptView {
             // lines and stored with them, because the marker ids the spans carry index THIS table.
             let links = crate::osc::LinkSink::new();
             let lines = self.lines_with(width, theme, Some(&links)); // the current body, unchanged
-            // Measure WRAPPED display rows, not logical lines: `markdown::render` emits ONE
-            // un-wrapped `Line` per prose paragraph, so counting `lines.len()` under-counts a long
-            // streaming paragraph. `wrapped_height` measures with the SAME word-wrap `render`
-            // applies (`Paragraph::line_count`). (Moved verbatim from the old `content_height`
-            // body, transcript.rs:1138-1143.)
-            let wrapped_height = wrapped_height(&lines, width);
+            // Wrap HERE, on the miss path, where the markdown pass already is — so a frame pays for
+            // wrapping only when the content changed, and `render` becomes a slice of the result
+            // rather than a re-wrap of the whole turn (PERF-005 §3.0).
             self.render_cache = RenderCache {
                 generation: self.render_generation,
                 width,
                 theme_generation: theme.generation,
-                lines,
-                wrapped_height,
+                rows: std::sync::Arc::new(wrap_all_owned(lines, width.max(1))),
                 links,
             };
         }
@@ -56,7 +53,7 @@ impl TranscriptView {
     /// height, used to **content-size** the inline viewport (ADR-0001 commitment #1, audit #1) so the
     /// empty turn never balloons into a void. `0` when nothing is streaming.
     pub fn content_height(&mut self, width: usize, theme: &UiTheme) -> usize {
-        self.cached_render(width, theme).wrapped_height
+        self.cached_render(width, theme).rows.len()
     }
 
     /// Build the styled lines the inline viewport renders: **only** the active streaming partial,
@@ -227,21 +224,26 @@ impl Component for TranscriptView {
     /// text stays visible as it grows (spec/tui/01 §3 overflow).
     fn render(&mut self, frame: &mut Frame, area: Rect, theme: &UiTheme) {
         let width = area.width as usize;
-        let (total, lines) = {
-            let cache = self.cached_render(width, theme);
-            (cache.lines.len(), cache.lines.clone())
-        };
+        // A refcount bump, not a deep copy of the turn. The rows outlive the borrow, so nothing
+        // holds `&mut self` across the paint (PERF-005 §3.0).
+        let rows = std::sync::Arc::clone(&self.cached_render(width, theme).rows);
         // Auto-scroll: keep the tail (newest text) visible when content exceeds the region height,
         // minus any user page-up offset (clamped so it can never scroll past the top).
         let inner_h = area.height as usize;
+        let total = rows.len();
         let max_scroll = total.saturating_sub(inner_h);
         self.scroll_offset = self.scroll_offset.min(max_scroll);
-        let scroll = max_scroll.saturating_sub(self.scroll_offset).min(u16::MAX as usize) as u16;
-        let para = Paragraph::new(lines)
-            .style(theme.base_style())
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
-        frame.render_widget(para, area);
+        // `total` is WRAPPED rows, which is what the scroll unit always was — closing the mismatch
+        // where a logical line count was compared against a wrapped scroll offset and the
+        // tail-anchor missed the newest text (PERF-005 §0.5).
+        //
+        // Every row is pre-wrapped, so this index is an exact screen row: `Paragraph` needs neither
+        // `.wrap()` (they already fit) nor `.scroll()` (we sliced instead), and the copy below is
+        // bounded by the VIEWPORT rather than by the turn.
+        let first = max_scroll.saturating_sub(self.scroll_offset);
+        let window: Vec<Line<'static>> =
+            rows.get(first..(first + inner_h).min(total)).unwrap_or(&[]).to_vec();
+        frame.render_widget(Paragraph::new(window).style(theme.base_style()), area);
         // TUI-020 — same ordering rule as the scrollback flush: inject only once the cells exist.
         // `ForcedWidth` keeps `Buffer::diff_iter` advancing one column per escaped cell, so the
         // frame-to-frame diff that drives the live viewport stays aligned.

@@ -25,6 +25,7 @@ impl<B: Backend> App<B> {
         Ok(App {
             terminal,
             state,
+            frames: crate::app::frames::FrameScheduler::default(),
             // ADR-0005 §B-14 — `None` IS regular mode. `App::new` is the inline renderer's
             // constructor and stays exactly that: the alternate screen is only ever installed by
             // `App::switch_tui_mode` (`app/mode_switch.rs`), so a session that never switches

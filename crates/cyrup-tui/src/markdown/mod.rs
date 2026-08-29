@@ -69,7 +69,7 @@ pub(crate) use mermaid::{mode_from_setting, MermaidContext, MessageType};
 // through its own `use super::*;`, the same way `crate::transcript`'s split modules do.
 use highlight::highlight_lines;
 use mermaid::{DiagramOutcome, SpanClass};
-use prepass::{latex_prepass, MATH_END, MATH_START};
+use prepass::{fence_is_closed, latex_prepass, MATH_END, MATH_START};
 use table::trim_cell;
 
 /// Render markdown `text` into styled lines at content `width` (spec/tui/06 §2). Total / never panics:
@@ -312,6 +312,10 @@ struct MdRenderer<'t> {
     /// Fenced-code capture: `Some(lang)` while inside a code block.
     code_lang: Option<String>,
     code_buf: String,
+    /// Whether the open fence carries its closing delimiter — i.e. whether its body is frozen and
+    /// may be memoised by the highlighter. Set from `Start(Tag::CodeBlock)`'s own source
+    /// ([`fence_is_closed`]), taken at `TagEnd::CodeBlock` (PERF-005 §3.0b rule (b)).
+    code_closed: bool,
     /// Raw HTML **block** capture: `Some(buffer)` between `Tag::HtmlBlock` and `TagEnd::HtmlBlock`.
     ///
     /// Upstream a block-level `html` token is ONE `lines.push(applyDefaultStyle(token.raw.trim()))`

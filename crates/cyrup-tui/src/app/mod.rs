@@ -37,6 +37,7 @@ mod draw;
 mod event_extract;
 mod events;
 mod events_fold;
+mod frames;
 mod extension_ui;
 mod execute;
 mod execute_misc;
@@ -167,7 +168,7 @@ use ratatui::crossterm::terminal::{
 use ratatui::crossterm::{execute, queue, ExecutableCommand};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget, Wrap};
+use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 use crate::commands::{CommandRegistry, Dispatch};
@@ -216,6 +217,10 @@ pub const ELAPSED_TICK_INTERVAL: Duration = Duration::from_secs(1);
 pub struct App<B: Backend> {
     terminal: Terminal<B>,
     state: AppState,
+    /// One frame per [`MIN_RENDER_INTERVAL`](frames::MIN_RENDER_INTERVAL), input preempting
+    /// (PERF-005 §3.1). Every run-loop arm REQUESTS a frame; the single production paint site at
+    /// the top of `App::run`'s body consumes the request.
+    frames: frames::FrameScheduler,
     /// The ADR-0005 §B-3 alternate-screen renderer while fullscreen mode is live — `None` for
     /// regular mode, which is every session that never calls [`App::switch_tui_mode`].
     ///

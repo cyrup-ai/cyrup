@@ -73,7 +73,7 @@ pub use entry::{CompactionCostKind, Entry, Rendered, ToolRun};
 pub use images::{ResultImage, DEFAULT_IMAGE_WIDTH_CELLS};
 pub use message::HIDDEN_THINKING_LABEL;
 
-pub(crate) use layout::{is_ws_grapheme, text_lines_of, wrap_line, wrapped_height};
+pub(crate) use layout::{is_ws_grapheme, text_lines_of, wrap_all_owned, wrap_line, wrapped_height};
 pub(crate) use render::entry_lines;
 pub(crate) use tool_render::{tool_lines, ImageOpts};
 
@@ -316,16 +316,25 @@ pub struct TranscriptView {
     render_cache: RenderCache,
 }
 
-/// One materialisation of the active region: the styled lines plus their wrapped display height,
-/// keyed by everything `lines()` + `wrapped_height()` read that is not `self` — the width and the
-/// theme generation — plus the content generation that covers every `self` field.
+/// One materialisation of the active region as ALREADY-WRAPPED display rows, keyed by everything
+/// `lines()` reads that is not `self` — the width and the theme generation — plus the content
+/// generation that covers every `self` field.
 #[derive(Default)]
 struct RenderCache {
     generation: u64,
     width: usize,
     theme_generation: u64,
-    lines: Vec<Line<'static>>,
-    wrapped_height: usize,
+    /// Already-wrapped display rows, one [`Line`] per screen row, shared rather than copied.
+    ///
+    /// `Arc` because every consumer wants the whole vector and none mutates it — `render` per
+    /// frame and `content_height` per frame — so a refcount bump replaces a deep copy of the
+    /// entire turn (PERF-005 §3.0).
+    ///
+    /// This replaces a separate `wrapped_height: usize`, which was recomputed on every MISS by
+    /// `wrapped_height()`: a `lines.to_vec()` plus a full `Paragraph::line_count` wrap. `rows.len()`
+    /// is the same quantity, exactly, for free — and after this change it is not an ESTIMATE of the
+    /// painted height but the height itself, because these are the rows that get blitted.
+    rows: std::sync::Arc<Vec<Line<'static>>>,
     /// The hrefs `lines` was built with (TUI-020). Cached alongside because the ids in the spans'
     /// marker bits index THIS table; a cache hit that reused stale hrefs would link the right text
     /// to the wrong file.

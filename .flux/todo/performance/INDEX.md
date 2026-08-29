@@ -8,7 +8,7 @@ updated: 2026-08-29 02:33
 # Performance backlog
 
 Filed 2026-08-29 from a measured read of the inference-to-render hot path at
-`761dc19` (branch `david/performance`). Six tasks, ranked by measured leverage.
+`761dc19` (branch `david/performance`). Six tasks, ranked by measured leverage — 001 has since landed, five remain open.
 
 **Everything here is measured, not inferred.** Where a number appears it was produced on
 this host in `--release` and the probe is reproduced inside the task file so anyone can
@@ -30,13 +30,21 @@ Two structural facts govern the whole list:
    throughput critical path, not merely the cosmetic one. A slow consumer stalls the
    provider stream.
 2. **Five full copies of the accumulated assistant message are made per delta**, and the
-   primary consumer discards all of them. See PERF-001 §1.
+   primary consumer discards all of them. See [PERF-001](../../done/2026-08-29-01-49/PERF-001_STREAM_SNAPSHOT_QUADRATIC.md) §1.
+
+## Landed
+
+**001 — [`PERF-001_STREAM_SNAPSHOT_QUADRATIC.md`](../../done/2026-08-29-01-49/PERF-001_STREAM_SNAPSHOT_QUADRATIC.md) shipped** in `04d6fa5`, merged as
+PR #104. The per-delta re-parse and the per-delta payload copy are both gone: a snapshot is now
+O(blocks), and the content axis of a 256 KB tool call in 40-byte deltas sits at 1.4x-1.9x a single
+end-of-stream parse against a pre-change ~500x. It also fixed a live wrong-arguments bug on three
+OpenAI-shaped wires. **It changed the cost model for 002, 005 and 006 — each of those files has a
+revision pass recording what moved.**
 
 ## The tasks
 
 | # | file | what | measured leverage |
 | --- | --- | --- | --- |
-| **001** | [`PERF-001_STREAM_SNAPSHOT_QUADRATIC.md`](PERF-001_STREAM_SNAPSHOT_QUADRATIC.md) | Per-delta `snapshot()` re-parses the whole accumulated tool-call buffer | **up to 2,883×** on a 256 KB tool call (10.06 s → 3.5 ms) |
 | **002** | [`PERF-002_ARC_TRANSCRIPT_SNAPSHOTS.md`](PERF-002_ARC_TRANSCRIPT_SNAPSHOTS.md) | Whole transcript deep-cloned 4× per turn where pi passes a reference | O(history) → O(1); **cyrup is currently slower than pi** |
 | **003** | [`PERF-003_PARALLEL_FILE_WALK.md`](PERF-003_PARALLEL_FILE_WALK.md) | `grep`/`find` walk single-threaded where pi shells out to multi-threaded `rg` | **2.8×** floor on this repo warm; **cyrup is currently slower than pi** |
 | **004** | [`PERF-004_SESSION_PERSIST_FSYNC.md`](PERF-004_SESSION_PERSIST_FSYNC.md) | `fdatasync` per persisted entry, synchronously, on the caller's thread | **310×** per entry (3.3 µs → 1022 µs) on ext4 |
@@ -45,13 +53,14 @@ Two structural facts govern the whole list:
 
 ## Suggested order
 
-`001` → `005` → `002` → `003` → `004` → `006`.
+`005` → `003` → `006` → `004` → `002`.  (`001` is landed.)
 
-`001` first because it is the largest by two orders of magnitude, is contained inside one
-crate, and is behaviour-preserving. `005` second because it fixes a failure the code
-itself documents as already reachable. `006` last because its benefit is partly masked
-until `001` lands — with the quadratic gone, there may be little left to pipeline, and
-that is a good reason to measure before building it.
+`005` first because it fixes a failure the code itself documents as already reachable, and
+because `Fanout::emit` awaits every send — a slow renderer throttles the provider stream, so this
+is a throughput fix as well as a responsiveness one. `002` last because `001` already delivered
+most of it: assistant messages, text, thinking and tool arguments are all refcounted now, so
+re-measure before building. The three-stage pipeline `006` was opened for is closed; what survives
+there is the SSE framer replacement.
 
 ## Two tasks are parity regressions, not just optimisations
 
@@ -64,8 +73,8 @@ task states the decision rather than presuming it.
 ## What is deliberately NOT here
 
 - **simd-json / sonic-rs.** The per-frame JSON is small. The quadratic is the problem;
-  once `001` lands the parser choice is close to irrelevant. Reaching for a faster parser
-  first would deliver a few percent and hide the 2,883×.
+  with `001` landed the parser choice is close to irrelevant. Reaching for a faster parser
+  first would have delivered a few percent and hidden the 2,883×.
 - **Removing the awaited fanout backpressure.** It is what bounds memory. `005` fixes the
   consumer instead.
 - **Touching `ToolExecution::Sequential`**
